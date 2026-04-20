@@ -22,6 +22,9 @@ Usage:
     python benchmarks/bench_complex.py
     python benchmarks/bench_complex.py --engine decentdb
     python benchmarks/bench_complex.py --users 50000 --items 5000 --orders 150000
+
+The default no-argument run uses a smoke-scale workload so it completes quickly
+enough for local comparison runs.
 """
 
 import argparse
@@ -33,6 +36,10 @@ import time
 
 import decentdb
 from decentdb.native import load_library as load_decentdb_library
+
+DEFAULT_USERS = 1000
+DEFAULT_ITEMS = 50
+DEFAULT_ORDERS = 100
 
 
 def remove_if_exists(path):
@@ -851,20 +858,20 @@ def parse_args():
     parser.add_argument(
         "--users",
         type=int,
-        default=20000,
-        help="Number of users to generate (default: 20000)",
+        default=DEFAULT_USERS,
+        help=f"Number of users to generate (default: {DEFAULT_USERS})",
     )
     parser.add_argument(
         "--items",
         type=int,
-        default=5000,
-        help="Number of items to generate (default: 5000)",
+        default=DEFAULT_ITEMS,
+        help=f"Number of items to generate (default: {DEFAULT_ITEMS})",
     )
     parser.add_argument(
         "--orders",
         type=int,
-        default=100000,
-        help="Number of orders to generate (default: 100000)",
+        default=DEFAULT_ORDERS,
+        help=f"Number of orders to generate (default: {DEFAULT_ORDERS})",
     )
     parser.add_argument(
         "--history-reads",
@@ -937,6 +944,15 @@ def main():
     args = parse_args()
     engines = ["decentdb", "sqlite"] if args.engine == "all" else [args.engine]
     results = {}
+
+    print(
+        "Running benchmark with "
+        f"engines={','.join(engines)} users={args.users} items={args.items} "
+        f"orders={args.orders} history_reads={args.history_reads} "
+        f"point_lookups={args.point_lookups} range_scans={args.range_scans} "
+        f"joins={args.joins} aggregates={args.aggregates} updates={args.updates} "
+        f"deletes={args.deletes} table_scans={args.table_scans}"
+    )
 
     for engine in engines:
         suffix = "ddb" if engine == "decentdb" else "db"

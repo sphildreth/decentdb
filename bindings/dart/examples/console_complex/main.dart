@@ -306,58 +306,64 @@ class ComplexDemoRunner {
     print('--- Schema Creation ---');
     final watch = Stopwatch()..start();
 
-    db.execute('''
-      CREATE TABLE categories (
-        id INT64 PRIMARY KEY,
-        name TEXT UNIQUE NOT NULL,
-        description TEXT
-      )''');
-    db.execute('''
-      CREATE TABLE customers (
-        id INT64 PRIMARY KEY,
-        name TEXT NOT NULL,
-        email TEXT UNIQUE NOT NULL,
-        city TEXT,
-        created_at TEXT
-      )''');
-    db.execute('''
-      CREATE TABLE products (
-        id INT64 PRIMARY KEY,
-        name TEXT NOT NULL,
-        price FLOAT64 NOT NULL,
-        category_id INT64 NOT NULL REFERENCES categories(id),
-        stock INT64 NOT NULL DEFAULT 0
-      )''');
-    db.execute('''
-      CREATE TABLE orders (
-        id INT64 PRIMARY KEY,
-        customer_id INT64 NOT NULL REFERENCES customers(id),
-        order_date TEXT NOT NULL,
-        total FLOAT64 NOT NULL DEFAULT 0.0
-      )''');
-    db.execute('''
-      CREATE TABLE order_items (
-        id INT64 PRIMARY KEY,
-        order_id INT64 NOT NULL REFERENCES orders(id),
-        product_id INT64 NOT NULL REFERENCES products(id),
-        quantity INT64 NOT NULL,
-        unit_price FLOAT64 NOT NULL
-      )''');
-    db.execute('''
-      CREATE TABLE reviews (
-        id INT64 PRIMARY KEY,
-        product_id INT64 NOT NULL REFERENCES products(id),
-        customer_id INT64 NOT NULL REFERENCES customers(id),
-        rating INT64 NOT NULL,
-        comment TEXT
-      )''');
+    // Group all DDL into a single transaction so the WAL fsync cost is paid
+    // once instead of once per statement. With WalSyncMode::Full each commit
+    // calls fdatasync (~30 ms on typical NVMe); collapsing 10 commits into 1
+    // turns ~325 ms of DDL into a few tens of ms.
+    db.transaction(() {
+      db.execute('''
+        CREATE TABLE categories (
+          id INT64 PRIMARY KEY,
+          name TEXT UNIQUE NOT NULL,
+          description TEXT
+        )''');
+      db.execute('''
+        CREATE TABLE customers (
+          id INT64 PRIMARY KEY,
+          name TEXT NOT NULL,
+          email TEXT UNIQUE NOT NULL,
+          city TEXT,
+          created_at TEXT
+        )''');
+      db.execute('''
+        CREATE TABLE products (
+          id INT64 PRIMARY KEY,
+          name TEXT NOT NULL,
+          price FLOAT64 NOT NULL,
+          category_id INT64 NOT NULL REFERENCES categories(id),
+          stock INT64 NOT NULL DEFAULT 0
+        )''');
+      db.execute('''
+        CREATE TABLE orders (
+          id INT64 PRIMARY KEY,
+          customer_id INT64 NOT NULL REFERENCES customers(id),
+          order_date TEXT NOT NULL,
+          total FLOAT64 NOT NULL DEFAULT 0.0
+        )''');
+      db.execute('''
+        CREATE TABLE order_items (
+          id INT64 PRIMARY KEY,
+          order_id INT64 NOT NULL REFERENCES orders(id),
+          product_id INT64 NOT NULL REFERENCES products(id),
+          quantity INT64 NOT NULL,
+          unit_price FLOAT64 NOT NULL
+        )''');
+      db.execute('''
+        CREATE TABLE reviews (
+          id INT64 PRIMARY KEY,
+          product_id INT64 NOT NULL REFERENCES products(id),
+          customer_id INT64 NOT NULL REFERENCES customers(id),
+          rating INT64 NOT NULL,
+          comment TEXT
+        )''');
 
-    // Keep explicit indexes focused on the demo queries rather than duplicating
-    // PK/UNIQUE/FK-backed indexes the engine already creates.
-    db.execute('CREATE INDEX idx_customers_city ON customers (city)');
-    db.execute('CREATE INDEX idx_products_name ON products (name)');
-    db.execute('CREATE INDEX idx_orders_date ON orders (order_date)');
-    db.execute('CREATE INDEX idx_orders_total ON orders (total)');
+      // Keep explicit indexes focused on the demo queries rather than duplicating
+      // PK/UNIQUE/FK-backed indexes the engine already creates.
+      db.execute('CREATE INDEX idx_customers_city ON customers (city)');
+      db.execute('CREATE INDEX idx_products_name ON products (name)');
+      db.execute('CREATE INDEX idx_orders_date ON orders (order_date)');
+      db.execute('CREATE INDEX idx_orders_total ON orders (total)');
+    });
 
     watch.stop();
     final ddlMs = watch.elapsedMicroseconds / 1000.0;

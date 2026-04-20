@@ -14,6 +14,7 @@ use crate::sql::parser::parse_expression_sql;
 
 use super::constraints::auto_index_name;
 use super::{table_row_dataset, EngineRuntime, TableData};
+use std::sync::Arc;
 
 impl EngineRuntime {
     pub(super) fn execute_create_schema(&mut self, name: &str, if_not_exists: bool) -> Result<()> {
@@ -26,7 +27,7 @@ impl EngineRuntime {
         if self.catalog.contains_non_schema_object(name) {
             return Err(DbError::sql(format!("object {} already exists", name)));
         }
-        self.catalog.schemas.insert(
+        self.catalog_mut().schemas.insert(
             name.to_string(),
             SchemaInfo {
                 name: name.to_string(),
@@ -182,22 +183,23 @@ impl EngineRuntime {
                     fresh: false,
                 });
             }
-            self.temp_tables.insert(statement.table_name.clone(), table);
-            self.temp_table_data
-                .insert(statement.table_name.clone(), TableData::default());
+            self.temp_tables_mut()
+                .insert(statement.table_name.clone(), table);
+            self.temp_table_data_map_mut()
+                .insert(statement.table_name.clone(), Arc::new(TableData::default()));
             for index in temp_indexes {
-                self.temp_indexes.insert(index.name.clone(), index);
+                self.temp_indexes_mut().insert(index.name.clone(), index);
             }
             self.bump_temp_schema_cookie();
             return Ok(());
         }
         validate_foreign_keys(self, &table)?;
 
-        self.catalog
+        self.catalog_mut()
             .tables
             .insert(statement.table_name.clone(), table.clone());
-        self.tables
-            .insert(statement.table_name.clone(), TableData::default());
+        self.tables_mut()
+            .insert(statement.table_name.clone(), Arc::new(TableData::default()));
 
         if !table.primary_key_columns.is_empty() {
             self.insert_index_schema(IndexSchema {
@@ -471,8 +473,8 @@ impl EngineRuntime {
                     auto_index_name("fk", &statement.table_name, &column_names)
                 );
                 if self.catalog.indexes.contains_key(&fk_auto_name) {
-                    self.catalog.indexes.remove(&fk_auto_name);
-                    self.indexes.remove(&fk_auto_name);
+                    self.catalog_mut().indexes.remove(&fk_auto_name);
+                    self.indexes_mut().remove(&fk_auto_name);
                 }
             }
         }
@@ -502,9 +504,9 @@ impl EngineRuntime {
                     dependent_views.join(", ")
                 )));
             }
-            self.temp_tables.remove(&table_name);
-            self.temp_table_data.remove(&table_name);
-            self.temp_indexes
+            self.temp_tables_mut().remove(&table_name);
+            self.temp_table_data_map_mut().remove(&table_name);
+            self.temp_indexes_mut()
                 .retain(|_, index| !identifiers_equal(&index.table_name, &table_name));
             self.bump_temp_schema_cookie();
             return Ok(());
@@ -542,12 +544,12 @@ impl EngineRuntime {
             )));
         }
 
-        self.catalog.tables.remove(&table_name);
-        self.tables.remove(&table_name);
-        self.catalog
+        self.catalog_mut().tables.remove(&table_name);
+        self.tables_mut().remove(&table_name);
+        self.catalog_mut()
             .indexes
             .retain(|_, index| !identifiers_equal(&index.table_name, &table_name));
-        self.catalog.triggers.retain(|_, trigger| {
+        self.catalog_mut().triggers.retain(|_, trigger| {
             !identifiers_equal(&trigger.target_name, &table_name) || trigger.on_view
         });
         self.bump_schema_cookie();
@@ -567,8 +569,8 @@ impl EngineRuntime {
                 name
             )));
         }
-        self.catalog.indexes.remove(name);
-        self.indexes.remove(name);
+        self.catalog_mut().indexes.remove(name);
+        self.indexes_mut().remove(name);
         self.bump_schema_cookie();
         Ok(())
     }
@@ -605,13 +607,14 @@ impl EngineRuntime {
         )?;
 
         for target in &targets {
-            let data = self.tables.get_mut(target).ok_or_else(|| {
+            let entry = self.tables_mut().get_mut(target).ok_or_else(|| {
                 DbError::internal(format!("table data for {} is missing", target))
             })?;
+            let data = Arc::make_mut(entry);
             data.rows.clear();
 
             if restart_identity {
-                let table = self.catalog.tables.get_mut(target).ok_or_else(|| {
+                let table = self.catalog_mut().tables.get_mut(target).ok_or_else(|| {
                     DbError::internal(format!("table schema for {} is missing", target))
                 })?;
                 table.next_row_id = 1;
@@ -619,7 +622,7 @@ impl EngineRuntime {
 
             self.mark_table_dirty(target);
             self.mark_indexes_stale_for_table(target);
-            self.catalog
+            self.catalog_mut()
                 .table_stats
                 .insert(target.clone(), super::TableStats { row_count: 0 });
         }
@@ -760,15 +763,13 @@ impl EngineRuntime {
                             column.name
                         )));
                     }
-                    for row in &mut self
-                        .tables
-                        .get_mut(table_name)
-                        .ok_or_else(|| {
-                            DbError::internal(format!("table data for {table_name} is missing"))
-                        })?
-                        .rows
                     {
-                        row.values.push(fill_value.clone());
+                        let entry = self.tables_mut().get_mut(table_name).ok_or_else(|| {
+                            DbError::internal(format!("table data for {table_name} is missing"))
+                        })?;
+                        for row in &mut Arc::make_mut(entry).rows {
+                            row.values.push(fill_value.clone());
+                        }
                     }
                     table.columns.push(column);
                 }
@@ -813,15 +814,13 @@ impl EngineRuntime {
                         .position(|column| column.name == *column_name)
                         .ok_or_else(|| DbError::sql(format!("unknown column {column_name}")))?;
                     table.columns.remove(index);
-                    for row in &mut self
-                        .tables
-                        .get_mut(table_name)
-                        .ok_or_else(|| {
-                            DbError::internal(format!("table data for {table_name} is missing"))
-                        })?
-                        .rows
                     {
-                        row.values.remove(index);
+                        let entry = self.tables_mut().get_mut(table_name).ok_or_else(|| {
+                            DbError::internal(format!("table data for {table_name} is missing"))
+                        })?;
+                        for row in &mut Arc::make_mut(entry).rows {
+                            row.values.remove(index);
+                        }
                     }
                 }
                 AlterTableAction::RenameColumn { old_name, new_name } => {
@@ -901,16 +900,14 @@ impl EngineRuntime {
                             column_name
                         )));
                     }
-                    for row in &mut self
-                        .tables
-                        .get_mut(table_name)
-                        .ok_or_else(|| {
-                            DbError::internal(format!("table data for {table_name} is missing"))
-                        })?
-                        .rows
                     {
-                        row.values[index] =
-                            super::cast_value(row.values[index].clone(), *new_type)?;
+                        let entry = self.tables_mut().get_mut(table_name).ok_or_else(|| {
+                            DbError::internal(format!("table data for {table_name} is missing"))
+                        })?;
+                        for row in &mut Arc::make_mut(entry).rows {
+                            row.values[index] =
+                                super::cast_value(row.values[index].clone(), *new_type)?;
+                        }
                     }
                     table.columns[index].column_type = *new_type;
                 }
@@ -927,7 +924,9 @@ impl EngineRuntime {
             }
         }
 
-        self.catalog.tables.insert(table_name.to_string(), table);
+        self.catalog_mut()
+            .tables
+            .insert(table_name.to_string(), table);
         self.mark_table_dirty(table_name);
         self.bump_schema_cookie();
         Ok(())
@@ -1007,7 +1006,7 @@ impl EngineRuntime {
                     }
                 }
                 table.checks.push(candidate);
-                self.catalog.tables.insert(table_name.clone(), table);
+                self.catalog_mut().tables.insert(table_name.clone(), table);
                 self.bump_schema_cookie();
                 Ok(())
             }
@@ -1035,7 +1034,7 @@ impl EngineRuntime {
                 validate_foreign_keys(self, &table)?;
                 validate_existing_rows_with_staged_table(self, &table_name, &table)?;
 
-                self.catalog.tables.insert(table_name.clone(), table);
+                self.catalog_mut().tables.insert(table_name.clone(), table);
                 let index_name = foreign_key_index_name(&table_name, &candidate.columns);
                 if !self.catalog.indexes.contains_key(&index_name) {
                     self.insert_index_schema(IndexSchema {
@@ -1118,7 +1117,7 @@ impl EngineRuntime {
                         self.validate_row(&table_name, &row.values, Some(row.row_id), &[])
                     });
                 if let Err(error) = validation {
-                    self.catalog.indexes.remove(&index_name);
+                    self.catalog_mut().indexes.remove(&index_name);
                     return Err(error);
                 }
                 self.rebuild_index(&index_name, page_size)?;
@@ -1135,7 +1134,7 @@ impl EngineRuntime {
                     .position(|check| check.name.as_deref() == Some(constraint_name.as_str()))
                 {
                     table.checks.remove(index);
-                    self.catalog.tables.insert(table_name.clone(), table);
+                    self.catalog_mut().tables.insert(table_name.clone(), table);
                     self.bump_schema_cookie();
                     return Ok(());
                 }
@@ -1156,10 +1155,10 @@ impl EngineRuntime {
                         .foreign_keys
                         .iter()
                         .any(|candidate| candidate.columns == foreign_key.columns);
-                    self.catalog.tables.insert(table_name.clone(), table);
+                    self.catalog_mut().tables.insert(table_name.clone(), table);
                     if drop_index {
-                        self.catalog.indexes.remove(&index_name);
-                        self.indexes.remove(&index_name);
+                        self.catalog_mut().indexes.remove(&index_name);
+                        self.indexes_mut().remove(&index_name);
                     }
                     self.bump_schema_cookie();
                     return Ok(());
@@ -1170,8 +1169,8 @@ impl EngineRuntime {
                         && index.unique
                         && identifiers_equal(&index.name, constraint_name)
                 }) {
-                    self.catalog.indexes.remove(constraint_name);
-                    self.indexes.remove(constraint_name);
+                    self.catalog_mut().indexes.remove(constraint_name);
+                    self.indexes_mut().remove(constraint_name);
                     self.bump_schema_cookie();
                     return Ok(());
                 }
@@ -1204,22 +1203,30 @@ impl EngineRuntime {
                 dependent_views.join(", ")
             )));
         }
-        let mut table = self.catalog.tables.remove(&old_table_name).ok_or_else(|| {
-            DbError::internal(format!("table schema for {} is missing", table_name))
-        })?;
+        let mut table = self
+            .catalog_mut()
+            .tables
+            .remove(&old_table_name)
+            .ok_or_else(|| {
+                DbError::internal(format!("table schema for {} is missing", table_name))
+            })?;
         table.name = new_name.to_string();
-        self.catalog.tables.insert(new_name.to_string(), table);
+        self.catalog_mut()
+            .tables
+            .insert(new_name.to_string(), table);
 
-        let data = self.tables.remove(&old_table_name).ok_or_else(|| {
+        let data = self.tables_mut().remove(&old_table_name).ok_or_else(|| {
             DbError::internal(format!("table data for {} is missing", table_name))
         })?;
-        self.tables.insert(new_name.to_string(), data);
+        self.tables_mut().insert(new_name.to_string(), data);
 
         if let Some(state) = self.persisted_tables.remove(&old_table_name) {
             self.persisted_tables.insert(new_name.to_string(), state);
         }
-        if let Some(stats) = self.catalog.table_stats.remove(&old_table_name) {
-            self.catalog.table_stats.insert(new_name.to_string(), stats);
+        if let Some(stats) = self.catalog_mut().table_stats.remove(&old_table_name) {
+            self.catalog_mut()
+                .table_stats
+                .insert(new_name.to_string(), stats);
         }
         if self.dirty_tables.remove(&old_table_name) {
             self.dirty_tables.insert(new_name.to_string());
@@ -1240,12 +1247,13 @@ impl EngineRuntime {
                 index.name
             )));
         }
-        self.catalog.indexes.insert(index.name.clone(), index);
+        self.catalog_mut().indexes.insert(index.name.clone(), index);
         Ok(())
     }
 
     pub(super) fn bump_schema_cookie(&mut self) {
-        self.catalog.schema_cookie = self.catalog.schema_cookie.saturating_add(1);
+        let next = self.catalog.schema_cookie.saturating_add(1);
+        self.catalog_mut().schema_cookie = next;
     }
 }
 
@@ -1386,7 +1394,7 @@ fn validate_existing_rows_with_staged_table(
     staged_table: &TableSchema,
 ) -> Result<()> {
     let original_table = runtime
-        .catalog
+        .catalog_mut()
         .tables
         .insert(table_name.to_string(), staged_table.clone());
     let rows = runtime
@@ -1400,11 +1408,11 @@ fn validate_existing_rows_with_staged_table(
         .try_for_each(|row| runtime.validate_row(table_name, &row.values, Some(row.row_id), &[]));
     if let Some(original_table) = original_table {
         runtime
-            .catalog
+            .catalog_mut()
             .tables
             .insert(table_name.to_string(), original_table);
     } else {
-        runtime.catalog.tables.remove(table_name);
+        runtime.catalog_mut().tables.remove(table_name);
     }
     validation
 }
@@ -1662,7 +1670,7 @@ fn rename_column_references(
     old_name: &str,
     new_name: &str,
 ) {
-    if let Some(table) = runtime.catalog.tables.get_mut(table_name) {
+    if let Some(table) = runtime.catalog_mut().tables.get_mut(table_name) {
         for primary_key_column in &mut table.primary_key_columns {
             if primary_key_column == old_name {
                 *primary_key_column = new_name.to_string();
@@ -1677,7 +1685,7 @@ fn rename_column_references(
         }
     }
 
-    for index in runtime.catalog.indexes.values_mut() {
+    for index in runtime.catalog_mut().indexes.values_mut() {
         if index.table_name == table_name {
             for column in &mut index.columns {
                 if column.column_name.as_deref() == Some(old_name) {
@@ -1695,7 +1703,7 @@ fn rename_column_references(
         }
     }
 
-    for table in runtime.catalog.tables.values_mut() {
+    for table in runtime.catalog_mut().tables.values_mut() {
         for foreign_key in &mut table.foreign_keys {
             if foreign_key.referenced_table == table_name {
                 for column_name in &mut foreign_key.referenced_columns {
@@ -1709,19 +1717,19 @@ fn rename_column_references(
 }
 
 fn rename_table_references(runtime: &mut EngineRuntime, old_name: &str, new_name: &str) {
-    for index in runtime.catalog.indexes.values_mut() {
+    for index in runtime.catalog_mut().indexes.values_mut() {
         if identifiers_equal(&index.table_name, old_name) {
             index.table_name = new_name.to_string();
         }
     }
 
-    for trigger in runtime.catalog.triggers.values_mut() {
+    for trigger in runtime.catalog_mut().triggers.values_mut() {
         if !trigger.on_view && identifiers_equal(&trigger.target_name, old_name) {
             trigger.target_name = new_name.to_string();
         }
     }
 
-    for table in runtime.catalog.tables.values_mut() {
+    for table in runtime.catalog_mut().tables.values_mut() {
         for foreign_key in &mut table.foreign_keys {
             if identifiers_equal(&foreign_key.referenced_table, old_name) {
                 foreign_key.referenced_table = new_name.to_string();

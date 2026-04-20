@@ -207,3 +207,37 @@ def test_prefetched_rows_support_zero_param_and_two_float_queries(tmp_path):
     assert cur.fetchall() == [(1,), (2,)]
 
     conn.close()
+
+
+def test_stmt_cache_stats_tracks_hits_and_misses(tmp_path):
+    db_path = str(tmp_path / "stmt_cache_stats.ddb")
+    conn = decentdb.connect(db_path, stmt_cache_size=10)
+    conn.execute("CREATE TABLE foo (id INT64 PRIMARY KEY)")
+    conn.execute("INSERT INTO foo VALUES (?)", (1,))
+
+    before = conn.stmt_cache_stats
+    for _ in range(3):
+        cur = conn.execute("SELECT id FROM foo WHERE id = ?", (1,))
+        assert cur.fetchall() == [(1,)]
+        cur.close()
+
+    after = conn.stmt_cache_stats
+    assert after["hits"] - before["hits"] == 2
+    assert after["misses"] - before["misses"] == 1
+    assert after["capacity"] == 10
+    assert after["size"] >= 1
+
+    conn.close()
+
+
+def test_low_hit_rate_emits_performance_warning(tmp_path):
+    db_path = str(tmp_path / "stmt_cache_warning.ddb")
+    conn = decentdb.connect(db_path, stmt_cache_size=10)
+
+    for i in range(100):
+        cur = conn.execute(f"SELECT {i}")
+        assert cur.fetchone() == (i,)
+        cur.close()
+
+    with pytest.warns(decentdb.PerformanceWarning, match="parameterized"):
+        conn.close()

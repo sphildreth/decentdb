@@ -2,6 +2,15 @@
 
 Go `database/sql` driver for DecentDB.
 
+## Validation
+
+Run the Go binding test suite, including the strict cgo pointer checker:
+
+```bash
+go test ./...
+GOEXPERIMENT=cgocheck2 go test ./...
+```
+
 ## Benchmark
 
 Run the fair DecentDB vs SQLite benchmark:

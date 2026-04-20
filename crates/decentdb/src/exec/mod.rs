@@ -22,7 +22,7 @@ mod dml_unit_tests;
 mod runtime_unit_tests;
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -106,6 +106,18 @@ fn map_get_ci_mut<'a, V>(map: &'a mut BTreeMap<String, V>, name: &str) -> Option
         .find(|entry_name| identifiers_equal(entry_name, name))
         .cloned()?;
     map.get_mut(&existing)
+}
+
+/// Resolves the canonical key for `name` in `map` using the same
+/// case-insensitive matching rules as `map_get_ci`. Used by callers that
+/// need to perform a follow-up mutation under a fresh `&mut` borrow.
+fn map_key_ci<V>(map: &BTreeMap<String, V>, name: &str) -> Option<String> {
+    if map.contains_key(name) {
+        return Some(name.to_string());
+    }
+    map.keys()
+        .find(|entry_name| identifiers_equal(entry_name, name))
+        .cloned()
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -456,14 +468,14 @@ pub(super) enum PendingIndexInsert {
 
 #[derive(Debug)]
 pub(crate) struct EngineRuntime {
-    pub(crate) catalog: CatalogState,
-    pub(crate) tables: BTreeMap<String, TableData>,
-    pub(crate) temp_tables: BTreeMap<String, TableSchema>,
-    pub(crate) temp_table_data: BTreeMap<String, TableData>,
-    pub(crate) temp_views: BTreeMap<String, ViewSchema>,
-    pub(crate) temp_indexes: BTreeMap<String, IndexSchema>,
+    pub(crate) catalog: Arc<CatalogState>,
+    pub(crate) tables: Arc<BTreeMap<String, Arc<TableData>>>,
+    pub(crate) temp_tables: Arc<BTreeMap<String, TableSchema>>,
+    pub(crate) temp_table_data: Arc<BTreeMap<String, Arc<TableData>>>,
+    pub(crate) temp_views: Arc<BTreeMap<String, ViewSchema>>,
+    pub(crate) temp_indexes: Arc<BTreeMap<String, IndexSchema>>,
     pub(crate) temp_schema_cookie: u32,
-    pub(crate) indexes: BTreeMap<String, RuntimeIndex>,
+    pub(crate) indexes: Arc<BTreeMap<String, Arc<RuntimeIndex>>>,
     pub(crate) persisted_tables: BTreeMap<String, PersistedTableState>,
     /// Tables whose row data has not yet been loaded from storage.
     /// Populated during `decode_manifest_payload` and cleared by
@@ -473,8 +485,10 @@ pub(crate) struct EngineRuntime {
     pub(crate) append_only_dirty_tables: BTreeSet<String>,
     /// Row indices updated by prepared simple UPDATE; avoids full re-encode.
     row_update_dirty: BTreeMap<String, Vec<usize>>,
-    /// Cached table payloads from the last commit for incremental splice.
-    cached_payloads: BTreeMap<String, Arc<Vec<u8>>>,
+    /// Per-session cache; capped at `cached_payloads_max_entries`. Eviction is LRU.
+    cached_payloads: HashMap<String, Arc<Vec<u8>>>,
+    cached_payload_access_order: VecDeque<String>,
+    cached_payloads_max_entries: usize,
     root_state: Option<RootHeader>,
     pub(crate) index_state_epoch: u64,
     manifest_template: Option<ManifestTemplate>,
@@ -504,14 +518,14 @@ impl Default for BulkLoadOptions {
 impl Clone for EngineRuntime {
     fn clone(&self) -> Self {
         Self {
-            catalog: self.catalog.clone(),
-            tables: self.tables.clone(),
-            temp_tables: self.temp_tables.clone(),
-            temp_table_data: self.temp_table_data.clone(),
-            temp_views: self.temp_views.clone(),
-            temp_indexes: self.temp_indexes.clone(),
+            catalog: Arc::clone(&self.catalog),
+            tables: Arc::clone(&self.tables),
+            temp_tables: Arc::clone(&self.temp_tables),
+            temp_table_data: Arc::clone(&self.temp_table_data),
+            temp_views: Arc::clone(&self.temp_views),
+            temp_indexes: Arc::clone(&self.temp_indexes),
             temp_schema_cookie: self.temp_schema_cookie,
-            indexes: self.indexes.clone(),
+            indexes: Arc::clone(&self.indexes),
             persisted_tables: self.persisted_tables.clone(),
             deferred_tables: self.deferred_tables.clone(),
             // Preserve dirty state so that multi-statement transactions
@@ -526,6 +540,8 @@ impl Clone for EngineRuntime {
             row_update_dirty: BTreeMap::new(),
             // Arc payloads: clone is just a refcount bump.
             cached_payloads: self.cached_payloads.clone(),
+            cached_payload_access_order: self.cached_payload_access_order.clone(),
+            cached_payloads_max_entries: self.cached_payloads_max_entries,
             root_state: self.root_state,
             index_state_epoch: self.index_state_epoch,
             // Optimization caches rebuilt on demand during persist.
@@ -539,21 +555,28 @@ impl Clone for EngineRuntime {
 impl EngineRuntime {
     #[must_use]
     pub(crate) fn empty(schema_cookie: u32) -> Self {
+        Self::from_config(schema_cookie, &crate::config::DbConfig::default())
+    }
+
+    #[must_use]
+    pub(crate) fn from_config(schema_cookie: u32, config: &crate::config::DbConfig) -> Self {
         Self {
-            catalog: CatalogState::empty(schema_cookie),
-            tables: BTreeMap::new(),
-            temp_tables: BTreeMap::new(),
-            temp_table_data: BTreeMap::new(),
-            temp_views: BTreeMap::new(),
-            temp_indexes: BTreeMap::new(),
+            catalog: Arc::new(CatalogState::empty(schema_cookie)),
+            tables: Arc::new(BTreeMap::new()),
+            temp_tables: Arc::new(BTreeMap::new()),
+            temp_table_data: Arc::new(BTreeMap::new()),
+            temp_views: Arc::new(BTreeMap::new()),
+            temp_indexes: Arc::new(BTreeMap::new()),
             temp_schema_cookie: 0,
-            indexes: BTreeMap::new(),
+            indexes: Arc::new(BTreeMap::new()),
             persisted_tables: BTreeMap::new(),
             deferred_tables: BTreeSet::new(),
             dirty_tables: BTreeSet::new(),
             append_only_dirty_tables: BTreeSet::new(),
             row_update_dirty: BTreeMap::new(),
-            cached_payloads: BTreeMap::new(),
+            cached_payloads: HashMap::new(),
+            cached_payload_access_order: VecDeque::new(),
+            cached_payloads_max_entries: config.cached_payloads_max_entries,
             root_state: None,
             index_state_epoch: 0,
             manifest_template: None,
@@ -571,18 +594,113 @@ impl EngineRuntime {
 
     fn persistent_resolution_runtime(&self) -> Self {
         let mut runtime = self.clone();
-        runtime.temp_tables.clear();
-        runtime.temp_table_data.clear();
-        runtime.temp_views.clear();
-        runtime.temp_indexes.clear();
+        runtime.temp_tables_mut().clear();
+        runtime.temp_table_data_map_mut().clear();
+        runtime.temp_views_mut().clear();
+        runtime.temp_indexes_mut().clear();
         runtime.temp_schema_cookie = 0;
         runtime
+    }
+
+    fn catalog_mut(&mut self) -> &mut CatalogState {
+        Arc::make_mut(&mut self.catalog)
+    }
+
+    fn tables_mut(&mut self) -> &mut BTreeMap<String, Arc<TableData>> {
+        Arc::make_mut(&mut self.tables)
+    }
+
+    fn temp_table_data_map_mut(&mut self) -> &mut BTreeMap<String, Arc<TableData>> {
+        Arc::make_mut(&mut self.temp_table_data)
+    }
+
+    /// Per-entry COW: locates `name` in `tables` (case-insensitive) and
+    /// returns a `&mut TableData` for the targeted table, cloning only that
+    /// table's row vector when the per-entry `Arc<TableData>` is shared.
+    /// This avoids deep-cloning every other table's rows during writes.
+    fn entry_table_data_mut(&mut self, name: &str) -> Option<&mut TableData> {
+        let canonical = map_key_ci(self.tables.as_ref(), name)?;
+        let map = self.tables_mut();
+        let entry = map.get_mut(&canonical)?;
+        Some(Arc::make_mut(entry))
+    }
+
+    fn entry_temp_table_data_mut(&mut self, name: &str) -> Option<&mut TableData> {
+        let canonical = map_key_ci(self.temp_table_data.as_ref(), name)?;
+        let map = self.temp_table_data_map_mut();
+        let entry = map.get_mut(&canonical)?;
+        Some(Arc::make_mut(entry))
+    }
+
+    fn temp_tables_mut(&mut self) -> &mut BTreeMap<String, TableSchema> {
+        Arc::make_mut(&mut self.temp_tables)
+    }
+
+    fn temp_views_mut(&mut self) -> &mut BTreeMap<String, ViewSchema> {
+        Arc::make_mut(&mut self.temp_views)
+    }
+
+    fn temp_indexes_mut(&mut self) -> &mut BTreeMap<String, IndexSchema> {
+        Arc::make_mut(&mut self.temp_indexes)
+    }
+
+    fn indexes_mut(&mut self) -> &mut BTreeMap<String, Arc<RuntimeIndex>> {
+        Arc::make_mut(&mut self.indexes)
+    }
+
+    /// Read-only access to a runtime index by name (case-sensitive).
+    pub(crate) fn index(&self, name: &str) -> Option<&RuntimeIndex> {
+        self.indexes.get(name).map(|arc| arc.as_ref())
+    }
+
+    /// Targeted copy-on-write access to a single runtime index entry.
+    ///
+    /// Performs `Arc::make_mut` only on the targeted entry (and on the outer
+    /// map), so unrelated indexes are not cloned even when the runtime is
+    /// shared with concurrent readers.
+    pub(crate) fn index_mut(&mut self, name: &str) -> Option<&mut RuntimeIndex> {
+        let map = Arc::make_mut(&mut self.indexes);
+        map.get_mut(name).map(Arc::make_mut)
+    }
+
+    fn cached_payload(&mut self, table_name: &str) -> Option<Arc<Vec<u8>>> {
+        let payload = self.cached_payloads.get(table_name).cloned()?;
+        self.touch_cached_payload(table_name);
+        Some(payload)
+    }
+
+    fn touch_cached_payload(&mut self, table_name: &str) {
+        self.cached_payload_access_order
+            .retain(|key| key != table_name);
+        self.cached_payload_access_order
+            .push_back(table_name.to_string());
+    }
+
+    fn cache_payload_insert(&mut self, table_name: String, payload: Arc<Vec<u8>>) {
+        if self.cached_payloads_max_entries == 0 {
+            return;
+        }
+        self.cache_payload_remove(&table_name);
+        self.cached_payloads.insert(table_name.clone(), payload);
+        self.cached_payload_access_order.push_back(table_name);
+        while self.cached_payloads.len() > self.cached_payloads_max_entries {
+            if let Some(evicted) = self.cached_payload_access_order.pop_front() {
+                self.cached_payloads.remove(&evicted);
+            }
+        }
+    }
+
+    fn cache_payload_remove(&mut self, table_name: &str) {
+        self.cached_payloads.remove(table_name);
+        self.cached_payload_access_order
+            .retain(|key| key != table_name);
     }
 
     pub(crate) fn load_from_storage(
         pager: &PagerHandle,
         wal: &WalHandle,
         schema_cookie: u32,
+        config: &crate::config::DbConfig,
     ) -> Result<(Self, u64)> {
         let reader = wal.begin_reader()?;
         let snapshot_lsn = reader.snapshot_lsn();
@@ -603,7 +721,7 @@ impl EngineRuntime {
                 return Err(DbError::corruption("catalog state checksum mismatch"));
             }
             let mut runtime = if payload.is_empty() {
-                Self::empty(root.schema_cookie)
+                Self::from_config(root.schema_cookie, config)
             } else if payload.starts_with(LEGACY_RUNTIME_PAYLOAD_MAGIC) {
                 let mut runtime = decode_runtime_payload(&payload)?;
                 runtime.mark_all_tables_dirty();
@@ -616,9 +734,10 @@ impl EngineRuntime {
             runtime.root_state = Some(root);
             runtime
         } else {
-            Self::empty(schema_cookie)
+            Self::from_config(schema_cookie, config)
         };
-        runtime.catalog.schema_cookie = schema_cookie;
+        runtime.cached_payloads_max_entries = config.cached_payloads_max_entries;
+        runtime.catalog_mut().schema_cookie = schema_cookie;
         // Materialize any deferred tables under the same reader guard so
         // that overflow pointers from the manifest are read against the
         // same WAL snapshot. If deferred loading uses a later snapshot,
@@ -699,7 +818,7 @@ impl EngineRuntime {
                 ps.row_count = data.rows.len();
                 ps.tail = read_uncompressed_overflow_tail(store, ps.pointer)?.unwrap_or_default();
             }
-            self.tables.insert(table_name.clone(), data);
+            self.tables_mut().insert(table_name.clone(), Arc::new(data));
         }
         self.deferred_tables.clear();
         self.rebuild_indexes(page_size)?;
@@ -729,9 +848,16 @@ impl EngineRuntime {
                     continue;
                 };
                 let canonical_table_name = table.name.clone();
+                let dirty_indices = self.row_update_dirty.get(&canonical_table_name).cloned();
+                let cached_payload = if dirty_indices.is_some() {
+                    self.cached_payload(&canonical_table_name)
+                } else {
+                    None
+                };
                 let data = self.tables.get(&canonical_table_name).ok_or_else(|| {
                     DbError::internal(format!("table data for {table_name} is missing"))
                 })?;
+                let data: &TableData = data.as_ref();
                 let previous_state = self
                     .persisted_tables
                     .get(&canonical_table_name)
@@ -774,7 +900,7 @@ impl EngineRuntime {
                             // Invalidate chain cache — the append path
                             // modified the chain without hashing.
                             self.overflow_chain_caches.remove(&canonical_table_name);
-                            self.cached_payloads.remove(&canonical_table_name);
+                            self.cache_payload_remove(&canonical_table_name);
                             continue;
                         }
                     }
@@ -784,30 +910,30 @@ impl EngineRuntime {
                 //  1. Row-update splice: only re-encode modified rows using cached payload
                 //  2. Append-only: read old payload, append new rows
                 //  3. Full re-encode: encode every row from scratch
-                let (payload, skip_overflow_pages) =
-                    if let Some(dirty_indices) = self.row_update_dirty.get(&canonical_table_name) {
-                        if let Some(cached) = self.cached_payloads.get(&canonical_table_name) {
-                            let splice = splice_updated_rows_payload(cached, data, dirty_indices)?;
-                            // Compute how many leading overflow pages are
-                            // guaranteed identical (their byte ranges fall
-                            // entirely within the unchanged prefix).
-                            let page_size = db.config().page_size as usize;
-                            let chunk_cap = page_size.saturating_sub(OVERFLOW_HEADER_SIZE);
-                            let skip = splice.first_dirty_byte.checked_div(chunk_cap).unwrap_or(0);
-                            (splice.payload, skip)
-                        } else {
-                            (encode_table_payload(data)?, 0)
-                        }
-                    } else if self
-                        .append_only_dirty_tables
-                        .contains(&canonical_table_name)
-                        && previous_pointer.head_page_id != 0
-                    {
-                        let previous_payload = read_overflow(&store, previous_pointer)?;
-                        (append_table_payload(previous_payload, data)?, 0)
+                let (payload, skip_overflow_pages) = if let Some(dirty_indices) = dirty_indices {
+                    if let Some(cached) = cached_payload {
+                        let splice =
+                            splice_updated_rows_payload(cached.as_slice(), data, &dirty_indices)?;
+                        // Compute how many leading overflow pages are
+                        // guaranteed identical (their byte ranges fall
+                        // entirely within the unchanged prefix).
+                        let page_size = db.config().page_size as usize;
+                        let chunk_cap = page_size.saturating_sub(OVERFLOW_HEADER_SIZE);
+                        let skip = splice.first_dirty_byte.checked_div(chunk_cap).unwrap_or(0);
+                        (splice.payload, skip)
                     } else {
                         (encode_table_payload(data)?, 0)
-                    };
+                    }
+                } else if self
+                    .append_only_dirty_tables
+                    .contains(&canonical_table_name)
+                    && previous_pointer.head_page_id != 0
+                {
+                    let previous_payload = read_overflow(&store, previous_pointer)?;
+                    (append_table_payload(previous_payload, data)?, 0)
+                } else {
+                    (encode_table_payload(data)?, 0)
+                };
 
                 let checksum = crc32c_parts(&[payload.as_slice()]);
                 let (pointer, new_chain_cache, tail) = if let Some(chain_cache) =
@@ -842,15 +968,14 @@ impl EngineRuntime {
                         tail,
                     },
                 );
-                self.cached_payloads
-                    .insert(canonical_table_name, Arc::new(payload));
+                self.cache_payload_insert(canonical_table_name, Arc::new(payload));
             }
             for table_name in removed_tables {
                 let Some(state) = self.persisted_tables.remove(&table_name) else {
                     continue;
                 };
                 self.overflow_chain_caches.remove(&table_name);
-                self.cached_payloads.remove(&table_name);
+                self.cache_payload_remove(&table_name);
                 if state.pointer.head_page_id != 0 {
                     free_overflow(&mut store, state.pointer.head_page_id)?;
                 }
@@ -959,8 +1084,8 @@ impl EngineRuntime {
                 {
                     continue;
                 }
-                let payload = if let Some(cached) = self.cached_payloads.get(&table_name) {
-                    Arc::clone(cached)
+                let payload = if let Some(cached) = self.cached_payload(&table_name) {
+                    cached
                 } else {
                     Arc::new(read_overflow(&store, previous_pointer)?)
                 };
@@ -987,7 +1112,7 @@ impl EngineRuntime {
                         tail,
                     },
                 );
-                self.cached_payloads.insert(table_name.clone(), payload);
+                self.cache_payload_insert(table_name.clone(), payload);
                 self.overflow_chain_caches.remove(&table_name);
             }
         }
@@ -1084,8 +1209,8 @@ impl EngineRuntime {
     }
 
     pub(super) fn planner_catalog(&self) -> CatalogState {
-        let mut catalog = self.catalog.clone();
-        for (name, table) in &self.temp_tables {
+        let mut catalog = self.catalog.as_ref().clone();
+        for (name, table) in self.temp_tables.iter() {
             catalog.views.remove(name);
             catalog.tables.insert(name.clone(), table.clone());
             catalog
@@ -1096,7 +1221,7 @@ impl EngineRuntime {
                 .retain(|_, trigger| !identifiers_equal(&trigger.target_name, name));
             catalog.table_stats.remove(name);
         }
-        for (name, view) in &self.temp_views {
+        for (name, view) in self.temp_views.iter() {
             catalog.tables.remove(name);
             catalog.views.insert(name.clone(), view.clone());
             catalog
@@ -1115,15 +1240,15 @@ impl EngineRuntime {
     }
 
     pub(super) fn temp_table_schema_mut(&mut self, name: &str) -> Option<&mut TableSchema> {
-        map_get_ci_mut(&mut self.temp_tables, name)
+        map_get_ci_mut(self.temp_tables_mut(), name)
     }
 
     pub(super) fn temp_table_data(&self, name: &str) -> Option<&TableData> {
-        map_get_ci(&self.temp_table_data, name)
+        map_get_ci(&self.temp_table_data, name).map(|arc| arc.as_ref())
     }
 
     pub(super) fn temp_table_data_mut(&mut self, name: &str) -> Option<&mut TableData> {
-        map_get_ci_mut(&mut self.temp_table_data, name)
+        self.entry_temp_table_data_mut(name)
     }
 
     pub(super) fn temp_view(&self, name: &str) -> Option<&ViewSchema> {
@@ -1167,7 +1292,8 @@ impl EngineRuntime {
     }
 
     pub(super) fn catalog_table_mut(&mut self, name: &str) -> Option<&mut TableSchema> {
-        map_get_ci_mut(&mut self.catalog.tables, name)
+        let catalog = self.catalog_mut();
+        map_get_ci_mut(&mut catalog.tables, name)
     }
 
     pub(super) fn canonical_catalog_table_name(&self, name: &str) -> Option<String> {
@@ -1186,7 +1312,7 @@ impl EngineRuntime {
             return self.temp_table_data(&table.name);
         }
         let table_name = self.catalog.table(name)?.name.clone();
-        self.tables.get(&table_name)
+        self.tables.get(&table_name).map(|arc| arc.as_ref())
     }
 
     pub(super) fn table_data(&self, name: &str) -> Option<&TableData> {
@@ -1228,7 +1354,7 @@ impl EngineRuntime {
         if self.temp_table_schema(name).is_some() {
             return self.temp_table_data_mut(name);
         }
-        map_get_ci_mut(&mut self.tables, name)
+        self.entry_table_data_mut(name)
     }
 
     pub(super) fn table_data_mut(&mut self, name: &str) -> Option<&mut TableData> {
@@ -1237,15 +1363,15 @@ impl EngineRuntime {
 
     pub(crate) fn rebuild_indexes(&mut self, page_size: u32) -> Result<()> {
         let indexes = self.catalog.indexes.values().cloned().collect::<Vec<_>>();
-        let mut rebuilt = BTreeMap::new();
+        let mut rebuilt: BTreeMap<String, Arc<RuntimeIndex>> = BTreeMap::new();
         for index in indexes {
             rebuilt.insert(
                 index.name.clone(),
-                build_runtime_index(&index, self, page_size)?,
+                Arc::new(build_runtime_index(&index, self, page_size)?),
             );
         }
-        self.indexes = rebuilt;
-        for index in self.catalog.indexes.values_mut() {
+        *self.indexes_mut() = rebuilt;
+        for index in self.catalog_mut().indexes.values_mut() {
             index.fresh = true;
         }
         self.index_state_epoch = self.index_state_epoch.wrapping_add(1);
@@ -1255,15 +1381,13 @@ impl EngineRuntime {
     pub(crate) fn rebuild_index(&mut self, name: &str, page_size: u32) -> Result<()> {
         let index = self
             .catalog
-            .indexes
-            .get(name)
+            .index(name)
             .cloned()
             .ok_or_else(|| DbError::sql(format!("unknown index {name}")))?;
-        self.indexes.insert(
-            name.to_string(),
-            build_runtime_index(&index, self, page_size)?,
-        );
-        if let Some(index) = self.catalog.indexes.get_mut(name) {
+        let rebuilt = build_runtime_index(&index, self, page_size)?;
+        self.indexes_mut()
+            .insert(name.to_string(), Arc::new(rebuilt));
+        if let Some(index) = self.catalog_mut().indexes.get_mut(name) {
             index.fresh = true;
         }
         self.index_state_epoch = self.index_state_epoch.wrapping_add(1);
@@ -1298,7 +1422,7 @@ impl EngineRuntime {
             return;
         }
         let mut changed = false;
-        for index in self.catalog.indexes.values_mut() {
+        for index in self.catalog_mut().indexes.values_mut() {
             if identifiers_equal(&index.table_name, table_name) && index.fresh {
                 index.fresh = false;
                 changed = true;
@@ -1444,40 +1568,36 @@ impl EngineRuntime {
     ) -> Result<()> {
         for update in updates {
             match update {
-                PendingIndexInsert::Btree { name, key, row_id } => {
-                    match self.indexes.get_mut(&name) {
-                        Some(RuntimeIndex::Btree { keys }) => {
-                            keys.insert_row_id(key, row_id)?;
-                        }
-                        Some(_) => {
-                            return Err(DbError::internal(format!(
-                                "runtime index {name} is not a BTREE index"
-                            )))
-                        }
-                        None => {
-                            return Err(DbError::internal(format!(
-                                "runtime index {name} is missing"
-                            )))
-                        }
+                PendingIndexInsert::Btree { name, key, row_id } => match self.index_mut(&name) {
+                    Some(RuntimeIndex::Btree { keys }) => {
+                        keys.insert_row_id(key, row_id)?;
                     }
-                }
-                PendingIndexInsert::Trigram { name, row_id, text } => {
-                    match self.indexes.get_mut(&name) {
-                        Some(RuntimeIndex::Trigram { index }) => {
-                            index.queue_insert(row_id, &text);
-                        }
-                        Some(_) => {
-                            return Err(DbError::internal(format!(
-                                "runtime index {name} is not a trigram index"
-                            )))
-                        }
-                        None => {
-                            return Err(DbError::internal(format!(
-                                "runtime index {name} is missing"
-                            )))
-                        }
+                    Some(_) => {
+                        return Err(DbError::internal(format!(
+                            "runtime index {name} is not a BTREE index"
+                        )))
                     }
-                }
+                    None => {
+                        return Err(DbError::internal(format!(
+                            "runtime index {name} is missing"
+                        )))
+                    }
+                },
+                PendingIndexInsert::Trigram { name, row_id, text } => match self.index_mut(&name) {
+                    Some(RuntimeIndex::Trigram { index }) => {
+                        index.queue_insert(row_id, &text);
+                    }
+                    Some(_) => {
+                        return Err(DbError::internal(format!(
+                            "runtime index {name} is not a trigram index"
+                        )))
+                    }
+                    None => {
+                        return Err(DbError::internal(format!(
+                            "runtime index {name} is missing"
+                        )))
+                    }
+                },
             }
         }
         Ok(())
@@ -1680,7 +1800,7 @@ impl EngineRuntime {
         let table_name = statement.table_name.clone();
         let temporary = self.visible_table_is_temporary(&table_name);
         let mut affected_rows = 0_u64;
-        for source_row in source.rows.drain(..) {
+        for source_row in source.take_rows() {
             let candidate = {
                 let mut staged_table = self
                     .table_schema(&table_name)
@@ -1698,7 +1818,7 @@ impl EngineRuntime {
                         .ok_or_else(|| DbError::sql(format!("unknown table {}", table_name)))?
                         .next_row_id = staged_table.next_row_id;
                 } else {
-                    self.catalog
+                    self.catalog_mut()
                         .tables
                         .get_mut(&table_name)
                         .ok_or_else(|| DbError::sql(format!("unknown table {}", table_name)))?
@@ -2287,8 +2407,7 @@ impl EngineRuntime {
             &BTreeMap::new(),
             None,
         )?;
-        let Some(RuntimeIndex::Btree { keys: filter_keys }) = self.indexes.get(&filter_index.name)
-        else {
+        let Some(RuntimeIndex::Btree { keys: filter_keys }) = self.index(&filter_index.name) else {
             return Ok(None);
         };
         let filtered_join_index = filtered_schema
@@ -2324,7 +2443,7 @@ impl EngineRuntime {
             return Ok(None);
         }
         let keys = if let Some(index) = probe_index {
-            let Some(RuntimeIndex::Btree { keys }) = self.indexes.get(&index.name) else {
+            let Some(RuntimeIndex::Btree { keys }) = self.index(&index.name) else {
                 return Ok(None);
             };
             Some(keys)
@@ -3213,7 +3332,7 @@ impl EngineRuntime {
                     .is_some_and(|index_column| identifiers_equal(index_column, column_name))
                 && index.columns[0].expression_sql.is_none()
         })?;
-        let RuntimeIndex::Btree { keys } = self.indexes.get(&index.name)? else {
+        let RuntimeIndex::Btree { keys } = self.index(&index.name)? else {
             return None;
         };
         Some(keys)
@@ -3258,7 +3377,7 @@ impl EngineRuntime {
                 ))
             })?
             .unwrap_or(0);
-        self.catalog
+        self.catalog_mut()
             .table_stats
             .insert(table_name.to_string(), TableStats { row_count });
 
@@ -3270,14 +3389,14 @@ impl EngineRuntime {
             .map(|index| index.name.clone())
             .collect::<Vec<_>>();
         for index_name in index_names {
-            self.catalog.index_stats.remove(&index_name);
+            self.catalog_mut().index_stats.remove(&index_name);
             let Some(index) = self.catalog.index(&index_name).cloned() else {
                 continue;
             };
             if index.kind != IndexKind::Btree {
                 continue;
             }
-            let Some(RuntimeIndex::Btree { keys }) = self.indexes.get(&index.name) else {
+            let Some(RuntimeIndex::Btree { keys }) = self.index(&index.name) else {
                 continue;
             };
             let entry_count = i64::try_from(keys.total_row_id_count()).map_err(|_| {
@@ -3292,7 +3411,7 @@ impl EngineRuntime {
                     index.name
                 ))
             })?;
-            self.catalog.index_stats.insert(
+            self.catalog_mut().index_stats.insert(
                 index.name.clone(),
                 IndexStats {
                     entry_count,
@@ -3657,7 +3776,7 @@ impl EngineRuntime {
         }) else {
             return Ok(None);
         };
-        let Some(RuntimeIndex::Btree { keys }) = self.indexes.get(&index.name) else {
+        let Some(RuntimeIndex::Btree { keys }) = self.index(&index.name) else {
             return Ok(None);
         };
         let row_ids = keys.row_ids_for_value_set(&value)?;
@@ -3788,7 +3907,7 @@ impl EngineRuntime {
             let rows = if start >= dataset.rows.len() {
                 Vec::new()
             } else {
-                let iter = dataset.rows.into_iter().skip(start);
+                let iter = dataset.take_rows().into_iter().skip(start);
                 match limit {
                     Some(limit) => iter
                         .take(usize::try_from(limit.max(0)).unwrap_or(0))
@@ -3796,7 +3915,7 @@ impl EngineRuntime {
                     None => iter.collect(),
                 }
             };
-            dataset.rows = rows;
+            dataset.set_rows(rows);
         }
         Ok(dataset)
     }
@@ -3847,7 +3966,8 @@ impl EngineRuntime {
 
         let mut anchor = self.evaluate_query_body(left, params, inherited_ctes)?;
         if !all {
-            anchor.rows = deduplicate_rows(anchor.rows)?;
+            let rows = anchor.take_rows();
+            anchor.set_rows(deduplicate_rows(rows)?);
         }
         let mut result = prepare_cte_dataset(cte, anchor)?;
         let mut working = result.clone();
@@ -3886,7 +4006,7 @@ impl EngineRuntime {
 
             let next_rows = if let Some(seen) = &mut seen {
                 let mut rows = Vec::new();
-                for row in recursive_rows.rows {
+                for row in recursive_rows.into_rows() {
                     let identity = row_identity(&row)?;
                     if seen.insert(identity) {
                         rows.push(row);
@@ -3894,15 +4014,15 @@ impl EngineRuntime {
                 }
                 rows
             } else {
-                recursive_rows.rows
+                recursive_rows.into_rows()
             };
 
             if next_rows.is_empty() {
                 return Ok(result);
             }
 
-            result.rows.extend(next_rows.clone());
-            working.rows = next_rows;
+            result.rows_mut().extend(next_rows.clone());
+            working.set_rows(next_rows);
         }
 
         Err(DbError::sql(format!(
@@ -4017,7 +4137,7 @@ impl EngineRuntime {
             let rows = if start >= dataset.rows.len() {
                 Vec::new()
             } else {
-                let iter = dataset.rows.into_iter().skip(start);
+                let iter = dataset.take_rows().into_iter().skip(start);
                 match limit {
                     Some(limit) => iter
                         .take(usize::try_from(limit.max(0)).unwrap_or(0))
@@ -4025,7 +4145,7 @@ impl EngineRuntime {
                     None => iter.collect(),
                 }
             };
-            dataset.rows = rows;
+            dataset.set_rows(rows);
         }
         Ok(dataset)
     }
@@ -4134,17 +4254,14 @@ impl EngineRuntime {
             return Ok(dataset);
         }
 
-        let columns = dataset.columns;
+        let Dataset { columns, rows } = dataset;
         let rows = if select.distinct_on.is_empty() {
-            deduplicate_rows_stable(dataset.rows)?
+            deduplicate_rows_stable(Arc::unwrap_or_clone(rows))?
         } else {
-            let key_dataset = Dataset {
-                columns: columns.clone(),
-                rows: Vec::new(),
-            };
+            let key_dataset = Dataset::with_rows(columns.clone(), Vec::new());
             let mut seen = BTreeSet::new();
             let mut distinct_rows = Vec::new();
-            for row in dataset.rows {
+            for row in Arc::unwrap_or_clone(rows) {
                 let key = select
                     .distinct_on
                     .iter()
@@ -4157,7 +4274,7 @@ impl EngineRuntime {
             distinct_rows
         };
 
-        Ok(Dataset { columns, rows })
+        Ok(Dataset::with_rows(columns, rows))
     }
 
     fn build_select_dataset(
@@ -4184,11 +4301,8 @@ impl EngineRuntime {
         };
 
         if let Some(filter) = &select.filter {
-            let filter_dataset = Dataset {
-                columns: dataset.columns.clone(),
-                rows: Vec::new(),
-            };
-            dataset.rows.retain(|row| {
+            let filter_dataset = Dataset::with_rows(dataset.columns.clone(), Vec::new());
+            dataset.rows_mut().retain(|row| {
                 matches!(
                     self.eval_expr(filter, &filter_dataset, row, params, ctes, None),
                     Ok(Value::Bool(true))
@@ -4212,11 +4326,8 @@ impl EngineRuntime {
 
         dataset = augment_dataset_with_outer_scope(dataset, outer_dataset, outer_row);
         if let Some(filter) = &select.filter {
-            let filter_dataset = Dataset {
-                columns: dataset.columns.clone(),
-                rows: Vec::new(),
-            };
-            dataset.rows.retain(|row| {
+            let filter_dataset = Dataset::with_rows(dataset.columns.clone(), Vec::new());
+            dataset.rows_mut().retain(|row| {
                 matches!(
                     self.eval_expr(filter, &filter_dataset, row, params, ctes, None),
                     Ok(Value::Bool(true))
@@ -4235,10 +4346,7 @@ impl EngineRuntime {
         scope_row: &[Value],
     ) -> Result<Dataset> {
         if from.is_empty() {
-            return Ok(Dataset {
-                columns: Vec::new(),
-                rows: vec![Vec::new()],
-            });
+            return Ok(Dataset::with_rows(Vec::new(), vec![Vec::new()]));
         }
         let mut iter = from.iter();
         let cross_constraint = JoinConstraint::On(Expr::Literal(Value::Bool(true)));
@@ -4329,7 +4437,7 @@ impl EngineRuntime {
             }) {
                 let value =
                     self.eval_expr(value_expr, &Dataset::empty(), &[], params, ctes, None)?;
-                if let Some(RuntimeIndex::Btree { keys }) = self.indexes.get(&index.name) {
+                if let Some(RuntimeIndex::Btree { keys }) = self.index(&index.name) {
                     let row_ids = keys.row_ids_for_value_set(&value)?;
                     return self
                         .dataset_from_row_id_set(table, data, alias, row_ids)
@@ -4355,7 +4463,7 @@ impl EngineRuntime {
                 let pattern =
                     self.eval_expr(pattern_expr, &Dataset::empty(), &[], params, ctes, None)?;
                 if let Value::Text(pattern) = pattern {
-                    if let Some(RuntimeIndex::Trigram { index }) = self.indexes.get(&index.name) {
+                    if let Some(RuntimeIndex::Trigram { index }) = self.index(&index.name) {
                         if !index.planner_may_use_index() {
                             return Ok(None);
                         }
@@ -4438,10 +4546,7 @@ impl EngineRuntime {
                 .collect::<Result<Vec<_>>>()?;
             result_rows.push(values);
         }
-        Ok(Dataset {
-            columns,
-            rows: result_rows,
-        })
+        Ok(Dataset::with_rows(columns, result_rows))
     }
 
     fn try_indexed_join(
@@ -4711,7 +4816,7 @@ impl EngineRuntime {
         };
 
         let value = self.eval_expr(value_expr, &Dataset::empty(), &[], params, ctes, None)?;
-        let Some(RuntimeIndex::Btree { keys }) = self.indexes.get(&index.name) else {
+        let Some(RuntimeIndex::Btree { keys }) = self.index(&index.name) else {
             return Ok(None);
         };
         let row_ids = keys.row_ids_for_value_set(&value)?;
@@ -4768,7 +4873,7 @@ impl EngineRuntime {
             return Ok(None);
         }
         let keys = if let Some(index) = probe_index {
-            let Some(RuntimeIndex::Btree { keys }) = self.indexes.get(&index.name) else {
+            let Some(RuntimeIndex::Btree { keys }) = self.index(&index.name) else {
                 return Ok(None);
             };
             Some(keys)
@@ -4811,7 +4916,7 @@ impl EngineRuntime {
             columns.extend(plan.filtered_dataset.columns.clone());
         }
         let mut rows = Vec::new();
-        for filtered_row in &plan.filtered_dataset.rows {
+        for filtered_row in plan.filtered_dataset.rows.iter() {
             let Some(join_value) = filtered_row.get(filtered_join_index) else {
                 return Err(DbError::internal(
                     "join row is shorter than filtered table schema",
@@ -4853,7 +4958,7 @@ impl EngineRuntime {
                 rows.push(row);
             });
         }
-        Ok(Some(Dataset { columns, rows }))
+        Ok(Some(Dataset::with_rows(columns, rows)))
     }
 
     /// Indexed equi-join probe path.
@@ -4958,7 +5063,7 @@ impl EngineRuntime {
             return Ok(None);
         }
         let keys = if let Some(index) = probe_index {
-            let Some(RuntimeIndex::Btree { keys }) = self.indexes.get(&index.name) else {
+            let Some(RuntimeIndex::Btree { keys }) = self.index(&index.name) else {
                 return Ok(None);
             };
             Some(keys)
@@ -4986,7 +5091,7 @@ impl EngineRuntime {
         let right_column_count = right_table.columns.len();
         let is_left_outer = matches!(kind, JoinKind::Left);
         let mut rows = Vec::new();
-        for left_row in &left.rows {
+        for left_row in left.rows.iter() {
             let Some(join_value) = left_row.get(left_join_index) else {
                 return Err(DbError::internal(
                     "join row is shorter than the left input schema",
@@ -5033,7 +5138,7 @@ impl EngineRuntime {
                 rows.push(row);
             }
         }
-        Ok(Some(Dataset { columns, rows }))
+        Ok(Some(Dataset::with_rows(columns, rows)))
     }
 
     fn evaluate_from_item(
@@ -5056,13 +5161,13 @@ impl EngineRuntime {
         match item {
             FromItem::Table { name, alias } => {
                 if let Some(dataset) = ctes.get(name) {
-                    let mut dataset = dataset.clone();
+                    let mut columns = dataset.columns.clone();
                     if let Some(alias) = alias {
-                        for column in &mut dataset.columns {
+                        for column in &mut columns {
                             column.table = Some(alias.clone());
                         }
                     }
-                    return Ok(dataset);
+                    return Ok(dataset.share_rows(columns));
                 }
                 if let Some(view) = self.visible_view(name, NameResolutionScope::Session) {
                     let view_statement = parse_sql_statement(&view.sql_text)?;
@@ -5096,8 +5201,8 @@ impl EngineRuntime {
                     .table_data_for_schema(table, name)
                     .map(|data| data.map(Cow::into_owned))?
                     .unwrap_or_default();
-                Ok(Dataset {
-                    columns: table
+                Ok(Dataset::with_rows(
+                    table
                         .columns
                         .iter()
                         .map(|column| {
@@ -5107,8 +5212,8 @@ impl EngineRuntime {
                             )
                         })
                         .collect(),
-                    rows: data.rows.into_iter().map(|row| row.values).collect(),
-                })
+                    data.rows.into_iter().map(|row| row.values).collect(),
+                ))
             }
             FromItem::Subquery {
                 query,
@@ -5216,11 +5321,8 @@ impl EngineRuntime {
 
         let mut columns = left.columns.clone();
         let mut rows = Vec::new();
-        for left_row in &left.rows {
-            let left_single = Dataset {
-                columns: left.columns.clone(),
-                rows: vec![left_row.clone()],
-            };
+        for left_row in left.rows.iter() {
+            let left_single = Dataset::with_rows(left.columns.clone(), vec![left_row.clone()]);
             let scope_with_left =
                 augment_dataset_with_outer_scope(left_single.clone(), scope_dataset, scope_row);
             let scope_values = scope_with_left
@@ -5238,9 +5340,9 @@ impl EngineRuntime {
             let joined =
                 nested_loop_join(left_single, right, kind, constraint, self, params, ctes)?;
             columns = joined.columns.clone();
-            rows.extend(joined.rows);
+            rows.extend(joined.into_rows());
         }
-        Ok(Dataset { columns, rows })
+        Ok(Dataset::with_rows(columns, rows))
     }
 
     fn evaluate_table_function(
@@ -5287,7 +5389,7 @@ impl EngineRuntime {
         if recursive {
             columns.push(ColumnBinding::visible(Some(table_name), "path".to_string()));
         }
-        Ok(Dataset { columns, rows })
+        Ok(Dataset::with_rows(columns, rows))
     }
 
     fn dataset_from_row_id_set(
@@ -5304,14 +5406,14 @@ impl EngineRuntime {
                 rows.push(row.values.clone());
             }
         });
-        Ok(Dataset {
-            columns: table
+        Ok(Dataset::with_rows(
+            table
                 .columns
                 .iter()
                 .map(|column| ColumnBinding::visible(Some(table_name.clone()), column.name.clone()))
                 .collect(),
             rows,
-        })
+        ))
     }
 }
 
@@ -5363,7 +5465,7 @@ impl PageStore for SnapshotPageStore<'_> {
 
     fn read_page(&self, page_id: PageId) -> Result<Arc<[u8]>> {
         if let Some(page) = self.wal.read_page_at_snapshot(page_id, self.snapshot_lsn)? {
-            Ok(Arc::from(page))
+            Ok(page)
         } else {
             self.pager.read_page(page_id)
         }
@@ -5417,7 +5519,7 @@ fn augment_dataset_with_outer_scope(
     }
 
     dataset.columns.extend(outer_dataset.columns.clone());
-    for row in &mut dataset.rows {
+    for row in dataset.rows_mut() {
         row.extend_from_slice(outer_row);
     }
     dataset
@@ -6113,14 +6215,14 @@ pub(super) fn row_satisfies_index_predicate(
 }
 
 pub(super) fn table_row_dataset(table: &TableSchema, row: &[Value], table_name: &str) -> Dataset {
-    Dataset {
-        columns: table
+    Dataset::with_rows(
+        table
             .columns
             .iter()
             .map(|column| ColumnBinding::visible(Some(table_name.to_string()), column.name.clone()))
             .collect(),
-        rows: vec![row.to_vec()],
-    }
+        vec![row.to_vec()],
+    )
 }
 
 fn decode_root_header(page_bytes: &[u8]) -> Result<Option<RootHeader>> {
@@ -6200,7 +6302,11 @@ fn encode_runtime_payload(runtime: &EngineRuntime) -> Result<Vec<u8>> {
         }
         encode_strings(&mut output, &table.primary_key_columns)?;
         encode_i64(&mut output, table.next_row_id);
-        let data = runtime.tables.get(&table.name).cloned().unwrap_or_default();
+        let data = runtime
+            .tables
+            .get(&table.name)
+            .map(|arc| (**arc).clone())
+            .unwrap_or_default();
         encode_u32(&mut output, data.rows.len() as u32);
         for row in data.rows {
             encode_i64(&mut output, row.row_id);
@@ -6327,8 +6433,11 @@ fn decode_runtime_payload(bytes: &[u8]) -> Result<EngineRuntime> {
                 values: row.into_values(),
             });
         }
-        runtime.catalog.tables.insert(table_name.clone(), table);
-        runtime.tables.insert(table_name, data);
+        runtime
+            .catalog_mut()
+            .tables
+            .insert(table_name.clone(), table);
+        runtime.tables_mut().insert(table_name, Arc::new(data));
     }
 
     let index_count = cursor.read_u32()?;
@@ -6347,7 +6456,7 @@ fn decode_runtime_payload(bytes: &[u8]) -> Result<EngineRuntime> {
         }
         let predicate_sql = cursor.read_optional_string()?;
         let fresh = cursor.read_bool()?;
-        runtime.catalog.indexes.insert(
+        runtime.catalog_mut().indexes.insert(
             name.clone(),
             crate::catalog::IndexSchema {
                 name,
@@ -6370,7 +6479,7 @@ fn decode_runtime_payload(bytes: &[u8]) -> Result<EngineRuntime> {
             column_names: cursor.read_strings()?,
             dependencies: cursor.read_strings()?,
         };
-        runtime.catalog.views.insert(view.name.clone(), view);
+        runtime.catalog_mut().views.insert(view.name.clone(), view);
     }
 
     let trigger_count = cursor.read_u32()?;
@@ -6384,18 +6493,18 @@ fn decode_runtime_payload(bytes: &[u8]) -> Result<EngineRuntime> {
             action_sql: cursor.read_string()?,
         };
         runtime
-            .catalog
+            .catalog_mut()
             .triggers
             .insert(trigger.name.clone(), trigger);
     }
     if cursor.offset < cursor.bytes.len() {
-        decode_schemas_section(&mut cursor, &mut runtime.catalog.schemas)?;
+        decode_schemas_section(&mut cursor, &mut runtime.catalog_mut().schemas)?;
     }
     if cursor.offset < cursor.bytes.len() {
-        decode_index_include_columns_section(&mut cursor, &mut runtime.catalog.indexes)?;
+        decode_index_include_columns_section(&mut cursor, &mut runtime.catalog_mut().indexes)?;
     }
     if cursor.offset < cursor.bytes.len() {
-        decode_generated_columns_section(&mut cursor, &mut runtime.catalog.tables)?;
+        decode_generated_columns_section(&mut cursor, &mut runtime.catalog_mut().tables)?;
     }
     Ok(runtime)
 }
@@ -6641,7 +6750,10 @@ fn decode_manifest_payload<S: PageStore>(_store: &S, bytes: &[u8]) -> Result<Eng
             row_count: 0,
             tail: OverflowTailInfo::default(),
         };
-        runtime.catalog.tables.insert(table_name.clone(), table);
+        runtime
+            .catalog_mut()
+            .tables
+            .insert(table_name.clone(), table);
         let has_data = state.pointer.head_page_id != 0 && state.pointer.logical_len != 0;
         if has_data {
             // Defer row data loading to first statement execution.
@@ -6650,7 +6762,9 @@ fn decode_manifest_payload<S: PageStore>(_store: &S, bytes: &[u8]) -> Result<Eng
         runtime.persisted_tables.insert(table_name.clone(), state);
         if !has_data {
             // Empty tables are immediately available.
-            runtime.tables.insert(table_name, TableData::default());
+            runtime
+                .tables_mut()
+                .insert(table_name, Arc::new(TableData::default()));
         }
     }
 
@@ -6670,7 +6784,7 @@ fn decode_manifest_payload<S: PageStore>(_store: &S, bytes: &[u8]) -> Result<Eng
         }
         let predicate_sql = cursor.read_optional_string()?;
         let fresh = cursor.read_bool()?;
-        runtime.catalog.indexes.insert(
+        runtime.catalog_mut().indexes.insert(
             name.clone(),
             crate::catalog::IndexSchema {
                 name,
@@ -6693,7 +6807,7 @@ fn decode_manifest_payload<S: PageStore>(_store: &S, bytes: &[u8]) -> Result<Eng
             column_names: cursor.read_strings()?,
             dependencies: cursor.read_strings()?,
         };
-        runtime.catalog.views.insert(view.name.clone(), view);
+        runtime.catalog_mut().views.insert(view.name.clone(), view);
     }
 
     let trigger_count = cursor.read_u32()?;
@@ -6707,7 +6821,7 @@ fn decode_manifest_payload<S: PageStore>(_store: &S, bytes: &[u8]) -> Result<Eng
             action_sql: cursor.read_string()?,
         };
         runtime
-            .catalog
+            .catalog_mut()
             .triggers
             .insert(trigger.name.clone(), trigger);
     }
@@ -6718,7 +6832,7 @@ fn decode_manifest_payload<S: PageStore>(_store: &S, bytes: &[u8]) -> Result<Eng
             let stats = crate::catalog::TableStats {
                 row_count: cursor.read_i64()?,
             };
-            runtime.catalog.table_stats.insert(name, stats);
+            runtime.catalog_mut().table_stats.insert(name, stats);
         }
     }
     if cursor.offset < cursor.bytes.len() {
@@ -6729,17 +6843,17 @@ fn decode_manifest_payload<S: PageStore>(_store: &S, bytes: &[u8]) -> Result<Eng
                 entry_count: cursor.read_i64()?,
                 distinct_key_count: cursor.read_i64()?,
             };
-            runtime.catalog.index_stats.insert(name, stats);
+            runtime.catalog_mut().index_stats.insert(name, stats);
         }
     }
     if cursor.offset < cursor.bytes.len() {
-        decode_schemas_section(&mut cursor, &mut runtime.catalog.schemas)?;
+        decode_schemas_section(&mut cursor, &mut runtime.catalog_mut().schemas)?;
     }
     if cursor.offset < cursor.bytes.len() {
-        decode_index_include_columns_section(&mut cursor, &mut runtime.catalog.indexes)?;
+        decode_index_include_columns_section(&mut cursor, &mut runtime.catalog_mut().indexes)?;
     }
     if cursor.offset < cursor.bytes.len() {
-        decode_generated_columns_section(&mut cursor, &mut runtime.catalog.tables)?;
+        decode_generated_columns_section(&mut cursor, &mut runtime.catalog_mut().tables)?;
     }
     Ok(runtime)
 }
@@ -7374,13 +7488,13 @@ impl<'a> Cursor<'a> {
 }
 
 fn dataset_to_result(dataset: Dataset) -> QueryResult {
+    let Dataset { columns, rows } = dataset;
     QueryResult::with_rows(
-        dataset
-            .columns
+        columns.into_iter().map(|binding| binding.name).collect(),
+        Arc::unwrap_or_clone(rows)
             .into_iter()
-            .map(|binding| binding.name)
+            .map(QueryRow::new)
             .collect(),
-        dataset.rows.into_iter().map(QueryRow::new).collect(),
     )
 }
 
@@ -8157,7 +8271,7 @@ fn try_project_simple_select_items(
     }
 
     let mut output_rows = Vec::with_capacity(dataset.rows.len());
-    for row in &dataset.rows {
+    for row in dataset.rows.iter() {
         let mut output_row = Vec::with_capacity(projection_plan.len());
         for source_index in &projection_plan {
             let value = row
@@ -8167,10 +8281,7 @@ fn try_project_simple_select_items(
         }
         output_rows.push(output_row);
     }
-    Ok(Some(Dataset {
-        columns: output_columns,
-        rows: output_rows,
-    }))
+    Ok(Some(Dataset::with_rows(output_columns, output_rows)))
 }
 
 fn simple_trigram_lookup(filter: &Expr) -> Option<(&str, &Expr, bool)> {
@@ -8482,10 +8593,7 @@ fn nested_loop_join(
 
     let mut eval_columns = left.columns.clone();
     eval_columns.extend(right.columns.clone());
-    let eval_dataset = Dataset {
-        columns: eval_columns,
-        rows: Vec::new(),
-    };
+    let eval_dataset = Dataset::with_rows(eval_columns, Vec::new());
     let eval_context = JoinEvalContext {
         dataset: &eval_dataset,
         runtime,
@@ -8497,7 +8605,7 @@ fn nested_loop_join(
     let mut matched_right = vec![false; right.rows.len()];
     let left_nulls = vec![Value::Null; left.columns.len()];
     let right_nulls = vec![Value::Null; right.columns.len()];
-    for left_row in &left.rows {
+    for left_row in left.rows.iter() {
         let mut matched = false;
         for (right_index, right_row) in right.rows.iter().enumerate() {
             let mut eval_row = left_row.clone();
@@ -8520,13 +8628,13 @@ fn nested_loop_join(
         }
     }
     if matches!(kind, JoinKind::Right | JoinKind::Full) {
-        for (matched, right_row) in matched_right.iter().zip(&right.rows) {
+        for (matched, right_row) in matched_right.iter().zip(right.rows.iter()) {
             if !matched {
                 rows.push(join_output_row(&left_nulls, right_row, &using_columns)?);
             }
         }
     }
-    Ok(Dataset { columns, rows })
+    Ok(Dataset::with_rows(columns, rows))
 }
 
 impl EngineRuntime {
@@ -8543,10 +8651,12 @@ impl EngineRuntime {
             ));
         }
         let columns = left.columns.clone();
+        let left_rows = left.into_rows();
+        let right_rows = right.into_rows();
         let rows = match op {
             crate::sql::ast::SetOperation::Union => {
-                let mut rows = left.rows;
-                rows.extend(right.rows);
+                let mut rows = left_rows;
+                rows.extend(right_rows);
                 if !all {
                     deduplicate_rows(rows)?
                 } else {
@@ -8554,18 +8664,18 @@ impl EngineRuntime {
                 }
             }
             crate::sql::ast::SetOperation::Intersect => {
-                let right_counts = count_row_identities(&right.rows)?;
+                let right_counts = count_row_identities(&right_rows)?;
                 let mut rows = Vec::new();
                 if all {
                     let mut remaining = right_counts;
-                    for row in left.rows {
+                    for row in left_rows {
                         let identity = row_identity(&row)?;
                         if consume_row_identity_count(&mut remaining, &identity) {
                             rows.push(row);
                         }
                     }
                 } else {
-                    for row in left.rows {
+                    for row in left_rows {
                         let identity = row_identity(&row)?;
                         if right_counts.contains_key(&identity) {
                             rows.push(row);
@@ -8576,18 +8686,18 @@ impl EngineRuntime {
                 rows
             }
             crate::sql::ast::SetOperation::Except => {
-                let right_counts = count_row_identities(&right.rows)?;
+                let right_counts = count_row_identities(&right_rows)?;
                 let mut rows = Vec::new();
                 if all {
                     let mut remaining = right_counts;
-                    for row in left.rows {
+                    for row in left_rows {
                         let identity = row_identity(&row)?;
                         if !consume_row_identity_count(&mut remaining, &identity) {
                             rows.push(row);
                         }
                     }
                 } else {
-                    for row in left.rows {
+                    for row in left_rows {
                         let identity = row_identity(&row)?;
                         if !right_counts.contains_key(&identity) {
                             rows.push(row);
@@ -8598,7 +8708,7 @@ impl EngineRuntime {
                 rows
             }
         };
-        Ok(Dataset { columns, rows })
+        Ok(Dataset::with_rows(columns, rows))
     }
 
     fn project_dataset(
@@ -8724,7 +8834,7 @@ impl EngineRuntime {
             }
             rows.push(output);
         }
-        Ok(Dataset { columns, rows })
+        Ok(Dataset::with_rows(columns, rows))
     }
 
     fn compute_row_number_values(
@@ -9640,7 +9750,7 @@ impl EngineRuntime {
             }
             rows.push(output);
         }
-        Ok(Dataset { columns, rows })
+        Ok(Dataset::with_rows(columns, rows))
     }
 
     fn sort_dataset(
@@ -9653,10 +9763,7 @@ impl EngineRuntime {
         if order_by.is_empty() || dataset.rows.len() <= 1 {
             return Ok(());
         }
-        let eval_dataset = Dataset {
-            columns: dataset.columns.clone(),
-            rows: Vec::new(),
-        };
+        let eval_dataset = Dataset::with_rows(dataset.columns.clone(), Vec::new());
         let sort_keys = dataset
             .rows
             .iter()
@@ -9691,18 +9798,21 @@ impl EngineRuntime {
             left_index.cmp(right_index)
         });
 
-        let mut rows = std::mem::take(&mut dataset.rows)
+        let mut rows = dataset
+            .take_rows()
             .into_iter()
             .map(Some)
             .collect::<Vec<_>>();
-        dataset.rows = order
-            .into_iter()
-            .map(|row_index| {
-                rows.get_mut(row_index)
-                    .and_then(Option::take)
-                    .ok_or_else(|| DbError::internal("sorted row index is invalid"))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        dataset.set_rows(
+            order
+                .into_iter()
+                .map(|row_index| {
+                    rows.get_mut(row_index)
+                        .and_then(Option::take)
+                        .ok_or_else(|| DbError::internal("sorted row index is invalid"))
+                })
+                .collect::<Result<Vec<_>>>()?,
+        );
         Ok(())
     }
 
@@ -10360,7 +10470,7 @@ impl EngineRuntime {
                     )));
                 }
                 let mut saw_null = false;
-                for subquery_row in &subquery.rows {
+                for subquery_row in subquery.rows.iter() {
                     let candidate = if expected_width == 1 {
                         MembershipValue::Scalar(
                             subquery_row.first().cloned().unwrap_or(Value::Null),
@@ -10395,7 +10505,7 @@ impl EngineRuntime {
                 }
                 let mut saw_null = false;
                 let mut saw_row = false;
-                for subquery_row in &subquery.rows {
+                for subquery_row in subquery.rows.iter() {
                     saw_row = true;
                     let candidate = subquery_row.first().cloned().unwrap_or(Value::Null);
                     match eval_binary(op, left_value.clone(), candidate)? {
@@ -13649,16 +13759,20 @@ fn eval_regex(left: Value, right: Value, case_insensitive: bool, negated: bool) 
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
     use crate::record::compression::CompressionMode;
     use crate::search::TrigramQueryResult;
+    use crate::sql::ast::FromItem;
     use crate::sql::parser::parse_sql_statement;
     use crate::storage::page::InMemoryPageStore;
-    use crate::Value;
+    use crate::{Db, DbConfig, Value};
 
     use super::{
         decode_manifest_payload, decode_runtime_payload, drop_index_include_columns_section,
-        encode_manifest_payload, encode_runtime_payload, encode_table_payload, EngineRuntime,
-        PersistedTableState, RuntimeBtreeKeys, RuntimeIndex,
+        encode_manifest_payload, encode_runtime_payload, encode_table_payload, ColumnBinding,
+        Dataset, EngineRuntime, PersistedTableState, RuntimeBtreeKeys, RuntimeIndex,
     };
 
     const PAGE_SIZE: u32 = 4096;
@@ -13683,8 +13797,7 @@ mod tests {
         let cloned = runtime.clone();
 
         let RuntimeIndex::Btree { keys } = cloned
-            .indexes
-            .get("docs_email_idx")
+            .index("docs_email_idx")
             .expect("email index should be cloned")
         else {
             panic!("expected BTREE runtime index");
@@ -13692,8 +13805,7 @@ mod tests {
         assert!(!keys.is_empty(), "btree entries should be preserved");
 
         let RuntimeIndex::Trigram { index } = cloned
-            .indexes
-            .get("docs_body_trgm_idx")
+            .index("docs_body_trgm_idx")
             .expect("trigram index should be cloned")
         else {
             panic!("expected trigram runtime index");
@@ -13727,8 +13839,7 @@ mod tests {
             .expect("primary-key index should exist");
 
         let RuntimeIndex::Btree { keys } = runtime
-            .indexes
-            .get(&index_name)
+            .index(&index_name)
             .expect("INT64 index should exist")
         else {
             panic!("expected BTREE runtime index");
@@ -13905,7 +14016,7 @@ mod tests {
         let mut runtime = EngineRuntime::empty(10);
         execute_sql(&mut runtime, "CREATE TABLE docs (id INT64 PRIMARY KEY)");
         runtime
-            .catalog
+            .catalog_mut()
             .tables
             .get_mut("docs")
             .expect("table should exist")
@@ -13920,7 +14031,7 @@ mod tests {
         assert_eq!(first.catalog.tables["docs"].next_row_id, 42);
 
         runtime
-            .catalog
+            .catalog_mut()
             .tables
             .get_mut("docs")
             .expect("table should exist")
@@ -14016,6 +14127,202 @@ mod tests {
             .expect("execute count");
         assert_eq!(result.rows().len(), 1);
         assert_eq!(result.rows()[0].values(), &[Value::Int64(3)]);
+    }
+
+    #[test]
+    fn engine_runtime_clone_is_shallow_when_unmutated() {
+        let mut runtime = EngineRuntime::empty(17);
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE docs (id INT64 PRIMARY KEY, name TEXT)",
+        );
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE people (id INT64 PRIMARY KEY, email TEXT)",
+        );
+        execute_sql(&mut runtime, "CREATE INDEX docs_name_idx ON docs (name)");
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO docs (id, name) VALUES (1, 'alpha')",
+        );
+        execute_sql(
+            &mut runtime,
+            "CREATE TEMP TABLE temp_docs (id INT64 PRIMARY KEY, name TEXT)",
+        );
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO temp_docs (id, name) VALUES (1, 'temp')",
+        );
+
+        let cloned = runtime.clone();
+
+        assert!(Arc::ptr_eq(&runtime.catalog, &cloned.catalog));
+        assert!(Arc::ptr_eq(&runtime.tables, &cloned.tables));
+        assert!(Arc::ptr_eq(
+            &runtime.temp_table_data,
+            &cloned.temp_table_data
+        ));
+        assert!(Arc::ptr_eq(&runtime.indexes, &cloned.indexes));
+        assert_eq!(Arc::strong_count(&runtime.catalog), 2);
+        assert_eq!(Arc::strong_count(&runtime.tables), 2);
+        assert_eq!(Arc::strong_count(&runtime.temp_table_data), 2);
+        assert_eq!(Arc::strong_count(&runtime.indexes), 2);
+    }
+
+    #[test]
+    fn engine_runtime_cow_isolates_mutations() {
+        let mut runtime = EngineRuntime::empty(18);
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE docs (id INT64 PRIMARY KEY, name TEXT)",
+        );
+        execute_sql(
+            &mut runtime,
+            "CREATE TEMP TABLE temp_docs (id INT64 PRIMARY KEY, name TEXT)",
+        );
+
+        let mut cloned = runtime.clone();
+        execute_sql(&mut cloned, "CREATE INDEX docs_name_idx ON docs (name)");
+        execute_sql(
+            &mut cloned,
+            "INSERT INTO docs (id, name) VALUES (1, 'alpha')",
+        );
+        execute_sql(
+            &mut cloned,
+            "INSERT INTO temp_docs (id, name) VALUES (1, 'temp')",
+        );
+
+        assert!(!Arc::ptr_eq(&runtime.catalog, &cloned.catalog));
+        assert!(!Arc::ptr_eq(&runtime.tables, &cloned.tables));
+        assert!(!Arc::ptr_eq(
+            &runtime.temp_table_data,
+            &cloned.temp_table_data
+        ));
+        assert!(!Arc::ptr_eq(&runtime.indexes, &cloned.indexes));
+        assert!(!runtime.catalog.indexes.contains_key("docs_name_idx"));
+        assert!(cloned.catalog.indexes.contains_key("docs_name_idx"));
+        assert!(runtime
+            .table_data("docs")
+            .expect("original table data")
+            .rows
+            .is_empty());
+        assert_eq!(
+            cloned
+                .table_data("docs")
+                .expect("cloned table data")
+                .rows
+                .len(),
+            1
+        );
+        assert!(runtime
+            .temp_table_data("temp_docs")
+            .expect("original temp table data")
+            .rows
+            .is_empty());
+        assert_eq!(
+            cloned
+                .temp_table_data("temp_docs")
+                .expect("cloned temp table data")
+                .rows
+                .len(),
+            1
+        );
+
+        drop(cloned);
+
+        assert_eq!(Arc::strong_count(&runtime.catalog), 1);
+        assert_eq!(Arc::strong_count(&runtime.tables), 1);
+        assert_eq!(Arc::strong_count(&runtime.temp_table_data), 1);
+        assert_eq!(Arc::strong_count(&runtime.indexes), 1);
+    }
+
+    #[test]
+    fn engine_runtime_autocommit_select_does_not_grow_strong_counts_unboundedly() {
+        let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
+        db.execute("CREATE TABLE docs (id INT64 PRIMARY KEY, name TEXT)")
+            .expect("create table");
+        db.execute("INSERT INTO docs (id, name) VALUES (1, 'alpha')")
+            .expect("insert row 1");
+        db.execute("INSERT INTO docs (id, name) VALUES (2, 'beta')")
+            .expect("insert row 2");
+        db.execute("INSERT INTO docs (id, name) VALUES (3, 'gamma')")
+            .expect("insert row 3");
+
+        for _ in 0..100 {
+            let result = db
+                .execute("SELECT COUNT(*) FROM docs")
+                .expect("execute autocommit select");
+            assert_eq!(result.rows()[0].values(), &[Value::Int64(3)]);
+        }
+
+        let snapshot = db.debug_engine_snapshot().expect("snapshot runtime");
+        assert!(Arc::strong_count(&snapshot.catalog) <= 2);
+        assert!(Arc::strong_count(&snapshot.tables) <= 2);
+        assert!(Arc::strong_count(&snapshot.indexes) <= 2);
+    }
+
+    #[test]
+    fn cached_payloads_evicts_at_capacity() {
+        let mut config = DbConfig::default();
+        config.set_cached_payloads_max_entries_for_tests(4);
+        let mut runtime = EngineRuntime::from_config(20, &config);
+
+        for key in ["a", "b", "c", "d", "e"] {
+            runtime.cache_payload_insert(key.to_string(), Arc::new(vec![key.as_bytes()[0]]));
+        }
+
+        assert_eq!(runtime.cached_payloads.len(), 4);
+        assert!(!runtime.cached_payloads.contains_key("a"));
+        assert!(runtime.cached_payloads.contains_key("e"));
+    }
+
+    #[test]
+    fn cached_payloads_lru_promotes_on_access() {
+        let mut config = DbConfig::default();
+        config.set_cached_payloads_max_entries_for_tests(4);
+        let mut runtime = EngineRuntime::from_config(21, &config);
+
+        for key in ["a", "b", "c", "d"] {
+            runtime.cache_payload_insert(key.to_string(), Arc::new(vec![key.as_bytes()[0]]));
+        }
+        assert!(runtime.cached_payload("a").is_some());
+
+        runtime.cache_payload_insert("e".to_string(), Arc::new(vec![b'e']));
+
+        assert!(runtime.cached_payloads.contains_key("a"));
+        assert!(!runtime.cached_payloads.contains_key("b"));
+        assert!(runtime.cached_payloads.contains_key("e"));
+    }
+
+    #[test]
+    fn cte_alias_shares_row_storage() {
+        let runtime = EngineRuntime::empty(19);
+        let original = Dataset::with_rows(
+            vec![ColumnBinding::visible(
+                Some("cte".to_string()),
+                "id".to_string(),
+            )],
+            (0..1000).map(|id| vec![Value::Int64(id)]).collect(),
+        );
+        let mut ctes = BTreeMap::new();
+        ctes.insert("cte".to_string(), original.clone());
+
+        let aliased = runtime
+            .evaluate_from_item_in_scope(
+                &FromItem::Table {
+                    name: "cte".to_string(),
+                    alias: Some("alias_cte".to_string()),
+                },
+                &[],
+                &ctes,
+                &Dataset::empty(),
+                &[],
+            )
+            .expect("resolve aliased cte");
+
+        assert!(Arc::ptr_eq(&original.rows, &aliased.rows));
+        assert_eq!(aliased.columns[0].table.as_deref(), Some("alias_cte"));
+        assert_eq!(Arc::strong_count(&original.rows), 3);
     }
 
     #[test]

@@ -73,3 +73,19 @@ Or to stdout:
 ```bash
 decentdb-sqlite-import /path/to/input.sqlite /path/to/output.decentdb --report-json -
 ```
+
+## Statement Cache Statistics
+
+Connections expose `stmt_cache_stats` as a read-only dictionary with:
+
+- `hits`
+- `misses`
+- `size`
+- `capacity`
+
+Low hit rates usually mean SQL strings are being built with embedded literals
+instead of parameters. Prefer parameterized queries so prepared statements can
+be reused.
+
+On `Connection.close()`, DecentDB emits `decentdb.PerformanceWarning` when the
+statement cache sees at least 100 lookups and the hit rate stays below 50%.

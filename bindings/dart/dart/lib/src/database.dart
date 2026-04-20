@@ -1,3 +1,5 @@
+import 'dart:collection';
+import 'dart:convert';
 import 'dart:ffi';
 
 import 'package:ffi/ffi.dart';
@@ -18,7 +20,10 @@ enum _OpenMode { create, open, openOrCreate }
 /// the object is garbage collected, a Dart [Finalizer] will release the native
 /// handle automatically.
 class Database {
-  Database._(this._bindings, Pointer<DdbDb> dbPtr) : _dbPtr = dbPtr {
+  Database._(this._bindings, Pointer<DdbDb> dbPtr, {int stmtCacheCapacity = 128})
+      : _dbPtr = dbPtr,
+        _cap = stmtCacheCapacity,
+        _lru = LinkedHashMap<String, Statement>() {
     _finalizer.attach(
       this,
       (bindings: _bindings, ptr: dbPtr),
@@ -39,6 +44,14 @@ class Database {
 
   final NativeBindings _bindings;
   Pointer<DdbDb>? _dbPtr;
+
+  // Prepared-statement LRU cache (D4).
+  final LinkedHashMap<String, Statement> _lru;
+  final int _cap;
+  int _hits = 0;
+  int _misses = 0;
+  bool _perfWarningEmitted = false;
+  void Function(PerformanceWarning)? _onPerformanceWarning;
 
   void _checkOpen() {
     if (_dbPtr == null || _dbPtr == nullptr) {
@@ -67,6 +80,7 @@ class Database {
     String path, {
     String? libraryPath,
     NativeBindings? bindings,
+    int stmtCacheCapacity = 128,
   }) {
     final nb = _resolveBindings(libraryPath, bindings);
     final nativePath = path.toNativeUtf8();
@@ -88,7 +102,7 @@ class Database {
             : msgPtr.toDartString();
         throw DecentDbException(ErrorCode.fromCode(status), msg);
       }
-      return Database._(nb, outDb.value);
+      return Database._(nb, outDb.value, stmtCacheCapacity: stmtCacheCapacity);
     } finally {
       calloc.free(outDb);
       calloc.free(nativePath);
@@ -99,11 +113,15 @@ class Database {
   ///
   /// The [options] parameter is reserved for future ABI extension; passing a
   /// non-empty string currently throws [ArgumentError].
+  ///
+  /// [stmtCacheCapacity] sets the maximum number of prepared statements held
+  /// in the internal LRU cache.  Pass `0` to disable caching.
   static Database open(
     String path, {
     String? options,
     String? libraryPath,
     NativeBindings? bindings,
+    int stmtCacheCapacity = 128,
   }) {
     if (options != null && options.trim().isNotEmpty) {
       throw ArgumentError(
@@ -115,6 +133,7 @@ class Database {
       path,
       libraryPath: libraryPath,
       bindings: bindings,
+      stmtCacheCapacity: stmtCacheCapacity,
     );
   }
 
@@ -123,22 +142,35 @@ class Database {
     String path, {
     String? libraryPath,
     NativeBindings? bindings,
+    int stmtCacheCapacity = 128,
   }) =>
       _openWith(_OpenMode.create, path,
-          libraryPath: libraryPath, bindings: bindings);
+          libraryPath: libraryPath,
+          bindings: bindings,
+          stmtCacheCapacity: stmtCacheCapacity);
 
   /// Open an existing database at [path], failing if it does not exist.
   static Database openExisting(
     String path, {
     String? libraryPath,
     NativeBindings? bindings,
+    int stmtCacheCapacity = 128,
   }) =>
       _openWith(_OpenMode.open, path,
-          libraryPath: libraryPath, bindings: bindings);
+          libraryPath: libraryPath,
+          bindings: bindings,
+          stmtCacheCapacity: stmtCacheCapacity);
 
   /// Open an in-memory database (not persisted to disk).
-  static Database memory({String? libraryPath, NativeBindings? bindings}) =>
-      open(':memory:', libraryPath: libraryPath, bindings: bindings);
+  static Database memory({
+    String? libraryPath,
+    NativeBindings? bindings,
+    int stmtCacheCapacity = 128,
+  }) =>
+      open(':memory:',
+          libraryPath: libraryPath,
+          bindings: bindings,
+          stmtCacheCapacity: stmtCacheCapacity);
 
   /// Evict the shared WAL cache entry for an on-disk database [path].
   ///
@@ -192,15 +224,94 @@ class Database {
   // Statement API
   // ---------------------------------------------------------------------------
 
-  /// Prepare [sql] as a native statement.  Caller must call [Statement.dispose].
+  /// Register a callback that receives [PerformanceWarning] notifications.
+  ///
+  /// Fires at most once per [Database] lifetime, when the statement cache hit
+  /// rate falls below 50% after 100 cumulative prepares.
+  set onPerformanceWarning(void Function(PerformanceWarning)? sink) {
+    _onPerformanceWarning = sink;
+  }
+
+  /// Cache statistics: `hits`, `misses`, `size`, `capacity`.
+  Map<String, int> get stmtCacheStats => {
+        'hits': _hits,
+        'misses': _misses,
+        'size': _lru.length,
+        'capacity': _cap,
+      };
+
+  /// Finalize every cached statement and reset cache counters.
+  void clearStmtCache() {
+    for (final stmt in _lru.values) {
+      if (!stmt.isDisposed) stmt.dispose();
+    }
+    _lru.clear();
+    _hits = 0;
+    _misses = 0;
+    _perfWarningEmitted = false;
+  }
+
+  void _maybeEmitPerfWarning() {
+    if (_perfWarningEmitted) return;
+    final total = _hits + _misses;
+    if (total >= 100 && _hits / total < 0.5) {
+      _perfWarningEmitted = true;
+      final pct = (_hits * 100 ~/ total);
+      _onPerformanceWarning?.call(PerformanceWarning(
+        'stmt cache hit rate $pct% over $total prepares — '
+        'consider raising stmtCacheCapacity or reusing Statement handles.',
+      ));
+    }
+  }
+
+  /// Prepare [sql] as a native statement.
+  ///
+  /// When the statement cache is enabled (capacity > 0), repeated calls with
+  /// the same SQL return a cached handle (reset and cleared) without
+  /// re-parsing. The [Database] owns cached statements; callers must **not**
+  /// call [Statement.dispose] on them — doing so marks the handle as disposed
+  /// and the cache will create a fresh one on the next call.
+  ///
+  /// When the cache is disabled (capacity == 0), callers **must** call
+  /// [Statement.dispose] to avoid native handle leaks.
   Statement prepare(String sql) {
     _checkOpen();
+    if (_cap > 0) {
+      final cached = _lru.remove(sql);
+      if (cached != null && !cached.isDisposed) {
+        _lru[sql] = cached; // move to MRU end
+        cached.resetForReuse();
+        _hits++;
+        _maybeEmitPerfWarning();
+        return cached;
+      }
+      // Cache miss (or previously disposed cached entry).
+      _misses++;
+      final stmt = Statement.fromSql(_bindings, _dbPtr!, sql);
+      _lru[sql] = stmt;
+      if (_lru.length > _cap) {
+        // Evict the least-recently-used entry.
+        final oldestKey = _lru.keys.first;
+        final evicted = _lru.remove(oldestKey)!;
+        if (!evicted.isDisposed) evicted.dispose();
+      }
+      _maybeEmitPerfWarning();
+      return stmt;
+    }
+    _misses++;
+    _maybeEmitPerfWarning();
     return Statement.fromSql(_bindings, _dbPtr!, sql);
   }
 
+  /// Prepare [sql] directly, bypassing the cache. Used by convenience helpers
+  /// that manage their own statement lifecycle with [Statement.dispose].
+  Statement _rawPrepare(String sql) =>
+      Statement.fromSql(_bindings, _dbPtr!, sql);
+
   /// Execute [sql] with no parameters; returns the number of affected rows.
   int execute(String sql) {
-    final stmt = prepare(sql);
+    _checkOpen();
+    final stmt = _rawPrepare(sql);
     try {
       return stmt.execute();
     } finally {
@@ -247,7 +358,8 @@ class Database {
 
   /// Execute [sql] with positional [params]; returns affected rows.
   int executeWithParams(String sql, List<Object?> params) {
-    final stmt = prepare(sql);
+    _checkOpen();
+    final stmt = _rawPrepare(sql);
     try {
       stmt.bindAll(params);
       return stmt.execute();
@@ -258,7 +370,8 @@ class Database {
 
   /// Execute [sql] and return all result rows.
   List<Row> query(String sql, [List<Object?> params = const []]) {
-    final stmt = prepare(sql);
+    _checkOpen();
+    final stmt = _rawPrepare(sql);
     try {
       stmt.bindAll(params);
       return stmt.query();
@@ -298,6 +411,70 @@ class Database {
       _throwStatus(status, 'Failed to roll back transaction');
   }
 
+  // ---------------------------------------------------------------------------
+  // Savepoint API
+  // ---------------------------------------------------------------------------
+
+  /// Validates [name] for use as a SQL identifier in savepoint commands.
+  ///
+  /// Rejects empty strings, names longer than 128 characters, names containing
+  /// double-quote characters, and names containing control characters (code
+  /// unit < 0x20).
+  void _assertValidIdent(String name) {
+    if (name.isEmpty) {
+      throw ArgumentError.value(name, 'name', 'Savepoint name must not be empty');
+    }
+    if (name.length > 128) {
+      throw ArgumentError.value(
+          name, 'name', 'Savepoint name must be 128 characters or fewer');
+    }
+    for (var i = 0; i < name.length; i++) {
+      final c = name.codeUnitAt(i);
+      if (c == 0x22) {
+        throw ArgumentError.value(
+            name, 'name', 'Savepoint name must not contain double-quote characters');
+      }
+      if (c < 0x20) {
+        throw ArgumentError.value(
+            name, 'name', 'Savepoint name must not contain control characters');
+      }
+    }
+  }
+
+  /// Create a savepoint named [name] within the current transaction.
+  ///
+  /// Savepoints follow standard SQL semantics: multiple savepoints may be
+  /// nested, and each is uniquely identified by [name]. To undo work back to
+  /// this savepoint use [rollbackToSavepoint]; to permanently keep the work
+  /// use [releaseSavepoint].
+  void savepoint(String name) {
+    _checkOpen();
+    _assertValidIdent(name);
+    executeDirect('SAVEPOINT "$name"');
+  }
+
+  /// Release (commit) the savepoint named [name].
+  ///
+  /// The work done since the savepoint was created becomes part of the
+  /// enclosing transaction. If [name] was created multiple times in a nested
+  /// stack, only the innermost matching savepoint is released.
+  void releaseSavepoint(String name) {
+    _checkOpen();
+    _assertValidIdent(name);
+    executeDirect('RELEASE SAVEPOINT "$name"');
+  }
+
+  /// Roll back the current transaction to the savepoint named [name].
+  ///
+  /// All work done after the savepoint was created is discarded.  The
+  /// savepoint itself is not destroyed — it can be reused or released
+  /// afterwards.
+  void rollbackToSavepoint(String name) {
+    _checkOpen();
+    _assertValidIdent(name);
+    executeDirect('ROLLBACK TO SAVEPOINT "$name"');
+  }
+
   /// Run [action] inside a transaction.  Commits on success; rolls back on
   /// any exception and rethrows.
   T transaction<T>(T Function() action) {
@@ -333,6 +510,36 @@ class Database {
     if (status != ddbOk) _throwStatus(status, 'Failed to checkpoint database');
   }
 
+  /// Returns a snapshot of the engine's current pager / WAL / cache state.
+  ///
+  /// Useful for diagnostics and observability. The returned
+  /// [StorageStateSnapshot] captures all fields emitted by the engine at the
+  /// moment of the call; [StorageStateSnapshot.rawJson] preserves the full
+  /// JSON text for forward compatibility.
+  StorageStateSnapshot inspectStorageState() {
+    _checkOpen();
+    final out = calloc<Pointer<Utf8>>();
+    try {
+      final status = _bindings.dbInspectStorageStateJson(_dbPtr!, out);
+      if (status != ddbOk) {
+        _throwStatus(status, 'Failed to inspect storage state');
+      }
+      final rawJson = out.value == nullptr ? '{}' : out.value.toDartString();
+      final freeStatus = _bindings.stringFree(out);
+      if (freeStatus != ddbOk) {
+        _throwStatus(freeStatus, 'Failed to free storage state JSON');
+      }
+      final decoded = jsonDecode(rawJson);
+      if (decoded is! Map<String, Object?>) {
+        throw FormatException(
+            'Storage state JSON is not an object: $rawJson');
+      }
+      return StorageStateSnapshot.fromJson(decoded, rawJson: rawJson);
+    } finally {
+      calloc.free(out);
+    }
+  }
+
   /// Save a snapshot of the current database state to [destPath].
   void saveAs(String destPath) {
     _checkOpen();
@@ -353,9 +560,11 @@ class Database {
   /// Close the database and release the native handle.
   ///
   /// After calling [close], no other methods may be used.  Calling [close]
-  /// on an already-closed database is a no-op.
+  /// on an already-closed database is a no-op.  All cached statements are
+  /// finalized before the database handle is released.
   void close() {
     if (_dbPtr == null || _dbPtr == nullptr) return;
+    clearStmtCache(); // D4: finalize cached statements before closing DB
     _finalizer.detach(this);
     final slot = calloc<Pointer<DdbDb>>()..value = _dbPtr!;
     try {

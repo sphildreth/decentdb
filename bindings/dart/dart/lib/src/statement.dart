@@ -1,3 +1,4 @@
+import 'dart:collection';
 import 'dart:ffi';
 import 'dart:typed_data';
 
@@ -65,10 +66,14 @@ class ResultPage {
 // Statement  (backed by ddb_stmt_t)
 // ---------------------------------------------------------------------------
 
+/// Token passed to the GC finalizer for safe native cleanup.
+typedef _StmtToken = ({NativeBindings bindings, Pointer<DdbStmt> ptr});
+
 /// A prepared statement wrapping a native [ddb_stmt_t] handle.
 ///
 /// Obtain via [Database.prepare]. Callers are responsible for calling
-/// [dispose] when done; failing to do so leaks the native statement.
+/// [dispose] when done; failing to do so leaks the native statement handle
+/// (though a Dart [Finalizer] provides a GC-safety net).
 ///
 /// Typical single-execution pattern:
 /// ```dart
@@ -90,7 +95,23 @@ class ResultPage {
 /// stmt.dispose();
 /// ```
 class Statement {
-  Statement._(this._bindings, this._stmtPtr);
+  Statement._(this._bindings, Pointer<DdbStmt> stmtPtr) : _stmtPtr = stmtPtr {
+    _finalizer.attach(
+      this,
+      (bindings: _bindings, ptr: stmtPtr),
+      detach: this,
+    );
+  }
+
+  // GC-safety finalizer: runs if dispose() is never called.
+  static final _finalizer = Finalizer<_StmtToken>((token) {
+    final slot = calloc<Pointer<DdbStmt>>()..value = token.ptr;
+    try {
+      token.bindings.stmtFree(slot);
+    } finally {
+      calloc.free(slot);
+    }
+  });
 
   /// Prepare [sql] against [dbPtr].  Throws [DecentDbException] on invalid SQL.
   factory Statement.fromSql(
@@ -123,10 +144,14 @@ class Statement {
   // Cached execution results
   List<String> _columnNames = const [];
   Map<String, int> _columnIndex = const {};
+  bool _columnMetadataLoaded = false; // D7: persists across reset/bind cycles
   bool _executionPrimed = false;
   bool _streamExhausted = false;
   int _affectedRows = 0;
   Row? _currentRow;
+
+  /// `true` if [dispose] has been called.
+  bool get isDisposed => _disposed;
 
   // ---------------------------------------------------------------------------
   // Internal helpers
@@ -158,7 +183,11 @@ class Statement {
 
   /// Fetch column names from the native stmt; must be called after prepare
   /// (or after the first step for SELECT) and before iterating rows.
+  ///
+  /// Column names do not change between resets within the same prepared
+  /// statement, so this method short-circuits on subsequent calls (D7).
   void _loadColumnMetadata() {
+    if (_columnMetadataLoaded) return; // D7: only load once per statement lifetime
     final countPtr = calloc<IntPtr>();
     try {
       final status = _bindings.stmtColumnCount(_stmtPtr!, countPtr);
@@ -167,6 +196,7 @@ class Statement {
       if (count == 0) {
         _columnNames = const [];
         _columnIndex = const {};
+        _columnMetadataLoaded = true;
         return;
       }
       final names = List<String>.filled(count, '');
@@ -190,6 +220,7 @@ class Statement {
       }
       _columnNames = List.unmodifiable(names);
       _columnIndex = {for (var i = 0; i < names.length; i++) names[i]: i};
+      _columnMetadataLoaded = true; // D7: mark as cached
     } finally {
       calloc.free(countPtr);
     }
@@ -304,14 +335,14 @@ class Statement {
       if (status != ddbOk) _throwStatus(status, 'Failed to bind blob');
       return;
     }
-    final data = calloc<Uint8>(value.length);
+    final data = malloc<Uint8>(value.length);
     try {
       data.asTypedList(value.length).setAll(0, value);
       final status =
           _bindings.stmtBindBlob(_stmtPtr!, index, data, value.length);
       if (status != ddbOk) _throwStatus(status, 'Failed to bind blob');
     } finally {
-      calloc.free(data);
+      malloc.free(data);
     }
   }
 
@@ -332,6 +363,27 @@ class Statement {
     if (status != ddbOk) _throwStatus(status, 'Failed to bind timestamp');
   }
 
+  /// Bind a UUID value at 1-based [index].
+  ///
+  /// [bytes] must be exactly 16 bytes in canonical UUID byte order; throws
+  /// [ArgumentError] otherwise.
+  void bindUuid(int index, Uint8List bytes) {
+    _checkNotDisposed();
+    _invalidateExecution();
+    if (bytes.length != 16) {
+      throw ArgumentError(
+          'UUID bytes must be exactly 16, got ${bytes.length}');
+    }
+    final data = malloc<Uint8>(16);
+    try {
+      data.asTypedList(16).setAll(0, bytes);
+      final status = _bindings.stmtBindUuid(_stmtPtr!, index, data);
+      if (status != ddbOk) _throwStatus(status, 'Failed to bind UUID');
+    } finally {
+      malloc.free(data);
+    }
+  }
+
   /// Polymorphic bind: dispatches to the typed method based on [value]'s type.
   void bind(int index, Object? value) {
     if (value == null) return bindNull(index);
@@ -339,6 +391,8 @@ class Statement {
     if (value is bool) return bindBool(index, value);
     if (value is double) return bindFloat64(index, value);
     if (value is String) return bindText(index, value);
+    // UuidValue must be checked before Uint8List so bare Uint8List stays BLOB.
+    if (value is UuidValue) return bindUuid(index, value.bytes);
     if (value is Uint8List) return bindBlob(index, value);
     if (value is DateTime) return bindDateTime(index, value);
     if (value is DecimalValue)
@@ -358,7 +412,11 @@ class Statement {
   // ---------------------------------------------------------------------------
 
   int get columnCount => _columnNames.length;
-  List<String> get columnNames => List.unmodifiable(_columnNames);
+
+  /// The column names for the current result set.
+  ///
+  /// Returns the cached unmodifiable list directly — no wrapper allocation.
+  List<String> get columnNames => _columnNames;
 
   // ---------------------------------------------------------------------------
   // Execution API
@@ -380,7 +438,7 @@ class Statement {
         break;
       }
     }
-    return List<Row>.unmodifiable(rows);
+    return UnmodifiableListView(rows); // D8: zero-copy wrap
   }
 
   /// Execute a DML statement and return the number of affected rows.
@@ -424,7 +482,7 @@ class Statement {
       return 0;
     }
 
-    final valuesPtr = calloc<Int64>(values.length);
+    final valuesPtr = malloc<Int64>(values.length);
     final outAffected = calloc<Uint64>();
     try {
       for (var i = 0; i < values.length; i++) {
@@ -442,7 +500,7 @@ class Statement {
       _affectedRows = outAffected.value;
       return _affectedRows;
     } finally {
-      calloc.free(valuesPtr);
+      malloc.free(valuesPtr);
       calloc.free(outAffected);
     }
   }
@@ -456,10 +514,10 @@ class Statement {
       return 0;
     }
 
-    final valuesI64 = calloc<Int64>(rows.length);
-    final valuesTextPtrs = calloc<Pointer<Utf8>>(rows.length);
-    final valuesTextLens = calloc<IntPtr>(rows.length);
-    final valuesF64 = calloc<Double>(rows.length);
+    final valuesI64 = malloc<Int64>(rows.length);
+    final valuesTextPtrs = malloc<Pointer<Utf8>>(rows.length);
+    final valuesTextLens = malloc<IntPtr>(rows.length);
+    final valuesF64 = malloc<Double>(rows.length);
     final outAffected = calloc<Uint64>();
     final allocatedText = <Pointer<Utf8>>[];
     try {
@@ -490,15 +548,19 @@ class Statement {
       for (final ptr in allocatedText) {
         calloc.free(ptr);
       }
-      calloc.free(valuesI64);
-      calloc.free(valuesTextPtrs);
-      calloc.free(valuesTextLens);
-      calloc.free(valuesF64);
+      malloc.free(valuesI64);
+      malloc.free(valuesTextPtrs);
+      malloc.free(valuesTextLens);
+      malloc.free(valuesF64);
       calloc.free(outAffected);
     }
   }
 
   /// Execute a typed batch in one native call using an `i`/`t`/`f` signature.
+  ///
+  /// Sizes are computed upfront from [signature] and [rows].length so C
+  /// buffers are allocated once and written directly (single-pass, no
+  /// intermediate Dart lists). Uses [malloc] for write-only buffers (D5/D6).
   int executeBatchTyped(String signature, List<List<Object?>> rows) {
     _checkNotDisposed();
     _invalidateExecution();
@@ -511,78 +573,33 @@ class Statement {
     }
 
     final sig = signature.codeUnits;
-    final iPerRow = sig.where((code) => code == 0x69).length; // i
-    final tPerRow = sig.where((code) => code == 0x74).length; // t
-    final fPerRow = sig.where((code) => code == 0x66).length; // f
 
+    // Validate signature characters and compute per-type totals upfront.
+    var iPerRow = 0, tPerRow = 0, fPerRow = 0;
     for (var col = 0; col < sig.length; col++) {
-      final code = sig[col];
-      if (code != 0x69 && code != 0x74 && code != 0x66) {
-        throw ArgumentError.value(
-          signature,
-          'signature',
-          'contains unsupported type at column $col: ${String.fromCharCode(code)}',
-        );
+      switch (sig[col]) {
+        case 0x69:
+          iPerRow++;
+          break;
+        case 0x74:
+          tPerRow++;
+          break;
+        case 0x66:
+          fPerRow++;
+          break;
+        default:
+          throw ArgumentError.value(
+            signature,
+            'signature',
+            'contains unsupported type at column $col: '
+                '${String.fromCharCode(sig[col])}',
+          );
       }
     }
 
-    final iValues = <int>[];
-    final tValues = <String>[];
-    final fValues = <double>[];
-
-    for (var rowIndex = 0; rowIndex < rows.length; rowIndex++) {
-      final row = rows[rowIndex];
-      if (row.length != sig.length) {
-        throw ArgumentError.value(
-          row,
-          'rows[$rowIndex]',
-          'expected ${sig.length} values, got ${row.length}',
-        );
-      }
-      for (var col = 0; col < sig.length; col++) {
-        final value = row[col];
-        switch (sig[col]) {
-          case 0x69: // i
-            if (value is! int) {
-              throw ArgumentError.value(
-                value,
-                'rows[$rowIndex][$col]',
-                'expected int for signature column i',
-              );
-            }
-            iValues.add(value);
-            break;
-          case 0x74: // t
-            if (value is! String) {
-              throw ArgumentError.value(
-                value,
-                'rows[$rowIndex][$col]',
-                'expected String for signature column t',
-              );
-            }
-            tValues.add(value);
-            break;
-          case 0x66: // f
-            if (value is! num) {
-              throw ArgumentError.value(
-                value,
-                'rows[$rowIndex][$col]',
-                'expected num for signature column f',
-              );
-            }
-            fValues.add(value.toDouble());
-            break;
-          default:
-            throw StateError('Unsupported signature code ${sig[col]}');
-        }
-      }
-    }
-
-    if (iValues.length != rows.length * iPerRow ||
-        tValues.length != rows.length * tPerRow ||
-        fValues.length != rows.length * fPerRow) {
-      throw StateError('Typed batch flattening produced inconsistent lengths');
-    }
+    final iTotal = rows.length * iPerRow;
+    final tTotal = rows.length * tPerRow;
+    final fTotal = rows.length * fPerRow;
 
     final signaturePtr = signature.toNativeUtf8();
     Pointer<Int64> valuesI64 = nullptr.cast<Int64>();
@@ -592,26 +609,64 @@ class Statement {
     final outAffected = calloc<Uint64>();
     final allocatedText = <Pointer<Utf8>>[];
     try {
-      if (iValues.isNotEmpty) {
-        valuesI64 = calloc<Int64>(iValues.length);
-        for (var i = 0; i < iValues.length; i++) {
-          valuesI64[i] = iValues[i];
-        }
+      if (iTotal > 0) valuesI64 = malloc<Int64>(iTotal);
+      if (fTotal > 0) valuesF64 = malloc<Double>(fTotal);
+      if (tTotal > 0) {
+        valuesTextPtrs = malloc<Pointer<Utf8>>(tTotal);
+        valuesTextLens = malloc<IntPtr>(tTotal);
       }
-      if (fValues.isNotEmpty) {
-        valuesF64 = calloc<Double>(fValues.length);
-        for (var i = 0; i < fValues.length; i++) {
-          valuesF64[i] = fValues[i];
+
+      // Single pass: write directly into C buffers.
+      var iIdx = 0, tIdx = 0, fIdx = 0;
+      for (var rowIndex = 0; rowIndex < rows.length; rowIndex++) {
+        final row = rows[rowIndex];
+        if (row.length != sig.length) {
+          throw ArgumentError.value(
+            row,
+            'rows[$rowIndex]',
+            'expected ${sig.length} values, got ${row.length}',
+          );
         }
-      }
-      if (tValues.isNotEmpty) {
-        valuesTextPtrs = calloc<Pointer<Utf8>>(tValues.length);
-        valuesTextLens = calloc<IntPtr>(tValues.length);
-        for (var i = 0; i < tValues.length; i++) {
-          final text = tValues[i].toNativeUtf8();
-          allocatedText.add(text);
-          valuesTextPtrs[i] = text;
-          valuesTextLens[i] = text.length;
+        for (var col = 0; col < sig.length; col++) {
+          final value = row[col];
+          switch (sig[col]) {
+            case 0x69:
+              if (value is! int) {
+                throw ArgumentError.value(
+                  value,
+                  'rows[$rowIndex][$col]',
+                  'expected int for signature column i',
+                );
+              }
+              valuesI64[iIdx++] = value;
+              break;
+            case 0x74:
+              if (value is! String) {
+                throw ArgumentError.value(
+                  value,
+                  'rows[$rowIndex][$col]',
+                  'expected String for signature column t',
+                );
+              }
+              final text = value.toNativeUtf8();
+              allocatedText.add(text);
+              valuesTextPtrs[tIdx] = text;
+              valuesTextLens[tIdx] = text.length;
+              tIdx++;
+              break;
+            case 0x66:
+              if (value is! num) {
+                throw ArgumentError.value(
+                  value,
+                  'rows[$rowIndex][$col]',
+                  'expected num for signature column f',
+                );
+              }
+              valuesF64[fIdx++] = value.toDouble();
+              break;
+            default:
+              throw StateError('Unsupported signature code ${sig[col]}');
+          }
         }
       }
 
@@ -634,10 +689,12 @@ class Statement {
       for (final ptr in allocatedText) {
         calloc.free(ptr);
       }
-      if (valuesI64 != nullptr) calloc.free(valuesI64);
-      if (valuesF64 != nullptr) calloc.free(valuesF64);
-      if (valuesTextPtrs != nullptr) calloc.free(valuesTextPtrs);
-      if (valuesTextLens != nullptr) calloc.free(valuesTextLens);
+      if (iTotal > 0) malloc.free(valuesI64);
+      if (fTotal > 0) malloc.free(valuesF64);
+      if (tTotal > 0) {
+        malloc.free(valuesTextPtrs);
+        malloc.free(valuesTextLens);
+      }
       calloc.free(signaturePtr);
       calloc.free(outAffected);
     }
@@ -900,10 +957,49 @@ class Statement {
     _invalidateExecution();
   }
 
+  /// Reset and clear bindings in one step without re-fetching column metadata.
+  ///
+  /// Equivalent to [reset] + [clearBindings] but avoids the redundant metadata
+  /// reload. Column names are cached across resets (D7) so this is safe.
+  /// Used by the prepared-statement cache inside [Database.prepare].
+  void resetForReuse() {
+    _checkNotDisposed();
+    _nativeReset();
+    final status = _bindings.stmtClearBindings(_stmtPtr!);
+    if (status != ddbOk) _throwStatus(status, 'Failed to clear bindings');
+    _invalidateExecution();
+  }
+
+  /// Returns a [Stream] that yields each result row.
+  ///
+  /// Internally calls [nextPage] with [pageSize] rows per FFI round-trip.
+  /// Starting a new iteration after the stream completes requires calling
+  /// [reset] first. The stream is single-subscription.
+  ///
+  /// [pageSize] must be positive; 0 or negative values throw [ArgumentError].
+  Stream<Row> rows({int pageSize = 256}) async* {
+    if (pageSize <= 0) {
+      throw ArgumentError.value(pageSize, 'pageSize', 'must be > 0');
+    }
+    while (true) {
+      final page = nextPage(pageSize);
+      for (final row in page.rows) {
+        yield row;
+      }
+      if (page.isLast) return;
+    }
+  }
+
   /// Release the native statement handle.
+  ///
+  /// Idempotent — subsequent calls are safe no-ops. The Finalizer is detached
+  /// before [stmtFree] runs to prevent any double-free if the GC fires
+  /// concurrently.
   void dispose() {
     if (_disposed) return;
     _disposed = true;
+    _finalizer.detach(this); // D9: prevent double-free
+    _columnMetadataLoaded = false; // D7: reset so re-prepare can reload
     _invalidateExecution();
     if (_stmtPtr != null) {
       final slot = calloc<Pointer<DdbStmt>>()..value = _stmtPtr!;

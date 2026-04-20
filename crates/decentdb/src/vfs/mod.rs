@@ -78,6 +78,11 @@ impl VfsHandle {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn from_vfs(inner: Arc<dyn Vfs>) -> Self {
+        Self { inner }
+    }
+
     pub(crate) fn open(
         &self,
         path: &Path,

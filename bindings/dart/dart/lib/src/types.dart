@@ -1,3 +1,5 @@
+import 'dart:typed_data';
+
 /// DecentDB error codes.
 enum ErrorCode {
   ok(0),
@@ -37,6 +39,103 @@ class DecimalValue {
 
   @override
   String toString() => 'DecimalValue($scaled, scale: $scale)';
+}
+
+/// A canonical 16-byte UUID value.
+///
+/// Bytes are stored in native order (hex byte 0 first, matching the engine's
+/// `Value::Uuid([u8; 16])` representation). Use [UuidValue.parse] to construct
+/// from canonical hyphenated text ("xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx").
+///
+/// Only the 36-character hyphenated form is accepted by [parse]; compact
+/// 32-character text is rejected with [FormatException].
+final class UuidValue {
+  /// The raw 16 bytes of the UUID in canonical byte order.
+  ///
+  /// A defensive copy is made on construction so mutations to the original
+  /// [Uint8List] do not affect this value.
+  final Uint8List bytes;
+
+  /// Constructs a [UuidValue] from [bytes].
+  ///
+  /// [bytes] must have exactly 16 elements; throws [ArgumentError] otherwise.
+  /// A copy of [bytes] is stored internally.
+  UuidValue(Uint8List bytes) : bytes = Uint8List.fromList(bytes) {
+    if (bytes.length != 16) {
+      throw ArgumentError(
+          'UuidValue requires exactly 16 bytes, got ${bytes.length}');
+    }
+  }
+
+  /// Parses a canonical 36-character hyphenated UUID string.
+  ///
+  /// Accepts both lower- and uppercase hex digits. Throws [FormatException]
+  /// if [text] is not exactly 36 characters in the form
+  /// "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx".
+  factory UuidValue.parse(String text) {
+    if (text.length != 36 ||
+        text[8] != '-' ||
+        text[13] != '-' ||
+        text[18] != '-' ||
+        text[23] != '-') {
+      throw FormatException(
+          'Invalid UUID: expected xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx, '
+          'got "$text"');
+    }
+    final result = Uint8List(16);
+    var byteIdx = 0;
+    var i = 0;
+    while (i < 36) {
+      if (text[i] == '-') {
+        i++;
+        continue;
+      }
+      result[byteIdx++] =
+          (_hexNibble(text, i) << 4) | _hexNibble(text, i + 1);
+      i += 2;
+    }
+    // Use internal constructor to avoid a second copy.
+    return UuidValue._trusted(result);
+  }
+
+  // Private constructor used by parse — skips the defensive copy since the
+  // bytes were just freshly allocated inside parse.
+  UuidValue._trusted(this.bytes);
+
+  static int _hexNibble(String s, int index) {
+    final v = s.codeUnitAt(index);
+    if (v >= 0x30 && v <= 0x39) return v - 0x30; // 0-9
+    if (v >= 0x61 && v <= 0x66) return v - 0x57; // a-f
+    if (v >= 0x41 && v <= 0x46) return v - 0x37; // A-F
+    throw FormatException(
+        'Invalid hex character "${s[index]}" in UUID "$s"');
+  }
+
+  /// Returns the canonical lowercase hyphenated text representation.
+  String toText() {
+    final buf = StringBuffer();
+    for (var i = 0; i < 16; i++) {
+      if (i == 4 || i == 6 || i == 8 || i == 10) buf.write('-');
+      buf.write(bytes[i].toRadixString(16).padLeft(2, '0'));
+    }
+    return buf.toString();
+  }
+
+  @override
+  bool operator ==(Object other) {
+    if (identical(this, other)) return true;
+    if (other is! UuidValue) return false;
+    for (var i = 0; i < 16; i++) {
+      if (bytes[i] != other.bytes[i]) return false;
+    }
+    return true;
+  }
+
+  @override
+  int get hashCode => Object.hashAll(bytes);
+
+  @override
+  String toString() => toText();
 }
 
 class ForeignKeyInfo {
@@ -226,5 +325,130 @@ class TriggerInfo {
       onView: json['on_view'] as bool? ?? false,
       actionSql: json['action_sql'] as String,
     );
+  }
+}
+
+/// A snapshot of the database engine's storage and WAL state.
+///
+/// Obtained via [Database.inspectStorageState]. The [rawJson] field preserves
+/// the full JSON text for forward compatibility; all named fields are parsed
+/// from it.
+class StorageStateSnapshot {
+  const StorageStateSnapshot({
+    required this.rawJson,
+    required this.path,
+    required this.pageSize,
+    required this.pageCount,
+    required this.schemaCookie,
+    required this.walEndLsn,
+    required this.walSizeBytes,
+    required this.walPath,
+    required this.checkpointSequence,
+    required this.activeReaders,
+    required this.walVersions,
+    required this.warningCount,
+    required this.sharedWal,
+    required this.cacheEntries,
+    required this.cacheCapacity,
+  });
+
+  /// The raw JSON text returned by the engine. Non-empty; round-trips through
+  /// `jsonDecode` without error.
+  final String rawJson;
+
+  /// The database file path (or `":memory:"` for in-memory databases).
+  final String path;
+
+  /// Page size in bytes (e.g. 4096).
+  final int pageSize;
+
+  /// Number of committed pages currently tracked by the pager.
+  final int pageCount;
+
+  /// Schema cookie — incremented on every DDL change.
+  final int schemaCookie;
+
+  /// LSN of the latest WAL record (end-of-WAL position).
+  final int walEndLsn;
+
+  /// Current WAL file size in bytes. Zero for in-memory databases.
+  final int walSizeBytes;
+
+  /// Path to the WAL file.
+  final String walPath;
+
+  /// LSN of the last successful checkpoint.
+  final int checkpointSequence;
+
+  /// Number of active concurrent readers holding WAL snapshots.
+  final int activeReaders;
+
+  /// Number of distinct WAL page versions retained for active readers.
+  final int walVersions;
+
+  /// Number of health warnings emitted by the engine.
+  final int warningCount;
+
+  /// Whether this database uses a shared (inter-process) WAL.
+  final bool sharedWal;
+
+  /// Number of entries currently in the page cache (0 if not reported).
+  final int cacheEntries;
+
+  /// Page cache capacity in entries (0 if not reported).
+  final int cacheCapacity;
+
+  /// Construct from a decoded JSON map.
+  ///
+  /// Behaviour:
+  /// - Unknown keys are silently ignored.
+  /// - Missing numeric keys default to `0`.
+  /// - A numeric-typed key that is present but holds a non-numeric value
+  ///   throws [FormatException].
+  factory StorageStateSnapshot.fromJson(
+    Map<String, Object?> json, {
+    required String rawJson,
+  }) {
+    return StorageStateSnapshot(
+      rawJson: rawJson,
+      path: _stringField(json, 'path'),
+      pageSize: _numericField(json, 'page_size'),
+      pageCount: _numericField(json, 'page_count'),
+      schemaCookie: _numericField(json, 'schema_cookie'),
+      walEndLsn: _numericField(json, 'wal_end_lsn'),
+      walSizeBytes: _numericField(json, 'wal_file_size'),
+      walPath: _stringField(json, 'wal_path'),
+      checkpointSequence: _numericField(json, 'last_checkpoint_lsn'),
+      activeReaders: _numericField(json, 'active_readers'),
+      walVersions: _numericField(json, 'wal_versions'),
+      warningCount: _numericField(json, 'warning_count'),
+      sharedWal: _boolField(json, 'shared_wal'),
+      cacheEntries: _numericField(json, 'cache_entries'),
+      cacheCapacity: _numericField(json, 'cache_capacity'),
+    );
+  }
+
+  static int _numericField(Map<String, Object?> json, String key) {
+    final v = json[key];
+    if (v == null) return 0;
+    if (v is int) return v;
+    if (v is double) return v.toInt();
+    throw FormatException(
+        'Expected numeric value for key "$key", got ${v.runtimeType}: $v');
+  }
+
+  static bool _boolField(Map<String, Object?> json, String key) {
+    final v = json[key];
+    if (v == null) return false;
+    if (v is bool) return v;
+    throw FormatException(
+        'Expected boolean value for key "$key", got ${v.runtimeType}: $v');
+  }
+
+  static String _stringField(Map<String, Object?> json, String key) {
+    final v = json[key];
+    if (v == null) return '';
+    if (v is String) return v;
+    return v.toString();
   }
 }

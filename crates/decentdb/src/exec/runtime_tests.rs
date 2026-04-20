@@ -280,10 +280,10 @@ mod tests {
             primary_key_columns: Vec::new(),
             next_row_id: 1,
         };
-        runtime.catalog.tables.insert("t".to_string(), table);
-        runtime.tables.insert(
+        runtime.catalog_mut().tables.insert("t".to_string(), table);
+        runtime.tables_mut().insert(
             "t".to_string(),
-            TableData {
+            std::sync::Arc::new(TableData {
                 rows: vec![
                     StoredRow {
                         row_id: 1,
@@ -294,7 +294,7 @@ mod tests {
                         values: Vec::new(),
                     },
                 ],
-            },
+            }),
         );
 
         let res = runtime
@@ -336,22 +336,24 @@ mod tests {
 
         // mark_table_dirty
         runtime
-            .catalog
+            .catalog_mut()
             .tables
             .insert("x".to_string(), table.clone());
-        runtime.tables.insert("x".to_string(), TableData::default());
+        runtime
+            .tables_mut()
+            .insert("x".to_string(), std::sync::Arc::new(TableData::default()));
         runtime.mark_table_dirty("x");
         assert!(runtime.dirty_tables.contains("x"));
 
         // mark_table_append_dirty and mark_table_row_dirty
         let mut runtime2 = EngineRuntime::empty(1);
         runtime2
-            .catalog
+            .catalog_mut()
             .tables
             .insert("x".to_string(), table.clone());
         runtime2
-            .tables
-            .insert("x".to_string(), TableData::default());
+            .tables_mut()
+            .insert("x".to_string(), std::sync::Arc::new(TableData::default()));
         runtime2.mark_table_append_dirty("x");
         assert!(runtime2.append_only_dirty_tables.contains("x"));
         runtime2.mark_table_row_dirty("x", 3);
@@ -362,11 +364,11 @@ mod tests {
         // mark_all_tables_dirty
         let mut runtime3 = EngineRuntime::empty(1);
         runtime3
-            .catalog
+            .catalog_mut()
             .tables
             .insert("a".to_string(), table.clone());
         runtime3
-            .catalog
+            .catalog_mut()
             .tables
             .insert("b".to_string(), table.clone());
         runtime3.mark_all_tables_dirty();
@@ -410,12 +412,13 @@ mod tests {
             next_row_id: 1,
         };
         runtime
-            .temp_tables
+            .temp_tables_mut()
             .insert("temp".to_string(), table.clone());
-        runtime
-            .temp_table_data
-            .insert("temp".to_string(), TableData::default());
-        runtime.temp_views.insert(
+        runtime.temp_table_data_map_mut().insert(
+            "temp".to_string(),
+            std::sync::Arc::new(TableData::default()),
+        );
+        runtime.temp_views_mut().insert(
             "v".to_string(),
             crate::catalog::ViewSchema {
                 name: "v".to_string(),
@@ -457,8 +460,10 @@ mod tests {
             primary_key_columns: Vec::new(),
             next_row_id: 1,
         };
-        runtime.temp_tables.insert("t".to_string(), table.clone());
-        runtime.temp_views.insert(
+        runtime
+            .temp_tables_mut()
+            .insert("t".to_string(), table.clone());
+        runtime.temp_views_mut().insert(
             "v".to_string(),
             crate::catalog::ViewSchema {
                 name: "v".to_string(),
@@ -552,7 +557,7 @@ mod tests {
             primary_key_columns: Vec::new(),
             next_row_id: 1,
         };
-        runtime.catalog.tables.insert("t".to_string(), t);
+        runtime.catalog_mut().tables.insert("t".to_string(), t);
         let mut v = runtime
             .catalog
             .tables
@@ -560,7 +565,7 @@ mod tests {
             .cloned()
             .expect("expected test table");
         v.name = "v".to_string();
-        runtime.catalog.tables.insert("v".to_string(), v);
+        runtime.catalog_mut().tables.insert("v".to_string(), v);
 
         runtime.mark_table_row_dirty("t", 3);
         assert!(runtime.row_update_dirty.contains_key("t"));
@@ -639,10 +644,13 @@ mod tests {
             primary_key_columns: Vec::new(),
             next_row_id: 1,
         };
-        runtime.catalog.tables.insert("grp".to_string(), table);
-        runtime.tables.insert(
+        runtime
+            .catalog_mut()
+            .tables
+            .insert("grp".to_string(), table);
+        runtime.tables_mut().insert(
             "grp".to_string(),
-            TableData {
+            std::sync::Arc::new(TableData {
                 rows: vec![
                     StoredRow {
                         row_id: 1,
@@ -657,7 +665,7 @@ mod tests {
                         values: vec![Value::Text("b".to_string()), Value::Int64(7)],
                     },
                 ],
-            },
+            }),
         );
 
         let res = runtime
@@ -699,10 +707,10 @@ mod tests {
             primary_key_columns: Vec::new(),
             next_row_id: 1,
         };
-        runtime.catalog.tables.insert("t2".to_string(), table);
-        runtime.tables.insert(
+        runtime.catalog_mut().tables.insert("t2".to_string(), table);
+        runtime.tables_mut().insert(
             "t2".to_string(),
-            TableData {
+            std::sync::Arc::new(TableData {
                 rows: vec![
                     StoredRow {
                         row_id: 1,
@@ -717,7 +725,7 @@ mod tests {
                         values: vec![Value::Text("x".to_string())],
                     },
                 ],
-            },
+            }),
         );
         let res = runtime
             .execute_read_statement(&statement, &[], 4096)
@@ -770,10 +778,13 @@ mod tests {
             primary_key_columns: Vec::new(),
             next_row_id: 1,
         };
-        runtime.catalog.tables.insert("a".to_string(), table_a);
-        runtime.tables.insert(
+        runtime
+            .catalog_mut()
+            .tables
+            .insert("a".to_string(), table_a);
+        runtime.tables_mut().insert(
             "a".to_string(),
-            TableData {
+            std::sync::Arc::new(TableData {
                 rows: vec![
                     StoredRow {
                         row_id: 1,
@@ -784,7 +795,7 @@ mod tests {
                         values: vec![Value::Int64(2), Value::Int64(200)],
                     },
                 ],
-            },
+            }),
         );
 
         let col_b_id = ColumnSchema {
@@ -835,10 +846,13 @@ mod tests {
             primary_key_columns: Vec::new(),
             next_row_id: 10,
         };
-        runtime.catalog.tables.insert("b".to_string(), table_b);
-        runtime.tables.insert(
+        runtime
+            .catalog_mut()
+            .tables
+            .insert("b".to_string(), table_b);
+        runtime.tables_mut().insert(
             "b".to_string(),
-            TableData {
+            std::sync::Arc::new(TableData {
                 rows: vec![
                     StoredRow {
                         row_id: 10,
@@ -857,7 +871,7 @@ mod tests {
                         ],
                     },
                 ],
-            },
+            }),
         );
 
         let idx_a = IndexSchema {
@@ -886,8 +900,14 @@ mod tests {
             predicate_sql: None,
             fresh: true,
         };
-        runtime.catalog.indexes.insert(idx_a.name.clone(), idx_a);
-        runtime.catalog.indexes.insert(idx_b.name.clone(), idx_b);
+        runtime
+            .catalog_mut()
+            .indexes
+            .insert(idx_a.name.clone(), idx_a);
+        runtime
+            .catalog_mut()
+            .indexes
+            .insert(idx_b.name.clone(), idx_b);
 
         let _ = runtime.rebuild_indexes(4096);
 

@@ -1,5 +1,6 @@
 //! Write-ahead log ownership, recovery, and checkpointing.
 
+pub(crate) mod async_commit;
 pub(crate) mod checkpoint;
 pub(crate) mod delta;
 pub(crate) mod format;
@@ -21,6 +22,7 @@ use crate::storage::PagerHandle;
 use crate::vfs::VfsFile;
 use crate::vfs::VfsHandle;
 
+use self::async_commit::AsyncCommitState;
 use self::index::WalIndex;
 use self::reader_registry::{ReaderGuard, ReaderRegistry};
 
@@ -43,6 +45,11 @@ pub(crate) struct SharedWalInner {
     reader_registry: ReaderRegistry,
     checkpoint_pending: AtomicBool,
     checkpoint_epoch: AtomicU64,
+    /// `Some` when `sync_mode` is `WalSyncMode::AsyncCommit { .. }`; owns the
+    /// background flusher thread and durability watermark. Constructed lazily
+    /// in `build_handle` and torn down when `SharedWalInner` is dropped (which
+    /// joins the thread and performs a final synchronous flush).
+    pub(super) async_commit: Option<AsyncCommitState>,
 }
 
 #[derive(Debug, Default)]
@@ -93,7 +100,7 @@ impl WalHandle {
         &self,
         page_id: PageId,
         snapshot_lsn: u64,
-    ) -> Result<Option<Vec<u8>>> {
+    ) -> Result<Option<Arc<[u8]>>> {
         let index = self
             .inner
             .index
@@ -101,7 +108,7 @@ impl WalHandle {
             .expect("wal index lock should not be poisoned");
         Ok(index
             .latest_visible(page_id, snapshot_lsn)
-            .map(|version| version.data.clone()))
+            .map(|version| Arc::clone(&version.data)))
     }
 
     pub(crate) fn latest_snapshot(&self) -> u64 {
@@ -179,5 +186,72 @@ impl WalHandle {
         self.inner
             .checkpoint_pending
             .store(pending, Ordering::SeqCst);
+    }
+
+    /// Blocks until every commit acknowledged before this call is durable on
+    /// disk. For sync modes other than `AsyncCommit` this is a no-op because
+    /// commits are already synchronously durable.
+    pub(crate) fn flush_to_durable(&self) -> Result<()> {
+        match self.inner.async_commit.as_ref() {
+            Some(state) => state.flush_to_durable(),
+            None => Ok(()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use crate::config::WalSyncMode;
+    use crate::storage::page;
+    use crate::storage::{write_database_bootstrap_vfs, DatabaseHeader, PagerHandle};
+    use crate::vfs::mem::MemVfs;
+    use crate::vfs::{FileKind, OpenMode, Vfs, VfsHandle};
+
+    use super::WalHandle;
+
+    fn test_pager(vfs: &VfsHandle, path: &Path) -> PagerHandle {
+        let file = vfs
+            .open(path, OpenMode::OpenOrCreate, FileKind::Database)
+            .expect("create database file");
+        let header = DatabaseHeader::new(page::DEFAULT_PAGE_SIZE);
+        write_database_bootstrap_vfs(file.as_ref(), &header).expect("bootstrap db");
+        PagerHandle::open(Arc::clone(&file), header, 1).expect("open pager")
+    }
+
+    #[test]
+    fn read_page_at_snapshot_shares_backing_allocation() {
+        let mem_vfs: Arc<dyn Vfs> = Arc::new(MemVfs::default());
+        let vfs = VfsHandle::from_vfs(Arc::clone(&mem_vfs));
+        let db_path = Path::new(":memory:");
+        let pager = test_pager(&vfs, db_path);
+        let wal = WalHandle::acquire(
+            &vfs,
+            db_path,
+            page::DEFAULT_PAGE_SIZE,
+            WalSyncMode::TestingOnlyUnsafeNoSync,
+            &pager,
+        )
+        .expect("acquire wal");
+        let page_id = page::CATALOG_ROOT_PAGE_ID + 1;
+        let payload = vec![0x5A; page::DEFAULT_PAGE_SIZE as usize];
+        let snapshot_lsn = wal
+            .commit_pages(&pager, vec![(page_id, payload)], page_id)
+            .expect("commit page");
+
+        let first = wal
+            .read_page_at_snapshot(page_id, snapshot_lsn)
+            .expect("read snapshot page")
+            .expect("page should be in wal");
+        let second = wal
+            .read_page_at_snapshot(page_id, snapshot_lsn)
+            .expect("read snapshot page again")
+            .expect("page should be in wal");
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(Arc::strong_count(&first) >= 2);
+        assert!(mem_vfs.is_memory());
     }
 }

@@ -51,7 +51,7 @@ impl EngineRuntime {
             )));
         }
 
-        self.catalog.triggers.insert(
+        self.catalog_mut().triggers.insert(
             statement.trigger_name.clone(),
             TriggerSchema {
                 name: statement.trigger_name.clone(),
@@ -88,7 +88,7 @@ impl EngineRuntime {
                 name, trigger.target_name, table_name
             )));
         }
-        self.catalog.triggers.remove(name);
+        self.catalog_mut().triggers.remove(name);
         self.bump_schema_cookie();
         Ok(())
     }

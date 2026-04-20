@@ -507,12 +507,14 @@ mod tests {
 
 #[cfg(test)]
 mod wal_index_tests {
+    use std::sync::Arc;
+
     use crate::wal::index::{WalIndex, WalVersion};
 
     fn ver(lsn: u64, byte: u8) -> WalVersion {
         WalVersion {
             lsn,
-            data: vec![byte; 16],
+            data: Arc::<[u8]>::from(vec![byte; 16]),
         }
     }
 

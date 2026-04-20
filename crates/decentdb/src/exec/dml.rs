@@ -1,6 +1,7 @@
 //! DML execution helpers.
 
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use crate::catalog::{
     identifiers_equal, ColumnType, ForeignKeyAction, ForeignKeyConstraint, IndexKind, TriggerEvent,
@@ -693,7 +694,7 @@ impl EngineRuntime {
                 if matches!(value, Value::Null) {
                     return Ok(QueryResult::with_affected_rows(0));
                 }
-                let Some(RuntimeIndex::Btree { keys }) = self.indexes.get(index_name) else {
+                let Some(RuntimeIndex::Btree { keys }) = self.index(index_name) else {
                     return Ok(QueryResult::with_affected_rows(0));
                 };
                 row_id_set_to_vec(keys.row_ids_for_value_set(&value)?)
@@ -770,7 +771,7 @@ impl EngineRuntime {
             self.catalog.indexes.get(&prepared.name),
             Some(index) if index.kind == IndexKind::Btree && index.fresh
         ) && matches!(
-            self.indexes.get(&prepared.name),
+            self.index(&prepared.name),
             Some(super::RuntimeIndex::Btree { .. })
         )
     }
@@ -783,7 +784,7 @@ impl EngineRuntime {
             self.catalog.indexes.get(&prepared.parent_index_name),
             Some(index) if index.kind == IndexKind::Btree && index.fresh
         ) && matches!(
-            self.indexes.get(&prepared.parent_index_name),
+            self.index(&prepared.parent_index_name),
             Some(super::RuntimeIndex::Btree { .. })
         )
     }
@@ -1671,16 +1672,16 @@ impl EngineRuntime {
             }
             rendered_rows
         };
-        let dataset = Dataset {
-            columns: table
+        let dataset = Dataset::with_rows(
+            table
                 .columns
                 .iter()
                 .map(|column| {
                     ColumnBinding::visible(Some(table_name.to_string()), column.name.clone())
                 })
                 .collect(),
-            rows: rendered_rows.iter().map(|row| row.values.clone()).collect(),
-        };
+            rendered_rows.iter().map(|row| row.values.clone()).collect(),
+        );
         let projected = self.project_dataset(
             &dataset,
             items,
@@ -1688,13 +1689,13 @@ impl EngineRuntime {
             &std::collections::BTreeMap::new(),
             None,
         )?;
+        let Dataset { columns, rows } = projected;
         Ok(QueryResult::with_rows(
-            projected
-                .columns
+            columns.into_iter().map(|column| column.name).collect(),
+            Arc::unwrap_or_clone(rows)
                 .into_iter()
-                .map(|column| column.name)
+                .map(QueryRow::new)
                 .collect(),
-            projected.rows.into_iter().map(QueryRow::new).collect(),
         ))
     }
 
@@ -1723,16 +1724,16 @@ impl EngineRuntime {
         let current_eval_values =
             materialize_row_for_generated(self, &table, &current_row.values)?.into_owned();
         let dataset = table_row_dataset(&table, &current_eval_values, table_name);
-        let excluded = Dataset {
-            columns: table
+        let excluded = Dataset::with_rows(
+            table
                 .columns
                 .iter()
                 .map(|column| {
                     ColumnBinding::visible(Some("excluded".to_string()), column.name.clone())
                 })
                 .collect(),
-            rows: vec![excluded_values.to_vec()],
-        };
+            vec![excluded_values.to_vec()],
+        );
         if let Some(filter) = filter {
             if !matches!(
                 self.eval_expr(
@@ -2298,7 +2299,7 @@ fn prepare_btree_insert_index(
         || !index.fresh
         || index.predicate_sql.is_some()
         || !matches!(
-            runtime.indexes.get(&index.name),
+            runtime.index(&index.name),
             Some(super::RuntimeIndex::Btree { .. })
         )
     {
@@ -2429,7 +2430,7 @@ fn validate_prepared_insert(
                 continue;
             }
             let key = prepared_btree_index_key(index, row)?;
-            let Some(super::RuntimeIndex::Btree { keys }) = runtime.indexes.get(&index.name) else {
+            let Some(super::RuntimeIndex::Btree { keys }) = runtime.index(&index.name) else {
                 return Err(DbError::internal(format!(
                     "runtime index {} is missing",
                     index.name
@@ -2453,7 +2454,7 @@ fn validate_prepared_insert(
             continue;
         }
         let Some(super::RuntimeIndex::Btree { keys }) =
-            runtime.indexes.get(&foreign_key.parent_index_name)
+            runtime.index(&foreign_key.parent_index_name)
         else {
             return Err(DbError::internal(format!(
                 "runtime index {} is missing",
@@ -2530,8 +2531,7 @@ fn apply_prepared_insert_index_updates(
                     "typed INT64 prepared index expected an INT64 value",
                 ));
             };
-            let Some(super::RuntimeIndex::Btree { keys }) = runtime.indexes.get_mut(&index.name)
-            else {
+            let Some(super::RuntimeIndex::Btree { keys }) = runtime.index_mut(&index.name) else {
                 return Err(DbError::internal(format!(
                     "runtime index {} is missing",
                     index.name
@@ -2570,7 +2570,7 @@ fn apply_prepared_insert_index_updates(
             continue;
         }
         let key = prepared_btree_index_key(index, &row.values)?;
-        let Some(super::RuntimeIndex::Btree { keys }) = runtime.indexes.get_mut(&index.name) else {
+        let Some(super::RuntimeIndex::Btree { keys }) = runtime.index_mut(&index.name) else {
             return Err(DbError::internal(format!(
                 "runtime index {} is missing",
                 index.name
@@ -2665,7 +2665,7 @@ fn materialize_insert_source(
             .collect(),
         InsertSource::Query(query) => runtime
             .evaluate_query(query, params, &std::collections::BTreeMap::new())
-            .map(|dataset| dataset.rows),
+            .map(Dataset::into_rows),
     }
 }
 
@@ -2785,7 +2785,7 @@ fn indexed_row_ids_for_filter(
     }) else {
         return Ok(None);
     };
-    let Some(RuntimeIndex::Btree { keys }) = runtime.indexes.get(&index.name) else {
+    let Some(RuntimeIndex::Btree { keys }) = runtime.index(&index.name) else {
         return Ok(None);
     };
     if matches!(
@@ -2945,7 +2945,7 @@ fn prepared_delete_has_referencing_child(
         )));
     };
     if let Some(index_name) = &child.child_index_name {
-        let Some(RuntimeIndex::Btree { keys }) = runtime.indexes.get(index_name) else {
+        let Some(RuntimeIndex::Btree { keys }) = runtime.index(index_name) else {
             return Ok(false);
         };
         return Ok(!keys.row_ids_for_value_set(parent_value)?.is_empty());
@@ -2984,7 +2984,7 @@ fn apply_runtime_index_update_for_row_change(
             if old_key == new_key {
                 return Ok(true);
             }
-            let Some(RuntimeIndex::Btree { keys }) = runtime.indexes.get_mut(&index.name) else {
+            let Some(RuntimeIndex::Btree { keys }) = runtime.index_mut(&index.name) else {
                 return Ok(false);
             };
             if let Some(old_key) = old_key.as_ref() {
@@ -2998,8 +2998,7 @@ fn apply_runtime_index_update_for_row_change(
         IndexKind::Trigram => {
             let old_text = trigram_index_text_for_row(runtime, index, table, old_row_values)?;
             let new_text = trigram_index_text_for_row(runtime, index, table, new_row_values)?;
-            let Some(RuntimeIndex::Trigram { index: trigram }) =
-                runtime.indexes.get_mut(&index.name)
+            let Some(RuntimeIndex::Trigram { index: trigram }) = runtime.index_mut(&index.name)
             else {
                 return Ok(false);
             };
@@ -3030,7 +3029,7 @@ fn apply_runtime_index_delete_for_row(
     match index.kind {
         IndexKind::Btree => {
             let key = compute_index_key(runtime, index, table, row_values)?;
-            let Some(RuntimeIndex::Btree { keys }) = runtime.indexes.get_mut(&index.name) else {
+            let Some(RuntimeIndex::Btree { keys }) = runtime.index_mut(&index.name) else {
                 return Ok(false);
             };
             if let Some(key) = key.as_ref() {
@@ -3040,8 +3039,7 @@ fn apply_runtime_index_delete_for_row(
         }
         IndexKind::Trigram => {
             let text = trigram_index_text_for_row(runtime, index, table, row_values)?;
-            let Some(RuntimeIndex::Trigram { index: trigram }) =
-                runtime.indexes.get_mut(&index.name)
+            let Some(RuntimeIndex::Trigram { index: trigram }) = runtime.index_mut(&index.name)
             else {
                 return Ok(false);
             };
@@ -3124,10 +3122,7 @@ fn view_match_count(
                 runtime
                     .eval_expr(
                         filter,
-                        &Dataset {
-                            columns: bindings.clone(),
-                            rows: vec![row.to_vec()],
-                        },
+                        &Dataset::with_rows(bindings.clone(), vec![row.to_vec()]),
                         row,
                         params,
                         &std::collections::BTreeMap::new(),
@@ -3232,7 +3227,7 @@ fn fk_matching_row_ids_via_index(
     }) else {
         return Ok(None);
     };
-    let Some(RuntimeIndex::Btree { keys }) = runtime.indexes.get(&index.name) else {
+    let Some(RuntimeIndex::Btree { keys }) = runtime.index(&index.name) else {
         return Ok(None);
     };
     keys.row_ids_for_value(&parent_key[0]).map(Some)
@@ -3458,7 +3453,7 @@ mod tests {
 
         let mut runtime = EngineRuntime::empty(0);
         runtime
-            .catalog
+            .catalog_mut()
             .tables
             .insert("t".to_string(), table.clone());
         assert_eq!(next_row_id(&mut runtime, "t"), 42);
@@ -3469,7 +3464,7 @@ mod tests {
         let mut temp_table = table.clone();
         temp_table.name = "temp_t".to_string();
         runtime2
-            .temp_tables
+            .temp_tables_mut()
             .insert(temp_table.name.clone(), temp_table);
         assert_eq!(next_row_id(&mut runtime2, "temp_t"), 42);
     }
@@ -3612,22 +3607,22 @@ mod tests {
         };
 
         runtime
-            .catalog
+            .catalog_mut()
             .tables
             .insert(parent.name.clone(), parent.clone());
         runtime
-            .catalog
+            .catalog_mut()
             .tables
             .insert(child.name.clone(), child.clone());
 
-        runtime.tables.insert(
+        runtime.tables_mut().insert(
             "child".to_string(),
-            crate::exec::TableData {
+            std::sync::Arc::new(crate::exec::TableData {
                 rows: vec![StoredRow {
                     row_id: 1,
                     values: vec![Value::Int64(1), Value::Int64(7)],
                 }],
-            },
+            }),
         );
 
         runtime
@@ -3708,22 +3703,22 @@ mod tests {
         };
 
         runtime
-            .catalog
+            .catalog_mut()
             .tables
             .insert(parent.name.clone(), parent.clone());
         runtime
-            .catalog
+            .catalog_mut()
             .tables
             .insert(child.name.clone(), child.clone());
 
-        runtime.tables.insert(
+        runtime.tables_mut().insert(
             "child".to_string(),
-            crate::exec::TableData {
+            std::sync::Arc::new(crate::exec::TableData {
                 rows: vec![StoredRow {
                     row_id: 1,
                     values: vec![Value::Int64(1), Value::Int64(7)],
                 }],
-            },
+            }),
         );
 
         runtime
@@ -3806,22 +3801,22 @@ mod tests {
         };
 
         runtime
-            .catalog
+            .catalog_mut()
             .tables
             .insert(parent.name.clone(), parent.clone());
         runtime
-            .catalog
+            .catalog_mut()
             .tables
             .insert(child.name.clone(), child.clone());
 
-        runtime.tables.insert(
+        runtime.tables_mut().insert(
             "child".to_string(),
-            crate::exec::TableData {
+            std::sync::Arc::new(crate::exec::TableData {
                 rows: vec![StoredRow {
                     row_id: 1,
                     values: vec![Value::Int64(1), Value::Int64(7)],
                 }],
-            },
+            }),
         );
 
         assert!(runtime
@@ -3900,22 +3895,22 @@ mod tests {
         };
 
         runtime
-            .catalog
+            .catalog_mut()
             .tables
             .insert(parent.name.clone(), parent.clone());
         runtime
-            .catalog
+            .catalog_mut()
             .tables
             .insert(child.name.clone(), child.clone());
 
-        runtime.tables.insert(
+        runtime.tables_mut().insert(
             "child".to_string(),
-            crate::exec::TableData {
+            std::sync::Arc::new(crate::exec::TableData {
                 rows: vec![StoredRow {
                     row_id: 1,
                     values: vec![Value::Int64(1), Value::Int64(7)],
                 }],
-            },
+            }),
         );
 
         runtime
@@ -4004,22 +3999,22 @@ mod tests {
         };
 
         runtime
-            .catalog
+            .catalog_mut()
             .tables
             .insert(parent.name.clone(), parent.clone());
         runtime
-            .catalog
+            .catalog_mut()
             .tables
             .insert(child.name.clone(), child.clone());
 
-        runtime.tables.insert(
+        runtime.tables_mut().insert(
             "child".to_string(),
-            crate::exec::TableData {
+            std::sync::Arc::new(crate::exec::TableData {
                 rows: vec![StoredRow {
                     row_id: 1,
                     values: vec![Value::Int64(1), Value::Int64(7)],
                 }],
-            },
+            }),
         );
 
         runtime
@@ -4108,22 +4103,22 @@ mod tests {
         };
 
         runtime
-            .catalog
+            .catalog_mut()
             .tables
             .insert(parent.name.clone(), parent.clone());
         runtime
-            .catalog
+            .catalog_mut()
             .tables
             .insert(child.name.clone(), child.clone());
 
-        runtime.tables.insert(
+        runtime.tables_mut().insert(
             "child".to_string(),
-            crate::exec::TableData {
+            std::sync::Arc::new(crate::exec::TableData {
                 rows: vec![StoredRow {
                     row_id: 1,
                     values: vec![Value::Int64(1), Value::Int64(7)],
                 }],
-            },
+            }),
         );
 
         assert!(runtime
@@ -4184,17 +4179,17 @@ mod apply_conflict_tests {
             next_row_id: 2,
         };
         runtime
-            .catalog
+            .catalog_mut()
             .tables
             .insert(table.name.clone(), table.clone());
-        runtime.tables.insert(
+        runtime.tables_mut().insert(
             "t".to_string(),
-            crate::exec::TableData {
+            std::sync::Arc::new(crate::exec::TableData {
                 rows: vec![StoredRow {
                     row_id: 1,
                     values: vec![Value::Int64(1), Value::Int64(10)],
                 }],
-            },
+            }),
         );
 
         let assignments = vec![crate::sql::ast::Assignment {
@@ -4268,17 +4263,17 @@ mod apply_conflict_tests {
             next_row_id: 2,
         };
         runtime
-            .catalog
+            .catalog_mut()
             .tables
             .insert(table.name.clone(), table.clone());
-        runtime.tables.insert(
+        runtime.tables_mut().insert(
             "t2".to_string(),
-            crate::exec::TableData {
+            std::sync::Arc::new(crate::exec::TableData {
                 rows: vec![StoredRow {
                     row_id: 1,
                     values: vec![Value::Int64(1), Value::Int64(0), Value::Int64(10)],
                 }],
-            },
+            }),
         );
 
         let assignments = vec![crate::sql::ast::Assignment {
@@ -4336,17 +4331,17 @@ mod apply_conflict_tests {
             next_row_id: 2,
         };
         runtime
-            .catalog
+            .catalog_mut()
             .tables
             .insert(table.name.clone(), table.clone());
-        runtime.tables.insert(
+        runtime.tables_mut().insert(
             "t3".to_string(),
-            crate::exec::TableData {
+            std::sync::Arc::new(crate::exec::TableData {
                 rows: vec![StoredRow {
                     row_id: 1,
                     values: vec![Value::Int64(1), Value::Int64(10)],
                 }],
-            },
+            }),
         );
 
         let assignments = vec![crate::sql::ast::Assignment {
@@ -4414,17 +4409,17 @@ mod apply_conflict_tests {
             next_row_id: 2,
         };
         runtime
-            .catalog
+            .catalog_mut()
             .tables
             .insert(table.name.clone(), table.clone());
-        runtime.tables.insert(
+        runtime.tables_mut().insert(
             "t4".to_string(),
-            crate::exec::TableData {
+            std::sync::Arc::new(crate::exec::TableData {
                 rows: vec![StoredRow {
                     row_id: 1,
                     values: vec![Value::Int64(1), Value::Int64(10)],
                 }],
-            },
+            }),
         );
 
         let assignments = vec![crate::sql::ast::Assignment {
@@ -4539,7 +4534,7 @@ mod dml_private_tests {
             next_row_id: 10,
         };
         runtime
-            .catalog
+            .catalog_mut()
             .tables
             .insert("t".to_string(), table.clone());
         let id = next_row_id(&mut runtime, "t");

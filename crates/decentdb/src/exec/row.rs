@@ -1,5 +1,7 @@
 //! Public result rows and internal row-set buffers.
 
+use std::sync::Arc;
+
 use crate::record::value::Value;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -104,7 +106,7 @@ pub(crate) struct ColumnBinding {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Dataset {
     pub(crate) columns: Vec<ColumnBinding>,
-    pub(crate) rows: Vec<Vec<Value>>,
+    pub(crate) rows: Arc<Vec<Vec<Value>>>,
 }
 
 impl Dataset {
@@ -112,8 +114,41 @@ impl Dataset {
     pub(crate) fn empty() -> Self {
         Self {
             columns: Vec::new(),
-            rows: Vec::new(),
+            rows: Arc::new(Vec::new()),
         }
+    }
+
+    #[must_use]
+    pub(crate) fn with_rows(columns: Vec<ColumnBinding>, rows: Vec<Vec<Value>>) -> Self {
+        Self {
+            columns,
+            rows: Arc::new(rows),
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn share_rows(&self, columns: Vec<ColumnBinding>) -> Self {
+        Self {
+            columns,
+            rows: Arc::clone(&self.rows),
+        }
+    }
+
+    pub(crate) fn rows_mut(&mut self) -> &mut Vec<Vec<Value>> {
+        Arc::make_mut(&mut self.rows)
+    }
+
+    #[must_use]
+    pub(crate) fn into_rows(self) -> Vec<Vec<Value>> {
+        Arc::unwrap_or_clone(self.rows)
+    }
+
+    pub(crate) fn set_rows(&mut self, rows: Vec<Vec<Value>>) {
+        self.rows = Arc::new(rows);
+    }
+
+    pub(crate) fn take_rows(&mut self) -> Vec<Vec<Value>> {
+        Arc::unwrap_or_clone(std::mem::take(&mut self.rows))
     }
 }
 

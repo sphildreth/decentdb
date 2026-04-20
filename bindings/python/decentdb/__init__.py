@@ -6,6 +6,7 @@ import json
 import os
 import re
 import uuid
+import warnings
 import weakref
 from collections.abc import Mapping
 
@@ -90,6 +91,10 @@ class DataError(DatabaseError):
 
 
 class NotSupportedError(DatabaseError):
+    pass
+
+
+class PerformanceWarning(UserWarning):
     pass
 
 
@@ -3198,6 +3203,15 @@ class Connection:
             ptr = ctypes.c_void_p(stmt.value)
             self._lib.ddb_stmt_free(ctypes.byref(ptr))
         self._stmt_cache.clear()
+        hits = self._stats["cache_hit"]
+        misses = self._stats["cache_miss"]
+        total = hits + misses
+        if misses > 0 and total >= 100 and (hits / total) < 0.5:
+            warnings.warn(
+                "Statement cache hit rate stayed below 50%; prefer parameterized queries to improve statement reuse.",
+                PerformanceWarning,
+                stacklevel=2,
+            )
         self._lib.ddb_db_free(ctypes.byref(self._db))
         self._db = None
         self._closed = True
@@ -3225,6 +3239,16 @@ class Connection:
         if code != ERR_OK:
             return self._in_explicit_txn
         return bool(flag.value)
+
+    @property
+    def stmt_cache_stats(self):
+        """Return statement cache statistics with hits, misses, size, and capacity."""
+        return {
+            "hits": self._stats["cache_hit"],
+            "misses": self._stats["cache_miss"],
+            "size": len(self._stmt_cache),
+            "capacity": self._stmt_cache_size,
+        }
 
     def commit(self):
         self._ensure_open()

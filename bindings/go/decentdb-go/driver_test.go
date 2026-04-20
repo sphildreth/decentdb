@@ -1,12 +1,15 @@
 package decentdb
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -410,6 +413,51 @@ func TestDriver_Blob(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+func TestBindLargeBlob_NoCgoPointerViolation(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "decentdb-test-large-blob-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	dbPath := filepath.Join(tmpDir, "large-blob.ddb")
+	dsn := fmt.Sprintf("file:%s", dbPath)
+
+	db, err := sql.Open("decentdb", dsn)
+	if err != nil {
+		t.Fatalf("failed to open: %v", err)
+	}
+	defer db.Close()
+
+	if _, err := db.Exec("CREATE TABLE t (id INT PRIMARY KEY, data BLOB)"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Regression guard for the cgo pointer-rule fix when binding Go byte slices.
+	blob := make([]byte, 1<<20)
+	for i := range blob {
+		blob[i] = byte(i % 251)
+	}
+
+	stmt, err := db.Prepare("INSERT INTO t (id, data) VALUES ($1, $2)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stmt.Close()
+
+	if _, err := stmt.Exec(1, blob); err != nil {
+		t.Fatalf("insert large blob failed: %v", err)
+	}
+
+	var got []byte
+	if err := db.QueryRow("SELECT data FROM t WHERE id = 1").Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, blob) {
+		t.Fatal("large blob round-trip mismatch")
 	}
 }
 
@@ -951,5 +999,45 @@ func TestSaveAs_EmptyDatabase(t *testing.T) {
 	}
 	if len(tables) != 0 {
 		t.Errorf("expected 0 tables in empty db, got %d", len(tables))
+	}
+}
+
+func TestDoubleClose_IsIdempotent(t *testing.T) {
+	db, err := OpenDirect(":memory:")
+	if err != nil {
+		t.Fatalf("OpenDirect(:memory:) failed: %v", err)
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("first Close failed: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("second Close failed: %v", err)
+	}
+}
+
+func TestExplicitCloseDetachesFinalizer(t *testing.T) {
+	var closeCount atomic.Uint32
+	hook := closeHook(func() {
+		closeCount.Add(1)
+	})
+	dbCloseHook.Store(&hook)
+	defer dbCloseHook.Store(nil)
+
+	db, err := OpenDirect(":memory:")
+	if err != nil {
+		t.Fatalf("OpenDirect(:memory:) failed: %v", err)
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+	db = nil
+
+	runtime.GC()
+	runtime.GC()
+
+	if got := closeCount.Load(); got != 1 {
+		t.Fatalf("expected close hook to run once, got %d", got)
 	}
 }

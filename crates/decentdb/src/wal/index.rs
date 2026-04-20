@@ -1,13 +1,14 @@
 //! In-memory WAL page-version index.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::storage::page::PageId;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct WalVersion {
     pub(crate) lsn: u64,
-    pub(crate) data: Vec<u8>,
+    pub(crate) data: Arc<[u8]>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -77,5 +78,24 @@ impl WalIndex {
     #[must_use]
     pub(crate) fn version_count(&self) -> usize {
         self.pages.values().map(std::vec::Vec::len).sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::WalVersion;
+
+    #[test]
+    fn wal_version_clone_shares_arc_backing_storage() {
+        let data = Arc::<[u8]>::from(vec![0xAB; 16]);
+        let first = WalVersion {
+            lsn: 42,
+            data: Arc::clone(&data),
+        };
+        let second = first.clone();
+
+        assert!(Arc::ptr_eq(&first.data, &second.data));
     }
 }

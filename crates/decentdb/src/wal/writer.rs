@@ -4,6 +4,7 @@
 //! - design/adr/0003-snapshot-lsn-atomicity.md
 
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use crate::config::WalSyncMode;
 use crate::error::{DbError, Result};
@@ -57,7 +58,7 @@ pub(crate) fn commit_pages(
         let base = base_pages
             .get(i)
             .and_then(|b| b.as_ref())
-            .map(|data| data.as_slice());
+            .map(|data| &data[..]);
         let encoded_len =
             append_best_page_frame_with_base(page_batch, wal, pager, page_id, &payload, base)?;
         prepared_pages.push((page_id, payload, encoded_len));
@@ -72,7 +73,7 @@ pub(crate) fn commit_pages(
     recovery::persist_header(&wal.inner.file, wal.inner.page_size, new_offset)?;
     write_all_at(wal.inner.file.as_ref(), offset, page_batch)?;
     offset = new_offset;
-    sync_for_mode(wal.inner.sync_mode, wal, metadata_changed)?;
+    sync_for_mode(wal, metadata_changed, new_offset)?;
 
     {
         let mut index = wal
@@ -90,7 +91,7 @@ pub(crate) fn commit_pages(
                 page_id,
                 WalVersion {
                     lsn: version_lsn,
-                    data: payload,
+                    data: Arc::from(payload),
                 },
                 retain_history,
             );
@@ -148,7 +149,7 @@ pub(crate) fn commit_pages_if_latest(
         let base = base_pages
             .get(i)
             .and_then(|b| b.as_ref())
-            .map(|data| data.as_slice());
+            .map(|data| &data[..]);
         let encoded_len =
             append_best_page_frame_with_base(page_batch, wal, pager, page_id, &payload, base)?;
         prepared_pages.push((page_id, payload, encoded_len));
@@ -161,7 +162,7 @@ pub(crate) fn commit_pages_if_latest(
     recovery::persist_header(&wal.inner.file, wal.inner.page_size, new_offset)?;
     write_all_at(wal.inner.file.as_ref(), offset, page_batch)?;
     offset = new_offset;
-    sync_for_mode(wal.inner.sync_mode, wal, metadata_changed)?;
+    sync_for_mode(wal, metadata_changed, new_offset)?;
 
     {
         let mut index = wal
@@ -179,7 +180,7 @@ pub(crate) fn commit_pages_if_latest(
                 page_id,
                 WalVersion {
                     lsn: version_lsn,
-                    data: payload,
+                    data: Arc::from(payload),
                 },
                 retain_history,
             );
@@ -207,14 +208,17 @@ pub(crate) fn append_checkpoint_frame(wal: &WalHandle, checkpoint_lsn: u64) -> R
     recovery::persist_header(&wal.inner.file, wal.inner.page_size, new_offset)?;
     write_all_at(wal.inner.file.as_ref(), offset, &bytes)?;
     offset = new_offset;
-    sync_for_mode(wal.inner.sync_mode, wal, metadata_changed)?;
+    // Checkpoint frames are a critical recovery boundary: even under
+    // AsyncCommit, we want them durable before advancing wal_end_lsn so
+    // recovery cannot observe a checkpoint frame that is not yet on disk.
+    sync_durably(wal, metadata_changed)?;
     wal.inner.wal_end_lsn.store(offset, Ordering::Release);
     Ok(offset)
 }
 
 pub(crate) fn truncate_to_header(wal: &WalHandle) -> Result<()> {
     recovery::truncate_to_header(&wal.inner.file, wal.inner.page_size)?;
-    sync_for_mode(wal.inner.sync_mode, wal, true)?;
+    sync_durably(wal, true)?;
     wal.inner.wal_end_lsn.store(0, Ordering::Release);
     wal.inner
         .allocated_len
@@ -222,8 +226,13 @@ pub(crate) fn truncate_to_header(wal: &WalHandle) -> Result<()> {
     Ok(())
 }
 
-fn sync_for_mode(sync_mode: WalSyncMode, wal: &WalHandle, metadata_changed: bool) -> Result<()> {
-    match sync_mode {
+/// Sync helper used by per-commit paths. Under `AsyncCommit` this is a no-op
+/// and the background flusher will catch up; the writer records the new end
+/// LSN with the flusher state so any concurrent `flush_to_durable` knows the
+/// target. Under all other modes this performs the appropriate synchronous
+/// fsync.
+fn sync_for_mode(wal: &WalHandle, metadata_changed: bool, new_end_lsn: u64) -> Result<()> {
+    match wal.inner.sync_mode {
         WalSyncMode::Full => {
             if metadata_changed {
                 wal.inner.file.sync_metadata()
@@ -232,7 +241,26 @@ fn sync_for_mode(sync_mode: WalSyncMode, wal: &WalHandle, metadata_changed: bool
             }
         }
         WalSyncMode::Normal => wal.inner.file.sync_data(),
+        WalSyncMode::AsyncCommit { .. } => {
+            // SAFETY (durability): we publish the new dirty watermark *before*
+            // returning so a subsequent `Db::sync()` cannot complete without
+            // observing this commit.
+            if let Some(state) = wal.inner.async_commit.as_ref() {
+                state.note_write(new_end_lsn, metadata_changed);
+            }
+            Ok(())
+        }
         WalSyncMode::TestingOnlyUnsafeNoSync => Ok(()),
+    }
+}
+
+/// Force-sync helper for paths that must be durable regardless of sync mode
+/// (checkpoint frames, WAL truncation). Bypasses the AsyncCommit deferral.
+fn sync_durably(wal: &WalHandle, metadata_changed: bool) -> Result<()> {
+    if metadata_changed {
+        wal.inner.file.sync_metadata()
+    } else {
+        wal.inner.file.sync_data()
     }
 }
 
@@ -302,7 +330,7 @@ fn lookup_base_pages_batch(
     wal: &WalHandle,
     pages: &[(PageId, Vec<u8>)],
     snapshot_lsn: u64,
-) -> Vec<Option<Vec<u8>>> {
+) -> Vec<Option<Arc<[u8]>>> {
     let index = wal
         .inner
         .index
@@ -313,7 +341,7 @@ fn lookup_base_pages_batch(
         .map(|(page_id, _)| {
             index
                 .latest_visible(*page_id, snapshot_lsn)
-                .map(|v| v.data.clone())
+                .map(|v| Arc::clone(&v.data))
         })
         .collect()
 }

@@ -682,6 +682,40 @@ fn cte_with_join() {
 }
 
 #[test]
+fn aliased_cte_self_join_returns_expected_rows() {
+    let db = mem_db();
+    exec(
+        &db,
+        "CREATE TABLE pairs (id INT64 PRIMARY KEY, group_id INT64, name TEXT)",
+    );
+    exec(
+        &db,
+        "INSERT INTO pairs VALUES
+            (1, 10, 'alpha'),
+            (2, 10, 'beta'),
+            (3, 20, 'gamma')",
+    );
+
+    let r = exec(
+        &db,
+        "WITH cte AS (
+            SELECT id, group_id, name FROM pairs
+         )
+         SELECT a.id, b.id, a.group_id
+         FROM cte AS a
+         JOIN cte AS b
+           ON a.group_id = b.group_id
+          AND a.id < b.id
+         ORDER BY a.id, b.id",
+    );
+
+    assert_eq!(
+        rows(&r),
+        vec![vec![Value::Int64(1), Value::Int64(2), Value::Int64(10)]]
+    );
+}
+
+#[test]
 fn cte_wrong_column_count_error() {
     let db = mem_db();
     db.execute("CREATE TABLE t(id INT64, val TEXT)").unwrap();

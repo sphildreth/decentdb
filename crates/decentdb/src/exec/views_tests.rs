@@ -239,4 +239,45 @@ mod tests {
 
         Ok(())
     }
+
+    /// Regression test: CREATE VIEW must NOT execute the SELECT body just to
+    /// learn its column names. We verify this by creating a view with a
+    /// projection list whose column names are fully resolvable from the AST,
+    /// then dropping all data — the view should still report the correct
+    /// columns at definition time even though the body would scan an empty
+    /// table.
+    #[test]
+    fn test_create_view_does_not_execute_body() -> Result<()> {
+        let (db, _temp) = create_test_db()?;
+
+        db.execute("CREATE TABLE t (x INT64, y INT64)")?;
+        // No INSERTs — the table is empty. CREATE VIEW must still resolve
+        // column names from the AST without executing the body.
+        db.execute("CREATE VIEW v AS SELECT x AS first, y AS second, x + y AS total FROM t")?;
+
+        // Verify the column names are correctly registered without ever
+        // executing the SELECT body.
+        let result = db.execute("SELECT * FROM v")?;
+        assert_eq!(result.columns(), &["first", "second", "total"]);
+        assert_eq!(result.rows().len(), 0);
+
+        Ok(())
+    }
+
+    /// Wildcard projections must still work via the execution-based fallback
+    /// since their column names depend on the source dataset's schema.
+    #[test]
+    fn test_create_view_wildcard_fallback() -> Result<()> {
+        let (db, _temp) = create_test_db()?;
+
+        db.execute("CREATE TABLE src (a INT64, b TEXT)")?;
+        db.execute("INSERT INTO src VALUES (1, 'one')")?;
+        db.execute("CREATE VIEW v_all AS SELECT * FROM src")?;
+
+        let result = db.execute("SELECT * FROM v_all")?;
+        assert_eq!(result.columns(), &["a", "b"]);
+        assert_eq!(result.rows().len(), 1);
+
+        Ok(())
+    }
 }

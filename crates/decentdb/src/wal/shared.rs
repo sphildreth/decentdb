@@ -77,6 +77,13 @@ fn build_handle(
         recovery::initialize_or_recover(&file, pager, page_size)?;
     let allocated_len = file.file_size()?;
 
+    let async_commit = match sync_mode {
+        WalSyncMode::AsyncCommit { interval_ms } => Some(
+            super::async_commit::AsyncCommitState::new(Arc::clone(&file), end_lsn, interval_ms),
+        ),
+        _ => None,
+    };
+
     Ok(WalHandle {
         inner: Arc::new(SharedWalInner {
             canonical_path,
@@ -91,6 +98,7 @@ fn build_handle(
             reader_registry: ReaderRegistry::default(),
             checkpoint_pending: AtomicBool::new(false),
             checkpoint_epoch: AtomicU64::new(0),
+            async_commit,
         }),
     })
 }

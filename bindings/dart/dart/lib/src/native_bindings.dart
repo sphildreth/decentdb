@@ -213,6 +213,15 @@ typedef _DbStringOutDart = int Function(
   Pointer<Pointer<Utf8>> outValue,
 );
 
+typedef _DbInspectStorageStateC = Uint32 Function(
+  Pointer<DdbDb> db,
+  Pointer<Pointer<Utf8>> outJson,
+);
+typedef _DbInspectStorageStateDart = int Function(
+  Pointer<DdbDb> db,
+  Pointer<Pointer<Utf8>> outJson,
+);
+
 typedef _DbNamedStringOutC = Uint32 Function(
   Pointer<DdbDb> db,
   Pointer<Utf8> name,
@@ -385,6 +394,17 @@ typedef _StmtBindTimestampMicrosDart = int Function(
   Pointer<DdbStmt> stmt,
   int index,
   int timestampMicros,
+);
+
+typedef _StmtBindUuidC = Uint32 Function(
+  Pointer<DdbStmt> stmt,
+  IntPtr index,
+  Pointer<Uint8> bytes16,
+);
+typedef _StmtBindUuidDart = int Function(
+  Pointer<DdbStmt> stmt,
+  int index,
+  Pointer<Uint8> bytes16,
 );
 
 typedef _StmtExecuteBatchI64C = Uint32 Function(
@@ -685,6 +705,9 @@ class NativeBindings {
         dbGetSchemaSnapshotJson =
             _lib.lookupFunction<_DbStringOutC, _DbStringOutDart>(
                 'ddb_db_get_schema_snapshot_json'),
+        dbInspectStorageStateJson = _lib.lookupFunction<
+                _DbInspectStorageStateC, _DbInspectStorageStateDart>(
+            'ddb_db_inspect_storage_state_json'),
         evictSharedWal =
             _lib.lookupFunction<_EvictSharedWalC, _EvictSharedWalDart>(
                 'ddb_evict_shared_wal'),
@@ -774,7 +797,10 @@ class NativeBindings {
         stmtBindInt64StepI64TextF64 = _lib.lookupFunction<
                 _StmtBindInt64StepI64TextF64C,
                 _StmtBindInt64StepI64TextF64Dart>(
-            'ddb_stmt_bind_int64_step_i64_text_f64');
+            'ddb_stmt_bind_int64_step_i64_text_f64'),
+        stmtBindUuid =
+            _lib.lookupFunction<_StmtBindUuidC, _StmtBindUuidDart>(
+                'ddb_stmt_bind_uuid');
 
   // ignore: unused_field – kept so DynamicLibrary stays live and symbols remain resolved
   final DynamicLibrary _lib;
@@ -811,6 +837,7 @@ class NativeBindings {
   final _DbNamedStringOutDart dbGetViewDdl;
   final _DbStringOutDart dbListTriggersJson;
   final _DbStringOutDart dbGetSchemaSnapshotJson;
+  final _DbInspectStorageStateDart dbInspectStorageStateJson;
   final _EvictSharedWalDart evictSharedWal;
 
   // ddb_db_execute result accessors
@@ -850,6 +877,7 @@ class NativeBindings {
   final _StmtFetchRowsI64TextF64Dart stmtFetchRowsI64TextF64;
   final _StmtBindInt64StepRowViewDart stmtBindInt64StepRowView;
   final _StmtBindInt64StepI64TextF64Dart stmtBindInt64StepI64TextF64;
+  final _StmtBindUuidDart stmtBindUuid;
 
   static final Map<String, NativeBindings> _cache = {};
 

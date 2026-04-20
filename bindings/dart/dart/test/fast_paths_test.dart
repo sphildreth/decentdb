@@ -1,3 +1,5 @@
+import 'dart:typed_data';
+
 import 'package:decentdb/decentdb.dart';
 import 'package:test/test.dart';
 
@@ -154,6 +156,109 @@ void main() {
 
       final r3 = stmt.bindInt64StepI64TextF64(1, 99);
       expect(r3, isNull);
+    } finally {
+      stmt.dispose();
+    }
+  });
+
+  // D5/D6: malloc-backed batch helpers -------------------------------------------
+
+  test('bindBlob round-trips a 1 MiB blob exactly (D5)', () {
+    db.execute('CREATE TABLE blobs (id INT64 PRIMARY KEY, data BLOB)');
+    final data = Uint8List.fromList(
+        List.generate(1024 * 1024, (i) => i & 0xFF));
+    final stmt = db.prepare(r'INSERT INTO blobs VALUES ($1, $2)');
+    try {
+      stmt.bindInt64(1, 1);
+      stmt.bindBlob(2, data);
+      stmt.execute();
+    } finally {
+      stmt.dispose();
+    }
+
+    final row = db.query('SELECT data FROM blobs WHERE id = 1').first;
+    final result = row['data'] as List<int>;
+    expect(result.length, 1024 * 1024);
+    expect(result, orderedEquals(data));
+  });
+
+  test('executeBatchTyped preserves row order across 1k rows (D6)', () {
+    db.execute('CREATE TABLE t (id INT64 PRIMARY KEY, name TEXT)');
+    final stmt = db.prepare(r'INSERT INTO t VALUES ($1, $2)');
+    const n = 1000;
+    try {
+      stmt.executeBatchTyped(
+        'it',
+        [for (var i = 0; i < n; i++) [i, 'row_$i']],
+      );
+    } finally {
+      stmt.dispose();
+    }
+
+    final rows = db.query('SELECT id, name FROM t ORDER BY id');
+    expect(rows.length, n);
+    expect(rows.first['id'], 0);
+    expect(rows.last['id'], n - 1);
+    expect(rows.last['name'], 'row_${n - 1}');
+  });
+
+  test('executeBatchTyped handles a mix of short and long strings (D6)', () {
+    db.execute('CREATE TABLE t (id INT64 PRIMARY KEY, name TEXT)');
+    final stmt = db.prepare(r'INSERT INTO t VALUES ($1, $2)');
+    try {
+      final rows = [
+        [1, ''],
+        [2, 'x' * 10000],
+        [3, 'hello'],
+      ];
+      stmt.executeBatchTyped('it', rows);
+    } finally {
+      stmt.dispose();
+    }
+
+    final result = db.query('SELECT id, name FROM t ORDER BY id');
+    expect(result[0]['name'], '');
+    expect((result[1]['name'] as String).length, 10000);
+    expect(result[2]['name'], 'hello');
+  });
+
+  test('executeBatchTyped with 0 rows is a no-op (D6)', () {
+    db.execute('CREATE TABLE t (id INT64 PRIMARY KEY, name TEXT)');
+    final stmt = db.prepare(r'INSERT INTO t VALUES ($1, $2)');
+    try {
+      final affected = stmt.executeBatchTyped('it', []);
+      expect(affected, 0);
+    } finally {
+      stmt.dispose();
+    }
+
+    final rows = db.query('SELECT id FROM t');
+    expect(rows, isEmpty);
+  });
+
+  // D8: zero-copy column names / query() ----------------------------------------
+
+  test('columnNames returns an unmodifiable view (D8)', () {
+    db.execute('CREATE TABLE t (a INT64, b TEXT, c FLOAT64)');
+    final stmt = db.prepare('SELECT a, b, c FROM t');
+    try {
+      stmt.step(); // primes execution and loads column metadata
+      final names = stmt.columnNames;
+      expect(names, orderedEquals(['a', 'b', 'c']));
+      expect(() => (names as List).clear(), throwsUnsupportedError);
+    } finally {
+      stmt.dispose();
+    }
+  });
+
+  test('query() result list is unmodifiable (D8)', () {
+    db.execute('CREATE TABLE t (id INT64 PRIMARY KEY)');
+    db.execute('INSERT INTO t VALUES (1)');
+    final stmt = db.prepare('SELECT id FROM t');
+    try {
+      final result = stmt.query();
+      expect(result.length, 1);
+      expect(() => (result as List).clear(), throwsUnsupportedError);
     } finally {
       stmt.dispose();
     }
