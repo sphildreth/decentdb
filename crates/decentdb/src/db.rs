@@ -235,7 +235,7 @@ impl TempSchemaState {
     fn apply_to_runtime(&self, runtime: &mut EngineRuntime) {
         runtime.temp_schema_cookie = self.schema_cookie;
         runtime.temp_tables = self.tables.clone();
-        runtime.temp_table_data = self.table_data.clone();
+        runtime.temp_table_data = Arc::new(self.table_data.clone());
         runtime.temp_views = self.views.clone();
         runtime.temp_indexes = self.indexes.clone();
     }
@@ -243,7 +243,7 @@ impl TempSchemaState {
     fn update_from_runtime(&mut self, runtime: &EngineRuntime) {
         self.schema_cookie = runtime.temp_schema_cookie;
         self.tables = runtime.temp_tables.clone();
-        self.table_data = runtime.temp_table_data.clone();
+        self.table_data = runtime.temp_table_data.as_ref().clone();
         self.views = runtime.temp_views.clone();
         self.indexes = runtime.temp_indexes.clone();
     }
@@ -1418,7 +1418,7 @@ impl Db {
         )?;
         wal.set_max_page_count(pager.on_disk_page_count()?);
         let (runtime, runtime_lsn) = EngineRuntime::load_from_storage(&pager, &wal, schema_cookie)?;
-        let catalog = CatalogHandle::new(runtime.catalog.clone());
+        let catalog = CatalogHandle::new(runtime.catalog.as_ref().clone());
         let last_seen_checkpoint_epoch = wal.checkpoint_epoch();
 
         Ok(Self {
@@ -2041,7 +2041,9 @@ impl Db {
         };
         let runtime_schema_cookie = runtime.catalog.schema_cookie;
         if self.inner.catalog.schema_cookie()? != runtime_schema_cookie {
-            self.inner.catalog.replace(runtime.catalog.clone())?;
+            self.inner
+                .catalog
+                .replace(runtime.catalog.as_ref().clone())?;
         }
         self.sync_temp_state_from_runtime(&runtime)?;
         self.inner
@@ -2093,7 +2095,9 @@ impl Db {
         };
         let runtime_schema_cookie = runtime.catalog.schema_cookie;
         if self.inner.catalog.schema_cookie()? != runtime_schema_cookie {
-            self.inner.catalog.replace(runtime.catalog.clone())?;
+            self.inner
+                .catalog
+                .replace(runtime.catalog.as_ref().clone())?;
         }
         self.sync_temp_state_from_runtime(&runtime)?;
         self.inner
@@ -2145,7 +2149,9 @@ impl Db {
         };
         let runtime_schema_cookie = runtime.catalog.schema_cookie;
         if self.inner.catalog.schema_cookie()? != runtime_schema_cookie {
-            self.inner.catalog.replace(runtime.catalog.clone())?;
+            self.inner
+                .catalog
+                .replace(runtime.catalog.as_ref().clone())?;
         }
         self.sync_temp_state_from_runtime(&runtime)?;
         self.inner
@@ -2187,7 +2193,9 @@ impl Db {
         };
         let runtime_schema_cookie = runtime.catalog.schema_cookie;
         if self.inner.catalog.schema_cookie()? != runtime_schema_cookie {
-            self.inner.catalog.replace(runtime.catalog.clone())?;
+            self.inner
+                .catalog
+                .replace(runtime.catalog.as_ref().clone())?;
         }
         self.sync_temp_state_from_runtime(&runtime)?;
         self.inner
@@ -2248,6 +2256,11 @@ impl Db {
         self.apply_temp_state_to_runtime(&mut snapshot)?;
         snapshot.rebuild_stale_indexes(self.inner.config.page_size)?;
         Ok(snapshot)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_engine_snapshot(&self) -> Result<EngineRuntime> {
+        self.engine_snapshot()
     }
 
     fn apply_temp_state_to_runtime(&self, runtime: &mut EngineRuntime) -> Result<()> {
@@ -2424,7 +2437,9 @@ impl Db {
             }
         };
         if self.inner.catalog.schema_cookie()? != runtime_schema_cookie {
-            self.inner.catalog.replace(state.runtime.catalog.clone())?;
+            self.inner
+                .catalog
+                .replace(state.runtime.catalog.as_ref().clone())?;
         }
         self.sync_temp_state_from_runtime(&state.runtime)?;
         self.inner
@@ -2465,7 +2480,9 @@ impl Db {
             }
         };
         if self.inner.catalog.schema_cookie()? != runtime_schema_cookie {
-            self.inner.catalog.replace(runtime.catalog.clone())?;
+            self.inner
+                .catalog
+                .replace(runtime.catalog.as_ref().clone())?;
         }
         self.sync_temp_state_from_runtime(&runtime)?;
         let mut guard = self
@@ -2527,7 +2544,9 @@ impl Db {
         let (mut restored, restored_lsn) =
             EngineRuntime::load_from_storage(&self.inner.pager, &self.inner.wal, schema_cookie)?;
         self.apply_temp_state_to_runtime(&mut restored)?;
-        self.inner.catalog.replace(restored.catalog.clone())?;
+        self.inner
+            .catalog
+            .replace(restored.catalog.as_ref().clone())?;
         *runtime = restored;
         self.inner
             .last_runtime_lsn
@@ -2563,7 +2582,9 @@ impl Db {
         let (mut runtime, runtime_lsn) =
             EngineRuntime::load_from_storage(&self.inner.pager, &self.inner.wal, schema_cookie)?;
         self.apply_temp_state_to_runtime(&mut runtime)?;
-        self.inner.catalog.replace(runtime.catalog.clone())?;
+        self.inner
+            .catalog
+            .replace(runtime.catalog.as_ref().clone())?;
         let mut guard = self
             .inner
             .engine
@@ -3559,7 +3580,7 @@ fn render_runtime_dump(runtime: &EngineRuntime) -> String {
     for table in runtime.catalog.tables.values() {
         lines.push(render_create_table(table));
     }
-    for (table_name, table_data) in &runtime.tables {
+    for (table_name, table_data) in runtime.tables.iter() {
         if let Some(table) = runtime.catalog.tables.get(table_name) {
             for row in &table_data.rows {
                 lines.push(render_insert(table, &row.values));
@@ -3572,7 +3593,7 @@ fn render_runtime_dump(runtime: &EngineRuntime) -> String {
     for table in runtime.temp_tables.values() {
         lines.push(render_create_table(table));
     }
-    for (table_name, table_data) in &runtime.temp_table_data {
+    for (table_name, table_data) in runtime.temp_table_data.iter() {
         if let Some(table) = runtime.temp_tables.get(table_name) {
             for row in &table_data.rows {
                 lines.push(render_insert(table, &row.values));

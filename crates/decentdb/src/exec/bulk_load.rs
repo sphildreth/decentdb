@@ -44,7 +44,7 @@ impl EngineRuntime {
                     source_row.clone(),
                     &[],
                 )?;
-                self.catalog
+                self.catalog_mut()
                     .tables
                     .get_mut(table_name)
                     .ok_or_else(|| DbError::sql(format!("unknown table {}", table_name)))?
@@ -60,7 +60,7 @@ impl EngineRuntime {
                 &candidate,
             )
             .unwrap_or_else(|| super::dml::next_row_id(self, table_name));
-            self.tables
+            self.tables_mut()
                 .get_mut(table_name)
                 .ok_or_else(|| {
                     DbError::internal(format!("table data for {table_name} is missing"))

@@ -456,14 +456,14 @@ pub(super) enum PendingIndexInsert {
 
 #[derive(Debug)]
 pub(crate) struct EngineRuntime {
-    pub(crate) catalog: CatalogState,
-    pub(crate) tables: BTreeMap<String, TableData>,
+    pub(crate) catalog: Arc<CatalogState>,
+    pub(crate) tables: Arc<BTreeMap<String, TableData>>,
     pub(crate) temp_tables: BTreeMap<String, TableSchema>,
-    pub(crate) temp_table_data: BTreeMap<String, TableData>,
+    pub(crate) temp_table_data: Arc<BTreeMap<String, TableData>>,
     pub(crate) temp_views: BTreeMap<String, ViewSchema>,
     pub(crate) temp_indexes: BTreeMap<String, IndexSchema>,
     pub(crate) temp_schema_cookie: u32,
-    pub(crate) indexes: BTreeMap<String, RuntimeIndex>,
+    pub(crate) indexes: Arc<BTreeMap<String, RuntimeIndex>>,
     pub(crate) persisted_tables: BTreeMap<String, PersistedTableState>,
     /// Tables whose row data has not yet been loaded from storage.
     /// Populated during `decode_manifest_payload` and cleared by
@@ -504,14 +504,14 @@ impl Default for BulkLoadOptions {
 impl Clone for EngineRuntime {
     fn clone(&self) -> Self {
         Self {
-            catalog: self.catalog.clone(),
-            tables: self.tables.clone(),
+            catalog: Arc::clone(&self.catalog),
+            tables: Arc::clone(&self.tables),
             temp_tables: self.temp_tables.clone(),
-            temp_table_data: self.temp_table_data.clone(),
+            temp_table_data: Arc::clone(&self.temp_table_data),
             temp_views: self.temp_views.clone(),
             temp_indexes: self.temp_indexes.clone(),
             temp_schema_cookie: self.temp_schema_cookie,
-            indexes: self.indexes.clone(),
+            indexes: Arc::clone(&self.indexes),
             persisted_tables: self.persisted_tables.clone(),
             deferred_tables: self.deferred_tables.clone(),
             // Preserve dirty state so that multi-statement transactions
@@ -540,14 +540,14 @@ impl EngineRuntime {
     #[must_use]
     pub(crate) fn empty(schema_cookie: u32) -> Self {
         Self {
-            catalog: CatalogState::empty(schema_cookie),
-            tables: BTreeMap::new(),
+            catalog: Arc::new(CatalogState::empty(schema_cookie)),
+            tables: Arc::new(BTreeMap::new()),
             temp_tables: BTreeMap::new(),
-            temp_table_data: BTreeMap::new(),
+            temp_table_data: Arc::new(BTreeMap::new()),
             temp_views: BTreeMap::new(),
             temp_indexes: BTreeMap::new(),
             temp_schema_cookie: 0,
-            indexes: BTreeMap::new(),
+            indexes: Arc::new(BTreeMap::new()),
             persisted_tables: BTreeMap::new(),
             deferred_tables: BTreeSet::new(),
             dirty_tables: BTreeSet::new(),
@@ -572,11 +572,27 @@ impl EngineRuntime {
     fn persistent_resolution_runtime(&self) -> Self {
         let mut runtime = self.clone();
         runtime.temp_tables.clear();
-        runtime.temp_table_data.clear();
+        runtime.temp_table_data_map_mut().clear();
         runtime.temp_views.clear();
         runtime.temp_indexes.clear();
         runtime.temp_schema_cookie = 0;
         runtime
+    }
+
+    fn catalog_mut(&mut self) -> &mut CatalogState {
+        Arc::make_mut(&mut self.catalog)
+    }
+
+    fn tables_mut(&mut self) -> &mut BTreeMap<String, TableData> {
+        Arc::make_mut(&mut self.tables)
+    }
+
+    fn temp_table_data_map_mut(&mut self) -> &mut BTreeMap<String, TableData> {
+        Arc::make_mut(&mut self.temp_table_data)
+    }
+
+    fn indexes_mut(&mut self) -> &mut BTreeMap<String, RuntimeIndex> {
+        Arc::make_mut(&mut self.indexes)
     }
 
     pub(crate) fn load_from_storage(
@@ -618,7 +634,7 @@ impl EngineRuntime {
         } else {
             Self::empty(schema_cookie)
         };
-        runtime.catalog.schema_cookie = schema_cookie;
+        runtime.catalog_mut().schema_cookie = schema_cookie;
         // Materialize any deferred tables under the same reader guard so
         // that overflow pointers from the manifest are read against the
         // same WAL snapshot. If deferred loading uses a later snapshot,
@@ -699,7 +715,7 @@ impl EngineRuntime {
                 ps.row_count = data.rows.len();
                 ps.tail = read_uncompressed_overflow_tail(store, ps.pointer)?.unwrap_or_default();
             }
-            self.tables.insert(table_name.clone(), data);
+            self.tables_mut().insert(table_name.clone(), data);
         }
         self.deferred_tables.clear();
         self.rebuild_indexes(page_size)?;
@@ -1084,7 +1100,7 @@ impl EngineRuntime {
     }
 
     pub(super) fn planner_catalog(&self) -> CatalogState {
-        let mut catalog = self.catalog.clone();
+        let mut catalog = self.catalog.as_ref().clone();
         for (name, table) in &self.temp_tables {
             catalog.views.remove(name);
             catalog.tables.insert(name.clone(), table.clone());
@@ -1123,7 +1139,7 @@ impl EngineRuntime {
     }
 
     pub(super) fn temp_table_data_mut(&mut self, name: &str) -> Option<&mut TableData> {
-        map_get_ci_mut(&mut self.temp_table_data, name)
+        map_get_ci_mut(self.temp_table_data_map_mut(), name)
     }
 
     pub(super) fn temp_view(&self, name: &str) -> Option<&ViewSchema> {
@@ -1167,7 +1183,8 @@ impl EngineRuntime {
     }
 
     pub(super) fn catalog_table_mut(&mut self, name: &str) -> Option<&mut TableSchema> {
-        map_get_ci_mut(&mut self.catalog.tables, name)
+        let catalog = self.catalog_mut();
+        map_get_ci_mut(&mut catalog.tables, name)
     }
 
     pub(super) fn canonical_catalog_table_name(&self, name: &str) -> Option<String> {
@@ -1228,7 +1245,7 @@ impl EngineRuntime {
         if self.temp_table_schema(name).is_some() {
             return self.temp_table_data_mut(name);
         }
-        map_get_ci_mut(&mut self.tables, name)
+        map_get_ci_mut(self.tables_mut(), name)
     }
 
     pub(super) fn table_data_mut(&mut self, name: &str) -> Option<&mut TableData> {
@@ -1244,8 +1261,8 @@ impl EngineRuntime {
                 build_runtime_index(&index, self, page_size)?,
             );
         }
-        self.indexes = rebuilt;
-        for index in self.catalog.indexes.values_mut() {
+        *self.indexes_mut() = rebuilt;
+        for index in self.catalog_mut().indexes.values_mut() {
             index.fresh = true;
         }
         self.index_state_epoch = self.index_state_epoch.wrapping_add(1);
@@ -1259,11 +1276,9 @@ impl EngineRuntime {
             .get(name)
             .cloned()
             .ok_or_else(|| DbError::sql(format!("unknown index {name}")))?;
-        self.indexes.insert(
-            name.to_string(),
-            build_runtime_index(&index, self, page_size)?,
-        );
-        if let Some(index) = self.catalog.indexes.get_mut(name) {
+        let rebuilt = build_runtime_index(&index, self, page_size)?;
+        self.indexes_mut().insert(name.to_string(), rebuilt);
+        if let Some(index) = self.catalog_mut().indexes.get_mut(name) {
             index.fresh = true;
         }
         self.index_state_epoch = self.index_state_epoch.wrapping_add(1);
@@ -1298,7 +1313,7 @@ impl EngineRuntime {
             return;
         }
         let mut changed = false;
-        for index in self.catalog.indexes.values_mut() {
+        for index in self.catalog_mut().indexes.values_mut() {
             if identifiers_equal(&index.table_name, table_name) && index.fresh {
                 index.fresh = false;
                 changed = true;
@@ -1445,7 +1460,7 @@ impl EngineRuntime {
         for update in updates {
             match update {
                 PendingIndexInsert::Btree { name, key, row_id } => {
-                    match self.indexes.get_mut(&name) {
+                    match self.indexes_mut().get_mut(&name) {
                         Some(RuntimeIndex::Btree { keys }) => {
                             keys.insert_row_id(key, row_id)?;
                         }
@@ -1462,7 +1477,7 @@ impl EngineRuntime {
                     }
                 }
                 PendingIndexInsert::Trigram { name, row_id, text } => {
-                    match self.indexes.get_mut(&name) {
+                    match self.indexes_mut().get_mut(&name) {
                         Some(RuntimeIndex::Trigram { index }) => {
                             index.queue_insert(row_id, &text);
                         }
@@ -1698,7 +1713,7 @@ impl EngineRuntime {
                         .ok_or_else(|| DbError::sql(format!("unknown table {}", table_name)))?
                         .next_row_id = staged_table.next_row_id;
                 } else {
-                    self.catalog
+                    self.catalog_mut()
                         .tables
                         .get_mut(&table_name)
                         .ok_or_else(|| DbError::sql(format!("unknown table {}", table_name)))?
@@ -3258,7 +3273,7 @@ impl EngineRuntime {
                 ))
             })?
             .unwrap_or(0);
-        self.catalog
+        self.catalog_mut()
             .table_stats
             .insert(table_name.to_string(), TableStats { row_count });
 
@@ -3270,7 +3285,7 @@ impl EngineRuntime {
             .map(|index| index.name.clone())
             .collect::<Vec<_>>();
         for index_name in index_names {
-            self.catalog.index_stats.remove(&index_name);
+            self.catalog_mut().index_stats.remove(&index_name);
             let Some(index) = self.catalog.index(&index_name).cloned() else {
                 continue;
             };
@@ -3292,7 +3307,7 @@ impl EngineRuntime {
                     index.name
                 ))
             })?;
-            self.catalog.index_stats.insert(
+            self.catalog_mut().index_stats.insert(
                 index.name.clone(),
                 IndexStats {
                     entry_count,
@@ -6327,8 +6342,11 @@ fn decode_runtime_payload(bytes: &[u8]) -> Result<EngineRuntime> {
                 values: row.into_values(),
             });
         }
-        runtime.catalog.tables.insert(table_name.clone(), table);
-        runtime.tables.insert(table_name, data);
+        runtime
+            .catalog_mut()
+            .tables
+            .insert(table_name.clone(), table);
+        runtime.tables_mut().insert(table_name, data);
     }
 
     let index_count = cursor.read_u32()?;
@@ -6347,7 +6365,7 @@ fn decode_runtime_payload(bytes: &[u8]) -> Result<EngineRuntime> {
         }
         let predicate_sql = cursor.read_optional_string()?;
         let fresh = cursor.read_bool()?;
-        runtime.catalog.indexes.insert(
+        runtime.catalog_mut().indexes.insert(
             name.clone(),
             crate::catalog::IndexSchema {
                 name,
@@ -6370,7 +6388,7 @@ fn decode_runtime_payload(bytes: &[u8]) -> Result<EngineRuntime> {
             column_names: cursor.read_strings()?,
             dependencies: cursor.read_strings()?,
         };
-        runtime.catalog.views.insert(view.name.clone(), view);
+        runtime.catalog_mut().views.insert(view.name.clone(), view);
     }
 
     let trigger_count = cursor.read_u32()?;
@@ -6384,18 +6402,18 @@ fn decode_runtime_payload(bytes: &[u8]) -> Result<EngineRuntime> {
             action_sql: cursor.read_string()?,
         };
         runtime
-            .catalog
+            .catalog_mut()
             .triggers
             .insert(trigger.name.clone(), trigger);
     }
     if cursor.offset < cursor.bytes.len() {
-        decode_schemas_section(&mut cursor, &mut runtime.catalog.schemas)?;
+        decode_schemas_section(&mut cursor, &mut runtime.catalog_mut().schemas)?;
     }
     if cursor.offset < cursor.bytes.len() {
-        decode_index_include_columns_section(&mut cursor, &mut runtime.catalog.indexes)?;
+        decode_index_include_columns_section(&mut cursor, &mut runtime.catalog_mut().indexes)?;
     }
     if cursor.offset < cursor.bytes.len() {
-        decode_generated_columns_section(&mut cursor, &mut runtime.catalog.tables)?;
+        decode_generated_columns_section(&mut cursor, &mut runtime.catalog_mut().tables)?;
     }
     Ok(runtime)
 }
@@ -6641,7 +6659,10 @@ fn decode_manifest_payload<S: PageStore>(_store: &S, bytes: &[u8]) -> Result<Eng
             row_count: 0,
             tail: OverflowTailInfo::default(),
         };
-        runtime.catalog.tables.insert(table_name.clone(), table);
+        runtime
+            .catalog_mut()
+            .tables
+            .insert(table_name.clone(), table);
         let has_data = state.pointer.head_page_id != 0 && state.pointer.logical_len != 0;
         if has_data {
             // Defer row data loading to first statement execution.
@@ -6650,7 +6671,9 @@ fn decode_manifest_payload<S: PageStore>(_store: &S, bytes: &[u8]) -> Result<Eng
         runtime.persisted_tables.insert(table_name.clone(), state);
         if !has_data {
             // Empty tables are immediately available.
-            runtime.tables.insert(table_name, TableData::default());
+            runtime
+                .tables_mut()
+                .insert(table_name, TableData::default());
         }
     }
 
@@ -6670,7 +6693,7 @@ fn decode_manifest_payload<S: PageStore>(_store: &S, bytes: &[u8]) -> Result<Eng
         }
         let predicate_sql = cursor.read_optional_string()?;
         let fresh = cursor.read_bool()?;
-        runtime.catalog.indexes.insert(
+        runtime.catalog_mut().indexes.insert(
             name.clone(),
             crate::catalog::IndexSchema {
                 name,
@@ -6693,7 +6716,7 @@ fn decode_manifest_payload<S: PageStore>(_store: &S, bytes: &[u8]) -> Result<Eng
             column_names: cursor.read_strings()?,
             dependencies: cursor.read_strings()?,
         };
-        runtime.catalog.views.insert(view.name.clone(), view);
+        runtime.catalog_mut().views.insert(view.name.clone(), view);
     }
 
     let trigger_count = cursor.read_u32()?;
@@ -6707,7 +6730,7 @@ fn decode_manifest_payload<S: PageStore>(_store: &S, bytes: &[u8]) -> Result<Eng
             action_sql: cursor.read_string()?,
         };
         runtime
-            .catalog
+            .catalog_mut()
             .triggers
             .insert(trigger.name.clone(), trigger);
     }
@@ -6718,7 +6741,7 @@ fn decode_manifest_payload<S: PageStore>(_store: &S, bytes: &[u8]) -> Result<Eng
             let stats = crate::catalog::TableStats {
                 row_count: cursor.read_i64()?,
             };
-            runtime.catalog.table_stats.insert(name, stats);
+            runtime.catalog_mut().table_stats.insert(name, stats);
         }
     }
     if cursor.offset < cursor.bytes.len() {
@@ -6729,17 +6752,17 @@ fn decode_manifest_payload<S: PageStore>(_store: &S, bytes: &[u8]) -> Result<Eng
                 entry_count: cursor.read_i64()?,
                 distinct_key_count: cursor.read_i64()?,
             };
-            runtime.catalog.index_stats.insert(name, stats);
+            runtime.catalog_mut().index_stats.insert(name, stats);
         }
     }
     if cursor.offset < cursor.bytes.len() {
-        decode_schemas_section(&mut cursor, &mut runtime.catalog.schemas)?;
+        decode_schemas_section(&mut cursor, &mut runtime.catalog_mut().schemas)?;
     }
     if cursor.offset < cursor.bytes.len() {
-        decode_index_include_columns_section(&mut cursor, &mut runtime.catalog.indexes)?;
+        decode_index_include_columns_section(&mut cursor, &mut runtime.catalog_mut().indexes)?;
     }
     if cursor.offset < cursor.bytes.len() {
-        decode_generated_columns_section(&mut cursor, &mut runtime.catalog.tables)?;
+        decode_generated_columns_section(&mut cursor, &mut runtime.catalog_mut().tables)?;
     }
     Ok(runtime)
 }
@@ -13649,11 +13672,13 @@ fn eval_regex(left: Value, right: Value, case_insensitive: bool, negated: bool) 
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
+    use std::sync::Arc;
+
     use crate::record::compression::CompressionMode;
     use crate::search::TrigramQueryResult;
     use crate::sql::parser::parse_sql_statement;
     use crate::storage::page::InMemoryPageStore;
-    use crate::Value;
+    use crate::{Db, DbConfig, Value};
 
     use super::{
         decode_manifest_payload, decode_runtime_payload, drop_index_include_columns_section,
@@ -13905,7 +13930,7 @@ mod tests {
         let mut runtime = EngineRuntime::empty(10);
         execute_sql(&mut runtime, "CREATE TABLE docs (id INT64 PRIMARY KEY)");
         runtime
-            .catalog
+            .catalog_mut()
             .tables
             .get_mut("docs")
             .expect("table should exist")
@@ -13920,7 +13945,7 @@ mod tests {
         assert_eq!(first.catalog.tables["docs"].next_row_id, 42);
 
         runtime
-            .catalog
+            .catalog_mut()
             .tables
             .get_mut("docs")
             .expect("table should exist")
@@ -14016,6 +14041,138 @@ mod tests {
             .expect("execute count");
         assert_eq!(result.rows().len(), 1);
         assert_eq!(result.rows()[0].values(), &[Value::Int64(3)]);
+    }
+
+    #[test]
+    fn engine_runtime_clone_is_shallow_when_unmutated() {
+        let mut runtime = EngineRuntime::empty(17);
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE docs (id INT64 PRIMARY KEY, name TEXT)",
+        );
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE people (id INT64 PRIMARY KEY, email TEXT)",
+        );
+        execute_sql(&mut runtime, "CREATE INDEX docs_name_idx ON docs (name)");
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO docs (id, name) VALUES (1, 'alpha')",
+        );
+        execute_sql(
+            &mut runtime,
+            "CREATE TEMP TABLE temp_docs (id INT64 PRIMARY KEY, name TEXT)",
+        );
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO temp_docs (id, name) VALUES (1, 'temp')",
+        );
+
+        let cloned = runtime.clone();
+
+        assert!(Arc::ptr_eq(&runtime.catalog, &cloned.catalog));
+        assert!(Arc::ptr_eq(&runtime.tables, &cloned.tables));
+        assert!(Arc::ptr_eq(
+            &runtime.temp_table_data,
+            &cloned.temp_table_data
+        ));
+        assert!(Arc::ptr_eq(&runtime.indexes, &cloned.indexes));
+        assert_eq!(Arc::strong_count(&runtime.catalog), 2);
+        assert_eq!(Arc::strong_count(&runtime.tables), 2);
+        assert_eq!(Arc::strong_count(&runtime.temp_table_data), 2);
+        assert_eq!(Arc::strong_count(&runtime.indexes), 2);
+    }
+
+    #[test]
+    fn engine_runtime_cow_isolates_mutations() {
+        let mut runtime = EngineRuntime::empty(18);
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE docs (id INT64 PRIMARY KEY, name TEXT)",
+        );
+        execute_sql(
+            &mut runtime,
+            "CREATE TEMP TABLE temp_docs (id INT64 PRIMARY KEY, name TEXT)",
+        );
+
+        let mut cloned = runtime.clone();
+        execute_sql(&mut cloned, "CREATE INDEX docs_name_idx ON docs (name)");
+        execute_sql(
+            &mut cloned,
+            "INSERT INTO docs (id, name) VALUES (1, 'alpha')",
+        );
+        execute_sql(
+            &mut cloned,
+            "INSERT INTO temp_docs (id, name) VALUES (1, 'temp')",
+        );
+
+        assert!(!Arc::ptr_eq(&runtime.catalog, &cloned.catalog));
+        assert!(!Arc::ptr_eq(&runtime.tables, &cloned.tables));
+        assert!(!Arc::ptr_eq(
+            &runtime.temp_table_data,
+            &cloned.temp_table_data
+        ));
+        assert!(!Arc::ptr_eq(&runtime.indexes, &cloned.indexes));
+        assert!(!runtime.catalog.indexes.contains_key("docs_name_idx"));
+        assert!(cloned.catalog.indexes.contains_key("docs_name_idx"));
+        assert!(runtime
+            .table_data("docs")
+            .expect("original table data")
+            .rows
+            .is_empty());
+        assert_eq!(
+            cloned
+                .table_data("docs")
+                .expect("cloned table data")
+                .rows
+                .len(),
+            1
+        );
+        assert!(runtime
+            .temp_table_data("temp_docs")
+            .expect("original temp table data")
+            .rows
+            .is_empty());
+        assert_eq!(
+            cloned
+                .temp_table_data("temp_docs")
+                .expect("cloned temp table data")
+                .rows
+                .len(),
+            1
+        );
+
+        drop(cloned);
+
+        assert_eq!(Arc::strong_count(&runtime.catalog), 1);
+        assert_eq!(Arc::strong_count(&runtime.tables), 1);
+        assert_eq!(Arc::strong_count(&runtime.temp_table_data), 1);
+        assert_eq!(Arc::strong_count(&runtime.indexes), 1);
+    }
+
+    #[test]
+    fn engine_runtime_autocommit_select_does_not_grow_strong_counts_unboundedly() {
+        let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
+        db.execute("CREATE TABLE docs (id INT64 PRIMARY KEY, name TEXT)")
+            .expect("create table");
+        db.execute("INSERT INTO docs (id, name) VALUES (1, 'alpha')")
+            .expect("insert row 1");
+        db.execute("INSERT INTO docs (id, name) VALUES (2, 'beta')")
+            .expect("insert row 2");
+        db.execute("INSERT INTO docs (id, name) VALUES (3, 'gamma')")
+            .expect("insert row 3");
+
+        for _ in 0..100 {
+            let result = db
+                .execute("SELECT COUNT(*) FROM docs")
+                .expect("execute autocommit select");
+            assert_eq!(result.rows()[0].values(), &[Value::Int64(3)]);
+        }
+
+        let snapshot = db.debug_engine_snapshot().expect("snapshot runtime");
+        assert!(Arc::strong_count(&snapshot.catalog) <= 2);
+        assert!(Arc::strong_count(&snapshot.tables) <= 2);
+        assert!(Arc::strong_count(&snapshot.indexes) <= 2);
     }
 
     #[test]

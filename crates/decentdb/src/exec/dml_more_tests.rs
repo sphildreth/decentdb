@@ -48,11 +48,11 @@ mod tests {
             next_row_id: 2,
         };
         runtime
-            .catalog
+            .catalog_mut()
             .tables
             .insert("t".to_string(), table.clone());
 
-        runtime.tables.insert(
+        runtime.tables_mut().insert(
             "t".to_string(),
             TableData {
                 rows: vec![StoredRow {
@@ -125,11 +125,11 @@ mod tests {
             next_row_id: 2,
         };
         runtime
-            .catalog
+            .catalog_mut()
             .tables
             .insert("t".to_string(), table.clone());
 
-        runtime.tables.insert(
+        runtime.tables_mut().insert(
             "t".to_string(),
             TableData {
                 rows: vec![StoredRow {
@@ -196,7 +196,7 @@ mod tests {
             next_row_id: 1,
         };
         runtime
-            .catalog
+            .catalog_mut()
             .tables
             .insert(table.name.clone(), table.clone());
         let res = build_insert_row_values(&runtime, &mut table, &[], vec![Value::Int64(1)], &[]);
@@ -243,7 +243,7 @@ mod tests {
             next_row_id: 1,
         };
         runtime
-            .catalog
+            .catalog_mut()
             .tables
             .insert(table.name.clone(), table.clone());
         let res = build_insert_row_values(
@@ -281,7 +281,7 @@ mod tests {
             next_row_id: 1,
         };
         runtime
-            .catalog
+            .catalog_mut()
             .tables
             .insert(table.name.clone(), table.clone());
         let res = build_insert_row_values(
@@ -334,11 +334,11 @@ mod tests {
             next_row_id: 1,
         };
         runtime
-            .catalog
+            .catalog_mut()
             .tables
             .insert(table.name.clone(), table.clone());
         runtime
-            .tables
+            .tables_mut()
             .insert(table.name.clone(), TableData { rows: vec![] });
         let prepared = crate::exec::dml::PreparedSimpleInsert {
             table_name: "t".to_string(),
@@ -398,11 +398,11 @@ mod tests {
             next_row_id: 1,
         };
         runtime
-            .catalog
+            .catalog_mut()
             .tables
             .insert(table.name.clone(), table.clone());
         runtime
-            .tables
+            .tables_mut()
             .insert(table.name.clone(), TableData { rows: vec![] });
         let prepared = crate::exec::dml::PreparedSimpleInsert {
             table_name: "t2".to_string(),

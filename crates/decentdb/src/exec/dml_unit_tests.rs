@@ -46,7 +46,7 @@ mod tests {
             primary_key_columns: vec![],
             next_row_id: 1,
         };
-        runtime.catalog.tables.insert("t".to_string(), table);
+        runtime.catalog_mut().tables.insert("t".to_string(), table);
 
         let stmt = parse_sql_statement("INSERT INTO t (id, name) VALUES (1, 'x')").unwrap();
         let insert = match stmt {
@@ -83,7 +83,7 @@ mod tests {
             primary_key_columns: vec![],
             next_row_id: 1,
         };
-        runtime.catalog.tables.insert("t".to_string(), table);
+        runtime.catalog_mut().tables.insert("t".to_string(), table);
 
         let stmt = parse_sql_statement("INSERT INTO t (id) VALUES (1, 2)").unwrap();
         let insert = match stmt {
@@ -118,7 +118,7 @@ mod tests {
             primary_key_columns: vec![],
             next_row_id: 1,
         };
-        runtime.catalog.tables.insert("t".to_string(), table);
+        runtime.catalog_mut().tables.insert("t".to_string(), table);
         let stmt = parse_sql_statement("INSERT INTO t (unknown) VALUES (1)").unwrap();
         let insert = match stmt {
             Statement::Insert(insert) => insert,
@@ -140,7 +140,7 @@ mod tests {
             primary_key_columns: vec![],
             next_row_id: 1,
         };
-        runtime.catalog.tables.insert("t".to_string(), table);
+        runtime.catalog_mut().tables.insert("t".to_string(), table);
 
         let prepared = PreparedSimpleInsert {
             table_name: "t".to_string(),
@@ -198,11 +198,11 @@ mod tests {
             next_row_id: 1,
         };
         runtime
-            .catalog
+            .catalog_mut()
             .tables
             .insert("t".to_string(), table.clone());
         runtime
-            .tables
+            .tables_mut()
             .insert("t".to_string(), TableData { rows: vec![] });
 
         let stmt = parse_sql_statement("INSERT INTO t (val) VALUES (20)").unwrap();

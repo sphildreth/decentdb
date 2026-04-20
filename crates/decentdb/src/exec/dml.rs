@@ -2530,7 +2530,8 @@ fn apply_prepared_insert_index_updates(
                     "typed INT64 prepared index expected an INT64 value",
                 ));
             };
-            let Some(super::RuntimeIndex::Btree { keys }) = runtime.indexes.get_mut(&index.name)
+            let Some(super::RuntimeIndex::Btree { keys }) =
+                runtime.indexes_mut().get_mut(&index.name)
             else {
                 return Err(DbError::internal(format!(
                     "runtime index {} is missing",
@@ -2570,7 +2571,8 @@ fn apply_prepared_insert_index_updates(
             continue;
         }
         let key = prepared_btree_index_key(index, &row.values)?;
-        let Some(super::RuntimeIndex::Btree { keys }) = runtime.indexes.get_mut(&index.name) else {
+        let Some(super::RuntimeIndex::Btree { keys }) = runtime.indexes_mut().get_mut(&index.name)
+        else {
             return Err(DbError::internal(format!(
                 "runtime index {} is missing",
                 index.name
@@ -2984,7 +2986,8 @@ fn apply_runtime_index_update_for_row_change(
             if old_key == new_key {
                 return Ok(true);
             }
-            let Some(RuntimeIndex::Btree { keys }) = runtime.indexes.get_mut(&index.name) else {
+            let Some(RuntimeIndex::Btree { keys }) = runtime.indexes_mut().get_mut(&index.name)
+            else {
                 return Ok(false);
             };
             if let Some(old_key) = old_key.as_ref() {
@@ -2999,7 +3002,7 @@ fn apply_runtime_index_update_for_row_change(
             let old_text = trigram_index_text_for_row(runtime, index, table, old_row_values)?;
             let new_text = trigram_index_text_for_row(runtime, index, table, new_row_values)?;
             let Some(RuntimeIndex::Trigram { index: trigram }) =
-                runtime.indexes.get_mut(&index.name)
+                runtime.indexes_mut().get_mut(&index.name)
             else {
                 return Ok(false);
             };
@@ -3030,7 +3033,8 @@ fn apply_runtime_index_delete_for_row(
     match index.kind {
         IndexKind::Btree => {
             let key = compute_index_key(runtime, index, table, row_values)?;
-            let Some(RuntimeIndex::Btree { keys }) = runtime.indexes.get_mut(&index.name) else {
+            let Some(RuntimeIndex::Btree { keys }) = runtime.indexes_mut().get_mut(&index.name)
+            else {
                 return Ok(false);
             };
             if let Some(key) = key.as_ref() {
@@ -3041,7 +3045,7 @@ fn apply_runtime_index_delete_for_row(
         IndexKind::Trigram => {
             let text = trigram_index_text_for_row(runtime, index, table, row_values)?;
             let Some(RuntimeIndex::Trigram { index: trigram }) =
-                runtime.indexes.get_mut(&index.name)
+                runtime.indexes_mut().get_mut(&index.name)
             else {
                 return Ok(false);
             };
@@ -3458,7 +3462,7 @@ mod tests {
 
         let mut runtime = EngineRuntime::empty(0);
         runtime
-            .catalog
+            .catalog_mut()
             .tables
             .insert("t".to_string(), table.clone());
         assert_eq!(next_row_id(&mut runtime, "t"), 42);
@@ -3612,15 +3616,15 @@ mod tests {
         };
 
         runtime
-            .catalog
+            .catalog_mut()
             .tables
             .insert(parent.name.clone(), parent.clone());
         runtime
-            .catalog
+            .catalog_mut()
             .tables
             .insert(child.name.clone(), child.clone());
 
-        runtime.tables.insert(
+        runtime.tables_mut().insert(
             "child".to_string(),
             crate::exec::TableData {
                 rows: vec![StoredRow {
@@ -3708,15 +3712,15 @@ mod tests {
         };
 
         runtime
-            .catalog
+            .catalog_mut()
             .tables
             .insert(parent.name.clone(), parent.clone());
         runtime
-            .catalog
+            .catalog_mut()
             .tables
             .insert(child.name.clone(), child.clone());
 
-        runtime.tables.insert(
+        runtime.tables_mut().insert(
             "child".to_string(),
             crate::exec::TableData {
                 rows: vec![StoredRow {
@@ -3806,15 +3810,15 @@ mod tests {
         };
 
         runtime
-            .catalog
+            .catalog_mut()
             .tables
             .insert(parent.name.clone(), parent.clone());
         runtime
-            .catalog
+            .catalog_mut()
             .tables
             .insert(child.name.clone(), child.clone());
 
-        runtime.tables.insert(
+        runtime.tables_mut().insert(
             "child".to_string(),
             crate::exec::TableData {
                 rows: vec![StoredRow {
@@ -3900,15 +3904,15 @@ mod tests {
         };
 
         runtime
-            .catalog
+            .catalog_mut()
             .tables
             .insert(parent.name.clone(), parent.clone());
         runtime
-            .catalog
+            .catalog_mut()
             .tables
             .insert(child.name.clone(), child.clone());
 
-        runtime.tables.insert(
+        runtime.tables_mut().insert(
             "child".to_string(),
             crate::exec::TableData {
                 rows: vec![StoredRow {
@@ -4004,15 +4008,15 @@ mod tests {
         };
 
         runtime
-            .catalog
+            .catalog_mut()
             .tables
             .insert(parent.name.clone(), parent.clone());
         runtime
-            .catalog
+            .catalog_mut()
             .tables
             .insert(child.name.clone(), child.clone());
 
-        runtime.tables.insert(
+        runtime.tables_mut().insert(
             "child".to_string(),
             crate::exec::TableData {
                 rows: vec![StoredRow {
@@ -4108,15 +4112,15 @@ mod tests {
         };
 
         runtime
-            .catalog
+            .catalog_mut()
             .tables
             .insert(parent.name.clone(), parent.clone());
         runtime
-            .catalog
+            .catalog_mut()
             .tables
             .insert(child.name.clone(), child.clone());
 
-        runtime.tables.insert(
+        runtime.tables_mut().insert(
             "child".to_string(),
             crate::exec::TableData {
                 rows: vec![StoredRow {
@@ -4184,10 +4188,10 @@ mod apply_conflict_tests {
             next_row_id: 2,
         };
         runtime
-            .catalog
+            .catalog_mut()
             .tables
             .insert(table.name.clone(), table.clone());
-        runtime.tables.insert(
+        runtime.tables_mut().insert(
             "t".to_string(),
             crate::exec::TableData {
                 rows: vec![StoredRow {
@@ -4268,10 +4272,10 @@ mod apply_conflict_tests {
             next_row_id: 2,
         };
         runtime
-            .catalog
+            .catalog_mut()
             .tables
             .insert(table.name.clone(), table.clone());
-        runtime.tables.insert(
+        runtime.tables_mut().insert(
             "t2".to_string(),
             crate::exec::TableData {
                 rows: vec![StoredRow {
@@ -4336,10 +4340,10 @@ mod apply_conflict_tests {
             next_row_id: 2,
         };
         runtime
-            .catalog
+            .catalog_mut()
             .tables
             .insert(table.name.clone(), table.clone());
-        runtime.tables.insert(
+        runtime.tables_mut().insert(
             "t3".to_string(),
             crate::exec::TableData {
                 rows: vec![StoredRow {
@@ -4414,10 +4418,10 @@ mod apply_conflict_tests {
             next_row_id: 2,
         };
         runtime
-            .catalog
+            .catalog_mut()
             .tables
             .insert(table.name.clone(), table.clone());
-        runtime.tables.insert(
+        runtime.tables_mut().insert(
             "t4".to_string(),
             crate::exec::TableData {
                 rows: vec![StoredRow {
@@ -4539,7 +4543,7 @@ mod dml_private_tests {
             next_row_id: 10,
         };
         runtime
-            .catalog
+            .catalog_mut()
             .tables
             .insert("t".to_string(), table.clone());
         let id = next_row_id(&mut runtime, "t");

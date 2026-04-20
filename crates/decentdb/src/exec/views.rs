@@ -59,7 +59,9 @@ impl EngineRuntime {
             self.temp_views.insert(statement.view_name.clone(), view);
             self.bump_temp_schema_cookie();
         } else {
-            self.catalog.views.insert(statement.view_name.clone(), view);
+            self.catalog_mut()
+                .views
+                .insert(statement.view_name.clone(), view);
             self.bump_schema_cookie();
         }
         Ok(())
@@ -99,8 +101,8 @@ impl EngineRuntime {
                 dependents.join(", ")
             )));
         }
-        self.catalog.views.remove(&view_name);
-        self.catalog
+        self.catalog_mut().views.remove(&view_name);
+        self.catalog_mut()
             .triggers
             .retain(|_, trigger| !(trigger.target_name == view_name && trigger.on_view));
         self.bump_schema_cookie();
@@ -132,13 +134,13 @@ impl EngineRuntime {
             )));
         }
         let mut view = self
-            .catalog
+            .catalog_mut()
             .views
             .remove(view_name)
             .ok_or_else(|| DbError::sql(format!("unknown view {view_name}")))?;
         view.name = new_name.to_string();
-        self.catalog.views.insert(new_name.to_string(), view);
-        for trigger in self.catalog.triggers.values_mut() {
+        self.catalog_mut().views.insert(new_name.to_string(), view);
+        for trigger in self.catalog_mut().triggers.values_mut() {
             if trigger.on_view && trigger.target_name == view_name {
                 trigger.target_name = new_name.to_string();
             }
