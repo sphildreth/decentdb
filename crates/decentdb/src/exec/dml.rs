@@ -1,6 +1,7 @@
 //! DML execution helpers.
 
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use crate::catalog::{
     identifiers_equal, ColumnType, ForeignKeyAction, ForeignKeyConstraint, IndexKind, TriggerEvent,
@@ -1671,16 +1672,16 @@ impl EngineRuntime {
             }
             rendered_rows
         };
-        let dataset = Dataset {
-            columns: table
+        let dataset = Dataset::with_rows(
+            table
                 .columns
                 .iter()
                 .map(|column| {
                     ColumnBinding::visible(Some(table_name.to_string()), column.name.clone())
                 })
                 .collect(),
-            rows: rendered_rows.iter().map(|row| row.values.clone()).collect(),
-        };
+            rendered_rows.iter().map(|row| row.values.clone()).collect(),
+        );
         let projected = self.project_dataset(
             &dataset,
             items,
@@ -1688,13 +1689,13 @@ impl EngineRuntime {
             &std::collections::BTreeMap::new(),
             None,
         )?;
+        let Dataset { columns, rows } = projected;
         Ok(QueryResult::with_rows(
-            projected
-                .columns
+            columns.into_iter().map(|column| column.name).collect(),
+            Arc::unwrap_or_clone(rows)
                 .into_iter()
-                .map(|column| column.name)
+                .map(QueryRow::new)
                 .collect(),
-            projected.rows.into_iter().map(QueryRow::new).collect(),
         ))
     }
 
@@ -1723,16 +1724,16 @@ impl EngineRuntime {
         let current_eval_values =
             materialize_row_for_generated(self, &table, &current_row.values)?.into_owned();
         let dataset = table_row_dataset(&table, &current_eval_values, table_name);
-        let excluded = Dataset {
-            columns: table
+        let excluded = Dataset::with_rows(
+            table
                 .columns
                 .iter()
                 .map(|column| {
                     ColumnBinding::visible(Some("excluded".to_string()), column.name.clone())
                 })
                 .collect(),
-            rows: vec![excluded_values.to_vec()],
-        };
+            vec![excluded_values.to_vec()],
+        );
         if let Some(filter) = filter {
             if !matches!(
                 self.eval_expr(
@@ -2667,7 +2668,7 @@ fn materialize_insert_source(
             .collect(),
         InsertSource::Query(query) => runtime
             .evaluate_query(query, params, &std::collections::BTreeMap::new())
-            .map(|dataset| dataset.rows),
+            .map(Dataset::into_rows),
     }
 }
 
@@ -3128,10 +3129,7 @@ fn view_match_count(
                 runtime
                     .eval_expr(
                         filter,
-                        &Dataset {
-                            columns: bindings.clone(),
-                            rows: vec![row.to_vec()],
-                        },
+                        &Dataset::with_rows(bindings.clone(), vec![row.to_vec()]),
                         row,
                         params,
                         &std::collections::BTreeMap::new(),

@@ -1695,7 +1695,7 @@ impl EngineRuntime {
         let table_name = statement.table_name.clone();
         let temporary = self.visible_table_is_temporary(&table_name);
         let mut affected_rows = 0_u64;
-        for source_row in source.rows.drain(..) {
+        for source_row in source.take_rows() {
             let candidate = {
                 let mut staged_table = self
                     .table_schema(&table_name)
@@ -3803,7 +3803,7 @@ impl EngineRuntime {
             let rows = if start >= dataset.rows.len() {
                 Vec::new()
             } else {
-                let iter = dataset.rows.into_iter().skip(start);
+                let iter = dataset.take_rows().into_iter().skip(start);
                 match limit {
                     Some(limit) => iter
                         .take(usize::try_from(limit.max(0)).unwrap_or(0))
@@ -3811,7 +3811,7 @@ impl EngineRuntime {
                     None => iter.collect(),
                 }
             };
-            dataset.rows = rows;
+            dataset.set_rows(rows);
         }
         Ok(dataset)
     }
@@ -3862,7 +3862,8 @@ impl EngineRuntime {
 
         let mut anchor = self.evaluate_query_body(left, params, inherited_ctes)?;
         if !all {
-            anchor.rows = deduplicate_rows(anchor.rows)?;
+            let rows = anchor.take_rows();
+            anchor.set_rows(deduplicate_rows(rows)?);
         }
         let mut result = prepare_cte_dataset(cte, anchor)?;
         let mut working = result.clone();
@@ -3901,7 +3902,7 @@ impl EngineRuntime {
 
             let next_rows = if let Some(seen) = &mut seen {
                 let mut rows = Vec::new();
-                for row in recursive_rows.rows {
+                for row in recursive_rows.into_rows() {
                     let identity = row_identity(&row)?;
                     if seen.insert(identity) {
                         rows.push(row);
@@ -3909,15 +3910,15 @@ impl EngineRuntime {
                 }
                 rows
             } else {
-                recursive_rows.rows
+                recursive_rows.into_rows()
             };
 
             if next_rows.is_empty() {
                 return Ok(result);
             }
 
-            result.rows.extend(next_rows.clone());
-            working.rows = next_rows;
+            result.rows_mut().extend(next_rows.clone());
+            working.set_rows(next_rows);
         }
 
         Err(DbError::sql(format!(
@@ -4032,7 +4033,7 @@ impl EngineRuntime {
             let rows = if start >= dataset.rows.len() {
                 Vec::new()
             } else {
-                let iter = dataset.rows.into_iter().skip(start);
+                let iter = dataset.take_rows().into_iter().skip(start);
                 match limit {
                     Some(limit) => iter
                         .take(usize::try_from(limit.max(0)).unwrap_or(0))
@@ -4040,7 +4041,7 @@ impl EngineRuntime {
                     None => iter.collect(),
                 }
             };
-            dataset.rows = rows;
+            dataset.set_rows(rows);
         }
         Ok(dataset)
     }
@@ -4149,17 +4150,14 @@ impl EngineRuntime {
             return Ok(dataset);
         }
 
-        let columns = dataset.columns;
+        let Dataset { columns, rows } = dataset;
         let rows = if select.distinct_on.is_empty() {
-            deduplicate_rows_stable(dataset.rows)?
+            deduplicate_rows_stable(Arc::unwrap_or_clone(rows))?
         } else {
-            let key_dataset = Dataset {
-                columns: columns.clone(),
-                rows: Vec::new(),
-            };
+            let key_dataset = Dataset::with_rows(columns.clone(), Vec::new());
             let mut seen = BTreeSet::new();
             let mut distinct_rows = Vec::new();
-            for row in dataset.rows {
+            for row in Arc::unwrap_or_clone(rows) {
                 let key = select
                     .distinct_on
                     .iter()
@@ -4172,7 +4170,7 @@ impl EngineRuntime {
             distinct_rows
         };
 
-        Ok(Dataset { columns, rows })
+        Ok(Dataset::with_rows(columns, rows))
     }
 
     fn build_select_dataset(
@@ -4199,11 +4197,8 @@ impl EngineRuntime {
         };
 
         if let Some(filter) = &select.filter {
-            let filter_dataset = Dataset {
-                columns: dataset.columns.clone(),
-                rows: Vec::new(),
-            };
-            dataset.rows.retain(|row| {
+            let filter_dataset = Dataset::with_rows(dataset.columns.clone(), Vec::new());
+            dataset.rows_mut().retain(|row| {
                 matches!(
                     self.eval_expr(filter, &filter_dataset, row, params, ctes, None),
                     Ok(Value::Bool(true))
@@ -4227,11 +4222,8 @@ impl EngineRuntime {
 
         dataset = augment_dataset_with_outer_scope(dataset, outer_dataset, outer_row);
         if let Some(filter) = &select.filter {
-            let filter_dataset = Dataset {
-                columns: dataset.columns.clone(),
-                rows: Vec::new(),
-            };
-            dataset.rows.retain(|row| {
+            let filter_dataset = Dataset::with_rows(dataset.columns.clone(), Vec::new());
+            dataset.rows_mut().retain(|row| {
                 matches!(
                     self.eval_expr(filter, &filter_dataset, row, params, ctes, None),
                     Ok(Value::Bool(true))
@@ -4250,10 +4242,7 @@ impl EngineRuntime {
         scope_row: &[Value],
     ) -> Result<Dataset> {
         if from.is_empty() {
-            return Ok(Dataset {
-                columns: Vec::new(),
-                rows: vec![Vec::new()],
-            });
+            return Ok(Dataset::with_rows(Vec::new(), vec![Vec::new()]));
         }
         let mut iter = from.iter();
         let cross_constraint = JoinConstraint::On(Expr::Literal(Value::Bool(true)));
@@ -4453,10 +4442,7 @@ impl EngineRuntime {
                 .collect::<Result<Vec<_>>>()?;
             result_rows.push(values);
         }
-        Ok(Dataset {
-            columns,
-            rows: result_rows,
-        })
+        Ok(Dataset::with_rows(columns, result_rows))
     }
 
     fn try_indexed_join(
@@ -4826,7 +4812,7 @@ impl EngineRuntime {
             columns.extend(plan.filtered_dataset.columns.clone());
         }
         let mut rows = Vec::new();
-        for filtered_row in &plan.filtered_dataset.rows {
+        for filtered_row in plan.filtered_dataset.rows.iter() {
             let Some(join_value) = filtered_row.get(filtered_join_index) else {
                 return Err(DbError::internal(
                     "join row is shorter than filtered table schema",
@@ -4868,7 +4854,7 @@ impl EngineRuntime {
                 rows.push(row);
             });
         }
-        Ok(Some(Dataset { columns, rows }))
+        Ok(Some(Dataset::with_rows(columns, rows)))
     }
 
     /// Indexed equi-join probe path.
@@ -5001,7 +4987,7 @@ impl EngineRuntime {
         let right_column_count = right_table.columns.len();
         let is_left_outer = matches!(kind, JoinKind::Left);
         let mut rows = Vec::new();
-        for left_row in &left.rows {
+        for left_row in left.rows.iter() {
             let Some(join_value) = left_row.get(left_join_index) else {
                 return Err(DbError::internal(
                     "join row is shorter than the left input schema",
@@ -5048,7 +5034,7 @@ impl EngineRuntime {
                 rows.push(row);
             }
         }
-        Ok(Some(Dataset { columns, rows }))
+        Ok(Some(Dataset::with_rows(columns, rows)))
     }
 
     fn evaluate_from_item(
@@ -5071,13 +5057,13 @@ impl EngineRuntime {
         match item {
             FromItem::Table { name, alias } => {
                 if let Some(dataset) = ctes.get(name) {
-                    let mut dataset = dataset.clone();
+                    let mut columns = dataset.columns.clone();
                     if let Some(alias) = alias {
-                        for column in &mut dataset.columns {
+                        for column in &mut columns {
                             column.table = Some(alias.clone());
                         }
                     }
-                    return Ok(dataset);
+                    return Ok(dataset.share_rows(columns));
                 }
                 if let Some(view) = self.visible_view(name, NameResolutionScope::Session) {
                     let view_statement = parse_sql_statement(&view.sql_text)?;
@@ -5111,8 +5097,8 @@ impl EngineRuntime {
                     .table_data_for_schema(table, name)
                     .map(|data| data.map(Cow::into_owned))?
                     .unwrap_or_default();
-                Ok(Dataset {
-                    columns: table
+                Ok(Dataset::with_rows(
+                    table
                         .columns
                         .iter()
                         .map(|column| {
@@ -5122,8 +5108,8 @@ impl EngineRuntime {
                             )
                         })
                         .collect(),
-                    rows: data.rows.into_iter().map(|row| row.values).collect(),
-                })
+                    data.rows.into_iter().map(|row| row.values).collect(),
+                ))
             }
             FromItem::Subquery {
                 query,
@@ -5231,11 +5217,8 @@ impl EngineRuntime {
 
         let mut columns = left.columns.clone();
         let mut rows = Vec::new();
-        for left_row in &left.rows {
-            let left_single = Dataset {
-                columns: left.columns.clone(),
-                rows: vec![left_row.clone()],
-            };
+        for left_row in left.rows.iter() {
+            let left_single = Dataset::with_rows(left.columns.clone(), vec![left_row.clone()]);
             let scope_with_left =
                 augment_dataset_with_outer_scope(left_single.clone(), scope_dataset, scope_row);
             let scope_values = scope_with_left
@@ -5253,9 +5236,9 @@ impl EngineRuntime {
             let joined =
                 nested_loop_join(left_single, right, kind, constraint, self, params, ctes)?;
             columns = joined.columns.clone();
-            rows.extend(joined.rows);
+            rows.extend(joined.into_rows());
         }
-        Ok(Dataset { columns, rows })
+        Ok(Dataset::with_rows(columns, rows))
     }
 
     fn evaluate_table_function(
@@ -5302,7 +5285,7 @@ impl EngineRuntime {
         if recursive {
             columns.push(ColumnBinding::visible(Some(table_name), "path".to_string()));
         }
-        Ok(Dataset { columns, rows })
+        Ok(Dataset::with_rows(columns, rows))
     }
 
     fn dataset_from_row_id_set(
@@ -5319,14 +5302,14 @@ impl EngineRuntime {
                 rows.push(row.values.clone());
             }
         });
-        Ok(Dataset {
-            columns: table
+        Ok(Dataset::with_rows(
+            table
                 .columns
                 .iter()
                 .map(|column| ColumnBinding::visible(Some(table_name.clone()), column.name.clone()))
                 .collect(),
             rows,
-        })
+        ))
     }
 }
 
@@ -5432,7 +5415,7 @@ fn augment_dataset_with_outer_scope(
     }
 
     dataset.columns.extend(outer_dataset.columns.clone());
-    for row in &mut dataset.rows {
+    for row in dataset.rows_mut() {
         row.extend_from_slice(outer_row);
     }
     dataset
@@ -6128,14 +6111,14 @@ pub(super) fn row_satisfies_index_predicate(
 }
 
 pub(super) fn table_row_dataset(table: &TableSchema, row: &[Value], table_name: &str) -> Dataset {
-    Dataset {
-        columns: table
+    Dataset::with_rows(
+        table
             .columns
             .iter()
             .map(|column| ColumnBinding::visible(Some(table_name.to_string()), column.name.clone()))
             .collect(),
-        rows: vec![row.to_vec()],
-    }
+        vec![row.to_vec()],
+    )
 }
 
 fn decode_root_header(page_bytes: &[u8]) -> Result<Option<RootHeader>> {
@@ -7397,13 +7380,13 @@ impl<'a> Cursor<'a> {
 }
 
 fn dataset_to_result(dataset: Dataset) -> QueryResult {
+    let Dataset { columns, rows } = dataset;
     QueryResult::with_rows(
-        dataset
-            .columns
+        columns.into_iter().map(|binding| binding.name).collect(),
+        Arc::unwrap_or_clone(rows)
             .into_iter()
-            .map(|binding| binding.name)
+            .map(QueryRow::new)
             .collect(),
-        dataset.rows.into_iter().map(QueryRow::new).collect(),
     )
 }
 
@@ -8180,7 +8163,7 @@ fn try_project_simple_select_items(
     }
 
     let mut output_rows = Vec::with_capacity(dataset.rows.len());
-    for row in &dataset.rows {
+    for row in dataset.rows.iter() {
         let mut output_row = Vec::with_capacity(projection_plan.len());
         for source_index in &projection_plan {
             let value = row
@@ -8190,10 +8173,7 @@ fn try_project_simple_select_items(
         }
         output_rows.push(output_row);
     }
-    Ok(Some(Dataset {
-        columns: output_columns,
-        rows: output_rows,
-    }))
+    Ok(Some(Dataset::with_rows(output_columns, output_rows)))
 }
 
 fn simple_trigram_lookup(filter: &Expr) -> Option<(&str, &Expr, bool)> {
@@ -8505,10 +8485,7 @@ fn nested_loop_join(
 
     let mut eval_columns = left.columns.clone();
     eval_columns.extend(right.columns.clone());
-    let eval_dataset = Dataset {
-        columns: eval_columns,
-        rows: Vec::new(),
-    };
+    let eval_dataset = Dataset::with_rows(eval_columns, Vec::new());
     let eval_context = JoinEvalContext {
         dataset: &eval_dataset,
         runtime,
@@ -8520,7 +8497,7 @@ fn nested_loop_join(
     let mut matched_right = vec![false; right.rows.len()];
     let left_nulls = vec![Value::Null; left.columns.len()];
     let right_nulls = vec![Value::Null; right.columns.len()];
-    for left_row in &left.rows {
+    for left_row in left.rows.iter() {
         let mut matched = false;
         for (right_index, right_row) in right.rows.iter().enumerate() {
             let mut eval_row = left_row.clone();
@@ -8543,13 +8520,13 @@ fn nested_loop_join(
         }
     }
     if matches!(kind, JoinKind::Right | JoinKind::Full) {
-        for (matched, right_row) in matched_right.iter().zip(&right.rows) {
+        for (matched, right_row) in matched_right.iter().zip(right.rows.iter()) {
             if !matched {
                 rows.push(join_output_row(&left_nulls, right_row, &using_columns)?);
             }
         }
     }
-    Ok(Dataset { columns, rows })
+    Ok(Dataset::with_rows(columns, rows))
 }
 
 impl EngineRuntime {
@@ -8566,10 +8543,12 @@ impl EngineRuntime {
             ));
         }
         let columns = left.columns.clone();
+        let left_rows = left.into_rows();
+        let right_rows = right.into_rows();
         let rows = match op {
             crate::sql::ast::SetOperation::Union => {
-                let mut rows = left.rows;
-                rows.extend(right.rows);
+                let mut rows = left_rows;
+                rows.extend(right_rows);
                 if !all {
                     deduplicate_rows(rows)?
                 } else {
@@ -8577,18 +8556,18 @@ impl EngineRuntime {
                 }
             }
             crate::sql::ast::SetOperation::Intersect => {
-                let right_counts = count_row_identities(&right.rows)?;
+                let right_counts = count_row_identities(&right_rows)?;
                 let mut rows = Vec::new();
                 if all {
                     let mut remaining = right_counts;
-                    for row in left.rows {
+                    for row in left_rows {
                         let identity = row_identity(&row)?;
                         if consume_row_identity_count(&mut remaining, &identity) {
                             rows.push(row);
                         }
                     }
                 } else {
-                    for row in left.rows {
+                    for row in left_rows {
                         let identity = row_identity(&row)?;
                         if right_counts.contains_key(&identity) {
                             rows.push(row);
@@ -8599,18 +8578,18 @@ impl EngineRuntime {
                 rows
             }
             crate::sql::ast::SetOperation::Except => {
-                let right_counts = count_row_identities(&right.rows)?;
+                let right_counts = count_row_identities(&right_rows)?;
                 let mut rows = Vec::new();
                 if all {
                     let mut remaining = right_counts;
-                    for row in left.rows {
+                    for row in left_rows {
                         let identity = row_identity(&row)?;
                         if !consume_row_identity_count(&mut remaining, &identity) {
                             rows.push(row);
                         }
                     }
                 } else {
-                    for row in left.rows {
+                    for row in left_rows {
                         let identity = row_identity(&row)?;
                         if !right_counts.contains_key(&identity) {
                             rows.push(row);
@@ -8621,7 +8600,7 @@ impl EngineRuntime {
                 rows
             }
         };
-        Ok(Dataset { columns, rows })
+        Ok(Dataset::with_rows(columns, rows))
     }
 
     fn project_dataset(
@@ -8747,7 +8726,7 @@ impl EngineRuntime {
             }
             rows.push(output);
         }
-        Ok(Dataset { columns, rows })
+        Ok(Dataset::with_rows(columns, rows))
     }
 
     fn compute_row_number_values(
@@ -9663,7 +9642,7 @@ impl EngineRuntime {
             }
             rows.push(output);
         }
-        Ok(Dataset { columns, rows })
+        Ok(Dataset::with_rows(columns, rows))
     }
 
     fn sort_dataset(
@@ -9676,10 +9655,7 @@ impl EngineRuntime {
         if order_by.is_empty() || dataset.rows.len() <= 1 {
             return Ok(());
         }
-        let eval_dataset = Dataset {
-            columns: dataset.columns.clone(),
-            rows: Vec::new(),
-        };
+        let eval_dataset = Dataset::with_rows(dataset.columns.clone(), Vec::new());
         let sort_keys = dataset
             .rows
             .iter()
@@ -9714,18 +9690,21 @@ impl EngineRuntime {
             left_index.cmp(right_index)
         });
 
-        let mut rows = std::mem::take(&mut dataset.rows)
+        let mut rows = dataset
+            .take_rows()
             .into_iter()
             .map(Some)
             .collect::<Vec<_>>();
-        dataset.rows = order
-            .into_iter()
-            .map(|row_index| {
-                rows.get_mut(row_index)
-                    .and_then(Option::take)
-                    .ok_or_else(|| DbError::internal("sorted row index is invalid"))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        dataset.set_rows(
+            order
+                .into_iter()
+                .map(|row_index| {
+                    rows.get_mut(row_index)
+                        .and_then(Option::take)
+                        .ok_or_else(|| DbError::internal("sorted row index is invalid"))
+                })
+                .collect::<Result<Vec<_>>>()?,
+        );
         Ok(())
     }
 
@@ -10383,7 +10362,7 @@ impl EngineRuntime {
                     )));
                 }
                 let mut saw_null = false;
-                for subquery_row in &subquery.rows {
+                for subquery_row in subquery.rows.iter() {
                     let candidate = if expected_width == 1 {
                         MembershipValue::Scalar(
                             subquery_row.first().cloned().unwrap_or(Value::Null),
@@ -10418,7 +10397,7 @@ impl EngineRuntime {
                 }
                 let mut saw_null = false;
                 let mut saw_row = false;
-                for subquery_row in &subquery.rows {
+                for subquery_row in subquery.rows.iter() {
                     saw_row = true;
                     let candidate = subquery_row.first().cloned().unwrap_or(Value::Null);
                     match eval_binary(op, left_value.clone(), candidate)? {
@@ -13672,18 +13651,20 @@ fn eval_regex(left: Value, right: Value, case_insensitive: bool, negated: bool) 
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::sync::Arc;
 
     use crate::record::compression::CompressionMode;
     use crate::search::TrigramQueryResult;
+    use crate::sql::ast::FromItem;
     use crate::sql::parser::parse_sql_statement;
     use crate::storage::page::InMemoryPageStore;
     use crate::{Db, DbConfig, Value};
 
     use super::{
         decode_manifest_payload, decode_runtime_payload, drop_index_include_columns_section,
-        encode_manifest_payload, encode_runtime_payload, encode_table_payload, EngineRuntime,
-        PersistedTableState, RuntimeBtreeKeys, RuntimeIndex,
+        encode_manifest_payload, encode_runtime_payload, encode_table_payload, ColumnBinding,
+        Dataset, EngineRuntime, PersistedTableState, RuntimeBtreeKeys, RuntimeIndex,
     };
 
     const PAGE_SIZE: u32 = 4096;
@@ -14173,6 +14154,37 @@ mod tests {
         assert!(Arc::strong_count(&snapshot.catalog) <= 2);
         assert!(Arc::strong_count(&snapshot.tables) <= 2);
         assert!(Arc::strong_count(&snapshot.indexes) <= 2);
+    }
+
+    #[test]
+    fn cte_alias_shares_row_storage() {
+        let runtime = EngineRuntime::empty(19);
+        let original = Dataset::with_rows(
+            vec![ColumnBinding::visible(
+                Some("cte".to_string()),
+                "id".to_string(),
+            )],
+            (0..1000).map(|id| vec![Value::Int64(id)]).collect(),
+        );
+        let mut ctes = BTreeMap::new();
+        ctes.insert("cte".to_string(), original.clone());
+
+        let aliased = runtime
+            .evaluate_from_item_in_scope(
+                &FromItem::Table {
+                    name: "cte".to_string(),
+                    alias: Some("alias_cte".to_string()),
+                },
+                &[],
+                &ctes,
+                &Dataset::empty(),
+                &[],
+            )
+            .expect("resolve aliased cte");
+
+        assert!(Arc::ptr_eq(&original.rows, &aliased.rows));
+        assert_eq!(aliased.columns[0].table.as_deref(), Some("alias_cte"));
+        assert_eq!(Arc::strong_count(&original.rows), 3);
     }
 
     #[test]
