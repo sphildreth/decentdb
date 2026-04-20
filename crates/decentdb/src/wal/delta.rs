@@ -49,7 +49,14 @@ pub(crate) fn encode_page_delta(base: &[u8], updated: &[u8]) -> Option<Vec<u8>> 
     Some(payload)
 }
 
+#[cfg(test)]
 pub(crate) fn apply_page_delta(base: &[u8], payload: &[u8]) -> Result<Vec<u8>> {
+    let mut page = base.to_vec();
+    apply_page_delta_in_place(&mut page, payload)?;
+    Ok(page)
+}
+
+pub(crate) fn apply_page_delta_in_place(page: &mut [u8], payload: &[u8]) -> Result<()> {
     if payload.len() != DELTA_FRAME_PAYLOAD_SIZE {
         return Err(DbError::corruption(format!(
             "invalid WAL delta payload length {}; expected {}",
@@ -58,40 +65,51 @@ pub(crate) fn apply_page_delta(base: &[u8], payload: &[u8]) -> Result<Vec<u8>> {
         )));
     }
 
-    let mut page = base.to_vec();
     let patch_count = u16::from_le_bytes(
         payload[..DELTA_PATCH_COUNT_SIZE]
             .try_into()
             .expect("delta patch count bytes"),
     ) as usize;
+
     let mut cursor = DELTA_PATCH_COUNT_SIZE;
     for _ in 0..patch_count {
-        if cursor + DELTA_PATCH_HEADER_SIZE > payload.len() {
-            return Err(DbError::corruption(
-                "WAL delta patch header overruns payload",
-            ));
-        }
-        let offset = u16::from_le_bytes(
-            payload[cursor..cursor + 2]
-                .try_into()
-                .expect("delta patch offset bytes"),
-        ) as usize;
-        let len = u16::from_le_bytes(
-            payload[cursor + 2..cursor + 4]
-                .try_into()
-                .expect("delta patch length bytes"),
-        ) as usize;
-        cursor += DELTA_PATCH_HEADER_SIZE;
-        if cursor + len > payload.len() {
+        let (offset, len, next_cursor) = decode_delta_patch_header(payload, cursor)?;
+        if next_cursor + len > payload.len() {
             return Err(DbError::corruption("WAL delta patch bytes overrun payload"));
         }
         if offset + len > page.len() {
             return Err(DbError::corruption("WAL delta patch writes past page end"));
         }
-        page[offset..offset + len].copy_from_slice(&payload[cursor..cursor + len]);
-        cursor += len;
+        cursor = next_cursor + len;
     }
-    Ok(page)
+
+    let mut cursor = DELTA_PATCH_COUNT_SIZE;
+    for _ in 0..patch_count {
+        let (offset, len, next_cursor) = decode_delta_patch_header(payload, cursor)?;
+        let bytes_end = next_cursor + len;
+        page[offset..offset + len].copy_from_slice(&payload[next_cursor..bytes_end]);
+        cursor = bytes_end;
+    }
+    Ok(())
+}
+
+fn decode_delta_patch_header(payload: &[u8], cursor: usize) -> Result<(usize, usize, usize)> {
+    if cursor + DELTA_PATCH_HEADER_SIZE > payload.len() {
+        return Err(DbError::corruption(
+            "WAL delta patch header overruns payload",
+        ));
+    }
+    let offset = u16::from_le_bytes(
+        payload[cursor..cursor + 2]
+            .try_into()
+            .expect("delta patch offset bytes"),
+    ) as usize;
+    let len = u16::from_le_bytes(
+        payload[cursor + 2..cursor + 4]
+            .try_into()
+            .expect("delta patch length bytes"),
+    ) as usize;
+    Ok((offset, len, cursor + DELTA_PATCH_HEADER_SIZE))
 }
 
 #[cfg(test)]

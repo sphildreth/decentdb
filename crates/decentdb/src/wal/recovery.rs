@@ -1,5 +1,6 @@
 //! WAL recovery and index rebuild logic.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::error::{DbError, Result};
@@ -7,9 +8,19 @@ use crate::storage::page::PageId;
 use crate::storage::PagerHandle;
 use crate::vfs::{read_exact_at, write_all_at, VfsFile};
 
-use super::delta::apply_page_delta;
+use super::delta::apply_page_delta_in_place;
 use super::format::{FrameType, WalFrame, WalHeader, WAL_HEADER_SIZE, WAL_HEADER_SIZE_USIZE};
 use super::index::{WalIndex, WalVersion};
+
+const MAX_PENDING_RECOVERY_FRAMES: usize = 1_000_000;
+const RECOVERY_PENDING_OVERFLOW_MESSAGE: &str =
+    "WAL recovery aborted: more than 1,000,000 uncommitted page frames before commit";
+
+#[derive(Debug)]
+struct PendingRecoveryPage {
+    data: Vec<u8>,
+    lsn: u64,
+}
 
 pub(crate) fn initialize_or_recover(
     file: &Arc<dyn VfsFile>,
@@ -50,7 +61,8 @@ pub(crate) fn initialize_or_recover(
     let mut index = WalIndex::default();
     let mut max_page_id = 0;
     let mut offset = WAL_HEADER_SIZE;
-    let mut pending = Vec::<(PageId, Arc<[u8]>, u64)>::new();
+    let mut pending = Vec::<PageId>::new();
+    let mut pending_pages = HashMap::<PageId, PendingRecoveryPage>::new();
     while offset < header.wal_end_offset {
         let Some(frame) =
             WalFrame::decode_from_file(file.as_ref(), offset, page_size, header.wal_end_offset)?
@@ -61,28 +73,50 @@ pub(crate) fn initialize_or_recover(
         match frame.frame_type {
             FrameType::Page => {
                 max_page_id = max_page_id.max(frame.page_id);
-                pending.push((frame.page_id, Arc::from(frame.payload), next_offset));
+                push_pending_frame(&mut pending, frame.page_id)?;
+                store_pending_page(
+                    &mut pending_pages,
+                    frame.page_id,
+                    frame.payload,
+                    next_offset,
+                )?;
             }
             FrameType::PageDelta => {
                 max_page_id = max_page_id.max(frame.page_id);
-                let base = if let Some(version) = index.latest_visible(frame.page_id, u64::MAX) {
-                    version.data.clone()
+                push_pending_frame(&mut pending, frame.page_id)?;
+                if let Some(pending_page) = pending_pages.get_mut(&frame.page_id) {
+                    apply_page_delta_in_place(&mut pending_page.data, &frame.payload)?;
+                    pending_page.lsn = next_offset;
                 } else {
-                    pager.read_page(frame.page_id)?
-                };
-                let data = apply_page_delta(&base, &frame.payload)?;
-                pending.push((frame.page_id, Arc::from(data), next_offset));
+                    let mut data =
+                        if let Some(version) = index.latest_visible(frame.page_id, u64::MAX) {
+                            version.data.to_vec()
+                        } else {
+                            pager.read_page(frame.page_id)?.to_vec()
+                        };
+                    apply_page_delta_in_place(&mut data, &frame.payload)?;
+                    store_pending_page(&mut pending_pages, frame.page_id, data, next_offset)?;
+                }
             }
             FrameType::Commit => {
-                for (page_id, data, lsn) in pending.drain(..) {
+                pending.clear();
+                for (page_id, pending_page) in pending_pages.drain() {
                     // Recovery runs before any readers can hold snapshots, so we only need
                     // the latest recovered version per page. Retaining full historical
                     // versions from a large WAL can consume substantial memory on open.
-                    index.add_version(page_id, WalVersion { lsn, data }, false);
+                    index.add_version(
+                        page_id,
+                        WalVersion {
+                            lsn: pending_page.lsn,
+                            data: Arc::from(pending_page.data),
+                        },
+                        false,
+                    );
                 }
             }
             FrameType::Checkpoint => {
                 pending.clear();
+                pending_pages.clear();
             }
         }
         offset = next_offset;
@@ -105,16 +139,54 @@ pub(crate) fn truncate_to_header(file: &Arc<dyn VfsFile>, page_size: u32) -> Res
     file.set_len(WAL_HEADER_SIZE)
 }
 
+fn push_pending_frame(pending: &mut Vec<PageId>, page_id: PageId) -> Result<()> {
+    if pending.len() >= MAX_PENDING_RECOVERY_FRAMES {
+        return Err(recovery_pending_overflow_error());
+    }
+    pending.push(page_id);
+    Ok(())
+}
+
+fn store_pending_page(
+    pending_pages: &mut HashMap<PageId, PendingRecoveryPage>,
+    page_id: PageId,
+    data: Vec<u8>,
+    lsn: u64,
+) -> Result<()> {
+    let at_capacity = pending_pages.len() >= MAX_PENDING_RECOVERY_FRAMES;
+    match pending_pages.entry(page_id) {
+        std::collections::hash_map::Entry::Occupied(mut entry) => {
+            let pending_page = entry.get_mut();
+            pending_page.data = data;
+            pending_page.lsn = lsn;
+            Ok(())
+        }
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            if at_capacity {
+                return Err(recovery_pending_overflow_error());
+            }
+            entry.insert(PendingRecoveryPage { data, lsn });
+            Ok(())
+        }
+    }
+}
+
+fn recovery_pending_overflow_error() -> DbError {
+    DbError::corruption(RECOVERY_PENDING_OVERFLOW_MESSAGE)
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
     use std::sync::Arc;
 
+    use tempfile::TempDir;
+
     use crate::storage::page;
     use crate::storage::{write_database_bootstrap_vfs, DatabaseHeader, PagerHandle};
     use crate::vfs::{write_all_at, FileKind, OpenMode, Vfs};
 
-    use super::initialize_or_recover;
+    use super::{initialize_or_recover, persist_header, MAX_PENDING_RECOVERY_FRAMES};
     use crate::wal::format::{WalHeader, WAL_HEADER_SIZE};
 
     fn test_pager(vfs: &crate::vfs::mem::MemVfs, path: &Path) -> PagerHandle {
@@ -368,5 +440,96 @@ mod tests {
             .latest_visible(3, u64::MAX)
             .expect("recovered page version");
         assert_eq!(version.data.as_ref(), updated.as_slice());
+    }
+
+    #[test]
+    fn recovery_many_deltas_to_same_page_does_not_clone_base_per_delta() {
+        let vfs = crate::vfs::mem::MemVfs::default();
+        let file = vfs
+            .open(Path::new(":memory:"), OpenMode::CreateNew, FileKind::Wal)
+            .expect("create wal file");
+        let pager = test_pager(&vfs, Path::new(":memory-db:"));
+
+        let ps = page::DEFAULT_PAGE_SIZE;
+        let page_id = 9_u32;
+        let mut current = vec![0_u8; ps as usize];
+        current[0..4].copy_from_slice(&1_u32.to_le_bytes());
+
+        let mut frames = Vec::with_capacity(1026);
+        frames.push(crate::wal::format::WalFrame::page(page_id, current.clone()));
+        for update in 0_u32..1024_u32 {
+            let mut next = current.clone();
+            let byte_index = ((update as usize) * 31) % next.len();
+            next[byte_index] = next[byte_index]
+                .wrapping_add((update % 251) as u8)
+                .wrapping_add(1);
+            let delta =
+                crate::wal::delta::encode_page_delta(&current, &next).expect("encode delta");
+            frames.push(crate::wal::format::WalFrame::page_delta(page_id, delta));
+            current = next;
+        }
+        let expected = current;
+        frames.push(crate::wal::format::WalFrame::commit());
+
+        let mut data = Vec::new();
+        for frame in &frames {
+            data.extend_from_slice(&frame.encode(ps).expect("encode frame"));
+        }
+        let logical_end = WAL_HEADER_SIZE + data.len() as u64;
+        let header = WalHeader::new(ps, logical_end);
+        write_all_at(file.as_ref(), 0, &header.encode()).expect("write header");
+        write_all_at(file.as_ref(), WAL_HEADER_SIZE, &data).expect("write frames");
+        file.set_len(logical_end).expect("set len");
+
+        let (index, _end, _max_page_id) =
+            initialize_or_recover(&file, &pager, ps).expect("recover");
+        assert_eq!(index.version_count(), 1);
+        let version = index
+            .latest_visible(page_id, u64::MAX)
+            .expect("latest version for page");
+        assert_eq!(version.data.as_ref(), expected.as_slice());
+    }
+
+    #[test]
+    #[ignore = "requires generating a large synthetic WAL to exercise the hard overflow bound"]
+    fn recovery_rejects_pending_overflow() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let wal_path = tempdir.path().join("overflow.wal");
+        let vfs = crate::vfs::VfsHandle::for_path(&wal_path);
+        let file = vfs
+            .open(&wal_path, OpenMode::CreateNew, FileKind::Wal)
+            .expect("create wal file");
+        let pager_vfs = crate::vfs::mem::MemVfs::default();
+        let pager = test_pager(&pager_vfs, Path::new(":memory-db:"));
+
+        let ps = page::DEFAULT_PAGE_SIZE;
+        let page_id = 13_u32;
+        let base = vec![0_u8; ps as usize];
+        let mut updated = base.clone();
+        updated[0] = 1;
+        let delta = crate::wal::delta::encode_page_delta(&base, &updated).expect("encode delta");
+        let page_bytes = crate::wal::format::WalFrame::page(page_id, base)
+            .encode(ps)
+            .expect("encode page frame");
+        let delta_bytes = crate::wal::format::WalFrame::page_delta(page_id, delta)
+            .encode(ps)
+            .expect("encode delta frame");
+
+        write_all_at(file.as_ref(), 0, &WalHeader::new(ps, 0).encode()).expect("write header");
+        let mut offset = WAL_HEADER_SIZE;
+        write_all_at(file.as_ref(), offset, &page_bytes).expect("write page frame");
+        offset += page_bytes.len() as u64;
+        for _ in 0..MAX_PENDING_RECOVERY_FRAMES {
+            write_all_at(file.as_ref(), offset, &delta_bytes).expect("write delta frame");
+            offset += delta_bytes.len() as u64;
+        }
+        persist_header(&file, ps, offset).expect("persist header");
+        file.set_len(offset).expect("set wal len");
+
+        let error = initialize_or_recover(&file, &pager, ps).expect_err("pending overflow");
+        assert!(matches!(error, crate::error::DbError::Corruption { .. }));
+        assert!(error
+            .to_string()
+            .contains("more than 1,000,000 uncommitted page frames"));
     }
 }
