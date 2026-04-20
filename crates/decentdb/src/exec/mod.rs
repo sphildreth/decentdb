@@ -4643,10 +4643,11 @@ impl EngineRuntime {
                     value_expr,
                     applied_prefilter,
                 )?;
-                if matches!(kind, JoinKind::Inner) {
-                    if let Some(dataset) = self.try_indexed_inner_join_with_right_table(
+                if matches!(kind, JoinKind::Inner | JoinKind::Left) {
+                    if let Some(dataset) = self.try_indexed_equi_join_with_right_table(
                         &left_dataset,
                         right,
+                        *kind,
                         constraint,
                         ctes,
                     )? {
@@ -4855,13 +4856,32 @@ impl EngineRuntime {
         Ok(Some(Dataset { columns, rows }))
     }
 
-    fn try_indexed_inner_join_with_right_table(
+    /// Indexed equi-join probe path.
+    ///
+    /// For each row in `left`, probes the right table via a b-tree index
+    /// (or the rowid alias) instead of doing a full O(|left| * |right|)
+    /// nested loop. Supported join kinds:
+    ///
+    /// * `Inner` — skips left rows with NULL join values and left rows
+    ///   whose join value has no match.
+    /// * `Left`  — preserves every left row, emitting a NULL-extended
+    ///   right half when the left join value is NULL or has no match.
+    ///
+    /// Returns `Ok(None)` if any of the preconditions for the fast path
+    /// are not met (non-table right side, non-equi join, view/CTE/temp
+    /// table, etc.), in which case the caller falls back to the nested
+    /// loop join.
+    fn try_indexed_equi_join_with_right_table(
         &self,
         left: &Dataset,
         right_item: &FromItem,
+        kind: JoinKind,
         constraint: &JoinConstraint,
         ctes: &BTreeMap<String, Dataset>,
     ) -> Result<Option<Dataset>> {
+        if !matches!(kind, JoinKind::Inner | JoinKind::Left) {
+            return Ok(None);
+        }
         let JoinConstraint::On(on) = constraint else {
             return Ok(None);
         };
@@ -4963,6 +4983,8 @@ impl EngineRuntime {
         columns.extend(right_table.columns.iter().map(|column| {
             ColumnBinding::visible(Some(right_binding_name.clone()), column.name.clone())
         }));
+        let right_column_count = right_table.columns.len();
+        let is_left_outer = matches!(kind, JoinKind::Left);
         let mut rows = Vec::new();
         for left_row in &left.rows {
             let Some(join_value) = left_row.get(left_join_index) else {
@@ -4971,6 +4993,12 @@ impl EngineRuntime {
                 ));
             };
             if matches!(join_value, Value::Null) {
+                if is_left_outer {
+                    let mut row = Vec::with_capacity(left_row.len() + right_column_count);
+                    row.extend_from_slice(left_row);
+                    row.extend(std::iter::repeat_n(Value::Null, right_column_count));
+                    rows.push(row);
+                }
                 continue;
             }
             let row_ids = if let Some(keys) = keys {
@@ -4980,6 +5008,7 @@ impl EngineRuntime {
             } else {
                 RuntimeRowIdSet::Empty
             };
+            let rows_before = rows.len();
             row_ids.for_each(|row_id| {
                 let right_values = if let Some(positions) = right_row_positions.as_ref() {
                     let Some(right_position) = positions.get(&row_id).copied() else {
@@ -4997,6 +5026,12 @@ impl EngineRuntime {
                 row.extend_from_slice(right_values);
                 rows.push(row);
             });
+            if is_left_outer && rows.len() == rows_before {
+                let mut row = Vec::with_capacity(left_row.len() + right_column_count);
+                row.extend_from_slice(left_row);
+                row.extend(std::iter::repeat_n(Value::Null, right_column_count));
+                rows.push(row);
+            }
         }
         Ok(Some(Dataset { columns, rows }))
     }
@@ -5142,10 +5177,10 @@ impl EngineRuntime {
                         scope_row,
                     );
                 }
-                if matches!(kind, JoinKind::Inner) {
-                    if let Some(dataset) = self
-                        .try_indexed_inner_join_with_right_table(&left, right, constraint, ctes)?
-                    {
+                if matches!(kind, JoinKind::Inner | JoinKind::Left) {
+                    if let Some(dataset) = self.try_indexed_equi_join_with_right_table(
+                        &left, right, *kind, constraint, ctes,
+                    )? {
                         return Ok(dataset);
                     }
                 }
