@@ -694,7 +694,7 @@ impl EngineRuntime {
                 if matches!(value, Value::Null) {
                     return Ok(QueryResult::with_affected_rows(0));
                 }
-                let Some(RuntimeIndex::Btree { keys }) = self.indexes.get(index_name) else {
+                let Some(RuntimeIndex::Btree { keys }) = self.index(index_name) else {
                     return Ok(QueryResult::with_affected_rows(0));
                 };
                 row_id_set_to_vec(keys.row_ids_for_value_set(&value)?)
@@ -771,7 +771,7 @@ impl EngineRuntime {
             self.catalog.indexes.get(&prepared.name),
             Some(index) if index.kind == IndexKind::Btree && index.fresh
         ) && matches!(
-            self.indexes.get(&prepared.name),
+            self.index(&prepared.name),
             Some(super::RuntimeIndex::Btree { .. })
         )
     }
@@ -784,7 +784,7 @@ impl EngineRuntime {
             self.catalog.indexes.get(&prepared.parent_index_name),
             Some(index) if index.kind == IndexKind::Btree && index.fresh
         ) && matches!(
-            self.indexes.get(&prepared.parent_index_name),
+            self.index(&prepared.parent_index_name),
             Some(super::RuntimeIndex::Btree { .. })
         )
     }
@@ -2299,7 +2299,7 @@ fn prepare_btree_insert_index(
         || !index.fresh
         || index.predicate_sql.is_some()
         || !matches!(
-            runtime.indexes.get(&index.name),
+            runtime.index(&index.name),
             Some(super::RuntimeIndex::Btree { .. })
         )
     {
@@ -2430,7 +2430,7 @@ fn validate_prepared_insert(
                 continue;
             }
             let key = prepared_btree_index_key(index, row)?;
-            let Some(super::RuntimeIndex::Btree { keys }) = runtime.indexes.get(&index.name) else {
+            let Some(super::RuntimeIndex::Btree { keys }) = runtime.index(&index.name) else {
                 return Err(DbError::internal(format!(
                     "runtime index {} is missing",
                     index.name
@@ -2454,7 +2454,7 @@ fn validate_prepared_insert(
             continue;
         }
         let Some(super::RuntimeIndex::Btree { keys }) =
-            runtime.indexes.get(&foreign_key.parent_index_name)
+            runtime.index(&foreign_key.parent_index_name)
         else {
             return Err(DbError::internal(format!(
                 "runtime index {} is missing",
@@ -2531,9 +2531,7 @@ fn apply_prepared_insert_index_updates(
                     "typed INT64 prepared index expected an INT64 value",
                 ));
             };
-            let Some(super::RuntimeIndex::Btree { keys }) =
-                runtime.indexes_mut().get_mut(&index.name)
-            else {
+            let Some(super::RuntimeIndex::Btree { keys }) = runtime.index_mut(&index.name) else {
                 return Err(DbError::internal(format!(
                     "runtime index {} is missing",
                     index.name
@@ -2572,8 +2570,7 @@ fn apply_prepared_insert_index_updates(
             continue;
         }
         let key = prepared_btree_index_key(index, &row.values)?;
-        let Some(super::RuntimeIndex::Btree { keys }) = runtime.indexes_mut().get_mut(&index.name)
-        else {
+        let Some(super::RuntimeIndex::Btree { keys }) = runtime.index_mut(&index.name) else {
             return Err(DbError::internal(format!(
                 "runtime index {} is missing",
                 index.name
@@ -2788,7 +2785,7 @@ fn indexed_row_ids_for_filter(
     }) else {
         return Ok(None);
     };
-    let Some(RuntimeIndex::Btree { keys }) = runtime.indexes.get(&index.name) else {
+    let Some(RuntimeIndex::Btree { keys }) = runtime.index(&index.name) else {
         return Ok(None);
     };
     if matches!(
@@ -2948,7 +2945,7 @@ fn prepared_delete_has_referencing_child(
         )));
     };
     if let Some(index_name) = &child.child_index_name {
-        let Some(RuntimeIndex::Btree { keys }) = runtime.indexes.get(index_name) else {
+        let Some(RuntimeIndex::Btree { keys }) = runtime.index(index_name) else {
             return Ok(false);
         };
         return Ok(!keys.row_ids_for_value_set(parent_value)?.is_empty());
@@ -2987,8 +2984,7 @@ fn apply_runtime_index_update_for_row_change(
             if old_key == new_key {
                 return Ok(true);
             }
-            let Some(RuntimeIndex::Btree { keys }) = runtime.indexes_mut().get_mut(&index.name)
-            else {
+            let Some(RuntimeIndex::Btree { keys }) = runtime.index_mut(&index.name) else {
                 return Ok(false);
             };
             if let Some(old_key) = old_key.as_ref() {
@@ -3002,8 +2998,7 @@ fn apply_runtime_index_update_for_row_change(
         IndexKind::Trigram => {
             let old_text = trigram_index_text_for_row(runtime, index, table, old_row_values)?;
             let new_text = trigram_index_text_for_row(runtime, index, table, new_row_values)?;
-            let Some(RuntimeIndex::Trigram { index: trigram }) =
-                runtime.indexes_mut().get_mut(&index.name)
+            let Some(RuntimeIndex::Trigram { index: trigram }) = runtime.index_mut(&index.name)
             else {
                 return Ok(false);
             };
@@ -3034,8 +3029,7 @@ fn apply_runtime_index_delete_for_row(
     match index.kind {
         IndexKind::Btree => {
             let key = compute_index_key(runtime, index, table, row_values)?;
-            let Some(RuntimeIndex::Btree { keys }) = runtime.indexes_mut().get_mut(&index.name)
-            else {
+            let Some(RuntimeIndex::Btree { keys }) = runtime.index_mut(&index.name) else {
                 return Ok(false);
             };
             if let Some(key) = key.as_ref() {
@@ -3045,8 +3039,7 @@ fn apply_runtime_index_delete_for_row(
         }
         IndexKind::Trigram => {
             let text = trigram_index_text_for_row(runtime, index, table, row_values)?;
-            let Some(RuntimeIndex::Trigram { index: trigram }) =
-                runtime.indexes_mut().get_mut(&index.name)
+            let Some(RuntimeIndex::Trigram { index: trigram }) = runtime.index_mut(&index.name)
             else {
                 return Ok(false);
             };
@@ -3234,7 +3227,7 @@ fn fk_matching_row_ids_via_index(
     }) else {
         return Ok(None);
     };
-    let Some(RuntimeIndex::Btree { keys }) = runtime.indexes.get(&index.name) else {
+    let Some(RuntimeIndex::Btree { keys }) = runtime.index(&index.name) else {
         return Ok(None);
     };
     keys.row_ids_for_value(&parent_key[0]).map(Some)

@@ -358,7 +358,7 @@ fn unique_index_row_ids(
     if !index.fresh || index.kind != IndexKind::Btree {
         return Ok(None);
     }
-    let Some(RuntimeIndex::Btree { keys }) = runtime.indexes.get(&index.name) else {
+    let Some(RuntimeIndex::Btree { keys }) = runtime.index(&index.name) else {
         return Ok(None);
     };
     let Some(key) = super::compute_index_key(runtime, index, table, row)? else {
@@ -499,7 +499,7 @@ fn parent_exists_via_single_column_index(
     else {
         return Ok(None);
     };
-    let Some(RuntimeIndex::Btree { keys }) = runtime.indexes.get(&index.name) else {
+    let Some(RuntimeIndex::Btree { keys }) = runtime.index(&index.name) else {
         return Ok(None);
     };
     let matched_row_ids = keys.row_ids_for_value_set(child_values[0])?;

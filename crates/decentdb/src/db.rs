@@ -1332,17 +1332,11 @@ impl Db {
     /// Verifies that a named index can be rebuilt logically from the persisted table state.
     pub fn verify_index(&self, name: &str) -> Result<IndexVerification> {
         let runtime = self.runtime_for_inspection()?;
-        let existing = runtime
-            .indexes
-            .get(name)
-            .map_or(0, runtime_index_entry_count);
+        let existing = runtime.index(name).map_or(0, runtime_index_entry_count);
 
         let mut rebuilt = self.runtime_for_inspection()?;
         rebuilt.rebuild_index(name, self.inner.config.page_size)?;
-        let actual = rebuilt
-            .indexes
-            .get(name)
-            .map_or(0, runtime_index_entry_count);
+        let actual = rebuilt.index(name).map_or(0, runtime_index_entry_count);
 
         Ok(IndexVerification {
             name: name.to_string(),

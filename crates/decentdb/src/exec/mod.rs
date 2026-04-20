@@ -475,7 +475,7 @@ pub(crate) struct EngineRuntime {
     pub(crate) temp_views: Arc<BTreeMap<String, ViewSchema>>,
     pub(crate) temp_indexes: Arc<BTreeMap<String, IndexSchema>>,
     pub(crate) temp_schema_cookie: u32,
-    pub(crate) indexes: Arc<BTreeMap<String, RuntimeIndex>>,
+    pub(crate) indexes: Arc<BTreeMap<String, Arc<RuntimeIndex>>>,
     pub(crate) persisted_tables: BTreeMap<String, PersistedTableState>,
     /// Tables whose row data has not yet been loaded from storage.
     /// Populated during `decode_manifest_payload` and cleared by
@@ -644,8 +644,23 @@ impl EngineRuntime {
         Arc::make_mut(&mut self.temp_indexes)
     }
 
-    fn indexes_mut(&mut self) -> &mut BTreeMap<String, RuntimeIndex> {
+    fn indexes_mut(&mut self) -> &mut BTreeMap<String, Arc<RuntimeIndex>> {
         Arc::make_mut(&mut self.indexes)
+    }
+
+    /// Read-only access to a runtime index by name (case-sensitive).
+    pub(crate) fn index(&self, name: &str) -> Option<&RuntimeIndex> {
+        self.indexes.get(name).map(|arc| arc.as_ref())
+    }
+
+    /// Targeted copy-on-write access to a single runtime index entry.
+    ///
+    /// Performs `Arc::make_mut` only on the targeted entry (and on the outer
+    /// map), so unrelated indexes are not cloned even when the runtime is
+    /// shared with concurrent readers.
+    pub(crate) fn index_mut(&mut self, name: &str) -> Option<&mut RuntimeIndex> {
+        let map = Arc::make_mut(&mut self.indexes);
+        map.get_mut(name).map(Arc::make_mut)
     }
 
     fn cached_payload(&mut self, table_name: &str) -> Option<Arc<Vec<u8>>> {
@@ -1348,11 +1363,11 @@ impl EngineRuntime {
 
     pub(crate) fn rebuild_indexes(&mut self, page_size: u32) -> Result<()> {
         let indexes = self.catalog.indexes.values().cloned().collect::<Vec<_>>();
-        let mut rebuilt = BTreeMap::new();
+        let mut rebuilt: BTreeMap<String, Arc<RuntimeIndex>> = BTreeMap::new();
         for index in indexes {
             rebuilt.insert(
                 index.name.clone(),
-                build_runtime_index(&index, self, page_size)?,
+                Arc::new(build_runtime_index(&index, self, page_size)?),
             );
         }
         *self.indexes_mut() = rebuilt;
@@ -1366,12 +1381,12 @@ impl EngineRuntime {
     pub(crate) fn rebuild_index(&mut self, name: &str, page_size: u32) -> Result<()> {
         let index = self
             .catalog
-            .indexes
-            .get(name)
+            .index(name)
             .cloned()
             .ok_or_else(|| DbError::sql(format!("unknown index {name}")))?;
         let rebuilt = build_runtime_index(&index, self, page_size)?;
-        self.indexes_mut().insert(name.to_string(), rebuilt);
+        self.indexes_mut()
+            .insert(name.to_string(), Arc::new(rebuilt));
         if let Some(index) = self.catalog_mut().indexes.get_mut(name) {
             index.fresh = true;
         }
@@ -1553,40 +1568,36 @@ impl EngineRuntime {
     ) -> Result<()> {
         for update in updates {
             match update {
-                PendingIndexInsert::Btree { name, key, row_id } => {
-                    match self.indexes_mut().get_mut(&name) {
-                        Some(RuntimeIndex::Btree { keys }) => {
-                            keys.insert_row_id(key, row_id)?;
-                        }
-                        Some(_) => {
-                            return Err(DbError::internal(format!(
-                                "runtime index {name} is not a BTREE index"
-                            )))
-                        }
-                        None => {
-                            return Err(DbError::internal(format!(
-                                "runtime index {name} is missing"
-                            )))
-                        }
+                PendingIndexInsert::Btree { name, key, row_id } => match self.index_mut(&name) {
+                    Some(RuntimeIndex::Btree { keys }) => {
+                        keys.insert_row_id(key, row_id)?;
                     }
-                }
-                PendingIndexInsert::Trigram { name, row_id, text } => {
-                    match self.indexes_mut().get_mut(&name) {
-                        Some(RuntimeIndex::Trigram { index }) => {
-                            index.queue_insert(row_id, &text);
-                        }
-                        Some(_) => {
-                            return Err(DbError::internal(format!(
-                                "runtime index {name} is not a trigram index"
-                            )))
-                        }
-                        None => {
-                            return Err(DbError::internal(format!(
-                                "runtime index {name} is missing"
-                            )))
-                        }
+                    Some(_) => {
+                        return Err(DbError::internal(format!(
+                            "runtime index {name} is not a BTREE index"
+                        )))
                     }
-                }
+                    None => {
+                        return Err(DbError::internal(format!(
+                            "runtime index {name} is missing"
+                        )))
+                    }
+                },
+                PendingIndexInsert::Trigram { name, row_id, text } => match self.index_mut(&name) {
+                    Some(RuntimeIndex::Trigram { index }) => {
+                        index.queue_insert(row_id, &text);
+                    }
+                    Some(_) => {
+                        return Err(DbError::internal(format!(
+                            "runtime index {name} is not a trigram index"
+                        )))
+                    }
+                    None => {
+                        return Err(DbError::internal(format!(
+                            "runtime index {name} is missing"
+                        )))
+                    }
+                },
             }
         }
         Ok(())
@@ -2396,8 +2407,7 @@ impl EngineRuntime {
             &BTreeMap::new(),
             None,
         )?;
-        let Some(RuntimeIndex::Btree { keys: filter_keys }) = self.indexes.get(&filter_index.name)
-        else {
+        let Some(RuntimeIndex::Btree { keys: filter_keys }) = self.index(&filter_index.name) else {
             return Ok(None);
         };
         let filtered_join_index = filtered_schema
@@ -2433,7 +2443,7 @@ impl EngineRuntime {
             return Ok(None);
         }
         let keys = if let Some(index) = probe_index {
-            let Some(RuntimeIndex::Btree { keys }) = self.indexes.get(&index.name) else {
+            let Some(RuntimeIndex::Btree { keys }) = self.index(&index.name) else {
                 return Ok(None);
             };
             Some(keys)
@@ -3322,7 +3332,7 @@ impl EngineRuntime {
                     .is_some_and(|index_column| identifiers_equal(index_column, column_name))
                 && index.columns[0].expression_sql.is_none()
         })?;
-        let RuntimeIndex::Btree { keys } = self.indexes.get(&index.name)? else {
+        let RuntimeIndex::Btree { keys } = self.index(&index.name)? else {
             return None;
         };
         Some(keys)
@@ -3386,7 +3396,7 @@ impl EngineRuntime {
             if index.kind != IndexKind::Btree {
                 continue;
             }
-            let Some(RuntimeIndex::Btree { keys }) = self.indexes.get(&index.name) else {
+            let Some(RuntimeIndex::Btree { keys }) = self.index(&index.name) else {
                 continue;
             };
             let entry_count = i64::try_from(keys.total_row_id_count()).map_err(|_| {
@@ -3766,7 +3776,7 @@ impl EngineRuntime {
         }) else {
             return Ok(None);
         };
-        let Some(RuntimeIndex::Btree { keys }) = self.indexes.get(&index.name) else {
+        let Some(RuntimeIndex::Btree { keys }) = self.index(&index.name) else {
             return Ok(None);
         };
         let row_ids = keys.row_ids_for_value_set(&value)?;
@@ -4427,7 +4437,7 @@ impl EngineRuntime {
             }) {
                 let value =
                     self.eval_expr(value_expr, &Dataset::empty(), &[], params, ctes, None)?;
-                if let Some(RuntimeIndex::Btree { keys }) = self.indexes.get(&index.name) {
+                if let Some(RuntimeIndex::Btree { keys }) = self.index(&index.name) {
                     let row_ids = keys.row_ids_for_value_set(&value)?;
                     return self
                         .dataset_from_row_id_set(table, data, alias, row_ids)
@@ -4453,7 +4463,7 @@ impl EngineRuntime {
                 let pattern =
                     self.eval_expr(pattern_expr, &Dataset::empty(), &[], params, ctes, None)?;
                 if let Value::Text(pattern) = pattern {
-                    if let Some(RuntimeIndex::Trigram { index }) = self.indexes.get(&index.name) {
+                    if let Some(RuntimeIndex::Trigram { index }) = self.index(&index.name) {
                         if !index.planner_may_use_index() {
                             return Ok(None);
                         }
@@ -4806,7 +4816,7 @@ impl EngineRuntime {
         };
 
         let value = self.eval_expr(value_expr, &Dataset::empty(), &[], params, ctes, None)?;
-        let Some(RuntimeIndex::Btree { keys }) = self.indexes.get(&index.name) else {
+        let Some(RuntimeIndex::Btree { keys }) = self.index(&index.name) else {
             return Ok(None);
         };
         let row_ids = keys.row_ids_for_value_set(&value)?;
@@ -4863,7 +4873,7 @@ impl EngineRuntime {
             return Ok(None);
         }
         let keys = if let Some(index) = probe_index {
-            let Some(RuntimeIndex::Btree { keys }) = self.indexes.get(&index.name) else {
+            let Some(RuntimeIndex::Btree { keys }) = self.index(&index.name) else {
                 return Ok(None);
             };
             Some(keys)
@@ -5053,7 +5063,7 @@ impl EngineRuntime {
             return Ok(None);
         }
         let keys = if let Some(index) = probe_index {
-            let Some(RuntimeIndex::Btree { keys }) = self.indexes.get(&index.name) else {
+            let Some(RuntimeIndex::Btree { keys }) = self.index(&index.name) else {
                 return Ok(None);
             };
             Some(keys)
@@ -13787,8 +13797,7 @@ mod tests {
         let cloned = runtime.clone();
 
         let RuntimeIndex::Btree { keys } = cloned
-            .indexes
-            .get("docs_email_idx")
+            .index("docs_email_idx")
             .expect("email index should be cloned")
         else {
             panic!("expected BTREE runtime index");
@@ -13796,8 +13805,7 @@ mod tests {
         assert!(!keys.is_empty(), "btree entries should be preserved");
 
         let RuntimeIndex::Trigram { index } = cloned
-            .indexes
-            .get("docs_body_trgm_idx")
+            .index("docs_body_trgm_idx")
             .expect("trigram index should be cloned")
         else {
             panic!("expected trigram runtime index");
@@ -13831,8 +13839,7 @@ mod tests {
             .expect("primary-key index should exist");
 
         let RuntimeIndex::Btree { keys } = runtime
-            .indexes
-            .get(&index_name)
+            .index(&index_name)
             .expect("INT64 index should exist")
         else {
             panic!("expected BTREE runtime index");

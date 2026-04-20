@@ -5,7 +5,7 @@ All notable changes to DecentDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [2.3.0] - UNRELEASED
+## [2.3.0] - 2026-04-20
 
 ### Added
 
@@ -33,6 +33,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Eliminated repeated base-page materialization during WAL recovery by reusing per-page pending reconstruction state across long delta chains.
 - Stopped deep-cloning read-mostly execution runtime state by Arc-sharing catalog, table, temp-table, and runtime-index maps with copy-on-write mutation.
 - Eliminated cross-table COW contamination on UPDATE/DELETE/INSERT by wrapping each table's `TableData` in its own `Arc`, so the first write in a transaction now clones only the targeted table's row vector instead of every table's rows. Yields ~3× faster DELETE p50 (132 µs → 42 µs) and ~1.3× faster UPDATE p50 (116 µs → 87 µs) on the Python `bench_complex` workload, with a 44× speedup on a worst-case micro-probe (mutating a small table while a large unrelated table sits in the catalog).
+- Extended the per-entry `Arc` copy-on-write pattern to the runtime index map so the first write to an indexed column in a transaction clones only the targeted index instead of every `RuntimeIndex` (BTREE keys + trigram postings) in the database. Closes a latent regression that would have appeared on workloads updating indexed columns on databases with many or large secondary indexes.
+- ADR 0136 (proposed): chunked row storage for finer-grained copy-on-write, targeting the remaining UPDATE-latency gap to SQLite by reducing per-transaction first-write cloning from O(rows in mutated table) to O(rows in mutated chunk).
 - Avoided full dataset clones on CTE alias resolution by sharing dataset row storage and rewriting only column-binding metadata.
 - Bounded the per-session cached payload map with an LRU cap from `DbConfig` and Arc-shared temp schema state to avoid repeated deep clones across statements.
 - Documented C ABI ownership and free responsibilities for database, statement, and result handles in both the public header and Rust rustdoc.
