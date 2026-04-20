@@ -387,6 +387,17 @@ typedef _StmtBindTimestampMicrosDart = int Function(
   int timestampMicros,
 );
 
+typedef _StmtBindUuidC = Uint32 Function(
+  Pointer<DdbStmt> stmt,
+  IntPtr index,
+  Pointer<Uint8> bytes16,
+);
+typedef _StmtBindUuidDart = int Function(
+  Pointer<DdbStmt> stmt,
+  int index,
+  Pointer<Uint8> bytes16,
+);
+
 typedef _StmtExecuteBatchI64C = Uint32 Function(
   Pointer<DdbStmt> stmt,
   IntPtr rowCount,
@@ -774,7 +785,10 @@ class NativeBindings {
         stmtBindInt64StepI64TextF64 = _lib.lookupFunction<
                 _StmtBindInt64StepI64TextF64C,
                 _StmtBindInt64StepI64TextF64Dart>(
-            'ddb_stmt_bind_int64_step_i64_text_f64');
+            'ddb_stmt_bind_int64_step_i64_text_f64'),
+        stmtBindUuid =
+            _lib.lookupFunction<_StmtBindUuidC, _StmtBindUuidDart>(
+                'ddb_stmt_bind_uuid');
 
   // ignore: unused_field – kept so DynamicLibrary stays live and symbols remain resolved
   final DynamicLibrary _lib;
@@ -850,6 +864,7 @@ class NativeBindings {
   final _StmtFetchRowsI64TextF64Dart stmtFetchRowsI64TextF64;
   final _StmtBindInt64StepRowViewDart stmtBindInt64StepRowView;
   final _StmtBindInt64StepI64TextF64Dart stmtBindInt64StepI64TextF64;
+  final _StmtBindUuidDart stmtBindUuid;
 
   static final Map<String, NativeBindings> _cache = {};
 

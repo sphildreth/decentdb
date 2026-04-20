@@ -332,6 +332,27 @@ class Statement {
     if (status != ddbOk) _throwStatus(status, 'Failed to bind timestamp');
   }
 
+  /// Bind a UUID value at 1-based [index].
+  ///
+  /// [bytes] must be exactly 16 bytes in canonical UUID byte order; throws
+  /// [ArgumentError] otherwise.
+  void bindUuid(int index, Uint8List bytes) {
+    _checkNotDisposed();
+    _invalidateExecution();
+    if (bytes.length != 16) {
+      throw ArgumentError(
+          'UUID bytes must be exactly 16, got ${bytes.length}');
+    }
+    final data = malloc<Uint8>(16);
+    try {
+      data.asTypedList(16).setAll(0, bytes);
+      final status = _bindings.stmtBindUuid(_stmtPtr!, index, data);
+      if (status != ddbOk) _throwStatus(status, 'Failed to bind UUID');
+    } finally {
+      malloc.free(data);
+    }
+  }
+
   /// Polymorphic bind: dispatches to the typed method based on [value]'s type.
   void bind(int index, Object? value) {
     if (value == null) return bindNull(index);
@@ -339,6 +360,8 @@ class Statement {
     if (value is bool) return bindBool(index, value);
     if (value is double) return bindFloat64(index, value);
     if (value is String) return bindText(index, value);
+    // UuidValue must be checked before Uint8List so bare Uint8List stays BLOB.
+    if (value is UuidValue) return bindUuid(index, value.bytes);
     if (value is Uint8List) return bindBlob(index, value);
     if (value is DateTime) return bindDateTime(index, value);
     if (value is DecimalValue)

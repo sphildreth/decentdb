@@ -1,3 +1,5 @@
+import 'dart:typed_data';
+
 /// DecentDB error codes.
 enum ErrorCode {
   ok(0),
@@ -37,6 +39,103 @@ class DecimalValue {
 
   @override
   String toString() => 'DecimalValue($scaled, scale: $scale)';
+}
+
+/// A canonical 16-byte UUID value.
+///
+/// Bytes are stored in native order (hex byte 0 first, matching the engine's
+/// `Value::Uuid([u8; 16])` representation). Use [UuidValue.parse] to construct
+/// from canonical hyphenated text ("xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx").
+///
+/// Only the 36-character hyphenated form is accepted by [parse]; compact
+/// 32-character text is rejected with [FormatException].
+final class UuidValue {
+  /// The raw 16 bytes of the UUID in canonical byte order.
+  ///
+  /// A defensive copy is made on construction so mutations to the original
+  /// [Uint8List] do not affect this value.
+  final Uint8List bytes;
+
+  /// Constructs a [UuidValue] from [bytes].
+  ///
+  /// [bytes] must have exactly 16 elements; throws [ArgumentError] otherwise.
+  /// A copy of [bytes] is stored internally.
+  UuidValue(Uint8List bytes) : bytes = Uint8List.fromList(bytes) {
+    if (bytes.length != 16) {
+      throw ArgumentError(
+          'UuidValue requires exactly 16 bytes, got ${bytes.length}');
+    }
+  }
+
+  /// Parses a canonical 36-character hyphenated UUID string.
+  ///
+  /// Accepts both lower- and uppercase hex digits. Throws [FormatException]
+  /// if [text] is not exactly 36 characters in the form
+  /// "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx".
+  factory UuidValue.parse(String text) {
+    if (text.length != 36 ||
+        text[8] != '-' ||
+        text[13] != '-' ||
+        text[18] != '-' ||
+        text[23] != '-') {
+      throw FormatException(
+          'Invalid UUID: expected xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx, '
+          'got "$text"');
+    }
+    final result = Uint8List(16);
+    var byteIdx = 0;
+    var i = 0;
+    while (i < 36) {
+      if (text[i] == '-') {
+        i++;
+        continue;
+      }
+      result[byteIdx++] =
+          (_hexNibble(text, i) << 4) | _hexNibble(text, i + 1);
+      i += 2;
+    }
+    // Use internal constructor to avoid a second copy.
+    return UuidValue._trusted(result);
+  }
+
+  // Private constructor used by parse — skips the defensive copy since the
+  // bytes were just freshly allocated inside parse.
+  UuidValue._trusted(this.bytes);
+
+  static int _hexNibble(String s, int index) {
+    final v = s.codeUnitAt(index);
+    if (v >= 0x30 && v <= 0x39) return v - 0x30; // 0-9
+    if (v >= 0x61 && v <= 0x66) return v - 0x57; // a-f
+    if (v >= 0x41 && v <= 0x46) return v - 0x37; // A-F
+    throw FormatException(
+        'Invalid hex character "${s[index]}" in UUID "$s"');
+  }
+
+  /// Returns the canonical lowercase hyphenated text representation.
+  String toText() {
+    final buf = StringBuffer();
+    for (var i = 0; i < 16; i++) {
+      if (i == 4 || i == 6 || i == 8 || i == 10) buf.write('-');
+      buf.write(bytes[i].toRadixString(16).padLeft(2, '0'));
+    }
+    return buf.toString();
+  }
+
+  @override
+  bool operator ==(Object other) {
+    if (identical(this, other)) return true;
+    if (other is! UuidValue) return false;
+    for (var i = 0; i < 16; i++) {
+      if (bytes[i] != other.bytes[i]) return false;
+    }
+    return true;
+  }
+
+  @override
+  int get hashCode => Object.hashAll(bytes);
+
+  @override
+  String toString() => toText();
 }
 
 class ForeignKeyInfo {
