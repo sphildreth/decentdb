@@ -377,7 +377,12 @@ def build_checks() -> list[Check]:
             key="dotnet-stack",
             title=".NET clean/build/test",
             cwd=REPO_ROOT / "bindings" / "dotnet",
-            command="dotnet clean -c Release && dotnet build -c Release && dotnet test -c Release",
+            command=(
+                "dotnet restore DecentDB.NET.sln && "
+                "dotnet clean DecentDB.NET.sln -c Release --nologo && "
+                "dotnet build DecentDB.NET.sln -c Release --no-restore --nologo && "
+                "dotnet test DecentDB.NET.sln -c Release --no-build --nologo"
+            ),
             env={},
             stage=4,
         ),
@@ -453,8 +458,9 @@ def build_checks() -> list[Check]:
             / "benchmarks"
             / "DecentDB.Benchmarks",
             command=(
-                "dotnet clean && "
-                "dotnet run -c Release --project DecentDB.Benchmarks.csproj -- "
+                "dotnet restore DecentDB.Benchmarks.csproj && "
+                "dotnet clean DecentDB.Benchmarks.csproj -c Release --nologo && "
+                "dotnet run -c Release --no-restore --project DecentDB.Benchmarks.csproj -- "
                 "--count 50000 --point-reads 2000 --fetchmany-batch 1000"
             ),
             env={},
@@ -811,13 +817,13 @@ def _run_rich(
             if output:
                 console.print(
                     Panel(
-                        output,
-                        title=f"[red]{f.check.key}[/] failure log",
+                        Text.from_ansi(output),
+                        title=Text(f"{f.check.key} failure log", style="red"),
                         border_style="red",
                         expand=True,
                     )
                 )
-        console.print(f"[dim]Logs: {run_log_root}[/]")
+        console.print(Text(f"Logs: {run_log_root}", style="dim"))
         return 1
 
     console.print(
@@ -830,7 +836,7 @@ def _run_rich(
             expand=False,
         )
     )
-    console.print(f"[dim]Logs: {run_log_root}[/]")
+    console.print(Text(f"Logs: {run_log_root}", style="dim"))
     return 0
 
 
