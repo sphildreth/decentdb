@@ -988,6 +988,24 @@ pub extern "C" fn ddb_stmt_bind_blob(
 }
 
 #[no_mangle]
+pub extern "C" fn ddb_stmt_bind_uuid(
+    stmt: *mut StmtHandle,
+    index_1_based: usize,
+    uuid_bytes: *const u8,
+) -> u32 {
+    ffi_boundary(|| {
+        let bytes = borrowed_bytes(uuid_bytes, 16)?;
+        let stmt = handle_mut(stmt, "stmt")?;
+        let slot = ensure_stmt_binding_slot(stmt, index_1_based)?;
+        let mut uuid = [0_u8; 16];
+        uuid.copy_from_slice(bytes);
+        stmt.bindings[slot] = Value::Uuid(uuid);
+        invalidate_stmt_result(stmt);
+        Ok(())
+    })
+}
+
+#[no_mangle]
 pub extern "C" fn ddb_stmt_bind_decimal(
     stmt: *mut StmtHandle,
     index_1_based: usize,
@@ -2278,6 +2296,56 @@ mod tests {
         assert_eq!(ddb_value_dispose(&mut count_value), DDB_OK);
         assert_eq!(ddb_result_free(&mut result), DDB_OK);
         assert_eq!(ddb_stmt_free(&mut stmt), DDB_OK);
+        assert_eq!(ddb_db_free(&mut db), DDB_OK);
+    }
+
+    #[test]
+    fn ffi_stmt_bind_uuid_round_trips_through_uuid_predicate() {
+        let mut db = ptr::null_mut();
+        let path = CString::new(":memory:").expect("path");
+        assert_eq!(ddb_db_open_or_create(path.as_ptr(), &mut db), DDB_OK);
+
+        let create = CString::new("CREATE TABLE t (id INT64 PRIMARY KEY, api_key UUID UNIQUE)")
+            .expect("create");
+        let mut result = ptr::null_mut();
+        assert_eq!(
+            ddb_db_execute(db, create.as_ptr(), ptr::null(), 0, &mut result),
+            DDB_OK
+        );
+        assert_eq!(ddb_result_free(&mut result), DDB_OK);
+
+        let insert = CString::new("INSERT INTO t (id, api_key) VALUES ($1, $2)").expect("insert");
+        let mut insert_stmt = ptr::null_mut();
+        assert_eq!(
+            ddb_db_prepare(db, insert.as_ptr(), &mut insert_stmt),
+            DDB_OK
+        );
+
+        let uuid = [0x10_u8; 16];
+        assert_eq!(ddb_stmt_bind_int64(insert_stmt, 1, 1), DDB_OK);
+        assert_eq!(ddb_stmt_bind_uuid(insert_stmt, 2, uuid.as_ptr()), DDB_OK);
+
+        let mut has_row = 1;
+        assert_eq!(ddb_stmt_step(insert_stmt, &mut has_row), DDB_OK);
+        assert_eq!(has_row, 0);
+        assert_eq!(ddb_stmt_free(&mut insert_stmt), DDB_OK);
+
+        let select = CString::new("SELECT id FROM t WHERE api_key = $1").expect("select");
+        let mut select_stmt = ptr::null_mut();
+        assert_eq!(
+            ddb_db_prepare(db, select.as_ptr(), &mut select_stmt),
+            DDB_OK
+        );
+        assert_eq!(ddb_stmt_bind_uuid(select_stmt, 1, uuid.as_ptr()), DDB_OK);
+        assert_eq!(ddb_stmt_step(select_stmt, &mut has_row), DDB_OK);
+        assert_eq!(has_row, 1);
+
+        let mut id = DdbValue::default();
+        assert_eq!(ddb_stmt_value_copy(select_stmt, 0, &mut id), DDB_OK);
+        assert_eq!(id.int64_value, 1);
+        assert_eq!(ddb_value_dispose(&mut id), DDB_OK);
+
+        assert_eq!(ddb_stmt_free(&mut select_stmt), DDB_OK);
         assert_eq!(ddb_db_free(&mut db), DDB_OK);
     }
 }

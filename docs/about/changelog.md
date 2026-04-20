@@ -5,6 +5,18 @@ All notable changes to DecentDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.1] - 2026-04-19
+
+### Fixed
+- .NET GUID/UUID parameter binding so native prepared statements, ADO.NET commands, and EF Core modification batches preserve UUID semantics instead of binding GUID values as raw blobs.
+- Mixed-case identifier handling across Rust execution/runtime paths used by EF-created schemas, including raw SQL DML resolution and dirty-table persistence tracking after append-only and row-update writes.
+- Planner/executor now uses the indexed equi-join fast path for `LEFT JOIN` on an indexed (or rowid-alias) right-side column, not only `INNER JOIN`. Previously LEFT JOINs with a valid B-tree or rowid probe fell back to an O(n·m) nested loop, causing multi-second regressions on mid-sized joined workloads. NULL-extended row semantics are preserved for non-matching left rows and for left rows whose join key is NULL.
+
+### Added
+- Regression coverage for typed UUID binding through the C ABI plus ADO.NET and EF Core indexed GUID equality queries.
+- Regression coverage for mixed-case EF-created tables remaining reachable from unquoted raw SQL after `EnsureCreated()`.
+- Regression coverage for the indexed `LEFT JOIN` fast path: a scaling/perf guard (`indexed_left_join_scales_linearly_not_quadratically`) plus correctness tests covering NULL-extended non-matches (`indexed_left_join_preserves_null_extended_rows`) and multi-row right-side matches (`indexed_left_join_handles_multi_match_right_side`).
+
 ## [2.2.0] - 2026-04-18
 
 ### Fixed

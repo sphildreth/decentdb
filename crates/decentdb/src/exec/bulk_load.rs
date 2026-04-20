@@ -20,7 +20,7 @@ impl EngineRuntime {
                 "bulk-load batch_size and sync_interval must be greater than zero",
             ));
         }
-        if self.catalog.views.contains_key(table_name) {
+        if self.catalog.view(table_name).is_some() {
             return Err(DbError::sql("bulk load targets must be base tables"));
         }
 

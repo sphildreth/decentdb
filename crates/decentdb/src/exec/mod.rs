@@ -718,26 +718,29 @@ impl EngineRuntime {
         let removed_tables = self
             .persisted_tables
             .keys()
-            .filter(|table_name| !self.catalog.tables.contains_key(*table_name))
+            .filter(|table_name| self.catalog.table(table_name).is_none())
             .cloned()
             .collect::<Vec<_>>();
 
         {
             let mut store = DbTxnPageStore { db };
             for table_name in dirty_tables {
-                let Some(_table) = self.catalog.tables.get(&table_name) else {
+                let Some(table) = self.catalog.table(&table_name) else {
                     continue;
                 };
-                let data = self.tables.get(&table_name).ok_or_else(|| {
+                let canonical_table_name = table.name.clone();
+                let data = self.tables.get(&canonical_table_name).ok_or_else(|| {
                     DbError::internal(format!("table data for {table_name} is missing"))
                 })?;
                 let previous_state = self
                     .persisted_tables
-                    .get(&table_name)
+                    .get(&canonical_table_name)
                     .copied()
                     .unwrap_or_default();
                 let previous_pointer = previous_state.pointer;
-                if self.append_only_dirty_tables.contains(&table_name)
+                if self
+                    .append_only_dirty_tables
+                    .contains(&canonical_table_name)
                     && previous_pointer.head_page_id != 0
                     && !previous_pointer.is_compressed()
                 {
@@ -760,7 +763,7 @@ impl EngineRuntime {
                                     DbError::corruption("overflow tail info is missing")
                                 })?;
                             self.persisted_tables.insert(
-                                table_name.clone(),
+                                canonical_table_name.clone(),
                                 PersistedTableState {
                                     pointer,
                                     checksum,
@@ -770,8 +773,8 @@ impl EngineRuntime {
                             );
                             // Invalidate chain cache — the append path
                             // modified the chain without hashing.
-                            self.overflow_chain_caches.remove(&table_name);
-                            self.cached_payloads.remove(&table_name);
+                            self.overflow_chain_caches.remove(&canonical_table_name);
+                            self.cached_payloads.remove(&canonical_table_name);
                             continue;
                         }
                     }
@@ -782,8 +785,8 @@ impl EngineRuntime {
                 //  2. Append-only: read old payload, append new rows
                 //  3. Full re-encode: encode every row from scratch
                 let (payload, skip_overflow_pages) =
-                    if let Some(dirty_indices) = self.row_update_dirty.get(&table_name) {
-                        if let Some(cached) = self.cached_payloads.get(&table_name) {
+                    if let Some(dirty_indices) = self.row_update_dirty.get(&canonical_table_name) {
+                        if let Some(cached) = self.cached_payloads.get(&canonical_table_name) {
                             let splice = splice_updated_rows_payload(cached, data, dirty_indices)?;
                             // Compute how many leading overflow pages are
                             // guaranteed identical (their byte ranges fall
@@ -795,7 +798,9 @@ impl EngineRuntime {
                         } else {
                             (encode_table_payload(data)?, 0)
                         }
-                    } else if self.append_only_dirty_tables.contains(&table_name)
+                    } else if self
+                        .append_only_dirty_tables
+                        .contains(&canonical_table_name)
                         && previous_pointer.head_page_id != 0
                     {
                         let previous_payload = read_overflow(&store, previous_pointer)?;
@@ -806,7 +811,7 @@ impl EngineRuntime {
 
                 let checksum = crc32c_parts(&[payload.as_slice()]);
                 let (pointer, new_chain_cache, tail) = if let Some(chain_cache) =
-                    self.overflow_chain_caches.get(&table_name)
+                    self.overflow_chain_caches.get(&canonical_table_name)
                 {
                     rewrite_overflow_cached(
                         &mut store,
@@ -827,9 +832,9 @@ impl EngineRuntime {
                     (ptr, cache, tail)
                 };
                 self.overflow_chain_caches
-                    .insert(table_name.clone(), new_chain_cache);
+                    .insert(canonical_table_name.clone(), new_chain_cache);
                 self.persisted_tables.insert(
-                    table_name.clone(),
+                    canonical_table_name.clone(),
                     PersistedTableState {
                         pointer,
                         checksum,
@@ -838,7 +843,7 @@ impl EngineRuntime {
                     },
                 );
                 self.cached_payloads
-                    .insert(table_name.clone(), Arc::new(payload));
+                    .insert(canonical_table_name, Arc::new(payload));
             }
             for table_name in removed_tables {
                 let Some(state) = self.persisted_tables.remove(&table_name) else {
@@ -1161,6 +1166,14 @@ impl EngineRuntime {
         self.table_schema_in_scope(name, NameResolutionScope::Session)
     }
 
+    pub(super) fn catalog_table_mut(&mut self, name: &str) -> Option<&mut TableSchema> {
+        map_get_ci_mut(&mut self.catalog.tables, name)
+    }
+
+    pub(super) fn canonical_catalog_table_name(&self, name: &str) -> Option<String> {
+        self.catalog.table(name).map(|table| table.name.clone())
+    }
+
     pub(super) fn table_data_in_scope(
         &self,
         name: &str,
@@ -1300,33 +1313,39 @@ impl EngineRuntime {
         if self.visible_table_is_temporary(table_name) {
             return;
         }
-        self.append_only_dirty_tables.remove(table_name);
-        self.row_update_dirty.remove(table_name);
-        if self.dirty_tables.contains(table_name) {
+        let Some(table_name) = self.canonical_catalog_table_name(table_name) else {
+            return;
+        };
+        self.append_only_dirty_tables.remove(&table_name);
+        self.row_update_dirty.remove(&table_name);
+        if self.dirty_tables.contains(&table_name) {
             return;
         }
-        self.dirty_tables.insert(table_name.to_string());
+        self.dirty_tables.insert(table_name);
     }
 
     pub(super) fn mark_table_row_dirty(&mut self, table_name: &str, row_index: usize) {
         if self.visible_table_is_temporary(table_name) {
             return;
         }
+        let Some(table_name) = self.canonical_catalog_table_name(table_name) else {
+            return;
+        };
         // Already fully dirty (not append-only, not row-update) — nothing to refine.
-        if self.dirty_tables.contains(table_name)
-            && !self.append_only_dirty_tables.contains(table_name)
-            && !self.row_update_dirty.contains_key(table_name)
+        if self.dirty_tables.contains(&table_name)
+            && !self.append_only_dirty_tables.contains(&table_name)
+            && !self.row_update_dirty.contains_key(&table_name)
         {
             return;
         }
         // Append-only dirty is incompatible with row-update; escalate.
-        if self.append_only_dirty_tables.contains(table_name) {
-            self.append_only_dirty_tables.remove(table_name);
+        if self.append_only_dirty_tables.contains(&table_name) {
+            self.append_only_dirty_tables.remove(&table_name);
             return;
         }
-        self.dirty_tables.insert(table_name.to_string());
+        self.dirty_tables.insert(table_name.clone());
         self.row_update_dirty
-            .entry(table_name.to_string())
+            .entry(table_name)
             .or_default()
             .push(row_index);
     }
@@ -1335,13 +1354,16 @@ impl EngineRuntime {
         if self.visible_table_is_temporary(table_name) {
             return;
         }
-        if self.append_only_dirty_tables.contains(table_name)
-            || self.dirty_tables.contains(table_name)
+        let Some(table_name) = self.canonical_catalog_table_name(table_name) else {
+            return;
+        };
+        if self.append_only_dirty_tables.contains(&table_name)
+            || self.dirty_tables.contains(&table_name)
         {
             return;
         }
-        self.dirty_tables.insert(table_name.to_string());
-        self.append_only_dirty_tables.insert(table_name.to_string());
+        self.dirty_tables.insert(table_name.clone());
+        self.append_only_dirty_tables.insert(table_name);
     }
 
     pub(super) fn mark_all_tables_dirty(&mut self) {
@@ -4621,10 +4643,11 @@ impl EngineRuntime {
                     value_expr,
                     applied_prefilter,
                 )?;
-                if matches!(kind, JoinKind::Inner) {
-                    if let Some(dataset) = self.try_indexed_inner_join_with_right_table(
+                if matches!(kind, JoinKind::Inner | JoinKind::Left) {
+                    if let Some(dataset) = self.try_indexed_equi_join_with_right_table(
                         &left_dataset,
                         right,
+                        *kind,
                         constraint,
                         ctes,
                     )? {
@@ -4833,13 +4856,32 @@ impl EngineRuntime {
         Ok(Some(Dataset { columns, rows }))
     }
 
-    fn try_indexed_inner_join_with_right_table(
+    /// Indexed equi-join probe path.
+    ///
+    /// For each row in `left`, probes the right table via a b-tree index
+    /// (or the rowid alias) instead of doing a full O(|left| * |right|)
+    /// nested loop. Supported join kinds:
+    ///
+    /// * `Inner` — skips left rows with NULL join values and left rows
+    ///   whose join value has no match.
+    /// * `Left`  — preserves every left row, emitting a NULL-extended
+    ///   right half when the left join value is NULL or has no match.
+    ///
+    /// Returns `Ok(None)` if any of the preconditions for the fast path
+    /// are not met (non-table right side, non-equi join, view/CTE/temp
+    /// table, etc.), in which case the caller falls back to the nested
+    /// loop join.
+    fn try_indexed_equi_join_with_right_table(
         &self,
         left: &Dataset,
         right_item: &FromItem,
+        kind: JoinKind,
         constraint: &JoinConstraint,
         ctes: &BTreeMap<String, Dataset>,
     ) -> Result<Option<Dataset>> {
+        if !matches!(kind, JoinKind::Inner | JoinKind::Left) {
+            return Ok(None);
+        }
         let JoinConstraint::On(on) = constraint else {
             return Ok(None);
         };
@@ -4941,6 +4983,8 @@ impl EngineRuntime {
         columns.extend(right_table.columns.iter().map(|column| {
             ColumnBinding::visible(Some(right_binding_name.clone()), column.name.clone())
         }));
+        let right_column_count = right_table.columns.len();
+        let is_left_outer = matches!(kind, JoinKind::Left);
         let mut rows = Vec::new();
         for left_row in &left.rows {
             let Some(join_value) = left_row.get(left_join_index) else {
@@ -4949,6 +4993,12 @@ impl EngineRuntime {
                 ));
             };
             if matches!(join_value, Value::Null) {
+                if is_left_outer {
+                    let mut row = Vec::with_capacity(left_row.len() + right_column_count);
+                    row.extend_from_slice(left_row);
+                    row.extend(std::iter::repeat_n(Value::Null, right_column_count));
+                    rows.push(row);
+                }
                 continue;
             }
             let row_ids = if let Some(keys) = keys {
@@ -4958,6 +5008,7 @@ impl EngineRuntime {
             } else {
                 RuntimeRowIdSet::Empty
             };
+            let rows_before = rows.len();
             row_ids.for_each(|row_id| {
                 let right_values = if let Some(positions) = right_row_positions.as_ref() {
                     let Some(right_position) = positions.get(&row_id).copied() else {
@@ -4975,6 +5026,12 @@ impl EngineRuntime {
                 row.extend_from_slice(right_values);
                 rows.push(row);
             });
+            if is_left_outer && rows.len() == rows_before {
+                let mut row = Vec::with_capacity(left_row.len() + right_column_count);
+                row.extend_from_slice(left_row);
+                row.extend(std::iter::repeat_n(Value::Null, right_column_count));
+                rows.push(row);
+            }
         }
         Ok(Some(Dataset { columns, rows }))
     }
@@ -5120,10 +5177,10 @@ impl EngineRuntime {
                         scope_row,
                     );
                 }
-                if matches!(kind, JoinKind::Inner) {
-                    if let Some(dataset) = self
-                        .try_indexed_inner_join_with_right_table(&left, right, constraint, ctes)?
-                    {
+                if matches!(kind, JoinKind::Inner | JoinKind::Left) {
+                    if let Some(dataset) = self.try_indexed_equi_join_with_right_table(
+                        &left, right, *kind, constraint, ctes,
+                    )? {
                         return Ok(dataset);
                     }
                 }

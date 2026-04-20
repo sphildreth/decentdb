@@ -283,6 +283,9 @@ public static unsafe class DecentDBNativeUnsafe
     [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_stmt_bind_blob")]
     internal static extern uint ddb_stmt_bind_blob(IntPtr stmt, nuint index1Based, byte* data, nuint byteLen);
 
+    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_stmt_bind_uuid")]
+    internal static extern uint ddb_stmt_bind_uuid(IntPtr stmt, nuint index1Based, byte* uuidBytes);
+
     [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_stmt_bind_timestamp_micros")]
     internal static extern uint ddb_stmt_bind_timestamp_micros(IntPtr stmt, nuint index1Based, long timestampMicros);
 

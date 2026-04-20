@@ -553,6 +553,14 @@ mod tests {
             next_row_id: 1,
         };
         runtime.catalog.tables.insert("t".to_string(), t);
+        let mut v = runtime
+            .catalog
+            .tables
+            .get("t")
+            .cloned()
+            .expect("expected test table");
+        v.name = "v".to_string();
+        runtime.catalog.tables.insert("v".to_string(), v);
 
         runtime.mark_table_row_dirty("t", 3);
         assert!(runtime.row_update_dirty.contains_key("t"));
