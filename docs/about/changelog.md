@@ -5,7 +5,24 @@ All notable changes to DecentDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [2.2.2] - 2026-04-20
+## [2.2.3] - 2026-04-21
+
+### Added (Dart/Flutter binding)
+- **UUID bind** (`UuidValue`): `Statement.bindAll` and `Statement.bindUuid` accept `UuidValue` and bind it via the native UUID path instead of a generic BLOB.
+- **`inspectStorageState`**: `Database.inspectStorageState()` exposes WAL and cache metrics without requiring a snapshot handle.
+- **Savepoint helpers**: `Database.savepoint()`, `Database.releaseSavepoint()`, and `Database.rollbackToSavepoint()` with a `transaction()` overload that wraps work in a named savepoint instead of a bare BEGIN/COMMIT.
+- **LRU prepared-statement cache**: `Database.prepare()` now returns a cached `Statement` keyed by SQL (capacity configurable via `stmtCacheCapacity` on all factory methods, default 128). `stmtCacheStats`, `clearStmtCache()`, and `onPerformanceWarning` allow observability and tuning.
+- **`PerformanceWarning`** exception class fires (at most once per database) when the statement-cache hit rate falls below 50 % after 100 prepares.
+- **Zero-copy batch binding**: `executeBatchTyped`, `executeBatchInt64`, and `executeBatchI64TextF64` use `malloc` for write-only bulk arrays instead of zero-filling with `calloc`.
+- **Single-pass `executeBatchTyped`**: rewrote from multi-pass type-probe to single-pass dispatch, reducing FFI call count for mixed-type bulk inserts.
+- **Column-metadata caching**: `Statement._loadColumnMetadata` is called at most once per prepared statement; the result is reused across resets and rebinds (eliminates ~30k redundant FFI calls in point-read workloads).
+- **Unmodifiable result views**: `columnNames` and `query()` return `UnmodifiableListView` to prevent accidental mutation.
+- **`Statement` finalizer**: a `dart:core` `Finalizer<_StmtToken>` calls `stmtFree` on GC'd statements; `dispose()` detaches it to prevent double-free.
+- **`isDisposed` getter** on `Statement` for safe cache-lookup checks.
+- **`rows()` streaming**: `Statement.rows({int pageSize = 100})` returns a lazy `Stream<Row>` backed by `nextPage`, suitable for large result sets.
+- **`AsyncDatabase` and `AsyncStatement`**: an isolate-backed wrapper that moves all FFI calls to a dedicated worker isolate, keeping the caller's event loop unblocked.
+
+
 
 ### Fixed
 - Made WAL page versions cheaply shareable with `Arc<[u8]>` so snapshot reads stop cloning full WAL-resident page buffers on every access.

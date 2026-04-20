@@ -130,4 +130,117 @@ void main() {
       stmt.dispose();
     }
   });
+
+  // D7: column metadata caching ---------------------------------------------------
+
+  test('column metadata is cached across reset/bind/execute cycles (D7)', () {
+    seed(5);
+    final stmt = db.prepare(r'SELECT id, name FROM items WHERE id = $1');
+    try {
+      // First step primes execution and loads metadata.
+      stmt.bindInt64(1, 1);
+      stmt.step();
+      final names1 = stmt.columnNames;
+      expect(names1, orderedEquals(['id', 'name']));
+
+      // Reset and re-execute; columnNames must be identical object (cached).
+      stmt.reset();
+      stmt.bindInt64(1, 2);
+      stmt.step();
+      final names2 = stmt.columnNames;
+      expect(identical(names1, names2), isTrue,
+          reason: 'columnNames should return the same cached list');
+    } finally {
+      stmt.dispose();
+    }
+  });
+
+  test('column metadata is fresh after dispose and re-prepare (D7)', () {
+    seed(3);
+    final stmt1 = db.prepare(r'SELECT id, name FROM items WHERE id = $1');
+    final names1 = () {
+      stmt1.bindInt64(1, 1);
+      stmt1.step(); // loads metadata via _primeStreamingExecution
+      final n = stmt1.columnNames;
+      stmt1.dispose();
+      return n;
+    }();
+
+    final stmt2 = db.prepare(r'SELECT id, name FROM items WHERE id = $1');
+    try {
+      stmt2.bindInt64(1, 1);
+      stmt2.step();
+      final names2 = stmt2.columnNames;
+      // Different objects but same content.
+      expect(identical(names1, names2), isFalse);
+      expect(names2, orderedEquals(['id', 'name']));
+    } finally {
+      stmt2.dispose();
+    }
+  });
+
+  // D11: rows() async* stream ----------------------------------------------------
+
+  test('rows() yields all rows in order (D11)', () async {
+    seed(100);
+    final stmt = db.prepare('SELECT id FROM items ORDER BY id');
+    try {
+      final ids = <int>[];
+      await for (final row in stmt.rows()) {
+        ids.add(row['id'] as int);
+      }
+      expect(ids.length, 100);
+      expect(ids.first, 1);
+      expect(ids.last, 100);
+    } finally {
+      stmt.dispose();
+    }
+  });
+
+  test('rows(pageSize: 1) yields each row individually (D11)', () async {
+    seed(5);
+    final stmt = db.prepare('SELECT id FROM items ORDER BY id');
+    try {
+      final ids = <int>[];
+      await for (final row in stmt.rows(pageSize: 1)) {
+        ids.add(row['id'] as int);
+      }
+      expect(ids, orderedEquals([1, 2, 3, 4, 5]));
+    } finally {
+      stmt.dispose();
+    }
+  });
+
+  test('rows(pageSize: 0) throws ArgumentError (D11)', () async {
+    final stmt = db.prepare('SELECT id FROM items ORDER BY id');
+    try {
+      await expectLater(
+        stmt.rows(pageSize: 0).first,
+        throwsA(isA<ArgumentError>()),
+      );
+    } finally {
+      stmt.dispose();
+    }
+  });
+
+  test('breaking out of await-for stops iteration and allows reuse (D11)',
+      () async {
+    seed(20);
+    final stmt = db.prepare('SELECT id FROM items ORDER BY id');
+    try {
+      final ids = <int>[];
+      await for (final row in stmt.rows()) {
+        ids.add(row['id'] as int);
+        if (ids.length == 5) break;
+      }
+      expect(ids, orderedEquals([1, 2, 3, 4, 5]));
+
+      // After break, reset and re-query should work.
+      stmt.reset();
+      final all = stmt.query();
+      expect(all.length, 20);
+    } finally {
+      stmt.dispose();
+    }
+  });
 }
