@@ -38,13 +38,13 @@ impl EngineRuntime {
             ));
         }
         if on_view {
-            if !self.catalog.views.contains_key(&statement.target_name) {
+            if self.catalog.view(&statement.target_name).is_none() {
                 return Err(DbError::sql(format!(
                     "INSTEAD OF triggers require an existing target view {}",
                     statement.target_name
                 )));
             }
-        } else if !self.catalog.tables.contains_key(&statement.target_name) {
+        } else if self.catalog.table(&statement.target_name).is_none() {
             return Err(DbError::sql(format!(
                 "AFTER triggers require an existing target table {}",
                 statement.target_name

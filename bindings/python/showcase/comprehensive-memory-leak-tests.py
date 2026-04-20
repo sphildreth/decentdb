@@ -278,12 +278,22 @@ def s_connection_churn(db_path: Path, i: int) -> int:
     return ops
 
 
-def s_long_lived_conn(db_path: Path, i: int, *, _state={}) -> int:
+# Module-level state shared between s_long_lived_conn and its teardown.
+# (Do NOT use per-function `_state={}` defaults — each `def` would get its
+# own dict, and the teardown would never see the iter function's connection,
+# leaving the native Db handle and its prepared-statement cache to leak
+# at process exit. That bug masked itself under RSS-based detection because
+# the leak was finite, but Valgrind caught it cleanly at `ddb_db_prepare`
+# and `ddb_db_open_or_create`.)
+_long_lived_state: dict = {}
+
+
+def s_long_lived_conn(db_path: Path, i: int) -> int:
     """ONE connection across all iterations, doing a fixed batch of work each iter.
 
     Targets per-connection accumulation that connection-churn tests miss.
     """
-    conn = _state.get("conn")
+    conn = _long_lived_state.get("conn")
     if conn is None:
         conn = decentdb.connect(str(db_path), mode="open_or_create", stmt_cache_size=128)
         cur = conn.cursor()
@@ -293,7 +303,7 @@ def s_long_lived_conn(db_path: Path, i: int, *, _state={}) -> int:
         )
         conn.commit()
         cur.close()
-        _state["conn"] = conn
+        _long_lived_state["conn"] = conn
     cur = conn.cursor()
     base = i * 200
     cur.executemany(
@@ -314,8 +324,8 @@ def s_long_lived_conn(db_path: Path, i: int, *, _state={}) -> int:
     return 200 + 1 + 1 + 1
 
 
-def s_long_lived_conn_teardown(_db_path: Path, _state={}) -> None:
-    conn = _state.pop("conn", None)
+def s_long_lived_conn_teardown(_db_path: Path) -> None:
+    conn = _long_lived_state.pop("conn", None)
     if conn is not None:
         with suppress(Exception):
             conn.close()

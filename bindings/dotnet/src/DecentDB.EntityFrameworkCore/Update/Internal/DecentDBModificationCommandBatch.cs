@@ -297,7 +297,7 @@ internal sealed class DecentDBModificationCommandBatch : ModificationCommandBatc
         else if (type == typeof(byte[]))
             stmt.BindBlob(index1Based, (byte[])value);
         else if (type == typeof(Guid))
-            stmt.BindBlob(index1Based, ((Guid)value).ToByteArray());
+            stmt.BindGuid(index1Based, (Guid)value);
         else if (type.IsEnum)
             stmt.BindInt64(index1Based, Convert.ToInt64(value));
         else
@@ -599,6 +599,23 @@ internal sealed class DecentDBModificationCommandBatch : ModificationCommandBatc
         var providerValue = converter is null
             ? value
             : converter.ConvertToProvider(value);
+
+        if (column.TypeMapping?.DbType == DbType.Guid)
+        {
+            if (providerValue is byte[] guidBytes)
+            {
+                if (guidBytes.Length != 16)
+                {
+                    throw new InvalidOperationException("GUID provider values must be 16 bytes.");
+                }
+
+                providerValue = new Guid(guidBytes);
+            }
+            else if (providerValue is string guidText && Guid.TryParse(guidText, out var parsedGuid))
+            {
+                providerValue = parsedGuid;
+            }
+        }
 
         if (providerValue is decimal decimalValue && column.TypeMapping?.Scale is int scale)
         {

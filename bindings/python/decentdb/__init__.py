@@ -3202,6 +3202,14 @@ class Connection:
         self._db = None
         self._closed = True
 
+    def __del__(self):
+        if getattr(self, "_closed", True):
+            return
+        try:
+            self.close()
+        except Exception:
+            pass
+
     def begin_transaction(self):
         self._ensure_open()
         code = self._lib.ddb_db_begin_transaction(self._db)

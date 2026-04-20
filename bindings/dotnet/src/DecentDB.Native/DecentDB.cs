@@ -514,9 +514,11 @@ public sealed class PreparedStatement : IDisposable
             if (!value.TryWriteBytes(new Span<byte>(bytes, 16)))
                 throw new InvalidOperationException("Failed to write Guid bytes");
 
-            // Bind as BLOB (UUID-typed columns accept BLOB writes; the engine
-            // stores them identically and the reader already handles UUID→Guid).
-            var res = _db.RecordStatus(DecentDBNativeUnsafe.ddb_stmt_bind_blob(Handle, checked((nuint)index1Based), bytes, 16));
+            var res = _db.RecordStatus(
+                DecentDBNativeUnsafe.ddb_stmt_bind_uuid(
+                    Handle,
+                    checked((nuint)index1Based),
+                    bytes));
             if (res != 0)
             {
                 throw new DecentDBException(_db.LastErrorCode, _db.LastErrorMessage, _sql);

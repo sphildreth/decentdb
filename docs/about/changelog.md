@@ -5,6 +5,16 @@ All notable changes to DecentDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.1] - UNRELEASED
+
+### Fixed
+- .NET GUID/UUID parameter binding so native prepared statements, ADO.NET commands, and EF Core modification batches preserve UUID semantics instead of binding GUID values as raw blobs.
+- Mixed-case identifier handling across Rust execution/runtime paths used by EF-created schemas, including raw SQL DML resolution and dirty-table persistence tracking after append-only and row-update writes.
+
+### Added
+- Regression coverage for typed UUID binding through the C ABI plus ADO.NET and EF Core indexed GUID equality queries.
+- Regression coverage for mixed-case EF-created tables remaining reachable from unquoted raw SQL after `EnsureCreated()`.
+
 ## [2.2.0] - 2026-04-18
 
 ### Fixed

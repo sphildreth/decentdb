@@ -718,26 +718,29 @@ impl EngineRuntime {
         let removed_tables = self
             .persisted_tables
             .keys()
-            .filter(|table_name| !self.catalog.tables.contains_key(*table_name))
+            .filter(|table_name| self.catalog.table(table_name).is_none())
             .cloned()
             .collect::<Vec<_>>();
 
         {
             let mut store = DbTxnPageStore { db };
             for table_name in dirty_tables {
-                let Some(_table) = self.catalog.tables.get(&table_name) else {
+                let Some(table) = self.catalog.table(&table_name) else {
                     continue;
                 };
-                let data = self.tables.get(&table_name).ok_or_else(|| {
+                let canonical_table_name = table.name.clone();
+                let data = self.tables.get(&canonical_table_name).ok_or_else(|| {
                     DbError::internal(format!("table data for {table_name} is missing"))
                 })?;
                 let previous_state = self
                     .persisted_tables
-                    .get(&table_name)
+                    .get(&canonical_table_name)
                     .copied()
                     .unwrap_or_default();
                 let previous_pointer = previous_state.pointer;
-                if self.append_only_dirty_tables.contains(&table_name)
+                if self
+                    .append_only_dirty_tables
+                    .contains(&canonical_table_name)
                     && previous_pointer.head_page_id != 0
                     && !previous_pointer.is_compressed()
                 {
@@ -760,7 +763,7 @@ impl EngineRuntime {
                                     DbError::corruption("overflow tail info is missing")
                                 })?;
                             self.persisted_tables.insert(
-                                table_name.clone(),
+                                canonical_table_name.clone(),
                                 PersistedTableState {
                                     pointer,
                                     checksum,
@@ -770,8 +773,8 @@ impl EngineRuntime {
                             );
                             // Invalidate chain cache — the append path
                             // modified the chain without hashing.
-                            self.overflow_chain_caches.remove(&table_name);
-                            self.cached_payloads.remove(&table_name);
+                            self.overflow_chain_caches.remove(&canonical_table_name);
+                            self.cached_payloads.remove(&canonical_table_name);
                             continue;
                         }
                     }
@@ -782,8 +785,8 @@ impl EngineRuntime {
                 //  2. Append-only: read old payload, append new rows
                 //  3. Full re-encode: encode every row from scratch
                 let (payload, skip_overflow_pages) =
-                    if let Some(dirty_indices) = self.row_update_dirty.get(&table_name) {
-                        if let Some(cached) = self.cached_payloads.get(&table_name) {
+                    if let Some(dirty_indices) = self.row_update_dirty.get(&canonical_table_name) {
+                        if let Some(cached) = self.cached_payloads.get(&canonical_table_name) {
                             let splice = splice_updated_rows_payload(cached, data, dirty_indices)?;
                             // Compute how many leading overflow pages are
                             // guaranteed identical (their byte ranges fall
@@ -795,7 +798,9 @@ impl EngineRuntime {
                         } else {
                             (encode_table_payload(data)?, 0)
                         }
-                    } else if self.append_only_dirty_tables.contains(&table_name)
+                    } else if self
+                        .append_only_dirty_tables
+                        .contains(&canonical_table_name)
                         && previous_pointer.head_page_id != 0
                     {
                         let previous_payload = read_overflow(&store, previous_pointer)?;
@@ -806,7 +811,7 @@ impl EngineRuntime {
 
                 let checksum = crc32c_parts(&[payload.as_slice()]);
                 let (pointer, new_chain_cache, tail) = if let Some(chain_cache) =
-                    self.overflow_chain_caches.get(&table_name)
+                    self.overflow_chain_caches.get(&canonical_table_name)
                 {
                     rewrite_overflow_cached(
                         &mut store,
@@ -827,9 +832,9 @@ impl EngineRuntime {
                     (ptr, cache, tail)
                 };
                 self.overflow_chain_caches
-                    .insert(table_name.clone(), new_chain_cache);
+                    .insert(canonical_table_name.clone(), new_chain_cache);
                 self.persisted_tables.insert(
-                    table_name.clone(),
+                    canonical_table_name.clone(),
                     PersistedTableState {
                         pointer,
                         checksum,
@@ -838,7 +843,7 @@ impl EngineRuntime {
                     },
                 );
                 self.cached_payloads
-                    .insert(table_name.clone(), Arc::new(payload));
+                    .insert(canonical_table_name, Arc::new(payload));
             }
             for table_name in removed_tables {
                 let Some(state) = self.persisted_tables.remove(&table_name) else {
@@ -1161,6 +1166,14 @@ impl EngineRuntime {
         self.table_schema_in_scope(name, NameResolutionScope::Session)
     }
 
+    pub(super) fn catalog_table_mut(&mut self, name: &str) -> Option<&mut TableSchema> {
+        map_get_ci_mut(&mut self.catalog.tables, name)
+    }
+
+    pub(super) fn canonical_catalog_table_name(&self, name: &str) -> Option<String> {
+        self.catalog.table(name).map(|table| table.name.clone())
+    }
+
     pub(super) fn table_data_in_scope(
         &self,
         name: &str,
@@ -1300,33 +1313,39 @@ impl EngineRuntime {
         if self.visible_table_is_temporary(table_name) {
             return;
         }
-        self.append_only_dirty_tables.remove(table_name);
-        self.row_update_dirty.remove(table_name);
-        if self.dirty_tables.contains(table_name) {
+        let Some(table_name) = self.canonical_catalog_table_name(table_name) else {
+            return;
+        };
+        self.append_only_dirty_tables.remove(&table_name);
+        self.row_update_dirty.remove(&table_name);
+        if self.dirty_tables.contains(&table_name) {
             return;
         }
-        self.dirty_tables.insert(table_name.to_string());
+        self.dirty_tables.insert(table_name);
     }
 
     pub(super) fn mark_table_row_dirty(&mut self, table_name: &str, row_index: usize) {
         if self.visible_table_is_temporary(table_name) {
             return;
         }
+        let Some(table_name) = self.canonical_catalog_table_name(table_name) else {
+            return;
+        };
         // Already fully dirty (not append-only, not row-update) — nothing to refine.
-        if self.dirty_tables.contains(table_name)
-            && !self.append_only_dirty_tables.contains(table_name)
-            && !self.row_update_dirty.contains_key(table_name)
+        if self.dirty_tables.contains(&table_name)
+            && !self.append_only_dirty_tables.contains(&table_name)
+            && !self.row_update_dirty.contains_key(&table_name)
         {
             return;
         }
         // Append-only dirty is incompatible with row-update; escalate.
-        if self.append_only_dirty_tables.contains(table_name) {
-            self.append_only_dirty_tables.remove(table_name);
+        if self.append_only_dirty_tables.contains(&table_name) {
+            self.append_only_dirty_tables.remove(&table_name);
             return;
         }
-        self.dirty_tables.insert(table_name.to_string());
+        self.dirty_tables.insert(table_name.clone());
         self.row_update_dirty
-            .entry(table_name.to_string())
+            .entry(table_name)
             .or_default()
             .push(row_index);
     }
@@ -1335,13 +1354,16 @@ impl EngineRuntime {
         if self.visible_table_is_temporary(table_name) {
             return;
         }
-        if self.append_only_dirty_tables.contains(table_name)
-            || self.dirty_tables.contains(table_name)
+        let Some(table_name) = self.canonical_catalog_table_name(table_name) else {
+            return;
+        };
+        if self.append_only_dirty_tables.contains(&table_name)
+            || self.dirty_tables.contains(&table_name)
         {
             return;
         }
-        self.dirty_tables.insert(table_name.to_string());
-        self.append_only_dirty_tables.insert(table_name.to_string());
+        self.dirty_tables.insert(table_name.clone());
+        self.append_only_dirty_tables.insert(table_name);
     }
 
     pub(super) fn mark_all_tables_dirty(&mut self) {

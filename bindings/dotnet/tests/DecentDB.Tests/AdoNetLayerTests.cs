@@ -494,6 +494,51 @@ public class AdoNetLayerTests : IDisposable
         Assert.Null(preparedField.GetValue(cmd));
         Assert.Equal(2L, cmd.ExecuteScalar());
     }
+
+    [Fact]
+    public void DecentDBCommand_GuidParameter_UsesUuidSemanticsForIndexedEquality()
+    {
+        using var conn = new DecentDBConnection($"Data Source={_dbPath}");
+        conn.Open();
+
+        using (var setup = conn.CreateCommand())
+        {
+            setup.CommandText = """
+                CREATE TABLE guid_lookup (
+                    id INTEGER PRIMARY KEY,
+                    api_key UUID NOT NULL
+                )
+                """;
+            setup.ExecuteNonQuery();
+            setup.CommandText = "CREATE UNIQUE INDEX ux_guid_lookup_api_key ON guid_lookup (api_key)";
+            setup.ExecuteNonQuery();
+        }
+
+        var apiKeyBytes = Guid.NewGuid().ToByteArray();
+
+        using (var insert = conn.CreateCommand())
+        {
+            var apiKey = insert.CreateParameter();
+            apiKey.ParameterName = "@apiKey";
+            apiKey.DbType = DbType.Guid;
+            apiKey.Value = apiKeyBytes;
+
+            insert.CommandText = "INSERT INTO guid_lookup (id, api_key) VALUES (1, @apiKey)";
+            insert.Parameters.Add(apiKey);
+            Assert.Equal(1, insert.ExecuteNonQuery());
+        }
+
+        using var query = conn.CreateCommand();
+        var lookup = query.CreateParameter();
+        lookup.ParameterName = "@apiKey";
+        lookup.DbType = DbType.Guid;
+        lookup.Value = apiKeyBytes;
+
+        query.CommandText = "SELECT id FROM guid_lookup WHERE api_key = @apiKey";
+        query.Parameters.Add(lookup);
+
+        Assert.Equal(1L, query.ExecuteScalar());
+    }
     
     // ───── GetSchema tests ─────
 

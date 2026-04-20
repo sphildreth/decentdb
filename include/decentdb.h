@@ -123,6 +123,10 @@ ddb_status_t ddb_stmt_bind_blob(
     size_t index_1_based,
     const uint8_t *data,
     size_t byte_len);
+ddb_status_t ddb_stmt_bind_uuid(
+    ddb_stmt_t *stmt,
+    size_t index_1_based,
+    const uint8_t uuid_bytes[16]);
 ddb_status_t ddb_stmt_bind_decimal(
     ddb_stmt_t *stmt,
     size_t index_1_based,

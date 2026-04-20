@@ -481,6 +481,38 @@ namespace DecentDB.AdoNet
                 return;
             }
 
+            if (parameter.DbType == DbType.Guid)
+            {
+                if (value is Guid parameterGuid)
+                {
+                    stmt.BindGuid(index1Based, parameterGuid);
+                    return;
+                }
+
+                if (value is byte[] guidBytes)
+                {
+                    if (guidBytes.Length != 16)
+                    {
+                        throw new ArgumentException(
+                            "GUID parameters must use 16-byte values.",
+                            nameof(parameter));
+                    }
+
+                    stmt.BindGuid(index1Based, new Guid(guidBytes));
+                    return;
+                }
+
+                if (value is string guidText && Guid.TryParse(guidText, out var parsedGuid))
+                {
+                    stmt.BindGuid(index1Based, parsedGuid);
+                    return;
+                }
+
+                throw new ArgumentException(
+                    $"Unsupported GUID parameter value type: {value.GetType().FullName}",
+                    nameof(parameter));
+            }
+
             if (value is long l)
             {
                 stmt.BindInt64(index1Based, l);
@@ -628,7 +660,7 @@ namespace DecentDB.AdoNet
 
             if (value is Guid guid)
             {
-                stmt.BindBlob(index1Based, guid.ToByteArray());
+                stmt.BindGuid(index1Based, guid);
                 return;
             }
 

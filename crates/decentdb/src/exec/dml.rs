@@ -288,7 +288,7 @@ impl EngineRuntime {
         }
         !self.catalog.triggers.values().any(|trigger| {
             !trigger.on_view
-                && trigger.target_name == statement.table_name
+                && identifiers_equal(&trigger.target_name, &statement.table_name)
                 && trigger.event == TriggerEvent::Insert
         })
     }
@@ -796,9 +796,7 @@ impl EngineRuntime {
     ) -> Result<QueryResult> {
         let table_name = prepared.table_name.as_str();
         let mut next_row_id = self
-            .catalog
-            .tables
-            .get(table_name)
+            .table_schema(table_name)
             .ok_or_else(|| DbError::sql(format!("unknown table {table_name}")))?
             .next_row_id;
         let mut candidate = Vec::with_capacity(prepared.columns.len());
@@ -866,9 +864,7 @@ impl EngineRuntime {
     ) -> Result<u64> {
         let table_name = prepared.table_name.as_str();
         let mut next_row_id = self
-            .catalog
-            .tables
-            .get(table_name)
+            .table_schema(table_name)
             .ok_or_else(|| DbError::sql(format!("unknown table {table_name}")))?
             .next_row_id;
         let mut candidate = Vec::with_capacity(prepared.columns.len());
@@ -967,13 +963,10 @@ impl EngineRuntime {
                 !prepared.use_generic_validation,
             )?;
         }
-        self.catalog
-            .tables
-            .get_mut(table_name)
+        self.catalog_table_mut(table_name)
             .ok_or_else(|| DbError::sql(format!("unknown table {table_name}")))?
             .next_row_id = next_row_id;
-        self.tables
-            .get_mut(table_name)
+        self.table_data_mut(table_name)
             .ok_or_else(|| DbError::internal(format!("table data for {table_name} is missing")))?
             .rows
             .push(stored_row);
@@ -1037,9 +1030,7 @@ impl EngineRuntime {
                         .ok_or_else(|| DbError::sql(format!("unknown table {}", table_name)))?
                         .next_row_id = staged_table.next_row_id;
                 } else {
-                    self.catalog
-                        .tables
-                        .get_mut(&table_name)
+                    self.catalog_table_mut(&table_name)
                         .ok_or_else(|| DbError::sql(format!("unknown table {}", table_name)))?
                         .next_row_id = staged_table.next_row_id;
                 }
@@ -1815,24 +1806,23 @@ impl EngineRuntime {
         if table.temporary {
             return Ok(());
         }
-        let referencing_tables = self
-            .catalog
-            .tables
-            .values()
-            .filter(|child| {
-                child
-                    .foreign_keys
-                    .iter()
-                    .any(|foreign_key| foreign_key.referenced_table == table_name)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
+        let referencing_tables =
+            self.catalog
+                .tables
+                .values()
+                .filter(|child| {
+                    child.foreign_keys.iter().any(|foreign_key| {
+                        identifiers_equal(&foreign_key.referenced_table, table_name)
+                    })
+                })
+                .cloned()
+                .collect::<Vec<_>>();
 
         for child_table in referencing_tables {
             let foreign_keys = child_table
                 .foreign_keys
                 .iter()
-                .filter(|foreign_key| foreign_key.referenced_table == table_name)
+                .filter(|foreign_key| identifiers_equal(&foreign_key.referenced_table, table_name))
                 .cloned()
                 .collect::<Vec<_>>();
             for foreign_key in foreign_keys {
@@ -1943,23 +1933,22 @@ impl EngineRuntime {
         if table.temporary {
             return Ok(());
         }
-        let referencing_tables = self
-            .catalog
-            .tables
-            .values()
-            .filter(|child| {
-                child
-                    .foreign_keys
-                    .iter()
-                    .any(|foreign_key| foreign_key.referenced_table == table_name)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
+        let referencing_tables =
+            self.catalog
+                .tables
+                .values()
+                .filter(|child| {
+                    child.foreign_keys.iter().any(|foreign_key| {
+                        identifiers_equal(&foreign_key.referenced_table, table_name)
+                    })
+                })
+                .cloned()
+                .collect::<Vec<_>>();
         for child_table in referencing_tables {
             let foreign_keys = child_table
                 .foreign_keys
                 .iter()
-                .filter(|foreign_key| foreign_key.referenced_table == table_name)
+                .filter(|foreign_key| identifiers_equal(&foreign_key.referenced_table, table_name))
                 .cloned()
                 .collect::<Vec<_>>();
             for foreign_key in foreign_keys {
@@ -2149,9 +2138,7 @@ impl EngineRuntime {
         if let Some(table) = self.temp_table_schema_mut(&table_name) {
             table.next_row_id = staged_table.next_row_id;
         } else {
-            self.catalog
-                .tables
-                .get_mut(&table_name)
+            self.catalog_table_mut(&table_name)
                 .ok_or_else(|| DbError::sql(format!("unknown table {}", table_name)))?
                 .next_row_id = staged_table.next_row_id;
         }
@@ -2202,7 +2189,7 @@ pub(super) fn build_insert_row_values(
         let column_index = table
             .columns
             .iter()
-            .position(|column| column.name == column_name)
+            .position(|column| identifiers_equal(&column.name, &column_name))
             .ok_or_else(|| DbError::sql(format!("unknown column {}", column_name)))?;
         if table.columns[column_index].generated_sql.is_some() {
             return Err(DbError::sql(format!(
@@ -2380,8 +2367,7 @@ fn prepare_single_column_foreign_key(
         })?;
     let parent = runtime
         .catalog
-        .tables
-        .get(&foreign_key.referenced_table)
+        .table(&foreign_key.referenced_table)
         .ok_or_else(|| {
             DbError::constraint(format!(
                 "foreign key references unknown table {}",
@@ -2695,9 +2681,7 @@ pub(super) fn next_row_id(runtime: &mut EngineRuntime, table_name: &str) -> i64 
         table
     } else {
         runtime
-            .catalog
-            .tables
-            .get_mut(table_name)
+            .catalog_table_mut(table_name)
             .expect("table must exist for row-id allocation")
     };
     let row_id = table.next_row_id;

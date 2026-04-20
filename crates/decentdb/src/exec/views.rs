@@ -20,7 +20,7 @@ impl EngineRuntime {
                 )));
             }
         } else if self.catalog.contains_object(&statement.view_name)
-            && (!statement.replace || !self.catalog.views.contains_key(&statement.view_name))
+            && (!statement.replace || self.catalog.view(&statement.view_name).is_none())
         {
             return Err(DbError::sql(format!(
                 "object {} already exists",
