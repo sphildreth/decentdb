@@ -50,7 +50,7 @@ pub(crate) fn initialize_or_recover(
     let mut index = WalIndex::default();
     let mut max_page_id = 0;
     let mut offset = WAL_HEADER_SIZE;
-    let mut pending = Vec::<(PageId, Vec<u8>, u64)>::new();
+    let mut pending = Vec::<(PageId, Arc<[u8]>, u64)>::new();
     while offset < header.wal_end_offset {
         let Some(frame) =
             WalFrame::decode_from_file(file.as_ref(), offset, page_size, header.wal_end_offset)?
@@ -61,17 +61,17 @@ pub(crate) fn initialize_or_recover(
         match frame.frame_type {
             FrameType::Page => {
                 max_page_id = max_page_id.max(frame.page_id);
-                pending.push((frame.page_id, frame.payload, next_offset));
+                pending.push((frame.page_id, Arc::from(frame.payload), next_offset));
             }
             FrameType::PageDelta => {
                 max_page_id = max_page_id.max(frame.page_id);
                 let base = if let Some(version) = index.latest_visible(frame.page_id, u64::MAX) {
                     version.data.clone()
                 } else {
-                    pager.read_page(frame.page_id)?.to_vec()
+                    pager.read_page(frame.page_id)?
                 };
                 let data = apply_page_delta(&base, &frame.payload)?;
-                pending.push((frame.page_id, data, next_offset));
+                pending.push((frame.page_id, Arc::from(data), next_offset));
             }
             FrameType::Commit => {
                 for (page_id, data, lsn) in pending.drain(..) {
@@ -258,7 +258,7 @@ mod tests {
         let latest = index
             .latest_visible(7, u64::MAX)
             .expect("latest version for page 7");
-        assert_eq!(latest.data, second);
+        assert_eq!(latest.data.as_ref(), second.as_slice());
     }
 
     #[test]
@@ -367,6 +367,6 @@ mod tests {
         let version = index
             .latest_visible(3, u64::MAX)
             .expect("recovered page version");
-        assert_eq!(version.data, updated);
+        assert_eq!(version.data.as_ref(), updated.as_slice());
     }
 }

@@ -942,7 +942,7 @@ impl Db {
             .wal
             .read_page_at_snapshot(page_id, snapshot_lsn)?
         {
-            return Ok(Arc::from(wal_page));
+            return Ok(wal_page);
         }
         self.inner.pager.read_page(page_id)
     }
@@ -982,7 +982,7 @@ impl Db {
             .wal
             .read_page_at_snapshot(page_id, snapshot_lsn)?
         {
-            return Ok(Arc::from(wal_page));
+            return Ok(wal_page);
         }
         self.inner.pager.read_page(page_id)
     }
@@ -1169,7 +1169,7 @@ impl Db {
             .wal
             .read_page_at_snapshot(page_id, snapshot_lsn)?
         {
-            return Ok(Arc::from(wal_page));
+            return Ok(wal_page);
         }
         self.inner.pager.read_page(page_id)
     }

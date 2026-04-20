@@ -4,6 +4,7 @@
 //! - design/adr/0003-snapshot-lsn-atomicity.md
 
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use crate::config::WalSyncMode;
 use crate::error::{DbError, Result};
@@ -57,7 +58,7 @@ pub(crate) fn commit_pages(
         let base = base_pages
             .get(i)
             .and_then(|b| b.as_ref())
-            .map(|data| data.as_slice());
+            .map(|data| &data[..]);
         let encoded_len =
             append_best_page_frame_with_base(page_batch, wal, pager, page_id, &payload, base)?;
         prepared_pages.push((page_id, payload, encoded_len));
@@ -90,7 +91,7 @@ pub(crate) fn commit_pages(
                 page_id,
                 WalVersion {
                     lsn: version_lsn,
-                    data: payload,
+                    data: Arc::from(payload),
                 },
                 retain_history,
             );
@@ -148,7 +149,7 @@ pub(crate) fn commit_pages_if_latest(
         let base = base_pages
             .get(i)
             .and_then(|b| b.as_ref())
-            .map(|data| data.as_slice());
+            .map(|data| &data[..]);
         let encoded_len =
             append_best_page_frame_with_base(page_batch, wal, pager, page_id, &payload, base)?;
         prepared_pages.push((page_id, payload, encoded_len));
@@ -179,7 +180,7 @@ pub(crate) fn commit_pages_if_latest(
                 page_id,
                 WalVersion {
                     lsn: version_lsn,
-                    data: payload,
+                    data: Arc::from(payload),
                 },
                 retain_history,
             );
@@ -302,7 +303,7 @@ fn lookup_base_pages_batch(
     wal: &WalHandle,
     pages: &[(PageId, Vec<u8>)],
     snapshot_lsn: u64,
-) -> Vec<Option<Vec<u8>>> {
+) -> Vec<Option<Arc<[u8]>>> {
     let index = wal
         .inner
         .index
@@ -313,7 +314,7 @@ fn lookup_base_pages_batch(
         .map(|(page_id, _)| {
             index
                 .latest_visible(*page_id, snapshot_lsn)
-                .map(|v| v.data.clone())
+                .map(|v| Arc::clone(&v.data))
         })
         .collect()
 }

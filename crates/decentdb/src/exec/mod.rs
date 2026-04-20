@@ -5363,7 +5363,7 @@ impl PageStore for SnapshotPageStore<'_> {
 
     fn read_page(&self, page_id: PageId) -> Result<Arc<[u8]>> {
         if let Some(page) = self.wal.read_page_at_snapshot(page_id, self.snapshot_lsn)? {
-            Ok(Arc::from(page))
+            Ok(page)
         } else {
             self.pager.read_page(page_id)
         }
