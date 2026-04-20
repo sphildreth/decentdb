@@ -32,6 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Made WAL page versions cheaply shareable with `Arc<[u8]>` so snapshot reads stop cloning full WAL-resident page buffers on every access.
 - Eliminated repeated base-page materialization during WAL recovery by reusing per-page pending reconstruction state across long delta chains.
 - Stopped deep-cloning read-mostly execution runtime state by Arc-sharing catalog, table, temp-table, and runtime-index maps with copy-on-write mutation.
+- Eliminated cross-table COW contamination on UPDATE/DELETE/INSERT by wrapping each table's `TableData` in its own `Arc`, so the first write in a transaction now clones only the targeted table's row vector instead of every table's rows. Yields ~3× faster DELETE p50 (132 µs → 42 µs) and ~1.3× faster UPDATE p50 (116 µs → 87 µs) on the Python `bench_complex` workload, with a 44× speedup on a worst-case micro-probe (mutating a small table while a large unrelated table sits in the catalog).
 - Avoided full dataset clones on CTE alias resolution by sharing dataset row storage and rewriting only column-binding metadata.
 - Bounded the per-session cached payload map with an LRU cap from `DbConfig` and Arc-shared temp schema state to avoid repeated deep clones across statements.
 - Documented C ABI ownership and free responsibilities for database, statement, and result handles in both the public header and Rust rustdoc.

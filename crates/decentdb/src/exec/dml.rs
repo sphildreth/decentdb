@@ -3624,12 +3624,12 @@ mod tests {
 
         runtime.tables_mut().insert(
             "child".to_string(),
-            crate::exec::TableData {
+            std::sync::Arc::new(crate::exec::TableData {
                 rows: vec![StoredRow {
                     row_id: 1,
                     values: vec![Value::Int64(1), Value::Int64(7)],
                 }],
-            },
+            }),
         );
 
         runtime
@@ -3720,12 +3720,12 @@ mod tests {
 
         runtime.tables_mut().insert(
             "child".to_string(),
-            crate::exec::TableData {
+            std::sync::Arc::new(crate::exec::TableData {
                 rows: vec![StoredRow {
                     row_id: 1,
                     values: vec![Value::Int64(1), Value::Int64(7)],
                 }],
-            },
+            }),
         );
 
         runtime
@@ -3818,12 +3818,12 @@ mod tests {
 
         runtime.tables_mut().insert(
             "child".to_string(),
-            crate::exec::TableData {
+            std::sync::Arc::new(crate::exec::TableData {
                 rows: vec![StoredRow {
                     row_id: 1,
                     values: vec![Value::Int64(1), Value::Int64(7)],
                 }],
-            },
+            }),
         );
 
         assert!(runtime
@@ -3912,12 +3912,12 @@ mod tests {
 
         runtime.tables_mut().insert(
             "child".to_string(),
-            crate::exec::TableData {
+            std::sync::Arc::new(crate::exec::TableData {
                 rows: vec![StoredRow {
                     row_id: 1,
                     values: vec![Value::Int64(1), Value::Int64(7)],
                 }],
-            },
+            }),
         );
 
         runtime
@@ -4016,12 +4016,12 @@ mod tests {
 
         runtime.tables_mut().insert(
             "child".to_string(),
-            crate::exec::TableData {
+            std::sync::Arc::new(crate::exec::TableData {
                 rows: vec![StoredRow {
                     row_id: 1,
                     values: vec![Value::Int64(1), Value::Int64(7)],
                 }],
-            },
+            }),
         );
 
         runtime
@@ -4120,12 +4120,12 @@ mod tests {
 
         runtime.tables_mut().insert(
             "child".to_string(),
-            crate::exec::TableData {
+            std::sync::Arc::new(crate::exec::TableData {
                 rows: vec![StoredRow {
                     row_id: 1,
                     values: vec![Value::Int64(1), Value::Int64(7)],
                 }],
-            },
+            }),
         );
 
         assert!(runtime
@@ -4191,12 +4191,12 @@ mod apply_conflict_tests {
             .insert(table.name.clone(), table.clone());
         runtime.tables_mut().insert(
             "t".to_string(),
-            crate::exec::TableData {
+            std::sync::Arc::new(crate::exec::TableData {
                 rows: vec![StoredRow {
                     row_id: 1,
                     values: vec![Value::Int64(1), Value::Int64(10)],
                 }],
-            },
+            }),
         );
 
         let assignments = vec![crate::sql::ast::Assignment {
@@ -4275,12 +4275,12 @@ mod apply_conflict_tests {
             .insert(table.name.clone(), table.clone());
         runtime.tables_mut().insert(
             "t2".to_string(),
-            crate::exec::TableData {
+            std::sync::Arc::new(crate::exec::TableData {
                 rows: vec![StoredRow {
                     row_id: 1,
                     values: vec![Value::Int64(1), Value::Int64(0), Value::Int64(10)],
                 }],
-            },
+            }),
         );
 
         let assignments = vec![crate::sql::ast::Assignment {
@@ -4343,12 +4343,12 @@ mod apply_conflict_tests {
             .insert(table.name.clone(), table.clone());
         runtime.tables_mut().insert(
             "t3".to_string(),
-            crate::exec::TableData {
+            std::sync::Arc::new(crate::exec::TableData {
                 rows: vec![StoredRow {
                     row_id: 1,
                     values: vec![Value::Int64(1), Value::Int64(10)],
                 }],
-            },
+            }),
         );
 
         let assignments = vec![crate::sql::ast::Assignment {
@@ -4421,12 +4421,12 @@ mod apply_conflict_tests {
             .insert(table.name.clone(), table.clone());
         runtime.tables_mut().insert(
             "t4".to_string(),
-            crate::exec::TableData {
+            std::sync::Arc::new(crate::exec::TableData {
                 rows: vec![StoredRow {
                     row_id: 1,
                     values: vec![Value::Int64(1), Value::Int64(10)],
                 }],
-            },
+            }),
         );
 
         let assignments = vec![crate::sql::ast::Assignment {

@@ -201,9 +201,10 @@ mod tests {
             .catalog_mut()
             .tables
             .insert("t".to_string(), table.clone());
-        runtime
-            .tables_mut()
-            .insert("t".to_string(), TableData { rows: vec![] });
+        runtime.tables_mut().insert(
+            "t".to_string(),
+            std::sync::Arc::new(TableData { rows: vec![] }),
+        );
 
         let stmt = parse_sql_statement("INSERT INTO t (val) VALUES (20)").unwrap();
         let insert = match stmt {

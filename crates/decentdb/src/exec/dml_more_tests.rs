@@ -54,12 +54,12 @@ mod tests {
 
         runtime.tables_mut().insert(
             "t".to_string(),
-            TableData {
+            std::sync::Arc::new(TableData {
                 rows: vec![StoredRow {
                     row_id: 1,
                     values: vec![Value::Int64(1), Value::Int64(10)],
                 }],
-            },
+            }),
         );
 
         let stmt = parse_sql_statement("UPDATE t SET val = 20 WHERE id = 1").unwrap();
@@ -131,12 +131,12 @@ mod tests {
 
         runtime.tables_mut().insert(
             "t".to_string(),
-            TableData {
+            std::sync::Arc::new(TableData {
                 rows: vec![StoredRow {
                     row_id: 1,
                     values: vec![Value::Int64(1), Value::Int64(10)],
                 }],
-            },
+            }),
         );
 
         let stmt = parse_sql_statement("DELETE FROM t WHERE id = 1").unwrap();
@@ -337,9 +337,10 @@ mod tests {
             .catalog_mut()
             .tables
             .insert(table.name.clone(), table.clone());
-        runtime
-            .tables_mut()
-            .insert(table.name.clone(), TableData { rows: vec![] });
+        runtime.tables_mut().insert(
+            table.name.clone(),
+            std::sync::Arc::new(TableData { rows: vec![] }),
+        );
         let prepared = crate::exec::dml::PreparedSimpleInsert {
             table_name: "t".to_string(),
             columns: vec![
@@ -401,9 +402,10 @@ mod tests {
             .catalog_mut()
             .tables
             .insert(table.name.clone(), table.clone());
-        runtime
-            .tables_mut()
-            .insert(table.name.clone(), TableData { rows: vec![] });
+        runtime.tables_mut().insert(
+            table.name.clone(),
+            std::sync::Arc::new(TableData { rows: vec![] }),
+        );
         let prepared = crate::exec::dml::PreparedSimpleInsert {
             table_name: "t2".to_string(),
             columns: vec![crate::exec::dml::PreparedInsertColumn {

@@ -108,6 +108,18 @@ fn map_get_ci_mut<'a, V>(map: &'a mut BTreeMap<String, V>, name: &str) -> Option
     map.get_mut(&existing)
 }
 
+/// Resolves the canonical key for `name` in `map` using the same
+/// case-insensitive matching rules as `map_get_ci`. Used by callers that
+/// need to perform a follow-up mutation under a fresh `&mut` borrow.
+fn map_key_ci<V>(map: &BTreeMap<String, V>, name: &str) -> Option<String> {
+    if map.contains_key(name) {
+        return Some(name.to_string());
+    }
+    map.keys()
+        .find(|entry_name| identifiers_equal(entry_name, name))
+        .cloned()
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct StoredRow {
     pub(crate) row_id: i64,
@@ -457,9 +469,9 @@ pub(super) enum PendingIndexInsert {
 #[derive(Debug)]
 pub(crate) struct EngineRuntime {
     pub(crate) catalog: Arc<CatalogState>,
-    pub(crate) tables: Arc<BTreeMap<String, TableData>>,
+    pub(crate) tables: Arc<BTreeMap<String, Arc<TableData>>>,
     pub(crate) temp_tables: Arc<BTreeMap<String, TableSchema>>,
-    pub(crate) temp_table_data: Arc<BTreeMap<String, TableData>>,
+    pub(crate) temp_table_data: Arc<BTreeMap<String, Arc<TableData>>>,
     pub(crate) temp_views: Arc<BTreeMap<String, ViewSchema>>,
     pub(crate) temp_indexes: Arc<BTreeMap<String, IndexSchema>>,
     pub(crate) temp_schema_cookie: u32,
@@ -594,12 +606,30 @@ impl EngineRuntime {
         Arc::make_mut(&mut self.catalog)
     }
 
-    fn tables_mut(&mut self) -> &mut BTreeMap<String, TableData> {
+    fn tables_mut(&mut self) -> &mut BTreeMap<String, Arc<TableData>> {
         Arc::make_mut(&mut self.tables)
     }
 
-    fn temp_table_data_map_mut(&mut self) -> &mut BTreeMap<String, TableData> {
+    fn temp_table_data_map_mut(&mut self) -> &mut BTreeMap<String, Arc<TableData>> {
         Arc::make_mut(&mut self.temp_table_data)
+    }
+
+    /// Per-entry COW: locates `name` in `tables` (case-insensitive) and
+    /// returns a `&mut TableData` for the targeted table, cloning only that
+    /// table's row vector when the per-entry `Arc<TableData>` is shared.
+    /// This avoids deep-cloning every other table's rows during writes.
+    fn entry_table_data_mut(&mut self, name: &str) -> Option<&mut TableData> {
+        let canonical = map_key_ci(self.tables.as_ref(), name)?;
+        let map = self.tables_mut();
+        let entry = map.get_mut(&canonical)?;
+        Some(Arc::make_mut(entry))
+    }
+
+    fn entry_temp_table_data_mut(&mut self, name: &str) -> Option<&mut TableData> {
+        let canonical = map_key_ci(self.temp_table_data.as_ref(), name)?;
+        let map = self.temp_table_data_map_mut();
+        let entry = map.get_mut(&canonical)?;
+        Some(Arc::make_mut(entry))
     }
 
     fn temp_tables_mut(&mut self) -> &mut BTreeMap<String, TableSchema> {
@@ -773,7 +803,7 @@ impl EngineRuntime {
                 ps.row_count = data.rows.len();
                 ps.tail = read_uncompressed_overflow_tail(store, ps.pointer)?.unwrap_or_default();
             }
-            self.tables_mut().insert(table_name.clone(), data);
+            self.tables_mut().insert(table_name.clone(), Arc::new(data));
         }
         self.deferred_tables.clear();
         self.rebuild_indexes(page_size)?;
@@ -812,6 +842,7 @@ impl EngineRuntime {
                 let data = self.tables.get(&canonical_table_name).ok_or_else(|| {
                     DbError::internal(format!("table data for {table_name} is missing"))
                 })?;
+                let data: &TableData = data.as_ref();
                 let previous_state = self
                     .persisted_tables
                     .get(&canonical_table_name)
@@ -1198,11 +1229,11 @@ impl EngineRuntime {
     }
 
     pub(super) fn temp_table_data(&self, name: &str) -> Option<&TableData> {
-        map_get_ci(&self.temp_table_data, name)
+        map_get_ci(&self.temp_table_data, name).map(|arc| arc.as_ref())
     }
 
     pub(super) fn temp_table_data_mut(&mut self, name: &str) -> Option<&mut TableData> {
-        map_get_ci_mut(self.temp_table_data_map_mut(), name)
+        self.entry_temp_table_data_mut(name)
     }
 
     pub(super) fn temp_view(&self, name: &str) -> Option<&ViewSchema> {
@@ -1266,7 +1297,7 @@ impl EngineRuntime {
             return self.temp_table_data(&table.name);
         }
         let table_name = self.catalog.table(name)?.name.clone();
-        self.tables.get(&table_name)
+        self.tables.get(&table_name).map(|arc| arc.as_ref())
     }
 
     pub(super) fn table_data(&self, name: &str) -> Option<&TableData> {
@@ -1308,7 +1339,7 @@ impl EngineRuntime {
         if self.temp_table_schema(name).is_some() {
             return self.temp_table_data_mut(name);
         }
-        map_get_ci_mut(self.tables_mut(), name)
+        self.entry_table_data_mut(name)
     }
 
     pub(super) fn table_data_mut(&mut self, name: &str) -> Option<&mut TableData> {
@@ -6261,7 +6292,11 @@ fn encode_runtime_payload(runtime: &EngineRuntime) -> Result<Vec<u8>> {
         }
         encode_strings(&mut output, &table.primary_key_columns)?;
         encode_i64(&mut output, table.next_row_id);
-        let data = runtime.tables.get(&table.name).cloned().unwrap_or_default();
+        let data = runtime
+            .tables
+            .get(&table.name)
+            .map(|arc| (**arc).clone())
+            .unwrap_or_default();
         encode_u32(&mut output, data.rows.len() as u32);
         for row in data.rows {
             encode_i64(&mut output, row.row_id);
@@ -6392,7 +6427,7 @@ fn decode_runtime_payload(bytes: &[u8]) -> Result<EngineRuntime> {
             .catalog_mut()
             .tables
             .insert(table_name.clone(), table);
-        runtime.tables_mut().insert(table_name, data);
+        runtime.tables_mut().insert(table_name, Arc::new(data));
     }
 
     let index_count = cursor.read_u32()?;
@@ -6719,7 +6754,7 @@ fn decode_manifest_payload<S: PageStore>(_store: &S, bytes: &[u8]) -> Result<Eng
             // Empty tables are immediately available.
             runtime
                 .tables_mut()
-                .insert(table_name, TableData::default());
+                .insert(table_name, Arc::new(TableData::default()));
         }
     }
 

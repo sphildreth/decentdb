@@ -226,7 +226,7 @@ struct WriteTxn {
 struct TempSchemaState {
     schema_cookie: u32,
     tables: Arc<BTreeMap<String, TableSchema>>,
-    table_data: Arc<BTreeMap<String, TableData>>,
+    table_data: Arc<BTreeMap<String, Arc<TableData>>>,
     views: Arc<BTreeMap<String, ViewSchema>>,
     indexes: Arc<BTreeMap<String, IndexSchema>>,
 }
@@ -3994,7 +3994,7 @@ mod tests {
             tables: Arc::new(BTreeMap::from([(table.name.clone(), table)])),
             table_data: Arc::new(BTreeMap::from([(
                 "temp_docs".to_string(),
-                TableData::default(),
+                Arc::new(TableData::default()),
             )])),
             views: Arc::new(BTreeMap::from([(view.name.clone(), view)])),
             indexes: Arc::new(BTreeMap::from([(index.name.clone(), index)])),

@@ -14,6 +14,7 @@ use crate::sql::parser::parse_expression_sql;
 
 use super::constraints::auto_index_name;
 use super::{table_row_dataset, EngineRuntime, TableData};
+use std::sync::Arc;
 
 impl EngineRuntime {
     pub(super) fn execute_create_schema(&mut self, name: &str, if_not_exists: bool) -> Result<()> {
@@ -185,7 +186,7 @@ impl EngineRuntime {
             self.temp_tables_mut()
                 .insert(statement.table_name.clone(), table);
             self.temp_table_data_map_mut()
-                .insert(statement.table_name.clone(), TableData::default());
+                .insert(statement.table_name.clone(), Arc::new(TableData::default()));
             for index in temp_indexes {
                 self.temp_indexes_mut().insert(index.name.clone(), index);
             }
@@ -198,7 +199,7 @@ impl EngineRuntime {
             .tables
             .insert(statement.table_name.clone(), table.clone());
         self.tables_mut()
-            .insert(statement.table_name.clone(), TableData::default());
+            .insert(statement.table_name.clone(), Arc::new(TableData::default()));
 
         if !table.primary_key_columns.is_empty() {
             self.insert_index_schema(IndexSchema {
@@ -606,9 +607,10 @@ impl EngineRuntime {
         )?;
 
         for target in &targets {
-            let data = self.tables_mut().get_mut(target).ok_or_else(|| {
+            let entry = self.tables_mut().get_mut(target).ok_or_else(|| {
                 DbError::internal(format!("table data for {} is missing", target))
             })?;
+            let data = Arc::make_mut(entry);
             data.rows.clear();
 
             if restart_identity {
@@ -761,15 +763,13 @@ impl EngineRuntime {
                             column.name
                         )));
                     }
-                    for row in &mut self
-                        .tables_mut()
-                        .get_mut(table_name)
-                        .ok_or_else(|| {
-                            DbError::internal(format!("table data for {table_name} is missing"))
-                        })?
-                        .rows
                     {
-                        row.values.push(fill_value.clone());
+                        let entry = self.tables_mut().get_mut(table_name).ok_or_else(|| {
+                            DbError::internal(format!("table data for {table_name} is missing"))
+                        })?;
+                        for row in &mut Arc::make_mut(entry).rows {
+                            row.values.push(fill_value.clone());
+                        }
                     }
                     table.columns.push(column);
                 }
@@ -814,15 +814,13 @@ impl EngineRuntime {
                         .position(|column| column.name == *column_name)
                         .ok_or_else(|| DbError::sql(format!("unknown column {column_name}")))?;
                     table.columns.remove(index);
-                    for row in &mut self
-                        .tables_mut()
-                        .get_mut(table_name)
-                        .ok_or_else(|| {
-                            DbError::internal(format!("table data for {table_name} is missing"))
-                        })?
-                        .rows
                     {
-                        row.values.remove(index);
+                        let entry = self.tables_mut().get_mut(table_name).ok_or_else(|| {
+                            DbError::internal(format!("table data for {table_name} is missing"))
+                        })?;
+                        for row in &mut Arc::make_mut(entry).rows {
+                            row.values.remove(index);
+                        }
                     }
                 }
                 AlterTableAction::RenameColumn { old_name, new_name } => {
@@ -902,16 +900,14 @@ impl EngineRuntime {
                             column_name
                         )));
                     }
-                    for row in &mut self
-                        .tables_mut()
-                        .get_mut(table_name)
-                        .ok_or_else(|| {
-                            DbError::internal(format!("table data for {table_name} is missing"))
-                        })?
-                        .rows
                     {
-                        row.values[index] =
-                            super::cast_value(row.values[index].clone(), *new_type)?;
+                        let entry = self.tables_mut().get_mut(table_name).ok_or_else(|| {
+                            DbError::internal(format!("table data for {table_name} is missing"))
+                        })?;
+                        for row in &mut Arc::make_mut(entry).rows {
+                            row.values[index] =
+                                super::cast_value(row.values[index].clone(), *new_type)?;
+                        }
                     }
                     table.columns[index].column_type = *new_type;
                 }
