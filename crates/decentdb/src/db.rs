@@ -995,6 +995,19 @@ impl Db {
             .checkpoint(&self.inner.pager, self.inner.config.checkpoint_timeout_sec)
     }
 
+    /// Blocks until every commit acknowledged before this call is durable on
+    /// disk.
+    ///
+    /// For the default [`crate::WalSyncMode::Full`] mode (and `Normal`), every
+    /// commit is already synchronously durable when it returns, so this is a
+    /// cheap no-op. Under [`crate::WalSyncMode::AsyncCommit`] it forces the
+    /// background flusher to run and waits until the WAL is on stable storage.
+    ///
+    /// See `design/adr/0135-async-commit-wal-group-commit.md`.
+    pub fn sync(&self) -> Result<()> {
+        self.inner.wal.flush_to_durable()
+    }
+
     /// Executes a single SQL statement without parameters.
     pub fn execute(&self, sql: &str) -> Result<QueryResult> {
         self.execute_with_params(sql, &[])

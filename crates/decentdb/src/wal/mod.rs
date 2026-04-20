@@ -1,5 +1,6 @@
 //! Write-ahead log ownership, recovery, and checkpointing.
 
+pub(crate) mod async_commit;
 pub(crate) mod checkpoint;
 pub(crate) mod delta;
 pub(crate) mod format;
@@ -21,6 +22,7 @@ use crate::storage::PagerHandle;
 use crate::vfs::VfsFile;
 use crate::vfs::VfsHandle;
 
+use self::async_commit::AsyncCommitState;
 use self::index::WalIndex;
 use self::reader_registry::{ReaderGuard, ReaderRegistry};
 
@@ -43,6 +45,11 @@ pub(crate) struct SharedWalInner {
     reader_registry: ReaderRegistry,
     checkpoint_pending: AtomicBool,
     checkpoint_epoch: AtomicU64,
+    /// `Some` when `sync_mode` is `WalSyncMode::AsyncCommit { .. }`; owns the
+    /// background flusher thread and durability watermark. Constructed lazily
+    /// in `build_handle` and torn down when `SharedWalInner` is dropped (which
+    /// joins the thread and performs a final synchronous flush).
+    pub(super) async_commit: Option<AsyncCommitState>,
 }
 
 #[derive(Debug, Default)]
@@ -179,6 +186,16 @@ impl WalHandle {
         self.inner
             .checkpoint_pending
             .store(pending, Ordering::SeqCst);
+    }
+
+    /// Blocks until every commit acknowledged before this call is durable on
+    /// disk. For sync modes other than `AsyncCommit` this is a no-op because
+    /// commits are already synchronously durable.
+    pub(crate) fn flush_to_durable(&self) -> Result<()> {
+        match self.inner.async_commit.as_ref() {
+            Some(state) => state.flush_to_durable(),
+            None => Ok(()),
+        }
     }
 }
 

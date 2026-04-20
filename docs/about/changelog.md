@@ -5,7 +5,11 @@ All notable changes to DecentDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [2.2.2] - UNRELEASED
+## [2.3.0] - UNRELEASED
+
+### Added
+
+- WAL group-commit mode (`WalSyncMode::AsyncCommit { interval_ms }`): commits return as soon as the WAL frame is written, while a per-WAL background thread fsyncs on the configured interval. Default `WalSyncMode::Full` is unchanged. New `Db::sync()` provides an explicit durability barrier (no-op for non-AsyncCommit modes). Trades a bounded recovery window (last `interval_ms` of acked commits may be lost on crash) for higher write throughput. See ADR 0135.
 
 ### Added (Dart/Flutter binding)
 

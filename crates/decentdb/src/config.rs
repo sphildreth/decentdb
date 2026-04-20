@@ -13,6 +13,20 @@ pub enum WalSyncMode {
     /// Reduced sync overhead for environments that can tolerate weaker flush
     /// behavior.
     Normal,
+    /// Group-commit mode: commits are acknowledged as soon as the WAL frame is
+    /// written; a background flusher thread fsyncs the WAL on the configured
+    /// interval. Trades up to `interval_ms` of post-crash durability for
+    /// dramatically lower commit latency. Atomicity, consistency, and
+    /// isolation are unaffected. Use [`crate::Db::sync`] for an explicit
+    /// durability barrier.
+    ///
+    /// See `design/adr/0135-async-commit-wal-group-commit.md`.
+    AsyncCommit {
+        /// Interval between background fsync ticks, in milliseconds. Smaller
+        /// values reduce the durability window at the cost of more wakeups.
+        /// Must be at least 1 ms.
+        interval_ms: u32,
+    },
     /// Test-only mode with no durability guarantees.
     TestingOnlyUnsafeNoSync,
 }
