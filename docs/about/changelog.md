@@ -34,6 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed the Go binding BLOB bind path to satisfy cgo pointer rules by pinning Go byte slices during the native call, with a large-blob regression test and strict cgo validation guidance.
 - Made Go `DB.Close()` idempotent and detached finalizers on explicit close to prevent double-free races, with direct regression coverage.
 - Added Python statement-cache hit/miss stats, a close-time `PerformanceWarning` for low cache hit rates, and documented the new observability surface.
+- `CREATE VIEW` no longer executes the SELECT body to derive output column names. A syntactic resolver walks the projection AST instead, falling back to execution only for `*`/`tbl.*` wildcards. Eliminates the cost of running large JOIN/aggregate view bodies during DDL (~94 % faster for the Dart `console_complex` view-creation step) and avoids unintended side effects of the SELECT during view definition.
 
 ## [2.2.1] - 2026-04-19
 
