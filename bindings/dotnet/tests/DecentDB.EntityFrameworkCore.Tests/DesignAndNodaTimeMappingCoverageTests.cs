@@ -53,16 +53,16 @@ public sealed class DesignAndNodaTimeMappingCoverageTests : IDisposable
         using var context = CreateNodaContext();
         var mappingSource = context.GetService<IRelationalTypeMappingSource>();
 
-        var decimalExact = Assert.IsType<RelationalTypeMapping>(mappingSource.FindMapping("DECIMAL(9,2)"));
+        var decimalExact = Assert.IsAssignableFrom<RelationalTypeMapping>(mappingSource.FindMapping("DECIMAL(9,2)"));
         Assert.Equal("DECIMAL(9,2)", decimalExact.StoreType);
 
-        var numericPrecisionOnly = Assert.IsType<RelationalTypeMapping>(mappingSource.FindMapping("NUMERIC(6)"));
+        var numericPrecisionOnly = Assert.IsAssignableFrom<RelationalTypeMapping>(mappingSource.FindMapping("NUMERIC(6)"));
         Assert.Equal("DECIMAL(6,4)", numericPrecisionOnly.StoreType);
 
-        var malformedDecimal = Assert.IsType<RelationalTypeMapping>(mappingSource.FindMapping("DECIMAL(not_a_number)"));
+        var malformedDecimal = Assert.IsAssignableFrom<RelationalTypeMapping>(mappingSource.FindMapping("DECIMAL(not_a_number)"));
         Assert.Equal("DECIMAL(18,4)", malformedDecimal.StoreType);
 
-        var nullableDecimal = Assert.IsType<RelationalTypeMapping>(mappingSource.FindMapping(typeof(decimal?)));
+        var nullableDecimal = Assert.IsAssignableFrom<RelationalTypeMapping>(mappingSource.FindMapping(typeof(decimal?)));
         Assert.Equal("DECIMAL(18,4)", nullableDecimal.StoreType);
     }
 

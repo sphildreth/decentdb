@@ -46,9 +46,9 @@ public sealed class DataReaderEdgeCoverageTests : IDisposable
         {
             insert.CommandText = """
                 INSERT INTO reader_conv (c_char, c_int, c_bool, c_real, c_blob, c_ts, c_date, c_time, c_span, c_dec_text, c_enum, c_null)
-                VALUES ('Z', 7, 1, 3.5, @blob, @ts, @date, @time, @span, '123.45', 2, NULL);
+                VALUES ('Z', 7, TRUE, 3.5, @blob, @ts, @date, @time, @span, '123.45', 2, NULL);
                 INSERT INTO reader_conv (c_char, c_int, c_bool, c_real, c_blob, c_ts, c_date, c_time, c_span, c_dec_text, c_enum, c_null)
-                VALUES ('NO', 1, 0, 1.0, @blob, @ts, @date, @time, @span, '1.0', 1, NULL);
+                VALUES ('NO', 1, FALSE, 1.0, @blob, @ts, @date, @time, @span, '1.0', 1, NULL);
                 """;
             insert.Parameters.Add(new DecentDBParameter("@blob", guidBytes));
             insert.Parameters.Add(new DecentDBParameter("@ts", micros));
@@ -97,7 +97,7 @@ public sealed class DataReaderEdgeCoverageTests : IDisposable
     }
 
     [Fact]
-    public void GetCharsAndReadAfterClose_CoverEdgePaths()
+    public async Task GetCharsAndReadAfterClose_CoverEdgePaths()
     {
         using var connection = new DecentDBConnection($"Data Source={_dbPath}");
         connection.Open();
@@ -106,9 +106,15 @@ public sealed class DataReaderEdgeCoverageTests : IDisposable
         {
             setup.CommandText = """
                 CREATE TABLE reader_chars (id INTEGER PRIMARY KEY, txt TEXT, data BLOB);
-                INSERT INTO reader_chars (id, txt, data) VALUES (1, 'abcdef', X'01020304');
                 """;
             setup.ExecuteNonQuery();
+        }
+
+        using (var insert = connection.CreateCommand())
+        {
+            insert.CommandText = "INSERT INTO reader_chars (id, txt, data) VALUES (1, 'abcdef', @data)";
+            insert.Parameters.Add(new DecentDBParameter("@data", new byte[] { 0x01, 0x02, 0x03, 0x04 }));
+            insert.ExecuteNonQuery();
         }
 
         using var query = connection.CreateCommand();
@@ -132,8 +138,8 @@ public sealed class DataReaderEdgeCoverageTests : IDisposable
         Assert.Throws<InvalidOperationException>(() => reader.Read());
 
         Assert.False(reader.NextResult());
-        Assert.False(reader.NextResultAsync(CancellationToken.None).GetAwaiter().GetResult());
-        Assert.False(reader.ReadAsync(CancellationToken.None).GetAwaiter().GetResult());
+        Assert.False(await reader.NextResultAsync(CancellationToken.None));
+        await Assert.ThrowsAsync<InvalidOperationException>(async () => _ = await reader.ReadAsync(CancellationToken.None));
     }
 
     public void Dispose()

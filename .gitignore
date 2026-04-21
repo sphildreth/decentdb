@@ -104,3 +104,4 @@ bindings/dart/examples/console_complex/*.json
 
 bindings/dotnet/.tmp/*
 bindings/dotnet/tests/DecentDB.Tests/TestResults/*
+bindings/dotnet/tests/DecentDB.EntityFrameworkCore.Tests/TestResults/*
