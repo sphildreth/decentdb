@@ -739,12 +739,15 @@ namespace DecentDB.AdoNet
                     throw ex;
                 }
 
+                var rowsAffected = (int)stmt.RowsAffected;
+                stmt.Reset().ClearBindings();
+
                 if (observation != null)
                 {
-                    _connection.CompleteSqlObservation(observation, stmt.RowsAffected, exception: null);
+                    _connection.CompleteSqlObservation(observation, rowsAffected, exception: null);
                 }
 
-                return (int)stmt.RowsAffected;
+                return rowsAffected;
             }
             catch (Exception ex)
             {

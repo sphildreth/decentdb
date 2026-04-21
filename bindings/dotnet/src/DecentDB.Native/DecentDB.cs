@@ -1,4 +1,5 @@
 using System;
+using System.Buffers;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
@@ -580,13 +581,45 @@ public sealed class PreparedStatement : IDisposable
     public PreparedStatement BindText(int index1Based, string? value)
     {
         if (value == null) return BindNull(index1Based);
-        var bytes = Encoding.UTF8.GetBytes(value);
-        return BindTextBytes(index1Based, bytes);
+
+        var byteCount = Encoding.UTF8.GetByteCount(value);
+        if (byteCount == 0)
+        {
+            return BindTextBytes(index1Based, Array.Empty<byte>());
+        }
+
+        if (byteCount <= 512)
+        {
+            Span<byte> stackBuffer = stackalloc byte[byteCount];
+            var written = Encoding.UTF8.GetBytes(value.AsSpan(), stackBuffer);
+            return BindTextSpan(index1Based, stackBuffer[..written]);
+        }
+
+        var pooled = ArrayPool<byte>.Shared.Rent(byteCount);
+        try
+        {
+            var written = Encoding.UTF8.GetBytes(value.AsSpan(), pooled.AsSpan(0, byteCount));
+            return BindTextSpan(index1Based, pooled.AsSpan(0, written));
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(pooled);
+        }
     }
 
     public PreparedStatement BindTextBytes(int index1Based, byte[] bytes)
     {
-        var len = bytes?.Length ?? 0;
+        if (bytes == null || bytes.Length == 0)
+        {
+            return BindTextSpan(index1Based, ReadOnlySpan<byte>.Empty);
+        }
+
+        return BindTextSpan(index1Based, bytes);
+    }
+
+    private PreparedStatement BindTextSpan(int index1Based, ReadOnlySpan<byte> bytes)
+    {
+        var len = bytes.Length;
         if (len == 0)
         {
             unsafe

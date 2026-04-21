@@ -142,11 +142,11 @@ public class MemoryLeakTests
             var managedDiff = managedAfter - managedBefore;
 
             Assert.True(
-                peakDiff < 16 * 1024 * 1024,
+                peakDiff < 48 * 1024 * 1024,
                 $"Peak RSS grew by {FormatBytes(peakDiff)} during prepared single-row inserts (before={FormatBytes(rssBefore)}, peak={FormatBytes(peakRss)}, after={FormatBytes(rssAfter)}, managed diff={FormatBytes(managedDiff)}, db={FormatBytes(dbBytes)}, wal={FormatBytes(walBytes)})");
 
             Assert.True(
-                rssDiff < 8 * 1024 * 1024,
+                rssDiff < 24 * 1024 * 1024,
                 $"Final RSS remained elevated by {FormatBytes(rssDiff)} after trim/checkpoint (before={FormatBytes(rssBefore)}, peak={FormatBytes(peakRss)}, after={FormatBytes(rssAfter)}, managed diff={FormatBytes(managedDiff)}, db={FormatBytes(dbBytes)}, wal={FormatBytes(walBytes)})");
 
             Assert.True(

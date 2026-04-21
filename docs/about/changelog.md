@@ -5,6 +5,18 @@ All notable changes to DecentDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.3.1] - UNRELEASED
+
+### Added
+
+- Expanded .NET regression coverage with new ADO.NET and EF Core suites targeting common provider failure modes: parameter-collection shape/errors, maintenance path resolution and cleanup behavior, design-time model-factory metadata extraction, window/sql-expression translator contracts, modification-batch bind/execute fallback paths, and broad SaveChanges type-matrix binding coverage.
+
+### Fixed
+
+- .NET SQL parameter rewriting for EF-style multi-row parameter names (for example `@p0_0`, `@p1_1`, `@p10_11`) so provider-generated names bind correctly without false positional rewrites.
+- .NET prepared-command reuse now consistently resets and clears bindings after successful non-query execution, reducing native statement-retention pressure in repeated prepared insert/update workloads.
+- .NET native text binding path now uses pooled/stack-based UTF-8 encoding buffers instead of per-call byte-array allocations, reducing allocation churn on high-frequency bind paths.
+
 ## [2.3.0] - 2026-04-20
 
 ### Added

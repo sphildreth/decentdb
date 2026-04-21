@@ -230,7 +230,7 @@ public class AdoNetLayerTests : IDisposable
     }
 
     [Fact]
-    public void DecentDBCommand_ExecuteNonQuery_MultiRowUnderscoreParameterNames_ThrowsMissingParameter()
+    public void DecentDBCommand_ExecuteNonQuery_MultiRowUnderscoreParameterNames_InsertsAllRows()
     {
         using var conn = new DecentDBConnection($"Data Source={_dbPath}");
         conn.Open();
@@ -253,8 +253,12 @@ public class AdoNetLayerTests : IDisposable
         AddParameter(cmd, "@p1_0", 2);
         AddParameter(cmd, "@p1_1", 20);
 
-        var exception = Assert.Throws<InvalidOperationException>(() => cmd.ExecuteNonQuery());
-        Assert.Contains("Missing value for parameter '$1'", exception.Message);
+        var affected = cmd.ExecuteNonQuery();
+        Assert.Equal(2, affected);
+
+        using var verify = conn.CreateCommand();
+        verify.CommandText = "SELECT COUNT(*) FROM bulk_probe";
+        Assert.Equal(2L, Convert.ToInt64(verify.ExecuteScalar()));
     }
 
     [Fact]

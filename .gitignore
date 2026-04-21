@@ -101,3 +101,6 @@ tests/bindings/**/*.node
 
 bindings/dart/examples/console_complex/*.json
 *.pyc
+
+bindings/dotnet/.tmp/*
+bindings/dotnet/tests/DecentDB.Tests/TestResults/*
