@@ -69,4 +69,25 @@ public class SqlParameterRewriterTests
         Assert.DoesNotContain("@5__2", rewritten);
         Assert.Single(paramMap);
     }
+
+    [Fact]
+    public void Rewrite_MultiRowParameterNamesUsingUnderscores_ThrowsMissingParameter()
+    {
+        var sql = """
+                  INSERT INTO t (a, b)
+                  VALUES (@p0_0, @p0_1),
+                         (@p1_0, @p1_1)
+                  """;
+        var parameters = new List<DbParameter>
+        {
+            new DecentDBParameter { ParameterName = "@p0_0", Value = 1 },
+            new DecentDBParameter { ParameterName = "@p0_1", Value = 2 },
+            new DecentDBParameter { ParameterName = "@p1_0", Value = 3 },
+            new DecentDBParameter { ParameterName = "@p1_1", Value = 4 }
+        };
+
+        var exception = Assert.Throws<InvalidOperationException>(() => SqlParameterRewriter.Rewrite(sql, parameters));
+
+        Assert.Contains("Missing value for parameter '$1'", exception.Message);
+    }
 }
