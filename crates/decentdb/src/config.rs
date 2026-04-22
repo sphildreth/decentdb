@@ -113,21 +113,35 @@ pub struct DbConfig {
     /// When `true`, `Db::open` skips the eager materialization of all
     /// table row data into memory, leaving each table in the
     /// `deferred_tables` set. Tables are then materialized on first
-    /// access via the existing `ensure_deferred_tables_loaded` path.
+    /// access — when ADR 0143 Phase B can prove the active statement's
+    /// table set is conservatively exhaustive, only those tables are
+    /// loaded; otherwise all deferred tables are loaded as a fallback.
     ///
-    /// Default: `false` (preserve the historical eager-load behavior).
+    /// Default: `false`. The per-table loader uses `persisted_tables`
+    /// pointers captured at `refresh_engine_from_storage` time but reads
+    /// payloads against a fresh WAL snapshot taken at materialization
+    /// time. In multi-writer / multi-reader workloads, a checkpoint or
+    /// concurrent writer can extend overflow chains between those two
+    /// timestamps, producing `overflow payload length mismatch` errors
+    /// (see `concurrent_writer_reader_overflow_consistency` in
+    /// `tests/engine_lifecycle_tests.rs`). The per-table path is
+    /// therefore opt-in; a future change must pin the WAL snapshot
+    /// across the persisted_tables read and the payload read before this
+    /// can flip to `true` by default.
     ///
-    /// **Tradeoff** — opting in dramatically reduces `Db::open` RSS for
-    /// large databases (the goal of ADR 0143) but the *first* SQL
-    /// operation on any deferred table pays the materialization cost,
-    /// and currently materializes **all** still-deferred tables in one
-    /// shot (per-table on-demand load is tracked as ADR 0143 Phase B
-    /// follow-up). The first access also pins the WAL snapshot
-    /// established at open until materialization completes, briefly
-    /// blocking checkpoints in shared multi-connection scenarios.
-    ///
-    /// See ADR 0143 — On-Disk Row-Scan Executor (Phase B opt-in).
+    /// See ADR 0143 — On-Disk Row-Scan Executor.
     pub defer_table_materialization: bool,
+
+    /// If non-zero, `Db::open` will run a synchronous checkpoint when the
+    /// existing WAL file size on disk exceeds this threshold (in MiB).
+    /// This drops the in-memory WAL page-version index and lets steady-
+    /// state RSS approach the configured `cache_size_mb` rather than
+    /// growing with the size of an uncheckpointed WAL.
+    ///
+    /// Default: `16` MiB. Set to `0` to disable.
+    ///
+    /// See ADR 0143 — engine-memory plan, open-time checkpoint heuristic.
+    pub auto_checkpoint_on_open_mb: u32,
 }
 
 impl DbConfig {
@@ -167,6 +181,7 @@ impl Default for DbConfig {
             background_checkpoint_worker: true,
             wal_index_hot_set_pages: 0,
             defer_table_materialization: false,
+            auto_checkpoint_on_open_mb: 16,
         }
     }
 }

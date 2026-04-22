@@ -1107,7 +1107,7 @@ impl Db {
             .sql_write_lock
             .lock()
             .map_err(|_| DbError::internal("SQL writer lock poisoned"))?;
-        self.ensure_deferred_tables_loaded()?;
+        self.ensure_all_tables_loaded()?;
         let mut working = self.engine_snapshot()?;
         let inserted = working.bulk_load_rows(
             table_name,
@@ -1130,7 +1130,7 @@ impl Db {
             .sql_write_lock
             .lock()
             .map_err(|_| DbError::internal("SQL writer lock poisoned"))?;
-        self.ensure_deferred_tables_loaded()?;
+        self.ensure_all_tables_loaded()?;
         let mut working = self.engine_snapshot()?;
         working.rebuild_index(name, self.inner.config.page_size)?;
         self.persist_runtime(working).map(|_| ())
@@ -1143,7 +1143,7 @@ impl Db {
             .sql_write_lock
             .lock()
             .map_err(|_| DbError::internal("SQL writer lock poisoned"))?;
-        self.ensure_deferred_tables_loaded()?;
+        self.ensure_all_tables_loaded()?;
         let mut working = self.engine_snapshot()?;
         working.rebuild_indexes(self.inner.config.page_size)?;
         self.persist_runtime(working).map(|_| ())
@@ -1440,6 +1440,33 @@ impl Db {
         let pager = PagerHandle::open(Arc::clone(&file), header, effective_config.cache_size_mb)?;
         let wal = WalHandle::acquire(&vfs, &path, &effective_config, &pager)?;
         wal.set_max_page_count(pager.on_disk_page_count()?);
+
+        // ADR 0143 engine-memory plan: drop the in-memory WAL page-version
+        // index before loading the runtime when the on-disk WAL is large.
+        // Without this, re-opening a database with an uncheckpointed
+        // multi-hundred-MB WAL leaves the entire page-version chain
+        // resident (~one Arc<[u8]> per WAL frame), which is what the
+        // 2026-04-22 memory probes were reporting as `wal_versions=82191`
+        // / 336 MB of pure index. The synchronous checkpoint does the
+        // copyback into the data file, then truncates the WAL header so
+        // downstream reads service straight from the page cache.
+        let on_open_threshold_bytes =
+            u64::from(effective_config.auto_checkpoint_on_open_mb) * 1024 * 1024;
+        if on_open_threshold_bytes > 0 {
+            let wal_size = wal.file_size().unwrap_or(0);
+            if wal_size > on_open_threshold_bytes {
+                // Best-effort: a checkpoint failure here is not fatal,
+                // because the runtime load below will still succeed
+                // against the existing WAL state. Surface it as a
+                // warning-shaped log so embedders can investigate.
+                if let Err(e) = wal.checkpoint(&pager, effective_config.checkpoint_timeout_sec) {
+                    eprintln!(
+                        "decentdb open: auto-checkpoint at open failed (wal_size={wal_size} bytes): {e}"
+                    );
+                }
+            }
+        }
+
         let (runtime, runtime_lsn) =
             EngineRuntime::load_from_storage(&pager, &wal, schema_cookie, &effective_config)?;
         let catalog = CatalogHandle::new(runtime.catalog.as_ref().clone());
@@ -1496,7 +1523,18 @@ impl Db {
         }
 
         self.refresh_engine_from_storage()?;
-        self.ensure_deferred_tables_loaded()?;
+        // ADR 0143 Phase B: try a targeted per-table load first. If
+        // statement analysis is conservatively exhaustive (no CTEs,
+        // subqueries, set ops, …) we skip the all-loader entirely and
+        // leave non-referenced tables deferred. Otherwise fall back.
+        let targeted_ok = if self.inner.config.defer_table_materialization {
+            self.ensure_tables_loaded_for_statement(statement)?
+        } else {
+            false
+        };
+        if !targeted_ok {
+            self.ensure_all_tables_loaded()?;
+        }
         let runtime = self
             .inner
             .engine
@@ -1798,7 +1836,15 @@ impl Db {
         }
 
         self.refresh_engine_from_storage()?;
-        self.ensure_deferred_tables_loaded()?;
+        // ADR 0143 Phase B: targeted load gated on safe analyzer.
+        let targeted_ok = if self.inner.config.defer_table_materialization {
+            self.ensure_tables_loaded_for_statement(prepared.statement.as_ref())?
+        } else {
+            false
+        };
+        if !targeted_ok {
+            self.ensure_all_tables_loaded()?;
+        }
         let runtime = self
             .inner
             .engine
@@ -1842,7 +1888,7 @@ impl Db {
             .lock()
             .map_err(|_| DbError::internal("SQL writer lock poisoned"))?;
         self.refresh_engine_from_storage()?;
-        self.ensure_deferred_tables_loaded()?;
+        self.ensure_all_tables_loaded()?;
         let temp_only = {
             let runtime = self
                 .inner
@@ -1951,7 +1997,7 @@ impl Db {
             .lock()
             .map_err(|_| DbError::internal("SQL writer lock poisoned"))?;
         self.refresh_engine_from_storage()?;
-        self.ensure_deferred_tables_loaded()?;
+        self.ensure_all_tables_loaded()?;
         let temp_only = {
             let runtime = self
                 .inner
@@ -2233,7 +2279,7 @@ impl Db {
             return Ok(());
         }
         self.refresh_engine_from_storage()?;
-        self.ensure_deferred_tables_loaded()?;
+        self.ensure_all_tables_loaded()?;
         let mut runtime = self
             .inner
             .engine
@@ -2419,7 +2465,7 @@ impl Db {
 
     fn build_exclusive_sql_txn_state(&self) -> Result<ExclusiveSqlTxnState<'_>> {
         self.refresh_engine_from_storage()?;
-        self.ensure_deferred_tables_loaded()?;
+        self.ensure_all_tables_loaded()?;
         let current_lsn = self.inner.last_runtime_lsn.load(Ordering::Acquire);
         let current_epoch = self.inner.wal.checkpoint_epoch();
         let runtime = self
@@ -2531,7 +2577,7 @@ impl Db {
             return Ok(runtime);
         }
         self.refresh_engine_from_storage()?;
-        self.ensure_deferred_tables_loaded()?;
+        self.ensure_all_tables_loaded()?;
         self.engine_snapshot()
     }
 
@@ -2540,7 +2586,12 @@ impl Db {
             return Ok(runtime);
         }
         self.refresh_engine_from_storage()?;
-        self.ensure_deferred_tables_loaded()?;
+        // ADR 0143 Phase B: prepare() only needs catalog/schema metadata
+        // to plan a statement. Skip the eager all-tables materialization
+        // so applications that prepare a large number of statements at
+        // startup don't fault every persisted table into memory just to
+        // get a `PreparedStatement` handle. Row data is loaded on first
+        // execution by the read/write paths.
         self.engine_snapshot()
     }
 
@@ -2632,12 +2683,99 @@ impl Db {
         Ok(())
     }
 
-    /// Materializes any table data that was deferred during `Db::open`.
+    /// Materializes deferred tables specified by name.
+    ///
+    /// Fast path (no matching deferred tables): one read-lock check.
+    /// Slow path: drops the read lock, takes a write lock, loads only the
+    /// specified tables and rebuilds their indexes, then releases.
+    ///
+    /// This enables per-table on-demand loading for ADR 0143 Phase B.
+    #[allow(dead_code)]
+    fn ensure_tables_loaded(&self, names: &[&str]) -> Result<()> {
+        use std::collections::BTreeSet;
+        let filter: BTreeSet<String> = names.iter().map(|s| s.to_string()).collect();
+        {
+            let runtime = self
+                .inner
+                .engine
+                .read()
+                .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+            let has_deferred = runtime.has_deferred_tables();
+            let has_match = names
+                .iter()
+                .any(|n| runtime.deferred_table_names().any(|dt| dt == *n));
+            if !has_deferred || !has_match {
+                return Ok(());
+            }
+        }
+        let mut runtime = self
+            .inner
+            .engine
+            .write()
+            .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+        runtime.load_deferred_tables_filtered(
+            &self.inner.pager,
+            &self.inner.wal,
+            self.inner.config.page_size,
+            &filter,
+        )
+    }
+
+    /// Attempts to materialize *only* the tables referenced by `statement`.
+    ///
+    /// Returns `Ok(true)` when statement analysis was conservatively
+    /// exhaustive and the targeted load succeeded — the caller can then
+    /// safely skip `ensure_all_tables_loaded()`. Returns `Ok(false)` when
+    /// the statement contains shapes the analyzer can't fully resolve
+    /// (CTEs, subqueries, set operations, INSERT…SELECT, DDL, …); the
+    /// caller must fall back to loading all tables.
+    ///
+    /// Per ADR 0143 Phase B + the rubber-duck plan critique on
+    /// 2026-04-22: only a strict whitelist is treated as targeted-safe.
+    fn ensure_tables_loaded_for_statement(&self, statement: &SqlStatement) -> Result<bool> {
+        use crate::sql::ast::safe_referenced_tables;
+        let Some(tables) = safe_referenced_tables(statement) else {
+            return Ok(false);
+        };
+        if tables.is_empty() {
+            // Statement is safely analyzed but references no tables
+            // (e.g. `SELECT 1`); nothing to load.
+            return Ok(true);
+        }
+        // ADR 0143 Phase B: if any reference is to something the catalog
+        // does not recognize as a base table (most commonly a view, but
+        // also a not-yet-attached temp table), the statement may pull in
+        // additional underlying tables we cannot enumerate here. Fall
+        // back to loading everything to keep correctness.
+        {
+            let runtime = self
+                .inner
+                .engine
+                .read()
+                .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+            for name in &tables {
+                let known = runtime
+                    .catalog
+                    .tables
+                    .keys()
+                    .any(|k| k.eq_ignore_ascii_case(name));
+                if !known {
+                    return Ok(false);
+                }
+            }
+        }
+        let names: Vec<String> = tables.into_iter().collect();
+        let names_refs: Vec<&str> = names.iter().map(|s: &String| s.as_str()).collect();
+        self.ensure_tables_loaded(&names_refs)?;
+        Ok(true)
+    }
+
+    /// Materializes all tables that were deferred during `Db::open`.
     ///
     /// Fast path (no deferred tables): one read-lock check on the engine.
     /// Slow path: drops the read lock, takes a write lock, loads all deferred
     /// tables and rebuilds indexes, then releases.
-    fn ensure_deferred_tables_loaded(&self) -> Result<()> {
+    fn ensure_all_tables_loaded(&self) -> Result<()> {
         {
             let runtime = self
                 .inner
@@ -2685,7 +2823,7 @@ impl Db {
 
     fn build_sql_txn_state(&self) -> Result<SqlTxnState> {
         self.refresh_engine_from_storage()?;
-        self.ensure_deferred_tables_loaded()?;
+        self.ensure_all_tables_loaded()?;
         let current_lsn = self.inner.last_runtime_lsn.load(Ordering::Acquire);
         let current_epoch = self.inner.wal.checkpoint_epoch();
 
@@ -4882,6 +5020,117 @@ mod tests {
         assert!(
             json_after.contains("\"rows_in_memory_count\":50"),
             "expected 50 resident rows after materialize, got: {json_after}"
+        );
+    }
+
+    /// ADR 0143 Phase B: per-table on-demand load - query only small table
+    /// should not materialize the large table.
+    #[test]
+    fn per_table_load_skips_large_table() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir.path().join("per-table.ddb");
+
+        // Seed the DB with both tables - small and large
+        {
+            let db = Db::open_or_create(&path, DbConfig::default()).expect("create db");
+            db.execute("CREATE TABLE small (id INTEGER PRIMARY KEY, n INTEGER)")
+                .expect("create small");
+            db.execute("CREATE TABLE large (id INTEGER PRIMARY KEY, data TEXT)")
+                .expect("create large");
+
+            for i in 0..10 {
+                db.execute(&format!("INSERT INTO small (id, n) VALUES ({i}, {i})"))
+                    .expect("insert small");
+            }
+            db.checkpoint().expect("checkpoint small");
+            for i in 0..1000 {
+                let data = format!("data-{}", i);
+                db.execute(&format!(
+                    "INSERT INTO large (id, data) VALUES ({i}, '{}')",
+                    data
+                ))
+                .expect("insert large");
+            }
+            db.checkpoint().expect("checkpoint before close");
+        }
+
+        // Re-open with deferred materialization
+        let cfg = DbConfig {
+            defer_table_materialization: true,
+            ..DbConfig::default()
+        };
+        let db = Db::open_or_create(&path, cfg).expect("reopen with defer");
+
+        // At open, both tables should be deferred
+        let json_open = db.inspect_storage_state_json().expect("json at open");
+        assert!(
+            json_open.contains("\"deferred_table_count\":2"),
+            "expected 2 deferred tables at open, got: {json_open}"
+        );
+
+        // Query only the small table
+        let result = db
+            .execute("SELECT COUNT(*) FROM small")
+            .expect("query small");
+        assert_eq!(scalar_i64(&result), 10);
+
+        // After query: per-table on-demand load must have materialized
+        // ONLY `small`, leaving `large` deferred. Use precise field
+        // assertions (with trailing comma) to avoid the substring-match
+        // bug where `:10` matches `:1010`.
+        let json_after = db.inspect_storage_state_json().expect("json after query");
+        assert!(
+            json_after.contains("\"deferred_table_count\":1}"),
+            "expected exactly 1 deferred table after small-only query, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"loaded_table_count\":1,"),
+            "expected exactly 1 loaded table after small-only query, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"rows_in_memory_count\":10,"),
+            "expected exactly 10 resident rows (small only), got: {json_after}"
+        );
+    }
+
+    /// ADR 0143 Phase B: when statement analysis is uncertain (subquery
+    /// in WHERE), the per-table gate must conservatively fall back to
+    /// loading all tables.
+    #[test]
+    fn per_table_load_falls_back_for_subquery() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir.path().join("subq.ddb");
+        {
+            let db = Db::open_or_create(&path, DbConfig::default()).expect("create db");
+            db.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, n INTEGER)")
+                .expect("create a");
+            db.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, n INTEGER)")
+                .expect("create b");
+            for i in 0..3 {
+                db.execute(&format!("INSERT INTO a VALUES ({i},{i})"))
+                    .expect("ins a");
+                db.execute(&format!("INSERT INTO b VALUES ({i},{i})"))
+                    .expect("ins b");
+            }
+            db.checkpoint().expect("checkpoint");
+        }
+        let cfg = DbConfig {
+            defer_table_materialization: true,
+            ..DbConfig::default()
+        };
+        let db = Db::open_or_create(&path, cfg).expect("reopen");
+        // EXISTS subquery references `b`, but `safe_referenced_tables`
+        // returns None for any subquery shape, so both tables must load.
+        db.execute("SELECT COUNT(*) FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.n = a.n)")
+            .expect("query with subquery");
+        let json = db.inspect_storage_state_json().expect("json");
+        assert!(
+            json.contains("\"deferred_table_count\":0}"),
+            "expected zero deferred tables after subquery fallback, got: {json}"
+        );
+        assert!(
+            json.contains("\"loaded_table_count\":2,"),
+            "expected both tables loaded after subquery fallback, got: {json}"
         );
     }
 }

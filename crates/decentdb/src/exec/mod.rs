@@ -770,7 +770,7 @@ impl EngineRuntime {
         // point will materialize on first use. Note that this opens a
         // per-table-snapshot consistency window — see config docs.
         if !runtime.deferred_tables.is_empty() && !config.defer_table_materialization {
-            runtime.materialize_deferred_tables_with_store(&store, pager.page_size())?;
+            runtime.materialize_deferred_tables_with_store(&store, pager.page_size(), None)?;
         }
         if config.defer_table_materialization && !runtime.deferred_tables.is_empty() {
             // Mark all catalog indexes as stale so the lazy materialization
@@ -790,6 +790,13 @@ impl EngineRuntime {
     #[must_use]
     pub(crate) fn has_deferred_tables(&self) -> bool {
         !self.deferred_tables.is_empty()
+    }
+
+    /// Returns an iterator over deferred table names.
+    #[allow(clippy::double_must_use)]
+    #[must_use]
+    pub(crate) fn deferred_table_names(&self) -> impl Iterator<Item = &String> {
+        self.deferred_tables.iter()
     }
 
     /// Returns per-table residency stats `(table_name, row_count, heap_bytes)`
@@ -842,23 +849,71 @@ impl EngineRuntime {
             wal,
             snapshot_lsn: reader.snapshot_lsn(),
         };
-        self.materialize_deferred_tables_with_store(&store, page_size)?;
+        self.materialize_deferred_tables_with_store(&store, page_size, None)?;
         drop(reader);
         Ok(())
     }
 
-    /// Loads all deferred tables using an existing `SnapshotPageStore`.
+    /// Loads a subset of deferred tables, specified by name.
+    ///
+    /// This is used for per-table on-demand loading where only the tables
+    /// referenced by the current SQL statement are materialized.
+    #[allow(dead_code)]
+    pub(crate) fn load_deferred_tables_filtered(
+        &mut self,
+        pager: &PagerHandle,
+        wal: &WalHandle,
+        page_size: u32,
+        filter: &BTreeSet<String>,
+    ) -> Result<()> {
+        let intersection: BTreeSet<String> = self
+            .deferred_tables
+            .iter()
+            .filter(|t| filter.contains(*t))
+            .cloned()
+            .collect();
+        if intersection.is_empty() {
+            return Ok(());
+        }
+        let reader = wal.begin_reader()?;
+        let store = SnapshotPageStore {
+            pager,
+            wal,
+            snapshot_lsn: reader.snapshot_lsn(),
+        };
+        self.materialize_deferred_tables_with_store(&store, page_size, Some(filter))?;
+        drop(reader);
+        Ok(())
+    }
+
+    /// Loads deferred tables using an existing `SnapshotPageStore`.
     ///
     /// This ensures the overflow pointers recorded in `persisted_tables`
     /// (from the manifest) are read against the same WAL snapshot that
     /// produced those pointers, avoiding length mismatches when a
     /// concurrent writer extends the overflow chain.
+    ///
+    /// When `filter` is `Some`, only the named tables are materialized.
+    /// When `None`, all deferred tables are materialized (legacy behavior).
     fn materialize_deferred_tables_with_store<S: PageStore>(
         &mut self,
         store: &S,
         page_size: u32,
+        filter: Option<&BTreeSet<String>>,
     ) -> Result<()> {
-        let table_names: Vec<String> = self.deferred_tables.iter().cloned().collect();
+        let table_names: Vec<String> = if let Some(f) = filter {
+            self.deferred_tables
+                .iter()
+                .filter(|t| f.contains(*t))
+                .cloned()
+                .collect()
+        } else {
+            self.deferred_tables.iter().cloned().collect()
+        };
+        if table_names.is_empty() {
+            return Ok(());
+        }
+        let mut tables_loaded = Vec::new();
         for table_name in &table_names {
             let state = self.persisted_tables.get(table_name).ok_or_else(|| {
                 DbError::internal(format!(
@@ -885,9 +940,13 @@ impl EngineRuntime {
                 ps.tail = read_uncompressed_overflow_tail(store, ps.pointer)?.unwrap_or_default();
             }
             self.tables_mut().insert(table_name.clone(), Arc::new(data));
+            tables_loaded.push(table_name.clone());
+            self.deferred_tables.remove(table_name);
         }
-        self.deferred_tables.clear();
-        self.rebuild_indexes(page_size)?;
+        for table_name in &tables_loaded {
+            self.mark_indexes_stale_for_table(table_name);
+        }
+        self.rebuild_stale_indexes(page_size)?;
         Ok(())
     }
 
@@ -1470,11 +1529,18 @@ impl EngineRuntime {
             return Ok(());
         }
 
+        // ADR 0143 Phase B: under per-table deferred materialization, an
+        // index whose target table has not yet been loaded must not be
+        // rebuilt — its rows are not in memory. The index is rebuilt
+        // when the table itself is materialized via
+        // `materialize_deferred_tables_with_store`, which calls
+        // `mark_indexes_stale_for_table` followed by `rebuild_stale_indexes`.
         let names = self
             .catalog
             .indexes
             .iter()
             .filter(|(name, index)| !index.fresh || !self.indexes.contains_key(*name))
+            .filter(|(_, index)| !self.deferred_tables.contains(&index.table_name))
             .map(|(name, _)| name.clone())
             .collect::<Vec<_>>();
         for name in names {
