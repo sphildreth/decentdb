@@ -49,6 +49,40 @@ pub struct DbConfig {
     pub checkpoint_timeout_sec: u64,
     pub trigram_postings_threshold: usize,
     pub temp_dir: PathBuf,
+
+    /// Trigger an automatic checkpoint when the in-memory WAL has accumulated
+    /// at least this many distinct dirty page versions since the last
+    /// checkpoint. `0` disables the page-count trigger. The trigger only
+    /// fires when there are no active readers; otherwise the WAL is allowed
+    /// to keep growing until readers complete (per ADR 0019).
+    ///
+    /// Default: `4096` (≈ 16 MB at the default 4 KB page size).
+    ///
+    /// See `design/2026-04-22.ENGINE-MEMORY-PLAN.md` slice **M1**.
+    pub wal_checkpoint_threshold_pages: u32,
+
+    /// Trigger an automatic checkpoint when the WAL has grown by at least
+    /// this many bytes since the last checkpoint. `0` disables the
+    /// byte-count trigger. Bounds writer-side memory growth on workloads
+    /// that touch many distinct pages without exceeding the page-count
+    /// threshold (e.g. wide-row inserts on large pages).
+    ///
+    /// Default: `64 * 1024 * 1024` (64 MB).
+    ///
+    /// See `design/2026-04-22.ENGINE-MEMORY-PLAN.md` slice **M1**.
+    pub wal_checkpoint_threshold_bytes: u64,
+
+    /// On Linux/glibc, call `malloc_trim(0)` after a successful checkpoint
+    /// to return freed heap arenas to the operating system. No-op on other
+    /// platforms regardless of value.
+    ///
+    /// Defaults to `true` on Linux/glibc and `false` elsewhere. On
+    /// long-lived embedders the default removes the dominant cause of
+    /// observed RSS growth (allocator fragmentation amplifying transient
+    /// per-commit allocations).
+    ///
+    /// See `design/2026-04-22.ENGINE-MEMORY-PLAN.md` slice **M2**.
+    pub release_freed_memory_after_checkpoint: bool,
 }
 
 impl DbConfig {
@@ -79,6 +113,10 @@ impl Default for DbConfig {
             checkpoint_timeout_sec: 30,
             trigram_postings_threshold: 100_000,
             temp_dir: std::env::temp_dir(),
+            wal_checkpoint_threshold_pages: 4096,
+            wal_checkpoint_threshold_bytes: 64 * 1024 * 1024,
+            release_freed_memory_after_checkpoint:
+                cfg!(all(target_os = "linux", target_env = "gnu")),
         }
     }
 }
@@ -99,5 +137,9 @@ mod tests {
         assert_eq!(config.checkpoint_timeout_sec, 30);
         assert_eq!(config.trigram_postings_threshold, 100_000);
         assert!(!config.temp_dir.as_os_str().is_empty());
+        assert_eq!(config.wal_checkpoint_threshold_pages, 4096);
+        assert_eq!(config.wal_checkpoint_threshold_bytes, 64 * 1024 * 1024);
+        // Default depends on platform; just assert the field is reachable.
+        let _ = config.release_freed_memory_after_checkpoint;
     }
 }
