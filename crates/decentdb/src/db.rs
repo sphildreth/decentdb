@@ -1191,8 +1191,19 @@ impl Db {
     pub fn inspect_storage_state_json(&self) -> Result<String> {
         let header = self.inner.pager.header_snapshot()?;
         let warnings = self.inner.wal.warnings()?;
+        // ADR 0143 Phase A: surface per-runtime row residency so callers can
+        // verify that Phases B/C/D close the gap between db_file_bytes and
+        // tables_in_memory_bytes.
+        let (rows_total, bytes_total, table_count, deferred_count) = {
+            let runtime = self
+                .inner
+                .engine
+                .read()
+                .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+            runtime.table_memory_totals()
+        };
         Ok(format!(
-            "{{\"path\":\"{}\",\"page_size\":{},\"page_count\":{},\"schema_cookie\":{},\"wal_end_lsn\":{},\"wal_file_size\":{},\"wal_path\":\"{}\",\"last_checkpoint_lsn\":{},\"active_readers\":{},\"wal_versions\":{},\"warning_count\":{},\"shared_wal\":{}}}",
+            "{{\"path\":\"{}\",\"page_size\":{},\"page_count\":{},\"schema_cookie\":{},\"wal_end_lsn\":{},\"wal_file_size\":{},\"wal_path\":\"{}\",\"last_checkpoint_lsn\":{},\"active_readers\":{},\"wal_versions\":{},\"warning_count\":{},\"shared_wal\":{},\"tables_in_memory_bytes\":{},\"rows_in_memory_count\":{},\"loaded_table_count\":{},\"deferred_table_count\":{}}}",
             json_escape(self.path().display().to_string()),
             self.inner.config.page_size,
             self.inner.pager.on_disk_page_count()?,
@@ -1204,7 +1215,11 @@ impl Db {
             self.inner.wal.active_reader_count()?,
             self.inner.wal.version_count()?,
             warnings.len(),
-            if self.inner.wal.is_shared() { "true" } else { "false" }
+            if self.inner.wal.is_shared() { "true" } else { "false" },
+            bytes_total,
+            rows_total,
+            table_count,
+            deferred_count,
         ))
     }
 
@@ -1416,13 +1431,7 @@ impl Db {
         let schema_cookie = header.schema_cookie;
 
         let pager = PagerHandle::open(Arc::clone(&file), header, effective_config.cache_size_mb)?;
-        let wal = WalHandle::acquire(
-            &vfs,
-            &path,
-            effective_config.page_size,
-            effective_config.wal_sync_mode,
-            &pager,
-        )?;
+        let wal = WalHandle::acquire(&vfs, &path, &effective_config, &pager)?;
         wal.set_max_page_count(pager.on_disk_page_count()?);
         let (runtime, runtime_lsn) =
             EngineRuntime::load_from_storage(&pager, &wal, schema_cookie, &effective_config)?;
@@ -4768,5 +4777,99 @@ mod tests {
             Value::Int64(value) => value,
             ref other => panic!("expected INT64 scalar, got {other:?}"),
         }
+    }
+
+    /// ADR 0143 Phase A: `inspect_storage_state_json` exposes per-runtime
+    /// table residency so callers can verify lazy-load progress.
+    #[test]
+    fn inspect_storage_state_json_reports_table_memory_totals() {
+        let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
+        db.execute("CREATE TABLE m (id INTEGER PRIMARY KEY, label TEXT)")
+            .expect("create m");
+        for i in 0..32 {
+            db.execute(&format!(
+                "INSERT INTO m (id, label) VALUES ({i}, 'value-{i}-with-some-text')"
+            ))
+            .expect("insert m");
+        }
+        let json = db
+            .inspect_storage_state_json()
+            .expect("inspect storage state");
+        assert!(
+            json.contains("\"tables_in_memory_bytes\":"),
+            "missing tables_in_memory_bytes: {json}"
+        );
+        assert!(
+            json.contains("\"rows_in_memory_count\":"),
+            "missing rows_in_memory_count: {json}"
+        );
+        assert!(
+            json.contains("\"loaded_table_count\":"),
+            "missing loaded_table_count: {json}"
+        );
+        assert!(
+            json.contains("\"deferred_table_count\":0"),
+            "expected zero deferred tables on a fresh in-memory db: {json}"
+        );
+        // 32 inserted rows must show up in the residency total.
+        assert!(
+            json.contains("\"rows_in_memory_count\":32"),
+            "expected rows_in_memory_count=32, got: {json}"
+        );
+    }
+
+    /// ADR 0143 Phase B (opt-in): when `defer_table_materialization=true`
+    /// re-opening a DB leaves persisted tables in the deferred set until
+    /// the first SQL statement runs, then materializes them.
+    #[test]
+    fn defer_table_materialization_skips_eager_load_at_open() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir.path().join("defer-load.ddb");
+
+        // Seed a DB with a persisted table and close.
+        {
+            let db = Db::open_or_create(&path, DbConfig::default()).expect("create db");
+            db.execute("CREATE TABLE seeded (id INTEGER PRIMARY KEY, n INTEGER)")
+                .expect("create seeded");
+            for i in 0..50 {
+                db.execute(&format!("INSERT INTO seeded (id, n) VALUES ({i}, {i})"))
+                    .expect("insert");
+            }
+            db.checkpoint().expect("checkpoint before close");
+        }
+
+        // Re-open with deferred materialization.
+        let cfg = DbConfig {
+            defer_table_materialization: true,
+            ..DbConfig::default()
+        };
+        let db = Db::open_or_create(&path, cfg).expect("reopen with defer");
+
+        // At open, the table should not yet be loaded.
+        let json_open = db.inspect_storage_state_json().expect("json snapshot");
+        assert!(
+            json_open.contains("\"deferred_table_count\":1"),
+            "expected 1 deferred table at open, got: {json_open}"
+        );
+        assert!(
+            json_open.contains("\"rows_in_memory_count\":0"),
+            "expected zero resident rows at open, got: {json_open}"
+        );
+
+        // The first SELECT triggers materialization.
+        let result = db
+            .execute("SELECT COUNT(*) FROM seeded")
+            .expect("count after defer");
+        assert_eq!(scalar_i64(&result), 50);
+
+        let json_after = db.inspect_storage_state_json().expect("json after");
+        assert!(
+            json_after.contains("\"deferred_table_count\":0"),
+            "expected zero deferred tables after first query, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"rows_in_memory_count\":50"),
+            "expected 50 resident rows after materialize, got: {json_after}"
+        );
     }
 }

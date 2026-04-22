@@ -1,10 +1,13 @@
 //! Write-ahead log ownership, recovery, and checkpointing.
 
 pub(crate) mod async_commit;
+pub(crate) mod background;
 pub(crate) mod checkpoint;
 pub(crate) mod delta;
 pub(crate) mod format;
 pub(crate) mod index;
+pub(crate) mod index_sidecar;
+pub(crate) mod platform;
 pub(crate) mod reader_registry;
 pub(crate) mod recovery;
 pub(crate) mod savepoint;
@@ -13,9 +16,9 @@ pub(crate) mod writer;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
-use crate::config::WalSyncMode;
+use crate::config::{DbConfig, WalSyncMode};
 use crate::error::Result;
 use crate::storage::page::PageId;
 use crate::storage::PagerHandle;
@@ -23,6 +26,7 @@ use crate::vfs::VfsFile;
 use crate::vfs::VfsHandle;
 
 use self::async_commit::AsyncCommitState;
+use self::background::BgCheckpointer;
 use self::index::WalIndex;
 use self::reader_registry::{ReaderGuard, ReaderRegistry};
 
@@ -50,23 +54,70 @@ pub(crate) struct SharedWalInner {
     /// in `build_handle` and torn down when `SharedWalInner` is dropped (which
     /// joins the thread and performs a final synchronous flush).
     pub(super) async_commit: Option<AsyncCommitState>,
+    /// Auto-checkpoint and post-checkpoint memory-release tuning.
+    /// Snapshotted from `DbConfig` at first acquisition; subsequent opens of
+    /// the same WAL share these values via the registry (matches existing
+    /// `sync_mode` / `page_size` behaviour). See ADR 0137 / 0138.
+    pub(crate) auto_checkpoint: AutoCheckpointConfig,
+    /// Number of dirty page versions that have been added to the WAL index
+    /// since the last successful checkpoint. Reset by `checkpoint::checkpoint`
+    /// after pruning. See ADR 0137.
+    pub(crate) pages_since_checkpoint: AtomicU32,
+    /// Reusable scratch buffer for `checkpoint::checkpoint`; see slice M5.
+    /// Avoids a fresh allocation of the per-checkpoint
+    /// `Vec<(PageId, WalVersion)>` materialised by
+    /// `WalIndex::latest_versions_at_or_before`. The buffer is held under
+    /// the writer lock so this `Mutex` is uncontended in practice.
+    pub(crate) checkpoint_scratch: Mutex<Vec<(PageId, index::WalVersion)>>,
+    /// Optional background checkpoint worker (ADR 0058). Set once during
+    /// `shared::build_handle` when the embedder opts in via
+    /// `DbConfig::background_checkpoint_worker`. `OnceLock` is used so
+    /// `SharedWalInner::drop` can `take()` it and signal the worker to
+    /// shut down before joining the thread.
+    pub(crate) bg_checkpointer: OnceLock<BgCheckpointer>,
+}
+
+/// Snapshot of the checkpoint-related `DbConfig` fields. Held inside
+/// `SharedWalInner` so the writer can evaluate auto-checkpoint thresholds
+/// without re-threading config through every call site.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AutoCheckpointConfig {
+    pub(crate) threshold_pages: u32,
+    pub(crate) threshold_bytes: u64,
+    pub(crate) checkpoint_timeout_sec: u64,
+    pub(crate) release_freed_after_checkpoint: bool,
+}
+
+impl AutoCheckpointConfig {
+    pub(crate) fn from_db_config(cfg: &DbConfig) -> Self {
+        Self {
+            threshold_pages: cfg.wal_checkpoint_threshold_pages,
+            threshold_bytes: cfg.wal_checkpoint_threshold_bytes,
+            checkpoint_timeout_sec: cfg.checkpoint_timeout_sec,
+            release_freed_after_checkpoint: cfg.release_freed_memory_after_checkpoint,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct WalWriteState {
     pub(crate) page_batch: Vec<u8>,
     pub(crate) prepared_pages: Vec<(PageId, Vec<u8>, usize)>,
+    /// Reusable scratch buffer for the per-page delta payload (slice M6).
+    /// `encode_page_delta_into` clears and refills this buffer on every
+    /// page rather than allocating a fresh `Vec<u8>` per page in the
+    /// commit hot path.
+    pub(crate) delta_scratch: Vec<u8>,
 }
 
 impl WalHandle {
     pub(crate) fn acquire(
         vfs: &VfsHandle,
         db_path: &Path,
-        page_size: u32,
-        sync_mode: WalSyncMode,
+        config: &DbConfig,
         pager: &PagerHandle,
     ) -> Result<Self> {
-        shared::acquire(vfs, db_path, page_size, sync_mode, pager)
+        shared::acquire(vfs, db_path, config, pager)
     }
 
     pub(crate) fn evict(vfs: &VfsHandle, db_path: &Path) -> Result<()> {
@@ -108,7 +159,7 @@ impl WalHandle {
             .expect("wal index lock should not be poisoned");
         Ok(index
             .latest_visible(page_id, snapshot_lsn)
-            .map(|version| Arc::clone(&version.data)))
+            .map(|version| version.payload.arc()))
     }
 
     pub(crate) fn latest_snapshot(&self) -> u64 {
@@ -204,7 +255,7 @@ mod tests {
     use std::path::Path;
     use std::sync::Arc;
 
-    use crate::config::WalSyncMode;
+    use crate::config::{DbConfig, WalSyncMode};
     use crate::storage::page;
     use crate::storage::{write_database_bootstrap_vfs, DatabaseHeader, PagerHandle};
     use crate::vfs::mem::MemVfs;
@@ -221,20 +272,25 @@ mod tests {
         PagerHandle::open(Arc::clone(&file), header, 1).expect("open pager")
     }
 
+    fn test_config() -> DbConfig {
+        DbConfig {
+            wal_sync_mode: WalSyncMode::TestingOnlyUnsafeNoSync,
+            // Disable auto-checkpoint inside this low-level test so the
+            // single explicit commit produces an observable WAL state.
+            wal_checkpoint_threshold_pages: 0,
+            wal_checkpoint_threshold_bytes: 0,
+            ..DbConfig::default()
+        }
+    }
+
     #[test]
     fn read_page_at_snapshot_shares_backing_allocation() {
         let mem_vfs: Arc<dyn Vfs> = Arc::new(MemVfs::default());
         let vfs = VfsHandle::from_vfs(Arc::clone(&mem_vfs));
         let db_path = Path::new(":memory:");
         let pager = test_pager(&vfs, db_path);
-        let wal = WalHandle::acquire(
-            &vfs,
-            db_path,
-            page::DEFAULT_PAGE_SIZE,
-            WalSyncMode::TestingOnlyUnsafeNoSync,
-            &pager,
-        )
-        .expect("acquire wal");
+        let cfg = test_config();
+        let wal = WalHandle::acquire(&vfs, db_path, &cfg, &pager).expect("acquire wal");
         let page_id = page::CATALOG_ROOT_PAGE_ID + 1;
         let payload = vec![0x5A; page::DEFAULT_PAGE_SIZE as usize];
         let snapshot_lsn = wal

@@ -1,6 +1,6 @@
 # Per-Engine Allocator (Decoupled from Host `#[global_allocator]`)
 **Date:** 2026-04-22
-**Status:** Deferred
+**Status:** Accepted (2026-04-23) — `EngineAlloc` trait + default forwarder land; full callsite plumbing remains a follow-up.
 
 ### Decision (proposed)
 

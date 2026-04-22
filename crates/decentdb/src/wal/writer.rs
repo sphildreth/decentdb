@@ -12,7 +12,7 @@ use crate::storage::page::PageId;
 use crate::storage::PagerHandle;
 use crate::vfs::write_all_at;
 
-use super::delta::encode_page_delta;
+use super::delta::encode_page_delta_into;
 use super::format::{FrameType, WalFrame, FRAME_HEADER_SIZE, FRAME_TRAILER_SIZE, WAL_HEADER_SIZE};
 use super::index::WalVersion;
 use super::recovery;
@@ -44,6 +44,7 @@ pub(crate) fn commit_pages(
     let WalWriteState {
         page_batch,
         prepared_pages,
+        delta_scratch,
     } = &mut *writer_state;
     page_batch.clear();
     page_batch.reserve(page_frame_len * pages.len() + COMMIT_FRAME_BYTES.len());
@@ -59,8 +60,15 @@ pub(crate) fn commit_pages(
             .get(i)
             .and_then(|b| b.as_ref())
             .map(|data| &data[..]);
-        let encoded_len =
-            append_best_page_frame_with_base(page_batch, wal, pager, page_id, &payload, base)?;
+        let encoded_len = append_best_page_frame_with_base(
+            page_batch,
+            delta_scratch,
+            wal,
+            pager,
+            page_id,
+            &payload,
+            base,
+        )?;
         prepared_pages.push((page_id, payload, encoded_len));
     }
     let commit_start_lsn = offset;
@@ -85,14 +93,12 @@ pub(crate) fn commit_pages(
         // between the count check and the version clear (TOCTOU fix).
         let retain_history = wal.inner.reader_registry.active_reader_count()? > 0;
         let mut version_lsn = commit_start_lsn;
+        let prepared_count = prepared_pages.len();
         for (page_id, payload, encoded_len) in prepared_pages.drain(..) {
             version_lsn += encoded_len as u64;
             index.add_version(
                 page_id,
-                WalVersion {
-                    lsn: version_lsn,
-                    data: Arc::from(payload),
-                },
+                WalVersion::resident(version_lsn, Arc::from(payload)),
                 retain_history,
             );
         }
@@ -103,7 +109,17 @@ pub(crate) fn commit_pages(
             .max_page_count
             .fetch_max(max_page_count, Ordering::AcqRel);
         wal.inner.wal_end_lsn.store(offset, Ordering::Release);
+        // Track work since the last checkpoint for the size-based trigger
+        // (ADR 0137). Saturating add: a u32 is enough headroom for a single
+        // checkpoint window even on the largest practical workloads, and
+        // saturation is safe because the trigger compares >= threshold.
+        let prepared_count_u32 = u32::try_from(prepared_count).unwrap_or(u32::MAX);
+        wal.inner
+            .pages_since_checkpoint
+            .fetch_add(prepared_count_u32, Ordering::AcqRel);
     }
+    drop(writer_state);
+    maybe_auto_checkpoint(wal, pager)?;
     Ok(offset)
 }
 
@@ -136,6 +152,7 @@ pub(crate) fn commit_pages_if_latest(
     let WalWriteState {
         page_batch,
         prepared_pages,
+        delta_scratch,
     } = &mut *writer_state;
     page_batch.clear();
     page_batch.reserve(page_frame_len * pages.len() + COMMIT_FRAME_BYTES.len());
@@ -150,8 +167,15 @@ pub(crate) fn commit_pages_if_latest(
             .get(i)
             .and_then(|b| b.as_ref())
             .map(|data| &data[..]);
-        let encoded_len =
-            append_best_page_frame_with_base(page_batch, wal, pager, page_id, &payload, base)?;
+        let encoded_len = append_best_page_frame_with_base(
+            page_batch,
+            delta_scratch,
+            wal,
+            pager,
+            page_id,
+            &payload,
+            base,
+        )?;
         prepared_pages.push((page_id, payload, encoded_len));
     }
     let commit_start_lsn = offset;
@@ -174,14 +198,12 @@ pub(crate) fn commit_pages_if_latest(
         // between the count check and the version clear (TOCTOU fix).
         let retain_history = wal.inner.reader_registry.active_reader_count()? > 0;
         let mut version_lsn = commit_start_lsn;
+        let prepared_count = prepared_pages.len();
         for (page_id, payload, encoded_len) in prepared_pages.drain(..) {
             version_lsn += encoded_len as u64;
             index.add_version(
                 page_id,
-                WalVersion {
-                    lsn: version_lsn,
-                    data: Arc::from(payload),
-                },
+                WalVersion::resident(version_lsn, Arc::from(payload)),
                 retain_history,
             );
         }
@@ -191,7 +213,13 @@ pub(crate) fn commit_pages_if_latest(
             .max_page_count
             .fetch_max(max_page_count, Ordering::AcqRel);
         wal.inner.wal_end_lsn.store(offset, Ordering::Release);
+        let prepared_count_u32 = u32::try_from(prepared_count).unwrap_or(u32::MAX);
+        wal.inner
+            .pages_since_checkpoint
+            .fetch_add(prepared_count_u32, Ordering::AcqRel);
     }
+    drop(writer_state);
+    maybe_auto_checkpoint(wal, pager)?;
     Ok(offset)
 }
 
@@ -307,6 +335,7 @@ fn append_page_frame(
 
 fn append_best_page_frame_with_base(
     output: &mut Vec<u8>,
+    delta_scratch: &mut Vec<u8>,
     wal: &WalHandle,
     pager: &PagerHandle,
     page_id: PageId,
@@ -314,12 +343,12 @@ fn append_best_page_frame_with_base(
     wal_base: Option<&[u8]>,
 ) -> Result<usize> {
     if let Some(base) = wal_base {
-        if let Some(delta_payload) = encode_page_delta(base, payload) {
-            return append_page_delta_frame(output, page_id, &delta_payload);
+        if encode_page_delta_into(delta_scratch, base, payload) {
+            return append_page_delta_frame(output, page_id, delta_scratch);
         }
     } else if let Ok(base) = pager.read_page(page_id) {
-        if let Some(delta_payload) = encode_page_delta(&base, payload) {
-            return append_page_delta_frame(output, page_id, &delta_payload);
+        if encode_page_delta_into(delta_scratch, &base, payload) {
+            return append_page_delta_frame(output, page_id, delta_scratch);
         }
     }
     append_page_frame(output, page_id, payload, wal.inner.page_size)
@@ -341,9 +370,55 @@ fn lookup_base_pages_batch(
         .map(|(page_id, _)| {
             index
                 .latest_visible(*page_id, snapshot_lsn)
-                .map(|v| Arc::clone(&v.data))
+                .map(|v| v.payload.arc())
         })
         .collect()
+}
+
+/// Evaluate the size-based auto-checkpoint thresholds (ADR 0137) and trigger
+/// a synchronous checkpoint when both thresholds and reader gating allow it.
+///
+/// MUST be called with the writer state guard already dropped — `checkpoint`
+/// re-acquires it. Best-effort: when readers are active or another checkpoint
+/// is already pending, this is a silent no-op; the next reader-free commit
+/// re-evaluates and may trigger then.
+fn maybe_auto_checkpoint(wal: &WalHandle, pager: &PagerHandle) -> Result<()> {
+    let cfg = wal.inner.auto_checkpoint;
+    let pages_threshold = cfg.threshold_pages;
+    let bytes_threshold = cfg.threshold_bytes;
+    if pages_threshold == 0 && bytes_threshold == 0 {
+        return Ok(());
+    }
+
+    let pages_since = wal.inner.pages_since_checkpoint.load(Ordering::Acquire);
+    let pages_hit = pages_threshold != 0 && pages_since >= pages_threshold;
+
+    let bytes_since = wal.latest_snapshot().saturating_sub(WAL_HEADER_SIZE);
+    let bytes_hit = bytes_threshold != 0 && bytes_since >= bytes_threshold;
+
+    if !pages_hit && !bytes_hit {
+        return Ok(());
+    }
+    if wal.inner.checkpoint_pending.load(Ordering::Acquire) {
+        return Ok(());
+    }
+
+    // ADR 0058: prefer the background worker when present so the writer's
+    // commit hot path is not blocked by checkpoint copyback. The worker
+    // applies the same reader-active gating below.
+    if let Some(bg) = wal.inner.bg_checkpointer.get() {
+        bg.wake();
+        return Ok(());
+    }
+
+    // Skip when readers are active so we preserve ADR 0019 retention semantics
+    // and avoid a redundant `prune_at_or_below` pass that would not actually
+    // free memory.
+    if wal.inner.reader_registry.active_reader_count()? > 0 {
+        return Ok(());
+    }
+
+    super::checkpoint::checkpoint(wal, pager, cfg.checkpoint_timeout_sec)
 }
 
 fn append_page_delta_frame(output: &mut Vec<u8>, page_id: PageId, payload: &[u8]) -> Result<usize> {
@@ -394,5 +469,117 @@ mod tests {
         // page id le bytes
         let id = u32::from_le_bytes(out[1..5].try_into().expect("id bytes"));
         assert_eq!(id, 5);
+    }
+
+    // --- ADR 0137: size-based auto-checkpoint trigger ---
+
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use crate::config::{DbConfig, WalSyncMode};
+    use crate::storage::{write_database_bootstrap_vfs, DatabaseHeader, PagerHandle};
+    use crate::vfs::mem::MemVfs;
+    use crate::vfs::{FileKind, OpenMode, Vfs, VfsHandle};
+
+    use super::super::WalHandle;
+
+    fn setup_wal(
+        threshold_pages: u32,
+        threshold_bytes: u64,
+    ) -> (VfsHandle, PagerHandle, WalHandle) {
+        let mem_vfs: Arc<dyn Vfs> = Arc::new(MemVfs::default());
+        let vfs = VfsHandle::from_vfs(Arc::clone(&mem_vfs));
+        let path = Path::new(":memory:");
+        let file = vfs
+            .open(path, OpenMode::OpenOrCreate, FileKind::Database)
+            .expect("create db file");
+        let header = DatabaseHeader::new(page::DEFAULT_PAGE_SIZE);
+        write_database_bootstrap_vfs(file.as_ref(), &header).expect("bootstrap");
+        let pager = PagerHandle::open(Arc::clone(&file), header, 1).expect("pager");
+        let cfg = DbConfig {
+            wal_sync_mode: WalSyncMode::TestingOnlyUnsafeNoSync,
+            wal_checkpoint_threshold_pages: threshold_pages,
+            wal_checkpoint_threshold_bytes: threshold_bytes,
+            release_freed_memory_after_checkpoint: false,
+            background_checkpoint_worker: false,
+            ..DbConfig::default()
+        };
+        let wal = WalHandle::acquire(&vfs, path, &cfg, &pager).expect("acquire");
+        (vfs, pager, wal)
+    }
+
+    fn payload(byte: u8) -> Vec<u8> {
+        vec![byte; page::DEFAULT_PAGE_SIZE as usize]
+    }
+
+    #[test]
+    fn auto_checkpoint_disabled_by_zero_thresholds() {
+        let (_vfs, pager, wal) = setup_wal(0, 0);
+        for i in 1u32..=20 {
+            let pid = page::CATALOG_ROOT_PAGE_ID + i;
+            wal.commit_pages(&pager, vec![(pid, payload(i as u8))], pid)
+                .expect("commit");
+        }
+        // No threshold => no auto-checkpoint => versions accumulate.
+        assert!(wal.version_count().expect("count") >= 20);
+        assert_eq!(wal.checkpoint_epoch(), 0);
+    }
+
+    #[test]
+    fn auto_checkpoint_fires_on_page_threshold() {
+        let (_vfs, pager, wal) = setup_wal(8, 0);
+        for i in 1u32..=32 {
+            let pid = page::CATALOG_ROOT_PAGE_ID + i;
+            wal.commit_pages(&pager, vec![(pid, payload(i as u8))], pid)
+                .expect("commit");
+        }
+        // With a page threshold of 8 over 32 commits we expect at least 4
+        // checkpoint epochs to have advanced.
+        assert!(
+            wal.checkpoint_epoch() >= 4,
+            "expected >=4 epochs, saw {}",
+            wal.checkpoint_epoch()
+        );
+        // After the final auto-checkpoint with no readers the index is cleared.
+        assert!(
+            wal.version_count().expect("count") < 8,
+            "expected bounded versions, saw {}",
+            wal.version_count().expect("count")
+        );
+    }
+
+    #[test]
+    fn auto_checkpoint_fires_on_byte_threshold() {
+        // One commit ≈ FRAME_HEADER + page + FRAME_TRAILER + COMMIT_FRAME.
+        // Set the byte threshold low enough that two commits trigger.
+        let (_vfs, pager, wal) = setup_wal(0, 1024);
+        for i in 1u32..=10 {
+            let pid = page::CATALOG_ROOT_PAGE_ID + i;
+            wal.commit_pages(&pager, vec![(pid, payload(i as u8))], pid)
+                .expect("commit");
+        }
+        assert!(
+            wal.checkpoint_epoch() >= 1,
+            "expected at least one auto-checkpoint, saw {}",
+            wal.checkpoint_epoch()
+        );
+    }
+
+    #[test]
+    fn auto_checkpoint_skipped_while_reader_active() {
+        let (_vfs, pager, wal) = setup_wal(2, 0);
+        let pid = page::CATALOG_ROOT_PAGE_ID + 1;
+        wal.commit_pages(&pager, vec![(pid, payload(0xAB))], pid)
+            .expect("first commit");
+        let _reader = wal.begin_reader().expect("reader");
+        let initial_epoch = wal.checkpoint_epoch();
+        for i in 2u32..=10 {
+            let p = page::CATALOG_ROOT_PAGE_ID + i;
+            wal.commit_pages(&pager, vec![(p, payload(i as u8))], p)
+                .expect("commit");
+        }
+        // The active reader must block the auto-checkpoint trigger entirely.
+        assert_eq!(wal.checkpoint_epoch(), initial_epoch);
+        assert!(wal.version_count().expect("count") >= 10);
     }
 }

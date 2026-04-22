@@ -155,6 +155,24 @@ impl TableData {
         self.row_index_by_id(row_id)
             .and_then(|index| self.rows.get(index))
     }
+
+    /// Approximate heap residency of this table's row vector. Includes
+    /// `Vec<StoredRow>` capacity plus each row's `Vec<Value>` capacity plus
+    /// each `Value`'s heap allocations. Excludes the `TableData` struct
+    /// itself. Used by storage instrumentation (ADR 0143 Phase A).
+    #[must_use]
+    pub(crate) fn approximate_heap_bytes(&self) -> usize {
+        let row_struct = std::mem::size_of::<StoredRow>();
+        let value_struct = std::mem::size_of::<crate::record::value::Value>();
+        let mut total = self.rows.capacity() * row_struct;
+        for row in &self.rows {
+            total += row.values.capacity() * value_struct;
+            for value in &row.values {
+                total += value.approximate_heap_bytes();
+            }
+        }
+        total
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -743,10 +761,26 @@ impl EngineRuntime {
         // same WAL snapshot. If deferred loading uses a later snapshot,
         // a concurrent writer may have extended the overflow chain, causing
         // a length mismatch.
-        if !runtime.deferred_tables.is_empty() {
+        //
+        // ADR 0143 Phase B (opt-in): when
+        // `DbConfig::defer_table_materialization` is true we intentionally
+        // skip the eager materialize+rebuild here so that `Db::open` does
+        // not allocate `Vec<StoredRow>` for every persisted table. The
+        // `ensure_deferred_tables_loaded` fast-path on each Db API entry
+        // point will materialize on first use. Note that this opens a
+        // per-table-snapshot consistency window — see config docs.
+        if !runtime.deferred_tables.is_empty() && !config.defer_table_materialization {
             runtime.materialize_deferred_tables_with_store(&store, pager.page_size())?;
         }
-        runtime.rebuild_indexes(pager.page_size())?;
+        if config.defer_table_materialization && !runtime.deferred_tables.is_empty() {
+            // Mark all catalog indexes as stale so the lazy materialization
+            // path will rebuild them once row data is available.
+            for index in runtime.catalog_mut().indexes.values_mut() {
+                index.fresh = false;
+            }
+        } else {
+            runtime.rebuild_indexes(pager.page_size())?;
+        }
         drop(reader);
         Ok((runtime, snapshot_lsn))
     }
@@ -756,6 +790,38 @@ impl EngineRuntime {
     #[must_use]
     pub(crate) fn has_deferred_tables(&self) -> bool {
         !self.deferred_tables.is_empty()
+    }
+
+    /// Returns per-table residency stats `(table_name, row_count, heap_bytes)`
+    /// for every fully-loaded table in this runtime. Deferred (not-yet-loaded)
+    /// tables are omitted. Used by `Db::inspect_storage_state_json` per
+    /// ADR 0143 Phase A. Result is sorted by table name for deterministic
+    /// output.
+    #[must_use]
+    #[allow(dead_code)] // exposed for follow-up Phase A JSON breakdown wiring
+    pub(crate) fn table_memory_breakdown(&self) -> Vec<(String, usize, usize)> {
+        let mut out = Vec::with_capacity(self.tables.len());
+        for (name, data) in self.tables.iter() {
+            out.push((name.clone(), data.rows.len(), data.approximate_heap_bytes()));
+        }
+        out
+    }
+
+    /// Returns aggregate `(total_rows, total_heap_bytes, table_count,
+    /// deferred_table_count)` across all loaded tables. Deferred tables
+    /// contribute zero to the byte/row totals but are counted separately.
+    /// Per ADR 0143 Phase A.
+    #[must_use]
+    pub(crate) fn table_memory_totals(&self) -> (u64, u64, u32, u32) {
+        let mut rows: u64 = 0;
+        let mut bytes: u64 = 0;
+        for data in self.tables.values() {
+            rows = rows.saturating_add(data.rows.len() as u64);
+            bytes = bytes.saturating_add(data.approximate_heap_bytes() as u64);
+        }
+        let table_count = u32::try_from(self.tables.len()).unwrap_or(u32::MAX);
+        let deferred_count = u32::try_from(self.deferred_tables.len()).unwrap_or(u32::MAX);
+        (rows, bytes, table_count, deferred_count)
     }
 
     /// Materializes all deferred table data from storage, then rebuilds

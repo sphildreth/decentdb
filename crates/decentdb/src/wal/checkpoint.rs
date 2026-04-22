@@ -39,22 +39,31 @@ pub(crate) fn checkpoint(wal: &WalHandle, pager: &PagerHandle, timeout_sec: u64)
         .min_snapshot_lsn()?
         .unwrap_or(current_lsn);
 
-    let latest_versions = {
+    let mut latest_versions = wal
+        .inner
+        .checkpoint_scratch
+        .lock()
+        .expect("checkpoint scratch lock should not be poisoned");
+    {
         let index = wal
             .inner
             .index
             .lock()
             .expect("wal index lock should not be poisoned");
-        index.latest_versions_at_or_before(safe_lsn)
-    };
+        index.populate_latest_versions_at_or_before(safe_lsn, &mut latest_versions);
+    }
 
     let page_ids: Vec<_> = latest_versions
         .iter()
         .map(|(page_id, _)| *page_id)
         .collect();
-    for (page_id, version) in &latest_versions {
-        pager.write_page_direct(*page_id, &version.data)?;
+    for (page_id, version) in latest_versions.iter() {
+        pager.write_page_direct(*page_id, version.payload.as_slice())?;
     }
+    // Drop large `Arc<[u8]>` references early so the checkpoint copyback's
+    // peak heap footprint is not retained across the disk-flush stall.
+    latest_versions.clear();
+    drop(latest_versions);
     let header = pager.header_from_disk()?;
     pager.refresh_from_disk(header)?;
     if let Some(page_count) = pager.truncate_freelist_tail()? {
@@ -91,6 +100,17 @@ pub(crate) fn checkpoint(wal: &WalHandle, pager: &PagerHandle, timeout_sec: u64)
     }
 
     wal.inner.checkpoint_epoch.fetch_add(1, Ordering::AcqRel);
+    // Reset the size-based trigger counter (ADR 0137). The byte threshold
+    // resets implicitly because `truncate_to_header` zeroes `wal_end_lsn`;
+    // when readers prevented truncation the next commit will re-evaluate
+    // against the still-larger WAL but with `pages_since_checkpoint = 0`.
+    wal.inner.pages_since_checkpoint.store(0, Ordering::Release);
+
+    // Return freed heap arenas to the OS on platforms where it helps.
+    // No-op on non-Linux/non-glibc targets. ADR 0138.
+    if wal.inner.auto_checkpoint.release_freed_after_checkpoint {
+        super::platform::release_freed_heap();
+    }
 
     Ok(())
 }

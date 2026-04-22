@@ -1,6 +1,6 @@
 # Paged On-Disk WAL Index with Bounded In-Memory Hot Set
 **Date:** 2026-04-22
-**Status:** Deferred
+**Status:** Accepted (2026-04-23) — scaffolding lands; full sidecar format remains a follow-up.
 
 ### Decision (proposed)
 

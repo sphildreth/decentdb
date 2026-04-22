@@ -83,6 +83,51 @@ pub struct DbConfig {
     ///
     /// See `design/2026-04-22.ENGINE-MEMORY-PLAN.md` slice **M2**.
     pub release_freed_memory_after_checkpoint: bool,
+
+    /// Run auto-checkpoints on a dedicated background thread instead of
+    /// blocking the writer's commit hot path.
+    ///
+    /// When `true` (default), `Db::open` / `Db::create` spawn a per-WAL
+    /// worker thread that wakes when `wal_checkpoint_threshold_pages` or
+    /// `wal_checkpoint_threshold_bytes` is exceeded. The writer signals
+    /// the worker via a condvar and returns immediately. When `false`,
+    /// the writer falls back to running `checkpoint::checkpoint()`
+    /// synchronously on the commit thread (the Phase 1 / ADR 0137 default).
+    ///
+    /// See ADR 0058 — Background / Incremental Checkpoint Worker.
+    pub background_checkpoint_worker: bool,
+
+    /// Maximum number of page-version chains kept resident in the WAL
+    /// index. `0` (default) preserves the historical behavior of an
+    /// unbounded in-memory index. Non-zero values request that the
+    /// engine spill cold chains to a `<db>.wal-idx` sidecar file.
+    ///
+    /// **The sidecar implementation is not yet wired in (ADR 0141 is in
+    /// "Accepted — scaffolding lands" status).** Setting this field is
+    /// presently a no-op; it is exposed now so embedders can roll out the
+    /// configuration ahead of the engine update without a flag day.
+    ///
+    /// See ADR 0141 — Paged On-Disk WAL Index.
+    pub wal_index_hot_set_pages: u32,
+
+    /// When `true`, `Db::open` skips the eager materialization of all
+    /// table row data into memory, leaving each table in the
+    /// `deferred_tables` set. Tables are then materialized on first
+    /// access via the existing `ensure_deferred_tables_loaded` path.
+    ///
+    /// Default: `false` (preserve the historical eager-load behavior).
+    ///
+    /// **Tradeoff** — opting in dramatically reduces `Db::open` RSS for
+    /// large databases (the goal of ADR 0143) but the *first* SQL
+    /// operation on any deferred table pays the materialization cost,
+    /// and currently materializes **all** still-deferred tables in one
+    /// shot (per-table on-demand load is tracked as ADR 0143 Phase B
+    /// follow-up). The first access also pins the WAL snapshot
+    /// established at open until materialization completes, briefly
+    /// blocking checkpoints in shared multi-connection scenarios.
+    ///
+    /// See ADR 0143 — On-Disk Row-Scan Executor (Phase B opt-in).
+    pub defer_table_materialization: bool,
 }
 
 impl DbConfig {
@@ -115,8 +160,13 @@ impl Default for DbConfig {
             temp_dir: std::env::temp_dir(),
             wal_checkpoint_threshold_pages: 4096,
             wal_checkpoint_threshold_bytes: 64 * 1024 * 1024,
-            release_freed_memory_after_checkpoint:
-                cfg!(all(target_os = "linux", target_env = "gnu")),
+            release_freed_memory_after_checkpoint: cfg!(all(
+                target_os = "linux",
+                target_env = "gnu"
+            )),
+            background_checkpoint_worker: true,
+            wal_index_hot_set_pages: 0,
+            defer_table_materialization: false,
         }
     }
 }

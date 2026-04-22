@@ -1,6 +1,6 @@
 ## Background / Incremental Checkpoint Worker
 **Date:** 2026-02-02
-**Status:** Deferred
+**Status:** Accepted (2026-04-23) — initial implementation lands the off-thread worker; cooperative incremental checkpointing remains a follow-up.
 
 ### Decision
 Draft a design for an incremental/background checkpoint worker that can spread checkpoint work over time while preserving Snapshot Isolation and the one-writer/many-reader model.

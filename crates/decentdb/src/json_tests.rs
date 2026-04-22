@@ -512,10 +512,7 @@ mod wal_index_tests {
     use crate::wal::index::{WalIndex, WalVersion};
 
     fn ver(lsn: u64, byte: u8) -> WalVersion {
-        WalVersion {
-            lsn,
-            data: Arc::<[u8]>::from(vec![byte; 16]),
-        }
+        WalVersion::resident(lsn, Arc::<[u8]>::from(vec![byte; 16]))
     }
 
     #[test]
@@ -539,7 +536,7 @@ mod wal_index_tests {
         idx.add_version(1, ver(30, 0xCC), false);
         assert_eq!(idx.version_count(), 1);
         let v = idx.latest_visible(1, u64::MAX).unwrap();
-        assert_eq!(v.data[0], 0xCC);
+        assert_eq!(v.payload.as_slice()[0], 0xCC);
         assert_eq!(v.lsn, 30);
     }
 
@@ -552,15 +549,15 @@ mod wal_index_tests {
 
         let v = idx.latest_visible(1, 15).unwrap();
         assert_eq!(v.lsn, 10);
-        assert_eq!(v.data[0], 0x11);
+        assert_eq!(v.payload.as_slice()[0], 0x11);
 
         let v = idx.latest_visible(1, 20).unwrap();
         assert_eq!(v.lsn, 20);
-        assert_eq!(v.data[0], 0x22);
+        assert_eq!(v.payload.as_slice()[0], 0x22);
 
         let v = idx.latest_visible(1, 100).unwrap();
         assert_eq!(v.lsn, 30);
-        assert_eq!(v.data[0], 0x33);
+        assert_eq!(v.payload.as_slice()[0], 0x33);
     }
 
     #[test]

@@ -90,7 +90,7 @@ pub(crate) fn initialize_or_recover(
                 } else {
                     let mut data =
                         if let Some(version) = index.latest_visible(frame.page_id, u64::MAX) {
-                            version.data.to_vec()
+                            version.payload.as_slice().to_vec()
                         } else {
                             pager.read_page(frame.page_id)?.to_vec()
                         };
@@ -106,10 +106,7 @@ pub(crate) fn initialize_or_recover(
                     // versions from a large WAL can consume substantial memory on open.
                     index.add_version(
                         page_id,
-                        WalVersion {
-                            lsn: pending_page.lsn,
-                            data: Arc::from(pending_page.data),
-                        },
+                        WalVersion::resident(pending_page.lsn, Arc::from(pending_page.data)),
                         false,
                     );
                 }
@@ -330,7 +327,7 @@ mod tests {
         let latest = index
             .latest_visible(7, u64::MAX)
             .expect("latest version for page 7");
-        assert_eq!(latest.data.as_ref(), second.as_slice());
+        assert_eq!(latest.payload.as_slice(), second.as_slice());
     }
 
     #[test]
@@ -373,7 +370,10 @@ mod tests {
         let latest = index
             .latest_visible(page_id, u64::MAX)
             .expect("latest version for page");
-        assert_eq!(latest.data[0], ((update_count - 1) % 251) as u8);
+        assert_eq!(
+            latest.payload.as_slice()[0],
+            ((update_count - 1) % 251) as u8
+        );
     }
 
     #[test]
@@ -439,7 +439,7 @@ mod tests {
         let version = index
             .latest_visible(3, u64::MAX)
             .expect("recovered page version");
-        assert_eq!(version.data.as_ref(), updated.as_slice());
+        assert_eq!(version.payload.as_slice(), updated.as_slice());
     }
 
     #[test]
@@ -487,7 +487,7 @@ mod tests {
         let version = index
             .latest_visible(page_id, u64::MAX)
             .expect("latest version for page");
-        assert_eq!(version.data.as_ref(), expected.as_slice());
+        assert_eq!(version.payload.as_slice(), expected.as_slice());
     }
 
     #[test]

@@ -10,6 +10,11 @@ decentdb = { path = "../decentdb" }
 clap.workspace = true
 anyhow.workspace = true
 rustyline.workspace = true
+mimalloc = { version = "0.1", default-features = false, optional = true }
+
+[features]
+# Opt-in low-fragmentation allocator. See ADR 0139.
+mimalloc = ["dep:mimalloc"]
 
 [[bin]]
 name = "decentdb"
