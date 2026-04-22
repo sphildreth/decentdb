@@ -114,6 +114,8 @@ namespace DecentDB.AdoNet
             {
                 _state = ConnectionState.Closed;
             }
+
+            OnStateChange(new StateChangeEventArgs(ConnectionState.Open, ConnectionState.Closed));
         }
 
         /// <summary>
@@ -161,6 +163,7 @@ namespace DecentDB.AdoNet
             {
                 _db = new Native.DecentDB(path, _nativeOptions);
                 _state = ConnectionState.Open;
+                OnStateChange(new StateChangeEventArgs(ConnectionState.Closed, ConnectionState.Open));
             }
             catch (Exception ex)
             {
