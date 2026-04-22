@@ -201,6 +201,11 @@ namespace DecentDB.AdoNet
 
         public override object? ExecuteScalar()
         {
+            if (TryExecutePragmaScalar(out var pragmaValue))
+            {
+                return pragmaValue;
+            }
+
             using var reader = ExecuteDbDataReader(CommandBehavior.Default);
             if (reader.Read())
             {
@@ -708,6 +713,11 @@ namespace DecentDB.AdoNet
                 throw new InvalidOperationException("Command has no connection");
             }
 
+            if (TryExecutePragmaNonQuery(out var pragmaRowsAffected))
+            {
+                return pragmaRowsAffected;
+            }
+
             var (sql, paramMap, needsOffsetClamp) = GetRewrittenSqlAndParameters();
             if (needsOffsetClamp)
             {
@@ -760,6 +770,167 @@ namespace DecentDB.AdoNet
 
                 throw;
             }
+        }
+
+        private bool TryExecutePragmaNonQuery(out int rowsAffected)
+        {
+            rowsAffected = 0;
+            if (_connection == null)
+            {
+                return false;
+            }
+
+            if (!TryParsePragma(_commandText, out var pragmaName, out var pragmaArgument))
+            {
+                return false;
+            }
+
+            if (!pragmaName.Equals("wal_checkpoint", StringComparison.OrdinalIgnoreCase) &&
+                !pragmaName.Equals("journal_mode", StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            var observation = StartSqlObservationIfEnabled(_connection, _commandText, new Dictionary<int, DbParameter>());
+            try
+            {
+                if (pragmaName.Equals("wal_checkpoint", StringComparison.OrdinalIgnoreCase))
+                {
+                    _connection.Checkpoint();
+                }
+                else if (!string.IsNullOrWhiteSpace(pragmaArgument))
+                {
+                    _ = NormalizePragmaJournalMode(pragmaArgument!);
+                }
+
+                if (observation != null)
+                {
+                    _connection.CompleteSqlObservation(observation, rowsAffected, exception: null);
+                }
+
+                return true;
+            }
+            catch (Exception ex)
+            {
+                if (observation != null)
+                {
+                    _connection.CompleteSqlObservation(observation, rowsAffected: 0, ex);
+                }
+
+                throw;
+            }
+        }
+
+        private bool TryExecutePragmaScalar(out object? value)
+        {
+            value = null;
+            if (_connection == null)
+            {
+                return false;
+            }
+
+            if (!TryParsePragma(_commandText, out var pragmaName, out var pragmaArgument) ||
+                !pragmaName.Equals("journal_mode", StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            var observation = StartSqlObservationIfEnabled(_connection, _commandText, new Dictionary<int, DbParameter>());
+            try
+            {
+                value = string.IsNullOrWhiteSpace(pragmaArgument)
+                    ? "WAL"
+                    : NormalizePragmaJournalMode(pragmaArgument!);
+
+                if (observation != null)
+                {
+                    _connection.CompleteSqlObservation(observation, rowsAffected: 0, exception: null);
+                }
+
+                return true;
+            }
+            catch (Exception ex)
+            {
+                if (observation != null)
+                {
+                    _connection.CompleteSqlObservation(observation, rowsAffected: 0, ex);
+                }
+
+                throw;
+            }
+        }
+
+        private static string NormalizePragmaJournalMode(string journalModeToken)
+        {
+            var normalized = journalModeToken.Trim().Trim('"', '\'').ToUpperInvariant();
+            return normalized switch
+            {
+                "WAL" => "WAL",
+                "DELETE" => "DELETE",
+                _ => throw new NotSupportedException($"Unsupported PRAGMA journal_mode value '{journalModeToken}'.")
+            };
+        }
+
+        private static bool TryParsePragma(string sql, out string pragmaName, out string? pragmaArgument)
+        {
+            pragmaName = string.Empty;
+            pragmaArgument = null;
+
+            if (string.IsNullOrWhiteSpace(sql))
+            {
+                return false;
+            }
+
+            var trimmed = sql.Trim();
+            if (trimmed.EndsWith(';'))
+            {
+                trimmed = trimmed[..^1].TrimEnd();
+            }
+
+            if (!trimmed.StartsWith("PRAGMA", StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            var pragmaBody = trimmed["PRAGMA".Length..].Trim();
+            if (pragmaBody.Length == 0)
+            {
+                return false;
+            }
+
+            string pragmaNamePart = pragmaBody;
+            string? pragmaArgumentPart = null;
+
+            var equalsIndex = pragmaBody.IndexOf('=');
+            var openParenIndex = pragmaBody.IndexOf('(');
+            if (openParenIndex >= 0)
+            {
+                pragmaNamePart = pragmaBody[..openParenIndex].Trim();
+                var closeParenIndex = pragmaBody.LastIndexOf(')');
+                pragmaArgumentPart = closeParenIndex > openParenIndex
+                    ? pragmaBody[(openParenIndex + 1)..closeParenIndex].Trim()
+                    : pragmaBody[(openParenIndex + 1)..].Trim();
+            }
+            else if (equalsIndex >= 0)
+            {
+                pragmaNamePart = pragmaBody[..equalsIndex].Trim();
+                pragmaArgumentPart = pragmaBody[(equalsIndex + 1)..].Trim();
+            }
+
+            var dotIndex = pragmaNamePart.LastIndexOf('.');
+            if (dotIndex >= 0 && dotIndex < pragmaNamePart.Length - 1)
+            {
+                pragmaNamePart = pragmaNamePart[(dotIndex + 1)..];
+            }
+
+            if (pragmaNamePart.Length == 0)
+            {
+                return false;
+            }
+
+            pragmaName = pragmaNamePart;
+            pragmaArgument = string.IsNullOrWhiteSpace(pragmaArgumentPart) ? null : pragmaArgumentPart;
+            return true;
         }
 
         private PreparedStatement EnsurePreparedStatement(string sql, bool resetForExecution)
