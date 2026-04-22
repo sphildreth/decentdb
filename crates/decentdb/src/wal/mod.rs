@@ -139,8 +139,16 @@ impl WalHandle {
         pages: Vec<(PageId, Vec<u8>)>,
         max_page_count: u32,
         expected_latest_lsn: u64,
+        expected_checkpoint_epoch: u64,
     ) -> Result<u64> {
-        writer::commit_pages_if_latest(self, pager, pages, max_page_count, expected_latest_lsn)
+        writer::commit_pages_if_latest(
+            self,
+            pager,
+            pages,
+            max_page_count,
+            expected_latest_lsn,
+            expected_checkpoint_epoch,
+        )
     }
 
     pub(crate) fn checkpoint(&self, pager: &PagerHandle, timeout_sec: u64) -> Result<()> {

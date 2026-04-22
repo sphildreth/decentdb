@@ -129,6 +129,7 @@ pub(crate) fn commit_pages_if_latest(
     pages: Vec<(PageId, Vec<u8>)>,
     max_page_count: u32,
     expected_latest_lsn: u64,
+    expected_checkpoint_epoch: u64,
 ) -> Result<u64> {
     let mut writer_state = wal
         .inner
@@ -138,9 +139,20 @@ pub(crate) fn commit_pages_if_latest(
 
     let latest = wal.latest_snapshot();
     if latest != expected_latest_lsn {
-        return Err(DbError::transaction(format!(
-            "transaction conflict: WAL advanced from {expected_latest_lsn} to {latest}"
-        )));
+        // Distinguish a benign checkpoint (which is the only operation that
+        // can move `wal_end_lsn` while we hold no foreign-writer lock — see
+        // ADR 0058 background checkpoint worker) from a real concurrent
+        // writer commit (multi-connection OCC, see ADR 0023). A checkpoint
+        // bumps `checkpoint_epoch`; a foreign writer does not. If the epoch
+        // advanced and no foreign commit occurred, the checkpoint preserved
+        // every durable page, so our staged pages are safe to append at the
+        // current WAL end.
+        let current_epoch = wal.inner.checkpoint_epoch.load(Ordering::Acquire);
+        if current_epoch == expected_checkpoint_epoch {
+            return Err(DbError::transaction(format!(
+                "transaction conflict: WAL advanced from {expected_latest_lsn} to {latest}"
+            )));
+        }
     }
 
     let mut offset = latest;

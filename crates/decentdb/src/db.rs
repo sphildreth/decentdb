@@ -253,6 +253,7 @@ impl TempSchemaState {
 struct SqlTxnState {
     runtime: EngineRuntime,
     base_lsn: u64,
+    base_checkpoint_epoch: u64,
     persistent_changed: bool,
     indexes_maybe_stale: bool,
     savepoints: Vec<SqlSavepoint>,
@@ -262,6 +263,7 @@ struct SqlTxnState {
 struct ExclusiveSqlTxnState<'a> {
     runtime: RwLockWriteGuard<'a, EngineRuntime>,
     base_lsn: u64,
+    base_checkpoint_epoch: u64,
     persistent_changed: bool,
     indexes_maybe_stale: bool,
 }
@@ -543,7 +545,7 @@ impl Db {
         }
         self.persist_runtime_if_latest(
             state.runtime,
-            Some(state.base_lsn),
+            Some((state.base_lsn, state.base_checkpoint_epoch)),
             state.indexes_maybe_stale,
         )
     }
@@ -888,7 +890,11 @@ impl Db {
             .commit_pages(&self.inner.pager, pages, max_page_count)
     }
 
-    fn commit_if_latest(&self, expected_latest_lsn: u64) -> Result<u64> {
+    fn commit_if_latest(
+        &self,
+        expected_latest_lsn: u64,
+        expected_checkpoint_epoch: u64,
+    ) -> Result<u64> {
         let (max_page_id, pages) = {
             let mut txn = self
                 .inner
@@ -915,6 +921,7 @@ impl Db {
             pages,
             max_page_count,
             expected_latest_lsn,
+            expected_checkpoint_epoch,
         )
     }
 
@@ -2414,6 +2421,7 @@ impl Db {
         self.refresh_engine_from_storage()?;
         self.ensure_deferred_tables_loaded()?;
         let current_lsn = self.inner.last_runtime_lsn.load(Ordering::Acquire);
+        let current_epoch = self.inner.wal.checkpoint_epoch();
         let runtime = self
             .inner
             .engine
@@ -2422,6 +2430,7 @@ impl Db {
         Ok(ExclusiveSqlTxnState {
             runtime,
             base_lsn: current_lsn,
+            base_checkpoint_epoch: current_epoch,
             persistent_changed: false,
             indexes_maybe_stale: false,
         })
@@ -2445,7 +2454,8 @@ impl Db {
             self.restore_runtime_from_storage(&mut state.runtime)?;
             return Err(error);
         }
-        let committed_lsn = match self.commit_if_latest(state.base_lsn) {
+        let committed_lsn = match self.commit_if_latest(state.base_lsn, state.base_checkpoint_epoch)
+        {
             Ok(lsn) => lsn,
             Err(error) => {
                 let _ = self.rollback();
@@ -2472,7 +2482,7 @@ impl Db {
     fn persist_runtime_if_latest(
         &self,
         runtime: EngineRuntime,
-        expected_latest_lsn: Option<u64>,
+        expected_latest: Option<(u64, u64)>,
         rebuild_stale_indexes: bool,
     ) -> Result<u64> {
         let mut runtime = runtime;
@@ -2485,8 +2495,8 @@ impl Db {
             let _ = self.rollback();
             return Err(error);
         }
-        let committed_lsn = match expected_latest_lsn {
-            Some(expected) => self.commit_if_latest(expected),
+        let committed_lsn = match expected_latest {
+            Some((lsn, epoch)) => self.commit_if_latest(lsn, epoch),
             None => self.commit(),
         };
         let committed_lsn = match committed_lsn {
@@ -2677,6 +2687,7 @@ impl Db {
         self.refresh_engine_from_storage()?;
         self.ensure_deferred_tables_loaded()?;
         let current_lsn = self.inner.last_runtime_lsn.load(Ordering::Acquire);
+        let current_epoch = self.inner.wal.checkpoint_epoch();
 
         let mut runtime = self
             .inner
@@ -2688,6 +2699,7 @@ impl Db {
         Ok(SqlTxnState {
             runtime,
             base_lsn: current_lsn,
+            base_checkpoint_epoch: current_epoch,
             persistent_changed: false,
             indexes_maybe_stale: false,
             savepoints: Vec::new(),

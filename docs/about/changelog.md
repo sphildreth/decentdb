@@ -10,12 +10,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Expanded .NET regression coverage with new ADO.NET and EF Core suites targeting common provider failure modes: parameter-collection shape/errors, maintenance path resolution and cleanup behavior, design-time model-factory metadata extraction, window/sql-expression translator contracts, modification-batch bind/execute fallback paths, and broad SaveChanges type-matrix binding coverage.
+- **Background incremental checkpoint worker (ADR 0058):** auto-checkpoint work moved off the writer commit hot path onto a dedicated `decentdb-checkpoint` thread. Writers signal the worker via a `Condvar`; the worker also wakes on a periodic timeout to drain WAL even for workloads that just barely cross a threshold and then go idle. Opt-in via `DbConfig::background_checkpoint_worker` (default `true` when any auto-checkpoint threshold is configured).
+- **Per-engine allocator scaffold (ADR 0142):** new `crates/decentdb/src/alloc.rs` introduces a per-engine allocator forwarder defaulting to the global allocator. Provides the abstraction needed for future per-database arena/jemalloc integration without changing call sites.
+- **Paged on-disk WAL index sidecar scaffold (ADR 0141):** new `wal/index_sidecar.rs` and supporting `WalVersionPayload` enum (`Resident`/`OnDisk`) introduce the type machinery required to spill WAL-resident page versions to a sidecar file. Currently always-resident; spill path will be wired in a follow-up.
+- **Storage-state memory instrumentation (ADR 0143 Phase A):** `Db::inspect_storage_state_json` now reports four new fields — `tables_in_memory_bytes`, `rows_in_memory_count`, `loaded_table_count`, and `deferred_table_count` — sourced from new helpers `EngineRuntime::table_memory_totals`, `TableData::approximate_heap_bytes`, and `Value::approximate_heap_bytes`. Enables external memory probes without parsing platform-specific RSS.
+- **Per-commit delta payload recycler (M6) and `SmallVec` WAL index (M7):** writer-side commit path reuses encoded-delta scratch buffers across commits, and `WalIndex` now stores per-page version chains in a `SmallVec` to avoid heap allocations for the common single-version case.
+- **Linux heap-release hook (ADR 0138):** opt-in `DbConfig::release_freed_after_checkpoint` calls `malloc_trim` on glibc Linux after a successful checkpoint to return freed arena pages to the OS. No-op on non-glibc/non-Linux targets.
+- New helper `Value::approximate_heap_bytes()` returns a best-effort byte estimate of heap-allocated payload (`Text`, `Blob`, `Json`, etc.) for memory-accounting callers.
 
 ### Fixed
 
 - .NET SQL parameter rewriting for EF-style multi-row parameter names (for example `@p0_0`, `@p1_1`, `@p10_11`) so provider-generated names bind correctly without false positional rewrites.
 - .NET prepared-command reuse now consistently resets and clears bindings after successful non-query execution, reducing native statement-retention pressure in repeated prepared insert/update workloads.
 - .NET native text binding path now uses pooled/stack-based UTF-8 encoding buffers instead of per-call byte-array allocations, reducing allocation churn on high-frequency bind paths.
+- **WAL writer / background-checkpoint race (regression introduced by ADR 0058):** `commit_pages_if_latest` now distinguishes a benign WAL-end-LSN advance caused by the background checkpoint worker (which bumps `WalShared::checkpoint_epoch` and may truncate `wal_end_lsn` to `0`) from a real concurrent writer commit. Previously, a long-running write transaction whose commit happened to land just after a background checkpoint truncated the WAL would spuriously fail with `transaction conflict: WAL advanced from N to 0`. The OCC guard for true multi-connection writer conflicts (ADR 0023) is preserved by checking the checkpoint epoch alongside the WAL end LSN.
+
+### Documentation
+
+- New design notes: `design/2026-04-22.ENGINE-MEMORY-PLAN.md` (engine memory reduction roadmap, status table, and validation evidence) and `design/2026-04-23.ENGINE-MEMORY-REMAINING-WORK.md` (per-table on-demand load, persistent PK index, paged row format, executor scratch, and follow-up sequencing for ADRs 0141/0142).
+- New ADRs: 0058 (background incremental checkpoint worker), 0138 (Linux heap-release on checkpoint), 0141 (paged on-disk WAL index), 0142 (per-engine allocator), 0143 (on-disk row-scan executor, phased plan).
 
 ## [2.3.0] - 2026-04-20
 
