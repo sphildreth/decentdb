@@ -137,6 +137,17 @@ pub struct DbConfig {
     /// See ADR 0144 — Persistent Primary-Key Locator Index.
     pub persistent_pk_index: bool,
 
+    /// When `true`, persisted base tables are stored behind a table-level
+    /// paged-row manifest instead of a single table payload pointer. The
+    /// current Phase D persistence slice writes one manifest chunk per table
+    /// and backfills legacy tables on open; later slices will extend that
+    /// manifest to true append-only multi-chunk storage.
+    ///
+    /// Default: `false` for one release of soak time.
+    ///
+    /// See ADR 0145 — Paged Table Row Source.
+    pub paged_row_storage: bool,
+
     /// If non-zero, `Db::open` will run a synchronous checkpoint when the
     /// existing WAL file size on disk exceeds this threshold (in MiB).
     /// This drops the in-memory WAL page-version index and lets steady-
@@ -187,6 +198,7 @@ impl Default for DbConfig {
             wal_index_hot_set_pages: 0,
             defer_table_materialization: true,
             persistent_pk_index: false,
+            paged_row_storage: false,
             auto_checkpoint_on_open_mb: 16,
         }
     }
@@ -212,6 +224,7 @@ mod tests {
         assert_eq!(config.wal_checkpoint_threshold_bytes, 64 * 1024 * 1024);
         assert!(config.defer_table_materialization);
         assert!(!config.persistent_pk_index);
+        assert!(!config.paged_row_storage);
         // Default depends on platform; just assert the field is reachable.
         let _ = config.release_freed_memory_after_checkpoint;
     }

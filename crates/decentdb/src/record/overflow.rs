@@ -15,6 +15,7 @@ type ChainPages = Vec<(PageId, Arc<[u8]>)>;
 
 pub(crate) const OVERFLOW_HEADER_SIZE: usize = 8;
 const FLAG_COMPRESSED: u8 = 0x01;
+const FLAG_TABLE_PAGED_MANIFEST: u8 = 0x02;
 
 /// Cached page IDs for an overflow chain.  Used by
 /// [`rewrite_overflow_cached`] to skip the chain walk and compare pages
@@ -35,6 +36,21 @@ impl OverflowPointer {
     #[must_use]
     pub(crate) fn is_compressed(self) -> bool {
         self.flags & FLAG_COMPRESSED != 0
+    }
+
+    #[must_use]
+    pub(crate) fn is_table_paged_manifest(self) -> bool {
+        self.flags & FLAG_TABLE_PAGED_MANIFEST != 0
+    }
+
+    #[must_use]
+    pub(crate) fn with_table_paged_manifest(mut self, paged: bool) -> Self {
+        if paged {
+            self.flags |= FLAG_TABLE_PAGED_MANIFEST;
+        } else {
+            self.flags &= !FLAG_TABLE_PAGED_MANIFEST;
+        }
+        self
     }
 }
 

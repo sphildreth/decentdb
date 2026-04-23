@@ -1493,6 +1493,7 @@ impl Db {
             }),
         };
         db.backfill_missing_persistent_pk_indexes()?;
+        db.backfill_paged_row_storage()?;
         Ok(db)
     }
 
@@ -2358,6 +2359,62 @@ impl Db {
 
         self.begin_write()?;
         let changed = match runtime.backfill_missing_persistent_pk_indexes(self) {
+            Ok(changed) => changed,
+            Err(error) => {
+                let _ = self.rollback();
+                self.restore_runtime_from_storage(&mut runtime)?;
+                return Err(error);
+            }
+        };
+        if !changed {
+            self.rollback()?;
+            return Ok(());
+        }
+        if let Err(error) = runtime.persist_to_db(self) {
+            let _ = self.rollback();
+            self.restore_runtime_from_storage(&mut runtime)?;
+            return Err(error);
+        }
+        let committed_lsn = match self.commit() {
+            Ok(lsn) => lsn,
+            Err(error) => {
+                let _ = self.rollback();
+                self.restore_runtime_from_storage(&mut runtime)?;
+                return Err(error);
+            }
+        };
+        self.inner
+            .catalog
+            .replace(runtime.catalog.as_ref().clone())?;
+        self.sync_temp_state_from_runtime(&runtime)?;
+        self.inner
+            .last_runtime_lsn
+            .store(committed_lsn, Ordering::Release);
+        self.inner
+            .writer_last_commit_lsn
+            .store(committed_lsn, Ordering::Release);
+        Ok(())
+    }
+
+    fn backfill_paged_row_storage(&self) -> Result<()> {
+        if !self.inner.config.paged_row_storage {
+            return Ok(());
+        }
+
+        let mut runtime = self
+            .inner
+            .engine
+            .write()
+            .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+        let needs_backfill = runtime.persisted_tables.values().any(|state| {
+            state.pointer.head_page_id != 0 && !state.pointer.is_table_paged_manifest()
+        });
+        if !needs_backfill {
+            return Ok(());
+        }
+
+        self.begin_write()?;
+        let changed = match runtime.backfill_paged_row_storage(self) {
             Ok(changed) => changed,
             Err(error) => {
                 let _ = self.rollback();
@@ -4899,6 +4956,234 @@ mod tests {
     }
 
     #[test]
+    fn paged_row_storage_backfills_legacy_tables_and_keeps_wildcard_scan_deferred() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir.path().join("paged-row-storage-backfill.ddb");
+
+        {
+            let db = Db::open_or_create(&path, DbConfig::default()).expect("create db");
+            db.execute("CREATE TABLE seeded (id INTEGER PRIMARY KEY, n INTEGER, body TEXT)")
+                .expect("create seeded");
+            let large_body = "x".repeat(2048);
+            let mut txn = db.transaction().expect("begin txn");
+            let insert = txn
+                .prepare("INSERT INTO seeded VALUES ($1, $2, $3)")
+                .expect("prepare insert");
+            for i in 0_i64..96_i64 {
+                insert
+                    .execute_in(
+                        &mut txn,
+                        &[
+                            Value::Int64(i),
+                            Value::Int64(i),
+                            Value::Text(large_body.clone()),
+                        ],
+                    )
+                    .expect("insert row");
+            }
+            txn.commit().expect("commit rows");
+            db.checkpoint().expect("checkpoint");
+        }
+
+        let config = DbConfig {
+            paged_row_storage: true,
+            ..DbConfig::default()
+        };
+        let db = Db::open_or_create(&path, config).expect("reopen with paged storage");
+        {
+            let runtime = db.inner.engine.read().expect("engine runtime lock");
+            let seeded = runtime
+                .persisted_tables
+                .get("seeded")
+                .expect("persisted seeded after paged backfill");
+            assert!(
+                seeded.pointer.is_table_paged_manifest(),
+                "expected legacy table to be wrapped in paged manifest storage"
+            );
+        }
+
+        let json_open = db.inspect_storage_state_json().expect("json snapshot");
+        assert!(
+            json_open.contains("\"deferred_table_count\":1"),
+            "expected paged-backed table to stay deferred at open, got: {json_open}"
+        );
+
+        let result = db.execute("SELECT * FROM seeded").expect("wildcard scan");
+        assert_eq!(result.rows().len(), 96);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[
+                Value::Int64(0),
+                Value::Int64(0),
+                Value::Text("x".repeat(2048)),
+            ]
+        );
+
+        let json_after = db.inspect_storage_state_json().expect("json after scan");
+        assert!(
+            json_after.contains("\"loaded_table_count\":0"),
+            "expected paged wildcard scan to avoid materialization, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"deferred_table_count\":1"),
+            "expected paged-backed table to remain deferred after scan, got: {json_after}"
+        );
+    }
+
+    #[test]
+    fn paged_row_storage_persists_new_large_tables_and_keeps_wildcard_scan_deferred() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir.path().join("paged-row-storage-new-write.ddb");
+        let config = DbConfig {
+            paged_row_storage: true,
+            ..DbConfig::default()
+        };
+
+        {
+            let db = Db::open_or_create(&path, config.clone()).expect("create db");
+            db.execute("CREATE TABLE seeded (id INTEGER PRIMARY KEY, n INTEGER, body TEXT)")
+                .expect("create seeded");
+            let large_body = "x".repeat(2048);
+            let mut txn = db.transaction().expect("begin txn");
+            let insert = txn
+                .prepare("INSERT INTO seeded VALUES ($1, $2, $3)")
+                .expect("prepare insert");
+            for i in 0_i64..96_i64 {
+                insert
+                    .execute_in(
+                        &mut txn,
+                        &[
+                            Value::Int64(i),
+                            Value::Int64(i),
+                            Value::Text(large_body.clone()),
+                        ],
+                    )
+                    .expect("insert row");
+            }
+            txn.commit().expect("commit rows");
+            db.checkpoint().expect("checkpoint");
+        }
+
+        let db = Db::open_or_create(&path, config).expect("reopen with paged storage");
+        {
+            let runtime = db.inner.engine.read().expect("engine runtime lock");
+            let seeded = runtime
+                .persisted_tables
+                .get("seeded")
+                .expect("persisted seeded after paged write");
+            assert!(
+                seeded.pointer.is_table_paged_manifest(),
+                "expected new large table to persist behind paged manifest storage"
+            );
+        }
+
+        let json_open = db.inspect_storage_state_json().expect("json snapshot");
+        assert!(
+            json_open.contains("\"deferred_table_count\":1"),
+            "expected paged-backed table to stay deferred at open, got: {json_open}"
+        );
+
+        let result = db.execute("SELECT * FROM seeded").expect("wildcard scan");
+        assert_eq!(result.rows().len(), 96);
+        assert_eq!(
+            result.rows()[95].values(),
+            &[
+                Value::Int64(95),
+                Value::Int64(95),
+                Value::Text("x".repeat(2048)),
+            ]
+        );
+
+        let json_after = db.inspect_storage_state_json().expect("json after scan");
+        assert!(
+            json_after.contains("\"loaded_table_count\":0"),
+            "expected paged wildcard scan to avoid materialization, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"deferred_table_count\":1"),
+            "expected paged-backed table to remain deferred after scan, got: {json_after}"
+        );
+    }
+
+    #[test]
+    fn persistent_pk_index_keeps_paged_row_storage_point_lookup_deferred() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir.path().join("paged-row-storage-pk-lookup.ddb");
+        let config = DbConfig {
+            persistent_pk_index: true,
+            paged_row_storage: true,
+            ..DbConfig::default()
+        };
+
+        {
+            let db = Db::open_or_create(&path, config.clone()).expect("create db");
+            db.execute("CREATE TABLE seeded (id INTEGER PRIMARY KEY, n INTEGER, body TEXT)")
+                .expect("create seeded");
+            let large_body = "x".repeat(2048);
+            let mut txn = db.transaction().expect("begin txn");
+            let insert = txn
+                .prepare("INSERT INTO seeded VALUES ($1, $2, $3)")
+                .expect("prepare insert");
+            for i in 0_i64..96_i64 {
+                insert
+                    .execute_in(
+                        &mut txn,
+                        &[
+                            Value::Int64(i),
+                            Value::Int64(i),
+                            Value::Text(large_body.clone()),
+                        ],
+                    )
+                    .expect("insert row");
+            }
+            txn.commit().expect("commit rows");
+            db.checkpoint().expect("checkpoint");
+        }
+
+        let db = Db::open_or_create(&path, config).expect("reopen with paged storage + pk index");
+        {
+            let runtime = db.inner.engine.read().expect("engine runtime lock");
+            let seeded = runtime
+                .persisted_tables
+                .get("seeded")
+                .expect("persisted seeded after paged write");
+            assert!(
+                seeded.pointer.is_table_paged_manifest(),
+                "expected new large table to persist behind paged manifest storage"
+            );
+            assert!(
+                seeded.pk_index_root.is_some(),
+                "expected paged-backed table to retain a persistent pk locator root"
+            );
+        }
+
+        let json_open = db.inspect_storage_state_json().expect("json snapshot");
+        assert!(
+            json_open.contains("\"deferred_table_count\":1"),
+            "expected paged-backed table to stay deferred at open, got: {json_open}"
+        );
+
+        let result = db
+            .execute("SELECT n FROM seeded WHERE id = 95")
+            .expect("point lookup");
+        assert_eq!(scalar_i64(&result), 95);
+
+        let json_after = db.inspect_storage_state_json().expect("json after lookup");
+        assert!(
+            json_after.contains("\"loaded_table_count\":0"),
+            "expected paged point lookup to avoid materialization, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"deferred_table_count\":1"),
+            "expected paged-backed table to remain deferred after point lookup, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"rows_in_memory_count\":0"),
+            "expected zero resident rows after paged point lookup, got: {json_after}"
+        );
+    }
+
+    #[test]
     fn reader_handle_refreshes_after_external_checkpoint() {
         let tempdir = TempDir::new().expect("tempdir");
         let path = tempdir.path().join("checkpoint-refresh.ddb");
@@ -5684,6 +5969,53 @@ mod tests {
     }
 
     #[test]
+    fn wildcard_table_projection_keeps_deferred_table_unloaded() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir.path().join("deferred-wildcard-projection.ddb");
+
+        {
+            let db = Db::open_or_create(&path, DbConfig::default()).expect("create db");
+            db.execute("CREATE TABLE seeded (id INTEGER PRIMARY KEY, n INTEGER)")
+                .expect("create seeded");
+            for i in 0..50 {
+                db.execute(&format!("INSERT INTO seeded (id, n) VALUES ({i}, {i})"))
+                    .expect("insert");
+            }
+            db.checkpoint().expect("checkpoint before close");
+        }
+
+        let db = Db::open_or_create(&path, DbConfig::default()).expect("reopen with defer");
+        let result = db
+            .execute("SELECT * FROM seeded")
+            .expect("wildcard projection");
+        assert_eq!(result.rows().len(), 50);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[Value::Int64(0), Value::Int64(0)]
+        );
+        assert_eq!(
+            result.rows()[49].values(),
+            &[Value::Int64(49), Value::Int64(49)]
+        );
+
+        let json_after = db
+            .inspect_storage_state_json()
+            .expect("json after wildcard projection");
+        assert!(
+            json_after.contains("\"loaded_table_count\":0"),
+            "expected wildcard projection to avoid resident materialization, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"deferred_table_count\":1"),
+            "expected deferred table to remain deferred after wildcard projection, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"rows_in_memory_count\":0"),
+            "expected zero resident rows after wildcard projection, got: {json_after}"
+        );
+    }
+
+    #[test]
     fn simple_filtered_projection_keeps_deferred_table_unloaded() {
         let tempdir = TempDir::new().expect("tempdir");
         let path = tempdir.path().join("deferred-filtered-projection.ddb");
@@ -5722,6 +6054,59 @@ mod tests {
         assert!(
             json_after.contains("\"rows_in_memory_count\":0"),
             "expected zero resident rows after filtered projection, got: {json_after}"
+        );
+    }
+
+    #[test]
+    fn qualified_wildcard_filtered_projection_keeps_deferred_table_unloaded() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir
+            .path()
+            .join("deferred-qualified-wildcard-projection.ddb");
+
+        {
+            let db = Db::open_or_create(&path, DbConfig::default()).expect("create db");
+            db.execute("CREATE TABLE seeded (id INTEGER PRIMARY KEY, n INTEGER)")
+                .expect("create seeded");
+            for i in 0..50 {
+                db.execute(&format!("INSERT INTO seeded (id, n) VALUES ({i}, {i})"))
+                    .expect("insert");
+            }
+            db.checkpoint().expect("checkpoint before close");
+        }
+
+        let db = Db::open_or_create(&path, DbConfig::default()).expect("reopen with defer");
+        let result = db
+            .execute("SELECT s.* FROM seeded AS s WHERE s.n >= 10 AND s.n <= 12 ORDER BY s.n")
+            .expect("qualified wildcard filtered projection");
+        assert_eq!(result.rows().len(), 3);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[Value::Int64(10), Value::Int64(10)]
+        );
+        assert_eq!(
+            result.rows()[1].values(),
+            &[Value::Int64(11), Value::Int64(11)]
+        );
+        assert_eq!(
+            result.rows()[2].values(),
+            &[Value::Int64(12), Value::Int64(12)]
+        );
+
+        let json_after = db
+            .inspect_storage_state_json()
+            .expect("json after qualified wildcard filtered projection");
+        assert!(
+            json_after.contains("\"loaded_table_count\":0"),
+            "expected qualified wildcard filtered projection to avoid resident materialization, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"deferred_table_count\":1"),
+            "expected deferred table to remain deferred after qualified wildcard filtered projection, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"rows_in_memory_count\":0"),
+            "expected zero resident rows after qualified wildcard filtered projection, got: {json_after}"
         );
     }
 
@@ -5774,6 +6159,56 @@ mod tests {
         assert!(
             json_after.contains("\"rows_in_memory_count\":0"),
             "expected zero resident rows after grouped aggregate, got: {json_after}"
+        );
+    }
+
+    #[test]
+    fn simple_grouped_count_aggregate_keeps_deferred_table_unloaded() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir.path().join("deferred-grouped-count.ddb");
+
+        {
+            let db = Db::open_or_create(&path, DbConfig::default()).expect("create db");
+            db.execute("CREATE TABLE seeded (id INTEGER PRIMARY KEY, grp INTEGER, n INTEGER)")
+                .expect("create seeded");
+            for i in 0..10 {
+                db.execute(&format!(
+                    "INSERT INTO seeded (id, grp, n) VALUES ({i}, {}, {i})",
+                    i % 2
+                ))
+                .expect("insert");
+            }
+            db.checkpoint().expect("checkpoint before close");
+        }
+
+        let db = Db::open_or_create(&path, DbConfig::default()).expect("reopen with defer");
+        let result = db
+            .execute("SELECT grp, COUNT(*) FROM seeded GROUP BY grp")
+            .expect("grouped count");
+        assert_eq!(result.rows().len(), 2);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[Value::Int64(0), Value::Int64(5)]
+        );
+        assert_eq!(
+            result.rows()[1].values(),
+            &[Value::Int64(1), Value::Int64(5)]
+        );
+
+        let json_after = db
+            .inspect_storage_state_json()
+            .expect("json after grouped count");
+        assert!(
+            json_after.contains("\"loaded_table_count\":0"),
+            "expected grouped count to avoid resident materialization, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"deferred_table_count\":1"),
+            "expected deferred table to remain deferred after grouped count, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"rows_in_memory_count\":0"),
+            "expected zero resident rows after grouped count, got: {json_after}"
         );
     }
 
