@@ -3448,6 +3448,7 @@ mod tests {
             foreign_keys: vec![],
             primary_key_columns: vec!["id".to_string()],
             next_row_id: 42,
+            pk_index_root: None,
         };
         assert_eq!(primary_row_id(&table, &[Value::Int64(7)]), Some(7));
 
@@ -3530,6 +3531,7 @@ mod tests {
             foreign_keys: vec![],
             primary_key_columns: vec![],
             next_row_id: 1,
+            pk_index_root: None,
         };
         assert!(validate_assigned_not_null_columns(&table, &[0], &[Value::Null], "t").is_err());
         assert!(validate_assigned_not_null_columns(&table, &[0], &[Value::Int64(1)], "t").is_ok());
@@ -3560,6 +3562,7 @@ mod tests {
             foreign_keys: vec![],
             primary_key_columns: vec!["id".to_string()],
             next_row_id: 2,
+            pk_index_root: None,
         };
 
         let child = crate::catalog::TableSchema {
@@ -3604,6 +3607,7 @@ mod tests {
             }],
             primary_key_columns: vec!["id".to_string()],
             next_row_id: 2,
+            pk_index_root: None,
         };
 
         runtime
@@ -3617,12 +3621,13 @@ mod tests {
 
         runtime.tables_mut().insert(
             "child".to_string(),
-            std::sync::Arc::new(crate::exec::TableData {
+            crate::exec::TableData {
                 rows: vec![StoredRow {
                     row_id: 1,
                     values: vec![Value::Int64(1), Value::Int64(7)],
                 }],
-            }),
+            }
+            .into(),
         );
 
         runtime
@@ -3656,6 +3661,7 @@ mod tests {
             foreign_keys: vec![],
             primary_key_columns: vec!["id".to_string()],
             next_row_id: 2,
+            pk_index_root: None,
         };
 
         let child = crate::catalog::TableSchema {
@@ -3700,6 +3706,7 @@ mod tests {
             }],
             primary_key_columns: vec!["id".to_string()],
             next_row_id: 2,
+            pk_index_root: None,
         };
 
         runtime
@@ -3713,12 +3720,13 @@ mod tests {
 
         runtime.tables_mut().insert(
             "child".to_string(),
-            std::sync::Arc::new(crate::exec::TableData {
+            crate::exec::TableData {
                 rows: vec![StoredRow {
                     row_id: 1,
                     values: vec![Value::Int64(1), Value::Int64(7)],
                 }],
-            }),
+            }
+            .into(),
         );
 
         runtime
@@ -3754,6 +3762,7 @@ mod tests {
             foreign_keys: vec![],
             primary_key_columns: vec!["id".to_string()],
             next_row_id: 2,
+            pk_index_root: None,
         };
 
         let child = crate::catalog::TableSchema {
@@ -3798,6 +3807,7 @@ mod tests {
             }],
             primary_key_columns: vec!["id".to_string()],
             next_row_id: 2,
+            pk_index_root: None,
         };
 
         runtime
@@ -3811,12 +3821,13 @@ mod tests {
 
         runtime.tables_mut().insert(
             "child".to_string(),
-            std::sync::Arc::new(crate::exec::TableData {
+            crate::exec::TableData {
                 rows: vec![StoredRow {
                     row_id: 1,
                     values: vec![Value::Int64(1), Value::Int64(7)],
                 }],
-            }),
+            }
+            .into(),
         );
 
         assert!(runtime
@@ -3848,6 +3859,7 @@ mod tests {
             foreign_keys: vec![],
             primary_key_columns: vec!["id".to_string()],
             next_row_id: 2,
+            pk_index_root: None,
         };
 
         let child = crate::catalog::TableSchema {
@@ -3892,6 +3904,7 @@ mod tests {
             }],
             primary_key_columns: vec!["id".to_string()],
             next_row_id: 2,
+            pk_index_root: None,
         };
 
         runtime
@@ -3905,12 +3918,13 @@ mod tests {
 
         runtime.tables_mut().insert(
             "child".to_string(),
-            std::sync::Arc::new(crate::exec::TableData {
+            crate::exec::TableData {
                 rows: vec![StoredRow {
                     row_id: 1,
                     values: vec![Value::Int64(1), Value::Int64(7)],
                 }],
-            }),
+            }
+            .into(),
         );
 
         runtime
@@ -3952,6 +3966,7 @@ mod tests {
             foreign_keys: vec![],
             primary_key_columns: vec!["id".to_string()],
             next_row_id: 2,
+            pk_index_root: None,
         };
 
         let child = crate::catalog::TableSchema {
@@ -3996,6 +4011,7 @@ mod tests {
             }],
             primary_key_columns: vec!["id".to_string()],
             next_row_id: 2,
+            pk_index_root: None,
         };
 
         runtime
@@ -4009,12 +4025,13 @@ mod tests {
 
         runtime.tables_mut().insert(
             "child".to_string(),
-            std::sync::Arc::new(crate::exec::TableData {
+            crate::exec::TableData {
                 rows: vec![StoredRow {
                     row_id: 1,
                     values: vec![Value::Int64(1), Value::Int64(7)],
                 }],
-            }),
+            }
+            .into(),
         );
 
         runtime
@@ -4056,6 +4073,7 @@ mod tests {
             foreign_keys: vec![],
             primary_key_columns: vec!["id".to_string()],
             next_row_id: 2,
+            pk_index_root: None,
         };
 
         let child = crate::catalog::TableSchema {
@@ -4100,6 +4118,7 @@ mod tests {
             }],
             primary_key_columns: vec!["id".to_string()],
             next_row_id: 2,
+            pk_index_root: None,
         };
 
         runtime
@@ -4113,12 +4132,13 @@ mod tests {
 
         runtime.tables_mut().insert(
             "child".to_string(),
-            std::sync::Arc::new(crate::exec::TableData {
+            crate::exec::TableData {
                 rows: vec![StoredRow {
                     row_id: 1,
                     values: vec![Value::Int64(1), Value::Int64(7)],
                 }],
-            }),
+            }
+            .into(),
         );
 
         assert!(runtime
@@ -4177,6 +4197,7 @@ mod apply_conflict_tests {
             foreign_keys: vec![],
             primary_key_columns: vec!["id".to_string()],
             next_row_id: 2,
+            pk_index_root: None,
         };
         runtime
             .catalog_mut()
@@ -4184,12 +4205,13 @@ mod apply_conflict_tests {
             .insert(table.name.clone(), table.clone());
         runtime.tables_mut().insert(
             "t".to_string(),
-            std::sync::Arc::new(crate::exec::TableData {
+            crate::exec::TableData {
                 rows: vec![StoredRow {
                     row_id: 1,
                     values: vec![Value::Int64(1), Value::Int64(10)],
                 }],
-            }),
+            }
+            .into(),
         );
 
         let assignments = vec![crate::sql::ast::Assignment {
@@ -4261,6 +4283,7 @@ mod apply_conflict_tests {
             foreign_keys: vec![],
             primary_key_columns: vec!["id".to_string()],
             next_row_id: 2,
+            pk_index_root: None,
         };
         runtime
             .catalog_mut()
@@ -4268,12 +4291,13 @@ mod apply_conflict_tests {
             .insert(table.name.clone(), table.clone());
         runtime.tables_mut().insert(
             "t2".to_string(),
-            std::sync::Arc::new(crate::exec::TableData {
+            crate::exec::TableData {
                 rows: vec![StoredRow {
                     row_id: 1,
                     values: vec![Value::Int64(1), Value::Int64(0), Value::Int64(10)],
                 }],
-            }),
+            }
+            .into(),
         );
 
         let assignments = vec![crate::sql::ast::Assignment {
@@ -4329,6 +4353,7 @@ mod apply_conflict_tests {
             foreign_keys: vec![],
             primary_key_columns: vec!["id".to_string()],
             next_row_id: 2,
+            pk_index_root: None,
         };
         runtime
             .catalog_mut()
@@ -4336,12 +4361,13 @@ mod apply_conflict_tests {
             .insert(table.name.clone(), table.clone());
         runtime.tables_mut().insert(
             "t3".to_string(),
-            std::sync::Arc::new(crate::exec::TableData {
+            crate::exec::TableData {
                 rows: vec![StoredRow {
                     row_id: 1,
                     values: vec![Value::Int64(1), Value::Int64(10)],
                 }],
-            }),
+            }
+            .into(),
         );
 
         let assignments = vec![crate::sql::ast::Assignment {
@@ -4407,6 +4433,7 @@ mod apply_conflict_tests {
             foreign_keys: vec![],
             primary_key_columns: vec!["id".to_string()],
             next_row_id: 2,
+            pk_index_root: None,
         };
         runtime
             .catalog_mut()
@@ -4414,12 +4441,13 @@ mod apply_conflict_tests {
             .insert(table.name.clone(), table.clone());
         runtime.tables_mut().insert(
             "t4".to_string(),
-            std::sync::Arc::new(crate::exec::TableData {
+            crate::exec::TableData {
                 rows: vec![StoredRow {
                     row_id: 1,
                     values: vec![Value::Int64(1), Value::Int64(10)],
                 }],
-            }),
+            }
+            .into(),
         );
 
         let assignments = vec![crate::sql::ast::Assignment {
@@ -4532,6 +4560,7 @@ mod dml_private_tests {
             foreign_keys: vec![],
             primary_key_columns: vec!["id".to_string()],
             next_row_id: 10,
+            pk_index_root: None,
         };
         runtime
             .catalog_mut()

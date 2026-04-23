@@ -137,6 +137,7 @@ impl EngineRuntime {
             foreign_keys,
             primary_key_columns,
             next_row_id: 1,
+            pk_index_root: None,
         };
         validate_generated_columns(self, &table)?;
         if table.temporary {
@@ -199,7 +200,7 @@ impl EngineRuntime {
             .tables
             .insert(statement.table_name.clone(), table.clone());
         self.tables_mut()
-            .insert(statement.table_name.clone(), Arc::new(TableData::default()));
+            .insert(statement.table_name.clone(), TableData::default().into());
 
         if !table.primary_key_columns.is_empty() {
             self.insert_index_schema(IndexSchema {
@@ -610,7 +611,7 @@ impl EngineRuntime {
             let entry = self.tables_mut().get_mut(target).ok_or_else(|| {
                 DbError::internal(format!("table data for {} is missing", target))
             })?;
-            let data = Arc::make_mut(entry);
+            let data = entry.resident_data_mut();
             data.rows.clear();
 
             if restart_identity {
@@ -755,6 +756,7 @@ impl EngineRuntime {
                         .ok_or_else(|| {
                             DbError::internal(format!("table data for {table_name} is missing"))
                         })?
+                        .resident_data()
                         .rows
                         .is_empty();
                     if !column.nullable && matches!(fill_value, Value::Null) && has_rows {
@@ -767,7 +769,7 @@ impl EngineRuntime {
                         let entry = self.tables_mut().get_mut(table_name).ok_or_else(|| {
                             DbError::internal(format!("table data for {table_name} is missing"))
                         })?;
-                        for row in &mut Arc::make_mut(entry).rows {
+                        for row in &mut entry.resident_data_mut().rows {
                             row.values.push(fill_value.clone());
                         }
                     }
@@ -818,7 +820,7 @@ impl EngineRuntime {
                         let entry = self.tables_mut().get_mut(table_name).ok_or_else(|| {
                             DbError::internal(format!("table data for {table_name} is missing"))
                         })?;
-                        for row in &mut Arc::make_mut(entry).rows {
+                        for row in &mut entry.resident_data_mut().rows {
                             row.values.remove(index);
                         }
                     }
@@ -904,7 +906,7 @@ impl EngineRuntime {
                         let entry = self.tables_mut().get_mut(table_name).ok_or_else(|| {
                             DbError::internal(format!("table data for {table_name} is missing"))
                         })?;
-                        for row in &mut Arc::make_mut(entry).rows {
+                        for row in &mut entry.resident_data_mut().rows {
                             row.values[index] =
                                 super::cast_value(row.values[index].clone(), *new_type)?;
                         }
@@ -987,6 +989,7 @@ impl EngineRuntime {
                     .ok_or_else(|| {
                         DbError::internal(format!("table data for {table_name} is missing"))
                     })?
+                    .resident_data()
                     .rows
                 {
                     let expr = parse_expression_sql(&candidate.expression_sql)?;
@@ -1111,6 +1114,7 @@ impl EngineRuntime {
                     .ok_or_else(|| {
                         DbError::internal(format!("table data for {table_name} is missing"))
                     })?
+                    .resident_data()
                     .rows
                     .iter()
                     .try_for_each(|row| {
@@ -1401,6 +1405,7 @@ fn validate_existing_rows_with_staged_table(
         .tables
         .get(table_name)
         .ok_or_else(|| DbError::internal(format!("table data for {table_name} is missing")))?
+        .resident_data()
         .rows
         .clone();
     let validation = rows

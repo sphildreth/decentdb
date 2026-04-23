@@ -33,6 +33,9 @@ use chrono::{
     Timelike, Utc,
 };
 
+use crate::btree::read::find_exact as btree_find_exact;
+use crate::btree::table::free_table_btree;
+use crate::btree::write::Btree;
 use crate::catalog::{
     identifiers_equal, CatalogState, ColumnSchema, IndexKind, IndexSchema, IndexStats, SchemaInfo,
     TableSchema, TableStats, ViewSchema,
@@ -75,6 +78,8 @@ const TABLE_PAYLOAD_MAGIC: &[u8; 8] = b"DDBTBL01";
 const GENERATED_COLUMNS_SECTION_MAGIC: &[u8; 8] = b"DDBGCM02";
 const INDEX_INCLUDE_COLUMNS_SECTION_MAGIC: &[u8; 8] = b"DDBICL1\0";
 const SCHEMAS_SECTION_MAGIC: &[u8; 8] = b"DDBSCH01";
+const PK_INDEX_ROOTS_SECTION_MAGIC: &[u8; 8] = b"DDBPKR01";
+const SIGNED_ROW_ID_BIAS: u64 = 0x8000_0000_0000_0000;
 static RANDOM_STATE: AtomicU64 = AtomicU64::new(0);
 
 fn generated_columns_are_stored(table: &TableSchema) -> bool {
@@ -126,6 +131,12 @@ pub(crate) struct StoredRow {
     pub(crate) values: Vec<Value>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RowLocatorV1 {
+    byte_offset: u32,
+    byte_len: u32,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct TableData {
     pub(crate) rows: Vec<StoredRow>,
@@ -175,12 +186,136 @@ impl TableData {
     }
 }
 
+pub(crate) enum TableRowIter<'a> {
+    Empty(std::iter::Empty<&'a StoredRow>),
+    Resident(std::slice::Iter<'a, StoredRow>),
+}
+
+impl<'a> Iterator for TableRowIter<'a> {
+    type Item = &'a StoredRow;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Empty(iter) => iter.next(),
+            Self::Resident(iter) => iter.next(),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            Self::Empty(iter) => iter.size_hint(),
+            Self::Resident(iter) => iter.size_hint(),
+        }
+    }
+}
+
+impl ExactSizeIterator for TableRowIter<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Empty(iter) => iter.len(),
+            Self::Resident(iter) => iter.len(),
+        }
+    }
+}
+
+impl<'a> TableRowIter<'a> {
+    fn empty() -> Self {
+        Self::Empty(std::iter::empty())
+    }
+}
+
+#[derive(Clone, Copy)]
+enum VisibleTableRowSource<'a> {
+    Temp(&'a TableData),
+    Base(&'a TableRowSource),
+}
+
+impl<'a> VisibleTableRowSource<'a> {
+    fn rows(&self) -> TableRowIter<'a> {
+        match self {
+            Self::Temp(data) => TableRowIter::Resident(data.rows.iter()),
+            Self::Base(source) => source.rows(),
+        }
+    }
+
+    fn row_count(&self) -> usize {
+        match self {
+            Self::Temp(data) => data.rows.len(),
+            Self::Base(source) => source.row_count(),
+        }
+    }
+
+    fn row_by_id(&self, row_id: i64) -> Option<&'a StoredRow> {
+        match self {
+            Self::Temp(data) => data.row_by_id(row_id),
+            Self::Base(source) => source.row_by_id(row_id),
+        }
+    }
+
+    fn row_at_position(&self, position: usize) -> Option<&'a StoredRow> {
+        match self {
+            Self::Temp(data) => data.rows.get(position),
+            Self::Base(source) => source.row_at_position(position),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum TableRowSource {
+    Resident(Arc<TableData>),
+}
+
+impl TableRowSource {
+    pub(crate) fn rows(&self) -> TableRowIter<'_> {
+        match self {
+            Self::Resident(data) => TableRowIter::Resident(data.rows.iter()),
+        }
+    }
+
+    pub(crate) fn resident_data(&self) -> &TableData {
+        match self {
+            Self::Resident(data) => data.as_ref(),
+        }
+    }
+
+    fn resident_data_mut(&mut self) -> &mut TableData {
+        match self {
+            Self::Resident(data) => Arc::make_mut(data),
+        }
+    }
+
+    fn row_count(&self) -> usize {
+        self.rows().len()
+    }
+
+    fn row_by_id(&self, row_id: i64) -> Option<&StoredRow> {
+        self.resident_data().row_by_id(row_id)
+    }
+
+    fn row_at_position(&self, position: usize) -> Option<&StoredRow> {
+        match self {
+            Self::Resident(data) => data.rows.get(position),
+        }
+    }
+
+    fn approximate_heap_bytes(&self) -> usize {
+        self.resident_data().approximate_heap_bytes()
+    }
+}
+
+impl From<TableData> for TableRowSource {
+    fn from(data: TableData) -> Self {
+        Self::Resident(Arc::new(data))
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct PersistedTableState {
     pub(crate) pointer: OverflowPointer,
     pub(crate) checksum: u32,
     pub(crate) row_count: usize,
     pub(crate) tail: OverflowTailInfo,
+    pub(crate) pk_index_root: Option<PageId>,
 }
 
 impl Default for PersistedTableState {
@@ -194,6 +329,7 @@ impl Default for PersistedTableState {
             checksum: 0,
             row_count: 0,
             tail: OverflowTailInfo::default(),
+            pk_index_root: None,
         }
     }
 }
@@ -487,7 +623,7 @@ pub(super) enum PendingIndexInsert {
 #[derive(Debug)]
 pub(crate) struct EngineRuntime {
     pub(crate) catalog: Arc<CatalogState>,
-    pub(crate) tables: Arc<BTreeMap<String, Arc<TableData>>>,
+    pub(crate) tables: Arc<BTreeMap<String, TableRowSource>>,
     pub(crate) temp_tables: Arc<BTreeMap<String, TableSchema>>,
     pub(crate) temp_table_data: Arc<BTreeMap<String, Arc<TableData>>>,
     pub(crate) temp_views: Arc<BTreeMap<String, ViewSchema>>,
@@ -624,7 +760,7 @@ impl EngineRuntime {
         Arc::make_mut(&mut self.catalog)
     }
 
-    fn tables_mut(&mut self) -> &mut BTreeMap<String, Arc<TableData>> {
+    fn tables_mut(&mut self) -> &mut BTreeMap<String, TableRowSource> {
         Arc::make_mut(&mut self.tables)
     }
 
@@ -640,7 +776,7 @@ impl EngineRuntime {
         let canonical = map_key_ci(self.tables.as_ref(), name)?;
         let map = self.tables_mut();
         let entry = map.get_mut(&canonical)?;
-        Some(Arc::make_mut(entry))
+        Some(entry.resident_data_mut())
     }
 
     fn entry_temp_table_data_mut(&mut self, name: &str) -> Option<&mut TableData> {
@@ -822,7 +958,11 @@ impl EngineRuntime {
     pub(crate) fn table_memory_breakdown(&self) -> Vec<(String, usize, usize)> {
         let mut out = Vec::with_capacity(self.tables.len());
         for (name, data) in self.tables.iter() {
-            out.push((name.clone(), data.rows.len(), data.approximate_heap_bytes()));
+            out.push((
+                name.clone(),
+                data.row_count(),
+                data.approximate_heap_bytes(),
+            ));
         }
         out
     }
@@ -836,7 +976,7 @@ impl EngineRuntime {
         let mut rows: u64 = 0;
         let mut bytes: u64 = 0;
         for data in self.tables.values() {
-            rows = rows.saturating_add(data.rows.len() as u64);
+            rows = rows.saturating_add(data.row_count() as u64);
             bytes = bytes.saturating_add(data.approximate_heap_bytes() as u64);
         }
         let table_count = u32::try_from(self.tables.len()).unwrap_or(u32::MAX);
@@ -987,7 +1127,7 @@ impl EngineRuntime {
                 ps.row_count = data.rows.len();
                 ps.tail = read_uncompressed_overflow_tail(store, ps.pointer)?.unwrap_or_default();
             }
-            self.tables_mut().insert(table_name.clone(), Arc::new(data));
+            self.tables_mut().insert(table_name.clone(), data.into());
             tables_loaded.push(table_name.clone());
             self.deferred_tables.remove(table_name);
         }
@@ -1030,7 +1170,7 @@ impl EngineRuntime {
                 let data = self.tables.get(&canonical_table_name).ok_or_else(|| {
                     DbError::internal(format!("table data for {table_name} is missing"))
                 })?;
-                let data: &TableData = data.as_ref();
+                let data = data.resident_data();
                 let previous_state = self
                     .persisted_tables
                     .get(&canonical_table_name)
@@ -1068,12 +1208,30 @@ impl EngineRuntime {
                                     checksum,
                                     row_count: data.rows.len(),
                                     tail,
+                                    pk_index_root: previous_state.pk_index_root,
                                 },
                             );
                             // Invalidate chain cache — the append path
                             // modified the chain without hashing.
                             self.overflow_chain_caches.remove(&canonical_table_name);
-                            self.cache_payload_remove(&canonical_table_name);
+                            if db.config().persistent_pk_index {
+                                let payload = Arc::new(read_overflow(&store, pointer)?);
+                                let pk_index_root =
+                                    build_persistent_pk_index_root(db, payload.as_slice())?;
+                                replace_table_pk_index_root(
+                                    self,
+                                    db,
+                                    &canonical_table_name,
+                                    pk_index_root,
+                                )?;
+                                self.cache_payload_insert(
+                                    canonical_table_name.clone(),
+                                    Arc::clone(&payload),
+                                );
+                            } else {
+                                replace_table_pk_index_root(self, db, &canonical_table_name, None)?;
+                                self.cache_payload_remove(&canonical_table_name);
+                            }
                             continue;
                         }
                     }
@@ -1139,8 +1297,15 @@ impl EngineRuntime {
                         checksum,
                         row_count: data.rows.len(),
                         tail,
+                        pk_index_root: previous_state.pk_index_root,
                     },
                 );
+                let pk_index_root = if db.config().persistent_pk_index {
+                    build_persistent_pk_index_root(db, payload.as_slice())?
+                } else {
+                    None
+                };
+                replace_table_pk_index_root(self, db, &canonical_table_name, pk_index_root)?;
                 self.cache_payload_insert(canonical_table_name, Arc::new(payload));
             }
             for table_name in removed_tables {
@@ -1151,6 +1316,9 @@ impl EngineRuntime {
                 self.cache_payload_remove(&table_name);
                 if state.pointer.head_page_id != 0 {
                     free_overflow(&mut store, state.pointer.head_page_id)?;
+                }
+                if state.pk_index_root.is_some() {
+                    free_table_btree(&mut store, state.pk_index_root)?;
                 }
             }
         }
@@ -1222,6 +1390,7 @@ impl EngineRuntime {
     pub(crate) fn has_checkpoint_compaction_candidates(&self) -> bool {
         self.persisted_tables.values().any(|state| {
             state.pointer.head_page_id != 0
+                && state.pk_index_root.is_none()
                 && !state.pointer.is_compressed()
                 && usize::try_from(state.pointer.logical_len)
                     .ok()
@@ -1233,6 +1402,69 @@ impl EngineRuntime {
                     .ok()
                     .is_some_and(|len| len >= AUTO_MIN_PAYLOAD_BYTES)
         })
+    }
+
+    pub(crate) fn backfill_missing_persistent_pk_indexes(
+        &mut self,
+        db: &crate::db::Db,
+    ) -> Result<bool> {
+        let table_names = self
+            .catalog
+            .tables
+            .iter()
+            .filter(|(_, table)| table.pk_index_root.is_none())
+            .filter_map(|(table_name, _)| {
+                self.persisted_tables
+                    .get(table_name)
+                    .filter(|state| state.pointer.head_page_id != 0)
+                    .map(|_| table_name.clone())
+            })
+            .collect::<Vec<_>>();
+        if table_names.is_empty() {
+            return Ok(false);
+        }
+
+        let mut changed = false;
+        for table_name in table_names {
+            let Some(previous_state) = self.persisted_tables.get(&table_name).copied() else {
+                continue;
+            };
+
+            let mut store = DbTxnPageStore { db };
+            let payload = Arc::new(read_overflow(&store, previous_state.pointer)?);
+            let pointer = if previous_state.pointer.is_compressed() {
+                rewrite_overflow(
+                    &mut store,
+                    previous_state.pointer,
+                    payload.as_slice(),
+                    CompressionMode::Never,
+                )?
+            } else {
+                previous_state.pointer
+            };
+            let tail = read_uncompressed_overflow_tail(&store, pointer)?.unwrap_or_default();
+            let checksum = crc32c_parts(&[payload.as_slice()]);
+            self.persisted_tables.insert(
+                table_name.clone(),
+                PersistedTableState {
+                    pointer,
+                    checksum,
+                    row_count: previous_state.row_count,
+                    tail,
+                    pk_index_root: previous_state.pk_index_root,
+                },
+            );
+            self.cache_payload_insert(table_name.clone(), Arc::clone(&payload));
+            self.overflow_chain_caches.remove(&table_name);
+            let chain_cache = build_overflow_chain_cache(&store, pointer.head_page_id)?;
+            self.overflow_chain_caches
+                .insert(table_name.clone(), chain_cache);
+
+            let pk_index_root = build_persistent_pk_index_root(db, payload.as_slice())?;
+            replace_table_pk_index_root(self, db, &table_name, pk_index_root)?;
+            changed = true;
+        }
+        Ok(changed)
     }
 
     pub(crate) fn compact_persisted_payloads_for_checkpoint(
@@ -1250,6 +1482,7 @@ impl EngineRuntime {
                 };
                 let previous_pointer = previous_state.pointer;
                 if previous_pointer.head_page_id == 0
+                    || previous_state.pk_index_root.is_some()
                     || previous_pointer.is_compressed()
                     || usize::try_from(previous_pointer.logical_len)
                         .ok()
@@ -1283,6 +1516,7 @@ impl EngineRuntime {
                         checksum: previous_state.checksum,
                         row_count: previous_state.row_count,
                         tail,
+                        pk_index_root: previous_state.pk_index_root,
                     },
                 );
                 self.cache_payload_insert(table_name.clone(), payload);
@@ -1333,6 +1567,7 @@ impl EngineRuntime {
                 template.schema_cookie == self.catalog.schema_cookie
                     && template.table_next_row_id_offsets.len() == self.catalog.tables.len()
                     && template.table_state_offsets.len() == self.catalog.tables.len()
+                    && template.table_pk_index_root_offsets.len() == self.catalog.tables.len()
                     && self.catalog.tables.keys().all(|table_name| {
                         template.table_next_row_id_offsets.contains_key(table_name)
                     })
@@ -1341,6 +1576,11 @@ impl EngineRuntime {
                         .tables
                         .keys()
                         .all(|table_name| template.table_state_offsets.contains_key(table_name))
+                    && self.catalog.tables.keys().all(|table_name| {
+                        template
+                            .table_pk_index_root_offsets
+                            .contains_key(table_name)
+                    })
             });
 
         if !use_template {
@@ -1349,6 +1589,7 @@ impl EngineRuntime {
                 schema_cookie: self.catalog.schema_cookie,
                 table_next_row_id_offsets: encoded.table_next_row_id_offsets,
                 table_state_offsets: encoded.table_state_offsets,
+                table_pk_index_root_offsets: encoded.table_pk_index_root_offsets,
                 bytes: encoded.bytes,
             });
         }
@@ -1377,6 +1618,19 @@ impl EngineRuntime {
                 .copied()
                 .unwrap_or_default();
             patch_manifest_table_state(&mut template.bytes, *offset, state)?;
+        }
+        for (table_name, offset) in &template.table_pk_index_root_offsets {
+            let pk_index_root = self
+                .catalog
+                .tables
+                .get(table_name)
+                .map(|table| table.pk_index_root)
+                .ok_or_else(|| {
+                    DbError::internal(format!(
+                        "manifest pk_index_root offset referenced unknown table {table_name}"
+                    ))
+                })?;
+            patch_manifest_table_pk_index_root(&mut template.bytes, *offset, pk_index_root)?;
         }
         Ok(template.bytes.as_slice())
     }
@@ -1485,11 +1739,55 @@ impl EngineRuntime {
             return self.temp_table_data(&table.name);
         }
         let table_name = self.catalog.table(name)?.name.clone();
-        self.tables.get(&table_name).map(|arc| arc.as_ref())
+        self.tables
+            .get(&table_name)
+            .map(TableRowSource::resident_data)
+    }
+
+    pub(super) fn table_row_source(&self, name: &str) -> Option<&TableRowSource> {
+        if self.temp_view(name).is_some() {
+            return None;
+        }
+        let table_name = self.catalog.table(name)?.name.clone();
+        self.tables.get(&table_name)
+    }
+
+    fn visible_table_row_source_in_scope(
+        &self,
+        name: &str,
+        _scope: NameResolutionScope,
+    ) -> Option<VisibleTableRowSource<'_>> {
+        if self.temp_view(name).is_some() {
+            return None;
+        }
+        if let Some(table) = self.temp_table_schema(name) {
+            return self
+                .temp_table_data(&table.name)
+                .map(VisibleTableRowSource::Temp);
+        }
+        let table_name = self.catalog.table(name)?.name.clone();
+        self.tables
+            .get(&table_name)
+            .map(VisibleTableRowSource::Base)
+    }
+
+    fn visible_table_row_source(&self, name: &str) -> Option<VisibleTableRowSource<'_>> {
+        self.visible_table_row_source_in_scope(name, NameResolutionScope::Session)
     }
 
     pub(super) fn table_data(&self, name: &str) -> Option<&TableData> {
         self.table_data_in_scope(name, NameResolutionScope::Session)
+    }
+
+    pub(crate) fn loaded_tables(&self) -> impl Iterator<Item = (&String, &TableData)> {
+        self.tables
+            .iter()
+            .map(|(name, source)| (name, source.resident_data()))
+    }
+
+    pub(super) fn persisted_table_state(&self, name: &str) -> Option<PersistedTableState> {
+        let table_name = self.catalog.table(name)?.name.clone();
+        self.persisted_tables.get(&table_name).copied()
     }
 
     pub(super) fn table_data_for_schema<'a>(
@@ -2175,7 +2473,10 @@ impl EngineRuntime {
             return Ok(None);
         }
 
-        let row_count = self.table_data(name).map_or(0, |data| data.rows.len());
+        let row_count = self.visible_table_row_source(name).map_or_else(
+            || self.table_data(name).map_or(0, |data| data.rows.len()),
+            |source| source.row_count(),
+        );
         let row_count = i64::try_from(row_count)
             .map_err(|_| DbError::sql(format!("table {name} exceeds COUNT(*) row-count limits")))?;
         let column_name = alias.clone().unwrap_or_else(|| infer_expr_name(expr, 1));
@@ -2229,9 +2530,7 @@ impl EngineRuntime {
         if !generated_columns_are_stored(table_schema) {
             return Ok(None);
         }
-        let Some(data) = self.table_data(name) else {
-            return Ok(None);
-        };
+        let source = self.visible_table_row_source(name);
         let binding_name = alias.as_deref().unwrap_or(name);
 
         let Expr::Column {
@@ -2408,7 +2707,10 @@ impl EngineRuntime {
         };
 
         let mut groups = Vec::<SimpleGroupedNumericAggregate>::new();
-        for stored_row in &data.rows {
+        for stored_row in source
+            .map(|source| source.rows())
+            .unwrap_or_else(TableRowIter::empty)
+        {
             if !simple_range_bound_matches(
                 &stored_row.values[filter_column_index],
                 lower_bound.as_ref(),
@@ -2562,9 +2864,7 @@ impl EngineRuntime {
         {
             return Ok(None);
         }
-        let Some(filtered_data) = self.table_data(filtered_table) else {
-            return Ok(None);
-        };
+        let filtered_source = self.visible_table_row_source(filtered_table);
         let Some(filter_index) = self.catalog.indexes.values().find(|index| {
             identifiers_equal(&index.table_name, filtered_table)
                 && index.fresh
@@ -2595,9 +2895,7 @@ impl EngineRuntime {
             .iter()
             .position(|column| identifiers_equal(&column.name, filtered_join_column))
             .ok_or_else(|| DbError::sql(format!("unknown column {filtered_join_column}")))?;
-        let Some(probe_data) = self.table_data(probe_table) else {
-            return Ok(None);
-        };
+        let probe_source = self.visible_table_row_source(probe_table);
         let is_probe_rowid_alias = crate::exec::dml::row_id_alias_column_name(probe_schema)
             .is_some_and(|name| identifiers_equal(name, probe_join_column));
 
@@ -2649,14 +2947,17 @@ impl EngineRuntime {
             .transpose()?
             .map(|value| usize::try_from(value.max(0)).unwrap_or(usize::MAX));
 
-        let use_probe_row_position_map = probe_data
-            .rows
-            .len()
-            .saturating_mul(filtered_data.rows.len())
+        let use_probe_row_position_map = probe_source
+            .map_or(0, |source| source.row_count())
+            .saturating_mul(filtered_source.map_or(0, |source| source.row_count()))
             > 8_192;
         let probe_row_positions = if use_probe_row_position_map {
             let mut positions = Int64Map::<usize>::default();
-            for (position, row) in probe_data.rows.iter().enumerate() {
+            for (position, row) in probe_source
+                .map(|source| source.rows())
+                .unwrap_or_else(TableRowIter::empty)
+                .enumerate()
+            {
                 positions.insert(row.row_id, position);
             }
             Some(positions)
@@ -2673,7 +2974,9 @@ impl EngineRuntime {
             if stop || projection_error.is_some() {
                 return;
             }
-            let Some(filtered_row) = filtered_data.row_by_id(filtered_row_id) else {
+            let Some(filtered_row) =
+                filtered_source.and_then(|source| source.row_by_id(filtered_row_id))
+            else {
                 return;
             };
             let Some(join_value) = filtered_row.values.get(filtered_join_index) else {
@@ -2710,9 +3013,15 @@ impl EngineRuntime {
                     let Some(probe_position) = positions.get(&row_id).copied() else {
                         return;
                     };
-                    &probe_data.rows[probe_position].values
+                    let Some(probe_row) =
+                        probe_source.and_then(|source| source.row_at_position(probe_position))
+                    else {
+                        return;
+                    };
+                    &probe_row.values
                 } else {
-                    let Some(probe_row) = probe_data.row_by_id(row_id) else {
+                    let Some(probe_row) = probe_source.and_then(|source| source.row_by_id(row_id))
+                    else {
                         return;
                     };
                     &probe_row.values
@@ -3548,8 +3857,10 @@ impl EngineRuntime {
 
     fn refresh_table_stats(&mut self, table_name: &str) -> Result<()> {
         let row_count = self
-            .table_data(table_name)
-            .map(|table| i64::try_from(table.rows.len()))
+            .table_row_source(table_name)
+            .map(TableRowSource::row_count)
+            .or_else(|| self.table_data(table_name).map(|table| table.rows.len()))
+            .map(i64::try_from)
             .transpose()
             .map_err(|_| {
                 DbError::sql(format!(
@@ -3641,17 +3952,18 @@ impl EngineRuntime {
         if !generated_columns_are_stored(table_schema) {
             return Ok(None);
         }
-        let Some(data) = self.table_data(name) else {
-            return Ok(None);
-        };
+        let row_source = self.visible_table_row_source(name);
         let Some((projection_indexes, column_names)) =
             self.simple_projection_plan(select, name, alias, table_schema)
         else {
             return Ok(None);
         };
 
-        let mut rows = Vec::with_capacity(data.rows.len());
-        for stored_row in &data.rows {
+        let mut rows = Vec::with_capacity(row_source.map_or(0, |source| source.row_count()));
+        for stored_row in row_source
+            .map(|source| source.rows())
+            .unwrap_or_else(TableRowIter::empty)
+        {
             let mut projected = Vec::with_capacity(projection_indexes.len());
             for index in &projection_indexes {
                 projected.push(stored_row.values[*index].clone());
@@ -3700,9 +4012,7 @@ impl EngineRuntime {
         if !generated_columns_are_stored(table_schema) {
             return Ok(None);
         }
-        let Some(data) = self.table_data(name) else {
-            return Ok(None);
-        };
+        let row_source = self.visible_table_row_source(name);
         let Some((projection_indexes, column_names)) =
             self.simple_projection_plan(select, name, alias, table_schema)
         else {
@@ -3806,8 +4116,11 @@ impl EngineRuntime {
             .transpose()?
             .map(|value| usize::try_from(value.max(0)).unwrap_or(usize::MAX));
 
-        let mut rows = Vec::with_capacity(data.rows.len());
-        for stored_row in &data.rows {
+        let mut rows = Vec::with_capacity(row_source.map_or(0, |source| source.row_count()));
+        for stored_row in row_source
+            .map(|source| source.rows())
+            .unwrap_or_else(TableRowIter::empty)
+        {
             let candidate = &stored_row.values[filter_column_index];
             if !simple_range_bound_matches(candidate, lower_bound.as_ref(), upper_bound.as_ref())? {
                 continue;
@@ -3859,6 +4172,140 @@ impl EngineRuntime {
         query: &Query,
         params: &[Value],
     ) -> Result<Option<QueryResult>> {
+        let Some(plan) = self.analyze_simple_indexed_projection_query(query, params)? else {
+            return Ok(None);
+        };
+        let row_source = self.visible_table_row_source(plan.table_name);
+
+        if row_id_alias_column_name(plan.table_schema)
+            .is_some_and(|column_name| identifiers_equal(column_name, plan.filter_column))
+        {
+            let mut rows = Vec::new();
+            if let Some(row_id) = value_as_int64(&plan.lookup_value) {
+                if let Some(stored_row) = row_source.and_then(|source| source.row_by_id(row_id)) {
+                    rows.push(project_simple_projection_row(
+                        stored_row,
+                        &plan.projection_indexes,
+                    ));
+                }
+            }
+            return Ok(Some(QueryResult::with_rows(plan.column_names, rows)));
+        }
+
+        let Some(index) = self.catalog.indexes.values().find(|index| {
+            identifiers_equal(&index.table_name, plan.table_name)
+                && index.fresh
+                && index.kind == IndexKind::Btree
+                && index.predicate_sql.is_none()
+                && index.columns.len() == 1
+                && index.columns[0]
+                    .column_name
+                    .as_deref()
+                    .is_some_and(|index_column| identifiers_equal(index_column, plan.filter_column))
+                && index.columns[0].expression_sql.is_none()
+        }) else {
+            return Ok(None);
+        };
+        let Some(RuntimeIndex::Btree { keys }) = self.index(&index.name) else {
+            return Ok(None);
+        };
+        let row_ids = keys.row_ids_for_value_set(&plan.lookup_value)?;
+
+        let mut rows = Vec::with_capacity(row_ids.len());
+        row_ids.for_each(|row_id| {
+            let Some(stored_row) = row_source.and_then(|source| source.row_by_id(row_id)) else {
+                return;
+            };
+            rows.push(project_simple_projection_row(
+                stored_row,
+                &plan.projection_indexes,
+            ));
+        });
+        Ok(Some(QueryResult::with_rows(plan.column_names, rows)))
+    }
+
+    pub(crate) fn try_execute_simple_deferred_indexed_projection_query(
+        &self,
+        query: &Query,
+        params: &[Value],
+        pager: &PagerHandle,
+        wal: &WalHandle,
+        snapshot_lsn: u64,
+        use_persistent_pk_index: bool,
+    ) -> Result<Option<QueryResult>> {
+        let Some(plan) = self.analyze_simple_indexed_projection_query(query, params)? else {
+            return Ok(None);
+        };
+        if self.table_data(plan.table_name).is_some() || !self.has_deferred_tables() {
+            return Ok(None);
+        }
+        if !self
+            .deferred_table_names()
+            .any(|candidate| identifiers_equal(candidate, plan.table_name))
+        {
+            return Ok(None);
+        }
+        if !row_id_alias_column_name(plan.table_schema)
+            .is_some_and(|column_name| identifiers_equal(column_name, plan.filter_column))
+        {
+            return Ok(None);
+        }
+
+        let Some(state) = self.persisted_table_state(plan.table_name) else {
+            return Ok(None);
+        };
+
+        let mut rows = Vec::new();
+        if let Some(row_id) = value_as_int64(&plan.lookup_value) {
+            let store = SnapshotPageStore {
+                pager,
+                wal,
+                snapshot_lsn,
+            };
+            let stored_row = if use_persistent_pk_index {
+                if let Some(pk_index_root) = plan.table_schema.pk_index_root {
+                    let locator = btree_find_exact(
+                        &store,
+                        Some(pk_index_root),
+                        encode_row_id_locator_key(row_id),
+                    )?
+                    .map(|payload| decode_row_locator(&payload))
+                    .transpose()?;
+                    if let Some(locator) = locator {
+                        read_deferred_row_by_locator_from_table_payload(
+                            &store,
+                            state.pointer,
+                            row_id,
+                            locator,
+                        )?
+                    } else {
+                        None
+                    }
+                } else if !state.pointer.is_compressed() {
+                    read_deferred_row_by_id_from_table_payload(&store, state.pointer, row_id)?
+                } else {
+                    None
+                }
+            } else if !state.pointer.is_compressed() {
+                read_deferred_row_by_id_from_table_payload(&store, state.pointer, row_id)?
+            } else {
+                None
+            };
+            if let Some(stored_row) = stored_row {
+                rows.push(project_simple_projection_row(
+                    &stored_row,
+                    &plan.projection_indexes,
+                ));
+            }
+        }
+        Ok(Some(QueryResult::with_rows(plan.column_names, rows)))
+    }
+
+    fn analyze_simple_indexed_projection_query<'a>(
+        &'a self,
+        query: &'a Query,
+        params: &[Value],
+    ) -> Result<Option<SimpleIndexedProjectionPlan<'a>>> {
         if !query.ctes.is_empty()
             || !query.order_by.is_empty()
             || query.limit.is_some()
@@ -3897,11 +4344,7 @@ impl EngineRuntime {
         if !generated_columns_are_stored(table_schema) {
             return Ok(None);
         }
-        let Some(data) = self.table_data(name) else {
-            return Ok(None);
-        };
         let binding_name = alias.as_deref().unwrap_or(name);
-
         let Some((filter_table, filter_column, value_expr)) = simple_btree_lookup(filter) else {
             return Ok(None);
         };
@@ -3912,7 +4355,7 @@ impl EngineRuntime {
             }
         }
 
-        let value = self.eval_expr(
+        let lookup_value = self.eval_expr(
             value_expr,
             &Dataset::empty(),
             &[],
@@ -3926,53 +4369,14 @@ impl EngineRuntime {
             return Ok(None);
         };
 
-        if row_id_alias_column_name(table_schema)
-            .is_some_and(|column_name| identifiers_equal(column_name, filter_column))
-        {
-            let mut rows = Vec::new();
-            if let Value::Int64(row_id) = value {
-                if let Some(stored_row) = data.row_by_id(row_id) {
-                    let mut projected = Vec::with_capacity(projection_indexes.len());
-                    for index in &projection_indexes {
-                        projected.push(stored_row.values[*index].clone());
-                    }
-                    rows.push(QueryRow::new(projected));
-                }
-            }
-            return Ok(Some(QueryResult::with_rows(column_names, rows)));
-        }
-
-        let Some(index) = self.catalog.indexes.values().find(|index| {
-            identifiers_equal(&index.table_name, name)
-                && index.fresh
-                && index.kind == IndexKind::Btree
-                && index.predicate_sql.is_none()
-                && index.columns.len() == 1
-                && index.columns[0]
-                    .column_name
-                    .as_deref()
-                    .is_some_and(|index_column| identifiers_equal(index_column, filter_column))
-                && index.columns[0].expression_sql.is_none()
-        }) else {
-            return Ok(None);
-        };
-        let Some(RuntimeIndex::Btree { keys }) = self.index(&index.name) else {
-            return Ok(None);
-        };
-        let row_ids = keys.row_ids_for_value_set(&value)?;
-
-        let mut rows = Vec::with_capacity(row_ids.len());
-        row_ids.for_each(|row_id| {
-            let Some(stored_row) = data.row_by_id(row_id) else {
-                return;
-            };
-            let mut projected = Vec::with_capacity(projection_indexes.len());
-            for index in &projection_indexes {
-                projected.push(stored_row.values[*index].clone());
-            }
-            rows.push(QueryRow::new(projected));
-        });
-        Ok(Some(QueryResult::with_rows(column_names, rows)))
+        Ok(Some(SimpleIndexedProjectionPlan {
+            table_name: name,
+            table_schema,
+            filter_column,
+            lookup_value,
+            projection_indexes,
+            column_names,
+        }))
     }
 
     fn simple_projection_plan(
@@ -4595,9 +4999,7 @@ impl EngineRuntime {
         if !generated_columns_are_stored(table) {
             return Ok(None);
         }
-        let Some(data) = self.table_data(name) else {
-            return Ok(None);
-        };
+        let row_source = self.table_row_source(name);
 
         if let Some((table_qualifier, column_name, value_expr)) = simple_btree_lookup(filter) {
             if !matches_filter_binding(name, alias, table_qualifier) {
@@ -4620,7 +5022,7 @@ impl EngineRuntime {
                 if let Some(RuntimeIndex::Btree { keys }) = self.index(&index.name) {
                     let row_ids = keys.row_ids_for_value_set(&value)?;
                     return self
-                        .dataset_from_row_id_set(table, data, alias, row_ids)
+                        .dataset_from_row_id_set(table, row_source, alias, row_ids)
                         .map(Some);
                 }
             }
@@ -4661,7 +5063,7 @@ impl EngineRuntime {
                         return self
                             .dataset_from_row_id_set(
                                 table,
-                                data,
+                                row_source,
                                 alias,
                                 RuntimeRowIdSet::Many(&row_ids),
                             )
@@ -4977,9 +5379,7 @@ impl EngineRuntime {
         if !generated_columns_are_stored(table) {
             return Ok(None);
         }
-        let Some(data) = self.table_data(table_name) else {
-            return Ok(None);
-        };
+        let row_source = self.table_row_source(table_name);
         let Some(index) = self.catalog.indexes.values().find(|index| {
             identifiers_equal(&index.table_name, table_name)
                 && index.fresh
@@ -5000,7 +5400,7 @@ impl EngineRuntime {
             return Ok(None);
         };
         let row_ids = keys.row_ids_for_value_set(&value)?;
-        self.dataset_from_row_id_set(table, data, alias, row_ids)
+        self.dataset_from_row_id_set(table, row_source, alias, row_ids)
             .map(Some)
     }
 
@@ -5019,10 +5419,7 @@ impl EngineRuntime {
         {
             return Ok(None);
         }
-        let empty_probe_data = TableData::default();
-        let probe_data = self
-            .table_data(plan.probe_table.name)
-            .unwrap_or(&empty_probe_data);
+        let probe_source = self.visible_table_row_source(plan.probe_table.name);
         let filtered_join_index = filtered_table
             .columns
             .iter()
@@ -5060,14 +5457,17 @@ impl EngineRuntime {
         } else {
             None
         };
-        let use_probe_row_position_map = probe_data
-            .rows
-            .len()
+        let use_probe_row_position_map = probe_source
+            .map_or(0, |source| source.row_count())
             .saturating_mul(plan.filtered_dataset.rows.len())
             > 8_192;
         let probe_row_positions = if use_probe_row_position_map {
             let mut positions = Int64Map::<usize>::default();
-            for (position, row) in probe_data.rows.iter().enumerate() {
+            for (position, row) in probe_source
+                .map(|source| source.rows())
+                .unwrap_or_else(TableRowIter::empty)
+                .enumerate()
+            {
                 positions.insert(row.row_id, position);
             }
             Some(positions)
@@ -5120,9 +5520,15 @@ impl EngineRuntime {
                     let Some(probe_position) = positions.get(&row_id).copied() else {
                         return;
                     };
-                    &probe_data.rows[probe_position].values
+                    let Some(probe_row) =
+                        probe_source.and_then(|source| source.row_at_position(probe_position))
+                    else {
+                        return;
+                    };
+                    &probe_row.values
                 } else {
-                    let Some(probe_row) = probe_data.row_by_id(row_id) else {
+                    let Some(probe_row) = probe_source.and_then(|source| source.row_by_id(row_id))
+                    else {
                         return;
                     };
                     &probe_row.values
@@ -5215,9 +5621,7 @@ impl EngineRuntime {
         if !generated_columns_are_stored(right_table) {
             return Ok(None);
         }
-        let Some(right_data) = self.table_data(right_name) else {
-            return Ok(None);
-        };
+        let right_source = self.visible_table_row_source(right_name);
         let is_probe_rowid_alias = crate::exec::dml::row_id_alias_column_name(right_table)
             .is_some_and(|name| identifiers_equal(name, right_join_column));
 
@@ -5251,11 +5655,17 @@ impl EngineRuntime {
             None
         };
 
-        let use_right_row_position_map =
-            right_data.rows.len().saturating_mul(left.rows.len()) > 8_192;
+        let use_right_row_position_map = right_source
+            .map_or(0, |source| source.row_count())
+            .saturating_mul(left.rows.len())
+            > 8_192;
         let right_row_positions = if use_right_row_position_map {
             let mut positions = Int64Map::<usize>::default();
-            for (position, row) in right_data.rows.iter().enumerate() {
+            for (position, row) in right_source
+                .map(|source| source.rows())
+                .unwrap_or_else(TableRowIter::empty)
+                .enumerate()
+            {
                 positions.insert(row.row_id, position);
             }
             Some(positions)
@@ -5299,9 +5709,15 @@ impl EngineRuntime {
                     let Some(right_position) = positions.get(&row_id).copied() else {
                         return;
                     };
-                    &right_data.rows[right_position].values
+                    let Some(right_row) =
+                        right_source.and_then(|source| source.row_at_position(right_position))
+                    else {
+                        return;
+                    };
+                    &right_row.values
                 } else {
-                    let Some(right_row) = right_data.row_by_id(row_id) else {
+                    let Some(right_row) = right_source.and_then(|source| source.row_by_id(row_id))
+                    else {
                         return;
                     };
                     &right_row.values
@@ -5575,14 +5991,14 @@ impl EngineRuntime {
     fn dataset_from_row_id_set(
         &self,
         table: &TableSchema,
-        data: &TableData,
+        row_source: Option<&TableRowSource>,
         alias: &Option<String>,
         row_ids: RuntimeRowIdSet<'_>,
     ) -> Result<Dataset> {
         let table_name = alias.clone().unwrap_or_else(|| table.name.clone());
         let mut rows = Vec::with_capacity(row_ids.len());
         row_ids.for_each(|row_id| {
-            if let Some(row) = data.row_by_id(row_id) {
+            if let Some(row) = row_source.and_then(|source| source.row_by_id(row_id)) {
                 rows.push(row.values.clone());
             }
         });
@@ -5604,11 +6020,21 @@ struct RootHeader {
     pointer: OverflowPointer,
 }
 
+struct SimpleIndexedProjectionPlan<'a> {
+    table_name: &'a str,
+    table_schema: &'a TableSchema,
+    filter_column: &'a str,
+    lookup_value: Value,
+    projection_indexes: Vec<usize>,
+    column_names: Vec<String>,
+}
+
 #[derive(Clone, Debug)]
 struct ManifestTemplate {
     schema_cookie: u32,
     table_next_row_id_offsets: BTreeMap<String, usize>,
     table_state_offsets: BTreeMap<String, usize>,
+    table_pk_index_root_offsets: BTreeMap<String, usize>,
     bytes: Vec<u8>,
 }
 
@@ -5617,6 +6043,7 @@ struct ManifestEncoding {
     bytes: Vec<u8>,
     table_next_row_id_offsets: BTreeMap<String, usize>,
     table_state_offsets: BTreeMap<String, usize>,
+    table_pk_index_root_offsets: BTreeMap<String, usize>,
 }
 
 #[derive(Debug)]
@@ -5655,6 +6082,118 @@ impl PageStore for SnapshotPageStore<'_> {
         Err(DbError::internal(
             "snapshot page store does not support writes",
         ))
+    }
+}
+
+struct OverflowPayloadCursor<'a, S: PageStore> {
+    store: &'a S,
+    next_page_id: PageId,
+    page: Option<Arc<[u8]>>,
+    chunk_offset: usize,
+    chunk_remaining: usize,
+    remaining: usize,
+}
+
+impl<'a, S: PageStore> OverflowPayloadCursor<'a, S> {
+    fn new(store: &'a S, pointer: OverflowPointer) -> Self {
+        Self {
+            store,
+            next_page_id: pointer.head_page_id,
+            page: None,
+            chunk_offset: OVERFLOW_HEADER_SIZE,
+            chunk_remaining: 0,
+            remaining: pointer.logical_len as usize,
+        }
+    }
+
+    fn read_i64(&mut self) -> Result<i64> {
+        let mut bytes = [0_u8; 8];
+        self.read_exact(&mut bytes)?;
+        Ok(i64::from_le_bytes(bytes))
+    }
+
+    fn read_u32(&mut self) -> Result<u32> {
+        let mut bytes = [0_u8; 4];
+        self.read_exact(&mut bytes)?;
+        Ok(u32::from_le_bytes(bytes))
+    }
+
+    fn read_vec(&mut self, len: usize) -> Result<Vec<u8>> {
+        let mut bytes = vec![0_u8; len];
+        self.read_exact(&mut bytes)?;
+        Ok(bytes)
+    }
+
+    fn read_exact(&mut self, out: &mut [u8]) -> Result<()> {
+        if out.len() > self.remaining {
+            return Err(DbError::corruption("overflow payload length mismatch"));
+        }
+        let mut written = 0;
+        while written < out.len() {
+            self.ensure_chunk()?;
+            let take = (out.len() - written).min(self.chunk_remaining);
+            if take == 0 {
+                return Err(DbError::corruption("overflow payload truncated"));
+            }
+            let page = self
+                .page
+                .as_ref()
+                .ok_or_else(|| DbError::corruption("overflow payload page is missing"))?;
+            out[written..written + take]
+                .copy_from_slice(&page[self.chunk_offset..self.chunk_offset + take]);
+            self.chunk_offset += take;
+            self.chunk_remaining -= take;
+            self.remaining -= take;
+            written += take;
+        }
+        Ok(())
+    }
+
+    fn skip(&mut self, len: usize) -> Result<()> {
+        if len > self.remaining {
+            return Err(DbError::corruption("overflow payload length mismatch"));
+        }
+        let mut skipped = 0;
+        while skipped < len {
+            self.ensure_chunk()?;
+            let take = (len - skipped).min(self.chunk_remaining);
+            if take == 0 {
+                return Err(DbError::corruption("overflow payload truncated"));
+            }
+            self.chunk_offset += take;
+            self.chunk_remaining -= take;
+            self.remaining -= take;
+            skipped += take;
+        }
+        Ok(())
+    }
+
+    fn ensure_chunk(&mut self) -> Result<()> {
+        while self.chunk_remaining == 0 {
+            if self.remaining == 0 {
+                return Ok(());
+            }
+            if self.next_page_id == 0 {
+                return Err(DbError::corruption("overflow payload truncated"));
+            }
+            let page = self.store.read_page(self.next_page_id)?;
+            if page.len() < OVERFLOW_HEADER_SIZE {
+                return Err(DbError::corruption("overflow page shorter than header"));
+            }
+            let next_page_id = u32::from_le_bytes(page[0..4].try_into().expect("header next page"));
+            let chunk_len = u32::from_le_bytes(page[4..8].try_into().expect("header chunk len"));
+            let chunk_end = OVERFLOW_HEADER_SIZE + chunk_len as usize;
+            if chunk_end > page.len() {
+                return Err(DbError::corruption(
+                    "overflow chunk length exceeds page payload",
+                ));
+            }
+            self.next_page_id = next_page_id;
+            self.page = Some(page);
+            self.chunk_offset = OVERFLOW_HEADER_SIZE;
+            self.chunk_remaining = chunk_len as usize;
+        }
+        Ok(())
     }
 }
 
@@ -6169,7 +6708,7 @@ fn build_runtime_index(
             index.name, index.table_name
         ))
     })?;
-    let data = runtime.table_data(&index.table_name).ok_or_else(|| {
+    let source = runtime.table_row_source(&index.table_name).ok_or_else(|| {
         DbError::corruption(format!("table data for {} is missing", index.table_name))
     })?;
 
@@ -6177,9 +6716,11 @@ fn build_runtime_index(
         IndexKind::Btree => {
             let int64_keys = btree_uses_typed_int64_keys(index, table);
             if index.unique && int64_keys {
-                let mut keys =
-                    HashMap::with_capacity_and_hasher(data.rows.len(), Int64HashBuilder::default());
-                for row in &data.rows {
+                let mut keys = HashMap::with_capacity_and_hasher(
+                    source.row_count(),
+                    Int64HashBuilder::default(),
+                );
+                for row in source.rows() {
                     let Some(key) = compute_index_key(runtime, index, table, &row.values)? else {
                         continue;
                     };
@@ -6200,7 +6741,7 @@ fn build_runtime_index(
                 })
             } else if index.unique {
                 let mut keys = BTreeMap::<Vec<u8>, i64>::new();
-                for row in &data.rows {
+                for row in source.rows() {
                     let Some(key) = compute_index_key(runtime, index, table, &row.values)? else {
                         continue;
                     };
@@ -6220,9 +6761,11 @@ fn build_runtime_index(
                     keys: RuntimeBtreeKeys::UniqueEncoded(keys),
                 })
             } else if int64_keys {
-                let mut keys: Int64Map<Vec<i64>> =
-                    HashMap::with_capacity_and_hasher(data.rows.len(), Int64HashBuilder::default());
-                for row in &data.rows {
+                let mut keys: Int64Map<Vec<i64>> = HashMap::with_capacity_and_hasher(
+                    source.row_count(),
+                    Int64HashBuilder::default(),
+                );
+                for row in source.rows() {
                     let Some(key) = compute_index_key(runtime, index, table, &row.values)? else {
                         continue;
                     };
@@ -6238,7 +6781,7 @@ fn build_runtime_index(
                 })
             } else {
                 let mut keys = BTreeMap::<Vec<u8>, Vec<i64>>::new();
-                for row in &data.rows {
+                for row in source.rows() {
                     let Some(key) = compute_index_key(runtime, index, table, &row.values)? else {
                         continue;
                     };
@@ -6256,7 +6799,7 @@ fn build_runtime_index(
         }
         IndexKind::Trigram => {
             let mut trigram = TrigramIndex::new(page_size, 100_000);
-            for row in &data.rows {
+            for row in source.rows() {
                 if !row_satisfies_index_predicate(runtime, index, table, &row.values)? {
                     continue;
                 }
@@ -6485,7 +7028,7 @@ fn encode_runtime_payload(runtime: &EngineRuntime) -> Result<Vec<u8>> {
         let data = runtime
             .tables
             .get(&table.name)
-            .map(|arc| (**arc).clone())
+            .map(|source| source.resident_data().clone())
             .unwrap_or_default();
         encode_u32(&mut output, data.rows.len() as u32);
         for row in data.rows {
@@ -6551,6 +7094,7 @@ fn decode_runtime_payload(bytes: &[u8]) -> Result<EngineRuntime> {
             foreign_keys: Vec::new(),
             primary_key_columns: Vec::new(),
             next_row_id: 1,
+            pk_index_root: None,
         };
         for _ in 0..column_count {
             let name = cursor.read_string()?;
@@ -6617,7 +7161,7 @@ fn decode_runtime_payload(bytes: &[u8]) -> Result<EngineRuntime> {
             .catalog_mut()
             .tables
             .insert(table_name.clone(), table);
-        runtime.tables_mut().insert(table_name, Arc::new(data));
+        runtime.tables_mut().insert(table_name, data.into());
     }
 
     let index_count = cursor.read_u32()?;
@@ -6686,6 +7230,9 @@ fn decode_runtime_payload(bytes: &[u8]) -> Result<EngineRuntime> {
     if cursor.offset < cursor.bytes.len() {
         decode_generated_columns_section(&mut cursor, &mut runtime.catalog_mut().tables)?;
     }
+    if cursor.offset < cursor.bytes.len() {
+        decode_pk_index_roots_section(&mut cursor, &mut runtime.catalog_mut().tables)?;
+    }
     Ok(runtime)
 }
 
@@ -6704,6 +7251,7 @@ fn encode_manifest_payload_with_offsets(
     let mut output = Vec::new();
     let mut table_next_row_id_offsets = BTreeMap::new();
     let mut table_state_offsets = BTreeMap::new();
+    let mut table_pk_index_root_offsets = BTreeMap::new();
     output.extend_from_slice(MANIFEST_PAYLOAD_MAGIC);
     encode_u32(&mut output, runtime.catalog.schema_cookie);
     encode_u32(&mut output, runtime.catalog.tables.len() as u32);
@@ -6807,10 +7355,16 @@ fn encode_manifest_payload_with_offsets(
     encode_schemas_section(&mut output, &runtime.catalog.schemas)?;
     encode_index_include_columns_section(&mut output, &runtime.catalog.indexes)?;
     encode_generated_columns_section(&mut output, &runtime.catalog.tables)?;
+    encode_pk_index_roots_section(
+        &mut output,
+        &runtime.catalog.tables,
+        Some(&mut table_pk_index_root_offsets),
+    )?;
     Ok(ManifestEncoding {
         bytes: output,
         table_next_row_id_offsets,
         table_state_offsets,
+        table_pk_index_root_offsets,
     })
 }
 
@@ -6851,6 +7405,23 @@ fn patch_manifest_table_state(
     Ok(())
 }
 
+fn patch_manifest_table_pk_index_root(
+    payload: &mut [u8],
+    offset: usize,
+    pk_index_root: Option<PageId>,
+) -> Result<()> {
+    let end = offset
+        .checked_add(4)
+        .ok_or_else(|| DbError::internal("manifest pk_index_root offset overflow"))?;
+    if end > payload.len() {
+        return Err(DbError::internal(
+            "manifest pk_index_root offset exceeded payload length",
+        ));
+    }
+    payload[offset..end].copy_from_slice(&pk_index_root.unwrap_or(0).to_le_bytes());
+    Ok(())
+}
+
 fn decode_manifest_payload<S: PageStore>(_store: &S, bytes: &[u8]) -> Result<EngineRuntime> {
     let mut cursor = Cursor::new(bytes);
     let magic = cursor.read_slice(MANIFEST_PAYLOAD_MAGIC.len())?;
@@ -6870,6 +7441,7 @@ fn decode_manifest_payload<S: PageStore>(_store: &S, bytes: &[u8]) -> Result<Eng
             foreign_keys: Vec::new(),
             primary_key_columns: Vec::new(),
             next_row_id: 1,
+            pk_index_root: None,
         };
         for _ in 0..column_count {
             let name = cursor.read_string()?;
@@ -6929,6 +7501,7 @@ fn decode_manifest_payload<S: PageStore>(_store: &S, bytes: &[u8]) -> Result<Eng
             },
             row_count: 0,
             tail: OverflowTailInfo::default(),
+            pk_index_root: None,
         };
         runtime
             .catalog_mut()
@@ -6944,7 +7517,7 @@ fn decode_manifest_payload<S: PageStore>(_store: &S, bytes: &[u8]) -> Result<Eng
             // Empty tables are immediately available.
             runtime
                 .tables_mut()
-                .insert(table_name, Arc::new(TableData::default()));
+                .insert(table_name, TableData::default().into());
         }
     }
 
@@ -7035,6 +7608,14 @@ fn decode_manifest_payload<S: PageStore>(_store: &S, bytes: &[u8]) -> Result<Eng
     if cursor.offset < cursor.bytes.len() {
         decode_generated_columns_section(&mut cursor, &mut runtime.catalog_mut().tables)?;
     }
+    if cursor.offset < cursor.bytes.len() {
+        decode_pk_index_roots_section(&mut cursor, &mut runtime.catalog_mut().tables)?;
+    }
+    for (table_name, table) in &runtime.catalog.tables {
+        if let Some(state) = runtime.persisted_tables.get_mut(table_name) {
+            state.pk_index_root = table.pk_index_root;
+        }
+    }
     Ok(runtime)
 }
 
@@ -7052,6 +7633,47 @@ fn encode_table_payload(data: &TableData) -> Result<Vec<u8>> {
         encode_bytes(&mut output, &encoded_row)?;
     }
     Ok(output)
+}
+
+fn build_persistent_pk_index_root(db: &crate::db::Db, payload: &[u8]) -> Result<Option<PageId>> {
+    let entries = build_row_locator_entries(payload)?;
+    let mut tree = Btree::new(DbTxnPageStore { db });
+    tree.replace_entries(entries)?;
+    let (_store, root_page_id) = tree.into_parts();
+    Ok(root_page_id)
+}
+
+fn replace_table_pk_index_root(
+    runtime: &mut EngineRuntime,
+    db: &crate::db::Db,
+    table_name: &str,
+    new_pk_index_root: Option<PageId>,
+) -> Result<()> {
+    let previous_pk_index_root = runtime
+        .persisted_tables
+        .get(table_name)
+        .and_then(|state| state.pk_index_root)
+        .or_else(|| {
+            runtime
+                .catalog
+                .tables
+                .get(table_name)
+                .and_then(|table| table.pk_index_root)
+        });
+    if let Some(previous_pk_index_root) = previous_pk_index_root {
+        let mut store = DbTxnPageStore { db };
+        free_table_btree(&mut store, Some(previous_pk_index_root))?;
+    }
+    let table = runtime
+        .catalog_mut()
+        .tables
+        .get_mut(table_name)
+        .ok_or_else(|| DbError::internal(format!("table schema for {table_name} is missing")))?;
+    table.pk_index_root = new_pk_index_root;
+    if let Some(state) = runtime.persisted_tables.get_mut(table_name) {
+        state.pk_index_root = new_pk_index_root;
+    }
+    Ok(())
 }
 
 /// Build a new payload by splicing only the modified rows into the cached
@@ -7396,6 +8018,28 @@ fn encode_schemas_section(
     Ok(())
 }
 
+fn encode_pk_index_roots_section(
+    output: &mut Vec<u8>,
+    tables: &BTreeMap<String, TableSchema>,
+    mut offsets: Option<&mut BTreeMap<String, usize>>,
+) -> Result<()> {
+    output.extend_from_slice(PK_INDEX_ROOTS_SECTION_MAGIC);
+    output.push(1);
+    encode_u32(
+        output,
+        u32::try_from(tables.len())
+            .map_err(|_| DbError::constraint("pk index root entry count exceeds u32"))?,
+    );
+    for table in tables.values() {
+        encode_string(output, &table.name)?;
+        if let Some(offsets) = offsets.as_deref_mut() {
+            offsets.insert(table.name.clone(), output.len());
+        }
+        encode_u32(output, table.pk_index_root.unwrap_or(0));
+    }
+    Ok(())
+}
+
 fn decode_schemas_section(
     cursor: &mut Cursor<'_>,
     schemas: &mut BTreeMap<String, SchemaInfo>,
@@ -7533,6 +8177,41 @@ fn decode_generated_columns_section(
             })?;
         column.generated_sql = Some(generated_sql);
         column.generated_stored = generated_stored;
+    }
+    Ok(())
+}
+
+fn decode_pk_index_roots_section(
+    cursor: &mut Cursor<'_>,
+    tables: &mut BTreeMap<String, TableSchema>,
+) -> Result<()> {
+    let section_is_present = cursor
+        .bytes
+        .get(cursor.offset..cursor.offset + PK_INDEX_ROOTS_SECTION_MAGIC.len())
+        .is_some_and(|magic| magic == PK_INDEX_ROOTS_SECTION_MAGIC);
+    if !section_is_present {
+        return Ok(());
+    }
+    cursor.offset += PK_INDEX_ROOTS_SECTION_MAGIC.len();
+    let version = cursor.read_u8()?;
+    if version != 1 {
+        return Err(DbError::corruption(format!(
+            "unknown pk index roots section version {version}"
+        )));
+    }
+    let entry_count = cursor.read_u32()?;
+    for _ in 0..entry_count {
+        let table_name = cursor.read_string()?;
+        let pk_index_root = match cursor.read_u32()? {
+            0 => None,
+            page_id => Some(page_id),
+        };
+        let table = tables.get_mut(&table_name).ok_or_else(|| {
+            DbError::corruption(format!(
+                "pk index root metadata referenced unknown table {table_name}"
+            ))
+        })?;
+        table.pk_index_root = pk_index_root;
     }
     Ok(())
 }
@@ -8040,6 +8719,119 @@ fn row_id_alias_column_name(table: &TableSchema) -> Option<&str> {
         .iter()
         .find(|column| identifiers_equal(&column.name, primary_key_column) && column.auto_increment)
         .map(|column| column.name.as_str())
+}
+
+fn project_simple_projection_row(stored_row: &StoredRow, projection_indexes: &[usize]) -> QueryRow {
+    let mut projected = Vec::with_capacity(projection_indexes.len());
+    for index in projection_indexes {
+        projected.push(stored_row.values[*index].clone());
+    }
+    QueryRow::new(projected)
+}
+
+fn encode_row_id_locator_key(row_id: i64) -> u64 {
+    (row_id as u64) ^ SIGNED_ROW_ID_BIAS
+}
+
+fn encode_row_locator(locator: RowLocatorV1) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(8);
+    bytes.extend_from_slice(&locator.byte_offset.to_le_bytes());
+    bytes.extend_from_slice(&locator.byte_len.to_le_bytes());
+    bytes
+}
+
+fn decode_row_locator(bytes: &[u8]) -> Result<RowLocatorV1> {
+    if bytes.len() != 8 {
+        return Err(DbError::corruption("row locator payload length is invalid"));
+    }
+    Ok(RowLocatorV1 {
+        byte_offset: u32::from_le_bytes(bytes[0..4].try_into().expect("row locator offset")),
+        byte_len: u32::from_le_bytes(bytes[4..8].try_into().expect("row locator len")),
+    })
+}
+
+fn build_row_locator_entries(payload: &[u8]) -> Result<BTreeMap<u64, Vec<u8>>> {
+    if payload.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    if !payload.starts_with(TABLE_PAYLOAD_MAGIC) {
+        return Err(DbError::corruption("table payload magic is invalid"));
+    }
+    let mut cursor = Cursor::new(payload);
+    let magic = cursor.read_slice(TABLE_PAYLOAD_MAGIC.len())?;
+    if magic != TABLE_PAYLOAD_MAGIC {
+        return Err(DbError::corruption("table payload magic is invalid"));
+    }
+    let row_count = cursor.read_u32()? as usize;
+    let mut entries = BTreeMap::new();
+    for _ in 0..row_count {
+        let row_id = cursor.read_i64()?;
+        let row_bytes_len = cursor.read_u32()? as usize;
+        let row_bytes_offset = cursor.offset;
+        cursor.read_slice(row_bytes_len)?;
+        let locator = RowLocatorV1 {
+            byte_offset: u32::try_from(row_bytes_offset)
+                .map_err(|_| DbError::constraint("row locator offset exceeds u32"))?,
+            byte_len: u32::try_from(row_bytes_len)
+                .map_err(|_| DbError::constraint("row locator length exceeds u32"))?,
+        };
+        entries.insert(
+            encode_row_id_locator_key(row_id),
+            encode_row_locator(locator),
+        );
+    }
+    Ok(entries)
+}
+
+fn read_deferred_row_by_locator_from_table_payload<S: PageStore>(
+    store: &S,
+    pointer: OverflowPointer,
+    row_id: i64,
+    locator: RowLocatorV1,
+) -> Result<Option<StoredRow>> {
+    if pointer.head_page_id == 0 {
+        return Ok(None);
+    }
+    let mut cursor = OverflowPayloadCursor::new(store, pointer);
+    cursor.skip(locator.byte_offset as usize)?;
+    let row_bytes = cursor.read_vec(locator.byte_len as usize)?;
+    let row = Row::decode(&row_bytes)?;
+    Ok(Some(StoredRow {
+        row_id,
+        values: row.into_values(),
+    }))
+}
+
+fn read_deferred_row_by_id_from_table_payload<S: PageStore>(
+    store: &S,
+    pointer: OverflowPointer,
+    row_id: i64,
+) -> Result<Option<StoredRow>> {
+    if pointer.head_page_id == 0 {
+        return Ok(None);
+    }
+    let mut cursor = OverflowPayloadCursor::new(store, pointer);
+    let mut magic = [0_u8; TABLE_PAYLOAD_MAGIC.len()];
+    cursor.read_exact(&mut magic)?;
+    if magic != *TABLE_PAYLOAD_MAGIC {
+        return Err(DbError::corruption("table payload magic is invalid"));
+    }
+
+    let row_count = cursor.read_u32()? as usize;
+    for _ in 0..row_count {
+        let candidate_row_id = cursor.read_i64()?;
+        let row_bytes_len = cursor.read_u32()? as usize;
+        if candidate_row_id == row_id {
+            let row_bytes = cursor.read_vec(row_bytes_len)?;
+            let row = Row::decode(&row_bytes)?;
+            return Ok(Some(StoredRow {
+                row_id: candidate_row_id,
+                values: row.into_values(),
+            }));
+        }
+        cursor.skip(row_bytes_len)?;
+    }
+    Ok(None)
 }
 
 fn matches_table_binding(table: TableBindingRef<'_>, qualifier: Option<&str>) -> bool {
@@ -14057,7 +14849,7 @@ mod tests {
         let decoded = decode_runtime_payload(&payload).expect("decode legacy runtime payload");
 
         assert_eq!(decoded.catalog.schema_cookie, runtime.catalog.schema_cookie);
-        assert_eq!(decoded.tables["docs"].rows, runtime.tables["docs"].rows);
+        assert_eq!(decoded.tables["docs"], runtime.tables["docs"]);
         assert!(decoded.catalog.indexes.contains_key("docs_email_idx"));
     }
 
@@ -14074,8 +14866,8 @@ mod tests {
         );
 
         let mut store = InMemoryPageStore::new(PAGE_SIZE);
-        let table_payload =
-            encode_table_payload(&runtime.tables["docs"]).expect("encode table payload");
+        let table_payload = encode_table_payload(runtime.tables["docs"].resident_data())
+            .expect("encode table payload");
         let pointer = crate::record::overflow::write_overflow(
             &mut store,
             &table_payload,
@@ -14091,8 +14883,9 @@ mod tests {
             PersistedTableState {
                 pointer,
                 checksum: crate::storage::checksum::crc32c_parts(&[table_payload.as_slice()]),
-                row_count: runtime.tables["docs"].rows.len(),
+                row_count: runtime.tables["docs"].resident_data().rows.len(),
                 tail,
+                pk_index_root: None,
             },
         );
 
@@ -15036,6 +15829,7 @@ mod exec_mod_private_tests {
             foreign_keys: vec![],
             primary_key_columns: vec![],
             next_row_id: 1,
+            pk_index_root: None,
         };
         assert!(generated_columns_are_stored(&table));
 
@@ -15059,6 +15853,7 @@ mod exec_mod_private_tests {
             foreign_keys: vec![],
             primary_key_columns: vec![],
             next_row_id: 1,
+            pk_index_root: None,
         };
         assert!(generated_columns_are_stored(&table2));
 
@@ -15082,6 +15877,7 @@ mod exec_mod_private_tests {
             foreign_keys: vec![],
             primary_key_columns: vec![],
             next_row_id: 1,
+            pk_index_root: None,
         };
         assert!(!generated_columns_are_stored(&table3));
     }

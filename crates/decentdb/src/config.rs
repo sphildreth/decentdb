@@ -127,6 +127,16 @@ pub struct DbConfig {
     /// See ADR 0143 — On-Disk Row-Scan Executor.
     pub defer_table_materialization: bool,
 
+    /// When `true`, the engine persists a row-id -> table-payload-byte-range
+    /// locator B+Tree for base tables and consults it for deferred
+    /// `WHERE id = ?` reads before falling back to full table materialization.
+    ///
+    /// Default: `false` for one release of soak time. Existing databases and
+    /// callers keep the Phase B behavior until they opt in.
+    ///
+    /// See ADR 0144 — Persistent Primary-Key Locator Index.
+    pub persistent_pk_index: bool,
+
     /// If non-zero, `Db::open` will run a synchronous checkpoint when the
     /// existing WAL file size on disk exceeds this threshold (in MiB).
     /// This drops the in-memory WAL page-version index and lets steady-
@@ -176,6 +186,7 @@ impl Default for DbConfig {
             background_checkpoint_worker: true,
             wal_index_hot_set_pages: 0,
             defer_table_materialization: true,
+            persistent_pk_index: false,
             auto_checkpoint_on_open_mb: 16,
         }
     }
@@ -200,6 +211,7 @@ mod tests {
         assert_eq!(config.wal_checkpoint_threshold_pages, 4096);
         assert_eq!(config.wal_checkpoint_threshold_bytes, 64 * 1024 * 1024);
         assert!(config.defer_table_materialization);
+        assert!(!config.persistent_pk_index);
         // Default depends on platform; just assert the field is reachable.
         let _ = config.release_freed_memory_after_checkpoint;
     }

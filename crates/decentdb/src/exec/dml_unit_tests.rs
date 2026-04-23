@@ -45,6 +45,7 @@ mod tests {
             foreign_keys: vec![],
             primary_key_columns: vec![],
             next_row_id: 1,
+            pk_index_root: None,
         };
         runtime.catalog_mut().tables.insert("t".to_string(), table);
 
@@ -82,6 +83,7 @@ mod tests {
             foreign_keys: vec![],
             primary_key_columns: vec![],
             next_row_id: 1,
+            pk_index_root: None,
         };
         runtime.catalog_mut().tables.insert("t".to_string(), table);
 
@@ -117,6 +119,7 @@ mod tests {
             foreign_keys: vec![],
             primary_key_columns: vec![],
             next_row_id: 1,
+            pk_index_root: None,
         };
         runtime.catalog_mut().tables.insert("t".to_string(), table);
         let stmt = parse_sql_statement("INSERT INTO t (unknown) VALUES (1)").unwrap();
@@ -139,6 +142,7 @@ mod tests {
             foreign_keys: vec![],
             primary_key_columns: vec![],
             next_row_id: 1,
+            pk_index_root: None,
         };
         runtime.catalog_mut().tables.insert("t".to_string(), table);
 
@@ -196,15 +200,15 @@ mod tests {
             foreign_keys: vec![],
             primary_key_columns: vec!["id".to_string()],
             next_row_id: 1,
+            pk_index_root: None,
         };
         runtime
             .catalog_mut()
             .tables
             .insert("t".to_string(), table.clone());
-        runtime.tables_mut().insert(
-            "t".to_string(),
-            std::sync::Arc::new(TableData { rows: vec![] }),
-        );
+        runtime
+            .tables_mut()
+            .insert("t".to_string(), TableData { rows: vec![] }.into());
 
         let stmt = parse_sql_statement("INSERT INTO t (val) VALUES (20)").unwrap();
         let insert = match stmt {
@@ -220,7 +224,7 @@ mod tests {
             .execute_prepared_simple_insert(&prepared, &[], 4096)
             .expect("execute succeeded");
         assert_eq!(res.affected_rows(), 1);
-        let rows = &runtime.tables.get("t").unwrap().rows;
+        let rows = &runtime.tables.get("t").unwrap().resident_data().rows;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values[1], crate::record::value::Value::Int64(20));
         assert_eq!(rows[0].row_id, 1);

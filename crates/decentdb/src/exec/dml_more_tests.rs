@@ -46,6 +46,7 @@ mod tests {
             foreign_keys: vec![],
             primary_key_columns: vec!["id".to_string()],
             next_row_id: 2,
+            pk_index_root: None,
         };
         runtime
             .catalog_mut()
@@ -54,12 +55,13 @@ mod tests {
 
         runtime.tables_mut().insert(
             "t".to_string(),
-            std::sync::Arc::new(TableData {
+            TableData {
                 rows: vec![StoredRow {
                     row_id: 1,
                     values: vec![Value::Int64(1), Value::Int64(10)],
                 }],
-            }),
+            }
+            .into(),
         );
 
         let stmt = parse_sql_statement("UPDATE t SET val = 20 WHERE id = 1").unwrap();
@@ -80,7 +82,7 @@ mod tests {
             .expect("execute succeeded");
         assert_eq!(res.affected_rows(), 1);
         assert_eq!(
-            runtime.tables.get("t").unwrap().rows[0].values[1],
+            runtime.tables.get("t").unwrap().resident_data().rows[0].values[1],
             Value::Int64(20)
         );
     }
@@ -123,6 +125,7 @@ mod tests {
             foreign_keys: vec![],
             primary_key_columns: vec!["id".to_string()],
             next_row_id: 2,
+            pk_index_root: None,
         };
         runtime
             .catalog_mut()
@@ -131,12 +134,13 @@ mod tests {
 
         runtime.tables_mut().insert(
             "t".to_string(),
-            std::sync::Arc::new(TableData {
+            TableData {
                 rows: vec![StoredRow {
                     row_id: 1,
                     values: vec![Value::Int64(1), Value::Int64(10)],
                 }],
-            }),
+            }
+            .into(),
         );
 
         let stmt = parse_sql_statement("DELETE FROM t WHERE id = 1").unwrap();
@@ -153,7 +157,13 @@ mod tests {
             .execute_prepared_simple_delete(&prepared, &[])
             .expect("execute succeeded");
         assert_eq!(res.affected_rows(), 1);
-        assert!(runtime.tables.get("t").unwrap().rows.is_empty());
+        assert!(runtime
+            .tables
+            .get("t")
+            .unwrap()
+            .resident_data()
+            .rows
+            .is_empty());
     }
 
     #[test]
@@ -194,6 +204,7 @@ mod tests {
             foreign_keys: vec![],
             primary_key_columns: vec![],
             next_row_id: 1,
+            pk_index_root: None,
         };
         runtime
             .catalog_mut()
@@ -241,6 +252,7 @@ mod tests {
             foreign_keys: vec![],
             primary_key_columns: vec![],
             next_row_id: 1,
+            pk_index_root: None,
         };
         runtime
             .catalog_mut()
@@ -279,6 +291,7 @@ mod tests {
             foreign_keys: vec![],
             primary_key_columns: vec![],
             next_row_id: 1,
+            pk_index_root: None,
         };
         runtime
             .catalog_mut()
@@ -332,15 +345,15 @@ mod tests {
             foreign_keys: vec![],
             primary_key_columns: vec![],
             next_row_id: 1,
+            pk_index_root: None,
         };
         runtime
             .catalog_mut()
             .tables
             .insert(table.name.clone(), table.clone());
-        runtime.tables_mut().insert(
-            table.name.clone(),
-            std::sync::Arc::new(TableData { rows: vec![] }),
-        );
+        runtime
+            .tables_mut()
+            .insert(table.name.clone(), TableData { rows: vec![] }.into());
         let prepared = crate::exec::dml::PreparedSimpleInsert {
             table_name: "t".to_string(),
             columns: vec![
@@ -397,15 +410,15 @@ mod tests {
             foreign_keys: vec![],
             primary_key_columns: vec!["id".to_string()],
             next_row_id: 1,
+            pk_index_root: None,
         };
         runtime
             .catalog_mut()
             .tables
             .insert(table.name.clone(), table.clone());
-        runtime.tables_mut().insert(
-            table.name.clone(),
-            std::sync::Arc::new(TableData { rows: vec![] }),
-        );
+        runtime
+            .tables_mut()
+            .insert(table.name.clone(), TableData { rows: vec![] }.into());
         let prepared = crate::exec::dml::PreparedSimpleInsert {
             table_name: "t2".to_string(),
             columns: vec![crate::exec::dml::PreparedInsertColumn {

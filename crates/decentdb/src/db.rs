@@ -1242,8 +1242,7 @@ impl Db {
                 table_info(
                     table,
                     runtime
-                        .tables
-                        .get(&table.name)
+                        .table_data(&table.name)
                         .map_or(0, |data| data.rows.len()),
                 )
             })
@@ -1282,7 +1281,7 @@ impl Db {
                 .ok_or_else(|| DbError::sql(format!("unknown table {name}")))?;
             (
                 table,
-                runtime.tables.get(name).map_or(0, |data| data.rows.len()),
+                runtime.table_data(name).map_or(0, |data| data.rows.len()),
             )
         };
         Ok(table_info(table, row_count))
@@ -1471,7 +1470,7 @@ impl Db {
         let catalog = CatalogHandle::new(runtime.catalog.as_ref().clone());
         let last_seen_checkpoint_epoch = wal.checkpoint_epoch();
 
-        Ok(Self {
+        let db = Self {
             inner: Arc::new(DbInner {
                 path,
                 config: effective_config,
@@ -1492,7 +1491,9 @@ impl Db {
                 prepared_insert_cache: Mutex::new(PreparedInsertCache::default()),
                 held_snapshots: Mutex::new(HashMap::new()),
             }),
-        })
+        };
+        db.backfill_missing_persistent_pk_indexes()?;
+        Ok(db)
     }
 
     #[must_use]
@@ -1522,13 +1523,78 @@ impl Db {
             return runtime.execute_read_statement(statement, params, self.inner.config.page_size);
         }
 
-        self.refresh_and_prepare_tables_for_read(statement)?;
+        self.execute_nontransaction_read_statement(statement, params, None)
+    }
+
+    fn execute_nontransaction_read_statement(
+        &self,
+        statement: &SqlStatement,
+        params: &[Value],
+        prepared: Option<&PreparedStatement>,
+    ) -> Result<QueryResult> {
+        if !self.inner.config.defer_table_materialization {
+            self.refresh_engine_from_storage()?;
+            self.ensure_all_tables_loaded()?;
+            let runtime = self
+                .inner
+                .engine
+                .read()
+                .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+            self.validate_prepared_against_runtime(prepared, &runtime)?;
+            return runtime.execute_read_statement(statement, params, self.inner.config.page_size);
+        }
+
+        let reader = self.inner.wal.begin_reader()?;
+        let snapshot_lsn = reader.snapshot_lsn();
+        self.refresh_engine_from_snapshot(snapshot_lsn)?;
+        if let SqlStatement::Query(query) = statement {
+            let runtime = self
+                .inner
+                .engine
+                .read()
+                .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+            self.validate_prepared_against_runtime(prepared, &runtime)?;
+            if let Some(result) = runtime.try_execute_simple_deferred_indexed_projection_query(
+                query,
+                params,
+                &self.inner.pager,
+                &self.inner.wal,
+                snapshot_lsn,
+                self.inner.config.persistent_pk_index,
+            )? {
+                return Ok(result);
+            }
+        }
+
+        let targeted_ok =
+            self.ensure_tables_loaded_for_statement_at_snapshot(statement, Some(snapshot_lsn))?;
+        if !targeted_ok {
+            self.ensure_all_tables_loaded_at_snapshot(Some(snapshot_lsn))?;
+        }
+        drop(reader);
+
         let runtime = self
             .inner
             .engine
             .read()
             .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+        self.validate_prepared_against_runtime(prepared, &runtime)?;
         runtime.execute_read_statement(statement, params, self.inner.config.page_size)
+    }
+
+    fn validate_prepared_against_runtime(
+        &self,
+        prepared: Option<&PreparedStatement>,
+        runtime: &EngineRuntime,
+    ) -> Result<()> {
+        if let Some(prepared) = prepared {
+            self.validate_prepared_schema_cookie(
+                prepared,
+                runtime.catalog.schema_cookie,
+                runtime.temp_schema_cookie,
+            )?;
+        }
+        Ok(())
     }
 
     fn execute_pragma_command(&self, command: PragmaCommand) -> Result<QueryResult> {
@@ -1597,7 +1663,7 @@ impl Db {
                 runtime.rebuild_stale_indexes(self.inner.config.page_size)?;
                 let mut errors = Vec::new();
                 for (table_name, table) in &runtime.catalog.tables {
-                    let Some(data) = runtime.tables.get(table_name) else {
+                    let Some(data) = runtime.table_data(table_name) else {
                         errors.push(format!("table {} is missing row storage", table_name));
                         continue;
                     };
@@ -1823,21 +1889,10 @@ impl Db {
             );
         }
 
-        self.refresh_and_prepare_tables_for_read(prepared.statement.as_ref())?;
-        let runtime = self
-            .inner
-            .engine
-            .read()
-            .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
-        self.validate_prepared_schema_cookie(
-            prepared,
-            runtime.catalog.schema_cookie,
-            runtime.temp_schema_cookie,
-        )?;
-        runtime.execute_read_statement(
+        self.execute_nontransaction_read_statement(
             prepared.statement.as_ref(),
             params,
-            self.inner.config.page_size,
+            Some(prepared),
         )
     }
 
@@ -2261,6 +2316,66 @@ impl Db {
             .writer_last_commit_lsn
             .store(committed_lsn, Ordering::Release);
         Ok(result)
+    }
+
+    fn backfill_missing_persistent_pk_indexes(&self) -> Result<()> {
+        if !self.inner.config.persistent_pk_index {
+            return Ok(());
+        }
+
+        let mut runtime = self
+            .inner
+            .engine
+            .write()
+            .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+        let needs_backfill = runtime.catalog.tables.iter().any(|(table_name, table)| {
+            table.pk_index_root.is_none()
+                && runtime
+                    .persisted_tables
+                    .get(table_name)
+                    .is_some_and(|state| state.pointer.head_page_id != 0)
+        });
+        if !needs_backfill {
+            return Ok(());
+        }
+
+        self.begin_write()?;
+        let changed = match runtime.backfill_missing_persistent_pk_indexes(self) {
+            Ok(changed) => changed,
+            Err(error) => {
+                let _ = self.rollback();
+                self.restore_runtime_from_storage(&mut runtime)?;
+                return Err(error);
+            }
+        };
+        if !changed {
+            self.rollback()?;
+            return Ok(());
+        }
+        if let Err(error) = runtime.persist_to_db(self) {
+            let _ = self.rollback();
+            self.restore_runtime_from_storage(&mut runtime)?;
+            return Err(error);
+        }
+        let committed_lsn = match self.commit() {
+            Ok(lsn) => lsn,
+            Err(error) => {
+                let _ = self.rollback();
+                self.restore_runtime_from_storage(&mut runtime)?;
+                return Err(error);
+            }
+        };
+        self.inner
+            .catalog
+            .replace(runtime.catalog.as_ref().clone())?;
+        self.sync_temp_state_from_runtime(&runtime)?;
+        self.inner
+            .last_runtime_lsn
+            .store(committed_lsn, Ordering::Release);
+        self.inner
+            .writer_last_commit_lsn
+            .store(committed_lsn, Ordering::Release);
+        Ok(())
     }
 
     fn compact_persisted_payloads_before_checkpoint(&self) -> Result<()> {
@@ -2748,25 +2863,6 @@ impl Db {
         self.inner
             .last_runtime_lsn
             .store(runtime_lsn, Ordering::Release);
-        Ok(())
-    }
-
-    fn refresh_and_prepare_tables_for_read(&self, statement: &SqlStatement) -> Result<()> {
-        if !self.inner.config.defer_table_materialization {
-            self.refresh_engine_from_storage()?;
-            self.ensure_all_tables_loaded()?;
-            return Ok(());
-        }
-
-        let reader = self.inner.wal.begin_reader()?;
-        let snapshot_lsn = reader.snapshot_lsn();
-        self.refresh_engine_from_snapshot(snapshot_lsn)?;
-        let targeted_ok =
-            self.ensure_tables_loaded_for_statement_at_snapshot(statement, Some(snapshot_lsn))?;
-        if !targeted_ok {
-            self.ensure_all_tables_loaded_at_snapshot(Some(snapshot_lsn))?;
-        }
-        drop(reader);
         Ok(())
     }
 
@@ -3707,8 +3803,7 @@ fn schema_snapshot(runtime: &EngineRuntime) -> SchemaSnapshot {
             schema_table_info(
                 table,
                 runtime
-                    .tables
-                    .get(&table.name)
+                    .table_data(&table.name)
                     .map_or(0, |data| data.rows.len()),
             )
         })
@@ -3903,7 +3998,7 @@ fn render_runtime_dump(runtime: &EngineRuntime) -> String {
     for table in runtime.catalog.tables.values() {
         lines.push(render_create_table(table));
     }
-    for (table_name, table_data) in runtime.tables.iter() {
+    for (table_name, table_data) in runtime.loaded_tables() {
         if let Some(table) = runtime.catalog.tables.get(table_name) {
             for row in &table_data.rows {
                 lines.push(render_insert(table, &row.values));
@@ -4272,6 +4367,7 @@ mod tests {
             foreign_keys: Vec::new(),
             primary_key_columns: vec!["id".to_string()],
             next_row_id: 1,
+            pk_index_root: None,
         };
         let view = ViewSchema {
             name: "temp_view".to_string(),
@@ -4612,6 +4708,176 @@ mod tests {
                     .expect("count docs rows")
             ),
             96
+        );
+    }
+
+    #[test]
+    fn checkpoint_preserves_large_payloads_with_persistent_pk_index() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir.path().join("checkpoint-keeps-pk-payloads.ddb");
+        let config = DbConfig {
+            persistent_pk_index: true,
+            ..DbConfig::default()
+        };
+        let db = Db::open_or_create(&path, config).expect("open db");
+        db.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT)")
+            .expect("create docs table");
+
+        let large_body = "x".repeat(2048);
+        let mut txn = db.transaction().expect("begin exclusive txn");
+        let insert = txn
+            .prepare("INSERT INTO docs VALUES ($1, $2)")
+            .expect("prepare insert");
+        for i in 0_i64..96_i64 {
+            insert
+                .execute_in(
+                    &mut txn,
+                    &[Value::Int64(i), Value::Text(large_body.clone())],
+                )
+                .expect("insert large row");
+        }
+        txn.commit().expect("commit rows");
+
+        let runtime_before = db
+            .runtime_for_inspection()
+            .expect("runtime before checkpoint");
+        let docs_before = runtime_before
+            .persisted_tables
+            .get("docs")
+            .expect("persisted docs before checkpoint");
+        assert!(
+            docs_before.pointer.logical_len >= 64 * 1024,
+            "test setup did not create a large enough payload"
+        );
+        assert!(
+            !docs_before.pointer.is_compressed(),
+            "persistent pk writes should keep payload uncompressed"
+        );
+        assert!(
+            docs_before.pk_index_root.is_some(),
+            "persistent pk writes should record a locator tree root"
+        );
+
+        db.checkpoint().expect("checkpoint");
+
+        let runtime_after = db
+            .runtime_for_inspection()
+            .expect("runtime after checkpoint");
+        let docs_after = runtime_after
+            .persisted_tables
+            .get("docs")
+            .expect("persisted docs after checkpoint");
+        assert!(
+            !docs_after.pointer.is_compressed(),
+            "checkpoint should not compact payloads with persistent pk roots"
+        );
+        assert!(
+            docs_after.pk_index_root.is_some(),
+            "checkpoint should preserve the persistent pk locator tree"
+        );
+    }
+
+    #[test]
+    fn persistent_pk_index_backfills_compressed_tables_and_keeps_point_lookup_deferred() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir.path().join("persistent-pk-backfill.ddb");
+
+        {
+            let db = Db::open_or_create(&path, DbConfig::default()).expect("create db");
+            db.execute("CREATE TABLE seeded (id INTEGER PRIMARY KEY, n INTEGER, body TEXT)")
+                .expect("create seeded");
+            let large_body = "x".repeat(2048);
+            let mut txn = db.transaction().expect("begin txn");
+            let insert = txn
+                .prepare("INSERT INTO seeded VALUES ($1, $2, $3)")
+                .expect("prepare insert");
+            for i in 0_i64..96_i64 {
+                insert
+                    .execute_in(
+                        &mut txn,
+                        &[
+                            Value::Int64(i),
+                            Value::Int64(i),
+                            Value::Text(large_body.clone()),
+                        ],
+                    )
+                    .expect("insert row");
+            }
+            txn.commit().expect("commit rows");
+            db.checkpoint().expect("checkpoint");
+
+            let runtime = db
+                .runtime_for_inspection()
+                .expect("runtime after checkpoint");
+            let seeded = runtime
+                .persisted_tables
+                .get("seeded")
+                .expect("persisted seeded after checkpoint");
+            assert!(
+                seeded.pointer.is_compressed(),
+                "legacy checkpoint should compact the large payload before backfill"
+            );
+            assert!(
+                seeded.pk_index_root.is_none(),
+                "legacy checkpoint should not have a persistent pk root"
+            );
+        }
+
+        let config = DbConfig {
+            persistent_pk_index: true,
+            ..DbConfig::default()
+        };
+        let db = Db::open_or_create(&path, config).expect("reopen with persistent pk index");
+        {
+            let runtime = db.inner.engine.read().expect("engine runtime lock");
+            let seeded = runtime
+                .persisted_tables
+                .get("seeded")
+                .expect("persisted seeded after backfill");
+            assert!(
+                !seeded.pointer.is_compressed(),
+                "backfill should rewrite the large payload uncompressed"
+            );
+            assert!(
+                seeded.pk_index_root.is_some(),
+                "backfill should attach a persistent pk locator tree"
+            );
+            assert!(
+                runtime
+                    .catalog
+                    .tables
+                    .get("seeded")
+                    .and_then(|table| table.pk_index_root)
+                    .is_some(),
+                "catalog state should retain the persistent pk locator root"
+            );
+        }
+
+        let json_open = db.inspect_storage_state_json().expect("json snapshot");
+        assert!(
+            json_open.contains("\"deferred_table_count\":1"),
+            "expected backfilled table to stay deferred at open, got: {json_open}"
+        );
+
+        let result = db
+            .execute("SELECT n FROM seeded WHERE id = 17")
+            .expect("point lookup");
+        assert_eq!(scalar_i64(&result), 17);
+
+        let json_after = db
+            .inspect_storage_state_json()
+            .expect("json after point lookup");
+        assert!(
+            json_after.contains("\"loaded_table_count\":0"),
+            "expected persistent pk point lookup to avoid materialization, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"deferred_table_count\":1"),
+            "expected seeded to remain deferred after point lookup, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"rows_in_memory_count\":0"),
+            "expected zero resident rows after persistent pk point lookup, got: {json_after}"
         );
     }
 
@@ -5227,6 +5493,93 @@ mod tests {
         assert!(
             json_after.contains("\"rows_in_memory_count\":50"),
             "expected 50 resident rows after materialize, got: {json_after}"
+        );
+    }
+
+    #[test]
+    fn row_id_point_lookup_keeps_deferred_table_unloaded() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir.path().join("deferred-row-id.ddb");
+
+        {
+            let db = Db::open_or_create(&path, DbConfig::default()).expect("create db");
+            db.execute("CREATE TABLE seeded (id INTEGER PRIMARY KEY, n INTEGER)")
+                .expect("create seeded");
+            for i in 0..50 {
+                db.execute(&format!("INSERT INTO seeded (id, n) VALUES ({i}, {i})"))
+                    .expect("insert");
+            }
+            db.checkpoint().expect("checkpoint before close");
+        }
+
+        let db = Db::open_or_create(&path, DbConfig::default()).expect("reopen with defer");
+        let json_open = db.inspect_storage_state_json().expect("json snapshot");
+        assert!(
+            json_open.contains("\"deferred_table_count\":1"),
+            "expected deferred table at open, got: {json_open}"
+        );
+
+        let result = db
+            .execute("SELECT n FROM seeded WHERE id = 17")
+            .expect("point lookup");
+        assert_eq!(scalar_i64(&result), 17);
+
+        let json_after = db
+            .inspect_storage_state_json()
+            .expect("json after point lookup");
+        assert!(
+            json_after.contains("\"loaded_table_count\":0"),
+            "expected point lookup to avoid materialization, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"deferred_table_count\":1"),
+            "expected deferred table to remain deferred, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"rows_in_memory_count\":0"),
+            "expected zero resident rows after deferred point lookup, got: {json_after}"
+        );
+    }
+
+    #[test]
+    fn prepared_row_id_point_lookup_keeps_deferred_table_unloaded() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir.path().join("prepared-deferred-row-id.ddb");
+
+        {
+            let db = Db::open_or_create(&path, DbConfig::default()).expect("create db");
+            db.execute("CREATE TABLE seeded (id INTEGER PRIMARY KEY, n INTEGER)")
+                .expect("create seeded");
+            for i in 0..50 {
+                db.execute(&format!("INSERT INTO seeded (id, n) VALUES ({i}, {i})"))
+                    .expect("insert");
+            }
+            db.checkpoint().expect("checkpoint before close");
+        }
+
+        let db = Db::open_or_create(&path, DbConfig::default()).expect("reopen with defer");
+        let prepared = db
+            .prepare("SELECT n FROM seeded WHERE id = $1")
+            .expect("prepare point lookup");
+        let result = prepared
+            .execute(&[Value::Int64(17)])
+            .expect("execute prepared point lookup");
+        assert_eq!(scalar_i64(&result), 17);
+
+        let json_after = db
+            .inspect_storage_state_json()
+            .expect("json after prepared point lookup");
+        assert!(
+            json_after.contains("\"loaded_table_count\":0"),
+            "expected prepared point lookup to avoid materialization, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"deferred_table_count\":1"),
+            "expected deferred table to remain deferred, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"rows_in_memory_count\":0"),
+            "expected zero resident rows after prepared deferred point lookup, got: {json_after}"
         );
     }
 
