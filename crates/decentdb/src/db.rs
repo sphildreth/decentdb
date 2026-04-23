@@ -1108,7 +1108,7 @@ impl Db {
             .sql_write_lock
             .lock()
             .map_err(|_| DbError::internal("SQL writer lock poisoned"))?;
-        self.ensure_all_tables_loaded()?;
+        self.refresh_and_ensure_all_tables_loaded()?;
         let mut working = self.engine_snapshot()?;
         let inserted = working.bulk_load_rows(
             table_name,
@@ -1131,7 +1131,7 @@ impl Db {
             .sql_write_lock
             .lock()
             .map_err(|_| DbError::internal("SQL writer lock poisoned"))?;
-        self.ensure_all_tables_loaded()?;
+        self.refresh_and_ensure_all_tables_loaded()?;
         let mut working = self.engine_snapshot()?;
         working.rebuild_index(name, self.inner.config.page_size)?;
         self.persist_runtime(working).map(|_| ())
@@ -1144,7 +1144,7 @@ impl Db {
             .sql_write_lock
             .lock()
             .map_err(|_| DbError::internal("SQL writer lock poisoned"))?;
-        self.ensure_all_tables_loaded()?;
+        self.refresh_and_ensure_all_tables_loaded()?;
         let mut working = self.engine_snapshot()?;
         working.rebuild_indexes(self.inner.config.page_size)?;
         self.persist_runtime(working).map(|_| ())
@@ -1522,19 +1522,7 @@ impl Db {
             return runtime.execute_read_statement(statement, params, self.inner.config.page_size);
         }
 
-        self.refresh_engine_from_storage()?;
-        // ADR 0143 Phase B: try a targeted per-table load first. If
-        // statement analysis is conservatively exhaustive (no CTEs,
-        // subqueries, set ops, …) we skip the all-loader entirely and
-        // leave non-referenced tables deferred. Otherwise fall back.
-        let targeted_ok = if self.inner.config.defer_table_materialization {
-            self.ensure_tables_loaded_for_statement(statement)?
-        } else {
-            false
-        };
-        if !targeted_ok {
-            self.ensure_all_tables_loaded()?;
-        }
+        self.refresh_and_prepare_tables_for_read(statement)?;
         let runtime = self
             .inner
             .engine
@@ -1835,16 +1823,7 @@ impl Db {
             );
         }
 
-        self.refresh_engine_from_storage()?;
-        // ADR 0143 Phase B: targeted load gated on safe analyzer.
-        let targeted_ok = if self.inner.config.defer_table_materialization {
-            self.ensure_tables_loaded_for_statement(prepared.statement.as_ref())?
-        } else {
-            false
-        };
-        if !targeted_ok {
-            self.ensure_all_tables_loaded()?;
-        }
+        self.refresh_and_prepare_tables_for_read(prepared.statement.as_ref())?;
         let runtime = self
             .inner
             .engine
@@ -1887,8 +1866,7 @@ impl Db {
             .sql_write_lock
             .lock()
             .map_err(|_| DbError::internal("SQL writer lock poisoned"))?;
-        self.refresh_engine_from_storage()?;
-        self.ensure_all_tables_loaded()?;
+        self.refresh_and_ensure_all_tables_loaded()?;
         let temp_only = {
             let runtime = self
                 .inner
@@ -1996,8 +1974,7 @@ impl Db {
             .sql_write_lock
             .lock()
             .map_err(|_| DbError::internal("SQL writer lock poisoned"))?;
-        self.refresh_engine_from_storage()?;
-        self.ensure_all_tables_loaded()?;
+        self.refresh_and_ensure_all_tables_loaded()?;
         let temp_only = {
             let runtime = self
                 .inner
@@ -2290,8 +2267,7 @@ impl Db {
         if self.inner.sql_txn_active.load(Ordering::Acquire) {
             return Ok(());
         }
-        self.refresh_engine_from_storage()?;
-        self.ensure_all_tables_loaded()?;
+        self.refresh_and_ensure_all_tables_loaded()?;
         let mut runtime = self
             .inner
             .engine
@@ -2479,8 +2455,7 @@ impl Db {
     }
 
     fn build_exclusive_sql_txn_state(&self) -> Result<ExclusiveSqlTxnState<'_>> {
-        self.refresh_engine_from_storage()?;
-        self.ensure_all_tables_loaded()?;
+        self.refresh_and_ensure_all_tables_loaded()?;
         let current_lsn = self.inner.last_runtime_lsn.load(Ordering::Acquire);
         let current_epoch = self.inner.wal.checkpoint_epoch();
         let runtime = self
@@ -2597,8 +2572,7 @@ impl Db {
         if let Some(runtime) = self.transaction_runtime_snapshot()? {
             return Ok(runtime);
         }
-        self.refresh_engine_from_storage()?;
-        self.ensure_all_tables_loaded()?;
+        self.refresh_and_ensure_all_tables_loaded()?;
         self.engine_snapshot()
     }
 
@@ -2654,6 +2628,66 @@ impl Db {
         self.inner
             .last_runtime_lsn
             .store(restored_lsn, Ordering::Release);
+        Ok(())
+    }
+
+    fn refresh_engine_from_snapshot(&self, snapshot_lsn: u64) -> Result<()> {
+        let latest_checkpoint_epoch = self.inner.wal.checkpoint_epoch();
+        let last_seen_checkpoint_epoch = self
+            .inner
+            .last_seen_checkpoint_epoch
+            .load(Ordering::Acquire);
+        let last_runtime_lsn = self.inner.last_runtime_lsn.load(Ordering::Acquire);
+        if latest_checkpoint_epoch != last_seen_checkpoint_epoch {
+            let cached_header = self.inner.pager.header_snapshot()?;
+            let on_disk_header = self.inner.pager.header_from_disk()?;
+            if on_disk_header.last_checkpoint_lsn != cached_header.last_checkpoint_lsn {
+                self.inner.pager.refresh_from_disk(on_disk_header)?;
+            }
+            self.inner
+                .last_seen_checkpoint_epoch
+                .store(latest_checkpoint_epoch, Ordering::Release);
+        }
+        if snapshot_lsn == last_runtime_lsn && latest_checkpoint_epoch == last_seen_checkpoint_epoch
+        {
+            return Ok(());
+        }
+
+        let writer_last_commit_lsn = self.inner.writer_last_commit_lsn.load(Ordering::Acquire);
+        if last_runtime_lsn > 0 && snapshot_lsn <= writer_last_commit_lsn {
+            self.inner
+                .last_runtime_lsn
+                .store(snapshot_lsn, Ordering::Release);
+            self.inner
+                .last_seen_checkpoint_epoch
+                .store(latest_checkpoint_epoch, Ordering::Release);
+            return Ok(());
+        }
+
+        let schema_cookie = self.current_schema_cookie_at_snapshot(snapshot_lsn)?;
+        let mut runtime = EngineRuntime::load_from_storage_at_snapshot(
+            &self.inner.pager,
+            &self.inner.wal,
+            schema_cookie,
+            &self.inner.config,
+            snapshot_lsn,
+        )?;
+        self.apply_temp_state_to_runtime(&mut runtime)?;
+        self.inner
+            .catalog
+            .replace(runtime.catalog.as_ref().clone())?;
+        let mut guard = self
+            .inner
+            .engine
+            .write()
+            .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+        *guard = runtime;
+        self.inner
+            .last_runtime_lsn
+            .store(snapshot_lsn, Ordering::Release);
+        self.inner
+            .last_seen_checkpoint_epoch
+            .store(latest_checkpoint_epoch, Ordering::Release);
         Ok(())
     }
 
@@ -2717,6 +2751,40 @@ impl Db {
         Ok(())
     }
 
+    fn refresh_and_prepare_tables_for_read(&self, statement: &SqlStatement) -> Result<()> {
+        if !self.inner.config.defer_table_materialization {
+            self.refresh_engine_from_storage()?;
+            self.ensure_all_tables_loaded()?;
+            return Ok(());
+        }
+
+        let reader = self.inner.wal.begin_reader()?;
+        let snapshot_lsn = reader.snapshot_lsn();
+        self.refresh_engine_from_snapshot(snapshot_lsn)?;
+        let targeted_ok =
+            self.ensure_tables_loaded_for_statement_at_snapshot(statement, Some(snapshot_lsn))?;
+        if !targeted_ok {
+            self.ensure_all_tables_loaded_at_snapshot(Some(snapshot_lsn))?;
+        }
+        drop(reader);
+        Ok(())
+    }
+
+    fn refresh_and_ensure_all_tables_loaded(&self) -> Result<()> {
+        if !self.inner.config.defer_table_materialization {
+            self.refresh_engine_from_storage()?;
+            self.ensure_all_tables_loaded()?;
+            return Ok(());
+        }
+
+        let reader = self.inner.wal.begin_reader()?;
+        let snapshot_lsn = reader.snapshot_lsn();
+        self.refresh_engine_from_snapshot(snapshot_lsn)?;
+        self.ensure_all_tables_loaded_at_snapshot(Some(snapshot_lsn))?;
+        drop(reader);
+        Ok(())
+    }
+
     /// Materializes deferred tables specified by name.
     ///
     /// Fast path (no matching deferred tables): one read-lock check.
@@ -2724,8 +2792,11 @@ impl Db {
     /// specified tables and rebuilds their indexes, then releases.
     ///
     /// This enables per-table on-demand loading for ADR 0143 Phase B.
-    #[allow(dead_code)]
-    fn ensure_tables_loaded(&self, names: &[&str]) -> Result<()> {
+    fn ensure_tables_loaded_at_snapshot(
+        &self,
+        names: &[&str],
+        snapshot_lsn: Option<u64>,
+    ) -> Result<()> {
         use std::collections::BTreeSet;
         let filter: BTreeSet<String> = names.iter().map(|s| s.to_string()).collect();
         {
@@ -2735,9 +2806,11 @@ impl Db {
                 .read()
                 .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
             let has_deferred = runtime.has_deferred_tables();
-            let has_match = names
-                .iter()
-                .any(|n| runtime.deferred_table_names().any(|dt| dt == *n));
+            let has_match = names.iter().any(|name| {
+                runtime
+                    .deferred_table_names()
+                    .any(|dt| dt.eq_ignore_ascii_case(name))
+            });
             if !has_deferred || !has_match {
                 return Ok(());
             }
@@ -2747,12 +2820,22 @@ impl Db {
             .engine
             .write()
             .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
-        runtime.load_deferred_tables_filtered(
-            &self.inner.pager,
-            &self.inner.wal,
-            self.inner.config.page_size,
-            &filter,
-        )
+        if let Some(snapshot_lsn) = snapshot_lsn {
+            runtime.load_deferred_tables_filtered_at_snapshot(
+                &self.inner.pager,
+                &self.inner.wal,
+                self.inner.config.page_size,
+                &filter,
+                snapshot_lsn,
+            )
+        } else {
+            runtime.load_deferred_tables_filtered(
+                &self.inner.pager,
+                &self.inner.wal,
+                self.inner.config.page_size,
+                &filter,
+            )
+        }
     }
 
     /// Attempts to materialize *only* the tables referenced by `statement`.
@@ -2766,7 +2849,11 @@ impl Db {
     ///
     /// Per ADR 0143 Phase B + the rubber-duck plan critique on
     /// 2026-04-22: only a strict whitelist is treated as targeted-safe.
-    fn ensure_tables_loaded_for_statement(&self, statement: &SqlStatement) -> Result<bool> {
+    fn ensure_tables_loaded_for_statement_at_snapshot(
+        &self,
+        statement: &SqlStatement,
+        snapshot_lsn: Option<u64>,
+    ) -> Result<bool> {
         use crate::sql::ast::safe_referenced_tables;
         let Some(tables) = safe_referenced_tables(statement) else {
             return Ok(false);
@@ -2800,7 +2887,7 @@ impl Db {
         }
         let names: Vec<String> = tables.into_iter().collect();
         let names_refs: Vec<&str> = names.iter().map(|s: &String| s.as_str()).collect();
-        self.ensure_tables_loaded(&names_refs)?;
+        self.ensure_tables_loaded_at_snapshot(&names_refs, snapshot_lsn)?;
         Ok(true)
     }
 
@@ -2810,6 +2897,10 @@ impl Db {
     /// Slow path: drops the read lock, takes a write lock, loads all deferred
     /// tables and rebuilds indexes, then releases.
     fn ensure_all_tables_loaded(&self) -> Result<()> {
+        self.ensure_all_tables_loaded_at_snapshot(None)
+    }
+
+    fn ensure_all_tables_loaded_at_snapshot(&self, snapshot_lsn: Option<u64>) -> Result<()> {
         {
             let runtime = self
                 .inner
@@ -2825,15 +2916,39 @@ impl Db {
             .engine
             .write()
             .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
-        runtime.load_deferred_tables(
-            &self.inner.pager,
-            &self.inner.wal,
-            self.inner.config.page_size,
-        )
+        if let Some(snapshot_lsn) = snapshot_lsn {
+            runtime.load_deferred_tables_at_snapshot(
+                &self.inner.pager,
+                &self.inner.wal,
+                self.inner.config.page_size,
+                snapshot_lsn,
+            )
+        } else {
+            runtime.load_deferred_tables(
+                &self.inner.pager,
+                &self.inner.wal,
+                self.inner.config.page_size,
+            )
+        }
     }
 
     fn current_schema_cookie(&self) -> Result<u32> {
         let page = self.read_page(page::HEADER_PAGE_ID)?;
+        let mut bytes = [0_u8; storage::header::DB_HEADER_SIZE];
+        bytes.copy_from_slice(&page[..storage::header::DB_HEADER_SIZE]);
+        Ok(DatabaseHeader::decode(&bytes)?.schema_cookie)
+    }
+
+    fn current_schema_cookie_at_snapshot(&self, snapshot_lsn: u64) -> Result<u32> {
+        let page = if let Some(wal_page) = self
+            .inner
+            .wal
+            .read_page_at_snapshot(page::HEADER_PAGE_ID, snapshot_lsn)?
+        {
+            wal_page
+        } else {
+            self.inner.pager.read_page(page::HEADER_PAGE_ID)?
+        };
         let mut bytes = [0_u8; storage::header::DB_HEADER_SIZE];
         bytes.copy_from_slice(&page[..storage::header::DB_HEADER_SIZE]);
         Ok(DatabaseHeader::decode(&bytes)?.schema_cookie)
@@ -2856,8 +2971,7 @@ impl Db {
     }
 
     fn build_sql_txn_state(&self) -> Result<SqlTxnState> {
-        self.refresh_engine_from_storage()?;
-        self.ensure_all_tables_loaded()?;
+        self.refresh_and_ensure_all_tables_loaded()?;
         let current_lsn = self.inner.last_runtime_lsn.load(Ordering::Acquire);
         let current_epoch = self.inner.wal.checkpoint_epoch();
 
@@ -5066,11 +5180,11 @@ mod tests {
         );
     }
 
-    /// ADR 0143 Phase B (opt-in): when `defer_table_materialization=true`
-    /// re-opening a DB leaves persisted tables in the deferred set until
-    /// the first SQL statement runs, then materializes them.
+    /// ADR 0143 Phase B: by default, re-opening a DB leaves persisted
+    /// tables in the deferred set until the first SQL statement runs,
+    /// then materializes them.
     #[test]
-    fn defer_table_materialization_skips_eager_load_at_open() {
+    fn default_defer_table_materialization_skips_eager_load_at_open() {
         let tempdir = TempDir::new().expect("tempdir");
         let path = tempdir.path().join("defer-load.ddb");
 
@@ -5086,12 +5200,7 @@ mod tests {
             db.checkpoint().expect("checkpoint before close");
         }
 
-        // Re-open with deferred materialization.
-        let cfg = DbConfig {
-            defer_table_materialization: true,
-            ..DbConfig::default()
-        };
-        let db = Db::open_or_create(&path, cfg).expect("reopen with defer");
+        let db = Db::open_or_create(&path, DbConfig::default()).expect("reopen with default defer");
 
         // At open, the table should not yet be loaded.
         let json_open = db.inspect_storage_state_json().expect("json snapshot");
@@ -5118,6 +5227,79 @@ mod tests {
         assert!(
             json_after.contains("\"rows_in_memory_count\":50"),
             "expected 50 resident rows after materialize, got: {json_after}"
+        );
+    }
+
+    #[test]
+    fn defer_table_materialization_false_preserves_eager_load_at_open() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir.path().join("eager-load.ddb");
+
+        {
+            let db = Db::open_or_create(&path, DbConfig::default()).expect("create db");
+            db.execute("CREATE TABLE seeded (id INTEGER PRIMARY KEY, n INTEGER)")
+                .expect("create seeded");
+            for i in 0..50 {
+                db.execute(&format!("INSERT INTO seeded (id, n) VALUES ({i}, {i})"))
+                    .expect("insert");
+            }
+            db.checkpoint().expect("checkpoint before close");
+        }
+
+        let db = Db::open_or_create(
+            &path,
+            DbConfig {
+                defer_table_materialization: false,
+                ..DbConfig::default()
+            },
+        )
+        .expect("reopen with eager load");
+
+        let json_open = db.inspect_storage_state_json().expect("json snapshot");
+        assert!(
+            json_open.contains("\"deferred_table_count\":0"),
+            "expected zero deferred tables at open, got: {json_open}"
+        );
+        assert!(
+            json_open.contains("\"rows_in_memory_count\":50"),
+            "expected eager load to materialize rows at open, got: {json_open}"
+        );
+    }
+
+    #[test]
+    fn per_table_load_matches_mixed_case_identifiers_case_insensitively() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir.path().join("mixed-case.ddb");
+
+        {
+            let db = Db::open_or_create(&path, DbConfig::default()).expect("create db");
+            db.execute("CREATE TABLE \"ArtistStaging\" (id INTEGER PRIMARY KEY, name TEXT)")
+                .expect("create mixed-case table");
+            db.execute("INSERT INTO \"ArtistStaging\" VALUES (1, 'alpha')")
+                .expect("insert seed row");
+            db.checkpoint().expect("checkpoint before close");
+        }
+
+        let db = Db::open_or_create(&path, DbConfig::default()).expect("reopen");
+        let json_open = db.inspect_storage_state_json().expect("json at open");
+        assert!(
+            json_open.contains("\"deferred_table_count\":1"),
+            "expected deferred table at open, got: {json_open}"
+        );
+
+        let result = db
+            .execute("SELECT COUNT(*) FROM ArtistStaging")
+            .expect("count mixed-case table from unquoted SQL");
+        assert_eq!(scalar_i64(&result), 1);
+
+        let json_after = db.inspect_storage_state_json().expect("json after query");
+        assert!(
+            json_after.contains("\"loaded_table_count\":1,"),
+            "expected mixed-case table to load on first query, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"deferred_table_count\":0}"),
+            "expected no deferred tables after load, got: {json_after}"
         );
     }
 

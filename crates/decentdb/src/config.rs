@@ -117,17 +117,12 @@ pub struct DbConfig {
     /// table set is conservatively exhaustive, only those tables are
     /// loaded; otherwise all deferred tables are loaded as a fallback.
     ///
-    /// Default: `false`. The per-table loader uses `persisted_tables`
-    /// pointers captured at `refresh_engine_from_storage` time but reads
-    /// payloads against a fresh WAL snapshot taken at materialization
-    /// time. In multi-writer / multi-reader workloads, a checkpoint or
-    /// concurrent writer can extend overflow chains between those two
-    /// timestamps, producing `overflow payload length mismatch` errors
-    /// (see `concurrent_writer_reader_overflow_consistency` in
-    /// `tests/engine_lifecycle_tests.rs`). The per-table path is
-    /// therefore opt-in; a future change must pin the WAL snapshot
-    /// across the persisted_tables read and the payload read before this
-    /// can flip to `true` by default.
+    /// Default: `true`. Deferred materialization now pins a single WAL
+    /// snapshot across the runtime refresh and the first-use overflow
+    /// payload read, avoiding the old `overflow payload length mismatch`
+    /// race under concurrent checkpoints. Set this to `false` to restore
+    /// the old eager-at-open behavior for callers that prefer immediate
+    /// full materialization.
     ///
     /// See ADR 0143 — On-Disk Row-Scan Executor.
     pub defer_table_materialization: bool,
@@ -180,7 +175,7 @@ impl Default for DbConfig {
             )),
             background_checkpoint_worker: true,
             wal_index_hot_set_pages: 0,
-            defer_table_materialization: false,
+            defer_table_materialization: true,
             auto_checkpoint_on_open_mb: 16,
         }
     }
@@ -204,6 +199,7 @@ mod tests {
         assert!(!config.temp_dir.as_os_str().is_empty());
         assert_eq!(config.wal_checkpoint_threshold_pages, 4096);
         assert_eq!(config.wal_checkpoint_threshold_bytes, 64 * 1024 * 1024);
+        assert!(config.defer_table_materialization);
         // Default depends on platform; just assert the field is reachable.
         let _ = config.release_freed_memory_after_checkpoint;
     }

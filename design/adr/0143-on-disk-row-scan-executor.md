@@ -1,6 +1,6 @@
 # On-Disk Row-Scan Executor (eliminate full-table in-memory materialization)
 **Date:** 2026-04-23
-**Status:** Accepted — **Phase A done, Phase B opt-in shipped (2026-04-23)**; Phase B per-table on-demand load + Phases C/D/E remaining
+**Status:** Accepted — **Phase A done, Phase B shipped with default-on deferred materialization (2026-04-23 follow-up)**; Phases C/D/E remaining
 
 ### Decision
 
@@ -130,8 +130,8 @@ without breaking SQL semantics.
 ### Acceptance
 
 - **Phase A** complete when the new metric appears in the JSON snapshot. ✅ **Done (2026-04-23)** — `tables_in_memory_bytes`, `rows_in_memory_count`, `loaded_table_count`, `deferred_table_count` are now in `Db::inspect_storage_state_json()`. Test: `db::tests::inspect_storage_state_json_reports_table_memory_totals`.
-- **Phase B (opt-in)** complete when `DbConfig::defer_table_materialization = true` skips eager materialize at open. ✅ **Done (2026-04-23)** — `load_from_storage` honors the flag; existing `ensure_deferred_tables_loaded` lazy path takes over. Test: `db::tests::defer_table_materialization_skips_eager_load_at_open`.
-- **Phase B (per-table on-demand)** complete when re-opening the 5 M-row probe DB consumes < 200 MB RSS before any query runs (today: 1 144 MB). ⏳ **Remaining** — requires changing `ensure_deferred_tables_loaded` from "all deferred tables in one shot" to "only the table(s) referenced by the current statement". This requires threading the target-table set from prepared-statement analysis into the materialization fast-path.
+- **Phase B** complete when `DbConfig::defer_table_materialization` skips eager materialize at open by default and concurrent checkpoints cannot invalidate first-use overflow reads. ✅ **Done (2026-04-23 follow-up)** — `load_from_storage` honors the flag, the read paths target only referenced tables when safe, and snapshot pinning now keeps the persisted-table manifest read and overflow payload reads on one WAL snapshot. Tests: `db::tests::default_defer_table_materialization_skips_eager_load_at_open`, `db::tests::per_table_load_skips_large_table`, `engine_lifecycle_tests::concurrent_writer_reader_overflow_consistency_with_deferred_materialization`.
+- **Phase C** complete when re-opening the 5 M-row probe DB consumes < 200 MB RSS before any query runs *and* point lookups against a huge table avoid full-table materialization. ⏳ **Remaining** — requires persisted on-disk indexing and row-source work so large-table point lookups no longer force a full `Vec<StoredRow>`.
 - **Phase D** complete when peak RSS during a 10 M-row load with `cache_size_mb=64` stays below 1 GB (today: 2.6+ GB). ⏳ **Remaining** — requires new on-disk row format.
 
 ### Risks

@@ -722,6 +722,19 @@ impl EngineRuntime {
     ) -> Result<(Self, u64)> {
         let reader = wal.begin_reader()?;
         let snapshot_lsn = reader.snapshot_lsn();
+        let runtime =
+            Self::load_from_storage_at_snapshot(pager, wal, schema_cookie, config, snapshot_lsn)?;
+        drop(reader);
+        Ok((runtime, snapshot_lsn))
+    }
+
+    pub(crate) fn load_from_storage_at_snapshot(
+        pager: &PagerHandle,
+        wal: &WalHandle,
+        schema_cookie: u32,
+        config: &crate::config::DbConfig,
+        snapshot_lsn: u64,
+    ) -> Result<Self> {
         let store = SnapshotPageStore {
             pager,
             wal,
@@ -766,9 +779,10 @@ impl EngineRuntime {
         // `DbConfig::defer_table_materialization` is true we intentionally
         // skip the eager materialize+rebuild here so that `Db::open` does
         // not allocate `Vec<StoredRow>` for every persisted table. The
-        // `ensure_deferred_tables_loaded` fast-path on each Db API entry
-        // point will materialize on first use. Note that this opens a
-        // per-table-snapshot consistency window — see config docs.
+        // per-statement/transaction lazy-load path in `db.rs` now pins a
+        // single reader snapshot across both the manifest refresh and the
+        // overflow payload read so first-use materialization does not mix
+        // snapshots under concurrent checkpoints.
         if !runtime.deferred_tables.is_empty() && !config.defer_table_materialization {
             runtime.materialize_deferred_tables_with_store(&store, pager.page_size(), None)?;
         }
@@ -781,8 +795,7 @@ impl EngineRuntime {
         } else {
             runtime.rebuild_indexes(pager.page_size())?;
         }
-        drop(reader);
-        Ok((runtime, snapshot_lsn))
+        Ok(runtime)
     }
 
     /// Returns `true` when one or more tables still have their row data
@@ -840,18 +853,17 @@ impl EngineRuntime {
         wal: &WalHandle,
         page_size: u32,
     ) -> Result<()> {
-        if self.deferred_tables.is_empty() {
-            return Ok(());
-        }
-        let reader = wal.begin_reader()?;
-        let store = SnapshotPageStore {
-            pager,
-            wal,
-            snapshot_lsn: reader.snapshot_lsn(),
-        };
-        self.materialize_deferred_tables_with_store(&store, page_size, None)?;
-        drop(reader);
-        Ok(())
+        self.load_deferred_tables_with_snapshot(pager, wal, page_size, None, None)
+    }
+
+    pub(crate) fn load_deferred_tables_at_snapshot(
+        &mut self,
+        pager: &PagerHandle,
+        wal: &WalHandle,
+        page_size: u32,
+        snapshot_lsn: u64,
+    ) -> Result<()> {
+        self.load_deferred_tables_with_snapshot(pager, wal, page_size, None, Some(snapshot_lsn))
     }
 
     /// Loads a subset of deferred tables, specified by name.
@@ -866,23 +878,56 @@ impl EngineRuntime {
         page_size: u32,
         filter: &BTreeSet<String>,
     ) -> Result<()> {
-        let intersection: BTreeSet<String> = self
-            .deferred_tables
-            .iter()
-            .filter(|t| filter.contains(*t))
-            .cloned()
-            .collect();
-        if intersection.is_empty() {
+        self.load_deferred_tables_with_snapshot(pager, wal, page_size, Some(filter), None)
+    }
+
+    pub(crate) fn load_deferred_tables_filtered_at_snapshot(
+        &mut self,
+        pager: &PagerHandle,
+        wal: &WalHandle,
+        page_size: u32,
+        filter: &BTreeSet<String>,
+        snapshot_lsn: u64,
+    ) -> Result<()> {
+        self.load_deferred_tables_with_snapshot(
+            pager,
+            wal,
+            page_size,
+            Some(filter),
+            Some(snapshot_lsn),
+        )
+    }
+
+    fn load_deferred_tables_with_snapshot(
+        &mut self,
+        pager: &PagerHandle,
+        wal: &WalHandle,
+        page_size: u32,
+        filter: Option<&BTreeSet<String>>,
+        snapshot_lsn: Option<u64>,
+    ) -> Result<()> {
+        if self.deferred_tables.is_empty() {
             return Ok(());
         }
-        let reader = wal.begin_reader()?;
+        let Some(snapshot_lsn) = snapshot_lsn else {
+            let reader = wal.begin_reader()?;
+            let snapshot_lsn = reader.snapshot_lsn();
+            let store = SnapshotPageStore {
+                pager,
+                wal,
+                snapshot_lsn,
+            };
+            self.materialize_deferred_tables_with_store(&store, page_size, filter)?;
+            drop(reader);
+            return Ok(());
+        };
+
         let store = SnapshotPageStore {
             pager,
             wal,
-            snapshot_lsn: reader.snapshot_lsn(),
+            snapshot_lsn,
         };
-        self.materialize_deferred_tables_with_store(&store, page_size, Some(filter))?;
-        drop(reader);
+        self.materialize_deferred_tables_with_store(&store, page_size, filter)?;
         Ok(())
     }
 
@@ -904,7 +949,10 @@ impl EngineRuntime {
         let table_names: Vec<String> = if let Some(f) = filter {
             self.deferred_tables
                 .iter()
-                .filter(|t| f.contains(*t))
+                .filter(|table_name| {
+                    f.iter()
+                        .any(|filter_name| filter_name.eq_ignore_ascii_case(table_name))
+                })
                 .cloned()
                 .collect()
         } else {
