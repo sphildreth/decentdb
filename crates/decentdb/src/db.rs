@@ -1563,6 +1563,14 @@ impl Db {
             )? {
                 return Ok(result);
             }
+            if let Some(result) = runtime.try_execute_simple_deferred_min_max_query(
+                query,
+                &self.inner.pager,
+                &self.inner.wal,
+                snapshot_lsn,
+            )? {
+                return Ok(result);
+            }
             if let Some(result) = runtime.try_execute_simple_deferred_indexed_projection_query(
                 query,
                 params,
@@ -4370,19 +4378,55 @@ fn json_escape(input: String) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     use crate::catalog::{
         ColumnSchema, ColumnType, IndexKind, IndexSchema, TableSchema, ViewSchema,
     };
     use crate::config::DbConfig;
-    use crate::exec::{EngineRuntime, TableData};
-    use std::sync::Arc;
+    use crate::error::{DbError, Result};
+    use crate::exec::{decode_paged_table_manifest_payload, EngineRuntime, TableData};
+    use crate::record::overflow::read_overflow;
+    use crate::storage::page::{PageId, PageStore};
 
     use crate::exec::dml::{PreparedInsertColumn, PreparedInsertValueSource, PreparedSimpleInsert};
     use crate::{Db, Value};
 
     use super::{split_sql_batch, PreparedInsertCache, StatementCache, TempSchemaState};
+
+    #[derive(Debug)]
+    struct PagerReadStore<'a> {
+        db: &'a Db,
+    }
+
+    impl PageStore for PagerReadStore<'_> {
+        fn page_size(&self) -> u32 {
+            self.db.config().page_size
+        }
+
+        fn allocate_page(&mut self) -> Result<PageId> {
+            Err(DbError::internal(
+                "PagerReadStore does not support page allocation",
+            ))
+        }
+
+        fn free_page(&mut self, _page_id: PageId) -> Result<()> {
+            Err(DbError::internal(
+                "PagerReadStore does not support freeing pages",
+            ))
+        }
+
+        fn read_page(&self, page_id: PageId) -> Result<Arc<[u8]>> {
+            self.db.read_page(page_id)
+        }
+
+        fn write_page(&mut self, _page_id: PageId, _data: &[u8]) -> Result<()> {
+            Err(DbError::internal(
+                "PagerReadStore does not support writing pages",
+            ))
+        }
+    }
 
     #[test]
     fn statement_cache_reuses_parsed_statement() {
@@ -4852,6 +4896,106 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_compacts_paged_table_chunks_and_preserves_persistent_pk_index() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir.path().join("checkpoint-compacts-paged-table.ddb");
+        let config = DbConfig {
+            persistent_pk_index: true,
+            paged_row_storage: true,
+            ..DbConfig::default()
+        };
+        let db = Db::open_or_create(&path, config).expect("open db");
+        db.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT)")
+            .expect("create docs table");
+
+        let large_body = "x".repeat(2048);
+        let mut txn = db.transaction().expect("begin exclusive txn");
+        let insert = txn
+            .prepare("INSERT INTO docs VALUES ($1, $2)")
+            .expect("prepare insert");
+        for i in 0_i64..96_i64 {
+            insert
+                .execute_in(
+                    &mut txn,
+                    &[Value::Int64(i), Value::Text(large_body.clone())],
+                )
+                .expect("insert large row");
+        }
+        txn.commit().expect("commit rows");
+
+        let runtime_before = db
+            .runtime_for_inspection()
+            .expect("runtime before checkpoint");
+        let docs_before = runtime_before
+            .persisted_tables
+            .get("docs")
+            .expect("persisted docs before checkpoint");
+        assert!(
+            docs_before.pointer.is_table_paged_manifest(),
+            "paged row storage should persist docs through a paged manifest"
+        );
+        assert!(
+            docs_before.pk_index_root.is_some(),
+            "paged row storage should preserve the persistent pk locator tree"
+        );
+        let page_store = PagerReadStore { db: &db };
+        let manifest_before = read_overflow(&page_store, docs_before.pointer)
+            .expect("read paged manifest before checkpoint");
+        let manifest_before = decode_paged_table_manifest_payload(&manifest_before)
+            .expect("decode paged manifest before checkpoint");
+        assert!(
+            manifest_before
+                .chunks
+                .iter()
+                .any(|chunk| !chunk.pointer.is_compressed()),
+            "normal paged writes should leave chunk payloads uncompressed"
+        );
+
+        db.checkpoint().expect("checkpoint");
+
+        let runtime_after = db
+            .runtime_for_inspection()
+            .expect("runtime after checkpoint");
+        let docs_after = runtime_after
+            .persisted_tables
+            .get("docs")
+            .expect("persisted docs after checkpoint");
+        assert!(
+            docs_after.pointer.is_table_paged_manifest(),
+            "checkpoint should preserve paged-table state"
+        );
+        assert!(
+            docs_after.pk_index_root.is_some(),
+            "checkpoint should preserve the persistent pk locator tree"
+        );
+        let manifest_after = read_overflow(&page_store, docs_after.pointer)
+            .expect("read paged manifest after checkpoint");
+        let manifest_after = decode_paged_table_manifest_payload(&manifest_after)
+            .expect("decode paged manifest after checkpoint");
+        assert!(
+            manifest_after
+                .chunks
+                .iter()
+                .any(|chunk| chunk.pointer.is_compressed()),
+            "checkpoint should compact large paged chunk payloads"
+        );
+        assert_eq!(
+            scalar_i64(
+                &db.execute("SELECT COUNT(*) FROM docs")
+                    .expect("count docs rows after checkpoint")
+            ),
+            96
+        );
+        assert_eq!(
+            scalar_text(
+                &db.execute("SELECT body FROM docs WHERE id = 17")
+                    .expect("select row after checkpoint")
+            ),
+            large_body
+        );
+    }
+
+    #[test]
     fn persistent_pk_index_backfills_compressed_tables_and_keeps_point_lookup_deferred() {
         let tempdir = TempDir::new().expect("tempdir");
         let path = tempdir.path().join("persistent-pk-backfill.ddb");
@@ -5180,6 +5324,229 @@ mod tests {
         assert!(
             json_after.contains("\"rows_in_memory_count\":0"),
             "expected zero resident rows after paged point lookup, got: {json_after}"
+        );
+    }
+
+    #[test]
+    fn paged_row_storage_grouped_count_keeps_deferred_table_unloaded() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir.path().join("paged-row-storage-grouped-count.ddb");
+        let config = DbConfig {
+            paged_row_storage: true,
+            ..DbConfig::default()
+        };
+
+        {
+            let db = Db::open_or_create(&path, config.clone()).expect("create db");
+            db.execute("CREATE TABLE seeded (id INTEGER PRIMARY KEY, grp INTEGER, body TEXT)")
+                .expect("create seeded");
+            let large_body = "x".repeat(2048);
+            let mut txn = db.transaction().expect("begin txn");
+            let insert = txn
+                .prepare("INSERT INTO seeded VALUES ($1, $2, $3)")
+                .expect("prepare insert");
+            for i in 0_i64..96_i64 {
+                insert
+                    .execute_in(
+                        &mut txn,
+                        &[
+                            Value::Int64(i),
+                            Value::Int64(i % 3),
+                            Value::Text(large_body.clone()),
+                        ],
+                    )
+                    .expect("insert row");
+            }
+            txn.commit().expect("commit rows");
+            db.checkpoint().expect("checkpoint");
+        }
+
+        let db = Db::open_or_create(&path, config).expect("reopen with paged storage");
+        let result = db
+            .execute("SELECT grp, COUNT(*) FROM seeded GROUP BY grp")
+            .expect("grouped count");
+        assert_eq!(result.rows().len(), 3);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[Value::Int64(0), Value::Int64(32)]
+        );
+        assert_eq!(
+            result.rows()[1].values(),
+            &[Value::Int64(1), Value::Int64(32)]
+        );
+        assert_eq!(
+            result.rows()[2].values(),
+            &[Value::Int64(2), Value::Int64(32)]
+        );
+
+        let json_after = db
+            .inspect_storage_state_json()
+            .expect("json after grouped count");
+        assert!(
+            json_after.contains("\"loaded_table_count\":0"),
+            "expected paged grouped count to avoid resident materialization, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"deferred_table_count\":1"),
+            "expected paged-backed table to remain deferred after grouped count, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"rows_in_memory_count\":0"),
+            "expected zero resident rows after paged grouped count, got: {json_after}"
+        );
+    }
+
+    #[test]
+    fn paged_row_storage_grouped_numeric_aggregate_keeps_deferred_table_unloaded() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir.path().join("paged-row-storage-grouped-sum.ddb");
+        let config = DbConfig {
+            paged_row_storage: true,
+            ..DbConfig::default()
+        };
+
+        {
+            let db = Db::open_or_create(&path, config.clone()).expect("create db");
+            db.execute(
+                "CREATE TABLE seeded (id INTEGER PRIMARY KEY, grp INTEGER, n INTEGER, body TEXT)",
+            )
+            .expect("create seeded");
+            let large_body = "x".repeat(2048);
+            let mut txn = db.transaction().expect("begin txn");
+            let insert = txn
+                .prepare("INSERT INTO seeded VALUES ($1, $2, $3, $4)")
+                .expect("prepare insert");
+            for i in 0_i64..96_i64 {
+                insert
+                    .execute_in(
+                        &mut txn,
+                        &[
+                            Value::Int64(i),
+                            Value::Int64(i % 2),
+                            Value::Int64(i),
+                            Value::Text(large_body.clone()),
+                        ],
+                    )
+                    .expect("insert row");
+            }
+            txn.commit().expect("commit rows");
+            db.checkpoint().expect("checkpoint");
+        }
+
+        let db = Db::open_or_create(&path, config).expect("reopen with paged storage");
+        let result = db
+            .execute(
+                "SELECT grp, COUNT(*), SUM(n) FROM seeded WHERE n >= 10 AND n <= 19 GROUP BY grp",
+            )
+            .expect("grouped aggregate");
+        assert_eq!(result.rows().len(), 2);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[Value::Int64(0), Value::Int64(5), Value::Int64(70)]
+        );
+        assert_eq!(
+            result.rows()[1].values(),
+            &[Value::Int64(1), Value::Int64(5), Value::Int64(75)]
+        );
+
+        let json_after = db
+            .inspect_storage_state_json()
+            .expect("json after grouped aggregate");
+        assert!(
+            json_after.contains("\"loaded_table_count\":0"),
+            "expected paged grouped aggregate to avoid materialization, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"deferred_table_count\":1"),
+            "expected paged-backed table to remain deferred after grouped aggregate, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"rows_in_memory_count\":0"),
+            "expected zero resident rows after paged grouped aggregate, got: {json_after}"
+        );
+    }
+
+    #[test]
+    fn paged_row_storage_expression_projection_keeps_deferred_table_unloaded() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir
+            .path()
+            .join("paged-row-storage-expression-projection.ddb");
+        let config = DbConfig {
+            paged_row_storage: true,
+            ..DbConfig::default()
+        };
+
+        {
+            let db = Db::open_or_create(&path, config.clone()).expect("create db");
+            db.execute(
+                "CREATE TABLE seeded (id INTEGER PRIMARY KEY, n INTEGER, name TEXT, body TEXT)",
+            )
+            .expect("create seeded");
+            let large_body = "x".repeat(2048);
+            let mut txn = db.transaction().expect("begin txn");
+            let insert = txn
+                .prepare("INSERT INTO seeded VALUES ($1, $2, $3, $4)")
+                .expect("prepare insert");
+            for i in 0_i64..96_i64 {
+                insert
+                    .execute_in(
+                        &mut txn,
+                        &[
+                            Value::Int64(i),
+                            Value::Int64(i),
+                            Value::Text(format!("name-{i:03}")),
+                            Value::Text(large_body.clone()),
+                        ],
+                    )
+                    .expect("insert row");
+            }
+            txn.commit().expect("commit rows");
+            db.checkpoint().expect("checkpoint");
+        }
+
+        let db = Db::open_or_create(&path, config).expect("reopen with paged storage");
+
+        let result = db
+            .execute("SELECT n + 1 AS next_n FROM seeded ORDER BY n LIMIT 1")
+            .expect("arithmetic projection");
+        assert_eq!(scalar_i64(&result), 1);
+
+        let json_after_arithmetic = db
+            .inspect_storage_state_json()
+            .expect("json after arithmetic projection");
+        assert!(
+            json_after_arithmetic.contains("\"loaded_table_count\":0"),
+            "expected paged arithmetic projection to avoid materialization, got: {json_after_arithmetic}"
+        );
+        assert!(
+            json_after_arithmetic.contains("\"deferred_table_count\":1"),
+            "expected paged-backed table to remain deferred after arithmetic projection, got: {json_after_arithmetic}"
+        );
+        assert!(
+            json_after_arithmetic.contains("\"rows_in_memory_count\":0"),
+            "expected zero resident rows after arithmetic projection, got: {json_after_arithmetic}"
+        );
+
+        let upper_result = db
+            .execute("SELECT UPPER(name) FROM seeded ORDER BY name LIMIT 1")
+            .expect("function projection");
+        assert_eq!(scalar_text(&upper_result), "NAME-000");
+
+        let json_after_function = db
+            .inspect_storage_state_json()
+            .expect("json after function projection");
+        assert!(
+            json_after_function.contains("\"loaded_table_count\":0"),
+            "expected paged function projection to avoid materialization, got: {json_after_function}"
+        );
+        assert!(
+            json_after_function.contains("\"deferred_table_count\":1"),
+            "expected paged-backed table to remain deferred after function projection, got: {json_after_function}"
+        );
+        assert!(
+            json_after_function.contains("\"rows_in_memory_count\":0"),
+            "expected zero resident rows after function projection, got: {json_after_function}"
         );
     }
 
@@ -5788,7 +6155,8 @@ mod tests {
             "expected zero resident rows at open, got: {json_open}"
         );
 
-        // A query shape outside the deferred fast paths still triggers materialization.
+        // Simple single-table expression projections now stream directly from
+        // persisted rows instead of forcing resident materialization.
         let result = db
             .execute("SELECT n + 1 FROM seeded ORDER BY n LIMIT 1")
             .expect("query after defer");
@@ -5796,12 +6164,16 @@ mod tests {
 
         let json_after = db.inspect_storage_state_json().expect("json after");
         assert!(
-            json_after.contains("\"deferred_table_count\":0"),
-            "expected zero deferred tables after first query, got: {json_after}"
+            json_after.contains("\"deferred_table_count\":1"),
+            "expected deferred table to remain deferred after first query, got: {json_after}"
         );
         assert!(
-            json_after.contains("\"rows_in_memory_count\":50"),
-            "expected 50 resident rows after materialize, got: {json_after}"
+            json_after.contains("\"loaded_table_count\":0"),
+            "expected zero loaded tables after deferred expression projection, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"rows_in_memory_count\":0"),
+            "expected zero resident rows after deferred expression projection, got: {json_after}"
         );
     }
 
@@ -5882,6 +6254,48 @@ mod tests {
         assert!(
             json_after.contains("\"rows_in_memory_count\":0"),
             "expected zero resident rows after deferred count, got: {json_after}"
+        );
+    }
+
+    #[test]
+    fn simple_min_max_keeps_deferred_table_unloaded() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir.path().join("deferred-min-max.ddb");
+
+        {
+            let db = Db::open_or_create(&path, DbConfig::default()).expect("create db");
+            db.execute("CREATE TABLE seeded (id INTEGER PRIMARY KEY, n INTEGER)")
+                .expect("create seeded");
+            for i in 0..50 {
+                let n = if i % 10 == 0 {
+                    "NULL".to_string()
+                } else {
+                    i.to_string()
+                };
+                db.execute(&format!("INSERT INTO seeded (id, n) VALUES ({i}, {n})"))
+                    .expect("insert");
+            }
+            db.checkpoint().expect("checkpoint before close");
+        }
+
+        let db = Db::open_or_create(&path, DbConfig::default()).expect("reopen with defer");
+        let max_result = db.execute("SELECT MAX(id) FROM seeded").expect("max");
+        assert_eq!(scalar_i64(&max_result), 49);
+        let min_result = db.execute("SELECT MIN(n) FROM seeded").expect("min");
+        assert_eq!(scalar_i64(&min_result), 1);
+
+        let json_after = db.inspect_storage_state_json().expect("json after min/max");
+        assert!(
+            json_after.contains("\"loaded_table_count\":0"),
+            "expected min/max to avoid materialization, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"deferred_table_count\":1"),
+            "expected deferred table to remain deferred after min/max, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"rows_in_memory_count\":0"),
+            "expected zero resident rows after deferred min/max, got: {json_after}"
         );
     }
 
@@ -6276,12 +6690,12 @@ mod tests {
 
         let json_after = db.inspect_storage_state_json().expect("json after query");
         assert!(
-            json_after.contains("\"loaded_table_count\":1,"),
-            "expected mixed-case table to load on first query, got: {json_after}"
+            json_after.contains("\"loaded_table_count\":0,"),
+            "expected mixed-case expression projection to stay deferred, got: {json_after}"
         );
         assert!(
-            json_after.contains("\"deferred_table_count\":0}"),
-            "expected no deferred tables after load, got: {json_after}"
+            json_after.contains("\"deferred_table_count\":1}"),
+            "expected mixed-case table to remain deferred after query, got: {json_after}"
         );
     }
 
@@ -6330,29 +6744,30 @@ mod tests {
             "expected 2 deferred tables at open, got: {json_open}"
         );
 
-        // Query only the small table with a shape that still requires
-        // resident rows, not the deferred COUNT(*) fast path.
+        // Query only the small table with a single-table expression
+        // projection. The deferred expression path should answer from
+        // persisted bytes without loading either table.
         let result = db
             .execute("SELECT n + 1 FROM small ORDER BY n LIMIT 1")
             .expect("query small");
         assert_eq!(scalar_i64(&result), 1);
 
-        // After query: per-table on-demand load must have materialized
-        // ONLY `small`, leaving `large` deferred. Use precise field
-        // assertions (with trailing comma) to avoid the substring-match
-        // bug where `:10` matches `:1010`.
+        // After query both tables should still be deferred because the
+        // executor streamed from persisted bytes instead of materializing
+        // `small`. Use precise field assertions (with trailing comma) to
+        // avoid the substring-match bug where `:10` matches `:1010`.
         let json_after = db.inspect_storage_state_json().expect("json after query");
         assert!(
-            json_after.contains("\"deferred_table_count\":1}"),
-            "expected exactly 1 deferred table after small-only query, got: {json_after}"
+            json_after.contains("\"deferred_table_count\":2}"),
+            "expected both tables to remain deferred after small-only query, got: {json_after}"
         );
         assert!(
-            json_after.contains("\"loaded_table_count\":1,"),
-            "expected exactly 1 loaded table after small-only query, got: {json_after}"
+            json_after.contains("\"loaded_table_count\":0,"),
+            "expected zero loaded tables after small-only query, got: {json_after}"
         );
         assert!(
-            json_after.contains("\"rows_in_memory_count\":10,"),
-            "expected exactly 10 resident rows (small only), got: {json_after}"
+            json_after.contains("\"rows_in_memory_count\":0,"),
+            "expected zero resident rows after deferred expression projection, got: {json_after}"
         );
     }
 
