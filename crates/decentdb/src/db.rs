@@ -1564,6 +1564,15 @@ impl Db {
             )? {
                 return Ok(result);
             }
+            if let Some(result) = runtime.try_execute_simple_deferred_paged_query(
+                query,
+                params,
+                &self.inner.pager,
+                &self.inner.wal,
+                snapshot_lsn,
+            )? {
+                return Ok(result);
+            }
         }
 
         let targeted_ok =
@@ -5580,6 +5589,141 @@ mod tests {
         assert!(
             json_after.contains("\"rows_in_memory_count\":0"),
             "expected zero resident rows after prepared deferred point lookup, got: {json_after}"
+        );
+    }
+
+    #[test]
+    fn simple_table_projection_keeps_deferred_table_unloaded() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir.path().join("deferred-simple-projection.ddb");
+
+        {
+            let db = Db::open_or_create(&path, DbConfig::default()).expect("create db");
+            db.execute("CREATE TABLE seeded (id INTEGER PRIMARY KEY, n INTEGER)")
+                .expect("create seeded");
+            for i in 0..50 {
+                db.execute(&format!("INSERT INTO seeded (id, n) VALUES ({i}, {i})"))
+                    .expect("insert");
+            }
+            db.checkpoint().expect("checkpoint before close");
+        }
+
+        let db = Db::open_or_create(&path, DbConfig::default()).expect("reopen with defer");
+        let result = db
+            .execute("SELECT n FROM seeded")
+            .expect("simple projection");
+        assert_eq!(result.rows().len(), 50);
+        assert_eq!(result.rows()[0].values(), &[Value::Int64(0)]);
+        assert_eq!(result.rows()[49].values(), &[Value::Int64(49)]);
+
+        let json_after = db
+            .inspect_storage_state_json()
+            .expect("json after simple projection");
+        assert!(
+            json_after.contains("\"loaded_table_count\":0"),
+            "expected simple projection to avoid resident materialization, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"deferred_table_count\":1"),
+            "expected deferred table to remain deferred after simple projection, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"rows_in_memory_count\":0"),
+            "expected zero resident rows after simple projection, got: {json_after}"
+        );
+    }
+
+    #[test]
+    fn simple_filtered_projection_keeps_deferred_table_unloaded() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir.path().join("deferred-filtered-projection.ddb");
+
+        {
+            let db = Db::open_or_create(&path, DbConfig::default()).expect("create db");
+            db.execute("CREATE TABLE seeded (id INTEGER PRIMARY KEY, n INTEGER)")
+                .expect("create seeded");
+            for i in 0..50 {
+                db.execute(&format!("INSERT INTO seeded (id, n) VALUES ({i}, {i})"))
+                    .expect("insert");
+            }
+            db.checkpoint().expect("checkpoint before close");
+        }
+
+        let db = Db::open_or_create(&path, DbConfig::default()).expect("reopen with defer");
+        let result = db
+            .execute("SELECT n FROM seeded WHERE n >= 10 AND n <= 12 ORDER BY n")
+            .expect("filtered projection");
+        assert_eq!(result.rows().len(), 3);
+        assert_eq!(result.rows()[0].values(), &[Value::Int64(10)]);
+        assert_eq!(result.rows()[1].values(), &[Value::Int64(11)]);
+        assert_eq!(result.rows()[2].values(), &[Value::Int64(12)]);
+
+        let json_after = db
+            .inspect_storage_state_json()
+            .expect("json after filtered projection");
+        assert!(
+            json_after.contains("\"loaded_table_count\":0"),
+            "expected filtered projection to avoid resident materialization, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"deferred_table_count\":1"),
+            "expected deferred table to remain deferred after filtered projection, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"rows_in_memory_count\":0"),
+            "expected zero resident rows after filtered projection, got: {json_after}"
+        );
+    }
+
+    #[test]
+    fn simple_grouped_numeric_aggregate_keeps_deferred_table_unloaded() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir.path().join("deferred-grouped-aggregate.ddb");
+
+        {
+            let db = Db::open_or_create(&path, DbConfig::default()).expect("create db");
+            db.execute("CREATE TABLE seeded (id INTEGER PRIMARY KEY, grp INTEGER, n INTEGER)")
+                .expect("create seeded");
+            for i in 0..10 {
+                db.execute(&format!(
+                    "INSERT INTO seeded (id, grp, n) VALUES ({i}, {}, {i})",
+                    i % 2
+                ))
+                .expect("insert");
+            }
+            db.checkpoint().expect("checkpoint before close");
+        }
+
+        let db = Db::open_or_create(&path, DbConfig::default()).expect("reopen with defer");
+        let result = db
+            .execute(
+                "SELECT grp, COUNT(*), SUM(n) FROM seeded WHERE n >= 2 AND n <= 7 GROUP BY grp",
+            )
+            .expect("grouped aggregate");
+        assert_eq!(result.rows().len(), 2);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[Value::Int64(0), Value::Int64(3), Value::Int64(12)]
+        );
+        assert_eq!(
+            result.rows()[1].values(),
+            &[Value::Int64(1), Value::Int64(3), Value::Int64(15)]
+        );
+
+        let json_after = db
+            .inspect_storage_state_json()
+            .expect("json after grouped aggregate");
+        assert!(
+            json_after.contains("\"loaded_table_count\":0"),
+            "expected grouped aggregate to avoid materialization, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"deferred_table_count\":1"),
+            "expected deferred table to remain deferred after grouped aggregate, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"rows_in_memory_count\":0"),
+            "expected zero resident rows after grouped aggregate, got: {json_after}"
         );
     }
 

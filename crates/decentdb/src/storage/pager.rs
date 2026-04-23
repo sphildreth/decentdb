@@ -55,6 +55,11 @@ impl PagerHandle {
         handle.read()
     }
 
+    pub(crate) fn read_page_from_disk(&self, page_id: PageId) -> Result<Arc<[u8]>> {
+        page::validate_page_id(page_id)?;
+        Ok(Arc::from(self.inner.load_page_from_disk(page_id)?))
+    }
+
     pub(crate) fn write_page_direct(&self, page_id: PageId, data: &[u8]) -> Result<()> {
         page::validate_page_id(page_id)?;
         if data.len() != self.inner.page_size as usize {
@@ -354,6 +359,53 @@ mod tests {
         assert_eq!(first.to_vec(), payload);
         assert_eq!(second.to_vec(), payload);
         assert_eq!(counter.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn read_page_from_disk_bypasses_stale_cache() {
+        let mem_vfs = MemVfs::default();
+        let path = unique_path("disk-bypass");
+        let inner = mem_vfs
+            .open(&path, OpenMode::CreateNew, FileKind::Database)
+            .expect("create database");
+        let header = DatabaseHeader::new(page::DEFAULT_PAGE_SIZE);
+        write_database_bootstrap_vfs(inner.as_ref(), &header).expect("bootstrap database");
+        let original = vec![0x11; page::DEFAULT_PAGE_SIZE as usize];
+        write_all_at(
+            inner.as_ref(),
+            page::page_offset(3, page::DEFAULT_PAGE_SIZE),
+            &original,
+        )
+        .expect("write original page");
+        inner
+            .set_len(page::page_offset(4, page::DEFAULT_PAGE_SIZE))
+            .expect("extend file");
+
+        let pager = PagerHandle::open(Arc::clone(&inner), header, 1).expect("open pager");
+        assert_eq!(pager.read_page(3).expect("cached read").to_vec(), original);
+
+        let updated = vec![0x22; page::DEFAULT_PAGE_SIZE as usize];
+        write_all_at(
+            inner.as_ref(),
+            page::page_offset(3, page::DEFAULT_PAGE_SIZE),
+            &updated,
+        )
+        .expect("overwrite page");
+
+        assert_eq!(
+            pager
+                .read_page(3)
+                .expect("cached page remains stale")
+                .to_vec(),
+            original
+        );
+        assert_eq!(
+            pager
+                .read_page_from_disk(3)
+                .expect("disk bypass read")
+                .to_vec(),
+            updated
+        );
     }
 
     #[test]
