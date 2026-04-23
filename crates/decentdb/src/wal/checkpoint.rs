@@ -82,20 +82,22 @@ pub(crate) fn checkpoint(wal: &WalHandle, pager: &PagerHandle, timeout_sec: u64)
             .lock()
             .expect("wal index lock should not be poisoned");
         // Check inside the index lock to avoid racing with begin_reader().
-        if wal.inner.reader_registry.active_reader_count()? == 0 {
+        // Only truncate WAL when safe_lsn covers all committed data
+        // (i.e. no readers were active when we started, so we wrote
+        // every version).  If safe_lsn < current_lsn, a reader that
+        // dropped after we computed safe_lsn would cause us to lose
+        // post-safe_lsn commits if we truncated.
+        if wal.inner.reader_registry.active_reader_count()? == 0 && safe_lsn >= current_lsn {
             index.clear();
             drop(index);
             writer::truncate_to_header(wal)?;
         } else {
             index.prune_at_or_below(&page_ids, safe_lsn);
             drop(index);
-            let warnings = wal
+            let _warnings = wal
                 .inner
                 .reader_registry
                 .capture_long_reader_warnings(timeout_sec)?;
-            for warning in warnings {
-                eprintln!("decentdb checkpoint warning: {warning}");
-            }
         }
     }
 
