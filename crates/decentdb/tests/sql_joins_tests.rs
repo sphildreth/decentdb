@@ -6,12 +6,19 @@
 
 use decentdb::{Db, DbConfig, QueryResult, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 static NEXT_JOIN_ID: AtomicU64 = AtomicU64::new(0);
 
 fn unique_path() -> String {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time")
+        .as_nanos();
     format!(
-        "/tmp/test_join_{}.db",
+        "/tmp/test_join_{}-{}-{}.db",
+        std::process::id(),
+        timestamp,
         NEXT_JOIN_ID.fetch_add(1, Ordering::SeqCst)
     )
 }

@@ -1454,7 +1454,9 @@ impl Db {
         let on_open_threshold_bytes =
             u64::from(effective_config.auto_checkpoint_on_open_mb) * 1024 * 1024;
         if on_open_threshold_bytes > 0 {
-            let wal_size = wal.file_size().unwrap_or(0);
+            let wal_size = wal
+                .latest_snapshot()
+                .saturating_sub(crate::wal::format::WAL_HEADER_SIZE);
             if wal_size > on_open_threshold_bytes {
                 // Best-effort: a checkpoint failure here is not fatal,
                 // because the runtime load below will still succeed
@@ -2681,6 +2683,14 @@ impl Db {
 
         let writer_last_commit_lsn = self.inner.writer_last_commit_lsn.load(Ordering::Acquire);
         if last_runtime_lsn > 0 && latest_lsn <= writer_last_commit_lsn {
+            // A checkpoint can legally fold this handle's last committed WAL
+            // history back into the database file and reset the live WAL end
+            // (often to 0 after truncation). The in-memory runtime is still
+            // current, but future OCC writes must compare against the new live
+            // WAL end rather than the pre-checkpoint commit LSN.
+            self.inner
+                .last_runtime_lsn
+                .store(latest_lsn, Ordering::Release);
             return Ok(());
         }
 
@@ -4537,6 +4547,70 @@ mod tests {
                     .expect("reader count after")
             ),
             200
+        );
+    }
+
+    #[test]
+    fn same_handle_explicit_txn_can_commit_after_checkpoint_truncates_wal() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir.path().join("checkpoint-explicit-txn-rebase.ddb");
+        let db = Db::open_or_create(&path, DbConfig::default()).expect("open db");
+
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+            .expect("create table");
+        db.execute("INSERT INTO t VALUES (1, 'before-checkpoint')")
+            .expect("insert before checkpoint");
+        db.checkpoint().expect("checkpoint");
+        assert_eq!(
+            db.inner.wal.latest_snapshot(),
+            0,
+            "checkpoint should truncate WAL"
+        );
+
+        db.begin_transaction().expect("begin transaction");
+        db.execute("INSERT INTO t VALUES (2, 'after-checkpoint')")
+            .expect("insert after checkpoint");
+        db.commit_transaction()
+            .expect("commit transaction after checkpoint");
+
+        assert_eq!(
+            scalar_i64(&db.execute("SELECT COUNT(*) FROM t").expect("count rows")),
+            2
+        );
+    }
+
+    #[test]
+    fn same_handle_prepared_explicit_txn_can_commit_after_checkpoint_truncates_wal() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir
+            .path()
+            .join("checkpoint-prepared-explicit-txn-rebase.ddb");
+        let db = Db::open_or_create(&path, DbConfig::default()).expect("open db");
+
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+            .expect("create table");
+        db.execute("INSERT INTO t VALUES (1, 'before-checkpoint')")
+            .expect("insert before checkpoint");
+        db.checkpoint().expect("checkpoint");
+        assert_eq!(
+            db.inner.wal.latest_snapshot(),
+            0,
+            "checkpoint should truncate WAL"
+        );
+
+        db.begin_transaction().expect("begin transaction");
+        let prepared = db
+            .prepare("INSERT INTO t VALUES ($1, $2)")
+            .expect("prepare insert");
+        prepared
+            .execute(&[Value::Int64(2), Value::Text("after-checkpoint".to_string())])
+            .expect("execute prepared insert after checkpoint");
+        db.commit_transaction()
+            .expect("commit prepared transaction after checkpoint");
+
+        assert_eq!(
+            scalar_i64(&db.execute("SELECT COUNT(*) FROM t").expect("count rows")),
+            2
         );
     }
 

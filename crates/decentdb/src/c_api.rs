@@ -2409,4 +2409,196 @@ mod tests {
         assert_eq!(ddb_stmt_free(&mut select_stmt), DDB_OK);
         assert_eq!(ddb_db_free(&mut db), DDB_OK);
     }
+
+    #[test]
+    fn ffi_prepared_explicit_txn_can_commit_after_checkpoint_truncates_wal() {
+        let unique = format!(
+            "ffi-checkpoint-{}-{}.ddb",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        );
+        let path_buf = std::env::temp_dir().join(unique);
+        let path = CString::new(path_buf.to_string_lossy().as_bytes()).expect("path");
+        let mut db = ptr::null_mut();
+        let mut result = ptr::null_mut();
+
+        assert_eq!(ddb_db_open_or_create(path.as_ptr(), &mut db), DDB_OK);
+
+        let create =
+            CString::new("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)").expect("create");
+        assert_eq!(
+            ddb_db_execute(db, create.as_ptr(), ptr::null(), 0, &mut result),
+            DDB_OK
+        );
+        assert_eq!(ddb_result_free(&mut result), DDB_OK);
+
+        let seed_insert =
+            CString::new("INSERT INTO t VALUES (1, 'before-checkpoint')").expect("seed insert");
+        assert_eq!(
+            ddb_db_execute(db, seed_insert.as_ptr(), ptr::null(), 0, &mut result),
+            DDB_OK
+        );
+        assert_eq!(ddb_result_free(&mut result), DDB_OK);
+
+        assert_eq!(ddb_db_checkpoint(db), DDB_OK);
+
+        let insert = CString::new("INSERT INTO t VALUES ($1, $2)").expect("insert");
+        let text = CString::new("after-checkpoint").expect("text");
+        let mut stmt = ptr::null_mut();
+        let mut has_row = 1;
+        let mut lsn = u64::MAX;
+
+        assert_eq!(ddb_db_begin_transaction(db), DDB_OK);
+        assert_eq!(ddb_db_prepare(db, insert.as_ptr(), &mut stmt), DDB_OK);
+        assert_eq!(ddb_stmt_bind_int64(stmt, 1, 2), DDB_OK);
+        assert_eq!(
+            ddb_stmt_bind_text(stmt, 2, text.as_ptr(), text.as_bytes().len()),
+            DDB_OK
+        );
+        assert_eq!(ddb_stmt_step(stmt, &mut has_row), DDB_OK);
+        assert_eq!(has_row, 0);
+        assert_eq!(ddb_db_commit_transaction(db, &mut lsn), DDB_OK);
+        assert_ne!(lsn, u64::MAX);
+
+        assert_eq!(ddb_stmt_free(&mut stmt), DDB_OK);
+        assert_eq!(ddb_db_free(&mut db), DDB_OK);
+
+        let _ = std::fs::remove_file(&path_buf);
+        let _ = std::fs::remove_file(path_buf.with_extension("ddb.wal"));
+        let _ = std::fs::remove_file(path_buf.with_extension("ddb.shm"));
+    }
+
+    #[test]
+    fn ffi_cached_prepared_stmt_can_commit_after_checkpoint_truncates_wal() {
+        let unique = format!(
+            "ffi-checkpoint-cached-{}-{}.ddb",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        );
+        let path_buf = std::env::temp_dir().join(unique);
+        let path = CString::new(path_buf.to_string_lossy().as_bytes()).expect("path");
+        let mut db = ptr::null_mut();
+        let mut result = ptr::null_mut();
+        let insert = CString::new("INSERT INTO t VALUES ($1, $2)").expect("insert");
+        let first_text = CString::new("before-checkpoint").expect("first text");
+        let second_text = CString::new("after-checkpoint").expect("second text");
+        let mut stmt = ptr::null_mut();
+        let mut has_row = 1;
+        let mut lsn = u64::MAX;
+
+        assert_eq!(ddb_db_open_or_create(path.as_ptr(), &mut db), DDB_OK);
+
+        let create =
+            CString::new("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)").expect("create");
+        assert_eq!(
+            ddb_db_execute(db, create.as_ptr(), ptr::null(), 0, &mut result),
+            DDB_OK
+        );
+        assert_eq!(ddb_result_free(&mut result), DDB_OK);
+
+        assert_eq!(ddb_db_prepare(db, insert.as_ptr(), &mut stmt), DDB_OK);
+
+        assert_eq!(ddb_db_begin_transaction(db), DDB_OK);
+        assert_eq!(ddb_stmt_bind_int64(stmt, 1, 1), DDB_OK);
+        assert_eq!(
+            ddb_stmt_bind_text(stmt, 2, first_text.as_ptr(), first_text.as_bytes().len()),
+            DDB_OK
+        );
+        assert_eq!(ddb_stmt_step(stmt, &mut has_row), DDB_OK);
+        assert_eq!(has_row, 0);
+        assert_eq!(ddb_db_commit_transaction(db, &mut lsn), DDB_OK);
+        assert_ne!(lsn, u64::MAX);
+        assert_eq!(ddb_stmt_reset(stmt), DDB_OK);
+        assert_eq!(ddb_stmt_clear_bindings(stmt), DDB_OK);
+
+        assert_eq!(ddb_db_checkpoint(db), DDB_OK);
+
+        has_row = 1;
+        lsn = u64::MAX;
+        assert_eq!(ddb_db_begin_transaction(db), DDB_OK);
+        assert_eq!(ddb_stmt_bind_int64(stmt, 1, 2), DDB_OK);
+        assert_eq!(
+            ddb_stmt_bind_text(stmt, 2, second_text.as_ptr(), second_text.as_bytes().len()),
+            DDB_OK
+        );
+        assert_eq!(ddb_stmt_step(stmt, &mut has_row), DDB_OK);
+        assert_eq!(has_row, 0);
+        assert_eq!(ddb_db_commit_transaction(db, &mut lsn), DDB_OK);
+        assert_ne!(lsn, u64::MAX);
+
+        assert_eq!(ddb_stmt_free(&mut stmt), DDB_OK);
+        assert_eq!(ddb_db_free(&mut db), DDB_OK);
+
+        let _ = std::fs::remove_file(&path_buf);
+        let _ = std::fs::remove_file(path_buf.with_extension("ddb.wal"));
+        let _ = std::fs::remove_file(path_buf.with_extension("ddb.shm"));
+    }
+
+    #[test]
+    fn ffi_reused_prepared_stmt_across_checkpoint_keeps_explicit_txn_commit_working() {
+        let unique = format!(
+            "ffi-checkpoint-reuse-{}-{}.ddb",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        );
+        let path_buf = std::env::temp_dir().join(unique);
+        let path = CString::new(path_buf.to_string_lossy().as_bytes()).expect("path");
+        let mut db = ptr::null_mut();
+        let mut result = ptr::null_mut();
+        let insert = CString::new("INSERT INTO t VALUES ($1, $2)").expect("insert");
+        let mut stmt = ptr::null_mut();
+        let mut has_row = 1;
+        let mut lsn = u64::MAX;
+
+        assert_eq!(ddb_db_open_or_create(path.as_ptr(), &mut db), DDB_OK);
+
+        let create =
+            CString::new("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)").expect("create");
+        assert_eq!(
+            ddb_db_execute(db, create.as_ptr(), ptr::null(), 0, &mut result),
+            DDB_OK
+        );
+        assert_eq!(ddb_result_free(&mut result), DDB_OK);
+
+        assert_eq!(ddb_db_prepare(db, insert.as_ptr(), &mut stmt), DDB_OK);
+
+        for chunk in 0_i64..4_i64 {
+            assert_eq!(ddb_db_begin_transaction(db), DDB_OK);
+            for i in 0_i64..64_i64 {
+                let id = chunk * 64 + i + 1;
+                let text = CString::new(format!("payload-{id}")).expect("text");
+                assert_eq!(ddb_stmt_bind_int64(stmt, 1, id), DDB_OK);
+                assert_eq!(
+                    ddb_stmt_bind_text(stmt, 2, text.as_ptr(), text.as_bytes().len()),
+                    DDB_OK
+                );
+                assert_eq!(ddb_stmt_step(stmt, &mut has_row), DDB_OK);
+                assert_eq!(has_row, 0);
+                assert_eq!(ddb_stmt_reset(stmt), DDB_OK);
+                assert_eq!(ddb_stmt_clear_bindings(stmt), DDB_OK);
+                has_row = 1;
+            }
+            assert_eq!(ddb_db_commit_transaction(db, &mut lsn), DDB_OK);
+            assert_ne!(lsn, u64::MAX);
+            if chunk % 2 == 1 {
+                assert_eq!(ddb_db_checkpoint(db), DDB_OK);
+            }
+        }
+
+        assert_eq!(ddb_stmt_free(&mut stmt), DDB_OK);
+        assert_eq!(ddb_db_free(&mut db), DDB_OK);
+
+        let _ = std::fs::remove_file(&path_buf);
+        let _ = std::fs::remove_file(path_buf.with_extension("ddb.wal"));
+        let _ = std::fs::remove_file(path_buf.with_extension("ddb.shm"));
+    }
 }

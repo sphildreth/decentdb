@@ -87,8 +87,7 @@ pub(crate) fn checkpoint(wal: &WalHandle, pager: &PagerHandle, timeout_sec: u64)
         // every version).  If safe_lsn < current_lsn, a reader that
         // dropped after we computed safe_lsn would cause us to lose
         // post-safe_lsn commits if we truncated.
-        let latest_now = wal.latest_snapshot();
-        if wal.inner.reader_registry.active_reader_count()? == 0 && safe_lsn >= latest_now {
+        if wal.inner.reader_registry.active_reader_count()? == 0 && safe_lsn >= current_lsn {
             index.clear();
             drop(index);
             writer::truncate_to_header(wal)?;
