@@ -173,6 +173,7 @@ struct DbInner {
     catalog: CatalogHandle,
     engine: RwLock<EngineRuntime>,
     last_runtime_lsn: AtomicU64,
+    writer_last_commit_lsn: AtomicU64,
     last_seen_checkpoint_epoch: AtomicU64,
     sql_write_lock: Mutex<()>,
     sql_txn: Mutex<SqlTxnSlot>,
@@ -1459,11 +1460,7 @@ impl Db {
                 // because the runtime load below will still succeed
                 // against the existing WAL state. Surface it as a
                 // warning-shaped log so embedders can investigate.
-                if let Err(e) = wal.checkpoint(&pager, effective_config.checkpoint_timeout_sec) {
-                    eprintln!(
-                        "decentdb open: auto-checkpoint at open failed (wal_size={wal_size} bytes): {e}"
-                    );
-                }
+                if let Err(_e) = wal.checkpoint(&pager, effective_config.checkpoint_timeout_sec) {}
             }
         }
 
@@ -1482,6 +1479,7 @@ impl Db {
                 catalog,
                 engine: RwLock::new(runtime),
                 last_runtime_lsn: AtomicU64::new(runtime_lsn),
+                writer_last_commit_lsn: AtomicU64::new(0),
                 last_seen_checkpoint_epoch: AtomicU64::new(last_seen_checkpoint_epoch),
                 sql_write_lock: Mutex::new(()),
                 sql_txn: Mutex::new(SqlTxnSlot::None),
@@ -2119,6 +2117,9 @@ impl Db {
         self.inner
             .last_runtime_lsn
             .store(committed_lsn, Ordering::Release);
+        self.inner
+            .writer_last_commit_lsn
+            .store(committed_lsn, Ordering::Release);
         Ok(Some(result))
     }
 
@@ -2172,6 +2173,9 @@ impl Db {
         self.sync_temp_state_from_runtime(&runtime)?;
         self.inner
             .last_runtime_lsn
+            .store(committed_lsn, Ordering::Release);
+        self.inner
+            .writer_last_commit_lsn
             .store(committed_lsn, Ordering::Release);
         Ok(Some(result))
     }
@@ -2227,6 +2231,9 @@ impl Db {
         self.inner
             .last_runtime_lsn
             .store(committed_lsn, Ordering::Release);
+        self.inner
+            .writer_last_commit_lsn
+            .store(committed_lsn, Ordering::Release);
         Ok(Some(result))
     }
 
@@ -2271,6 +2278,9 @@ impl Db {
         self.inner
             .last_runtime_lsn
             .store(committed_lsn, Ordering::Release);
+        self.inner
+            .writer_last_commit_lsn
+            .store(committed_lsn, Ordering::Release);
         Ok(result)
     }
 
@@ -2312,6 +2322,9 @@ impl Db {
         self.sync_temp_state_from_runtime(&runtime)?;
         self.inner
             .last_runtime_lsn
+            .store(committed_lsn, Ordering::Release);
+        self.inner
+            .writer_last_commit_lsn
             .store(committed_lsn, Ordering::Release);
         Ok(())
     }
@@ -2518,6 +2531,9 @@ impl Db {
         self.inner
             .last_runtime_lsn
             .store(committed_lsn, Ordering::Release);
+        self.inner
+            .writer_last_commit_lsn
+            .store(committed_lsn, Ordering::Release);
         Ok(committed_lsn)
     }
 
@@ -2566,6 +2582,9 @@ impl Db {
         *guard = runtime;
         self.inner
             .last_runtime_lsn
+            .store(committed_lsn, Ordering::Release);
+        self.inner
+            .writer_last_commit_lsn
             .store(committed_lsn, Ordering::Release);
         drop(guard);
 
@@ -2658,6 +2677,11 @@ impl Db {
             self.inner
                 .last_seen_checkpoint_epoch
                 .store(latest_checkpoint_epoch, Ordering::Release);
+        }
+
+        let writer_last_commit_lsn = self.inner.writer_last_commit_lsn.load(Ordering::Acquire);
+        if last_runtime_lsn > 0 && latest_lsn <= writer_last_commit_lsn {
+            return Ok(());
         }
 
         let schema_cookie = self.current_schema_cookie()?;
