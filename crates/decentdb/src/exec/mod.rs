@@ -2598,7 +2598,10 @@ impl EngineRuntime {
         }
     }
 
-    fn try_execute_simple_count_query(&self, query: &Query) -> Result<Option<QueryResult>> {
+    fn analyze_simple_count_query<'a>(
+        &'a self,
+        query: &'a Query,
+    ) -> Result<Option<SimpleCountQueryPlan<'a>>> {
         if !query.ctes.is_empty()
             || !query.order_by.is_empty()
             || query.limit.is_some()
@@ -2659,15 +2662,87 @@ impl EngineRuntime {
             return Ok(None);
         }
 
-        let row_count = self.visible_table_row_source(name).map_or_else(
-            || self.table_data(name).map_or(0, |data| data.rows.len()),
+        Ok(Some(SimpleCountQueryPlan {
+            table_name: name,
+            column_name: alias.clone().unwrap_or_else(|| infer_expr_name(expr, 1)),
+        }))
+    }
+
+    fn try_execute_simple_count_query(&self, query: &Query) -> Result<Option<QueryResult>> {
+        let Some(plan) = self.analyze_simple_count_query(query)? else {
+            return Ok(None);
+        };
+
+        let row_count = self.visible_table_row_source(plan.table_name).map_or_else(
+            || {
+                self.table_data(plan.table_name)
+                    .map_or(0, |data| data.rows.len())
+            },
             |source| source.row_count(),
         );
-        let row_count = i64::try_from(row_count)
-            .map_err(|_| DbError::sql(format!("table {name} exceeds COUNT(*) row-count limits")))?;
-        let column_name = alias.clone().unwrap_or_else(|| infer_expr_name(expr, 1));
+        let row_count = i64::try_from(row_count).map_err(|_| {
+            DbError::sql(format!(
+                "table {} exceeds COUNT(*) row-count limits",
+                plan.table_name
+            ))
+        })?;
         Ok(Some(QueryResult::with_rows(
-            vec![column_name],
+            vec![plan.column_name],
+            vec![QueryRow::new(vec![Value::Int64(row_count)])],
+        )))
+    }
+
+    pub(crate) fn try_execute_simple_deferred_count_query(
+        &self,
+        query: &Query,
+        pager: &PagerHandle,
+        wal: &WalHandle,
+        snapshot_lsn: u64,
+    ) -> Result<Option<QueryResult>> {
+        let Some(plan) = self.analyze_simple_count_query(query)? else {
+            return Ok(None);
+        };
+        if self.visible_table_is_temporary(plan.table_name)
+            || self.visible_table_row_source(plan.table_name).is_some()
+            || !self.has_deferred_tables()
+        {
+            return Ok(None);
+        }
+        if !self
+            .deferred_table_names()
+            .any(|candidate| identifiers_equal(candidate, plan.table_name))
+        {
+            return Ok(None);
+        }
+        let Some(state) = self.persisted_table_state(plan.table_name) else {
+            return Ok(None);
+        };
+        let row_count = self
+            .catalog
+            .table_stats
+            .iter()
+            .find(|(name, _)| identifiers_equal(name, plan.table_name))
+            .map(|(_, stats)| stats.row_count)
+            .or_else(|| {
+                if state.row_count == 0
+                    && state.pointer.head_page_id != 0
+                    && state.pointer.logical_len != 0
+                {
+                    let store = SnapshotPageStore {
+                        pager,
+                        wal,
+                        snapshot_lsn,
+                    };
+                    read_table_payload_row_count(&store, state.pointer)
+                        .ok()
+                        .and_then(|count| i64::try_from(count).ok())
+                } else {
+                    i64::try_from(state.row_count).ok()
+                }
+            })
+            .unwrap_or(0);
+        Ok(Some(QueryResult::with_rows(
+            vec![plan.column_name],
             vec![QueryRow::new(vec![Value::Int64(row_count)])],
         )))
     }
@@ -6659,6 +6734,11 @@ struct SimpleIndexedProjectionPlan<'a> {
     column_names: Vec<String>,
 }
 
+struct SimpleCountQueryPlan<'a> {
+    table_name: &'a str,
+    column_name: String,
+}
+
 struct SimpleGroupedNumericAggregatePlan<'a> {
     table_name: &'a str,
     group_column_index: usize,
@@ -8231,6 +8311,9 @@ fn decode_manifest_payload<S: PageStore>(_store: &S, bytes: &[u8]) -> Result<Eng
             let stats = crate::catalog::TableStats {
                 row_count: cursor.read_i64()?,
             };
+            if let Some(state) = runtime.persisted_tables.get_mut(&name) {
+                state.row_count = usize::try_from(stats.row_count.max(0)).unwrap_or(usize::MAX);
+            }
             runtime.catalog_mut().table_stats.insert(name, stats);
         }
     }
@@ -9450,6 +9533,32 @@ fn read_deferred_row_by_locator_from_table_payload<S: PageStore>(
         row_id,
         values: row.into_values(),
     }))
+}
+
+fn read_table_payload_row_count<S: PageStore>(
+    store: &S,
+    pointer: OverflowPointer,
+) -> Result<usize> {
+    if pointer.head_page_id == 0 || pointer.logical_len == 0 {
+        return Ok(0);
+    }
+    if pointer.is_compressed() {
+        let payload = read_overflow(store, pointer)?;
+        let mut cursor = Cursor::new(&payload);
+        let magic = cursor.read_slice(TABLE_PAYLOAD_MAGIC.len())?;
+        if magic != TABLE_PAYLOAD_MAGIC {
+            return Err(DbError::corruption("table payload magic is invalid"));
+        }
+        return Ok(cursor.read_u32()? as usize);
+    }
+
+    let mut cursor = OverflowPayloadCursor::new(store, pointer);
+    let mut magic = [0_u8; TABLE_PAYLOAD_MAGIC.len()];
+    cursor.read_exact(&mut magic)?;
+    if magic != *TABLE_PAYLOAD_MAGIC {
+        return Err(DbError::corruption("table payload magic is invalid"));
+    }
+    Ok(cursor.read_u32()? as usize)
 }
 
 fn read_deferred_row_by_id_from_table_payload<S: PageStore>(

@@ -1554,6 +1554,14 @@ impl Db {
                 .read()
                 .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
             self.validate_prepared_against_runtime(prepared, &runtime)?;
+            if let Some(result) = runtime.try_execute_simple_deferred_count_query(
+                query,
+                &self.inner.pager,
+                &self.inner.wal,
+                snapshot_lsn,
+            )? {
+                return Ok(result);
+            }
             if let Some(result) = runtime.try_execute_simple_deferred_indexed_projection_query(
                 query,
                 params,
@@ -5416,6 +5424,13 @@ mod tests {
         }
     }
 
+    fn scalar_text(result: &crate::QueryResult) -> &str {
+        match &result.rows()[0].values()[0] {
+            Value::Text(value) => value,
+            other => panic!("expected TEXT scalar, got {other:?}"),
+        }
+    }
+
     /// ADR 0143 Phase A: `inspect_storage_state_json` exposes per-runtime
     /// table residency so callers can verify lazy-load progress.
     #[test]
@@ -5488,11 +5503,11 @@ mod tests {
             "expected zero resident rows at open, got: {json_open}"
         );
 
-        // The first SELECT triggers materialization.
+        // A query shape outside the deferred fast paths still triggers materialization.
         let result = db
-            .execute("SELECT COUNT(*) FROM seeded")
-            .expect("count after defer");
-        assert_eq!(scalar_i64(&result), 50);
+            .execute("SELECT n + 1 FROM seeded ORDER BY n LIMIT 1")
+            .expect("query after defer");
+        assert_eq!(scalar_i64(&result), 1);
 
         let json_after = db.inspect_storage_state_json().expect("json after");
         assert!(
@@ -5547,6 +5562,41 @@ mod tests {
         assert!(
             json_after.contains("\"rows_in_memory_count\":0"),
             "expected zero resident rows after deferred point lookup, got: {json_after}"
+        );
+    }
+
+    #[test]
+    fn simple_count_keeps_deferred_table_unloaded() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir.path().join("deferred-count.ddb");
+
+        {
+            let db = Db::open_or_create(&path, DbConfig::default()).expect("create db");
+            db.execute("CREATE TABLE seeded (id INTEGER PRIMARY KEY, n INTEGER)")
+                .expect("create seeded");
+            for i in 0..50 {
+                db.execute(&format!("INSERT INTO seeded (id, n) VALUES ({i}, {i})"))
+                    .expect("insert");
+            }
+            db.checkpoint().expect("checkpoint before close");
+        }
+
+        let db = Db::open_or_create(&path, DbConfig::default()).expect("reopen with defer");
+        let result = db.execute("SELECT COUNT(*) FROM seeded").expect("count");
+        assert_eq!(scalar_i64(&result), 50);
+
+        let json_after = db.inspect_storage_state_json().expect("json after count");
+        assert!(
+            json_after.contains("\"loaded_table_count\":0"),
+            "expected count to avoid materialization, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"deferred_table_count\":1"),
+            "expected deferred table to remain deferred after count, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"rows_in_memory_count\":0"),
+            "expected zero resident rows after deferred count, got: {json_after}"
         );
     }
 
@@ -5785,9 +5835,9 @@ mod tests {
         );
 
         let result = db
-            .execute("SELECT COUNT(*) FROM ArtistStaging")
-            .expect("count mixed-case table from unquoted SQL");
-        assert_eq!(scalar_i64(&result), 1);
+            .execute("SELECT UPPER(name) FROM ArtistStaging ORDER BY name LIMIT 1")
+            .expect("query mixed-case table from unquoted SQL");
+        assert_eq!(scalar_text(&result), "ALPHA");
 
         let json_after = db.inspect_storage_state_json().expect("json after query");
         assert!(
@@ -5845,11 +5895,12 @@ mod tests {
             "expected 2 deferred tables at open, got: {json_open}"
         );
 
-        // Query only the small table
+        // Query only the small table with a shape that still requires
+        // resident rows, not the deferred COUNT(*) fast path.
         let result = db
-            .execute("SELECT COUNT(*) FROM small")
+            .execute("SELECT n + 1 FROM small ORDER BY n LIMIT 1")
             .expect("query small");
-        assert_eq!(scalar_i64(&result), 10);
+        assert_eq!(scalar_i64(&result), 1);
 
         // After query: per-table on-demand load must have materialized
         // ONLY `small`, leaving `large` deferred. Use precise field
