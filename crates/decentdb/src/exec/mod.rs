@@ -2961,6 +2961,9 @@ impl EngineRuntime {
                 {
                     return Ok(result);
                 }
+                if let Some(result) = self.try_execute_general_grouped_query(query, params)? {
+                    return Ok(result);
+                }
                 if let Some(result) = self.try_execute_benchmark_history_query(query, params)? {
                     return Ok(result);
                 }
@@ -4552,6 +4555,300 @@ impl EngineRuntime {
                 &store, state, &plan, params,
             )?,
         ))
+    }
+
+    fn try_execute_general_grouped_query(
+        &self,
+        query: &Query,
+        params: &[Value],
+    ) -> Result<Option<QueryResult>> {
+        let Some(plan) = self.analyze_general_grouped_single_table_query(query) else {
+            return Ok(None);
+        };
+        let Some(source) = self.visible_table_row_source(plan.table_name) else {
+            return Ok(None);
+        };
+        Ok(Some(self.execute_general_grouped_from_source(
+            source, &plan, params,
+        )?))
+    }
+
+    fn analyze_general_grouped_single_table_query<'a>(
+        &self,
+        query: &'a Query,
+    ) -> Option<GeneralGroupedSingleTablePlan<'a>> {
+        if !query.ctes.is_empty() || query.recursive {
+            return None;
+        }
+        let QueryBody::Select(select) = &query.body else {
+            return None;
+        };
+        if select.group_by.is_empty() && !projection_has_aggregate_items(&select.projection) {
+            return None;
+        }
+        if select.from.len() != 1 {
+            return None;
+        }
+        let FromItem::Table { name, alias } = &select.from[0] else {
+            return None;
+        };
+        if self
+            .visible_view(name, NameResolutionScope::Session)
+            .is_some()
+        {
+            return None;
+        }
+        self.table_schema(name)?;
+        if select.projection.iter().any(|item| {
+            matches!(
+                item,
+                SelectItem::Wildcard | SelectItem::QualifiedWildcard(_)
+            )
+        }) {
+            return None;
+        }
+        for item in &select.projection {
+            if let SelectItem::Expr { expr, .. } = item {
+                if expr_contains_window(expr) {
+                    return None;
+                }
+            }
+        }
+        if select.having.as_ref().is_some_and(expr_contains_window) {
+            return None;
+        }
+        for order in &query.order_by {
+            if expr_contains_window(&order.expr) {
+                return None;
+            }
+        }
+        if select.filter.as_ref().is_some_and(expr_contains_window) {
+            return None;
+        }
+        for gb in &select.group_by {
+            if expr_contains_window(gb) {
+                return None;
+            }
+        }
+        Some(GeneralGroupedSingleTablePlan {
+            table_name: name,
+            table_alias: alias.as_deref(),
+            group_by: &select.group_by,
+            filter: select.filter.as_ref(),
+            projection: &select.projection,
+            having: select.having.as_ref(),
+            order_by: &query.order_by,
+            distinct: select.distinct,
+            limit: query.limit.as_ref(),
+            offset: query.offset.as_ref(),
+        })
+    }
+
+    fn execute_general_grouped_from_source(
+        &self,
+        source: VisibleTableRowSource<'_>,
+        plan: &GeneralGroupedSingleTablePlan<'_>,
+        params: &[Value],
+    ) -> Result<QueryResult> {
+        let table = self.table_schema(plan.table_name).ok_or_else(|| {
+            DbError::internal(format!(
+                "table {} not found for general grouped query",
+                plan.table_name
+            ))
+        })?;
+
+        let binding_name = plan.table_alias.unwrap_or(plan.table_name);
+        let columns: Vec<ColumnBinding> = table
+            .columns
+            .iter()
+            .map(|c| ColumnBinding::visible(Some(binding_name.to_string()), c.name.clone()))
+            .collect();
+
+        let empty_dataset = Dataset::with_rows(columns.clone(), Vec::new());
+        let ctes = BTreeMap::new();
+        let needs_virtual_generated = !generated_columns_are_stored(table);
+
+        let mut groups: BTreeMap<Vec<u8>, Vec<Vec<Value>>> = BTreeMap::new();
+
+        for row_result in source.rows() {
+            let row_ref = row_result?;
+            let mut values = row_ref.values().to_vec();
+            if needs_virtual_generated {
+                self.apply_virtual_generated_columns(table, &mut values)?;
+            }
+
+            if let Some(filter) = plan.filter {
+                let val = self.eval_expr(filter, &empty_dataset, &values, params, &ctes, None)?;
+                if !matches!(val, Value::Bool(true)) {
+                    continue;
+                }
+            }
+
+            let key_values: Vec<Value> = plan
+                .group_by
+                .iter()
+                .map(|expr| self.eval_expr(expr, &empty_dataset, &values, params, &ctes, None))
+                .collect::<Result<Vec<_>>>()?;
+            let key = row_identity(&key_values)?;
+
+            groups.entry(key).or_default().push(values);
+        }
+
+        if groups.is_empty() && plan.group_by.is_empty() {
+            groups.insert(Vec::new(), Vec::new());
+        }
+
+        let result_columns: Vec<ColumnBinding> = plan
+            .projection
+            .iter()
+            .enumerate()
+            .map(|(index, item)| match item {
+                SelectItem::Expr { expr, alias } => ColumnBinding::visible(
+                    None,
+                    alias
+                        .clone()
+                        .unwrap_or_else(|| infer_expr_name(expr, index + 1)),
+                ),
+                _ => ColumnBinding::visible(None, format!("col{}", index + 1)),
+            })
+            .collect();
+
+        let has_order_by = !plan.order_by.is_empty();
+        let projection_order_plan = projection_order_by_plan(plan.order_by, plan.projection);
+        let mut output_with_order: Vec<(Vec<Value>, Vec<Value>)> = Vec::new();
+
+        for group_rows in groups.values() {
+            let group_dataset = Dataset::with_rows(columns.clone(), group_rows.clone());
+            let group_row_indexes: Vec<usize> = (0..group_rows.len()).collect();
+
+            if let Some(having) = plan.having {
+                let val = self.eval_group_expr(
+                    having,
+                    &group_dataset,
+                    &group_row_indexes,
+                    params,
+                    &ctes,
+                )?;
+                if !matches!(val, Value::Bool(true)) {
+                    continue;
+                }
+            }
+
+            let mut output = Vec::with_capacity(plan.projection.len());
+            for item in plan.projection {
+                let SelectItem::Expr { expr, .. } = item else {
+                    return Err(DbError::sql(
+                        "wildcards not supported in grouped SELECT output",
+                    ));
+                };
+                output.push(self.eval_group_expr(
+                    expr,
+                    &group_dataset,
+                    &group_row_indexes,
+                    params,
+                    &ctes,
+                )?);
+            }
+
+            let order_values = if let Some(order_plan) = &projection_order_plan {
+                order_plan
+                    .iter()
+                    .map(|plan| output[plan.projection_index].clone())
+                    .collect()
+            } else if has_order_by {
+                plan.order_by
+                    .iter()
+                    .map(|order| {
+                        self.eval_group_expr(
+                            &order.expr,
+                            &group_dataset,
+                            &group_row_indexes,
+                            params,
+                            &ctes,
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            } else {
+                Vec::new()
+            };
+
+            output_with_order.push((output, order_values));
+        }
+
+        if has_order_by {
+            let mut sort_error = None;
+            output_with_order.sort_by(|(_, left_order), (_, right_order)| {
+                if let Some(order_plan) = &projection_order_plan {
+                    let mut ord = std::cmp::Ordering::Equal;
+                    for (i, plan) in order_plan.iter().enumerate() {
+                        match compare_values(&left_order[i], &right_order[i]) {
+                            Ok(std::cmp::Ordering::Equal) => continue,
+                            Ok(o) => {
+                                ord = if plan.descending { o.reverse() } else { o };
+                                break;
+                            }
+                            Err(error) => {
+                                if sort_error.is_none() {
+                                    sort_error = Some(error);
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    ord
+                } else {
+                    match compare_query_row_order_values(left_order, right_order, plan.order_by) {
+                        Ok(ordering) => ordering,
+                        Err(error) => {
+                            if sort_error.is_none() {
+                                sort_error = Some(error);
+                            }
+                            std::cmp::Ordering::Equal
+                        }
+                    }
+                }
+            });
+            if let Some(error) = sort_error {
+                return Err(error);
+            }
+        }
+
+        let mut rows: Vec<QueryRow> = if plan.distinct {
+            let mut seen = BTreeSet::new();
+            let mut distinct_rows = Vec::new();
+            for (output, _) in output_with_order {
+                if seen.insert(row_identity(&output)?) {
+                    distinct_rows.push(QueryRow::new(output));
+                }
+            }
+            distinct_rows
+        } else {
+            output_with_order
+                .into_iter()
+                .map(|(output, _)| QueryRow::new(output))
+                .collect()
+        };
+
+        let offset_val = plan
+            .offset
+            .map(|expr| self.eval_constant_i64(expr, params, &ctes))
+            .transpose()?
+            .unwrap_or(0);
+        let limit_val = plan
+            .limit
+            .map(|expr| self.eval_constant_i64(expr, params, &ctes))
+            .transpose()?;
+
+        let start = usize::try_from(offset_val.max(0)).unwrap_or(usize::MAX);
+        if start > 0 || limit_val.is_some() {
+            let take = limit_val
+                .map(|l| usize::try_from(l.max(0)).unwrap_or(0))
+                .unwrap_or(usize::MAX);
+            rows = rows.into_iter().skip(start).take(take).collect();
+        }
+
+        let column_names: Vec<String> = result_columns.into_iter().map(|c| c.name).collect();
+        Ok(QueryResult::with_rows(column_names, rows))
     }
 
     pub(crate) fn try_execute_simple_indexed_join_projection_query(
@@ -10598,6 +10895,19 @@ struct SimpleGroupedNumericAggregatePlan<'a> {
     order_by: Option<Vec<SimpleOrderByPlan>>,
     limit: Option<usize>,
     offset: usize,
+}
+
+struct GeneralGroupedSingleTablePlan<'a> {
+    table_name: &'a str,
+    table_alias: Option<&'a str>,
+    group_by: &'a [Expr],
+    filter: Option<&'a Expr>,
+    projection: &'a [SelectItem],
+    having: Option<&'a Expr>,
+    order_by: &'a [crate::sql::ast::OrderBy],
+    distinct: bool,
+    limit: Option<&'a Expr>,
+    offset: Option<&'a Expr>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -17701,6 +18011,53 @@ fn expr_contains_aggregate(expr: &Expr) -> bool {
     }
 }
 
+fn expr_contains_window(expr: &Expr) -> bool {
+    match expr {
+        Expr::RowNumber { .. } | Expr::WindowFunction { .. } => true,
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+            expr_contains_window(expr)
+        }
+        Expr::Binary { left, right, .. } => {
+            expr_contains_window(left) || expr_contains_window(right)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => expr_contains_window(expr) || expr_contains_window(low) || expr_contains_window(high),
+        Expr::InList { expr, items, .. } => {
+            expr_contains_window(expr) || items.iter().any(expr_contains_window)
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            expr_contains_window(expr)
+                || expr_contains_window(pattern)
+                || escape.as_ref().is_some_and(|e| expr_contains_window(e))
+        }
+        Expr::Function { args, .. } => args.iter().any(expr_contains_window),
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            operand.as_ref().is_some_and(|e| expr_contains_window(e))
+                || branches
+                    .iter()
+                    .any(|(c, v)| expr_contains_window(c) || expr_contains_window(v))
+                || else_expr.as_ref().is_some_and(|e| expr_contains_window(e))
+        }
+        Expr::Row(items) => items.iter().any(expr_contains_window),
+        Expr::Aggregate { args, .. } => args.iter().any(expr_contains_window),
+        Expr::InSubquery { .. }
+        | Expr::CompareSubquery { .. }
+        | Expr::ScalarSubquery(_)
+        | Expr::Exists(_) => false,
+        Expr::Literal(_) | Expr::Column { .. } | Expr::Parameter(_) => false,
+    }
+}
+
 #[derive(Clone, Debug)]
 struct JoinUsingColumn {
     name: String,
@@ -23126,6 +23483,7 @@ mod tests {
         encode_table_payload, persist_paged_table, read_table_page_manifest_from_state,
         rewrite_paged_table_from_resident, ColumnBinding, Dataset, DbTxnPageStore, EngineRuntime,
         PersistedTableState, RuntimeBtreeKeys, RuntimeIndex, StoredRow, TableData,
+        TablePageManifest, TableRowSource,
     };
 
     const PAGE_SIZE: u32 = 4096;
@@ -26528,6 +26886,306 @@ mod tests {
         runtime
             .execute_statement(&statement, &[], PAGE_SIZE)
             .expect("execute SQL");
+    }
+
+    fn paged_row_source(rows: Vec<StoredRow>) -> TableRowSource {
+        let payload = encode_table_payload(&TableData { rows: rows.clone() })
+            .expect("encode paged test payload");
+        let manifest =
+            TablePageManifest::from_payload(Arc::new(payload)).expect("build paged test manifest");
+        TableRowSource::Paged(Arc::new(manifest))
+    }
+
+    #[test]
+    fn general_grouped_group_concat_from_source() {
+        let mut runtime = EngineRuntime::empty(1);
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE items (id INT64 PRIMARY KEY, cat TEXT, name TEXT)",
+        );
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO items (id, cat, name) VALUES (1, 'a', 'alpha')",
+        );
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO items (id, cat, name) VALUES (2, 'a', 'aplomb')",
+        );
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO items (id, cat, name) VALUES (3, 'b', 'bravo')",
+        );
+
+        let statement = parse_sql_statement(
+            "SELECT cat, GROUP_CONCAT(name) AS names FROM items GROUP BY cat ORDER BY cat",
+        )
+        .expect("parse");
+        let crate::sql::ast::Statement::Query(query) = &statement else {
+            panic!("expected query");
+        };
+
+        let result = runtime
+            .try_execute_general_grouped_query(query, &[])
+            .expect("execute")
+            .expect("general grouped path should handle GROUP_CONCAT");
+
+        assert_eq!(result.rows().len(), 2);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[
+                Value::Text("a".to_string()),
+                Value::Text("alpha,aplomb".to_string())
+            ]
+        );
+        assert_eq!(
+            result.rows()[1].values(),
+            &[
+                Value::Text("b".to_string()),
+                Value::Text("bravo".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn general_grouped_having_with_order_by() {
+        let mut runtime = EngineRuntime::empty(1);
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE sales (id INT64 PRIMARY KEY, region TEXT, amount INT64)",
+        );
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO sales (id, region, amount) VALUES (1, 'east', 10)",
+        );
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO sales (id, region, amount) VALUES (2, 'east', 20)",
+        );
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO sales (id, region, amount) VALUES (3, 'west', 5)",
+        );
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO sales (id, region, amount) VALUES (4, 'north', 15)",
+        );
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO sales (id, region, amount) VALUES (5, 'north', 15)",
+        );
+
+        let statement = parse_sql_statement(
+            "SELECT region, SUM(amount) AS total FROM sales GROUP BY region \
+             HAVING SUM(amount) > 20 ORDER BY total DESC",
+        )
+        .expect("parse");
+        let crate::sql::ast::Statement::Query(query) = &statement else {
+            panic!("expected query");
+        };
+
+        let result = runtime
+            .try_execute_general_grouped_query(query, &[])
+            .expect("execute")
+            .expect("general grouped path should handle HAVING + ORDER BY");
+
+        assert_eq!(result.rows().len(), 2);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[Value::Text("east".to_string()), Value::Int64(30)]
+        );
+        assert_eq!(
+            result.rows()[1].values(),
+            &[Value::Text("north".to_string()), Value::Int64(30)]
+        );
+    }
+
+    #[test]
+    fn general_grouped_mixed_aggregates() {
+        let mut runtime = EngineRuntime::empty(1);
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE metrics (id INT64 PRIMARY KEY, grp TEXT, val INT64)",
+        );
+        for (id, grp, val) in [(1, "x", 10), (2, "x", 20), (3, "x", 30), (4, "y", 5)] {
+            execute_sql(
+                &mut runtime,
+                &format!("INSERT INTO metrics (id, grp, val) VALUES ({id}, '{grp}', {val})"),
+            );
+        }
+
+        let statement = parse_sql_statement(
+            "SELECT grp, COUNT(*) AS cnt, AVG(val) AS avg_val, MIN(val) AS mn, MAX(val) AS mx \
+             FROM metrics GROUP BY grp ORDER BY grp",
+        )
+        .expect("parse");
+        let crate::sql::ast::Statement::Query(query) = &statement else {
+            panic!("expected query");
+        };
+
+        let result = runtime
+            .try_execute_general_grouped_query(query, &[])
+            .expect("execute")
+            .expect("general grouped path should handle mixed aggregates");
+
+        assert_eq!(result.rows().len(), 2);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[
+                Value::Text("x".to_string()),
+                Value::Int64(3),
+                Value::Float64(20.0),
+                Value::Int64(10),
+                Value::Int64(30),
+            ]
+        );
+        assert_eq!(
+            result.rows()[1].values(),
+            &[
+                Value::Text("y".to_string()),
+                Value::Int64(1),
+                Value::Float64(5.0),
+                Value::Int64(5),
+                Value::Int64(5),
+            ]
+        );
+    }
+
+    #[test]
+    fn general_grouped_paged_row_source() {
+        let mut runtime = EngineRuntime::empty(1);
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE paged_grp (id INT64 PRIMARY KEY, category TEXT, value INT64)",
+        );
+
+        let rows: Vec<StoredRow> = vec![
+            StoredRow {
+                row_id: 1,
+                values: vec![
+                    Value::Int64(1),
+                    Value::Text("a".to_string()),
+                    Value::Int64(10),
+                ],
+            },
+            StoredRow {
+                row_id: 2,
+                values: vec![
+                    Value::Int64(2),
+                    Value::Text("a".to_string()),
+                    Value::Int64(20),
+                ],
+            },
+            StoredRow {
+                row_id: 3,
+                values: vec![
+                    Value::Int64(3),
+                    Value::Text("b".to_string()),
+                    Value::Int64(30),
+                ],
+            },
+        ];
+        runtime
+            .tables_mut()
+            .insert("paged_grp".to_string(), paged_row_source(rows));
+
+        let statement = parse_sql_statement(
+            "SELECT category, SUM(value) AS total FROM paged_grp GROUP BY category ORDER BY category",
+        )
+        .expect("parse");
+        let crate::sql::ast::Statement::Query(query) = &statement else {
+            panic!("expected query");
+        };
+
+        let result = runtime
+            .try_execute_general_grouped_query(query, &[])
+            .expect("execute")
+            .expect("general grouped path should handle paged row source");
+
+        assert_eq!(result.rows().len(), 2);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[Value::Text("a".to_string()), Value::Int64(30)]
+        );
+        assert_eq!(
+            result.rows()[1].values(),
+            &[Value::Text("b".to_string()), Value::Int64(30)]
+        );
+    }
+
+    #[test]
+    fn general_grouped_with_limit_offset() {
+        let mut runtime = EngineRuntime::empty(1);
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE lo_data (id INT64 PRIMARY KEY, grp TEXT, val INT64)",
+        );
+        for (id, grp, val) in [(1, "a", 1), (2, "b", 2), (3, "c", 3), (4, "d", 4)] {
+            execute_sql(
+                &mut runtime,
+                &format!("INSERT INTO lo_data (id, grp, val) VALUES ({id}, '{grp}', {val})"),
+            );
+        }
+
+        let statement = parse_sql_statement(
+            "SELECT grp, SUM(val) AS total FROM lo_data GROUP BY grp ORDER BY grp LIMIT 2 OFFSET 1",
+        )
+        .expect("parse");
+        let crate::sql::ast::Statement::Query(query) = &statement else {
+            panic!("expected query");
+        };
+
+        let result = runtime
+            .try_execute_general_grouped_query(query, &[])
+            .expect("execute")
+            .expect("general grouped path should handle LIMIT/OFFSET");
+
+        assert_eq!(result.rows().len(), 2);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[Value::Text("b".to_string()), Value::Int64(2)]
+        );
+        assert_eq!(
+            result.rows()[1].values(),
+            &[Value::Text("c".to_string()), Value::Int64(3)]
+        );
+    }
+
+    #[test]
+    fn general_grouped_distinct() {
+        let mut runtime = EngineRuntime::empty(1);
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE dist_data (id INT64 PRIMARY KEY, grp TEXT, val INT64)",
+        );
+        for (id, grp, val) in [(1, "a", 10), (2, "a", 5), (3, "a", 5), (4, "b", 20)] {
+            execute_sql(
+                &mut runtime,
+                &format!("INSERT INTO dist_data (id, grp, val) VALUES ({id}, '{grp}', {val})"),
+            );
+        }
+
+        let statement = parse_sql_statement(
+            "SELECT DISTINCT grp, SUM(val) AS total FROM dist_data GROUP BY grp, val ORDER BY grp",
+        )
+        .expect("parse");
+        let crate::sql::ast::Statement::Query(query) = &statement else {
+            panic!("expected query");
+        };
+
+        let result = runtime
+            .try_execute_general_grouped_query(query, &[])
+            .expect("execute")
+            .expect("general grouped path should handle DISTINCT");
+
+        assert_eq!(result.rows().len(), 2);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[Value::Text("a".to_string()), Value::Int64(10)]
+        );
+        assert_eq!(
+            result.rows()[1].values(),
+            &[Value::Text("b".to_string()), Value::Int64(20)]
+        );
     }
 }
 
