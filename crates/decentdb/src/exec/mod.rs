@@ -1510,6 +1510,27 @@ impl EngineRuntime {
                     }
                 }
 
+                if use_paged_row_storage {
+                    self.overflow_chain_caches.remove(&canonical_table_name);
+                    let new_state = rewrite_paged_table_from_resident(
+                        &mut store,
+                        previous_state,
+                        data,
+                        db.config().page_size,
+                    )?;
+                    self.persisted_tables
+                        .insert(canonical_table_name.clone(), new_state);
+                    let pk_index_root = if db.config().persistent_pk_index {
+                        let chunk_payloads = read_paged_table_chunk_payloads(&store, new_state)?;
+                        build_persistent_pk_index_root_from_chunk_payloads(db, &chunk_payloads)?
+                    } else {
+                        None
+                    };
+                    replace_table_pk_index_root(self, db, &canonical_table_name, pk_index_root)?;
+                    self.cache_payload_remove(&canonical_table_name);
+                    continue;
+                }
+
                 // Choose the encoding path:
                 //  1. Row-update splice: only re-encode modified rows using cached payload
                 //  2. Append-only: read old payload, append new rows
@@ -1538,30 +1559,6 @@ impl EngineRuntime {
                 } else {
                     (encode_table_payload(data)?, 0)
                 };
-
-                if use_paged_row_storage {
-                    let encoded_chunks = encode_paged_table_chunks(data, db.config().page_size)?;
-                    self.overflow_chain_caches.remove(&canonical_table_name);
-                    let new_state = persist_paged_table(
-                        &mut store,
-                        previous_state,
-                        &encoded_chunks,
-                        data.rows.len(),
-                    )?;
-                    self.persisted_tables
-                        .insert(canonical_table_name.clone(), new_state);
-                    let pk_index_root = if db.config().persistent_pk_index {
-                        build_persistent_pk_index_root_from_encoded_paged_chunks(
-                            db,
-                            &encoded_chunks,
-                        )?
-                    } else {
-                        None
-                    };
-                    replace_table_pk_index_root(self, db, &canonical_table_name, pk_index_root)?;
-                    self.cache_payload_insert(canonical_table_name, Arc::new(payload));
-                    continue;
-                }
 
                 let checksum = crc32c_parts(&[payload.as_slice()]);
                 let (pointer, new_chain_cache, tail) = if let Some(chain_cache) =
@@ -3077,7 +3074,7 @@ impl EngineRuntime {
                         wal,
                         snapshot_lsn,
                     };
-                    read_table_payload_row_count(&store, state.pointer)
+                    read_persisted_table_row_count(&store, state)
                         .ok()
                         .and_then(|count| i64::try_from(count).ok())
                 } else {
@@ -3116,6 +3113,9 @@ impl EngineRuntime {
         let Some(state) = self.persisted_table_state(plan.table_name) else {
             return Ok(None);
         };
+        if !state.pointer.is_table_paged_manifest() {
+            return Ok(None);
+        }
         let store = SnapshotPageStore {
             pager,
             wal,
@@ -9695,6 +9695,18 @@ where
     Ok(total_row_count)
 }
 
+fn decode_table_payload_rows(bytes: &[u8]) -> Result<Vec<StoredRow>> {
+    let mut rows = Vec::new();
+    visit_table_payload_rows_from_bytes(bytes, &mut |row_id, values| {
+        rows.push(StoredRow {
+            row_id,
+            values: values.to_vec(),
+        });
+        Ok(())
+    })?;
+    Ok(rows)
+}
+
 fn read_single_paged_table_chunk_payload<S: PageStore>(
     store: &S,
     state: PersistedTableState,
@@ -10003,6 +10015,137 @@ fn persist_paged_table<S: PageStore>(
     })
 }
 
+fn rewrite_paged_table_from_resident<S: PageStore>(
+    store: &mut S,
+    previous_state: PersistedTableState,
+    data: &TableData,
+    page_size: u32,
+) -> Result<PersistedTableState> {
+    if previous_state.pointer.head_page_id == 0 || !previous_state.pointer.is_table_paged_manifest()
+    {
+        let encoded_chunks = encode_paged_table_chunks(data, page_size)?;
+        return persist_paged_table(store, previous_state, &encoded_chunks, data.rows.len());
+    }
+
+    let manifest_payload = read_overflow(store, previous_state.pointer)?;
+    if crc32c_parts(&[manifest_payload.as_slice()]) != previous_state.checksum {
+        return Err(DbError::corruption(
+            "paged table manifest checksum mismatch",
+        ));
+    }
+    let manifest = decode_paged_table_manifest_payload(&manifest_payload)?;
+    let mut current_rows_by_id = Int64Map::default();
+    for row in &data.rows {
+        current_rows_by_id.insert(row.row_id, row);
+    }
+
+    let mut seen_old_row_ids = std::collections::BTreeSet::new();
+    let mut new_chunks = Vec::with_capacity(manifest.chunks.len());
+    let mut replaced_chunk_pointers = Vec::new();
+    let mut changed = false;
+
+    for chunk in manifest.chunks {
+        let payload = read_overflow(store, chunk.pointer)?;
+        if crc32c_parts(&[payload.as_slice()]) != chunk.checksum {
+            return Err(DbError::corruption("paged table chunk checksum mismatch"));
+        }
+        let previous_rows = decode_table_payload_rows(payload.as_slice())?;
+        let mut current_chunk_rows = Vec::with_capacity(previous_rows.len());
+        let mut chunk_changed = false;
+
+        for previous_row in &previous_rows {
+            seen_old_row_ids.insert(previous_row.row_id);
+            if let Some(current_row) = current_rows_by_id.get(&previous_row.row_id).copied() {
+                if current_row.values != previous_row.values {
+                    chunk_changed = true;
+                }
+                current_chunk_rows.push(current_row.clone());
+            } else {
+                chunk_changed = true;
+            }
+        }
+
+        if !chunk_changed {
+            new_chunks.push(chunk);
+            continue;
+        }
+
+        changed = true;
+        replaced_chunk_pointers.push(chunk.pointer);
+        for encoded_chunk in encode_paged_table_chunks_from_rows(&current_chunk_rows, page_size)? {
+            let pointer = write_overflow(store, &encoded_chunk.payload, CompressionMode::Never)?;
+            new_chunks.push(PersistedTableChunkState {
+                pointer,
+                checksum: encoded_chunk.checksum,
+                row_count: encoded_chunk.row_count,
+            });
+        }
+    }
+
+    let appended_rows = data
+        .rows
+        .iter()
+        .filter(|row| !seen_old_row_ids.contains(&row.row_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !appended_rows.is_empty() {
+        changed = true;
+        for encoded_chunk in encode_paged_table_chunks_from_rows(&appended_rows, page_size)? {
+            let pointer = write_overflow(store, &encoded_chunk.payload, CompressionMode::Never)?;
+            new_chunks.push(PersistedTableChunkState {
+                pointer,
+                checksum: encoded_chunk.checksum,
+                row_count: encoded_chunk.row_count,
+            });
+        }
+    }
+
+    if !changed {
+        return Ok(previous_state);
+    }
+
+    if new_chunks.is_empty() {
+        free_persisted_table_bytes(store, previous_state)?;
+        return Ok(PersistedTableState {
+            pointer: OverflowPointer {
+                head_page_id: 0,
+                logical_len: 0,
+                flags: 0,
+            },
+            checksum: 0,
+            row_count: 0,
+            tail: OverflowTailInfo::default(),
+            pk_index_root: previous_state.pk_index_root,
+        });
+    }
+
+    let updated_manifest_payload =
+        encode_paged_table_manifest_payload(&PersistedPagedTableManifest { chunks: new_chunks })?;
+    let checksum = crc32c_parts(&[updated_manifest_payload.as_slice()]);
+    let pointer = rewrite_overflow(
+        store,
+        previous_state.pointer.with_table_paged_manifest(false),
+        &updated_manifest_payload,
+        CompressionMode::Never,
+    )?
+    .with_table_paged_manifest(true);
+    let tail = read_uncompressed_overflow_tail(store, pointer)?.unwrap_or_default();
+
+    for replaced_pointer in replaced_chunk_pointers {
+        if replaced_pointer.head_page_id != 0 {
+            free_overflow(store, replaced_pointer.head_page_id)?;
+        }
+    }
+
+    Ok(PersistedTableState {
+        pointer,
+        checksum,
+        row_count: data.rows.len(),
+        tail,
+        pk_index_root: previous_state.pk_index_root,
+    })
+}
+
 fn build_persistent_pk_index_root(db: &crate::db::Db, payload: &[u8]) -> Result<Option<PageId>> {
     let entries = build_row_locator_entries(payload)?;
     let mut tree = Btree::new(DbTxnPageStore { db });
@@ -10016,17 +10159,6 @@ fn build_persistent_pk_index_root_from_chunk_payloads(
     chunk_payloads: &[Arc<Vec<u8>>],
 ) -> Result<Option<PageId>> {
     let entries = build_paged_row_locator_entries_from_chunk_payloads(chunk_payloads)?;
-    let mut tree = Btree::new(DbTxnPageStore { db });
-    tree.replace_entries(entries)?;
-    let (_store, root_page_id) = tree.into_parts();
-    Ok(root_page_id)
-}
-
-fn build_persistent_pk_index_root_from_encoded_paged_chunks(
-    db: &crate::db::Db,
-    chunk_payloads: &[EncodedPagedTableChunk],
-) -> Result<Option<PageId>> {
-    let entries = build_paged_row_locator_entries_from_encoded_chunks(chunk_payloads)?;
     let mut tree = Btree::new(DbTxnPageStore { db });
     tree.replace_entries(entries)?;
     let (_store, root_page_id) = tree.into_parts();
@@ -11282,21 +11414,6 @@ fn build_paged_row_locator_entries_from_chunk_payloads(
     Ok(entries)
 }
 
-fn build_paged_row_locator_entries_from_encoded_chunks(
-    chunk_payloads: &[EncodedPagedTableChunk],
-) -> Result<BTreeMap<u64, Vec<u8>>> {
-    let mut entries = BTreeMap::new();
-    for (chunk_index, payload) in chunk_payloads.iter().enumerate() {
-        append_paged_row_locator_entries(
-            &mut entries,
-            payload.payload.as_slice(),
-            u32::try_from(chunk_index)
-                .map_err(|_| DbError::constraint("paged table chunk index exceeds u32"))?,
-        )?;
-    }
-    Ok(entries)
-}
-
 fn read_deferred_row_by_locator_from_table_payload<S: PageStore>(
     store: &S,
     pointer: OverflowPointer,
@@ -11359,6 +11476,27 @@ fn read_table_payload_row_count<S: PageStore>(
         return Err(DbError::corruption("table payload magic is invalid"));
     }
     Ok(cursor.read_u32()? as usize)
+}
+
+fn read_persisted_table_row_count<S: PageStore>(
+    store: &S,
+    state: PersistedTableState,
+) -> Result<usize> {
+    if state.pointer.head_page_id == 0 || state.pointer.logical_len == 0 {
+        return Ok(0);
+    }
+    if !state.pointer.is_table_paged_manifest() {
+        return read_table_payload_row_count(store, state.pointer);
+    }
+
+    let manifest_payload = read_overflow(store, state.pointer)?;
+    if crc32c_parts(&[manifest_payload.as_slice()]) != state.checksum {
+        return Err(DbError::corruption(
+            "paged table manifest checksum mismatch",
+        ));
+    }
+    let manifest = decode_paged_table_manifest_payload(&manifest_payload)?;
+    Ok(manifest.chunks.iter().map(|chunk| chunk.row_count).sum())
 }
 
 fn read_deferred_row_by_id_from_table_payload<S: PageStore>(
@@ -17306,8 +17444,8 @@ mod tests {
         encode_legacy_table_payload_from_chunk_payloads, encode_manifest_payload,
         encode_paged_table_chunks, encode_paged_table_chunks_from_rows, encode_runtime_payload,
         encode_table_payload, persist_paged_table, read_table_page_manifest_from_state,
-        ColumnBinding, Dataset, EngineRuntime, PersistedTableState, RuntimeBtreeKeys, RuntimeIndex,
-        StoredRow, TableData,
+        rewrite_paged_table_from_resident, ColumnBinding, Dataset, EngineRuntime,
+        PersistedTableState, RuntimeBtreeKeys, RuntimeIndex, StoredRow, TableData,
     };
 
     const PAGE_SIZE: u32 = 4096;
@@ -17613,6 +17751,73 @@ mod tests {
                 .collect::<Vec<_>>(),
             initial_chunk_pointers,
             "append path should preserve existing paged chunk pointers"
+        );
+    }
+
+    #[test]
+    fn rewrite_paged_table_from_resident_preserves_untouched_chunk_pointers() {
+        let body = "x".repeat(2048);
+        let mut store = InMemoryPageStore::new(PAGE_SIZE);
+        let initial = TableData {
+            rows: (0_i64..96_i64)
+                .map(|row_id| StoredRow {
+                    row_id: row_id + 1,
+                    values: vec![Value::Int64(row_id), Value::Text(body.clone())],
+                })
+                .collect(),
+        };
+        let initial_chunks =
+            encode_paged_table_chunks(&initial, PAGE_SIZE).expect("encode initial chunks");
+        let initial_state = persist_paged_table(
+            &mut store,
+            PersistedTableState::default(),
+            &initial_chunks,
+            initial.rows.len(),
+        )
+        .expect("persist initial paged table");
+        let initial_manifest_payload =
+            crate::record::overflow::read_overflow(&store, initial_state.pointer)
+                .expect("read initial manifest");
+        let initial_manifest = decode_paged_table_manifest_payload(&initial_manifest_payload)
+            .expect("decode initial manifest");
+        assert!(
+            initial_manifest.chunks.len() > 2,
+            "expected multiple chunks to observe pointer preservation"
+        );
+        let initial_untouched_pointers = initial_manifest
+            .chunks
+            .iter()
+            .skip(1)
+            .map(|chunk| chunk.pointer)
+            .collect::<Vec<_>>();
+
+        let mut updated = initial.clone();
+        updated.rows[5].values[0] = Value::Int64(500);
+        updated.rows[5].values[1] = Value::Text("y".repeat(2600));
+        updated.rows.remove(6);
+
+        let rewritten_state =
+            rewrite_paged_table_from_resident(&mut store, initial_state, &updated, PAGE_SIZE)
+                .expect("rewrite paged table from resident rows");
+        let rewritten_manifest_payload =
+            crate::record::overflow::read_overflow(&store, rewritten_state.pointer)
+                .expect("read rewritten manifest");
+        let rewritten_manifest = decode_paged_table_manifest_payload(&rewritten_manifest_payload)
+            .expect("decode rewritten manifest");
+        let preserved_untouched = rewritten_manifest
+            .chunks
+            .iter()
+            .filter_map(|chunk| {
+                initial_untouched_pointers
+                    .contains(&chunk.pointer)
+                    .then_some(chunk.pointer)
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(rewritten_state.row_count, updated.rows.len());
+        assert_eq!(
+            preserved_untouched, initial_untouched_pointers,
+            "unchanged paged chunks should retain their original pointers in order"
         );
     }
 

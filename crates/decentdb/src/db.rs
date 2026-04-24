@@ -5328,6 +5328,145 @@ mod tests {
     }
 
     #[test]
+    fn paged_row_storage_updates_and_deletes_preserve_untouched_chunks() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir.path().join("paged-row-storage-update-delete.ddb");
+        let config = DbConfig {
+            persistent_pk_index: true,
+            paged_row_storage: true,
+            ..DbConfig::default()
+        };
+
+        let untouched_chunk_pointers = {
+            let db = Db::open_or_create(&path, config.clone()).expect("open db");
+            db.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, n INTEGER, body TEXT)")
+                .expect("create docs table");
+            let large_body = "x".repeat(2048);
+            let mut txn = db.transaction().expect("begin txn");
+            let insert = txn
+                .prepare("INSERT INTO docs VALUES ($1, $2, $3)")
+                .expect("prepare insert");
+            for i in 0_i64..96_i64 {
+                insert
+                    .execute_in(
+                        &mut txn,
+                        &[
+                            Value::Int64(i + 1),
+                            Value::Int64(i),
+                            Value::Text(large_body.clone()),
+                        ],
+                    )
+                    .expect("insert row");
+            }
+            txn.commit().expect("commit rows");
+
+            let untouched_chunk_pointers = {
+                let runtime_before = db.inner.engine.read().expect("engine runtime lock");
+                let docs_before = runtime_before
+                    .persisted_tables
+                    .get("docs")
+                    .expect("persisted docs before mutation");
+                let page_store = PagerReadStore { db: &db };
+                let manifest_before = read_overflow(&page_store, docs_before.pointer)
+                    .expect("read paged manifest before mutation");
+                let manifest_before = decode_paged_table_manifest_payload(&manifest_before)
+                    .expect("decode paged manifest before mutation");
+                assert!(
+                    manifest_before.chunks.len() > 2,
+                    "expected multiple chunks before mutation"
+                );
+                manifest_before
+                    .chunks
+                    .iter()
+                    .skip(1)
+                    .map(|chunk| chunk.pointer)
+                    .collect::<Vec<_>>()
+            };
+
+            db.execute(&format!(
+                "UPDATE docs SET n = 500, body = '{}' WHERE id = 6",
+                "y".repeat(2600)
+            ))
+            .expect("update docs row");
+            db.execute("DELETE FROM docs WHERE id = 7")
+                .expect("delete docs row");
+
+            untouched_chunk_pointers
+        };
+
+        let db = Db::open_or_create(&path, config).expect("reopen mutated db");
+        let preserved_untouched = {
+            let runtime_after = db.inner.engine.read().expect("engine runtime lock");
+            let docs_after = runtime_after
+                .persisted_tables
+                .get("docs")
+                .expect("persisted docs after mutation");
+            assert!(
+                docs_after.pointer.is_table_paged_manifest(),
+                "mutated table should remain paged"
+            );
+            assert!(
+                docs_after.pk_index_root.is_some(),
+                "mutated paged table should retain persistent pk locator root"
+            );
+            let page_store = PagerReadStore { db: &db };
+            let manifest_after = read_overflow(&page_store, docs_after.pointer)
+                .expect("read paged manifest after mutation");
+            let manifest_after = decode_paged_table_manifest_payload(&manifest_after)
+                .expect("decode paged manifest after mutation");
+            assert_eq!(
+                manifest_after
+                    .chunks
+                    .iter()
+                    .map(|chunk| chunk.row_count)
+                    .sum::<usize>(),
+                95,
+                "paged manifest row counts should reflect the delete"
+            );
+            manifest_after
+                .chunks
+                .iter()
+                .filter_map(|chunk| {
+                    untouched_chunk_pointers
+                        .contains(&chunk.pointer)
+                        .then_some(chunk.pointer)
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            preserved_untouched, untouched_chunk_pointers,
+            "unchanged paged chunks should retain their original pointers"
+        );
+
+        let updated = db
+            .execute("SELECT n FROM docs WHERE id = 6")
+            .expect("point lookup after update");
+        assert_eq!(scalar_i64(&updated), 500);
+        let deleted = db
+            .execute("SELECT n FROM docs WHERE id = 7")
+            .expect("point lookup after delete");
+        assert!(
+            deleted.rows().is_empty(),
+            "deleted row should no longer be visible"
+        );
+        assert_eq!(
+            scalar_i64(
+                &db.execute("SELECT COUNT(*) FROM docs")
+                    .expect("count docs rows")
+            ),
+            95
+        );
+
+        let json_after = db
+            .inspect_storage_state_json()
+            .expect("json after mutation");
+        assert!(
+            json_after.contains("\"loaded_table_count\":0"),
+            "expected paged point lookup to stay deferred after mutation, got: {json_after}"
+        );
+    }
+
+    #[test]
     fn paged_row_storage_grouped_count_keeps_deferred_table_unloaded() {
         let tempdir = TempDir::new().expect("tempdir");
         let path = tempdir.path().join("paged-row-storage-grouped-count.ddb");
@@ -5596,6 +5735,52 @@ mod tests {
                     .expect("reader count after")
             ),
             200
+        );
+    }
+
+    #[test]
+    fn checkpoint_with_active_reader_retains_wal_versions_until_reader_drops() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir
+            .path()
+            .join("checkpoint-active-reader-retains-wal.ddb");
+        let db = Db::open_or_create(&path, DbConfig::default()).expect("open db");
+
+        db.execute("CREATE TABLE t (id INTEGER, val TEXT)")
+            .expect("create table");
+        for i in 0..512_i64 {
+            db.execute_with_params(
+                "INSERT INTO t VALUES ($1, $2)",
+                &[Value::Int64(i), Value::Text("x".repeat(128))],
+            )
+            .expect("insert row");
+        }
+
+        assert!(
+            db.inner.wal.version_count().expect("version count before") > 0,
+            "expected inserts to populate the WAL before checkpoint"
+        );
+
+        let reader = db.inner.wal.begin_reader().expect("begin reader");
+        db.checkpoint().expect("checkpoint with active reader");
+        assert!(
+            db.inner
+                .wal
+                .version_count()
+                .expect("version count with reader")
+                > 0,
+            "checkpoint should retain WAL versions while a reader is active"
+        );
+
+        drop(reader);
+        db.checkpoint().expect("checkpoint after reader drop");
+        assert_eq!(
+            db.inner
+                .wal
+                .version_count()
+                .expect("version count after reader"),
+            0,
+            "checkpoint should truncate WAL after active readers are gone"
         );
     }
 
@@ -6261,9 +6446,13 @@ mod tests {
     fn simple_min_max_keeps_deferred_table_unloaded() {
         let tempdir = TempDir::new().expect("tempdir");
         let path = tempdir.path().join("deferred-min-max.ddb");
+        let config = DbConfig {
+            paged_row_storage: true,
+            ..DbConfig::default()
+        };
 
         {
-            let db = Db::open_or_create(&path, DbConfig::default()).expect("create db");
+            let db = Db::open_or_create(&path, config.clone()).expect("create db");
             db.execute("CREATE TABLE seeded (id INTEGER PRIMARY KEY, n INTEGER)")
                 .expect("create seeded");
             for i in 0..50 {
@@ -6278,7 +6467,7 @@ mod tests {
             db.checkpoint().expect("checkpoint before close");
         }
 
-        let db = Db::open_or_create(&path, DbConfig::default()).expect("reopen with defer");
+        let db = Db::open_or_create(&path, config).expect("reopen with defer");
         let max_result = db.execute("SELECT MAX(id) FROM seeded").expect("max");
         assert_eq!(scalar_i64(&max_result), 49);
         let min_result = db.execute("SELECT MIN(n) FROM seeded").expect("min");

@@ -53,10 +53,6 @@ pub(crate) fn checkpoint(wal: &WalHandle, pager: &PagerHandle, timeout_sec: u64)
         index.populate_latest_versions_at_or_before(safe_lsn, &mut latest_versions);
     }
 
-    let page_ids: Vec<_> = latest_versions
-        .iter()
-        .map(|(page_id, _)| *page_id)
-        .collect();
     for (page_id, version) in latest_versions.iter() {
         pager.write_page_direct(*page_id, version.payload.as_slice())?;
     }
@@ -76,6 +72,7 @@ pub(crate) fn checkpoint(wal: &WalHandle, pager: &PagerHandle, timeout_sec: u64)
     let _checkpoint_end = writer::append_checkpoint_frame(wal, safe_lsn)?;
 
     {
+        let active_readers = wal.inner.reader_registry.active_reader_count()?;
         let mut index = wal
             .inner
             .index
@@ -87,13 +84,16 @@ pub(crate) fn checkpoint(wal: &WalHandle, pager: &PagerHandle, timeout_sec: u64)
         // every version).  If safe_lsn < current_lsn, a reader that
         // dropped after we computed safe_lsn would cause us to lose
         // post-safe_lsn commits if we truncated.
-        if wal.inner.reader_registry.active_reader_count()? == 0 && safe_lsn >= current_lsn {
+        if active_readers == 0 && safe_lsn >= current_lsn {
             index.clear();
             drop(index);
             writer::truncate_to_header(wal)?;
         } else {
-            index.prune_at_or_below(&page_ids, safe_lsn);
             drop(index);
+            // Retain snapshot-visible versions while readers are active.
+            // Pruning them here forces deferred readers back onto fallback
+            // page reads after checkpoint, which can race with subsequent
+            // commits that rewrite or recycle those pages.
             let _warnings = wal
                 .inner
                 .reader_registry

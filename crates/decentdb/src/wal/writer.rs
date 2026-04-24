@@ -75,11 +75,10 @@ pub(crate) fn commit_pages(
     page_batch.extend_from_slice(&COMMIT_FRAME_BYTES);
     let new_offset = offset + page_batch.len() as u64;
     let metadata_changed = ensure_capacity(wal, new_offset)?;
-    // Write the WAL header (small, at offset 0) before the sequential frame
-    // data. This avoids dirtying two distant file regions before fdatasync,
-    // which can nearly halve fsync latency on NVMe.
-    recovery::persist_header(&wal.inner.file, wal.inner.page_size, new_offset)?;
     write_all_at(wal.inner.file.as_ref(), offset, page_batch)?;
+    // Publish the logical end only after the frame bytes are in place so a
+    // concurrent opener never trusts a WAL tail that has not been written yet.
+    recovery::persist_header(&wal.inner.file, wal.inner.page_size, new_offset)?;
     offset = new_offset;
     sync_for_mode(wal, metadata_changed, new_offset)?;
 
@@ -194,9 +193,10 @@ pub(crate) fn commit_pages_if_latest(
     page_batch.extend_from_slice(&COMMIT_FRAME_BYTES);
     let new_offset = offset + page_batch.len() as u64;
     let metadata_changed = ensure_capacity(wal, new_offset)?;
-    // Write header before frame data — see commit_pages for rationale.
-    recovery::persist_header(&wal.inner.file, wal.inner.page_size, new_offset)?;
     write_all_at(wal.inner.file.as_ref(), offset, page_batch)?;
+    // Publish the logical end only after the frame bytes are in place so a
+    // concurrent opener never trusts a WAL tail that has not been written yet.
+    recovery::persist_header(&wal.inner.file, wal.inner.page_size, new_offset)?;
     offset = new_offset;
     sync_for_mode(wal, metadata_changed, new_offset)?;
 
@@ -245,8 +245,8 @@ pub(crate) fn append_checkpoint_frame(wal: &WalHandle, checkpoint_lsn: u64) -> R
     let bytes = frame.encode(wal.inner.page_size)?;
     let new_offset = offset + bytes.len() as u64;
     let metadata_changed = ensure_capacity(wal, new_offset)?;
-    recovery::persist_header(&wal.inner.file, wal.inner.page_size, new_offset)?;
     write_all_at(wal.inner.file.as_ref(), offset, &bytes)?;
+    recovery::persist_header(&wal.inner.file, wal.inner.page_size, new_offset)?;
     offset = new_offset;
     // Checkpoint frames are a critical recovery boundary: even under
     // AsyncCommit, we want them durable before advancing wal_end_lsn so

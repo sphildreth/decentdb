@@ -140,6 +140,7 @@ impl WalIndex {
         out.sort_by_key(|(page_id, _)| *page_id);
     }
 
+    #[cfg(test)]
     pub(crate) fn prune_at_or_below(&mut self, page_ids: &[PageId], safe_lsn: u64) {
         for page_id in page_ids {
             if let Some(entries) = self.pages.get_mut(page_id) {
