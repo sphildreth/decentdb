@@ -951,6 +951,11 @@ namespace DecentDB.AdoNet
             out byte[]? utf8Bytes)
         {
             utf8Bytes = null;
+            if (parameter.DbType == DbType.Guid)
+            {
+                return false;
+            }
+
             if (value is not string text)
             {
                 return false;
@@ -1194,7 +1199,7 @@ namespace DecentDB.AdoNet
 
         private static bool IsSchemaChangedPreparedStatementError(DecentDBException ex)
         {
-            return ex.ErrorCode == -5 &&
+            return (ex.ErrorCode == -5 || ex.ErrorCode == 5) &&
                 ex.Message.Contains(
                     "prepared statement is no longer valid because the schema changed",
                     StringComparison.Ordinal);

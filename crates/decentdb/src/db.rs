@@ -49,6 +49,22 @@ pub struct Db {
 #[derive(Debug)]
 struct PagerReadStore<'a> {
     db: &'a Db,
+    snapshot_token: u64,
+}
+
+impl<'a> PagerReadStore<'a> {
+    fn new(db: &'a Db) -> Result<Self> {
+        Ok(Self {
+            db,
+            snapshot_token: db.hold_snapshot()?,
+        })
+    }
+}
+
+impl Drop for PagerReadStore<'_> {
+    fn drop(&mut self) {
+        let _ = self.db.release_snapshot(self.snapshot_token);
+    }
 }
 
 impl PageStore for PagerReadStore<'_> {
@@ -69,7 +85,7 @@ impl PageStore for PagerReadStore<'_> {
     }
 
     fn read_page(&self, page_id: PageId) -> Result<Arc<[u8]>> {
-        self.db.read_page(page_id)
+        self.db.read_page_for_snapshot(self.snapshot_token, page_id)
     }
 
     fn write_page(&mut self, _page_id: PageId, _data: &[u8]) -> Result<()> {
@@ -1025,6 +1041,15 @@ impl Db {
 
     /// Reads the latest visible version of a page.
     pub fn read_page(&self, page_id: u32) -> Result<Arc<[u8]>> {
+        let reader = self.inner.wal.begin_reader()?;
+        self.read_page_at_snapshot_lsn(page_id, reader.snapshot_lsn())
+    }
+
+    pub(crate) fn read_page_at_snapshot_lsn(
+        &self,
+        page_id: u32,
+        snapshot_lsn: u64,
+    ) -> Result<Arc<[u8]>> {
         page::validate_page_id(page_id)?;
         if let Some(staged) = self
             .inner
@@ -1038,8 +1063,6 @@ impl Db {
             return Ok(Arc::from(staged));
         }
 
-        let reader = self.inner.wal.begin_reader()?;
-        let snapshot_lsn = reader.snapshot_lsn();
         if let Some(wal_page) =
             self.inner
                 .wal
@@ -1305,15 +1328,7 @@ impl Db {
             .get(&token)
             .map(|guard| guard.snapshot_lsn())
             .ok_or_else(|| DbError::transaction(format!("unknown snapshot token {token}")))?;
-
-        if let Some(wal_page) =
-            self.inner
-                .wal
-                .read_page_at_snapshot(&self.inner.pager, page_id, snapshot_lsn)?
-        {
-            return Ok(wal_page);
-        }
-        self.inner.pager.read_page(page_id)
+        self.read_page_at_snapshot_lsn(page_id, snapshot_lsn)
     }
 
     /// Returns a deterministic JSON summary of storage state for the harness.
@@ -1989,36 +2004,34 @@ impl Db {
                         state.runtime.temp_schema_cookie,
                     )?;
                     let mut total_affected = 0_u64;
-                    if !prepared.read_only {
-                        if matches!(prepared.statement.as_ref(), SqlStatement::Insert(_)) {
-                            let snapshot_lsn = state.snapshot_lsn();
-                            if let Some(prepared_insert) = self
-                                .prepared_insert_plan_for_runtime_state(
-                                    prepared,
-                                    &mut state.runtime,
-                                    snapshot_lsn,
-                                    &mut state.indexes_maybe_stale,
-                                    &mut state.prepared_insert_runtime_cache,
-                                )?
-                            {
-                                if Self::prepared_insert_uses_direct_positional_params(
-                                    prepared_insert.as_ref(),
-                                    param_count,
-                                ) {
-                                    for row_index in 0..row_count {
-                                        build_params(row_index, &mut params)?;
-                                        let affected = state
-                                            .runtime
-                                            .execute_prepared_simple_insert_positional_params_in_place(
-                                                prepared_insert.as_ref(),
-                                                &mut params,
-                                                self.inner.config.page_size,
-                                            )?;
-                                        total_affected = total_affected.saturating_add(affected);
-                                    }
-                                    state.persistent_changed = true;
-                                    return Ok(total_affected);
+                    if !prepared.read_only
+                        && matches!(prepared.statement.as_ref(), SqlStatement::Insert(_))
+                    {
+                        let snapshot_lsn = state.snapshot_lsn();
+                        if let Some(prepared_insert) = self.prepared_insert_plan_for_runtime_state(
+                            prepared,
+                            &mut state.runtime,
+                            snapshot_lsn,
+                            &mut state.indexes_maybe_stale,
+                            &mut state.prepared_insert_runtime_cache,
+                        )? {
+                            if Self::prepared_insert_uses_direct_positional_params(
+                                prepared_insert.as_ref(),
+                                param_count,
+                            ) {
+                                for row_index in 0..row_count {
+                                    build_params(row_index, &mut params)?;
+                                    let affected = state
+                                        .runtime
+                                        .execute_prepared_simple_insert_positional_params_in_place(
+                                            prepared_insert.as_ref(),
+                                            &mut params,
+                                            self.inner.config.page_size,
+                                        )?;
+                                    total_affected = total_affected.saturating_add(affected);
                                 }
+                                state.persistent_changed = true;
+                                return Ok(total_affected);
                             }
                         }
                     }
@@ -3467,7 +3480,7 @@ impl Db {
             return Ok(state.row_count);
         }
 
-        let store = PagerReadStore { db: self };
+        let store = PagerReadStore::new(self)?;
         let payload = read_overflow(&store, state.pointer)?;
         if state.pointer.is_table_paged_manifest() {
             let manifest = decode_paged_table_manifest_payload(&payload)?;
@@ -3560,7 +3573,10 @@ impl Db {
         }
 
         let writer_last_commit_lsn = self.inner.writer_last_commit_lsn.load(Ordering::Acquire);
-        if last_runtime_lsn > 0 && snapshot_lsn <= writer_last_commit_lsn {
+        if last_runtime_lsn > 0
+            && writer_last_commit_lsn > 0
+            && snapshot_lsn <= writer_last_commit_lsn
+        {
             self.inner
                 .last_runtime_lsn
                 .store(snapshot_lsn, Ordering::Release);
@@ -3622,7 +3638,10 @@ impl Db {
         }
 
         let writer_last_commit_lsn = self.inner.writer_last_commit_lsn.load(Ordering::Acquire);
-        if last_runtime_lsn > 0 && latest_lsn <= writer_last_commit_lsn {
+        if last_runtime_lsn > 0
+            && writer_last_commit_lsn > 0
+            && latest_lsn <= writer_last_commit_lsn
+        {
             // A checkpoint can legally fold this handle's last committed WAL
             // history back into the database file and reset the live WAL end
             // (often to 0 after truncation). The in-memory runtime is still
@@ -4622,6 +4641,7 @@ impl Db {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn try_execute_prepared_insert_in_runtime_state(
         &self,
         prepared: &PreparedStatement,
@@ -18058,6 +18078,79 @@ mod tests {
         assert!(
             json_after.contains("\"rows_in_memory_count\":0"),
             "expected zero resident rows after grouped numeric with expression filter, got: {json_after}"
+        );
+    }
+
+    #[test]
+    fn simple_grouped_total_variance_bool_keeps_deferred_table_unloaded() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir
+            .path()
+            .join("deferred-grouped-total-variance-bool.ddb");
+
+        {
+            let db = Db::open_or_create(&path, DbConfig::default()).expect("create db");
+            db.execute(
+                "CREATE TABLE seeded (id INTEGER PRIMARY KEY, grp INTEGER, n INTEGER, flag BOOLEAN)",
+            )
+            .expect("create seeded");
+            for (id, grp, n, flag) in [
+                (0, 0, 1, true),
+                (1, 0, 1, true),
+                (2, 0, 3, false),
+                (3, 1, 2, true),
+                (4, 1, 4, true),
+            ] {
+                db.execute(&format!(
+                    "INSERT INTO seeded (id, grp, n, flag) VALUES ({id}, {grp}, {n}, {flag})"
+                ))
+                .expect("insert");
+            }
+            db.checkpoint().expect("checkpoint before close");
+        }
+
+        let db = Db::open_or_create(&path, DbConfig::default()).expect("reopen with defer");
+        let result = db
+            .execute(
+                "SELECT grp, TOTAL(DISTINCT n) AS total_n, VAR_SAMP(DISTINCT n) AS spread, \
+                 BOOL_AND(DISTINCT flag) AS all_true \
+                 FROM seeded GROUP BY grp HAVING TOTAL(DISTINCT n) >= 4 ORDER BY grp ASC",
+            )
+            .expect("grouped total variance bool");
+        assert_eq!(result.rows().len(), 2);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[
+                Value::Int64(0),
+                Value::Float64(4.0),
+                Value::Float64(2.0),
+                Value::Bool(false),
+            ]
+        );
+        assert_eq!(
+            result.rows()[1].values(),
+            &[
+                Value::Int64(1),
+                Value::Float64(6.0),
+                Value::Float64(2.0),
+                Value::Bool(true),
+            ]
+        );
+
+        let json_after = db
+            .inspect_storage_state_json()
+            .expect("json after grouped total variance bool");
+        assert!(
+            json_after.contains("\"loaded_table_count\":0"),
+            "expected grouped total variance bool to avoid resident materialization, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"deferred_table_count\":1"),
+            "expected deferred table to remain deferred after grouped total variance bool, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"rows_in_memory_count\":0"),
+            "expected zero resident rows after grouped total variance bool, got: {json_after}"
         );
     }
 

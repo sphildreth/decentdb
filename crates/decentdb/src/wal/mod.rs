@@ -17,6 +17,7 @@ pub(crate) mod writer;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::thread;
 
 use crate::alloc::{EngineAllocHandle, EngineByteBuf};
 use crate::config::{DbConfig, WalSyncMode};
@@ -204,17 +205,28 @@ impl WalHandle {
     }
 
     pub(crate) fn begin_reader(&self) -> Result<ReaderGuard> {
-        // Hold the index lock while reading wal_end_lsn and registering the
-        // reader. This guarantees mutual exclusion with the writer's
-        // retain_history check: either the writer sees our active_count
-        // increment (and retains history), or we observe the post-commit
-        // wal_end_lsn (and don't need old versions).
-        let _index = self
-            .inner
-            .index
-            .lock()
-            .expect("wal index lock should not be poisoned");
-        self.inner.reader_registry.register(self.latest_snapshot())
+        loop {
+            if self.inner.checkpoint_pending.load(Ordering::Acquire) {
+                thread::yield_now();
+                continue;
+            }
+            // Hold the index lock while reading wal_end_lsn and registering the
+            // reader. This guarantees mutual exclusion with the writer's
+            // retain_history check: either the writer sees our active_count
+            // increment (and retains history), or we observe the post-commit
+            // wal_end_lsn (and don't need old versions).
+            let _index = self
+                .inner
+                .index
+                .lock()
+                .expect("wal index lock should not be poisoned");
+            if self.inner.checkpoint_pending.load(Ordering::Acquire) {
+                drop(_index);
+                thread::yield_now();
+                continue;
+            }
+            return self.inner.reader_registry.register(self.latest_snapshot());
+        }
     }
 
     pub(crate) fn set_max_page_count(&self, page_count: u32) {

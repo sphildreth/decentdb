@@ -4139,12 +4139,15 @@ impl EngineRuntime {
                     SimpleGroupedNumericAggregateKind::Sum
                     | SimpleGroupedNumericAggregateKind::SumDistinct
                     | SimpleGroupedNumericAggregateKind::Avg
-                    | SimpleGroupedNumericAggregateKind::AvgDistinct => {
+                    | SimpleGroupedNumericAggregateKind::AvgDistinct
+                    | SimpleGroupedNumericAggregateKind::Total
+                    | SimpleGroupedNumericAggregateKind::TotalDistinct => {
                         if let Some(source_column_index) = aggregate.source_column_index {
                             if matches!(
                                 aggregate.kind,
                                 SimpleGroupedNumericAggregateKind::SumDistinct
                                     | SimpleGroupedNumericAggregateKind::AvgDistinct
+                                    | SimpleGroupedNumericAggregateKind::TotalDistinct
                             ) {
                                 groups[group_index].add_numeric_distinct(
                                     aggregate_index,
@@ -4169,11 +4172,81 @@ impl EngineRuntime {
                                 aggregate.kind,
                                 SimpleGroupedNumericAggregateKind::SumDistinct
                                     | SimpleGroupedNumericAggregateKind::AvgDistinct
+                                    | SimpleGroupedNumericAggregateKind::TotalDistinct
                             ) {
                                 groups[group_index]
                                     .add_numeric_distinct(aggregate_index, &value)?;
                             } else {
                                 groups[group_index].add_numeric(aggregate_index, &value)?;
+                            }
+                        }
+                    }
+                    SimpleGroupedNumericAggregateKind::StddevSamp
+                    | SimpleGroupedNumericAggregateKind::StddevSampDistinct
+                    | SimpleGroupedNumericAggregateKind::StddevPop
+                    | SimpleGroupedNumericAggregateKind::StddevPopDistinct
+                    | SimpleGroupedNumericAggregateKind::VarSamp
+                    | SimpleGroupedNumericAggregateKind::VarSampDistinct
+                    | SimpleGroupedNumericAggregateKind::VarPop
+                    | SimpleGroupedNumericAggregateKind::VarPopDistinct => {
+                        if let Some(source_column_index) = aggregate.source_column_index {
+                            if aggregate.kind.uses_distinct() {
+                                groups[group_index].add_variance_distinct(
+                                    aggregate_index,
+                                    &stored_row.values()[source_column_index],
+                                )?;
+                            } else {
+                                groups[group_index].add_variance(
+                                    aggregate_index,
+                                    &stored_row.values()[source_column_index],
+                                )?;
+                            }
+                        } else if let Some(source_expr) = aggregate.source_expr.as_ref() {
+                            let value = self.eval_expr(
+                                source_expr,
+                                &group_dataset,
+                                stored_row.values(),
+                                params,
+                                &BTreeMap::new(),
+                                None,
+                            )?;
+                            if aggregate.kind.uses_distinct() {
+                                groups[group_index]
+                                    .add_variance_distinct(aggregate_index, &value)?;
+                            } else {
+                                groups[group_index].add_variance(aggregate_index, &value)?;
+                            }
+                        }
+                    }
+                    SimpleGroupedNumericAggregateKind::BoolAnd
+                    | SimpleGroupedNumericAggregateKind::BoolAndDistinct
+                    | SimpleGroupedNumericAggregateKind::BoolOr
+                    | SimpleGroupedNumericAggregateKind::BoolOrDistinct => {
+                        if let Some(source_column_index) = aggregate.source_column_index {
+                            if aggregate.kind.uses_distinct() {
+                                groups[group_index].add_bool_distinct(
+                                    aggregate_index,
+                                    &stored_row.values()[source_column_index],
+                                )?;
+                            } else {
+                                groups[group_index].add_bool(
+                                    aggregate_index,
+                                    &stored_row.values()[source_column_index],
+                                )?;
+                            }
+                        } else if let Some(source_expr) = aggregate.source_expr.as_ref() {
+                            let value = self.eval_expr(
+                                source_expr,
+                                &group_dataset,
+                                stored_row.values(),
+                                params,
+                                &BTreeMap::new(),
+                                None,
+                            )?;
+                            if aggregate.kind.uses_distinct() {
+                                groups[group_index].add_bool_distinct(aggregate_index, &value)?;
+                            } else {
+                                groups[group_index].add_bool(aggregate_index, &value)?;
                             }
                         }
                     }
@@ -4288,12 +4361,15 @@ impl EngineRuntime {
                     SimpleGroupedNumericAggregateKind::Sum
                     | SimpleGroupedNumericAggregateKind::SumDistinct
                     | SimpleGroupedNumericAggregateKind::Avg
-                    | SimpleGroupedNumericAggregateKind::AvgDistinct => {
+                    | SimpleGroupedNumericAggregateKind::AvgDistinct
+                    | SimpleGroupedNumericAggregateKind::Total
+                    | SimpleGroupedNumericAggregateKind::TotalDistinct => {
                         if let Some(source_column_index) = aggregate.source_column_index {
                             if matches!(
                                 aggregate.kind,
                                 SimpleGroupedNumericAggregateKind::SumDistinct
                                     | SimpleGroupedNumericAggregateKind::AvgDistinct
+                                    | SimpleGroupedNumericAggregateKind::TotalDistinct
                             ) {
                                 groups[group_index].add_numeric_distinct(
                                     aggregate_index,
@@ -4316,11 +4392,77 @@ impl EngineRuntime {
                                 aggregate.kind,
                                 SimpleGroupedNumericAggregateKind::SumDistinct
                                     | SimpleGroupedNumericAggregateKind::AvgDistinct
+                                    | SimpleGroupedNumericAggregateKind::TotalDistinct
                             ) {
                                 groups[group_index]
                                     .add_numeric_distinct(aggregate_index, &value)?;
                             } else {
                                 groups[group_index].add_numeric(aggregate_index, &value)?;
+                            }
+                        }
+                    }
+                    SimpleGroupedNumericAggregateKind::StddevSamp
+                    | SimpleGroupedNumericAggregateKind::StddevSampDistinct
+                    | SimpleGroupedNumericAggregateKind::StddevPop
+                    | SimpleGroupedNumericAggregateKind::StddevPopDistinct
+                    | SimpleGroupedNumericAggregateKind::VarSamp
+                    | SimpleGroupedNumericAggregateKind::VarSampDistinct
+                    | SimpleGroupedNumericAggregateKind::VarPop
+                    | SimpleGroupedNumericAggregateKind::VarPopDistinct => {
+                        if let Some(source_column_index) = aggregate.source_column_index {
+                            if aggregate.kind.uses_distinct() {
+                                groups[group_index].add_variance_distinct(
+                                    aggregate_index,
+                                    &values[source_column_index],
+                                )?;
+                            } else {
+                                groups[group_index]
+                                    .add_variance(aggregate_index, &values[source_column_index])?;
+                            }
+                        } else if let Some(source_expr) = aggregate.source_expr.as_ref() {
+                            let value = self.eval_expr(
+                                source_expr,
+                                &group_dataset,
+                                values,
+                                params,
+                                &BTreeMap::new(),
+                                None,
+                            )?;
+                            if aggregate.kind.uses_distinct() {
+                                groups[group_index]
+                                    .add_variance_distinct(aggregate_index, &value)?;
+                            } else {
+                                groups[group_index].add_variance(aggregate_index, &value)?;
+                            }
+                        }
+                    }
+                    SimpleGroupedNumericAggregateKind::BoolAnd
+                    | SimpleGroupedNumericAggregateKind::BoolAndDistinct
+                    | SimpleGroupedNumericAggregateKind::BoolOr
+                    | SimpleGroupedNumericAggregateKind::BoolOrDistinct => {
+                        if let Some(source_column_index) = aggregate.source_column_index {
+                            if aggregate.kind.uses_distinct() {
+                                groups[group_index].add_bool_distinct(
+                                    aggregate_index,
+                                    &values[source_column_index],
+                                )?;
+                            } else {
+                                groups[group_index]
+                                    .add_bool(aggregate_index, &values[source_column_index])?;
+                            }
+                        } else if let Some(source_expr) = aggregate.source_expr.as_ref() {
+                            let value = self.eval_expr(
+                                source_expr,
+                                &group_dataset,
+                                values,
+                                params,
+                                &BTreeMap::new(),
+                                None,
+                            )?;
+                            if aggregate.kind.uses_distinct() {
+                                groups[group_index].add_bool_distinct(aggregate_index, &value)?;
+                            } else {
+                                groups[group_index].add_bool(aggregate_index, &value)?;
                             }
                         }
                     }
@@ -10467,8 +10609,69 @@ enum SimpleGroupedNumericAggregateKind {
     SumDistinct,
     Avg,
     AvgDistinct,
+    Total,
+    TotalDistinct,
+    StddevSamp,
+    StddevSampDistinct,
+    StddevPop,
+    StddevPopDistinct,
+    VarSamp,
+    VarSampDistinct,
+    VarPop,
+    VarPopDistinct,
+    BoolAnd,
+    BoolAndDistinct,
+    BoolOr,
+    BoolOrDistinct,
     Min,
     Max,
+}
+
+impl SimpleGroupedNumericAggregateKind {
+    fn aggregate_name(self) -> &'static str {
+        match self {
+            Self::CountRows | Self::CountNonNull | Self::CountDistinct => "count",
+            Self::Sum | Self::SumDistinct => "sum",
+            Self::Avg | Self::AvgDistinct => "avg",
+            Self::Total | Self::TotalDistinct => "total",
+            Self::StddevSamp | Self::StddevSampDistinct => "stddev",
+            Self::StddevPop | Self::StddevPopDistinct => "stddev_pop",
+            Self::VarSamp | Self::VarSampDistinct => "variance",
+            Self::VarPop | Self::VarPopDistinct => "var_pop",
+            Self::BoolAnd | Self::BoolAndDistinct => "bool_and",
+            Self::BoolOr | Self::BoolOrDistinct => "bool_or",
+            Self::Min => "min",
+            Self::Max => "max",
+        }
+    }
+
+    fn uses_distinct(self) -> bool {
+        matches!(
+            self,
+            Self::CountDistinct
+                | Self::SumDistinct
+                | Self::AvgDistinct
+                | Self::TotalDistinct
+                | Self::StddevSampDistinct
+                | Self::StddevPopDistinct
+                | Self::VarSampDistinct
+                | Self::VarPopDistinct
+                | Self::BoolAndDistinct
+                | Self::BoolOrDistinct
+        )
+    }
+
+    fn matches_aggregate_name(self, name: &str) -> bool {
+        match self {
+            Self::StddevSamp | Self::StddevSampDistinct => {
+                name.eq_ignore_ascii_case("stddev") || name.eq_ignore_ascii_case("stddev_samp")
+            }
+            Self::VarSamp | Self::VarSampDistinct => {
+                name.eq_ignore_ascii_case("variance") || name.eq_ignore_ascii_case("var_samp")
+            }
+            _ => name.eq_ignore_ascii_case(self.aggregate_name()),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -13901,6 +14104,127 @@ impl SimpleGroupedNumericState {
                     Value::Float64(self.total_float / self.numeric_count as f64)
                 }
             }
+            SimpleGroupedNumericAggregateKind::Total
+            | SimpleGroupedNumericAggregateKind::TotalDistinct => {
+                if self.numeric_count == 0 {
+                    Value::Float64(0.0)
+                } else {
+                    Value::Float64(self.total_float)
+                }
+            }
+            _ => Value::Null,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct SimpleGroupedVarianceState {
+    count: u64,
+    mean: f64,
+    m2: f64,
+}
+
+impl SimpleGroupedVarianceState {
+    fn add(&mut self, value: &Value) -> Result<()> {
+        let number = match value {
+            Value::Null => return Ok(()),
+            Value::Int64(value) => *value as f64,
+            Value::Float64(value) => *value,
+            Value::Decimal { scaled, scale } => decimal_to_f64(*scaled, *scale),
+            other => {
+                return Err(DbError::sql(format!(
+                    "variance aggregate does not support {other:?}"
+                )))
+            }
+        };
+        self.count += 1;
+        let delta = number - self.mean;
+        self.mean += delta / (self.count as f64);
+        let delta2 = number - self.mean;
+        self.m2 += delta * delta2;
+        Ok(())
+    }
+
+    fn value(&self, kind: SimpleGroupedNumericAggregateKind) -> Value {
+        if self.count == 0 {
+            return Value::Null;
+        }
+        let denominator = match kind {
+            SimpleGroupedNumericAggregateKind::StddevPop
+            | SimpleGroupedNumericAggregateKind::StddevPopDistinct
+            | SimpleGroupedNumericAggregateKind::VarPop
+            | SimpleGroupedNumericAggregateKind::VarPopDistinct => self.count as f64,
+            SimpleGroupedNumericAggregateKind::StddevSamp
+            | SimpleGroupedNumericAggregateKind::StddevSampDistinct
+            | SimpleGroupedNumericAggregateKind::VarSamp
+            | SimpleGroupedNumericAggregateKind::VarSampDistinct => {
+                if self.count < 2 {
+                    return Value::Null;
+                }
+                (self.count - 1) as f64
+            }
+            _ => return Value::Null,
+        };
+        let variance = self.m2 / denominator;
+        match kind {
+            SimpleGroupedNumericAggregateKind::StddevPop
+            | SimpleGroupedNumericAggregateKind::StddevPopDistinct
+            | SimpleGroupedNumericAggregateKind::StddevSamp
+            | SimpleGroupedNumericAggregateKind::StddevSampDistinct => {
+                Value::Float64(variance.sqrt())
+            }
+            SimpleGroupedNumericAggregateKind::VarPop
+            | SimpleGroupedNumericAggregateKind::VarPopDistinct
+            | SimpleGroupedNumericAggregateKind::VarSamp
+            | SimpleGroupedNumericAggregateKind::VarSampDistinct => Value::Float64(variance),
+            _ => Value::Null,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SimpleGroupedBoolState {
+    saw_non_null: bool,
+    and_value: bool,
+    or_value: bool,
+}
+
+impl Default for SimpleGroupedBoolState {
+    fn default() -> Self {
+        Self {
+            saw_non_null: false,
+            and_value: true,
+            or_value: false,
+        }
+    }
+}
+
+impl SimpleGroupedBoolState {
+    fn add(&mut self, value: &Value) -> Result<()> {
+        let boolean = match value {
+            Value::Null => return Ok(()),
+            Value::Bool(value) => *value,
+            other => {
+                return Err(DbError::sql(format!(
+                    "boolean aggregate does not support {other:?}"
+                )))
+            }
+        };
+        self.saw_non_null = true;
+        self.and_value &= boolean;
+        self.or_value |= boolean;
+        Ok(())
+    }
+
+    fn value(&self, kind: SimpleGroupedNumericAggregateKind) -> Value {
+        if !self.saw_non_null {
+            return Value::Null;
+        }
+        match kind {
+            SimpleGroupedNumericAggregateKind::BoolAnd
+            | SimpleGroupedNumericAggregateKind::BoolAndDistinct => Value::Bool(self.and_value),
+            SimpleGroupedNumericAggregateKind::BoolOr
+            | SimpleGroupedNumericAggregateKind::BoolOrDistinct => Value::Bool(self.or_value),
             _ => Value::Null,
         }
     }
@@ -13913,6 +14237,8 @@ struct SimpleGroupedNumericAggregate {
     value_counts: Vec<i64>,
     distinct_values: Vec<BTreeSet<Vec<u8>>>,
     numeric_states: Vec<SimpleGroupedNumericState>,
+    variance_states: Vec<SimpleGroupedVarianceState>,
+    bool_states: Vec<SimpleGroupedBoolState>,
     extreme_values: Vec<Value>,
 }
 
@@ -13933,6 +14259,8 @@ impl SimpleGroupedNumericAggregate {
                 };
                 aggregate_count
             ],
+            variance_states: vec![SimpleGroupedVarianceState::default(); aggregate_count],
+            bool_states: vec![SimpleGroupedBoolState::default(); aggregate_count],
             extreme_values: vec![Value::Null; aggregate_count],
         }
     }
@@ -13969,6 +14297,36 @@ impl SimpleGroupedNumericAggregate {
         Ok(())
     }
 
+    fn add_variance(&mut self, aggregate_index: usize, value: &Value) -> Result<()> {
+        self.variance_states[aggregate_index].add(value)
+    }
+
+    fn add_variance_distinct(&mut self, aggregate_index: usize, value: &Value) -> Result<()> {
+        if matches!(value, Value::Null) {
+            return Ok(());
+        }
+        let key = row_identity(std::slice::from_ref(value))?;
+        if self.distinct_values[aggregate_index].insert(key) {
+            self.variance_states[aggregate_index].add(value)?;
+        }
+        Ok(())
+    }
+
+    fn add_bool(&mut self, aggregate_index: usize, value: &Value) -> Result<()> {
+        self.bool_states[aggregate_index].add(value)
+    }
+
+    fn add_bool_distinct(&mut self, aggregate_index: usize, value: &Value) -> Result<()> {
+        if matches!(value, Value::Null) {
+            return Ok(());
+        }
+        let key = row_identity(std::slice::from_ref(value))?;
+        if self.distinct_values[aggregate_index].insert(key) {
+            self.bool_states[aggregate_index].add(value)?;
+        }
+        Ok(())
+    }
+
     fn aggregate_value(
         &self,
         kind: SimpleGroupedNumericAggregateKind,
@@ -13983,8 +14341,26 @@ impl SimpleGroupedNumericAggregate {
             SimpleGroupedNumericAggregateKind::Sum
             | SimpleGroupedNumericAggregateKind::SumDistinct
             | SimpleGroupedNumericAggregateKind::Avg
-            | SimpleGroupedNumericAggregateKind::AvgDistinct => {
+            | SimpleGroupedNumericAggregateKind::AvgDistinct
+            | SimpleGroupedNumericAggregateKind::Total
+            | SimpleGroupedNumericAggregateKind::TotalDistinct => {
                 self.numeric_states[aggregate_index].value(kind)
+            }
+            SimpleGroupedNumericAggregateKind::StddevSamp
+            | SimpleGroupedNumericAggregateKind::StddevSampDistinct
+            | SimpleGroupedNumericAggregateKind::StddevPop
+            | SimpleGroupedNumericAggregateKind::StddevPopDistinct
+            | SimpleGroupedNumericAggregateKind::VarSamp
+            | SimpleGroupedNumericAggregateKind::VarSampDistinct
+            | SimpleGroupedNumericAggregateKind::VarPop
+            | SimpleGroupedNumericAggregateKind::VarPopDistinct => {
+                self.variance_states[aggregate_index].value(kind)
+            }
+            SimpleGroupedNumericAggregateKind::BoolAnd
+            | SimpleGroupedNumericAggregateKind::BoolAndDistinct
+            | SimpleGroupedNumericAggregateKind::BoolOr
+            | SimpleGroupedNumericAggregateKind::BoolOrDistinct => {
+                self.bool_states[aggregate_index].value(kind)
             }
             SimpleGroupedNumericAggregateKind::Min | SimpleGroupedNumericAggregateKind::Max => {
                 self.extreme_values[aggregate_index].clone()
@@ -16037,6 +16413,48 @@ fn analyze_simple_grouped_numeric_aggregate_binding(
         } else {
             SimpleGroupedNumericAggregateKind::Avg
         }
+    } else if name.eq_ignore_ascii_case("total") {
+        if *distinct {
+            SimpleGroupedNumericAggregateKind::TotalDistinct
+        } else {
+            SimpleGroupedNumericAggregateKind::Total
+        }
+    } else if name.eq_ignore_ascii_case("stddev") || name.eq_ignore_ascii_case("stddev_samp") {
+        if *distinct {
+            SimpleGroupedNumericAggregateKind::StddevSampDistinct
+        } else {
+            SimpleGroupedNumericAggregateKind::StddevSamp
+        }
+    } else if name.eq_ignore_ascii_case("stddev_pop") {
+        if *distinct {
+            SimpleGroupedNumericAggregateKind::StddevPopDistinct
+        } else {
+            SimpleGroupedNumericAggregateKind::StddevPop
+        }
+    } else if name.eq_ignore_ascii_case("variance") || name.eq_ignore_ascii_case("var_samp") {
+        if *distinct {
+            SimpleGroupedNumericAggregateKind::VarSampDistinct
+        } else {
+            SimpleGroupedNumericAggregateKind::VarSamp
+        }
+    } else if name.eq_ignore_ascii_case("var_pop") {
+        if *distinct {
+            SimpleGroupedNumericAggregateKind::VarPopDistinct
+        } else {
+            SimpleGroupedNumericAggregateKind::VarPop
+        }
+    } else if name.eq_ignore_ascii_case("bool_and") {
+        if *distinct {
+            SimpleGroupedNumericAggregateKind::BoolAndDistinct
+        } else {
+            SimpleGroupedNumericAggregateKind::BoolAnd
+        }
+    } else if name.eq_ignore_ascii_case("bool_or") {
+        if *distinct {
+            SimpleGroupedNumericAggregateKind::BoolOrDistinct
+        } else {
+            SimpleGroupedNumericAggregateKind::BoolOr
+        }
     } else if name.eq_ignore_ascii_case("min") {
         if *distinct {
             return None;
@@ -16175,24 +16593,23 @@ fn matching_simple_grouped_aggregate_binding<'a>(
             SimpleGroupedNumericAggregateKind::Sum
             | SimpleGroupedNumericAggregateKind::SumDistinct
             | SimpleGroupedNumericAggregateKind::Avg
-            | SimpleGroupedNumericAggregateKind::AvgDistinct => {
-                let expected_name = match binding.kind {
-                    SimpleGroupedNumericAggregateKind::Sum => "sum",
-                    SimpleGroupedNumericAggregateKind::SumDistinct => "sum",
-                    SimpleGroupedNumericAggregateKind::Avg => "avg",
-                    SimpleGroupedNumericAggregateKind::AvgDistinct => "avg",
-                    SimpleGroupedNumericAggregateKind::CountRows
-                    | SimpleGroupedNumericAggregateKind::CountNonNull
-                    | SimpleGroupedNumericAggregateKind::CountDistinct
-                    | SimpleGroupedNumericAggregateKind::Min
-                    | SimpleGroupedNumericAggregateKind::Max => unreachable!(),
-                };
-                let expected_distinct = matches!(
-                    binding.kind,
-                    SimpleGroupedNumericAggregateKind::SumDistinct
-                        | SimpleGroupedNumericAggregateKind::AvgDistinct
-                );
-                if !name.eq_ignore_ascii_case(expected_name)
+            | SimpleGroupedNumericAggregateKind::AvgDistinct
+            | SimpleGroupedNumericAggregateKind::Total
+            | SimpleGroupedNumericAggregateKind::TotalDistinct
+            | SimpleGroupedNumericAggregateKind::StddevSamp
+            | SimpleGroupedNumericAggregateKind::StddevSampDistinct
+            | SimpleGroupedNumericAggregateKind::StddevPop
+            | SimpleGroupedNumericAggregateKind::StddevPopDistinct
+            | SimpleGroupedNumericAggregateKind::VarSamp
+            | SimpleGroupedNumericAggregateKind::VarSampDistinct
+            | SimpleGroupedNumericAggregateKind::VarPop
+            | SimpleGroupedNumericAggregateKind::VarPopDistinct
+            | SimpleGroupedNumericAggregateKind::BoolAnd
+            | SimpleGroupedNumericAggregateKind::BoolAndDistinct
+            | SimpleGroupedNumericAggregateKind::BoolOr
+            | SimpleGroupedNumericAggregateKind::BoolOrDistinct => {
+                let expected_distinct = binding.kind.uses_distinct();
+                if !binding.kind.matches_aggregate_name(name)
                     || *distinct != expected_distinct
                     || *star
                     || args.len() != 1
@@ -16220,18 +16637,7 @@ fn matching_simple_grouped_aggregate_binding<'a>(
                 }
             }
             SimpleGroupedNumericAggregateKind::Min | SimpleGroupedNumericAggregateKind::Max => {
-                let expected_name = match binding.kind {
-                    SimpleGroupedNumericAggregateKind::Min => "min",
-                    SimpleGroupedNumericAggregateKind::Max => "max",
-                    SimpleGroupedNumericAggregateKind::CountRows
-                    | SimpleGroupedNumericAggregateKind::CountNonNull
-                    | SimpleGroupedNumericAggregateKind::CountDistinct
-                    | SimpleGroupedNumericAggregateKind::Sum
-                    | SimpleGroupedNumericAggregateKind::SumDistinct
-                    | SimpleGroupedNumericAggregateKind::Avg => unreachable!(),
-                    SimpleGroupedNumericAggregateKind::AvgDistinct => unreachable!(),
-                };
-                if !name.eq_ignore_ascii_case(expected_name) || *star || args.len() != 1 {
+                if !binding.kind.matches_aggregate_name(name) || *star || args.len() != 1 {
                     return false;
                 }
                 binding.source_expr.as_ref().is_some_and(|expected| {
@@ -23346,6 +23752,71 @@ mod tests {
         assert_eq!(
             result.rows()[1].values(),
             &[Value::Int64(0), Value::Int64(1), Value::Int64(1)]
+        );
+    }
+
+    #[test]
+    fn simple_grouped_total_variance_bool_use_numeric_fast_path() {
+        let mut runtime = EngineRuntime::empty(1);
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE seeded (id INT64 PRIMARY KEY, grp INT64, n INT64, flag BOOLEAN)",
+        );
+        for (id, grp, n, flag) in [
+            (0, 0, 1, true),
+            (1, 0, 1, true),
+            (2, 0, 3, false),
+            (3, 1, 2, true),
+            (4, 1, 4, true),
+        ] {
+            execute_sql(
+                &mut runtime,
+                &format!("INSERT INTO seeded (id, grp, n, flag) VALUES ({id}, {grp}, {n}, {flag})"),
+            );
+        }
+
+        let statement = parse_sql_statement(
+            "SELECT grp, TOTAL(DISTINCT n) AS total_n, VAR_SAMP(DISTINCT n) AS spread, \
+             BOOL_AND(DISTINCT flag) AS all_true \
+             FROM seeded GROUP BY grp HAVING TOTAL(DISTINCT n) >= 4 ORDER BY grp ASC",
+        )
+        .expect("parse grouped total variance bool");
+        let crate::sql::ast::Statement::Query(query) = &statement else {
+            panic!("expected query statement");
+        };
+
+        let result = runtime
+            .try_execute_simple_grouped_numeric_aggregate_query(query, &[])
+            .expect("execute grouped total variance bool")
+            .expect("grouped total variance bool should stay on fast path");
+
+        assert_eq!(
+            result.columns(),
+            &[
+                "grp".to_string(),
+                "total_n".to_string(),
+                "spread".to_string(),
+                "all_true".to_string(),
+            ]
+        );
+        assert_eq!(result.rows().len(), 2);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[
+                Value::Int64(0),
+                Value::Float64(4.0),
+                Value::Float64(2.0),
+                Value::Bool(false),
+            ]
+        );
+        assert_eq!(
+            result.rows()[1].values(),
+            &[
+                Value::Int64(1),
+                Value::Float64(6.0),
+                Value::Float64(2.0),
+                Value::Bool(true),
+            ]
         );
     }
 
