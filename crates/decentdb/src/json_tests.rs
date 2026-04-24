@@ -509,10 +509,17 @@ mod tests {
 mod wal_index_tests {
     use std::sync::Arc;
 
+    use crate::wal::format::FrameEncoding;
     use crate::wal::index::{WalIndex, WalVersion};
 
     fn ver(lsn: u64, byte: u8) -> WalVersion {
-        WalVersion::resident(lsn, Arc::<[u8]>::from(vec![byte; 16]))
+        WalVersion::resident(
+            lsn,
+            lsn.saturating_sub(4),
+            4,
+            FrameEncoding::Page,
+            Arc::<[u8]>::from(vec![byte; 16]),
+        )
     }
 
     #[test]

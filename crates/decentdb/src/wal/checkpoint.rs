@@ -52,9 +52,19 @@ pub(crate) fn checkpoint(wal: &WalHandle, pager: &PagerHandle, timeout_sec: u64)
             .expect("wal index lock should not be poisoned");
         index.populate_latest_versions_at_or_before(safe_lsn, &mut latest_versions);
     }
+    if let Some(sidecar) = &wal.inner.index_sidecar {
+        sidecar
+            .lock()
+            .expect("wal index sidecar lock should not be poisoned")
+            .populate_latest_versions_at_or_before(safe_lsn, &mut latest_versions)?;
+        latest_versions.sort_by_key(|(page_id, _)| *page_id);
+    }
 
     for (page_id, version) in latest_versions.iter() {
-        pager.write_page_direct(*page_id, version.payload.as_slice())?;
+        let payload = wal
+            .read_page_at_snapshot(pager, *page_id, version.lsn)?
+            .ok_or_else(|| crate::error::DbError::corruption("checkpoint page version vanished"))?;
+        pager.write_page_direct(*page_id, &payload)?;
     }
     // Drop large `Arc<[u8]>` references early so the checkpoint copyback's
     // peak heap footprint is not retained across the disk-flush stall.
@@ -86,6 +96,12 @@ pub(crate) fn checkpoint(wal: &WalHandle, pager: &PagerHandle, timeout_sec: u64)
         // post-safe_lsn commits if we truncated.
         if active_readers == 0 && safe_lsn >= current_lsn {
             index.clear();
+            if let Some(sidecar) = &wal.inner.index_sidecar {
+                sidecar
+                    .lock()
+                    .expect("wal index sidecar lock should not be poisoned")
+                    .clear()?;
+            }
             drop(index);
             writer::truncate_to_header(wal)?;
         } else {

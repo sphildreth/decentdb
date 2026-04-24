@@ -102,13 +102,23 @@ pub struct DbConfig {
     /// unbounded in-memory index. Non-zero values request that the
     /// engine spill cold chains to a `<db>.wal-idx` sidecar file.
     ///
-    /// **The sidecar implementation is not yet wired in (ADR 0141 is in
-    /// "Accepted — scaffolding lands" status).** Setting this field is
-    /// presently a no-op; it is exposed now so embedders can roll out the
-    /// configuration ahead of the engine update without a flag day.
+    /// The current ADR 0141 slice spills reader-free latest full-page
+    /// versions into the sidecar and promotes those pages back into the
+    /// in-memory hot set on demand. Multi-version reader history and
+    /// delta-dependent latest versions still stay resident, and recovery
+    /// still rebuilds the index in memory before post-open spill.
     ///
     /// See ADR 0141 — Paged On-Disk WAL Index.
     pub wal_index_hot_set_pages: u32,
+
+    /// Number of most-recent WAL versions to keep resident per page before
+    /// the M4 demotion pass is allowed to convert older cold versions to
+    /// `WalVersionPayload::OnDisk`.
+    ///
+    /// Default: `16`.
+    ///
+    /// See ADR 0140 — `WalVersion` Discriminated Payload.
+    pub wal_resident_versions_per_page: u32,
 
     /// When `true`, `Db::open` skips the eager materialization of all
     /// table row data into memory, leaving each table in the
@@ -196,6 +206,7 @@ impl Default for DbConfig {
             )),
             background_checkpoint_worker: true,
             wal_index_hot_set_pages: 0,
+            wal_resident_versions_per_page: 16,
             defer_table_materialization: true,
             persistent_pk_index: false,
             paged_row_storage: false,
@@ -222,6 +233,7 @@ mod tests {
         assert!(!config.temp_dir.as_os_str().is_empty());
         assert_eq!(config.wal_checkpoint_threshold_pages, 4096);
         assert_eq!(config.wal_checkpoint_threshold_bytes, 64 * 1024 * 1024);
+        assert_eq!(config.wal_resident_versions_per_page, 16);
         assert!(config.defer_table_materialization);
         assert!(!config.persistent_pk_index);
         assert!(!config.paged_row_storage);

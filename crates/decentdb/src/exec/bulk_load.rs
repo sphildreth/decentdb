@@ -60,17 +60,18 @@ impl EngineRuntime {
                 &candidate,
             )
             .unwrap_or_else(|| super::dml::next_row_id(self, table_name));
-            let entry = self.tables_mut().get_mut(table_name).ok_or_else(|| {
-                DbError::internal(format!("table data for {table_name} is missing"))
-            })?;
-            entry.resident_data_mut().rows.push(StoredRow {
-                row_id,
-                values: candidate,
-            });
+            self.append_stored_row_to_table_row_source(
+                table_name,
+                &StoredRow {
+                    row_id,
+                    values: candidate,
+                },
+                page_size,
+            )?;
             affected_rows += 1;
         }
         if affected_rows > 0 {
-            self.mark_table_dirty(table_name);
+            self.mark_table_append_dirty(table_name);
         }
         self.rebuild_indexes(page_size)?;
         self.execute_after_triggers(

@@ -78,7 +78,7 @@ mod tests {
             .expect("prepare didn't error")
             .expect("expected prepared update");
         let res = runtime
-            .execute_prepared_simple_update(&prepared, &[])
+            .execute_prepared_simple_update(&prepared, &[], 1024)
             .expect("execute succeeded");
         assert_eq!(res.affected_rows(), 1);
         assert_eq!(
@@ -154,7 +154,7 @@ mod tests {
             .expect("prepare didn't error")
             .expect("expected prepared delete");
         let res = runtime
-            .execute_prepared_simple_delete(&prepared, &[])
+            .execute_prepared_simple_delete(&prepared, &[], 1024)
             .expect("execute succeeded");
         assert_eq!(res.affected_rows(), 1);
         assert!(runtime

@@ -9,8 +9,11 @@ use crate::storage::PagerHandle;
 use crate::vfs::{read_exact_at, write_all_at, VfsFile};
 
 use super::delta::apply_page_delta_in_place;
-use super::format::{FrameType, WalFrame, WalHeader, WAL_HEADER_SIZE, WAL_HEADER_SIZE_USIZE};
+use super::format::{
+    FrameEncoding, FrameType, WalFrame, WalHeader, WAL_HEADER_SIZE, WAL_HEADER_SIZE_USIZE,
+};
 use super::index::{WalIndex, WalVersion};
+use super::index_sidecar::WalIndexSidecar;
 
 const MAX_PENDING_RECOVERY_FRAMES: usize = 1_000_000;
 const RECOVERY_PENDING_OVERFLOW_MESSAGE: &str =
@@ -20,12 +23,17 @@ const RECOVERY_PENDING_OVERFLOW_MESSAGE: &str =
 struct PendingRecoveryPage {
     data: Vec<u8>,
     lsn: u64,
+    wal_offset: u64,
+    frame_len: u32,
+    encoding: FrameEncoding,
 }
 
 pub(crate) fn initialize_or_recover(
     file: &Arc<dyn VfsFile>,
     pager: &PagerHandle,
     page_size: u32,
+    hot_set_pages: u32,
+    mut sidecar: Option<&mut WalIndexSidecar>,
 ) -> Result<(WalIndex, u64, u32)> {
     let size = file.file_size()?;
     if size == 0 {
@@ -69,7 +77,8 @@ pub(crate) fn initialize_or_recover(
         else {
             break;
         };
-        let next_offset = offset + frame.encoded_len(page_size) as u64;
+        let frame_len = frame.encoded_len(page_size) as u32;
+        let next_offset = offset + frame_len as u64;
         match frame.frame_type {
             FrameType::Page => {
                 max_page_id = max_page_id.max(frame.page_id);
@@ -79,6 +88,9 @@ pub(crate) fn initialize_or_recover(
                     frame.page_id,
                     frame.payload,
                     next_offset,
+                    offset,
+                    frame_len,
+                    FrameEncoding::Page,
                 )?;
             }
             FrameType::PageDelta => {
@@ -87,6 +99,9 @@ pub(crate) fn initialize_or_recover(
                 if let Some(pending_page) = pending_pages.get_mut(&frame.page_id) {
                     apply_page_delta_in_place(&mut pending_page.data, &frame.payload)?;
                     pending_page.lsn = next_offset;
+                    pending_page.wal_offset = offset;
+                    pending_page.frame_len = frame_len;
+                    pending_page.encoding = FrameEncoding::PageDelta;
                 } else {
                     let mut data =
                         if let Some(version) = index.latest_visible(frame.page_id, u64::MAX) {
@@ -95,7 +110,15 @@ pub(crate) fn initialize_or_recover(
                             pager.read_page(frame.page_id)?.to_vec()
                         };
                     apply_page_delta_in_place(&mut data, &frame.payload)?;
-                    store_pending_page(&mut pending_pages, frame.page_id, data, next_offset)?;
+                    store_pending_page(
+                        &mut pending_pages,
+                        frame.page_id,
+                        data,
+                        next_offset,
+                        offset,
+                        frame_len,
+                        FrameEncoding::PageDelta,
+                    )?;
                 }
             }
             FrameType::Commit => {
@@ -106,10 +129,17 @@ pub(crate) fn initialize_or_recover(
                     // versions from a large WAL can consume substantial memory on open.
                     index.add_version(
                         page_id,
-                        WalVersion::resident(pending_page.lsn, Arc::from(pending_page.data)),
+                        WalVersion::resident(
+                            pending_page.lsn,
+                            pending_page.wal_offset,
+                            pending_page.frame_len,
+                            pending_page.encoding,
+                            Arc::from(pending_page.data),
+                        ),
                         false,
                     );
                 }
+                spill_recovered_latest_versions(&mut index, hot_set_pages, sidecar.as_deref_mut())?;
             }
             FrameType::Checkpoint => {
                 pending.clear();
@@ -120,6 +150,21 @@ pub(crate) fn initialize_or_recover(
     }
 
     Ok((index, header.wal_end_offset, max_page_id))
+}
+
+fn spill_recovered_latest_versions(
+    index: &mut WalIndex,
+    hot_set_pages: u32,
+    mut sidecar: Option<&mut WalIndexSidecar>,
+) -> Result<()> {
+    let Some(sidecar) = sidecar.as_mut() else {
+        return Ok(());
+    };
+    let hot_set_pages = usize::try_from(hot_set_pages).unwrap_or(usize::MAX);
+    while let Some((page_id, version)) = index.spill_one_cold_latest(hot_set_pages) {
+        sidecar.write_latest(page_id, &version)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn persist_header(
@@ -149,6 +194,9 @@ fn store_pending_page(
     page_id: PageId,
     data: Vec<u8>,
     lsn: u64,
+    wal_offset: u64,
+    frame_len: u32,
+    encoding: FrameEncoding,
 ) -> Result<()> {
     let at_capacity = pending_pages.len() >= MAX_PENDING_RECOVERY_FRAMES;
     match pending_pages.entry(page_id) {
@@ -156,13 +204,22 @@ fn store_pending_page(
             let pending_page = entry.get_mut();
             pending_page.data = data;
             pending_page.lsn = lsn;
+            pending_page.wal_offset = wal_offset;
+            pending_page.frame_len = frame_len;
+            pending_page.encoding = encoding;
             Ok(())
         }
         std::collections::hash_map::Entry::Vacant(entry) => {
             if at_capacity {
                 return Err(recovery_pending_overflow_error());
             }
-            entry.insert(PendingRecoveryPage { data, lsn });
+            entry.insert(PendingRecoveryPage {
+                data,
+                lsn,
+                wal_offset,
+                frame_len,
+                encoding,
+            });
             Ok(())
         }
     }
@@ -181,7 +238,7 @@ mod tests {
 
     use crate::storage::page;
     use crate::storage::{write_database_bootstrap_vfs, DatabaseHeader, PagerHandle};
-    use crate::vfs::{write_all_at, FileKind, OpenMode, Vfs};
+    use crate::vfs::{write_all_at, FileKind, OpenMode, Vfs, VfsHandle};
 
     use super::{initialize_or_recover, persist_header, MAX_PENDING_RECOVERY_FRAMES};
     use crate::wal::format::{WalHeader, WAL_HEADER_SIZE};
@@ -206,7 +263,7 @@ mod tests {
         write_all_at(file.as_ref(), 0, &bad_header).expect("write corrupt header");
         file.set_len(WAL_HEADER_SIZE).expect("size wal header");
 
-        let error = initialize_or_recover(&file, &pager, page::DEFAULT_PAGE_SIZE)
+        let error = initialize_or_recover(&file, &pager, page::DEFAULT_PAGE_SIZE, 0, None)
             .expect_err("header is corrupt");
         assert!(matches!(error, crate::error::DbError::Corruption { .. }));
     }
@@ -219,7 +276,8 @@ mod tests {
             .expect("create wal file");
         let pager = test_pager(&vfs, Path::new(":memory-db:"));
         let (index, end, max_page_id) =
-            initialize_or_recover(&file, &pager, page::DEFAULT_PAGE_SIZE).expect("initialize wal");
+            initialize_or_recover(&file, &pager, page::DEFAULT_PAGE_SIZE, 0, None)
+                .expect("initialize wal");
 
         assert_eq!(index.version_count(), 0);
         assert_eq!(end, 0);
@@ -243,8 +301,8 @@ mod tests {
         write_all_at(file.as_ref(), 0, &header.encode()).expect("write header");
         file.set_len(WAL_HEADER_SIZE).expect("size wal header");
 
-        let error =
-            initialize_or_recover(&file, &pager, page::DEFAULT_PAGE_SIZE).expect_err("mismatch");
+        let error = initialize_or_recover(&file, &pager, page::DEFAULT_PAGE_SIZE, 0, None)
+            .expect_err("mismatch");
         assert!(matches!(error, crate::error::DbError::Corruption { .. }));
     }
 
@@ -260,8 +318,8 @@ mod tests {
         write_all_at(file.as_ref(), 0, &header.encode()).expect("write header");
         file.set_len(WAL_HEADER_SIZE).expect("size wal header");
 
-        let error =
-            initialize_or_recover(&file, &pager, page::DEFAULT_PAGE_SIZE).expect_err("end_exceeds");
+        let error = initialize_or_recover(&file, &pager, page::DEFAULT_PAGE_SIZE, 0, None)
+            .expect_err("end_exceeds");
         assert!(matches!(error, crate::error::DbError::Corruption { .. }));
     }
 
@@ -288,7 +346,8 @@ mod tests {
         write_all_at(file.as_ref(), WAL_HEADER_SIZE, &data).expect("write frames");
         file.set_len(logical_end).expect("set len");
 
-        let (index, end, max_page_id) = initialize_or_recover(&file, &pager, ps).expect("recover");
+        let (index, end, max_page_id) =
+            initialize_or_recover(&file, &pager, ps, 0, None).expect("recover");
         assert_eq!(index.version_count(), 1);
         assert_eq!(end, logical_end);
         assert_eq!(max_page_id, 3);
@@ -322,7 +381,7 @@ mod tests {
         file.set_len(logical_end).expect("set len");
 
         let (index, _end, _max_page_id) =
-            initialize_or_recover(&file, &pager, ps).expect("recover");
+            initialize_or_recover(&file, &pager, ps, 0, None).expect("recover");
         assert_eq!(index.version_count(), 1);
         let latest = index
             .latest_visible(7, u64::MAX)
@@ -361,7 +420,7 @@ mod tests {
         file.set_len(logical_end).expect("set len");
 
         let (index, _end, _max_page_id) =
-            initialize_or_recover(&file, &pager, ps).expect("recover");
+            initialize_or_recover(&file, &pager, ps, 0, None).expect("recover");
         assert_eq!(
             index.version_count(),
             1,
@@ -374,6 +433,115 @@ mod tests {
             latest.payload.as_slice()[0],
             ((update_count - 1) % 251) as u8
         );
+    }
+
+    #[test]
+    fn recovery_spills_excess_full_page_versions_into_sidecar() {
+        let mem_vfs = Arc::new(crate::vfs::mem::MemVfs::default());
+        let vfs: Arc<dyn Vfs> = mem_vfs.clone();
+        let handle = VfsHandle::from_vfs(vfs);
+        let db_path = Path::new("spill-recovery.ddb");
+        let wal_path = Path::new("spill-recovery.ddb.wal");
+        let file = mem_vfs
+            .open(wal_path, OpenMode::CreateNew, FileKind::Wal)
+            .expect("create wal file");
+        let pager = test_pager(&mem_vfs, db_path);
+
+        let ps = page::DEFAULT_PAGE_SIZE;
+        let frames = vec![
+            crate::wal::format::WalFrame::page(7, vec![0x11; ps as usize]),
+            crate::wal::format::WalFrame::commit(),
+            crate::wal::format::WalFrame::page(8, vec![0x22; ps as usize]),
+            crate::wal::format::WalFrame::commit(),
+        ];
+        let mut data = Vec::new();
+        for frame in &frames {
+            data.extend_from_slice(&frame.encode(ps).expect("encode frame"));
+        }
+        let logical_end = WAL_HEADER_SIZE + data.len() as u64;
+        let header = WalHeader::new(ps, logical_end);
+        write_all_at(file.as_ref(), 0, &header.encode()).expect("write header");
+        write_all_at(file.as_ref(), WAL_HEADER_SIZE, &data).expect("write frames");
+        file.set_len(logical_end).expect("set len");
+
+        let mut sidecar = crate::wal::index_sidecar::WalIndexSidecar::open(&handle, db_path)
+            .expect("open sidecar");
+        let (index, _end, _max_page_id) =
+            initialize_or_recover(&file, &pager, ps, 1, Some(&mut sidecar)).expect("recover");
+
+        assert_eq!(index.version_count(), 1);
+        assert_eq!(sidecar.version_count(), 1);
+        assert!(index.latest_visible(8, u64::MAX).is_some());
+        let spilled = sidecar
+            .read_latest(7)
+            .expect("read spilled latest")
+            .expect("page 7 should spill during recovery");
+        assert!(matches!(
+            spilled.payload,
+            crate::wal::index::WalVersionPayload::OnDisk {
+                encoding: crate::wal::format::FrameEncoding::Page,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn recovery_spills_excess_delta_versions_into_sidecar() {
+        let mem_vfs = Arc::new(crate::vfs::mem::MemVfs::default());
+        let vfs: Arc<dyn Vfs> = mem_vfs.clone();
+        let handle = VfsHandle::from_vfs(vfs);
+        let db_path = Path::new("spill-recovery-delta.ddb");
+        let wal_path = Path::new("spill-recovery-delta.ddb.wal");
+        let file = mem_vfs
+            .open(wal_path, OpenMode::CreateNew, FileKind::Wal)
+            .expect("create wal file");
+        let pager = test_pager(&mem_vfs, db_path);
+
+        let ps = page::DEFAULT_PAGE_SIZE;
+        let base_page = vec![0x21; ps as usize];
+        pager
+            .write_page_direct(7, &base_page)
+            .expect("seed base page for delta recovery");
+        let mut updated_page = base_page.clone();
+        updated_page[0] = 0x99;
+        updated_page[11] = 0x42;
+        let delta_payload =
+            crate::wal::delta::encode_page_delta(&base_page, &updated_page).expect("delta payload");
+        let frames = vec![
+            crate::wal::format::WalFrame::page_delta(7, delta_payload),
+            crate::wal::format::WalFrame::commit(),
+            crate::wal::format::WalFrame::page(8, vec![0x22; ps as usize]),
+            crate::wal::format::WalFrame::commit(),
+        ];
+        let mut data = Vec::new();
+        for frame in &frames {
+            data.extend_from_slice(&frame.encode(ps).expect("encode frame"));
+        }
+        let logical_end = WAL_HEADER_SIZE + data.len() as u64;
+        let header = WalHeader::new(ps, logical_end);
+        write_all_at(file.as_ref(), 0, &header.encode()).expect("write header");
+        write_all_at(file.as_ref(), WAL_HEADER_SIZE, &data).expect("write frames");
+        file.set_len(logical_end).expect("set len");
+
+        let mut sidecar = crate::wal::index_sidecar::WalIndexSidecar::open(&handle, db_path)
+            .expect("open sidecar");
+        let (index, _end, _max_page_id) =
+            initialize_or_recover(&file, &pager, ps, 1, Some(&mut sidecar)).expect("recover");
+
+        assert_eq!(index.version_count(), 1);
+        assert_eq!(sidecar.version_count(), 1);
+        assert!(index.latest_visible(8, u64::MAX).is_some());
+        let spilled = sidecar
+            .read_latest(7)
+            .expect("read spilled latest")
+            .expect("page 7 should spill during recovery");
+        assert!(matches!(
+            spilled.payload,
+            crate::wal::index::WalVersionPayload::OnDisk {
+                encoding: crate::wal::format::FrameEncoding::PageDelta,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -397,7 +565,7 @@ mod tests {
         file.set_len(logical_end).expect("set len");
 
         let (index, _end, _max_page_id) =
-            initialize_or_recover(&file, &pager, ps).expect("recover");
+            initialize_or_recover(&file, &pager, ps, 0, None).expect("recover");
         // No committed frames -> index should be empty
         assert_eq!(index.version_count(), 0);
     }
@@ -435,7 +603,7 @@ mod tests {
         file.set_len(logical_end).expect("set len");
 
         let (index, _end, _max_page_id) =
-            initialize_or_recover(&file, &pager, ps).expect("recover");
+            initialize_or_recover(&file, &pager, ps, 0, None).expect("recover");
         let version = index
             .latest_visible(3, u64::MAX)
             .expect("recovered page version");
@@ -482,7 +650,7 @@ mod tests {
         file.set_len(logical_end).expect("set len");
 
         let (index, _end, _max_page_id) =
-            initialize_or_recover(&file, &pager, ps).expect("recover");
+            initialize_or_recover(&file, &pager, ps, 0, None).expect("recover");
         assert_eq!(index.version_count(), 1);
         let version = index
             .latest_visible(page_id, u64::MAX)
@@ -526,7 +694,8 @@ mod tests {
         persist_header(&file, ps, offset).expect("persist header");
         file.set_len(offset).expect("set wal len");
 
-        let error = initialize_or_recover(&file, &pager, ps).expect_err("pending overflow");
+        let error =
+            initialize_or_recover(&file, &pager, ps, 0, None).expect_err("pending overflow");
         assert!(matches!(error, crate::error::DbError::Corruption { .. }));
         assert!(error
             .to_string()

@@ -9,11 +9,13 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::thread;
 
+use crate::alloc::EngineAllocHandle;
 use crate::config::DbConfig;
 use crate::error::Result;
 use crate::storage::PagerHandle;
 use crate::vfs::{FileKind, OpenMode, VfsHandle};
 
+use super::index_sidecar::{WalIndexBackendKind, WalIndexSidecar};
 use super::reader_registry::ReaderRegistry;
 use super::recovery;
 use super::{AutoCheckpointConfig, SharedWalInner, WalHandle, WalWriteState};
@@ -70,8 +72,18 @@ fn build_handle(
         OpenMode::OpenOrCreate
     };
     let file = vfs.open(&wal_path, mode, FileKind::Wal)?;
-    let (index, end_lsn, recovered_max_page_id) =
-        recovery::initialize_or_recover(&file, pager, config.page_size)?;
+    let backend_kind = WalIndexBackendKind::for_hot_set_pages(config.wal_index_hot_set_pages);
+    let mut index_sidecar = match backend_kind {
+        WalIndexBackendKind::InMemory => None,
+        WalIndexBackendKind::PagedSidecar => Some(WalIndexSidecar::open(vfs, db_path)?),
+    };
+    let (index, end_lsn, recovered_max_page_id) = recovery::initialize_or_recover(
+        &file,
+        pager,
+        config.page_size,
+        config.wal_index_hot_set_pages,
+        index_sidecar.as_mut(),
+    )?;
     let allocated_len = file.file_size()?;
 
     let async_commit = match config.wal_sync_mode {
@@ -80,6 +92,7 @@ fn build_handle(
         ),
         _ => None,
     };
+    let alloc = EngineAllocHandle::default();
 
     let inner = Arc::new(SharedWalInner {
         canonical_path,
@@ -87,19 +100,36 @@ fn build_handle(
         page_size: config.page_size,
         sync_mode: config.wal_sync_mode,
         index: Mutex::new(index),
+        index_sidecar: index_sidecar.take().map(Mutex::new),
+        wal_index_hot_set_pages: config.wal_index_hot_set_pages,
         wal_end_lsn: AtomicU64::new(end_lsn),
         max_page_count: AtomicU32::new(recovered_max_page_id),
         allocated_len: AtomicU64::new(allocated_len),
-        write_lock: Mutex::new(WalWriteState::default()),
+        write_lock: Mutex::new(WalWriteState::new(alloc)),
         reader_registry: ReaderRegistry::default(),
         checkpoint_pending: AtomicBool::new(false),
         checkpoint_epoch: AtomicU64::new(0),
         async_commit,
+        resident_versions_per_page: config.wal_resident_versions_per_page,
         auto_checkpoint: AutoCheckpointConfig::from_db_config(config),
         pages_since_checkpoint: AtomicU32::new(0),
         checkpoint_scratch: Mutex::new(Vec::new()),
         bg_checkpointer: std::sync::OnceLock::new(),
     });
+
+    if let Some(sidecar) = &inner.index_sidecar {
+        let mut index = inner
+            .index
+            .lock()
+            .expect("wal index lock should not be poisoned");
+        let mut sidecar = sidecar
+            .lock()
+            .expect("wal index sidecar lock should not be poisoned");
+        let wal = WalHandle {
+            inner: Arc::clone(&inner),
+        };
+        wal.spill_excess_hot_pages_locked(&mut index, &mut sidecar)?;
+    }
 
     // Background checkpoint worker (ADR 0058). Only spawn when at least one
     // size-based threshold is enabled; otherwise the worker would be idle

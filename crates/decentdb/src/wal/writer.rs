@@ -6,6 +6,7 @@
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
+use crate::alloc::EngineByteBuf;
 use crate::config::WalSyncMode;
 use crate::error::{DbError, Result};
 use crate::storage::page::PageId;
@@ -13,7 +14,9 @@ use crate::storage::PagerHandle;
 use crate::vfs::write_all_at;
 
 use super::delta::encode_page_delta_into;
-use super::format::{FrameType, WalFrame, FRAME_HEADER_SIZE, FRAME_TRAILER_SIZE, WAL_HEADER_SIZE};
+use super::format::{
+    FrameEncoding, FrameType, WalFrame, FRAME_HEADER_SIZE, FRAME_TRAILER_SIZE, WAL_HEADER_SIZE,
+};
 use super::index::WalVersion;
 use super::recovery;
 use super::WalHandle;
@@ -51,7 +54,7 @@ pub(crate) fn commit_pages(
     let latest_snapshot = wal.latest_snapshot();
 
     // Look up all base pages under a single index lock for delta encoding.
-    let base_pages = lookup_base_pages_batch(wal, &pages, latest_snapshot);
+    let base_pages = lookup_base_pages_batch(wal, pager, &pages, latest_snapshot)?;
 
     prepared_pages.clear();
     prepared_pages.reserve(pages.len());
@@ -60,7 +63,8 @@ pub(crate) fn commit_pages(
             .get(i)
             .and_then(|b| b.as_ref())
             .map(|data| &data[..]);
-        let encoded_len = append_best_page_frame_with_base(
+        let frame_offset = offset + page_batch.len() as u64;
+        let (encoded_len, encoding) = append_best_page_frame_with_base(
             page_batch,
             delta_scratch,
             wal,
@@ -69,13 +73,13 @@ pub(crate) fn commit_pages(
             &payload,
             base,
         )?;
-        prepared_pages.push((page_id, payload, encoded_len));
+        prepared_pages.push((page_id, payload, encoded_len, encoding, frame_offset));
     }
     let commit_start_lsn = offset;
     page_batch.extend_from_slice(&COMMIT_FRAME_BYTES);
     let new_offset = offset + page_batch.len() as u64;
     let metadata_changed = ensure_capacity(wal, new_offset)?;
-    write_all_at(wal.inner.file.as_ref(), offset, page_batch)?;
+    write_all_at(wal.inner.file.as_ref(), offset, page_batch.as_slice())?;
     // Publish the logical end only after the frame bytes are in place so a
     // concurrent opener never trusts a WAL tail that has not been written yet.
     recovery::persist_header(&wal.inner.file, wal.inner.page_size, new_offset)?;
@@ -91,13 +95,32 @@ pub(crate) fn commit_pages(
         // Check inside the index lock so begin_reader() cannot register
         // between the count check and the version clear (TOCTOU fix).
         let retain_history = wal.inner.reader_registry.active_reader_count()? > 0;
+        let mut sidecar = wal.inner.index_sidecar.as_ref().map(|sidecar| {
+            sidecar
+                .lock()
+                .expect("wal index sidecar lock should not be poisoned")
+        });
         let mut version_lsn = commit_start_lsn;
         let prepared_count = prepared_pages.len();
-        for (page_id, payload, encoded_len) in prepared_pages.drain(..) {
+        for (page_id, payload, encoded_len, encoding, frame_offset) in prepared_pages.drain(..) {
             version_lsn += encoded_len as u64;
+            if let Some(sidecar) = sidecar.as_mut() {
+                if retain_history && !index.contains_page(page_id) {
+                    if let Some(previous) = sidecar.read_latest(page_id)? {
+                        index.seed_latest(page_id, previous);
+                    }
+                }
+                sidecar.clear_latest(page_id)?;
+            }
             index.add_version(
                 page_id,
-                WalVersion::resident(version_lsn, Arc::from(payload)),
+                WalVersion::resident(
+                    version_lsn,
+                    frame_offset,
+                    encoded_len as u32,
+                    encoding,
+                    Arc::from(payload),
+                ),
                 retain_history,
             );
         }
@@ -118,6 +141,7 @@ pub(crate) fn commit_pages(
             .fetch_add(prepared_count_u32, Ordering::AcqRel);
     }
     drop(writer_state);
+    demote_cold_versions(wal)?;
     maybe_auto_checkpoint(wal, pager)?;
     Ok(offset)
 }
@@ -169,7 +193,7 @@ pub(crate) fn commit_pages_if_latest(
     page_batch.reserve(page_frame_len * pages.len() + COMMIT_FRAME_BYTES.len());
 
     // Look up all base pages under a single index lock for delta encoding.
-    let base_pages = lookup_base_pages_batch(wal, &pages, latest);
+    let base_pages = lookup_base_pages_batch(wal, pager, &pages, latest)?;
 
     prepared_pages.clear();
     prepared_pages.reserve(pages.len());
@@ -178,7 +202,8 @@ pub(crate) fn commit_pages_if_latest(
             .get(i)
             .and_then(|b| b.as_ref())
             .map(|data| &data[..]);
-        let encoded_len = append_best_page_frame_with_base(
+        let frame_offset = offset + page_batch.len() as u64;
+        let (encoded_len, encoding) = append_best_page_frame_with_base(
             page_batch,
             delta_scratch,
             wal,
@@ -187,13 +212,13 @@ pub(crate) fn commit_pages_if_latest(
             &payload,
             base,
         )?;
-        prepared_pages.push((page_id, payload, encoded_len));
+        prepared_pages.push((page_id, payload, encoded_len, encoding, frame_offset));
     }
     let commit_start_lsn = offset;
     page_batch.extend_from_slice(&COMMIT_FRAME_BYTES);
     let new_offset = offset + page_batch.len() as u64;
     let metadata_changed = ensure_capacity(wal, new_offset)?;
-    write_all_at(wal.inner.file.as_ref(), offset, page_batch)?;
+    write_all_at(wal.inner.file.as_ref(), offset, page_batch.as_slice())?;
     // Publish the logical end only after the frame bytes are in place so a
     // concurrent opener never trusts a WAL tail that has not been written yet.
     recovery::persist_header(&wal.inner.file, wal.inner.page_size, new_offset)?;
@@ -209,13 +234,32 @@ pub(crate) fn commit_pages_if_latest(
         // Check inside the index lock so begin_reader() cannot register
         // between the count check and the version clear (TOCTOU fix).
         let retain_history = wal.inner.reader_registry.active_reader_count()? > 0;
+        let mut sidecar = wal.inner.index_sidecar.as_ref().map(|sidecar| {
+            sidecar
+                .lock()
+                .expect("wal index sidecar lock should not be poisoned")
+        });
         let mut version_lsn = commit_start_lsn;
         let prepared_count = prepared_pages.len();
-        for (page_id, payload, encoded_len) in prepared_pages.drain(..) {
+        for (page_id, payload, encoded_len, encoding, frame_offset) in prepared_pages.drain(..) {
             version_lsn += encoded_len as u64;
+            if let Some(sidecar) = sidecar.as_mut() {
+                if retain_history && !index.contains_page(page_id) {
+                    if let Some(previous) = sidecar.read_latest(page_id)? {
+                        index.seed_latest(page_id, previous);
+                    }
+                }
+                sidecar.clear_latest(page_id)?;
+            }
             index.add_version(
                 page_id,
-                WalVersion::resident(version_lsn, Arc::from(payload)),
+                WalVersion::resident(
+                    version_lsn,
+                    frame_offset,
+                    encoded_len as u32,
+                    encoding,
+                    Arc::from(payload),
+                ),
                 retain_history,
             );
         }
@@ -231,6 +275,7 @@ pub(crate) fn commit_pages_if_latest(
             .fetch_add(prepared_count_u32, Ordering::AcqRel);
     }
     drop(writer_state);
+    demote_cold_versions(wal)?;
     maybe_auto_checkpoint(wal, pager)?;
     Ok(offset)
 }
@@ -318,7 +363,7 @@ fn ensure_capacity(wal: &WalHandle, required_len: u64) -> Result<bool> {
 }
 
 fn append_page_frame(
-    output: &mut Vec<u8>,
+    output: &mut EngineByteBuf,
     page_id: PageId,
     payload: &[u8],
     page_size: u32,
@@ -346,32 +391,36 @@ fn append_page_frame(
 }
 
 fn append_best_page_frame_with_base(
-    output: &mut Vec<u8>,
-    delta_scratch: &mut Vec<u8>,
+    output: &mut EngineByteBuf,
+    delta_scratch: &mut EngineByteBuf,
     wal: &WalHandle,
     pager: &PagerHandle,
     page_id: PageId,
     payload: &[u8],
     wal_base: Option<&[u8]>,
-) -> Result<usize> {
+) -> Result<(usize, FrameEncoding)> {
     if let Some(base) = wal_base {
         if encode_page_delta_into(delta_scratch, base, payload) {
-            return append_page_delta_frame(output, page_id, delta_scratch);
+            return append_page_delta_frame(output, page_id, delta_scratch)
+                .map(|len| (len, FrameEncoding::PageDelta));
         }
     } else if let Ok(base) = pager.read_page(page_id) {
         if encode_page_delta_into(delta_scratch, &base, payload) {
-            return append_page_delta_frame(output, page_id, delta_scratch);
+            return append_page_delta_frame(output, page_id, delta_scratch)
+                .map(|len| (len, FrameEncoding::PageDelta));
         }
     }
     append_page_frame(output, page_id, payload, wal.inner.page_size)
+        .map(|len| (len, FrameEncoding::Page))
 }
 
 /// Look up base pages for an entire batch under a single index lock.
 fn lookup_base_pages_batch(
     wal: &WalHandle,
+    pager: &PagerHandle,
     pages: &[(PageId, Vec<u8>)],
     snapshot_lsn: u64,
-) -> Vec<Option<Arc<[u8]>>> {
+) -> Result<Vec<Option<Arc<[u8]>>>> {
     let index = wal
         .inner
         .index
@@ -380,11 +429,29 @@ fn lookup_base_pages_batch(
     pages
         .iter()
         .map(|(page_id, _)| {
-            index
-                .latest_visible(*page_id, snapshot_lsn)
-                .map(|v| v.payload.arc())
+            wal.materialize_latest_visible_locked(&index, pager, *page_id, snapshot_lsn)
         })
         .collect()
+}
+
+fn demote_cold_versions(wal: &WalHandle) -> Result<()> {
+    let retain_recent = wal.inner.resident_versions_per_page;
+    let min_reader_snapshot = wal.inner.reader_registry.min_snapshot_lsn()?;
+    let mut index = wal
+        .inner
+        .index
+        .lock()
+        .expect("wal index lock should not be poisoned");
+    index.demote_cold(min_reader_snapshot, retain_recent);
+    if min_reader_snapshot.is_none() {
+        if let Some(sidecar) = &wal.inner.index_sidecar {
+            let mut sidecar = sidecar
+                .lock()
+                .expect("wal index sidecar lock should not be poisoned");
+            wal.spill_excess_hot_pages_locked(&mut index, &mut sidecar)?;
+        }
+    }
+    Ok(())
 }
 
 /// Evaluate the size-based auto-checkpoint thresholds (ADR 0137) and trigger
@@ -433,7 +500,11 @@ fn maybe_auto_checkpoint(wal: &WalHandle, pager: &PagerHandle) -> Result<()> {
     super::checkpoint::checkpoint(wal, pager, cfg.checkpoint_timeout_sec)
 }
 
-fn append_page_delta_frame(output: &mut Vec<u8>, page_id: PageId, payload: &[u8]) -> Result<usize> {
+fn append_page_delta_frame(
+    output: &mut EngineByteBuf,
+    page_id: PageId,
+    payload: &[u8],
+) -> Result<usize> {
     if page_id == 0 {
         return Err(DbError::corruption(
             "page WAL frames must have a non-zero page id",
@@ -452,11 +523,12 @@ fn append_page_delta_frame(output: &mut Vec<u8>, page_id: PageId, payload: &[u8]
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::alloc::{EngineAllocHandle, EngineByteBuf};
     use crate::storage::page;
 
     #[test]
     fn append_page_frame_rejects_zero_page_id() {
-        let mut out = Vec::new();
+        let mut out = EngineByteBuf::new_in(EngineAllocHandle::default());
         let payload = vec![0u8; page::DEFAULT_PAGE_SIZE as usize];
         let res = append_page_frame(&mut out, 0, &payload, page::DEFAULT_PAGE_SIZE);
         assert!(res.is_err());
@@ -464,7 +536,7 @@ mod tests {
 
     #[test]
     fn append_page_frame_rejects_size_mismatch() {
-        let mut out = Vec::new();
+        let mut out = EngineByteBuf::new_in(EngineAllocHandle::default());
         let payload = vec![0u8; 10];
         let res = append_page_frame(&mut out, 1, &payload, page::DEFAULT_PAGE_SIZE);
         assert!(res.is_err());
@@ -472,7 +544,7 @@ mod tests {
 
     #[test]
     fn append_page_frame_encodes_frame() {
-        let mut out = Vec::new();
+        let mut out = EngineByteBuf::new_in(EngineAllocHandle::default());
         let payload = vec![0xAA; page::DEFAULT_PAGE_SIZE as usize];
         let res =
             append_page_frame(&mut out, 5, &payload, page::DEFAULT_PAGE_SIZE).expect("append");

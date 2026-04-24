@@ -1,5 +1,6 @@
 //! Fixed-size WAL delta payloads for small page edits.
 
+use crate::alloc::{EngineAllocHandle, EngineByteBuf};
 use crate::error::{DbError, Result};
 
 pub(crate) const DELTA_FRAME_PAYLOAD_SIZE: usize = 512;
@@ -9,9 +10,9 @@ const DELTA_PATCH_HEADER_SIZE: usize = 4;
 
 #[allow(dead_code)]
 pub(crate) fn encode_page_delta(base: &[u8], updated: &[u8]) -> Option<Vec<u8>> {
-    let mut payload = Vec::with_capacity(DELTA_FRAME_PAYLOAD_SIZE);
+    let mut payload = EngineByteBuf::new_in(EngineAllocHandle::default());
     if encode_page_delta_into(&mut payload, base, updated) {
-        Some(payload)
+        Some(payload.as_slice().to_vec())
     } else {
         None
     }
@@ -23,7 +24,11 @@ pub(crate) fn encode_page_delta(base: &[u8], updated: &[u8]) -> Option<Vec<u8>> 
 /// `payload` now contains it); `false` if the page is incompatible with
 /// delta encoding (in which case `payload` is left empty and the writer
 /// falls back to a full-page frame).
-pub(crate) fn encode_page_delta_into(payload: &mut Vec<u8>, base: &[u8], updated: &[u8]) -> bool {
+pub(crate) fn encode_page_delta_into(
+    payload: &mut EngineByteBuf,
+    base: &[u8],
+    updated: &[u8],
+) -> bool {
     payload.clear();
     if base.len() != updated.len() {
         return false;

@@ -1205,35 +1205,62 @@ fn literal_to_sql(value: &Value) -> String {
 /// on. This function is the safe gate.
 pub(crate) fn safe_referenced_tables(stmt: &Statement) -> Option<BTreeSet<String>> {
     let mut tables = BTreeSet::new();
-    if !is_safe_statement(stmt, &mut tables) {
+    if !is_safe_statement(stmt, &mut tables, &BTreeSet::new()) {
         return None;
     }
     Some(tables)
 }
 
-fn is_safe_statement(stmt: &Statement, tables: &mut BTreeSet<String>) -> bool {
+fn is_safe_statement(
+    stmt: &Statement,
+    tables: &mut BTreeSet<String>,
+    inherited_ctes: &BTreeSet<String>,
+) -> bool {
     match stmt {
-        Statement::Query(query) => is_safe_query(query, tables),
+        Statement::Query(query) => is_safe_query(query, tables, inherited_ctes),
         Statement::Insert(insert) => {
             tables.insert(insert.table_name.clone());
-            match &insert.source {
-                InsertSource::Values(rows) => rows
-                    .iter()
-                    .all(|row| row.iter().all(|e| is_safe_expr(e, tables))),
-                // INSERT … SELECT is not analyzed exhaustively here.
-                InsertSource::Query(_) => false,
+            let source_safe = match &insert.source {
+                InsertSource::Values(rows) => rows.iter().all(|row| {
+                    row.iter()
+                        .all(|e| is_safe_expr(e, tables, inherited_ctes, &BTreeSet::new()))
+                }),
+                InsertSource::Query(query) => is_safe_query(query, tables, inherited_ctes),
+            };
+            if !source_safe {
+                return false;
             }
+            let conflict_safe = match &insert.on_conflict {
+                Some(ConflictAction::DoNothing { .. }) | None => true,
+                Some(ConflictAction::DoUpdate {
+                    assignments,
+                    filter,
+                    ..
+                }) => {
+                    assignments.iter().all(|assignment| {
+                        is_safe_expr(&assignment.expr, tables, inherited_ctes, &BTreeSet::new())
+                    }) && filter
+                        .as_ref()
+                        .map(|expr| is_safe_expr(expr, tables, inherited_ctes, &BTreeSet::new()))
+                        .unwrap_or(true)
+                }
+            };
+            conflict_safe
+                && insert
+                    .returning
+                    .iter()
+                    .all(|item| is_safe_select_item(item, tables, inherited_ctes, &BTreeSet::new()))
         }
         Statement::Update(update) => {
             tables.insert(update.table_name.clone());
             update
                 .assignments
                 .iter()
-                .all(|a| is_safe_expr(&a.expr, tables))
+                .all(|a| is_safe_expr(&a.expr, tables, inherited_ctes, &BTreeSet::new()))
                 && update
                     .filter
                     .as_ref()
-                    .map(|f| is_safe_expr(f, tables))
+                    .map(|f| is_safe_expr(f, tables, inherited_ctes, &BTreeSet::new()))
                     .unwrap_or(true)
         }
         Statement::Delete(delete) => {
@@ -1241,7 +1268,7 @@ fn is_safe_statement(stmt: &Statement, tables: &mut BTreeSet<String>) -> bool {
             delete
                 .filter
                 .as_ref()
-                .map(|f| is_safe_expr(f, tables))
+                .map(|f| is_safe_expr(f, tables, inherited_ctes, &BTreeSet::new()))
                 .unwrap_or(true)
         }
         // DDL / metadata: we conservatively report unsafe so the all-loader
@@ -1251,79 +1278,139 @@ fn is_safe_statement(stmt: &Statement, tables: &mut BTreeSet<String>) -> bool {
     }
 }
 
-fn is_safe_query(query: &Query, tables: &mut BTreeSet<String>) -> bool {
-    if !query.ctes.is_empty() {
+fn is_safe_query(
+    query: &Query,
+    tables: &mut BTreeSet<String>,
+    inherited_ctes: &BTreeSet<String>,
+) -> bool {
+    if query.recursive {
         return false;
     }
-    if !is_safe_query_body(&query.body, tables) {
+    let local_ctes = query
+        .ctes
+        .iter()
+        .map(|cte| cte.name.clone())
+        .collect::<BTreeSet<_>>();
+    let mut available_ctes = inherited_ctes.clone();
+    for cte in &query.ctes {
+        if !is_safe_query(&cte.query, tables, &available_ctes) {
+            return false;
+        }
+        available_ctes.insert(cte.name.clone());
+    }
+    if !is_safe_query_body(&query.body, tables, &available_ctes, &local_ctes) {
         return false;
     }
-    if !query.order_by.iter().all(|o| is_safe_expr(&o.expr, tables)) {
+    if !query
+        .order_by
+        .iter()
+        .all(|o| is_safe_expr(&o.expr, tables, &available_ctes, &local_ctes))
+    {
         return false;
     }
     if let Some(limit) = &query.limit {
-        if !is_safe_expr(limit, tables) {
+        if !is_safe_expr(limit, tables, &available_ctes, &local_ctes) {
             return false;
         }
     }
     if let Some(offset) = &query.offset {
-        if !is_safe_expr(offset, tables) {
+        if !is_safe_expr(offset, tables, &available_ctes, &local_ctes) {
             return false;
         }
     }
     true
 }
 
-fn is_safe_query_body(body: &QueryBody, tables: &mut BTreeSet<String>) -> bool {
+fn is_safe_query_body(
+    body: &QueryBody,
+    tables: &mut BTreeSet<String>,
+    available_ctes: &BTreeSet<String>,
+    local_ctes: &BTreeSet<String>,
+) -> bool {
     match body {
-        QueryBody::Select(select) => is_safe_select(select, tables),
-        // Set operations and VALUES outside an INSERT are conservatively
-        // unsafe: while VALUES has no table references, callers still expect
-        // the runtime to be fully loaded for downstream projection.
-        QueryBody::SetOperation { .. } | QueryBody::Values(_) => false,
+        QueryBody::Select(select) => is_safe_select(select, tables, available_ctes, local_ctes),
+        QueryBody::SetOperation { left, right, .. } => {
+            is_safe_query_body(left, tables, available_ctes, local_ctes)
+                && is_safe_query_body(right, tables, available_ctes, local_ctes)
+        }
+        QueryBody::Values(rows) => rows.iter().all(|row| {
+            row.iter()
+                .all(|expr| is_safe_expr(expr, tables, available_ctes, local_ctes))
+        }),
     }
 }
 
-fn is_safe_select(select: &Select, tables: &mut BTreeSet<String>) -> bool {
+fn is_safe_select(
+    select: &Select,
+    tables: &mut BTreeSet<String>,
+    available_ctes: &BTreeSet<String>,
+    local_ctes: &BTreeSet<String>,
+) -> bool {
     for from in &select.from {
-        if !is_safe_from_item(from, tables) {
+        if !is_safe_from_item(from, tables, available_ctes, local_ctes) {
             return false;
         }
     }
     for item in &select.projection {
-        match item {
-            SelectItem::Expr { expr, .. } => {
-                if !is_safe_expr(expr, tables) {
-                    return false;
-                }
-            }
-            // Wildcards (`*`, `tbl.*`) are fine — they only reference tables
-            // already in the FROM clause.
-            SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => {}
-        }
-    }
-    if let Some(filter) = &select.filter {
-        if !is_safe_expr(filter, tables) {
+        if !is_safe_select_item(item, tables, available_ctes, local_ctes) {
             return false;
         }
     }
-    if !select.group_by.iter().all(|e| is_safe_expr(e, tables)) {
+    if let Some(filter) = &select.filter {
+        if !is_safe_expr(filter, tables, available_ctes, local_ctes) {
+            return false;
+        }
+    }
+    if !select
+        .group_by
+        .iter()
+        .all(|e| is_safe_expr(e, tables, available_ctes, local_ctes))
+    {
         return false;
     }
-    if !select.distinct_on.iter().all(|e| is_safe_expr(e, tables)) {
+    if !select
+        .distinct_on
+        .iter()
+        .all(|e| is_safe_expr(e, tables, available_ctes, local_ctes))
+    {
         return false;
     }
     if let Some(having) = &select.having {
-        if !is_safe_expr(having, tables) {
+        if !is_safe_expr(having, tables, available_ctes, local_ctes) {
             return false;
         }
     }
     true
 }
 
-fn is_safe_from_item(item: &FromItem, tables: &mut BTreeSet<String>) -> bool {
+fn is_safe_select_item(
+    item: &SelectItem,
+    tables: &mut BTreeSet<String>,
+    available_ctes: &BTreeSet<String>,
+    local_ctes: &BTreeSet<String>,
+) -> bool {
+    match item {
+        SelectItem::Expr { expr, .. } => is_safe_expr(expr, tables, available_ctes, local_ctes),
+        // Wildcards (`*`, `tbl.*`) are fine — they only reference tables
+        // already in the FROM clause.
+        SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => true,
+    }
+}
+
+fn is_safe_from_item(
+    item: &FromItem,
+    tables: &mut BTreeSet<String>,
+    available_ctes: &BTreeSet<String>,
+    local_ctes: &BTreeSet<String>,
+) -> bool {
     match item {
         FromItem::Table { name, .. } => {
+            if cte_name_in_scope(name, available_ctes) {
+                return true;
+            }
+            if cte_name_in_scope(name, local_ctes) {
+                return false;
+            }
             tables.insert(name.clone());
             true
         }
@@ -1333,98 +1420,136 @@ fn is_safe_from_item(item: &FromItem, tables: &mut BTreeSet<String>) -> bool {
             constraint,
             ..
         } => {
-            if !is_safe_from_item(left, tables) || !is_safe_from_item(right, tables) {
+            if !is_safe_from_item(left, tables, available_ctes, local_ctes)
+                || !is_safe_from_item(right, tables, available_ctes, local_ctes)
+            {
                 return false;
             }
             match constraint {
-                JoinConstraint::On(expr) => is_safe_expr(expr, tables),
+                JoinConstraint::On(expr) => is_safe_expr(expr, tables, available_ctes, local_ctes),
                 JoinConstraint::Using(_) | JoinConstraint::Natural => true,
             }
         }
-        // Subqueries and table-valued functions are not analyzed —
-        // fall back to load-all.
-        FromItem::Subquery { .. } | FromItem::Function { .. } => false,
+        FromItem::Subquery { query, lateral, .. } => {
+            !*lateral && is_safe_query(query, tables, available_ctes)
+        }
+        // Table-valued functions are not analyzed — fall back to load-all.
+        FromItem::Function { .. } => false,
     }
 }
 
 #[allow(clippy::only_used_in_recursion)]
-fn is_safe_expr(expr: &Expr, tables: &mut BTreeSet<String>) -> bool {
+fn is_safe_expr(
+    expr: &Expr,
+    tables: &mut BTreeSet<String>,
+    available_ctes: &BTreeSet<String>,
+    local_ctes: &BTreeSet<String>,
+) -> bool {
     match expr {
         Expr::Literal(_) | Expr::Column { .. } | Expr::Parameter(_) => true,
         // Function and aggregate args may be expressions — walk them.
-        Expr::Function { args, .. } | Expr::Aggregate { args, .. } => {
-            args.iter().all(|a| is_safe_expr(a, tables))
-        }
+        Expr::Function { args, .. } | Expr::Aggregate { args, .. } => args
+            .iter()
+            .all(|a| is_safe_expr(a, tables, available_ctes, local_ctes)),
         Expr::WindowFunction {
             args,
             partition_by,
             order_by,
             ..
         } => {
-            args.iter().all(|a| is_safe_expr(a, tables))
-                && partition_by.iter().all(|e| is_safe_expr(e, tables))
-                && order_by.iter().all(|o| is_safe_expr(&o.expr, tables))
+            args.iter()
+                .all(|a| is_safe_expr(a, tables, available_ctes, local_ctes))
+                && partition_by
+                    .iter()
+                    .all(|e| is_safe_expr(e, tables, available_ctes, local_ctes))
+                && order_by
+                    .iter()
+                    .all(|o| is_safe_expr(&o.expr, tables, available_ctes, local_ctes))
         }
         Expr::RowNumber {
             partition_by,
             order_by,
             ..
         } => {
-            partition_by.iter().all(|e| is_safe_expr(e, tables))
-                && order_by.iter().all(|o| is_safe_expr(&o.expr, tables))
+            partition_by
+                .iter()
+                .all(|e| is_safe_expr(e, tables, available_ctes, local_ctes))
+                && order_by
+                    .iter()
+                    .all(|o| is_safe_expr(&o.expr, tables, available_ctes, local_ctes))
         }
-        Expr::Unary { expr, .. } => is_safe_expr(expr, tables),
+        Expr::Unary { expr, .. } => is_safe_expr(expr, tables, available_ctes, local_ctes),
         Expr::Binary { left, right, .. } => {
-            is_safe_expr(left, tables) && is_safe_expr(right, tables)
+            is_safe_expr(left, tables, available_ctes, local_ctes)
+                && is_safe_expr(right, tables, available_ctes, local_ctes)
         }
         Expr::Between {
             expr, low, high, ..
-        } => is_safe_expr(expr, tables) && is_safe_expr(low, tables) && is_safe_expr(high, tables),
-        Expr::InList { expr, items, .. } => {
-            is_safe_expr(expr, tables) && items.iter().all(|i| is_safe_expr(i, tables))
+        } => {
+            is_safe_expr(expr, tables, available_ctes, local_ctes)
+                && is_safe_expr(low, tables, available_ctes, local_ctes)
+                && is_safe_expr(high, tables, available_ctes, local_ctes)
         }
-        Expr::IsNull { expr, .. } => is_safe_expr(expr, tables),
+        Expr::InList { expr, items, .. } => {
+            is_safe_expr(expr, tables, available_ctes, local_ctes)
+                && items
+                    .iter()
+                    .all(|i| is_safe_expr(i, tables, available_ctes, local_ctes))
+        }
+        Expr::IsNull { expr, .. } => is_safe_expr(expr, tables, available_ctes, local_ctes),
         Expr::Case {
             operand,
             branches,
             else_expr,
         } => {
             if let Some(op) = operand {
-                if !is_safe_expr(op, tables) {
+                if !is_safe_expr(op, tables, available_ctes, local_ctes) {
                     return false;
                 }
             }
             for (when, then) in branches {
-                if !is_safe_expr(when, tables) || !is_safe_expr(then, tables) {
+                if !is_safe_expr(when, tables, available_ctes, local_ctes)
+                    || !is_safe_expr(then, tables, available_ctes, local_ctes)
+                {
                     return false;
                 }
             }
             if let Some(e) = else_expr {
-                if !is_safe_expr(e, tables) {
+                if !is_safe_expr(e, tables, available_ctes, local_ctes) {
                     return false;
                 }
             }
             true
         }
-        Expr::Cast { expr, .. } => is_safe_expr(expr, tables),
+        Expr::Cast { expr, .. } => is_safe_expr(expr, tables, available_ctes, local_ctes),
         Expr::Like {
             expr,
             pattern,
             escape,
             ..
         } => {
-            is_safe_expr(expr, tables)
-                && is_safe_expr(pattern, tables)
+            is_safe_expr(expr, tables, available_ctes, local_ctes)
+                && is_safe_expr(pattern, tables, available_ctes, local_ctes)
                 && escape
                     .as_deref()
-                    .map(|e| is_safe_expr(e, tables))
+                    .map(|e| is_safe_expr(e, tables, available_ctes, local_ctes))
                     .unwrap_or(true)
         }
-        Expr::Row(exprs) => exprs.iter().all(|e| is_safe_expr(e, tables)),
-        // Subquery shapes are explicitly unsafe for per-table gating.
-        Expr::InSubquery { .. }
-        | Expr::CompareSubquery { .. }
-        | Expr::ScalarSubquery(_)
-        | Expr::Exists(_) => false,
+        Expr::Row(exprs) => exprs
+            .iter()
+            .all(|e| is_safe_expr(e, tables, available_ctes, local_ctes)),
+        Expr::InSubquery { expr, query, .. } | Expr::CompareSubquery { expr, query, .. } => {
+            is_safe_expr(expr, tables, available_ctes, local_ctes)
+                && is_safe_query(query, tables, available_ctes)
+        }
+        Expr::ScalarSubquery(query) | Expr::Exists(query) => {
+            is_safe_query(query, tables, available_ctes)
+        }
     }
+}
+
+fn cte_name_in_scope(name: &str, cte_names: &BTreeSet<String>) -> bool {
+    cte_names
+        .iter()
+        .any(|entry| entry.eq_ignore_ascii_case(name))
 }

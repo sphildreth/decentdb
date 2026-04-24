@@ -348,6 +348,7 @@ mod tests {
             .insert("x".to_string(), TableData::default().into());
         runtime.mark_table_dirty("x");
         assert!(runtime.dirty_tables.contains("x"));
+        assert!(!runtime.row_delete_dirty.contains_key("x"));
 
         // mark_table_append_dirty and mark_table_row_dirty
         let mut runtime2 = EngineRuntime::empty(1);
@@ -364,6 +365,21 @@ mod tests {
         // append-only should have been escalated and not converted to row-update
         assert!(!runtime2.append_only_dirty_tables.contains("x"));
         assert!(!runtime2.row_update_dirty.contains_key("x"));
+        runtime2.mark_table_row_deleted("x", 5);
+        assert!(!runtime2.row_delete_dirty.contains_key("x"));
+
+        runtime2.catalog_mut().tables.insert(
+            "y".to_string(),
+            TableSchema {
+                name: "y".to_string(),
+                ..table.clone()
+            },
+        );
+        runtime2
+            .tables_mut()
+            .insert("y".to_string(), TableData::default().into());
+        runtime2.mark_table_row_deleted("y", 5);
+        assert!(runtime2.row_delete_dirty.contains_key("y"));
 
         // mark_all_tables_dirty
         let mut runtime3 = EngineRuntime::empty(1);
@@ -378,6 +394,7 @@ mod tests {
         runtime3.mark_all_tables_dirty();
         assert!(runtime3.dirty_tables.contains("a"));
         assert!(runtime3.dirty_tables.contains("b"));
+        assert!(runtime3.row_delete_dirty.is_empty());
     }
 
     #[test]
@@ -576,6 +593,9 @@ mod tests {
 
         runtime.mark_table_row_dirty("t", 3);
         assert!(runtime.row_update_dirty.contains_key("t"));
+        runtime.mark_table_row_deleted("t", 7);
+        assert!(!runtime.row_update_dirty.contains_key("t"));
+        assert!(!runtime.row_delete_dirty.contains_key("t"));
 
         // If a table is already fully dirty (and not append-only) then marking a row dirty is a no-op
         runtime.dirty_tables.insert("w".to_string());
@@ -592,6 +612,16 @@ mod tests {
         runtime.append_only_dirty_tables.insert("v".to_string());
         runtime.mark_table_row_dirty("v", 1);
         assert!(!runtime.append_only_dirty_tables.contains("v"));
+
+        runtime.mark_table_row_deleted("v", 9);
+        assert!(runtime.row_delete_dirty.contains_key("v"));
+        runtime.mark_table_append_dirty("v");
+        assert!(!runtime.row_delete_dirty.contains_key("v"));
+
+        runtime.mark_table_row_deleted("u", 9);
+        assert!(!runtime.row_delete_dirty.contains_key("u"));
+        runtime.mark_table_row_deleted("t", 9);
+        assert!(!runtime.row_delete_dirty.contains_key("t"));
     }
 
     #[test]
