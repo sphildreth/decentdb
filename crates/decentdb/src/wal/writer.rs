@@ -26,6 +26,12 @@ const WAL_PREALLOC_CHUNK_BYTES: u64 = 64 << 20;
 const COMMIT_FRAME_BYTES: [u8; FRAME_HEADER_SIZE + FRAME_TRAILER_SIZE] =
     [FrameType::Commit as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 
+#[derive(Clone)]
+struct DeltaBasePage {
+    data: Arc<[u8]>,
+    from_wal: bool,
+}
+
 pub(crate) fn commit_pages(
     wal: &WalHandle,
     pager: &PagerHandle,
@@ -54,7 +60,8 @@ pub(crate) fn commit_pages(
     let latest_snapshot = wal.latest_snapshot();
 
     // Look up all base pages under a single index lock for delta encoding.
-    let base_pages = lookup_base_pages_batch(wal, pager, &pages, latest_snapshot)?;
+    let (base_pages, retain_history_hint) =
+        lookup_base_pages_batch(wal, pager, &pages, latest_snapshot)?;
 
     prepared_pages.clear();
     prepared_pages.reserve(pages.len());
@@ -62,16 +69,16 @@ pub(crate) fn commit_pages(
         let base = base_pages
             .get(i)
             .and_then(|b| b.as_ref())
-            .map(|data| &data[..]);
+            .map(|base| (&base.data[..], base.from_wal));
         let frame_offset = offset + page_batch.len() as u64;
         let (encoded_len, encoding) = append_best_page_frame_with_base(
             page_batch,
             delta_scratch,
             wal,
-            pager,
             page_id,
             &payload,
             base,
+            retain_history_hint,
         )?;
         prepared_pages.push((page_id, payload, encoded_len, encoding, frame_offset));
     }
@@ -94,7 +101,8 @@ pub(crate) fn commit_pages(
             .expect("wal index lock should not be poisoned");
         // Check inside the index lock so begin_reader() cannot register
         // between the count check and the version clear (TOCTOU fix).
-        let retain_history = wal.inner.reader_registry.active_reader_count()? > 0;
+        let retain_history =
+            retain_history_hint || wal.inner.reader_registry.active_reader_count()? > 0;
         let mut sidecar = wal.inner.index_sidecar.as_ref().map(|sidecar| {
             sidecar
                 .lock()
@@ -193,7 +201,7 @@ pub(crate) fn commit_pages_if_latest(
     page_batch.reserve(page_frame_len * pages.len() + COMMIT_FRAME_BYTES.len());
 
     // Look up all base pages under a single index lock for delta encoding.
-    let base_pages = lookup_base_pages_batch(wal, pager, &pages, latest)?;
+    let (base_pages, retain_history_hint) = lookup_base_pages_batch(wal, pager, &pages, latest)?;
 
     prepared_pages.clear();
     prepared_pages.reserve(pages.len());
@@ -201,16 +209,16 @@ pub(crate) fn commit_pages_if_latest(
         let base = base_pages
             .get(i)
             .and_then(|b| b.as_ref())
-            .map(|data| &data[..]);
+            .map(|base| (&base.data[..], base.from_wal));
         let frame_offset = offset + page_batch.len() as u64;
         let (encoded_len, encoding) = append_best_page_frame_with_base(
             page_batch,
             delta_scratch,
             wal,
-            pager,
             page_id,
             &payload,
             base,
+            retain_history_hint,
         )?;
         prepared_pages.push((page_id, payload, encoded_len, encoding, frame_offset));
     }
@@ -233,7 +241,8 @@ pub(crate) fn commit_pages_if_latest(
             .expect("wal index lock should not be poisoned");
         // Check inside the index lock so begin_reader() cannot register
         // between the count check and the version clear (TOCTOU fix).
-        let retain_history = wal.inner.reader_registry.active_reader_count()? > 0;
+        let retain_history =
+            retain_history_hint || wal.inner.reader_registry.active_reader_count()? > 0;
         let mut sidecar = wal.inner.index_sidecar.as_ref().map(|sidecar| {
             sidecar
                 .lock()
@@ -394,18 +403,13 @@ fn append_best_page_frame_with_base(
     output: &mut EngineByteBuf,
     delta_scratch: &mut EngineByteBuf,
     wal: &WalHandle,
-    pager: &PagerHandle,
     page_id: PageId,
     payload: &[u8],
-    wal_base: Option<&[u8]>,
+    base_page: Option<(&[u8], bool)>,
+    _retain_history_hint: bool,
 ) -> Result<(usize, FrameEncoding)> {
-    if let Some(base) = wal_base {
-        if encode_page_delta_into(delta_scratch, base, payload) {
-            return append_page_delta_frame(output, page_id, delta_scratch)
-                .map(|len| (len, FrameEncoding::PageDelta));
-        }
-    } else if let Ok(base) = pager.read_page(page_id) {
-        if encode_page_delta_into(delta_scratch, &base, payload) {
+    if let Some((base, from_wal)) = base_page {
+        if !from_wal && encode_page_delta_into(delta_scratch, base, payload) {
             return append_page_delta_frame(output, page_id, delta_scratch)
                 .map(|len| (len, FrameEncoding::PageDelta));
         }
@@ -420,18 +424,34 @@ fn lookup_base_pages_batch(
     pager: &PagerHandle,
     pages: &[(PageId, Vec<u8>)],
     snapshot_lsn: u64,
-) -> Result<Vec<Option<Arc<[u8]>>>> {
+) -> Result<(Vec<Option<DeltaBasePage>>, bool)> {
     let index = wal
         .inner
         .index
         .lock()
         .expect("wal index lock should not be poisoned");
-    pages
+    let retain_history_hint = wal.inner.reader_registry.active_reader_count()? > 0;
+    let pages = pages
         .iter()
         .map(|(page_id, _)| {
-            wal.materialize_latest_visible_locked(&index, pager, *page_id, snapshot_lsn)
+            if let Some(page) =
+                wal.materialize_latest_visible_locked(&index, pager, *page_id, snapshot_lsn)?
+            {
+                Ok(Some(DeltaBasePage {
+                    data: page,
+                    from_wal: true,
+                }))
+            } else if let Ok(page) = pager.read_page(*page_id) {
+                Ok(Some(DeltaBasePage {
+                    data: page,
+                    from_wal: false,
+                }))
+            } else {
+                Ok(None)
+            }
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    Ok((pages, retain_history_hint))
 }
 
 fn demote_cold_versions(wal: &WalHandle) -> Result<()> {

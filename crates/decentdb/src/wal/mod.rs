@@ -586,6 +586,40 @@ mod tests {
     }
 
     #[test]
+    fn read_page_at_snapshot_latest_delta_without_history_uses_disk_base_only() {
+        let mem_vfs: Arc<dyn Vfs> = Arc::new(MemVfs::default());
+        let vfs = VfsHandle::from_vfs(Arc::clone(&mem_vfs));
+        let db_path = Path::new(":memory:");
+        let pager = test_pager(&vfs, db_path);
+        let mut cfg = test_config();
+        cfg.wal_resident_versions_per_page = 0;
+        let wal = WalHandle::acquire(&vfs, db_path, &cfg, &pager).expect("acquire wal");
+        let page_id = page::CATALOG_ROOT_PAGE_ID + 1;
+
+        let base = vec![0x10; page::DEFAULT_PAGE_SIZE as usize];
+        pager
+            .write_page_direct(page_id, &base)
+            .expect("seed base page");
+
+        let mut first_payload = base.clone();
+        first_payload[32..40].copy_from_slice(b"delta-v1");
+        wal.commit_pages(&pager, vec![(page_id, first_payload)], page_id)
+            .expect("commit first page");
+
+        let mut second_payload = base.clone();
+        second_payload[32..40].copy_from_slice(b"delta-v2");
+        let second_snapshot = wal
+            .commit_pages(&pager, vec![(page_id, second_payload.clone())], page_id)
+            .expect("commit second page");
+
+        let latest_page = wal
+            .read_page_at_snapshot(&pager, page_id, second_snapshot)
+            .expect("read latest snapshot")
+            .expect("page should exist");
+        assert_eq!(latest_page.as_ref(), second_payload.as_slice());
+    }
+
+    #[test]
     fn read_page_at_snapshot_promotes_spilled_full_page_version() {
         let mem_vfs: Arc<dyn Vfs> = Arc::new(MemVfs::default());
         let vfs = VfsHandle::from_vfs(Arc::clone(&mem_vfs));
