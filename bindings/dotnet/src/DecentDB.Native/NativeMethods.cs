@@ -327,7 +327,15 @@ public static unsafe class DecentDBNativeUnsafe
         long* ids, byte** texts, nuint* textLens, double* floats, out ulong outAffected);
 
     [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_stmt_execute_batch_typed")]
-    internal static extern uint ddb_stmt_execute_batch_typed(IntPtr stmt, byte* signatureUtf8, nuint count, out ulong outAffected);
+    internal static extern uint ddb_stmt_execute_batch_typed(
+        IntPtr stmt,
+        nuint count,
+        byte* signatureUtf8,
+        long* valuesI64,
+        double* valuesF64,
+        byte** valuesTextPtrs,
+        nuint* valuesTextLens,
+        out ulong outAffected);
 
     [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_stmt_rebind_int64_execute")]
     internal static extern uint ddb_stmt_rebind_int64_execute(IntPtr stmt, long value, out ulong outAffected);

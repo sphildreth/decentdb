@@ -969,6 +969,172 @@ public sealed class PreparedStatement : IDisposable
         }
     }
 
+    public long ExecuteBatchTypedOneRow(
+        ReadOnlySpan<byte> signatureUtf8,
+        ReadOnlySpan<long> i64Values,
+        ReadOnlySpan<double> f64Values,
+        byte[]? text0,
+        byte[]? text1,
+        int textCount)
+    {
+        unsafe
+        {
+            fixed (byte* pSignature = signatureUtf8)
+            {
+                long affected;
+                if (i64Values.IsEmpty)
+                {
+                    if (f64Values.IsEmpty)
+                    {
+                        affected = ExecuteBatchTypedOneRowCore(
+                            pSignature,
+                            null,
+                            null,
+                            text0,
+                            text1,
+                            textCount);
+                    }
+                    else
+                    {
+                        fixed (double* pF64 = f64Values)
+                        {
+                            affected = ExecuteBatchTypedOneRowCore(
+                                pSignature,
+                                null,
+                                pF64,
+                                text0,
+                                text1,
+                                textCount);
+                        }
+                    }
+                }
+                else
+                {
+                    fixed (long* pI64 = i64Values)
+                    {
+                        if (f64Values.IsEmpty)
+                        {
+                            affected = ExecuteBatchTypedOneRowCore(
+                                pSignature,
+                                pI64,
+                                null,
+                                text0,
+                                text1,
+                                textCount);
+                        }
+                        else
+                        {
+                            fixed (double* pF64 = f64Values)
+                            {
+                                affected = ExecuteBatchTypedOneRowCore(
+                                    pSignature,
+                                    pI64,
+                                    pF64,
+                                    text0,
+                                    text1,
+                                    textCount);
+                            }
+                        }
+                    }
+                }
+
+                return affected;
+            }
+        }
+    }
+
+    private unsafe long ExecuteBatchTypedOneRowCore(
+        byte* signatureUtf8,
+        long* valuesI64,
+        double* valuesF64,
+        byte[]? text0,
+        byte[]? text1,
+        int textCount)
+    {
+        unsafe
+        {
+            switch (textCount)
+            {
+                case 0:
+                {
+                    var res = _db.RecordStatus(
+                        DecentDBNativeUnsafe.ddb_stmt_execute_batch_typed(
+                            Handle,
+                            1,
+                            signatureUtf8,
+                            valuesI64,
+                            valuesF64,
+                            null,
+                            null,
+                            out var affected));
+                    if (res != 0)
+                    {
+                        throw new DecentDBException(_db.LastErrorCode, _db.LastErrorMessage, _sql);
+                    }
+
+                    return (long)affected;
+                }
+                case 1:
+                {
+                    fixed (byte* pText0 = text0)
+                    {
+                        byte** textPtrs = stackalloc byte*[1];
+                        nuint* textLens = stackalloc nuint[1];
+                        textPtrs[0] = pText0;
+                        textLens[0] = (nuint)(text0?.Length ?? 0);
+                        var res = _db.RecordStatus(
+                            DecentDBNativeUnsafe.ddb_stmt_execute_batch_typed(
+                                Handle,
+                                1,
+                                signatureUtf8,
+                                valuesI64,
+                                valuesF64,
+                                textPtrs,
+                                textLens,
+                                out var affected));
+                        if (res != 0)
+                        {
+                            throw new DecentDBException(_db.LastErrorCode, _db.LastErrorMessage, _sql);
+                        }
+
+                        return (long)affected;
+                    }
+                }
+                case 2:
+                {
+                    fixed (byte* pText0 = text0)
+                    fixed (byte* pText1 = text1)
+                    {
+                        byte** textPtrs = stackalloc byte*[2];
+                        nuint* textLens = stackalloc nuint[2];
+                        textPtrs[0] = pText0;
+                        textPtrs[1] = pText1;
+                        textLens[0] = (nuint)(text0?.Length ?? 0);
+                        textLens[1] = (nuint)(text1?.Length ?? 0);
+                        var res = _db.RecordStatus(
+                            DecentDBNativeUnsafe.ddb_stmt_execute_batch_typed(
+                                Handle,
+                                1,
+                                signatureUtf8,
+                                valuesI64,
+                                valuesF64,
+                                textPtrs,
+                                textLens,
+                                out var affected));
+                        if (res != 0)
+                        {
+                            throw new DecentDBException(_db.LastErrorCode, _db.LastErrorMessage, _sql);
+                        }
+
+                        return (long)affected;
+                    }
+                }
+                default:
+                    throw new ArgumentOutOfRangeException(nameof(textCount));
+            }
+        }
+    }
+
     public long RebindInt64Execute(long value)
     {
         var res = _db.RecordStatus(

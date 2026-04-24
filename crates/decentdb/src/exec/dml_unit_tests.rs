@@ -143,6 +143,101 @@ mod tests {
     }
 
     #[test]
+    fn resident_prepared_simple_insert_keeps_table_data_arc_stable() {
+        let mut runtime = EngineRuntime::empty(1);
+        runtime.catalog_mut().tables.insert(
+            "t".to_string(),
+            crate::catalog::TableSchema {
+                name: "t".to_string(),
+                temporary: false,
+                columns: vec![
+                    crate::catalog::ColumnSchema {
+                        name: "id".to_string(),
+                        column_type: crate::catalog::ColumnType::Int64,
+                        nullable: false,
+                        default_sql: None,
+                        generated_sql: None,
+                        generated_stored: false,
+                        primary_key: false,
+                        unique: false,
+                        auto_increment: false,
+                        checks: vec![],
+                        foreign_key: None,
+                    },
+                    crate::catalog::ColumnSchema {
+                        name: "name".to_string(),
+                        column_type: crate::catalog::ColumnType::Text,
+                        nullable: false,
+                        default_sql: None,
+                        generated_sql: None,
+                        generated_stored: false,
+                        primary_key: false,
+                        unique: false,
+                        auto_increment: false,
+                        checks: vec![],
+                        foreign_key: None,
+                    },
+                ],
+                checks: vec![],
+                foreign_keys: vec![],
+                primary_key_columns: vec![],
+                next_row_id: 1,
+                pk_index_root: None,
+            },
+        );
+        runtime.tables_mut().insert(
+            "t".to_string(),
+            TableRowSource::Resident(Arc::new(TableData { rows: Vec::new() })),
+        );
+
+        let stmt =
+            parse_sql_statement("INSERT INTO t (id, name) VALUES ($1, $2)").expect("parse insert");
+        let Statement::Insert(insert) = stmt else {
+            panic!("expected insert");
+        };
+        let prepared = runtime
+            .prepare_simple_insert(&insert)
+            .expect("prepare insert")
+            .expect("simple insert");
+
+        let resident_ptr_before = match runtime.table_row_source("t") {
+            Some(TableRowSource::Resident(data)) => Arc::as_ptr(data),
+            other => panic!("expected resident row source, got {other:?}"),
+        };
+
+        runtime
+            .execute_prepared_simple_insert(
+                &prepared,
+                &[Value::Int64(1), Value::Text("a".to_string())],
+                4096,
+            )
+            .expect("execute first insert");
+        runtime
+            .execute_prepared_simple_insert(
+                &prepared,
+                &[Value::Int64(2), Value::Text("b".to_string())],
+                4096,
+            )
+            .expect("execute second insert");
+
+        let resident_ptr_after = match runtime.table_row_source("t") {
+            Some(TableRowSource::Resident(data)) => Arc::as_ptr(data),
+            other => panic!("expected resident row source, got {other:?}"),
+        };
+        assert_eq!(resident_ptr_before, resident_ptr_after);
+        let rows = &runtime.table_data("t").expect("table data").rows;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0].values,
+            vec![Value::Int64(1), Value::Text("a".to_string())]
+        );
+        assert_eq!(
+            rows[1].values,
+            vec![Value::Int64(2), Value::Text("b".to_string())]
+        );
+    }
+
+    #[test]
     fn can_reuse_prepared_simple_insert_epoch_matches() {
         let mut runtime = EngineRuntime::empty(1);
         let table = crate::catalog::TableSchema {
@@ -170,6 +265,49 @@ mod tests {
             use_generic_index_updates: false,
             compiled_index_state_epoch: runtime.index_state_epoch,
         };
+        assert!(runtime.can_reuse_prepared_simple_insert(&prepared));
+    }
+
+    #[test]
+    fn generic_validation_prepared_simple_insert_remains_reusable() {
+        let mut runtime = EngineRuntime::empty(1);
+        let table = crate::catalog::TableSchema {
+            name: "t".to_string(),
+            temporary: false,
+            columns: vec![crate::catalog::ColumnSchema {
+                name: "id".to_string(),
+                column_type: crate::catalog::ColumnType::Int64,
+                nullable: false,
+                default_sql: None,
+                generated_sql: None,
+                generated_stored: false,
+                primary_key: false,
+                unique: false,
+                auto_increment: false,
+                checks: vec![crate::catalog::CheckConstraint {
+                    name: None,
+                    expression_sql: "id > 0".to_string(),
+                }],
+                foreign_key: None,
+            }],
+            checks: vec![],
+            foreign_keys: vec![],
+            primary_key_columns: vec![],
+            next_row_id: 1,
+            pk_index_root: None,
+        };
+        runtime.catalog_mut().tables.insert("t".to_string(), table);
+
+        let stmt = parse_sql_statement("INSERT INTO t VALUES (1)").expect("parse insert");
+        let insert = match stmt {
+            Statement::Insert(insert) => insert,
+            _ => panic!("expected insert"),
+        };
+        let prepared = runtime
+            .prepare_simple_insert(&insert)
+            .expect("prepare insert")
+            .expect("prepared insert");
+        assert!(prepared.use_generic_validation);
         assert!(runtime.can_reuse_prepared_simple_insert(&prepared));
     }
 

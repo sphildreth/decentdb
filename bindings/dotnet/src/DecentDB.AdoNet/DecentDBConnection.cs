@@ -281,6 +281,7 @@ namespace DecentDB.AdoNet
 
         internal int DefaultCommandTimeoutSeconds => _defaultCommandTimeoutSeconds;
         internal bool IsSqlObservationEnabled => _loggingEnabled || _sqlExecuting != null || _sqlExecuted != null;
+        internal void ClearPreparedStatementCacheForSchemaChange() => ClearPreparedStatementCache();
 
         private void ClearPreparedStatementCache()
         {

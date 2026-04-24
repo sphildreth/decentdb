@@ -119,6 +119,37 @@ public sealed class MigrationsRuntimeTests : IDisposable
     }
 
     [Fact]
+    public void EnsureCreated_CompositeForeignKey_AllowsDirectAdoInsertAfterParentSave()
+    {
+        var optionsBuilder = new DbContextOptionsBuilder<CompositeFkDbContext>();
+        optionsBuilder.UseDecentDB($"Data Source={_dbPath}");
+
+        using (var context = new CompositeFkDbContext(optionsBuilder.Options))
+        {
+            context.Database.EnsureDeleted();
+            context.Database.EnsureCreated();
+            context.Parents.Add(new CompositeParent
+            {
+                KeyPart1 = 10,
+                KeyPart2 = 20,
+                Name = "parent"
+            });
+            context.SaveChanges();
+        }
+
+        using var connection = new DecentDBConnection($"Data Source={_dbPath}");
+        connection.Open();
+        using var command = connection.CreateCommand();
+        command.CommandText =
+            "INSERT INTO composite_children (id, parent_key_part1, parent_key_part2, label) VALUES (@id, @p1, @p2, @label)";
+        command.Parameters.Add(new DecentDBParameter("@id", 1));
+        command.Parameters.Add(new DecentDBParameter("@p1", 10));
+        command.Parameters.Add(new DecentDBParameter("@p2", 20));
+        command.Parameters.Add(new DecentDBParameter("@label", "child"));
+        Assert.Equal(1, command.ExecuteNonQuery());
+    }
+
+    [Fact]
     public void MigrationsSqlGenerator_AddForeignKey_WithActions_Executes()
     {
         using var context = CreateContext();

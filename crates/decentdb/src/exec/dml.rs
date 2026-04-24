@@ -426,19 +426,18 @@ impl EngineRuntime {
         if prepared.compiled_index_state_epoch == self.index_state_epoch {
             return true;
         }
-        (prepared.use_generic_validation
-            || prepared
-                .unique_indexes
+        prepared
+            .unique_indexes
+            .iter()
+            .all(|index| self.prepared_btree_index_is_fresh(index))
+            && prepared
+                .foreign_keys
+                .iter()
+                .all(|foreign_key| self.prepared_foreign_key_parent_index_is_fresh(foreign_key))
+            && prepared
+                .insert_indexes
                 .iter()
                 .all(|index| self.prepared_btree_index_is_fresh(index))
-                && prepared.foreign_keys.iter().all(|foreign_key| {
-                    self.prepared_foreign_key_parent_index_is_fresh(foreign_key)
-                }))
-            && (prepared.use_generic_index_updates
-                || prepared
-                    .insert_indexes
-                    .iter()
-                    .all(|index| self.prepared_btree_index_is_fresh(index)))
     }
 
     pub(crate) fn prepare_simple_insert(
@@ -712,7 +711,13 @@ impl EngineRuntime {
                 };
                 if *current_value != next_value {
                     table_data.rows[row_index].values[prepared.column_index] = next_value;
-                    self.mark_table_row_dirty(&prepared.table_name, row_index);
+                    let updated_values = table_data.rows[row_index].values.clone();
+                    self.mark_table_row_dirty(
+                        &prepared.table_name,
+                        row_index,
+                        row_id,
+                        &updated_values,
+                    );
                 }
                 Ok(QueryResult::with_affected_rows(1))
             }
@@ -1186,31 +1191,32 @@ impl EngineRuntime {
                 .push(stored_row.clone());
             return Ok(());
         }
-        match self.table_row_source(table_name).cloned() {
-            Some(TableRowSource::Resident(_)) => {
-                self.table_data_mut(table_name)
-                    .ok_or_else(|| {
-                        DbError::internal(format!("table data for {table_name} is missing"))
-                    })?
-                    .rows
-                    .push(stored_row.clone());
-                Ok(())
-            }
-            Some(TableRowSource::Paged(manifest)) => {
-                let updated_manifest = super::append_paged_rows_to_manifest(
-                    manifest.as_ref(),
-                    page_size,
-                    std::slice::from_ref(stored_row),
-                )?;
-                self.replace_table_row_source(
-                    table_name,
-                    TableRowSource::Paged(Arc::new(updated_manifest)),
-                )
-            }
-            None => Err(DbError::internal(format!(
-                "table row source for {table_name} is missing"
-            ))),
+        if matches!(
+            self.table_row_source(table_name),
+            Some(TableRowSource::Resident(_))
+        ) {
+            self.table_data_mut(table_name)
+                .ok_or_else(|| {
+                    DbError::internal(format!("table data for {table_name} is missing"))
+                })?
+                .rows
+                .push(stored_row.clone());
+            return Ok(());
         }
+        let Some(TableRowSource::Paged(manifest)) = self.table_row_source(table_name) else {
+            return Err(DbError::internal(format!(
+                "table row source for {table_name} is missing"
+            )));
+        };
+        let updated_manifest = super::append_paged_rows_to_manifest(
+            manifest.as_ref(),
+            page_size,
+            std::slice::from_ref(stored_row),
+        )?;
+        self.replace_table_row_source(
+            table_name,
+            TableRowSource::Paged(Arc::new(updated_manifest)),
+        )
     }
 
     fn apply_row_changes_to_table_row_source(
@@ -1236,36 +1242,34 @@ impl EngineRuntime {
                 .retain(|row| !matches!(row_changes.get(&row.row_id), Some(None)));
             return Ok(());
         }
-        match self.table_row_source(table_name).cloned() {
-            Some(TableRowSource::Resident(_)) => {
-                let table_data = self.table_data_mut(table_name).ok_or_else(|| {
-                    DbError::internal(format!("table data for {table_name} is missing"))
-                })?;
-                for row in &mut table_data.rows {
-                    if let Some(Some(next_values)) = row_changes.get(&row.row_id) {
-                        row.values = next_values.clone();
-                    }
+        if matches!(
+            self.table_row_source(table_name),
+            Some(TableRowSource::Resident(_))
+        ) {
+            let table_data = self.table_data_mut(table_name).ok_or_else(|| {
+                DbError::internal(format!("table data for {table_name} is missing"))
+            })?;
+            for row in &mut table_data.rows {
+                if let Some(Some(next_values)) = row_changes.get(&row.row_id) {
+                    row.values = next_values.clone();
                 }
-                table_data
-                    .rows
-                    .retain(|row| !matches!(row_changes.get(&row.row_id), Some(None)));
-                Ok(())
             }
-            Some(TableRowSource::Paged(manifest)) => {
-                let updated_manifest = super::apply_paged_row_changes_to_manifest(
-                    manifest.as_ref(),
-                    page_size,
-                    row_changes,
-                )?;
-                self.replace_table_row_source(
-                    table_name,
-                    TableRowSource::Paged(Arc::new(updated_manifest)),
-                )
-            }
-            None => Err(DbError::internal(format!(
-                "table row source for {table_name} is missing"
-            ))),
+            table_data
+                .rows
+                .retain(|row| !matches!(row_changes.get(&row.row_id), Some(None)));
+            return Ok(());
         }
+        let Some(TableRowSource::Paged(manifest)) = self.table_row_source(table_name) else {
+            return Err(DbError::internal(format!(
+                "table row source for {table_name} is missing"
+            )));
+        };
+        let updated_manifest =
+            super::apply_paged_row_changes_to_manifest(manifest.as_ref(), page_size, row_changes)?;
+        self.replace_table_row_source(
+            table_name,
+            TableRowSource::Paged(Arc::new(updated_manifest)),
+        )
     }
 
     pub(super) fn execute_insert(
@@ -1819,7 +1823,13 @@ impl EngineRuntime {
                     };
                     if current_value != &next_email {
                         table_data.rows[row_index].values[column_index] = next_email;
-                        self.mark_table_dirty(&table_name);
+                        let updated_values = table_data.rows[row_index].values.clone();
+                        self.mark_table_row_dirty(
+                            &table_name,
+                            row_index,
+                            single_row_id,
+                            &updated_values,
+                        );
                     }
                     self.execute_after_triggers(&table_name, TriggerEvent::Update, 1, page_size)?;
                     return Ok(QueryResult::with_affected_rows(1));
@@ -1883,11 +1893,19 @@ impl EngineRuntime {
                     )));
                 }
                 if current_row.values != next_values {
-                    table_data.rows[target_index].values = next_values;
+                    let updated_values = {
+                        table_data.rows[target_index].values = next_values.clone();
+                        table_data.rows[target_index].values.clone()
+                    };
                     if !indexes_remain_fresh {
                         self.mark_indexes_stale_for_table(&table_name);
                     }
-                    self.mark_table_dirty(&table_name);
+                    self.mark_table_row_dirty(
+                        &table_name,
+                        target_index,
+                        single_row_id,
+                        &updated_values,
+                    );
                 }
                 self.execute_after_triggers(&table_name, TriggerEvent::Update, 1, page_size)?;
                 return Ok(QueryResult::with_affected_rows(1));
@@ -1977,7 +1995,8 @@ impl EngineRuntime {
                     DbError::internal(format!("table data for {table_name} is missing"))
                 })?
                 .rows[row_index]
-                .values = next_values;
+                .values = next_values.clone();
+            self.mark_table_row_dirty(&table_name, row_index, row_id, &next_values);
             if let Some(values) = returning_values {
                 returning_rows.push(StoredRow { row_id, values });
             }
@@ -1985,11 +2004,8 @@ impl EngineRuntime {
             changed_rows += 1;
         }
 
-        if changed_rows > 0 {
-            if !indexes_remain_fresh {
-                self.mark_indexes_stale_for_table(&table_name);
-            }
-            self.mark_table_dirty(&table_name);
+        if changed_rows > 0 && !indexes_remain_fresh {
+            self.mark_indexes_stale_for_table(&table_name);
         }
 
         self.execute_after_triggers(

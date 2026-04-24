@@ -292,6 +292,7 @@ struct SqlTxnState {
     base_checkpoint_epoch: u64,
     persistent_changed: bool,
     indexes_maybe_stale: bool,
+    prepared_insert_runtime_cache: HashMap<usize, Arc<PreparedSimpleInsert>>,
     savepoints: Vec<SqlSavepoint>,
 }
 
@@ -303,6 +304,7 @@ struct ExclusiveSqlTxnState<'a> {
     base_checkpoint_epoch: u64,
     persistent_changed: bool,
     indexes_maybe_stale: bool,
+    prepared_insert_runtime_cache: HashMap<usize, Arc<PreparedSimpleInsert>>,
 }
 
 #[derive(Debug)]
@@ -318,6 +320,7 @@ struct SqlSavepoint {
     runtime: EngineRuntime,
     persistent_changed: bool,
     indexes_maybe_stale: bool,
+    prepared_insert_runtime_cache: HashMap<usize, Arc<PreparedSimpleInsert>>,
 }
 
 impl SqlTxnState {
@@ -652,6 +655,7 @@ impl Db {
             runtime: state.runtime.clone(),
             persistent_changed: state.persistent_changed,
             indexes_maybe_stale: state.indexes_maybe_stale,
+            prepared_insert_runtime_cache: state.prepared_insert_runtime_cache.clone(),
         });
         Ok(())
     }
@@ -707,6 +711,9 @@ impl Db {
         state.runtime = state.savepoints[index].runtime.clone();
         state.persistent_changed = state.savepoints[index].persistent_changed;
         state.indexes_maybe_stale = state.savepoints[index].indexes_maybe_stale;
+        state.prepared_insert_runtime_cache = state.savepoints[index]
+            .prepared_insert_runtime_cache
+            .clone();
         state.savepoints.truncate(index + 1);
         Ok(())
     }
@@ -1454,42 +1461,18 @@ impl Db {
 
     /// Verifies that a named index can be rebuilt logically from the persisted table state.
     pub fn verify_index(&self, name: &str) -> Result<IndexVerification> {
-        if self.inner.config.defer_table_materialization {
-            let reader = self.inner.wal.begin_reader()?;
-            let snapshot_lsn = reader.snapshot_lsn();
-            self.refresh_engine_from_snapshot(snapshot_lsn)?;
-            let mut runtime = self.engine_snapshot()?;
-            let table_name = runtime
-                .catalog
-                .index(name)
-                .ok_or_else(|| DbError::sql(format!("unknown index {name}")))?
-                .table_name
-                .clone();
-            self.load_runtime_table_row_sources_at_snapshot(
-                &mut runtime,
-                &[table_name.as_str()],
-                snapshot_lsn,
-            )?;
-            runtime.rebuild_stale_indexes(self.inner.config.page_size)?;
-            let existing = runtime.index(name).map_or(0, runtime_index_entry_count);
-
-            let mut rebuilt = runtime.clone();
-            drop(reader);
-            rebuilt.rebuild_index(name, self.inner.config.page_size)?;
-            let actual = rebuilt.index(name).map_or(0, runtime_index_entry_count);
-
-            return Ok(IndexVerification {
-                name: name.to_string(),
-                valid: existing == actual,
-                expected_entries: existing,
-                actual_entries: actual,
-            });
-        }
-
-        let runtime = self.runtime_for_row_source_inspection()?;
+        let (mut runtime, snapshot_lsn) = self.runtime_for_targeted_row_source_inspection()?;
+        let table_name = runtime
+            .catalog
+            .index(name)
+            .ok_or_else(|| DbError::sql(format!("unknown index {name}")))?
+            .table_name
+            .clone();
+        self.ensure_inspection_table_row_source(&mut runtime, &table_name, snapshot_lsn)?;
+        runtime.rebuild_stale_indexes(self.inner.config.page_size)?;
         let existing = runtime.index(name).map_or(0, runtime_index_entry_count);
 
-        let mut rebuilt = self.runtime_for_row_source_inspection()?;
+        let mut rebuilt = runtime.clone();
         rebuilt.rebuild_index(name, self.inner.config.page_size)?;
         let actual = rebuilt.index(name).map_or(0, runtime_index_entry_count);
 
@@ -1503,8 +1486,8 @@ impl Db {
 
     /// Dumps the current catalog and table contents as deterministic SQL.
     pub fn dump_sql(&self) -> Result<String> {
-        let runtime = self.runtime_for_row_source_inspection()?;
-        render_runtime_dump(&runtime)
+        let (mut runtime, snapshot_lsn) = self.runtime_for_targeted_row_source_inspection()?;
+        render_runtime_dump(self, &mut runtime, snapshot_lsn)
     }
 
     /// Installs a global FaultyVfs failpoint used by the storage harness.
@@ -1684,6 +1667,18 @@ impl Db {
         params: &[Value],
         prepared: Option<&PreparedStatement>,
     ) -> Result<QueryResult> {
+        {
+            let runtime = self
+                .inner
+                .engine
+                .read()
+                .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+            self.validate_prepared_against_runtime(prepared, &runtime)?;
+            if self.statement_is_temp_only(&runtime, statement) {
+                drop(runtime);
+                return self.execute_autocommit_temp_only_statement(statement, params);
+            }
+        }
         if !self.inner.config.defer_table_materialization {
             self.refresh_engine_from_storage()?;
             self.ensure_all_tables_loaded()?;
@@ -1856,12 +1851,23 @@ impl Db {
                 ))
             }
             PragmaCommand::Query(PragmaName::IntegrityCheck) => {
-                let mut runtime = self.runtime_for_row_source_inspection()?;
+                let (mut runtime, snapshot_lsn) =
+                    self.runtime_for_targeted_row_source_inspection()?;
                 runtime.rebuild_stale_indexes(self.inner.config.page_size)?;
                 let mut errors = Vec::new();
-                for (table_name, table) in &runtime.catalog.tables {
-                    let Some(row_source) = runtime.table_row_source(table_name) else {
-                        errors.push(format!("table {} is missing row storage", table_name));
+                let table_names = runtime.catalog.tables.keys().cloned().collect::<Vec<_>>();
+                for table_name in table_names {
+                    self.ensure_inspection_table_row_source(
+                        &mut runtime,
+                        &table_name,
+                        snapshot_lsn,
+                    )?;
+                    let Some(table) = runtime.catalog.table(&table_name).cloned() else {
+                        errors.push(format!("table {table_name} is missing schema"));
+                        continue;
+                    };
+                    let Some(row_source) = runtime.table_row_source(&table_name) else {
+                        errors.push(format!("table {} is missing row storage", table.name));
                         continue;
                     };
                     for row in row_source.rows() {
@@ -1877,6 +1883,11 @@ impl Db {
                             break;
                         }
                     }
+                    self.redefer_inspection_table_row_source(
+                        &mut runtime,
+                        &table_name,
+                        snapshot_lsn,
+                    );
                 }
                 for index in runtime.catalog.indexes.values() {
                     if runtime.catalog.table(&index.table_name).is_none() {
@@ -1979,20 +1990,19 @@ impl Db {
                     )?;
                     let mut total_affected = 0_u64;
                     if !prepared.read_only {
-                        if let SqlStatement::Insert(insert) = prepared.statement.as_ref() {
+                        if matches!(prepared.statement.as_ref(), SqlStatement::Insert(_)) {
                             let snapshot_lsn = state.snapshot_lsn();
-                            self.load_runtime_table_row_sources_at_snapshot(
-                                &mut state.runtime,
-                                &[insert.table_name.as_str()],
-                                snapshot_lsn,
-                            )?;
-                            if let Some(prepared_insert) = prepared
-                                .prepared_insert
-                                .as_deref()
-                                .filter(|plan| state.runtime.can_reuse_prepared_simple_insert(plan))
+                            if let Some(prepared_insert) = self
+                                .prepared_insert_plan_for_runtime_state(
+                                    prepared,
+                                    &mut state.runtime,
+                                    snapshot_lsn,
+                                    &mut state.indexes_maybe_stale,
+                                    &mut state.prepared_insert_runtime_cache,
+                                )?
                             {
                                 if Self::prepared_insert_uses_direct_positional_params(
-                                    prepared_insert,
+                                    prepared_insert.as_ref(),
                                     param_count,
                                 ) {
                                     for row_index in 0..row_count {
@@ -2000,7 +2010,7 @@ impl Db {
                                         let affected = state
                                             .runtime
                                             .execute_prepared_simple_insert_positional_params_in_place(
-                                                prepared_insert,
+                                                prepared_insert.as_ref(),
                                                 &mut params,
                                                 self.inner.config.page_size,
                                             )?;
@@ -2066,6 +2076,59 @@ impl Db {
             })
     }
 
+    fn prepared_statement_cache_key(prepared: &PreparedStatement) -> usize {
+        Arc::as_ptr(&prepared.statement) as usize
+    }
+
+    fn prepared_insert_plan_for_runtime_state(
+        &self,
+        prepared: &PreparedStatement,
+        runtime: &mut EngineRuntime,
+        snapshot_lsn: u64,
+        indexes_maybe_stale: &mut bool,
+        prepared_insert_runtime_cache: &mut HashMap<usize, Arc<PreparedSimpleInsert>>,
+    ) -> Result<Option<Arc<PreparedSimpleInsert>>> {
+        let Some(prepared_insert) = prepared.prepared_insert.as_ref() else {
+            return Ok(None);
+        };
+
+        if *indexes_maybe_stale {
+            runtime.rebuild_stale_indexes(self.inner.config.page_size)?;
+            *indexes_maybe_stale = false;
+        }
+
+        let table_names =
+            self.insert_dependency_table_names(runtime, &prepared_insert.table_name)?;
+        let table_refs = table_names.iter().map(String::as_str).collect::<Vec<_>>();
+        self.load_runtime_table_row_sources_at_snapshot(runtime, &table_refs, snapshot_lsn)?;
+
+        let cache_key = Self::prepared_statement_cache_key(prepared);
+        if let Some(plan) = prepared_insert_runtime_cache.get(&cache_key) {
+            if runtime.can_reuse_prepared_simple_insert(plan) {
+                return Ok(Some(Arc::clone(plan)));
+            }
+            prepared_insert_runtime_cache.remove(&cache_key);
+        }
+
+        let needs_refresh =
+            prepared_insert.use_generic_validation || prepared_insert.use_generic_index_updates;
+        if !needs_refresh && runtime.can_reuse_prepared_simple_insert(prepared_insert) {
+            return Ok(Some(Arc::clone(prepared_insert)));
+        }
+
+        let SqlStatement::Insert(insert) = prepared.statement.as_ref() else {
+            return Ok(None);
+        };
+        let Some(refreshed) = runtime.prepare_simple_insert(insert)? else {
+            return Ok(None);
+        };
+        let refreshed = Arc::new(refreshed);
+        if runtime.can_reuse_prepared_simple_insert(refreshed.as_ref()) {
+            prepared_insert_runtime_cache.insert(cache_key, Arc::clone(&refreshed));
+        }
+        Ok(Some(refreshed))
+    }
+
     fn execute_prepared_read_statement(
         &self,
         prepared: &PreparedStatement,
@@ -2124,6 +2187,19 @@ impl Db {
                 SqlTxnSlot::None => {}
             }
         }
+        let temp_only = {
+            let runtime = self
+                .inner
+                .engine
+                .read()
+                .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+            self.validate_prepared_schema_cookie(
+                prepared,
+                runtime.catalog.schema_cookie,
+                runtime.temp_schema_cookie,
+            )?;
+            self.statement_is_temp_only(&runtime, prepared.statement.as_ref())
+        };
 
         let _writer = self
             .inner
@@ -2179,6 +2255,10 @@ impl Db {
             }
             drop(runtime);
         }
+        if temp_only {
+            return self
+                .execute_autocommit_temp_only_statement(prepared.statement.as_ref(), params);
+        }
         if self.can_execute_statement_with_row_sources_at_latest_snapshot(
             prepared.statement.as_ref(),
         )? && self.load_statement_row_sources_at_latest_snapshot(prepared.statement.as_ref())?
@@ -2195,30 +2275,7 @@ impl Db {
                 .finalize_row_source_autocommit_statement(prepared.statement.as_ref(), result);
         }
         self.refresh_and_load_tables_for_statement_at_latest_snapshot(prepared.statement.as_ref())?;
-        let temp_only = {
-            let runtime = self
-                .inner
-                .engine
-                .read()
-                .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
-            self.validate_prepared_schema_cookie(
-                prepared,
-                runtime.catalog.schema_cookie,
-                runtime.temp_schema_cookie,
-            )?;
-            self.statement_is_temp_only(&runtime, prepared.statement.as_ref())
-        };
         let _savepoint = StatementSavepoint::new(self.inner.wal.latest_snapshot());
-        if temp_only {
-            let mut working = self.engine_snapshot()?;
-            let result = working.execute_statement(
-                prepared.statement.as_ref(),
-                params,
-                self.inner.config.page_size,
-            )?;
-            self.install_temp_runtime(working)?;
-            return Ok(result);
-        }
         self.execute_autocommit_in_place(|runtime| {
             runtime.execute_statement(
                 prepared.statement.as_ref(),
@@ -2234,6 +2291,14 @@ impl Db {
         statement: &crate::sql::ast::Statement,
         params: &[Value],
     ) -> Result<QueryResult> {
+        let temp_only = {
+            let runtime = self
+                .inner
+                .engine
+                .read()
+                .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+            self.statement_is_temp_only(&runtime, statement)
+        };
         if self.inner.sql_txn_active.load(Ordering::Acquire) {
             let mut txn = self
                 .inner
@@ -2306,6 +2371,9 @@ impl Db {
                 return self.execute_autocommit_insert_in_place(statement, params);
             }
         }
+        if temp_only {
+            return self.execute_autocommit_temp_only_statement(statement, params);
+        }
         if self.can_execute_statement_with_row_sources_at_latest_snapshot(statement)?
             && self.load_statement_row_sources_at_latest_snapshot(statement)?
         {
@@ -2316,25 +2384,21 @@ impl Db {
             return self.finalize_row_source_autocommit_statement(statement, result);
         }
         self.refresh_and_load_tables_for_statement_at_latest_snapshot(statement)?;
-        let temp_only = {
-            let runtime = self
-                .inner
-                .engine
-                .read()
-                .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
-            self.statement_is_temp_only(&runtime, statement)
-        };
         let _savepoint = StatementSavepoint::new(self.inner.wal.latest_snapshot());
-        if temp_only {
-            let mut working = self.engine_snapshot()?;
-            let result =
-                working.execute_statement(statement, params, self.inner.config.page_size)?;
-            self.install_temp_runtime(working)?;
-            return Ok(result);
-        }
         self.execute_autocommit_in_place(|runtime| {
             runtime.execute_statement(statement, params, self.inner.config.page_size)
         })
+    }
+
+    fn execute_autocommit_temp_only_statement(
+        &self,
+        statement: &crate::sql::ast::Statement,
+        params: &[Value],
+    ) -> Result<QueryResult> {
+        let mut working = self.engine_snapshot()?;
+        let result = working.execute_statement(statement, params, self.inner.config.page_size)?;
+        self.install_temp_runtime(working)?;
+        Ok(result)
     }
 
     fn execute_autocommit_insert_in_place(
@@ -2342,20 +2406,34 @@ impl Db {
         statement: &crate::sql::ast::Statement,
         params: &[Value],
     ) -> Result<QueryResult> {
-        if let crate::sql::ast::Statement::Insert(insert) = statement {
-            self.load_simple_write_row_sources_at_latest_snapshot(&[insert.table_name.as_str()])?;
-        }
+        let insert_table_names = if let crate::sql::ast::Statement::Insert(insert) = statement {
+            let table_names = {
+                self.refresh_engine_from_storage()?;
+                let runtime = self
+                    .inner
+                    .engine
+                    .read()
+                    .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+                self.insert_dependency_table_names(&runtime, &insert.table_name)?
+            };
+            let table_refs = table_names.iter().map(String::as_str).collect::<Vec<_>>();
+            self.load_simple_write_row_sources_at_latest_snapshot(&table_refs)?;
+            Some(table_names)
+        } else {
+            None
+        };
         let result = self.execute_autocommit_in_place(|runtime| {
             runtime.execute_statement(statement, params, self.inner.config.page_size)
         })?;
-        if let crate::sql::ast::Statement::Insert(insert) = statement {
-            self.redefer_persisted_tables(&[insert.table_name.as_str()])?;
+        if let Some(table_names) = &insert_table_names {
+            let table_refs = table_names.iter().map(String::as_str).collect::<Vec<_>>();
+            self.redefer_persisted_tables(&table_refs)?;
         }
         Ok(result)
     }
 
     fn can_use_autocommit_prepared_insert_fast_path(&self, _table_name: &str) -> Result<bool> {
-        Ok(!self.inner.config.defer_table_materialization)
+        Ok(true)
     }
 
     fn execute_autocommit_prepared_insert_in_place(
@@ -2363,7 +2441,17 @@ impl Db {
         prepared: &PreparedSimpleInsert,
         params: &[Value],
     ) -> Result<QueryResult> {
-        self.load_simple_write_row_sources_at_latest_snapshot(&[prepared.table_name.as_str()])?;
+        let table_names = {
+            self.refresh_engine_from_storage()?;
+            let runtime = self
+                .inner
+                .engine
+                .read()
+                .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+            self.insert_dependency_table_names(&runtime, &prepared.table_name)?
+        };
+        let table_refs = table_names.iter().map(String::as_str).collect::<Vec<_>>();
+        self.load_simple_write_row_sources_at_latest_snapshot(&table_refs)?;
         let mut runtime = self
             .inner
             .engine
@@ -2378,7 +2466,7 @@ impl Db {
                     self.inner.config.page_size,
                 )
             })?;
-            self.redefer_persisted_tables(&[prepared.table_name.as_str()])?;
+            self.redefer_persisted_tables(&table_refs)?;
             return Ok(result);
         }
         let result = match runtime.execute_prepared_simple_insert(
@@ -2415,7 +2503,7 @@ impl Db {
             .writer_last_commit_lsn
             .store(committed_lsn, Ordering::Release);
         drop(runtime);
-        self.redefer_persisted_tables(&[prepared.table_name.as_str()])?;
+        self.redefer_persisted_tables(&table_refs)?;
         Ok(result)
     }
 
@@ -2556,9 +2644,17 @@ impl Db {
         if !self.can_use_autocommit_prepared_insert_fast_path(&prepared_insert.table_name)? {
             return Ok(None);
         }
-        self.load_simple_write_row_sources_at_latest_snapshot(&[prepared_insert
-            .table_name
-            .as_str()])?;
+        let table_names = {
+            self.refresh_engine_from_storage()?;
+            let runtime = self
+                .inner
+                .engine
+                .read()
+                .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+            self.insert_dependency_table_names(&runtime, &prepared_insert.table_name)?
+        };
+        let table_refs = table_names.iter().map(String::as_str).collect::<Vec<_>>();
+        self.load_simple_write_row_sources_at_latest_snapshot(&table_refs)?;
         let mut runtime = self
             .inner
             .engine
@@ -2612,7 +2708,7 @@ impl Db {
             .writer_last_commit_lsn
             .store(committed_lsn, Ordering::Release);
         drop(runtime);
-        self.redefer_persisted_tables(&[prepared_insert.table_name.as_str()])?;
+        self.redefer_persisted_tables(&table_refs)?;
         Ok(Some(result))
     }
 
@@ -3020,18 +3116,75 @@ impl Db {
                 .keys()
                 .any(|entry| identifiers_equal(entry, name))
         };
-        let temp_has_name = |name: &str| temp_has_table(name) || temp_has_view(name);
         match statement {
             crate::sql::ast::Statement::CreateTable(statement) => statement.temporary,
-            crate::sql::ast::Statement::CreateTableAs(statement) => statement.temporary,
-            crate::sql::ast::Statement::CreateView(statement) => statement.temporary,
+            crate::sql::ast::Statement::CreateTableAs(statement) => {
+                statement.temporary && self.query_is_temp_only(runtime, &statement.query)
+            }
+            crate::sql::ast::Statement::CreateView(statement) => {
+                statement.temporary && self.query_is_temp_only(runtime, &statement.query)
+            }
             crate::sql::ast::Statement::DropTable { name, .. } => temp_has_table(name),
             crate::sql::ast::Statement::DropView { name, .. } => temp_has_view(name),
-            crate::sql::ast::Statement::Insert(statement) => temp_has_name(&statement.table_name),
-            crate::sql::ast::Statement::Update(statement) => temp_has_name(&statement.table_name),
-            crate::sql::ast::Statement::Delete(statement) => temp_has_name(&statement.table_name),
+            crate::sql::ast::Statement::Query(_)
+            | crate::sql::ast::Statement::Insert(_)
+            | crate::sql::ast::Statement::Update(_)
+            | crate::sql::ast::Statement::Delete(_) => {
+                self.safe_referenced_names_are_temp_only(runtime, statement)
+            }
             _ => false,
         }
+    }
+
+    fn query_is_temp_only(&self, runtime: &EngineRuntime, query: &crate::sql::ast::Query) -> bool {
+        self.safe_referenced_names_are_temp_only(
+            runtime,
+            &crate::sql::ast::Statement::Query(query.clone()),
+        )
+    }
+
+    fn safe_referenced_names_are_temp_only(
+        &self,
+        runtime: &EngineRuntime,
+        statement: &crate::sql::ast::Statement,
+    ) -> bool {
+        let Some(names) = crate::sql::ast::safe_referenced_tables(statement) else {
+            return false;
+        };
+        let mut visiting_views = BTreeSet::new();
+        names
+            .into_iter()
+            .all(|name| self.referenced_name_is_temp_only(runtime, &name, &mut visiting_views))
+    }
+
+    fn referenced_name_is_temp_only(
+        &self,
+        runtime: &EngineRuntime,
+        name: &str,
+        visiting_views: &mut BTreeSet<String>,
+    ) -> bool {
+        if runtime
+            .temp_tables
+            .keys()
+            .any(|entry| identifiers_equal(entry, name))
+        {
+            return true;
+        }
+        let Some((view_name, view)) = runtime
+            .temp_views
+            .iter()
+            .find(|(entry, _)| identifiers_equal(entry, name))
+        else {
+            return false;
+        };
+        if !visiting_views.insert(view_name.clone()) {
+            return false;
+        }
+        let temp_only = view.dependencies.iter().all(|dependency| {
+            self.referenced_name_is_temp_only(runtime, dependency, visiting_views)
+        });
+        visiting_views.remove(view_name);
+        temp_only
     }
 
     fn parsed_statement(&self, sql: &str) -> Result<Arc<SqlStatement>> {
@@ -3116,6 +3269,7 @@ impl Db {
             base_checkpoint_epoch: current_epoch,
             persistent_changed: false,
             indexes_maybe_stale: false,
+            prepared_insert_runtime_cache: HashMap::new(),
         })
     }
 
@@ -3215,22 +3369,67 @@ impl Db {
         Ok(committed_lsn)
     }
 
-    fn runtime_for_row_source_inspection(&self) -> Result<EngineRuntime> {
-        if let Some((mut runtime, snapshot_lsn)) = self.transaction_runtime_snapshot_with_lsn()? {
-            self.load_all_runtime_row_sources_at_snapshot(&mut runtime, snapshot_lsn)?;
-            return Ok(runtime);
+    fn runtime_for_targeted_row_source_inspection(&self) -> Result<(EngineRuntime, Option<u64>)> {
+        if let Some((runtime, snapshot_lsn)) = self.transaction_runtime_snapshot_with_lsn()? {
+            return Ok((runtime, Some(snapshot_lsn)));
         }
         if !self.inner.config.defer_table_materialization {
-            self.refresh_and_ensure_all_tables_loaded()?;
-            return self.engine_snapshot();
+            self.refresh_engine_from_storage()?;
+            return Ok((self.engine_snapshot()?, None));
         }
         let reader = self.inner.wal.begin_reader()?;
         let snapshot_lsn = reader.snapshot_lsn();
         self.refresh_engine_from_snapshot(snapshot_lsn)?;
-        let mut runtime = self.engine_snapshot()?;
-        self.load_all_runtime_row_sources_at_snapshot(&mut runtime, snapshot_lsn)?;
         drop(reader);
-        Ok(runtime)
+        Ok((self.engine_snapshot()?, Some(snapshot_lsn)))
+    }
+
+    fn ensure_inspection_table_row_source(
+        &self,
+        runtime: &mut EngineRuntime,
+        table_name: &str,
+        snapshot_lsn: Option<u64>,
+    ) -> Result<()> {
+        if runtime.table_row_source(table_name).is_some()
+            || runtime.temp_table_schema(table_name).is_some()
+        {
+            return Ok(());
+        }
+        let Some(snapshot_lsn) = snapshot_lsn else {
+            return Ok(());
+        };
+        self.load_runtime_table_row_sources_at_snapshot(runtime, &[table_name], snapshot_lsn)
+    }
+
+    fn insert_dependency_table_names(
+        &self,
+        runtime: &EngineRuntime,
+        table_name: &str,
+    ) -> Result<Vec<String>> {
+        let table = runtime
+            .table_schema(table_name)
+            .ok_or_else(|| DbError::sql(format!("unknown table {table_name}")))?;
+        let mut names = vec![table_name.to_string()];
+        for foreign_key in &table.foreign_keys {
+            if !names
+                .iter()
+                .any(|name| identifiers_equal(name, &foreign_key.referenced_table))
+            {
+                names.push(foreign_key.referenced_table.clone());
+            }
+        }
+        Ok(names)
+    }
+
+    fn redefer_inspection_table_row_source(
+        &self,
+        runtime: &mut EngineRuntime,
+        table_name: &str,
+        snapshot_lsn: Option<u64>,
+    ) {
+        if snapshot_lsn.is_some() && runtime.persisted_table_state(table_name).is_some() {
+            runtime.redefer_persisted_tables(&[table_name]);
+        }
     }
 
     fn runtime_for_metadata_inspection(&self) -> Result<EngineRuntime> {
@@ -4002,6 +4201,9 @@ impl Db {
         snapshot_lsn: u64,
         indexes_maybe_stale: &mut bool,
     ) -> Result<QueryResult> {
+        if self.statement_is_temp_only(runtime, statement) {
+            return runtime.execute_read_statement(statement, params, self.inner.config.page_size);
+        }
         if !*indexes_maybe_stale {
             if let SqlStatement::Query(query) = statement {
                 if let Some(result) = self
@@ -4064,9 +4266,12 @@ impl Db {
         let temp_only = self.statement_is_temp_only(runtime, statement);
         match statement {
             SqlStatement::Insert(insert) => {
+                let table_names =
+                    self.insert_dependency_table_names(runtime, &insert.table_name)?;
+                let table_refs = table_names.iter().map(String::as_str).collect::<Vec<_>>();
                 self.load_runtime_table_row_sources_at_snapshot(
                     runtime,
-                    &[insert.table_name.as_str()],
+                    &table_refs,
                     snapshot_lsn,
                 )?;
                 if let Some(prepared_insert) = runtime.prepare_simple_insert(insert)? {
@@ -4298,6 +4503,7 @@ impl Db {
             base_checkpoint_epoch: current_epoch,
             persistent_changed: false,
             indexes_maybe_stale: false,
+            prepared_insert_runtime_cache: HashMap::new(),
             savepoints: Vec::new(),
         })
     }
@@ -4329,6 +4535,17 @@ impl Db {
             );
         }
         let snapshot_lsn = state.snapshot_lsn();
+        if let Some(result) = self.try_execute_prepared_insert_in_runtime_state(
+            prepared,
+            params,
+            &mut state.runtime,
+            snapshot_lsn,
+            &mut state.persistent_changed,
+            &mut state.indexes_maybe_stale,
+            &mut state.prepared_insert_runtime_cache,
+        )? {
+            return Ok(result);
+        }
         self.execute_write_in_runtime_state(
             prepared.statement.as_ref(),
             params,
@@ -4366,6 +4583,17 @@ impl Db {
             );
         }
         let snapshot_lsn = state.snapshot_lsn();
+        if let Some(result) = self.try_execute_prepared_insert_in_runtime_state(
+            prepared,
+            params,
+            &mut state.runtime,
+            snapshot_lsn,
+            &mut state.persistent_changed,
+            &mut state.indexes_maybe_stale,
+            &mut state.prepared_insert_runtime_cache,
+        )? {
+            return Ok(result);
+        }
         self.execute_write_in_runtime_state(
             prepared.statement.as_ref(),
             params,
@@ -4392,6 +4620,36 @@ impl Db {
             &mut state.persistent_changed,
             &mut state.indexes_maybe_stale,
         )
+    }
+
+    fn try_execute_prepared_insert_in_runtime_state(
+        &self,
+        prepared: &PreparedStatement,
+        params: &[Value],
+        runtime: &mut EngineRuntime,
+        snapshot_lsn: u64,
+        persistent_changed: &mut bool,
+        indexes_maybe_stale: &mut bool,
+        prepared_insert_runtime_cache: &mut HashMap<usize, Arc<PreparedSimpleInsert>>,
+    ) -> Result<Option<QueryResult>> {
+        let Some(insert_plan) = self.prepared_insert_plan_for_runtime_state(
+            prepared,
+            runtime,
+            snapshot_lsn,
+            indexes_maybe_stale,
+            prepared_insert_runtime_cache,
+        )?
+        else {
+            return Ok(None);
+        };
+
+        let result = runtime.execute_prepared_simple_insert(
+            insert_plan.as_ref(),
+            params,
+            self.inner.config.page_size,
+        )?;
+        *persistent_changed |= !self.statement_is_temp_only(runtime, prepared.statement.as_ref());
+        Ok(Some(result))
     }
 
     fn exclusive_sql_txn_error(&self) -> DbError {
@@ -5034,19 +5292,31 @@ fn runtime_index_entry_count(index: &RuntimeIndex) -> usize {
     }
 }
 
-fn render_runtime_dump(runtime: &EngineRuntime) -> Result<String> {
+fn render_runtime_dump(
+    db: &Db,
+    runtime: &mut EngineRuntime,
+    snapshot_lsn: Option<u64>,
+) -> Result<String> {
     let mut lines = Vec::new();
 
     for table in runtime.catalog.tables.values() {
         lines.push(render_create_table(table));
     }
-    for table in runtime.catalog.tables.values() {
+    let table_names = runtime.catalog.tables.keys().cloned().collect::<Vec<_>>();
+    for table_name in table_names {
+        db.ensure_inspection_table_row_source(runtime, &table_name, snapshot_lsn)?;
+        let table = runtime
+            .catalog
+            .table(&table_name)
+            .cloned()
+            .ok_or_else(|| DbError::internal(format!("unknown table {table_name}")))?;
         let row_source = runtime.table_row_source(&table.name).ok_or_else(|| {
             DbError::internal(format!("table row source for {} is missing", table.name))
         })?;
         for row in row_source.rows() {
-            lines.push(render_insert(table, row?.values()));
+            lines.push(render_insert(&table, row?.values()));
         }
+        db.redefer_inspection_table_row_source(runtime, &table_name, snapshot_lsn);
     }
     for view in runtime.catalog.views.values() {
         lines.push(render_create_view(view));
@@ -5346,6 +5616,7 @@ mod tests {
         ColumnSchema, ColumnType, IndexKind, IndexSchema, TableSchema, ViewSchema,
     };
     use crate::config::DbConfig;
+    use crate::db::SqlTxnSlot;
     use crate::error::{DbError, Result};
     use crate::exec::{
         decode_paged_table_manifest_payload, EngineRuntime, TableData, TableRowSource,
@@ -5661,6 +5932,86 @@ mod tests {
             .expect("prepared plan");
         assert!(!Arc::ptr_eq(&first, &second_schema));
         assert_eq!(second_schema.table_name, "users_v2");
+    }
+
+    #[test]
+    fn default_deferred_materialization_keeps_prepared_insert_fast_path_enabled() {
+        let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
+        assert!(
+            db.can_use_autocommit_prepared_insert_fast_path("t")
+                .expect("prepared insert fast path check"),
+            "default deferred materialization must not disable prepared inserts"
+        );
+    }
+
+    #[test]
+    fn shared_transaction_prepared_insert_refreshes_generic_cached_plan_once() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir
+            .path()
+            .join("shared-txn-prepared-insert-refresh.ddb");
+        let config = DbConfig::default();
+
+        {
+            let db = Db::open_or_create(&path, config.clone()).expect("open db");
+            db.execute("CREATE TABLE bench (id INTEGER, val TEXT, f FLOAT64)")
+                .expect("create bench table");
+            db.execute("CREATE INDEX bench_id_idx ON bench(id)")
+                .expect("create bench index");
+        }
+
+        let db = Db::open_or_create(&path, config).expect("reopen db");
+        db.begin_transaction().expect("begin shared transaction");
+        let mut prepared = db
+            .prepare("INSERT INTO bench VALUES ($1, $2, $3)")
+            .expect("prepare insert");
+        let cached_plan = prepared
+            .prepared_insert
+            .as_ref()
+            .expect("prepared insert plan");
+        let mut generic_plan = (**cached_plan).clone();
+        generic_plan.use_generic_index_updates = true;
+        prepared.prepared_insert = Some(Arc::new(generic_plan));
+
+        prepared
+            .execute(&[
+                Value::Int64(1),
+                Value::Text("value-1".to_string()),
+                Value::Float64(1.0),
+            ])
+            .expect("execute prepared insert in shared transaction");
+
+        {
+            let txn = db.inner.sql_txn.lock().expect("lock shared txn slot");
+            let SqlTxnSlot::Shared(state) = &*txn else {
+                panic!("expected shared sql transaction state");
+            };
+            let cached_runtime_plan = state
+                .prepared_insert_runtime_cache
+                .get(&Db::prepared_statement_cache_key(&prepared))
+                .expect("refreshed runtime insert plan");
+            assert!(
+                !cached_runtime_plan.use_generic_index_updates,
+                "transaction runtime should cache a specialized insert plan once row sources are loaded"
+            );
+        }
+
+        prepared
+            .execute(&[
+                Value::Int64(2),
+                Value::Text("value-2".to_string()),
+                Value::Float64(2.0),
+            ])
+            .expect("reuse prepared insert in shared transaction");
+        db.commit_transaction().expect("commit shared transaction");
+
+        assert_eq!(
+            scalar_i64(
+                &db.execute("SELECT COUNT(*) FROM bench")
+                    .expect("count committed rows")
+            ),
+            2
+        );
     }
 
     #[test]
@@ -10587,6 +10938,131 @@ mod tests {
     }
 
     #[test]
+    fn paged_row_storage_indexed_join_multi_column_using_wildcard_keeps_deferred_tables_unloaded() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir
+            .path()
+            .join("paged-row-storage-indexed-join-multi-column-using-wildcard.ddb");
+        let config = DbConfig {
+            paged_row_storage: true,
+            ..DbConfig::default()
+        };
+
+        {
+            let db = Db::open_or_create(&path, config.clone()).expect("open db");
+            db.execute(
+                "CREATE TABLE docs (pk INTEGER PRIMARY KEY, org_id INTEGER, id INTEGER, body TEXT)",
+            )
+            .expect("create docs");
+            db.execute(
+                "CREATE TABLE archive (archive_pk INTEGER PRIMARY KEY, org_id INTEGER, id INTEGER, note TEXT)",
+            )
+            .expect("create archive");
+            db.execute("CREATE INDEX archive_org_id_id_idx ON archive(org_id, id)")
+                .expect("create archive index");
+            db.execute("INSERT INTO docs (pk, org_id, id, body) VALUES (1, 7, 8, 'doc-8')")
+                .expect("insert doc row");
+            db.execute(
+                "INSERT INTO archive (archive_pk, org_id, id, note) VALUES (1, 7, 8, 'note-z')",
+            )
+            .expect("insert archive row");
+            db.checkpoint().expect("checkpoint");
+        }
+
+        let db = Db::open_or_create(&path, config).expect("reopen db");
+        let result = db
+            .execute(
+                "SELECT * \
+                 FROM docs \
+                 JOIN archive USING (org_id, id) \
+                 ORDER BY note DESC",
+            )
+            .expect("indexed join multi-column using wildcard query");
+        assert_eq!(result.rows().len(), 1);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[
+                Value::Int64(7),
+                Value::Int64(8),
+                Value::Int64(1),
+                Value::Text("doc-8".to_string()),
+                Value::Int64(1),
+                Value::Text("note-z".to_string()),
+            ]
+        );
+
+        let json_after = db.inspect_storage_state_json().expect("json after join");
+        assert!(
+            json_after.contains("\"loaded_table_count\":0"),
+            "expected indexed join multi-column using wildcard to avoid resident table materialization, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"deferred_table_count\":2"),
+            "expected indexed join multi-column using wildcard to leave both paged tables deferred, got: {json_after}"
+        );
+    }
+
+    #[test]
+    fn paged_row_storage_indexed_natural_join_keeps_deferred_tables_unloaded() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir
+            .path()
+            .join("paged-row-storage-indexed-natural-join.ddb");
+        let config = DbConfig {
+            paged_row_storage: true,
+            ..DbConfig::default()
+        };
+
+        {
+            let db = Db::open_or_create(&path, config.clone()).expect("open db");
+            db.execute(
+                "CREATE TABLE docs (pk INTEGER PRIMARY KEY, org_id INTEGER, id INTEGER, body TEXT)",
+            )
+            .expect("create docs");
+            db.execute(
+                "CREATE TABLE archive (pk INTEGER PRIMARY KEY, org_id INTEGER, id INTEGER, note TEXT)",
+            )
+            .expect("create archive");
+            db.execute("CREATE INDEX archive_org_id_id_idx ON archive(org_id, id)")
+                .expect("create archive index");
+            db.execute("INSERT INTO docs (pk, org_id, id, body) VALUES (1, 7, 8, 'doc-8')")
+                .expect("insert doc row");
+            db.execute("INSERT INTO archive (pk, org_id, id, note) VALUES (1, 7, 8, 'note-z')")
+                .expect("insert archive row");
+            db.checkpoint().expect("checkpoint");
+        }
+
+        let db = Db::open_or_create(&path, config).expect("reopen db");
+        let result = db
+            .execute(
+                "SELECT docs.pk, org_id, id, archive.note \
+                 FROM docs NATURAL JOIN archive \
+                 ORDER BY archive.note DESC",
+            )
+            .expect("indexed natural join query");
+        assert_eq!(result.rows().len(), 1);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[
+                Value::Int64(1),
+                Value::Int64(7),
+                Value::Int64(8),
+                Value::Text("note-z".to_string()),
+            ]
+        );
+
+        let json_after = db.inspect_storage_state_json().expect("json after join");
+        assert!(
+            json_after.contains("\"loaded_table_count\":0"),
+            "expected indexed natural join to avoid resident table materialization, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"deferred_table_count\":2"),
+            "expected indexed natural join to leave both paged tables deferred, got: {json_after}"
+        );
+    }
+
+    #[test]
     fn paged_row_storage_indexed_join_without_filter_keeps_deferred_tables_unloaded() {
         let tempdir = TempDir::new().expect("tempdir");
         let path = tempdir
@@ -10774,6 +11250,170 @@ mod tests {
         assert!(
             json_after.contains("\"deferred_table_count\":2"),
             "expected composite indexed join without filter path to leave both paged tables deferred, got: {json_after}"
+        );
+    }
+
+    #[test]
+    fn paged_row_storage_composite_indexed_join_with_filter_keeps_deferred_tables_unloaded() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir
+            .path()
+            .join("paged-row-storage-composite-indexed-join-with-filter.ddb");
+        let config = DbConfig {
+            paged_row_storage: true,
+            ..DbConfig::default()
+        };
+
+        {
+            let db = Db::open_or_create(&path, config.clone()).expect("open db");
+            db.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, org_id INTEGER, body TEXT)")
+                .expect("create docs");
+            db.execute(
+                "CREATE TABLE archive (id INTEGER PRIMARY KEY, org_id INTEGER, doc_id INTEGER, note TEXT)",
+            )
+            .expect("create archive");
+            db.execute("CREATE INDEX idx_archive_org_doc ON archive(org_id, doc_id)")
+                .expect("create composite archive join index");
+            let mut txn = db.transaction().expect("begin txn");
+            let docs_insert = txn
+                .prepare("INSERT INTO docs VALUES ($1, $2, $3)")
+                .expect("prepare docs insert");
+            let archive_insert = txn
+                .prepare("INSERT INTO archive VALUES ($1, $2, $3, $4)")
+                .expect("prepare archive insert");
+            for i in 0_i64..16_i64 {
+                let doc_id = i + 1;
+                let org_id = if i < 8 { 10 } else { 20 };
+                docs_insert
+                    .execute_in(
+                        &mut txn,
+                        &[
+                            Value::Int64(doc_id),
+                            Value::Int64(org_id),
+                            Value::Text("x".repeat(1024)),
+                        ],
+                    )
+                    .expect("insert docs row");
+                archive_insert
+                    .execute_in(
+                        &mut txn,
+                        &[
+                            Value::Int64(1000 + i),
+                            Value::Int64(org_id),
+                            Value::Int64(doc_id),
+                            Value::Text(format!("note-{i:02}")),
+                        ],
+                    )
+                    .expect("insert archive row");
+            }
+            txn.commit().expect("commit seed txn");
+            db.checkpoint().expect("checkpoint");
+        }
+
+        let db = Db::open_or_create(&path, config).expect("reopen db");
+        let result = db
+            .execute(
+                "SELECT docs.id, archive.note \
+                 FROM docs \
+                 JOIN archive ON docs.org_id = archive.org_id AND docs.id = archive.doc_id \
+                 WHERE docs.id = 2",
+            )
+            .expect("composite indexed join with filter query");
+        assert_eq!(result.rows().len(), 1);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[Value::Int64(2), Value::Text("note-01".to_string())]
+        );
+
+        let json_after = db.inspect_storage_state_json().expect("json after join");
+        assert!(
+            json_after.contains("\"loaded_table_count\":0"),
+            "expected composite indexed join with filter path to avoid resident table materialization, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"deferred_table_count\":2"),
+            "expected composite indexed join with filter path to leave both paged tables deferred, got: {json_after}"
+        );
+    }
+
+    #[test]
+    fn paged_row_storage_composite_hashed_join_with_filter_keeps_deferred_tables_unloaded() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir
+            .path()
+            .join("paged-row-storage-composite-hashed-join-with-filter.ddb");
+        let config = DbConfig {
+            paged_row_storage: true,
+            ..DbConfig::default()
+        };
+
+        {
+            let db = Db::open_or_create(&path, config.clone()).expect("open db");
+            db.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, org_id INTEGER, body TEXT)")
+                .expect("create docs");
+            db.execute(
+                "CREATE TABLE archive (id INTEGER PRIMARY KEY, org_id INTEGER, doc_id INTEGER, note TEXT)",
+            )
+            .expect("create archive");
+            let mut txn = db.transaction().expect("begin txn");
+            let docs_insert = txn
+                .prepare("INSERT INTO docs VALUES ($1, $2, $3)")
+                .expect("prepare docs insert");
+            let archive_insert = txn
+                .prepare("INSERT INTO archive VALUES ($1, $2, $3, $4)")
+                .expect("prepare archive insert");
+            for i in 0_i64..16_i64 {
+                let doc_id = i + 1;
+                let org_id = if i < 8 { 10 } else { 20 };
+                docs_insert
+                    .execute_in(
+                        &mut txn,
+                        &[
+                            Value::Int64(doc_id),
+                            Value::Int64(org_id),
+                            Value::Text("x".repeat(1024)),
+                        ],
+                    )
+                    .expect("insert docs row");
+                archive_insert
+                    .execute_in(
+                        &mut txn,
+                        &[
+                            Value::Int64(1000 + i),
+                            Value::Int64(org_id),
+                            Value::Int64(doc_id),
+                            Value::Text(format!("note-{i:02}")),
+                        ],
+                    )
+                    .expect("insert archive row");
+            }
+            txn.commit().expect("commit seed txn");
+            db.checkpoint().expect("checkpoint");
+        }
+
+        let db = Db::open_or_create(&path, config).expect("reopen db");
+        let result = db
+            .execute(
+                "SELECT docs.id, archive.note \
+                 FROM docs \
+                 JOIN archive ON docs.org_id = archive.org_id AND docs.id = archive.doc_id \
+                 WHERE docs.id = 2",
+            )
+            .expect("composite hashed join with filter query");
+        assert_eq!(result.rows().len(), 1);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[Value::Int64(2), Value::Text("note-01".to_string())]
+        );
+
+        let json_after = db.inspect_storage_state_json().expect("json after join");
+        assert!(
+            json_after.contains("\"loaded_table_count\":0"),
+            "expected composite hashed join with filter path to avoid resident table materialization, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"deferred_table_count\":2"),
+            "expected composite hashed join with filter path to leave both paged tables deferred, got: {json_after}"
         );
     }
 
@@ -11481,6 +12121,433 @@ mod tests {
         assert!(
             json_after.contains("\"rows_in_memory_count\":0"),
             "expected zero resident rows after generic join execution, got: {json_after}"
+        );
+    }
+
+    #[test]
+    fn paged_row_storage_indexed_join_expression_filter_keeps_deferred_tables_unloaded() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir
+            .path()
+            .join("paged-row-storage-indexed-join-expression-filter.ddb");
+        let config = DbConfig {
+            paged_row_storage: true,
+            ..DbConfig::default()
+        };
+
+        {
+            let db = Db::open_or_create(&path, config.clone()).expect("open db");
+            db.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, n INTEGER, body TEXT)")
+                .expect("create docs");
+            db.execute("CREATE TABLE archive (id INTEGER PRIMARY KEY, doc_id INTEGER, note TEXT)")
+                .expect("create archive");
+            db.execute("CREATE INDEX idx_archive_doc_id ON archive(doc_id)")
+                .expect("create archive join index");
+            let docs_body = "x".repeat(2048);
+            let archive_note = "y".repeat(1024);
+            let mut txn = db.transaction().expect("begin txn");
+            let docs_insert = txn
+                .prepare("INSERT INTO docs VALUES ($1, $2, $3)")
+                .expect("prepare docs insert");
+            let archive_insert = txn
+                .prepare("INSERT INTO archive VALUES ($1, $2, $3)")
+                .expect("prepare archive insert");
+            for i in 0_i64..96_i64 {
+                docs_insert
+                    .execute_in(
+                        &mut txn,
+                        &[
+                            Value::Int64(i + 1),
+                            Value::Int64(i),
+                            Value::Text(docs_body.clone()),
+                        ],
+                    )
+                    .expect("insert docs row");
+                archive_insert
+                    .execute_in(
+                        &mut txn,
+                        &[
+                            Value::Int64(i + 1),
+                            Value::Int64(i + 1),
+                            Value::Text(format!("{archive_note}-{i}")),
+                        ],
+                    )
+                    .expect("insert archive row");
+            }
+            txn.commit().expect("commit seed txn");
+            db.checkpoint().expect("checkpoint");
+        }
+
+        let db = Db::open_or_create(&path, config).expect("reopen db");
+        let json_before = db.inspect_storage_state_json().expect("json before join");
+        assert!(
+            json_before.contains("\"loaded_table_count\":0"),
+            "expected join tables to stay deferred at reopen, got: {json_before}"
+        );
+        assert!(
+            json_before.contains("\"deferred_table_count\":2"),
+            "expected both join tables deferred at reopen, got: {json_before}"
+        );
+
+        let result = db
+            .execute(
+                "SELECT docs.id, archive.note \
+                 FROM docs \
+                 JOIN archive ON docs.id = archive.doc_id \
+                 WHERE docs.id + archive.doc_id >= 18 AND docs.id <= 10 \
+                 ORDER BY docs.id",
+            )
+            .expect("indexed join expression filter query");
+        assert_eq!(result.rows().len(), 2);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[
+                Value::Int64(9),
+                Value::Text(format!("{}-8", "y".repeat(1024)))
+            ]
+        );
+        assert_eq!(
+            result.rows()[1].values(),
+            &[
+                Value::Int64(10),
+                Value::Text(format!("{}-9", "y".repeat(1024)))
+            ]
+        );
+
+        let json_after = db.inspect_storage_state_json().expect("json after join");
+        assert!(
+            json_after.contains("\"loaded_table_count\":0"),
+            "expected indexed join expression filter to avoid resident table materialization, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"deferred_table_count\":2"),
+            "expected indexed join expression filter to leave both paged tables deferred, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"rows_in_memory_count\":0"),
+            "expected zero resident rows after indexed join expression filter, got: {json_after}"
+        );
+    }
+
+    #[test]
+    fn paged_row_storage_hashed_join_keeps_deferred_tables_unloaded() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir.path().join("paged-row-storage-hashed-join.ddb");
+        let config = DbConfig {
+            paged_row_storage: true,
+            ..DbConfig::default()
+        };
+
+        {
+            let db = Db::open_or_create(&path, config.clone()).expect("open db");
+            db.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, n INTEGER, body TEXT)")
+                .expect("create docs");
+            db.execute("CREATE TABLE archive (id INTEGER PRIMARY KEY, doc_id INTEGER, note TEXT)")
+                .expect("create archive");
+            let docs_body = "x".repeat(2048);
+            let archive_note = "y".repeat(1024);
+            let mut txn = db.transaction().expect("begin txn");
+            let docs_insert = txn
+                .prepare("INSERT INTO docs VALUES ($1, $2, $3)")
+                .expect("prepare docs insert");
+            let archive_insert = txn
+                .prepare("INSERT INTO archive VALUES ($1, $2, $3)")
+                .expect("prepare archive insert");
+            for i in 0_i64..96_i64 {
+                docs_insert
+                    .execute_in(
+                        &mut txn,
+                        &[
+                            Value::Int64(i + 1),
+                            Value::Int64(i),
+                            Value::Text(docs_body.clone()),
+                        ],
+                    )
+                    .expect("insert docs row");
+                archive_insert
+                    .execute_in(
+                        &mut txn,
+                        &[
+                            Value::Int64(i + 1),
+                            Value::Int64(i + 1),
+                            Value::Text(format!("{archive_note}-{i}")),
+                        ],
+                    )
+                    .expect("insert archive row");
+            }
+            txn.commit().expect("commit seed txn");
+            db.checkpoint().expect("checkpoint");
+        }
+
+        let db = Db::open_or_create(&path, config).expect("reopen db");
+        let json_before = db.inspect_storage_state_json().expect("json before join");
+        assert!(
+            json_before.contains("\"loaded_table_count\":0"),
+            "expected join tables to stay deferred at reopen, got: {json_before}"
+        );
+        assert!(
+            json_before.contains("\"deferred_table_count\":2"),
+            "expected both join tables deferred at reopen, got: {json_before}"
+        );
+
+        let result = db
+            .execute(
+                "SELECT docs.id, archive.note \
+                 FROM docs \
+                 JOIN archive ON docs.id = archive.doc_id \
+                 WHERE docs.id + archive.doc_id >= 18 AND docs.id <= 10 \
+                 ORDER BY docs.id",
+            )
+            .expect("hashed join query");
+        assert_eq!(result.rows().len(), 2);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[
+                Value::Int64(9),
+                Value::Text(format!("{}-8", "y".repeat(1024)))
+            ]
+        );
+        assert_eq!(
+            result.rows()[1].values(),
+            &[
+                Value::Int64(10),
+                Value::Text(format!("{}-9", "y".repeat(1024)))
+            ]
+        );
+
+        let json_after = db.inspect_storage_state_json().expect("json after join");
+        assert!(
+            json_after.contains("\"loaded_table_count\":0"),
+            "expected hashed join to avoid resident table materialization, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"deferred_table_count\":2"),
+            "expected hashed join to leave both paged tables deferred, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"rows_in_memory_count\":0"),
+            "expected zero resident rows after hashed join, got: {json_after}"
+        );
+    }
+
+    #[test]
+    fn paged_row_storage_generic_right_join_keeps_deferred_tables_unloaded() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir
+            .path()
+            .join("paged-row-storage-generic-right-join.ddb");
+        let config = DbConfig {
+            paged_row_storage: true,
+            ..DbConfig::default()
+        };
+
+        {
+            let db = Db::open_or_create(&path, config.clone()).expect("open db");
+            db.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, n INTEGER, body TEXT)")
+                .expect("create docs");
+            db.execute("CREATE TABLE archive (id INTEGER PRIMARY KEY, doc_id INTEGER, note TEXT)")
+                .expect("create archive");
+            db.execute("CREATE INDEX archive_doc_idx ON archive (doc_id)")
+                .expect("create archive doc index");
+            let docs_body = "x".repeat(2048);
+            let archive_note = "y".repeat(1024);
+            let mut txn = db.transaction().expect("begin txn");
+            let docs_insert = txn
+                .prepare("INSERT INTO docs VALUES ($1, $2, $3)")
+                .expect("prepare docs insert");
+            let archive_insert = txn
+                .prepare("INSERT INTO archive VALUES ($1, $2, $3)")
+                .expect("prepare archive insert");
+            for i in 0_i64..96_i64 {
+                docs_insert
+                    .execute_in(
+                        &mut txn,
+                        &[
+                            Value::Int64(i + 1),
+                            Value::Int64(i),
+                            Value::Text(docs_body.clone()),
+                        ],
+                    )
+                    .expect("insert docs row");
+                archive_insert
+                    .execute_in(
+                        &mut txn,
+                        &[
+                            Value::Int64(i + 1),
+                            Value::Int64(i + 1),
+                            Value::Text(format!("{archive_note}-{i}")),
+                        ],
+                    )
+                    .expect("insert archive row");
+            }
+            archive_insert
+                .execute_in(
+                    &mut txn,
+                    &[
+                        Value::Int64(1001),
+                        Value::Int64(999),
+                        Value::Text("orphan".to_string()),
+                    ],
+                )
+                .expect("insert unmatched archive row");
+            txn.commit().expect("commit seed txn");
+            db.checkpoint().expect("checkpoint");
+        }
+
+        let db = Db::open_or_create(&path, config).expect("reopen db");
+        let json_before = db.inspect_storage_state_json().expect("json before join");
+        assert!(
+            json_before.contains("\"loaded_table_count\":0"),
+            "expected join tables to stay deferred at reopen, got: {json_before}"
+        );
+        assert!(
+            json_before.contains("\"deferred_table_count\":2"),
+            "expected both join tables deferred at reopen, got: {json_before}"
+        );
+
+        let result = db
+            .execute(
+                "SELECT docs.id, archive.id \
+                 FROM docs \
+                 RIGHT JOIN archive ON docs.id = archive.doc_id \
+                 WHERE archive.id >= 1000 \
+                 ORDER BY archive.id",
+            )
+            .expect("generic right join query");
+        assert_eq!(result.rows().len(), 1);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[Value::Null, Value::Int64(1001)]
+        );
+
+        let json_after = db.inspect_storage_state_json().expect("json after join");
+        assert!(
+            json_after.contains("\"loaded_table_count\":0"),
+            "expected generic right join execution to avoid resident table materialization, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"deferred_table_count\":2"),
+            "expected generic right join execution to leave both paged tables deferred, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"rows_in_memory_count\":0"),
+            "expected zero resident rows after generic right join execution, got: {json_after}"
+        );
+    }
+
+    #[test]
+    fn paged_row_storage_indexed_full_join_keeps_deferred_tables_unloaded() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir
+            .path()
+            .join("paged-row-storage-indexed-full-join.ddb");
+        let config = DbConfig {
+            paged_row_storage: true,
+            ..DbConfig::default()
+        };
+
+        {
+            let db = Db::open_or_create(&path, config.clone()).expect("open db");
+            db.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, n INTEGER, body TEXT)")
+                .expect("create docs");
+            db.execute("CREATE TABLE archive (id INTEGER PRIMARY KEY, doc_id INTEGER, note TEXT)")
+                .expect("create archive");
+            db.execute("CREATE INDEX idx_archive_doc_id ON archive(doc_id)")
+                .expect("create archive join index");
+            let docs_body = "x".repeat(2048);
+            let archive_note = "y".repeat(1024);
+            let mut txn = db.transaction().expect("begin txn");
+            let docs_insert = txn
+                .prepare("INSERT INTO docs VALUES ($1, $2, $3)")
+                .expect("prepare docs insert");
+            let archive_insert = txn
+                .prepare("INSERT INTO archive VALUES ($1, $2, $3)")
+                .expect("prepare archive insert");
+            for i in 0_i64..2_i64 {
+                docs_insert
+                    .execute_in(
+                        &mut txn,
+                        &[
+                            Value::Int64(i + 1),
+                            Value::Int64(i),
+                            Value::Text(docs_body.clone()),
+                        ],
+                    )
+                    .expect("insert docs row");
+            }
+            archive_insert
+                .execute_in(
+                    &mut txn,
+                    &[
+                        Value::Int64(1000),
+                        Value::Int64(1),
+                        Value::Text(format!("{archive_note}-0")),
+                    ],
+                )
+                .expect("insert archive row");
+            archive_insert
+                .execute_in(
+                    &mut txn,
+                    &[
+                        Value::Int64(1001),
+                        Value::Int64(99),
+                        Value::Text("orphan".to_string()),
+                    ],
+                )
+                .expect("insert unmatched archive row");
+            txn.commit().expect("commit seed txn");
+            db.checkpoint().expect("checkpoint");
+        }
+
+        let db = Db::open_or_create(&path, config).expect("reopen db");
+        let json_before = db.inspect_storage_state_json().expect("json before join");
+        assert!(
+            json_before.contains("\"loaded_table_count\":0"),
+            "expected join tables to stay deferred at reopen, got: {json_before}"
+        );
+        assert!(
+            json_before.contains("\"deferred_table_count\":2"),
+            "expected both join tables deferred at reopen, got: {json_before}"
+        );
+
+        let result = db
+            .execute(
+                "SELECT docs.id, archive.note, COALESCE(docs.id, archive.doc_id) AS sort_key \
+                 FROM docs \
+                 FULL JOIN archive ON docs.id = archive.doc_id \
+                 ORDER BY sort_key",
+            )
+            .expect("indexed full join projection query");
+        assert_eq!(result.rows().len(), 3);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[
+                Value::Int64(1),
+                Value::Text(format!("{}-0", "y".repeat(1024))),
+                Value::Int64(1)
+            ]
+        );
+        assert_eq!(
+            result.rows()[1].values(),
+            &[Value::Int64(2), Value::Null, Value::Int64(2)]
+        );
+        assert_eq!(
+            result.rows()[2].values(),
+            &[
+                Value::Null,
+                Value::Text("orphan".to_string()),
+                Value::Int64(99)
+            ]
+        );
+
+        let json_after = db.inspect_storage_state_json().expect("json after join");
+        assert!(
+            json_after.contains("\"loaded_table_count\":0"),
+            "expected indexed full join projection to avoid resident table materialization, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"deferred_table_count\":2"),
+            "expected indexed full join projection to leave both paged tables deferred, got: {json_after}"
         );
     }
 
@@ -12463,6 +13530,67 @@ mod tests {
                     .expect("count child rows")
             ),
             48
+        );
+    }
+
+    #[test]
+    fn paged_row_storage_composite_foreign_key_insert_keeps_tables_deferred() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir
+            .path()
+            .join("paged-row-storage-composite-foreign-key-insert.ddb");
+        let config = DbConfig {
+            paged_row_storage: true,
+            ..DbConfig::default()
+        };
+
+        {
+            let db = Db::open_or_create(&path, config.clone()).expect("open db");
+            db.execute("CREATE TABLE parent (a INTEGER, b INTEGER, body TEXT, PRIMARY KEY(a, b))")
+                .expect("create parent");
+            db.execute(
+                "CREATE TABLE child (id INTEGER PRIMARY KEY, parent_a INTEGER, parent_b INTEGER, body TEXT, \
+                 FOREIGN KEY(parent_a, parent_b) REFERENCES parent(a, b) ON DELETE RESTRICT)",
+            )
+            .expect("create child");
+            let mut txn = db.transaction().expect("begin txn");
+            let insert = txn
+                .prepare("INSERT INTO parent VALUES ($1, $2, $3)")
+                .expect("prepare parent insert");
+            insert
+                .execute_in(
+                    &mut txn,
+                    &[
+                        Value::Int64(1),
+                        Value::Int64(2),
+                        Value::Text("p".repeat(2048)),
+                    ],
+                )
+                .expect("insert parent row");
+            txn.commit().expect("commit seed txn");
+            db.checkpoint().expect("checkpoint");
+        }
+
+        let db = Db::open_or_create(&path, config).expect("reopen db");
+        db.execute("INSERT INTO child VALUES (1, 1, 2, 'child')")
+            .expect("insert child row");
+
+        let json_after = db.inspect_storage_state_json().expect("json after insert");
+        assert!(
+            !json_after.contains("\"loaded_table_count\":2"),
+            "expected composite foreign-key insert to avoid loading both parent and child resident at once, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"deferred_table_count\":1")
+                || json_after.contains("\"deferred_table_count\":2"),
+            "expected at least one table to remain deferred after insert, got: {json_after}"
+        );
+        assert_eq!(
+            scalar_i64(
+                &db.execute("SELECT COUNT(*) FROM child")
+                    .expect("count child rows")
+            ),
+            1
         );
     }
 
@@ -13652,6 +14780,13 @@ mod tests {
             .expect("function projection");
         assert_eq!(scalar_text(&upper_result), "NAME-000");
 
+        let offset_result = db
+            .execute("SELECT n + 1 AS next_n FROM seeded ORDER BY n DESC LIMIT 2 OFFSET 1")
+            .expect("offset arithmetic projection");
+        assert_eq!(offset_result.rows().len(), 2);
+        assert_eq!(offset_result.rows()[0].values(), &[Value::Int64(95)]);
+        assert_eq!(offset_result.rows()[1].values(), &[Value::Int64(94)]);
+
         let json_after_function = db
             .inspect_storage_state_json()
             .expect("json after function projection");
@@ -13666,6 +14801,80 @@ mod tests {
         assert!(
             json_after_function.contains("\"rows_in_memory_count\":0"),
             "expected zero resident rows after function projection, got: {json_after_function}"
+        );
+    }
+
+    #[test]
+    fn paged_row_storage_projection_multi_order_keeps_deferred_table_unloaded() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir
+            .path()
+            .join("paged-row-storage-projection-multi-order.ddb");
+        let config = DbConfig {
+            paged_row_storage: true,
+            ..DbConfig::default()
+        };
+
+        {
+            let db = Db::open_or_create(&path, config.clone()).expect("create db");
+            db.execute(
+                "CREATE TABLE seeded (id INTEGER PRIMARY KEY, grp INTEGER, n INTEGER, body TEXT)",
+            )
+            .expect("create seeded");
+            let large_body = "x".repeat(2048);
+            let mut txn = db.transaction().expect("begin txn");
+            let insert = txn
+                .prepare("INSERT INTO seeded VALUES ($1, $2, $3, $4)")
+                .expect("prepare insert");
+            for (id, grp, n) in [(0_i64, 0_i64, 2_i64), (1, 0, 1), (2, 1, 2), (3, 1, 1)] {
+                insert
+                    .execute_in(
+                        &mut txn,
+                        &[
+                            Value::Int64(id),
+                            Value::Int64(grp),
+                            Value::Int64(n),
+                            Value::Text(large_body.clone()),
+                        ],
+                    )
+                    .expect("insert row");
+            }
+            txn.commit().expect("commit rows");
+            db.checkpoint().expect("checkpoint");
+        }
+
+        let db = Db::open_or_create(&path, config).expect("reopen with paged storage");
+        let result = db
+            .execute("SELECT grp, n FROM seeded ORDER BY grp DESC, n ASC LIMIT 3")
+            .expect("projection multi-order");
+        assert_eq!(result.rows().len(), 3);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[Value::Int64(1), Value::Int64(1)]
+        );
+        assert_eq!(
+            result.rows()[1].values(),
+            &[Value::Int64(1), Value::Int64(2)]
+        );
+        assert_eq!(
+            result.rows()[2].values(),
+            &[Value::Int64(0), Value::Int64(1)]
+        );
+
+        let json_after = db
+            .inspect_storage_state_json()
+            .expect("json after projection multi-order");
+        assert!(
+            json_after.contains("\"loaded_table_count\":0"),
+            "expected paged projection multi-order to avoid materialization, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"deferred_table_count\":1"),
+            "expected paged-backed table to remain deferred after projection multi-order, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"rows_in_memory_count\":0"),
+            "expected zero resident rows after projection multi-order, got: {json_after}"
         );
     }
 
@@ -14147,6 +15356,46 @@ mod tests {
         assert_eq!(
             scalar_i64(&db.execute("SELECT COUNT(*) FROM t").expect("count rows")),
             2
+        );
+    }
+
+    #[test]
+    fn prepared_after_schema_change_in_shared_transaction_uses_current_transaction_schema() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir.path().join("shared-txn-schema-change-prepare.ddb");
+        let db = Db::open_or_create(&path, DbConfig::default()).expect("open db");
+
+        db.begin_transaction().expect("begin transaction");
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            .expect("create table in shared transaction");
+
+        let prepared = db
+            .prepare("INSERT INTO t VALUES ($1)")
+            .expect("prepare insert after schema change");
+
+        {
+            let txn = db.inner.sql_txn.lock().expect("lock sql transaction");
+            let super::SqlTxnSlot::Shared(state) = &*txn else {
+                panic!("expected shared sql transaction state");
+            };
+            assert_eq!(
+                prepared.schema_cookie, state.runtime.catalog.schema_cookie,
+                "prepared insert should capture the shared transaction schema cookie"
+            );
+            assert_eq!(
+                prepared.temp_schema_cookie, state.runtime.temp_schema_cookie,
+                "prepared insert should capture the shared transaction temp schema cookie"
+            );
+        }
+
+        prepared
+            .execute(&[Value::Int64(1)])
+            .expect("execute prepared insert after schema change");
+        db.commit_transaction().expect("commit transaction");
+
+        assert_eq!(
+            scalar_i64(&db.execute("SELECT COUNT(*) FROM t").expect("count rows")),
+            1
         );
     }
 
@@ -14657,6 +15906,13 @@ mod tests {
             .expect("query after defer");
         assert_eq!(scalar_i64(&result), 1);
 
+        let offset_result = db
+            .execute("SELECT n + 1 FROM seeded ORDER BY n DESC LIMIT 2 OFFSET 1")
+            .expect("offset query after defer");
+        assert_eq!(offset_result.rows().len(), 2);
+        assert_eq!(offset_result.rows()[0].values(), &[Value::Int64(49)]);
+        assert_eq!(offset_result.rows()[1].values(), &[Value::Int64(48)]);
+
         let json_after = db.inspect_storage_state_json().expect("json after");
         assert!(
             json_after.contains("\"deferred_table_count\":1"),
@@ -14669,6 +15925,65 @@ mod tests {
         assert!(
             json_after.contains("\"rows_in_memory_count\":0"),
             "expected zero resident rows after deferred expression projection, got: {json_after}"
+        );
+    }
+
+    #[test]
+    fn temp_only_writes_do_not_load_deferred_persisted_tables() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir.path().join("defer-temp-only-writes.ddb");
+
+        {
+            let db = Db::open_or_create(&path, DbConfig::default()).expect("create db");
+            db.execute("CREATE TABLE seeded (id INTEGER PRIMARY KEY, n INTEGER)")
+                .expect("create seeded");
+            for i in 0..50 {
+                db.execute(&format!("INSERT INTO seeded (id, n) VALUES ({i}, {i})"))
+                    .expect("insert");
+            }
+            db.checkpoint().expect("checkpoint before close");
+        }
+
+        let db = Db::open_or_create(&path, DbConfig::default()).expect("reopen with default defer");
+        let json_open = db.inspect_storage_state_json().expect("json at open");
+        assert!(
+            json_open.contains("\"loaded_table_count\":0"),
+            "expected zero loaded tables at open, got: {json_open}"
+        );
+        assert!(
+            json_open.contains("\"deferred_table_count\":1"),
+            "expected one deferred table at open, got: {json_open}"
+        );
+
+        db.execute("CREATE TEMP TABLE temp_data (id INTEGER PRIMARY KEY)")
+            .expect("create temp table");
+        db.execute("INSERT INTO temp_data SELECT 1 UNION ALL SELECT 2")
+            .expect("insert into temp table");
+        db.execute("CREATE TEMP VIEW temp_view AS SELECT id FROM temp_data")
+            .expect("create temp view");
+
+        let temp_count = db
+            .execute("SELECT COUNT(*) FROM temp_data")
+            .expect("count temp rows");
+        assert_eq!(scalar_i64(&temp_count), 2);
+        let temp_view_count = db
+            .execute("SELECT COUNT(*) FROM temp_view")
+            .expect("count temp view rows");
+        assert_eq!(scalar_i64(&temp_view_count), 2);
+
+        db.execute("DROP VIEW temp_view").expect("drop temp view");
+        db.execute("DROP TABLE temp_data").expect("drop temp table");
+
+        let json_after = db
+            .inspect_storage_state_json()
+            .expect("json after temp writes");
+        assert!(
+            json_after.contains("\"loaded_table_count\":0"),
+            "expected temp-only DDL and writes to avoid loading persisted tables, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"deferred_table_count\":1"),
+            "expected deferred persisted table to remain deferred after temp-only DDL and writes, got: {json_after}"
         );
     }
 
@@ -15087,6 +16402,50 @@ mod tests {
     }
 
     #[test]
+    fn expression_filtered_column_projection_keeps_deferred_table_unloaded() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir
+            .path()
+            .join("deferred-expression-filtered-column-projection.ddb");
+
+        {
+            let db = Db::open_or_create(&path, DbConfig::default()).expect("create db");
+            db.execute("CREATE TABLE seeded (id INTEGER PRIMARY KEY, n INTEGER, m INTEGER)")
+                .expect("create seeded");
+            for (id, n, m) in [(0, 1, 1), (1, 2, 4), (2, 3, 1), (3, 1, 0)] {
+                db.execute(&format!(
+                    "INSERT INTO seeded (id, n, m) VALUES ({id}, {n}, {m})"
+                ))
+                .expect("insert");
+            }
+            db.checkpoint().expect("checkpoint before close");
+        }
+
+        let db = Db::open_or_create(&path, DbConfig::default()).expect("reopen with defer");
+        let result = db
+            .execute("SELECT n FROM seeded WHERE n + m >= 5")
+            .expect("expression filtered column projection");
+        assert_eq!(result.rows().len(), 1);
+        assert_eq!(result.rows()[0].values(), &[Value::Int64(2)]);
+
+        let json_after = db
+            .inspect_storage_state_json()
+            .expect("json after expression filtered column projection");
+        assert!(
+            json_after.contains("\"loaded_table_count\":0"),
+            "expected expression filtered column projection to avoid resident materialization, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"deferred_table_count\":1"),
+            "expected deferred table to remain deferred after expression filtered column projection, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"rows_in_memory_count\":0"),
+            "expected zero resident rows after expression filtered column projection, got: {json_after}"
+        );
+    }
+
+    #[test]
     fn ordered_filtered_projection_with_offset_keeps_deferred_table_unloaded() {
         let tempdir = TempDir::new().expect("tempdir");
         let path = tempdir
@@ -15264,6 +16623,53 @@ mod tests {
     }
 
     #[test]
+    fn distinct_expression_filtered_column_projection_keeps_deferred_table_unloaded() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir
+            .path()
+            .join("deferred-distinct-expression-filtered-column-projection.ddb");
+
+        {
+            let db = Db::open_or_create(&path, DbConfig::default()).expect("create db");
+            db.execute(
+                "CREATE TABLE seeded (id INTEGER PRIMARY KEY, grp INTEGER, n INTEGER, m INTEGER)",
+            )
+            .expect("create seeded");
+            for (id, grp, n, m) in [(0, 0, 1, 1), (1, 0, 2, 4), (2, 1, 3, 1), (3, 1, 2, 3)] {
+                db.execute(&format!(
+                    "INSERT INTO seeded (id, grp, n, m) VALUES ({id}, {grp}, {n}, {m})"
+                ))
+                .expect("insert");
+            }
+            db.checkpoint().expect("checkpoint before close");
+        }
+
+        let db = Db::open_or_create(&path, DbConfig::default()).expect("reopen with defer");
+        let result = db
+            .execute("SELECT DISTINCT grp FROM seeded WHERE n + m >= 5 ORDER BY grp ASC")
+            .expect("distinct expression filtered column projection");
+        assert_eq!(result.rows().len(), 2);
+        assert_eq!(result.rows()[0].values(), &[Value::Int64(0)]);
+        assert_eq!(result.rows()[1].values(), &[Value::Int64(1)]);
+
+        let json_after = db
+            .inspect_storage_state_json()
+            .expect("json after distinct expression filtered column projection");
+        assert!(
+            json_after.contains("\"loaded_table_count\":0"),
+            "expected distinct expression filtered column projection to avoid resident materialization, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"deferred_table_count\":1"),
+            "expected deferred table to remain deferred after distinct expression filtered column projection, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"rows_in_memory_count\":0"),
+            "expected zero resident rows after distinct expression filtered column projection, got: {json_after}"
+        );
+    }
+
+    #[test]
     fn ordered_distinct_filtered_projection_keeps_deferred_table_unloaded() {
         let tempdir = TempDir::new().expect("tempdir");
         let path = tempdir
@@ -15308,6 +16714,76 @@ mod tests {
         assert!(
             json_after.contains("\"rows_in_memory_count\":0"),
             "expected zero resident rows after ordered distinct filtered projection, got: {json_after}"
+        );
+    }
+
+    #[test]
+    fn ordered_distinct_filtered_projection_multi_order_keeps_deferred_table_unloaded() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir
+            .path()
+            .join("deferred-ordered-distinct-filtered-projection-multi-order.ddb");
+
+        {
+            let db = Db::open_or_create(&path, DbConfig::default()).expect("create db");
+            db.execute("CREATE TABLE seeded (id INTEGER PRIMARY KEY, grp INTEGER, n INTEGER)")
+                .expect("create seeded");
+            for (id, grp, n) in [
+                (0, 0, 10),
+                (1, 0, 11),
+                (2, 1, 10),
+                (3, 1, 11),
+                (4, 2, 10),
+                (5, 2, 11),
+            ] {
+                db.execute(&format!(
+                    "INSERT INTO seeded (id, grp, n) VALUES ({id}, {grp}, {n})"
+                ))
+                .expect("insert");
+            }
+            db.checkpoint().expect("checkpoint before close");
+        }
+
+        let db = Db::open_or_create(&path, DbConfig::default()).expect("reopen with defer");
+        let result = db
+            .execute(
+                "SELECT DISTINCT grp, n FROM seeded \
+                 WHERE n >= 10 AND n <= 11 \
+                 ORDER BY grp DESC, n ASC LIMIT 4 OFFSET 1",
+            )
+            .expect("ordered distinct filtered projection multi-order");
+        assert_eq!(result.rows().len(), 4);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[Value::Int64(2), Value::Int64(11)]
+        );
+        assert_eq!(
+            result.rows()[1].values(),
+            &[Value::Int64(1), Value::Int64(10)]
+        );
+        assert_eq!(
+            result.rows()[2].values(),
+            &[Value::Int64(1), Value::Int64(11)]
+        );
+        assert_eq!(
+            result.rows()[3].values(),
+            &[Value::Int64(0), Value::Int64(10)]
+        );
+
+        let json_after = db
+            .inspect_storage_state_json()
+            .expect("json after ordered distinct filtered projection multi-order");
+        assert!(
+            json_after.contains("\"loaded_table_count\":0"),
+            "expected ordered distinct filtered projection multi-order to avoid resident materialization, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"deferred_table_count\":1"),
+            "expected deferred table to remain deferred after ordered distinct filtered projection multi-order, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"rows_in_memory_count\":0"),
+            "expected zero resident rows after ordered distinct filtered projection multi-order, got: {json_after}"
         );
     }
 
@@ -16153,6 +17629,60 @@ mod tests {
     }
 
     #[test]
+    fn simple_grouped_multiple_count_rows_keep_deferred_table_unloaded() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir
+            .path()
+            .join("deferred-grouped-multiple-count-rows.ddb");
+
+        {
+            let db = Db::open_or_create(&path, DbConfig::default()).expect("create db");
+            db.execute("CREATE TABLE seeded (id INTEGER PRIMARY KEY, grp INTEGER)")
+                .expect("create seeded");
+            for (id, grp) in [(0, 0), (1, 0), (2, 1)] {
+                db.execute(&format!(
+                    "INSERT INTO seeded (id, grp) VALUES ({id}, {grp})"
+                ))
+                .expect("insert");
+            }
+            db.checkpoint().expect("checkpoint before close");
+        }
+
+        let db = Db::open_or_create(&path, DbConfig::default()).expect("reopen with defer");
+        let result = db
+            .execute(
+                "SELECT grp, COUNT(*) AS c, COUNT(*) + 1 AS c_plus_one \
+                 FROM seeded GROUP BY grp ORDER BY grp ASC",
+            )
+            .expect("grouped repeated count");
+        assert_eq!(result.rows().len(), 2);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[Value::Int64(0), Value::Int64(2), Value::Int64(3)]
+        );
+        assert_eq!(
+            result.rows()[1].values(),
+            &[Value::Int64(1), Value::Int64(1), Value::Int64(2)]
+        );
+
+        let json_after = db
+            .inspect_storage_state_json()
+            .expect("json after grouped repeated count");
+        assert!(
+            json_after.contains("\"loaded_table_count\":0"),
+            "expected grouped repeated count to avoid resident materialization, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"deferred_table_count\":1"),
+            "expected deferred table to remain deferred after grouped repeated count, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"rows_in_memory_count\":0"),
+            "expected zero resident rows after grouped repeated count, got: {json_after}"
+        );
+    }
+
+    #[test]
     fn simple_grouped_count_having_keeps_deferred_table_unloaded() {
         let tempdir = TempDir::new().expect("tempdir");
         let path = tempdir.path().join("deferred-grouped-count-having.ddb");
@@ -16197,6 +17727,337 @@ mod tests {
         assert!(
             json_after.contains("\"rows_in_memory_count\":0"),
             "expected zero resident rows after grouped count with having, got: {json_after}"
+        );
+    }
+
+    #[test]
+    fn simple_grouped_count_expr_keeps_deferred_table_unloaded() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir.path().join("deferred-grouped-count-expr.ddb");
+
+        {
+            let db = Db::open_or_create(&path, DbConfig::default()).expect("create db");
+            db.execute("CREATE TABLE seeded (id INTEGER PRIMARY KEY, grp INTEGER, n INTEGER)")
+                .expect("create seeded");
+            for (id, grp, n) in [(0, 0, "1"), (1, 0, "NULL"), (2, 1, "5"), (3, 1, "7")] {
+                db.execute(&format!(
+                    "INSERT INTO seeded (id, grp, n) VALUES ({id}, {grp}, {n})"
+                ))
+                .expect("insert");
+            }
+            db.checkpoint().expect("checkpoint before close");
+        }
+
+        let db = Db::open_or_create(&path, DbConfig::default()).expect("reopen with defer");
+        let result = db
+            .execute(
+                "SELECT grp, COUNT(n) AS present, COUNT(n + 1) AS shifted \
+                 FROM seeded GROUP BY grp HAVING COUNT(n) >= 1 \
+                 ORDER BY present DESC, grp ASC",
+            )
+            .expect("grouped count expr");
+        assert_eq!(result.rows().len(), 2);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[Value::Int64(1), Value::Int64(2), Value::Int64(2)]
+        );
+        assert_eq!(
+            result.rows()[1].values(),
+            &[Value::Int64(0), Value::Int64(1), Value::Int64(1)]
+        );
+
+        let json_after = db
+            .inspect_storage_state_json()
+            .expect("json after grouped count expr");
+        assert!(
+            json_after.contains("\"loaded_table_count\":0"),
+            "expected grouped count expr to avoid resident materialization, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"deferred_table_count\":1"),
+            "expected deferred table to remain deferred after grouped count expr, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"rows_in_memory_count\":0"),
+            "expected zero resident rows after grouped count expr, got: {json_after}"
+        );
+    }
+
+    #[test]
+    fn simple_grouped_count_distinct_keeps_deferred_table_unloaded() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir.path().join("deferred-grouped-count-distinct.ddb");
+
+        {
+            let db = Db::open_or_create(&path, DbConfig::default()).expect("create db");
+            db.execute("CREATE TABLE seeded (id INTEGER PRIMARY KEY, grp INTEGER, n INTEGER)")
+                .expect("create seeded");
+            for (id, grp, n) in [
+                (0, 0, "1"),
+                (1, 0, "1"),
+                (2, 0, "NULL"),
+                (3, 1, "2"),
+                (4, 1, "3"),
+                (5, 1, "3"),
+            ] {
+                db.execute(&format!(
+                    "INSERT INTO seeded (id, grp, n) VALUES ({id}, {grp}, {n})"
+                ))
+                .expect("insert");
+            }
+            db.checkpoint().expect("checkpoint before close");
+        }
+
+        let db = Db::open_or_create(&path, DbConfig::default()).expect("reopen with defer");
+        let result = db
+            .execute(
+                "SELECT grp, COUNT(DISTINCT n) AS uniq, COUNT(DISTINCT n + 1) AS shifted \
+                 FROM seeded GROUP BY grp HAVING COUNT(DISTINCT n) >= 1 \
+                 ORDER BY uniq DESC, grp ASC",
+            )
+            .expect("grouped count distinct");
+        assert_eq!(result.rows().len(), 2);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[Value::Int64(1), Value::Int64(2), Value::Int64(2)]
+        );
+        assert_eq!(
+            result.rows()[1].values(),
+            &[Value::Int64(0), Value::Int64(1), Value::Int64(1)]
+        );
+
+        let json_after = db
+            .inspect_storage_state_json()
+            .expect("json after grouped count distinct");
+        assert!(
+            json_after.contains("\"loaded_table_count\":0"),
+            "expected grouped count distinct to avoid resident materialization, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"deferred_table_count\":1"),
+            "expected deferred table to remain deferred after grouped count distinct, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"rows_in_memory_count\":0"),
+            "expected zero resident rows after grouped count distinct, got: {json_after}"
+        );
+    }
+
+    #[test]
+    fn simple_grouped_numeric_distinct_keeps_deferred_table_unloaded() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir.path().join("deferred-grouped-numeric-distinct.ddb");
+
+        {
+            let db = Db::open_or_create(&path, DbConfig::default()).expect("create db");
+            db.execute("CREATE TABLE seeded (id INTEGER PRIMARY KEY, grp INTEGER, n INTEGER)")
+                .expect("create seeded");
+            for (id, grp, n) in [
+                (0, 0, 1),
+                (1, 0, 1),
+                (2, 0, 2),
+                (3, 1, 2),
+                (4, 1, 3),
+                (5, 1, 3),
+            ] {
+                db.execute(&format!(
+                    "INSERT INTO seeded (id, grp, n) VALUES ({id}, {grp}, {n})"
+                ))
+                .expect("insert");
+            }
+            db.checkpoint().expect("checkpoint before close");
+        }
+
+        let db = Db::open_or_create(&path, DbConfig::default()).expect("reopen with defer");
+        let result = db
+            .execute(
+                "SELECT grp, SUM(DISTINCT n) AS total, AVG(DISTINCT n + 1) AS shifted_avg \
+                 FROM seeded GROUP BY grp HAVING SUM(DISTINCT n) >= 3 \
+                 ORDER BY total DESC, grp ASC",
+            )
+            .expect("grouped numeric distinct");
+        assert_eq!(result.rows().len(), 2);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[Value::Int64(1), Value::Int64(5), Value::Float64(3.5)]
+        );
+        assert_eq!(
+            result.rows()[1].values(),
+            &[Value::Int64(0), Value::Int64(3), Value::Float64(2.5)]
+        );
+
+        let json_after = db
+            .inspect_storage_state_json()
+            .expect("json after grouped numeric distinct");
+        assert!(
+            json_after.contains("\"loaded_table_count\":0"),
+            "expected grouped numeric distinct to avoid resident materialization, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"deferred_table_count\":1"),
+            "expected deferred table to remain deferred after grouped numeric distinct, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"rows_in_memory_count\":0"),
+            "expected zero resident rows after grouped numeric distinct, got: {json_after}"
+        );
+    }
+
+    #[test]
+    fn simple_grouped_having_only_aggregate_keeps_deferred_table_unloaded() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir
+            .path()
+            .join("deferred-grouped-having-only-aggregate.ddb");
+
+        {
+            let db = Db::open_or_create(&path, DbConfig::default()).expect("create db");
+            db.execute("CREATE TABLE seeded (id INTEGER PRIMARY KEY, grp INTEGER, n INTEGER)")
+                .expect("create seeded");
+            for (id, grp, n) in [(0, 0, 1), (1, 0, 4), (2, 1, 1)] {
+                db.execute(&format!(
+                    "INSERT INTO seeded (id, grp, n) VALUES ({id}, {grp}, {n})"
+                ))
+                .expect("insert");
+            }
+            db.checkpoint().expect("checkpoint before close");
+        }
+
+        let db = Db::open_or_create(&path, DbConfig::default()).expect("reopen with defer");
+        let result = db
+            .execute(
+                "SELECT grp, COUNT(*) AS c FROM seeded \
+                 GROUP BY grp HAVING SUM(n) >= 3 ORDER BY grp ASC",
+            )
+            .expect("grouped having-only aggregate");
+        assert_eq!(result.rows().len(), 1);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[Value::Int64(0), Value::Int64(2)]
+        );
+
+        let json_after = db
+            .inspect_storage_state_json()
+            .expect("json after grouped having-only aggregate");
+        assert!(
+            json_after.contains("\"loaded_table_count\":0"),
+            "expected grouped having-only aggregate to avoid resident materialization, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"deferred_table_count\":1"),
+            "expected deferred table to remain deferred after grouped having-only aggregate, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"rows_in_memory_count\":0"),
+            "expected zero resident rows after grouped having-only aggregate, got: {json_after}"
+        );
+    }
+
+    #[test]
+    fn simple_grouped_count_with_expression_filter_keeps_deferred_table_unloaded() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir
+            .path()
+            .join("deferred-grouped-count-expression-filter.ddb");
+
+        {
+            let db = Db::open_or_create(&path, DbConfig::default()).expect("create db");
+            db.execute(
+                "CREATE TABLE seeded (id INTEGER PRIMARY KEY, grp INTEGER, n INTEGER, m INTEGER)",
+            )
+            .expect("create seeded");
+            for (id, grp, n, m) in [(0, 0, 1, 1), (1, 0, 2, 4), (2, 1, 3, 1), (3, 1, 1, 0)] {
+                db.execute(&format!(
+                    "INSERT INTO seeded (id, grp, n, m) VALUES ({id}, {grp}, {n}, {m})"
+                ))
+                .expect("insert");
+            }
+            db.checkpoint().expect("checkpoint before close");
+        }
+
+        let db = Db::open_or_create(&path, DbConfig::default()).expect("reopen with defer");
+        let result = db
+            .execute(
+                "SELECT grp, COUNT(*) AS c FROM seeded \
+                 WHERE n + m >= 5 GROUP BY grp ORDER BY grp ASC",
+            )
+            .expect("grouped count with expression filter");
+        assert_eq!(result.rows().len(), 1);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[Value::Int64(0), Value::Int64(1)]
+        );
+
+        let json_after = db
+            .inspect_storage_state_json()
+            .expect("json after grouped count with expression filter");
+        assert!(
+            json_after.contains("\"loaded_table_count\":0"),
+            "expected grouped count with expression filter to avoid resident materialization, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"deferred_table_count\":1"),
+            "expected deferred table to remain deferred after grouped count with expression filter, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"rows_in_memory_count\":0"),
+            "expected zero resident rows after grouped count with expression filter, got: {json_after}"
+        );
+    }
+
+    #[test]
+    fn simple_grouped_numeric_with_expression_filter_keeps_deferred_table_unloaded() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir
+            .path()
+            .join("deferred-grouped-numeric-expression-filter.ddb");
+
+        {
+            let db = Db::open_or_create(&path, DbConfig::default()).expect("create db");
+            db.execute(
+                "CREATE TABLE seeded (id INTEGER PRIMARY KEY, grp INTEGER, n INTEGER, m INTEGER)",
+            )
+            .expect("create seeded");
+            for (id, grp, n, m) in [(0, 0, 1, 1), (1, 0, 2, 4), (2, 1, 3, 1), (3, 1, 1, 0)] {
+                db.execute(&format!(
+                    "INSERT INTO seeded (id, grp, n, m) VALUES ({id}, {grp}, {n}, {m})"
+                ))
+                .expect("insert");
+            }
+            db.checkpoint().expect("checkpoint before close");
+        }
+
+        let db = Db::open_or_create(&path, DbConfig::default()).expect("reopen with defer");
+        let result = db
+            .execute(
+                "SELECT grp, SUM(n) AS total FROM seeded \
+                 WHERE n + m >= 4 GROUP BY grp ORDER BY grp ASC",
+            )
+            .expect("grouped numeric with expression filter");
+        assert_eq!(result.rows().len(), 2);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[Value::Int64(0), Value::Int64(2)]
+        );
+        assert_eq!(
+            result.rows()[1].values(),
+            &[Value::Int64(1), Value::Int64(3)]
+        );
+
+        let json_after = db
+            .inspect_storage_state_json()
+            .expect("json after grouped numeric with expression filter");
+        assert!(
+            json_after.contains("\"loaded_table_count\":0"),
+            "expected grouped numeric with expression filter to avoid resident materialization, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"deferred_table_count\":1"),
+            "expected deferred table to remain deferred after grouped numeric with expression filter, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"rows_in_memory_count\":0"),
+            "expected zero resident rows after grouped numeric with expression filter, got: {json_after}"
         );
     }
 

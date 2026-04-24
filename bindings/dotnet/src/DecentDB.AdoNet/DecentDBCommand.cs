@@ -245,41 +245,53 @@ namespace DecentDB.AdoNet
             var usingPreparedStatementCache = false;
             try
             {
-                if (GetSplitStatements().Count <= 1)
+                for (var attempt = 0; ; attempt++)
                 {
-                    stmt = EnsurePreparedStatement(sql, resetForExecution: true);
-                    usingPreparedStatementCache = true;
-                }
-                else
-                {
-                    stmt = db.Prepare(sql);
-                }
-
-                foreach (var kvp in paramMap)
-                {
-                    BindParameter(stmt, kvp.Key, kvp.Value);
-                }
-
-                _statement = stmt;
-
-                var stepResult = stmt.Step();
-                if (stepResult < 0)
-                {
-                    _statement = null;
-
-                    if (usingPreparedStatementCache)
+                    stmt = null;
+                    usingPreparedStatementCache = false;
+                    if (GetSplitStatements().Count <= 1)
                     {
-                        InvalidatePreparedStatement(discardFromConnectionCache: true);
+                        stmt = EnsurePreparedStatement(sql, resetForExecution: true);
+                        usingPreparedStatementCache = true;
                     }
                     else
                     {
-                        stmt.Dispose();
+                        stmt = db.Prepare(sql);
                     }
 
-                    throw new DecentDBException(stepResult, db.LastErrorMessage, sql);
-                }
+                    foreach (var kvp in paramMap)
+                    {
+                        BindParameter(stmt, kvp.Key, kvp.Value);
+                    }
 
-                return new DecentDBDataReader(this, stmt, stepResult, observation);
+                    _statement = stmt;
+
+                    var stepResult = stmt.Step();
+                    if (stepResult < 0)
+                    {
+                        _statement = null;
+
+                        if (usingPreparedStatementCache)
+                        {
+                            InvalidatePreparedStatement(discardFromConnectionCache: true);
+                        }
+                        else
+                        {
+                            stmt.Dispose();
+                        }
+
+                        var ex = new DecentDBException(stepResult, db.LastErrorMessage, sql);
+                        if (attempt == 0 && IsSchemaChangedPreparedStatementError(ex))
+                        {
+                            _connection.ClearPreparedStatementCacheForSchemaChange();
+                            continue;
+                        }
+
+                        throw ex;
+                    }
+
+                    return new DecentDBDataReader(this, stmt, stepResult, observation);
+                }
             }
             catch (Exception ex)
             {
@@ -728,36 +740,58 @@ namespace DecentDB.AdoNet
 
             try
             {
-                var stmt = EnsurePreparedStatement(sql, resetForExecution: true);
-
-                foreach (var kvp in paramMap)
+                for (var attempt = 0; ; attempt++)
                 {
-                    BindParameter(stmt, kvp.Key, kvp.Value);
+                    var stmt = EnsurePreparedStatement(sql, resetForExecution: false);
+
+                    int rowsAffected;
+                    try
+                    {
+                        if (!TryExecuteTypedSingleNonQuery(stmt, paramMap, out rowsAffected))
+                        {
+                            stmt.Reset().ClearBindings();
+                            foreach (var kvp in paramMap)
+                            {
+                                BindParameter(stmt, kvp.Key, kvp.Value);
+                            }
+
+                            var stepResult = stmt.Step();
+                            while (stepResult == 1)
+                            {
+                                stepResult = stmt.Step();
+                            }
+
+                            if (stepResult < 0)
+                            {
+                                throw new DecentDBException(
+                                    stepResult,
+                                    _connection.GetNativeDb().LastErrorMessage,
+                                    sql);
+                            }
+
+                            rowsAffected = (int)stmt.RowsAffected;
+                            stmt.Reset().ClearBindings();
+                        }
+                    }
+                    catch (DecentDBException ex)
+                    {
+                        InvalidatePreparedStatement(discardFromConnectionCache: true);
+                        if (attempt == 0 && IsSchemaChangedPreparedStatementError(ex))
+                        {
+                            _connection.ClearPreparedStatementCacheForSchemaChange();
+                            continue;
+                        }
+
+                        throw;
+                    }
+
+                    if (observation != null)
+                    {
+                        _connection.CompleteSqlObservation(observation, rowsAffected, exception: null);
+                    }
+
+                    return rowsAffected;
                 }
-
-                var stepResult = stmt.Step();
-                while (stepResult == 1)
-                {
-                    stepResult = stmt.Step();
-                }
-
-                if (stepResult < 0)
-                {
-                    var ex = new DecentDBException(stepResult,
-                        _connection.GetNativeDb().LastErrorMessage, sql);
-                    InvalidatePreparedStatement(discardFromConnectionCache: true);
-                    throw ex;
-                }
-
-                var rowsAffected = (int)stmt.RowsAffected;
-                stmt.Reset().ClearBindings();
-
-                if (observation != null)
-                {
-                    _connection.CompleteSqlObservation(observation, rowsAffected, exception: null);
-                }
-
-                return rowsAffected;
             }
             catch (Exception ex)
             {
@@ -770,6 +804,170 @@ namespace DecentDB.AdoNet
 
                 throw;
             }
+        }
+
+        private bool TryExecuteTypedSingleNonQuery(
+            PreparedStatement stmt,
+            Dictionary<int, DbParameter> paramMap,
+            out int rowsAffected)
+        {
+            rowsAffected = 0;
+            if (paramMap.Count == 0 || paramMap.Count > 8)
+            {
+                return false;
+            }
+
+            Span<byte> signatureUtf8 = stackalloc byte[paramMap.Count + 1];
+            Span<long> i64Values = stackalloc long[paramMap.Count];
+            Span<double> f64Values = stackalloc double[paramMap.Count];
+            byte[]? text0 = null;
+            byte[]? text1 = null;
+            var i64Count = 0;
+            var f64Count = 0;
+            var textCount = 0;
+
+            for (var ordinal = 1; ordinal <= paramMap.Count; ordinal++)
+            {
+                if (!paramMap.TryGetValue(ordinal, out var parameter))
+                {
+                    return false;
+                }
+
+                var value = parameter.Value;
+                if (value == null || value == DBNull.Value)
+                {
+                    return false;
+                }
+
+                if (TryGetOptimizedInt64(parameter, value, out var intValue))
+                {
+                    signatureUtf8[ordinal - 1] = (byte)'i';
+                    i64Values[i64Count++] = intValue;
+                    continue;
+                }
+
+                if (TryGetOptimizedFloat64(value, out var floatValue))
+                {
+                    signatureUtf8[ordinal - 1] = (byte)'f';
+                    f64Values[f64Count++] = floatValue;
+                    continue;
+                }
+
+                if (TryGetOptimizedTextBytes(parameter, value, out var textBytes))
+                {
+                    signatureUtf8[ordinal - 1] = (byte)'t';
+                    if (textCount == 0)
+                    {
+                        text0 = textBytes;
+                    }
+                    else if (textCount == 1)
+                    {
+                        text1 = textBytes;
+                    }
+                    else
+                    {
+                        return false;
+                    }
+
+                    textCount++;
+                    continue;
+                }
+
+                return false;
+            }
+
+            signatureUtf8[paramMap.Count] = 0;
+            rowsAffected = checked((int)stmt.ExecuteBatchTypedOneRow(
+                signatureUtf8,
+                i64Values[..i64Count],
+                f64Values[..f64Count],
+                text0,
+                text1,
+                textCount));
+            return true;
+        }
+
+        private static bool TryGetOptimizedInt64(
+            DbParameter parameter,
+            object value,
+            out long result)
+        {
+            result = default;
+            if (parameter.DbType == DbType.Guid)
+            {
+                return false;
+            }
+
+            switch (value)
+            {
+                case long int64:
+                    result = int64;
+                    return true;
+                case int int32:
+                    result = int32;
+                    return true;
+                case short int16:
+                    result = int16;
+                    return true;
+                case sbyte int8:
+                    result = int8;
+                    return true;
+                case byte uint8:
+                    result = uint8;
+                    return true;
+                case uint uint32:
+                    result = uint32;
+                    return true;
+                case ushort uint16:
+                    result = uint16;
+                    return true;
+                case ulong uint64 when uint64 <= long.MaxValue:
+                    result = (long)uint64;
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        private static bool TryGetOptimizedFloat64(object value, out double result)
+        {
+            switch (value)
+            {
+                case double float64:
+                    result = float64;
+                    return true;
+                case float float32:
+                    result = float32;
+                    return true;
+                default:
+                    result = default;
+                    return false;
+            }
+        }
+
+        private static bool TryGetOptimizedTextBytes(
+            DbParameter parameter,
+            object value,
+            out byte[]? utf8Bytes)
+        {
+            utf8Bytes = null;
+            if (value is not string text)
+            {
+                return false;
+            }
+
+            if (parameter.Size > 0)
+            {
+                var byteCount = Encoding.UTF8.GetByteCount(text);
+                if (byteCount > parameter.Size)
+                {
+                    throw new ArgumentException(
+                        $"Value exceeds Size({parameter.Size}) bytes (UTF-8). Actual: {byteCount} bytes.");
+                }
+            }
+
+            utf8Bytes = Encoding.UTF8.GetBytes(text);
+            return true;
         }
 
         private bool TryExecutePragmaNonQuery(out int rowsAffected)
@@ -992,6 +1190,14 @@ namespace DecentDB.AdoNet
             _preparedSql = null;
             _preparedDb = null;
             _preparedStatementFromConnectionCache = false;
+        }
+
+        private static bool IsSchemaChangedPreparedStatementError(DecentDBException ex)
+        {
+            return ex.ErrorCode == -5 &&
+                ex.Message.Contains(
+                    "prepared statement is no longer valid because the schema changed",
+                    StringComparison.Ordinal);
         }
 
         protected override void Dispose(bool disposing)

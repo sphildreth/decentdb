@@ -65,6 +65,57 @@ public sealed class DecentDBCommandCoverageTests : IDisposable
     }
 
     [Fact]
+    public void PreparedNonQuery_RetriesOnceAfterSchemaChange()
+    {
+        using var connection = OpenConnection();
+        Execute(connection, "CREATE TABLE cmd_cov_retry_write (id INTEGER PRIMARY KEY)");
+
+        using var insert = connection.CreateCommand();
+        insert.CommandText = "INSERT INTO cmd_cov_retry_write (id) VALUES (@id)";
+        insert.Parameters.Add(new DecentDBParameter("@id", 1));
+        insert.Prepare();
+
+        Execute(connection, "CREATE TABLE cmd_cov_retry_write_schema_bump (id INTEGER PRIMARY KEY)");
+
+        Assert.Equal(1, insert.ExecuteNonQuery());
+
+        using var verify = connection.CreateCommand();
+        verify.CommandText = "SELECT COUNT(*) FROM cmd_cov_retry_write";
+        Assert.Equal(1L, verify.ExecuteScalar());
+    }
+
+    [Fact]
+    public void PreparedReader_RetriesOnceAfterSchemaChange()
+    {
+        using var connection = OpenConnection();
+        Execute(connection, "CREATE TABLE cmd_cov_retry_read (id INTEGER PRIMARY KEY); INSERT INTO cmd_cov_retry_read (id) VALUES (41)");
+
+        using var select = connection.CreateCommand();
+        select.CommandText = "SELECT id + 1 FROM cmd_cov_retry_read";
+        select.Prepare();
+
+        Execute(connection, "CREATE TABLE cmd_cov_retry_read_schema_bump (id INTEGER PRIMARY KEY)");
+
+        Assert.Equal(42L, select.ExecuteScalar());
+    }
+
+    [Fact]
+    public void TransactionalSchemaChange_AllowsFollowupInsertOnSameConnection()
+    {
+        using var connection = OpenConnection();
+        using var transaction = connection.BeginTransaction();
+
+        Execute(connection, "CREATE TABLE cmd_cov_tx_schema (id INTEGER PRIMARY KEY)");
+
+        using var insert = connection.CreateCommand();
+        insert.Transaction = transaction;
+        insert.CommandText = "INSERT INTO cmd_cov_tx_schema (id) VALUES (1)";
+        Assert.Equal(1, insert.ExecuteNonQuery());
+
+        transaction.Commit();
+    }
+
+    [Fact]
     public void BindParameter_GuidDbTypeVariants_AreHandled()
     {
         using var connection = OpenConnection();

@@ -361,7 +361,7 @@ mod tests {
             .insert("x".to_string(), TableData::default().into());
         runtime2.mark_table_append_dirty("x");
         assert!(runtime2.append_only_dirty_tables.contains("x"));
-        runtime2.mark_table_row_dirty("x", 3);
+        runtime2.mark_table_row_dirty("x", 3, 30, &[Value::Int64(30)]);
         // append-only should have been escalated and not converted to row-update
         assert!(!runtime2.append_only_dirty_tables.contains("x"));
         assert!(!runtime2.row_update_dirty.contains_key("x"));
@@ -591,7 +591,7 @@ mod tests {
         v.name = "v".to_string();
         runtime.catalog_mut().tables.insert("v".to_string(), v);
 
-        runtime.mark_table_row_dirty("t", 3);
+        runtime.mark_table_row_dirty("t", 3, 30, &[Value::Int64(30)]);
         assert!(runtime.row_update_dirty.contains_key("t"));
         runtime.mark_table_row_deleted("t", 7);
         assert!(!runtime.row_update_dirty.contains_key("t"));
@@ -599,7 +599,7 @@ mod tests {
 
         // If a table is already fully dirty (and not append-only) then marking a row dirty is a no-op
         runtime.dirty_tables.insert("w".to_string());
-        runtime.mark_table_row_dirty("w", 5);
+        runtime.mark_table_row_dirty("w", 5, 50, &[Value::Int64(50)]);
         assert!(!runtime.row_update_dirty.contains_key("w"));
 
         // Append-only dirty on a fresh table
@@ -610,7 +610,7 @@ mod tests {
 
         // Now test escalation when append-only present
         runtime.append_only_dirty_tables.insert("v".to_string());
-        runtime.mark_table_row_dirty("v", 1);
+        runtime.mark_table_row_dirty("v", 1, 10, &[Value::Int64(10)]);
         assert!(!runtime.append_only_dirty_tables.contains("v"));
 
         runtime.mark_table_row_deleted("v", 9);
