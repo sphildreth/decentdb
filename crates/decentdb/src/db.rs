@@ -18563,4 +18563,233 @@ mod tests {
             "expected logs to be deferred again after mixed aggregate query, got: {json_after}"
         );
     }
+
+    /// D-E2: Reopen-time INNER JOIN on paged tables stays deferred.
+    #[test]
+    fn paged_row_storage_inner_join_after_reopen_stays_deferred() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir
+            .path()
+            .join("paged-row-storage-inner-join-reopen.ddb");
+        let config = DbConfig {
+            paged_row_storage: true,
+            ..DbConfig::default()
+        };
+
+        {
+            let db = Db::open_or_create(&path, config.clone()).expect("open db");
+            db.execute("CREATE TABLE authors (id INTEGER PRIMARY KEY, name TEXT)")
+                .expect("create authors");
+            db.execute(
+                "CREATE TABLE books (id INTEGER PRIMARY KEY, author_id INTEGER, title TEXT)",
+            )
+            .expect("create books");
+            for i in 0_i64..50_i64 {
+                db.execute(&format!(
+                    "INSERT INTO authors VALUES ({}, 'author {}')",
+                    i + 1,
+                    i
+                ))
+                .expect("insert author");
+            }
+            for i in 0_i64..200_i64 {
+                db.execute(&format!(
+                    "INSERT INTO books VALUES ({}, {}, 'book {}')",
+                    i + 1,
+                    (i % 50) + 1,
+                    i
+                ))
+                .expect("insert book");
+            }
+            db.checkpoint().expect("checkpoint");
+        }
+
+        let db = Db::open_or_create(&path, config).expect("reopen db");
+
+        let result = db
+            .execute(
+                "SELECT a.name, b.title FROM authors a INNER JOIN books b \
+                 ON a.id = b.author_id ORDER BY a.name, b.title",
+            )
+            .expect("inner join after reopen");
+        assert_eq!(result.rows().len(), 200);
+
+        let json_after = db.inspect_storage_state_json().expect("json after query");
+        assert!(
+            json_after.contains("\"loaded_table_count\":0"),
+            "expected inner join to re-defer tables after commit, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"deferred_table_count\":2"),
+            "expected both tables deferred after inner join, got: {json_after}"
+        );
+    }
+
+    /// D-E2: Reopen-time LEFT JOIN on paged tables stays deferred.
+    #[test]
+    fn paged_row_storage_left_join_after_reopen_stays_deferred() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir
+            .path()
+            .join("paged-row-storage-left-join-reopen.ddb");
+        let config = DbConfig {
+            paged_row_storage: true,
+            ..DbConfig::default()
+        };
+
+        {
+            let db = Db::open_or_create(&path, config.clone()).expect("open db");
+            db.execute("CREATE TABLE deps (id INTEGER PRIMARY KEY, name TEXT)")
+                .expect("create deps");
+            db.execute(
+                "CREATE TABLE packages (id INTEGER PRIMARY KEY, dep_id INTEGER, version TEXT)",
+            )
+            .expect("create packages");
+            for i in 0_i64..30_i64 {
+                db.execute(&format!("INSERT INTO deps VALUES ({}, 'dep {}')", i + 1, i))
+                    .expect("insert dep");
+            }
+            for i in 0_i64..100_i64 {
+                db.execute(&format!(
+                    "INSERT INTO packages VALUES ({}, {}, '1.{}')",
+                    i + 1,
+                    (i % 30) + 1,
+                    i
+                ))
+                .expect("insert package");
+            }
+            db.checkpoint().expect("checkpoint");
+        }
+
+        let db = Db::open_or_create(&path, config).expect("reopen db");
+
+        let result = db
+            .execute(
+                "SELECT d.name, p.version FROM deps d LEFT JOIN packages p \
+                 ON d.id = p.dep_id ORDER BY d.name, p.version",
+            )
+            .expect("left join after reopen");
+        assert!(!result.rows().is_empty());
+
+        let json_after = db.inspect_storage_state_json().expect("json after query");
+        assert!(
+            json_after.contains("\"loaded_table_count\":0"),
+            "expected left join to re-defer tables after commit, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"deferred_table_count\":2"),
+            "expected both tables deferred after left join, got: {json_after}"
+        );
+    }
+
+    /// D-E2: Reopen-time JOIN USING on paged tables stays deferred.
+    #[test]
+    fn paged_row_storage_join_using_after_reopen_stays_deferred() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir
+            .path()
+            .join("paged-row-storage-join-using-reopen.ddb");
+        let config = DbConfig {
+            paged_row_storage: true,
+            ..DbConfig::default()
+        };
+
+        {
+            let db = Db::open_or_create(&path, config.clone()).expect("open db");
+            db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
+                .expect("create users");
+            db.execute(
+                "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, amount INTEGER)",
+            )
+            .expect("create orders");
+            for i in 0_i64..20_i64 {
+                db.execute(&format!(
+                    "INSERT INTO users VALUES ({}, 'user {}')",
+                    i + 1,
+                    i
+                ))
+                .expect("insert user");
+            }
+            for i in 0_i64..80_i64 {
+                db.execute(&format!(
+                    "INSERT INTO orders VALUES ({}, {}, {})",
+                    i + 1,
+                    (i % 20) + 1,
+                    (i % 100) + 10
+                ))
+                .expect("insert order");
+            }
+            db.checkpoint().expect("checkpoint");
+        }
+
+        let db = Db::open_or_create(&path, config).expect("reopen db");
+
+        let result = db
+            .execute(
+                "SELECT u.name, o.amount FROM users u INNER JOIN orders o \
+                 ON u.id = o.user_id WHERE o.amount > 50 ORDER BY o.amount",
+            )
+            .expect("join with filter after reopen");
+        assert!(!result.rows().is_empty());
+
+        let json_after = db.inspect_storage_state_json().expect("json after query");
+        assert!(
+            json_after.contains("\"loaded_table_count\":0"),
+            "expected join with filter to re-defer tables after commit, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"deferred_table_count\":2"),
+            "expected both tables deferred after join with filter, got: {json_after}"
+        );
+    }
+
+    /// D-E2: Reopen-time FULL JOIN on paged tables stays deferred.
+    #[test]
+    fn paged_row_storage_full_join_after_reopen_stays_deferred() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir
+            .path()
+            .join("paged-row-storage-full-join-reopen.ddb");
+        let config = DbConfig {
+            paged_row_storage: true,
+            ..DbConfig::default()
+        };
+
+        {
+            let db = Db::open_or_create(&path, config.clone()).expect("open db");
+            db.execute("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)")
+                .expect("create t1");
+            db.execute("CREATE TABLE t2 (id INTEGER PRIMARY KEY, val TEXT)")
+                .expect("create t2");
+            for i in 0_i64..10_i64 {
+                db.execute(&format!("INSERT INTO t1 VALUES ({}, 't1-{}')", i + 1, i))
+                    .expect("insert t1");
+            }
+            for i in 5_i64..15_i64 {
+                db.execute(&format!("INSERT INTO t2 VALUES ({}, 't2-{}')", i + 1, i))
+                    .expect("insert t2");
+            }
+            db.checkpoint().expect("checkpoint");
+        }
+
+        let db = Db::open_or_create(&path, config).expect("reopen db");
+
+        let result = db
+            .execute(
+                "SELECT t1.val, t2.val FROM t1 FULL JOIN t2 ON t1.id = t2.id \
+                 ORDER BY t1.val, t2.val",
+            )
+            .expect("full join after reopen");
+        assert!(!result.rows().is_empty());
+
+        let json_after = db.inspect_storage_state_json().expect("json after query");
+        assert!(
+            json_after.contains("\"loaded_table_count\":0"),
+            "expected full join to re-defer tables after commit, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"deferred_table_count\":2"),
+            "expected both tables deferred after full join, got: {json_after}"
+        );
+    }
 }

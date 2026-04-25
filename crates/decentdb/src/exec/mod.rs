@@ -3036,6 +3036,9 @@ impl EngineRuntime {
                 {
                     return Ok(result);
                 }
+                if let Some(result) = self.try_execute_base_table_join(query, params)? {
+                    return Ok(result);
+                }
                 if let Some(result) =
                     self.try_execute_simple_indexed_projection_query(query, params)?
                 {
@@ -4885,6 +4888,350 @@ impl EngineRuntime {
             distinct_rows
         } else {
             output_with_order
+                .into_iter()
+                .map(|(output, _)| QueryRow::new(output))
+                .collect()
+        };
+
+        let offset_val = plan
+            .offset
+            .map(|expr| self.eval_constant_i64(expr, params, &ctes))
+            .transpose()?
+            .unwrap_or(0);
+        let limit_val = plan
+            .limit
+            .map(|expr| self.eval_constant_i64(expr, params, &ctes))
+            .transpose()?;
+
+        let start = usize::try_from(offset_val.max(0)).unwrap_or(usize::MAX);
+        if start > 0 || limit_val.is_some() {
+            let take = limit_val
+                .map(|l| usize::try_from(l.max(0)).unwrap_or(0))
+                .unwrap_or(usize::MAX);
+            rows = rows.into_iter().skip(start).take(take).collect();
+        }
+
+        let column_names: Vec<String> = result_columns.into_iter().map(|c| c.name).collect();
+        Ok(QueryResult::with_rows(column_names, rows))
+    }
+
+    fn try_execute_base_table_join(
+        &self,
+        query: &Query,
+        params: &[Value],
+    ) -> Result<Option<QueryResult>> {
+        let Some(plan) = self.analyze_base_table_join_query(query) else {
+            return Ok(None);
+        };
+        let Some(left_source) = self.visible_table_row_source(plan.left_name) else {
+            return Ok(None);
+        };
+        let Some(right_source) = self.visible_table_row_source(plan.right_name) else {
+            return Ok(None);
+        };
+        Ok(Some(self.execute_base_table_join_from_sources(
+            left_source,
+            right_source,
+            &plan,
+            params,
+        )?))
+    }
+
+    fn analyze_base_table_join_query<'a>(
+        &'a self,
+        query: &'a Query,
+    ) -> Option<BaseTableJoinPlan<'a>> {
+        if !query.ctes.is_empty() || query.recursive {
+            return None;
+        }
+        let QueryBody::Select(select) = &query.body else {
+            return None;
+        };
+        if !select.group_by.is_empty() || select.having.is_some() {
+            return None;
+        }
+        if select.from.len() != 1 {
+            return None;
+        }
+        let FromItem::Join {
+            left,
+            right,
+            kind,
+            constraint,
+        } = &select.from[0]
+        else {
+            return None;
+        };
+        if !matches!(
+            kind,
+            JoinKind::Inner | JoinKind::Left | JoinKind::Right | JoinKind::Full
+        ) {
+            return None;
+        }
+        let (left_name, left_alias) = match &**left {
+            FromItem::Table { name, alias } => (name, alias.as_deref()),
+            _ => return None,
+        };
+        let (right_name, right_alias) = match &**right {
+            FromItem::Table { name, alias } => (name, alias.as_deref()),
+            _ => return None,
+        };
+        if self
+            .visible_view(left_name, NameResolutionScope::Session)
+            .is_some()
+            || self
+                .visible_view(right_name, NameResolutionScope::Session)
+                .is_some()
+            || self.visible_table_is_temporary(left_name)
+            || self.visible_table_is_temporary(right_name)
+        {
+            return None;
+        }
+        if self.table_schema(left_name).is_none() || self.table_schema(right_name).is_none() {
+            return None;
+        }
+        if select.projection.iter().any(|item| {
+            matches!(
+                item,
+                SelectItem::Wildcard | SelectItem::QualifiedWildcard(_)
+            )
+        }) {
+            return None;
+        }
+        for item in &select.projection {
+            if let SelectItem::Expr { expr, .. } = item {
+                if expr_contains_window(expr) {
+                    return None;
+                }
+            }
+        }
+        for order in &query.order_by {
+            if expr_contains_window(&order.expr) {
+                return None;
+            }
+        }
+        if select.filter.as_ref().is_some_and(expr_contains_window) {
+            return None;
+        }
+        Some(BaseTableJoinPlan {
+            left_name,
+            left_alias,
+            right_name,
+            right_alias,
+            kind: *kind,
+            constraint,
+            filter: select.filter.as_ref(),
+            projection: &select.projection,
+            order_by: &query.order_by,
+            distinct: select.distinct,
+            limit: query.limit.as_ref(),
+            offset: query.offset.as_ref(),
+        })
+    }
+
+    fn execute_base_table_join_from_sources(
+        &self,
+        left_source: VisibleTableRowSource<'_>,
+        right_source: VisibleTableRowSource<'_>,
+        plan: &BaseTableJoinPlan<'_>,
+        params: &[Value],
+    ) -> Result<QueryResult> {
+        let left_table = self.table_schema(plan.left_name).ok_or_else(|| {
+            DbError::internal(format!("table {} not found for join", plan.left_name))
+        })?;
+        let right_table = self.table_schema(plan.right_name).ok_or_else(|| {
+            DbError::internal(format!("table {} not found for join", plan.right_name))
+        })?;
+
+        let left_binding_name = plan.left_alias.unwrap_or(plan.left_name);
+        let right_binding_name = plan.right_alias.unwrap_or(plan.right_name);
+
+        let left_columns: Vec<ColumnBinding> = left_table
+            .columns
+            .iter()
+            .map(|c| ColumnBinding::visible(Some(left_binding_name.to_string()), c.name.clone()))
+            .collect();
+        let right_columns: Vec<ColumnBinding> = right_table
+            .columns
+            .iter()
+            .map(|c| ColumnBinding::visible(Some(right_binding_name.to_string()), c.name.clone()))
+            .collect();
+
+        let using_columns = resolve_join_using_columns_for_schemas(
+            &left_columns,
+            &right_columns,
+            plan.constraint,
+            left_table,
+            right_table,
+        )?;
+
+        let eval_columns: Vec<ColumnBinding> = left_columns
+            .iter()
+            .cloned()
+            .chain(right_columns.iter().cloned())
+            .collect();
+        let eval_dataset = Dataset::with_rows(eval_columns, Vec::new());
+        let ctes = BTreeMap::new();
+
+        let left_needs_virtual_generated = !generated_columns_are_stored(left_table);
+        let right_needs_virtual_generated = !generated_columns_are_stored(right_table);
+
+        let left_nulls = vec![Value::Null; left_columns.len()];
+        let right_nulls = vec![Value::Null; right_columns.len()];
+
+        let mut right_rows: Vec<Vec<Value>> = Vec::new();
+        for row_result in right_source.rows() {
+            let row_ref = row_result?;
+            let mut values = row_ref.values().to_vec();
+            if right_needs_virtual_generated {
+                self.apply_virtual_generated_columns(right_table, &mut values)?;
+            }
+            right_rows.push(values);
+        }
+
+        let mut matched_right = vec![false; right_rows.len()];
+        let mut join_output: Vec<Vec<Value>> = Vec::new();
+
+        for left_row_result in left_source.rows() {
+            let mut left_values = left_row_result?.values().to_vec();
+            if left_needs_virtual_generated {
+                self.apply_virtual_generated_columns(left_table, &mut left_values)?;
+            }
+
+            let mut matched = false;
+            for (right_index, right_values) in right_rows.iter().enumerate() {
+                let mut eval_row = left_values.clone();
+                eval_row.extend(right_values.clone());
+                if join_rows_match(
+                    plan.constraint,
+                    &using_columns,
+                    &eval_row,
+                    &left_values,
+                    right_values,
+                    &JoinEvalContext {
+                        dataset: &eval_dataset,
+                        runtime: self,
+                        params,
+                        ctes: &ctes,
+                    },
+                )? {
+                    matched = true;
+                    matched_right[right_index] = true;
+                    join_output.push(join_output_row(&left_values, right_values, &using_columns)?);
+                }
+            }
+            if !matched && matches!(plan.kind, JoinKind::Left | JoinKind::Full) {
+                join_output.push(join_output_row(&left_values, &right_nulls, &using_columns)?);
+            }
+        }
+        if matches!(plan.kind, JoinKind::Right | JoinKind::Full) {
+            for (matched, right_values) in matched_right.iter().zip(right_rows.iter()) {
+                if !matched {
+                    join_output.push(join_output_row(&left_nulls, right_values, &using_columns)?);
+                }
+            }
+        }
+
+        let result_columns: Vec<ColumnBinding> = plan
+            .projection
+            .iter()
+            .enumerate()
+            .map(|(index, item)| match item {
+                SelectItem::Expr { expr, alias } => ColumnBinding::visible(
+                    None,
+                    alias
+                        .clone()
+                        .unwrap_or_else(|| infer_expr_name(expr, index + 1)),
+                ),
+                _ => ColumnBinding::visible(None, format!("col{}", index + 1)),
+            })
+            .collect();
+
+        let join_ds_columns: Vec<ColumnBinding> = left_columns
+            .iter()
+            .cloned()
+            .chain(right_columns.iter().cloned())
+            .collect();
+        let join_dataset = Dataset::with_rows(join_ds_columns, join_output);
+
+        let mut output_rows: Vec<Vec<Value>> = Vec::new();
+        for row in join_dataset.rows.iter() {
+            let mut projected = Vec::with_capacity(plan.projection.len());
+            for item in plan.projection {
+                let SelectItem::Expr { expr, .. } = item else {
+                    return Err(DbError::sql(
+                        "wildcards not supported in join SELECT output",
+                    ));
+                };
+                projected.push(self.eval_expr(expr, &join_dataset, row, params, &ctes, None)?);
+            }
+            output_rows.push(projected);
+        }
+
+        if let Some(filter) = plan.filter {
+            let filter_ds = Dataset::with_rows(result_columns.clone(), Vec::new());
+            let mut filtered = Vec::with_capacity(output_rows.len());
+            for row in &output_rows {
+                let val = self.eval_expr(filter, &filter_ds, row, params, &ctes, None)?;
+                if matches!(val, Value::Bool(true)) {
+                    filtered.push(row.clone());
+                }
+            }
+            output_rows = filtered;
+        }
+
+        let has_order_by = !plan.order_by.is_empty();
+        let mut rows_with_order: Vec<(Vec<Value>, Vec<Value>)> = if has_order_by {
+            let order_ds = Dataset::with_rows(result_columns.clone(), output_rows.clone());
+            output_rows
+                .into_iter()
+                .map(|row| {
+                    let order_values: Vec<Value> = plan
+                        .order_by
+                        .iter()
+                        .map(|order| {
+                            self.eval_expr(&order.expr, &order_ds, &row, params, &ctes, None)
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    Ok((row, order_values))
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            output_rows
+                .into_iter()
+                .map(|row| (row, Vec::new()))
+                .collect()
+        };
+
+        if has_order_by {
+            let mut sort_error = None;
+            rows_with_order.sort_by(|(_, left_order), (_, right_order)| {
+                match compare_query_row_order_values(left_order, right_order, plan.order_by) {
+                    Ok(ordering) => ordering,
+                    Err(error) => {
+                        if sort_error.is_none() {
+                            sort_error = Some(error);
+                        }
+                        std::cmp::Ordering::Equal
+                    }
+                }
+            });
+            if let Some(error) = sort_error {
+                return Err(error);
+            }
+        }
+
+        let mut rows: Vec<QueryRow> = if plan.distinct {
+            let mut seen = BTreeSet::new();
+            let mut distinct_rows = Vec::new();
+            for (output, _) in rows_with_order {
+                if seen.insert(row_identity(&output)?) {
+                    distinct_rows.push(QueryRow::new(output));
+                }
+            }
+            distinct_rows
+        } else {
+            rows_with_order
                 .into_iter()
                 .map(|(output, _)| QueryRow::new(output))
                 .collect()
@@ -10965,6 +11312,21 @@ struct GeneralGroupedSingleTablePlan<'a> {
     filter: Option<&'a Expr>,
     projection: &'a [SelectItem],
     having: Option<&'a Expr>,
+    order_by: &'a [crate::sql::ast::OrderBy],
+    distinct: bool,
+    limit: Option<&'a Expr>,
+    offset: Option<&'a Expr>,
+}
+
+struct BaseTableJoinPlan<'a> {
+    left_name: &'a str,
+    left_alias: Option<&'a str>,
+    right_name: &'a str,
+    right_alias: Option<&'a str>,
+    kind: JoinKind,
+    constraint: &'a JoinConstraint,
+    filter: Option<&'a Expr>,
+    projection: &'a [SelectItem],
     order_by: &'a [crate::sql::ast::OrderBy],
     distinct: bool,
     limit: Option<&'a Expr>,
@@ -18485,6 +18847,61 @@ fn resolve_join_using_columns(
             }
             Ok(pairs)
         }
+    }
+}
+
+fn resolve_join_using_columns_for_schemas(
+    left_columns: &[ColumnBinding],
+    right_columns: &[ColumnBinding],
+    constraint: &JoinConstraint,
+    _left_table: &TableSchema,
+    _right_table: &TableSchema,
+) -> Result<Vec<JoinUsingColumn>> {
+    match constraint {
+        JoinConstraint::Using(names) => {
+            let mut result = Vec::new();
+            for name in names {
+                let left_idx = left_columns
+                    .iter()
+                    .position(|c| identifiers_equal(&c.name, name))
+                    .ok_or_else(|| {
+                        DbError::sql(format!("column \"{name}\" not found in left table"))
+                    })?;
+                let right_idx = right_columns
+                    .iter()
+                    .position(|c| identifiers_equal(&c.name, name))
+                    .ok_or_else(|| {
+                        DbError::sql(format!("column \"{name}\" not found in right table"))
+                    })?;
+                result.push(JoinUsingColumn {
+                    name: left_columns[left_idx].name.clone(),
+                    left_index: left_idx,
+                    right_index: right_idx,
+                });
+            }
+            Ok(result)
+        }
+        JoinConstraint::Natural => {
+            let mut result = Vec::new();
+            for lc in left_columns.iter() {
+                if let Some(right_idx) = right_columns
+                    .iter()
+                    .position(|rc| identifiers_equal(&rc.name, &lc.name))
+                {
+                    let left_idx = left_columns
+                        .iter()
+                        .position(|c| identifiers_equal(&c.name, &lc.name))
+                        .unwrap();
+                    result.push(JoinUsingColumn {
+                        name: left_columns[left_idx].name.clone(),
+                        left_index: left_idx,
+                        right_index: right_idx,
+                    });
+                }
+            }
+            Ok(result)
+        }
+        JoinConstraint::On(_) => Ok(Vec::new()),
     }
 }
 
