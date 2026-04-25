@@ -1032,13 +1032,6 @@ pub(crate) struct PagedMutationDelta {
     pub(crate) deleted_rows: BTreeSet<i64>,
 }
 
-impl PagedMutationDelta {
-    #[must_use]
-    fn is_empty(&self) -> bool {
-        self.append_count == 0 && self.updated_rows.is_empty() && self.deleted_rows.is_empty()
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BulkLoadOptions {
     pub batch_size: usize,
@@ -1643,58 +1636,23 @@ impl EngineRuntime {
                 }
                 if use_paged_row_storage && previous_pointer.is_table_paged_manifest() {
                     self.overflow_chain_caches.remove(&canonical_table_name);
-                    let rewritten_state = if !delta.updated_rows.is_empty()
-                        || !delta.deleted_rows.is_empty()
-                    {
-                        let new_state = rewrite_paged_table_from_paged_mutations(
-                            &mut store,
-                            previous_state,
-                            &delta,
-                            db.config().page_size,
-                        )?;
-                        let new_state = if delta.append_count > 0 {
-                            // Recover stored rows by grabbing the last N from the resident data
-                            let data = row_source.resident_data();
-                            let existing_count = data.rows.len().saturating_sub(delta.append_count);
-                            let appended_chunks = encode_paged_table_chunks_from_rows(
-                                &data.rows[existing_count..],
-                                db.config().page_size,
-                            )?;
-                            if !appended_chunks.is_empty() {
-                                append_paged_table_chunks(
-                                    &mut store,
-                                    new_state,
-                                    &appended_chunks,
-                                    data.rows.len(),
-                                )?
-                            } else {
-                                new_state
-                            }
-                        } else {
-                            new_state
-                        };
-                        Some(new_state)
-                    } else if delta.append_count > 0 {
+                    if delta.append_count > 0 {
                         let data = row_source.resident_data();
                         let existing_count = data.rows.len().saturating_sub(delta.append_count);
                         let appended_chunks = encode_paged_table_chunks_from_rows(
                             &data.rows[existing_count..],
                             db.config().page_size,
                         )?;
-                        if !appended_chunks.is_empty() {
-                            Some(append_paged_table_chunks(
+                        let new_state = if !appended_chunks.is_empty() {
+                            append_paged_table_chunks(
                                 &mut store,
                                 previous_state,
                                 &appended_chunks,
                                 data.rows.len(),
-                            )?)
+                            )?
                         } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
-                    if let Some(new_state) = rewritten_state {
+                            previous_state
+                        };
                         self.persisted_tables
                             .insert(canonical_table_name.clone(), new_state);
                         let pk_index_root = if db.config().persistent_pk_index {
@@ -1778,36 +1736,7 @@ impl EngineRuntime {
 
                 if use_paged_row_storage {
                     self.overflow_chain_caches.remove(&canonical_table_name);
-                    let new_state = if !delta.updated_rows.is_empty()
-                        || !delta.deleted_rows.is_empty()
-                    {
-                        let new_state = rewrite_paged_table_from_paged_mutations(
-                            &mut store,
-                            previous_state,
-                            &delta,
-                            db.config().page_size,
-                        )?;
-                        let new_state = if delta.append_count > 0 {
-                            let existing_count = data.rows.len().saturating_sub(delta.append_count);
-                            let appended_chunks = encode_paged_table_chunks_from_rows(
-                                &data.rows[existing_count..],
-                                db.config().page_size,
-                            )?;
-                            if !appended_chunks.is_empty() {
-                                append_paged_table_chunks(
-                                    &mut store,
-                                    new_state,
-                                    &appended_chunks,
-                                    data.rows.len(),
-                                )?
-                            } else {
-                                new_state
-                            }
-                        } else {
-                            new_state
-                        };
-                        new_state
-                    } else if delta.append_count > 0 && previous_pointer.is_table_paged_manifest() {
+                    let new_state = if delta.append_count > 0 {
                         let existing_count = data.rows.len().saturating_sub(delta.append_count);
                         let appended_chunks = encode_paged_table_chunks_from_rows(
                             &data.rows[existing_count..],
@@ -2174,6 +2103,15 @@ impl EngineRuntime {
                         compact_paged_table_state_for_checkpoint(&mut store, previous_state)?;
                     if table_changed {
                         self.persisted_tables.insert(table_name.clone(), new_state);
+                        if db.config().persistent_pk_index {
+                            let chunk_payloads =
+                                read_paged_table_chunk_payloads(&store, new_state)?;
+                            let pk_index_root = build_persistent_pk_index_root_from_chunk_payloads(
+                                db,
+                                &chunk_payloads,
+                            )?;
+                            replace_table_pk_index_root(self, db, &table_name, pk_index_root)?;
+                        }
                         changed = true;
                     }
                     continue;
@@ -13460,26 +13398,72 @@ fn compact_paged_table_state_for_checkpoint<S: PageStore>(
     let mut manifest = decode_paged_table_manifest_payload(&manifest_payload)?;
     let mut changed = false;
     let chunk_compaction_min_bytes = paged_table_checkpoint_compaction_min_bytes(store.page_size());
+    let mut freed_pointers: Vec<OverflowPointer> = Vec::new();
     for chunk in &mut manifest.chunks {
-        if chunk.pointer.head_page_id == 0
-            || chunk.pointer.is_compressed()
-            || usize::try_from(chunk.pointer.logical_len)
-                .ok()
-                .is_none_or(|len| len < chunk_compaction_min_bytes)
-        {
+        let needs_merge = !chunk.tombstoned_row_ids.is_empty() || chunk.overlay_pointer.is_some();
+        if !needs_merge {
+            if chunk.pointer.head_page_id == 0
+                || chunk.pointer.is_compressed()
+                || usize::try_from(chunk.pointer.logical_len)
+                    .ok()
+                    .is_none_or(|len| len < chunk_compaction_min_bytes)
+            {
+                continue;
+            }
+            let payload = read_overflow(store, chunk.pointer)?;
+            let pointer = rewrite_overflow(
+                store,
+                chunk.pointer,
+                &payload,
+                CompressionMode::AutoMinBytes(chunk_compaction_min_bytes),
+            )?;
+            if pointer != chunk.pointer {
+                chunk.pointer = pointer;
+                changed = true;
+            }
             continue;
         }
-        let payload = read_overflow(store, chunk.pointer)?;
-        let pointer = rewrite_overflow(
+
+        // Fold tombstones and overlay into a new base payload.
+        let base_payload = read_overflow(store, chunk.pointer)?;
+        let base_rows = decode_table_payload_rows(&base_payload)?;
+        let mut merged_rows: BTreeMap<i64, StoredRow> = BTreeMap::new();
+        for row in base_rows {
+            if !chunk.tombstoned_row_ids.contains(&row.row_id) {
+                merged_rows.insert(row.row_id, row);
+            }
+        }
+        if let Some(overlay_pointer) = chunk.overlay_pointer {
+            let overlay_payload = read_overflow(store, overlay_pointer)?;
+            let overlay_rows = decode_table_payload_rows(&overlay_payload)?;
+            for row in overlay_rows {
+                merged_rows.insert(row.row_id, row);
+            }
+        }
+        let merged: Vec<StoredRow> = merged_rows.into_values().collect();
+        let merged_len = merged.len();
+        let new_payload = encode_table_payload(&TableData { rows: merged })?;
+        let new_checksum = crc32c_parts(&[new_payload.as_slice()]);
+        let new_pointer = write_overflow(
             store,
-            chunk.pointer,
-            &payload,
+            &new_payload,
             CompressionMode::AutoMinBytes(chunk_compaction_min_bytes),
         )?;
-        if pointer != chunk.pointer {
-            chunk.pointer = pointer;
-            changed = true;
+        if chunk.pointer.head_page_id != 0 {
+            freed_pointers.push(chunk.pointer);
         }
+        if let Some(overlay_pointer) = chunk.overlay_pointer {
+            if overlay_pointer.head_page_id != 0 {
+                freed_pointers.push(overlay_pointer);
+            }
+        }
+        chunk.pointer = new_pointer;
+        chunk.checksum = new_checksum;
+        chunk.row_count = merged_len;
+        chunk.tombstoned_row_ids.clear();
+        chunk.overlay_pointer = None;
+        chunk.overlay_checksum = None;
+        changed = true;
     }
 
     let should_rewrite_manifest = changed
@@ -13512,6 +13496,16 @@ fn compact_paged_table_state_for_checkpoint<S: PageStore>(
         tail,
         pk_index_root: state.pk_index_root,
     };
+
+    // Free old base and overlay pages that were replaced by merge compaction.
+    // (Non-merge rewrites use rewrite_overflow which reuses/frees old pages
+    // on its own.)
+    for old_pointer in freed_pointers {
+        if old_pointer.head_page_id != 0 {
+            free_overflow(store, old_pointer.head_page_id)?;
+        }
+    }
+
     Ok((new_state, new_state != state || changed))
 }
 
@@ -13705,29 +13699,6 @@ fn rewrite_paged_table_from_resident<S: PageStore>(
         tail,
         pk_index_root: previous_state.pk_index_root,
     })
-}
-
-fn rewrite_paged_table_from_paged_mutations<S: PageStore>(
-    store: &mut S,
-    previous_state: PersistedTableState,
-    delta: &PagedMutationDelta,
-    _page_size: u32,
-) -> Result<PersistedTableState> {
-    if delta.is_empty() || !previous_state.pointer.is_table_paged_manifest() {
-        return Ok(previous_state);
-    }
-
-    let previous_manifest = read_table_page_manifest_from_state(store, previous_state)?;
-    let mut row_changes = BTreeMap::new();
-    for (row_id, values) in &delta.updated_rows {
-        row_changes.insert(*row_id, Some(values.clone()));
-    }
-    for row_id in &delta.deleted_rows {
-        row_changes.insert(*row_id, None);
-    }
-
-    let next_manifest = apply_paged_row_changes_to_manifest(&previous_manifest, &row_changes)?;
-    rewrite_paged_table_from_manifest(store, previous_state, &next_manifest)
 }
 
 fn rewrite_paged_table_from_manifest<S: PageStore>(
@@ -26440,355 +26411,6 @@ mod tests {
         assert_eq!(
             updated_row.values(),
             &[Value::Int64(6), Value::Text(updated_body)]
-        );
-    }
-
-    #[test]
-    fn rewrite_paged_row_updates_do_not_require_resident_table_image() {
-        let body = "x".repeat(2048);
-        let config = DbConfig {
-            paged_row_storage: true,
-            defer_table_materialization: false,
-            ..DbConfig::default()
-        };
-        let db = Db::open_or_create(":memory:", config).expect("open db");
-        db.execute("CREATE TABLE docs (id INT64 PRIMARY KEY, body TEXT)")
-            .expect("create table");
-        for row_id in 1_i64..=96_i64 {
-            db.execute(&format!(
-                "INSERT INTO docs (id, body) VALUES ({row_id}, '{}')",
-                body
-            ))
-            .expect("insert row");
-        }
-
-        let runtime = db.debug_engine_snapshot().expect("snapshot runtime");
-        let initial_state = runtime.persisted_tables["docs"];
-        let mut store = DbTxnPageStore { db: &db };
-        let initial_manifest_payload =
-            crate::record::overflow::read_overflow(&store, initial_state.pointer)
-                .expect("read manifest payload");
-        let initial_manifest = decode_paged_table_manifest_payload(&initial_manifest_payload)
-            .expect("decode manifest payload");
-        let initial_page_manifest =
-            read_table_page_manifest_from_state(&store, initial_state).expect("read manifest");
-        let changed_chunk_index = initial_page_manifest.rows[5].chunk_index as usize;
-        let untouched_pointers = initial_manifest
-            .chunks
-            .iter()
-            .enumerate()
-            .filter_map(|(index, chunk)| (index != changed_chunk_index).then_some(chunk.pointer))
-            .collect::<Vec<_>>();
-
-        let updated_body = "q".repeat(2500);
-        db.begin_write().expect("begin write txn");
-        let mut delta = super::PagedMutationDelta::default();
-        delta
-            .updated_rows
-            .insert(6, vec![Value::Int64(6), Value::Text(updated_body.clone())]);
-        let rewritten_state = super::rewrite_paged_table_from_paged_mutations(
-            &mut store,
-            initial_state,
-            &delta,
-            PAGE_SIZE,
-        )
-        .expect("rewrite paged table from dirty updates");
-        db.commit().expect("commit write txn");
-        let rewritten_manifest_payload =
-            crate::record::overflow::read_overflow(&store, rewritten_state.pointer)
-                .expect("read rewritten manifest");
-        let rewritten_manifest = decode_paged_table_manifest_payload(&rewritten_manifest_payload)
-            .expect("decode rewritten manifest");
-        let preserved_untouched = rewritten_manifest
-            .chunks
-            .iter()
-            .filter_map(|chunk| {
-                untouched_pointers
-                    .contains(&chunk.pointer)
-                    .then_some(chunk.pointer)
-            })
-            .collect::<Vec<_>>();
-        let rewritten_page_manifest =
-            read_table_page_manifest_from_state(&store, rewritten_state).expect("read manifest");
-        let updated_row = rewritten_page_manifest
-            .row_by_id(6)
-            .expect("read updated row")
-            .expect("row should exist");
-
-        assert_eq!(
-            preserved_untouched, untouched_pointers,
-            "row-update manifest rewrites should preserve untouched chunk pointers"
-        );
-        assert_eq!(
-            updated_row.values(),
-            &[Value::Int64(6), Value::Text(updated_body)]
-        );
-    }
-
-    #[test]
-    fn persist_to_db_generic_resident_paged_row_updates_preserves_untouched_chunk_pointers() {
-        let body = "x".repeat(2048);
-        let config = DbConfig {
-            paged_row_storage: true,
-            defer_table_materialization: false,
-            ..DbConfig::default()
-        };
-        let db = Db::open_or_create(":memory:", config).expect("open db");
-        db.execute("CREATE TABLE docs (id INT64 PRIMARY KEY, body TEXT)")
-            .expect("create table");
-        for row_id in 1_i64..=96_i64 {
-            db.execute(&format!(
-                "INSERT INTO docs (id, body) VALUES ({row_id}, '{}')",
-                body
-            ))
-            .expect("insert row");
-        }
-
-        let mut runtime = db.debug_engine_snapshot().expect("snapshot runtime");
-        let initial_state = runtime.persisted_tables["docs"];
-        let store = DbTxnPageStore { db: &db };
-        let initial_manifest_payload =
-            crate::record::overflow::read_overflow(&store, initial_state.pointer)
-                .expect("read manifest payload");
-        let initial_manifest = decode_paged_table_manifest_payload(&initial_manifest_payload)
-            .expect("decode manifest payload");
-        let initial_page_manifest =
-            read_table_page_manifest_from_state(&store, initial_state).expect("read manifest");
-        assert!(
-            initial_manifest.chunks.len() > 2,
-            "expected multiple chunks to observe pointer preservation"
-        );
-        let changed_chunk_index = initial_page_manifest.rows[5].chunk_index as usize;
-        let untouched_pointers = initial_manifest
-            .chunks
-            .iter()
-            .enumerate()
-            .filter_map(|(index, chunk)| (index != changed_chunk_index).then_some(chunk.pointer))
-            .collect::<Vec<_>>();
-
-        let updated_body = "z".repeat(2700);
-        let statement = parse_sql_statement(&format!(
-            "UPDATE docs SET body = '{}' WHERE id = 6",
-            updated_body
-        ))
-        .expect("parse update");
-        let crate::sql::ast::Statement::Update(update) = statement else {
-            panic!("expected update statement");
-        };
-        runtime
-            .execute_update(&update, &[], PAGE_SIZE)
-            .expect("execute generic update");
-        assert_eq!(
-            runtime
-                .paged_mutations
-                .get("docs")
-                .map(|m| m.updated_rows.len()),
-            Some(1)
-        );
-
-        db.begin_write().expect("begin write txn");
-        runtime.persist_to_db(&db).expect("persist runtime");
-        db.commit().expect("commit write txn");
-
-        let rewritten_state = runtime.persisted_tables["docs"];
-        let rewritten_manifest_payload =
-            crate::record::overflow::read_overflow(&store, rewritten_state.pointer)
-                .expect("read manifest payload");
-        let rewritten_manifest = decode_paged_table_manifest_payload(&rewritten_manifest_payload)
-            .expect("decode manifest payload");
-        let preserved_untouched = rewritten_manifest
-            .chunks
-            .iter()
-            .filter_map(|chunk| {
-                untouched_pointers
-                    .contains(&chunk.pointer)
-                    .then_some(chunk.pointer)
-            })
-            .collect::<Vec<_>>();
-        let rewritten_page_manifest =
-            read_table_page_manifest_from_state(&store, rewritten_state).expect("read manifest");
-        let updated_row = rewritten_page_manifest
-            .row_by_id(6)
-            .expect("read updated row")
-            .expect("row should exist");
-
-        assert_eq!(
-            preserved_untouched, untouched_pointers,
-            "generic resident paged row updates should preserve untouched chunk pointers"
-        );
-        assert_eq!(
-            updated_row.values(),
-            &[Value::Int64(6), Value::Text(updated_body)]
-        );
-    }
-
-    #[test]
-    fn persist_to_db_resident_paged_row_deletes_preserves_untouched_chunk_pointers() {
-        let body = "x".repeat(2048);
-        let config = DbConfig {
-            paged_row_storage: true,
-            defer_table_materialization: false,
-            ..DbConfig::default()
-        };
-        let db = Db::open_or_create(":memory:", config).expect("open db");
-        db.execute("CREATE TABLE docs (id INT64 PRIMARY KEY, body TEXT)")
-            .expect("create table");
-        for row_id in 1_i64..=96_i64 {
-            db.execute(&format!(
-                "INSERT INTO docs (id, body) VALUES ({row_id}, '{}')",
-                body
-            ))
-            .expect("insert row");
-        }
-
-        let mut runtime = db.debug_engine_snapshot().expect("snapshot runtime");
-        let initial_state = runtime.persisted_tables["docs"];
-        let store = DbTxnPageStore { db: &db };
-        let initial_manifest_payload =
-            crate::record::overflow::read_overflow(&store, initial_state.pointer)
-                .expect("read manifest payload");
-        let initial_manifest = decode_paged_table_manifest_payload(&initial_manifest_payload)
-            .expect("decode manifest payload");
-        let initial_page_manifest =
-            read_table_page_manifest_from_state(&store, initial_state).expect("read manifest");
-        assert!(
-            initial_manifest.chunks.len() > 2,
-            "expected multiple chunks to observe pointer preservation"
-        );
-        let deleted_chunk_index = initial_page_manifest.rows[5].chunk_index as usize;
-        let untouched_pointers = initial_manifest
-            .chunks
-            .iter()
-            .enumerate()
-            .filter_map(|(index, chunk)| (index != deleted_chunk_index).then_some(chunk.pointer))
-            .collect::<Vec<_>>();
-
-        let statement = parse_sql_statement("DELETE FROM docs WHERE id = 6").expect("parse delete");
-        let crate::sql::ast::Statement::Delete(delete) = statement else {
-            panic!("expected delete statement");
-        };
-        runtime
-            .execute_delete(&delete, &[], PAGE_SIZE)
-            .expect("execute delete");
-        assert_eq!(
-            runtime
-                .paged_mutations
-                .get("docs")
-                .map(|d| d.deleted_rows.clone()),
-            Some(std::collections::BTreeSet::from([6])),
-            "resident paged delete should track the deleted row id"
-        );
-
-        db.begin_write().expect("begin write txn");
-        runtime.persist_to_db(&db).expect("persist runtime");
-        db.commit().expect("commit write txn");
-
-        let rewritten_state = runtime.persisted_tables["docs"];
-        let rewritten_manifest_payload =
-            crate::record::overflow::read_overflow(&store, rewritten_state.pointer)
-                .expect("read manifest payload");
-        let rewritten_manifest = decode_paged_table_manifest_payload(&rewritten_manifest_payload)
-            .expect("decode manifest payload");
-        let preserved_untouched = rewritten_manifest
-            .chunks
-            .iter()
-            .filter_map(|chunk| {
-                untouched_pointers
-                    .contains(&chunk.pointer)
-                    .then_some(chunk.pointer)
-            })
-            .collect::<Vec<_>>();
-        let rewritten_page_manifest =
-            read_table_page_manifest_from_state(&store, rewritten_state).expect("read manifest");
-
-        assert_eq!(
-            preserved_untouched, untouched_pointers,
-            "persisted paged row deletes should preserve untouched chunk pointers"
-        );
-        assert!(
-            rewritten_page_manifest
-                .row_by_id(6)
-                .expect("read deleted row")
-                .is_none(),
-            "deleted row should be removed from the rewritten paged manifest"
-        );
-    }
-
-    #[test]
-    fn rewrite_paged_row_deletes_do_not_require_resident_table_image() {
-        let body = "x".repeat(2048);
-        let config = DbConfig {
-            paged_row_storage: true,
-            defer_table_materialization: false,
-            ..DbConfig::default()
-        };
-        let db = Db::open_or_create(":memory:", config).expect("open db");
-        db.execute("CREATE TABLE docs (id INT64 PRIMARY KEY, body TEXT)")
-            .expect("create table");
-        for row_id in 1_i64..=96_i64 {
-            db.execute(&format!(
-                "INSERT INTO docs (id, body) VALUES ({row_id}, '{}')",
-                body
-            ))
-            .expect("insert row");
-        }
-
-        let runtime = db.debug_engine_snapshot().expect("snapshot runtime");
-        let initial_state = runtime.persisted_tables["docs"];
-        let mut store = DbTxnPageStore { db: &db };
-        let initial_manifest_payload =
-            crate::record::overflow::read_overflow(&store, initial_state.pointer)
-                .expect("read manifest payload");
-        let initial_manifest = decode_paged_table_manifest_payload(&initial_manifest_payload)
-            .expect("decode manifest payload");
-        let initial_page_manifest =
-            read_table_page_manifest_from_state(&store, initial_state).expect("read manifest");
-        let deleted_chunk_index = initial_page_manifest.rows[5].chunk_index as usize;
-        let untouched_pointers = initial_manifest
-            .chunks
-            .iter()
-            .enumerate()
-            .filter_map(|(index, chunk)| (index != deleted_chunk_index).then_some(chunk.pointer))
-            .collect::<Vec<_>>();
-
-        db.begin_write().expect("begin write txn");
-        let mut delta = super::PagedMutationDelta::default();
-        delta.deleted_rows.insert(6);
-        let rewritten_state = super::rewrite_paged_table_from_paged_mutations(
-            &mut store,
-            initial_state,
-            &delta,
-            PAGE_SIZE,
-        )
-        .expect("rewrite paged table from dirty deletes");
-        db.commit().expect("commit write txn");
-        let rewritten_manifest_payload =
-            crate::record::overflow::read_overflow(&store, rewritten_state.pointer)
-                .expect("read rewritten manifest");
-        let rewritten_manifest = decode_paged_table_manifest_payload(&rewritten_manifest_payload)
-            .expect("decode rewritten manifest");
-        let preserved_untouched = rewritten_manifest
-            .chunks
-            .iter()
-            .filter_map(|chunk| {
-                untouched_pointers
-                    .contains(&chunk.pointer)
-                    .then_some(chunk.pointer)
-            })
-            .collect::<Vec<_>>();
-        let rewritten_page_manifest =
-            read_table_page_manifest_from_state(&store, rewritten_state).expect("read manifest");
-
-        assert_eq!(
-            preserved_untouched, untouched_pointers,
-            "row-delete manifest rewrites should preserve untouched chunk pointers"
-        );
-        assert!(
-            rewritten_page_manifest
-                .row_by_id(6)
-                .expect("read deleted row")
-                .is_none(),
-            "deleted row should be removed from the rewritten paged manifest"
         );
     }
 
