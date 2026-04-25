@@ -22,7 +22,7 @@ crates.
 ### Rationale
 
 The diagnostic probe in
-[`design/2026-04-22.ENGINE-MEMORY-PLAN.md`](../2026-04-22.ENGINE-MEMORY-PLAN.md)
+[`design/2026-04-25.ENGINE-MEMORY-WORK.md`](../2026-04-25.ENGINE-MEMORY-WORK.md)
 showed that DecentDB's per-commit allocation churn interacts pathologically
 with glibc's `malloc`. ADR 0138 mitigates the steady-state retention via
 periodic `malloc_trim(0)`, but does not address allocator-internal
@@ -90,6 +90,6 @@ The CLI is the right place for this opt-in because:
 
 ### References
 
-- design/2026-04-22.ENGINE-MEMORY-PLAN.md (slice M3)
+- design/2026-04-25.ENGINE-MEMORY-WORK.md (slice M3)
 - design/adr/0138-post-checkpoint-heap-release.md
 - mimalloc upstream: <https://github.com/microsoft/mimalloc>

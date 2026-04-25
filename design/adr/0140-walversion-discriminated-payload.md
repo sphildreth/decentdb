@@ -47,7 +47,7 @@ until that reader completes.
 ### Rationale
 
 The diagnostic probe in
-[`design/2026-04-22.ENGINE-MEMORY-PLAN.md`](../2026-04-22.ENGINE-MEMORY-PLAN.md)
+[`design/2026-04-25.ENGINE-MEMORY-WORK.md`](../2026-04-25.ENGINE-MEMORY-WORK.md)
 showed that even after ADR 0137 (auto-checkpoint) and ADR 0138 (heap
 release) bound the inter-checkpoint footprint, the WAL index itself still
 holds one full-page `Arc<[u8]>` per dirty page (≈ 184 MB at 47 173 versions
@@ -125,7 +125,7 @@ descriptor (24 bytes) instead of a 4 KB `Arc<[u8]>`.
 
 ### References
 
-- design/2026-04-22.ENGINE-MEMORY-PLAN.md (slice M4)
+- design/2026-04-25.ENGINE-MEMORY-WORK.md (slice M4)
 - design/adr/0019-wal-retention-for-active-readers.md
 - design/adr/0033-wal-frame-format.md
 - design/adr/0056-wal-index-pruning-on-checkpoint.md

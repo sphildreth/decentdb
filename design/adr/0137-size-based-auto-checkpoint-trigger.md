@@ -29,7 +29,7 @@ restores pre-ADR behavior (timeout-based checkpointing only, per ADR 0004).
 ### Rationale
 
 The probe captured in
-[`design/2026-04-22.ENGINE-MEMORY-PLAN.md`](../2026-04-22.ENGINE-MEMORY-PLAN.md)
+[`design/2026-04-25.ENGINE-MEMORY-WORK.md`](../2026-04-25.ENGINE-MEMORY-WORK.md)
 demonstrates that under sustained writes the existing checkpoint policy
 (`checkpoint_timeout_sec: 30`) does not fire frequently enough to bound
 in-memory WAL state. A 6.5-second 5 M-row load produced
@@ -88,7 +88,7 @@ this gives embedders a single knob with predictable units.
 
 ### References
 
-- design/2026-04-22.ENGINE-MEMORY-PLAN.md (slice M1)
+- design/2026-04-25.ENGINE-MEMORY-WORK.md (slice M1)
 - design/adr/0004-wal-checkpoint-strategy.md
 - design/adr/0019-wal-retention-for-active-readers.md
 - design/adr/0037-group-commit-wal-batching.md

@@ -24,7 +24,7 @@ compiles to an inline no-op regardless of the config field's value.
 ### Rationale
 
 The diagnostic probe captured in
-[`design/2026-04-22.ENGINE-MEMORY-PLAN.md`](../2026-04-22.ENGINE-MEMORY-PLAN.md)
+[`design/2026-04-25.ENGINE-MEMORY-WORK.md`](../2026-04-25.ENGINE-MEMORY-WORK.md)
 showed that after dropping the `Db` and freeing all engine state, RSS
 remained at 1.08 GB on a 5 M-row workload. A single `malloc_trim(0)` call
 released 1.08 GB → 8.8 MB. The engine has no leak; glibc retains freed
@@ -100,7 +100,7 @@ A post-checkpoint trim is the right hook because:
 
 ### References
 
-- design/2026-04-22.ENGINE-MEMORY-PLAN.md (slice M2)
+- design/2026-04-25.ENGINE-MEMORY-WORK.md (slice M2)
 - design/adr/0011-memory-management-strategy.md
 - design/adr/0025-memory-leak-prevention-strategy.md
 - design/adr/0137-size-based-auto-checkpoint-trigger.md

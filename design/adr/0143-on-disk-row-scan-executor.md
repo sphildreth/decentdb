@@ -12,7 +12,7 @@ on-disk pages through the page cache, so resident memory tracks
 
 ### Background — how E1 was diagnosed
 
-The Engine Memory Plan ([`design/2026-04-22.ENGINE-MEMORY-PLAN.md`](../2026-04-22.ENGINE-MEMORY-PLAN.md))
+The Engine Memory Plan ([`design/2026-04-25.ENGINE-MEMORY-WORK.md`](../2026-04-25.ENGINE-MEMORY-WORK.md))
 slice E1 set out to explain why a re-opened 36 MB DB consumed **1 144 MB
 RSS** before any user query ran. After landing Phase 1 (auto-checkpoint
 trigger, post-checkpoint `malloc_trim`, mimalloc opt-in, pooled checkpoint
@@ -155,7 +155,7 @@ without breaking SQL semantics.
 
 ### References
 
-- design/2026-04-22.ENGINE-MEMORY-PLAN.md (E1 — Open-path RSS investigation)
+- design/2026-04-25.ENGINE-MEMORY-WORK.md (E1 — Open-path RSS investigation)
 - design/adr/0136-chunked-row-storage-for-coarse-grained-cow.md
 - design/adr/0140-walversion-discriminated-payload.md
 - design/adr/0141-paged-on-disk-wal-index.md
