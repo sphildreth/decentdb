@@ -1172,7 +1172,7 @@ impl EngineRuntime {
         if prepared.use_generic_index_updates {
             self.apply_insert_index_updates(index_updates)?;
         }
-        self.mark_table_append_dirty(table_name);
+        self.mark_table_row_appended(table_name, &stored_row.values);
         Ok(1)
     }
 
@@ -1396,7 +1396,7 @@ impl EngineRuntime {
             self.append_stored_row_to_table_row_source(&table_name, &stored_row, page_size)?;
             self.apply_insert_index_updates(index_updates)?;
             if !temporary {
-                self.mark_table_append_dirty(&table_name);
+                self.mark_table_row_appended(&table_name, &stored_row.values);
             }
             affected_rows += 1;
             if !statement.returning.is_empty() {
@@ -2725,7 +2725,7 @@ impl EngineRuntime {
                 .next_row_id = staged_table.next_row_id;
         }
         self.apply_insert_index_updates(index_updates)?;
-        self.mark_table_append_dirty(&table_name);
+        self.mark_table_row_appended(&table_name, &stored_row.values);
 
         let result = if statement.returning.is_empty() {
             QueryResult::with_affected_rows(1)
@@ -3160,8 +3160,9 @@ fn validate_prepared_insert(
             .dirty_tables
             .contains(&foreign_key.parent_table_name)
             || runtime
-                .append_only_dirty_tables
-                .contains(&foreign_key.parent_table_name)
+                .paged_mutations
+                .get(&foreign_key.parent_table_name)
+                .is_some_and(|delta| delta.updated_rows.is_empty() && delta.deleted_rows.is_empty())
         {
             continue;
         }

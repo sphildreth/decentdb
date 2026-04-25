@@ -60,18 +60,13 @@ impl EngineRuntime {
                 &candidate,
             )
             .unwrap_or_else(|| super::dml::next_row_id(self, table_name));
-            self.append_stored_row_to_table_row_source(
-                table_name,
-                &StoredRow {
-                    row_id,
-                    values: candidate,
-                },
-                page_size,
-            )?;
+            let stored_row = StoredRow {
+                row_id,
+                values: candidate,
+            };
+            self.append_stored_row_to_table_row_source(table_name, &stored_row, page_size)?;
+            self.mark_table_row_appended(table_name, &stored_row.values);
             affected_rows += 1;
-        }
-        if affected_rows > 0 {
-            self.mark_table_append_dirty(table_name);
         }
         self.rebuild_indexes(page_size)?;
         self.execute_after_triggers(

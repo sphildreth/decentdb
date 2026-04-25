@@ -1235,8 +1235,8 @@ impl EngineRuntime {
         if self.dirty_tables.remove(&old_table_name) {
             self.dirty_tables.insert(new_name.to_string());
         }
-        if self.append_only_dirty_tables.remove(&old_table_name) {
-            self.append_only_dirty_tables.insert(new_name.to_string());
+        if let Some(delta) = self.paged_mutations.remove(&old_table_name) {
+            self.paged_mutations.insert(new_name.to_string(), delta);
         }
 
         rename_table_references(self, &old_table_name, new_name);
