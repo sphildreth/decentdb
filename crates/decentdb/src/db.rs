@@ -18337,4 +18337,230 @@ mod tests {
             "expected safe subquery execution to avoid live-runtime table loads, got: {json}"
         );
     }
+    #[test]
+    fn paged_row_storage_grouped_query_after_reopen_stays_deferred() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir.path().join("paged-row-storage-grouped-reopen.ddb");
+        let config = DbConfig {
+            paged_row_storage: true,
+            ..DbConfig::default()
+        };
+
+        {
+            let db = Db::open_or_create(&path, config.clone()).expect("open db");
+            db.execute("CREATE TABLE sales (id INTEGER PRIMARY KEY, region TEXT, amount INTEGER)")
+                .expect("create sales");
+            let mut txn = db.transaction().expect("begin txn");
+            let insert = txn
+                .prepare("INSERT INTO sales VALUES ($1, $2, $3)")
+                .expect("prepare");
+            let regions = ["east", "west", "north", "south"];
+            for i in 0_i64..200_i64 {
+                insert
+                    .execute_in(
+                        &mut txn,
+                        &[
+                            Value::Int64(i + 1),
+                            Value::Text(regions[(i as usize) % 4].to_string()),
+                            Value::Int64((i % 50) + 1),
+                        ],
+                    )
+                    .expect("insert row");
+            }
+            txn.commit().expect("commit seed txn");
+            db.checkpoint().expect("checkpoint");
+        }
+
+        let db = Db::open_or_create(&path, config).expect("reopen db");
+
+        let result = db
+            .execute(
+                "SELECT region, GROUP_CONCAT(amount) AS amounts \
+                 FROM sales GROUP BY region ORDER BY region",
+            )
+            .expect("grouped query after reopen");
+        assert_eq!(result.rows().len(), 4);
+
+        let json_after = db.inspect_storage_state_json().expect("json after query");
+        assert!(
+            json_after.contains("\"loaded_table_count\":0"),
+            "expected grouped query to re-defer sales after commit, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"deferred_table_count\":1"),
+            "expected sales to be deferred again after grouped query, got: {json_after}"
+        );
+    }
+
+    /// D-E1: Reopen-time grouped query with HAVING + ORDER BY on a paged table.
+    #[test]
+    fn paged_row_storage_grouped_having_order_by_after_reopen_stays_deferred() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir
+            .path()
+            .join("paged-row-storage-grouped-having-reopen.ddb");
+        let config = DbConfig {
+            paged_row_storage: true,
+            ..DbConfig::default()
+        };
+
+        {
+            let db = Db::open_or_create(&path, config.clone()).expect("open db");
+            db.execute(
+                "CREATE TABLE orders (id INTEGER PRIMARY KEY, customer TEXT, total INTEGER)",
+            )
+            .expect("create orders");
+            let mut txn = db.transaction().expect("begin txn");
+            let insert = txn
+                .prepare("INSERT INTO orders VALUES ($1, $2, $3)")
+                .expect("prepare");
+            let customers = ["alice", "bob", "carol"];
+            for i in 0_i64..150_i64 {
+                insert
+                    .execute_in(
+                        &mut txn,
+                        &[
+                            Value::Int64(i + 1),
+                            Value::Text(customers[(i as usize) % 3].to_string()),
+                            Value::Int64((i % 100) + 10),
+                        ],
+                    )
+                    .expect("insert row");
+            }
+            txn.commit().expect("commit seed txn");
+            db.checkpoint().expect("checkpoint");
+        }
+
+        let db = Db::open_or_create(&path, config).expect("reopen db");
+
+        let result = db
+            .execute(
+                "SELECT customer, SUM(total) AS grand_total FROM orders \
+                 GROUP BY customer HAVING SUM(total) > 2000 ORDER BY grand_total DESC",
+            )
+            .expect("grouped having query after reopen");
+        assert!(!result.rows().is_empty());
+
+        let json_after = db.inspect_storage_state_json().expect("json after query");
+        assert!(
+            json_after.contains("\"loaded_table_count\":0"),
+            "expected grouped HAVING query to re-defer orders after commit, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"deferred_table_count\":1"),
+            "expected orders to be deferred again after grouped HAVING query, got: {json_after}"
+        );
+    }
+
+    /// D-E1: Grouped query after reopen (autocommit path).
+    #[test]
+    fn paged_row_storage_grouped_query_autocommit_after_reopen() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir
+            .path()
+            .join("paged-row-storage-grouped-autocommit.ddb");
+        let config = DbConfig {
+            paged_row_storage: true,
+            ..DbConfig::default()
+        };
+
+        {
+            let db = Db::open_or_create(&path, config.clone()).expect("open db");
+            db.execute("CREATE TABLE events (id INTEGER PRIMARY KEY, kind TEXT, ts INTEGER)")
+                .expect("create events");
+            let mut txn = db.transaction().expect("begin txn");
+            let insert = txn
+                .prepare("INSERT INTO events VALUES ($1, $2, $3)")
+                .expect("prepare");
+            let kinds = ["login", "logout", "click", "view"];
+            for i in 0_i64..120_i64 {
+                insert
+                    .execute_in(
+                        &mut txn,
+                        &[
+                            Value::Int64(i + 1),
+                            Value::Text(kinds[(i as usize) % 4].to_string()),
+                            Value::Int64(1700000000 + i * 60),
+                        ],
+                    )
+                    .expect("insert row");
+            }
+            txn.commit().expect("commit seed txn");
+            db.checkpoint().expect("checkpoint");
+        }
+
+        let db = Db::open_or_create(&path, config).expect("reopen db");
+
+        let result = db
+            .execute("SELECT kind, COUNT(*) AS cnt FROM events GROUP BY kind ORDER BY kind")
+            .expect("grouped query after reopen");
+        assert_eq!(result.rows().len(), 4);
+
+        let json_after = db.inspect_storage_state_json().expect("json after query");
+        assert!(
+            json_after.contains("\"loaded_table_count\":0"),
+            "expected grouped query to keep events deferred, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"deferred_table_count\":1"),
+            "expected events to remain deferred after grouped query, got: {json_after}"
+        );
+    }
+
+    /// D-E1: Mixed aggregate projection not handled by current specialization
+    /// (GROUP_CONCAT + COUNT) exercises the general grouped path.
+    #[test]
+    fn paged_row_storage_mixed_aggregate_grouped_after_reopen() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir.path().join("paged-row-storage-mixed-aggregate.ddb");
+        let config = DbConfig {
+            paged_row_storage: true,
+            ..DbConfig::default()
+        };
+
+        {
+            let db = Db::open_or_create(&path, config.clone()).expect("open db");
+            db.execute("CREATE TABLE logs (id INTEGER PRIMARY KEY, level TEXT, msg TEXT)")
+                .expect("create logs");
+            let mut txn = db.transaction().expect("begin txn");
+            let insert = txn
+                .prepare("INSERT INTO logs VALUES ($1, $2, $3)")
+                .expect("prepare");
+            let levels = ["INFO", "WARN", "ERROR"];
+            for i in 0_i64..90_i64 {
+                insert
+                    .execute_in(
+                        &mut txn,
+                        &[
+                            Value::Int64(i + 1),
+                            Value::Text(levels[(i as usize) % 3].to_string()),
+                            Value::Text(format!("message {}", i)),
+                        ],
+                    )
+                    .expect("insert row");
+            }
+            txn.commit().expect("commit seed txn");
+            db.checkpoint().expect("checkpoint");
+        }
+
+        let db = Db::open_or_create(&path, config).expect("reopen db");
+
+        let result = db
+            .execute(
+                "SELECT level, COUNT(*) AS cnt, GROUP_CONCAT(msg) AS messages \
+                 FROM logs GROUP BY level ORDER BY level",
+            )
+            .expect("mixed aggregate grouped query after reopen");
+        assert_eq!(result.rows().len(), 3);
+
+        let json_after = db.inspect_storage_state_json().expect("json after query");
+        assert!(
+            json_after.contains("\"loaded_table_count\":0"),
+            "expected mixed aggregate grouped query to re-defer logs after commit, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"deferred_table_count\":1"),
+            "expected logs to be deferred again after mixed aggregate query, got: {json_after}"
+        );
+    }
 }
