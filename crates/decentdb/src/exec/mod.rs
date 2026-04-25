@@ -144,6 +144,7 @@ struct RowLocatorV2 {
     chunk_index: u32,
     byte_offset: u32,
     byte_len: u32,
+    is_overlay: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -276,8 +277,51 @@ impl TablePageManifest {
     }
 
     fn from_chunks(chunks: Vec<TablePageManifestChunk>) -> Result<Self> {
+        // Collect tombstoned row IDs into a set per chunk
+        let chunk_tombstones: Vec<BTreeSet<i64>> = chunks
+            .iter()
+            .map(|c| c.tombstoned_row_ids.iter().copied().collect())
+            .collect();
+
+        // Collect overlay row IDs per chunk into a set
+        let chunk_overlay_row_ids: Vec<BTreeSet<i64>> = chunks
+            .iter()
+            .map(|c| {
+                let mut set = BTreeSet::new();
+                if let Some(overlay_payload) = &c.overlay_payload {
+                    if !overlay_payload.is_empty() {
+                        let mut cursor = Cursor::new(overlay_payload.as_slice());
+                        let magic = cursor
+                            .read_slice(TABLE_PAYLOAD_MAGIC.len())
+                            .unwrap_or_default();
+                        if magic == *TABLE_PAYLOAD_MAGIC {
+                            let row_count = cursor.read_u32().unwrap_or(0) as usize;
+                            for _ in 0..row_count {
+                                let row_id = cursor.read_i64().unwrap_or(0);
+                                let row_bytes_len = cursor.read_u32().unwrap_or(0) as usize;
+                                if cursor.read_slice(row_bytes_len).is_err() {
+                                    break;
+                                }
+                                set.insert(row_id);
+                            }
+                        }
+                    }
+                }
+                set
+            })
+            .collect();
+
         let mut rows = Vec::new();
+        let mut base_row_entries = Vec::new();
+        let mut overlay_row_entries = Vec::new();
+
         for (chunk_index, chunk) in chunks.iter().enumerate() {
+            base_row_entries.clear();
+            overlay_row_entries.clear();
+
+            let tombstones = &chunk_tombstones[chunk_index];
+            let overlay_ids = &chunk_overlay_row_ids[chunk_index];
+
             if !chunk.payload.is_empty() {
                 let mut cursor = Cursor::new(chunk.payload.as_slice());
                 let magic = cursor.read_slice(TABLE_PAYLOAD_MAGIC.len())?;
@@ -285,17 +329,16 @@ impl TablePageManifest {
                     return Err(DbError::corruption("table payload magic is invalid"));
                 }
                 let row_count = cursor.read_u32()? as usize;
-                rows.reserve(row_count);
                 for _ in 0..row_count {
                     let row_id = cursor.read_i64()?;
                     let row_bytes_len = cursor.read_u32()? as usize;
                     let row_bytes_offset = cursor.offset;
                     let row_bytes = cursor.read_slice(row_bytes_len)?;
                     Row::decode(row_bytes)?;
-                    if chunk.tombstoned_row_ids.contains(&row_id) {
-                        continue;
+                    if tombstones.contains(&row_id) || overlay_ids.contains(&row_id) {
+                        continue; // skip tombstoned and overlaid base rows
                     }
-                    rows.push(TablePageEntry {
+                    base_row_entries.push(TablePageEntry {
                         row_id,
                         chunk_index: u32::try_from(chunk_index)
                             .map_err(|_| DbError::constraint("table chunk index exceeds u32"))?,
@@ -311,6 +354,7 @@ impl TablePageManifest {
                     });
                 }
             }
+
             if let Some(overlay_payload) = &chunk.overlay_payload {
                 if !overlay_payload.is_empty() {
                     let mut cursor = Cursor::new(overlay_payload.as_slice());
@@ -319,14 +363,13 @@ impl TablePageManifest {
                         return Err(DbError::corruption("table payload magic is invalid"));
                     }
                     let row_count = cursor.read_u32()? as usize;
-                    rows.reserve(row_count);
                     for _ in 0..row_count {
                         let row_id = cursor.read_i64()?;
                         let row_bytes_len = cursor.read_u32()? as usize;
                         let row_bytes_offset = cursor.offset;
                         let row_bytes = cursor.read_slice(row_bytes_len)?;
                         Row::decode(row_bytes)?;
-                        rows.push(TablePageEntry {
+                        overlay_row_entries.push(TablePageEntry {
                             row_id,
                             chunk_index: u32::try_from(chunk_index).map_err(|_| {
                                 DbError::constraint("table chunk index exceeds u32")
@@ -344,8 +387,29 @@ impl TablePageManifest {
                     }
                 }
             }
+
+            // Add base entries first, then overlay entries. Since overlay row_ids
+            // are not in base_row_entries, the merged list has unique row_ids per chunk.
+            rows.extend_from_slice(&base_row_entries);
+            rows.extend_from_slice(&overlay_row_entries);
         }
+
+        // Now rows are globally sorted by (chunk_index, row_id), but
+        // row_by_id needs them sorted by row_id. Sort and verify no duplicates.
         rows.sort_by_key(|entry| entry.row_id);
+
+        // Sanity check: after deduplication, there should be no duplicate row_ids
+        // because overlay_ids were used to skip overlaid base rows.
+        #[cfg(debug_assertions)]
+        {
+            for window in rows.windows(2) {
+                assert_ne!(
+                    window[0].row_id, window[1].row_id,
+                    "duplicate row_id in TablePageManifest rows"
+                );
+            }
+        }
+
         Ok(Self {
             chunks: Arc::new(chunks),
             rows: Arc::new(rows),
@@ -12989,12 +13053,28 @@ where
     let manifest = decode_paged_table_manifest_payload(&manifest_payload)?;
     let mut total_row_count = 0usize;
     for chunk in manifest.chunks {
-        let chunk_row_count =
-            visit_table_payload_rows_from_pointer(store, chunk.pointer, &mut visitor)?;
-        if chunk_row_count != chunk.row_count {
+        let mut count = 0usize;
+
+        let base_payload = read_overflow(store, chunk.pointer)?;
+        for row in decode_table_payload_rows(&base_payload)? {
+            if !chunk.tombstoned_row_ids.contains(&row.row_id) {
+                visitor(row.row_id, &row.values)?;
+                count += 1;
+            }
+        }
+
+        if let Some(overlay_pointer) = chunk.overlay_pointer {
+            let overlay_payload = read_overflow(store, overlay_pointer)?;
+            for row in decode_table_payload_rows(&overlay_payload)? {
+                visitor(row.row_id, &row.values)?;
+                count += 1;
+            }
+        }
+
+        if count != chunk.row_count {
             return Err(DbError::corruption("paged table chunk row count mismatch"));
         }
-        total_row_count = total_row_count.saturating_add(chunk_row_count);
+        total_row_count = total_row_count.saturating_add(count);
     }
     if state.row_count != 0 && total_row_count != state.row_count {
         return Err(DbError::corruption(
@@ -13014,34 +13094,6 @@ fn decode_table_payload_rows(bytes: &[u8]) -> Result<Vec<StoredRow>> {
         Ok(())
     })?;
     Ok(rows)
-}
-
-fn read_single_paged_table_chunk_payload<S: PageStore>(
-    store: &S,
-    state: PersistedTableState,
-    chunk_index: u32,
-) -> Result<Arc<Vec<u8>>> {
-    if state.pointer.head_page_id == 0 || state.pointer.logical_len == 0 {
-        return Err(DbError::corruption(
-            "paged table chunk requested from empty table state",
-        ));
-    }
-    let manifest_payload = read_overflow(store, state.pointer)?;
-    if crc32c_parts(&[manifest_payload.as_slice()]) != state.checksum {
-        return Err(DbError::corruption(
-            "paged table manifest checksum mismatch",
-        ));
-    }
-    let manifest = decode_paged_table_manifest_payload(&manifest_payload)?;
-    let chunk = manifest
-        .chunks
-        .get(chunk_index as usize)
-        .ok_or_else(|| DbError::corruption("paged table locator chunk index is invalid"))?;
-    let payload = Arc::new(read_overflow(store, chunk.pointer)?);
-    if crc32c_parts(&[payload.as_slice()]) != chunk.checksum {
-        return Err(DbError::corruption("paged table chunk checksum mismatch"));
-    }
-    Ok(payload)
 }
 
 fn encode_legacy_table_payload_from_manifest(manifest: &TablePageManifest) -> Result<Vec<u8>> {
@@ -13070,32 +13122,74 @@ pub(crate) fn read_table_payload_row_count_from_bytes(bytes: &[u8]) -> Result<us
 
 fn apply_paged_row_changes_to_manifest(
     manifest: &TablePageManifest,
-    page_size: u32,
     row_changes: &BTreeMap<i64, Option<Vec<Value>>>,
 ) -> Result<TablePageManifest> {
     if row_changes.is_empty() {
         return Ok(manifest.clone());
     }
 
+    eprintln!(
+        "DEBUG apply_paged_row_changes_to_manifest: row_changes={:?}",
+        row_changes.keys().collect::<Vec<_>>()
+    );
+
     let mut new_chunks = Vec::with_capacity(manifest.chunks.len());
     for chunk in manifest.chunks.iter() {
-        let previous_rows = decode_table_payload_rows(chunk.payload.as_slice())?;
-        let mut current_chunk_rows = Vec::with_capacity(previous_rows.len());
+        let mut new_tombstones: BTreeSet<i64> = chunk.tombstoned_row_ids.iter().copied().collect();
+        // Use BTreeMap so each row_id appears at most once in the overlay.
+        let mut overlay_rows: BTreeMap<i64, StoredRow> = BTreeMap::new();
         let mut chunk_changed = false;
 
+        // Scan the base payload: tombstone touched rows and queue their
+        // replacements in the overlay map.
+        let previous_rows = decode_table_payload_rows(chunk.payload.as_slice())?;
         for previous_row in previous_rows {
             match row_changes.get(&previous_row.row_id) {
                 Some(Some(next_values)) => {
                     chunk_changed = true;
-                    current_chunk_rows.push(StoredRow {
-                        row_id: previous_row.row_id,
-                        values: next_values.clone(),
-                    });
+                    new_tombstones.insert(previous_row.row_id);
+                    overlay_rows.insert(
+                        previous_row.row_id,
+                        StoredRow {
+                            row_id: previous_row.row_id,
+                            values: next_values.clone(),
+                        },
+                    );
                 }
                 Some(None) => {
                     chunk_changed = true;
+                    new_tombstones.insert(previous_row.row_id);
                 }
-                None => current_chunk_rows.push(previous_row),
+                None => {}
+            }
+        }
+
+        // Scan any existing overlay: replace rows that are re-updated,
+        // keep untouched rows, drop rows that are deleted.
+        if let Some(overlay_payload) = &chunk.overlay_payload {
+            let previous_overlay_rows = decode_table_payload_rows(overlay_payload.as_slice())?;
+            for previous_row in previous_overlay_rows {
+                match row_changes.get(&previous_row.row_id) {
+                    Some(Some(next_values)) => {
+                        chunk_changed = true;
+                        overlay_rows.insert(
+                            previous_row.row_id,
+                            StoredRow {
+                                row_id: previous_row.row_id,
+                                values: next_values.clone(),
+                            },
+                        );
+                    }
+                    Some(None) => {
+                        chunk_changed = true;
+                        overlay_rows.remove(&previous_row.row_id);
+                    }
+                    None => {
+                        overlay_rows
+                            .entry(previous_row.row_id)
+                            .or_insert(previous_row);
+                    }
+                }
             }
         }
 
@@ -13104,22 +13198,29 @@ fn apply_paged_row_changes_to_manifest(
             continue;
         }
 
-        for encoded_chunk in encode_paged_table_chunks_from_rows(&current_chunk_rows, page_size)? {
-            new_chunks.push(TablePageManifestChunk {
-                pointer: OverflowPointer {
-                    head_page_id: 0,
-                    logical_len: 0,
-                    flags: 0,
-                },
-                checksum: encoded_chunk.checksum,
-                row_count: encoded_chunk.row_count,
-                payload: Arc::new(encoded_chunk.payload),
-                tombstoned_row_ids: Arc::new(BTreeSet::new()),
-                overlay_pointer: None,
-                overlay_checksum: None,
-                overlay_payload: None,
-            });
-        }
+        let overlay_payload = if overlay_rows.is_empty() {
+            None
+        } else {
+            let rows: Vec<StoredRow> = overlay_rows.into_values().collect();
+            eprintln!(
+                "DEBUG apply_paged_row_changes_to_manifest: chunk changed, overlay rows={:?}",
+                rows.iter()
+                    .map(|r| (r.row_id, r.values.clone()))
+                    .collect::<Vec<_>>()
+            );
+            Some(Arc::new(encode_table_payload(&TableData { rows })?))
+        };
+
+        new_chunks.push(TablePageManifestChunk {
+            pointer: chunk.pointer,
+            checksum: chunk.checksum,
+            row_count: chunk.row_count,
+            payload: Arc::clone(&chunk.payload),
+            tombstoned_row_ids: Arc::new(new_tombstones),
+            overlay_pointer: None,
+            overlay_checksum: None,
+            overlay_payload,
+        });
     }
 
     TablePageManifest::from_chunks(new_chunks)
@@ -13610,7 +13711,7 @@ fn rewrite_paged_table_from_paged_mutations<S: PageStore>(
     store: &mut S,
     previous_state: PersistedTableState,
     delta: &PagedMutationDelta,
-    page_size: u32,
+    _page_size: u32,
 ) -> Result<PersistedTableState> {
     if delta.is_empty() || !previous_state.pointer.is_table_paged_manifest() {
         return Ok(previous_state);
@@ -13625,8 +13726,7 @@ fn rewrite_paged_table_from_paged_mutations<S: PageStore>(
         row_changes.insert(*row_id, None);
     }
 
-    let next_manifest =
-        apply_paged_row_changes_to_manifest(&previous_manifest, page_size, &row_changes)?;
+    let next_manifest = apply_paged_row_changes_to_manifest(&previous_manifest, &row_changes)?;
     rewrite_paged_table_from_manifest(store, previous_state, &next_manifest)
 }
 
@@ -13681,15 +13781,30 @@ fn rewrite_paged_table_from_manifest<S: PageStore>(
     let mut new_chunks = Vec::with_capacity(manifest.chunks.len());
     for current_chunk in manifest.chunks.iter() {
         let checksum = crc32c_parts(&[current_chunk.payload.as_slice()]);
+        let _overlay_checksum = current_chunk
+            .overlay_payload
+            .as_ref()
+            .map(|p| crc32c_parts(&[p.as_slice()]));
         let reused_index =
             reusable_previous
                 .iter()
                 .enumerate()
                 .find_map(|(index, (chunk_state, payload))| {
+                    let overlay_match = matches!(
+                        (&chunk_state.overlay_pointer, &current_chunk.overlay_payload),
+                        (None, None)
+                    );
                     (!reused_previous[index]
                         && chunk_state.checksum == checksum
-                        && payload.payload.as_slice() == current_chunk.payload.as_slice())
-                    .then_some(index)
+                        && payload.payload.as_slice() == current_chunk.payload.as_slice()
+                        && chunk_state.tombstoned_row_ids.len()
+                            == current_chunk.tombstoned_row_ids.len()
+                        && chunk_state
+                            .tombstoned_row_ids
+                            .iter()
+                            .all(|id| current_chunk.tombstoned_row_ids.contains(id))
+                        && overlay_match)
+                        .then_some(index)
                 });
         if let Some(index) = reused_index {
             reused_previous[index] = true;
@@ -13698,13 +13813,30 @@ fn rewrite_paged_table_from_manifest<S: PageStore>(
         }
 
         let pointer = write_overflow(store, &current_chunk.payload, CompressionMode::Never)?;
+        let overlay = if let Some(overlay_payload) = &current_chunk.overlay_payload {
+            let overlay_pointer =
+                write_overflow(store, overlay_payload.as_slice(), CompressionMode::Never)?;
+            let overlay_checksum = crc32c_parts(&[overlay_payload.as_slice()]);
+            Some((overlay_pointer, overlay_checksum))
+        } else {
+            None
+        };
+        let base_physical = read_table_payload_row_count_from_bytes(&current_chunk.payload)?;
+        let overlay_physical = current_chunk
+            .overlay_payload
+            .as_ref()
+            .map(|p| read_table_payload_row_count_from_bytes(p).unwrap_or(0))
+            .unwrap_or(0);
+        let visible = base_physical
+            .saturating_sub(current_chunk.tombstoned_row_ids.len())
+            .saturating_add(overlay_physical);
         new_chunks.push(PersistedTableChunkState {
             pointer,
             checksum,
-            row_count: read_table_payload_row_count_from_bytes(&current_chunk.payload)?,
+            row_count: visible,
             tombstoned_row_ids: current_chunk.tombstoned_row_ids.iter().copied().collect(),
-            overlay_pointer: current_chunk.overlay_pointer,
-            overlay_checksum: current_chunk.overlay_checksum,
+            overlay_pointer: overlay.map(|(p, _)| p),
+            overlay_checksum: overlay.map(|(_, c)| c),
         });
     }
 
@@ -13725,6 +13857,11 @@ fn rewrite_paged_table_from_manifest<S: PageStore>(
             continue;
         }
         free_overflow(store, chunk_state.pointer.head_page_id)?;
+        if let Some(overlay_pointer) = chunk_state.overlay_pointer {
+            if overlay_pointer.head_page_id != 0 {
+                free_overflow(store, overlay_pointer.head_page_id)?;
+            }
+        }
     }
 
     Ok(PersistedTableState {
@@ -16251,10 +16388,11 @@ fn encode_row_locator(locator: RowLocatorV1) -> Vec<u8> {
 }
 
 fn encode_paged_row_locator(locator: RowLocatorV2) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(12);
+    let mut bytes = Vec::with_capacity(13);
     bytes.extend_from_slice(&locator.chunk_index.to_le_bytes());
     bytes.extend_from_slice(&locator.byte_offset.to_le_bytes());
     bytes.extend_from_slice(&locator.byte_len.to_le_bytes());
+    bytes.push(if locator.is_overlay { 1 } else { 0 });
     bytes
 }
 
@@ -16268,6 +16406,13 @@ fn decode_row_locator(bytes: &[u8]) -> Result<DecodedRowLocator> {
             chunk_index: u32::from_le_bytes(bytes[0..4].try_into().expect("row locator chunk")),
             byte_offset: u32::from_le_bytes(bytes[4..8].try_into().expect("row locator offset")),
             byte_len: u32::from_le_bytes(bytes[8..12].try_into().expect("row locator len")),
+            is_overlay: false,
+        })),
+        13 => Ok(DecodedRowLocator::V2(RowLocatorV2 {
+            chunk_index: u32::from_le_bytes(bytes[0..4].try_into().expect("row locator chunk")),
+            byte_offset: u32::from_le_bytes(bytes[4..8].try_into().expect("row locator offset")),
+            byte_len: u32::from_le_bytes(bytes[8..12].try_into().expect("row locator len")),
+            is_overlay: bytes[12] != 0,
         })),
         _ => Err(DbError::corruption("row locator payload length is invalid")),
     }
@@ -16277,6 +16422,8 @@ fn append_paged_row_locator_entries(
     entries: &mut BTreeMap<u64, Vec<u8>>,
     payload: &[u8],
     chunk_index: u32,
+    is_overlay: bool,
+    skip: &BTreeSet<i64>,
 ) -> Result<()> {
     if payload.is_empty() {
         return Ok(());
@@ -16295,12 +16442,16 @@ fn append_paged_row_locator_entries(
         let row_bytes_len = cursor.read_u32()? as usize;
         let row_bytes_offset = cursor.offset;
         cursor.read_slice(row_bytes_len)?;
+        if skip.contains(&row_id) {
+            continue;
+        }
         let locator = RowLocatorV2 {
             chunk_index,
             byte_offset: u32::try_from(row_bytes_offset)
                 .map_err(|_| DbError::constraint("row locator offset exceeds u32"))?,
             byte_len: u32::try_from(row_bytes_len)
                 .map_err(|_| DbError::constraint("row locator length exceeds u32"))?,
+            is_overlay,
         };
         entries.insert(
             encode_row_id_locator_key(row_id),
@@ -16348,12 +16499,25 @@ fn build_paged_row_locator_entries_from_chunk_payloads(
 ) -> Result<BTreeMap<u64, Vec<u8>>> {
     let mut entries = BTreeMap::new();
     for (chunk_index, chunk) in chunk_payloads.iter().enumerate() {
+        let skip = chunk.tombstoned_row_ids.iter().copied().collect();
         append_paged_row_locator_entries(
             &mut entries,
             chunk.payload.as_slice(),
             u32::try_from(chunk_index)
                 .map_err(|_| DbError::constraint("paged table chunk index exceeds u32"))?,
+            false,
+            &skip,
         )?;
+        if let Some(overlay) = &chunk.overlay_payload {
+            append_paged_row_locator_entries(
+                &mut entries,
+                overlay.as_slice(),
+                u32::try_from(chunk_index)
+                    .map_err(|_| DbError::constraint("paged table chunk index exceeds u32"))?,
+                true,
+                &BTreeSet::new(),
+            )?;
+        }
     }
     Ok(entries)
 }
@@ -16383,7 +16547,25 @@ fn read_deferred_row_by_locator_from_paged_table_payload<S: PageStore>(
     row_id: i64,
     locator: RowLocatorV2,
 ) -> Result<Option<StoredRow>> {
-    let payload = read_single_paged_table_chunk_payload(store, state, locator.chunk_index)?;
+    let manifest_payload = read_overflow(store, state.pointer)?;
+    if crc32c_parts(&[manifest_payload.as_slice()]) != state.checksum {
+        return Err(DbError::corruption(
+            "paged table manifest checksum mismatch",
+        ));
+    }
+    let manifest = decode_paged_table_manifest_payload(&manifest_payload)?;
+    let chunk = manifest
+        .chunks
+        .get(locator.chunk_index as usize)
+        .ok_or_else(|| DbError::corruption("paged table locator chunk index is invalid"))?;
+    let pointer = if locator.is_overlay {
+        chunk.overlay_pointer.ok_or_else(|| {
+            DbError::corruption("paged table overlay pointer missing for overlay locator")
+        })?
+    } else {
+        chunk.pointer
+    };
+    let payload = read_overflow(store, pointer)?;
     let start = locator.byte_offset as usize;
     let end = start.saturating_add(locator.byte_len as usize);
     let row_bytes = payload

@@ -673,7 +673,7 @@ impl EngineRuntime {
         &mut self,
         prepared: &PreparedSimpleUpdate,
         params: &[Value],
-        page_size: u32,
+        _page_size: u32,
     ) -> Result<QueryResult> {
         let row_id = match resolve_prepared_simple_value(&prepared.row_id_source, params)? {
             Value::Int64(value) => value,
@@ -738,7 +738,6 @@ impl EngineRuntime {
                     row_changes.insert(row_id, Some(next_values));
                     let updated_manifest = super::apply_paged_row_changes_to_manifest(
                         manifest.as_ref(),
-                        page_size,
                         &row_changes,
                     )?;
                     self.replace_table_row_source(
@@ -843,7 +842,7 @@ impl EngineRuntime {
         &mut self,
         prepared: &PreparedSimpleDelete,
         params: &[Value],
-        page_size: u32,
+        _page_size: u32,
     ) -> Result<QueryResult> {
         let matching_row_ids = match &prepared.lookup {
             PreparedDeleteLookup::RowId(value_source) => {
@@ -942,11 +941,8 @@ impl EngineRuntime {
                     .copied()
                     .map(|row_id| (row_id, None))
                     .collect::<BTreeMap<_, _>>();
-                let updated_manifest = super::apply_paged_row_changes_to_manifest(
-                    manifest.as_ref(),
-                    page_size,
-                    &row_changes,
-                )?;
+                let updated_manifest =
+                    super::apply_paged_row_changes_to_manifest(manifest.as_ref(), &row_changes)?;
                 self.replace_table_row_source(
                     &prepared.table.name,
                     TableRowSource::Paged(Arc::new(updated_manifest)),
@@ -1223,7 +1219,7 @@ impl EngineRuntime {
         &mut self,
         table_name: &str,
         row_changes: &BTreeMap<i64, Option<Vec<Value>>>,
-        page_size: u32,
+        _page_size: u32,
     ) -> Result<()> {
         if row_changes.is_empty() {
             return Ok(());
@@ -1265,7 +1261,7 @@ impl EngineRuntime {
             )));
         };
         let updated_manifest =
-            super::apply_paged_row_changes_to_manifest(manifest.as_ref(), page_size, row_changes)?;
+            super::apply_paged_row_changes_to_manifest(manifest.as_ref(), row_changes)?;
         self.replace_table_row_source(
             table_name,
             TableRowSource::Paged(Arc::new(updated_manifest)),
@@ -1523,11 +1519,8 @@ impl EngineRuntime {
         }
 
         if changed_rows > 0 {
-            let updated_manifest = super::apply_paged_row_changes_to_manifest(
-                manifest.as_ref(),
-                page_size,
-                &row_changes,
-            )?;
+            let updated_manifest =
+                super::apply_paged_row_changes_to_manifest(manifest.as_ref(), &row_changes)?;
             self.replace_table_row_source(
                 &table.name,
                 TableRowSource::Paged(Arc::new(updated_manifest)),
@@ -1630,11 +1623,8 @@ impl EngineRuntime {
                 .iter()
                 .map(|row| (row.row_id, None))
                 .collect::<BTreeMap<_, _>>();
-            let updated_manifest = super::apply_paged_row_changes_to_manifest(
-                manifest.as_ref(),
-                page_size,
-                &row_changes,
-            )?;
+            let updated_manifest =
+                super::apply_paged_row_changes_to_manifest(manifest.as_ref(), &row_changes)?;
             self.replace_table_row_source(
                 &table.name,
                 TableRowSource::Paged(Arc::new(updated_manifest)),
@@ -2410,11 +2400,8 @@ impl EngineRuntime {
             TableRowSource::Paged(manifest) => {
                 let mut row_changes = BTreeMap::new();
                 row_changes.insert(row_id, Some(next_values.clone()));
-                let updated_manifest = super::apply_paged_row_changes_to_manifest(
-                    manifest.as_ref(),
-                    page_size,
-                    &row_changes,
-                )?;
+                let updated_manifest =
+                    super::apply_paged_row_changes_to_manifest(manifest.as_ref(), &row_changes)?;
                 self.replace_table_row_source(
                     table_name,
                     TableRowSource::Paged(Arc::new(updated_manifest)),
