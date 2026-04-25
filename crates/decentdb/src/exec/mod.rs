@@ -963,9 +963,16 @@ pub(crate) struct EngineRuntime {
 
 #[derive(Clone, Debug, PartialEq, Default)]
 pub(crate) struct PagedMutationDelta {
-    pub(crate) appended_rows: Vec<Vec<Value>>,
+    pub(crate) append_count: usize,
     pub(crate) updated_rows: BTreeMap<i64, Vec<Value>>,
     pub(crate) deleted_rows: BTreeSet<i64>,
+}
+
+impl PagedMutationDelta {
+    #[must_use]
+    fn is_empty(&self) -> bool {
+        self.append_count == 0 && self.updated_rows.is_empty() && self.deleted_rows.is_empty()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1572,58 +1579,57 @@ impl EngineRuntime {
                 }
                 if use_paged_row_storage && previous_pointer.is_table_paged_manifest() {
                     self.overflow_chain_caches.remove(&canonical_table_name);
-                    let rewritten_state =
-                        if !delta.updated_rows.is_empty() || !delta.deleted_rows.is_empty() {
-                            let new_state = rewrite_paged_table_from_paged_mutations(
-                                &mut store,
-                                previous_state,
-                                &delta,
-                                db.config().page_size,
-                            )?;
-                            let new_state = if !delta.appended_rows.is_empty() {
-                                // Recover stored rows by grabbing the last N from the resident data
-                                let data = row_source.resident_data();
-                                let existing_count =
-                                    data.rows.len().saturating_sub(delta.appended_rows.len());
-                                let appended_chunks = encode_paged_table_chunks_from_rows(
-                                    &data.rows[existing_count..],
-                                    db.config().page_size,
-                                )?;
-                                if !appended_chunks.is_empty() {
-                                    append_paged_table_chunks(
-                                        &mut store,
-                                        new_state,
-                                        &appended_chunks,
-                                        data.rows.len(),
-                                    )?
-                                } else {
-                                    new_state
-                                }
-                            } else {
-                                new_state
-                            };
-                            Some(new_state)
-                        } else if !delta.appended_rows.is_empty() {
+                    let rewritten_state = if !delta.updated_rows.is_empty()
+                        || !delta.deleted_rows.is_empty()
+                    {
+                        let new_state = rewrite_paged_table_from_paged_mutations(
+                            &mut store,
+                            previous_state,
+                            &delta,
+                            db.config().page_size,
+                        )?;
+                        let new_state = if delta.append_count > 0 {
+                            // Recover stored rows by grabbing the last N from the resident data
                             let data = row_source.resident_data();
-                            let existing_count =
-                                data.rows.len().saturating_sub(delta.appended_rows.len());
+                            let existing_count = data.rows.len().saturating_sub(delta.append_count);
                             let appended_chunks = encode_paged_table_chunks_from_rows(
                                 &data.rows[existing_count..],
                                 db.config().page_size,
                             )?;
                             if !appended_chunks.is_empty() {
-                                Some(append_paged_table_chunks(
+                                append_paged_table_chunks(
                                     &mut store,
-                                    previous_state,
+                                    new_state,
                                     &appended_chunks,
                                     data.rows.len(),
-                                )?)
+                                )?
                             } else {
-                                None
+                                new_state
                             }
                         } else {
-                            None
+                            new_state
                         };
+                        Some(new_state)
+                    } else if delta.append_count > 0 {
+                        let data = row_source.resident_data();
+                        let existing_count = data.rows.len().saturating_sub(delta.append_count);
+                        let appended_chunks = encode_paged_table_chunks_from_rows(
+                            &data.rows[existing_count..],
+                            db.config().page_size,
+                        )?;
+                        if !appended_chunks.is_empty() {
+                            Some(append_paged_table_chunks(
+                                &mut store,
+                                previous_state,
+                                &appended_chunks,
+                                data.rows.len(),
+                            )?)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
                     if let Some(new_state) = rewritten_state {
                         self.persisted_tables
                             .insert(canonical_table_name.clone(), new_state);
@@ -1645,14 +1651,14 @@ impl EngineRuntime {
                     }
                 }
                 let data = row_source.resident_data();
-                if !delta.appended_rows.is_empty()
+                if delta.append_count > 0
                     && delta.updated_rows.is_empty()
                     && delta.deleted_rows.is_empty()
                     && previous_pointer.head_page_id != 0
                     && !use_paged_row_storage
                     && !previous_pointer.is_compressed()
                 {
-                    let existing_count = data.rows.len().saturating_sub(delta.appended_rows.len());
+                    let existing_count = data.rows.len().saturating_sub(delta.append_count);
                     if existing_count <= data.rows.len() {
                         let appended_rows = encode_appended_table_rows(data, existing_count)?;
                         if !appended_rows.is_empty() {
@@ -1708,40 +1714,17 @@ impl EngineRuntime {
 
                 if use_paged_row_storage {
                     self.overflow_chain_caches.remove(&canonical_table_name);
-                    let new_state =
-                        if !delta.updated_rows.is_empty() || !delta.deleted_rows.is_empty() {
-                            let new_state = rewrite_paged_table_from_paged_mutations(
-                                &mut store,
-                                previous_state,
-                                &delta,
-                                db.config().page_size,
-                            )?;
-                            let new_state = if !delta.appended_rows.is_empty() {
-                                let existing_count =
-                                    data.rows.len().saturating_sub(delta.appended_rows.len());
-                                let appended_chunks = encode_paged_table_chunks_from_rows(
-                                    &data.rows[existing_count..],
-                                    db.config().page_size,
-                                )?;
-                                if !appended_chunks.is_empty() {
-                                    append_paged_table_chunks(
-                                        &mut store,
-                                        new_state,
-                                        &appended_chunks,
-                                        data.rows.len(),
-                                    )?
-                                } else {
-                                    new_state
-                                }
-                            } else {
-                                new_state
-                            };
-                            new_state
-                        } else if !delta.appended_rows.is_empty()
-                            && previous_pointer.is_table_paged_manifest()
-                        {
-                            let existing_count =
-                                data.rows.len().saturating_sub(delta.appended_rows.len());
+                    let new_state = if !delta.updated_rows.is_empty()
+                        || !delta.deleted_rows.is_empty()
+                    {
+                        let new_state = rewrite_paged_table_from_paged_mutations(
+                            &mut store,
+                            previous_state,
+                            &delta,
+                            db.config().page_size,
+                        )?;
+                        let new_state = if delta.append_count > 0 {
+                            let existing_count = data.rows.len().saturating_sub(delta.append_count);
                             let appended_chunks = encode_paged_table_chunks_from_rows(
                                 &data.rows[existing_count..],
                                 db.config().page_size,
@@ -1749,18 +1732,30 @@ impl EngineRuntime {
                             if !appended_chunks.is_empty() {
                                 append_paged_table_chunks(
                                     &mut store,
-                                    previous_state,
+                                    new_state,
                                     &appended_chunks,
                                     data.rows.len(),
                                 )?
                             } else {
-                                rewrite_paged_table_from_resident(
-                                    &mut store,
-                                    previous_state,
-                                    data,
-                                    db.config().page_size,
-                                )?
+                                new_state
                             }
+                        } else {
+                            new_state
+                        };
+                        new_state
+                    } else if delta.append_count > 0 && previous_pointer.is_table_paged_manifest() {
+                        let existing_count = data.rows.len().saturating_sub(delta.append_count);
+                        let appended_chunks = encode_paged_table_chunks_from_rows(
+                            &data.rows[existing_count..],
+                            db.config().page_size,
+                        )?;
+                        if !appended_chunks.is_empty() {
+                            append_paged_table_chunks(
+                                &mut store,
+                                previous_state,
+                                &appended_chunks,
+                                data.rows.len(),
+                            )?
                         } else {
                             rewrite_paged_table_from_resident(
                                 &mut store,
@@ -1768,7 +1763,15 @@ impl EngineRuntime {
                                 data,
                                 db.config().page_size,
                             )?
-                        };
+                        }
+                    } else {
+                        rewrite_paged_table_from_resident(
+                            &mut store,
+                            previous_state,
+                            data,
+                            db.config().page_size,
+                        )?
+                    };
                     self.persisted_tables
                         .insert(canonical_table_name.clone(), new_state);
                     let pk_index_root = if db.config().persistent_pk_index {
@@ -1788,7 +1791,7 @@ impl EngineRuntime {
                 //  3. Full re-encode: encode every row from scratch
                 let (payload, skip_overflow_pages) = if !delta.updated_rows.is_empty()
                     && delta.deleted_rows.is_empty()
-                    && delta.appended_rows.is_empty()
+                    && delta.append_count == 0
                 {
                     if let Some(cached) = cached_payload {
                         let mut dirty_indices = Vec::with_capacity(delta.updated_rows.len());
@@ -1810,7 +1813,7 @@ impl EngineRuntime {
                     } else {
                         (encode_table_payload(data)?, 0)
                     }
-                } else if !delta.appended_rows.is_empty()
+                } else if delta.append_count > 0
                     && delta.updated_rows.is_empty()
                     && delta.deleted_rows.is_empty()
                     && previous_pointer.head_page_id != 0
@@ -2599,7 +2602,7 @@ impl EngineRuntime {
             .insert(row_id);
     }
 
-    pub(super) fn mark_table_row_appended(&mut self, table_name: &str, values: &[Value]) {
+    pub(super) fn mark_table_row_appended(&mut self, table_name: &str) {
         if self.visible_table_is_temporary(table_name) {
             return;
         }
@@ -2615,8 +2618,7 @@ impl EngineRuntime {
         self.paged_mutations
             .entry(table_name)
             .or_default()
-            .appended_rows
-            .push(values.to_vec());
+            .append_count += 1;
     }
 
     pub(super) fn mark_all_tables_dirty(&mut self) {
@@ -13610,9 +13612,7 @@ fn rewrite_paged_table_from_paged_mutations<S: PageStore>(
     delta: &PagedMutationDelta,
     page_size: u32,
 ) -> Result<PersistedTableState> {
-    if (delta.updated_rows.is_empty() && delta.deleted_rows.is_empty())
-        || !previous_state.pointer.is_table_paged_manifest()
-    {
+    if delta.is_empty() || !previous_state.pointer.is_table_paged_manifest() {
         return Ok(previous_state);
     }
 

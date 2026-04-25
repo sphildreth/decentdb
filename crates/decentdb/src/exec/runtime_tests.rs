@@ -359,13 +359,8 @@ mod tests {
         runtime2
             .tables_mut()
             .insert("x".to_string(), TableData::default().into());
-        runtime2.mark_table_row_appended("x", &[Value::Int64(1)]);
-        assert!(!runtime2
-            .paged_mutations
-            .get("x")
-            .unwrap()
-            .appended_rows
-            .is_empty());
+        runtime2.mark_table_row_appended("x");
+        assert!(runtime2.paged_mutations.get("x").unwrap().append_count > 0);
         runtime2.mark_table_row_dirty("x", 3, 30, &[Value::Int64(30)]);
         // append and row-update are both allowed
         assert!(runtime2.paged_mutations.contains_key("x"));
@@ -610,12 +605,12 @@ mod tests {
         assert!(!runtime.paged_mutations.contains_key("w"));
 
         // Append-only dirty on a fresh table
-        runtime.mark_table_row_appended("u", &[]); // no-op since u doesn't exist; should not panic
-        runtime.mark_table_row_appended("t", &[]);
+        runtime.mark_table_row_appended("u"); // no-op since u doesn't exist; should not panic
+        runtime.mark_table_row_appended("t");
         assert!(runtime.paged_mutations.contains_key("t"));
 
         // Now test escalation when append-only present
-        runtime.mark_table_row_appended("v", &[Value::Int64(1)]);
+        runtime.mark_table_row_appended("v");
         runtime.mark_table_row_dirty("v", 1, 10, &[Value::Int64(10)]);
         assert!(runtime.paged_mutations.contains_key("v"));
 
@@ -626,7 +621,7 @@ mod tests {
             .unwrap()
             .deleted_rows
             .contains(&9));
-        runtime.mark_table_row_appended("v", &[Value::Int64(2)]);
+        runtime.mark_table_row_appended("v");
         assert!(runtime
             .paged_mutations
             .get("v")

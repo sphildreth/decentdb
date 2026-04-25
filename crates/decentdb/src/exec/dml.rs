@@ -1172,7 +1172,7 @@ impl EngineRuntime {
         if prepared.use_generic_index_updates {
             self.apply_insert_index_updates(index_updates)?;
         }
-        self.mark_table_row_appended(table_name, &stored_row.values);
+        self.mark_table_row_appended(table_name);
         Ok(1)
     }
 
@@ -1396,7 +1396,7 @@ impl EngineRuntime {
             self.append_stored_row_to_table_row_source(&table_name, &stored_row, page_size)?;
             self.apply_insert_index_updates(index_updates)?;
             if !temporary {
-                self.mark_table_row_appended(&table_name, &stored_row.values);
+                self.mark_table_row_appended(&table_name);
             }
             affected_rows += 1;
             if !statement.returning.is_empty() {
@@ -2725,7 +2725,7 @@ impl EngineRuntime {
                 .next_row_id = staged_table.next_row_id;
         }
         self.apply_insert_index_updates(index_updates)?;
-        self.mark_table_row_appended(&table_name, &stored_row.values);
+        self.mark_table_row_appended(&table_name);
 
         let result = if statement.returning.is_empty() {
             QueryResult::with_affected_rows(1)

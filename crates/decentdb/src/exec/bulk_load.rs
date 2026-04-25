@@ -65,7 +65,7 @@ impl EngineRuntime {
                 values: candidate,
             };
             self.append_stored_row_to_table_row_source(table_name, &stored_row, page_size)?;
-            self.mark_table_row_appended(table_name, &stored_row.values);
+            self.mark_table_row_appended(table_name);
             affected_rows += 1;
         }
         self.rebuild_indexes(page_size)?;
