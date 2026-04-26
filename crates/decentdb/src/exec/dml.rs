@@ -1525,10 +1525,14 @@ impl EngineRuntime {
                 &table.name,
                 TableRowSource::Paged(Arc::new(updated_manifest)),
             )?;
+            for (row_id, next_values) in &row_changes {
+                if let Some(values) = next_values {
+                    self.mark_table_row_dirty(&table.name, 0, *row_id, values);
+                }
+            }
             if !indexes_remain_fresh {
                 self.mark_indexes_stale_for_table(&table.name);
             }
-            self.mark_table_dirty(&table.name);
         }
 
         self.execute_after_triggers(
@@ -1629,10 +1633,12 @@ impl EngineRuntime {
                 &table.name,
                 TableRowSource::Paged(Arc::new(updated_manifest)),
             )?;
+            for row in &matching_rows {
+                self.mark_table_row_deleted(&table.name, row.row_id);
+            }
             if !indexes_remain_fresh {
                 self.mark_indexes_stale_for_table(&table.name);
             }
-            self.mark_table_dirty(&table.name);
         }
 
         self.execute_after_triggers(
