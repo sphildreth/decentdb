@@ -236,7 +236,7 @@ stats) are deliberately **out of scope** here and are listed in §6
 | N17   | AdoNet `DecentDBConnection` — fire `StateChange` on `Open()` and `Close()` | AdoNet           | P1  | no      | **Done**    |
 | N18   | AdoNet `GetSchema("Indexes")` — distinguish auto-PK indexes from user indexes | AdoNet           | P2  | no      | **Done**    |
 | N19   | EF Core — cache compiled query plans across DbContext lifetime              | EF Core + docs   | P2  | no      | **Done**    |
-| N-REL | Release: version bump, regenerate benchmark numbers, smoke tests            | release plumbing | —   | no      | Pending   |
+| N-REL | Release: version bump, regenerate benchmark numbers, smoke tests            | release plumbing | —   | no      | **Done**    |
 
 There is no slice for `EF1001` suppression — that issue was retracted
 during verification (the EF Core binding builds with zero warnings without

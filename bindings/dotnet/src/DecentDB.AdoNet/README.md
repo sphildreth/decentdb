@@ -28,9 +28,15 @@ The connection string accepts the following keys:
 
 Bare paths (e.g., `"/tmp/mydb.ddb"`) are also accepted by `DecentDBConnection`'s constructor and are automatically prefixed with `Data Source=`.
 
+## Cleanup helper
+
+Use `DecentDBConnection.DeleteDatabaseFiles(path)` to safely delete the database file and all sidecar files (`.wal`, `-wal`, `-shm`) in the correct order. This prevents stale WAL issues when recreating databases.
+
 ## Notes
 
 - The native engine library is shipped as a NuGet runtime native asset under `runtimes/{rid}/native/`.
 - Supported RIDs in this pre-release: `linux-x64`, `osx-x64`, `win-x64`.
+
+See the [top-level .NET bindings README](../../README.md) for the feature-parity matrix.
 
 Repository: https://github.com/sphildreth/decentdb

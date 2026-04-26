@@ -49,4 +49,6 @@ var artist = _artistById(context, 42);
 
 This reduces per-call latency from ~1–5 ms (LINQ translation + SQL generation) to sub-millisecond execution, matching the raw engine performance.
 
+See the [top-level .NET bindings README](../../README.md) for the feature-parity matrix and connection-string documentation.
+
 Repository: https://github.com/sphildreth/decentdb
