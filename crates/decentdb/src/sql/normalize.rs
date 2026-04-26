@@ -18,6 +18,21 @@ use super::ast::{
     WindowFrameUnit,
 };
 
+/// Rewrites `CREATE VIEW IF NOT EXISTS` to `CREATE VIEW` so pg_query can parse it.
+/// The original SQL is preserved for later IF NOT EXISTS flag detection in `normalize_create_view`.
+fn rewrite_create_view_if_not_exists(sql: &str) -> String {
+    const PAT: &str = "CREATE VIEW IF NOT EXISTS";
+    let trimmed = sql.trim_start();
+    let upper = trimmed.to_ascii_uppercase();
+    if upper.starts_with(PAT) {
+        // Grab everything after the pattern
+        let rest = &trimmed[PAT.len()..].trim_start();
+        format!("CREATE VIEW {}", rest)
+    } else {
+        sql.to_string()
+    }
+}
+
 pub(crate) fn normalize_statement_text(sql: &str) -> Result<Statement> {
     normalize_statement_text_with_generated_modes(sql, &[])
 }
@@ -26,7 +41,9 @@ pub(crate) fn normalize_statement_text_with_generated_modes(
     sql: &str,
     generated_column_modes: &[bool],
 ) -> Result<Statement> {
-    let parsed = libpg_query_sys::parse_statement(sql)
+    // Pre-rewrite: make CREATE VIEW IF NOT EXISTS parsable by pg_query.
+    let rewritten = rewrite_create_view_if_not_exists(sql);
+    let parsed = libpg_query_sys::parse_statement(&rewritten)
         .map_err(|error| DbError::sql(error.message().to_string()))?;
     let raw = parsed
         .stmts
@@ -34,6 +51,7 @@ pub(crate) fn normalize_statement_text_with_generated_modes(
         .and_then(|stmt| stmt.stmt.as_ref())
         .and_then(|stmt| stmt.node.as_ref())
         .ok_or_else(|| DbError::sql("parser returned an empty statement"))?;
+    // Pass the original unmodified sql so normalize_create_view can detect IF NOT EXISTS.
     normalize_statement_with_generated_modes(raw, sql, generated_column_modes)
 }
 
@@ -61,9 +79,10 @@ fn normalize_statement_with_generated_modes(
         NodeEnum::IndexStmt(statement) => {
             Ok(Statement::CreateIndex(normalize_create_index(statement)?))
         }
-        NodeEnum::ViewStmt(statement) => {
-            Ok(Statement::CreateView(normalize_create_view(statement)?))
-        }
+        NodeEnum::ViewStmt(statement) => Ok(Statement::CreateView(normalize_create_view(
+            statement,
+            original_sql,
+        )?)),
         NodeEnum::ExplainStmt(statement) => Ok(Statement::Explain(normalize_explain(
             statement,
             original_sql,
@@ -754,7 +773,10 @@ fn normalize_create_index(statement: &protobuf::IndexStmt) -> Result<CreateIndex
     })
 }
 
-fn normalize_create_view(statement: &protobuf::ViewStmt) -> Result<CreateViewStatement> {
+fn normalize_create_view(
+    statement: &protobuf::ViewStmt,
+    original_sql: &str,
+) -> Result<CreateViewStatement> {
     let column_names = statement
         .aliases
         .iter()
@@ -764,10 +786,20 @@ fn normalize_create_view(statement: &protobuf::ViewStmt) -> Result<CreateViewSta
         .view
         .as_ref()
         .ok_or_else(|| unsupported("CREATE VIEW is missing a view name"))?;
+
+    // Detect IF NOT EXISTS by inspecting the original SQL (pre-parser, before pg_query)
+    // pg_query itself does not expose if_not_exists; we detect it textually.
+    let trimmed = original_sql.trim_start();
+    let normalized = trimmed.to_ascii_uppercase();
+    // Pattern: "CREATE VIEW IF NOT EXISTS" (possibly with OR REPLACE in between)
+    let if_not_exists = normalized.starts_with("CREATE VIEW IF NOT EXISTS")
+        || normalized.contains("CREATE VIEW IF NOT EXISTS"); // more robust: find occurrence
+
     Ok(CreateViewStatement {
         view_name: normalize_range_var(view)?,
         temporary: view.relpersistence == "t",
         replace: statement.replace,
+        if_not_exists,
         column_names,
         query: normalize_query(as_select_stmt(
             statement

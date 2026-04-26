@@ -1,4 +1,5 @@
 using System.Data;
+using System.Linq;
 using DecentDB.AdoNet;
 using Xunit;
 
@@ -151,6 +152,47 @@ public sealed class SchemaIntrospectionTests : IDisposable
 
         // Primary key auto-index + ix_a
         Assert.Equal(2, dt.Rows.Count);
+    }
+
+    [Fact]
+    public void GetSchema_Indexes_FlagsAutoPkIndex()
+    {
+        using var conn = OpenConnection();
+        Execute(conn, "CREATE TABLE pk_test (id INTEGER PRIMARY KEY, name TEXT)");
+        Execute(conn, "CREATE INDEX ix_name ON pk_test (name)");
+
+        var dt = conn.GetSchema("Indexes");
+        var rows = dt.AsEnumerable()
+            .Where(r => string.Equals(r["TABLE_NAME"].ToString(), "pk_test", StringComparison.OrdinalIgnoreCase))
+            .ToList();
+
+        Assert.Equal(2, rows.Count);
+        var pkRow = rows.FirstOrDefault(r => r["INDEX_NAME"].ToString()!.StartsWith("pk_", StringComparison.OrdinalIgnoreCase));
+        var userRow = rows.FirstOrDefault(r => r["INDEX_NAME"].ToString() == "ix_name");
+
+        Assert.NotNull(pkRow);
+        Assert.True((bool)pkRow["IS_PRIMARY_KEY"]);
+        // Note: the primary key index is typically unique; this also verifies the column exists.
+        Assert.True((bool)pkRow["IS_UNIQUE"]);
+
+        Assert.NotNull(userRow);
+        Assert.False((bool)userRow["IS_PRIMARY_KEY"]);
+    }
+
+    [Fact]
+    public void GetSchema_Indexes_NoPk_NoAutoFlagged()
+    {
+        using var conn = OpenConnection();
+        // Table without PRIMARY KEY
+        Execute(conn, "CREATE TABLE nopk_table (id INTEGER, name TEXT)");
+        Execute(conn, "CREATE INDEX ix_id ON nopk_table (id)");
+
+        var dt = conn.GetSchema("Indexes", new[] { "nopk_table" });
+        foreach (DataRow row in dt.Rows)
+        {
+            var isPk = (bool)row["IS_PRIMARY_KEY"];
+            Assert.False(isPk);
+        }
     }
 
     [Fact]

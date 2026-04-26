@@ -224,17 +224,17 @@ stats) are deliberately **out of scope** here and are listed in §6
 | N5    | MicroOrm `InsertManyAsync` `RETURNING` parity with `InsertAsync`            | MicroOrm         | P1  | no      | **Done**    |
 | N6    | EF Core + MicroOrm — `Random.Next`/non-deterministic LINQ translator handling| EF Core, MicroOrm| P1  | no      | **Done**    |
 | N7    | EF Core `UseDecentDB` — accept bare paths consistently with ADO.NET         | EF Core          | P1  | no      | **Done**    |
-| N8    | AdoNet `DecentDBConnectionStringBuilder` — strongly-typed `Pooling` + docs  | AdoNet           | P2  | no      | Pending   |
+| N8    | AdoNet `DecentDBConnectionStringBuilder` — strongly-typed `Pooling` + docs  | AdoNet           | P2  | no      | **Done**    |
 | N9    | Engine — accept `CREATE VIEW IF NOT EXISTS` (or document the workaround)    | engine + docs    | P2  | yes (parser only) | Pending   |
 | N10   | Engine — improve subquery-in-FROM error context for the .NET surface        | engine + AdoNet  | P2  | yes (error message only) | Pending   |
 | N11   | Bindings docs — feature-parity matrix and POCO/connection-string notes      | docs             | P3  | no      | Pending   |
 | N12   | AdoNet — accept multi-statement SQL via `SqlStatementSplitter` in `Prepare`/`ExecuteReader` | AdoNet | P1 | no | **Done**    |
-| N13   | AdoNet `SqlStatementSplitter` — handle `CREATE TRIGGER ... BEGIN ... END` bodies | AdoNet           | P2  | no      | Pending   |
+| N13   | AdoNet `SqlStatementSplitter` — handle `CREATE TRIGGER ... BEGIN ... END` bodies | AdoNet           | P2  | no      | **Done**    |
 | N14   | EF Core — register an `IQueryTranslationPostprocessor` to rewrite correlated `Count` subqueries as `LEFT JOIN ... GROUP BY` | EF Core | P1 | no | Pending   |
-| N15   | EF Core — document and trim the ~7–8 s first-`DbContext` startup cost      | EF Core + docs   | P2  | no      | Pending   |
-| N16   | AdoNet — unify WAL filename convention and expose a `DeleteDatabaseFiles` helper | AdoNet           | P2  | no      | Pending   |
+| N15   | EF Core — document and trim the ~7–8 s first-`DbContext` startup cost      | EF Core + docs   | P2  | no      | **Done**    |
+| N16   | AdoNet — unify WAL filename convention and expose a `DeleteDatabaseFiles` helper | AdoNet           | P2  | no      | **Done**    |
 | N17   | AdoNet `DecentDBConnection` — fire `StateChange` on `Open()` and `Close()` | AdoNet           | P1  | no      | **Done**    |
-| N18   | AdoNet `GetSchema("Indexes")` — distinguish auto-PK indexes from user indexes | AdoNet           | P2  | no      | Pending   |
+| N18   | AdoNet `GetSchema("Indexes")` — distinguish auto-PK indexes from user indexes | AdoNet           | P2  | no      | **Done**    |
 | N19   | EF Core — cache compiled query plans across DbContext lifetime              | EF Core + docs   | P2  | no      | Pending   |
 | N-REL | Release: version bump, regenerate benchmark numbers, smoke tests            | release plumbing | —   | no      | Pending   |
 

@@ -467,6 +467,7 @@ pub(crate) struct CreateViewStatement {
     pub(crate) view_name: String,
     pub(crate) temporary: bool,
     pub(crate) replace: bool,
+    pub(crate) if_not_exists: bool,
     pub(crate) column_names: Vec<String>,
     pub(crate) query: Query,
 }

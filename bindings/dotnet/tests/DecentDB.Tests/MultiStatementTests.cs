@@ -120,4 +120,92 @@ public sealed class MultiStatementTests : IDisposable
         verify.CommandText = "SELECT COUNT(*) FROM mixed WHERE id IN (11, 21)";
         Assert.Equal(2L, verify.ExecuteScalar());
     }
+
+    // ─── N13: CREATE TRIGGER … BEGIN … END splitting ───
+
+    [Fact]
+    public void SqlStatementSplitter_Split_CreateTrigger_PreservesBody()
+    {
+        // Trigger body contains semicolons; should produce exactly one statement.
+        var sql = """
+            CREATE TRIGGER trg_audit
+            AFTER INSERT ON songs
+            BEGIN
+                INSERT INTO audit_log (msg) VALUES ('new song');
+                UPDATE stats SET count = count + 1;
+            END;
+            """;
+
+        var parts = SqlStatementSplitter.Split(sql);
+
+        Assert.Single(parts);
+        Assert.Contains("CREATE TRIGGER", parts[0]);
+        Assert.Contains("BEGIN", parts[0]);
+        Assert.Contains("INSERT INTO audit_log", parts[0]);
+        Assert.Contains("UPDATE stats", parts[0]);
+        Assert.Contains("END", parts[0]);
+    }
+
+    [Fact]
+    public void SqlStatementSplitter_Split_CreateTrigger_NestedBeginEnd()
+    {
+        var sql = """
+            CREATE TRIGGER trg_nested
+            AFTER INSERT ON t
+            BEGIN
+                BEGIN
+                    UPDATE a SET x = 1;
+                END;
+                INSERT INTO b VALUES (2);
+            END;
+            """;
+
+        var parts = SqlStatementSplitter.Split(sql);
+
+        Assert.Single(parts);
+        var stmt = parts[0];
+        Assert.Contains("CREATE TRIGGER", stmt);
+        // Count BEGIN occurrences
+        int beginCount = 0;
+        int idx = 0;
+        while ((idx = stmt.IndexOf("BEGIN", idx, StringComparison.OrdinalIgnoreCase)) >= 0)
+        {
+            beginCount++;
+            idx += 5;
+        }
+        Assert.Equal(2, beginCount); // outer + 1 nested
+    }
+
+    [Fact]
+    public void SqlStatementSplitter_Split_CreateTrigger_MissingEnd_ThrowsFormatException()
+    {
+        var sql = """
+            CREATE TRIGGER broken
+            AFTER INSERT ON t
+            BEGIN
+                INSERT INTO t VALUES (1);
+            -- missing END
+            """;
+
+        Assert.Throws<FormatException>(() => SqlStatementSplitter.Split(sql));
+    }
+
+    [Fact]
+    public void SqlStatementSplitter_Split_CreateTriggerThenSelect_ProducesTwoFragments()
+    {
+        var sql = """
+            CREATE TRIGGER trg
+            AFTER INSERT ON t
+            BEGIN
+                INSERT INTO log VALUES ('x');
+            END;
+            SELECT * FROM log;
+            """;
+
+        var parts = SqlStatementSplitter.Split(sql);
+
+        Assert.Equal(2, parts.Count);
+        Assert.Contains("CREATE TRIGGER", parts[0]);
+        Assert.Contains("SELECT", parts[1]);
+    }
 }

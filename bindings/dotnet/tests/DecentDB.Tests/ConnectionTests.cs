@@ -1,7 +1,9 @@
 using System;
+using System.Collections.Generic;
 using System.Data;
 using System.IO;
-using System.Threading.Tasks;
+using System.Linq;
+using System.Threading;
 using Xunit;
 using DecentDB.AdoNet;
 
@@ -116,5 +118,88 @@ public class ConnectionTests
             if (File.Exists(dbPath + "-wal"))
                 File.Delete(dbPath + "-wal");
         }
+    }
+
+    [Fact]
+    public void DeleteDatabaseFiles_RemovesAllSidecars()
+    {
+        var dir = Path.GetTempPath();
+        var basePath = Path.Combine(dir, $"testdel_{Guid.NewGuid():N}.ddb");
+        // Create dummy files
+        File.WriteAllText(basePath, "dummy");
+        File.WriteAllText(basePath + ".wal", "wal");
+        File.WriteAllText(basePath + "-wal", "d-wal");
+        File.WriteAllText(basePath + "-shm", "shm");
+
+        DecentDBConnection.DeleteDatabaseFiles(basePath);
+
+        Assert.False(File.Exists(basePath), "Data file should be deleted");
+        Assert.False(File.Exists(basePath + ".wal"), ".wal file should be deleted");
+        Assert.False(File.Exists(basePath + "-wal"), "-wal file should be deleted");
+        Assert.False(File.Exists(basePath + "-shm"), "-shm file should be deleted");
+    }
+
+    [Fact]
+    public void DeleteDatabaseFiles_NoOp_WhenMissing()
+    {
+        var dir = Path.GetTempPath();
+        var basePath = Path.Combine(dir, $"testdel_{Guid.NewGuid():N}.ddb");
+        // Ensure no files exist
+        Assert.False(File.Exists(basePath));
+        Assert.False(File.Exists(basePath + ".wal"));
+        Assert.False(File.Exists(basePath + "-wal"));
+        Assert.False(File.Exists(basePath + "-shm"));
+
+        // Should not throw
+        DecentDBConnection.DeleteDatabaseFiles(basePath);
+    }
+
+    [Fact]
+    public void DeleteDatabaseFiles_DeletesDataFileLast()
+    {
+        var dir = Path.GetTempPath();
+        var basePath = Path.Combine(dir, $"testdel_{Guid.NewGuid():N}.ddb");
+        // Create dummy files
+        File.WriteAllText(basePath, "dummy");
+        File.WriteAllText(basePath + ".wal", "wal");
+        File.WriteAllText(basePath + "-wal", "d-wal");
+        File.WriteAllText(basePath + "-shm", "shm");
+
+        var deletedOrder = new List<string>();
+        var watcher = new FileSystemWatcher(dir);
+        watcher.NotifyFilter = NotifyFilters.FileName;
+        watcher.EnableRaisingEvents = true;
+        watcher.Deleted += (s, e) =>
+        {
+            deletedOrder.Add(e.FullPath);
+        };
+
+        try
+        {
+            DecentDBConnection.DeleteDatabaseFiles(basePath);
+
+            // Give the watcher a moment to flush events
+            Thread.Sleep(100);
+        }
+        finally
+        {
+            watcher.EnableRaisingEvents = false;
+            watcher.Dispose();
+        }
+
+        // Remove duplicates if any
+        deletedOrder = deletedOrder.Distinct().ToList();
+
+        // Should have exactly 4 deletions
+        Assert.Equal(4, deletedOrder.Count);
+
+        var dataIndex = deletedOrder.FindIndex(p => p == basePath);
+        var walIndex = deletedOrder.FindIndex(p => p == basePath + ".wal");
+        var dashWalIndex = deletedOrder.FindIndex(p => p == basePath + "-wal");
+        var dashShmIndex = deletedOrder.FindIndex(p => p == basePath + "-shm");
+
+        Assert.True(walIndex >= 0 && walIndex < dataIndex, $".wal should be deleted before data file");
+        Assert.True(dashWalIndex >= 0 && dashWalIndex < dataIndex, "-wal should be deleted before data file");
+        Assert.True(dashShmIndex >= 0 && dashShmIndex < dataIndex, "-shm should be deleted before data file");
     }
 }
