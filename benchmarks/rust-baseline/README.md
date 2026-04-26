@@ -63,8 +63,6 @@ results/
 └── ...
 ```
 
-Results are tracked over time in [results/comparison.md](results/comparison.md).
-
 ## Headline numbers (engine 2.3.1, scale=`full`, ≈2.75M songs)
 
 | metric                       | RustRaw   |
