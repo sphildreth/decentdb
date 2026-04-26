@@ -1,6 +1,7 @@
 using System;
 using System.Data.Common;
 using DecentDB.AdoNet;
+using DecentDB.AdoNet.Internal;
 using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 
@@ -16,7 +17,7 @@ public static class DecentDBDbContextOptionsBuilderExtensions
         ArgumentNullException.ThrowIfNull(optionsBuilder);
 
         var extension = GetOrCreateExtension(optionsBuilder);
-        extension = extension.WithConnectionString(connectionString);
+        extension = extension.WithConnectionString(ConnectionStringHelper.NormalizeToConnectionString(connectionString));
 
         ((IDbContextOptionsBuilderInfrastructure)optionsBuilder).AddOrUpdateExtension(extension);
         ConfigureWarnings(optionsBuilder);

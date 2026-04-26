@@ -1,4 +1,5 @@
 using System;
+using System.Collections;
 using System.Collections.Concurrent;
 using System.ComponentModel.DataAnnotations;
 using System.Reflection;
@@ -16,6 +17,25 @@ internal sealed record PropertyMap(
 internal sealed class EntityMap
 {
     private static readonly ConcurrentDictionary<Type, EntityMap> Cache = new();
+    private static readonly ConcurrentDictionary<Type, EntityMap> ReadOnlyCache = new();
+
+    private static readonly HashSet<Type> BindableTypes = new()
+    {
+        typeof(bool), typeof(byte), typeof(sbyte),
+        typeof(short), typeof(ushort), typeof(int), typeof(uint),
+        typeof(long), typeof(ulong), typeof(float), typeof(double),
+        typeof(decimal), typeof(string), typeof(Guid),
+        typeof(DateTime), typeof(DateTimeOffset),
+        typeof(DateOnly), typeof(TimeOnly), typeof(TimeSpan),
+        typeof(byte[]),
+    };
+
+    private static bool IsBindableType(Type t)
+    {
+        var underlying = Nullable.GetUnderlyingType(t) ?? t;
+        if (underlying.IsEnum) return true;
+        return BindableTypes.Contains(underlying);
+    }
 
     public static EntityMap For<T>() => For(typeof(T));
 
@@ -24,7 +44,16 @@ internal sealed class EntityMap
         return Cache.GetOrAdd(entityType, static t => new EntityMap(t));
     }
 
-    private EntityMap(Type entityType)
+    public static EntityMap ForReadOnly<T>() => ForReadOnly(typeof(T));
+
+    public static EntityMap ForReadOnly(Type entityType)
+    {
+        return ReadOnlyCache.GetOrAdd(entityType, static t => new EntityMap(t, requirePrimaryKey: false));
+    }
+
+    private EntityMap(Type entityType) : this(entityType, requirePrimaryKey: true) { }
+
+    private EntityMap(Type entityType, bool requirePrimaryKey)
     {
         EntityType = entityType;
 
@@ -42,6 +71,16 @@ internal sealed class EntityMap
             if (prop.GetIndexParameters().Length != 0) continue;
 
             var isIgnored = prop.GetCustomAttribute<IgnoreAttribute>() != null;
+            if (isIgnored) continue;
+
+            var hasExplicitMap = prop.GetCustomAttribute<ColumnAttribute>() != null
+                || prop.GetCustomAttribute<PrimaryKeyAttribute>() != null;
+
+            if (!hasExplicitMap && !IsBindableType(prop.PropertyType))
+            {
+                continue;
+            }
+
             var isPk = prop.GetCustomAttribute<PrimaryKeyAttribute>() != null || string.Equals(prop.Name, "Id", StringComparison.Ordinal);
 
             var isNullable = ComputeNullability(prop);
@@ -54,7 +93,7 @@ internal sealed class EntityMap
 
             mapped.Add(new PropertyMap(prop, colName, isPk, isIgnored, maxLength, isNullable));
 
-            if (isPk && !isIgnored)
+            if (isPk)
             {
                 pk ??= prop;
             }
@@ -63,7 +102,7 @@ internal sealed class EntityMap
         Properties = mapped.Where(p => !p.IsIgnored).ToArray();
         PrimaryKey = pk;
 
-        if (PrimaryKey == null)
+        if (requirePrimaryKey && PrimaryKey == null)
         {
             throw new InvalidOperationException($"Entity type '{entityType.FullName}' must have a primary key (property named 'Id' or marked [PrimaryKey]).");
         }
@@ -84,7 +123,7 @@ internal sealed class EntityMap
         if (prop.GetCustomAttribute<NotNullAttribute>() != null) return false;
 
         var t = prop.PropertyType;
-        if (!t.IsValueType) return true; // convention: reference types are nullable
+        if (!t.IsValueType) return true;
         return Nullable.GetUnderlyingType(t) != null;
     }
 

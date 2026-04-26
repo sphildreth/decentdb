@@ -6,6 +6,7 @@ using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
 using DecentDB.AdoNet;
+using DecentDB.AdoNet.Internal;
 
 namespace DecentDB.MicroOrm;
 
@@ -52,25 +53,12 @@ public class DecentDBContext : IDisposable
 
     public DecentDBContext(string connectionStringOrPath, bool pooling = true)
     {
-        if (string.IsNullOrWhiteSpace(connectionStringOrPath))
-        {
-            throw new ArgumentException("Connection string or data source path must be provided.", nameof(connectionStringOrPath));
-        }
-
-        _connectionString = LooksLikeConnectionString(connectionStringOrPath)
-            ? connectionStringOrPath
-            : $"Data Source={connectionStringOrPath}";
-        _pooling = LooksLikeConnectionString(connectionStringOrPath) && TryGetBoolOption(connectionStringOrPath, "Pooling", out var poolingFromCs)
+        _connectionString = ConnectionStringHelper.NormalizeToConnectionString(connectionStringOrPath);
+        _pooling = TryGetBoolOption(_connectionString, "Pooling", out var poolingFromCs)
             ? poolingFromCs
             : pooling;
 
         InitializeDbSets();
-    }
-
-    private static bool LooksLikeConnectionString(string value)
-    {
-        // Heuristic: paths usually don't contain '='. Connection strings do.
-        return value.Contains('=');
     }
 
     private static bool TryGetBoolOption(string connectionString, string key, out bool value)
@@ -210,6 +198,26 @@ public class DecentDBContext : IDisposable
     public async Task<List<T>> QueryAsync<T>(string sql, params object?[] args) where T : class, new()
     {
         var map = EntityMap.For<T>();
+        using var scope = AcquireConnectionScope();
+        using var cmd = BuildRawCommand(scope.Connection, sql, args);
+        using var reader = await cmd.ExecuteReaderAsync();
+        var mapper = FastMaterializer<T>.Bind(map, reader);
+        var list = new List<T>();
+        while (await reader.ReadAsync())
+        {
+            list.Add(mapper(reader));
+        }
+        return list;
+    }
+
+    /// <summary>
+    /// Executes raw SQL and maps results to <typeparamref name="T"/> without requiring a primary key.
+    /// Use this for read-only DTOs (view rows, aggregate projections). For write-side mapped entities
+    /// use Set&lt;T&gt;() or QueryAsync&lt;T&gt;().
+    /// </summary>
+    public async Task<List<T>> QueryRawAsync<T>(string sql, params object?[] args) where T : class, new()
+    {
+        var map = EntityMap.ForReadOnly<T>();
         using var scope = AcquireConnectionScope();
         using var cmd = BuildRawCommand(scope.Connection, sql, args);
         using var reader = await cmd.ExecuteReaderAsync();

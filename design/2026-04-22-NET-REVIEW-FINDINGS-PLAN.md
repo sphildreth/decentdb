@@ -217,13 +217,13 @@ stats) are deliberately **out of scope** here and are listed in §6
 
 | Slice | Title                                                                       | Bindings touched | Pri | Engine? | Status    |
 |-------|-----------------------------------------------------------------------------|------------------|----:|---------|-----------|
-| N1    | EF Core multi-row `VALUES` coalescing in `ModificationCommandBatch`         | EF Core          | P0  | no      | Pending   |
-| N2    | MicroOrm `InsertManyAsync` — multi-row `VALUES` + cached parameter shape    | MicroOrm         | P0  | no      | Pending   |
-| N3    | MicroOrm POCO portability — ignore unmapped reference/collection properties | MicroOrm         | P1  | no      | Pending   |
-| N4    | MicroOrm `QueryRawAsync<T>` for keyless DTOs                                | MicroOrm         | P1  | no      | Pending   |
-| N5    | MicroOrm `InsertManyAsync` `RETURNING` parity with `InsertAsync`            | MicroOrm         | P1  | no      | Pending   |
-| N6    | EF Core + MicroOrm — `Random.Next`/non-deterministic LINQ translator handling| EF Core, MicroOrm| P1  | no      | Pending   |
-| N7    | EF Core `UseDecentDB` — accept bare paths consistently with ADO.NET         | EF Core          | P1  | no      | Pending   |
+| N1    | EF Core multi-row `VALUES` coalescing in `ModificationCommandBatch`         | EF Core          | P0  | no      | **Done**    |
+| N2    | MicroOrm `InsertManyAsync` — multi-row `VALUES` + cached parameter shape    | MicroOrm         | P0  | no      | **Done**    |
+| N3    | MicroOrm POCO portability — ignore unmapped reference/collection properties | MicroOrm         | P1  | no      | **Done**    |
+| N4    | MicroOrm `QueryRawAsync<T>` for keyless DTOs                                | MicroOrm         | P1  | no      | **Done**    |
+| N5    | MicroOrm `InsertManyAsync` `RETURNING` parity with `InsertAsync`            | MicroOrm         | P1  | no      | **Done**    |
+| N6    | EF Core + MicroOrm — `Random.Next`/non-deterministic LINQ translator handling| EF Core, MicroOrm| P1  | no      | **Done**    |
+| N7    | EF Core `UseDecentDB` — accept bare paths consistently with ADO.NET         | EF Core          | P1  | no      | **Done**    |
 | N8    | AdoNet `DecentDBConnectionStringBuilder` — strongly-typed `Pooling` + docs  | AdoNet           | P2  | no      | Pending   |
 | N9    | Engine — accept `CREATE VIEW IF NOT EXISTS` (or document the workaround)    | engine + docs    | P2  | yes (parser only) | Pending   |
 | N10   | Engine — improve subquery-in-FROM error context for the .NET surface        | engine + AdoNet  | P2  | yes (error message only) | Pending   |
