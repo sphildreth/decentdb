@@ -4732,7 +4732,15 @@ impl EngineRuntime {
         let ctes = BTreeMap::new();
         let needs_virtual_generated = !generated_columns_are_stored(table);
 
-        let mut groups: BTreeMap<Vec<u8>, Vec<Vec<Value>>> = BTreeMap::new();
+        // Materialize filtered rows into a single flat buffer and store only
+        // row indices per group. Previously this path stored full row clones
+        // per group and then cloned them again into a per-group `Dataset`;
+        // that doubled the copy cost and regressed aggregate-over-full-table
+        // queries by ~2x versus the prior `evaluate_grouped_select` path.
+        // Indexing into one shared Dataset matches that older path's
+        // efficiency while keeping the streaming scan from `source.rows()`.
+        let mut all_rows: Vec<Vec<Value>> = Vec::new();
+        let mut groups: BTreeMap<Vec<u8>, Vec<usize>> = BTreeMap::new();
 
         for row_result in source.rows() {
             let row_ref = row_result?;
@@ -4755,7 +4763,9 @@ impl EngineRuntime {
                 .collect::<Result<Vec<_>>>()?;
             let key = row_identity(&key_values)?;
 
-            groups.entry(key).or_default().push(values);
+            let row_index = all_rows.len();
+            all_rows.push(values);
+            groups.entry(key).or_default().push(row_index);
         }
 
         if groups.is_empty() && plan.group_by.is_empty() {
@@ -4781,18 +4791,16 @@ impl EngineRuntime {
         let projection_order_plan = projection_order_by_plan(plan.order_by, plan.projection);
         let mut output_with_order: Vec<(Vec<Value>, Vec<Value>)> = Vec::new();
 
-        for group_rows in groups.values() {
-            let group_dataset = Dataset::with_rows(columns.clone(), group_rows.clone());
-            let group_row_indexes: Vec<usize> = (0..group_rows.len()).collect();
+        // Build a single shared dataset that every group indexes into. This
+        // replaces the per-group `Dataset::with_rows(columns.clone(),
+        // group_rows.clone())` that previously cloned every matching row
+        // twice.
+        let group_dataset = Dataset::with_rows(columns.clone(), all_rows);
 
+        for group_row_indexes in groups.values() {
             if let Some(having) = plan.having {
-                let val = self.eval_group_expr(
-                    having,
-                    &group_dataset,
-                    &group_row_indexes,
-                    params,
-                    &ctes,
-                )?;
+                let val =
+                    self.eval_group_expr(having, &group_dataset, group_row_indexes, params, &ctes)?;
                 if !matches!(val, Value::Bool(true)) {
                     continue;
                 }
@@ -4808,7 +4816,7 @@ impl EngineRuntime {
                 output.push(self.eval_group_expr(
                     expr,
                     &group_dataset,
-                    &group_row_indexes,
+                    group_row_indexes,
                     params,
                     &ctes,
                 )?);
@@ -4826,7 +4834,7 @@ impl EngineRuntime {
                         self.eval_group_expr(
                             &order.expr,
                             &group_dataset,
-                            &group_row_indexes,
+                            group_row_indexes,
                             params,
                             &ctes,
                         )

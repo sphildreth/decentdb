@@ -891,7 +891,12 @@ impl Db {
             return Ok(page_id);
         }
 
-        let max_staged_page_id = txn.staged_pages.keys().copied().max().unwrap_or(0);
+        // `staged_pages` is a BTreeMap keyed by PageId, so its last entry is
+        // the largest staged page id in O(log n). Using `keys().max()` here
+        // was O(n) per allocation and made this function O(n^2) across a
+        // large transaction (e.g. bulk seeding), dominating CPU time for
+        // single-transaction multi-million-row inserts.
+        let max_staged_page_id = txn.staged_pages.keys().next_back().copied().unwrap_or(0);
         let next_page_id = self
             .inner
             .pager
