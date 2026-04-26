@@ -156,13 +156,42 @@ def setup_schema(conn, engine_name):
     cur.execute("CREATE INDEX idx_payments_order_id ON payments(order_id)")
 
 
+def _cleanup_db_files(db_path):
+    for suffix in ("", ".wal", "-wal", ".shm", "-shm"):
+        try:
+            os.unlink(db_path + suffix)
+        except OSError:
+            pass
+
+
+def _cleanup_db_files(db_path):
+    for suffix in ("", ".wal", "-wal", ".shm", "-shm"):
+        try:
+            os.unlink(db_path + suffix)
+        except OSError:
+            pass
+
+
 def setup_decentdb(db_path):
+    _cleanup_db_files(db_path)
     conn = decentdb.connect(db_path)
     setup_schema(conn, "decentdb")
     return conn
 
 
 def setup_sqlite(db_path):
+    _cleanup_db_files(db_path)
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.execute("PRAGMA journal_mode=WAL")
+    cur.execute("PRAGMA synchronous=FULL")
+    cur.execute("PRAGMA wal_autocheckpoint=0")
+    setup_schema(conn, "sqlite")
+    return conn
+
+
+def setup_sqlite(db_path):
+    _cleanup_db_files(db_path)
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
     cur.execute("PRAGMA journal_mode=WAL")

@@ -24,6 +24,13 @@ if (options.ShowHelp)
 }
 
 var offerings = ResolveOfferings(options.Engine);
+
+var benchDir = Path.GetDirectoryName(Path.GetFullPath(options.DbPrefix)) ?? ".";
+var benchPattern = $"{Path.GetFileName(options.DbPrefix)}_*";
+foreach (var file in Directory.EnumerateFiles(benchDir, benchPattern))
+{
+    File.Delete(file);
+}
 var results = new Dictionary<OfferingKind, OfferingResult>();
 foreach (var offering in offerings)
 {
@@ -1084,6 +1091,7 @@ static void DeleteDbFiles(string dbPath)
     TryDelete(dbPath);
     TryDelete(dbPath + ".wal");
     TryDelete(dbPath + "-wal");
+    TryDelete(dbPath + ".shm");
     TryDelete(dbPath + "-shm");
 
     static void TryDelete(string path)

@@ -408,7 +408,7 @@ def build_checks() -> list[Check]:
             key="node-tests",
             title="Node.js binding tests",
             cwd=REPO_ROOT / "bindings" / "node" / "decentdb",
-            command="npm test",
+            command="rm -rf build && npm test",
             env={"DECENTDB_NATIVE_LIB_PATH": str(native_lib)},
             stage=4,
             requires="node",
