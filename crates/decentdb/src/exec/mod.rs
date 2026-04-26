@@ -46,9 +46,9 @@ use crate::planner;
 use crate::record::compression::{CompressionMode, AUTO_MIN_PAYLOAD_BYTES};
 use crate::record::key::encode_index_key;
 use crate::record::overflow::{
-    append_uncompressed_with_first_page_patch, build_overflow_chain_cache, free_overflow,
-    read_overflow, read_uncompressed_overflow_tail, rewrite_overflow, rewrite_overflow_cached,
-    write_overflow, OverflowChainCache, OverflowPointer, OverflowTailInfo, OVERFLOW_HEADER_SIZE,
+    build_overflow_chain_cache, free_overflow, read_overflow, read_uncompressed_overflow_tail,
+    rewrite_overflow, rewrite_overflow_cached, write_overflow, OverflowChainCache, OverflowPointer,
+    OverflowTailInfo, OVERFLOW_HEADER_SIZE,
 };
 use crate::record::row::Row;
 use crate::record::value::{compare_decimal, parse_decimal_text, Value};
@@ -1203,6 +1203,13 @@ impl EngineRuntime {
         Some(payload)
     }
 
+    fn take_cached_payload(&mut self, table_name: &str) -> Option<Arc<Vec<u8>>> {
+        let payload = self.cached_payloads.remove(table_name)?;
+        self.cached_payload_access_order
+            .retain(|key| key != table_name);
+        Some(payload)
+    }
+
     fn touch_cached_payload(&mut self, table_name: &str) {
         self.cached_payload_access_order
             .retain(|key| key != table_name);
@@ -1608,10 +1615,10 @@ impl EngineRuntime {
                 let previous_pointer = previous_state.pointer;
                 let use_paged_row_storage =
                     db.config().paged_row_storage || previous_pointer.is_table_paged_manifest();
-                let cached_payload = if !delta.updated_rows.is_empty()
-                    && (!use_paged_row_storage || !previous_pointer.is_table_paged_manifest())
+                let cached_payload = if !use_paged_row_storage
+                    || !previous_pointer.is_table_paged_manifest()
                 {
-                    self.cached_payload(&canonical_table_name)
+                    self.take_cached_payload(&canonical_table_name)
                 } else {
                     None
                 };
@@ -1684,20 +1691,39 @@ impl EngineRuntime {
                     if existing_count <= data.rows.len() {
                         let appended_rows = encode_appended_table_rows(data, existing_count)?;
                         if !appended_rows.is_empty() {
-                            let row_count_bytes = u32::try_from(data.rows.len())
-                                .map_err(|_| DbError::constraint("table row count exceeds u32"))?
-                                .to_le_bytes();
-                            let (pointer, checksum) = append_uncompressed_with_first_page_patch(
-                                &mut store,
-                                previous_pointer,
-                                TABLE_PAYLOAD_MAGIC.len(),
-                                &row_count_bytes,
-                                &appended_rows,
-                            )?;
-                            let tail = read_uncompressed_overflow_tail(&store, pointer)?
-                                .ok_or_else(|| {
-                                    DbError::corruption("overflow tail info is missing")
-                                })?;
+                            let new_payload = if let Some(cached) = cached_payload {
+                                append_table_payload_from_cached(cached, data)?
+                            } else {
+                                let previous_payload = read_overflow(&store, previous_pointer)?;
+                                append_table_payload(previous_payload, data)?
+                            };
+                            let checksum = crc32c_parts(&[new_payload.as_slice()]);
+                            let (pointer, new_chain_cache, tail) =
+                                if let Some(chain_cache) =
+                                    self.overflow_chain_caches.get(&canonical_table_name)
+                                {
+                                    rewrite_overflow_cached(
+                                        &mut store,
+                                        previous_pointer,
+                                        &new_payload,
+                                        &chain_cache.page_ids,
+                                        0,
+                                    )?
+                                } else {
+                                    let ptr = rewrite_overflow(
+                                        &mut store,
+                                        previous_pointer,
+                                        &new_payload,
+                                        CompressionMode::Never,
+                                    )?;
+                                    let cache =
+                                        build_overflow_chain_cache(&store, ptr.head_page_id)?;
+                                    let tail = read_uncompressed_overflow_tail(&store, ptr)?
+                                        .unwrap_or_default();
+                                    (ptr, cache, tail)
+                                };
+                            self.overflow_chain_caches
+                                .insert(canonical_table_name.clone(), new_chain_cache);
                             self.persisted_tables.insert(
                                 canonical_table_name.clone(),
                                 PersistedTableState {
@@ -1708,27 +1734,22 @@ impl EngineRuntime {
                                     pk_index_root: previous_state.pk_index_root,
                                 },
                             );
-                            // Invalidate chain cache — the append path
-                            // modified the chain without hashing.
-                            self.overflow_chain_caches.remove(&canonical_table_name);
                             if db.config().persistent_pk_index {
-                                let payload = Arc::new(read_overflow(&store, pointer)?);
                                 let pk_index_root =
-                                    build_persistent_pk_index_root(db, payload.as_slice())?;
+                                    build_persistent_pk_index_root(db, new_payload.as_slice())?;
                                 replace_table_pk_index_root(
                                     self,
                                     db,
                                     &canonical_table_name,
                                     pk_index_root,
                                 )?;
-                                self.cache_payload_insert(
-                                    canonical_table_name.clone(),
-                                    Arc::clone(&payload),
-                                );
                             } else {
                                 replace_table_pk_index_root(self, db, &canonical_table_name, None)?;
-                                self.cache_payload_remove(&canonical_table_name);
                             }
+                            self.cache_payload_insert(
+                                canonical_table_name.clone(),
+                                Arc::new(new_payload),
+                            );
                             continue;
                         }
                     }
@@ -14408,6 +14429,17 @@ fn encode_appended_table_rows(data: &TableData, existing_count: usize) -> Result
         encode_bytes(&mut appended, &encoded_row)?;
     }
     Ok(appended)
+}
+
+fn append_table_payload_from_cached(
+    cached: Arc<Vec<u8>>,
+    data: &TableData,
+) -> Result<Vec<u8>> {
+    if data.rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let previous = Arc::try_unwrap(cached).unwrap_or_else(|arc| arc.as_slice().to_vec());
+    append_table_payload(previous, data)
 }
 
 fn append_table_payload(mut previous: Vec<u8>, data: &TableData) -> Result<Vec<u8>> {
