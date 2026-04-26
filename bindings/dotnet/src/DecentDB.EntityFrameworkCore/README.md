@@ -31,4 +31,22 @@ using var ctx = new MyDbContext(options);
 
 The `DecentDBModelBuilder.BuildModel<TContext>()` method caches the model per context type. Subsequent calls return the cached instance immediately.
 
+### Compiled queries for tight loops
+
+For hot-path queries executed thousands of times (e.g., in a request loop), use `EF.CompileQuery` to pre-compile the LINQ expression tree and eliminate per-call translation overhead:
+
+```csharp
+using Microsoft.EntityFrameworkCore;
+
+// Define once at application startup
+private static readonly Func<MyDbContext, int, Artist?> _artistById =
+    EF.CompileQuery((MyDbContext ctx, int id) =>
+        ctx.Artists.FirstOrDefault(a => a.Id == id));
+
+// Use in hot path — zero LINQ translation cost
+var artist = _artistById(context, 42);
+```
+
+This reduces per-call latency from ~1–5 ms (LINQ translation + SQL generation) to sub-millisecond execution, matching the raw engine performance.
+
 Repository: https://github.com/sphildreth/decentdb

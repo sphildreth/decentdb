@@ -10,6 +10,7 @@ namespace DecentDB.EntityFrameworkCore;
 public sealed class DecentDBOptionsExtension : RelationalOptionsExtension
 {
     private DbContextOptionsExtensionInfo? _info;
+    private bool _correlatedAggregateRewrite = true;
 
     public DecentDBOptionsExtension()
     {
@@ -18,13 +19,23 @@ public sealed class DecentDBOptionsExtension : RelationalOptionsExtension
     private DecentDBOptionsExtension(DecentDBOptionsExtension copyFrom)
         : base(copyFrom)
     {
+        _correlatedAggregateRewrite = copyFrom._correlatedAggregateRewrite;
+    }
+
+    public bool CorrelatedAggregateRewrite => _correlatedAggregateRewrite;
+
+    public DecentDBOptionsExtension WithCorrelatedAggregateRewrite(bool enabled)
+    {
+        var clone = (DecentDBOptionsExtension)Clone();
+        clone._correlatedAggregateRewrite = enabled;
+        return clone;
     }
 
     public override DbContextOptionsExtensionInfo Info
         => _info ??= new ExtensionInfo(this);
 
     public override void ApplyServices(IServiceCollection services)
-        => services.AddEntityFrameworkDecentDB();
+        => services.AddEntityFrameworkDecentDB(this);
 
     public override void Validate(IDbContextOptions options)
     {

@@ -18,8 +18,14 @@ namespace DecentDB.EntityFrameworkCore.Extensions;
 public static class DecentDBServiceCollectionExtensions
 {
     public static IServiceCollection AddEntityFrameworkDecentDB(this IServiceCollection serviceCollection)
+        => AddEntityFrameworkDecentDB(serviceCollection, null);
+
+    internal static IServiceCollection AddEntityFrameworkDecentDB(
+        this IServiceCollection serviceCollection,
+        DecentDBOptionsExtension? extension)
     {
         var builder = new EntityFrameworkRelationalServicesBuilder(serviceCollection);
+        var disableCorrelatedAggregateRewrite = extension?.CorrelatedAggregateRewrite == false;
 
         builder.TryAdd<LoggingDefinitions, DecentDBLoggingDefinitions>();
         builder.TryAdd<IDatabaseProvider, DatabaseProvider<DecentDBOptionsExtension>>();
@@ -36,7 +42,9 @@ public static class DecentDBServiceCollectionExtensions
         builder.TryAdd<IMethodCallTranslatorProvider, DecentDBMethodCallTranslatorProvider>();
         builder.TryAdd<IMemberTranslatorProvider, DecentDBMemberTranslatorProvider>();
         builder.TryAdd<IEvaluatableExpressionFilter, DecentDBEvaluatableExpressionFilter>();
-        builder.TryAdd<IEvaluatableExpressionFilter, DecentDBEvaluatableExpressionFilter>();
+        builder.TryAdd<IQueryTranslationPostprocessorFactory, DecentDBQueryTranslationPostprocessorFactory>();
+        // Register the disable flag as a singleton so the factory can access it
+        serviceCollection.AddSingleton(new CorrelatedAggregateRewriteOption(disableCorrelatedAggregateRewrite));
         builder.TryAdd<IUpdateSqlGenerator, DecentDBUpdateSqlGenerator>();
         builder.TryAdd<IModificationCommandBatchFactory, DecentDBModificationCommandBatchFactory>();
         builder.TryAdd<IQueryableMethodTranslatingExpressionVisitorFactory,

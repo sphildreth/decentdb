@@ -12,4 +12,17 @@ public sealed class DecentDBDbContextOptionsBuilder : RelationalDbContextOptions
 
     public DbContextOptionsBuilder ContextOptionsBuilder
         => OptionsBuilder;
+
+    /// <summary>
+    /// Disables the correlated aggregate rewrite (N14) that transforms
+    /// correlated COUNT subqueries into LEFT JOIN ... GROUP BY.
+    /// </summary>
+    public DecentDBDbContextOptionsBuilder DisableCorrelatedAggregateRewrite()
+    {
+        var extension = OptionsBuilder.Options.FindExtension<DecentDBOptionsExtension>()
+            ?? new DecentDBOptionsExtension();
+        ((IDbContextOptionsBuilderInfrastructure)OptionsBuilder).AddOrUpdateExtension(
+            extension.WithCorrelatedAggregateRewrite(false));
+        return this;
+    }
 }
