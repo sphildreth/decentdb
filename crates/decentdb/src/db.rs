@@ -4253,6 +4253,11 @@ impl Db {
             snapshot_lsn,
         )?;
         if !targeted_ok {
+            // Intentionally unsupported for row-source execution: the
+            // statement analyzer could not determine a conservative set of
+            // referenced base tables (CTEs, recursive queries, VALUES,
+            // subqueries, etc.). Fall back to broad-load so the generic
+            // executor has every table available.
             self.ensure_runtime_all_tables_loaded_at_snapshot(runtime, snapshot_lsn)?;
         }
         if *indexes_maybe_stale {
@@ -4358,6 +4363,9 @@ impl Db {
         if runtime.can_execute_statement_in_state_without_clone(statement) {
             let Some(base_tables) = self.safe_referenced_base_tables_in_runtime(runtime, statement)
             else {
+                // Intentionally unsupported for targeted loading: the
+                // statement analyzer could not determine a conservative set
+                // of referenced base tables. Fall back to broad-load.
                 self.ensure_runtime_all_tables_loaded_at_snapshot(runtime, snapshot_lsn)?;
                 let result =
                     runtime.execute_statement(statement, params, self.inner.config.page_size)?;
@@ -4379,6 +4387,11 @@ impl Db {
             snapshot_lsn,
         )?;
         if !targeted_ok {
+            // Intentionally unsupported for row-source execution: the
+            // statement analyzer could not determine a conservative set of
+            // referenced base tables (CTEs, recursive queries, VALUES,
+            // subqueries, etc.). Fall back to broad-load so the generic
+            // executor has every table available.
             self.ensure_runtime_all_tables_loaded_at_snapshot(&mut working, snapshot_lsn)?;
         }
         working.rebuild_stale_indexes(self.inner.config.page_size)?;
