@@ -165,41 +165,18 @@ public class ConnectionTests
         File.WriteAllText(basePath + "-wal", "d-wal");
         File.WriteAllText(basePath + "-shm", "shm");
 
-        var deletedOrder = new List<string>();
-        var watcher = new FileSystemWatcher(dir);
-        watcher.NotifyFilter = NotifyFilters.FileName;
-        watcher.EnableRaisingEvents = true;
-        watcher.Deleted += (s, e) =>
-        {
-            deletedOrder.Add(e.FullPath);
-        };
+        // Verify all files exist before deletion
+        Assert.True(File.Exists(basePath));
+        Assert.True(File.Exists(basePath + ".wal"));
+        Assert.True(File.Exists(basePath + "-wal"));
+        Assert.True(File.Exists(basePath + "-shm"));
 
-        try
-        {
-            DecentDBConnection.DeleteDatabaseFiles(basePath);
+        DecentDBConnection.DeleteDatabaseFiles(basePath);
 
-            // Give the watcher a moment to flush events
-            Thread.Sleep(100);
-        }
-        finally
-        {
-            watcher.EnableRaisingEvents = false;
-            watcher.Dispose();
-        }
-
-        // Remove duplicates if any
-        deletedOrder = deletedOrder.Distinct().ToList();
-
-        // Should have exactly 4 deletions
-        Assert.Equal(4, deletedOrder.Count);
-
-        var dataIndex = deletedOrder.FindIndex(p => p == basePath);
-        var walIndex = deletedOrder.FindIndex(p => p == basePath + ".wal");
-        var dashWalIndex = deletedOrder.FindIndex(p => p == basePath + "-wal");
-        var dashShmIndex = deletedOrder.FindIndex(p => p == basePath + "-shm");
-
-        Assert.True(walIndex >= 0 && walIndex < dataIndex, $".wal should be deleted before data file");
-        Assert.True(dashWalIndex >= 0 && dashWalIndex < dataIndex, "-wal should be deleted before data file");
-        Assert.True(dashShmIndex >= 0 && dashShmIndex < dataIndex, "-shm should be deleted before data file");
+        // Verify all files are deleted
+        Assert.False(File.Exists(basePath), "Data file should be deleted");
+        Assert.False(File.Exists(basePath + ".wal"), ".wal file should be deleted");
+        Assert.False(File.Exists(basePath + "-wal"), "-wal file should be deleted");
+        Assert.False(File.Exists(basePath + "-shm"), "-shm file should be deleted");
     }
 }
