@@ -1615,13 +1615,12 @@ impl EngineRuntime {
                 let previous_pointer = previous_state.pointer;
                 let use_paged_row_storage =
                     db.config().paged_row_storage || previous_pointer.is_table_paged_manifest();
-                let cached_payload = if !use_paged_row_storage
-                    || !previous_pointer.is_table_paged_manifest()
-                {
-                    self.take_cached_payload(&canonical_table_name)
-                } else {
-                    None
-                };
+                let cached_payload =
+                    if !use_paged_row_storage || !previous_pointer.is_table_paged_manifest() {
+                        self.take_cached_payload(&canonical_table_name)
+                    } else {
+                        None
+                    };
                 let row_source = self.tables.get(&canonical_table_name).ok_or_else(|| {
                     DbError::internal(format!("table data for {table_name} is missing"))
                 })?;
@@ -1698,36 +1697,22 @@ impl EngineRuntime {
                                 append_table_payload(previous_payload, data)?
                             };
                             let checksum = crc32c_parts(&[new_payload.as_slice()]);
-                            let (pointer, new_chain_cache, tail) =
-                                if let Some(chain_cache) =
-                                    self.overflow_chain_caches.get(&canonical_table_name)
-                                {
-                                    rewrite_overflow_cached(
-                                        &mut store,
-                                        previous_pointer,
-                                        &new_payload,
-                                        &chain_cache.page_ids,
-                                        0,
-                                    )?
-                                } else {
-                                    let ptr = rewrite_overflow(
-                                        &mut store,
-                                        previous_pointer,
-                                        &new_payload,
-                                        CompressionMode::Never,
-                                    )?;
-                                    let cache =
-                                        build_overflow_chain_cache(&store, ptr.head_page_id)?;
-                                    let tail = read_uncompressed_overflow_tail(&store, ptr)?
-                                        .unwrap_or_default();
-                                    (ptr, cache, tail)
-                                };
+                            let ptr = rewrite_overflow(
+                                &mut store,
+                                previous_pointer,
+                                &new_payload,
+                                CompressionMode::Never,
+                            )?;
+                            let new_chain_cache =
+                                build_overflow_chain_cache(&store, ptr.head_page_id)?;
+                            let tail =
+                                read_uncompressed_overflow_tail(&store, ptr)?.unwrap_or_default();
                             self.overflow_chain_caches
                                 .insert(canonical_table_name.clone(), new_chain_cache);
                             self.persisted_tables.insert(
                                 canonical_table_name.clone(),
                                 PersistedTableState {
-                                    pointer,
+                                    pointer: ptr,
                                     checksum,
                                     row_count: data.rows.len(),
                                     tail,
@@ -14431,10 +14416,7 @@ fn encode_appended_table_rows(data: &TableData, existing_count: usize) -> Result
     Ok(appended)
 }
 
-fn append_table_payload_from_cached(
-    cached: Arc<Vec<u8>>,
-    data: &TableData,
-) -> Result<Vec<u8>> {
+fn append_table_payload_from_cached(cached: Arc<Vec<u8>>, data: &TableData) -> Result<Vec<u8>> {
     if data.rows.is_empty() {
         return Ok(Vec::new());
     }
