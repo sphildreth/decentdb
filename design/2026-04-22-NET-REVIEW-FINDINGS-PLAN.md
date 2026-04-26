@@ -225,8 +225,8 @@ stats) are deliberately **out of scope** here and are listed in §6
 | N6    | EF Core + MicroOrm — `Random.Next`/non-deterministic LINQ translator handling| EF Core, MicroOrm| P1  | no      | **Done**    |
 | N7    | EF Core `UseDecentDB` — accept bare paths consistently with ADO.NET         | EF Core          | P1  | no      | **Done**    |
 | N8    | AdoNet `DecentDBConnectionStringBuilder` — strongly-typed `Pooling` + docs  | AdoNet           | P2  | no      | **Done**    |
-| N9    | Engine — accept `CREATE VIEW IF NOT EXISTS` (or document the workaround)    | engine + docs    | P2  | yes (parser only) | Pending   |
-| N10   | Engine — improve subquery-in-FROM error context for the .NET surface        | engine + AdoNet  | P2  | yes (error message only) | Pending   |
+| N9    | Engine — accept `CREATE VIEW IF NOT EXISTS` (or document the workaround)    | engine + docs    | P2  | yes (parser only) | **Done**    |
+| N10   | Engine — improve subquery-in-FROM error context for the .NET surface        | engine + AdoNet  | P2  | yes (error message only) | **Done**    |
 | N11   | Bindings docs — feature-parity matrix and POCO/connection-string notes      | docs             | P3  | no      | Pending   |
 | N12   | AdoNet — accept multi-statement SQL via `SqlStatementSplitter` in `Prepare`/`ExecuteReader` | AdoNet | P1 | no | **Done**    |
 | N13   | AdoNet `SqlStatementSplitter` — handle `CREATE TRIGGER ... BEGIN ... END` bodies | AdoNet           | P2  | no      | **Done**    |

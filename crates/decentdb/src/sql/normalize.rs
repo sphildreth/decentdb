@@ -18,19 +18,32 @@ use super::ast::{
     WindowFrameUnit,
 };
 
-/// Rewrites `CREATE VIEW IF NOT EXISTS` to `CREATE VIEW` so pg_query can parse it.
-/// The original SQL is preserved for later IF NOT EXISTS flag detection in `normalize_create_view`.
-fn rewrite_create_view_if_not_exists(sql: &str) -> String {
+// Thread-local flag set by `detect_and_rewrite_create_view_if_not_exists` and
+// consumed by `normalize_create_view` to propagate the IF NOT EXISTS signal
+// across the pg_query split → normalize boundary.
+thread_local! {
+    static PENDING_VIEW_IF_NOT_EXISTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Detects `CREATE VIEW IF NOT EXISTS` and rewrites it to `CREATE VIEW` so pg_query can parse it.
+/// Sets a thread-local flag that `normalize_create_view` reads to populate the AST field.
+/// Only sets the flag to true when the pattern is found; never resets it to false.
+pub(crate) fn detect_and_rewrite_create_view_if_not_exists(sql: &str) -> String {
     const PAT: &str = "CREATE VIEW IF NOT EXISTS";
     let trimmed = sql.trim_start();
     let upper = trimmed.to_ascii_uppercase();
     if upper.starts_with(PAT) {
-        // Grab everything after the pattern
+        PENDING_VIEW_IF_NOT_EXISTS.with(|c| c.set(true));
         let rest = &trimmed[PAT.len()..].trim_start();
         format!("CREATE VIEW {}", rest)
     } else {
         sql.to_string()
     }
+}
+
+/// Consumes the thread-local IF NOT EXISTS flag set by `detect_and_rewrite_create_view_if_not_exists`.
+pub(crate) fn take_pending_view_if_not_exists() -> bool {
+    PENDING_VIEW_IF_NOT_EXISTS.with(|c| c.replace(false))
 }
 
 pub(crate) fn normalize_statement_text(sql: &str) -> Result<Statement> {
@@ -42,7 +55,7 @@ pub(crate) fn normalize_statement_text_with_generated_modes(
     generated_column_modes: &[bool],
 ) -> Result<Statement> {
     // Pre-rewrite: make CREATE VIEW IF NOT EXISTS parsable by pg_query.
-    let rewritten = rewrite_create_view_if_not_exists(sql);
+    let rewritten = detect_and_rewrite_create_view_if_not_exists(sql);
     let parsed = libpg_query_sys::parse_statement(&rewritten)
         .map_err(|error| DbError::sql(error.message().to_string()))?;
     let raw = parsed
@@ -51,7 +64,6 @@ pub(crate) fn normalize_statement_text_with_generated_modes(
         .and_then(|stmt| stmt.stmt.as_ref())
         .and_then(|stmt| stmt.node.as_ref())
         .ok_or_else(|| DbError::sql("parser returned an empty statement"))?;
-    // Pass the original unmodified sql so normalize_create_view can detect IF NOT EXISTS.
     normalize_statement_with_generated_modes(raw, sql, generated_column_modes)
 }
 
@@ -775,7 +787,7 @@ fn normalize_create_index(statement: &protobuf::IndexStmt) -> Result<CreateIndex
 
 fn normalize_create_view(
     statement: &protobuf::ViewStmt,
-    original_sql: &str,
+    _original_sql: &str,
 ) -> Result<CreateViewStatement> {
     let column_names = statement
         .aliases
@@ -787,13 +799,8 @@ fn normalize_create_view(
         .as_ref()
         .ok_or_else(|| unsupported("CREATE VIEW is missing a view name"))?;
 
-    // Detect IF NOT EXISTS by inspecting the original SQL (pre-parser, before pg_query)
-    // pg_query itself does not expose if_not_exists; we detect it textually.
-    let trimmed = original_sql.trim_start();
-    let normalized = trimmed.to_ascii_uppercase();
-    // Pattern: "CREATE VIEW IF NOT EXISTS" (possibly with OR REPLACE in between)
-    let if_not_exists = normalized.starts_with("CREATE VIEW IF NOT EXISTS")
-        || normalized.contains("CREATE VIEW IF NOT EXISTS"); // more robust: find occurrence
+    // Consume the IF NOT EXISTS flag that was set during the pre-rewrite step.
+    let if_not_exists = take_pending_view_if_not_exists();
 
     Ok(CreateViewStatement {
         view_name: normalize_range_var(view)?,
@@ -1163,7 +1170,9 @@ fn normalize_from_item(node: &protobuf::Node) -> Result<FromItem> {
                 .alias
                 .as_ref()
                 .map(|alias| alias.aliasname.clone())
-                .ok_or_else(|| unsupported("subqueries in FROM require an alias"))?,
+                .ok_or_else(|| {
+                    unsupported("subqueries in FROM require an alias (e.g. `SELECT ... FROM (SELECT ...) AS alias`)")
+                })?,
             column_names: normalize_alias_column_names(range.alias.as_ref())?,
             lateral: range.lateral,
         }),

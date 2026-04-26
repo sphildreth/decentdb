@@ -141,6 +141,19 @@ public sealed class CommonAdoNetRegressionTests : IDisposable
         TryDelete(_dbPath + ".vacuum_tmp");
     }
 
+    // ─── N10: subquery-in-FROM error message includes helpful hint ───
+
+    [Fact]
+    public void MissingSubqueryAlias_PropagatesEngineMessage()
+    {
+        using var connection = new DecentDBConnection($"Data Source={_dbPath}");
+        connection.Open();
+        using var cmd = connection.CreateCommand();
+        cmd.CommandText = "SELECT AVG(cnt) FROM (SELECT COUNT(*) AS cnt FROM t)";
+        var ex = Assert.Throws<DecentDB.Native.DecentDBException>(() => cmd.ExecuteNonQuery());
+        Assert.Contains("alias", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
     private static void TryDelete(string path)
     {
         if (File.Exists(path))

@@ -1338,14 +1338,15 @@ fn temp_tables_and_views_are_session_scoped_shadow_persistent_objects_and_do_not
 fn create_view_if_not_exists_idempotent() {
     let db = mem_db();
     exec(&db, "CREATE TABLE base (id INT64)");
+    exec(&db, "INSERT INTO base (id) VALUES (1)");
     // First CREATE VIEW IF NOT EXISTS should succeed
     exec(&db, "CREATE VIEW IF NOT EXISTS v AS SELECT id FROM base");
     // Second should also succeed (no-op)
     exec(&db, "CREATE VIEW IF NOT EXISTS v AS SELECT id FROM base");
 
     // View exists and works
-    let result = exec(&db, "SELECT * FROM v");
-    assert_eq!(rows(&result), vec![vec![Value::Null]]); // table empty
+    let result = exec(&db, "SELECT * FROM v ORDER BY id");
+    assert_eq!(rows(&result), vec![vec![Value::Int64(1)]]);
 }
 
 #[test]
@@ -1361,7 +1362,7 @@ fn create_view_if_not_exists_does_not_replace() {
     );
 
     // Query should reflect original definition (id, not id+1)
-    let result = exec(&db, "INSERT INTO base (id) VALUES (42)");
+    exec(&db, "INSERT INTO base (id) VALUES (42)");
     // Access the view
     let view_result = exec(&db, "SELECT * FROM v ORDER BY id");
     let row = &view_result.rows()[0];

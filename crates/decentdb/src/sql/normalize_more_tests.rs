@@ -147,6 +147,22 @@ mod tests {
     }
 
     #[test]
+    fn subquery_in_from_without_alias_includes_helpful_hint() {
+        let s = "SELECT AVG(cnt) FROM (SELECT COUNT(*) AS cnt FROM t)";
+        let res = normalize_statement_text(s);
+        assert!(res.is_err());
+        let msg = res.unwrap_err().to_string();
+        assert!(
+            msg.contains("alias"),
+            "error should mention 'alias', got: {msg}"
+        );
+        assert!(
+            msg.contains("AS alias") || msg.contains("AS name"),
+            "error should include example syntax hint, got: {msg}"
+        );
+    }
+
+    #[test]
     fn unsupported_update_from_and_delete_using() {
         let s = "UPDATE t SET a = 1 FROM x";
         let res = normalize_statement_text(s);
