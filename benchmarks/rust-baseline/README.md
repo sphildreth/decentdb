@@ -2,8 +2,7 @@
 
 This is a **raw Rust baseline** for the same benchmark suite the .NET tests
 in `..` exercise. It links the `decentdb` crate directly (path-dep against
-the workspace at `/home/steven/source/decentdb/crates/decentdb`) and uses
-the engine's hot-path API:
+`../../crates/decentdb`) and uses the engine's hot-path API:
 
 - `Db::create()` to make a fresh database
 - `db.transaction()` to acquire an exclusive `SqlTransaction`
@@ -43,17 +42,32 @@ counts are reported as `Plan: artists=… total_albums=… total_songs=…`.
 ## Build & run
 
 ```bash
+cd /home/steven/source/decentdb/benchmarks/rust-baseline
 cargo build --release
 ./target/release/rust-baseline --scale smoke
 ./target/release/rust-baseline --scale medium
 ./target/release/rust-baseline --scale full
 ```
 
-JSON reports are written to `results/rust-baseline-<scale>.json`.
+## Results
+
+JSON reports are written to `results/<datetime>-rust-baseline-<scale>.json` where
+`<datetime>` is `YYYY-MM-DD-HHMM` (e.g., `2026-04-26-1430`). This timestamped
+naming enables historical comparisons across multiple runs:
+
+```
+results/
+├── 2026-03-24-1200-rust-baseline-full.json
+├── 2026-04-01-0900-rust-baseline-full.json
+├── 2026-04-26-1430-rust-baseline-full.json
+└── ...
+```
+
+Results are tracked over time in [results/comparison.md](results/comparison.md).
 
 ## Headline numbers (engine 2.3.1, scale=`full`, ≈2.75M songs)
 
-| metric                       | RustRaw   | 
+| metric                       | RustRaw   |
 |------------------------------|----------:|
 | `seed_artists` r/s           |   792,664 |
 | `seed_albums` r/s            |   786,594 |

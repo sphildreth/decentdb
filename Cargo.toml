@@ -6,6 +6,9 @@ members = [
     "crates/libpg_query_sys",    # Pinned SQL parser wrapper
     "crates/decentdb-migrate",   # Migration tooling
 ]
+exclude = [
+    "benchmarks/rust-baseline",   # Standalone baseline benchmark (not part of main workspace)
+]
 resolver = "2"
 
 [workspace.package]

@@ -12,12 +12,12 @@
 //
 // Scales mirror DecentDB.Compare.Common.Scale exactly.
 //
-// Output: pretty-printed JSON to results/rust-baseline-<scale>.json with the
+// Output: pretty-printed JSON to results/<datetime>-rust-baseline-<scale>.json with the
 // same shape as RunReport so it can be diffed against the .NET reports.
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 use decentdb::{DbConfig, PreparedStatement, Value};
@@ -556,11 +556,44 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     report.finished_unix = now_unix();
 
     fs::create_dir_all(&cli.out_dir)?;
+    let datetime_stamp = SystemTime::UNIX_EPOCH
+        .checked_add(std::time::Duration::from_secs(report.started_unix))
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| {
+            let secs = d.as_secs();
+            let days = secs / 86400;
+            let rem = secs % 86400;
+            let hour = rem / 3600;
+            let min = (rem % 3600) / 60;
+            let year = 1970 + days / 365;
+            let yday = days % 365;
+            let is_leap = |y: u64| y.is_multiple_of(4) && (!y.is_multiple_of(100) || y.is_multiple_of(400));
+            let mut month = 1u64;
+            let mut day = 1u64;
+            let mut remaining = yday;
+            for m in &[31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31] {
+                if remaining < *m {
+                    day = remaining + 1;
+                    break;
+                }
+                remaining -= *m;
+                month += 1;
+            }
+            if is_leap(year) && month == 2 && day > 28 {
+                day = if day == 29 { 29 } else { day - 1 };
+            }
+            format!("{:04}-{:02}-{:02}-{:02}{:02}", year, month, day, hour, min)
+        })
+        .unwrap_or_else(|| "unknown".to_string());
     let out_path = cli
         .out_dir
-        .join(format!("rust-baseline-{}.json", scale.name));
+        .join(format!("{datetime_stamp}-rust-baseline-{}.json", scale.name));
     fs::write(&out_path, serde_json::to_string_pretty(&report)?)?;
     println!("\nWrote {}", out_path.display());
+
+    delete_db_files(&db_path);
+    println!("Cleaned up temp DB files: {}", db_path.display());
+
     Ok(())
 }
 

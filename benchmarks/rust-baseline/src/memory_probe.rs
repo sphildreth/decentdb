@@ -29,7 +29,7 @@ struct Args {
     #[arg(long, default_value_t = 4)]
     cache_mb: usize,
     /// Working directory for the probe DB.
-    #[arg(long, default_value = "/tmp/tmp-opus47-decentdb-net-tests/rust-baseline/probe")]
+    #[arg(long, default_value = "probe")]
     dir: PathBuf,
     /// Label for the report.
     #[arg(long, default_value = "probe")]
@@ -126,13 +126,13 @@ fn main() -> Result<()> {
                 params[0] = Value::Int64(id as i64);
                 params[1] = Value::Int64((id % 16) as i64);
                 params[2] = Value::Text(format!("payload-{id}"));
-                prepared.execute_in(&mut txn, &mut params)?;
+                prepared.execute_in(&mut txn, &params)?;
             }
             txn.commit()?;
         }
         next_id = end + 1;
         batch_index += 1;
-        if batch_index % 10 == 0 || next_id > args.rows {
+        if batch_index.is_multiple_of(10) || next_id > args.rows {
             sample(&format!("after {} rows", end));
         }
     }
