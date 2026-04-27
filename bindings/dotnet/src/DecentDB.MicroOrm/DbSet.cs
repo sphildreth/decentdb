@@ -253,18 +253,14 @@ public sealed class DbSet<T> : IQueryable<T> where T : class, new()
     {
         if (entities == null) throw new ArgumentNullException(nameof(entities));
 
-        var entityList = entities as List<T> ?? entities.ToList();
-        if (entityList.Count == 0) return;
-
         var bindProps = _map.Properties.Where(p => !p.IsIgnored).ToArray();
         var columnCount = bindProps.Length;
+        if (columnCount == 0) return;
 
-        var cols = new List<string>(columnCount);
-        for (var i = 0; i < columnCount; i++)
-        {
-            cols.Add(bindProps[i].ColumnName);
-        }
-        var colList = string.Join(", ", cols);
+        // Build a single-row prepared INSERT.
+        var cols = string.Join(", ", bindProps.Select(p => p.ColumnName));
+        var vals = string.Join(", ", Enumerable.Range(0, columnCount).Select(i => $"@p{i}"));
+        var sql = $"INSERT INTO {_map.TableName} ({cols}) VALUES ({vals})";
 
         using var scope = _context.AcquireConnectionScope();
 
@@ -273,47 +269,61 @@ public sealed class DbSet<T> : IQueryable<T> where T : class, new()
 
         try
         {
-            var sb = new StringBuilder();
-            var paramIndex = 0;
-
-            for (var offset = 0; offset < entityList.Count; offset += MaxRowsPerInsert)
+            using var cmd = scope.Connection.CreateCommand();
+            cmd.CommandText = sql;
+            if (tx != null)
             {
-                var chunkSize = Math.Min(MaxRowsPerInsert, entityList.Count - offset);
+                cmd.Transaction = tx;
+            }
+            else if (_context.CurrentTransaction != null)
+            {
+                cmd.Transaction = _context.CurrentTransaction;
+            }
 
-                sb.Clear();
-                sb.Append("INSERT INTO ").Append(_map.TableName).Append(" (").Append(colList).Append(") VALUES ");
-
-                var totalParams = chunkSize * columnCount;
-                var parameters = new List<(string Name, object? Value, int? MaxLength)>(totalParams);
-
-                for (var row = 0; row < chunkSize; row++)
+            // Prepare parameters once.
+            var parameters = new DbParameter[columnCount];
+            for (var i = 0; i < columnCount; i++)
+            {
+                var p = cmd.CreateParameter();
+                p.ParameterName = $"@p{i}";
+                if (bindProps[i].MaxLength.HasValue)
                 {
-                    if (row > 0) sb.Append(", ");
-                    sb.Append('(');
+                    p.Size = bindProps[i].MaxLength!.Value;
+                }
+                cmd.Parameters.Add(p);
+                parameters[i] = p;
+            }
 
-                    var entity = entityList[offset + row];
-                    for (var col = 0; col < columnCount; col++)
+            var enumerator = entities.GetEnumerator();
+            try
+            {
+                if (!enumerator.MoveNext())
+                {
+                    // Empty sequence — nothing to do.
+                    if (ownsTx) tx!.Rollback();
+                    return;
+                }
+
+                do
+                {
+                    var entity = enumerator.Current;
+                    for (var i = 0; i < columnCount; i++)
                     {
-                        if (col > 0) sb.Append(", ");
-                        var propName = $"@p{paramIndex}";
-                        sb.Append(propName);
-
-                        var prop = bindProps[col];
+                        var prop = bindProps[i];
                         var v = prop.Property.GetValue(entity);
                         if (!prop.IsNullable && v == null)
                         {
                             throw new ArgumentException($"Property '{prop.Property.Name}' cannot be NULL.");
                         }
-
-                        parameters.Add((propName, v, prop.MaxLength));
-                        paramIndex++;
+                        parameters[i].Value = DefaultTypeConverters.ToDbValue(v);
                     }
-                    sb.Append(')');
+                    await cmd.ExecuteNonQueryAsync(cancellationToken);
                 }
-
-                using var cmd = CreateCommand(scope.Connection, sb.ToString(), parameters);
-                if (tx != null) cmd.Transaction = tx;
-                await cmd.ExecuteNonQueryAsync(cancellationToken);
+                while (enumerator.MoveNext());
+            }
+            finally
+            {
+                (enumerator as IDisposable)?.Dispose();
             }
 
             if (ownsTx)
