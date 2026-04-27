@@ -47,7 +47,7 @@ struct BgCtrl {
 #[derive(Debug)]
 pub(crate) struct BgCheckpointer {
     ctrl: Arc<BgCtrl>,
-    join: Option<JoinHandle<()>>,
+    join: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl BgCheckpointer {
@@ -62,7 +62,7 @@ impl BgCheckpointer {
             .expect("spawn checkpoint worker thread");
         Self {
             ctrl,
-            join: Some(join),
+            join: Mutex::new(Some(join)),
         }
     }
 
@@ -78,10 +78,8 @@ impl BgCheckpointer {
         state.wake = true;
         self.ctrl.cond.notify_one();
     }
-}
 
-impl Drop for BgCheckpointer {
-    fn drop(&mut self) {
+    pub(crate) fn shutdown_and_join(&self) {
         {
             let mut state = match self.ctrl.state.lock() {
                 Ok(g) => g,
@@ -90,12 +88,25 @@ impl Drop for BgCheckpointer {
             state.shutdown = true;
             self.ctrl.cond.notify_all();
         }
-        if let Some(join) = self.join.take() {
+        let join = match self.join.lock() {
+            Ok(mut guard) => guard.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+        if let Some(join) = join {
+            if join.thread().id() == thread::current().id() {
+                return;
+            }
             // Best-effort join: if the worker panicked we don't want to
-            // poison Drop. The panic has already been reported on the
-            // worker's stack.
+            // poison shutdown paths. The panic has already been reported on
+            // the worker's stack.
             let _ = join.join();
         }
+    }
+}
+
+impl Drop for BgCheckpointer {
+    fn drop(&mut self) {
+        self.shutdown_and_join();
     }
 }
 

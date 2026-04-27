@@ -1075,15 +1075,8 @@ impl EngineRuntime {
             )));
         }
 
-        for (index, column) in prepared.columns.iter().enumerate() {
-            let mut value = std::mem::replace(
-                params.get_mut(index).ok_or_else(|| {
-                    DbError::internal(format!(
-                        "prepared insert parameter index {index} out of bounds"
-                    ))
-                })?,
-                Value::Null,
-            );
+        for (param, column) in params.iter_mut().zip(&prepared.columns) {
+            let mut value = std::mem::replace(param, Value::Null);
 
             if column.auto_increment {
                 match value {

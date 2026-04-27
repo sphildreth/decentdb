@@ -237,6 +237,7 @@ struct DbInner {
 
 impl Drop for DbInner {
     fn drop(&mut self) {
+        self.wal.shutdown_background_checkpointer();
         if self.wal.latest_snapshot() == 0 {
             return;
         }
@@ -1756,25 +1757,27 @@ impl Db {
             )? {
                 return Ok(result);
             }
-            if let Some(result) = self
-                .try_execute_simple_indexed_join_projection_query_at_snapshot(
+            if prepared.is_none() {
+                if let Some(result) = self
+                    .try_execute_simple_indexed_join_projection_query_at_snapshot(
+                        &runtime,
+                        statement,
+                        query,
+                        params,
+                        snapshot_lsn,
+                    )?
+                {
+                    return Ok(result);
+                }
+                if let Some(result) = self.try_execute_query_with_row_sources_at_snapshot(
                     &runtime,
                     statement,
-                    query,
                     params,
                     snapshot_lsn,
-                )?
-            {
-                return Ok(result);
-            }
-            if let Some(result) = self.try_execute_query_with_row_sources_at_snapshot(
-                &runtime,
-                statement,
-                params,
-                snapshot_lsn,
-                false,
-            )? {
-                return Ok(result);
+                    false,
+                )? {
+                    return Ok(result);
+                }
             }
         }
 
@@ -2095,6 +2098,9 @@ impl Db {
     }
 
     fn prepared_statement_cache_key(prepared: &PreparedStatement) -> usize {
+        if let Some(insert) = prepared.prepared_insert.as_ref() {
+            return Arc::as_ptr(insert) as usize;
+        }
         Arc::as_ptr(&prepared.statement) as usize
     }
 
@@ -2115,14 +2121,12 @@ impl Db {
             *indexes_maybe_stale = false;
         }
 
-        let table_names =
-            self.insert_dependency_table_names(runtime, &prepared_insert.table_name)?;
-        let table_refs = table_names.iter().map(String::as_str).collect::<Vec<_>>();
-        self.load_runtime_table_row_sources_at_snapshot(runtime, &table_refs, snapshot_lsn)?;
-
         let cache_key = Self::prepared_statement_cache_key(prepared);
         if let Some(plan) = prepared_insert_runtime_cache.get(&cache_key) {
-            if runtime.can_reuse_prepared_simple_insert(plan) {
+            if runtime.can_reuse_prepared_simple_insert(plan)
+                && (runtime.table_row_source(&plan.table_name).is_some()
+                    || runtime.temp_table_schema(&plan.table_name).is_some())
+            {
                 return Ok(Some(Arc::clone(plan)));
             }
             prepared_insert_runtime_cache.remove(&cache_key);
@@ -2130,7 +2134,26 @@ impl Db {
 
         let needs_refresh =
             prepared_insert.use_generic_validation || prepared_insert.use_generic_index_updates;
+        if !needs_refresh
+            && runtime.can_reuse_prepared_simple_insert(prepared_insert)
+            && (runtime
+                .table_row_source(&prepared_insert.table_name)
+                .is_some()
+                || runtime
+                    .temp_table_schema(&prepared_insert.table_name)
+                    .is_some())
+        {
+            prepared_insert_runtime_cache.insert(cache_key, Arc::clone(prepared_insert));
+            return Ok(Some(Arc::clone(prepared_insert)));
+        }
+
+        let table_names =
+            self.insert_dependency_table_names(runtime, &prepared_insert.table_name)?;
+        let table_refs = table_names.iter().map(String::as_str).collect::<Vec<_>>();
+        self.load_runtime_table_row_sources_at_snapshot(runtime, &table_refs, snapshot_lsn)?;
+
         if !needs_refresh && runtime.can_reuse_prepared_simple_insert(prepared_insert) {
+            prepared_insert_runtime_cache.insert(cache_key, Arc::clone(prepared_insert));
             return Ok(Some(Arc::clone(prepared_insert)));
         }
 
@@ -6048,6 +6071,51 @@ mod tests {
                 &db.execute("SELECT COUNT(*) FROM bench")
                     .expect("count committed rows")
             ),
+            2
+        );
+    }
+
+    #[test]
+    fn shared_transaction_prepared_insert_caches_loaded_runtime_plan() {
+        let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+            .expect("create table");
+
+        db.begin_transaction().expect("begin shared transaction");
+        let prepared = db
+            .prepare("INSERT INTO t VALUES ($1, $2)")
+            .expect("prepare insert");
+
+        prepared
+            .execute(&[Value::Int64(1), Value::Text("value-1".to_string())])
+            .expect("execute first prepared insert");
+
+        {
+            let txn = db.inner.sql_txn.lock().expect("lock shared txn slot");
+            let SqlTxnSlot::Shared(state) = &*txn else {
+                panic!("expected shared sql transaction state");
+            };
+            let cached_runtime_plan = state
+                .prepared_insert_runtime_cache
+                .get(&Db::prepared_statement_cache_key(&prepared))
+                .expect("cached runtime insert plan");
+            let prepared_plan = prepared
+                .prepared_insert
+                .as_ref()
+                .expect("prepared insert plan");
+            assert!(
+                Arc::ptr_eq(cached_runtime_plan, prepared_plan),
+                "shared transaction should retain the reusable prepared insert plan in the runtime cache"
+            );
+        }
+
+        prepared
+            .execute(&[Value::Int64(2), Value::Text("value-2".to_string())])
+            .expect("execute second prepared insert");
+        db.commit_transaction().expect("commit shared transaction");
+
+        assert_eq!(
+            scalar_i64(&db.execute("SELECT COUNT(*) FROM t").expect("count rows")),
             2
         );
     }

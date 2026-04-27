@@ -3002,10 +3002,13 @@ fn to_i64(value: u64) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        deterministic_id, deterministic_scan_start, run_scenario, throughput_degradation_ratio,
+        deterministic_id, deterministic_scan_start, load_id_table_chunked,
+        real_fs_full_durability_config, run_cold_point_lookup_probe, run_scenario,
+        throughput_degradation_ratio, ColdPointLookupProbeArgs,
     };
     use crate::profiles::ResolvedProfile;
     use crate::types::{ProfileKind, ScenarioId, ScenarioStatus};
+    use decentdb::Db;
     use tempfile::TempDir;
 
     fn tiny_profile() -> ResolvedProfile {
@@ -3065,6 +3068,50 @@ mod tests {
         assert!(result.metrics.contains_key("orders_insert_rps"));
         assert!(result.metrics.contains_key("report_query_s"));
         assert!(result.metrics.contains_key("update_p95_ms"));
+    }
+
+    #[test]
+    fn read_under_write_scenario_runs_with_tiny_profile() {
+        let temp = TempDir::new().expect("tempdir");
+        let result = run_scenario(ScenarioId::ReadUnderWrite, &tiny_profile(), temp.path())
+            .expect("run read-under-write scenario");
+        assert!(matches!(result.status, ScenarioStatus::Passed));
+        assert!(result.metrics.contains_key("reader_p95_degradation_ratio"));
+        assert!(result
+            .metrics
+            .contains_key("writer_throughput_degradation_ratio"));
+    }
+
+    #[test]
+    fn cold_point_lookup_probe_finds_seeded_rows() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("cold_probe.ddb");
+        let db = Db::open_or_create(&db_path, real_fs_full_durability_config(temp.path()))
+            .expect("open db");
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS bench_point_lookup_cold (id INT64 PRIMARY KEY, payload TEXT NOT NULL)",
+        )
+        .expect("create table");
+        load_id_table_chunked(
+            &db,
+            "INSERT INTO bench_point_lookup_cold (id, payload) VALUES ($1, 'point-lookup-cold')",
+            1_000,
+            100,
+        )
+        .expect("seed rows");
+        db.checkpoint().expect("checkpoint");
+        drop(db);
+
+        let result = run_cold_point_lookup_probe(ColdPointLookupProbeArgs {
+            db_path,
+            rows: 1_000,
+            seed: 7,
+            trial: 0,
+            start_op: 0,
+            lookups: 32,
+        })
+        .expect("run cold point lookup probe");
+        assert_eq!(result.rows_returned, 32);
     }
 
     #[test]

@@ -25,7 +25,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::{
@@ -82,7 +82,10 @@ const INDEX_INCLUDE_COLUMNS_SECTION_MAGIC: &[u8; 8] = b"DDBICL1\0";
 const SCHEMAS_SECTION_MAGIC: &[u8; 8] = b"DDBSCH01";
 const PK_INDEX_ROOTS_SECTION_MAGIC: &[u8; 8] = b"DDBPKR01";
 const SIGNED_ROW_ID_BIAS: u64 = 0x8000_0000_0000_0000;
+const DEFERRED_COMPRESSED_LOOKUP_CACHE_LIMIT: usize = 32;
 static RANDOM_STATE: AtomicU64 = AtomicU64::new(0);
+static DEFERRED_COMPRESSED_LOOKUP_CACHE: OnceLock<Mutex<DeferredCompressedLookupCache>> =
+    OnceLock::new();
 
 fn generated_columns_are_stored(table: &TableSchema) -> bool {
     table
@@ -137,6 +140,26 @@ pub(crate) struct StoredRow {
 struct RowLocatorV1 {
     byte_offset: u32,
     byte_len: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct DeferredCompressedLookupCacheKey {
+    head_page_id: PageId,
+    logical_len: u32,
+    flags: u8,
+    checksum: u32,
+}
+
+#[derive(Debug)]
+struct DeferredCompressedLookupCacheEntry {
+    payload: Arc<Vec<u8>>,
+    row_locators: HashMap<i64, RowLocatorV1>,
+}
+
+#[derive(Default)]
+struct DeferredCompressedLookupCache {
+    entries: HashMap<DeferredCompressedLookupCacheKey, Arc<DeferredCompressedLookupCacheEntry>>,
+    insertion_order: VecDeque<DeferredCompressedLookupCacheKey>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -8113,16 +8136,13 @@ impl EngineRuntime {
                 match locator {
                     DecodedRowLocator::V1(locator) => {
                         read_deferred_row_by_locator_from_table_payload(
-                            &store,
-                            state.pointer,
-                            row_id,
-                            locator,
+                            &store, state, row_id, locator,
                         )?
                     }
                     DecodedRowLocator::V2(locator) => {
                         read_deferred_row_by_locator_from_table_payload(
                             &store,
-                            state.pointer,
+                            state,
                             row_id,
                             RowLocatorV1 {
                                 byte_offset: locator.byte_offset,
@@ -8131,10 +8151,8 @@ impl EngineRuntime {
                         )?
                     }
                 }
-            } else if !state.pointer.is_compressed() {
-                read_deferred_row_by_id_from_table_payload(&store, state.pointer, row_id)?
             } else {
-                None
+                read_deferred_row_by_id_from_table_payload(&store, state, row_id)?
             };
             if let Some(stored_row) = stored_row {
                 rows.push(project_simple_projection_row(
@@ -16877,14 +16895,124 @@ fn build_paged_row_locator_entries_from_chunk_payloads(
     Ok(entries)
 }
 
+fn deferred_compressed_lookup_cache() -> &'static Mutex<DeferredCompressedLookupCache> {
+    DEFERRED_COMPRESSED_LOOKUP_CACHE
+        .get_or_init(|| Mutex::new(DeferredCompressedLookupCache::default()))
+}
+
+fn deferred_compressed_lookup_cache_key(
+    state: PersistedTableState,
+) -> DeferredCompressedLookupCacheKey {
+    DeferredCompressedLookupCacheKey {
+        head_page_id: state.pointer.head_page_id,
+        logical_len: state.pointer.logical_len,
+        flags: state.pointer.flags,
+        checksum: state.checksum,
+    }
+}
+
+fn decode_compressed_table_payload_lookup_entry(
+    payload: Arc<Vec<u8>>,
+) -> Result<DeferredCompressedLookupCacheEntry> {
+    let mut cursor = Cursor::new(payload.as_slice());
+    let magic = cursor.read_slice(TABLE_PAYLOAD_MAGIC.len())?;
+    if magic != TABLE_PAYLOAD_MAGIC {
+        return Err(DbError::corruption("table payload magic is invalid"));
+    }
+    let row_count = cursor.read_u32()? as usize;
+    let mut row_locators = HashMap::with_capacity(row_count);
+    for _ in 0..row_count {
+        let row_id = cursor.read_i64()?;
+        let row_bytes_len = cursor.read_u32()? as usize;
+        let row_bytes_offset = cursor.offset;
+        let _ = cursor.read_slice(row_bytes_len)?;
+        row_locators.insert(
+            row_id,
+            RowLocatorV1 {
+                byte_offset: u32::try_from(row_bytes_offset)
+                    .map_err(|_| DbError::constraint("row locator offset exceeds u32"))?,
+                byte_len: u32::try_from(row_bytes_len)
+                    .map_err(|_| DbError::constraint("row locator length exceeds u32"))?,
+            },
+        );
+    }
+    Ok(DeferredCompressedLookupCacheEntry {
+        payload,
+        row_locators,
+    })
+}
+
+fn read_deferred_compressed_table_lookup_entry<S: PageStore>(
+    store: &S,
+    state: PersistedTableState,
+) -> Result<Arc<DeferredCompressedLookupCacheEntry>> {
+    let cache_key = deferred_compressed_lookup_cache_key(state);
+    {
+        let cache = deferred_compressed_lookup_cache()
+            .lock()
+            .map_err(|_| DbError::internal("deferred compressed lookup cache lock poisoned"))?;
+        if let Some(entry) = cache.entries.get(&cache_key) {
+            return Ok(entry.clone());
+        }
+    }
+
+    let payload = Arc::new(read_overflow(store, state.pointer)?);
+    if crc32c_parts(&[payload.as_slice()]) != state.checksum {
+        return Err(DbError::corruption(
+            "deferred table payload checksum mismatch",
+        ));
+    }
+    let entry = Arc::new(decode_compressed_table_payload_lookup_entry(payload)?);
+
+    let mut cache = deferred_compressed_lookup_cache()
+        .lock()
+        .map_err(|_| DbError::internal("deferred compressed lookup cache lock poisoned"))?;
+    if let Some(existing) = cache.entries.get(&cache_key) {
+        return Ok(existing.clone());
+    }
+    if cache.entries.len() >= DEFERRED_COMPRESSED_LOOKUP_CACHE_LIMIT {
+        if let Some(evicted) = cache.insertion_order.pop_front() {
+            cache.entries.remove(&evicted);
+        }
+    }
+    cache.insertion_order.push_back(cache_key);
+    cache.entries.insert(cache_key, entry.clone());
+    Ok(entry)
+}
+
+fn decode_row_by_locator_from_payload(
+    payload: &[u8],
+    row_id: i64,
+    locator: RowLocatorV1,
+) -> Result<StoredRow> {
+    let start = locator.byte_offset as usize;
+    let end = start
+        .checked_add(locator.byte_len as usize)
+        .ok_or_else(|| DbError::corruption("row locator exceeded payload length"))?;
+    let row_bytes = payload
+        .get(start..end)
+        .ok_or_else(|| DbError::corruption("row locator exceeded payload length"))?;
+    let row = Row::decode(row_bytes)?;
+    Ok(StoredRow {
+        row_id,
+        values: row.into_values(),
+    })
+}
+
 fn read_deferred_row_by_locator_from_table_payload<S: PageStore>(
     store: &S,
-    pointer: OverflowPointer,
+    state: PersistedTableState,
     row_id: i64,
     locator: RowLocatorV1,
 ) -> Result<Option<StoredRow>> {
+    let pointer = state.pointer;
     if pointer.head_page_id == 0 {
         return Ok(None);
+    }
+    if pointer.is_compressed() {
+        let entry = read_deferred_compressed_table_lookup_entry(store, state)?;
+        return decode_row_by_locator_from_payload(entry.payload.as_slice(), row_id, locator)
+            .map(Some);
     }
     let mut cursor = OverflowPayloadCursor::new(store, pointer);
     cursor.skip(locator.byte_offset as usize)?;
@@ -16982,11 +17110,20 @@ fn read_persisted_table_row_count<S: PageStore>(
 
 fn read_deferred_row_by_id_from_table_payload<S: PageStore>(
     store: &S,
-    pointer: OverflowPointer,
+    state: PersistedTableState,
     row_id: i64,
 ) -> Result<Option<StoredRow>> {
+    let pointer = state.pointer;
     if pointer.head_page_id == 0 {
         return Ok(None);
+    }
+    if pointer.is_compressed() {
+        let entry = read_deferred_compressed_table_lookup_entry(store, state)?;
+        let Some(locator) = entry.row_locators.get(&row_id).copied() else {
+            return Ok(None);
+        };
+        return decode_row_by_locator_from_payload(entry.payload.as_slice(), row_id, locator)
+            .map(Some);
     }
     let mut cursor = OverflowPayloadCursor::new(store, pointer);
     let mut magic = [0_u8; TABLE_PAYLOAD_MAGIC.len()];
@@ -24232,6 +24369,7 @@ mod tests {
     use crate::search::TrigramQueryResult;
     use crate::sql::ast::FromItem;
     use crate::sql::parser::parse_sql_statement;
+    use crate::storage::checksum::crc32c_parts;
     use crate::storage::page::InMemoryPageStore;
     use crate::{Db, DbConfig, Value};
 
@@ -24240,10 +24378,11 @@ mod tests {
         decode_runtime_payload, drop_index_include_columns_section,
         encode_legacy_table_payload_from_manifest, encode_manifest_payload,
         encode_paged_table_chunks, encode_paged_table_chunks_from_rows, encode_runtime_payload,
-        encode_table_payload, persist_paged_table, read_table_page_manifest_from_state,
-        rewrite_paged_table_from_resident, ColumnBinding, Dataset, DbTxnPageStore, EngineRuntime,
-        OverflowPointer, PersistedTableState, RuntimeBtreeKeys, RuntimeIndex, StoredRow, TableData,
-        TablePageManifest, TablePageManifestChunk, TableRowSource,
+        encode_table_payload, persist_paged_table, read_deferred_row_by_id_from_table_payload,
+        read_table_page_manifest_from_state, rewrite_paged_table_from_resident, ColumnBinding,
+        Dataset, DbTxnPageStore, EngineRuntime, OverflowPointer, PersistedTableState,
+        RuntimeBtreeKeys, RuntimeIndex, StoredRow, TableData, TablePageManifest,
+        TablePageManifestChunk, TableRowSource,
     };
 
     const PAGE_SIZE: u32 = 4096;
@@ -26573,6 +26712,47 @@ mod tests {
         let single_payload = encode_table_payload(&data).expect("encode legacy payload");
 
         assert_eq!(reconstructed, single_payload);
+    }
+
+    #[test]
+    fn deferred_row_lookup_reads_compressed_table_payload() {
+        let data = TableData {
+            rows: (1_i64..=4_i64)
+                .map(|row_id| StoredRow {
+                    row_id,
+                    values: vec![Value::Int64(row_id), Value::Text("x".repeat(2048))],
+                })
+                .collect(),
+        };
+        let payload = encode_table_payload(&data).expect("encode table payload");
+        let mut store = InMemoryPageStore::new(PAGE_SIZE);
+        let pointer = crate::record::overflow::write_overflow(
+            &mut store,
+            &payload,
+            CompressionMode::AutoMinBytes(1),
+        )
+        .expect("write compressed table payload");
+        assert!(
+            pointer.is_compressed(),
+            "expected compressed overflow pointer"
+        );
+        let state = PersistedTableState {
+            pointer,
+            checksum: crc32c_parts(&[payload.as_slice()]),
+            row_count: data.rows.len(),
+            ..PersistedTableState::default()
+        };
+
+        let row = read_deferred_row_by_id_from_table_payload(&store, state, 3)
+            .expect("read deferred row")
+            .expect("row should exist");
+        assert_eq!(row.row_id, 3);
+        assert_eq!(row.values, data.rows[2].values);
+        assert!(
+            read_deferred_row_by_id_from_table_payload(&store, state, 99)
+                .expect("read missing deferred row")
+                .is_none()
+        );
     }
 
     #[test]

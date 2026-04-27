@@ -176,6 +176,12 @@ impl WalHandle {
         checkpoint::checkpoint(self, pager, timeout_sec)
     }
 
+    pub(crate) fn shutdown_background_checkpointer(&self) {
+        if let Some(bg) = self.inner.bg_checkpointer.get() {
+            bg.shutdown_and_join();
+        }
+    }
+
     pub(crate) fn read_page_at_snapshot(
         &self,
         pager: &PagerHandle,
