@@ -1,7 +1,8 @@
 //! Page-cache implementation with explicit pin/unpin tracking.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::error::{DbError, Result};
 
@@ -11,12 +12,12 @@ use super::page::PageId;
 pub(crate) struct PageCache {
     capacity_pages: usize,
     page_size: usize,
-    state: Mutex<PageCacheState>,
+    access_counter: AtomicU64,
+    state: RwLock<PageCacheState>,
 }
 
 #[derive(Debug, Default)]
 struct PageCacheState {
-    access_counter: u64,
     pages: HashMap<PageId, Arc<CachedPage>>,
 }
 
@@ -43,7 +44,8 @@ impl PageCache {
         Self {
             capacity_pages: capacity_pages.max(1),
             page_size,
-            state: Mutex::new(PageCacheState::default()),
+            access_counter: AtomicU64::new(0),
+            state: RwLock::new(PageCacheState::default()),
         }
     }
 
@@ -70,7 +72,7 @@ impl PageCache {
 
         let mut state = self
             .state
-            .lock()
+            .write()
             .map_err(|_| DbError::internal("page cache lock poisoned"))?;
         if let Some(page) = state.pages.get(&page_id).cloned() {
             {
@@ -78,21 +80,21 @@ impl PageCache {
                     .inner
                     .lock()
                     .map_err(|_| DbError::internal("cached page lock poisoned"))?;
-                state.access_counter += 1;
+                let ts = self.access_counter.fetch_add(1, Ordering::Relaxed);
                 inner.pin_count += 1;
-                inner.last_access = state.access_counter;
+                inner.last_access = ts;
             }
             return Ok(PageHandle { page });
         }
 
         self.evict_one_if_needed(&mut state)?;
-        state.access_counter += 1;
+        let ts = self.access_counter.fetch_add(1, Ordering::Relaxed);
         let page = Arc::new(CachedPage {
             inner: Mutex::new(CachedPageInner {
                 data: loaded,
                 dirty: false,
                 pin_count: 1,
-                last_access: state.access_counter,
+                last_access: ts,
             }),
         });
         state.pages.insert(page_id, Arc::clone(&page));
@@ -106,7 +108,7 @@ impl PageCache {
     #[cfg(test)]
     pub(crate) fn discard(&self, page_id: PageId) -> Result<()> {
         self.state
-            .lock()
+            .write()
             .map_err(|_| DbError::internal("page cache lock poisoned"))?
             .pages
             .remove(&page_id);
@@ -116,30 +118,31 @@ impl PageCache {
     pub(crate) fn clear(&self) -> Result<()> {
         let mut state = self
             .state
-            .lock()
+            .write()
             .map_err(|_| DbError::internal("page cache lock poisoned"))?;
         state.pages.clear();
-        state.access_counter = 0;
+        self.access_counter.store(0, Ordering::Relaxed);
         Ok(())
     }
 
     fn try_pin_existing(&self, page_id: PageId) -> Result<Option<PageHandle>> {
-        let mut state = self
+        let state = self
             .state
-            .lock()
+            .read()
             .map_err(|_| DbError::internal("page cache lock poisoned"))?;
         let Some(page) = state.pages.get(&page_id).cloned() else {
             return Ok(None);
         };
+        drop(state);
 
         {
             let mut inner = page
                 .inner
                 .lock()
                 .map_err(|_| DbError::internal("cached page lock poisoned"))?;
-            state.access_counter += 1;
+            let ts = self.access_counter.fetch_add(1, Ordering::Relaxed);
             inner.pin_count += 1;
-            inner.last_access = state.access_counter;
+            inner.last_access = ts;
         }
         Ok(Some(PageHandle { page }))
     }
@@ -155,23 +158,22 @@ impl PageCache {
 
         let mut state = self
             .state
-            .lock()
+            .write()
             .map_err(|_| DbError::internal("page cache lock poisoned"))?;
         if let Some(page) = state.pages.get(&page_id).cloned() {
             let mut inner = page
                 .inner
                 .lock()
                 .map_err(|_| DbError::internal("cached page lock poisoned"))?;
-            state.access_counter += 1;
+            let ts = self.access_counter.fetch_add(1, Ordering::Relaxed);
             inner.data = Arc::from(data);
             inner.dirty = dirty;
-            inner.last_access = state.access_counter;
+            inner.last_access = ts;
             return Ok(());
         }
 
         self.evict_one_if_needed(&mut state)?;
-        state.access_counter += 1;
-        let last_access = state.access_counter;
+        let ts = self.access_counter.fetch_add(1, Ordering::Relaxed);
         state.pages.insert(
             page_id,
             Arc::new(CachedPage {
@@ -179,7 +181,7 @@ impl PageCache {
                     data: Arc::from(data),
                     dirty,
                     pin_count: 0,
-                    last_access,
+                    last_access: ts,
                 }),
             }),
         );
@@ -240,7 +242,7 @@ mod tests {
     use std::cell::Cell;
 
     fn dirty_flag(cache: &PageCache, page_id: u32) -> bool {
-        let state = cache.state.lock().expect("cache state");
+        let state = cache.state.read().expect("cache state");
         let page = state.pages.get(&page_id).expect("page exists");
         let dirty = page.inner.lock().expect("page inner").dirty;
         dirty
