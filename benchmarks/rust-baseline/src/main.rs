@@ -27,7 +27,7 @@ use serde::Serialize;
 #[derive(Parser, Debug)]
 #[command(version, about = "DecentDB raw-engine baseline benchmark")]
 struct Cli {
-    /// Scale: smoke | medium | full
+    /// Scale: smoke | medium | full | huge
     #[arg(long, default_value = "smoke")]
     scale: String,
     /// Output directory for JSON report.
@@ -71,13 +71,21 @@ const FULL: Scale = Scale {
     max_songs_per_album: 10,
     songs_cap: 5_000_000,
 };
+const HUGE: Scale = Scale {
+    name: "huge",
+    artists: 250_000,
+    albums: 2_500_000,
+    max_songs_per_album: 10,
+    songs_cap: 25_000_000,
+};
 
 fn parse_scale(name: &str) -> Scale {
     match name.to_ascii_lowercase().as_str() {
         "smoke" => SMOKE,
         "medium" => MEDIUM,
         "full" => FULL,
-        other => panic!("Unknown scale '{other}'. Use smoke|medium|full."),
+        "huge" => HUGE,
+        other => panic!("Unknown scale '{other}'. Use smoke|medium|full|huge."),
     }
 }
 
@@ -126,9 +134,7 @@ struct SongPlan {
     duration_ms: i32,
 }
 
-const COUNTRIES: &[&str] = &[
-    "US", "UK", "DE", "FR", "JP", "BR", "CA", "AU", "SE", "NL",
-];
+const COUNTRIES: &[&str] = &["US", "UK", "DE", "FR", "JP", "BR", "CA", "AU", "SE", "NL"];
 
 struct SeedPlan {
     artists: Vec<ArtistPlan>,
@@ -265,6 +271,20 @@ struct RunReport {
     steps: Vec<StepMetric>,
 }
 
+fn read_proc_status_kb(field: &str) -> Option<u64> {
+    let s = fs::read_to_string("/proc/self/status").ok()?;
+    for line in s.lines() {
+        if line.starts_with(field) {
+            // Format: "VmRSS:    1234 kB"
+            let parts: Vec<_> = line.split_whitespace().collect();
+            if parts.len() >= 2 {
+                return parts[1].parse::<u64>().ok();
+            }
+        }
+    }
+    None
+}
+
 fn read_rss_bytes() -> u64 {
     // /proc/self/statm: size resident shared text lib data dt
     // resident is in pages.
@@ -287,7 +307,11 @@ unsafe fn libc_sysconf_pagesize() -> u64 {
     }
     const _SC_PAGESIZE: i32 = 30;
     let v = unsafe { sysconf(_SC_PAGESIZE) };
-    if v <= 0 { 4096 } else { v as u64 }
+    if v <= 0 {
+        4096
+    } else {
+        v as u64
+    }
 }
 
 struct Recorder<'a> {
@@ -296,7 +320,10 @@ struct Recorder<'a> {
 }
 impl<'a> Recorder<'a> {
     fn new(report: &'a mut RunReport) -> Self {
-        Self { report, peak_rss: 0 }
+        Self {
+            report,
+            peak_rss: 0,
+        }
     }
     fn format_duration_ns(ns: u64) -> String {
         if ns < 1_000 {
@@ -321,7 +348,13 @@ impl<'a> Recorder<'a> {
         if rss > self.peak_rss {
             self.peak_rss = rss;
         }
-        let rps = records.map(|r| if dur_secs > 0.0 { r as f64 / dur_secs } else { 0.0 });
+        let rps = records.map(|r| {
+            if dur_secs > 0.0 {
+                r as f64 / dur_secs
+            } else {
+                0.0
+            }
+        });
         println!(
             "  [Rust    ] {:<38} {:>12}  {:>14}  {:>14}  RSS={:>9}",
             name,
@@ -558,9 +591,10 @@ fn run(cli: Cli) -> anyhow::Result<()> {
 
     fs::create_dir_all(&cli.out_dir)?;
     let datetime_stamp = Utc::now().format("%Y-%m-%d-%H%M").to_string();
-    let out_path = cli
-        .out_dir
-        .join(format!("{datetime_stamp}-rust-baseline-{}.json", scale.name));
+    let out_path = cli.out_dir.join(format!(
+        "{datetime_stamp}-rust-baseline-{}.json",
+        scale.name
+    ));
     fs::write(&out_path, serde_json::to_string_pretty(&report)?)?;
     println!("\nWrote {}", out_path.display());
 
@@ -628,7 +662,9 @@ fn seed_songs(db: &decentdb::Db, plan: &SeedPlan) {
 
 // --- helpers ---------------------------------------------------------------
 fn first_value(r: &decentdb::QueryResult) -> Option<Value> {
-    r.rows().first().and_then(|row| row.values().first().cloned())
+    r.rows()
+        .first()
+        .and_then(|row| row.values().first().cloned())
 }
 fn scalar_int(r: &decentdb::QueryResult) -> i64 {
     match first_value(r) {
@@ -642,5 +678,20 @@ fn main() {
     if let Err(e) = run(cli) {
         eprintln!("Error: {e:?}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_scale, HUGE};
+
+    #[test]
+    fn parse_scale_supports_huge() {
+        let scale = parse_scale("huge");
+
+        assert_eq!(scale.name, HUGE.name);
+        assert_eq!(scale.artists, HUGE.artists);
+        assert_eq!(scale.albums, HUGE.albums);
+        assert_eq!(scale.songs_cap, HUGE.songs_cap);
     }
 }

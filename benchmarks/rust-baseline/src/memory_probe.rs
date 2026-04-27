@@ -71,9 +71,7 @@ fn main() -> Result<()> {
     let db_path = args.dir.join(format!("probe-{}.ddb", args.label));
     // best-effort cleanup
     for suffix in ["", "-wal", ".wal", "-shm", ".shm"] {
-        let p = args
-            .dir
-            .join(format!("probe-{}.ddb{suffix}", args.label));
+        let p = args.dir.join(format!("probe-{}.ddb{suffix}", args.label));
         let _ = fs::remove_file(&p);
     }
 
@@ -114,14 +112,10 @@ fn main() -> Result<()> {
         let end = (next_id + args.batch - 1).min(args.rows);
         {
             let mut txn = db.transaction()?;
-            let prepared = txn.prepare(
-                "INSERT INTO events (id, kind, payload) VALUES ($1, $2, $3)",
-            )?;
-            let mut params: [Value; 3] = [
-                Value::Int64(0),
-                Value::Int64(0),
-                Value::Text(String::new()),
-            ];
+            let prepared =
+                txn.prepare("INSERT INTO events (id, kind, payload) VALUES ($1, $2, $3)")?;
+            let mut params: [Value; 3] =
+                [Value::Int64(0), Value::Int64(0), Value::Text(String::new())];
             for id in next_id..=end {
                 params[0] = Value::Int64(id as i64);
                 params[1] = Value::Int64((id % 16) as i64);
@@ -194,7 +188,11 @@ fn main() -> Result<()> {
     println!("rows inserted        : {}", args.rows);
     println!("batch size           : {}", args.batch);
     println!("cache_size_mb        : {}", args.cache_mb);
-    println!("load duration        : {:.0} ms ({:.0} r/s)", load_ns / 1_000_000.0, args.rows as f64 / (load_ns / 1_000_000_000.0));
+    println!(
+        "load duration        : {:.0} ms ({:.0} r/s)",
+        load_ns / 1_000_000.0,
+        args.rows as f64 / (load_ns / 1_000_000_000.0)
+    );
     println!("DB size on disk      : {:.1} MB", mb(db_size));
     println!("WAL size on disk     : {:.1} MB", mb(wal_size));
     println!("end-of-load RSS      : {:.1} MB", mb(load_rss));

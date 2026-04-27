@@ -25,13 +25,15 @@ theoretical engine ceiling that any binding could approach but never beat.
 
 ## Scales
 
-Mirror `Scale.cs`:
+Mirror `Scale.cs` for `smoke` / `medium` / `full`, with an additional
+benchmark-only `huge` scale at 5x `full`:
 
 | name   | artists | albums (target) | songs cap |
 |--------|--------:|----------------:|----------:|
 | smoke  |     500 |          5,000  |    50,000 |
 | medium |   5,000 |         50,000  |   500,000 |
 | full   |  50,000 |        500,000  | 5,000,000 |
+| huge   | 250,000 |      2,500,000  |25,000,000 |
 
 The **seed plan** uses a SplitMix64 RNG seeded with 42 (deterministic, but
 distinct from .NET's `System.Random`), so the actual song counts differ
@@ -47,6 +49,7 @@ cargo build --release
 ./target/release/rust-baseline --scale smoke
 ./target/release/rust-baseline --scale medium
 ./target/release/rust-baseline --scale full
+./target/release/rust-baseline --scale huge
 ```
 
 ## Results

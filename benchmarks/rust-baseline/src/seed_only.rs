@@ -7,7 +7,9 @@ use std::time::Instant;
 use decentdb::{DbConfig, PreparedStatement, Value};
 
 fn main() {
-    let scale = std::env::args().nth(1).unwrap_or_else(|| "medium".to_string());
+    let scale = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "medium".to_string());
     let path: PathBuf = format!("seed-{}.ddb", scale).into();
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(format!("{}.wal", path.display()));
@@ -16,6 +18,7 @@ fn main() {
         "smoke" => (500u32, 10u32, 10u32),
         "medium" => (5_000u32, 10u32, 10u32),
         "full" => (50_000u32, 10u32, 10u32),
+        "huge" => (250_000u32, 10u32, 10u32),
         _ => panic!("bad scale"),
     };
 
