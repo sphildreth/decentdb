@@ -1,0 +1,442 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>DecentDB rust-baseline report</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0f172a;
+      --panel: #111827;
+      --panel-alt: #1f2937;
+      --border: #334155;
+      --text: #e5e7eb;
+      --muted: #94a3b8;
+      --good: #22c55e;
+      --bad: #ef4444;
+      --accent: #38bdf8;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.45;
+    }
+    header, main {
+      width: min(1500px, calc(100vw - 32px));
+      margin: 0 auto;
+    }
+    header {
+      padding: 32px 0 20px;
+    }
+    h1, h2, h3 { margin: 0 0 12px; }
+    h2 { margin-top: 28px; }
+    p.meta { color: var(--muted); margin: 0; }
+    .overview-grid, .summary-grid, .chart-grid {
+      display: grid;
+      gap: 16px;
+    }
+    .overview-grid {
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      margin: 20px 0 28px;
+    }
+    .summary-grid {
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      margin-bottom: 18px;
+    }
+    .chart-grid {
+      grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
+      margin: 16px 0 24px;
+    }
+    .card, .chart-card, .table-wrap, section {
+      background: rgba(17, 24, 39, 0.88);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      box-shadow: 0 8px 30px rgba(0, 0, 0, 0.25);
+    }
+    .card, .chart-card {
+      padding: 18px;
+    }
+    .chart-card {
+      overflow: hidden;
+    }
+    .card .label {
+      color: var(--muted);
+      font-size: 0.85rem;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .card .value {
+      font-size: 1.6rem;
+      font-weight: 700;
+      margin-top: 6px;
+    }
+    .card .sub {
+      color: var(--muted);
+      font-size: 0.9rem;
+      margin-top: 6px;
+    }
+    section {
+      padding: 22px;
+      margin-bottom: 24px;
+    }
+    .section-meta {
+      color: var(--muted);
+      margin-bottom: 12px;
+    }
+    .table-wrap {
+      overflow-x: auto;
+      margin: 16px 0 0;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      min-width: 760px;
+    }
+    th, td {
+      padding: 10px 12px;
+      border-bottom: 1px solid rgba(148, 163, 184, 0.18);
+      text-align: left;
+      vertical-align: top;
+    }
+    th {
+      position: sticky;
+      top: 0;
+      background: var(--panel-alt);
+      color: #f8fafc;
+      font-size: 0.86rem;
+    }
+    td.mono, th.mono {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.9rem;
+    }
+    .muted { color: var(--muted); }
+    .good { color: var(--good); }
+    .bad { color: var(--bad); }
+    .chart-frame {
+      position: relative;
+      height: clamp(260px, 34vh, 360px);
+      max-height: 360px;
+      margin-top: 12px;
+    }
+    .chart-card canvas {
+      width: 100%;
+      height: 100%;
+    }
+    .empty {
+      color: var(--muted);
+      font-style: italic;
+      margin-top: 8px;
+    }
+    code {
+      background: rgba(148, 163, 184, 0.12);
+      border-radius: 6px;
+      padding: 1px 5px;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>DecentDB rust-baseline analytics report</h1>
+    <p class="meta">Generated 2026-04-27 14:46:43 UTC from <code>results</code> using 10 historical run(s).</p>
+  </header>
+  <main>
+    <div id="overview"></div>
+    <div id="scales"></div>
+  </main>
+
+  <script id="report-data" type="application/json">{"generated_at_unix":1777301203,"generated_at_label":"2026-04-27 14:46:43 UTC","source_directory":"results","total_runs":10,"scales":[{"scale_name":"smoke","step_names":["connect_open","schema_create","seed_artists","seed_albums","seed_songs","query_count_songs","query_aggregate_durations","query_artist_by_id","query_top10_artists_by_songs","query_top10_albums_by_songs","query_view_first_1000","query_songs_for_artist_via_view"],"runs":[{"file_name":"2026-04-26-2203-rust-baseline-smoke.json","timestamp_unix":1777240993,"timestamp_label":"2026-04-26 22:03:13 UTC","total_runtime_seconds":0.18033301999999998,"report":{"binding":"RustRaw","scale_name":"smoke","target_artists":500,"target_albums":5000,"target_songs_cap":50000,"started_unix":1777240993,"finished_unix":1777240993,"engine_version":"2.3.1","database_path":"run-rust-smoke.ddb","database_size_bytes":1392640,"wal_size_bytes":32,"peak_rss_bytes":36753408,"steps":[{"name":"connect_open","duration_seconds":0.006170943,"records":null,"records_per_second":null,"rss_bytes":8413184,"extra":{}},{"name":"schema_create","duration_seconds":0.024528263,"records":null,"records_per_second":null,"rss_bytes":11431936,"extra":{}},{"name":"seed_artists","duration_seconds":0.002875392,"records":500,"records_per_second":173889.33404558405,"rss_bytes":11997184,"extra":{}},{"name":"seed_albums","duration_seconds":0.009005669,"records":5000,"records_per_second":555205.8375674257,"rss_bytes":14811136,"extra":{}},{"name":"seed_songs","duration_seconds":0.034199253,"records":27783,"records_per_second":812386.1652767679,"rss_bytes":27664384,"extra":{}},{"name":"query_count_songs","duration_seconds":0.000111188,"records":null,"records_per_second":null,"rss_bytes":27860992,"extra":{"count":27783}},{"name":"query_aggregate_durations","duration_seconds":0.009789202,"records":null,"records_per_second":null,"rss_bytes":34496512,"extra":{}},{"name":"query_artist_by_id","duration_seconds":0.000108343,"records":null,"records_per_second":null,"rss_bytes":34496512,"extra":{}},{"name":"query_top10_artists_by_songs","duration_seconds":0.018199352,"records":null,"records_per_second":null,"rss_bytes":36356096,"extra":{}},{"name":"query_top10_albums_by_songs","duration_seconds":0.023205708,"records":null,"records_per_second":null,"rss_bytes":36753408,"extra":{}},{"name":"query_view_first_1000","duration_seconds":0.026856296,"records":null,"records_per_second":null,"rss_bytes":34873344,"extra":{}},{"name":"query_songs_for_artist_via_view","duration_seconds":0.025283411,"records":null,"records_per_second":null,"rss_bytes":34873344,"extra":{}}]}}]},{"scale_name":"medium","step_names":["connect_open","schema_create","seed_artists","seed_albums","seed_songs","query_count_songs","query_aggregate_durations","query_artist_by_id","query_top10_artists_by_songs","query_top10_albums_by_songs","query_view_first_1000","query_songs_for_artist_via_view"],"runs":[{"file_name":"2026-04-26-2203-rust-baseline-medium.json","timestamp_unix":1777240998,"timestamp_label":"2026-04-26 22:03:18 UTC","total_runtime_seconds":1.551889756,"report":{"binding":"RustRaw","scale_name":"medium","target_artists":5000,"target_albums":50000,"target_songs_cap":500000,"started_unix":1777240998,"finished_unix":1777241000,"engine_version":"2.3.1","database_path":"run-rust-medium.ddb","database_size_bytes":14430208,"wal_size_bytes":32,"peak_rss_bytes":267870208,"steps":[{"name":"connect_open","duration_seconds":0.005097578,"records":null,"records_per_second":null,"rss_bytes":31735808,"extra":{}},{"name":"schema_create","duration_seconds":0.02972772,"records":null,"records_per_second":null,"rss_bytes":34766848,"extra":{}},{"name":"seed_artists","duration_seconds":0.010060291,"records":5000,"records_per_second":497003.516101075,"rss_bytes":37756928,"extra":{}},{"name":"seed_albums","duration_seconds":0.076401791,"records":50000,"records_per_second":654434.9202494482,"rss_bytes":66318336,"extra":{}},{"name":"seed_songs","duration_seconds":0.345635483,"records":276243,"records_per_second":799232.1783698348,"rss_bytes":197898240,"extra":{}},{"name":"query_count_songs","duration_seconds":0.000137267,"records":null,"records_per_second":null,"rss_bytes":198160384,"extra":{"count":276243}},{"name":"query_aggregate_durations","duration_seconds":0.093457393,"records":null,"records_per_second":null,"rss_bytes":227172352,"extra":{}},{"name":"query_artist_by_id","duration_seconds":0.000152085,"records":null,"records_per_second":null,"rss_bytes":227172352,"extra":{}},{"name":"query_top10_artists_by_songs","duration_seconds":0.202796195,"records":null,"records_per_second":null,"rss_bytes":261578752,"extra":{}},{"name":"query_top10_albums_by_songs","duration_seconds":0.252760765,"records":null,"records_per_second":null,"rss_bytes":267870208,"extra":{}},{"name":"query_view_first_1000","duration_seconds":0.28326264,"records":null,"records_per_second":null,"rss_bytes":261578752,"extra":{}},{"name":"query_songs_for_artist_via_view","duration_seconds":0.252400548,"records":null,"records_per_second":null,"rss_bytes":261578752,"extra":{}}]}},{"file_name":"2026-04-27-1116-rust-baseline-medium.json","timestamp_unix":1777288564,"timestamp_label":"2026-04-27 11:16:04 UTC","total_runtime_seconds":1.503531912,"report":{"binding":"RustRaw","scale_name":"medium","target_artists":5000,"target_albums":50000,"target_songs_cap":500000,"started_unix":1777288564,"finished_unix":1777288565,"engine_version":"2.3.1","database_path":"run-rust-medium.ddb","database_size_bytes":14430208,"wal_size_bytes":32,"peak_rss_bytes":264622080,"steps":[{"name":"connect_open","duration_seconds":0.002919883,"records":null,"records_per_second":null,"rss_bytes":31637504,"extra":{}},{"name":"schema_create","duration_seconds":0.02477522,"records":null,"records_per_second":null,"rss_bytes":34799616,"extra":{}},{"name":"seed_artists","duration_seconds":0.009002525,"records":5000,"records_per_second":555399.7350743263,"rss_bytes":37789696,"extra":{}},{"name":"seed_albums","duration_seconds":0.071206646,"records":50000,"records_per_second":702181.6474827364,"rss_bytes":66351104,"extra":{}},{"name":"seed_songs","duration_seconds":0.338910007,"records":276243,"records_per_second":815092.4855989867,"rss_bytes":194678784,"extra":{}},{"name":"query_count_songs","duration_seconds":0.000121118,"records":null,"records_per_second":null,"rss_bytes":194940928,"extra":{"count":276243}},{"name":"query_aggregate_durations","duration_seconds":0.089848982,"records":null,"records_per_second":null,"rss_bytes":223956992,"extra":{}},{"name":"query_artist_by_id","duration_seconds":0.000129283,"records":null,"records_per_second":null,"rss_bytes":223956992,"extra":{}},{"name":"query_top10_artists_by_songs","duration_seconds":0.194316763,"records":null,"records_per_second":null,"rss_bytes":258363392,"extra":{}},{"name":"query_top10_albums_by_songs","duration_seconds":0.245221267,"records":null,"records_per_second":null,"rss_bytes":264622080,"extra":{}},{"name":"query_view_first_1000","duration_seconds":0.276431451,"records":null,"records_per_second":null,"rss_bytes":258289664,"extra":{}},{"name":"query_songs_for_artist_via_view","duration_seconds":0.250648767,"records":null,"records_per_second":null,"rss_bytes":258048000,"extra":{}}]}},{"file_name":"2026-04-27-1407-rust-baseline-medium.json","timestamp_unix":1777298856,"timestamp_label":"2026-04-27 14:07:36 UTC","total_runtime_seconds":1.539770688,"report":{"binding":"RustRaw","scale_name":"medium","target_artists":5000,"target_albums":50000,"target_songs_cap":500000,"started_unix":1777298856,"finished_unix":1777298858,"engine_version":"2.3.1","database_path":"run-rust-medium.ddb","database_size_bytes":14430208,"wal_size_bytes":32,"peak_rss_bytes":265916416,"steps":[{"name":"connect_open","duration_seconds":0.005701339,"records":null,"records_per_second":null,"rss_bytes":31748096,"extra":{}},{"name":"schema_create","duration_seconds":0.021585825,"records":null,"records_per_second":null,"rss_bytes":34779136,"extra":{}},{"name":"seed_artists","duration_seconds":0.009898843,"records":5000,"records_per_second":505109.5365387653,"rss_bytes":37834752,"extra":{}},{"name":"seed_albums","duration_seconds":0.070374095,"records":50000,"records_per_second":710488.7103699166,"rss_bytes":66396160,"extra":{}},{"name":"seed_songs","duration_seconds":0.340704076,"records":276243,"records_per_second":810800.3967642582,"rss_bytes":196104192,"extra":{}},{"name":"query_count_songs","duration_seconds":0.00011663,"records":null,"records_per_second":null,"rss_bytes":196300800,"extra":{"count":276243}},{"name":"query_aggregate_durations","duration_seconds":0.091452048,"records":null,"records_per_second":null,"rss_bytes":225251328,"extra":{}},{"name":"query_artist_by_id","duration_seconds":0.000205105,"records":null,"records_per_second":null,"rss_bytes":225251328,"extra":{}},{"name":"query_top10_artists_by_songs","duration_seconds":0.206627884,"records":null,"records_per_second":null,"rss_bytes":259657728,"extra":{}},{"name":"query_top10_albums_by_songs","duration_seconds":0.251942472,"records":null,"records_per_second":null,"rss_bytes":265916416,"extra":{}},{"name":"query_view_first_1000","duration_seconds":0.281752935,"records":null,"records_per_second":null,"rss_bytes":259584000,"extra":{}},{"name":"query_songs_for_artist_via_view","duration_seconds":0.259409436,"records":null,"records_per_second":null,"rss_bytes":259342336,"extra":{}}]}}]},{"scale_name":"full","step_names":["connect_open","schema_create","seed_artists","seed_albums","seed_songs","query_count_songs","query_aggregate_durations","query_artist_by_id","query_top10_artists_by_songs","query_top10_albums_by_songs","query_view_first_1000","query_songs_for_artist_via_view"],"runs":[{"file_name":"2026-04-26-2203-rust-baseline-full.json","timestamp_unix":1777241017,"timestamp_label":"2026-04-26 22:03:37 UTC","total_runtime_seconds":15.393465122,"report":{"binding":"RustRaw","scale_name":"full","target_artists":50000,"target_albums":500000,"target_songs_cap":5000000,"started_unix":1777241017,"finished_unix":1777241033,"engine_version":"2.3.1","database_path":"run-rust-full.ddb","database_size_bytes":151916544,"wal_size_bytes":32,"peak_rss_bytes":2319106048,"steps":[{"name":"connect_open","duration_seconds":0.005850301,"records":null,"records_per_second":null,"rss_bytes":264130560,"extra":{}},{"name":"schema_create","duration_seconds":0.0235479,"records":null,"records_per_second":null,"rss_bytes":267153408,"extra":{}},{"name":"seed_artists","duration_seconds":0.074158765,"records":50000,"records_per_second":674229.1352883236,"rss_bytes":297148416,"extra":{}},{"name":"seed_albums","duration_seconds":0.737183866,"records":500000,"records_per_second":678256.8407431749,"rss_bytes":585076736,"extra":{}},{"name":"seed_songs","duration_seconds":3.326134805,"records":2749816,"records_per_second":826730.1721705173,"rss_bytes":1878175744,"extra":{}},{"name":"query_count_songs","duration_seconds":0.000126147,"records":null,"records_per_second":null,"rss_bytes":1878372352,"extra":{"count":2749816}},{"name":"query_aggregate_durations","duration_seconds":0.844347586,"records":null,"records_per_second":null,"rss_bytes":2318843904,"extra":{}},{"name":"query_artist_by_id","duration_seconds":0.000133842,"records":null,"records_per_second":null,"rss_bytes":2318843904,"extra":{}},{"name":"query_top10_artists_by_songs","duration_seconds":1.932684843,"records":null,"records_per_second":null,"rss_bytes":2319106048,"extra":{}},{"name":"query_top10_albums_by_songs","duration_seconds":3.388770175,"records":null,"records_per_second":null,"rss_bytes":2319106048,"extra":{}},{"name":"query_view_first_1000","duration_seconds":2.611697025,"records":null,"records_per_second":null,"rss_bytes":2319106048,"extra":{}},{"name":"query_songs_for_artist_via_view","duration_seconds":2.448829867,"records":null,"records_per_second":null,"rss_bytes":2319106048,"extra":{}}]}},{"file_name":"2026-04-27-1116-rust-baseline-full.json","timestamp_unix":1777288582,"timestamp_label":"2026-04-27 11:16:22 UTC","total_runtime_seconds":15.169000649,"report":{"binding":"RustRaw","scale_name":"full","target_artists":50000,"target_albums":500000,"target_songs_cap":5000000,"started_unix":1777288582,"finished_unix":1777288598,"engine_version":"2.3.1","database_path":"run-rust-full.ddb","database_size_bytes":151916544,"wal_size_bytes":32,"peak_rss_bytes":2318598144,"steps":[{"name":"connect_open","duration_seconds":0.005275085,"records":null,"records_per_second":null,"rss_bytes":264216576,"extra":{}},{"name":"schema_create","duration_seconds":0.026524977,"records":null,"records_per_second":null,"rss_bytes":267038720,"extra":{}},{"name":"seed_artists","duration_seconds":0.073383152,"records":50000,"records_per_second":681355.3061879927,"rss_bytes":297099264,"extra":{}},{"name":"seed_albums","duration_seconds":0.719091689,"records":500000,"records_per_second":695321.6226088243,"rss_bytes":584568832,"extra":{}},{"name":"seed_songs","duration_seconds":3.282152747,"records":2749816,"records_per_second":837808.6615601379,"rss_bytes":1877659648,"extra":{}},{"name":"query_count_songs","duration_seconds":0.000119053,"records":null,"records_per_second":null,"rss_bytes":1877856256,"extra":{"count":2749816}},{"name":"query_aggregate_durations","duration_seconds":0.814754656,"records":null,"records_per_second":null,"rss_bytes":2318336000,"extra":{}},{"name":"query_artist_by_id","duration_seconds":0.000148028,"records":null,"records_per_second":null,"rss_bytes":2318336000,"extra":{}},{"name":"query_top10_artists_by_songs","duration_seconds":1.864445075,"records":null,"records_per_second":null,"rss_bytes":2318598144,"extra":{}},{"name":"query_top10_albums_by_songs","duration_seconds":3.362985141,"records":null,"records_per_second":null,"rss_bytes":2318598144,"extra":{}},{"name":"query_view_first_1000","duration_seconds":2.599984716,"records":null,"records_per_second":null,"rss_bytes":2318598144,"extra":{}},{"name":"query_songs_for_artist_via_view","duration_seconds":2.42013633,"records":null,"records_per_second":null,"rss_bytes":2318598144,"extra":{}}]}},{"file_name":"2026-04-27-1408-rust-baseline-full.json","timestamp_unix":1777298879,"timestamp_label":"2026-04-27 14:07:59 UTC","total_runtime_seconds":15.518709161999999,"report":{"binding":"RustRaw","scale_name":"full","target_artists":50000,"target_albums":500000,"target_songs_cap":5000000,"started_unix":1777298879,"finished_unix":1777298895,"engine_version":"2.3.1","database_path":"run-rust-full.ddb","database_size_bytes":151916544,"wal_size_bytes":32,"peak_rss_bytes":2317807616,"steps":[{"name":"connect_open","duration_seconds":0.006124724,"records":null,"records_per_second":null,"rss_bytes":264069120,"extra":{}},{"name":"schema_create","duration_seconds":0.024644902,"records":null,"records_per_second":null,"rss_bytes":267157504,"extra":{}},{"name":"seed_artists","duration_seconds":0.0753329,"records":50000,"records_per_second":663720.6320213347,"rss_bytes":296955904,"extra":{}},{"name":"seed_albums","duration_seconds":0.733168073,"records":500000,"records_per_second":681971.8675884022,"rss_bytes":583647232,"extra":{}},{"name":"seed_songs","duration_seconds":3.305597058,"records":2749816,"records_per_second":831866.6648571297,"rss_bytes":1876738048,"extra":{}},{"name":"query_count_songs","duration_seconds":0.000123351,"records":null,"records_per_second":null,"rss_bytes":1877000192,"extra":{"count":2749816}},{"name":"query_aggregate_durations","duration_seconds":0.828179095,"records":null,"records_per_second":null,"rss_bytes":2317479936,"extra":{}},{"name":"query_artist_by_id","duration_seconds":0.00013846,"records":null,"records_per_second":null,"rss_bytes":2317479936,"extra":{}},{"name":"query_top10_artists_by_songs","duration_seconds":1.964739814,"records":null,"records_per_second":null,"rss_bytes":2317807616,"extra":{}},{"name":"query_top10_albums_by_songs","duration_seconds":3.429583669,"records":null,"records_per_second":null,"rss_bytes":2317807616,"extra":{}},{"name":"query_view_first_1000","duration_seconds":2.689031345,"records":null,"records_per_second":null,"rss_bytes":2317807616,"extra":{}},{"name":"query_songs_for_artist_via_view","duration_seconds":2.462045771,"records":null,"records_per_second":null,"rss_bytes":2317807616,"extra":{}}]}},{"file_name":"2026-04-27-1416-rust-baseline-full.json","timestamp_unix":1777299349,"timestamp_label":"2026-04-27 14:15:49 UTC","total_runtime_seconds":16.03479888,"report":{"binding":"RustRaw","scale_name":"full","target_artists":50000,"target_albums":500000,"target_songs_cap":5000000,"started_unix":1777299349,"finished_unix":1777299366,"engine_version":"2.3.1","database_path":"run-rust-full.ddb","database_size_bytes":151916544,"wal_size_bytes":32,"peak_rss_bytes":2312736768,"steps":[{"name":"connect_open","duration_seconds":0.006124986,"records":null,"records_per_second":null,"rss_bytes":264167424,"extra":{}},{"name":"schema_create","duration_seconds":0.024514847,"records":null,"records_per_second":null,"rss_bytes":267190272,"extra":{}},{"name":"seed_artists","duration_seconds":0.078283393,"records":50000,"records_per_second":638705.0699246007,"rss_bytes":297054208,"extra":{}},{"name":"seed_albums","duration_seconds":0.788274353,"records":500000,"records_per_second":634296.9273288028,"rss_bytes":582144000,"extra":{}},{"name":"seed_songs","duration_seconds":3.556024941,"records":2749816,"records_per_second":773283.6652227519,"rss_bytes":1871798272,"extra":{}},{"name":"query_count_songs","duration_seconds":0.000152496,"records":null,"records_per_second":null,"rss_bytes":1872060416,"extra":{"count":2749816}},{"name":"query_aggregate_durations","duration_seconds":0.90401234,"records":null,"records_per_second":null,"rss_bytes":2312540160,"extra":{}},{"name":"query_artist_by_id","duration_seconds":0.000140484,"records":null,"records_per_second":null,"rss_bytes":2312540160,"extra":{}},{"name":"query_top10_artists_by_songs","duration_seconds":1.95226876,"records":null,"records_per_second":null,"rss_bytes":2312736768,"extra":{}},{"name":"query_top10_albums_by_songs","duration_seconds":3.503212893,"records":null,"records_per_second":null,"rss_bytes":2312736768,"extra":{}},{"name":"query_view_first_1000","duration_seconds":2.689233655,"records":null,"records_per_second":null,"rss_bytes":2312736768,"extra":{}},{"name":"query_songs_for_artist_via_view","duration_seconds":2.532555732,"records":null,"records_per_second":null,"rss_bytes":2312736768,"extra":{}}]}},{"file_name":"2026-04-27-1420-rust-baseline-full.json","timestamp_unix":1777299600,"timestamp_label":"2026-04-27 14:20:00 UTC","total_runtime_seconds":16.607835699000002,"report":{"binding":"RustRaw","scale_name":"full","target_artists":50000,"target_albums":500000,"target_songs_cap":5000000,"started_unix":1777299600,"finished_unix":1777299617,"engine_version":"2.3.1","database_path":"run-rust-full.ddb","database_size_bytes":151916544,"wal_size_bytes":32,"peak_rss_bytes":2312663040,"steps":[{"name":"connect_open","duration_seconds":0.00608213,"records":null,"records_per_second":null,"rss_bytes":264032256,"extra":{}},{"name":"schema_create","duration_seconds":0.026366074,"records":null,"records_per_second":null,"rss_bytes":266919936,"extra":{}},{"name":"seed_artists","duration_seconds":0.075394549,"records":50000,"records_per_second":663177.9175441449,"rss_bytes":296980480,"extra":{}},{"name":"seed_albums","duration_seconds":0.775128651,"records":500000,"records_per_second":645054.2104913112,"rss_bytes":582070272,"extra":{}},{"name":"seed_songs","duration_seconds":3.591058835,"records":2749816,"records_per_second":765739.6122834617,"rss_bytes":1871724544,"extra":{}},{"name":"query_count_songs","duration_seconds":0.000114585,"records":null,"records_per_second":null,"rss_bytes":1871921152,"extra":{"count":2749816}},{"name":"query_aggregate_durations","duration_seconds":0.896588406,"records":null,"records_per_second":null,"rss_bytes":2312400896,"extra":{}},{"name":"query_artist_by_id","duration_seconds":0.000132118,"records":null,"records_per_second":null,"rss_bytes":2312400896,"extra":{}},{"name":"query_top10_artists_by_songs","duration_seconds":2.01750173,"records":null,"records_per_second":null,"rss_bytes":2312663040,"extra":{}},{"name":"query_top10_albums_by_songs","duration_seconds":3.593689716,"records":null,"records_per_second":null,"rss_bytes":2312663040,"extra":{}},{"name":"query_view_first_1000","duration_seconds":2.918040997,"records":null,"records_per_second":null,"rss_bytes":2312663040,"extra":{}},{"name":"query_songs_for_artist_via_view","duration_seconds":2.707737908,"records":null,"records_per_second":null,"rss_bytes":2312663040,"extra":{}}]}}]},{"scale_name":"huge","step_names":["connect_open","schema_create","seed_artists","seed_albums","seed_songs","query_count_songs","query_aggregate_durations","query_artist_by_id","query_top10_artists_by_songs","query_top10_albums_by_songs","query_view_first_1000","query_songs_for_artist_via_view"],"runs":[{"file_name":"2026-04-27-1419-rust-baseline-huge.json","timestamp_unix":1777299460,"timestamp_label":"2026-04-27 14:17:40 UTC","total_runtime_seconds":82.60764655599999,"report":{"binding":"RustRaw","scale_name":"huge","target_artists":250000,"target_albums":2500000,"target_songs_cap":25000000,"started_unix":1777299460,"finished_unix":1777299546,"engine_version":"2.3.1","database_path":"run-rust-huge.ddb","database_size_bytes":785825792,"wal_size_bytes":32,"peak_rss_bytes":11597443072,"steps":[{"name":"connect_open","duration_seconds":0.005641902,"records":null,"records_per_second":null,"rss_bytes":1297584128,"extra":{}},{"name":"schema_create","duration_seconds":0.026459504,"records":null,"records_per_second":null,"rss_bytes":1300602880,"extra":{}},{"name":"seed_artists","duration_seconds":0.375203277,"records":250000,"records_per_second":666305.481121904,"rss_bytes":1452789760,"extra":{}},{"name":"seed_albums","duration_seconds":3.622014228,"records":2500000,"records_per_second":690223.6829092876,"rss_bytes":2893570048,"extra":{}},{"name":"seed_songs","duration_seconds":17.172423547,"records":13746520,"records_per_second":800499.7059603446,"rss_bytes":9415049216,"extra":{}},{"name":"query_count_songs","duration_seconds":0.000148509,"records":null,"records_per_second":null,"rss_bytes":9415245824,"extra":{"count":13746520}},{"name":"query_aggregate_durations","duration_seconds":4.394227893,"records":null,"records_per_second":null,"rss_bytes":11582427136,"extra":{}},{"name":"query_artist_by_id","duration_seconds":0.000137908,"records":null,"records_per_second":null,"rss_bytes":11582427136,"extra":{}},{"name":"query_top10_artists_by_songs","duration_seconds":10.535589121,"records":null,"records_per_second":null,"rss_bytes":11582754816,"extra":{}},{"name":"query_top10_albums_by_songs","duration_seconds":19.692164369,"records":null,"records_per_second":null,"rss_bytes":11582754816,"extra":{}},{"name":"query_view_first_1000","duration_seconds":13.780175656,"records":null,"records_per_second":null,"rss_bytes":11582754816,"extra":{}},{"name":"query_songs_for_artist_via_view","duration_seconds":13.003460642,"records":null,"records_per_second":null,"rss_bytes":11597443072,"extra":{}}]}}]}]}</script>
+  <script>
+    const reportData = JSON.parse(document.getElementById('report-data').textContent);
+    const chartPalette = ['#38bdf8', '#a78bfa', '#22c55e', '#f59e0b', '#ef4444', '#14b8a6', '#f472b6', '#eab308', '#60a5fa', '#c084fc', '#fb7185', '#34d399'];
+
+    function formatBytes(bytes) {
+      if (bytes == null) return '—';
+      const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+      let value = Number(bytes);
+      let index = 0;
+      while (value >= 1024 && index < units.length - 1) {
+        value /= 1024;
+        index++;
+      }
+      return `${value.toFixed(value >= 100 || index === 0 ? 0 : 1)}${units[index]}`;
+    }
+
+    function formatSeconds(value) {
+      if (value == null || Number.isNaN(value)) return '—';
+      return `${Number(value).toFixed(3)} s`;
+    }
+
+    function formatRps(value) {
+      if (value == null || Number.isNaN(value)) return '—';
+      return `${Math.round(Number(value)).toLocaleString()} r/s`;
+    }
+
+    function formatDateLabel(unix) {
+      if (!unix) return '—';
+      return new Date(unix * 1000).toLocaleString();
+    }
+
+    function getStep(run, stepName) {
+      return run.report.steps.find(step => step.name === stepName) || null;
+    }
+
+    function trendClass(latest, best, lowerIsBetter) {
+      if (latest == null || best == null) return 'muted';
+      if (latest === best) return 'good';
+      return lowerIsBetter ? (latest > best ? 'bad' : 'good') : (latest < best ? 'bad' : 'good');
+    }
+
+    function makeCard(label, value, sub, extraClass = '') {
+      const card = document.createElement('div');
+      card.className = `card ${extraClass}`;
+      card.innerHTML = `<div class="label">${label}</div><div class="value">${value}</div><div class="sub">${sub}</div>`;
+      return card;
+    }
+
+    function renderOverview() {
+      const container = document.getElementById('overview');
+      const title = document.createElement('h2');
+      title.textContent = 'Overview';
+      container.appendChild(title);
+
+      const meta = document.createElement('p');
+      meta.className = 'section-meta';
+      meta.textContent = 'Historical benchmark runs grouped by scale. Charts show both improvements and regressions over time.';
+      container.appendChild(meta);
+
+      const grid = document.createElement('div');
+      grid.className = 'overview-grid';
+
+      for (const scale of reportData.scales) {
+        const latest = scale.runs.at(-1);
+        if (!latest) {
+          grid.appendChild(makeCard(scale.scale_name, '0 runs', 'No data yet'));
+          continue;
+        }
+        const latestSeedSongs = getStep(latest, 'seed_songs');
+        grid.appendChild(makeCard(
+          scale.scale_name,
+          `${scale.runs.length} run(s)`,
+          `Latest seed_songs: ${formatRps(latestSeedSongs?.records_per_second)}`
+        ));
+      }
+
+      container.appendChild(grid);
+    }
+
+    function createLineChart(canvas, labels, datasets, yTickFormatter) {
+      return new Chart(canvas, {
+        type: 'line',
+        data: { labels, datasets },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          interaction: { mode: 'nearest', intersect: false },
+          scales: {
+            y: {
+              ticks: {
+                color: '#cbd5e1',
+                callback: value => yTickFormatter(value),
+              },
+              grid: { color: 'rgba(148, 163, 184, 0.15)' },
+            },
+            x: {
+              ticks: { color: '#cbd5e1' },
+              grid: { color: 'rgba(148, 163, 184, 0.10)' },
+            },
+          },
+          plugins: {
+            legend: {
+              labels: { color: '#e5e7eb', boxWidth: 14 },
+            },
+            tooltip: {
+              callbacks: {
+                label: context => `${context.dataset.label}: ${yTickFormatter(context.parsed.y)}`,
+              },
+            },
+          },
+        },
+      });
+    }
+
+    function renderScale(scale) {
+      const host = document.getElementById('scales');
+      const section = document.createElement('section');
+      const title = document.createElement('h2');
+      title.textContent = scale.scale_name;
+      section.appendChild(title);
+
+      if (scale.runs.length === 0) {
+        const empty = document.createElement('p');
+        empty.className = 'empty';
+        empty.textContent = 'No historical runs found for this scale.';
+        section.appendChild(empty);
+        host.appendChild(section);
+        return;
+      }
+
+      const latest = scale.runs.at(-1);
+      const latestSeedSongs = getStep(latest, 'seed_songs');
+      const bestSeedSongs = Math.max(...scale.runs.map(run => getStep(run, 'seed_songs')?.records_per_second || 0));
+      const bestRuntime = Math.min(...scale.runs.map(run => run.total_runtime_seconds));
+      const bestPeakRss = Math.min(...scale.runs.map(run => run.report.peak_rss_bytes));
+
+      const meta = document.createElement('p');
+      meta.className = 'section-meta';
+      meta.textContent = `Runs: ${scale.runs.length} · Latest: ${latest.timestamp_label}`;
+      section.appendChild(meta);
+
+      const summary = document.createElement('div');
+      summary.className = 'summary-grid';
+      summary.appendChild(makeCard('Latest total runtime', formatSeconds(latest.total_runtime_seconds), `Best observed: ${formatSeconds(bestRuntime)}`, trendClass(latest.total_runtime_seconds, bestRuntime, true)));
+      summary.appendChild(makeCard('Latest peak RSS', formatBytes(latest.report.peak_rss_bytes), `Best observed: ${formatBytes(bestPeakRss)}`, trendClass(latest.report.peak_rss_bytes, bestPeakRss, true)));
+      summary.appendChild(makeCard('Latest seed_songs throughput', formatRps(latestSeedSongs?.records_per_second), `Best observed: ${formatRps(bestSeedSongs)}`, trendClass(latestSeedSongs?.records_per_second, bestSeedSongs, false)));
+      summary.appendChild(makeCard('Latest DB size', formatBytes(latest.report.database_size_bytes), `WAL: ${formatBytes(latest.report.wal_size_bytes)}`));
+      section.appendChild(summary);
+
+      const chartGrid = document.createElement('div');
+      chartGrid.className = 'chart-grid';
+
+      const labels = scale.runs.map(run => run.timestamp_label);
+
+      const runtimeCard = document.createElement('div');
+      runtimeCard.className = 'chart-card';
+      runtimeCard.innerHTML = '<h3>Total runtime over time</h3><div class="chart-frame"><canvas></canvas></div>';
+      chartGrid.appendChild(runtimeCard);
+      createLineChart(runtimeCard.querySelector('canvas'), labels, [{
+        label: 'Total runtime',
+        data: scale.runs.map(run => run.total_runtime_seconds),
+        borderColor: chartPalette[0],
+        backgroundColor: chartPalette[0],
+        tension: 0.2,
+      }], value => formatSeconds(value));
+
+      const rssCard = document.createElement('div');
+      rssCard.className = 'chart-card';
+      rssCard.innerHTML = '<h3>Peak RSS over time</h3><div class="chart-frame"><canvas></canvas></div>';
+      chartGrid.appendChild(rssCard);
+      createLineChart(rssCard.querySelector('canvas'), labels, [{
+        label: 'Peak RSS',
+        data: scale.runs.map(run => run.report.peak_rss_bytes),
+        borderColor: chartPalette[1],
+        backgroundColor: chartPalette[1],
+        tension: 0.2,
+      }], value => formatBytes(value));
+
+      const durationCard = document.createElement('div');
+      durationCard.className = 'chart-card';
+      durationCard.innerHTML = '<h3>Step durations over time</h3><div class="chart-frame"><canvas></canvas></div>';
+      chartGrid.appendChild(durationCard);
+      createLineChart(durationCard.querySelector('canvas'), labels, scale.step_names.map((stepName, index) => ({
+        label: stepName,
+        data: scale.runs.map(run => getStep(run, stepName)?.duration_seconds ?? null),
+        borderColor: chartPalette[index % chartPalette.length],
+        backgroundColor: chartPalette[index % chartPalette.length],
+        tension: 0.2,
+        spanGaps: true,
+      })), value => formatSeconds(value));
+
+      const throughputCard = document.createElement('div');
+      throughputCard.className = 'chart-card';
+      throughputCard.innerHTML = '<h3>Seed throughput over time</h3><div class="chart-frame"><canvas></canvas></div>';
+      chartGrid.appendChild(throughputCard);
+      createLineChart(throughputCard.querySelector('canvas'), labels, ['seed_artists', 'seed_albums', 'seed_songs'].map((stepName, index) => ({
+        label: stepName,
+        data: scale.runs.map(run => getStep(run, stepName)?.records_per_second ?? null),
+        borderColor: chartPalette[(index + 4) % chartPalette.length],
+        backgroundColor: chartPalette[(index + 4) % chartPalette.length],
+        tension: 0.2,
+        spanGaps: true,
+      })), value => formatRps(value));
+
+      section.appendChild(chartGrid);
+
+      const runTableWrap = document.createElement('div');
+      runTableWrap.className = 'table-wrap';
+      const runTable = document.createElement('table');
+      runTable.innerHTML = `
+        <thead>
+          <tr>
+            <th>Run</th>
+            <th>Started</th>
+            <th>Engine</th>
+            <th>Total runtime</th>
+            <th>Peak RSS</th>
+            <th>DB size</th>
+            <th>WAL size</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      `;
+      const runBody = runTable.querySelector('tbody');
+      for (const run of scale.runs) {
+        const row = document.createElement('tr');
+        row.innerHTML = `
+          <td class="mono">${run.file_name}</td>
+          <td>${run.timestamp_label}</td>
+          <td>${run.report.engine_version}</td>
+          <td>${formatSeconds(run.total_runtime_seconds)}</td>
+          <td>${formatBytes(run.report.peak_rss_bytes)}</td>
+          <td>${formatBytes(run.report.database_size_bytes)}</td>
+          <td>${formatBytes(run.report.wal_size_bytes)}</td>
+        `;
+        runBody.appendChild(row);
+      }
+      runTableWrap.appendChild(runTable);
+      section.appendChild(document.createElement('h3')).textContent = 'Run history';
+      section.appendChild(runTableWrap);
+
+      const stepSummaryWrap = document.createElement('div');
+      stepSummaryWrap.className = 'table-wrap';
+      const stepSummary = document.createElement('table');
+      stepSummary.innerHTML = `
+        <thead>
+          <tr>
+            <th>Step</th>
+            <th>Latest duration</th>
+            <th>Best duration</th>
+            <th>Latest throughput</th>
+            <th>Best throughput</th>
+            <th>Latest RSS</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      `;
+      const stepBody = stepSummary.querySelector('tbody');
+      for (const stepName of scale.step_names) {
+        const metrics = scale.runs.map(run => getStep(run, stepName)).filter(Boolean);
+        if (!metrics.length) continue;
+        const latestMetric = getStep(latest, stepName);
+        const bestDuration = Math.min(...metrics.map(metric => metric.duration_seconds));
+        const throughputMetrics = metrics.map(metric => metric.records_per_second).filter(value => value != null);
+        const bestThroughput = throughputMetrics.length ? Math.max(...throughputMetrics) : null;
+        const row = document.createElement('tr');
+        row.innerHTML = `
+          <td class="mono">${stepName}</td>
+          <td>${formatSeconds(latestMetric?.duration_seconds)}</td>
+          <td>${formatSeconds(bestDuration)}</td>
+          <td>${formatRps(latestMetric?.records_per_second)}</td>
+          <td>${formatRps(bestThroughput)}</td>
+          <td>${formatBytes(latestMetric?.rss_bytes)}</td>
+        `;
+        stepBody.appendChild(row);
+      }
+      stepSummaryWrap.appendChild(stepSummary);
+      section.appendChild(document.createElement('h3')).textContent = 'Step summary';
+      section.appendChild(stepSummaryWrap);
+
+      host.appendChild(section);
+    }
+
+    renderOverview();
+    for (const scale of reportData.scales) {
+      renderScale(scale);
+    }
+  </script>
+</body>
+</html>

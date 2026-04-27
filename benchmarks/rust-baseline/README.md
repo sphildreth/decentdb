@@ -50,6 +50,8 @@ cargo build --release
 ./target/release/rust-baseline --scale medium
 ./target/release/rust-baseline --scale full
 ./target/release/rust-baseline --scale huge
+./target/release/rust-baseline --report
+./target/release/rust-baseline --report --report-file /tmp/rust-baseline-report.html
 ```
 
 ## Results
@@ -65,6 +67,24 @@ results/
 ├── 2026-04-26-1430-rust-baseline-full.json
 └── ...
 ```
+
+### Historical HTML report
+
+`--report` is a **report-only** mode: it does not run a benchmark. Instead it
+loads every `*.json` result in `results/`, groups runs by scale (`smoke`,
+`medium`, `full`, `huge`), and writes a static HTML report to
+`results/report.html` by default.
+
+The generated report includes:
+
+- overview cards summarizing run counts and latest results
+- one section per scale in chronological order
+- charts for total runtime, peak RSS, per-step duration trends, and seed
+  throughput trends
+- raw run-history tables and per-step summary tables so regressions and
+  improvements are easy to spot over time
+
+Use `--report-file <path>` with `--report` to override the output path.
 
 ## Headline numbers (engine 2.3.1, scale=`full`, ≈2.75M songs)
 
