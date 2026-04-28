@@ -1780,6 +1780,34 @@ impl Db {
                 }
             }
         }
+        if self.inner.config.paged_row_storage {
+            let runtime = self
+                .inner
+                .engine
+                .read()
+                .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+            if runtime.has_deferred_tables() {
+                if let Some(base_tables) =
+                    self.safe_referenced_base_tables_in_runtime(&runtime, statement)
+                {
+                    let names: Vec<&str> = base_tables.iter().map(|s| s.as_str()).collect();
+                    drop(runtime);
+                    self.ensure_table_row_sources_loaded_at_snapshot(&names, snapshot_lsn)?;
+                    drop(reader);
+                    let runtime = self
+                        .inner
+                        .engine
+                        .read()
+                        .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+                    self.validate_prepared_against_runtime(prepared, &runtime)?;
+                    return runtime.execute_read_statement(
+                        statement,
+                        params,
+                        self.inner.config.page_size,
+                    );
+                }
+            }
+        }
 
         let targeted_ok =
             self.ensure_tables_loaded_for_statement_at_snapshot(statement, Some(snapshot_lsn))?;
@@ -3399,6 +3427,10 @@ impl Db {
             .write()
             .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
         *guard = runtime;
+        if self.inner.config.paged_row_storage {
+            guard.redefer_all_persisted_paged_tables();
+            crate::wal::platform::release_freed_heap();
+        }
         self.inner
             .last_runtime_lsn
             .store(committed_lsn, Ordering::Release);

@@ -2497,6 +2497,33 @@ impl EngineRuntime {
         }
     }
 
+    pub(crate) fn redefer_all_persisted_paged_tables(&mut self) {
+        let persisted_total = self.persisted_tables.len();
+        let paged_names: Vec<String> = self
+            .persisted_tables
+            .iter()
+            .filter_map(|(name, state)| {
+                if state.pointer.is_table_paged_manifest() && self.tables.contains_key(name) {
+                    Some(name.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        eprintln!(
+            "DEBUG redefer_all: persisted_total={persisted_total} paged_candidates={} names={paged_names:?}",
+            paged_names.len(),
+        );
+        let name_refs: Vec<&str> = paged_names.iter().map(|s| s.as_str()).collect();
+        self.redefer_persisted_tables(&name_refs);
+        eprintln!(
+            "DEBUG redefer_all after: table_count={} has_deferred={} deferred_names={:?}",
+            self.tables.len(),
+            self.has_deferred_tables(),
+            self.deferred_table_names().collect::<Vec<_>>(),
+        );
+    }
+
     pub(crate) fn rebuild_indexes(&mut self, page_size: u32) -> Result<()> {
         let indexes = self.catalog.indexes.values().cloned().collect::<Vec<_>>();
         let mut rebuilt: BTreeMap<String, Arc<RuntimeIndex>> = BTreeMap::new();
