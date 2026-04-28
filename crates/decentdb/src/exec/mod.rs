@@ -507,6 +507,44 @@ impl TablePageManifest {
     }
 }
 
+fn table_page_entries_from_payload(
+    payload: &[u8],
+    chunk_index: usize,
+    is_overlay: bool,
+) -> Result<Vec<TablePageEntry>> {
+    if payload.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut cursor = Cursor::new(payload);
+    let magic = cursor.read_slice(TABLE_PAYLOAD_MAGIC.len())?;
+    if magic != TABLE_PAYLOAD_MAGIC {
+        return Err(DbError::corruption("table payload magic is invalid"));
+    }
+    let row_count = cursor.read_u32()? as usize;
+    let chunk_index = u32::try_from(chunk_index)
+        .map_err(|_| DbError::constraint("table chunk index exceeds u32"))?;
+    let mut entries = Vec::with_capacity(row_count);
+    for _ in 0..row_count {
+        let row_id = cursor.read_i64()?;
+        let row_bytes_len = cursor.read_u32()? as usize;
+        let row_bytes_offset = cursor.offset;
+        let row_bytes = cursor.read_slice(row_bytes_len)?;
+        Row::decode(row_bytes)?;
+        entries.push(TablePageEntry {
+            row_id,
+            chunk_index,
+            is_overlay,
+            locator: RowLocatorV1 {
+                byte_offset: u32::try_from(row_bytes_offset)
+                    .map_err(|_| DbError::constraint("row locator offset exceeds u32"))?,
+                byte_len: u32::try_from(row_bytes_len)
+                    .map_err(|_| DbError::constraint("row locator length exceeds u32"))?,
+            },
+        });
+    }
+    Ok(entries)
+}
+
 pub(crate) enum TableRowIter<'a> {
     Empty(std::iter::Empty<Result<TableRowRef<'a>>>),
     Resident(std::slice::Iter<'a, StoredRow>),
@@ -1448,6 +1486,80 @@ impl EngineRuntime {
         )
     }
 
+    pub(crate) fn load_deferred_table_row_sources_filtered(
+        &mut self,
+        pager: &PagerHandle,
+        wal: &WalHandle,
+        page_size: u32,
+        filter: &BTreeSet<String>,
+    ) -> Result<()> {
+        self.load_deferred_table_row_sources_with_snapshot(
+            pager,
+            wal,
+            page_size,
+            Some(filter),
+            None,
+        )
+    }
+
+    pub(crate) fn load_deferred_table_row_sources_at_snapshot(
+        &mut self,
+        pager: &PagerHandle,
+        wal: &WalHandle,
+        page_size: u32,
+        snapshot_lsn: u64,
+    ) -> Result<()> {
+        self.load_deferred_table_row_sources_with_snapshot(
+            pager,
+            wal,
+            page_size,
+            None,
+            Some(snapshot_lsn),
+        )
+    }
+
+    pub(crate) fn load_deferred_table_row_sources(
+        &mut self,
+        pager: &PagerHandle,
+        wal: &WalHandle,
+        page_size: u32,
+    ) -> Result<()> {
+        self.load_deferred_table_row_sources_with_snapshot(pager, wal, page_size, None, None)
+    }
+
+    fn load_deferred_table_row_sources_with_snapshot(
+        &mut self,
+        pager: &PagerHandle,
+        wal: &WalHandle,
+        page_size: u32,
+        filter: Option<&BTreeSet<String>>,
+        snapshot_lsn: Option<u64>,
+    ) -> Result<()> {
+        if self.deferred_tables.is_empty() {
+            return Ok(());
+        }
+        let Some(snapshot_lsn) = snapshot_lsn else {
+            let reader = wal.begin_reader()?;
+            let snapshot_lsn = reader.snapshot_lsn();
+            let store = SnapshotPageStore {
+                pager,
+                wal,
+                snapshot_lsn,
+            };
+            self.materialize_deferred_table_row_sources_with_store(&store, page_size, filter)?;
+            drop(reader);
+            return Ok(());
+        };
+
+        let store = SnapshotPageStore {
+            pager,
+            wal,
+            snapshot_lsn,
+        };
+        self.materialize_deferred_table_row_sources_with_store(&store, page_size, filter)?;
+        Ok(())
+    }
+
     pub(crate) fn load_deferred_table_row_sources_filtered_at_snapshot(
         &mut self,
         pager: &PagerHandle,
@@ -1665,7 +1777,10 @@ impl EngineRuntime {
                 }
                 if use_paged_row_storage && previous_pointer.is_table_paged_manifest() {
                     self.overflow_chain_caches.remove(&canonical_table_name);
-                    if delta.append_count > 0 {
+                    if delta.append_count > 0
+                        && delta.updated_rows.is_empty()
+                        && delta.deleted_rows.is_empty()
+                    {
                         let data = row_source.resident_data();
                         let existing_count = data.rows.len().saturating_sub(delta.append_count);
                         let appended_chunks = encode_paged_table_chunks_from_rows(
@@ -1765,7 +1880,10 @@ impl EngineRuntime {
 
                 if use_paged_row_storage {
                     self.overflow_chain_caches.remove(&canonical_table_name);
-                    let new_state = if delta.append_count > 0 {
+                    let new_state = if delta.append_count > 0
+                        && delta.updated_rows.is_empty()
+                        && delta.deleted_rows.is_empty()
+                    {
                         let existing_count = data.rows.len().saturating_sub(delta.append_count);
                         let appended_chunks = encode_paged_table_chunks_from_rows(
                             &data.rows[existing_count..],
@@ -2498,7 +2616,6 @@ impl EngineRuntime {
     }
 
     pub(crate) fn redefer_all_persisted_paged_tables(&mut self) {
-        let persisted_total = self.persisted_tables.len();
         let paged_names: Vec<String> = self
             .persisted_tables
             .iter()
@@ -2510,18 +2627,8 @@ impl EngineRuntime {
                 }
             })
             .collect();
-        eprintln!(
-            "DEBUG redefer_all: persisted_total={persisted_total} paged_candidates={} names={paged_names:?}",
-            paged_names.len(),
-        );
         let name_refs: Vec<&str> = paged_names.iter().map(|s| s.as_str()).collect();
         self.redefer_persisted_tables(&name_refs);
-        eprintln!(
-            "DEBUG redefer_all after: table_count={} has_deferred={} deferred_names={:?}",
-            self.tables.len(),
-            self.has_deferred_tables(),
-            self.deferred_table_names().collect::<Vec<_>>(),
-        );
     }
 
     pub(crate) fn rebuild_indexes(&mut self, page_size: u32) -> Result<()> {
@@ -13487,11 +13594,6 @@ fn apply_paged_row_changes_to_manifest(
         return Ok(manifest.clone());
     }
 
-    eprintln!(
-        "DEBUG apply_paged_row_changes_to_manifest: row_changes={:?}",
-        row_changes.keys().collect::<Vec<_>>()
-    );
-
     let mut new_chunks = Vec::with_capacity(manifest.chunks.len());
     for chunk in manifest.chunks.iter() {
         let mut new_tombstones: BTreeSet<i64> = chunk.tombstoned_row_ids.iter().copied().collect();
@@ -13561,12 +13663,6 @@ fn apply_paged_row_changes_to_manifest(
             None
         } else {
             let rows: Vec<StoredRow> = overlay_rows.into_values().collect();
-            eprintln!(
-                "DEBUG apply_paged_row_changes_to_manifest: chunk changed, overlay rows={:?}",
-                rows.iter()
-                    .map(|r| (r.row_id, r.values.clone()))
-                    .collect::<Vec<_>>()
-            );
             Some(Arc::new(encode_table_payload(&TableData { rows })?))
         };
 
@@ -13596,10 +13692,13 @@ fn append_paged_rows_to_manifest(
 
     let target_chunk_bytes = paged_table_target_chunk_bytes(page_size);
     let mut new_chunks = manifest.chunks.iter().cloned().collect::<Vec<_>>();
+    let mut new_rows = manifest.rows.iter().copied().collect::<Vec<_>>();
+    let mut force_full_reindex = false;
     let mut appended_start = 0usize;
     let mut encoded_row = Vec::with_capacity(64);
 
     if let Some(last_chunk) = new_chunks.last() {
+        let chunk_index = new_chunks.len() - 1;
         let mut payload = last_chunk.payload.as_slice().to_vec();
         let mut row_count = read_table_payload_row_count_from_bytes(last_chunk.payload.as_slice())?;
         let preserve_tombstones: BTreeSet<i64> =
@@ -13620,12 +13719,26 @@ fn append_paged_rows_to_manifest(
             if row_count > 0 && payload.len().saturating_add(encoded_row_len) > target_chunk_bytes {
                 break;
             }
+            let row_bytes_offset = payload.len().saturating_add(8).saturating_add(4);
             encode_i64(&mut payload, row.row_id);
             encode_bytes(&mut payload, &encoded_row)?;
+            new_rows.push(TablePageEntry {
+                row_id: row.row_id,
+                chunk_index: u32::try_from(chunk_index)
+                    .map_err(|_| DbError::constraint("table chunk index exceeds u32"))?,
+                is_overlay: false,
+                locator: RowLocatorV1 {
+                    byte_offset: u32::try_from(row_bytes_offset)
+                        .map_err(|_| DbError::constraint("row locator offset exceeds u32"))?,
+                    byte_len: u32::try_from(encoded_row.len())
+                        .map_err(|_| DbError::constraint("row locator length exceeds u32"))?,
+                },
+            });
             row_count += 1;
             appended_start += 1;
         }
         if !overlay_additions.is_empty() {
+            force_full_reindex = true;
             let mut overlay_rows: BTreeMap<i64, StoredRow> =
                 if let Some(ref existing) = preserve_overlay_payload {
                     let decoded = decode_table_payload_rows(existing.as_slice())?;
@@ -13679,10 +13792,37 @@ fn append_paged_rows_to_manifest(
                 overlay_checksum: None,
                 overlay_payload: None,
             });
+            let chunk_index = new_chunks.len() - 1;
+            new_rows.extend(table_page_entries_from_payload(
+                new_chunks[chunk_index].payload.as_slice(),
+                chunk_index,
+                false,
+            )?);
         }
     }
 
-    TablePageManifest::from_chunks(new_chunks)
+    if force_full_reindex {
+        return TablePageManifest::from_chunks(new_chunks);
+    }
+    if !new_rows
+        .windows(2)
+        .all(|window| window[0].row_id < window[1].row_id)
+    {
+        new_rows.sort_by_key(|entry| entry.row_id);
+    }
+    #[cfg(debug_assertions)]
+    {
+        for window in new_rows.windows(2) {
+            assert_ne!(
+                window[0].row_id, window[1].row_id,
+                "duplicate row_id in TablePageManifest rows"
+            );
+        }
+    }
+    Ok(TablePageManifest {
+        chunks: Arc::new(new_chunks),
+        rows: Arc::new(new_rows),
+    })
 }
 
 fn read_table_page_manifest_from_state<S: PageStore>(

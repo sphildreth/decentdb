@@ -3808,12 +3808,29 @@ impl Db {
             .write()
             .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
         if let Some(snapshot_lsn) = snapshot_lsn {
-            runtime.load_deferred_tables_filtered_at_snapshot(
+            if self.inner.config.paged_row_storage {
+                runtime.load_deferred_table_row_sources_filtered_at_snapshot(
+                    &self.inner.pager,
+                    &self.inner.wal,
+                    self.inner.config.page_size,
+                    &filter,
+                    snapshot_lsn,
+                )
+            } else {
+                runtime.load_deferred_tables_filtered_at_snapshot(
+                    &self.inner.pager,
+                    &self.inner.wal,
+                    self.inner.config.page_size,
+                    &filter,
+                    snapshot_lsn,
+                )
+            }
+        } else if self.inner.config.paged_row_storage {
+            runtime.load_deferred_table_row_sources_filtered(
                 &self.inner.pager,
                 &self.inner.wal,
                 self.inner.config.page_size,
                 &filter,
-                snapshot_lsn,
             )
         } else {
             runtime.load_deferred_tables_filtered(
@@ -4264,12 +4281,21 @@ impl Db {
         if !runtime.has_deferred_tables() {
             return Ok(());
         }
-        runtime.load_deferred_tables_at_snapshot(
-            &self.inner.pager,
-            &self.inner.wal,
-            self.inner.config.page_size,
-            snapshot_lsn,
-        )
+        if self.inner.config.paged_row_storage {
+            runtime.load_deferred_table_row_sources_at_snapshot(
+                &self.inner.pager,
+                &self.inner.wal,
+                self.inner.config.page_size,
+                snapshot_lsn,
+            )
+        } else {
+            runtime.load_deferred_tables_at_snapshot(
+                &self.inner.pager,
+                &self.inner.wal,
+                self.inner.config.page_size,
+                snapshot_lsn,
+            )
+        }
     }
 
     fn execute_read_in_runtime_state(
@@ -4525,11 +4551,26 @@ impl Db {
             .write()
             .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
         if let Some(snapshot_lsn) = snapshot_lsn {
-            runtime.load_deferred_tables_at_snapshot(
+            if self.inner.config.paged_row_storage {
+                runtime.load_deferred_table_row_sources_at_snapshot(
+                    &self.inner.pager,
+                    &self.inner.wal,
+                    self.inner.config.page_size,
+                    snapshot_lsn,
+                )
+            } else {
+                runtime.load_deferred_tables_at_snapshot(
+                    &self.inner.pager,
+                    &self.inner.wal,
+                    self.inner.config.page_size,
+                    snapshot_lsn,
+                )
+            }
+        } else if self.inner.config.paged_row_storage {
+            runtime.load_deferred_table_row_sources(
                 &self.inner.pager,
                 &self.inner.wal,
                 self.inner.config.page_size,
-                snapshot_lsn,
             )
         } else {
             runtime.load_deferred_tables(
@@ -18474,6 +18515,93 @@ mod tests {
             "expected safe subquery execution to avoid live-runtime table loads, got: {json}"
         );
     }
+
+    #[test]
+    fn paged_row_storage_mixed_update_and_append_in_transaction_persists_update() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir.path().join("mixed-update-append.ddb");
+        let config = DbConfig {
+            paged_row_storage: true,
+            defer_table_materialization: true,
+            ..DbConfig::default()
+        };
+
+        {
+            let db = Db::open_or_create(&path, config.clone()).expect("create db");
+            db.execute(
+                "CREATE TABLE ef_batch_entities (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+            )
+            .expect("create table");
+            db.execute("INSERT INTO ef_batch_entities (name) VALUES ('pre-existing')")
+                .expect("insert seed row");
+        }
+
+        {
+            let db = Db::open_or_create(&path, config.clone()).expect("reopen db");
+            db.begin_transaction().expect("begin transaction");
+            db.execute("UPDATE ef_batch_entities SET name = 'updated' WHERE id = 1")
+                .expect("update seed row");
+            for i in 0..5 {
+                db.execute(&format!(
+                    "INSERT INTO ef_batch_entities (name) VALUES ('add{i}')"
+                ))
+                .expect("insert appended row");
+            }
+            db.commit_transaction().expect("commit transaction");
+        }
+
+        let db = Db::open_or_create(&path, config).expect("reopen verify db");
+        let count = db
+            .execute("SELECT COUNT(*) FROM ef_batch_entities")
+            .expect("count rows");
+        assert_eq!(scalar_i64(&count), 6);
+
+        let names = db
+            .execute("SELECT name FROM ef_batch_entities ORDER BY id")
+            .expect("read names");
+        let names = names
+            .rows()
+            .iter()
+            .map(|row| match &row.values()[0] {
+                Value::Text(value) => value.as_str(),
+                other => panic!("expected TEXT value, got {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["updated", "add0", "add1", "add2", "add3", "add4"]);
+    }
+
+    #[test]
+    fn paged_row_storage_alter_table_add_column_materializes_rows() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir.path().join("paged-alter-table.ddb");
+        let config = DbConfig {
+            paged_row_storage: true,
+            defer_table_materialization: true,
+            ..DbConfig::default()
+        };
+
+        {
+            let db = Db::open_or_create(&path, config.clone()).expect("create db");
+            db.execute("CREATE TABLE migration_contacts (id INTEGER PRIMARY KEY, display_name TEXT NOT NULL)")
+                .expect("create table");
+            db.execute("INSERT INTO migration_contacts (display_name) VALUES ('Alice')")
+                .expect("insert seed row");
+        }
+
+        let db = Db::open_or_create(&path, config).expect("reopen db");
+        db.execute("ALTER TABLE migration_contacts ADD slug TEXT NOT NULL DEFAULT 'pending'")
+            .expect("add defaulted column");
+
+        let row = db
+            .execute("SELECT display_name, slug FROM migration_contacts WHERE id = 1")
+            .expect("read altered row");
+        assert_eq!(row.rows()[0].values()[0], Value::Text("Alice".to_string()));
+        assert_eq!(
+            row.rows()[0].values()[1],
+            Value::Text("pending".to_string())
+        );
+    }
+
     #[test]
     fn paged_row_storage_grouped_query_after_reopen_stays_deferred() {
         let tempdir = TempDir::new().expect("tempdir");

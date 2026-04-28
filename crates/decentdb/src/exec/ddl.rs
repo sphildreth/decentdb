@@ -13,7 +13,7 @@ use crate::sql::ast::{
 use crate::sql::parser::parse_expression_sql;
 
 use super::constraints::auto_index_name;
-use super::{table_row_dataset, EngineRuntime, TableData};
+use super::{table_row_dataset, EngineRuntime, StoredRow, TableData, TableRowSource};
 use std::sync::Arc;
 
 impl EngineRuntime {
@@ -608,6 +608,7 @@ impl EngineRuntime {
         )?;
 
         for target in &targets {
+            self.materialize_table_row_source(target)?;
             let entry = self.tables_mut().get_mut(target).ok_or_else(|| {
                 DbError::internal(format!("table data for {} is missing", target))
             })?;
@@ -709,6 +710,7 @@ impl EngineRuntime {
                 "ALTER TABLE is rejected on tables that define expression indexes",
             ));
         }
+        self.materialize_table_row_source(table_name)?;
         for action in actions {
             match action {
                 AlterTableAction::AddColumn(definition) => {
@@ -934,6 +936,27 @@ impl EngineRuntime {
         Ok(())
     }
 
+    fn materialize_table_row_source(&mut self, table_name: &str) -> Result<()> {
+        if !matches!(
+            self.table_row_source(table_name),
+            Some(TableRowSource::Paged(_))
+        ) {
+            return Ok(());
+        }
+        let row_source = self
+            .table_row_source(table_name)
+            .ok_or_else(|| DbError::internal(format!("table data for {table_name} is missing")))?;
+        let mut rows = Vec::with_capacity(row_source.row_count());
+        for row in row_source.rows() {
+            let row = row?;
+            rows.push(StoredRow {
+                row_id: row.row_id(),
+                values: row.values().to_vec(),
+            });
+        }
+        self.replace_table_row_source(table_name, TableData { rows }.into())
+    }
+
     fn execute_alter_table_constraint(
         &mut self,
         table_name: &str,
@@ -945,6 +968,7 @@ impl EngineRuntime {
             .table(table_name)
             .map(|table| table.name.clone())
             .ok_or_else(|| DbError::sql(format!("unknown table {table_name}")))?;
+        self.materialize_table_row_source(&table_name)?;
         let mut table = self
             .catalog
             .tables
