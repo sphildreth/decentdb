@@ -209,7 +209,7 @@ impl Default for DbConfig {
             wal_resident_versions_per_page: 16,
             defer_table_materialization: true,
             persistent_pk_index: false,
-            paged_row_storage: false,
+            paged_row_storage: true,
             auto_checkpoint_on_open_mb: 16,
         }
     }
@@ -236,7 +236,7 @@ mod tests {
         assert_eq!(config.wal_resident_versions_per_page, 16);
         assert!(config.defer_table_materialization);
         assert!(!config.persistent_pk_index);
-        assert!(!config.paged_row_storage);
+        assert!(config.paged_row_storage);
         // Default depends on platform; just assert the field is reachable.
         let _ = config.release_freed_memory_after_checkpoint;
     }

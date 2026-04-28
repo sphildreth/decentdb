@@ -258,7 +258,9 @@ struct StepMetric {
     records: Option<u64>,
     records_per_second: Option<f64>,
     rss_bytes: u64,
+    #[serde(default)]
     rss_anon_kb: u64,
+    #[serde(default)]
     rss_file_kb: u64,
     extra: serde_json::Map<String, serde_json::Value>,
 }
@@ -378,6 +380,8 @@ impl<'a> Recorder<'a> {
         let dur_ns = t0.elapsed().as_secs_f64() * 1_000_000_000.0;
         let dur_secs = dur_ns / 1_000_000_000.0;
         let rss = read_rss_bytes();
+        let rss_anon_kb = read_proc_status_kb("RssAnon:").unwrap_or(0);
+        let rss_file_kb = read_proc_status_kb("RssFile:").unwrap_or(0);
         if rss > self.peak_rss {
             self.peak_rss = rss;
         }
@@ -402,6 +406,8 @@ impl<'a> Recorder<'a> {
             records,
             records_per_second: rps,
             rss_bytes: rss,
+            rss_anon_kb,
+            rss_file_kb,
             extra: Default::default(),
         });
         self.report.peak_rss_bytes = self.peak_rss;

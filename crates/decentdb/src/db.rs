@@ -6192,7 +6192,14 @@ mod tests {
         let path = tempdir
             .path()
             .join("checkpoint-compacts-large-payloads.ddb");
-        let db = Db::open_or_create(&path, DbConfig::default()).expect("open db");
+        let db = Db::open_or_create(
+            &path,
+            DbConfig {
+                paged_row_storage: false,
+                ..DbConfig::default()
+            },
+        )
+        .expect("open db");
         db.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT)")
             .expect("create docs table");
 
@@ -6255,6 +6262,7 @@ mod tests {
         let path = tempdir.path().join("checkpoint-keeps-pk-payloads.ddb");
         let config = DbConfig {
             persistent_pk_index: true,
+            paged_row_storage: false,
             ..DbConfig::default()
         };
         let db = Db::open_or_create(&path, config).expect("open db");
@@ -6478,7 +6486,14 @@ mod tests {
         let path = tempdir.path().join("persistent-pk-backfill.ddb");
 
         {
-            let db = Db::open_or_create(&path, DbConfig::default()).expect("create db");
+            let db = Db::open_or_create(
+                &path,
+                DbConfig {
+                    paged_row_storage: false,
+                    ..DbConfig::default()
+                },
+            )
+            .expect("create db");
             db.execute("CREATE TABLE seeded (id INTEGER PRIMARY KEY, n INTEGER, body TEXT)")
                 .expect("create seeded");
             let large_body = "x".repeat(2048);
@@ -15961,14 +15976,18 @@ mod tests {
             json.contains("\"wal_on_disk_versions\":"),
             "missing wal_on_disk_versions: {json}"
         );
+        // With default paged_row_storage: true, the table stays deferred
+        // after the autocommit insert. Only non-paged paths materialize
+        // table data into memory.
         assert!(
-            json.contains("\"deferred_table_count\":0"),
-            "expected zero deferred tables on a fresh in-memory db: {json}"
+            json.contains("\"deferred_table_count\":1"),
+            "expected one deferred table with paged_row_storage=true, got: {json}"
         );
-        // 32 inserted rows must show up in the residency total.
+        // 32 inserted rows are recorded in the WAL but not resident in memory
+        // (paged row source keeps data on-disk).
         assert!(
-            json.contains("\"rows_in_memory_count\":32"),
-            "expected rows_in_memory_count=32, got: {json}"
+            json.contains("\"rows_in_memory_count\":0"),
+            "expected zero resident rows with paged_row_storage=true, got: {json}"
         );
     }
 

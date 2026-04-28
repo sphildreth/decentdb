@@ -8077,7 +8077,7 @@ impl EngineRuntime {
         let Some(plan) = self.analyze_simple_indexed_projection_query(query, params)? else {
             return Ok(None);
         };
-        if self.table_data(plan.table_name).is_some() || !self.has_deferred_tables() {
+        if self.table_row_source(plan.table_name).is_some() || !self.has_deferred_tables() {
             return Ok(None);
         }
         if !self
@@ -13575,7 +13575,18 @@ fn append_paged_rows_to_manifest(
     if let Some(last_chunk) = new_chunks.last() {
         let mut payload = last_chunk.payload.as_slice().to_vec();
         let mut row_count = read_table_payload_row_count_from_bytes(last_chunk.payload.as_slice())?;
+        let preserve_tombstones: BTreeSet<i64> =
+            last_chunk.tombstoned_row_ids.iter().copied().collect();
+        let preserve_overlay_pointer = last_chunk.overlay_pointer;
+        let preserve_overlay_checksum = last_chunk.overlay_checksum;
+        let mut preserve_overlay_payload = last_chunk.overlay_payload.clone();
+        let mut overlay_additions: BTreeMap<i64, StoredRow> = BTreeMap::new();
         for row in appended_rows {
+            if preserve_tombstones.contains(&row.row_id) {
+                overlay_additions.insert(row.row_id, row.clone());
+                appended_start += 1;
+                continue;
+            }
             encoded_row.clear();
             Row::encode_values_into(&row.values, &mut encoded_row)?;
             let encoded_row_len = 8usize.saturating_add(4).saturating_add(encoded_row.len());
@@ -13586,6 +13597,22 @@ fn append_paged_rows_to_manifest(
             encode_bytes(&mut payload, &encoded_row)?;
             row_count += 1;
             appended_start += 1;
+        }
+        if !overlay_additions.is_empty() {
+            let mut overlay_rows: BTreeMap<i64, StoredRow> =
+                if let Some(ref existing) = preserve_overlay_payload {
+                    let decoded = decode_table_payload_rows(existing.as_slice())?;
+                    decoded.into_iter().map(|row| (row.row_id, row)).collect()
+                } else {
+                    BTreeMap::new()
+                };
+            for (row_id, row) in overlay_additions {
+                overlay_rows.insert(row_id, row);
+            }
+            let encoded = encode_table_payload(&TableData {
+                rows: overlay_rows.into_values().collect(),
+            })?;
+            preserve_overlay_payload = Some(Arc::new(encoded));
         }
         if appended_start > 0 {
             new_chunks.pop();
@@ -13599,10 +13626,10 @@ fn append_paged_rows_to_manifest(
                 checksum: updated_chunk.checksum,
                 row_count: updated_chunk.row_count,
                 payload: Arc::new(updated_chunk.payload),
-                tombstoned_row_ids: Arc::new(BTreeSet::new()),
-                overlay_pointer: None,
-                overlay_checksum: None,
-                overlay_payload: None,
+                tombstoned_row_ids: Arc::new(preserve_tombstones),
+                overlay_pointer: preserve_overlay_pointer,
+                overlay_checksum: preserve_overlay_checksum,
+                overlay_payload: preserve_overlay_payload,
             });
         }
     }

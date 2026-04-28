@@ -203,42 +203,55 @@ impl EngineRuntime {
         if self.visible_table_is_temporary(&statement.table_name) {
             return Some(Vec::new());
         }
-        let Some(ConflictAction::DoUpdate { assignments, .. }) = &statement.on_conflict else {
-            return Some(Vec::new());
-        };
         let table = self.table_schema(&statement.table_name)?;
-        let assignment_columns = assignments
-            .iter()
-            .map(|assignment| {
-                table
-                    .columns
-                    .iter()
-                    .position(|column| column.name == assignment.column_name)
-            })
-            .collect::<Option<Vec<_>>>()?;
         let mut dependencies: Vec<String> = Vec::new();
-        if assignment_targets_foreign_key_columns(table, &assignment_columns) {
-            for parent in collect_updated_foreign_key_parent_tables(table, &assignment_columns) {
-                if dependencies
-                    .iter()
-                    .any(|name| identifiers_equal(name, parent.as_str()))
+
+        if let Some(ConflictAction::DoUpdate { assignments, .. }) = &statement.on_conflict {
+            let assignment_columns = assignments
+                .iter()
+                .map(|assignment| {
+                    table
+                        .columns
+                        .iter()
+                        .position(|column| column.name == assignment.column_name)
+                })
+                .collect::<Option<Vec<_>>>()?;
+
+            if assignment_targets_foreign_key_columns(table, &assignment_columns) {
+                for parent in collect_updated_foreign_key_parent_tables(table, &assignment_columns)
                 {
-                    continue;
+                    if dependencies
+                        .iter()
+                        .any(|name| identifiers_equal(name, parent.as_str()))
+                    {
+                        continue;
+                    }
+                    dependencies.push(parent);
                 }
-                dependencies.push(parent);
+            }
+            if assignment_targets_referenced_parent_key_columns(self, table, &assignment_columns) {
+                for child in collect_direct_referencing_tables(self, &statement.table_name) {
+                    if dependencies
+                        .iter()
+                        .any(|name| identifiers_equal(name, child.as_str()))
+                    {
+                        continue;
+                    }
+                    dependencies.push(child);
+                }
             }
         }
-        if assignment_targets_referenced_parent_key_columns(self, table, &assignment_columns) {
-            for child in collect_direct_referencing_tables(self, &statement.table_name) {
-                if dependencies
-                    .iter()
-                    .any(|name| identifiers_equal(name, child.as_str()))
-                {
-                    continue;
-                }
-                dependencies.push(child);
+
+        for foreign_key in &table.foreign_keys {
+            if dependencies
+                .iter()
+                .any(|name| identifiers_equal(name, &foreign_key.referenced_table))
+            {
+                continue;
             }
+            dependencies.push(foreign_key.referenced_table.clone());
         }
+
         Some(dependencies)
     }
 
