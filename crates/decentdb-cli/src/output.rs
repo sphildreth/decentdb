@@ -7,6 +7,7 @@ pub enum OutputFormat {
     Json,
     Csv,
     Table,
+    Markdown,
 }
 
 pub fn stringify_value(value: &Value) -> String {
@@ -59,7 +60,7 @@ pub fn render_rows(
     match format {
         OutputFormat::Json => render_json_rows(columns, rows),
         OutputFormat::Csv => render_csv(columns, rows, include_header),
-        OutputFormat::Table => render_table(columns, rows, include_header),
+        OutputFormat::Table | OutputFormat::Markdown => render_table(columns, rows, include_header),
     }
 }
 

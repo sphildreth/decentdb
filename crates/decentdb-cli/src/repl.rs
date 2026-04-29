@@ -67,7 +67,7 @@ pub fn run_repl(db: Db, format: OutputFormat) -> Result<()> {
 fn print_results(format: OutputFormat, results: &[QueryResult]) {
     match format {
         OutputFormat::Json => println!("{}", render_exec_success_json(results, 0.0, false)),
-        OutputFormat::Csv | OutputFormat::Table => {
+        OutputFormat::Csv | OutputFormat::Table | OutputFormat::Markdown => {
             for (index, result) in results.iter().enumerate() {
                 if index > 0 {
                     println!();

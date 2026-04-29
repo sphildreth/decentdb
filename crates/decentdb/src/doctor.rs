@@ -108,7 +108,8 @@ pub enum DoctorSeverity {
 
 impl DoctorSeverity {
     /// Numeric sort key where smaller = more severe (0 = error).
-    pub(crate) fn sort_key(self) -> u8 {
+    #[must_use]
+    pub fn sort_key(self) -> u8 {
         match self {
             Self::Error => 0,
             Self::Warning => 1,
@@ -1068,6 +1069,133 @@ fn build_partial_report(
         vec![],
         collected,
     )
+}
+
+// ---------------------------------------------------------------------------
+// DR-07: Markdown Report Renderer
+// ---------------------------------------------------------------------------
+
+/// Render a [`DoctorReport`] as Markdown following the shape in Section 9.
+#[must_use]
+pub fn render_markdown(report: &DoctorReport) -> String {
+    let mut out = String::new();
+
+    out.push_str("# DecentDB Doctor Report\n\n");
+    out.push_str("## Status\n\n");
+    out.push_str(&format!(
+        "Overall status: {}\n",
+        match report.status {
+            DoctorStatus::Ok => "OK",
+            DoctorStatus::Warning => "WARNING",
+            DoctorStatus::Error => "ERROR",
+        }
+    ));
+    out.push('\n');
+
+    // Database section
+    out.push_str("## Database\n\n");
+    out.push_str("| Field | Value |\n|---|---|\n");
+    out.push_str(&format!("| Path | {} |\n", report.database.path));
+    out.push_str(&format!(
+        "| Format version | {} |\n",
+        report.database.format_version
+    ));
+    out.push_str(&format!("| Page size | {} |\n", report.database.page_size));
+    out.push_str(&format!(
+        "| Page count | {} |\n",
+        report.database.page_count
+    ));
+    out.push_str(&format!(
+        "| Schema cookie | {} |\n",
+        report.database.schema_cookie
+    ));
+    out.push('\n');
+
+    // Summary
+    out.push_str("## Summary\n\n");
+    out.push_str("| Severity | Count |\n|---|---:|\n");
+    out.push_str(&format!("| Error | {} |\n", report.summary.error_count));
+    out.push_str(&format!("| Warning | {} |\n", report.summary.warning_count));
+    out.push_str(&format!("| Info | {} |\n", report.summary.info_count));
+    out.push('\n');
+
+    // Fixes
+    out.push_str("## Fixes\n\n");
+    if report.fixes.is_empty() {
+        if report.mode == DoctorMode::Fix {
+            out.push_str("No auto-fixable findings were found.\n");
+        } else {
+            out.push_str("No fixes requested.\n");
+        }
+    } else {
+        out.push_str("| Fix | Finding | Status | Message |\n|---|---|---|---|\n");
+        for fix in &report.fixes {
+            out.push_str(&format!(
+                "| {} | {} | {} | {} |\n",
+                fix.id,
+                fix.finding_id,
+                match fix.status {
+                    DoctorFixStatus::Planned => "planned",
+                    DoctorFixStatus::Applied => "applied",
+                    DoctorFixStatus::Skipped => "skipped",
+                    DoctorFixStatus::Failed => "failed",
+                },
+                fix.message,
+            ));
+        }
+    }
+    out.push('\n');
+
+    // Findings
+    out.push_str("## Findings\n\n");
+    if report.findings.is_empty() {
+        out.push_str("No findings.\n");
+    } else {
+        for finding in &report.findings {
+            let sev_str = match finding.severity {
+                DoctorSeverity::Error => "ERROR",
+                DoctorSeverity::Warning => "WARNING",
+                DoctorSeverity::Info => "INFO",
+            };
+            out.push_str(&format!(
+                "### {sev_str} {} — {}\n\n",
+                finding.id, finding.title
+            ));
+            out.push_str(&format!("{}\n\n", finding.message));
+
+            if !finding.evidence.is_empty() {
+                out.push_str("Evidence:\n\n");
+                out.push_str("| Field | Value | Unit |\n|---|---:|---|\n");
+                for ev in &finding.evidence {
+                    let val = evidence_value_fmt(&ev.value);
+                    let unit = ev.unit.as_deref().unwrap_or("");
+                    out.push_str(&format!("| {} | {val} | {unit} |\n", ev.field));
+                }
+                out.push('\n');
+            }
+
+            if let Some(ref rec) = &finding.recommendation {
+                out.push_str("Recommendation:\n\n");
+                out.push_str(&format!("{}\n", rec.summary));
+                for cmd in &rec.commands {
+                    out.push_str(&format!("\n```bash\n{cmd}\n```\n"));
+                }
+                out.push('\n');
+            }
+        }
+    }
+
+    out
+}
+
+fn evidence_value_fmt(v: &DoctorEvidenceValue) -> String {
+    match v {
+        DoctorEvidenceValue::Bool(b) => b.to_string(),
+        DoctorEvidenceValue::Int(i) => i.to_string(),
+        DoctorEvidenceValue::Uint(u) => u.to_string(),
+        DoctorEvidenceValue::Float(f) => format!("{f:.1}"),
+        DoctorEvidenceValue::String(s) => s.clone(),
+    }
 }
 
 impl DoctorCollectedFacts {
@@ -2743,5 +2871,113 @@ mod tests {
             indexes: vec![],
             physical_bytes: 8192,
         }
+    }
+
+    // ---- DR-07: Markdown renderer golden tests --------------------------
+
+    #[test]
+    fn markdown_no_findings() {
+        let r = report(vec![]);
+        let md = render_markdown(&r);
+        assert!(md.contains("# DecentDB Doctor Report"));
+        assert!(md.contains("## Status"));
+        assert!(md.contains("Overall status: OK"));
+        assert!(md.contains("## Summary"));
+        assert!(md.contains("| Error | 0 |"));
+        assert!(md.contains("## Findings\n\nNo findings."));
+        assert!(md.contains("No fixes requested."));
+    }
+
+    #[test]
+    fn markdown_warning_with_evidence() {
+        let r = report(vec![finding(
+            "wal.large_file",
+            DoctorSeverity::Warning,
+            DoctorCategory::Wal,
+        )]);
+        let md = render_markdown(&r);
+        assert!(md.contains("Overall status: WARNING"));
+        assert!(md.contains("### WARNING wal.large_file"));
+        assert!(md.contains("| Field | Value | Unit |"));
+        assert!(md.contains("| some_field | 42 |  |"));
+        assert!(md.contains("## Summary"));
+        assert!(md.contains("| Warning | 1 |"));
+        assert!(md.contains("No fixes requested."));
+    }
+
+    #[test]
+    fn markdown_fix_report_with_applied_and_failed() {
+        use DoctorCategory::*;
+        let fixes = vec![
+            DoctorFix {
+                id: "fix.checkpoint".into(),
+                finding_id: "wal.large_file".into(),
+                status: DoctorFixStatus::Applied,
+                message: "Checkpoint completed.".into(),
+                evidence_before: vec![DoctorEvidence {
+                    field: "wal_file_size".into(),
+                    value: DoctorEvidenceValue::Uint(1_048_576),
+                    unit: Some("bytes".into()),
+                }],
+                evidence_after: vec![DoctorEvidence {
+                    field: "wal_file_size".into(),
+                    value: DoctorEvidenceValue::Uint(32),
+                    unit: Some("bytes".into()),
+                }],
+            },
+            DoctorFix {
+                id: "fix.rebuild_stale_index".into(),
+                finding_id: "schema.index_not_fresh".into(),
+                status: DoctorFixStatus::Failed,
+                message: "Index missing.".into(),
+                evidence_before: vec![],
+                evidence_after: vec![],
+            },
+        ];
+        let r = DoctorReport::new(
+            DoctorMode::Fix,
+            db_summary(),
+            all_categories(),
+            vec![],
+            vec![finding("wal.large_file", DoctorSeverity::Warning, Wal)],
+            fixes,
+            DoctorCollectedFacts::default(),
+        );
+        let md = render_markdown(&r);
+        assert!(md.contains("## Fixes"));
+        assert!(
+            md.contains("| fix.checkpoint | wal.large_file | applied | Checkpoint completed. |")
+        );
+        assert!(md.contains(
+            "| fix.rebuild_stale_index | schema.index_not_fresh | failed | Index missing. |"
+        ));
+        assert!(md.contains("## Findings"));
+    }
+
+    #[test]
+    fn markdown_path_and_database_fields() {
+        let r = report(vec![]);
+        let md = render_markdown(&r);
+        assert!(md.contains("## Database"));
+        assert!(md.contains("| Path | test.ddb |"));
+        assert!(md.contains("| Format version | 1 |"));
+        assert!(md.contains("| Page size | 4096 |"));
+        assert!(md.contains("| Page count | 128 |"));
+        assert!(md.contains("| Schema cookie | 7 |"));
+    }
+
+    #[test]
+    fn markdown_fix_mode_no_auto_fixable() {
+        let r = DoctorReport::new(
+            DoctorMode::Fix,
+            db_summary(),
+            all_categories(),
+            vec![],
+            vec![],
+            vec![],
+            DoctorCollectedFacts::default(),
+        );
+        let md = render_markdown(&r);
+        assert!(md.contains("No auto-fixable findings were found."));
     }
 }

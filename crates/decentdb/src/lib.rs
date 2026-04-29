@@ -29,6 +29,13 @@ mod wal;
 
 pub use crate::config::{DbConfig, WalSyncMode};
 pub use crate::db::{evict_shared_wal, Db, PreparedStatement, SqlTransaction};
+pub use crate::doctor::{
+    render_markdown, run_doctor, sort_findings, DoctorCategory, DoctorCheckSelection,
+    DoctorCollectedFacts, DoctorDatabaseSummary, DoctorEvidence, DoctorEvidenceValue,
+    DoctorFinding, DoctorFix, DoctorFixStatus, DoctorHighestSeverity, DoctorIndexVerification,
+    DoctorMode, DoctorOptions, DoctorPathMode, DoctorRecommendation, DoctorReport, DoctorSeverity,
+    DoctorStatus, DoctorSummary,
+};
 pub use crate::error::{DbError, DbErrorCode, Result};
 pub use crate::exec::{BulkLoadOptions, QueryResult, QueryRow};
 pub use crate::metadata::{
