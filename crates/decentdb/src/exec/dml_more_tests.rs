@@ -55,12 +55,10 @@ mod tests {
 
         runtime.tables_mut().insert(
             "t".to_string(),
-            TableData {
-                rows: vec![StoredRow {
-                    row_id: 1,
-                    values: vec![Value::Int64(1), Value::Int64(10)],
-                }],
-            }
+            TableData::from_rows(vec![StoredRow {
+                row_id: 1,
+                values: vec![Value::Int64(1), Value::Int64(10)],
+            }])
             .into(),
         );
 
@@ -134,12 +132,10 @@ mod tests {
 
         runtime.tables_mut().insert(
             "t".to_string(),
-            TableData {
-                rows: vec![StoredRow {
-                    row_id: 1,
-                    values: vec![Value::Int64(1), Value::Int64(10)],
-                }],
-            }
+            TableData::from_rows(vec![StoredRow {
+                row_id: 1,
+                values: vec![Value::Int64(1), Value::Int64(10)],
+            }])
             .into(),
         );
 
@@ -353,7 +349,7 @@ mod tests {
             .insert(table.name.clone(), table.clone());
         runtime
             .tables_mut()
-            .insert(table.name.clone(), TableData { rows: vec![] }.into());
+            .insert(table.name.clone(), TableData::from_rows(vec![]).into());
         let prepared = crate::exec::dml::PreparedSimpleInsert {
             table_name: "t".to_string(),
             columns: vec![
@@ -418,7 +414,7 @@ mod tests {
             .insert(table.name.clone(), table.clone());
         runtime
             .tables_mut()
-            .insert(table.name.clone(), TableData { rows: vec![] }.into());
+            .insert(table.name.clone(), TableData::from_rows(vec![]).into());
         let prepared = crate::exec::dml::PreparedSimpleInsert {
             table_name: "t2".to_string(),
             columns: vec![crate::exec::dml::PreparedInsertColumn {

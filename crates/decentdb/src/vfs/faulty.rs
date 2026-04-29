@@ -155,6 +155,10 @@ impl VfsFile for FaultyVfsFile {
         }
     }
 
+    fn advise_sequential(&self) -> Result<()> {
+        self.inner.advise_sequential()
+    }
+
     fn sync_data(&self) -> Result<()> {
         let label = classify_sync(self.inner.kind());
         match self.state.decision(label) {

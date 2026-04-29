@@ -723,7 +723,14 @@ impl EngineRuntime {
                     )));
                 };
                 if *current_value != next_value {
-                    table_data.rows[row_index].values[prepared.column_index] = next_value;
+                    table_data
+                        .replace_value(row_index, prepared.column_index, next_value)
+                        .ok_or_else(|| {
+                            DbError::internal(format!(
+                                "column index {} is invalid for {}",
+                                prepared.column_index, prepared.table_name
+                            ))
+                        })?;
                     let updated_values = table_data.rows[row_index].values.clone();
                     self.mark_table_row_dirty(
                         &prepared.table_name,
@@ -944,7 +951,7 @@ impl EngineRuntime {
                             ))
                         })?;
                     for &row_index in &row_indices {
-                        table_data.rows.remove(row_index);
+                        table_data.remove_row(row_index);
                     }
                 }
             }
@@ -1824,7 +1831,13 @@ impl EngineRuntime {
                         )));
                     };
                     if current_value != &next_email {
-                        table_data.rows[row_index].values[column_index] = next_email;
+                        table_data
+                            .replace_value(row_index, column_index, next_email)
+                            .ok_or_else(|| {
+                                DbError::internal(format!(
+                                    "column index {column_index} is invalid for {table_name}"
+                                ))
+                            })?;
                         let updated_values = table_data.rows[row_index].values.clone();
                         self.mark_table_row_dirty(
                             &table_name,
@@ -1895,10 +1908,12 @@ impl EngineRuntime {
                     )));
                 }
                 if current_row.values != next_values {
-                    let updated_values = {
-                        table_data.rows[target_index].values = next_values.clone();
-                        table_data.rows[target_index].values.clone()
-                    };
+                    table_data
+                        .replace_row_values(target_index, next_values.clone())
+                        .ok_or_else(|| {
+                            DbError::internal(format!("row {single_row_id} vanished during UPDATE"))
+                        })?;
+                    let updated_values = table_data.rows[target_index].values.clone();
                     if !indexes_remain_fresh {
                         self.mark_indexes_stale_for_table(&table_name);
                     }
@@ -1996,8 +2011,8 @@ impl EngineRuntime {
                 .ok_or_else(|| {
                     DbError::internal(format!("table data for {table_name} is missing"))
                 })?
-                .rows[row_index]
-                .values = next_values.clone();
+                .replace_row_values(row_index, next_values.clone())
+                .ok_or_else(|| DbError::internal(format!("row {row_id} vanished during UPDATE")))?;
             self.mark_table_row_dirty(&table_name, row_index, row_id, &next_values);
             if let Some(values) = returning_values {
                 returning_rows.push(StoredRow { row_id, values });
@@ -2108,7 +2123,7 @@ impl EngineRuntime {
                     })?;
                     let mut removed = Vec::with_capacity(row_indices.len());
                     for &row_index in &row_indices {
-                        removed.push(table_data.rows.remove(row_index));
+                        removed.push(table_data.remove_row(row_index));
                     }
                     removed
                 };
@@ -2201,15 +2216,14 @@ impl EngineRuntime {
                 DbError::internal(format!("table data for {table_name} is missing"))
             })?;
             if let Some(row_index) = table_data.row_index_by_id(matching_row_ids[0]) {
-                table_data.rows.remove(row_index);
+                table_data.remove_row(row_index);
             }
         } else {
             self.table_data_mut(&table_name)
                 .ok_or_else(|| {
                     DbError::internal(format!("table data for {table_name} is missing"))
                 })?
-                .rows
-                .retain(|row| !matching_row_id_set.contains(&row.row_id));
+                .retain_rows(|row| !matching_row_id_set.contains(&row.row_id));
         }
 
         if !matching_row_ids.is_empty() {
@@ -4245,7 +4259,7 @@ mod tests {
     use super::*;
 
     fn paged_row_source(rows: Vec<StoredRow>) -> TableRowSource {
-        let payload = super::super::encode_table_payload(&crate::exec::TableData { rows })
+        let payload = super::super::encode_table_payload(&crate::exec::TableData::from_rows(rows))
             .expect("encode paged test payload");
         let manifest = super::super::TablePageManifest::from_payload(Arc::new(payload))
             .expect("build paged test manifest");
@@ -4454,12 +4468,10 @@ mod tests {
 
         runtime.tables_mut().insert(
             "child".to_string(),
-            crate::exec::TableData {
-                rows: vec![StoredRow {
-                    row_id: 1,
-                    values: vec![Value::Int64(1), Value::Int64(7)],
-                }],
-            }
+            crate::exec::TableData::from_rows(vec![StoredRow {
+                row_id: 1,
+                values: vec![Value::Int64(1), Value::Int64(7)],
+            }])
             .into(),
         );
 
@@ -4553,12 +4565,10 @@ mod tests {
 
         runtime.tables_mut().insert(
             "child".to_string(),
-            crate::exec::TableData {
-                rows: vec![StoredRow {
-                    row_id: 1,
-                    values: vec![Value::Int64(1), Value::Int64(7)],
-                }],
-            }
+            crate::exec::TableData::from_rows(vec![StoredRow {
+                row_id: 1,
+                values: vec![Value::Int64(1), Value::Int64(7)],
+            }])
             .into(),
         );
 
@@ -5080,12 +5090,10 @@ mod tests {
 
         runtime.tables_mut().insert(
             "child".to_string(),
-            crate::exec::TableData {
-                rows: vec![StoredRow {
-                    row_id: 1,
-                    values: vec![Value::Int64(1), Value::Int64(7)],
-                }],
-            }
+            crate::exec::TableData::from_rows(vec![StoredRow {
+                row_id: 1,
+                values: vec![Value::Int64(1), Value::Int64(7)],
+            }])
             .into(),
         );
 
@@ -5177,12 +5185,10 @@ mod tests {
 
         runtime.tables_mut().insert(
             "child".to_string(),
-            crate::exec::TableData {
-                rows: vec![StoredRow {
-                    row_id: 1,
-                    values: vec![Value::Int64(1), Value::Int64(7)],
-                }],
-            }
+            crate::exec::TableData::from_rows(vec![StoredRow {
+                row_id: 1,
+                values: vec![Value::Int64(1), Value::Int64(7)],
+            }])
             .into(),
         );
 
@@ -5285,12 +5291,10 @@ mod tests {
 
         runtime.tables_mut().insert(
             "child".to_string(),
-            crate::exec::TableData {
-                rows: vec![StoredRow {
-                    row_id: 1,
-                    values: vec![Value::Int64(1), Value::Int64(7)],
-                }],
-            }
+            crate::exec::TableData::from_rows(vec![StoredRow {
+                row_id: 1,
+                values: vec![Value::Int64(1), Value::Int64(7)],
+            }])
             .into(),
         );
 
@@ -5503,12 +5507,10 @@ mod tests {
 
         runtime.tables_mut().insert(
             "child".to_string(),
-            crate::exec::TableData {
-                rows: vec![StoredRow {
-                    row_id: 1,
-                    values: vec![Value::Int64(1), Value::Int64(7)],
-                }],
-            }
+            crate::exec::TableData::from_rows(vec![StoredRow {
+                row_id: 1,
+                values: vec![Value::Int64(1), Value::Int64(7)],
+            }])
             .into(),
         );
 
@@ -5577,12 +5579,10 @@ mod apply_conflict_tests {
             .insert(table.name.clone(), table.clone());
         runtime.tables_mut().insert(
             "t".to_string(),
-            crate::exec::TableData {
-                rows: vec![StoredRow {
-                    row_id: 1,
-                    values: vec![Value::Int64(1), Value::Int64(10)],
-                }],
-            }
+            crate::exec::TableData::from_rows(vec![StoredRow {
+                row_id: 1,
+                values: vec![Value::Int64(1), Value::Int64(10)],
+            }])
             .into(),
         );
 
@@ -5664,12 +5664,10 @@ mod apply_conflict_tests {
             .insert(table.name.clone(), table.clone());
         runtime.tables_mut().insert(
             "t2".to_string(),
-            crate::exec::TableData {
-                rows: vec![StoredRow {
-                    row_id: 1,
-                    values: vec![Value::Int64(1), Value::Int64(0), Value::Int64(10)],
-                }],
-            }
+            crate::exec::TableData::from_rows(vec![StoredRow {
+                row_id: 1,
+                values: vec![Value::Int64(1), Value::Int64(0), Value::Int64(10)],
+            }])
             .into(),
         );
 
@@ -5735,12 +5733,10 @@ mod apply_conflict_tests {
             .insert(table.name.clone(), table.clone());
         runtime.tables_mut().insert(
             "t3".to_string(),
-            crate::exec::TableData {
-                rows: vec![StoredRow {
-                    row_id: 1,
-                    values: vec![Value::Int64(1), Value::Int64(10)],
-                }],
-            }
+            crate::exec::TableData::from_rows(vec![StoredRow {
+                row_id: 1,
+                values: vec![Value::Int64(1), Value::Int64(10)],
+            }])
             .into(),
         );
 
@@ -5816,12 +5812,10 @@ mod apply_conflict_tests {
             .insert(table.name.clone(), table.clone());
         runtime.tables_mut().insert(
             "t4".to_string(),
-            crate::exec::TableData {
-                rows: vec![StoredRow {
-                    row_id: 1,
-                    values: vec![Value::Int64(1), Value::Int64(10)],
-                }],
-            }
+            crate::exec::TableData::from_rows(vec![StoredRow {
+                row_id: 1,
+                values: vec![Value::Int64(1), Value::Int64(10)],
+            }])
             .into(),
         );
 

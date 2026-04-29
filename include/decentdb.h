@@ -216,6 +216,12 @@ ddb_status_t ddb_stmt_rebind_int64_text_execute(
     const char *text_value,
     size_t text_len,
     uint64_t *out_affected);
+/*
+ * Performance note: for read-heavy workloads, prefer ddb_stmt_*_row_view
+ * functions, which return borrowed pointers into the result set without heap
+ * allocation. Use ddb_*_value_copy functions when ownership transfer is
+ * required.
+ */
 ddb_status_t ddb_stmt_value_copy(
     ddb_stmt_t *stmt,
     size_t column_index,
@@ -289,6 +295,10 @@ ddb_status_t ddb_result_column_name_copy(
     ddb_result_t *result,
     size_t column_index,
     char **out_name);
+/*
+ * Performance note: ddb_result_value_copy returns owned values and may allocate
+ * per cell. For streaming read-heavy paths, prefer statement row-view APIs.
+ */
 ddb_status_t ddb_result_value_copy(
     ddb_result_t *result,
     size_t row_index,

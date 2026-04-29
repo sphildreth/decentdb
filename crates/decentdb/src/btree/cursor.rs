@@ -16,6 +16,9 @@ pub(crate) struct BtreeCursor<'a, S: PageStore> {
 
 impl<'a, S: PageStore> BtreeCursor<'a, S> {
     pub(crate) fn from_start(store: &'a S, root_page_id: Option<PageId>) -> Result<Self> {
+        if root_page_id.is_some() {
+            store.advise_sequential()?;
+        }
         Ok(Self {
             store,
             root_page_id,
@@ -36,6 +39,9 @@ impl<'a, S: PageStore> BtreeCursor<'a, S> {
         root_page_id: Option<PageId>,
         key: u64,
     ) -> Result<Self> {
+        if root_page_id.is_some() {
+            store.advise_sequential()?;
+        }
         Ok(Self {
             store,
             root_page_id,

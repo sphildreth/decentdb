@@ -554,7 +554,7 @@ mod tests {
     use crate::catalog::{ColumnSchema, ForeignKeyAction, ForeignKeyConstraint, IndexColumn};
 
     fn paged_row_source(rows: Vec<StoredRow>) -> super::super::TableRowSource {
-        let payload = super::super::encode_table_payload(&crate::exec::TableData { rows })
+        let payload = super::super::encode_table_payload(&crate::exec::TableData::from_rows(rows))
             .expect("encode paged test payload");
         let manifest = super::super::TablePageManifest::from_payload(Arc::new(payload))
             .expect("build paged test manifest");

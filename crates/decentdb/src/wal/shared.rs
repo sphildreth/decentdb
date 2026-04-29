@@ -9,7 +9,6 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::thread;
 
-use crate::alloc::EngineAllocHandle;
 use crate::config::DbConfig;
 use crate::error::Result;
 use crate::storage::PagerHandle;
@@ -92,8 +91,6 @@ fn build_handle(
         ),
         _ => None,
     };
-    let alloc = EngineAllocHandle::default();
-
     let inner = Arc::new(SharedWalInner {
         canonical_path,
         file,
@@ -105,7 +102,7 @@ fn build_handle(
         wal_end_lsn: AtomicU64::new(end_lsn),
         max_page_count: AtomicU32::new(recovered_max_page_id),
         allocated_len: AtomicU64::new(allocated_len),
-        write_lock: Mutex::new(WalWriteState::new(alloc)),
+        write_lock: Mutex::new(WalWriteState::new()),
         reader_registry: ReaderRegistry::default(),
         checkpoint_pending: AtomicBool::new(false),
         checkpoint_epoch: AtomicU64::new(0),

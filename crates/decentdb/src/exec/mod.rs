@@ -176,12 +176,34 @@ enum DecodedRowLocator {
     V2(RowLocatorV2),
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Debug, Default)]
 pub(crate) struct TableData {
     pub(crate) rows: Vec<StoredRow>,
+    cached_heap_bytes: usize,
+}
+
+impl Clone for TableData {
+    fn clone(&self) -> Self {
+        Self::from_rows(self.rows.clone())
+    }
+}
+
+impl PartialEq for TableData {
+    fn eq(&self, other: &Self) -> bool {
+        self.rows == other.rows
+    }
 }
 
 impl TableData {
+    pub(crate) fn from_rows(rows: Vec<StoredRow>) -> Self {
+        let mut data = Self {
+            rows,
+            cached_heap_bytes: 0,
+        };
+        data.cached_heap_bytes = data.compute_heap_bytes();
+        data
+    }
+
     pub(super) fn row_index_by_id(&self, row_id: i64) -> Option<usize> {
         if let Some(index) = row_id
             .checked_sub(1)
@@ -209,19 +231,102 @@ impl TableData {
     /// Approximate heap residency of this table's row vector. Includes
     /// `Vec<StoredRow>` capacity plus each row's `Vec<Value>` capacity plus
     /// each `Value`'s heap allocations. Excludes the `TableData` struct
-    /// itself. Used by storage instrumentation (ADR 0143 Phase A).
+    /// itself. Used by storage instrumentation (ADR 0143 Phase A). This value
+    /// is cached and maintained by row mutation helpers.
     #[must_use]
     pub(crate) fn approximate_heap_bytes(&self) -> usize {
+        self.cached_heap_bytes
+    }
+
+    fn compute_heap_bytes(&self) -> usize {
         let row_struct = std::mem::size_of::<StoredRow>();
-        let value_struct = std::mem::size_of::<crate::record::value::Value>();
         let mut total = self.rows.capacity() * row_struct;
         for row in &self.rows {
-            total += row.values.capacity() * value_struct;
-            for value in &row.values {
-                total += value.approximate_heap_bytes();
-            }
+            total += Self::row_heap_bytes(row);
         }
         total
+    }
+
+    fn row_heap_bytes(row: &StoredRow) -> usize {
+        let value_struct = std::mem::size_of::<crate::record::value::Value>();
+        row.values.capacity() * value_struct
+            + row
+                .values
+                .iter()
+                .map(Value::approximate_heap_bytes)
+                .sum::<usize>()
+    }
+
+    pub(crate) fn push_row(&mut self, row: StoredRow) {
+        let old_capacity = self.rows.capacity();
+        let row_heap_bytes = Self::row_heap_bytes(&row);
+        self.rows.push(row);
+        self.cached_heap_bytes = self
+            .cached_heap_bytes
+            .saturating_add(row_heap_bytes)
+            .saturating_add(
+                self.rows
+                    .capacity()
+                    .saturating_sub(old_capacity)
+                    .saturating_mul(std::mem::size_of::<StoredRow>()),
+            );
+    }
+
+    pub(crate) fn remove_row(&mut self, row_index: usize) -> StoredRow {
+        let row = self.rows.remove(row_index);
+        self.cached_heap_bytes = self
+            .cached_heap_bytes
+            .saturating_sub(Self::row_heap_bytes(&row));
+        row
+    }
+
+    pub(crate) fn retain_rows<F>(&mut self, mut keep: F)
+    where
+        F: FnMut(&StoredRow) -> bool,
+    {
+        let mut removed_heap_bytes = 0usize;
+        self.rows.retain(|row| {
+            let retain = keep(row);
+            if !retain {
+                removed_heap_bytes = removed_heap_bytes.saturating_add(Self::row_heap_bytes(row));
+            }
+            retain
+        });
+        self.cached_heap_bytes = self.cached_heap_bytes.saturating_sub(removed_heap_bytes);
+    }
+
+    pub(crate) fn replace_value(
+        &mut self,
+        row_index: usize,
+        column_index: usize,
+        value: Value,
+    ) -> Option<()> {
+        let row = self.rows.get_mut(row_index)?;
+        let slot = row.values.get_mut(column_index)?;
+        let old_heap_bytes = slot.approximate_heap_bytes();
+        *slot = value;
+        let new_heap_bytes = slot.approximate_heap_bytes();
+        self.cached_heap_bytes = self
+            .cached_heap_bytes
+            .saturating_sub(old_heap_bytes)
+            .saturating_add(new_heap_bytes);
+        Some(())
+    }
+
+    pub(crate) fn replace_row_values(
+        &mut self,
+        row_index: usize,
+        values: Vec<Value>,
+    ) -> Option<()> {
+        let row = self.rows.get_mut(row_index)?;
+        let old_heap_bytes = Self::row_heap_bytes(row);
+        row.values = values;
+        let new_heap_bytes = Self::row_heap_bytes(row);
+        self.cached_heap_bytes = self
+            .cached_heap_bytes
+            .saturating_sub(old_heap_bytes)
+            .saturating_add(new_heap_bytes);
+        Some(())
     }
 }
 
@@ -1068,22 +1173,136 @@ pub(crate) struct EngineRuntime {
     pub(crate) temp_indexes: Arc<BTreeMap<String, IndexSchema>>,
     pub(crate) temp_schema_cookie: u32,
     pub(crate) indexes: Arc<BTreeMap<String, Arc<RuntimeIndex>>>,
-    pub(crate) persisted_tables: BTreeMap<String, PersistedTableState>,
+    pub(crate) persisted_tables: Arc<BTreeMap<String, PersistedTableState>>,
     /// Tables whose row data has not yet been loaded from storage.
     /// Populated during `decode_manifest_payload` and cleared by
     /// `load_deferred_tables`.
-    pub(crate) deferred_tables: BTreeSet<String>,
-    pub(crate) dirty_tables: BTreeSet<String>,
+    pub(crate) deferred_tables: Arc<BTreeSet<String>>,
+    pub(crate) dirty_tables: Arc<BTreeSet<String>>,
     pub(crate) paged_mutations: BTreeMap<String, PagedMutationDelta>,
     /// Per-session cache; capped at `cached_payloads_max_entries`. Eviction is LRU.
-    cached_payloads: HashMap<String, Arc<Vec<u8>>>,
-    cached_payload_access_order: VecDeque<String>,
-    cached_payloads_max_entries: usize,
+    payload_cache: Arc<Mutex<PayloadCache>>,
     root_state: Option<RootHeader>,
     pub(crate) index_state_epoch: u64,
     manifest_template: Option<ManifestTemplate>,
     overflow_chain_caches: BTreeMap<String, OverflowChainCache>,
     manifest_chain_cache: Option<OverflowChainCache>,
+}
+
+#[derive(Debug)]
+pub(crate) struct PayloadCache {
+    entries: HashMap<String, PayloadCacheEntry>,
+    next_touch_gen: u64,
+    max_entries: usize,
+}
+
+#[derive(Debug)]
+struct PayloadCacheEntry {
+    payload: Arc<Vec<u8>>,
+    last_touch_gen: u64,
+}
+
+impl PayloadCache {
+    fn new(max_entries: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            next_touch_gen: 0,
+            max_entries,
+        }
+    }
+
+    fn set_max_entries(&mut self, max_entries: usize) {
+        self.max_entries = max_entries;
+        self.evict_excess();
+    }
+
+    fn get(&mut self, table_name: &str) -> Option<Arc<Vec<u8>>> {
+        let payload = Arc::clone(&self.entries.get(table_name)?.payload);
+        self.touch(table_name);
+        Some(payload)
+    }
+
+    fn take(&mut self, table_name: &str) -> Option<Arc<Vec<u8>>> {
+        self.entries.remove(table_name).map(|entry| entry.payload)
+    }
+
+    fn insert(&mut self, table_name: String, payload: Arc<Vec<u8>>) {
+        if self.max_entries == 0 {
+            return;
+        }
+        let last_touch_gen = self.advance_touch_gen();
+        self.entries.insert(
+            table_name,
+            PayloadCacheEntry {
+                payload,
+                last_touch_gen,
+            },
+        );
+        self.evict_excess();
+    }
+
+    fn remove(&mut self, table_name: &str) {
+        self.entries.remove(table_name);
+    }
+
+    fn touch(&mut self, table_name: &str) {
+        let last_touch_gen = self.advance_touch_gen();
+        if let Some(entry) = self.entries.get_mut(table_name) {
+            entry.last_touch_gen = last_touch_gen;
+        }
+    }
+
+    fn evict_excess(&mut self) {
+        while self.entries.len() > self.max_entries {
+            if let Some(evicted) = self.oldest_key().cloned() {
+                self.entries.remove(&evicted);
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn advance_touch_gen(&mut self) -> u64 {
+        let touch_gen = self.next_touch_gen;
+        self.next_touch_gen = self.next_touch_gen.wrapping_add(1);
+        touch_gen
+    }
+
+    fn oldest_key(&self) -> Option<&String> {
+        self.entries
+            .iter()
+            .min_by(|(_, left), (_, right)| {
+                if touch_gen_older(left.last_touch_gen, right.last_touch_gen) {
+                    std::cmp::Ordering::Less
+                } else if touch_gen_older(right.last_touch_gen, left.last_touch_gen) {
+                    std::cmp::Ordering::Greater
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .map(|(key, _)| key)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[cfg(test)]
+    fn contains_key(&self, table_name: &str) -> bool {
+        self.entries.contains_key(table_name)
+    }
+
+    #[cfg(test)]
+    fn last_touch_gen(&self, table_name: &str) -> Option<u64> {
+        self.entries
+            .get(table_name)
+            .map(|entry| entry.last_touch_gen)
+    }
+}
+
+fn touch_gen_older(left: u64, right: u64) -> bool {
+    left != right && left.wrapping_sub(right) > (u64::MAX / 2)
 }
 
 #[derive(Clone, Debug, PartialEq, Default)]
@@ -1123,21 +1342,18 @@ impl Clone for EngineRuntime {
             temp_indexes: Arc::clone(&self.temp_indexes),
             temp_schema_cookie: self.temp_schema_cookie,
             indexes: Arc::clone(&self.indexes),
-            persisted_tables: self.persisted_tables.clone(),
-            deferred_tables: self.deferred_tables.clone(),
+            persisted_tables: Arc::clone(&self.persisted_tables),
+            deferred_tables: Arc::clone(&self.deferred_tables),
             // Preserve dirty state so that multi-statement transactions
             // (clone-and-replace) do not lose modifications from earlier
             // statements.  `persist_to_db` clears dirty state after a
             // successful persist, so autocommit paths are unaffected.
-            dirty_tables: self.dirty_tables.clone(),
+            dirty_tables: Arc::clone(&self.dirty_tables),
             // Escalate paged_mutations to full dirty on clone: the
             // subsequent generic execution path may modify the same rows
             // in ways that invalidate the splice assumption.
             paged_mutations: BTreeMap::new(),
-            // Arc payloads: clone is just a refcount bump.
-            cached_payloads: self.cached_payloads.clone(),
-            cached_payload_access_order: self.cached_payload_access_order.clone(),
-            cached_payloads_max_entries: self.cached_payloads_max_entries,
+            payload_cache: Arc::clone(&self.payload_cache),
             root_state: self.root_state,
             index_state_epoch: self.index_state_epoch,
             // Optimization caches rebuilt on demand during persist.
@@ -1165,13 +1381,13 @@ impl EngineRuntime {
             temp_indexes: Arc::new(BTreeMap::new()),
             temp_schema_cookie: 0,
             indexes: Arc::new(BTreeMap::new()),
-            persisted_tables: BTreeMap::new(),
-            deferred_tables: BTreeSet::new(),
-            dirty_tables: BTreeSet::new(),
+            persisted_tables: Arc::new(BTreeMap::new()),
+            deferred_tables: Arc::new(BTreeSet::new()),
+            dirty_tables: Arc::new(BTreeSet::new()),
             paged_mutations: BTreeMap::new(),
-            cached_payloads: HashMap::new(),
-            cached_payload_access_order: VecDeque::new(),
-            cached_payloads_max_entries: config.cached_payloads_max_entries,
+            payload_cache: Arc::new(Mutex::new(PayloadCache::new(
+                config.cached_payloads_max_entries,
+            ))),
             root_state: None,
             index_state_epoch: 0,
             manifest_template: None,
@@ -1243,6 +1459,18 @@ impl EngineRuntime {
         Arc::make_mut(&mut self.indexes)
     }
 
+    fn persisted_tables_mut(&mut self) -> &mut BTreeMap<String, PersistedTableState> {
+        Arc::make_mut(&mut self.persisted_tables)
+    }
+
+    fn deferred_tables_mut(&mut self) -> &mut BTreeSet<String> {
+        Arc::make_mut(&mut self.deferred_tables)
+    }
+
+    fn dirty_tables_mut(&mut self) -> &mut BTreeSet<String> {
+        Arc::make_mut(&mut self.dirty_tables)
+    }
+
     /// Read-only access to a runtime index by name (case-sensitive).
     pub(crate) fn index(&self, name: &str) -> Option<&RuntimeIndex> {
         self.indexes.get(name).map(|arc| arc.as_ref())
@@ -1259,43 +1487,31 @@ impl EngineRuntime {
     }
 
     fn cached_payload(&mut self, table_name: &str) -> Option<Arc<Vec<u8>>> {
-        let payload = self.cached_payloads.get(table_name).cloned()?;
-        self.touch_cached_payload(table_name);
-        Some(payload)
+        self.payload_cache
+            .lock()
+            .expect("payload cache lock should not be poisoned")
+            .get(table_name)
     }
 
     fn take_cached_payload(&mut self, table_name: &str) -> Option<Arc<Vec<u8>>> {
-        let payload = self.cached_payloads.remove(table_name)?;
-        self.cached_payload_access_order
-            .retain(|key| key != table_name);
-        Some(payload)
-    }
-
-    fn touch_cached_payload(&mut self, table_name: &str) {
-        self.cached_payload_access_order
-            .retain(|key| key != table_name);
-        self.cached_payload_access_order
-            .push_back(table_name.to_string());
+        self.payload_cache
+            .lock()
+            .expect("payload cache lock should not be poisoned")
+            .take(table_name)
     }
 
     fn cache_payload_insert(&mut self, table_name: String, payload: Arc<Vec<u8>>) {
-        if self.cached_payloads_max_entries == 0 {
-            return;
-        }
-        self.cache_payload_remove(&table_name);
-        self.cached_payloads.insert(table_name.clone(), payload);
-        self.cached_payload_access_order.push_back(table_name);
-        while self.cached_payloads.len() > self.cached_payloads_max_entries {
-            if let Some(evicted) = self.cached_payload_access_order.pop_front() {
-                self.cached_payloads.remove(&evicted);
-            }
-        }
+        self.payload_cache
+            .lock()
+            .expect("payload cache lock should not be poisoned")
+            .insert(table_name, payload);
     }
 
     fn cache_payload_remove(&mut self, table_name: &str) {
-        self.cached_payloads.remove(table_name);
-        self.cached_payload_access_order
-            .retain(|key| key != table_name);
+        self.payload_cache
+            .lock()
+            .expect("payload cache lock should not be poisoned")
+            .remove(table_name);
     }
 
     pub(crate) fn load_from_storage(
@@ -1351,7 +1567,11 @@ impl EngineRuntime {
         } else {
             Self::from_config(schema_cookie, config)
         };
-        runtime.cached_payloads_max_entries = config.cached_payloads_max_entries;
+        runtime
+            .payload_cache
+            .lock()
+            .expect("payload cache lock should not be poisoned")
+            .set_max_entries(config.cached_payloads_max_entries);
         runtime.catalog_mut().schema_cookie = schema_cookie;
         // Materialize any deferred tables under the same reader guard so
         // that overflow pointers from the manifest are read against the
@@ -1641,20 +1861,20 @@ impl EngineRuntime {
         }
         let mut tables_loaded = Vec::new();
         for table_name in &table_names {
-            let state = self.persisted_tables.get(table_name).ok_or_else(|| {
+            let state = *self.persisted_tables.get(table_name).ok_or_else(|| {
                 DbError::internal(format!(
                     "deferred table '{table_name}' has no persisted state"
                 ))
             })?;
-            let data = decode_persisted_table_data(store, *state)?;
+            let data = decode_persisted_table_data(store, state)?;
 
-            if let Some(ps) = self.persisted_tables.get_mut(table_name) {
+            if let Some(ps) = self.persisted_tables_mut().get_mut(table_name) {
                 ps.row_count = data.rows.len();
                 ps.tail = read_uncompressed_overflow_tail(store, ps.pointer)?.unwrap_or_default();
             }
             self.tables_mut().insert(table_name.clone(), data.into());
             tables_loaded.push(table_name.clone());
-            self.deferred_tables.remove(table_name);
+            self.deferred_tables_mut().remove(table_name);
         }
         for table_name in &tables_loaded {
             self.mark_indexes_stale_for_table(table_name);
@@ -1686,26 +1906,24 @@ impl EngineRuntime {
         }
         let mut tables_loaded = Vec::new();
         for table_name in &table_names {
-            let state = self.persisted_tables.get(table_name).ok_or_else(|| {
+            let state = *self.persisted_tables.get(table_name).ok_or_else(|| {
                 DbError::internal(format!(
                     "deferred table '{table_name}' has no persisted state"
                 ))
             })?;
             let row_source = if state.pointer.is_table_paged_manifest() {
-                TableRowSource::Paged(Arc::new(read_table_page_manifest_from_state(
-                    store, *state,
-                )?))
+                TableRowSource::Paged(Arc::new(read_table_page_manifest_from_state(store, state)?))
             } else {
-                TableRowSource::Resident(Arc::new(decode_persisted_table_data(store, *state)?))
+                TableRowSource::Resident(Arc::new(decode_persisted_table_data(store, state)?))
             };
             let row_count = row_source.row_count();
-            if let Some(ps) = self.persisted_tables.get_mut(table_name) {
+            if let Some(ps) = self.persisted_tables_mut().get_mut(table_name) {
                 ps.row_count = row_count;
                 ps.tail = read_uncompressed_overflow_tail(store, ps.pointer)?.unwrap_or_default();
             }
             self.tables_mut().insert(table_name.clone(), row_source);
             tables_loaded.push(table_name.clone());
-            self.deferred_tables.remove(table_name);
+            self.deferred_tables_mut().remove(table_name);
         }
         for table_name in &tables_loaded {
             self.mark_indexes_stale_for_table(table_name);
@@ -1763,7 +1981,7 @@ impl EngineRuntime {
                     self.overflow_chain_caches.remove(&canonical_table_name);
                     let new_state =
                         rewrite_paged_table_from_manifest(&mut store, previous_state, manifest)?;
-                    self.persisted_tables
+                    self.persisted_tables_mut()
                         .insert(canonical_table_name.clone(), new_state);
                     let pk_index_root = if db.config().persistent_pk_index {
                         let chunk_payloads = read_paged_table_chunk_payloads(&store, new_state)?;
@@ -1797,7 +2015,7 @@ impl EngineRuntime {
                         } else {
                             previous_state
                         };
-                        self.persisted_tables
+                        self.persisted_tables_mut()
                             .insert(canonical_table_name.clone(), new_state);
                         let pk_index_root = if db.config().persistent_pk_index {
                             let chunk_payloads =
@@ -1847,12 +2065,13 @@ impl EngineRuntime {
                                 read_uncompressed_overflow_tail(&store, ptr)?.unwrap_or_default();
                             self.overflow_chain_caches
                                 .insert(canonical_table_name.clone(), new_chain_cache);
-                            self.persisted_tables.insert(
+                            let row_count = data.rows.len();
+                            self.persisted_tables_mut().insert(
                                 canonical_table_name.clone(),
                                 PersistedTableState {
                                     pointer: ptr,
                                     checksum,
-                                    row_count: data.rows.len(),
+                                    row_count,
                                     tail,
                                     pk_index_root: previous_state.pk_index_root,
                                 },
@@ -1912,7 +2131,7 @@ impl EngineRuntime {
                             db.config().page_size,
                         )?
                     };
-                    self.persisted_tables
+                    self.persisted_tables_mut()
                         .insert(canonical_table_name.clone(), new_state);
                     let pk_index_root = if db.config().persistent_pk_index {
                         let chunk_payloads = read_paged_table_chunk_payloads(&store, new_state)?;
@@ -1988,12 +2207,13 @@ impl EngineRuntime {
                 };
                 self.overflow_chain_caches
                     .insert(canonical_table_name.clone(), new_chain_cache);
-                self.persisted_tables.insert(
+                let row_count = data.rows.len();
+                self.persisted_tables_mut().insert(
                     canonical_table_name.clone(),
                     PersistedTableState {
                         pointer,
                         checksum,
-                        row_count: data.rows.len(),
+                        row_count,
                         tail,
                         pk_index_root: previous_state.pk_index_root,
                     },
@@ -2007,7 +2227,7 @@ impl EngineRuntime {
                 self.cache_payload_insert(canonical_table_name, Arc::new(payload));
             }
             for table_name in removed_tables {
-                let Some(state) = self.persisted_tables.remove(&table_name) else {
+                let Some(state) = self.persisted_tables_mut().remove(&table_name) else {
                     continue;
                 };
                 self.overflow_chain_caches.remove(&table_name);
@@ -2069,7 +2289,7 @@ impl EngineRuntime {
             },
         );
         db.write_page_owned(page::CATALOG_ROOT_PAGE_ID, root_page)?;
-        self.dirty_tables.clear();
+        self.dirty_tables_mut().clear();
         self.paged_mutations.clear();
         self.root_state = Some(RootHeader {
             schema_cookie: self.catalog.schema_cookie,
@@ -2159,7 +2379,7 @@ impl EngineRuntime {
             } else {
                 crc32c_parts(&[payload.as_slice()])
             };
-            self.persisted_tables.insert(
+            self.persisted_tables_mut().insert(
                 table_name.clone(),
                 PersistedTableState {
                     pointer,
@@ -2212,7 +2432,8 @@ impl EngineRuntime {
                 continue;
             };
             let new_state = wrap_legacy_table_state_as_paged_manifest(&mut store, previous_state)?;
-            self.persisted_tables.insert(table_name.clone(), new_state);
+            self.persisted_tables_mut()
+                .insert(table_name.clone(), new_state);
             self.overflow_chain_caches.remove(&table_name);
             if db.config().persistent_pk_index {
                 let chunk_payloads = read_paged_table_chunk_payloads(&store, new_state)?;
@@ -2249,7 +2470,8 @@ impl EngineRuntime {
                     let (new_state, table_changed) =
                         compact_paged_table_state_for_checkpoint(&mut store, previous_state)?;
                     if table_changed {
-                        self.persisted_tables.insert(table_name.clone(), new_state);
+                        self.persisted_tables_mut()
+                            .insert(table_name.clone(), new_state);
                         if db.config().persistent_pk_index {
                             let chunk_payloads =
                                 read_paged_table_chunk_payloads(&store, new_state)?;
@@ -2290,7 +2512,7 @@ impl EngineRuntime {
                 } else {
                     read_uncompressed_overflow_tail(&store, pointer)?.unwrap_or_default()
                 };
-                self.persisted_tables.insert(
+                self.persisted_tables_mut().insert(
                     table_name.clone(),
                     PersistedTableState {
                         pointer,
@@ -2608,8 +2830,8 @@ impl EngineRuntime {
                 .is_some_and(|state| state.pointer.is_table_paged_manifest())
                 && self.tables_mut().remove(&table_name).is_some()
             {
-                self.deferred_tables.insert(table_name.clone());
-                self.dirty_tables.remove(&table_name);
+                self.deferred_tables_mut().insert(table_name.clone());
+                self.dirty_tables_mut().remove(&table_name);
                 self.paged_mutations.remove(&table_name);
                 self.mark_indexes_stale_for_table(&table_name);
             }
@@ -2739,7 +2961,7 @@ impl EngineRuntime {
             return;
         };
         self.paged_mutations.remove(&table_name);
-        self.dirty_tables.insert(table_name);
+        self.dirty_tables_mut().insert(table_name);
     }
 
     pub(super) fn mark_table_row_dirty(
@@ -2760,7 +2982,7 @@ impl EngineRuntime {
         {
             return;
         }
-        self.dirty_tables.insert(table_name.clone());
+        self.dirty_tables_mut().insert(table_name.clone());
         self.paged_mutations
             .entry(table_name)
             .or_default()
@@ -2780,7 +3002,7 @@ impl EngineRuntime {
         {
             return;
         }
-        self.dirty_tables.insert(table_name.clone());
+        self.dirty_tables_mut().insert(table_name.clone());
         self.paged_mutations
             .entry(table_name)
             .or_default()
@@ -2800,7 +3022,7 @@ impl EngineRuntime {
         {
             return;
         }
-        self.dirty_tables.insert(table_name.clone());
+        self.dirty_tables_mut().insert(table_name.clone());
         self.paged_mutations
             .entry(table_name)
             .or_default()
@@ -2808,8 +3030,8 @@ impl EngineRuntime {
     }
 
     pub(super) fn mark_all_tables_dirty(&mut self) {
-        self.dirty_tables
-            .extend(self.catalog.tables.keys().cloned());
+        let table_names = self.catalog.tables.keys().cloned().collect::<Vec<_>>();
+        self.dirty_tables_mut().extend(table_names);
         self.paged_mutations.clear();
     }
 
@@ -3172,8 +3394,7 @@ impl EngineRuntime {
                 .ok_or_else(|| {
                     DbError::internal(format!("table data for {table_name} is missing"))
                 })?
-                .rows
-                .push(stored_row);
+                .push_row(stored_row);
             self.apply_insert_index_updates(index_updates)?;
             if !temporary {
                 self.mark_table_dirty(&table_name);
@@ -11655,6 +11876,10 @@ impl PageStore for SnapshotPageStore<'_> {
         }
     }
 
+    fn advise_sequential(&self) -> Result<()> {
+        self.pager.advise_sequential()
+    }
+
     fn write_page(&mut self, _page_id: PageId, _data: &[u8]) -> Result<()> {
         Err(DbError::internal(
             "snapshot page store does not support writes",
@@ -11794,6 +12019,10 @@ impl PageStore for DbTxnPageStore<'_> {
 
     fn read_page(&self, page_id: PageId) -> Result<Arc<[u8]>> {
         self.db.read_page(page_id)
+    }
+
+    fn advise_sequential(&self) -> Result<()> {
+        self.db.advise_sequential()
     }
 
     fn write_page(&mut self, page_id: PageId, data: &[u8]) -> Result<()> {
@@ -12735,7 +12964,7 @@ fn decode_runtime_payload(bytes: &[u8]) -> Result<EngineRuntime> {
             let row_bytes_len = cursor.read_u32()? as usize;
             let row_bytes = cursor.read_slice(row_bytes_len)?;
             let row = Row::decode(row_bytes)?;
-            data.rows.push(StoredRow {
+            data.push_row(StoredRow {
                 row_id,
                 values: row.into_values(),
             });
@@ -13093,9 +13322,11 @@ fn decode_manifest_payload<S: PageStore>(_store: &S, bytes: &[u8]) -> Result<Eng
         let has_data = state.pointer.head_page_id != 0 && state.pointer.logical_len != 0;
         if has_data {
             // Defer row data loading to first statement execution.
-            runtime.deferred_tables.insert(table_name.clone());
+            runtime.deferred_tables_mut().insert(table_name.clone());
         }
-        runtime.persisted_tables.insert(table_name.clone(), state);
+        runtime
+            .persisted_tables_mut()
+            .insert(table_name.clone(), state);
         if !has_data {
             // Empty tables are immediately available.
             runtime
@@ -13168,7 +13399,7 @@ fn decode_manifest_payload<S: PageStore>(_store: &S, bytes: &[u8]) -> Result<Eng
             let stats = crate::catalog::TableStats {
                 row_count: cursor.read_i64()?,
             };
-            if let Some(state) = runtime.persisted_tables.get_mut(&name) {
+            if let Some(state) = runtime.persisted_tables_mut().get_mut(&name) {
                 state.row_count = usize::try_from(stats.row_count.max(0)).unwrap_or(usize::MAX);
             }
             runtime.catalog_mut().table_stats.insert(name, stats);
@@ -13197,9 +13428,15 @@ fn decode_manifest_payload<S: PageStore>(_store: &S, bytes: &[u8]) -> Result<Eng
     if cursor.offset < cursor.bytes.len() {
         decode_pk_index_roots_section(&mut cursor, &mut runtime.catalog_mut().tables)?;
     }
-    for (table_name, table) in &runtime.catalog.tables {
-        if let Some(state) = runtime.persisted_tables.get_mut(table_name) {
-            state.pk_index_root = table.pk_index_root;
+    let table_pk_roots = runtime
+        .catalog
+        .tables
+        .iter()
+        .map(|(table_name, table)| (table_name.clone(), table.pk_index_root))
+        .collect::<Vec<_>>();
+    for (table_name, pk_index_root) in table_pk_roots {
+        if let Some(state) = runtime.persisted_tables_mut().get_mut(&table_name) {
+            state.pk_index_root = pk_index_root;
         }
     }
     Ok(runtime)
@@ -13595,7 +13832,7 @@ fn encode_legacy_table_payload_from_manifest(manifest: &TablePageManifest) -> Re
             values: row.values().to_vec(),
         });
     }
-    encode_table_payload(&TableData { rows })
+    encode_table_payload(&TableData::from_rows(rows))
 }
 
 pub(crate) fn read_table_payload_row_count_from_bytes(bytes: &[u8]) -> Result<usize> {
@@ -13684,7 +13921,7 @@ fn apply_paged_row_changes_to_manifest(
             None
         } else {
             let rows: Vec<StoredRow> = overlay_rows.into_values().collect();
-            Some(Arc::new(encode_table_payload(&TableData { rows })?))
+            Some(Arc::new(encode_table_payload(&TableData::from_rows(rows))?))
         };
 
         new_chunks.push(TablePageManifestChunk {
@@ -13770,9 +14007,8 @@ fn append_paged_rows_to_manifest(
             for (row_id, row) in overlay_additions {
                 overlay_rows.insert(row_id, row);
             }
-            let encoded = encode_table_payload(&TableData {
-                rows: overlay_rows.into_values().collect(),
-            })?;
+            let encoded =
+                encode_table_payload(&TableData::from_rows(overlay_rows.into_values().collect()))?;
             preserve_overlay_payload = Some(Arc::new(encoded));
         }
         if appended_start > 0 {
@@ -13876,7 +14112,7 @@ fn decode_persisted_table_data<S: PageStore>(
             values: row.values().to_vec(),
         });
     }
-    Ok(TableData { rows })
+    Ok(TableData::from_rows(rows))
 }
 
 fn free_persisted_table_bytes<S: PageStore>(
@@ -14051,7 +14287,7 @@ fn compact_paged_table_state_for_checkpoint<S: PageStore>(
         }
         let merged: Vec<StoredRow> = merged_rows.into_values().collect();
         let merged_len = merged.len();
-        let new_payload = encode_table_payload(&TableData { rows: merged })?;
+        let new_payload = encode_table_payload(&TableData::from_rows(merged))?;
         let new_checksum = crc32c_parts(&[new_payload.as_slice()]);
         let new_pointer = write_overflow(
             store,
@@ -14499,7 +14735,7 @@ fn replace_table_pk_index_root(
         .get_mut(table_name)
         .ok_or_else(|| DbError::internal(format!("table schema for {table_name} is missing")))?;
     table.pk_index_root = new_pk_index_root;
-    if let Some(state) = runtime.persisted_tables.get_mut(table_name) {
+    if let Some(state) = runtime.persisted_tables_mut().get_mut(table_name) {
         state.pk_index_root = new_pk_index_root;
     }
     Ok(())
@@ -14709,7 +14945,7 @@ fn decode_table_payload(bytes: &[u8]) -> Result<TableData> {
         let row_bytes_len = cursor.read_u32()? as usize;
         let row_bytes = cursor.read_slice(row_bytes_len)?;
         let row = Row::decode(row_bytes)?;
-        data.rows.push(StoredRow {
+        data.push_row(StoredRow {
             row_id,
             values: row.into_values(),
         });
@@ -26842,7 +27078,7 @@ mod tests {
         let tail = crate::record::overflow::read_uncompressed_overflow_tail(&store, pointer)
             .expect("read table tail")
             .expect("table tail");
-        let mut table_states = runtime.persisted_tables.clone();
+        let mut table_states = runtime.persisted_tables.as_ref().clone();
         table_states.insert(
             "docs".to_string(),
             PersistedTableState {
@@ -26877,8 +27113,8 @@ mod tests {
     #[test]
     fn multi_chunk_paged_payload_reconstructs_legacy_table_payload() {
         let body = "x".repeat(2048);
-        let data = TableData {
-            rows: (0_i64..96_i64)
+        let data = TableData::from_rows(
+            (0_i64..96_i64)
                 .map(|row_id| StoredRow {
                     row_id: row_id + 1,
                     values: vec![
@@ -26888,7 +27124,7 @@ mod tests {
                     ],
                 })
                 .collect(),
-        };
+        );
 
         let encoded_chunks =
             encode_paged_table_chunks(&data, PAGE_SIZE).expect("encode paged table chunks");
@@ -26931,14 +27167,14 @@ mod tests {
 
     #[test]
     fn deferred_row_lookup_reads_compressed_table_payload() {
-        let data = TableData {
-            rows: (1_i64..=4_i64)
+        let data = TableData::from_rows(
+            (1_i64..=4_i64)
                 .map(|row_id| StoredRow {
                     row_id,
                     values: vec![Value::Int64(row_id), Value::Text("x".repeat(2048))],
                 })
                 .collect(),
-        };
+        );
         let payload = encode_table_payload(&data).expect("encode table payload");
         let mut store = InMemoryPageStore::new(PAGE_SIZE);
         let pointer = crate::record::overflow::write_overflow(
@@ -26973,14 +27209,14 @@ mod tests {
     #[test]
     fn persist_paged_table_writes_multi_chunk_manifest() {
         let body = "x".repeat(2048);
-        let data = TableData {
-            rows: (0_i64..96_i64)
+        let data = TableData::from_rows(
+            (0_i64..96_i64)
                 .map(|row_id| StoredRow {
                     row_id: row_id + 1,
                     values: vec![Value::Int64(row_id), Value::Text(body.clone())],
                 })
                 .collect(),
-        };
+        );
         let mut store = InMemoryPageStore::new(PAGE_SIZE);
 
         let encoded_chunks =
@@ -27021,14 +27257,14 @@ mod tests {
     fn append_paged_table_chunks_preserves_existing_chunk_pointers() {
         let body = "x".repeat(2048);
         let mut store = InMemoryPageStore::new(PAGE_SIZE);
-        let initial = TableData {
-            rows: (0_i64..48_i64)
+        let initial = TableData::from_rows(
+            (0_i64..48_i64)
                 .map(|row_id| StoredRow {
                     row_id: row_id + 1,
                     values: vec![Value::Int64(row_id), Value::Text(body.clone())],
                 })
                 .collect(),
-        };
+        );
         let initial_chunks =
             encode_paged_table_chunks(&initial, PAGE_SIZE).expect("encode initial chunks");
         let initial_state = persist_paged_table(
@@ -27084,14 +27320,14 @@ mod tests {
     fn rewrite_paged_table_from_resident_preserves_untouched_chunk_pointers() {
         let body = "x".repeat(2048);
         let mut store = InMemoryPageStore::new(PAGE_SIZE);
-        let initial = TableData {
-            rows: (0_i64..96_i64)
+        let initial = TableData::from_rows(
+            (0_i64..96_i64)
                 .map(|row_id| StoredRow {
                     row_id: row_id + 1,
                     values: vec![Value::Int64(row_id), Value::Text(body.clone())],
                 })
                 .collect(),
-        };
+        );
         let initial_chunks =
             encode_paged_table_chunks(&initial, PAGE_SIZE).expect("encode initial chunks");
         let initial_state = persist_paged_table(
@@ -27118,9 +27354,13 @@ mod tests {
             .collect::<Vec<_>>();
 
         let mut updated = initial.clone();
-        updated.rows[5].values[0] = Value::Int64(500);
-        updated.rows[5].values[1] = Value::Text("y".repeat(2600));
-        updated.rows.remove(6);
+        updated
+            .replace_value(5, 0, Value::Int64(500))
+            .expect("replace integer value");
+        updated
+            .replace_value(5, 1, Value::Text("y".repeat(2600)))
+            .expect("replace text value");
+        updated.remove_row(6);
 
         let rewritten_state =
             rewrite_paged_table_from_resident(&mut store, initial_state, &updated, PAGE_SIZE)
@@ -27583,9 +27823,13 @@ mod tests {
             runtime.cache_payload_insert(key.to_string(), Arc::new(vec![key.as_bytes()[0]]));
         }
 
-        assert_eq!(runtime.cached_payloads.len(), 4);
-        assert!(!runtime.cached_payloads.contains_key("a"));
-        assert!(runtime.cached_payloads.contains_key("e"));
+        let cache = runtime
+            .payload_cache
+            .lock()
+            .expect("payload cache lock should not be poisoned");
+        assert_eq!(cache.len(), 4);
+        assert!(!cache.contains_key("a"));
+        assert!(cache.contains_key("e"));
     }
 
     #[test]
@@ -27601,9 +27845,177 @@ mod tests {
 
         runtime.cache_payload_insert("e".to_string(), Arc::new(vec![b'e']));
 
-        assert!(runtime.cached_payloads.contains_key("a"));
-        assert!(!runtime.cached_payloads.contains_key("b"));
-        assert!(runtime.cached_payloads.contains_key("e"));
+        let cache = runtime
+            .payload_cache
+            .lock()
+            .expect("payload cache lock should not be poisoned");
+        assert!(cache.contains_key("a"));
+        assert!(!cache.contains_key("b"));
+        assert!(cache.contains_key("e"));
+    }
+
+    #[test]
+    fn heap_bytes_cached_counter_accurate() {
+        let data = TableData::from_rows(vec![
+            StoredRow {
+                row_id: 1,
+                values: vec![
+                    Value::Int64(1),
+                    Value::Text("alpha".repeat(32)),
+                    Value::Blob(vec![0xAA; 128]),
+                ],
+            },
+            StoredRow {
+                row_id: 2,
+                values: vec![Value::Text("beta".repeat(16)), Value::Bool(true)],
+            },
+        ]);
+
+        assert_eq!(data.approximate_heap_bytes(), data.compute_heap_bytes());
+        assert!(data.approximate_heap_bytes() > data.rows.len() * std::mem::size_of::<StoredRow>());
+    }
+
+    #[test]
+    fn heap_bytes_updates_on_mutation() {
+        let mut data = TableData::default();
+        assert_eq!(data.approximate_heap_bytes(), 0);
+
+        data.push_row(StoredRow {
+            row_id: 1,
+            values: vec![Value::Int64(1), Value::Text("short".to_string())],
+        });
+        assert_eq!(data.approximate_heap_bytes(), data.compute_heap_bytes());
+        let after_insert = data.approximate_heap_bytes();
+
+        data.replace_value(0, 1, Value::Text("long".repeat(128)))
+            .expect("replace text value");
+        assert_eq!(data.approximate_heap_bytes(), data.compute_heap_bytes());
+        assert!(data.approximate_heap_bytes() > after_insert);
+
+        data.replace_row_values(0, vec![Value::Int64(1), Value::Blob(vec![0xBB; 256])])
+            .expect("replace row values");
+        assert_eq!(data.approximate_heap_bytes(), data.compute_heap_bytes());
+
+        data.push_row(StoredRow {
+            row_id: 2,
+            values: vec![Value::Text("keep".repeat(32))],
+        });
+        data.retain_rows(|row| row.row_id == 2);
+        assert_eq!(data.rows.len(), 1);
+        assert_eq!(data.rows[0].row_id, 2);
+        assert_eq!(data.approximate_heap_bytes(), data.compute_heap_bytes());
+
+        let removed = data.remove_row(0);
+        assert_eq!(removed.row_id, 2);
+        assert_eq!(data.approximate_heap_bytes(), data.compute_heap_bytes());
+    }
+
+    #[test]
+    fn payload_cache_touch_is_o1() {
+        let mut config = DbConfig::default();
+        config.set_cached_payloads_max_entries_for_tests(512);
+        let mut runtime = EngineRuntime::from_config(22, &config);
+
+        for idx in 0..512 {
+            let key = format!("k{idx:03}");
+            runtime.cache_payload_insert(key, Arc::new(vec![idx as u8]));
+        }
+
+        let before: Vec<(String, u64)> = {
+            let cache = runtime
+                .payload_cache
+                .lock()
+                .expect("payload cache lock should not be poisoned");
+            (0..512)
+                .map(|idx| {
+                    let key = format!("k{idx:03}");
+                    let touch_gen = cache
+                        .last_touch_gen(&key)
+                        .expect("inserted cache key should have a touch generation");
+                    (key, touch_gen)
+                })
+                .collect()
+        };
+
+        assert!(runtime.cached_payload("k000").is_some());
+
+        let cache = runtime
+            .payload_cache
+            .lock()
+            .expect("payload cache lock should not be poisoned");
+        for (key, touch_gen) in &before {
+            let after_touch_gen = cache
+                .last_touch_gen(key)
+                .expect("cache key should remain present");
+            if key == "k000" {
+                assert_ne!(after_touch_gen, *touch_gen);
+            } else {
+                assert_eq!(after_touch_gen, *touch_gen);
+            }
+        }
+    }
+
+    #[test]
+    fn payload_cache_eviction_is_lru() {
+        let mut config = DbConfig::default();
+        config.set_cached_payloads_max_entries_for_tests(512);
+        let mut runtime = EngineRuntime::from_config(23, &config);
+
+        for idx in 0..512 {
+            let key = format!("k{idx:03}");
+            runtime.cache_payload_insert(key, Arc::new(vec![idx as u8]));
+        }
+        assert!(runtime.cached_payload("k000").is_some());
+
+        runtime.cache_payload_insert("k512".to_string(), Arc::new(vec![0xFF]));
+
+        let cache = runtime
+            .payload_cache
+            .lock()
+            .expect("payload cache lock should not be poisoned");
+        assert_eq!(cache.len(), 512);
+        assert!(cache.contains_key("k000"));
+        assert!(!cache.contains_key("k001"));
+        assert!(cache.contains_key("k512"));
+    }
+
+    #[test]
+    fn transaction_clone_is_cheap() {
+        let mut runtime = EngineRuntime::empty(24);
+        for idx in 0..1_000 {
+            let table_name = format!("t{idx}");
+            runtime
+                .persisted_tables_mut()
+                .insert(table_name.clone(), PersistedTableState::default());
+            runtime.deferred_tables_mut().insert(table_name.clone());
+            runtime.dirty_tables_mut().insert(table_name);
+        }
+        runtime.cache_payload_insert("payload".to_string(), Arc::new(vec![0xAA; 4096]));
+
+        let cloned = runtime.clone();
+
+        assert!(Arc::ptr_eq(
+            &runtime.persisted_tables,
+            &cloned.persisted_tables
+        ));
+        assert!(Arc::ptr_eq(
+            &runtime.deferred_tables,
+            &cloned.deferred_tables
+        ));
+        assert!(Arc::ptr_eq(&runtime.dirty_tables, &cloned.dirty_tables));
+        assert!(Arc::ptr_eq(&runtime.payload_cache, &cloned.payload_cache));
+        assert_eq!(Arc::strong_count(&runtime.persisted_tables), 2);
+        assert_eq!(Arc::strong_count(&runtime.deferred_tables), 2);
+        assert_eq!(Arc::strong_count(&runtime.dirty_tables), 2);
+
+        runtime
+            .persisted_tables_mut()
+            .insert("new_table".to_string(), PersistedTableState::default());
+        assert!(!Arc::ptr_eq(
+            &runtime.persisted_tables,
+            &cloned.persisted_tables
+        ));
+        assert!(!cloned.persisted_tables.contains_key("new_table"));
     }
 
     #[test]
@@ -27717,7 +28129,7 @@ mod tests {
     }
 
     fn paged_row_source(rows: Vec<StoredRow>) -> TableRowSource {
-        let payload = encode_table_payload(&TableData { rows: rows.clone() })
+        let payload = encode_table_payload(&TableData::from_rows(rows.clone()))
             .expect("encode paged test payload");
         let manifest =
             TablePageManifest::from_payload(Arc::new(payload)).expect("build paged test manifest");

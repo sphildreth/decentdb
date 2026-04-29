@@ -1,6 +1,15 @@
 # Per-Engine Allocator (Decoupled from Host `#[global_allocator]`)
 **Date:** 2026-04-22
-**Status:** Accepted (2026-04-23) — `EngineAlloc` trait + default forwarder land; full callsite plumbing remains a follow-up.
+**Status:** Superseded (2026-04-29) — the unused `EngineAlloc`/`EngineByteBuf` scaffold was removed in favor of plain `Vec<u8>` buffers plus targeted reuse where measurements justify it.
+
+### Supersession note
+
+The accepted scaffold never became a production allocator boundary: every call
+site used the default forwarder to Rust's global allocator, and the only
+production hot path holding `EngineByteBuf` was the WAL writer scratch state.
+Slice S7 retired the scaffold and restored ordinary `Vec<u8>` buffers there.
+Future per-engine allocation work should start from fresh measurements and a
+new ADR instead of reviving this unused unsafe abstraction by default.
 
 ### Decision (proposed)
 

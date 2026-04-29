@@ -125,55 +125,49 @@ mod tests {
 
     #[test]
     fn table_data_row_index_and_row_by_id() {
-        let td = TableData {
-            rows: vec![
-                StoredRow {
-                    row_id: 1,
-                    values: Vec::new(),
-                },
-                StoredRow {
-                    row_id: 2,
-                    values: Vec::new(),
-                },
-            ],
-        };
+        let td = TableData::from_rows(vec![
+            StoredRow {
+                row_id: 1,
+                values: Vec::new(),
+            },
+            StoredRow {
+                row_id: 2,
+                values: Vec::new(),
+            },
+        ]);
         assert_eq!(td.row_index_by_id(1), Some(0));
         assert_eq!(td.row_by_id(2).unwrap().row_id, 2);
 
-        let td2 = TableData {
-            rows: vec![
-                StoredRow {
-                    row_id: 10,
-                    values: Vec::new(),
-                },
-                StoredRow {
-                    row_id: 20,
-                    values: Vec::new(),
-                },
-                StoredRow {
-                    row_id: 30,
-                    values: Vec::new(),
-                },
-            ],
-        };
+        let td2 = TableData::from_rows(vec![
+            StoredRow {
+                row_id: 10,
+                values: Vec::new(),
+            },
+            StoredRow {
+                row_id: 20,
+                values: Vec::new(),
+            },
+            StoredRow {
+                row_id: 30,
+                values: Vec::new(),
+            },
+        ]);
         assert_eq!(td2.row_index_by_id(20), Some(1));
 
-        let td3 = TableData {
-            rows: vec![
-                StoredRow {
-                    row_id: 7,
-                    values: Vec::new(),
-                },
-                StoredRow {
-                    row_id: 3,
-                    values: Vec::new(),
-                },
-                StoredRow {
-                    row_id: 5,
-                    values: Vec::new(),
-                },
-            ],
-        };
+        let td3 = TableData::from_rows(vec![
+            StoredRow {
+                row_id: 7,
+                values: Vec::new(),
+            },
+            StoredRow {
+                row_id: 3,
+                values: Vec::new(),
+            },
+            StoredRow {
+                row_id: 5,
+                values: Vec::new(),
+            },
+        ]);
         assert_eq!(td3.row_index_by_id(3), Some(1));
     }
 
@@ -285,18 +279,16 @@ mod tests {
         runtime.catalog_mut().tables.insert("t".to_string(), table);
         runtime.tables_mut().insert(
             "t".to_string(),
-            TableData {
-                rows: vec![
-                    StoredRow {
-                        row_id: 1,
-                        values: Vec::new(),
-                    },
-                    StoredRow {
-                        row_id: 2,
-                        values: Vec::new(),
-                    },
-                ],
-            }
+            TableData::from_rows(vec![
+                StoredRow {
+                    row_id: 1,
+                    values: Vec::new(),
+                },
+                StoredRow {
+                    row_id: 2,
+                    values: Vec::new(),
+                },
+            ])
             .into(),
         );
 
@@ -600,7 +592,7 @@ mod tests {
         runtime.mark_table_row_deleted("t", 7);
         assert!(runtime.paged_mutations.contains_key("t"));
 
-        runtime.dirty_tables.insert("w".to_string());
+        runtime.dirty_tables_mut().insert("w".to_string());
         runtime.mark_table_row_dirty("w", 5, 50, &[Value::Int64(50)]);
         assert!(!runtime.paged_mutations.contains_key("w"));
 
@@ -704,22 +696,20 @@ mod tests {
             .insert("grp".to_string(), table);
         runtime.tables_mut().insert(
             "grp".to_string(),
-            TableData {
-                rows: vec![
-                    StoredRow {
-                        row_id: 1,
-                        values: vec![Value::Text("a".to_string()), Value::Int64(10)],
-                    },
-                    StoredRow {
-                        row_id: 2,
-                        values: vec![Value::Text("a".to_string()), Value::Int64(5)],
-                    },
-                    StoredRow {
-                        row_id: 3,
-                        values: vec![Value::Text("b".to_string()), Value::Int64(7)],
-                    },
-                ],
-            }
+            TableData::from_rows(vec![
+                StoredRow {
+                    row_id: 1,
+                    values: vec![Value::Text("a".to_string()), Value::Int64(10)],
+                },
+                StoredRow {
+                    row_id: 2,
+                    values: vec![Value::Text("a".to_string()), Value::Int64(5)],
+                },
+                StoredRow {
+                    row_id: 3,
+                    values: vec![Value::Text("b".to_string()), Value::Int64(7)],
+                },
+            ])
             .into(),
         );
 
@@ -766,22 +756,20 @@ mod tests {
         runtime.catalog_mut().tables.insert("t2".to_string(), table);
         runtime.tables_mut().insert(
             "t2".to_string(),
-            TableData {
-                rows: vec![
-                    StoredRow {
-                        row_id: 1,
-                        values: vec![Value::Text("x".to_string())],
-                    },
-                    StoredRow {
-                        row_id: 2,
-                        values: vec![Value::Text("y".to_string())],
-                    },
-                    StoredRow {
-                        row_id: 3,
-                        values: vec![Value::Text("x".to_string())],
-                    },
-                ],
-            }
+            TableData::from_rows(vec![
+                StoredRow {
+                    row_id: 1,
+                    values: vec![Value::Text("x".to_string())],
+                },
+                StoredRow {
+                    row_id: 2,
+                    values: vec![Value::Text("y".to_string())],
+                },
+                StoredRow {
+                    row_id: 3,
+                    values: vec![Value::Text("x".to_string())],
+                },
+            ])
             .into(),
         );
         let res = runtime
@@ -842,18 +830,16 @@ mod tests {
             .insert("a".to_string(), table_a);
         runtime.tables_mut().insert(
             "a".to_string(),
-            TableData {
-                rows: vec![
-                    StoredRow {
-                        row_id: 1,
-                        values: vec![Value::Int64(1), Value::Int64(100)],
-                    },
-                    StoredRow {
-                        row_id: 2,
-                        values: vec![Value::Int64(2), Value::Int64(200)],
-                    },
-                ],
-            }
+            TableData::from_rows(vec![
+                StoredRow {
+                    row_id: 1,
+                    values: vec![Value::Int64(1), Value::Int64(100)],
+                },
+                StoredRow {
+                    row_id: 2,
+                    values: vec![Value::Int64(2), Value::Int64(200)],
+                },
+            ])
             .into(),
         );
 
@@ -912,26 +898,24 @@ mod tests {
             .insert("b".to_string(), table_b);
         runtime.tables_mut().insert(
             "b".to_string(),
-            TableData {
-                rows: vec![
-                    StoredRow {
-                        row_id: 10,
-                        values: vec![
-                            Value::Int64(10),
-                            Value::Int64(1),
-                            Value::Text("p1".to_string()),
-                        ],
-                    },
-                    StoredRow {
-                        row_id: 20,
-                        values: vec![
-                            Value::Int64(20),
-                            Value::Int64(2),
-                            Value::Text("p2".to_string()),
-                        ],
-                    },
-                ],
-            }
+            TableData::from_rows(vec![
+                StoredRow {
+                    row_id: 10,
+                    values: vec![
+                        Value::Int64(10),
+                        Value::Int64(1),
+                        Value::Text("p1".to_string()),
+                    ],
+                },
+                StoredRow {
+                    row_id: 20,
+                    values: vec![
+                        Value::Int64(20),
+                        Value::Int64(2),
+                        Value::Text("p2".to_string()),
+                    ],
+                },
+            ])
             .into(),
         );
 

@@ -140,6 +140,10 @@ impl VfsFile for MemVfsFile {
         Ok(buf.len())
     }
 
+    fn advise_sequential(&self) -> Result<()> {
+        Ok(())
+    }
+
     fn sync_data(&self) -> Result<()> {
         Ok(())
     }

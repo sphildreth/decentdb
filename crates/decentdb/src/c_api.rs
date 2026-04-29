@@ -1869,6 +1869,7 @@ pub extern "C" fn ddb_result_value_copy(
 mod tests {
     use super::*;
     use serde_json::Value as JsonValue;
+    use std::sync::Arc;
 
     type ExecuteFn = extern "C" fn(
         *mut DbHandle,
@@ -1940,6 +1941,27 @@ mod tests {
         assert_eq!(ddb_result_free(&mut result), DDB_OK);
         assert_eq!(ddb_result_free(&mut result), DDB_OK);
         assert_eq!(ddb_db_free(&mut db), DDB_OK);
+        assert_eq!(ddb_db_free(&mut db), DDB_OK);
+    }
+
+    #[test]
+    fn ddb_db_prepare_uses_cache() {
+        let mut db = ptr::null_mut();
+        let path = CString::new(":memory:").expect("path");
+        assert_eq!(ddb_db_open_or_create(path.as_ptr(), &mut db), DDB_OK);
+
+        let sql = CString::new("SELECT 1").expect("sql");
+        let mut first = ptr::null_mut();
+        let mut second = ptr::null_mut();
+        assert_eq!(ddb_db_prepare(db, sql.as_ptr(), &mut first), DDB_OK);
+        assert_eq!(ddb_db_prepare(db, sql.as_ptr(), &mut second), DDB_OK);
+
+        let first_statement = unsafe { (*first).prepared.statement_arc_for_tests() };
+        let second_statement = unsafe { (*second).prepared.statement_arc_for_tests() };
+        assert!(Arc::ptr_eq(&first_statement, &second_statement));
+
+        assert_eq!(ddb_stmt_free(&mut first), DDB_OK);
+        assert_eq!(ddb_stmt_free(&mut second), DDB_OK);
         assert_eq!(ddb_db_free(&mut db), DDB_OK);
     }
 

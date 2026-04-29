@@ -954,7 +954,7 @@ impl EngineRuntime {
                 values: row.values().to_vec(),
             });
         }
-        self.replace_table_row_source(table_name, TableData { rows }.into())
+        self.replace_table_row_source(table_name, TableData::from_rows(rows).into())
     }
 
     fn execute_alter_table_constraint(
@@ -1248,16 +1248,17 @@ impl EngineRuntime {
         })?;
         self.tables_mut().insert(new_name.to_string(), data);
 
-        if let Some(state) = self.persisted_tables.remove(&old_table_name) {
-            self.persisted_tables.insert(new_name.to_string(), state);
+        if let Some(state) = self.persisted_tables_mut().remove(&old_table_name) {
+            self.persisted_tables_mut()
+                .insert(new_name.to_string(), state);
         }
         if let Some(stats) = self.catalog_mut().table_stats.remove(&old_table_name) {
             self.catalog_mut()
                 .table_stats
                 .insert(new_name.to_string(), stats);
         }
-        if self.dirty_tables.remove(&old_table_name) {
-            self.dirty_tables.insert(new_name.to_string());
+        if self.dirty_tables_mut().remove(&old_table_name) {
+            self.dirty_tables_mut().insert(new_name.to_string());
         }
         if let Some(delta) = self.paged_mutations.remove(&old_table_name) {
             self.paged_mutations.insert(new_name.to_string(), delta);

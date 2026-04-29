@@ -47,6 +47,10 @@ pub(crate) trait PageStore: std::fmt::Debug {
     fn read_page(&self, page_id: PageId) -> Result<Arc<[u8]>>;
     fn write_page(&mut self, page_id: PageId, data: &[u8]) -> Result<()>;
 
+    fn advise_sequential(&self) -> Result<()> {
+        Ok(())
+    }
+
     fn write_page_owned(&mut self, page_id: PageId, data: Vec<u8>) -> Result<()> {
         self.write_page(page_id, &data)
     }

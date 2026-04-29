@@ -93,6 +93,10 @@ impl PageStore for PagerReadStore<'_> {
         self.db.read_page_for_snapshot(self.snapshot_token, page_id)
     }
 
+    fn advise_sequential(&self) -> Result<()> {
+        self.db.advise_sequential()
+    }
+
     fn write_page(&mut self, _page_id: PageId, _data: &[u8]) -> Result<()> {
         Err(DbError::internal(
             "PagerReadStore does not support writing pages",
@@ -140,6 +144,11 @@ impl PreparedStatement {
         params: &[Value],
     ) -> Result<QueryResult> {
         txn.execute_prepared(self, params)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn statement_arc_for_tests(&self) -> Arc<SqlStatement> {
+        Arc::clone(&self.statement)
     }
 }
 
@@ -268,9 +277,19 @@ impl Drop for DbInner {
         if let Ok(mut held_snapshots) = self.held_snapshots.lock() {
             held_snapshots.clear();
         }
-        let _ = self
-            .wal
-            .checkpoint(&self.pager, self.config.checkpoint_timeout_sec);
+        let wal = self.wal.clone();
+        let checkpoint_wal = wal.clone();
+        let pager = self.pager.clone();
+        let timeout = self.config.checkpoint_timeout_sec;
+        if std::thread::Builder::new()
+            .name("decentdb-drop-checkpoint".to_string())
+            .spawn(move || {
+                let _ = checkpoint_wal.checkpoint(&pager, timeout);
+            })
+            .is_err()
+        {
+            wal.set_checkpoint_pending(false);
+        }
     }
 }
 
@@ -399,7 +418,9 @@ impl StatementCache {
 
     fn get_or_parse(&mut self, sql: &str) -> Result<Arc<SqlStatement>> {
         if let Some(statement) = self.entries.get(sql) {
-            return Ok(Arc::clone(statement));
+            let statement = Arc::clone(statement);
+            self.promote(sql);
+            return Ok(statement);
         }
 
         let statement = Arc::new(parse_sql_statement(sql)?);
@@ -419,6 +440,11 @@ impl StatementCache {
         self.order.push_back(key.clone());
         self.entries.insert(key, Arc::clone(&statement));
         Ok(statement)
+    }
+
+    fn promote(&mut self, sql: &str) {
+        self.order.retain(|key| key != sql);
+        self.order.push_back(sql.to_string());
     }
 }
 
@@ -1063,6 +1089,10 @@ impl Db {
         self.read_page_at_snapshot_lsn(page_id, reader.snapshot_lsn())
     }
 
+    pub(crate) fn advise_sequential(&self) -> Result<()> {
+        self.inner.pager.advise_sequential()
+    }
+
     pub(crate) fn read_page_at_snapshot_lsn(
         &self,
         page_id: u32,
@@ -1603,7 +1633,12 @@ impl Db {
         effective_config.page_size = header.page_size;
         let schema_cookie = header.schema_cookie;
 
-        let pager = PagerHandle::open(Arc::clone(&file), header, effective_config.cache_size_mb)?;
+        let pager = PagerHandle::open_with_page_pool(
+            Arc::clone(&file),
+            header,
+            effective_config.cache_size_mb,
+            effective_config.page_pool_max,
+        )?;
         let wal = WalHandle::acquire(&vfs, &path, &effective_config, &pager)?;
         wal.set_max_page_count(pager.on_disk_page_count()?);
 
@@ -5866,6 +5901,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::{Arc, Barrier};
     use std::thread;
+    use std::time::{Duration, Instant};
     use tempfile::TempDir;
 
     use crate::catalog::{
@@ -5911,6 +5947,10 @@ mod tests {
             self.db.read_page(page_id)
         }
 
+        fn advise_sequential(&self) -> Result<()> {
+            self.db.advise_sequential()
+        }
+
         fn write_page(&mut self, _page_id: PageId, _data: &[u8]) -> Result<()> {
             Err(DbError::internal(
                 "PagerReadStore does not support writing pages",
@@ -5933,6 +5973,58 @@ mod tests {
         let _second = cache.get_or_parse("SELECT 2").expect("parse second");
         let first_again = cache.get_or_parse("SELECT 1").expect("reparse evicted");
         assert!(!Arc::ptr_eq(&first, &first_again));
+    }
+
+    #[test]
+    fn statement_cache_lru_promotes_on_hit() {
+        let mut cache = StatementCache::with_capacity(2);
+        let first = cache.get_or_parse("SELECT 1").expect("parse first");
+        let second = cache.get_or_parse("SELECT 2").expect("parse second");
+        let first_hit = cache.get_or_parse("SELECT 1").expect("cache hit");
+        assert!(Arc::ptr_eq(&first, &first_hit));
+
+        let _third = cache.get_or_parse("SELECT 3").expect("parse third");
+        let first_again = cache.get_or_parse("SELECT 1").expect("first still cached");
+        let second_again = cache.get_or_parse("SELECT 2").expect("reparse evicted");
+
+        assert!(Arc::ptr_eq(&first, &first_again));
+        assert!(!Arc::ptr_eq(&second, &second_again));
+    }
+
+    #[test]
+    fn drop_does_not_block_indefinitely() -> Result<()> {
+        let dir = TempDir::new().expect("create temp dir");
+        let path = dir.path().join("drop-checkpoint.ddb");
+        let mut config = DbConfig {
+            checkpoint_timeout_sec: 60,
+            ..DbConfig::default()
+        };
+        config.wal_checkpoint_threshold_pages = u32::MAX;
+        config.wal_checkpoint_threshold_bytes = u64::MAX;
+
+        let db = Db::open_or_create(&path, config.clone())?;
+        db.execute("CREATE TABLE docs (id INT64 PRIMARY KEY, body TEXT NOT NULL)")?;
+        for id in 0..256 {
+            db.execute_with_params(
+                "INSERT INTO docs (id, body) VALUES ($1, $2)",
+                &[
+                    Value::Int64(id),
+                    Value::Text(format!("payload-{id}-{}", "x".repeat(256))),
+                ],
+            )?;
+        }
+
+        let started = Instant::now();
+        drop(db);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "drop should not wait for the full checkpoint timeout"
+        );
+
+        let reopened = Db::open(&path, config)?;
+        let result = reopened.execute("SELECT COUNT(*) FROM docs")?;
+        assert_eq!(result.rows()[0].values(), &[Value::Int64(256)]);
+        Ok(())
     }
 
     #[test]
@@ -15929,6 +16021,12 @@ mod tests {
 
         drop(db);
 
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while crate::wal::shared::has_registry_entry_for_tests(&canonical_path)
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
         assert!(!crate::wal::shared::has_registry_entry_for_tests(
             &canonical_path
         ));

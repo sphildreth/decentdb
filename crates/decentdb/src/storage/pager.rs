@@ -25,13 +25,30 @@ struct Pager {
     page_size: u32,
     cache: PageCache,
     header: Mutex<DatabaseHeader>,
+    page_pool: Mutex<Vec<Vec<u8>>>,
+    page_pool_max: usize,
+    #[cfg(test)]
+    page_pool_reuse_count: std::sync::atomic::AtomicUsize,
 }
 
 impl PagerHandle {
+    #[cfg(any(test, feature = "bench-internals"))]
+    const DEFAULT_PAGE_POOL_MAX: usize = 256;
+
+    #[cfg(any(test, feature = "bench-internals"))]
     pub(crate) fn open(
         file: Arc<dyn VfsFile>,
         header: DatabaseHeader,
         cache_size_mb: usize,
+    ) -> Result<Self> {
+        Self::open_with_page_pool(file, header, cache_size_mb, Self::DEFAULT_PAGE_POOL_MAX)
+    }
+
+    pub(crate) fn open_with_page_pool(
+        file: Arc<dyn VfsFile>,
+        header: DatabaseHeader,
+        cache_size_mb: usize,
+        page_pool_max: usize,
     ) -> Result<Self> {
         let page_size = header.page_size;
         let bytes = cache_size_mb.saturating_mul(1024 * 1024);
@@ -42,6 +59,10 @@ impl PagerHandle {
                 page_size,
                 cache: PageCache::new(capacity_pages, page_size as usize),
                 header: Mutex::new(header),
+                page_pool: Mutex::new(Vec::with_capacity(page_pool_max.min(256))),
+                page_pool_max,
+                #[cfg(test)]
+                page_pool_reuse_count: std::sync::atomic::AtomicUsize::new(0),
             }),
         })
     }
@@ -58,6 +79,10 @@ impl PagerHandle {
     pub(crate) fn read_page_from_disk(&self, page_id: PageId) -> Result<Arc<[u8]>> {
         page::validate_page_id(page_id)?;
         Ok(Arc::from(self.inner.load_page_from_disk(page_id)?))
+    }
+
+    pub(crate) fn advise_sequential(&self) -> Result<()> {
+        self.inner.file.advise_sequential()
     }
 
     pub(crate) fn write_page_direct(&self, page_id: PageId, data: &[u8]) -> Result<()> {
@@ -108,12 +133,13 @@ impl PagerHandle {
         }
 
         let page_id = self.on_disk_page_count()? + 1;
-        let empty = page::zeroed_page(self.inner.page_size);
+        let empty = self.inner.take_page_buffer()?;
         write_all_at(
             self.inner.file.as_ref(),
             page::page_offset(page_id, self.inner.page_size),
             &empty,
         )?;
+        self.inner.recycle_page_buffer(empty)?;
         self.inner.file.set_len(
             page::page_offset(page_id, self.inner.page_size) + u64::from(self.inner.page_size),
         )?;
@@ -266,13 +292,15 @@ impl PagerHandle {
     }
 
     fn read_freelist_next(&self, page_id: PageId) -> Result<PageId> {
-        let mut page = page::zeroed_page(self.inner.page_size);
+        let mut page = self.inner.take_page_buffer()?;
         read_exact_at(
             self.inner.file.as_ref(),
             page::page_offset(page_id, self.inner.page_size),
             &mut page,
         )?;
-        decode_freelist_next(&page)
+        let next = decode_freelist_next(&page);
+        self.inner.recycle_page_buffer(page)?;
+        next
     }
 
     fn persist_header(&self, header: &DatabaseHeader) -> Result<()> {
@@ -297,16 +325,66 @@ impl Pager {
             .file_size()
             .map(|size| page::page_count_for_len(size, self.page_size))?;
         if page_id > page_count {
-            return Ok(page::zeroed_page(self.page_size));
+            return self.take_page_buffer();
         }
 
-        let mut data = page::zeroed_page(self.page_size);
+        let mut data = self.take_page_buffer()?;
         read_exact_at(
             self.file.as_ref(),
             page::page_offset(page_id, self.page_size),
             &mut data,
         )?;
         Ok(data)
+    }
+
+    fn take_page_buffer(&self) -> Result<Vec<u8>> {
+        let page_size = self.page_size as usize;
+        if self.page_pool_max != 0 {
+            let mut pool = self
+                .page_pool
+                .lock()
+                .map_err(|_| DbError::internal("pager page-pool lock poisoned"))?;
+            if let Some(mut buffer) = pool.pop() {
+                debug_assert!(buffer.capacity() >= page_size);
+                buffer.resize(page_size, 0);
+                buffer.fill(0);
+                #[cfg(test)]
+                self.page_pool_reuse_count
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Ok(buffer);
+            }
+        }
+        Ok(page::zeroed_page(self.page_size))
+    }
+
+    fn recycle_page_buffer(&self, mut buffer: Vec<u8>) -> Result<()> {
+        let page_size = self.page_size as usize;
+        if self.page_pool_max == 0 || buffer.capacity() < page_size {
+            return Ok(());
+        }
+        buffer.clear();
+        let mut pool = self
+            .page_pool
+            .lock()
+            .map_err(|_| DbError::internal("pager page-pool lock poisoned"))?;
+        if pool.len() < self.page_pool_max {
+            pool.push(buffer);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn page_pool_available(&self) -> Result<usize> {
+        self.page_pool
+            .lock()
+            .map(|pool| pool.len())
+            .map_err(|_| DbError::internal("pager page-pool lock poisoned"))
+    }
+
+    #[cfg(test)]
+    fn page_pool_reuse_count(&self) -> usize {
+        self.page_pool_reuse_count
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -494,6 +572,10 @@ mod tests {
             self.inner.write_at(offset, buf)
         }
 
+        fn advise_sequential(&self) -> crate::Result<()> {
+            self.inner.advise_sequential()
+        }
+
         fn sync_data(&self) -> crate::Result<()> {
             self.inner.sync_data()
         }
@@ -600,5 +682,44 @@ mod tests {
 
         let data = pager.read_page(100).expect("read beyond");
         assert_eq!(data.to_vec(), page::zeroed_page(page::DEFAULT_PAGE_SIZE));
+    }
+
+    #[test]
+    fn page_pool_recycles_buffers() {
+        let mem_vfs = MemVfs::default();
+        let path = unique_path("page-pool");
+        let file = mem_vfs
+            .open(&path, OpenMode::CreateNew, FileKind::Database)
+            .expect("create db");
+        let header = DatabaseHeader::new(page::DEFAULT_PAGE_SIZE);
+        write_database_bootstrap_vfs(file.as_ref(), &header).expect("bootstrap database");
+        let pager =
+            PagerHandle::open_with_page_pool(file, header, 1, 10).expect("open pager with pool");
+
+        let mut buffers = Vec::new();
+        for _ in 0..10 {
+            buffers.push(pager.inner.take_page_buffer().expect("take fresh buffer"));
+        }
+        assert_eq!(pager.inner.page_pool_available().expect("pool size"), 0);
+        assert_eq!(pager.inner.page_pool_reuse_count(), 0);
+
+        for buffer in buffers.drain(..) {
+            pager
+                .inner
+                .recycle_page_buffer(buffer)
+                .expect("recycle buffer");
+        }
+        assert_eq!(pager.inner.page_pool_available().expect("pool size"), 10);
+
+        for _ in 0..10 {
+            buffers.push(pager.inner.take_page_buffer().expect("reuse buffer"));
+        }
+        assert_eq!(pager.inner.page_pool_reuse_count(), 10);
+        assert!(buffers
+            .iter()
+            .all(|buffer| buffer.len() == page::DEFAULT_PAGE_SIZE as usize));
+        assert!(buffers
+            .iter()
+            .all(|buffer| buffer.iter().all(|byte| *byte == 0)));
     }
 }

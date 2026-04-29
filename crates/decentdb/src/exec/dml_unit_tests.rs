@@ -11,7 +11,7 @@ mod tests {
     use crate::sql::parser::parse_sql_statement;
 
     fn paged_row_source(rows: Vec<StoredRow>) -> TableRowSource {
-        let payload = super::super::encode_table_payload(&crate::exec::TableData { rows })
+        let payload = super::super::encode_table_payload(&crate::exec::TableData::from_rows(rows))
             .expect("encode paged test payload");
         let manifest = super::super::TablePageManifest::from_payload(Arc::new(payload))
             .expect("build paged test manifest");
@@ -187,7 +187,7 @@ mod tests {
         );
         runtime.tables_mut().insert(
             "t".to_string(),
-            TableRowSource::Resident(Arc::new(TableData { rows: Vec::new() })),
+            TableRowSource::Resident(Arc::new(TableData::from_rows(Vec::new()))),
         );
 
         let stmt =
@@ -357,7 +357,7 @@ mod tests {
             .insert("t".to_string(), table.clone());
         runtime
             .tables_mut()
-            .insert("t".to_string(), TableData { rows: vec![] }.into());
+            .insert("t".to_string(), TableData::from_rows(vec![]).into());
 
         let stmt = parse_sql_statement("INSERT INTO t (val) VALUES (20)").unwrap();
         let insert = match stmt {
@@ -998,7 +998,7 @@ mod tests {
         );
         runtime
             .tables_mut()
-            .insert("child".to_string(), TableData { rows: vec![] }.into());
+            .insert("child".to_string(), TableData::from_rows(vec![]).into());
         runtime.mark_table_dirty("parent");
 
         let stmt =

@@ -45,6 +45,13 @@ pub struct DbConfig {
     pub page_size: u32,
     pub cache_size_mb: usize,
     pub cached_payloads_max_entries: usize,
+    /// Maximum number of reusable page-sized buffers retained by each pager.
+    ///
+    /// The pool only recycles buffers already created by pager hot paths and
+    /// never allocates during recycle. `0` disables pooling.
+    ///
+    /// Default: `256`.
+    pub page_pool_max: usize,
     pub wal_sync_mode: WalSyncMode,
     pub checkpoint_timeout_sec: u64,
     pub trigram_postings_threshold: usize,
@@ -195,6 +202,7 @@ impl Default for DbConfig {
             page_size: page::DEFAULT_PAGE_SIZE,
             cache_size_mb: 4,
             cached_payloads_max_entries: 1024,
+            page_pool_max: 256,
             wal_sync_mode: WalSyncMode::Full,
             checkpoint_timeout_sec: 30,
             trigram_postings_threshold: 100_000,
@@ -228,6 +236,7 @@ mod tests {
         assert_eq!(config.page_size, page::DEFAULT_PAGE_SIZE);
         assert_eq!(config.cache_size_mb, 4);
         assert_eq!(config.cached_payloads_max_entries, 1024);
+        assert_eq!(config.page_pool_max, 256);
         assert_eq!(config.wal_sync_mode, WalSyncMode::Full);
         assert_eq!(config.checkpoint_timeout_sec, 30);
         assert_eq!(config.trigram_postings_threshold, 100_000);

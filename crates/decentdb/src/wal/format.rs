@@ -301,6 +301,9 @@ mod tests {
         fn write_at(&self, _: u64, _: &[u8]) -> Result<usize> {
             unimplemented!()
         }
+        fn advise_sequential(&self) -> Result<()> {
+            Ok(())
+        }
         fn sync_data(&self) -> Result<()> {
             Ok(())
         }

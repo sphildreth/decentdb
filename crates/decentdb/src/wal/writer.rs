@@ -6,7 +6,6 @@
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use crate::alloc::EngineByteBuf;
 use crate::config::WalSyncMode;
 use crate::error::{DbError, Result};
 use crate::storage::page::PageId;
@@ -372,7 +371,7 @@ fn ensure_capacity(wal: &WalHandle, required_len: u64) -> Result<bool> {
 }
 
 fn append_page_frame(
-    output: &mut EngineByteBuf,
+    output: &mut Vec<u8>,
     page_id: PageId,
     payload: &[u8],
     page_size: u32,
@@ -400,8 +399,8 @@ fn append_page_frame(
 }
 
 fn append_best_page_frame_with_base(
-    output: &mut EngineByteBuf,
-    delta_scratch: &mut EngineByteBuf,
+    output: &mut Vec<u8>,
+    delta_scratch: &mut Vec<u8>,
     wal: &WalHandle,
     page_id: PageId,
     payload: &[u8],
@@ -520,11 +519,7 @@ fn maybe_auto_checkpoint(wal: &WalHandle, pager: &PagerHandle) -> Result<()> {
     super::checkpoint::checkpoint(wal, pager, cfg.checkpoint_timeout_sec)
 }
 
-fn append_page_delta_frame(
-    output: &mut EngineByteBuf,
-    page_id: PageId,
-    payload: &[u8],
-) -> Result<usize> {
+fn append_page_delta_frame(output: &mut Vec<u8>, page_id: PageId, payload: &[u8]) -> Result<usize> {
     if page_id == 0 {
         return Err(DbError::corruption(
             "page WAL frames must have a non-zero page id",
@@ -543,12 +538,11 @@ fn append_page_delta_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::alloc::{EngineAllocHandle, EngineByteBuf};
     use crate::storage::page;
 
     #[test]
     fn append_page_frame_rejects_zero_page_id() {
-        let mut out = EngineByteBuf::new_in(EngineAllocHandle::default());
+        let mut out = Vec::new();
         let payload = vec![0u8; page::DEFAULT_PAGE_SIZE as usize];
         let res = append_page_frame(&mut out, 0, &payload, page::DEFAULT_PAGE_SIZE);
         assert!(res.is_err());
@@ -556,7 +550,7 @@ mod tests {
 
     #[test]
     fn append_page_frame_rejects_size_mismatch() {
-        let mut out = EngineByteBuf::new_in(EngineAllocHandle::default());
+        let mut out = Vec::new();
         let payload = vec![0u8; 10];
         let res = append_page_frame(&mut out, 1, &payload, page::DEFAULT_PAGE_SIZE);
         assert!(res.is_err());
@@ -564,7 +558,7 @@ mod tests {
 
     #[test]
     fn append_page_frame_encodes_frame() {
-        let mut out = EngineByteBuf::new_in(EngineAllocHandle::default());
+        let mut out = Vec::new();
         let payload = vec![0xAA; page::DEFAULT_PAGE_SIZE as usize];
         let res =
             append_page_frame(&mut out, 5, &payload, page::DEFAULT_PAGE_SIZE).expect("append");

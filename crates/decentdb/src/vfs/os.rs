@@ -113,6 +113,19 @@ impl VfsFile for OsVfsFile {
         })
     }
 
+    fn advise_sequential(&self) -> Result<()> {
+        advise_sequential(&self.file).map_err(|source| {
+            DbError::io(
+                format!(
+                    "advise sequential access for {} file at {}",
+                    self.kind.label(),
+                    self.path.display()
+                ),
+                source,
+            )
+        })
+    }
+
     fn sync_data(&self) -> Result<()> {
         let _guard = self
             .path_lock
@@ -207,6 +220,32 @@ fn read_at(file: &File, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
 #[cfg(windows)]
 fn write_at(file: &File, offset: u64, buf: &[u8]) -> std::io::Result<usize> {
     std::os::windows::fs::FileExt::seek_write(file, buf, offset)
+}
+
+#[cfg(target_os = "linux")]
+fn advise_sequential(file: &File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::raw::{c_int, c_long};
+
+    const POSIX_FADV_SEQUENTIAL: c_int = 2;
+
+    unsafe extern "C" {
+        fn posix_fadvise(fd: c_int, offset: c_long, len: c_long, advice: c_int) -> c_int;
+    }
+
+    // SAFETY: `file.as_raw_fd()` returns a valid borrowed descriptor for the
+    // duration of this call, and the offset/length pair covers the whole file.
+    let rc = unsafe { posix_fadvise(file.as_raw_fd(), 0, 0, POSIX_FADV_SEQUENTIAL) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::from_raw_os_error(rc))
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn advise_sequential(_file: &File) -> std::io::Result<()> {
+    Ok(())
 }
 
 impl FileKind {
@@ -354,6 +393,19 @@ mod tests {
 
         file.set_len(512).expect("shrink");
         assert_eq!(file.file_size().expect("size3"), 512);
+
+        vfs.remove_file(&path).expect("cleanup");
+    }
+
+    #[test]
+    fn advise_sequential_on_temp_file_succeeds() {
+        let vfs = OsVfs;
+        let path = unique_path("advise-sequential");
+        let file = vfs
+            .open(&path, OpenMode::CreateNew, FileKind::Database)
+            .expect("create file");
+
+        file.advise_sequential().expect("advise sequential");
 
         vfs.remove_file(&path).expect("cleanup");
     }

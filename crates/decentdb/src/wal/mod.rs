@@ -19,7 +19,6 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 
-use crate::alloc::{EngineAllocHandle, EngineByteBuf};
 use crate::config::{DbConfig, WalSyncMode};
 use crate::error::{DbError, Result};
 use crate::storage::page::PageId;
@@ -118,22 +117,22 @@ impl AutoCheckpointConfig {
 
 #[derive(Debug)]
 pub(crate) struct WalWriteState {
-    pub(crate) page_batch: EngineByteBuf,
+    pub(crate) page_batch: Vec<u8>,
     pub(crate) prepared_pages: Vec<(PageId, Vec<u8>, usize, format::FrameEncoding, u64)>,
     /// Reusable scratch buffer for the per-page delta payload (slice M6).
     /// `encode_page_delta_into` clears and refills this buffer on every
     /// page rather than allocating a fresh `Vec<u8>` per page in the
     /// commit hot path.
-    pub(crate) delta_scratch: EngineByteBuf,
+    pub(crate) delta_scratch: Vec<u8>,
 }
 
 impl WalWriteState {
     #[must_use]
-    pub(crate) fn new(alloc: EngineAllocHandle) -> Self {
+    pub(crate) fn new() -> Self {
         Self {
-            page_batch: EngineByteBuf::new_in(alloc.clone()),
+            page_batch: Vec::new(),
             prepared_pages: Vec::new(),
-            delta_scratch: EngineByteBuf::new_in(alloc),
+            delta_scratch: Vec::new(),
         }
     }
 }
