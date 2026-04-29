@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, RwLockWriteGuard};
 
+#[cfg(feature = "bench-internals")]
+use crate::benchmark::READ_PATH_WRITE_TXN_LOCK_COUNT;
 use crate::catalog::{
     identifiers_equal, CatalogHandle, CheckConstraint, ColumnSchema, ForeignKeyAction,
     ForeignKeyConstraint, IndexColumn, IndexKind, IndexSchema, TableSchema, TriggerEvent,
@@ -228,6 +230,7 @@ struct DbInner {
     sql_write_lock: Mutex<()>,
     sql_txn: Mutex<SqlTxnSlot>,
     sql_txn_active: AtomicBool,
+    write_txn_active: AtomicBool,
     write_txn: Mutex<WriteTxn>,
     temp_state: Mutex<TempSchemaState>,
     statement_cache: Mutex<StatementCache>,
@@ -815,6 +818,7 @@ impl Db {
             return Err(DbError::transaction("write transaction is already active"));
         }
         txn.active = true;
+        self.inner.write_txn_active.store(true, Ordering::Release);
         txn.staged_pages.clear();
         Ok(())
     }
@@ -960,6 +964,7 @@ impl Db {
                 .map_or(0, |(page_id, _)| *page_id);
             (max_page_id, std::mem::take(&mut txn.staged_pages))
         };
+        self.inner.write_txn_active.store(false, Ordering::Release);
 
         let pages: Vec<_> = pages.into_iter().collect();
         let max_page_count = self.inner.wal.max_page_count().max(max_page_id);
@@ -991,6 +996,7 @@ impl Db {
                 .map_or(0, |(page_id, _)| *page_id);
             (max_page_id, std::mem::take(&mut txn.staged_pages))
         };
+        self.inner.write_txn_active.store(false, Ordering::Release);
 
         let pages: Vec<_> = pages.into_iter().collect();
         let max_page_count = self.inner.wal.max_page_count().max(max_page_id);
@@ -1012,6 +1018,7 @@ impl Db {
             .map_err(|_| DbError::internal("write transaction lock poisoned"))?;
         txn.active = false;
         txn.staged_pages.clear();
+        self.inner.write_txn_active.store(false, Ordering::Release);
         Ok(())
     }
 
@@ -1057,16 +1064,17 @@ impl Db {
         snapshot_lsn: u64,
     ) -> Result<Arc<[u8]>> {
         page::validate_page_id(page_id)?;
-        if let Some(staged) = self
-            .inner
-            .write_txn
-            .lock()
-            .map_err(|_| DbError::internal("write transaction lock poisoned"))?
-            .staged_pages
-            .get(&page_id)
-            .cloned()
-        {
-            return Ok(Arc::from(staged));
+        if self.inner.write_txn_active.load(Ordering::Acquire) {
+            #[cfg(feature = "bench-internals")]
+            READ_PATH_WRITE_TXN_LOCK_COUNT.fetch_add(1, Ordering::Relaxed);
+            let txn = self
+                .inner
+                .write_txn
+                .lock()
+                .map_err(|_| DbError::internal("write transaction lock poisoned"))?;
+            if let Some(staged) = txn.staged_pages.get(&page_id).cloned() {
+                return Ok(Arc::from(staged));
+            }
         }
 
         if let Some(wal_page) =
@@ -1623,6 +1631,7 @@ impl Db {
                 sql_txn: Mutex::new(SqlTxnSlot::None),
                 sql_txn_active: AtomicBool::new(false),
                 write_txn: Mutex::new(WriteTxn::default()),
+                write_txn_active: AtomicBool::new(false),
                 temp_state: Mutex::new(TempSchemaState::default()),
                 statement_cache: Mutex::new(StatementCache::default()),
                 prepared_insert_cache: Mutex::new(PreparedInsertCache::default()),
@@ -19290,5 +19299,83 @@ mod tests {
             json_after.contains("\"deferred_table_count\":2"),
             "expected both tables deferred after full join, got: {json_after}"
         );
+    }
+
+    #[test]
+    #[cfg(feature = "bench-internals")]
+    fn read_page_without_writer_skips_write_txn_lock() {
+        use crate::benchmark;
+
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("skip_write_txn_lock.ddb");
+        let db = Db::open_or_create(&path, DbConfig::default()).expect("open db");
+        db.execute("CREATE TABLE t (id INT64 PRIMARY KEY, val TEXT NOT NULL)")
+            .expect("create table");
+        {
+            let mut txn = db.transaction().expect("begin txn");
+            let insert = txn
+                .prepare("INSERT INTO t (id, val) VALUES ($1, 'a')")
+                .expect("prepare");
+            for i in 1..=10 {
+                insert
+                    .execute_in(&mut txn, &[Value::Int64(i)])
+                    .expect("insert");
+            }
+            txn.commit().expect("commit");
+        }
+        db.checkpoint().expect("checkpoint");
+
+        benchmark::reset_read_path_counters();
+        for _ in 0..20 {
+            let page = db
+                .read_page(crate::storage::page::CATALOG_ROOT_PAGE_ID)
+                .expect("read catalog root page");
+            assert_eq!(page.len(), DbConfig::default().page_size as usize);
+        }
+        let (write_txn_lock_count, _) = benchmark::take_read_path_counters();
+        assert_eq!(
+            write_txn_lock_count, 0,
+            "read path should skip write_txn lock when no writer is active"
+        );
+    }
+
+    #[test]
+    fn read_page_with_active_writer_still_sees_staged_page() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("staged_visible.ddb");
+        let db = Db::open_or_create(&path, DbConfig::default()).expect("open db");
+        db.execute("CREATE TABLE t (id INT64 PRIMARY KEY, val TEXT NOT NULL)")
+            .expect("create table");
+        {
+            let mut txn = db.transaction().expect("begin txn");
+            let insert = txn
+                .prepare("INSERT INTO t (id, val) VALUES ($1, 'a')")
+                .expect("prepare");
+            for i in 1..=5 {
+                insert
+                    .execute_in(&mut txn, &[Value::Int64(i)])
+                    .expect("insert");
+            }
+            txn.commit().expect("commit");
+        }
+        db.checkpoint().expect("checkpoint");
+
+        let mut txn = db.transaction().expect("begin txn");
+        let update = txn
+            .prepare("UPDATE t SET val = 'staged' WHERE id = 1")
+            .expect("prepare");
+        update.execute_in(&mut txn, &[]).expect("update");
+
+        // The staged page should still be visible via the read path before commit.
+        let select = txn
+            .prepare("SELECT val FROM t WHERE id = 1")
+            .expect("prepare select");
+        let result = select.execute_in(&mut txn, &[]).expect("select");
+        assert_eq!(result.rows().len(), 1);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[Value::Text("staged".to_string())]
+        );
+        txn.commit().expect("commit");
     }
 }

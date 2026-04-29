@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, TryLockError};
 
 use crate::error::{DbError, Result};
 
@@ -33,6 +33,7 @@ struct CachedPageInner {
     dirty: bool,
     pin_count: usize,
     last_access: u64,
+    indexed_access: u64,
 }
 
 #[derive(Debug)]
@@ -76,25 +77,20 @@ impl PageCache {
             .write()
             .map_err(|_| DbError::internal("page cache lock poisoned"))?;
         if let Some(page) = state.pages.get(&page_id).cloned() {
-            let (old_ts, new_ts);
+            let new_ts = self.access_counter.fetch_add(1, Ordering::Relaxed);
+            let old_indexed_access;
             {
                 let mut inner = page
                     .inner
                     .lock()
                     .map_err(|_| DbError::internal("cached page lock poisoned"))?;
-                old_ts = inner.last_access;
-                new_ts = self.access_counter.fetch_add(1, Ordering::Relaxed);
+                old_indexed_access = inner.indexed_access;
                 inner.pin_count += 1;
                 inner.last_access = new_ts;
+                inner.indexed_access = new_ts;
             }
-            if new_ts != old_ts {
-                Self::remove_from_lru_index(&mut state, page_id, old_ts);
-                state
-                    .lru_index
-                    .entry(new_ts)
-                    .or_insert_with(Vec::new)
-                    .push(page_id);
-            }
+            Self::remove_from_lru_index(&mut state, page_id, old_indexed_access);
+            state.lru_index.entry(new_ts).or_default().push(page_id);
             return Ok(PageHandle { page });
         }
 
@@ -106,14 +102,11 @@ impl PageCache {
                 dirty: false,
                 pin_count: 1,
                 last_access: ts,
+                indexed_access: ts,
             }),
         });
         state.pages.insert(page_id, Arc::clone(&page));
-        state
-            .lru_index
-            .entry(ts)
-            .or_insert_with(Vec::new)
-            .push(page_id);
+        state.lru_index.entry(ts).or_default().push(page_id);
         Ok(PageHandle { page })
     }
 
@@ -128,7 +121,7 @@ impl PageCache {
             .write()
             .map_err(|_| DbError::internal("page cache lock poisoned"))?;
         if let Some(page) = state.pages.get(&page_id) {
-            let last_access = page.inner.lock().map(|inner| inner.last_access).ok();
+            let last_access = page.inner.lock().map(|inner| inner.indexed_access).ok();
             if let Some(ts) = last_access {
                 Self::remove_from_lru_index(&mut state, page_id, ts);
             }
@@ -167,35 +160,62 @@ impl PageCache {
         };
         drop(state);
 
-        let old_ts;
-        let new_ts;
+        let new_ts = self.access_counter.fetch_add(1, Ordering::Relaxed);
         {
             let mut inner = page
                 .inner
                 .lock()
                 .map_err(|_| DbError::internal("cached page lock poisoned"))?;
-            old_ts = inner.last_access;
-            new_ts = self.access_counter.fetch_add(1, Ordering::Relaxed);
             inner.pin_count += 1;
             inner.last_access = new_ts;
         }
 
-        if new_ts != old_ts {
-            let mut state = self
-                .state
-                .write()
-                .map_err(|_| DbError::internal("page cache lock poisoned"))?;
-            if state.pages.contains_key(&page_id) {
-                Self::remove_from_lru_index(&mut state, page_id, old_ts);
-                state
-                    .lru_index
-                    .entry(new_ts)
-                    .or_insert_with(Vec::new)
-                    .push(page_id);
+        // Lazily refresh LRU index without blocking on write lock.
+        let _ = self.try_refresh_lru_index(page_id);
+
+        Ok(Some(PageHandle { page }))
+    }
+
+    fn try_refresh_lru_index(&self, page_id: PageId) -> Result<()> {
+        let mut state = match self.state.try_write() {
+            Ok(guard) => guard,
+            Err(TryLockError::WouldBlock) => return Ok(()),
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(DbError::internal("page cache lock poisoned"));
+            }
+        };
+
+        let (last_access, indexed_access) = {
+            let Some(page) = state.pages.get(&page_id) else {
+                return Ok(());
+            };
+            let inner = page
+                .inner
+                .lock()
+                .map_err(|_| DbError::internal("cached page lock poisoned"))?;
+            (inner.last_access, inner.indexed_access)
+        };
+
+        if indexed_access != last_access {
+            Self::remove_from_lru_index(&mut state, page_id, indexed_access);
+            state
+                .lru_index
+                .entry(last_access)
+                .or_default()
+                .push(page_id);
+            {
+                let Some(page) = state.pages.get(&page_id) else {
+                    return Ok(());
+                };
+                let mut inner = page
+                    .inner
+                    .lock()
+                    .map_err(|_| DbError::internal("cached page lock poisoned"))?;
+                inner.indexed_access = last_access;
             }
         }
 
-        Ok(Some(PageHandle { page }))
+        Ok(())
     }
 
     fn insert_page(&self, page_id: PageId, data: Vec<u8>, dirty: bool) -> Result<()> {
@@ -216,18 +236,15 @@ impl PageCache {
                 .inner
                 .lock()
                 .map_err(|_| DbError::internal("cached page lock poisoned"))?;
-            let old_ts = inner.last_access;
+            let old_ts = inner.indexed_access;
             let ts = self.access_counter.fetch_add(1, Ordering::Relaxed);
             inner.data = Arc::from(data);
             inner.dirty = dirty;
             inner.last_access = ts;
+            inner.indexed_access = ts;
             if ts != old_ts {
                 Self::remove_from_lru_index(&mut state, page_id, old_ts);
-                state
-                    .lru_index
-                    .entry(ts)
-                    .or_insert_with(Vec::new)
-                    .push(page_id);
+                state.lru_index.entry(ts).or_default().push(page_id);
             }
             return Ok(());
         }
@@ -242,14 +259,11 @@ impl PageCache {
                     dirty,
                     pin_count: 0,
                     last_access: ts,
+                    indexed_access: ts,
                 }),
             }),
         );
-        state
-            .lru_index
-            .entry(ts)
-            .or_insert_with(Vec::new)
-            .push(page_id);
+        state.lru_index.entry(ts).or_default().push(page_id);
         Ok(())
     }
 
@@ -258,39 +272,45 @@ impl PageCache {
             return Ok(());
         }
 
-        let victim = state
-            .lru_index
-            .iter()
-            .flat_map(|(_, bucket)| bucket.iter())
-            .find_map(|page_id| {
-                let page = state.pages.get(page_id)?;
-                let inner = page.inner.lock().ok()?;
-                if inner.pin_count == 0 {
-                    Some(*page_id)
-                } else {
-                    None
+        loop {
+            let candidate = state
+                .lru_index
+                .iter()
+                .flat_map(|(_, bucket)| bucket.iter())
+                .find_map(|page_id| {
+                    let page = state.pages.get(page_id)?;
+                    let inner = page.inner.lock().ok()?;
+                    if inner.pin_count == 0 {
+                        Some((*page_id, inner.indexed_access, inner.last_access))
+                    } else {
+                        None
+                    }
+                });
+
+            let Some((victim, bucket_ts, last_access)) = candidate else {
+                return Err(DbError::transaction(
+                    "page cache is full and every cached page is pinned",
+                ));
+            };
+
+            // Lazy repair staleness before evicting.
+            if last_access != bucket_ts {
+                Self::remove_from_lru_index(state, victim, bucket_ts);
+                if state.pages.contains_key(&victim) {
+                    state.lru_index.entry(last_access).or_default().push(victim);
+                    if let Some(page) = state.pages.get(&victim) {
+                        if let Ok(mut inner) = page.inner.lock() {
+                            inner.indexed_access = last_access;
+                        }
+                    }
                 }
-            });
-
-        let Some(victim) = victim else {
-            return Err(DbError::transaction(
-                "page cache is full and every cached page is pinned",
-            ));
-        };
-
-        state.pages.remove(&victim);
-        // Find the timestamp bucket for the victim and remove it.
-        let remove_ts = state.lru_index.iter().find_map(|(ts, bucket)| {
-            if bucket.contains(&victim) {
-                Some(*ts)
-            } else {
-                None
+                continue;
             }
-        });
-        if let Some(ts) = remove_ts {
-            Self::remove_from_lru_index(state, victim, ts);
+
+            state.pages.remove(&victim);
+            Self::remove_from_lru_index(state, victim, bucket_ts);
+            return Ok(());
         }
-        Ok(())
     }
 }
 
@@ -523,5 +543,82 @@ mod tests {
             assert_eq!(handle.read().expect("read").to_vec(), vec![i as u8; 4]);
         }
         drop(pinned);
+    }
+
+    #[test]
+    fn cache_hit_does_not_wait_for_lru_write_lock() {
+        let cache = PageCache::new(2, 4);
+        drop(
+            cache
+                .pin_or_load(1, || Ok(vec![1, 1, 1, 1]))
+                .expect("load page"),
+        );
+
+        // Hold a read() guard in the test.
+        let _guard = cache.state.read().expect("cache state read");
+
+        // Cache hit should still succeed without blocking.
+        let handle = cache
+            .pin_or_load(1, || panic!("loader should not be called for cache hit"))
+            .expect("pin existing page while read guard held");
+        assert_eq!(handle.read().expect("read page").to_vec(), vec![1, 1, 1, 1]);
+        drop(handle);
+    }
+
+    #[test]
+    fn lazy_lru_repair_preserves_recently_touched_page() {
+        let cache = PageCache::new(2, 4);
+        // Load pages 1 and 2, then drop handles.
+        drop(
+            cache
+                .pin_or_load(1, || Ok(vec![1, 1, 1, 1]))
+                .expect("load page1"),
+        );
+        drop(
+            cache
+                .pin_or_load(2, || Ok(vec![2, 2, 2, 2]))
+                .expect("load page2"),
+        );
+
+        // Repeatedly hit page 1 while holding a write lock so
+        // try_refresh_lru_index cannot take the write lock.
+        for _ in 0..10 {
+            let h = cache
+                .pin_or_load(1, || panic!("page1 should be cached"))
+                .expect("hit page1");
+            // Hold write lock briefly.
+            {
+                let _guard = cache.state.write().expect("cache state write");
+            }
+            drop(h);
+        }
+
+        // Insert page 3, forcing eviction.
+        drop(
+            cache
+                .pin_or_load(3, || Ok(vec![3, 3, 3, 3]))
+                .expect("load page3"),
+        );
+
+        // Page 2 should be evicted, not page 1 (which was touched recently).
+        let page1_loads = Cell::new(0);
+        let page1 = cache
+            .pin_or_load(1, || {
+                page1_loads.set(page1_loads.get() + 1);
+                Ok(vec![1, 1, 1, 1])
+            })
+            .expect("page1 should still be cached");
+        assert_eq!(page1.read().expect("read").to_vec(), vec![1, 1, 1, 1]);
+        assert_eq!(page1_loads.get(), 0, "page1 should not have been evicted");
+
+        let page2_loads = Cell::new(0);
+        let page2 = cache
+            .pin_or_load(2, || {
+                page2_loads.set(page2_loads.get() + 1);
+                Ok(vec![2, 2, 2, 2])
+            })
+            .expect("reload evicted page2");
+        assert_eq!(page2.read().expect("read").to_vec(), vec![2, 2, 2, 2]);
+        assert_eq!(page2_loads.get(), 1, "page2 should have been evicted");
     }
 }

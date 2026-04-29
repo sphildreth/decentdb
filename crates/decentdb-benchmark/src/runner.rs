@@ -176,6 +176,7 @@ where
         started_unix_ms,
         finished_unix_ms,
         &scenario_results,
+        capture_environment()?,
     );
     if !args.dry_run {
         let scenario_values = scenario_results
@@ -235,6 +236,7 @@ fn build_summary(
     started_unix_ms: u128,
     finished_unix_ms: u128,
     scenario_results: &[(ScenarioResult, PathBuf)],
+    environment: EnvironmentCapture,
 ) -> RunSummary {
     let mut passed = 0_usize;
     let mut failed = 0_usize;
@@ -287,6 +289,7 @@ fn build_summary(
         scenarios: summary_rows,
         warnings,
         target_assessment: None,
+        environment: Some(environment),
     }
 }
 
@@ -556,14 +559,19 @@ fn capture_environment() -> Result<EnvironmentCapture> {
         .with_context(|| "resolve current directory".to_string())?
         .display()
         .to_string();
+    let git_status = command_output("git", &["status", "--short"]);
+    let git_dirty = git_status.as_ref().map(|status| !status.trim().is_empty());
     Ok(EnvironmentCapture {
         benchmark_crate_version: env!("CARGO_PKG_VERSION").to_string(),
         build_profile: build_profile().to_string(),
         rustc_version: command_output("rustc", &["--version"]),
+        cargo_version: command_output("cargo", &["--version"]),
         os: env::consts::OS.to_string(),
         arch: env::consts::ARCH.to_string(),
         git_sha: command_output("git", &["rev-parse", "--short", "HEAD"]),
         git_branch: command_output("git", &["rev-parse", "--abbrev-ref", "HEAD"]),
+        git_dirty,
+        git_status_short: git_status,
         hostname: env::var("HOSTNAME")
             .ok()
             .or_else(|| env::var("COMPUTERNAME").ok()),

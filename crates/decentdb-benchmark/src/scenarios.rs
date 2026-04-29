@@ -3,7 +3,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -1999,7 +1999,7 @@ fn read_under_write(profile: &ResolvedProfile, scenario_scratch: &Path) -> Resul
         metrics,
         warnings: Vec::new(),
         notes: vec![
-            "One writer thread and multiple reader threads run against the same database path using direct Rust API calls."
+            "One writer thread and multiple reader threads run against one shared Db handle; access is serialized until VFS-level file locking makes independent opens safe."
                 .to_string(),
             "reader_degradation_ratio = reader_p95_under_write_us / reader_p95_isolation_us"
                 .to_string(),
@@ -2406,6 +2406,7 @@ fn memory_footprint(profile: &ResolvedProfile, scenario_scratch: &Path) -> Resul
         Some(after_reopen_sum / u64::from(after_reopen_count))
     };
 
+    let peak_rss_mb = rss_peak_avg.map(|b| b as f64 / (1024.0 * 1024.0));
     let mut metrics = BTreeMap::new();
     metrics.insert(
         "rss_steady_bytes".to_string(),
@@ -2414,6 +2415,10 @@ fn memory_footprint(profile: &ResolvedProfile, scenario_scratch: &Path) -> Resul
     metrics.insert(
         "rss_peak_bytes".to_string(),
         rss_peak_avg.map_or(serde_json::Value::Null, |value| json!(value)),
+    );
+    metrics.insert(
+        "peak_rss_mb".to_string(),
+        peak_rss_mb.map_or(serde_json::Value::Null, |v| json!(v)),
     );
     metrics.insert(
         "rss_after_reopen_bytes".to_string(),
@@ -2526,8 +2531,8 @@ fn run_reader_only_workload(
 }
 
 fn run_writer_only_workload(db_path: &Path, profile: &ResolvedProfile, trial: u32) -> Result<f64> {
-    run_writer_thread(
-        db_path.to_path_buf(),
+    run_writer_on_db_path(
+        db_path,
         profile.rows,
         profile.writer_ops,
         profile.seed,
@@ -2540,36 +2545,61 @@ fn run_mixed_workload(
     profile: &ResolvedProfile,
     trial: u32,
 ) -> Result<(LatencyCollector, f64)> {
+    let db = Arc::new(Mutex::new(
+        Db::open_or_create(db_path, real_fs_default_config(path_parent(db_path)?)).with_context(
+            || format!("open read_under_write mixed database {}", db_path.display()),
+        )?,
+    ));
+
     let thread_count = profile.reader_threads.max(1);
     let barrier = Arc::new(Barrier::new((thread_count + 1) as usize));
 
-    let writer_path = db_path.to_path_buf();
+    let writer_db = Arc::clone(&db);
     let writer_barrier = Arc::clone(&barrier);
     let writer_ops = profile.writer_ops;
     let writer_rows = profile.rows;
     let writer_seed = profile.seed;
     let writer_handle = thread::spawn(move || {
+        let update = {
+            let db = writer_db
+                .lock()
+                .map_err(|_| anyhow!("read_under_write shared Db mutex poisoned"))?;
+            db.prepare("UPDATE bench_read_under_write SET payload = 'rw' WHERE id = $1")?
+        };
         writer_barrier.wait();
-        run_writer_thread(writer_path, writer_rows, writer_ops, writer_seed, trial)
+        let started = Instant::now();
+        for op in 0..writer_ops {
+            let key = deterministic_id(writer_seed.rotate_left(17), op, writer_rows, trial);
+            let db = writer_db
+                .lock()
+                .map_err(|_| anyhow!("read_under_write shared Db mutex poisoned"))?;
+            let mut txn = db.transaction()?;
+            update.execute_in(&mut txn, &[Value::Int64(to_i64(key)?)])?;
+            txn.commit()?;
+        }
+        let elapsed_secs = started.elapsed().as_secs_f64();
+        if elapsed_secs == 0.0 {
+            Ok::<f64, anyhow::Error>(0.0)
+        } else {
+            Ok::<f64, anyhow::Error>(writer_ops as f64 / elapsed_secs)
+        }
     });
 
     let mut reader_handles = Vec::with_capacity(thread_count as usize);
     for thread_index in 0..thread_count {
-        let db_path = db_path.to_path_buf();
+        let reader_db = Arc::clone(&db);
         let reader_barrier = Arc::clone(&barrier);
         let seed = profile.seed;
         let rows = profile.rows;
         let (start_op, op_count) = split_ops(profile.point_reads, thread_count, thread_index);
         let trial_local = trial;
         reader_handles.push(thread::spawn(move || {
-            let db = Db::open(&db_path, real_fs_default_config(path_parent(&db_path)?))
-                .with_context(|| {
-                    format!(
-                        "open read_under_write reader database {}",
-                        db_path.display()
-                    )
-                })?;
-            let select = db.prepare("SELECT payload FROM bench_read_under_write WHERE id = $1")?;
+            let select = {
+                let db = reader_db
+                    .lock()
+                    .map_err(|_| anyhow!("read_under_write shared Db mutex poisoned"))?;
+                db.prepare("SELECT payload FROM bench_read_under_write WHERE id = $1")?
+            };
             let mut collector = LatencyCollector::new()?;
             reader_barrier.wait();
             for op in 0..op_count {
@@ -2580,7 +2610,12 @@ fn run_mixed_workload(
                     trial_local,
                 );
                 let started = Instant::now();
-                let result = select.execute(&[Value::Int64(to_i64(key)?)])?;
+                let result = {
+                    let _db = reader_db
+                        .lock()
+                        .map_err(|_| anyhow!("read_under_write shared Db mutex poisoned"))?;
+                    select.execute(&[Value::Int64(to_i64(key)?)])?
+                };
                 collector.record(started.elapsed())?;
                 let row_count = result.rows().len();
                 if row_count != 1 {
@@ -2648,25 +2683,8 @@ fn run_reader_thread(
     Ok(collector)
 }
 
-fn run_writer_thread(
-    db_path: PathBuf,
-    rows: u64,
-    writer_ops: u64,
-    seed: u64,
-    trial: u32,
-) -> Result<f64> {
-    let db = Db::open_or_create(
-        &db_path,
-        real_fs_full_durability_config(path_parent(&db_path)?),
-    )
-    .with_context(|| {
-        format!(
-            "open read_under_write writer database {}",
-            db_path.display()
-        )
-    })?;
+fn run_writer_on_db(db: &Db, rows: u64, writer_ops: u64, seed: u64, trial: u32) -> Result<f64> {
     let update = db.prepare("UPDATE bench_read_under_write SET payload = 'rw' WHERE id = $1")?;
-
     let started = Instant::now();
     for op in 0..writer_ops {
         let key = deterministic_id(seed.rotate_left(17), op, rows, trial);
@@ -2681,6 +2699,26 @@ fn run_writer_thread(
     } else {
         Ok(writer_ops as f64 / elapsed_secs)
     }
+}
+
+fn run_writer_on_db_path(
+    db_path: &Path,
+    rows: u64,
+    writer_ops: u64,
+    seed: u64,
+    trial: u32,
+) -> Result<f64> {
+    let db = Db::open_or_create(
+        db_path,
+        real_fs_full_durability_config(path_parent(db_path)?),
+    )
+    .with_context(|| {
+        format!(
+            "open read_under_write writer database {}",
+            db_path.display()
+        )
+    })?;
+    run_writer_on_db(&db, rows, writer_ops, seed, trial)
 }
 
 #[derive(Debug, Serialize, Deserialize)]

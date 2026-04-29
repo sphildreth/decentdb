@@ -1,9 +1,27 @@
-//! Benchmark-only instrumentation helpers.
-//!
-//! This surface is intentionally gated behind the `bench-internals` feature.
-
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Number of write_txn lock acquisitions on the read path.
+pub static READ_PATH_WRITE_TXN_LOCK_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Number of read_page_at_snapshot_lsn calls that checked read_path_write_txn_lock.
+pub static READ_PATH_WAL_READER_BEGIN_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Returns the current values of the read-path counters and resets them to zero.
+#[cfg(feature = "bench-internals")]
+#[must_use]
+pub fn take_read_path_counters() -> (u64, u64) {
+    let write_txn_lock_count = READ_PATH_WRITE_TXN_LOCK_COUNT.swap(0, Ordering::SeqCst);
+    let wal_reader_begin_count = READ_PATH_WAL_READER_BEGIN_COUNT.swap(0, Ordering::SeqCst);
+    (write_txn_lock_count, wal_reader_begin_count)
+}
+
+/// Resets all read-path counters to zero.
+#[cfg(feature = "bench-internals")]
+pub fn reset_read_path_counters() {
+    READ_PATH_WRITE_TXN_LOCK_COUNT.store(0, Ordering::SeqCst);
+    READ_PATH_WAL_READER_BEGIN_COUNT.store(0, Ordering::SeqCst);
+}
 use crate::btree::page::{decode_page, BtreePage, LeafCell, LeafPage};
 use crate::btree::write::Btree;
 use crate::error::{DbError, Result};
