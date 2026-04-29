@@ -207,7 +207,6 @@ does not move the memory needle.
 
 ## References
 
-- `design/2026-04-25.ENGINE-MEMORY-WORK.md`
 - `design/adr/0123-phase1-table-btree-foundation.md`
 - `design/adr/0131-legacy-format-migrations.md`
 - `design/adr/0143-on-disk-row-scan-executor.md`

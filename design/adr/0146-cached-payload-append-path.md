@@ -123,5 +123,4 @@ problem for large tables.
 
 - `crates/decentdb/src/exec/mod.rs` — `persist_to_db`, append path
 - `crates/decentdb/src/record/overflow.rs` — `append_uncompressed_with_first_page_patch`, `rewrite_overflow_cached`
-- `design/2026-04-25.ENGINE-MEMORY-WORK.md` — memory work context
 - ADR 0145 — Paged Table Row Source (related but not required for this fix)

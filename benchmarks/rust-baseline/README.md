@@ -108,5 +108,4 @@ fact that RSS climbs sharply *during query evaluation* and stays elevated
 suggests intermediate result buffers (group-by hash tables, sort buffers)
 are not being released until the `Db` is dropped. This is engine-side
 behavior visible to every binding, and is a candidate for an engine
-backlog item alongside the existing `COUNT(*)` cold-start latency note in
-`design/2026-04-22-NET-REVIEW-FINDINGS-PLAN.md` §6.
+backlog item alongside the existing `COUNT(*)` cold-start latency work.

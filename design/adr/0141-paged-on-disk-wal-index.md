@@ -55,7 +55,6 @@ A paged on-disk index would:
 
 ### References
 
-- design/2026-04-25.ENGINE-MEMORY-WORK.md (Phase 4)
 - design/adr/0019-wal-retention-for-active-readers.md
 - design/adr/0033-wal-frame-format.md
 - design/adr/0056-wal-index-pruning-on-checkpoint.md

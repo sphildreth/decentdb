@@ -10,10 +10,9 @@ Arc<TableData>>` with an iterator-based row-source that streams rows from
 on-disk pages through the page cache, so resident memory tracks
 `cache_size_mb` and the executor's working set, not total row count.
 
-### Background — how E1 was diagnosed
+### Background — open-path RSS diagnosis
 
-The Engine Memory Plan ([`design/2026-04-25.ENGINE-MEMORY-WORK.md`](../2026-04-25.ENGINE-MEMORY-WORK.md))
-slice E1 set out to explain why a re-opened 36 MB DB consumed **1 144 MB
+The open-path RSS investigation set out to explain why a re-opened 36 MB DB consumed **1 144 MB
 RSS** before any user query ran. After landing Phase 1 (auto-checkpoint
 trigger, post-checkpoint `malloc_trim`, mimalloc opt-in, pooled checkpoint
 scratch) the WAL retention was confirmed bounded (`wal_versions = 0`) yet
@@ -155,7 +154,6 @@ without breaking SQL semantics.
 
 ### References
 
-- design/2026-04-25.ENGINE-MEMORY-WORK.md (E1 — Open-path RSS investigation)
 - design/adr/0136-chunked-row-storage-for-coarse-grained-cow.md
 - design/adr/0140-walversion-discriminated-payload.md
 - design/adr/0141-paged-on-disk-wal-index.md

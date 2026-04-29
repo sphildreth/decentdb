@@ -34,7 +34,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 
-- New design note: `design/2026-04-25.ENGINE-MEMORY-WORK.md` (consolidated engine memory roadmap for the remaining Phase D executor promotion, mutation end-state, Phase E cleanup, and final validation).
 - New ADRs: 0058 (background incremental checkpoint worker), 0138 (Linux heap-release on checkpoint), 0141 (paged on-disk WAL index), 0142 (per-engine allocator), 0143 (on-disk row-scan executor, phased plan).
 
 ## [2.3.0] - 2026-04-20

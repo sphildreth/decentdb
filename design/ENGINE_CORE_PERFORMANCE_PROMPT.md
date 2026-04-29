@@ -72,7 +72,6 @@ Read these before coding:
 - `design/RUST_BENCHMARK_PLAN.md`
 - `design/BENCHMARKING_GUIDE.md`
 - `benchmarks/targets.toml`
-- `design/2026-04-25.ENGINE-MEMORY-WORK.md`
 - `design/adr/0138-post-checkpoint-heap-release.md`
 - `design/adr/0141-paged-on-disk-wal-index.md`
 - `design/adr/0144-persistent-primary-key-index.md`

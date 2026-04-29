@@ -37,9 +37,7 @@ benefit from a low-fragmentation allocator on the database's hot path
 *regardless of host policy*, which is the only fix that scales across all
 embedding scenarios.
 
-The diagnostic probe in
-[`design/2026-04-25.ENGINE-MEMORY-WORK.md`](../2026-04-25.ENGINE-MEMORY-WORK.md)
-shows that the dominant cost is small-allocation churn on per-commit
+Memory profiling showed that the dominant cost is small-allocation churn on per-commit
 buffers and WAL index entries. Routing those through an engine-owned
 allocator with arena recycling would eliminate the churn at the source,
 not just mitigate its OS-visible effects.
@@ -81,7 +79,6 @@ not just mitigate its OS-visible effects.
 
 ### References
 
-- design/2026-04-25.ENGINE-MEMORY-WORK.md (Phase 4)
 - design/adr/0011-memory-management-strategy.md
 - design/adr/0025-memory-leak-prevention-strategy.md
 - design/adr/0138-post-checkpoint-heap-release.md

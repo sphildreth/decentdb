@@ -65,7 +65,7 @@ pub struct DbConfig {
     ///
     /// Default: `4096` (≈ 16 MB at the default 4 KB page size).
     ///
-    /// See `design/2026-04-25.ENGINE-MEMORY-WORK.md` §6 Appendix (slice M1).
+    /// See ADR 0137 — Size-Based Auto-Checkpoint Trigger.
     pub wal_checkpoint_threshold_pages: u32,
 
     /// Trigger an automatic checkpoint when the WAL has grown by at least
@@ -76,7 +76,7 @@ pub struct DbConfig {
     ///
     /// Default: `64 * 1024 * 1024` (64 MB).
     ///
-    /// See `design/2026-04-25.ENGINE-MEMORY-WORK.md` §6 Appendix (slice M1).
+    /// See ADR 0137 — Size-Based Auto-Checkpoint Trigger.
     pub wal_checkpoint_threshold_bytes: u64,
 
     /// On Linux/glibc, call `malloc_trim(0)` after a successful checkpoint
@@ -88,7 +88,7 @@ pub struct DbConfig {
     /// observed RSS growth (allocator fragmentation amplifying transient
     /// per-commit allocations).
     ///
-    /// See `design/2026-04-25.ENGINE-MEMORY-WORK.md` §6 Appendix (slice M2).
+    /// See ADR 0138 — Post-Checkpoint Heap Release.
     pub release_freed_memory_after_checkpoint: bool,
 
     /// Run auto-checkpoints on a dedicated background thread instead of
