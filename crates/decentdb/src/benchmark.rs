@@ -1,5 +1,22 @@
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+use crate::btree::page::{decode_page, BtreePage, LeafCell, LeafPage};
+use crate::btree::write::Btree;
+use crate::config::{DbConfig, WalSyncMode};
+use crate::error::{DbError, Result};
+use crate::record::key::encode_index_key as encode_index_key_internal;
+use crate::record::row::Row;
+use crate::search::trigram::unique_tokens as unique_trigram_tokens;
+use crate::storage::checksum;
+use crate::storage::page::{InMemoryPageStore, CATALOG_ROOT_PAGE_ID, DEFAULT_PAGE_SIZE};
+use crate::storage::{write_database_bootstrap_vfs, DatabaseHeader, PagerHandle};
+use crate::vfs::{stats, FileKind, OpenMode, VfsHandle};
+use crate::wal::format::{FrameType, WalFrame, FRAME_HEADER_SIZE, FRAME_TRAILER_SIZE};
+use crate::wal::WalHandle;
+use crate::Value;
 
 /// Number of write_txn lock acquisitions on the read path.
 pub static READ_PATH_WRITE_TXN_LOCK_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -10,11 +27,27 @@ pub static READ_PATH_HELD_SNAPSHOTS_LOCK_COUNT: AtomicU64 = AtomicU64::new(0);
 /// Number of WAL reader snapshots opened on the read path.
 pub static READ_PATH_WAL_READER_BEGIN_COUNT: AtomicU64 = AtomicU64::new(0);
 
+/// Number of delta-backed WAL page materializations.
+pub static WAL_DELTA_MATERIALIZE_CALLS: AtomicU64 = AtomicU64::new(0);
+
+/// Number of delta materializations that reused existing scratch capacity.
+pub static WAL_DELTA_SCRATCH_REUSES: AtomicU64 = AtomicU64::new(0);
+
+/// Number of delta materializations that had to grow scratch capacity.
+pub static WAL_DELTA_SCRATCH_GROWS: AtomicU64 = AtomicU64::new(0);
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ReadPathCounters {
     pub write_txn_lock_count: u64,
     pub held_snapshots_lock_count: u64,
     pub wal_reader_begin_count: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WalDeltaMaterializeCounters {
+    pub calls: u64,
+    pub scratch_reuses: u64,
+    pub scratch_grows: u64,
 }
 
 /// Returns the current values of the read-path counters and resets them to zero.
@@ -31,6 +64,20 @@ pub fn take_read_path_counters() -> ReadPathCounters {
     }
 }
 
+/// Returns the current WAL delta materialization counters and resets them to zero.
+#[cfg(feature = "bench-internals")]
+#[must_use]
+pub fn take_wal_delta_materialize_counters() -> WalDeltaMaterializeCounters {
+    let calls = WAL_DELTA_MATERIALIZE_CALLS.swap(0, Ordering::SeqCst);
+    let scratch_reuses = WAL_DELTA_SCRATCH_REUSES.swap(0, Ordering::SeqCst);
+    let scratch_grows = WAL_DELTA_SCRATCH_GROWS.swap(0, Ordering::SeqCst);
+    WalDeltaMaterializeCounters {
+        calls,
+        scratch_reuses,
+        scratch_grows,
+    }
+}
+
 /// Resets all read-path counters to zero.
 #[cfg(feature = "bench-internals")]
 pub fn reset_read_path_counters() {
@@ -38,18 +85,14 @@ pub fn reset_read_path_counters() {
     READ_PATH_HELD_SNAPSHOTS_LOCK_COUNT.store(0, Ordering::SeqCst);
     READ_PATH_WAL_READER_BEGIN_COUNT.store(0, Ordering::SeqCst);
 }
-use crate::btree::page::{decode_page, BtreePage, LeafCell, LeafPage};
-use crate::btree::write::Btree;
-use crate::error::{DbError, Result};
-use crate::record::key::encode_index_key as encode_index_key_internal;
-use crate::record::row::Row;
-use crate::search::trigram::unique_tokens as unique_trigram_tokens;
-use crate::storage::checksum;
-use crate::storage::page::{InMemoryPageStore, DEFAULT_PAGE_SIZE};
-use crate::vfs::stats;
-use crate::wal::format::{FrameType, WalFrame, FRAME_HEADER_SIZE, FRAME_TRAILER_SIZE};
-use crate::Value;
 
+/// Resets all WAL delta materialization counters to zero.
+#[cfg(feature = "bench-internals")]
+pub fn reset_wal_delta_materialize_counters() {
+    WAL_DELTA_MATERIALIZE_CALLS.store(0, Ordering::SeqCst);
+    WAL_DELTA_SCRATCH_REUSES.store(0, Ordering::SeqCst);
+    WAL_DELTA_SCRATCH_GROWS.store(0, Ordering::SeqCst);
+}
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct VfsFileStats {
     pub open_calls: u64,
@@ -247,6 +290,62 @@ impl BtreeFixture {
             advanced += 1;
         }
         Ok(advanced)
+    }
+}
+
+#[derive(Debug)]
+pub struct WalDeltaMaterializeFixture {
+    wal: WalHandle,
+    pager: PagerHandle,
+    page_id: u32,
+    snapshot_lsn: u64,
+    expected: Vec<u8>,
+}
+
+impl WalDeltaMaterializeFixture {
+    /// Builds an in-memory WAL with a single delta-backed page version.
+    pub fn new() -> Result<Self> {
+        let db_path = Path::new(":memory:");
+        let vfs = VfsHandle::for_path(db_path);
+        let file = vfs.open(db_path, OpenMode::OpenOrCreate, FileKind::Database)?;
+        let header = DatabaseHeader::new(DEFAULT_PAGE_SIZE);
+        write_database_bootstrap_vfs(file.as_ref(), &header)?;
+        let pager = PagerHandle::open(Arc::clone(&file), header, 1)?;
+
+        let cfg = DbConfig {
+            wal_sync_mode: WalSyncMode::TestingOnlyUnsafeNoSync,
+            wal_checkpoint_threshold_pages: 0,
+            wal_checkpoint_threshold_bytes: 0,
+            wal_resident_versions_per_page: 0,
+            ..DbConfig::default()
+        };
+        let wal = WalHandle::acquire(&vfs, db_path, &cfg, &pager)?;
+        let page_id = CATALOG_ROOT_PAGE_ID + 1;
+
+        let base = vec![0xA1; DEFAULT_PAGE_SIZE as usize];
+        pager.write_page_direct(page_id, &base)?;
+        let mut expected = base;
+        expected[128..136].copy_from_slice(b"scratch!");
+        let snapshot_lsn = wal.commit_pages(&pager, vec![(page_id, expected.clone())], page_id)?;
+
+        Ok(Self {
+            wal,
+            pager,
+            page_id,
+            snapshot_lsn,
+            expected,
+        })
+    }
+
+    pub fn materialize(&self) -> Result<Arc<[u8]>> {
+        self.wal
+            .read_page_at_snapshot(&self.pager, self.page_id, self.snapshot_lsn)?
+            .ok_or_else(|| DbError::corruption("benchmark WAL delta page vanished"))
+    }
+
+    #[must_use]
+    pub fn expected(&self) -> &[u8] {
+        &self.expected
     }
 }
 
@@ -455,7 +554,7 @@ mod tests {
         append_wal_page_frame, benchmark_leaf_cells, copy_page_bytes, crc32c_parts,
         decode_leaf_page_cell_count, decode_row, decode_wal_frame_payload_len, default_page_size,
         encode_index_key, encode_leaf_page, encode_row, encode_wal_frame_page,
-        intersect_sorted_postings, trigram_tokens, BtreeFixture,
+        intersect_sorted_postings, trigram_tokens, BtreeFixture, WalDeltaMaterializeFixture,
     };
     use crate::Value;
 
@@ -526,6 +625,13 @@ mod tests {
         let encoded = encode_wal_frame_page(13, &payload, page_size).expect("encode");
         let decoded_len = decode_wal_frame_payload_len(&encoded, page_size).expect("decode");
         assert_eq!(decoded_len, payload.len());
+    }
+
+    #[test]
+    fn wal_delta_materialize_fixture_replays_expected_page() {
+        let fixture = WalDeltaMaterializeFixture::new().expect("fixture");
+        let page = fixture.materialize().expect("materialize");
+        assert_eq!(page.as_ref(), fixture.expected());
     }
 
     #[test]

@@ -27,6 +27,11 @@ use crate::storage::PagerHandle;
 use crate::vfs::VfsFile;
 use crate::vfs::VfsHandle;
 
+#[cfg(feature = "bench-internals")]
+use crate::benchmark::{
+    WAL_DELTA_MATERIALIZE_CALLS, WAL_DELTA_SCRATCH_GROWS, WAL_DELTA_SCRATCH_REUSES,
+};
+
 use self::async_commit::AsyncCommitState;
 use self::background::BgCheckpointer;
 use self::delta::apply_page_delta_in_place;
@@ -79,6 +84,8 @@ pub(crate) struct SharedWalInner {
     /// `WalIndex::latest_versions_at_or_before`. The buffer is held under
     /// the writer lock so this `Mutex` is uncontended in practice.
     pub(crate) checkpoint_scratch: Mutex<Vec<(PageId, index::WalVersion)>>,
+    /// Reusable mutable page image for delta-frame materialization.
+    pub(crate) materialize_scratch: Mutex<Vec<u8>>,
     /// Optional background checkpoint worker (ADR 0058). Set once during
     /// `shared::build_handle` when the embedder opts in via
     /// `DbConfig::background_checkpoint_worker`. `OnceLock` is used so
@@ -426,20 +433,56 @@ impl WalHandle {
         match encoding {
             FrameEncoding::Page => Ok(Arc::from(frame.payload)),
             FrameEncoding::PageDelta => {
-                let mut base = if let Some(previous) = self.materialize_latest_visible_locked(
+                let base = if let Some(previous) = self.materialize_latest_visible_locked(
                     index,
                     pager,
                     page_id,
                     version_lsn.saturating_sub(1),
                 )? {
-                    previous.to_vec()
+                    previous
                 } else {
-                    pager.read_page(page_id)?.to_vec()
+                    pager.read_page(page_id)?
                 };
-                apply_page_delta_in_place(&mut base, &frame.payload)?;
-                Ok(Arc::from(base))
+                self.materialize_delta_page_with_scratch(base, &frame.payload)
             }
         }
+    }
+
+    fn materialize_delta_page_with_scratch(
+        &self,
+        base: Arc<[u8]>,
+        delta_payload: &[u8],
+    ) -> Result<Arc<[u8]>> {
+        #[cfg(feature = "bench-internals")]
+        WAL_DELTA_MATERIALIZE_CALLS.fetch_add(1, Ordering::Relaxed);
+
+        let page_size = self.inner.page_size as usize;
+        let mut scratch = self
+            .inner
+            .materialize_scratch
+            .lock()
+            .expect("wal materialization scratch lock should not be poisoned");
+        let scratch_capacity = scratch.capacity();
+        if scratch_capacity < page_size {
+            #[cfg(feature = "bench-internals")]
+            WAL_DELTA_SCRATCH_GROWS.fetch_add(1, Ordering::Relaxed);
+
+            scratch.reserve(page_size - scratch_capacity);
+        } else {
+            #[cfg(feature = "bench-internals")]
+            WAL_DELTA_SCRATCH_REUSES.fetch_add(1, Ordering::Relaxed);
+        }
+
+        scratch.clear();
+        scratch.extend_from_slice(base.as_ref());
+        if let Err(err) = apply_page_delta_in_place(&mut scratch, delta_payload) {
+            scratch.clear();
+            return Err(err);
+        }
+
+        let out = Arc::<[u8]>::from(scratch.as_slice());
+        scratch.clear();
+        Ok(out)
     }
 
     pub(crate) fn file_size(&self) -> Result<u64> {
@@ -623,6 +666,55 @@ mod tests {
             .expect("read latest snapshot")
             .expect("page should exist");
         assert_eq!(latest_page.as_ref(), second_payload.as_slice());
+    }
+
+    #[test]
+    fn delta_materialization_reuses_scratch_capacity() {
+        let mem_vfs: Arc<dyn Vfs> = Arc::new(MemVfs::default());
+        let vfs = VfsHandle::from_vfs(Arc::clone(&mem_vfs));
+        let db_path = Path::new(":memory:");
+        let pager = test_pager(&vfs, db_path);
+        let mut cfg = test_config();
+        cfg.wal_resident_versions_per_page = 0;
+        let wal = WalHandle::acquire(&vfs, db_path, &cfg, &pager).expect("acquire wal");
+        let page_id = page::CATALOG_ROOT_PAGE_ID + 1;
+
+        let base = vec![0xA1; page::DEFAULT_PAGE_SIZE as usize];
+        pager
+            .write_page_direct(page_id, &base)
+            .expect("seed base page");
+        let mut updated = base.clone();
+        updated[128..136].copy_from_slice(b"scratch!");
+        let snapshot_lsn = wal
+            .commit_pages(&pager, vec![(page_id, updated.clone())], page_id)
+            .expect("commit delta page");
+
+        let first = wal
+            .read_page_at_snapshot(&pager, page_id, snapshot_lsn)
+            .expect("read first materialized page")
+            .expect("page should exist");
+        let capacity_after_first = wal
+            .inner
+            .materialize_scratch
+            .lock()
+            .expect("materialize scratch lock")
+            .capacity();
+
+        let second = wal
+            .read_page_at_snapshot(&pager, page_id, snapshot_lsn)
+            .expect("read second materialized page")
+            .expect("page should exist");
+        let capacity_after_second = wal
+            .inner
+            .materialize_scratch
+            .lock()
+            .expect("materialize scratch lock")
+            .capacity();
+
+        assert_eq!(first.as_ref(), updated.as_slice());
+        assert_eq!(second.as_ref(), updated.as_slice());
+        assert!(capacity_after_first >= page::DEFAULT_PAGE_SIZE as usize);
+        assert_eq!(capacity_after_second, capacity_after_first);
     }
 
     #[test]

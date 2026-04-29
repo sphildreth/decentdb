@@ -114,6 +114,7 @@ fn build_handle(
         auto_checkpoint: AutoCheckpointConfig::from_db_config(config),
         pages_since_checkpoint: AtomicU32::new(0),
         checkpoint_scratch: Mutex::new(Vec::new()),
+        materialize_scratch: Mutex::new(Vec::with_capacity(config.page_size as usize)),
         bg_checkpointer: std::sync::OnceLock::new(),
     });
 

@@ -4,7 +4,8 @@ use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criteri
 use decentdb::benchmark::{
     append_wal_page_frame, copy_page_bytes, crc32c_parts, decode_row, decode_wal_frame_payload_len,
     default_page_size, encode_index_key, encode_row, encode_wal_frame_page,
-    intersect_sorted_postings, trigram_tokens, BtreeFixture,
+    intersect_sorted_postings, reset_wal_delta_materialize_counters,
+    take_wal_delta_materialize_counters, trigram_tokens, BtreeFixture, WalDeltaMaterializeFixture,
 };
 use decentdb::Value;
 
@@ -45,6 +46,21 @@ fn bench_wal_append_path(c: &mut Criterion) {
             black_box(written);
             black_box(out);
         });
+    });
+    group.finish();
+}
+
+fn bench_wal_delta_materialize(c: &mut Criterion) {
+    let fixture = WalDeltaMaterializeFixture::new().expect("build WAL delta fixture");
+
+    let mut group = c.benchmark_group("wal_delta");
+    group.bench_function("wal_delta_materialize_4k_scratch_reuse", |b| {
+        reset_wal_delta_materialize_counters();
+        b.iter(|| {
+            let page = fixture.materialize().expect("materialize delta page");
+            black_box(page);
+        });
+        black_box(take_wal_delta_materialize_counters());
     });
     group.finish();
 }
@@ -183,6 +199,7 @@ criterion_group!(
     micro_hot_paths,
     bench_wal_frame_encode_decode,
     bench_wal_append_path,
+    bench_wal_delta_materialize,
     bench_checksum_and_copy,
     bench_btree_seek,
     bench_btree_insert_split,
