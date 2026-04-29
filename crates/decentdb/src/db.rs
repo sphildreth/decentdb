@@ -1800,11 +1800,13 @@ impl Db {
                         .read()
                         .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
                     self.validate_prepared_against_runtime(prepared, &runtime)?;
-                    return runtime.execute_read_statement(
+                    let result = runtime.execute_read_statement(
                         statement,
                         params,
                         self.inner.config.page_size,
                     );
+                    drop(runtime);
+                    return self.finalize_row_source_autocommit_statement(statement, result);
                 }
             }
         }
@@ -1822,7 +1824,19 @@ impl Db {
             .read()
             .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
         self.validate_prepared_against_runtime(prepared, &runtime)?;
-        runtime.execute_read_statement(statement, params, self.inner.config.page_size)
+        let result = runtime.execute_read_statement(statement, params, self.inner.config.page_size);
+        drop(runtime);
+        if targeted_ok {
+            self.finalize_row_source_autocommit_statement(statement, result)
+        } else {
+            let redefer_result = self.redefer_all_persisted_paged_tables();
+            match (result, redefer_result) {
+                (Ok(result), Ok(())) => Ok(result),
+                (Err(error), Ok(())) => Err(error),
+                (Ok(_), Err(error)) => Err(error),
+                (Err(error), Err(_)) => Err(error),
+            }
+        }
     }
 
     fn validate_prepared_against_runtime(
@@ -1947,7 +1961,10 @@ impl Db {
                             index.name, index.table_name
                         ));
                     }
-                    if !runtime.indexes.contains_key(&index.name) {
+                    let table_deferred = runtime
+                        .deferred_table_names()
+                        .any(|table_name| identifiers_equal(table_name, &index.table_name));
+                    if !table_deferred && !runtime.indexes.contains_key(&index.name) {
                         errors.push(format!("runtime index {} is missing", index.name));
                     }
                 }
@@ -3123,6 +3140,12 @@ impl Db {
     }
 
     fn engine_snapshot(&self) -> Result<EngineRuntime> {
+        let mut snapshot = self.engine_snapshot_without_index_rebuild()?;
+        snapshot.rebuild_stale_indexes(self.inner.config.page_size)?;
+        Ok(snapshot)
+    }
+
+    fn engine_snapshot_without_index_rebuild(&self) -> Result<EngineRuntime> {
         let runtime = self
             .inner
             .engine
@@ -3130,7 +3153,6 @@ impl Db {
             .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
         let mut snapshot = runtime.clone();
         self.apply_temp_state_to_runtime(&mut snapshot)?;
-        snapshot.rebuild_stale_indexes(self.inner.config.page_size)?;
         Ok(snapshot)
     }
 
@@ -3375,6 +3397,10 @@ impl Db {
                 .replace(state.runtime.catalog.as_ref().clone())?;
         }
         self.sync_temp_state_from_runtime(&state.runtime)?;
+        if self.inner.config.defer_table_materialization && self.inner.config.paged_row_storage {
+            state.runtime.redefer_all_persisted_paged_tables();
+            self.release_freed_heap_after_paged_row_source_drop();
+        }
         self.inner
             .last_runtime_lsn
             .store(committed_lsn, Ordering::Release);
@@ -3427,9 +3453,9 @@ impl Db {
             .write()
             .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
         *guard = runtime;
-        if self.inner.config.paged_row_storage {
+        if self.inner.config.defer_table_materialization && self.inner.config.paged_row_storage {
             guard.redefer_all_persisted_paged_tables();
-            crate::wal::platform::release_freed_heap();
+            self.release_freed_heap_after_paged_row_source_drop();
         }
         self.inner
             .last_runtime_lsn
@@ -3551,7 +3577,7 @@ impl Db {
     }
 
     fn runtime_for_prepare(&self) -> Result<EngineRuntime> {
-        if let Some(runtime) = self.transaction_runtime_snapshot()? {
+        if let Some(runtime) = self.transaction_runtime_snapshot_for_prepare()? {
             return Ok(runtime);
         }
         self.refresh_engine_from_storage()?;
@@ -3561,7 +3587,24 @@ impl Db {
         // startup don't fault every persisted table into memory just to
         // get a `PreparedStatement` handle. Row data is loaded on first
         // execution by the read/write paths.
-        self.engine_snapshot()
+        self.engine_snapshot_without_index_rebuild()
+    }
+
+    fn transaction_runtime_snapshot_for_prepare(&self) -> Result<Option<EngineRuntime>> {
+        if !self.inner.sql_txn_active.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let txn = self
+            .inner
+            .sql_txn
+            .lock()
+            .map_err(|_| DbError::internal("SQL transaction lock poisoned"))?;
+        let state = match &*txn {
+            SqlTxnSlot::Shared(state) => state,
+            SqlTxnSlot::Exclusive => return Err(self.exclusive_sql_txn_error()),
+            SqlTxnSlot::None => return Ok(None),
+        };
+        Ok(Some(state.runtime.clone()))
     }
 
     fn transaction_runtime_snapshot(&self) -> Result<Option<EngineRuntime>> {
@@ -3968,7 +4011,30 @@ impl Db {
             .write()
             .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
         runtime.redefer_persisted_tables(names);
+        drop(runtime);
+        self.release_freed_heap_after_paged_row_source_drop();
         Ok(())
+    }
+
+    fn redefer_all_persisted_paged_tables(&self) -> Result<()> {
+        if !self.inner.config.defer_table_materialization || !self.inner.config.paged_row_storage {
+            return Ok(());
+        }
+        let mut runtime = self
+            .inner
+            .engine
+            .write()
+            .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+        runtime.redefer_all_persisted_paged_tables();
+        drop(runtime);
+        self.release_freed_heap_after_paged_row_source_drop();
+        Ok(())
+    }
+
+    fn release_freed_heap_after_paged_row_source_drop(&self) {
+        if self.inner.config.paged_row_storage {
+            crate::wal::platform::release_freed_heap();
+        }
     }
 
     fn redefer_statement_tables(&self, statement: &SqlStatement) -> Result<()> {
@@ -4072,11 +4138,10 @@ impl Db {
         if rebuild_stale_indexes {
             working.rebuild_stale_indexes(self.inner.config.page_size)?;
         }
-        Ok(Some(working.execute_read_statement(
-            statement,
-            params,
-            self.inner.config.page_size,
-        )?))
+        let result = working.execute_read_statement(statement, params, self.inner.config.page_size);
+        drop(working);
+        self.release_freed_heap_after_paged_row_source_drop();
+        Ok(Some(result?))
     }
 
     fn safe_referenced_base_tables_in_runtime(
@@ -4225,7 +4290,10 @@ impl Db {
             &base_refs,
             snapshot_lsn,
         )?;
-        join_runtime.try_execute_simple_indexed_join_projection_query(query, params)
+        let result = join_runtime.try_execute_simple_indexed_join_projection_query(query, params);
+        drop(join_runtime);
+        self.release_freed_heap_after_paged_row_source_drop();
+        result
     }
 
     fn ensure_runtime_tables_loaded_at_snapshot(
@@ -10262,6 +10330,172 @@ mod tests {
                     .expect("count after bulk load")
             ),
             97
+        );
+    }
+
+    #[test]
+    fn exclusive_transaction_commit_redefers_paged_tables() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir
+            .path()
+            .join("exclusive-transaction-commit-redefers-paged-tables.ddb");
+        let config = DbConfig {
+            paged_row_storage: true,
+            ..DbConfig::default()
+        };
+
+        let db = Db::open_or_create(&path, config).expect("open db");
+        db.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT)")
+            .expect("create docs");
+
+        let mut txn = db.transaction().expect("begin exclusive txn");
+        let insert = txn
+            .prepare("INSERT INTO docs VALUES ($1, $2)")
+            .expect("prepare insert");
+        for i in 0_i64..64_i64 {
+            insert
+                .execute_in(
+                    &mut txn,
+                    &[Value::Int64(i + 1), Value::Text(format!("body-{i}"))],
+                )
+                .expect("insert row");
+        }
+        txn.commit().expect("commit exclusive txn");
+
+        let json_after = db
+            .inspect_storage_state_json()
+            .expect("json after exclusive txn commit");
+        assert!(
+            json_after.contains("\"loaded_table_count\":0"),
+            "expected exclusive transaction commit to redefer paged table, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"deferred_table_count\":1"),
+            "expected exclusive transaction commit to keep paged table deferred, got: {json_after}"
+        );
+        assert_eq!(
+            scalar_i64(
+                &db.execute("SELECT COUNT(*) FROM docs")
+                    .expect("count after exclusive txn commit")
+            ),
+            64
+        );
+
+        let mut duplicate_txn = db.transaction().expect("begin duplicate txn");
+        let duplicate_insert = duplicate_txn
+            .prepare("INSERT INTO docs VALUES ($1, $2)")
+            .expect("prepare duplicate insert");
+        let duplicate = duplicate_insert.execute_in(
+            &mut duplicate_txn,
+            &[Value::Int64(1), Value::Text("duplicate".to_string())],
+        );
+        assert!(
+            duplicate.is_err(),
+            "expected duplicate primary key insert to fail after index eviction"
+        );
+    }
+
+    #[test]
+    fn nontransaction_view_read_redefers_paged_tables() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir
+            .path()
+            .join("nontransaction-view-read-redefers-paged-tables.ddb");
+        let config = DbConfig {
+            paged_row_storage: true,
+            ..DbConfig::default()
+        };
+
+        let db = Db::open_or_create(&path, config).expect("open db");
+        db.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT)")
+            .expect("create docs");
+        db.execute("CREATE VIEW doc_view AS SELECT id, body FROM docs")
+            .expect("create view");
+        let mut txn = db.transaction().expect("begin seed txn");
+        let insert = txn
+            .prepare("INSERT INTO docs VALUES ($1, $2)")
+            .expect("prepare insert");
+        for i in 0_i64..64_i64 {
+            insert
+                .execute_in(
+                    &mut txn,
+                    &[Value::Int64(i + 1), Value::Text(format!("body-{i}"))],
+                )
+                .expect("insert row");
+        }
+        txn.commit().expect("commit seed txn");
+
+        let rows = db
+            .execute("SELECT id, body FROM doc_view LIMIT 4")
+            .expect("query view");
+        assert_eq!(rows.rows().len(), 4);
+
+        let json_after = db
+            .inspect_storage_state_json()
+            .expect("json after view read");
+        assert!(
+            json_after.contains("\"loaded_table_count\":0"),
+            "expected nontransaction view read to redefer paged table, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"deferred_table_count\":1"),
+            "expected nontransaction view read to leave paged table deferred, got: {json_after}"
+        );
+    }
+
+    #[test]
+    fn prepare_after_redefer_with_partial_unique_index_does_not_rebuild_missing_row_source() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir
+            .path()
+            .join("prepare-after-redefer-partial-unique-index.ddb");
+        let config = DbConfig {
+            paged_row_storage: true,
+            ..DbConfig::default()
+        };
+
+        let db = Db::open_or_create(&path, config).expect("open db");
+        db.execute("CREATE TABLE Libraries (id INTEGER PRIMARY KEY, name TEXT NOT NULL, kind INTEGER NOT NULL)")
+            .expect("create libraries");
+        db.execute("CREATE UNIQUE INDEX Libraries_kind_unique ON Libraries (kind) WHERE kind != 3")
+            .expect("create partial unique index");
+
+        db.execute("INSERT INTO Libraries (id, name, kind) VALUES (11, 'Storage One', 3)")
+            .expect("insert excluded row");
+        let json_after_first = db
+            .inspect_storage_state_json()
+            .expect("json after first insert");
+        assert!(
+            json_after_first.contains("\"deferred_table_count\":1"),
+            "expected first insert to redefer paged table, got: {json_after_first}"
+        );
+
+        let prepared = db
+            .prepare("INSERT INTO Libraries (id, name, kind) VALUES (12, 'Storage Two', 3)")
+            .expect("prepare second excluded row after redefer");
+        prepared
+            .execute(&[])
+            .expect("execute second excluded row after redefer");
+        assert_eq!(
+            scalar_i64(
+                &db.execute("SELECT COUNT(*) FROM libraries WHERE kind = 3")
+                    .expect("count excluded rows")
+            ),
+            2
+        );
+
+        let duplicate = db
+            .execute("INSERT INTO Libraries (id, name, kind) VALUES (13, 'Duplicate Covered', 1)");
+        assert!(
+            duplicate.is_ok(),
+            "expected first covered row insert to succeed: {duplicate:?}"
+        );
+        let duplicate = db.execute(
+            "INSERT INTO Libraries (id, name, kind) VALUES (14, 'Duplicate Covered Again', 1)",
+        );
+        assert!(
+            duplicate.is_err(),
+            "expected partial unique index to reject duplicate covered rows"
         );
     }
 

@@ -2611,6 +2611,7 @@ impl EngineRuntime {
                 self.deferred_tables.insert(table_name.clone());
                 self.dirty_tables.remove(&table_name);
                 self.paged_mutations.remove(&table_name);
+                self.mark_indexes_stale_for_table(&table_name);
             }
         }
     }
@@ -2685,7 +2686,12 @@ impl EngineRuntime {
             .indexes
             .iter()
             .filter(|(name, index)| !index.fresh || !self.indexes.contains_key(*name))
-            .filter(|(_, index)| !self.deferred_tables.contains(&index.table_name))
+            .filter(|(_, index)| {
+                !self
+                    .deferred_tables
+                    .iter()
+                    .any(|table_name| identifiers_equal(table_name, &index.table_name))
+            })
             .map(|(name, _)| name.clone())
             .collect::<Vec<_>>();
         for name in names {
@@ -2698,12 +2704,27 @@ impl EngineRuntime {
         if self.visible_table_is_temporary(table_name) {
             return;
         }
+        let index_names = self
+            .catalog
+            .indexes
+            .values()
+            .filter(|index| identifiers_equal(&index.table_name, table_name))
+            .map(|index| index.name.clone())
+            .collect::<Vec<_>>();
+        if index_names.is_empty() {
+            return;
+        }
+
         let mut changed = false;
         for index in self.catalog_mut().indexes.values_mut() {
             if identifiers_equal(&index.table_name, table_name) && index.fresh {
                 index.fresh = false;
                 changed = true;
             }
+        }
+        let indexes = self.indexes_mut();
+        for index_name in index_names {
+            changed |= indexes.remove(&index_name).is_some();
         }
         if changed {
             self.index_state_epoch = self.index_state_epoch.wrapping_add(1);
