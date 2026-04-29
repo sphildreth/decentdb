@@ -22,8 +22,8 @@ Status values:
 
 | Slice | Status | Owner surface | Depends on | Summary | Notes |
 |---|---|---|---|---|---|
-| DR-00 | Pending | Design | none | Confirm scope, constants, output contract, and `--fix` policy | This document is the initial plan |
-| DR-01 | Pending | Rust engine | DR-00 | Add doctor domain model and report serialization | No CLI yet |
+| DR-00 | Done | Design | none | Confirm scope, constants, output contract, and `--fix` policy | This document is the initial plan |
+| DR-01 | Done | Rust engine | DR-00 | Add doctor domain model and report serialization | No CLI yet |
 | DR-02 | Pending | Rust engine | DR-01 | Implement read-only fact collection from existing metadata | Must support partial header-only report |
 | DR-03 | Pending | Rust engine | DR-02 | Implement v1 rule engine and finding catalog | Use exact IDs from this plan |
 | DR-04 | Pending | Rust engine | DR-03 | Add optional index verification integration | Must be opt-in and capped |

@@ -12,6 +12,7 @@ mod c_api;
 mod catalog;
 mod config;
 mod db;
+mod doctor;
 mod error;
 mod exec;
 mod json;
