@@ -445,6 +445,7 @@ class TestConcurrentSchemaOperations:
         
         errors = []
         index_created = threading.Event()
+        reader_ready = threading.Event()
         read_count = [0]
         
         def reader():
@@ -455,6 +456,7 @@ class TestConcurrentSchemaOperations:
                     cur.execute("SELECT * FROM t WHERE id > ?", (250,))
                     cur.fetchall()
                     read_count[0] += 1
+                    reader_ready.set()
                 conn.close()
             except Exception as e:
                 errors.append(("reader", str(e)))
@@ -474,6 +476,10 @@ class TestConcurrentSchemaOperations:
         indexer_thread = threading.Thread(target=index_creator)
         
         reader_thread.start()
+        if not reader_ready.wait(timeout=5):
+            index_created.set()
+            reader_thread.join(timeout=10)
+            assert False, f"Reader did not complete an initial read; errors: {errors}"
         indexer_thread.start()
         
         reader_thread.join(timeout=10)

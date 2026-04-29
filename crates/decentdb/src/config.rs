@@ -153,7 +153,8 @@ pub struct DbConfig {
     /// and backfills legacy tables on open; later slices will extend that
     /// manifest to true append-only multi-chunk storage.
     ///
-    /// Default: `false` for one release of soak time.
+    /// Default: `true`. Set to `false` to keep the legacy single-payload
+    /// resident table materialization path for compatibility testing.
     ///
     /// See ADR 0145 — Paged Table Row Source.
     pub paged_row_storage: bool,

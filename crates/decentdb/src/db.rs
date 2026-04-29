@@ -6781,7 +6781,11 @@ mod tests {
         let path = tempdir.path().join("paged-row-storage-backfill.ddb");
 
         {
-            let db = Db::open_or_create(&path, DbConfig::default()).expect("create db");
+            let legacy_config = DbConfig {
+                paged_row_storage: false,
+                ..DbConfig::default()
+            };
+            let db = Db::open_or_create(&path, legacy_config).expect("create legacy db");
             db.execute("CREATE TABLE seeded (id INTEGER PRIMARY KEY, n INTEGER, body TEXT)")
                 .expect("create seeded");
             let large_body = "x".repeat(2048);
@@ -6803,50 +6807,77 @@ mod tests {
             }
             txn.commit().expect("commit rows");
             db.checkpoint().expect("checkpoint");
-        }
-
-        let config = DbConfig {
-            paged_row_storage: true,
-            ..DbConfig::default()
-        };
-        let db = Db::open_or_create(&path, config).expect("reopen with paged storage");
-        {
             let runtime = db.inner.engine.read().expect("engine runtime lock");
             let seeded = runtime
                 .persisted_tables
                 .get("seeded")
-                .expect("persisted seeded after paged backfill");
+                .expect("legacy persisted seeded");
             assert!(
-                seeded.pointer.is_table_paged_manifest(),
-                "expected legacy table to be wrapped in paged manifest storage"
+                !seeded.pointer.is_table_paged_manifest(),
+                "expected legacy setup to use single-payload table storage"
             );
         }
 
-        let json_open = db.inspect_storage_state_json().expect("json snapshot");
-        assert!(
-            json_open.contains("\"deferred_table_count\":1"),
-            "expected paged-backed table to stay deferred at open, got: {json_open}"
-        );
+        let (pointer_after_backfill, checksum_after_backfill) = {
+            let db = Db::open_or_create(&path, DbConfig::default())
+                .expect("reopen legacy db with default paged storage");
+            let state_after_backfill = {
+                let runtime = db.inner.engine.read().expect("engine runtime lock");
+                let seeded = runtime
+                    .persisted_tables
+                    .get("seeded")
+                    .expect("persisted seeded after paged backfill");
+                assert!(
+                    seeded.pointer.is_table_paged_manifest(),
+                    "expected legacy table to be wrapped in paged manifest storage"
+                );
+                *seeded
+            };
 
-        let result = db.execute("SELECT * FROM seeded").expect("wildcard scan");
-        assert_eq!(result.rows().len(), 96);
+            let json_open = db.inspect_storage_state_json().expect("json snapshot");
+            assert!(
+                json_open.contains("\"deferred_table_count\":1"),
+                "expected paged-backed table to stay deferred at open, got: {json_open}"
+            );
+
+            let result = db.execute("SELECT * FROM seeded").expect("wildcard scan");
+            assert_eq!(result.rows().len(), 96);
+            assert_eq!(
+                result.rows()[0].values(),
+                &[
+                    Value::Int64(0),
+                    Value::Int64(0),
+                    Value::Text("x".repeat(2048)),
+                ]
+            );
+
+            let json_after = db.inspect_storage_state_json().expect("json after scan");
+            assert!(
+                json_after.contains("\"loaded_table_count\":0"),
+                "expected paged wildcard scan to avoid materialization, got: {json_after}"
+            );
+            assert!(
+                json_after.contains("\"deferred_table_count\":1"),
+                "expected paged-backed table to remain deferred after scan, got: {json_after}"
+            );
+
+            (state_after_backfill.pointer, state_after_backfill.checksum)
+        };
+
+        let db = Db::open_or_create(&path, DbConfig::default())
+            .expect("reopen already-backfilled db with default paged storage");
+        let runtime = db.inner.engine.read().expect("engine runtime lock");
+        let state_after_reopen = *runtime
+            .persisted_tables
+            .get("seeded")
+            .expect("persisted seeded after second reopen");
         assert_eq!(
-            result.rows()[0].values(),
-            &[
-                Value::Int64(0),
-                Value::Int64(0),
-                Value::Text("x".repeat(2048)),
-            ]
+            state_after_reopen.pointer, pointer_after_backfill,
+            "expected second reopen to keep the existing paged manifest pointer"
         );
-
-        let json_after = db.inspect_storage_state_json().expect("json after scan");
-        assert!(
-            json_after.contains("\"loaded_table_count\":0"),
-            "expected paged wildcard scan to avoid materialization, got: {json_after}"
-        );
-        assert!(
-            json_after.contains("\"deferred_table_count\":1"),
-            "expected paged-backed table to remain deferred after scan, got: {json_after}"
+        assert_eq!(
+            state_after_reopen.checksum, checksum_after_backfill,
+            "expected second reopen to keep the existing paged manifest checksum"
         );
     }
 

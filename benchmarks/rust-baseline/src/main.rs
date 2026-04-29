@@ -122,42 +122,55 @@ impl Rng {
 }
 
 // --- seed plan -------------------------------------------------------------
-struct ArtistPlan {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ArtistSeed {
     id: i64,
-    name: String,
     country: &'static str,
     formed_year: i32,
-    albums: Vec<AlbumPlan>,
 }
-struct AlbumPlan {
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AlbumSeed {
     id: i64,
-    title: String,
+    artist_id: i64,
     release_year: i32,
-    songs: Vec<SongPlan>,
 }
-struct SongPlan {
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SongSeed {
     id: i64,
-    title: String,
+    album_id: i64,
+    artist_id: i64,
     duration_ms: i32,
 }
 
 const COUNTRIES: &[&str] = &["US", "UK", "DE", "FR", "JP", "BR", "CA", "AU", "SE", "NL"];
 
-struct SeedPlan {
-    artists: Vec<ArtistPlan>,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SeedSummary {
     total_albums: u64,
     total_songs: u64,
 }
 
-fn build_seed_plan(scale: Scale, seed: u64) -> SeedPlan {
+fn summarize_seed_plan(scale: Scale, seed: u64) -> SeedSummary {
+    walk_seed_plan(scale, seed, |_| {}, |_| {}, |_| {})
+}
+
+fn walk_seed_plan(
+    scale: Scale,
+    seed: u64,
+    mut on_artist: impl FnMut(ArtistSeed),
+    mut on_album: impl FnMut(AlbumSeed),
+    mut on_song: impl FnMut(SongSeed),
+) -> SeedSummary {
     let mut rng = Rng::new(seed);
     let mut album_counter: i64 = 0;
     let mut song_counter: i64 = 0;
     let mut album_quota = scale.albums as i64;
     let song_quota = scale.songs_cap as i64;
 
-    let mut artists = Vec::with_capacity(scale.artists as usize);
     for a in 0..scale.artists {
+        let artist_id = (a + 1) as i64;
         let artists_remaining = (scale.artists - a) as i64;
         let albums_remaining = album_quota;
         let avg = (albums_remaining / artists_remaining).max(1);
@@ -170,41 +183,37 @@ fn build_seed_plan(scale: Scale, seed: u64) -> SeedPlan {
         };
         album_quota -= desired;
 
-        let mut albums = Vec::with_capacity(desired as usize);
         for _ in 0..desired {
             let mut songs_this_album = 1 + rng.gen_range(scale.max_songs_per_album) as i64;
             if song_counter + songs_this_album > song_quota {
                 songs_this_album = (song_quota - song_counter).max(0);
             }
-            let mut songs = Vec::with_capacity(songs_this_album as usize);
+            album_counter += 1;
+            let album_id = album_counter;
             for _ in 0..songs_this_album {
                 song_counter += 1;
-                songs.push(SongPlan {
+                on_song(SongSeed {
                     id: song_counter,
-                    title: format!("Song {song_counter}"),
+                    album_id,
+                    artist_id,
                     duration_ms: 60_000 + rng.gen_range(360_000) as i32,
                 });
             }
-            album_counter += 1;
-            albums.push(AlbumPlan {
-                id: album_counter,
-                title: format!("Album {album_counter}"),
+            on_album(AlbumSeed {
+                id: album_id,
+                artist_id,
                 release_year: 1960 + rng.gen_range(65) as i32,
-                songs,
             });
         }
 
-        artists.push(ArtistPlan {
-            id: (a + 1) as i64,
-            name: format!("Artist {}", a + 1),
+        on_artist(ArtistSeed {
+            id: artist_id,
             country: COUNTRIES[rng.gen_range(COUNTRIES.len() as u32) as usize],
             formed_year: 1950 + rng.gen_range(75) as i32,
-            albums,
         });
     }
 
-    SeedPlan {
-        artists,
+    SeedSummary {
         total_albums: album_counter as u64,
         total_songs: song_counter as u64,
     }
@@ -476,15 +485,13 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         .unwrap_or_else(|| PathBuf::from(format!("run-rust-{}.ddb", scale.name)));
 
     println!(
-        "Building seed plan: scale={} artists={} albums(target)={} songs_cap={}",
+        "Summarizing seed plan: scale={} artists={} albums(target)={} songs_cap={}",
         scale.name, scale.artists, scale.albums, scale.songs_cap
     );
-    let plan = build_seed_plan(scale, cli.seed);
+    let summary = summarize_seed_plan(scale, cli.seed);
     println!(
         "Plan: artists={} total_albums={} total_songs={}",
-        plan.artists.len(),
-        plan.total_albums,
-        plan.total_songs
+        scale.artists, summary.total_albums, summary.total_songs
     );
 
     delete_db_files(&db_path);
@@ -513,7 +520,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     });
 
     // ── Seed artists ──────────────────────────────────────────────
-    rec.measure("seed_artists", Some(plan.artists.len() as u64), || {
+    rec.measure("seed_artists", Some(u64::from(scale.artists)), || {
         let mut txn = db.transaction().expect("begin");
         let prepared: PreparedStatement = txn
             .prepare(
@@ -527,24 +534,30 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             Value::Text(String::new()),
             Value::Int64(0),
         ];
-        for a in &plan.artists {
-            params[0] = Value::Int64(a.id);
-            params[1] = Value::Text(a.name.clone());
-            params[2] = Value::Text(a.country.to_string());
-            params[3] = Value::Int64(a.formed_year as i64);
-            prepared.execute_in(&mut txn, params).expect("ins artist");
-        }
+        walk_seed_plan(
+            scale,
+            cli.seed,
+            |a| {
+                params[0] = Value::Int64(a.id);
+                params[1] = Value::Text(format!("Artist {}", a.id));
+                params[2] = Value::Text(a.country.to_string());
+                params[3] = Value::Int64(a.formed_year as i64);
+                prepared.execute_in(&mut txn, params).expect("ins artist");
+            },
+            |_| {},
+            |_| {},
+        );
         txn.commit().expect("commit artists");
     });
 
     // ── Seed albums ───────────────────────────────────────────────
-    rec.measure("seed_albums", Some(plan.total_albums), || {
-        seed_albums(&db, &plan);
+    rec.measure("seed_albums", Some(summary.total_albums), || {
+        seed_albums(&db, scale, cli.seed);
     });
 
     // ── Seed songs ────────────────────────────────────────────────
-    rec.measure("seed_songs", Some(plan.total_songs), || {
-        seed_songs(&db, &plan);
+    rec.measure("seed_songs", Some(summary.total_songs), || {
+        seed_songs(&db, scale, cli.seed);
     });
 
     // ── Queries ───────────────────────────────────────────────────
@@ -569,7 +582,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     });
 
     rec.measure("query_artist_by_id", None, || {
-        let target = (plan.artists.len() as i64) / 2 + 1;
+        let target = i64::from(scale.artists) / 2 + 1;
         let r = db
             .execute_with_params(
                 "SELECT id, name, country, formed_year FROM artists WHERE id = $1",
@@ -657,7 +670,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn seed_albums(db: &decentdb::Db, plan: &SeedPlan) {
+fn seed_albums(db: &decentdb::Db, scale: Scale, seed: u64) {
     let mut txn = db.transaction().expect("begin albums");
     let prepared = txn
         .prepare(
@@ -671,19 +684,23 @@ fn seed_albums(db: &decentdb::Db, plan: &SeedPlan) {
         Value::Text(String::new()),
         Value::Int64(0),
     ];
-    for a in &plan.artists {
-        for al in &a.albums {
+    walk_seed_plan(
+        scale,
+        seed,
+        |_| {},
+        |al| {
             params[0] = Value::Int64(al.id);
-            params[1] = Value::Int64(a.id);
-            params[2] = Value::Text(al.title.clone());
+            params[1] = Value::Int64(al.artist_id);
+            params[2] = Value::Text(format!("Album {}", al.id));
             params[3] = Value::Int64(al.release_year as i64);
             prepared.execute_in(&mut txn, params).expect("ins album");
-        }
-    }
+        },
+        |_| {},
+    );
     txn.commit().expect("commit albums");
 }
 
-fn seed_songs(db: &decentdb::Db, plan: &SeedPlan) {
+fn seed_songs(db: &decentdb::Db, scale: Scale, seed: u64) {
     let mut txn = db.transaction().expect("begin songs");
     let prepared = txn
         .prepare(
@@ -698,18 +715,20 @@ fn seed_songs(db: &decentdb::Db, plan: &SeedPlan) {
         Value::Text(String::new()),
         Value::Int64(0),
     ];
-    for a in &plan.artists {
-        for al in &a.albums {
-            for s in &al.songs {
-                params[0] = Value::Int64(s.id);
-                params[1] = Value::Int64(al.id);
-                params[2] = Value::Int64(a.id);
-                params[3] = Value::Text(s.title.clone());
-                params[4] = Value::Int64(s.duration_ms as i64);
-                prepared.execute_in(&mut txn, params).expect("ins song");
-            }
-        }
-    }
+    walk_seed_plan(
+        scale,
+        seed,
+        |_| {},
+        |_| {},
+        |s| {
+            params[0] = Value::Int64(s.id);
+            params[1] = Value::Int64(s.album_id);
+            params[2] = Value::Int64(s.artist_id);
+            params[3] = Value::Text(format!("Song {}", s.id));
+            params[4] = Value::Int64(s.duration_ms as i64);
+            prepared.execute_in(&mut txn, params).expect("ins song");
+        },
+    );
     txn.commit().expect("commit songs");
 }
 
@@ -1349,7 +1368,10 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{ordered_step_names, parse_scale, HistoricalRun, RunReport, StepMetric, HUGE};
+    use super::{
+        ordered_step_names, parse_scale, summarize_seed_plan, HistoricalRun, RunReport, StepMetric,
+        HUGE, SMOKE,
+    };
 
     #[test]
     fn parse_scale_supports_huge() {
@@ -1359,6 +1381,14 @@ mod tests {
         assert_eq!(scale.artists, HUGE.artists);
         assert_eq!(scale.albums, HUGE.albums);
         assert_eq!(scale.songs_cap, HUGE.songs_cap);
+    }
+
+    #[test]
+    fn seed_summary_matches_known_smoke_plan() {
+        let summary = summarize_seed_plan(SMOKE, 42);
+
+        assert_eq!(summary.total_albums, 5_000);
+        assert_eq!(summary.total_songs, 27_783);
     }
 
     #[test]
