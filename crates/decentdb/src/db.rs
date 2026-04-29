@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock, RwLockWriteGuard};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockWriteGuard, Weak};
 
 #[cfg(feature = "bench-internals")]
 use crate::benchmark::READ_PATH_WRITE_TXN_LOCK_COUNT;
@@ -1568,6 +1568,20 @@ impl Db {
     }
 
     fn open_with_vfs(path: PathBuf, config: DbConfig, vfs: VfsHandle) -> Result<Self> {
+        let open_lock = if vfs.is_memory() {
+            None
+        } else {
+            let canonical_path = vfs.canonicalize_path(&path)?;
+            Some(db_open_lock(canonical_path)?)
+        };
+        let _open_guard = open_lock
+            .as_ref()
+            .map(|lock| {
+                lock.lock()
+                    .map_err(|_| DbError::internal("database open lock poisoned"))
+            })
+            .transpose()?;
+
         let file = vfs.open(
             &path,
             if vfs.is_memory() {
@@ -4870,6 +4884,25 @@ impl Db {
     }
 }
 
+fn db_open_lock(canonical_path: PathBuf) -> Result<Arc<Mutex<()>>> {
+    let mut registry = db_open_lock_registry()
+        .lock()
+        .map_err(|_| DbError::internal("database open lock registry poisoned"))?;
+    if let Some(existing) = registry.get(&canonical_path).and_then(Weak::upgrade) {
+        return Ok(existing);
+    }
+
+    registry.retain(|_, lock| lock.strong_count() > 0);
+    let lock = Arc::new(Mutex::new(()));
+    registry.insert(canonical_path, Arc::downgrade(&lock));
+    Ok(lock)
+}
+
+fn db_open_lock_registry() -> &'static Mutex<HashMap<PathBuf, Weak<Mutex<()>>>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 /// Evicts the shared WAL registry entry for an on-disk database path.
 pub fn evict_shared_wal(path: impl AsRef<Path>) -> Result<()> {
     let path = path.as_ref();
@@ -5820,7 +5853,8 @@ fn json_escape(input: String) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::sync::Arc;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
     use tempfile::TempDir;
 
     use crate::catalog::{
@@ -16253,6 +16287,105 @@ mod tests {
         match &result.rows()[0].values()[0] {
             Value::Text(value) => value,
             other => panic!("expected TEXT scalar, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn concurrent_independent_handles_keep_paged_manifest_valid() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("independent-handles.ddb");
+        let rows = 1_000_i64;
+
+        {
+            let db = Db::open_or_create(&path, DbConfig::default()).expect("open seed db");
+            db.execute(
+                "CREATE TABLE bench_read_under_write (id INT64 PRIMARY KEY, payload TEXT NOT NULL)",
+            )
+            .expect("create table");
+            let mut inserted = 0_i64;
+            while inserted < rows {
+                let mut txn = db.transaction().expect("begin seed txn");
+                let insert = txn
+                    .prepare("INSERT INTO bench_read_under_write (id, payload) VALUES ($1, $2)")
+                    .expect("prepare insert");
+                for id in inserted..(inserted + 100).min(rows) {
+                    insert
+                        .execute_in(
+                            &mut txn,
+                            &[Value::Int64(id + 1), Value::Text(format!("payload-{id}"))],
+                        )
+                        .expect("insert row");
+                }
+                txn.commit().expect("commit seed txn");
+                inserted = (inserted + 100).min(rows);
+            }
+            db.checkpoint().expect("checkpoint seed db");
+        }
+
+        let reader_a = Db::open(&path, DbConfig::default()).expect("open reader a");
+        let reader_b = Db::open(&path, DbConfig::default()).expect("open reader b");
+        let writer = Db::open(&path, DbConfig::default()).expect("open writer");
+        let barrier = Arc::new(Barrier::new(3));
+
+        let reader_handles = [reader_a, reader_b]
+            .into_iter()
+            .enumerate()
+            .map(|(reader_index, db)| {
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    let select = db
+                        .prepare("SELECT payload FROM bench_read_under_write WHERE id = $1")
+                        .expect("prepare reader select");
+                    barrier.wait();
+                    for op in 0..500_i64 {
+                        let id = ((op * 17 + reader_index as i64) % rows) + 1;
+                        let result = select
+                            .execute(&[Value::Int64(id)])
+                            .expect("reader point lookup");
+                        assert_eq!(result.rows().len(), 1);
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let writer_barrier = Arc::clone(&barrier);
+        let writer_handle = thread::spawn(move || {
+            let update = writer
+                .prepare("UPDATE bench_read_under_write SET payload = 'rw' WHERE id = $1")
+                .expect("prepare writer update");
+            writer_barrier.wait();
+            for op in 0..80_i64 {
+                let id = ((op * 31) % rows) + 1;
+                let mut txn = writer.transaction().expect("begin writer txn");
+                update
+                    .execute_in(&mut txn, &[Value::Int64(id)])
+                    .expect("writer update");
+                txn.commit().expect("commit writer txn");
+            }
+        });
+
+        for handle in reader_handles {
+            handle.join().expect("reader thread");
+        }
+        writer_handle.join().expect("writer thread");
+
+        let reopened = Db::open(&path, DbConfig::default()).expect("reopen after mixed workload");
+        assert_eq!(
+            scalar_i64(
+                &reopened
+                    .execute("SELECT COUNT(*) FROM bench_read_under_write")
+                    .expect("count rows")
+            ),
+            rows
+        );
+        let point = reopened
+            .prepare("SELECT payload FROM bench_read_under_write WHERE id = $1")
+            .expect("prepare final point lookup");
+        for id in [1_i64, 7, 127, 509, 1000] {
+            let result = point
+                .execute(&[Value::Int64(id)])
+                .expect("final point lookup");
+            assert_eq!(result.rows().len(), 1);
         }
     }
 

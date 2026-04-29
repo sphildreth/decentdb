@@ -3,7 +3,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -1999,7 +1999,7 @@ fn read_under_write(profile: &ResolvedProfile, scenario_scratch: &Path) -> Resul
         metrics,
         warnings: Vec::new(),
         notes: vec![
-            "One writer thread and multiple reader threads run against one shared Db handle; access is serialized until VFS-level file locking makes independent opens safe."
+            "One writer thread and multiple reader threads run against independent Db handles for the same database path."
                 .to_string(),
             "reader_degradation_ratio = reader_p95_under_write_us / reader_p95_isolation_us"
                 .to_string(),
@@ -2545,86 +2545,38 @@ fn run_mixed_workload(
     profile: &ResolvedProfile,
     trial: u32,
 ) -> Result<(LatencyCollector, f64)> {
-    let db = Arc::new(Mutex::new(
-        Db::open_or_create(db_path, real_fs_default_config(path_parent(db_path)?)).with_context(
-            || format!("open read_under_write mixed database {}", db_path.display()),
-        )?,
-    ));
-
     let thread_count = profile.reader_threads.max(1);
     let barrier = Arc::new(Barrier::new((thread_count + 1) as usize));
 
-    let writer_db = Arc::clone(&db);
+    let writer_path = db_path.to_path_buf();
     let writer_barrier = Arc::clone(&barrier);
     let writer_ops = profile.writer_ops;
     let writer_rows = profile.rows;
     let writer_seed = profile.seed;
     let writer_handle = thread::spawn(move || {
-        let update = {
-            let db = writer_db
-                .lock()
-                .map_err(|_| anyhow!("read_under_write shared Db mutex poisoned"))?;
-            db.prepare("UPDATE bench_read_under_write SET payload = 'rw' WHERE id = $1")?
-        };
         writer_barrier.wait();
-        let started = Instant::now();
-        for op in 0..writer_ops {
-            let key = deterministic_id(writer_seed.rotate_left(17), op, writer_rows, trial);
-            let db = writer_db
-                .lock()
-                .map_err(|_| anyhow!("read_under_write shared Db mutex poisoned"))?;
-            let mut txn = db.transaction()?;
-            update.execute_in(&mut txn, &[Value::Int64(to_i64(key)?)])?;
-            txn.commit()?;
-        }
-        let elapsed_secs = started.elapsed().as_secs_f64();
-        if elapsed_secs == 0.0 {
-            Ok::<f64, anyhow::Error>(0.0)
-        } else {
-            Ok::<f64, anyhow::Error>(writer_ops as f64 / elapsed_secs)
-        }
+        run_writer_on_db_path(&writer_path, writer_rows, writer_ops, writer_seed, trial)
     });
 
     let mut reader_handles = Vec::with_capacity(thread_count as usize);
     for thread_index in 0..thread_count {
-        let reader_db = Arc::clone(&db);
+        let reader_path = db_path.to_path_buf();
         let reader_barrier = Arc::clone(&barrier);
         let seed = profile.seed;
         let rows = profile.rows;
         let (start_op, op_count) = split_ops(profile.point_reads, thread_count, thread_index);
         let trial_local = trial;
         reader_handles.push(thread::spawn(move || {
-            let select = {
-                let db = reader_db
-                    .lock()
-                    .map_err(|_| anyhow!("read_under_write shared Db mutex poisoned"))?;
-                db.prepare("SELECT payload FROM bench_read_under_write WHERE id = $1")?
-            };
-            let mut collector = LatencyCollector::new()?;
             reader_barrier.wait();
-            for op in 0..op_count {
-                let key = deterministic_id(
-                    seed ^ u64::from(thread_index).wrapping_mul(0x9e37_79b9),
-                    start_op.saturating_add(op),
-                    rows,
-                    trial_local,
-                );
-                let started = Instant::now();
-                let result = {
-                    let _db = reader_db
-                        .lock()
-                        .map_err(|_| anyhow!("read_under_write shared Db mutex poisoned"))?;
-                    select.execute(&[Value::Int64(to_i64(key)?)])?
-                };
-                collector.record(started.elapsed())?;
-                let row_count = result.rows().len();
-                if row_count != 1 {
-                    return Err(anyhow!(
-                        "read_under_write expected exactly 1 row, got {row_count}"
-                    ));
-                }
-            }
-            Ok::<LatencyCollector, anyhow::Error>(collector)
+            run_reader_thread(
+                reader_path,
+                rows,
+                seed,
+                trial_local,
+                start_op,
+                op_count,
+                thread_index,
+            )
         }));
     }
 
@@ -3118,6 +3070,22 @@ mod tests {
         assert!(result
             .metrics
             .contains_key("writer_throughput_degradation_ratio"));
+    }
+
+    #[test]
+    fn read_under_write_paged_manifest_checksum_remains_valid() {
+        let temp = TempDir::new().expect("tempdir");
+        let profile = ResolvedProfile {
+            rows: 2_000,
+            point_reads: 1_600,
+            reader_threads: 4,
+            writer_ops: 40,
+            batch_size: 50,
+            ..tiny_profile()
+        };
+        let result = run_scenario(ScenarioId::ReadUnderWrite, &profile, temp.path())
+            .expect("run read-under-write checksum regression");
+        assert!(matches!(result.status, ScenarioStatus::Passed));
     }
 
     #[test]
