@@ -1,10 +1,14 @@
-# DecentDB SPEC: Schema-First, Strongly-Typed SDK Generation
+# DecentDB / Decent Bench SPEC: Schema-First, Strongly-Typed SDK Generation
 
 - **Status:** Proposed
-- **Audience:** Core DecentDB maintainers, CLI maintainers, SDK/codegen contributors, documentation contributors, coding agents
+- **Primary product home:** Decent Bench, the official DecentDB workbench/IDE
+- **DecentDB responsibility:** Stable schema metadata, query-contract validation
+  primitives, ABI/binding guarantees, and any low-level metadata export needed by
+  Decent Bench.
+- **Audience:** Core DecentDB maintainers, Decent Bench maintainers, SDK/codegen contributors, documentation contributors, coding agents
 - **Related roadmap item:** `3. Schema-First, Strongly-Typed SDK Generation`
 - **Suggested ADRs:**
-  - ADR: Introduce schema-first SDK generation
+  - ADR: Decent Bench owns schema-first SDK generation workflow
   - ADR: Canonical schema metadata model and intermediate representation (IR)
   - ADR: Generated SDK support matrix and maturity policy
   - ADR: Query contract strategy for typed result generation
@@ -14,7 +18,16 @@
 
 ## 1. Executive Summary
 
-This SPEC defines a **schema-first code generation system** for DecentDB that produces **strongly-typed SDK artifacts** from a DecentDB database schema and related query contracts.
+This SPEC defines a **schema-first code generation system** for DecentDB that
+produces **strongly-typed SDK artifacts** from a DecentDB database schema and
+related query contracts.
+
+The preferred product home for the generator UX is **Decent Bench**, the
+official DecentDB desktop workbench and IDE. Decent Bench already owns schema
+inspection, imports from many external formats, SQL editing, and export
+workflows, so it is the natural place for interactive generation, previews,
+drift reports, and project-oriented output. DecentDB should remain the
+authoritative engine and contract provider.
 
 The goal is to make DecentDB feel less like “an embedded SQL engine you manually wire up” and more like **an embedded application platform with first-class, cross-language developer ergonomics**.
 
@@ -59,12 +72,12 @@ A strong schema-first code generation story can help DecentDB compete on a dimen
 
 Build a DecentDB code generation system that:
 
-- Generates **strongly-typed SDK artifacts** from an existing DecentDB schema.
+- Generates **strongly-typed SDK artifacts** from an existing DecentDB schema, with Decent Bench owning the primary user workflow.
 - Supports a **canonical intermediate representation (IR)** so language generators are consistent.
 - Supports **multiple target languages** through a shared pipeline.
 - Provides **typed models**, parameter helpers, and query result contracts.
 - Detects and reports **schema drift** and **breaking schema changes**.
-- Integrates cleanly into **CLI workflows**, **CI**, and **coding agent workflows**.
+- Integrates cleanly into **Decent Bench workflows**, **CLI workflows**, **CI**, and **coding agent workflows**.
 - Ships with **high-quality user documentation** and **ample end-to-end examples**.
 
 ### 3.2 Secondary goals
@@ -113,7 +126,7 @@ This should make the workflow feel like:
 
 - Canonical schema inspection/export pipeline.
 - Canonical IR for tables, columns, constraints, indexes, enums/domains if supported, and selected query contracts.
-- CLI command(s) to generate SDKs.
+- Decent Bench command(s) to generate SDKs in GUI/headless workflows.
 - Initial language support for:
   - **C#/.NET**
   - **TypeScript/Node**
@@ -138,7 +151,7 @@ This should make the workflow feel like:
 
 ### 6.3 Explicitly out of scope for first implementation
 
-- Visual GUI for SDK generation.
+- Implementing the visual Decent Bench generation workflow inside the core DecentDB engine or CLI.
 - Runtime ORM with change tracking.
 - Automatic arbitrary SQL parsing from code repositories.
 - Full LINQ-like query DSL generation.
@@ -227,19 +240,21 @@ The IR must be:
 - stable enough for tests and snapshots
 - explicit about unsupported/unknown constructs
 
-### 9.3 CLI generation
+### 9.3 Decent Bench and CLI generation
 
-The system shall provide CLI support such as:
+The primary command surface should live with Decent Bench. A headless command is
+still useful for CI and agents, but it should be exposed as part of the
+workbench/tooling layer rather than as a core engine command:
 
 ```bash
-decentdb generate --lang csharp --schema ./app.ddb --out ./Generated
-decentdb generate --lang typescript --schema ./app.ddb --out ./src/generated
-decentdb generate --lang python --schema ./app.ddb --out ./client
-decentdb generate --lang csharp,typescript --schema ./app.ddb --out-root ./generated
-decentdb generate --lang csharp --schema ./app.ddb --queries ./decentdb-queries.sql --out ./Generated
+dbench generate --lang csharp --schema ./app.ddb --out ./Generated
+dbench generate --lang typescript --schema ./app.ddb --out ./src/generated
+dbench generate --lang python --schema ./app.ddb --out ./client
+dbench generate --lang csharp,typescript --schema ./app.ddb --out-root ./generated
+dbench generate --lang csharp --schema ./app.ddb --queries ./decentdb-queries.sql --out ./Generated
 ```
 
-The CLI shall support:
+The Decent Bench command shall support:
 
 - one or more languages
 - input database path
@@ -250,6 +265,11 @@ The CLI shall support:
 - deterministic mode (default on)
 - schema drift check mode
 - machine-readable output mode (JSON)
+
+DecentDB may expose lower-level schema metadata export or validation helpers if
+Decent Bench needs them, but generated SDK layout, language selection, project
+templates, drift report presentation, and user-facing generator workflows belong
+to Decent Bench.
 
 ### 9.4 Generated artifacts
 
@@ -353,7 +373,7 @@ The user experience must be:
 
 #### Basic workflow
 1. Create or open a DecentDB database.
-2. Run `decentdb generate`.
+2. Run `dbench generate` or use the equivalent Decent Bench UI workflow.
 3. Review generated files.
 4. Use generated types and query helpers in application code.
 5. Re-run generation after schema changes.
@@ -538,17 +558,17 @@ For each named query, the generator should produce:
 
 #### Generate
 ```bash
-decentdb generate [options]
+dbench generate [options]
 ```
 
 #### Check / drift detection
 ```bash
-decentdb generate --check [options]
+dbench generate --check [options]
 ```
 
 #### Export IR
 ```bash
-decentdb generate --emit-ir ./schema.ir.json [options]
+dbench generate --emit-ir ./schema.ir.json [options]
 ```
 
 ### 14.2 CLI options
@@ -1128,14 +1148,14 @@ After the first release, likely next steps include:
 
 ```bash
 # Generate C# SDK artifacts
-decentdb generate \
+dbench generate \
   --lang csharp \
   --schema ./sample.ddb \
   --queries ./queries.sql \
   --out ./Generated
 
 # Check for drift / breaking changes
-decentdb generate \
+dbench generate \
   --lang csharp \
   --schema ./sample.ddb \
   --queries ./queries.sql \
@@ -1143,7 +1163,7 @@ decentdb generate \
   --check
 
 # Emit canonical IR snapshot
-decentdb generate \
+dbench generate \
   --schema ./sample.ddb \
   --emit-ir ./schema.ir.json
 ```
@@ -1195,4 +1215,3 @@ This domain works well for:
 - offline/local-first narratives
 - multiple language samples
 - future sync and branch demos
-

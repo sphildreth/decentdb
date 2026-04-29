@@ -69,7 +69,7 @@ moved beyond product sketching:
 | Theme | Current status | Source of truth |
 |---|---|---|
 | Local-first sync | Proposed implementation spec | [`WIN01_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md`](WIN01_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md) |
-| Schema-first SDK generation | Proposed implementation spec | [`WIN02_SCHEMA_FIRST_STRONGLY_TYPED_SDK_GENERATION_SPEC.md`](WIN02_SCHEMA_FIRST_STRONGLY_TYPED_SDK_GENERATION_SPEC.md) |
+| Schema-first SDK generation | Proposed Decent Bench-owned workflow with DecentDB metadata support | [`WIN02_SCHEMA_FIRST_STRONGLY_TYPED_SDK_GENERATION_SPEC.md`](WIN02_SCHEMA_FIRST_STRONGLY_TYPED_SDK_GENERATION_SPEC.md) |
 | Geospatial support | Proposed implementation spec plus ADRs | [`WIN03_GEOSPATIAL_DATA_SUPPORT.md`](WIN03_GEOSPATIAL_DATA_SUPPORT.md), [`ADR-0124`](adr/0124-geospatial-type-system-and-ewkb-storage.md), [`ADR-0125`](adr/0125-spatial-covering-cell-secondary-index.md), [`ADR-0126`](adr/0126-geospatial-c-abi-contract.md), [`ADR-0127`](adr/0127-planner-native-spatial-access-paths.md), [`ADR-0128`](adr/0128-true-3d-semantics-and-3d-aware-indexing.md) |
 | WASM + OPFS | Proposed implementation plan | [`WIN03_WASM_SUPPORT_IMPLEMENTATION.md`](WIN03_WASM_SUPPORT_IMPLEMENTATION.md) |
 
@@ -190,10 +190,13 @@ DecentDB can.
 ---
 
 ## 3. Schema-First, Strongly-Typed SDK Generation
-**Current status:** Proposed, with a dedicated implementation spec. See
+**Current status:** Proposed, with Decent Bench as the preferred product home.
+See
 [`WIN02_SCHEMA_FIRST_STRONGLY_TYPED_SDK_GENERATION_SPEC.md`](WIN02_SCHEMA_FIRST_STRONGLY_TYPED_SDK_GENERATION_SPEC.md)
 for the current architecture, initial language scope, generated artifact model,
-CLI shape, and acceptance criteria.
+CLI shape, and acceptance criteria. DecentDB should provide the stable schema
+metadata, query-contract validation primitives, and binding guarantees that the
+workbench consumes; Decent Bench should own the end-user generation workflow.
 
 ### Why this matters
 The engine can be excellent and still lose adoption if the integration story feels hand-built.
@@ -201,7 +204,8 @@ The engine can be excellent and still lose adoption if the integration story fee
 Developers remember ergonomics.
 
 ### The DecentDB win
-Given a DecentDB schema, generate strongly typed bindings and helpers for:
+Given a DecentDB schema, Decent Bench can generate strongly typed bindings and
+helpers for:
 
 - .NET
 - Python
@@ -220,9 +224,9 @@ Given a DecentDB schema, generate strongly typed bindings and helpers for:
 
 ### Desired workflow
 ```bash
-decentdb generate --lang csharp --schema db.ddb --out ./Generated
-decentdb generate --lang typescript --schema db.ddb --out ./src/generated
-decentdb generate --lang python --schema db.ddb --out ./client
+dbench generate --lang csharp --schema db.ddb --out ./Generated
+dbench generate --lang typescript --schema db.ddb --out ./src/generated
+dbench generate --lang python --schema db.ddb --out ./client
 ```
 
 ### Why this is a separator
@@ -466,7 +470,7 @@ These are the capabilities most likely to give DecentDB a memorable market posit
 |---|---|---|
 | 1 | Native local-first sync & merge | Strongest product identity and real painkiller |
 | 2 | Branch / diff / restore / time-travel | Memorable workflow; ideal for agents, tests, support |
-| 3 | Schema-first typed SDK/codegen | Adoption accelerator across languages |
+| 3 | Schema-first typed SDK/codegen via Decent Bench | Adoption accelerator across languages |
 | 4 | Doctor / advisor / introspection | High leverage for humans and coding agents |
 
 ## Tier 2 — High-Value Platform Multipliers
@@ -570,7 +574,7 @@ Focus on features that create the clearest product story fast.
 1. Convert **doctor/advisor** into a scoped spec that builds on existing CLI inspection commands and defines the first committed `sys.*`/JSON surfaces.
 2. Write the **branch + restore + diff** ADR/spec before implementation so retention, safety, and merge boundaries are explicit.
 3. Use [`WIN01_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md`](WIN01_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md) to break **changesets and sync protocol primitives** into implementable slices.
-4. Use [`WIN02_SCHEMA_FIRST_STRONGLY_TYPED_SDK_GENERATION_SPEC.md`](WIN02_SCHEMA_FIRST_STRONGLY_TYPED_SDK_GENERATION_SPEC.md) to formalize the first **schema-first code generation** slice.
+4. Move the first **schema-first code generation** product slice into Decent Bench, while keeping DecentDB responsible for the stable metadata and validation contracts described by [`WIN02_SCHEMA_FIRST_STRONGLY_TYPED_SDK_GENERATION_SPEC.md`](WIN02_SCHEMA_FIRST_STRONGLY_TYPED_SDK_GENERATION_SPEC.md).
 
 ## Phase 2 — Make local-first real
 1. WASM + OPFS, guided by [`WIN03_WASM_SUPPORT_IMPLEMENTATION.md`](WIN03_WASM_SUPPORT_IMPLEMENTATION.md)
