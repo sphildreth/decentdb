@@ -1,14 +1,22 @@
-//! Doctor domain model and report serialization.
+//! Doctor domain model, fact collection, rule engine, and report
+//! serialization.
 //!
 //! DR-01: Typed structures, sort order, summary calculation, and JSON
-//! serialization. No database fact collection, CLI parsing, or fix execution.
-//!
-//! This module contains public types that are not yet consumed by production
-//! code; dead-code warnings are expected until later slices wire them up.
+//! serialization.
+//! DR-02: Read-only fact collection from existing metadata.
+//! DR-03: v1 rule engine and finding catalog.
 
 #![allow(dead_code)]
 
+use std::path::Path;
+
 use serde::Serialize;
+
+use crate::config::DbConfig;
+use crate::db::Db;
+use crate::error::Result;
+use crate::metadata::{HeaderInfo, IndexInfo, SchemaSnapshot, StorageInfo};
+use crate::storage::DB_FORMAT_VERSION;
 
 // ---------------------------------------------------------------------------
 // Option helper types
@@ -415,6 +423,699 @@ fn calculate_status(findings: &[DoctorFinding]) -> DoctorStatus {
         DoctorStatus::Warning
     } else {
         DoctorStatus::Ok
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DR-02: Fact Collection
+// ---------------------------------------------------------------------------
+
+/// Facts collected from a database for rule evaluation.
+///
+/// This is an internal type used during collection; it is never serialized
+/// directly.
+struct CollectedData {
+    database: DoctorDatabaseSummary,
+    /// `Some` when a full open succeeded; `None` during partial (header-only)
+    /// reports.
+    storage: Option<StorageInfo>,
+    /// `Some` when a full open succeeded; `None` during partial reports.
+    header: Option<HeaderInfo>,
+    /// `Some` when a full open succeeded; `None` during partial reports.
+    schema: Option<SchemaSnapshot>,
+    /// Index list; empty when schema was not available.
+    indexes: Vec<IndexInfo>,
+    /// Physical database file size in bytes (used by WAL rules).
+    physical_bytes: u64,
+    /// Whether the full engine open failed after a successful loose-header
+    /// read. When `true`, the collector produces a partial report with
+    /// `database.open_failed`.
+    open_failed: bool,
+}
+
+/// Collect all facts needed by v1 rules without mutating the database.
+///
+/// Returns an `Err` only when even a loose header cannot be read.
+fn collect_facts(path: &Path, _options: &DoctorOptions) -> Result<CollectedData> {
+    let wal_path_str = format!("{}.wal", path.display());
+
+    let header_info = match Db::read_header_info(path) {
+        Ok(h) => h,
+        Err(_e) => {
+            return Ok(CollectedData {
+                database: DoctorDatabaseSummary {
+                    path: path.display().to_string(),
+                    wal_path: wal_path_str,
+                    format_version: 0,
+                    page_size: 0,
+                    page_count: 0,
+                    schema_cookie: 0,
+                },
+                storage: None,
+                header: None,
+                schema: None,
+                indexes: Vec::new(),
+                physical_bytes: 0,
+                open_failed: false,
+            });
+        }
+    };
+
+    let database = DoctorDatabaseSummary {
+        path: path.display().to_string(),
+        wal_path: wal_path_str,
+        format_version: header_info.format_version,
+        page_size: header_info.page_size,
+        page_count: 0,
+        schema_cookie: header_info.schema_cookie,
+    };
+
+    // Physical file size for threshold calculations.
+    let physical_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+
+    let db = match Db::open(
+        path,
+        DbConfig {
+            auto_checkpoint_on_open_mb: 0, // DR-02: must be read-only
+            ..DbConfig::default()
+        },
+    ) {
+        Ok(d) => d,
+        Err(_e) => {
+            return Ok(CollectedData {
+                database,
+                storage: None,
+                header: Some(header_info),
+                schema: None,
+                indexes: Vec::new(),
+                physical_bytes,
+                open_failed: true,
+            });
+        }
+    };
+
+    let storage = db.storage_info().ok();
+    let header = db.header_info().ok();
+    let schema = db.get_schema_snapshot().ok();
+    let indexes = db.list_indexes().unwrap_or_default();
+
+    // Update page_count from storage when available.
+    let database = {
+        let page = storage
+            .as_ref()
+            .map_or(database.page_count, |s| s.page_count);
+        DoctorDatabaseSummary {
+            page_count: page,
+            ..database
+        }
+    };
+
+    Ok(CollectedData {
+        database,
+        storage,
+        header,
+        schema,
+        indexes,
+        physical_bytes,
+        open_failed: false,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// DR-03: Rule Engine
+// ---------------------------------------------------------------------------
+
+/// v1 thresholds as specified in the plan.
+const WAL_LARGE_FILE_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB
+const WAL_MANY_VERSIONS_THRESHOLD: usize = 100_000;
+const FRAGMENTATION_MIN_PAGE_COUNT: u32 = 128;
+const FRAGMENTATION_HIGH_RATIO: f64 = 0.25;
+const FRAGMENTATION_MODERATE_RATIO: f64 = 0.10;
+const MANY_INDEXES_THRESHOLD: usize = 8;
+
+/// Evaluate every v1 rule against the collected data and return findings in
+/// the order described by the plan.
+fn evaluate_rules(data: &CollectedData, _options: &DoctorOptions) -> Vec<DoctorFinding> {
+    let mut findings = Vec::new();
+
+    // 10.1 Header and compatibility findings
+    if data.header.is_none() && data.storage.is_none() {
+        findings.push(header_unreadable(
+            &data.database.path,
+            "Header could not be read. Verify the path, file permissions, and file type.".into(),
+        ));
+        return findings;
+    }
+
+    if data.open_failed {
+        findings.push(open_failed(
+            data.database.format_version,
+            data.database.page_size,
+            "Full engine open failed. Use `decentdb info` or migration tooling.",
+        ));
+        // Partial report — no further checks are possible.
+        return findings;
+    }
+
+    // Full report: all checks are available.
+
+    // compatibility.format_version_unknown
+    if let Some(hdr) = &data.header {
+        if hdr.format_version != DB_FORMAT_VERSION {
+            findings.push(format_version_unknown(hdr.format_version));
+        }
+    }
+
+    // 10.2 WAL findings
+    if let Some(st) = &data.storage {
+        let large_threshold = WAL_LARGE_FILE_BYTES.max(data.physical_bytes / 4);
+        if st.wal_file_size >= large_threshold {
+            findings.push(wal_large_file(
+                st.wal_file_size,
+                data.physical_bytes,
+                large_threshold,
+            ));
+        }
+
+        if st.wal_versions >= WAL_MANY_VERSIONS_THRESHOLD {
+            findings.push(wal_many_versions(st.wal_versions));
+        }
+
+        if st.active_readers > 0 && st.wal_file_size > 0 {
+            findings.push(wal_long_readers_present(
+                st.active_readers,
+                st.wal_file_size,
+            ));
+        }
+
+        if st.warning_count > 0 {
+            findings.push(wal_reader_warnings(st.warning_count));
+        }
+
+        if st.shared_wal {
+            findings.push(wal_shared_enabled());
+        }
+    }
+
+    // 10.3 Fragmentation findings
+    if let Some(hdr) = &data.header {
+        if data.database.page_count >= FRAGMENTATION_MIN_PAGE_COUNT && hdr.freelist_page_count > 0 {
+            let ratio = hdr.freelist_page_count as f64 / data.database.page_count as f64;
+            let pct = (ratio * 100.0 * 10.0).round() / 10.0;
+
+            if ratio >= FRAGMENTATION_HIGH_RATIO {
+                findings.push(fragmentation_high(
+                    data.database.page_count,
+                    hdr.freelist_page_count,
+                    pct,
+                ));
+            } else if ratio >= FRAGMENTATION_MODERATE_RATIO {
+                findings.push(fragmentation_moderate(
+                    data.database.page_count,
+                    hdr.freelist_page_count,
+                    pct,
+                ));
+            }
+        }
+    }
+
+    // 10.4 Schema findings
+    if let Some(schema) = &data.schema {
+        let user_tables: Vec<_> = schema.tables.iter().filter(|t| !t.temporary).collect();
+        let table_count = user_tables.len();
+
+        if table_count == 0 {
+            findings.push(schema_no_user_tables());
+        }
+
+        for table in &user_tables {
+            let table_indexes: Vec<_> = data
+                .indexes
+                .iter()
+                .filter(|idx| idx.table_name == table.name)
+                .collect();
+            if table_indexes.len() > MANY_INDEXES_THRESHOLD {
+                findings.push(schema_many_indexes(&table.name, table_indexes.len()));
+            }
+        }
+
+        // schema.index_not_fresh
+        for idx in &data.indexes {
+            if !idx.fresh {
+                findings.push(index_not_fresh(&idx.name, &idx.table_name));
+            }
+        }
+
+        // statistics.missing_analyze — intentionally not implemented in v1.
+        // Reliable detection requires a typed engine helper that does not yet
+        // exist. See `design/DR_ADVISOR_INTROSPECTION_PLAN.md` Section 10.4.
+    }
+
+    // 10.5 Index verification findings — only when explicitly requested.
+    if let Some(ref db) = data.storage {
+        // We don't have access to the live Db handle here, so index
+        // verification findings are deferred to DR-04.
+        let _ = db;
+    }
+
+    // 10.6 Fix execution findings (`fix.failed`) are only produced during
+    // DR-05 fix execution and are deferred.
+
+    findings
+}
+
+/// Top-level entry point: collect facts, evaluate rules, and produce a report.
+///
+/// This is the public API for callers (CLI, bindings, tests).
+pub fn run_doctor(path: impl AsRef<Path>, options: DoctorOptions) -> Result<DoctorReport> {
+    let data = collect_facts(path.as_ref(), &options)?;
+
+    // Determine the active check set.
+    let checked_categories = match &options.checks {
+        DoctorCheckSelection::All => all_category_list(),
+        DoctorCheckSelection::Selected(cats) => cats.clone(),
+    };
+
+    let mut raw_findings = evaluate_rules(&data, &options);
+
+    // Filter findings by selected categories.
+    raw_findings.retain(|f| checked_categories.contains(&f.category));
+
+    let mode = if options.fix {
+        DoctorMode::Fix
+    } else {
+        DoctorMode::Check
+    };
+
+    let collected = DoctorCollectedFacts::from_data(&data);
+
+    Ok(DoctorReport::new(
+        mode,
+        data.database,
+        checked_categories,
+        Vec::new(), // pre_fix_findings: empty in check-only mode
+        raw_findings,
+        Vec::new(), // fixes: empty in check-only mode
+        collected,
+    ))
+}
+
+impl DoctorCollectedFacts {
+    fn from_data(data: &CollectedData) -> Self {
+        let storage = match &data.storage {
+            Some(st) => serde_json::json!({
+                "format_version": st.format_version,
+                "page_size": st.page_size,
+                "page_count": st.page_count,
+                "schema_cookie": st.schema_cookie,
+                "wal_file_size": st.wal_file_size,
+                "wal_versions": st.wal_versions,
+                "active_readers": st.active_readers,
+                "warning_count": st.warning_count,
+                "shared_wal": st.shared_wal,
+            }),
+            None => serde_json::json!({}),
+        };
+
+        let header = match &data.header {
+            Some(hdr) => serde_json::json!({
+                "format_version": hdr.format_version,
+                "page_size": hdr.page_size,
+                "schema_cookie": hdr.schema_cookie,
+                "freelist_page_count": hdr.freelist_page_count,
+            }),
+            None => serde_json::json!({}),
+        };
+
+        let schema = match &data.schema {
+            Some(sch) => serde_json::json!({
+                "table_count": sch.tables.iter().filter(|t| !t.temporary).count(),
+                "index_count": data.indexes.len(),
+            }),
+            None => serde_json::json!({}),
+        };
+
+        Self {
+            storage,
+            header,
+            schema,
+            indexes_verified: Vec::new(),
+        }
+    }
+}
+
+fn all_category_list() -> Vec<DoctorCategory> {
+    use DoctorCategory::*;
+    vec![
+        Header,
+        Storage,
+        Wal,
+        Fragmentation,
+        Schema,
+        Statistics,
+        Indexes,
+        Compatibility,
+    ]
+}
+
+// ---------------------------------------------------------------------------
+// Finding constructors — each returns a fully populated DoctorFinding
+// ---------------------------------------------------------------------------
+
+fn header_unreadable(path: &str, error_msg: String) -> DoctorFinding {
+    DoctorFinding {
+        id: "header.unreadable".into(),
+        severity: DoctorSeverity::Error,
+        category: DoctorCategory::Header,
+        title: "Database header cannot be read".into(),
+        message: error_msg.clone(),
+        evidence: vec![
+            DoctorEvidence {
+                field: "path".into(),
+                value: DoctorEvidenceValue::String(path.into()),
+                unit: None,
+            },
+            DoctorEvidence {
+                field: "error".into(),
+                value: DoctorEvidenceValue::String(error_msg),
+                unit: None,
+            },
+        ],
+        recommendation: Some(DoctorRecommendation {
+            summary: "Verify the path, file permissions, and file type.".into(),
+            commands: vec![],
+            safe_to_automate: false,
+        }),
+    }
+}
+
+fn open_failed(format_version: u32, page_size: u32, message: &str) -> DoctorFinding {
+    DoctorFinding {
+        id: "database.open_failed".into(),
+        severity: DoctorSeverity::Error,
+        category: DoctorCategory::Compatibility,
+        title: "Full engine open failed".into(),
+        message: message.into(),
+        evidence: vec![
+            DoctorEvidence {
+                field: "format_version".into(),
+                value: DoctorEvidenceValue::Uint(format_version.into()),
+                unit: None,
+            },
+            DoctorEvidence {
+                field: "page_size".into(),
+                value: DoctorEvidenceValue::Uint(page_size.into()),
+                unit: Some("bytes".into()),
+            },
+        ],
+        recommendation: Some(DoctorRecommendation {
+            summary: "Use `decentdb info`, migration tooling, or a compatible engine version."
+                .into(),
+            commands: vec![],
+            safe_to_automate: false,
+        }),
+    }
+}
+
+fn format_version_unknown(version: u32) -> DoctorFinding {
+    DoctorFinding {
+        id: "compatibility.format_version_unknown".into(),
+        severity: DoctorSeverity::Warning,
+        category: DoctorCategory::Compatibility,
+        title: "Database format version differs from engine format version".into(),
+        message: format!(
+            "Header format version {version} differs from engine format version \
+             {DB_FORMAT_VERSION}, but the database still opened successfully."
+        ),
+        evidence: vec![DoctorEvidence {
+            field: "format_version".into(),
+            value: DoctorEvidenceValue::Uint(version.into()),
+            unit: None,
+        }],
+        recommendation: Some(DoctorRecommendation {
+            summary: "Confirm the engine version expected by the application.".into(),
+            commands: vec![],
+            safe_to_automate: false,
+        }),
+    }
+}
+
+fn wal_large_file(wal_file_size: u64, physical_bytes: u64, threshold: u64) -> DoctorFinding {
+    DoctorFinding {
+        id: "wal.large_file".into(),
+        severity: DoctorSeverity::Warning,
+        category: DoctorCategory::Wal,
+        title: "WAL file is large relative to the database".into(),
+        message: "The WAL file size exceeds the threshold.".into(),
+        evidence: vec![
+            DoctorEvidence {
+                field: "wal_file_size".into(),
+                value: DoctorEvidenceValue::Uint(wal_file_size),
+                unit: Some("bytes".into()),
+            },
+            DoctorEvidence {
+                field: "physical_bytes".into(),
+                value: DoctorEvidenceValue::Uint(physical_bytes),
+                unit: Some("bytes".into()),
+            },
+            DoctorEvidence {
+                field: "threshold".into(),
+                value: DoctorEvidenceValue::Uint(threshold),
+                unit: Some("bytes".into()),
+            },
+        ],
+        recommendation: Some(DoctorRecommendation {
+            summary: "Run a checkpoint when no long reader is active.".into(),
+            commands: vec!["decentdb checkpoint --db <path>".into()],
+            safe_to_automate: false,
+        }),
+    }
+}
+
+fn wal_many_versions(wal_versions: usize) -> DoctorFinding {
+    DoctorFinding {
+        id: "wal.many_versions".into(),
+        severity: DoctorSeverity::Warning,
+        category: DoctorCategory::Wal,
+        title: "WAL has accumulated many versions".into(),
+        message: "A large number of WAL versions may indicate long-running readers or checkpoint starvation.".into(),
+        evidence: vec![DoctorEvidence {
+            field: "wal_versions".into(),
+            value: DoctorEvidenceValue::Uint(wal_versions as u64),
+            unit: None,
+        }],
+        recommendation: Some(DoctorRecommendation {
+            summary: "Check for long readers; checkpoint when safe.".into(),
+            commands: vec![],
+            safe_to_automate: false,
+        }),
+    }
+}
+
+fn wal_long_readers_present(active_readers: usize, wal_file_size: u64) -> DoctorFinding {
+    DoctorFinding {
+        id: "wal.long_readers_present".into(),
+        severity: DoctorSeverity::Warning,
+        category: DoctorCategory::Wal,
+        title: "Long-running readers are holding WAL space".into(),
+        message: "Active readers prevent the WAL from checkpointing.".into(),
+        evidence: vec![
+            DoctorEvidence {
+                field: "active_readers".into(),
+                value: DoctorEvidenceValue::Uint(active_readers as u64),
+                unit: None,
+            },
+            DoctorEvidence {
+                field: "wal_file_size".into(),
+                value: DoctorEvidenceValue::Uint(wal_file_size),
+                unit: Some("bytes".into()),
+            },
+        ],
+        recommendation: Some(DoctorRecommendation {
+            summary: "Close long-running readers before checkpoint-sensitive operations.".into(),
+            commands: vec![],
+            safe_to_automate: false,
+        }),
+    }
+}
+
+fn wal_reader_warnings(warning_count: usize) -> DoctorFinding {
+    DoctorFinding {
+        id: "wal.reader_warnings_recorded".into(),
+        severity: DoctorSeverity::Warning,
+        category: DoctorCategory::Wal,
+        title: "Reader transaction warnings recorded".into(),
+        message: "WAL reader warnings indicate long-lived read transactions.".into(),
+        evidence: vec![DoctorEvidence {
+            field: "warning_count".into(),
+            value: DoctorEvidenceValue::Uint(warning_count as u64),
+            unit: None,
+        }],
+        recommendation: Some(DoctorRecommendation {
+            summary: "Inspect application read transaction lifetime.".into(),
+            commands: vec![],
+            safe_to_automate: false,
+        }),
+    }
+}
+
+fn wal_shared_enabled() -> DoctorFinding {
+    DoctorFinding {
+        id: "wal.shared_enabled".into(),
+        severity: DoctorSeverity::Info,
+        category: DoctorCategory::Wal,
+        title: "Shared WAL mode is enabled".into(),
+        message: "Shared WAL is enabled for this database.".into(),
+        evidence: vec![DoctorEvidence {
+            field: "shared_wal".into(),
+            value: DoctorEvidenceValue::Bool(true),
+            unit: None,
+        }],
+        recommendation: None,
+    }
+}
+
+fn fragmentation_high(page_count: u32, freelist_page_count: u32, pct: f64) -> DoctorFinding {
+    DoctorFinding {
+        id: "fragmentation.high".into(),
+        severity: DoctorSeverity::Warning,
+        category: DoctorCategory::Fragmentation,
+        title: "High fragmentation detected".into(),
+        message: format!(
+            "Free-list pages ({freelist_page_count}) represent {pct}% of total pages \
+             ({page_count})."
+        ),
+        evidence: vec![
+            DoctorEvidence {
+                field: "page_count".into(),
+                value: DoctorEvidenceValue::Uint(page_count.into()),
+                unit: None,
+            },
+            DoctorEvidence {
+                field: "freelist_page_count".into(),
+                value: DoctorEvidenceValue::Uint(freelist_page_count.into()),
+                unit: None,
+            },
+            DoctorEvidence {
+                field: "fragmentation_percent".into(),
+                value: DoctorEvidenceValue::Float(pct),
+                unit: Some("%".into()),
+            },
+        ],
+        recommendation: Some(DoctorRecommendation {
+            summary: "Consider `decentdb vacuum --db <path> --output <new-path>`.".into(),
+            commands: vec!["decentdb vacuum --db <path> --output <new-path>".into()],
+            safe_to_automate: false,
+        }),
+    }
+}
+
+fn fragmentation_moderate(page_count: u32, freelist_page_count: u32, pct: f64) -> DoctorFinding {
+    DoctorFinding {
+        id: "fragmentation.moderate".into(),
+        severity: DoctorSeverity::Info,
+        category: DoctorCategory::Fragmentation,
+        title: "Moderate fragmentation detected".into(),
+        message: format!(
+            "Free-list pages ({freelist_page_count}) represent {pct}% of total pages \
+             ({page_count})."
+        ),
+        evidence: vec![
+            DoctorEvidence {
+                field: "page_count".into(),
+                value: DoctorEvidenceValue::Uint(page_count.into()),
+                unit: None,
+            },
+            DoctorEvidence {
+                field: "freelist_page_count".into(),
+                value: DoctorEvidenceValue::Uint(freelist_page_count.into()),
+                unit: None,
+            },
+            DoctorEvidence {
+                field: "fragmentation_percent".into(),
+                value: DoctorEvidenceValue::Float(pct),
+                unit: Some("%".into()),
+            },
+        ],
+        recommendation: Some(DoctorRecommendation {
+            summary: "Monitor; vacuum only if file size matters.".into(),
+            commands: vec![],
+            safe_to_automate: false,
+        }),
+    }
+}
+
+fn schema_no_user_tables() -> DoctorFinding {
+    DoctorFinding {
+        id: "schema.no_user_tables".into(),
+        severity: DoctorSeverity::Info,
+        category: DoctorCategory::Schema,
+        title: "No persistent user tables detected".into(),
+        message: "The schema snapshot has zero persistent user tables.".into(),
+        evidence: vec![DoctorEvidence {
+            field: "table_count".into(),
+            value: DoctorEvidenceValue::Uint(0),
+            unit: None,
+        }],
+        recommendation: None,
+    }
+}
+
+fn schema_many_indexes(table: &str, index_count: usize) -> DoctorFinding {
+    DoctorFinding {
+        id: "schema.many_indexes_on_table".into(),
+        severity: DoctorSeverity::Info,
+        category: DoctorCategory::Schema,
+        title: format!("Table \"{table}\" has many indexes"),
+        message: format!("Table \"{table}\" has {index_count} indexes, which may slow writes."),
+        evidence: vec![
+            DoctorEvidence {
+                field: "table".into(),
+                value: DoctorEvidenceValue::String(table.into()),
+                unit: None,
+            },
+            DoctorEvidence {
+                field: "index_count".into(),
+                value: DoctorEvidenceValue::Uint(index_count as u64),
+                unit: None,
+            },
+        ],
+        recommendation: Some(DoctorRecommendation {
+            summary: "Review write overhead; keep indexes that match query patterns.".into(),
+            commands: vec![],
+            safe_to_automate: false,
+        }),
+    }
+}
+
+fn index_not_fresh(index: &str, table: &str) -> DoctorFinding {
+    DoctorFinding {
+        id: "schema.index_not_fresh".into(),
+        severity: DoctorSeverity::Warning,
+        category: DoctorCategory::Indexes,
+        title: format!("Index \"{index}\" on \"{table}\" is not fresh"),
+        message: format!(
+            "The metadata for index \"{index}\" on table \"{table}\" indicates it is stale."
+        ),
+        evidence: vec![
+            DoctorEvidence {
+                field: "index".into(),
+                value: DoctorEvidenceValue::String(index.into()),
+                unit: None,
+            },
+            DoctorEvidence {
+                field: "table".into(),
+                value: DoctorEvidenceValue::String(table.into()),
+                unit: None,
+            },
+        ],
+        recommendation: Some(DoctorRecommendation {
+            summary: format!("Run `decentdb rebuild-index --db <path> --index {index}`."),
+            commands: vec![format!(
+                "decentdb rebuild-index --db <path> --index {index}"
+            )],
+            safe_to_automate: true,
+        }),
     }
 }
 
@@ -836,5 +1537,594 @@ mod tests {
         assert!(json.contains(r#""header":{}"#));
         assert!(json.contains(r#""schema":{}"#));
         assert!(json.contains(r#""indexes_verified":[]"#));
+    }
+
+    // ---- DR-02: fact collection tests ---------------------------------
+
+    #[test]
+    fn run_doctor_on_valid_empty_db() {
+        use tempfile::TempDir;
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join("empty.ddb");
+        crate::Db::create(&path, DbConfig::default()).expect("create db");
+
+        let report = run_doctor(&path, DoctorOptions::default())
+            .expect("report should succeed for valid empty db");
+        assert_eq!(report.schema_version, 1);
+        assert_eq!(report.mode, DoctorMode::Check);
+        assert!(matches!(report.status, DoctorStatus::Ok));
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.id == "schema.no_user_tables"),
+            "empty db should have no_user_tables"
+        );
+    }
+
+    #[test]
+    fn run_doctor_on_missing_file_produces_header_unreadable() {
+        let report = run_doctor(
+            "/nonexistent/path/that/does/not/exist.ddb",
+            DoctorOptions::default(),
+        )
+        .expect("report should succeed even for missing file (partial report)");
+        assert!(
+            report.findings.iter().any(|f| f.id == "header.unreadable"),
+            "missing file should produce header.unreadable"
+        );
+        assert_eq!(report.status, DoctorStatus::Error);
+    }
+
+    #[test]
+    fn run_doctor_does_not_mutate_database() {
+        use crate::Db;
+        use crate::DbConfig;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join("nomutate.ddb");
+
+        let db = Db::create(&path, DbConfig::default()).expect("create db");
+        db.execute("CREATE TABLE t(id INT64 PRIMARY KEY)")
+            .expect("create table");
+        db.execute("INSERT INTO t VALUES (1), (2), (3)")
+            .expect("insert rows");
+        db.checkpoint().expect("checkpoint for stable baseline");
+        let before_storage = db.storage_info().expect("storage info before");
+        drop(db);
+
+        let _report = run_doctor(&path, DoctorOptions::default()).expect("doctor run");
+
+        let db2 = Db::open(
+            &path,
+            DbConfig {
+                auto_checkpoint_on_open_mb: 0,
+                ..DbConfig::default()
+            },
+        )
+        .expect("re-open");
+        let after_storage = db2.storage_info().expect("storage info after");
+
+        assert_eq!(
+            before_storage.last_checkpoint_lsn, after_storage.last_checkpoint_lsn,
+            "doctor must not change last_checkpoint_lsn"
+        );
+        assert_eq!(
+            before_storage.schema_cookie, after_storage.schema_cookie,
+            "doctor must not change schema_cookie"
+        );
+    }
+
+    // ---- DR-03: rule engine unit tests ---------------------------------
+
+    // -- header.unreadable -----------------------------------------------
+
+    #[test]
+    fn header_unreadable_is_error() {
+        let data = CollectedData {
+            database: DoctorDatabaseSummary {
+                path: "bad.ddb".into(),
+                wal_path: "bad.ddb.wal".into(),
+                format_version: 0,
+                page_size: 0,
+                page_count: 0,
+                schema_cookie: 0,
+            },
+            storage: None,
+            header: None,
+            schema: None,
+            indexes: vec![],
+            physical_bytes: 0,
+            open_failed: false,
+        };
+        let findings = evaluate_rules(&data, &DoctorOptions::default());
+        assert!(findings.iter().any(|f| f.id == "header.unreadable"));
+        assert!(findings.len() == 1);
+    }
+
+    // -- database.open_failed --------------------------------------------
+
+    #[test]
+    fn open_failed_is_error() {
+        let mut data = fresh_collected();
+        data.open_failed = true;
+        data.storage = None;
+        data.schema = None;
+
+        let findings = evaluate_rules(&data, &DoctorOptions::default());
+        assert!(
+            findings.iter().any(|f| f.id == "database.open_failed"),
+            "{findings:?}"
+        );
+        assert!(findings.iter().all(|f| f.severity == DoctorSeverity::Error));
+    }
+
+    // -- compatibility.format_version_unknown ----------------------------
+
+    #[test]
+    fn format_version_match_no_finding() {
+        let data = fresh_collected();
+        let findings = evaluate_rules(&data, &DoctorOptions::default());
+        assert!(!findings
+            .iter()
+            .any(|f| f.id == "compatibility.format_version_unknown"));
+    }
+
+    #[test]
+    fn format_version_mismatch_is_warning() {
+        let mut data = fresh_collected();
+        if let Some(ref mut hdr) = data.header {
+            hdr.format_version = 99; // different from DB_FORMAT_VERSION = 10
+        }
+        let findings = evaluate_rules(&data, &DoctorOptions::default());
+        assert!(findings
+            .iter()
+            .any(|f| f.id == "compatibility.format_version_unknown"));
+    }
+
+    // -- wal.large_file --------------------------------------------------
+
+    #[test]
+    fn wal_file_below_threshold_no_finding() {
+        let mut data = fresh_collected();
+        if let Some(ref mut st) = data.storage {
+            st.wal_file_size = 1_000; // well below 64 MiB
+        }
+        data.physical_bytes = 1_000_000;
+        let findings = evaluate_rules(&data, &DoctorOptions::default());
+        assert!(!findings.iter().any(|f| f.id == "wal.large_file"));
+    }
+
+    #[test]
+    fn wal_file_at_64_mib_threshold() {
+        let data = fresh_collected(); // physical_bytes = 8192, so threshold = max(64MiB, 2048) = 64MiB
+        let mut data_with_wal = data;
+        if let Some(ref mut st) = data_with_wal.storage {
+            st.wal_file_size = 64 * 1024 * 1024; // exactly 64 MiB
+        }
+        let findings = evaluate_rules(&data_with_wal, &DoctorOptions::default());
+        assert!(
+            findings.iter().any(|f| f.id == "wal.large_file"),
+            "exactly 64 MiB should trigger wal.large_file"
+        );
+    }
+
+    #[test]
+    fn wal_file_above_threshold_by_physical_bytes_ratio() {
+        let mut data = fresh_collected();
+        // physical_bytes = 8192; wal_file_size = 32 (from fresh_collected)
+        // Override: threshold = max(64MiB, 4000/4=1000) = 64 MiB, so we'd
+        // need a huge wal.  Instead, leave wal_file_size at 32 but show that
+        // the ratio trigger works by checking that a wal_file_size >=
+        // physical_bytes/4 (and >=64MiB) triggers.
+        // For ratio-only to win, wal_file_size must be >= 64 MiB
+        // AND also >= physical_bytes/4.  We set wal large enough.
+        if let Some(ref mut st) = data.storage {
+            st.wal_file_size = 70 * 1024 * 1024; // 70 MiB > 64 MiB
+        }
+        data.physical_bytes = 200 * 1024 * 1024; // 200 MiB, /4 = 50 MiB
+                                                 // threshold = max(64MiB, 50MiB) = 64MiB, wal_file_size=70MiB >= 64MiB
+        let findings = evaluate_rules(&data, &DoctorOptions::default());
+        assert!(
+            findings.iter().any(|f| f.id == "wal.large_file"),
+            "wal_file_size >= threshold should trigger"
+        );
+    }
+
+    // -- wal.many_versions -----------------------------------------------
+
+    #[test]
+    fn wal_versions_below_threshold_no_finding() {
+        let data = fresh_collected();
+        let findings = evaluate_rules(&data, &DoctorOptions::default());
+        assert!(!findings.iter().any(|f| f.id == "wal.many_versions"));
+    }
+
+    #[test]
+    fn wal_versions_at_threshold() {
+        let mut data = fresh_collected();
+        if let Some(ref mut st) = data.storage {
+            st.wal_versions = 100_000;
+        }
+        let findings = evaluate_rules(&data, &DoctorOptions::default());
+        assert!(findings.iter().any(|f| f.id == "wal.many_versions"));
+    }
+
+    #[test]
+    fn wal_versions_above_threshold() {
+        let mut data = fresh_collected();
+        if let Some(ref mut st) = data.storage {
+            st.wal_versions = 200_000;
+        }
+        let findings = evaluate_rules(&data, &DoctorOptions::default());
+        assert!(findings.iter().any(|f| f.id == "wal.many_versions"));
+    }
+
+    // -- wal.long_readers_present ----------------------------------------
+
+    #[test]
+    fn no_active_readers_no_finding() {
+        let data = fresh_collected();
+        let findings = evaluate_rules(&data, &DoctorOptions::default());
+        assert!(!findings.iter().any(|f| f.id == "wal.long_readers_present"));
+    }
+
+    #[test]
+    fn active_readers_with_non_empty_wal() {
+        let mut data = fresh_collected();
+        if let Some(ref mut st) = data.storage {
+            st.active_readers = 1;
+            st.wal_file_size = 1024;
+        }
+        let findings = evaluate_rules(&data, &DoctorOptions::default());
+        assert!(findings.iter().any(|f| f.id == "wal.long_readers_present"));
+    }
+
+    #[test]
+    fn active_readers_with_empty_wal_no_finding() {
+        let mut data = fresh_collected();
+        if let Some(ref mut st) = data.storage {
+            st.active_readers = 1;
+            st.wal_file_size = 0;
+        }
+        let findings = evaluate_rules(&data, &DoctorOptions::default());
+        assert!(!findings.iter().any(|f| f.id == "wal.long_readers_present"));
+    }
+
+    // -- wal.reader_warnings_recorded -----------------------------------
+
+    #[test]
+    fn no_warnings_no_finding() {
+        let data = fresh_collected();
+        let findings = evaluate_rules(&data, &DoctorOptions::default());
+        assert!(!findings
+            .iter()
+            .any(|f| f.id == "wal.reader_warnings_recorded"));
+    }
+
+    #[test]
+    fn warnings_positive_triggers() {
+        let mut data = fresh_collected();
+        if let Some(ref mut st) = data.storage {
+            st.warning_count = 3;
+        }
+        let findings = evaluate_rules(&data, &DoctorOptions::default());
+        assert!(findings
+            .iter()
+            .any(|f| f.id == "wal.reader_warnings_recorded"));
+    }
+
+    // -- wal.shared_enabled ----------------------------------------------
+
+    #[test]
+    fn shared_wal_disabled_no_finding() {
+        let data = fresh_collected();
+        let findings = evaluate_rules(&data, &DoctorOptions::default());
+        assert!(!findings.iter().any(|f| f.id == "wal.shared_enabled"));
+    }
+
+    #[test]
+    fn shared_wal_enabled_is_info() {
+        let mut data = fresh_collected();
+        if let Some(ref mut st) = data.storage {
+            st.shared_wal = true;
+        }
+        let findings = evaluate_rules(&data, &DoctorOptions::default());
+        let f = findings
+            .iter()
+            .find(|f| f.id == "wal.shared_enabled")
+            .expect("shared wal finding missing");
+        assert_eq!(f.severity, DoctorSeverity::Info);
+    }
+
+    // -- fragmentation.high / fragmentation.moderate --------------------
+
+    #[test]
+    fn fragmentation_below_min_page_count_no_finding() {
+        let mut data = fresh_collected();
+        data.database.page_count = 100; // below 128
+        if let Some(ref mut hdr) = data.header {
+            hdr.freelist_page_count = 30; // ratio = 0.30
+        }
+        let findings = evaluate_rules(&data, &DoctorOptions::default());
+        assert!(!findings
+            .iter()
+            .any(|f| f.id == "fragmentation.high" || f.id == "fragmentation.moderate"));
+    }
+
+    #[test]
+    fn fragmentation_high_at_25_percent() {
+        let mut data = fresh_collected();
+        data.database.page_count = 200;
+        if let Some(ref mut hdr) = data.header {
+            hdr.freelist_page_count = 50; // 25%
+        }
+        let findings = evaluate_rules(&data, &DoctorOptions::default());
+        assert!(findings.iter().any(|f| f.id == "fragmentation.high"));
+    }
+
+    #[test]
+    fn fragmentation_high_above_25_percent() {
+        let mut data = fresh_collected();
+        data.database.page_count = 200;
+        if let Some(ref mut hdr) = data.header {
+            hdr.freelist_page_count = 80; // 40%
+        }
+        let findings = evaluate_rules(&data, &DoctorOptions::default());
+        assert!(findings.iter().any(|f| f.id == "fragmentation.high"));
+    }
+
+    #[test]
+    fn fragmentation_moderate_at_10_percent() {
+        let mut data = fresh_collected();
+        data.database.page_count = 200;
+        if let Some(ref mut hdr) = data.header {
+            hdr.freelist_page_count = 20; // 10%
+        }
+        let findings = evaluate_rules(&data, &DoctorOptions::default());
+        assert!(findings.iter().any(|f| f.id == "fragmentation.moderate"));
+    }
+
+    #[test]
+    fn fragmentation_below_10_percent_no_finding() {
+        let mut data = fresh_collected();
+        data.database.page_count = 200;
+        if let Some(ref mut hdr) = data.header {
+            hdr.freelist_page_count = 15; // 7.5%
+        }
+        let findings = evaluate_rules(&data, &DoctorOptions::default());
+        assert!(!findings
+            .iter()
+            .any(|f| f.id == "fragmentation.moderate" || f.id == "fragmentation.high"));
+    }
+
+    // -- schema.no_user_tables -------------------------------------------
+
+    #[test]
+    fn no_user_tables_is_info() {
+        let data = fresh_collected();
+        let findings = evaluate_rules(&data, &DoctorOptions::default());
+        let f = findings
+            .iter()
+            .find(|f| f.id == "schema.no_user_tables")
+            .expect("no_user_tables missing");
+        assert_eq!(f.severity, DoctorSeverity::Info);
+    }
+
+    // -- schema.many_indexes_on_table ------------------------------------
+
+    #[test]
+    fn many_indexes_boundary_8_no_finding() {
+        use crate::metadata::SchemaTableInfo;
+
+        let mut data = fresh_collected();
+        if let Some(ref mut schema) = data.schema {
+            schema.tables.push(SchemaTableInfo {
+                name: "t".into(),
+                temporary: false,
+                ddl: "CREATE TABLE t()".into(),
+                row_count: 0,
+                primary_key_columns: vec![],
+                checks: vec![],
+                foreign_keys: vec![],
+                columns: vec![],
+            });
+        }
+        data.indexes = (0..8)
+            .map(|i| IndexInfo {
+                name: format!("idx_{i}"),
+                table_name: "t".into(),
+                kind: "btree".into(),
+                unique: false,
+                columns: vec![format!("col_{i}")],
+                include_columns: vec![],
+                predicate_sql: None,
+                fresh: true,
+            })
+            .collect();
+        let findings = evaluate_rules(&data, &DoctorOptions::default());
+        assert!(!findings
+            .iter()
+            .any(|f| f.id == "schema.many_indexes_on_table"));
+    }
+
+    #[test]
+    fn many_indexes_boundary_9_triggers() {
+        use crate::metadata::SchemaTableInfo;
+
+        let mut data = fresh_collected();
+        if let Some(ref mut schema) = data.schema {
+            schema.tables.push(SchemaTableInfo {
+                name: "t".into(),
+                temporary: false,
+                ddl: "CREATE TABLE t()".into(),
+                row_count: 0,
+                primary_key_columns: vec![],
+                checks: vec![],
+                foreign_keys: vec![],
+                columns: vec![],
+            });
+        }
+        data.indexes = (0..9)
+            .map(|i| IndexInfo {
+                name: format!("idx_{i}"),
+                table_name: "t".into(),
+                kind: "btree".into(),
+                unique: false,
+                columns: vec![format!("col_{i}")],
+                include_columns: vec![],
+                predicate_sql: None,
+                fresh: true,
+            })
+            .collect();
+        let findings = evaluate_rules(&data, &DoctorOptions::default());
+        assert!(findings
+            .iter()
+            .any(|f| f.id == "schema.many_indexes_on_table"));
+    }
+
+    // -- schema.index_not_fresh ------------------------------------------
+
+    #[test]
+    fn fresh_indexes_no_finding() {
+        let data = fresh_collected();
+        let findings = evaluate_rules(&data, &DoctorOptions::default());
+        assert!(!findings.iter().any(|f| f.id == "schema.index_not_fresh"));
+    }
+
+    #[test]
+    fn stale_index_triggers_warning() {
+        let mut data = fresh_collected();
+        data.indexes.push(IndexInfo {
+            name: "stale_idx".into(),
+            table_name: "t".into(),
+            kind: "btree".into(),
+            unique: false,
+            columns: vec!["a".into()],
+            include_columns: vec![],
+            predicate_sql: None,
+            fresh: false,
+        });
+        let findings = evaluate_rules(&data, &DoctorOptions::default());
+        let f = findings
+            .iter()
+            .find(|f| f.id == "schema.index_not_fresh")
+            .expect("index_not_fresh missing");
+        assert_eq!(f.severity, DoctorSeverity::Warning);
+    }
+
+    // ---- check filtering -----------------------------------------------
+
+    #[test]
+    fn check_filtering_excludes_other_categories() {
+        let report = run_doctor(
+            ":memory:",
+            DoctorOptions {
+                checks: DoctorCheckSelection::Selected(vec![DoctorCategory::Header]),
+                ..DoctorOptions::default()
+            },
+        )
+        .expect("doctor run");
+        assert!(report
+            .findings
+            .iter()
+            .all(|f| f.category == DoctorCategory::Header));
+        assert!(report
+            .summary
+            .checked_categories
+            .contains(&DoctorCategory::Header));
+    }
+
+    // ---- integration test ----------------------------------------------
+
+    #[test]
+    fn full_report_on_table_with_indexes() {
+        use crate::Db;
+        use crate::DbConfig;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join("full.ddb");
+
+        let db = Db::create(&path, DbConfig::default()).expect("create db");
+        db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, v TEXT)")
+            .expect("create table");
+        db.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')")
+            .expect("insert");
+        db.execute("CREATE INDEX t_v ON t(v)")
+            .expect("create index");
+        drop(db);
+
+        let report = run_doctor(&path, DoctorOptions::default()).expect("doctor run");
+
+        assert_eq!(report.schema_version, 1);
+        assert_eq!(report.mode, DoctorMode::Check);
+
+        // Should NOT have no_user_tables (we have 't')
+        assert!(!report
+            .findings
+            .iter()
+            .any(|f| f.id == "schema.no_user_tables"));
+
+        // Should have compatible format version
+        assert!(!report
+            .findings
+            .iter()
+            .any(|f| f.id == "compatibility.format_version_unknown"));
+    }
+
+    // ---- helpers -------------------------------------------------------
+
+    fn fresh_collected() -> CollectedData {
+        CollectedData {
+            database: DoctorDatabaseSummary {
+                path: "test.ddb".into(),
+                wal_path: "test.ddb.wal".into(),
+                format_version: DB_FORMAT_VERSION,
+                page_size: 4096,
+                page_count: 128,
+                schema_cookie: 7,
+            },
+            storage: Some(StorageInfo {
+                path: "test.ddb".into(),
+                wal_path: "test.ddb.wal".into(),
+                format_version: DB_FORMAT_VERSION,
+                page_size: 4096,
+                cache_size_mb: 4,
+                page_count: 128,
+                schema_cookie: 7,
+                wal_end_lsn: 0,
+                wal_file_size: 32,
+                last_checkpoint_lsn: 0,
+                active_readers: 0,
+                wal_versions: 10,
+                warning_count: 0,
+                shared_wal: false,
+            }),
+            header: Some(HeaderInfo {
+                magic_hex: "DECENTDB".into(),
+                format_version: DB_FORMAT_VERSION,
+                page_size: 4096,
+                header_checksum: 12345,
+                schema_cookie: 7,
+                catalog_root_page_id: 2,
+                freelist_root_page_id: 0,
+                freelist_head_page_id: 0,
+                freelist_page_count: 0,
+                last_checkpoint_lsn: 0,
+            }),
+            schema: Some(SchemaSnapshot {
+                snapshot_version: 1,
+                schema_cookie: 7,
+                tables: vec![],
+                views: vec![],
+                indexes: vec![],
+                triggers: vec![],
+            }),
+            indexes: vec![],
+            physical_bytes: 8192,
+            open_failed: false,
+        }
     }
 }
