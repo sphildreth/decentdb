@@ -645,9 +645,10 @@ mod wal_index_tests {
         idx.add_version(3, ver(25, 0x44), true);
 
         // safe_lsn=20 includes page 1 @ lsn=20 and page 2 @ lsn=15 but not page 3 @ lsn=25.
-        let versions = idx.latest_versions_at_or_before(20);
+        let mut versions = idx.latest_versions_at_or_before(20);
+        versions.sort_by_key(|(page_id, _)| *page_id);
         assert_eq!(versions.len(), 2);
-        // Result is sorted by page_id.
+        // Check contents independent of the WAL index's hash-map iteration order.
         assert_eq!(versions[0].0, 1);
         assert_eq!(versions[0].1.lsn, 20);
         assert_eq!(versions[1].0, 2);

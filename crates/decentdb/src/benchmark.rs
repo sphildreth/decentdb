@@ -4,22 +4,38 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Number of write_txn lock acquisitions on the read path.
 pub static READ_PATH_WRITE_TXN_LOCK_COUNT: AtomicU64 = AtomicU64::new(0);
 
-/// Number of read_page_at_snapshot_lsn calls that checked read_path_write_txn_lock.
+/// Number of held-snapshot registry lock acquisitions on the read path.
+pub static READ_PATH_HELD_SNAPSHOTS_LOCK_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Number of WAL reader snapshots opened on the read path.
 pub static READ_PATH_WAL_READER_BEGIN_COUNT: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ReadPathCounters {
+    pub write_txn_lock_count: u64,
+    pub held_snapshots_lock_count: u64,
+    pub wal_reader_begin_count: u64,
+}
 
 /// Returns the current values of the read-path counters and resets them to zero.
 #[cfg(feature = "bench-internals")]
 #[must_use]
-pub fn take_read_path_counters() -> (u64, u64) {
+pub fn take_read_path_counters() -> ReadPathCounters {
     let write_txn_lock_count = READ_PATH_WRITE_TXN_LOCK_COUNT.swap(0, Ordering::SeqCst);
+    let held_snapshots_lock_count = READ_PATH_HELD_SNAPSHOTS_LOCK_COUNT.swap(0, Ordering::SeqCst);
     let wal_reader_begin_count = READ_PATH_WAL_READER_BEGIN_COUNT.swap(0, Ordering::SeqCst);
-    (write_txn_lock_count, wal_reader_begin_count)
+    ReadPathCounters {
+        write_txn_lock_count,
+        held_snapshots_lock_count,
+        wal_reader_begin_count,
+    }
 }
 
 /// Resets all read-path counters to zero.
 #[cfg(feature = "bench-internals")]
 pub fn reset_read_path_counters() {
     READ_PATH_WRITE_TXN_LOCK_COUNT.store(0, Ordering::SeqCst);
+    READ_PATH_HELD_SNAPSHOTS_LOCK_COUNT.store(0, Ordering::SeqCst);
     READ_PATH_WAL_READER_BEGIN_COUNT.store(0, Ordering::SeqCst);
 }
 use crate::btree::page::{decode_page, BtreePage, LeafCell, LeafPage};

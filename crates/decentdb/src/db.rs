@@ -8,7 +8,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockWriteGuard, Weak};
 
 #[cfg(feature = "bench-internals")]
-use crate::benchmark::READ_PATH_WRITE_TXN_LOCK_COUNT;
+use crate::benchmark::{
+    READ_PATH_HELD_SNAPSHOTS_LOCK_COUNT, READ_PATH_WAL_READER_BEGIN_COUNT,
+    READ_PATH_WRITE_TXN_LOCK_COUNT,
+};
 use crate::catalog::{
     identifiers_equal, CatalogHandle, CheckConstraint, ColumnSchema, ForeignKeyAction,
     ForeignKeyConstraint, IndexColumn, IndexKind, IndexSchema, TableSchema, TriggerEvent,
@@ -1054,6 +1057,8 @@ impl Db {
 
     /// Reads the latest visible version of a page.
     pub fn read_page(&self, page_id: u32) -> Result<Arc<[u8]>> {
+        #[cfg(feature = "bench-internals")]
+        READ_PATH_WAL_READER_BEGIN_COUNT.fetch_add(1, Ordering::Relaxed);
         let reader = self.inner.wal.begin_reader()?;
         self.read_page_at_snapshot_lsn(page_id, reader.snapshot_lsn())
     }
@@ -1334,6 +1339,8 @@ impl Db {
     /// Reads a page using a previously held snapshot token.
     pub fn read_page_for_snapshot(&self, token: u64, page_id: u32) -> Result<Arc<[u8]>> {
         page::validate_page_id(page_id)?;
+        #[cfg(feature = "bench-internals")]
+        READ_PATH_HELD_SNAPSHOTS_LOCK_COUNT.fetch_add(1, Ordering::Relaxed);
         let snapshot_lsn = self
             .inner
             .held_snapshots
@@ -1735,6 +1742,8 @@ impl Db {
             return runtime.execute_read_statement(statement, params, self.inner.config.page_size);
         }
 
+        #[cfg(feature = "bench-internals")]
+        READ_PATH_WAL_READER_BEGIN_COUNT.fetch_add(1, Ordering::Relaxed);
         let reader = self.inner.wal.begin_reader()?;
         let snapshot_lsn = reader.snapshot_lsn();
         self.refresh_engine_from_snapshot(snapshot_lsn)?;
@@ -4096,6 +4105,8 @@ impl Db {
     }
 
     fn begin_sql_snapshot(&self) -> Result<(ReaderGuard, u64, u64)> {
+        #[cfg(feature = "bench-internals")]
+        READ_PATH_WAL_READER_BEGIN_COUNT.fetch_add(1, Ordering::Relaxed);
         let reader = self.inner.wal.begin_reader()?;
         let snapshot_lsn = reader.snapshot_lsn();
         self.refresh_engine_from_snapshot(snapshot_lsn)?;
@@ -19496,10 +19507,39 @@ mod tests {
                 .expect("read catalog root page");
             assert_eq!(page.len(), DbConfig::default().page_size as usize);
         }
-        let (write_txn_lock_count, _) = benchmark::take_read_path_counters();
+        let counters = benchmark::take_read_path_counters();
         assert_eq!(
-            write_txn_lock_count, 0,
+            counters.write_txn_lock_count, 0,
             "read path should skip write_txn lock when no writer is active"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "bench-internals")]
+    fn read_page_for_snapshot_counts_held_snapshot_lock() {
+        use crate::benchmark;
+
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("held_snapshot_counter.ddb");
+        let db = Db::open_or_create(&path, DbConfig::default()).expect("open db");
+        db.execute("CREATE TABLE t (id INT64 PRIMARY KEY)")
+            .expect("create table");
+        db.execute("INSERT INTO t VALUES (1)").expect("insert");
+        db.checkpoint().expect("checkpoint");
+
+        let token = db.hold_snapshot().expect("hold snapshot");
+        benchmark::reset_read_path_counters();
+        let page = db
+            .read_page_for_snapshot(token, crate::storage::page::CATALOG_ROOT_PAGE_ID)
+            .expect("read page for snapshot");
+        assert_eq!(page.len(), DbConfig::default().page_size as usize);
+        db.release_snapshot(token).expect("release snapshot");
+
+        let counters = benchmark::take_read_path_counters();
+        assert_eq!(counters.held_snapshots_lock_count, 1);
+        assert_eq!(
+            counters.write_txn_lock_count, 0,
+            "held-snapshot read should still skip write_txn lock when no writer is active"
         );
     }
 

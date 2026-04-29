@@ -1,6 +1,6 @@
 //! In-memory WAL page-version hot set.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use smallvec::SmallVec;
@@ -104,6 +104,8 @@ pub(crate) struct WalIndex {
     pages: HashMap<PageId, VersionVec>,
     access_order: VecDeque<(PageId, u64)>,
     page_touch_epochs: HashMap<PageId, u64>,
+    dirty_since_demote: Vec<PageId>,
+    dirty_since_demote_set: HashSet<PageId>,
     next_touch_epoch: u64,
 }
 
@@ -126,6 +128,7 @@ impl WalIndex {
             versions.push(version);
         }
         self.touch(page_id);
+        self.mark_dirty_since_demote(page_id);
     }
 
     pub(crate) fn latest_visible(&self, page_id: PageId, snapshot_lsn: u64) -> Option<&WalVersion> {
@@ -161,7 +164,6 @@ impl WalIndex {
                 out.push((*page_id, entry.clone()));
             }
         }
-        out.sort_by_key(|(page_id, _)| *page_id);
     }
 
     #[cfg(test)]
@@ -184,6 +186,10 @@ impl WalIndex {
         self.pages = HashMap::new();
         self.access_order.clear();
         self.page_touch_epochs.clear();
+        self.dirty_since_demote.clear();
+        self.dirty_since_demote.shrink_to_fit();
+        self.dirty_since_demote_set.clear();
+        self.dirty_since_demote_set.shrink_to_fit();
         self.next_touch_epoch = 0;
     }
 
@@ -191,12 +197,24 @@ impl WalIndex {
         &mut self,
         min_reader_snapshot: Option<u64>,
         retain_recent_per_page: u32,
-    ) {
+    ) -> usize {
         let retain_recent_per_page = retain_recent_per_page as usize;
-        for versions in self.pages.values_mut() {
+        let dirty_pages = std::mem::take(&mut self.dirty_since_demote);
+        self.dirty_since_demote_set.clear();
+
+        let mut scanned_pages = 0;
+        for page_id in dirty_pages {
+            let Some(versions) = self.pages.get_mut(&page_id) else {
+                continue;
+            };
+            scanned_pages += 1;
             let demotable_prefix_len = versions.len().saturating_sub(retain_recent_per_page);
+            let mut retry_after_reader = false;
             for version in versions.iter_mut().take(demotable_prefix_len) {
                 if min_reader_snapshot.is_some_and(|snapshot| version.lsn <= snapshot) {
+                    // Reader-visible resident versions must be retried after the reader leaves.
+                    retry_after_reader |=
+                        matches!(version.payload, WalVersionPayload::Resident { .. });
                     continue;
                 }
                 let WalVersionPayload::Resident {
@@ -214,7 +232,15 @@ impl WalIndex {
                     encoding,
                 };
             }
+            if retry_after_reader {
+                self.mark_dirty_since_demote(page_id);
+            }
         }
+        if self.dirty_since_demote.is_empty() {
+            self.dirty_since_demote.shrink_to_fit();
+            self.dirty_since_demote_set.shrink_to_fit();
+        }
+        scanned_pages
     }
 
     #[must_use]
@@ -246,6 +272,7 @@ impl WalIndex {
         versions.push(version);
         self.pages.insert(page_id, versions);
         self.touch(page_id);
+        self.mark_dirty_since_demote(page_id);
     }
 
     pub(crate) fn touch(&mut self, page_id: PageId) {
@@ -253,6 +280,12 @@ impl WalIndex {
         let epoch = self.next_touch_epoch;
         self.page_touch_epochs.insert(page_id, epoch);
         self.access_order.push_back((page_id, epoch));
+    }
+
+    fn mark_dirty_since_demote(&mut self, page_id: PageId) {
+        if self.dirty_since_demote_set.insert(page_id) {
+            self.dirty_since_demote.push(page_id);
+        }
     }
 
     pub(crate) fn spill_one_cold_latest(
@@ -373,6 +406,74 @@ mod tests {
         assert!(matches!(
             index.latest_visible(1, 30).unwrap().payload,
             WalVersionPayload::Resident { .. }
+        ));
+    }
+
+    #[test]
+    fn demote_cold_only_scans_dirty_pages() {
+        let mut index = WalIndex::default();
+        for page_id in 1..=100 {
+            for lsn in [10_u64, 20] {
+                index.add_version(
+                    page_id,
+                    WalVersion::resident(
+                        lsn,
+                        page_id as u64 * 100 + lsn,
+                        4,
+                        FrameEncoding::Page,
+                        Arc::<[u8]>::from(vec![page_id as u8; 16]),
+                    ),
+                    true,
+                );
+            }
+        }
+
+        assert_eq!(index.demote_cold(None, 1), 100);
+
+        for lsn in [30_u64, 40] {
+            index.add_version(
+                101,
+                WalVersion::resident(
+                    lsn,
+                    10_000 + lsn,
+                    4,
+                    FrameEncoding::Page,
+                    Arc::<[u8]>::from(vec![0x65; 16]),
+                ),
+                true,
+            );
+        }
+
+        assert_eq!(index.demote_cold(None, 1), 1);
+    }
+
+    #[test]
+    fn demote_cold_retries_reader_visible_resident_versions() {
+        let mut index = WalIndex::default();
+        for lsn in [10_u64, 20] {
+            index.add_version(
+                1,
+                WalVersion::resident(
+                    lsn,
+                    lsn - 4,
+                    4,
+                    FrameEncoding::Page,
+                    Arc::<[u8]>::from(vec![lsn as u8; 16]),
+                ),
+                true,
+            );
+        }
+
+        assert_eq!(index.demote_cold(Some(15), 1), 1);
+        assert!(matches!(
+            index.latest_visible(1, 10).unwrap().payload,
+            WalVersionPayload::Resident { .. }
+        ));
+
+        assert_eq!(index.demote_cold(None, 1), 1);
+        assert!(matches!(
+            index.latest_visible(1, 10).unwrap().payload,
+            WalVersionPayload::OnDisk { .. }
         ));
     }
 

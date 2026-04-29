@@ -12,7 +12,10 @@ use hdrhistogram::Histogram;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use decentdb::benchmark::{snapshot_vfs_stats, VfsStats, VfsStatsScope};
+use decentdb::benchmark::{
+    reset_read_path_counters, snapshot_vfs_stats, take_read_path_counters, ReadPathCounters,
+    VfsStats, VfsStatsScope,
+};
 use decentdb::{Db, DbConfig, QueryResult, Value, WalSyncMode};
 
 use crate::cli::{ColdPointLookupProbeArgs, InternalCommand, RecoveryReopenProbeArgs};
@@ -1915,6 +1918,8 @@ fn read_under_write(profile: &ResolvedProfile, scenario_scratch: &Path) -> Resul
 
     let mut writer_iso_sum = 0.0_f64;
     let mut writer_under_sum = 0.0_f64;
+    let mut reader_iso_counters = ReadPathCounters::default();
+    let mut reader_under_counters = ReadPathCounters::default();
 
     for trial in 0..profile.trials {
         let trial_dir = scenario_scratch.join(format!("trial-{}", trial + 1));
@@ -1923,7 +1928,9 @@ fn read_under_write(profile: &ResolvedProfile, scenario_scratch: &Path) -> Resul
 
         let reader_iso_path = trial_dir.join("read_under_write_reader_iso.ddb");
         seed_read_under_write_db(&reader_iso_path, profile)?;
+        reset_read_path_counters();
         let reader_iso = run_reader_only_workload(&reader_iso_path, profile, trial)?;
+        add_read_path_counters(&mut reader_iso_counters, take_read_path_counters());
         reader_iso_agg.merge(reader_iso)?;
 
         let writer_iso_path = trial_dir.join("read_under_write_writer_iso.ddb");
@@ -1932,7 +1939,9 @@ fn read_under_write(profile: &ResolvedProfile, scenario_scratch: &Path) -> Resul
 
         let mixed_path = trial_dir.join("read_under_write_mixed.ddb");
         seed_read_under_write_db(&mixed_path, profile)?;
+        reset_read_path_counters();
         let (reader_under, writer_under) = run_mixed_workload(&mixed_path, profile, trial)?;
+        add_read_path_counters(&mut reader_under_counters, take_read_path_counters());
         reader_under_agg.merge(reader_under)?;
         writer_under_sum += writer_under;
     }
@@ -1986,6 +1995,37 @@ fn read_under_write(profile: &ResolvedProfile, scenario_scratch: &Path) -> Resul
     );
     metrics.insert("reader_threads".to_string(), json!(profile.reader_threads));
     metrics.insert("writer_ops".to_string(), json!(profile.writer_ops));
+    insert_read_path_counter_metrics(
+        &mut metrics,
+        "reader_iso",
+        reader_iso_counters,
+        profile
+            .point_reads
+            .saturating_mul(u64::from(profile.trials)),
+        "per_read",
+    );
+    insert_read_path_counter_metrics(
+        &mut metrics,
+        "reader_under_write",
+        reader_under_counters,
+        profile
+            .point_reads
+            .saturating_add(profile.writer_ops)
+            .saturating_mul(u64::from(profile.trials)),
+        "per_measured_operation",
+    );
+    metrics.insert(
+        "read_path_write_txn_lock_count".to_string(),
+        json!(reader_under_counters.write_txn_lock_count),
+    );
+    metrics.insert(
+        "read_path_held_snapshots_lock_count".to_string(),
+        json!(reader_under_counters.held_snapshots_lock_count),
+    );
+    metrics.insert(
+        "read_path_wal_reader_begin_count".to_string(),
+        json!(reader_under_counters.wal_reader_begin_count),
+    );
 
     Ok(ScenarioResult {
         status: ScenarioStatus::Passed,
@@ -2011,6 +2051,59 @@ fn read_under_write(profile: &ResolvedProfile, scenario_scratch: &Path) -> Resul
         vfs_stats: None,
         artifacts: Vec::new(),
     })
+}
+
+fn add_read_path_counters(total: &mut ReadPathCounters, sample: ReadPathCounters) {
+    total.write_txn_lock_count = total
+        .write_txn_lock_count
+        .saturating_add(sample.write_txn_lock_count);
+    total.held_snapshots_lock_count = total
+        .held_snapshots_lock_count
+        .saturating_add(sample.held_snapshots_lock_count);
+    total.wal_reader_begin_count = total
+        .wal_reader_begin_count
+        .saturating_add(sample.wal_reader_begin_count);
+}
+
+fn insert_read_path_counter_metrics(
+    metrics: &mut BTreeMap<String, serde_json::Value>,
+    prefix: &str,
+    counters: ReadPathCounters,
+    measured_ops: u64,
+    rate_suffix: &str,
+) {
+    let rate = |count: u64| {
+        if measured_ops == 0 {
+            0.0
+        } else {
+            count as f64 / measured_ops as f64
+        }
+    };
+
+    metrics.insert(
+        format!("{prefix}_read_path_write_txn_lock_count"),
+        json!(counters.write_txn_lock_count),
+    );
+    metrics.insert(
+        format!("{prefix}_read_path_write_txn_locks_{rate_suffix}"),
+        json!(rate(counters.write_txn_lock_count)),
+    );
+    metrics.insert(
+        format!("{prefix}_read_path_held_snapshots_lock_count"),
+        json!(counters.held_snapshots_lock_count),
+    );
+    metrics.insert(
+        format!("{prefix}_read_path_held_snapshot_locks_{rate_suffix}"),
+        json!(rate(counters.held_snapshots_lock_count)),
+    );
+    metrics.insert(
+        format!("{prefix}_read_path_wal_reader_begin_count"),
+        json!(counters.wal_reader_begin_count),
+    );
+    metrics.insert(
+        format!("{prefix}_read_path_wal_reader_begins_{rate_suffix}"),
+        json!(rate(counters.wal_reader_begin_count)),
+    );
 }
 
 fn storage_efficiency(
