@@ -26,8 +26,8 @@ Status values:
 | DR-01 | Done | Rust engine | DR-00 | Add doctor domain model and report serialization | No CLI yet |
 | DR-02 | Done | Rust engine | DR-01 | Implement read-only fact collection from existing metadata | Must support partial header-only report |
 | DR-03 | Done | Rust engine | DR-02 | Implement v1 rule engine and finding catalog | Use exact IDs from this plan. `statistics.missing_analyze` deferred — no typed stats helper yet. |
-| DR-04 | Pending | Rust engine | DR-03 | Add optional index verification integration | Must be opt-in and capped |
-| DR-05 | Pending | Rust engine | DR-03, DR-04 | Add constrained `--fix` planner and executor | Only actions in Section 6.6 |
+| DR-04 | Done | Rust engine | DR-03 | Add optional index verification integration | Must be opt-in and capped |
+| DR-05 | Done | Rust engine | DR-03, DR-04 | Add constrained `--fix` planner and executor | Only actions in Section 6.6. `fix.analyze` always skipped — no typed stats helper. `open_failed` fixture blocker documented. |
 | DR-06 | Pending | CLI | DR-03, DR-05 | Add `decentdb doctor` command, options, JSON output, fix mode, and exit codes | Markdown may be stubbed only if DR-07 follows immediately |
 | DR-07 | Pending | CLI | DR-06 | Add Markdown renderer and optional table summary | Markdown must render same report data as JSON |
 | DR-08 | Pending | Tests | DR-01 through DR-07 | Add unit, integration, golden, fix, and no-mutation tests | Includes CLI exit-code tests |
