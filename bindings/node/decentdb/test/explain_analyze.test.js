@@ -3,19 +3,23 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 const { Database } = require('..');
 
-const DB_PATH = 'test_explain_analyze.db';
-
-function cleanup() {
-  try { fs.unlinkSync(DB_PATH); } catch {}
-  try { fs.unlinkSync(DB_PATH + '-wal'); } catch {}
+function tmpDb() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'decentdb-explain-'));
+  return {
+    dbPath: path.join(dir, 'test.ddb'),
+    cleanup() {
+      fs.rmSync(dir, { recursive: true, force: true });
+    },
+  };
 }
 
 test('EXPLAIN ANALYZE returns plan with actual metrics', async (t) => {
-  cleanup();
-
-  const db = new Database({ path: DB_PATH });
+  const { dbPath, cleanup } = tmpDb();
+  const db = new Database({ path: dbPath });
   db.exec('CREATE TABLE t (id BIGINT, name TEXT)');
   db.exec('INSERT INTO t VALUES ($1, $2)', [1n, 'Alice']);
   db.exec('INSERT INTO t VALUES ($1, $2)', [2n, 'Bob']);
@@ -35,9 +39,8 @@ test('EXPLAIN ANALYZE returns plan with actual metrics', async (t) => {
 });
 
 test('EXPLAIN without ANALYZE has no actual metrics', async (t) => {
-  cleanup();
-
-  const db = new Database({ path: DB_PATH });
+  const { dbPath, cleanup } = tmpDb();
+  const db = new Database({ path: dbPath });
   db.exec('CREATE TABLE t (id BIGINT)');
 
   const res = await db.execAsync('EXPLAIN SELECT * FROM t');
@@ -51,9 +54,8 @@ test('EXPLAIN without ANALYZE has no actual metrics', async (t) => {
 });
 
 test('EXPLAIN ANALYZE with empty table shows zero rows', async (t) => {
-  cleanup();
-
-  const db = new Database({ path: DB_PATH });
+  const { dbPath, cleanup } = tmpDb();
+  const db = new Database({ path: dbPath });
   db.exec('CREATE TABLE t (id BIGINT)');
 
   const res = await db.execAsync('EXPLAIN ANALYZE SELECT * FROM t');
@@ -65,9 +67,8 @@ test('EXPLAIN ANALYZE with empty table shows zero rows', async (t) => {
 });
 
 test('EXPLAIN ANALYZE with filter shows filtered row count', async (t) => {
-  cleanup();
-
-  const db = new Database({ path: DB_PATH });
+  const { dbPath, cleanup } = tmpDb();
+  const db = new Database({ path: dbPath });
   db.exec('CREATE TABLE t (id BIGINT)');
   for (let i = 1; i <= 10; i++) {
     db.exec('INSERT INTO t VALUES ($1)', [BigInt(i)]);

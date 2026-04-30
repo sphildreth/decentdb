@@ -5911,7 +5911,7 @@ mod tests {
     use crate::db::SqlTxnSlot;
     use crate::error::{DbError, Result};
     use crate::exec::{
-        decode_paged_table_manifest_payload, EngineRuntime, TableData, TableRowSource,
+        decode_paged_table_manifest_payload, EngineRuntime, RuntimeIndex, TableData, TableRowSource,
     };
     use crate::record::overflow::read_overflow;
     use crate::storage::page::{PageId, PageStore};
@@ -6664,6 +6664,89 @@ mod tests {
         assert!(
             json_after.contains("\"deferred_table_count\":1"),
             "expected checkpoint compaction to keep paged-backed table deferred, got: {json_after}"
+        );
+    }
+
+    #[test]
+    fn deferred_paged_secondary_index_point_lookup_stays_indexed_and_unloaded() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir
+            .path()
+            .join("deferred-paged-secondary-index-point-lookup.ddb");
+        let config = DbConfig {
+            paged_row_storage: true,
+            ..DbConfig::default()
+        };
+        let db = Db::open_or_create(&path, config).expect("open db");
+        db.execute("CREATE TABLE bench (id INT64, val TEXT, f FLOAT64)")
+            .expect("create bench");
+        db.execute("CREATE INDEX bench_id_idx ON bench(id)")
+            .expect("create id index");
+        let mut txn = db.transaction().expect("begin txn");
+        let insert = txn
+            .prepare("INSERT INTO bench VALUES ($1, $2, $3)")
+            .expect("prepare insert");
+        for i in 0_i64..128_i64 {
+            insert
+                .execute_in(
+                    &mut txn,
+                    &[
+                        Value::Int64(i),
+                        Value::Text(format!("value_{i}")),
+                        Value::Float64(i as f64),
+                    ],
+                )
+                .expect("insert row");
+        }
+        txn.commit().expect("commit rows");
+
+        {
+            let runtime = db.inner.engine.read().expect("engine runtime lock");
+            let index = runtime
+                .catalog
+                .index("bench_id_idx")
+                .expect("catalog index after redefer");
+            assert!(
+                index.fresh,
+                "secondary index should stay fresh after redefer"
+            );
+            assert!(
+                matches!(
+                    runtime.index("bench_id_idx"),
+                    Some(RuntimeIndex::Btree { .. })
+                ),
+                "runtime btree index should remain available for deferred lookups"
+            );
+            assert!(
+                runtime
+                    .deferred_table_names()
+                    .any(|name| name.eq_ignore_ascii_case("bench")),
+                "bench should be deferred after commit"
+            );
+        }
+
+        let result = db
+            .execute("SELECT id, val, f FROM bench WHERE id = 42")
+            .expect("indexed point lookup");
+        assert_eq!(result.rows().len(), 1);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[
+                Value::Int64(42),
+                Value::Text("value_42".to_string()),
+                Value::Float64(42.0),
+            ]
+        );
+        let json_after = db
+            .inspect_storage_state_json()
+            .expect("json after indexed lookup");
+        assert!(
+            json_after.contains("\"loaded_table_count\":0"),
+            "indexed deferred lookup should not materialize the table, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"deferred_table_count\":1"),
+            "indexed deferred lookup should keep the table deferred, got: {json_after}"
         );
     }
 

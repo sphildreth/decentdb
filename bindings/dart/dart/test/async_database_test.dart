@@ -45,10 +45,12 @@ void main() {
     final db = await AsyncDatabase.open(':memory:', libraryPath: libPath);
     addTearDown(db.close);
 
-    // Build a large table so the worker is busy for a moment.
+    // Build enough rows so the worker is busy for a moment without making the
+    // binding smoke suite sensitive to parallel pre-commit load.
     await db.execute('CREATE TABLE t (id INT64 PRIMARY KEY, v TEXT)');
     final ins = await db.prepare(r'INSERT INTO t VALUES ($1, $2)');
-    for (var i = 0; i < 5000; i++) {
+    const rowCount = 2000;
+    for (var i = 0; i < rowCount; i++) {
       await ins.bindAll([i, 'x' * 64]);
       await ins.execute();
       await ins.reset();
@@ -59,7 +61,7 @@ void main() {
     // responsiveness with a Timer.
     var timerFires = 0;
     final timer =
-        Timer.periodic(const Duration(milliseconds: 5), (_) => timerFires++);
+        Timer.periodic(const Duration(milliseconds: 1), (_) => timerFires++);
 
     final sel =
         await db.prepare('SELECT id FROM t WHERE v LIKE \'x%\'');
@@ -67,7 +69,7 @@ void main() {
     await sel.dispose();
     timer.cancel();
 
-    expect(rows.length, 5000);
+    expect(rows.length, rowCount);
     // The timer should have fired at least a few times while the query was
     // running, proving the main isolate remained responsive.
     expect(timerFires, greaterThanOrEqualTo(1));

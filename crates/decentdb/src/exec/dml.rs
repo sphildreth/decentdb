@@ -21,7 +21,8 @@ use super::row::{ColumnBinding, Dataset, QueryResult, QueryRow};
 use super::{
     compare_values, compute_index_key, compute_index_values, generated_columns_are_stored,
     row_satisfies_index_predicate, table_row_dataset, EngineRuntime, RuntimeBtreeKey, RuntimeIndex,
-    RuntimeRowIdSet, StoredRow, TableRowRef, TableRowSource,
+    RuntimeRowIdSet, StoredRow, TablePageManifest, TableRowRef, TableRowSource,
+    PAGED_TABLE_RESIDENT_APPEND_ROW_THRESHOLD,
 };
 
 #[derive(Clone, Debug)]
@@ -1191,6 +1192,29 @@ impl EngineRuntime {
         stored_row: &StoredRow,
         page_size: u32,
     ) -> Result<()> {
+        self.append_stored_row_to_table_row_source_with_mode(
+            table_name, stored_row, page_size, false,
+        )
+    }
+
+    fn append_stored_row_to_table_row_source_preserving_paged(
+        &mut self,
+        table_name: &str,
+        stored_row: &StoredRow,
+        page_size: u32,
+    ) -> Result<()> {
+        self.append_stored_row_to_table_row_source_with_mode(
+            table_name, stored_row, page_size, true,
+        )
+    }
+
+    fn append_stored_row_to_table_row_source_with_mode(
+        &mut self,
+        table_name: &str,
+        stored_row: &StoredRow,
+        page_size: u32,
+        _preserve_paged: bool,
+    ) -> Result<()> {
         if self.temp_table_schema(table_name).is_some() {
             self.temp_table_data_mut(table_name)
                 .ok_or_else(|| {
@@ -1200,32 +1224,29 @@ impl EngineRuntime {
                 .push(stored_row.clone());
             return Ok(());
         }
-        if matches!(
-            self.table_row_source(table_name),
-            Some(TableRowSource::Resident(_))
-        ) {
-            self.table_data_mut(table_name)
-                .ok_or_else(|| {
-                    DbError::internal(format!("table data for {table_name} is missing"))
-                })?
-                .rows
-                .push(stored_row.clone());
-            return Ok(());
-        }
-        let Some(TableRowSource::Paged(manifest)) = self.table_row_source(table_name) else {
+        let use_paged_row_storage = self.paged_row_storage;
+        let Some(row_source) = self.entry_table_row_source_mut(table_name) else {
             return Err(DbError::internal(format!(
                 "table row source for {table_name} is missing"
             )));
         };
-        let updated_manifest = super::append_paged_rows_to_manifest(
-            manifest.as_ref(),
-            page_size,
-            std::slice::from_ref(stored_row),
-        )?;
-        self.replace_table_row_source(
-            table_name,
-            TableRowSource::Paged(Arc::new(updated_manifest)),
-        )
+        match row_source {
+            TableRowSource::Resident(data) => {
+                let data = Arc::make_mut(data);
+                data.rows.push(stored_row.clone());
+                if use_paged_row_storage
+                    && data.rows.len() >= PAGED_TABLE_RESIDENT_APPEND_ROW_THRESHOLD
+                {
+                    *row_source = TableRowSource::Paged(Arc::new(TablePageManifest::from_rows(
+                        &data.rows, page_size,
+                    )?));
+                }
+                Ok(())
+            }
+            TableRowSource::Paged(manifest) => {
+                Arc::make_mut(manifest).append_row(stored_row, page_size)
+            }
+        }
     }
 
     fn apply_row_changes_to_table_row_source(
@@ -1402,7 +1423,15 @@ impl EngineRuntime {
             };
             let index_updates =
                 self.prepare_insert_index_updates(&table_name, &stored_row, page_size)?;
-            self.append_stored_row_to_table_row_source(&table_name, &stored_row, page_size)?;
+            if statement.returning.is_empty() {
+                self.append_stored_row_to_table_row_source(&table_name, &stored_row, page_size)?;
+            } else {
+                self.append_stored_row_to_table_row_source_preserving_paged(
+                    &table_name,
+                    &stored_row,
+                    page_size,
+                )?;
+            }
             self.apply_insert_index_updates(index_updates)?;
             if !temporary {
                 self.mark_table_row_appended(&table_name);
@@ -2729,7 +2758,15 @@ impl EngineRuntime {
         let index_updates =
             self.prepare_insert_index_updates(&table_name, &stored_row, page_size)?;
 
-        self.append_stored_row_to_table_row_source(&table_name, &stored_row, page_size)?;
+        if statement.returning.is_empty() {
+            self.append_stored_row_to_table_row_source(&table_name, &stored_row, page_size)?;
+        } else {
+            self.append_stored_row_to_table_row_source_preserving_paged(
+                &table_name,
+                &stored_row,
+                page_size,
+            )?;
+        }
         if let Some(table) = self.temp_table_schema_mut(&table_name) {
             table.next_row_id = staged_table.next_row_id;
         } else {
