@@ -461,7 +461,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         Commands::Export(command) => run_export(command)?,
         Commands::BulkLoad(command) => run_bulk_load(command)?,
         Commands::Checkpoint(command) => {
-            open_db(&command.db, false, 0, 0)?.checkpoint()?;
+            open_db(&command.db, false, 0, 0)?.checkpoint_wal()?;
             println!("checkpoint complete");
         }
         Commands::SaveAs(command) => {
@@ -504,7 +504,7 @@ fn run_exec(command: &ExecCommand) -> Result<()> {
     }
 
     if command.sql.is_none() && command.checkpoint {
-        db.checkpoint()?;
+        db.checkpoint_wal()?;
         match command.format {
             OutputFormat::Json => println!("{}", render_exec_success_json(&[], 0.0, true)),
             _ => println!("checkpoint complete"),
@@ -527,7 +527,7 @@ fn run_exec(command: &ExecCommand) -> Result<()> {
         results = vec![QueryResult::with_affected_rows(row_count as u64)];
     }
     if command.checkpoint {
-        db.checkpoint()?;
+        db.checkpoint_wal()?;
     }
     let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
     match command.format {
@@ -776,7 +776,7 @@ fn run_dump(command: DumpCommand) -> Result<()> {
 }
 
 fn run_dump_header(command: DumpHeaderCommand) -> Result<()> {
-    let header = open_db(&command.db, false, 0, 0)?.header_info()?;
+    let header = Db::read_header_info(&command.db)?;
     print_header_info(command.format, &header);
     Ok(())
 }
@@ -870,7 +870,7 @@ fn run_vacuum(command: VacuumCommand) -> Result<()> {
         fs::remove_file(&command.output)?;
     }
     let db = open_db(&command.db, false, 0, 0)?;
-    db.checkpoint()?;
+    db.checkpoint_wal()?;
     db.save_as(&command.output)?;
     evict_shared_wal(&command.output)?;
     println!("{}", command.output.display());
@@ -878,7 +878,7 @@ fn run_vacuum(command: VacuumCommand) -> Result<()> {
 }
 
 fn run_verify_header(command: VerifyHeaderCommand) -> Result<()> {
-    let header = open_db(&command.db, false, 0, 0)?.header_info()?;
+    let header = Db::read_header_info(&command.db)?;
     print_header_info(command.format, &header);
     Ok(())
 }

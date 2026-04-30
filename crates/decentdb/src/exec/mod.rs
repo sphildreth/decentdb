@@ -1814,13 +1814,7 @@ impl EngineRuntime {
         if !runtime.deferred_tables.is_empty() && !config.defer_table_materialization {
             runtime.materialize_deferred_tables_with_store(&store, pager.page_size(), None)?;
         }
-        if config.defer_table_materialization && !runtime.deferred_tables.is_empty() {
-            // Mark all catalog indexes as stale so the lazy materialization
-            // path will rebuild them once row data is available.
-            for index in runtime.catalog_mut().indexes.values_mut() {
-                index.fresh = false;
-            }
-        } else {
+        if !config.defer_table_materialization || runtime.deferred_tables.is_empty() {
             runtime.rebuild_indexes(pager.page_size())?;
         }
         Ok(runtime)
@@ -3091,6 +3085,7 @@ impl EngineRuntime {
         for index in self.catalog_mut().indexes.values_mut() {
             index.fresh = true;
         }
+        self.manifest_template = None;
         self.index_state_epoch = self.index_state_epoch.wrapping_add(1);
         Ok(())
     }
@@ -3107,6 +3102,7 @@ impl EngineRuntime {
         if let Some(index) = self.catalog_mut().indexes.get_mut(name) {
             index.fresh = true;
         }
+        self.manifest_template = None;
         self.index_state_epoch = self.index_state_epoch.wrapping_add(1);
         Ok(())
     }
@@ -3167,6 +3163,9 @@ impl EngineRuntime {
                 index.fresh = false;
                 changed = true;
             }
+        }
+        if changed {
+            self.manifest_template = None;
         }
         let indexes = self.indexes_mut();
         for index_name in index_names {
@@ -5584,7 +5583,10 @@ impl EngineRuntime {
         let QueryBody::Select(select) = &query.body else {
             return None;
         };
-        if !select.group_by.is_empty() || select.having.is_some() {
+        if !select.group_by.is_empty()
+            || select.having.is_some()
+            || projection_has_aggregate_items(&select.projection)
+        {
             return None;
         }
         if select.from.len() != 1 {
@@ -5789,7 +5791,18 @@ impl EngineRuntime {
             .cloned()
             .chain(right_columns.iter().cloned())
             .collect();
-        let join_dataset = Dataset::with_rows(join_ds_columns, join_output);
+        let mut join_dataset = Dataset::with_rows(join_ds_columns, join_output);
+        if let Some(filter) = plan.filter {
+            let filter_ds = Dataset::with_rows(join_dataset.columns.clone(), Vec::new());
+            let mut filtered = Vec::with_capacity(join_dataset.rows.len());
+            for row in join_dataset.take_rows() {
+                let val = self.eval_expr(filter, &filter_ds, &row, params, &ctes, None)?;
+                if matches!(val, Value::Bool(true)) {
+                    filtered.push(row);
+                }
+            }
+            join_dataset.set_rows(filtered);
+        }
 
         let mut output_rows: Vec<Vec<Value>> = Vec::new();
         for row in join_dataset.rows.iter() {
@@ -5803,18 +5816,6 @@ impl EngineRuntime {
                 projected.push(self.eval_expr(expr, &join_dataset, row, params, &ctes, None)?);
             }
             output_rows.push(projected);
-        }
-
-        if let Some(filter) = plan.filter {
-            let filter_ds = Dataset::with_rows(result_columns.clone(), Vec::new());
-            let mut filtered = Vec::with_capacity(output_rows.len());
-            for row in &output_rows {
-                let val = self.eval_expr(filter, &filter_ds, row, params, &ctes, None)?;
-                if matches!(val, Value::Bool(true)) {
-                    filtered.push(row.clone());
-                }
-            }
-            output_rows = filtered;
         }
 
         let has_order_by = !plan.order_by.is_empty();
@@ -5907,7 +5908,11 @@ impl EngineRuntime {
         let QueryBody::Select(select) = &query.body else {
             return Ok(None);
         };
-        if !select.group_by.is_empty() || select.having.is_some() || select.from.len() != 1 {
+        if !select.group_by.is_empty()
+            || select.having.is_some()
+            || projection_has_aggregate_items(&select.projection)
+            || select.from.len() != 1
+        {
             return Ok(None);
         }
         if !select.distinct_on.is_empty() {
@@ -12259,7 +12264,7 @@ impl PageStore for DbTxnPageStore<'_> {
     }
 
     fn read_page(&self, page_id: PageId) -> Result<Arc<[u8]>> {
-        self.db.read_page(page_id)
+        self.db.read_page_in_write_txn(page_id)
     }
 
     fn advise_sequential(&self) -> Result<()> {
@@ -27167,6 +27172,79 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_join_query_uses_grouped_evaluation() {
+        let mut runtime = EngineRuntime::empty(1);
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE artists (id INT64 PRIMARY KEY, name TEXT)",
+        );
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE albums (id INT64 PRIMARY KEY, artist_id INT64, name TEXT)",
+        );
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE songs (id INT64 PRIMARY KEY, album_id INT64, title TEXT)",
+        );
+        execute_sql(&mut runtime, "INSERT INTO artists VALUES (1, 'one')");
+        execute_sql(&mut runtime, "INSERT INTO artists VALUES (2, 'two')");
+        execute_sql(&mut runtime, "INSERT INTO albums VALUES (10, 1, 'first')");
+        execute_sql(&mut runtime, "INSERT INTO albums VALUES (20, 2, 'second')");
+        execute_sql(&mut runtime, "INSERT INTO songs VALUES (100, 10, 'alpha')");
+        execute_sql(&mut runtime, "INSERT INTO songs VALUES (101, 10, 'beta')");
+        execute_sql(&mut runtime, "INSERT INTO songs VALUES (200, 20, 'gamma')");
+
+        let statement = parse_sql_statement(
+            "SELECT COUNT(*) \
+             FROM songs AS s \
+             INNER JOIN albums AS a ON s.album_id = a.id \
+             WHERE a.artist_id = 1",
+        )
+        .expect("parse aggregate join query");
+        let result = runtime
+            .execute_statement(&statement, &[], PAGE_SIZE)
+            .expect("execute aggregate join query");
+
+        assert_eq!(result.rows().len(), 1);
+        assert_eq!(result.rows()[0].values(), &[Value::Int64(2)]);
+    }
+
+    #[test]
+    fn base_table_join_filters_against_join_scope_before_projection() {
+        let mut runtime = EngineRuntime::empty(1);
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE users (id INT64 PRIMARY KEY, name TEXT)",
+        );
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE shares (id INT64 PRIMARY KEY, user_id INT64, share_unique_id TEXT)",
+        );
+        execute_sql(&mut runtime, "INSERT INTO users VALUES (1, 'user-one')");
+        execute_sql(&mut runtime, "INSERT INTO users VALUES (2, 'user-two')");
+        execute_sql(&mut runtime, "INSERT INTO shares VALUES (10, 1, 'target')");
+        execute_sql(&mut runtime, "INSERT INTO shares VALUES (20, 2, 'other')");
+
+        let statement = parse_sql_statement(
+            "SELECT s.id, u.name \
+             FROM shares AS s \
+             INNER JOIN users AS u ON s.user_id = u.id \
+             WHERE s.share_unique_id = 'target' \
+             LIMIT 1",
+        )
+        .expect("parse filtered join query");
+        let result = runtime
+            .execute_statement(&statement, &[], PAGE_SIZE)
+            .expect("execute filtered join query");
+
+        assert_eq!(result.rows().len(), 1);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[Value::Int64(10), Value::Text("user-one".to_string())]
+        );
+    }
+
+    #[test]
     fn simple_indexed_left_join_without_filter_uses_fast_path() {
         let mut runtime = EngineRuntime::empty(1);
         execute_sql(
@@ -27672,6 +27750,7 @@ mod tests {
         let mut runtime = db.debug_engine_snapshot().expect("snapshot runtime");
         let initial_state = runtime.persisted_tables["docs"];
         let store = DbTxnPageStore { db: &db };
+        db.begin_write().expect("begin write transaction");
         let initial_manifest_payload =
             crate::record::overflow::read_overflow(&store, initial_state.pointer)
                 .expect("read manifest payload");
@@ -27679,6 +27758,7 @@ mod tests {
             .expect("decode manifest payload");
         let initial_page_manifest =
             read_table_page_manifest_from_state(&store, initial_state).expect("read manifest");
+        db.commit().expect("commit write transaction");
         assert!(
             initial_manifest.chunks.len() > 2,
             "expected multiple chunks to observe pointer preservation"
@@ -27720,11 +27800,15 @@ mod tests {
         db.commit().expect("commit write txn");
 
         let rewritten_state = runtime.persisted_tables["docs"];
+        db.begin_write().expect("begin write transaction");
         let rewritten_manifest_payload =
             crate::record::overflow::read_overflow(&store, rewritten_state.pointer)
                 .expect("read manifest payload");
         let rewritten_manifest = decode_paged_table_manifest_payload(&rewritten_manifest_payload)
             .expect("decode manifest payload");
+        let rewritten_page_manifest =
+            read_table_page_manifest_from_state(&store, rewritten_state).expect("read manifest");
+        db.commit().expect("commit write transaction");
         let preserved_untouched = rewritten_manifest
             .chunks
             .iter()
@@ -27734,8 +27818,6 @@ mod tests {
                     .then_some(chunk.pointer)
             })
             .collect::<Vec<_>>();
-        let rewritten_page_manifest =
-            read_table_page_manifest_from_state(&store, rewritten_state).expect("read manifest");
         let updated_row = rewritten_page_manifest
             .row_by_id(6)
             .expect("read updated row")

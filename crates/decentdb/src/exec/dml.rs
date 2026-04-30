@@ -194,6 +194,15 @@ impl EngineRuntime {
                 dependencies.push(child);
             }
         }
+        for foreign_key in &table.foreign_keys {
+            if dependencies
+                .iter()
+                .any(|name| identifiers_equal(name, &foreign_key.referenced_table))
+            {
+                continue;
+            }
+            dependencies.push(foreign_key.referenced_table.clone());
+        }
         Some(dependencies)
     }
 
@@ -4050,8 +4059,16 @@ fn collect_updated_foreign_key_parent_tables(
 
 fn collect_delete_dependency_tables(runtime: &EngineRuntime, table_name: &str) -> Vec<String> {
     let mut dependencies: Vec<String> = Vec::new();
+    let mut visited: Vec<String> = Vec::new();
     let mut queue = VecDeque::from([table_name.to_string()]);
     while let Some(parent_table_name) = queue.pop_front() {
+        if visited
+            .iter()
+            .any(|name| identifiers_equal(name, &parent_table_name))
+        {
+            continue;
+        }
+        visited.push(parent_table_name.clone());
         for child in runtime.catalog.tables.values() {
             let mut depends_on_parent = false;
             let mut cascades_delete = false;
@@ -4074,6 +4091,9 @@ fn collect_delete_dependency_tables(runtime: &EngineRuntime, table_name: &str) -
                 dependencies.push(child.name.clone());
             }
             if cascades_delete
+                && !visited
+                    .iter()
+                    .any(|name| identifiers_equal(name, &child.name))
                 && !queue
                     .iter()
                     .any(|name| identifiers_equal(name, &child.name))
@@ -4301,6 +4321,57 @@ mod tests {
         let manifest = super::super::TablePageManifest::from_payload(Arc::new(payload))
             .expect("build paged test manifest");
         TableRowSource::Paged(Arc::new(manifest))
+    }
+
+    fn execute_sql(runtime: &mut EngineRuntime, sql: &str) {
+        let statement = crate::sql::parser::parse_sql_statement(sql).expect("parse SQL");
+        runtime
+            .execute_statement(&statement, &[], 4096)
+            .expect("execute SQL");
+    }
+
+    #[test]
+    fn delete_dependency_tables_terminate_for_transitive_self_cascade() {
+        let mut runtime = EngineRuntime::empty(1);
+        execute_sql(&mut runtime, "CREATE TABLE requests (id INT64 PRIMARY KEY)");
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE request_comments (\
+             id INT64 PRIMARY KEY, \
+             request_id INT64 REFERENCES requests(id) ON DELETE CASCADE, \
+             parent_comment_id INT64 REFERENCES request_comments(id) ON DELETE CASCADE)",
+        );
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE request_participants (\
+             request_id INT64 REFERENCES requests(id) ON DELETE CASCADE, \
+             user_id INT64, \
+             PRIMARY KEY(request_id, user_id))",
+        );
+
+        let statement =
+            crate::sql::parser::parse_sql_statement("DELETE FROM requests WHERE id = 1")
+                .expect("parse delete");
+        let crate::sql::ast::Statement::Delete(delete) = statement else {
+            panic!("expected delete statement");
+        };
+        let dependencies = runtime
+            .delete_row_source_dependency_tables(&delete)
+            .expect("collect delete dependencies");
+
+        assert!(dependencies
+            .iter()
+            .any(|name| identifiers_equal(name, "request_comments")));
+        assert!(dependencies
+            .iter()
+            .any(|name| identifiers_equal(name, "request_participants")));
+        assert_eq!(
+            dependencies
+                .iter()
+                .filter(|name| identifiers_equal(name, "request_comments"))
+                .count(),
+            1
+        );
     }
 
     #[test]

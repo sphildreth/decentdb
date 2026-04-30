@@ -183,6 +183,12 @@ fn run_checkpoint_if_needed(wal: &WalHandle, pager: &PagerHandle) -> crate::erro
     if wal.inner.checkpoint_pending.load(Ordering::Acquire) {
         return Ok(());
     }
+    // Same policy as the writer-side auto-checkpoint path: shared WALs use
+    // independent pager caches per Db handle, so implicit background copyback
+    // is unsafe until cache invalidation is coordinated.
+    if wal.is_shared() {
+        return Ok(());
+    }
     if wal.inner.reader_registry.active_reader_count()? > 0 {
         return Ok(());
     }

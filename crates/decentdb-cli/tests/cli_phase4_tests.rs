@@ -205,6 +205,41 @@ fn import_export_bulk_load_and_maintenance_commands_work() {
 }
 
 #[test]
+fn header_only_commands_ignore_sparse_huge_wal_files() {
+    let dir = temp_dir();
+    let db = dir.join("huge-wal-header-only.ddb");
+    let db_str = db.display().to_string();
+
+    run(&[
+        "exec",
+        "--db",
+        &db_str,
+        "--sql",
+        "CREATE TABLE users (id INT64 PRIMARY KEY, name TEXT);",
+        "--format",
+        "json",
+    ]);
+
+    let wal = db.with_extension("ddb.wal");
+    let wal_file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&wal)
+        .expect("open sparse WAL");
+    if let Err(err) = wal_file.set_len(8 * 1024 * 1024) {
+        eprintln!("skipping test: unable to create sparse WAL fixture: {err}");
+        return;
+    }
+
+    let header = run(&["dump-header", "--db", &db_str, "--format", "table"]);
+    assert!(header.contains("format_version"));
+
+    let verify_header = run(&["verify-header", "--db", &db_str, "--format", "table"]);
+    assert!(verify_header.contains("magic_hex"));
+}
+
+#[test]
 fn completion_and_repl_smoke_work() {
     let bash_completion = run(&["completion", "--shell", "bash"]);
     assert!(bash_completion.contains("exec repl import export"));

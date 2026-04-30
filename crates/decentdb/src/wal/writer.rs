@@ -500,6 +500,13 @@ fn maybe_auto_checkpoint(wal: &WalHandle, pager: &PagerHandle) -> Result<()> {
     if wal.inner.checkpoint_pending.load(Ordering::Acquire) {
         return Ok(());
     }
+    // Shared WAL handles have independent Db pager caches. Automatic
+    // checkpoint copyback can invalidate another handle's cached main-db pages,
+    // so shared file-backed databases require explicit checkpointing until
+    // pager cache invalidation is coordinated across handles.
+    if wal.is_shared() {
+        return Ok(());
+    }
 
     // ADR 0058: prefer the background worker when present so the writer's
     // commit hot path is not blocked by checkpoint copyback. The worker

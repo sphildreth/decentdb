@@ -3,19 +3,24 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 const { Database } = require('..');
 
-const DB_PATH = 'test_decimal.db';
-
-function cleanup() {
-  try { fs.unlinkSync(DB_PATH); } catch {}
-  try { fs.unlinkSync(DB_PATH + '-wal'); } catch {}
+function tmpDb() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'decentdb-node-decimal-'));
+  return {
+    dbPath: path.join(dir, 'test.ddb'),
+    cleanup() {
+      fs.rmSync(dir, { recursive: true, force: true });
+    },
+  };
 }
 
 test('Decimal type support', async (t) => {
-  cleanup();
-  
-  const db = new Database({ path: DB_PATH });
+  const { dbPath, cleanup } = tmpDb();
+  t.after(() => cleanup());
+  const db = new Database({ path: dbPath });
   
   // Create table
   db.exec('CREATE TABLE decimals (d DECIMAL(18, 9))');
@@ -44,12 +49,12 @@ test('Decimal type support', async (t) => {
   }
   
   db.close();
-  cleanup();
 });
 
 test('Decimal scale coercion', async (t) => {
-  cleanup();
-  const db = new Database({ path: DB_PATH });
+  const { dbPath, cleanup } = tmpDb();
+  t.after(() => cleanup());
+  const db = new Database({ path: dbPath });
   db.exec('CREATE TABLE t (d DECIMAL(18, 2))');
   
   // Insert 1 (scale 0)
@@ -68,5 +73,4 @@ test('Decimal scale coercion', async (t) => {
   }
   
   db.close();
-  cleanup();
 });
