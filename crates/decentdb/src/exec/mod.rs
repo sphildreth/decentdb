@@ -398,6 +398,7 @@ pub(crate) struct TablePageManifestChunk {
 pub(crate) struct TablePageManifest {
     chunks: Arc<Vec<TablePageManifestChunk>>,
     rows: Arc<Vec<TablePageEntry>>,
+    tombstoned_row_ids: Arc<BTreeSet<i64>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -427,6 +428,11 @@ impl TablePageManifest {
     }
 
     fn from_chunks(chunks: Vec<TablePageManifestChunk>) -> Result<Self> {
+        let tombstoned_row_ids = chunks
+            .iter()
+            .flat_map(|chunk| chunk.tombstoned_row_ids.iter().copied())
+            .collect::<BTreeSet<_>>();
+
         // Collect tombstoned row IDs into a set per chunk
         let chunk_tombstones: Vec<BTreeSet<i64>> = chunks
             .iter()
@@ -563,6 +569,7 @@ impl TablePageManifest {
         Ok(Self {
             chunks: Arc::new(chunks),
             rows: Arc::new(rows),
+            tombstoned_row_ids: Arc::new(tombstoned_row_ids),
         })
     }
 
@@ -600,10 +607,15 @@ impl TablePageManifest {
         let target_chunk_bytes = paged_table_target_chunk_bytes(page_size);
 
         let chunks = Arc::make_mut(&mut self.chunks);
-        let (chunk_index, is_overlay, locator) = if let Some(chunk_index) = chunks
-            .iter()
-            .position(|chunk| chunk.tombstoned_row_ids.contains(&row.row_id))
-        {
+        let (chunk_index, is_overlay, locator) = if self.tombstoned_row_ids.contains(&row.row_id) {
+            let Some(chunk_index) = chunks
+                .iter()
+                .position(|chunk| chunk.tombstoned_row_ids.contains(&row.row_id))
+            else {
+                return Err(DbError::corruption(
+                    "paged table tombstone index referenced a missing chunk tombstone",
+                ));
+            };
             let chunk = chunks
                 .get_mut(chunk_index)
                 .ok_or_else(|| DbError::internal("paged append chunk index was out of bounds"))?;
@@ -754,6 +766,7 @@ impl TablePageManifest {
             .iter()
             .map(|chunk| chunk.payload.capacity())
             .sum::<usize>()
+            + self.tombstoned_row_ids.len() * std::mem::size_of::<i64>()
             + self.rows.capacity() * std::mem::size_of::<TablePageEntry>()
     }
 }
