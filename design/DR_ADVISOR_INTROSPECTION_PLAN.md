@@ -30,8 +30,8 @@ Status values:
 | DR-05 | Done | Rust engine | DR-03, DR-04 | Add constrained `--fix` planner and executor | Only actions in Section 6.6. `fix.analyze` always skipped — no typed stats helper. `open_failed` fixture blocker documented. |
 | DR-06 | Done | CLI | DR-03, DR-05 | Add `decentdb doctor` command, options, JSON output, fix mode, and exit codes | `serde_json` added to CLI deps |
 | DR-07 | Done | CLI | DR-06 | Add Markdown renderer and optional table summary | 5 golden tests in engine; 8 CLI integration tests |
-| DR-08 | Pending | Tests | DR-01 through DR-07 | Add unit, integration, golden, fix, and no-mutation tests | Includes CLI exit-code tests |
-| DR-09 | Pending | Docs | DR-06 through DR-08 | Update README/docs/help text and examples | Include CI/agent and `--fix` examples |
+| DR-08 | Done | Tests | DR-01 through DR-07 | Add unit, integration, golden, fix, and no-mutation tests | 77 engine tests + 8 CLI tests. WAL growth fixture deferred: no safe small-fixture method. Path normalization deferred: not required for golden test stability. |
+| DR-09 | Done | Docs | DR-06 through DR-08 | Update README/docs/help text and examples | Updated `docs/api/cli-reference.md` with full doctor command reference |
 | DR-10 | Pending | Quality | DR-09 | Run final quality gates and update slice map | Cannot be Done until checks pass |
 
 ---
