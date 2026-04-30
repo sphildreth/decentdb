@@ -314,7 +314,10 @@ internal sealed class DecentDBModificationCommandBatch : ModificationCommandBatc
             var stepResult = stmt.Step();
             if (stepResult < 0)
             {
-                throw new Native.DecentDBException(stepResult, "Step failed", command.TableName);
+                var message = string.IsNullOrWhiteSpace(stmt.LastErrorMessage)
+                    ? "Step failed"
+                    : stmt.LastErrorMessage;
+                throw new Native.DecentDBException(stmt.LastErrorCode, message, command.TableName);
             }
 
             if (readColumns.Count > 0 && stepResult > 0)

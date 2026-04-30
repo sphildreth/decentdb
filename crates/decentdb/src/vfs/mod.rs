@@ -113,33 +113,168 @@ pub(crate) fn is_memory_path(path: &Path) -> bool {
 }
 
 pub(crate) fn read_exact_at(file: &dyn VfsFile, offset: u64, buf: &mut [u8]) -> Result<()> {
-    let read = file.read_at(offset, buf)?;
-    if read == buf.len() {
-        Ok(())
-    } else {
-        Err(DbError::io(
-            format!(
-                "short read on {} at offset {offset}: expected {} bytes, got {read}",
+    let mut cursor = 0;
+    while cursor < buf.len() {
+        let read = file.read_at(offset + cursor as u64, &mut buf[cursor..])?;
+        if read == 0 {
+            return Err(DbError::io(
+                format!(
+                    "short read on {} at offset {offset}: expected {} bytes, got {cursor}",
+                    file.path().display(),
+                    buf.len()
+                ),
+                std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "short read"),
+            ));
+        }
+        if read > buf.len() - cursor {
+            return Err(DbError::internal(format!(
+                "VFS read for {} returned {read} bytes into a {} byte buffer",
                 file.path().display(),
-                buf.len()
-            ),
-            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "short read"),
-        ))
+                buf.len() - cursor
+            )));
+        }
+        cursor += read;
     }
+    Ok(())
 }
 
 pub(crate) fn write_all_at(file: &dyn VfsFile, offset: u64, buf: &[u8]) -> Result<()> {
-    let written = file.write_at(offset, buf)?;
-    if written == buf.len() {
-        Ok(())
-    } else {
-        Err(DbError::io(
-            format!(
-                "short write on {} at offset {offset}: expected {} bytes, got {written}",
+    let mut cursor = 0;
+    while cursor < buf.len() {
+        let written = file.write_at(offset + cursor as u64, &buf[cursor..])?;
+        if written == 0 {
+            return Err(DbError::io(
+                format!(
+                    "short write on {} at offset {offset}: expected {} bytes, got {cursor}",
+                    file.path().display(),
+                    buf.len()
+                ),
+                std::io::Error::new(std::io::ErrorKind::WriteZero, "short write"),
+            ));
+        }
+        if written > buf.len() - cursor {
+            return Err(DbError::internal(format!(
+                "VFS write for {} accepted {written} bytes from a {} byte buffer",
                 file.path().display(),
-                buf.len()
-            ),
-            std::io::Error::new(std::io::ErrorKind::WriteZero, "short write"),
-        ))
+                buf.len() - cursor
+            )));
+        }
+        cursor += written;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    use super::{read_exact_at, write_all_at, FileKind, VfsFile};
+    use crate::error::{DbError, Result};
+
+    #[derive(Debug)]
+    struct ChunkedFile {
+        path: PathBuf,
+        data: Mutex<Vec<u8>>,
+        max_chunk: usize,
+    }
+
+    impl ChunkedFile {
+        fn new(max_chunk: usize) -> Self {
+            Self {
+                path: PathBuf::from("chunked.ddb"),
+                data: Mutex::new(Vec::new()),
+                max_chunk,
+            }
+        }
+
+        fn bytes(&self) -> Vec<u8> {
+            self.data.lock().expect("chunked file lock").clone()
+        }
+    }
+
+    impl VfsFile for ChunkedFile {
+        fn kind(&self) -> FileKind {
+            FileKind::Database
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
+            let data = self
+                .data
+                .lock()
+                .map_err(|_| DbError::internal("chunked file lock poisoned"))?;
+            let offset = offset as usize;
+            if offset >= data.len() {
+                return Ok(0);
+            }
+            let len = self.max_chunk.min(buf.len()).min(data.len() - offset);
+            buf[..len].copy_from_slice(&data[offset..offset + len]);
+            Ok(len)
+        }
+
+        fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize> {
+            let mut data = self
+                .data
+                .lock()
+                .map_err(|_| DbError::internal("chunked file lock poisoned"))?;
+            let offset = offset as usize;
+            let len = self.max_chunk.min(buf.len());
+            let end = offset + len;
+            if data.len() < end {
+                data.resize(end, 0);
+            }
+            data[offset..end].copy_from_slice(&buf[..len]);
+            Ok(len)
+        }
+
+        fn advise_sequential(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn sync_data(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn sync_metadata(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn file_size(&self) -> Result<u64> {
+            self.data
+                .lock()
+                .map(|data| data.len() as u64)
+                .map_err(|_| DbError::internal("chunked file lock poisoned"))
+        }
+
+        fn set_len(&self, len: u64) -> Result<()> {
+            self.data
+                .lock()
+                .map_err(|_| DbError::internal("chunked file lock poisoned"))?
+                .resize(len as usize, 0);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn write_all_at_retries_partial_writes() {
+        let file = ChunkedFile::new(3);
+        write_all_at(&file, 2, b"abcdefghij").expect("write all");
+
+        assert_eq!(file.bytes(), b"\0\0abcdefghij");
+    }
+
+    #[test]
+    fn read_exact_at_retries_partial_reads() {
+        let file = ChunkedFile::new(2);
+        write_all_at(&file, 0, b"abcdefghij").expect("seed bytes");
+        let mut out = [0_u8; 7];
+
+        read_exact_at(&file, 2, &mut out).expect("read exact");
+
+        assert_eq!(&out, b"cdefghi");
     }
 }

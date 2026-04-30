@@ -435,6 +435,10 @@ public sealed class PreparedStatement : IDisposable
         _handle = new DecentDBStatementHandle(stmtPtr, db.DbHandle);
     }
 
+    public int LastErrorCode => _db.LastErrorCode;
+
+    public string LastErrorMessage => _db.LastErrorMessage;
+
     public void Dispose()
     {
         if (_disposed) return;

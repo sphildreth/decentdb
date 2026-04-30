@@ -924,7 +924,7 @@ fn execute_fix(db: &Db, fix: &mut DoctorFix) {
                 fix.message = "Skipped checkpoint: active readers present.".into();
                 return;
             }
-            match db.checkpoint() {
+            match db.checkpoint_wal() {
                 Ok(()) => {
                     fix.status = DoctorFixStatus::Applied;
                     fix.message = "Checkpoint completed.".into();

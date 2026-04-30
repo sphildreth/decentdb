@@ -13,7 +13,7 @@ function tmpPath(suffix) {
 
 function cleanupFile(p) {
   try { fs.unlinkSync(p); } catch {}
-  try { fs.unlinkSync(p + '-wal'); } catch {}
+  try { fs.unlinkSync(p + '.wal'); } catch {}
 }
 
 test('SaveAs exports memory to disk', async (t) => {

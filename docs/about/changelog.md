@@ -5,6 +5,20 @@ All notable changes to DecentDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.1] - 2026-04-30
+
+### Fixed
+
+- Fixed deferred paged-row UPDATE validation so all foreign-key parent tables needed by row validation are materialized, including unchanged FK columns. This resolves the DecentDB.EntityFrameworkCore regression seen by downstream apps merge workflows after upgrading to 2.4.0.
+- Improved .NET EF Core modification-batch diagnostics by surfacing the native DecentDB statement error instead of replacing it with a generic `Step failed` message.
+- Fixed aggregate SELECTs over joins, including Entity Framework Core `COUNT(*)` join queries, so aggregate projections fall through to grouped evaluation instead of the non-aggregate join fast paths.
+- Fixed base-table join filtering so `WHERE` predicates are evaluated against the full join scope before projection. This resolves filtered joins whose predicate references columns not present in the final projection.
+- Fixed deferred DELETE dependency analysis for transitive self-referential `ON DELETE CASCADE` relationships so dependency traversal terminates and loads each affected table once.
+- Fixed shared file-backed WAL checkpoint races that could corrupt paged table manifests or overflow payload reads during concurrent writer plus rapid open/close reader workloads. Implicit automatic, on-open, and drop-time checkpoints are now skipped for shared WAL handles until cross-handle pager-cache invalidation is coordinated; explicit checkpoints remain available.
+- Fixed large WAL checkpointing so exact VFS reads and writes retry legal partial I/O results instead of treating them as fatal short reads/writes. CLI maintenance paths (`checkpoint`, `exec --checkpoint`, `import`, `bulk-load`, `save-as`, `vacuum`, and `doctor --fix`) now perform pure WAL flushes without running the optional pre-checkpoint payload compaction pass, avoiding multi-GB compaction appends during maintenance flushes.
+- Fixed deferred-table index freshness reporting so `rebuild-indexes` persists fresh catalog metadata and subsequent `list-indexes` / `doctor` runs do not report rebuilt indexes as stale simply because table row payloads are still lazily materialized.
+- Fixed PostgreSQL dump overwrite imports in the Python tools by evicting any shared WAL registry entry and removing the `.wal` sidecar before recreating the destination database.
+
 ## [2.4.0] - 2026-04-30
 
 ### Added

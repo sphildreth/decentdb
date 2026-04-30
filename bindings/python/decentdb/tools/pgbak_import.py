@@ -1204,9 +1204,11 @@ def convert_pg_dump_to_decentdb(
             raise ConversionError(
                 f"Destination already exists: {decentdb_path} (pass overwrite=True to replace)"
             )
+        decentdb.evict_shared_wal(decentdb_path)
         os.remove(decentdb_path)
-        if os.path.exists(decentdb_path + "-wal"):
-            os.remove(decentdb_path + "-wal")
+        for wal_path in (decentdb_path + ".wal", decentdb_path + "-wal"):
+            if os.path.exists(wal_path):
+                os.remove(wal_path)
 
     # Setup progress early so parsing can show feedback
     progress = None

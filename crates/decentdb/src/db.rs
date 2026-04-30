@@ -256,6 +256,14 @@ impl Drop for DbInner {
         if self.wal.latest_snapshot() == 0 {
             return;
         }
+        // Shared file-backed WAL handles can outlive any single Db and are
+        // paired with independent pager caches. Implicit drop-time checkpoint
+        // copyback can invalidate another handle's cached pages; leave shared
+        // WAL cleanup to explicit checkpoints or a future coordinated pager
+        // registry.
+        if self.wal.is_shared() {
+            return;
+        }
         self.wal.set_checkpoint_pending(true);
         if self.wal.strong_handle_count() != 1 {
             self.wal.set_checkpoint_pending(false);
@@ -297,6 +305,7 @@ impl Drop for DbInner {
 struct WriteTxn {
     active: bool,
     staged_pages: BTreeMap<PageId, Vec<u8>>,
+    snapshot_reader: Option<ReaderGuard>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -814,7 +823,7 @@ impl Db {
             ));
         }
 
-        self.checkpoint()?;
+        self.checkpoint_wal()?;
 
         let vfs = VfsHandle::for_path(dest);
         if vfs.file_exists(dest)? {
@@ -838,6 +847,8 @@ impl Db {
 
     /// Begins a single-connection write transaction.
     pub fn begin_write(&self) -> Result<()> {
+        let snapshot_reader = self.inner.wal.begin_reader()?;
+        self.refresh_pager_after_checkpoint()?;
         let mut txn = self
             .inner
             .write_txn
@@ -849,6 +860,28 @@ impl Db {
         txn.active = true;
         self.inner.write_txn_active.store(true, Ordering::Release);
         txn.staged_pages.clear();
+        txn.snapshot_reader = Some(snapshot_reader);
+        Ok(())
+    }
+
+    fn refresh_pager_after_checkpoint(&self) -> Result<()> {
+        let latest_checkpoint_epoch = self.inner.wal.checkpoint_epoch();
+        let last_seen_checkpoint_epoch = self
+            .inner
+            .last_seen_checkpoint_epoch
+            .load(Ordering::Acquire);
+        if latest_checkpoint_epoch == last_seen_checkpoint_epoch {
+            return Ok(());
+        }
+
+        let cached_header = self.inner.pager.header_snapshot()?;
+        let on_disk_header = self.inner.pager.header_from_disk()?;
+        if on_disk_header.last_checkpoint_lsn != cached_header.last_checkpoint_lsn {
+            self.inner.pager.refresh_from_disk(on_disk_header)?;
+        }
+        self.inner
+            .last_seen_checkpoint_epoch
+            .store(latest_checkpoint_epoch, Ordering::Release);
         Ok(())
     }
 
@@ -987,6 +1020,7 @@ impl Db {
                 ));
             }
             txn.active = false;
+            txn.snapshot_reader = None;
             let max_page_id = txn
                 .staged_pages
                 .last_key_value()
@@ -1019,6 +1053,7 @@ impl Db {
                 ));
             }
             txn.active = false;
+            txn.snapshot_reader = None;
             let max_page_id = txn
                 .staged_pages
                 .last_key_value()
@@ -1047,8 +1082,40 @@ impl Db {
             .map_err(|_| DbError::internal("write transaction lock poisoned"))?;
         txn.active = false;
         txn.staged_pages.clear();
+        txn.snapshot_reader = None;
         self.inner.write_txn_active.store(false, Ordering::Release);
         Ok(())
+    }
+
+    pub(crate) fn read_page_in_write_txn(&self, page_id: PageId) -> Result<Arc<[u8]>> {
+        page::validate_page_id(page_id)?;
+        let snapshot_lsn = {
+            let txn = self
+                .inner
+                .write_txn
+                .lock()
+                .map_err(|_| DbError::internal("write transaction lock poisoned"))?;
+            if !txn.active {
+                return Err(DbError::transaction(
+                    "read_page_in_write_txn requires an active write transaction",
+                ));
+            }
+            if let Some(staged) = txn.staged_pages.get(&page_id).cloned() {
+                return Ok(Arc::from(staged));
+            }
+            txn.snapshot_reader
+                .as_ref()
+                .ok_or_else(|| DbError::transaction("write transaction has no read snapshot"))?
+                .snapshot_lsn()
+        };
+        if let Some(wal_page) =
+            self.inner
+                .wal
+                .read_page_at_snapshot(&self.inner.pager, page_id, snapshot_lsn)?
+        {
+            return Ok(wal_page);
+        }
+        self.inner.pager.read_page(page_id)
     }
 
     fn write_txn_visible_page(&self, txn: &WriteTxn, page_id: PageId) -> Result<Arc<[u8]>> {
@@ -1056,8 +1123,11 @@ impl Db {
             return Ok(Arc::from(staged));
         }
 
-        let reader = self.inner.wal.begin_reader()?;
-        let snapshot_lsn = reader.snapshot_lsn();
+        let snapshot_lsn = txn
+            .snapshot_reader
+            .as_ref()
+            .ok_or_else(|| DbError::transaction("write transaction has no read snapshot"))?
+            .snapshot_lsn();
         if let Some(wal_page) =
             self.inner
                 .wal
@@ -1125,6 +1195,12 @@ impl Db {
     /// Performs a reader-aware checkpoint.
     pub fn checkpoint(&self) -> Result<()> {
         self.compact_persisted_payloads_before_checkpoint()?;
+        self.checkpoint_wal()
+    }
+
+    /// Flushes committed WAL frames into the database file without running the
+    /// optional pre-checkpoint payload compaction pass.
+    pub fn checkpoint_wal(&self) -> Result<()> {
         self.inner
             .wal
             .checkpoint(&self.inner.pager, self.inner.config.checkpoint_timeout_sec)
@@ -1257,7 +1333,7 @@ impl Db {
                 .collect::<Vec<_>>();
             self.redefer_persisted_tables(&deferred_refs)?;
             if options.checkpoint_on_complete {
-                self.checkpoint()?;
+                self.checkpoint_wal()?;
             }
             return Ok(inserted);
         }
@@ -1272,7 +1348,7 @@ impl Db {
         )?;
         self.persist_runtime(working)?;
         if options.checkpoint_on_complete {
-            self.checkpoint()?;
+            self.checkpoint_wal()?;
         }
         Ok(inserted)
     }
@@ -1657,7 +1733,10 @@ impl Db {
             let wal_size = wal
                 .latest_snapshot()
                 .saturating_sub(crate::wal::format::WAL_HEADER_SIZE);
-            if wal_size > on_open_threshold_bytes {
+            // See DbInner::drop: implicit checkpoint copyback is only safe for
+            // non-shared WALs until shared handles coordinate pager cache
+            // invalidation.
+            if wal_size > on_open_threshold_bytes && !wal.is_shared() {
                 // Best-effort: a checkpoint failure here is not fatal,
                 // because the runtime load below will still succeed
                 // against the existing WAL state. Surface it as a
@@ -6472,6 +6551,53 @@ mod tests {
     }
 
     #[test]
+    fn rebuild_indexes_persists_fresh_metadata_for_deferred_paged_tables() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir.path().join("rebuild-indexes-fresh-metadata.ddb");
+        let db = Db::open_or_create(&path, DbConfig::default()).expect("open db");
+        db.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, name TEXT)")
+            .expect("create table");
+        db.execute("CREATE INDEX docs_name_idx ON docs(name)")
+            .expect("create index");
+        db.execute("INSERT INTO docs VALUES (1, 'old'), (2, 'stable')")
+            .expect("insert rows");
+        let mut stale_runtime = db
+            .runtime_for_metadata_inspection()
+            .expect("runtime for stale setup");
+        {
+            let catalog = Arc::make_mut(&mut stale_runtime.catalog);
+            catalog.schema_cookie = catalog.schema_cookie.wrapping_add(1);
+            for index in catalog.indexes.values_mut() {
+                index.fresh = false;
+            }
+        }
+        db.persist_runtime_if_latest(stale_runtime, None, false)
+            .expect("persist stale index metadata");
+
+        let before = db.list_indexes().expect("list indexes before rebuild");
+        assert!(
+            before.iter().any(|index| !index.fresh),
+            "test setup should leave at least one stale index: {before:?}"
+        );
+
+        db.rebuild_indexes().expect("rebuild indexes");
+
+        let after = db.list_indexes().expect("list indexes after rebuild");
+        assert!(
+            after.iter().all(|index| index.fresh),
+            "rebuild_indexes should mark every index fresh: {after:?}"
+        );
+        drop(db);
+
+        let reopened = Db::open(&path, DbConfig::default()).expect("reopen db");
+        let reopened_indexes = reopened.list_indexes().expect("list reopened indexes");
+        assert!(
+            reopened_indexes.iter().all(|index| index.fresh),
+            "fresh index metadata should survive reopen: {reopened_indexes:?}"
+        );
+    }
+
+    #[test]
     fn checkpoint_compacts_large_persisted_payloads() {
         let tempdir = TempDir::new().expect("tempdir");
         let path = tempdir
@@ -6531,6 +6657,196 @@ mod tests {
         assert!(
             docs_after.pointer.is_compressed(),
             "checkpoint should compact large persisted payloads"
+        );
+        assert_eq!(
+            scalar_i64(
+                &db.execute("SELECT COUNT(*) FROM docs")
+                    .expect("count docs rows")
+            ),
+            96
+        );
+    }
+
+    #[test]
+    fn checkpoint_wal_flushes_without_compacting_large_persisted_payloads() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir
+            .path()
+            .join("checkpoint-wal-skips-large-payload-compaction.ddb");
+        let db = Db::open_or_create(
+            &path,
+            DbConfig {
+                paged_row_storage: false,
+                ..DbConfig::default()
+            },
+        )
+        .expect("open db");
+        db.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT)")
+            .expect("create docs table");
+
+        let large_body = "x".repeat(2048);
+        let mut txn = db.transaction().expect("begin exclusive txn");
+        let insert = txn
+            .prepare("INSERT INTO docs VALUES ($1, $2)")
+            .expect("prepare insert");
+        for i in 0_i64..96_i64 {
+            insert
+                .execute_in(
+                    &mut txn,
+                    &[Value::Int64(i), Value::Text(large_body.clone())],
+                )
+                .expect("insert large row");
+        }
+        txn.commit().expect("commit rows");
+
+        let runtime_before = db
+            .runtime_for_metadata_inspection()
+            .expect("runtime before checkpoint");
+        let docs_before = runtime_before
+            .persisted_tables
+            .get("docs")
+            .expect("persisted docs table before checkpoint");
+        assert!(
+            docs_before.pointer.logical_len >= 64 * 1024,
+            "test setup did not create a large enough payload"
+        );
+        assert!(
+            !docs_before.pointer.is_compressed(),
+            "normal commits should leave table payloads uncompressed"
+        );
+
+        db.checkpoint_wal().expect("checkpoint wal");
+
+        let storage = db.storage_info().expect("storage info");
+        assert_eq!(storage.wal_end_lsn, 0);
+        let runtime_after = db
+            .runtime_for_metadata_inspection()
+            .expect("runtime after checkpoint");
+        let docs_after = runtime_after
+            .persisted_tables
+            .get("docs")
+            .expect("persisted docs table after checkpoint");
+        assert!(
+            !docs_after.pointer.is_compressed(),
+            "checkpoint_wal should flush WAL without compacting large payloads"
+        );
+        assert_eq!(
+            scalar_i64(
+                &db.execute("SELECT COUNT(*) FROM docs")
+                    .expect("count docs rows")
+            ),
+            96
+        );
+    }
+
+    #[test]
+    fn save_as_flushes_wal_without_compacting_source_payloads() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir
+            .path()
+            .join("save-as-skips-large-payload-compaction.ddb");
+        let snapshot_path = tempdir.path().join("snapshot.ddb");
+        let db = Db::open_or_create(
+            &path,
+            DbConfig {
+                paged_row_storage: false,
+                ..DbConfig::default()
+            },
+        )
+        .expect("open db");
+        db.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT)")
+            .expect("create docs table");
+
+        let large_body = "x".repeat(2048);
+        let mut txn = db.transaction().expect("begin exclusive txn");
+        let insert = txn
+            .prepare("INSERT INTO docs VALUES ($1, $2)")
+            .expect("prepare insert");
+        for i in 0_i64..96_i64 {
+            insert
+                .execute_in(
+                    &mut txn,
+                    &[Value::Int64(i), Value::Text(large_body.clone())],
+                )
+                .expect("insert large row");
+        }
+        txn.commit().expect("commit rows");
+
+        db.save_as(&snapshot_path).expect("save as");
+
+        let storage = db.storage_info().expect("source storage info");
+        assert_eq!(storage.wal_end_lsn, 0);
+        let runtime_after = db
+            .runtime_for_metadata_inspection()
+            .expect("runtime after save_as");
+        let docs_after = runtime_after
+            .persisted_tables
+            .get("docs")
+            .expect("persisted docs table after save_as");
+        assert!(
+            !docs_after.pointer.is_compressed(),
+            "save_as should flush WAL without compacting the source payload"
+        );
+
+        let snapshot = Db::open(&snapshot_path, DbConfig::default()).expect("open snapshot");
+        assert_eq!(
+            scalar_i64(
+                &snapshot
+                    .execute("SELECT COUNT(*) FROM docs")
+                    .expect("count snapshot docs")
+            ),
+            96
+        );
+    }
+
+    #[test]
+    fn bulk_load_checkpoint_flushes_wal_without_compacting_payloads() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir
+            .path()
+            .join("bulk-load-checkpoint-skips-large-payload-compaction.ddb");
+        let db = Db::open_or_create(
+            &path,
+            DbConfig {
+                paged_row_storage: false,
+                ..DbConfig::default()
+            },
+        )
+        .expect("open db");
+        db.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT)")
+            .expect("create docs table");
+
+        let large_body = "x".repeat(2048);
+        let rows = (0_i64..96_i64)
+            .map(|i| vec![Value::Int64(i), Value::Text(large_body.clone())])
+            .collect::<Vec<_>>();
+
+        let inserted = db
+            .bulk_load_rows(
+                "docs",
+                &["id", "body"],
+                &rows,
+                BulkLoadOptions {
+                    batch_size: 16,
+                    checkpoint_on_complete: true,
+                    ..BulkLoadOptions::default()
+                },
+            )
+            .expect("bulk load rows");
+        assert_eq!(inserted, 96);
+
+        let storage = db.storage_info().expect("storage info after bulk load");
+        assert_eq!(storage.wal_end_lsn, 0);
+        let runtime_after = db
+            .runtime_for_metadata_inspection()
+            .expect("runtime after bulk load");
+        let docs_after = runtime_after
+            .persisted_tables
+            .get("docs")
+            .expect("persisted docs table after bulk load");
+        assert!(
+            !docs_after.pointer.is_compressed(),
+            "bulk-load completion checkpoint should flush WAL without compacting large payloads"
         );
         assert_eq!(
             scalar_i64(
@@ -11180,6 +11496,77 @@ mod tests {
                     .expect("count after exclusive txn commit")
             ),
             97
+        );
+    }
+
+    #[test]
+    fn paged_row_storage_update_loads_all_foreign_key_parents_for_validation() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir
+            .path()
+            .join("paged-row-storage-update-fk-parents.ddb");
+        let config = DbConfig {
+            paged_row_storage: true,
+            ..DbConfig::default()
+        };
+
+        {
+            let db = Db::open_or_create(&path, config.clone()).expect("open db");
+            db.execute("CREATE TABLE Users (Id INTEGER PRIMARY KEY, Name TEXT)")
+                .expect("create users");
+            db.execute("CREATE TABLE Songs (Id INTEGER PRIMARY KEY, Title TEXT)")
+                .expect("create songs");
+            db.execute(
+                "CREATE TABLE UserSongs (\
+                 Id INTEGER PRIMARY KEY, \
+                 UserId INTEGER NOT NULL, \
+                 SongId INTEGER NOT NULL, \
+                 Note TEXT, \
+                 FOREIGN KEY (UserId) REFERENCES Users(Id), \
+                 FOREIGN KEY (SongId) REFERENCES Songs(Id))",
+            )
+            .expect("create user songs");
+            db.execute("CREATE UNIQUE INDEX ux_user_songs_user_song ON UserSongs(UserId, SongId)")
+                .expect("create user song unique index");
+            db.execute("INSERT INTO Users VALUES (1, 'user')")
+                .expect("insert user");
+            db.execute("INSERT INTO Songs VALUES (1, 'old')")
+                .expect("insert old song");
+            db.execute("INSERT INTO Songs VALUES (2, 'new')")
+                .expect("insert new song");
+            db.execute("INSERT INTO UserSongs VALUES (1, 1, 1, 'liked')")
+                .expect("insert user song");
+            db.checkpoint().expect("checkpoint");
+        }
+
+        let db = Db::open_or_create(&path, config).expect("reopen db");
+        db.begin_transaction().expect("begin sql transaction");
+        {
+            let txn = db.inner.sql_txn.lock().expect("lock shared txn slot");
+            let super::SqlTxnSlot::Shared(state) = &*txn else {
+                panic!("expected shared sql transaction state");
+            };
+            assert_eq!(
+                state.runtime.deferred_tables.len(),
+                3,
+                "expected all seeded tables to start deferred"
+            );
+        }
+
+        db.execute("UPDATE UserSongs SET SongId = 2 WHERE Id = 1")
+            .expect("update child foreign key while unchanged parent fk is deferred");
+        db.commit_transaction().expect("commit sql transaction");
+
+        let result = db
+            .execute("SELECT UserId, SongId, Note FROM UserSongs WHERE Id = 1")
+            .expect("select updated user song");
+        assert_eq!(
+            result.rows()[0].values(),
+            &[
+                Value::Int64(1),
+                Value::Int64(2),
+                Value::Text("liked".to_string())
+            ]
         );
     }
 

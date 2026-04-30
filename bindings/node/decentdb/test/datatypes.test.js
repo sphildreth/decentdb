@@ -3,18 +3,23 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 const { Database } = require('..');
 
-const DB_PATH = 'test_datatypes.db';
-
-function cleanup() {
-  try { fs.unlinkSync(DB_PATH); } catch {}
-  try { fs.unlinkSync(DB_PATH + '-wal'); } catch {}
+function tmpDb() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'decentdb-node-datatypes-'));
+  return {
+    dbPath: path.join(dir, 'test.ddb'),
+    cleanup() {
+      fs.rmSync(dir, { recursive: true, force: true });
+    },
+  };
 }
 
 test('Boolean support', async (t) => {
-  cleanup();
-  const db = new Database({ path: DB_PATH });
+  const { dbPath, cleanup } = tmpDb();
+  const db = new Database({ path: dbPath });
   db.exec('CREATE TABLE t_bool (b BOOL)');
   
   db.exec('INSERT INTO t_bool VALUES ($1)', [true]);
@@ -26,11 +31,12 @@ test('Boolean support', async (t) => {
   assert.strictEqual(res.rows[1][0], false);
   
   db.close();
+  cleanup();
 });
 
 test('UUID support (as Blob)', async (t) => {
-  cleanup();
-  const db = new Database({ path: DB_PATH });
+  const { dbPath, cleanup } = tmpDb();
+  const db = new Database({ path: dbPath });
   db.exec('CREATE TABLE t_uuid (u UUID)');
   
   const uuid1 = Buffer.alloc(16);
@@ -53,8 +59,8 @@ test('UUID support (as Blob)', async (t) => {
 });
 
 test('Float64 support', async (t) => {
-  cleanup();
-  const db = new Database({ path: DB_PATH });
+  const { dbPath, cleanup } = tmpDb();
+  const db = new Database({ path: dbPath });
   db.exec('CREATE TABLE t_float (id BIGINT, v FLOAT)');
 
   const vals = [0.0, 1.0, -1.0, 3.141592653589793, 1.7976931348623157e+308, 5e-324];
@@ -73,8 +79,8 @@ test('Float64 support', async (t) => {
 });
 
 test('NULL support', async (t) => {
-  cleanup();
-  const db = new Database({ path: DB_PATH });
+  const { dbPath, cleanup } = tmpDb();
+  const db = new Database({ path: dbPath });
   db.exec('CREATE TABLE t_null (id BIGINT, i INT, t TEXT, b BOOL)');
 
   db.exec('INSERT INTO t_null VALUES ($1, $2, $3, $4)', [1n, null, null, null]);

@@ -3,19 +3,23 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 const { Database } = require('..');
 
-const DB_PATH = 'test_basic.db';
-
-function cleanup() {
-  try { fs.unlinkSync(DB_PATH); } catch {}
-  try { fs.unlinkSync(DB_PATH + '-wal'); } catch {}
+function tmpDb() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'decentdb-node-basic-'));
+  return {
+    dbPath: path.join(dir, 'test.ddb'),
+    cleanup() {
+      fs.rmSync(dir, { recursive: true, force: true });
+    },
+  };
 }
 
 test('Database basic operations', async (t) => {
-  cleanup();
-  
-  const db = new Database({ path: DB_PATH });
+  const { dbPath, cleanup } = tmpDb();
+  const db = new Database({ path: dbPath });
   
   // Create table
   db.exec('CREATE TABLE foo (id BIGINT, txt TEXT, b BLOB)');
@@ -36,11 +40,12 @@ test('Database basic operations', async (t) => {
   assert.equal(res.rows[1][2], null);
   
   db.close();
+  cleanup();
 });
 
 test('Parameter validation', (t) => {
-  cleanup();
-  const db = new Database({ path: DB_PATH });
+  const { dbPath, cleanup } = tmpDb();
+  const db = new Database({ path: dbPath });
   
   assert.throws(() => {
     db.prepare('SELECT ?');
@@ -51,11 +56,12 @@ test('Parameter validation', (t) => {
   stmt.finalize();
   
   db.close();
+  cleanup();
 });
 
 test('Streaming and async iteration', async (t) => {
-  cleanup();
-  const db = new Database({ path: DB_PATH });
+  const { dbPath, cleanup } = tmpDb();
+  const db = new Database({ path: dbPath });
   db.exec('CREATE TABLE nums (val BIGINT)');
   
   const count = 100;
@@ -72,11 +78,12 @@ test('Streaming and async iteration', async (t) => {
   assert.equal(seen, count);
   stmt.finalize();
   db.close();
+  cleanup();
 });
 
 test('Transaction rollback', async (t) => {
-  cleanup();
-  const db = new Database({ path: DB_PATH });
+  const { dbPath, cleanup } = tmpDb();
+  const db = new Database({ path: dbPath });
   db.exec('CREATE TABLE t (id BIGINT)');
   
   db.exec('BEGIN');
