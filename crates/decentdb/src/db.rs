@@ -4541,21 +4541,19 @@ impl Db {
                 }
             }
             SqlStatement::Update(update) => {
-                if runtime.prepare_simple_update(update)?.is_some() {
-                    self.load_runtime_table_row_sources_at_snapshot(
-                        runtime,
-                        &[update.table_name.as_str()],
-                        snapshot_lsn,
+                self.load_runtime_table_row_sources_at_snapshot(
+                    runtime,
+                    &[update.table_name.as_str()],
+                    snapshot_lsn,
+                )?;
+                if let Some(prepared_update) = runtime.prepare_simple_update(update)? {
+                    let result = runtime.execute_prepared_simple_update(
+                        &prepared_update,
+                        params,
+                        self.inner.config.page_size,
                     )?;
-                    if let Some(prepared_update) = runtime.prepare_simple_update(update)? {
-                        let result = runtime.execute_prepared_simple_update(
-                            &prepared_update,
-                            params,
-                            self.inner.config.page_size,
-                        )?;
-                        *persistent_changed |= !temp_only;
-                        return Ok(result);
-                    }
+                    *persistent_changed |= !temp_only;
+                    return Ok(result);
                 }
             }
             SqlStatement::Delete(delete) => {

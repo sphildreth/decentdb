@@ -275,8 +275,8 @@ impl PageCache {
         loop {
             let candidate = state
                 .lru_index
-                .iter()
-                .flat_map(|(_, bucket)| bucket.iter())
+                .values()
+                .flat_map(|bucket| bucket.iter())
                 .find_map(|page_id| {
                     let page = state.pages.get(page_id)?;
                     let inner = page.inner.lock().ok()?;
