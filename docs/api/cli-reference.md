@@ -220,7 +220,7 @@ Supported options:
 - `--verify-indexes` run expensive logical verification for all indexes up to `--max-index-verify`
 - `--max-index-verify=<n>` safety cap for `--verify-indexes`, default `32`
 - `--fail-on=<info|warning|error>` minimum severity that makes the process exit non-zero, default `error`
-- `--include-recommendations` include safe recommendation text and commands, default `true`
+- `--include-recommendations[=true|false]` include safe recommendation text and commands, default `true`
 - `--path-mode=<absolute|basename|redacted>` controls path rendering in output, default `absolute`
 - `--fix` apply v1 auto-fixable actions after diagnosis, then re-run diagnosis
 

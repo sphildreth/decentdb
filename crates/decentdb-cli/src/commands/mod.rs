@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{anyhow, Result};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use decentdb::{
     evict_shared_wal, render_markdown, run_doctor, BulkLoadOptions, Db, DbConfig, DoctorCategory,
     DoctorCheckSelection, DoctorIndexVerification, DoctorOptions, DoctorPathMode, DoctorReport,
@@ -385,7 +385,14 @@ pub struct DoctorCommand {
     #[arg(long = "fail-on", default_value = "error")]
     pub fail_on: String,
 
-    #[arg(long = "include-recommendations", default_value_t = true)]
+    #[arg(
+        long = "include-recommendations",
+        default_value_t = true,
+        default_missing_value = "true",
+        num_args = 0..=1,
+        require_equals = true,
+        action = ArgAction::Set
+    )]
     pub include_recommendations: bool,
 
     #[arg(long = "path-mode", default_value = "absolute")]

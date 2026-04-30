@@ -119,6 +119,49 @@ fn doctor_markdown_output() {
 }
 
 #[test]
+fn doctor_path_mode_basename_hides_parent_directories() {
+    let dir = temp_dir();
+    let db = setup_empty_db(&dir);
+    let db_name = Path::new(&db).file_name().unwrap().to_string_lossy();
+    let (code, stdout, _) = run_result(&[
+        "doctor",
+        "--db",
+        &db,
+        "--format",
+        "json",
+        "--path-mode",
+        "basename",
+    ]);
+    assert_eq!(code, 0);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(parsed["database"]["path"], db_name.as_ref());
+    assert_eq!(parsed["database"]["wal_path"], format!("{db_name}.wal"));
+    assert!(!parsed["database"]["path"]
+        .as_str()
+        .expect("path string")
+        .contains('/'));
+}
+
+#[test]
+fn doctor_include_recommendations_false_suppresses_recommendations() {
+    let (code, stdout, _) = run_result(&[
+        "doctor",
+        "--db",
+        "/nonexistent/path.ddb",
+        "--format",
+        "json",
+        "--include-recommendations=false",
+    ]);
+    assert_eq!(code, 2);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert!(parsed["findings"]
+        .as_array()
+        .expect("findings array")
+        .iter()
+        .all(|finding| finding["recommendation"].is_null()));
+}
+
+#[test]
 fn doctor_verify_index_named() {
     let dir = temp_dir();
     let db = setup_empty_db(&dir);
@@ -162,4 +205,24 @@ fn doctor_missing_file_exits_2() {
         "json",
     ]);
     assert_eq!(code, 2);
+}
+
+#[test]
+fn doctor_missing_file_exits_2_even_with_filtered_checks() {
+    let (code, stdout, _) = run_result(&[
+        "doctor",
+        "--db",
+        "/nonexistent/path.ddb",
+        "--format",
+        "json",
+        "--checks",
+        "wal",
+    ]);
+    assert_eq!(code, 2);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert!(parsed["findings"]
+        .as_array()
+        .expect("findings array")
+        .iter()
+        .any(|finding| finding["id"] == "header.unreadable"));
 }

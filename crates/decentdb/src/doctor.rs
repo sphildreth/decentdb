@@ -429,6 +429,84 @@ fn calculate_status(findings: &[DoctorFinding]) -> DoctorStatus {
     }
 }
 
+fn selected_categories(options: &DoctorOptions) -> Vec<DoctorCategory> {
+    match &options.checks {
+        DoctorCheckSelection::All => all_category_list(),
+        DoctorCheckSelection::Selected(cats) => cats.clone(),
+    }
+}
+
+fn database_summary_for_path(
+    mut database: DoctorDatabaseSummary,
+    path: &Path,
+    path_mode: &DoctorPathMode,
+) -> DoctorDatabaseSummary {
+    database.path = display_db_path(path, path_mode);
+    database.wal_path = display_wal_path(path, path_mode);
+    database
+}
+
+fn display_db_path(path: &Path, path_mode: &DoctorPathMode) -> String {
+    match path_mode {
+        DoctorPathMode::Absolute => path.display().to_string(),
+        DoctorPathMode::Basename => path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string()),
+        DoctorPathMode::Redacted => "<redacted>".into(),
+    }
+}
+
+fn display_wal_path(path: &Path, path_mode: &DoctorPathMode) -> String {
+    match path_mode {
+        DoctorPathMode::Absolute => format!("{}.wal", path.display()),
+        DoctorPathMode::Basename => format!("{}.wal", display_db_path(path, path_mode)),
+        DoctorPathMode::Redacted => "<redacted>".into(),
+    }
+}
+
+fn prepare_findings(
+    mut findings: Vec<DoctorFinding>,
+    options: &DoctorOptions,
+    checked_categories: &[DoctorCategory],
+    path: &Path,
+) -> Vec<DoctorFinding> {
+    findings.retain(|finding| {
+        checked_categories.contains(&finding.category)
+            || matches!(
+                finding.id.as_str(),
+                "header.unreadable" | "database.open_failed" | "fix.failed"
+            )
+    });
+
+    for finding in &mut findings {
+        apply_path_mode_to_finding(finding, path, &options.path_mode);
+        if !options.include_recommendations {
+            finding.recommendation = None;
+        }
+    }
+
+    findings
+}
+
+fn apply_path_mode_to_finding(
+    finding: &mut DoctorFinding,
+    path: &Path,
+    path_mode: &DoctorPathMode,
+) {
+    if matches!(path_mode, DoctorPathMode::Absolute) {
+        return;
+    }
+
+    for evidence in &mut finding.evidence {
+        if evidence.field == "path" {
+            evidence.value = DoctorEvidenceValue::String(display_db_path(path, path_mode));
+        } else if evidence.field == "wal_path" {
+            evidence.value = DoctorEvidenceValue::String(display_wal_path(path, path_mode));
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // DR-02: Fact Collection
 // ---------------------------------------------------------------------------
@@ -913,20 +991,23 @@ fn extract_index_from_fix(evidence: &[DoctorEvidence]) -> String {
 pub fn run_doctor(path: impl AsRef<Path>, options: DoctorOptions) -> Result<DoctorReport> {
     let path = path.as_ref();
 
-    let checked_categories = match &options.checks {
-        DoctorCheckSelection::All => all_category_list(),
-        DoctorCheckSelection::Selected(cats) => cats.clone(),
-    };
+    let checked_categories = selected_categories(&options);
 
     // Step 1: attempt a loose header read.
     let header_info = match Db::read_header_info(path) {
         Ok(h) => h,
         Err(_e) => {
             let path_str = path.display().to_string();
+            let findings = prepare_findings(
+                vec![header_unreadable(&path_str, _e.to_string())],
+                &options,
+                &checked_categories,
+                path,
+            );
             return Ok(build_partial_report(
                 DoctorMode::Check,
-                partial_database_empty(path),
-                vec![header_unreadable(&path_str, _e.to_string())],
+                database_summary_for_path(partial_database_empty(path), path, &options.path_mode),
+                findings,
                 DoctorCollectedFacts::default(),
                 checked_categories,
             ));
@@ -943,15 +1024,25 @@ pub fn run_doctor(path: impl AsRef<Path>, options: DoctorOptions) -> Result<Doct
     ) {
         Ok(d) => d,
         Err(_e) => {
-            let db_summary = partial_database_from_header(path, &header_info);
-            return Ok(build_partial_report(
-                DoctorMode::Check,
-                db_summary,
+            let db_summary = database_summary_for_path(
+                partial_database_from_header(path, &header_info),
+                path,
+                &options.path_mode,
+            );
+            let findings = prepare_findings(
                 vec![open_failed(
                     header_info.format_version,
                     header_info.page_size,
                     &_e.to_string(),
                 )],
+                &options,
+                &checked_categories,
+                path,
+            );
+            return Ok(build_partial_report(
+                DoctorMode::Check,
+                db_summary,
+                findings,
                 DoctorCollectedFacts::default(),
                 checked_categories,
             ));
@@ -967,6 +1058,7 @@ pub fn run_doctor(path: impl AsRef<Path>, options: DoctorOptions) -> Result<Doct
     // Step 5: index verification (DR-04 — opt-in).
     let verif = run_index_verification(&db, &options, &data.indexes);
     raw_findings.extend(verif.findings);
+    raw_findings = prepare_findings(raw_findings, &options, &checked_categories, path);
 
     // Step 6: update collected facts with verification records.
     let mut collected = DoctorCollectedFacts::from_data(&data);
@@ -988,6 +1080,7 @@ pub fn run_doctor(path: impl AsRef<Path>, options: DoctorOptions) -> Result<Doct
         // Re-run index verification on post-fix state.
         let verif2 = run_index_verification(&db, &options, &data2.indexes);
         post_findings.extend(verif2.findings);
+        post_findings = prepare_findings(post_findings, &options, &checked_categories, path);
 
         let mut collected2 = DoctorCollectedFacts::from_data(&data2);
         collected2.indexes_verified = verif2.records;
@@ -1028,11 +1121,16 @@ pub fn run_doctor(path: impl AsRef<Path>, options: DoctorOptions) -> Result<Doct
                 }),
             })
             .collect();
-        post_findings.extend(failed_fixes);
+        post_findings.extend(prepare_findings(
+            failed_fixes,
+            &options,
+            &checked_categories,
+            path,
+        ));
 
         Ok(DoctorReport::new(
             DoctorMode::Fix,
-            data2.database,
+            database_summary_for_path(data2.database, path, &options.path_mode),
             checked_categories,
             pre_fix_findings,
             post_findings,
@@ -1043,7 +1141,7 @@ pub fn run_doctor(path: impl AsRef<Path>, options: DoctorOptions) -> Result<Doct
         // Check-only mode.
         Ok(DoctorReport::new(
             DoctorMode::Check,
-            data.database,
+            database_summary_for_path(data.database, path, &options.path_mode),
             checked_categories,
             vec![],
             raw_findings,
@@ -2499,6 +2597,76 @@ mod tests {
             .summary
             .checked_categories
             .contains(&DoctorCategory::Header));
+    }
+
+    #[test]
+    fn path_mode_basename_redacts_parent_directories() {
+        let path = Path::new("/tmp/decentdb-doctor-path-mode/missing.ddb");
+        let report = run_doctor(
+            path,
+            DoctorOptions {
+                path_mode: DoctorPathMode::Basename,
+                ..DoctorOptions::default()
+            },
+        )
+        .expect("doctor run");
+
+        assert_eq!(report.database.path, "missing.ddb");
+        assert_eq!(report.database.wal_path, "missing.ddb.wal");
+        let path_evidence = report
+            .findings
+            .iter()
+            .flat_map(|finding| finding.evidence.iter())
+            .find(|evidence| evidence.field == "path")
+            .expect("path evidence");
+        assert_eq!(
+            path_evidence.value,
+            DoctorEvidenceValue::String("missing.ddb".into())
+        );
+    }
+
+    #[test]
+    fn path_mode_redacted_hides_database_paths() {
+        let path = Path::new("/tmp/decentdb-doctor-path-mode/missing.ddb");
+        let report = run_doctor(
+            path,
+            DoctorOptions {
+                path_mode: DoctorPathMode::Redacted,
+                ..DoctorOptions::default()
+            },
+        )
+        .expect("doctor run");
+
+        assert_eq!(report.database.path, "<redacted>");
+        assert_eq!(report.database.wal_path, "<redacted>");
+        let path_evidence = report
+            .findings
+            .iter()
+            .flat_map(|finding| finding.evidence.iter())
+            .find(|evidence| evidence.field == "path")
+            .expect("path evidence");
+        assert_eq!(
+            path_evidence.value,
+            DoctorEvidenceValue::String("<redacted>".into())
+        );
+    }
+
+    #[test]
+    fn include_recommendations_false_suppresses_recommendations() {
+        let report = run_doctor(
+            "/tmp/decentdb-doctor-recommendations/missing.ddb",
+            DoctorOptions {
+                include_recommendations: false,
+                ..DoctorOptions::default()
+            },
+        )
+        .expect("doctor run");
+
+        assert!(!report.findings.is_empty());
+        assert!(report
+            .findings
+            .iter()
+            .all(|finding| finding.recommendation.is_none()));
     }
 
     // ---- integration test ----------------------------------------------
