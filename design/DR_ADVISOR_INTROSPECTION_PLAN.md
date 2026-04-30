@@ -32,7 +32,7 @@ Status values:
 | DR-07 | Done | CLI | DR-06 | Add Markdown renderer and optional table summary | 5 golden tests in engine; 8 CLI integration tests |
 | DR-08 | Done | Tests | DR-01 through DR-07 | Add unit, integration, golden, fix, and no-mutation tests | 77 engine tests + 8 CLI tests. WAL growth fixture deferred: no safe small-fixture method. Path normalization deferred: not required for golden test stability. |
 | DR-09 | Done | Docs | DR-06 through DR-08 | Update README/docs/help text and examples | Updated `docs/api/cli-reference.md` with full doctor command reference |
-| DR-10 | Pending | Quality | DR-09 | Run final quality gates and update slice map | Cannot be Done until checks pass |
+| DR-10 | Done | Quality | DR-09 | Run final quality gates and update slice map | All 19 DoD criteria verified. Fast pre-commit (8/8) passed. Clippy workspace clean. |
 
 ---
 
