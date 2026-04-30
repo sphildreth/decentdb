@@ -27750,7 +27750,7 @@ mod tests {
         let mut runtime = db.debug_engine_snapshot().expect("snapshot runtime");
         let initial_state = runtime.persisted_tables["docs"];
         let store = DbTxnPageStore { db: &db };
-        db.begin_write().expect("begin read transaction");
+        db.begin_write().expect("begin write transaction");
         let initial_manifest_payload =
             crate::record::overflow::read_overflow(&store, initial_state.pointer)
                 .expect("read manifest payload");
@@ -27758,7 +27758,7 @@ mod tests {
             .expect("decode manifest payload");
         let initial_page_manifest =
             read_table_page_manifest_from_state(&store, initial_state).expect("read manifest");
-        db.commit().expect("commit read transaction");
+        db.commit().expect("commit write transaction");
         assert!(
             initial_manifest.chunks.len() > 2,
             "expected multiple chunks to observe pointer preservation"
@@ -27800,7 +27800,7 @@ mod tests {
         db.commit().expect("commit write txn");
 
         let rewritten_state = runtime.persisted_tables["docs"];
-        db.begin_write().expect("begin read transaction");
+        db.begin_write().expect("begin write transaction");
         let rewritten_manifest_payload =
             crate::record::overflow::read_overflow(&store, rewritten_state.pointer)
                 .expect("read manifest payload");
@@ -27808,7 +27808,7 @@ mod tests {
             .expect("decode manifest payload");
         let rewritten_page_manifest =
             read_table_page_manifest_from_state(&store, rewritten_state).expect("read manifest");
-        db.commit().expect("commit read transaction");
+        db.commit().expect("commit write transaction");
         let preserved_untouched = rewritten_manifest
             .chunks
             .iter()

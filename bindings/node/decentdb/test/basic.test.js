@@ -19,6 +19,7 @@ function tmpDb() {
 
 test('Database basic operations', async (t) => {
   const { dbPath, cleanup } = tmpDb();
+  t.after(() => cleanup());
   const db = new Database({ path: dbPath });
   
   // Create table
@@ -40,11 +41,11 @@ test('Database basic operations', async (t) => {
   assert.equal(res.rows[1][2], null);
   
   db.close();
-  cleanup();
 });
 
 test('Parameter validation', (t) => {
   const { dbPath, cleanup } = tmpDb();
+  t.after(() => cleanup());
   const db = new Database({ path: dbPath });
   
   assert.throws(() => {
@@ -56,11 +57,11 @@ test('Parameter validation', (t) => {
   stmt.finalize();
   
   db.close();
-  cleanup();
 });
 
 test('Streaming and async iteration', async (t) => {
   const { dbPath, cleanup } = tmpDb();
+  t.after(() => cleanup());
   const db = new Database({ path: dbPath });
   db.exec('CREATE TABLE nums (val BIGINT)');
   
@@ -78,11 +79,11 @@ test('Streaming and async iteration', async (t) => {
   assert.equal(seen, count);
   stmt.finalize();
   db.close();
-  cleanup();
 });
 
 test('Transaction rollback', async (t) => {
   const { dbPath, cleanup } = tmpDb();
+  t.after(() => cleanup());
   const db = new Database({ path: dbPath });
   db.exec('CREATE TABLE t (id BIGINT)');
   
@@ -94,5 +95,4 @@ test('Transaction rollback', async (t) => {
   assert.equal(res.rows[0][0], 0n);
   
   db.close();
-  cleanup();
 });

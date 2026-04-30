@@ -19,6 +19,7 @@ function tmpDb() {
 
 test('Decimal type support', async (t) => {
   const { dbPath, cleanup } = tmpDb();
+  t.after(() => cleanup());
   const db = new Database({ path: dbPath });
   
   // Create table
@@ -48,11 +49,11 @@ test('Decimal type support', async (t) => {
   }
   
   db.close();
-  cleanup();
 });
 
 test('Decimal scale coercion', async (t) => {
   const { dbPath, cleanup } = tmpDb();
+  t.after(() => cleanup());
   const db = new Database({ path: dbPath });
   db.exec('CREATE TABLE t (d DECIMAL(18, 2))');
   
@@ -72,5 +73,4 @@ test('Decimal scale coercion', async (t) => {
   }
   
   db.close();
-  cleanup();
 });

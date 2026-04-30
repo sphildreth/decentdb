@@ -19,6 +19,7 @@ function tmpDb() {
 
 test('Boolean support', async (t) => {
   const { dbPath, cleanup } = tmpDb();
+  t.after(() => cleanup());
   const db = new Database({ path: dbPath });
   db.exec('CREATE TABLE t_bool (b BOOL)');
   
@@ -31,11 +32,11 @@ test('Boolean support', async (t) => {
   assert.strictEqual(res.rows[1][0], false);
   
   db.close();
-  cleanup();
 });
 
 test('UUID support (as Blob)', async (t) => {
   const { dbPath, cleanup } = tmpDb();
+  t.after(() => cleanup());
   const db = new Database({ path: dbPath });
   db.exec('CREATE TABLE t_uuid (u UUID)');
   
@@ -55,11 +56,11 @@ test('UUID support (as Blob)', async (t) => {
   assert.equal(val[15], 0xBB);
   
   db.close();
-  cleanup();
 });
 
 test('Float64 support', async (t) => {
   const { dbPath, cleanup } = tmpDb();
+  t.after(() => cleanup());
   const db = new Database({ path: dbPath });
   db.exec('CREATE TABLE t_float (id BIGINT, v FLOAT)');
 
@@ -75,11 +76,11 @@ test('Float64 support', async (t) => {
   }
 
   db.close();
-  cleanup();
 });
 
 test('NULL support', async (t) => {
   const { dbPath, cleanup } = tmpDb();
+  t.after(() => cleanup());
   const db = new Database({ path: dbPath });
   db.exec('CREATE TABLE t_null (id BIGINT, i INT, t TEXT, b BOOL)');
 
@@ -92,5 +93,4 @@ test('NULL support', async (t) => {
   assert.strictEqual(res.rows[0][2], null);
 
   db.close();
-  cleanup();
 });

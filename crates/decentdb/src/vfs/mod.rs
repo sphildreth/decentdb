@@ -119,8 +119,9 @@ pub(crate) fn read_exact_at(file: &dyn VfsFile, offset: u64, buf: &mut [u8]) -> 
         if read == 0 {
             return Err(DbError::io(
                 format!(
-                    "short read on {} at offset {offset}: expected {} bytes, got {cursor}",
+                    "short read on {} at offset {}: expected {} bytes, got {cursor}",
                     file.path().display(),
+                    offset + cursor as u64,
                     buf.len()
                 ),
                 std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "short read"),
@@ -145,8 +146,9 @@ pub(crate) fn write_all_at(file: &dyn VfsFile, offset: u64, buf: &[u8]) -> Resul
         if written == 0 {
             return Err(DbError::io(
                 format!(
-                    "short write on {} at offset {offset}: expected {} bytes, got {cursor}",
+                    "short write on {} at offset {}: expected {} bytes, got {cursor}",
                     file.path().display(),
+                    offset + cursor as u64,
                     buf.len()
                 ),
                 std::io::Error::new(std::io::ErrorKind::WriteZero, "short write"),
