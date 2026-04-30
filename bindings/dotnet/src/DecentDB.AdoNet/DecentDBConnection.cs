@@ -114,6 +114,8 @@ namespace DecentDB.AdoNet
             {
                 _state = ConnectionState.Closed;
             }
+
+            OnStateChange(new StateChangeEventArgs(ConnectionState.Open, ConnectionState.Closed));
         }
 
         /// <summary>
@@ -161,6 +163,7 @@ namespace DecentDB.AdoNet
             {
                 _db = new Native.DecentDB(path, _nativeOptions);
                 _state = ConnectionState.Open;
+                OnStateChange(new StateChangeEventArgs(ConnectionState.Closed, ConnectionState.Open));
             }
             catch (Exception ex)
             {
@@ -231,6 +234,42 @@ namespace DecentDB.AdoNet
         public static uint AbiVersion() => Native.DecentDB.AbiVersion();
         public static string EngineVersion() => Native.DecentDB.EngineVersion();
 
+        /// <summary>
+        /// Deletes the database file and all associated sidecar files (WAL, SHM).
+        /// This operation ignores missing files — each path is deleted if present,
+        /// and no exception is thrown for absent files. The data file itself is
+        /// deleted last so that an interruption mid-call leaves the database openable
+        /// (the WAL will replay over the original file on next open).
+        /// </summary>
+        /// <param name="databasePath">Path to the database file (e.g., <c>/tmp/mydb.ddb</c>).</param>
+        public static void DeleteDatabaseFiles(string databasePath)
+        {
+            if (string.IsNullOrWhiteSpace(databasePath))
+                throw new ArgumentException("Database path must be provided.", nameof(databasePath));
+
+            var fullPath = Path.GetFullPath(databasePath);
+
+            // Helper: delete if exists, ignore missing-file errors
+            static void TryDelete(string path)
+            {
+                try
+                {
+                    if (File.Exists(path))
+                        File.Delete(path);
+                }
+                catch (FileNotFoundException) { }
+                catch (DirectoryNotFoundException) { }
+            }
+
+            // Delete sidecars first (order: .wal, -wal, -shm)
+            TryDelete(fullPath + ".wal");
+            TryDelete(fullPath + "-wal");
+            TryDelete(fullPath + "-shm");
+
+            // Delete the data file last
+            TryDelete(fullPath);
+        }
+
         internal Native.DecentDB GetNativeDb()
         {
             return _db ?? throw new InvalidOperationException("Connection is not open");
@@ -278,6 +317,7 @@ namespace DecentDB.AdoNet
 
         internal int DefaultCommandTimeoutSeconds => _defaultCommandTimeoutSeconds;
         internal bool IsSqlObservationEnabled => _loggingEnabled || _sqlExecuting != null || _sqlExecuted != null;
+        internal void ClearPreparedStatementCacheForSchemaChange() => ClearPreparedStatementCache();
 
         private void ClearPreparedStatementCache()
         {
@@ -671,6 +711,7 @@ namespace DecentDB.AdoNet
             dt.Columns.Add("COLUMNS", typeof(string));
             dt.Columns.Add("IS_UNIQUE", typeof(bool));
             dt.Columns.Add("INDEX_TYPE", typeof(string));
+            dt.Columns.Add("IS_PRIMARY_KEY", typeof(bool));
 
             var json = System.Text.Json.JsonDocument.Parse(ListIndexesJson());
             foreach (var idx in json.RootElement.EnumerateArray())
@@ -687,12 +728,17 @@ namespace DecentDB.AdoNet
                     columns.Add(col.GetString()!);
                 }
 
+                var indexName = idx.GetProperty("name").GetString()!;
+                // Heuristic: auto-created primary key indexes follow the naming pattern "pk_<table>_<cols>"
+                var isPrimaryKey = indexName.StartsWith("pk_", StringComparison.OrdinalIgnoreCase);
+
                 dt.Rows.Add(
-                    idx.GetProperty("name").GetString(),
+                    indexName,
                     tableName,
                     string.Join(", ", columns),
                     idx.GetProperty("unique").GetBoolean(),
-                    idx.GetProperty("kind").GetString());
+                    idx.GetProperty("kind").GetString(),
+                    isPrimaryKey);
             }
             return dt;
         }

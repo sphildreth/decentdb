@@ -1,5 +1,9 @@
 # DecentDB: Future Wins & Real Differentiators
 
+**Status:** Vision and prioritization index. This document describes product
+positioning and roadmap direction; it is not the implementation source of truth
+for features that now have dedicated specs or ADRs.
+
 This document reframes DecentDB’s future roadmap around a blunt market truth:
 
 > **DecentDB should not try to win by becoming “SQLite, but with more features.”**
@@ -7,6 +11,9 @@ This document reframes DecentDB’s future roadmap around a blunt market truth:
 > It should win by becoming the embedded SQL engine that makes **local-first sync, branchable data workflows, and agent-friendly developer experience** feel native and obvious.
 
 DecentDB already has meaningful foundations in place. The next phase should focus less on accumulating checklist items and more on building a clear product identity that developers can remember in one sentence.
+
+When a roadmap theme has a dedicated implementation plan, use that plan for
+execution details and use this document for product framing and priority.
 
 ## Core Positioning
 
@@ -49,14 +56,36 @@ This roadmap should treat existing DecentDB capabilities as foundations, not as 
 - In-memory VFS for testing
 - Bulk load API foundation
 - Same-process shared WAL visibility
+- Mature C ABI and multi-language binding surface
+- Paged row storage, deferred table materialization, and WAL/page-cache memory work that support larger embedded workloads
 
 That means the future roadmap should emphasize **identity-level wins**, not just “fill remaining parity gaps.”
+
+## Current Planning Sources
+
+Use these documents as the current execution references for themes that have
+moved beyond product sketching:
+
+| Theme | Current status | Source of truth |
+|---|---|---|
+| Local-first sync | Proposed implementation spec | [`WIN01_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md`](WIN01_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md) |
+| Schema-first SDK generation | Proposed Decent Bench-owned workflow with DecentDB metadata support | [`WIN02_SCHEMA_FIRST_STRONGLY_TYPED_SDK_GENERATION_SPEC.md`](WIN02_SCHEMA_FIRST_STRONGLY_TYPED_SDK_GENERATION_SPEC.md) |
+| Geospatial support | Proposed implementation spec plus ADRs | [`WIN03_GEOSPATIAL_DATA_SUPPORT.md`](WIN03_GEOSPATIAL_DATA_SUPPORT.md), [`ADR-0124`](adr/0124-geospatial-type-system-and-ewkb-storage.md), [`ADR-0125`](adr/0125-spatial-covering-cell-secondary-index.md), [`ADR-0126`](adr/0126-geospatial-c-abi-contract.md), [`ADR-0127`](adr/0127-planner-native-spatial-access-paths.md), [`ADR-0128`](adr/0128-true-3d-semantics-and-3d-aware-indexing.md) |
+| WASM + OPFS | Proposed implementation plan | [`WIN03_WASM_SUPPORT_IMPLEMENTATION.md`](WIN03_WASM_SUPPORT_IMPLEMENTATION.md) |
+
+Themes without a dedicated spec in this table should be treated as product
+direction until an ADR or implementation spec narrows scope and semantics.
 
 ---
 
 ## The New Strategic Pillars
 
 ## 1. Local-First Sync as a First-Class Capability
+**Current status:** Proposed, with a dedicated implementation spec. See
+[`WIN01_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md`](WIN01_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md)
+for concrete scope, non-goals, SQL surfaces, CLI expectations, and acceptance
+criteria.
+
 ### Why this matters
 This is the strongest opportunity for DecentDB to become memorable.
 
@@ -103,6 +132,11 @@ SQLite can be part of local-first systems, but the sync story is generally exter
 ---
 
 ## 2. Branchable Databases: Branch, Diff, Restore, Merge
+**Current status:** Product direction. No implementation spec is currently the
+source of truth for this theme, so early work should start with an ADR/spec that
+defines branch identity, snapshot retention, diff semantics, restore safety, and
+the limits of merge behavior.
+
 ### Why this matters
 Branching is already one of the most distinctive ideas in the current roadmap. It should be expanded into a full workflow, not treated as a niche optimization.
 
@@ -156,13 +190,22 @@ DecentDB can.
 ---
 
 ## 3. Schema-First, Strongly-Typed SDK Generation
+**Current status:** Proposed, with Decent Bench as the preferred product home.
+See
+[`WIN02_SCHEMA_FIRST_STRONGLY_TYPED_SDK_GENERATION_SPEC.md`](WIN02_SCHEMA_FIRST_STRONGLY_TYPED_SDK_GENERATION_SPEC.md)
+for the current architecture, initial language scope, generated artifact model,
+CLI shape, and acceptance criteria. DecentDB should provide the stable schema
+metadata, query-contract validation primitives, and binding guarantees that the
+workbench consumes; Decent Bench should own the end-user generation workflow.
+
 ### Why this matters
 The engine can be excellent and still lose adoption if the integration story feels hand-built.
 
 Developers remember ergonomics.
 
 ### The DecentDB win
-Given a DecentDB schema, generate strongly typed bindings and helpers for:
+Given a DecentDB schema, Decent Bench can generate strongly typed bindings and
+helpers for:
 
 - .NET
 - Python
@@ -181,9 +224,9 @@ Given a DecentDB schema, generate strongly typed bindings and helpers for:
 
 ### Desired workflow
 ```bash
-decentdb generate --lang csharp --schema db.ddb --out ./Generated
-decentdb generate --lang typescript --schema db.ddb --out ./src/generated
-decentdb generate --lang python --schema db.ddb --out ./client
+dbench generate --lang csharp --schema db.ddb --out ./Generated
+dbench generate --lang typescript --schema db.ddb --out ./src/generated
+dbench generate --lang python --schema db.ddb --out ./client
 ```
 
 ### Why this is a separator
@@ -195,6 +238,12 @@ This turns DecentDB from “just an embedded database” into a cross-language a
 ---
 
 ## 4. Built-in Doctor, Advisor, and Self-Inspection
+**Current status:** Product direction. The CLI already has operational
+inspection and repair-adjacent commands such as `info`, `stats`,
+`verify-header`, `verify-index`, `rebuild-index`, `rebuild-indexes`, `vacuum`,
+and `migrate`; a first-class `doctor` command, `PRAGMA doctor`, and broad
+`sys.*` virtual table surface are not yet the committed interface.
+
 ### Why this matters
 Embedded databases often fail silently from the developer’s perspective. There is no DBA watching them. There is just an application team trying to figure out why things feel weird.
 
@@ -239,6 +288,11 @@ This aligns perfectly with modern developer expectations:
 ---
 
 ## 5. Application Database Bundle Format
+**Current status:** Product direction. Before implementation, this needs an
+ADR/spec that defines the bundle manifest, integrity/signature model, asset/blob
+storage rules, compatibility guarantees, and how bundle import/export interacts
+with WAL, checkpoints, encryption, and future sync metadata.
+
 ### Why this matters
 SQLite is often used as a portable application file format, but that story is mostly accidental. DecentDB can make it explicit.
 
@@ -278,6 +332,10 @@ It gives DecentDB a concrete “product object” developers can reason about an
 ---
 
 ## 6. Policy-Aware Embedded SQL
+**Current status:** Product direction. This needs one or more ADRs before
+implementation because it intersects with authorization semantics, encryption,
+auditability, SQL planning, ABI/binding behavior, and possibly on-disk format.
+
 ### Why this matters
 Encryption-at-rest is good, but in many applications it is not enough.
 
@@ -313,6 +371,18 @@ This creates a much stronger story for regulated, enterprise, offline, and field
 ---
 
 ## 7. Native Geospatial Data Support
+**Current status:** Proposed, with a dedicated implementation spec and ADRs. See
+[`WIN03_GEOSPATIAL_DATA_SUPPORT.md`](WIN03_GEOSPATIAL_DATA_SUPPORT.md) and
+[`ADR-0124`](adr/0124-geospatial-type-system-and-ewkb-storage.md),
+[`ADR-0125`](adr/0125-spatial-covering-cell-secondary-index.md),
+[`ADR-0126`](adr/0126-geospatial-c-abi-contract.md),
+[`ADR-0127`](adr/0127-planner-native-spatial-access-paths.md), and
+[`ADR-0128`](adr/0128-true-3d-semantics-and-3d-aware-indexing.md). The product
+goal in this section remains valid, but
+the implementation direction is now EWKB plus planner-native covering-cell
+indexes over existing B+Tree storage, not a separate spatial page subsystem for
+the initial release.
+
 ### Why this matters
 Location-aware applications are pervasive: mobile apps, IoT, logistics, field service, geospatial analytics. SQLite's geo story is limited to R-Tree indexes for bounding boxes and Geopoly for simple polygons. DecentDB can do better.
 
@@ -321,11 +391,12 @@ The geo opportunity is not about being SpatiaLite — it's about making location
 ### The DecentDB win
 Expose native `GEOGRAPHY` and `GEOMETRY` types with:
 
-- **Native types**: `GEOGRAPHY(POINT)`, `GEOGRAPHY(POLYGON)`, `GEOMETRY` with SRID support
-- **Spatial indexing**: R*-Tree index (better than SQLite's R-Tree for dynamic data)
-- **Core functions**: `ST_Distance`, `ST_Contains`, `ST_Within`, `ST_Intersects`, `ST_Point`, `ST_AsGeoJSON`
-- **Spherical calculations**: Haversine and Vincenty formulas for Earth geometry
-- **Input/output**: WKB, WKT, and GeoJSON formats
+- **Native types**: `GEOGRAPHY` and `GEOMETRY` with subtype, dimensions, and SRID metadata
+- **Canonical binary contract**: dimension-aware normalized EWKB for persisted values and ABI interchange
+- **Spatial indexing**: a `SPATIAL` secondary index backed by hierarchical covering cells in the existing B+Tree subsystem
+- **Planner-native access paths**: coarse candidate generation plus exact refinement for eligible spatial predicates
+- **Core functions**: `ST_Distance`, `ST_DWithin`, `ST_Contains`, `ST_Within`, `ST_Intersects`, `ST_Point`, and output helpers such as `ST_AsGeoJSON`
+- **Initial high-value slice**: `GEOGRAPHY(POINT,4326)` nearest-neighbor and radius queries
 
 ### Desired developer experience
 ```sql
@@ -352,15 +423,16 @@ SELECT id, name FROM zones WHERE ST_Contains(boundary, ST_Point(-122.4194, 37.77
 |---|---|---|
 | Point storage | Two REAL columns | Native POINT type |
 | Distance calculation | Manual Haversine SQL | `ST_Distance` built-in |
-| Spatial index | R-Tree (static) | R*-Tree (dynamic) |
-| Polygon operations | Geopoly (convex only) | Full polygon support |
+| Spatial index | R-Tree bounding boxes | Planner-native `SPATIAL` index over covering cells |
+| Polygon operations | Geopoly-limited | Native typed geometry/geography roadmap |
 | Type safety | None | Static geography type |
 
 ### Implementation considerations
-- **Rust crate**: Leverage `geo` or `geosine` for geometry math
-- **SRID support**: WGS84 (4326) default; planar vs spherical mode
+- **Storage/indexing**: Reuse B+Tree, WAL, page cache, and planner infrastructure rather than introducing a second durable index stack in the first slice
+- **Rust implementation**: Keep the initial engine path pure Rust and avoid GEOS/PROJ/GDAL-style native stacks
+- **SRID support**: Initial `GEOGRAPHY` scope is SRID 4326; preserve dimensions while initial query/index semantics use XY projection
 - **WASM compatibility**: Required for browser/OPFS use cases
-- **Performance**: Spatial index must be zero-copy with page cache
+- **Performance**: Spatial access must be benchmarked as a planner/storage feature, not treated as scalar-function sugar
 
 ### Priority
 **Tier 3 — Feature-completeness win. Useful for specific verticals (mobile, IoT, logistics) but not a primary separator.**
@@ -372,11 +444,11 @@ SELECT id, name FROM zones WHERE ST_Contains(boundary, ST_Point(-122.4194, 37.77
 The following features are still worthwhile. They simply should not be the center of the DecentDB identity because they are increasingly table stakes or already available elsewhere in some form.
 
 ### Valuable but not primary separators
-- First-class WASM / browser support
+- First-class WASM / browser support; see [`WIN03_WASM_SUPPORT_IMPLEMENTATION.md`](WIN03_WASM_SUPPORT_IMPLEMENTATION.md)
 - JSONB
 - Full-text search
 - Vector / HNSW indexes
-- Native geospatial types & R*-Tree index
+- Native geospatial types and planner-native spatial indexes
 - Built-in HTTP serve mode
 - Group commit
 - Compression
@@ -398,7 +470,7 @@ These are the capabilities most likely to give DecentDB a memorable market posit
 |---|---|---|
 | 1 | Native local-first sync & merge | Strongest product identity and real painkiller |
 | 2 | Branch / diff / restore / time-travel | Memorable workflow; ideal for agents, tests, support |
-| 3 | Schema-first typed SDK/codegen | Adoption accelerator across languages |
+| 3 | Schema-first typed SDK/codegen via Decent Bench | Adoption accelerator across languages |
 | 4 | Doctor / advisor / introspection | High leverage for humans and coding agents |
 
 ## Tier 2 — High-Value Platform Multipliers
@@ -424,7 +496,7 @@ Important, but these should support the larger story rather than define it.
 | 14 | Compression | Smaller files, better cache behavior |
 | 15 | Bulk-load follow-ons | Better ETL and migration workflows |
 | 16 | Non-blocking schema migration | Valuable operational differentiator |
-| 17 | Native geospatial types & R*-Tree | First-class location data, spatial indexes, ST_* functions |
+| 17 | Native geospatial types & spatial indexes | First-class location data, planner-native spatial access, ST_* functions |
 
 ## Tier 4 — Important Capability Checks
 Strong features, but less likely to be the decisive reason someone chooses DecentDB.
@@ -484,7 +556,7 @@ These features are still important, but they should serve the bigger product sto
 - JSONB
 - FTS
 - vector
-- geo / spatial types and R*-Tree
+- geo / spatial types and planner-native spatial indexes
 - compression
 - TDE
 - cross-process coordination
@@ -499,13 +571,13 @@ These features are still important, but they should serve the bigger product sto
 ## Phase 1 — Tighten the identity
 Focus on features that create the clearest product story fast.
 
-1. Expand observability into a real **doctor/advisor** experience
-2. Deliver **branch + restore + diff** before chasing more parity features
-3. Start designing **changesets and sync protocol primitives**
-4. Formalize a **schema-first code generation** toolchain
+1. Convert **doctor/advisor** into a scoped spec that builds on existing CLI inspection commands and defines the first committed `sys.*`/JSON surfaces.
+2. Write the **branch + restore + diff** ADR/spec before implementation so retention, safety, and merge boundaries are explicit.
+3. Use [`WIN01_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md`](WIN01_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md) to break **changesets and sync protocol primitives** into implementable slices.
+4. Move the first **schema-first code generation** product slice into Decent Bench, while keeping DecentDB responsible for the stable metadata and validation contracts described by [`WIN02_SCHEMA_FIRST_STRONGLY_TYPED_SDK_GENERATION_SPEC.md`](WIN02_SCHEMA_FIRST_STRONGLY_TYPED_SDK_GENERATION_SPEC.md).
 
 ## Phase 2 — Make local-first real
-1. WASM + OPFS
+1. WASM + OPFS, guided by [`WIN03_WASM_SUPPORT_IMPLEMENTATION.md`](WIN03_WASM_SUPPORT_IMPLEMENTATION.md)
 2. selective sync publications
 3. pull/push replication
 4. conflict visibility and deterministic merge policies
@@ -522,7 +594,7 @@ Focus on features that create the clearest product story fast.
 3. compression
 4. vector
 5. FTS
-6. geo / spatial types and R*-Tree index
+6. geo / spatial types and planner-native spatial indexes, guided by [`WIN03_GEOSPATIAL_DATA_SUPPORT.md`](WIN03_GEOSPATIAL_DATA_SUPPORT.md)
 7. object storage VFS
 8. replication and HA enhancements
 

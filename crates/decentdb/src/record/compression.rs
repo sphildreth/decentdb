@@ -12,6 +12,7 @@ pub(crate) const AUTO_MIN_PAYLOAD_BYTES: usize = 64 * 1024;
 pub(crate) enum CompressionMode {
     Never,
     Auto,
+    AutoMinBytes(usize),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -21,13 +22,17 @@ pub(crate) struct CompressedPayload {
 }
 
 pub(crate) fn maybe_compress(bytes: &[u8], mode: CompressionMode) -> CompressedPayload {
-    if mode == CompressionMode::Never || bytes.is_empty() {
-        return CompressedPayload {
-            bytes: bytes.to_vec(),
-            compressed: false,
-        };
-    }
-    if bytes.len() < AUTO_MIN_PAYLOAD_BYTES {
+    let min_payload_bytes = match mode {
+        CompressionMode::Never => {
+            return CompressedPayload {
+                bytes: bytes.to_vec(),
+                compressed: false,
+            };
+        }
+        CompressionMode::Auto => AUTO_MIN_PAYLOAD_BYTES,
+        CompressionMode::AutoMinBytes(min_payload_bytes) => min_payload_bytes,
+    };
+    if bytes.is_empty() || bytes.len() < min_payload_bytes {
         return CompressedPayload {
             bytes: bytes.to_vec(),
             compressed: false,
@@ -80,6 +85,14 @@ mod tests {
         let out = maybe_compress(&data, CompressionMode::Auto);
         assert!(!out.compressed);
         assert_eq!(out.bytes, data);
+    }
+
+    #[test]
+    fn maybe_compress_with_custom_minimum_allows_smaller_payloads() {
+        let data = vec![b'x'; 48 * 1024];
+        let out = maybe_compress(&data, CompressionMode::AutoMinBytes(32 * 1024));
+        assert!(out.compressed);
+        assert_eq!(decompress(&out.bytes).expect("decompress"), data);
     }
 
     #[test]

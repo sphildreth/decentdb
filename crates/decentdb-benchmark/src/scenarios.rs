@@ -12,7 +12,10 @@ use hdrhistogram::Histogram;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use decentdb::benchmark::{snapshot_vfs_stats, VfsStats, VfsStatsScope};
+use decentdb::benchmark::{
+    reset_read_path_counters, snapshot_vfs_stats, take_read_path_counters, ReadPathCounters,
+    VfsStats, VfsStatsScope,
+};
 use decentdb::{Db, DbConfig, QueryResult, Value, WalSyncMode};
 
 use crate::cli::{ColdPointLookupProbeArgs, InternalCommand, RecoveryReopenProbeArgs};
@@ -1915,6 +1918,8 @@ fn read_under_write(profile: &ResolvedProfile, scenario_scratch: &Path) -> Resul
 
     let mut writer_iso_sum = 0.0_f64;
     let mut writer_under_sum = 0.0_f64;
+    let mut reader_iso_counters = ReadPathCounters::default();
+    let mut reader_under_counters = ReadPathCounters::default();
 
     for trial in 0..profile.trials {
         let trial_dir = scenario_scratch.join(format!("trial-{}", trial + 1));
@@ -1923,7 +1928,9 @@ fn read_under_write(profile: &ResolvedProfile, scenario_scratch: &Path) -> Resul
 
         let reader_iso_path = trial_dir.join("read_under_write_reader_iso.ddb");
         seed_read_under_write_db(&reader_iso_path, profile)?;
+        reset_read_path_counters();
         let reader_iso = run_reader_only_workload(&reader_iso_path, profile, trial)?;
+        add_read_path_counters(&mut reader_iso_counters, take_read_path_counters());
         reader_iso_agg.merge(reader_iso)?;
 
         let writer_iso_path = trial_dir.join("read_under_write_writer_iso.ddb");
@@ -1932,7 +1939,9 @@ fn read_under_write(profile: &ResolvedProfile, scenario_scratch: &Path) -> Resul
 
         let mixed_path = trial_dir.join("read_under_write_mixed.ddb");
         seed_read_under_write_db(&mixed_path, profile)?;
+        reset_read_path_counters();
         let (reader_under, writer_under) = run_mixed_workload(&mixed_path, profile, trial)?;
+        add_read_path_counters(&mut reader_under_counters, take_read_path_counters());
         reader_under_agg.merge(reader_under)?;
         writer_under_sum += writer_under;
     }
@@ -1986,6 +1995,37 @@ fn read_under_write(profile: &ResolvedProfile, scenario_scratch: &Path) -> Resul
     );
     metrics.insert("reader_threads".to_string(), json!(profile.reader_threads));
     metrics.insert("writer_ops".to_string(), json!(profile.writer_ops));
+    insert_read_path_counter_metrics(
+        &mut metrics,
+        "reader_iso",
+        reader_iso_counters,
+        profile
+            .point_reads
+            .saturating_mul(u64::from(profile.trials)),
+        "per_read",
+    );
+    insert_read_path_counter_metrics(
+        &mut metrics,
+        "reader_under_write",
+        reader_under_counters,
+        profile
+            .point_reads
+            .saturating_add(profile.writer_ops)
+            .saturating_mul(u64::from(profile.trials)),
+        "per_measured_operation",
+    );
+    metrics.insert(
+        "read_path_write_txn_lock_count".to_string(),
+        json!(reader_under_counters.write_txn_lock_count),
+    );
+    metrics.insert(
+        "read_path_held_snapshots_lock_count".to_string(),
+        json!(reader_under_counters.held_snapshots_lock_count),
+    );
+    metrics.insert(
+        "read_path_wal_reader_begin_count".to_string(),
+        json!(reader_under_counters.wal_reader_begin_count),
+    );
 
     Ok(ScenarioResult {
         status: ScenarioStatus::Passed,
@@ -1999,7 +2039,7 @@ fn read_under_write(profile: &ResolvedProfile, scenario_scratch: &Path) -> Resul
         metrics,
         warnings: Vec::new(),
         notes: vec![
-            "One writer thread and multiple reader threads run against the same database path using direct Rust API calls."
+            "One writer thread and multiple reader threads run against independent Db handles for the same database path."
                 .to_string(),
             "reader_degradation_ratio = reader_p95_under_write_us / reader_p95_isolation_us"
                 .to_string(),
@@ -2011,6 +2051,59 @@ fn read_under_write(profile: &ResolvedProfile, scenario_scratch: &Path) -> Resul
         vfs_stats: None,
         artifacts: Vec::new(),
     })
+}
+
+fn add_read_path_counters(total: &mut ReadPathCounters, sample: ReadPathCounters) {
+    total.write_txn_lock_count = total
+        .write_txn_lock_count
+        .saturating_add(sample.write_txn_lock_count);
+    total.held_snapshots_lock_count = total
+        .held_snapshots_lock_count
+        .saturating_add(sample.held_snapshots_lock_count);
+    total.wal_reader_begin_count = total
+        .wal_reader_begin_count
+        .saturating_add(sample.wal_reader_begin_count);
+}
+
+fn insert_read_path_counter_metrics(
+    metrics: &mut BTreeMap<String, serde_json::Value>,
+    prefix: &str,
+    counters: ReadPathCounters,
+    measured_ops: u64,
+    rate_suffix: &str,
+) {
+    let rate = |count: u64| {
+        if measured_ops == 0 {
+            0.0
+        } else {
+            count as f64 / measured_ops as f64
+        }
+    };
+
+    metrics.insert(
+        format!("{prefix}_read_path_write_txn_lock_count"),
+        json!(counters.write_txn_lock_count),
+    );
+    metrics.insert(
+        format!("{prefix}_read_path_write_txn_locks_{rate_suffix}"),
+        json!(rate(counters.write_txn_lock_count)),
+    );
+    metrics.insert(
+        format!("{prefix}_read_path_held_snapshots_lock_count"),
+        json!(counters.held_snapshots_lock_count),
+    );
+    metrics.insert(
+        format!("{prefix}_read_path_held_snapshot_locks_{rate_suffix}"),
+        json!(rate(counters.held_snapshots_lock_count)),
+    );
+    metrics.insert(
+        format!("{prefix}_read_path_wal_reader_begin_count"),
+        json!(counters.wal_reader_begin_count),
+    );
+    metrics.insert(
+        format!("{prefix}_read_path_wal_reader_begins_{rate_suffix}"),
+        json!(rate(counters.wal_reader_begin_count)),
+    );
 }
 
 fn storage_efficiency(
@@ -2406,6 +2499,7 @@ fn memory_footprint(profile: &ResolvedProfile, scenario_scratch: &Path) -> Resul
         Some(after_reopen_sum / u64::from(after_reopen_count))
     };
 
+    let peak_rss_mb = rss_peak_avg.map(|b| b as f64 / (1024.0 * 1024.0));
     let mut metrics = BTreeMap::new();
     metrics.insert(
         "rss_steady_bytes".to_string(),
@@ -2414,6 +2508,10 @@ fn memory_footprint(profile: &ResolvedProfile, scenario_scratch: &Path) -> Resul
     metrics.insert(
         "rss_peak_bytes".to_string(),
         rss_peak_avg.map_or(serde_json::Value::Null, |value| json!(value)),
+    );
+    metrics.insert(
+        "peak_rss_mb".to_string(),
+        peak_rss_mb.map_or(serde_json::Value::Null, |v| json!(v)),
     );
     metrics.insert(
         "rss_after_reopen_bytes".to_string(),
@@ -2526,8 +2624,8 @@ fn run_reader_only_workload(
 }
 
 fn run_writer_only_workload(db_path: &Path, profile: &ResolvedProfile, trial: u32) -> Result<f64> {
-    run_writer_thread(
-        db_path.to_path_buf(),
+    run_writer_on_db_path(
+        db_path,
         profile.rows,
         profile.writer_ops,
         profile.seed,
@@ -2550,46 +2648,28 @@ fn run_mixed_workload(
     let writer_seed = profile.seed;
     let writer_handle = thread::spawn(move || {
         writer_barrier.wait();
-        run_writer_thread(writer_path, writer_rows, writer_ops, writer_seed, trial)
+        run_writer_on_db_path(&writer_path, writer_rows, writer_ops, writer_seed, trial)
     });
 
     let mut reader_handles = Vec::with_capacity(thread_count as usize);
     for thread_index in 0..thread_count {
-        let db_path = db_path.to_path_buf();
+        let reader_path = db_path.to_path_buf();
         let reader_barrier = Arc::clone(&barrier);
         let seed = profile.seed;
         let rows = profile.rows;
         let (start_op, op_count) = split_ops(profile.point_reads, thread_count, thread_index);
         let trial_local = trial;
         reader_handles.push(thread::spawn(move || {
-            let db = Db::open(&db_path, real_fs_default_config(path_parent(&db_path)?))
-                .with_context(|| {
-                    format!(
-                        "open read_under_write reader database {}",
-                        db_path.display()
-                    )
-                })?;
-            let select = db.prepare("SELECT payload FROM bench_read_under_write WHERE id = $1")?;
-            let mut collector = LatencyCollector::new()?;
             reader_barrier.wait();
-            for op in 0..op_count {
-                let key = deterministic_id(
-                    seed ^ u64::from(thread_index).wrapping_mul(0x9e37_79b9),
-                    start_op.saturating_add(op),
-                    rows,
-                    trial_local,
-                );
-                let started = Instant::now();
-                let result = select.execute(&[Value::Int64(to_i64(key)?)])?;
-                collector.record(started.elapsed())?;
-                let row_count = result.rows().len();
-                if row_count != 1 {
-                    return Err(anyhow!(
-                        "read_under_write expected exactly 1 row, got {row_count}"
-                    ));
-                }
-            }
-            Ok::<LatencyCollector, anyhow::Error>(collector)
+            run_reader_thread(
+                reader_path,
+                rows,
+                seed,
+                trial_local,
+                start_op,
+                op_count,
+                thread_index,
+            )
         }));
     }
 
@@ -2648,25 +2728,8 @@ fn run_reader_thread(
     Ok(collector)
 }
 
-fn run_writer_thread(
-    db_path: PathBuf,
-    rows: u64,
-    writer_ops: u64,
-    seed: u64,
-    trial: u32,
-) -> Result<f64> {
-    let db = Db::open_or_create(
-        &db_path,
-        real_fs_full_durability_config(path_parent(&db_path)?),
-    )
-    .with_context(|| {
-        format!(
-            "open read_under_write writer database {}",
-            db_path.display()
-        )
-    })?;
+fn run_writer_on_db(db: &Db, rows: u64, writer_ops: u64, seed: u64, trial: u32) -> Result<f64> {
     let update = db.prepare("UPDATE bench_read_under_write SET payload = 'rw' WHERE id = $1")?;
-
     let started = Instant::now();
     for op in 0..writer_ops {
         let key = deterministic_id(seed.rotate_left(17), op, rows, trial);
@@ -2681,6 +2744,26 @@ fn run_writer_thread(
     } else {
         Ok(writer_ops as f64 / elapsed_secs)
     }
+}
+
+fn run_writer_on_db_path(
+    db_path: &Path,
+    rows: u64,
+    writer_ops: u64,
+    seed: u64,
+    trial: u32,
+) -> Result<f64> {
+    let db = Db::open_or_create(
+        db_path,
+        real_fs_full_durability_config(path_parent(db_path)?),
+    )
+    .with_context(|| {
+        format!(
+            "open read_under_write writer database {}",
+            db_path.display()
+        )
+    })?;
+    run_writer_on_db(&db, rows, writer_ops, seed, trial)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -3002,10 +3085,13 @@ fn to_i64(value: u64) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        deterministic_id, deterministic_scan_start, run_scenario, throughput_degradation_ratio,
+        deterministic_id, deterministic_scan_start, load_id_table_chunked,
+        real_fs_full_durability_config, run_cold_point_lookup_probe, run_scenario,
+        throughput_degradation_ratio, ColdPointLookupProbeArgs,
     };
     use crate::profiles::ResolvedProfile;
     use crate::types::{ProfileKind, ScenarioId, ScenarioStatus};
+    use decentdb::Db;
     use tempfile::TempDir;
 
     fn tiny_profile() -> ResolvedProfile {
@@ -3065,6 +3151,66 @@ mod tests {
         assert!(result.metrics.contains_key("orders_insert_rps"));
         assert!(result.metrics.contains_key("report_query_s"));
         assert!(result.metrics.contains_key("update_p95_ms"));
+    }
+
+    #[test]
+    fn read_under_write_scenario_runs_with_tiny_profile() {
+        let temp = TempDir::new().expect("tempdir");
+        let result = run_scenario(ScenarioId::ReadUnderWrite, &tiny_profile(), temp.path())
+            .expect("run read-under-write scenario");
+        assert!(matches!(result.status, ScenarioStatus::Passed));
+        assert!(result.metrics.contains_key("reader_p95_degradation_ratio"));
+        assert!(result
+            .metrics
+            .contains_key("writer_throughput_degradation_ratio"));
+    }
+
+    #[test]
+    fn read_under_write_paged_manifest_checksum_remains_valid() {
+        let temp = TempDir::new().expect("tempdir");
+        let profile = ResolvedProfile {
+            rows: 2_000,
+            point_reads: 1_600,
+            reader_threads: 4,
+            writer_ops: 40,
+            batch_size: 50,
+            ..tiny_profile()
+        };
+        let result = run_scenario(ScenarioId::ReadUnderWrite, &profile, temp.path())
+            .expect("run read-under-write checksum regression");
+        assert!(matches!(result.status, ScenarioStatus::Passed));
+    }
+
+    #[test]
+    fn cold_point_lookup_probe_finds_seeded_rows() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("cold_probe.ddb");
+        let db = Db::open_or_create(&db_path, real_fs_full_durability_config(temp.path()))
+            .expect("open db");
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS bench_point_lookup_cold (id INT64 PRIMARY KEY, payload TEXT NOT NULL)",
+        )
+        .expect("create table");
+        load_id_table_chunked(
+            &db,
+            "INSERT INTO bench_point_lookup_cold (id, payload) VALUES ($1, 'point-lookup-cold')",
+            1_000,
+            100,
+        )
+        .expect("seed rows");
+        db.checkpoint().expect("checkpoint");
+        drop(db);
+
+        let result = run_cold_point_lookup_probe(ColdPointLookupProbeArgs {
+            db_path,
+            rows: 1_000,
+            seed: 7,
+            trial: 0,
+            start_op: 0,
+            lookups: 32,
+        })
+        .expect("run cold point lookup probe");
+        assert_eq!(result.rows_returned, 32);
     }
 
     #[test]

@@ -2,13 +2,14 @@
 
 use crate::catalog::{identifiers_equal, ColumnSchema, IndexKind, IndexSchema, TableSchema};
 use crate::error::{DbError, Result};
+use crate::record::row::Row;
 use crate::record::value::Value;
 use crate::sql::ast::ConflictTarget;
 use crate::sql::parser::parse_expression_sql;
 
 use super::{
     compare_values, generated_columns_are_stored, row_satisfies_index_predicate, table_row_dataset,
-    EngineRuntime, RuntimeIndex, StoredRow,
+    EngineRuntime, RuntimeBtreeKey, RuntimeIndex, StoredRow, TableRowRef,
 };
 
 impl EngineRuntime {
@@ -130,12 +131,11 @@ impl EngineRuntime {
                 }
                 continue;
             }
-            let rows = self
-                .table_data_for_schema(table, table_name)?
-                .map(std::borrow::Cow::into_owned)
-                .unwrap_or_default()
-                .rows;
-            for existing in rows {
+            let Some(row_source) = self.visible_table_row_source(table_name) else {
+                continue;
+            };
+            for existing in row_source.rows() {
+                let existing = materialize_constraint_row(self, table, existing?)?;
                 if Some(existing.row_id) == existing_row_id {
                     continue;
                 }
@@ -198,7 +198,7 @@ impl EngineRuntime {
                         .unwrap_or_else(|| format!("{}_fk", table.name))
                 )));
             }
-            if let Some(exists) = parent_exists_via_single_column_index(
+            if let Some(exists) = parent_exists_via_single_or_composite_index(
                 self,
                 parent,
                 &foreign_key.referenced_table,
@@ -213,24 +213,28 @@ impl EngineRuntime {
                     table.name, foreign_key.referenced_table
                 )));
             }
-            let Some(parent_rows) =
-                self.table_data_for_schema(parent, &foreign_key.referenced_table)?
+            let Some(parent_rows) = self.visible_table_row_source(&foreign_key.referenced_table)
             else {
                 return Err(DbError::constraint(format!(
                     "foreign key parent table {} has no row store",
                     foreign_key.referenced_table
                 )));
             };
-            let exists = parent_rows.rows.iter().any(|parent_row| {
-                referenced_columns
-                    .iter()
-                    .zip(&child_values)
-                    .all(|(column_name, child_value)| {
+            let mut exists = false;
+            for parent_row in parent_rows.rows() {
+                let parent_row = materialize_constraint_row(self, parent, parent_row?)?;
+                let is_match = referenced_columns.iter().zip(&child_values).all(
+                    |(column_name, child_value)| {
                         lookup_column_value(parent, &parent_row.values, column_name)
                             .and_then(|parent_value| compare_values(parent_value, child_value))
                             .is_ok_and(|ordering| ordering == std::cmp::Ordering::Equal)
-                    })
-            });
+                    },
+                );
+                if is_match {
+                    exists = true;
+                    break;
+                }
+            }
             if !exists {
                 return Err(DbError::constraint(format!(
                     "foreign key on {} references missing parent row in {}",
@@ -255,7 +259,7 @@ impl EngineRuntime {
         if indexes.is_empty() {
             return Ok(None);
         }
-        let Some(table_data) = self.table_data(table_name) else {
+        let Some(table_row_source) = self.table_row_source(table_name) else {
             return Ok(None);
         };
         for index in indexes {
@@ -267,27 +271,28 @@ impl EngineRuntime {
                 continue;
             }
             if let Some(row_ids) = unique_index_row_ids(self, index, table, row)? {
-                if let Some(existing) = table_data
-                    .rows
-                    .iter()
-                    .find(|existing| row_ids.contains(&existing.row_id))
-                {
-                    return Ok(Some(existing.clone()));
+                for row_id in row_ids {
+                    if let Some(existing) = table_row_source.row_by_id(row_id)? {
+                        return Ok(Some(StoredRow {
+                            row_id: existing.row_id(),
+                            values: existing.values().to_vec(),
+                        }));
+                    }
                 }
                 continue;
             }
-            if let Some(existing) = table_data.rows.iter().find(|existing| {
-                row_satisfies_index_predicate(self, index, table, &existing.values)
-                    .and_then(|matches| {
-                        if !matches {
-                            return Ok(false);
-                        }
-                        index_values(self, index, table, &existing.values)
-                            .and_then(|existing_values| values_equal(&candidate, &existing_values))
-                    })
-                    .unwrap_or(false)
-            }) {
-                return Ok(Some(existing.clone()));
+            for existing in table_row_source.rows() {
+                let existing = existing?;
+                let existing_values = existing.values();
+                if row_satisfies_index_predicate(self, index, table, existing_values)? {
+                    let existing_index_values = index_values(self, index, table, existing_values)?;
+                    if values_equal(&candidate, &existing_index_values)? {
+                        return Ok(Some(StoredRow {
+                            row_id: existing.row_id(),
+                            values: existing_values.to_vec(),
+                        }));
+                    }
+                }
             }
         }
         Ok(None)
@@ -472,29 +477,32 @@ fn values_equal(left: &[Value], right: &[Value]) -> Result<bool> {
     Ok(true)
 }
 
-fn parent_exists_via_single_column_index(
+fn parent_exists_via_single_or_composite_index(
     runtime: &EngineRuntime,
-    parent: &TableSchema,
+    _parent: &TableSchema,
     parent_table_name: &str,
     referenced_columns: &[String],
     child_values: &[&Value],
 ) -> Result<Option<bool>> {
-    if referenced_columns.len() != 1 || child_values.len() != 1 {
+    if referenced_columns.len() != child_values.len() || referenced_columns.is_empty() {
         return Ok(None);
     }
-    let referenced_column = &referenced_columns[0];
     let Some(index) = unique_indexes_for_table(runtime, parent_table_name)
         .into_iter()
         .find(|index| {
             index.fresh
                 && index.kind == IndexKind::Btree
                 && index.predicate_sql.is_none()
-                && index.columns.len() == 1
-                && index.columns[0].expression_sql.is_none()
-                && index.columns[0]
-                    .column_name
-                    .as_ref()
-                    .is_some_and(|name| identifiers_equal(name, referenced_column))
+                && index.columns.len() == referenced_columns.len()
+                && index.columns.iter().zip(referenced_columns).all(
+                    |(index_column, referenced_column)| {
+                        index_column.expression_sql.is_none()
+                            && index_column
+                                .column_name
+                                .as_ref()
+                                .is_some_and(|name| identifiers_equal(name, referenced_column))
+                    },
+                )
         })
     else {
         return Ok(None);
@@ -502,18 +510,284 @@ fn parent_exists_via_single_column_index(
     let Some(RuntimeIndex::Btree { keys }) = runtime.index(&index.name) else {
         return Ok(None);
     };
-    let matched_row_ids = keys.row_ids_for_value_set(child_values[0])?;
+    let matched_row_ids = if child_values.len() == 1 {
+        keys.row_ids_for_value(child_values[0])?
+    } else {
+        keys.row_ids_for_key(&RuntimeBtreeKey::Encoded(
+            Row::new(child_values.iter().map(|value| (*value).clone()).collect()).encode()?,
+        ))
+    };
     if matched_row_ids.is_empty() {
         return Ok(Some(false));
     }
-    let Some(parent_rows) = runtime.table_data_for_schema(parent, parent_table_name)? else {
+    let Some(parent_rows) = runtime.visible_table_row_source(parent_table_name) else {
         return Ok(Some(false));
     };
-    let mut exists = false;
-    matched_row_ids.for_each(|row_id| {
-        if !exists && parent_rows.row_by_id(row_id).is_some() {
-            exists = true;
+    for row_id in matched_row_ids {
+        if parent_rows.row_by_id(row_id)?.is_some() {
+            return Ok(Some(true));
         }
-    });
-    Ok(Some(exists))
+    }
+    Ok(Some(false))
+}
+
+fn materialize_constraint_row(
+    runtime: &EngineRuntime,
+    table: &TableSchema,
+    row: TableRowRef<'_>,
+) -> Result<StoredRow> {
+    let mut values = row.values().to_vec();
+    if !generated_columns_are_stored(table) {
+        runtime.apply_virtual_generated_columns(table, &mut values)?;
+    }
+    Ok(StoredRow {
+        row_id: row.row_id(),
+        values,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::catalog::{ColumnSchema, ForeignKeyAction, ForeignKeyConstraint, IndexColumn};
+
+    fn paged_row_source(rows: Vec<StoredRow>) -> super::super::TableRowSource {
+        let payload = super::super::encode_table_payload(&crate::exec::TableData::from_rows(rows))
+            .expect("encode paged test payload");
+        let manifest = super::super::TablePageManifest::from_payload(Arc::new(payload))
+            .expect("build paged test manifest");
+        super::super::TableRowSource::Paged(Arc::new(manifest))
+    }
+
+    fn int_column(name: &str, primary_key: bool, nullable: bool) -> ColumnSchema {
+        ColumnSchema {
+            name: name.to_string(),
+            column_type: crate::catalog::ColumnType::Int64,
+            nullable,
+            default_sql: None,
+            generated_sql: None,
+            generated_stored: false,
+            primary_key,
+            unique: false,
+            auto_increment: false,
+            checks: vec![],
+            foreign_key: None,
+        }
+    }
+
+    #[test]
+    fn validate_row_unique_fallback_scans_paged_row_source() {
+        let mut runtime = EngineRuntime::empty(1);
+        let table = TableSchema {
+            name: "items".to_string(),
+            temporary: false,
+            columns: vec![
+                int_column("id", true, false),
+                int_column("code", false, false),
+            ],
+            checks: vec![],
+            foreign_keys: vec![],
+            primary_key_columns: vec!["id".to_string()],
+            next_row_id: 2,
+            pk_index_root: None,
+        };
+        runtime
+            .catalog_mut()
+            .tables
+            .insert(table.name.clone(), table.clone());
+        runtime.catalog_mut().indexes.insert(
+            "items_code_unique".to_string(),
+            IndexSchema {
+                name: "items_code_unique".to_string(),
+                table_name: "items".to_string(),
+                kind: IndexKind::Btree,
+                unique: true,
+                columns: vec![IndexColumn {
+                    column_name: Some("code".to_string()),
+                    expression_sql: None,
+                }],
+                include_columns: vec![],
+                predicate_sql: None,
+                fresh: false,
+            },
+        );
+        runtime.tables_mut().insert(
+            "items".to_string(),
+            paged_row_source(vec![StoredRow {
+                row_id: 1,
+                values: vec![Value::Int64(1), Value::Int64(7)],
+            }]),
+        );
+
+        let err = runtime
+            .validate_row("items", &[Value::Int64(2), Value::Int64(7)], None, &[])
+            .expect_err("duplicate code should violate unique constraint");
+        assert!(err.to_string().contains("unique constraint"));
+        assert!(matches!(
+            runtime.table_row_source("items"),
+            Some(super::super::TableRowSource::Paged(_))
+        ));
+    }
+
+    #[test]
+    fn validate_row_foreign_key_fallback_scans_paged_parent_source() {
+        let mut runtime = EngineRuntime::empty(1);
+        let parent = TableSchema {
+            name: "parent".to_string(),
+            temporary: false,
+            columns: vec![
+                int_column("id", true, false),
+                int_column("code", false, false),
+            ],
+            checks: vec![],
+            foreign_keys: vec![],
+            primary_key_columns: vec!["id".to_string()],
+            next_row_id: 2,
+            pk_index_root: None,
+        };
+        let child = TableSchema {
+            name: "child".to_string(),
+            temporary: false,
+            columns: vec![
+                int_column("id", true, false),
+                int_column("parent_code", false, false),
+            ],
+            checks: vec![],
+            foreign_keys: vec![ForeignKeyConstraint {
+                name: None,
+                columns: vec!["parent_code".to_string()],
+                referenced_table: "parent".to_string(),
+                referenced_columns: vec!["code".to_string()],
+                on_delete: ForeignKeyAction::Restrict,
+                on_update: ForeignKeyAction::Restrict,
+            }],
+            primary_key_columns: vec!["id".to_string()],
+            next_row_id: 1,
+            pk_index_root: None,
+        };
+        runtime
+            .catalog_mut()
+            .tables
+            .insert(parent.name.clone(), parent.clone());
+        runtime
+            .catalog_mut()
+            .tables
+            .insert(child.name.clone(), child.clone());
+        runtime.tables_mut().insert(
+            "parent".to_string(),
+            paged_row_source(vec![StoredRow {
+                row_id: 1,
+                values: vec![Value::Int64(1), Value::Int64(42)],
+            }]),
+        );
+
+        runtime
+            .validate_row("child", &[Value::Int64(1), Value::Int64(42)], None, &[])
+            .expect("matching parent row should satisfy foreign key");
+        assert!(matches!(
+            runtime.table_row_source("parent"),
+            Some(super::super::TableRowSource::Paged(_))
+        ));
+    }
+
+    #[test]
+    fn validate_row_foreign_key_composite_index_checks_paged_parent_source() {
+        let mut runtime = EngineRuntime::empty(1);
+        let parent = TableSchema {
+            name: "parent".to_string(),
+            temporary: false,
+            columns: vec![int_column("a", false, false), int_column("b", false, false)],
+            checks: vec![],
+            foreign_keys: vec![],
+            primary_key_columns: vec!["a".to_string(), "b".to_string()],
+            next_row_id: 2,
+            pk_index_root: None,
+        };
+        let child = TableSchema {
+            name: "child".to_string(),
+            temporary: false,
+            columns: vec![
+                int_column("id", true, false),
+                int_column("parent_a", false, false),
+                int_column("parent_b", false, false),
+            ],
+            checks: vec![],
+            foreign_keys: vec![ForeignKeyConstraint {
+                name: None,
+                columns: vec!["parent_a".to_string(), "parent_b".to_string()],
+                referenced_table: "parent".to_string(),
+                referenced_columns: vec!["a".to_string(), "b".to_string()],
+                on_delete: ForeignKeyAction::Restrict,
+                on_update: ForeignKeyAction::Restrict,
+            }],
+            primary_key_columns: vec!["id".to_string()],
+            next_row_id: 1,
+            pk_index_root: None,
+        };
+        runtime
+            .catalog_mut()
+            .tables
+            .insert(parent.name.clone(), parent.clone());
+        runtime
+            .catalog_mut()
+            .tables
+            .insert(child.name.clone(), child.clone());
+        runtime.catalog_mut().indexes.insert(
+            "parent_ab_unique".to_string(),
+            IndexSchema {
+                name: "parent_ab_unique".to_string(),
+                table_name: "parent".to_string(),
+                kind: IndexKind::Btree,
+                unique: true,
+                columns: vec![
+                    IndexColumn {
+                        column_name: Some("a".to_string()),
+                        expression_sql: None,
+                    },
+                    IndexColumn {
+                        column_name: Some("b".to_string()),
+                        expression_sql: None,
+                    },
+                ],
+                include_columns: vec![],
+                predicate_sql: None,
+                fresh: true,
+            },
+        );
+        let mut entries = std::collections::BTreeMap::new();
+        entries.insert(
+            crate::record::row::Row::new(vec![Value::Int64(42), Value::Int64(7)])
+                .encode()
+                .expect("encode composite parent key"),
+            1,
+        );
+        runtime.indexes_mut().insert(
+            "parent_ab_unique".to_string(),
+            Arc::new(RuntimeIndex::Btree {
+                keys: super::super::RuntimeBtreeKeys::UniqueEncoded(entries),
+            }),
+        );
+        runtime.tables_mut().insert(
+            "parent".to_string(),
+            paged_row_source(vec![StoredRow {
+                row_id: 1,
+                values: vec![Value::Int64(42), Value::Int64(7)],
+            }]),
+        );
+
+        runtime
+            .validate_row(
+                "child",
+                &[Value::Int64(1), Value::Int64(42), Value::Int64(7)],
+                None,
+                &[],
+            )
+            .expect("matching composite parent row should satisfy foreign key");
+        assert!(matches!(
+            runtime.table_row_source("parent"),
+            Some(super::super::TableRowSource::Paged(_))
+        ));
+    }
 }

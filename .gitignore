@@ -101,3 +101,9 @@ tests/bindings/**/*.node
 
 bindings/dart/examples/console_complex/*.json
 *.pyc
+
+bindings/dotnet/.tmp/*
+bindings/dotnet/tests/DecentDB.Tests/TestResults/*
+bindings/dotnet/tests/DecentDB.EntityFrameworkCore.Tests/TestResults/*
+
+benchmarks/rust-baseline/.tmp/*

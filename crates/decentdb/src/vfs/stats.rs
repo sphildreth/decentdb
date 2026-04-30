@@ -228,6 +228,10 @@ impl VfsFile for StatsVfsFile {
         Ok(written)
     }
 
+    fn advise_sequential(&self) -> Result<()> {
+        self.inner.advise_sequential()
+    }
+
     fn sync_data(&self) -> Result<()> {
         let state = global_stats_state();
         if state.enabled() {

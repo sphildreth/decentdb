@@ -53,7 +53,6 @@ internal sealed class ExpressionSqlBuilder<T>
 
     private string VisitBinary(BinaryExpression be, string op)
     {
-        // Handle NULL comparisons as IS / IS NOT.
         if (IsNullConstant(be.Right) && TryGetColumn(be.Left, out var colLeft, out _))
         {
             return op == "="
@@ -107,7 +106,37 @@ internal sealed class ExpressionSqlBuilder<T>
             }
         }
 
-        throw new NotSupportedException($"Unsupported method call: {mce.Method.DeclaringType?.FullName}.{mce.Method.Name}");
+        if (!ReferencesLambdaParameter(mce))
+        {
+            return AddParameter(() => Evaluate(mce), null);
+        }
+
+        throw new NotSupportedException(
+            $"DecentDB cannot translate '{mce.Method.DeclaringType?.FullName}.{mce.Method.Name}' to SQL. " +
+            $"Either call this method outside the LINQ expression and capture the result, or use a server-side equivalent.");
+    }
+
+    private static bool ReferencesLambdaParameter(Expression expr)
+    {
+        var visitor = new LambdaParameterVisitor();
+        visitor.Visit(expr);
+        return visitor.Found;
+    }
+
+    private sealed class LambdaParameterVisitor : ExpressionVisitor
+    {
+        public bool Found { get; private set; }
+
+        public override Expression? Visit(Expression? node)
+        {
+            if (Found) return node;
+            if (node is ParameterExpression)
+            {
+                Found = true;
+                return node;
+            }
+            return base.Visit(node);
+        }
     }
 
     private string VisitMember(MemberExpression me)
@@ -117,7 +146,6 @@ internal sealed class ExpressionSqlBuilder<T>
             return col;
         }
 
-        // Captured variables / static members.
         return AddParameter(() => Evaluate(me), null);
     }
 
@@ -125,7 +153,6 @@ internal sealed class ExpressionSqlBuilder<T>
     {
         if (expr is MemberExpression me && me.Member is PropertyInfo pi)
         {
-            // Entity property access: x.Prop
             if (me.Expression is ParameterExpression)
             {
                 var pm = _map.GetPropertyMap(pi);
@@ -169,7 +196,6 @@ internal sealed class ExpressionSqlBuilder<T>
             };
         }
 
-        // Fallback: evaluate via compilation.
         var lambda = Expression.Lambda(expr);
         var del = lambda.Compile();
         return del.DynamicInvoke();

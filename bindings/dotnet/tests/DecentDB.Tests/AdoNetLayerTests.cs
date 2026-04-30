@@ -230,6 +230,38 @@ public class AdoNetLayerTests : IDisposable
     }
 
     [Fact]
+    public void DecentDBCommand_ExecuteNonQuery_MultiRowUnderscoreParameterNames_InsertsAllRows()
+    {
+        using var conn = new DecentDBConnection($"Data Source={_dbPath}");
+        conn.Open();
+
+        using (var setup = conn.CreateCommand())
+        {
+            setup.CommandText = "CREATE TABLE bulk_probe (id INTEGER PRIMARY KEY, value INTEGER NOT NULL)";
+            setup.ExecuteNonQuery();
+        }
+
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+                          INSERT INTO bulk_probe (id, value)
+                          VALUES (@p0_0, @p0_1),
+                                 (@p1_0, @p1_1)
+                          """;
+
+        AddParameter(cmd, "@p0_0", 1);
+        AddParameter(cmd, "@p0_1", 10);
+        AddParameter(cmd, "@p1_0", 2);
+        AddParameter(cmd, "@p1_1", 20);
+
+        var affected = cmd.ExecuteNonQuery();
+        Assert.Equal(2, affected);
+
+        using var verify = conn.CreateCommand();
+        verify.CommandText = "SELECT COUNT(*) FROM bulk_probe";
+        Assert.Equal(2L, Convert.ToInt64(verify.ExecuteScalar()));
+    }
+
+    [Fact]
     public void DecentDBCommand_DbConnection_SetterGetter()
     {
         using var conn1 = new DecentDBConnection($"Data Source={_dbPath}1");
@@ -245,6 +277,14 @@ public class AdoNetLayerTests : IDisposable
         // Setting to non-DecentDBConnection should throw
         using var fakeConn = new FakeDbConnection();
         Assert.Throws<ArgumentException>(() => cmd.Connection = fakeConn);
+    }
+
+    private static void AddParameter(DbCommand command, string name, object value)
+    {
+        var parameter = command.CreateParameter();
+        parameter.ParameterName = name;
+        parameter.Value = value;
+        command.Parameters.Add(parameter);
     }
 
     [Fact]

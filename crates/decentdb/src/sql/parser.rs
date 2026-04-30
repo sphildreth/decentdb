@@ -21,7 +21,9 @@ pub(crate) fn parse_sql_statement(sql: &str) -> Result<Statement> {
 pub(crate) fn parse_sql_batch(sql: &str) -> Result<Vec<Statement>> {
     let (generated_modes, sql_with_generated_rewrite) = rewrite_generated_virtual_columns(sql);
     let compat_sql = rewrite_legacy_trigger_body(sql_with_generated_rewrite.as_ref());
-    let statements = libpg_query_sys::split_statements(compat_sql.as_ref())
+    // Pre-rewrite: make CREATE VIEW IF NOT EXISTS parsable by pg_query.
+    let sql_for_split = super::normalize::detect_and_rewrite_create_view_if_not_exists(&compat_sql);
+    let statements = libpg_query_sys::split_statements(sql_for_split.as_str())
         .map_err(|error| DbError::sql(error.message().to_string()))?;
     if statements.is_empty() {
         return Err(DbError::sql("no SQL statements found"));

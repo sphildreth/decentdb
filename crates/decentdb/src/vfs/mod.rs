@@ -51,6 +51,7 @@ pub(crate) trait VfsFile: Send + Sync + std::fmt::Debug {
     fn path(&self) -> &Path;
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize>;
     fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize>;
+    fn advise_sequential(&self) -> Result<()>;
     fn sync_data(&self) -> Result<()>;
     fn sync_metadata(&self) -> Result<()>;
     fn file_size(&self) -> Result<u64>;

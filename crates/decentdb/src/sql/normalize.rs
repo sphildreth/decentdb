@@ -18,6 +18,34 @@ use super::ast::{
     WindowFrameUnit,
 };
 
+// Thread-local flag set by `detect_and_rewrite_create_view_if_not_exists` and
+// consumed by `normalize_create_view` to propagate the IF NOT EXISTS signal
+// across the pg_query split → normalize boundary.
+thread_local! {
+    static PENDING_VIEW_IF_NOT_EXISTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Detects `CREATE VIEW IF NOT EXISTS` and rewrites it to `CREATE VIEW` so pg_query can parse it.
+/// Sets a thread-local flag that `normalize_create_view` reads to populate the AST field.
+/// Only sets the flag to true when the pattern is found; never resets it to false.
+pub(crate) fn detect_and_rewrite_create_view_if_not_exists(sql: &str) -> String {
+    const PAT: &str = "CREATE VIEW IF NOT EXISTS";
+    let trimmed = sql.trim_start();
+    let upper = trimmed.to_ascii_uppercase();
+    if upper.starts_with(PAT) {
+        PENDING_VIEW_IF_NOT_EXISTS.with(|c| c.set(true));
+        let rest = &trimmed[PAT.len()..].trim_start();
+        format!("CREATE VIEW {}", rest)
+    } else {
+        sql.to_string()
+    }
+}
+
+/// Consumes the thread-local IF NOT EXISTS flag set by `detect_and_rewrite_create_view_if_not_exists`.
+pub(crate) fn take_pending_view_if_not_exists() -> bool {
+    PENDING_VIEW_IF_NOT_EXISTS.with(|c| c.replace(false))
+}
+
 pub(crate) fn normalize_statement_text(sql: &str) -> Result<Statement> {
     normalize_statement_text_with_generated_modes(sql, &[])
 }
@@ -26,7 +54,9 @@ pub(crate) fn normalize_statement_text_with_generated_modes(
     sql: &str,
     generated_column_modes: &[bool],
 ) -> Result<Statement> {
-    let parsed = libpg_query_sys::parse_statement(sql)
+    // Pre-rewrite: make CREATE VIEW IF NOT EXISTS parsable by pg_query.
+    let rewritten = detect_and_rewrite_create_view_if_not_exists(sql);
+    let parsed = libpg_query_sys::parse_statement(&rewritten)
         .map_err(|error| DbError::sql(error.message().to_string()))?;
     let raw = parsed
         .stmts
@@ -61,9 +91,10 @@ fn normalize_statement_with_generated_modes(
         NodeEnum::IndexStmt(statement) => {
             Ok(Statement::CreateIndex(normalize_create_index(statement)?))
         }
-        NodeEnum::ViewStmt(statement) => {
-            Ok(Statement::CreateView(normalize_create_view(statement)?))
-        }
+        NodeEnum::ViewStmt(statement) => Ok(Statement::CreateView(normalize_create_view(
+            statement,
+            original_sql,
+        )?)),
         NodeEnum::ExplainStmt(statement) => Ok(Statement::Explain(normalize_explain(
             statement,
             original_sql,
@@ -754,7 +785,10 @@ fn normalize_create_index(statement: &protobuf::IndexStmt) -> Result<CreateIndex
     })
 }
 
-fn normalize_create_view(statement: &protobuf::ViewStmt) -> Result<CreateViewStatement> {
+fn normalize_create_view(
+    statement: &protobuf::ViewStmt,
+    _original_sql: &str,
+) -> Result<CreateViewStatement> {
     let column_names = statement
         .aliases
         .iter()
@@ -764,10 +798,15 @@ fn normalize_create_view(statement: &protobuf::ViewStmt) -> Result<CreateViewSta
         .view
         .as_ref()
         .ok_or_else(|| unsupported("CREATE VIEW is missing a view name"))?;
+
+    // Consume the IF NOT EXISTS flag that was set during the pre-rewrite step.
+    let if_not_exists = take_pending_view_if_not_exists();
+
     Ok(CreateViewStatement {
         view_name: normalize_range_var(view)?,
         temporary: view.relpersistence == "t",
         replace: statement.replace,
+        if_not_exists,
         column_names,
         query: normalize_query(as_select_stmt(
             statement
@@ -1131,7 +1170,9 @@ fn normalize_from_item(node: &protobuf::Node) -> Result<FromItem> {
                 .alias
                 .as_ref()
                 .map(|alias| alias.aliasname.clone())
-                .ok_or_else(|| unsupported("subqueries in FROM require an alias"))?,
+                .ok_or_else(|| {
+                    unsupported("subqueries in FROM require an alias (e.g. `SELECT ... FROM (SELECT ...) AS alias`)")
+                })?,
             column_names: normalize_alias_column_names(range.alias.as_ref())?,
             lateral: range.lateral,
         }),

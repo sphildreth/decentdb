@@ -8,7 +8,7 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use decentdb::{Db, DbConfig, DbError, Value};
 
@@ -166,6 +166,7 @@ fn truncated_wal_to_zero_bytes_is_corruption() {
         let db = Db::create(&path, DbConfig::default()).unwrap();
         exec(&db, "CREATE TABLE t(id INT64)");
         exec(&db, "INSERT INTO t VALUES (1)");
+        db.begin_transaction().unwrap();
         drop(db);
     }
 
@@ -230,6 +231,7 @@ fn partial_wal_header_is_corruption() {
         exec(&db, "INSERT INTO t VALUES (1)");
         drop(db);
     }
+    std::thread::sleep(Duration::from_millis(200));
 
     let wal = wal_path(&path);
     // Truncate to 16 bytes — below the 32-byte WAL header.
@@ -260,8 +262,10 @@ fn corrupt_wal_magic_is_detected_on_reopen() {
     {
         let db = Db::create(&path, DbConfig::default()).unwrap();
         exec(&db, "CREATE TABLE t(id INT64)");
+        db.begin_transaction().unwrap();
         drop(db);
     }
+    std::thread::sleep(Duration::from_millis(200));
 
     // Overwrite the WAL header magic.
     let wal = wal_path(&path);

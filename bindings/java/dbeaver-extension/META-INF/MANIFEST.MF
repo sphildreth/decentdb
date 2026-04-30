@@ -2,7 +2,7 @@ Manifest-Version: 1.0
 Bundle-ManifestVersion: 2
 Bundle-Name: DecentDB DBeaver Extension
 Bundle-SymbolicName: org.jkiss.dbeaver.ext.decentdb;singleton:=true
-Bundle-Version: 2.3.0
+Bundle-Version: 2.4.0
 Bundle-Activator: org.jkiss.dbeaver.ext.decentdb.DecentDBActivator
 Bundle-Vendor: DecentDB Contributors
 Require-Bundle: org.eclipse.core.runtime,
@@ -11,5 +11,5 @@ Require-Bundle: org.eclipse.core.runtime,
  org.jkiss.dbeaver.ext.generic
 Bundle-RequiredExecutionEnvironment: JavaSE-17
 Bundle-ClassPath: .,
- lib/decentdb-jdbc-2.3.0.jar
+ lib/decentdb-jdbc-2.4.0.jar
 Export-Package: org.jkiss.dbeaver.ext.decentdb.model

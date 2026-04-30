@@ -23,6 +23,25 @@ impl Value {
             DbError::corruption(format!("TEXT payload is not valid UTF-8: {error}"))
         })
     }
+
+    /// Approximate heap-allocated bytes owned by this value (excludes the
+    /// `Value` discriminant itself, which is accounted by the caller via
+    /// `size_of::<Value>()`). Used by storage instrumentation to report
+    /// per-table residency. Per ADR 0143 (Phase A).
+    #[must_use]
+    pub fn approximate_heap_bytes(&self) -> usize {
+        match self {
+            Value::Null
+            | Value::Int64(_)
+            | Value::Float64(_)
+            | Value::Bool(_)
+            | Value::Decimal { .. }
+            | Value::Uuid(_)
+            | Value::TimestampMicros(_) => 0,
+            Value::Text(s) => s.capacity(),
+            Value::Blob(b) => b.capacity(),
+        }
+    }
 }
 
 #[must_use]

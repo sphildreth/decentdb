@@ -242,50 +242,198 @@ public sealed class DbSet<T> : IQueryable<T> where T : class, new()
         return false;
     }
 
+    private const int MaxRowsPerInsert = 256;
+
+    /// <summary>
+    /// Inserts entities in chunks of up to 256 rows per INSERT … VALUES statement.
+    /// Auto-generated PKs are not supported by this method; pre-assign PKs on the
+    /// entities or use InsertAsync per row.
+    /// </summary>
     public async Task InsertManyAsync(IEnumerable<T> entities, CancellationToken cancellationToken = default)
     {
         if (entities == null) throw new ArgumentNullException(nameof(entities));
 
-        // Keep connection stable for the whole batch.
+        var bindProps = _map.Properties.Where(p => !p.IsIgnored).ToArray();
+        var columnCount = bindProps.Length;
+        if (columnCount == 0) return;
+
+        // Build a single-row prepared INSERT.
+        var cols = string.Join(", ", bindProps.Select(p => p.ColumnName));
+        var vals = string.Join(", ", Enumerable.Range(0, columnCount).Select(i => $"@p{i}"));
+        var sql = $"INSERT INTO {_map.TableName} ({cols}) VALUES ({vals})";
+
         using var scope = _context.AcquireConnectionScope();
 
         var ownsTx = _context.CurrentTransaction == null;
         DbTransaction? tx = ownsTx ? scope.Connection.BeginTransaction() : _context.CurrentTransaction;
 
-        // Pre-build SQL shape once.
-        var cols = new List<string>();
-        var vals = new List<string>();
-        for (var i = 0; i < _map.Properties.Length; i++)
+        try
         {
-            var prop = _map.Properties[i];
-            if (prop.IsIgnored) continue;
-            cols.Add(prop.ColumnName);
-            vals.Add($"@p{vals.Count}");
+            using var cmd = scope.Connection.CreateCommand();
+            cmd.CommandText = sql;
+            if (tx != null)
+            {
+                cmd.Transaction = tx;
+            }
+            else if (_context.CurrentTransaction != null)
+            {
+                cmd.Transaction = _context.CurrentTransaction;
+            }
+
+            // Prepare parameters once.
+            var parameters = new DbParameter[columnCount];
+            for (var i = 0; i < columnCount; i++)
+            {
+                var p = cmd.CreateParameter();
+                p.ParameterName = $"@p{i}";
+                if (bindProps[i].MaxLength.HasValue)
+                {
+                    p.Size = bindProps[i].MaxLength!.Value;
+                }
+                cmd.Parameters.Add(p);
+                parameters[i] = p;
+            }
+
+            var enumerator = entities.GetEnumerator();
+            try
+            {
+                if (!enumerator.MoveNext())
+                {
+                    // Empty sequence — nothing to do.
+                    if (ownsTx) tx!.Rollback();
+                    return;
+                }
+
+                do
+                {
+                    var entity = enumerator.Current;
+                    for (var i = 0; i < columnCount; i++)
+                    {
+                        var prop = bindProps[i];
+                        var v = prop.Property.GetValue(entity);
+                        if (!prop.IsNullable && v == null)
+                        {
+                            throw new ArgumentException($"Property '{prop.Property.Name}' cannot be NULL.");
+                        }
+                        parameters[i].Value = DefaultTypeConverters.ToDbValue(v);
+                    }
+                    await cmd.ExecuteNonQueryAsync(cancellationToken);
+                }
+                while (enumerator.MoveNext());
+            }
+            finally
+            {
+                (enumerator as IDisposable)?.Dispose();
+            }
+
+            if (ownsTx)
+            {
+                tx!.Commit();
+            }
         }
-        var sql = $"INSERT INTO {_map.TableName} ({string.Join(", ", cols)}) VALUES ({string.Join(", ", vals)})";
+        catch
+        {
+            if (ownsTx)
+            {
+                try { tx!.Rollback(); } catch { /* ignore rollback failures */ }
+            }
+            throw;
+        }
+        finally
+        {
+            if (ownsTx)
+            {
+                tx?.Dispose();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Inserts entities in chunks and reads back auto-generated PKs via RETURNING.
+    /// Requires that every entity has a default integer PK (0). Uses the same
+    /// chunking strategy as InsertManyAsync (up to 256 rows per statement).
+    /// </summary>
+    public async Task InsertManyReturningAsync(IList<T> entities, CancellationToken cancellationToken = default)
+    {
+        if (entities == null) throw new ArgumentNullException(nameof(entities));
+
+        var pk = _map.PrimaryKey;
+        if (pk == null || (entities.Count > 0 && !IsDefaultIntegerPk(pk, entities[0])))
+        {
+            throw new InvalidOperationException(
+                "InsertManyReturningAsync requires auto-generated integer PKs. All entities must have a default PK value (0).");
+        }
+
+        if (entities.Count == 0) return;
+
+        var bindProps = _map.Properties.Where(p => !p.IsIgnored && !p.IsPrimaryKey).ToArray();
+        var columnCount = bindProps.Length;
+
+        var cols = new List<string>(columnCount);
+        for (var i = 0; i < columnCount; i++)
+        {
+            cols.Add(bindProps[i].ColumnName);
+        }
+        var colList = string.Join(", ", cols);
+
+        using var scope = _context.AcquireConnectionScope();
+
+        var ownsTx = _context.CurrentTransaction == null;
+        DbTransaction? tx = ownsTx ? scope.Connection.BeginTransaction() : _context.CurrentTransaction;
 
         try
         {
-            foreach (var entity in entities)
+            var sb = new StringBuilder();
+            var paramIndex = 0;
+
+            for (var offset = 0; offset < entities.Count; offset += MaxRowsPerInsert)
             {
-                var parameters = new List<(string Name, object? Value, int? MaxLength)>();
-                foreach (var prop in _map.Properties)
+                var chunkSize = Math.Min(MaxRowsPerInsert, entities.Count - offset);
+
+                sb.Clear();
+                sb.Append("INSERT INTO ").Append(_map.TableName).Append(" (").Append(colList).Append(") VALUES ");
+
+                var totalParams = chunkSize * columnCount;
+                var parameters = new List<(string Name, object? Value, int? MaxLength)>(totalParams);
+
+                for (var row = 0; row < chunkSize; row++)
                 {
-                    if (prop.IsIgnored) continue;
+                    if (row > 0) sb.Append(", ");
+                    sb.Append('(');
 
-                    var v = prop.Property.GetValue(entity);
-                    if (!prop.IsNullable && v == null)
+                    var entity = entities[offset + row];
+                    for (var col = 0; col < columnCount; col++)
                     {
-                        throw new ArgumentException($"Property '{prop.Property.Name}' cannot be NULL.");
-                    }
+                        if (col > 0) sb.Append(", ");
+                        var propName = $"@p{paramIndex}";
+                        sb.Append(propName);
 
-                    var name = $"@p{parameters.Count}";
-                    parameters.Add((name, v, prop.MaxLength));
+                        var prop = bindProps[col];
+                        var v = prop.Property.GetValue(entity);
+                        if (!prop.IsNullable && v == null)
+                        {
+                            throw new ArgumentException($"Property '{prop.Property.Name}' cannot be NULL.");
+                        }
+
+                        parameters.Add((propName, v, prop.MaxLength));
+                        paramIndex++;
+                    }
+                    sb.Append(')');
                 }
 
-                using var cmd = CreateCommand(scope.Connection, sql, parameters);
+                sb.Append(" RETURNING ").Append(_map.PrimaryKeyColumnName);
+
+                using var cmd = CreateCommand(scope.Connection, sb.ToString(), parameters);
                 if (tx != null) cmd.Transaction = tx;
-                await cmd.ExecuteNonQueryAsync(cancellationToken);
+                using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+
+                var rowIndex = 0;
+                while (await reader.ReadAsync(cancellationToken))
+                {
+                    var returnedId = reader.GetInt64(0);
+                    pk.SetValue(entities[offset + rowIndex], Convert.ChangeType(returnedId, pk.PropertyType));
+                    rowIndex++;
+                }
             }
 
             if (ownsTx)

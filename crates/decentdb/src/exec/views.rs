@@ -75,22 +75,39 @@ fn infer_expr_name_syntactic(expr: &Expr, ordinal: usize) -> String {
 
 impl EngineRuntime {
     pub(super) fn execute_create_view(&mut self, statement: &CreateViewStatement) -> Result<()> {
+        // Handle existence conflicts for temporary and persistent views.
         if statement.temporary {
-            if self.temp_relation_exists(&statement.view_name)
-                && (!statement.replace || self.temp_view(&statement.view_name).is_none())
-            {
+            if let Some(_existing) = self.temp_view(&statement.view_name) {
+                if statement.replace {
+                    self.temp_views_mut().remove(&statement.view_name);
+                } else if statement.if_not_exists {
+                    return Ok(());
+                } else {
+                    return Err(DbError::sql(format!(
+                        "object {} already exists",
+                        statement.view_name
+                    )));
+                }
+            }
+        } else if self.catalog.contains_object(&statement.view_name) {
+            if self.catalog.view(&statement.view_name).is_some() {
+                if statement.replace {
+                    self.catalog_mut().views.remove(&statement.view_name);
+                } else if statement.if_not_exists {
+                    return Ok(());
+                } else {
+                    return Err(DbError::sql(format!(
+                        "object {} already exists",
+                        statement.view_name
+                    )));
+                }
+            } else {
+                // Object exists but is not a view (e.g., a table)
                 return Err(DbError::sql(format!(
                     "object {} already exists",
                     statement.view_name
                 )));
             }
-        } else if self.catalog.contains_object(&statement.view_name)
-            && (!statement.replace || self.catalog.view(&statement.view_name).is_none())
-        {
-            return Err(DbError::sql(format!(
-                "object {} already exists",
-                statement.view_name
-            )));
         }
 
         let column_names = if statement.column_names.is_empty() {

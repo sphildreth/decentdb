@@ -125,55 +125,49 @@ mod tests {
 
     #[test]
     fn table_data_row_index_and_row_by_id() {
-        let td = TableData {
-            rows: vec![
-                StoredRow {
-                    row_id: 1,
-                    values: Vec::new(),
-                },
-                StoredRow {
-                    row_id: 2,
-                    values: Vec::new(),
-                },
-            ],
-        };
+        let td = TableData::from_rows(vec![
+            StoredRow {
+                row_id: 1,
+                values: Vec::new(),
+            },
+            StoredRow {
+                row_id: 2,
+                values: Vec::new(),
+            },
+        ]);
         assert_eq!(td.row_index_by_id(1), Some(0));
         assert_eq!(td.row_by_id(2).unwrap().row_id, 2);
 
-        let td2 = TableData {
-            rows: vec![
-                StoredRow {
-                    row_id: 10,
-                    values: Vec::new(),
-                },
-                StoredRow {
-                    row_id: 20,
-                    values: Vec::new(),
-                },
-                StoredRow {
-                    row_id: 30,
-                    values: Vec::new(),
-                },
-            ],
-        };
+        let td2 = TableData::from_rows(vec![
+            StoredRow {
+                row_id: 10,
+                values: Vec::new(),
+            },
+            StoredRow {
+                row_id: 20,
+                values: Vec::new(),
+            },
+            StoredRow {
+                row_id: 30,
+                values: Vec::new(),
+            },
+        ]);
         assert_eq!(td2.row_index_by_id(20), Some(1));
 
-        let td3 = TableData {
-            rows: vec![
-                StoredRow {
-                    row_id: 7,
-                    values: Vec::new(),
-                },
-                StoredRow {
-                    row_id: 3,
-                    values: Vec::new(),
-                },
-                StoredRow {
-                    row_id: 5,
-                    values: Vec::new(),
-                },
-            ],
-        };
+        let td3 = TableData::from_rows(vec![
+            StoredRow {
+                row_id: 7,
+                values: Vec::new(),
+            },
+            StoredRow {
+                row_id: 3,
+                values: Vec::new(),
+            },
+            StoredRow {
+                row_id: 5,
+                values: Vec::new(),
+            },
+        ]);
         assert_eq!(td3.row_index_by_id(3), Some(1));
     }
 
@@ -219,6 +213,7 @@ mod tests {
             foreign_keys: Vec::new(),
             primary_key_columns: Vec::new(),
             next_row_id: 1,
+            pk_index_root: None,
         };
         assert!(!generated_columns_are_stored(&table));
         let mut table2 = table.clone();
@@ -279,22 +274,22 @@ mod tests {
             foreign_keys: Vec::new(),
             primary_key_columns: Vec::new(),
             next_row_id: 1,
+            pk_index_root: None,
         };
         runtime.catalog_mut().tables.insert("t".to_string(), table);
         runtime.tables_mut().insert(
             "t".to_string(),
-            std::sync::Arc::new(TableData {
-                rows: vec![
-                    StoredRow {
-                        row_id: 1,
-                        values: Vec::new(),
-                    },
-                    StoredRow {
-                        row_id: 2,
-                        values: Vec::new(),
-                    },
-                ],
-            }),
+            TableData::from_rows(vec![
+                StoredRow {
+                    row_id: 1,
+                    values: Vec::new(),
+                },
+                StoredRow {
+                    row_id: 2,
+                    values: Vec::new(),
+                },
+            ])
+            .into(),
         );
 
         let res = runtime
@@ -332,6 +327,7 @@ mod tests {
             foreign_keys: Vec::new(),
             primary_key_columns: Vec::new(),
             next_row_id: 1,
+            pk_index_root: None,
         };
 
         // mark_table_dirty
@@ -341,11 +337,12 @@ mod tests {
             .insert("x".to_string(), table.clone());
         runtime
             .tables_mut()
-            .insert("x".to_string(), std::sync::Arc::new(TableData::default()));
+            .insert("x".to_string(), TableData::default().into());
         runtime.mark_table_dirty("x");
         assert!(runtime.dirty_tables.contains("x"));
+        assert!(!runtime.paged_mutations.contains_key("x"));
 
-        // mark_table_append_dirty and mark_table_row_dirty
+        // mark_table_row_appended and mark_table_row_dirty
         let mut runtime2 = EngineRuntime::empty(1);
         runtime2
             .catalog_mut()
@@ -353,13 +350,32 @@ mod tests {
             .insert("x".to_string(), table.clone());
         runtime2
             .tables_mut()
-            .insert("x".to_string(), std::sync::Arc::new(TableData::default()));
-        runtime2.mark_table_append_dirty("x");
-        assert!(runtime2.append_only_dirty_tables.contains("x"));
-        runtime2.mark_table_row_dirty("x", 3);
-        // append-only should have been escalated and not converted to row-update
-        assert!(!runtime2.append_only_dirty_tables.contains("x"));
-        assert!(!runtime2.row_update_dirty.contains_key("x"));
+            .insert("x".to_string(), TableData::default().into());
+        runtime2.mark_table_row_appended("x");
+        assert!(runtime2.paged_mutations.get("x").unwrap().append_count > 0);
+        runtime2.mark_table_row_dirty("x", 3, 30, &[Value::Int64(30)]);
+        // append and row-update are both allowed
+        assert!(runtime2.paged_mutations.contains_key("x"));
+        runtime2.mark_table_row_deleted("x", 5);
+        assert!(runtime2.paged_mutations.contains_key("x"));
+
+        runtime2.catalog_mut().tables.insert(
+            "y".to_string(),
+            TableSchema {
+                name: "y".to_string(),
+                ..table.clone()
+            },
+        );
+        runtime2
+            .tables_mut()
+            .insert("y".to_string(), TableData::default().into());
+        runtime2.mark_table_row_deleted("y", 5);
+        assert!(runtime2
+            .paged_mutations
+            .get("y")
+            .unwrap()
+            .deleted_rows
+            .contains(&5));
 
         // mark_all_tables_dirty
         let mut runtime3 = EngineRuntime::empty(1);
@@ -374,6 +390,7 @@ mod tests {
         runtime3.mark_all_tables_dirty();
         assert!(runtime3.dirty_tables.contains("a"));
         assert!(runtime3.dirty_tables.contains("b"));
+        assert!(!runtime3.paged_mutations.contains_key("a"));
     }
 
     #[test]
@@ -410,6 +427,7 @@ mod tests {
             foreign_keys: Vec::new(),
             primary_key_columns: Vec::new(),
             next_row_id: 1,
+            pk_index_root: None,
         };
         runtime
             .temp_tables_mut()
@@ -459,6 +477,7 @@ mod tests {
             foreign_keys: Vec::new(),
             primary_key_columns: Vec::new(),
             next_row_id: 1,
+            pk_index_root: None,
         };
         runtime
             .temp_tables_mut()
@@ -556,6 +575,7 @@ mod tests {
             foreign_keys: Vec::new(),
             primary_key_columns: Vec::new(),
             next_row_id: 1,
+            pk_index_root: None,
         };
         runtime.catalog_mut().tables.insert("t".to_string(), t);
         let mut v = runtime
@@ -567,24 +587,49 @@ mod tests {
         v.name = "v".to_string();
         runtime.catalog_mut().tables.insert("v".to_string(), v);
 
-        runtime.mark_table_row_dirty("t", 3);
-        assert!(runtime.row_update_dirty.contains_key("t"));
+        runtime.mark_table_row_dirty("t", 3, 30, &[Value::Int64(30)]);
+        assert!(runtime.paged_mutations.contains_key("t"));
+        runtime.mark_table_row_deleted("t", 7);
+        assert!(runtime.paged_mutations.contains_key("t"));
 
-        // If a table is already fully dirty (and not append-only) then marking a row dirty is a no-op
-        runtime.dirty_tables.insert("w".to_string());
-        runtime.mark_table_row_dirty("w", 5);
-        assert!(!runtime.row_update_dirty.contains_key("w"));
+        runtime.dirty_tables_mut().insert("w".to_string());
+        runtime.mark_table_row_dirty("w", 5, 50, &[Value::Int64(50)]);
+        assert!(!runtime.paged_mutations.contains_key("w"));
 
         // Append-only dirty on a fresh table
-        runtime.mark_table_append_dirty("u"); // no-op since u doesn't exist; should not panic
-        runtime.mark_table_append_dirty("t");
-        // t was already row-update-dirty, so append-only should have no effect
-        assert!(runtime.dirty_tables.contains("t"));
+        runtime.mark_table_row_appended("u"); // no-op since u doesn't exist; should not panic
+        runtime.mark_table_row_appended("t");
+        assert!(runtime.paged_mutations.contains_key("t"));
 
         // Now test escalation when append-only present
-        runtime.append_only_dirty_tables.insert("v".to_string());
-        runtime.mark_table_row_dirty("v", 1);
-        assert!(!runtime.append_only_dirty_tables.contains("v"));
+        runtime.mark_table_row_appended("v");
+        runtime.mark_table_row_dirty("v", 1, 10, &[Value::Int64(10)]);
+        assert!(runtime.paged_mutations.contains_key("v"));
+
+        runtime.mark_table_row_deleted("v", 9);
+        assert!(runtime
+            .paged_mutations
+            .get("v")
+            .unwrap()
+            .deleted_rows
+            .contains(&9));
+        runtime.mark_table_row_appended("v");
+        assert!(runtime
+            .paged_mutations
+            .get("v")
+            .unwrap()
+            .deleted_rows
+            .contains(&9));
+
+        runtime.mark_table_row_deleted("u", 9);
+        assert!(!runtime.paged_mutations.contains_key("u"));
+        runtime.mark_table_row_deleted("t", 9);
+        assert!(runtime
+            .paged_mutations
+            .get("t")
+            .unwrap()
+            .deleted_rows
+            .contains(&9));
     }
 
     #[test]
@@ -643,6 +688,7 @@ mod tests {
             foreign_keys: Vec::new(),
             primary_key_columns: Vec::new(),
             next_row_id: 1,
+            pk_index_root: None,
         };
         runtime
             .catalog_mut()
@@ -650,22 +696,21 @@ mod tests {
             .insert("grp".to_string(), table);
         runtime.tables_mut().insert(
             "grp".to_string(),
-            std::sync::Arc::new(TableData {
-                rows: vec![
-                    StoredRow {
-                        row_id: 1,
-                        values: vec![Value::Text("a".to_string()), Value::Int64(10)],
-                    },
-                    StoredRow {
-                        row_id: 2,
-                        values: vec![Value::Text("a".to_string()), Value::Int64(5)],
-                    },
-                    StoredRow {
-                        row_id: 3,
-                        values: vec![Value::Text("b".to_string()), Value::Int64(7)],
-                    },
-                ],
-            }),
+            TableData::from_rows(vec![
+                StoredRow {
+                    row_id: 1,
+                    values: vec![Value::Text("a".to_string()), Value::Int64(10)],
+                },
+                StoredRow {
+                    row_id: 2,
+                    values: vec![Value::Text("a".to_string()), Value::Int64(5)],
+                },
+                StoredRow {
+                    row_id: 3,
+                    values: vec![Value::Text("b".to_string()), Value::Int64(7)],
+                },
+            ])
+            .into(),
         );
 
         let res = runtime
@@ -706,26 +751,26 @@ mod tests {
             foreign_keys: Vec::new(),
             primary_key_columns: Vec::new(),
             next_row_id: 1,
+            pk_index_root: None,
         };
         runtime.catalog_mut().tables.insert("t2".to_string(), table);
         runtime.tables_mut().insert(
             "t2".to_string(),
-            std::sync::Arc::new(TableData {
-                rows: vec![
-                    StoredRow {
-                        row_id: 1,
-                        values: vec![Value::Text("x".to_string())],
-                    },
-                    StoredRow {
-                        row_id: 2,
-                        values: vec![Value::Text("y".to_string())],
-                    },
-                    StoredRow {
-                        row_id: 3,
-                        values: vec![Value::Text("x".to_string())],
-                    },
-                ],
-            }),
+            TableData::from_rows(vec![
+                StoredRow {
+                    row_id: 1,
+                    values: vec![Value::Text("x".to_string())],
+                },
+                StoredRow {
+                    row_id: 2,
+                    values: vec![Value::Text("y".to_string())],
+                },
+                StoredRow {
+                    row_id: 3,
+                    values: vec![Value::Text("x".to_string())],
+                },
+            ])
+            .into(),
         );
         let res = runtime
             .execute_read_statement(&statement, &[], 4096)
@@ -777,6 +822,7 @@ mod tests {
             foreign_keys: Vec::new(),
             primary_key_columns: Vec::new(),
             next_row_id: 1,
+            pk_index_root: None,
         };
         runtime
             .catalog_mut()
@@ -784,18 +830,17 @@ mod tests {
             .insert("a".to_string(), table_a);
         runtime.tables_mut().insert(
             "a".to_string(),
-            std::sync::Arc::new(TableData {
-                rows: vec![
-                    StoredRow {
-                        row_id: 1,
-                        values: vec![Value::Int64(1), Value::Int64(100)],
-                    },
-                    StoredRow {
-                        row_id: 2,
-                        values: vec![Value::Int64(2), Value::Int64(200)],
-                    },
-                ],
-            }),
+            TableData::from_rows(vec![
+                StoredRow {
+                    row_id: 1,
+                    values: vec![Value::Int64(1), Value::Int64(100)],
+                },
+                StoredRow {
+                    row_id: 2,
+                    values: vec![Value::Int64(2), Value::Int64(200)],
+                },
+            ])
+            .into(),
         );
 
         let col_b_id = ColumnSchema {
@@ -845,6 +890,7 @@ mod tests {
             foreign_keys: Vec::new(),
             primary_key_columns: Vec::new(),
             next_row_id: 10,
+            pk_index_root: None,
         };
         runtime
             .catalog_mut()
@@ -852,26 +898,25 @@ mod tests {
             .insert("b".to_string(), table_b);
         runtime.tables_mut().insert(
             "b".to_string(),
-            std::sync::Arc::new(TableData {
-                rows: vec![
-                    StoredRow {
-                        row_id: 10,
-                        values: vec![
-                            Value::Int64(10),
-                            Value::Int64(1),
-                            Value::Text("p1".to_string()),
-                        ],
-                    },
-                    StoredRow {
-                        row_id: 20,
-                        values: vec![
-                            Value::Int64(20),
-                            Value::Int64(2),
-                            Value::Text("p2".to_string()),
-                        ],
-                    },
-                ],
-            }),
+            TableData::from_rows(vec![
+                StoredRow {
+                    row_id: 10,
+                    values: vec![
+                        Value::Int64(10),
+                        Value::Int64(1),
+                        Value::Text("p1".to_string()),
+                    ],
+                },
+                StoredRow {
+                    row_id: 20,
+                    values: vec![
+                        Value::Int64(20),
+                        Value::Int64(2),
+                        Value::Text("p2".to_string()),
+                    ],
+                },
+            ])
+            .into(),
         );
 
         let idx_a = IndexSchema {

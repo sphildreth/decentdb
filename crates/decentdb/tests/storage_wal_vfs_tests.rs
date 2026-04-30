@@ -47,7 +47,7 @@ fn cleanup_db(path: &Path) {
 }
 
 #[test]
-fn checkpoint_defers_truncation_when_snapshot_is_held_and_prunes_index() {
+fn checkpoint_defers_truncation_when_snapshot_is_held_and_retains_visible_versions() {
     let _guard = test_lock().lock().expect("test lock");
     let path = unique_db_path("checkpoint-reader");
     let db = Db::create(&path, DbConfig::default()).expect("create database");
@@ -81,8 +81,8 @@ fn checkpoint_defers_truncation_when_snapshot_is_held_and_prunes_index() {
         .expect("inspect storage state");
     assert!(inspect.contains("\"active_readers\":1"));
     assert!(
-        inspect.contains("\"wal_versions\":1"),
-        "checkpoint should prune old versions already copied back"
+        !inspect.contains("\"wal_versions\":0"),
+        "checkpoint should retain WAL versions while a snapshot is active: {inspect}"
     );
 
     db.release_snapshot(snapshot).expect("release snapshot");
@@ -147,6 +147,37 @@ fn failed_commit_does_not_publish_uncommitted_pages_after_reopen() {
     let visible = reopened.read_page(3).expect("read visible page");
     assert_eq!(
         visible.to_vec(),
+        filled_page(reopened.config().page_size, 0x22)
+    );
+
+    cleanup_db(&path);
+}
+
+#[test]
+fn failed_wal_write_does_not_publish_bad_header_to_real_reopen() {
+    let _guard = test_lock().lock().expect("test lock");
+    let path = unique_db_path("failed-wal-write-real-reopen");
+    let config = DbConfig::default();
+    let db = Db::create(&path, config.clone()).expect("create database");
+
+    db.begin_write().expect("begin write");
+    db.write_page(3, &filled_page(db.config().page_size, 0x22))
+        .expect("write first page image");
+    db.commit().expect("commit first image");
+
+    Db::clear_failpoints().expect("clear failpoint state");
+    Db::install_failpoint("wal.write_commit", "error", 1, 0).expect("install failpoint");
+    db.begin_write().expect("begin second write");
+    db.write_page(3, &filled_page(db.config().page_size, 0x44))
+        .expect("stage second page image");
+    let error = db.commit().expect_err("commit should fail");
+    assert!(matches!(error, decentdb::DbError::Io { .. }));
+    Db::clear_failpoints().expect("clear failpoints");
+
+    decentdb::evict_shared_wal(&path).expect("evict shared wal");
+    let reopened = Db::open(&path, config).expect("reopen from disk after failed commit");
+    assert_eq!(
+        reopened.read_page(3).expect("read visible page").to_vec(),
         filled_page(reopened.config().page_size, 0x22)
     );
 

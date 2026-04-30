@@ -190,7 +190,13 @@ namespace DecentDB.AdoNet
                             k++;
                         }
 
-                        if (int.TryParse(sql.Substring(j + 1, k - (j + 1)), out var pNum) && pNum >= 0)
+                        var hasIdentifierSuffix =
+                            k < sql.Length &&
+                            (char.IsLetterOrDigit(sql[k]) || sql[k] == '_');
+
+                        if (!hasIdentifierSuffix &&
+                            int.TryParse(sql.Substring(j + 1, k - (j + 1)), out var pNum) &&
+                            pNum >= 0)
                         {
                             var idx = pNum + 1;
                             usedIndices.Add(idx);

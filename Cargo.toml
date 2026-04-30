@@ -6,10 +6,13 @@ members = [
     "crates/libpg_query_sys",    # Pinned SQL parser wrapper
     "crates/decentdb-migrate",   # Migration tooling
 ]
+exclude = [
+    "benchmarks/rust-baseline",   # Standalone baseline benchmark (not part of main workspace)
+]
 resolver = "2"
 
 [workspace.package]
-version = "2.3.0"
+version = "2.4.0"
 edition = "2021"
 authors = ["Steven Hildreth"]
 license = "Apache-2.0"

@@ -27,6 +27,22 @@ pub(crate) enum FrameType {
     PageDelta = 3,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FrameEncoding {
+    Page,
+    PageDelta,
+}
+
+impl FrameEncoding {
+    #[must_use]
+    pub(crate) fn frame_type(self) -> FrameType {
+        match self {
+            Self::Page => FrameType::Page,
+            Self::PageDelta => FrameType::PageDelta,
+        }
+    }
+}
+
 impl FrameType {
     pub(crate) fn payload_size(self, page_size: u32) -> usize {
         match self {
@@ -284,6 +300,9 @@ mod tests {
         }
         fn write_at(&self, _: u64, _: &[u8]) -> Result<usize> {
             unimplemented!()
+        }
+        fn advise_sequential(&self) -> Result<()> {
+            Ok(())
         }
         fn sync_data(&self) -> Result<()> {
             Ok(())

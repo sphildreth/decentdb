@@ -1,8 +1,9 @@
 //! Operating-system backed VFS using positional I/O only.
 
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 
 use crate::error::{DbError, Result};
 
@@ -31,11 +32,13 @@ impl Vfs for OsVfs {
                 source,
             )
         })?;
+        let path_lock = path_lock(path)?;
 
         Ok(Arc::new(OsVfsFile {
             kind,
             path: path.to_path_buf(),
             file,
+            path_lock,
         }))
     }
 
@@ -68,6 +71,7 @@ struct OsVfsFile {
     kind: FileKind,
     path: PathBuf,
     file: File,
+    path_lock: Arc<RwLock<()>>,
 }
 
 impl VfsFile for OsVfsFile {
@@ -80,6 +84,10 @@ impl VfsFile for OsVfsFile {
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
+        let _guard = self
+            .path_lock
+            .read()
+            .map_err(|_| DbError::internal("VFS path lock poisoned"))?;
         read_at(&self.file, offset, buf).map_err(|source| {
             DbError::io(
                 format!("read {} file at {}", self.kind.label(), self.path.display()),
@@ -89,6 +97,10 @@ impl VfsFile for OsVfsFile {
     }
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize> {
+        let _guard = self
+            .path_lock
+            .write()
+            .map_err(|_| DbError::internal("VFS path lock poisoned"))?;
         write_at(&self.file, offset, buf).map_err(|source| {
             DbError::io(
                 format!(
@@ -101,19 +113,44 @@ impl VfsFile for OsVfsFile {
         })
     }
 
+    fn advise_sequential(&self) -> Result<()> {
+        advise_sequential(&self.file).map_err(|source| {
+            DbError::io(
+                format!(
+                    "advise sequential access for {} file at {}",
+                    self.kind.label(),
+                    self.path.display()
+                ),
+                source,
+            )
+        })
+    }
+
     fn sync_data(&self) -> Result<()> {
+        let _guard = self
+            .path_lock
+            .write()
+            .map_err(|_| DbError::internal("VFS path lock poisoned"))?;
         self.file
             .sync_data()
             .map_err(|source| DbError::io(format!("sync data for {}", self.path.display()), source))
     }
 
     fn sync_metadata(&self) -> Result<()> {
+        let _guard = self
+            .path_lock
+            .write()
+            .map_err(|_| DbError::internal("VFS path lock poisoned"))?;
         self.file.sync_all().map_err(|source| {
             DbError::io(format!("sync metadata for {}", self.path.display()), source)
         })
     }
 
     fn file_size(&self) -> Result<u64> {
+        let _guard = self
+            .path_lock
+            .read()
+            .map_err(|_| DbError::internal("VFS path lock poisoned"))?;
         self.file
             .metadata()
             .map(|metadata| metadata.len())
@@ -121,10 +158,48 @@ impl VfsFile for OsVfsFile {
     }
 
     fn set_len(&self, len: u64) -> Result<()> {
+        let _guard = self
+            .path_lock
+            .write()
+            .map_err(|_| DbError::internal("VFS path lock poisoned"))?;
         self.file
             .set_len(len)
             .map_err(|source| DbError::io(format!("resize file {}", self.path.display()), source))
     }
+}
+
+fn path_lock(path: &Path) -> Result<Arc<RwLock<()>>> {
+    let key = path_lock_key(path)?;
+    let mut registry = path_lock_registry()
+        .lock()
+        .map_err(|_| DbError::internal("VFS path lock registry poisoned"))?;
+    if let Some(existing) = registry.get(&key).and_then(Weak::upgrade) {
+        return Ok(existing);
+    }
+
+    registry.retain(|_, lock| lock.strong_count() > 0);
+    let lock = Arc::new(RwLock::new(()));
+    registry.insert(key, Arc::downgrade(&lock));
+    Ok(lock)
+}
+
+fn path_lock_registry() -> &'static Mutex<HashMap<PathBuf, Weak<RwLock<()>>>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<PathBuf, Weak<RwLock<()>>>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn path_lock_key(path: &Path) -> Result<PathBuf> {
+    if path.exists() {
+        return std::fs::canonicalize(path).map_err(|source| {
+            DbError::io(format!("canonicalize path {}", path.display()), source)
+        });
+    }
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    std::env::current_dir()
+        .map(|cwd| cwd.join(path))
+        .map_err(|source| DbError::io("resolve current working directory", source))
 }
 
 #[cfg(unix)]
@@ -145,6 +220,32 @@ fn read_at(file: &File, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
 #[cfg(windows)]
 fn write_at(file: &File, offset: u64, buf: &[u8]) -> std::io::Result<usize> {
     std::os::windows::fs::FileExt::seek_write(file, buf, offset)
+}
+
+#[cfg(target_os = "linux")]
+fn advise_sequential(file: &File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::raw::{c_int, c_long};
+
+    const POSIX_FADV_SEQUENTIAL: c_int = 2;
+
+    unsafe extern "C" {
+        fn posix_fadvise(fd: c_int, offset: c_long, len: c_long, advice: c_int) -> c_int;
+    }
+
+    // SAFETY: `file.as_raw_fd()` returns a valid borrowed descriptor for the
+    // duration of this call, and the offset/length pair covers the whole file.
+    let rc = unsafe { posix_fadvise(file.as_raw_fd(), 0, 0, POSIX_FADV_SEQUENTIAL) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::from_raw_os_error(rc))
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn advise_sequential(_file: &File) -> std::io::Result<()> {
+    Ok(())
 }
 
 impl FileKind {
@@ -292,6 +393,19 @@ mod tests {
 
         file.set_len(512).expect("shrink");
         assert_eq!(file.file_size().expect("size3"), 512);
+
+        vfs.remove_file(&path).expect("cleanup");
+    }
+
+    #[test]
+    fn advise_sequential_on_temp_file_succeeds() {
+        let vfs = OsVfs;
+        let path = unique_path("advise-sequential");
+        let file = vfs
+            .open(&path, OpenMode::CreateNew, FileKind::Database)
+            .expect("create file");
+
+        file.advise_sequential().expect("advise sequential");
 
         vfs.remove_file(&path).expect("cleanup");
     }

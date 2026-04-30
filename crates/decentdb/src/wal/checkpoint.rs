@@ -39,22 +39,37 @@ pub(crate) fn checkpoint(wal: &WalHandle, pager: &PagerHandle, timeout_sec: u64)
         .min_snapshot_lsn()?
         .unwrap_or(current_lsn);
 
-    let latest_versions = {
+    let mut latest_versions = wal
+        .inner
+        .checkpoint_scratch
+        .lock()
+        .expect("checkpoint scratch lock should not be poisoned");
+    {
         let index = wal
             .inner
             .index
             .lock()
             .expect("wal index lock should not be poisoned");
-        index.latest_versions_at_or_before(safe_lsn)
-    };
-
-    let page_ids: Vec<_> = latest_versions
-        .iter()
-        .map(|(page_id, _)| *page_id)
-        .collect();
-    for (page_id, version) in &latest_versions {
-        pager.write_page_direct(*page_id, &version.data)?;
+        index.populate_latest_versions_at_or_before(safe_lsn, &mut latest_versions);
     }
+    if let Some(sidecar) = &wal.inner.index_sidecar {
+        sidecar
+            .lock()
+            .expect("wal index sidecar lock should not be poisoned")
+            .populate_latest_versions_at_or_before(safe_lsn, &mut latest_versions)?;
+        latest_versions.sort_by_key(|(page_id, _)| *page_id);
+    }
+
+    for (page_id, version) in latest_versions.iter() {
+        let payload = wal
+            .read_page_at_snapshot(pager, *page_id, version.lsn)?
+            .ok_or_else(|| crate::error::DbError::corruption("checkpoint page version vanished"))?;
+        pager.write_page_direct(*page_id, &payload)?;
+    }
+    // Drop large `Arc<[u8]>` references early so the checkpoint copyback's
+    // peak heap footprint is not retained across the disk-flush stall.
+    latest_versions.clear();
+    drop(latest_versions);
     let header = pager.header_from_disk()?;
     pager.refresh_from_disk(header)?;
     if let Some(page_count) = pager.truncate_freelist_tail()? {
@@ -67,30 +82,53 @@ pub(crate) fn checkpoint(wal: &WalHandle, pager: &PagerHandle, timeout_sec: u64)
     let _checkpoint_end = writer::append_checkpoint_frame(wal, safe_lsn)?;
 
     {
+        let active_readers = wal.inner.reader_registry.active_reader_count()?;
         let mut index = wal
             .inner
             .index
             .lock()
             .expect("wal index lock should not be poisoned");
         // Check inside the index lock to avoid racing with begin_reader().
-        if wal.inner.reader_registry.active_reader_count()? == 0 {
+        // Only truncate WAL when safe_lsn covers all committed data
+        // (i.e. no readers were active when we started, so we wrote
+        // every version).  If safe_lsn < current_lsn, a reader that
+        // dropped after we computed safe_lsn would cause us to lose
+        // post-safe_lsn commits if we truncated.
+        if active_readers == 0 && safe_lsn >= current_lsn {
             index.clear();
+            if let Some(sidecar) = &wal.inner.index_sidecar {
+                sidecar
+                    .lock()
+                    .expect("wal index sidecar lock should not be poisoned")
+                    .clear()?;
+            }
             drop(index);
             writer::truncate_to_header(wal)?;
         } else {
-            index.prune_at_or_below(&page_ids, safe_lsn);
             drop(index);
-            let warnings = wal
+            // Retain snapshot-visible versions while readers are active.
+            // Pruning them here forces deferred readers back onto fallback
+            // page reads after checkpoint, which can race with subsequent
+            // commits that rewrite or recycle those pages.
+            let _warnings = wal
                 .inner
                 .reader_registry
                 .capture_long_reader_warnings(timeout_sec)?;
-            for warning in warnings {
-                eprintln!("decentdb checkpoint warning: {warning}");
-            }
         }
     }
 
     wal.inner.checkpoint_epoch.fetch_add(1, Ordering::AcqRel);
+    // Reset the size-based trigger counter (ADR 0137). The byte threshold
+    // resets implicitly because `truncate_to_header` zeroes `wal_end_lsn`;
+    // when readers prevented truncation the next commit will re-evaluate
+    // against the still-larger WAL but with `pages_since_checkpoint = 0`.
+    wal.inner.pages_since_checkpoint.store(0, Ordering::Release);
+
+    // Return freed heap arenas to the OS on platforms where it helps.
+    // No-op on non-Linux/non-glibc targets. ADR 0138.
+    if wal.inner.auto_checkpoint.release_freed_after_checkpoint {
+        super::platform::release_freed_heap();
+    }
 
     Ok(())
 }

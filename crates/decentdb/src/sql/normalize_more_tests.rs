@@ -103,6 +103,66 @@ mod tests {
     }
 
     #[test]
+    fn create_view_if_not_exists_parses() {
+        let s = "CREATE VIEW IF NOT EXISTS v AS SELECT 1 AS x";
+        let stmt = normalize_statement_text(s).expect("parsed");
+        match stmt {
+            Statement::CreateView(cv) => {
+                assert!(cv.if_not_exists, "if_not_exists flag should be true");
+                assert_eq!(cv.view_name, "v");
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+
+        // Without IF NOT EXISTS: default false
+        let s2 = "CREATE VIEW v AS SELECT 1";
+        let stmt2 = normalize_statement_text(s2).expect("parsed");
+        match stmt2 {
+            Statement::CreateView(cv) => {
+                assert!(!cv.if_not_exists);
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn create_view_if_not_exists_case_insensitive() {
+        let s = "create view if not exists v as select 1";
+        let stmt = normalize_statement_text(s).expect("parsed");
+        match stmt {
+            Statement::CreateView(cv) => {
+                assert!(cv.if_not_exists);
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+
+        let s2 = "CREATE VIEW If Not Exists v AS SELECT 1";
+        let stmt2 = normalize_statement_text(s2).expect("parsed");
+        match stmt2 {
+            Statement::CreateView(cv) => {
+                assert!(cv.if_not_exists);
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn subquery_in_from_without_alias_includes_helpful_hint() {
+        let s = "SELECT AVG(cnt) FROM (SELECT COUNT(*) AS cnt FROM t)";
+        let res = normalize_statement_text(s);
+        assert!(res.is_err());
+        let msg = res.unwrap_err().to_string();
+        assert!(
+            msg.contains("alias"),
+            "error should mention 'alias', got: {msg}"
+        );
+        assert!(
+            msg.contains("AS alias") || msg.contains("AS name"),
+            "error should include example syntax hint, got: {msg}"
+        );
+    }
+
+    #[test]
     fn unsupported_update_from_and_delete_using() {
         let s = "UPDATE t SET a = 1 FROM x";
         let res = normalize_statement_text(s);

@@ -5,7 +5,6 @@ use crate::error::{DbError, Result};
 use crate::record::value::Value;
 
 use super::{BulkLoadOptions, EngineRuntime, StoredRow};
-use std::sync::Arc;
 
 impl EngineRuntime {
     pub(crate) fn bulk_load_rows(
@@ -61,17 +60,13 @@ impl EngineRuntime {
                 &candidate,
             )
             .unwrap_or_else(|| super::dml::next_row_id(self, table_name));
-            let entry = self.tables_mut().get_mut(table_name).ok_or_else(|| {
-                DbError::internal(format!("table data for {table_name} is missing"))
-            })?;
-            Arc::make_mut(entry).rows.push(StoredRow {
+            let stored_row = StoredRow {
                 row_id,
                 values: candidate,
-            });
+            };
+            self.append_stored_row_to_table_row_source(table_name, &stored_row, page_size)?;
+            self.mark_table_row_appended(table_name);
             affected_rows += 1;
-        }
-        if affected_rows > 0 {
-            self.mark_table_dirty(table_name);
         }
         self.rebuild_indexes(page_size)?;
         self.execute_after_triggers(

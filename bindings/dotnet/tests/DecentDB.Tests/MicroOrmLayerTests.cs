@@ -145,6 +145,61 @@ public class MicroOrmLayerTests : IDisposable
     }
 
     [Fact]
+    public async Task DbSet_InsertManyAsync_Empty_NoOp()
+    {
+        using var context = new DecentDBContext(_dbPath);
+        var set = context.Set<TestEntity>();
+        
+        await set.InsertManyAsync(Array.Empty<TestEntity>());
+        
+        var result = await set.ToListAsync();
+        Assert.Empty(result);
+    }
+
+    [Fact]
+    public async Task DbSet_InsertManyAsync_OneRow_Works()
+    {
+        using var context = new DecentDBContext(_dbPath);
+        var set = context.Set<TestEntity>();
+        
+        await set.InsertManyAsync(new[] { new TestEntity { Id = 42, Name = "solo" } });
+        
+        var result = await set.ToListAsync();
+        Assert.Single(result);
+        Assert.Equal("solo", result[0].Name);
+    }
+
+    [Fact]
+    public async Task DbSet_InsertManyAsync_257Rows_SplitsAtMaxChunk()
+    {
+        using var context = new DecentDBContext(_dbPath);
+        var set = context.Set<TestEntity>();
+        
+        var entities = Enumerable.Range(1, 257)
+            .Select(i => new TestEntity { Id = i, Name = $"r{i}" })
+            .ToList();
+        
+        await set.InsertManyAsync(entities);
+        
+        var result = await set.ToListAsync();
+        Assert.Equal(257, result.Count);
+    }
+
+    [Fact]
+    public async Task DbSet_InsertManyAsync_EnlistsInOuterTransaction()
+    {
+        using var context = new DecentDBContext(_dbPath);
+        var set = context.Set<TestEntity>();
+        
+        using var tx = context.BeginTransaction();
+        await set.InsertManyAsync(new[] { new TestEntity { Id = 100, Name = "tx-test" } });
+        tx.Rollback();
+        
+        var result = await set.ToListAsync();
+        Assert.Empty(result);
+    }
+
+    [Fact]
     public async Task DbSet_UpdateAsync_Entity()
     {
         using var context = new DecentDBContext(_dbPath);

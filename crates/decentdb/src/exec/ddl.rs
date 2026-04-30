@@ -13,7 +13,7 @@ use crate::sql::ast::{
 use crate::sql::parser::parse_expression_sql;
 
 use super::constraints::auto_index_name;
-use super::{table_row_dataset, EngineRuntime, TableData};
+use super::{table_row_dataset, EngineRuntime, StoredRow, TableData, TableRowSource};
 use std::sync::Arc;
 
 impl EngineRuntime {
@@ -137,6 +137,7 @@ impl EngineRuntime {
             foreign_keys,
             primary_key_columns,
             next_row_id: 1,
+            pk_index_root: None,
         };
         validate_generated_columns(self, &table)?;
         if table.temporary {
@@ -199,7 +200,7 @@ impl EngineRuntime {
             .tables
             .insert(statement.table_name.clone(), table.clone());
         self.tables_mut()
-            .insert(statement.table_name.clone(), Arc::new(TableData::default()));
+            .insert(statement.table_name.clone(), TableData::default().into());
 
         if !table.primary_key_columns.is_empty() {
             self.insert_index_schema(IndexSchema {
@@ -607,10 +608,11 @@ impl EngineRuntime {
         )?;
 
         for target in &targets {
+            self.materialize_table_row_source(target)?;
             let entry = self.tables_mut().get_mut(target).ok_or_else(|| {
                 DbError::internal(format!("table data for {} is missing", target))
             })?;
-            let data = Arc::make_mut(entry);
+            let data = entry.resident_data_mut();
             data.rows.clear();
 
             if restart_identity {
@@ -708,6 +710,7 @@ impl EngineRuntime {
                 "ALTER TABLE is rejected on tables that define expression indexes",
             ));
         }
+        self.materialize_table_row_source(table_name)?;
         for action in actions {
             match action {
                 AlterTableAction::AddColumn(definition) => {
@@ -755,6 +758,7 @@ impl EngineRuntime {
                         .ok_or_else(|| {
                             DbError::internal(format!("table data for {table_name} is missing"))
                         })?
+                        .resident_data()
                         .rows
                         .is_empty();
                     if !column.nullable && matches!(fill_value, Value::Null) && has_rows {
@@ -767,7 +771,7 @@ impl EngineRuntime {
                         let entry = self.tables_mut().get_mut(table_name).ok_or_else(|| {
                             DbError::internal(format!("table data for {table_name} is missing"))
                         })?;
-                        for row in &mut Arc::make_mut(entry).rows {
+                        for row in &mut entry.resident_data_mut().rows {
                             row.values.push(fill_value.clone());
                         }
                     }
@@ -818,7 +822,7 @@ impl EngineRuntime {
                         let entry = self.tables_mut().get_mut(table_name).ok_or_else(|| {
                             DbError::internal(format!("table data for {table_name} is missing"))
                         })?;
-                        for row in &mut Arc::make_mut(entry).rows {
+                        for row in &mut entry.resident_data_mut().rows {
                             row.values.remove(index);
                         }
                     }
@@ -904,7 +908,7 @@ impl EngineRuntime {
                         let entry = self.tables_mut().get_mut(table_name).ok_or_else(|| {
                             DbError::internal(format!("table data for {table_name} is missing"))
                         })?;
-                        for row in &mut Arc::make_mut(entry).rows {
+                        for row in &mut entry.resident_data_mut().rows {
                             row.values[index] =
                                 super::cast_value(row.values[index].clone(), *new_type)?;
                         }
@@ -932,6 +936,27 @@ impl EngineRuntime {
         Ok(())
     }
 
+    fn materialize_table_row_source(&mut self, table_name: &str) -> Result<()> {
+        if !matches!(
+            self.table_row_source(table_name),
+            Some(TableRowSource::Paged(_))
+        ) {
+            return Ok(());
+        }
+        let row_source = self
+            .table_row_source(table_name)
+            .ok_or_else(|| DbError::internal(format!("table data for {table_name} is missing")))?;
+        let mut rows = Vec::with_capacity(row_source.row_count());
+        for row in row_source.rows() {
+            let row = row?;
+            rows.push(StoredRow {
+                row_id: row.row_id(),
+                values: row.values().to_vec(),
+            });
+        }
+        self.replace_table_row_source(table_name, TableData::from_rows(rows).into())
+    }
+
     fn execute_alter_table_constraint(
         &mut self,
         table_name: &str,
@@ -943,6 +968,7 @@ impl EngineRuntime {
             .table(table_name)
             .map(|table| table.name.clone())
             .ok_or_else(|| DbError::sql(format!("unknown table {table_name}")))?;
+        self.materialize_table_row_source(&table_name)?;
         let mut table = self
             .catalog
             .tables
@@ -987,6 +1013,7 @@ impl EngineRuntime {
                     .ok_or_else(|| {
                         DbError::internal(format!("table data for {table_name} is missing"))
                     })?
+                    .resident_data()
                     .rows
                 {
                     let expr = parse_expression_sql(&candidate.expression_sql)?;
@@ -1111,6 +1138,7 @@ impl EngineRuntime {
                     .ok_or_else(|| {
                         DbError::internal(format!("table data for {table_name} is missing"))
                     })?
+                    .resident_data()
                     .rows
                     .iter()
                     .try_for_each(|row| {
@@ -1220,19 +1248,20 @@ impl EngineRuntime {
         })?;
         self.tables_mut().insert(new_name.to_string(), data);
 
-        if let Some(state) = self.persisted_tables.remove(&old_table_name) {
-            self.persisted_tables.insert(new_name.to_string(), state);
+        if let Some(state) = self.persisted_tables_mut().remove(&old_table_name) {
+            self.persisted_tables_mut()
+                .insert(new_name.to_string(), state);
         }
         if let Some(stats) = self.catalog_mut().table_stats.remove(&old_table_name) {
             self.catalog_mut()
                 .table_stats
                 .insert(new_name.to_string(), stats);
         }
-        if self.dirty_tables.remove(&old_table_name) {
-            self.dirty_tables.insert(new_name.to_string());
+        if self.dirty_tables_mut().remove(&old_table_name) {
+            self.dirty_tables_mut().insert(new_name.to_string());
         }
-        if self.append_only_dirty_tables.remove(&old_table_name) {
-            self.append_only_dirty_tables.insert(new_name.to_string());
+        if let Some(delta) = self.paged_mutations.remove(&old_table_name) {
+            self.paged_mutations.insert(new_name.to_string(), delta);
         }
 
         rename_table_references(self, &old_table_name, new_name);
@@ -1401,6 +1430,7 @@ fn validate_existing_rows_with_staged_table(
         .tables
         .get(table_name)
         .ok_or_else(|| DbError::internal(format!("table data for {table_name} is missing")))?
+        .resident_data()
         .rows
         .clone();
     let validation = rows

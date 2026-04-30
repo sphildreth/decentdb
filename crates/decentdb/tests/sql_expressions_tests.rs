@@ -1822,6 +1822,34 @@ fn length_function() {
 }
 
 #[test]
+fn length_function_counts_blob_bytes() {
+    let db = mem_db();
+    db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, data BLOB)")
+        .unwrap();
+    db.execute_with_params(
+        "INSERT INTO t VALUES ($1, $2), ($3, $4)",
+        &[
+            Value::Int64(1),
+            Value::Blob(vec![]),
+            Value::Int64(2),
+            Value::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF]),
+        ],
+    )
+    .unwrap();
+
+    let result = db
+        .execute("SELECT id, LENGTH(data) FROM t ORDER BY LENGTH(data), id")
+        .unwrap();
+    assert_eq!(
+        rows(&result),
+        vec![
+            vec![Value::Int64(1), Value::Int64(0)],
+            vec![Value::Int64(2), Value::Int64(4)],
+        ]
+    );
+}
+
+#[test]
 fn like_patterns() {
     let db = mem_db();
     db.execute("CREATE TABLE t(name TEXT)").unwrap();

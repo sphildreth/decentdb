@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use decentdb::{Db, DbConfig, WalSyncMode};
+use decentdb::{Db, DbConfig, WalSyncMode, DB_FORMAT_VERSION};
 
 static NEXT_PATH_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -171,7 +171,7 @@ fn header_info_returns_consistent_values() {
     let db = Db::create(&path, config).unwrap();
     let hdr = db.header_info().unwrap();
     assert_eq!(hdr.page_size, 4096);
-    assert_eq!(hdr.format_version, 8);
+    assert_eq!(hdr.format_version, DB_FORMAT_VERSION);
     assert_eq!(hdr.catalog_root_page_id, 2);
     assert_eq!(hdr.freelist_root_page_id, 0);
     assert_eq!(hdr.freelist_head_page_id, 0);

@@ -761,7 +761,7 @@ dependencies = [
 
 [[package]]
 name = "decentdb"
-version = "2.3.0"
+version = "2.4.0"
 dependencies = [
  "chrono",
  "criterion",
@@ -779,13 +779,14 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "smallvec",
  "tempfile",
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "decentdb-benchmark"
-version = "2.3.0"
+version = "2.4.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -799,17 +800,19 @@ dependencies = [
 
 [[package]]
 name = "decentdb-cli"
-version = "2.3.0"
+version = "2.4.0"
 dependencies = [
  "anyhow",
  "clap",
  "decentdb",
+ "mimalloc",
  "rustyline",
+ "serde_json",
 ]
 
 [[package]]
 name = "decentdb-migrate"
-version = "2.3.0"
+version = "2.4.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1713,8 +1716,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
+name = "libmimalloc-sys"
+version = "0.1.47"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d1eacfa31c33ec25e873c136ba5669f00f9866d0688bea7be4d3f7e43067df6"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "libpg_query_sys"
-version = "2.3.0"
+version = "2.4.0"
 dependencies = [
  "pg_query",
 ]
@@ -1782,6 +1794,15 @@ name = "memchr"
 version = "2.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
+
+[[package]]
+name = "mimalloc"
+version = "0.1.50"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b3627c4272df786b9260cabaa46aec1d59c93ede723d4c3ef646c503816b0640"
+dependencies = [
+ "libmimalloc-sys",
+]
 
 [[package]]
 name = "minimal-lexical"

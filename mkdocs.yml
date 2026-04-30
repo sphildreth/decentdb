@@ -28,6 +28,7 @@ nav:
     - DecentDB vs LevelDB: user-guide/decentdb-vs-leveldb.md
     - DecentDB vs sled: user-guide/decentdb-vs-sled.md
     - Tools:
+      - Doctor: user-guide/doctor.md
       - DBeaver Integration: user-guide/dbeaver.md
   - API Reference:
     - Rust API: api/rust-api.md

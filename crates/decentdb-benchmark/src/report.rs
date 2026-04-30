@@ -479,6 +479,36 @@ fn render_run_markdown_human(summary: &RunSummary) -> String {
     lines.push(format!("Profile: `{}`", summary.profile.as_str()));
     lines.push(format!("Status: `{}`", summary.status));
 
+    // Environment / Provenance
+    lines.push(String::new());
+    lines.push("## Environment".to_string());
+    if let Some(env) = &summary.environment {
+        if let Some(sha) = &env.git_sha {
+            lines.push(format!("- Git SHA: `{}`", sha));
+        }
+        if let Some(branch) = &env.git_branch {
+            lines.push(format!("- Git branch: `{}`", branch));
+        }
+        if let Some(dirty) = env.git_dirty {
+            lines.push(format!(
+                "- Git dirty: `{}`{}",
+                dirty,
+                if dirty {
+                    format!(" (`{}`)", env.git_status_short.as_deref().unwrap_or(""))
+                } else {
+                    String::new()
+                }
+            ));
+        }
+        lines.push(format!("- Build profile: `{}`", env.build_profile));
+        if let Some(rustc) = &env.rustc_version {
+            lines.push(format!("- Rust version: `{}`", rustc));
+        }
+        if let Some(cargo) = &env.cargo_version {
+            lines.push(format!("- Cargo version: `{}`", cargo));
+        }
+    }
+
     lines.push(String::new());
     lines.push("## Headline KPI Snapshot".to_string());
     lines.push("| Scenario | Metric | Value |".to_string());
@@ -526,6 +556,27 @@ fn render_run_text_human(summary: &RunSummary) -> String {
         summary.profile.as_str(),
         summary.status
     ));
+
+    if let Some(env) = &summary.environment {
+        lines.push(String::new());
+        lines.push("Environment".to_string());
+        if let Some(sha) = &env.git_sha {
+            lines.push(format!("  git_sha={}", sha));
+        }
+        if let Some(branch) = &env.git_branch {
+            lines.push(format!("  git_branch={}", branch));
+        }
+        if let Some(dirty) = env.git_dirty {
+            lines.push(format!("  git_dirty={}", dirty));
+        }
+        lines.push(format!("  build_profile={}", env.build_profile));
+        if let Some(rustc) = &env.rustc_version {
+            lines.push(format!("  rustc_version={}", rustc));
+        }
+        if let Some(cargo) = &env.cargo_version {
+            lines.push(format!("  cargo_version={}", cargo));
+        }
+    }
 
     lines.push(String::new());
     lines.push("Headline Metrics".to_string());
@@ -1806,6 +1857,7 @@ mod tests {
             scenarios: Vec::new(),
             warnings: Vec::new(),
             target_assessment: None,
+            environment: None,
         };
         let rendered = render_run_html_agent_brief(&summary);
         assert!(rendered.contains("DecentDB Agent Brief"));
@@ -1863,6 +1915,7 @@ mod tests {
                 headline_metrics: BTreeMap::new(),
             }],
             warnings: Vec::new(),
+            environment: None,
             target_assessment: Some(RunTargetAssessment {
                 targets_file: "benchmarks/targets.toml".to_string(),
                 format_version: 1,

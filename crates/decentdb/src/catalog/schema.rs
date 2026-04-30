@@ -115,6 +115,7 @@ pub(crate) struct TableSchema {
     pub(crate) foreign_keys: Vec<ForeignKeyConstraint>,
     pub(crate) primary_key_columns: Vec<String>,
     pub(crate) next_row_id: i64,
+    pub(crate) pk_index_root: Option<u32>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -445,6 +446,7 @@ mod tests {
             foreign_keys: vec![],
             primary_key_columns: vec!["id".to_string()],
             next_row_id: 1,
+            pk_index_root: None,
         };
         let copied = table.clone();
         assert_eq!(copied.name, "users");

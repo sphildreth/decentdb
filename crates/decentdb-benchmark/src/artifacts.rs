@@ -30,10 +30,13 @@ pub(crate) struct EnvironmentCapture {
     pub benchmark_crate_version: String,
     pub build_profile: String,
     pub rustc_version: Option<String>,
+    pub cargo_version: Option<String>,
     pub os: String,
     pub arch: String,
     pub git_sha: Option<String>,
     pub git_branch: Option<String>,
+    pub git_dirty: Option<bool>,
+    pub git_status_short: Option<String>,
     pub hostname: Option<String>,
     pub cwd: String,
     pub logical_cores: Option<usize>,
@@ -56,6 +59,8 @@ pub(crate) struct RunSummary {
     pub warnings: Vec<String>,
     #[serde(default)]
     pub target_assessment: Option<RunTargetAssessment>,
+    #[serde(default)]
+    pub environment: Option<EnvironmentCapture>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

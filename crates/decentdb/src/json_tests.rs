@@ -509,13 +509,17 @@ mod tests {
 mod wal_index_tests {
     use std::sync::Arc;
 
+    use crate::wal::format::FrameEncoding;
     use crate::wal::index::{WalIndex, WalVersion};
 
     fn ver(lsn: u64, byte: u8) -> WalVersion {
-        WalVersion {
+        WalVersion::resident(
             lsn,
-            data: Arc::<[u8]>::from(vec![byte; 16]),
-        }
+            lsn.saturating_sub(4),
+            4,
+            FrameEncoding::Page,
+            Arc::<[u8]>::from(vec![byte; 16]),
+        )
     }
 
     #[test]
@@ -539,7 +543,7 @@ mod wal_index_tests {
         idx.add_version(1, ver(30, 0xCC), false);
         assert_eq!(idx.version_count(), 1);
         let v = idx.latest_visible(1, u64::MAX).unwrap();
-        assert_eq!(v.data[0], 0xCC);
+        assert_eq!(v.payload.as_slice()[0], 0xCC);
         assert_eq!(v.lsn, 30);
     }
 
@@ -552,15 +556,15 @@ mod wal_index_tests {
 
         let v = idx.latest_visible(1, 15).unwrap();
         assert_eq!(v.lsn, 10);
-        assert_eq!(v.data[0], 0x11);
+        assert_eq!(v.payload.as_slice()[0], 0x11);
 
         let v = idx.latest_visible(1, 20).unwrap();
         assert_eq!(v.lsn, 20);
-        assert_eq!(v.data[0], 0x22);
+        assert_eq!(v.payload.as_slice()[0], 0x22);
 
         let v = idx.latest_visible(1, 100).unwrap();
         assert_eq!(v.lsn, 30);
-        assert_eq!(v.data[0], 0x33);
+        assert_eq!(v.payload.as_slice()[0], 0x33);
     }
 
     #[test]
@@ -641,9 +645,10 @@ mod wal_index_tests {
         idx.add_version(3, ver(25, 0x44), true);
 
         // safe_lsn=20 includes page 1 @ lsn=20 and page 2 @ lsn=15 but not page 3 @ lsn=25.
-        let versions = idx.latest_versions_at_or_before(20);
+        let mut versions = idx.latest_versions_at_or_before(20);
+        versions.sort_by_key(|(page_id, _)| *page_id);
         assert_eq!(versions.len(), 2);
-        // Result is sorted by page_id.
+        // Check contents independent of the WAL index's hash-map iteration order.
         assert_eq!(versions[0].0, 1);
         assert_eq!(versions[0].1.lsn, 20);
         assert_eq!(versions[1].0, 2);

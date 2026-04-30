@@ -1,0 +1,668 @@
+{
+  "artifact_kind": "decentdb_benchmark_baseline_snapshot",
+  "schema_version": 1,
+  "baseline_name": "engine-perf-start",
+  "created_unix_ms": 1777244090144,
+  "source_summary": "build/bench/runs/unix-1777241256054-dev-4f282a4/summary.json",
+  "source_manifest": "build/bench/runs/unix-1777241256054-dev-4f282a4/manifest.json",
+  "snapshot": {
+    "run_id": "unix-1777241256054-dev-4f282a4",
+    "profile": "dev",
+    "status": "incomplete",
+    "started_unix_ms": 1777241256054,
+    "finished_unix_ms": 1777244062195,
+    "build_profile": "release",
+    "os": "linux",
+    "arch": "x86_64",
+    "git_sha": "4f282a4",
+    "git_branch": "sph-2026-04-21.02",
+    "summary_warnings": [
+      "one or more scenarios failed; inspect per-scenario JSON artifacts",
+      "run is not in the authoritative grading context; expected build=release profile=nightly, got build=release profile=dev",
+      "overall grade withheld because only 13/19 target metrics were available for this run"
+    ],
+    "metrics": [
+      {
+        "scenario": "durable_commit_single",
+        "metric": "bytes_written_per_commit",
+        "value": 16512.3396
+      },
+      {
+        "scenario": "durable_commit_single",
+        "metric": "commit_max_us",
+        "value": 6672.383
+      },
+      {
+        "scenario": "durable_commit_single",
+        "metric": "commit_mean_us",
+        "value": 2413.128396800001
+      },
+      {
+        "scenario": "durable_commit_single",
+        "metric": "commit_p50_us",
+        "value": 2022.399
+      },
+      {
+        "scenario": "durable_commit_single",
+        "metric": "commit_p95_us",
+        "value": 3016.703
+      },
+      {
+        "scenario": "durable_commit_single",
+        "metric": "commit_p99_us",
+        "value": 3028.991
+      },
+      {
+        "scenario": "durable_commit_single",
+        "metric": "commit_stddev_us",
+        "value": 488.4354313132879
+      },
+      {
+        "scenario": "durable_commit_single",
+        "metric": "commits_measured",
+        "value": 5000.0
+      },
+      {
+        "scenario": "durable_commit_single",
+        "metric": "commits_per_sec",
+        "value": 414.3998068973812
+      },
+      {
+        "scenario": "durable_commit_single",
+        "metric": "db_bytes_written_per_commit",
+        "value": 32.0
+      },
+      {
+        "scenario": "durable_commit_single",
+        "metric": "fsyncs_per_commit",
+        "value": 1.0008
+      },
+      {
+        "scenario": "durable_commit_single",
+        "metric": "txn_max_us",
+        "value": 6684.671
+      },
+      {
+        "scenario": "durable_commit_single",
+        "metric": "txn_mean_us",
+        "value": 2415.773286399999
+      },
+      {
+        "scenario": "durable_commit_single",
+        "metric": "txn_p50_us",
+        "value": 2024.447
+      },
+      {
+        "scenario": "durable_commit_single",
+        "metric": "txn_p95_us",
+        "value": 3020.799
+      },
+      {
+        "scenario": "durable_commit_single",
+        "metric": "txn_p99_us",
+        "value": 3033.087
+      },
+      {
+        "scenario": "durable_commit_single",
+        "metric": "txn_stddev_us",
+        "value": 488.7111976714685
+      },
+      {
+        "scenario": "durable_commit_single",
+        "metric": "txns_per_sec",
+        "value": 413.9470787550701
+      },
+      {
+        "scenario": "durable_commit_single",
+        "metric": "wal_bytes_written_per_commit",
+        "value": 16480.3396
+      },
+      {
+        "scenario": "durable_commit_single",
+        "metric": "write_calls_per_commit",
+        "value": 2.0094
+      },
+      {
+        "scenario": "durable_commit_batch",
+        "metric": "batch_commit_max_us",
+        "value": 57966.591
+      },
+      {
+        "scenario": "durable_commit_batch",
+        "metric": "batch_commit_p50_us",
+        "value": 3903.487
+      },
+      {
+        "scenario": "durable_commit_batch",
+        "metric": "batch_commit_p95_us",
+        "value": 5926.911
+      },
+      {
+        "scenario": "durable_commit_batch",
+        "metric": "batch_commit_p99_us",
+        "value": 50987.007
+      },
+      {
+        "scenario": "durable_commit_batch",
+        "metric": "batches_measured",
+        "value": 5000.0
+      },
+      {
+        "scenario": "durable_commit_batch",
+        "metric": "bytes_written_per_batch",
+        "value": 21354.3336
+      },
+      {
+        "scenario": "durable_commit_batch",
+        "metric": "bytes_written_per_row",
+        "value": 427.086672
+      },
+      {
+        "scenario": "durable_commit_batch",
+        "metric": "fsyncs_per_batch",
+        "value": 1.002
+      },
+      {
+        "scenario": "durable_commit_batch",
+        "metric": "rows_measured_total",
+        "value": 250000.0
+      },
+      {
+        "scenario": "durable_commit_batch",
+        "metric": "rows_per_batch",
+        "value": 50.0
+      },
+      {
+        "scenario": "durable_commit_batch",
+        "metric": "rows_per_sec",
+        "value": 11043.673165360138
+      },
+      {
+        "scenario": "durable_commit_batch",
+        "metric": "txn_batch_p50_us",
+        "value": 3938.303
+      },
+      {
+        "scenario": "durable_commit_batch",
+        "metric": "txn_batch_p95_us",
+        "value": 5971.967
+      },
+      {
+        "scenario": "durable_commit_batch",
+        "metric": "txn_batch_p99_us",
+        "value": 51052.543
+      },
+      {
+        "scenario": "durable_commit_batch",
+        "metric": "wal_bytes_after_measurement",
+        "value": 67108864.0
+      },
+      {
+        "scenario": "durable_commit_batch",
+        "metric": "wal_bytes_before_measurement",
+        "value": 67108864.0
+      },
+      {
+        "scenario": "durable_commit_batch",
+        "metric": "wal_file_bytes_peak",
+        "value": 67108864.0
+      },
+      {
+        "scenario": "durable_commit_batch",
+        "metric": "wal_growth_bytes",
+        "value": 0.0
+      },
+      {
+        "scenario": "durable_commit_batch",
+        "metric": "wal_growth_bytes_per_row",
+        "value": 0.0
+      },
+      {
+        "scenario": "durable_commit_batch",
+        "metric": "write_calls_per_batch",
+        "value": 2.7718
+      },
+      {
+        "scenario": "complex_ecommerce",
+        "metric": "aggregate_p50_ms",
+        "value": 13.410303
+      },
+      {
+        "scenario": "complex_ecommerce",
+        "metric": "aggregate_p95_ms",
+        "value": 21.430271
+      },
+      {
+        "scenario": "complex_ecommerce",
+        "metric": "aggregate_rows_total",
+        "value": 6120.0
+      },
+      {
+        "scenario": "complex_ecommerce",
+        "metric": "catalog_insert_s",
+        "value": 0.0142032665
+      },
+      {
+        "scenario": "complex_ecommerce",
+        "metric": "catalog_rows",
+        "value": 12500.0
+      },
+      {
+        "scenario": "complex_ecommerce",
+        "metric": "delete_p50_ms",
+        "value": 21.708799
+      },
+      {
+        "scenario": "complex_ecommerce",
+        "metric": "delete_p95_ms",
+        "value": 27.017215
+      },
+      {
+        "scenario": "complex_ecommerce",
+        "metric": "deletes_measured",
+        "value": 2000.0
+      },
+      {
+        "scenario": "complex_ecommerce",
+        "metric": "history_p50_ms",
+        "value": 533.987327
+      },
+      {
+        "scenario": "complex_ecommerce",
+        "metric": "history_p95_ms",
+        "value": 555.220991
+      },
+      {
+        "scenario": "complex_ecommerce",
+        "metric": "history_rows_total",
+        "value": 60232.0
+      },
+      {
+        "scenario": "complex_ecommerce",
+        "metric": "join_p50_ms",
+        "value": 60.293119
+      },
+      {
+        "scenario": "complex_ecommerce",
+        "metric": "join_p95_ms",
+        "value": 65.011711
+      },
+      {
+        "scenario": "complex_ecommerce",
+        "metric": "join_rows_total",
+        "value": 200000.0
+      },
+      {
+        "scenario": "complex_ecommerce",
+        "metric": "orders_insert_rps",
+        "value": 600593.9799458889
+      },
+      {
+        "scenario": "complex_ecommerce",
+        "metric": "orders_rows",
+        "value": 249998.0
+      },
+      {
+        "scenario": "complex_ecommerce",
+        "metric": "point_lookup_p50_ms",
+        "value": 0.111807
+      },
+      {
+        "scenario": "complex_ecommerce",
+        "metric": "point_lookup_p95_ms",
+        "value": 0.206591
+      },
+      {
+        "scenario": "complex_ecommerce",
+        "metric": "point_lookup_rows_total",
+        "value": 4000.0
+      },
+      {
+        "scenario": "complex_ecommerce",
+        "metric": "range_scan_p50_ms",
+        "value": 0.646655
+      },
+      {
+        "scenario": "complex_ecommerce",
+        "metric": "range_scan_p95_ms",
+        "value": 2.138111
+      },
+      {
+        "scenario": "complex_ecommerce",
+        "metric": "range_scan_rows_total",
+        "value": 196207.0
+      },
+      {
+        "scenario": "complex_ecommerce",
+        "metric": "report_query_s",
+        "value": 0.4421429155
+      },
+      {
+        "scenario": "complex_ecommerce",
+        "metric": "report_rows_total",
+        "value": 400.0
+      },
+      {
+        "scenario": "complex_ecommerce",
+        "metric": "table_scan_count_sum",
+        "value": 1000000.0
+      },
+      {
+        "scenario": "complex_ecommerce",
+        "metric": "table_scan_p50_ms",
+        "value": 0.002185
+      },
+      {
+        "scenario": "complex_ecommerce",
+        "metric": "table_scan_p95_ms",
+        "value": 0.002635
+      },
+      {
+        "scenario": "complex_ecommerce",
+        "metric": "update_p50_ms",
+        "value": 0.005111
+      },
+      {
+        "scenario": "complex_ecommerce",
+        "metric": "update_p95_ms",
+        "value": 0.018271000000000003
+      },
+      {
+        "scenario": "point_lookup_warm",
+        "metric": "lookup_max_us",
+        "value": 15.599
+      },
+      {
+        "scenario": "point_lookup_warm",
+        "metric": "lookup_mean_us",
+        "value": 1.505635540000002
+      },
+      {
+        "scenario": "point_lookup_warm",
+        "metric": "lookup_p50_us",
+        "value": 1.503
+      },
+      {
+        "scenario": "point_lookup_warm",
+        "metric": "lookup_p95_us",
+        "value": 1.724
+      },
+      {
+        "scenario": "point_lookup_warm",
+        "metric": "lookup_p99_us",
+        "value": 1.904
+      },
+      {
+        "scenario": "point_lookup_warm",
+        "metric": "lookup_stddev_us",
+        "value": 0.21917788261799687
+      },
+      {
+        "scenario": "point_lookup_warm",
+        "metric": "lookups_measured",
+        "value": 50000.0
+      },
+      {
+        "scenario": "point_lookup_warm",
+        "metric": "lookups_per_sec",
+        "value": 664171.9747401583
+      },
+      {
+        "scenario": "point_lookup_warm",
+        "metric": "rows_returned_total",
+        "value": 50000.0
+      },
+      {
+        "scenario": "range_scan_warm",
+        "metric": "rows_per_sec",
+        "value": 259749.87636273695
+      },
+      {
+        "scenario": "range_scan_warm",
+        "metric": "rows_scanned_total",
+        "value": 512000.0
+      },
+      {
+        "scenario": "range_scan_warm",
+        "metric": "scan_max_us",
+        "value": 2162.687
+      },
+      {
+        "scenario": "range_scan_warm",
+        "metric": "scan_mean_us",
+        "value": 985.5603199999998
+      },
+      {
+        "scenario": "range_scan_warm",
+        "metric": "scan_p50_us",
+        "value": 965.119
+      },
+      {
+        "scenario": "range_scan_warm",
+        "metric": "scan_p95_us",
+        "value": 1274.879
+      },
+      {
+        "scenario": "range_scan_warm",
+        "metric": "scan_p99_us",
+        "value": 1532.927
+      },
+      {
+        "scenario": "range_scan_warm",
+        "metric": "scan_stddev_us",
+        "value": 149.51338490543782
+      },
+      {
+        "scenario": "range_scan_warm",
+        "metric": "scans_measured",
+        "value": 2000.0
+      },
+      {
+        "scenario": "range_scan_warm",
+        "metric": "scans_per_sec",
+        "value": 1014.6479545419412
+      },
+      {
+        "scenario": "checkpoint",
+        "metric": "bytes_written_per_checkpoint",
+        "value": 6651057.0
+      },
+      {
+        "scenario": "checkpoint",
+        "metric": "checkpoint_bytes_written",
+        "value": 13302114.0
+      },
+      {
+        "scenario": "checkpoint",
+        "metric": "checkpoint_fsync_calls",
+        "value": 6.0
+      },
+      {
+        "scenario": "checkpoint",
+        "metric": "checkpoint_max_ms",
+        "value": 39.878655
+      },
+      {
+        "scenario": "checkpoint",
+        "metric": "checkpoint_ms",
+        "value": 39.878655
+      },
+      {
+        "scenario": "checkpoint",
+        "metric": "checkpoint_p50_ms",
+        "value": 28.033023
+      },
+      {
+        "scenario": "checkpoint",
+        "metric": "checkpoint_p95_ms",
+        "value": 39.878655
+      },
+      {
+        "scenario": "checkpoint",
+        "metric": "checkpoint_p99_ms",
+        "value": 39.878655
+      },
+      {
+        "scenario": "checkpoint",
+        "metric": "checkpoint_total_ms",
+        "value": 39.878655
+      },
+      {
+        "scenario": "checkpoint",
+        "metric": "fsyncs_per_checkpoint",
+        "value": 3.0
+      },
+      {
+        "scenario": "checkpoint",
+        "metric": "wal_bytes_after_checkpoint",
+        "value": 32.0
+      },
+      {
+        "scenario": "checkpoint",
+        "metric": "wal_bytes_before_checkpoint",
+        "value": 67108864.0
+      },
+      {
+        "scenario": "checkpoint",
+        "metric": "wal_bytes_reduced",
+        "value": 67108832.0
+      },
+      {
+        "scenario": "checkpoint",
+        "metric": "wal_file_bytes_peak",
+        "value": 67108864.0
+      },
+      {
+        "scenario": "storage_efficiency",
+        "metric": "bytes_per_logical_row",
+        "value": 4.54688
+      },
+      {
+        "scenario": "storage_efficiency",
+        "metric": "bytes_written_per_row",
+        "value": 122.67765
+      },
+      {
+        "scenario": "storage_efficiency",
+        "metric": "bytes_written_total",
+        "value": 24535530.0
+      },
+      {
+        "scenario": "storage_efficiency",
+        "metric": "catalog_manifest_bytes",
+        "value": 4096.0
+      },
+      {
+        "scenario": "storage_efficiency",
+        "metric": "db_file_bytes",
+        "value": 454656.0
+      },
+      {
+        "scenario": "storage_efficiency",
+        "metric": "freelist_bytes",
+        "value": 0.0
+      },
+      {
+        "scenario": "storage_efficiency",
+        "metric": "fsync_calls_total",
+        "value": 106.0
+      },
+      {
+        "scenario": "storage_efficiency",
+        "metric": "logical_payload_bytes",
+        "value": 2300000.0
+      },
+      {
+        "scenario": "storage_efficiency",
+        "metric": "metadata_bytes",
+        "value": 8192.0
+      },
+      {
+        "scenario": "storage_efficiency",
+        "metric": "overflow_bytes_total",
+        "value": 446464.0
+      },
+      {
+        "scenario": "storage_efficiency",
+        "metric": "row_count",
+        "value": 100000.0
+      },
+      {
+        "scenario": "storage_efficiency",
+        "metric": "space_amplification",
+        "value": 0.1976904347826087
+      },
+      {
+        "scenario": "storage_efficiency",
+        "metric": "steady_state_file_bytes",
+        "value": 454688.0
+      },
+      {
+        "scenario": "storage_efficiency",
+        "metric": "table_data_bytes",
+        "value": 442368.0
+      },
+      {
+        "scenario": "storage_efficiency",
+        "metric": "table_data_space_amplification",
+        "value": 0.19233391304347827
+      },
+      {
+        "scenario": "storage_efficiency",
+        "metric": "unknown_bytes",
+        "value": 0.0
+      },
+      {
+        "scenario": "storage_efficiency",
+        "metric": "wal_file_bytes_after_checkpoint",
+        "value": 32.0
+      },
+      {
+        "scenario": "storage_efficiency",
+        "metric": "wal_file_bytes_peak",
+        "value": 67108864.0
+      },
+      {
+        "scenario": "memory_footprint",
+        "metric": "logical_payload_bytes",
+        "value": 2400000.0
+      },
+      {
+        "scenario": "memory_footprint",
+        "metric": "memory_amplification",
+        "value": 33.539413333333336
+      },
+      {
+        "scenario": "memory_footprint",
+        "metric": "rss_after_reopen_bytes",
+        "value": 94146560.0
+      },
+      {
+        "scenario": "memory_footprint",
+        "metric": "rss_peak_bytes",
+        "value": 80494592.0
+      },
+      {
+        "scenario": "memory_footprint",
+        "metric": "rss_samples_collected",
+        "value": 782.0
+      },
+      {
+        "scenario": "memory_footprint",
+        "metric": "rss_steady_bytes",
+        "value": 80494592.0
+      }
+    ],
+    "storage": {
+      "bytes_per_logical_row": 4.54688,
+      "db_file_bytes": 454656.0,
+      "wal_file_bytes_peak": 67108864.0,
+      "space_amplification": 0.1976904347826087
+    }
+  },
+  "warnings": [
+    "one or more scenarios failed; inspect per-scenario JSON artifacts",
+    "run is not in the authoritative grading context; expected build=release profile=nightly, got build=release profile=dev",
+    "overall grade withheld because only 13/19 target metrics were available for this run"
+  ]
+}

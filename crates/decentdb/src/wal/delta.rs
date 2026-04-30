@@ -7,12 +7,28 @@ pub(crate) const DELTA_FRAME_PAYLOAD_SIZE: usize = 512;
 const DELTA_PATCH_COUNT_SIZE: usize = 2;
 const DELTA_PATCH_HEADER_SIZE: usize = 4;
 
+#[allow(dead_code)]
 pub(crate) fn encode_page_delta(base: &[u8], updated: &[u8]) -> Option<Vec<u8>> {
-    if base.len() != updated.len() {
-        return None;
+    let mut payload = Vec::new();
+    if encode_page_delta_into(&mut payload, base, updated) {
+        Some(payload.as_slice().to_vec())
+    } else {
+        None
     }
+}
 
-    let mut payload = Vec::with_capacity(DELTA_FRAME_PAYLOAD_SIZE);
+/// Reusable variant of `encode_page_delta` (slice M6). Reuses caller
+/// storage so the writer does not allocate a fresh `Vec<u8>` per page on
+/// the commit hot path. Returns `true` if a delta was produced (and
+/// `payload` now contains it); `false` if the page is incompatible with
+/// delta encoding (in which case `payload` is left empty and the writer
+/// falls back to a full-page frame).
+pub(crate) fn encode_page_delta_into(payload: &mut Vec<u8>, base: &[u8], updated: &[u8]) -> bool {
+    payload.clear();
+    if base.len() != updated.len() {
+        return false;
+    }
+    payload.reserve(DELTA_FRAME_PAYLOAD_SIZE);
     payload.extend_from_slice(&0_u16.to_le_bytes());
     let mut patch_count = 0_u16;
     let mut index = 0_usize;
@@ -29,24 +45,36 @@ pub(crate) fn encode_page_delta(base: &[u8], updated: &[u8]) -> Option<Vec<u8>> 
         }
         let len = index - start;
         if payload.len() + DELTA_PATCH_HEADER_SIZE + len > DELTA_FRAME_PAYLOAD_SIZE {
-            return None;
+            payload.clear();
+            return false;
         }
 
-        let offset = u16::try_from(start).ok()?;
-        let patch_len = u16::try_from(len).ok()?;
+        let Ok(offset) = u16::try_from(start) else {
+            payload.clear();
+            return false;
+        };
+        let Ok(patch_len) = u16::try_from(len) else {
+            payload.clear();
+            return false;
+        };
         payload.extend_from_slice(&offset.to_le_bytes());
         payload.extend_from_slice(&patch_len.to_le_bytes());
         payload.extend_from_slice(&updated[start..index]);
-        patch_count = patch_count.checked_add(1)?;
+        let Some(next) = patch_count.checked_add(1) else {
+            payload.clear();
+            return false;
+        };
+        patch_count = next;
     }
 
     if patch_count == 0 || payload.len() >= updated.len() {
-        return None;
+        payload.clear();
+        return false;
     }
 
     payload[..DELTA_PATCH_COUNT_SIZE].copy_from_slice(&patch_count.to_le_bytes());
     payload.resize(DELTA_FRAME_PAYLOAD_SIZE, 0);
-    Some(payload)
+    true
 }
 
 #[cfg(test)]

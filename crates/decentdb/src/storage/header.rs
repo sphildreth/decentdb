@@ -8,7 +8,7 @@ use super::freelist::FreelistState;
 use super::page;
 
 pub(crate) const DB_HEADER_SIZE: usize = 128;
-pub const DB_FORMAT_VERSION: u32 = 8;
+pub const DB_FORMAT_VERSION: u32 = 10;
 #[allow(dead_code)]
 pub(crate) const WAL_HEADER_VERSION: u32 = 1;
 pub(crate) const HEADER_PAGE_ID: u32 = 1;

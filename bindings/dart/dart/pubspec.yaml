@@ -1,6 +1,6 @@
 name: decentdb
 description: Dart FFI bindings for the Rust DecentDB C ABI.
-version: 2.3.0
+version: 2.4.0
 repository: https://github.com/sphildreth/decentdb
 homepage: https://github.com/sphildreth/decentdb/tree/main/bindings/dart
 

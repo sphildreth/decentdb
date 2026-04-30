@@ -493,3 +493,92 @@ assumptions = [
   "complex_ecommerce_v1 schema and workload",
   "delete phase removes order_items, payments, and the order row in one explicit transaction",
 ]
+
+[[metric]]
+id = "range_scan_warm.scan_p95_us"
+display_name = "Warm range scan p95"
+scenario = "range_scan_warm"
+metric = "scan_p95_us"
+priority = "P0"
+phase = 1
+signature = false
+direction = "smaller_is_better"
+unit = "microseconds"
+weight = 0.70
+floor = 500.0
+target = 250.0
+stretch = 120.0
+cache_mode = "in_memory"
+durability_mode = "n/a"
+likely_owners = ["btree", "pager", "executor"]
+assumptions = [
+  "ordered range scans on oltp_narrow_v1",
+  "prepared statement reused in the hot loop",
+]
+
+[[metric]]
+id = "read_under_write.reader_p95_under_write_us"
+display_name = "Reader p95 under write load"
+scenario = "read_under_write"
+metric = "reader_p95_under_write_us"
+priority = "P0"
+phase = 2
+signature = false
+direction = "smaller_is_better"
+unit = "microseconds"
+weight = 0.80
+floor = 300.0
+target = 150.0
+stretch = 80.0
+cache_mode = "warm_cache"
+durability_mode = "full"
+likely_owners = ["locks", "pager", "scheduler"]
+assumptions = [
+  "one writer thread",
+  "four reader threads",
+  "deterministic oltp_narrow_v1 key distribution",
+]
+
+[[metric]]
+id = "read_under_write.writer_throughput_under_readers_ops_per_sec"
+display_name = "Writer throughput under readers"
+scenario = "read_under_write"
+metric = "writer_throughput_under_readers_ops_per_sec"
+priority = "P0"
+phase = 2
+signature = false
+direction = "larger_is_better"
+unit = "ops_per_second"
+weight = 0.70
+floor = 5000.0
+target = 15000.0
+stretch = 30000.0
+cache_mode = "warm_cache"
+durability_mode = "full"
+likely_owners = ["locks", "pager", "wal"]
+assumptions = [
+  "one writer thread",
+  "four reader threads",
+]
+
+[[metric]]
+id = "memory_footprint.peak_rss_mb"
+display_name = "Peak RSS in MiB"
+scenario = "memory_footprint"
+metric = "peak_rss_mb"
+priority = "P0"
+phase = 2
+signature = false
+direction = "smaller_is_better"
+unit = "megabytes"
+weight = 0.80
+floor = 1024.0
+target = 256.0
+stretch = 64.0
+cache_mode = "real_fs"
+durability_mode = "full"
+likely_owners = ["executor", "pager", "wal"]
+assumptions = [
+  "Linux RSS snapshots via /proc/self/status",
+  "process-level snapshot; transient spikes may be missed",
+]

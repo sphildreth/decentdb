@@ -273,7 +273,58 @@ fn group_children_for_internal_pages(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
     use crate::btree::write::Btree;
+    use crate::storage::page::{InMemoryPageStore, PageId, PageStore};
+    use crate::Result;
+
+    #[derive(Clone, Debug)]
+    struct AdvisoryPageStore {
+        inner: InMemoryPageStore,
+        advise_count: Arc<AtomicUsize>,
+    }
+
+    impl AdvisoryPageStore {
+        fn new(page_size: u32) -> Self {
+            Self {
+                inner: InMemoryPageStore::new(page_size),
+                advise_count: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn advise_count(&self) -> usize {
+            self.advise_count.load(Ordering::Relaxed)
+        }
+    }
+
+    impl PageStore for AdvisoryPageStore {
+        fn page_size(&self) -> u32 {
+            self.inner.page_size()
+        }
+
+        fn allocate_page(&mut self) -> Result<PageId> {
+            self.inner.allocate_page()
+        }
+
+        fn free_page(&mut self, page_id: PageId) -> Result<()> {
+            self.inner.free_page(page_id)
+        }
+
+        fn read_page(&self, page_id: PageId) -> Result<Arc<[u8]>> {
+            self.inner.read_page(page_id)
+        }
+
+        fn write_page(&mut self, page_id: PageId, data: &[u8]) -> Result<()> {
+            self.inner.write_page(page_id, data)
+        }
+
+        fn advise_sequential(&self) -> Result<()> {
+            self.advise_count.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
 
     fn collect_forward(
         tree: &Btree<crate::storage::page::InMemoryPageStore>,
@@ -373,5 +424,28 @@ mod tests {
 
         let mut backward = tree.cursor_seek_backward(25).expect("seek backward");
         assert_eq!(backward.prev().expect("prev").map(|item| item.0), Some(20));
+    }
+
+    #[test]
+    fn forward_range_cursors_request_sequential_advice() {
+        let store = AdvisoryPageStore::new(512);
+        let mut tree = Btree::new(store);
+        for key in [10_u64, 20, 30, 40, 50] {
+            tree.insert(key, vec![key as u8]).expect("insert");
+        }
+
+        assert_eq!(tree.store().advise_count(), 0);
+        assert_eq!(tree.get(20).expect("lookup"), Some(vec![20]));
+        assert_eq!(tree.store().advise_count(), 0);
+
+        let _from_start = tree.cursor_from_start().expect("cursor from start");
+        assert_eq!(tree.store().advise_count(), 1);
+
+        let _seek_forward = tree.cursor_seek_forward(25).expect("seek forward");
+        assert_eq!(tree.store().advise_count(), 2);
+
+        let _from_end = tree.cursor_from_end().expect("cursor from end");
+        let _seek_backward = tree.cursor_seek_backward(25).expect("seek backward");
+        assert_eq!(tree.store().advise_count(), 2);
     }
 }

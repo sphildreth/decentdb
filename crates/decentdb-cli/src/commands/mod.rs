@@ -3,10 +3,11 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{anyhow, Result};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use decentdb::{
-    evict_shared_wal, BulkLoadOptions, Db, DbConfig, HeaderInfo, IndexVerification, QueryResult,
-    StorageInfo, TableInfo, Value,
+    evict_shared_wal, render_markdown, run_doctor, BulkLoadOptions, Db, DbConfig, DoctorCategory,
+    DoctorCheckSelection, DoctorIndexVerification, DoctorOptions, DoctorPathMode, DoctorReport,
+    DoctorSeverity, HeaderInfo, IndexVerification, QueryResult, StorageInfo, TableInfo, Value,
 };
 
 use crate::output::{
@@ -77,6 +78,8 @@ pub enum Commands {
     VerifyHeader(VerifyHeaderCommand),
     /// Verify index integrity
     VerifyIndex(VerifyIndexCommand),
+    /// Run `decentdb doctor` to diagnose database health
+    Doctor(DoctorCommand),
     /// Migrate a legacy database format to the current version
     Migrate(MigrateCommand),
 }
@@ -318,7 +321,116 @@ pub struct MigrateCommand {
     pub dest: String,
 }
 
+/// Parsed CLI values for the `--checks` comma-separated list.
+fn parse_checks(raw: &str) -> Result<DoctorCheckSelection, String> {
+    if raw.eq_ignore_ascii_case("all") {
+        return Ok(DoctorCheckSelection::All);
+    }
+    let cats: Result<Vec<DoctorCategory>, _> = raw
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(|s| match s.trim().to_lowercase().as_str() {
+            "header" => Ok(DoctorCategory::Header),
+            "storage" => Ok(DoctorCategory::Storage),
+            "wal" => Ok(DoctorCategory::Wal),
+            "fragmentation" => Ok(DoctorCategory::Fragmentation),
+            "schema" => Ok(DoctorCategory::Schema),
+            "statistics" => Ok(DoctorCategory::Statistics),
+            "indexes" => Ok(DoctorCategory::Indexes),
+            "compatibility" => Ok(DoctorCategory::Compatibility),
+            other => Err(format!("invalid check category: {other}")),
+        })
+        .collect();
+    Ok(DoctorCheckSelection::Selected(cats?))
+}
+
+fn parse_severity(raw: &str) -> Result<DoctorSeverity, String> {
+    match raw.trim().to_lowercase().as_str() {
+        "info" => Ok(DoctorSeverity::Info),
+        "warning" => Ok(DoctorSeverity::Warning),
+        "error" => Ok(DoctorSeverity::Error),
+        other => Err(format!("invalid severity: {other}")),
+    }
+}
+
+fn parse_path_mode(raw: &str) -> Result<DoctorPathMode, String> {
+    match raw.trim().to_lowercase().as_str() {
+        "absolute" => Ok(DoctorPathMode::Absolute),
+        "basename" => Ok(DoctorPathMode::Basename),
+        "redacted" => Ok(DoctorPathMode::Redacted),
+        other => Err(format!("invalid path mode: {other}")),
+    }
+}
+
+#[derive(Clone, Debug, Parser)]
+pub struct DoctorCommand {
+    #[arg(long)]
+    pub db: String,
+
+    #[arg(long, value_enum, default_value_t = OutputFormat::Markdown)]
+    pub format: OutputFormat,
+
+    #[arg(long, default_value = "all")]
+    pub checks: String,
+
+    #[arg(long = "verify-index")]
+    pub verify_index: Vec<String>,
+
+    #[arg(long = "verify-indexes")]
+    pub verify_all: bool,
+
+    #[arg(long = "max-index-verify", default_value = "32")]
+    pub max_index_verify: usize,
+
+    #[arg(long = "fail-on", default_value = "error")]
+    pub fail_on: String,
+
+    #[arg(
+        long = "include-recommendations",
+        default_value_t = true,
+        default_missing_value = "true",
+        num_args = 0..=1,
+        require_equals = true,
+        action = ArgAction::Set
+    )]
+    pub include_recommendations: bool,
+
+    #[arg(long = "path-mode", default_value = "absolute")]
+    pub path_mode: String,
+
+    #[arg(long = "fix", default_value_t = false)]
+    pub fix: bool,
+}
+
+impl DoctorCommand {
+    fn into_options(self) -> Result<DoctorOptions, String> {
+        let checks = parse_checks(&self.checks)?;
+        let verify_indexes = if self.verify_all {
+            DoctorIndexVerification::All {
+                max_count: self.max_index_verify,
+            }
+        } else if !self.verify_index.is_empty() {
+            DoctorIndexVerification::Named(self.verify_index.clone())
+        } else {
+            DoctorIndexVerification::None
+        };
+        let path_mode = parse_path_mode(&self.path_mode)?;
+        // fail_on validated during exit-code calculation.
+
+        Ok(DoctorOptions {
+            checks,
+            verify_indexes,
+            include_recommendations: self.include_recommendations,
+            path_mode,
+            fix: self.fix,
+        })
+    }
+}
+
 pub fn run(cli: Cli) -> i32 {
+    if let Commands::Doctor(cmd) = &cli.command {
+        return run_doctor_cli(cmd);
+    }
     match dispatch(cli) {
         Ok(()) => 0,
         Err(error) => {
@@ -374,6 +486,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         Commands::VerifyHeader(command) => run_verify_header(command)?,
         Commands::VerifyIndex(command) => run_verify_index(command)?,
         Commands::Migrate(command) => run_migrate(command)?,
+        Commands::Doctor(_) => unreachable!("Doctor is handled in run()"),
     }
     Ok(())
 }
@@ -424,7 +537,7 @@ fn run_exec(command: &ExecCommand) -> Result<()> {
                 render_exec_success_json(&results, elapsed_ms, command.checkpoint)
             );
         }
-        OutputFormat::Csv | OutputFormat::Table => {
+        OutputFormat::Csv | OutputFormat::Table | OutputFormat::Markdown => {
             for (index, result) in results.iter().enumerate() {
                 if index > 0 {
                     println!();
@@ -1074,4 +1187,57 @@ fn _table_summary(table: &TableInfo) -> Vec<String> {
             .collect::<Vec<_>>()
             .join(", "),
     ]
+}
+
+// ----------------------------------------------------------------------
+// Doctor command
+// ----------------------------------------------------------------------
+
+fn run_doctor_cli(cmd: &DoctorCommand) -> i32 {
+    match run_doctor_command(cmd) {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("{e}");
+            1
+        }
+    }
+}
+
+fn run_doctor_command(cmd: &DoctorCommand) -> Result<i32, String> {
+    let options = cmd.clone().into_options()?;
+    let fail_on = parse_severity(&cmd.fail_on)?;
+
+    let report = run_doctor(&cmd.db, options).map_err(|e| format!("Doctor engine error: {e}"))?;
+
+    match cmd.format {
+        OutputFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report)
+                    .map_err(|e| format!("JSON serialization error: {e}"))?
+            );
+        }
+        OutputFormat::Markdown => {
+            print!("{}", render_markdown(&report));
+        }
+        OutputFormat::Csv | OutputFormat::Table => {
+            // Fall through to Markdown for non-JSON, non-Markdown
+            // formats since table rendering is not implemented for
+            // doctor reports in v1.
+            print!("{}", render_markdown(&report));
+        }
+    }
+
+    Ok(exit_code(&report, fail_on))
+}
+
+fn exit_code(report: &DoctorReport, fail_on: DoctorSeverity) -> i32 {
+    if report.findings.iter().any(|f| {
+        f.severity.sort_key() <= fail_on.sort_key()
+            || (f.id == "fix.failed" && f.severity == DoctorSeverity::Error)
+    }) {
+        2
+    } else {
+        0
+    }
 }

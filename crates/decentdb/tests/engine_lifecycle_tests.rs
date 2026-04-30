@@ -77,8 +77,20 @@ fn cleanup_db_file(path: &PathBuf) {
 /// "overflow payload length mismatch" errors during concurrent access.
 #[test]
 fn concurrent_writer_reader_overflow_consistency() {
+    run_concurrent_writer_reader_overflow_consistency(DbConfig::default());
+}
+
+#[test]
+fn concurrent_writer_reader_overflow_consistency_with_deferred_materialization() {
+    run_concurrent_writer_reader_overflow_consistency(DbConfig {
+        defer_table_materialization: true,
+        ..DbConfig::default()
+    });
+}
+
+fn run_concurrent_writer_reader_overflow_consistency(config: DbConfig) {
     let path = unique_db_path("concurrent-overflow");
-    let db = Db::open_or_create(&path, DbConfig::default()).expect("create db");
+    let db = Db::open_or_create(&path, config.clone()).expect("create db");
 
     // Use a value large enough to spill into overflow pages.
     let big_value: String = "X".repeat(8000);
@@ -92,8 +104,9 @@ fn concurrent_writer_reader_overflow_consistency() {
     let writer_stop = Arc::clone(&stop);
     let writer_path = path.clone();
     let writer_big = big_value.clone();
+    let writer_config = config.clone();
     let writer_handle = std::thread::spawn(move || {
-        let db = Db::open_or_create(&writer_path, DbConfig::default()).expect("open writer");
+        let db = Db::open_or_create(&writer_path, writer_config).expect("open writer");
         let mut i: i64 = 0;
         while !writer_stop.load(Ordering::Relaxed) {
             let sql = format!("INSERT INTO t VALUES ({i}, '{}')", writer_big);
@@ -103,6 +116,9 @@ fn concurrent_writer_reader_overflow_consistency() {
                 if !msg.contains("UNIQUE constraint") {
                     eprintln!("writer error at row {i}: {e}");
                 }
+            }
+            if i % 8 == 0 {
+                let _ = db.checkpoint();
             }
             i += 1;
         }
@@ -114,8 +130,9 @@ fn concurrent_writer_reader_overflow_consistency() {
         let reader_stop = Arc::clone(&stop);
         let reader_errors = Arc::clone(&errors);
         let reader_path = path.clone();
+        let reader_config = config.clone();
         reader_handles.push(std::thread::spawn(move || {
-            let db = Db::open_or_create(&reader_path, DbConfig::default()).expect("open reader");
+            let db = Db::open_or_create(&reader_path, reader_config).expect("open reader");
             while !reader_stop.load(Ordering::Relaxed) {
                 match db.execute("SELECT COUNT(*), LENGTH(data) FROM t") {
                     Ok(_) => {}
