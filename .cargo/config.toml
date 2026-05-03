@@ -9,3 +9,8 @@ cov-ci = "llvm-cov nextest --lcov --output-path lcov.info"
 
 # Formatting and linting
 lint = "clippy --all-targets --all-features -- -D warnings"
+
+[env]
+# Fedora can provide libclang without the clang driver package. In that setup,
+# bindgen may fail to find Clang's builtin C headers such as stddef.h.
+BINDGEN_EXTRA_CLANG_ARGS = { value = "-I/usr/lib/clang/22/include", force = false }
