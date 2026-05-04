@@ -285,6 +285,13 @@ impl Drop for DbInner {
         if let Ok(mut held_snapshots) = self.held_snapshots.lock() {
             held_snapshots.clear();
         }
+        if is_memory_path(&self.path) {
+            let _ = self
+                .wal
+                .checkpoint(&self.pager, self.config.checkpoint_timeout_sec);
+            return;
+        }
+
         let wal = self.wal.clone();
         let checkpoint_wal = wal.clone();
         let pager = self.pager.clone();
@@ -1681,13 +1688,17 @@ impl Db {
     }
 
     fn open_with_vfs(path: PathBuf, config: DbConfig, vfs: VfsHandle) -> Result<Self> {
-        let open_lock = if vfs.is_memory() {
+        let open_lock_key = if vfs.is_memory() {
             None
         } else {
-            let canonical_path = vfs.canonicalize_path(&path)?;
-            Some(db_open_lock(canonical_path)?)
+            Some(vfs.canonicalize_path(&path)?)
         };
-        let _open_guard = open_lock
+        let _open_lock_cleanup = DbOpenLockCleanup(open_lock_key.clone());
+        let open_lock = open_lock_key
+            .as_ref()
+            .map(|canonical_path| db_open_lock(canonical_path.clone()))
+            .transpose()?;
+        let open_guard = open_lock
             .as_ref()
             .map(|lock| {
                 lock.lock()
@@ -1775,6 +1786,11 @@ impl Db {
         };
         db.backfill_missing_persistent_pk_indexes()?;
         db.backfill_paged_row_storage()?;
+        drop(open_guard);
+        drop(open_lock);
+        if let Some(canonical_path) = open_lock_key {
+            prune_db_open_lock_registry(&canonical_path);
+        }
         Ok(db)
     }
 
@@ -5024,6 +5040,31 @@ fn db_open_lock(canonical_path: PathBuf) -> Result<Arc<Mutex<()>>> {
 fn db_open_lock_registry() -> &'static Mutex<HashMap<PathBuf, Weak<Mutex<()>>>> {
     static REGISTRY: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+struct DbOpenLockCleanup(Option<PathBuf>);
+
+impl Drop for DbOpenLockCleanup {
+    fn drop(&mut self) {
+        if let Some(canonical_path) = self.0.as_deref() {
+            prune_db_open_lock_registry(canonical_path);
+        }
+    }
+}
+
+fn prune_db_open_lock_registry(canonical_path: &Path) {
+    let Ok(mut registry) = db_open_lock_registry().lock() else {
+        return;
+    };
+    if registry
+        .get(canonical_path)
+        .is_some_and(|entry| entry.upgrade().is_none())
+    {
+        registry.remove(canonical_path);
+    }
+    if registry.is_empty() {
+        registry.shrink_to_fit();
+    }
 }
 
 /// Evicts the shared WAL registry entry for an on-disk database path.
