@@ -16,6 +16,7 @@
 //! - The worker holds `Weak<SharedWalInner>` so it does not keep the WAL
 //!   alive past the last external `WalHandle` clone.
 
+use std::cell::Cell;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::{self, JoinHandle};
@@ -39,6 +40,10 @@ struct BgCtrlState {
 struct BgCtrl {
     state: Mutex<BgCtrlState>,
     cond: Condvar,
+}
+
+thread_local! {
+    static IN_BG_CHECKPOINTER: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Owns the worker thread and its shared control block. Held as
@@ -80,6 +85,9 @@ impl BgCheckpointer {
     }
 
     pub(crate) fn shutdown_and_join(&self) {
+        if IN_BG_CHECKPOINTER.with(Cell::get) {
+            return;
+        }
         {
             let mut state = match self.ctrl.state.lock() {
                 Ok(g) => g,
@@ -93,9 +101,6 @@ impl BgCheckpointer {
             Err(poisoned) => poisoned.into_inner().take(),
         };
         if let Some(join) = join {
-            if join.thread().id() == thread::current().id() {
-                return;
-            }
             // Best-effort join: if the worker panicked we don't want to
             // poison shutdown paths. The panic has already been reported on
             // the worker's stack.
@@ -111,6 +116,7 @@ impl Drop for BgCheckpointer {
 }
 
 fn worker_loop(ctrl: Arc<BgCtrl>, weak: Weak<SharedWalInner>, pager: PagerHandle) {
+    IN_BG_CHECKPOINTER.with(|flag| flag.set(true));
     // The worker wakes either on a writer signal or on a periodic timeout
     // matching the configured `checkpoint_timeout_sec`. The timeout fallback
     // ensures that a workload that *just barely* crosses a threshold and

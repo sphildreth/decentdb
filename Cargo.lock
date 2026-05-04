@@ -761,7 +761,7 @@ dependencies = [
 
 [[package]]
 name = "decentdb"
-version = "2.4.1"
+version = "2.4.2"
 dependencies = [
  "chrono",
  "criterion",
@@ -786,7 +786,7 @@ dependencies = [
 
 [[package]]
 name = "decentdb-benchmark"
-version = "2.4.1"
+version = "2.4.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -800,7 +800,7 @@ dependencies = [
 
 [[package]]
 name = "decentdb-cli"
-version = "2.4.1"
+version = "2.4.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -812,7 +812,7 @@ dependencies = [
 
 [[package]]
 name = "decentdb-migrate"
-version = "2.4.1"
+version = "2.4.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -1726,7 +1726,7 @@ dependencies = [
 
 [[package]]
 name = "libpg_query_sys"
-version = "2.4.1"
+version = "2.4.2"
 dependencies = [
  "pg_query",
 ]

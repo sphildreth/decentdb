@@ -5,6 +5,14 @@ All notable changes to DecentDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.2] - 2026-05-04
+
+### Fixed
+
+- Fixed shutdown-time ownership that caused the nightly memory-safety Valgrind workflow to report possible leaks after C ABI and Python open/query/close probes. In-memory database drop now runs its final checkpoint synchronously so `ddb_db_free` does not return while a drop checkpoint thread still owns WAL and pager state.
+- Pruned stale weak entries from the database open-lock and OS VFS path-lock registries as handles close, avoiding process-lifetime registry allocations being reported as possible leaks by Memcheck.
+- Hardened background checkpoint worker shutdown so worker-context teardown cannot attempt to join its own thread.
+
 ## [2.4.1] - 2026-04-30
 
 ### Fixed

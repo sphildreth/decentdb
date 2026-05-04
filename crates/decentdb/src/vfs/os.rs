@@ -32,12 +32,13 @@ impl Vfs for OsVfs {
                 source,
             )
         })?;
-        let path_lock = path_lock(path)?;
+        let (path_lock_key, path_lock) = path_lock(path)?;
 
         Ok(Arc::new(OsVfsFile {
             kind,
             path: path.to_path_buf(),
             file,
+            path_lock_key,
             path_lock,
         }))
     }
@@ -71,6 +72,7 @@ struct OsVfsFile {
     kind: FileKind,
     path: PathBuf,
     file: File,
+    path_lock_key: PathBuf,
     path_lock: Arc<RwLock<()>>,
 }
 
@@ -168,19 +170,39 @@ impl VfsFile for OsVfsFile {
     }
 }
 
-fn path_lock(path: &Path) -> Result<Arc<RwLock<()>>> {
+impl Drop for OsVfsFile {
+    fn drop(&mut self) {
+        let Ok(mut registry) = path_lock_registry().lock() else {
+            return;
+        };
+        let should_remove = registry
+            .get(&self.path_lock_key)
+            .and_then(Weak::upgrade)
+            .is_some_and(|lock| {
+                Arc::ptr_eq(&lock, &self.path_lock) && Arc::strong_count(&lock) == 2
+            });
+        if should_remove {
+            registry.remove(&self.path_lock_key);
+            if registry.is_empty() {
+                registry.shrink_to_fit();
+            }
+        }
+    }
+}
+
+fn path_lock(path: &Path) -> Result<(PathBuf, Arc<RwLock<()>>)> {
     let key = path_lock_key(path)?;
     let mut registry = path_lock_registry()
         .lock()
         .map_err(|_| DbError::internal("VFS path lock registry poisoned"))?;
     if let Some(existing) = registry.get(&key).and_then(Weak::upgrade) {
-        return Ok(existing);
+        return Ok((key, existing));
     }
 
     registry.retain(|_, lock| lock.strong_count() > 0);
     let lock = Arc::new(RwLock::new(()));
-    registry.insert(key, Arc::downgrade(&lock));
-    Ok(lock)
+    registry.insert(key.clone(), Arc::downgrade(&lock));
+    Ok((key, lock))
 }
 
 fn path_lock_registry() -> &'static Mutex<HashMap<PathBuf, Weak<RwLock<()>>>> {
