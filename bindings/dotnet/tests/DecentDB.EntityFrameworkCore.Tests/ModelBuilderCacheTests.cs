@@ -93,7 +93,7 @@ public sealed class ModelBuilderCacheTests : IDisposable
     }
 
     [Fact]
-    public void BuildModel_IsThreadSafe()
+    public async Task BuildModel_IsThreadSafe()
     {
         // Stress test: call from 16 parallel threads
         var tasks = new Task[16];
@@ -105,7 +105,7 @@ public sealed class ModelBuilderCacheTests : IDisposable
                 Assert.NotNull(model);
             });
         }
-        Task.WaitAll(tasks);
+        await Task.WhenAll(tasks);
     }
 
     [Fact]
