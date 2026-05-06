@@ -199,6 +199,9 @@ jobs:
       - name: Build CLI (release)
         run: cargo build -p decentdb-cli --release
 
+      - name: Build migrate tool (release)
+        run: cargo build -p decentdb-migrate --release
+
       - name: Build JNI bridge native library (Linux/macOS)
         if: runner.os != 'Windows'
         shell: bash
@@ -231,6 +234,7 @@ jobs:
           set -euo pipefail
           mkdir -p dist
           cp -v target/release/decentdb dist/
+          cp -v target/release/decentdb-migrate dist/
           cp -v target/release/libdecentdb.so dist/libdecentdb.so 2>/dev/null || true
           cp -v target/release/libdecentdb.dylib dist/libdecentdb.dylib 2>/dev/null || true
           cp -v target/release/libdecentdb_jni.so dist/ 2>/dev/null || true
@@ -242,6 +246,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item -Force target\release\decentdb.exe dist\
+          Copy-Item -Force target\release\decentdb-migrate.exe dist\
           Copy-Item -Force target\release\decentdb.dll dist\ 2>$null
           Copy-Item -Force target\release\decentdb_jni.dll dist\ 2>$null
           if (!(Test-Path dist\decentdb.dll)) { throw "Native DLL not found" }
