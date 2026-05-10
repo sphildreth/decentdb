@@ -114,6 +114,55 @@ fn exec_and_schema_introspection_commands_work() {
 }
 
 #[test]
+fn checkpoint_command_flushes_wal_and_preserves_data_without_wal_file() {
+    let dir = temp_dir();
+    let db = dir.join("checkpoint.ddb");
+    let db_str = db.display().to_string();
+
+    let result = run(&[
+        "exec",
+        "--db",
+        &db_str,
+        "--sql",
+        "CREATE TABLE t (id INT64 PRIMARY KEY, value TEXT); \
+         INSERT INTO t (id, value) VALUES (1, 'before'); \
+         UPDATE t SET value = 'after' WHERE id = 1;",
+        "--format",
+        "json",
+    ]);
+    assert!(result.contains("\"ok\":true"));
+
+    let wal = db.with_extension("ddb.wal");
+    let wal_size_before = fs::metadata(&wal)
+        .expect("stat WAL before checkpoint")
+        .len();
+    assert!(
+        wal_size_before > 32,
+        "test setup should leave committed frames in the WAL"
+    );
+
+    let checkpoint = run(&["checkpoint", "--db", &db_str]);
+    assert!(checkpoint.contains("checkpoint complete"));
+    assert_eq!(
+        fs::metadata(&wal).expect("stat WAL after checkpoint").len(),
+        32,
+        "checkpoint should truncate WAL to its header when no readers are active"
+    );
+
+    fs::remove_file(&wal).expect("remove checkpointed WAL");
+    let selected = run(&[
+        "exec",
+        "--db",
+        &db_str,
+        "--sql",
+        "SELECT value FROM t WHERE id = 1;",
+        "--format",
+        "json",
+    ]);
+    assert!(selected.contains("\"rows\":[[\"after\"]]"));
+}
+
+#[test]
 fn import_export_bulk_load_and_maintenance_commands_work() {
     let dir = temp_dir();
     let db = dir.join("ops.ddb");
