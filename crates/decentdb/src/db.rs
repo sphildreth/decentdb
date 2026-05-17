@@ -82,10 +82,8 @@ struct SyncConflictRecordData {
 #[derive(Clone, Debug)]
 enum SyncImportRecordOutcome {
     Applied,
-    Skipped,
     Conflict(SyncConflictRecordData),
     Resolved(SyncConflictRecordData),
-    Stop(SyncConflictRecordData),
 }
 
 impl<'a> PagerReadStore<'a> {
@@ -5728,7 +5726,9 @@ impl Db {
             .unwrap_or_default();
         let origin_priority = match self.sync_read_metadata("conflict_origin_priority")? {
             Some(value) => serde_json::from_str::<Vec<String>>(&value).map_err(|error| {
-                DbError::sql(format!("invalid sync conflict origin priority metadata: {error}"))
+                DbError::sql(format!(
+                    "invalid sync conflict origin priority metadata: {error}"
+                ))
             })?,
             None => Vec::new(),
         };
@@ -5849,7 +5849,7 @@ impl Db {
         let mut applied = 0usize;
         let mut skipped = 0usize;
         let mut conflicted = 0usize;
-        let mut stop_conflict = None;
+        let mut stop_conflict: Option<(SyncJournalRecord, SyncConflictRecordData)> = None;
 
         for record in &batch.records {
             if let Some(local_replica_id) = local_replica_id.as_deref() {
@@ -5904,9 +5904,6 @@ impl Db {
                     self.sync_upsert_metadata(&marker_key, "applied")?;
                     applied += 1;
                 }
-                SyncImportRecordOutcome::Skipped => {
-                    skipped += 1;
-                }
                 SyncImportRecordOutcome::Conflict(conflict) => {
                     if matches!(policy, SyncConflictPolicy::Stop) {
                         stop_conflict = Some((record.clone(), conflict));
@@ -5920,10 +5917,6 @@ impl Db {
                     self.record_sync_conflict_with_data(batch, record, &conflict)?;
                     applied += 1;
                     conflicted += 1;
-                }
-                SyncImportRecordOutcome::Stop(conflict) => {
-                    stop_conflict = Some((record.clone(), conflict));
-                    break;
                 }
             }
         }
@@ -5984,6 +5977,7 @@ impl Db {
     }
 
     pub fn sync_conflicts(&self) -> Result<Vec<SyncConflict>> {
+        self.ensure_sync_tables()?;
         let sql = format!(
             "SELECT * FROM {} WHERE resolved = 0 ORDER BY conflict_id",
             crate::sync::CONFLICTS_TABLE
@@ -6002,6 +5996,7 @@ impl Db {
     }
 
     pub fn sync_conflicts_all(&self) -> Result<Vec<SyncConflict>> {
+        self.ensure_sync_tables()?;
         let sql = format!(
             "SELECT * FROM {} ORDER BY conflict_id",
             crate::sync::CONFLICTS_TABLE
@@ -6020,13 +6015,18 @@ impl Db {
     }
 
     pub fn sync_conflict(&self, conflict_id: i64) -> Result<Option<SyncConflict>> {
+        self.ensure_sync_tables()?;
         let sql = format!(
             "SELECT * FROM {} WHERE conflict_id = {}",
             crate::sync::CONFLICTS_TABLE,
             conflict_id
         );
         match self.execute(&sql) {
-            Ok(result) => Ok(result.rows().first().map(sync_conflict_from_row).transpose()?),
+            Ok(result) => Ok(result
+                .rows()
+                .first()
+                .map(sync_conflict_from_row)
+                .transpose()?),
             Err(error) => {
                 let message = error.to_string();
                 if message.contains("no such table") || message.contains("unknown table") {
@@ -6063,11 +6063,13 @@ impl Db {
             return Ok(false);
         };
         let record: SyncJournalRecord = serde_json::from_value(conflict.remote_record_json.clone())
-            .map_err(|error| DbError::corruption(format!(
-                "malformed sync conflict remote_record_json: {error}"
-            )))?;
+            .map_err(|error| {
+                DbError::corruption(format!(
+                    "malformed sync conflict remote_record_json: {error}"
+                ))
+            })?;
         let batch = SyncChangeBatch::from_records(vec![record.clone()])?;
-        let policy = SyncConflictPolicy::Record;
+        let policy = SyncConflictPolicy::LastWriterWins;
         let _suppress_capture = self.inner.sync_ctx.suppress_capture();
         let tx = {
             self.begin_transaction()?;
@@ -6124,14 +6126,13 @@ impl Db {
                 tx.commit()?;
                 Ok(true)
             }
-            SyncImportRecordOutcome::Conflict(conflict) | SyncImportRecordOutcome::Stop(conflict) => {
+            SyncImportRecordOutcome::Conflict(conflict) => {
                 let _ = conflict;
                 Err(DbError::sql(format!(
                     "cannot apply remote conflict {} because replay now fails",
                     conflict_id
                 )))
             }
-            SyncImportRecordOutcome::Skipped => Ok(false),
         }
     }
 
@@ -6349,7 +6350,10 @@ impl Db {
             .duration_since(SystemTime::UNIX_EPOCH)
             .map(|duration| duration.as_micros() as i64)
             .unwrap_or(0);
-        let local_row_json_text = conflict.local_row_json.as_ref().map(|value| value.to_string());
+        let local_row_json_text = conflict
+            .local_row_json
+            .as_ref()
+            .map(|value| value.to_string());
         let resolution = conflict.resolution.as_deref().unwrap_or("NULL");
         let resolved_at_micros = conflict
             .resolved_at_micros
@@ -6437,12 +6441,8 @@ impl Db {
                         table.name
                     ))
                 })?;
-                let expected = json_to_typed_value(
-                    &table.name,
-                    pk_col,
-                    &column.column_type,
-                    json_value,
-                )?;
+                let expected =
+                    json_to_typed_value(&table.name, pk_col, &column.column_type, json_value)?;
                 let Some(actual) = values.get(
                     table
                         .columns
@@ -6472,7 +6472,7 @@ impl Db {
 
     fn sync_apply_import_record(
         &self,
-        batch: &SyncChangeBatch,
+        _batch: &SyncChangeBatch,
         record: &SyncJournalRecord,
         table: &TableSchema,
         policy: &SyncConflictPolicy,
@@ -6494,30 +6494,26 @@ impl Db {
             SyncConflictPolicy::LastWriterWins => true,
             SyncConflictPolicy::OriginPriority => {
                 let config = self.sync_conflict_policy()?;
-                let Some(local_replica_id) = self
+                match self
                     .inner
                     .sync_ctx
                     .replica_id()
                     .or_else(|| self.sync_read_metadata("replica_id").ok().flatten())
-                else {
-                    false
-                };
-                let remote_index = config
-                    .origin_priority
-                    .iter()
-                    .position(|replica| replica == &record.replica_id);
-                let local_index = config
-                    .origin_priority
-                    .iter()
-                    .position(|replica| replica == &local_replica_id);
-                matches!((remote_index, local_index), (Some(remote), Some(local)) if remote < local)
+                {
+                    Some(local_replica_id) => {
+                        let remote_index = config
+                            .origin_priority
+                            .iter()
+                            .position(|replica| replica == &record.replica_id);
+                        let local_index = config
+                            .origin_priority
+                            .iter()
+                            .position(|replica| replica == &local_replica_id);
+                        matches!((remote_index, local_index), (Some(remote), Some(local)) if remote < local)
+                    }
+                    None => false,
+                }
             }
-        };
-
-        let conflict_type_for_constraint = |op: SyncOperation| match op {
-            SyncOperation::Insert => "insert_insert",
-            SyncOperation::Update => "update_update",
-            SyncOperation::Delete => "delete_update",
         };
 
         let apply_remote_replace = |operation: SyncOperation| -> Result<()> {
@@ -6648,8 +6644,8 @@ impl Db {
                             policy_name: Some(policy.as_str().to_string()),
                         }))
                     }
-                    Err(DbError::Constraint { message }) => Ok(SyncImportRecordOutcome::Conflict(
-                        SyncConflictRecordData {
+                    Err(DbError::Constraint { message }) => {
+                        Ok(SyncImportRecordOutcome::Conflict(SyncConflictRecordData {
                             conflict_type: if local_row_json.is_some() {
                                 "insert_insert".to_string()
                             } else {
@@ -6662,8 +6658,8 @@ impl Db {
                             resolved_by: None,
                             resolution_note: None,
                             policy_name: Some(policy.as_str().to_string()),
-                        },
-                    )),
+                        }))
+                    }
                     Err(error) => Ok(SyncImportRecordOutcome::Conflict(SyncConflictRecordData {
                         conflict_type: "apply_error".to_string(),
                         message: error.to_string(),
@@ -6683,7 +6679,8 @@ impl Db {
                     .ok_or_else(|| DbError::sql("update record missing after payload"))?
                     .as_object()
                     .ok_or_else(|| DbError::sql("after must be an object for update"))?;
-                let mut params = Vec::with_capacity(table.columns.len() + table.primary_key_columns.len());
+                let mut params =
+                    Vec::with_capacity(table.columns.len() + table.primary_key_columns.len());
                 let mut expressions = Vec::with_capacity(table.columns.len());
                 for column in &table.columns {
                     let json_value = after.get(&column.name).ok_or_else(|| {
@@ -6698,7 +6695,11 @@ impl Db {
                         &column.column_type,
                         json_value,
                     )?);
-                    expressions.push(format!("{} = ${}", sql_identifier(&column.name), params.len()));
+                    expressions.push(format!(
+                        "{} = ${}",
+                        sql_identifier(&column.name),
+                        params.len()
+                    ));
                 }
                 for pk_col in &table.primary_key_columns {
                     let column = table
@@ -6732,13 +6733,17 @@ impl Db {
                         .primary_key_columns
                         .iter()
                         .enumerate()
-                        .map(|(idx, pk_col)| format!("{} = ${}", sql_identifier(pk_col), table.columns.len() + idx + 1))
+                        .map(|(idx, pk_col)| format!(
+                            "{} = ${}",
+                            sql_identifier(pk_col),
+                            table.columns.len() + idx + 1
+                        ))
                         .collect::<Vec<_>>()
                         .join(" AND ")
                 );
                 match self.execute_with_params(&sql, &params) {
-                    Ok(result) if result.affected_rows() == 0 => Ok(SyncImportRecordOutcome::Conflict(
-                        SyncConflictRecordData {
+                    Ok(result) if result.affected_rows() == 0 => {
+                        Ok(SyncImportRecordOutcome::Conflict(SyncConflictRecordData {
                             conflict_type: "missing_target".to_string(),
                             message: "update affected no rows".to_string(),
                             local_row_json,
@@ -6747,8 +6752,8 @@ impl Db {
                             resolved_by: None,
                             resolution_note: None,
                             policy_name: Some(policy.as_str().to_string()),
-                        },
-                    )),
+                        }))
+                    }
                     Ok(_) => Ok(SyncImportRecordOutcome::Applied),
                     Err(DbError::Constraint { message }) if remote_wins => {
                         apply_remote_replace(SyncOperation::Update)?;
@@ -6763,8 +6768,8 @@ impl Db {
                             policy_name: Some(policy.as_str().to_string()),
                         }))
                     }
-                    Err(DbError::Constraint { message }) => Ok(SyncImportRecordOutcome::Conflict(
-                        SyncConflictRecordData {
+                    Err(DbError::Constraint { message }) => {
+                        Ok(SyncImportRecordOutcome::Conflict(SyncConflictRecordData {
                             conflict_type: if local_row_json.is_some() {
                                 "update_update".to_string()
                             } else {
@@ -6777,8 +6782,8 @@ impl Db {
                             resolved_by: None,
                             resolution_note: None,
                             policy_name: Some(policy.as_str().to_string()),
-                        },
-                    )),
+                        }))
+                    }
                     Err(error) => Ok(SyncImportRecordOutcome::Conflict(SyncConflictRecordData {
                         conflict_type: "apply_error".to_string(),
                         message: error.to_string(),
@@ -6829,8 +6834,8 @@ impl Db {
                     where_parts.join(" AND ")
                 );
                 match self.execute_with_params(&sql, &where_values) {
-                    Ok(result) if result.affected_rows() == 0 => Ok(SyncImportRecordOutcome::Conflict(
-                        SyncConflictRecordData {
+                    Ok(result) if result.affected_rows() == 0 => {
+                        Ok(SyncImportRecordOutcome::Conflict(SyncConflictRecordData {
                             conflict_type: "missing_target".to_string(),
                             message: "delete affected no rows".to_string(),
                             local_row_json,
@@ -6839,8 +6844,8 @@ impl Db {
                             resolved_by: None,
                             resolution_note: None,
                             policy_name: Some(policy.as_str().to_string()),
-                        },
-                    )),
+                        }))
+                    }
                     Ok(_) => Ok(SyncImportRecordOutcome::Applied),
                     Err(DbError::Constraint { message }) if remote_wins => {
                         apply_remote_replace(SyncOperation::Delete)?;
@@ -6855,8 +6860,8 @@ impl Db {
                             policy_name: Some(policy.as_str().to_string()),
                         }))
                     }
-                    Err(DbError::Constraint { message }) => Ok(SyncImportRecordOutcome::Conflict(
-                        SyncConflictRecordData {
+                    Err(DbError::Constraint { message }) => {
+                        Ok(SyncImportRecordOutcome::Conflict(SyncConflictRecordData {
                             conflict_type: if local_row_json.is_some() {
                                 "delete_update".to_string()
                             } else {
@@ -6869,8 +6874,8 @@ impl Db {
                             resolved_by: None,
                             resolution_note: None,
                             policy_name: Some(policy.as_str().to_string()),
-                        },
-                    )),
+                        }))
+                    }
                     Err(error) => Ok(SyncImportRecordOutcome::Conflict(SyncConflictRecordData {
                         conflict_type: "apply_error".to_string(),
                         message: error.to_string(),
@@ -6915,6 +6920,7 @@ impl Db {
         note: Option<&str>,
         resolved_at_micros: Option<i64>,
     ) -> Result<bool> {
+        self.ensure_sync_tables()?;
         let Some(_) = self.sync_conflict(conflict_id)? else {
             return Ok(false);
         };
@@ -7388,7 +7394,10 @@ impl Db {
     fn sync_conflict_policy_query_result(&self) -> Result<QueryResult> {
         let policy = self.sync_conflict_policy()?;
         Ok(QueryResult::with_rows(
-            vec!["default_policy".to_string(), "origin_priority_json".to_string()],
+            vec![
+                "default_policy".to_string(),
+                "origin_priority_json".to_string(),
+            ],
             vec![QueryRow::new(vec![
                 Value::Text(policy.default_policy.to_string()),
                 Value::Text(

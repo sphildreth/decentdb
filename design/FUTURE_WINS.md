@@ -20,9 +20,9 @@ Future version values are planning buckets, not release commitments.
 
 | Priority | Future Version | Status | Feature | Current Source Of Truth | Why This Rank |
 |---:|---|---|---|---|---|
-| 1 | vNext | IN PROGRESS | Native local-first sync, changesets, CDC, and merge | [`WIN01_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md`](WIN01_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md), ADR 0147, ADR 0148, ADR 0149 | Strongest identity-level differentiator and real application painkiller |
-| 2 | vNext | TODO | Branch, diff, restore, and time-travel workflows | Needs ADR/spec | Memorable workflow for agents, test environments, migration rehearsal, and support |
-| 3 | vNext | TODO | Schema-first strongly typed SDK generation | [`WIN02_SCHEMA_FIRST_STRONGLY_TYPED_SDK_GENERATION_SPEC.md`](WIN02_SCHEMA_FIRST_STRONGLY_TYPED_SDK_GENERATION_SPEC.md), ADR 0116, ADR 0129 | Adoption accelerator across languages; DecentDB metadata foundation exists |
+| 1 | vNext | IN PROGRESS | Native local-first sync, changesets, CDC, and merge | [`WIN01_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md`](WIN01_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md), ADR 0147, ADR 0148, ADR 0149, ADR 0150 | Strongest identity-level differentiator and real application painkiller |
+| 2 | vNext | BACKLOG | Branch, diff, restore, and time-travel workflows | Needs ADR/spec | Memorable workflow for agents, test environments, migration rehearsal, and support |
+| 3 | vNext | BACKLOG | Schema-first strongly typed SDK generation | [`WIN02_SCHEMA_FIRST_STRONGLY_TYPED_SDK_GENERATION_SPEC.md`](WIN02_SCHEMA_FIRST_STRONGLY_TYPED_SDK_GENERATION_SPEC.md), ADR 0116, ADR 0129 | Adoption accelerator across languages; DecentDB metadata foundation exists |
 | 4 | vNext+1 | BACKLOG | WASM and browser OPFS support | [`WIN03_WASM_SUPPORT_IMPLEMENTATION.md`](WIN03_WASM_SUPPORT_IMPLEMENTATION.md) | Essential enabler for browser local-first apps, but no longer unique by itself |
 | 5 | vNext+1 | BACKLOG | Application database bundle format | Needs ADR/spec | Makes DecentDB a portable app artifact, support bundle, and sharable dataset format |
 | 6 | vNext+1 | BACKLOG | Built-in observability and `sys.*` virtual tables | Needs ADR/spec; doctor v1 is foundation | Complements doctor and makes operational state queryable |
@@ -89,7 +89,7 @@ The remaining roadmap should support one clear lane:
 
 **Status:** `TODO`  
 **Future Version:** vNext  
-**Source of truth:** [`WIN01_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md`](WIN01_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md), ADR 0147, ADR 0148, ADR 0149
+**Source of truth:** [`WIN01_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md`](WIN01_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md), ADR 0147, ADR 0148, ADR 0149, ADR 0150
 
 ### Why This Is First
 
@@ -103,7 +103,7 @@ semantics as an engine capability.
 
 ### Completed Foundation
 
-Slices 1-4 are complete:
+Slices 1-5 are complete:
 
 - replica identity
 - sync enablement metadata
@@ -123,20 +123,22 @@ Slices 1-4 are complete:
 - handshake/capability checks, retry behavior, and session inspection
 - scoped sync catalogs, peer bindings, SQL inspection views, and CLI commands
 - validated deterministic row filters and scoped batch high-watermarks
+- conflict policy configuration and deterministic v1 policy execution
+- manual conflict show, resolve, reopen, and all-conflict inspection workflows
+- structured conflict payload/resolution fields and compatible table upgrades
 
 ### Next Implementable Slice
 
-The remaining sync work now moves to Slice 5 conflict resolution workflows:
+The remaining sync work now moves to Slice 6 doctor, retention, and operational hardening:
 
-- conflict policy configuration
-- manual conflict inspection and resolution
-- structured conflict payload storage
-- conflict workflow diagnostics and tests
+- sync doctor coverage beyond journal integrity
+- retention/pruning ergonomics and safety modes
+- backlog and watermark lag reporting
+- schema drift and compatibility warnings
 
 ### Later Slices
 
 - manual exchange hardening beyond the Slice 3 transport foundation
-- conflict resolution workflows and policies
 - retention ergonomics, crash-hardened prune rewrites, and deeper sync doctor checks
 - SDK polish, beginning with .NET
 

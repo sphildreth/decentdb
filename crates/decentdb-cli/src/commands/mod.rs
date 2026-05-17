@@ -13,8 +13,8 @@ use decentdb::{
     evict_shared_wal, render_markdown, run_doctor, BulkLoadOptions, Db, DbConfig, DoctorCategory,
     DoctorCheckSelection, DoctorIndexVerification, DoctorOptions, DoctorPathMode, DoctorReport,
     DoctorSeverity, HeaderInfo, IndexVerification, QueryResult, StorageInfo, SyncChangeBatch,
-    SyncConflict, SyncHandshake, SyncImportSummary, SyncPeer, SyncPeerScopeBinding,
-    SyncRunDirection, SyncRunSummary, SyncScope, TableInfo, Value,
+    SyncConflict, SyncConflictPolicy, SyncHandshake, SyncImportSummary, SyncPeer,
+    SyncPeerScopeBinding, SyncRunDirection, SyncRunSummary, SyncScope, TableInfo, Value,
 };
 
 use crate::output::{
@@ -351,6 +351,9 @@ pub enum SyncCommand {
     Import(SyncImportCommand),
     /// Inspect unresolved sync conflicts
     Conflicts(SyncConflictsCommand),
+    /// Inspect and resolve sync conflicts
+    #[command(subcommand)]
+    Conflict(SyncConflictCommand),
     /// Prune local sync journal records through a sequence
     Prune(SyncPruneCommand),
     /// Manage sync peers
@@ -441,8 +444,101 @@ pub struct SyncImportCommand {
 pub struct SyncConflictsCommand {
     #[arg(long)]
     pub db: String,
+    #[arg(long, default_value_t = false)]
+    pub all: bool,
     #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
     pub format: OutputFormat,
+}
+
+#[derive(Clone, Debug, Subcommand)]
+pub enum SyncConflictCommand {
+    /// Show a single conflict
+    Show(SyncConflictShowCommand),
+    /// Resolve a conflict
+    Resolve(SyncConflictResolveCommand),
+    /// Reopen a resolved conflict
+    Reopen(SyncConflictReopenCommand),
+    /// Inspect or update the conflict policy
+    #[command(subcommand)]
+    Policy(SyncConflictPolicyCommand),
+}
+
+#[derive(Clone, Debug, Subcommand)]
+pub enum SyncConflictPolicyCommand {
+    /// Show the current conflict policy
+    Get(SyncConflictPolicyGetCommand),
+    /// Update the current conflict policy
+    Set(SyncConflictPolicySetCommand),
+}
+
+#[derive(Clone, Debug, Parser)]
+pub struct SyncConflictShowCommand {
+    #[arg(long)]
+    pub db: String,
+    #[arg(long)]
+    pub id: i64,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
+    pub format: OutputFormat,
+}
+
+#[derive(Clone, Debug, Parser)]
+pub struct SyncConflictResolveCommand {
+    #[arg(long)]
+    pub db: String,
+    #[arg(long)]
+    pub id: i64,
+    #[arg(long, value_enum)]
+    pub action: SyncConflictResolveAction,
+    #[arg(long)]
+    pub by: Option<String>,
+    #[arg(long)]
+    pub note: Option<String>,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
+    pub format: OutputFormat,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum SyncConflictResolveAction {
+    KeepLocal,
+    ApplyRemote,
+}
+
+#[derive(Clone, Debug, Parser)]
+pub struct SyncConflictReopenCommand {
+    #[arg(long)]
+    pub db: String,
+    #[arg(long)]
+    pub id: i64,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
+    pub format: OutputFormat,
+}
+
+#[derive(Clone, Debug, Parser)]
+pub struct SyncConflictPolicyGetCommand {
+    #[arg(long)]
+    pub db: String,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
+    pub format: OutputFormat,
+}
+
+#[derive(Clone, Debug, Parser)]
+pub struct SyncConflictPolicySetCommand {
+    #[arg(long)]
+    pub db: String,
+    #[arg(long, value_enum)]
+    pub policy: SyncConflictPolicyCli,
+    #[arg(long = "origin-priority")]
+    pub origin_priority: Option<String>,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
+    pub format: OutputFormat,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum SyncConflictPolicyCli {
+    Record,
+    Stop,
+    LastWriterWins,
+    OriginPriority,
 }
 
 #[derive(Clone, Debug, Parser)]
@@ -559,6 +655,8 @@ pub struct SyncRunCommand {
     pub limit: usize,
     #[arg(long, default_value_t = 2)]
     pub retries: usize,
+    #[arg(long = "conflict-policy")]
+    pub conflict_policy: Option<SyncConflictPolicyCli>,
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,
 }
@@ -573,6 +671,8 @@ pub struct SyncServeCommand {
     pub scope: Option<String>,
     #[arg(long = "token-env")]
     pub token_env: Option<String>,
+    #[arg(long = "conflict-policy")]
+    pub conflict_policy: Option<SyncConflictPolicyCli>,
     #[arg(long = "ready-file")]
     pub ready_file: Option<PathBuf>,
     #[arg(long = "max-requests")]
@@ -1295,7 +1395,11 @@ fn run_sync(command: SyncCommand) -> Result<()> {
         }
         SyncCommand::Conflicts(cmd) => {
             let db = open_db(&cmd.db, false, 0, 0)?;
-            let conflicts = db.sync_conflicts()?;
+            let conflicts = if cmd.all {
+                db.sync_conflicts_all()?
+            } else {
+                db.sync_conflicts()?
+            };
             match cmd.format {
                 OutputFormat::Json => {
                     println!("{}", serde_json::to_string_pretty(&conflicts)?);
@@ -1309,6 +1413,15 @@ fn run_sync(command: SyncCommand) -> Result<()> {
             }
             Ok(())
         }
+        SyncCommand::Conflict(cmd) => match cmd {
+            SyncConflictCommand::Show(cmd) => run_sync_conflict_show(cmd),
+            SyncConflictCommand::Resolve(cmd) => run_sync_conflict_resolve(cmd),
+            SyncConflictCommand::Reopen(cmd) => run_sync_conflict_reopen(cmd),
+            SyncConflictCommand::Policy(cmd) => match cmd {
+                SyncConflictPolicyCommand::Get(cmd) => run_sync_conflict_policy_get(cmd),
+                SyncConflictPolicyCommand::Set(cmd) => run_sync_conflict_policy_set(cmd),
+            },
+        },
         SyncCommand::Prune(cmd) => {
             let db = open_db(&cmd.db, false, 0, 0)?;
             let pruned = db.sync_prune_journal_through(cmd.through)?;
@@ -1459,6 +1572,77 @@ fn run_sync_scope_bindings(command: SyncScopeBindingsCommand) -> Result<()> {
     Ok(())
 }
 
+fn run_sync_conflict_show(command: SyncConflictShowCommand) -> Result<()> {
+    let db = open_db(&command.db, false, 0, 0)?;
+    let conflict = db
+        .sync_conflict(command.id)?
+        .ok_or_else(|| anyhow!("sync conflict '{}' not found", command.id))?;
+    print_sync_conflict_output(command.format, &conflict)?;
+    Ok(())
+}
+
+fn run_sync_conflict_resolve(command: SyncConflictResolveCommand) -> Result<()> {
+    let db = open_db(&command.db, true, 0, 0)?;
+    let resolved = match command.action {
+        SyncConflictResolveAction::KeepLocal => db.sync_resolve_conflict_keep_local(
+            command.id,
+            command.by.as_deref(),
+            command.note.as_deref(),
+        )?,
+        SyncConflictResolveAction::ApplyRemote => db.sync_resolve_conflict_apply_remote(
+            command.id,
+            command.by.as_deref(),
+            command.note.as_deref(),
+        )?,
+    };
+    if !resolved {
+        return Err(anyhow!("sync conflict '{}' not found", command.id));
+    }
+    let conflict = db
+        .sync_conflict(command.id)?
+        .ok_or_else(|| anyhow!("sync conflict '{}' not found", command.id))?;
+    print_sync_conflict_output(command.format, &conflict)?;
+    Ok(())
+}
+
+fn run_sync_conflict_reopen(command: SyncConflictReopenCommand) -> Result<()> {
+    let db = open_db(&command.db, true, 0, 0)?;
+    let reopened = db.sync_reopen_conflict(command.id)?;
+    if !reopened {
+        return Err(anyhow!("sync conflict '{}' not found", command.id));
+    }
+    let conflict = db
+        .sync_conflict(command.id)?
+        .ok_or_else(|| anyhow!("sync conflict '{}' not found", command.id))?;
+    print_sync_conflict_output(command.format, &conflict)?;
+    Ok(())
+}
+
+fn run_sync_conflict_policy_get(command: SyncConflictPolicyGetCommand) -> Result<()> {
+    let db = open_db(&command.db, false, 0, 0)?;
+    let policy = db.sync_conflict_policy()?;
+    print_sync_conflict_policy_output(command.format, &policy)?;
+    Ok(())
+}
+
+fn run_sync_conflict_policy_set(command: SyncConflictPolicySetCommand) -> Result<()> {
+    let db = open_db(&command.db, true, 0, 0)?;
+    let policy = sync_policy_from_cli(command.policy);
+    let origin_priority = command
+        .origin_priority
+        .as_deref()
+        .map(split_scope_tables)
+        .unwrap_or_default();
+    let origin_priority_refs = origin_priority
+        .iter()
+        .map(|value| value.as_str())
+        .collect::<Vec<_>>();
+    db.sync_set_conflict_policy(policy.clone(), &origin_priority_refs)?;
+    let config = db.sync_conflict_policy()?;
+    print_sync_conflict_policy_output(command.format, &config)?;
+    Ok(())
+}
+
 fn run_sync_run(command: SyncRunCommand) -> Result<()> {
     let db = open_db(&command.db, false, 0, 0)?;
     let peer = db
@@ -1467,6 +1651,7 @@ fn run_sync_run(command: SyncRunCommand) -> Result<()> {
     let local_scope = db.sync_peer_scope_definition(&peer.name)?;
     let direction = SyncRunDirection::from_str(&command.direction)?;
     let token = resolve_sync_peer_token(&peer)?;
+    let conflict_policy = command.conflict_policy.map(sync_policy_from_cli);
     let session_id = db.sync_start_session(&peer.name, direction.clone(), None)?;
 
     let mut attempt = 0usize;
@@ -1478,6 +1663,7 @@ fn run_sync_run(command: SyncRunCommand) -> Result<()> {
             token.as_deref(),
             direction.clone(),
             command.limit,
+            conflict_policy.clone(),
         ) {
             Ok(mut summary) => {
                 summary.retry_count = attempt;
@@ -1520,10 +1706,17 @@ fn run_sync_serve(command: SyncServeCommand) -> Result<()> {
         ),
         None => None,
     };
+    let conflict_policy = command.conflict_policy.map(sync_policy_from_cli);
 
     for (handled, incoming) in listener.incoming().enumerate() {
         let stream = incoming?;
-        handle_sync_connection(&db, stream, auth_token.as_deref(), scope.as_deref())?;
+        handle_sync_connection(
+            &db,
+            stream,
+            auth_token.as_deref(),
+            scope.as_deref(),
+            conflict_policy.clone(),
+        )?;
         if command.max_requests.is_some_and(|max| handled + 1 >= max) {
             break;
         }
@@ -1539,6 +1732,7 @@ fn perform_sync_run_once(
     token: Option<&str>,
     direction: SyncRunDirection,
     limit: usize,
+    conflict_policy: Option<SyncConflictPolicy>,
 ) -> std::result::Result<SyncRunSummary, SyncRunFailure> {
     let handshake = sync_http_get_handshake(&peer.endpoint, token).map_err(|error| {
         SyncRunFailure::retryable(empty_sync_summary(peer, direction.clone()), error.message)
@@ -1587,16 +1781,14 @@ fn perform_sync_run_once(
             )?;
         }
         SyncRunDirection::Pull => {
-            sync_run_pull_phase(
-                db,
-                peer,
+            let pull_phase = SyncRunPullPhase {
                 local_scope,
                 token,
                 limit,
-                &handshake,
-                &mut summary,
-            )
-            .map_err(|error| {
+                handshake: &handshake,
+                conflict_policy: conflict_policy.clone(),
+            };
+            sync_run_pull_phase(db, peer, pull_phase, &mut summary).map_err(|error| {
                 SyncRunFailure::with_summary(summary.clone(), error.message, error.retryable)
             })?;
         }
@@ -1606,16 +1798,14 @@ fn perform_sync_run_once(
                     SyncRunFailure::with_summary(summary.clone(), error.message, error.retryable)
                 },
             )?;
-            sync_run_pull_phase(
-                db,
-                peer,
+            let pull_phase = SyncRunPullPhase {
                 local_scope,
                 token,
                 limit,
-                &handshake,
-                &mut summary,
-            )
-            .map_err(|error| {
+                handshake: &handshake,
+                conflict_policy: conflict_policy.clone(),
+            };
+            sync_run_pull_phase(db, peer, pull_phase, &mut summary).map_err(|error| {
                 SyncRunFailure::with_summary(summary.clone(), error.message, error.retryable)
             })?;
         }
@@ -1654,30 +1844,45 @@ fn sync_run_push_phase(
     Ok(())
 }
 
+struct SyncRunPullPhase<'a> {
+    local_scope: Option<&'a SyncScope>,
+    token: Option<&'a str>,
+    limit: usize,
+    handshake: &'a SyncHandshake,
+    conflict_policy: Option<SyncConflictPolicy>,
+}
+
 fn sync_run_pull_phase(
     db: &Db,
     peer: &SyncPeer,
-    local_scope: Option<&SyncScope>,
-    token: Option<&str>,
-    limit: usize,
-    handshake: &SyncHandshake,
+    phase: SyncRunPullPhase<'_>,
     summary: &mut SyncRunSummary,
 ) -> std::result::Result<(), SyncRunPhaseError> {
-    let remote_replica_id = handshake.replica_id.as_deref().ok_or_else(|| {
+    let remote_replica_id = phase.handshake.replica_id.as_deref().ok_or_else(|| {
         SyncRunPhaseError::fatal("peer hello response is missing replica_id".to_string())
     })?;
     let since = db
         .sync_peer_watermark(remote_replica_id)
         .map_err(|error| SyncRunPhaseError::fatal(error.to_string()))?
         .unwrap_or(0);
-    let batch = sync_http_get_changes(&peer.endpoint, token, since, limit)
+    let batch = sync_http_get_changes(&peer.endpoint, phase.token, since, phase.limit)
         .map_err(|error| SyncRunPhaseError::new(error.message, error.retryable))?;
-    let local_summary = if let Some(scope) = local_scope {
-        db.sync_import_batch_for_scope(&scope.name, &batch)
-            .map_err(|error| SyncRunPhaseError::fatal(error.to_string()))?
+    let local_summary = if let Some(scope) = phase.local_scope {
+        if let Some(policy) = phase.conflict_policy {
+            db.sync_import_batch_for_scope_with_policy(&scope.name, &batch, policy)
+                .map_err(|error| SyncRunPhaseError::fatal(error.to_string()))?
+        } else {
+            db.sync_import_batch_for_scope(&scope.name, &batch)
+                .map_err(|error| SyncRunPhaseError::fatal(error.to_string()))?
+        }
     } else {
-        db.sync_import_batch(&batch)
-            .map_err(|error| SyncRunPhaseError::fatal(error.to_string()))?
+        if let Some(policy) = phase.conflict_policy {
+            db.sync_import_batch_with_policy(&batch, policy)
+                .map_err(|error| SyncRunPhaseError::fatal(error.to_string()))?
+        } else {
+            db.sync_import_batch(&batch)
+                .map_err(|error| SyncRunPhaseError::fatal(error.to_string()))?
+        }
     };
     summary.pulled_batch_id = Some(batch.batch_id);
     summary.pulled = Some(local_summary);
@@ -2161,6 +2366,7 @@ fn handle_sync_connection(
     stream: TcpStream,
     expected_token: Option<&str>,
     scope: Option<&str>,
+    conflict_policy: Option<SyncConflictPolicy>,
 ) -> Result<()> {
     let mut reader = BufReader::new(stream);
     let mut request_line = String::new();
@@ -2233,20 +2439,34 @@ fn handle_sync_connection(
         ("GET", "/decentdb/sync/v1/changes") => {
             let since = parse_sync_query_param_u64(query, "since")?;
             let limit = parse_sync_query_param_usize(query, "limit")?;
-            Ok(serde_json::to_value(if let Some(scope_name) = scope {
-                db.sync_export_batch_for_scope(scope_name, since, limit)?
+            let batch = if let Some(scope_name) = scope {
+                db.sync_export_batch_for_scope(scope_name, since, limit)
             } else {
-                db.sync_export_batch(since, limit)?
-            })?)
+                db.sync_export_batch(since, limit)
+            };
+            batch
+                .map_err(|error| anyhow!(error.to_string()))
+                .and_then(|batch| serde_json::to_value(batch).map_err(Into::into))
         }
         ("POST", "/decentdb/sync/v1/import") => {
             let batch: SyncChangeBatch = serde_json::from_slice(&body)
                 .map_err(|error| anyhow!("invalid sync batch payload: {error}"))?;
-            Ok(serde_json::to_value(if let Some(scope_name) = scope {
-                db.sync_import_batch_for_scope(scope_name, &batch)?
+            let summary = if let Some(scope_name) = scope {
+                if let Some(policy) = conflict_policy {
+                    db.sync_import_batch_for_scope_with_policy(scope_name, &batch, policy)
+                } else {
+                    db.sync_import_batch_for_scope(scope_name, &batch)
+                }
             } else {
-                db.sync_import_batch(&batch)?
-            })?)
+                if let Some(policy) = conflict_policy {
+                    db.sync_import_batch_with_policy(&batch, policy)
+                } else {
+                    db.sync_import_batch(&batch)
+                }
+            };
+            summary
+                .map_err(|error| anyhow!(error.to_string()))
+                .and_then(|summary| serde_json::to_value(summary).map_err(Into::into))
         }
         ("GET", "/decentdb/sync/v1/conflicts") => Ok(serde_json::to_value(db.sync_conflicts()?)?),
         _ => {
@@ -2329,43 +2549,91 @@ fn print_sync_conflicts_table(conflicts: &[SyncConflict]) {
         .map(|conflict| {
             vec![
                 conflict.conflict_id.to_string(),
-                conflict.batch_id.clone(),
-                conflict.remote_replica_id.clone(),
-                conflict.remote_sequence.to_string(),
                 conflict.table_name.clone(),
                 conflict.operation.clone(),
+                if conflict.resolved {
+                    "resolved".to_string()
+                } else {
+                    "open".to_string()
+                },
                 conflict.conflict_type.clone(),
-                conflict.message.clone(),
-                conflict.primary_key_json.to_string(),
-                conflict.remote_record_json.to_string(),
                 conflict
-                    .local_row_json
-                    .as_ref()
-                    .map_or_else(|| "-".to_string(), |value| value.to_string()),
-                conflict.created_at_micros.to_string(),
-                conflict.resolved.to_string(),
+                    .resolution
+                    .clone()
+                    .unwrap_or_else(|| "-".to_string()),
+                conflict.message.clone(),
             ]
         })
         .collect::<Vec<_>>();
     let columns = vec![
         "conflict_id".to_string(),
-        "batch_id".to_string(),
-        "remote_replica_id".to_string(),
-        "remote_sequence".to_string(),
         "table_name".to_string(),
         "operation".to_string(),
+        "status".to_string(),
         "conflict_type".to_string(),
+        "resolution".to_string(),
         "message".to_string(),
-        "primary_key_json".to_string(),
-        "remote_record_json".to_string(),
-        "local_row_json".to_string(),
-        "created_at_micros".to_string(),
-        "resolved".to_string(),
     ];
     println!(
         "{}",
         render_rows(OutputFormat::Table, &columns, &rows, true)
     );
+}
+
+fn print_sync_conflict_output(format: OutputFormat, conflict: &SyncConflict) -> Result<()> {
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(conflict)?);
+        }
+        OutputFormat::Table => {
+            print_sync_conflicts_table(std::slice::from_ref(conflict));
+        }
+        _ => {
+            return Err(anyhow!(
+                "sync conflict output supports only json or table output"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn print_sync_conflict_policy_output(
+    format: OutputFormat,
+    policy: &decentdb::SyncConflictPolicyConfig,
+) -> Result<()> {
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(policy)?);
+        }
+        OutputFormat::Table => {
+            let rows = vec![
+                (
+                    "default_policy".to_string(),
+                    policy.default_policy.to_string(),
+                ),
+                (
+                    "origin_priority_json".to_string(),
+                    serde_json::to_string(&policy.origin_priority)?,
+                ),
+            ];
+            println!("{}", render_key_value_rows(format, &rows));
+        }
+        _ => {
+            return Err(anyhow!(
+                "sync conflict policy output supports only json or table output"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn sync_policy_from_cli(policy: SyncConflictPolicyCli) -> SyncConflictPolicy {
+    match policy {
+        SyncConflictPolicyCli::Record => SyncConflictPolicy::Record,
+        SyncConflictPolicyCli::Stop => SyncConflictPolicy::Stop,
+        SyncConflictPolicyCli::LastWriterWins => SyncConflictPolicy::LastWriterWins,
+        SyncConflictPolicyCli::OriginPriority => SyncConflictPolicy::OriginPriority,
+    }
 }
 
 fn print_sync_integrity_report_table(report: &decentdb::SyncJournalIntegrityReport) {

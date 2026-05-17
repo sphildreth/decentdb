@@ -280,10 +280,11 @@ pub enum SyncRunDirection {
     Both,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SyncConflictPolicy {
     #[serde(alias = "record")]
+    #[default]
     Record,
     #[serde(alias = "stop")]
     Stop,
@@ -324,12 +325,6 @@ impl FromStr for SyncConflictPolicy {
                 "unsupported sync conflict policy '{other}'"
             ))),
         }
-    }
-}
-
-impl Default for SyncConflictPolicy {
-    fn default() -> Self {
-        Self::Record
     }
 }
 
@@ -1507,7 +1502,8 @@ mod tests {
     use std::sync::{Mutex, OnceLock};
 
     use super::{
-        SyncChangeBatch, SyncImportSummary, SyncJournalRecord, SyncRunDirection, SyncRunSummary,
+        SyncChangeBatch, SyncConflictPolicy, SyncImportSummary, SyncJournalRecord,
+        SyncRunDirection, SyncRunSummary,
     };
     use crate::Db;
     use crate::SyncDoctorSeverity;
@@ -1533,6 +1529,40 @@ mod tests {
         db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
             .unwrap();
         (dir, db)
+    }
+
+    fn conflicting_insert_fixture() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        Db,
+        Db,
+        SyncChangeBatch,
+    ) {
+        let (dir_src, db_src) = temp_db();
+        let (dir_dst, db_dst) = temp_db();
+        db_src.sync_init_replica("node-a").unwrap();
+        db_src
+            .execute("INSERT INTO users VALUES (1, 'alice')")
+            .unwrap();
+        db_dst.sync_init_replica("node-b").unwrap();
+        db_dst
+            .execute("INSERT INTO users VALUES (1, 'existing')")
+            .unwrap();
+        let batch = db_src.sync_export_batch(0, 100).unwrap();
+        (dir_src, dir_dst, db_src, db_dst, batch)
+    }
+
+    fn users_rows(db: &Db) -> Vec<(i64, String)> {
+        let rows = db
+            .execute("SELECT id, name FROM users ORDER BY id")
+            .unwrap();
+        rows.rows()
+            .iter()
+            .map(|row| match row.values() {
+                [Value::Int64(id), Value::Text(name)] => (*id, name.clone()),
+                other => panic!("unexpected row values: {:?}", other),
+            })
+            .collect()
     }
 
     fn scoped_temp_db() -> (tempfile::TempDir, Db) {
@@ -2093,8 +2123,246 @@ mod tests {
 
         let conflicts = db_b.sync_conflicts().unwrap();
         assert_eq!(conflicts.len(), 1);
-        assert_eq!(conflicts[0].conflict_type, "constraint_error");
+        assert_eq!(conflicts[0].conflict_type, "insert_insert");
+        assert!(conflicts[0].local_row_json.is_some());
         assert!(!conflicts[0].message.is_empty());
+    }
+
+    #[test]
+    fn sync_conflict_workflows_support_manual_resolution_and_reopen() {
+        let (_dir_src, _dir_dst, _db_src, db_dst, batch) = conflicting_insert_fixture();
+        let summary = db_dst.sync_import_batch(&batch).unwrap();
+        assert_eq!(summary.conflicted, 1);
+        assert_eq!(users_rows(&db_dst), vec![(1, "existing".to_string())]);
+
+        let conflict = db_dst.sync_conflict(1).unwrap().expect("conflict");
+        assert!(conflict.local_row_json.is_some());
+        assert!(conflict.remote_record_json.is_object());
+        assert_eq!(conflict.resolution, None);
+
+        let pending_before = db_dst.sync_pending_changes(0, 100).unwrap().len();
+        assert!(db_dst
+            .sync_resolve_conflict_keep_local(1, Some("tester"), Some("keep local"))
+            .unwrap());
+        let kept = db_dst.sync_conflict(1).unwrap().expect("conflict");
+        assert!(kept.resolved);
+        assert_eq!(kept.resolution.as_deref(), Some("keep_local"));
+        assert_eq!(kept.resolved_by.as_deref(), Some("tester"));
+        assert_eq!(users_rows(&db_dst), vec![(1, "existing".to_string())]);
+
+        assert!(db_dst.sync_reopen_conflict(1).unwrap());
+        assert_eq!(db_dst.sync_conflicts().unwrap().len(), 1);
+
+        assert!(db_dst
+            .sync_resolve_conflict_apply_remote(1, Some("tester"), Some("apply remote"))
+            .unwrap());
+        let applied = db_dst.sync_conflict(1).unwrap().expect("conflict");
+        assert!(applied.resolved);
+        assert_eq!(applied.resolution.as_deref(), Some("apply_remote"));
+        assert_eq!(users_rows(&db_dst), vec![(1, "alice".to_string())]);
+        assert_eq!(
+            db_dst.sync_pending_changes(0, 100).unwrap().len(),
+            pending_before
+        );
+        assert!(db_dst.sync_conflicts().unwrap().is_empty());
+    }
+
+    #[test]
+    fn sync_conflict_policy_round_trip_and_table_upgrade_are_available() {
+        let (_dir, db) = temp_db();
+        db.execute(
+            "CREATE TABLE __decentdb_sync_conflicts (conflict_id INT64 PRIMARY KEY, batch_id TEXT NOT NULL, remote_replica_id TEXT NOT NULL, remote_sequence INT64 NOT NULL, table_name TEXT NOT NULL, operation TEXT NOT NULL, conflict_type TEXT NOT NULL, message TEXT NOT NULL, primary_key_json TEXT NOT NULL, remote_record_json TEXT NOT NULL, local_row_json TEXT, created_at_micros INT64 NOT NULL, resolved INT64 NOT NULL)",
+        )
+        .unwrap();
+
+        db.sync_set_conflict_policy(SyncConflictPolicy::OriginPriority, &["node-b", "node-a"])
+            .unwrap();
+
+        let columns = db
+            .execute("PRAGMA table_info(__decentdb_sync_conflicts)")
+            .unwrap();
+        let names = columns
+            .rows()
+            .iter()
+            .map(|row| match row.values().get(1) {
+                Some(Value::Text(name)) => name.clone(),
+                other => panic!("unexpected pragma row: {:?}", other),
+            })
+            .collect::<Vec<_>>();
+        for expected in [
+            "resolution",
+            "resolved_at_micros",
+            "resolved_by",
+            "resolution_note",
+            "policy_name",
+            "local_record_json",
+        ] {
+            assert!(
+                names.iter().any(|name| name == expected),
+                "missing {expected}"
+            );
+        }
+
+        let config = db.sync_conflict_policy().unwrap();
+        assert_eq!(config.default_policy, SyncConflictPolicy::OriginPriority);
+        assert_eq!(
+            config.origin_priority,
+            vec!["node-b".to_string(), "node-a".to_string()]
+        );
+
+        let policy_view = db
+            .execute("SELECT * FROM sys_sync_conflict_policy")
+            .unwrap();
+        assert_eq!(
+            policy_view.columns(),
+            &["default_policy", "origin_priority_json"]
+        );
+        assert_eq!(
+            policy_view.rows()[0].values(),
+            &[
+                Value::Text("origin_priority".to_string()),
+                Value::Text("[\"node-b\",\"node-a\"]".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn sync_import_stop_last_writer_wins_and_origin_priority_behaviors_are_deterministic() {
+        let (_dir_src, db_src) = temp_db();
+        db_src.sync_init_replica("node-a").unwrap();
+        db_src
+            .execute("INSERT INTO users VALUES (1, 'alice')")
+            .unwrap();
+        db_src
+            .execute("INSERT INTO users VALUES (2, 'bob')")
+            .unwrap();
+        let batch = db_src.sync_export_batch(0, 100).unwrap();
+
+        let (_dir_dst, db_dst) = temp_db();
+        db_dst.sync_init_replica("node-b").unwrap();
+        db_dst
+            .execute("INSERT INTO users VALUES (1, 'existing')")
+            .unwrap();
+
+        let stop_err = db_dst
+            .sync_import_batch_with_policy(&batch, SyncConflictPolicy::Stop)
+            .expect_err("stop policy should fail on conflict");
+        assert!(stop_err.to_string().contains("stopped on conflict"));
+        assert_eq!(users_rows(&db_dst), vec![(1, "existing".to_string())]);
+        assert_eq!(db_dst.sync_conflicts().unwrap().len(), 1);
+
+        let (_dir_lww, lww_db) = temp_db();
+        lww_db.sync_init_replica("node-b").unwrap();
+        lww_db
+            .execute("INSERT INTO users VALUES (1, 'existing')")
+            .unwrap();
+        let lww_summary = lww_db
+            .sync_import_batch_with_policy(&batch, SyncConflictPolicy::LastWriterWins)
+            .unwrap();
+        assert_eq!(lww_summary.applied, 2);
+        assert_eq!(lww_summary.conflicted, 1);
+        assert_eq!(
+            users_rows(&lww_db),
+            vec![(1, "alice".to_string()), (2, "bob".to_string())]
+        );
+        let lww_conflicts = lww_db.sync_conflicts_all().unwrap();
+        assert_eq!(lww_conflicts.len(), 1);
+        assert!(lww_conflicts[0].resolved);
+        assert_eq!(
+            lww_conflicts[0].resolution.as_deref(),
+            Some("remote_applied")
+        );
+
+        let (_dir_origin_remote, origin_remote_db) = temp_db();
+        origin_remote_db.sync_init_replica("node-b").unwrap();
+        origin_remote_db
+            .execute("INSERT INTO users VALUES (1, 'existing')")
+            .unwrap();
+        origin_remote_db
+            .sync_set_conflict_policy(SyncConflictPolicy::OriginPriority, &["node-a", "node-b"])
+            .unwrap();
+        let origin_remote_summary = origin_remote_db
+            .sync_import_batch_with_policy(&batch, SyncConflictPolicy::OriginPriority)
+            .unwrap();
+        assert_eq!(origin_remote_summary.conflicted, 1);
+        assert_eq!(
+            users_rows(&origin_remote_db),
+            vec![(1, "alice".to_string()), (2, "bob".to_string())]
+        );
+
+        let (_dir_origin_local, origin_local_db) = temp_db();
+        origin_local_db.sync_init_replica("node-b").unwrap();
+        origin_local_db
+            .execute("INSERT INTO users VALUES (1, 'existing')")
+            .unwrap();
+        origin_local_db
+            .sync_set_conflict_policy(SyncConflictPolicy::OriginPriority, &["node-b", "node-a"])
+            .unwrap();
+        let origin_local_summary = origin_local_db
+            .sync_import_batch_with_policy(&batch, SyncConflictPolicy::OriginPriority)
+            .unwrap();
+        assert_eq!(origin_local_summary.conflicted, 1);
+        assert_eq!(
+            users_rows(&origin_local_db),
+            vec![(1, "existing".to_string()), (2, "bob".to_string())]
+        );
+        assert_eq!(origin_local_db.sync_conflicts().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn sync_import_fk_constraint_conflicts_are_classified_as_delete_update() {
+        let dir = tempfile::TempDir::with_prefix("decentdb-sync-fk").unwrap();
+        let path = dir.path().join("test.ddb");
+        let db = Db::create(&path, crate::config::DbConfig::default()).unwrap();
+        db.execute("CREATE TABLE parents (id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+        db.execute(
+            "CREATE TABLE children (id INTEGER PRIMARY KEY, parent_id INTEGER NOT NULL REFERENCES parents(id), name TEXT)",
+        )
+        .unwrap();
+        db.sync_init_replica("node-b").unwrap();
+        db.execute("INSERT INTO parents VALUES (1, 'parent')")
+            .unwrap();
+        db.execute("INSERT INTO children VALUES (1, 1, 'child')")
+            .unwrap();
+
+        let source_dir = tempfile::TempDir::with_prefix("decentdb-sync-fk-src").unwrap();
+        let source_path = source_dir.path().join("test.ddb");
+        let source = Db::create(&source_path, crate::config::DbConfig::default()).unwrap();
+        source
+            .execute("CREATE TABLE parents (id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+        source
+            .execute(
+                "CREATE TABLE children (id INTEGER PRIMARY KEY, parent_id INTEGER NOT NULL REFERENCES parents(id), name TEXT)",
+            )
+            .unwrap();
+        source.sync_init_replica("node-a").unwrap();
+        source
+            .execute("INSERT INTO parents VALUES (1, 'parent')")
+            .unwrap();
+        let mut delete_record = source.sync_export_batch(0, 1).unwrap().records[0].clone();
+        delete_record.sequence = 2;
+        delete_record.operation = "delete".to_string();
+        delete_record.after = None;
+        let batch = SyncChangeBatch {
+            protocol_version: 1,
+            batch_id: "sync-batch:v1:node-a:2:2:1".to_string(),
+            source_replica_id: Some("node-a".to_string()),
+            first_sequence: Some(2),
+            last_sequence: Some(2),
+            source_high_watermark: None,
+            record_count: 1,
+            records: vec![delete_record],
+        };
+
+        let summary = db
+            .sync_import_batch_with_policy(&batch, SyncConflictPolicy::Record)
+            .unwrap();
+        assert_eq!(summary.conflicted, 1);
+        let conflicts = db.sync_conflicts().unwrap();
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].conflict_type, "delete_update");
     }
 
     #[test]

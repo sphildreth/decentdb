@@ -1,6 +1,6 @@
 # Local-First Sync as a First-Class Capability
 
-**Status:** Active spec — Slice 1 complete, Slice 2 complete, and Slice 3 complete (2026-05-17); later slices remain TODO
+**Status:** Active spec — Slices 1-5 complete (2026-05-17); later slices remain TODO
 **Project:** DecentDB  
 **Document Type:** Implementation SPEC  
 **Audience:** Core engine developers, storage/replication implementers, SDK maintainers, CLI maintainers, documentation authors, coding agents  
@@ -1291,6 +1291,20 @@ Complete (2026-05-17).
 ### Objectives
 
 Move from recording conflicts to managing them usefully.
+
+### Status
+
+Complete (2026-05-17).
+
+### Implementation Notes
+
+- Conflict records now include workflow metadata for resolution, resolver, notes, policy name, and local record JSON.
+- Existing conflict tables are upgraded in place with compatible nullable columns.
+- Engine APIs support conflict policy get/set, single-conflict lookup, keep-local resolution, apply-remote resolution, reopen, unresolved listing, and all-conflict listing.
+- v1 policies are `record`, `stop`, `last_writer_wins`, and `origin_priority`; record-and-continue remains the safe default.
+- CLI commands cover conflict show/resolve/reopen/policy operations, and `sync run` / `sync serve` accept conflict policy overrides.
+- SQL inspection includes `sys_sync_conflicts` with the extended schema and `sys_sync_conflict_policy`.
+- Future work remains for richer causality-aware policies, custom merge handlers, and per-table/per-scope conflict policies.
 
 ### Tasks
 

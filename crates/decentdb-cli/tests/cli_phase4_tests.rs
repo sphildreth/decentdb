@@ -565,7 +565,7 @@ fn sync_conflicts_command_displays_json_and_table() {
     ]);
 
     let conflicts_json = run(&["sync", "conflicts", "--db", &target_str, "--format", "json"]);
-    assert!(conflicts_json.contains("\"conflict_type\": \"constraint_error\""));
+    assert!(conflicts_json.contains("\"conflict_type\": \"insert_insert\""));
     assert!(conflicts_json.contains("\"batch_id\": \"sync-batch:v1:node-a:1:1:1\""));
 
     let conflicts_table = run(&[
@@ -576,8 +576,7 @@ fn sync_conflicts_command_displays_json_and_table() {
         "--format",
         "table",
     ]);
-    assert!(conflicts_table.contains("constraint_error"));
-    assert!(conflicts_table.contains("sync-batch:v1:node-a:1:1:1"));
+    assert!(conflicts_table.contains("insert_insert"));
 }
 
 #[test]

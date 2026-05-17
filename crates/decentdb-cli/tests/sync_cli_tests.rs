@@ -168,6 +168,16 @@ fn spawn_sync_serve_scoped(
     scope: Option<&str>,
     token_env: Option<(&str, &str)>,
 ) -> (ChildGuard, String) {
+    spawn_sync_serve_scoped_with_policy(db, max_requests, scope, token_env, None)
+}
+
+fn spawn_sync_serve_scoped_with_policy(
+    db: &Path,
+    max_requests: usize,
+    scope: Option<&str>,
+    token_env: Option<(&str, &str)>,
+    conflict_policy: Option<&str>,
+) -> (ChildGuard, String) {
     let ready_file = db.with_extension("ready");
     let mut command = Command::new(bin());
     command.args([
@@ -189,6 +199,9 @@ fn spawn_sync_serve_scoped(
         command.env(env_name, env_value);
         command.args(["--token-env", env_name]);
     }
+    if let Some(policy) = conflict_policy {
+        command.args(["--conflict-policy", policy]);
+    }
     let child = command
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -197,6 +210,16 @@ fn spawn_sync_serve_scoped(
 
     let addr = wait_for_ready_file(&ready_file);
     (ChildGuard(child), addr)
+}
+
+fn journal_line_count(path: &Path) -> usize {
+    match fs::read_to_string(path) {
+        Ok(content) => content
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count(),
+        Err(_) => 0,
+    }
 }
 
 fn wait_for_ready_file(path: &Path) -> String {
@@ -412,6 +435,257 @@ fn sync_run_both_round_trips_changes_and_remains_incremental() {
         sessions.rows()[1].values()[6],
         decentdb::Value::Text("success".to_string())
     );
+}
+
+#[test]
+fn sync_conflict_cli_commands_support_show_resolve_reopen_and_all() {
+    let dir = temp_dir("decentdb-sync-conflict-cli");
+    let local = dir.join("local.ddb");
+    let remote = dir.join("remote.ddb");
+    setup_sync_db(&local, "local-a", &[(1, "alice"), (2, "bravo")]);
+    setup_sync_db(
+        &remote,
+        "remote-b",
+        &[(1, "remote-alice"), (2, "remote-bravo")],
+    );
+
+    let (_server, addr) = spawn_sync_serve(&remote, 10);
+    let local_str = local.display().to_string();
+    run(&[
+        "sync",
+        "peer",
+        "add",
+        "--db",
+        &local_str,
+        "--name",
+        "remote",
+        "--endpoint",
+        &format!("http://{addr}"),
+        "--format",
+        "json",
+    ]);
+
+    let sync = run(&[
+        "sync",
+        "run",
+        "--db",
+        &local_str,
+        "--peer",
+        "remote",
+        "--direction",
+        "pull",
+        "--format",
+        "json",
+    ]);
+    let sync_json: serde_json::Value = serde_json::from_str(&sync).expect("json");
+    assert_eq!(sync_json["direction"], "pull");
+    assert_eq!(sync_json["pulled"]["seen"], 2);
+    assert_eq!(sync_json["pulled"]["conflicted"], 2);
+
+    let all_before = run(&[
+        "sync",
+        "conflicts",
+        "--db",
+        &local_str,
+        "--all",
+        "--format",
+        "json",
+    ]);
+    let all_before_json: serde_json::Value = serde_json::from_str(&all_before).expect("json");
+    let all_before_rows = all_before_json.as_array().expect("array");
+    assert_eq!(all_before_rows.len(), 2);
+    assert!(all_before_rows.iter().all(|row| row["resolved"] == false));
+
+    let show = run(&[
+        "sync", "conflict", "show", "--db", &local_str, "--id", "1", "--format", "json",
+    ]);
+    let show_json: serde_json::Value = serde_json::from_str(&show).expect("json");
+    assert!(show_json["remote_record_json"].is_object());
+    assert_eq!(show_json["local_record_json"], show_json["local_row_json"]);
+    assert_eq!(show_json["resolved"], false);
+
+    let keep_local = run(&[
+        "sync",
+        "conflict",
+        "resolve",
+        "--db",
+        &local_str,
+        "--id",
+        "1",
+        "--action",
+        "keep-local",
+        "--by",
+        "cli",
+        "--note",
+        "keep local",
+        "--format",
+        "json",
+    ]);
+    let keep_local_json: serde_json::Value = serde_json::from_str(&keep_local).expect("json");
+    assert_eq!(keep_local_json["resolution"], "keep_local");
+    assert_eq!(keep_local_json["resolved_by"], "cli");
+    assert_eq!(
+        query_users(&local),
+        vec![(1, "alice".to_string()), (2, "bravo".to_string())]
+    );
+
+    let unresolved = run(&["sync", "conflicts", "--db", &local_str, "--format", "json"]);
+    let unresolved_json: serde_json::Value = serde_json::from_str(&unresolved).expect("json");
+    let unresolved_rows = unresolved_json.as_array().expect("array");
+    assert_eq!(unresolved_rows.len(), 1);
+    assert_eq!(unresolved_rows[0]["conflict_id"], 2);
+
+    let reopened = run(&[
+        "sync", "conflict", "reopen", "--db", &local_str, "--id", "1", "--format", "json",
+    ]);
+    let reopened_json: serde_json::Value = serde_json::from_str(&reopened).expect("json");
+    assert_eq!(reopened_json["resolved"], false);
+
+    let apply_remote = run(&[
+        "sync",
+        "conflict",
+        "resolve",
+        "--db",
+        &local_str,
+        "--id",
+        "1",
+        "--action",
+        "apply-remote",
+        "--by",
+        "cli",
+        "--note",
+        "apply remote",
+        "--format",
+        "json",
+    ]);
+    let apply_remote_json: serde_json::Value = serde_json::from_str(&apply_remote).expect("json");
+    assert_eq!(apply_remote_json["resolution"], "apply_remote");
+    assert_eq!(
+        query_users(&local),
+        vec![(1, "remote-alice".to_string()), (2, "bravo".to_string())]
+    );
+    assert_eq!(
+        journal_line_count(&local.with_file_name("local.ddb.sync-journal")),
+        2
+    );
+
+    let all_after = run(&[
+        "sync",
+        "conflicts",
+        "--db",
+        &local_str,
+        "--all",
+        "--format",
+        "table",
+    ]);
+    assert!(all_after.contains("resolved"));
+    assert!(all_after.contains("open"));
+    assert!(all_after.contains("apply_remote"));
+}
+
+#[test]
+fn sync_conflict_policy_cli_round_trips_get_and_set() {
+    let dir = temp_dir("decentdb-sync-conflict-policy-cli");
+    let db = dir.join("policy.ddb");
+    let db_str = db.display().to_string();
+
+    run(&[
+        "exec",
+        "--db",
+        &db_str,
+        "--sql",
+        "CREATE TABLE users (id INT64 PRIMARY KEY, name TEXT);",
+        "--format",
+        "json",
+    ]);
+    run(&["sync", "init", "--db", &db_str, "--replica-id", "local-a"]);
+
+    let set = run(&[
+        "sync",
+        "conflict",
+        "policy",
+        "set",
+        "--db",
+        &db_str,
+        "--policy",
+        "origin-priority",
+        "--origin-priority",
+        "remote-a,local-a",
+        "--format",
+        "json",
+    ]);
+    let set_json: serde_json::Value = serde_json::from_str(&set).expect("json");
+    assert_eq!(set_json["default_policy"], "origin_priority");
+    assert_eq!(
+        set_json["origin_priority"],
+        serde_json::json!(["remote-a", "local-a"])
+    );
+
+    let get = run(&[
+        "sync", "conflict", "policy", "get", "--db", &db_str, "--format", "table",
+    ]);
+    assert!(get.contains("origin_priority"));
+    assert!(get.contains("remote-a"));
+    assert!(get.contains("local-a"));
+}
+
+#[test]
+fn sync_run_respects_server_side_conflict_policy_stop() {
+    let dir = temp_dir("decentdb-sync-conflict-stop-server");
+    let local = dir.join("local.ddb");
+    let remote = dir.join("remote.ddb");
+    setup_sync_db(&local, "local-a", &[(1, "alice")]);
+    setup_sync_db(
+        &remote,
+        "remote-b",
+        &[(1, "remote-alice"), (2, "remote-bravo")],
+    );
+
+    let (_server, addr) =
+        spawn_sync_serve_scoped_with_policy(&remote, 10, None, None, Some("stop"));
+    let local_str = local.display().to_string();
+    run(&[
+        "sync",
+        "peer",
+        "add",
+        "--db",
+        &local_str,
+        "--name",
+        "remote",
+        "--endpoint",
+        &format!("http://{addr}"),
+        "--format",
+        "json",
+    ]);
+
+    let (code, _stdout, stderr) = run_result(
+        &[
+            "sync",
+            "run",
+            "--db",
+            &local_str,
+            "--peer",
+            "remote",
+            "--direction",
+            "push",
+            "--format",
+            "json",
+        ],
+        &[],
+    );
+    assert_ne!(code, 0);
+    assert!(stderr.contains("stopped on conflict") || stderr.contains("conflict"));
+    assert_eq!(
+        query_users(&remote),
+        vec![
+            (1, "remote-alice".to_string()),
+            (2, "remote-bravo".to_string())
+        ]
+    );
+    let remote_db = open_db(&remote);
+    let conflicts = remote_db.sync_conflicts().expect("remote conflicts");
+    assert_eq!(conflicts.len(), 1);
+    assert_eq!(conflicts[0].conflict_type, "insert_insert");
 }
 
 #[test]
