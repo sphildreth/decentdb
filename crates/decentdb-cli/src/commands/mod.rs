@@ -82,6 +82,9 @@ pub enum Commands {
     Doctor(DoctorCommand),
     /// Migrate a legacy database format to the current version
     Migrate(MigrateCommand),
+    /// Local-first sync journal management
+    #[command(subcommand)]
+    Sync(SyncCommand),
 }
 
 #[derive(Clone, Debug, Parser)]
@@ -321,6 +324,48 @@ pub struct MigrateCommand {
     pub dest: String,
 }
 
+#[derive(Clone, Debug, Subcommand)]
+pub enum SyncCommand {
+    /// Initialize a replica and enable sync
+    Init(SyncInitCommand),
+    /// Enable sync on a database
+    Enable(DbCommand),
+    /// Disable sync on a database
+    Disable(DbCommand),
+    /// Show sync status
+    Status(SyncStatusCommand),
+    /// List pending sync changes
+    Pending(SyncPendingCommand),
+}
+
+#[derive(Clone, Debug, Parser)]
+pub struct SyncInitCommand {
+    #[arg(long)]
+    pub db: String,
+    #[arg(long)]
+    pub replica_id: String,
+}
+
+#[derive(Clone, Debug, Parser)]
+pub struct SyncStatusCommand {
+    #[arg(long)]
+    pub db: String,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+    pub format: OutputFormat,
+}
+
+#[derive(Clone, Debug, Parser)]
+pub struct SyncPendingCommand {
+    #[arg(long)]
+    pub db: String,
+    #[arg(long, default_value_t = 0)]
+    pub since: u64,
+    #[arg(long, default_value_t = 100)]
+    pub limit: usize,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
+    pub format: OutputFormat,
+}
+
 /// Parsed CLI values for the `--checks` comma-separated list.
 fn parse_checks(raw: &str) -> Result<DoctorCheckSelection, String> {
     if raw.eq_ignore_ascii_case("all") {
@@ -486,6 +531,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         Commands::VerifyHeader(command) => run_verify_header(command)?,
         Commands::VerifyIndex(command) => run_verify_index(command)?,
         Commands::Migrate(command) => run_migrate(command)?,
+        Commands::Sync(command) => run_sync(command)?,
         Commands::Doctor(_) => unreachable!("Doctor is handled in run()"),
     }
     Ok(())
@@ -915,6 +961,87 @@ fn run_migrate(command: MigrateCommand) -> Result<()> {
         decentdb::DB_FORMAT_VERSION,
         command.source
     ))
+}
+
+fn run_sync(command: SyncCommand) -> Result<()> {
+    match command {
+        SyncCommand::Init(cmd) => {
+            let db = open_db(&cmd.db, false, 0, 0)?;
+            db.sync_init_replica(&cmd.replica_id)?;
+            println!("sync initialized (replica: {})", cmd.replica_id);
+            Ok(())
+        }
+        SyncCommand::Enable(cmd) => {
+            let db = open_db(&cmd.db, false, 0, 0)?;
+            db.sync_set_enabled(true)?;
+            println!("sync enabled");
+            Ok(())
+        }
+        SyncCommand::Disable(cmd) => {
+            let db = open_db(&cmd.db, false, 0, 0)?;
+            db.sync_set_enabled(false)?;
+            println!("sync disabled");
+            Ok(())
+        }
+        SyncCommand::Status(cmd) => {
+            let db = open_db(&cmd.db, false, 0, 0)?;
+            let status = db.sync_status()?;
+            match cmd.format {
+                OutputFormat::Json => {
+                    println!("{}", serde_json::to_string_pretty(&status)?);
+                }
+                _ => {
+                    println!("enabled:        {}", status.enabled);
+                    println!(
+                        "replica_id:     {}",
+                        status.replica_id.as_deref().unwrap_or("-")
+                    );
+                    println!("next_sequence:  {}", status.next_sequence);
+                    println!(
+                        "journal_path:   {}",
+                        status.journal_path.as_deref().unwrap_or("-")
+                    );
+                    println!("journal_size:   {} bytes", status.journal_size_bytes);
+                }
+            }
+            Ok(())
+        }
+        SyncCommand::Pending(cmd) => {
+            let db = open_db(&cmd.db, false, 0, 0)?;
+            let records = db.sync_pending_changes(cmd.since, cmd.limit)?;
+            match cmd.format {
+                OutputFormat::Json => {
+                    println!("{}", serde_json::to_string_pretty(&records)?);
+                }
+                _ => {
+                    if records.is_empty() {
+                        println!("no pending changes");
+                    } else {
+                        println!(
+                            "{:>10} | {:>20} | {:>20} | {:>8} | {:<}",
+                            "sequence", "transaction_lsn", "table", "op", "primary_key"
+                        );
+                        println!(
+                            "{:-<10}-|-{:-<20}-|-{:-<20}-|-{:-<8}-|-{:-<}",
+                            "", "", "", "", ""
+                        );
+                        for r in &records {
+                            println!(
+                                "{:>10} | {:>20} | {:>20} | {:>8} | {}",
+                                r.sequence,
+                                r.transaction_lsn,
+                                r.table,
+                                r.operation,
+                                serde_json::to_string(&r.primary_key)?
+                            );
+                        }
+                    }
+                    println!("{} record(s)", records.len());
+                }
+            }
+            Ok(())
+        }
+    }
 }
 
 fn print_storage_info(format: OutputFormat, storage: &StorageInfo) {

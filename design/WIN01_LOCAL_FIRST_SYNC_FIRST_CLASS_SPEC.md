@@ -1,6 +1,6 @@
 # Local-First Sync as a First-Class Capability
 
-**Status:** Proposed  
+**Status:** Active spec — Slice 1 foundation (local journal + metadata catalog) implemented per ADR 0147 (2026-05-17); later slices remain TODO
 **Project:** DecentDB  
 **Document Type:** Implementation SPEC  
 **Audience:** Core engine developers, storage/replication implementers, SDK maintainers, CLI maintainers, documentation authors, coding agents  
@@ -1064,6 +1064,11 @@ This work is large enough that it **must** be implemented in slices.
 
 ## Slice 0 — Foundations and Design Hardening
 
+### Status (2026-05-17)
+
+ADR 0147 created for local-first sync journal foundation. Remaining ADRs (protocol/version
+negotiation, conflict semantics, scoped sync, HTTP transport) deferred to later slices.
+
 ### Objectives
 
 - lock the conceptual model
@@ -1101,6 +1106,20 @@ This work is large enough that it **must** be implemented in slices.
 ---
 
 ## Slice 1 — Local Journal and Metadata Catalog
+
+### Status (2026-05-17)
+
+Slice 1 foundation implemented per ADR 0147:
+- Replica initialization and identity storage (DONE — `Db::sync_init_replica`)
+- Sync enablement flag (DONE — `Db::sync_set_enabled` / `Db::sync_is_enabled`)
+- Sync metadata catalog table `__decentdb_sync_metadata` (DONE — lazily created)
+- Durable journal capture for inserts/updates/deletes (DONE — `<db path>.sync-journal`)
+- Tombstone recording (DONE — operation `"delete"` with `after: null`)
+- Journal sequence numbering (DONE — monotonic u64 per replica)
+- Journal enumeration API (DONE — `Db::sync_pending_changes`)
+- Status view (DONE — `Db::sync_status`)
+- Not yet done: local integrity checks, scoped sync, conflict resolution, peer networking,
+  import/export apply, WASM, binding SDKs. See ADR 0147 for scope details.
 
 ### Objectives
 

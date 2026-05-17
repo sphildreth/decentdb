@@ -24,6 +24,7 @@ mod record;
 mod search;
 mod sql;
 mod storage;
+mod sync;
 mod vfs;
 mod wal;
 
@@ -45,6 +46,7 @@ pub use crate::metadata::{
 };
 pub use crate::record::value::Value;
 pub use crate::storage::DB_FORMAT_VERSION;
+pub use crate::sync::{SyncJournalRecord, SyncStatus};
 
 /// Returns the DecentDB crate version.
 #[must_use]

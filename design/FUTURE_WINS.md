@@ -20,7 +20,7 @@ Future version values are planning buckets, not release commitments.
 
 | Priority | Future Version | Status | Feature | Current Source Of Truth | Why This Rank |
 |---:|---|---|---|---|---|
-| 1 | vNext | IN PROGRESS | Native local-first sync, changesets, CDC, and merge | [`WIN01_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md`](WIN01_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md) | Strongest identity-level differentiator and real application painkiller |
+| 1 | vNext | TODO | Native local-first sync, changesets, CDC, and merge | [`WIN01_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md`](WIN01_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md), ADR 0147 | Strongest identity-level differentiator and real application painkiller |
 | 2 | vNext | TODO | Branch, diff, restore, and time-travel workflows | Needs ADR/spec | Memorable workflow for agents, test environments, migration rehearsal, and support |
 | 3 | vNext | TODO | Schema-first strongly typed SDK generation | [`WIN02_SCHEMA_FIRST_STRONGLY_TYPED_SDK_GENERATION_SPEC.md`](WIN02_SCHEMA_FIRST_STRONGLY_TYPED_SDK_GENERATION_SPEC.md), ADR 0116, ADR 0129 | Adoption accelerator across languages; DecentDB metadata foundation exists |
 | 4 | vNext+1 | TODO | WASM and browser OPFS support | [`WIN03_WASM_SUPPORT_IMPLEMENTATION.md`](WIN03_WASM_SUPPORT_IMPLEMENTATION.md) | Essential enabler for browser local-first apps, but no longer unique by itself |
@@ -58,6 +58,7 @@ than future roadmap claims:
 - Cost-based optimizer and `ANALYZE`
 - In-memory VFS for testing
 - Bulk-load API foundation
+- Local sync Slice 1 foundation: replica metadata, durable sidecar journal, pending-change enumeration, and sync CLI
 - Same-process shared WAL visibility
 - Mature C ABI and multi-language binding surface
 - Doctor/advisor v1 CLI, JSON, Markdown, and safe `--fix` surface
@@ -86,9 +87,9 @@ The remaining roadmap should support one clear lane:
 
 ## 1. Native Local-First Sync, Changesets, CDC, And Merge
 
-**Status:** `IN PROGRESS`  
+**Status:** `TODO`  
 **Future Version:** vNext  
-**Source of truth:** [`WIN01_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md`](WIN01_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md)
+**Source of truth:** [`WIN01_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md`](WIN01_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md), ADR 0147
 
 ### Why This Is First
 
@@ -100,18 +101,27 @@ middleware or third-party products.
 The DecentDB win is native SQL-first local/offline sync with conflict-aware merge
 semantics as an engine capability.
 
-### First Implementable Slice
+### Completed Foundation
 
-Do not start with the whole sync product. Start with the durable local foundation:
+Slice 1 is implemented per ADR 0147:
 
 - replica identity
 - sync enablement metadata
-- durable change journal
+- durable sidecar change journal
 - transaction sequence numbers
 - tombstones for deletes
-- local pending-change inspection
+- pending-change enumeration
+- machine-readable sync CLI status and pending output
+
+### Next Implementable Slice
+
+The next work should build on the durable local foundation rather than jumping
+straight to full networking:
+
 - crash/restart tests
-- machine-readable CLI status
+- local integrity checks for journal consistency
+- manual export/import sync
+- retention and compaction policy for the sync journal
 
 ### Later Slices
 

@@ -1519,6 +1519,7 @@ impl Clone for EngineRuntime {
             manifest_template: None,
             overflow_chain_caches: BTreeMap::new(),
             manifest_chain_cache: None,
+            sync_mutations: self.sync_mutations.clone(),
         }
     }
 }
@@ -1558,7 +1559,29 @@ impl EngineRuntime {
             manifest_template: None,
             overflow_chain_caches: BTreeMap::new(),
             manifest_chain_cache: None,
+            sync_mutations: Vec::new(),
         }
+    }
+
+    pub(crate) fn record_sync_mutation(
+        &mut self,
+        table_name: &str,
+        operation: crate::sync::SyncOperation,
+        primary_key: serde_json::Value,
+        after: Option<serde_json::Value>,
+        schema_cookie: u32,
+    ) {
+        self.sync_mutations.push(crate::sync::SyncMutation {
+            table: table_name.to_string(),
+            operation,
+            primary_key,
+            after,
+            schema_cookie,
+        });
+    }
+
+    pub(crate) fn take_sync_mutations(&mut self) -> Vec<crate::sync::SyncMutation> {
+        std::mem::take(&mut self.sync_mutations)
     }
 
     pub(super) fn bump_temp_schema_cookie(&mut self) {

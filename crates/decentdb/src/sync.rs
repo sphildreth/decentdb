@@ -1,4 +1,3 @@
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -11,7 +10,7 @@ use crate::error::{DbError, Result};
 use crate::record::value::Value;
 use crate::vfs::{self, FileKind, OpenMode, VfsFile, VfsHandle};
 
-const METADATA_TABLE: &str = "__decentdb_sync_metadata";
+pub(crate) const METADATA_TABLE: &str = "__decentdb_sync_metadata";
 
 pub(crate) const METADATA_TABLE_DDL: &str =
     "CREATE TABLE IF NOT EXISTS __decentdb_sync_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)";
@@ -44,6 +43,7 @@ pub struct SyncStatus {
     pub journal_size_bytes: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SyncMutation {
     pub table: String,
     pub operation: SyncOperation,
@@ -77,6 +77,17 @@ pub(crate) struct SyncContext {
     journal_write_offset: Mutex<u64>,
     journal_path: PathBuf,
     pub(crate) pending_mutations: Mutex<Vec<SyncMutation>>,
+}
+
+impl std::fmt::Debug for SyncContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SyncContext")
+            .field("enabled", &self.enabled)
+            .field("replica_id", &self.replica_id)
+            .field("next_sequence", &self.next_sequence)
+            .field("journal_path", &self.journal_path)
+            .finish()
+    }
 }
 
 impl SyncContext {
@@ -117,7 +128,11 @@ impl SyncContext {
         if guard.is_some() {
             return Ok(());
         }
-        let file = vfs.open(&self.journal_path, OpenMode::OpenOrCreate, FileKind::SyncJournal)?;
+        let file = vfs.open(
+            &self.journal_path,
+            OpenMode::OpenOrCreate,
+            FileKind::SyncJournal,
+        )?;
         let file_size = file.file_size()?;
         if let Ok(mut off) = self.journal_write_offset.lock() {
             *off = file_size;
@@ -149,7 +164,7 @@ impl SyncContext {
     }
 
     pub(crate) fn journal_size_bytes(&self) -> u64 {
-        *self.journal_write_offset.lock().unwrap_or(std::sync::MutexGuard::new(&mut 0))
+        self.journal_write_offset.lock().map(|g| *g).unwrap_or(0)
     }
 
     pub(crate) fn flush_journal(&self, vfs: &VfsHandle, transaction_lsn: u64) -> Result<()> {
@@ -160,7 +175,7 @@ impl SyncContext {
             Some(id) => id,
             None => return Ok(()),
         };
-        let mutations: Vec<SyncMutation> = {
+        let mut mutations: Vec<SyncMutation> = {
             let mut guard = self
                 .pending_mutations
                 .lock()
@@ -180,7 +195,7 @@ impl SyncContext {
         let mut buffer = Vec::new();
         let mut seq = self.next_sequence();
 
-        for mutation in &mutations {
+        for mutation in &mut mutations {
             let record = SyncJournalRecord {
                 schema_version: 1,
                 sequence: seq,
@@ -263,20 +278,16 @@ fn value_to_json(val: &Value) -> serde_json::Value {
     match val {
         Value::Null => serde_json::Value::Null,
         Value::Int64(n) => serde_json::Value::Number(serde_json::Number::from(*n)),
-        Value::Float64(f) => {
-            serde_json::Number::from_f64(*f)
-                .map(serde_json::Value::Number)
-                .unwrap_or(serde_json::Value::Null)
-        }
+        Value::Float64(f) => serde_json::Number::from_f64(*f)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
         Value::Bool(b) => serde_json::Value::Bool(*b),
         Value::Text(s) => serde_json::Value::String(s.clone()),
         Value::Blob(b) => {
             let hex: String = b.iter().map(|byte| format!("{byte:02x}")).collect();
             serde_json::Value::String(hex)
         }
-        Value::Decimal { scaled, scale } => {
-            serde_json::Value::String(format!("{scaled}e-{scale}"))
-        }
+        Value::Decimal { scaled, scale } => serde_json::Value::String(format!("{scaled}e-{scale}")),
         Value::Uuid(u) => {
             let s = format!(
                 "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
@@ -329,4 +340,226 @@ pub(crate) fn read_journal_records(
         records.truncate(limit);
     }
     Ok(records)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::Db;
+
+    fn temp_db() -> (tempfile::TempDir, Db) {
+        let dir = tempfile::TempDir::with_prefix("decentdb-sync-test").unwrap();
+        let path = dir.path().join("test.ddb");
+        let db = Db::create(&path, crate::config::DbConfig::default()).unwrap();
+        db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+        (dir, db)
+    }
+
+    #[test]
+    fn sync_starts_disabled() {
+        let (_dir, db) = temp_db();
+        assert!(!db.sync_is_enabled().unwrap());
+    }
+
+    #[test]
+    fn init_replica_enables_sync() {
+        let (_dir, db) = temp_db();
+        db.sync_init_replica("node-1").unwrap();
+        assert!(db.sync_is_enabled().unwrap());
+        let status = db.sync_status().unwrap();
+        assert!(status.enabled);
+        assert_eq!(status.replica_id.as_deref(), Some("node-1"));
+        assert_eq!(status.next_sequence, 1);
+    }
+
+    #[test]
+    fn insert_creates_journal_record() {
+        let (_dir, db) = temp_db();
+        db.sync_init_replica("node-1").unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
+        let records = db.sync_pending_changes(0, 10).unwrap();
+        assert_eq!(records.len(), 1);
+        let r = &records[0];
+        assert_eq!(r.schema_version, 1);
+        assert_eq!(r.sequence, 1);
+        assert_eq!(r.replica_id, "node-1");
+        assert_eq!(r.table, "users");
+        assert_eq!(r.operation, "insert");
+        assert!(r.primary_key.is_object());
+        assert!(r.after.is_some());
+        let after = r.after.as_ref().unwrap();
+        assert_eq!(after["id"], serde_json::json!(1));
+        assert_eq!(after["name"], serde_json::json!("Alice"));
+    }
+
+    #[test]
+    fn update_creates_journal_record() {
+        let (_dir, db) = temp_db();
+        db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
+        db.sync_init_replica("node-1").unwrap();
+        db.execute("UPDATE users SET name = 'Bob' WHERE id = 1")
+            .unwrap();
+        let records = db.sync_pending_changes(0, 10).unwrap();
+        assert_eq!(records.len(), 1);
+        let r = &records[0];
+        assert_eq!(r.operation, "update");
+        assert_eq!(r.table, "users");
+        let after = r.after.as_ref().unwrap();
+        assert_eq!(after["name"], serde_json::json!("Bob"));
+    }
+
+    #[test]
+    fn delete_creates_journal_record() {
+        let (_dir, db) = temp_db();
+        db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
+        db.sync_init_replica("node-1").unwrap();
+        db.execute("DELETE FROM users WHERE id = 1").unwrap();
+        let records = db.sync_pending_changes(0, 10).unwrap();
+        assert_eq!(records.len(), 1);
+        let r = &records[0];
+        assert_eq!(r.operation, "delete");
+        assert_eq!(r.table, "users");
+        assert!(r.after.is_none());
+        assert!(r.primary_key.is_object());
+    }
+
+    #[test]
+    fn rollback_creates_no_records() {
+        let (_dir, db) = temp_db();
+        db.sync_init_replica("node-1").unwrap();
+        db.begin_transaction().unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
+        db.rollback_transaction().unwrap();
+        let records = db.sync_pending_changes(0, 10).unwrap();
+        assert_eq!(records.len(), 0);
+    }
+
+    #[test]
+    fn savepoint_rollback_no_records() {
+        let (_dir, db) = temp_db();
+        db.sync_init_replica("node-1").unwrap();
+        db.begin_transaction().unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
+        db.create_savepoint("sp1").unwrap();
+        db.execute("UPDATE users SET name = 'Bob' WHERE id = 1")
+            .unwrap();
+        db.rollback_to_savepoint("sp1").unwrap();
+        db.commit_transaction().unwrap();
+        let records = db.sync_pending_changes(0, 10).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].operation, "insert");
+    }
+
+    #[test]
+    fn temp_table_mutations_ignored() {
+        let (_dir, db) = temp_db();
+        db.execute("CREATE TEMP TABLE tmp (x INTEGER)").unwrap();
+        db.sync_init_replica("node-1").unwrap();
+        db.execute("INSERT INTO tmp VALUES (1)").unwrap();
+        let records = db.sync_pending_changes(0, 10).unwrap();
+        assert_eq!(records.len(), 0);
+    }
+
+    #[test]
+    fn sync_metadata_table_mutations_ignored() {
+        let (_dir, db) = temp_db();
+        db.sync_init_replica("node-1").unwrap();
+        let records = db.sync_pending_changes(0, 10).unwrap();
+        assert!(records.is_empty());
+    }
+
+    #[test]
+    fn reopen_preserves_metadata() {
+        let dir = tempfile::TempDir::with_prefix("decentdb-sync-reopen").unwrap();
+        let path = dir.path().join("test.ddb");
+        {
+            let db = Db::create(&path, crate::config::DbConfig::default()).unwrap();
+            db.execute("CREATE TABLE t (k INTEGER PRIMARY KEY, v TEXT)")
+                .unwrap();
+            db.sync_init_replica("node-a").unwrap();
+            db.execute("INSERT INTO t VALUES (1, 'x')").unwrap();
+        }
+        {
+            let db = Db::open(&path, crate::config::DbConfig::default()).unwrap();
+            assert!(db.sync_is_enabled().unwrap());
+            let status = db.sync_status().unwrap();
+            assert_eq!(status.replica_id.as_deref(), Some("node-a"));
+            assert!(status.enabled);
+            let records = db.sync_pending_changes(0, 10).unwrap();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].replica_id, "node-a");
+        }
+    }
+
+    #[test]
+    fn pending_changes_respects_since_and_limit() {
+        let (_dir, db) = temp_db();
+        db.sync_init_replica("node-1").unwrap();
+        for i in 1..=5 {
+            db.execute(&format!("INSERT INTO users VALUES ({i}, 'user{i}')"))
+                .unwrap();
+        }
+        let all = db.sync_pending_changes(0, 10).unwrap();
+        assert_eq!(all.len(), 5);
+        let from3 = db.sync_pending_changes(3, 10).unwrap();
+        assert_eq!(from3.len(), 2);
+        let limited = db.sync_pending_changes(0, 2).unwrap();
+        assert_eq!(limited.len(), 2);
+    }
+
+    #[test]
+    fn enable_disable_sync() {
+        let (_dir, db) = temp_db();
+        assert!(!db.sync_is_enabled().unwrap());
+        db.sync_set_enabled(true).unwrap();
+        assert!(db.sync_is_enabled().unwrap());
+        db.sync_set_enabled(false).unwrap();
+        assert!(!db.sync_is_enabled().unwrap());
+    }
+
+    #[test]
+    fn list_tables_filters_internal() {
+        let (_dir, db) = temp_db();
+        db.sync_init_replica("node-1").unwrap();
+        let tables = db.list_tables().unwrap();
+        let names: Vec<&str> = tables.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"users"));
+        assert!(!names.contains(&"__decentdb_sync_metadata"));
+    }
+
+    #[test]
+    fn multiple_inserts_in_transaction() {
+        let (_dir, db) = temp_db();
+        db.sync_init_replica("node-1").unwrap();
+        db.begin_transaction().unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'a')").unwrap();
+        db.execute("INSERT INTO users VALUES (2, 'b')").unwrap();
+        db.commit_transaction().unwrap();
+        let records = db.sync_pending_changes(0, 10).unwrap();
+        assert_eq!(records.len(), 2);
+    }
+
+    #[test]
+    fn sync_disabled_no_journal_writes() {
+        let (_dir, db) = temp_db();
+        db.execute("INSERT INTO users VALUES (1, 'x')").unwrap();
+        let status = db.sync_status().unwrap();
+        assert!(!status.enabled);
+        assert_eq!(status.journal_size_bytes, 0);
+    }
+
+    #[test]
+    fn journal_sequence_monotonic() {
+        let (_dir, db) = temp_db();
+        db.sync_init_replica("node-1").unwrap();
+        for i in 1..=10 {
+            db.execute(&format!("INSERT INTO users VALUES ({i}, 'user{i}')"))
+                .unwrap();
+        }
+        let records = db.sync_pending_changes(0, 20).unwrap();
+        assert_eq!(records.len(), 10);
+        for (i, r) in records.iter().enumerate() {
+            assert_eq!(r.sequence, (i + 1) as u64);
+        }
+    }
 }

@@ -16,6 +16,7 @@ use crate::sql::ast::{
     InsertStatement, SelectItem, UpdateStatement,
 };
 use crate::sql::parser::parse_expression_sql;
+use crate::sync::{self, SyncOperation};
 
 use super::row::{ColumnBinding, Dataset, QueryResult, QueryRow};
 use super::{
@@ -748,6 +749,27 @@ impl EngineRuntime {
                         row_id,
                         &updated_values,
                     );
+                    let sync_info = self
+                        .catalog
+                        .table(prepared.table_name.as_str())
+                        .filter(|s| !s.temporary && !sync::is_internal_table_name(&s.name))
+                        .map(|schema| {
+                            (
+                                sync::build_primary_key_json(schema, &updated_values),
+                                sync::build_after_json(schema, &updated_values),
+                                schema.primary_key_columns.clone(),
+                            )
+                        });
+                    if let Some((pk, after, _)) = sync_info {
+                        let schema_cookie = self.catalog.schema_cookie;
+                        self.record_sync_mutation(
+                            &prepared.table_name,
+                            SyncOperation::Update,
+                            pk,
+                            Some(after),
+                            schema_cookie,
+                        );
+                    }
                 }
                 Ok(QueryResult::with_affected_rows(1))
             }
@@ -764,6 +786,7 @@ impl EngineRuntime {
                 if *current_value != next_value {
                     let mut next_values = current_row.values().to_vec();
                     next_values[prepared.column_index] = next_value;
+                    let updated_values = next_values.clone();
                     let mut row_changes = BTreeMap::new();
                     row_changes.insert(row_id, Some(next_values));
                     let updated_manifest = super::apply_paged_row_changes_to_manifest(
@@ -775,6 +798,26 @@ impl EngineRuntime {
                         TableRowSource::Paged(Arc::new(updated_manifest)),
                     )?;
                     self.mark_table_dirty(&prepared.table_name);
+                    let sync_data = self
+                        .catalog
+                        .table(prepared.table_name.as_str())
+                        .filter(|s| !s.temporary && !sync::is_internal_table_name(&s.name))
+                        .map(|schema| {
+                            (
+                                sync::build_primary_key_json(schema, &updated_values),
+                                sync::build_after_json(schema, &updated_values),
+                            )
+                        });
+                    if let Some((pk, after)) = sync_data {
+                        let schema_cookie = self.catalog.schema_cookie;
+                        self.record_sync_mutation(
+                            &prepared.table_name,
+                            SyncOperation::Update,
+                            pk,
+                            Some(after),
+                            schema_cookie,
+                        );
+                    }
                 }
                 Ok(QueryResult::with_affected_rows(1))
             }
@@ -993,6 +1036,18 @@ impl EngineRuntime {
         }
 
         self.mark_table_dirty(&prepared.table.name);
+        if !prepared.table.temporary && !sync::is_internal_table_name(&prepared.table.name) {
+            for row in &removed_rows {
+                let pk = sync::build_primary_key_json(&prepared.table, &row.values);
+                self.record_sync_mutation(
+                    &prepared.table.name,
+                    SyncOperation::Delete,
+                    pk,
+                    None,
+                    self.catalog.schema_cookie,
+                );
+            }
+        }
         Ok(QueryResult::with_affected_rows(removed_rows.len() as u64))
     }
 
@@ -1074,6 +1129,7 @@ impl EngineRuntime {
 
             candidate.push(super::cast_value(value, column.column_type)?);
         }
+        let candidate_clone = candidate.clone();
         let affected = self.apply_prepared_simple_insert_candidate(
             prepared,
             candidate,
@@ -1081,6 +1137,28 @@ impl EngineRuntime {
             params,
             page_size,
         )?;
+        if affected > 0 {
+            let sync_data = self
+                .catalog
+                .table(prepared.table_name.as_str())
+                .filter(|s| !s.temporary && !sync::is_internal_table_name(&s.name))
+                .map(|schema| {
+                    (
+                        sync::build_primary_key_json(schema, &candidate_clone),
+                        sync::build_after_json(schema, &candidate_clone),
+                    )
+                });
+            if let Some((pk, after)) = sync_data {
+                let schema_cookie = self.catalog.schema_cookie;
+                self.record_sync_mutation(
+                    &prepared.table_name,
+                    SyncOperation::Insert,
+                    pk,
+                    Some(after),
+                    schema_cookie,
+                );
+            }
+        }
         Ok(QueryResult::with_affected_rows(affected))
     }
 

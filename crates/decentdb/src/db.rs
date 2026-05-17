@@ -39,6 +39,8 @@ use crate::sql::parser::{parse_sql_statement, rewrite_legacy_trigger_body};
 use crate::storage::freelist::{decode_freelist_next, encode_freelist_page};
 use crate::storage::page::{self, PageId, PageStore};
 use crate::storage::{self, DatabaseHeader, PagerHandle};
+use crate::sync::SyncContext;
+use crate::sync::{SyncJournalRecord, SyncStatus};
 use crate::vfs::faulty::{self, FailAction, Failpoint};
 use crate::vfs::{is_memory_path, write_all_at, FileKind, OpenMode, VfsHandle};
 use crate::wal::reader_registry::ReaderGuard;
@@ -231,7 +233,7 @@ impl Drop for SqlTransaction<'_> {
 struct DbInner {
     path: PathBuf,
     config: DbConfig,
-    _vfs: VfsHandle,
+    vfs: VfsHandle,
     pager: PagerHandle,
     wal: WalHandle,
     catalog: CatalogHandle,
@@ -248,6 +250,7 @@ struct DbInner {
     statement_cache: Mutex<StatementCache>,
     prepared_insert_cache: Mutex<PreparedInsertCache>,
     held_snapshots: Mutex<HashMap<u64, ReaderGuard>>,
+    sync_ctx: SyncContext,
 }
 
 impl Drop for DbInner {
@@ -1511,6 +1514,9 @@ impl Db {
         let mut tables =
             Vec::with_capacity(runtime.catalog.tables.len() + runtime.temp_tables.len());
         for table in runtime.catalog.tables.values() {
+            if crate::sync::is_internal_table_name(&table.name) {
+                continue;
+            }
             tables.push(table_info(
                 table,
                 self.runtime_table_row_count(&runtime, &table.name)?,
@@ -1763,9 +1769,9 @@ impl Db {
 
         let db = Self {
             inner: Arc::new(DbInner {
-                path,
+                path: path.clone(),
                 config: effective_config,
-                _vfs: vfs,
+                vfs,
                 pager,
                 wal,
                 catalog,
@@ -1782,6 +1788,7 @@ impl Db {
                 statement_cache: Mutex::new(StatementCache::default()),
                 prepared_insert_cache: Mutex::new(PreparedInsertCache::default()),
                 held_snapshots: Mutex::new(HashMap::new()),
+                sync_ctx: SyncContext::new(&path),
             }),
         };
         db.backfill_missing_persistent_pk_indexes()?;
@@ -2743,6 +2750,13 @@ impl Db {
                 return Err(error);
             }
         };
+        self.sync_post_commit(&mut runtime, committed_lsn)?;
+        let runtime_schema_cookie = runtime.catalog.schema_cookie;
+        if self.inner.catalog.schema_cookie()? != runtime_schema_cookie {
+            self.inner
+                .catalog
+                .replace(runtime.catalog.as_ref().clone())?;
+        }
         self.sync_temp_state_from_runtime(&runtime)?;
         self.inner
             .last_runtime_lsn
@@ -2806,6 +2820,7 @@ impl Db {
                 return Err(error);
             }
         };
+        self.sync_post_commit(&mut runtime, committed_lsn)?;
         self.sync_temp_state_from_runtime(&runtime)?;
         self.inner
             .last_runtime_lsn
@@ -2871,6 +2886,7 @@ impl Db {
                 return Err(error);
             }
         };
+        self.sync_post_commit(&mut runtime, committed_lsn)?;
         self.sync_temp_state_from_runtime(&runtime)?;
         self.inner
             .last_runtime_lsn
@@ -2942,6 +2958,7 @@ impl Db {
                 return Err(error);
             }
         };
+        self.sync_post_commit(&mut runtime, committed_lsn)?;
         let runtime_schema_cookie = runtime.catalog.schema_cookie;
         if self.inner.catalog.schema_cookie()? != runtime_schema_cookie {
             self.inner
@@ -3008,6 +3025,7 @@ impl Db {
                 return Err(error);
             }
         };
+        self.sync_post_commit(&mut runtime, committed_lsn)?;
         let runtime_schema_cookie = runtime.catalog.schema_cookie;
         if self.inner.catalog.schema_cookie()? != runtime_schema_cookie {
             self.inner
@@ -3076,6 +3094,7 @@ impl Db {
                 return Err(error);
             }
         };
+        self.sync_post_commit(&mut runtime, committed_lsn)?;
         let runtime_schema_cookie = runtime.catalog.schema_cookie;
         if self.inner.catalog.schema_cookie()? != runtime_schema_cookie {
             self.inner
@@ -3125,6 +3144,7 @@ impl Db {
                 return Err(error);
             }
         };
+        self.sync_post_commit(&mut runtime, committed_lsn)?;
         let runtime_schema_cookie = runtime.catalog.schema_cookie;
         if self.inner.catalog.schema_cookie()? != runtime_schema_cookie {
             self.inner
@@ -3553,6 +3573,7 @@ impl Db {
                 return Err(error);
             }
         };
+        self.sync_post_commit(&mut state.runtime, committed_lsn)?;
         if self.inner.catalog.schema_cookie()? != runtime_schema_cookie {
             self.inner
                 .catalog
@@ -3603,6 +3624,7 @@ impl Db {
                 return Err(error);
             }
         };
+        self.sync_post_commit(&mut runtime, committed_lsn)?;
         if self.inner.catalog.schema_cookie()? != runtime_schema_cookie {
             self.inner
                 .catalog
@@ -5021,6 +5043,174 @@ impl Db {
             "a SQL transaction handle is active on this database handle; use it until commit or rollback",
         )
     }
+
+    pub fn sync_init_replica(&self, replica_id: &str) -> Result<()> {
+        self.ensure_sync_metadata_table()?;
+        self.sync_upsert_metadata("replica_id", replica_id)?;
+        self.sync_upsert_metadata("enabled", "true")?;
+        self.sync_upsert_metadata("next_sequence", "1")?;
+        self.inner.sync_ctx.set_replica_id(replica_id);
+        self.inner.sync_ctx.set_enabled(true);
+        self.inner.sync_ctx.set_next_sequence(1);
+        self.inner.sync_ctx.ensure_journal_open(&self.inner.vfs)?;
+        Ok(())
+    }
+
+    pub fn sync_status(&self) -> Result<SyncStatus> {
+        if self.inner.sync_ctx.is_enabled() {
+            return Ok(SyncStatus {
+                enabled: true,
+                replica_id: self.inner.sync_ctx.replica_id(),
+                next_sequence: self.inner.sync_ctx.next_sequence(),
+                journal_path: Some(
+                    self.inner
+                        .sync_ctx
+                        .journal_path()
+                        .to_string_lossy()
+                        .to_string(),
+                ),
+                journal_size_bytes: self.inner.sync_ctx.journal_size_bytes(),
+            });
+        }
+        self.load_sync_status_from_db()
+    }
+
+    pub fn sync_pending_changes(
+        &self,
+        since_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<SyncJournalRecord>> {
+        if !self.inner.sync_ctx.is_enabled() {
+            let loaded = self.load_sync_status_from_db()?;
+            if !loaded.enabled {
+                return Ok(Vec::new());
+            }
+        }
+        crate::sync::read_journal_records(
+            self.inner.sync_ctx.journal_path(),
+            &self.inner.vfs,
+            since_seq,
+            limit,
+        )
+    }
+
+    pub fn sync_set_enabled(&self, enabled: bool) -> Result<()> {
+        self.ensure_sync_metadata_table()?;
+        self.sync_upsert_metadata("enabled", if enabled { "true" } else { "false" })?;
+        self.inner.sync_ctx.set_enabled(enabled);
+        if enabled {
+            self.inner.sync_ctx.ensure_journal_open(&self.inner.vfs)?;
+        }
+        Ok(())
+    }
+
+    pub fn sync_is_enabled(&self) -> Result<bool> {
+        if self.inner.sync_ctx.is_enabled() {
+            return Ok(true);
+        }
+        let status = self.load_sync_status_from_db()?;
+        if status.enabled {
+            self.inner.sync_ctx.set_enabled(true);
+            self.inner
+                .sync_ctx
+                .set_replica_id(&status.replica_id.unwrap_or_default());
+            self.inner.sync_ctx.set_next_sequence(status.next_sequence);
+        }
+        Ok(status.enabled)
+    }
+
+    fn ensure_sync_metadata_table(&self) -> Result<()> {
+        let _ = self.execute(crate::sync::METADATA_TABLE_DDL)?;
+        Ok(())
+    }
+
+    fn sync_upsert_metadata(&self, key: &str, value: &str) -> Result<()> {
+        let sql = format!(
+            "INSERT INTO {table} (key, value) VALUES ('{k}', '{v}') ON CONFLICT (key) DO UPDATE SET value = '{v}'",
+            table = crate::sync::METADATA_TABLE,
+            k = key.replace('\'', "''"),
+            v = value.replace('\'', "''"),
+        );
+        let _ = self.execute(&sql)?;
+        Ok(())
+    }
+
+    fn sync_read_metadata(&self, key: &str) -> Result<Option<String>> {
+        let sql = format!(
+            "SELECT value FROM {} WHERE key = '{}'",
+            crate::sync::METADATA_TABLE,
+            key.replace('\'', "''"),
+        );
+        match self.execute(&sql) {
+            Ok(result) => {
+                if let Some(row) = result.rows().first() {
+                    if let Some(val) = row.values().first() {
+                        match val {
+                            Value::Text(s) => return Ok(Some(s.clone())),
+                            _ => return Ok(None),
+                        }
+                    }
+                }
+                Ok(None)
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("no such table") || msg.contains("unknown table") {
+                    return Ok(None);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    fn load_sync_status_from_db(&self) -> Result<SyncStatus> {
+        let enabled = self
+            .sync_read_metadata("enabled")?
+            .map(|v| v == "true")
+            .unwrap_or(false);
+        let replica_id = self.sync_read_metadata("replica_id")?;
+        let next_sequence: u64 = self
+            .sync_read_metadata("next_sequence")?
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+        let journal_path = self
+            .inner
+            .sync_ctx
+            .journal_path()
+            .to_string_lossy()
+            .to_string();
+        let journal_size_bytes = self.inner.sync_ctx.journal_size_bytes();
+        Ok(SyncStatus {
+            enabled,
+            replica_id,
+            next_sequence,
+            journal_path: Some(journal_path),
+            journal_size_bytes,
+        })
+    }
+
+    pub(crate) fn sync_post_commit(
+        &self,
+        runtime: &mut EngineRuntime,
+        committed_lsn: u64,
+    ) -> Result<()> {
+        let mutations = runtime.take_sync_mutations();
+        if !self.inner.sync_ctx.is_enabled() {
+            return Ok(());
+        }
+        if mutations.is_empty() {
+            return Ok(());
+        }
+        self.inner
+            .sync_ctx
+            .pending_mutations
+            .lock()
+            .map_err(|_| DbError::internal("sync pending mutations lock poisoned"))?
+            .extend(mutations);
+        self.inner
+            .sync_ctx
+            .flush_journal(&self.inner.vfs, committed_lsn)
+    }
 }
 
 fn db_open_lock(canonical_path: PathBuf) -> Result<Arc<Mutex<()>>> {
@@ -5514,6 +5704,9 @@ fn trigger_info(trigger: &TriggerSchema) -> TriggerInfo {
 fn schema_snapshot(db: &Db, runtime: &EngineRuntime) -> Result<SchemaSnapshot> {
     let mut tables = Vec::with_capacity(runtime.catalog.tables.len() + runtime.temp_tables.len());
     for table in runtime.catalog.tables.values() {
+        if crate::sync::is_internal_table_name(&table.name) {
+            continue;
+        }
         tables.push(schema_table_info(
             table,
             db.runtime_table_row_count(runtime, &table.name)?,
