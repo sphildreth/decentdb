@@ -3,7 +3,7 @@
 **Status:** Proposed  
 **Audience:** Core engine developers, parser/planner/executor maintainers, storage/indexing implementers, C ABI maintainers, binding maintainers, CLI maintainers, documentation authors, coding agents  
 **Related roadmap item:** `7. Native Geospatial Data Support`  
-**Related vision documents:** `design/DECENTDB_FUTURE_WINS_V2.md`, `design/PRD.md`, `design/TESTING_STRATEGY.md`, `docs/design/spec.md`
+**Related vision documents:** `design/FUTURE_WINS.md`, `design/PRD.md`, `design/TESTING_STRATEGY.md`, `docs/design/spec.md`
 **Related ADR drafts:** `design/adr/0124-geospatial-type-system-and-ewkb-storage.md`, `design/adr/0125-spatial-covering-cell-secondary-index.md`, `design/adr/0126-geospatial-c-abi-contract.md`, `design/adr/0127-planner-native-spatial-access-paths.md`, `design/adr/0128-true-3d-semantics-and-3d-aware-indexing.md`
 
 ---
@@ -66,7 +66,7 @@ begins, because it crosses multiple ADR-required boundaries:
 
 ## 2. Why This Needs a Dedicated Plan
 
-`design/DECENTDB_FUTURE_WINS_V2.md` identifies geospatial support as a valuable
+`design/FUTURE_WINS.md` identifies geospatial support as a valuable
 future win and sketches a direction that includes native types, spatial
 indexing, and `ST_*` functions.
 
@@ -96,7 +96,7 @@ This SPEC is derived from the following local project documents:
 - `design/PRD.md`
 - `design/TESTING_STRATEGY.md`
 - `docs/design/spec.md`
-- `design/DECENTDB_FUTURE_WINS_V2.md`
+- `design/FUTURE_WINS.md`
 - `design/adr/0072-new-data-types-decimal-uuid.md`
 - `design/adr/0091-decimal-uuid-implementation.md`
 - `design/adr/0088-expression-indexes-v0.md`
@@ -234,7 +234,7 @@ Rules:
 
 ### 5.5 Initial Spatial Index Strategy Is Covering-Cell Based
 
-Although `design/DECENTDB_FUTURE_WINS_V2.md` mentions an R*-Tree, this SPEC
+Although the earlier roadmap drafts mentioned an R*-Tree, this SPEC
 standardizes the **initial implementation** on a covering-cell spatial index
 stored in the existing B+Tree subsystem.
 
@@ -1962,7 +1962,7 @@ these.
 
 ### Local
 
-- `design/DECENTDB_FUTURE_WINS_V2.md`
+- `design/FUTURE_WINS.md`
 - `design/PRD.md`
 - `design/TESTING_STRATEGY.md`
 - `docs/design/spec.md`

@@ -209,7 +209,7 @@ wrong persistent and ABI boundary.
 ## References
 
 - `design/WIN03_GEOSPATIAL_DATA_SUPPORT.md`
-- `design/DECENTDB_FUTURE_WINS_V2.md`
+- `design/FUTURE_WINS.md`
 - `design/adr/0072-new-data-types-decimal-uuid.md`
 - PostGIS geometry vs geography FAQ:
   `https://postgis.net/documentation/faq/geometry-or-geography/`

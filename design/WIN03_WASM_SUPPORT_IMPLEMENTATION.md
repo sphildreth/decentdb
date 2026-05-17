@@ -5,7 +5,7 @@
 ## 1. Purpose
 
 This document translates the "First-Class WASM & Browser Support" proposal from
-`design/DECENTDB_FUTURE_WINS.md` into an implementation plan that is:
+`design/FUTURE_WINS.md` into an implementation plan that is:
 
 - incremental
 - quality-gated
@@ -48,7 +48,7 @@ This plan is derived from the following project documents:
 - `design/SPEC.md`
 - `design/TESTING_STRATEGY.md`
 - `docs/design/spec.md`
-- `design/DECENTDB_FUTURE_WINS.md`
+- `design/FUTURE_WINS.md`
 - `design/adr/0105-in-memory-vfs.md`
 - `design/adr/0117-shared-wal-registry.md`
 - `design/adr/0119-rust-vfs-pread-pwrite.md`
