@@ -79,8 +79,66 @@ fn setup_sync_db(path: &Path, replica_id: &str, rows: &[(i64, &str)]) {
     }
 }
 
+fn setup_tenant_sync_db(
+    path: &Path,
+    replica_id: &str,
+    tenant_one_id: i64,
+    tenant_one_value: &str,
+    tenant_two_id: i64,
+    tenant_two_value: &str,
+) {
+    let db_str = path.display().to_string();
+    run(&[
+        "exec",
+        "--db",
+        &db_str,
+        "--sql",
+        "CREATE TABLE tenant_items (tenant_id INT64, id INT64, value TEXT, PRIMARY KEY (tenant_id, id));",
+        "--format",
+        "json",
+    ]);
+    run(&["sync", "init", "--db", &db_str, "--replica-id", replica_id]);
+    run(&[
+        "exec",
+        "--db",
+        &db_str,
+        "--sql",
+        &format!("INSERT INTO tenant_items VALUES (1, {tenant_one_id}, '{tenant_one_value}')"),
+        "--format",
+        "json",
+    ]);
+    run(&[
+        "exec",
+        "--db",
+        &db_str,
+        "--sql",
+        &format!("INSERT INTO tenant_items VALUES (2, {tenant_two_id}, '{tenant_two_value}')"),
+        "--format",
+        "json",
+    ]);
+}
+
 fn open_db(path: &Path) -> Db {
     Db::open(path, DbConfig::default()).expect("open db")
+}
+
+fn query_tenant_items(path: &Path) -> Vec<(i64, i64, String)> {
+    let db = open_db(path);
+    let result = db
+        .execute("SELECT tenant_id, id, value FROM tenant_items ORDER BY tenant_id, id")
+        .expect("query tenant items");
+    result
+        .rows()
+        .iter()
+        .map(|row| match row.values() {
+            [
+                decentdb::Value::Int64(tenant_id),
+                decentdb::Value::Int64(id),
+                decentdb::Value::Text(value),
+            ] => (*tenant_id, *id, value.clone()),
+            other => panic!("unexpected row values: {:?}", other),
+        })
+        .collect()
 }
 
 struct ChildGuard(Child);
@@ -101,6 +159,15 @@ fn spawn_sync_serve_with_token(
     max_requests: usize,
     token_env: Option<(&str, &str)>,
 ) -> (ChildGuard, String) {
+    spawn_sync_serve_scoped(db, max_requests, None, token_env)
+}
+
+fn spawn_sync_serve_scoped(
+    db: &Path,
+    max_requests: usize,
+    scope: Option<&str>,
+    token_env: Option<(&str, &str)>,
+) -> (ChildGuard, String) {
     let ready_file = db.with_extension("ready");
     let mut command = Command::new(bin());
     command.args([
@@ -115,6 +182,9 @@ fn spawn_sync_serve_with_token(
         "--max-requests",
         &max_requests.to_string(),
     ]);
+    if let Some(scope_name) = scope {
+        command.args(["--scope", scope_name]);
+    }
     if let Some((env_name, env_value)) = token_env {
         command.env(env_name, env_value);
         command.args(["--token-env", env_name]);
@@ -199,6 +269,90 @@ fn sync_peer_add_list_remove_supports_json_and_table_outputs() {
 }
 
 #[test]
+fn sync_scope_create_list_bind_unbind_supports_json_and_table_outputs() {
+    let dir = temp_dir("decentdb-sync-scope-cli");
+    let db = dir.join("scopes.ddb");
+    let db_str = db.display().to_string();
+
+    run(&[
+        "exec",
+        "--db",
+        &db_str,
+        "--sql",
+        "CREATE TABLE users (id INT64 PRIMARY KEY, tenant_id INT64, name TEXT);",
+        "--format",
+        "json",
+    ]);
+    run(&["sync", "init", "--db", &db_str, "--replica-id", "local-a"]);
+    run(&[
+        "sync",
+        "peer",
+        "add",
+        "--db",
+        &db_str,
+        "--name",
+        "relay",
+        "--endpoint",
+        "https://relay.example.com",
+        "--format",
+        "json",
+    ]);
+
+    let create = run(&[
+        "sync",
+        "scope",
+        "create",
+        "--db",
+        &db_str,
+        "--name",
+        "tenant_1",
+        "--include",
+        "users",
+        "--row-filter",
+        "id = 1",
+        "--format",
+        "json",
+    ]);
+    let created: serde_json::Value = serde_json::from_str(&create).expect("json");
+    assert_eq!(created["name"], "tenant_1");
+    assert_eq!(created["include_tables"], serde_json::json!(["users"]));
+    assert_eq!(created["filter_columns"], serde_json::json!(["id"]));
+
+    let list = run(&[
+        "sync", "scope", "list", "--db", &db_str, "--format", "table",
+    ]);
+    assert!(list.contains("tenant_1"));
+    assert!(list.contains("users"));
+    assert!(list.contains("id"));
+
+    let bind = run(&[
+        "sync", "scope", "bind", "--db", &db_str, "--peer", "relay", "--scope", "tenant_1",
+        "--format", "json",
+    ]);
+    let binding: serde_json::Value = serde_json::from_str(&bind).expect("json");
+    assert_eq!(binding["peer_name"], "relay");
+    assert_eq!(binding["scope_name"], "tenant_1");
+
+    let bindings = run(&[
+        "sync", "scope", "bindings", "--db", &db_str, "--format", "table",
+    ]);
+    assert!(bindings.contains("relay"));
+    assert!(bindings.contains("tenant_1"));
+
+    let unbind = run(&[
+        "sync", "scope", "unbind", "--db", &db_str, "--peer", "relay", "--format", "json",
+    ]);
+    let unbound: serde_json::Value = serde_json::from_str(&unbind).expect("json");
+    assert_eq!(unbound["removed"], true);
+
+    let bindings_after = run(&[
+        "sync", "scope", "bindings", "--db", &db_str, "--format", "json",
+    ]);
+    let parsed_after: serde_json::Value = serde_json::from_str(&bindings_after).expect("json");
+    assert!(parsed_after.as_array().expect("array").is_empty());
+}
+
+#[test]
 fn sync_run_both_round_trips_changes_and_remains_incremental() {
     let dir = temp_dir("decentdb-sync-run-both");
     let local = dir.join("local.ddb");
@@ -258,6 +412,90 @@ fn sync_run_both_round_trips_changes_and_remains_incremental() {
         sessions.rows()[1].values()[6],
         decentdb::Value::Text("success".to_string())
     );
+}
+
+#[test]
+fn sync_scoped_http_sync_prevents_tenant_leakage() {
+    let dir = temp_dir("decentdb-sync-scope-http");
+    let local = dir.join("local.ddb");
+    let remote = dir.join("remote.ddb");
+
+    setup_tenant_sync_db(&local, "local-a", 1, "local-t1", 2, "local-t2");
+    setup_tenant_sync_db(&remote, "remote-b", 11, "remote-t1", 22, "remote-t2");
+
+    let local_str = local.display().to_string();
+    let remote_str = remote.display().to_string();
+
+    run(&[
+        "sync",
+        "scope",
+        "create",
+        "--db",
+        &local_str,
+        "--name",
+        "tenant_1",
+        "--include",
+        "tenant_items",
+        "--row-filter",
+        "tenant_id = 1",
+        "--format",
+        "json",
+    ]);
+    run(&[
+        "sync",
+        "scope",
+        "create",
+        "--db",
+        &remote_str,
+        "--name",
+        "tenant_1",
+        "--include",
+        "tenant_items",
+        "--row-filter",
+        "tenant_id = 1",
+        "--format",
+        "json",
+    ]);
+
+    let (_server, addr) = spawn_sync_serve_scoped(&remote, 10, Some("tenant_1"), None);
+    run(&[
+        "sync",
+        "peer",
+        "add",
+        "--db",
+        &local_str,
+        "--name",
+        "remote",
+        "--endpoint",
+        &format!("http://{addr}"),
+        "--format",
+        "json",
+    ]);
+    run(&[
+        "sync", "scope", "bind", "--db", &local_str, "--peer", "remote", "--scope", "tenant_1",
+        "--format", "json",
+    ]);
+
+    let sync = run(&[
+        "sync", "run", "--db", &local_str, "--peer", "remote", "--format", "json",
+    ]);
+    let parsed: serde_json::Value = serde_json::from_str(&sync).expect("json");
+    assert_eq!(parsed["direction"], "both");
+    assert_eq!(parsed["pushed"]["applied"], 1);
+    assert_eq!(parsed["pulled"]["applied"], 1);
+
+    let local_rows = query_tenant_items(&local);
+    let remote_rows = query_tenant_items(&remote);
+    assert!(local_rows.contains(&(1, 1, "local-t1".to_string())));
+    assert!(local_rows.contains(&(1, 11, "remote-t1".to_string())));
+    assert!(remote_rows.contains(&(1, 1, "local-t1".to_string())));
+    assert!(remote_rows.contains(&(1, 11, "remote-t1".to_string())));
+    assert!(!local_rows
+        .iter()
+        .any(|row| row.0 == 2 && row.2 == "remote-t2"));
+    assert!(!remote_rows
+        .iter()
+        .any(|row| row.0 == 2 && row.2 == "local-t2"));
 }
 
 #[test]

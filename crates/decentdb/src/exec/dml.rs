@@ -122,6 +122,43 @@ pub(crate) struct PreparedSimpleDelete {
 }
 
 impl EngineRuntime {
+    fn record_sync_update_for_row(
+        &mut self,
+        table: &crate::catalog::TableSchema,
+        values: &[Value],
+    ) {
+        if table.temporary || sync::is_internal_table_name(&table.name) {
+            return;
+        }
+        let pk = sync::build_primary_key_json(table, values);
+        let after = sync::build_after_json(table, values);
+        self.record_sync_mutation(
+            &table.name,
+            SyncOperation::Update,
+            pk,
+            Some(after),
+            self.catalog.schema_cookie,
+        );
+    }
+
+    fn record_sync_delete_for_row(
+        &mut self,
+        table: &crate::catalog::TableSchema,
+        values: &[Value],
+    ) {
+        if table.temporary || sync::is_internal_table_name(&table.name) {
+            return;
+        }
+        let pk = sync::build_primary_key_json(table, values);
+        self.record_sync_mutation(
+            &table.name,
+            SyncOperation::Delete,
+            pk,
+            None,
+            self.catalog.schema_cookie,
+        );
+    }
+
     pub(crate) fn can_execute_statement_in_state_without_clone(
         &self,
         statement: &crate::sql::ast::Statement,
@@ -1642,6 +1679,7 @@ impl EngineRuntime {
                     values: next_values.clone(),
                 });
             }
+            self.record_sync_update_for_row(table, &next_values);
             row_changes.insert(row_id, Some(next_values));
             affected_rows += 1;
             changed_rows += 1;
@@ -1764,6 +1802,7 @@ impl EngineRuntime {
             )?;
             for row in &matching_rows {
                 self.mark_table_row_deleted(&table.name, row.row_id);
+                self.record_sync_delete_for_row(table, &row.values);
             }
             if !indexes_remain_fresh {
                 self.mark_indexes_stale_for_table(&table.name);
@@ -1961,6 +2000,7 @@ impl EngineRuntime {
                             single_row_id,
                             &updated_values,
                         );
+                        self.record_sync_update_for_row(&table, &updated_values);
                     }
                     self.execute_after_triggers(&table_name, TriggerEvent::Update, 1, page_size)?;
                     return Ok(QueryResult::with_affected_rows(1));
@@ -2039,6 +2079,7 @@ impl EngineRuntime {
                         single_row_id,
                         &updated_values,
                     );
+                    self.record_sync_update_for_row(&table, &updated_values);
                 }
                 self.execute_after_triggers(&table_name, TriggerEvent::Update, 1, page_size)?;
                 return Ok(QueryResult::with_affected_rows(1));
@@ -2130,6 +2171,7 @@ impl EngineRuntime {
                 .replace_row_values(row_index, next_values.clone())
                 .ok_or_else(|| DbError::internal(format!("row {row_id} vanished during UPDATE")))?;
             self.mark_table_row_dirty(&table_name, row_index, row_id, &next_values);
+            self.record_sync_update_for_row(&table, &next_values);
             if let Some(values) = returning_values {
                 returning_rows.push(StoredRow { row_id, values });
             }
@@ -2268,6 +2310,7 @@ impl EngineRuntime {
                 }
                 for row in &removed_rows {
                     self.mark_table_row_deleted(&table_name, row.row_id);
+                    self.record_sync_delete_for_row(&table, &row.values);
                 }
             }
             self.execute_after_triggers(
@@ -2348,6 +2391,7 @@ impl EngineRuntime {
             }
             for row in &matching_rows {
                 self.mark_table_row_deleted(&table_name, row.row_id);
+                self.record_sync_delete_for_row(&table, &row.values);
             }
         }
 

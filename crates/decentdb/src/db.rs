@@ -26,8 +26,8 @@ use crate::exec::dml::{
 };
 use crate::exec::{
     decode_paged_table_manifest_payload, read_table_payload_row_count_from_bytes,
-    statement_is_read_only, BulkLoadOptions, EngineRuntime, QueryResult, QueryRow, RuntimeIndex,
-    TableData,
+    row_satisfies_expression, statement_is_read_only, BulkLoadOptions, EngineRuntime, QueryResult,
+    QueryRow, RuntimeIndex, TableData,
 };
 use crate::metadata::{
     CheckConstraintInfo, ColumnInfo, ForeignKeyInfo, HeaderInfo, IndexInfo, IndexVerification,
@@ -37,15 +37,16 @@ use crate::metadata::{
 use crate::record::overflow::read_overflow;
 use crate::record::value::{normalize_decimal, parse_decimal_text, Value};
 use crate::sql::ast::Statement as SqlStatement;
-use crate::sql::parser::{parse_sql_statement, rewrite_legacy_trigger_body};
+use crate::sql::parser::{parse_expression_sql, parse_sql_statement, rewrite_legacy_trigger_body};
 use crate::storage::freelist::{decode_freelist_next, encode_freelist_page};
 use crate::storage::page::{self, PageId, PageStore};
 use crate::storage::{self, DatabaseHeader, PagerHandle};
 use crate::sync::SyncContext;
 use crate::sync::{
-    current_time_micros, SyncChangeBatch, SyncConflict, SyncImportSummary,
-    SyncJournalIntegrityReport, SyncJournalRecord, SyncOperation, SyncPeer, SyncRunDirection,
-    SyncRunSummary, SyncSession, SyncStatus,
+    current_time_micros, validate_sync_scope_definition, SyncChangeBatch, SyncConflict,
+    SyncConflictPolicy, SyncConflictPolicyConfig, SyncImportSummary, SyncJournalIntegrityReport,
+    SyncJournalRecord, SyncOperation, SyncPeer, SyncPeerScopeBinding, SyncRunDirection,
+    SyncRunSummary, SyncScope, SyncSession, SyncStatus,
 };
 use crate::vfs::faulty::{self, FailAction, Failpoint};
 use crate::vfs::{is_memory_path, write_all_at, FileKind, OpenMode, VfsHandle};
@@ -64,6 +65,27 @@ pub struct Db {
 struct PagerReadStore<'a> {
     db: &'a Db,
     snapshot_token: u64,
+}
+
+#[derive(Clone, Debug)]
+struct SyncConflictRecordData {
+    conflict_type: String,
+    message: String,
+    local_row_json: Option<serde_json::Value>,
+    resolution: Option<String>,
+    resolved_at_micros: Option<i64>,
+    resolved_by: Option<String>,
+    resolution_note: Option<String>,
+    policy_name: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+enum SyncImportRecordOutcome {
+    Applied,
+    Skipped,
+    Conflict(SyncConflictRecordData),
+    Resolved(SyncConflictRecordData),
+    Stop(SyncConflictRecordData),
 }
 
 impl<'a> PagerReadStore<'a> {
@@ -5067,6 +5089,242 @@ impl Db {
         Ok(())
     }
 
+    pub fn sync_create_scope(
+        &self,
+        name: &str,
+        include_tables: &[&str],
+        row_filter: Option<&str>,
+    ) -> Result<()> {
+        self.ensure_sync_tables()?;
+        let runtime = self.runtime_for_metadata_inspection()?;
+        let validation =
+            validate_sync_scope_definition(&runtime, name, include_tables, row_filter)?;
+        let created_at_micros = self
+            .sync_scope(name)?
+            .map(|scope| scope.created_at_micros)
+            .unwrap_or_else(current_time_micros);
+        let updated_at_micros = current_time_micros();
+        let sql = format!(
+            "INSERT INTO {table} (name, include_tables_json, row_filter, filter_columns_json, created_at_micros, updated_at_micros) VALUES ({name}, {include_tables_json}, {row_filter}, {filter_columns_json}, {created_at_micros}, {updated_at_micros}) ON CONFLICT (name) DO UPDATE SET include_tables_json = {include_tables_json}, row_filter = {row_filter}, filter_columns_json = {filter_columns_json}, updated_at_micros = {updated_at_micros}",
+            table = crate::sync::SCOPES_TABLE,
+            name = sql_text_literal(&validation.name),
+            include_tables_json = sql_text_literal(
+                &serde_json::to_string(&validation.include_tables)
+                    .map_err(|error| DbError::internal(format!("failed to encode scope tables: {error}")))?,
+            ),
+            row_filter = sql_nullable_text_literal(validation.row_filter.as_deref()),
+            filter_columns_json = sql_text_literal(
+                &serde_json::to_string(&validation.filter_columns)
+                    .map_err(|error| DbError::internal(format!("failed to encode scope columns: {error}")))?,
+            ),
+            created_at_micros = created_at_micros,
+            updated_at_micros = updated_at_micros,
+        );
+        let _ = self.execute(&sql)?;
+        Ok(())
+    }
+
+    pub fn sync_drop_scope(&self, name: &str) -> Result<bool> {
+        self.ensure_sync_tables()?;
+        let scope_name = name.trim();
+        if scope_name.is_empty() {
+            return Err(DbError::sql("sync scope name must not be empty"));
+        }
+        if self
+            .sync_peer_scope_bindings()?
+            .iter()
+            .any(|binding| binding.scope_name.eq_ignore_ascii_case(scope_name))
+        {
+            return Err(DbError::sql(format!(
+                "cannot drop sync scope '{scope_name}' while peer bindings exist"
+            )));
+        }
+        let sql = format!(
+            "DELETE FROM {} WHERE name = {}",
+            crate::sync::SCOPES_TABLE,
+            sql_text_literal(scope_name)
+        );
+        let result = self.execute(&sql)?;
+        Ok(result.affected_rows() > 0)
+    }
+
+    pub fn sync_scope(&self, name: &str) -> Result<Option<SyncScope>> {
+        self.ensure_sync_tables()?;
+        let scope_name = name.trim();
+        if scope_name.is_empty() {
+            return Err(DbError::sql("sync scope name must not be empty"));
+        }
+        let sql = format!(
+            "SELECT name, include_tables_json, row_filter, filter_columns_json, created_at_micros, updated_at_micros FROM {} WHERE name = {}",
+            crate::sync::SCOPES_TABLE,
+            sql_text_literal(scope_name)
+        );
+        match self.execute(&sql) {
+            Ok(result) => Ok(result.rows().first().map(sync_scope_from_row).transpose()?),
+            Err(error) => {
+                let message = error.to_string();
+                if message.contains("no such table") || message.contains("unknown table") {
+                    Ok(None)
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    pub fn sync_scopes(&self) -> Result<Vec<SyncScope>> {
+        self.ensure_sync_tables()?;
+        let sql = format!(
+            "SELECT name, include_tables_json, row_filter, filter_columns_json, created_at_micros, updated_at_micros FROM {} ORDER BY name",
+            crate::sync::SCOPES_TABLE
+        );
+        match self.execute(&sql) {
+            Ok(result) => result.rows().iter().map(sync_scope_from_row).collect(),
+            Err(error) => {
+                let message = error.to_string();
+                if message.contains("no such table") || message.contains("unknown table") {
+                    Ok(Vec::new())
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    pub fn sync_bind_peer_scope(&self, peer_name: &str, scope_name: &str) -> Result<()> {
+        self.ensure_sync_tables()?;
+        let peer_name = peer_name.trim();
+        if peer_name.is_empty() {
+            return Err(DbError::sql("sync peer name must not be empty"));
+        }
+        if self.sync_peer(peer_name)?.is_none() {
+            return Err(DbError::sql(format!("sync peer '{peer_name}' not found")));
+        }
+        let scope = self
+            .sync_scope(scope_name)?
+            .ok_or_else(|| DbError::sql(format!("sync scope '{scope_name}' not found")))?;
+        let existing = self.sync_peer_scope_binding_row(peer_name)?;
+        let created_at_micros = existing
+            .as_ref()
+            .map(|binding| binding.created_at_micros)
+            .unwrap_or_else(current_time_micros);
+        let updated_at_micros = current_time_micros();
+        let sql = format!(
+            "INSERT INTO {table} (peer_name, scope_name, created_at_micros, updated_at_micros) VALUES ({peer_name}, {scope_name}, {created_at_micros}, {updated_at_micros}) ON CONFLICT (peer_name) DO UPDATE SET scope_name = {scope_name}, updated_at_micros = {updated_at_micros}",
+            table = crate::sync::PEER_SCOPES_TABLE,
+            peer_name = sql_text_literal(peer_name),
+            scope_name = sql_text_literal(&scope.name),
+            created_at_micros = created_at_micros,
+            updated_at_micros = updated_at_micros,
+        );
+        let _ = self.execute(&sql)?;
+        Ok(())
+    }
+
+    pub fn sync_unbind_peer_scope(&self, peer_name: &str) -> Result<bool> {
+        self.ensure_sync_tables()?;
+        let peer_name = peer_name.trim();
+        if peer_name.is_empty() {
+            return Err(DbError::sql("sync peer name must not be empty"));
+        }
+        let sql = format!(
+            "DELETE FROM {} WHERE peer_name = {}",
+            crate::sync::PEER_SCOPES_TABLE,
+            sql_text_literal(peer_name)
+        );
+        let result = self.execute(&sql)?;
+        Ok(result.affected_rows() > 0)
+    }
+
+    pub fn sync_peer_scope(&self, peer_name: &str) -> Result<Option<SyncPeerScopeBinding>> {
+        self.ensure_sync_tables()?;
+        let peer_name = peer_name.trim();
+        if peer_name.is_empty() {
+            return Err(DbError::sql("sync peer name must not be empty"));
+        }
+        self.sync_peer_scope_binding_row(peer_name)
+    }
+
+    pub fn sync_peer_scope_definition(&self, peer_name: &str) -> Result<Option<SyncScope>> {
+        let binding = match self.sync_peer_scope(peer_name)? {
+            Some(binding) => binding,
+            None => return Ok(None),
+        };
+        match self.sync_scope(&binding.scope_name)? {
+            Some(scope) => Ok(Some(scope)),
+            None => Err(DbError::sql(format!(
+                "sync scope '{}' bound to peer '{}' was not found",
+                binding.scope_name, binding.peer_name
+            ))),
+        }
+    }
+
+    pub fn sync_peer_scope_bindings(&self) -> Result<Vec<SyncPeerScopeBinding>> {
+        self.ensure_sync_tables()?;
+        let sql = format!(
+            "SELECT peer_name, scope_name, created_at_micros, updated_at_micros FROM {} ORDER BY peer_name",
+            crate::sync::PEER_SCOPES_TABLE
+        );
+        match self.execute(&sql) {
+            Ok(result) => result
+                .rows()
+                .iter()
+                .map(sync_peer_scope_binding_from_row)
+                .collect(),
+            Err(error) => {
+                let message = error.to_string();
+                if message.contains("no such table") || message.contains("unknown table") {
+                    Ok(Vec::new())
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    pub fn sync_export_batch_for_scope(
+        &self,
+        scope_name: &str,
+        since_seq: u64,
+        limit: usize,
+    ) -> Result<SyncChangeBatch> {
+        let scope = self
+            .sync_scope(scope_name)?
+            .ok_or_else(|| DbError::sql(format!("sync scope '{scope_name}' not found")))?;
+        let records = self.sync_pending_changes(since_seq, limit)?;
+        let source_replica_id = records.first().map(|record| record.replica_id.clone());
+        let source_high_watermark = records.last().map(|record| record.sequence);
+        let filtered = self.sync_filter_records_for_scope(&scope, records)?;
+        SyncChangeBatch::scoped_from_records(filtered, source_replica_id, source_high_watermark)
+    }
+
+    pub fn sync_import_batch_for_scope(
+        &self,
+        scope_name: &str,
+        batch: &SyncChangeBatch,
+    ) -> Result<SyncImportSummary> {
+        batch.validate()?;
+        let scope = self
+            .sync_scope(scope_name)?
+            .ok_or_else(|| DbError::sql(format!("sync scope '{scope_name}' not found")))?;
+        self.sync_validate_batch_for_scope(&scope, batch)?;
+        self.sync_import_batch(batch)
+    }
+
+    pub fn sync_import_batch_for_scope_with_policy(
+        &self,
+        scope_name: &str,
+        batch: &SyncChangeBatch,
+        policy: SyncConflictPolicy,
+    ) -> Result<SyncImportSummary> {
+        batch.validate()?;
+        let scope = self
+            .sync_scope(scope_name)?
+            .ok_or_else(|| DbError::sql(format!("sync scope '{scope_name}' not found")))?;
+        self.sync_validate_batch_for_scope(&scope, batch)?;
+        self.sync_import_batch_with_policy(batch, policy)
+    }
+
     pub fn sync_add_peer(&self, name: &str, endpoint: &str, token_env: Option<&str>) -> Result<()> {
         let name = name.trim();
         if name.is_empty() {
@@ -5137,6 +5395,29 @@ impl Db {
         );
         match self.execute(&sql) {
             Ok(result) => Ok(result.rows().first().map(sync_peer_from_row).transpose()?),
+            Err(error) => {
+                let message = error.to_string();
+                if message.contains("no such table") || message.contains("unknown table") {
+                    Ok(None)
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    fn sync_peer_scope_binding_row(&self, peer_name: &str) -> Result<Option<SyncPeerScopeBinding>> {
+        let sql = format!(
+            "SELECT peer_name, scope_name, created_at_micros, updated_at_micros FROM {} WHERE peer_name = {}",
+            crate::sync::PEER_SCOPES_TABLE,
+            sql_text_literal(peer_name)
+        );
+        match self.execute(&sql) {
+            Ok(result) => Ok(result
+                .rows()
+                .first()
+                .map(sync_peer_scope_binding_from_row)
+                .transpose()?),
             Err(error) => {
                 let message = error.to_string();
                 if message.contains("no such table") || message.contains("unknown table") {
@@ -5261,12 +5542,243 @@ impl Db {
         )
     }
 
+    fn sync_scope_row_filter_expr(scope: &SyncScope) -> Result<Option<crate::sql::ast::Expr>> {
+        match scope.row_filter.as_deref() {
+            Some(filter_sql) => Ok(Some(parse_expression_sql(filter_sql).map_err(|error| {
+                DbError::sql(format!(
+                    "invalid row filter for sync scope '{}': {error}",
+                    scope.name
+                ))
+            })?)),
+            None => Ok(None),
+        }
+    }
+
+    fn sync_scope_record_matches(
+        &self,
+        scope: &SyncScope,
+        record: &SyncJournalRecord,
+    ) -> Result<bool> {
+        if !scope
+            .include_tables
+            .iter()
+            .any(|table_name| table_name.eq_ignore_ascii_case(&record.table))
+        {
+            return Ok(false);
+        }
+        let Some(expr) = Self::sync_scope_row_filter_expr(scope)? else {
+            return Ok(true);
+        };
+        let runtime = self.runtime_for_metadata_inspection()?;
+        let table = runtime
+            .catalog
+            .table(&record.table)
+            .ok_or_else(|| DbError::sql(format!("unknown table '{}'", record.table)))?;
+        let payload = match record.operation.as_str() {
+            "delete" => &record.primary_key,
+            "insert" | "update" => record
+                .after
+                .as_ref()
+                .ok_or_else(|| DbError::sql("sync record missing after payload"))?,
+            other => {
+                return Err(DbError::sql(format!("unsupported operation '{other}'")));
+            }
+        };
+        let payload = payload.as_object().ok_or_else(|| {
+            DbError::sql(format!(
+                "sync record for table '{}' must use an object payload",
+                record.table
+            ))
+        })?;
+
+        let mut values = Vec::with_capacity(scope.filter_columns.len());
+        for column_name in &scope.filter_columns {
+            let column = table
+                .columns
+                .iter()
+                .find(|candidate| candidate.name.eq_ignore_ascii_case(column_name))
+                .ok_or_else(|| {
+                    DbError::sql(format!(
+                        "sync scope column '{column_name}' is missing from table '{}'",
+                        table.name
+                    ))
+                })?;
+            let json_value = payload.get(&column.name).ok_or_else(|| {
+                DbError::sql(format!(
+                    "sync record for table '{}' is missing scoped column '{}'",
+                    table.name, column.name
+                ))
+            })?;
+            values.push(json_to_typed_value(
+                &table.name,
+                &column.name,
+                &column.column_type,
+                json_value,
+            )?);
+        }
+
+        row_satisfies_expression(&runtime, &table.name, &scope.filter_columns, &values, &expr)
+    }
+
+    fn sync_filter_records_for_scope(
+        &self,
+        scope: &SyncScope,
+        records: Vec<SyncJournalRecord>,
+    ) -> Result<Vec<SyncJournalRecord>> {
+        let mut filtered = Vec::new();
+        for record in records {
+            if self.sync_scope_record_matches(scope, &record)? {
+                filtered.push(record);
+            }
+        }
+        Ok(filtered)
+    }
+
+    fn sync_validate_batch_for_scope(
+        &self,
+        scope: &SyncScope,
+        batch: &SyncChangeBatch,
+    ) -> Result<()> {
+        let runtime = self.runtime_for_metadata_inspection()?;
+        for record in &batch.records {
+            if !scope
+                .include_tables
+                .iter()
+                .any(|table_name| table_name.eq_ignore_ascii_case(&record.table))
+            {
+                return Err(DbError::sql(format!(
+                    "sync batch contains table '{}' which is outside scope '{}'",
+                    record.table, scope.name
+                )));
+            }
+            if scope.row_filter.is_some() {
+                let table = runtime
+                    .catalog
+                    .table(&record.table)
+                    .ok_or_else(|| DbError::sql(format!("unknown table '{}'", record.table)))?;
+                let payload = match record.operation.as_str() {
+                    "delete" => &record.primary_key,
+                    "insert" | "update" => record
+                        .after
+                        .as_ref()
+                        .ok_or_else(|| DbError::sql("sync record missing after payload"))?,
+                    other => {
+                        return Err(DbError::sql(format!("unsupported operation '{other}'")));
+                    }
+                };
+                let payload = payload.as_object().ok_or_else(|| {
+                    DbError::sql(format!(
+                        "sync record for table '{}' must use an object payload",
+                        record.table
+                    ))
+                })?;
+                let mut values = Vec::with_capacity(scope.filter_columns.len());
+                for column_name in &scope.filter_columns {
+                    let column = table
+                        .columns
+                        .iter()
+                        .find(|candidate| candidate.name.eq_ignore_ascii_case(column_name))
+                        .ok_or_else(|| {
+                            DbError::sql(format!(
+                                "sync scope column '{column_name}' is missing from table '{}'",
+                                table.name
+                            ))
+                        })?;
+                    let json_value = payload.get(&column.name).ok_or_else(|| {
+                        DbError::sql(format!(
+                            "sync record for table '{}' is missing scoped column '{}'",
+                            table.name, column.name
+                        ))
+                    })?;
+                    values.push(json_to_typed_value(
+                        &table.name,
+                        &column.name,
+                        &column.column_type,
+                        json_value,
+                    )?);
+                }
+                if !row_satisfies_expression(
+                    &runtime,
+                    &table.name,
+                    &scope.filter_columns,
+                    &values,
+                    &Self::sync_scope_row_filter_expr(scope)?
+                        .ok_or_else(|| DbError::internal("scope row filter expression missing"))?,
+                )? {
+                    return Err(DbError::sql(format!(
+                        "sync batch contains record for table '{}' that does not match scope '{}'",
+                        record.table, scope.name
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn sync_export_batch(&self, since_seq: u64, limit: usize) -> Result<SyncChangeBatch> {
         let records = self.sync_pending_changes(since_seq, limit)?;
         SyncChangeBatch::from_records(records)
     }
 
+    pub fn sync_conflict_policy(&self) -> Result<SyncConflictPolicyConfig> {
+        let default_policy = self
+            .sync_read_metadata("conflict_policy")?
+            .map(|value| SyncConflictPolicy::from_str(&value))
+            .transpose()?
+            .unwrap_or_default();
+        let origin_priority = match self.sync_read_metadata("conflict_origin_priority")? {
+            Some(value) => serde_json::from_str::<Vec<String>>(&value).map_err(|error| {
+                DbError::sql(format!("invalid sync conflict origin priority metadata: {error}"))
+            })?,
+            None => Vec::new(),
+        };
+        Ok(SyncConflictPolicyConfig {
+            default_policy,
+            origin_priority,
+        })
+    }
+
+    pub fn sync_set_conflict_policy(
+        &self,
+        policy: SyncConflictPolicy,
+        origin_priority: &[&str],
+    ) -> Result<()> {
+        self.ensure_sync_tables()?;
+        let origin_priority = origin_priority
+            .iter()
+            .map(|value| value.trim())
+            .map(|value| {
+                if value.is_empty() {
+                    Err(DbError::sql(
+                        "sync conflict origin priority entries must not be empty",
+                    ))
+                } else {
+                    Ok(value.to_string())
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.sync_upsert_metadata("conflict_policy", policy.as_str())?;
+        self.sync_upsert_metadata(
+            "conflict_origin_priority",
+            &serde_json::to_string(&origin_priority).map_err(|error| {
+                DbError::internal(format!(
+                    "failed to serialize sync conflict origin priority: {error}"
+                ))
+            })?,
+        )?;
+        Ok(())
+    }
+
     pub fn sync_import_batch(&self, batch: &SyncChangeBatch) -> Result<SyncImportSummary> {
+        let policy = self.sync_conflict_policy()?.default_policy;
+        self.sync_import_batch_with_policy(batch, policy)
+    }
+
+    pub fn sync_import_batch_with_policy(
+        &self,
+        batch: &SyncChangeBatch,
+        policy: SyncConflictPolicy,
+    ) -> Result<SyncImportSummary> {
         batch.validate()?;
         self.ensure_sync_tables()?;
 
@@ -5278,7 +5790,11 @@ impl Db {
             .replica_id()
             .or_else(|| self.sync_read_metadata("replica_id").ok().flatten());
         let batch_source_replica_id = batch.source_replica_id.as_deref();
-        let batch_last_sequence = batch.last_sequence;
+        let batch_watermark = batch.source_high_watermark.or(batch.last_sequence);
+        let current_peer_watermark = match batch_source_replica_id {
+            Some(replica_id) => self.sync_peer_watermark(replica_id)?,
+            None => None,
+        };
 
         if let Some(local_replica_id) = local_replica_id.as_deref() {
             if batch_source_replica_id == Some(local_replica_id) {
@@ -5289,20 +5805,13 @@ impl Db {
             }
         }
 
-        let current_peer_watermark = match batch_source_replica_id {
-            Some(replica_id) => self.sync_peer_watermark(replica_id)?,
-            None => None,
-        };
-
         let _suppress_capture = self.inner.sync_ctx.suppress_capture();
-
         struct SyncImportTransaction<'a>(&'a Db, bool);
         impl<'a> SyncImportTransaction<'a> {
             fn new(db: &'a Db) -> Result<Self> {
                 db.begin_transaction()?;
                 Ok(Self(db, true))
             }
-
             fn commit(mut self) -> Result<()> {
                 self.1 = false;
                 self.0.commit_transaction()?;
@@ -5317,11 +5826,11 @@ impl Db {
             }
         }
 
-        if let Some(last_sequence) = batch_last_sequence {
-            if current_peer_watermark.is_some_and(|watermark| last_sequence <= watermark) {
+        if let Some(batch_watermark) = batch_watermark {
+            if current_peer_watermark.is_some_and(|watermark| batch_watermark <= watermark) {
                 if let Some(replica_id) = batch_source_replica_id {
                     let watermark = current_peer_watermark
-                        .map_or(last_sequence, |current| current.max(last_sequence));
+                        .map_or(batch_watermark, |current| current.max(batch_watermark));
                     self.sync_upsert_metadata(
                         &peer_watermark_key(replica_id),
                         &watermark.to_string(),
@@ -5337,10 +5846,10 @@ impl Db {
         }
 
         let tx = SyncImportTransaction::new(self)?;
-
         let mut applied = 0usize;
         let mut skipped = 0usize;
         let mut conflicted = 0usize;
+        let mut stop_conflict = None;
 
         for record in &batch.records {
             if let Some(local_replica_id) = local_replica_id.as_deref() {
@@ -5373,300 +5882,70 @@ impl Db {
                 )));
             }
 
-            let table = match runtime.catalog.table(&record.table) {
-                Some(table) => table,
-                None => {
-                    return Err(DbError::sql(format!("unknown table '{}'", record.table)));
-                }
-            };
-
+            let table = runtime
+                .catalog
+                .table(&record.table)
+                .ok_or_else(|| DbError::sql(format!("unknown table '{}'", record.table)))?;
             if crate::sync::is_internal_table_name(&table.name) {
                 return Err(DbError::sql(format!(
                     "cannot import into internal table '{}'",
                     table.name
                 )));
             }
-
             let marker_key = imported_record_key(&record.replica_id, record.sequence);
             if self.sync_read_metadata(&marker_key)?.is_some() {
                 skipped += 1;
                 continue;
             }
 
-            let operation = match record.operation.as_str() {
-                "insert" => SyncOperation::Insert,
-                "update" => SyncOperation::Update,
-                "delete" => SyncOperation::Delete,
-                other => {
-                    return Err(DbError::sql(format!("unsupported operation '{other}'")));
-                }
-            };
-
-            let primary_key = record
-                .primary_key
-                .as_object()
-                .ok_or_else(|| DbError::sql("primary_key must be an object"))?;
-            if table.primary_key_columns.is_empty() {
-                return Err(DbError::sql(format!(
-                    "table '{}' has no primary key column",
-                    table.name
-                )));
-            }
-            for pk_col in &table.primary_key_columns {
-                if !primary_key.contains_key(pk_col) {
-                    return Err(DbError::sql(format!(
-                        "missing primary key column '{}' in record for table '{}'",
-                        pk_col, table.name
-                    )));
-                }
-            }
-            for key in primary_key.keys() {
-                if !table.primary_key_columns.iter().any(|column| column == key) {
-                    return Err(DbError::sql(format!(
-                        "unknown primary key column '{key}' for table '{}'",
-                        table.name
-                    )));
-                }
-            }
-
-            let conflict_result = match operation {
-                SyncOperation::Insert => {
-                    let after = match record.after.as_ref() {
-                        Some(value) => value
-                            .as_object()
-                            .ok_or_else(|| DbError::sql("after must be an object for insert"))?,
-                        None => {
-                            return Err(DbError::sql("insert record missing after payload"));
-                        }
-                    };
-
-                    let mut set_values = Vec::with_capacity(table.columns.len());
-                    let mut set_columns = Vec::with_capacity(table.columns.len());
-                    let mut placeholders = Vec::with_capacity(table.columns.len());
-                    for column in &table.columns {
-                        let json_value = after.get(&column.name).ok_or_else(|| {
-                            DbError::sql(format!(
-                                "missing column '{}' in after payload for table '{}'",
-                                column.name, table.name
-                            ))
-                        })?;
-                        set_values.push(json_to_typed_value(
-                            &table.name,
-                            &column.name,
-                            &column.column_type,
-                            json_value,
-                        )?);
-                        set_columns.push(sql_identifier(&column.name));
-                        placeholders.push(format!("${}", set_values.len()));
-                    }
-                    for key in after.keys() {
-                        if !table.columns.iter().any(|column| column.name == *key) {
-                            return Err(DbError::sql(format!(
-                                "unknown column '{key}' in insert payload for table '{}'",
-                                table.name
-                            )));
-                        }
-                    }
-
-                    let sql = format!(
-                        "INSERT INTO {} ({}) VALUES ({})",
-                        sql_identifier(&table.name),
-                        set_columns.join(", "),
-                        placeholders.join(", ")
-                    );
-                    match self.execute_with_params(&sql, &set_values) {
-                        Ok(_) => Ok(None),
-                        Err(error) => Err(error),
-                    }
-                }
-                SyncOperation::Update => {
-                    let after = match record.after.as_ref() {
-                        Some(value) => value
-                            .as_object()
-                            .ok_or_else(|| DbError::sql("after must be an object for update"))?,
-                        None => {
-                            return Err(DbError::sql("update record missing after payload"));
-                        }
-                    };
-                    if table.columns.len() > after.len() {
-                        let missing = table
-                            .columns
-                            .iter()
-                            .find(|column| !after.contains_key(&column.name))
-                            .map_or_else(
-                                || table.columns[0].name.clone(),
-                                |column| column.name.clone(),
-                            );
-                        return Err(DbError::sql(format!(
-                            "missing column '{missing}' in update payload for table '{}'",
-                            table.name
-                        )));
-                    }
-                    for key in after.keys() {
-                        if !table.columns.iter().any(|column| column.name == *key) {
-                            return Err(DbError::sql(format!(
-                                "unknown column '{key}' in update payload for table '{}'",
-                                table.name
-                            )));
-                        }
-                    }
-                    let mut params =
-                        Vec::with_capacity(table.columns.len() + table.primary_key_columns.len());
-                    let mut expressions = Vec::with_capacity(table.columns.len());
-                    for column in &table.columns {
-                        let json_value = after.get(&column.name).ok_or_else(|| {
-                            DbError::sql(format!(
-                                "missing column '{}' in update payload for table '{}'",
-                                column.name, table.name
-                            ))
-                        })?;
-                        let value = json_to_typed_value(
-                            &table.name,
-                            &column.name,
-                            &column.column_type,
-                            json_value,
-                        )?;
-                        params.push(value);
-                        expressions.push(format!(
-                            "{} = ${}",
-                            sql_identifier(&column.name),
-                            params.len()
-                        ));
-                    }
-                    let set_clause = expressions.join(", ");
-                    let mut where_parts = Vec::with_capacity(table.primary_key_columns.len());
-                    for pk_col in &table.primary_key_columns {
-                        let column = table
-                            .columns
-                            .iter()
-                            .find(|column| column.name == *pk_col)
-                            .ok_or_else(|| {
-                                DbError::sql(format!(
-                                    "table '{}' missing primary key column '{}'",
-                                    table.name, pk_col
-                                ))
-                            })?;
-                        let json_value = primary_key.get(pk_col).ok_or_else(|| {
-                            DbError::sql(format!(
-                                "missing primary key column '{pk_col}' in record for table '{}'",
-                                table.name
-                            ))
-                        })?;
-                        let value = json_to_typed_value(
-                            &table.name,
-                            pk_col,
-                            &column.column_type,
-                            json_value,
-                        )?;
-                        params.push(value);
-                        where_parts.push(format!("{} = ${}", sql_identifier(pk_col), params.len()));
-                    }
-                    let sql = format!(
-                        "UPDATE {} SET {} WHERE {}",
-                        sql_identifier(&table.name),
-                        set_clause,
-                        where_parts.join(" AND ")
-                    );
-                    match self.execute_with_params(&sql, &params) {
-                        Ok(result) if result.affected_rows() == 0 => Ok(Some((
-                            String::from("missing_target"),
-                            String::from("update affected no rows"),
-                        ))),
-                        Ok(_) => Ok(None),
-                        Err(error) => Err(error),
-                    }
-                }
-                SyncOperation::Delete => {
-                    let mut where_parts = Vec::with_capacity(table.primary_key_columns.len());
-                    let mut where_values = Vec::with_capacity(table.primary_key_columns.len());
-                    for pk_col in &table.primary_key_columns {
-                        let column = table
-                            .columns
-                            .iter()
-                            .find(|column| column.name == *pk_col)
-                            .ok_or_else(|| {
-                                DbError::sql(format!(
-                                    "table '{}' missing primary key column '{}'",
-                                    table.name, pk_col
-                                ))
-                            })?;
-                        let json_value = primary_key.get(pk_col).ok_or_else(|| {
-                            DbError::sql(format!(
-                                "missing primary key column '{pk_col}' in record for table '{}'",
-                                table.name
-                            ))
-                        })?;
-                        let value = json_to_typed_value(
-                            &table.name,
-                            pk_col,
-                            &column.column_type,
-                            json_value,
-                        )?;
-                        where_values.push(value);
-                        where_parts.push(format!(
-                            "{} = ${}",
-                            sql_identifier(pk_col),
-                            where_values.len()
-                        ));
-                    }
-                    let sql = format!(
-                        "DELETE FROM {} WHERE {}",
-                        sql_identifier(&table.name),
-                        where_parts.join(" AND ")
-                    );
-                    match self.execute_with_params(&sql, &where_values) {
-                        Ok(result) if result.affected_rows() == 0 => Ok(Some((
-                            String::from("missing_target"),
-                            String::from("delete affected no rows"),
-                        ))),
-                        Ok(_) => Ok(None),
-                        Err(error) => Err(error),
-                    }
-                }
-            };
-
-            match conflict_result {
-                Ok(Some((conflict_type, message))) => {
-                    self.record_sync_conflict(batch, record, &conflict_type, &message, None)?;
-                    conflicted += 1;
-                }
-                Ok(None) => {
+            let outcome = self.sync_apply_import_record(batch, record, table, &policy)?;
+            match outcome {
+                SyncImportRecordOutcome::Applied => {
                     self.sync_upsert_metadata(&marker_key, "applied")?;
                     applied += 1;
                 }
-                Err(error) if matches!(error, DbError::Constraint { .. }) => {
-                    self.record_sync_conflict(
-                        batch,
-                        record,
-                        "constraint_error",
-                        &error.to_string(),
-                        None,
-                    )?;
+                SyncImportRecordOutcome::Skipped => {
+                    skipped += 1;
+                }
+                SyncImportRecordOutcome::Conflict(conflict) => {
+                    if matches!(policy, SyncConflictPolicy::Stop) {
+                        stop_conflict = Some((record.clone(), conflict));
+                        break;
+                    }
+                    self.record_sync_conflict_with_data(batch, record, &conflict)?;
                     conflicted += 1;
                 }
-                Err(error) => {
-                    self.record_sync_conflict(
-                        batch,
-                        record,
-                        "apply_error",
-                        &error.to_string(),
-                        None,
-                    )?;
+                SyncImportRecordOutcome::Resolved(conflict) => {
+                    self.sync_upsert_metadata(&marker_key, "applied")?;
+                    self.record_sync_conflict_with_data(batch, record, &conflict)?;
+                    applied += 1;
                     conflicted += 1;
+                }
+                SyncImportRecordOutcome::Stop(conflict) => {
+                    stop_conflict = Some((record.clone(), conflict));
+                    break;
                 }
             }
         }
 
-        if let (Some(replica_id), Some(last_sequence)) =
-            (batch_source_replica_id, batch_last_sequence)
+        if let Some((record, conflict)) = stop_conflict {
+            drop(tx);
+            let conflict_id = self.record_sync_conflict_with_data(batch, &record, &conflict)?;
+            return Err(DbError::sql(format!(
+                "sync import stopped on conflict {}",
+                conflict_id
+            )));
+        }
+
+        if let (Some(replica_id), Some(batch_watermark)) =
+            (batch_source_replica_id, batch_watermark)
         {
-            let watermark =
-                current_peer_watermark.map_or(last_sequence, |current| current.max(last_sequence));
+            let watermark = current_peer_watermark
+                .map_or(batch_watermark, |current| current.max(batch_watermark));
             self.sync_upsert_metadata(&peer_watermark_key(replica_id), &watermark.to_string())?;
         }
 
         tx.commit()?;
-
         Ok(SyncImportSummary {
             seen: batch.record_count,
             applied,
@@ -5720,6 +5999,144 @@ impl Db {
                 }
             }
         }
+    }
+
+    pub fn sync_conflicts_all(&self) -> Result<Vec<SyncConflict>> {
+        let sql = format!(
+            "SELECT * FROM {} ORDER BY conflict_id",
+            crate::sync::CONFLICTS_TABLE
+        );
+        match self.execute(&sql) {
+            Ok(result) => result.rows().iter().map(sync_conflict_from_row).collect(),
+            Err(error) => {
+                let message = error.to_string();
+                if message.contains("no such table") || message.contains("unknown table") {
+                    Ok(Vec::new())
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    pub fn sync_conflict(&self, conflict_id: i64) -> Result<Option<SyncConflict>> {
+        let sql = format!(
+            "SELECT * FROM {} WHERE conflict_id = {}",
+            crate::sync::CONFLICTS_TABLE,
+            conflict_id
+        );
+        match self.execute(&sql) {
+            Ok(result) => Ok(result.rows().first().map(sync_conflict_from_row).transpose()?),
+            Err(error) => {
+                let message = error.to_string();
+                if message.contains("no such table") || message.contains("unknown table") {
+                    Ok(None)
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    pub fn sync_resolve_conflict_keep_local(
+        &self,
+        conflict_id: i64,
+        resolved_by: Option<&str>,
+        note: Option<&str>,
+    ) -> Result<bool> {
+        self.sync_update_conflict_resolution(
+            conflict_id,
+            Some("keep_local"),
+            resolved_by,
+            note,
+            Some(current_time_micros()),
+        )
+    }
+
+    pub fn sync_resolve_conflict_apply_remote(
+        &self,
+        conflict_id: i64,
+        resolved_by: Option<&str>,
+        note: Option<&str>,
+    ) -> Result<bool> {
+        let Some(conflict) = self.sync_conflict(conflict_id)? else {
+            return Ok(false);
+        };
+        let record: SyncJournalRecord = serde_json::from_value(conflict.remote_record_json.clone())
+            .map_err(|error| DbError::corruption(format!(
+                "malformed sync conflict remote_record_json: {error}"
+            )))?;
+        let batch = SyncChangeBatch::from_records(vec![record.clone()])?;
+        let policy = SyncConflictPolicy::Record;
+        let _suppress_capture = self.inner.sync_ctx.suppress_capture();
+        let tx = {
+            self.begin_transaction()?;
+            struct Tx<'a>(&'a Db, bool);
+            impl<'a> Drop for Tx<'a> {
+                fn drop(&mut self) {
+                    if self.1 {
+                        let _ = self.0.rollback_transaction();
+                    }
+                }
+            }
+            impl<'a> Tx<'a> {
+                fn commit(mut self) -> Result<()> {
+                    self.1 = false;
+                    self.0.commit_transaction()?;
+                    Ok(())
+                }
+            }
+            Tx(self, true)
+        };
+        let runtime = self.runtime_for_metadata_inspection()?;
+        let table = runtime
+            .catalog
+            .table(&record.table)
+            .ok_or_else(|| DbError::sql(format!("unknown table '{}'", record.table)))?;
+        match self.sync_apply_import_record(&batch, &record, table, &policy)? {
+            SyncImportRecordOutcome::Applied => {
+                self.sync_upsert_metadata(
+                    &imported_record_key(&record.replica_id, record.sequence),
+                    "applied",
+                )?;
+                self.sync_update_conflict_resolution(
+                    conflict_id,
+                    Some("apply_remote"),
+                    resolved_by,
+                    note,
+                    Some(current_time_micros()),
+                )?;
+                tx.commit()?;
+                Ok(true)
+            }
+            SyncImportRecordOutcome::Resolved(_) => {
+                self.sync_upsert_metadata(
+                    &imported_record_key(&record.replica_id, record.sequence),
+                    "applied",
+                )?;
+                self.sync_update_conflict_resolution(
+                    conflict_id,
+                    Some("apply_remote"),
+                    resolved_by,
+                    note,
+                    Some(current_time_micros()),
+                )?;
+                tx.commit()?;
+                Ok(true)
+            }
+            SyncImportRecordOutcome::Conflict(conflict) | SyncImportRecordOutcome::Stop(conflict) => {
+                let _ = conflict;
+                Err(DbError::sql(format!(
+                    "cannot apply remote conflict {} because replay now fails",
+                    conflict_id
+                )))
+            }
+            SyncImportRecordOutcome::Skipped => Ok(false),
+        }
+    }
+
+    pub fn sync_reopen_conflict(&self, conflict_id: i64) -> Result<bool> {
+        self.sync_update_conflict_resolution(conflict_id, None, None, None, None)
     }
 
     pub fn sync_prune_journal_through(&self, sequence: u64) -> Result<usize> {
@@ -5910,14 +6327,12 @@ impl Db {
             .collect()
     }
 
-    fn record_sync_conflict(
+    fn record_sync_conflict_with_data(
         &self,
         batch: &SyncChangeBatch,
         record: &SyncJournalRecord,
-        conflict_type: &str,
-        message: &str,
-        local_row_json: Option<serde_json::Value>,
-    ) -> Result<()> {
+        conflict: &SyncConflictRecordData,
+    ) -> Result<i64> {
         let conflict_id = self.next_sync_conflict_id()?;
         let remote_sequence = i64::try_from(record.sequence).map_err(|_| {
             DbError::internal("remote_sequence exceeds INT64 range for sync conflict")
@@ -5934,9 +6349,28 @@ impl Db {
             .duration_since(SystemTime::UNIX_EPOCH)
             .map(|duration| duration.as_micros() as i64)
             .unwrap_or(0);
-        let local_row_json_text = local_row_json.map(|value| value.to_string());
+        let local_row_json_text = conflict.local_row_json.as_ref().map(|value| value.to_string());
+        let resolution = conflict.resolution.as_deref().unwrap_or("NULL");
+        let resolved_at_micros = conflict
+            .resolved_at_micros
+            .map_or_else(|| "NULL".to_string(), |value| value.to_string());
+        let resolved_by = conflict
+            .resolved_by
+            .as_deref()
+            .map(sql_text_literal)
+            .unwrap_or_else(|| "NULL".to_string());
+        let resolution_note = conflict
+            .resolution_note
+            .as_deref()
+            .map(sql_text_literal)
+            .unwrap_or_else(|| "NULL".to_string());
+        let policy_name = conflict
+            .policy_name
+            .as_deref()
+            .map(sql_text_literal)
+            .unwrap_or_else(|| "NULL".to_string());
         let sql = format!(
-            "INSERT INTO {table} (conflict_id, batch_id, remote_replica_id, remote_sequence, table_name, operation, conflict_type, message, primary_key_json, remote_record_json, local_row_json, created_at_micros, resolved) VALUES ({conflict_id}, {batch_id}, {remote_replica_id}, {remote_sequence}, {table_name}, {operation}, {conflict_type}, {message}, {primary_key_json}, {remote_record_json}, {local_row_json}, {created_at_micros}, 0)",
+            "INSERT INTO {table} (conflict_id, batch_id, remote_replica_id, remote_sequence, table_name, operation, conflict_type, message, primary_key_json, remote_record_json, local_row_json, created_at_micros, resolved, resolution, resolved_at_micros, resolved_by, resolution_note, policy_name, local_record_json) VALUES ({conflict_id}, {batch_id}, {remote_replica_id}, {remote_sequence}, {table_name}, {operation}, {conflict_type}, {message}, {primary_key_json}, {remote_record_json}, {local_row_json}, {created_at_micros}, {resolved}, {resolution}, {resolved_at_micros}, {resolved_by}, {resolution_note}, {policy_name}, {local_record_json})",
             table = crate::sync::CONFLICTS_TABLE,
             conflict_id = conflict_id,
             batch_id = sql_text_literal(&batch.batch_id),
@@ -5944,8 +6378,8 @@ impl Db {
             remote_sequence = remote_sequence,
             table_name = sql_text_literal(&record.table),
             operation = sql_text_literal(&record.operation),
-            conflict_type = sql_text_literal(conflict_type),
-            message = sql_text_literal(message),
+            conflict_type = sql_text_literal(&conflict.conflict_type),
+            message = sql_text_literal(&conflict.message),
             primary_key_json = sql_text_literal(&primary_key_json.to_string()),
             remote_record_json = sql_text_literal(&remote_record_json.to_string()),
             local_row_json = local_row_json_text
@@ -5953,9 +6387,503 @@ impl Db {
                 .map(sql_text_literal)
                 .unwrap_or_else(|| "NULL".to_string()),
             created_at_micros = created_at_micros,
+            resolved = if conflict.resolution.is_some() { 1 } else { 0 },
+            resolution = if conflict.resolution.is_some() {
+                sql_text_literal(resolution)
+            } else {
+                "NULL".to_string()
+            },
+            resolved_at_micros = resolved_at_micros,
+            resolved_by = resolved_by,
+            resolution_note = resolution_note,
+            policy_name = policy_name,
+            local_record_json = conflict
+                .local_row_json
+                .as_ref()
+                .map(|value| sql_text_literal(&value.to_string()))
+                .unwrap_or_else(|| "NULL".to_string()),
         );
         let _ = self.execute(&sql)?;
-        Ok(())
+        Ok(conflict_id)
+    }
+
+    fn sync_capture_local_row_json(
+        &self,
+        table: &TableSchema,
+        primary_key: &serde_json::Map<String, JsonValue>,
+    ) -> Result<Option<serde_json::Value>> {
+        let runtime = self.runtime_for_metadata_inspection()?;
+        let Some(source) = runtime.table_row_source(&table.name) else {
+            return Ok(None);
+        };
+        for row in source.rows() {
+            let row = row?;
+            let values = row.values();
+            let mut matches = true;
+            for pk_col in &table.primary_key_columns {
+                let column = table
+                    .columns
+                    .iter()
+                    .find(|column| column.name == *pk_col)
+                    .ok_or_else(|| {
+                        DbError::sql(format!(
+                            "table '{}' missing primary key column '{}'",
+                            table.name, pk_col
+                        ))
+                    })?;
+                let json_value = primary_key.get(pk_col).ok_or_else(|| {
+                    DbError::sql(format!(
+                        "missing primary key column '{pk_col}' in record for table '{}'",
+                        table.name
+                    ))
+                })?;
+                let expected = json_to_typed_value(
+                    &table.name,
+                    pk_col,
+                    &column.column_type,
+                    json_value,
+                )?;
+                let Some(actual) = values.get(
+                    table
+                        .columns
+                        .iter()
+                        .position(|candidate| candidate.name == *pk_col)
+                        .ok_or_else(|| {
+                            DbError::sql(format!(
+                                "table '{}' missing primary key column '{}'",
+                                table.name, pk_col
+                            ))
+                        })?,
+                ) else {
+                    matches = false;
+                    break;
+                };
+                if actual != &expected {
+                    matches = false;
+                    break;
+                }
+            }
+            if matches {
+                return Ok(Some(crate::sync::build_after_json(table, values)));
+            }
+        }
+        Ok(None)
+    }
+
+    fn sync_apply_import_record(
+        &self,
+        batch: &SyncChangeBatch,
+        record: &SyncJournalRecord,
+        table: &TableSchema,
+        policy: &SyncConflictPolicy,
+    ) -> Result<SyncImportRecordOutcome> {
+        let primary_key = record
+            .primary_key
+            .as_object()
+            .ok_or_else(|| DbError::sql("primary_key must be an object"))?;
+        let local_row_json = self.sync_capture_local_row_json(table, primary_key)?;
+        let operation = match record.operation.as_str() {
+            "insert" => SyncOperation::Insert,
+            "update" => SyncOperation::Update,
+            "delete" => SyncOperation::Delete,
+            other => return Err(DbError::sql(format!("unsupported operation '{other}'"))),
+        };
+
+        let remote_wins = match policy {
+            SyncConflictPolicy::Record | SyncConflictPolicy::Stop => false,
+            SyncConflictPolicy::LastWriterWins => true,
+            SyncConflictPolicy::OriginPriority => {
+                let config = self.sync_conflict_policy()?;
+                let Some(local_replica_id) = self
+                    .inner
+                    .sync_ctx
+                    .replica_id()
+                    .or_else(|| self.sync_read_metadata("replica_id").ok().flatten())
+                else {
+                    false
+                };
+                let remote_index = config
+                    .origin_priority
+                    .iter()
+                    .position(|replica| replica == &record.replica_id);
+                let local_index = config
+                    .origin_priority
+                    .iter()
+                    .position(|replica| replica == &local_replica_id);
+                matches!((remote_index, local_index), (Some(remote), Some(local)) if remote < local)
+            }
+        };
+
+        let conflict_type_for_constraint = |op: SyncOperation| match op {
+            SyncOperation::Insert => "insert_insert",
+            SyncOperation::Update => "update_update",
+            SyncOperation::Delete => "delete_update",
+        };
+
+        let apply_remote_replace = |operation: SyncOperation| -> Result<()> {
+            let sql = format!(
+                "DELETE FROM {} WHERE {}",
+                sql_identifier(&table.name),
+                table
+                    .primary_key_columns
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, pk_col)| format!("{} = ${}", sql_identifier(pk_col), idx + 1))
+                    .collect::<Vec<_>>()
+                    .join(" AND ")
+            );
+            let mut where_values = Vec::with_capacity(table.primary_key_columns.len());
+            for pk_col in &table.primary_key_columns {
+                let column = table
+                    .columns
+                    .iter()
+                    .find(|column| column.name == *pk_col)
+                    .ok_or_else(|| {
+                        DbError::sql(format!(
+                            "table '{}' missing primary key column '{}'",
+                            table.name, pk_col
+                        ))
+                    })?;
+                let json_value = primary_key.get(pk_col).ok_or_else(|| {
+                    DbError::sql(format!(
+                        "missing primary key column '{pk_col}' in record for table '{}'",
+                        table.name
+                    ))
+                })?;
+                where_values.push(json_to_typed_value(
+                    &table.name,
+                    pk_col,
+                    &column.column_type,
+                    json_value,
+                )?);
+            }
+            let _ = self.execute_with_params(&sql, &where_values)?;
+
+            if matches!(operation, SyncOperation::Delete) {
+                return Ok(());
+            }
+
+            let after = record
+                .after
+                .as_ref()
+                .ok_or_else(|| DbError::sql("remote record missing after payload"))?
+                .as_object()
+                .ok_or_else(|| DbError::sql("remote record after payload must be an object"))?;
+            let mut columns = Vec::with_capacity(table.columns.len());
+            let mut values = Vec::with_capacity(table.columns.len());
+            for column in &table.columns {
+                let json_value = after.get(&column.name).ok_or_else(|| {
+                    DbError::sql(format!(
+                        "missing column '{}' in after payload for table '{}'",
+                        column.name, table.name
+                    ))
+                })?;
+                columns.push(sql_identifier(&column.name));
+                values.push(json_to_typed_value(
+                    &table.name,
+                    &column.name,
+                    &column.column_type,
+                    json_value,
+                )?);
+            }
+            let sql = format!(
+                "INSERT INTO {} ({}) VALUES ({})",
+                sql_identifier(&table.name),
+                columns.join(", "),
+                (1..=values.len())
+                    .map(|idx| format!("${idx}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            let _ = self.execute_with_params(&sql, &values)?;
+            Ok(())
+        };
+
+        match operation {
+            SyncOperation::Insert => {
+                let after = record
+                    .after
+                    .as_ref()
+                    .ok_or_else(|| DbError::sql("insert record missing after payload"))?
+                    .as_object()
+                    .ok_or_else(|| DbError::sql("after must be an object for insert"))?;
+                let mut columns = Vec::with_capacity(table.columns.len());
+                let mut values = Vec::with_capacity(table.columns.len());
+                for column in &table.columns {
+                    let json_value = after.get(&column.name).ok_or_else(|| {
+                        DbError::sql(format!(
+                            "missing column '{}' in after payload for table '{}'",
+                            column.name, table.name
+                        ))
+                    })?;
+                    columns.push(sql_identifier(&column.name));
+                    values.push(json_to_typed_value(
+                        &table.name,
+                        &column.name,
+                        &column.column_type,
+                        json_value,
+                    )?);
+                }
+                let sql = format!(
+                    "INSERT INTO {} ({}) VALUES ({})",
+                    sql_identifier(&table.name),
+                    columns.join(", "),
+                    (1..=values.len())
+                        .map(|idx| format!("${idx}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                match self.execute_with_params(&sql, &values) {
+                    Ok(_) => Ok(SyncImportRecordOutcome::Applied),
+                    Err(DbError::Constraint { message }) if remote_wins => {
+                        apply_remote_replace(SyncOperation::Insert)?;
+                        Ok(SyncImportRecordOutcome::Resolved(SyncConflictRecordData {
+                            conflict_type: "insert_insert".to_string(),
+                            message,
+                            local_row_json,
+                            resolution: Some("remote_applied".to_string()),
+                            resolved_at_micros: Some(current_time_micros()),
+                            resolved_by: Some("sync_policy".to_string()),
+                            resolution_note: None,
+                            policy_name: Some(policy.as_str().to_string()),
+                        }))
+                    }
+                    Err(DbError::Constraint { message }) => Ok(SyncImportRecordOutcome::Conflict(
+                        SyncConflictRecordData {
+                            conflict_type: if local_row_json.is_some() {
+                                "insert_insert".to_string()
+                            } else {
+                                "constraint_error".to_string()
+                            },
+                            message,
+                            local_row_json,
+                            resolution: None,
+                            resolved_at_micros: None,
+                            resolved_by: None,
+                            resolution_note: None,
+                            policy_name: Some(policy.as_str().to_string()),
+                        },
+                    )),
+                    Err(error) => Ok(SyncImportRecordOutcome::Conflict(SyncConflictRecordData {
+                        conflict_type: "apply_error".to_string(),
+                        message: error.to_string(),
+                        local_row_json,
+                        resolution: None,
+                        resolved_at_micros: None,
+                        resolved_by: None,
+                        resolution_note: None,
+                        policy_name: Some(policy.as_str().to_string()),
+                    })),
+                }
+            }
+            SyncOperation::Update => {
+                let after = record
+                    .after
+                    .as_ref()
+                    .ok_or_else(|| DbError::sql("update record missing after payload"))?
+                    .as_object()
+                    .ok_or_else(|| DbError::sql("after must be an object for update"))?;
+                let mut params = Vec::with_capacity(table.columns.len() + table.primary_key_columns.len());
+                let mut expressions = Vec::with_capacity(table.columns.len());
+                for column in &table.columns {
+                    let json_value = after.get(&column.name).ok_or_else(|| {
+                        DbError::sql(format!(
+                            "missing column '{}' in update payload for table '{}'",
+                            column.name, table.name
+                        ))
+                    })?;
+                    params.push(json_to_typed_value(
+                        &table.name,
+                        &column.name,
+                        &column.column_type,
+                        json_value,
+                    )?);
+                    expressions.push(format!("{} = ${}", sql_identifier(&column.name), params.len()));
+                }
+                for pk_col in &table.primary_key_columns {
+                    let column = table
+                        .columns
+                        .iter()
+                        .find(|column| column.name == *pk_col)
+                        .ok_or_else(|| {
+                            DbError::sql(format!(
+                                "table '{}' missing primary key column '{}'",
+                                table.name, pk_col
+                            ))
+                        })?;
+                    let json_value = primary_key.get(pk_col).ok_or_else(|| {
+                        DbError::sql(format!(
+                            "missing primary key column '{pk_col}' in record for table '{}'",
+                            table.name
+                        ))
+                    })?;
+                    params.push(json_to_typed_value(
+                        &table.name,
+                        pk_col,
+                        &column.column_type,
+                        json_value,
+                    )?);
+                }
+                let sql = format!(
+                    "UPDATE {} SET {} WHERE {}",
+                    sql_identifier(&table.name),
+                    expressions.join(", "),
+                    table
+                        .primary_key_columns
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, pk_col)| format!("{} = ${}", sql_identifier(pk_col), table.columns.len() + idx + 1))
+                        .collect::<Vec<_>>()
+                        .join(" AND ")
+                );
+                match self.execute_with_params(&sql, &params) {
+                    Ok(result) if result.affected_rows() == 0 => Ok(SyncImportRecordOutcome::Conflict(
+                        SyncConflictRecordData {
+                            conflict_type: "missing_target".to_string(),
+                            message: "update affected no rows".to_string(),
+                            local_row_json,
+                            resolution: None,
+                            resolved_at_micros: None,
+                            resolved_by: None,
+                            resolution_note: None,
+                            policy_name: Some(policy.as_str().to_string()),
+                        },
+                    )),
+                    Ok(_) => Ok(SyncImportRecordOutcome::Applied),
+                    Err(DbError::Constraint { message }) if remote_wins => {
+                        apply_remote_replace(SyncOperation::Update)?;
+                        Ok(SyncImportRecordOutcome::Resolved(SyncConflictRecordData {
+                            conflict_type: "update_update".to_string(),
+                            message,
+                            local_row_json,
+                            resolution: Some("remote_applied".to_string()),
+                            resolved_at_micros: Some(current_time_micros()),
+                            resolved_by: Some("sync_policy".to_string()),
+                            resolution_note: None,
+                            policy_name: Some(policy.as_str().to_string()),
+                        }))
+                    }
+                    Err(DbError::Constraint { message }) => Ok(SyncImportRecordOutcome::Conflict(
+                        SyncConflictRecordData {
+                            conflict_type: if local_row_json.is_some() {
+                                "update_update".to_string()
+                            } else {
+                                "constraint_error".to_string()
+                            },
+                            message,
+                            local_row_json,
+                            resolution: None,
+                            resolved_at_micros: None,
+                            resolved_by: None,
+                            resolution_note: None,
+                            policy_name: Some(policy.as_str().to_string()),
+                        },
+                    )),
+                    Err(error) => Ok(SyncImportRecordOutcome::Conflict(SyncConflictRecordData {
+                        conflict_type: "apply_error".to_string(),
+                        message: error.to_string(),
+                        local_row_json,
+                        resolution: None,
+                        resolved_at_micros: None,
+                        resolved_by: None,
+                        resolution_note: None,
+                        policy_name: Some(policy.as_str().to_string()),
+                    })),
+                }
+            }
+            SyncOperation::Delete => {
+                let mut where_values = Vec::with_capacity(table.primary_key_columns.len());
+                let mut where_parts = Vec::with_capacity(table.primary_key_columns.len());
+                for pk_col in &table.primary_key_columns {
+                    let column = table
+                        .columns
+                        .iter()
+                        .find(|column| column.name == *pk_col)
+                        .ok_or_else(|| {
+                            DbError::sql(format!(
+                                "table '{}' missing primary key column '{}'",
+                                table.name, pk_col
+                            ))
+                        })?;
+                    let json_value = primary_key.get(pk_col).ok_or_else(|| {
+                        DbError::sql(format!(
+                            "missing primary key column '{pk_col}' in record for table '{}'",
+                            table.name
+                        ))
+                    })?;
+                    where_values.push(json_to_typed_value(
+                        &table.name,
+                        pk_col,
+                        &column.column_type,
+                        json_value,
+                    )?);
+                    where_parts.push(format!(
+                        "{} = ${}",
+                        sql_identifier(pk_col),
+                        where_values.len()
+                    ));
+                }
+                let sql = format!(
+                    "DELETE FROM {} WHERE {}",
+                    sql_identifier(&table.name),
+                    where_parts.join(" AND ")
+                );
+                match self.execute_with_params(&sql, &where_values) {
+                    Ok(result) if result.affected_rows() == 0 => Ok(SyncImportRecordOutcome::Conflict(
+                        SyncConflictRecordData {
+                            conflict_type: "missing_target".to_string(),
+                            message: "delete affected no rows".to_string(),
+                            local_row_json,
+                            resolution: None,
+                            resolved_at_micros: None,
+                            resolved_by: None,
+                            resolution_note: None,
+                            policy_name: Some(policy.as_str().to_string()),
+                        },
+                    )),
+                    Ok(_) => Ok(SyncImportRecordOutcome::Applied),
+                    Err(DbError::Constraint { message }) if remote_wins => {
+                        apply_remote_replace(SyncOperation::Delete)?;
+                        Ok(SyncImportRecordOutcome::Resolved(SyncConflictRecordData {
+                            conflict_type: "delete_update".to_string(),
+                            message,
+                            local_row_json,
+                            resolution: Some("remote_applied".to_string()),
+                            resolved_at_micros: Some(current_time_micros()),
+                            resolved_by: Some("sync_policy".to_string()),
+                            resolution_note: None,
+                            policy_name: Some(policy.as_str().to_string()),
+                        }))
+                    }
+                    Err(DbError::Constraint { message }) => Ok(SyncImportRecordOutcome::Conflict(
+                        SyncConflictRecordData {
+                            conflict_type: if local_row_json.is_some() {
+                                "delete_update".to_string()
+                            } else {
+                                "constraint_error".to_string()
+                            },
+                            message,
+                            local_row_json,
+                            resolution: None,
+                            resolved_at_micros: None,
+                            resolved_by: None,
+                            resolution_note: None,
+                            policy_name: Some(policy.as_str().to_string()),
+                        },
+                    )),
+                    Err(error) => Ok(SyncImportRecordOutcome::Conflict(SyncConflictRecordData {
+                        conflict_type: "apply_error".to_string(),
+                        message: error.to_string(),
+                        local_row_json,
+                        resolution: None,
+                        resolved_at_micros: None,
+                        resolved_by: None,
+                        resolution_note: None,
+                        policy_name: Some(policy.as_str().to_string()),
+                    })),
+                }
+            }
+        }
     }
 
     fn next_sync_conflict_id(&self) -> Result<i64> {
@@ -5977,6 +6905,39 @@ impl Db {
         current
             .checked_add(1)
             .ok_or_else(|| DbError::internal("sync conflict_id counter overflow"))
+    }
+
+    fn sync_update_conflict_resolution(
+        &self,
+        conflict_id: i64,
+        resolution: Option<&str>,
+        resolved_by: Option<&str>,
+        note: Option<&str>,
+        resolved_at_micros: Option<i64>,
+    ) -> Result<bool> {
+        let Some(_) = self.sync_conflict(conflict_id)? else {
+            return Ok(false);
+        };
+        let sql = format!(
+            "UPDATE {table} SET resolved = {resolved}, resolution = {resolution}, resolved_at_micros = {resolved_at_micros}, resolved_by = {resolved_by}, resolution_note = {resolution_note} WHERE conflict_id = {conflict_id}",
+            table = crate::sync::CONFLICTS_TABLE,
+            resolved = if resolution.is_some() { 1 } else { 0 },
+            resolution = resolution
+                .map(sql_text_literal)
+                .unwrap_or_else(|| "NULL".to_string()),
+            resolved_at_micros = resolved_at_micros
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "NULL".to_string()),
+            resolved_by = resolved_by
+                .map(sql_text_literal)
+                .unwrap_or_else(|| "NULL".to_string()),
+            resolution_note = note
+                .map(sql_text_literal)
+                .unwrap_or_else(|| "NULL".to_string()),
+            conflict_id = conflict_id,
+        );
+        let _ = self.execute(&sql)?;
+        Ok(true)
     }
 
     fn next_sync_session_id(&self) -> Result<i64> {
@@ -6047,8 +7008,56 @@ impl Db {
         let _ = self.execute(crate::sync::METADATA_TABLE_DDL)?;
         let _ = self.execute(crate::sync::PEERS_TABLE_DDL)?;
         let _ = self.execute(crate::sync::SESSIONS_TABLE_DDL)?;
+        let _ = self.execute(crate::sync::SCOPES_TABLE_DDL)?;
+        let _ = self.execute(crate::sync::PEER_SCOPES_TABLE_DDL)?;
         let _ = self.execute(crate::sync::CONFLICTS_TABLE_DDL)?;
+        self.ensure_sync_conflict_columns()?;
         Ok(())
+    }
+
+    fn ensure_sync_conflict_columns(&self) -> Result<()> {
+        let existing = self.sync_table_columns(crate::sync::CONFLICTS_TABLE)?;
+        for (name, ty) in [
+            ("resolution", "TEXT"),
+            ("resolved_at_micros", "INT64"),
+            ("resolved_by", "TEXT"),
+            ("resolution_note", "TEXT"),
+            ("policy_name", "TEXT"),
+            ("local_record_json", "TEXT"),
+        ] {
+            if !existing.iter().any(|column| column == name) {
+                let sql = format!(
+                    "ALTER TABLE {} ADD COLUMN {} {}",
+                    sql_identifier(crate::sync::CONFLICTS_TABLE),
+                    sql_identifier(name),
+                    ty
+                );
+                let _ = self.execute(&sql)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn sync_table_columns(&self, table_name: &str) -> Result<Vec<String>> {
+        let sql = format!("PRAGMA table_info({})", sql_identifier(table_name));
+        match self.execute(&sql) {
+            Ok(result) => Ok(result
+                .rows()
+                .iter()
+                .filter_map(|row| match row.values().get(1) {
+                    Some(Value::Text(value)) => Some(value.clone()),
+                    _ => None,
+                })
+                .collect()),
+            Err(error) => {
+                let message = error.to_string();
+                if message.contains("no such table") || message.contains("unknown table") {
+                    Ok(Vec::new())
+                } else {
+                    Err(error)
+                }
+            }
+        }
     }
 
     fn load_sync_status_from_db(&self) -> Result<SyncStatus> {
@@ -6144,7 +7153,13 @@ impl Db {
                 self.sync_journal_query_result(since_sequence).map(Some)
             }
             SyncInspectionQuery::Peers => self.sync_peers_query_result().map(Some),
+            SyncInspectionQuery::Scopes => self.sync_scopes_query_result().map(Some),
+            SyncInspectionQuery::ScopeTables => self.sync_scope_tables_query_result().map(Some),
+            SyncInspectionQuery::PeerScopes => self.sync_peer_scopes_query_result().map(Some),
             SyncInspectionQuery::Sessions => self.sync_sessions_query_result().map(Some),
+            SyncInspectionQuery::ConflictPolicy => {
+                self.sync_conflict_policy_query_result().map(Some)
+            }
             SyncInspectionQuery::Conflicts => self.sync_conflicts_query_result().map(Some),
         }
     }
@@ -6231,6 +7246,91 @@ impl Db {
         ))
     }
 
+    fn sync_scopes_query_result(&self) -> Result<QueryResult> {
+        let scopes = self.sync_scopes()?;
+        let rows = scopes
+            .into_iter()
+            .map(|scope| {
+                let SyncScope {
+                    name,
+                    include_tables,
+                    row_filter,
+                    filter_columns,
+                    created_at_micros,
+                    updated_at_micros,
+                } = scope;
+                Ok(QueryRow::new(vec![
+                    Value::Text(name),
+                    Value::Text(serde_json::to_string(&include_tables).map_err(|error| {
+                        DbError::internal(format!(
+                            "failed to encode sync scope include tables: {error}"
+                        ))
+                    })?),
+                    row_filter.map_or(Value::Null, Value::Text),
+                    Value::Text(serde_json::to_string(&filter_columns).map_err(|error| {
+                        DbError::internal(format!(
+                            "failed to encode sync scope filter columns: {error}"
+                        ))
+                    })?),
+                    Value::Int64(created_at_micros),
+                    Value::Int64(updated_at_micros),
+                ]))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(QueryResult::with_rows(
+            vec![
+                "name".to_string(),
+                "include_tables_json".to_string(),
+                "row_filter".to_string(),
+                "filter_columns_json".to_string(),
+                "created_at_micros".to_string(),
+                "updated_at_micros".to_string(),
+            ],
+            rows,
+        ))
+    }
+
+    fn sync_scope_tables_query_result(&self) -> Result<QueryResult> {
+        let mut rows = Vec::new();
+        for scope in self.sync_scopes()? {
+            let scope_name = scope.name;
+            for table_name in scope.include_tables {
+                rows.push(QueryRow::new(vec![
+                    Value::Text(scope_name.clone()),
+                    Value::Text(table_name),
+                ]));
+            }
+        }
+        Ok(QueryResult::with_rows(
+            vec!["scope_name".to_string(), "table_name".to_string()],
+            rows,
+        ))
+    }
+
+    fn sync_peer_scopes_query_result(&self) -> Result<QueryResult> {
+        let bindings = self.sync_peer_scope_bindings()?;
+        let rows = bindings
+            .into_iter()
+            .map(|binding| {
+                Ok(QueryRow::new(vec![
+                    Value::Text(binding.peer_name),
+                    Value::Text(binding.scope_name),
+                    Value::Int64(binding.created_at_micros),
+                    Value::Int64(binding.updated_at_micros),
+                ]))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(QueryResult::with_rows(
+            vec![
+                "peer_name".to_string(),
+                "scope_name".to_string(),
+                "created_at_micros".to_string(),
+                "updated_at_micros".to_string(),
+            ],
+            rows,
+        ))
+    }
+
     fn sync_sessions_query_result(&self) -> Result<QueryResult> {
         let sessions = self.sync_sessions()?;
         let rows = sessions
@@ -6285,6 +7385,23 @@ impl Db {
         ))
     }
 
+    fn sync_conflict_policy_query_result(&self) -> Result<QueryResult> {
+        let policy = self.sync_conflict_policy()?;
+        Ok(QueryResult::with_rows(
+            vec!["default_policy".to_string(), "origin_priority_json".to_string()],
+            vec![QueryRow::new(vec![
+                Value::Text(policy.default_policy.to_string()),
+                Value::Text(
+                    serde_json::to_string(&policy.origin_priority).map_err(|error| {
+                        DbError::internal(format!(
+                            "failed to encode sync conflict policy origin priority: {error}"
+                        ))
+                    })?,
+                ),
+            ])],
+        ))
+    }
+
     fn sync_conflicts_query_result(&self) -> Result<QueryResult> {
         let sql = format!(
             "SELECT * FROM {} WHERE resolved = 0 ORDER BY conflict_id",
@@ -6310,6 +7427,12 @@ impl Db {
                             "local_row_json".to_string(),
                             "created_at_micros".to_string(),
                             "resolved".to_string(),
+                            "resolution".to_string(),
+                            "resolved_at_micros".to_string(),
+                            "resolved_by".to_string(),
+                            "resolution_note".to_string(),
+                            "policy_name".to_string(),
+                            "local_record_json".to_string(),
                         ],
                         Vec::new(),
                     ))
@@ -6397,7 +7520,11 @@ enum SyncInspectionQuery {
     Status,
     Journal { since_sequence: u64 },
     Peers,
+    Scopes,
+    ScopeTables,
+    PeerScopes,
     Sessions,
+    ConflictPolicy,
     Conflicts,
 }
 
@@ -6415,9 +7542,26 @@ impl SyncInspectionQuery {
             "select * from sys_sync_peers" => Some(Self::Peers),
             "select * from sys_sync_peers order by name" => Some(Self::Peers),
             "select * from sys_sync_peers order by name asc" => Some(Self::Peers),
+            "select * from sys_sync_scopes" => Some(Self::Scopes),
+            "select * from sys_sync_scopes order by name" => Some(Self::Scopes),
+            "select * from sys_sync_scopes order by name asc" => Some(Self::Scopes),
+            "select * from sys_sync_scope_tables" => Some(Self::ScopeTables),
+            "select * from sys_sync_scope_tables order by scope_name, table_name" => {
+                Some(Self::ScopeTables)
+            }
+            "select * from sys_sync_scope_tables order by scope_name, table_name asc" => {
+                Some(Self::ScopeTables)
+            }
+            "select * from sys_sync_peer_scopes" => Some(Self::PeerScopes),
+            "select * from sys_sync_peer_scopes order by peer_name" => Some(Self::PeerScopes),
+            "select * from sys_sync_peer_scopes order by peer_name asc" => Some(Self::PeerScopes),
             "select * from sys_sync_sessions" => Some(Self::Sessions),
             "select * from sys_sync_sessions order by session_id" => Some(Self::Sessions),
             "select * from sys_sync_sessions order by session_id asc" => Some(Self::Sessions),
+            "select * from sys_sync_conflict_policy" => Some(Self::ConflictPolicy),
+            "select * from sys_sync_conflict_policy order by default_policy" => {
+                Some(Self::ConflictPolicy)
+            }
             "select * from sys_sync_conflicts" => Some(Self::Conflicts),
             "select * from sys_sync_conflicts order by conflict_id" => Some(Self::Conflicts),
             "select * from sys_sync_conflicts order by conflict_id asc" => Some(Self::Conflicts),
@@ -6562,6 +7706,65 @@ fn sync_conflict_from_row(row: &QueryRow) -> Result<SyncConflict> {
             return Err(DbError::corruption("malformed sync conflict row: resolved"));
         }
     };
+    let resolution = match values.get(13) {
+        Some(Value::Null) | None => None,
+        Some(Value::Text(value)) => Some(value.clone()),
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync conflict row: resolution",
+            ));
+        }
+    };
+    let resolved_at_micros = match values.get(14) {
+        Some(Value::Null) | None => None,
+        Some(Value::Int64(value)) => Some(*value),
+        Some(Value::Bool(value)) => Some(i64::from(*value)),
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync conflict row: resolved_at_micros",
+            ));
+        }
+    };
+    let resolved_by = match values.get(15) {
+        Some(Value::Null) | None => None,
+        Some(Value::Text(value)) => Some(value.clone()),
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync conflict row: resolved_by",
+            ));
+        }
+    };
+    let resolution_note = match values.get(16) {
+        Some(Value::Null) | None => None,
+        Some(Value::Text(value)) => Some(value.clone()),
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync conflict row: resolution_note",
+            ));
+        }
+    };
+    let policy_name = match values.get(17) {
+        Some(Value::Null) | None => None,
+        Some(Value::Text(value)) => Some(value.clone()),
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync conflict row: policy_name",
+            ));
+        }
+    };
+    let local_record_json = match values.get(18) {
+        Some(Value::Null) | None => None,
+        Some(Value::Text(value)) => Some(serde_json::from_str(value).map_err(|error| {
+            DbError::corruption(format!(
+                "malformed sync conflict local_record_json: {error}"
+            ))
+        })?),
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync conflict row: local_record_json",
+            ));
+        }
+    };
 
     Ok(SyncConflict {
         conflict_id,
@@ -6574,6 +7777,12 @@ fn sync_conflict_from_row(row: &QueryRow) -> Result<SyncConflict> {
         message,
         primary_key_json,
         remote_record_json,
+        resolution,
+        resolved_at_micros,
+        resolved_by,
+        resolution_note,
+        policy_name,
+        local_record_json,
         local_row_json,
         created_at_micros,
         resolved,
@@ -6618,6 +7827,116 @@ fn sync_peer_from_row(row: &QueryRow) -> Result<SyncPeer> {
         name,
         endpoint,
         token_env,
+        created_at_micros,
+        updated_at_micros,
+    })
+}
+
+fn sync_scope_from_row(row: &QueryRow) -> Result<SyncScope> {
+    let values = row.values();
+    let name = match values.first() {
+        Some(Value::Text(value)) => value.clone(),
+        _ => return Err(DbError::corruption("malformed sync scope row: name")),
+    };
+    let include_tables_json = match values.get(1) {
+        Some(Value::Text(value)) => value.clone(),
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync scope row: include_tables_json",
+            ))
+        }
+    };
+    let row_filter = match values.get(2) {
+        Some(Value::Null) | None => None,
+        Some(Value::Text(value)) => Some(value.clone()),
+        _ => return Err(DbError::corruption("malformed sync scope row: row_filter")),
+    };
+    let filter_columns_json = match values.get(3) {
+        Some(Value::Text(value)) => value.clone(),
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync scope row: filter_columns_json",
+            ))
+        }
+    };
+    let created_at_micros = match values.get(4) {
+        Some(Value::Int64(value)) => *value,
+        Some(Value::Bool(value)) => i64::from(*value),
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync scope row: created_at_micros",
+            ))
+        }
+    };
+    let updated_at_micros = match values.get(5) {
+        Some(Value::Int64(value)) => *value,
+        Some(Value::Bool(value)) => i64::from(*value),
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync scope row: updated_at_micros",
+            ))
+        }
+    };
+
+    let include_tables: Vec<String> =
+        serde_json::from_str(&include_tables_json).map_err(|error| {
+            DbError::corruption(format!("malformed sync scope include tables: {error}"))
+        })?;
+    let filter_columns: Vec<String> =
+        serde_json::from_str(&filter_columns_json).map_err(|error| {
+            DbError::corruption(format!("malformed sync scope filter columns: {error}"))
+        })?;
+
+    Ok(SyncScope {
+        name,
+        include_tables,
+        row_filter,
+        filter_columns,
+        created_at_micros,
+        updated_at_micros,
+    })
+}
+
+fn sync_peer_scope_binding_from_row(row: &QueryRow) -> Result<SyncPeerScopeBinding> {
+    let values = row.values();
+    let peer_name = match values.first() {
+        Some(Value::Text(value)) => value.clone(),
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync peer scope row: peer_name",
+            ))
+        }
+    };
+    let scope_name = match values.get(1) {
+        Some(Value::Text(value)) => value.clone(),
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync peer scope row: scope_name",
+            ))
+        }
+    };
+    let created_at_micros = match values.get(2) {
+        Some(Value::Int64(value)) => *value,
+        Some(Value::Bool(value)) => i64::from(*value),
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync peer scope row: created_at_micros",
+            ))
+        }
+    };
+    let updated_at_micros = match values.get(3) {
+        Some(Value::Int64(value)) => *value,
+        Some(Value::Bool(value)) => i64::from(*value),
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync peer scope row: updated_at_micros",
+            ))
+        }
+    };
+
+    Ok(SyncPeerScopeBinding {
+        peer_name,
+        scope_name,
         created_at_micros,
         updated_at_micros,
     })

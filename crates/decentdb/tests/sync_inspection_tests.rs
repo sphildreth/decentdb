@@ -75,3 +75,73 @@ fn sync_sql_inspection_views_expose_status_and_journal() {
     assert_eq!(from_sequence_1.rows().len(), 1);
     assert_eq!(from_sequence_1.rows()[0].values()[0], Value::Int64(2));
 }
+
+#[test]
+fn sync_sql_inspection_views_expose_scopes_and_bindings() {
+    let dir = tempfile::TempDir::with_prefix("decentdb-sync-sql-scopes").unwrap();
+    let path = dir.path().join("test.ddb");
+    let db = Db::create(&path, DbConfig::default()).unwrap();
+    db.execute("CREATE TABLE tenant_items (tenant_id INT64, id INT64, value TEXT, PRIMARY KEY (tenant_id, id))")
+        .unwrap();
+    db.sync_init_replica("node-a").unwrap();
+    db.sync_create_scope("tenant_1", &["tenant_items"], Some("tenant_id = 1"))
+        .unwrap();
+    db.sync_add_peer("relay", "https://relay.example.com", None)
+        .unwrap();
+    db.sync_bind_peer_scope("relay", "tenant_1").unwrap();
+
+    let scopes = db
+        .execute("SELECT * FROM sys_sync_scopes ORDER BY name")
+        .unwrap();
+    assert_eq!(
+        scopes.columns(),
+        &[
+            "name",
+            "include_tables_json",
+            "row_filter",
+            "filter_columns_json",
+            "created_at_micros",
+            "updated_at_micros",
+        ]
+    );
+    assert_eq!(scopes.rows().len(), 1);
+    assert_eq!(
+        scopes.rows()[0].values()[0],
+        Value::Text("tenant_1".to_string())
+    );
+
+    let scope_tables = db
+        .execute("SELECT * FROM sys_sync_scope_tables ORDER BY scope_name, table_name")
+        .unwrap();
+    assert_eq!(scope_tables.columns(), &["scope_name", "table_name"]);
+    assert_eq!(scope_tables.rows().len(), 1);
+    assert_eq!(
+        scope_tables.rows()[0].values(),
+        &[
+            Value::Text("tenant_1".to_string()),
+            Value::Text("tenant_items".to_string()),
+        ]
+    );
+
+    let peer_scopes = db
+        .execute("SELECT * FROM sys_sync_peer_scopes ORDER BY peer_name")
+        .unwrap();
+    assert_eq!(
+        peer_scopes.columns(),
+        &[
+            "peer_name",
+            "scope_name",
+            "created_at_micros",
+            "updated_at_micros",
+        ]
+    );
+    assert_eq!(peer_scopes.rows().len(), 1);
+    assert_eq!(
+        peer_scopes.rows()[0].values()[0],
+        Value::Text("relay".to_string())
+    );
+    assert_eq!(
+        peer_scopes.rows()[0].values()[1],
+        Value::Text("tenant_1".to_string())
+    );
+}

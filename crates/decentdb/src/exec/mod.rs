@@ -12553,6 +12553,32 @@ pub(super) fn row_satisfies_index_predicate(
     ))
 }
 
+pub(crate) fn row_satisfies_expression(
+    runtime: &EngineRuntime,
+    table_name: &str,
+    column_names: &[String],
+    row_values: &[Value],
+    expr: &Expr,
+) -> Result<bool> {
+    if column_names.len() != row_values.len() {
+        return Err(DbError::internal(
+            "row filter evaluation received mismatched column/value counts",
+        ));
+    }
+    let dataset = Dataset::with_rows(
+        column_names
+            .iter()
+            .map(|column| ColumnBinding::visible(Some(table_name.to_string()), column.clone()))
+            .collect(),
+        vec![row_values.to_vec()],
+    );
+    let row = dataset.rows.first().map(Vec::as_slice).unwrap_or(&[]);
+    Ok(matches!(
+        runtime.eval_expr(expr, &dataset, row, &[], &BTreeMap::new(), None)?,
+        Value::Bool(true)
+    ))
+}
+
 pub(super) fn table_row_dataset(table: &TableSchema, row: &[Value], table_name: &str) -> Dataset {
     Dataset::with_rows(
         table

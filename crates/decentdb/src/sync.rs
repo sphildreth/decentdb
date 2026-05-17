@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fmt::{Display, Formatter};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -8,9 +8,12 @@ use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
-use crate::catalog::TableSchema;
+use crate::catalog::{identifiers_equal, TableSchema};
 use crate::error::{DbError, Result};
+use crate::exec::EngineRuntime;
 use crate::record::value::Value;
+use crate::sql::ast::{BinaryOp, Expr};
+use crate::sql::parser::parse_expression_sql;
 use crate::vfs::{self, FileKind, OpenMode, VfsFile, VfsHandle};
 
 pub(crate) const METADATA_TABLE: &str = "__decentdb_sync_metadata";
@@ -29,6 +32,14 @@ pub(crate) const PEERS_TABLE_DDL: &str = "CREATE TABLE IF NOT EXISTS __decentdb_
 pub(crate) const SESSIONS_TABLE: &str = "__decentdb_sync_sessions";
 
 pub(crate) const SESSIONS_TABLE_DDL: &str = "CREATE TABLE IF NOT EXISTS __decentdb_sync_sessions (session_id INT64 PRIMARY KEY, peer_name TEXT NOT NULL, direction TEXT NOT NULL, remote_replica_id TEXT, started_at_micros INT64 NOT NULL, ended_at_micros INT64, status TEXT NOT NULL, error TEXT, pushed_batch_id TEXT, pulled_batch_id TEXT, pushed_seen INT64 NOT NULL, pushed_applied INT64 NOT NULL, pushed_skipped INT64 NOT NULL, pushed_conflicted INT64 NOT NULL, pulled_seen INT64 NOT NULL, pulled_applied INT64 NOT NULL, pulled_skipped INT64 NOT NULL, pulled_conflicted INT64 NOT NULL, retry_count INT64 NOT NULL)";
+
+pub(crate) const SCOPES_TABLE: &str = "__decentdb_sync_scopes";
+
+pub(crate) const SCOPES_TABLE_DDL: &str = "CREATE TABLE IF NOT EXISTS __decentdb_sync_scopes (name TEXT PRIMARY KEY, include_tables_json TEXT NOT NULL, row_filter TEXT, filter_columns_json TEXT NOT NULL, created_at_micros INT64 NOT NULL, updated_at_micros INT64 NOT NULL)";
+
+pub(crate) const PEER_SCOPES_TABLE: &str = "__decentdb_sync_peer_scopes";
+
+pub(crate) const PEER_SCOPES_TABLE_DDL: &str = "CREATE TABLE IF NOT EXISTS __decentdb_sync_peer_scopes (peer_name TEXT PRIMARY KEY, scope_name TEXT NOT NULL, created_at_micros INT64 NOT NULL, updated_at_micros INT64 NOT NULL)";
 
 pub(crate) fn is_internal_table_name(name: &str) -> bool {
     name.starts_with("__decentdb_")
@@ -59,6 +70,8 @@ pub struct SyncChangeBatch {
     pub first_sequence: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_sequence: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_high_watermark: Option<u64>,
     pub record_count: usize,
     #[serde(default)]
     pub records: Vec<SyncJournalRecord>,
@@ -75,6 +88,7 @@ impl SyncChangeBatch {
             source_replica_id: None,
             first_sequence: None,
             last_sequence: None,
+            source_high_watermark: None,
             record_count: 0,
             records: Vec::new(),
         }
@@ -104,9 +118,24 @@ impl SyncChangeBatch {
             source_replica_id,
             first_sequence,
             last_sequence,
+            source_high_watermark: None,
             record_count: records.len(),
             records,
         };
+        batch.validate()?;
+        Ok(batch)
+    }
+
+    pub(crate) fn scoped_from_records(
+        records: Vec<SyncJournalRecord>,
+        source_replica_id: Option<String>,
+        source_high_watermark: Option<u64>,
+    ) -> Result<Self> {
+        let mut batch = Self::from_records(records)?;
+        if batch.source_replica_id.is_none() {
+            batch.source_replica_id = source_replica_id;
+        }
+        batch.source_high_watermark = source_high_watermark;
         batch.validate()?;
         Ok(batch)
     }
@@ -137,6 +166,11 @@ impl SyncChangeBatch {
             if self.first_sequence.is_some() || self.last_sequence.is_some() {
                 return Err(DbError::sql(
                     "empty sync batch must not declare sequence bounds",
+                ));
+            }
+            if self.source_high_watermark.is_some() && self.source_replica_id.is_none() {
+                return Err(DbError::sql(
+                    "empty sync batch with source_high_watermark must include source_replica_id",
                 ));
             }
             return Ok(());
@@ -183,6 +217,14 @@ impl SyncChangeBatch {
                     .last()
                     .map(|record| record.sequence)
                     .unwrap_or(0)
+            )));
+        }
+        if self
+            .source_high_watermark
+            .is_some_and(|watermark| watermark < last_sequence)
+        {
+            return Err(DbError::sql(format!(
+                "sync batch source_high_watermark must be >= last_sequence {last_sequence}"
             )));
         }
 
@@ -238,6 +280,75 @@ pub enum SyncRunDirection {
     Both,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncConflictPolicy {
+    #[serde(alias = "record")]
+    Record,
+    #[serde(alias = "stop")]
+    Stop,
+    #[serde(alias = "last-writer-wins")]
+    LastWriterWins,
+    #[serde(alias = "origin-priority")]
+    OriginPriority,
+}
+
+impl SyncConflictPolicy {
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Record => "record",
+            Self::Stop => "stop",
+            Self::LastWriterWins => "last_writer_wins",
+            Self::OriginPriority => "origin_priority",
+        }
+    }
+}
+
+impl Display for SyncConflictPolicy {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for SyncConflictPolicy {
+    type Err = DbError;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "record" => Ok(Self::Record),
+            "stop" => Ok(Self::Stop),
+            "last_writer_wins" | "last-writer-wins" => Ok(Self::LastWriterWins),
+            "origin_priority" | "origin-priority" => Ok(Self::OriginPriority),
+            other => Err(DbError::sql(format!(
+                "unsupported sync conflict policy '{other}'"
+            ))),
+        }
+    }
+}
+
+impl Default for SyncConflictPolicy {
+    fn default() -> Self {
+        Self::Record
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncConflictPolicyConfig {
+    #[serde(default)]
+    pub default_policy: SyncConflictPolicy,
+    pub origin_priority: Vec<String>,
+}
+
+impl Default for SyncConflictPolicyConfig {
+    fn default() -> Self {
+        Self {
+            default_policy: SyncConflictPolicy::Record,
+            origin_priority: Vec::new(),
+        }
+    }
+}
+
 impl SyncRunDirection {
     #[must_use]
     pub const fn as_str(&self) -> &'static str {
@@ -276,6 +387,25 @@ pub struct SyncPeer {
     pub endpoint: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_env: Option<String>,
+    pub created_at_micros: i64,
+    pub updated_at_micros: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncScope {
+    pub name: String,
+    pub include_tables: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_filter: Option<String>,
+    pub filter_columns: Vec<String>,
+    pub created_at_micros: i64,
+    pub updated_at_micros: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncPeerScopeBinding {
+    pub peer_name: String,
+    pub scope_name: String,
     pub created_at_micros: i64,
     pub updated_at_micros: i64,
 }
@@ -345,6 +475,18 @@ pub struct SyncConflict {
     pub message: String,
     pub primary_key_json: serde_json::Value,
     pub remote_record_json: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_at_micros: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_note: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_record_json: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_row_json: Option<serde_json::Value>,
     pub created_at_micros: i64,
@@ -426,6 +568,419 @@ impl SyncOperation {
             SyncOperation::Insert => "insert",
             SyncOperation::Update => "update",
             SyncOperation::Delete => "delete",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SyncScopeDefinition {
+    pub(crate) name: String,
+    pub(crate) include_tables: Vec<String>,
+    pub(crate) row_filter: Option<String>,
+    pub(crate) filter_columns: Vec<String>,
+}
+
+pub(crate) fn validate_sync_scope_definition(
+    runtime: &EngineRuntime,
+    name: &str,
+    include_tables: &[&str],
+    row_filter: Option<&str>,
+) -> Result<SyncScopeDefinition> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(DbError::sql("sync scope name must not be empty"));
+    }
+
+    if include_tables.is_empty() {
+        return Err(DbError::sql("sync scope include_tables must not be empty"));
+    }
+
+    let mut canonical_tables = Vec::with_capacity(include_tables.len());
+    let mut seen_tables = BTreeSet::new();
+    for table_name in include_tables {
+        let table_name = table_name.trim();
+        if table_name.is_empty() {
+            return Err(DbError::sql("sync scope table name must not be empty"));
+        }
+        if is_internal_table_name(table_name) {
+            return Err(DbError::sql(format!(
+                "sync scope cannot include internal table '{table_name}'"
+            )));
+        }
+        if !seen_tables.insert(table_name.to_ascii_lowercase()) {
+            return Err(DbError::sql(format!(
+                "sync scope include_tables contains duplicate table '{table_name}'"
+            )));
+        }
+        let table = runtime.catalog.table(table_name).ok_or_else(|| {
+            DbError::sql(format!("sync scope table '{table_name}' does not exist"))
+        })?;
+        if table.primary_key_columns.is_empty() {
+            return Err(DbError::sql(format!(
+                "sync scope table '{}' must have a stable primary key",
+                table.name
+            )));
+        }
+        canonical_tables.push(table.name.clone());
+    }
+    canonical_tables.sort_unstable();
+
+    let row_filter = row_filter.map(str::trim).map(str::to_string);
+    if row_filter
+        .as_deref()
+        .is_some_and(|filter| filter.is_empty())
+    {
+        return Err(DbError::sql("sync scope row_filter must not be empty"));
+    }
+
+    let filter_columns = if let Some(filter_sql) = row_filter.as_deref() {
+        let expr = parse_expression_sql(filter_sql).map_err(|error| {
+            DbError::sql(format!(
+                "invalid row filter for sync scope '{name}': {error}"
+            ))
+        })?;
+        validate_sync_scope_filter_expr(runtime, &canonical_tables, &expr)?
+    } else {
+        Vec::new()
+    };
+
+    Ok(SyncScopeDefinition {
+        name: name.to_string(),
+        include_tables: canonical_tables,
+        row_filter,
+        filter_columns,
+    })
+}
+
+fn validate_sync_scope_filter_expr(
+    runtime: &EngineRuntime,
+    include_tables: &[String],
+    expr: &Expr,
+) -> Result<Vec<String>> {
+    let mut referenced_columns = BTreeSet::new();
+    validate_sync_scope_filter_expr_inner(expr, &mut referenced_columns)?;
+    let mut columns = Vec::with_capacity(referenced_columns.len());
+    for column in referenced_columns {
+        let mut canonical_column: Option<String> = None;
+        for table_name in include_tables {
+            let table = runtime
+                .catalog
+                .table(table_name)
+                .expect("validated table must exist");
+            let Some(table_column) = table
+                .columns
+                .iter()
+                .find(|candidate| identifiers_equal(&candidate.name, &column))
+            else {
+                return Err(DbError::sql(format!(
+                    "sync scope row filter column '{column}' is missing from table '{}'",
+                    table.name
+                )));
+            };
+            if !table
+                .primary_key_columns
+                .iter()
+                .any(|pk| identifiers_equal(pk, &table_column.name))
+            {
+                return Err(DbError::sql(format!(
+                    "sync scope row filter column '{column}' must be part of the primary key for table '{}'",
+                    table.name
+                )));
+            }
+            if canonical_column.is_none() {
+                canonical_column = Some(table_column.name.clone());
+            }
+        }
+        columns.push(canonical_column.expect("column canonicalized"));
+    }
+    columns.sort_unstable();
+    Ok(columns)
+}
+
+fn validate_sync_scope_filter_expr_inner(
+    expr: &Expr,
+    referenced_columns: &mut BTreeSet<String>,
+) -> Result<()> {
+    match expr {
+        Expr::Binary { left, op, right } => match op {
+            BinaryOp::And => {
+                validate_sync_scope_filter_expr_inner(left, referenced_columns)?;
+                validate_sync_scope_filter_expr_inner(right, referenced_columns)
+            }
+            BinaryOp::Eq
+            | BinaryOp::NotEq
+            | BinaryOp::Lt
+            | BinaryOp::LtEq
+            | BinaryOp::Gt
+            | BinaryOp::GtEq => {
+                if let Some(error) = sync_scope_filter_disallowed_operand(left)
+                    .or_else(|| sync_scope_filter_disallowed_operand(right))
+                {
+                    return Err(error);
+                }
+                let column = sync_scope_filter_column_name(left, right).ok_or_else(|| {
+                    DbError::sql("sync scope predicates must compare a column against a literal")
+                })?;
+                sync_scope_filter_literal(right)?;
+                referenced_columns.insert(column);
+                Ok(())
+            }
+            BinaryOp::Or => Err(DbError::sql(
+                "OR is not supported in sync row filters; use AND only",
+            )),
+            BinaryOp::Add
+            | BinaryOp::Sub
+            | BinaryOp::Mul
+            | BinaryOp::Div
+            | BinaryOp::Mod
+            | BinaryOp::Concat => Err(DbError::sql(
+                "arithmetic and concatenation are not supported in sync row filters",
+            )),
+            BinaryOp::JsonExtract | BinaryOp::JsonExtractText => Err(DbError::sql(
+                "JSON path operators are not supported in sync row filters",
+            )),
+            BinaryOp::IsDistinctFrom | BinaryOp::IsNotDistinctFrom => Err(DbError::sql(
+                "IS DISTINCT FROM is not supported in sync row filters",
+            )),
+            BinaryOp::RegexMatch
+            | BinaryOp::RegexMatchCaseInsensitive
+            | BinaryOp::RegexNotMatch
+            | BinaryOp::RegexNotMatchCaseInsensitive => Err(DbError::sql(
+                "regular expression operators are not supported in sync row filters",
+            )),
+        },
+        Expr::InList {
+            expr,
+            items,
+            negated,
+        } => {
+            if *negated {
+                return Err(DbError::sql("NOT IN is not supported in sync row filters"));
+            }
+            if let Some(error) = sync_scope_filter_disallowed_operand(expr) {
+                return Err(error);
+            }
+            sync_scope_filter_column(expr)?;
+            if items.is_empty() {
+                return Err(DbError::sql(
+                    "IN lists in sync row filters must contain at least one literal",
+                ));
+            }
+            for item in items {
+                sync_scope_filter_literal(item)?;
+            }
+            if let Expr::Column {
+                column,
+                table: None,
+            } = expr.as_ref()
+            {
+                referenced_columns.insert(column.clone());
+                Ok(())
+            } else {
+                Err(DbError::sql(
+                    "sync row filters must compare a single column against literal values",
+                ))
+            }
+        }
+        Expr::IsNull { expr, .. } => {
+            if let Some(error) = sync_scope_filter_disallowed_operand(expr) {
+                return Err(error);
+            }
+            sync_scope_filter_column(expr)?;
+            if let Expr::Column {
+                column,
+                table: None,
+            } = expr.as_ref()
+            {
+                referenced_columns.insert(column.clone());
+                Ok(())
+            } else {
+                Err(DbError::sql(
+                    "sync row filters must reference a single unqualified column",
+                ))
+            }
+        }
+        Expr::Column {
+            table: Some(table),
+            column,
+        } => Err(DbError::sql(format!(
+            "dotted column references are not supported in sync row filters: {table}.{column}"
+        ))),
+        Expr::Column {
+            table: None,
+            column,
+        } => Err(DbError::sql(format!(
+            "column '{column}' must be compared against a literal in sync row filters"
+        ))),
+        Expr::Literal(_) => Err(DbError::sql(
+            "sync row filters must compare columns against literals",
+        )),
+        Expr::Unary { op, .. } => Err(DbError::sql(format!(
+            "unary operator '{op:?}' is not supported in sync row filters"
+        ))),
+        Expr::Between { .. } => Err(DbError::sql("BETWEEN is not supported in sync row filters")),
+        Expr::InSubquery { .. }
+        | Expr::CompareSubquery { .. }
+        | Expr::ScalarSubquery(_)
+        | Expr::Exists(_) => Err(DbError::sql(
+            "subqueries and EXISTS are not supported in sync row filters",
+        )),
+        Expr::Like { .. } => Err(DbError::sql("LIKE is not supported in sync row filters")),
+        Expr::Function { name, .. } => Err(DbError::sql(format!(
+            "functions are not supported in sync row filters: {name}()"
+        ))),
+        Expr::Aggregate { name, .. } => Err(DbError::sql(format!(
+            "aggregate-like function calls are not supported in sync row filters: {name}"
+        ))),
+        Expr::RowNumber { .. } | Expr::WindowFunction { .. } => Err(DbError::sql(
+            "window functions are not supported in sync row filters",
+        )),
+        Expr::Case { .. } => Err(DbError::sql(
+            "CASE expressions are not supported in sync row filters",
+        )),
+        Expr::Cast { .. } => Err(DbError::sql("CAST is not supported in sync row filters")),
+        Expr::Row(_) => Err(DbError::sql(
+            "row values are not supported in sync row filters",
+        )),
+        Expr::Parameter(_) => Err(DbError::sql(
+            "parameters are not supported in sync row filters",
+        )),
+    }
+}
+
+fn sync_scope_filter_column_name(left: &Expr, right: &Expr) -> Option<String> {
+    match (left, right) {
+        (
+            Expr::Column {
+                table: None,
+                column,
+            },
+            Expr::Literal(_),
+        ) => Some(column.clone()),
+        _ => None,
+    }
+}
+
+fn sync_scope_filter_column(expr: &Expr) -> Result<()> {
+    match expr {
+        Expr::Column { table: None, .. } => Ok(()),
+        Expr::Column {
+            table: Some(table),
+            column,
+        } => Err(DbError::sql(format!(
+            "dotted column references are not supported in sync row filters: {table}.{column}"
+        ))),
+        _ => Err(DbError::sql(
+            "sync row filter predicates must reference a single column",
+        )),
+    }
+}
+
+fn sync_scope_filter_disallowed_operand(expr: &Expr) -> Option<DbError> {
+    match expr {
+        Expr::Column {
+            table: Some(table),
+            column,
+        } => Some(DbError::sql(format!(
+            "dotted column references are not supported in sync row filters: {table}.{column}"
+        ))),
+        Expr::Function { name, .. } => Some(DbError::sql(format!(
+            "functions are not supported in sync row filters: {name}()"
+        ))),
+        Expr::Aggregate { name, .. } => Some(DbError::sql(format!(
+            "aggregate-like function calls are not supported in sync row filters: {name}"
+        ))),
+        Expr::InSubquery { .. }
+        | Expr::CompareSubquery { .. }
+        | Expr::ScalarSubquery(_)
+        | Expr::Exists(_) => Some(DbError::sql(
+            "subqueries and EXISTS are not supported in sync row filters",
+        )),
+        Expr::Binary { op, .. } => match op {
+            BinaryOp::Or => Some(DbError::sql(
+                "OR is not supported in sync row filters; use AND only",
+            )),
+            BinaryOp::Add
+            | BinaryOp::Sub
+            | BinaryOp::Mul
+            | BinaryOp::Div
+            | BinaryOp::Mod
+            | BinaryOp::Concat => Some(DbError::sql(
+                "arithmetic and concatenation are not supported in sync row filters",
+            )),
+            BinaryOp::JsonExtract | BinaryOp::JsonExtractText => Some(DbError::sql(
+                "JSON path operators are not supported in sync row filters",
+            )),
+            BinaryOp::IsDistinctFrom | BinaryOp::IsNotDistinctFrom => Some(DbError::sql(
+                "IS DISTINCT FROM is not supported in sync row filters",
+            )),
+            BinaryOp::RegexMatch
+            | BinaryOp::RegexMatchCaseInsensitive
+            | BinaryOp::RegexNotMatch
+            | BinaryOp::RegexNotMatchCaseInsensitive => Some(DbError::sql(
+                "regular expression operators are not supported in sync row filters",
+            )),
+            BinaryOp::And
+            | BinaryOp::Eq
+            | BinaryOp::NotEq
+            | BinaryOp::Lt
+            | BinaryOp::LtEq
+            | BinaryOp::Gt
+            | BinaryOp::GtEq => None,
+        },
+        Expr::Unary { op, .. } => Some(DbError::sql(format!(
+            "unary operator '{op:?}' is not supported in sync row filters"
+        ))),
+        Expr::Between { .. } => Some(DbError::sql("BETWEEN is not supported in sync row filters")),
+        Expr::Like { .. } => Some(DbError::sql("LIKE is not supported in sync row filters")),
+        Expr::RowNumber { .. } | Expr::WindowFunction { .. } => Some(DbError::sql(
+            "window functions are not supported in sync row filters",
+        )),
+        Expr::Case { .. } => Some(DbError::sql(
+            "CASE expressions are not supported in sync row filters",
+        )),
+        Expr::Cast { .. } => Some(DbError::sql("CAST is not supported in sync row filters")),
+        Expr::InList { .. } => None,
+        Expr::IsNull { .. } => None,
+        Expr::Row(_) => Some(DbError::sql(
+            "row values are not supported in sync row filters",
+        )),
+        Expr::Parameter(_) => Some(DbError::sql(
+            "parameters are not supported in sync row filters",
+        )),
+        Expr::Column { table: None, .. } | Expr::Literal(_) => None,
+    }
+}
+
+fn sync_scope_filter_literal(expr: &Expr) -> Result<()> {
+    match expr {
+        Expr::Literal(Value::Int64(_))
+        | Expr::Literal(Value::Text(_))
+        | Expr::Literal(Value::Null)
+        | Expr::Literal(Value::Bool(_)) => Ok(()),
+        Expr::Literal(_) => Err(DbError::sql(
+            "sync row filters only support integer, text, NULL, true, and false literals",
+        )),
+        Expr::Column {
+            table: Some(table),
+            column,
+        } => Err(DbError::sql(format!(
+            "dotted column references are not supported in sync row filters: {table}.{column}"
+        ))),
+        Expr::Column {
+            table: None,
+            column,
+        } => Err(DbError::sql(format!(
+            "column '{column}' must be compared against a literal in sync row filters"
+        ))),
+        other => {
+            if let Some(error) = sync_scope_filter_disallowed_operand(other) {
+                Err(error)
+            } else {
+                Err(DbError::sql(
+                    "sync row filter predicates must compare columns against literals",
+                ))
+            }
         }
     }
 }
@@ -977,6 +1532,22 @@ mod tests {
         let db = Db::create(&path, crate::config::DbConfig::default()).unwrap();
         db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
             .unwrap();
+        (dir, db)
+    }
+
+    fn scoped_temp_db() -> (tempfile::TempDir, Db) {
+        let dir = tempfile::TempDir::with_prefix("decentdb-sync-scope-test").unwrap();
+        let path = dir.path().join("test.ddb");
+        let db = Db::create(&path, crate::config::DbConfig::default()).unwrap();
+        db.execute(
+            "CREATE TABLE tenant_items (tenant_id INTEGER, id INTEGER, value TEXT, PRIMARY KEY (tenant_id, id))",
+        )
+        .unwrap();
+        db.execute(
+            "CREATE TABLE tenant_logs (tenant_id INTEGER, id INTEGER, value TEXT, PRIMARY KEY (tenant_id, id))",
+        )
+        .unwrap();
+        db.sync_init_replica("node-a").unwrap();
         (dir, db)
     }
 
@@ -1544,6 +2115,7 @@ mod tests {
             source_replica_id: Some("node-a".to_string()),
             first_sequence: Some(1),
             last_sequence: Some(2),
+            source_high_watermark: None,
             record_count: 2,
             records: vec![
                 users_sync_record(
@@ -1730,6 +2302,245 @@ mod tests {
         let remaining = db.sync_peers().unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].name, "beta");
+    }
+
+    #[test]
+    fn sync_scopes_round_trip_and_views_stay_deterministic() {
+        let (_dir, db) = temp_db();
+
+        db.sync_create_scope("tenant_1", &["users"], None).unwrap();
+        db.sync_create_scope("tenant_2", &["users"], Some("id >= 10"))
+            .unwrap();
+
+        let scope = db.sync_scope("tenant_1").unwrap().expect("scope");
+        assert_eq!(scope.name, "tenant_1");
+        assert_eq!(scope.include_tables, vec!["users".to_string()]);
+        assert!(scope.row_filter.is_none());
+        assert_eq!(scope.filter_columns, Vec::<String>::new());
+
+        let scopes = db.sync_scopes().unwrap();
+        assert_eq!(
+            scopes
+                .iter()
+                .map(|scope| scope.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["tenant_1", "tenant_2"]
+        );
+
+        let scopes_view = db
+            .execute("SELECT * FROM sys_sync_scopes ORDER BY name")
+            .unwrap();
+        assert_eq!(
+            scopes_view.columns(),
+            &[
+                "name",
+                "include_tables_json",
+                "row_filter",
+                "filter_columns_json",
+                "created_at_micros",
+                "updated_at_micros",
+            ]
+        );
+        assert_eq!(scopes_view.rows().len(), 2);
+
+        let scope_tables_view = db
+            .execute("SELECT * FROM sys_sync_scope_tables ORDER BY scope_name, table_name")
+            .unwrap();
+        assert_eq!(scope_tables_view.columns(), &["scope_name", "table_name"]);
+        assert_eq!(scope_tables_view.rows().len(), 2);
+        assert_eq!(
+            scope_tables_view.rows()[0].values(),
+            &[
+                Value::Text("tenant_1".to_string()),
+                Value::Text("users".to_string()),
+            ]
+        );
+
+        assert!(db.sync_drop_scope("tenant_2").unwrap());
+        assert!(!db.sync_drop_scope("tenant_2").unwrap());
+        assert_eq!(db.sync_scopes().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn sync_scope_validation_rejects_invalid_definitions() {
+        let (_dir, db) = temp_db();
+        db.execute("CREATE TABLE no_pk (id INTEGER, value TEXT)")
+            .unwrap();
+        db.execute(
+            "CREATE TABLE tenant_docs (tenant_id INTEGER, id INTEGER PRIMARY KEY, value TEXT)",
+        )
+        .unwrap();
+        db.execute(
+            "CREATE TABLE tenant_items (tenant_id INTEGER, id INTEGER, value TEXT, PRIMARY KEY (tenant_id, id))",
+        )
+        .unwrap();
+
+        let missing_table = db
+            .sync_create_scope("missing", &["does_not_exist"], None)
+            .expect_err("missing table should fail");
+        assert!(missing_table.to_string().contains("does_not_exist"));
+
+        let duplicate = db
+            .sync_create_scope("duplicate", &["users", "users"], None)
+            .expect_err("duplicate include should fail");
+        assert!(duplicate.to_string().contains("duplicate"));
+
+        let internal = db
+            .sync_create_scope("internal", &["__decentdb_sync_metadata"], None)
+            .expect_err("internal table should fail");
+        assert!(internal.to_string().contains("internal table"));
+
+        let no_pk = db
+            .sync_create_scope("no_pk", &["no_pk"], None)
+            .expect_err("table without pk should fail");
+        assert!(no_pk.to_string().contains("stable primary key"));
+
+        let missing_column = db
+            .sync_create_scope("missing_column", &["users"], Some("tenant_id = 1"))
+            .expect_err("missing filter column should fail");
+        assert!(missing_column.to_string().contains("tenant_id"));
+
+        let not_in_pk = db
+            .sync_create_scope("not_in_pk", &["tenant_docs"], Some("tenant_id = 1"))
+            .expect_err("filter column not in pk should fail");
+        assert!(not_in_pk.to_string().contains("primary key"));
+
+        for (name, filter, needle) in [
+            ("or", Some("id = 1 OR id = 2"), "OR"),
+            (
+                "subquery",
+                Some("id IN (SELECT id FROM users)"),
+                "subqueries",
+            ),
+            ("function", Some("random() = 1"), "functions"),
+            ("dotted", Some("users.id = 1"), "dotted"),
+            ("decimal_literal", Some("id = 1.5"), "literals"),
+        ] {
+            let err = db
+                .sync_create_scope(name, &["users"], filter)
+                .expect_err("invalid filter should fail");
+            assert!(err.to_string().contains(needle), "{err}");
+        }
+
+        db.sync_create_scope("pk_filter", &["tenant_items"], Some("tenant_id = 1"))
+            .unwrap();
+        let pk_filter = db.sync_scope("pk_filter").unwrap().unwrap();
+        assert_eq!(pk_filter.filter_columns, vec!["tenant_id".to_string()]);
+    }
+
+    #[test]
+    fn sync_scoped_export_import_and_peer_binding_round_trip() {
+        let (_dir_src, src) = scoped_temp_db();
+        let (_dir_dst, dst) = scoped_temp_db();
+        dst.sync_init_replica("node-b").unwrap();
+
+        src.execute("INSERT INTO tenant_items VALUES (1, 10, 't1-a')")
+            .unwrap();
+        src.execute("INSERT INTO tenant_items VALUES (2, 20, 't2-a')")
+            .unwrap();
+        src.execute("UPDATE tenant_items SET value = 't1-b' WHERE tenant_id = 1 AND id = 10")
+            .unwrap();
+        src.execute("DELETE FROM tenant_items WHERE tenant_id = 2 AND id = 20")
+            .unwrap();
+        src.execute("INSERT INTO tenant_logs VALUES (1, 1, 'log-1')")
+            .unwrap();
+        src.execute("INSERT INTO tenant_logs VALUES (2, 2, 'log-2')")
+            .unwrap();
+
+        src.sync_create_scope(
+            "tenant_1",
+            &["tenant_items", "tenant_logs"],
+            Some("tenant_id = 1"),
+        )
+        .unwrap();
+        dst.sync_create_scope(
+            "tenant_1",
+            &["tenant_items", "tenant_logs"],
+            Some("tenant_id = 1"),
+        )
+        .unwrap();
+
+        let scoped_batch = src.sync_export_batch_for_scope("tenant_1", 0, 100).unwrap();
+        assert_eq!(scoped_batch.records.len(), 3);
+        assert_eq!(scoped_batch.last_sequence, Some(5));
+        assert_eq!(scoped_batch.source_high_watermark, Some(6));
+        assert!(scoped_batch.records.iter().all(|record| {
+            record
+                .primary_key
+                .get("tenant_id")
+                .is_some_and(|value| value == &serde_json::json!(1))
+        }));
+
+        let err = dst
+            .sync_import_batch_for_scope("tenant_1", &src.sync_export_batch(0, 100).unwrap())
+            .expect_err("out of scope records must be rejected");
+        assert!(err.to_string().contains("does not match scope"));
+
+        let summary = dst
+            .sync_import_batch_for_scope("tenant_1", &scoped_batch)
+            .unwrap();
+        assert_eq!(summary.applied, 3);
+        assert_eq!(dst.sync_peer_watermark("node-a").unwrap(), Some(6));
+
+        let rows = dst
+            .execute("SELECT tenant_id, id, value FROM tenant_items ORDER BY tenant_id, id")
+            .unwrap();
+        assert_eq!(rows.rows().len(), 1);
+        assert_eq!(
+            rows.rows()[0].values(),
+            &[
+                Value::Int64(1),
+                Value::Int64(10),
+                Value::Text("t1-b".to_string()),
+            ]
+        );
+
+        dst.sync_add_peer("relay", "https://relay.example.com", None)
+            .unwrap();
+        dst.sync_bind_peer_scope("relay", "tenant_1").unwrap();
+        let binding = dst.sync_peer_scope("relay").unwrap().expect("binding");
+        assert_eq!(binding.scope_name, "tenant_1");
+        let definition = dst
+            .sync_peer_scope_definition("relay")
+            .unwrap()
+            .expect("definition");
+        assert_eq!(definition.name, "tenant_1");
+        assert!(dst.sync_unbind_peer_scope("relay").unwrap());
+        assert!(dst.sync_peer_scope("relay").unwrap().is_none());
+        assert!(dst.sync_peer_scope_definition("relay").unwrap().is_none());
+    }
+
+    #[test]
+    fn sync_sql_inspection_views_cover_scopes_tables_and_bindings() {
+        let (_dir, db) = temp_db();
+        db.sync_add_peer("relay", "https://relay.example.com", None)
+            .unwrap();
+        db.sync_create_scope("tenant_1", &["users"], Some("id = 1"))
+            .unwrap();
+        db.sync_bind_peer_scope("relay", "tenant_1").unwrap();
+
+        let peer_scopes = db
+            .execute("SELECT * FROM sys_sync_peer_scopes ORDER BY peer_name")
+            .unwrap();
+        assert_eq!(
+            peer_scopes.columns(),
+            &[
+                "peer_name",
+                "scope_name",
+                "created_at_micros",
+                "updated_at_micros",
+            ]
+        );
+        assert_eq!(peer_scopes.rows().len(), 1);
+        assert_eq!(
+            peer_scopes.rows()[0].values(),
+            &[
+                Value::Text("relay".to_string()),
+                Value::Text("tenant_1".to_string()),
+                peer_scopes.rows()[0].values()[2].clone(),
+                peer_scopes.rows()[0].values()[3].clone(),
+            ]
+        );
     }
 
     #[test]

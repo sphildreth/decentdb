@@ -1067,8 +1067,8 @@ This work is large enough that it **must** be implemented in slices.
 ### Status (2026-05-17)
 
 ADR 0147 created for the local-first sync journal foundation. ADR 0148 created
-for HTTP transport and peer management. Remaining ADR work includes scoped sync
-restrictions and richer conflict resolution defaults.
+for HTTP transport and peer management. ADR 0149 created for scoped sync v1.
+Remaining ADR work includes richer conflict resolution defaults.
 
 ### Objectives
 
@@ -1271,26 +1271,18 @@ Add first official online transport with peer definitions and resumable sync ses
 
 Allow partial replication with validated table and row filters.
 
-### Tasks
+### Status
 
-1. Implement scope catalog objects.
-2. Implement table inclusion rules.
-3. Implement restricted row-filter validation.
-4. Bind peers to scopes.
-5. Ensure capture/export/apply all respect scope.
-6. Add error messages for unsupported scope definitions.
-7. Add tests for correctness and data leakage prevention.
+Complete (2026-05-17).
 
-### Deliverables
+### Implementation Notes
 
-- scoped sync v1
-- validation rules
-- examples for tenant/user/device subsets
-
-### Exit Criteria
-
-- scoped peers receive only intended data
-- invalid scopes are rejected clearly
+- Scope catalog tables are created and hidden behind the existing internal-table filter.
+- v1 row filters are deterministic AND chains only, with comparison, `IN`, and null checks over literals.
+- Scoped delete evaluation is restricted to primary-key columns to avoid tombstone leakage.
+- Scoped batches carry a source high-watermark so peers can advance past scanned out-of-scope journal records.
+- Peer-to-scope bindings, scoped export/import, SQL pseudo views, CLI scope commands, and scoped HTTP serve/run behavior are implemented and tested.
+- Future broad SQL filter support remains backlog, including `OR`, joins, subqueries, and other complex expressions.
 
 ---
 

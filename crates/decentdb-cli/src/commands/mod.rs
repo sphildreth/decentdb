@@ -13,8 +13,8 @@ use decentdb::{
     evict_shared_wal, render_markdown, run_doctor, BulkLoadOptions, Db, DbConfig, DoctorCategory,
     DoctorCheckSelection, DoctorIndexVerification, DoctorOptions, DoctorPathMode, DoctorReport,
     DoctorSeverity, HeaderInfo, IndexVerification, QueryResult, StorageInfo, SyncChangeBatch,
-    SyncConflict, SyncHandshake, SyncImportSummary, SyncPeer, SyncRunDirection, SyncRunSummary,
-    TableInfo, Value,
+    SyncConflict, SyncHandshake, SyncImportSummary, SyncPeer, SyncPeerScopeBinding,
+    SyncRunDirection, SyncRunSummary, SyncScope, TableInfo, Value,
 };
 
 use crate::output::{
@@ -356,6 +356,9 @@ pub enum SyncCommand {
     /// Manage sync peers
     #[command(subcommand)]
     Peer(SyncPeerCommand),
+    /// Manage sync scopes
+    #[command(subcommand)]
+    Scope(SyncScopeCommand),
     /// Run peer-to-peer sync over HTTP
     Run(SyncRunCommand),
     /// Serve sync protocol endpoints for tests and dev
@@ -370,6 +373,22 @@ pub enum SyncPeerCommand {
     Remove(SyncPeerRemoveCommand),
     /// List configured sync peers
     List(SyncPeerListCommand),
+}
+
+#[derive(Clone, Debug, Subcommand)]
+pub enum SyncScopeCommand {
+    /// Create or update a sync scope
+    Create(SyncScopeCreateCommand),
+    /// Drop a sync scope
+    Drop(SyncScopeDropCommand),
+    /// List configured sync scopes
+    List(SyncScopeListCommand),
+    /// Bind a peer to a sync scope
+    Bind(SyncScopeBindCommand),
+    /// Unbind a peer from its sync scope
+    Unbind(SyncScopeUnbindCommand),
+    /// List peer-to-scope bindings
+    Bindings(SyncScopeBindingsCommand),
 }
 
 #[derive(Clone, Debug, Parser)]
@@ -467,6 +486,68 @@ pub struct SyncPeerListCommand {
 }
 
 #[derive(Clone, Debug, Parser)]
+pub struct SyncScopeCreateCommand {
+    #[arg(long)]
+    pub db: String,
+    #[arg(long)]
+    pub name: String,
+    #[arg(long)]
+    pub include: String,
+    #[arg(long = "row-filter")]
+    pub row_filter: Option<String>,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
+    pub format: OutputFormat,
+}
+
+#[derive(Clone, Debug, Parser)]
+pub struct SyncScopeDropCommand {
+    #[arg(long)]
+    pub db: String,
+    #[arg(long)]
+    pub name: String,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
+    pub format: OutputFormat,
+}
+
+#[derive(Clone, Debug, Parser)]
+pub struct SyncScopeListCommand {
+    #[arg(long)]
+    pub db: String,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+    pub format: OutputFormat,
+}
+
+#[derive(Clone, Debug, Parser)]
+pub struct SyncScopeBindCommand {
+    #[arg(long)]
+    pub db: String,
+    #[arg(long)]
+    pub peer: String,
+    #[arg(long)]
+    pub scope: String,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
+    pub format: OutputFormat,
+}
+
+#[derive(Clone, Debug, Parser)]
+pub struct SyncScopeUnbindCommand {
+    #[arg(long)]
+    pub db: String,
+    #[arg(long)]
+    pub peer: String,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
+    pub format: OutputFormat,
+}
+
+#[derive(Clone, Debug, Parser)]
+pub struct SyncScopeBindingsCommand {
+    #[arg(long)]
+    pub db: String,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+    pub format: OutputFormat,
+}
+
+#[derive(Clone, Debug, Parser)]
 pub struct SyncRunCommand {
     #[arg(long)]
     pub db: String,
@@ -488,6 +569,8 @@ pub struct SyncServeCommand {
     pub db: String,
     #[arg(long)]
     pub bind: String,
+    #[arg(long)]
+    pub scope: Option<String>,
     #[arg(long = "token-env")]
     pub token_env: Option<String>,
     #[arg(long = "ready-file")]
@@ -1237,6 +1320,14 @@ fn run_sync(command: SyncCommand) -> Result<()> {
             SyncPeerCommand::Remove(cmd) => run_sync_peer_remove(cmd),
             SyncPeerCommand::List(cmd) => run_sync_peer_list(cmd),
         },
+        SyncCommand::Scope(cmd) => match cmd {
+            SyncScopeCommand::Create(cmd) => run_sync_scope_create(cmd),
+            SyncScopeCommand::Drop(cmd) => run_sync_scope_drop(cmd),
+            SyncScopeCommand::List(cmd) => run_sync_scope_list(cmd),
+            SyncScopeCommand::Bind(cmd) => run_sync_scope_bind(cmd),
+            SyncScopeCommand::Unbind(cmd) => run_sync_scope_unbind(cmd),
+            SyncScopeCommand::Bindings(cmd) => run_sync_scope_bindings(cmd),
+        },
         SyncCommand::Run(cmd) => run_sync_run(cmd),
         SyncCommand::Serve(cmd) => run_sync_serve(cmd),
     }
@@ -1294,11 +1385,86 @@ fn run_sync_peer_list(command: SyncPeerListCommand) -> Result<()> {
     Ok(())
 }
 
+fn run_sync_scope_create(command: SyncScopeCreateCommand) -> Result<()> {
+    let db = open_db(&command.db, true, 0, 0)?;
+    let include_tables = split_scope_tables(&command.include);
+    let include_table_refs: Vec<&str> = include_tables.iter().map(|table| table.as_str()).collect();
+    db.sync_create_scope(
+        &command.name,
+        &include_table_refs,
+        command.row_filter.as_deref(),
+    )?;
+    let scope = db
+        .sync_scope(&command.name)?
+        .ok_or_else(|| anyhow!("sync scope was not persisted"))?;
+    print_sync_scope_output(command.format, &scope)?;
+    Ok(())
+}
+
+fn run_sync_scope_drop(command: SyncScopeDropCommand) -> Result<()> {
+    let db = open_db(&command.db, false, 0, 0)?;
+    let removed = db.sync_drop_scope(&command.name)?;
+    match command.format {
+        OutputFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({ "removed": removed }))?
+            );
+        }
+        _ => {
+            println!("removed={removed}");
+        }
+    }
+    Ok(())
+}
+
+fn run_sync_scope_list(command: SyncScopeListCommand) -> Result<()> {
+    let db = open_db(&command.db, false, 0, 0)?;
+    let scopes = db.sync_scopes()?;
+    print_sync_scopes_output(command.format, &scopes)?;
+    Ok(())
+}
+
+fn run_sync_scope_bind(command: SyncScopeBindCommand) -> Result<()> {
+    let db = open_db(&command.db, true, 0, 0)?;
+    db.sync_bind_peer_scope(&command.peer, &command.scope)?;
+    let binding = db
+        .sync_peer_scope(&command.peer)?
+        .ok_or_else(|| anyhow!("sync peer scope binding was not persisted"))?;
+    print_sync_peer_scope_binding_output(command.format, &binding)?;
+    Ok(())
+}
+
+fn run_sync_scope_unbind(command: SyncScopeUnbindCommand) -> Result<()> {
+    let db = open_db(&command.db, false, 0, 0)?;
+    let removed = db.sync_unbind_peer_scope(&command.peer)?;
+    match command.format {
+        OutputFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({ "removed": removed }))?
+            );
+        }
+        _ => {
+            println!("removed={removed}");
+        }
+    }
+    Ok(())
+}
+
+fn run_sync_scope_bindings(command: SyncScopeBindingsCommand) -> Result<()> {
+    let db = open_db(&command.db, false, 0, 0)?;
+    let bindings = db.sync_peer_scope_bindings()?;
+    print_sync_peer_scope_bindings_output(command.format, &bindings)?;
+    Ok(())
+}
+
 fn run_sync_run(command: SyncRunCommand) -> Result<()> {
     let db = open_db(&command.db, false, 0, 0)?;
     let peer = db
         .sync_peer(&command.peer)?
         .ok_or_else(|| anyhow!("sync peer '{}' not found", command.peer))?;
+    let local_scope = db.sync_peer_scope_definition(&peer.name)?;
     let direction = SyncRunDirection::from_str(&command.direction)?;
     let token = resolve_sync_peer_token(&peer)?;
     let session_id = db.sync_start_session(&peer.name, direction.clone(), None)?;
@@ -1308,6 +1474,7 @@ fn run_sync_run(command: SyncRunCommand) -> Result<()> {
         match perform_sync_run_once(
             &db,
             &peer,
+            local_scope.as_ref(),
             token.as_deref(),
             direction.clone(),
             command.limit,
@@ -1335,6 +1502,11 @@ fn run_sync_run(command: SyncRunCommand) -> Result<()> {
 
 fn run_sync_serve(command: SyncServeCommand) -> Result<()> {
     let db = open_db(&command.db, true, 0, 0)?;
+    let scope = command.scope.clone();
+    if let Some(scope_name) = scope.as_deref() {
+        db.sync_scope(scope_name)?
+            .ok_or_else(|| anyhow!("sync scope '{}' not found", scope_name))?;
+    }
     let listener = TcpListener::bind(&command.bind)?;
     let bound_addr = listener.local_addr()?;
     if let Some(path) = &command.ready_file {
@@ -1351,7 +1523,7 @@ fn run_sync_serve(command: SyncServeCommand) -> Result<()> {
 
     for (handled, incoming) in listener.incoming().enumerate() {
         let stream = incoming?;
-        handle_sync_connection(&db, stream, auth_token.as_deref())?;
+        handle_sync_connection(&db, stream, auth_token.as_deref(), scope.as_deref())?;
         if command.max_requests.is_some_and(|max| handled + 1 >= max) {
             break;
         }
@@ -1363,6 +1535,7 @@ fn run_sync_serve(command: SyncServeCommand) -> Result<()> {
 fn perform_sync_run_once(
     db: &Db,
     peer: &SyncPeer,
+    local_scope: Option<&SyncScope>,
     token: Option<&str>,
     direction: SyncRunDirection,
     limit: usize,
@@ -1407,26 +1580,44 @@ fn perform_sync_run_once(
 
     match direction {
         SyncRunDirection::Push => {
-            sync_run_push_phase(db, peer, token, limit, &mut summary).map_err(|error| {
-                SyncRunFailure::with_summary(summary.clone(), error.message, error.retryable)
-            })?;
+            sync_run_push_phase(db, peer, local_scope, token, limit, &mut summary).map_err(
+                |error| {
+                    SyncRunFailure::with_summary(summary.clone(), error.message, error.retryable)
+                },
+            )?;
         }
         SyncRunDirection::Pull => {
-            sync_run_pull_phase(db, peer, token, limit, &handshake, &mut summary).map_err(
-                |error| {
-                    SyncRunFailure::with_summary(summary.clone(), error.message, error.retryable)
-                },
-            )?;
-        }
-        SyncRunDirection::Both => {
-            sync_run_push_phase(db, peer, token, limit, &mut summary).map_err(|error| {
+            sync_run_pull_phase(
+                db,
+                peer,
+                local_scope,
+                token,
+                limit,
+                &handshake,
+                &mut summary,
+            )
+            .map_err(|error| {
                 SyncRunFailure::with_summary(summary.clone(), error.message, error.retryable)
             })?;
-            sync_run_pull_phase(db, peer, token, limit, &handshake, &mut summary).map_err(
+        }
+        SyncRunDirection::Both => {
+            sync_run_push_phase(db, peer, local_scope, token, limit, &mut summary).map_err(
                 |error| {
                     SyncRunFailure::with_summary(summary.clone(), error.message, error.retryable)
                 },
             )?;
+            sync_run_pull_phase(
+                db,
+                peer,
+                local_scope,
+                token,
+                limit,
+                &handshake,
+                &mut summary,
+            )
+            .map_err(|error| {
+                SyncRunFailure::with_summary(summary.clone(), error.message, error.retryable)
+            })?;
         }
     }
 
@@ -1436,6 +1627,7 @@ fn perform_sync_run_once(
 fn sync_run_push_phase(
     db: &Db,
     peer: &SyncPeer,
+    local_scope: Option<&SyncScope>,
     token: Option<&str>,
     limit: usize,
     summary: &mut SyncRunSummary,
@@ -1444,18 +1636,20 @@ fn sync_run_push_phase(
         .sync_peer_out_watermark(&peer.name)
         .map_err(|error| SyncRunPhaseError::fatal(error.to_string()))?
         .unwrap_or(0);
-    let batch = db
-        .sync_export_batch(since, limit)
-        .map_err(|error| SyncRunPhaseError::fatal(error.to_string()))?;
+    let batch = if let Some(scope) = local_scope {
+        db.sync_export_batch_for_scope(&scope.name, since, limit)
+            .map_err(|error| SyncRunPhaseError::fatal(error.to_string()))?
+    } else {
+        db.sync_export_batch(since, limit)
+            .map_err(|error| SyncRunPhaseError::fatal(error.to_string()))?
+    };
     let remote_summary = sync_http_post_import(&peer.endpoint, token, &batch)
         .map_err(|error| SyncRunPhaseError::new(error.message, error.retryable))?;
     summary.pushed_batch_id = Some(batch.batch_id);
     summary.pushed = Some(remote_summary);
-    if let Some(last_sequence) = batch.last_sequence {
-        if !batch.records.is_empty() {
-            db.sync_set_peer_out_watermark(&peer.name, last_sequence)
-                .map_err(|error| SyncRunPhaseError::fatal(error.to_string()))?;
-        }
+    if let Some(watermark) = batch.source_high_watermark.or(batch.last_sequence) {
+        db.sync_set_peer_out_watermark(&peer.name, watermark)
+            .map_err(|error| SyncRunPhaseError::fatal(error.to_string()))?;
     }
     Ok(())
 }
@@ -1463,6 +1657,7 @@ fn sync_run_push_phase(
 fn sync_run_pull_phase(
     db: &Db,
     peer: &SyncPeer,
+    local_scope: Option<&SyncScope>,
     token: Option<&str>,
     limit: usize,
     handshake: &SyncHandshake,
@@ -1477,9 +1672,13 @@ fn sync_run_pull_phase(
         .unwrap_or(0);
     let batch = sync_http_get_changes(&peer.endpoint, token, since, limit)
         .map_err(|error| SyncRunPhaseError::new(error.message, error.retryable))?;
-    let local_summary = db
-        .sync_import_batch(&batch)
-        .map_err(|error| SyncRunPhaseError::fatal(error.to_string()))?;
+    let local_summary = if let Some(scope) = local_scope {
+        db.sync_import_batch_for_scope(&scope.name, &batch)
+            .map_err(|error| SyncRunPhaseError::fatal(error.to_string()))?
+    } else {
+        db.sync_import_batch(&batch)
+            .map_err(|error| SyncRunPhaseError::fatal(error.to_string()))?
+    };
     summary.pulled_batch_id = Some(batch.batch_id);
     summary.pulled = Some(local_summary);
     Ok(())
@@ -1548,6 +1747,133 @@ fn print_sync_peers_output(format: OutputFormat, peers: &[SyncPeer]) -> Result<(
                 "name".to_string(),
                 "endpoint".to_string(),
                 "token_env".to_string(),
+                "created_at_micros".to_string(),
+                "updated_at_micros".to_string(),
+            ];
+            println!("{}", render_rows(format, &columns, &rows, true));
+        }
+    }
+    Ok(())
+}
+
+fn print_sync_scope_output(format: OutputFormat, scope: &SyncScope) -> Result<()> {
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(scope)?);
+        }
+        _ => {
+            let rows = vec![
+                ("name".to_string(), scope.name.clone()),
+                (
+                    "include_tables".to_string(),
+                    scope.include_tables.join(", "),
+                ),
+                (
+                    "row_filter".to_string(),
+                    scope.row_filter.clone().unwrap_or_else(|| "-".to_string()),
+                ),
+                (
+                    "filter_columns".to_string(),
+                    scope.filter_columns.join(", "),
+                ),
+                (
+                    "created_at_micros".to_string(),
+                    scope.created_at_micros.to_string(),
+                ),
+                (
+                    "updated_at_micros".to_string(),
+                    scope.updated_at_micros.to_string(),
+                ),
+            ];
+            println!("{}", render_key_value_rows(format, &rows));
+        }
+    }
+    Ok(())
+}
+
+fn print_sync_scopes_output(format: OutputFormat, scopes: &[SyncScope]) -> Result<()> {
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(scopes)?);
+        }
+        _ => {
+            let rows = scopes
+                .iter()
+                .map(|scope| {
+                    vec![
+                        scope.name.clone(),
+                        scope.include_tables.join(", "),
+                        scope.row_filter.clone().unwrap_or_else(|| "-".to_string()),
+                        scope.filter_columns.join(", "),
+                        scope.created_at_micros.to_string(),
+                        scope.updated_at_micros.to_string(),
+                    ]
+                })
+                .collect::<Vec<_>>();
+            let columns = vec![
+                "name".to_string(),
+                "include_tables".to_string(),
+                "row_filter".to_string(),
+                "filter_columns".to_string(),
+                "created_at_micros".to_string(),
+                "updated_at_micros".to_string(),
+            ];
+            println!("{}", render_rows(format, &columns, &rows, true));
+        }
+    }
+    Ok(())
+}
+
+fn print_sync_peer_scope_binding_output(
+    format: OutputFormat,
+    binding: &SyncPeerScopeBinding,
+) -> Result<()> {
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(binding)?);
+        }
+        _ => {
+            let rows = vec![
+                ("peer_name".to_string(), binding.peer_name.clone()),
+                ("scope_name".to_string(), binding.scope_name.clone()),
+                (
+                    "created_at_micros".to_string(),
+                    binding.created_at_micros.to_string(),
+                ),
+                (
+                    "updated_at_micros".to_string(),
+                    binding.updated_at_micros.to_string(),
+                ),
+            ];
+            println!("{}", render_key_value_rows(format, &rows));
+        }
+    }
+    Ok(())
+}
+
+fn print_sync_peer_scope_bindings_output(
+    format: OutputFormat,
+    bindings: &[SyncPeerScopeBinding],
+) -> Result<()> {
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(bindings)?);
+        }
+        _ => {
+            let rows = bindings
+                .iter()
+                .map(|binding| {
+                    vec![
+                        binding.peer_name.clone(),
+                        binding.scope_name.clone(),
+                        binding.created_at_micros.to_string(),
+                        binding.updated_at_micros.to_string(),
+                    ]
+                })
+                .collect::<Vec<_>>();
+            let columns = vec![
+                "peer_name".to_string(),
+                "scope_name".to_string(),
                 "created_at_micros".to_string(),
                 "updated_at_micros".to_string(),
             ];
@@ -1830,7 +2156,12 @@ impl SyncHttpError {
     }
 }
 
-fn handle_sync_connection(db: &Db, stream: TcpStream, expected_token: Option<&str>) -> Result<()> {
+fn handle_sync_connection(
+    db: &Db,
+    stream: TcpStream,
+    expected_token: Option<&str>,
+    scope: Option<&str>,
+) -> Result<()> {
     let mut reader = BufReader::new(stream);
     let mut request_line = String::new();
     reader.read_line(&mut request_line)?;
@@ -1902,12 +2233,20 @@ fn handle_sync_connection(db: &Db, stream: TcpStream, expected_token: Option<&st
         ("GET", "/decentdb/sync/v1/changes") => {
             let since = parse_sync_query_param_u64(query, "since")?;
             let limit = parse_sync_query_param_usize(query, "limit")?;
-            Ok(serde_json::to_value(db.sync_export_batch(since, limit)?)?)
+            Ok(serde_json::to_value(if let Some(scope_name) = scope {
+                db.sync_export_batch_for_scope(scope_name, since, limit)?
+            } else {
+                db.sync_export_batch(since, limit)?
+            })?)
         }
         ("POST", "/decentdb/sync/v1/import") => {
             let batch: SyncChangeBatch = serde_json::from_slice(&body)
                 .map_err(|error| anyhow!("invalid sync batch payload: {error}"))?;
-            Ok(serde_json::to_value(db.sync_import_batch(&batch)?)?)
+            Ok(serde_json::to_value(if let Some(scope_name) = scope {
+                db.sync_import_batch_for_scope(scope_name, &batch)?
+            } else {
+                db.sync_import_batch(&batch)?
+            })?)
         }
         ("GET", "/decentdb/sync/v1/conflicts") => Ok(serde_json::to_value(db.sync_conflicts()?)?),
         _ => {
@@ -2205,6 +2544,14 @@ fn open_db(db: &str, create_if_missing: bool, cache_pages: usize, cache_mb: usiz
     } else {
         Ok(Db::open(db, config)?)
     }
+}
+
+fn split_scope_tables(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn parse_param(raw: &str) -> Result<Value> {

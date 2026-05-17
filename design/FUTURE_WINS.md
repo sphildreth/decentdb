@@ -20,22 +20,22 @@ Future version values are planning buckets, not release commitments.
 
 | Priority | Future Version | Status | Feature | Current Source Of Truth | Why This Rank |
 |---:|---|---|---|---|---|
-| 1 | vNext | TODO | Native local-first sync, changesets, CDC, and merge | [`WIN01_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md`](WIN01_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md), ADR 0147 | Strongest identity-level differentiator and real application painkiller |
+| 1 | vNext | IN PROGRESS | Native local-first sync, changesets, CDC, and merge | [`WIN01_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md`](WIN01_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md), ADR 0147, ADR 0148, ADR 0149 | Strongest identity-level differentiator and real application painkiller |
 | 2 | vNext | TODO | Branch, diff, restore, and time-travel workflows | Needs ADR/spec | Memorable workflow for agents, test environments, migration rehearsal, and support |
 | 3 | vNext | TODO | Schema-first strongly typed SDK generation | [`WIN02_SCHEMA_FIRST_STRONGLY_TYPED_SDK_GENERATION_SPEC.md`](WIN02_SCHEMA_FIRST_STRONGLY_TYPED_SDK_GENERATION_SPEC.md), ADR 0116, ADR 0129 | Adoption accelerator across languages; DecentDB metadata foundation exists |
-| 4 | vNext+1 | TODO | WASM and browser OPFS support | [`WIN03_WASM_SUPPORT_IMPLEMENTATION.md`](WIN03_WASM_SUPPORT_IMPLEMENTATION.md) | Essential enabler for browser local-first apps, but no longer unique by itself |
-| 5 | vNext+1 | TODO | Application database bundle format | Needs ADR/spec | Makes DecentDB a portable app artifact, support bundle, and sharable dataset format |
-| 6 | vNext+1 | TODO | Built-in observability and `sys.*` virtual tables | Needs ADR/spec; doctor v1 is foundation | Complements doctor and makes operational state queryable |
+| 4 | vNext+1 | BACKLOG | WASM and browser OPFS support | [`WIN03_WASM_SUPPORT_IMPLEMENTATION.md`](WIN03_WASM_SUPPORT_IMPLEMENTATION.md) | Essential enabler for browser local-first apps, but no longer unique by itself |
+| 5 | vNext+1 | BACKLOG | Application database bundle format | Needs ADR/spec | Makes DecentDB a portable app artifact, support bundle, and sharable dataset format |
+| 6 | vNext+1 | BACKLOG | Built-in observability and `sys.*` virtual tables | Needs ADR/spec; doctor v1 is foundation | Complements doctor and makes operational state queryable |
 | 7 | vNext+2 | BACKLOG | Policy-aware embedded SQL | Needs ADR/spec | Strong regulated/offline/enterprise story beyond encryption alone |
 | 8 | vNext+2 | BACKLOG | Built-in HTTP / remote server mode | Needs ADR/spec | Useful deployment multiplier, especially with write queuing |
-| 9 | vNext+2 | TODO | Transparent write queuing and pipelining | Needs ADR/spec | Makes one-writer reality feel modern under concurrent application writes |
-| 10 | vNext+2 | TODO | Group commit / WAL batching refinements | ADR 0135 | Async commit exists; strict durable group commit refinements remain |
+| 9 | vNext+2 | BACKLOG | Transparent write queuing and pipelining | Needs ADR/spec | Makes one-writer reality feel modern under concurrent application writes |
+| 10 | vNext+2 | BACKLOG | Group commit / WAL batching refinements | ADR 0135 | Async commit exists; strict durable group commit refinements remain |
 | 11 | vNext+2 | BACKLOG | Cross-process WAL coordination | Needs ADR/spec | Useful for Electron, helper processes, and background sync workers |
 | 12 | vNext+3 | BACKLOG | JSONB binary storage | Needs ADR/spec | Better JSON performance, but less identity-defining after SQLite JSONB |
-| 13 | vNext+3 | TODO | Transparent data compression | Existing compression foundation; needs product spec | Storage/cache multiplier, especially for large overflow payloads |
-| 14 | vNext+3 | TODO | Bulk-load follow-ons | Existing bulk-load API | Extends shipped foundation into stronger import and ETL workflows |
+| 13 | vNext+3 | BACKLOG | Transparent data compression | Existing compression foundation; needs product spec | Storage/cache multiplier, especially for large overflow payloads |
+| 14 | vNext+3 | BACKLOG | Bulk-load follow-ons | Existing bulk-load API | Extends shipped foundation into stronger import and ETL workflows |
 | 15 | vNext+3 | BACKLOG | Non-blocking schema migration | Needs ADR/spec | Valuable for large evolving databases, but complex and not the clearest identity anchor |
-| 16 | vNext+3 | TODO | Native geospatial types and spatial indexes | [`WIN03_GEOSPATIAL_DATA_SUPPORT.md`](WIN03_GEOSPATIAL_DATA_SUPPORT.md), ADR 0124-0128 | Strong feature-completeness win for location-heavy verticals |
+| 16 | vNext+3 | BACKLOG | Native geospatial types and spatial indexes | [`WIN03_GEOSPATIAL_DATA_SUPPORT.md`](WIN03_GEOSPATIAL_DATA_SUPPORT.md), ADR 0124-0128 | Strong feature-completeness win for location-heavy verticals |
 | 17 | Later | BACKLOG | Native vector / HNSW index | Needs ADR/spec | AI-era checkbox, useful but less unique |
 | 18 | Later | BACKLOG | Full-text search with BM25 ranking | Needs ADR/spec | Expected search capability; less distinctive because SQLite FTS is mature |
 | 19 | Later | BACKLOG | Transparent data encryption | Needs ADR/spec | Practical security feature, but weaker positioning than policy-aware data controls |
@@ -58,7 +58,7 @@ than future roadmap claims:
 - Cost-based optimizer and `ANALYZE`
 - In-memory VFS for testing
 - Bulk-load API foundation
-- Local sync Slices 1-3 complete: durable journal capture, batch-envelope export/import, conflict inspection, peer catalog, session tracking, HTTP client transport, dev sync server, `sync run`, retry handling, and session inspection
+- Local sync Slices 1-4 complete: durable journal capture, batch-envelope export/import, conflict inspection, peer catalog, session tracking, scoped replication, HTTP client transport, dev sync server, `sync run`, retry handling, and session inspection
 - Same-process shared WAL visibility
 - Mature C ABI and multi-language binding surface
 - Doctor/advisor v1 CLI, JSON, Markdown, and safe `--fix` surface
@@ -89,7 +89,7 @@ The remaining roadmap should support one clear lane:
 
 **Status:** `TODO`  
 **Future Version:** vNext  
-**Source of truth:** [`WIN01_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md`](WIN01_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md), ADR 0147, ADR 0148
+**Source of truth:** [`WIN01_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md`](WIN01_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md), ADR 0147, ADR 0148, ADR 0149
 
 ### Why This Is First
 
@@ -103,7 +103,7 @@ semantics as an engine capability.
 
 ### Completed Foundation
 
-Slices 1-3 are complete:
+Slices 1-4 are complete:
 
 - replica identity
 - sync enablement metadata
@@ -121,16 +121,17 @@ Slices 1-3 are complete:
 - peer catalog and credential-reference metadata
 - HTTP sync client transport and sync-only dev server
 - handshake/capability checks, retry behavior, and session inspection
+- scoped sync catalogs, peer bindings, SQL inspection views, and CLI commands
+- validated deterministic row filters and scoped batch high-watermarks
 
 ### Next Implementable Slice
 
-The next work should move to scoped replication now that the peer/session and
-transport foundation exists:
+The remaining sync work now moves to Slice 5 conflict resolution workflows:
 
-- scoped sync and row filters
-- scope-to-peer bindings
-- capture/apply validation for scoped data
-- scoped sync diagnostics and tests
+- conflict policy configuration
+- manual conflict inspection and resolution
+- structured conflict payload storage
+- conflict workflow diagnostics and tests
 
 ### Later Slices
 
