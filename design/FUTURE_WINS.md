@@ -58,7 +58,7 @@ than future roadmap claims:
 - Cost-based optimizer and `ANALYZE`
 - In-memory VFS for testing
 - Bulk-load API foundation
-- Local sync Slice 1 foundation: replica metadata, durable sidecar journal, pending-change enumeration, and sync CLI
+- Local sync Slice 1/2 foundation: replica metadata, durable sidecar journal, integrity checks, pending-change enumeration, manual export/import, and sync CLI
 - Same-process shared WAL visibility
 - Mature C ABI and multi-language binding surface
 - Doctor/advisor v1 CLI, JSON, Markdown, and safe `--fix` surface
@@ -103,7 +103,7 @@ semantics as an engine capability.
 
 ### Completed Foundation
 
-Slice 1 is implemented per ADR 0147:
+The Slice 1 functional foundation and the first Slice 2 foundations are implemented:
 
 - replica identity
 - sync enablement metadata
@@ -111,7 +111,13 @@ Slice 1 is implemented per ADR 0147:
 - transaction sequence numbers
 - tombstones for deletes
 - pending-change enumeration
+- sync journal integrity checks
+- manual JSONL export/import
+- idempotent remote sequence tracking
 - machine-readable sync CLI status and pending output
+
+Remaining Slice 1 validation work: crash/restart and fault-injection tests for
+journal durability.
 
 ### Next Implementable Slice
 
@@ -119,9 +125,9 @@ The next work should build on the durable local foundation rather than jumping
 straight to full networking:
 
 - crash/restart tests
-- local integrity checks for journal consistency
-- manual export/import sync
+- conflict recording and inspection for manual import
 - retention and compaction policy for the sync journal
+- protocol envelope/version negotiation for exchange files
 
 ### Later Slices
 

@@ -7,7 +7,8 @@ use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use decentdb::{
     evict_shared_wal, render_markdown, run_doctor, BulkLoadOptions, Db, DbConfig, DoctorCategory,
     DoctorCheckSelection, DoctorIndexVerification, DoctorOptions, DoctorPathMode, DoctorReport,
-    DoctorSeverity, HeaderInfo, IndexVerification, QueryResult, StorageInfo, TableInfo, Value,
+    DoctorSeverity, HeaderInfo, IndexVerification, QueryResult, StorageInfo, SyncJournalRecord,
+    TableInfo, Value,
 };
 
 use crate::output::{
@@ -328,6 +329,8 @@ pub struct MigrateCommand {
 pub enum SyncCommand {
     /// Initialize a replica and enable sync
     Init(SyncInitCommand),
+    /// Run sync journal integrity checks
+    Doctor(SyncDoctorCommand),
     /// Enable sync on a database
     Enable(DbCommand),
     /// Disable sync on a database
@@ -336,6 +339,10 @@ pub enum SyncCommand {
     Status(SyncStatusCommand),
     /// List pending sync changes
     Pending(SyncPendingCommand),
+    /// Export sync records from the local journal
+    Export(SyncExportCommand),
+    /// Import sync records into the database
+    Import(SyncImportCommand),
 }
 
 #[derive(Clone, Debug, Parser)]
@@ -347,11 +354,41 @@ pub struct SyncInitCommand {
 }
 
 #[derive(Clone, Debug, Parser)]
+pub struct SyncDoctorCommand {
+    #[arg(long)]
+    pub db: String,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+    pub format: OutputFormat,
+}
+
+#[derive(Clone, Debug, Parser)]
 pub struct SyncStatusCommand {
     #[arg(long)]
     pub db: String,
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,
+}
+
+#[derive(Clone, Debug, Parser)]
+pub struct SyncExportCommand {
+    #[arg(long)]
+    pub db: String,
+    #[arg(long)]
+    pub since: u64,
+    #[arg(long)]
+    pub output: PathBuf,
+    #[arg(long)]
+    pub limit: Option<usize>,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
+    pub format: OutputFormat,
+}
+
+#[derive(Clone, Debug, Parser)]
+pub struct SyncImportCommand {
+    #[arg(long)]
+    pub db: String,
+    #[arg(long)]
+    pub input: PathBuf,
 }
 
 #[derive(Clone, Debug, Parser)]
@@ -971,6 +1008,22 @@ fn run_sync(command: SyncCommand) -> Result<()> {
             println!("sync initialized (replica: {})", cmd.replica_id);
             Ok(())
         }
+        SyncCommand::Doctor(cmd) => {
+            let db = open_db(&cmd.db, false, 0, 0)?;
+            let report = db.sync_integrity_report()?;
+            match cmd.format {
+                OutputFormat::Json => {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                }
+                OutputFormat::Table => {
+                    print_sync_integrity_report_table(&report);
+                }
+                _ => {
+                    return Err(anyhow!("sync doctor supports only json or table output"));
+                }
+            }
+            Ok(())
+        }
         SyncCommand::Enable(cmd) => {
             let db = open_db(&cmd.db, false, 0, 0)?;
             db.sync_set_enabled(true)?;
@@ -1041,7 +1094,117 @@ fn run_sync(command: SyncCommand) -> Result<()> {
             }
             Ok(())
         }
+        SyncCommand::Export(cmd) => run_sync_export(cmd),
+        SyncCommand::Import(cmd) => {
+            let db = open_db(&cmd.db, true, 0, 0)?;
+            let records = parse_sync_records_file(&cmd.input)?;
+            let summary = db.sync_import_records(&records)?;
+            println!(
+                "seen={}, applied={}, skipped={}",
+                summary.seen, summary.applied, summary.skipped
+            );
+            Ok(())
+        }
     }
+}
+
+fn run_sync_export(command: SyncExportCommand) -> Result<()> {
+    let db = open_db(&command.db, false, 0, 0)?;
+    let records = db.sync_pending_changes(command.since, command.limit.unwrap_or(usize::MAX))?;
+
+    match command.format {
+        OutputFormat::Json => {
+            let mut output = String::new();
+            for record in records {
+                output.push_str(&serde_json::to_string(&record)?);
+                output.push('\n');
+            }
+            fs::write(&command.output, output)?;
+            Ok(())
+        }
+        OutputFormat::Table => Err(anyhow!("sync export supports only json output")),
+        _ => Err(anyhow!("sync export supports only json output")),
+    }
+}
+
+fn parse_sync_records_file(path: &Path) -> Result<Vec<SyncJournalRecord>> {
+    let content = fs::read_to_string(path)?;
+    let mut records = Vec::new();
+    for (line_index, raw_line) in content.lines().enumerate() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let record = serde_json::from_str(line).map_err(|error| {
+            anyhow!("malformed sync record on line {}: {error}", line_index + 1)
+        })?;
+        records.push(record);
+    }
+    Ok(records)
+}
+
+fn print_sync_integrity_report_table(report: &decentdb::SyncJournalIntegrityReport) {
+    println!(
+        "{}",
+        render_key_value_rows(
+            OutputFormat::Table,
+            &[
+                (
+                    "total_records".to_string(),
+                    report.total_records.to_string()
+                ),
+                (
+                    "first_sequence".to_string(),
+                    report
+                        .first_sequence
+                        .map_or_else(|| "-".to_string(), |value| value.to_string()),
+                ),
+                (
+                    "last_sequence".to_string(),
+                    report
+                        .last_sequence
+                        .map_or_else(|| "-".to_string(), |value| value.to_string()),
+                ),
+                (
+                    "highest_severity".to_string(),
+                    format!("{:?}", report.highest_severity),
+                ),
+                ("issues".to_string(), report.issues.len().to_string(),),
+            ]
+        )
+    );
+
+    if report.issues.is_empty() {
+        println!("issues: none");
+        return;
+    }
+
+    let columns = [
+        "line".to_string(),
+        "sequence".to_string(),
+        "severity".to_string(),
+        "code".to_string(),
+        "message".to_string(),
+    ];
+    let rows = report
+        .issues
+        .iter()
+        .map(|issue| {
+            vec![
+                issue.line_number.to_string(),
+                issue
+                    .sequence
+                    .map_or_else(|| "-".to_string(), |value| value.to_string()),
+                format!("{:?}", issue.severity),
+                issue.code.clone(),
+                issue.message.clone(),
+            ]
+        })
+        .collect::<Vec<_>>();
+    println!(
+        "{}",
+        render_rows(OutputFormat::Table, &columns, &rows, true)
+    );
 }
 
 fn print_storage_info(format: OutputFormat, storage: &StorageInfo) {

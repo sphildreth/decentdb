@@ -1,6 +1,6 @@
 # Local-First Sync as a First-Class Capability
 
-**Status:** Active spec — Slice 1 foundation (local journal + metadata catalog) implemented per ADR 0147 (2026-05-17); later slices remain TODO
+**Status:** Active spec — Slice 1 functional foundation and first Slice 2 manual export/import foundation implemented (2026-05-17); Slice 1 crash/restart validation and later slices remain TODO
 **Project:** DecentDB  
 **Document Type:** Implementation SPEC  
 **Audience:** Core engine developers, storage/replication implementers, SDK maintainers, CLI maintainers, documentation authors, coding agents  
@@ -1109,7 +1109,8 @@ negotiation, conflict semantics, scoped sync, HTTP transport) deferred to later 
 
 ### Status (2026-05-17)
 
-Slice 1 foundation implemented per ADR 0147:
+Slice 1 functional foundation implemented per ADR 0147:
+
 - Replica initialization and identity storage (DONE — `Db::sync_init_replica`)
 - Sync enablement flag (DONE — `Db::sync_set_enabled` / `Db::sync_is_enabled`)
 - Sync metadata catalog table `__decentdb_sync_metadata` (DONE — lazily created)
@@ -1118,8 +1119,11 @@ Slice 1 foundation implemented per ADR 0147:
 - Journal sequence numbering (DONE — monotonic u64 per replica)
 - Journal enumeration API (DONE — `Db::sync_pending_changes`)
 - Status view (DONE — `Db::sync_status`)
-- Not yet done: local integrity checks, scoped sync, conflict resolution, peer networking,
-  import/export apply, WASM, binding SDKs. See ADR 0147 for scope details.
+- Local integrity checks (DONE — `Db::sync_integrity_report` / `decentdb sync doctor`)
+- Slice 1 validation gap: crash/restart and fault-injection tests for journal
+  durability remain TODO.
+- Out of scope for Slice 1: scoped sync, conflict resolution, peer networking,
+  protocol negotiation, WASM, and binding SDKs. See ADR 0147 for scope details.
 
 ### Objectives
 
@@ -1152,6 +1156,22 @@ Implement local prerequisites for sync without networking yet.
 ---
 
 ## Slice 2 — Manual Export/Import Sync
+
+### Status (2026-05-17)
+
+First Slice 2 foundation implemented:
+
+- Manual JSONL export (DONE — `decentdb sync export --since <seq> --output <path>`)
+- Manual JSONL import (DONE — `decentdb sync import --input <path>`)
+- Conservative apply through existing SQL execution paths (DONE)
+- Idempotent remote sequence tracking (DONE — internal metadata markers)
+- Local-replica self-import rejection (DONE)
+- Imported changes are not echoed into the local journal (DONE)
+- Malformed record, unsupported schema version, unknown table, schema mismatch,
+  and missing primary-key validation (DONE)
+- Journal integrity diagnostics (DONE — `decentdb sync doctor`)
+- Not yet done: conflict recording/inspection, explicit batch envelope identity,
+  retention/compaction, peer watermarks, and full protocol negotiation.
 
 ### Objectives
 

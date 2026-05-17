@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -43,6 +44,58 @@ pub struct SyncStatus {
     pub journal_size_bytes: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SyncDoctorSeverity {
+    #[default]
+    Info,
+    Warning,
+    Error,
+}
+
+impl SyncDoctorSeverity {
+    fn as_rank(&self) -> u8 {
+        match self {
+            Self::Info => 0,
+            Self::Warning => 1,
+            Self::Error => 2,
+        }
+    }
+
+    fn max(self, other: Self) -> Self {
+        if self.as_rank() >= other.as_rank() {
+            self
+        } else {
+            other
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SyncJournalIssue {
+    pub line_number: usize,
+    pub sequence: Option<u64>,
+    pub severity: SyncDoctorSeverity,
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SyncJournalIntegrityReport {
+    pub total_records: usize,
+    pub first_sequence: Option<u64>,
+    pub last_sequence: Option<u64>,
+    pub highest_severity: SyncDoctorSeverity,
+    pub issues: Vec<SyncJournalIssue>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SyncImportSummary {
+    pub seen: usize,
+    pub applied: usize,
+    pub skipped: usize,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SyncMutation {
     pub table: String,
@@ -72,11 +125,25 @@ impl SyncOperation {
 pub(crate) struct SyncContext {
     enabled: AtomicBool,
     replica_id: Mutex<Option<String>>,
+    capture_enabled: AtomicBool,
     next_sequence: AtomicU64,
     journal_file: Mutex<Option<Arc<dyn VfsFile>>>,
     journal_write_offset: Mutex<u64>,
     journal_path: PathBuf,
     pub(crate) pending_mutations: Mutex<Vec<SyncMutation>>,
+}
+
+pub(crate) struct SyncJournalCaptureScope<'a> {
+    sync_ctx: &'a SyncContext,
+    capture_enabled: bool,
+}
+
+impl<'a> Drop for SyncJournalCaptureScope<'a> {
+    fn drop(&mut self) {
+        self.sync_ctx
+            .capture_enabled
+            .store(self.capture_enabled, Ordering::Release);
+    }
 }
 
 impl std::fmt::Debug for SyncContext {
@@ -96,6 +163,7 @@ impl SyncContext {
         Self {
             enabled: AtomicBool::new(false),
             replica_id: Mutex::new(None),
+            capture_enabled: AtomicBool::new(true),
             next_sequence: AtomicU64::new(1),
             journal_file: Mutex::new(None),
             journal_write_offset: Mutex::new(0),
@@ -147,6 +215,18 @@ impl SyncContext {
         }
     }
 
+    pub(crate) fn suppress_capture(&self) -> SyncJournalCaptureScope<'_> {
+        let capture_enabled = self.capture_enabled.swap(false, Ordering::AcqRel);
+        SyncJournalCaptureScope {
+            sync_ctx: self,
+            capture_enabled,
+        }
+    }
+
+    pub(crate) fn capture_enabled(&self) -> bool {
+        self.capture_enabled.load(Ordering::Acquire)
+    }
+
     pub(crate) fn replica_id(&self) -> Option<String> {
         self.replica_id.lock().ok()?.clone()
     }
@@ -168,7 +248,7 @@ impl SyncContext {
     }
 
     pub(crate) fn flush_journal(&self, vfs: &VfsHandle, transaction_lsn: u64) -> Result<()> {
-        if !self.is_enabled() {
+        if !self.is_enabled() || !self.capture_enabled() {
             return Ok(());
         }
         let replica_id = match self.replica_id() {
@@ -287,7 +367,9 @@ fn value_to_json(val: &Value) -> serde_json::Value {
             let hex: String = b.iter().map(|byte| format!("{byte:02x}")).collect();
             serde_json::Value::String(hex)
         }
-        Value::Decimal { scaled, scale } => serde_json::Value::String(format!("{scaled}e-{scale}")),
+        Value::Decimal { scaled, scale } => {
+            serde_json::Value::String(decimal_to_json_text(*scaled, *scale))
+        }
         Value::Uuid(u) => {
             let s = format!(
                 "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
@@ -300,12 +382,35 @@ fn value_to_json(val: &Value) -> serde_json::Value {
     }
 }
 
+fn decimal_to_json_text(scaled: i64, scale: u8) -> String {
+    if scale == 0 {
+        return scaled.to_string();
+    }
+    let negative = scaled < 0;
+    let digits = scaled.unsigned_abs().to_string();
+    let scale = usize::from(scale);
+    let padded = if digits.len() <= scale {
+        format!("{}{}", "0".repeat(scale + 1 - digits.len()), digits)
+    } else {
+        digits
+    };
+    let split = padded.len() - scale;
+    let mut decimal = format!("{}.{}", &padded[..split], &padded[split..]);
+    if negative {
+        decimal.insert(0, '-');
+    }
+    decimal
+}
+
 pub(crate) fn read_journal_records(
     journal_path: &Path,
     vfs: &VfsHandle,
     since_seq: u64,
     limit: usize,
 ) -> Result<Vec<SyncJournalRecord>> {
+    if !vfs.file_exists(journal_path)? {
+        return Ok(Vec::new());
+    }
     let file = vfs.open(journal_path, OpenMode::OpenExisting, FileKind::SyncJournal)?;
     let file_size = file.file_size()?;
     if file_size == 0 {
@@ -342,9 +447,181 @@ pub(crate) fn read_journal_records(
     Ok(records)
 }
 
+pub(crate) fn inspect_journal_integrity(
+    journal_path: &Path,
+    vfs: &VfsHandle,
+    local_replica_id: Option<&str>,
+) -> Result<SyncJournalIntegrityReport> {
+    if !vfs.file_exists(journal_path)? {
+        return Ok(SyncJournalIntegrityReport {
+            total_records: 0,
+            first_sequence: None,
+            last_sequence: None,
+            highest_severity: SyncDoctorSeverity::Info,
+            issues: Vec::new(),
+        });
+    }
+
+    let file = vfs.open(journal_path, OpenMode::OpenExisting, FileKind::SyncJournal)?;
+    let file_size = file.file_size()?;
+    if file_size == 0 {
+        return Ok(SyncJournalIntegrityReport {
+            total_records: 0,
+            first_sequence: None,
+            last_sequence: None,
+            highest_severity: SyncDoctorSeverity::Info,
+            issues: Vec::new(),
+        });
+    }
+
+    let mut buf = vec![0u8; file_size as usize];
+    let mut offset = 0;
+    while (offset as usize) < buf.len() {
+        let read = file.read_at(offset, &mut buf[offset as usize..])?;
+        if read == 0 {
+            break;
+        }
+        offset += read as u64;
+    }
+    let content = String::from_utf8_lossy(&buf[..offset as usize]);
+
+    let mut issues = Vec::new();
+    let mut seen = HashSet::new();
+    let mut first_sequence: Option<u64> = None;
+    let mut last_sequence: Option<u64> = None;
+    let mut highest = SyncDoctorSeverity::Info;
+    let mut total_records = 0usize;
+
+    for (line_index, line) in content.lines().enumerate() {
+        let line_number = line_index + 1;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        total_records += 1;
+
+        let record: SyncJournalRecord = match serde_json::from_str(trimmed) {
+            Ok(record) => record,
+            Err(error) => {
+                highest = highest.max(SyncDoctorSeverity::Error);
+                issues.push(SyncJournalIssue {
+                    line_number,
+                    sequence: None,
+                    severity: SyncDoctorSeverity::Error,
+                    code: "malformed_record".to_string(),
+                    message: format!("malformed sync journal record: {error}"),
+                });
+                continue;
+            }
+        };
+
+        let sequence = record.sequence;
+        if sequence == 0 {
+            highest = highest.max(SyncDoctorSeverity::Error);
+            issues.push(SyncJournalIssue {
+                line_number,
+                sequence: Some(sequence),
+                severity: SyncDoctorSeverity::Error,
+                code: "invalid_sequence".to_string(),
+                message: "sequence must be positive".to_string(),
+            });
+        }
+
+        if first_sequence.is_none() && sequence > 1 {
+            highest = highest.max(SyncDoctorSeverity::Error);
+            issues.push(SyncJournalIssue {
+                line_number,
+                sequence: Some(sequence),
+                severity: SyncDoctorSeverity::Error,
+                code: "sequence_gap".to_string(),
+                message: format!("expected first sequence to be 1, got {sequence}"),
+            });
+        }
+
+        if let Some(previous) = last_sequence {
+            if sequence <= previous {
+                highest = highest.max(SyncDoctorSeverity::Error);
+                issues.push(SyncJournalIssue {
+                    line_number,
+                    sequence: Some(sequence),
+                    severity: SyncDoctorSeverity::Error,
+                    code: "non_monotonic_sequence".to_string(),
+                    message: "sequence values are not monotonic".to_string(),
+                });
+            }
+            if sequence > previous + 1 {
+                highest = highest.max(SyncDoctorSeverity::Error);
+                issues.push(SyncJournalIssue {
+                    line_number,
+                    sequence: Some(sequence),
+                    severity: SyncDoctorSeverity::Error,
+                    code: "sequence_gap".to_string(),
+                    message: format!("sequence gap after {previous}, expected {}", previous + 1),
+                });
+            }
+        }
+
+        if !seen.insert(sequence) {
+            highest = highest.max(SyncDoctorSeverity::Error);
+            issues.push(SyncJournalIssue {
+                line_number,
+                sequence: Some(sequence),
+                severity: SyncDoctorSeverity::Error,
+                code: "duplicate_sequence".to_string(),
+                message: format!("duplicate sequence value {sequence}"),
+            });
+        }
+
+        if let Some(local_replica_id) = local_replica_id {
+            if record.replica_id != local_replica_id {
+                highest = highest.max(SyncDoctorSeverity::Error);
+                issues.push(SyncJournalIssue {
+                    line_number,
+                    sequence: Some(sequence),
+                    severity: SyncDoctorSeverity::Error,
+                    code: "replica_id_mismatch".to_string(),
+                    message: format!(
+                        "record replica '{}' does not match local replica '{}'",
+                        record.replica_id, local_replica_id
+                    ),
+                });
+            }
+        }
+
+        if record.schema_version != 1 {
+            highest = highest.max(SyncDoctorSeverity::Error);
+            issues.push(SyncJournalIssue {
+                line_number,
+                sequence: Some(sequence),
+                severity: SyncDoctorSeverity::Error,
+                code: "unsupported_schema_version".to_string(),
+                message: format!("unsupported schema version {}", record.schema_version),
+            });
+        }
+
+        if first_sequence.is_none() {
+            first_sequence = Some(sequence);
+        }
+        last_sequence = Some(sequence);
+    }
+
+    Ok(SyncJournalIntegrityReport {
+        total_records,
+        first_sequence,
+        last_sequence,
+        highest_severity: highest,
+        issues,
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+    use std::fs;
+
     use crate::Db;
+    use crate::SyncDoctorSeverity;
+    use crate::Value;
 
     fn temp_db() -> (tempfile::TempDir, Db) {
         let dir = tempfile::TempDir::with_prefix("decentdb-sync-test").unwrap();
@@ -492,6 +769,34 @@ mod tests {
     }
 
     #[test]
+    fn reopened_db_records_new_changes_and_continues_sequence() {
+        let dir = tempfile::TempDir::with_prefix("decentdb-sync-reopen-seq").unwrap();
+        let path = dir.path().join("test.ddb");
+        {
+            let db = Db::create(&path, crate::config::DbConfig::default()).unwrap();
+            db.execute("CREATE TABLE t (k INTEGER PRIMARY KEY, v TEXT)")
+                .unwrap();
+            db.sync_init_replica("node-a").unwrap();
+            db.execute("INSERT INTO t VALUES (1, 'x')").unwrap();
+            assert_eq!(db.sync_status().unwrap().next_sequence, 2);
+        }
+        {
+            let db = Db::open(&path, crate::config::DbConfig::default()).unwrap();
+            assert_eq!(db.sync_status().unwrap().next_sequence, 2);
+            db.execute("INSERT INTO t VALUES (2, 'y')").unwrap();
+            let records = db.sync_pending_changes(0, 10).unwrap();
+            assert_eq!(records.len(), 2);
+            assert_eq!(records[0].sequence, 1);
+            assert_eq!(records[1].sequence, 2);
+            assert_eq!(db.sync_status().unwrap().next_sequence, 3);
+        }
+        {
+            let db = Db::open(&path, crate::config::DbConfig::default()).unwrap();
+            assert_eq!(db.sync_status().unwrap().next_sequence, 3);
+        }
+    }
+
+    #[test]
     fn pending_changes_respects_since_and_limit() {
         let (_dir, db) = temp_db();
         db.sync_init_replica("node-1").unwrap();
@@ -561,5 +866,164 @@ mod tests {
         for (i, r) in records.iter().enumerate() {
             assert_eq!(r.sequence, (i + 1) as u64);
         }
+    }
+
+    fn sync_journal_lines() -> Vec<String> {
+        vec![
+            r#"{"schema_version":1,"sequence":1,"replica_id":"node-a","transaction_lsn":1,"table":"users","operation":"insert","primary_key":{"id":1},"after":{"id":1,"name":"Alice"},"schema_cookie":1,"committed_at_micros":0}"#.to_string(),
+            r#"{"schema_version":1,"sequence":3,"replica_id":"node-a","transaction_lsn":1,"table":"users","operation":"insert","primary_key":{"id":1},"after":{"id":1,"name":"Alice"},"schema_cookie":1,"committed_at_micros":0}"#.to_string(),
+            r#"{"schema_version":1,"sequence":3,"replica_id":"node-a","transaction_lsn":1,"table":"users","operation":"insert","primary_key":{"id":1},"after":{"id":1,"name":"Alice"},"schema_cookie":1,"committed_at_micros":0}"#.to_string(),
+            r#"{"schema_version":1,"sequence":2,"replica_id":"node-b","transaction_lsn":1,"table":"users","operation":"insert","primary_key":{"id":1},"after":{"id":1,"name":"Alice"},"schema_cookie":1,"committed_at_micros":0}"#.to_string(),
+            r#"{"schema_version":2,"sequence":4,"replica_id":"node-a","transaction_lsn":1,"table":"users","operation":"insert","primary_key":{"id":1},"after":{"id":1,"name":"Alice"},"schema_cookie":1,"committed_at_micros":0}"#.to_string(),
+        ]
+    }
+
+    #[test]
+    fn sync_import_roundtrip_apply_insert_update_delete() {
+        let (_dir_a, db_a) = temp_db();
+        db_a.sync_init_replica("node-a").unwrap();
+        db_a.execute("INSERT INTO users VALUES (1, 'alice')")
+            .unwrap();
+        db_a.execute("INSERT INTO users VALUES (2, 'bob')").unwrap();
+        db_a.execute("UPDATE users SET name = 'alice v2' WHERE id = 1")
+            .unwrap();
+        db_a.execute("DELETE FROM users WHERE id = 2").unwrap();
+
+        let records = db_a.sync_pending_changes(0, 100).unwrap();
+        let (_dir_b, db_b) = temp_db();
+        db_b.sync_init_replica("node-b").unwrap();
+        let summary = db_b.sync_import_records(&records).unwrap();
+        assert_eq!(summary.seen, 4);
+        assert_eq!(summary.applied, 4);
+        assert_eq!(summary.skipped, 0);
+
+        let rows = db_b
+            .execute("SELECT id, name FROM users ORDER BY id")
+            .unwrap();
+        assert_eq!(rows.rows().len(), 1);
+        assert_eq!(
+            rows.rows()[0].values(),
+            &[Value::Int64(1), Value::Text("alice v2".to_string())]
+        );
+        assert_eq!(db_b.sync_pending_changes(0, 100).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn sync_import_roundtrip_preserves_decimal_payloads() {
+        let (_dir_a, db_a) = temp_db();
+        db_a.execute("CREATE TABLE money (id INTEGER PRIMARY KEY, amount DECIMAL(10, 3))")
+            .unwrap();
+        db_a.sync_init_replica("node-a").unwrap();
+        db_a.execute_with_params(
+            "INSERT INTO money VALUES (1, $1)",
+            &[Value::Decimal {
+                scaled: 1999,
+                scale: 2,
+            }],
+        )
+        .unwrap();
+        let records = db_a.sync_pending_changes(0, 100).unwrap();
+
+        let (_dir_b, db_b) = temp_db();
+        db_b.execute("CREATE TABLE money (id INTEGER PRIMARY KEY, amount DECIMAL(10, 3))")
+            .unwrap();
+        db_b.sync_init_replica("node-b").unwrap();
+        let summary = db_b.sync_import_records(&records).unwrap();
+        assert_eq!(summary.applied, 1);
+
+        let rows = db_b
+            .execute("SELECT amount FROM money WHERE id = 1")
+            .unwrap();
+        assert_eq!(
+            rows.rows()[0].values()[0],
+            Value::Decimal {
+                scaled: 1999,
+                scale: 2
+            }
+        );
+    }
+
+    #[test]
+    fn sync_import_reimport_skips_already_applied_records() {
+        let (_dir_a, db_a) = temp_db();
+        db_a.sync_init_replica("node-a").unwrap();
+        db_a.execute("INSERT INTO users VALUES (1, 'alice')")
+            .unwrap();
+        let records = db_a.sync_pending_changes(0, 100).unwrap();
+
+        let (_dir_b, db_b) = temp_db();
+        db_b.sync_init_replica("node-b").unwrap();
+        assert!(db_b.sync_import_records(&records).unwrap().applied == 1);
+        let reimported = db_b.sync_import_records(&records).unwrap();
+        assert_eq!(reimported.seen, 1);
+        assert_eq!(reimported.applied, 0);
+        assert_eq!(reimported.skipped, 1);
+        let rows = db_b
+            .execute("SELECT id, name FROM users ORDER BY id")
+            .unwrap();
+        assert_eq!(
+            rows.rows()[0].values(),
+            &[Value::Int64(1), Value::Text("alice".to_string())]
+        );
+    }
+
+    #[test]
+    fn sync_import_rejects_local_replica_records() {
+        let (_dir_a, db_a) = temp_db();
+        db_a.sync_init_replica("node-a").unwrap();
+        db_a.execute("INSERT INTO users VALUES (1, 'alice')")
+            .unwrap();
+        let records = db_a.sync_pending_changes(0, 100).unwrap();
+
+        let (_dir_b, db_b) = temp_db();
+        db_b.sync_init_replica("node-a").unwrap();
+        let err = db_b
+            .sync_import_records(&records)
+            .expect_err("same-replica records must be rejected");
+        assert!(err
+            .to_string()
+            .contains("cannot import record from same replica"));
+    }
+
+    #[test]
+    fn sync_integrity_report_passes_for_normal_journal() {
+        let (_dir, db) = temp_db();
+        db.sync_init_replica("node-a").unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'alice')").unwrap();
+        db.execute("INSERT INTO users VALUES (2, 'bob')").unwrap();
+        let report = db.sync_integrity_report().unwrap();
+        assert_eq!(report.total_records, 2);
+        assert_eq!(report.first_sequence, Some(1));
+        assert_eq!(report.last_sequence, Some(2));
+        assert!(report.issues.is_empty());
+        assert_eq!(report.highest_severity, SyncDoctorSeverity::Info);
+    }
+
+    #[test]
+    fn sync_integrity_report_detects_corruption_and_gaps() {
+        let (_dir, db) = temp_db();
+        db.sync_init_replica("node-a").unwrap();
+        let status = db.sync_status().unwrap();
+        let journal_path = status.journal_path.expect("journal path");
+        let lines = sync_journal_lines();
+        let mut content = lines.join("\n");
+        content.push('\n');
+        content.push_str("not-json");
+        fs::write(&journal_path, content).unwrap();
+
+        let report = db.sync_integrity_report().unwrap();
+        assert_eq!(report.total_records, 6);
+        let codes: HashSet<_> = report
+            .issues
+            .iter()
+            .map(|issue| issue.code.as_str())
+            .collect();
+        assert!(codes.contains("malformed_record"));
+        assert!(codes.contains("sequence_gap"));
+        assert!(codes.contains("duplicate_sequence"));
+        assert!(codes.contains("non_monotonic_sequence"));
+        assert!(codes.contains("replica_id_mismatch"));
+        assert!(codes.contains("unsupported_schema_version"));
+        assert_eq!(report.highest_severity, SyncDoctorSeverity::Error);
     }
 }

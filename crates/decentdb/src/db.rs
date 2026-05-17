@@ -13,7 +13,7 @@ use crate::benchmark::{
     READ_PATH_WRITE_TXN_LOCK_COUNT,
 };
 use crate::catalog::{
-    identifiers_equal, CatalogHandle, CheckConstraint, ColumnSchema, ForeignKeyAction,
+    identifiers_equal, CatalogHandle, CheckConstraint, ColumnSchema, ColumnType, ForeignKeyAction,
     ForeignKeyConstraint, IndexColumn, IndexKind, IndexSchema, TableSchema, TriggerEvent,
     TriggerKind, TriggerSchema, ViewSchema,
 };
@@ -33,19 +33,22 @@ use crate::metadata::{
     SchemaViewInfo, StorageInfo, TableInfo, TriggerInfo, ViewInfo,
 };
 use crate::record::overflow::read_overflow;
-use crate::record::value::Value;
+use crate::record::value::{normalize_decimal, parse_decimal_text, Value};
 use crate::sql::ast::Statement as SqlStatement;
 use crate::sql::parser::{parse_sql_statement, rewrite_legacy_trigger_body};
 use crate::storage::freelist::{decode_freelist_next, encode_freelist_page};
 use crate::storage::page::{self, PageId, PageStore};
 use crate::storage::{self, DatabaseHeader, PagerHandle};
 use crate::sync::SyncContext;
-use crate::sync::{SyncJournalRecord, SyncStatus};
+use crate::sync::{
+    SyncImportSummary, SyncJournalIntegrityReport, SyncJournalRecord, SyncOperation, SyncStatus,
+};
 use crate::vfs::faulty::{self, FailAction, Failpoint};
 use crate::vfs::{is_memory_path, write_all_at, FileKind, OpenMode, VfsHandle};
 use crate::wal::reader_registry::ReaderGuard;
 use crate::wal::savepoint::StatementSavepoint;
 use crate::wal::WalHandle;
+use serde_json::Value as JsonValue;
 
 /// Stable engine owner used across later storage, SQL, and FFI slices.
 #[derive(Clone, Debug)]
@@ -5056,6 +5059,15 @@ impl Db {
         Ok(())
     }
 
+    pub fn sync_integrity_report(&self) -> Result<SyncJournalIntegrityReport> {
+        let local_replica_id = self.sync_read_metadata("replica_id").ok().flatten();
+        crate::sync::inspect_journal_integrity(
+            self.inner.sync_ctx.journal_path(),
+            &self.inner.vfs,
+            local_replica_id.as_deref(),
+        )
+    }
+
     pub fn sync_status(&self) -> Result<SyncStatus> {
         if self.inner.sync_ctx.is_enabled() {
             return Ok(SyncStatus {
@@ -5092,6 +5104,316 @@ impl Db {
             since_seq,
             limit,
         )
+    }
+
+    pub fn sync_import_records(&self, records: &[SyncJournalRecord]) -> Result<SyncImportSummary> {
+        self.ensure_sync_metadata_table()?;
+
+        let runtime = self.runtime_for_metadata_inspection()?;
+        let schema_cookie = runtime.catalog.schema_cookie;
+        let local_replica_id = self
+            .inner
+            .sync_ctx
+            .replica_id()
+            .or_else(|| self.sync_read_metadata("replica_id").ok().flatten());
+
+        let _suppress_capture = self.inner.sync_ctx.suppress_capture();
+
+        struct SyncImportTransaction<'a>(&'a Db, bool);
+        impl<'a> SyncImportTransaction<'a> {
+            fn new(db: &'a Db) -> Result<Self> {
+                db.begin_transaction()?;
+                Ok(Self(db, true))
+            }
+
+            fn commit(mut self) -> Result<()> {
+                self.1 = false;
+                self.0.commit_transaction()?;
+                Ok(())
+            }
+        }
+        impl Drop for SyncImportTransaction<'_> {
+            fn drop(&mut self) {
+                if self.1 {
+                    let _ = self.0.rollback_transaction();
+                }
+            }
+        }
+
+        let tx = SyncImportTransaction::new(self)?;
+
+        let mut applied = 0usize;
+        let mut skipped = 0usize;
+
+        for record in records {
+            if let Some(local_replica_id) = local_replica_id.as_deref() {
+                if record.replica_id == local_replica_id {
+                    return Err(DbError::sql(format!(
+                        "cannot import record from same replica '{}'",
+                        local_replica_id
+                    )));
+                }
+            }
+
+            if record.schema_version != 1 {
+                return Err(DbError::sql(format!(
+                    "unsupported sync record schema version {}",
+                    record.schema_version
+                )));
+            }
+
+            if record.schema_cookie != schema_cookie {
+                return Err(DbError::sql(format!(
+                    "schema mismatch for table '{}': record has schema_cookie {} but local schema is {}",
+                    record.table, record.schema_cookie, schema_cookie
+                )));
+            }
+
+            let table = match runtime.catalog.table(&record.table) {
+                Some(table) => table,
+                None => {
+                    return Err(DbError::sql(format!("unknown table '{}'", record.table)));
+                }
+            };
+
+            if crate::sync::is_internal_table_name(&table.name) {
+                return Err(DbError::sql(format!(
+                    "cannot import into internal table '{}'",
+                    table.name
+                )));
+            }
+
+            let marker_key = imported_record_key(&record.replica_id, record.sequence);
+            if self.sync_read_metadata(&marker_key)?.is_some() {
+                skipped += 1;
+                continue;
+            }
+
+            let operation = match record.operation.as_str() {
+                "insert" => SyncOperation::Insert,
+                "update" => SyncOperation::Update,
+                "delete" => SyncOperation::Delete,
+                other => {
+                    return Err(DbError::sql(format!("unsupported operation '{other}'")));
+                }
+            };
+
+            let primary_key = record
+                .primary_key
+                .as_object()
+                .ok_or_else(|| DbError::sql("primary_key must be an object"))?;
+            if table.primary_key_columns.is_empty() {
+                return Err(DbError::sql(format!(
+                    "table '{}' has no primary key column",
+                    table.name
+                )));
+            }
+            for pk_col in &table.primary_key_columns {
+                if !primary_key.contains_key(pk_col) {
+                    return Err(DbError::sql(format!(
+                        "missing primary key column '{}' in record for table '{}'",
+                        pk_col, table.name
+                    )));
+                }
+            }
+            for key in primary_key.keys() {
+                if !table.primary_key_columns.iter().any(|column| column == key) {
+                    return Err(DbError::sql(format!(
+                        "unknown primary key column '{key}' for table '{}'",
+                        table.name
+                    )));
+                }
+            }
+
+            match operation {
+                SyncOperation::Insert => {
+                    let after = match record.after.as_ref() {
+                        Some(value) => value
+                            .as_object()
+                            .ok_or_else(|| DbError::sql("after must be an object for insert"))?,
+                        None => {
+                            return Err(DbError::sql("insert record missing after payload"));
+                        }
+                    };
+
+                    let mut set_values = Vec::with_capacity(table.columns.len());
+                    let mut set_columns = Vec::with_capacity(table.columns.len());
+                    let mut placeholders = Vec::with_capacity(table.columns.len());
+                    for column in &table.columns {
+                        let json_value = after.get(&column.name).ok_or_else(|| {
+                            DbError::sql(format!(
+                                "missing column '{}' in after payload for table '{}'",
+                                column.name, table.name
+                            ))
+                        })?;
+                        set_values.push(json_to_typed_value(
+                            &table.name,
+                            &column.name,
+                            &column.column_type,
+                            json_value,
+                        )?);
+                        set_columns.push(sql_identifier(&column.name));
+                        placeholders.push(format!("${}", set_values.len()));
+                    }
+                    for key in after.keys() {
+                        if !table.columns.iter().any(|column| column.name == *key) {
+                            return Err(DbError::sql(format!(
+                                "unknown column '{key}' in insert payload for table '{}'",
+                                table.name
+                            )));
+                        }
+                    }
+
+                    let sql = format!(
+                        "INSERT INTO {} ({}) VALUES ({})",
+                        sql_identifier(&table.name),
+                        set_columns.join(", "),
+                        placeholders.join(", ")
+                    );
+                    self.execute_with_params(&sql, &set_values)?;
+                }
+                SyncOperation::Update => {
+                    let after = match record.after.as_ref() {
+                        Some(value) => value
+                            .as_object()
+                            .ok_or_else(|| DbError::sql("after must be an object for update"))?,
+                        None => {
+                            return Err(DbError::sql("update record missing after payload"));
+                        }
+                    };
+                    if table.columns.len() > after.len() {
+                        let missing = table
+                            .columns
+                            .iter()
+                            .find(|column| !after.contains_key(&column.name))
+                            .map_or_else(
+                                || table.columns[0].name.clone(),
+                                |column| column.name.clone(),
+                            );
+                        return Err(DbError::sql(format!(
+                            "missing column '{missing}' in update payload for table '{}'",
+                            table.name
+                        )));
+                    }
+                    for key in after.keys() {
+                        if !table.columns.iter().any(|column| column.name == *key) {
+                            return Err(DbError::sql(format!(
+                                "unknown column '{key}' in update payload for table '{}'",
+                                table.name
+                            )));
+                        }
+                    }
+                    let mut params =
+                        Vec::with_capacity(table.columns.len() + table.primary_key_columns.len());
+                    let mut expressions = Vec::with_capacity(table.columns.len());
+                    for column in &table.columns {
+                        let json_value = after.get(&column.name).ok_or_else(|| {
+                            DbError::sql(format!(
+                                "missing column '{}' in update payload for table '{}'",
+                                column.name, table.name
+                            ))
+                        })?;
+                        let value = json_to_typed_value(
+                            &table.name,
+                            &column.name,
+                            &column.column_type,
+                            json_value,
+                        )?;
+                        params.push(value);
+                        expressions.push(format!(
+                            "{} = ${}",
+                            sql_identifier(&column.name),
+                            params.len()
+                        ));
+                    }
+                    let set_clause = expressions.join(", ");
+                    let mut where_parts = Vec::with_capacity(table.primary_key_columns.len());
+                    for pk_col in &table.primary_key_columns {
+                        let column = table
+                            .columns
+                            .iter()
+                            .find(|column| column.name == *pk_col)
+                            .ok_or_else(|| {
+                                DbError::sql(format!(
+                                    "table '{}' missing primary key column '{}'",
+                                    table.name, pk_col
+                                ))
+                            })?;
+                        let json_value = primary_key.get(pk_col).ok_or_else(|| {
+                            DbError::sql(format!(
+                                "missing primary key column '{pk_col}' in record for table '{}'",
+                                table.name
+                            ))
+                        })?;
+                        let value = json_to_typed_value(
+                            &table.name,
+                            pk_col,
+                            &column.column_type,
+                            json_value,
+                        )?;
+                        params.push(value);
+                        where_parts.push(format!("{} = ${}", sql_identifier(pk_col), params.len()));
+                    }
+                    let sql = format!(
+                        "UPDATE {} SET {} WHERE {}",
+                        sql_identifier(&table.name),
+                        set_clause,
+                        where_parts.join(" AND ")
+                    );
+                    self.execute_with_params(&sql, &params)?;
+                }
+                SyncOperation::Delete => {
+                    let mut where_parts = Vec::with_capacity(table.primary_key_columns.len());
+                    let mut where_values = Vec::with_capacity(table.primary_key_columns.len());
+                    for pk_col in &table.primary_key_columns {
+                        let column = table
+                            .columns
+                            .iter()
+                            .find(|column| column.name == *pk_col)
+                            .ok_or_else(|| {
+                                DbError::sql(format!(
+                                    "table '{}' missing primary key column '{}'",
+                                    table.name, pk_col
+                                ))
+                            })?;
+                        let json_value = primary_key.get(pk_col).ok_or_else(|| {
+                            DbError::sql(format!(
+                                "missing primary key column '{pk_col}' in record for table '{}'",
+                                table.name
+                            ))
+                        })?;
+                        let value = json_to_typed_value(
+                            &table.name,
+                            pk_col,
+                            &column.column_type,
+                            json_value,
+                        )?;
+                        where_values.push(value);
+                        where_parts.push(format!(
+                            "{} = ${}",
+                            sql_identifier(pk_col),
+                            where_values.len()
+                        ));
+                    }
+                    let sql = format!(
+                        "DELETE FROM {} WHERE {}",
+                        sql_identifier(&table.name),
+                        where_parts.join(" AND ")
+                    );
+                    self.execute_with_params(&sql, &where_values)?;
+                }
+            }
+
+            self.sync_upsert_metadata(&marker_key, "applied")?;
+            applied += 1;
+        }
+
+        tx.commit()?;
+        Ok(SyncImportSummary {
+            seen: records.len(),
+            applied,
+            skipped,
+        })
     }
 
     pub fn sync_set_enabled(&self, enabled: bool) -> Result<()> {
@@ -5169,10 +5491,11 @@ impl Db {
             .map(|v| v == "true")
             .unwrap_or(false);
         let replica_id = self.sync_read_metadata("replica_id")?;
-        let next_sequence: u64 = self
+        let stored_next_sequence: u64 = self
             .sync_read_metadata("next_sequence")?
             .and_then(|v| v.parse().ok())
             .unwrap_or(1);
+        let next_sequence = self.effective_sync_next_sequence(stored_next_sequence)?;
         let journal_path = self
             .inner
             .sync_ctx
@@ -5189,16 +5512,78 @@ impl Db {
         })
     }
 
+    fn load_sync_status_from_runtime(&self, runtime: &mut EngineRuntime) -> Result<SyncStatus> {
+        let mut filter = BTreeSet::new();
+        filter.insert(crate::sync::METADATA_TABLE.to_string());
+        runtime.load_deferred_table_row_sources_filtered(
+            &self.inner.pager,
+            &self.inner.wal,
+            self.inner.config.page_size,
+            &filter,
+        )?;
+        let enabled = sync_read_metadata_from_runtime(runtime, "enabled")?
+            .map(|v| v == "true")
+            .unwrap_or(false);
+        let replica_id = sync_read_metadata_from_runtime(runtime, "replica_id")?;
+        let stored_next_sequence: u64 = sync_read_metadata_from_runtime(runtime, "next_sequence")?
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+        let next_sequence = self.effective_sync_next_sequence(stored_next_sequence)?;
+        let journal_path = self
+            .inner
+            .sync_ctx
+            .journal_path()
+            .to_string_lossy()
+            .to_string();
+        let journal_size_bytes = self.inner.sync_ctx.journal_size_bytes();
+        Ok(SyncStatus {
+            enabled,
+            replica_id,
+            next_sequence,
+            journal_path: Some(journal_path),
+            journal_size_bytes,
+        })
+    }
+
+    fn effective_sync_next_sequence(&self, stored_next_sequence: u64) -> Result<u64> {
+        let report = crate::sync::inspect_journal_integrity(
+            self.inner.sync_ctx.journal_path(),
+            &self.inner.vfs,
+            None,
+        )?;
+        let journal_next_sequence = report
+            .last_sequence
+            .and_then(|sequence| sequence.checked_add(1))
+            .unwrap_or(1);
+        Ok(stored_next_sequence.max(journal_next_sequence))
+    }
+
     pub(crate) fn sync_post_commit(
         &self,
         runtime: &mut EngineRuntime,
         committed_lsn: u64,
     ) -> Result<()> {
         let mutations = runtime.take_sync_mutations();
-        if !self.inner.sync_ctx.is_enabled() {
+        if mutations.is_empty() {
             return Ok(());
         }
-        if mutations.is_empty() {
+        if !self.inner.sync_ctx.capture_enabled() {
+            return Ok(());
+        }
+        let enabled = if self.inner.sync_ctx.is_enabled() {
+            true
+        } else {
+            let status = self.load_sync_status_from_runtime(runtime)?;
+            if status.enabled {
+                self.inner.sync_ctx.set_enabled(true);
+                if let Some(replica_id) = status.replica_id.as_deref() {
+                    self.inner.sync_ctx.set_replica_id(replica_id);
+                }
+                self.inner.sync_ctx.set_next_sequence(status.next_sequence);
+            }
+            status.enabled
+        };
+        if !enabled {
             return Ok(());
         }
         self.inner
@@ -5209,8 +5594,224 @@ impl Db {
             .extend(mutations);
         self.inner
             .sync_ctx
-            .flush_journal(&self.inner.vfs, committed_lsn)
+            .flush_journal(&self.inner.vfs, committed_lsn)?;
+        Ok(())
     }
+}
+
+fn sync_read_metadata_from_runtime(runtime: &EngineRuntime, key: &str) -> Result<Option<String>> {
+    let Some(table) = runtime.catalog.table(crate::sync::METADATA_TABLE) else {
+        return Ok(None);
+    };
+    let Some(key_index) = table.columns.iter().position(|column| column.name == "key") else {
+        return Ok(None);
+    };
+    let Some(value_index) = table
+        .columns
+        .iter()
+        .position(|column| column.name == "value")
+    else {
+        return Ok(None);
+    };
+    let Some(source) = runtime.table_row_source(&table.name) else {
+        return Ok(None);
+    };
+
+    for row in source.rows() {
+        let row = row?;
+        let values = row.values();
+        if let (Some(Value::Text(row_key)), Some(Value::Text(row_value))) =
+            (values.get(key_index), values.get(value_index))
+        {
+            if row_key == key {
+                return Ok(Some(row_value.clone()));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn imported_record_key(replica_id: &str, sequence: u64) -> String {
+    format!("sync_imported:{replica_id}:{sequence}")
+}
+
+fn parse_uuid_text(input: &str) -> Result<[u8; 16]> {
+    let mut hex = input.trim();
+    if let Some(dashed) = hex
+        .strip_prefix("x'")
+        .and_then(|value| value.strip_suffix('\''))
+    {
+        hex = dashed;
+    }
+    let hex = hex.replace('-', "");
+    if hex.len() != 32 {
+        return Err(DbError::sql(format!(
+            "uuid must be 32 hex digits, got {}",
+            hex.len()
+        )));
+    }
+    let mut bytes = [0u8; 16];
+    for (index, chunk) in hex.as_bytes().chunks_exact(2).enumerate() {
+        let pair = std::str::from_utf8(chunk)
+            .map_err(|error| DbError::sql(format!("invalid UUID record: {error}")))?;
+        bytes[index] = u8::from_str_radix(pair, 16)
+            .map_err(|error| DbError::sql(format!("invalid uuid: {error}")))?;
+    }
+    Ok(bytes)
+}
+
+fn parse_json_blob(input: &str) -> Result<Vec<u8>> {
+    let hex = if let Some(stripped) = input
+        .strip_prefix("x'")
+        .and_then(|value| value.strip_suffix('\''))
+    {
+        stripped
+    } else {
+        input
+    };
+    if !hex.len().is_multiple_of(2) {
+        return Err(DbError::sql("blob JSON text must have even length"));
+    }
+    let mut bytes = Vec::with_capacity(hex.len() / 2);
+    for chunk in hex.as_bytes().chunks_exact(2) {
+        let pair = std::str::from_utf8(chunk)
+            .map_err(|error| DbError::sql(format!("invalid blob hex record: {error}")))?;
+        bytes.push(
+            u8::from_str_radix(pair, 16)
+                .map_err(|error| DbError::sql(format!("invalid blob hex: {error}")))?,
+        );
+    }
+    Ok(bytes)
+}
+
+fn json_to_typed_value(
+    table_name: &str,
+    column_name: &str,
+    column_type: &ColumnType,
+    value: &JsonValue,
+) -> Result<Value> {
+    match column_type {
+        ColumnType::Int64 => match value {
+            JsonValue::Number(value) => value
+                .as_i64()
+                .map(Value::Int64)
+                .ok_or_else(|| {
+                    DbError::sql(format!(
+                        "column '{column_name}' in table '{table_name}' is not a valid INT64"
+                    ))
+                }),
+            JsonValue::String(value) => value
+                .parse::<i64>()
+                .map(Value::Int64)
+                .map_err(|error| {
+                    DbError::sql(format!(
+                        "column '{column_name}' in table '{table_name}' is not a valid INT64: {error}"
+                    ))
+                }),
+            _ => Err(DbError::sql(format!(
+                "column '{column_name}' in table '{table_name}' must be INT64"
+            ))),
+        },
+        ColumnType::Float64 => match value {
+            JsonValue::Number(value) => value
+                .as_f64()
+                .map(Value::Float64)
+                .ok_or_else(|| {
+                    DbError::sql(format!(
+                        "column '{column_name}' in table '{table_name}' is not a valid FLOAT64"
+                    ))
+                }),
+            JsonValue::String(value) => value
+                .parse::<f64>()
+                .map(Value::Float64)
+                .map_err(|error| {
+                    DbError::sql(format!(
+                        "column '{column_name}' in table '{table_name}' is not a valid FLOAT64: {error}"
+                    ))
+                }),
+            _ => Err(DbError::sql(format!(
+                "column '{column_name}' in table '{table_name}' must be FLOAT64"
+            ))),
+        },
+        ColumnType::Text => match value {
+            JsonValue::String(value) => Ok(Value::Text(value.clone())),
+            _ => Err(DbError::sql(format!(
+                "column '{column_name}' in table '{table_name}' must be TEXT"
+            ))),
+        },
+        ColumnType::Bool => match value {
+            JsonValue::Bool(value) => Ok(Value::Bool(*value)),
+            _ => Err(DbError::sql(format!(
+                "column '{column_name}' in table '{table_name}' must be BOOL"
+            ))),
+        },
+        ColumnType::Blob => match value {
+            JsonValue::String(value) => Ok(Value::Blob(parse_json_blob(value)?)),
+            _ => Err(DbError::sql(format!(
+                "column '{column_name}' in table '{table_name}' must be BLOB"
+            ))),
+        },
+        ColumnType::Decimal => {
+            let text = match value {
+                JsonValue::Number(value) => value.to_string(),
+                JsonValue::String(value) => value.clone(),
+                _ => {
+                    return Err(DbError::sql(format!(
+                        "column '{column_name}' in table '{table_name}' must be DECIMAL"
+                    )));
+                }
+            };
+            let (scaled, scale) = parse_sync_decimal_text(&text)?;
+            Ok(Value::Decimal { scaled, scale })
+        }
+        ColumnType::Uuid => {
+            let text = value.as_str().ok_or_else(|| {
+                DbError::sql(format!(
+                    "column '{column_name}' in table '{table_name}' must be UUID text"
+                ))
+            })?;
+            Ok(Value::Uuid(parse_uuid_text(text)?))
+        }
+        ColumnType::Timestamp => match value {
+            JsonValue::Number(value) => value
+                .as_i64()
+                .map(Value::TimestampMicros)
+                .ok_or_else(|| {
+                    DbError::sql(format!(
+                        "column '{column_name}' in table '{table_name}' is not a valid TIMESTAMP"
+                    ))
+                }),
+            JsonValue::String(value) => value
+                .parse::<i64>()
+                .map(Value::TimestampMicros)
+                .map_err(|error| {
+                    DbError::sql(format!(
+                        "column '{column_name}' in table '{table_name}' is not a valid TIMESTAMP: {error}"
+                    ))
+                }),
+            _ => Err(DbError::sql(format!(
+                "column '{column_name}' in table '{table_name}' must be TIMESTAMP"
+            ))),
+        },
+    }
+}
+
+fn parse_sync_decimal_text(value: &str) -> Result<(i64, u8)> {
+    if let Ok(parsed) = parse_decimal_text(value) {
+        return Ok(parsed);
+    }
+    let trimmed = value.trim();
+    let (scaled_text, scale_text) = trimmed
+        .split_once("e-")
+        .or_else(|| trimmed.split_once("E-"))
+        .ok_or_else(|| DbError::sql("invalid DECIMAL cast"))?;
+    let scaled = scaled_text
+        .parse::<i64>()
+        .map_err(|_| DbError::sql("invalid DECIMAL cast"))?;
+    let scale = scale_text
+        .parse::<u8>()
+        .map_err(|_| DbError::sql("invalid DECIMAL cast"))?;
+    Ok(normalize_decimal(scaled, scale))
 }
 
 fn db_open_lock(canonical_path: PathBuf) -> Result<Arc<Mutex<()>>> {

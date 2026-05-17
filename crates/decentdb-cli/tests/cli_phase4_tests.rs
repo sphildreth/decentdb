@@ -32,6 +32,17 @@ fn run(args: &[&str]) -> String {
     String::from_utf8(output.stdout).expect("utf8 stdout")
 }
 
+fn run_result(args: &[&str]) -> (i32, String, String) {
+    let output = Command::new(bin())
+        .args(args)
+        .output()
+        .expect("run command");
+    let code = output.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+    (code, stdout, stderr)
+}
+
 #[test]
 fn exec_and_schema_introspection_commands_work() {
     let dir = temp_dir();
@@ -327,6 +338,143 @@ fn completion_and_repl_smoke_work() {
     let stdout = String::from_utf8(output.stdout).expect("stdout");
     assert!(stdout.contains("id | name"));
     assert!(stdout.contains("1  | Ada"));
+}
+
+#[test]
+fn sync_export_import_and_doctor_commands_work() {
+    let dir = temp_dir();
+    let source = dir.join("sync_source.ddb");
+    let target = dir.join("sync_target.ddb");
+    let export = dir.join("sync_export.jsonl");
+    let source_str = source.display().to_string();
+    let target_str = target.display().to_string();
+    let export_str = export.display().to_string();
+
+    run(&[
+        "exec",
+        "--db",
+        &source_str,
+        "--sql",
+        "CREATE TABLE users (id INT64 PRIMARY KEY, name TEXT)",
+    ]);
+    run(&[
+        "sync",
+        "init",
+        "--db",
+        &source_str,
+        "--replica-id",
+        "node-a",
+    ]);
+    run(&[
+        "exec",
+        "--db",
+        &source_str,
+        "--sql",
+        "INSERT INTO users (id, name) VALUES (1, 'Ada'); \
+         UPDATE users SET name = 'Ada Lovelace' WHERE id = 1; \
+         INSERT INTO users (id, name) VALUES (2, 'Grace');",
+    ]);
+
+    let doctor = run(&["sync", "doctor", "--db", &source_str, "--format", "json"]);
+    assert!(doctor.contains("\"total_records\": 3"));
+    assert!(doctor.contains("\"issues\": []"));
+
+    run(&[
+        "sync",
+        "export",
+        "--db",
+        &source_str,
+        "--since",
+        "0",
+        "--output",
+        &export_str,
+    ]);
+    let exported = fs::read_to_string(&export).expect("read sync export");
+    assert_eq!(exported.lines().count(), 3);
+    assert!(exported.contains("\"replica_id\":\"node-a\""));
+
+    run(&[
+        "exec",
+        "--db",
+        &target_str,
+        "--sql",
+        "CREATE TABLE users (id INT64 PRIMARY KEY, name TEXT)",
+    ]);
+    run(&[
+        "sync",
+        "init",
+        "--db",
+        &target_str,
+        "--replica-id",
+        "node-b",
+    ]);
+
+    let imported = run(&[
+        "sync",
+        "import",
+        "--db",
+        &target_str,
+        "--input",
+        &export_str,
+    ]);
+    assert_eq!(imported.trim(), "seen=3, applied=3, skipped=0");
+
+    let selected = run(&[
+        "exec",
+        "--db",
+        &target_str,
+        "--sql",
+        "SELECT id, name FROM users ORDER BY id",
+        "--format",
+        "json",
+    ]);
+    assert!(selected.contains("\"rows\":[[\"1\",\"Ada Lovelace\"],[\"2\",\"Grace\"]]"));
+
+    let reimported = run(&[
+        "sync",
+        "import",
+        "--db",
+        &target_str,
+        "--input",
+        &export_str,
+    ]);
+    assert_eq!(reimported.trim(), "seen=3, applied=0, skipped=3");
+
+    let pending = run(&["sync", "pending", "--db", &target_str, "--format", "json"]);
+    assert_eq!(pending.trim(), "[]");
+}
+
+#[test]
+fn sync_import_rejects_malformed_jsonl() {
+    let dir = temp_dir();
+    let db = dir.join("sync_import.ddb");
+    let db_str = db.display().to_string();
+
+    run(&[
+        "exec",
+        "--db",
+        &db_str,
+        "--sql",
+        "CREATE TABLE users (id INT64 PRIMARY KEY, name TEXT)",
+    ]);
+    run(&["sync", "init", "--db", &db_str, "--replica-id", "node-a"]);
+
+    let bad = dir.join("malformed.jsonl");
+    fs::write(&bad, "{ \"schema_version\": 1").expect("write malformed payload");
+
+    let (code, _stdout, stderr) = run_result(&[
+        "sync",
+        "import",
+        "--db",
+        &db_str,
+        "--input",
+        &bad.display().to_string(),
+    ]);
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("malformed sync record on line 1")
+            || stderr.contains("malformed sync record")
+    );
 }
 
 #[test]
