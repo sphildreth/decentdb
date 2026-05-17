@@ -1,6 +1,6 @@
 # Local-First Sync as a First-Class Capability
 
-**Status:** Active spec — Slices 1-5 complete (2026-05-17); later slices remain TODO
+**Status:** Active spec — Slices 1-6 complete (2026-05-17); later slices remain TODO
 **Project:** DecentDB  
 **Document Type:** Implementation SPEC  
 **Audience:** Core engine developers, storage/replication implementers, SDK maintainers, CLI maintainers, documentation authors, coding agents  
@@ -1334,14 +1334,31 @@ Complete (2026-05-17).
 
 Make the system supportable in production-like use.
 
+### Status (2026-05-17)
+
+Slice 6 is complete:
+
+- Operational doctor report (DONE — `Db::sync_operational_doctor_report`, `decentdb sync doctor`, `sys_sync_doctor`, ADR 0151)
+- Retention and prune hardening (DONE — `Db::sync_retention_report`, `Db::sync_prune_journal`, `decentdb sync prune`)
+- Backlog and watermark lag reporting (DONE — `Db::sync_peer_lag_report`, `sys_sync_peer_lag`, `sys_sync_retention`)
+- Dry-run and allow-data-loss overrides (DONE — `--dry-run`, `--allow-data-loss`, JSON/table prune summaries)
+- Recent session summaries and guidance lines (DONE — operational doctor report and CLI table output)
+
+Implementation notes:
+
+- Safe pruning is now the default and remains gated by known peer/session watermarks.
+- `--dry-run` reports the prune decision without mutating the journal.
+- `--allow-data-loss` is an explicit override for operators who accept that tradeoff.
+- v1 guidance is intentionally conservative: it reports known lag, blocked retention, and integrity issues, but it does not attempt speculative remote recovery or automatic schema repair.
+
 ### Tasks
 
-1. Implement `ddb sync doctor`.
-2. Implement retention/pruning with safety checks.
-3. Implement backlog and watermark lag reporting.
-4. Implement compatibility warnings for schema drift.
-5. Improve performance diagnostics and session summaries.
-6. Add maintenance guidance and safe/unsafe prune modes.
+1. Implement `ddb sync doctor`. DONE.
+2. Implement retention/pruning with safety checks. DONE.
+3. Implement backlog and watermark lag reporting. DONE.
+4. Implement compatibility warnings for schema drift. DONE through the v1 integrity and operational doctor reports.
+5. Improve performance diagnostics and session summaries. DONE for recent session summaries and retry/apply counts.
+6. Add maintenance guidance and safe/unsafe prune modes. DONE.
 
 ### Deliverables
 
@@ -1732,7 +1749,7 @@ If implementation capacity is limited, prioritize in this order:
 4. Slice 3 — HTTP Transport and Peer Management
 5. Slice 5 — Conflict Resolution Workflows
 6. Slice 4 — Scoped Sync
-7. Slice 6 — Doctor and Operational Hardening
+7. Slice 6 — Doctor, Retention, and Operational Hardening
 8. Slice 7 — SDK Polish
 9. Slice 8 — Documentation Completion Gate
 

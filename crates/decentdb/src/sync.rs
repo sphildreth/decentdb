@@ -263,7 +263,7 @@ impl SyncChangeBatch {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SyncStatus {
     pub enabled: bool,
     pub replica_id: Option<String>,
@@ -488,7 +488,7 @@ pub struct SyncConflict {
     pub resolved: bool,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, PartialOrd, Ord, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SyncDoctorSeverity {
     #[default]
@@ -515,7 +515,17 @@ impl SyncDoctorSeverity {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+impl std::fmt::Display for SyncDoctorSeverity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Info => "info",
+            Self::Warning => "warning",
+            Self::Error => "error",
+        })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SyncJournalIssue {
     pub line_number: usize,
     pub sequence: Option<u64>,
@@ -524,13 +534,58 @@ pub struct SyncJournalIssue {
     pub message: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SyncJournalIntegrityReport {
     pub total_records: usize,
     pub first_sequence: Option<u64>,
     pub last_sequence: Option<u64>,
     pub highest_severity: SyncDoctorSeverity,
     pub issues: Vec<SyncJournalIssue>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncPeerLag {
+    pub peer_name: String,
+    pub remote_replica_id: Option<String>,
+    pub in_watermark: Option<u64>,
+    pub out_watermark: Option<u64>,
+    pub local_high_watermark: Option<u64>,
+    pub in_lag: Option<u64>,
+    pub out_lag: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncRetentionReport {
+    pub journal_records: usize,
+    pub first_sequence: Option<u64>,
+    pub last_sequence: Option<u64>,
+    pub safe_prune_through: Option<u64>,
+    pub prunable_records: usize,
+    pub blocked_by: Vec<String>,
+    pub journal_size_bytes: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncOperationalDoctorReport {
+    pub status: SyncStatus,
+    pub integrity: SyncJournalIntegrityReport,
+    pub retention: SyncRetentionReport,
+    pub peer_lag: Vec<SyncPeerLag>,
+    pub unresolved_conflicts: usize,
+    pub recent_sessions: Vec<SyncSession>,
+    pub highest_severity: SyncDoctorSeverity,
+    pub issues: Vec<SyncJournalIssue>,
+    pub guidance: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncPruneSummary {
+    pub requested_through: u64,
+    pub effective_through: u64,
+    pub pruned: usize,
+    pub dry_run: bool,
+    pub allow_data_loss: bool,
+    pub blocked_by: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -2456,6 +2511,169 @@ mod tests {
         let remaining = db_dst.sync_pending_changes(0, 10).unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].sequence, 3);
+    }
+
+    fn operational_doctor_fixture() -> (tempfile::TempDir, Db) {
+        let (_src_dir, db_src) = temp_db();
+        db_src.sync_init_replica("node-a").unwrap();
+        db_src
+            .execute("INSERT INTO users VALUES (1, 'src1')")
+            .unwrap();
+        db_src
+            .execute("INSERT INTO users VALUES (2, 'src2')")
+            .unwrap();
+        let batch = db_src.sync_export_batch(0, 100).unwrap();
+
+        let (dir_dst, db_dst) = temp_db();
+        db_dst.sync_init_replica("node-b").unwrap();
+        db_dst
+            .sync_add_peer("peer-a", "https://peer.example.com", None)
+            .unwrap();
+        db_dst
+            .execute("INSERT INTO users VALUES (10, 'dst10')")
+            .unwrap();
+        db_dst
+            .execute("INSERT INTO users VALUES (11, 'dst11')")
+            .unwrap();
+        db_dst.sync_import_batch(&batch).unwrap();
+        db_dst.sync_set_peer_out_watermark("peer-a", 10).unwrap();
+
+        let session_id = db_dst
+            .sync_start_session("peer-a", SyncRunDirection::Pull, Some("node-a"))
+            .unwrap();
+        let summary = SyncRunSummary {
+            peer_name: "peer-a".to_string(),
+            direction: SyncRunDirection::Pull,
+            remote_replica_id: Some("node-a".to_string()),
+            pushed: None,
+            pulled: Some(SyncImportSummary {
+                seen: 2,
+                applied: 2,
+                skipped: 0,
+                conflicted: 0,
+            }),
+            pushed_batch_id: None,
+            pulled_batch_id: Some(batch.batch_id.clone()),
+            retry_count: 0,
+        };
+        db_dst
+            .sync_finish_session_success(session_id, &summary)
+            .unwrap();
+
+        (dir_dst, db_dst)
+    }
+
+    #[test]
+    fn sync_retention_and_peer_lag_reports_track_watermarks() {
+        let (_dir, db) = operational_doctor_fixture();
+
+        let peer_lag = db.sync_peer_lag_report().unwrap();
+        assert_eq!(peer_lag.len(), 1);
+        let peer = &peer_lag[0];
+        assert_eq!(peer.peer_name, "peer-a");
+        assert_eq!(peer.remote_replica_id.as_deref(), Some("node-a"));
+        assert_eq!(peer.in_watermark, Some(2));
+        assert_eq!(peer.out_watermark, Some(10));
+        assert_eq!(peer.local_high_watermark, Some(2));
+        assert_eq!(peer.in_lag, Some(0));
+        assert_eq!(peer.out_lag, None);
+
+        let retention = db.sync_retention_report().unwrap();
+        assert_eq!(retention.journal_records, 2);
+        assert_eq!(retention.first_sequence, Some(1));
+        assert_eq!(retention.last_sequence, Some(2));
+        assert_eq!(retention.safe_prune_through, Some(1));
+        assert_eq!(retention.prunable_records, 1);
+        assert_eq!(retention.blocked_by, vec!["remote:node-a".to_string()]);
+        assert_eq!(
+            retention.journal_size_bytes,
+            db.sync_status().unwrap().journal_size_bytes
+        );
+
+        let report = db.sync_operational_doctor_report().unwrap();
+        assert!(report
+            .guidance
+            .iter()
+            .any(|line| line.contains("safe prune is available")));
+        assert_eq!(report.recent_sessions.len(), 1);
+        assert_eq!(report.highest_severity, SyncDoctorSeverity::Info);
+        assert!(report.issues.is_empty());
+    }
+
+    #[test]
+    fn sync_prune_journal_supports_dry_run_and_data_loss_override() {
+        let (_dir, db) = operational_doctor_fixture();
+
+        let dry_run = db.sync_prune_journal(1, true, false).unwrap();
+        assert_eq!(dry_run.requested_through, 1);
+        assert_eq!(dry_run.effective_through, 1);
+        assert_eq!(dry_run.pruned, 1);
+        assert!(dry_run.dry_run);
+        assert!(!dry_run.allow_data_loss);
+        assert_eq!(dry_run.blocked_by, vec!["remote:node-a".to_string()]);
+        assert_eq!(db.sync_pending_changes(0, 100).unwrap().len(), 2);
+
+        let unsafe_override = db.sync_prune_journal(2, false, true).unwrap();
+        assert_eq!(unsafe_override.requested_through, 2);
+        assert_eq!(unsafe_override.effective_through, 2);
+        assert_eq!(unsafe_override.pruned, 2);
+        assert!(!unsafe_override.dry_run);
+        assert!(unsafe_override.allow_data_loss);
+        assert_eq!(
+            unsafe_override.blocked_by,
+            vec!["remote:node-a".to_string()]
+        );
+        assert!(db.sync_pending_changes(0, 100).unwrap().is_empty());
+    }
+
+    #[test]
+    fn sync_sql_inspection_views_cover_retention_lag_and_doctor() {
+        let (_dir, db) = operational_doctor_fixture();
+
+        let retention = db.execute("SELECT * FROM sys_sync_retention").unwrap();
+        assert_eq!(
+            retention.columns(),
+            &[
+                "journal_records".to_string(),
+                "first_sequence".to_string(),
+                "last_sequence".to_string(),
+                "safe_prune_through".to_string(),
+                "prunable_records".to_string(),
+                "blocked_by_json".to_string(),
+                "journal_size_bytes".to_string(),
+            ]
+        );
+        assert_eq!(retention.rows().len(), 1);
+
+        let peer_lag = db.execute("SELECT * FROM sys_sync_peer_lag").unwrap();
+        assert_eq!(
+            peer_lag.columns(),
+            &[
+                "peer_name".to_string(),
+                "remote_replica_id".to_string(),
+                "in_watermark".to_string(),
+                "out_watermark".to_string(),
+                "local_high_watermark".to_string(),
+                "in_lag".to_string(),
+                "out_lag".to_string(),
+            ]
+        );
+        assert_eq!(peer_lag.rows().len(), 1);
+
+        let doctor = db.execute("SELECT * FROM sys_sync_doctor").unwrap();
+        assert_eq!(
+            doctor.columns(),
+            &[
+                "enabled".to_string(),
+                "replica_id".to_string(),
+                "highest_severity".to_string(),
+                "journal_records".to_string(),
+                "journal_size_bytes".to_string(),
+                "unresolved_conflicts".to_string(),
+                "guidance_json".to_string(),
+            ]
+        );
+        assert_eq!(doctor.rows().len(), 1);
     }
 
     #[test]

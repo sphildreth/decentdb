@@ -547,6 +547,12 @@ pub struct SyncPruneCommand {
     pub db: String,
     #[arg(long)]
     pub through: u64,
+    #[arg(long, default_value_t = false)]
+    pub dry_run: bool,
+    #[arg(long, default_value_t = false)]
+    pub allow_data_loss: bool,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+    pub format: OutputFormat,
 }
 
 #[derive(Clone, Debug, Parser)]
@@ -1298,13 +1304,13 @@ fn run_sync(command: SyncCommand) -> Result<()> {
         }
         SyncCommand::Doctor(cmd) => {
             let db = open_db(&cmd.db, false, 0, 0)?;
-            let report = db.sync_integrity_report()?;
+            let report = db.sync_operational_doctor_report()?;
             match cmd.format {
                 OutputFormat::Json => {
                     println!("{}", serde_json::to_string_pretty(&report)?);
                 }
                 OutputFormat::Table => {
-                    print_sync_integrity_report_table(&report);
+                    print_sync_operational_doctor_report_table(&report);
                 }
                 _ => {
                     return Err(anyhow!("sync doctor supports only json or table output"));
@@ -1424,8 +1430,18 @@ fn run_sync(command: SyncCommand) -> Result<()> {
         },
         SyncCommand::Prune(cmd) => {
             let db = open_db(&cmd.db, false, 0, 0)?;
-            let pruned = db.sync_prune_journal_through(cmd.through)?;
-            println!("pruned={pruned}");
+            let summary = db.sync_prune_journal(cmd.through, cmd.dry_run, cmd.allow_data_loss)?;
+            match cmd.format {
+                OutputFormat::Json => {
+                    println!("{}", serde_json::to_string_pretty(&summary)?);
+                }
+                OutputFormat::Table => {
+                    print_sync_prune_summary_table(&summary);
+                }
+                _ => {
+                    return Err(anyhow!("sync prune supports only json or table output"));
+                }
+            }
             Ok(())
         }
         SyncCommand::Peer(cmd) => match cmd {
@@ -2636,6 +2652,7 @@ fn sync_policy_from_cli(policy: SyncConflictPolicyCli) -> SyncConflictPolicy {
     }
 }
 
+#[allow(dead_code)]
 fn print_sync_integrity_report_table(report: &decentdb::SyncJournalIntegrityReport) {
     println!(
         "{}",
@@ -2698,6 +2715,177 @@ fn print_sync_integrity_report_table(report: &decentdb::SyncJournalIntegrityRepo
         "{}",
         render_rows(OutputFormat::Table, &columns, &rows, true)
     );
+}
+
+fn print_sync_operational_doctor_report_table(report: &decentdb::SyncOperationalDoctorReport) {
+    let rows = vec![
+        ("enabled".to_string(), report.status.enabled.to_string()),
+        (
+            "replica_id".to_string(),
+            report
+                .status
+                .replica_id
+                .as_deref()
+                .unwrap_or("-")
+                .to_string(),
+        ),
+        (
+            "next_sequence".to_string(),
+            report.status.next_sequence.to_string(),
+        ),
+        (
+            "status_journal_size_bytes".to_string(),
+            report.status.journal_size_bytes.to_string(),
+        ),
+        (
+            "integrity_records".to_string(),
+            report.integrity.total_records.to_string(),
+        ),
+        (
+            "integrity_first_sequence".to_string(),
+            report
+                .integrity
+                .first_sequence
+                .map_or_else(|| "-".to_string(), |value| value.to_string()),
+        ),
+        (
+            "integrity_last_sequence".to_string(),
+            report
+                .integrity
+                .last_sequence
+                .map_or_else(|| "-".to_string(), |value| value.to_string()),
+        ),
+        (
+            "integrity_highest_severity".to_string(),
+            report.integrity.highest_severity.to_string(),
+        ),
+        (
+            "retention_safe_prune_through".to_string(),
+            report
+                .retention
+                .safe_prune_through
+                .map_or_else(|| "-".to_string(), |value| value.to_string()),
+        ),
+        (
+            "retention_prunable_records".to_string(),
+            report.retention.prunable_records.to_string(),
+        ),
+        (
+            "retention_blocked_by_json".to_string(),
+            serde_json::to_string(&report.retention.blocked_by)
+                .unwrap_or_else(|_| "[]".to_string()),
+        ),
+        (
+            "unresolved_conflicts".to_string(),
+            report.unresolved_conflicts.to_string(),
+        ),
+        (
+            "recent_sessions".to_string(),
+            report.recent_sessions.len().to_string(),
+        ),
+        (
+            "highest_severity".to_string(),
+            report.highest_severity.to_string(),
+        ),
+    ];
+    println!("{}", render_key_value_rows(OutputFormat::Table, &rows));
+
+    if !report.issues.is_empty() {
+        let columns = [
+            "line".to_string(),
+            "sequence".to_string(),
+            "severity".to_string(),
+            "code".to_string(),
+            "message".to_string(),
+        ];
+        let rows = report
+            .issues
+            .iter()
+            .map(|issue| {
+                vec![
+                    issue.line_number.to_string(),
+                    issue
+                        .sequence
+                        .map_or_else(|| "-".to_string(), |value| value.to_string()),
+                    format!("{:?}", issue.severity),
+                    issue.code.clone(),
+                    issue.message.clone(),
+                ]
+            })
+            .collect::<Vec<_>>();
+        println!(
+            "{}",
+            render_rows(OutputFormat::Table, &columns, &rows, true)
+        );
+    }
+
+    if !report.peer_lag.is_empty() {
+        let columns = [
+            "peer_name".to_string(),
+            "remote_replica_id".to_string(),
+            "in_watermark".to_string(),
+            "out_watermark".to_string(),
+            "local_high_watermark".to_string(),
+            "in_lag".to_string(),
+            "out_lag".to_string(),
+        ];
+        let rows = report
+            .peer_lag
+            .iter()
+            .map(|lag| {
+                vec![
+                    lag.peer_name.clone(),
+                    lag.remote_replica_id.as_deref().unwrap_or("-").to_string(),
+                    lag.in_watermark
+                        .map_or_else(|| "-".to_string(), |value| value.to_string()),
+                    lag.out_watermark
+                        .map_or_else(|| "-".to_string(), |value| value.to_string()),
+                    lag.local_high_watermark
+                        .map_or_else(|| "-".to_string(), |value| value.to_string()),
+                    lag.in_lag
+                        .map_or_else(|| "-".to_string(), |value| value.to_string()),
+                    lag.out_lag
+                        .map_or_else(|| "-".to_string(), |value| value.to_string()),
+                ]
+            })
+            .collect::<Vec<_>>();
+        println!(
+            "{}",
+            render_rows(OutputFormat::Table, &columns, &rows, true)
+        );
+    }
+
+    if report.guidance.is_empty() {
+        println!("guidance: none");
+    } else {
+        for line in &report.guidance {
+            println!("guidance: {}", line);
+        }
+    }
+}
+
+fn print_sync_prune_summary_table(summary: &decentdb::SyncPruneSummary) {
+    let rows = vec![
+        (
+            "requested_through".to_string(),
+            summary.requested_through.to_string(),
+        ),
+        (
+            "effective_through".to_string(),
+            summary.effective_through.to_string(),
+        ),
+        ("pruned".to_string(), summary.pruned.to_string()),
+        ("dry_run".to_string(), summary.dry_run.to_string()),
+        (
+            "allow_data_loss".to_string(),
+            summary.allow_data_loss.to_string(),
+        ),
+        (
+            "blocked_by_json".to_string(),
+            serde_json::to_string(&summary.blocked_by).unwrap_or_else(|_| "[]".to_string()),
+        ),
+    ];
+    println!("{}", render_key_value_rows(OutputFormat::Table, &rows));
 }
 
 fn print_storage_info(format: OutputFormat, storage: &StorageInfo) {

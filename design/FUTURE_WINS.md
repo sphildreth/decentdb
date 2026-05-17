@@ -20,7 +20,7 @@ Future version values are planning buckets, not release commitments.
 
 | Priority | Future Version | Status | Feature | Current Source Of Truth | Why This Rank |
 |---:|---|---|---|---|---|
-| 1 | vNext | IN PROGRESS | Native local-first sync, changesets, CDC, and merge | [`WIN01_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md`](WIN01_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md), ADR 0147, ADR 0148, ADR 0149, ADR 0150 | Strongest identity-level differentiator and real application painkiller |
+| 1 | vNext | IN PROGRESS | Native local-first sync, changesets, CDC, and merge | [`WIN01_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md`](WIN01_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md), ADR 0147, ADR 0148, ADR 0149, ADR 0150, ADR 0151 | Strongest identity-level differentiator and real application painkiller |
 | 2 | vNext | BACKLOG | Branch, diff, restore, and time-travel workflows | Needs ADR/spec | Memorable workflow for agents, test environments, migration rehearsal, and support |
 | 3 | vNext | BACKLOG | Schema-first strongly typed SDK generation | [`WIN02_SCHEMA_FIRST_STRONGLY_TYPED_SDK_GENERATION_SPEC.md`](WIN02_SCHEMA_FIRST_STRONGLY_TYPED_SDK_GENERATION_SPEC.md), ADR 0116, ADR 0129 | Adoption accelerator across languages; DecentDB metadata foundation exists |
 | 4 | vNext+1 | BACKLOG | WASM and browser OPFS support | [`WIN03_WASM_SUPPORT_IMPLEMENTATION.md`](WIN03_WASM_SUPPORT_IMPLEMENTATION.md) | Essential enabler for browser local-first apps, but no longer unique by itself |
@@ -58,7 +58,7 @@ than future roadmap claims:
 - Cost-based optimizer and `ANALYZE`
 - In-memory VFS for testing
 - Bulk-load API foundation
-- Local sync Slices 1-4 complete: durable journal capture, batch-envelope export/import, conflict inspection, peer catalog, session tracking, scoped replication, HTTP client transport, dev sync server, `sync run`, retry handling, and session inspection
+- Local sync Slices 1-6 complete: durable journal capture, batch-envelope export/import, conflict inspection, peer catalog, session tracking, scoped replication, HTTP client transport, dev sync server, `sync run`, retry handling, session inspection, conflict workflows, retention hardening, and operational doctor/reporting
 - Same-process shared WAL visibility
 - Mature C ABI and multi-language binding surface
 - Doctor/advisor v1 CLI, JSON, Markdown, and safe `--fix` surface
@@ -89,7 +89,7 @@ The remaining roadmap should support one clear lane:
 
 **Status:** `TODO`  
 **Future Version:** vNext  
-**Source of truth:** [`WIN01_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md`](WIN01_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md), ADR 0147, ADR 0148, ADR 0149, ADR 0150
+**Source of truth:** [`WIN01_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md`](WIN01_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md), ADR 0147, ADR 0148, ADR 0149, ADR 0150, ADR 0151
 
 ### Why This Is First
 
@@ -103,7 +103,7 @@ semantics as an engine capability.
 
 ### Completed Foundation
 
-Slices 1-5 are complete:
+Slices 1-6 are complete:
 
 - replica identity
 - sync enablement metadata
@@ -126,21 +126,23 @@ Slices 1-5 are complete:
 - conflict policy configuration and deterministic v1 policy execution
 - manual conflict show, resolve, reopen, and all-conflict inspection workflows
 - structured conflict payload/resolution fields and compatible table upgrades
+- operational doctor reports with retention, peer lag, and guidance summaries
+- safe/default prune, dry-run, and explicit data-loss override flows
 
 ### Next Implementable Slice
 
-The remaining sync work now moves to Slice 6 doctor, retention, and operational hardening:
+The remaining sync work now moves to Slice 7 SDK polish:
 
-- sync doctor coverage beyond journal integrity
-- retention/pruning ergonomics and safety modes
-- backlog and watermark lag reporting
-- schema drift and compatibility warnings
+- flagship SDK API surface completion
+- convenience wrappers for peer/scope/session operations
+- typed result objects and error codes
+- end-to-end samples and integration polish
 
 ### Later Slices
 
 - manual exchange hardening beyond the Slice 3 transport foundation
-- retention ergonomics, crash-hardened prune rewrites, and deeper sync doctor checks
-- SDK polish, beginning with .NET
+- future retention ergonomics, crash-hardened prune rewrites, and deeper sync doctor checks
+- post-SDK-publish documentation and bindings follow-ons
 
 ### Guardrails
 

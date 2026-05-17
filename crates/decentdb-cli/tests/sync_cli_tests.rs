@@ -10,7 +10,7 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use decentdb::{Db, DbConfig};
+use decentdb::{Db, DbConfig, SyncImportSummary, SyncRunDirection, SyncRunSummary};
 
 fn temp_dir(prefix: &str) -> PathBuf {
     let id = SystemTime::now()
@@ -250,6 +250,56 @@ fn query_users(path: &Path) -> Vec<(i64, String)> {
         .collect()
 }
 
+fn setup_operational_sync_db(path: &Path) {
+    let db = Db::create(path, DbConfig::default()).expect("create db");
+    db.execute("CREATE TABLE users (id INT64 PRIMARY KEY, name TEXT)")
+        .expect("create table");
+    db.sync_init_replica("node-b").expect("init replica");
+    db.sync_add_peer("peer-a", "https://peer.example.com", None)
+        .expect("add peer");
+    db.execute("INSERT INTO users VALUES (10, 'dst10')")
+        .expect("insert local row");
+    db.execute("INSERT INTO users VALUES (11, 'dst11')")
+        .expect("insert local row");
+
+    let src_dir = temp_dir("decentdb-sync-cli-src");
+    let src_path = src_dir.join("src.ddb");
+    let src = Db::create(&src_path, DbConfig::default()).expect("create source db");
+    src.execute("CREATE TABLE users (id INT64 PRIMARY KEY, name TEXT)")
+        .expect("create source table");
+    src.sync_init_replica("node-a").expect("init source");
+    src.execute("INSERT INTO users VALUES (1, 'src1')")
+        .expect("insert source row");
+    src.execute("INSERT INTO users VALUES (2, 'src2')")
+        .expect("insert source row");
+
+    let batch = src.sync_export_batch(0, 100).expect("export batch");
+    db.sync_import_batch(&batch).expect("import batch");
+    db.sync_set_peer_out_watermark("peer-a", 10)
+        .expect("set outbound watermark");
+
+    let session_id = db
+        .sync_start_session("peer-a", SyncRunDirection::Pull, Some("node-a"))
+        .expect("start session");
+    let summary = SyncRunSummary {
+        peer_name: "peer-a".to_string(),
+        direction: SyncRunDirection::Pull,
+        remote_replica_id: Some("node-a".to_string()),
+        pushed: None,
+        pulled: Some(SyncImportSummary {
+            seen: 2,
+            applied: 2,
+            skipped: 0,
+            conflicted: 0,
+        }),
+        pushed_batch_id: None,
+        pulled_batch_id: Some(batch.batch_id.clone()),
+        retry_count: 0,
+    };
+    db.sync_finish_session_success(session_id, &summary)
+        .expect("finish session");
+}
+
 #[test]
 fn sync_peer_add_list_remove_supports_json_and_table_outputs() {
     let dir = temp_dir("decentdb-sync-peer-cli");
@@ -289,6 +339,79 @@ fn sync_peer_add_list_remove_supports_json_and_table_outputs() {
     let list_after = run(&["sync", "peer", "list", "--db", &db_str, "--format", "json"]);
     let parsed_after: serde_json::Value = serde_json::from_str(&list_after).expect("json");
     assert!(parsed_after.as_array().expect("array").is_empty());
+}
+
+#[test]
+fn sync_doctor_json_reports_operational_state_and_guidance() {
+    let dir = temp_dir("decentdb-sync-doctor-cli");
+    let db = dir.join("doctor.ddb");
+    setup_operational_sync_db(&db);
+
+    let db_str = db.display().to_string();
+    let json = run(&["sync", "doctor", "--db", &db_str, "--format", "json"]);
+    let parsed: serde_json::Value = serde_json::from_str(&json).expect("json");
+    assert!(parsed["status"]["enabled"].as_bool().unwrap());
+    assert_eq!(parsed["status"]["replica_id"], "node-b");
+    assert_eq!(parsed["integrity"]["total_records"], 2);
+    assert_eq!(parsed["retention"]["safe_prune_through"], 1);
+    assert_eq!(parsed["peer_lag"].as_array().unwrap().len(), 1);
+    assert_eq!(parsed["recent_sessions"].as_array().unwrap().len(), 1);
+    assert!(parsed["guidance"].as_array().unwrap().iter().any(|line| {
+        line.as_str()
+            .expect("guidance string")
+            .contains("safe prune is available")
+    }));
+
+    let table = run(&["sync", "doctor", "--db", &db_str, "--format", "table"]);
+    assert!(table.contains("integrity_records"));
+    assert!(table.contains("retention_safe_prune_through"));
+    assert!(table.contains("peer-a"));
+    assert!(table.contains("guidance:"));
+}
+
+#[test]
+fn sync_prune_supports_dry_run_json_and_allow_data_loss_table_outputs() {
+    let dir = temp_dir("decentdb-sync-prune-cli");
+    let db = dir.join("prune.ddb");
+    setup_operational_sync_db(&db);
+
+    let db_str = db.display().to_string();
+    let journal_path = db.with_extension("ddb.sync-journal");
+    let dry_run = run(&[
+        "sync",
+        "prune",
+        "--db",
+        &db_str,
+        "--through",
+        "1",
+        "--dry-run",
+        "--format",
+        "json",
+    ]);
+    let parsed: serde_json::Value = serde_json::from_str(&dry_run).expect("json");
+    assert_eq!(parsed["requested_through"], 1);
+    assert_eq!(parsed["effective_through"], 1);
+    assert_eq!(parsed["pruned"], 1);
+    assert!(parsed["dry_run"].as_bool().unwrap());
+    assert!(!parsed["allow_data_loss"].as_bool().unwrap());
+    assert_eq!(journal_line_count(&journal_path), 2);
+
+    let table = run(&[
+        "sync",
+        "prune",
+        "--db",
+        &db_str,
+        "--through",
+        "2",
+        "--allow-data-loss",
+        "--format",
+        "table",
+    ]);
+    assert!(table.contains("requested_through"));
+    assert!(table.contains("allow_data_loss"));
+    assert!(table.contains("blocked_by_json"));
+    assert!(table.contains("remote:node-a"));
+    assert_eq!(journal_line_count(&journal_path), 0);
 }
 
 #[test]

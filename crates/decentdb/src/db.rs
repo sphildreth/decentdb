@@ -44,9 +44,10 @@ use crate::storage::{self, DatabaseHeader, PagerHandle};
 use crate::sync::SyncContext;
 use crate::sync::{
     current_time_micros, validate_sync_scope_definition, SyncChangeBatch, SyncConflict,
-    SyncConflictPolicy, SyncConflictPolicyConfig, SyncImportSummary, SyncJournalIntegrityReport,
-    SyncJournalRecord, SyncOperation, SyncPeer, SyncPeerScopeBinding, SyncRunDirection,
-    SyncRunSummary, SyncScope, SyncSession, SyncStatus,
+    SyncConflictPolicy, SyncConflictPolicyConfig, SyncDoctorSeverity, SyncImportSummary,
+    SyncJournalIntegrityReport, SyncJournalIssue, SyncJournalRecord, SyncOperation,
+    SyncOperationalDoctorReport, SyncPeer, SyncPeerLag, SyncPeerScopeBinding, SyncPruneSummary,
+    SyncRetentionReport, SyncRunDirection, SyncRunSummary, SyncScope, SyncSession, SyncStatus,
 };
 use crate::vfs::faulty::{self, FailAction, Failpoint};
 use crate::vfs::{is_memory_path, write_all_at, FileKind, OpenMode, VfsHandle};
@@ -5502,6 +5503,222 @@ impl Db {
         )
     }
 
+    pub fn sync_peer_lag_report(&self) -> Result<Vec<SyncPeerLag>> {
+        self.ensure_sync_tables()?;
+        let local_high_watermark = self.sync_integrity_report()?.last_sequence;
+        let peers = self.sync_peers()?;
+        let sessions = self.sync_sessions()?;
+        let mut latest_successful_remote_replica_ids: HashMap<String, Option<String>> =
+            HashMap::new();
+        for session in sessions.iter().rev() {
+            if session.status == "success" {
+                latest_successful_remote_replica_ids
+                    .entry(session.peer_name.clone())
+                    .or_insert_with(|| session.remote_replica_id.clone());
+            }
+        }
+
+        peers
+            .into_iter()
+            .map(|peer| {
+                let remote_replica_id = latest_successful_remote_replica_ids
+                    .get(&peer.name)
+                    .cloned()
+                    .flatten();
+                let in_watermark = match remote_replica_id.as_deref() {
+                    Some(replica_id) => self.sync_peer_watermark(replica_id)?,
+                    None => None,
+                };
+                let out_watermark = self.sync_peer_out_watermark(&peer.name)?;
+                let in_lag = match (local_high_watermark, in_watermark) {
+                    (Some(local_high), Some(in_watermark)) if local_high >= in_watermark => {
+                        Some(local_high - in_watermark)
+                    }
+                    _ => None,
+                };
+                let out_lag = match (local_high_watermark, out_watermark) {
+                    (Some(local_high), Some(out_watermark)) if local_high >= out_watermark => {
+                        Some(local_high - out_watermark)
+                    }
+                    _ => None,
+                };
+                Ok(SyncPeerLag {
+                    peer_name: peer.name,
+                    remote_replica_id,
+                    in_watermark,
+                    out_watermark,
+                    local_high_watermark,
+                    in_lag,
+                    out_lag,
+                })
+            })
+            .collect()
+    }
+
+    pub fn sync_retention_report(&self) -> Result<SyncRetentionReport> {
+        let integrity = self.sync_integrity_report()?;
+        let peer_lag = self.sync_peer_lag_report()?;
+        let journal_size_bytes = self.sync_status()?.journal_size_bytes;
+        let mut watermark_entries = peer_lag
+            .iter()
+            .flat_map(|peer| {
+                let inbound = peer.remote_replica_id.as_ref().zip(peer.in_watermark).map(
+                    |(remote_replica_id, watermark)| {
+                        (format!("remote:{remote_replica_id}"), watermark)
+                    },
+                );
+                let outbound = peer
+                    .out_watermark
+                    .map(|watermark| (peer.peer_name.clone(), watermark));
+                inbound.into_iter().chain(outbound)
+            })
+            .collect::<Vec<_>>();
+        watermark_entries.extend(self.sync_peer_watermark_entries()?);
+        watermark_entries.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+        watermark_entries.dedup();
+        let lowest_watermark = watermark_entries
+            .iter()
+            .map(|(_, watermark)| *watermark)
+            .min();
+        let safe_prune_through = if integrity.total_records == 0 {
+            None
+        } else {
+            lowest_watermark.and_then(|watermark| watermark.checked_sub(1))
+        };
+        let blocked_by = if integrity.total_records == 0 {
+            Vec::new()
+        } else if let Some(lowest_watermark) = lowest_watermark {
+            if integrity
+                .last_sequence
+                .is_some_and(|local_high| lowest_watermark <= local_high)
+            {
+                watermark_entries
+                    .iter()
+                    .filter(|(_, watermark)| *watermark == lowest_watermark)
+                    .map(|(label, _)| label.clone())
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+        let prunable_records = match safe_prune_through {
+            Some(safe_through) => {
+                match crate::sync::read_journal_records(
+                    self.inner.sync_ctx.journal_path(),
+                    &self.inner.vfs,
+                    0,
+                    usize::MAX,
+                ) {
+                    Ok(records) => records
+                        .into_iter()
+                        .filter(|record| record.sequence <= safe_through)
+                        .count(),
+                    Err(_) => 0,
+                }
+            }
+            None => 0,
+        };
+
+        Ok(SyncRetentionReport {
+            journal_records: integrity.total_records,
+            first_sequence: integrity.first_sequence,
+            last_sequence: integrity.last_sequence,
+            safe_prune_through,
+            prunable_records,
+            blocked_by,
+            journal_size_bytes,
+        })
+    }
+
+    pub fn sync_operational_doctor_report(&self) -> Result<SyncOperationalDoctorReport> {
+        let status = self.sync_status()?;
+        let integrity = self.sync_integrity_report()?;
+        let retention = self.sync_retention_report()?;
+        let peer_lag = self.sync_peer_lag_report()?;
+        let unresolved_conflicts = self.sync_conflicts()?.len();
+        let mut recent_sessions = self.sync_sessions()?;
+        if recent_sessions.len() > 5 {
+            recent_sessions = recent_sessions.split_off(recent_sessions.len() - 5);
+        }
+        let mut issues = integrity.issues.clone();
+        let mut guidance = Vec::new();
+        let mut highest_severity = integrity.highest_severity;
+
+        if !status.enabled {
+            highest_severity = highest_severity.max(SyncDoctorSeverity::Warning);
+            guidance.push(
+                "sync is disabled; enable it before expecting journal growth or peer watermarks"
+                    .to_string(),
+            );
+        }
+
+        if unresolved_conflicts > 0 {
+            highest_severity = highest_severity.max(SyncDoctorSeverity::Warning);
+            let message = format!("{unresolved_conflicts} unresolved conflict(s) need attention");
+            issues.push(SyncJournalIssue {
+                line_number: 0,
+                sequence: None,
+                severity: SyncDoctorSeverity::Warning,
+                code: "unresolved_conflicts".to_string(),
+                message: message.clone(),
+            });
+            guidance.push(message);
+        }
+
+        if retention.journal_records > 0 && retention.safe_prune_through.is_none() {
+            highest_severity = highest_severity.max(SyncDoctorSeverity::Warning);
+            let message = if retention.blocked_by.is_empty() {
+                "safe prune is unavailable because no peer watermarks are known".to_string()
+            } else {
+                format!(
+                    "safe prune is blocked by {}",
+                    retention.blocked_by.join(", ")
+                )
+            };
+            issues.push(SyncJournalIssue {
+                line_number: 0,
+                sequence: None,
+                severity: SyncDoctorSeverity::Warning,
+                code: "retention_blocked".to_string(),
+                message: message.clone(),
+            });
+            guidance.push(message);
+        } else if let Some(safe_through) = retention.safe_prune_through {
+            guidance.push(format!(
+                "safe prune is available through sequence {safe_through}"
+            ));
+        }
+
+        if peer_lag.iter().any(|peer| {
+            peer.in_lag.is_some_and(|lag| lag > 0) || peer.out_lag.is_some_and(|lag| lag > 0)
+        }) {
+            highest_severity = highest_severity.max(SyncDoctorSeverity::Warning);
+            guidance.push("peer lag exists; inspect sys_sync_peer_lag before pruning".to_string());
+        }
+
+        if integrity.highest_severity == SyncDoctorSeverity::Error {
+            highest_severity = SyncDoctorSeverity::Error;
+        }
+
+        if issues.is_empty() {
+            guidance.push("journal integrity is clean".to_string());
+        }
+
+        Ok(SyncOperationalDoctorReport {
+            status,
+            integrity,
+            retention,
+            peer_lag,
+            unresolved_conflicts,
+            recent_sessions,
+            highest_severity,
+            issues,
+            guidance,
+        })
+    }
+
     pub fn sync_status(&self) -> Result<SyncStatus> {
         if self.inner.sync_ctx.is_enabled() {
             return Ok(SyncStatus {
@@ -6141,17 +6358,31 @@ impl Db {
     }
 
     pub fn sync_prune_journal_through(&self, sequence: u64) -> Result<usize> {
-        let peer_watermarks = self.sync_peer_watermarks()?;
-        if let Some(lowest_peer_watermark) = peer_watermarks
-            .iter()
-            .map(|(_, watermark)| *watermark)
-            .min()
-        {
-            if sequence >= lowest_peer_watermark {
-                return Err(DbError::sql(format!(
-                    "cannot prune through {sequence}; lowest peer watermark is {lowest_peer_watermark}"
-                )));
-            }
+        self.sync_prune_journal(sequence, false, false)
+            .map(|summary| summary.pruned)
+    }
+
+    pub fn sync_prune_journal(
+        &self,
+        through: u64,
+        dry_run: bool,
+        allow_data_loss: bool,
+    ) -> Result<SyncPruneSummary> {
+        let retention = self.sync_retention_report()?;
+        let requested_through = through;
+        if !allow_data_loss && through > retention.safe_prune_through.unwrap_or(0) {
+            let message = if let Some(lowest_watermark) =
+                retention.safe_prune_through.map(|value| value + 1)
+            {
+                format!(
+                    "cannot prune through {through}; lowest peer watermark is {lowest_watermark}"
+                )
+            } else if retention.blocked_by.is_empty() {
+                format!("cannot prune through {through}; no peer watermarks are known")
+            } else {
+                format!("cannot prune through {through}; lowest peer watermark is 0")
+            };
+            return Err(DbError::sql(message));
         }
 
         let records = crate::sync::read_journal_records(
@@ -6161,17 +6392,36 @@ impl Db {
             usize::MAX,
         )?;
         if records.is_empty() {
-            return Ok(0);
+            return Ok(SyncPruneSummary {
+                requested_through,
+                effective_through: 0,
+                pruned: 0,
+                dry_run,
+                allow_data_loss,
+                blocked_by: retention.blocked_by,
+            });
         }
 
-        let total = records.len();
+        let effective_through = records
+            .last()
+            .map(|record| record.sequence.min(through))
+            .unwrap_or(0);
+        let total_records = records.len();
         let retained = records
             .into_iter()
-            .filter(|record| record.sequence > sequence)
+            .filter(|record| record.sequence > through)
             .collect::<Vec<_>>();
-        let pruned = total.saturating_sub(retained.len());
-        if pruned == 0 {
-            return Ok(0);
+        let pruned = total_records.saturating_sub(retained.len());
+
+        if dry_run || pruned == 0 {
+            return Ok(SyncPruneSummary {
+                requested_through,
+                effective_through,
+                pruned,
+                dry_run,
+                allow_data_loss,
+                blocked_by: retention.blocked_by,
+            });
         }
 
         let mut buffer = Vec::new();
@@ -6205,7 +6455,14 @@ impl Db {
                 .set_journal_write_offset(buffer.len() as u64)?;
         }
 
-        Ok(pruned)
+        Ok(SyncPruneSummary {
+            requested_through,
+            effective_through,
+            pruned,
+            dry_run,
+            allow_data_loss,
+            blocked_by: retention.blocked_by,
+        })
     }
 
     pub fn sync_set_enabled(&self, enabled: bool) -> Result<()> {
@@ -6309,7 +6566,7 @@ impl Db {
         }
     }
 
-    fn sync_peer_watermarks(&self) -> Result<Vec<(String, u64)>> {
+    fn sync_peer_watermark_entries(&self) -> Result<Vec<(String, u64)>> {
         self.sync_metadata_entries()?
             .into_iter()
             .filter_map(|(key, value)| {
@@ -6323,7 +6580,7 @@ impl Db {
                         replica_id, error
                     ))
                 })?;
-                Ok((replica_id, watermark))
+                Ok((format!("remote:{replica_id}"), watermark))
             })
             .collect()
     }
@@ -7159,6 +7416,9 @@ impl Db {
                 self.sync_journal_query_result(since_sequence).map(Some)
             }
             SyncInspectionQuery::Peers => self.sync_peers_query_result().map(Some),
+            SyncInspectionQuery::Retention => self.sync_retention_query_result().map(Some),
+            SyncInspectionQuery::PeerLag => self.sync_peer_lag_query_result().map(Some),
+            SyncInspectionQuery::Doctor => self.sync_doctor_query_result().map(Some),
             SyncInspectionQuery::Scopes => self.sync_scopes_query_result().map(Some),
             SyncInspectionQuery::ScopeTables => self.sync_scope_tables_query_result().map(Some),
             SyncInspectionQuery::PeerScopes => self.sync_peer_scopes_query_result().map(Some),
@@ -7249,6 +7509,125 @@ impl Db {
                 "updated_at_micros".to_string(),
             ],
             rows,
+        ))
+    }
+
+    fn sync_retention_query_result(&self) -> Result<QueryResult> {
+        let retention = self.sync_retention_report()?;
+        let first_sequence = match retention.first_sequence {
+            Some(value) => sync_u64_to_i64(value, "first_sequence")?,
+            None => Value::Null,
+        };
+        let last_sequence = match retention.last_sequence {
+            Some(value) => sync_u64_to_i64(value, "last_sequence")?,
+            None => Value::Null,
+        };
+        let safe_prune_through = match retention.safe_prune_through {
+            Some(value) => sync_u64_to_i64(value, "safe_prune_through")?,
+            None => Value::Null,
+        };
+
+        Ok(QueryResult::with_rows(
+            vec![
+                "journal_records".to_string(),
+                "first_sequence".to_string(),
+                "last_sequence".to_string(),
+                "safe_prune_through".to_string(),
+                "prunable_records".to_string(),
+                "blocked_by_json".to_string(),
+                "journal_size_bytes".to_string(),
+            ],
+            vec![QueryRow::new(vec![
+                sync_u64_to_i64(retention.journal_records as u64, "journal_records")?,
+                first_sequence,
+                last_sequence,
+                safe_prune_through,
+                sync_u64_to_i64(retention.prunable_records as u64, "prunable_records")?,
+                Value::Text(
+                    serde_json::to_string(&retention.blocked_by).map_err(|error| {
+                        DbError::internal(format!(
+                            "failed to encode sync retention blocked_by: {error}"
+                        ))
+                    })?,
+                ),
+                sync_u64_to_i64(retention.journal_size_bytes, "journal_size_bytes")?,
+            ])],
+        ))
+    }
+
+    fn sync_peer_lag_query_result(&self) -> Result<QueryResult> {
+        let peer_lag = self.sync_peer_lag_report()?;
+        let rows = peer_lag
+            .into_iter()
+            .map(|lag| {
+                let in_watermark = match lag.in_watermark {
+                    Some(value) => sync_u64_to_i64(value, "in_watermark")?,
+                    None => Value::Null,
+                };
+                let out_watermark = match lag.out_watermark {
+                    Some(value) => sync_u64_to_i64(value, "out_watermark")?,
+                    None => Value::Null,
+                };
+                let local_high_watermark = match lag.local_high_watermark {
+                    Some(value) => sync_u64_to_i64(value, "local_high_watermark")?,
+                    None => Value::Null,
+                };
+                let in_lag = match lag.in_lag {
+                    Some(value) => sync_u64_to_i64(value, "in_lag")?,
+                    None => Value::Null,
+                };
+                let out_lag = match lag.out_lag {
+                    Some(value) => sync_u64_to_i64(value, "out_lag")?,
+                    None => Value::Null,
+                };
+                Ok(QueryRow::new(vec![
+                    Value::Text(lag.peer_name),
+                    lag.remote_replica_id.map_or(Value::Null, Value::Text),
+                    in_watermark,
+                    out_watermark,
+                    local_high_watermark,
+                    in_lag,
+                    out_lag,
+                ]))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(QueryResult::with_rows(
+            vec![
+                "peer_name".to_string(),
+                "remote_replica_id".to_string(),
+                "in_watermark".to_string(),
+                "out_watermark".to_string(),
+                "local_high_watermark".to_string(),
+                "in_lag".to_string(),
+                "out_lag".to_string(),
+            ],
+            rows,
+        ))
+    }
+
+    fn sync_doctor_query_result(&self) -> Result<QueryResult> {
+        let report = self.sync_operational_doctor_report()?;
+        Ok(QueryResult::with_rows(
+            vec![
+                "enabled".to_string(),
+                "replica_id".to_string(),
+                "highest_severity".to_string(),
+                "journal_records".to_string(),
+                "journal_size_bytes".to_string(),
+                "unresolved_conflicts".to_string(),
+                "guidance_json".to_string(),
+            ],
+            vec![QueryRow::new(vec![
+                Value::Bool(report.status.enabled),
+                report.status.replica_id.map_or(Value::Null, Value::Text),
+                Value::Text(report.highest_severity.to_string()),
+                sync_u64_to_i64(report.integrity.total_records as u64, "journal_records")?,
+                sync_u64_to_i64(report.retention.journal_size_bytes, "journal_size_bytes")?,
+                sync_u64_to_i64(report.unresolved_conflicts as u64, "unresolved_conflicts")?,
+                Value::Text(serde_json::to_string(&report.guidance).map_err(|error| {
+                    DbError::internal(format!("failed to encode sync doctor guidance: {error}"))
+                })?),
+            ])],
         ))
     }
 
@@ -7529,6 +7908,9 @@ enum SyncInspectionQuery {
     Status,
     Journal { since_sequence: u64 },
     Peers,
+    Retention,
+    PeerLag,
+    Doctor,
     Scopes,
     ScopeTables,
     PeerScopes,
@@ -7551,6 +7933,11 @@ impl SyncInspectionQuery {
             "select * from sys_sync_peers" => Some(Self::Peers),
             "select * from sys_sync_peers order by name" => Some(Self::Peers),
             "select * from sys_sync_peers order by name asc" => Some(Self::Peers),
+            "select * from sys_sync_retention" => Some(Self::Retention),
+            "select * from sys_sync_peer_lag" => Some(Self::PeerLag),
+            "select * from sys_sync_peer_lag order by peer_name" => Some(Self::PeerLag),
+            "select * from sys_sync_peer_lag order by peer_name asc" => Some(Self::PeerLag),
+            "select * from sys_sync_doctor" => Some(Self::Doctor),
             "select * from sys_sync_scopes" => Some(Self::Scopes),
             "select * from sys_sync_scopes order by name" => Some(Self::Scopes),
             "select * from sys_sync_scopes order by name asc" => Some(Self::Scopes),
