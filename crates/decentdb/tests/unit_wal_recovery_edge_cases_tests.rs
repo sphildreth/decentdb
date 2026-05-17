@@ -142,57 +142,11 @@ fn uncommitted_wal_frames_are_not_visible_after_reopen() {
     cleanup(&path);
 }
 
-/// Hypothesis: truncating the WAL to 0 bytes causes a corruption error on open.
+/// Design choice (`wal/recovery.rs:38-40`): a zero-byte WAL file is a
+/// valid initialization state. The engine writes a fresh 32-byte
+/// header and opens successfully — this is not corruption.
 ///
-/// Classification: **Test assumption likely wrong.**
-///
-/// The recovery code (`wal/recovery.rs`, `initialize_or_recover`) explicitly
-/// treats a zero-byte WAL file as a valid "empty" state: it writes a fresh
-/// 32-byte header and returns an empty index.  A missing or zero-length WAL
-/// simply means "no unplayed frames" — the database falls back to whatever
-/// state the DB file contains.  This is intentional design (consistent with
-/// SQLite WAL mode and crash-safe semantics).
-///
-/// Only `0 < size < 32` triggers the corruption path.  Size == 0 is a clean
-/// initialization signal, not an error.
-///
-/// Recommendation: keep this test as a specification of the _current_
-/// behaviour so future refactors cannot accidentally regress it.
-#[test]
-#[ignore = "Design choice: zero-byte WAL is valid initialization state, not corruption (see recovery.rs line 17-21)"]
-fn truncated_wal_to_zero_bytes_is_corruption() {
-    let path = unique_db_path("wal-truncated");
-    {
-        let db = Db::create(&path, DbConfig::default()).unwrap();
-        exec(&db, "CREATE TABLE t(id INT64)");
-        exec(&db, "INSERT INTO t VALUES (1)");
-        db.begin_transaction().unwrap();
-        drop(db);
-    }
-
-    // Truncate the WAL to 0 bytes (below the 32-byte minimum header size).
-    let wal = wal_path(&path);
-    fs::OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .open(&wal)
-        .unwrap();
-
-    let result = Db::open(&path, DbConfig::default());
-    assert!(
-        result.is_err(),
-        "opening a db with a zero-byte WAL should fail"
-    );
-    match result.unwrap_err() {
-        DbError::Corruption { .. } => {}
-        other => panic!("expected Corruption error, got {other:?}"),
-    }
-    cleanup(&path);
-}
-
-/// Zero-byte WAL is treated as a clean initialization state — the engine
-/// writes a fresh 32-byte header and opens successfully.  This documents the
-/// designed behaviour for future regression protection.
+/// This test validates the intended behaviour for regression protection.
 #[test]
 fn zero_byte_wal_is_reinitialized_and_db_opens_successfully() {
     let path = unique_db_path("wal-zero-reinit");
@@ -462,4 +416,114 @@ fn page_size_is_preserved_through_wal_recovery() {
         drop(db);
         cleanup(&path);
     }
+}
+
+// ── Expanded crash-recovery scenarios ───────────────────────────────────
+
+/// After committing multiple pages and running a checkpoint, the data
+/// survives a simulated crash (drop + reopen) intact.
+#[test]
+fn crash_after_checkpoint_recovers_committed_data() {
+    let path = unique_db_path("crash-after-ckpt");
+    {
+        let db = Db::create(&path, DbConfig::default()).unwrap();
+        exec(&db, "CREATE TABLE t(id INT64, val TEXT)");
+        exec(&db, "INSERT INTO t VALUES (1, 'alpha')");
+        exec(&db, "INSERT INTO t VALUES (2, 'beta')");
+        exec(&db, "INSERT INTO t VALUES (3, 'gamma')");
+        db.checkpoint_wal().unwrap();
+    }
+
+    let db = Db::open(&path, DbConfig::default()).unwrap();
+    let r = db.execute("SELECT id, val FROM t ORDER BY id").unwrap();
+    let rows = r.rows();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].values()[0], Value::Int64(1));
+    assert_eq!(rows[1].values()[1], Value::Text("beta".into()));
+    assert_eq!(rows[2].values()[0], Value::Int64(3));
+    drop(db);
+    cleanup(&path);
+}
+
+/// Uncommitted writes inside a transaction that is dropped without
+/// commit or rollback are discarded on reopen.
+#[test]
+fn crash_with_uncommitted_transaction_discards_data() {
+    let path = unique_db_path("crash-uncommitted");
+    {
+        let db = Db::create(&path, DbConfig::default()).unwrap();
+        exec(&db, "CREATE TABLE t(id INT64)");
+        exec(&db, "INSERT INTO t VALUES (1)");
+        db.begin_transaction().unwrap();
+        exec(&db, "INSERT INTO t VALUES (2)");
+    }
+
+    let db = Db::open(&path, DbConfig::default()).unwrap();
+    let r = db.execute("SELECT COUNT(*) FROM t").unwrap();
+    assert_eq!(r.rows()[0].values()[0], Value::Int64(1));
+    drop(db);
+    cleanup(&path);
+}
+
+/// WAL growth and truncation cycle: many commits followed by checkpoint
+/// truncates the WAL, and subsequent commits survive reopen.
+#[test]
+fn wal_growth_and_truncation_cycle_preserves_data() {
+    let path = unique_db_path("wal-cycle");
+    {
+        let db = Db::create(&path, DbConfig::default()).unwrap();
+        exec(&db, "CREATE TABLE t(id INT64)");
+        for i in 1..=100 {
+            exec(&db, &format!("INSERT INTO t VALUES ({i})"));
+        }
+        let wal_size_before = fs::metadata(wal_path(&path)).unwrap().len();
+        assert!(wal_size_before > 32, "WAL should have grown beyond header");
+
+        db.checkpoint_wal().unwrap();
+
+        let wal_size_after = fs::metadata(wal_path(&path)).unwrap().len();
+        assert_eq!(
+            wal_size_after, 32,
+            "WAL should be header-only after checkpoint"
+        );
+
+        for i in 101..=110 {
+            exec(&db, &format!("INSERT INTO t VALUES ({i})"));
+        }
+    }
+
+    let db = Db::open(&path, DbConfig::default()).unwrap();
+    let r = db.execute("SELECT COUNT(*) FROM t").unwrap();
+    assert_eq!(r.rows()[0].values()[0], Value::Int64(110));
+    drop(db);
+    cleanup(&path);
+}
+
+/// Within a transaction, all previously-committed data plus new writes
+/// within the transaction are visible. After ROLLBACK the transaction
+/// state is discarded and data survives reopen.
+#[test]
+fn snapshot_isolation_through_sql_transaction() {
+    let path = unique_db_path("snapshot-iso");
+    {
+        let db = Db::create(&path, DbConfig::default()).unwrap();
+        exec(&db, "CREATE TABLE t(id INT64)");
+        exec(&db, "INSERT INTO t VALUES (1)");
+        exec(&db, "INSERT INTO t VALUES (2)");
+
+        exec(&db, "BEGIN");
+        let r = db.execute("SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(r.rows()[0].values()[0], Value::Int64(2));
+
+        exec(&db, "INSERT INTO t VALUES (3)");
+        let r = db.execute("SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(r.rows()[0].values()[0], Value::Int64(3));
+        exec(&db, "ROLLBACK");
+    }
+
+    let db = Db::open(&path, DbConfig::default()).unwrap();
+    let r = db.execute("SELECT COUNT(*) FROM t").unwrap();
+    assert_eq!(r.rows()[0].values()[0], Value::Int64(2));
+    drop(db);
+    cleanup(&path);
 }

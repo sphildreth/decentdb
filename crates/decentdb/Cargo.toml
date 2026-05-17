@@ -53,3 +53,8 @@ required-features = ["bench-internals"]
 name = "micro_hot_paths_callgrind"
 harness = false
 required-features = ["bench-internals"]
+
+[[bin]]
+name = "wal_fuzz"
+test = false
+bench = false

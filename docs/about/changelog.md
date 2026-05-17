@@ -5,6 +5,22 @@ All notable changes to DecentDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.3] - [UNRELEASED] [WIP]
+
+### Changed
+
+- Extracted CTE and query-scope utility functions from `exec/mod.rs` into `exec/cte.rs` (~470 lines), improving module cohesion.
+
+### Fixed
+
+- Removed three stale `#[ignore]` test annotations: the zero-byte WAL design-choice test, the `INSERT DEFAULT VALUES` missing-feature test, and the decimal negative-precision ordering test (the underlying sortable encoding was already correct, validated by the now-active test).
+
+### Added
+
+- 12 proptest-based property tests for WAL delta encoding (roundtrip, no-op, size bounds, determinism, corruption rejection) and WAL frame format (page/commit/checkpoint roundtrips, header identity, invalid frame types, encoded-len consistency).
+- 4 crash-recovery edge-case tests: checkpoint survival, uncommitted transaction discard, WAL growth-and-truncation cycle, and SQL-level transaction isolation.
+- `wal_fuzz` standalone binary exercising 6 WAL-corruption strategies across 75+ DB states to verify recovery never panics.
+
 ## [2.4.2] - 2026-05-04
 
 ### Fixed

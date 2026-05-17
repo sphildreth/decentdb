@@ -4,7 +4,11 @@ pub(crate) mod async_commit;
 pub(crate) mod background;
 pub(crate) mod checkpoint;
 pub(crate) mod delta;
+#[cfg(test)]
+mod delta_tests;
 pub(crate) mod format;
+#[cfg(test)]
+mod format_tests;
 pub(crate) mod index;
 pub(crate) mod index_sidecar;
 pub(crate) mod platform;

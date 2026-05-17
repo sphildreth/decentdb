@@ -978,8 +978,7 @@ fn run_single(benchmarker: &mut dyn DatabaseBenchmarker) -> EngineMetrics {
     metrics.concurrent_read_p95_ms = compute_p95_ms(&mut concurrent_latencies);
     println!(
         "  -> Concurrent read p95 ({} threads): {:.6} ms",
-        metrics.concurrent_read_threads,
-        metrics.concurrent_read_p95_ms
+        metrics.concurrent_read_threads, metrics.concurrent_read_p95_ms
     );
 
     // 9. Teardown & Size
@@ -1016,22 +1015,24 @@ fn run_engine(benchmarker: &mut dyn DatabaseBenchmarker) -> EngineMetrics {
         concurrent_p95_samples.push(single.concurrent_read_p95_ms);
     }
 
-    let mut aggregated = EngineMetrics::default();
-    aggregated.read_p95_ms = mean_f64(&read_p95_samples);
-    aggregated.read_p95_stddev_ms = stddev_f64(&read_p95_samples);
-    aggregated.join_p95_ms = mean_f64(&join_p95_samples);
-    aggregated.join_p95_stddev_ms = stddev_f64(&join_p95_samples);
-    aggregated.commit_p95_ms = mean_f64(&commit_p95_samples);
-    aggregated.commit_p95_stddev_ms = stddev_f64(&commit_p95_samples);
-    aggregated.insert_rows_per_sec = mean_f64(&insert_rps_samples);
-    aggregated.insert_rps_stddev = stddev_f64(&insert_rps_samples);
-    aggregated.range_scan_p95_ms = mean_f64(&range_p95_samples);
-    aggregated.range_scan_p95_stddev_ms = stddev_f64(&range_p95_samples);
-    aggregated.aggregate_p95_ms = mean_f64(&agg_p95_samples);
-    aggregated.aggregate_p95_stddev_ms = stddev_f64(&agg_p95_samples);
-    aggregated.concurrent_read_p95_ms = mean_f64(&concurrent_p95_samples);
-    aggregated.concurrent_read_p95_stddev_ms = stddev_f64(&concurrent_p95_samples);
-    aggregated.concurrent_read_threads = CONCURRENT_READ_THREADS;
+    let aggregated = EngineMetrics {
+        read_p95_ms: mean_f64(&read_p95_samples),
+        read_p95_stddev_ms: stddev_f64(&read_p95_samples),
+        join_p95_ms: mean_f64(&join_p95_samples),
+        join_p95_stddev_ms: stddev_f64(&join_p95_samples),
+        commit_p95_ms: mean_f64(&commit_p95_samples),
+        commit_p95_stddev_ms: stddev_f64(&commit_p95_samples),
+        insert_rows_per_sec: mean_f64(&insert_rps_samples),
+        insert_rps_stddev: stddev_f64(&insert_rps_samples),
+        range_scan_p95_ms: mean_f64(&range_p95_samples),
+        range_scan_p95_stddev_ms: stddev_f64(&range_p95_samples),
+        aggregate_p95_ms: mean_f64(&agg_p95_samples),
+        aggregate_p95_stddev_ms: stddev_f64(&agg_p95_samples),
+        concurrent_read_p95_ms: mean_f64(&concurrent_p95_samples),
+        concurrent_read_p95_stddev_ms: stddev_f64(&concurrent_p95_samples),
+        concurrent_read_threads: CONCURRENT_READ_THREADS,
+        ..Default::default()
+    };
 
     // Use the last run's DB size (all runs are on fresh temp dirs)
     println!("\n  === {} aggregated results ===", benchmarker.name());
@@ -1070,7 +1071,10 @@ fn run_engine(benchmarker: &mut dyn DatabaseBenchmarker) -> EngineMetrics {
 }
 
 fn main() {
-    println!("Starting Embedded DB Benchmarks ({} runs per engine)", BENCH_RUNS);
+    println!(
+        "Starting Embedded DB Benchmarks ({} runs per engine)",
+        BENCH_RUNS
+    );
 
     let storage_root = benchmark_storage_root();
     let mut summary = BenchSummary {
@@ -1175,10 +1179,9 @@ fn main() {
         "latency_report_unit".to_string(),
         "milliseconds".to_string(),
     );
-    summary.metadata.insert(
-        "statistical_runs".to_string(),
-        BENCH_RUNS.to_string(),
-    );
+    summary
+        .metadata
+        .insert("statistical_runs".to_string(), BENCH_RUNS.to_string());
     summary.metadata.insert(
         "join_dataset_rows".to_string(),
         JOIN_DATASET_COUNT.to_string(),
@@ -1191,11 +1194,13 @@ fn main() {
     );
     summary.metadata.insert(
         "hardware_class_note".to_string(),
-        "server_cloud_cpu; results may not generalize to embedded targets such as raspberry pi".to_string(),
+        "server_cloud_cpu; results may not generalize to embedded targets such as raspberry pi"
+            .to_string(),
     );
     summary.metadata.insert(
         "wal_autocheckpoint_note".to_string(),
-        "sqlite wal_autocheckpoint=0 is a benchmark-specific tuning; production defaults differ".to_string(),
+        "sqlite wal_autocheckpoint=0 is a benchmark-specific tuning; production defaults differ"
+            .to_string(),
     );
     summary.metadata.insert(
         "duckdb_threads_note".to_string(),
@@ -1203,7 +1208,8 @@ fn main() {
     );
     summary.metadata.insert(
         "decentdb_clone_overhead_note".to_string(),
-        "removed string.clone() on every read in this revision to eliminate heap-allocator skew".to_string(),
+        "removed string.clone() on every read in this revision to eliminate heap-allocator skew"
+            .to_string(),
     );
 
     // SQLite

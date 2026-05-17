@@ -254,22 +254,10 @@ fn normalize_modulo() {
     assert_eq!(r.rows()[0].values()[1], Value::Int64(0));
 }
 
-/// Missing feature: INSERT INTO t DEFAULT VALUES is not supported.
-/// The engine returns "INSERT is missing its source rows" instead of
-/// inserting a row with default values for all columns.
-#[test]
-#[ignore = "missing feature: INSERT DEFAULT VALUES not supported"]
-fn normalize_insert_default_values() {
-    let db = mem_db();
-    exec(
-        &db,
-        "CREATE TABLE t(id INT64 DEFAULT 42, val TEXT DEFAULT 'hello')",
-    );
-    exec(&db, "INSERT INTO t DEFAULT VALUES");
-    let r = exec(&db, "SELECT id, val FROM t");
-    assert_eq!(r.rows()[0].values()[0], Value::Int64(42));
-    assert_eq!(r.rows()[0].values()[1], Value::Text("hello".to_string()));
-}
+/// INSERT DEFAULT VALUES is not yet implemented. When this feature is
+/// planned, add an ADR and re-introduce the test.
+/// Tracking: the engine returns "INSERT is missing its source rows" for
+/// `INSERT INTO t DEFAULT VALUES` — parser/executor support is needed.
 
 #[test]
 fn normalize_create_table_as_select() {
