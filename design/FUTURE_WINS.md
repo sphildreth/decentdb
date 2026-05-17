@@ -58,7 +58,7 @@ than future roadmap claims:
 - Cost-based optimizer and `ANALYZE`
 - In-memory VFS for testing
 - Bulk-load API foundation
-- Local sync Slice 1/2 foundation: replica metadata, durable sidecar journal, integrity checks, pending-change enumeration, manual export/import, and sync CLI
+- Local sync Slice 1 complete plus Slice 2 foundation: replica metadata, durable sidecar journal, SQL/CLI inspection, integrity checks, pending-change enumeration, manual export/import, and sync CLI
 - Same-process shared WAL visibility
 - Mature C ABI and multi-language binding surface
 - Doctor/advisor v1 CLI, JSON, Markdown, and safe `--fix` surface
@@ -103,7 +103,7 @@ semantics as an engine capability.
 
 ### Completed Foundation
 
-The Slice 1 functional foundation and the first Slice 2 foundations are implemented:
+Slice 1 is complete and the first Slice 2 foundations are implemented:
 
 - replica identity
 - sync enablement metadata
@@ -111,31 +111,30 @@ The Slice 1 functional foundation and the first Slice 2 foundations are implemen
 - transaction sequence numbers
 - tombstones for deletes
 - pending-change enumeration
+- SQL inspection views
 - sync journal integrity checks
+- restart/replay and sync journal fault-injection tests
 - manual JSONL export/import
 - idempotent remote sequence tracking
 - machine-readable sync CLI status and pending output
-
-Remaining Slice 1 validation work: crash/restart and fault-injection tests for
-journal durability.
 
 ### Next Implementable Slice
 
 The next work should build on the durable local foundation rather than jumping
 straight to full networking:
 
-- crash/restart tests
 - conflict recording and inspection for manual import
+- import/apply crash-safety tests
 - retention and compaction policy for the sync journal
 - protocol envelope/version negotiation for exchange files
 
 ### Later Slices
 
-- manual export/import sync
+- manual exchange hardening beyond the Slice 2 JSONL foundation
 - HTTP transport and peer management
 - scoped sync and row filters
 - conflict inspection and resolution
-- sync doctor and retention management
+- retention management and deeper sync doctor checks
 - SDK polish, beginning with .NET
 
 ### Guardrails

@@ -1290,6 +1290,10 @@ impl Db {
                 results.push(result);
                 continue;
             }
+            if let Some(result) = self.try_execute_sync_inspection_query(trimmed, params)? {
+                results.push(result);
+                continue;
+            }
 
             let statement = self.parsed_statement(trimmed)?;
             let result = if statement_is_read_only(&statement) {
@@ -5558,6 +5562,84 @@ impl Db {
         Ok(stored_next_sequence.max(journal_next_sequence))
     }
 
+    fn try_execute_sync_inspection_query(
+        &self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Option<QueryResult>> {
+        let normalized = normalize_sync_inspection_sql(sql);
+        let Some(query) = SyncInspectionQuery::parse(&normalized) else {
+            return Ok(None);
+        };
+        if !params.is_empty() {
+            return Err(DbError::sql(
+                "sync inspection system views do not accept parameters",
+            ));
+        }
+        match query {
+            SyncInspectionQuery::Status => self.sync_status_query_result().map(Some),
+            SyncInspectionQuery::Journal { since_sequence } => {
+                self.sync_journal_query_result(since_sequence).map(Some)
+            }
+        }
+    }
+
+    fn sync_status_query_result(&self) -> Result<QueryResult> {
+        let status = self.sync_status()?;
+        Ok(QueryResult::with_rows(
+            vec![
+                "enabled".to_string(),
+                "replica_id".to_string(),
+                "next_sequence".to_string(),
+                "journal_path".to_string(),
+                "journal_size_bytes".to_string(),
+            ],
+            vec![QueryRow::new(vec![
+                Value::Bool(status.enabled),
+                status.replica_id.map_or(Value::Null, Value::Text),
+                sync_u64_to_i64(status.next_sequence, "next_sequence")?,
+                status.journal_path.map_or(Value::Null, Value::Text),
+                sync_u64_to_i64(status.journal_size_bytes, "journal_size_bytes")?,
+            ])],
+        ))
+    }
+
+    fn sync_journal_query_result(&self, since_sequence: u64) -> Result<QueryResult> {
+        let records = self.sync_pending_changes(since_sequence, usize::MAX)?;
+        let rows = records
+            .into_iter()
+            .map(|record| {
+                Ok(QueryRow::new(vec![
+                    sync_u64_to_i64(record.sequence, "sequence")?,
+                    Value::Text(record.replica_id),
+                    sync_u64_to_i64(record.transaction_lsn, "transaction_lsn")?,
+                    Value::Text(record.table),
+                    Value::Text(record.operation),
+                    Value::Text(record.primary_key.to_string()),
+                    record
+                        .after
+                        .map_or(Value::Null, |value| Value::Text(value.to_string())),
+                    Value::Int64(i64::from(record.schema_cookie)),
+                    Value::Int64(record.committed_at_micros),
+                ]))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(QueryResult::with_rows(
+            vec![
+                "sequence".to_string(),
+                "replica_id".to_string(),
+                "transaction_lsn".to_string(),
+                "table_name".to_string(),
+                "operation".to_string(),
+                "primary_key_json".to_string(),
+                "after_json".to_string(),
+                "schema_cookie".to_string(),
+                "committed_at_micros".to_string(),
+            ],
+            rows,
+        ))
+    }
+
     pub(crate) fn sync_post_commit(
         &self,
         runtime: &mut EngineRuntime,
@@ -5629,6 +5711,50 @@ fn sync_read_metadata_from_runtime(runtime: &EngineRuntime, key: &str) -> Result
         }
     }
     Ok(None)
+}
+
+enum SyncInspectionQuery {
+    Status,
+    Journal { since_sequence: u64 },
+}
+
+impl SyncInspectionQuery {
+    fn parse(normalized: &str) -> Option<Self> {
+        match normalized {
+            "select * from sys_sync_status" => Some(Self::Status),
+            "select * from sys_sync_journal" => Some(Self::Journal { since_sequence: 0 }),
+            "select * from sys_sync_journal order by sequence" => {
+                Some(Self::Journal { since_sequence: 0 })
+            }
+            "select * from sys_sync_journal order by sequence asc" => {
+                Some(Self::Journal { since_sequence: 0 })
+            }
+            _ => parse_sync_journal_where_sequence(normalized)
+                .map(|since_sequence| Self::Journal { since_sequence }),
+        }
+    }
+}
+
+fn normalize_sync_inspection_sql(sql: &str) -> String {
+    sql.trim()
+        .trim_end_matches(';')
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+fn parse_sync_journal_where_sequence(normalized: &str) -> Option<u64> {
+    let rest = normalized.strip_prefix("select * from sys_sync_journal where sequence > ")?;
+    let rest = rest.strip_suffix(" order by sequence asc").unwrap_or(rest);
+    let rest = rest.strip_suffix(" order by sequence").unwrap_or(rest);
+    rest.parse().ok()
+}
+
+fn sync_u64_to_i64(value: u64, field_name: &str) -> Result<Value> {
+    i64::try_from(value)
+        .map(Value::Int64)
+        .map_err(|_| DbError::internal(format!("{field_name} exceeds INT64 range")))
 }
 
 fn imported_record_key(replica_id: &str, sequence: u64) -> String {

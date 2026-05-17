@@ -618,10 +618,24 @@ pub(crate) fn inspect_journal_integrity(
 mod tests {
     use std::collections::HashSet;
     use std::fs;
+    use std::sync::{Mutex, OnceLock};
 
     use crate::Db;
     use crate::SyncDoctorSeverity;
     use crate::Value;
+
+    fn sync_failpoint_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct FailpointReset;
+
+    impl Drop for FailpointReset {
+        fn drop(&mut self) {
+            let _ = Db::clear_failpoints();
+        }
+    }
 
     fn temp_db() -> (tempfile::TempDir, Db) {
         let dir = tempfile::TempDir::with_prefix("decentdb-sync-test").unwrap();
@@ -794,6 +808,95 @@ mod tests {
             let db = Db::open(&path, crate::config::DbConfig::default()).unwrap();
             assert_eq!(db.sync_status().unwrap().next_sequence, 3);
         }
+    }
+
+    #[test]
+    fn committed_sync_journal_records_survive_reopen_and_are_incrementally_enumerable() {
+        let dir = tempfile::TempDir::with_prefix("decentdb-sync-journal-reopen").unwrap();
+        let path = dir.path().join("test.ddb");
+        {
+            let db = Db::create(&path, crate::config::DbConfig::default()).unwrap();
+            db.execute("CREATE TABLE t (k INTEGER PRIMARY KEY, v TEXT)")
+                .unwrap();
+            db.sync_init_replica("node-a").unwrap();
+            db.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+            db.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+            db.execute("INSERT INTO t VALUES (3, 'c')").unwrap();
+
+            let records = db.sync_pending_changes(0, 10).unwrap();
+            assert_eq!(
+                records
+                    .iter()
+                    .map(|record| record.sequence)
+                    .collect::<Vec<_>>(),
+                vec![1, 2, 3]
+            );
+        }
+        {
+            let db = Db::open(&path, crate::config::DbConfig::default()).unwrap();
+            assert_eq!(db.sync_status().unwrap().next_sequence, 4);
+
+            let first = db.sync_pending_changes(0, 1).unwrap();
+            assert_eq!(first.len(), 1);
+            assert_eq!(first[0].sequence, 1);
+
+            let second = db.sync_pending_changes(1, 1).unwrap();
+            assert_eq!(second.len(), 1);
+            assert_eq!(second[0].sequence, 2);
+
+            let third = db.sync_pending_changes(2, 10).unwrap();
+            assert_eq!(
+                third
+                    .iter()
+                    .map(|record| record.sequence)
+                    .collect::<Vec<_>>(),
+                vec![3]
+            );
+        }
+    }
+
+    fn sync_journal_failure_surfaces_error(label: &str, expect_empty_after_reopen: bool) {
+        let _guard = sync_failpoint_lock().lock().unwrap();
+        let _reset = FailpointReset;
+        Db::clear_failpoints().unwrap();
+
+        let dir = tempfile::TempDir::with_prefix("decentdb-sync-failure").unwrap();
+        let path = dir.path().join("test.ddb");
+        let db = Db::create(&path, crate::config::DbConfig::default()).unwrap();
+        db.execute("CREATE TABLE t (k INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        db.sync_init_replica("node-a").unwrap();
+
+        Db::install_failpoint(label, "error", 1, 0).unwrap();
+        let err = db
+            .execute("INSERT INTO t VALUES (1, 'a')")
+            .expect_err("sync journal failure must surface to the caller");
+        assert!(
+            err.to_string()
+                .contains(&format!("fault injected at {label}")),
+            "unexpected error: {err}"
+        );
+
+        Db::clear_failpoints().unwrap();
+        drop(db);
+
+        let reopened = Db::open(&path, crate::config::DbConfig::default()).unwrap();
+        if expect_empty_after_reopen {
+            assert!(
+                reopened.sync_pending_changes(0, 10).unwrap().is_empty(),
+                "write failure should not leave a committed sync journal record"
+            );
+        }
+    }
+
+    #[test]
+    fn sync_journal_write_failure_is_returned_to_caller() {
+        sync_journal_failure_surfaces_error("sync.write", true);
+    }
+
+    #[test]
+    fn sync_journal_fsync_failure_is_returned_to_caller() {
+        sync_journal_failure_surfaces_error("sync.fsync", false);
     }
 
     #[test]

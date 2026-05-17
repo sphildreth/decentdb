@@ -1,6 +1,6 @@
 # Local-First Sync as a First-Class Capability
 
-**Status:** Active spec — Slice 1 functional foundation and first Slice 2 manual export/import foundation implemented (2026-05-17); Slice 1 crash/restart validation and later slices remain TODO
+**Status:** Active spec — Slice 1 complete and first Slice 2 manual export/import foundation implemented (2026-05-17); later slices remain TODO
 **Project:** DecentDB  
 **Document Type:** Implementation SPEC  
 **Audience:** Core engine developers, storage/replication implementers, SDK maintainers, CLI maintainers, documentation authors, coding agents  
@@ -1109,7 +1109,7 @@ negotiation, conflict semantics, scoped sync, HTTP transport) deferred to later 
 
 ### Status (2026-05-17)
 
-Slice 1 functional foundation implemented per ADR 0147:
+Slice 1 is complete per ADR 0147:
 
 - Replica initialization and identity storage (DONE — `Db::sync_init_replica`)
 - Sync enablement flag (DONE — `Db::sync_set_enabled` / `Db::sync_is_enabled`)
@@ -1120,8 +1120,9 @@ Slice 1 functional foundation implemented per ADR 0147:
 - Journal enumeration API (DONE — `Db::sync_pending_changes`)
 - Status view (DONE — `Db::sync_status`)
 - Local integrity checks (DONE — `Db::sync_integrity_report` / `decentdb sync doctor`)
-- Slice 1 validation gap: crash/restart and fault-injection tests for journal
-  durability remain TODO.
+- SQL inspection views (DONE — `sys_sync_status` and `sys_sync_journal`)
+- Restart/replay enumeration tests (DONE)
+- Fault-injection tests for `sync.write` and `sync.fsync` error paths (DONE)
 - Out of scope for Slice 1: scoped sync, conflict resolution, peer networking,
   protocol negotiation, WASM, and binding SDKs. See ADR 0147 for scope details.
 
@@ -1144,14 +1145,14 @@ Implement local prerequisites for sync without networking yet.
 ### Deliverables
 
 - working local journal
-- SQL inspection views
+- SQL inspection views (`sys_sync_status`, `sys_sync_journal`)
 - tests for crash safety and replay enumeration
 
 ### Exit Criteria
 
-- local mutations are durably captured
-- journal can be queried incrementally
-- restart/crash tests pass
+- local mutations are durably captured (DONE)
+- journal can be queried incrementally (DONE)
+- restart/crash tests pass (DONE)
 
 ---
 
