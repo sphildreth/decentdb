@@ -10,7 +10,9 @@ decentdb = { path = "../decentdb" }
 clap.workspace = true
 anyhow.workspace = true
 serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
 rustyline.workspace = true
+ureq.workspace = true
 mimalloc = { version = "0.1", default-features = false, optional = true }
 
 [features]

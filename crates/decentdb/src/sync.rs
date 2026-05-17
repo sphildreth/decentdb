@@ -1,5 +1,7 @@
 use std::collections::HashSet;
+use std::fmt::{Display, Formatter};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
@@ -19,6 +21,14 @@ pub(crate) const METADATA_TABLE_DDL: &str =
 pub(crate) const CONFLICTS_TABLE: &str = "__decentdb_sync_conflicts";
 
 pub(crate) const CONFLICTS_TABLE_DDL: &str = "CREATE TABLE IF NOT EXISTS __decentdb_sync_conflicts (conflict_id INT64 PRIMARY KEY, batch_id TEXT NOT NULL, remote_replica_id TEXT NOT NULL, remote_sequence INT64 NOT NULL, table_name TEXT NOT NULL, operation TEXT NOT NULL, conflict_type TEXT NOT NULL, message TEXT NOT NULL, primary_key_json TEXT NOT NULL, remote_record_json TEXT NOT NULL, local_row_json TEXT, created_at_micros INT64 NOT NULL, resolved INT64 NOT NULL)";
+
+pub(crate) const PEERS_TABLE: &str = "__decentdb_sync_peers";
+
+pub(crate) const PEERS_TABLE_DDL: &str = "CREATE TABLE IF NOT EXISTS __decentdb_sync_peers (name TEXT PRIMARY KEY, endpoint TEXT NOT NULL, token_env TEXT, created_at_micros INT64 NOT NULL, updated_at_micros INT64 NOT NULL)";
+
+pub(crate) const SESSIONS_TABLE: &str = "__decentdb_sync_sessions";
+
+pub(crate) const SESSIONS_TABLE_DDL: &str = "CREATE TABLE IF NOT EXISTS __decentdb_sync_sessions (session_id INT64 PRIMARY KEY, peer_name TEXT NOT NULL, direction TEXT NOT NULL, remote_replica_id TEXT, started_at_micros INT64 NOT NULL, ended_at_micros INT64, status TEXT NOT NULL, error TEXT, pushed_batch_id TEXT, pulled_batch_id TEXT, pushed_seen INT64 NOT NULL, pushed_applied INT64 NOT NULL, pushed_skipped INT64 NOT NULL, pushed_conflicted INT64 NOT NULL, pulled_seen INT64 NOT NULL, pulled_applied INT64 NOT NULL, pulled_skipped INT64 NOT NULL, pulled_conflicted INT64 NOT NULL, retry_count INT64 NOT NULL)";
 
 pub(crate) fn is_internal_table_name(name: &str) -> bool {
     name.starts_with("__decentdb_")
@@ -220,6 +230,109 @@ pub struct SyncStatus {
     pub journal_size_bytes: u64,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SyncRunDirection {
+    Push,
+    Pull,
+    Both,
+}
+
+impl SyncRunDirection {
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Push => "push",
+            Self::Pull => "pull",
+            Self::Both => "both",
+        }
+    }
+}
+
+impl Display for SyncRunDirection {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for SyncRunDirection {
+    type Err = DbError;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "push" => Ok(Self::Push),
+            "pull" => Ok(Self::Pull),
+            "both" => Ok(Self::Both),
+            other => Err(DbError::sql(format!(
+                "unsupported sync run direction '{other}'"
+            ))),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncPeer {
+    pub name: String,
+    pub endpoint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_env: Option<String>,
+    pub created_at_micros: i64,
+    pub updated_at_micros: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncSession {
+    pub session_id: i64,
+    pub peer_name: String,
+    pub direction: SyncRunDirection,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_replica_id: Option<String>,
+    pub started_at_micros: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at_micros: Option<i64>,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pushed_batch_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pulled_batch_id: Option<String>,
+    pub pushed_seen: i64,
+    pub pushed_applied: i64,
+    pub pushed_skipped: i64,
+    pub pushed_conflicted: i64,
+    pub pulled_seen: i64,
+    pub pulled_applied: i64,
+    pub pulled_skipped: i64,
+    pub pulled_conflicted: i64,
+    pub retry_count: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncHandshake {
+    pub protocol_version: u32,
+    pub engine_version: String,
+    pub replica_id: Option<String>,
+    pub capabilities: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncRunSummary {
+    pub peer_name: String,
+    pub direction: SyncRunDirection,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_replica_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pushed: Option<SyncImportSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pulled: Option<SyncImportSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pushed_batch_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pulled_batch_id: Option<String>,
+    pub retry_count: usize,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct SyncConflict {
     pub conflict_id: i64,
@@ -283,7 +396,7 @@ pub struct SyncJournalIntegrityReport {
     pub issues: Vec<SyncJournalIssue>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SyncImportSummary {
     pub seen: usize,
     pub applied: usize,
@@ -326,6 +439,13 @@ pub(crate) struct SyncContext {
     journal_write_offset: Mutex<u64>,
     journal_path: PathBuf,
     pub(crate) pending_mutations: Mutex<Vec<SyncMutation>>,
+}
+
+pub(crate) fn current_time_micros() -> i64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|duration| duration.as_micros() as i64)
+        .unwrap_or(0)
 }
 
 pub(crate) struct SyncJournalCaptureScope<'a> {
@@ -831,7 +951,9 @@ mod tests {
     use std::fs;
     use std::sync::{Mutex, OnceLock};
 
-    use super::{SyncChangeBatch, SyncJournalRecord};
+    use super::{
+        SyncChangeBatch, SyncImportSummary, SyncJournalRecord, SyncRunDirection, SyncRunSummary,
+    };
     use crate::Db;
     use crate::SyncDoctorSeverity;
     use crate::Value;
@@ -1554,5 +1676,148 @@ mod tests {
         assert!(codes.contains("replica_id_mismatch"));
         assert!(codes.contains("unsupported_schema_version"));
         assert_eq!(report.highest_severity, SyncDoctorSeverity::Error);
+    }
+
+    #[test]
+    fn sync_peers_persist_update_remove_and_internal_tables_stay_hidden() {
+        let (_dir, db) = temp_db();
+
+        db.sync_add_peer("beta", "https://beta.example.com", Some("BETA_TOKEN"))
+            .unwrap();
+        db.sync_add_peer("alpha", "https://alpha.example.com", None)
+            .unwrap();
+
+        let tables = db.list_tables().unwrap();
+        assert!(tables
+            .iter()
+            .all(|table| !table.name.starts_with("__decentdb_sync_")));
+
+        let peers = db.sync_peers().unwrap();
+        assert_eq!(
+            peers
+                .iter()
+                .map(|peer| peer.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "beta"]
+        );
+        assert_eq!(peers[1].token_env.as_deref(), Some("BETA_TOKEN"));
+
+        let created_at = peers[1].created_at_micros;
+        db.sync_add_peer("beta", "https://beta2.example.com", Some("BETA_TOKEN_2"))
+            .unwrap();
+        let updated = db.sync_peer("beta").unwrap().expect("peer");
+        assert_eq!(updated.created_at_micros, created_at);
+        assert_eq!(updated.endpoint, "https://beta2.example.com");
+        assert_eq!(updated.token_env.as_deref(), Some("BETA_TOKEN_2"));
+
+        let view = db
+            .execute("SELECT * FROM sys_sync_peers ORDER BY name")
+            .unwrap();
+        assert_eq!(
+            view.columns(),
+            &[
+                "name".to_string(),
+                "endpoint".to_string(),
+                "token_env".to_string(),
+                "created_at_micros".to_string(),
+                "updated_at_micros".to_string(),
+            ]
+        );
+        assert_eq!(view.rows().len(), 2);
+
+        assert!(db.sync_remove_peer("alpha").unwrap());
+        assert!(!db.sync_remove_peer("alpha").unwrap());
+        let remaining = db.sync_peers().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].name, "beta");
+    }
+
+    #[test]
+    fn sync_session_helpers_record_success_failure_and_views_expose_columns() {
+        let (_dir, db) = temp_db();
+        db.sync_init_replica("node-a").unwrap();
+
+        let success_id = db
+            .sync_start_session("peer-a", SyncRunDirection::Both, Some("remote-a"))
+            .unwrap();
+        let success_summary = SyncRunSummary {
+            peer_name: "peer-a".to_string(),
+            direction: SyncRunDirection::Both,
+            remote_replica_id: Some("remote-a".to_string()),
+            pushed: Some(SyncImportSummary {
+                seen: 2,
+                applied: 1,
+                skipped: 1,
+                conflicted: 0,
+            }),
+            pulled: Some(SyncImportSummary {
+                seen: 1,
+                applied: 1,
+                skipped: 0,
+                conflicted: 0,
+            }),
+            pushed_batch_id: Some("push-batch".to_string()),
+            pulled_batch_id: Some("pull-batch".to_string()),
+            retry_count: 0,
+        };
+        db.sync_finish_session_success(success_id, &success_summary)
+            .unwrap();
+
+        let failed_id = db
+            .sync_start_session("peer-b", SyncRunDirection::Pull, Some("remote-b"))
+            .unwrap();
+        let failed_summary = SyncRunSummary {
+            peer_name: "peer-b".to_string(),
+            direction: SyncRunDirection::Pull,
+            remote_replica_id: Some("remote-b".to_string()),
+            pushed: None,
+            pulled: Some(SyncImportSummary {
+                seen: 3,
+                applied: 2,
+                skipped: 1,
+                conflicted: 0,
+            }),
+            pushed_batch_id: None,
+            pulled_batch_id: Some("pull-batch-2".to_string()),
+            retry_count: 0,
+        };
+        db.sync_finish_session_failed(failed_id, &failed_summary, "boom")
+            .unwrap();
+
+        let sessions = db.sync_sessions().unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].status, "success");
+        assert_eq!(sessions[0].pushed_batch_id.as_deref(), Some("push-batch"));
+        assert_eq!(sessions[1].status, "failed");
+        assert_eq!(sessions[1].error.as_deref(), Some("boom"));
+
+        let view = db
+            .execute("SELECT * FROM sys_sync_sessions ORDER BY session_id")
+            .unwrap();
+        assert_eq!(
+            view.columns(),
+            &[
+                "session_id".to_string(),
+                "peer_name".to_string(),
+                "direction".to_string(),
+                "remote_replica_id".to_string(),
+                "started_at_micros".to_string(),
+                "ended_at_micros".to_string(),
+                "status".to_string(),
+                "error".to_string(),
+                "pushed_batch_id".to_string(),
+                "pulled_batch_id".to_string(),
+                "pushed_seen".to_string(),
+                "pushed_applied".to_string(),
+                "pushed_skipped".to_string(),
+                "pushed_conflicted".to_string(),
+                "pulled_seen".to_string(),
+                "pulled_applied".to_string(),
+                "pulled_skipped".to_string(),
+                "pulled_conflicted".to_string(),
+                "retry_count".to_string(),
+            ]
+        );
+        assert_eq!(view.rows().len(), 2);
     }
 }

@@ -1,6 +1,6 @@
 # Local-First Sync as a First-Class Capability
 
-**Status:** Active spec — Slice 1 complete and Slice 2 complete (2026-05-17); later slices remain TODO
+**Status:** Active spec — Slice 1 complete, Slice 2 complete, and Slice 3 complete (2026-05-17); later slices remain TODO
 **Project:** DecentDB  
 **Document Type:** Implementation SPEC  
 **Audience:** Core engine developers, storage/replication implementers, SDK maintainers, CLI maintainers, documentation authors, coding agents  
@@ -1066,8 +1066,9 @@ This work is large enough that it **must** be implemented in slices.
 
 ### Status (2026-05-17)
 
-ADR 0147 created for local-first sync journal foundation. Remaining ADRs (protocol/version
-negotiation, conflict semantics, scoped sync, HTTP transport) deferred to later slices.
+ADR 0147 created for the local-first sync journal foundation. ADR 0148 created
+for HTTP transport and peer management. Remaining ADR work includes scoped sync
+restrictions and richer conflict resolution defaults.
 
 ### Objectives
 
@@ -1208,6 +1209,32 @@ Provide a no-network sync path first to validate protocol and apply semantics.
 ---
 
 ## Slice 3 — HTTP Transport and Peer Management
+
+### Status (2026-05-17)
+
+Slice 3 is complete:
+
+- Core peer catalog APIs and typed protocol structs are available:
+  - `Db::sync_add_peer`
+  - `Db::sync_remove_peer`
+  - `Db::sync_peer`
+  - `Db::sync_peers`
+  - `Db::sync_sessions`
+  - `SyncPeer`, `SyncSession`, `SyncHandshake`, `SyncRunDirection`, `SyncRunSummary`
+- CLI peer management and run commands are implemented:
+  - `decentdb sync peer add`
+  - `decentdb sync peer remove`
+  - `decentdb sync peer list`
+  - `decentdb sync run`
+  - `decentdb sync serve`
+- HTTP sync protocol endpoints are implemented under `/decentdb/sync/v1/*`:
+  - `GET /hello`
+  - `GET /status`
+  - `GET /changes`
+  - `POST /import`
+  - `GET /conflicts`
+- Retryable transport failures and session recording are implemented.
+- The built-in `sync serve` dev server is plain HTTP; production TLS termination is expected to happen externally.
 
 ### Objectives
 

@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockWriteGuard, Weak};
 use std::time::SystemTime;
@@ -42,8 +43,9 @@ use crate::storage::page::{self, PageId, PageStore};
 use crate::storage::{self, DatabaseHeader, PagerHandle};
 use crate::sync::SyncContext;
 use crate::sync::{
-    SyncChangeBatch, SyncConflict, SyncImportSummary, SyncJournalIntegrityReport,
-    SyncJournalRecord, SyncOperation, SyncStatus,
+    current_time_micros, SyncChangeBatch, SyncConflict, SyncImportSummary,
+    SyncJournalIntegrityReport, SyncJournalRecord, SyncOperation, SyncPeer, SyncRunDirection,
+    SyncRunSummary, SyncSession, SyncStatus,
 };
 use crate::vfs::faulty::{self, FailAction, Failpoint};
 use crate::vfs::{is_memory_path, write_all_at, FileKind, OpenMode, VfsHandle};
@@ -5054,7 +5056,7 @@ impl Db {
     }
 
     pub fn sync_init_replica(&self, replica_id: &str) -> Result<()> {
-        self.ensure_sync_metadata_table()?;
+        self.ensure_sync_tables()?;
         self.sync_upsert_metadata("replica_id", replica_id)?;
         self.sync_upsert_metadata("enabled", "true")?;
         self.sync_upsert_metadata("next_sequence", "1")?;
@@ -5063,6 +5065,153 @@ impl Db {
         self.inner.sync_ctx.set_next_sequence(1);
         self.inner.sync_ctx.ensure_journal_open(&self.inner.vfs)?;
         Ok(())
+    }
+
+    pub fn sync_add_peer(&self, name: &str, endpoint: &str, token_env: Option<&str>) -> Result<()> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(DbError::sql("sync peer name must not be empty"));
+        }
+        if !(endpoint.starts_with("http://") || endpoint.starts_with("https://")) {
+            return Err(DbError::sql(
+                "sync peer endpoint must start with http:// or https://",
+            ));
+        }
+        if token_env.is_some_and(|value| value.trim().is_empty()) {
+            return Err(DbError::sql("sync peer token_env must not be empty"));
+        }
+
+        self.ensure_sync_tables()?;
+        let now = current_time_micros();
+        let token_sql = token_env
+            .map(sql_text_literal)
+            .unwrap_or_else(|| "NULL".to_string());
+        let sql = format!(
+            "INSERT INTO {table} (name, endpoint, token_env, created_at_micros, updated_at_micros) VALUES ({name}, {endpoint}, {token_env}, {now}, {now}) ON CONFLICT (name) DO UPDATE SET endpoint = {endpoint}, token_env = {token_env}, updated_at_micros = {now}",
+            table = crate::sync::PEERS_TABLE,
+            name = sql_text_literal(name),
+            endpoint = sql_text_literal(endpoint),
+            token_env = token_sql,
+            now = now,
+        );
+        let _ = self.execute(&sql)?;
+        Ok(())
+    }
+
+    pub fn sync_remove_peer(&self, name: &str) -> Result<bool> {
+        self.ensure_sync_tables()?;
+        let sql = format!(
+            "DELETE FROM {} WHERE name = {}",
+            crate::sync::PEERS_TABLE,
+            sql_text_literal(name)
+        );
+        let result = self.execute(&sql)?;
+        Ok(result.affected_rows() > 0)
+    }
+
+    pub fn sync_peers(&self) -> Result<Vec<SyncPeer>> {
+        self.ensure_sync_tables()?;
+        let sql = format!(
+            "SELECT name, endpoint, token_env, created_at_micros, updated_at_micros FROM {} ORDER BY name",
+            crate::sync::PEERS_TABLE
+        );
+        match self.execute(&sql) {
+            Ok(result) => result.rows().iter().map(sync_peer_from_row).collect(),
+            Err(error) => {
+                let message = error.to_string();
+                if message.contains("no such table") || message.contains("unknown table") {
+                    Ok(Vec::new())
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    pub fn sync_peer(&self, name: &str) -> Result<Option<SyncPeer>> {
+        self.ensure_sync_tables()?;
+        let sql = format!(
+            "SELECT name, endpoint, token_env, created_at_micros, updated_at_micros FROM {} WHERE name = {}",
+            crate::sync::PEERS_TABLE,
+            sql_text_literal(name)
+        );
+        match self.execute(&sql) {
+            Ok(result) => Ok(result.rows().first().map(sync_peer_from_row).transpose()?),
+            Err(error) => {
+                let message = error.to_string();
+                if message.contains("no such table") || message.contains("unknown table") {
+                    Ok(None)
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    pub fn sync_sessions(&self) -> Result<Vec<SyncSession>> {
+        self.ensure_sync_tables()?;
+        let sql = format!(
+            "SELECT session_id, peer_name, direction, remote_replica_id, started_at_micros, ended_at_micros, status, error, pushed_batch_id, pulled_batch_id, pushed_seen, pushed_applied, pushed_skipped, pushed_conflicted, pulled_seen, pulled_applied, pulled_skipped, pulled_conflicted, retry_count FROM {} ORDER BY session_id",
+            crate::sync::SESSIONS_TABLE
+        );
+        match self.execute(&sql) {
+            Ok(result) => result.rows().iter().map(sync_session_from_row).collect(),
+            Err(error) => {
+                let message = error.to_string();
+                if message.contains("no such table") || message.contains("unknown table") {
+                    Ok(Vec::new())
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    pub fn sync_start_session(
+        &self,
+        peer_name: &str,
+        direction: SyncRunDirection,
+        remote_replica_id: Option<&str>,
+    ) -> Result<i64> {
+        self.ensure_sync_tables()?;
+        let session_id = self.next_sync_session_id()?;
+        let started_at_micros = current_time_micros();
+        let sql = format!(
+            "INSERT INTO {table} (session_id, peer_name, direction, remote_replica_id, started_at_micros, ended_at_micros, status, error, pushed_batch_id, pulled_batch_id, pushed_seen, pushed_applied, pushed_skipped, pushed_conflicted, pulled_seen, pulled_applied, pulled_skipped, pulled_conflicted, retry_count) VALUES ({session_id}, {peer_name}, {direction}, {remote_replica_id}, {started_at_micros}, NULL, 'started', NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, 0, 0, 0)",
+            table = crate::sync::SESSIONS_TABLE,
+            session_id = session_id,
+            peer_name = sql_text_literal(peer_name),
+            direction = sql_text_literal(direction.as_str()),
+            remote_replica_id = remote_replica_id
+                .map(sql_text_literal)
+                .unwrap_or_else(|| "NULL".to_string()),
+            started_at_micros = started_at_micros,
+        );
+        let _ = self.execute(&sql)?;
+        Ok(session_id)
+    }
+
+    pub fn sync_finish_session_success(
+        &self,
+        session_id: i64,
+        summary: &SyncRunSummary,
+    ) -> Result<()> {
+        self.sync_update_session(session_id, summary, "success", None, current_time_micros())
+    }
+
+    pub fn sync_finish_session_failed(
+        &self,
+        session_id: i64,
+        summary: &SyncRunSummary,
+        error: &str,
+    ) -> Result<()> {
+        self.sync_update_session(
+            session_id,
+            summary,
+            "failed",
+            Some(error),
+            current_time_micros(),
+        )
     }
 
     pub fn sync_integrity_report(&self) -> Result<SyncJournalIntegrityReport> {
@@ -5541,6 +5690,20 @@ impl Db {
         }
     }
 
+    pub fn sync_peer_out_watermark(&self, peer_name: &str) -> Result<Option<u64>> {
+        match self.sync_read_metadata(&peer_out_watermark_key(peer_name))? {
+            Some(value) => value.parse::<u64>().map(Some).map_err(|error| {
+                DbError::sql(format!("invalid peer outbound watermark value: {error}"))
+            }),
+            None => Ok(None),
+        }
+    }
+
+    pub fn sync_set_peer_out_watermark(&self, peer_name: &str, watermark: u64) -> Result<()> {
+        self.ensure_sync_tables()?;
+        self.sync_upsert_metadata(&peer_out_watermark_key(peer_name), &watermark.to_string())
+    }
+
     pub fn sync_conflicts(&self) -> Result<Vec<SyncConflict>> {
         let sql = format!(
             "SELECT * FROM {} WHERE resolved = 0 ORDER BY conflict_id",
@@ -5628,7 +5791,7 @@ impl Db {
     }
 
     pub fn sync_set_enabled(&self, enabled: bool) -> Result<()> {
-        self.ensure_sync_metadata_table()?;
+        self.ensure_sync_tables()?;
         self.sync_upsert_metadata("enabled", if enabled { "true" } else { "false" })?;
         self.inner.sync_ctx.set_enabled(enabled);
         if enabled {
@@ -5650,12 +5813,6 @@ impl Db {
             self.inner.sync_ctx.set_next_sequence(status.next_sequence);
         }
         Ok(status.enabled)
-    }
-
-    fn ensure_sync_metadata_table(&self) -> Result<()> {
-        let _ = self.execute(crate::sync::METADATA_TABLE_DDL)?;
-        let _ = self.execute(crate::sync::CONFLICTS_TABLE_DDL)?;
-        Ok(())
     }
 
     fn sync_upsert_metadata(&self, key: &str, value: &str) -> Result<()> {
@@ -5822,8 +5979,76 @@ impl Db {
             .ok_or_else(|| DbError::internal("sync conflict_id counter overflow"))
     }
 
+    fn next_sync_session_id(&self) -> Result<i64> {
+        let sql = format!(
+            "SELECT COALESCE(MAX(session_id), 0) FROM {}",
+            crate::sync::SESSIONS_TABLE
+        );
+        let result = self.execute(&sql)?;
+        let current = result
+            .rows()
+            .first()
+            .and_then(|row| row.values().first())
+            .and_then(|value| match value {
+                Value::Int64(value) => Some(*value),
+                Value::Bool(value) => Some(i64::from(*value)),
+                _ => None,
+            })
+            .ok_or_else(|| DbError::corruption("malformed sync session id counter"))?;
+        current
+            .checked_add(1)
+            .ok_or_else(|| DbError::internal("sync session_id counter overflow"))
+    }
+
+    fn sync_update_session(
+        &self,
+        session_id: i64,
+        summary: &SyncRunSummary,
+        status: &str,
+        error: Option<&str>,
+        ended_at_micros: i64,
+    ) -> Result<()> {
+        self.ensure_sync_tables()?;
+        let (
+            pushed_seen,
+            pushed_applied,
+            pushed_skipped,
+            pushed_conflicted,
+            pulled_seen,
+            pulled_applied,
+            pulled_skipped,
+            pulled_conflicted,
+        ) = sync_session_summary_counts(summary);
+        let sql = format!(
+            "UPDATE {table} SET remote_replica_id = {remote_replica_id}, ended_at_micros = {ended_at_micros}, status = {status}, error = {error}, pushed_batch_id = {pushed_batch_id}, pulled_batch_id = {pulled_batch_id}, pushed_seen = {pushed_seen}, pushed_applied = {pushed_applied}, pushed_skipped = {pushed_skipped}, pushed_conflicted = {pushed_conflicted}, pulled_seen = {pulled_seen}, pulled_applied = {pulled_applied}, pulled_skipped = {pulled_skipped}, pulled_conflicted = {pulled_conflicted}, retry_count = {retry_count} WHERE session_id = {session_id}",
+            table = crate::sync::SESSIONS_TABLE,
+            remote_replica_id = sql_nullable_text_literal(summary.remote_replica_id.as_deref()),
+            ended_at_micros = ended_at_micros,
+            status = sql_text_literal(status),
+            error = sql_nullable_text_literal(error),
+            pushed_batch_id = sql_nullable_text_literal(summary.pushed_batch_id.as_deref()),
+            pulled_batch_id = sql_nullable_text_literal(summary.pulled_batch_id.as_deref()),
+            pushed_seen = pushed_seen,
+            pushed_applied = pushed_applied,
+            pushed_skipped = pushed_skipped,
+            pushed_conflicted = pushed_conflicted,
+            pulled_seen = pulled_seen,
+            pulled_applied = pulled_applied,
+            pulled_skipped = pulled_skipped,
+            pulled_conflicted = pulled_conflicted,
+            retry_count = summary.retry_count as i64,
+            session_id = session_id,
+        );
+        let _ = self.execute(&sql)?;
+        Ok(())
+    }
+
     fn ensure_sync_tables(&self) -> Result<()> {
-        self.ensure_sync_metadata_table()
+        let _ = self.execute(crate::sync::METADATA_TABLE_DDL)?;
+        let _ = self.execute(crate::sync::PEERS_TABLE_DDL)?;
+        let _ = self.execute(crate::sync::SESSIONS_TABLE_DDL)?;
+        let _ = self.execute(crate::sync::CONFLICTS_TABLE_DDL)?;
+        Ok(())
     }
 
     fn load_sync_status_from_db(&self) -> Result<SyncStatus> {
@@ -5918,6 +6143,8 @@ impl Db {
             SyncInspectionQuery::Journal { since_sequence } => {
                 self.sync_journal_query_result(since_sequence).map(Some)
             }
+            SyncInspectionQuery::Peers => self.sync_peers_query_result().map(Some),
+            SyncInspectionQuery::Sessions => self.sync_sessions_query_result().map(Some),
             SyncInspectionQuery::Conflicts => self.sync_conflicts_query_result().map(Some),
         }
     }
@@ -5973,6 +6200,86 @@ impl Db {
                 "after_json".to_string(),
                 "schema_cookie".to_string(),
                 "committed_at_micros".to_string(),
+            ],
+            rows,
+        ))
+    }
+
+    fn sync_peers_query_result(&self) -> Result<QueryResult> {
+        let peers = self.sync_peers()?;
+        let rows = peers
+            .into_iter()
+            .map(|peer| {
+                Ok(QueryRow::new(vec![
+                    Value::Text(peer.name),
+                    Value::Text(peer.endpoint),
+                    peer.token_env.map_or(Value::Null, Value::Text),
+                    Value::Int64(peer.created_at_micros),
+                    Value::Int64(peer.updated_at_micros),
+                ]))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(QueryResult::with_rows(
+            vec![
+                "name".to_string(),
+                "endpoint".to_string(),
+                "token_env".to_string(),
+                "created_at_micros".to_string(),
+                "updated_at_micros".to_string(),
+            ],
+            rows,
+        ))
+    }
+
+    fn sync_sessions_query_result(&self) -> Result<QueryResult> {
+        let sessions = self.sync_sessions()?;
+        let rows = sessions
+            .into_iter()
+            .map(|session| {
+                Ok(QueryRow::new(vec![
+                    Value::Int64(session.session_id),
+                    Value::Text(session.peer_name),
+                    Value::Text(session.direction.to_string()),
+                    session.remote_replica_id.map_or(Value::Null, Value::Text),
+                    Value::Int64(session.started_at_micros),
+                    session.ended_at_micros.map_or(Value::Null, Value::Int64),
+                    Value::Text(session.status),
+                    session.error.map_or(Value::Null, Value::Text),
+                    session.pushed_batch_id.map_or(Value::Null, Value::Text),
+                    session.pulled_batch_id.map_or(Value::Null, Value::Text),
+                    Value::Int64(session.pushed_seen),
+                    Value::Int64(session.pushed_applied),
+                    Value::Int64(session.pushed_skipped),
+                    Value::Int64(session.pushed_conflicted),
+                    Value::Int64(session.pulled_seen),
+                    Value::Int64(session.pulled_applied),
+                    Value::Int64(session.pulled_skipped),
+                    Value::Int64(session.pulled_conflicted),
+                    Value::Int64(session.retry_count),
+                ]))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(QueryResult::with_rows(
+            vec![
+                "session_id".to_string(),
+                "peer_name".to_string(),
+                "direction".to_string(),
+                "remote_replica_id".to_string(),
+                "started_at_micros".to_string(),
+                "ended_at_micros".to_string(),
+                "status".to_string(),
+                "error".to_string(),
+                "pushed_batch_id".to_string(),
+                "pulled_batch_id".to_string(),
+                "pushed_seen".to_string(),
+                "pushed_applied".to_string(),
+                "pushed_skipped".to_string(),
+                "pushed_conflicted".to_string(),
+                "pulled_seen".to_string(),
+                "pulled_applied".to_string(),
+                "pulled_skipped".to_string(),
+                "pulled_conflicted".to_string(),
+                "retry_count".to_string(),
             ],
             rows,
         ))
@@ -6089,6 +6396,8 @@ fn sync_read_metadata_from_runtime(runtime: &EngineRuntime, key: &str) -> Result
 enum SyncInspectionQuery {
     Status,
     Journal { since_sequence: u64 },
+    Peers,
+    Sessions,
     Conflicts,
 }
 
@@ -6103,6 +6412,12 @@ impl SyncInspectionQuery {
             "select * from sys_sync_journal order by sequence asc" => {
                 Some(Self::Journal { since_sequence: 0 })
             }
+            "select * from sys_sync_peers" => Some(Self::Peers),
+            "select * from sys_sync_peers order by name" => Some(Self::Peers),
+            "select * from sys_sync_peers order by name asc" => Some(Self::Peers),
+            "select * from sys_sync_sessions" => Some(Self::Sessions),
+            "select * from sys_sync_sessions order by session_id" => Some(Self::Sessions),
+            "select * from sys_sync_sessions order by session_id asc" => Some(Self::Sessions),
             "select * from sys_sync_conflicts" => Some(Self::Conflicts),
             "select * from sys_sync_conflicts order by conflict_id" => Some(Self::Conflicts),
             "select * from sys_sync_conflicts order by conflict_id asc" => Some(Self::Conflicts),
@@ -6265,12 +6580,199 @@ fn sync_conflict_from_row(row: &QueryRow) -> Result<SyncConflict> {
     })
 }
 
+fn sync_peer_from_row(row: &QueryRow) -> Result<SyncPeer> {
+    let values = row.values();
+    let name = match values.first() {
+        Some(Value::Text(value)) => value.clone(),
+        _ => return Err(DbError::corruption("malformed sync peer row: name")),
+    };
+    let endpoint = match values.get(1) {
+        Some(Value::Text(value)) => value.clone(),
+        _ => return Err(DbError::corruption("malformed sync peer row: endpoint")),
+    };
+    let token_env = match values.get(2) {
+        Some(Value::Null) | None => None,
+        Some(Value::Text(value)) => Some(value.clone()),
+        _ => return Err(DbError::corruption("malformed sync peer row: token_env")),
+    };
+    let created_at_micros = match values.get(3) {
+        Some(Value::Int64(value)) => *value,
+        Some(Value::Bool(value)) => i64::from(*value),
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync peer row: created_at_micros",
+            ))
+        }
+    };
+    let updated_at_micros = match values.get(4) {
+        Some(Value::Int64(value)) => *value,
+        Some(Value::Bool(value)) => i64::from(*value),
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync peer row: updated_at_micros",
+            ))
+        }
+    };
+
+    Ok(SyncPeer {
+        name,
+        endpoint,
+        token_env,
+        created_at_micros,
+        updated_at_micros,
+    })
+}
+
+fn sync_session_from_row(row: &QueryRow) -> Result<SyncSession> {
+    let values = row.values();
+    let session_id = match values.first() {
+        Some(Value::Int64(value)) => *value,
+        Some(Value::Bool(value)) => i64::from(*value),
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync session row: session_id",
+            ))
+        }
+    };
+    let peer_name = match values.get(1) {
+        Some(Value::Text(value)) => value.clone(),
+        _ => return Err(DbError::corruption("malformed sync session row: peer_name")),
+    };
+    let direction = match values.get(2) {
+        Some(Value::Text(value)) => SyncRunDirection::from_str(value)?,
+        _ => return Err(DbError::corruption("malformed sync session row: direction")),
+    };
+    let remote_replica_id = match values.get(3) {
+        Some(Value::Null) | None => None,
+        Some(Value::Text(value)) => Some(value.clone()),
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync session row: remote_replica_id",
+            ))
+        }
+    };
+    let started_at_micros = match values.get(4) {
+        Some(Value::Int64(value)) => *value,
+        Some(Value::Bool(value)) => i64::from(*value),
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync session row: started_at_micros",
+            ))
+        }
+    };
+    let ended_at_micros = match values.get(5) {
+        Some(Value::Null) | None => None,
+        Some(Value::Int64(value)) => Some(*value),
+        Some(Value::Bool(value)) => Some(i64::from(*value)),
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync session row: ended_at_micros",
+            ))
+        }
+    };
+    let status = match values.get(6) {
+        Some(Value::Text(value)) => value.clone(),
+        _ => return Err(DbError::corruption("malformed sync session row: status")),
+    };
+    let error = match values.get(7) {
+        Some(Value::Null) | None => None,
+        Some(Value::Text(value)) => Some(value.clone()),
+        _ => return Err(DbError::corruption("malformed sync session row: error")),
+    };
+    let pushed_batch_id = match values.get(8) {
+        Some(Value::Null) | None => None,
+        Some(Value::Text(value)) => Some(value.clone()),
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync session row: pushed_batch_id",
+            ))
+        }
+    };
+    let pulled_batch_id = match values.get(9) {
+        Some(Value::Null) | None => None,
+        Some(Value::Text(value)) => Some(value.clone()),
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync session row: pulled_batch_id",
+            ))
+        }
+    };
+    let pushed_seen = parse_sync_i64(values.get(10), "pushed_seen")?;
+    let pushed_applied = parse_sync_i64(values.get(11), "pushed_applied")?;
+    let pushed_skipped = parse_sync_i64(values.get(12), "pushed_skipped")?;
+    let pushed_conflicted = parse_sync_i64(values.get(13), "pushed_conflicted")?;
+    let pulled_seen = parse_sync_i64(values.get(14), "pulled_seen")?;
+    let pulled_applied = parse_sync_i64(values.get(15), "pulled_applied")?;
+    let pulled_skipped = parse_sync_i64(values.get(16), "pulled_skipped")?;
+    let pulled_conflicted = parse_sync_i64(values.get(17), "pulled_conflicted")?;
+    let retry_count = parse_sync_i64(values.get(18), "retry_count")?;
+
+    Ok(SyncSession {
+        session_id,
+        peer_name,
+        direction,
+        remote_replica_id,
+        started_at_micros,
+        ended_at_micros,
+        status,
+        error,
+        pushed_batch_id,
+        pulled_batch_id,
+        pushed_seen,
+        pushed_applied,
+        pushed_skipped,
+        pushed_conflicted,
+        pulled_seen,
+        pulled_applied,
+        pulled_skipped,
+        pulled_conflicted,
+        retry_count,
+    })
+}
+
 fn sql_text_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
+fn sql_nullable_text_literal(value: Option<&str>) -> String {
+    value
+        .map(sql_text_literal)
+        .unwrap_or_else(|| "NULL".to_string())
+}
+
+fn parse_sync_i64(value: Option<&Value>, field_name: &str) -> Result<i64> {
+    match value {
+        Some(Value::Int64(value)) => Ok(*value),
+        Some(Value::Bool(value)) => Ok(i64::from(*value)),
+        _ => Err(DbError::corruption(format!(
+            "malformed sync session row: {field_name}"
+        ))),
+    }
+}
+
+fn sync_session_summary_counts(
+    summary: &SyncRunSummary,
+) -> (i64, i64, i64, i64, i64, i64, i64, i64) {
+    let pushed = summary.pushed.as_ref();
+    let pulled = summary.pulled.as_ref();
+    (
+        pushed.map_or(0, |value| value.seen as i64),
+        pushed.map_or(0, |value| value.applied as i64),
+        pushed.map_or(0, |value| value.skipped as i64),
+        pushed.map_or(0, |value| value.conflicted as i64),
+        pulled.map_or(0, |value| value.seen as i64),
+        pulled.map_or(0, |value| value.applied as i64),
+        pulled.map_or(0, |value| value.skipped as i64),
+        pulled.map_or(0, |value| value.conflicted as i64),
+    )
+}
+
 fn peer_watermark_key(replica_id: &str) -> String {
     format!("peer_watermark:{replica_id}")
+}
+
+fn peer_out_watermark_key(peer_name: &str) -> String {
+    format!("peer_out_watermark:{peer_name}")
 }
 
 fn imported_record_key(replica_id: &str, sequence: u64) -> String {

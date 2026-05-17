@@ -47,8 +47,9 @@ pub use crate::metadata::{
 pub use crate::record::value::Value;
 pub use crate::storage::DB_FORMAT_VERSION;
 pub use crate::sync::{
-    SyncChangeBatch, SyncConflict, SyncDoctorSeverity, SyncImportSummary,
-    SyncJournalIntegrityReport, SyncJournalIssue, SyncJournalRecord, SyncStatus,
+    SyncChangeBatch, SyncConflict, SyncDoctorSeverity, SyncHandshake, SyncImportSummary,
+    SyncJournalIntegrityReport, SyncJournalIssue, SyncJournalRecord, SyncPeer, SyncRunDirection,
+    SyncRunSummary, SyncSession, SyncStatus,
 };
 
 /// Returns the DecentDB crate version.

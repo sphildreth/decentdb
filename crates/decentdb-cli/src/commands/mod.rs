@@ -1,5 +1,10 @@
+use std::convert::TryFrom;
 use std::fs;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
+use std::thread;
 use std::time::Instant;
 
 use anyhow::{anyhow, Result};
@@ -8,7 +13,8 @@ use decentdb::{
     evict_shared_wal, render_markdown, run_doctor, BulkLoadOptions, Db, DbConfig, DoctorCategory,
     DoctorCheckSelection, DoctorIndexVerification, DoctorOptions, DoctorPathMode, DoctorReport,
     DoctorSeverity, HeaderInfo, IndexVerification, QueryResult, StorageInfo, SyncChangeBatch,
-    SyncConflict, TableInfo, Value,
+    SyncConflict, SyncHandshake, SyncImportSummary, SyncPeer, SyncRunDirection, SyncRunSummary,
+    TableInfo, Value,
 };
 
 use crate::output::{
@@ -347,6 +353,23 @@ pub enum SyncCommand {
     Conflicts(SyncConflictsCommand),
     /// Prune local sync journal records through a sequence
     Prune(SyncPruneCommand),
+    /// Manage sync peers
+    #[command(subcommand)]
+    Peer(SyncPeerCommand),
+    /// Run peer-to-peer sync over HTTP
+    Run(SyncRunCommand),
+    /// Serve sync protocol endpoints for tests and dev
+    Serve(SyncServeCommand),
+}
+
+#[derive(Clone, Debug, Subcommand)]
+pub enum SyncPeerCommand {
+    /// Add or update a sync peer
+    Add(SyncPeerAddCommand),
+    /// Remove a sync peer
+    Remove(SyncPeerRemoveCommand),
+    /// List configured sync peers
+    List(SyncPeerListCommand),
 }
 
 #[derive(Clone, Debug, Parser)]
@@ -409,6 +432,68 @@ pub struct SyncPruneCommand {
     pub db: String,
     #[arg(long)]
     pub through: u64,
+}
+
+#[derive(Clone, Debug, Parser)]
+pub struct SyncPeerAddCommand {
+    #[arg(long)]
+    pub db: String,
+    #[arg(long)]
+    pub name: String,
+    #[arg(long)]
+    pub endpoint: String,
+    #[arg(long = "token-env")]
+    pub token_env: Option<String>,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
+    pub format: OutputFormat,
+}
+
+#[derive(Clone, Debug, Parser)]
+pub struct SyncPeerRemoveCommand {
+    #[arg(long)]
+    pub db: String,
+    #[arg(long)]
+    pub name: String,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
+    pub format: OutputFormat,
+}
+
+#[derive(Clone, Debug, Parser)]
+pub struct SyncPeerListCommand {
+    #[arg(long)]
+    pub db: String,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+    pub format: OutputFormat,
+}
+
+#[derive(Clone, Debug, Parser)]
+pub struct SyncRunCommand {
+    #[arg(long)]
+    pub db: String,
+    #[arg(long)]
+    pub peer: String,
+    #[arg(long, default_value = "both")]
+    pub direction: String,
+    #[arg(long, default_value_t = 1000)]
+    pub limit: usize,
+    #[arg(long, default_value_t = 2)]
+    pub retries: usize,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+    pub format: OutputFormat,
+}
+
+#[derive(Clone, Debug, Parser)]
+pub struct SyncServeCommand {
+    #[arg(long)]
+    pub db: String,
+    #[arg(long)]
+    pub bind: String,
+    #[arg(long = "token-env")]
+    pub token_env: Option<String>,
+    #[arg(long = "ready-file")]
+    pub ready_file: Option<PathBuf>,
+    #[arg(long = "max-requests")]
+    pub max_requests: Option<usize>,
 }
 
 #[derive(Clone, Debug, Parser)]
@@ -1147,6 +1232,13 @@ fn run_sync(command: SyncCommand) -> Result<()> {
             println!("pruned={pruned}");
             Ok(())
         }
+        SyncCommand::Peer(cmd) => match cmd {
+            SyncPeerCommand::Add(cmd) => run_sync_peer_add(cmd),
+            SyncPeerCommand::Remove(cmd) => run_sync_peer_remove(cmd),
+            SyncPeerCommand::List(cmd) => run_sync_peer_list(cmd),
+        },
+        SyncCommand::Run(cmd) => run_sync_run(cmd),
+        SyncCommand::Serve(cmd) => run_sync_serve(cmd),
     }
 }
 
@@ -1162,6 +1254,729 @@ fn run_sync_export(command: SyncExportCommand) -> Result<()> {
         OutputFormat::Table => Err(anyhow!("sync export supports only json output")),
         _ => Err(anyhow!("sync export supports only json output")),
     }
+}
+
+fn run_sync_peer_add(command: SyncPeerAddCommand) -> Result<()> {
+    let db = open_db(&command.db, true, 0, 0)?;
+    db.sync_add_peer(
+        &command.name,
+        &command.endpoint,
+        command.token_env.as_deref(),
+    )?;
+    let peer = db
+        .sync_peer(&command.name)?
+        .ok_or_else(|| anyhow!("sync peer was not persisted"))?;
+    print_sync_peer_output(command.format, &peer)?;
+    Ok(())
+}
+
+fn run_sync_peer_remove(command: SyncPeerRemoveCommand) -> Result<()> {
+    let db = open_db(&command.db, false, 0, 0)?;
+    let removed = db.sync_remove_peer(&command.name)?;
+    match command.format {
+        OutputFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({ "removed": removed }))?
+            );
+        }
+        _ => {
+            println!("removed={removed}");
+        }
+    }
+    Ok(())
+}
+
+fn run_sync_peer_list(command: SyncPeerListCommand) -> Result<()> {
+    let db = open_db(&command.db, false, 0, 0)?;
+    let peers = db.sync_peers()?;
+    print_sync_peers_output(command.format, &peers)?;
+    Ok(())
+}
+
+fn run_sync_run(command: SyncRunCommand) -> Result<()> {
+    let db = open_db(&command.db, false, 0, 0)?;
+    let peer = db
+        .sync_peer(&command.peer)?
+        .ok_or_else(|| anyhow!("sync peer '{}' not found", command.peer))?;
+    let direction = SyncRunDirection::from_str(&command.direction)?;
+    let token = resolve_sync_peer_token(&peer)?;
+    let session_id = db.sync_start_session(&peer.name, direction.clone(), None)?;
+
+    let mut attempt = 0usize;
+    loop {
+        match perform_sync_run_once(
+            &db,
+            &peer,
+            token.as_deref(),
+            direction.clone(),
+            command.limit,
+        ) {
+            Ok(mut summary) => {
+                summary.retry_count = attempt;
+                db.sync_finish_session_success(session_id, &summary)?;
+                print_sync_run_summary(command.format, &summary)?;
+                return Ok(());
+            }
+            Err(mut failure) => {
+                failure.summary.retry_count = attempt;
+                let redacted = redact_sync_secret(&failure.message, token.as_deref());
+                if failure.retryable && attempt < command.retries {
+                    attempt += 1;
+                    thread::sleep(sync_retry_delay(attempt));
+                    continue;
+                }
+                db.sync_finish_session_failed(session_id, &failure.summary, &redacted)?;
+                return Err(anyhow!(redacted));
+            }
+        }
+    }
+}
+
+fn run_sync_serve(command: SyncServeCommand) -> Result<()> {
+    let db = open_db(&command.db, true, 0, 0)?;
+    let listener = TcpListener::bind(&command.bind)?;
+    let bound_addr = listener.local_addr()?;
+    if let Some(path) = &command.ready_file {
+        fs::write(path, bound_addr.to_string())?;
+    }
+
+    let auth_token = match &command.token_env {
+        Some(env) => Some(
+            std::env::var(env)
+                .map_err(|_| anyhow!("required sync server token env var '{env}' is not set"))?,
+        ),
+        None => None,
+    };
+
+    for (handled, incoming) in listener.incoming().enumerate() {
+        let stream = incoming?;
+        handle_sync_connection(&db, stream, auth_token.as_deref())?;
+        if command.max_requests.is_some_and(|max| handled + 1 >= max) {
+            break;
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+fn perform_sync_run_once(
+    db: &Db,
+    peer: &SyncPeer,
+    token: Option<&str>,
+    direction: SyncRunDirection,
+    limit: usize,
+) -> std::result::Result<SyncRunSummary, SyncRunFailure> {
+    let handshake = sync_http_get_handshake(&peer.endpoint, token).map_err(|error| {
+        SyncRunFailure::retryable(empty_sync_summary(peer, direction.clone()), error.message)
+    })?;
+
+    if handshake.protocol_version != 1 {
+        return Err(SyncRunFailure::fatal(
+            empty_sync_summary(peer, direction.clone()),
+            format!(
+                "sync protocol version mismatch: expected 1, got {}",
+                handshake.protocol_version
+            ),
+        ));
+    }
+    if !handshake
+        .capabilities
+        .iter()
+        .any(|capability| capability == SYNC_REQUIRED_CAPABILITY)
+    {
+        return Err(SyncRunFailure::fatal(
+            empty_sync_summary(peer, direction.clone()),
+            format!(
+                "peer '{}' does not advertise required capability '{}'",
+                peer.name, SYNC_REQUIRED_CAPABILITY
+            ),
+        ));
+    }
+
+    let mut summary = SyncRunSummary {
+        peer_name: peer.name.clone(),
+        direction: direction.clone(),
+        remote_replica_id: handshake.replica_id.clone(),
+        pushed: None,
+        pulled: None,
+        pushed_batch_id: None,
+        pulled_batch_id: None,
+        retry_count: 0,
+    };
+
+    match direction {
+        SyncRunDirection::Push => {
+            sync_run_push_phase(db, peer, token, limit, &mut summary).map_err(|error| {
+                SyncRunFailure::with_summary(summary.clone(), error.message, error.retryable)
+            })?;
+        }
+        SyncRunDirection::Pull => {
+            sync_run_pull_phase(db, peer, token, limit, &handshake, &mut summary).map_err(
+                |error| {
+                    SyncRunFailure::with_summary(summary.clone(), error.message, error.retryable)
+                },
+            )?;
+        }
+        SyncRunDirection::Both => {
+            sync_run_push_phase(db, peer, token, limit, &mut summary).map_err(|error| {
+                SyncRunFailure::with_summary(summary.clone(), error.message, error.retryable)
+            })?;
+            sync_run_pull_phase(db, peer, token, limit, &handshake, &mut summary).map_err(
+                |error| {
+                    SyncRunFailure::with_summary(summary.clone(), error.message, error.retryable)
+                },
+            )?;
+        }
+    }
+
+    Ok(summary)
+}
+
+fn sync_run_push_phase(
+    db: &Db,
+    peer: &SyncPeer,
+    token: Option<&str>,
+    limit: usize,
+    summary: &mut SyncRunSummary,
+) -> std::result::Result<(), SyncRunPhaseError> {
+    let since = db
+        .sync_peer_out_watermark(&peer.name)
+        .map_err(|error| SyncRunPhaseError::fatal(error.to_string()))?
+        .unwrap_or(0);
+    let batch = db
+        .sync_export_batch(since, limit)
+        .map_err(|error| SyncRunPhaseError::fatal(error.to_string()))?;
+    let remote_summary = sync_http_post_import(&peer.endpoint, token, &batch)
+        .map_err(|error| SyncRunPhaseError::new(error.message, error.retryable))?;
+    summary.pushed_batch_id = Some(batch.batch_id);
+    summary.pushed = Some(remote_summary);
+    if let Some(last_sequence) = batch.last_sequence {
+        if !batch.records.is_empty() {
+            db.sync_set_peer_out_watermark(&peer.name, last_sequence)
+                .map_err(|error| SyncRunPhaseError::fatal(error.to_string()))?;
+        }
+    }
+    Ok(())
+}
+
+fn sync_run_pull_phase(
+    db: &Db,
+    peer: &SyncPeer,
+    token: Option<&str>,
+    limit: usize,
+    handshake: &SyncHandshake,
+    summary: &mut SyncRunSummary,
+) -> std::result::Result<(), SyncRunPhaseError> {
+    let remote_replica_id = handshake.replica_id.as_deref().ok_or_else(|| {
+        SyncRunPhaseError::fatal("peer hello response is missing replica_id".to_string())
+    })?;
+    let since = db
+        .sync_peer_watermark(remote_replica_id)
+        .map_err(|error| SyncRunPhaseError::fatal(error.to_string()))?
+        .unwrap_or(0);
+    let batch = sync_http_get_changes(&peer.endpoint, token, since, limit)
+        .map_err(|error| SyncRunPhaseError::new(error.message, error.retryable))?;
+    let local_summary = db
+        .sync_import_batch(&batch)
+        .map_err(|error| SyncRunPhaseError::fatal(error.to_string()))?;
+    summary.pulled_batch_id = Some(batch.batch_id);
+    summary.pulled = Some(local_summary);
+    Ok(())
+}
+
+fn empty_sync_summary(peer: &SyncPeer, direction: SyncRunDirection) -> SyncRunSummary {
+    SyncRunSummary {
+        peer_name: peer.name.clone(),
+        direction,
+        remote_replica_id: None,
+        pushed: None,
+        pulled: None,
+        pushed_batch_id: None,
+        pulled_batch_id: None,
+        retry_count: 0,
+    }
+}
+
+fn print_sync_peer_output(format: OutputFormat, peer: &SyncPeer) -> Result<()> {
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(peer)?);
+        }
+        _ => {
+            let rows = vec![
+                ("name".to_string(), peer.name.clone()),
+                ("endpoint".to_string(), peer.endpoint.clone()),
+                (
+                    "token_env".to_string(),
+                    peer.token_env.clone().unwrap_or_else(|| "-".to_string()),
+                ),
+                (
+                    "created_at_micros".to_string(),
+                    peer.created_at_micros.to_string(),
+                ),
+                (
+                    "updated_at_micros".to_string(),
+                    peer.updated_at_micros.to_string(),
+                ),
+            ];
+            println!("{}", render_key_value_rows(format, &rows));
+        }
+    }
+    Ok(())
+}
+
+fn print_sync_peers_output(format: OutputFormat, peers: &[SyncPeer]) -> Result<()> {
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(peers)?);
+        }
+        _ => {
+            let rows = peers
+                .iter()
+                .map(|peer| {
+                    vec![
+                        peer.name.clone(),
+                        peer.endpoint.clone(),
+                        peer.token_env.clone().unwrap_or_else(|| "-".to_string()),
+                        peer.created_at_micros.to_string(),
+                        peer.updated_at_micros.to_string(),
+                    ]
+                })
+                .collect::<Vec<_>>();
+            let columns = vec![
+                "name".to_string(),
+                "endpoint".to_string(),
+                "token_env".to_string(),
+                "created_at_micros".to_string(),
+                "updated_at_micros".to_string(),
+            ];
+            println!("{}", render_rows(format, &columns, &rows, true));
+        }
+    }
+    Ok(())
+}
+
+fn print_sync_run_summary(format: OutputFormat, summary: &SyncRunSummary) -> Result<()> {
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(summary)?);
+        }
+        _ => {
+            let rows = vec![
+                ("peer_name".to_string(), summary.peer_name.clone()),
+                ("direction".to_string(), summary.direction.to_string()),
+                (
+                    "remote_replica_id".to_string(),
+                    summary
+                        .remote_replica_id
+                        .clone()
+                        .unwrap_or_else(|| "-".to_string()),
+                ),
+                ("retry_count".to_string(), summary.retry_count.to_string()),
+                (
+                    "pushed_batch_id".to_string(),
+                    summary
+                        .pushed_batch_id
+                        .clone()
+                        .unwrap_or_else(|| "-".to_string()),
+                ),
+                (
+                    "pulled_batch_id".to_string(),
+                    summary
+                        .pulled_batch_id
+                        .clone()
+                        .unwrap_or_else(|| "-".to_string()),
+                ),
+                (
+                    "pushed".to_string(),
+                    sync_import_summary_text(summary.pushed.as_ref()),
+                ),
+                (
+                    "pulled".to_string(),
+                    sync_import_summary_text(summary.pulled.as_ref()),
+                ),
+            ];
+            println!("{}", render_key_value_rows(format, &rows));
+        }
+    }
+    Ok(())
+}
+
+fn sync_import_summary_text(summary: Option<&SyncImportSummary>) -> String {
+    summary.map_or_else(
+        || "-".to_string(),
+        |summary| {
+            format!(
+                "seen={}, applied={}, skipped={}, conflicted={}",
+                summary.seen, summary.applied, summary.skipped, summary.conflicted
+            )
+        },
+    )
+}
+
+#[derive(Debug)]
+struct SyncRunPhaseError {
+    message: String,
+    retryable: bool,
+}
+
+impl SyncRunPhaseError {
+    fn new(message: String, retryable: bool) -> Self {
+        Self { message, retryable }
+    }
+
+    fn fatal(message: String) -> Self {
+        Self {
+            message,
+            retryable: false,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SyncRunFailure {
+    summary: SyncRunSummary,
+    message: String,
+    retryable: bool,
+}
+
+impl SyncRunFailure {
+    fn retryable(summary: SyncRunSummary, message: String) -> Self {
+        Self {
+            summary,
+            message,
+            retryable: true,
+        }
+    }
+
+    fn fatal(summary: SyncRunSummary, message: String) -> Self {
+        Self {
+            summary,
+            message,
+            retryable: false,
+        }
+    }
+
+    fn with_summary(summary: SyncRunSummary, message: String, retryable: bool) -> Self {
+        Self {
+            summary,
+            message,
+            retryable,
+        }
+    }
+}
+
+fn sync_retry_delay(attempt: usize) -> std::time::Duration {
+    let shift = attempt.saturating_sub(1).min(8) as u32;
+    std::time::Duration::from_millis(50u64.saturating_mul(1u64 << shift))
+}
+
+fn resolve_sync_peer_token(peer: &SyncPeer) -> Result<Option<String>> {
+    match peer.token_env.as_deref() {
+        Some(env_name) => {
+            let token = std::env::var(env_name).map_err(|_| {
+                anyhow!(
+                    "sync peer '{}' requires env var '{}' to be set",
+                    peer.name,
+                    env_name
+                )
+            })?;
+            Ok(Some(token))
+        }
+        None => Ok(None),
+    }
+}
+
+fn redact_sync_secret(message: &str, secret: Option<&str>) -> String {
+    match secret {
+        Some(secret) if !secret.is_empty() => message.replace(secret, "[redacted]"),
+        _ => message.to_string(),
+    }
+}
+
+fn sync_capabilities() -> Vec<String> {
+    vec![
+        "batch-envelope-v1".to_string(),
+        "manual-import-v1".to_string(),
+        "peer-watermarks-v1".to_string(),
+        "conflicts-v1".to_string(),
+    ]
+}
+
+const SYNC_REQUIRED_CAPABILITY: &str = "batch-envelope-v1";
+
+fn sync_hello_url(endpoint: &str) -> String {
+    format!("{}/decentdb/sync/v1/hello", endpoint.trim_end_matches('/'))
+}
+
+fn sync_changes_url(endpoint: &str, since: u64, limit: usize) -> String {
+    format!(
+        "{}/decentdb/sync/v1/changes?since={since}&limit={limit}",
+        endpoint.trim_end_matches('/')
+    )
+}
+
+fn sync_import_url(endpoint: &str) -> String {
+    format!("{}/decentdb/sync/v1/import", endpoint.trim_end_matches('/'))
+}
+
+fn sync_http_get_handshake(
+    endpoint: &str,
+    token: Option<&str>,
+) -> Result<SyncHandshake, SyncHttpError> {
+    let body = sync_http_get_text(&sync_hello_url(endpoint), token)?;
+    serde_json::from_str(&body)
+        .map_err(|error| SyncHttpError::fatal(format!("invalid hello response: {error}")))
+}
+
+fn sync_http_get_changes(
+    endpoint: &str,
+    token: Option<&str>,
+    since: u64,
+    limit: usize,
+) -> Result<SyncChangeBatch, SyncHttpError> {
+    let body = sync_http_get_text(&sync_changes_url(endpoint, since, limit), token)?;
+    serde_json::from_str(&body)
+        .map_err(|error| SyncHttpError::fatal(format!("invalid changes response: {error}")))
+}
+
+fn sync_http_post_import(
+    endpoint: &str,
+    token: Option<&str>,
+    batch: &SyncChangeBatch,
+) -> Result<SyncImportSummary, SyncHttpError> {
+    let body = sync_http_post_json(&sync_import_url(endpoint), token, batch)?;
+    serde_json::from_str(&body)
+        .map_err(|error| SyncHttpError::fatal(format!("invalid import response: {error}")))
+}
+
+#[allow(clippy::result_large_err)]
+fn sync_http_get_text(url: &str, token: Option<&str>) -> Result<String, SyncHttpError> {
+    sync_http_send(|| {
+        let mut request = ureq::get(url);
+        if let Some(token) = token {
+            request = request.set("Authorization", &format!("Bearer {token}"));
+        }
+        request.call()
+    })
+}
+
+#[allow(clippy::result_large_err)]
+fn sync_http_post_json<T: serde::Serialize>(
+    url: &str,
+    token: Option<&str>,
+    payload: &T,
+) -> Result<String, SyncHttpError> {
+    sync_http_send(|| {
+        let mut request = ureq::post(url);
+        if let Some(token) = token {
+            request = request.set("Authorization", &format!("Bearer {token}"));
+        }
+        request.send_json(payload)
+    })
+}
+
+#[allow(clippy::result_large_err)]
+fn sync_http_send<F>(send: F) -> Result<String, SyncHttpError>
+where
+    F: FnOnce() -> std::result::Result<ureq::Response, ureq::Error>,
+{
+    match send() {
+        Ok(response) => response.into_string().map_err(|error| {
+            SyncHttpError::retryable(format!("failed reading response body: {error}"))
+        }),
+        Err(ureq::Error::Status(code, response)) => {
+            let body = response.into_string().unwrap_or_default();
+            if (500..=599).contains(&code) {
+                Err(SyncHttpError::retryable(format!(
+                    "server returned {code}: {body}"
+                )))
+            } else if code == 401 || code == 403 {
+                Err(SyncHttpError::fatal(format!(
+                    "authentication failed with HTTP {code}"
+                )))
+            } else {
+                Err(SyncHttpError::fatal(format!(
+                    "server returned HTTP {code}: {body}"
+                )))
+            }
+        }
+        Err(ureq::Error::Transport(error)) => Err(SyncHttpError::retryable(format!(
+            "transport error: {error}"
+        ))),
+    }
+}
+
+#[derive(Debug)]
+struct SyncHttpError {
+    message: String,
+    retryable: bool,
+}
+
+impl SyncHttpError {
+    fn retryable(message: String) -> Self {
+        Self {
+            message,
+            retryable: true,
+        }
+    }
+
+    fn fatal(message: String) -> Self {
+        Self {
+            message,
+            retryable: false,
+        }
+    }
+}
+
+fn handle_sync_connection(db: &Db, stream: TcpStream, expected_token: Option<&str>) -> Result<()> {
+    let mut reader = BufReader::new(stream);
+    let mut request_line = String::new();
+    reader.read_line(&mut request_line)?;
+    if request_line.trim().is_empty() {
+        return Ok(());
+    }
+
+    let mut content_length = 0usize;
+    let mut authorization: Option<String> = None;
+    loop {
+        let mut line = String::new();
+        reader.read_line(&mut line)?;
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = trimmed.split_once(':') {
+            let name = name.trim().to_ascii_lowercase();
+            let value = value.trim().to_string();
+            if name == "content-length" {
+                content_length = value
+                    .parse::<usize>()
+                    .map_err(|_| anyhow!("invalid Content-Length header"))?;
+            } else if name == "authorization" {
+                authorization = Some(value);
+            }
+        }
+    }
+
+    let mut body = vec![0u8; content_length];
+    reader.read_exact(&mut body)?;
+    let mut stream = reader.into_inner();
+
+    let request_line = request_line.trim_end_matches(['\r', '\n']);
+    let mut parts = request_line.split_whitespace();
+    let method = parts
+        .next()
+        .ok_or_else(|| anyhow!("malformed request line"))?;
+    let target = parts
+        .next()
+        .ok_or_else(|| anyhow!("malformed request line"))?;
+    let _version = parts
+        .next()
+        .ok_or_else(|| anyhow!("malformed request line"))?;
+
+    if let Some(token) = expected_token {
+        let expected = format!("Bearer {token}");
+        if authorization.as_deref() != Some(expected.as_str()) {
+            return write_sync_json_response(
+                &mut stream,
+                401,
+                serde_json::json!({ "error": "unauthorized" }),
+            );
+        }
+    }
+
+    let (path, query) = split_request_target(target);
+    let response: Result<serde_json::Value> = match (method, path) {
+        ("GET", "/decentdb/sync/v1/hello") => {
+            let status = db.sync_status()?;
+            Ok(serde_json::json!(SyncHandshake {
+                protocol_version: 1,
+                engine_version: decentdb::version().to_string(),
+                replica_id: status.replica_id,
+                capabilities: sync_capabilities(),
+            }))
+        }
+        ("GET", "/decentdb/sync/v1/status") => Ok(serde_json::to_value(db.sync_status()?)?),
+        ("GET", "/decentdb/sync/v1/changes") => {
+            let since = parse_sync_query_param_u64(query, "since")?;
+            let limit = parse_sync_query_param_usize(query, "limit")?;
+            Ok(serde_json::to_value(db.sync_export_batch(since, limit)?)?)
+        }
+        ("POST", "/decentdb/sync/v1/import") => {
+            let batch: SyncChangeBatch = serde_json::from_slice(&body)
+                .map_err(|error| anyhow!("invalid sync batch payload: {error}"))?;
+            Ok(serde_json::to_value(db.sync_import_batch(&batch)?)?)
+        }
+        ("GET", "/decentdb/sync/v1/conflicts") => Ok(serde_json::to_value(db.sync_conflicts()?)?),
+        _ => {
+            return write_sync_json_response(
+                &mut stream,
+                404,
+                serde_json::json!({ "error": "not found" }),
+            );
+        }
+    };
+
+    match response {
+        Ok(body) => write_sync_json_response(&mut stream, 200, body),
+        Err(error) => write_sync_json_response(
+            &mut stream,
+            400,
+            serde_json::json!({ "error": error.to_string() }),
+        ),
+    }
+}
+
+fn write_sync_json_response(
+    stream: &mut TcpStream,
+    status: u16,
+    body: serde_json::Value,
+) -> Result<()> {
+    let body = serde_json::to_vec(&body)?;
+    let reason = match status {
+        200 => "OK",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        _ => "OK",
+    };
+    write!(
+        stream,
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )?;
+    stream.write_all(&body)?;
+    stream.flush()?;
+    Ok(())
+}
+
+fn split_request_target(target: &str) -> (&str, Option<&str>) {
+    match target.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (target, None),
+    }
+}
+
+fn parse_sync_query_param_u64(query: Option<&str>, key: &str) -> Result<u64> {
+    let query = query.ok_or_else(|| anyhow!("missing query string"))?;
+    for part in query.split('&') {
+        if let Some((name, value)) = part.split_once('=') {
+            if name == key {
+                return value
+                    .parse::<u64>()
+                    .map_err(|error| anyhow!("invalid {key} query parameter: {error}"));
+            }
+        }
+    }
+    Err(anyhow!("missing {key} query parameter"))
+}
+
+fn parse_sync_query_param_usize(query: Option<&str>, key: &str) -> Result<usize> {
+    let value = parse_sync_query_param_u64(query, key)?;
+    usize::try_from(value).map_err(|_| anyhow!("invalid {key} query parameter: value too large"))
 }
 
 fn parse_sync_batch_file(path: &Path) -> Result<SyncChangeBatch> {
@@ -1471,7 +2286,7 @@ fn completion_script(shell: ShellKind) -> &'static str {
     match shell {
         ShellKind::Bash => {
             r#"_decentdb_complete() {
-  local commands="version exec repl import export bulk-load checkpoint save-as info describe list-tables list-indexes list-views dump dump-header rebuild-index rebuild-indexes completion stats vacuum verify-header verify-index"
+  local commands="version exec repl import export bulk-load checkpoint save-as info describe list-tables list-indexes list-views dump dump-header rebuild-index rebuild-indexes completion stats vacuum verify-header verify-index sync"
   COMPREPLY=( $(compgen -W "$commands" -- "${COMP_WORDS[1]}") )
 }
 complete -F _decentdb_complete decentdb
@@ -1504,6 +2319,7 @@ _decentdb() {
     vacuum
     verify-header
     verify-index
+    sync
   )
   _describe 'command' commands
 }

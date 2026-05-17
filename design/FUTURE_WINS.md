@@ -58,7 +58,7 @@ than future roadmap claims:
 - Cost-based optimizer and `ANALYZE`
 - In-memory VFS for testing
 - Bulk-load API foundation
-- Local sync Slice 1 complete plus Slice 2 foundation: replica metadata, durable sidecar journal, SQL/CLI inspection, integrity checks, pending-change enumeration, manual export/import, and sync CLI
+- Local sync Slices 1-3 complete: durable journal capture, batch-envelope export/import, conflict inspection, peer catalog, session tracking, HTTP client transport, dev sync server, `sync run`, retry handling, and session inspection
 - Same-process shared WAL visibility
 - Mature C ABI and multi-language binding surface
 - Doctor/advisor v1 CLI, JSON, Markdown, and safe `--fix` surface
@@ -89,7 +89,7 @@ The remaining roadmap should support one clear lane:
 
 **Status:** `TODO`  
 **Future Version:** vNext  
-**Source of truth:** [`WIN01_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md`](WIN01_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md), ADR 0147
+**Source of truth:** [`WIN01_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md`](WIN01_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md), ADR 0147, ADR 0148
 
 ### Why This Is First
 
@@ -103,7 +103,7 @@ semantics as an engine capability.
 
 ### Completed Foundation
 
-Slice 1 is complete, and Slice 2 manual export/import sync is complete:
+Slices 1-3 are complete:
 
 - replica identity
 - sync enablement metadata
@@ -118,20 +118,23 @@ Slice 1 is complete, and Slice 2 manual export/import sync is complete:
 - conflict recording and inspection
 - peer watermarks and journal pruning
 - machine-readable sync CLI status, pending, and conflicts output
+- peer catalog and credential-reference metadata
+- HTTP sync client transport and sync-only dev server
+- handshake/capability checks, retry behavior, and session inspection
 
 ### Next Implementable Slice
 
-The next work should build on the durable local foundation by moving to the
-first real peer/session layer:
+The next work should move to scoped replication now that the peer/session and
+transport foundation exists:
 
-- HTTP transport and peer management
-- session metadata and resumable push/pull workflows
-- transport-level protocol negotiation and capability metadata
+- scoped sync and row filters
+- scope-to-peer bindings
+- capture/apply validation for scoped data
+- scoped sync diagnostics and tests
 
 ### Later Slices
 
-- manual exchange hardening beyond the Slice 2 batch-envelope foundation
-- scoped sync and row filters
+- manual exchange hardening beyond the Slice 3 transport foundation
 - conflict resolution workflows and policies
 - retention ergonomics, crash-hardened prune rewrites, and deeper sync doctor checks
 - SDK polish, beginning with .NET
