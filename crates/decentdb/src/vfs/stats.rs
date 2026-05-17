@@ -24,6 +24,7 @@ pub(crate) struct BenchVfsFileStats {
 pub(crate) struct BenchVfsStats {
     pub(crate) db: BenchVfsFileStats,
     pub(crate) wal: BenchVfsFileStats,
+    pub(crate) sync_journal: BenchVfsFileStats,
     pub(crate) open_create_like_calls: u64,
     pub(crate) file_exists_calls: u64,
     pub(crate) remove_file_calls: u64,
@@ -73,6 +74,7 @@ struct StatsState {
     enabled: AtomicBool,
     db: AtomicFileStats,
     wal: AtomicFileStats,
+    sync_journal: AtomicFileStats,
     open_create_like_calls: AtomicU64,
     file_exists_calls: AtomicU64,
     remove_file_calls: AtomicU64,
@@ -84,6 +86,7 @@ impl StatsState {
         match kind {
             FileKind::Database => &self.db,
             FileKind::Wal => &self.wal,
+            FileKind::SyncJournal => &self.sync_journal,
         }
     }
 
@@ -95,6 +98,7 @@ impl StatsState {
         BenchVfsStats {
             db: self.db.snapshot(),
             wal: self.wal.snapshot(),
+            sync_journal: self.sync_journal.snapshot(),
             open_create_like_calls: self.open_create_like_calls.load(Ordering::Acquire),
             file_exists_calls: self.file_exists_calls.load(Ordering::Acquire),
             remove_file_calls: self.remove_file_calls.load(Ordering::Acquire),

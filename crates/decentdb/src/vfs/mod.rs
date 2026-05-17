@@ -25,6 +25,7 @@ use self::stats::StatsVfs;
 pub(crate) enum FileKind {
     Database,
     Wal,
+    SyncJournal,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

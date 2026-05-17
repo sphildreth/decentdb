@@ -360,6 +360,7 @@ fn classify_read(kind: FileKind) -> &'static str {
     match kind {
         FileKind::Database => "db.read",
         FileKind::Wal => "wal.read",
+        FileKind::SyncJournal => "sync.read",
     }
 }
 
@@ -367,6 +368,7 @@ fn classify_sync(kind: FileKind) -> &'static str {
     match kind {
         FileKind::Database => "db.fsync",
         FileKind::Wal => "wal.fsync",
+        FileKind::SyncJournal => "sync.fsync",
     }
 }
 
@@ -374,6 +376,7 @@ fn classify_metadata_sync(kind: FileKind) -> &'static str {
     match kind {
         FileKind::Database => "db.sync_metadata",
         FileKind::Wal => "wal.sync_metadata",
+        FileKind::SyncJournal => "sync.sync_metadata",
     }
 }
 
@@ -387,6 +390,7 @@ fn classify_write(kind: FileKind, offset: u64, buf: &[u8]) -> &'static str {
             }
         }
         FileKind::Wal => classify_wal_write(offset, buf),
+        FileKind::SyncJournal => "sync.write",
     }
 }
 

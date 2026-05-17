@@ -1343,6 +1343,7 @@ pub(crate) struct EngineRuntime {
     manifest_template: Option<ManifestTemplate>,
     overflow_chain_caches: BTreeMap<String, OverflowChainCache>,
     manifest_chain_cache: Option<OverflowChainCache>,
+    pub(crate) sync_mutations: Vec<crate::sync::SyncMutation>,
 }
 
 #[derive(Debug)]
