@@ -1,6 +1,6 @@
 # Local-First Sync as a First-Class Capability
 
-**Status:** Active spec — Slice 1 complete and first Slice 2 manual export/import foundation implemented (2026-05-17); later slices remain TODO
+**Status:** Active spec — Slice 1 complete and Slice 2 complete (2026-05-17); later slices remain TODO
 **Project:** DecentDB  
 **Document Type:** Implementation SPEC  
 **Audience:** Core engine developers, storage/replication implementers, SDK maintainers, CLI maintainers, documentation authors, coding agents  
@@ -1160,19 +1160,24 @@ Implement local prerequisites for sync without networking yet.
 
 ### Status (2026-05-17)
 
-First Slice 2 foundation implemented:
+Slice 2 manual export/import sync is complete:
 
-- Manual JSONL export (DONE — `decentdb sync export --since <seq> --output <path>`)
-- Manual JSONL import (DONE — `decentdb sync import --input <path>`)
+- Manual batch-envelope export (DONE — `decentdb sync export --since <seq> --output <path>`)
+- Manual batch-envelope import (DONE — `decentdb sync import --input <path>`)
 - Conservative apply through existing SQL execution paths (DONE)
-- Idempotent remote sequence tracking (DONE — internal metadata markers)
+- Deterministic batch identity and replay-safe validation (DONE)
+- Idempotent remote sequence tracking and peer watermarks (DONE)
 - Local-replica self-import rejection (DONE)
 - Imported changes are not echoed into the local journal (DONE)
-- Malformed record, unsupported schema version, unknown table, schema mismatch,
-  and missing primary-key validation (DONE)
+- Malformed batch/record, unsupported protocol/schema version, unknown table,
+  schema mismatch, and missing primary-key validation (DONE)
+- Initial conflict recording and inspection (DONE — `Db::sync_conflicts`,
+  `SELECT * FROM sys_sync_conflicts`, `decentdb sync conflicts`)
+- Safe journal pruning gated by known peer watermarks (DONE — `decentdb sync prune`)
 - Journal integrity diagnostics (DONE — `decentdb sync doctor`)
-- Not yet done: conflict recording/inspection, explicit batch envelope identity,
-  retention/compaction, peer watermarks, and full protocol negotiation.
+
+Transport-level protocol negotiation, peer sessions, and crash-hardened
+maintenance ergonomics are future-slice work, not Slice 2 exit criteria.
 
 ### Objectives
 

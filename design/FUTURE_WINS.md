@@ -103,7 +103,7 @@ semantics as an engine capability.
 
 ### Completed Foundation
 
-Slice 1 is complete and the first Slice 2 foundations are implemented:
+Slice 1 is complete, and Slice 2 manual export/import sync is complete:
 
 - replica identity
 - sync enablement metadata
@@ -114,27 +114,26 @@ Slice 1 is complete and the first Slice 2 foundations are implemented:
 - SQL inspection views
 - sync journal integrity checks
 - restart/replay and sync journal fault-injection tests
-- manual JSONL export/import
-- idempotent remote sequence tracking
-- machine-readable sync CLI status and pending output
+- batch envelope export/import
+- conflict recording and inspection
+- peer watermarks and journal pruning
+- machine-readable sync CLI status, pending, and conflicts output
 
 ### Next Implementable Slice
 
-The next work should build on the durable local foundation rather than jumping
-straight to full networking:
+The next work should build on the durable local foundation by moving to the
+first real peer/session layer:
 
-- conflict recording and inspection for manual import
-- import/apply crash-safety tests
-- retention and compaction policy for the sync journal
-- protocol envelope/version negotiation for exchange files
+- HTTP transport and peer management
+- session metadata and resumable push/pull workflows
+- transport-level protocol negotiation and capability metadata
 
 ### Later Slices
 
-- manual exchange hardening beyond the Slice 2 JSONL foundation
-- HTTP transport and peer management
+- manual exchange hardening beyond the Slice 2 batch-envelope foundation
 - scoped sync and row filters
-- conflict inspection and resolution
-- retention management and deeper sync doctor checks
+- conflict resolution workflows and policies
+- retention ergonomics, crash-hardened prune rewrites, and deeper sync doctor checks
 - SDK polish, beginning with .NET
 
 ### Guardrails

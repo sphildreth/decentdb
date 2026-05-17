@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockWriteGuard, Weak};
+use std::time::SystemTime;
 
 #[cfg(feature = "bench-internals")]
 use crate::benchmark::{
@@ -41,7 +42,8 @@ use crate::storage::page::{self, PageId, PageStore};
 use crate::storage::{self, DatabaseHeader, PagerHandle};
 use crate::sync::SyncContext;
 use crate::sync::{
-    SyncImportSummary, SyncJournalIntegrityReport, SyncJournalRecord, SyncOperation, SyncStatus,
+    SyncChangeBatch, SyncConflict, SyncImportSummary, SyncJournalIntegrityReport,
+    SyncJournalRecord, SyncOperation, SyncStatus,
 };
 use crate::vfs::faulty::{self, FailAction, Failpoint};
 use crate::vfs::{is_memory_path, write_all_at, FileKind, OpenMode, VfsHandle};
@@ -5110,8 +5112,14 @@ impl Db {
         )
     }
 
-    pub fn sync_import_records(&self, records: &[SyncJournalRecord]) -> Result<SyncImportSummary> {
-        self.ensure_sync_metadata_table()?;
+    pub fn sync_export_batch(&self, since_seq: u64, limit: usize) -> Result<SyncChangeBatch> {
+        let records = self.sync_pending_changes(since_seq, limit)?;
+        SyncChangeBatch::from_records(records)
+    }
+
+    pub fn sync_import_batch(&self, batch: &SyncChangeBatch) -> Result<SyncImportSummary> {
+        batch.validate()?;
+        self.ensure_sync_tables()?;
 
         let runtime = self.runtime_for_metadata_inspection()?;
         let schema_cookie = runtime.catalog.schema_cookie;
@@ -5120,6 +5128,22 @@ impl Db {
             .sync_ctx
             .replica_id()
             .or_else(|| self.sync_read_metadata("replica_id").ok().flatten());
+        let batch_source_replica_id = batch.source_replica_id.as_deref();
+        let batch_last_sequence = batch.last_sequence;
+
+        if let Some(local_replica_id) = local_replica_id.as_deref() {
+            if batch_source_replica_id == Some(local_replica_id) {
+                return Err(DbError::sql(format!(
+                    "cannot import batch from same replica '{}'",
+                    local_replica_id
+                )));
+            }
+        }
+
+        let current_peer_watermark = match batch_source_replica_id {
+            Some(replica_id) => self.sync_peer_watermark(replica_id)?,
+            None => None,
+        };
 
         let _suppress_capture = self.inner.sync_ctx.suppress_capture();
 
@@ -5144,18 +5168,45 @@ impl Db {
             }
         }
 
+        if let Some(last_sequence) = batch_last_sequence {
+            if current_peer_watermark.is_some_and(|watermark| last_sequence <= watermark) {
+                if let Some(replica_id) = batch_source_replica_id {
+                    let watermark = current_peer_watermark
+                        .map_or(last_sequence, |current| current.max(last_sequence));
+                    self.sync_upsert_metadata(
+                        &peer_watermark_key(replica_id),
+                        &watermark.to_string(),
+                    )?;
+                }
+                return Ok(SyncImportSummary {
+                    seen: batch.record_count,
+                    applied: 0,
+                    skipped: batch.record_count,
+                    conflicted: 0,
+                });
+            }
+        }
+
         let tx = SyncImportTransaction::new(self)?;
 
         let mut applied = 0usize;
         let mut skipped = 0usize;
+        let mut conflicted = 0usize;
 
-        for record in records {
+        for record in &batch.records {
             if let Some(local_replica_id) = local_replica_id.as_deref() {
                 if record.replica_id == local_replica_id {
                     return Err(DbError::sql(format!(
                         "cannot import record from same replica '{}'",
                         local_replica_id
                     )));
+                }
+            }
+
+            if let Some(watermark) = current_peer_watermark {
+                if record.sequence <= watermark {
+                    skipped += 1;
+                    continue;
                 }
             }
 
@@ -5229,7 +5280,7 @@ impl Db {
                 }
             }
 
-            match operation {
+            let conflict_result = match operation {
                 SyncOperation::Insert => {
                     let after = match record.after.as_ref() {
                         Some(value) => value
@@ -5274,7 +5325,10 @@ impl Db {
                         set_columns.join(", "),
                         placeholders.join(", ")
                     );
-                    self.execute_with_params(&sql, &set_values)?;
+                    match self.execute_with_params(&sql, &set_values) {
+                        Ok(_) => Ok(None),
+                        Err(error) => Err(error),
+                    }
                 }
                 SyncOperation::Update => {
                     let after = match record.after.as_ref() {
@@ -5364,7 +5418,14 @@ impl Db {
                         set_clause,
                         where_parts.join(" AND ")
                     );
-                    self.execute_with_params(&sql, &params)?;
+                    match self.execute_with_params(&sql, &params) {
+                        Ok(result) if result.affected_rows() == 0 => Ok(Some((
+                            String::from("missing_target"),
+                            String::from("update affected no rows"),
+                        ))),
+                        Ok(_) => Ok(None),
+                        Err(error) => Err(error),
+                    }
                 }
                 SyncOperation::Delete => {
                     let mut where_parts = Vec::with_capacity(table.primary_key_columns.len());
@@ -5404,20 +5465,166 @@ impl Db {
                         sql_identifier(&table.name),
                         where_parts.join(" AND ")
                     );
-                    self.execute_with_params(&sql, &where_values)?;
+                    match self.execute_with_params(&sql, &where_values) {
+                        Ok(result) if result.affected_rows() == 0 => Ok(Some((
+                            String::from("missing_target"),
+                            String::from("delete affected no rows"),
+                        ))),
+                        Ok(_) => Ok(None),
+                        Err(error) => Err(error),
+                    }
+                }
+            };
+
+            match conflict_result {
+                Ok(Some((conflict_type, message))) => {
+                    self.record_sync_conflict(batch, record, &conflict_type, &message, None)?;
+                    conflicted += 1;
+                }
+                Ok(None) => {
+                    self.sync_upsert_metadata(&marker_key, "applied")?;
+                    applied += 1;
+                }
+                Err(error) if matches!(error, DbError::Constraint { .. }) => {
+                    self.record_sync_conflict(
+                        batch,
+                        record,
+                        "constraint_error",
+                        &error.to_string(),
+                        None,
+                    )?;
+                    conflicted += 1;
+                }
+                Err(error) => {
+                    self.record_sync_conflict(
+                        batch,
+                        record,
+                        "apply_error",
+                        &error.to_string(),
+                        None,
+                    )?;
+                    conflicted += 1;
                 }
             }
+        }
 
-            self.sync_upsert_metadata(&marker_key, "applied")?;
-            applied += 1;
+        if let (Some(replica_id), Some(last_sequence)) =
+            (batch_source_replica_id, batch_last_sequence)
+        {
+            let watermark =
+                current_peer_watermark.map_or(last_sequence, |current| current.max(last_sequence));
+            self.sync_upsert_metadata(&peer_watermark_key(replica_id), &watermark.to_string())?;
         }
 
         tx.commit()?;
+
         Ok(SyncImportSummary {
-            seen: records.len(),
+            seen: batch.record_count,
             applied,
             skipped,
+            conflicted,
         })
+    }
+
+    pub fn sync_import_records(&self, records: &[SyncJournalRecord]) -> Result<SyncImportSummary> {
+        let batch = SyncChangeBatch::from_records(records.to_vec())?;
+        self.sync_import_batch(&batch)
+    }
+
+    pub fn sync_peer_watermark(&self, replica_id: &str) -> Result<Option<u64>> {
+        match self.sync_read_metadata(&peer_watermark_key(replica_id))? {
+            Some(value) => value
+                .parse::<u64>()
+                .map(Some)
+                .map_err(|error| DbError::sql(format!("invalid peer watermark value: {error}"))),
+            None => Ok(None),
+        }
+    }
+
+    pub fn sync_conflicts(&self) -> Result<Vec<SyncConflict>> {
+        let sql = format!(
+            "SELECT * FROM {} WHERE resolved = 0 ORDER BY conflict_id",
+            crate::sync::CONFLICTS_TABLE
+        );
+        match self.execute(&sql) {
+            Ok(result) => result.rows().iter().map(sync_conflict_from_row).collect(),
+            Err(error) => {
+                let message = error.to_string();
+                if message.contains("no such table") || message.contains("unknown table") {
+                    Ok(Vec::new())
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    pub fn sync_prune_journal_through(&self, sequence: u64) -> Result<usize> {
+        let peer_watermarks = self.sync_peer_watermarks()?;
+        if let Some(lowest_peer_watermark) = peer_watermarks
+            .iter()
+            .map(|(_, watermark)| *watermark)
+            .min()
+        {
+            if sequence >= lowest_peer_watermark {
+                return Err(DbError::sql(format!(
+                    "cannot prune through {sequence}; lowest peer watermark is {lowest_peer_watermark}"
+                )));
+            }
+        }
+
+        let records = crate::sync::read_journal_records(
+            self.inner.sync_ctx.journal_path(),
+            &self.inner.vfs,
+            0,
+            usize::MAX,
+        )?;
+        if records.is_empty() {
+            return Ok(0);
+        }
+
+        let total = records.len();
+        let retained = records
+            .into_iter()
+            .filter(|record| record.sequence > sequence)
+            .collect::<Vec<_>>();
+        let pruned = total.saturating_sub(retained.len());
+        if pruned == 0 {
+            return Ok(0);
+        }
+
+        let mut buffer = Vec::new();
+        for record in &retained {
+            serde_json::to_writer(&mut buffer, record).map_err(|error| {
+                DbError::internal(format!("failed to serialize sync journal record: {error}"))
+            })?;
+            buffer.push(b'\n');
+        }
+
+        if self
+            .inner
+            .vfs
+            .file_exists(self.inner.sync_ctx.journal_path())?
+        {
+            let journal_file = self.inner.sync_ctx.journal_file_handle()?;
+            let journal_file = match journal_file {
+                Some(file) => file,
+                None => self.inner.vfs.open(
+                    self.inner.sync_ctx.journal_path(),
+                    OpenMode::OpenExisting,
+                    FileKind::SyncJournal,
+                )?,
+            };
+
+            journal_file.set_len(0)?;
+            write_all_at(journal_file.as_ref(), 0, &buffer)?;
+            journal_file.sync_data()?;
+            self.inner
+                .sync_ctx
+                .set_journal_write_offset(buffer.len() as u64)?;
+        }
+
+        Ok(pruned)
     }
 
     pub fn sync_set_enabled(&self, enabled: bool) -> Result<()> {
@@ -5447,6 +5654,7 @@ impl Db {
 
     fn ensure_sync_metadata_table(&self) -> Result<()> {
         let _ = self.execute(crate::sync::METADATA_TABLE_DDL)?;
+        let _ = self.execute(crate::sync::CONFLICTS_TABLE_DDL)?;
         Ok(())
     }
 
@@ -5487,6 +5695,135 @@ impl Db {
                 Err(e)
             }
         }
+    }
+
+    fn sync_metadata_entries(&self) -> Result<Vec<(String, String)>> {
+        let sql = format!("SELECT key, value FROM {}", crate::sync::METADATA_TABLE);
+        match self.execute(&sql) {
+            Ok(result) => result
+                .rows()
+                .iter()
+                .map(|row| {
+                    let key = row
+                        .values()
+                        .first()
+                        .and_then(|value| match value {
+                            Value::Text(text) => Some(text.clone()),
+                            _ => None,
+                        })
+                        .ok_or_else(|| DbError::corruption("malformed sync metadata row"))?;
+                    let value = row
+                        .values()
+                        .get(1)
+                        .and_then(|value| match value {
+                            Value::Text(text) => Some(text.clone()),
+                            _ => None,
+                        })
+                        .ok_or_else(|| DbError::corruption("malformed sync metadata row"))?;
+                    Ok((key, value))
+                })
+                .collect(),
+            Err(error) => {
+                let message = error.to_string();
+                if message.contains("no such table") || message.contains("unknown table") {
+                    Ok(Vec::new())
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    fn sync_peer_watermarks(&self) -> Result<Vec<(String, u64)>> {
+        self.sync_metadata_entries()?
+            .into_iter()
+            .filter_map(|(key, value)| {
+                key.strip_prefix("peer_watermark:")
+                    .map(|replica_id| (replica_id.to_string(), value))
+            })
+            .map(|(replica_id, value)| {
+                let watermark = value.parse::<u64>().map_err(|error| {
+                    DbError::sql(format!(
+                        "invalid peer watermark value for replica '{}': {}",
+                        replica_id, error
+                    ))
+                })?;
+                Ok((replica_id, watermark))
+            })
+            .collect()
+    }
+
+    fn record_sync_conflict(
+        &self,
+        batch: &SyncChangeBatch,
+        record: &SyncJournalRecord,
+        conflict_type: &str,
+        message: &str,
+        local_row_json: Option<serde_json::Value>,
+    ) -> Result<()> {
+        let conflict_id = self.next_sync_conflict_id()?;
+        let remote_sequence = i64::try_from(record.sequence).map_err(|_| {
+            DbError::internal("remote_sequence exceeds INT64 range for sync conflict")
+        })?;
+        let remote_record_json = serde_json::to_value(record).map_err(|error| {
+            DbError::internal(format!(
+                "failed to serialize sync record for conflict: {error}"
+            ))
+        })?;
+        let primary_key_json = serde_json::to_value(&record.primary_key).map_err(|error| {
+            DbError::internal(format!("failed to serialize sync primary key: {error}"))
+        })?;
+        let created_at_micros = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|duration| duration.as_micros() as i64)
+            .unwrap_or(0);
+        let local_row_json_text = local_row_json.map(|value| value.to_string());
+        let sql = format!(
+            "INSERT INTO {table} (conflict_id, batch_id, remote_replica_id, remote_sequence, table_name, operation, conflict_type, message, primary_key_json, remote_record_json, local_row_json, created_at_micros, resolved) VALUES ({conflict_id}, {batch_id}, {remote_replica_id}, {remote_sequence}, {table_name}, {operation}, {conflict_type}, {message}, {primary_key_json}, {remote_record_json}, {local_row_json}, {created_at_micros}, 0)",
+            table = crate::sync::CONFLICTS_TABLE,
+            conflict_id = conflict_id,
+            batch_id = sql_text_literal(&batch.batch_id),
+            remote_replica_id = sql_text_literal(&record.replica_id),
+            remote_sequence = remote_sequence,
+            table_name = sql_text_literal(&record.table),
+            operation = sql_text_literal(&record.operation),
+            conflict_type = sql_text_literal(conflict_type),
+            message = sql_text_literal(message),
+            primary_key_json = sql_text_literal(&primary_key_json.to_string()),
+            remote_record_json = sql_text_literal(&remote_record_json.to_string()),
+            local_row_json = local_row_json_text
+                .as_deref()
+                .map(sql_text_literal)
+                .unwrap_or_else(|| "NULL".to_string()),
+            created_at_micros = created_at_micros,
+        );
+        let _ = self.execute(&sql)?;
+        Ok(())
+    }
+
+    fn next_sync_conflict_id(&self) -> Result<i64> {
+        let sql = format!(
+            "SELECT COALESCE(MAX(conflict_id), 0) FROM {}",
+            crate::sync::CONFLICTS_TABLE
+        );
+        let result = self.execute(&sql)?;
+        let current = result
+            .rows()
+            .first()
+            .and_then(|row| row.values().first())
+            .and_then(|value| match value {
+                Value::Int64(value) => Some(*value),
+                Value::Bool(value) => Some(i64::from(*value)),
+                _ => None,
+            })
+            .ok_or_else(|| DbError::corruption("malformed sync conflict id counter"))?;
+        current
+            .checked_add(1)
+            .ok_or_else(|| DbError::internal("sync conflict_id counter overflow"))
+    }
+
+    fn ensure_sync_tables(&self) -> Result<()> {
+        self.ensure_sync_metadata_table()
     }
 
     fn load_sync_status_from_db(&self) -> Result<SyncStatus> {
@@ -5581,6 +5918,7 @@ impl Db {
             SyncInspectionQuery::Journal { since_sequence } => {
                 self.sync_journal_query_result(since_sequence).map(Some)
             }
+            SyncInspectionQuery::Conflicts => self.sync_conflicts_query_result().map(Some),
         }
     }
 
@@ -5638,6 +5976,41 @@ impl Db {
             ],
             rows,
         ))
+    }
+
+    fn sync_conflicts_query_result(&self) -> Result<QueryResult> {
+        let sql = format!(
+            "SELECT * FROM {} WHERE resolved = 0 ORDER BY conflict_id",
+            crate::sync::CONFLICTS_TABLE
+        );
+        match self.execute(&sql) {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                let message = error.to_string();
+                if message.contains("no such table") || message.contains("unknown table") {
+                    Ok(QueryResult::with_rows(
+                        vec![
+                            "conflict_id".to_string(),
+                            "batch_id".to_string(),
+                            "remote_replica_id".to_string(),
+                            "remote_sequence".to_string(),
+                            "table_name".to_string(),
+                            "operation".to_string(),
+                            "conflict_type".to_string(),
+                            "message".to_string(),
+                            "primary_key_json".to_string(),
+                            "remote_record_json".to_string(),
+                            "local_row_json".to_string(),
+                            "created_at_micros".to_string(),
+                            "resolved".to_string(),
+                        ],
+                        Vec::new(),
+                    ))
+                } else {
+                    Err(error)
+                }
+            }
+        }
     }
 
     pub(crate) fn sync_post_commit(
@@ -5716,6 +6089,7 @@ fn sync_read_metadata_from_runtime(runtime: &EngineRuntime, key: &str) -> Result
 enum SyncInspectionQuery {
     Status,
     Journal { since_sequence: u64 },
+    Conflicts,
 }
 
 impl SyncInspectionQuery {
@@ -5729,6 +6103,9 @@ impl SyncInspectionQuery {
             "select * from sys_sync_journal order by sequence asc" => {
                 Some(Self::Journal { since_sequence: 0 })
             }
+            "select * from sys_sync_conflicts" => Some(Self::Conflicts),
+            "select * from sys_sync_conflicts order by conflict_id" => Some(Self::Conflicts),
+            "select * from sys_sync_conflicts order by conflict_id asc" => Some(Self::Conflicts),
             _ => parse_sync_journal_where_sequence(normalized)
                 .map(|since_sequence| Self::Journal { since_sequence }),
         }
@@ -5755,6 +6132,145 @@ fn sync_u64_to_i64(value: u64, field_name: &str) -> Result<Value> {
     i64::try_from(value)
         .map(Value::Int64)
         .map_err(|_| DbError::internal(format!("{field_name} exceeds INT64 range")))
+}
+
+fn sync_conflict_from_row(row: &QueryRow) -> Result<SyncConflict> {
+    let values = row.values();
+    let conflict_id = match values.first() {
+        Some(Value::Int64(value)) => *value,
+        Some(Value::Bool(value)) => i64::from(*value),
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync conflict row: conflict_id",
+            ))
+        }
+    };
+    let batch_id = match values.get(1) {
+        Some(Value::Text(value)) => value.clone(),
+        _ => {
+            return Err(DbError::corruption("malformed sync conflict row: batch_id"));
+        }
+    };
+    let remote_replica_id = match values.get(2) {
+        Some(Value::Text(value)) => value.clone(),
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync conflict row: remote_replica_id",
+            ));
+        }
+    };
+    let remote_sequence = match values.get(3) {
+        Some(Value::Int64(value)) => *value,
+        Some(Value::Bool(value)) => i64::from(*value),
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync conflict row: remote_sequence",
+            ));
+        }
+    };
+    let table_name = match values.get(4) {
+        Some(Value::Text(value)) => value.clone(),
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync conflict row: table_name",
+            ));
+        }
+    };
+    let operation = match values.get(5) {
+        Some(Value::Text(value)) => value.clone(),
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync conflict row: operation",
+            ));
+        }
+    };
+    let conflict_type = match values.get(6) {
+        Some(Value::Text(value)) => value.clone(),
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync conflict row: conflict_type",
+            ));
+        }
+    };
+    let message = match values.get(7) {
+        Some(Value::Text(value)) => value.clone(),
+        _ => {
+            return Err(DbError::corruption("malformed sync conflict row: message"));
+        }
+    };
+    let primary_key_json = match values.get(8) {
+        Some(Value::Text(value)) => serde_json::from_str(value).map_err(|error| {
+            DbError::corruption(format!("malformed sync conflict primary_key_json: {error}"))
+        })?,
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync conflict row: primary_key_json",
+            ));
+        }
+    };
+    let remote_record_json = match values.get(9) {
+        Some(Value::Text(value)) => serde_json::from_str(value).map_err(|error| {
+            DbError::corruption(format!(
+                "malformed sync conflict remote_record_json: {error}"
+            ))
+        })?,
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync conflict row: remote_record_json",
+            ));
+        }
+    };
+    let local_row_json = match values.get(10) {
+        Some(Value::Null) | None => None,
+        Some(Value::Text(value)) => Some(serde_json::from_str(value).map_err(|error| {
+            DbError::corruption(format!("malformed sync conflict local_row_json: {error}"))
+        })?),
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync conflict row: local_row_json",
+            ));
+        }
+    };
+    let created_at_micros = match values.get(11) {
+        Some(Value::Int64(value)) => *value,
+        Some(Value::Bool(value)) => i64::from(*value),
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync conflict row: created_at_micros",
+            ));
+        }
+    };
+    let resolved = match values.get(12) {
+        Some(Value::Int64(value)) => *value != 0,
+        Some(Value::Bool(value)) => *value,
+        _ => {
+            return Err(DbError::corruption("malformed sync conflict row: resolved"));
+        }
+    };
+
+    Ok(SyncConflict {
+        conflict_id,
+        batch_id,
+        remote_replica_id,
+        remote_sequence,
+        table_name,
+        operation,
+        conflict_type,
+        message,
+        primary_key_json,
+        remote_record_json,
+        local_row_json,
+        created_at_micros,
+        resolved,
+    })
+}
+
+fn sql_text_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn peer_watermark_key(replica_id: &str) -> String {
+    format!("peer_watermark:{replica_id}")
 }
 
 fn imported_record_key(replica_id: &str, sequence: u64) -> String {

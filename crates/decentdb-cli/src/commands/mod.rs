@@ -7,8 +7,8 @@ use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use decentdb::{
     evict_shared_wal, render_markdown, run_doctor, BulkLoadOptions, Db, DbConfig, DoctorCategory,
     DoctorCheckSelection, DoctorIndexVerification, DoctorOptions, DoctorPathMode, DoctorReport,
-    DoctorSeverity, HeaderInfo, IndexVerification, QueryResult, StorageInfo, SyncJournalRecord,
-    TableInfo, Value,
+    DoctorSeverity, HeaderInfo, IndexVerification, QueryResult, StorageInfo, SyncChangeBatch,
+    SyncConflict, TableInfo, Value,
 };
 
 use crate::output::{
@@ -343,6 +343,10 @@ pub enum SyncCommand {
     Export(SyncExportCommand),
     /// Import sync records into the database
     Import(SyncImportCommand),
+    /// Inspect unresolved sync conflicts
+    Conflicts(SyncConflictsCommand),
+    /// Prune local sync journal records through a sequence
+    Prune(SyncPruneCommand),
 }
 
 #[derive(Clone, Debug, Parser)]
@@ -389,6 +393,22 @@ pub struct SyncImportCommand {
     pub db: String,
     #[arg(long)]
     pub input: PathBuf,
+}
+
+#[derive(Clone, Debug, Parser)]
+pub struct SyncConflictsCommand {
+    #[arg(long)]
+    pub db: String,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
+    pub format: OutputFormat,
+}
+
+#[derive(Clone, Debug, Parser)]
+pub struct SyncPruneCommand {
+    #[arg(long)]
+    pub db: String,
+    #[arg(long)]
+    pub through: u64,
 }
 
 #[derive(Clone, Debug, Parser)]
@@ -1097,12 +1117,34 @@ fn run_sync(command: SyncCommand) -> Result<()> {
         SyncCommand::Export(cmd) => run_sync_export(cmd),
         SyncCommand::Import(cmd) => {
             let db = open_db(&cmd.db, true, 0, 0)?;
-            let records = parse_sync_records_file(&cmd.input)?;
-            let summary = db.sync_import_records(&records)?;
+            let batch = parse_sync_batch_file(&cmd.input)?;
+            let summary = db.sync_import_batch(&batch)?;
             println!(
-                "seen={}, applied={}, skipped={}",
-                summary.seen, summary.applied, summary.skipped
+                "seen={}, applied={}, skipped={}, conflicted={}",
+                summary.seen, summary.applied, summary.skipped, summary.conflicted
             );
+            Ok(())
+        }
+        SyncCommand::Conflicts(cmd) => {
+            let db = open_db(&cmd.db, false, 0, 0)?;
+            let conflicts = db.sync_conflicts()?;
+            match cmd.format {
+                OutputFormat::Json => {
+                    println!("{}", serde_json::to_string_pretty(&conflicts)?);
+                }
+                OutputFormat::Table => {
+                    print_sync_conflicts_table(&conflicts);
+                }
+                _ => {
+                    return Err(anyhow!("sync conflicts supports only json or table output"));
+                }
+            }
+            Ok(())
+        }
+        SyncCommand::Prune(cmd) => {
+            let db = open_db(&cmd.db, false, 0, 0)?;
+            let pruned = db.sync_prune_journal_through(cmd.through)?;
+            println!("pruned={pruned}");
             Ok(())
         }
     }
@@ -1110,16 +1152,11 @@ fn run_sync(command: SyncCommand) -> Result<()> {
 
 fn run_sync_export(command: SyncExportCommand) -> Result<()> {
     let db = open_db(&command.db, false, 0, 0)?;
-    let records = db.sync_pending_changes(command.since, command.limit.unwrap_or(usize::MAX))?;
+    let batch = db.sync_export_batch(command.since, command.limit.unwrap_or(usize::MAX))?;
 
     match command.format {
         OutputFormat::Json => {
-            let mut output = String::new();
-            for record in records {
-                output.push_str(&serde_json::to_string(&record)?);
-                output.push('\n');
-            }
-            fs::write(&command.output, output)?;
+            fs::write(&command.output, serde_json::to_string_pretty(&batch)?)?;
             Ok(())
         }
         OutputFormat::Table => Err(anyhow!("sync export supports only json output")),
@@ -1127,20 +1164,54 @@ fn run_sync_export(command: SyncExportCommand) -> Result<()> {
     }
 }
 
-fn parse_sync_records_file(path: &Path) -> Result<Vec<SyncJournalRecord>> {
+fn parse_sync_batch_file(path: &Path) -> Result<SyncChangeBatch> {
     let content = fs::read_to_string(path)?;
-    let mut records = Vec::new();
-    for (line_index, raw_line) in content.lines().enumerate() {
-        let line = raw_line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let record = serde_json::from_str(line).map_err(|error| {
-            anyhow!("malformed sync record on line {}: {error}", line_index + 1)
-        })?;
-        records.push(record);
-    }
-    Ok(records)
+    serde_json::from_str(&content).map_err(|error| anyhow!("malformed sync batch: {error}"))
+}
+
+fn print_sync_conflicts_table(conflicts: &[SyncConflict]) {
+    let rows = conflicts
+        .iter()
+        .map(|conflict| {
+            vec![
+                conflict.conflict_id.to_string(),
+                conflict.batch_id.clone(),
+                conflict.remote_replica_id.clone(),
+                conflict.remote_sequence.to_string(),
+                conflict.table_name.clone(),
+                conflict.operation.clone(),
+                conflict.conflict_type.clone(),
+                conflict.message.clone(),
+                conflict.primary_key_json.to_string(),
+                conflict.remote_record_json.to_string(),
+                conflict
+                    .local_row_json
+                    .as_ref()
+                    .map_or_else(|| "-".to_string(), |value| value.to_string()),
+                conflict.created_at_micros.to_string(),
+                conflict.resolved.to_string(),
+            ]
+        })
+        .collect::<Vec<_>>();
+    let columns = vec![
+        "conflict_id".to_string(),
+        "batch_id".to_string(),
+        "remote_replica_id".to_string(),
+        "remote_sequence".to_string(),
+        "table_name".to_string(),
+        "operation".to_string(),
+        "conflict_type".to_string(),
+        "message".to_string(),
+        "primary_key_json".to_string(),
+        "remote_record_json".to_string(),
+        "local_row_json".to_string(),
+        "created_at_micros".to_string(),
+        "resolved".to_string(),
+    ];
+    println!(
+        "{}",
+        render_rows(OutputFormat::Table, &columns, &rows, true)
+    );
 }
 
 fn print_sync_integrity_report_table(report: &decentdb::SyncJournalIntegrityReport) {

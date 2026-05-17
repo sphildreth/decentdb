@@ -16,6 +16,10 @@ pub(crate) const METADATA_TABLE: &str = "__decentdb_sync_metadata";
 pub(crate) const METADATA_TABLE_DDL: &str =
     "CREATE TABLE IF NOT EXISTS __decentdb_sync_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)";
 
+pub(crate) const CONFLICTS_TABLE: &str = "__decentdb_sync_conflicts";
+
+pub(crate) const CONFLICTS_TABLE_DDL: &str = "CREATE TABLE IF NOT EXISTS __decentdb_sync_conflicts (conflict_id INT64 PRIMARY KEY, batch_id TEXT NOT NULL, remote_replica_id TEXT NOT NULL, remote_sequence INT64 NOT NULL, table_name TEXT NOT NULL, operation TEXT NOT NULL, conflict_type TEXT NOT NULL, message TEXT NOT NULL, primary_key_json TEXT NOT NULL, remote_record_json TEXT NOT NULL, local_row_json TEXT, created_at_micros INT64 NOT NULL, resolved INT64 NOT NULL)";
+
 pub(crate) fn is_internal_table_name(name: &str) -> bool {
     name.starts_with("__decentdb_")
 }
@@ -35,6 +39,178 @@ pub struct SyncJournalRecord {
     pub committed_at_micros: i64,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SyncChangeBatch {
+    pub protocol_version: u32,
+    pub batch_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_replica_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_sequence: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_sequence: Option<u64>,
+    pub record_count: usize,
+    #[serde(default)]
+    pub records: Vec<SyncJournalRecord>,
+}
+
+impl SyncChangeBatch {
+    const PROTOCOL_VERSION: u32 = 1;
+
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            protocol_version: Self::PROTOCOL_VERSION,
+            batch_id: "sync-batch:v1:empty:0:0:0".to_string(),
+            source_replica_id: None,
+            first_sequence: None,
+            last_sequence: None,
+            record_count: 0,
+            records: Vec::new(),
+        }
+    }
+
+    pub fn from_records(records: Vec<SyncJournalRecord>) -> Result<Self> {
+        if records.is_empty() {
+            return Ok(Self::empty());
+        }
+
+        let source_replica_id = Some(records[0].replica_id.clone());
+        let first_sequence = Some(records[0].sequence);
+        let last_sequence = Some(
+            records
+                .last()
+                .map(|record| record.sequence)
+                .unwrap_or(records[0].sequence),
+        );
+        let batch = Self {
+            protocol_version: Self::PROTOCOL_VERSION,
+            batch_id: Self::deterministic_batch_id(
+                source_replica_id.as_deref(),
+                first_sequence,
+                last_sequence,
+                records.len(),
+            ),
+            source_replica_id,
+            first_sequence,
+            last_sequence,
+            record_count: records.len(),
+            records,
+        };
+        batch.validate()?;
+        Ok(batch)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.protocol_version != Self::PROTOCOL_VERSION {
+            return Err(DbError::sql(format!(
+                "unsupported sync batch protocol version {}",
+                self.protocol_version
+            )));
+        }
+
+        if self.record_count != self.records.len() {
+            return Err(DbError::sql(format!(
+                "sync batch record_count {} does not match {} record(s)",
+                self.record_count,
+                self.records.len()
+            )));
+        }
+
+        if self.records.is_empty() {
+            if self.batch_id != "sync-batch:v1:empty:0:0:0" {
+                return Err(DbError::sql(format!(
+                    "sync batch_id mismatch for empty batch: expected sync-batch:v1:empty:0:0:0, got {}",
+                    self.batch_id
+                )));
+            }
+            if self.first_sequence.is_some() || self.last_sequence.is_some() {
+                return Err(DbError::sql(
+                    "empty sync batch must not declare sequence bounds",
+                ));
+            }
+            return Ok(());
+        }
+
+        let source_replica_id = self
+            .source_replica_id
+            .as_deref()
+            .ok_or_else(|| DbError::sql("non-empty sync batch must include source_replica_id"))?;
+        let first_sequence = self
+            .first_sequence
+            .ok_or_else(|| DbError::sql("non-empty sync batch must include first_sequence"))?;
+        let last_sequence = self
+            .last_sequence
+            .ok_or_else(|| DbError::sql("non-empty sync batch must include last_sequence"))?;
+        let expected_batch_id = Self::deterministic_batch_id(
+            Some(source_replica_id),
+            Some(first_sequence),
+            Some(last_sequence),
+            self.record_count,
+        );
+        if self.batch_id != expected_batch_id {
+            return Err(DbError::sql(format!(
+                "sync batch_id mismatch: expected {}, got {}",
+                expected_batch_id, self.batch_id
+            )));
+        }
+
+        if self.records.first().map(|record| record.sequence) != Some(first_sequence) {
+            return Err(DbError::sql(format!(
+                "sync batch first_sequence {} does not match first record sequence {}",
+                first_sequence,
+                self.records
+                    .first()
+                    .map(|record| record.sequence)
+                    .unwrap_or(0)
+            )));
+        }
+        if self.records.last().map(|record| record.sequence) != Some(last_sequence) {
+            return Err(DbError::sql(format!(
+                "sync batch last_sequence {} does not match last record sequence {}",
+                last_sequence,
+                self.records
+                    .last()
+                    .map(|record| record.sequence)
+                    .unwrap_or(0)
+            )));
+        }
+
+        for record in &self.records {
+            if record.replica_id != source_replica_id {
+                return Err(DbError::sql(format!(
+                    "mixed source_replica_id values in sync batch: expected {}, got {}",
+                    source_replica_id, record.replica_id
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn deterministic_batch_id(
+        source_replica_id: Option<&str>,
+        first_sequence: Option<u64>,
+        last_sequence: Option<u64>,
+        record_count: usize,
+    ) -> String {
+        match (
+            source_replica_id,
+            first_sequence,
+            last_sequence,
+            record_count,
+        ) {
+            (_, None, None, 0) => "sync-batch:v1:empty:0:0:0".to_string(),
+            (Some(source_replica_id), Some(first_sequence), Some(last_sequence), record_count) => {
+                format!(
+                    "sync-batch:v1:{source_replica_id}:{first_sequence}:{last_sequence}:{record_count}"
+                )
+            }
+            _ => "sync-batch:v1:empty:0:0:0".to_string(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct SyncStatus {
     pub enabled: bool,
@@ -42,6 +218,24 @@ pub struct SyncStatus {
     pub next_sequence: u64,
     pub journal_path: Option<String>,
     pub journal_size_bytes: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SyncConflict {
+    pub conflict_id: i64,
+    pub batch_id: String,
+    pub remote_replica_id: String,
+    pub remote_sequence: i64,
+    pub table_name: String,
+    pub operation: String,
+    pub conflict_type: String,
+    pub message: String,
+    pub primary_key_json: serde_json::Value,
+    pub remote_record_json: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_row_json: Option<serde_json::Value>,
+    pub created_at_micros: i64,
+    pub resolved: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, PartialOrd, Ord, Serialize)]
@@ -94,6 +288,7 @@ pub struct SyncImportSummary {
     pub seen: usize,
     pub applied: usize,
     pub skipped: usize,
+    pub conflicted: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -245,6 +440,22 @@ impl SyncContext {
 
     pub(crate) fn journal_size_bytes(&self) -> u64 {
         self.journal_write_offset.lock().map(|g| *g).unwrap_or(0)
+    }
+
+    pub(crate) fn journal_file_handle(&self) -> Result<Option<Arc<dyn VfsFile>>> {
+        let guard = self
+            .journal_file
+            .lock()
+            .map_err(|_| DbError::internal("sync journal lock poisoned"))?;
+        Ok(guard.as_ref().cloned())
+    }
+
+    pub(crate) fn set_journal_write_offset(&self, offset: u64) -> Result<()> {
+        *self
+            .journal_write_offset
+            .lock()
+            .map_err(|_| DbError::internal("sync journal offset lock poisoned"))? = offset;
+        Ok(())
     }
 
     pub(crate) fn flush_journal(&self, vfs: &VfsHandle, transaction_lsn: u64) -> Result<()> {
@@ -620,6 +831,7 @@ mod tests {
     use std::fs;
     use std::sync::{Mutex, OnceLock};
 
+    use super::{SyncChangeBatch, SyncJournalRecord};
     use crate::Db;
     use crate::SyncDoctorSeverity;
     use crate::Value;
@@ -644,6 +856,27 @@ mod tests {
         db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
             .unwrap();
         (dir, db)
+    }
+
+    fn users_sync_record(
+        seed: &SyncJournalRecord,
+        sequence: u64,
+        operation: &str,
+        primary_key: serde_json::Value,
+        after: Option<serde_json::Value>,
+    ) -> SyncJournalRecord {
+        SyncJournalRecord {
+            schema_version: seed.schema_version,
+            sequence,
+            replica_id: seed.replica_id.clone(),
+            transaction_lsn: sequence,
+            table: seed.table.clone(),
+            operation: operation.to_string(),
+            primary_key,
+            after,
+            schema_cookie: seed.schema_cookie,
+            committed_at_micros: sequence as i64,
+        }
     }
 
     #[test]
@@ -999,6 +1232,7 @@ mod tests {
         assert_eq!(summary.seen, 4);
         assert_eq!(summary.applied, 4);
         assert_eq!(summary.skipped, 0);
+        assert_eq!(summary.conflicted, 0);
 
         let rows = db_b
             .execute("SELECT id, name FROM users ORDER BY id")
@@ -1033,6 +1267,7 @@ mod tests {
         db_b.sync_init_replica("node-b").unwrap();
         let summary = db_b.sync_import_records(&records).unwrap();
         assert_eq!(summary.applied, 1);
+        assert_eq!(summary.conflicted, 0);
 
         let rows = db_b
             .execute("SELECT amount FROM money WHERE id = 1")
@@ -1061,6 +1296,7 @@ mod tests {
         assert_eq!(reimported.seen, 1);
         assert_eq!(reimported.applied, 0);
         assert_eq!(reimported.skipped, 1);
+        assert_eq!(reimported.conflicted, 0);
         let rows = db_b
             .execute("SELECT id, name FROM users ORDER BY id")
             .unwrap();
@@ -1068,6 +1304,196 @@ mod tests {
             rows.rows()[0].values(),
             &[Value::Int64(1), Value::Text("alice".to_string())]
         );
+    }
+
+    #[test]
+    fn sync_export_batch_has_deterministic_identity_and_validates_ranges() {
+        let (_dir, db) = temp_db();
+        db.sync_init_replica("node-a").unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
+        db.execute("INSERT INTO users VALUES (2, 'Bob')").unwrap();
+
+        let batch = db.sync_export_batch(0, 2).unwrap();
+        assert_eq!(batch.protocol_version, 1);
+        assert_eq!(batch.batch_id, "sync-batch:v1:node-a:1:2:2");
+        assert_eq!(batch.source_replica_id.as_deref(), Some("node-a"));
+        assert_eq!(batch.first_sequence, Some(1));
+        assert_eq!(batch.last_sequence, Some(2));
+        assert_eq!(batch.record_count, 2);
+        batch.validate().unwrap();
+
+        let mut bad_count = batch.clone();
+        bad_count.record_count = 3;
+        assert!(bad_count.validate().is_err());
+
+        let mut bad_source = batch.clone();
+        bad_source.source_replica_id = Some("node-b".to_string());
+        assert!(bad_source.validate().is_err());
+
+        let mut bad_range = batch.clone();
+        bad_range.first_sequence = Some(2);
+        assert!(bad_range.validate().is_err());
+    }
+
+    #[test]
+    fn sync_batches_exchange_bidirectionally_without_echo_and_advance_watermarks() {
+        let (_dir_a, db_a) = temp_db();
+        let (_dir_b, db_b) = temp_db();
+        db_a.sync_init_replica("node-a").unwrap();
+        db_b.sync_init_replica("node-b").unwrap();
+
+        db_a.execute("INSERT INTO users VALUES (1, 'alice')")
+            .unwrap();
+        let batch_a = db_a.sync_export_batch(0, 100).unwrap();
+        assert_eq!(batch_a.record_count, 1);
+        assert_eq!(batch_a.records[0].primary_key, serde_json::json!({"id": 1}));
+
+        let imported_a = db_b.sync_import_batch(&batch_a).unwrap();
+        assert_eq!(imported_a.applied, 1);
+        assert_eq!(imported_a.skipped, 0);
+        assert_eq!(imported_a.conflicted, 0);
+        assert_eq!(db_b.sync_peer_watermark("node-a").unwrap(), Some(1));
+
+        db_b.execute("INSERT INTO users VALUES (2, 'bob')").unwrap();
+        let batch_b = db_b.sync_export_batch(0, 100).unwrap();
+        assert_eq!(batch_b.record_count, 1);
+        assert_eq!(batch_b.source_replica_id.as_deref(), Some("node-b"));
+        assert_eq!(batch_b.records[0].primary_key, serde_json::json!({"id": 2}));
+
+        let imported_b = db_a.sync_import_batch(&batch_b).unwrap();
+        assert_eq!(imported_b.applied, 1);
+        assert_eq!(imported_b.skipped, 0);
+        assert_eq!(imported_b.conflicted, 0);
+        assert_eq!(db_a.sync_peer_watermark("node-b").unwrap(), Some(1));
+
+        let replay_a = db_b.sync_import_batch(&batch_a).unwrap();
+        assert_eq!(replay_a.seen, 1);
+        assert_eq!(replay_a.applied, 0);
+        assert_eq!(replay_a.skipped, 1);
+        assert_eq!(replay_a.conflicted, 0);
+
+        let replay_b = db_a.sync_import_batch(&batch_b).unwrap();
+        assert_eq!(replay_b.seen, 1);
+        assert_eq!(replay_b.applied, 0);
+        assert_eq!(replay_b.skipped, 1);
+        assert_eq!(replay_b.conflicted, 0);
+    }
+
+    #[test]
+    fn sync_import_conflicting_insert_records_visible_conflict() {
+        let (_dir_a, db_a) = temp_db();
+        let (_dir_b, db_b) = temp_db();
+        db_a.sync_init_replica("node-a").unwrap();
+        db_b.sync_init_replica("node-b").unwrap();
+
+        db_a.execute("INSERT INTO users VALUES (1, 'alice')")
+            .unwrap();
+        db_b.execute("INSERT INTO users VALUES (1, 'existing')")
+            .unwrap();
+
+        let batch = db_a.sync_export_batch(0, 10).unwrap();
+        let summary = db_b.sync_import_batch(&batch).unwrap();
+        assert_eq!(summary.seen, 1);
+        assert_eq!(summary.applied, 0);
+        assert_eq!(summary.skipped, 0);
+        assert_eq!(summary.conflicted, 1);
+
+        let conflicts = db_b.sync_conflicts().unwrap();
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].conflict_type, "constraint_error");
+        assert!(!conflicts[0].message.is_empty());
+    }
+
+    #[test]
+    fn sync_import_missing_target_records_conflict() {
+        let (_dir_src, db_src) = temp_db();
+        db_src.sync_init_replica("node-a").unwrap();
+        db_src
+            .execute("INSERT INTO users VALUES (99, 'seed')")
+            .unwrap();
+        let seed_record = db_src.sync_export_batch(0, 1).unwrap().records[0].clone();
+
+        let (_dir, db) = temp_db();
+        db.sync_init_replica("node-b").unwrap();
+
+        let batch = SyncChangeBatch {
+            protocol_version: 1,
+            batch_id: "sync-batch:v1:node-a:1:2:2".to_string(),
+            source_replica_id: Some("node-a".to_string()),
+            first_sequence: Some(1),
+            last_sequence: Some(2),
+            record_count: 2,
+            records: vec![
+                users_sync_record(
+                    &seed_record,
+                    1,
+                    "update",
+                    serde_json::json!({"id": 42}),
+                    Some(serde_json::json!({"id": 42, "name": "ghost"})),
+                ),
+                users_sync_record(
+                    &seed_record,
+                    2,
+                    "delete",
+                    serde_json::json!({"id": 43}),
+                    None,
+                ),
+            ],
+        };
+        batch.validate().unwrap();
+
+        let summary = db.sync_import_batch(&batch).unwrap();
+        assert_eq!(summary.seen, 2);
+        assert_eq!(summary.applied, 0);
+        assert_eq!(summary.skipped, 0);
+        assert_eq!(summary.conflicted, 2);
+
+        let conflicts = db.sync_conflicts().unwrap();
+        assert_eq!(conflicts.len(), 2);
+        assert!(conflicts
+            .iter()
+            .all(|conflict| conflict.conflict_type == "missing_target"));
+    }
+
+    #[test]
+    fn sync_prune_refuses_when_peer_watermark_is_too_low_and_succeeds_after_advancing() {
+        let (_dir_src, db_src) = temp_db();
+        let (_dir_dst, db_dst) = temp_db();
+        db_src.sync_init_replica("node-a").unwrap();
+        db_dst.sync_init_replica("node-b").unwrap();
+
+        for id in 1..=3 {
+            db_src
+                .execute(&format!("INSERT INTO users VALUES ({id}, 'src{id}')"))
+                .unwrap();
+        }
+        for id in 100..=102 {
+            db_dst
+                .execute(&format!("INSERT INTO users VALUES ({id}, 'dst{id}')"))
+                .unwrap();
+        }
+
+        let first_batch = db_src.sync_export_batch(0, 2).unwrap();
+        assert_eq!(first_batch.record_count, 2);
+        db_dst.sync_import_batch(&first_batch).unwrap();
+        assert_eq!(db_dst.sync_peer_watermark("node-a").unwrap(), Some(2));
+
+        let err = db_dst
+            .sync_prune_journal_through(2)
+            .expect_err("pruning through the watermark must be rejected");
+        assert!(err.to_string().contains("lowest peer watermark is 2"));
+
+        let second_batch = db_src.sync_export_batch(2, 1).unwrap();
+        assert_eq!(second_batch.record_count, 1);
+        db_dst.sync_import_batch(&second_batch).unwrap();
+        assert_eq!(db_dst.sync_peer_watermark("node-a").unwrap(), Some(3));
+
+        let pruned = db_dst.sync_prune_journal_through(2).unwrap();
+        assert_eq!(pruned, 2);
+
+        let remaining = db_dst.sync_pending_changes(0, 10).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].sequence, 3);
     }
 
     #[test]
@@ -1085,7 +1511,7 @@ mod tests {
             .expect_err("same-replica records must be rejected");
         assert!(err
             .to_string()
-            .contains("cannot import record from same replica"));
+            .contains("cannot import batch from same replica"));
     }
 
     #[test]

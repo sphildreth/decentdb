@@ -390,8 +390,19 @@ fn sync_export_import_and_doctor_commands_work() {
         &export_str,
     ]);
     let exported = fs::read_to_string(&export).expect("read sync export");
-    assert_eq!(exported.lines().count(), 3);
-    assert!(exported.contains("\"replica_id\":\"node-a\""));
+    let exported_json: serde_json::Value =
+        serde_json::from_str(&exported).expect("parse sync export batch");
+    assert_eq!(exported_json["protocol_version"], serde_json::json!(1));
+    assert_eq!(
+        exported_json["batch_id"],
+        serde_json::json!("sync-batch:v1:node-a:1:3:3")
+    );
+    assert_eq!(exported_json["record_count"], serde_json::json!(3));
+    assert_eq!(
+        exported_json["source_replica_id"],
+        serde_json::json!("node-a")
+    );
+    assert_eq!(exported_json["records"].as_array().unwrap().len(), 3);
 
     run(&[
         "exec",
@@ -417,7 +428,10 @@ fn sync_export_import_and_doctor_commands_work() {
         "--input",
         &export_str,
     ]);
-    assert_eq!(imported.trim(), "seen=3, applied=3, skipped=0");
+    assert_eq!(
+        imported.trim(),
+        "seen=3, applied=3, skipped=0, conflicted=0"
+    );
 
     let selected = run(&[
         "exec",
@@ -438,7 +452,10 @@ fn sync_export_import_and_doctor_commands_work() {
         "--input",
         &export_str,
     ]);
-    assert_eq!(reimported.trim(), "seen=3, applied=0, skipped=3");
+    assert_eq!(
+        reimported.trim(),
+        "seen=3, applied=0, skipped=3, conflicted=0"
+    );
 
     let pending = run(&["sync", "pending", "--db", &target_str, "--format", "json"]);
     assert_eq!(pending.trim(), "[]");
@@ -471,10 +488,96 @@ fn sync_import_rejects_malformed_jsonl() {
         &bad.display().to_string(),
     ]);
     assert_ne!(code, 0);
-    assert!(
-        stderr.contains("malformed sync record on line 1")
-            || stderr.contains("malformed sync record")
-    );
+    assert!(stderr.contains("malformed sync batch"));
+}
+
+#[test]
+fn sync_conflicts_command_displays_json_and_table() {
+    let dir = temp_dir();
+    let source = dir.join("sync_conflict_source.ddb");
+    let target = dir.join("sync_conflict_target.ddb");
+    let source_str = source.display().to_string();
+    let target_str = target.display().to_string();
+
+    run(&[
+        "exec",
+        "--db",
+        &source_str,
+        "--sql",
+        "CREATE TABLE users (id INT64 PRIMARY KEY, name TEXT)",
+        "--format",
+        "json",
+    ]);
+    run(&[
+        "sync",
+        "init",
+        "--db",
+        &source_str,
+        "--replica-id",
+        "node-a",
+    ]);
+    run(&[
+        "exec",
+        "--db",
+        &source_str,
+        "--sql",
+        "INSERT INTO users VALUES (1, 'Ada')",
+        "--format",
+        "json",
+    ]);
+    run(&[
+        "exec",
+        "--db",
+        &target_str,
+        "--sql",
+        "CREATE TABLE users (id INT64 PRIMARY KEY, name TEXT); \
+         INSERT INTO users VALUES (1, 'Existing')",
+        "--format",
+        "json",
+    ]);
+    run(&[
+        "sync",
+        "init",
+        "--db",
+        &target_str,
+        "--replica-id",
+        "node-b",
+    ]);
+
+    let export = dir.join("conflict_export.json");
+    run(&[
+        "sync",
+        "export",
+        "--db",
+        &source_str,
+        "--since",
+        "0",
+        "--output",
+        &export.display().to_string(),
+    ]);
+    run(&[
+        "sync",
+        "import",
+        "--db",
+        &target_str,
+        "--input",
+        &export.display().to_string(),
+    ]);
+
+    let conflicts_json = run(&["sync", "conflicts", "--db", &target_str, "--format", "json"]);
+    assert!(conflicts_json.contains("\"conflict_type\": \"constraint_error\""));
+    assert!(conflicts_json.contains("\"batch_id\": \"sync-batch:v1:node-a:1:1:1\""));
+
+    let conflicts_table = run(&[
+        "sync",
+        "conflicts",
+        "--db",
+        &target_str,
+        "--format",
+        "table",
+    ]);
+    assert!(conflicts_table.contains("constraint_error"));
+    assert!(conflicts_table.contains("sync-batch:v1:node-a:1:1:1"));
 }
 
 #[test]
