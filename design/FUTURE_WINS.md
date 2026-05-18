@@ -35,12 +35,12 @@ Future version values are planning buckets, not release commitments.
 | 12 | vNext+2 | BACKLOG | Cross-process WAL coordination | Needs ADR/spec | Useful for Electron, helper processes, and background sync workers |
 | 13 | vNext+3 | BACKLOG | JSONB binary storage | Needs ADR/spec | Better JSON performance, but less identity-defining after SQLite JSONB |
 | 14 | vNext+3 | TODO | Transparent data compression | Existing compression foundation; needs product spec | Storage/cache multiplier, especially for large overflow payloads |
-| 15 | vNext+3 | TODO | Bulk-load follow-ons | Existing bulk-load API | Extends shipped foundation into stronger import and ETL workflows |
+| 15 | vNext+3 | TODO | Bulk-load follow-ons and external file readers | Existing bulk-load API | Extends shipped foundation into stronger import, ETL, and query-external file workflows |
 | 16 | vNext+3 | BACKLOG | Non-blocking schema migration | Needs ADR/spec | Valuable for large evolving databases, but complex and not the clearest identity anchor |
 | 17 | Later | BACKLOG | Native vector / HNSW index | Needs ADR/spec | AI-era checkbox, useful but less unique |
 | 18 | Later | BACKLOG | Full-text search with BM25 ranking | Needs ADR/spec | Expected search capability; less distinctive because SQLite FTS is mature |
 | 19 | Later | BACKLOG | Transparent data encryption | Needs ADR/spec | Practical security feature, but weaker positioning than policy-aware data controls |
-| 20 | Later | BACKLOG | Advanced SQL compatibility surface | [`WIN04_ADVANCED_SQL_COMPATIBILITY_SURFACE.md`](WIN04_ADVANCED_SQL_COMPATIBILITY_SURFACE.md) | Useful adoption polish, but not an identity-level differentiator |
+| 20 | Later | BACKLOG | Advanced SQL compatibility and controlled extension surface | [`WIN04_ADVANCED_SQL_COMPATIBILITY_SURFACE.md`](WIN04_ADVANCED_SQL_COMPATIBILITY_SURFACE.md) | Useful adoption polish; controlled extension hooks cover common SQLite-extension workflows without arbitrary native loading |
 | 21 | Later | BACKLOG | WAL streaming replication | Needs ADR/spec | HA/read-scale story, but not the local-first differentiator |
 | 22 | Later | BACKLOG | Cloud-native object storage VFS | Needs ADR/spec | Interesting edge/serverless story, high complexity |
 
@@ -511,7 +511,7 @@ B+Tree traversal.
 - use established Rust compression crates rather than custom algorithms
 - expose user-facing SQL/configuration only after the storage contract is clear
 
-## 15. Bulk-Load Follow-Ons
+## 15. Bulk-Load Follow-Ons And External File Readers
 
 **Status:** `TODO`  
 **Future Version:** vNext+3  
@@ -526,11 +526,20 @@ DecentDB already ships a bulk-load API and CLI workflows.
 Build higher-level ingestion workflows:
 
 - `COPY`-style SQL or CLI import commands
+- read-only external file table functions such as `read_csv(...)` and
+  `read_json(...)`
 - CSV/JSON streaming readers for datasets larger than memory
 - sorted-input hints for index-friendly loading
 - better progress reporting
 - resumable import ergonomics
 - stronger benchmark coverage for ETL-style workloads
+
+### Guardrails
+
+- external file readers are explicit, read-only statement inputs
+- reuse the existing import/export and bulk-load parsing paths where possible
+- avoid a general virtual-table subsystem in this slice
+- keep path handling, error reporting, and resource cleanup testable from the CLI
 
 ## 16. Non-Blocking Schema Migration
 
@@ -602,6 +611,7 @@ SQLite FTS is mature, and FTS is increasingly expected rather than decisive.
 - BM25 ranking
 - phrase search
 - stemming/tokenization policy
+- optional fuzzy matching and spelling-suggestion helpers as a later slice
 - planner integration
 - standard SQL surface without virtual-table awkwardness
 
@@ -629,7 +639,7 @@ friction.
 Policy-aware SQL may subsume or extend this work, so encryption should be
 planned together with policy and audit requirements.
 
-## 20. Advanced SQL Compatibility Surface
+## 20. Advanced SQL Compatibility And Controlled Extension Surface
 
 **Status:** `BACKLOG`  
 **Future Version:** Later  
@@ -639,7 +649,9 @@ planned together with policy and audit requirements.
 
 DecentDB already has a broad practical SQL surface for an embedded engine. The
 remaining advanced compatibility work is useful for migrations, ORMs, power
-users, and PostgreSQL-adjacent application code.
+users, PostgreSQL-adjacent application code, and selected SQLite-extension
+workflows that should exist without adopting SQLite's arbitrary native extension
+loading model.
 
 ### Why It Is Not Higher
 
@@ -652,11 +664,25 @@ support, browser support, observability, and storage fundamentals.
 - schema-qualified object names
 - explicit sequence objects
 - materialized views
+- controlled host-defined scalar and table-valued functions
+- built-in table-valued helpers such as `generate_series(...)`
+- binding-friendly array parameter/table-valued input support for
+  `carray`-style use cases
+- built-in and host-defined collation hooks
 - user-defined functions and types
 - deferred constraints and exclusion constraints
 - covering-index execution for existing `INCLUDE (...)` metadata
 
 Full-text search and geospatial support are tracked as separate roadmap wins.
+
+### Guardrails
+
+- no arbitrary runtime `.load` support in the first extension surface
+- no unstable native plugin ABI before the C ABI and binding story are designed
+- host-defined functions must be scoped to a connection or explicit runtime
+  registration surface
+- table-valued function APIs must define ownership, lifetimes, cancellation, and
+  error propagation before implementation
 
 ## 21. WAL Streaming Replication
 
