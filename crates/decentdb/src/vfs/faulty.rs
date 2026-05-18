@@ -356,6 +356,12 @@ fn global_fault_state() -> Arc<FaultState> {
         .clone()
 }
 
+#[cfg(test)]
+pub(crate) fn test_failpoint_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
 fn classify_read(kind: FileKind) -> &'static str {
     match kind {
         FileKind::Database => "db.read",
@@ -456,7 +462,7 @@ fn is_combined_commit_write(buf: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
-    use std::sync::{Arc, Mutex, OnceLock};
+    use std::sync::Arc;
 
     use crate::vfs::{write_all_at, FileKind, OpenMode, Vfs};
     use crate::wal::delta::DELTA_FRAME_PAYLOAD_SIZE;
@@ -466,14 +472,9 @@ mod tests {
         clear_failpoints, failpoint_logs, install_failpoint, FailAction, Failpoint, FaultyVfs,
     };
 
-    fn test_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
-
     #[test]
     fn partial_write_and_dropped_sync_are_reproducible() {
-        let _guard = test_lock().lock().expect("test lock");
+        let _guard = super::test_failpoint_lock().lock().expect("test lock");
         clear_failpoints().expect("clear failpoints");
         install_failpoint(Failpoint {
             label: "db.write_page".to_string(),
@@ -520,7 +521,7 @@ mod tests {
 
     #[test]
     fn failpoint_hits_are_logged_in_order() {
-        let _guard = test_lock().lock().expect("test lock");
+        let _guard = super::test_failpoint_lock().lock().expect("test lock");
         clear_failpoints().expect("clear failpoints");
         install_failpoint(Failpoint {
             label: "db.read".to_string(),
@@ -563,7 +564,7 @@ mod tests {
 
     #[test]
     fn io_without_failpoints_does_not_accumulate_logs() {
-        let _guard = test_lock().lock().expect("test lock");
+        let _guard = super::test_failpoint_lock().lock().expect("test lock");
         clear_failpoints().expect("clear failpoints");
 
         let vfs = FaultyVfs::wrap(Arc::new(crate::vfs::mem::MemVfs::default()));
@@ -589,7 +590,7 @@ mod tests {
 
     #[test]
     fn classify_functions_return_expected_labels() {
-        let _guard = test_lock().lock().expect("test lock");
+        let _guard = super::test_failpoint_lock().lock().expect("test lock");
         // read/sync classifications
         assert_eq!(super::classify_read(FileKind::Database), "db.read");
         assert_eq!(super::classify_read(FileKind::Wal), "wal.read");
@@ -672,7 +673,7 @@ mod tests {
 
     #[test]
     fn failpoint_error_on_write_and_sync() {
-        let _guard = test_lock().lock().expect("test lock");
+        let _guard = super::test_failpoint_lock().lock().expect("test lock");
         clear_failpoints().expect("clear failpoints");
 
         // Inject a write error and verify write_at returns an error

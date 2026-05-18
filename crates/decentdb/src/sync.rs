@@ -1560,20 +1560,15 @@ pub(crate) fn inspect_journal_integrity(
 mod tests {
     use std::collections::HashSet;
     use std::fs;
-    use std::sync::{Mutex, OnceLock};
 
     use super::{
         SyncChangeBatch, SyncConflictPolicy, SyncImportSummary, SyncJournalRecord,
         SyncRunDirection, SyncRunSummary,
     };
+    use crate::vfs::faulty::test_failpoint_lock;
     use crate::Db;
     use crate::SyncDoctorSeverity;
     use crate::Value;
-
-    fn sync_failpoint_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
 
     struct FailpointReset;
 
@@ -1873,7 +1868,7 @@ mod tests {
     }
 
     fn sync_journal_failure_surfaces_error(label: &str, expect_empty_after_reopen: bool) {
-        let _guard = sync_failpoint_lock().lock().unwrap();
+        let _guard = test_failpoint_lock().lock().unwrap();
         let _reset = FailpointReset;
         Db::clear_failpoints().unwrap();
 

@@ -20,10 +20,10 @@ CIDR
 DATE
 TIME
 TIMESTAMPTZ
-DURATION
+INTERVAL
 ```
 
-These are the only type additions justified at this time. Types such as `EMAIL`, `URL`, `PHONE`, `JSON`, `SEMVER`, `MONEY`, `GEOPOINT`, `VECTOR`, `MACADDR`, `HOSTNAME`, and `DOMAIN` are **rejected** as `ColumnType` variants. Their validation and query value can be delivered through the existing `CHECK` constraint evaluator plus SQL functions, which is sufficient and avoids permanent type-system tax (see §2).
+These are the only type additions justified at this time. Types such as `EMAIL`, `URL`, `PHONE`, `JSON`, `SEMVER`, `MONEY`, `GEOPOINT`, `VECTOR`, `MACADDR`, `HOSTNAME`, and `DOMAIN` are **rejected** as `ColumnType` variants. When in doubt, DecentDB follows PostgreSQL semantics; deviations are documented with rationale. Their validation and query value can be delivered through the existing `CHECK` constraint evaluator plus SQL functions, which is sufficient and avoids permanent type-system tax (see §2).
 
 ---
 
@@ -52,14 +52,20 @@ Adding a `ColumnType` variant is a **permanent tax**. Every future type-related 
 | `DATE` | Yes (int32 days vs text) | Same | Yes | — | **Keep** |
 | `TIME` | Yes (int64 µs vs text) | Same | Yes | — | **Keep** |
 | `TIMESTAMPTZ` | Same as Timestamp | Same | Yes | — | **Keep** |
-| `DURATION` | Yes (int64 µs vs text) | Same | Yes | — | **Keep** |
+| `INTERVAL` | Yes (12-20 B vs text) | Same | Yes | Yes (months/days/µs) | **Keep** |
 | `EMAIL` | No (same as text) | Lexical = desired | Yes | No | **Reject** |
 | `URL` | No | Lexical = desired | Yes | No | **Reject** |
 | `PHONE` | Minor | Lexical = desired | Yes | No | **Reject** |
 | `SEMVER` | Minor (~5-10 B) | SemVer ≠ lexical | Yes | No | **Reject** |
 | `JSON` | No (text) | Lexical = desired | Yes | No | **Reject** |
+| `MONEY` | No (same as DECIMAL) | Same as DECIMAL | Yes | No | **Reject** |
+| `GEOPOINT` | Yes (16 B) | Same | Yes | No | **Reject** (use GEOMETRY) |
+| `VECTOR` | Minor | Specialized | Yes | Yes (dimensions) | **Reject** (future ADR) |
+| `MACADDR` | Yes (6/8 B vs 17 B) | Lexical = desired | Yes | Yes (v4/v6) | **Keep** (Phase 4) |
+| `HOSTNAME` | No | Lexical = desired | Yes | No | **Reject** |
+| `DOMAIN` | No | Lexical = desired | Yes | No | **Reject** |
 
-The four rejected types (`EMAIL`, `URL`, `PHONE`, `SEMVER`) provide schema introspection value but no storage or ordering win. Their value should be delivered as:
+The rejected types provide schema introspection value but no storage or ordering win (or, in the case of `GEOPOINT`, are subsumed by the existing `GEOMETRY` type; `VECTOR` may warrant a future ADR). Their value should be delivered as:
 
 ```sql
 -- Instead of EMAIL as a ColumnType variant:
@@ -120,7 +126,7 @@ The type system is a closed, compile-time enum with exhaustive match dispatch. T
 | `tooling.rs` | `value_kind()`, `c_value_tag()`, `column_type_from_name()`, `value_column_type()` | Add tooling entries |
 | `include/decentdb.h` | `ddb_value_tag_t` enum | Add C tag |
 
-This is ~18 modification sites per new type. The cost is non-trivial but bounded. The set of 7 types above is the smallest set that delivers meaningful technical advantages over `CHECK + functions`.
+This is ~18 modification sites per new type. The cost is non-trivial but bounded. The set of 8 types above is the smallest set that delivers meaningful technical advantages over `CHECK + functions`.
 
 ---
 
@@ -139,9 +145,11 @@ Row tags allocated:
 | 15 | `CIDR` |
 | 16 | `DATE` |
 | 17 | `TIME` |
-| 18 | `DURATION` |
+| 18 | `INTERVAL` |
 
-`TIMESTAMPTZ` reuses the existing `TAG_TIMESTAMP = 8` with distinct catalog semantics.
+`TIMESTAMPTZ` reuses the existing `TAG_TIMESTAMP = 8` with distinct catalog semantics. This is safe because `TIMESTAMPTZ` and `TIMESTAMP` have identical binary encoding (zigzag-varint i64 µs since epoch); the tag carries no type-identity information that differs between them. WAL replay does not need to distinguish them — both decode as `Value::TimestampMicros(i64)`. The distinction exists only at the catalog/DDL layer (input interpretation and display formatting).
+
+**ADR requirement:** This document reverses ADR 0114's decision to collapse `DATE` and `TIMESTAMP` into a single type. A formal ADR (To be numbered) should be created to record this reversal before implementation begins.
 
 ---
 
@@ -195,15 +203,16 @@ ENUM 'todo'      -- explicit literal (if parser supports typed literals)
 
 #### Ordering
 
-Declaration-order semantics deferred. Phase 1 supports equality and inequality only. `ORDER BY` on an enum column compares by label identifier, which reflects insertion/appending order (not reorderable declaration order). This is documented explicitly.
+Declaration-order semantics, matching PostgreSQL: `ORDER BY` on an enum column sorts by the order the labels were defined in the `CREATE TABLE` or `CREATE TYPE` statement. Internally, stable identifiers are assigned in definition order at DDL time, so identifier ordering matches declaration ordering for the initial label set. Labels appended later receive higher identifiers and sort after the original set. This is consistent with PostgreSQL's behavior.
 
 #### Functions
 
 ```sql
 enum_label(value)   → TEXT       -- label string for an enum value
 enum_id(value)      → INTEGER    -- stable identifier
-enum_valid(text)    → BOOLEAN    -- check if text is a valid label for this enum's column type
 ```
+
+`enum_valid(text)` is **not provided** as a standalone function because it lacks column-type context — a plain `TEXT` input cannot resolve which enum's label set to validate against. Instead, validation is enforced by the type system at INSERT/UPDATE time. If explicit runtime validation is needed, use `CHECK (value IN ('todo', 'doing', 'done'))` or a named-enum validator (deferred, requires `CREATE TYPE`).
 
 `enum_values('type_name')` requires named enum support and is deferred.
 
@@ -212,7 +221,7 @@ enum_valid(text)    → BOOLEAN    -- check if text is a valid label for this en
 | Operation | Supported? | Notes |
 |---|---|---|
 | Add label | Yes | New id assigned; existing rows unaffected |
-| Remove label | Yes, if no rows reference it | Validated at DDL time |
+| Remove label | Yes, if no rows reference it | Validated at DDL time via catalog check (constant-time for inline enums, requires row scan for large tables — implementation must document cost) |
 | Rename label | Yes | Updates catalog mapping; ids unchanged |
 | Reorder labels | No | Declaration order is not a storage property |
 
@@ -231,17 +240,17 @@ If any row contains a value not in the new enum's label set, the ALTER fails.
 Type name:            ENUM
 Aliases:              —
 Storage class:        Tagged u8/u16/varint label identifier
-Inline size:          1–N bytes (varint-bounded)
+Inline size:          1 byte (≤255 labels) / 2 bytes (≤65535 labels) / varint (larger)
 Overflow behavior:    N/A (fixed width per enum instance)
 Literal syntax:       Implicit string in typed column context
 Accepted inputs:      Strings matching a declared label (case-sensitive)
 Canonical format:     Label string
-Comparison:           Equality only (identifier-based); ordering deferred
+Comparison:           Declaration-order (identifier-based; initial labels assigned ids in definition order)
 Hash:                 Based on label identifier
 Index support:        B-tree (on identifier); expression indexes on enum_label()
 Casts from:           TEXT
 Casts to:             TEXT
-Functions:            enum_label(), enum_id(), enum_valid()
+Functions:            enum_label(), enum_id()
 Binding behavior:     Phase A: canonical string; Phase B+: typed adapter
 Migration:            ALTER COLUMN TYPE with USING
 Error codes:          E_TYPE_INVALID_ENUM_VALUE
@@ -267,6 +276,8 @@ Unified 16-byte representation with a family tag:
 - `family = 4`: IPv4 stored in the first 4 bytes of `address_bytes` (IPv4-mapped), remaining 12 bytes zeroed.
 - `family = 6`: IPv6 stored in all 16 bytes.
 
+Note: for comparison purposes, the IPv4-mapped representation (`::ffff:x.x.x.x`) is stored only in IPv6 columns. An IPv4-family value stores the address in the first 4 bytes and is distinct from the IPv6-mapped equivalent. See §5.2 Ordering for detail.
+
 Total payload: 17 bytes. An alternative compact encoding (tagged 4-byte IPv4, 16-byte IPv6) saves 13 bytes per IPv4 row but adds a branch to every encode/decode/compare path. Implementation should benchmark both before committing.
 
 #### SQL syntax
@@ -289,7 +300,9 @@ IPADDR '::1'
 
 #### Ordering
 
-Natural binary ordering: IPv4-mapped addresses compare correctly against IPv6 addresses when using the unified 16-byte representation. Family byte is the primary ordering key, so all IPv4 addresses sort before all IPv6 addresses.
+Binary ordering matching PostgreSQL's `inet` semantics: IPv4-mapped IPv6 addresses (`::ffff:x.x.x.x`) compare adjacent to their IPv4 counterpart. The family byte is **not** the primary sort key. Instead, the 16-byte address field is compared first; the family byte serves as a tiebreaker. This means `IPADDR '10.1.2.3'` and `IPADDR '::ffff:10.1.2.3'` are adjacent in index order (though not equal — they are distinct values of different families).
+
+This differs from a naive family-byte-first ordering, which would partition all IPv4 before all IPv6. DecentDB follows PostgreSQL's convention where cross-family comparison is meaningful and IPv4-mapped addresses sort near their IPv4 equivalent.
 
 #### Functions
 
@@ -313,7 +326,7 @@ Overflow behavior:    N/A (fixed width)
 Literal syntax:       IPADDR 'x.x.x.x' / IPADDR '::1'
 Accepted inputs:      IPv4 dotted-decimal, IPv6 colon-hex, IPv4-mapped IPv6
 Canonical format:     ip_to_text() output (consistent display)
-Comparison:           Binary ordering (family-byte primary, address bytes secondary)
+Comparison:           PostgreSQL-compatible (address bytes primary, family byte secondary; IPv4-mapped sort near IPv4)
 Hash:                 Based on full 17-byte representation
 Index support:        B-tree
 Casts from:           TEXT
@@ -372,7 +385,7 @@ cidr_network_address(cidr)     → IPADDR    -- base address with host bits zero
 cidr_broadcast_address(cidr)   → IPADDR    -- highest address in network
 ```
 
-No custom operators (`<<`, `<<=`) initially. All containment queries use function syntax.
+No custom operators (`<<`, `<<=`) initially. All containment queries use function syntax. Containment-optimized indexes (e.g., GIN-style prefix indexes) are deferred to a future type-specific index ADR.
 
 #### Per-type checklist
 
@@ -387,7 +400,7 @@ Accepted inputs:      Standard CIDR notation
 Canonical format:     network_address/prefix_length (host bits zeroed)
 Comparison:           Binary (family, prefix, then address)
 Hash:                 Based on full 18-byte representation
-Index support:        B-tree; containment indexes deferred
+Index support:        B-tree; containment indexes deferred (future GIN-style ADR)
 Casts from:           TEXT
 Casts to:             TEXT, IPADDR (to base address)
 Functions:            cidr_contains(), cidr_family(), cidr_prefix_length(), cidr_network_address(), cidr_broadcast_address()
@@ -409,7 +422,7 @@ ADR 0114 collapsed `DATE` and `TIMESTAMP` into a single `TIMESTAMP` ColumnType v
 
 #### Storage format
 
-Signed 32-bit integer: days since Unix epoch (1970-01-01). Encoded as zigzag varint.
+Signed 32-bit integer: days since Unix epoch (1970-01-01). Encoded as zigzag varint. Range: approximately ±5.88 million years (int32 bounds). Accepted input range matches PostgreSQL's practical range (0001-01-01 to 5874897-12-31). Values outside this range are rejected at parse time. Year 0 is not valid (proleptic Gregorian calendar, year 1 BCE is followed by year 1 CE).
 
 #### SQL syntax
 
@@ -486,7 +499,7 @@ A time-of-day value is not a timestamp. Business hours, schedules, recurring ala
 
 #### Storage format
 
-Signed 64-bit integer: microseconds since midnight (0–86,399,999,999 µs). Encoded as zigzag varint.
+Signed 64-bit integer: microseconds since midnight (0–86,399,999,999 µs). Encoded as zigzag varint. Leap seconds are not supported — `TIME` represents a time-of-day within a standard 86,400-second day. A value representing 23:59:60 is rejected at parse time.
 
 #### SQL syntax
 
