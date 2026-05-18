@@ -4,6 +4,48 @@ This document provides a comprehensive matrix of SQL features, comparing support
 
 > **See also:** [Comparison: DecentDB vs SQLite vs DuckDB](comparison.md) for a narrative discussion of design differences, trade-offs, and architecture.
 
+## Local-first sync and replication
+
+This section compares built-in database surfaces. SQLite, PostgreSQL, and
+DuckDB can all participate in application-designed synchronization systems, but
+DecentDB includes local-first sync as an engine feature with CLI, SQL
+inspection, and SDK surfaces.
+
+| Feature | DecentDB | SQLite | PostgreSQL | DuckDB |
+|---------|----------|--------|------------|--------|
+| Durable local change journal | ✅ (sidecar sync journal) | ⚠️ (session extension or triggers; app-managed) | ⚠️ (WAL/logical decoding; server-managed) | ❌ |
+| Replica identity | ✅ | ❌ | ⚠️ (server/publication identity concepts) | ❌ |
+| Peer catalog | ✅ | ❌ | ⚠️ (subscription catalogs; not embedded local-first peers) | ❌ |
+| Manual batch export/import | ✅ (`sync export` / `sync import`) | ⚠️ (changesets via optional extension) | ⚠️ (logical replication/dump tooling) | ❌ |
+| Scoped row replication | ✅ (named scopes with validated row filters) | ❌ | ⚠️ (publication filters; server replication) | ❌ |
+| Conflict recording and manual resolution | ✅ (`sync conflicts`, `sync conflict show/resolve/reopen`) | ❌ | ⚠️ (replication conflicts exist, but no embedded app conflict workflow) | ❌ |
+| Operational sync inspection | ✅ (`sys_sync_*` inspection queries) | ❌ | ⚠️ (system catalogs and monitoring views, server-oriented) | ❌ |
+| Sync doctor, retention, peer lag, prune | ✅ | ❌ | ⚠️ (separate server administration surfaces) | ❌ |
+| Local HTTP sync dev transport | ✅ (`sync run` / `sync serve`) | ❌ | ⚠️ (server replication protocols) | ❌ |
+| Typed .NET sync SDK | ✅ (`DecentDBSyncClient`) | ❌ | ❌ | ❌ |
+
+DecentDB sync is intentionally conservative by default: conflicts are recorded
+and inspectable instead of silently hidden behind global last-write-wins
+behavior.
+
+### Examples
+
+```bash
+decentdb sync status --db=app.ddb --format=table
+decentdb sync export --db=app.ddb --since=0 --limit=100 --output=changes.json
+decentdb sync import --db=peer.ddb --input=changes.json
+decentdb sync conflicts --db=peer.ddb --format=table
+```
+
+```sql
+SELECT * FROM sys_sync_status;
+SELECT * FROM sys_sync_journal WHERE sequence > 100 ORDER BY sequence;
+SELECT * FROM sys_sync_conflicts ORDER BY conflict_id;
+SELECT * FROM sys_sync_doctor;
+```
+
+See [Local-first sync](sync/index.md) for the full guide.
+
 ## DDL (Data Definition Language)
 
 | Feature | DecentDB | SQLite | PostgreSQL | DuckDB |

@@ -649,15 +649,12 @@ operational foundations.
 
 ## Near-Term Sequence
 
-1. Implement local-first sync Slice 0/1: ADRs, replica identity, durable local
-   journal, tombstones, and pending-change inspection.
-2. Write the branch/diff/restore/time-travel ADR/spec.
-3. Continue schema-first SDK generation through Decent Bench while keeping
+1. Write the branch/diff/restore/time-travel ADR/spec.
+2. Continue schema-first SDK generation through Decent Bench while keeping
    DecentDB metadata authoritative.
-4. Extend doctor into `sys.*`/advisor surfaces after the first sync and branch
-   metadata exists.
-5. Start WASM only after the sync foundation has a clear browser-facing story
-   and the parser/durability gates are accepted.
+3. Extend doctor into `sys.*`/advisor surfaces after branch metadata exists.
+4. Start WASM only after the browser-facing parser/durability gates are
+   accepted.
 
 ## Market Notes
 
