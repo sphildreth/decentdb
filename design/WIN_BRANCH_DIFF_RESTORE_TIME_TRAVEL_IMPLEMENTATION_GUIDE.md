@@ -3,7 +3,7 @@
 **Date:** 2026-05-18
 **Status:** Proposed
 **Audience:** Core engine developers, pager/WAL/checkpoint maintainers, SQL planner/executor maintainers, CLI maintainers, binding maintainers, documentation authors, coding agents
-**Related roadmap item:** `1. Branch, diff, restore, and time-travel workflows` in `design/FUTURE_WINS.md`
+**Related roadmap item:** Branch, diff, restore, and time-travel workflows in `design/FUTURE_WINS.md`
 **Related documents:** `design/PRD.md`, `design/SPEC.md`, `design/TESTING_STRATEGY.md`, `design/adr/0003-snapshot-lsn-atomicity.md`, `design/adr/0019-wal-retention-for-active-readers.md`, `design/adr/0136-chunked-row-storage-for-coarse-grained-cow.md`, `design/adr/0147-local-sync-journal-foundation.md`
 
 ---

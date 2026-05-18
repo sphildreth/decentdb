@@ -60,7 +60,7 @@ occur.
 
 ## References
 
-- `design/WIN01_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md`
+- `design/WIN_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md`
 - `design/FUTURE_WINS.md`
 - `crates/decentdb/src/sync.rs`
 - `crates/decentdb/src/db.rs`

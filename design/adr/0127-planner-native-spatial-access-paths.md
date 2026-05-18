@@ -106,7 +106,7 @@ project.
 
 ## References
 
-- `design/WIN03_GEOSPATIAL_DATA_SUPPORT.md`
+- `design/WIN_GEOSPATIAL_DATA_SUPPORT.md`
 - `design/adr/0112-cost-based-optimizer-with-stats.md`
 - `design/adr/0128-true-3d-semantics-and-3d-aware-indexing.md`
 - DuckDB spatial join discussion:

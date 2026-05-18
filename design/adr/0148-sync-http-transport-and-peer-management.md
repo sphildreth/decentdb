@@ -70,7 +70,7 @@ database HTTP server.
 
 ## References
 
-- `design/WIN01_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md`
+- `design/WIN_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md`
 - `design/FUTURE_WINS.md`
 - `design/adr/0147-local-sync-journal-foundation.md`
 - `crates/decentdb/src/sync.rs`

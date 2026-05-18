@@ -6,7 +6,8 @@
   primitives, ABI/binding guarantees, and any low-level metadata export needed by
   Decent Bench.
 - **Audience:** Core DecentDB maintainers, Decent Bench maintainers, SDK/codegen contributors, documentation contributors, coding agents
-- **Related roadmap item:** `3. Schema-First, Strongly-Typed SDK Generation`
+- **Related roadmap item:** Schema-first strongly typed SDK generation in
+  [`FUTURE_WINS.md`](FUTURE_WINS.md)
 - **Suggested ADRs:**
   - ADR: Decent Bench owns schema-first SDK generation workflow
   - ADR: Canonical schema metadata model and intermediate representation (IR)

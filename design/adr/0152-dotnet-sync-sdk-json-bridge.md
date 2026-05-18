@@ -57,7 +57,7 @@ would make SDK integration harder to reason about, slower, and less portable.
 
 ## References
 
-- `design/WIN01_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md`
+- `design/WIN_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md`
 - `design/FUTURE_WINS.md`
 - `crates/decentdb/src/c_api.rs`
 - `crates/decentdb/src/db.rs`

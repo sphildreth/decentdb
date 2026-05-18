@@ -2,7 +2,7 @@
 **Date:** 2026-03-28  
 **Status:** Proposed  
 **Audience:** Core engine developers, parser/planner/executor maintainers, storage/indexing implementers, C ABI maintainers, binding maintainers, CLI maintainers, documentation authors, coding agents  
-**Related roadmap item:** `7. Native Geospatial Data Support`  
+**Related roadmap item:** Native geospatial types and spatial indexes in [`FUTURE_WINS.md`](FUTURE_WINS.md)  
 **Related vision documents:** `design/FUTURE_WINS.md`, `design/PRD.md`, `design/TESTING_STRATEGY.md`, `docs/design/spec.md`
 **Related ADR drafts:** `design/adr/0124-geospatial-type-system-and-ewkb-storage.md`, `design/adr/0125-spatial-covering-cell-secondary-index.md`, `design/adr/0126-geospatial-c-abi-contract.md`, `design/adr/0127-planner-native-spatial-access-paths.md`, `design/adr/0128-true-3d-semantics-and-3d-aware-indexing.md`
 

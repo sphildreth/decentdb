@@ -5,7 +5,7 @@
 ## Context
 
 DecentDB needs first-class local-first sync support as defined in
-`design/WIN01_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md`. Before peer networking,
+`design/WIN_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md`. Before peer networking,
 import/export apply, scoped sync, conflict resolution, or branch/merge can be
 built, the engine must have a durable local changeset capture mechanism. Every
 committed INSERT, UPDATE, or DELETE on a persistent user table must produce a
@@ -154,7 +154,7 @@ When sync is disabled, the commit path incurs exactly **one cheap branch**
 
 ## References
 
-- `design/WIN01_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md` — full sync spec
+- `design/WIN_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md` — full sync spec
 - `design/adr/0147-local-sync-journal-foundation.md` — this document
 - `crates/decentdb/src/sync.rs` — implementation
 - `crates/decentdb/src/vfs/mod.rs` — `FileKind` enum

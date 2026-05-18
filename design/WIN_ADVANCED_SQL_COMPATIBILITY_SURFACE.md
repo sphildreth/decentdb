@@ -1,8 +1,8 @@
-# WIN04: Advanced SQL Compatibility Surface
+# Advanced SQL Compatibility Surface
 
 **Document Status:** Backlog / spec seed  
 **Future Version:** Later  
-**Roadmap:** [`FUTURE_WINS.md`](FUTURE_WINS.md), Priority 20  
+**Roadmap:** [`FUTURE_WINS.md`](FUTURE_WINS.md)  
 **Purpose:** Capture advanced SQL compatibility work that improves adoption and migration ergonomics without turning DecentDB into a PostgreSQL clone.
 
 ## Positioning
@@ -13,7 +13,7 @@ expression indexes, `RETURNING`, `INSERT ... ON CONFLICT`, rich scalar types,
 JSON functions, views, triggers, and broader raw `ALTER TABLE` coverage than
 SQLite in several areas.
 
-WIN04 is the remaining advanced compatibility backlog. It should help ORMs,
+This is the remaining advanced compatibility backlog. It should help ORMs,
 application migrations, PostgreSQL-adjacent SQL, and power users, but it should
 not displace the higher-priority product identity work around local-first sync,
 branchable data workflows, browser support, observability, and storage
@@ -26,13 +26,13 @@ fundamentals.
 - Require an ADR before changing catalog ownership, file format semantics,
   planner contracts, C ABI behavior, or transaction/constraint timing.
 - Keep role/user security, remote authorization, and server-style access control
-  out of WIN04 unless the product model changes.
+  out of this track unless the product model changes.
 - Treat full-text search and geospatial work as separate roadmap wins, not as
-  sub-slices of WIN04.
+  sub-slices of this track.
 
 ## Slice Order
 
-| WIN04 Priority | Implementation State | Slice | First Useful Deliverable |
+| Track Priority | Implementation State | Slice | First Useful Deliverable |
 |---:|---|---|---|
 | 1 | Not Started | Schema-qualified namespaces | Qualified object names such as `app.users` in DDL and DML |
 | 2 | Not Started | Explicit sequence objects | `CREATE SEQUENCE`, `NEXTVAL`, `CURRVAL`, and sequence-backed defaults |
@@ -46,7 +46,7 @@ fundamentals.
 ## Moved Out Of This Track
 
 - Full-text search with BM25 ranking is tracked in [`FUTURE_WINS.md`](FUTURE_WINS.md) as its own roadmap item.
-- Native geospatial types and spatial indexes are tracked in [`WIN03_GEOSPATIAL_DATA_SUPPORT.md`](WIN03_GEOSPATIAL_DATA_SUPPORT.md) and ADR 0124 through ADR 0128.
+- Native geospatial types and spatial indexes are tracked in [`WIN_GEOSPATIAL_DATA_SUPPORT.md`](WIN_GEOSPATIAL_DATA_SUPPORT.md) and ADR 0124 through ADR 0128.
 - Access control, `GRANT`, and `REVOKE` belong with policy-aware embedded SQL only if DecentDB later adds a product-level role or policy model.
 
 ## 1. Schema-Qualified Namespaces
@@ -262,7 +262,7 @@ There is no row-level exclusion constraint surface similar to PostgreSQL
 
 ## Definition Of Done
 
-A WIN04 slice is complete only when all of the following are true:
+A slice in this track is complete only when all of the following are true:
 
 1. Parser, normalization, planner, and executor behavior are coherent for the
    supported surface.

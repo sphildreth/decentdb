@@ -21,10 +21,10 @@ Future version values are planning buckets, not release commitments.
 
 | Priority | Future Version | Status | Feature | Current Source Of Truth | Why This Rank |
 |---:|---|---|---|---|---|
-| 1 | vNext | TODO | Branch, diff, restore, and time-travel workflows | [`WIN05_BRANCH_DIFF_RESTORE_TIME_TRAVEL_IMPLEMENTATION_GUIDE.md`](WIN05_BRANCH_DIFF_RESTORE_TIME_TRAVEL_IMPLEMENTATION_GUIDE.md) | Memorable workflow for agents, test environments, migration rehearsal, and support |
-| 2 | vNext | TODO | Native geospatial types and spatial indexes | [`WIN03_GEOSPATIAL_DATA_SUPPORT.md`](WIN03_GEOSPATIAL_DATA_SUPPORT.md), ADR 0124-0128 | Strong local-first wedge for mobile, field service, logistics, IoT, and offline map workflows |
-| 3 | vNext | TODO | Schema-first strongly typed SDK generation | [`WIN02_SCHEMA_FIRST_STRONGLY_TYPED_SDK_GENERATION_SPEC.md`](WIN02_SCHEMA_FIRST_STRONGLY_TYPED_SDK_GENERATION_SPEC.md), ADR 0116, ADR 0129 | Adoption accelerator across languages; DecentDB metadata foundation exists |
-| 4 | vNext+1 | TODO | WASM and browser OPFS support | [`WIN03_WASM_SUPPORT_IMPLEMENTATION.md`](WIN03_WASM_SUPPORT_IMPLEMENTATION.md) | Essential enabler for browser local-first apps, especially with sync, typed SDKs, and geospatial data |
+| 1 | vNext | TODO | Branch, diff, restore, and time-travel workflows | [`WIN_BRANCH_DIFF_RESTORE_TIME_TRAVEL_IMPLEMENTATION_GUIDE.md`](WIN_BRANCH_DIFF_RESTORE_TIME_TRAVEL_IMPLEMENTATION_GUIDE.md) | Memorable workflow for agents, test environments, migration rehearsal, and support |
+| 2 | vNext | TODO | Native geospatial types and spatial indexes | [`WIN_GEOSPATIAL_DATA_SUPPORT.md`](WIN_GEOSPATIAL_DATA_SUPPORT.md), ADR 0124-0128 | Strong local-first wedge for mobile, field service, logistics, IoT, and offline map workflows |
+| 3 | vNext | TODO | Schema-first strongly typed SDK generation | [`WIN_SCHEMA_FIRST_STRONGLY_TYPED_SDK_GENERATION_SPEC.md`](WIN_SCHEMA_FIRST_STRONGLY_TYPED_SDK_GENERATION_SPEC.md), ADR 0116, ADR 0129 | Adoption accelerator across languages; DecentDB metadata foundation exists |
+| 4 | vNext+1 | TODO | WASM and browser OPFS support | [`WIN_WASM_SUPPORT_IMPLEMENTATION.md`](WIN_WASM_SUPPORT_IMPLEMENTATION.md) | Essential enabler for browser local-first apps, especially with sync, typed SDKs, and geospatial data |
 | 5 | vNext+1 | TODO | Policy-aware embedded SQL | Needs ADR/spec | Strong regulated/offline/enterprise story beyond encryption alone |
 | 6 | vNext+1 | TODO | Application database bundle format | Needs ADR/spec | Makes DecentDB a portable app artifact, support bundle, and sharable dataset format |
 | 7 | vNext+1 | TODO | Built-in observability and `sys.*` virtual tables | Needs ADR/spec; doctor v1 is foundation | Complements doctor and makes operational state queryable |
@@ -40,7 +40,7 @@ Future version values are planning buckets, not release commitments.
 | 17 | Later | BACKLOG | Native vector / HNSW index | Needs ADR/spec | AI-era checkbox, useful but less unique |
 | 18 | Later | BACKLOG | Full-text search with BM25 ranking | Needs ADR/spec | Expected search capability; less distinctive because SQLite FTS is mature |
 | 19 | Later | BACKLOG | Transparent data encryption | Needs ADR/spec | Practical security feature, but weaker positioning than policy-aware data controls |
-| 20 | Later | BACKLOG | Advanced SQL compatibility and controlled extension surface | [`WIN04_ADVANCED_SQL_COMPATIBILITY_SURFACE.md`](WIN04_ADVANCED_SQL_COMPATIBILITY_SURFACE.md) | Useful adoption polish; controlled extension hooks cover common SQLite-extension workflows without arbitrary native loading |
+| 20 | Later | BACKLOG | Advanced SQL compatibility and controlled extension surface | [`WIN_ADVANCED_SQL_COMPATIBILITY_SURFACE.md`](WIN_ADVANCED_SQL_COMPATIBILITY_SURFACE.md) | Useful adoption polish; controlled extension hooks cover common SQLite-extension workflows without arbitrary native loading |
 | 21 | Later | BACKLOG | WAL streaming replication | Needs ADR/spec | HA/read-scale story, but not the local-first differentiator |
 | 22 | Later | BACKLOG | Cloud-native object storage VFS | Needs ADR/spec | Interesting edge/serverless story, high complexity |
 
@@ -91,7 +91,7 @@ The remaining roadmap should support one clear lane:
 
 **Status:** `TODO`
 **Future Version:** vNext
-**Source of truth:** [`WIN05_BRANCH_DIFF_RESTORE_TIME_TRAVEL_IMPLEMENTATION_GUIDE.md`](WIN05_BRANCH_DIFF_RESTORE_TIME_TRAVEL_IMPLEMENTATION_GUIDE.md)
+**Source of truth:** [`WIN_BRANCH_DIFF_RESTORE_TIME_TRAVEL_IMPLEMENTATION_GUIDE.md`](WIN_BRANCH_DIFF_RESTORE_TIME_TRAVEL_IMPLEMENTATION_GUIDE.md)
 
 ### Why This Matters
 
@@ -131,7 +131,7 @@ ADRs must define:
 
 **Status:** `TODO`
 **Future Version:** vNext
-**Source of truth:** [`WIN03_GEOSPATIAL_DATA_SUPPORT.md`](WIN03_GEOSPATIAL_DATA_SUPPORT.md), ADR 0124-0128
+**Source of truth:** [`WIN_GEOSPATIAL_DATA_SUPPORT.md`](WIN_GEOSPATIAL_DATA_SUPPORT.md), ADR 0124-0128
 
 ### Why This Matters
 
@@ -163,7 +163,7 @@ planner-aware, syncable, and portable across bindings.
 
 **Status:** `TODO`
 **Future Version:** vNext
-**Source of truth:** [`WIN02_SCHEMA_FIRST_STRONGLY_TYPED_SDK_GENERATION_SPEC.md`](WIN02_SCHEMA_FIRST_STRONGLY_TYPED_SDK_GENERATION_SPEC.md)
+**Source of truth:** [`WIN_SCHEMA_FIRST_STRONGLY_TYPED_SDK_GENERATION_SPEC.md`](WIN_SCHEMA_FIRST_STRONGLY_TYPED_SDK_GENERATION_SPEC.md)
 
 ### Why This Matters
 
@@ -192,7 +192,7 @@ Decent Bench should own the primary generator workflow.
 
 **Status:** `TODO`
 **Future Version:** vNext+1
-**Source of truth:** [`WIN03_WASM_SUPPORT_IMPLEMENTATION.md`](WIN03_WASM_SUPPORT_IMPLEMENTATION.md)
+**Source of truth:** [`WIN_WASM_SUPPORT_IMPLEMENTATION.md`](WIN_WASM_SUPPORT_IMPLEMENTATION.md)
 
 ### Why This Matters
 
@@ -643,7 +643,7 @@ planned together with policy and audit requirements.
 
 **Status:** `BACKLOG`  
 **Future Version:** Later  
-**Source of truth:** [`WIN04_ADVANCED_SQL_COMPATIBILITY_SURFACE.md`](WIN04_ADVANCED_SQL_COMPATIBILITY_SURFACE.md)
+**Source of truth:** [`WIN_ADVANCED_SQL_COMPATIBILITY_SURFACE.md`](WIN_ADVANCED_SQL_COMPATIBILITY_SURFACE.md)
 
 ### Why This Matters
 
