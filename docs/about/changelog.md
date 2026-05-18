@@ -22,6 +22,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   helpers, deterministic schema fingerprints, native type metadata, query
   parameter/result-column contracts, and binding exposure across Python, Go,
   .NET, Node.js, Java/JDBC, and Dart.
+- **Binding-native semantic data types:** added compact native storage and C ABI
+  value tags for `ENUM`, `IPADDR`/`INET`, `CIDR`, `DATE`, `TIME`,
+  `TIMESTAMPTZ`, `INTERVAL`, and `MACADDR`/`MACADDR8`, including SQL casts,
+  format-version migration support, dump/sync/tooling metadata coverage, and
+  typed result decoding across Python, Go, .NET, Node.js, Java/JDBC, and Dart.
+  `ENUM` stores stable label ids plus persisted catalog label metadata so row
+  values are not tied to mutable label strings.
 - **Native geospatial types and spatial indexes:** added `GEOMETRY` and
   `GEOGRAPHY` column types with EWKB-backed storage, WKB/WKT/GeoJSON
   conversion functions, core `ST_*` accessors/predicates/measurements,

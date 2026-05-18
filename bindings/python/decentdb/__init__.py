@@ -919,14 +919,15 @@ class Cursor:
             code = self._lib.ddb_stmt_bind_timestamp_micros(
                 self._stmt, index_1_based, micros
             )
-        elif isinstance(param, datetime.date):
-            epoch = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
-            dt = datetime.datetime(
-                param.year, param.month, param.day, tzinfo=datetime.timezone.utc
+        elif isinstance(param, datetime.time):
+            encoded = param.isoformat().encode("utf-8")
+            code = self._lib.ddb_stmt_bind_text(
+                self._stmt, index_1_based, encoded, len(encoded)
             )
-            micros = int((dt - epoch).total_seconds() * 1_000_000)
-            code = self._lib.ddb_stmt_bind_timestamp_micros(
-                self._stmt, index_1_based, micros
+        elif isinstance(param, datetime.date):
+            encoded = param.isoformat().encode("utf-8")
+            code = self._lib.ddb_stmt_bind_text(
+                self._stmt, index_1_based, encoded, len(encoded)
             )
         else:
             raw = str(param).encode("utf-8")
@@ -2924,7 +2925,7 @@ class Cursor:
                     else:
                         append_row(_decode_ffi_value(self._lib, value))
                 append_rows(tuple(row))
-        return rows
+            return rows
 
         if col_count == 1:
             sql = self._last_sql

@@ -24,6 +24,21 @@ with engine.connect() as conn:
         print(row)
 ```
 
+## Semantic result values
+
+The DB-API driver decodes semantic native types directly:
+
+- `ENUM` -> `decentdb.EnumValue(type_id, label_id)`
+- `IPADDR` / `INET` -> `ipaddress` address objects
+- `CIDR` -> `ipaddress` network objects
+- `DATE`, `TIME`, `TIMESTAMPTZ` -> `datetime.date`, `datetime.time`, and
+  timezone-aware UTC `datetime.datetime`
+- `INTERVAL` -> `decentdb.IntervalValue(months, days, micros)`
+- `MACADDR` / `MACADDR8` -> canonical lowercase `str`
+
+SQLAlchemy `Date`, `Time`, and `DateTime(timezone=True)` now compile to the
+native `DATE`, `TIME`, and `TIMESTAMPTZ` column types.
+
 ## Concurrency Model
 
 DecentDB operates as an embedded database with the following concurrency model:

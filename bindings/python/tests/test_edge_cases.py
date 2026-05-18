@@ -442,10 +442,7 @@ class TestDateTime:
         conn.close()
 
     def test_date_roundtrip(self, db_path):
-        """Test date storage and retrieval.
-
-        Note: DATE columns are returned as datetime objects in this binding.
-        """
+        """Test native DATE storage and retrieval."""
         conn = decentdb.connect(db_path)
         cur = conn.cursor()
         cur.execute("CREATE TABLE foo (d DATE)")
@@ -456,6 +453,8 @@ class TestDateTime:
 
         cur.execute("SELECT d FROM foo")
         row = cur.fetchone()
+        assert isinstance(row[0], datetime.date)
+        assert not isinstance(row[0], datetime.datetime)
         assert row[0].year == 2024
         assert row[0].month == 3
         assert row[0].day == 20

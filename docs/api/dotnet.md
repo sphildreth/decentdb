@@ -217,7 +217,7 @@ The current in-tree provider validation covers:
 ## Version introspection
 
 ```csharp
-uint abi = DecentDB.AbiVersion();       // e.g. 1
+uint abi = DecentDB.AbiVersion();       // e.g. 2
 string ver = DecentDB.EngineVersion();  // e.g. "2.0.0"
 
 // Via ADO.NET
@@ -332,6 +332,16 @@ The binding supports all DecentDB native types:
 | `byte[]` | BLOB | `BindBlob()` | `GetBlob()` |
 | `Guid` | UUID | `BindGuid()` | `GetGuid()` |
 | `DateTime` | TIMESTAMP | `BindDatetime(micros)` | `GetTimestampMicros()` / `GetValueObject()` |
+| `DecentDBEnumValue` | ENUM | string labels in column context | `GetValueObject()` |
+| `string` | IPADDR / CIDR / MACADDR | `BindText()` in column context | `GetText()` / `GetValueObject()` |
+| `DateOnly` | DATE | integer day count or text in column context | `GetValueObject()` |
+| `TimeOnly` | TIME | integer microseconds or text in column context | `GetValueObject()` |
+| `DateTimeOffset` | TIMESTAMPTZ | UTC microseconds or text in column context | `GetValueObject()` |
+| `DecentDBIntervalValue` / `TimeSpan` | INTERVAL | integer microseconds or text in column context | `GetValueObject()` |
+
+The low-level native value object path returns semantic values without requiring
+applications to parse display strings. `ENUM` values expose stable type and
+label ids; catalog metadata carries the human-readable label mapping.
 
 ## Maintenance
 

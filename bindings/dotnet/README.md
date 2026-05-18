@@ -78,6 +78,12 @@ public class Album
 
 Bindable types (auto-included by MicroOrm): all primitives, `string`, `Guid`, `DateTime`, `DateTimeOffset`, `DateOnly`, `TimeOnly`, `TimeSpan`, `byte[]`, `enum`, and `Nullable<T>` of any of these.
 
+Native semantic reads are exposed through the low-level value-object path:
+`ENUM` returns `DecentDBEnumValue`, `INTERVAL` returns `DecentDBIntervalValue`
+or `TimeSpan` when representable, `DATE` returns `DateOnly`, `TIME` returns
+`TimeOnly`, `TIMESTAMPTZ` returns `DateTimeOffset`, and `IPADDR`, `CIDR`, and
+`MACADDR` return canonical strings.
+
 ## Sync SDK quickstart
 
 The .NET binding exposes an engine-local sync surface through

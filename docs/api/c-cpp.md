@@ -182,6 +182,23 @@ guaranteed to be NUL-terminated; always use the returned length. Spatial values
 are returned as normalized EWKB with `DDB_VALUE_GEOMETRY` or
 `DDB_VALUE_GEOGRAPHY` tags.
 
+Semantic values have dedicated ABI tags in `ddb_value_t` and
+`ddb_value_view_t`:
+
+| Tag | Payload fields |
+|---|---|
+| `DDB_VALUE_ENUM` | `enum_type_id`, `enum_label_id` |
+| `DDB_VALUE_IPADDR` | `ip_family`, `ip_cidr_addr_bytes` |
+| `DDB_VALUE_CIDR` | `ip_family`, `cidr_prefix_len`, `ip_cidr_addr_bytes` |
+| `DDB_VALUE_DATE` | `date_days` |
+| `DDB_VALUE_TIME` | `time_micros` |
+| `DDB_VALUE_TIMESTAMPTZ_MICROS` | `timestamptz_micros` |
+| `DDB_VALUE_INTERVAL` | `interval_months`, `interval_days`, `interval_micros` |
+| `DDB_VALUE_MACADDR` | `ip_family` as length (`6` or `8`), `ip_cidr_addr_bytes` |
+
+For inserts, bind text or integer values in a statement where the destination
+column type is known; the engine performs the semantic cast during execution.
+
 For read-heavy streaming paths, prefer the statement row-view APIs described
 below to avoid per-cell heap allocation.
 

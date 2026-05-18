@@ -2,14 +2,28 @@
 
 Go `database/sql` driver for DecentDB.
 
+## Type notes
+
+Semantic result values decode as Go-native shapes:
+
+- `ENUM` -> `EnumValue{TypeID, LabelID}`
+- `IPADDR`, `CIDR`, `MACADDR` -> canonical `string`
+- `DATE`, `TIMESTAMPTZ` -> UTC `time.Time`
+- `TIME` -> `time.Duration`
+- `INTERVAL` -> `IntervalValue{Months, Days, Micros}`
+
 ## Validation
 
 Run the Go binding test suite, including the strict cgo pointer checker:
 
 ```bash
+cargo build -p decentdb --release
 go test ./...
 GOEXPERIMENT=cgocheck2 go test ./...
 ```
+
+The cgo linker searches the release target first when it exists, so rebuild the
+release native library before running the full suite after C ABI changes.
 
 ## Benchmark
 

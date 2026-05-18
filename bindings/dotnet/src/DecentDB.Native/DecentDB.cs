@@ -1634,7 +1634,11 @@ public sealed class PreparedStatement : IDisposable
             {
                 chars[i * 3 - 1] = ':';
             }
-            var b = value.ip_cidr_addr_bytes[i];
+            byte b;
+            unsafe
+            {
+                b = value.ip_cidr_addr_bytes[i];
+            }
             chars[i * 3] = hex[b >> 4];
             chars[i * 3 + 1] = hex[b & 0x0f];
         }

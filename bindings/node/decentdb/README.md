@@ -29,6 +29,19 @@ db.close();
 
 DecentDB-native uses engine-native placeholders: `$1`, `$2`, ...
 
+## Semantic result values
+
+Semantic native types are returned as compact display strings in the Node
+wrapper:
+
+- `ENUM` -> `"typeId:labelId"`
+- `IPADDR`, `CIDR`, `MACADDR` -> canonical text
+- `DATE`, `TIME`, `TIMESTAMPTZ` -> canonical date/time text
+- `INTERVAL` -> `"months days micros"`
+
+`DECIMAL` continues to return `{ unscaled: bigint, scale: number }`, and
+`TIMESTAMP` returns milliseconds since the Unix epoch.
+
 ## Runtime library
 
 Build the shared library from the repository root:

@@ -28,12 +28,18 @@ dependencies {
     candidateDirs << new File('/usr/lib/dbeaver/plugins')
     candidateDirs << new File('/usr/share/dbeaver/plugins')
 
-    def pluginDir = candidateDirs.find { it.exists() && it.isDirectory() }
-    if (pluginDir == null) {
-        throw new GradleException("DBeaver plugin directory not found. Set -PdbeaverPluginDir=... (or DBEAVER_PLUGIN_DIR) to a folder containing DBeaver's *.jar bundles.")
+    ext.dbeaverPluginDir = candidateDirs.find { it.exists() && it.isDirectory() }
+    if (ext.dbeaverPluginDir != null) {
+        compileOnly fileTree(ext.dbeaverPluginDir) { include '*.jar' }
     }
+}
 
-    compileOnly fileTree(pluginDir) { include '*.jar' }
+tasks.named('compileJava') {
+    doFirst {
+        if (project.ext.dbeaverPluginDir == null) {
+            throw new GradleException("DBeaver plugin directory not found. Set -PdbeaverPluginDir=... (or DBEAVER_PLUGIN_DIR) to a folder containing DBeaver's *.jar bundles.")
+        }
+    }
 }
 
 jar {
