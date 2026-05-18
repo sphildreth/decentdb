@@ -2,7 +2,7 @@
 **Date:** 2026-03-28  
 **Status:** Implemented  
 **Audience:** Core engine developers, parser/planner/executor maintainers, storage/indexing implementers, C ABI maintainers, binding maintainers, CLI maintainers, documentation authors, coding agents  
-**Related roadmap item:** Native geospatial types and spatial indexes in [`FUTURE_WINS.md`](FUTURE_WINS.md)  
+**Related shipped foundation:** Native geospatial types and spatial indexes in [`FUTURE_WINS.md`](FUTURE_WINS.md)  
 **Related vision documents:** `design/FUTURE_WINS.md`, `design/PRD.md`, `design/TESTING_STRATEGY.md`, `docs/design/spec.md`
 **Related ADR drafts:** `design/adr/0124-geospatial-type-system-and-ewkb-storage.md`, `design/adr/0125-spatial-covering-cell-secondary-index.md`, `design/adr/0126-geospatial-c-abi-contract.md`, `design/adr/0127-planner-native-spatial-access-paths.md`, `design/adr/0128-true-3d-semantics-and-3d-aware-indexing.md`
 
@@ -69,9 +69,8 @@ begins, because it crosses multiple ADR-required boundaries:
 
 ## 2. Why This Needs a Dedicated Plan
 
-`design/FUTURE_WINS.md` identifies geospatial support as a valuable
-future win and sketches a direction that includes native types, spatial
-indexing, and `ST_*` functions.
+`design/FUTURE_WINS.md` identifies geospatial support as a shipped foundation
+and tracks only advanced follow-on spatial work as future roadmap scope.
 
 That document is the right product-level prompt, but geospatial work is not
 "just add a few functions":

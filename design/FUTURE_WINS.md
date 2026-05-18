@@ -15,32 +15,31 @@ Status values:
 
 - `TODO`: prioritized roadmap work that is not actively being implemented right now.
 - `IN PROGRESS`: active implementation or design work is underway right now.
-- `SHIPPED`: implemented in the current codebase and documented as an available foundation.
 - `BACKLOG`: valuable, but not part of the near-term implementation path.
 
 Future version values are planning buckets, not release commitments.
 
 | Priority | Future Version | Status | Feature | Current Source Of Truth | Why This Rank |
 |---:|---|---|---|---|---|
-| 1 | vNext | SHIPPED | Native geospatial types and spatial indexes | [`WIN_GEOSPATIAL_DATA_SUPPORT.md`](WIN_GEOSPATIAL_DATA_SUPPORT.md), ADR 0124-0128 | Strong local-first wedge for mobile, field service, logistics, IoT, and offline map workflows |
-| 2 | vNext | TODO | Schema-first strongly typed SDK generation | [`WIN_SCHEMA_FIRST_STRONGLY_TYPED_SDK_GENERATION_SPEC.md`](WIN_SCHEMA_FIRST_STRONGLY_TYPED_SDK_GENERATION_SPEC.md), ADR 0116, ADR 0129 | Adoption accelerator across languages; DecentDB metadata foundation exists |
-| 3 | vNext+1 | TODO | WASM and browser OPFS support | [`WIN_WASM_SUPPORT_IMPLEMENTATION.md`](WIN_WASM_SUPPORT_IMPLEMENTATION.md) | Essential enabler for browser local-first apps, especially with sync, typed SDKs, and geospatial data |
-| 4 | vNext+1 | TODO | Policy-aware embedded SQL | Needs ADR/spec | Strong regulated/offline/enterprise story beyond encryption alone |
-| 5 | vNext+1 | TODO | Application database bundle format | Needs ADR/spec | Makes DecentDB a portable app artifact, support bundle, and sharable dataset format |
-| 6 | vNext+1 | TODO | Built-in observability and `sys.*` virtual tables | Needs ADR/spec; doctor v1 is foundation | Complements doctor and makes operational state queryable |
-| 7 | vNext+1 | TODO | Lua extension runtime and package model | [`WIN_LUA_EXTENSION_RUNTIME_SPEC.md`](WIN_LUA_EXTENSION_RUNTIME_SPEC.md) | One official extension language gives DecentDB a supportable extensibility story without arbitrary native loading |
-| 8 | vNext+1 | TODO | Mature interactive SQL shell and CLI ergonomics | [`../docs/user-guide/repl.md`](../docs/user-guide/repl.md); needs product spec | Baseline developer experience and SQLite migration comfort; not identity-defining but highly visible |
-| 9 | vNext+2 | TODO | Transparent write queuing and pipelining | Needs ADR/spec | Makes one-writer reality feel modern under concurrent application writes |
-| 10 | vNext+2 | TODO | Group commit / WAL batching refinements | ADR 0135 | Async commit exists; strict durable group commit refinements remain |
-| 11 | vNext+2 | BACKLOG | Built-in HTTP / remote server mode | Needs ADR/spec | Useful deployment multiplier, especially after write queuing exists |
-| 12 | vNext+2 | BACKLOG | Cross-process WAL coordination | Needs ADR/spec | Useful for Electron, helper processes, and background sync workers |
-| 13 | vNext+3 | BACKLOG | JSONB binary storage | Needs ADR/spec | Better JSON performance, but less identity-defining after SQLite JSONB |
-| 14 | vNext+3 | TODO | Transparent data compression | Existing compression foundation; needs product spec | Storage/cache multiplier, especially for large overflow payloads |
-| 15 | vNext+3 | TODO | Bulk-load follow-ons and external file readers | Existing bulk-load API | Extends shipped foundation into stronger import, ETL, and query-external file workflows |
-| 16 | vNext+3 | BACKLOG | Non-blocking schema migration | Needs ADR/spec | Valuable for large evolving databases, but complex and not the clearest identity anchor |
-| 17 | Later | BACKLOG | Native vector / HNSW index | Needs ADR/spec | AI-era checkbox, useful but less unique |
-| 18 | Later | BACKLOG | Full-text search with BM25 ranking | Needs ADR/spec | Expected search capability; less distinctive because SQLite FTS is mature |
-| 19 | Later | BACKLOG | Transparent data encryption | Needs ADR/spec | Practical security feature, but weaker positioning than policy-aware data controls |
+| 1 | vNext | TODO | Schema-first strongly typed SDK generation | [`WIN_SCHEMA_FIRST_STRONGLY_TYPED_SDK_GENERATION_SPEC.md`](WIN_SCHEMA_FIRST_STRONGLY_TYPED_SDK_GENERATION_SPEC.md), ADR 0116, ADR 0129 | Adoption accelerator across languages; DecentDB metadata foundation exists |
+| 2 | vNext+1 | TODO | WASM and browser OPFS support | [`WIN_WASM_SUPPORT_IMPLEMENTATION.md`](WIN_WASM_SUPPORT_IMPLEMENTATION.md) | Essential enabler for browser local-first apps, especially with sync, typed SDKs, and geospatial data |
+| 3 | vNext+1 | TODO | Policy-aware embedded SQL | Needs ADR/spec | Strong regulated/offline/enterprise story beyond encryption alone |
+| 4 | vNext+1 | TODO | Application database bundle format | Needs ADR/spec | Makes DecentDB a portable app artifact, support bundle, and sharable dataset format |
+| 5 | vNext+1 | TODO | Built-in observability and `sys.*` virtual tables | Needs ADR/spec; doctor v1 is foundation | Complements doctor and makes operational state queryable |
+| 6 | vNext+1 | TODO | Lua extension runtime and package model | [`WIN_LUA_EXTENSION_RUNTIME_SPEC.md`](WIN_LUA_EXTENSION_RUNTIME_SPEC.md) | One official extension language gives DecentDB a supportable extensibility story without arbitrary native loading |
+| 7 | vNext+1 | TODO | Mature interactive SQL shell and CLI ergonomics | [`../docs/user-guide/repl.md`](../docs/user-guide/repl.md); needs product spec | Baseline developer experience and SQLite migration comfort; not identity-defining but highly visible |
+| 8 | vNext+2 | TODO | Transparent write queuing and pipelining | Needs ADR/spec | Makes one-writer reality feel modern under concurrent application writes |
+| 9 | vNext+2 | TODO | Group commit / WAL batching refinements | ADR 0135 | Async commit exists; strict durable group commit refinements remain |
+| 10 | vNext+2 | BACKLOG | Built-in HTTP / remote server mode | Needs ADR/spec | Useful deployment multiplier, especially after write queuing exists |
+| 11 | vNext+2 | BACKLOG | Cross-process WAL coordination | Needs ADR/spec | Useful for Electron, helper processes, and background sync workers |
+| 12 | vNext+3 | BACKLOG | JSONB binary storage | Needs ADR/spec | Better JSON performance, but less identity-defining after SQLite JSONB |
+| 13 | vNext+3 | TODO | Transparent data compression | Existing compression foundation; needs product spec | Storage/cache multiplier, especially for large overflow payloads |
+| 14 | vNext+3 | TODO | Bulk-load follow-ons and external file readers | Existing bulk-load API | Extends shipped foundation into stronger import, ETL, and query-external file workflows |
+| 15 | vNext+3 | BACKLOG | Non-blocking schema migration | Needs ADR/spec | Valuable for large evolving databases, but complex and not the clearest identity anchor |
+| 16 | Later | BACKLOG | Native vector / HNSW index | Needs ADR/spec | AI-era checkbox, useful but less unique |
+| 17 | Later | BACKLOG | Full-text search with BM25 ranking | Needs ADR/spec | Expected search capability; less distinctive because SQLite FTS is mature |
+| 18 | Later | BACKLOG | Transparent data encryption | Needs ADR/spec | Practical security feature, but weaker positioning than policy-aware data controls |
+| 19 | Later | BACKLOG | Advanced geospatial semantics and analytics | [`WIN_GEOSPATIAL_DATA_SUPPORT.md`](WIN_GEOSPATIAL_DATA_SUPPORT.md) deferred work; needs follow-up ADR/spec | Builds on shipped native spatial support without confusing first-class geospatial as unfinished |
 | 20 | Later | BACKLOG | Advanced SQL compatibility surface | [`WIN_ADVANCED_SQL_COMPATIBILITY_SURFACE.md`](WIN_ADVANCED_SQL_COMPATIBILITY_SURFACE.md) | Useful adoption polish; Lua extensions are tracked separately as the extensibility model |
 | 21 | Later | BACKLOG | WAL streaming replication | Needs ADR/spec | HA/read-scale story, but not the local-first differentiator |
 | 22 | Later | BACKLOG | Cloud-native object storage VFS | Needs ADR/spec | Interesting edge/serverless story, high complexity |
@@ -91,42 +90,7 @@ The remaining roadmap should support one clear lane:
 > native spatial data, branchable workflows, Lua extensibility, and AI-assisted
 > development.
 
-## 1. Native Geospatial Types And Spatial Indexes
-
-**Status:** `SHIPPED`
-**Future Version:** vNext
-**Source of truth:** [`WIN_GEOSPATIAL_DATA_SUPPORT.md`](WIN_GEOSPATIAL_DATA_SUPPORT.md), ADR 0124-0128
-
-### Why This Matters
-
-Location-aware applications are common in mobile, IoT, logistics, and field
-service. Combined with native local-first sync, first-class geospatial support
-would let DecentDB serve offline map, dispatch, inspection, asset tracking, and
-field-data workflows without requiring an external extension stack.
-
-The goal is not to become SpatiaLite or PostGIS in the first pass. The goal is
-to make location data feel like a native DecentDB capability: typed, indexable,
-planner-aware, syncable, and portable across bindings.
-
-### Current Direction
-
-- `GEOGRAPHY` and `GEOMETRY` types
-- normalized EWKB storage and ABI interchange
-- `SPATIAL` secondary indexes backed by covering cells in existing B+Tree storage
-- planner-native candidate generation and exact refinement
-- richer first geospatial release: `GEOGRAPHY(POINT,4326)` nearest-neighbor and
-  radius queries, geography polygon containment/intersection workflows, planar
-  `GEOMETRY` point/line/polygon workflows, GeoJSON/WKT/WKB I/O, and a narrow
-  point-in-polygon spatial join path
-
-### Guardrails
-
-- reuse B+Tree, WAL, page cache, and planner infrastructure
-- keep initial path pure Rust
-- avoid GEOS/PROJ/GDAL-style native dependency stacks for the first slice
-- preserve WASM compatibility
-
-## 2. Schema-First Strongly Typed SDK Generation
+## 1. Schema-First Strongly Typed SDK Generation
 
 **Status:** `TODO`
 **Future Version:** vNext
@@ -155,7 +119,7 @@ Decent Bench should own the primary generator workflow.
 - deterministic regenerated output
 - C#, TypeScript, and Python first, then Go, Java, and Rust
 
-## 3. WASM And Browser OPFS Support
+## 2. WASM And Browser OPFS Support
 
 **Status:** `TODO`
 **Future Version:** vNext+1
@@ -183,7 +147,7 @@ enough to lead the roadmap, but it is a key enabler for the sync story.
 - native hot paths unchanged
 - minimal OPFS create/open/query/reopen smoke test
 
-## 4. Policy-Aware Embedded SQL
+## 3. Policy-Aware Embedded SQL
 
 **Status:** `TODO`
 **Future Version:** vNext+1
@@ -216,7 +180,7 @@ CREATE MASK ssn_mask
 - binding behavior
 - interaction with sync and bundles
 
-## 5. Application Database Bundle Format
+## 4. Application Database Bundle Format
 
 **Status:** `TODO`  
 **Future Version:** vNext+1  
@@ -256,7 +220,7 @@ decentdb import-bundle ./customer.ddbx ./restored.ddb
 - compatibility guarantees
 - interaction with WAL, checkpoints, encryption, and sync metadata
 
-## 6. Built-In Observability And `sys.*` Virtual Tables
+## 5. Built-In Observability And `sys.*` Virtual Tables
 
 **Status:** `TODO`  
 **Future Version:** vNext+1  
@@ -299,7 +263,7 @@ separate doctor-v1 roadmap item:
 - in-memory ring buffers for slow queries and lock waits
 - no recursive disk writes for telemetry
 
-## 7. Lua Extension Runtime And Package Model
+## 6. Lua Extension Runtime And Package Model
 
 **Status:** `TODO`
 **Future Version:** vNext+1
@@ -339,7 +303,7 @@ systems or unbounded native plugins.
 - Lua execution must be resource-bounded, cancellable, and converted into SQL
   errors without process corruption
 
-## 8. Mature Interactive SQL Shell And CLI Ergonomics
+## 7. Mature Interactive SQL Shell And CLI Ergonomics
 
 **Status:** `TODO`
 **Future Version:** vNext+1
@@ -389,7 +353,7 @@ experience work that keeps the product from feeling immature next to SQLite.
 - remote sync administration inside the REPL unless backed by existing
   `decentdb sync` command behavior
 
-## 9. Transparent Write Queuing And Pipelining
+## 8. Transparent Write Queuing And Pipelining
 
 **Status:** `TODO`  
 **Future Version:** vNext+2  
@@ -415,7 +379,7 @@ callers.
 - cancellation and timeout semantics must be explicit
 - group commit should be considered together with this work
 
-## 10. Group Commit / WAL Batching Refinements
+## 9. Group Commit / WAL Batching Refinements
 
 **Status:** `TODO`  
 **Future Version:** vNext+2  
@@ -437,7 +401,7 @@ with write queuing:
 - caller-visible durability remains explicit
 - default `WalSyncMode::Full` remains uncompromised
 
-## 11. Built-In HTTP / Remote Server Mode
+## 10. Built-In HTTP / Remote Server Mode
 
 **Status:** `BACKLOG`
 **Future Version:** vNext+2
@@ -458,7 +422,7 @@ engine concern.
 - avoid engine-level RBAC in this slice
 - integrate with write queuing when available
 
-## 12. Cross-Process WAL Coordination
+## 11. Cross-Process WAL Coordination
 
 **Status:** `BACKLOG`  
 **Future Version:** vNext+2  
@@ -477,7 +441,7 @@ while a background sync/helper process writes.
 - WAL retention for cross-process long readers
 - diagnostics for process-level blockers
 
-## 13. JSONB Binary Storage
+## 12. JSONB Binary Storage
 
 **Status:** `BACKLOG`  
 **Future Version:** vNext+3  
@@ -498,7 +462,7 @@ more effective.
 - large JSONB uses existing overflow page mechanics
 - partial updates rebuild the binary blob through the single writer
 
-## 14. Transparent Data Compression
+## 13. Transparent Data Compression
 
 **Status:** `TODO`  
 **Future Version:** vNext+3  
@@ -518,7 +482,7 @@ B+Tree traversal.
 - use established Rust compression crates rather than custom algorithms
 - expose user-facing SQL/configuration only after the storage contract is clear
 
-## 15. Bulk-Load Follow-Ons And External File Readers
+## 14. Bulk-Load Follow-Ons And External File Readers
 
 **Status:** `TODO`  
 **Future Version:** vNext+3  
@@ -548,7 +512,7 @@ Build higher-level ingestion workflows:
 - avoid a general virtual-table subsystem in this slice
 - keep path handling, error reporting, and resource cleanup testable from the CLI
 
-## 16. Non-Blocking Schema Migration
+## 15. Non-Blocking Schema Migration
 
 **Status:** `BACKLOG`  
 **Future Version:** vNext+3  
@@ -573,7 +537,7 @@ databases.
 This touches catalog, storage, concurrency, migration safety, and possibly file
 format semantics. It needs an ADR before implementation.
 
-## 17. Native Vector / HNSW Index
+## 16. Native Vector / HNSW Index
 
 **Status:** `BACKLOG`  
 **Future Version:** Later  
@@ -597,7 +561,7 @@ developer-experience work.
 - no external C extension requirement
 - benchmarks against common vector-search extensions
 
-## 18. Full-Text Search With BM25 Ranking
+## 17. Full-Text Search With BM25 Ranking
 
 **Status:** `BACKLOG`  
 **Future Version:** Later  
@@ -622,7 +586,7 @@ SQLite FTS is mature, and FTS is increasingly expected rather than decisive.
 - planner integration
 - standard SQL surface without virtual-table awkwardness
 
-## 19. Transparent Data Encryption
+## 18. Transparent Data Encryption
 
 **Status:** `BACKLOG`  
 **Future Version:** Later  
@@ -645,6 +609,35 @@ friction.
 
 Policy-aware SQL may subsume or extend this work, so encryption should be
 planned together with policy and audit requirements.
+
+## 19. Advanced Geospatial Semantics And Analytics
+
+**Status:** `BACKLOG`
+**Future Version:** Later
+**Source of truth:** [`WIN_GEOSPATIAL_DATA_SUPPORT.md`](WIN_GEOSPATIAL_DATA_SUPPORT.md) deferred work; needs follow-up ADR/spec before implementation.
+
+### Why This Matters
+
+Native geospatial types, spatial indexes, planner-visible filters, distance
+ordering, and the first point-in-polygon spatial join path are shipped
+foundations. More advanced GIS workloads still need a separate, explicit future
+track so the completed native geospatial feature does not appear unfinished.
+
+### Possible Direction
+
+- arbitrary planner-native spatial joins beyond the first point-in-polygon shape
+- spatial statistics in `ANALYZE`
+- true 3D predicate semantics and explicit 3D-aware spatial index modes
+- advanced index forms such as partial, expression, multi-column, or unique
+  spatial indexes
+- additional spatial reference systems and coordinate transformation support
+- exposed S2/covering-cell helpers for advanced application workflows
+
+### Guardrails
+
+- preserve the shipped EWKB/C ABI contract
+- avoid native GEOS/PROJ/GDAL dependencies unless an ADR justifies the tradeoff
+- keep WASM compatibility as a design constraint
 
 ## 20. Advanced SQL Compatibility Surface
 
@@ -681,8 +674,8 @@ support, browser support, observability, and storage fundamentals.
 - deferred constraints and exclusion constraints
 - covering-index execution for existing `INCLUDE (...)` metadata
 
-Full-text search, geospatial support, and Lua extensions are tracked as separate
-roadmap wins.
+Full-text search, advanced geospatial follow-ons, and Lua extensions are tracked
+as separate roadmap wins.
 
 ### Guardrails
 
@@ -741,17 +734,12 @@ operational foundations.
 
 ## Near-Term Sequence
 
-1. Refresh and accept the native geospatial ADRs around a richer first release:
-   `GEOGRAPHY(POINT,4326)` radius/KNN, geography polygon containment and
-   intersection, planar `GEOMETRY` point/line/polygon support,
-   GeoJSON/WKT/WKB I/O, a narrow point-in-polygon spatial join path, and
-   planner-visible `SPATIAL` indexes before implementation.
-2. Continue schema-first SDK generation through Decent Bench while keeping
+1. Continue schema-first SDK generation through Decent Bench while keeping
    DecentDB metadata authoritative.
-3. Start WASM only after the browser-facing parser/durability gates are
+2. Start WASM only after the browser-facing parser/durability gates are
    accepted.
-4. Advance policy, bundle, `sys.*`, Lua extension ADRs, and interactive SQL
-   shell designs after the top three roadmap items have accepted implementation
+3. Advance policy, bundle, `sys.*`, Lua extension ADRs, and interactive SQL
+   shell designs after the top roadmap items have accepted implementation
    specs.
 
 ## Market Notes
