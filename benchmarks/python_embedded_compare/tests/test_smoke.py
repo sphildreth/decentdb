@@ -160,6 +160,8 @@ class TestWorkloads:
         assert "orders" in schema
         assert "customer_id" in schema
         assert "order_id" in schema
+        assert "idx_orders_customer_created" in schema
+        assert "idx_orders_created_status" in schema
 
     def test_workload_b_schema(self):
         """Workload B should have valid schema."""
