@@ -38,13 +38,15 @@ Interactive SQL shell with:
 - transaction-aware prompt state
 
 ```bash
-decentdb repl --db=<path> [--format=<json|csv|table>]
+decentdb repl --db=<path> [--format=<json|csv|table|markdown>]
 ```
 
 Special commands:
 - `.help`
 - `.quit`
 - `.exit`
+
+See [Interactive SQL Shell](../user-guide/repl.md) for the full user guide.
 
 ### import
 

@@ -1,77 +1,168 @@
 # DecentDB
 
-**Durable. Fast. Embedded.**
+**Durable embedded SQL for local-first applications.**
 
-DecentDB is an embedded, single-machine relational database engine focused on **durable ACID writes** and **fast reads**.
+DecentDB is a Rust-native embedded relational database engine focused on
+durable ACID writes, fast reads, predictable correctness, and application
+integration. It is built around a single-process concurrency model with one
+writer and many concurrent readers under snapshot isolation.
 
-## Features
+DecentDB is not trying to be "SQLite with more features." Its strongest lane is
+embedded SQL for modern applications that need local durability, rich relational
+queries, syncable offline data, and language bindings that feel native.
 
-- **ACID Transactions** — Full durability with WAL-based persistence and snapshot isolation
-- **Single Writer + Many Readers** — Optimized for read-heavy workloads
-- **PostgreSQL-Compatible SQL** — JOINs (INNER, LEFT, RIGHT, FULL OUTER, CROSS, NATURAL), CTEs (including WITH RECURSIVE), window functions, aggregates (with DISTINCT), upsert, RETURNING, savepoints
-- **Rich Data Types** — INT64, FLOAT64, TEXT, BLOB, BOOL, DECIMAL, UUID, DATE, TIMESTAMP
-- **Full-Text Substring Search** — Trigram inverted index for `LIKE '%pattern%'` queries
-- **Auto-Assigned Primary Keys** — If a table has a single INT64 primary key column, omitting the value on INSERT will auto-assign an ID (INT/INTEGER/INT64/BIGINT are synonyms)
-- **Foreign Keys** — Referential integrity with CASCADE, SET NULL, RESTRICT
-- **Generated Columns** — `GENERATED ALWAYS AS (expr)` in `STORED` or `VIRTUAL` mode
-- **Temporary Objects** — Session-scoped TEMP tables and views
-- **JSON Support** — Scalar functions, table-valued functions (`json_each`, `json_tree`)
-- **Multiple Language Bindings** — [.NET](api/dotnet.md), [Go](api/go.md), [Python](api/python.md), [Node.js](api/node.md), [Dart](api/dart.md), [JDBC](api/jdbc.md)
-- **Cross-Platform** — Linux x86_64/arm64 (including 64-bit Raspberry Pi OS), macOS, Windows
+## What Stands Out
 
-## Releases
+| Capability | Why it matters |
+|---|---|
+| Durable ACID storage | WAL-based persistence and crash-safe recovery are central design goals. |
+| Local-first sync | Built-in change journals, batch exchange, scoped peer replication, conflict workflows, retention tooling, sync doctor, CLI commands, and a typed .NET sync SDK. |
+| Practical PostgreSQL-like SQL | Familiar DDL/DML, joins, CTEs, window functions, set operations, upsert, `RETURNING`, savepoints, triggers, generated columns, JSON functions, and rich scalar functions. |
+| Application-friendly types | Native `INT64`, `FLOAT64`, `BOOL`, `TEXT`, `BLOB`, `DECIMAL`, `UUID`, `DATE`, and `TIMESTAMP`. |
+| Indexed substring search | Native trigram indexes accelerate interactive `LIKE '%pattern%'` queries. |
+| Multi-language embedding | C ABI plus .NET, Go, Python, Node.js, Dart/Flutter, and JDBC bindings. |
+| Operational tooling | CLI inspection, stats, checkpoints, index rebuilds, import/export, bulk load, doctor reports, and DBeaver/JDBC integration. |
 
-Releases are driven by Git tags and published via GitHub Actions:
+## Core Features
 
-- Engine binaries (GitHub Releases): native Linux x86_64/arm64 (including 64-bit Raspberry Pi OS on Pi 3/4/5), macOS, and Windows builds. [Releases](development/releases.md)
-- NuGet packages (`.NET 10`): `DecentDB.AdoNet`, `DecentDB.MicroOrm`, `DecentDB.EntityFrameworkCore`, `DecentDB.EntityFrameworkCore.Design`, `DecentDB.EntityFrameworkCore.NodaTime`
+- **ACID transactions** with WAL durability and crash recovery.
+- **One writer, many readers** for predictable embedded concurrency.
+- **B+Tree tables and secondary indexes** with page caching.
+- **Foreign keys** with referential integrity and supported actions such as
+  `CASCADE`, `SET NULL`, and `RESTRICT`.
+- **Generated columns** in `STORED` and `VIRTUAL` modes.
+- **Temporary tables and views** scoped to the current session.
+- **JSON support** including scalar functions and table-valued functions such
+  as `json_each` and `json_tree`.
+- **Triggers** for application-side logic, including supported `AFTER` and
+  `INSTEAD OF` trigger paths.
+- **Bulk-load, CSV, and JSON import/export** workflows.
+- **In-memory databases** using `:memory:` plus save-as support for snapshots.
+- **Cross-platform release builds** for Linux x86_64/arm64, macOS, and Windows.
 
 ## Quick Start
 
+Install the CLI from the latest release:
+
+1. Download the archive for your platform from
+   [GitHub Releases](https://github.com/sphildreth/decentdb/releases).
+2. Extract the archive.
+3. Put `decentdb` or `decentdb.exe` on your `PATH`.
+
+Release archives are published for Linux x86_64/arm64, macOS, and Windows.
+Verify the CLI is available:
+
 ```bash
-# Install DecentDB
-cargo install --path crates/decentdb-cli
-
-# Create a database
-# Note: auto-increment works for a single INT64 PRIMARY KEY column (spelling INT/INTEGER/INT64 doesn’t matter).
-decentdb exec --db=mydb.ddb --sql="CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)"
-
-# Insert data (id auto-assigned)
-decentdb exec --db=mydb.ddb --sql="INSERT INTO users (name) VALUES ('Alice')"
-
-# Query
-decentdb exec --db=mydb.ddb --sql="SELECT * FROM users"
+decentdb --help
 ```
 
-## Use Cases
+If you are developing DecentDB itself, you can also install the CLI from a
+local checkout:
 
-- **Offline-first desktop app** — local relational cache for a UI-heavy app (fast reads, durable writes), with `saveAs` for backups/migration.
-- **Music library / media server** — trigram indexes for fast search across artist/album/track names and JSON metadata.
-- **IoT / edge device data logger** — append-only event table with native `TIMESTAMP`, periodic checkpoints, and snapshot exports.
-- **Game tools / editors** — temporary tables/views for import pipelines and fast iteration, with savepoints for “undo” style workflows.
-- **Embedded analytics & reporting** — `GROUP BY`/HAVING + window functions for dashboards on a single machine.
-- **Config/state store for services** — ACID transactions + foreign keys for consistent config + relational integrity.
-- **ETL staging / ingestion** — bulk-load CSV + generated columns for derived values and normalized search keys.
-- **Search-heavy workloads** — `%pattern%` queries accelerated by trigram indexes when you need substring matching.
+```bash
+cargo install --path crates/decentdb-cli
+```
 
-## Performance
+Create a database, insert a row, and query it:
 
-Latest benchmark snapshot
+```bash
+decentdb exec --db ./app.ddb --sql "CREATE TABLE users (id INT PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE)"
+decentdb exec --db ./app.ddb --sql "INSERT INTO users (name, email) VALUES ('Alice', 'alice@example.com') RETURNING id"
+decentdb exec --db ./app.ddb --sql "SELECT * FROM users"
+```
 
-- Point lookups: P95 `0.0008 ms` (~`3.0x` lower than SQLite in the same run)
-- Join lookups: P95 `0.0022 ms` (~`6%` lower than SQLite in the same run)
-- Auto-commit inserts: P95 `3.0017 ms` with full WAL sync
-- Explicit-transaction inserts: `1.91M rows/sec` (~`3.3%` higher than SQLite)
-- Checkpointed database size: `0.52 MB` (~`3.6x` smaller than SQLite)
+Open an interactive SQL shell:
 
-## Getting Started
+```bash
+decentdb repl --db ./app.ddb
+```
 
-- [Installation](getting-started/installation.md)
-- [Quick Start Guide](getting-started/quickstart.md)
-- [SQL Reference](user-guide/sql-reference.md)
+Enable local-first sync on a database:
 
-## Links
+```bash
+decentdb sync init --db ./app.ddb --replica-id node-a
+decentdb sync status --db ./app.ddb --format table
+decentdb sync pending --db ./app.ddb --since 0 --limit 10 --format table
+```
 
-- [GitHub Repository](https://github.com/sphildreth/decentdb)
-- [Issue Tracker](https://github.com/sphildreth/decentdb/issues)
-- [License](about/license.md) (Apache-2.0)
+## Where To Start
+
+- New users: [Installation](getting-started/installation.md) and
+  [Quick Start](getting-started/quickstart.md)
+- SQL users: [SQL Reference](user-guide/sql-reference.md),
+  [SQL Feature Matrix](user-guide/sql-feature-matrix.md), and
+  [Data Types](user-guide/data-types.md)
+- Local-first applications: [Local-first sync](user-guide/sync/index.md)
+- Operational workflows: [Doctor](user-guide/doctor.md),
+  [Performance Tuning](user-guide/performance.md), and
+  [Benchmarks](user-guide/benchmarks.md)
+- Comparing engines: [Comparison Overview](user-guide/comparison.md),
+  [DecentDB vs SQLite](user-guide/decentdb-vs-sqlite.md), and
+  [DecentDB vs DuckDB](user-guide/decentdb-vs-duckdb.md)
+- Language integrations: [.NET](api/dotnet.md), [Go](api/go.md),
+  [Python](api/python.md), [Node.js](api/node.md), [Dart/Flutter](api/dart.md),
+  and [JDBC](api/jdbc.md)
+- CLI users: [Interactive SQL Shell](user-guide/repl.md) and
+  [CLI Reference](api/cli-reference.md)
+
+## Local-First Sync At A Glance
+
+DecentDB sync is built into the engine and exposed through CLI commands, SQL
+inspection surfaces, and .NET APIs. The current sync surface includes:
+
+- durable row-level change capture in a sidecar sync journal
+- replica IDs, peer catalogs, and peer-to-scope bindings
+- manual JSON batch export/import
+- localhost/dev HTTP `sync run` and `sync serve` workflows
+- scoped replication with validated row filters
+- conflict recording, inspection, resolution, reopen, and policy commands
+- `sys_sync_*` inspection queries
+- retention reports, safe prune dry-runs, peer lag, and sync doctor guidance
+
+Start with the [sync overview](user-guide/sync/index.md) or jump directly to
+the [sync quickstart](user-guide/sync/quickstart.md).
+
+## Language Bindings
+
+| Language | Surface |
+|---|---|
+| .NET | Native wrapper, ADO.NET provider, Micro ORM, EF Core provider, NodaTime support, and typed sync SDK |
+| Go | `database/sql` driver with DecentDB-specific helpers |
+| Python | DB-API and SQLAlchemy dialect |
+| Node.js | Native addon and Knex dialect |
+| Dart/Flutter | FFI binding for desktop Flutter applications |
+| Java/JDBC | In-process JNI-backed JDBC driver, including DBeaver integration |
+
+All bindings sit above the native C ABI. The Rust engine remains the
+authoritative implementation.
+
+## Current Constraints
+
+- DecentDB is an embedded, single-process database engine.
+- The concurrency model is one writer with many concurrent readers.
+- The current local HTTP sync server is intended for localhost, development,
+  tests, and short-lived relay workflows; it is not a hardened public server.
+- DecentDB does not currently expose a general-purpose loadable SQL extension
+  or UDF plugin system.
+- Some roadmap items, including native geospatial types, branch/time-travel
+  workflows, WASM/OPFS, policy-aware SQL, vector search, and full-text ranking,
+  are planned work rather than shipped features.
+
+## Releases And Packages
+
+GitHub Releases publish native archives for Linux x86_64/arm64, macOS, and
+Windows. Release bundles include the CLI and native C API library. JDBC and
+DBeaver assets are published alongside the native bundles.
+
+.NET packages include `DecentDB.AdoNet`, `DecentDB.MicroOrm`,
+`DecentDB.EntityFrameworkCore`, `DecentDB.EntityFrameworkCore.Design`, and
+`DecentDB.EntityFrameworkCore.NodaTime`.
+
+See [Release process](development/releases.md) and
+[GitHub Releases](https://github.com/sphildreth/decentdb/releases).
+
+## Project Links
+
+- [GitHub repository](https://github.com/sphildreth/decentdb)
+- [Issue tracker](https://github.com/sphildreth/decentdb/issues)
+- [License](about/license.md)

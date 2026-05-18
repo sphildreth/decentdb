@@ -17,6 +17,7 @@ nav:
     - SQL Reference: user-guide/sql-reference.md
     - SQL Feature Matrix: user-guide/sql-feature-matrix.md
     - Data Types: user-guide/data-types.md
+    - Interactive SQL Shell: user-guide/repl.md
     - Migrations: user-guide/migration.md
     - Transactions: user-guide/transactions.md
     - Local-first sync:
