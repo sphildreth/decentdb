@@ -21,7 +21,7 @@ Future version values are planning buckets, not release commitments.
 
 | Priority | Future Version | Status | Feature | Current Source Of Truth | Why This Rank |
 |---:|---|---|---|---|---|
-| 1 | vNext | TODO | Schema-first strongly typed SDK generation | [`WIN_SCHEMA_FIRST_STRONGLY_TYPED_SDK_GENERATION_SPEC.md`](WIN_SCHEMA_FIRST_STRONGLY_TYPED_SDK_GENERATION_SPEC.md), ADR 0116, ADR 0129 | Adoption accelerator across languages; DecentDB metadata foundation exists |
+| 1 | vNext | TODO | Stable schema and query-contract metadata for tooling | Needs DecentDB ADR/spec; Decent Bench owns SDK generation workflow | Enables Bench-owned SDK generation without putting codegen templates or UI in the engine core |
 | 2 | vNext+1 | TODO | WASM and browser OPFS support | [`WIN_WASM_SUPPORT_IMPLEMENTATION.md`](WIN_WASM_SUPPORT_IMPLEMENTATION.md) | Essential enabler for browser local-first apps, especially with sync, typed SDKs, and geospatial data |
 | 3 | vNext+1 | TODO | Policy-aware embedded SQL | Needs ADR/spec | Strong regulated/offline/enterprise story beyond encryption alone |
 | 4 | vNext+1 | TODO | Application database bundle format | Needs ADR/spec | Makes DecentDB a portable app artifact, support bundle, and sharable dataset format |
@@ -90,34 +90,43 @@ The remaining roadmap should support one clear lane:
 > native spatial data, branchable workflows, Lua extensibility, and AI-assisted
 > development.
 
-## 1. Schema-First Strongly Typed SDK Generation
+## 1. Stable Schema And Query-Contract Metadata For Tooling
 
 **Status:** `TODO`
 **Future Version:** vNext
-**Source of truth:** [`WIN_SCHEMA_FIRST_STRONGLY_TYPED_SDK_GENERATION_SPEC.md`](WIN_SCHEMA_FIRST_STRONGLY_TYPED_SDK_GENERATION_SPEC.md)
+**Source of truth:** Needs DecentDB ADR/spec; Decent Bench owns the schema-first SDK generation product roadmap.
 
 ### Why This Matters
 
-The engine can be excellent and still lose adoption if application integration
-feels hand-built. Strong schema-first generation turns DecentDB from an embedded
-database into a cross-language application platform.
+Schema-first SDK generation is a Decent Bench product capability, not a core
+engine feature. DecentDB should provide the stable metadata and query-contract
+surfaces that make that tooling reliable without owning generated models,
+templates, project integration, or workbench UX.
 
 ### Current Foundation
 
 DecentDB already has rich schema introspection and a one-shot schema snapshot
-surface for tooling and bindings. DecentDB should own stable metadata,
-query-contract validation primitives, ABI/binding guarantees, and schema export.
-Decent Bench should own the primary generator workflow.
+surface for tooling and bindings. That foundation should be hardened into an
+explicit tooling contract that Decent Bench and future generators can consume
+without depending on private engine details.
 
-### Target Output
+### DecentDB-Owned Scope
 
-- generated models/types
-- typed query result contracts
-- parameter binding helpers
-- schema drift detection
-- migration compatibility checks
-- deterministic regenerated output
-- C#, TypeScript, and Python first, then Go, Java, and Rust
+- versioned schema metadata export with stable field semantics
+- schema fingerprinting suitable for drift checks
+- complete type metadata for native DecentDB types, including spatial values
+- query describe/contract primitives for explicit named queries, covering
+  parameters, result columns, nullability where knowable, and DecentDB types
+- Rust API, C ABI, and binding exposure for the metadata needed by tooling
+- deterministic JSON output suitable for golden tests and CI
+
+### Out Of Scope For DecentDB Core
+
+- generated SDK models, repositories, or package layouts
+- C# / TypeScript / Python templates
+- codegen naming conventions beyond stable engine type names
+- Decent Bench GUI/headless generator workflows
+- generated SDK documentation and sample applications
 
 ## 2. WASM And Browser OPFS Support
 

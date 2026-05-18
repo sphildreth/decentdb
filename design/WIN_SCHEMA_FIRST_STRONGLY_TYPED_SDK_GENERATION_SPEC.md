@@ -1,19 +1,27 @@
 # DecentDB / Decent Bench SPEC: Schema-First, Strongly-Typed SDK Generation
 
-- **Status:** Proposed
+- **Status:** Split / superseded for product ownership
 - **Primary product home:** Decent Bench, the official DecentDB workbench/IDE
 - **DecentDB responsibility:** Stable schema metadata, query-contract validation
   primitives, ABI/binding guarantees, and any low-level metadata export needed by
   Decent Bench.
 - **Audience:** Core DecentDB maintainers, Decent Bench maintainers, SDK/codegen contributors, documentation contributors, coding agents
-- **Related roadmap item:** Schema-first strongly typed SDK generation in
-  [`FUTURE_WINS.md`](FUTURE_WINS.md)
+- **Related DecentDB roadmap item:** Stable schema and query-contract metadata
+  for tooling in [`FUTURE_WINS.md`](FUTURE_WINS.md)
+- **Related Decent Bench roadmap item:** Schema-first strongly typed SDK
+  generation in `decent-bench/design/FUTURE_WINS.md`
 - **Suggested ADRs:**
   - ADR: Decent Bench owns schema-first SDK generation workflow
   - ADR: Canonical schema metadata model and intermediate representation (IR)
   - ADR: Generated SDK support matrix and maturity policy
   - ADR: Query contract strategy for typed result generation
   - ADR: Documentation and examples strategy for generated SDKs
+
+> Ownership note: the generated SDK workflow, language templates, GUI/headless
+> generator commands, drift reports, and generated SDK documentation belong in
+> the Decent Bench repository. This document is retained as design input for the
+> narrower DecentDB-owned metadata/query-contract surface and for migration into
+> Decent Bench ADRs/specs.
 
 ---
 
