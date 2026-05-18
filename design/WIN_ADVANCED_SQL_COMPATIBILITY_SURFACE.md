@@ -16,8 +16,8 @@ SQLite in several areas.
 This is the remaining advanced compatibility backlog. It should help ORMs,
 application migrations, PostgreSQL-adjacent SQL, and power users, but it should
 not displace the higher-priority product identity work around local-first sync,
-branchable data workflows, browser support, observability, and storage
-fundamentals.
+branchable data workflows, browser support, Lua extensions, observability, and
+storage fundamentals.
 
 ## Scope Rules
 
@@ -29,6 +29,8 @@ fundamentals.
   out of this track unless the product model changes.
 - Treat full-text search and geospatial work as separate roadmap wins, not as
   sub-slices of this track.
+- Treat the Lua extension runtime and package model as a separate roadmap win,
+  not as a sub-slice of this track.
 
 ## Slice Order
 
@@ -38,7 +40,7 @@ fundamentals.
 | 2 | Not Started | Explicit sequence objects | `CREATE SEQUENCE`, `NEXTVAL`, `CURRVAL`, and sequence-backed defaults |
 | 3 | Not Started | Materialized views | Manual `CREATE MATERIALIZED VIEW` and `REFRESH MATERIALIZED VIEW` |
 | 4 | Not Started | Covering-index execution | Planner/executor support for index-only reads using existing `INCLUDE (...)` metadata |
-| 5 | Not Started | User-defined functions | Constrained SQL-visible UDF registration and invocation |
+| 5 | Not Started | SQL-defined functions | Optional `CREATE FUNCTION ... LANGUAGE SQL` helper surface if it remains useful after Lua extensions |
 | 6 | Not Started | Deferred constraint timing | `DEFERRABLE`, `INITIALLY DEFERRED`, and commit-time validation |
 | 7 | Not Started | User-defined types | Decide and implement the first narrow type surface: domains, enums, composites, or aliases |
 | 8 | Not Started | Exclusion constraints | Limited index-backed `EXCLUDE` semantics for selected operator/type pairs |
@@ -47,6 +49,7 @@ fundamentals.
 
 - Full-text search with BM25 ranking is tracked in [`FUTURE_WINS.md`](FUTURE_WINS.md) as its own roadmap item.
 - Native geospatial types and spatial indexes are tracked in [`WIN_GEOSPATIAL_DATA_SUPPORT.md`](WIN_GEOSPATIAL_DATA_SUPPORT.md) and ADR 0124 through ADR 0128.
+- Lua extensions are tracked in [`WIN_LUA_EXTENSION_RUNTIME_SPEC.md`](WIN_LUA_EXTENSION_RUNTIME_SPEC.md) as the extension runtime and package model.
 - Access control, `GRANT`, and `REVOKE` belong with policy-aware embedded SQL only if DecentDB later adds a product-level role or policy model.
 
 ## 1. Schema-Qualified Namespaces
@@ -158,29 +161,34 @@ table fetches.
 - Projection and filter coverage using only key plus included columns.
 - Correct fallback to base-table lookup when the index cannot satisfy a query.
 
-## 5. User-Defined Functions
+## 5. SQL-Defined Functions
 
 ### Current State
 
 The engine exposes built-in scalar, aggregate, table, and trigger helper
-surfaces. Users cannot define their own SQL-visible functions.
+surfaces. Lua extensions are the primary planned path for user-authored
+procedural SQL-visible functions. A separate SQL-defined function surface may
+still be useful for simple expression wrappers that should be dumpable as SQL
+and do not require Lua.
 
 ### Target Scope
 
-- A constrained first-class UDF surface.
-- Clear separation between SQL-defined functions and host-language registered
-  functions.
+- Optional `CREATE FUNCTION ... LANGUAGE SQL` support for expression-only
+  helpers.
+- Clear separation between SQL-defined functions and Lua extension functions.
 - Determinism metadata where optimizer behavior depends on it.
 - Argument and return-type validation.
 
 ### Out Of Scope
 
 - Unrestricted native code execution inside the engine.
-- Sandboxed procedural languages in the first slice.
+- Sandboxed procedural languages in this track. Lua extension work belongs in
+  `WIN_LUA_EXTENSION_RUNTIME_SPEC.md`.
 
 ### Validation
 
-- Scalar UDF registration and invocation.
+- SQL-defined scalar function creation and invocation if this slice remains in
+  scope.
 - Error propagation and NULL semantics.
 - Persistence rules for SQL-defined functions.
 - Dump/restore or migration behavior, depending on the chosen design.
