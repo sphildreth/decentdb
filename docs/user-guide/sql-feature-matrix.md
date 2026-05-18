@@ -4,6 +4,64 @@ This document provides a comprehensive matrix of SQL features, comparing support
 
 > **See also:** [Comparison: DecentDB vs SQLite vs DuckDB](comparison.md) for a narrative discussion of design differences, trade-offs, and architecture.
 
+## Local-first sync and replication
+
+This section compares built-in database surfaces. SQLite, PostgreSQL, and
+DuckDB can all participate in application-designed synchronization systems, but
+DecentDB includes local-first sync as an engine feature with CLI, SQL
+inspection, and SDK surfaces.
+
+| Feature | DecentDB | SQLite | PostgreSQL | DuckDB |
+|---------|----------|--------|------------|--------|
+| Durable local change journal | ✅ (sidecar sync journal) | ⚠️ (session extension or triggers; app-managed) | ⚠️ (WAL/logical decoding; server-managed) | ❌ |
+| Replica identity | ✅ | ❌ | ⚠️ (server/publication identity concepts) | ❌ |
+| Peer catalog | ✅ | ❌ | ⚠️ (subscription catalogs; not embedded local-first peers) | ❌ |
+| Manual batch export/import | ✅ (`sync export` / `sync import`) | ⚠️ (changesets via optional extension) | ⚠️ (logical replication/dump tooling) | ❌ |
+| Scoped row replication | ✅ (named scopes with validated row filters) | ❌ | ⚠️ (publication filters; server replication) | ❌ |
+| Conflict recording and manual resolution | ✅ (`sync conflicts`, `sync conflict show/resolve/reopen`) | ❌ | ⚠️ (replication conflicts exist, but no embedded app conflict workflow) | ❌ |
+| Operational sync inspection | ✅ (`sys_sync_*` inspection queries) | ❌ | ⚠️ (system catalogs and monitoring views, server-oriented) | ❌ |
+| Sync doctor, retention, peer lag, prune | ✅ | ❌ | ⚠️ (separate server administration surfaces) | ❌ |
+| Local HTTP sync dev transport | ✅ (`sync run` / `sync serve`) | ❌ | ⚠️ (server replication protocols) | ❌ |
+| Typed .NET sync SDK | ✅ (`DecentDBSyncClient`) | ❌ | ❌ | ❌ |
+
+DecentDB sync is intentionally conservative by default: conflicts are recorded
+and inspectable instead of silently hidden behind global last-write-wins
+behavior.
+
+### Examples
+
+```bash
+decentdb sync status --db=app.ddb --format=table
+decentdb sync export --db=app.ddb --since=0 --limit=100 --output=changes.json
+decentdb sync import --db=peer.ddb --input=changes.json
+decentdb sync conflicts --db=peer.ddb --format=table
+```
+
+```sql
+SELECT * FROM sys_sync_status;
+SELECT * FROM sys_sync_journal WHERE sequence > 100 ORDER BY sequence;
+SELECT * FROM sys_sync_conflicts ORDER BY conflict_id;
+SELECT * FROM sys_sync_doctor;
+```
+
+See [Local-first sync](sync/index.md) for the full guide.
+
+## Branch, diff, restore, and time travel
+
+This section compares built-in database workflow surfaces. Other engines can
+approximate many workflows with file copies, backups, transactions, sessions,
+or external tools; DecentDB exposes these as named database operations.
+
+| Feature | DecentDB | SQLite | PostgreSQL | DuckDB |
+|---------|----------|--------|------------|--------|
+| Named retained snapshots | ✅ (`snapshot create/list/delete`) | ⚠️ (backup/session APIs; app-managed names/retention) | ⚠️ (server backups, restore points, PITR; server-managed) | ⚠️ (database/file snapshots; app-managed) |
+| Read-only time-travel query by name | ✅ (`exec --as-of`) | ❌ | ⚠️ (PITR/temporal patterns, not embedded per-DB named snapshots) | ❌ |
+| Branch-local writes | ✅ (`exec --branch`, `repl --branch`) | ❌ | ❌ | ❌ |
+| Branch diff | ✅ (primary-key row diff; JSON/table output) | ❌ | ❌ | ❌ |
+| Guarded branch restore | ✅ (`branch restore --dry-run/--confirm`) | ❌ | ⚠️ (restore/PITR outside a live embedded DB workflow) | ❌ |
+| Constrained branch merge | ✅ (clean primary-key row changes; conflicts stop) | ❌ | ❌ | ❌ |
+| C ABI workflow bridge | ✅ (`ddb_db_branch_execute_json`) | N/A | N/A | N/A |
+
 ## DDL (Data Definition Language)
 
 | Feature | DecentDB | SQLite | PostgreSQL | DuckDB |
@@ -11,6 +69,7 @@ This document provides a comprehensive matrix of SQL features, comparing support
 | CREATE TABLE | ✅ | ✅ | ✅ | ✅ |
 | DROP TABLE | ✅ | ✅ | ✅ | ✅ |
 | CREATE INDEX | ✅ | ✅ | ✅ | ✅ |
+| Spatial indexes | ✅ (`USING spatial`) | ⚠️ (RTree extension) | ✅ (GiST/SP-GiST via PostGIS) | ✅ (spatial extension) |
 | Covering indexes (`INCLUDE (...)`) | ✅ (BTREE key-column indexes) | ❌ | ✅ | ❌ |
 | DROP INDEX | ✅ | ✅ | ✅ | ✅ |
 | ALTER TABLE ADD COLUMN | ✅ | ✅ | ✅ | ✅ |
@@ -55,6 +114,7 @@ CREATE TABLE order_items (
 -- CREATE INDEX
 CREATE INDEX idx_users_name ON users (name);
 CREATE INDEX idx_orders_user ON orders (user_id) WHERE user_id IS NOT NULL;
+CREATE INDEX idx_places_geog ON places USING spatial(geog);
 
 -- ALTER TABLE
 ALTER TABLE users ADD COLUMN email TEXT;
@@ -474,6 +534,17 @@ FROM orders;
 | json_each() | ✅ | ✅ | ❌ | ❌ (use unnest) |
 | json_tree() | ✅ | ✅ | ❌ | ❌ |
 
+### Spatial Functions
+
+| Function | DecentDB | SQLite | PostgreSQL | DuckDB |
+|----------|----------|--------|------------|--------|
+| GEOMETRY / GEOGRAPHY constructors | ✅ | ⚠️ (extension) | ✅ (PostGIS) | ✅ (spatial extension) |
+| WKT/WKB/GeoJSON import/export | ✅ | ⚠️ (extension) | ✅ (PostGIS) | ✅ (spatial extension) |
+| ST_Distance() / ST_DWithin() | ✅ | ⚠️ (extension) | ✅ (PostGIS) | ✅ (spatial extension) |
+| ST_Intersects()/ST_Contains()/ST_Within()/ST_Equals() | ✅ | ⚠️ (extension) | ✅ (PostGIS) | ✅ (spatial extension) |
+| ST_Length()/ST_Area() | ✅ | ⚠️ (extension) | ✅ (PostGIS) | ✅ (spatial extension) |
+| Distance operator `<->` | ✅ | ❌ | ✅ (PostGIS) | ❌ |
+
 ### Math Examples
 
 ```sql
@@ -561,6 +632,25 @@ SELECT key, value FROM json_each('{"a":1,"b":2}');
 
 -- Table-valued: json_tree (recursive traversal)
 SELECT key, value, type FROM json_tree('{"a":{"b":1},"c":[2,3]}');
+```
+
+### Spatial Examples
+
+```sql
+CREATE TABLE places (id INT PRIMARY KEY, geog GEOGRAPHY(POINT,4326));
+CREATE INDEX idx_places_geog ON places USING spatial(geog);
+INSERT INTO places VALUES (1, ST_GeogPoint(-97.7431, 30.2672));
+
+SELECT id
+FROM places
+WHERE ST_DWithin(geog, ST_GeogPoint(-97.7431, 30.2672), 5000);
+
+SELECT h.id, z.id
+FROM houses h
+JOIN zones z
+  ON ST_Contains(z.boundary, h.location);
+
+SELECT ST_Area(ST_GeomFromText('POLYGON((0 0,10 0,10 10,0 10,0 0))'));
 ```
 
 ## Operators
@@ -713,6 +803,8 @@ PRAGMA cache_size = 1024;
 | DECIMAL/NUMERIC | ✅ | ✅ | ✅ | ✅ |
 | DATE | ✅ (native int64 µs UTC) | ✅ | ✅ | ✅ (native) |
 | TIMESTAMP | ✅ (native int64 µs UTC) | ✅ | ✅ | ✅ (native) |
+| GEOMETRY | ✅ | ⚠️ (extension) | ✅ (PostGIS) | ✅ (spatial extension) |
+| GEOGRAPHY | ✅ (SRID 4326) | ⚠️ (extension) | ✅ (PostGIS) | ⚠️ (via GEOMETRY) |
 
 ### Examples
 
@@ -734,6 +826,10 @@ CREATE TABLE t5 (price DECIMAL(10,2), tax NUMERIC(5,4));
 
 -- UUID
 CREATE TABLE t6 (id UUID PRIMARY KEY DEFAULT GEN_RANDOM_UUID());
+
+-- Spatial
+CREATE TABLE places (id INTEGER PRIMARY KEY, geog GEOGRAPHY(POINT,4326));
+CREATE TABLE parcels (id INTEGER PRIMARY KEY, boundary GEOMETRY(POLYGON,3857));
 
 -- Date and Timestamp (accepted as ISO-format TEXT literals; stored internally as native int64 microseconds in DecentDB)
 CREATE TABLE events (

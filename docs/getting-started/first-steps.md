@@ -101,7 +101,7 @@ decentdb exec --db=myapp.ddb --sql="SELECT * FROM users WHERE name LIKE '%lic%'"
 
 Group multiple operations into atomic transactions.
 
-`decentdb exec --sql` can contain multiple `;`-separated statements (they run on a single connection). However, all statements are **parsed/bound up front** against the schema at the start of the call, so DDL followed by dependent statements in the same `--sql` string can fail (e.g. `CREATE TABLE ...; INSERT INTO that_table ...;`). For schema changes + dependent statements, use separate `exec` calls or the REPL.
+`decentdb exec --sql` can contain multiple `;`-separated statements (they run on a single connection). However, all statements are **parsed/bound up front** against the schema at the start of the call, so DDL followed by dependent statements in the same `--sql` string can fail (e.g. `CREATE TABLE ...; INSERT INTO that_table ...;`). For schema changes + dependent statements, use separate `exec` calls or the [interactive SQL shell](../user-guide/repl.md).
 
 Example (table already exists):
 
@@ -109,7 +109,7 @@ Example (table already exists):
 decentdb exec --db=myapp.ddb --sql="BEGIN; INSERT INTO users (name) VALUES ('Dave'); INSERT INTO users (name) VALUES ('Eve'); COMMIT;"
 ```
 
-For interactive transactions (and for DDL followed by dependent statements), use `decentdb repl`:
+For interactive transactions (and for DDL followed by dependent statements), use [`decentdb repl`](../user-guide/repl.md):
 
 ```bash
 decentdb repl --db=myapp.ddb

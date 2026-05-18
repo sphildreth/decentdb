@@ -4,10 +4,10 @@ DecentDB ships an in-tree Go package under `bindings/go/decentdb-go/`.
 
 ## C ABI coverage
 
-The Go binding exposes 28 of 50 C ABI functions directly through cgo.
-Performance-critical fused `step_row_view` is implemented (reduces cgo crossings
-per row from 2 to 1). Batch, re-execute, and fused bind+step operations remain
-as future optimizations.
+The Go binding exposes the `database/sql` driver plus DecentDB-specific direct
+helpers through cgo. Performance-critical fused `step_row_view` is implemented
+(reduces cgo crossings per row from 2 to 1). Batch, re-execute, and fused
+bind+step operations remain as future optimizations.
 
 ## Package surface
 
@@ -29,6 +29,17 @@ The Go package:
 | `[]byte` | BLOB | Also reads UUID |
 | `time.Time` | TIMESTAMP | Microsecond precision |
 | `Decimal{Unscaled, Scale}` | DECIMAL | Explicit decimal type |
+| `EnumValue{TypeID, LabelID}` | ENUM | Read result value |
+| `string` | IPADDR / CIDR / MACADDR | Read as canonical text |
+| `time.Time` | DATE / TIMESTAMPTZ | DATE uses UTC midnight; TIMESTAMPTZ uses UTC instant |
+| `time.Duration` | TIME | Microseconds since midnight |
+| `IntervalValue{Months, Days, Micros}` | INTERVAL | Read result value |
+
+Parameters for semantic columns can be bound as text when the SQL statement has
+column context, for example inserting `'192.168.0.0/24'` into a `CIDR` column or
+`'paid'` into an `ENUM('new', 'paid')` column. Result scans expose enum and
+interval values as explicit helper structs so callers do not have to parse a
+display string.
 
 ## Use the Go driver from an application
 
@@ -63,7 +74,7 @@ db, err := sql.Open("decentdb", "file:/tmp/app.ddb?mode=open")
 ## Version introspection
 
 ```go
-abi := decentdb.AbiVersion()       // e.g. 1
+abi := decentdb.AbiVersion()       // e.g. 2
 ver := decentdb.EngineVersion()    // e.g. "2.0.0"
 ```
 
@@ -86,6 +97,8 @@ ddl, _ := db.GetTableDdl("users")
 views, _ := db.ListViews()
 viewDdl, _ := db.GetViewDdl("v_active_users")
 triggers, _ := db.ListTriggers()
+toolingMetadata, _ := db.GetToolingMetadataJson()
+queryContract, _ := db.DescribeQueryJson("SELECT id FROM users WHERE id = $1")
 
 // Transaction state
 if db.InTransaction() {
@@ -163,9 +176,13 @@ cargo build -p decentdb --release
 ## Run tests
 
 ```bash
+cargo build -p decentdb --release
 cd bindings/go/decentdb-go
 go test -v ./...
 ```
+
+The cgo linker prefers the release shared library when it exists. Rebuild it
+before the full suite so the Go driver is tested against the current C ABI.
 
 ## Run benchmarks
 

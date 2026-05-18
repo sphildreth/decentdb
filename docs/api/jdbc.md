@@ -185,6 +185,33 @@ try (Connection connection = dataSource.getConnection()) {
 DecentDB's Java driver currently follows the engine's native positional
 placeholder style (`$1`, `$2`, ...) in prepared SQL.
 
+## Type Mapping
+
+The JDBC driver maps native DecentDB values to standard JDBC types where the
+JDK has a natural representation:
+
+| DecentDB type | JDBC metadata | `ResultSet.getObject()` |
+|---|---|---|
+| `INT64` | `Types.BIGINT` | `Long` |
+| `FLOAT64` | `Types.DOUBLE` | `Double` |
+| `BOOL` | `Types.BOOLEAN` | `Boolean` |
+| `TEXT` | `Types.VARCHAR` | `String` |
+| `BLOB` | `Types.BINARY` | `byte[]` |
+| `DECIMAL` | `Types.DECIMAL` | `BigDecimal` |
+| `UUID` | `Types.BINARY` | `UUID` when bytes are UUID-shaped, otherwise `byte[]` |
+| `TIMESTAMP` | `Types.TIMESTAMP` | `Timestamp` |
+| `DATE` | `Types.DATE` | `java.sql.Date` |
+| `TIME` | `Types.TIME` | `java.sql.Time` |
+| `TIMESTAMPTZ` | `Types.TIMESTAMP` | `Timestamp` normalized to UTC |
+| `ENUM` | `Types.VARCHAR` | `String` |
+| `IPADDR` / `INET` | `Types.VARCHAR` | canonical `String` |
+| `CIDR` | `Types.VARCHAR` | canonical `String` |
+| `INTERVAL` | `Types.VARCHAR` | `"months days micros"` `String` |
+| `MACADDR` / `MACADDR8` | `Types.OTHER` | canonical lowercase `String` |
+
+String parameters can be used for semantic columns when SQL provides the target
+column context, including inline enum labels and network address literals.
+
 ## DecentDB-specific connection helpers
 
 `DecentDBConnection` adds a small number of engine-truth helpers beyond the
@@ -218,5 +245,7 @@ The driver includes:
 - JDBC metadata for tables, columns, indexes, keys, and type mapping
 - DecentDB-specific schema helpers on `DecentDBDatabaseMetaData` for table DDL
   and trigger listing
+- stable tooling metadata helpers on `DecentDBDatabaseMetaData`:
+  `getToolingMetadataJson()` and `describeQueryJson(sql)`
 
 For DBeaver integration details, see the [DBeaver guide](../user-guide/dbeaver.md).

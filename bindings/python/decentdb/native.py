@@ -5,6 +5,7 @@ from ctypes import (
     Structure,
     c_char_p,
     c_double,
+    c_int32,
     c_int64,
     c_size_t,
     c_uint8,
@@ -43,6 +44,16 @@ DDB_VALUE_BLOB = 5
 DDB_VALUE_DECIMAL = 6
 DDB_VALUE_UUID = 7
 DDB_VALUE_TIMESTAMP_MICROS = 8
+DDB_VALUE_GEOMETRY = 9
+DDB_VALUE_GEOGRAPHY = 10
+DDB_VALUE_ENUM = 11
+DDB_VALUE_IPADDR = 12
+DDB_VALUE_CIDR = 13
+DDB_VALUE_DATE = 14
+DDB_VALUE_TIME = 15
+DDB_VALUE_TIMESTAMPTZ_MICROS = 16
+DDB_VALUE_INTERVAL = 17
+DDB_VALUE_MACADDR = 18
 
 
 class DdbValue(Structure):
@@ -59,6 +70,18 @@ class DdbValue(Structure):
         ("len", c_size_t),
         ("uuid_bytes", c_uint8 * 16),
         ("timestamp_micros", c_int64),
+        ("enum_type_id", c_uint64),
+        ("enum_label_id", c_uint64),
+        ("ip_family", c_uint8),
+        ("cidr_prefix_len", c_uint8),
+        ("reserved2", c_uint8 * 6),
+        ("ip_cidr_addr_bytes", c_uint8 * 16),
+        ("date_days", c_int32),
+        ("time_micros", c_int64),
+        ("timestamptz_micros", c_int64),
+        ("interval_months", c_int32),
+        ("interval_days", c_int32),
+        ("interval_micros", c_int64),
     ]
 
 
@@ -76,6 +99,18 @@ class DdbValueView(Structure):
         ("len", c_size_t),
         ("uuid_bytes", c_uint8 * 16),
         ("timestamp_micros", c_int64),
+        ("enum_type_id", c_uint64),
+        ("enum_label_id", c_uint64),
+        ("ip_family", c_uint8),
+        ("cidr_prefix_len", c_uint8),
+        ("reserved2", c_uint8 * 6),
+        ("ip_cidr_addr_bytes", c_uint8 * 16),
+        ("date_days", c_int32),
+        ("time_micros", c_int64),
+        ("timestamptz_micros", c_int64),
+        ("interval_months", c_int32),
+        ("interval_days", c_int32),
+        ("interval_micros", c_int64),
     ]
 
 
@@ -214,6 +249,16 @@ def load_library():
     _lib.ddb_db_describe_table_json.restype = c_uint32
     _lib.ddb_db_list_indexes_json.argtypes = [c_void_p, POINTER(c_char_p)]
     _lib.ddb_db_list_indexes_json.restype = c_uint32
+    if hasattr(_lib, "ddb_db_get_tooling_metadata_json"):
+        _lib.ddb_db_get_tooling_metadata_json.argtypes = [c_void_p, POINTER(c_char_p)]
+        _lib.ddb_db_get_tooling_metadata_json.restype = c_uint32
+    if hasattr(_lib, "ddb_db_describe_query_json"):
+        _lib.ddb_db_describe_query_json.argtypes = [
+            c_void_p,
+            c_char_p,
+            POINTER(c_char_p),
+        ]
+        _lib.ddb_db_describe_query_json.restype = c_uint32
     if hasattr(_lib, "ddb_db_inspect_storage_state_json"):
         _lib.ddb_db_inspect_storage_state_json.argtypes = [c_void_p, POINTER(c_char_p)]
         _lib.ddb_db_inspect_storage_state_json.restype = c_uint32
@@ -261,6 +306,20 @@ def load_library():
     _lib.ddb_stmt_bind_text.restype = c_uint32
     _lib.ddb_stmt_bind_blob.argtypes = [c_void_p, c_size_t, POINTER(c_uint8), c_size_t]
     _lib.ddb_stmt_bind_blob.restype = c_uint32
+    _lib.ddb_stmt_bind_geometry_wkb.argtypes = [
+        c_void_p,
+        c_size_t,
+        POINTER(c_uint8),
+        c_size_t,
+    ]
+    _lib.ddb_stmt_bind_geometry_wkb.restype = c_uint32
+    _lib.ddb_stmt_bind_geography_wkb.argtypes = [
+        c_void_p,
+        c_size_t,
+        POINTER(c_uint8),
+        c_size_t,
+    ]
+    _lib.ddb_stmt_bind_geography_wkb.restype = c_uint32
     _lib.ddb_stmt_bind_decimal.argtypes = [c_void_p, c_size_t, c_int64, c_uint8]
     _lib.ddb_stmt_bind_decimal.restype = c_uint32
     _lib.ddb_stmt_bind_timestamp_micros.argtypes = [c_void_p, c_size_t, c_int64]

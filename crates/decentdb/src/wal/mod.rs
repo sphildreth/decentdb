@@ -4,7 +4,11 @@ pub(crate) mod async_commit;
 pub(crate) mod background;
 pub(crate) mod checkpoint;
 pub(crate) mod delta;
+#[cfg(test)]
+mod delta_tests;
 pub(crate) mod format;
+#[cfg(test)]
+mod format_tests;
 pub(crate) mod index;
 pub(crate) mod index_sidecar;
 pub(crate) mod platform;
@@ -39,6 +43,8 @@ use self::index::{WalIndex, WalVersion};
 use self::index_sidecar::WalIndexSidecar;
 use self::reader_registry::{ReaderGuard, ReaderRegistry};
 
+const NO_RETAINED_SNAPSHOT_LSN: u64 = u64::MAX;
+
 #[derive(Clone, Debug)]
 pub(crate) struct WalHandle {
     inner: Arc<SharedWalInner>,
@@ -58,6 +64,7 @@ pub(crate) struct SharedWalInner {
     allocated_len: AtomicU64,
     write_lock: Mutex<WalWriteState>,
     reader_registry: ReaderRegistry,
+    retained_snapshot_lsn: AtomicU64,
     checkpoint_pending: AtomicBool,
     checkpoint_epoch: AtomicU64,
     /// `Some` when `sync_mode` is `WalSyncMode::AsyncCommit { .. }`; owns the
@@ -259,6 +266,20 @@ impl WalHandle {
 
     pub(crate) fn active_reader_count(&self) -> Result<usize> {
         self.inner.reader_registry.active_reader_count()
+    }
+
+    pub(crate) fn set_retained_snapshot_lsn(&self, snapshot_lsn: Option<u64>) {
+        self.inner.retained_snapshot_lsn.store(
+            snapshot_lsn.unwrap_or(NO_RETAINED_SNAPSHOT_LSN),
+            Ordering::Release,
+        );
+    }
+
+    pub(crate) fn retained_snapshot_lsn(&self) -> Option<u64> {
+        match self.inner.retained_snapshot_lsn.load(Ordering::Acquire) {
+            NO_RETAINED_SNAPSHOT_LSN => None,
+            snapshot_lsn => Some(snapshot_lsn),
+        }
     }
 
     pub(crate) fn warnings(&self) -> Result<Vec<String>> {

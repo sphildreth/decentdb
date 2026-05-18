@@ -2,6 +2,7 @@ package com.decentdb.jdbc;
 
 import org.junit.jupiter.api.*;
 import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
+import org.json.JSONObject;
 
 import java.io.File;
 import java.sql.*;
@@ -105,6 +106,24 @@ class MetadataTest {
         assertNotNull(decentMeta.getTableDdl("departments"));
         String triggersJson = decentMeta.listTriggersJson();
         assertNotNull(triggersJson);
+
+        JSONObject metadataJson = new JSONObject(decentMeta.getToolingMetadataJson());
+        assertEquals(1, metadataJson.getInt("metadata_version"));
+        assertEquals("sha256:decentdb-tooling-schema-v1",
+            metadataJson.getString("schema_fingerprint_algorithm"));
+        String fingerprint = metadataJson.getString("schema_fingerprint");
+        assertEquals(64, fingerprint.length());
+
+        JSONObject contractJson = new JSONObject(
+            decentMeta.describeQueryJson("SELECT emp_id, email FROM employees WHERE emp_id = $1"));
+        assertEquals(1, contractJson.getInt("contract_version"));
+        assertEquals("query", contractJson.getString("statement_kind"));
+        assertTrue(contractJson.getBoolean("read_only"));
+        assertEquals(fingerprint, contractJson.getString("schema_fingerprint"));
+        assertEquals("INT64",
+            contractJson.getJSONArray("parameters").getJSONObject(0).getString("type_name"));
+        assertEquals("emp_id",
+            contractJson.getJSONArray("parameters").getJSONObject(0).getString("source_column"));
     }
 
     // ---- getTables -------------------------------------------------------

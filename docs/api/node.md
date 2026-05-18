@@ -69,6 +69,7 @@ Unsupported arbitrary open-option strings are rejected instead of being silently
 - `inTransaction`
 - `listTables()`, `getTableColumns(name)`, `listIndexes()`
 - `getTableDdl(name)`, `listViewsInfo()`, `listViews()`, `getViewDdl(name)`, `listTriggers()`
+- `getToolingMetadata()`, `describeQueryContract(sql)`
 - instance getters: `abiVersion`, `engineVersion`
 - static helpers: `Database.abiVersion()`, `Database.version()`, `Database.evictSharedWal(path)`
 
@@ -87,6 +88,32 @@ Unsupported arbitrary open-option strings are rejected instead of being silently
 - `reBindInt64TextExecute(value, text)`
 
 Both `Database` and `Statement` also register a `FinalizationRegistry` safety net so dropped objects do not permanently leak native handles, but explicit `close()` / `finalize()` is still preferred.
+
+## Result Type Mapping
+
+Rows returned by `exec()`, `execAsync()`, `stepRowView()`, and `rowArray()` use
+these JavaScript shapes:
+
+| DecentDB type | JavaScript result value |
+|---|---|
+| `INT64` | `bigint` |
+| `FLOAT64` | `number` |
+| `BOOL` | `boolean` |
+| `TEXT` | `string` |
+| `BLOB`, `UUID`, `GEOMETRY`, `GEOGRAPHY` | `Buffer` |
+| `DECIMAL` | `{ unscaled: bigint, scale: number }` |
+| `TIMESTAMP` | `number` milliseconds since Unix epoch |
+| `ENUM` | `"typeId:labelId"` string |
+| `IPADDR` / `INET` | canonical `string` |
+| `CIDR` | canonical `string` |
+| `DATE` | `YYYY-MM-DD` string |
+| `TIME` | `HH:MM:SS.ffffff` string |
+| `TIMESTAMPTZ` | UTC ISO-like string ending in `Z` |
+| `INTERVAL` | `"months days micros"` string |
+| `MACADDR` / `MACADDR8` | canonical lowercase `string` |
+
+String parameters can be used for typed semantic columns when SQL provides the
+target column context.
 
 ## Knex usage
 

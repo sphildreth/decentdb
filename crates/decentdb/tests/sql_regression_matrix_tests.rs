@@ -1,7 +1,14 @@
 #![allow(clippy::approx_constant)]
 
+use chrono::NaiveDate;
 use decentdb::{Db, DbConfig, Value};
 use tempfile::TempDir;
+
+fn date_days(year: i32, month: u32, day: u32) -> i32 {
+    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+    let date = NaiveDate::from_ymd_opt(year, month, day).unwrap();
+    i32::try_from(date.signed_duration_since(epoch).num_days()).unwrap()
+}
 
 fn row_values(result: &decentdb::QueryResult) -> Vec<Vec<Value>> {
     result
@@ -573,7 +580,7 @@ fn matrix_scalar_and_json_examples_execute() {
             Value::Bool(true),
             Value::Bool(true),
             Value::Bool(true),
-            Value::Text("2024-04-15".to_string()),
+            Value::DateDays(date_days(2024, 4, 15)),
             Value::Text("2024-03-15 12:30:00".to_string()),
             Value::Text("2024".to_string()),
             Value::Int64(2024),

@@ -30,10 +30,13 @@ It targets a single process with **one writer** and **many concurrent readers** 
 
 - 🔒 **ACID Transactions** - Write-ahead logging with crash-safe recovery
 - 🌳 **B+Tree Storage** - Efficient tables and secondary indexes with page caching
+- 🔁 **Local-First Sync** - Durable change journals, scoped peer replication, conflict workflows, operational doctor tooling, CLI commands, and a typed .NET sync SDK
 - 🐘 **PostgreSQL-like SQL** - Familiar DDL/DML syntax with JOINs (INNER, LEFT, RIGHT, FULL OUTER, CROSS, NATURAL), CTEs (including WITH RECURSIVE), subqueries, window functions, and rich types (UUID, DECIMAL, native TIMESTAMP)
 - 🕒 **Native TIMESTAMP Type** - DATE/TIMESTAMP columns stored as int64 microseconds since Unix epoch (UTC); correct `ORDER BY` and `EXTRACT(YEAR|MONTH|DAY|HOUR|MINUTE|SECOND FROM ...)`, with native bind/read in all bindings
 - 👥 **Concurrent Reads** - Snapshot isolation allows multiple readers with one writer
+- 🌿 **Branch, Diff, Restore, And Time Travel** - Named snapshots, isolated branch writes, branch diffs, guarded restore, and constrained merge for migration rehearsal and agent sandboxes
 - 🔎 **Trigram Index** - Fast text search for `LIKE '%pattern%'` queries
+- 🗺️ **Native Geospatial** - `GEOMETRY` / `GEOGRAPHY` values, `ST_*` functions, and `USING spatial` indexes
 - 🧪 **Comprehensive Testing** - Unit tests, property tests, crash injection, and differential testing
 - 🔄 **Foreign Key Constraints** - Automatic indexing and referential integrity enforcement
 - 📊 **Rich Query Support** - Aggregates (including DISTINCT), subqueries (FROM, EXISTS, scalar), UPSERT, set operations, generated columns, and scalar functions (string, math, UUID, JSON)
@@ -172,6 +175,11 @@ decentdb exec --db ./my.ddb --sql "SELECT u.name, SUM(o.amount) AS total
 # Text search with trigram index
 decentdb exec --db ./my.ddb --sql "CREATE INDEX idx_users_name ON users USING trigram(name)"
 decentdb exec --db ./my.ddb --sql "SELECT * FROM users WHERE name LIKE '%ali%'"
+
+# Geospatial radius query with a spatial index
+decentdb exec --db ./my.ddb --sql "CREATE TABLE places (id INT PRIMARY KEY, geog GEOGRAPHY(POINT,4326))"
+decentdb exec --db ./my.ddb --sql "CREATE INDEX idx_places_geog ON places USING spatial(geog)"
+decentdb exec --db ./my.ddb --sql "SELECT id FROM places WHERE ST_DWithin(geog, ST_GeogPoint(-97.7431, 30.2672), 5000)"
 ```
 
 ### Import/Export

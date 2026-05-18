@@ -16,13 +16,14 @@ use crate::sql::ast::{
     InsertStatement, SelectItem, UpdateStatement,
 };
 use crate::sql::parser::parse_expression_sql;
+use crate::sync::{self, SyncOperation};
 
 use super::row::{ColumnBinding, Dataset, QueryResult, QueryRow};
 use super::{
     compare_values, compute_index_key, compute_index_values, generated_columns_are_stored,
-    row_satisfies_index_predicate, table_row_dataset, EngineRuntime, RuntimeBtreeKey, RuntimeIndex,
-    RuntimeRowIdSet, StoredRow, TablePageManifest, TableRowRef, TableRowSource,
-    PAGED_TABLE_RESIDENT_APPEND_ROW_THRESHOLD,
+    row_satisfies_index_predicate, spatial_index_value_for_row, table_row_dataset, EngineRuntime,
+    RuntimeBtreeKey, RuntimeIndex, RuntimeRowIdSet, StoredRow, TablePageManifest, TableRowRef,
+    TableRowSource, PAGED_TABLE_RESIDENT_APPEND_ROW_THRESHOLD,
 };
 
 #[derive(Clone, Debug)]
@@ -121,6 +122,43 @@ pub(crate) struct PreparedSimpleDelete {
 }
 
 impl EngineRuntime {
+    fn record_sync_update_for_row(
+        &mut self,
+        table: &crate::catalog::TableSchema,
+        values: &[Value],
+    ) {
+        if table.temporary || sync::is_internal_table_name(&table.name) {
+            return;
+        }
+        let pk = sync::build_primary_key_json(table, values);
+        let after = sync::build_after_json(table, values);
+        self.record_sync_mutation(
+            &table.name,
+            SyncOperation::Update,
+            pk,
+            Some(after),
+            self.catalog.schema_cookie,
+        );
+    }
+
+    fn record_sync_delete_for_row(
+        &mut self,
+        table: &crate::catalog::TableSchema,
+        values: &[Value],
+    ) {
+        if table.temporary || sync::is_internal_table_name(&table.name) {
+            return;
+        }
+        let pk = sync::build_primary_key_json(table, values);
+        self.record_sync_mutation(
+            &table.name,
+            SyncOperation::Delete,
+            pk,
+            None,
+            self.catalog.schema_cookie,
+        );
+    }
+
     pub(crate) fn can_execute_statement_in_state_without_clone(
         &self,
         statement: &crate::sql::ast::Statement,
@@ -474,6 +512,13 @@ impl EngineRuntime {
         let table = self
             .table_schema(&statement.table_name)
             .ok_or_else(|| DbError::sql(format!("unknown table {}", statement.table_name)))?;
+        if table
+            .columns
+            .iter()
+            .any(|column| column.column_type == ColumnType::Enum)
+        {
+            return Ok(None);
+        }
         let InsertSource::Values(rows) = &statement.source else {
             return Ok(None);
         };
@@ -661,6 +706,9 @@ impl EngineRuntime {
         if column.generated_sql.is_some() {
             return Ok(None);
         }
+        if column.column_type == ColumnType::Enum {
+            return Ok(None);
+        }
 
         let assignment_columns = [column_index];
         if assignment_targets_referenced_parent_key_columns(self, table, &assignment_columns) {
@@ -748,6 +796,27 @@ impl EngineRuntime {
                         row_id,
                         &updated_values,
                     );
+                    let sync_info = self
+                        .catalog
+                        .table(prepared.table_name.as_str())
+                        .filter(|s| !s.temporary && !sync::is_internal_table_name(&s.name))
+                        .map(|schema| {
+                            (
+                                sync::build_primary_key_json(schema, &updated_values),
+                                sync::build_after_json(schema, &updated_values),
+                                schema.primary_key_columns.clone(),
+                            )
+                        });
+                    if let Some((pk, after, _)) = sync_info {
+                        let schema_cookie = self.catalog.schema_cookie;
+                        self.record_sync_mutation(
+                            &prepared.table_name,
+                            SyncOperation::Update,
+                            pk,
+                            Some(after),
+                            schema_cookie,
+                        );
+                    }
                 }
                 Ok(QueryResult::with_affected_rows(1))
             }
@@ -764,6 +833,7 @@ impl EngineRuntime {
                 if *current_value != next_value {
                     let mut next_values = current_row.values().to_vec();
                     next_values[prepared.column_index] = next_value;
+                    let updated_values = next_values.clone();
                     let mut row_changes = BTreeMap::new();
                     row_changes.insert(row_id, Some(next_values));
                     let updated_manifest = super::apply_paged_row_changes_to_manifest(
@@ -775,6 +845,26 @@ impl EngineRuntime {
                         TableRowSource::Paged(Arc::new(updated_manifest)),
                     )?;
                     self.mark_table_dirty(&prepared.table_name);
+                    let sync_data = self
+                        .catalog
+                        .table(prepared.table_name.as_str())
+                        .filter(|s| !s.temporary && !sync::is_internal_table_name(&s.name))
+                        .map(|schema| {
+                            (
+                                sync::build_primary_key_json(schema, &updated_values),
+                                sync::build_after_json(schema, &updated_values),
+                            )
+                        });
+                    if let Some((pk, after)) = sync_data {
+                        let schema_cookie = self.catalog.schema_cookie;
+                        self.record_sync_mutation(
+                            &prepared.table_name,
+                            SyncOperation::Update,
+                            pk,
+                            Some(after),
+                            schema_cookie,
+                        );
+                    }
                 }
                 Ok(QueryResult::with_affected_rows(1))
             }
@@ -993,6 +1083,18 @@ impl EngineRuntime {
         }
 
         self.mark_table_dirty(&prepared.table.name);
+        if !prepared.table.temporary && !sync::is_internal_table_name(&prepared.table.name) {
+            for row in &removed_rows {
+                let pk = sync::build_primary_key_json(&prepared.table, &row.values);
+                self.record_sync_mutation(
+                    &prepared.table.name,
+                    SyncOperation::Delete,
+                    pk,
+                    None,
+                    self.catalog.schema_cookie,
+                );
+            }
+        }
         Ok(QueryResult::with_affected_rows(removed_rows.len() as u64))
     }
 
@@ -1074,6 +1176,7 @@ impl EngineRuntime {
 
             candidate.push(super::cast_value(value, column.column_type)?);
         }
+        let candidate_clone = candidate.clone();
         let affected = self.apply_prepared_simple_insert_candidate(
             prepared,
             candidate,
@@ -1081,6 +1184,28 @@ impl EngineRuntime {
             params,
             page_size,
         )?;
+        if affected > 0 {
+            let sync_data = self
+                .catalog
+                .table(prepared.table_name.as_str())
+                .filter(|s| !s.temporary && !sync::is_internal_table_name(&s.name))
+                .map(|schema| {
+                    (
+                        sync::build_primary_key_json(schema, &candidate_clone),
+                        sync::build_after_json(schema, &candidate_clone),
+                    )
+                });
+            if let Some((pk, after)) = sync_data {
+                let schema_cookie = self.catalog.schema_cookie;
+                self.record_sync_mutation(
+                    &prepared.table_name,
+                    SyncOperation::Insert,
+                    pk,
+                    Some(after),
+                    schema_cookie,
+                );
+            }
+        }
         Ok(QueryResult::with_affected_rows(affected))
     }
 
@@ -1513,7 +1638,7 @@ impl EngineRuntime {
                     None,
                 )?;
                 next_values[*column_index] =
-                    super::cast_value(value, table.columns[*column_index].column_type)?;
+                    super::constraints::coerce_column_value(&table.columns[*column_index], value)?;
             }
             apply_generated_columns(self, table, &mut next_values, params)?;
             if next_values == current_row.values {
@@ -1564,6 +1689,7 @@ impl EngineRuntime {
                     values: next_values.clone(),
                 });
             }
+            self.record_sync_update_for_row(table, &next_values);
             row_changes.insert(row_id, Some(next_values));
             affected_rows += 1;
             changed_rows += 1;
@@ -1686,6 +1812,7 @@ impl EngineRuntime {
             )?;
             for row in &matching_rows {
                 self.mark_table_row_deleted(&table.name, row.row_id);
+                self.record_sync_delete_for_row(table, &row.values);
             }
             if !indexes_remain_fresh {
                 self.mark_indexes_stale_for_table(&table.name);
@@ -1843,8 +1970,10 @@ impl EngineRuntime {
                         "parameter ${param_index} was not provided"
                     )));
                 };
-                let next_email =
-                    super::cast_value(new_email, table.columns[column_index].column_type)?;
+                let next_email = super::constraints::coerce_column_value(
+                    &table.columns[column_index],
+                    new_email,
+                )?;
                 if indexes_to_update.is_empty() {
                     if !table.columns[column_index].nullable && matches!(next_email, Value::Null) {
                         return Err(DbError::constraint(format!(
@@ -1883,6 +2012,7 @@ impl EngineRuntime {
                             single_row_id,
                             &updated_values,
                         );
+                        self.record_sync_update_for_row(&table, &updated_values);
                     }
                     self.execute_after_triggers(&table_name, TriggerEvent::Update, 1, page_size)?;
                     return Ok(QueryResult::with_affected_rows(1));
@@ -1961,6 +2091,7 @@ impl EngineRuntime {
                         single_row_id,
                         &updated_values,
                     );
+                    self.record_sync_update_for_row(&table, &updated_values);
                 }
                 self.execute_after_triggers(&table_name, TriggerEvent::Update, 1, page_size)?;
                 return Ok(QueryResult::with_affected_rows(1));
@@ -1995,7 +2126,7 @@ impl EngineRuntime {
                     None,
                 )?;
                 next_values[*column_index] =
-                    super::cast_value(value, table.columns[*column_index].column_type)?;
+                    super::constraints::coerce_column_value(&table.columns[*column_index], value)?;
             }
             apply_generated_columns(self, &table, &mut next_values, params)?;
             if next_values == current_row.values {
@@ -2052,6 +2183,7 @@ impl EngineRuntime {
                 .replace_row_values(row_index, next_values.clone())
                 .ok_or_else(|| DbError::internal(format!("row {row_id} vanished during UPDATE")))?;
             self.mark_table_row_dirty(&table_name, row_index, row_id, &next_values);
+            self.record_sync_update_for_row(&table, &next_values);
             if let Some(values) = returning_values {
                 returning_rows.push(StoredRow { row_id, values });
             }
@@ -2190,6 +2322,7 @@ impl EngineRuntime {
                 }
                 for row in &removed_rows {
                     self.mark_table_row_deleted(&table_name, row.row_id);
+                    self.record_sync_delete_for_row(&table, &row.values);
                 }
             }
             self.execute_after_triggers(
@@ -2270,6 +2403,7 @@ impl EngineRuntime {
             }
             for row in &matching_rows {
                 self.mark_table_row_deleted(&table_name, row.row_id);
+                self.record_sync_delete_for_row(&table, &row.values);
             }
         }
 
@@ -2416,7 +2550,7 @@ impl EngineRuntime {
                 Some(&excluded),
             )?;
             next_values[column_index] =
-                super::cast_value(value, table.columns[column_index].column_type)?;
+                super::constraints::coerce_column_value(&table.columns[column_index], value)?;
         }
         apply_generated_columns(self, &table, &mut next_values, params)?;
         let assignment_columns = assignments
@@ -2975,7 +3109,7 @@ fn apply_generated_columns(
             &std::collections::BTreeMap::new(),
             None,
         )?;
-        row[index] = super::cast_value(value, column.column_type)?;
+        row[index] = super::constraints::coerce_column_value(column, value)?;
     }
     Ok(())
 }
@@ -3792,6 +3926,23 @@ fn apply_runtime_index_update_for_row_change(
             }
             Ok(true)
         }
+        IndexKind::Spatial => {
+            let old_value = spatial_index_value_for_row(runtime, index, table, old_row_values)?;
+            let new_value = spatial_index_value_for_row(runtime, index, table, new_row_values)?;
+            let Some(RuntimeIndex::Spatial { index: spatial }) = runtime.index_mut(&index.name)
+            else {
+                return Ok(false);
+            };
+            if old_value.is_some() {
+                spatial.remove(row_id);
+            }
+            if let Some(value) = new_value {
+                spatial
+                    .insert(row_id, value)
+                    .map_err(|error| DbError::constraint(error.to_string()))?;
+            }
+            Ok(true)
+        }
     }
 }
 
@@ -3824,6 +3975,14 @@ fn apply_runtime_index_delete_for_row(
                     .map_err(|_| DbError::internal(format!("row_id {row_id} is invalid")))?;
                 trigram.queue_delete(row_id, &text);
             }
+            Ok(true)
+        }
+        IndexKind::Spatial => {
+            let Some(RuntimeIndex::Spatial { index: spatial }) = runtime.index_mut(&index.name)
+            else {
+                return Ok(false);
+            };
+            spatial.remove(row_id);
             Ok(true)
         }
     }
@@ -4389,6 +4548,8 @@ mod tests {
             columns: vec![crate::catalog::ColumnSchema {
                 name: "id".to_string(),
                 column_type: crate::catalog::ColumnType::Int64,
+                spatial_type: None,
+                enum_type: None,
                 nullable: false,
                 default_sql: None,
                 generated_sql: None,
@@ -4472,6 +4633,8 @@ mod tests {
             columns: vec![crate::catalog::ColumnSchema {
                 name: "a".to_string(),
                 column_type: crate::catalog::ColumnType::Int64,
+                spatial_type: None,
+                enum_type: None,
                 nullable: false,
                 default_sql: None,
                 generated_sql: None,
@@ -4503,6 +4666,8 @@ mod tests {
             columns: vec![crate::catalog::ColumnSchema {
                 name: "id".to_string(),
                 column_type: crate::catalog::ColumnType::Int64,
+                spatial_type: None,
+                enum_type: None,
                 nullable: false,
                 default_sql: None,
                 generated_sql: None,
@@ -4527,6 +4692,8 @@ mod tests {
                 crate::catalog::ColumnSchema {
                     name: "id".to_string(),
                     column_type: crate::catalog::ColumnType::Int64,
+                    spatial_type: None,
+                    enum_type: None,
                     nullable: false,
                     default_sql: None,
                     generated_sql: None,
@@ -4540,6 +4707,8 @@ mod tests {
                 crate::catalog::ColumnSchema {
                     name: "parent_id".to_string(),
                     column_type: crate::catalog::ColumnType::Int64,
+                    spatial_type: None,
+                    enum_type: None,
                     nullable: false,
                     default_sql: None,
                     generated_sql: None,
@@ -4600,6 +4769,8 @@ mod tests {
             columns: vec![crate::catalog::ColumnSchema {
                 name: "id".to_string(),
                 column_type: crate::catalog::ColumnType::Int64,
+                spatial_type: None,
+                enum_type: None,
                 nullable: false,
                 default_sql: None,
                 generated_sql: None,
@@ -4624,6 +4795,8 @@ mod tests {
                 crate::catalog::ColumnSchema {
                     name: "id".to_string(),
                     column_type: crate::catalog::ColumnType::Int64,
+                    spatial_type: None,
+                    enum_type: None,
                     nullable: false,
                     default_sql: None,
                     generated_sql: None,
@@ -4637,6 +4810,8 @@ mod tests {
                 crate::catalog::ColumnSchema {
                     name: "parent_id".to_string(),
                     column_type: crate::catalog::ColumnType::Int64,
+                    spatial_type: None,
+                    enum_type: None,
                     nullable: true,
                     default_sql: None,
                     generated_sql: None,
@@ -4699,6 +4874,8 @@ mod tests {
             columns: vec![crate::catalog::ColumnSchema {
                 name: "id".to_string(),
                 column_type: crate::catalog::ColumnType::Int64,
+                spatial_type: None,
+                enum_type: None,
                 nullable: false,
                 default_sql: None,
                 generated_sql: None,
@@ -4723,6 +4900,8 @@ mod tests {
                 crate::catalog::ColumnSchema {
                     name: "id".to_string(),
                     column_type: crate::catalog::ColumnType::Int64,
+                    spatial_type: None,
+                    enum_type: None,
                     nullable: false,
                     default_sql: None,
                     generated_sql: None,
@@ -4736,6 +4915,8 @@ mod tests {
                 crate::catalog::ColumnSchema {
                     name: "parent_id".to_string(),
                     column_type: crate::catalog::ColumnType::Int64,
+                    spatial_type: None,
+                    enum_type: None,
                     nullable: false,
                     default_sql: None,
                     generated_sql: None,
@@ -4813,6 +4994,8 @@ mod tests {
                 crate::catalog::ColumnSchema {
                     name: "id".to_string(),
                     column_type: crate::catalog::ColumnType::Int64,
+                    spatial_type: None,
+                    enum_type: None,
                     nullable: false,
                     default_sql: None,
                     generated_sql: None,
@@ -4826,6 +5009,8 @@ mod tests {
                 crate::catalog::ColumnSchema {
                     name: "parent_a".to_string(),
                     column_type: crate::catalog::ColumnType::Int64,
+                    spatial_type: None,
+                    enum_type: None,
                     nullable: false,
                     default_sql: None,
                     generated_sql: None,
@@ -4839,6 +5024,8 @@ mod tests {
                 crate::catalog::ColumnSchema {
                     name: "parent_b".to_string(),
                     column_type: crate::catalog::ColumnType::Int64,
+                    spatial_type: None,
+                    enum_type: None,
                     nullable: false,
                     default_sql: None,
                     generated_sql: None,
@@ -4934,6 +5121,8 @@ mod tests {
                 crate::catalog::ColumnSchema {
                     name: "a".to_string(),
                     column_type: crate::catalog::ColumnType::Int64,
+                    spatial_type: None,
+                    enum_type: None,
                     nullable: false,
                     default_sql: None,
                     generated_sql: None,
@@ -4947,6 +5136,8 @@ mod tests {
                 crate::catalog::ColumnSchema {
                     name: "b".to_string(),
                     column_type: crate::catalog::ColumnType::Int64,
+                    spatial_type: None,
+                    enum_type: None,
                     nullable: false,
                     default_sql: None,
                     generated_sql: None,
@@ -4972,6 +5163,8 @@ mod tests {
                 crate::catalog::ColumnSchema {
                     name: "id".to_string(),
                     column_type: crate::catalog::ColumnType::Int64,
+                    spatial_type: None,
+                    enum_type: None,
                     nullable: false,
                     default_sql: None,
                     generated_sql: None,
@@ -4985,6 +5178,8 @@ mod tests {
                 crate::catalog::ColumnSchema {
                     name: "parent_a".to_string(),
                     column_type: crate::catalog::ColumnType::Int64,
+                    spatial_type: None,
+                    enum_type: None,
                     nullable: false,
                     default_sql: None,
                     generated_sql: None,
@@ -4998,6 +5193,8 @@ mod tests {
                 crate::catalog::ColumnSchema {
                     name: "parent_b".to_string(),
                     column_type: crate::catalog::ColumnType::Int64,
+                    spatial_type: None,
+                    enum_type: None,
                     nullable: false,
                     default_sql: None,
                     generated_sql: None,
@@ -5125,6 +5322,8 @@ mod tests {
             columns: vec![crate::catalog::ColumnSchema {
                 name: "id".to_string(),
                 column_type: crate::catalog::ColumnType::Int64,
+                spatial_type: None,
+                enum_type: None,
                 nullable: false,
                 default_sql: None,
                 generated_sql: None,
@@ -5149,6 +5348,8 @@ mod tests {
                 crate::catalog::ColumnSchema {
                     name: "id".to_string(),
                     column_type: crate::catalog::ColumnType::Int64,
+                    spatial_type: None,
+                    enum_type: None,
                     nullable: false,
                     default_sql: None,
                     generated_sql: None,
@@ -5162,6 +5363,8 @@ mod tests {
                 crate::catalog::ColumnSchema {
                     name: "parent_id".to_string(),
                     column_type: crate::catalog::ColumnType::Int64,
+                    spatial_type: None,
+                    enum_type: None,
                     nullable: false,
                     default_sql: None,
                     generated_sql: None,
@@ -5220,6 +5423,8 @@ mod tests {
             columns: vec![crate::catalog::ColumnSchema {
                 name: "id".to_string(),
                 column_type: crate::catalog::ColumnType::Int64,
+                spatial_type: None,
+                enum_type: None,
                 nullable: false,
                 default_sql: None,
                 generated_sql: None,
@@ -5244,6 +5449,8 @@ mod tests {
                 crate::catalog::ColumnSchema {
                     name: "id".to_string(),
                     column_type: crate::catalog::ColumnType::Int64,
+                    spatial_type: None,
+                    enum_type: None,
                     nullable: false,
                     default_sql: None,
                     generated_sql: None,
@@ -5257,6 +5464,8 @@ mod tests {
                 crate::catalog::ColumnSchema {
                     name: "parent_id".to_string(),
                     column_type: crate::catalog::ColumnType::Int64,
+                    spatial_type: None,
+                    enum_type: None,
                     nullable: false,
                     default_sql: None,
                     generated_sql: None,
@@ -5326,6 +5535,8 @@ mod tests {
             columns: vec![crate::catalog::ColumnSchema {
                 name: "id".to_string(),
                 column_type: crate::catalog::ColumnType::Int64,
+                spatial_type: None,
+                enum_type: None,
                 nullable: false,
                 default_sql: None,
                 generated_sql: None,
@@ -5350,6 +5561,8 @@ mod tests {
                 crate::catalog::ColumnSchema {
                     name: "id".to_string(),
                     column_type: crate::catalog::ColumnType::Int64,
+                    spatial_type: None,
+                    enum_type: None,
                     nullable: false,
                     default_sql: None,
                     generated_sql: None,
@@ -5363,6 +5576,8 @@ mod tests {
                 crate::catalog::ColumnSchema {
                     name: "parent_id".to_string(),
                     column_type: crate::catalog::ColumnType::Int64,
+                    spatial_type: None,
+                    enum_type: None,
                     nullable: true,
                     default_sql: None,
                     generated_sql: None,
@@ -5432,6 +5647,8 @@ mod tests {
             columns: vec![crate::catalog::ColumnSchema {
                 name: "id".to_string(),
                 column_type: crate::catalog::ColumnType::Int64,
+                spatial_type: None,
+                enum_type: None,
                 nullable: false,
                 default_sql: None,
                 generated_sql: None,
@@ -5456,6 +5673,8 @@ mod tests {
                 crate::catalog::ColumnSchema {
                     name: "id".to_string(),
                     column_type: crate::catalog::ColumnType::Int64,
+                    spatial_type: None,
+                    enum_type: None,
                     nullable: false,
                     default_sql: None,
                     generated_sql: None,
@@ -5469,6 +5688,8 @@ mod tests {
                 crate::catalog::ColumnSchema {
                     name: "parent_id".to_string(),
                     column_type: crate::catalog::ColumnType::Int64,
+                    spatial_type: None,
+                    enum_type: None,
                     nullable: true,
                     default_sql: None,
                     generated_sql: None,
@@ -5542,6 +5763,8 @@ mod tests {
             columns: vec![crate::catalog::ColumnSchema {
                 name: "id".to_string(),
                 column_type: crate::catalog::ColumnType::Int64,
+                spatial_type: None,
+                enum_type: None,
                 nullable: false,
                 default_sql: None,
                 generated_sql: None,
@@ -5566,6 +5789,8 @@ mod tests {
                 crate::catalog::ColumnSchema {
                     name: "id".to_string(),
                     column_type: crate::catalog::ColumnType::Int64,
+                    spatial_type: None,
+                    enum_type: None,
                     nullable: false,
                     default_sql: None,
                     generated_sql: None,
@@ -5579,6 +5804,8 @@ mod tests {
                 crate::catalog::ColumnSchema {
                     name: "parent_id".to_string(),
                     column_type: crate::catalog::ColumnType::Int64,
+                    spatial_type: None,
+                    enum_type: None,
                     nullable: false,
                     default_sql: None,
                     generated_sql: None,
@@ -5651,6 +5878,8 @@ mod apply_conflict_tests {
                 crate::catalog::ColumnSchema {
                     name: "id".to_string(),
                     column_type: crate::catalog::ColumnType::Int64,
+                    spatial_type: None,
+                    enum_type: None,
                     nullable: false,
                     default_sql: None,
                     generated_sql: None,
@@ -5664,6 +5893,8 @@ mod apply_conflict_tests {
                 crate::catalog::ColumnSchema {
                     name: "val".to_string(),
                     column_type: crate::catalog::ColumnType::Int64,
+                    spatial_type: None,
+                    enum_type: None,
                     nullable: false,
                     default_sql: None,
                     generated_sql: None,
@@ -5723,6 +5954,8 @@ mod apply_conflict_tests {
                 crate::catalog::ColumnSchema {
                     name: "id".to_string(),
                     column_type: crate::catalog::ColumnType::Int64,
+                    spatial_type: None,
+                    enum_type: None,
                     nullable: false,
                     default_sql: None,
                     generated_sql: None,
@@ -5736,6 +5969,8 @@ mod apply_conflict_tests {
                 crate::catalog::ColumnSchema {
                     name: "g".to_string(),
                     column_type: crate::catalog::ColumnType::Int64,
+                    spatial_type: None,
+                    enum_type: None,
                     nullable: false,
                     default_sql: None,
                     generated_sql: Some("1".to_string()),
@@ -5749,6 +5984,8 @@ mod apply_conflict_tests {
                 crate::catalog::ColumnSchema {
                     name: "val".to_string(),
                     column_type: crate::catalog::ColumnType::Int64,
+                    spatial_type: None,
+                    enum_type: None,
                     nullable: false,
                     default_sql: None,
                     generated_sql: None,
@@ -5805,6 +6042,8 @@ mod apply_conflict_tests {
                 crate::catalog::ColumnSchema {
                     name: "id".to_string(),
                     column_type: crate::catalog::ColumnType::Int64,
+                    spatial_type: None,
+                    enum_type: None,
                     nullable: false,
                     default_sql: None,
                     generated_sql: None,
@@ -5818,6 +6057,8 @@ mod apply_conflict_tests {
                 crate::catalog::ColumnSchema {
                     name: "val".to_string(),
                     column_type: crate::catalog::ColumnType::Int64,
+                    spatial_type: None,
+                    enum_type: None,
                     nullable: false,
                     default_sql: None,
                     generated_sql: None,
@@ -5884,6 +6125,8 @@ mod apply_conflict_tests {
                 crate::catalog::ColumnSchema {
                     name: "id".to_string(),
                     column_type: crate::catalog::ColumnType::Int64,
+                    spatial_type: None,
+                    enum_type: None,
                     nullable: false,
                     default_sql: None,
                     generated_sql: None,
@@ -5897,6 +6140,8 @@ mod apply_conflict_tests {
                 crate::catalog::ColumnSchema {
                     name: "val".to_string(),
                     column_type: crate::catalog::ColumnType::Int64,
+                    spatial_type: None,
+                    enum_type: None,
                     nullable: false,
                     default_sql: None,
                     generated_sql: None,
@@ -6024,6 +6269,8 @@ mod dml_private_tests {
             columns: vec![crate::catalog::ColumnSchema {
                 name: "id".to_string(),
                 column_type: crate::catalog::ColumnType::Int64,
+                spatial_type: None,
+                enum_type: None,
                 nullable: false,
                 default_sql: None,
                 generated_sql: None,

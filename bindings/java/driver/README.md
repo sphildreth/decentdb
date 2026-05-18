@@ -2,6 +2,13 @@
 
 JDBC driver implementation for DecentDB.
 
+## Semantic result values
+
+JDBC metadata maps `DATE`, `TIME`, and `TIMESTAMPTZ` to standard JDBC temporal
+types. `ENUM`, `IPADDR`, `CIDR`, and `INTERVAL` are exposed as strings,
+`MACADDR` as `Types.OTHER` with a canonical string value, and `TIMESTAMPTZ`
+values are normalized to UTC timestamps.
+
 ## Standalone example
 
 Run the standalone JDBC example:

@@ -7,6 +7,7 @@
 
 #[cfg(feature = "bench-internals")]
 pub mod benchmark;
+mod branch;
 mod btree;
 mod c_api;
 mod catalog;
@@ -22,11 +23,19 @@ mod metadata;
 mod planner;
 mod record;
 mod search;
+pub(crate) mod spatial;
 mod sql;
 mod storage;
+mod sync;
+mod tooling;
 mod vfs;
 mod wal;
 
+pub use crate::branch::{
+    BranchDiffReport, BranchInfo, BranchLogEntry, BranchMergeChange, BranchMergeConflict,
+    BranchMergeOperation, BranchMergeReport, BranchRestoreReport, BranchRowDiff, BranchTableDiff,
+    BranchTableDiffStatus, NamedSnapshot,
+};
 pub use crate::config::{DbConfig, WalSyncMode};
 pub use crate::db::{evict_shared_wal, Db, PreparedStatement, SqlTransaction};
 pub use crate::doctor::{
@@ -40,11 +49,20 @@ pub use crate::error::{DbError, DbErrorCode, Result};
 pub use crate::exec::{BulkLoadOptions, QueryResult, QueryRow};
 pub use crate::metadata::{
     CheckConstraintInfo, ColumnInfo, ForeignKeyInfo, HeaderInfo, IndexInfo, IndexVerification,
-    SchemaColumnInfo, SchemaIndexInfo, SchemaSnapshot, SchemaTableInfo, SchemaTriggerInfo,
-    SchemaViewInfo, StorageInfo, TableInfo, TriggerInfo, ViewInfo,
+    QueryContract, QueryParameterInfo, QueryResultColumnInfo, SchemaColumnInfo, SchemaIndexInfo,
+    SchemaSnapshot, SchemaTableInfo, SchemaTriggerInfo, SchemaViewInfo, StorageInfo, TableInfo,
+    ToolingCapabilities, ToolingColumnTypeMetadata, ToolingMetadata, ToolingSpatialTypeInfo,
+    ToolingTypeInfo, TriggerInfo, ViewInfo,
 };
 pub use crate::record::value::Value;
 pub use crate::storage::DB_FORMAT_VERSION;
+pub use crate::sync::{
+    SyncChangeBatch, SyncConflict, SyncConflictPolicy, SyncConflictPolicyConfig,
+    SyncDoctorSeverity, SyncHandshake, SyncImportSummary, SyncJournalIntegrityReport,
+    SyncJournalIssue, SyncJournalRecord, SyncOperationalDoctorReport, SyncPeer, SyncPeerLag,
+    SyncPeerScopeBinding, SyncPruneSummary, SyncRetentionReport, SyncRunDirection, SyncRunSummary,
+    SyncScope, SyncSession, SyncStatus,
+};
 
 /// Returns the DecentDB crate version.
 #[must_use]

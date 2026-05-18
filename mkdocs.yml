@@ -4,6 +4,8 @@ site_author: DecentDB Contributors
 site_url: https://decentdb.org
 
 docs_dir: docs
+exclude_docs: |
+  README.md
 
 nav:
   - Home: index.md
@@ -15,8 +17,21 @@ nav:
     - SQL Reference: user-guide/sql-reference.md
     - SQL Feature Matrix: user-guide/sql-feature-matrix.md
     - Data Types: user-guide/data-types.md
+    - Interactive SQL Shell: user-guide/repl.md
+    - Branching, Diff, Restore, And Time Travel: user-guide/branching.md
     - Migrations: user-guide/migration.md
     - Transactions: user-guide/transactions.md
+    - Local-first sync:
+      - Overview: user-guide/sync/index.md
+      - Quickstart: user-guide/sync/quickstart.md
+      - Concepts: user-guide/sync/concepts.md
+      - Scopes: user-guide/sync/scopes.md
+      - Conflicts: user-guide/sync/conflicts.md
+      - Schema compatibility: user-guide/sync/schema-compatibility.md
+      - Security: user-guide/sync/security.md
+      - Operations: user-guide/sync/operations.md
+      - Troubleshooting: user-guide/sync/troubleshooting.md
+      - Examples: user-guide/sync/examples.md
     - Indexes: user-guide/indexes.md
     - Performance Tuning: user-guide/performance.md
     - Benchmarks: user-guide/benchmarks.md
@@ -38,6 +53,7 @@ nav:
     - Error Codes: api/error-codes.md
     - Configuration: api/configuration.md
     - Language Bindings:
+      - C/C++ ABI: api/c-cpp.md
       - .NET (C#): api/dotnet.md
       - Dart/Flutter: api/dart.md
       - Go: api/go.md

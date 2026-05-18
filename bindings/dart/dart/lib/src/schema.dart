@@ -127,4 +127,23 @@ class Schema {
     );
     return SchemaSnapshot.fromJson(jsonDecode(json) as Map<String, dynamic>);
   }
+
+  Map<String, dynamic> getToolingMetadata() {
+    final json = _callDbString(
+      _bindings.dbGetToolingMetadataJson,
+      'Failed to get tooling metadata',
+    );
+    return jsonDecode(json) as Map<String, dynamic>;
+  }
+
+  Map<String, dynamic> describeQueryContract(String sql) {
+    final json = _callNamedString(
+      sql,
+      _bindings.dbDescribeQueryJson,
+      'Failed to describe query',
+    );
+    return jsonDecode(json) as Map<String, dynamic>;
+  }
+
+  Map<String, dynamic> describeQuery(String sql) => describeQueryContract(sql);
 }

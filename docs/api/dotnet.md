@@ -22,8 +22,8 @@ and `bindings/dotnet/benchmarks/`.
 
 ## C ABI coverage
 
-The .NET binding declares and exposes **all 50 C ABI functions** defined in
-`include/decentdb.h`. Performance-critical paths (batch execution, fused
+The .NET binding declares the C ABI functions used by the native, ADO.NET, EF
+Core, and MicroORM surfaces. Performance-critical paths (batch execution, fused
 bind+step, re-execute, zero-copy row views) are exposed through
 `DecentDBNativeUnsafe` and wrapped by the `PreparedStatement` class.
 
@@ -217,7 +217,7 @@ The current in-tree provider validation covers:
 ## Version introspection
 
 ```csharp
-uint abi = DecentDB.AbiVersion();       // e.g. 1
+uint abi = DecentDB.AbiVersion();       // e.g. 2
 string ver = DecentDB.EngineVersion();  // e.g. "2.0.0"
 
 // Via ADO.NET
@@ -305,10 +305,16 @@ string viewDdl = db.GetViewDdl("v_active_users");      // CREATE VIEW ...
 // Triggers
 string triggersJson = db.ListTriggersJson();
 
+// Stable tooling metadata
+string metadataJson = db.GetToolingMetadataJson();
+string contractJson = db.DescribeQueryJson("SELECT id FROM users WHERE id = $1");
+
 // Via ADO.NET
 string ddl = conn.GetTableDdl("users");
 string views = conn.ListViewsJson();
 string triggers = conn.ListTriggersJson();
+string metadata = conn.GetToolingMetadataJson();
+string contract = conn.DescribeQueryJson("SELECT id FROM users WHERE id = $1");
 bool inTxn = conn.InTransaction;
 ```
 
@@ -326,6 +332,16 @@ The binding supports all DecentDB native types:
 | `byte[]` | BLOB | `BindBlob()` | `GetBlob()` |
 | `Guid` | UUID | `BindGuid()` | `GetGuid()` |
 | `DateTime` | TIMESTAMP | `BindDatetime(micros)` | `GetTimestampMicros()` / `GetValueObject()` |
+| `DecentDBEnumValue` | ENUM | string labels in column context | `GetValueObject()` |
+| `string` | IPADDR / CIDR / MACADDR | `BindText()` in column context | `GetText()` / `GetValueObject()` |
+| `DateOnly` | DATE | integer day count or text in column context | `GetValueObject()` |
+| `TimeOnly` | TIME | integer microseconds or text in column context | `GetValueObject()` |
+| `DateTimeOffset` | TIMESTAMPTZ | UTC microseconds or text in column context | `GetValueObject()` |
+| `DecentDBIntervalValue` / `TimeSpan` | INTERVAL | integer microseconds or text in column context | `GetValueObject()` |
+
+The low-level native value object path returns semantic values without requiring
+applications to parse display strings. `ENUM` values expose stable type and
+label ids; catalog metadata carries the human-readable label mapping.
 
 ## Maintenance
 
@@ -338,6 +354,103 @@ conn.SaveAs("/path/to/backup.ddb");
 
 // File-backed vacuum/compaction helper
 await DecentDBMaintenance.VacuumAtomicAsync("/path/to/shop.ddb");
+```
+
+## Sync SDK
+
+The .NET binding exposes an engine-local sync surface through
+`DecentDB.Native` and `DecentDB.AdoNet`. Use it to initialize replicas, manage
+peers and scopes, inspect doctor output, and exchange batches without shelling
+out to the CLI.
+
+- Sync quickstart sample: `bindings/dotnet/examples/sync-quickstart.md`
+
+`DecentDBConnection.Sync` returns `DecentDB.Native.DecentDBSyncClient`. The
+same client is also exposed from `DecentDB.Native.DecentDB.Sync`.
+
+### Core surface
+
+`DecentDBSyncClient` includes:
+
+- `ExecuteRawJson` / `ExecuteRawJsonAsync`
+- `GetStatus` / `GetStatusAsync`
+- `InitializeReplica` / `InitializeReplicaAsync`
+- `SetEnabled` / `SetEnabledAsync`
+- `GetPendingChanges` / `GetPendingChangesAsync`
+- `ExportBatch` / `ExportBatchAsync`
+- `ImportBatch` / `ImportBatchAsync`
+- `AddPeer` / `AddPeerAsync`
+- `RemovePeer` / `RemovePeerAsync`
+- `ListPeers` / `ListPeersAsync`
+- `CreateScope` / `CreateScopeAsync`
+- `DropScope` / `DropScopeAsync`
+- `ListScopes` / `ListScopesAsync`
+- `BindPeerScope` / `BindPeerScopeAsync`
+- `UnbindPeerScope` / `UnbindPeerScopeAsync`
+- `ListPeerScopeBindings` / `ListPeerScopeBindingsAsync`
+- `ListSessions` / `ListSessionsAsync`
+- `ListConflicts` / `ListConflictsAsync`
+- `GetConflict` / `GetConflictAsync`
+- `ResolveConflict` / `ResolveConflictAsync`
+- `ReopenConflict` / `ReopenConflictAsync`
+- `GetConflictPolicy` / `GetConflictPolicyAsync`
+- `SetConflictPolicy` / `SetConflictPolicyAsync`
+- `GetDoctorReport` / `GetDoctorReportAsync`
+- `GetRetentionReport` / `GetRetentionReportAsync`
+- `GetPeerLag` / `GetPeerLagAsync`
+- `Prune` / `PruneAsync`
+
+Returned models include:
+
+- `SyncStatus`
+- `SyncJournalRecord`
+- `SyncChangeBatch`
+- `SyncImportSummary`
+- `SyncPeer`
+- `SyncScope`
+- `SyncPeerScopeBinding`
+- `SyncSession`
+- `SyncConflict`
+- `SyncConflictPolicyConfig`
+- `SyncOperationalDoctorReport`
+- `SyncRetentionReport`
+- `SyncPeerLag`
+- `SyncPruneSummary`
+
+### Example usage
+
+```csharp
+using System.Collections.Generic;
+using DecentDB.AdoNet;
+using DecentDB.Native;
+
+await using var connection = new DecentDBConnection("Data Source=/tmp/app.ddb");
+await connection.OpenAsync();
+
+await connection.Sync.InitializeReplicaAsync("node-a");
+
+await connection.Sync.AddPeerAsync(new SyncPeer
+{
+    Name = "central",
+    Endpoint = "http://127.0.0.1:43123",
+    TokenEnv = "DECENTDB_SYNC_TOKEN"
+});
+
+await connection.Sync.CreateScopeAsync(new SyncScope
+{
+    Name = "tenant_42",
+    IncludeTables = new List<string> { "accounts", "orders" },
+    RowFilter = "tenant_id = 42"
+});
+
+await connection.Sync.BindPeerScopeAsync("central", "tenant_42");
+
+var batch = await connection.Sync.ExportBatchAsync(since: 0, limit: 100);
+var summary = await connection.Sync.ImportBatchAsync(batch);
+var doctor = await connection.Sync.GetDoctorReportAsync();
+var retention = await connection.Sync.GetRetentionReportAsync();
+var conflicts = await connection.Sync.ListConflictsAsync();
+var raw = await connection.Sync.ExecuteRawJsonAsync("{\"op\":\"status\"}");
 ```
 
 ## Performance sanity guidance

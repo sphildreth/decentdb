@@ -141,7 +141,7 @@ final class DecentDBNative {
 
     /**
      * Returns column type kind at index.
-     * 0=NULL, 1=INT64, 2=FLOAT64, 3=TEXT, 4=BLOB, 5=BOOL, 6=DECIMAL
+     * Legacy kind values are stable within the JDBC driver and may differ from C ABI tags.
      */
     static native int colType(long stmtHandle, int index);
 
@@ -185,6 +185,12 @@ final class DecentDBNative {
     /** Returns JSON array of trigger metadata objects. */
     static native String metaListTriggers(long dbHandle);
 
+    /** Returns the stable tooling metadata contract as JSON. */
+    static native String metaGetToolingMetadata(long dbHandle);
+
+    /** Returns the stable non-executing query contract as JSON. */
+    static native String metaDescribeQuery(long dbHandle, String sql);
+
     // ---- Value kind constants (must match the DecentDB C ABI) ----------
     static final int KIND_NULL    = 0;
     static final int KIND_INT64   = 1;
@@ -199,6 +205,14 @@ final class DecentDBNative {
     static final int KIND_INT0       = 15;
     static final int KIND_INT1       = 16;
     static final int KIND_DATETIME   = 17;
+    static final int KIND_ENUM       = 18;
+    static final int KIND_IPADDR     = 19;
+    static final int KIND_CIDR       = 20;
+    static final int KIND_DATE       = 21;
+    static final int KIND_TIME       = 22;
+    static final int KIND_TIMESTAMPTZ = 23;
+    static final int KIND_INTERVAL   = 24;
+    static final int KIND_MACADDR    = 25;
 
     // ---- Error code constants (must match the DecentDB C ABI) ----------
     static final int ERR_OK          = 0;

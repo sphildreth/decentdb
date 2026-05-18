@@ -1,7 +1,10 @@
 //! Strongly typed internal AST for the supported DecentDB 1.0 SQL subset.
 
-use crate::catalog::ColumnType;
-use crate::record::value::Value;
+use crate::catalog::{ColumnType, EnumTypeInfo, SpatialTypeInfo};
+use crate::record::value::{
+    format_cidr, format_date_days, format_interval, format_ip_addr, format_mac_addr,
+    format_time_micros, format_timestamp_tz_micros, Value,
+};
 use std::collections::BTreeSet;
 
 #[allow(dead_code)]
@@ -311,6 +314,7 @@ pub(crate) enum BinaryOp {
     Concat,
     JsonExtract,
     JsonExtractText,
+    Distance,
     IsDistinctFrom,
     IsNotDistinctFrom,
 }
@@ -399,6 +403,8 @@ pub(crate) struct CreateTableAsStatement {
 pub(crate) struct ColumnDefinition {
     pub(crate) name: String,
     pub(crate) column_type: ColumnType,
+    pub(crate) spatial_type: Option<SpatialTypeInfo>,
+    pub(crate) enum_type: Option<EnumTypeInfo>,
     pub(crate) nullable: bool,
     pub(crate) default: Option<Expr>,
     pub(crate) generated: Option<Expr>,
@@ -869,6 +875,7 @@ impl Expr {
                     BinaryOp::Concat => "||",
                     BinaryOp::JsonExtract => "->",
                     BinaryOp::JsonExtractText => "->>",
+                    BinaryOp::Distance => "<->",
                     BinaryOp::IsDistinctFrom => "IS DISTINCT FROM",
                     BinaryOp::IsNotDistinctFrom => "IS NOT DISTINCT FROM",
                 },
@@ -939,6 +946,7 @@ impl Expr {
                     BinaryOp::Concat => "||",
                     BinaryOp::JsonExtract => "->",
                     BinaryOp::JsonExtractText => "->>",
+                    BinaryOp::Distance => "<->",
                     BinaryOp::IsDistinctFrom => "IS DISTINCT FROM",
                     BinaryOp::IsNotDistinctFrom => "IS NOT DISTINCT FROM",
                 },
@@ -1172,7 +1180,7 @@ fn literal_to_sql(value: &Value) -> String {
             }
         }
         Value::Text(value) => format!("'{}'", value.replace('\'', "''")),
-        Value::Blob(bytes) => {
+        Value::Blob(bytes) | Value::Geometry(bytes) | Value::Geography(bytes) => {
             let hex = bytes
                 .iter()
                 .map(|byte| format!("{byte:02x}"))
@@ -1188,6 +1196,35 @@ fn literal_to_sql(value: &Value) -> String {
             format!("'{hex}'")
         }
         Value::TimestampMicros(value) => value.to_string(),
+        Value::Enum {
+            enum_type_id,
+            label_id,
+        } => format!("'{enum_type_id}:{label_id}'"),
+        Value::IpAddr { family, addr } => format_ip_addr(*family, addr)
+            .map(|value| format!("'{value}'"))
+            .unwrap_or_else(|_| "NULL".to_string()),
+        Value::Cidr {
+            family,
+            prefix_len,
+            network,
+        } => format_cidr(*family, *prefix_len, network)
+            .map(|value| format!("'{value}'"))
+            .unwrap_or_else(|_| "NULL".to_string()),
+        Value::MacAddr { len, bytes } => format_mac_addr(*len, bytes)
+            .map(|value| format!("'{value}'"))
+            .unwrap_or_else(|_| "NULL".to_string()),
+        Value::DateDays(days) => format!("'{}'", format_date_days(*days)),
+        Value::TimeMicros(micros) => format_time_micros(*micros)
+            .map(|value| format!("'{value}'"))
+            .unwrap_or_else(|_| "NULL".to_string()),
+        Value::TimestampTzMicros(micros) => {
+            format!("'{}'", format_timestamp_tz_micros(*micros))
+        }
+        Value::Interval {
+            months,
+            days,
+            micros,
+        } => format!("'{}'", format_interval(*months, *days, *micros)),
     }
 }
 

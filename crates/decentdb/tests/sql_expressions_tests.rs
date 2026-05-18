@@ -37,6 +37,12 @@ fn rows(r: &QueryResult) -> Vec<Vec<Value>> {
     r.rows().iter().map(|r| r.values().to_vec()).collect()
 }
 
+fn date_days(year: i32, month: u32, day: u32) -> i32 {
+    let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+    let date = chrono::NaiveDate::from_ymd_opt(year, month, day).unwrap();
+    i32::try_from(date.signed_duration_since(epoch).num_days()).unwrap()
+}
+
 #[test]
 fn abs_function() {
     let db = mem_db();
@@ -3614,7 +3620,7 @@ fn cast_parameterized_text_to_decimal() {
 
 #[test]
 fn current_date_time_functions_return_expected_shapes() {
-    use chrono::{Datelike, NaiveDate, NaiveTime, Utc};
+    use chrono::{Datelike, Duration, NaiveDate, NaiveTime, Utc};
 
     let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
     let result = db
@@ -3632,19 +3638,27 @@ fn current_date_time_functions_return_expected_shapes() {
     );
 
     match &row[0] {
-        Value::Text(value) => {
-            NaiveDate::parse_from_str(value, "%Y-%m-%d").expect("CURRENT_DATE format")
+        Value::DateDays(days) => {
+            let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+            let current = epoch + Duration::days(i64::from(*days));
+            assert_eq!(current.year(), expected_year as i32);
         }
-        other => panic!("expected CURRENT_DATE text output, got {other:?}"),
+        other => panic!("expected CURRENT_DATE native DATE output, got {other:?}"),
     };
     match &row[1] {
-        Value::Text(value) => {
-            NaiveTime::parse_from_str(value, "%H:%M:%S").expect("CURRENT_TIME format")
+        Value::TimeMicros(micros) => {
+            let seconds = micros.div_euclid(1_000_000);
+            let subsecond_nanos = micros.rem_euclid(1_000_000) * 1_000;
+            NaiveTime::from_num_seconds_from_midnight_opt(
+                u32::try_from(seconds).unwrap(),
+                u32::try_from(subsecond_nanos).unwrap(),
+            )
+            .expect("CURRENT_TIME native TIME range");
         }
-        other => panic!("expected CURRENT_TIME text output, got {other:?}"),
+        other => panic!("expected CURRENT_TIME native TIME output, got {other:?}"),
     };
-    assert!(matches!(row[2], Value::TimestampMicros(_)));
-    assert!(matches!(row[3], Value::TimestampMicros(_)));
+    assert!(matches!(row[2], Value::TimestampTzMicros(_)));
+    assert!(matches!(row[3], Value::TimestampTzMicros(_)));
 }
 
 #[test]
@@ -3679,7 +3693,7 @@ fn date_time_scalar_functions_cover_documented_slice_6_examples() {
     assert_eq!(
         result.rows()[0].values(),
         &[
-            Value::Text("2024-04-15".to_string()),
+            Value::DateDays(date_days(2024, 4, 15)),
             Value::Text("2024-03-15 12:30:00".to_string()),
             Value::Text("2024-03-15".to_string()),
             Value::Text("14:30:00".to_string()),
@@ -3814,8 +3828,8 @@ fn extended_datetime_interval_arithmetic() {
         &[
             Value::TimestampMicros(1_710_599_400_000_000),
             Value::TimestampMicros(1_710_505_800_000_000),
-            Value::TimestampMicros(1_713_105_000_000_000),
-            Value::TimestampMicros(1_747_492_200_000_000),
+            Value::TimestampMicros(1_713_191_400_000_000),
+            Value::TimestampMicros(1_747_578_600_000_000),
             Value::TimestampMicros(1_711_065_600_000_000),
         ]
     );
@@ -3836,7 +3850,7 @@ fn extended_datetime_interval_arithmetic_with_casted_text() {
         result.rows()[0].values(),
         &[
             Value::TimestampMicros(1_710_599_400_000_000),
-            Value::TimestampMicros(1_713_052_800_000_000),
+            Value::TimestampMicros(1_713_139_200_000_000),
             Value::TimestampMicros(1_710_505_800_000_000),
         ]
     );

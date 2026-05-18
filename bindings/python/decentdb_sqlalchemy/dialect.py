@@ -18,11 +18,8 @@ class _DecentDate(sqltypes.Date):
         def process(value):
             if value is None:
                 return None
-            epoch = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
-            dt = datetime.datetime(
-                value.year, value.month, value.day, tzinfo=datetime.timezone.utc
-            )
-            return int((dt - epoch).total_seconds() * 1_000_000)
+            epoch = datetime.date(1970, 1, 1)
+            return (value - epoch).days
 
         return process
 
@@ -34,9 +31,8 @@ class _DecentDate(sqltypes.Date):
                 return value.date()
             if isinstance(value, datetime.date):
                 return value
-            epoch = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
-            dt = epoch + datetime.timedelta(microseconds=int(value))
-            return dt.date()
+            epoch = datetime.date(1970, 1, 1)
+            return epoch + datetime.timedelta(days=int(value))
 
         return process
 
@@ -249,13 +245,15 @@ class DecentDBTypeCompiler(compiler.GenericTypeCompiler):
         return "BLOB"
 
     def visit_date(self, type_, **kw):
-        return "TIMESTAMP"
+        return "DATE"
 
     def visit_datetime(self, type_, **kw):
+        if getattr(type_, "timezone", False):
+            return "TIMESTAMPTZ"
         return "TIMESTAMP"
 
     def visit_time(self, type_, **kw):
-        return "TIMESTAMP"
+        return "TIME"
 
     def visit_uuid(self, type_, **kw):
         return "UUID"
@@ -390,6 +388,12 @@ class DecentDBDialect(default.DefaultDialect):
                 return sqltypes.Uuid()
             if t == "TIMESTAMP" or t == "TIMESTAMP_MICROS":
                 return sqltypes.DateTime()
+            if t == "TIMESTAMPTZ":
+                return sqltypes.DateTime(timezone=True)
+            if t == "DATE":
+                return sqltypes.Date()
+            if t == "TIME":
+                return sqltypes.Time()
             return sqltypes.NULLTYPE
 
         out = []

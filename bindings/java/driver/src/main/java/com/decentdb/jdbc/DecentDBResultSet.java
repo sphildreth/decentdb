@@ -128,7 +128,14 @@ public class DecentDBResultSet implements ResultSet {
         checkOpen();
         int k = kindOrNull(columnIndex);
         if (wasNull) return null;
-        if (k == DecentDBNative.KIND_TEXT) {
+        if (k == DecentDBNative.KIND_TEXT
+                || k == DecentDBNative.KIND_ENUM
+                || k == DecentDBNative.KIND_IPADDR
+                || k == DecentDBNative.KIND_CIDR
+                || k == DecentDBNative.KIND_DATE
+                || k == DecentDBNative.KIND_TIME
+                || k == DecentDBNative.KIND_TIMESTAMPTZ
+                || k == DecentDBNative.KIND_INTERVAL) {
             return DecentDBNative.colText(stmtHandle, columnIndex - 1);
         } else if (k == DecentDBNative.KIND_BLOB) {
             byte[] bytes = DecentDBNative.colBlob(stmtHandle, columnIndex - 1);
@@ -308,6 +315,18 @@ public class DecentDBResultSet implements ResultSet {
 
     @Override
     public java.sql.Date getDate(int columnIndex) throws SQLException {
+        checkOpen();
+        int k = kindOrNull(columnIndex);
+        if (wasNull) return null;
+        if (k == DecentDBNative.KIND_DATE) {
+            String s = DecentDBNative.colText(stmtHandle, columnIndex - 1);
+            if (s == null) return null;
+            try {
+                return java.sql.Date.valueOf(java.time.LocalDate.parse(s.trim()));
+            } catch (Exception e) {
+                return null;
+            }
+        }
         String s = getString(columnIndex);
         if (s == null) return null;
         try { return java.sql.Date.valueOf(s.trim()); } catch (IllegalArgumentException e) { return null; }
@@ -315,6 +334,18 @@ public class DecentDBResultSet implements ResultSet {
 
     @Override
     public Time getTime(int columnIndex) throws SQLException {
+        checkOpen();
+        int k = kindOrNull(columnIndex);
+        if (wasNull) return null;
+        if (k == DecentDBNative.KIND_TIME) {
+            String s = DecentDBNative.colText(stmtHandle, columnIndex - 1);
+            if (s == null) return null;
+            try {
+                return Time.valueOf(java.time.LocalTime.parse(s.trim()));
+            } catch (Exception e) {
+                return null;
+            }
+        }
         String s = getString(columnIndex);
         if (s == null) return null;
         try { return Time.valueOf(s.trim()); } catch (IllegalArgumentException e) { return null; }
@@ -330,6 +361,14 @@ public class DecentDBResultSet implements ResultSet {
             long seconds = Math.floorDiv(micros, 1_000_000L);
             int nanos = (int) Math.floorMod(micros, 1_000_000L) * 1_000;
             return Timestamp.from(java.time.Instant.ofEpochSecond(seconds, nanos));
+        } else if (k == DecentDBNative.KIND_TIMESTAMPTZ) {
+            String s = DecentDBNative.colText(stmtHandle, columnIndex - 1);
+            if (s == null) return null;
+            try {
+                return Timestamp.from(java.time.Instant.parse(s.trim()));
+            } catch (Exception e) {
+                return null;
+            }
         }
         String s = getString(columnIndex);
         if (s == null) return null;
@@ -358,6 +397,15 @@ public class DecentDBResultSet implements ResultSet {
             }
             case DecentDBNative.KIND_DECIMAL: return getBigDecimal(columnIndex);
             case DecentDBNative.KIND_DATETIME: return getTimestamp(columnIndex);
+            case DecentDBNative.KIND_DATE: return getDate(columnIndex);
+            case DecentDBNative.KIND_TIME: return getTime(columnIndex);
+            case DecentDBNative.KIND_TIMESTAMPTZ: return getTimestamp(columnIndex);
+            case DecentDBNative.KIND_ENUM:
+            case DecentDBNative.KIND_IPADDR:
+            case DecentDBNative.KIND_CIDR:
+            case DecentDBNative.KIND_INTERVAL:
+            case DecentDBNative.KIND_MACADDR:
+                return getString(columnIndex);
             default: return getString(columnIndex);
         }
     }

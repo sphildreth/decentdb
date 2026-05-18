@@ -4,8 +4,10 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockWriteGuard, Weak};
+use std::time::SystemTime;
 
 #[cfg(feature = "bench-internals")]
 use crate::benchmark::{
@@ -13,7 +15,7 @@ use crate::benchmark::{
     READ_PATH_WRITE_TXN_LOCK_COUNT,
 };
 use crate::catalog::{
-    identifiers_equal, CatalogHandle, CheckConstraint, ColumnSchema, ForeignKeyAction,
+    identifiers_equal, CatalogHandle, CheckConstraint, ColumnSchema, ColumnType, ForeignKeyAction,
     ForeignKeyConstraint, IndexColumn, IndexKind, IndexSchema, TableSchema, TriggerEvent,
     TriggerKind, TriggerSchema, ViewSchema,
 };
@@ -24,26 +26,41 @@ use crate::exec::dml::{
 };
 use crate::exec::{
     decode_paged_table_manifest_payload, read_table_payload_row_count_from_bytes,
-    statement_is_read_only, BulkLoadOptions, EngineRuntime, QueryResult, QueryRow, RuntimeIndex,
-    TableData,
+    row_satisfies_expression, statement_is_read_only, BulkLoadOptions, EngineRuntime, QueryResult,
+    QueryRow, RuntimeIndex, TableData,
 };
 use crate::metadata::{
     CheckConstraintInfo, ColumnInfo, ForeignKeyInfo, HeaderInfo, IndexInfo, IndexVerification,
-    SchemaColumnInfo, SchemaIndexInfo, SchemaSnapshot, SchemaTableInfo, SchemaTriggerInfo,
-    SchemaViewInfo, StorageInfo, TableInfo, TriggerInfo, ViewInfo,
+    QueryContract, SchemaColumnInfo, SchemaIndexInfo, SchemaSnapshot, SchemaTableInfo,
+    SchemaTriggerInfo, SchemaViewInfo, StorageInfo, TableInfo, ToolingMetadata, TriggerInfo,
+    ViewInfo,
 };
 use crate::record::overflow::read_overflow;
-use crate::record::value::Value;
+use crate::record::value::{
+    format_cidr, format_date_days, format_interval, format_ip_addr, format_mac_addr,
+    format_time_micros, format_timestamp_tz_micros, normalize_decimal, parse_cidr, parse_date_days,
+    parse_decimal_text, parse_interval, parse_ip_addr, parse_mac_addr, parse_time_micros,
+    parse_timestamp_tz_micros, Value,
+};
 use crate::sql::ast::Statement as SqlStatement;
-use crate::sql::parser::{parse_sql_statement, rewrite_legacy_trigger_body};
+use crate::sql::parser::{parse_expression_sql, parse_sql_statement, rewrite_legacy_trigger_body};
 use crate::storage::freelist::{decode_freelist_next, encode_freelist_page};
 use crate::storage::page::{self, PageId, PageStore};
 use crate::storage::{self, DatabaseHeader, PagerHandle};
+use crate::sync::SyncContext;
+use crate::sync::{
+    current_time_micros, validate_sync_scope_definition, SyncChangeBatch, SyncConflict,
+    SyncConflictPolicy, SyncConflictPolicyConfig, SyncDoctorSeverity, SyncImportSummary,
+    SyncJournalIntegrityReport, SyncJournalIssue, SyncJournalRecord, SyncOperation,
+    SyncOperationalDoctorReport, SyncPeer, SyncPeerLag, SyncPeerScopeBinding, SyncPruneSummary,
+    SyncRetentionReport, SyncRunDirection, SyncRunSummary, SyncScope, SyncSession, SyncStatus,
+};
 use crate::vfs::faulty::{self, FailAction, Failpoint};
 use crate::vfs::{is_memory_path, write_all_at, FileKind, OpenMode, VfsHandle};
 use crate::wal::reader_registry::ReaderGuard;
 use crate::wal::savepoint::StatementSavepoint;
 use crate::wal::WalHandle;
+use serde_json::Value as JsonValue;
 
 /// Stable engine owner used across later storage, SQL, and FFI slices.
 #[derive(Clone, Debug)]
@@ -55,6 +72,25 @@ pub struct Db {
 struct PagerReadStore<'a> {
     db: &'a Db,
     snapshot_token: u64,
+}
+
+#[derive(Clone, Debug)]
+struct SyncConflictRecordData {
+    conflict_type: String,
+    message: String,
+    local_row_json: Option<serde_json::Value>,
+    resolution: Option<String>,
+    resolved_at_micros: Option<i64>,
+    resolved_by: Option<String>,
+    resolution_note: Option<String>,
+    policy_name: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+enum SyncImportRecordOutcome {
+    Applied,
+    Conflict(SyncConflictRecordData),
+    Resolved(SyncConflictRecordData),
 }
 
 impl<'a> PagerReadStore<'a> {
@@ -231,7 +267,7 @@ impl Drop for SqlTransaction<'_> {
 struct DbInner {
     path: PathBuf,
     config: DbConfig,
-    _vfs: VfsHandle,
+    vfs: VfsHandle,
     pager: PagerHandle,
     wal: WalHandle,
     catalog: CatalogHandle,
@@ -248,6 +284,7 @@ struct DbInner {
     statement_cache: Mutex<StatementCache>,
     prepared_insert_cache: Mutex<PreparedInsertCache>,
     held_snapshots: Mutex<HashMap<u64, ReaderGuard>>,
+    sync_ctx: SyncContext,
 }
 
 impl Drop for DbInner {
@@ -1248,6 +1285,364 @@ impl Db {
         self.execute_batch_with_params(sql, &[])
     }
 
+    /// Executes one or more read-only SQL statements against a retained WAL LSN.
+    pub fn execute_batch_at_snapshot_lsn(
+        &self,
+        sql: &str,
+        snapshot_lsn: u64,
+    ) -> Result<Vec<QueryResult>> {
+        self.execute_batch_at_snapshot_lsn_with_params(sql, snapshot_lsn, &[])
+    }
+
+    /// Executes one or more read-only SQL statements with `$n` parameters against a retained WAL LSN.
+    pub fn execute_batch_at_snapshot_lsn_with_params(
+        &self,
+        sql: &str,
+        snapshot_lsn: u64,
+        params: &[Value],
+    ) -> Result<Vec<QueryResult>> {
+        let latest_lsn = self.inner.wal.latest_snapshot();
+        if snapshot_lsn > latest_lsn {
+            return Err(DbError::transaction(format!(
+                "snapshot LSN {snapshot_lsn} is newer than WAL end LSN {latest_lsn}"
+            )));
+        }
+
+        let mut statements = Vec::new();
+        for statement_sql in split_sql_batch(sql) {
+            let trimmed = statement_sql.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if parse_transaction_control(trimmed).is_some()
+                || parse_pragma_command(trimmed)?.is_some()
+            {
+                return Err(DbError::transaction(
+                    "time-travel execution only supports read-only SQL statements",
+                ));
+            }
+            let statement = self.parsed_statement(trimmed)?;
+            if !statement_is_read_only(&statement) {
+                return Err(DbError::transaction(
+                    "time-travel execution is read-only; mutating statements are not allowed",
+                ));
+            }
+            statements.push(statement);
+        }
+        if statements.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let schema_cookie = self.current_schema_cookie_at_snapshot(snapshot_lsn)?;
+        let mut runtime = EngineRuntime::load_from_storage_at_snapshot(
+            &self.inner.pager,
+            &self.inner.wal,
+            schema_cookie,
+            &self.inner.config,
+            snapshot_lsn,
+        )?;
+        runtime.load_deferred_tables_at_snapshot(
+            &self.inner.pager,
+            &self.inner.wal,
+            self.inner.config.page_size,
+            snapshot_lsn,
+        )?;
+
+        statements
+            .iter()
+            .map(|statement| {
+                runtime.execute_read_statement(statement, params, self.inner.config.page_size)
+            })
+            .collect()
+    }
+
+    /// Executes SQL on a branch. Non-`main` branches are read-only until branch-local writes land.
+    pub fn execute_batch_on_branch(
+        &self,
+        sql: &str,
+        branch_name: &str,
+    ) -> Result<Vec<QueryResult>> {
+        self.execute_batch_on_branch_with_params(sql, branch_name, &[])
+    }
+
+    /// Executes SQL with `$n` parameters on a branch.
+    pub fn execute_batch_on_branch_with_params(
+        &self,
+        sql: &str,
+        branch_name: &str,
+        params: &[Value],
+    ) -> Result<Vec<QueryResult>> {
+        if branch_name == crate::branch::DEFAULT_BRANCH_NAME {
+            return self.execute_batch_with_params(sql, params);
+        }
+        let branch = crate::branch::branch_by_name(self, branch_name)?
+            .ok_or_else(|| DbError::transaction(format!("unknown branch '{branch_name}'")))?;
+        let read_only = self.sql_batch_is_read_only(sql)?;
+        if !read_only && !params.is_empty() {
+            return Err(DbError::transaction(
+                "branch-local writes with SQL parameters are not supported yet",
+            ));
+        }
+        let branch_db = self.materialize_branch_db(&branch)?;
+        let results = branch_db.execute_batch_with_params(sql, params)?;
+        if !read_only {
+            crate::branch::append_branch_sql_log(self, &branch, sql)?;
+            self.refresh_named_snapshot_retention()?;
+        }
+        Ok(results)
+    }
+
+    fn sql_batch_is_read_only(&self, sql: &str) -> Result<bool> {
+        for statement_sql in split_sql_batch(sql) {
+            let trimmed = statement_sql.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if parse_transaction_control(trimmed).is_some()
+                || parse_pragma_command(trimmed)?.is_some()
+            {
+                return Ok(false);
+            }
+            let statement = self.parsed_statement(trimmed)?;
+            if !statement_is_read_only(&statement) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn materialize_branch_db(&self, branch: &crate::branch::BranchInfo) -> Result<Db> {
+        let head_id = branch
+            .current_head_id
+            .as_deref()
+            .ok_or_else(|| DbError::internal("branch is missing a current head"))?;
+        let branch_lsn = crate::branch::branch_head_lsn_by_id(self, head_id)?
+            .ok_or_else(|| DbError::internal("branch current head is missing"))?;
+        let dump = self.dump_sql_at_snapshot_lsn(branch_lsn)?;
+        let branch_db = Db::open_or_create(":memory:", self.inner.config.clone())?;
+        if !dump.trim().is_empty() {
+            branch_db.execute_batch(&dump)?;
+        }
+        for entry in crate::branch::branch_sql_log_for_head(self, head_id)? {
+            branch_db.execute_batch(&entry.sql)?;
+        }
+        Ok(branch_db)
+    }
+
+    fn materialize_branch_head_db(&self, head_id: &str) -> Result<Db> {
+        let branch_lsn = crate::branch::branch_head_lsn_by_id(self, head_id)?
+            .ok_or_else(|| DbError::transaction(format!("unknown branch head '{head_id}'")))?;
+        let dump = self.dump_sql_at_snapshot_lsn(branch_lsn)?;
+        let branch_db = self.materialize_dump_db(&dump)?;
+        for entry in crate::branch::branch_sql_log_for_head(self, head_id)? {
+            branch_db.execute_batch(&entry.sql)?;
+        }
+        Ok(branch_db)
+    }
+
+    fn materialize_snapshot_lsn_db(&self, snapshot_lsn: u64) -> Result<Db> {
+        let dump = self.dump_sql_at_snapshot_lsn(snapshot_lsn)?;
+        self.materialize_dump_db(&dump)
+    }
+
+    fn materialize_current_db(&self) -> Result<Db> {
+        let dump = self.dump_sql()?;
+        self.materialize_dump_db(&dump)
+    }
+
+    fn materialize_dump_db(&self, dump: &str) -> Result<Db> {
+        let db = Db::open_or_create(":memory:", self.inner.config.clone())?;
+        if !dump.trim().is_empty() {
+            db.execute_batch(dump)?;
+        }
+        Ok(db)
+    }
+
+    fn materialize_ref_db(&self, reference: &str) -> Result<Db> {
+        if reference == crate::branch::DEFAULT_BRANCH_NAME {
+            return self.materialize_current_db();
+        }
+        if let Some(branch) = crate::branch::branch_by_name(self, reference)? {
+            return self.materialize_branch_db(&branch);
+        }
+        if let Some(snapshot) = self.snapshot_get(reference)? {
+            return self.materialize_snapshot_lsn_db(snapshot.snapshot_lsn);
+        }
+        if crate::branch::branch_head_by_id(self, reference)?.is_some() {
+            return self.materialize_branch_head_db(reference);
+        }
+        Err(DbError::transaction(format!(
+            "unknown branch, snapshot, or head '{reference}'"
+        )))
+    }
+
+    fn resolve_branch_target_head(
+        &self,
+        reference: &str,
+    ) -> Result<crate::branch::BranchHeadMetadata> {
+        if reference == crate::branch::DEFAULT_BRANCH_NAME {
+            return Err(DbError::transaction(
+                "use a named snapshot, branch, or head ID as the restore target",
+            ));
+        }
+        if let Some(branch) = crate::branch::branch_by_name(self, reference)? {
+            let head_id = branch
+                .current_head_id
+                .as_deref()
+                .ok_or_else(|| DbError::transaction(format!("branch '{reference}' has no head")))?;
+            return crate::branch::branch_head_by_id(self, head_id)?
+                .ok_or_else(|| DbError::corruption(format!("branch head '{head_id}' is missing")));
+        }
+        if let Some(snapshot) = self.snapshot_get(reference)? {
+            return crate::branch::branch_head_by_id(self, &snapshot.head_id)?.ok_or_else(|| {
+                DbError::corruption(format!(
+                    "snapshot '{}' references missing head '{}'",
+                    snapshot.name, snapshot.head_id
+                ))
+            });
+        }
+        if let Some(head) = crate::branch::branch_head_by_id(self, reference)? {
+            return Ok(head);
+        }
+        Err(DbError::transaction(format!(
+            "unknown branch, snapshot, or head '{reference}'"
+        )))
+    }
+
+    /// Compares two refs (`main`, branch name, named snapshot, or branch head ID).
+    pub fn branch_diff(
+        &self,
+        left_ref: &str,
+        right_ref: &str,
+    ) -> Result<crate::branch::BranchDiffReport> {
+        let left_db = self.materialize_ref_db(left_ref)?;
+        let right_db = self.materialize_ref_db(right_ref)?;
+        diff_materialized_refs(left_ref, right_ref, &left_db, &right_db)
+    }
+
+    /// Restores a non-main branch head to another branch, named snapshot, or head ID.
+    pub fn branch_restore(
+        &self,
+        branch_name: &str,
+        target_ref: &str,
+        dry_run: bool,
+    ) -> Result<crate::branch::BranchRestoreReport> {
+        if self.inner.sql_txn_active.load(Ordering::Acquire) {
+            return Err(DbError::transaction(
+                "cannot restore a branch while a SQL transaction is active",
+            ));
+        }
+        if branch_name == crate::branch::DEFAULT_BRANCH_NAME {
+            return Err(DbError::transaction(
+                "restore currently targets non-main branches; create a branch from the restore point to inspect main rollback candidates",
+            ));
+        }
+        let branch = crate::branch::branch_by_name(self, branch_name)?
+            .ok_or_else(|| DbError::transaction(format!("unknown branch '{branch_name}'")))?;
+        let target_head = self.resolve_branch_target_head(target_ref)?;
+        let diff = self.branch_diff(branch_name, target_ref)?;
+        if dry_run {
+            return Ok(crate::branch::BranchRestoreReport {
+                branch: branch_name.to_string(),
+                target_ref: target_ref.to_string(),
+                dry_run: true,
+                previous_head_id: branch.current_head_id,
+                target_head_id: target_head.head_id,
+                new_head_id: None,
+                changed_table_count: diff.changed_table_count,
+                added_row_count: diff.added_row_count,
+                updated_row_count: diff.updated_row_count,
+                deleted_row_count: diff.deleted_row_count,
+            });
+        }
+        let new_head = crate::branch::restore_branch_head(self, &branch, &target_head, target_ref)?;
+        self.refresh_named_snapshot_retention()?;
+        Ok(crate::branch::BranchRestoreReport {
+            branch: branch_name.to_string(),
+            target_ref: target_ref.to_string(),
+            dry_run: false,
+            previous_head_id: branch.current_head_id,
+            target_head_id: target_head.head_id,
+            new_head_id: Some(new_head.head_id),
+            changed_table_count: diff.changed_table_count,
+            added_row_count: diff.added_row_count,
+            updated_row_count: diff.updated_row_count,
+            deleted_row_count: diff.deleted_row_count,
+        })
+    }
+
+    /// Merges clean primary-key row changes from a source branch into a target ref.
+    pub fn branch_merge(
+        &self,
+        source_branch: &str,
+        target_ref: &str,
+        dry_run: bool,
+    ) -> Result<crate::branch::BranchMergeReport> {
+        if self.inner.sql_txn_active.load(Ordering::Acquire) {
+            return Err(DbError::transaction(
+                "cannot merge a branch while a SQL transaction is active",
+            ));
+        }
+        if source_branch == crate::branch::DEFAULT_BRANCH_NAME {
+            return Err(DbError::transaction(
+                "merge source must be a non-main branch",
+            ));
+        }
+        let source = crate::branch::branch_by_name(self, source_branch)?
+            .ok_or_else(|| DbError::transaction(format!("unknown branch '{source_branch}'")))?;
+        let base_head_id = source.base_head_id.clone().ok_or_else(|| {
+            DbError::transaction(format!("branch '{source_branch}' has no merge base"))
+        })?;
+        if target_ref != crate::branch::DEFAULT_BRANCH_NAME
+            && crate::branch::branch_by_name(self, target_ref)?.is_none()
+        {
+            return Err(DbError::transaction(format!(
+                "merge target must be 'main' or a branch; got '{target_ref}'"
+            )));
+        }
+
+        let base_db = self.materialize_branch_head_db(&base_head_id)?;
+        let source_db = self.materialize_branch_db(&source)?;
+        let target_db = self.materialize_ref_db(target_ref)?;
+        let plan = build_merge_plan(
+            source_branch,
+            target_ref,
+            &base_head_id,
+            &base_db,
+            &source_db,
+            &target_db,
+        )?;
+        if dry_run || !plan.conflicts.is_empty() {
+            return Ok(plan.into_report(dry_run));
+        }
+        let sql = plan
+            .changes
+            .iter()
+            .map(|change| change.sql.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !sql.trim().is_empty() {
+            if target_ref == crate::branch::DEFAULT_BRANCH_NAME {
+                self.execute_batch(&sql)?;
+            } else {
+                self.execute_batch_on_branch(&sql, target_ref)?;
+            }
+        }
+        Ok(plan.into_report(false))
+    }
+
+    /// Executes one or more read-only SQL statements against a named snapshot.
+    pub fn execute_batch_at_snapshot(
+        &self,
+        sql: &str,
+        snapshot_name: &str,
+    ) -> Result<Vec<QueryResult>> {
+        let snapshot_lsn = self.snapshot_lsn_for_ref(snapshot_name)?.ok_or_else(|| {
+            DbError::transaction(format!("unknown snapshot or branch head '{snapshot_name}'"))
+        })?;
+        self.execute_batch_at_snapshot_lsn(sql, snapshot_lsn)
+    }
+
     /// Executes one or more semicolon-delimited SQL statements with `$n` parameters.
     pub fn execute_batch_with_params(
         &self,
@@ -1281,6 +1676,10 @@ impl Db {
             }
             if let Some(pragma) = parse_pragma_command(trimmed)? {
                 let result = self.execute_pragma_command(pragma)?;
+                results.push(result);
+                continue;
+            }
+            if let Some(result) = self.try_execute_sync_inspection_query(trimmed, params)? {
                 results.push(result);
                 continue;
             }
@@ -1465,6 +1864,157 @@ impl Db {
         self.read_page_at_snapshot_lsn(page_id, snapshot_lsn)
     }
 
+    /// Creates an immutable named snapshot of the current durable `main` state.
+    pub fn snapshot_create(&self, name: &str) -> Result<crate::branch::NamedSnapshot> {
+        if self.inner.sql_txn_active.load(Ordering::Acquire) {
+            return Err(DbError::transaction(
+                "cannot create a named snapshot while a SQL transaction is active",
+            ));
+        }
+        let initial_lsn = self.inner.wal.latest_snapshot();
+        self.inner.wal.set_retained_snapshot_lsn(Some(initial_lsn));
+        self.checkpoint_wal()?;
+        let snapshot_lsn = self.inner.wal.latest_snapshot();
+        let schema_cookie = self.current_schema_cookie_at_snapshot(snapshot_lsn)?;
+        self.inner.wal.set_retained_snapshot_lsn(Some(snapshot_lsn));
+        let result = crate::branch::create_named_snapshot(self, name, snapshot_lsn, schema_cookie);
+        self.refresh_named_snapshot_retention()?;
+        result
+    }
+
+    /// Lists retained named snapshots.
+    pub fn snapshot_list(&self) -> Result<Vec<crate::branch::NamedSnapshot>> {
+        crate::branch::list_named_snapshots(self)
+    }
+
+    /// Returns one retained named snapshot by name.
+    pub fn snapshot_get(&self, name: &str) -> Result<Option<crate::branch::NamedSnapshot>> {
+        crate::branch::snapshot_by_name(self, name)
+    }
+
+    /// Resolves a named snapshot or branch-head ID to its retained WAL LSN.
+    pub fn snapshot_lsn_for_ref(&self, reference: &str) -> Result<Option<u64>> {
+        if let Some(snapshot) = self.snapshot_get(reference)? {
+            return Ok(Some(snapshot.snapshot_lsn));
+        }
+        crate::branch::branch_head_lsn_by_id(self, reference)
+    }
+
+    /// Creates a branch from `main`, another branch, a named snapshot, or a branch head.
+    pub fn branch_create(
+        &self,
+        name: &str,
+        from: Option<&str>,
+    ) -> Result<crate::branch::BranchInfo> {
+        let source = from.unwrap_or(crate::branch::DEFAULT_BRANCH_NAME);
+        let (source_lsn, parent_head_id) = if source == crate::branch::DEFAULT_BRANCH_NAME {
+            let initial_lsn = self.inner.wal.latest_snapshot();
+            self.inner.wal.set_retained_snapshot_lsn(Some(initial_lsn));
+            self.checkpoint_wal()?;
+            let source_lsn = self.inner.wal.latest_snapshot();
+            let parent_head_id = crate::branch::main_branch_head(self)?.map(|head| head.head_id);
+            (source_lsn, parent_head_id)
+        } else if let Some(branch) = crate::branch::branch_by_name(self, source)? {
+            let source_lsn = self.branch_lsn(source)?.ok_or_else(|| {
+                DbError::transaction(format!("branch '{source}' has no current head"))
+            })?;
+            (source_lsn, branch.current_head_id)
+        } else if let Some(snapshot) = self.snapshot_get(source)? {
+            (snapshot.snapshot_lsn, Some(snapshot.head_id))
+        } else if let Some(source_lsn) = crate::branch::branch_head_lsn_by_id(self, source)? {
+            (source_lsn, Some(source.to_string()))
+        } else {
+            return Err(DbError::transaction(format!(
+                "unknown branch, snapshot, or head '{source}'"
+            )));
+        };
+        self.inner.wal.set_retained_snapshot_lsn(Some(source_lsn));
+        let schema_cookie = self.current_schema_cookie_at_snapshot(source_lsn)?;
+        let result = crate::branch::create_branch(
+            self,
+            name,
+            source_lsn,
+            schema_cookie,
+            parent_head_id.as_deref(),
+        );
+        self.refresh_named_snapshot_retention()?;
+        result
+    }
+
+    /// Lists branches.
+    pub fn branch_list(&self) -> Result<Vec<crate::branch::BranchInfo>> {
+        crate::branch::list_branches(self)
+    }
+
+    /// Deletes a non-main branch.
+    pub fn branch_delete(&self, name: &str) -> Result<bool> {
+        let deleted = crate::branch::delete_branch(self, name)?;
+        if deleted {
+            self.refresh_named_snapshot_retention()?;
+        }
+        Ok(deleted)
+    }
+
+    /// Renames a non-main branch.
+    pub fn branch_rename(&self, old_name: &str, new_name: &str) -> Result<bool> {
+        crate::branch::rename_branch(self, old_name, new_name)
+    }
+
+    /// Resolves a branch name to its current retained WAL LSN.
+    pub fn branch_lsn(&self, name: &str) -> Result<Option<u64>> {
+        crate::branch::branch_lsn_by_name(self, name)
+    }
+
+    /// Adds a named commit marker to a non-main branch.
+    pub fn branch_commit(
+        &self,
+        name: &str,
+        message: &str,
+    ) -> Result<crate::branch::BranchLogEntry> {
+        if self.inner.sql_txn_active.load(Ordering::Acquire) {
+            return Err(DbError::transaction(
+                "cannot create a branch commit marker while a SQL transaction is active",
+            ));
+        }
+        if name == crate::branch::DEFAULT_BRANCH_NAME {
+            return Err(DbError::transaction(
+                "branch commit markers are only supported on non-main branches",
+            ));
+        }
+        let branch = crate::branch::branch_by_name(self, name)?
+            .ok_or_else(|| DbError::transaction(format!("unknown branch '{name}'")))?;
+        let head = crate::branch::commit_branch(self, &branch, message)?;
+        self.refresh_named_snapshot_retention()?;
+        Ok(crate::branch::BranchLogEntry {
+            head_id: head.head_id,
+            branch_id: head.branch_id,
+            parent_head_id: head.parent_head_id,
+            message: head.message,
+            created_at_micros: head.created_at_micros,
+            sql: None,
+        })
+    }
+
+    /// Returns branch head history newest first.
+    pub fn branch_log(&self, name: &str) -> Result<Vec<crate::branch::BranchLogEntry>> {
+        crate::branch::branch_log(self, name)
+    }
+
+    /// Deletes a named snapshot and refreshes the WAL retention floor.
+    pub fn snapshot_delete(&self, name: &str) -> Result<bool> {
+        let deleted = crate::branch::delete_named_snapshot(self, name)?;
+        if deleted {
+            self.refresh_named_snapshot_retention()?;
+        }
+        Ok(deleted)
+    }
+
+    pub(crate) fn refresh_named_snapshot_retention(&self) -> Result<()> {
+        let retained_lsn = crate::branch::retained_snapshot_lsn(self)?;
+        self.inner.wal.set_retained_snapshot_lsn(retained_lsn);
+        Ok(())
+    }
+
     /// Returns a deterministic JSON summary of storage state for the harness.
     pub fn inspect_storage_state_json(&self) -> Result<String> {
         let header = self.inner.pager.header_snapshot()?;
@@ -1511,6 +2061,9 @@ impl Db {
         let mut tables =
             Vec::with_capacity(runtime.catalog.tables.len() + runtime.temp_tables.len());
         for table in runtime.catalog.tables.values() {
+            if crate::sync::is_internal_table_name(&table.name) {
+                continue;
+            }
             tables.push(table_info(
                 table,
                 self.runtime_table_row_count(&runtime, &table.name)?,
@@ -1523,6 +2076,15 @@ impl Db {
             ));
         }
         Ok(tables)
+    }
+
+    pub(crate) fn internal_table_exists(&self, name: &str) -> Result<bool> {
+        let runtime = self.runtime_for_metadata_inspection()?;
+        Ok(runtime
+            .catalog
+            .tables
+            .values()
+            .any(|table| identifiers_equal(&table.name, name)))
     }
 
     /// Returns a single table definition by name.
@@ -1608,6 +2170,28 @@ impl Db {
         schema_snapshot(self, &runtime)
     }
 
+    /// Returns the stable metadata contract intended for external tooling.
+    pub fn get_tooling_metadata(&self) -> Result<ToolingMetadata> {
+        let runtime = self.runtime_for_metadata_inspection()?;
+        let snapshot = schema_snapshot(self, &runtime)?;
+        crate::tooling::build_tooling_metadata(&snapshot, &runtime)
+    }
+
+    /// Describes a single SQL statement without executing it.
+    pub fn describe_query_contract(&self, sql: &str) -> Result<QueryContract> {
+        let runtime = self.runtime_for_metadata_inspection()?;
+        let prepared_sql = prepared_statement_sql(sql)?;
+        let statement = self.parsed_statement(&prepared_sql)?;
+        let snapshot = schema_snapshot(self, &runtime)?;
+        let metadata = crate::tooling::build_tooling_metadata(&snapshot, &runtime)?;
+        crate::tooling::describe_query_contract(
+            &prepared_sql,
+            statement.as_ref(),
+            &runtime,
+            &metadata.schema_fingerprint,
+        )
+    }
+
     /// Verifies that a named index can be rebuilt logically from the persisted table state.
     pub fn verify_index(&self, name: &str) -> Result<IndexVerification> {
         let (mut runtime, snapshot_lsn) = self.runtime_for_targeted_row_source_inspection()?;
@@ -1637,6 +2221,19 @@ impl Db {
     pub fn dump_sql(&self) -> Result<String> {
         let (mut runtime, snapshot_lsn) = self.runtime_for_targeted_row_source_inspection()?;
         render_runtime_dump(self, &mut runtime, snapshot_lsn)
+    }
+
+    /// Dumps a retained historical snapshot as deterministic SQL.
+    pub fn dump_sql_at_snapshot_lsn(&self, snapshot_lsn: u64) -> Result<String> {
+        let schema_cookie = self.current_schema_cookie_at_snapshot(snapshot_lsn)?;
+        let mut runtime = EngineRuntime::load_from_storage_at_snapshot(
+            &self.inner.pager,
+            &self.inner.wal,
+            schema_cookie,
+            &self.inner.config,
+            snapshot_lsn,
+        )?;
+        render_runtime_dump(self, &mut runtime, Some(snapshot_lsn))
     }
 
     /// Installs a global FaultyVfs failpoint used by the storage harness.
@@ -1763,9 +2360,9 @@ impl Db {
 
         let db = Self {
             inner: Arc::new(DbInner {
-                path,
+                path: path.clone(),
                 config: effective_config,
-                _vfs: vfs,
+                vfs,
                 pager,
                 wal,
                 catalog,
@@ -1782,10 +2379,12 @@ impl Db {
                 statement_cache: Mutex::new(StatementCache::default()),
                 prepared_insert_cache: Mutex::new(PreparedInsertCache::default()),
                 held_snapshots: Mutex::new(HashMap::new()),
+                sync_ctx: SyncContext::new(&path),
             }),
         };
         db.backfill_missing_persistent_pk_indexes()?;
         db.backfill_paged_row_storage()?;
+        db.refresh_named_snapshot_retention()?;
         drop(open_guard);
         drop(open_lock);
         if let Some(canonical_path) = open_lock_key {
@@ -2743,6 +3342,13 @@ impl Db {
                 return Err(error);
             }
         };
+        self.sync_post_commit(&mut runtime, committed_lsn)?;
+        let runtime_schema_cookie = runtime.catalog.schema_cookie;
+        if self.inner.catalog.schema_cookie()? != runtime_schema_cookie {
+            self.inner
+                .catalog
+                .replace(runtime.catalog.as_ref().clone())?;
+        }
         self.sync_temp_state_from_runtime(&runtime)?;
         self.inner
             .last_runtime_lsn
@@ -2806,6 +3412,7 @@ impl Db {
                 return Err(error);
             }
         };
+        self.sync_post_commit(&mut runtime, committed_lsn)?;
         self.sync_temp_state_from_runtime(&runtime)?;
         self.inner
             .last_runtime_lsn
@@ -2871,6 +3478,7 @@ impl Db {
                 return Err(error);
             }
         };
+        self.sync_post_commit(&mut runtime, committed_lsn)?;
         self.sync_temp_state_from_runtime(&runtime)?;
         self.inner
             .last_runtime_lsn
@@ -2942,6 +3550,7 @@ impl Db {
                 return Err(error);
             }
         };
+        self.sync_post_commit(&mut runtime, committed_lsn)?;
         let runtime_schema_cookie = runtime.catalog.schema_cookie;
         if self.inner.catalog.schema_cookie()? != runtime_schema_cookie {
             self.inner
@@ -3008,6 +3617,7 @@ impl Db {
                 return Err(error);
             }
         };
+        self.sync_post_commit(&mut runtime, committed_lsn)?;
         let runtime_schema_cookie = runtime.catalog.schema_cookie;
         if self.inner.catalog.schema_cookie()? != runtime_schema_cookie {
             self.inner
@@ -3076,6 +3686,7 @@ impl Db {
                 return Err(error);
             }
         };
+        self.sync_post_commit(&mut runtime, committed_lsn)?;
         let runtime_schema_cookie = runtime.catalog.schema_cookie;
         if self.inner.catalog.schema_cookie()? != runtime_schema_cookie {
             self.inner
@@ -3125,6 +3736,7 @@ impl Db {
                 return Err(error);
             }
         };
+        self.sync_post_commit(&mut runtime, committed_lsn)?;
         let runtime_schema_cookie = runtime.catalog.schema_cookie;
         if self.inner.catalog.schema_cookie()? != runtime_schema_cookie {
             self.inner
@@ -3553,6 +4165,7 @@ impl Db {
                 return Err(error);
             }
         };
+        self.sync_post_commit(&mut state.runtime, committed_lsn)?;
         if self.inner.catalog.schema_cookie()? != runtime_schema_cookie {
             self.inner
                 .catalog
@@ -3603,6 +4216,7 @@ impl Db {
                 return Err(error);
             }
         };
+        self.sync_post_commit(&mut runtime, committed_lsn)?;
         if self.inner.catalog.schema_cookie()? != runtime_schema_cookie {
             self.inner
                 .catalog
@@ -5021,6 +5635,3682 @@ impl Db {
             "a SQL transaction handle is active on this database handle; use it until commit or rollback",
         )
     }
+
+    pub fn sync_init_replica(&self, replica_id: &str) -> Result<()> {
+        self.ensure_sync_tables()?;
+        self.sync_upsert_metadata("replica_id", replica_id)?;
+        self.sync_upsert_metadata("enabled", "true")?;
+        self.sync_upsert_metadata("next_sequence", "1")?;
+        self.inner.sync_ctx.set_replica_id(replica_id);
+        self.inner.sync_ctx.set_enabled(true);
+        self.inner.sync_ctx.set_next_sequence(1);
+        self.inner.sync_ctx.ensure_journal_open(&self.inner.vfs)?;
+        Ok(())
+    }
+
+    pub fn sync_create_scope(
+        &self,
+        name: &str,
+        include_tables: &[&str],
+        row_filter: Option<&str>,
+    ) -> Result<()> {
+        self.ensure_sync_tables()?;
+        let runtime = self.runtime_for_metadata_inspection()?;
+        let validation =
+            validate_sync_scope_definition(&runtime, name, include_tables, row_filter)?;
+        let created_at_micros = self
+            .sync_scope(name)?
+            .map(|scope| scope.created_at_micros)
+            .unwrap_or_else(current_time_micros);
+        let updated_at_micros = current_time_micros();
+        let sql = format!(
+            "INSERT INTO {table} (name, include_tables_json, row_filter, filter_columns_json, created_at_micros, updated_at_micros) VALUES ({name}, {include_tables_json}, {row_filter}, {filter_columns_json}, {created_at_micros}, {updated_at_micros}) ON CONFLICT (name) DO UPDATE SET include_tables_json = {include_tables_json}, row_filter = {row_filter}, filter_columns_json = {filter_columns_json}, updated_at_micros = {updated_at_micros}",
+            table = crate::sync::SCOPES_TABLE,
+            name = sql_text_literal(&validation.name),
+            include_tables_json = sql_text_literal(
+                &serde_json::to_string(&validation.include_tables)
+                    .map_err(|error| DbError::internal(format!("failed to encode scope tables: {error}")))?,
+            ),
+            row_filter = sql_nullable_text_literal(validation.row_filter.as_deref()),
+            filter_columns_json = sql_text_literal(
+                &serde_json::to_string(&validation.filter_columns)
+                    .map_err(|error| DbError::internal(format!("failed to encode scope columns: {error}")))?,
+            ),
+            created_at_micros = created_at_micros,
+            updated_at_micros = updated_at_micros,
+        );
+        let _ = self.execute(&sql)?;
+        Ok(())
+    }
+
+    pub fn sync_drop_scope(&self, name: &str) -> Result<bool> {
+        self.ensure_sync_tables()?;
+        let scope_name = name.trim();
+        if scope_name.is_empty() {
+            return Err(DbError::sql("sync scope name must not be empty"));
+        }
+        if self
+            .sync_peer_scope_bindings()?
+            .iter()
+            .any(|binding| binding.scope_name.eq_ignore_ascii_case(scope_name))
+        {
+            return Err(DbError::sql(format!(
+                "cannot drop sync scope '{scope_name}' while peer bindings exist"
+            )));
+        }
+        let sql = format!(
+            "DELETE FROM {} WHERE name = {}",
+            crate::sync::SCOPES_TABLE,
+            sql_text_literal(scope_name)
+        );
+        let result = self.execute(&sql)?;
+        Ok(result.affected_rows() > 0)
+    }
+
+    pub fn sync_scope(&self, name: &str) -> Result<Option<SyncScope>> {
+        self.ensure_sync_tables()?;
+        let scope_name = name.trim();
+        if scope_name.is_empty() {
+            return Err(DbError::sql("sync scope name must not be empty"));
+        }
+        let sql = format!(
+            "SELECT name, include_tables_json, row_filter, filter_columns_json, created_at_micros, updated_at_micros FROM {} WHERE name = {}",
+            crate::sync::SCOPES_TABLE,
+            sql_text_literal(scope_name)
+        );
+        match self.execute(&sql) {
+            Ok(result) => Ok(result.rows().first().map(sync_scope_from_row).transpose()?),
+            Err(error) => {
+                let message = error.to_string();
+                if message.contains("no such table") || message.contains("unknown table") {
+                    Ok(None)
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    pub fn sync_scopes(&self) -> Result<Vec<SyncScope>> {
+        self.ensure_sync_tables()?;
+        let sql = format!(
+            "SELECT name, include_tables_json, row_filter, filter_columns_json, created_at_micros, updated_at_micros FROM {} ORDER BY name",
+            crate::sync::SCOPES_TABLE
+        );
+        match self.execute(&sql) {
+            Ok(result) => result.rows().iter().map(sync_scope_from_row).collect(),
+            Err(error) => {
+                let message = error.to_string();
+                if message.contains("no such table") || message.contains("unknown table") {
+                    Ok(Vec::new())
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    pub fn sync_bind_peer_scope(&self, peer_name: &str, scope_name: &str) -> Result<()> {
+        self.ensure_sync_tables()?;
+        let peer_name = peer_name.trim();
+        if peer_name.is_empty() {
+            return Err(DbError::sql("sync peer name must not be empty"));
+        }
+        if self.sync_peer(peer_name)?.is_none() {
+            return Err(DbError::sql(format!("sync peer '{peer_name}' not found")));
+        }
+        let scope = self
+            .sync_scope(scope_name)?
+            .ok_or_else(|| DbError::sql(format!("sync scope '{scope_name}' not found")))?;
+        let existing = self.sync_peer_scope_binding_row(peer_name)?;
+        let created_at_micros = existing
+            .as_ref()
+            .map(|binding| binding.created_at_micros)
+            .unwrap_or_else(current_time_micros);
+        let updated_at_micros = current_time_micros();
+        let sql = format!(
+            "INSERT INTO {table} (peer_name, scope_name, created_at_micros, updated_at_micros) VALUES ({peer_name}, {scope_name}, {created_at_micros}, {updated_at_micros}) ON CONFLICT (peer_name) DO UPDATE SET scope_name = {scope_name}, updated_at_micros = {updated_at_micros}",
+            table = crate::sync::PEER_SCOPES_TABLE,
+            peer_name = sql_text_literal(peer_name),
+            scope_name = sql_text_literal(&scope.name),
+            created_at_micros = created_at_micros,
+            updated_at_micros = updated_at_micros,
+        );
+        let _ = self.execute(&sql)?;
+        Ok(())
+    }
+
+    pub fn sync_unbind_peer_scope(&self, peer_name: &str) -> Result<bool> {
+        self.ensure_sync_tables()?;
+        let peer_name = peer_name.trim();
+        if peer_name.is_empty() {
+            return Err(DbError::sql("sync peer name must not be empty"));
+        }
+        let sql = format!(
+            "DELETE FROM {} WHERE peer_name = {}",
+            crate::sync::PEER_SCOPES_TABLE,
+            sql_text_literal(peer_name)
+        );
+        let result = self.execute(&sql)?;
+        Ok(result.affected_rows() > 0)
+    }
+
+    pub fn sync_peer_scope(&self, peer_name: &str) -> Result<Option<SyncPeerScopeBinding>> {
+        self.ensure_sync_tables()?;
+        let peer_name = peer_name.trim();
+        if peer_name.is_empty() {
+            return Err(DbError::sql("sync peer name must not be empty"));
+        }
+        self.sync_peer_scope_binding_row(peer_name)
+    }
+
+    pub fn sync_peer_scope_definition(&self, peer_name: &str) -> Result<Option<SyncScope>> {
+        let binding = match self.sync_peer_scope(peer_name)? {
+            Some(binding) => binding,
+            None => return Ok(None),
+        };
+        match self.sync_scope(&binding.scope_name)? {
+            Some(scope) => Ok(Some(scope)),
+            None => Err(DbError::sql(format!(
+                "sync scope '{}' bound to peer '{}' was not found",
+                binding.scope_name, binding.peer_name
+            ))),
+        }
+    }
+
+    pub fn sync_peer_scope_bindings(&self) -> Result<Vec<SyncPeerScopeBinding>> {
+        self.ensure_sync_tables()?;
+        let sql = format!(
+            "SELECT peer_name, scope_name, created_at_micros, updated_at_micros FROM {} ORDER BY peer_name",
+            crate::sync::PEER_SCOPES_TABLE
+        );
+        match self.execute(&sql) {
+            Ok(result) => result
+                .rows()
+                .iter()
+                .map(sync_peer_scope_binding_from_row)
+                .collect(),
+            Err(error) => {
+                let message = error.to_string();
+                if message.contains("no such table") || message.contains("unknown table") {
+                    Ok(Vec::new())
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    pub fn sync_export_batch_for_scope(
+        &self,
+        scope_name: &str,
+        since_seq: u64,
+        limit: usize,
+    ) -> Result<SyncChangeBatch> {
+        let scope = self
+            .sync_scope(scope_name)?
+            .ok_or_else(|| DbError::sql(format!("sync scope '{scope_name}' not found")))?;
+        let records = self.sync_pending_changes(since_seq, limit)?;
+        let source_replica_id = records.first().map(|record| record.replica_id.clone());
+        let source_high_watermark = records.last().map(|record| record.sequence);
+        let filtered = self.sync_filter_records_for_scope(&scope, records)?;
+        SyncChangeBatch::scoped_from_records(filtered, source_replica_id, source_high_watermark)
+    }
+
+    pub fn sync_import_batch_for_scope(
+        &self,
+        scope_name: &str,
+        batch: &SyncChangeBatch,
+    ) -> Result<SyncImportSummary> {
+        batch.validate()?;
+        let scope = self
+            .sync_scope(scope_name)?
+            .ok_or_else(|| DbError::sql(format!("sync scope '{scope_name}' not found")))?;
+        self.sync_validate_batch_for_scope(&scope, batch)?;
+        self.sync_import_batch(batch)
+    }
+
+    pub fn sync_import_batch_for_scope_with_policy(
+        &self,
+        scope_name: &str,
+        batch: &SyncChangeBatch,
+        policy: SyncConflictPolicy,
+    ) -> Result<SyncImportSummary> {
+        batch.validate()?;
+        let scope = self
+            .sync_scope(scope_name)?
+            .ok_or_else(|| DbError::sql(format!("sync scope '{scope_name}' not found")))?;
+        self.sync_validate_batch_for_scope(&scope, batch)?;
+        self.sync_import_batch_with_policy(batch, policy)
+    }
+
+    pub fn sync_add_peer(&self, name: &str, endpoint: &str, token_env: Option<&str>) -> Result<()> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(DbError::sql("sync peer name must not be empty"));
+        }
+        if !(endpoint.starts_with("http://") || endpoint.starts_with("https://")) {
+            return Err(DbError::sql(
+                "sync peer endpoint must start with http:// or https://",
+            ));
+        }
+        if token_env.is_some_and(|value| value.trim().is_empty()) {
+            return Err(DbError::sql("sync peer token_env must not be empty"));
+        }
+
+        self.ensure_sync_tables()?;
+        let now = current_time_micros();
+        let token_sql = token_env
+            .map(sql_text_literal)
+            .unwrap_or_else(|| "NULL".to_string());
+        let sql = format!(
+            "INSERT INTO {table} (name, endpoint, token_env, created_at_micros, updated_at_micros) VALUES ({name}, {endpoint}, {token_env}, {now}, {now}) ON CONFLICT (name) DO UPDATE SET endpoint = {endpoint}, token_env = {token_env}, updated_at_micros = {now}",
+            table = crate::sync::PEERS_TABLE,
+            name = sql_text_literal(name),
+            endpoint = sql_text_literal(endpoint),
+            token_env = token_sql,
+            now = now,
+        );
+        let _ = self.execute(&sql)?;
+        Ok(())
+    }
+
+    pub fn sync_remove_peer(&self, name: &str) -> Result<bool> {
+        self.ensure_sync_tables()?;
+        let sql = format!(
+            "DELETE FROM {} WHERE name = {}",
+            crate::sync::PEERS_TABLE,
+            sql_text_literal(name)
+        );
+        let result = self.execute(&sql)?;
+        Ok(result.affected_rows() > 0)
+    }
+
+    pub fn sync_peers(&self) -> Result<Vec<SyncPeer>> {
+        self.ensure_sync_tables()?;
+        let sql = format!(
+            "SELECT name, endpoint, token_env, created_at_micros, updated_at_micros FROM {} ORDER BY name",
+            crate::sync::PEERS_TABLE
+        );
+        match self.execute(&sql) {
+            Ok(result) => result.rows().iter().map(sync_peer_from_row).collect(),
+            Err(error) => {
+                let message = error.to_string();
+                if message.contains("no such table") || message.contains("unknown table") {
+                    Ok(Vec::new())
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    pub fn sync_peer(&self, name: &str) -> Result<Option<SyncPeer>> {
+        self.ensure_sync_tables()?;
+        let sql = format!(
+            "SELECT name, endpoint, token_env, created_at_micros, updated_at_micros FROM {} WHERE name = {}",
+            crate::sync::PEERS_TABLE,
+            sql_text_literal(name)
+        );
+        match self.execute(&sql) {
+            Ok(result) => Ok(result.rows().first().map(sync_peer_from_row).transpose()?),
+            Err(error) => {
+                let message = error.to_string();
+                if message.contains("no such table") || message.contains("unknown table") {
+                    Ok(None)
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    fn sync_peer_scope_binding_row(&self, peer_name: &str) -> Result<Option<SyncPeerScopeBinding>> {
+        let sql = format!(
+            "SELECT peer_name, scope_name, created_at_micros, updated_at_micros FROM {} WHERE peer_name = {}",
+            crate::sync::PEER_SCOPES_TABLE,
+            sql_text_literal(peer_name)
+        );
+        match self.execute(&sql) {
+            Ok(result) => Ok(result
+                .rows()
+                .first()
+                .map(sync_peer_scope_binding_from_row)
+                .transpose()?),
+            Err(error) => {
+                let message = error.to_string();
+                if message.contains("no such table") || message.contains("unknown table") {
+                    Ok(None)
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    pub fn sync_sessions(&self) -> Result<Vec<SyncSession>> {
+        self.ensure_sync_tables()?;
+        let sql = format!(
+            "SELECT session_id, peer_name, direction, remote_replica_id, started_at_micros, ended_at_micros, status, error, pushed_batch_id, pulled_batch_id, pushed_seen, pushed_applied, pushed_skipped, pushed_conflicted, pulled_seen, pulled_applied, pulled_skipped, pulled_conflicted, retry_count FROM {} ORDER BY session_id",
+            crate::sync::SESSIONS_TABLE
+        );
+        match self.execute(&sql) {
+            Ok(result) => result.rows().iter().map(sync_session_from_row).collect(),
+            Err(error) => {
+                let message = error.to_string();
+                if message.contains("no such table") || message.contains("unknown table") {
+                    Ok(Vec::new())
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    pub fn sync_start_session(
+        &self,
+        peer_name: &str,
+        direction: SyncRunDirection,
+        remote_replica_id: Option<&str>,
+    ) -> Result<i64> {
+        self.ensure_sync_tables()?;
+        let session_id = self.next_sync_session_id()?;
+        let started_at_micros = current_time_micros();
+        let sql = format!(
+            "INSERT INTO {table} (session_id, peer_name, direction, remote_replica_id, started_at_micros, ended_at_micros, status, error, pushed_batch_id, pulled_batch_id, pushed_seen, pushed_applied, pushed_skipped, pushed_conflicted, pulled_seen, pulled_applied, pulled_skipped, pulled_conflicted, retry_count) VALUES ({session_id}, {peer_name}, {direction}, {remote_replica_id}, {started_at_micros}, NULL, 'started', NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, 0, 0, 0)",
+            table = crate::sync::SESSIONS_TABLE,
+            session_id = session_id,
+            peer_name = sql_text_literal(peer_name),
+            direction = sql_text_literal(direction.as_str()),
+            remote_replica_id = remote_replica_id
+                .map(sql_text_literal)
+                .unwrap_or_else(|| "NULL".to_string()),
+            started_at_micros = started_at_micros,
+        );
+        let _ = self.execute(&sql)?;
+        Ok(session_id)
+    }
+
+    pub fn sync_finish_session_success(
+        &self,
+        session_id: i64,
+        summary: &SyncRunSummary,
+    ) -> Result<()> {
+        self.sync_update_session(session_id, summary, "success", None, current_time_micros())
+    }
+
+    pub fn sync_finish_session_failed(
+        &self,
+        session_id: i64,
+        summary: &SyncRunSummary,
+        error: &str,
+    ) -> Result<()> {
+        self.sync_update_session(
+            session_id,
+            summary,
+            "failed",
+            Some(error),
+            current_time_micros(),
+        )
+    }
+
+    pub fn sync_integrity_report(&self) -> Result<SyncJournalIntegrityReport> {
+        let local_replica_id = self.sync_read_metadata("replica_id").ok().flatten();
+        crate::sync::inspect_journal_integrity(
+            self.inner.sync_ctx.journal_path(),
+            &self.inner.vfs,
+            local_replica_id.as_deref(),
+        )
+    }
+
+    pub fn sync_peer_lag_report(&self) -> Result<Vec<SyncPeerLag>> {
+        self.ensure_sync_tables()?;
+        let local_high_watermark = self.sync_integrity_report()?.last_sequence;
+        let peers = self.sync_peers()?;
+        let sessions = self.sync_sessions()?;
+        let mut latest_successful_remote_replica_ids: HashMap<String, Option<String>> =
+            HashMap::new();
+        for session in sessions.iter().rev() {
+            if session.status == "success" {
+                latest_successful_remote_replica_ids
+                    .entry(session.peer_name.clone())
+                    .or_insert_with(|| session.remote_replica_id.clone());
+            }
+        }
+
+        peers
+            .into_iter()
+            .map(|peer| {
+                let remote_replica_id = latest_successful_remote_replica_ids
+                    .get(&peer.name)
+                    .cloned()
+                    .flatten();
+                let in_watermark = match remote_replica_id.as_deref() {
+                    Some(replica_id) => self.sync_peer_watermark(replica_id)?,
+                    None => None,
+                };
+                let out_watermark = self.sync_peer_out_watermark(&peer.name)?;
+                let in_lag = match (local_high_watermark, in_watermark) {
+                    (Some(local_high), Some(in_watermark)) if local_high >= in_watermark => {
+                        Some(local_high - in_watermark)
+                    }
+                    _ => None,
+                };
+                let out_lag = match (local_high_watermark, out_watermark) {
+                    (Some(local_high), Some(out_watermark)) if local_high >= out_watermark => {
+                        Some(local_high - out_watermark)
+                    }
+                    _ => None,
+                };
+                Ok(SyncPeerLag {
+                    peer_name: peer.name,
+                    remote_replica_id,
+                    in_watermark,
+                    out_watermark,
+                    local_high_watermark,
+                    in_lag,
+                    out_lag,
+                })
+            })
+            .collect()
+    }
+
+    pub fn sync_retention_report(&self) -> Result<SyncRetentionReport> {
+        let integrity = self.sync_integrity_report()?;
+        let peer_lag = self.sync_peer_lag_report()?;
+        let journal_size_bytes = self.sync_status()?.journal_size_bytes;
+        let mut watermark_entries = peer_lag
+            .iter()
+            .flat_map(|peer| {
+                let inbound = peer.remote_replica_id.as_ref().zip(peer.in_watermark).map(
+                    |(remote_replica_id, watermark)| {
+                        (format!("remote:{remote_replica_id}"), watermark)
+                    },
+                );
+                let outbound = peer
+                    .out_watermark
+                    .map(|watermark| (peer.peer_name.clone(), watermark));
+                inbound.into_iter().chain(outbound)
+            })
+            .collect::<Vec<_>>();
+        watermark_entries.extend(self.sync_peer_watermark_entries()?);
+        watermark_entries.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+        watermark_entries.dedup();
+        let lowest_watermark = watermark_entries
+            .iter()
+            .map(|(_, watermark)| *watermark)
+            .min();
+        let safe_prune_through = if integrity.total_records == 0 {
+            None
+        } else {
+            lowest_watermark.and_then(|watermark| watermark.checked_sub(1))
+        };
+        let blocked_by = if integrity.total_records == 0 {
+            Vec::new()
+        } else if let Some(lowest_watermark) = lowest_watermark {
+            if integrity
+                .last_sequence
+                .is_some_and(|local_high| lowest_watermark <= local_high)
+            {
+                watermark_entries
+                    .iter()
+                    .filter(|(_, watermark)| *watermark == lowest_watermark)
+                    .map(|(label, _)| label.clone())
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+        let prunable_records = match safe_prune_through {
+            Some(safe_through) => {
+                match crate::sync::read_journal_records(
+                    self.inner.sync_ctx.journal_path(),
+                    &self.inner.vfs,
+                    0,
+                    usize::MAX,
+                ) {
+                    Ok(records) => records
+                        .into_iter()
+                        .filter(|record| record.sequence <= safe_through)
+                        .count(),
+                    Err(_) => 0,
+                }
+            }
+            None => 0,
+        };
+
+        Ok(SyncRetentionReport {
+            journal_records: integrity.total_records,
+            first_sequence: integrity.first_sequence,
+            last_sequence: integrity.last_sequence,
+            safe_prune_through,
+            prunable_records,
+            blocked_by,
+            journal_size_bytes,
+        })
+    }
+
+    pub fn sync_operational_doctor_report(&self) -> Result<SyncOperationalDoctorReport> {
+        let status = self.sync_status()?;
+        let integrity = self.sync_integrity_report()?;
+        let retention = self.sync_retention_report()?;
+        let peer_lag = self.sync_peer_lag_report()?;
+        let unresolved_conflicts = self.sync_conflicts()?.len();
+        let mut recent_sessions = self.sync_sessions()?;
+        if recent_sessions.len() > 5 {
+            recent_sessions = recent_sessions.split_off(recent_sessions.len() - 5);
+        }
+        let mut issues = integrity.issues.clone();
+        let mut guidance = Vec::new();
+        let mut highest_severity = integrity.highest_severity;
+
+        if !status.enabled {
+            highest_severity = highest_severity.max(SyncDoctorSeverity::Warning);
+            guidance.push(
+                "sync is disabled; enable it before expecting journal growth or peer watermarks"
+                    .to_string(),
+            );
+        }
+
+        if unresolved_conflicts > 0 {
+            highest_severity = highest_severity.max(SyncDoctorSeverity::Warning);
+            let message = format!("{unresolved_conflicts} unresolved conflict(s) need attention");
+            issues.push(SyncJournalIssue {
+                line_number: 0,
+                sequence: None,
+                severity: SyncDoctorSeverity::Warning,
+                code: "unresolved_conflicts".to_string(),
+                message: message.clone(),
+            });
+            guidance.push(message);
+        }
+
+        if retention.journal_records > 0 && retention.safe_prune_through.is_none() {
+            highest_severity = highest_severity.max(SyncDoctorSeverity::Warning);
+            let message = if retention.blocked_by.is_empty() {
+                "safe prune is unavailable because no peer watermarks are known".to_string()
+            } else {
+                format!(
+                    "safe prune is blocked by {}",
+                    retention.blocked_by.join(", ")
+                )
+            };
+            issues.push(SyncJournalIssue {
+                line_number: 0,
+                sequence: None,
+                severity: SyncDoctorSeverity::Warning,
+                code: "retention_blocked".to_string(),
+                message: message.clone(),
+            });
+            guidance.push(message);
+        } else if let Some(safe_through) = retention.safe_prune_through {
+            guidance.push(format!(
+                "safe prune is available through sequence {safe_through}"
+            ));
+        }
+
+        if peer_lag.iter().any(|peer| {
+            peer.in_lag.is_some_and(|lag| lag > 0) || peer.out_lag.is_some_and(|lag| lag > 0)
+        }) {
+            highest_severity = highest_severity.max(SyncDoctorSeverity::Warning);
+            guidance.push("peer lag exists; inspect sys_sync_peer_lag before pruning".to_string());
+        }
+
+        if integrity.highest_severity == SyncDoctorSeverity::Error {
+            highest_severity = SyncDoctorSeverity::Error;
+        }
+
+        if issues.is_empty() {
+            guidance.push("journal integrity is clean".to_string());
+        }
+
+        Ok(SyncOperationalDoctorReport {
+            status,
+            integrity,
+            retention,
+            peer_lag,
+            unresolved_conflicts,
+            recent_sessions,
+            highest_severity,
+            issues,
+            guidance,
+        })
+    }
+
+    pub fn sync_status(&self) -> Result<SyncStatus> {
+        if self.inner.sync_ctx.is_enabled() {
+            return Ok(SyncStatus {
+                enabled: true,
+                replica_id: self.inner.sync_ctx.replica_id(),
+                next_sequence: self.inner.sync_ctx.next_sequence(),
+                journal_path: Some(
+                    self.inner
+                        .sync_ctx
+                        .journal_path()
+                        .to_string_lossy()
+                        .to_string(),
+                ),
+                journal_size_bytes: self.inner.sync_ctx.journal_size_bytes(),
+            });
+        }
+        self.load_sync_status_from_db()
+    }
+
+    pub fn sync_pending_changes(
+        &self,
+        since_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<SyncJournalRecord>> {
+        if !self.inner.sync_ctx.is_enabled() {
+            let loaded = self.load_sync_status_from_db()?;
+            if !loaded.enabled {
+                return Ok(Vec::new());
+            }
+        }
+        crate::sync::read_journal_records(
+            self.inner.sync_ctx.journal_path(),
+            &self.inner.vfs,
+            since_seq,
+            limit,
+        )
+    }
+
+    fn sync_scope_row_filter_expr(scope: &SyncScope) -> Result<Option<crate::sql::ast::Expr>> {
+        match scope.row_filter.as_deref() {
+            Some(filter_sql) => Ok(Some(parse_expression_sql(filter_sql).map_err(|error| {
+                DbError::sql(format!(
+                    "invalid row filter for sync scope '{}': {error}",
+                    scope.name
+                ))
+            })?)),
+            None => Ok(None),
+        }
+    }
+
+    fn sync_scope_record_matches(
+        &self,
+        scope: &SyncScope,
+        record: &SyncJournalRecord,
+    ) -> Result<bool> {
+        if !scope
+            .include_tables
+            .iter()
+            .any(|table_name| table_name.eq_ignore_ascii_case(&record.table))
+        {
+            return Ok(false);
+        }
+        let Some(expr) = Self::sync_scope_row_filter_expr(scope)? else {
+            return Ok(true);
+        };
+        let runtime = self.runtime_for_metadata_inspection()?;
+        let table = runtime
+            .catalog
+            .table(&record.table)
+            .ok_or_else(|| DbError::sql(format!("unknown table '{}'", record.table)))?;
+        let payload = match record.operation.as_str() {
+            "delete" => &record.primary_key,
+            "insert" | "update" => record
+                .after
+                .as_ref()
+                .ok_or_else(|| DbError::sql("sync record missing after payload"))?,
+            other => {
+                return Err(DbError::sql(format!("unsupported operation '{other}'")));
+            }
+        };
+        let payload = payload.as_object().ok_or_else(|| {
+            DbError::sql(format!(
+                "sync record for table '{}' must use an object payload",
+                record.table
+            ))
+        })?;
+
+        let mut values = Vec::with_capacity(scope.filter_columns.len());
+        for column_name in &scope.filter_columns {
+            let column = table
+                .columns
+                .iter()
+                .find(|candidate| candidate.name.eq_ignore_ascii_case(column_name))
+                .ok_or_else(|| {
+                    DbError::sql(format!(
+                        "sync scope column '{column_name}' is missing from table '{}'",
+                        table.name
+                    ))
+                })?;
+            let json_value = payload.get(&column.name).ok_or_else(|| {
+                DbError::sql(format!(
+                    "sync record for table '{}' is missing scoped column '{}'",
+                    table.name, column.name
+                ))
+            })?;
+            values.push(json_to_column_value(&table.name, column, json_value)?);
+        }
+
+        row_satisfies_expression(&runtime, &table.name, &scope.filter_columns, &values, &expr)
+    }
+
+    fn sync_filter_records_for_scope(
+        &self,
+        scope: &SyncScope,
+        records: Vec<SyncJournalRecord>,
+    ) -> Result<Vec<SyncJournalRecord>> {
+        let mut filtered = Vec::new();
+        for record in records {
+            if self.sync_scope_record_matches(scope, &record)? {
+                filtered.push(record);
+            }
+        }
+        Ok(filtered)
+    }
+
+    fn sync_validate_batch_for_scope(
+        &self,
+        scope: &SyncScope,
+        batch: &SyncChangeBatch,
+    ) -> Result<()> {
+        let runtime = self.runtime_for_metadata_inspection()?;
+        for record in &batch.records {
+            if !scope
+                .include_tables
+                .iter()
+                .any(|table_name| table_name.eq_ignore_ascii_case(&record.table))
+            {
+                return Err(DbError::sql(format!(
+                    "sync batch contains table '{}' which is outside scope '{}'",
+                    record.table, scope.name
+                )));
+            }
+            if scope.row_filter.is_some() {
+                let table = runtime
+                    .catalog
+                    .table(&record.table)
+                    .ok_or_else(|| DbError::sql(format!("unknown table '{}'", record.table)))?;
+                let payload = match record.operation.as_str() {
+                    "delete" => &record.primary_key,
+                    "insert" | "update" => record
+                        .after
+                        .as_ref()
+                        .ok_or_else(|| DbError::sql("sync record missing after payload"))?,
+                    other => {
+                        return Err(DbError::sql(format!("unsupported operation '{other}'")));
+                    }
+                };
+                let payload = payload.as_object().ok_or_else(|| {
+                    DbError::sql(format!(
+                        "sync record for table '{}' must use an object payload",
+                        record.table
+                    ))
+                })?;
+                let mut values = Vec::with_capacity(scope.filter_columns.len());
+                for column_name in &scope.filter_columns {
+                    let column = table
+                        .columns
+                        .iter()
+                        .find(|candidate| candidate.name.eq_ignore_ascii_case(column_name))
+                        .ok_or_else(|| {
+                            DbError::sql(format!(
+                                "sync scope column '{column_name}' is missing from table '{}'",
+                                table.name
+                            ))
+                        })?;
+                    let json_value = payload.get(&column.name).ok_or_else(|| {
+                        DbError::sql(format!(
+                            "sync record for table '{}' is missing scoped column '{}'",
+                            table.name, column.name
+                        ))
+                    })?;
+                    values.push(json_to_column_value(&table.name, column, json_value)?);
+                }
+                if !row_satisfies_expression(
+                    &runtime,
+                    &table.name,
+                    &scope.filter_columns,
+                    &values,
+                    &Self::sync_scope_row_filter_expr(scope)?
+                        .ok_or_else(|| DbError::internal("scope row filter expression missing"))?,
+                )? {
+                    return Err(DbError::sql(format!(
+                        "sync batch contains record for table '{}' that does not match scope '{}'",
+                        record.table, scope.name
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn sync_export_batch(&self, since_seq: u64, limit: usize) -> Result<SyncChangeBatch> {
+        let records = self.sync_pending_changes(since_seq, limit)?;
+        SyncChangeBatch::from_records(records)
+    }
+
+    pub fn sync_conflict_policy(&self) -> Result<SyncConflictPolicyConfig> {
+        let default_policy = self
+            .sync_read_metadata("conflict_policy")?
+            .map(|value| SyncConflictPolicy::from_str(&value))
+            .transpose()?
+            .unwrap_or_default();
+        let origin_priority = match self.sync_read_metadata("conflict_origin_priority")? {
+            Some(value) => serde_json::from_str::<Vec<String>>(&value).map_err(|error| {
+                DbError::sql(format!(
+                    "invalid sync conflict origin priority metadata: {error}"
+                ))
+            })?,
+            None => Vec::new(),
+        };
+        Ok(SyncConflictPolicyConfig {
+            default_policy,
+            origin_priority,
+        })
+    }
+
+    pub fn sync_set_conflict_policy(
+        &self,
+        policy: SyncConflictPolicy,
+        origin_priority: &[&str],
+    ) -> Result<()> {
+        self.ensure_sync_tables()?;
+        let origin_priority = origin_priority
+            .iter()
+            .map(|value| value.trim())
+            .map(|value| {
+                if value.is_empty() {
+                    Err(DbError::sql(
+                        "sync conflict origin priority entries must not be empty",
+                    ))
+                } else {
+                    Ok(value.to_string())
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.sync_upsert_metadata("conflict_policy", policy.as_str())?;
+        self.sync_upsert_metadata(
+            "conflict_origin_priority",
+            &serde_json::to_string(&origin_priority).map_err(|error| {
+                DbError::internal(format!(
+                    "failed to serialize sync conflict origin priority: {error}"
+                ))
+            })?,
+        )?;
+        Ok(())
+    }
+
+    pub fn sync_import_batch(&self, batch: &SyncChangeBatch) -> Result<SyncImportSummary> {
+        let policy = self.sync_conflict_policy()?.default_policy;
+        self.sync_import_batch_with_policy(batch, policy)
+    }
+
+    pub fn sync_import_batch_with_policy(
+        &self,
+        batch: &SyncChangeBatch,
+        policy: SyncConflictPolicy,
+    ) -> Result<SyncImportSummary> {
+        batch.validate()?;
+        self.ensure_sync_tables()?;
+
+        let runtime = self.runtime_for_metadata_inspection()?;
+        let schema_cookie = runtime.catalog.schema_cookie;
+        let local_replica_id = self
+            .inner
+            .sync_ctx
+            .replica_id()
+            .or_else(|| self.sync_read_metadata("replica_id").ok().flatten());
+        let batch_source_replica_id = batch.source_replica_id.as_deref();
+        let batch_watermark = batch.source_high_watermark.or(batch.last_sequence);
+        let current_peer_watermark = match batch_source_replica_id {
+            Some(replica_id) => self.sync_peer_watermark(replica_id)?,
+            None => None,
+        };
+
+        if let Some(local_replica_id) = local_replica_id.as_deref() {
+            if batch_source_replica_id == Some(local_replica_id) {
+                return Err(DbError::sql(format!(
+                    "cannot import batch from same replica '{}'",
+                    local_replica_id
+                )));
+            }
+        }
+
+        let _suppress_capture = self.inner.sync_ctx.suppress_capture();
+        struct SyncImportTransaction<'a>(&'a Db, bool);
+        impl<'a> SyncImportTransaction<'a> {
+            fn new(db: &'a Db) -> Result<Self> {
+                db.begin_transaction()?;
+                Ok(Self(db, true))
+            }
+            fn commit(mut self) -> Result<()> {
+                self.1 = false;
+                self.0.commit_transaction()?;
+                Ok(())
+            }
+        }
+        impl Drop for SyncImportTransaction<'_> {
+            fn drop(&mut self) {
+                if self.1 {
+                    let _ = self.0.rollback_transaction();
+                }
+            }
+        }
+
+        if let Some(batch_watermark) = batch_watermark {
+            if current_peer_watermark.is_some_and(|watermark| batch_watermark <= watermark) {
+                if let Some(replica_id) = batch_source_replica_id {
+                    let watermark = current_peer_watermark
+                        .map_or(batch_watermark, |current| current.max(batch_watermark));
+                    self.sync_upsert_metadata(
+                        &peer_watermark_key(replica_id),
+                        &watermark.to_string(),
+                    )?;
+                }
+                return Ok(SyncImportSummary {
+                    seen: batch.record_count,
+                    applied: 0,
+                    skipped: batch.record_count,
+                    conflicted: 0,
+                });
+            }
+        }
+
+        let tx = SyncImportTransaction::new(self)?;
+        let mut applied = 0usize;
+        let mut skipped = 0usize;
+        let mut conflicted = 0usize;
+        let mut stop_conflict: Option<(SyncJournalRecord, SyncConflictRecordData)> = None;
+
+        for record in &batch.records {
+            if let Some(local_replica_id) = local_replica_id.as_deref() {
+                if record.replica_id == local_replica_id {
+                    return Err(DbError::sql(format!(
+                        "cannot import record from same replica '{}'",
+                        local_replica_id
+                    )));
+                }
+            }
+
+            if let Some(watermark) = current_peer_watermark {
+                if record.sequence <= watermark {
+                    skipped += 1;
+                    continue;
+                }
+            }
+
+            if record.schema_version != 1 {
+                return Err(DbError::sql(format!(
+                    "unsupported sync record schema version {}",
+                    record.schema_version
+                )));
+            }
+
+            if record.schema_cookie != schema_cookie {
+                return Err(DbError::sql(format!(
+                    "schema mismatch for table '{}': record has schema_cookie {} but local schema is {}",
+                    record.table, record.schema_cookie, schema_cookie
+                )));
+            }
+
+            let table = runtime
+                .catalog
+                .table(&record.table)
+                .ok_or_else(|| DbError::sql(format!("unknown table '{}'", record.table)))?;
+            if crate::sync::is_internal_table_name(&table.name) {
+                return Err(DbError::sql(format!(
+                    "cannot import into internal table '{}'",
+                    table.name
+                )));
+            }
+            let marker_key = imported_record_key(&record.replica_id, record.sequence);
+            if self.sync_read_metadata(&marker_key)?.is_some() {
+                skipped += 1;
+                continue;
+            }
+
+            let outcome = self.sync_apply_import_record(batch, record, table, &policy)?;
+            match outcome {
+                SyncImportRecordOutcome::Applied => {
+                    self.sync_upsert_metadata(&marker_key, "applied")?;
+                    applied += 1;
+                }
+                SyncImportRecordOutcome::Conflict(conflict) => {
+                    if matches!(policy, SyncConflictPolicy::Stop) {
+                        stop_conflict = Some((record.clone(), conflict));
+                        break;
+                    }
+                    self.record_sync_conflict_with_data(batch, record, &conflict)?;
+                    conflicted += 1;
+                }
+                SyncImportRecordOutcome::Resolved(conflict) => {
+                    self.sync_upsert_metadata(&marker_key, "applied")?;
+                    self.record_sync_conflict_with_data(batch, record, &conflict)?;
+                    applied += 1;
+                    conflicted += 1;
+                }
+            }
+        }
+
+        if let Some((record, conflict)) = stop_conflict {
+            drop(tx);
+            let conflict_id = self.record_sync_conflict_with_data(batch, &record, &conflict)?;
+            return Err(DbError::sql(format!(
+                "sync import stopped on conflict {}",
+                conflict_id
+            )));
+        }
+
+        if let (Some(replica_id), Some(batch_watermark)) =
+            (batch_source_replica_id, batch_watermark)
+        {
+            let watermark = current_peer_watermark
+                .map_or(batch_watermark, |current| current.max(batch_watermark));
+            self.sync_upsert_metadata(&peer_watermark_key(replica_id), &watermark.to_string())?;
+        }
+
+        tx.commit()?;
+        Ok(SyncImportSummary {
+            seen: batch.record_count,
+            applied,
+            skipped,
+            conflicted,
+        })
+    }
+
+    pub fn sync_import_records(&self, records: &[SyncJournalRecord]) -> Result<SyncImportSummary> {
+        let batch = SyncChangeBatch::from_records(records.to_vec())?;
+        self.sync_import_batch(&batch)
+    }
+
+    pub fn sync_peer_watermark(&self, replica_id: &str) -> Result<Option<u64>> {
+        match self.sync_read_metadata(&peer_watermark_key(replica_id))? {
+            Some(value) => value
+                .parse::<u64>()
+                .map(Some)
+                .map_err(|error| DbError::sql(format!("invalid peer watermark value: {error}"))),
+            None => Ok(None),
+        }
+    }
+
+    pub fn sync_peer_out_watermark(&self, peer_name: &str) -> Result<Option<u64>> {
+        match self.sync_read_metadata(&peer_out_watermark_key(peer_name))? {
+            Some(value) => value.parse::<u64>().map(Some).map_err(|error| {
+                DbError::sql(format!("invalid peer outbound watermark value: {error}"))
+            }),
+            None => Ok(None),
+        }
+    }
+
+    pub fn sync_set_peer_out_watermark(&self, peer_name: &str, watermark: u64) -> Result<()> {
+        self.ensure_sync_tables()?;
+        self.sync_upsert_metadata(&peer_out_watermark_key(peer_name), &watermark.to_string())
+    }
+
+    pub fn sync_conflicts(&self) -> Result<Vec<SyncConflict>> {
+        self.ensure_sync_tables()?;
+        let sql = format!(
+            "SELECT * FROM {} WHERE resolved = 0 ORDER BY conflict_id",
+            crate::sync::CONFLICTS_TABLE
+        );
+        match self.execute(&sql) {
+            Ok(result) => result.rows().iter().map(sync_conflict_from_row).collect(),
+            Err(error) => {
+                let message = error.to_string();
+                if message.contains("no such table") || message.contains("unknown table") {
+                    Ok(Vec::new())
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    pub fn sync_conflicts_all(&self) -> Result<Vec<SyncConflict>> {
+        self.ensure_sync_tables()?;
+        let sql = format!(
+            "SELECT * FROM {} ORDER BY conflict_id",
+            crate::sync::CONFLICTS_TABLE
+        );
+        match self.execute(&sql) {
+            Ok(result) => result.rows().iter().map(sync_conflict_from_row).collect(),
+            Err(error) => {
+                let message = error.to_string();
+                if message.contains("no such table") || message.contains("unknown table") {
+                    Ok(Vec::new())
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    pub fn sync_conflict(&self, conflict_id: i64) -> Result<Option<SyncConflict>> {
+        self.ensure_sync_tables()?;
+        let sql = format!(
+            "SELECT * FROM {} WHERE conflict_id = {}",
+            crate::sync::CONFLICTS_TABLE,
+            conflict_id
+        );
+        match self.execute(&sql) {
+            Ok(result) => Ok(result
+                .rows()
+                .first()
+                .map(sync_conflict_from_row)
+                .transpose()?),
+            Err(error) => {
+                let message = error.to_string();
+                if message.contains("no such table") || message.contains("unknown table") {
+                    Ok(None)
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    pub fn sync_resolve_conflict_keep_local(
+        &self,
+        conflict_id: i64,
+        resolved_by: Option<&str>,
+        note: Option<&str>,
+    ) -> Result<bool> {
+        self.sync_update_conflict_resolution(
+            conflict_id,
+            Some("keep_local"),
+            resolved_by,
+            note,
+            Some(current_time_micros()),
+        )
+    }
+
+    pub fn sync_resolve_conflict_apply_remote(
+        &self,
+        conflict_id: i64,
+        resolved_by: Option<&str>,
+        note: Option<&str>,
+    ) -> Result<bool> {
+        let Some(conflict) = self.sync_conflict(conflict_id)? else {
+            return Ok(false);
+        };
+        let record: SyncJournalRecord = serde_json::from_value(conflict.remote_record_json.clone())
+            .map_err(|error| {
+                DbError::corruption(format!(
+                    "malformed sync conflict remote_record_json: {error}"
+                ))
+            })?;
+        let batch = SyncChangeBatch::from_records(vec![record.clone()])?;
+        let policy = SyncConflictPolicy::LastWriterWins;
+        let _suppress_capture = self.inner.sync_ctx.suppress_capture();
+        let tx = {
+            self.begin_transaction()?;
+            struct Tx<'a>(&'a Db, bool);
+            impl<'a> Drop for Tx<'a> {
+                fn drop(&mut self) {
+                    if self.1 {
+                        let _ = self.0.rollback_transaction();
+                    }
+                }
+            }
+            impl<'a> Tx<'a> {
+                fn commit(mut self) -> Result<()> {
+                    self.1 = false;
+                    self.0.commit_transaction()?;
+                    Ok(())
+                }
+            }
+            Tx(self, true)
+        };
+        let runtime = self.runtime_for_metadata_inspection()?;
+        let table = runtime
+            .catalog
+            .table(&record.table)
+            .ok_or_else(|| DbError::sql(format!("unknown table '{}'", record.table)))?;
+        match self.sync_apply_import_record(&batch, &record, table, &policy)? {
+            SyncImportRecordOutcome::Applied => {
+                self.sync_upsert_metadata(
+                    &imported_record_key(&record.replica_id, record.sequence),
+                    "applied",
+                )?;
+                self.sync_update_conflict_resolution(
+                    conflict_id,
+                    Some("apply_remote"),
+                    resolved_by,
+                    note,
+                    Some(current_time_micros()),
+                )?;
+                tx.commit()?;
+                Ok(true)
+            }
+            SyncImportRecordOutcome::Resolved(_) => {
+                self.sync_upsert_metadata(
+                    &imported_record_key(&record.replica_id, record.sequence),
+                    "applied",
+                )?;
+                self.sync_update_conflict_resolution(
+                    conflict_id,
+                    Some("apply_remote"),
+                    resolved_by,
+                    note,
+                    Some(current_time_micros()),
+                )?;
+                tx.commit()?;
+                Ok(true)
+            }
+            SyncImportRecordOutcome::Conflict(conflict) => {
+                let _ = conflict;
+                Err(DbError::sql(format!(
+                    "cannot apply remote conflict {} because replay now fails",
+                    conflict_id
+                )))
+            }
+        }
+    }
+
+    pub fn sync_reopen_conflict(&self, conflict_id: i64) -> Result<bool> {
+        self.sync_update_conflict_resolution(conflict_id, None, None, None, None)
+    }
+
+    pub fn sync_prune_journal_through(&self, sequence: u64) -> Result<usize> {
+        self.sync_prune_journal(sequence, false, false)
+            .map(|summary| summary.pruned)
+    }
+
+    pub fn sync_prune_journal(
+        &self,
+        through: u64,
+        dry_run: bool,
+        allow_data_loss: bool,
+    ) -> Result<SyncPruneSummary> {
+        let retention = self.sync_retention_report()?;
+        let requested_through = through;
+        if !allow_data_loss && through > retention.safe_prune_through.unwrap_or(0) {
+            let message = if let Some(lowest_watermark) =
+                retention.safe_prune_through.map(|value| value + 1)
+            {
+                format!(
+                    "cannot prune through {through}; lowest peer watermark is {lowest_watermark}"
+                )
+            } else if retention.blocked_by.is_empty() {
+                format!("cannot prune through {through}; no peer watermarks are known")
+            } else {
+                format!("cannot prune through {through}; lowest peer watermark is 0")
+            };
+            return Err(DbError::sql(message));
+        }
+
+        let records = crate::sync::read_journal_records(
+            self.inner.sync_ctx.journal_path(),
+            &self.inner.vfs,
+            0,
+            usize::MAX,
+        )?;
+        if records.is_empty() {
+            return Ok(SyncPruneSummary {
+                requested_through,
+                effective_through: 0,
+                pruned: 0,
+                dry_run,
+                allow_data_loss,
+                blocked_by: retention.blocked_by,
+            });
+        }
+
+        let effective_through = records
+            .last()
+            .map(|record| record.sequence.min(through))
+            .unwrap_or(0);
+        let total_records = records.len();
+        let retained = records
+            .into_iter()
+            .filter(|record| record.sequence > through)
+            .collect::<Vec<_>>();
+        let pruned = total_records.saturating_sub(retained.len());
+
+        if dry_run || pruned == 0 {
+            return Ok(SyncPruneSummary {
+                requested_through,
+                effective_through,
+                pruned,
+                dry_run,
+                allow_data_loss,
+                blocked_by: retention.blocked_by,
+            });
+        }
+
+        let mut buffer = Vec::new();
+        for record in &retained {
+            serde_json::to_writer(&mut buffer, record).map_err(|error| {
+                DbError::internal(format!("failed to serialize sync journal record: {error}"))
+            })?;
+            buffer.push(b'\n');
+        }
+
+        if self
+            .inner
+            .vfs
+            .file_exists(self.inner.sync_ctx.journal_path())?
+        {
+            let journal_file = self.inner.sync_ctx.journal_file_handle()?;
+            let journal_file = match journal_file {
+                Some(file) => file,
+                None => self.inner.vfs.open(
+                    self.inner.sync_ctx.journal_path(),
+                    OpenMode::OpenExisting,
+                    FileKind::SyncJournal,
+                )?,
+            };
+
+            journal_file.set_len(0)?;
+            write_all_at(journal_file.as_ref(), 0, &buffer)?;
+            journal_file.sync_data()?;
+            self.inner
+                .sync_ctx
+                .set_journal_write_offset(buffer.len() as u64)?;
+        }
+
+        Ok(SyncPruneSummary {
+            requested_through,
+            effective_through,
+            pruned,
+            dry_run,
+            allow_data_loss,
+            blocked_by: retention.blocked_by,
+        })
+    }
+
+    pub fn sync_set_enabled(&self, enabled: bool) -> Result<()> {
+        self.ensure_sync_tables()?;
+        self.sync_upsert_metadata("enabled", if enabled { "true" } else { "false" })?;
+        self.inner.sync_ctx.set_enabled(enabled);
+        if enabled {
+            self.inner.sync_ctx.ensure_journal_open(&self.inner.vfs)?;
+        }
+        Ok(())
+    }
+
+    pub fn sync_is_enabled(&self) -> Result<bool> {
+        if self.inner.sync_ctx.is_enabled() {
+            return Ok(true);
+        }
+        let status = self.load_sync_status_from_db()?;
+        if status.enabled {
+            self.inner.sync_ctx.set_enabled(true);
+            self.inner
+                .sync_ctx
+                .set_replica_id(&status.replica_id.unwrap_or_default());
+            self.inner.sync_ctx.set_next_sequence(status.next_sequence);
+        }
+        Ok(status.enabled)
+    }
+
+    fn sync_upsert_metadata(&self, key: &str, value: &str) -> Result<()> {
+        let sql = format!(
+            "INSERT INTO {table} (key, value) VALUES ('{k}', '{v}') ON CONFLICT (key) DO UPDATE SET value = '{v}'",
+            table = crate::sync::METADATA_TABLE,
+            k = key.replace('\'', "''"),
+            v = value.replace('\'', "''"),
+        );
+        let _ = self.execute(&sql)?;
+        Ok(())
+    }
+
+    fn sync_read_metadata(&self, key: &str) -> Result<Option<String>> {
+        let sql = format!(
+            "SELECT value FROM {} WHERE key = '{}'",
+            crate::sync::METADATA_TABLE,
+            key.replace('\'', "''"),
+        );
+        match self.execute(&sql) {
+            Ok(result) => {
+                if let Some(row) = result.rows().first() {
+                    if let Some(val) = row.values().first() {
+                        match val {
+                            Value::Text(s) => return Ok(Some(s.clone())),
+                            _ => return Ok(None),
+                        }
+                    }
+                }
+                Ok(None)
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("no such table") || msg.contains("unknown table") {
+                    return Ok(None);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    fn sync_metadata_entries(&self) -> Result<Vec<(String, String)>> {
+        let sql = format!("SELECT key, value FROM {}", crate::sync::METADATA_TABLE);
+        match self.execute(&sql) {
+            Ok(result) => result
+                .rows()
+                .iter()
+                .map(|row| {
+                    let key = row
+                        .values()
+                        .first()
+                        .and_then(|value| match value {
+                            Value::Text(text) => Some(text.clone()),
+                            _ => None,
+                        })
+                        .ok_or_else(|| DbError::corruption("malformed sync metadata row"))?;
+                    let value = row
+                        .values()
+                        .get(1)
+                        .and_then(|value| match value {
+                            Value::Text(text) => Some(text.clone()),
+                            _ => None,
+                        })
+                        .ok_or_else(|| DbError::corruption("malformed sync metadata row"))?;
+                    Ok((key, value))
+                })
+                .collect(),
+            Err(error) => {
+                let message = error.to_string();
+                if message.contains("no such table") || message.contains("unknown table") {
+                    Ok(Vec::new())
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    fn sync_peer_watermark_entries(&self) -> Result<Vec<(String, u64)>> {
+        self.sync_metadata_entries()?
+            .into_iter()
+            .filter_map(|(key, value)| {
+                key.strip_prefix("peer_watermark:")
+                    .map(|replica_id| (replica_id.to_string(), value))
+            })
+            .map(|(replica_id, value)| {
+                let watermark = value.parse::<u64>().map_err(|error| {
+                    DbError::sql(format!(
+                        "invalid peer watermark value for replica '{}': {}",
+                        replica_id, error
+                    ))
+                })?;
+                Ok((format!("remote:{replica_id}"), watermark))
+            })
+            .collect()
+    }
+
+    fn record_sync_conflict_with_data(
+        &self,
+        batch: &SyncChangeBatch,
+        record: &SyncJournalRecord,
+        conflict: &SyncConflictRecordData,
+    ) -> Result<i64> {
+        let conflict_id = self.next_sync_conflict_id()?;
+        let remote_sequence = i64::try_from(record.sequence).map_err(|_| {
+            DbError::internal("remote_sequence exceeds INT64 range for sync conflict")
+        })?;
+        let remote_record_json = serde_json::to_value(record).map_err(|error| {
+            DbError::internal(format!(
+                "failed to serialize sync record for conflict: {error}"
+            ))
+        })?;
+        let primary_key_json = serde_json::to_value(&record.primary_key).map_err(|error| {
+            DbError::internal(format!("failed to serialize sync primary key: {error}"))
+        })?;
+        let created_at_micros = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|duration| duration.as_micros() as i64)
+            .unwrap_or(0);
+        let local_row_json_text = conflict
+            .local_row_json
+            .as_ref()
+            .map(|value| value.to_string());
+        let resolution = conflict.resolution.as_deref().unwrap_or("NULL");
+        let resolved_at_micros = conflict
+            .resolved_at_micros
+            .map_or_else(|| "NULL".to_string(), |value| value.to_string());
+        let resolved_by = conflict
+            .resolved_by
+            .as_deref()
+            .map(sql_text_literal)
+            .unwrap_or_else(|| "NULL".to_string());
+        let resolution_note = conflict
+            .resolution_note
+            .as_deref()
+            .map(sql_text_literal)
+            .unwrap_or_else(|| "NULL".to_string());
+        let policy_name = conflict
+            .policy_name
+            .as_deref()
+            .map(sql_text_literal)
+            .unwrap_or_else(|| "NULL".to_string());
+        let sql = format!(
+            "INSERT INTO {table} (conflict_id, batch_id, remote_replica_id, remote_sequence, table_name, operation, conflict_type, message, primary_key_json, remote_record_json, local_row_json, created_at_micros, resolved, resolution, resolved_at_micros, resolved_by, resolution_note, policy_name, local_record_json) VALUES ({conflict_id}, {batch_id}, {remote_replica_id}, {remote_sequence}, {table_name}, {operation}, {conflict_type}, {message}, {primary_key_json}, {remote_record_json}, {local_row_json}, {created_at_micros}, {resolved}, {resolution}, {resolved_at_micros}, {resolved_by}, {resolution_note}, {policy_name}, {local_record_json})",
+            table = crate::sync::CONFLICTS_TABLE,
+            conflict_id = conflict_id,
+            batch_id = sql_text_literal(&batch.batch_id),
+            remote_replica_id = sql_text_literal(&record.replica_id),
+            remote_sequence = remote_sequence,
+            table_name = sql_text_literal(&record.table),
+            operation = sql_text_literal(&record.operation),
+            conflict_type = sql_text_literal(&conflict.conflict_type),
+            message = sql_text_literal(&conflict.message),
+            primary_key_json = sql_text_literal(&primary_key_json.to_string()),
+            remote_record_json = sql_text_literal(&remote_record_json.to_string()),
+            local_row_json = local_row_json_text
+                .as_deref()
+                .map(sql_text_literal)
+                .unwrap_or_else(|| "NULL".to_string()),
+            created_at_micros = created_at_micros,
+            resolved = if conflict.resolution.is_some() { 1 } else { 0 },
+            resolution = if conflict.resolution.is_some() {
+                sql_text_literal(resolution)
+            } else {
+                "NULL".to_string()
+            },
+            resolved_at_micros = resolved_at_micros,
+            resolved_by = resolved_by,
+            resolution_note = resolution_note,
+            policy_name = policy_name,
+            local_record_json = conflict
+                .local_row_json
+                .as_ref()
+                .map(|value| sql_text_literal(&value.to_string()))
+                .unwrap_or_else(|| "NULL".to_string()),
+        );
+        let _ = self.execute(&sql)?;
+        Ok(conflict_id)
+    }
+
+    fn sync_capture_local_row_json(
+        &self,
+        table: &TableSchema,
+        primary_key: &serde_json::Map<String, JsonValue>,
+    ) -> Result<Option<serde_json::Value>> {
+        let runtime = self.runtime_for_metadata_inspection()?;
+        let Some(source) = runtime.table_row_source(&table.name) else {
+            return Ok(None);
+        };
+        for row in source.rows() {
+            let row = row?;
+            let values = row.values();
+            let mut matches = true;
+            for pk_col in &table.primary_key_columns {
+                let column = table
+                    .columns
+                    .iter()
+                    .find(|column| column.name == *pk_col)
+                    .ok_or_else(|| {
+                        DbError::sql(format!(
+                            "table '{}' missing primary key column '{}'",
+                            table.name, pk_col
+                        ))
+                    })?;
+                let json_value = primary_key.get(pk_col).ok_or_else(|| {
+                    DbError::sql(format!(
+                        "missing primary key column '{pk_col}' in record for table '{}'",
+                        table.name
+                    ))
+                })?;
+                let expected = json_to_column_value(&table.name, column, json_value)?;
+                let Some(actual) = values.get(
+                    table
+                        .columns
+                        .iter()
+                        .position(|candidate| candidate.name == *pk_col)
+                        .ok_or_else(|| {
+                            DbError::sql(format!(
+                                "table '{}' missing primary key column '{}'",
+                                table.name, pk_col
+                            ))
+                        })?,
+                ) else {
+                    matches = false;
+                    break;
+                };
+                if actual != &expected {
+                    matches = false;
+                    break;
+                }
+            }
+            if matches {
+                return Ok(Some(crate::sync::build_after_json(table, values)));
+            }
+        }
+        Ok(None)
+    }
+
+    fn sync_apply_import_record(
+        &self,
+        _batch: &SyncChangeBatch,
+        record: &SyncJournalRecord,
+        table: &TableSchema,
+        policy: &SyncConflictPolicy,
+    ) -> Result<SyncImportRecordOutcome> {
+        let primary_key = record
+            .primary_key
+            .as_object()
+            .ok_or_else(|| DbError::sql("primary_key must be an object"))?;
+        let local_row_json = self.sync_capture_local_row_json(table, primary_key)?;
+        let operation = match record.operation.as_str() {
+            "insert" => SyncOperation::Insert,
+            "update" => SyncOperation::Update,
+            "delete" => SyncOperation::Delete,
+            other => return Err(DbError::sql(format!("unsupported operation '{other}'"))),
+        };
+
+        let remote_wins = match policy {
+            SyncConflictPolicy::Record | SyncConflictPolicy::Stop => false,
+            SyncConflictPolicy::LastWriterWins => true,
+            SyncConflictPolicy::OriginPriority => {
+                let config = self.sync_conflict_policy()?;
+                match self
+                    .inner
+                    .sync_ctx
+                    .replica_id()
+                    .or_else(|| self.sync_read_metadata("replica_id").ok().flatten())
+                {
+                    Some(local_replica_id) => {
+                        let remote_index = config
+                            .origin_priority
+                            .iter()
+                            .position(|replica| replica == &record.replica_id);
+                        let local_index = config
+                            .origin_priority
+                            .iter()
+                            .position(|replica| replica == &local_replica_id);
+                        matches!((remote_index, local_index), (Some(remote), Some(local)) if remote < local)
+                    }
+                    None => false,
+                }
+            }
+        };
+
+        let apply_remote_replace = |operation: SyncOperation| -> Result<()> {
+            let sql = format!(
+                "DELETE FROM {} WHERE {}",
+                sql_identifier(&table.name),
+                table
+                    .primary_key_columns
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, pk_col)| format!("{} = ${}", sql_identifier(pk_col), idx + 1))
+                    .collect::<Vec<_>>()
+                    .join(" AND ")
+            );
+            let mut where_values = Vec::with_capacity(table.primary_key_columns.len());
+            for pk_col in &table.primary_key_columns {
+                let column = table
+                    .columns
+                    .iter()
+                    .find(|column| column.name == *pk_col)
+                    .ok_or_else(|| {
+                        DbError::sql(format!(
+                            "table '{}' missing primary key column '{}'",
+                            table.name, pk_col
+                        ))
+                    })?;
+                let json_value = primary_key.get(pk_col).ok_or_else(|| {
+                    DbError::sql(format!(
+                        "missing primary key column '{pk_col}' in record for table '{}'",
+                        table.name
+                    ))
+                })?;
+                where_values.push(json_to_column_value(&table.name, column, json_value)?);
+            }
+            let _ = self.execute_with_params(&sql, &where_values)?;
+
+            if matches!(operation, SyncOperation::Delete) {
+                return Ok(());
+            }
+
+            let after = record
+                .after
+                .as_ref()
+                .ok_or_else(|| DbError::sql("remote record missing after payload"))?
+                .as_object()
+                .ok_or_else(|| DbError::sql("remote record after payload must be an object"))?;
+            let mut columns = Vec::with_capacity(table.columns.len());
+            let mut values = Vec::with_capacity(table.columns.len());
+            for column in &table.columns {
+                let json_value = after.get(&column.name).ok_or_else(|| {
+                    DbError::sql(format!(
+                        "missing column '{}' in after payload for table '{}'",
+                        column.name, table.name
+                    ))
+                })?;
+                columns.push(sql_identifier(&column.name));
+                values.push(json_to_column_value(&table.name, column, json_value)?);
+            }
+            let sql = format!(
+                "INSERT INTO {} ({}) VALUES ({})",
+                sql_identifier(&table.name),
+                columns.join(", "),
+                (1..=values.len())
+                    .map(|idx| format!("${idx}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            let _ = self.execute_with_params(&sql, &values)?;
+            Ok(())
+        };
+
+        match operation {
+            SyncOperation::Insert => {
+                let after = record
+                    .after
+                    .as_ref()
+                    .ok_or_else(|| DbError::sql("insert record missing after payload"))?
+                    .as_object()
+                    .ok_or_else(|| DbError::sql("after must be an object for insert"))?;
+                let mut columns = Vec::with_capacity(table.columns.len());
+                let mut values = Vec::with_capacity(table.columns.len());
+                for column in &table.columns {
+                    let json_value = after.get(&column.name).ok_or_else(|| {
+                        DbError::sql(format!(
+                            "missing column '{}' in after payload for table '{}'",
+                            column.name, table.name
+                        ))
+                    })?;
+                    columns.push(sql_identifier(&column.name));
+                    values.push(json_to_column_value(&table.name, column, json_value)?);
+                }
+                let sql = format!(
+                    "INSERT INTO {} ({}) VALUES ({})",
+                    sql_identifier(&table.name),
+                    columns.join(", "),
+                    (1..=values.len())
+                        .map(|idx| format!("${idx}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                match self.execute_with_params(&sql, &values) {
+                    Ok(_) => Ok(SyncImportRecordOutcome::Applied),
+                    Err(DbError::Constraint { message }) if remote_wins => {
+                        apply_remote_replace(SyncOperation::Insert)?;
+                        Ok(SyncImportRecordOutcome::Resolved(SyncConflictRecordData {
+                            conflict_type: "insert_insert".to_string(),
+                            message,
+                            local_row_json,
+                            resolution: Some("remote_applied".to_string()),
+                            resolved_at_micros: Some(current_time_micros()),
+                            resolved_by: Some("sync_policy".to_string()),
+                            resolution_note: None,
+                            policy_name: Some(policy.as_str().to_string()),
+                        }))
+                    }
+                    Err(DbError::Constraint { message }) => {
+                        Ok(SyncImportRecordOutcome::Conflict(SyncConflictRecordData {
+                            conflict_type: if local_row_json.is_some() {
+                                "insert_insert".to_string()
+                            } else {
+                                "constraint_error".to_string()
+                            },
+                            message,
+                            local_row_json,
+                            resolution: None,
+                            resolved_at_micros: None,
+                            resolved_by: None,
+                            resolution_note: None,
+                            policy_name: Some(policy.as_str().to_string()),
+                        }))
+                    }
+                    Err(error) => Ok(SyncImportRecordOutcome::Conflict(SyncConflictRecordData {
+                        conflict_type: "apply_error".to_string(),
+                        message: error.to_string(),
+                        local_row_json,
+                        resolution: None,
+                        resolved_at_micros: None,
+                        resolved_by: None,
+                        resolution_note: None,
+                        policy_name: Some(policy.as_str().to_string()),
+                    })),
+                }
+            }
+            SyncOperation::Update => {
+                let after = record
+                    .after
+                    .as_ref()
+                    .ok_or_else(|| DbError::sql("update record missing after payload"))?
+                    .as_object()
+                    .ok_or_else(|| DbError::sql("after must be an object for update"))?;
+                let mut params =
+                    Vec::with_capacity(table.columns.len() + table.primary_key_columns.len());
+                let mut expressions = Vec::with_capacity(table.columns.len());
+                for column in &table.columns {
+                    let json_value = after.get(&column.name).ok_or_else(|| {
+                        DbError::sql(format!(
+                            "missing column '{}' in update payload for table '{}'",
+                            column.name, table.name
+                        ))
+                    })?;
+                    params.push(json_to_column_value(&table.name, column, json_value)?);
+                    expressions.push(format!(
+                        "{} = ${}",
+                        sql_identifier(&column.name),
+                        params.len()
+                    ));
+                }
+                for pk_col in &table.primary_key_columns {
+                    let column = table
+                        .columns
+                        .iter()
+                        .find(|column| column.name == *pk_col)
+                        .ok_or_else(|| {
+                            DbError::sql(format!(
+                                "table '{}' missing primary key column '{}'",
+                                table.name, pk_col
+                            ))
+                        })?;
+                    let json_value = primary_key.get(pk_col).ok_or_else(|| {
+                        DbError::sql(format!(
+                            "missing primary key column '{pk_col}' in record for table '{}'",
+                            table.name
+                        ))
+                    })?;
+                    params.push(json_to_column_value(&table.name, column, json_value)?);
+                }
+                let sql = format!(
+                    "UPDATE {} SET {} WHERE {}",
+                    sql_identifier(&table.name),
+                    expressions.join(", "),
+                    table
+                        .primary_key_columns
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, pk_col)| format!(
+                            "{} = ${}",
+                            sql_identifier(pk_col),
+                            table.columns.len() + idx + 1
+                        ))
+                        .collect::<Vec<_>>()
+                        .join(" AND ")
+                );
+                match self.execute_with_params(&sql, &params) {
+                    Ok(result) if result.affected_rows() == 0 => {
+                        Ok(SyncImportRecordOutcome::Conflict(SyncConflictRecordData {
+                            conflict_type: "missing_target".to_string(),
+                            message: "update affected no rows".to_string(),
+                            local_row_json,
+                            resolution: None,
+                            resolved_at_micros: None,
+                            resolved_by: None,
+                            resolution_note: None,
+                            policy_name: Some(policy.as_str().to_string()),
+                        }))
+                    }
+                    Ok(_) => Ok(SyncImportRecordOutcome::Applied),
+                    Err(DbError::Constraint { message }) if remote_wins => {
+                        apply_remote_replace(SyncOperation::Update)?;
+                        Ok(SyncImportRecordOutcome::Resolved(SyncConflictRecordData {
+                            conflict_type: "update_update".to_string(),
+                            message,
+                            local_row_json,
+                            resolution: Some("remote_applied".to_string()),
+                            resolved_at_micros: Some(current_time_micros()),
+                            resolved_by: Some("sync_policy".to_string()),
+                            resolution_note: None,
+                            policy_name: Some(policy.as_str().to_string()),
+                        }))
+                    }
+                    Err(DbError::Constraint { message }) => {
+                        Ok(SyncImportRecordOutcome::Conflict(SyncConflictRecordData {
+                            conflict_type: if local_row_json.is_some() {
+                                "update_update".to_string()
+                            } else {
+                                "constraint_error".to_string()
+                            },
+                            message,
+                            local_row_json,
+                            resolution: None,
+                            resolved_at_micros: None,
+                            resolved_by: None,
+                            resolution_note: None,
+                            policy_name: Some(policy.as_str().to_string()),
+                        }))
+                    }
+                    Err(error) => Ok(SyncImportRecordOutcome::Conflict(SyncConflictRecordData {
+                        conflict_type: "apply_error".to_string(),
+                        message: error.to_string(),
+                        local_row_json,
+                        resolution: None,
+                        resolved_at_micros: None,
+                        resolved_by: None,
+                        resolution_note: None,
+                        policy_name: Some(policy.as_str().to_string()),
+                    })),
+                }
+            }
+            SyncOperation::Delete => {
+                let mut where_values = Vec::with_capacity(table.primary_key_columns.len());
+                let mut where_parts = Vec::with_capacity(table.primary_key_columns.len());
+                for pk_col in &table.primary_key_columns {
+                    let column = table
+                        .columns
+                        .iter()
+                        .find(|column| column.name == *pk_col)
+                        .ok_or_else(|| {
+                            DbError::sql(format!(
+                                "table '{}' missing primary key column '{}'",
+                                table.name, pk_col
+                            ))
+                        })?;
+                    let json_value = primary_key.get(pk_col).ok_or_else(|| {
+                        DbError::sql(format!(
+                            "missing primary key column '{pk_col}' in record for table '{}'",
+                            table.name
+                        ))
+                    })?;
+                    where_values.push(json_to_column_value(&table.name, column, json_value)?);
+                    where_parts.push(format!(
+                        "{} = ${}",
+                        sql_identifier(pk_col),
+                        where_values.len()
+                    ));
+                }
+                let sql = format!(
+                    "DELETE FROM {} WHERE {}",
+                    sql_identifier(&table.name),
+                    where_parts.join(" AND ")
+                );
+                match self.execute_with_params(&sql, &where_values) {
+                    Ok(result) if result.affected_rows() == 0 => {
+                        Ok(SyncImportRecordOutcome::Conflict(SyncConflictRecordData {
+                            conflict_type: "missing_target".to_string(),
+                            message: "delete affected no rows".to_string(),
+                            local_row_json,
+                            resolution: None,
+                            resolved_at_micros: None,
+                            resolved_by: None,
+                            resolution_note: None,
+                            policy_name: Some(policy.as_str().to_string()),
+                        }))
+                    }
+                    Ok(_) => Ok(SyncImportRecordOutcome::Applied),
+                    Err(DbError::Constraint { message }) if remote_wins => {
+                        apply_remote_replace(SyncOperation::Delete)?;
+                        Ok(SyncImportRecordOutcome::Resolved(SyncConflictRecordData {
+                            conflict_type: "delete_update".to_string(),
+                            message,
+                            local_row_json,
+                            resolution: Some("remote_applied".to_string()),
+                            resolved_at_micros: Some(current_time_micros()),
+                            resolved_by: Some("sync_policy".to_string()),
+                            resolution_note: None,
+                            policy_name: Some(policy.as_str().to_string()),
+                        }))
+                    }
+                    Err(DbError::Constraint { message }) => {
+                        Ok(SyncImportRecordOutcome::Conflict(SyncConflictRecordData {
+                            conflict_type: if local_row_json.is_some() {
+                                "delete_update".to_string()
+                            } else {
+                                "constraint_error".to_string()
+                            },
+                            message,
+                            local_row_json,
+                            resolution: None,
+                            resolved_at_micros: None,
+                            resolved_by: None,
+                            resolution_note: None,
+                            policy_name: Some(policy.as_str().to_string()),
+                        }))
+                    }
+                    Err(error) => Ok(SyncImportRecordOutcome::Conflict(SyncConflictRecordData {
+                        conflict_type: "apply_error".to_string(),
+                        message: error.to_string(),
+                        local_row_json,
+                        resolution: None,
+                        resolved_at_micros: None,
+                        resolved_by: None,
+                        resolution_note: None,
+                        policy_name: Some(policy.as_str().to_string()),
+                    })),
+                }
+            }
+        }
+    }
+
+    fn next_sync_conflict_id(&self) -> Result<i64> {
+        let sql = format!(
+            "SELECT COALESCE(MAX(conflict_id), 0) FROM {}",
+            crate::sync::CONFLICTS_TABLE
+        );
+        let result = self.execute(&sql)?;
+        let current = result
+            .rows()
+            .first()
+            .and_then(|row| row.values().first())
+            .and_then(|value| match value {
+                Value::Int64(value) => Some(*value),
+                Value::Bool(value) => Some(i64::from(*value)),
+                _ => None,
+            })
+            .ok_or_else(|| DbError::corruption("malformed sync conflict id counter"))?;
+        current
+            .checked_add(1)
+            .ok_or_else(|| DbError::internal("sync conflict_id counter overflow"))
+    }
+
+    fn sync_update_conflict_resolution(
+        &self,
+        conflict_id: i64,
+        resolution: Option<&str>,
+        resolved_by: Option<&str>,
+        note: Option<&str>,
+        resolved_at_micros: Option<i64>,
+    ) -> Result<bool> {
+        self.ensure_sync_tables()?;
+        let Some(_) = self.sync_conflict(conflict_id)? else {
+            return Ok(false);
+        };
+        let sql = format!(
+            "UPDATE {table} SET resolved = {resolved}, resolution = {resolution}, resolved_at_micros = {resolved_at_micros}, resolved_by = {resolved_by}, resolution_note = {resolution_note} WHERE conflict_id = {conflict_id}",
+            table = crate::sync::CONFLICTS_TABLE,
+            resolved = if resolution.is_some() { 1 } else { 0 },
+            resolution = resolution
+                .map(sql_text_literal)
+                .unwrap_or_else(|| "NULL".to_string()),
+            resolved_at_micros = resolved_at_micros
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "NULL".to_string()),
+            resolved_by = resolved_by
+                .map(sql_text_literal)
+                .unwrap_or_else(|| "NULL".to_string()),
+            resolution_note = note
+                .map(sql_text_literal)
+                .unwrap_or_else(|| "NULL".to_string()),
+            conflict_id = conflict_id,
+        );
+        let _ = self.execute(&sql)?;
+        Ok(true)
+    }
+
+    fn next_sync_session_id(&self) -> Result<i64> {
+        let sql = format!(
+            "SELECT COALESCE(MAX(session_id), 0) FROM {}",
+            crate::sync::SESSIONS_TABLE
+        );
+        let result = self.execute(&sql)?;
+        let current = result
+            .rows()
+            .first()
+            .and_then(|row| row.values().first())
+            .and_then(|value| match value {
+                Value::Int64(value) => Some(*value),
+                Value::Bool(value) => Some(i64::from(*value)),
+                _ => None,
+            })
+            .ok_or_else(|| DbError::corruption("malformed sync session id counter"))?;
+        current
+            .checked_add(1)
+            .ok_or_else(|| DbError::internal("sync session_id counter overflow"))
+    }
+
+    fn sync_update_session(
+        &self,
+        session_id: i64,
+        summary: &SyncRunSummary,
+        status: &str,
+        error: Option<&str>,
+        ended_at_micros: i64,
+    ) -> Result<()> {
+        self.ensure_sync_tables()?;
+        let (
+            pushed_seen,
+            pushed_applied,
+            pushed_skipped,
+            pushed_conflicted,
+            pulled_seen,
+            pulled_applied,
+            pulled_skipped,
+            pulled_conflicted,
+        ) = sync_session_summary_counts(summary);
+        let sql = format!(
+            "UPDATE {table} SET remote_replica_id = {remote_replica_id}, ended_at_micros = {ended_at_micros}, status = {status}, error = {error}, pushed_batch_id = {pushed_batch_id}, pulled_batch_id = {pulled_batch_id}, pushed_seen = {pushed_seen}, pushed_applied = {pushed_applied}, pushed_skipped = {pushed_skipped}, pushed_conflicted = {pushed_conflicted}, pulled_seen = {pulled_seen}, pulled_applied = {pulled_applied}, pulled_skipped = {pulled_skipped}, pulled_conflicted = {pulled_conflicted}, retry_count = {retry_count} WHERE session_id = {session_id}",
+            table = crate::sync::SESSIONS_TABLE,
+            remote_replica_id = sql_nullable_text_literal(summary.remote_replica_id.as_deref()),
+            ended_at_micros = ended_at_micros,
+            status = sql_text_literal(status),
+            error = sql_nullable_text_literal(error),
+            pushed_batch_id = sql_nullable_text_literal(summary.pushed_batch_id.as_deref()),
+            pulled_batch_id = sql_nullable_text_literal(summary.pulled_batch_id.as_deref()),
+            pushed_seen = pushed_seen,
+            pushed_applied = pushed_applied,
+            pushed_skipped = pushed_skipped,
+            pushed_conflicted = pushed_conflicted,
+            pulled_seen = pulled_seen,
+            pulled_applied = pulled_applied,
+            pulled_skipped = pulled_skipped,
+            pulled_conflicted = pulled_conflicted,
+            retry_count = summary.retry_count as i64,
+            session_id = session_id,
+        );
+        let _ = self.execute(&sql)?;
+        Ok(())
+    }
+
+    fn ensure_sync_tables(&self) -> Result<()> {
+        let _ = self.execute(crate::sync::METADATA_TABLE_DDL)?;
+        let _ = self.execute(crate::sync::PEERS_TABLE_DDL)?;
+        let _ = self.execute(crate::sync::SESSIONS_TABLE_DDL)?;
+        let _ = self.execute(crate::sync::SCOPES_TABLE_DDL)?;
+        let _ = self.execute(crate::sync::PEER_SCOPES_TABLE_DDL)?;
+        let _ = self.execute(crate::sync::CONFLICTS_TABLE_DDL)?;
+        self.ensure_sync_conflict_columns()?;
+        Ok(())
+    }
+
+    fn ensure_sync_conflict_columns(&self) -> Result<()> {
+        let existing = self.sync_table_columns(crate::sync::CONFLICTS_TABLE)?;
+        for (name, ty) in [
+            ("resolution", "TEXT"),
+            ("resolved_at_micros", "INT64"),
+            ("resolved_by", "TEXT"),
+            ("resolution_note", "TEXT"),
+            ("policy_name", "TEXT"),
+            ("local_record_json", "TEXT"),
+        ] {
+            if !existing.iter().any(|column| column == name) {
+                let sql = format!(
+                    "ALTER TABLE {} ADD COLUMN {} {}",
+                    sql_identifier(crate::sync::CONFLICTS_TABLE),
+                    sql_identifier(name),
+                    ty
+                );
+                let _ = self.execute(&sql)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn sync_table_columns(&self, table_name: &str) -> Result<Vec<String>> {
+        let sql = format!("PRAGMA table_info({})", sql_identifier(table_name));
+        match self.execute(&sql) {
+            Ok(result) => Ok(result
+                .rows()
+                .iter()
+                .filter_map(|row| match row.values().get(1) {
+                    Some(Value::Text(value)) => Some(value.clone()),
+                    _ => None,
+                })
+                .collect()),
+            Err(error) => {
+                let message = error.to_string();
+                if message.contains("no such table") || message.contains("unknown table") {
+                    Ok(Vec::new())
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    fn load_sync_status_from_db(&self) -> Result<SyncStatus> {
+        let enabled = self
+            .sync_read_metadata("enabled")?
+            .map(|v| v == "true")
+            .unwrap_or(false);
+        let replica_id = self.sync_read_metadata("replica_id")?;
+        let stored_next_sequence: u64 = self
+            .sync_read_metadata("next_sequence")?
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+        let next_sequence = self.effective_sync_next_sequence(stored_next_sequence)?;
+        let journal_path = self
+            .inner
+            .sync_ctx
+            .journal_path()
+            .to_string_lossy()
+            .to_string();
+        let journal_size_bytes = self.inner.sync_ctx.journal_size_bytes();
+        Ok(SyncStatus {
+            enabled,
+            replica_id,
+            next_sequence,
+            journal_path: Some(journal_path),
+            journal_size_bytes,
+        })
+    }
+
+    fn load_sync_status_from_runtime(&self, runtime: &mut EngineRuntime) -> Result<SyncStatus> {
+        let mut filter = BTreeSet::new();
+        filter.insert(crate::sync::METADATA_TABLE.to_string());
+        runtime.load_deferred_table_row_sources_filtered(
+            &self.inner.pager,
+            &self.inner.wal,
+            self.inner.config.page_size,
+            &filter,
+        )?;
+        let enabled = sync_read_metadata_from_runtime(runtime, "enabled")?
+            .map(|v| v == "true")
+            .unwrap_or(false);
+        let replica_id = sync_read_metadata_from_runtime(runtime, "replica_id")?;
+        let stored_next_sequence: u64 = sync_read_metadata_from_runtime(runtime, "next_sequence")?
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+        let next_sequence = self.effective_sync_next_sequence(stored_next_sequence)?;
+        let journal_path = self
+            .inner
+            .sync_ctx
+            .journal_path()
+            .to_string_lossy()
+            .to_string();
+        let journal_size_bytes = self.inner.sync_ctx.journal_size_bytes();
+        Ok(SyncStatus {
+            enabled,
+            replica_id,
+            next_sequence,
+            journal_path: Some(journal_path),
+            journal_size_bytes,
+        })
+    }
+
+    fn effective_sync_next_sequence(&self, stored_next_sequence: u64) -> Result<u64> {
+        let report = crate::sync::inspect_journal_integrity(
+            self.inner.sync_ctx.journal_path(),
+            &self.inner.vfs,
+            None,
+        )?;
+        let journal_next_sequence = report
+            .last_sequence
+            .and_then(|sequence| sequence.checked_add(1))
+            .unwrap_or(1);
+        Ok(stored_next_sequence.max(journal_next_sequence))
+    }
+
+    fn try_execute_sync_inspection_query(
+        &self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Option<QueryResult>> {
+        let normalized = normalize_sync_inspection_sql(sql);
+        let Some(query) = SyncInspectionQuery::parse(&normalized) else {
+            return Ok(None);
+        };
+        if !params.is_empty() {
+            return Err(DbError::sql(
+                "sync inspection system views do not accept parameters",
+            ));
+        }
+        match query {
+            SyncInspectionQuery::Status => self.sync_status_query_result().map(Some),
+            SyncInspectionQuery::Journal { since_sequence } => {
+                self.sync_journal_query_result(since_sequence).map(Some)
+            }
+            SyncInspectionQuery::Peers => self.sync_peers_query_result().map(Some),
+            SyncInspectionQuery::Retention => self.sync_retention_query_result().map(Some),
+            SyncInspectionQuery::PeerLag => self.sync_peer_lag_query_result().map(Some),
+            SyncInspectionQuery::Doctor => self.sync_doctor_query_result().map(Some),
+            SyncInspectionQuery::Scopes => self.sync_scopes_query_result().map(Some),
+            SyncInspectionQuery::ScopeTables => self.sync_scope_tables_query_result().map(Some),
+            SyncInspectionQuery::PeerScopes => self.sync_peer_scopes_query_result().map(Some),
+            SyncInspectionQuery::Sessions => self.sync_sessions_query_result().map(Some),
+            SyncInspectionQuery::ConflictPolicy => {
+                self.sync_conflict_policy_query_result().map(Some)
+            }
+            SyncInspectionQuery::Conflicts => self.sync_conflicts_query_result().map(Some),
+        }
+    }
+
+    fn sync_status_query_result(&self) -> Result<QueryResult> {
+        let status = self.sync_status()?;
+        Ok(QueryResult::with_rows(
+            vec![
+                "enabled".to_string(),
+                "replica_id".to_string(),
+                "next_sequence".to_string(),
+                "journal_path".to_string(),
+                "journal_size_bytes".to_string(),
+            ],
+            vec![QueryRow::new(vec![
+                Value::Bool(status.enabled),
+                status.replica_id.map_or(Value::Null, Value::Text),
+                sync_u64_to_i64(status.next_sequence, "next_sequence")?,
+                status.journal_path.map_or(Value::Null, Value::Text),
+                sync_u64_to_i64(status.journal_size_bytes, "journal_size_bytes")?,
+            ])],
+        ))
+    }
+
+    fn sync_journal_query_result(&self, since_sequence: u64) -> Result<QueryResult> {
+        let records = self.sync_pending_changes(since_sequence, usize::MAX)?;
+        let rows = records
+            .into_iter()
+            .map(|record| {
+                Ok(QueryRow::new(vec![
+                    sync_u64_to_i64(record.sequence, "sequence")?,
+                    Value::Text(record.replica_id),
+                    sync_u64_to_i64(record.transaction_lsn, "transaction_lsn")?,
+                    Value::Text(record.table),
+                    Value::Text(record.operation),
+                    Value::Text(record.primary_key.to_string()),
+                    record
+                        .after
+                        .map_or(Value::Null, |value| Value::Text(value.to_string())),
+                    Value::Int64(i64::from(record.schema_cookie)),
+                    Value::Int64(record.committed_at_micros),
+                ]))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(QueryResult::with_rows(
+            vec![
+                "sequence".to_string(),
+                "replica_id".to_string(),
+                "transaction_lsn".to_string(),
+                "table_name".to_string(),
+                "operation".to_string(),
+                "primary_key_json".to_string(),
+                "after_json".to_string(),
+                "schema_cookie".to_string(),
+                "committed_at_micros".to_string(),
+            ],
+            rows,
+        ))
+    }
+
+    fn sync_peers_query_result(&self) -> Result<QueryResult> {
+        let peers = self.sync_peers()?;
+        let rows = peers
+            .into_iter()
+            .map(|peer| {
+                Ok(QueryRow::new(vec![
+                    Value::Text(peer.name),
+                    Value::Text(peer.endpoint),
+                    peer.token_env.map_or(Value::Null, Value::Text),
+                    Value::Int64(peer.created_at_micros),
+                    Value::Int64(peer.updated_at_micros),
+                ]))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(QueryResult::with_rows(
+            vec![
+                "name".to_string(),
+                "endpoint".to_string(),
+                "token_env".to_string(),
+                "created_at_micros".to_string(),
+                "updated_at_micros".to_string(),
+            ],
+            rows,
+        ))
+    }
+
+    fn sync_retention_query_result(&self) -> Result<QueryResult> {
+        let retention = self.sync_retention_report()?;
+        let first_sequence = match retention.first_sequence {
+            Some(value) => sync_u64_to_i64(value, "first_sequence")?,
+            None => Value::Null,
+        };
+        let last_sequence = match retention.last_sequence {
+            Some(value) => sync_u64_to_i64(value, "last_sequence")?,
+            None => Value::Null,
+        };
+        let safe_prune_through = match retention.safe_prune_through {
+            Some(value) => sync_u64_to_i64(value, "safe_prune_through")?,
+            None => Value::Null,
+        };
+
+        Ok(QueryResult::with_rows(
+            vec![
+                "journal_records".to_string(),
+                "first_sequence".to_string(),
+                "last_sequence".to_string(),
+                "safe_prune_through".to_string(),
+                "prunable_records".to_string(),
+                "blocked_by_json".to_string(),
+                "journal_size_bytes".to_string(),
+            ],
+            vec![QueryRow::new(vec![
+                sync_u64_to_i64(retention.journal_records as u64, "journal_records")?,
+                first_sequence,
+                last_sequence,
+                safe_prune_through,
+                sync_u64_to_i64(retention.prunable_records as u64, "prunable_records")?,
+                Value::Text(
+                    serde_json::to_string(&retention.blocked_by).map_err(|error| {
+                        DbError::internal(format!(
+                            "failed to encode sync retention blocked_by: {error}"
+                        ))
+                    })?,
+                ),
+                sync_u64_to_i64(retention.journal_size_bytes, "journal_size_bytes")?,
+            ])],
+        ))
+    }
+
+    fn sync_peer_lag_query_result(&self) -> Result<QueryResult> {
+        let peer_lag = self.sync_peer_lag_report()?;
+        let rows = peer_lag
+            .into_iter()
+            .map(|lag| {
+                let in_watermark = match lag.in_watermark {
+                    Some(value) => sync_u64_to_i64(value, "in_watermark")?,
+                    None => Value::Null,
+                };
+                let out_watermark = match lag.out_watermark {
+                    Some(value) => sync_u64_to_i64(value, "out_watermark")?,
+                    None => Value::Null,
+                };
+                let local_high_watermark = match lag.local_high_watermark {
+                    Some(value) => sync_u64_to_i64(value, "local_high_watermark")?,
+                    None => Value::Null,
+                };
+                let in_lag = match lag.in_lag {
+                    Some(value) => sync_u64_to_i64(value, "in_lag")?,
+                    None => Value::Null,
+                };
+                let out_lag = match lag.out_lag {
+                    Some(value) => sync_u64_to_i64(value, "out_lag")?,
+                    None => Value::Null,
+                };
+                Ok(QueryRow::new(vec![
+                    Value::Text(lag.peer_name),
+                    lag.remote_replica_id.map_or(Value::Null, Value::Text),
+                    in_watermark,
+                    out_watermark,
+                    local_high_watermark,
+                    in_lag,
+                    out_lag,
+                ]))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(QueryResult::with_rows(
+            vec![
+                "peer_name".to_string(),
+                "remote_replica_id".to_string(),
+                "in_watermark".to_string(),
+                "out_watermark".to_string(),
+                "local_high_watermark".to_string(),
+                "in_lag".to_string(),
+                "out_lag".to_string(),
+            ],
+            rows,
+        ))
+    }
+
+    fn sync_doctor_query_result(&self) -> Result<QueryResult> {
+        let report = self.sync_operational_doctor_report()?;
+        Ok(QueryResult::with_rows(
+            vec![
+                "enabled".to_string(),
+                "replica_id".to_string(),
+                "highest_severity".to_string(),
+                "journal_records".to_string(),
+                "journal_size_bytes".to_string(),
+                "unresolved_conflicts".to_string(),
+                "guidance_json".to_string(),
+            ],
+            vec![QueryRow::new(vec![
+                Value::Bool(report.status.enabled),
+                report.status.replica_id.map_or(Value::Null, Value::Text),
+                Value::Text(report.highest_severity.to_string()),
+                sync_u64_to_i64(report.integrity.total_records as u64, "journal_records")?,
+                sync_u64_to_i64(report.retention.journal_size_bytes, "journal_size_bytes")?,
+                sync_u64_to_i64(report.unresolved_conflicts as u64, "unresolved_conflicts")?,
+                Value::Text(serde_json::to_string(&report.guidance).map_err(|error| {
+                    DbError::internal(format!("failed to encode sync doctor guidance: {error}"))
+                })?),
+            ])],
+        ))
+    }
+
+    fn sync_scopes_query_result(&self) -> Result<QueryResult> {
+        let scopes = self.sync_scopes()?;
+        let rows = scopes
+            .into_iter()
+            .map(|scope| {
+                let SyncScope {
+                    name,
+                    include_tables,
+                    row_filter,
+                    filter_columns,
+                    created_at_micros,
+                    updated_at_micros,
+                } = scope;
+                Ok(QueryRow::new(vec![
+                    Value::Text(name),
+                    Value::Text(serde_json::to_string(&include_tables).map_err(|error| {
+                        DbError::internal(format!(
+                            "failed to encode sync scope include tables: {error}"
+                        ))
+                    })?),
+                    row_filter.map_or(Value::Null, Value::Text),
+                    Value::Text(serde_json::to_string(&filter_columns).map_err(|error| {
+                        DbError::internal(format!(
+                            "failed to encode sync scope filter columns: {error}"
+                        ))
+                    })?),
+                    Value::Int64(created_at_micros),
+                    Value::Int64(updated_at_micros),
+                ]))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(QueryResult::with_rows(
+            vec![
+                "name".to_string(),
+                "include_tables_json".to_string(),
+                "row_filter".to_string(),
+                "filter_columns_json".to_string(),
+                "created_at_micros".to_string(),
+                "updated_at_micros".to_string(),
+            ],
+            rows,
+        ))
+    }
+
+    fn sync_scope_tables_query_result(&self) -> Result<QueryResult> {
+        let mut rows = Vec::new();
+        for scope in self.sync_scopes()? {
+            let scope_name = scope.name;
+            for table_name in scope.include_tables {
+                rows.push(QueryRow::new(vec![
+                    Value::Text(scope_name.clone()),
+                    Value::Text(table_name),
+                ]));
+            }
+        }
+        Ok(QueryResult::with_rows(
+            vec!["scope_name".to_string(), "table_name".to_string()],
+            rows,
+        ))
+    }
+
+    fn sync_peer_scopes_query_result(&self) -> Result<QueryResult> {
+        let bindings = self.sync_peer_scope_bindings()?;
+        let rows = bindings
+            .into_iter()
+            .map(|binding| {
+                Ok(QueryRow::new(vec![
+                    Value::Text(binding.peer_name),
+                    Value::Text(binding.scope_name),
+                    Value::Int64(binding.created_at_micros),
+                    Value::Int64(binding.updated_at_micros),
+                ]))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(QueryResult::with_rows(
+            vec![
+                "peer_name".to_string(),
+                "scope_name".to_string(),
+                "created_at_micros".to_string(),
+                "updated_at_micros".to_string(),
+            ],
+            rows,
+        ))
+    }
+
+    fn sync_sessions_query_result(&self) -> Result<QueryResult> {
+        let sessions = self.sync_sessions()?;
+        let rows = sessions
+            .into_iter()
+            .map(|session| {
+                Ok(QueryRow::new(vec![
+                    Value::Int64(session.session_id),
+                    Value::Text(session.peer_name),
+                    Value::Text(session.direction.to_string()),
+                    session.remote_replica_id.map_or(Value::Null, Value::Text),
+                    Value::Int64(session.started_at_micros),
+                    session.ended_at_micros.map_or(Value::Null, Value::Int64),
+                    Value::Text(session.status),
+                    session.error.map_or(Value::Null, Value::Text),
+                    session.pushed_batch_id.map_or(Value::Null, Value::Text),
+                    session.pulled_batch_id.map_or(Value::Null, Value::Text),
+                    Value::Int64(session.pushed_seen),
+                    Value::Int64(session.pushed_applied),
+                    Value::Int64(session.pushed_skipped),
+                    Value::Int64(session.pushed_conflicted),
+                    Value::Int64(session.pulled_seen),
+                    Value::Int64(session.pulled_applied),
+                    Value::Int64(session.pulled_skipped),
+                    Value::Int64(session.pulled_conflicted),
+                    Value::Int64(session.retry_count),
+                ]))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(QueryResult::with_rows(
+            vec![
+                "session_id".to_string(),
+                "peer_name".to_string(),
+                "direction".to_string(),
+                "remote_replica_id".to_string(),
+                "started_at_micros".to_string(),
+                "ended_at_micros".to_string(),
+                "status".to_string(),
+                "error".to_string(),
+                "pushed_batch_id".to_string(),
+                "pulled_batch_id".to_string(),
+                "pushed_seen".to_string(),
+                "pushed_applied".to_string(),
+                "pushed_skipped".to_string(),
+                "pushed_conflicted".to_string(),
+                "pulled_seen".to_string(),
+                "pulled_applied".to_string(),
+                "pulled_skipped".to_string(),
+                "pulled_conflicted".to_string(),
+                "retry_count".to_string(),
+            ],
+            rows,
+        ))
+    }
+
+    fn sync_conflict_policy_query_result(&self) -> Result<QueryResult> {
+        let policy = self.sync_conflict_policy()?;
+        Ok(QueryResult::with_rows(
+            vec![
+                "default_policy".to_string(),
+                "origin_priority_json".to_string(),
+            ],
+            vec![QueryRow::new(vec![
+                Value::Text(policy.default_policy.to_string()),
+                Value::Text(
+                    serde_json::to_string(&policy.origin_priority).map_err(|error| {
+                        DbError::internal(format!(
+                            "failed to encode sync conflict policy origin priority: {error}"
+                        ))
+                    })?,
+                ),
+            ])],
+        ))
+    }
+
+    fn sync_conflicts_query_result(&self) -> Result<QueryResult> {
+        let sql = format!(
+            "SELECT * FROM {} WHERE resolved = 0 ORDER BY conflict_id",
+            crate::sync::CONFLICTS_TABLE
+        );
+        match self.execute(&sql) {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                let message = error.to_string();
+                if message.contains("no such table") || message.contains("unknown table") {
+                    Ok(QueryResult::with_rows(
+                        vec![
+                            "conflict_id".to_string(),
+                            "batch_id".to_string(),
+                            "remote_replica_id".to_string(),
+                            "remote_sequence".to_string(),
+                            "table_name".to_string(),
+                            "operation".to_string(),
+                            "conflict_type".to_string(),
+                            "message".to_string(),
+                            "primary_key_json".to_string(),
+                            "remote_record_json".to_string(),
+                            "local_row_json".to_string(),
+                            "created_at_micros".to_string(),
+                            "resolved".to_string(),
+                            "resolution".to_string(),
+                            "resolved_at_micros".to_string(),
+                            "resolved_by".to_string(),
+                            "resolution_note".to_string(),
+                            "policy_name".to_string(),
+                            "local_record_json".to_string(),
+                        ],
+                        Vec::new(),
+                    ))
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    pub(crate) fn sync_post_commit(
+        &self,
+        runtime: &mut EngineRuntime,
+        committed_lsn: u64,
+    ) -> Result<()> {
+        let mutations = runtime.take_sync_mutations();
+        if mutations.is_empty() {
+            return Ok(());
+        }
+        if !self.inner.sync_ctx.capture_enabled() {
+            return Ok(());
+        }
+        let enabled = if self.inner.sync_ctx.is_enabled() {
+            true
+        } else {
+            let status = self.load_sync_status_from_runtime(runtime)?;
+            if status.enabled {
+                self.inner.sync_ctx.set_enabled(true);
+                if let Some(replica_id) = status.replica_id.as_deref() {
+                    self.inner.sync_ctx.set_replica_id(replica_id);
+                }
+                self.inner.sync_ctx.set_next_sequence(status.next_sequence);
+            }
+            status.enabled
+        };
+        if !enabled {
+            return Ok(());
+        }
+        self.inner
+            .sync_ctx
+            .pending_mutations
+            .lock()
+            .map_err(|_| DbError::internal("sync pending mutations lock poisoned"))?
+            .extend(mutations);
+        self.inner
+            .sync_ctx
+            .flush_journal(&self.inner.vfs, committed_lsn)?;
+        Ok(())
+    }
+}
+
+fn sync_read_metadata_from_runtime(runtime: &EngineRuntime, key: &str) -> Result<Option<String>> {
+    let Some(table) = runtime.catalog.table(crate::sync::METADATA_TABLE) else {
+        return Ok(None);
+    };
+    let Some(key_index) = table.columns.iter().position(|column| column.name == "key") else {
+        return Ok(None);
+    };
+    let Some(value_index) = table
+        .columns
+        .iter()
+        .position(|column| column.name == "value")
+    else {
+        return Ok(None);
+    };
+    let Some(source) = runtime.table_row_source(&table.name) else {
+        return Ok(None);
+    };
+
+    for row in source.rows() {
+        let row = row?;
+        let values = row.values();
+        if let (Some(Value::Text(row_key)), Some(Value::Text(row_value))) =
+            (values.get(key_index), values.get(value_index))
+        {
+            if row_key == key {
+                return Ok(Some(row_value.clone()));
+            }
+        }
+    }
+    Ok(None)
+}
+
+enum SyncInspectionQuery {
+    Status,
+    Journal { since_sequence: u64 },
+    Peers,
+    Retention,
+    PeerLag,
+    Doctor,
+    Scopes,
+    ScopeTables,
+    PeerScopes,
+    Sessions,
+    ConflictPolicy,
+    Conflicts,
+}
+
+impl SyncInspectionQuery {
+    fn parse(normalized: &str) -> Option<Self> {
+        match normalized {
+            "select * from sys_sync_status" => Some(Self::Status),
+            "select * from sys_sync_journal" => Some(Self::Journal { since_sequence: 0 }),
+            "select * from sys_sync_journal order by sequence" => {
+                Some(Self::Journal { since_sequence: 0 })
+            }
+            "select * from sys_sync_journal order by sequence asc" => {
+                Some(Self::Journal { since_sequence: 0 })
+            }
+            "select * from sys_sync_peers" => Some(Self::Peers),
+            "select * from sys_sync_peers order by name" => Some(Self::Peers),
+            "select * from sys_sync_peers order by name asc" => Some(Self::Peers),
+            "select * from sys_sync_retention" => Some(Self::Retention),
+            "select * from sys_sync_peer_lag" => Some(Self::PeerLag),
+            "select * from sys_sync_peer_lag order by peer_name" => Some(Self::PeerLag),
+            "select * from sys_sync_peer_lag order by peer_name asc" => Some(Self::PeerLag),
+            "select * from sys_sync_doctor" => Some(Self::Doctor),
+            "select * from sys_sync_scopes" => Some(Self::Scopes),
+            "select * from sys_sync_scopes order by name" => Some(Self::Scopes),
+            "select * from sys_sync_scopes order by name asc" => Some(Self::Scopes),
+            "select * from sys_sync_scope_tables" => Some(Self::ScopeTables),
+            "select * from sys_sync_scope_tables order by scope_name, table_name" => {
+                Some(Self::ScopeTables)
+            }
+            "select * from sys_sync_scope_tables order by scope_name, table_name asc" => {
+                Some(Self::ScopeTables)
+            }
+            "select * from sys_sync_peer_scopes" => Some(Self::PeerScopes),
+            "select * from sys_sync_peer_scopes order by peer_name" => Some(Self::PeerScopes),
+            "select * from sys_sync_peer_scopes order by peer_name asc" => Some(Self::PeerScopes),
+            "select * from sys_sync_sessions" => Some(Self::Sessions),
+            "select * from sys_sync_sessions order by session_id" => Some(Self::Sessions),
+            "select * from sys_sync_sessions order by session_id asc" => Some(Self::Sessions),
+            "select * from sys_sync_conflict_policy" => Some(Self::ConflictPolicy),
+            "select * from sys_sync_conflict_policy order by default_policy" => {
+                Some(Self::ConflictPolicy)
+            }
+            "select * from sys_sync_conflicts" => Some(Self::Conflicts),
+            "select * from sys_sync_conflicts order by conflict_id" => Some(Self::Conflicts),
+            "select * from sys_sync_conflicts order by conflict_id asc" => Some(Self::Conflicts),
+            _ => parse_sync_journal_where_sequence(normalized)
+                .map(|since_sequence| Self::Journal { since_sequence }),
+        }
+    }
+}
+
+fn normalize_sync_inspection_sql(sql: &str) -> String {
+    sql.trim()
+        .trim_end_matches(';')
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+fn parse_sync_journal_where_sequence(normalized: &str) -> Option<u64> {
+    let rest = normalized.strip_prefix("select * from sys_sync_journal where sequence > ")?;
+    let rest = rest.strip_suffix(" order by sequence asc").unwrap_or(rest);
+    let rest = rest.strip_suffix(" order by sequence").unwrap_or(rest);
+    rest.parse().ok()
+}
+
+fn sync_u64_to_i64(value: u64, field_name: &str) -> Result<Value> {
+    i64::try_from(value)
+        .map(Value::Int64)
+        .map_err(|_| DbError::internal(format!("{field_name} exceeds INT64 range")))
+}
+
+fn sync_conflict_from_row(row: &QueryRow) -> Result<SyncConflict> {
+    let values = row.values();
+    let conflict_id = match values.first() {
+        Some(Value::Int64(value)) => *value,
+        Some(Value::Bool(value)) => i64::from(*value),
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync conflict row: conflict_id",
+            ))
+        }
+    };
+    let batch_id = match values.get(1) {
+        Some(Value::Text(value)) => value.clone(),
+        _ => {
+            return Err(DbError::corruption("malformed sync conflict row: batch_id"));
+        }
+    };
+    let remote_replica_id = match values.get(2) {
+        Some(Value::Text(value)) => value.clone(),
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync conflict row: remote_replica_id",
+            ));
+        }
+    };
+    let remote_sequence = match values.get(3) {
+        Some(Value::Int64(value)) => *value,
+        Some(Value::Bool(value)) => i64::from(*value),
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync conflict row: remote_sequence",
+            ));
+        }
+    };
+    let table_name = match values.get(4) {
+        Some(Value::Text(value)) => value.clone(),
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync conflict row: table_name",
+            ));
+        }
+    };
+    let operation = match values.get(5) {
+        Some(Value::Text(value)) => value.clone(),
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync conflict row: operation",
+            ));
+        }
+    };
+    let conflict_type = match values.get(6) {
+        Some(Value::Text(value)) => value.clone(),
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync conflict row: conflict_type",
+            ));
+        }
+    };
+    let message = match values.get(7) {
+        Some(Value::Text(value)) => value.clone(),
+        _ => {
+            return Err(DbError::corruption("malformed sync conflict row: message"));
+        }
+    };
+    let primary_key_json = match values.get(8) {
+        Some(Value::Text(value)) => serde_json::from_str(value).map_err(|error| {
+            DbError::corruption(format!("malformed sync conflict primary_key_json: {error}"))
+        })?,
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync conflict row: primary_key_json",
+            ));
+        }
+    };
+    let remote_record_json = match values.get(9) {
+        Some(Value::Text(value)) => serde_json::from_str(value).map_err(|error| {
+            DbError::corruption(format!(
+                "malformed sync conflict remote_record_json: {error}"
+            ))
+        })?,
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync conflict row: remote_record_json",
+            ));
+        }
+    };
+    let local_row_json = match values.get(10) {
+        Some(Value::Null) | None => None,
+        Some(Value::Text(value)) => Some(serde_json::from_str(value).map_err(|error| {
+            DbError::corruption(format!("malformed sync conflict local_row_json: {error}"))
+        })?),
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync conflict row: local_row_json",
+            ));
+        }
+    };
+    let created_at_micros = match values.get(11) {
+        Some(Value::Int64(value)) => *value,
+        Some(Value::Bool(value)) => i64::from(*value),
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync conflict row: created_at_micros",
+            ));
+        }
+    };
+    let resolved = match values.get(12) {
+        Some(Value::Int64(value)) => *value != 0,
+        Some(Value::Bool(value)) => *value,
+        _ => {
+            return Err(DbError::corruption("malformed sync conflict row: resolved"));
+        }
+    };
+    let resolution = match values.get(13) {
+        Some(Value::Null) | None => None,
+        Some(Value::Text(value)) => Some(value.clone()),
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync conflict row: resolution",
+            ));
+        }
+    };
+    let resolved_at_micros = match values.get(14) {
+        Some(Value::Null) | None => None,
+        Some(Value::Int64(value)) => Some(*value),
+        Some(Value::Bool(value)) => Some(i64::from(*value)),
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync conflict row: resolved_at_micros",
+            ));
+        }
+    };
+    let resolved_by = match values.get(15) {
+        Some(Value::Null) | None => None,
+        Some(Value::Text(value)) => Some(value.clone()),
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync conflict row: resolved_by",
+            ));
+        }
+    };
+    let resolution_note = match values.get(16) {
+        Some(Value::Null) | None => None,
+        Some(Value::Text(value)) => Some(value.clone()),
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync conflict row: resolution_note",
+            ));
+        }
+    };
+    let policy_name = match values.get(17) {
+        Some(Value::Null) | None => None,
+        Some(Value::Text(value)) => Some(value.clone()),
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync conflict row: policy_name",
+            ));
+        }
+    };
+    let local_record_json = match values.get(18) {
+        Some(Value::Null) | None => None,
+        Some(Value::Text(value)) => Some(serde_json::from_str(value).map_err(|error| {
+            DbError::corruption(format!(
+                "malformed sync conflict local_record_json: {error}"
+            ))
+        })?),
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync conflict row: local_record_json",
+            ));
+        }
+    };
+
+    Ok(SyncConflict {
+        conflict_id,
+        batch_id,
+        remote_replica_id,
+        remote_sequence,
+        table_name,
+        operation,
+        conflict_type,
+        message,
+        primary_key_json,
+        remote_record_json,
+        resolution,
+        resolved_at_micros,
+        resolved_by,
+        resolution_note,
+        policy_name,
+        local_record_json,
+        local_row_json,
+        created_at_micros,
+        resolved,
+    })
+}
+
+fn sync_peer_from_row(row: &QueryRow) -> Result<SyncPeer> {
+    let values = row.values();
+    let name = match values.first() {
+        Some(Value::Text(value)) => value.clone(),
+        _ => return Err(DbError::corruption("malformed sync peer row: name")),
+    };
+    let endpoint = match values.get(1) {
+        Some(Value::Text(value)) => value.clone(),
+        _ => return Err(DbError::corruption("malformed sync peer row: endpoint")),
+    };
+    let token_env = match values.get(2) {
+        Some(Value::Null) | None => None,
+        Some(Value::Text(value)) => Some(value.clone()),
+        _ => return Err(DbError::corruption("malformed sync peer row: token_env")),
+    };
+    let created_at_micros = match values.get(3) {
+        Some(Value::Int64(value)) => *value,
+        Some(Value::Bool(value)) => i64::from(*value),
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync peer row: created_at_micros",
+            ))
+        }
+    };
+    let updated_at_micros = match values.get(4) {
+        Some(Value::Int64(value)) => *value,
+        Some(Value::Bool(value)) => i64::from(*value),
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync peer row: updated_at_micros",
+            ))
+        }
+    };
+
+    Ok(SyncPeer {
+        name,
+        endpoint,
+        token_env,
+        created_at_micros,
+        updated_at_micros,
+    })
+}
+
+fn sync_scope_from_row(row: &QueryRow) -> Result<SyncScope> {
+    let values = row.values();
+    let name = match values.first() {
+        Some(Value::Text(value)) => value.clone(),
+        _ => return Err(DbError::corruption("malformed sync scope row: name")),
+    };
+    let include_tables_json = match values.get(1) {
+        Some(Value::Text(value)) => value.clone(),
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync scope row: include_tables_json",
+            ))
+        }
+    };
+    let row_filter = match values.get(2) {
+        Some(Value::Null) | None => None,
+        Some(Value::Text(value)) => Some(value.clone()),
+        _ => return Err(DbError::corruption("malformed sync scope row: row_filter")),
+    };
+    let filter_columns_json = match values.get(3) {
+        Some(Value::Text(value)) => value.clone(),
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync scope row: filter_columns_json",
+            ))
+        }
+    };
+    let created_at_micros = match values.get(4) {
+        Some(Value::Int64(value)) => *value,
+        Some(Value::Bool(value)) => i64::from(*value),
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync scope row: created_at_micros",
+            ))
+        }
+    };
+    let updated_at_micros = match values.get(5) {
+        Some(Value::Int64(value)) => *value,
+        Some(Value::Bool(value)) => i64::from(*value),
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync scope row: updated_at_micros",
+            ))
+        }
+    };
+
+    let include_tables: Vec<String> =
+        serde_json::from_str(&include_tables_json).map_err(|error| {
+            DbError::corruption(format!("malformed sync scope include tables: {error}"))
+        })?;
+    let filter_columns: Vec<String> =
+        serde_json::from_str(&filter_columns_json).map_err(|error| {
+            DbError::corruption(format!("malformed sync scope filter columns: {error}"))
+        })?;
+
+    Ok(SyncScope {
+        name,
+        include_tables,
+        row_filter,
+        filter_columns,
+        created_at_micros,
+        updated_at_micros,
+    })
+}
+
+fn sync_peer_scope_binding_from_row(row: &QueryRow) -> Result<SyncPeerScopeBinding> {
+    let values = row.values();
+    let peer_name = match values.first() {
+        Some(Value::Text(value)) => value.clone(),
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync peer scope row: peer_name",
+            ))
+        }
+    };
+    let scope_name = match values.get(1) {
+        Some(Value::Text(value)) => value.clone(),
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync peer scope row: scope_name",
+            ))
+        }
+    };
+    let created_at_micros = match values.get(2) {
+        Some(Value::Int64(value)) => *value,
+        Some(Value::Bool(value)) => i64::from(*value),
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync peer scope row: created_at_micros",
+            ))
+        }
+    };
+    let updated_at_micros = match values.get(3) {
+        Some(Value::Int64(value)) => *value,
+        Some(Value::Bool(value)) => i64::from(*value),
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync peer scope row: updated_at_micros",
+            ))
+        }
+    };
+
+    Ok(SyncPeerScopeBinding {
+        peer_name,
+        scope_name,
+        created_at_micros,
+        updated_at_micros,
+    })
+}
+
+fn sync_session_from_row(row: &QueryRow) -> Result<SyncSession> {
+    let values = row.values();
+    let session_id = match values.first() {
+        Some(Value::Int64(value)) => *value,
+        Some(Value::Bool(value)) => i64::from(*value),
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync session row: session_id",
+            ))
+        }
+    };
+    let peer_name = match values.get(1) {
+        Some(Value::Text(value)) => value.clone(),
+        _ => return Err(DbError::corruption("malformed sync session row: peer_name")),
+    };
+    let direction = match values.get(2) {
+        Some(Value::Text(value)) => SyncRunDirection::from_str(value)?,
+        _ => return Err(DbError::corruption("malformed sync session row: direction")),
+    };
+    let remote_replica_id = match values.get(3) {
+        Some(Value::Null) | None => None,
+        Some(Value::Text(value)) => Some(value.clone()),
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync session row: remote_replica_id",
+            ))
+        }
+    };
+    let started_at_micros = match values.get(4) {
+        Some(Value::Int64(value)) => *value,
+        Some(Value::Bool(value)) => i64::from(*value),
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync session row: started_at_micros",
+            ))
+        }
+    };
+    let ended_at_micros = match values.get(5) {
+        Some(Value::Null) | None => None,
+        Some(Value::Int64(value)) => Some(*value),
+        Some(Value::Bool(value)) => Some(i64::from(*value)),
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync session row: ended_at_micros",
+            ))
+        }
+    };
+    let status = match values.get(6) {
+        Some(Value::Text(value)) => value.clone(),
+        _ => return Err(DbError::corruption("malformed sync session row: status")),
+    };
+    let error = match values.get(7) {
+        Some(Value::Null) | None => None,
+        Some(Value::Text(value)) => Some(value.clone()),
+        _ => return Err(DbError::corruption("malformed sync session row: error")),
+    };
+    let pushed_batch_id = match values.get(8) {
+        Some(Value::Null) | None => None,
+        Some(Value::Text(value)) => Some(value.clone()),
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync session row: pushed_batch_id",
+            ))
+        }
+    };
+    let pulled_batch_id = match values.get(9) {
+        Some(Value::Null) | None => None,
+        Some(Value::Text(value)) => Some(value.clone()),
+        _ => {
+            return Err(DbError::corruption(
+                "malformed sync session row: pulled_batch_id",
+            ))
+        }
+    };
+    let pushed_seen = parse_sync_i64(values.get(10), "pushed_seen")?;
+    let pushed_applied = parse_sync_i64(values.get(11), "pushed_applied")?;
+    let pushed_skipped = parse_sync_i64(values.get(12), "pushed_skipped")?;
+    let pushed_conflicted = parse_sync_i64(values.get(13), "pushed_conflicted")?;
+    let pulled_seen = parse_sync_i64(values.get(14), "pulled_seen")?;
+    let pulled_applied = parse_sync_i64(values.get(15), "pulled_applied")?;
+    let pulled_skipped = parse_sync_i64(values.get(16), "pulled_skipped")?;
+    let pulled_conflicted = parse_sync_i64(values.get(17), "pulled_conflicted")?;
+    let retry_count = parse_sync_i64(values.get(18), "retry_count")?;
+
+    Ok(SyncSession {
+        session_id,
+        peer_name,
+        direction,
+        remote_replica_id,
+        started_at_micros,
+        ended_at_micros,
+        status,
+        error,
+        pushed_batch_id,
+        pulled_batch_id,
+        pushed_seen,
+        pushed_applied,
+        pushed_skipped,
+        pushed_conflicted,
+        pulled_seen,
+        pulled_applied,
+        pulled_skipped,
+        pulled_conflicted,
+        retry_count,
+    })
+}
+
+fn sql_text_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn sql_nullable_text_literal(value: Option<&str>) -> String {
+    value
+        .map(sql_text_literal)
+        .unwrap_or_else(|| "NULL".to_string())
+}
+
+fn parse_sync_i64(value: Option<&Value>, field_name: &str) -> Result<i64> {
+    match value {
+        Some(Value::Int64(value)) => Ok(*value),
+        Some(Value::Bool(value)) => Ok(i64::from(*value)),
+        _ => Err(DbError::corruption(format!(
+            "malformed sync session row: {field_name}"
+        ))),
+    }
+}
+
+fn sync_session_summary_counts(
+    summary: &SyncRunSummary,
+) -> (i64, i64, i64, i64, i64, i64, i64, i64) {
+    let pushed = summary.pushed.as_ref();
+    let pulled = summary.pulled.as_ref();
+    (
+        pushed.map_or(0, |value| value.seen as i64),
+        pushed.map_or(0, |value| value.applied as i64),
+        pushed.map_or(0, |value| value.skipped as i64),
+        pushed.map_or(0, |value| value.conflicted as i64),
+        pulled.map_or(0, |value| value.seen as i64),
+        pulled.map_or(0, |value| value.applied as i64),
+        pulled.map_or(0, |value| value.skipped as i64),
+        pulled.map_or(0, |value| value.conflicted as i64),
+    )
+}
+
+fn peer_watermark_key(replica_id: &str) -> String {
+    format!("peer_watermark:{replica_id}")
+}
+
+fn peer_out_watermark_key(peer_name: &str) -> String {
+    format!("peer_out_watermark:{peer_name}")
+}
+
+fn imported_record_key(replica_id: &str, sequence: u64) -> String {
+    format!("sync_imported:{replica_id}:{sequence}")
+}
+
+fn parse_uuid_text(input: &str) -> Result<[u8; 16]> {
+    let mut hex = input.trim();
+    if let Some(dashed) = hex
+        .strip_prefix("x'")
+        .and_then(|value| value.strip_suffix('\''))
+    {
+        hex = dashed;
+    }
+    let hex = hex.replace('-', "");
+    if hex.len() != 32 {
+        return Err(DbError::sql(format!(
+            "uuid must be 32 hex digits, got {}",
+            hex.len()
+        )));
+    }
+    let mut bytes = [0u8; 16];
+    for (index, chunk) in hex.as_bytes().chunks_exact(2).enumerate() {
+        let pair = std::str::from_utf8(chunk)
+            .map_err(|error| DbError::sql(format!("invalid UUID record: {error}")))?;
+        bytes[index] = u8::from_str_radix(pair, 16)
+            .map_err(|error| DbError::sql(format!("invalid uuid: {error}")))?;
+    }
+    Ok(bytes)
+}
+
+fn parse_json_blob(input: &str) -> Result<Vec<u8>> {
+    let hex = if let Some(stripped) = input
+        .strip_prefix("x'")
+        .and_then(|value| value.strip_suffix('\''))
+    {
+        stripped
+    } else {
+        input
+    };
+    if !hex.len().is_multiple_of(2) {
+        return Err(DbError::sql("blob JSON text must have even length"));
+    }
+    let mut bytes = Vec::with_capacity(hex.len() / 2);
+    for chunk in hex.as_bytes().chunks_exact(2) {
+        let pair = std::str::from_utf8(chunk)
+            .map_err(|error| DbError::sql(format!("invalid blob hex record: {error}")))?;
+        bytes.push(
+            u8::from_str_radix(pair, 16)
+                .map_err(|error| DbError::sql(format!("invalid blob hex: {error}")))?,
+        );
+    }
+    Ok(bytes)
+}
+
+fn json_to_column_value(
+    table_name: &str,
+    column: &ColumnSchema,
+    value: &JsonValue,
+) -> Result<Value> {
+    if column.column_type == ColumnType::Enum {
+        let label = value.as_str().ok_or_else(|| {
+            DbError::sql(format!(
+                "column '{}' in table '{table_name}' must be ENUM label text",
+                column.name
+            ))
+        })?;
+        let enum_type = column.enum_type.as_ref().ok_or_else(|| {
+            DbError::sql(format!(
+                "column '{}' in table '{table_name}' cannot import ENUM without enum metadata",
+                column.name
+            ))
+        })?;
+        let label_id = enum_type.label_id(label).ok_or_else(|| {
+            DbError::sql(format!(
+                "column '{}' in table '{table_name}' has invalid ENUM label '{label}'",
+                column.name
+            ))
+        })?;
+        return Ok(Value::Enum {
+            enum_type_id: enum_type.type_id,
+            label_id,
+        });
+    }
+    json_to_typed_value(table_name, &column.name, &column.column_type, value)
+}
+
+fn json_to_typed_value(
+    table_name: &str,
+    column_name: &str,
+    column_type: &ColumnType,
+    value: &JsonValue,
+) -> Result<Value> {
+    match column_type {
+        ColumnType::Int64 => match value {
+            JsonValue::Number(value) => value
+                .as_i64()
+                .map(Value::Int64)
+                .ok_or_else(|| {
+                    DbError::sql(format!(
+                        "column '{column_name}' in table '{table_name}' is not a valid INT64"
+                    ))
+                }),
+            JsonValue::String(value) => value
+                .parse::<i64>()
+                .map(Value::Int64)
+                .map_err(|error| {
+                    DbError::sql(format!(
+                        "column '{column_name}' in table '{table_name}' is not a valid INT64: {error}"
+                    ))
+                }),
+            _ => Err(DbError::sql(format!(
+                "column '{column_name}' in table '{table_name}' must be INT64"
+            ))),
+        },
+        ColumnType::Float64 => match value {
+            JsonValue::Number(value) => value
+                .as_f64()
+                .map(Value::Float64)
+                .ok_or_else(|| {
+                    DbError::sql(format!(
+                        "column '{column_name}' in table '{table_name}' is not a valid FLOAT64"
+                    ))
+                }),
+            JsonValue::String(value) => value
+                .parse::<f64>()
+                .map(Value::Float64)
+                .map_err(|error| {
+                    DbError::sql(format!(
+                        "column '{column_name}' in table '{table_name}' is not a valid FLOAT64: {error}"
+                    ))
+                }),
+            _ => Err(DbError::sql(format!(
+                "column '{column_name}' in table '{table_name}' must be FLOAT64"
+            ))),
+        },
+        ColumnType::Text => match value {
+            JsonValue::String(value) => Ok(Value::Text(value.clone())),
+            _ => Err(DbError::sql(format!(
+                "column '{column_name}' in table '{table_name}' must be TEXT"
+            ))),
+        },
+        ColumnType::Bool => match value {
+            JsonValue::Bool(value) => Ok(Value::Bool(*value)),
+            _ => Err(DbError::sql(format!(
+                "column '{column_name}' in table '{table_name}' must be BOOL"
+            ))),
+        },
+        ColumnType::Blob => match value {
+            JsonValue::String(value) => Ok(Value::Blob(parse_json_blob(value)?)),
+            _ => Err(DbError::sql(format!(
+                "column '{column_name}' in table '{table_name}' must be BLOB"
+            ))),
+        },
+        ColumnType::Geometry => match value {
+            JsonValue::String(value) => Ok(Value::Geometry(parse_json_blob(value)?)),
+            _ => Err(DbError::sql(format!(
+                "column '{column_name}' in table '{table_name}' must be GEOMETRY EWKB hex text"
+            ))),
+        },
+        ColumnType::Geography => match value {
+            JsonValue::String(value) => Ok(Value::Geography(parse_json_blob(value)?)),
+            _ => Err(DbError::sql(format!(
+                "column '{column_name}' in table '{table_name}' must be GEOGRAPHY EWKB hex text"
+            ))),
+        },
+        ColumnType::Decimal => {
+            let text = match value {
+                JsonValue::Number(value) => value.to_string(),
+                JsonValue::String(value) => value.clone(),
+                _ => {
+                    return Err(DbError::sql(format!(
+                        "column '{column_name}' in table '{table_name}' must be DECIMAL"
+                    )));
+                }
+            };
+            let (scaled, scale) = parse_sync_decimal_text(&text)?;
+            Ok(Value::Decimal { scaled, scale })
+        }
+        ColumnType::Uuid => {
+            let text = value.as_str().ok_or_else(|| {
+                DbError::sql(format!(
+                    "column '{column_name}' in table '{table_name}' must be UUID text"
+                ))
+            })?;
+            Ok(Value::Uuid(parse_uuid_text(text)?))
+        }
+        ColumnType::Timestamp => match value {
+            JsonValue::Number(value) => value
+                .as_i64()
+                .map(Value::TimestampMicros)
+                .ok_or_else(|| {
+                    DbError::sql(format!(
+                        "column '{column_name}' in table '{table_name}' is not a valid TIMESTAMP"
+                    ))
+                }),
+            JsonValue::String(value) => value
+                .parse::<i64>()
+                .map(Value::TimestampMicros)
+                .map_err(|error| {
+                    DbError::sql(format!(
+                        "column '{column_name}' in table '{table_name}' is not a valid TIMESTAMP: {error}"
+                    ))
+                }),
+            _ => Err(DbError::sql(format!(
+                "column '{column_name}' in table '{table_name}' must be TIMESTAMP"
+            ))),
+        },
+        ColumnType::Enum => Err(DbError::sql(format!(
+            "column '{column_name}' in table '{table_name}' cannot import ENUM without enum metadata"
+        ))),
+        ColumnType::IpAddr => {
+            let text = value.as_str().ok_or_else(|| {
+                DbError::sql(format!(
+                    "column '{column_name}' in table '{table_name}' must be IPADDR text"
+                ))
+            })?;
+            let (family, addr) = parse_ip_addr(text)?;
+            Ok(Value::IpAddr { family, addr })
+        }
+        ColumnType::Cidr => {
+            let text = value.as_str().ok_or_else(|| {
+                DbError::sql(format!(
+                    "column '{column_name}' in table '{table_name}' must be CIDR text"
+                ))
+            })?;
+            let (family, prefix_len, network) = parse_cidr(text)?;
+            Ok(Value::Cidr {
+                family,
+                prefix_len,
+                network,
+            })
+        }
+        ColumnType::MacAddr => {
+            let text = value.as_str().ok_or_else(|| {
+                DbError::sql(format!(
+                    "column '{column_name}' in table '{table_name}' must be MACADDR text"
+                ))
+            })?;
+            let (len, bytes) = parse_mac_addr(text)?;
+            Ok(Value::MacAddr { len, bytes })
+        }
+        ColumnType::Date => {
+            let text = value.as_str().ok_or_else(|| {
+                DbError::sql(format!(
+                    "column '{column_name}' in table '{table_name}' must be DATE text"
+                ))
+            })?;
+            Ok(Value::DateDays(parse_date_days(text)?))
+        }
+        ColumnType::Time => {
+            let text = value.as_str().ok_or_else(|| {
+                DbError::sql(format!(
+                    "column '{column_name}' in table '{table_name}' must be TIME text"
+                ))
+            })?;
+            Ok(Value::TimeMicros(parse_time_micros(text)?))
+        }
+        ColumnType::TimestampTz => match value {
+            JsonValue::Number(value) => value
+                .as_i64()
+                .map(Value::TimestampTzMicros)
+                .ok_or_else(|| {
+                    DbError::sql(format!(
+                        "column '{column_name}' in table '{table_name}' is not a valid TIMESTAMPTZ"
+                    ))
+                }),
+            JsonValue::String(value) => Ok(Value::TimestampTzMicros(parse_timestamp_tz_micros(value)?)),
+            _ => Err(DbError::sql(format!(
+                "column '{column_name}' in table '{table_name}' must be TIMESTAMPTZ"
+            ))),
+        },
+        ColumnType::Interval => {
+            let text = value.as_str().ok_or_else(|| {
+                DbError::sql(format!(
+                    "column '{column_name}' in table '{table_name}' must be INTERVAL text"
+                ))
+            })?;
+            let (months, days, micros) = parse_interval(text)?;
+            Ok(Value::Interval {
+                months,
+                days,
+                micros,
+            })
+        }
+    }
+}
+
+fn parse_sync_decimal_text(value: &str) -> Result<(i64, u8)> {
+    if let Ok(parsed) = parse_decimal_text(value) {
+        return Ok(parsed);
+    }
+    let trimmed = value.trim();
+    let (scaled_text, scale_text) = trimmed
+        .split_once("e-")
+        .or_else(|| trimmed.split_once("E-"))
+        .ok_or_else(|| DbError::sql("invalid DECIMAL cast"))?;
+    let scaled = scaled_text
+        .parse::<i64>()
+        .map_err(|_| DbError::sql("invalid DECIMAL cast"))?;
+    let scale = scale_text
+        .parse::<u8>()
+        .map_err(|_| DbError::sql("invalid DECIMAL cast"))?;
+    Ok(normalize_decimal(scaled, scale))
 }
 
 fn db_open_lock(canonical_path: PathBuf) -> Result<Arc<Mutex<()>>> {
@@ -5480,6 +9770,7 @@ fn index_info(index: &IndexSchema) -> IndexInfo {
         kind: match index.kind {
             IndexKind::Btree => "btree",
             IndexKind::Trigram => "trigram",
+            IndexKind::Spatial => "spatial",
         }
         .to_string(),
         unique: index.unique,
@@ -5514,6 +9805,9 @@ fn trigger_info(trigger: &TriggerSchema) -> TriggerInfo {
 fn schema_snapshot(db: &Db, runtime: &EngineRuntime) -> Result<SchemaSnapshot> {
     let mut tables = Vec::with_capacity(runtime.catalog.tables.len() + runtime.temp_tables.len());
     for table in runtime.catalog.tables.values() {
+        if crate::sync::is_internal_table_name(&table.name) {
+            continue;
+        }
         tables.push(schema_table_info(
             table,
             db.runtime_table_row_count(runtime, &table.name)?,
@@ -5616,6 +9910,7 @@ fn schema_index_info(index: &IndexSchema) -> SchemaIndexInfo {
         kind: match index.kind {
             IndexKind::Btree => "btree",
             IndexKind::Trigram => "trigram",
+            IndexKind::Spatial => "spatial",
         }
         .to_string(),
         unique: index.unique,
@@ -5697,7 +9992,602 @@ fn runtime_index_entry_count(index: &RuntimeIndex) -> usize {
     match index {
         RuntimeIndex::Btree { keys } => keys.total_row_id_count(),
         RuntimeIndex::Trigram { index } => index.entry_count(),
+        RuntimeIndex::Spatial { index } => index.len(),
     }
+}
+
+struct MergePlan {
+    source: String,
+    target: String,
+    base_head_id: String,
+    table_count: usize,
+    changes: Vec<MergeChangePlan>,
+    conflicts: Vec<crate::branch::BranchMergeConflict>,
+}
+
+impl MergePlan {
+    fn into_report(self, dry_run: bool) -> crate::branch::BranchMergeReport {
+        crate::branch::BranchMergeReport {
+            source: self.source,
+            target: self.target,
+            dry_run,
+            clean: self.conflicts.is_empty(),
+            base_head_id: self.base_head_id,
+            table_count: self.table_count,
+            applied_change_count: if dry_run || !self.conflicts.is_empty() {
+                0
+            } else {
+                self.changes.len()
+            },
+            conflict_count: self.conflicts.len(),
+            applied: if dry_run || !self.conflicts.is_empty() {
+                Vec::new()
+            } else {
+                self.changes
+                    .into_iter()
+                    .map(|change| change.change)
+                    .collect()
+            },
+            conflicts: self.conflicts,
+        }
+    }
+}
+
+struct MergeChangePlan {
+    change: crate::branch::BranchMergeChange,
+    sql: String,
+}
+
+struct MergeTableInputs<'a> {
+    base_db: &'a Db,
+    source_db: &'a Db,
+    target_db: &'a Db,
+    base_table: &'a TableInfo,
+    source_table: &'a TableInfo,
+    target_table: &'a TableInfo,
+}
+
+fn build_merge_plan(
+    source_ref: &str,
+    target_ref: &str,
+    base_head_id: &str,
+    base_db: &Db,
+    source_db: &Db,
+    target_db: &Db,
+) -> Result<MergePlan> {
+    let base_tables = table_info_map(base_db)?;
+    let source_tables = table_info_map(source_db)?;
+    let target_tables = table_info_map(target_db)?;
+    let mut table_names = BTreeSet::new();
+    table_names.extend(base_tables.keys().cloned());
+    table_names.extend(source_tables.keys().cloned());
+    table_names.extend(target_tables.keys().cloned());
+
+    let mut changes = Vec::new();
+    let mut conflicts = Vec::new();
+    for table_name in &table_names {
+        let Some(base_table) = base_tables.get(table_name) else {
+            if source_tables.get(table_name) != target_tables.get(table_name) {
+                conflicts.push(merge_conflict(
+                    table_name,
+                    Vec::new(),
+                    "schema_change",
+                    "merge does not support tables created after the branch base",
+                ));
+            }
+            continue;
+        };
+        let Some(source_table) = source_tables.get(table_name) else {
+            conflicts.push(merge_conflict(
+                table_name,
+                Vec::new(),
+                "schema_change",
+                "merge does not support dropped source tables",
+            ));
+            continue;
+        };
+        let Some(target_table) = target_tables.get(table_name) else {
+            conflicts.push(merge_conflict(
+                table_name,
+                Vec::new(),
+                "schema_change",
+                "merge does not support dropped target tables",
+            ));
+            continue;
+        };
+        if !merge_table_schema_equal(base_table, source_table)
+            || !merge_table_schema_equal(base_table, target_table)
+        {
+            conflicts.push(merge_conflict(
+                table_name,
+                Vec::new(),
+                "schema_change",
+                "merge supports identical table schemas only",
+            ));
+            continue;
+        }
+        if base_table.primary_key_columns.is_empty() {
+            conflicts.push(merge_conflict(
+                table_name,
+                Vec::new(),
+                "missing_primary_key",
+                "merge requires primary-key tables",
+            ));
+            continue;
+        }
+        merge_table_rows(
+            MergeTableInputs {
+                base_db,
+                source_db,
+                target_db,
+                base_table,
+                source_table,
+                target_table,
+            },
+            &mut changes,
+            &mut conflicts,
+        )?;
+    }
+
+    Ok(MergePlan {
+        source: source_ref.to_string(),
+        target: target_ref.to_string(),
+        base_head_id: base_head_id.to_string(),
+        table_count: table_names.len(),
+        changes,
+        conflicts,
+    })
+}
+
+fn table_info_map(db: &Db) -> Result<BTreeMap<String, TableInfo>> {
+    Ok(db
+        .list_tables()?
+        .into_iter()
+        .map(|table| (table.name.clone(), table))
+        .collect())
+}
+
+fn merge_table_rows(
+    inputs: MergeTableInputs<'_>,
+    changes: &mut Vec<MergeChangePlan>,
+    conflicts: &mut Vec<crate::branch::BranchMergeConflict>,
+) -> Result<()> {
+    let base_rows = diff_table_rows(inputs.base_db, inputs.base_table)?;
+    let source_rows = diff_table_rows(inputs.source_db, inputs.source_table)?;
+    let target_rows = diff_table_rows(inputs.target_db, inputs.target_table)?;
+    let mut row_keys = BTreeSet::new();
+    row_keys.extend(base_rows.keys().cloned());
+    row_keys.extend(source_rows.keys().cloned());
+    row_keys.extend(target_rows.keys().cloned());
+
+    for primary_key in row_keys {
+        let base = base_rows.get(&primary_key);
+        let source = source_rows.get(&primary_key);
+        let target = target_rows.get(&primary_key);
+        let source_changed = source != base;
+        if !source_changed {
+            continue;
+        }
+        let target_changed = target != base;
+        if target_changed {
+            if target == source {
+                continue;
+            }
+            conflicts.push(merge_conflict(
+                &inputs.base_table.name,
+                primary_key,
+                merge_conflict_type(base, source, target),
+                "source and target changed the same primary-key row differently",
+            ));
+            continue;
+        }
+        let Some(change) =
+            merge_change_for_source_delta(inputs.base_table, &primary_key, base, source)?
+        else {
+            continue;
+        };
+        changes.push(change);
+    }
+    Ok(())
+}
+
+fn merge_change_for_source_delta(
+    table: &TableInfo,
+    primary_key: &[String],
+    base: Option<&Vec<String>>,
+    source: Option<&Vec<String>>,
+) -> Result<Option<MergeChangePlan>> {
+    match (base, source) {
+        (None, Some(after)) => Ok(Some(MergeChangePlan {
+            change: crate::branch::BranchMergeChange {
+                table: table.name.clone(),
+                primary_key: primary_key.to_vec(),
+                operation: crate::branch::BranchMergeOperation::Insert,
+            },
+            sql: merge_insert_sql(table, after),
+        })),
+        (Some(_), None) => Ok(Some(MergeChangePlan {
+            change: crate::branch::BranchMergeChange {
+                table: table.name.clone(),
+                primary_key: primary_key.to_vec(),
+                operation: crate::branch::BranchMergeOperation::Delete,
+            },
+            sql: merge_delete_sql(table, primary_key)?,
+        })),
+        (Some(_), Some(after)) => {
+            let Some(sql) = merge_update_sql(table, primary_key, after)? else {
+                return Ok(None);
+            };
+            Ok(Some(MergeChangePlan {
+                change: crate::branch::BranchMergeChange {
+                    table: table.name.clone(),
+                    primary_key: primary_key.to_vec(),
+                    operation: crate::branch::BranchMergeOperation::Update,
+                },
+                sql,
+            }))
+        }
+        (None, None) => Ok(None),
+    }
+}
+
+fn merge_insert_sql(table: &TableInfo, after: &[String]) -> String {
+    let columns = table
+        .columns
+        .iter()
+        .map(|column| sql_identifier(&column.name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "INSERT INTO {} ({columns}) VALUES ({});",
+        sql_identifier(&table.name),
+        after.join(", ")
+    )
+}
+
+fn merge_delete_sql(table: &TableInfo, primary_key: &[String]) -> Result<String> {
+    Ok(format!(
+        "DELETE FROM {} WHERE {};",
+        sql_identifier(&table.name),
+        merge_where_clause(table, primary_key)?
+    ))
+}
+
+fn merge_update_sql(
+    table: &TableInfo,
+    primary_key: &[String],
+    after: &[String],
+) -> Result<Option<String>> {
+    let assignments = table
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(_, column)| {
+            !table
+                .primary_key_columns
+                .iter()
+                .any(|primary_key| identifiers_equal(primary_key, &column.name))
+        })
+        .map(|(index, column)| format!("{} = {}", sql_identifier(&column.name), after[index]))
+        .collect::<Vec<_>>();
+    if assignments.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "UPDATE {} SET {} WHERE {};",
+        sql_identifier(&table.name),
+        assignments.join(", "),
+        merge_where_clause(table, primary_key)?
+    )))
+}
+
+fn merge_where_clause(table: &TableInfo, primary_key: &[String]) -> Result<String> {
+    if primary_key.len() != table.primary_key_columns.len() {
+        return Err(DbError::internal("merge primary-key arity mismatch"));
+    }
+    Ok(table
+        .primary_key_columns
+        .iter()
+        .zip(primary_key.iter())
+        .map(|(column, value)| format!("{} = {value}", sql_identifier(column)))
+        .collect::<Vec<_>>()
+        .join(" AND "))
+}
+
+fn merge_conflict_type(
+    base: Option<&Vec<String>>,
+    source: Option<&Vec<String>>,
+    target: Option<&Vec<String>>,
+) -> &'static str {
+    match (base, source, target) {
+        (None, Some(_), Some(_)) => "duplicate_insert",
+        (Some(_), None, Some(_)) => "delete_update",
+        (Some(_), Some(_), None) => "update_delete",
+        (Some(_), Some(_), Some(_)) => "update_update",
+        _ => "row_conflict",
+    }
+}
+
+fn merge_conflict(
+    table: &str,
+    primary_key: Vec<String>,
+    conflict_type: &str,
+    message: &str,
+) -> crate::branch::BranchMergeConflict {
+    crate::branch::BranchMergeConflict {
+        table: table.to_string(),
+        primary_key,
+        conflict_type: conflict_type.to_string(),
+        message: message.to_string(),
+    }
+}
+
+fn merge_table_schema_equal(left: &TableInfo, right: &TableInfo) -> bool {
+    left.columns == right.columns
+        && left.checks == right.checks
+        && left.foreign_keys == right.foreign_keys
+        && left.primary_key_columns == right.primary_key_columns
+}
+
+fn diff_materialized_refs(
+    left_ref: &str,
+    right_ref: &str,
+    left_db: &Db,
+    right_db: &Db,
+) -> Result<crate::branch::BranchDiffReport> {
+    let left_tables = left_db
+        .list_tables()?
+        .into_iter()
+        .map(|table| (table.name.clone(), table))
+        .collect::<BTreeMap<_, _>>();
+    let right_tables = right_db
+        .list_tables()?
+        .into_iter()
+        .map(|table| (table.name.clone(), table))
+        .collect::<BTreeMap<_, _>>();
+    let mut table_names = BTreeSet::new();
+    table_names.extend(left_tables.keys().cloned());
+    table_names.extend(right_tables.keys().cloned());
+
+    let mut tables = Vec::new();
+    for table_name in table_names {
+        let table_diff = match (left_tables.get(&table_name), right_tables.get(&table_name)) {
+            (None, Some(right_table)) => {
+                let (added, message) = diff_rows_for_added_table(right_db, right_table)?;
+                crate::branch::BranchTableDiff {
+                    table: table_name,
+                    status: crate::branch::BranchTableDiffStatus::Added,
+                    schema_changed: true,
+                    added,
+                    updated: Vec::new(),
+                    deleted: Vec::new(),
+                    message,
+                }
+            }
+            (Some(left_table), None) => {
+                let (deleted, message) = diff_rows_for_removed_table(left_db, left_table)?;
+                crate::branch::BranchTableDiff {
+                    table: table_name,
+                    status: crate::branch::BranchTableDiffStatus::Removed,
+                    schema_changed: true,
+                    added: Vec::new(),
+                    updated: Vec::new(),
+                    deleted,
+                    message,
+                }
+            }
+            (Some(left_table), Some(right_table)) => {
+                diff_existing_table(left_db, right_db, left_table, right_table)?
+            }
+            (None, None) => continue,
+        };
+        tables.push(table_diff);
+    }
+
+    let added_row_count = tables.iter().map(|table| table.added.len()).sum();
+    let updated_row_count = tables.iter().map(|table| table.updated.len()).sum();
+    let deleted_row_count = tables.iter().map(|table| table.deleted.len()).sum();
+    let changed_table_count = tables
+        .iter()
+        .filter(|table| table.status != crate::branch::BranchTableDiffStatus::Unchanged)
+        .count();
+
+    Ok(crate::branch::BranchDiffReport {
+        left_ref: left_ref.to_string(),
+        right_ref: right_ref.to_string(),
+        table_count: tables.len(),
+        changed_table_count,
+        added_row_count,
+        updated_row_count,
+        deleted_row_count,
+        tables,
+    })
+}
+
+fn diff_existing_table(
+    left_db: &Db,
+    right_db: &Db,
+    left_table: &TableInfo,
+    right_table: &TableInfo,
+) -> Result<crate::branch::BranchTableDiff> {
+    let schema_changed = left_table.columns != right_table.columns
+        || left_table.checks != right_table.checks
+        || left_table.foreign_keys != right_table.foreign_keys
+        || left_table.primary_key_columns != right_table.primary_key_columns;
+    if left_table.primary_key_columns.is_empty() || right_table.primary_key_columns.is_empty() {
+        let changed = schema_changed || left_table.row_count != right_table.row_count;
+        return Ok(crate::branch::BranchTableDiff {
+            table: left_table.name.clone(),
+            status: if changed {
+                crate::branch::BranchTableDiffStatus::Unsupported
+            } else {
+                crate::branch::BranchTableDiffStatus::Unchanged
+            },
+            schema_changed,
+            added: Vec::new(),
+            updated: Vec::new(),
+            deleted: Vec::new(),
+            message: Some(
+                "row diff requires a primary key; table-level metadata was compared only"
+                    .to_string(),
+            ),
+        });
+    }
+    if left_table.primary_key_columns != right_table.primary_key_columns {
+        return Ok(crate::branch::BranchTableDiff {
+            table: left_table.name.clone(),
+            status: crate::branch::BranchTableDiffStatus::Unsupported,
+            schema_changed,
+            added: Vec::new(),
+            updated: Vec::new(),
+            deleted: Vec::new(),
+            message: Some("primary-key columns differ; row diff is not supported".to_string()),
+        });
+    }
+
+    let left_rows = diff_table_rows(left_db, left_table)?;
+    let right_rows = diff_table_rows(right_db, right_table)?;
+    let mut keys = BTreeSet::new();
+    keys.extend(left_rows.keys().cloned());
+    keys.extend(right_rows.keys().cloned());
+
+    let mut added = Vec::new();
+    let mut updated = Vec::new();
+    let mut deleted = Vec::new();
+    for key in keys {
+        match (left_rows.get(&key), right_rows.get(&key)) {
+            (None, Some(after)) => added.push(crate::branch::BranchRowDiff {
+                primary_key: key,
+                before: None,
+                after: Some(after.clone()),
+            }),
+            (Some(before), None) => deleted.push(crate::branch::BranchRowDiff {
+                primary_key: key,
+                before: Some(before.clone()),
+                after: None,
+            }),
+            (Some(before), Some(after)) if before != after => {
+                updated.push(crate::branch::BranchRowDiff {
+                    primary_key: key,
+                    before: Some(before.clone()),
+                    after: Some(after.clone()),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    let changed = schema_changed || !added.is_empty() || !updated.is_empty() || !deleted.is_empty();
+    Ok(crate::branch::BranchTableDiff {
+        table: left_table.name.clone(),
+        status: if changed {
+            crate::branch::BranchTableDiffStatus::Changed
+        } else {
+            crate::branch::BranchTableDiffStatus::Unchanged
+        },
+        schema_changed,
+        added,
+        updated,
+        deleted,
+        message: None,
+    })
+}
+
+fn diff_rows_for_added_table(
+    db: &Db,
+    table: &TableInfo,
+) -> Result<(Vec<crate::branch::BranchRowDiff>, Option<String>)> {
+    if table.primary_key_columns.is_empty() {
+        return Ok((
+            Vec::new(),
+            Some("row diff requires a primary key; table is reported as added".to_string()),
+        ));
+    }
+    let rows = diff_table_rows(db, table)?
+        .into_iter()
+        .map(|(primary_key, after)| crate::branch::BranchRowDiff {
+            primary_key,
+            before: None,
+            after: Some(after),
+        })
+        .collect();
+    Ok((rows, None))
+}
+
+fn diff_rows_for_removed_table(
+    db: &Db,
+    table: &TableInfo,
+) -> Result<(Vec<crate::branch::BranchRowDiff>, Option<String>)> {
+    if table.primary_key_columns.is_empty() {
+        return Ok((
+            Vec::new(),
+            Some("row diff requires a primary key; table is reported as removed".to_string()),
+        ));
+    }
+    let rows = diff_table_rows(db, table)?
+        .into_iter()
+        .map(|(primary_key, before)| crate::branch::BranchRowDiff {
+            primary_key,
+            before: Some(before),
+            after: None,
+        })
+        .collect();
+    Ok((rows, None))
+}
+
+fn diff_table_rows(db: &Db, table: &TableInfo) -> Result<BTreeMap<Vec<String>, Vec<String>>> {
+    let columns = table
+        .columns
+        .iter()
+        .map(|column| sql_identifier(&column.name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let order_by = table
+        .primary_key_columns
+        .iter()
+        .map(|column| sql_identifier(column))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT {columns} FROM {} ORDER BY {order_by}",
+        sql_identifier(&table.name)
+    );
+    let result = db.execute(&sql)?;
+    let primary_key_indexes = table
+        .primary_key_columns
+        .iter()
+        .map(|primary_key| {
+            table
+                .columns
+                .iter()
+                .position(|column| identifiers_equal(&column.name, primary_key))
+                .ok_or_else(|| {
+                    DbError::corruption(format!(
+                        "primary-key column '{primary_key}' missing from table '{}'",
+                        table.name
+                    ))
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut rows = BTreeMap::new();
+    for row in result.rows() {
+        let values = row
+            .values()
+            .iter()
+            .map(diff_value_string)
+            .collect::<Vec<_>>();
+        let primary_key = primary_key_indexes
+            .iter()
+            .map(|index| values[*index].clone())
+            .collect::<Vec<_>>();
+        rows.insert(primary_key, values);
+    }
+    Ok(rows)
+}
+
+fn diff_value_string(value: &Value) -> String {
+    render_value_sql(value)
 }
 
 fn render_runtime_dump(
@@ -5743,6 +10633,13 @@ fn render_runtime_dump(
         lines.push(render_create_view(view));
     }
     for index in runtime.catalog.indexes.values() {
+        if runtime
+            .catalog
+            .table(&index.table_name)
+            .is_some_and(|table| is_auto_table_index(table, index))
+        {
+            continue;
+        }
         lines.push(render_create_index(index));
     }
     for trigger in runtime.catalog.triggers.values() {
@@ -5758,7 +10655,7 @@ fn render_create_table(table: &TableSchema) -> String {
         let mut definition = format!(
             "{} {}",
             sql_identifier(&column.name),
-            column.column_type.as_str()
+            render_column_type(column)
         );
         if !column.nullable {
             definition.push_str(" NOT NULL");
@@ -5768,9 +10665,6 @@ fn render_create_table(table: &TableSchema) -> String {
         }
         if column.unique {
             definition.push_str(" UNIQUE");
-        }
-        if column.auto_increment {
-            definition.push_str(" AUTOINCREMENT");
         }
         if let Some(generated_sql) = &column.generated_sql {
             definition.push_str(" GENERATED ALWAYS AS (");
@@ -5870,13 +10764,48 @@ fn render_insert(table: &TableSchema, values: &[Value]) -> String {
         .join(", ");
     let values = values
         .iter()
-        .map(render_value_sql)
+        .zip(table.columns.iter())
+        .map(|(value, column)| render_column_value_sql(column, value))
         .collect::<Vec<_>>()
         .join(", ");
     format!(
         "INSERT INTO {} ({columns}) VALUES ({values});",
         sql_identifier(&table.name)
     )
+}
+
+fn render_column_type(column: &crate::catalog::ColumnSchema) -> String {
+    if column.column_type == crate::catalog::ColumnType::Enum {
+        if let Some(enum_type) = &column.enum_type {
+            let labels = enum_type
+                .labels
+                .iter()
+                .map(|label| sql_string_literal(&label.label))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return format!("ENUM({labels})");
+        }
+    }
+    column.column_type.as_str().to_string()
+}
+
+fn render_column_value_sql(column: &crate::catalog::ColumnSchema, value: &Value) -> String {
+    if let (
+        crate::catalog::ColumnType::Enum,
+        Some(enum_type),
+        Value::Enum {
+            enum_type_id,
+            label_id,
+        },
+    ) = (column.column_type, &column.enum_type, value)
+    {
+        if *enum_type_id == enum_type.type_id {
+            if let Some(label) = enum_type.label_for_id(*label_id) {
+                return sql_string_literal(label);
+            }
+        }
+    }
+    render_value_sql(value)
 }
 
 fn render_create_view(view: &ViewSchema) -> String {
@@ -5905,6 +10834,7 @@ fn render_create_index(index: &IndexSchema) -> String {
     let using = match index.kind {
         IndexKind::Btree => String::new(),
         IndexKind::Trigram => " USING trigram".to_string(),
+        IndexKind::Spatial => " USING spatial".to_string(),
     };
     let columns = index
         .columns
@@ -5937,6 +10867,73 @@ fn render_create_index(index: &IndexSchema) -> String {
     )
 }
 
+fn is_auto_table_index(table: &TableSchema, index: &IndexSchema) -> bool {
+    let Some(column_names) = index_column_names(index) else {
+        return false;
+    };
+    if !index.include_columns.is_empty() || index.predicate_sql.is_some() {
+        return false;
+    }
+    if !identifiers_equal(&index.table_name, &table.name) || index.kind != IndexKind::Btree {
+        return false;
+    }
+    if !table.primary_key_columns.is_empty()
+        && index.unique
+        && identifier_lists_equal(&column_names, &table.primary_key_columns)
+        && identifiers_equal(
+            &index.name,
+            &dump_auto_index_name("pk", &table.name, &table.primary_key_columns),
+        )
+    {
+        return true;
+    }
+    if column_names.len() == 1
+        && index.unique
+        && table.columns.iter().any(|column| {
+            column.unique
+                && !column.primary_key
+                && identifiers_equal(&column.name, &column_names[0])
+                && identifiers_equal(
+                    &index.name,
+                    &dump_auto_index_name("uq", &table.name, &column_names),
+                )
+        })
+    {
+        return true;
+    }
+    table.foreign_keys.iter().any(|foreign_key| {
+        !index.unique
+            && identifier_lists_equal(&column_names, &foreign_key.columns)
+            && identifiers_equal(
+                &index.name,
+                &format!(
+                    "{}_idx",
+                    dump_auto_index_name("fk", &table.name, &foreign_key.columns)
+                ),
+            )
+    })
+}
+
+fn index_column_names(index: &IndexSchema) -> Option<Vec<String>> {
+    index
+        .columns
+        .iter()
+        .map(|column| column.column_name.clone())
+        .collect()
+}
+
+fn identifier_lists_equal(left: &[String], right: &[String]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right.iter())
+            .all(|(left, right)| identifiers_equal(left, right))
+}
+
+fn dump_auto_index_name(prefix: &str, table_name: &str, columns: &[String]) -> String {
+    format!("{prefix}_{}_{}", table_name, columns.join("_"))
+}
+
 fn render_create_trigger(trigger: &TriggerSchema) -> String {
     format!(
         "CREATE TRIGGER {} {} {} ON {} FOR EACH ROW EXECUTE FUNCTION decentdb_exec_sql({});",
@@ -5966,8 +10963,9 @@ fn render_value_sql(value: &Value) -> String {
                 "FALSE".to_string()
             }
         }
-        Value::Text(value) => format!("'{}'", value.replace('\'', "''")),
+        Value::Text(value) => sql_string_literal(value),
         Value::Blob(value) => format!("X'{}'", hex_encode(value)),
+        Value::Geometry(value) | Value::Geography(value) => format!("X'{}'", hex_encode(value)),
         Value::Decimal { scaled, scale } => {
             if *scale == 0 {
                 scaled.to_string()
@@ -5990,11 +10988,48 @@ fn render_value_sql(value: &Value) -> String {
         }
         Value::Uuid(value) => format!("X'{}'", hex_encode(value)),
         Value::TimestampMicros(value) => value.to_string(),
+        Value::Enum {
+            enum_type_id,
+            label_id,
+        } => format!("'{enum_type_id}:{label_id}'"),
+        Value::IpAddr { family, addr } => match format_ip_addr(*family, addr) {
+            Ok(value) => format!("'{value}'"),
+            Err(_) => "NULL".to_string(),
+        },
+        Value::Cidr {
+            family,
+            prefix_len,
+            network,
+        } => match format_cidr(*family, *prefix_len, network) {
+            Ok(value) => format!("'{value}'"),
+            Err(_) => "NULL".to_string(),
+        },
+        Value::MacAddr { len, bytes } => match format_mac_addr(*len, bytes) {
+            Ok(value) => format!("'{value}'"),
+            Err(_) => "NULL".to_string(),
+        },
+        Value::DateDays(days) => format!("'{}'", format_date_days(*days)),
+        Value::TimeMicros(micros) => match format_time_micros(*micros) {
+            Ok(value) => format!("'{value}'"),
+            Err(_) => "NULL".to_string(),
+        },
+        Value::TimestampTzMicros(micros) => {
+            format!("'{}'", format_timestamp_tz_micros(*micros))
+        }
+        Value::Interval {
+            months,
+            days,
+            micros,
+        } => format!("'{}'", format_interval(*months, *days, *micros)),
     }
 }
 
 fn sql_identifier(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+fn sql_string_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -6171,6 +11206,8 @@ mod tests {
             columns: vec![ColumnSchema {
                 name: "id".to_string(),
                 column_type: ColumnType::Int64,
+                spatial_type: None,
+                enum_type: None,
                 nullable: false,
                 default_sql: None,
                 generated_sql: None,
@@ -6283,6 +11320,311 @@ mod tests {
                 Value::Text(":memory:".to_string())
             ]
         );
+    }
+
+    #[test]
+    fn enum_columns_store_label_ids_and_dump_labels() -> Result<()> {
+        let dir = TempDir::new().expect("create temp dir");
+        let path = dir.path().join("enum.ddb");
+        let db = Db::open_or_create(&path, DbConfig::default())?;
+        db.execute(
+            "CREATE TABLE tickets(
+                id INT PRIMARY KEY,
+                state ENUM('open', 'closed', 'blocked') NOT NULL
+            )",
+        )?;
+        db.execute("INSERT INTO tickets VALUES (1, 'open'), (2, 'closed')")?;
+
+        let result = db.execute("SELECT state FROM tickets ORDER BY id")?;
+        let Value::Enum {
+            enum_type_id,
+            label_id,
+        } = result.rows()[0].values()[0]
+        else {
+            panic!("expected enum value");
+        };
+        assert_ne!(enum_type_id, 0);
+        assert_eq!(label_id, 0);
+        assert_eq!(
+            result.rows()[1].values()[0],
+            Value::Enum {
+                enum_type_id,
+                label_id: 1
+            }
+        );
+        assert!(db
+            .execute("INSERT INTO tickets VALUES (3, 'missing')")
+            .is_err());
+
+        let ddl = db.table_ddl("tickets")?;
+        assert!(ddl.contains("ENUM('open', 'closed', 'blocked')"));
+        let dump = db.dump_sql()?;
+        assert!(dump.contains("\"state\" ENUM('open', 'closed', 'blocked') NOT NULL"));
+        assert!(dump.contains("VALUES (1, 'open')"));
+        drop(db);
+
+        let reopened = Db::open(&path, DbConfig::default())?;
+        reopened.execute("INSERT INTO tickets VALUES (3, 'blocked')")?;
+        reopened.execute("UPDATE tickets SET state = 'closed' WHERE id = 3")?;
+        assert!(reopened
+            .execute("INSERT INTO tickets VALUES (4, 'missing')")
+            .is_err());
+        let reopened_result = reopened.execute("SELECT state FROM tickets ORDER BY id")?;
+        assert_eq!(
+            reopened_result.rows()[0].values()[0],
+            result.rows()[0].values()[0]
+        );
+        assert_eq!(
+            reopened_result.rows()[2].values()[0],
+            Value::Enum {
+                enum_type_id,
+                label_id: 1
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn macaddr_columns_store_binary_and_dump_text() -> Result<()> {
+        let dir = TempDir::new().expect("create temp dir");
+        let path = dir.path().join("macaddr.ddb");
+        let db = Db::open_or_create(&path, DbConfig::default())?;
+        db.execute("CREATE TABLE devices(id INT PRIMARY KEY, mac MACADDR UNIQUE)")?;
+        db.execute(
+            "INSERT INTO devices VALUES
+                (1, '08:00:2b:01:02:03'),
+                (2, '08:00:2b:01:02:03:04:05')",
+        )?;
+
+        let result = db.execute("SELECT mac FROM devices ORDER BY mac")?;
+        assert_eq!(
+            result.rows()[0].values()[0],
+            Value::MacAddr {
+                len: 6,
+                bytes: [0x08, 0x00, 0x2b, 0x01, 0x02, 0x03, 0, 0]
+            }
+        );
+        assert_eq!(
+            result.rows()[1].values()[0],
+            Value::MacAddr {
+                len: 8,
+                bytes: [0x08, 0x00, 0x2b, 0x01, 0x02, 0x03, 0x04, 0x05]
+            }
+        );
+        assert!(db.execute("INSERT INTO devices VALUES (3, 'bad')").is_err());
+        let dump = db.dump_sql()?;
+        assert!(dump.contains("\"mac\" MACADDR UNIQUE"));
+        assert!(dump.contains("'08:00:2b:01:02:03'"));
+        drop(db);
+
+        let reopened = Db::open(&path, DbConfig::default())?;
+        let reopened_result = reopened.execute("SELECT COUNT(*) FROM devices")?;
+        assert_eq!(reopened_result.rows()[0].values(), &[Value::Int64(2)]);
+        Ok(())
+    }
+
+    #[test]
+    fn spatial_geography_points_and_indexed_radius_query() {
+        let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
+        db.execute(
+            "CREATE TABLE places(
+                id INT PRIMARY KEY,
+                name TEXT,
+                geog GEOGRAPHY(POINT,4326)
+            )",
+        )
+        .expect("create places");
+        db.execute("CREATE INDEX places_geog_spatial ON places USING spatial (geog)")
+            .expect("create spatial index");
+        db.execute(
+            "INSERT INTO places VALUES
+                (1, 'austin', ST_GeogPoint(-97.7431, 30.2672)),
+                (2, 'dallas', ST_GeogPoint(-96.7970, 32.7767)),
+                (3, 'houston', ST_GeogPoint(-95.3698, 29.7604))",
+        )
+        .expect("insert places");
+
+        let nearby = db
+            .execute(
+                "SELECT id FROM places
+                 WHERE ST_DWithin(geog, ST_GeogPoint(-97.7431, 30.2672), 5000)
+                 ORDER BY id",
+            )
+            .expect("radius query");
+        assert_eq!(nearby.rows().len(), 1);
+        assert_eq!(nearby.rows()[0].values(), &[Value::Int64(1)]);
+
+        let accessors = db
+            .execute("SELECT ST_SRID(geog), ST_X(geog), ST_Y(geog) FROM places WHERE id = 1")
+            .expect("spatial accessors");
+        assert_eq!(accessors.rows()[0].values()[0], Value::Int64(4326));
+        assert!(
+            matches!(accessors.rows()[0].values()[1], Value::Float64(x) if (x + 97.7431).abs() < 1e-9)
+        );
+        assert!(
+            matches!(accessors.rows()[0].values()[2], Value::Float64(y) if (y - 30.2672).abs() < 1e-9)
+        );
+
+        let explain = db
+            .execute(
+                "EXPLAIN SELECT id FROM places
+                 WHERE ST_DWithin(geog, ST_GeogPoint(-97.7431, 30.2672), 5000)",
+            )
+            .expect("explain spatial filter");
+        assert!(explain
+            .explain_lines()
+            .iter()
+            .any(|line| line.contains("SpatialFilter")));
+
+        let knn = db
+            .execute(
+                "EXPLAIN SELECT id FROM places
+                 ORDER BY geog <-> ST_GeogPoint(-97.7431, 30.2672)
+                 LIMIT 1",
+            )
+            .expect("explain spatial knn");
+        assert!(knn
+            .explain_lines()
+            .iter()
+            .any(|line| line.contains("SpatialKnn")));
+    }
+
+    #[test]
+    fn spatial_geometry_polygons_predicates_and_measurements() {
+        let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
+        db.execute(
+            "CREATE TABLE regions(
+                id INT PRIMARY KEY,
+                area GEOMETRY(POLYGON,0)
+            )",
+        )
+        .expect("create regions");
+        db.execute("CREATE INDEX regions_area_spatial ON regions USING spatial (area)")
+            .expect("create spatial index");
+        db.execute(
+            "INSERT INTO regions VALUES
+             (1, ST_GeomFromText('POLYGON((0 0,10 0,10 10,0 10,0 0))'))",
+        )
+        .expect("insert polygon");
+
+        let result = db
+            .execute(
+                "SELECT
+                    ST_Contains(area, ST_GeomFromText('POINT(2 2)')),
+                    ST_Within(ST_GeomFromText('POINT(2 2)'), area),
+                    ST_Intersects(area, ST_GeomFromText('POINT(12 12)')),
+                    ST_Area(area)
+                 FROM regions
+                 WHERE ST_Intersects(area, ST_GeomFromText('POINT(2 2)'))",
+            )
+            .expect("polygon predicates");
+        assert_eq!(result.rows().len(), 1);
+        assert_eq!(result.rows()[0].values()[0], Value::Bool(true));
+        assert_eq!(result.rows()[0].values()[1], Value::Bool(true));
+        assert_eq!(result.rows()[0].values()[2], Value::Bool(false));
+        assert!(
+            matches!(result.rows()[0].values()[3], Value::Float64(area) if (area - 100.0).abs() < 1e-9)
+        );
+    }
+
+    #[test]
+    fn spatial_geometry_point_in_polygon_join_uses_spatial_index() {
+        let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
+        db.execute(
+            "CREATE TABLE houses(
+                id INT PRIMARY KEY,
+                location GEOMETRY(POINT,0)
+            )",
+        )
+        .expect("create houses");
+        db.execute(
+            "CREATE TABLE zones(
+                id INT PRIMARY KEY,
+                boundary GEOMETRY(POLYGON,0)
+            )",
+        )
+        .expect("create zones");
+        db.execute("CREATE INDEX zones_boundary_spatial ON zones USING spatial(boundary)")
+            .expect("create spatial index");
+        db.execute(
+            "INSERT INTO houses VALUES
+                (1, ST_GeomFromText('POINT(2 2)')),
+                (2, ST_GeomFromText('POINT(12 12)')),
+                (3, ST_GeomFromText('POINT(22 22)'))",
+        )
+        .expect("insert houses");
+        db.execute(
+            "INSERT INTO zones VALUES
+                (10, ST_GeomFromText('POLYGON((0 0,10 0,10 10,0 10,0 0))')),
+                (20, ST_GeomFromText('POLYGON((10 10,20 10,20 20,10 20,10 10))'))",
+        )
+        .expect("insert zones");
+
+        let result = db
+            .execute(
+                "SELECT h.id, z.id
+                 FROM houses h JOIN zones z
+                   ON ST_Contains(z.boundary, h.location)",
+            )
+            .expect("spatial join");
+        assert_eq!(result.rows().len(), 2);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[Value::Int64(1), Value::Int64(10)]
+        );
+        assert_eq!(
+            result.rows()[1].values(),
+            &[Value::Int64(2), Value::Int64(20)]
+        );
+
+        let explain = db
+            .execute(
+                "EXPLAIN SELECT h.id, z.id
+                 FROM houses h JOIN zones z
+                   ON ST_Contains(z.boundary, h.location)",
+            )
+            .expect("explain spatial join");
+        assert!(explain
+            .explain_lines()
+            .iter()
+            .any(|line| line.contains("SpatialJoin")));
+    }
+
+    #[test]
+    fn spatial_schema_values_and_indexes_persist_after_reopen() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("spatial.ddb");
+        let path = path.to_string_lossy().to_string();
+        {
+            let db = Db::open_or_create(&path, DbConfig::default()).expect("open db");
+            db.execute(
+                "CREATE TABLE places(
+                    id INT PRIMARY KEY,
+                    geog GEOGRAPHY(POINT,4326)
+                )",
+            )
+            .expect("create places");
+            db.execute("CREATE INDEX idx_places_geog ON places USING spatial(geog)")
+                .expect("create spatial index");
+            db.execute("INSERT INTO places VALUES (1, ST_GeogPoint(-97.7431, 30.2672))")
+                .expect("insert place");
+        }
+
+        let db = Db::open_or_create(&path, DbConfig::default()).expect("reopen db");
+        let result = db
+            .execute(
+                "SELECT ST_SRID(geog), ST_DWithin(geog, ST_GeogPoint(-97.7431, 30.2672), 1)
+                 FROM places",
+            )
+            .expect("query reopened spatial data");
+        assert_eq!(result.rows().len(), 1);
+        assert_eq!(result.rows()[0].values()[0], Value::Int64(4326));
+        assert_eq!(result.rows()[0].values()[1], Value::Bool(true));
+
+        let indexes = db.list_indexes().expect("list indexes");
+        assert!(indexes
+            .iter()
+            .any(|index| index.name == "idx_places_geog" && index.kind == "spatial"));
     }
 
     #[test]
@@ -16796,6 +22138,187 @@ mod tests {
             .map(|trigger| trigger.name.clone())
             .collect::<Vec<_>>();
         assert_sorted_names(&trigger_names);
+    }
+
+    #[test]
+    fn tooling_metadata_fingerprint_ignores_row_counts_and_captures_spatial_types() {
+        let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
+        db.execute(
+            "CREATE TABLE sites (
+                id INT PRIMARY KEY,
+                name TEXT NOT NULL,
+                location GEOGRAPHY(POINT,4326),
+                boundary GEOMETRY(POLYGON,0)
+            )",
+        )
+        .expect("create sites");
+
+        let metadata = db.get_tooling_metadata().expect("tooling metadata");
+        assert_eq!(metadata.metadata_version, 1);
+        assert_eq!(
+            metadata.schema_fingerprint_algorithm,
+            "sha256:decentdb-tooling-schema-v1"
+        );
+        assert_eq!(metadata.schema_fingerprint.len(), 64);
+        assert!(metadata.capabilities.query_describe);
+        assert!(metadata.capabilities.deterministic_json);
+
+        let location_type = metadata
+            .column_type_metadata
+            .iter()
+            .find(|column| column.table_name == "sites" && column.column_name == "location")
+            .expect("location type metadata");
+        assert_eq!(location_type.column_type, "GEOGRAPHY");
+        assert_eq!(location_type.type_info.value_kind, "geography_ewkb");
+        assert_eq!(location_type.type_info.c_value_tag, 10);
+        let spatial = location_type
+            .type_info
+            .spatial
+            .as_ref()
+            .expect("location spatial metadata");
+        assert_eq!(spatial.subtype, "POINT");
+        assert_eq!(spatial.dimensions, "XY");
+        assert_eq!(spatial.srid, 4326);
+        let name_type = metadata
+            .column_type_metadata
+            .iter()
+            .find(|column| column.table_name == "sites" && column.column_name == "name")
+            .expect("name type metadata");
+        assert_eq!(name_type.type_info.c_value_tag, 4);
+
+        db.execute(
+            "INSERT INTO sites (id, name, location)
+             VALUES (1, 'austin', ST_GeogPoint(-97.7431, 30.2672))",
+        )
+        .expect("insert site");
+        let after_insert = db.get_tooling_metadata().expect("metadata after insert");
+        assert_eq!(
+            metadata.schema_fingerprint, after_insert.schema_fingerprint,
+            "data-only row-count changes must not alter the tooling schema fingerprint"
+        );
+
+        db.execute("CREATE INDEX sites_name_idx ON sites(name)")
+            .expect("create index");
+        let after_index = db.get_tooling_metadata().expect("metadata after index");
+        assert_ne!(
+            metadata.schema_fingerprint, after_index.schema_fingerprint,
+            "schema/index changes must alter the tooling schema fingerprint"
+        );
+    }
+
+    #[test]
+    fn describe_query_contract_infers_select_parameters_and_result_columns() {
+        let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
+        db.execute(
+            "CREATE TABLE users (
+                id INT64 PRIMARY KEY,
+                email TEXT NOT NULL,
+                location GEOGRAPHY(POINT,4326)
+            )",
+        )
+        .expect("create users");
+
+        let contract = db
+            .describe_query_contract(
+                "SELECT id, email, ST_DWithin(location, $1, $2) AS nearby
+                 FROM users
+                 WHERE id = $3 AND email ILIKE $4",
+            )
+            .expect("describe select");
+        assert_eq!(contract.contract_version, 1);
+        assert_eq!(contract.statement_kind, "query");
+        assert!(contract.read_only);
+        assert_eq!(contract.parameters.len(), 4);
+        assert_eq!(contract.parameters[0].name, "$1");
+        assert_eq!(
+            contract.parameters[0].type_name.as_deref(),
+            Some("GEOGRAPHY")
+        );
+        assert_eq!(contract.parameters[1].name, "$2");
+        assert_eq!(contract.parameters[1].type_name.as_deref(), Some("FLOAT64"));
+        assert_eq!(contract.parameters[2].name, "$3");
+        assert_eq!(contract.parameters[2].type_name.as_deref(), Some("INT64"));
+        assert_eq!(
+            contract.parameters[2].source_table.as_deref(),
+            Some("users")
+        );
+        assert_eq!(contract.parameters[2].source_column.as_deref(), Some("id"));
+        assert_eq!(contract.parameters[3].name, "$4");
+        assert_eq!(contract.parameters[3].type_name.as_deref(), Some("TEXT"));
+
+        assert_eq!(contract.result_columns.len(), 3);
+        assert_eq!(contract.result_columns[0].name, "id");
+        assert_eq!(
+            contract.result_columns[0].type_name.as_deref(),
+            Some("INT64")
+        );
+        assert_eq!(contract.result_columns[0].nullable, Some(false));
+        assert_eq!(
+            contract.result_columns[0].source_table.as_deref(),
+            Some("users")
+        );
+        assert_eq!(
+            contract.result_columns[0].source_column.as_deref(),
+            Some("id")
+        );
+        assert_eq!(contract.result_columns[1].name, "email");
+        assert_eq!(
+            contract.result_columns[1].type_name.as_deref(),
+            Some("TEXT")
+        );
+        assert_eq!(contract.result_columns[1].nullable, Some(false));
+        assert_eq!(contract.result_columns[2].name, "nearby");
+        assert_eq!(
+            contract.result_columns[2].type_name.as_deref(),
+            Some("BOOL")
+        );
+    }
+
+    #[test]
+    fn describe_query_contract_infers_insert_returning_contracts() {
+        let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
+        db.execute(
+            "CREATE TABLE users (
+                id INT64 PRIMARY KEY,
+                email TEXT NOT NULL
+            )",
+        )
+        .expect("create users");
+
+        let contract = db
+            .describe_query_contract(
+                "INSERT INTO users (id, email) VALUES ($1, $2) RETURNING id, email",
+            )
+            .expect("describe insert returning");
+        assert_eq!(contract.statement_kind, "insert");
+        assert!(!contract.read_only);
+        assert_eq!(contract.parameters.len(), 2);
+        assert_eq!(contract.parameters[0].type_name.as_deref(), Some("INT64"));
+        assert_eq!(
+            contract.parameters[0].source_table.as_deref(),
+            Some("users")
+        );
+        assert_eq!(contract.parameters[0].source_column.as_deref(), Some("id"));
+        assert_eq!(contract.parameters[1].type_name.as_deref(), Some("TEXT"));
+        assert_eq!(
+            contract.parameters[1].source_table.as_deref(),
+            Some("users")
+        );
+        assert_eq!(
+            contract.parameters[1].source_column.as_deref(),
+            Some("email")
+        );
+        assert_eq!(contract.result_columns.len(), 2);
+        assert_eq!(contract.result_columns[0].name, "id");
+        assert_eq!(
+            contract.result_columns[0].type_name.as_deref(),
+            Some("INT64")
+        );
+        assert_eq!(contract.result_columns[1].name, "email");
+        assert_eq!(
+            contract.result_columns[1].type_name.as_deref(),
+            Some("TEXT")
+        );
     }
 
     #[test]

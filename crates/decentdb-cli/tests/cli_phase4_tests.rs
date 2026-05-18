@@ -32,6 +32,17 @@ fn run(args: &[&str]) -> String {
     String::from_utf8(output.stdout).expect("utf8 stdout")
 }
 
+fn run_result(args: &[&str]) -> (i32, String, String) {
+    let output = Command::new(bin())
+        .args(args)
+        .output()
+        .expect("run command");
+    let code = output.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+    (code, stdout, stderr)
+}
+
 #[test]
 fn exec_and_schema_introspection_commands_work() {
     let dir = temp_dir();
@@ -111,6 +122,386 @@ fn exec_and_schema_introspection_commands_work() {
 
     let checkpoint = run(&["checkpoint", "--db", &db_str]);
     assert!(checkpoint.contains("checkpoint complete"));
+}
+
+#[test]
+fn checkpoint_command_flushes_wal_and_preserves_data_without_wal_file() {
+    let dir = temp_dir();
+    let db = dir.join("checkpoint.ddb");
+    let db_str = db.display().to_string();
+
+    let result = run(&[
+        "exec",
+        "--db",
+        &db_str,
+        "--sql",
+        "CREATE TABLE t (id INT64 PRIMARY KEY, value TEXT); \
+         INSERT INTO t (id, value) VALUES (1, 'before'); \
+         UPDATE t SET value = 'after' WHERE id = 1;",
+        "--format",
+        "json",
+    ]);
+    assert!(result.contains("\"ok\":true"));
+
+    let wal = db.with_extension("ddb.wal");
+    let wal_size_before = fs::metadata(&wal)
+        .expect("stat WAL before checkpoint")
+        .len();
+    assert!(
+        wal_size_before > 32,
+        "test setup should leave committed frames in the WAL"
+    );
+
+    let checkpoint = run(&["checkpoint", "--db", &db_str]);
+    assert!(checkpoint.contains("checkpoint complete"));
+    assert_eq!(
+        fs::metadata(&wal).expect("stat WAL after checkpoint").len(),
+        32,
+        "checkpoint should truncate WAL to its header when no readers are active"
+    );
+
+    fs::remove_file(&wal).expect("remove checkpointed WAL");
+    let selected = run(&[
+        "exec",
+        "--db",
+        &db_str,
+        "--sql",
+        "SELECT value FROM t WHERE id = 1;",
+        "--format",
+        "json",
+    ]);
+    assert!(selected.contains("\"rows\":[[\"after\"]]"));
+}
+
+#[test]
+fn snapshot_commands_and_exec_as_of_work() {
+    let dir = temp_dir();
+    let db = dir.join("snapshots.ddb");
+    let db_str = db.display().to_string();
+
+    run(&[
+        "exec",
+        "--db",
+        &db_str,
+        "--sql",
+        "CREATE TABLE items (id INT64 PRIMARY KEY, name TEXT); \
+         INSERT INTO items (id, name) VALUES (1, 'before');",
+        "--format",
+        "json",
+    ]);
+
+    let created = run(&[
+        "snapshot",
+        "create",
+        "--db",
+        &db_str,
+        "--name",
+        "before-update",
+        "--format",
+        "json",
+    ]);
+    assert!(created.contains("before-update"));
+    assert!(created.contains("snapshot_lsn"));
+
+    run(&[
+        "exec",
+        "--db",
+        &db_str,
+        "--sql",
+        "UPDATE items SET name = 'after' WHERE id = 1;",
+        "--format",
+        "json",
+    ]);
+
+    let historical = run(&[
+        "exec",
+        "--db",
+        &db_str,
+        "--sql",
+        "SELECT name FROM items WHERE id = 1;",
+        "--as-of",
+        "before-update",
+        "--format",
+        "json",
+    ]);
+    assert!(
+        historical.contains("\"rows\":[[\"before\"]]"),
+        "historical output: {historical}"
+    );
+
+    let latest = run(&[
+        "exec",
+        "--db",
+        &db_str,
+        "--sql",
+        "SELECT name FROM items WHERE id = 1;",
+        "--format",
+        "json",
+    ]);
+    assert!(latest.contains("\"rows\":[[\"after\"]]"));
+
+    let listed = run(&["snapshot", "list", "--db", &db_str, "--format", "table"]);
+    assert!(listed.contains("before-update"));
+
+    let deleted = run(&[
+        "snapshot",
+        "delete",
+        "--db",
+        &db_str,
+        "--name",
+        "before-update",
+        "--format",
+        "json",
+    ]);
+    assert!(deleted.contains("before-update"));
+    assert!(deleted.contains("true"));
+}
+
+#[test]
+fn branch_commands_and_exec_branch_work() {
+    let dir = temp_dir();
+    let db = dir.join("branches.ddb");
+    let db_str = db.display().to_string();
+
+    run(&[
+        "exec",
+        "--db",
+        &db_str,
+        "--sql",
+        "CREATE TABLE items (id INT64 PRIMARY KEY, name TEXT); \
+         INSERT INTO items (id, name) VALUES (1, 'before');",
+        "--format",
+        "json",
+    ]);
+
+    let created = run(&[
+        "branch", "create", "--db", &db_str, "--name", "work", "--format", "json",
+    ]);
+    assert!(created.contains("work"));
+    assert!(created.contains("current_head_id"));
+
+    run(&[
+        "exec",
+        "--db",
+        &db_str,
+        "--sql",
+        "UPDATE items SET name = 'after' WHERE id = 1;",
+        "--format",
+        "json",
+    ]);
+
+    let branch_read = run(&[
+        "exec",
+        "--db",
+        &db_str,
+        "--branch",
+        "work",
+        "--sql",
+        "SELECT name FROM items WHERE id = 1;",
+        "--format",
+        "json",
+    ]);
+    assert!(branch_read.contains("\"rows\":[[\"before\"]]"));
+
+    run(&[
+        "exec",
+        "--db",
+        &db_str,
+        "--branch",
+        "work",
+        "--sql",
+        "UPDATE items SET name = 'branch' WHERE id = 1;",
+        "--format",
+        "json",
+    ]);
+    let branch_after_write = run(&[
+        "exec",
+        "--db",
+        &db_str,
+        "--branch",
+        "work",
+        "--sql",
+        "SELECT name FROM items WHERE id = 1;",
+        "--format",
+        "json",
+    ]);
+    assert!(branch_after_write.contains("\"rows\":[[\"branch\"]]"));
+    let main_after_branch_write = run(&[
+        "exec",
+        "--db",
+        &db_str,
+        "--sql",
+        "SELECT name FROM items WHERE id = 1;",
+        "--format",
+        "json",
+    ]);
+    assert!(main_after_branch_write.contains("\"rows\":[[\"after\"]]"));
+
+    let committed = run(&[
+        "branch",
+        "commit",
+        "--db",
+        &db_str,
+        "--name",
+        "work",
+        "--message",
+        "reviewed branch change",
+        "--format",
+        "json",
+    ]);
+    assert!(committed.contains("reviewed branch change"));
+    let log = run(&[
+        "branch", "log", "--db", &db_str, "--name", "work", "--format", "json",
+    ]);
+    assert!(log.contains("reviewed branch change"));
+    assert!(log.contains("UPDATE items SET name = 'branch' WHERE id = 1"));
+
+    let diff = run(&[
+        "branch", "diff", "--db", &db_str, "--left", "main", "--right", "work", "--format", "json",
+    ]);
+    assert!(diff.contains("\"changed_table_count\": 1"));
+    assert!(diff.contains("\"updated_row_count\": 1"));
+    assert!(diff.contains("\"table\": \"items\""));
+
+    run(&[
+        "snapshot",
+        "create",
+        "--db",
+        &db_str,
+        "--name",
+        "main-after-update",
+        "--format",
+        "json",
+    ]);
+    let restore_dry_run = run(&[
+        "branch",
+        "restore",
+        "--db",
+        &db_str,
+        "--name",
+        "work",
+        "--to",
+        "main-after-update",
+        "--dry-run",
+        "--format",
+        "json",
+    ]);
+    assert!(restore_dry_run.contains("\"dry_run\": true"));
+    assert!(restore_dry_run.contains("\"updated_row_count\": 1"));
+    let restored = run(&[
+        "branch",
+        "restore",
+        "--db",
+        &db_str,
+        "--name",
+        "work",
+        "--to",
+        "main-after-update",
+        "--confirm",
+        "--format",
+        "json",
+    ]);
+    assert!(restored.contains("\"dry_run\": false"));
+    let branch_after_restore = run(&[
+        "exec",
+        "--db",
+        &db_str,
+        "--branch",
+        "work",
+        "--sql",
+        "SELECT name FROM items WHERE id = 1;",
+        "--format",
+        "json",
+    ]);
+    assert!(branch_after_restore.contains("\"rows\":[[\"after\"]]"));
+
+    run(&[
+        "branch",
+        "create",
+        "--db",
+        &db_str,
+        "--name",
+        "mergework",
+        "--from",
+        "main-after-update",
+        "--format",
+        "json",
+    ]);
+    run(&[
+        "exec",
+        "--db",
+        &db_str,
+        "--branch",
+        "mergework",
+        "--sql",
+        "UPDATE items SET name = 'merged' WHERE id = 1;",
+        "--format",
+        "json",
+    ]);
+    let merge_dry_run = run(&[
+        "branch",
+        "merge",
+        "--db",
+        &db_str,
+        "--source",
+        "mergework",
+        "--target",
+        "main",
+        "--dry-run",
+        "--format",
+        "json",
+    ]);
+    assert!(merge_dry_run.contains("\"clean\": true"));
+    assert!(merge_dry_run.contains("\"conflict_count\": 0"));
+    let merged = run(&[
+        "branch",
+        "merge",
+        "--db",
+        &db_str,
+        "--source",
+        "mergework",
+        "--target",
+        "main",
+        "--confirm",
+        "--format",
+        "json",
+    ]);
+    assert!(merged.contains("\"applied_change_count\": 1"));
+    let main_after_merge = run(&[
+        "exec",
+        "--db",
+        &db_str,
+        "--sql",
+        "SELECT name FROM items WHERE id = 1;",
+        "--format",
+        "json",
+    ]);
+    assert!(main_after_merge.contains("\"rows\":[[\"merged\"]]"));
+
+    let listed = run(&["branch", "list", "--db", &db_str, "--format", "table"]);
+    assert!(listed.contains("main"));
+    assert!(listed.contains("work"));
+
+    let renamed = run(&[
+        "branch",
+        "rename",
+        "--db",
+        &db_str,
+        "--name",
+        "work",
+        "--new-name",
+        "review",
+        "--format",
+        "json",
+    ]);
+    assert!(renamed.contains("review"));
+    assert!(renamed.contains("true"));
+
+    let deleted = run(&[
+        "branch", "delete", "--db", &db_str, "--name", "review", "--format", "json",
+    ]);
+    assert!(deleted.contains("review"));
+    assert!(deleted.contains("true"));
 }
 
 #[test]
@@ -278,6 +669,245 @@ fn completion_and_repl_smoke_work() {
     let stdout = String::from_utf8(output.stdout).expect("stdout");
     assert!(stdout.contains("id | name"));
     assert!(stdout.contains("1  | Ada"));
+}
+
+#[test]
+fn sync_export_import_and_doctor_commands_work() {
+    let dir = temp_dir();
+    let source = dir.join("sync_source.ddb");
+    let target = dir.join("sync_target.ddb");
+    let export = dir.join("sync_export.jsonl");
+    let source_str = source.display().to_string();
+    let target_str = target.display().to_string();
+    let export_str = export.display().to_string();
+
+    run(&[
+        "exec",
+        "--db",
+        &source_str,
+        "--sql",
+        "CREATE TABLE users (id INT64 PRIMARY KEY, name TEXT)",
+    ]);
+    run(&[
+        "sync",
+        "init",
+        "--db",
+        &source_str,
+        "--replica-id",
+        "node-a",
+    ]);
+    run(&[
+        "exec",
+        "--db",
+        &source_str,
+        "--sql",
+        "INSERT INTO users (id, name) VALUES (1, 'Ada'); \
+         UPDATE users SET name = 'Ada Lovelace' WHERE id = 1; \
+         INSERT INTO users (id, name) VALUES (2, 'Grace');",
+    ]);
+
+    let doctor = run(&["sync", "doctor", "--db", &source_str, "--format", "json"]);
+    assert!(doctor.contains("\"total_records\": 3"));
+    assert!(doctor.contains("\"issues\": []"));
+
+    run(&[
+        "sync",
+        "export",
+        "--db",
+        &source_str,
+        "--since",
+        "0",
+        "--output",
+        &export_str,
+    ]);
+    let exported = fs::read_to_string(&export).expect("read sync export");
+    let exported_json: serde_json::Value =
+        serde_json::from_str(&exported).expect("parse sync export batch");
+    assert_eq!(exported_json["protocol_version"], serde_json::json!(1));
+    assert_eq!(
+        exported_json["batch_id"],
+        serde_json::json!("sync-batch:v1:node-a:1:3:3")
+    );
+    assert_eq!(exported_json["record_count"], serde_json::json!(3));
+    assert_eq!(
+        exported_json["source_replica_id"],
+        serde_json::json!("node-a")
+    );
+    assert_eq!(exported_json["records"].as_array().unwrap().len(), 3);
+
+    run(&[
+        "exec",
+        "--db",
+        &target_str,
+        "--sql",
+        "CREATE TABLE users (id INT64 PRIMARY KEY, name TEXT)",
+    ]);
+    run(&[
+        "sync",
+        "init",
+        "--db",
+        &target_str,
+        "--replica-id",
+        "node-b",
+    ]);
+
+    let imported = run(&[
+        "sync",
+        "import",
+        "--db",
+        &target_str,
+        "--input",
+        &export_str,
+    ]);
+    assert_eq!(
+        imported.trim(),
+        "seen=3, applied=3, skipped=0, conflicted=0"
+    );
+
+    let selected = run(&[
+        "exec",
+        "--db",
+        &target_str,
+        "--sql",
+        "SELECT id, name FROM users ORDER BY id",
+        "--format",
+        "json",
+    ]);
+    assert!(selected.contains("\"rows\":[[\"1\",\"Ada Lovelace\"],[\"2\",\"Grace\"]]"));
+
+    let reimported = run(&[
+        "sync",
+        "import",
+        "--db",
+        &target_str,
+        "--input",
+        &export_str,
+    ]);
+    assert_eq!(
+        reimported.trim(),
+        "seen=3, applied=0, skipped=3, conflicted=0"
+    );
+
+    let pending = run(&["sync", "pending", "--db", &target_str, "--format", "json"]);
+    assert_eq!(pending.trim(), "[]");
+}
+
+#[test]
+fn sync_import_rejects_malformed_jsonl() {
+    let dir = temp_dir();
+    let db = dir.join("sync_import.ddb");
+    let db_str = db.display().to_string();
+
+    run(&[
+        "exec",
+        "--db",
+        &db_str,
+        "--sql",
+        "CREATE TABLE users (id INT64 PRIMARY KEY, name TEXT)",
+    ]);
+    run(&["sync", "init", "--db", &db_str, "--replica-id", "node-a"]);
+
+    let bad = dir.join("malformed.jsonl");
+    fs::write(&bad, "{ \"schema_version\": 1").expect("write malformed payload");
+
+    let (code, _stdout, stderr) = run_result(&[
+        "sync",
+        "import",
+        "--db",
+        &db_str,
+        "--input",
+        &bad.display().to_string(),
+    ]);
+    assert_ne!(code, 0);
+    assert!(stderr.contains("malformed sync batch"));
+}
+
+#[test]
+fn sync_conflicts_command_displays_json_and_table() {
+    let dir = temp_dir();
+    let source = dir.join("sync_conflict_source.ddb");
+    let target = dir.join("sync_conflict_target.ddb");
+    let source_str = source.display().to_string();
+    let target_str = target.display().to_string();
+
+    run(&[
+        "exec",
+        "--db",
+        &source_str,
+        "--sql",
+        "CREATE TABLE users (id INT64 PRIMARY KEY, name TEXT)",
+        "--format",
+        "json",
+    ]);
+    run(&[
+        "sync",
+        "init",
+        "--db",
+        &source_str,
+        "--replica-id",
+        "node-a",
+    ]);
+    run(&[
+        "exec",
+        "--db",
+        &source_str,
+        "--sql",
+        "INSERT INTO users VALUES (1, 'Ada')",
+        "--format",
+        "json",
+    ]);
+    run(&[
+        "exec",
+        "--db",
+        &target_str,
+        "--sql",
+        "CREATE TABLE users (id INT64 PRIMARY KEY, name TEXT); \
+         INSERT INTO users VALUES (1, 'Existing')",
+        "--format",
+        "json",
+    ]);
+    run(&[
+        "sync",
+        "init",
+        "--db",
+        &target_str,
+        "--replica-id",
+        "node-b",
+    ]);
+
+    let export = dir.join("conflict_export.json");
+    run(&[
+        "sync",
+        "export",
+        "--db",
+        &source_str,
+        "--since",
+        "0",
+        "--output",
+        &export.display().to_string(),
+    ]);
+    run(&[
+        "sync",
+        "import",
+        "--db",
+        &target_str,
+        "--input",
+        &export.display().to_string(),
+    ]);
+
+    let conflicts_json = run(&["sync", "conflicts", "--db", &target_str, "--format", "json"]);
+    assert!(conflicts_json.contains("\"conflict_type\": \"insert_insert\""));
+    assert!(conflicts_json.contains("\"batch_id\": \"sync-batch:v1:node-a:1:1:1\""));
+
+    let conflicts_table = run(&[
+        "sync",
+        "conflicts",
+        "--db",
+        &target_str,
+        "--format",
+        "table",
+    ]);
+    assert!(conflicts_table.contains("insert_insert"));
 }
 
 #[test]

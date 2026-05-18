@@ -3,6 +3,10 @@
 This directory includes the in-tree JDBC driver (`bindings/java/driver`) and
 native/JNI support.
 
+The JDBC driver exposes native `DATE`, `TIME`, and `TIMESTAMPTZ` values through
+standard JDBC temporal getters, and semantic `ENUM`, `IPADDR`, `CIDR`,
+`INTERVAL`, and `MACADDR` values as canonical strings.
+
 ## Standalone example
 
 From this directory:

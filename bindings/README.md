@@ -47,6 +47,10 @@ The following package trees live under `bindings/`:
 - `bindings/node/`: low-level `decentdb/` package and `knex-decentdb/`
 - `bindings/dart/`: Dart package, native glue, scripts, and examples
 
+All in-tree bindings consume the C ABI's semantic value tags for `ENUM`,
+`IPADDR`, `CIDR`, `DATE`, `TIME`, `TIMESTAMPTZ`, `INTERVAL`, and `MACADDR`;
+language-specific result shapes are documented in `docs/api/bindings-matrix.md`.
+
 Benchmark entry points:
 
 - Go: `go run ./benchmarks/bench_fetch/main.go` (from `bindings/go/decentdb-go`)

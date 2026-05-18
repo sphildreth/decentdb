@@ -209,7 +209,7 @@ UPDATE accounts SET balance = balance + 100 WHERE id = 2;
 
 Notes for the CLI:
 - `decentdb exec --sql` may contain multiple statements separated by `;` and they run on a single connection.
-- All statements are **parsed/bound up front** against the schema at the start of the call. That means `CREATE TABLE ...; INSERT INTO that_table ...;` in the same `--sql` will fail with “table not found”. Run schema changes as separate `exec` calls or use `decentdb repl`.
+- All statements are **parsed/bound up front** against the schema at the start of the call. That means `CREATE TABLE ...; INSERT INTO that_table ...;` in the same `--sql` will fail with “table not found”. Run schema changes as separate `exec` calls or use [`decentdb repl`](repl.md).
 
 ```bash
 # Assuming users table already exists:

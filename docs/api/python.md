@@ -21,10 +21,11 @@ bindings/python/tests/
 
 ## C ABI coverage
 
-The Python binding declares and exposes **all 50 C ABI functions** defined in
-`include/decentdb.h`. Performance-critical paths (batch execution, fused
-bind+step, re-execute, zero-copy row views) are accelerated by the
-`_fastdecode.c` C extension when available, falling back to ctypes otherwise.
+The Python binding declares the C ABI functions used by the packaged DB-API,
+metadata, maintenance, and fast-path surfaces. Performance-critical paths
+(batch execution, fused bind+step, re-execute, zero-copy row views) are
+accelerated by the `_fastdecode.c` C extension when available, falling back to
+ctypes otherwise.
 
 ## Use the packaged Python binding
 
@@ -126,14 +127,40 @@ view_ddl = conn.get_view_ddl("v_active_users")
 
 # Triggers
 triggers = conn.list_triggers()           # [...]
+
+# Stable tooling metadata
+metadata = conn.get_tooling_metadata()
+contract = conn.describe_query_contract(
+    "SELECT id, name FROM users WHERE id = $1"
+)
 ```
 
 ## Version introspection
 
 ```python
-abi = decentdb.abi_version()        # e.g. 1
+abi = decentdb.abi_version()        # e.g. 2
 ver = decentdb.engine_version()     # e.g. "2.0.0"
 ```
+
+## Native Result Types
+
+The DB-API layer decodes semantic column values from the C ABI into Python
+domain objects:
+
+| DecentDB type | Python result value |
+|---------------|---------------------|
+| `ENUM` | `decentdb.EnumValue(type_id, label_id)` |
+| `IPADDR` / `INET` | `ipaddress.IPv4Address` or `ipaddress.IPv6Address` |
+| `CIDR` | `ipaddress.IPv4Network` or `ipaddress.IPv6Network` |
+| `DATE` | `datetime.date` |
+| `TIME` | `datetime.time` |
+| `TIMESTAMPTZ` | timezone-aware `datetime.datetime` in UTC |
+| `INTERVAL` | `decentdb.IntervalValue(months, days, micros)` |
+| `MACADDR` / `MACADDR8` | canonical lowercase `str` |
+
+String parameters can be used for semantic columns when the target column type
+is known from SQL, such as inserting `'2001:db8::/32'` into `CIDR` or `'paid'`
+into an inline enum column.
 
 ## Maintenance
 
@@ -182,9 +209,10 @@ with Session(engine) as session:
 | `String`/`Text` | `TEXT` | |
 | `Numeric` | `DECIMAL` | Preserves precision/scale |
 | `LargeBinary` | `BLOB` | |
-| `Date` | `TIMESTAMP` | Stored as microsecond epoch |
-| `DateTime` | `TIMESTAMP` | Microsecond precision, UTC |
-| `Time` | `TIMESTAMP` | Stored as microsecond-of-day |
+| `Date` | `DATE` | Stored as day count |
+| `DateTime` | `TIMESTAMP` | Microsecond precision |
+| `DateTime(timezone=True)` | `TIMESTAMPTZ` | Normalized to UTC |
+| `Time` | `TIME` | Stored as microsecond-of-day |
 | `Uuid` | `UUID` | Native 128-bit UUID |
 
 ## Work on the package locally

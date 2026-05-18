@@ -1,5 +1,6 @@
 using System.Data;
 using System.Linq;
+using System.Text.Json;
 using DecentDB.AdoNet;
 using Xunit;
 
@@ -111,6 +112,40 @@ public sealed class SchemaIntrospectionTests : IDisposable
         Assert.Contains("ddl_table", ddl);
         Assert.Contains("id", ddl);
         Assert.Contains("name", ddl);
+    }
+
+    [Fact]
+    public void ToolingMetadataAndQueryContract_ReturnStableJson()
+    {
+        using var conn = OpenConnection();
+        Execute(conn, "CREATE TABLE contract_users (id INT64 PRIMARY KEY, email TEXT NOT NULL)");
+
+        using var metadata = JsonDocument.Parse(conn.GetToolingMetadataJson());
+        Assert.Equal(1, metadata.RootElement.GetProperty("metadata_version").GetInt32());
+        Assert.Equal(
+            "sha256:decentdb-tooling-schema-v1",
+            metadata.RootElement.GetProperty("schema_fingerprint_algorithm").GetString());
+        var fingerprint = metadata.RootElement.GetProperty("schema_fingerprint").GetString();
+        Assert.Equal(64, fingerprint?.Length);
+
+        using var contract = JsonDocument.Parse(
+            conn.DescribeQueryJson("SELECT id, email FROM contract_users WHERE id = $1"));
+        Assert.Equal(1, contract.RootElement.GetProperty("contract_version").GetInt32());
+        Assert.Equal("query", contract.RootElement.GetProperty("statement_kind").GetString());
+        Assert.True(contract.RootElement.GetProperty("read_only").GetBoolean());
+        Assert.Equal(fingerprint, contract.RootElement.GetProperty("schema_fingerprint").GetString());
+        Assert.Equal(
+            "INT64",
+            contract.RootElement.GetProperty("parameters")[0].GetProperty("type_name").GetString());
+        Assert.Equal(
+            "id",
+            contract.RootElement.GetProperty("parameters")[0].GetProperty("source_column").GetString());
+        Assert.Equal(
+            "email",
+            contract.RootElement.GetProperty("result_columns")[1].GetProperty("name").GetString());
+        Assert.Equal(
+            "TEXT",
+            contract.RootElement.GetProperty("result_columns")[1].GetProperty("type_name").GetString());
     }
 
     [Fact]

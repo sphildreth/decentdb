@@ -45,8 +45,193 @@ enum {
   DECENTDB_KIND_TEXT = DDB_VALUE_TEXT,
   DECENTDB_KIND_BLOB = DDB_VALUE_BLOB,
   DECENTDB_KIND_DECIMAL = DDB_VALUE_DECIMAL,
-  DECENTDB_KIND_DATETIME = DDB_VALUE_TIMESTAMP_MICROS
+  DECENTDB_KIND_DATETIME = DDB_VALUE_TIMESTAMP_MICROS,
+  DECENTDB_KIND_GEOMETRY = DDB_VALUE_GEOMETRY,
+  DECENTDB_KIND_GEOGRAPHY = DDB_VALUE_GEOGRAPHY,
+  DECENTDB_KIND_ENUM = DDB_VALUE_ENUM,
+  DECENTDB_KIND_IPADDR = DDB_VALUE_IPADDR,
+  DECENTDB_KIND_CIDR = DDB_VALUE_CIDR,
+  DECENTDB_KIND_DATE = DDB_VALUE_DATE,
+  DECENTDB_KIND_TIME = DDB_VALUE_TIME,
+  DECENTDB_KIND_TIMESTAMPTZ = DDB_VALUE_TIMESTAMPTZ_MICROS,
+  DECENTDB_KIND_INTERVAL = DDB_VALUE_INTERVAL,
+  DECENTDB_KIND_MACADDR = DDB_VALUE_MACADDR
 };
+
+static void civil_from_days(int64_t days, int64_t* out_year, int64_t* out_month, int64_t* out_day) {
+  int64_t z = days + 719468;
+  int64_t era = z >= 0 ? z : z - 146096;
+  era /= 146097;
+  int64_t doe = z - era * 146097;
+  int64_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+  int64_t y = yoe + era * 400;
+  int64_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+  int64_t mp = (5 * doy + 2) / 153;
+  int64_t day = doy - (153 * mp + 2) / 5 + 1;
+  int64_t month = mp + (mp < 10 ? 3 : -9);
+  int64_t year = y + (month <= 2 ? 1 : 0);
+  *out_year = year;
+  *out_month = month;
+  *out_day = day;
+}
+
+static int format_year(int64_t year, char* out, size_t out_len) {
+  if (year >= 0 && year <= 9999) {
+    return snprintf(out, out_len, "%04lld", (long long)year) < 0 ? -1 : 0;
+  }
+  return snprintf(out, out_len, "%lld", (long long)year) < 0 ? -1 : 0;
+}
+
+static int format_date_days(int32_t days, char* out, size_t out_len) {
+  int64_t year = 0, month = 0, day = 0;
+  char year_buf[32];
+  civil_from_days((int64_t)days, &year, &month, &day);
+  if (format_year(year, year_buf, sizeof(year_buf)) != 0) return -1;
+  return snprintf(out, out_len, "%s-%02lld-%02lld", year_buf, (long long)month, (long long)day) < 0
+             ? -1
+             : 0;
+}
+
+static int format_time_of_day(int64_t micros, char* out, size_t out_len) {
+  int64_t hour = micros / 3600000000LL;
+  int64_t minute = (micros % 3600000000LL) / 60000000LL;
+  int64_t second = (micros % 60000000LL) / 1000000LL;
+  int64_t fraction = micros % 1000000LL;
+  return snprintf(
+             out,
+             out_len,
+             "%02lld:%02lld:%02lld.%06lld",
+             (long long)hour,
+             (long long)minute,
+             (long long)second,
+             (long long)fraction) < 0
+             ? -1
+             : 0;
+}
+
+static int format_time_micros(int64_t micros, char* out, size_t out_len) {
+  if (micros < 0 || micros >= 86400000000LL) return -1;
+  return format_time_of_day(micros, out, out_len);
+}
+
+static int format_timestamp_tz_micros(int64_t micros, char* out, size_t out_len) {
+  int64_t days = micros / 86400000000LL;
+  int64_t time = micros % 86400000000LL;
+  if (time < 0) {
+    time += 86400000000LL;
+    days -= 1;
+  }
+
+  char date_buf[32];
+  char time_buf[32];
+  if (format_date_days((int32_t)days, date_buf, sizeof(date_buf)) != 0) return -1;
+  if (format_time_of_day(time, time_buf, sizeof(time_buf)) != 0) return -1;
+  return snprintf(out, out_len, "%sT%sZ", date_buf, time_buf) < 0 ? -1 : 0;
+}
+
+static int format_interval(int32_t months, int32_t days, int64_t micros, char* out, size_t out_len) {
+  return snprintf(out, out_len, "%d %d %lld", months, days, (long long)micros) < 0 ? -1 : 0;
+}
+
+static int format_ipv6(const uint8_t addr[16], char* out, size_t out_len) {
+  uint16_t words[8];
+  for (size_t i = 0; i < 8; i++) {
+    words[i] = (uint16_t)((uint16_t)addr[i * 2] << 8) | (uint16_t)addr[i * 2 + 1];
+  }
+
+  int best_start = -1;
+  int best_len = 0;
+  for (int i = 0; i < 8;) {
+    if (words[i] == 0) {
+      int j = i;
+      while (j < 8 && words[j] == 0) j++;
+      int len = j - i;
+      if (len > best_len && len >= 2) {
+        best_start = i;
+        best_len = len;
+      }
+      i = j;
+    } else {
+      i++;
+    }
+  }
+
+  size_t pos = 0;
+  int need_sep = 0;
+  for (int i = 0; i < 8;) {
+    if (i == best_start) {
+      if (need_sep) {
+        if (pos + 1 >= out_len) return -1;
+        out[pos++] = ':';
+      }
+      if (pos + 1 >= out_len) return -1;
+      out[pos++] = ':';
+      need_sep = 0;
+      i += best_len;
+      if (i >= 8) break;
+      continue;
+    }
+
+    if (need_sep) {
+      if (pos + 1 >= out_len) return -1;
+      out[pos++] = ':';
+    }
+
+    int written = snprintf(out + pos, out_len - pos, "%x", words[i]);
+    if (written < 0 || (size_t)written >= out_len - pos) return -1;
+    pos += (size_t)written;
+    need_sep = 1;
+    i++;
+  }
+
+  if (pos >= out_len) return -1;
+  out[pos] = '\0';
+  return 0;
+}
+
+static int format_ip_addr(uint8_t family, const uint8_t addr[16], char* out, size_t out_len) {
+  if (family == 4) {
+    return snprintf(
+               out,
+               out_len,
+               "%u.%u.%u.%u",
+               addr[0],
+               addr[1],
+               addr[2],
+               addr[3]) < 0
+               ? -1
+               : 0;
+  }
+  if (family == 6) {
+    return format_ipv6(addr, out, out_len);
+  }
+  return -1;
+}
+
+static int format_cidr(uint8_t family, uint8_t prefix_len, const uint8_t addr[16], char* out, size_t out_len) {
+  char ip_buf[64];
+  if (format_ip_addr(family, addr, ip_buf, sizeof(ip_buf)) != 0) return -1;
+  return snprintf(out, out_len, "%s/%u", ip_buf, (unsigned)prefix_len) < 0 ? -1 : 0;
+}
+
+static int format_macaddr(uint8_t len, const uint8_t addr[16], char* out, size_t out_len) {
+  if (len != 6 && len != 8) return -1;
+  size_t needed = (size_t)len * 3;
+  if (out_len < needed) return -1;
+  size_t pos = 0;
+  for (uint8_t i = 0; i < len; i++) {
+    int written = snprintf(out + pos, out_len - pos, i == 0 ? "%02x" : ":%02x", addr[i]);
+    if (written < 0) return -1;
+    pos += (size_t)written;
+  }
+  return 0;
+}
+
+static int format_enum(uint64_t type_id, uint64_t label_id, char* out, size_t out_len) {
+  return snprintf(out, out_len, "%llu:%llu", (unsigned long long)type_id, (unsigned long long)label_id) < 0
+             ? -1
+             : 0;
+}
 
 typedef struct {
   napi_async_work work;
@@ -1140,16 +1325,109 @@ static napi_value build_row_array(napi_env env, const decentdb_native_api* api, 
         case DECENTDB_KIND_TEXT: {
           const char* s = (const char*)v->data;
           size_t len = v->len;
-          if (!s) s = "";
+          if (!s) {
+            s = "";
+            len = 0;
+          }
           st = napi_create_string_utf8(env, s, len, &cell);
           NAPI_CALL(env, st);
           break;
         }
         case DECENTDB_KIND_BLOB:
+        case DECENTDB_KIND_GEOMETRY:
+        case DECENTDB_KIND_GEOGRAPHY:
         case DDB_VALUE_UUID: {
           const uint8_t* b = v->tag == DDB_VALUE_UUID ? v->uuid_bytes : v->data;
           size_t len = v->tag == DDB_VALUE_UUID ? 16u : v->len;
           st = napi_create_buffer_copy(env, len, b, NULL, &cell);
+          NAPI_CALL(env, st);
+          break;
+        }
+        case DECENTDB_KIND_ENUM: {
+          char buf[64];
+          if (format_enum(v->enum_type_id, v->enum_label_id, buf, sizeof(buf)) != 0) {
+            st = napi_get_null(env, &cell);
+            NAPI_CALL(env, st);
+            break;
+          }
+          st = napi_create_string_utf8(env, buf, NAPI_AUTO_LENGTH, &cell);
+          NAPI_CALL(env, st);
+          break;
+        }
+        case DECENTDB_KIND_IPADDR: {
+          char buf[64];
+          if (format_ip_addr(v->ip_family, v->ip_cidr_addr_bytes, buf, sizeof(buf)) != 0) {
+            st = napi_get_null(env, &cell);
+            NAPI_CALL(env, st);
+            break;
+          }
+          st = napi_create_string_utf8(env, buf, NAPI_AUTO_LENGTH, &cell);
+          NAPI_CALL(env, st);
+          break;
+        }
+        case DECENTDB_KIND_CIDR: {
+          char buf[80];
+          if (format_cidr(v->ip_family, v->cidr_prefix_len, v->ip_cidr_addr_bytes, buf, sizeof(buf)) != 0) {
+            st = napi_get_null(env, &cell);
+            NAPI_CALL(env, st);
+            break;
+          }
+          st = napi_create_string_utf8(env, buf, NAPI_AUTO_LENGTH, &cell);
+          NAPI_CALL(env, st);
+          break;
+        }
+        case DECENTDB_KIND_DATE: {
+          char buf[32];
+          if (format_date_days(v->date_days, buf, sizeof(buf)) != 0) {
+            st = napi_get_null(env, &cell);
+            NAPI_CALL(env, st);
+            break;
+          }
+          st = napi_create_string_utf8(env, buf, NAPI_AUTO_LENGTH, &cell);
+          NAPI_CALL(env, st);
+          break;
+        }
+        case DECENTDB_KIND_TIME: {
+          char buf[32];
+          if (format_time_micros(v->time_micros, buf, sizeof(buf)) != 0) {
+            st = napi_get_null(env, &cell);
+            NAPI_CALL(env, st);
+            break;
+          }
+          st = napi_create_string_utf8(env, buf, NAPI_AUTO_LENGTH, &cell);
+          NAPI_CALL(env, st);
+          break;
+        }
+        case DECENTDB_KIND_TIMESTAMPTZ: {
+          char buf[48];
+          if (format_timestamp_tz_micros(v->timestamptz_micros, buf, sizeof(buf)) != 0) {
+            st = napi_get_null(env, &cell);
+            NAPI_CALL(env, st);
+            break;
+          }
+          st = napi_create_string_utf8(env, buf, NAPI_AUTO_LENGTH, &cell);
+          NAPI_CALL(env, st);
+          break;
+        }
+        case DECENTDB_KIND_INTERVAL: {
+          char buf[64];
+          if (format_interval(v->interval_months, v->interval_days, v->interval_micros, buf, sizeof(buf)) != 0) {
+            st = napi_get_null(env, &cell);
+            NAPI_CALL(env, st);
+            break;
+          }
+          st = napi_create_string_utf8(env, buf, NAPI_AUTO_LENGTH, &cell);
+          NAPI_CALL(env, st);
+          break;
+        }
+        case DECENTDB_KIND_MACADDR: {
+          char buf[32];
+          if (format_macaddr(v->ip_family, v->ip_cidr_addr_bytes, buf, sizeof(buf)) != 0) {
+            st = napi_get_null(env, &cell);
+            NAPI_CALL(env, st);
+            break;
+          }
+          st = napi_create_string_utf8(env, buf, NAPI_AUTO_LENGTH, &cell);
           NAPI_CALL(env, st);
           break;
         }
@@ -1508,6 +1786,59 @@ static napi_value js_db_list_indexes_json(napi_env env, napi_callback_info info)
   return json_api_call(env, w, api, api->list_indexes_json);
 }
 
+static napi_value js_db_get_tooling_metadata_json(napi_env env, napi_callback_info info) {
+  const decentdb_native_api* api = require_api(env);
+
+  size_t argc = 1;
+  napi_value argv[1];
+  napi_status st = napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
+  NAPI_CALL(env, st);
+
+  db_wrap* w = unwrap_db(env, argv[0]);
+  if (!w) return NULL;
+  if (!api->get_tooling_metadata_json) {
+    return throw_error(env, "DECENTDB_UNSUPPORTED", "ddb_db_get_tooling_metadata_json not available");
+  }
+  return json_api_call(env, w, api, api->get_tooling_metadata_json);
+}
+
+static napi_value js_db_describe_query_json(napi_env env, napi_callback_info info) {
+  const decentdb_native_api* api = require_api(env);
+
+  size_t argc = 2;
+  napi_value argv[2];
+  napi_status st = napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
+  NAPI_CALL(env, st);
+
+  db_wrap* w = unwrap_db(env, argv[0]);
+  if (!w) return NULL;
+  if (!api->describe_query_json) {
+    return throw_error(env, "DECENTDB_UNSUPPORTED", "ddb_db_describe_query_json not available");
+  }
+
+  size_t sql_len = 0;
+  st = napi_get_value_string_utf8(env, argv[1], NULL, 0, &sql_len);
+  if (st != napi_ok) return throw_error(env, "DECENTDB_ARGS", "sql must be a string");
+
+  char* sql = (char*)malloc(sql_len + 1);
+  if (!sql) return throw_error(env, "DECENTDB_OOM", "out of memory");
+  st = napi_get_value_string_utf8(env, argv[1], sql, sql_len + 1, &sql_len);
+  if (st != napi_ok) { free(sql); NAPI_CALL(env, st); }
+
+  int out_len = 0;
+  const char* ptr = api->describe_query_json(w->db, sql, &out_len);
+  free(sql);
+  if (!ptr) {
+    const char* msg = api->last_error_message(w->db);
+    return throw_error(env, "DECENTDB_ERR", msg ? msg : "native error");
+  }
+  napi_value result;
+  st = napi_create_string_utf8(env, ptr, (size_t)out_len, &result);
+  NAPI_CALL(env, st);
+  api->free((void*)ptr);
+  return result;
+}
+
 static napi_value string_api_result(napi_env env, const decentdb_native_api* api, const char* ptr, int out_len) {
   if (!ptr) {
     const char* msg = api->last_error_message(NULL);
@@ -1711,18 +2042,112 @@ static napi_value js_stmt_step_row_view(napi_env env, napi_callback_info info) {
         break;
       case DDB_VALUE_TEXT: {
         const char* s = (const char*)v->data;
-        if (!s) s = "";
-        st = napi_create_string_utf8(env, s, v->len, &cell);
+        size_t len = v->len;
+        if (!s) {
+          s = "";
+          len = 0;
+        }
+        st = napi_create_string_utf8(env, s, len, &cell);
         NAPI_CALL(env, st);
         break;
       }
-      case DDB_VALUE_BLOB: {
+      case DDB_VALUE_BLOB:
+      case DDB_VALUE_GEOMETRY:
+      case DDB_VALUE_GEOGRAPHY: {
         st = napi_create_buffer_copy(env, v->len, v->data, NULL, &cell);
         NAPI_CALL(env, st);
         break;
       }
       case DDB_VALUE_UUID: {
         st = napi_create_buffer_copy(env, 16u, v->uuid_bytes, NULL, &cell);
+        NAPI_CALL(env, st);
+        break;
+      }
+      case DDB_VALUE_ENUM: {
+        char buf[64];
+        if (format_enum(v->enum_type_id, v->enum_label_id, buf, sizeof(buf)) != 0) {
+          st = napi_get_null(env, &cell);
+          NAPI_CALL(env, st);
+          break;
+        }
+        st = napi_create_string_utf8(env, buf, NAPI_AUTO_LENGTH, &cell);
+        NAPI_CALL(env, st);
+        break;
+      }
+      case DDB_VALUE_IPADDR: {
+        char buf[64];
+        if (format_ip_addr(v->ip_family, v->ip_cidr_addr_bytes, buf, sizeof(buf)) != 0) {
+          st = napi_get_null(env, &cell);
+          NAPI_CALL(env, st);
+          break;
+        }
+        st = napi_create_string_utf8(env, buf, NAPI_AUTO_LENGTH, &cell);
+        NAPI_CALL(env, st);
+        break;
+      }
+      case DDB_VALUE_CIDR: {
+        char buf[80];
+        if (format_cidr(v->ip_family, v->cidr_prefix_len, v->ip_cidr_addr_bytes, buf, sizeof(buf)) != 0) {
+          st = napi_get_null(env, &cell);
+          NAPI_CALL(env, st);
+          break;
+        }
+        st = napi_create_string_utf8(env, buf, NAPI_AUTO_LENGTH, &cell);
+        NAPI_CALL(env, st);
+        break;
+      }
+      case DDB_VALUE_DATE: {
+        char buf[32];
+        if (format_date_days(v->date_days, buf, sizeof(buf)) != 0) {
+          st = napi_get_null(env, &cell);
+          NAPI_CALL(env, st);
+          break;
+        }
+        st = napi_create_string_utf8(env, buf, NAPI_AUTO_LENGTH, &cell);
+        NAPI_CALL(env, st);
+        break;
+      }
+      case DDB_VALUE_TIME: {
+        char buf[32];
+        if (format_time_micros(v->time_micros, buf, sizeof(buf)) != 0) {
+          st = napi_get_null(env, &cell);
+          NAPI_CALL(env, st);
+          break;
+        }
+        st = napi_create_string_utf8(env, buf, NAPI_AUTO_LENGTH, &cell);
+        NAPI_CALL(env, st);
+        break;
+      }
+      case DDB_VALUE_TIMESTAMPTZ_MICROS: {
+        char buf[48];
+        if (format_timestamp_tz_micros(v->timestamptz_micros, buf, sizeof(buf)) != 0) {
+          st = napi_get_null(env, &cell);
+          NAPI_CALL(env, st);
+          break;
+        }
+        st = napi_create_string_utf8(env, buf, NAPI_AUTO_LENGTH, &cell);
+        NAPI_CALL(env, st);
+        break;
+      }
+      case DDB_VALUE_INTERVAL: {
+        char buf[64];
+        if (format_interval(v->interval_months, v->interval_days, v->interval_micros, buf, sizeof(buf)) != 0) {
+          st = napi_get_null(env, &cell);
+          NAPI_CALL(env, st);
+          break;
+        }
+        st = napi_create_string_utf8(env, buf, NAPI_AUTO_LENGTH, &cell);
+        NAPI_CALL(env, st);
+        break;
+      }
+      case DDB_VALUE_MACADDR: {
+        char buf[32];
+        if (format_macaddr(v->ip_family, v->ip_cidr_addr_bytes, buf, sizeof(buf)) != 0) {
+          st = napi_get_null(env, &cell);
+          NAPI_CALL(env, st);
+          break;
+        }
+        st = napi_create_string_utf8(env, buf, NAPI_AUTO_LENGTH, &cell);
         NAPI_CALL(env, st);
         break;
       }
@@ -2031,6 +2456,8 @@ static napi_value init(napi_env env, napi_value exports) {
      {"dbListViewsJson", 0, js_db_list_views_json, 0, 0, 0, napi_default, 0},
      {"dbGetViewDdl", 0, js_db_get_view_ddl, 0, 0, 0, napi_default, 0},
      {"dbListTriggersJson", 0, js_db_list_triggers_json, 0, 0, 0, napi_default, 0},
+     {"dbGetToolingMetadataJson", 0, js_db_get_tooling_metadata_json, 0, 0, 0, napi_default, 0},
+     {"dbDescribeQueryJson", 0, js_db_describe_query_json, 0, 0, 0, napi_default, 0},
      /* New in v2: in_transaction, evict_wal, version info */
     {"dbInTransaction", 0, js_db_in_transaction, 0, 0, 0, napi_default, 0},
     {"dbEvictSharedWal", 0, js_db_evict_shared_wal, 0, 0, 0, napi_default, 0},

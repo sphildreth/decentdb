@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/netip"
 	"net/url"
 	"runtime"
 	"strings"
@@ -120,6 +121,32 @@ type Decimal struct {
 	Unscaled int64
 	Scale    int
 }
+
+type EnumValue struct {
+	TypeID  uint64
+	LabelID uint64
+}
+
+type IntervalValue struct {
+	Months int32
+	Days   int32
+	Micros int64
+}
+
+type GeometryWKB []byte
+
+type GeographyWKB []byte
+
+const (
+	valueTagEnum              = 11
+	valueTagIPAddr            = 12
+	valueTagCIDR              = 13
+	valueTagDate              = 14
+	valueTagTime              = 15
+	valueTagTimestamptzMicros = 16
+	valueTagInterval          = 17
+	valueTagMACAddr           = 18
+)
 
 func (e *DecentDBError) Error() string {
 	return fmt.Sprintf("decentdb error %d: %s", e.Code, e.Message)
@@ -234,6 +261,12 @@ func (d *DB) ListIndexes() ([]IndexInfo, error) { return d.c.ListIndexes() }
 
 // GetTableDdl returns the CREATE TABLE DDL for the given table.
 func (d *DB) GetTableDdl(tableName string) (string, error) { return d.c.GetTableDdl(tableName) }
+
+// GetToolingMetadataJson returns the stable tooling metadata contract as JSON.
+func (d *DB) GetToolingMetadataJson() (string, error) { return d.c.GetToolingMetadataJson() }
+
+// DescribeQueryJson returns the stable non-executing query contract as JSON.
+func (d *DB) DescribeQueryJson(sql string) (string, error) { return d.c.DescribeQueryJson(sql) }
 
 // ListViews returns metadata about all views as a JSON array.
 func (d *DB) ListViews() (string, error) { return d.c.ListViews() }
@@ -529,6 +562,36 @@ func (c *conn) GetTableDdl(tableName string) (string, error) {
 	return C.GoString(ptr), nil
 }
 
+// GetToolingMetadataJson returns the stable tooling metadata contract as JSON.
+func (c *conn) GetToolingMetadataJson() (string, error) {
+	if c.db == nil {
+		return "", driver.ErrBadConn
+	}
+	var ptr *C.char
+	status := C.ddb_db_get_tooling_metadata_json(c.db, &ptr)
+	if status != C.DDB_OK {
+		return "", statusError(status, "")
+	}
+	defer freeAPIString(ptr)
+	return C.GoString(ptr), nil
+}
+
+// DescribeQueryJson returns the stable non-executing query contract as JSON.
+func (c *conn) DescribeQueryJson(sql string) (string, error) {
+	if c.db == nil {
+		return "", driver.ErrBadConn
+	}
+	cSQL := C.CString(sql)
+	defer C.free(unsafe.Pointer(cSQL))
+	var ptr *C.char
+	status := C.ddb_db_describe_query_json(c.db, cSQL, &ptr)
+	if status != C.DDB_OK {
+		return "", statusError(status, sql)
+	}
+	defer freeAPIString(ptr)
+	return C.GoString(ptr), nil
+}
+
 // ListViews returns metadata about all views as a JSON array.
 func (c *conn) ListViews() (string, error) {
 	if c.db == nil {
@@ -671,13 +734,165 @@ func valueToGo(val C.ddb_value_t) interface{} {
 			return []byte{}
 		}
 		return C.GoBytes(unsafe.Pointer(val.data), C.int(val.len))
+	case C.DDB_VALUE_GEOMETRY, C.DDB_VALUE_GEOGRAPHY:
+		if val.data == nil || val.len == 0 {
+			return []byte{}
+		}
+		return C.GoBytes(unsafe.Pointer(val.data), C.int(val.len))
 	case C.DDB_VALUE_UUID:
 		return C.GoBytes(unsafe.Pointer(&val.uuid_bytes[0]), 16)
 	case C.DDB_VALUE_DECIMAL:
 		return Decimal{Unscaled: int64(val.decimal_scaled), Scale: int(val.decimal_scale)}
 	case C.DDB_VALUE_TIMESTAMP_MICROS:
-		micros := int64(val.timestamp_micros)
-		return time.Unix(micros/1_000_000, (micros%1_000_000)*1_000).UTC()
+		return decodeTimestampMicrosValue(int64(val.timestamp_micros))
+	case C.DDB_VALUE_ENUM, C.DDB_VALUE_IPADDR, C.DDB_VALUE_CIDR,
+		C.DDB_VALUE_DATE, C.DDB_VALUE_TIME, C.DDB_VALUE_TIMESTAMPTZ_MICROS,
+		C.DDB_VALUE_INTERVAL, C.DDB_VALUE_MACADDR:
+		return decodeSemanticTag(
+			uint32(val.tag),
+			uint64(val.enum_type_id),
+			uint64(val.enum_label_id),
+			uint8(val.ip_family),
+			uint8(val.cidr_prefix_len),
+			ipCIDRBytesFromValue(val),
+			int32(val.date_days),
+			int64(val.time_micros),
+			int64(val.timestamptz_micros),
+			int32(val.interval_months),
+			int32(val.interval_days),
+			int64(val.interval_micros),
+		)
+	default:
+		return nil
+	}
+}
+
+func ipCIDRBytesFromValue(val C.ddb_value_t) [16]byte {
+	var out [16]byte
+	for i := 0; i < len(out); i++ {
+		out[i] = byte(val.ip_cidr_addr_bytes[i])
+	}
+	return out
+}
+
+func ipCIDRBytesFromView(val C.ddb_value_view_t) [16]byte {
+	var out [16]byte
+	for i := 0; i < len(out); i++ {
+		out[i] = byte(val.ip_cidr_addr_bytes[i])
+	}
+	return out
+}
+
+func decodeMACAddrString(length uint8, addrBytes [16]byte) interface{} {
+	if length != 6 && length != 8 {
+		return nil
+	}
+	out := make([]byte, 0, int(length)*3-1)
+	for i := 0; i < int(length); i++ {
+		if i > 0 {
+			out = append(out, ':')
+		}
+		out = append(out, "0123456789abcdef"[addrBytes[i]>>4])
+		out = append(out, "0123456789abcdef"[addrBytes[i]&0x0f])
+	}
+	return string(out)
+}
+
+func decodeIPAddrString(family uint8, addrBytes [16]byte) interface{} {
+	switch family {
+	case 4:
+		var addr4 [4]byte
+		for i := 0; i < len(addr4); i++ {
+			addr4[i] = addrBytes[i]
+		}
+		return netip.AddrFrom4(addr4).String()
+	case 6:
+		var addr6 [16]byte
+		for i := 0; i < len(addr6); i++ {
+			addr6[i] = addrBytes[i]
+		}
+		return netip.AddrFrom16(addr6).String()
+	default:
+		return nil
+	}
+}
+
+func decodeCIDRString(family uint8, prefixLen uint8, addrBytes [16]byte) interface{} {
+	var addr netip.Addr
+	switch family {
+	case 4:
+		var addr4 [4]byte
+		for i := 0; i < len(addr4); i++ {
+			addr4[i] = addrBytes[i]
+		}
+		addr = netip.AddrFrom4(addr4)
+	case 6:
+		var addr6 [16]byte
+		for i := 0; i < len(addr6); i++ {
+			addr6[i] = addrBytes[i]
+		}
+		addr = netip.AddrFrom16(addr6)
+	default:
+		return nil
+	}
+
+	prefix := netip.PrefixFrom(addr, int(prefixLen))
+	if !prefix.IsValid() {
+		return nil
+	}
+	return prefix.Masked().String()
+}
+
+func decodeDateDaysValue(days int32) time.Time {
+	return time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC).AddDate(0, 0, int(days))
+}
+
+func decodeTimeMicrosValue(micros int64) time.Duration {
+	return time.Duration(micros) * time.Microsecond
+}
+
+func decodeTimestampMicrosValue(micros int64) time.Time {
+	return time.UnixMicro(micros).UTC()
+}
+
+func decodeSemanticTag(
+	tag uint32,
+	enumTypeID uint64,
+	enumLabelID uint64,
+	ipFamily uint8,
+	cidrPrefixLen uint8,
+	ipCIDRAddrBytes [16]byte,
+	dateDays int32,
+	timeMicros int64,
+	timestamptzMicros int64,
+	intervalMonths int32,
+	intervalDays int32,
+	intervalMicros int64,
+) interface{} {
+	switch tag {
+	case valueTagEnum:
+		return EnumValue{
+			TypeID:  enumTypeID,
+			LabelID: enumLabelID,
+		}
+	case valueTagIPAddr:
+		return decodeIPAddrString(ipFamily, ipCIDRAddrBytes)
+	case valueTagCIDR:
+		return decodeCIDRString(ipFamily, cidrPrefixLen, ipCIDRAddrBytes)
+	case valueTagDate:
+		return decodeDateDaysValue(dateDays)
+	case valueTagTime:
+		return decodeTimeMicrosValue(timeMicros)
+	case valueTagTimestamptzMicros:
+		return decodeTimestampMicrosValue(timestamptzMicros)
+	case valueTagInterval:
+		return IntervalValue{
+			Months: intervalMonths,
+			Days:   intervalDays,
+			Micros: intervalMicros,
+		}
+	case valueTagMACAddr:
+		return decodeMACAddrString(ipFamily, ipCIDRAddrBytes)
 	default:
 		return nil
 	}
@@ -853,6 +1068,24 @@ func (s *stmtStruct) bind(args []driver.NamedValue) error {
 			cs := C.CString(v)
 			status = C.ddb_stmt_bind_text(s.stmt, idx, cs, C.size_t(len(v)))
 			C.free(unsafe.Pointer(cs))
+		case GeometryWKB:
+			if len(v) == 0 {
+				status = C.ddb_stmt_bind_geometry_wkb(s.stmt, idx, nil, 0)
+			} else {
+				var pinner runtime.Pinner
+				pinner.Pin(&v[0])
+				defer pinner.Unpin()
+				status = C.ddb_stmt_bind_geometry_wkb(s.stmt, idx, (*C.uint8_t)(unsafe.Pointer(&v[0])), C.size_t(len(v)))
+			}
+		case GeographyWKB:
+			if len(v) == 0 {
+				status = C.ddb_stmt_bind_geography_wkb(s.stmt, idx, nil, 0)
+			} else {
+				var pinner runtime.Pinner
+				pinner.Pin(&v[0])
+				defer pinner.Unpin()
+				status = C.ddb_stmt_bind_geography_wkb(s.stmt, idx, (*C.uint8_t)(unsafe.Pointer(&v[0])), C.size_t(len(v)))
+			}
 		case []byte:
 			if len(v) == 0 {
 				status = C.ddb_stmt_bind_blob(s.stmt, idx, nil, 0)
@@ -1111,6 +1344,12 @@ func (r *rows) Next(dest []driver.Value) error {
 				continue
 			}
 			dest[i] = C.GoBytes(unsafe.Pointer(v.data), C.int(v.len))
+		case C.DDB_VALUE_GEOMETRY, C.DDB_VALUE_GEOGRAPHY:
+			if v.len == 0 || v.data == nil {
+				dest[i] = []byte{}
+				continue
+			}
+			dest[i] = C.GoBytes(unsafe.Pointer(v.data), C.int(v.len))
 		case C.DDB_VALUE_UUID:
 			dest[i] = C.GoBytes(unsafe.Pointer(&v.uuid_bytes[0]), 16)
 		case C.DDB_VALUE_DECIMAL:
@@ -1119,8 +1358,24 @@ func (r *rows) Next(dest []driver.Value) error {
 				Scale:    int(v.decimal_scale),
 			}
 		case C.DDB_VALUE_TIMESTAMP_MICROS:
-			micros := int64(v.timestamp_micros)
-			dest[i] = time.Unix(micros/1_000_000, (micros%1_000_000)*1_000).UTC()
+			dest[i] = decodeTimestampMicrosValue(int64(v.timestamp_micros))
+		case C.DDB_VALUE_ENUM, C.DDB_VALUE_IPADDR, C.DDB_VALUE_CIDR,
+			C.DDB_VALUE_DATE, C.DDB_VALUE_TIME, C.DDB_VALUE_TIMESTAMPTZ_MICROS,
+			C.DDB_VALUE_INTERVAL, C.DDB_VALUE_MACADDR:
+			dest[i] = decodeSemanticTag(
+				uint32(v.tag),
+				uint64(v.enum_type_id),
+				uint64(v.enum_label_id),
+				uint8(v.ip_family),
+				uint8(v.cidr_prefix_len),
+				ipCIDRBytesFromView(v),
+				int32(v.date_days),
+				int64(v.time_micros),
+				int64(v.timestamptz_micros),
+				int32(v.interval_months),
+				int32(v.interval_days),
+				int64(v.interval_micros),
+			)
 		default:
 			dest[i] = nil
 		}

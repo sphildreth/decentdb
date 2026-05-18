@@ -34,6 +34,8 @@ idiomatic Dart API for desktop and CLI applications.
 - Rich schema metadata via `Schema.getSchemaSnapshot()` with typed Dart models
   (`SchemaSnapshot`, `SchemaTableInfo`, `SchemaColumnInfo`, `SchemaViewInfo`,
   `SchemaIndexInfo`, `SchemaTriggerInfo`, `SchemaCheckConstraintInfo`)
+- Stable tooling metadata and query contracts via `Schema.getToolingMetadata()`
+  and `Schema.describeQueryContract(sql)`
 - `ErrorCode.fromCode` throws `StateError` on unrecognised codes
 - `sqlite3` moved to `dev_dependencies` (only used by the benchmark)
 
@@ -152,9 +154,13 @@ Supported Dart bind values in the tested wrapper path are:
 - `DateTime`
 - `DecimalValue`
 
-Whether a value can be stored in a specific table column still depends on the
-current engine SQL type surface. The examples and tests in this directory stick
-to the currently validated SQL types: `INT64`, `FLOAT64`, `BOOL`, and `TEXT`.
+Semantic result values decode to Dart-native shapes:
+
+- `ENUM` -> `DecentDBEnumValue(typeId, labelId)`
+- `IPADDR`, `CIDR`, `MACADDR` -> canonical `String`
+- `DATE`, `TIMESTAMPTZ` -> UTC `DateTime`
+- `TIME` -> `Duration`
+- `INTERVAL` -> `DecentDBIntervalValue(months, days, microseconds)`
 
 ## Schema metadata
 

@@ -275,6 +275,7 @@ impl FileKind {
         match self {
             Self::Database => "database",
             Self::Wal => "wal",
+            Self::SyncJournal => "sync-journal",
         }
     }
 }

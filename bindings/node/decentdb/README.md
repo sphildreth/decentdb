@@ -7,7 +7,8 @@ Node.js bindings for DecentDB via N-API.
 - explicit open modes: `Database.openOrCreate()`, `openExisting()`, `create()`
 - sync `exec()` and promise-based `execAsync()`
 - native prepared statements via `Database.prepare()` / `Statement`
-- schema helpers: tables, columns, indexes, table DDL, views, view DDL, triggers
+- schema helpers: tables, columns, indexes, table DDL, views, view DDL, triggers,
+  tooling metadata, and query contracts
 - transaction helpers plus `db.inTransaction`
 - version helpers: `Database.abiVersion()`, `Database.version()`
 - timestamp binding via `Statement.bindTimestamp(...)` or `timestampMicros(...)`
@@ -27,6 +28,19 @@ db.close();
 ```
 
 DecentDB-native uses engine-native placeholders: `$1`, `$2`, ...
+
+## Semantic result values
+
+Semantic native types are returned as compact display strings in the Node
+wrapper:
+
+- `ENUM` -> `"typeId:labelId"`
+- `IPADDR`, `CIDR`, `MACADDR` -> canonical text
+- `DATE`, `TIME`, `TIMESTAMPTZ` -> canonical date/time text
+- `INTERVAL` -> `"months days micros"`
+
+`DECIMAL` continues to return `{ unscaled: bigint, scale: number }`, and
+`TIMESTAMP` returns milliseconds since the Unix epoch.
 
 ## Runtime library
 

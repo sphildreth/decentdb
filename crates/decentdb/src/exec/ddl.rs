@@ -1,8 +1,8 @@
 //! DDL execution helpers.
 
 use crate::catalog::{
-    identifiers_equal, CheckConstraint, ColumnSchema, ForeignKeyAction, ForeignKeyConstraint,
-    IndexColumn, IndexKind, IndexSchema, SchemaInfo, TableSchema,
+    identifiers_equal, CheckConstraint, ColumnSchema, ColumnType, EnumTypeInfo, ForeignKeyAction,
+    ForeignKeyConstraint, IndexColumn, IndexKind, IndexSchema, SchemaInfo, TableSchema,
 };
 use crate::error::{DbError, Result};
 use crate::record::value::Value;
@@ -63,7 +63,7 @@ impl EngineRuntime {
         let mut columns = statement
             .columns
             .iter()
-            .map(column_schema_from_definition)
+            .map(|definition| column_schema_from_definition(&statement.table_name, definition))
             .collect::<Result<Vec<_>>>()?;
         ensure_unique_column_names(&columns, &statement.table_name)?;
 
@@ -312,6 +312,7 @@ impl EngineRuntime {
         let kind = match access_method.as_str() {
             "btree" => IndexKind::Btree,
             "gin" | "trigram" => IndexKind::Trigram,
+            "spatial" => IndexKind::Spatial,
             other => {
                 return Err(DbError::sql(format!(
                     "unsupported index access method {other}"
@@ -338,6 +339,42 @@ impl EngineRuntime {
             if !statement.include_columns.is_empty() {
                 return Err(DbError::sql(
                     "trigram indexes do not support INCLUDE columns",
+                ));
+            }
+        }
+        if kind == IndexKind::Spatial {
+            if statement.unique {
+                return Err(DbError::sql("spatial indexes cannot be UNIQUE"));
+            }
+            if statement.columns.len() != 1 || has_expression {
+                return Err(DbError::sql(
+                    "spatial indexes require a single plain spatial column",
+                ));
+            }
+            if statement.predicate.is_some() {
+                return Err(DbError::sql("partial spatial indexes are not supported"));
+            }
+            if !statement.include_columns.is_empty() {
+                return Err(DbError::sql(
+                    "spatial indexes do not support INCLUDE columns",
+                ));
+            }
+            let IndexExpression::Column(column_name) = &statement.columns[0] else {
+                unreachable!("spatial index expression already rejected");
+            };
+            let column = table
+                .columns
+                .iter()
+                .find(|column| identifiers_equal(&column.name, column_name))
+                .ok_or_else(|| {
+                    DbError::sql(format!(
+                        "index column {} does not exist on {}",
+                        column_name, table.name
+                    ))
+                })?;
+            if !column.column_type.is_spatial() {
+                return Err(DbError::sql(
+                    "spatial indexes require GEOMETRY or GEOGRAPHY columns",
                 ));
             }
         }
@@ -737,7 +774,7 @@ impl EngineRuntime {
                             "ALTER TABLE ADD COLUMN with PRIMARY KEY, UNIQUE, or REFERENCES is not supported",
                         ));
                     }
-                    let column = column_schema_from_definition(definition)?;
+                    let column = column_schema_from_definition(table_name, definition)?;
                     let fill_value = if let Some(default) = &column.default_sql {
                         let expr = crate::sql::parser::parse_expression_sql(default)?;
                         self.eval_expr(
@@ -1325,7 +1362,10 @@ fn collect_truncate_targets(
     Ok(())
 }
 
-fn column_schema_from_definition(definition: &ColumnDefinition) -> Result<ColumnSchema> {
+fn column_schema_from_definition(
+    table_name: &str,
+    definition: &ColumnDefinition,
+) -> Result<ColumnSchema> {
     if definition.generated.is_some() && definition.default.is_some() {
         return Err(DbError::sql(
             "generated columns may not also define DEFAULT",
@@ -1334,9 +1374,12 @@ fn column_schema_from_definition(definition: &ColumnDefinition) -> Result<Column
     if definition.generated.is_some() && definition.primary_key {
         return Err(DbError::sql("generated columns may not be PRIMARY KEY"));
     }
+    let enum_type = enum_type_for_column(table_name, definition)?;
     Ok(ColumnSchema {
         name: definition.name.clone(),
         column_type: definition.column_type,
+        spatial_type: definition.spatial_type,
+        enum_type,
         nullable: definition.nullable && !definition.primary_key,
         default_sql: definition
             .generated
@@ -1362,6 +1405,48 @@ fn column_schema_from_definition(definition: &ColumnDefinition) -> Result<Column
             .as_ref()
             .map(foreign_key_constraint_from_definition),
     })
+}
+
+fn enum_type_for_column(
+    table_name: &str,
+    definition: &ColumnDefinition,
+) -> Result<Option<EnumTypeInfo>> {
+    if definition.column_type != ColumnType::Enum {
+        return Ok(None);
+    }
+    let Some(mut enum_type) = definition.enum_type.clone() else {
+        return Err(DbError::sql("ENUM columns require inline labels"));
+    };
+    enum_type.type_id = stable_enum_type_id(table_name, &definition.name, &enum_type);
+    Ok(Some(enum_type))
+}
+
+fn stable_enum_type_id(table_name: &str, column_name: &str, enum_type: &EnumTypeInfo) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    fn feed(mut hash: u64, bytes: &[u8]) -> u64 {
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        hash
+    }
+
+    let mut hash = FNV_OFFSET;
+    hash = feed(hash, table_name.as_bytes());
+    hash = feed(hash, &[0]);
+    hash = feed(hash, column_name.as_bytes());
+    hash = feed(hash, &[0]);
+    for label in &enum_type.labels {
+        hash = feed(hash, label.label.as_bytes());
+        hash = feed(hash, &[0]);
+    }
+    if hash == 0 {
+        1
+    } else {
+        hash
+    }
 }
 
 fn foreign_key_constraint_from_definition(

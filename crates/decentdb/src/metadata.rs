@@ -189,3 +189,86 @@ pub struct SchemaSnapshot {
     pub indexes: Vec<SchemaIndexInfo>,
     pub triggers: Vec<SchemaTriggerInfo>,
 }
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ToolingMetadata {
+    pub metadata_version: u32,
+    pub engine_version: String,
+    pub database_format_version: u32,
+    pub schema_cookie: u32,
+    pub temp_schema_cookie: u32,
+    pub schema_fingerprint: String,
+    pub schema_fingerprint_algorithm: String,
+    pub schema: SchemaSnapshot,
+    pub column_type_metadata: Vec<ToolingColumnTypeMetadata>,
+    pub capabilities: ToolingCapabilities,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ToolingCapabilities {
+    pub query_contract_version: u32,
+    pub query_describe: bool,
+    pub deterministic_json: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ToolingColumnTypeMetadata {
+    pub table_name: String,
+    pub column_name: String,
+    pub column_type: String,
+    pub type_info: ToolingTypeInfo,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ToolingTypeInfo {
+    pub type_name: String,
+    pub value_kind: String,
+    pub c_value_tag: u32,
+    pub spatial: Option<ToolingSpatialTypeInfo>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ToolingSpatialTypeInfo {
+    pub subtype: String,
+    pub dimensions: String,
+    pub srid: i32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct QueryContract {
+    pub contract_version: u32,
+    pub sql: String,
+    pub statement_kind: String,
+    pub read_only: bool,
+    pub schema_cookie: u32,
+    pub temp_schema_cookie: u32,
+    pub schema_fingerprint: String,
+    pub parameters: Vec<QueryParameterInfo>,
+    pub result_columns: Vec<QueryResultColumnInfo>,
+    pub diagnostics: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct QueryParameterInfo {
+    pub position: usize,
+    pub name: String,
+    pub type_name: Option<String>,
+    pub nullable: Option<bool>,
+    pub source: String,
+    pub source_table: Option<String>,
+    pub source_column: Option<String>,
+    pub diagnostics: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct QueryResultColumnInfo {
+    pub ordinal: usize,
+    pub name: String,
+    pub type_name: Option<String>,
+    pub nullable: Option<bool>,
+    pub source: String,
+    pub source_table: Option<String>,
+    pub source_column: Option<String>,
+    pub expression_sql: Option<String>,
+    pub diagnostics: Vec<String>,
+}

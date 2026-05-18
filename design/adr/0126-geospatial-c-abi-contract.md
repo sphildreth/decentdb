@@ -113,6 +113,6 @@ lossy for the engine boundary.
 
 ## References
 
-- `design/WIN03_GEOSPATIAL_DATA_SUPPORT.md`
+- `design/WIN_GEOSPATIAL_DATA_SUPPORT.md`
 - `include/decentdb.h`
 - `design/adr/0118-rust-ffi-panic-safety.md`

@@ -229,6 +229,64 @@ def compute_benchmark_drift(
     return "STABLE"
 
 
+def _java_home_from_runtime(env: dict[str, str]) -> Path | None:
+    try:
+        output = subprocess.check_output(
+            ["java", "-XshowSettings:properties", "-version"],
+            stderr=subprocess.STDOUT,
+            env=env,
+            text=True,
+        )
+    except (subprocess.CalledProcessError, OSError):
+        return None
+
+    for line in output.splitlines():
+        match = re.search(r"\bjava\.home\s*=\s*(.+)$", line.strip())
+        if match:
+            return Path(match.group(1))
+    return None
+
+
+def _has_jni_headers(java_home: Path) -> bool:
+    return (java_home / "include" / "jni.h").exists()
+
+
+def _java_home_with_jni_headers(env: dict[str, str]) -> Path | None:
+    candidates: list[Path] = []
+    if env.get("JAVA_HOME"):
+        candidates.append(Path(env["JAVA_HOME"]))
+
+    runtime_home = _java_home_from_runtime(env)
+    if runtime_home is not None:
+        candidates.append(runtime_home)
+
+    # Allows local validation on minimal Java runtime packages without root.
+    candidates.extend(
+        [
+            REPO_ROOT / ".tmp" / "jdk" / "usr" / "lib" / "jvm" / "java-25-openjdk",
+            REPO_ROOT / ".tmp" / "jdk25-full" / "usr" / "lib" / "jvm" / "java-25-openjdk",
+        ]
+    )
+
+    for candidate in candidates:
+        if (candidate / "bin" / "java").exists() and _has_jni_headers(candidate):
+            return candidate
+    return None
+
+
+def java_binding_env() -> dict[str, str]:
+    env = os.environ.copy()
+    java_home = _java_home_with_jni_headers(env)
+    if java_home is None:
+        return {}
+
+    path = os.environ.get("PATH", "")
+    return {
+        "JAVA_HOME": str(java_home),
+        "PATH": f"{java_home / 'bin'}{os.pathsep}{path}",
+    }
+
+
 def build_checks() -> list[Check]:
     native_lib = REPO_ROOT / "target" / "release" / "libdecentdb.so"
     release_dir = REPO_ROOT / "target" / "release"
@@ -237,6 +295,7 @@ def build_checks() -> list[Check]:
         "DECENTDB_NATIVE_LIB": str(native_lib),
         "PYTHONPATH": ".",
     }
+    java_env = java_binding_env()
     python_exec = shlex.quote(sys.executable)
 
     return [
@@ -399,8 +458,11 @@ def build_checks() -> list[Check]:
             key="java-tests",
             title="Java binding tests",
             cwd=REPO_ROOT / "bindings" / "java",
-            command=f"./gradlew test -PnativeLibDir={release_dir}",
-            env={},
+            command=(
+                "./gradlew --project-cache-dir ../../.tmp/gradle-java "
+                f":driver:test -PnativeLibDir={release_dir}"
+            ),
+            env=java_env,
             stage=4,
             requires="java",
         ),
@@ -592,15 +654,19 @@ def _run_stage(
 
 def _check_skip_reason(check: Check) -> str | None:
     """Return a human-readable skip reason, or None if the check can run."""
+    env = os.environ.copy()
+    env.update(check.env)
     if not check.requires:
         return None
-    if not shutil.which(check.requires):
+    if not shutil.which(check.requires, path=env.get("PATH")):
         return f"{check.requires} not found"
     # Gradle 8.x doesn't support JDK 25+; detect and skip gracefully.
     if check.key == "java-tests":
+        if _java_home_with_jni_headers(env) is None:
+            return "JDK headers (jni.h) not found"
         try:
             ver_out = subprocess.check_output(
-                ["java", "-version"], stderr=subprocess.STDOUT, text=True,
+                ["java", "-version"], stderr=subprocess.STDOUT, env=env, text=True,
             )
             match = re.search(r'"(\d+)', ver_out)
             if match and int(match.group(1)) >= 25:

@@ -9,6 +9,8 @@ The ShowCase project is a console application that exercises all major features 
 2. **DecentDB Engine** - Database operations, transactions, schema introspection
 3. **NodaTime Integration** - Precise date/time handling with EF Core
 
+For local-first sync, see [`sync-quickstart.md`](sync-quickstart.md).
+
 ## Prerequisites
 
 - .NET 10.0 SDK or later

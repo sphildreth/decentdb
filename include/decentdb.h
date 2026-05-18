@@ -35,7 +35,17 @@ typedef enum ddb_value_tag_t {
   DDB_VALUE_BLOB = 5,
   DDB_VALUE_DECIMAL = 6,
   DDB_VALUE_UUID = 7,
-  DDB_VALUE_TIMESTAMP_MICROS = 8
+  DDB_VALUE_TIMESTAMP_MICROS = 8,
+  DDB_VALUE_GEOMETRY = 9,
+  DDB_VALUE_GEOGRAPHY = 10,
+  DDB_VALUE_ENUM = 11,
+  DDB_VALUE_IPADDR = 12,
+  DDB_VALUE_CIDR = 13,
+  DDB_VALUE_DATE = 14,
+  DDB_VALUE_TIME = 15,
+  DDB_VALUE_TIMESTAMPTZ_MICROS = 16,
+  DDB_VALUE_INTERVAL = 17,
+  DDB_VALUE_MACADDR = 18
 } ddb_value_tag_t;
 
 typedef struct ddb_value_t {
@@ -51,6 +61,18 @@ typedef struct ddb_value_t {
   size_t len;
   uint8_t uuid_bytes[16];
   int64_t timestamp_micros;
+  uint64_t enum_type_id;
+  uint64_t enum_label_id;
+  uint8_t ip_family;
+  uint8_t cidr_prefix_len;
+  uint8_t reserved2[6];
+  uint8_t ip_cidr_addr_bytes[16];
+  int32_t date_days;
+  int64_t time_micros;
+  int64_t timestamptz_micros;
+  int32_t interval_months;
+  int32_t interval_days;
+  int64_t interval_micros;
 } ddb_value_t;
 
 typedef struct ddb_value_view_t {
@@ -66,6 +88,18 @@ typedef struct ddb_value_view_t {
   size_t len;
   uint8_t uuid_bytes[16];
   int64_t timestamp_micros;
+  uint64_t enum_type_id;
+  uint64_t enum_label_id;
+  uint8_t ip_family;
+  uint8_t cidr_prefix_len;
+  uint8_t reserved2[6];
+  uint8_t ip_cidr_addr_bytes[16];
+  int32_t date_days;
+  int64_t time_micros;
+  int64_t timestamptz_micros;
+  int32_t interval_months;
+  int32_t interval_days;
+  int64_t interval_micros;
 } ddb_value_view_t;
 
 typedef struct ddb_row_i64_text_f64_view_t {
@@ -101,6 +135,8 @@ ddb_status_t ddb_string_free(char **value);
 ddb_status_t ddb_db_create(const char *path, ddb_db_t **out_db);
 ddb_status_t ddb_db_open(const char *path, ddb_db_t **out_db);
 ddb_status_t ddb_db_open_or_create(const char *path, ddb_db_t **out_db);
+ddb_status_t ddb_db_sync_execute_json(ddb_db_t *db, const char *request_json, char **out_json);
+ddb_status_t ddb_db_branch_execute_json(ddb_db_t *db, const char *request_json, char **out_json);
 
 /*
  * Frees a database handle returned by ddb_db_create, ddb_db_open, or ddb_db_open_or_create.
@@ -154,6 +190,16 @@ ddb_status_t ddb_stmt_bind_text(
     const char *value,
     size_t byte_len);
 ddb_status_t ddb_stmt_bind_blob(
+    ddb_stmt_t *stmt,
+    size_t index_1_based,
+    const uint8_t *data,
+    size_t byte_len);
+ddb_status_t ddb_stmt_bind_geometry_wkb(
+    ddb_stmt_t *stmt,
+    size_t index_1_based,
+    const uint8_t *data,
+    size_t byte_len);
+ddb_status_t ddb_stmt_bind_geography_wkb(
     ddb_stmt_t *stmt,
     size_t index_1_based,
     const uint8_t *data,
@@ -277,6 +323,8 @@ ddb_status_t ddb_db_list_views_json(ddb_db_t *db, char **out_json);
 ddb_status_t ddb_db_get_view_ddl(ddb_db_t *db, const char *name, char **out_ddl);
 ddb_status_t ddb_db_list_triggers_json(ddb_db_t *db, char **out_json);
 ddb_status_t ddb_db_get_schema_snapshot_json(ddb_db_t *db, char **out_json);
+ddb_status_t ddb_db_get_tooling_metadata_json(ddb_db_t *db, char **out_json);
+ddb_status_t ddb_db_describe_query_json(ddb_db_t *db, const char *sql, char **out_json);
 ddb_status_t ddb_db_inspect_storage_state_json(ddb_db_t *db, char **out_json);
 
 ddb_status_t ddb_evict_shared_wal(const char *path);

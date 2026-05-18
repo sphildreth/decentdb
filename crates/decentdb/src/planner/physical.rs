@@ -17,6 +17,23 @@ pub(crate) enum PhysicalPlan {
         index: String,
         predicate: Expr,
     },
+    SpatialFilter {
+        table: String,
+        index: String,
+        predicate: Expr,
+    },
+    SpatialKnn {
+        table: String,
+        index: String,
+        order: Expr,
+        input: Box<PhysicalPlan>,
+    },
+    SpatialJoin {
+        table: String,
+        index: String,
+        predicate: Expr,
+        input: Box<PhysicalPlan>,
+    },
     Filter {
         input: Box<PhysicalPlan>,
         predicate: Expr,
@@ -82,6 +99,38 @@ impl PhysicalPlan {
                 "{indent}TrigramSearch(table={table}, index={index}, predicate={})",
                 predicate.to_sql()
             )),
+            Self::SpatialFilter {
+                table,
+                index,
+                predicate,
+            } => output.push(format!(
+                "{indent}SpatialFilter(table={table}, index={index}, predicate={})",
+                predicate.to_sql()
+            )),
+            Self::SpatialKnn {
+                table,
+                index,
+                order,
+                input,
+            } => {
+                output.push(format!(
+                    "{indent}SpatialKnn(table={table}, index={index}, order={})",
+                    order.to_sql()
+                ));
+                input.render_into(depth + 1, output);
+            }
+            Self::SpatialJoin {
+                table,
+                index,
+                predicate,
+                input,
+            } => {
+                output.push(format!(
+                    "{indent}SpatialJoin(table={table}, index={index}, predicate={})",
+                    predicate.to_sql()
+                ));
+                input.render_into(depth + 1, output);
+            }
             Self::Filter { input, predicate } => {
                 output.push(format!("{indent}Filter({})", predicate.to_sql()));
                 input.render_into(depth + 1, output);

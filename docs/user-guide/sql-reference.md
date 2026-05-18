@@ -66,6 +66,9 @@ CREATE INDEX index_name ON table_name(column_name);
 -- Trigram index for text search
 CREATE INDEX index_name ON table_name USING trigram(column_name);
 
+-- Spatial index for GEOMETRY / GEOGRAPHY
+CREATE INDEX index_name ON table_name USING spatial(column_name);
+
 -- Unique index
 CREATE UNIQUE INDEX index_name ON table_name(column_name);
 
@@ -81,6 +84,7 @@ CREATE INDEX index_name ON table_name(column_name) INCLUDE (other_col, more_col)
 
 Notes:
 - Partial/filtered indexes are supported for BTREE indexes with arbitrary predicates (including multi-column and `UNIQUE`). Partial trigram indexes are not supported.
+- Spatial indexes are supported for a single `GEOMETRY` or `GEOGRAPHY` column and accelerate `ST_DWithin`, `ST_Intersects`, `ST_Contains`, `ST_Within`, `ST_Equals`, and nearest-neighbor `<->` planning.
 - Covering indexes (`INCLUDE (...)`) are supported for BTREE key-column indexes and store additional non-key columns in index metadata for compatibility.
 - Expression indexes are currently limited to **a single** deterministic expression:
   - column reference
@@ -415,6 +419,13 @@ Supported scalar functions:
 **Other:**
 - `PRINTF(format, args...)` — formatted string output (SQLite-compatible)
 
+**Spatial:**
+- Constructors: `ST_Point`, `ST_MakePoint`, `ST_PointZ`, `ST_PointM`, `ST_PointZM`, `ST_GeogPoint`, `ST_GeogPointZ`, `ST_GeogPointM`, `ST_GeogPointZM`
+- Text/binary/JSON I/O: `ST_GeomFromText`, `ST_GeogFromText`, `ST_GeomFromWKB`, `ST_GeogFromWKB`, `ST_GeomFromGeoJSON`, `ST_GeogFromGeoJSON`, `ST_AsText`, `ST_AsBinary`, `ST_AsGeoJSON`
+- Accessors: `ST_SRID`, `ST_SetSRID`, `ST_GeometryType`, `ST_X`, `ST_Y`, `ST_Z`, `ST_M`, `ST_IsValid`
+- Predicates and measurements: `ST_Distance`, `ST_DWithin`, `ST_Intersects`, `ST_Contains`, `ST_Within`, `ST_Equals`, `ST_Length`, `ST_Area`
+- Distance operator: `left <-> right`
+
 ```sql
 SELECT COALESCE(nickname, name) FROM users;
 SELECT NULLIF(status, 'active') FROM users;
@@ -454,6 +465,8 @@ SELECT NOW(), CURRENT_DATE, CURRENT_TIME;
 SELECT EXTRACT(YEAR FROM '2026-02-24');  -- Returns 2026
 SELECT STRFTIME('%Y-%m-%d', CURRENT_TIMESTAMP);
 SELECT PRINTF('Hello %s, you are %d', name, age) FROM users;
+SELECT ST_DWithin(geog, ST_GeogPoint(-97.7431, 30.2672), 5000) FROM places;
+SELECT ST_Area(ST_GeomFromText('POLYGON((0 0,10 0,10 10,0 10,0 0))'));
 ```
 
 ### Common Table Expressions (CTE)

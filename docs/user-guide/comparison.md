@@ -2,13 +2,13 @@
 
 This page summarizes high-level feature differences between **DecentDB**, **SQLite**, and **DuckDB**.
 
-## Versions (as of 2026-03-28)
+## Versions (as of 2026-05-18)
 
 This comparison was written against:
 - SQLite `3.51.2` (sqlite3 CLI)
 - DuckDB `v1.4.3` (duckdb CLI)
 
-DecentDB is currently at **v2.0.0**. This document describes the current feature set and constraints; details may change
+DecentDB is currently at **v2.5.0**. This document describes the current feature set and constraints; details may change
 as DecentDB continues to evolve.
 
 DecentDB is intentionally scoped around:
@@ -30,6 +30,8 @@ SQLite and DuckDB are used as behavioral baselines for many SQL features, but De
 | Concurrency | Single writer, many readers (threads, same process) | Multi-reader, single-writer (process-safe) | Parallel query execution; analytics-oriented |
 | SQL breadth | Subset (deliberately small) | Very broad (plus extensions) | Very broad (esp. analytical SQL) |
 | Extensibility | No loadable extension / UDF plugin surface in the current baseline (extend by contributing to core) | Rich extension ecosystem (loadable extensions, virtual tables, UDFs) | Rich extension ecosystem (install/load extensions, UDFs) |
+| Local-first sync | Built-in durable change journal, batch exchange, scoped peers, conflict workflows, doctor/retention tooling, CLI, and .NET SDK | Not built in; usually application middleware or third-party replication layers | Not built in; not a local-first replication focus |
+| Branch/diff/restore workflows | Built-in named snapshots, branch-local writes, primary-key row diff, guarded restore, and constrained merge | Not built in; use file copies, backup APIs, sessions, or app tooling | Not built in; typically use external copies or app/tooling |
 | Substring search (`LIKE '%pattern%'`) | Built-in trigram index option (purpose-built for interactive “contains” queries) | Typically full scan or use FTS/extensions | Typically scan or use extensions (e.g., FTS) |
 | Durability fault-injection hooks | Built-in WAL failpoints + FaultyVFS for deterministic crash/torn-write testing | Not typically exposed as a first-class user feature | Not typically exposed as a first-class user feature |
 
@@ -39,6 +41,35 @@ Notes:
 What “extensions” means here:
 - The ability to add new SQL features without modifying the database core (e.g., new scalar/aggregate functions, new table-like modules such as SQLite virtual tables, or optional subsystems like full-text search).
 - DecentDB does support multiple language bindings, but those bindings are about how you *call* DecentDB, not a general-purpose SQL extension/plugin system.
+
+## Local-first sync
+
+DecentDB's biggest product-level differentiator is native local-first sync for
+embedded applications. It is built into the engine and exposed through the CLI,
+SQL inspection queries, and the .NET SDK.
+
+The current sync surface includes:
+
+- durable row-level change capture in a sidecar sync journal
+- replica IDs, peer catalogs, and peer-to-scope bindings
+- manual JSON batch export/import for offline exchange
+- localhost/dev HTTP `sync run` and `sync serve` workflows
+- scoped replication with validated primary-key-based row filters
+- conservative conflict recording by default, plus manual show/resolve/reopen
+  workflows and configurable policies
+- `sys_sync_*` inspection queries for status, journals, peers, scopes,
+  sessions, conflicts, peer lag, retention, and doctor summaries
+- retention reports, safe prune dry-runs, explicit data-loss override, and sync
+  doctor guidance
+- a typed .NET `DecentDBSyncClient` for app integration
+
+SQLite and DuckDB can participate in sync architectures when an application or
+external service layers replication around them. DecentDB's direction is
+different: offline writes, sync state, conflict inspection, scoped exchange,
+and operational diagnostics are first-class database capabilities.
+
+See [Local-first sync](sync/index.md) for the user guide and
+[CLI Reference](../api/cli-reference.md#sync-commands) for command details.
 
 ## SQL surface area
 

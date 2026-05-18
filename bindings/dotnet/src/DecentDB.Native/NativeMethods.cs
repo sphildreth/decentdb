@@ -245,6 +245,9 @@ public static class DecentDBNative
     [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_db_list_triggers_json")]
     internal static extern uint ddb_db_list_triggers_json(IntPtr db, out IntPtr outJson);
 
+    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_db_get_tooling_metadata_json")]
+    internal static extern uint ddb_db_get_tooling_metadata_json(IntPtr db, out IntPtr outJson);
+
 }
 
 public static unsafe class DecentDBNativeUnsafe
@@ -258,6 +261,9 @@ public static unsafe class DecentDBNativeUnsafe
 
     [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_db_open_or_create")]
     internal static extern uint ddb_db_open_or_create(byte* pathUtf8, out IntPtr outDb);
+
+    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_db_sync_execute_json")]
+    internal static extern uint ddb_db_sync_execute_json(IntPtr db, byte* requestJsonUtf8, out IntPtr outJson);
 
     [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_db_prepare")]
     internal static extern uint ddb_db_prepare(IntPtr db, byte* sqlUtf8, out IntPtr outStmt);
@@ -283,6 +289,12 @@ public static unsafe class DecentDBNativeUnsafe
     [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_stmt_bind_blob")]
     internal static extern uint ddb_stmt_bind_blob(IntPtr stmt, nuint index1Based, byte* data, nuint byteLen);
 
+    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_stmt_bind_geometry_wkb")]
+    internal static extern uint ddb_stmt_bind_geometry_wkb(IntPtr stmt, nuint index1Based, byte* data, nuint byteLen);
+
+    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_stmt_bind_geography_wkb")]
+    internal static extern uint ddb_stmt_bind_geography_wkb(IntPtr stmt, nuint index1Based, byte* data, nuint byteLen);
+
     [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_stmt_bind_uuid")]
     internal static extern uint ddb_stmt_bind_uuid(IntPtr stmt, nuint index1Based, byte* uuidBytes);
 
@@ -303,6 +315,9 @@ public static unsafe class DecentDBNativeUnsafe
 
     [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_db_get_view_ddl")]
     internal static extern uint ddb_db_get_view_ddl(IntPtr db, byte* viewNameUtf8, out IntPtr outDdl);
+
+    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_db_describe_query_json")]
+    internal static extern uint ddb_db_describe_query_json(IntPtr db, byte* sqlUtf8, out IntPtr outJson);
 
     [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_stmt_bind_int64_step_row_view")]
     internal static extern uint ddb_stmt_bind_int64_step_row_view(IntPtr stmt, nuint index1Based, long value,
@@ -357,7 +372,17 @@ internal enum DdbValueTag : uint
     Blob = 5,
     Decimal = 6,
     Uuid = 7,
-    TimestampMicros = 8
+    TimestampMicros = 8,
+    Geometry = 9,
+    Geography = 10,
+    Enum = 11,
+    IpAddr = 12,
+    Cidr = 13,
+    Date = 14,
+    Time = 15,
+    TimestamptzMicros = 16,
+    Interval = 17,
+    MacAddr = 18
 }
 
 [StructLayout(LayoutKind.Sequential)]
@@ -375,6 +400,47 @@ internal unsafe struct DdbValueNative
     public nuint len;
     public fixed byte uuid_bytes[16];
     public long timestamp_micros;
+    public ulong enum_type_id;
+    public ulong enum_label_id;
+    public byte ip_family;
+    public byte cidr_prefix_len;
+    public fixed byte reserved2[6];
+    public fixed byte ip_cidr_addr_bytes[16];
+    public int date_days;
+    public long time_micros;
+    public long timestamptz_micros;
+    public int interval_months;
+    public int interval_days;
+    public long interval_micros;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct DdbValueViewNative
+{
+    public uint tag;
+    public byte bool_value;
+    public fixed byte reserved0[7];
+    public long int64_value;
+    public double float64_value;
+    public long decimal_scaled;
+    public byte decimal_scale;
+    public fixed byte reserved1[7];
+    public byte* data;
+    public nuint len;
+    public fixed byte uuid_bytes[16];
+    public long timestamp_micros;
+    public ulong enum_type_id;
+    public ulong enum_label_id;
+    public byte ip_family;
+    public byte cidr_prefix_len;
+    public fixed byte reserved2[6];
+    public fixed byte ip_cidr_addr_bytes[16];
+    public int date_days;
+    public long time_micros;
+    public long timestamptz_micros;
+    public int interval_months;
+    public int interval_days;
+    public long interval_micros;
 }
 
 [StructLayout(LayoutKind.Sequential)]

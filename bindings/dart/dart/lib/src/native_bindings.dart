@@ -3,7 +3,7 @@ import 'dart:io' show Platform;
 
 import 'package:ffi/ffi.dart';
 
-const int expectedAbiVersion = 1;
+const int expectedAbiVersion = 2;
 const int ddbOk = 0;
 const int ddbTagNull = 0;
 const int ddbTagInt64 = 1;
@@ -14,6 +14,16 @@ const int ddbTagBlob = 5;
 const int ddbTagDecimal = 6;
 const int ddbTagUuid = 7;
 const int ddbTagTimestampMicros = 8;
+const int ddbTagGeometry = 9;
+const int ddbTagGeography = 10;
+const int ddbTagEnum = 11;
+const int ddbTagIpAddr = 12;
+const int ddbTagCidr = 13;
+const int ddbTagDate = 14;
+const int ddbTagTime = 15;
+const int ddbTagTimestamptzMicros = 16;
+const int ddbTagInterval = 17;
+const int ddbTagMacaddr = 18;
 
 final class DdbDb extends Opaque {}
 
@@ -57,6 +67,42 @@ final class DdbValue extends Struct {
 
   @Int64()
   external int timestampMicros;
+
+  @Uint64()
+  external int enumTypeId;
+
+  @Uint64()
+  external int enumLabelId;
+
+  @Uint8()
+  external int ipFamily;
+
+  @Uint8()
+  external int cidrPrefixLen;
+
+  @Array(6)
+  external Array<Uint8> reserved2;
+
+  @Array(16)
+  external Array<Uint8> ipCidrAddrBytes;
+
+  @Int32()
+  external int dateDays;
+
+  @Int64()
+  external int timeMicros;
+
+  @Int64()
+  external int timestamptzMicros;
+
+  @Int32()
+  external int intervalMonths;
+
+  @Int32()
+  external int intervalDays;
+
+  @Int64()
+  external int intervalMicros;
 }
 
 final class DdbValueView extends Struct {
@@ -94,6 +140,42 @@ final class DdbValueView extends Struct {
 
   @Int64()
   external int timestampMicros;
+
+  @Uint64()
+  external int enumTypeId;
+
+  @Uint64()
+  external int enumLabelId;
+
+  @Uint8()
+  external int ipFamily;
+
+  @Uint8()
+  external int cidrPrefixLen;
+
+  @Array(6)
+  external Array<Uint8> reserved2;
+
+  @Array(16)
+  external Array<Uint8> ipCidrAddrBytes;
+
+  @Int32()
+  external int dateDays;
+
+  @Int64()
+  external int timeMicros;
+
+  @Int64()
+  external int timestamptzMicros;
+
+  @Int32()
+  external int intervalMonths;
+
+  @Int32()
+  external int intervalDays;
+
+  @Int64()
+  external int intervalMicros;
 }
 
 final class DdbRowI64TextF64View extends Struct {
@@ -705,9 +787,14 @@ class NativeBindings {
         dbGetSchemaSnapshotJson =
             _lib.lookupFunction<_DbStringOutC, _DbStringOutDart>(
                 'ddb_db_get_schema_snapshot_json'),
-        dbInspectStorageStateJson = _lib.lookupFunction<
-                _DbInspectStorageStateC, _DbInspectStorageStateDart>(
-            'ddb_db_inspect_storage_state_json'),
+        dbGetToolingMetadataJson =
+            _lib.lookupFunction<_DbStringOutC, _DbStringOutDart>(
+                'ddb_db_get_tooling_metadata_json'),
+        dbDescribeQueryJson =
+            _lib.lookupFunction<_DbNamedStringOutC, _DbNamedStringOutDart>(
+                'ddb_db_describe_query_json'),
+        dbInspectStorageStateJson = _lib.lookupFunction<_DbInspectStorageStateC,
+            _DbInspectStorageStateDart>('ddb_db_inspect_storage_state_json'),
         evictSharedWal =
             _lib.lookupFunction<_EvictSharedWalC, _EvictSharedWalDart>(
                 'ddb_evict_shared_wal'),
@@ -798,9 +885,8 @@ class NativeBindings {
                 _StmtBindInt64StepI64TextF64C,
                 _StmtBindInt64StepI64TextF64Dart>(
             'ddb_stmt_bind_int64_step_i64_text_f64'),
-        stmtBindUuid =
-            _lib.lookupFunction<_StmtBindUuidC, _StmtBindUuidDart>(
-                'ddb_stmt_bind_uuid');
+        stmtBindUuid = _lib.lookupFunction<_StmtBindUuidC, _StmtBindUuidDart>(
+            'ddb_stmt_bind_uuid');
 
   // ignore: unused_field – kept so DynamicLibrary stays live and symbols remain resolved
   final DynamicLibrary _lib;
@@ -837,6 +923,8 @@ class NativeBindings {
   final _DbNamedStringOutDart dbGetViewDdl;
   final _DbStringOutDart dbListTriggersJson;
   final _DbStringOutDart dbGetSchemaSnapshotJson;
+  final _DbStringOutDart dbGetToolingMetadataJson;
+  final _DbNamedStringOutDart dbDescribeQueryJson;
   final _DbInspectStorageStateDart dbInspectStorageStateJson;
   final _EvictSharedWalDart evictSharedWal;
 

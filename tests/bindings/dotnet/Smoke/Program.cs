@@ -220,6 +220,18 @@ internal unsafe struct DdbValue
     public nuint Len;
     public fixed byte UuidBytes[16];
     public long TimestampMicros;
+    public ulong EnumTypeId;
+    public ulong EnumLabelId;
+    public byte IpFamily;
+    public byte CidrPrefixLen;
+    public fixed byte Reserved2[6];
+    public fixed byte IpCidrAddrBytes[16];
+    public int DateDays;
+    public long TimeMicros;
+    public long TimestamptzMicros;
+    public int IntervalMonths;
+    public int IntervalDays;
+    public long IntervalMicros;
 }
 
 internal static partial class Native

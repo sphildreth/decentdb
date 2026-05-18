@@ -33,11 +33,13 @@ pub(crate) fn checkpoint(wal: &WalHandle, pager: &PagerHandle, timeout_sec: u64)
     let _pending_reset = PendingReset(wal);
 
     let current_lsn = wal.latest_snapshot();
-    let safe_lsn = wal
+    let active_reader_lsn = wal
         .inner
         .reader_registry
         .min_snapshot_lsn()?
         .unwrap_or(current_lsn);
+    let retained_snapshot_lsn = wal.retained_snapshot_lsn().unwrap_or(current_lsn);
+    let safe_lsn = active_reader_lsn.min(retained_snapshot_lsn);
 
     let mut latest_versions = wal
         .inner
@@ -94,7 +96,10 @@ pub(crate) fn checkpoint(wal: &WalHandle, pager: &PagerHandle, timeout_sec: u64)
         // every version).  If safe_lsn < current_lsn, a reader that
         // dropped after we computed safe_lsn would cause us to lose
         // post-safe_lsn commits if we truncated.
-        if active_readers == 0 && safe_lsn >= current_lsn {
+        let named_snapshot_retained = wal
+            .retained_snapshot_lsn()
+            .is_some_and(|snapshot_lsn| snapshot_lsn < current_lsn);
+        if active_readers == 0 && !named_snapshot_retained && safe_lsn >= current_lsn {
             index.clear();
             if let Some(sidecar) = &wal.inner.index_sidecar {
                 sidecar

@@ -5,6 +5,47 @@ All notable changes to DecentDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.0] - 2026-05-18
+
+### Changed
+
+- Extracted CTE and query-scope utility functions from `exec/mod.rs` into `exec/cte.rs` (~470 lines), improving module cohesion.
+
+### Fixed
+
+- Fixed single-row `ENUM` inserts and updates after reopen so column label
+  metadata is used during write coercion instead of falling through to the
+  metadata-free generic cast path.
+- Removed three stale `#[ignore]` test annotations: the zero-byte WAL design-choice test, the `INSERT DEFAULT VALUES` missing-feature test, and the decimal negative-precision ordering test (the underlying sortable encoding was already correct, validated by the now-active test).
+
+### Added
+
+- **Stable schema and query-contract metadata for tooling:** added
+  `Db::get_tooling_metadata()`, `Db::describe_query_contract(sql)`, C ABI JSON
+  helpers, deterministic schema fingerprints, native type metadata, query
+  parameter/result-column contracts, and binding exposure across Python, Go,
+  .NET, Node.js, Java/JDBC, and Dart.
+- **Binding-native semantic data types:** added compact native storage and C ABI
+  value tags for `ENUM`, `IPADDR`/`INET`, `CIDR`, `DATE`, `TIME`,
+  `TIMESTAMPTZ`, `INTERVAL`, and `MACADDR`/`MACADDR8`, including SQL casts,
+  format-version migration support, dump/sync/tooling metadata coverage, and
+  typed result decoding across Python, Go, .NET, Node.js, Java/JDBC, and Dart.
+  `ENUM` stores stable label ids plus persisted catalog label metadata so row
+  values are not tied to mutable label strings.
+- **Native geospatial types and spatial indexes:** added `GEOMETRY` and
+  `GEOGRAPHY` column types with EWKB-backed storage, WKB/WKT/GeoJSON
+  conversion functions, core `ST_*` accessors/predicates/measurements,
+  indexed spatial filters, distance ordering via `<->`, point-in-polygon
+  spatial joins, C ABI bind/read support, and binding updates across Python,
+  Go, .NET, Node.js, Java JNI, and Dart.
+- **Branch, diff, restore, and time-travel workflows:** added named snapshots,
+  read-only historical execution, branch metadata, branch-local writes,
+  branch commit/log markers, primary-key row diffs, guarded restore,
+  constrained merge, CLI and REPL support, Rust APIs, and a C ABI JSON bridge.
+- 12 proptest-based property tests for WAL delta encoding (roundtrip, no-op, size bounds, determinism, corruption rejection) and WAL frame format (page/commit/checkpoint roundtrips, header identity, invalid frame types, encoded-len consistency).
+- 4 crash-recovery edge-case tests: checkpoint survival, uncommitted transaction discard, WAL growth-and-truncation cycle, and SQL-level transaction isolation.
+- `wal_fuzz` standalone binary exercising 6 WAL-corruption strategies across 75+ DB states to verify recovery never panics.
+
 ## [2.4.2] - 2026-05-04
 
 ### Fixed

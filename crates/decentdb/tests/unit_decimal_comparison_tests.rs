@@ -155,14 +155,11 @@ fn decimal_zero_normalized_to_zero_scale() {
     }
 }
 
-/// Confirmed defect: Very large negative decimals (-99999999.99) sort
-/// incorrectly relative to small negative decimals (-0.01). The
-/// sortable_decimal_bytes encoding likely has an overflow or bias issue
-/// for large magnitudes. Expected: id 2 (-99999999.99) < id 1 (-0.01).
-/// Actual: id 1 sorts first.
+/// Large negative decimals (-99999999.99) sort before small negative
+/// decimals (-0.01) via sortable_decimal_bytes. Validates that exponent
+/// inversion with digit complement produces correct lexicographic order.
 #[test]
-#[ignore = "known defect: large negative DECIMAL values sort incorrectly (sortable_decimal_bytes overflow/bias)"]
-fn decimal_negative_precision_ordering_defect() {
+fn decimal_negative_precision_ordering() {
     let db = mem_db();
     exec(&db, "CREATE TABLE t(id INT64, val DECIMAL(10, 2))");
     exec(&db, "INSERT INTO t VALUES (1, -0.01)");

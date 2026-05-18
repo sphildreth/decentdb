@@ -3,6 +3,10 @@
 This directory contains the in-tree Go `database/sql` driver package at
 `bindings/go/decentdb-go`.
 
+The driver decodes semantic result values into `EnumValue`, `IntervalValue`,
+canonical strings for network/MAC types, `time.Time` for `DATE` and
+`TIMESTAMPTZ`, and `time.Duration` for `TIME`.
+
 ## Benchmark
 
 From the repository root:

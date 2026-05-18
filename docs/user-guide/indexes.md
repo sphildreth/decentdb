@@ -101,6 +101,58 @@ SELECT * FROM users WHERE name ILIKE '%SMITH%';
 - Very common patterns (like 'the') may not use the index
 - Only works with `%pattern%` style LIKE queries
 
+## Spatial Indexes
+
+Spatial indexes accelerate native `GEOMETRY` and `GEOGRAPHY` columns. They store spatial envelopes in a native grid index and refine matches with exact `ST_*` predicate evaluation.
+
+### Creating Spatial Indexes
+
+```sql
+CREATE TABLE places (
+    id INTEGER PRIMARY KEY,
+    geog GEOGRAPHY(POINT,4326)
+);
+
+CREATE INDEX idx_places_geog ON places USING spatial(geog);
+```
+
+### When Spatial Indexes Are Used
+
+Spatial indexes accelerate single-table filters where one side is an indexed spatial column and the other side is a constant expression:
+
+- `ST_DWithin(geog, ST_GeogPoint(lon, lat), meters)`
+- `ST_Intersects(geom, ST_GeomFromText(...))`
+- `ST_Contains(geom, ST_GeomFromText(...))`
+- `ST_Within(geom, ST_GeomFromText(...))`
+- `ST_Equals(geom, ST_GeomFromText(...))`
+
+They also appear in `EXPLAIN` for nearest-neighbor ordering with `<->`:
+
+```sql
+EXPLAIN
+SELECT id
+FROM places
+ORDER BY geog <-> ST_GeogPoint(-97.7431, 30.2672)
+LIMIT 10;
+```
+
+Spatial indexes are also used for the narrow point-in-polygon join shape where one joined table has the indexed spatial column:
+
+```sql
+EXPLAIN
+SELECT h.id, z.id
+FROM houses h
+JOIN zones z
+  ON ST_Contains(z.boundary, h.location);
+```
+
+### Spatial Index Limitations
+
+- Spatial indexes are single-column only.
+- `UNIQUE`, partial predicates, expression keys, and `INCLUDE` columns are not supported for spatial indexes.
+- GEOGRAPHY indexes use WGS84 lon/lat with SRID 4326.
+- Exact predicates still run after candidate lookup, so results remain correct even when the grid returns false positives.
+
 ## Index Selectivity
 
 Selectivity measures how unique index values are:

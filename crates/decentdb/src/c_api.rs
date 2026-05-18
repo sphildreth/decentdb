@@ -4,13 +4,14 @@ use std::cell::RefCell;
 use std::ffi::{c_char, CStr, CString};
 use std::panic::{self, AssertUnwindSafe};
 use std::ptr;
+use std::str::FromStr;
 
 use crate::db::PreparedStatement;
 use crate::error::{DbError, DbErrorCode, Result};
 use crate::{evict_shared_wal, Db, DbConfig, QueryResult, Value};
 
 const DDB_OK: u32 = 0;
-const DDB_ABI_VERSION: u32 = 1;
+const DDB_ABI_VERSION: u32 = 2;
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -24,6 +25,16 @@ pub enum DdbValueTag {
     Decimal = 6,
     Uuid = 7,
     TimestampMicros = 8,
+    Geometry = 9,
+    Geography = 10,
+    Enum = 11,
+    IpAddr = 12,
+    Cidr = 13,
+    Date = 14,
+    Time = 15,
+    TimestamptzMicros = 16,
+    Interval = 17,
+    MacAddr = 18,
 }
 
 #[repr(C)]
@@ -41,6 +52,18 @@ pub struct DdbValue {
     pub len: usize,
     pub uuid_bytes: [u8; 16],
     pub timestamp_micros: i64,
+    pub enum_type_id: u64,
+    pub enum_label_id: u64,
+    pub ip_family: u8,
+    pub cidr_prefix_len: u8,
+    pub reserved2: [u8; 6],
+    pub ip_cidr_addr_bytes: [u8; 16],
+    pub date_days: i32,
+    pub time_micros: i64,
+    pub timestamptz_micros: i64,
+    pub interval_months: i32,
+    pub interval_days: i32,
+    pub interval_micros: i64,
 }
 
 impl Default for DdbValue {
@@ -58,6 +81,18 @@ impl Default for DdbValue {
             len: 0,
             uuid_bytes: [0; 16],
             timestamp_micros: 0,
+            enum_type_id: 0,
+            enum_label_id: 0,
+            ip_family: 0,
+            cidr_prefix_len: 0,
+            reserved2: [0; 6],
+            ip_cidr_addr_bytes: [0; 16],
+            date_days: 0,
+            time_micros: 0,
+            timestamptz_micros: 0,
+            interval_months: 0,
+            interval_days: 0,
+            interval_micros: 0,
         }
     }
 }
@@ -77,6 +112,18 @@ pub struct DdbValueView {
     pub len: usize,
     pub uuid_bytes: [u8; 16],
     pub timestamp_micros: i64,
+    pub enum_type_id: u64,
+    pub enum_label_id: u64,
+    pub ip_family: u8,
+    pub cidr_prefix_len: u8,
+    pub reserved2: [u8; 6],
+    pub ip_cidr_addr_bytes: [u8; 16],
+    pub date_days: i32,
+    pub time_micros: i64,
+    pub timestamptz_micros: i64,
+    pub interval_months: i32,
+    pub interval_days: i32,
+    pub interval_micros: i64,
 }
 
 impl Default for DdbValueView {
@@ -94,6 +141,18 @@ impl Default for DdbValueView {
             len: 0,
             uuid_bytes: [0; 16],
             timestamp_micros: 0,
+            enum_type_id: 0,
+            enum_label_id: 0,
+            ip_family: 0,
+            cidr_prefix_len: 0,
+            reserved2: [0; 6],
+            ip_cidr_addr_bytes: [0; 16],
+            date_days: 0,
+            time_micros: 0,
+            timestamptz_micros: 0,
+            interval_months: 0,
+            interval_days: 0,
+            interval_micros: 0,
         }
     }
 }
@@ -292,6 +351,14 @@ fn value_from_ffi(value: &DdbValue) -> Result<Value> {
             let bytes = borrowed_bytes(value.data.cast_const(), value.len)?;
             Ok(Value::Blob(bytes.to_vec()))
         }
+        x if x == DdbValueTag::Geometry as u32 => {
+            let bytes = borrowed_bytes(value.data.cast_const(), value.len)?;
+            Ok(Value::Geometry(bytes.to_vec()))
+        }
+        x if x == DdbValueTag::Geography as u32 => {
+            let bytes = borrowed_bytes(value.data.cast_const(), value.len)?;
+            Ok(Value::Geography(bytes.to_vec()))
+        }
         x if x == DdbValueTag::Decimal as u32 => Ok(Value::Decimal {
             scaled: value.decimal_scaled,
             scale: value.decimal_scale,
@@ -299,6 +366,40 @@ fn value_from_ffi(value: &DdbValue) -> Result<Value> {
         x if x == DdbValueTag::Uuid as u32 => Ok(Value::Uuid(value.uuid_bytes)),
         x if x == DdbValueTag::TimestampMicros as u32 => {
             Ok(Value::TimestampMicros(value.timestamp_micros))
+        }
+        x if x == DdbValueTag::Enum as u32 => Ok(Value::Enum {
+            enum_type_id: value.enum_type_id,
+            label_id: value.enum_label_id,
+        }),
+        x if x == DdbValueTag::IpAddr as u32 => Ok(Value::IpAddr {
+            family: value.ip_family,
+            addr: value.ip_cidr_addr_bytes,
+        }),
+        x if x == DdbValueTag::Cidr as u32 => Ok(Value::Cidr {
+            family: value.ip_family,
+            prefix_len: value.cidr_prefix_len,
+            network: value.ip_cidr_addr_bytes,
+        }),
+        x if x == DdbValueTag::Date as u32 => Ok(Value::DateDays(value.date_days)),
+        x if x == DdbValueTag::Time as u32 => Ok(Value::TimeMicros(value.time_micros)),
+        x if x == DdbValueTag::TimestamptzMicros as u32 => {
+            Ok(Value::TimestampTzMicros(value.timestamptz_micros))
+        }
+        x if x == DdbValueTag::Interval as u32 => Ok(Value::Interval {
+            months: value.interval_months,
+            days: value.interval_days,
+            micros: value.interval_micros,
+        }),
+        x if x == DdbValueTag::MacAddr as u32 => {
+            let len = value.ip_family;
+            let copy_len = match len {
+                crate::record::value::MACADDR_LEN_6 => 6,
+                crate::record::value::MACADDR_LEN_8 => 8,
+                _ => return Err(DbError::sql("invalid MACADDR parameter length")),
+            };
+            let mut bytes = [0_u8; 8];
+            bytes[..copy_len].copy_from_slice(&value.ip_cidr_addr_bytes[..copy_len]);
+            Ok(Value::MacAddr { len, bytes })
         }
         other => Err(DbError::sql(format!("unsupported DDB value tag {other}"))),
     }
@@ -320,11 +421,17 @@ fn borrowed_bytes<'a>(data: *const u8, len: usize) -> Result<&'a [u8]> {
 fn fill_ffi_value(out: &mut DdbValue, value: &Value) {
     if matches!(
         out.tag,
-        x if x == DdbValueTag::Text as u32 || x == DdbValueTag::Blob as u32
+        x if x == DdbValueTag::Text as u32
+            || x == DdbValueTag::Blob as u32
+            || x == DdbValueTag::Geometry as u32
+            || x == DdbValueTag::Geography as u32
     ) {
         free_owned_bytes(out.data, out.len);
     }
     ddb_value_reset(out);
+    if fill_semantic_ffi_value(out, value) {
+        return;
+    }
     match value {
         Value::Null => out.tag = DdbValueTag::Null as u32,
         Value::Int64(inner) => {
@@ -349,6 +456,16 @@ fn fill_ffi_value(out: &mut DdbValue, value: &Value) {
             out.data = owned_bytes(inner.clone());
             out.len = inner.len();
         }
+        Value::Geometry(inner) => {
+            out.tag = DdbValueTag::Geometry as u32;
+            out.data = owned_bytes(inner.clone());
+            out.len = inner.len();
+        }
+        Value::Geography(inner) => {
+            out.tag = DdbValueTag::Geography as u32;
+            out.data = owned_bytes(inner.clone());
+            out.len = inner.len();
+        }
         Value::Decimal { scaled, scale } => {
             out.tag = DdbValueTag::Decimal as u32;
             out.decimal_scaled = *scaled;
@@ -362,10 +479,23 @@ fn fill_ffi_value(out: &mut DdbValue, value: &Value) {
             out.tag = DdbValueTag::TimestampMicros as u32;
             out.timestamp_micros = *inner;
         }
+        Value::Enum { .. }
+        | Value::IpAddr { .. }
+        | Value::Cidr { .. }
+        | Value::MacAddr { .. }
+        | Value::DateDays(_)
+        | Value::TimeMicros(_)
+        | Value::TimestampTzMicros(_)
+        | Value::Interval { .. } => {
+            unreachable!("semantic values are handled before scalar C ABI fill")
+        }
     }
 }
 
 fn fill_ffi_value_view(out: &mut DdbValueView, value: &Value) {
+    if fill_semantic_ffi_value_view(out, value) {
+        return;
+    }
     match value {
         Value::Null => out.tag = DdbValueTag::Null as u32,
         Value::Int64(inner) => {
@@ -390,6 +520,16 @@ fn fill_ffi_value_view(out: &mut DdbValueView, value: &Value) {
             out.data = inner.as_ptr();
             out.len = inner.len();
         }
+        Value::Geometry(inner) => {
+            out.tag = DdbValueTag::Geometry as u32;
+            out.data = inner.as_ptr();
+            out.len = inner.len();
+        }
+        Value::Geography(inner) => {
+            out.tag = DdbValueTag::Geography as u32;
+            out.data = inner.as_ptr();
+            out.len = inner.len();
+        }
         Value::Decimal { scaled, scale } => {
             out.tag = DdbValueTag::Decimal as u32;
             out.decimal_scaled = *scaled;
@@ -403,6 +543,144 @@ fn fill_ffi_value_view(out: &mut DdbValueView, value: &Value) {
             out.tag = DdbValueTag::TimestampMicros as u32;
             out.timestamp_micros = *inner;
         }
+        Value::Enum { .. }
+        | Value::IpAddr { .. }
+        | Value::Cidr { .. }
+        | Value::MacAddr { .. }
+        | Value::DateDays(_)
+        | Value::TimeMicros(_)
+        | Value::TimestampTzMicros(_)
+        | Value::Interval { .. } => {
+            unreachable!("semantic values are handled before scalar C ABI view fill")
+        }
+    }
+}
+
+fn fill_semantic_ffi_value(_out: &mut DdbValue, _value: &Value) -> bool {
+    match _value {
+        Value::Enum {
+            enum_type_id,
+            label_id,
+        } => {
+            _out.tag = DdbValueTag::Enum as u32;
+            _out.enum_type_id = *enum_type_id;
+            _out.enum_label_id = *label_id;
+            true
+        }
+        Value::IpAddr { family, addr } => {
+            _out.tag = DdbValueTag::IpAddr as u32;
+            _out.ip_family = *family;
+            _out.ip_cidr_addr_bytes = *addr;
+            true
+        }
+        Value::Cidr {
+            family,
+            prefix_len,
+            network,
+        } => {
+            _out.tag = DdbValueTag::Cidr as u32;
+            _out.ip_family = *family;
+            _out.cidr_prefix_len = *prefix_len;
+            _out.ip_cidr_addr_bytes = *network;
+            true
+        }
+        Value::MacAddr { len, bytes } => {
+            _out.tag = DdbValueTag::MacAddr as u32;
+            _out.ip_family = *len;
+            _out.ip_cidr_addr_bytes[..8].copy_from_slice(bytes);
+            true
+        }
+        Value::DateDays(days) => {
+            _out.tag = DdbValueTag::Date as u32;
+            _out.date_days = *days;
+            true
+        }
+        Value::TimeMicros(micros) => {
+            _out.tag = DdbValueTag::Time as u32;
+            _out.time_micros = *micros;
+            true
+        }
+        Value::TimestampTzMicros(micros) => {
+            _out.tag = DdbValueTag::TimestamptzMicros as u32;
+            _out.timestamptz_micros = *micros;
+            true
+        }
+        Value::Interval {
+            months,
+            days,
+            micros,
+        } => {
+            _out.tag = DdbValueTag::Interval as u32;
+            _out.interval_months = *months;
+            _out.interval_days = *days;
+            _out.interval_micros = *micros;
+            true
+        }
+        _ => false,
+    }
+}
+
+fn fill_semantic_ffi_value_view(_out: &mut DdbValueView, _value: &Value) -> bool {
+    match _value {
+        Value::Enum {
+            enum_type_id,
+            label_id,
+        } => {
+            _out.tag = DdbValueTag::Enum as u32;
+            _out.enum_type_id = *enum_type_id;
+            _out.enum_label_id = *label_id;
+            true
+        }
+        Value::IpAddr { family, addr } => {
+            _out.tag = DdbValueTag::IpAddr as u32;
+            _out.ip_family = *family;
+            _out.ip_cidr_addr_bytes = *addr;
+            true
+        }
+        Value::Cidr {
+            family,
+            prefix_len,
+            network,
+        } => {
+            _out.tag = DdbValueTag::Cidr as u32;
+            _out.ip_family = *family;
+            _out.cidr_prefix_len = *prefix_len;
+            _out.ip_cidr_addr_bytes = *network;
+            true
+        }
+        Value::MacAddr { len, bytes } => {
+            _out.tag = DdbValueTag::MacAddr as u32;
+            _out.ip_family = *len;
+            _out.ip_cidr_addr_bytes[..8].copy_from_slice(bytes);
+            true
+        }
+        Value::DateDays(days) => {
+            _out.tag = DdbValueTag::Date as u32;
+            _out.date_days = *days;
+            true
+        }
+        Value::TimeMicros(micros) => {
+            _out.tag = DdbValueTag::Time as u32;
+            _out.time_micros = *micros;
+            true
+        }
+        Value::TimestampTzMicros(micros) => {
+            _out.tag = DdbValueTag::TimestamptzMicros as u32;
+            _out.timestamptz_micros = *micros;
+            true
+        }
+        Value::Interval {
+            months,
+            days,
+            micros,
+        } => {
+            _out.tag = DdbValueTag::Interval as u32;
+            _out.interval_months = *months;
+            _out.interval_days = *days;
+            _out.interval_micros = *micros;
+            true
+        }
+        _ => false,
     }
 }
 
@@ -563,6 +841,190 @@ fn to_json_string<T: serde::Serialize>(value: &T) -> Result<String> {
     })
 }
 
+fn sync_request_root(request_json: &str) -> Result<serde_json::Value> {
+    serde_json::from_str(request_json)
+        .map_err(|error| DbError::sql(format!("invalid sync JSON request: {error}")))
+}
+
+fn sync_request_object<'a>(
+    request: &'a serde_json::Value,
+    op: &str,
+) -> Result<&'a serde_json::Map<String, serde_json::Value>> {
+    request
+        .as_object()
+        .ok_or_else(|| DbError::sql(format!("sync request for op '{op}' must be a JSON object")))
+}
+
+fn sync_request_field<'a>(
+    request: &'a serde_json::Map<String, serde_json::Value>,
+    op: &str,
+    field: &str,
+) -> Result<&'a serde_json::Value> {
+    request.get(field).ok_or_else(|| {
+        DbError::sql(format!(
+            "sync request for op '{op}' is missing field '{field}'"
+        ))
+    })
+}
+
+fn sync_request_op(request: &serde_json::Map<String, serde_json::Value>) -> Result<String> {
+    match request.get("op") {
+        Some(serde_json::Value::String(value)) => Ok(value.clone()),
+        Some(serde_json::Value::Null) | None => {
+            Err(DbError::sql("sync request is missing field 'op'"))
+        }
+        Some(other) => Err(DbError::sql(format!(
+            "sync request field 'op' must be a string, got {other}"
+        ))),
+    }
+}
+
+fn sync_request_string_field(
+    request: &serde_json::Map<String, serde_json::Value>,
+    op: &str,
+    field: &str,
+) -> Result<String> {
+    match sync_request_field(request, op, field)? {
+        serde_json::Value::String(value) => Ok(value.clone()),
+        serde_json::Value::Null => Err(DbError::sql(format!(
+            "sync request field '{field}' for op '{op}' must be a string"
+        ))),
+        other => Err(DbError::sql(format!(
+            "sync request field '{field}' for op '{op}' must be a string, got {other}"
+        ))),
+    }
+}
+
+fn sync_request_optional_string_field(
+    request: &serde_json::Map<String, serde_json::Value>,
+    op: &str,
+    field: &str,
+) -> Result<Option<String>> {
+    match request.get(field) {
+        None => Ok(None),
+        Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(value)) => Ok(Some(value.clone())),
+        Some(other) => Err(DbError::sql(format!(
+            "sync request field '{field}' for op '{op}' must be null or a string, got {other}"
+        ))),
+    }
+}
+
+fn sync_request_bool_field(
+    request: &serde_json::Map<String, serde_json::Value>,
+    op: &str,
+    field: &str,
+) -> Result<bool> {
+    match sync_request_field(request, op, field)? {
+        serde_json::Value::Bool(value) => Ok(*value),
+        other => Err(DbError::sql(format!(
+            "sync request field '{field}' for op '{op}' must be a boolean, got {other}"
+        ))),
+    }
+}
+
+fn sync_request_u64_field(
+    request: &serde_json::Map<String, serde_json::Value>,
+    op: &str,
+    field: &str,
+) -> Result<u64> {
+    match sync_request_field(request, op, field)? {
+        serde_json::Value::Number(number) => number.as_u64().ok_or_else(|| {
+            DbError::sql(format!(
+                "sync request field '{field}' for op '{op}' must be an unsigned integer"
+            ))
+        }),
+        other => Err(DbError::sql(format!(
+            "sync request field '{field}' for op '{op}' must be an unsigned integer, got {other}"
+        ))),
+    }
+}
+
+fn sync_request_i64_field(
+    request: &serde_json::Map<String, serde_json::Value>,
+    op: &str,
+    field: &str,
+) -> Result<i64> {
+    match sync_request_field(request, op, field)? {
+        serde_json::Value::Number(number) => number.as_i64().ok_or_else(|| {
+            DbError::sql(format!(
+                "sync request field '{field}' for op '{op}' must be a signed integer"
+            ))
+        }),
+        other => Err(DbError::sql(format!(
+            "sync request field '{field}' for op '{op}' must be a signed integer, got {other}"
+        ))),
+    }
+}
+
+fn sync_request_usize_field(
+    request: &serde_json::Map<String, serde_json::Value>,
+    op: &str,
+    field: &str,
+) -> Result<usize> {
+    let value = sync_request_u64_field(request, op, field)?;
+    usize::try_from(value).map_err(|_| {
+        DbError::sql(format!(
+            "sync request field '{field}' for op '{op}' is too large"
+        ))
+    })
+}
+
+fn sync_request_string_list_field(
+    request: &serde_json::Map<String, serde_json::Value>,
+    op: &str,
+    field: &str,
+) -> Result<Vec<String>> {
+    let value = sync_request_field(request, op, field)?;
+    let Some(items) = value.as_array() else {
+        return Err(DbError::sql(format!(
+            "sync request field '{field}' for op '{op}' must be an array of strings"
+        )));
+    };
+    items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| match item {
+            serde_json::Value::String(value) => Ok(value.clone()),
+            other => Err(DbError::sql(format!(
+                "sync request field '{field}' for op '{op}' must contain only strings; item {index} was {other}"
+            ))),
+        })
+        .collect()
+}
+
+fn sync_request_optional_string_list_field(
+    request: &serde_json::Map<String, serde_json::Value>,
+    op: &str,
+    field: &str,
+) -> Result<Vec<String>> {
+    match request.get(field) {
+        None | Some(serde_json::Value::Null) => Ok(Vec::new()),
+        Some(serde_json::Value::Array(_)) => sync_request_string_list_field(request, op, field),
+        Some(other) => Err(DbError::sql(format!(
+            "sync request field '{field}' for op '{op}' must be null or an array of strings, got {other}"
+        ))),
+    }
+}
+
+fn sync_request_json_value_field(
+    request: &serde_json::Map<String, serde_json::Value>,
+    op: &str,
+    field: &str,
+) -> Result<serde_json::Value> {
+    Ok(sync_request_field(request, op, field)?.clone())
+}
+
+fn sync_json_response<T: serde::Serialize>(value: &T) -> Result<*mut c_char> {
+    cstring_from_string(to_json_string(value)?)
+}
+
+fn sync_to_value<T: serde::Serialize>(value: T) -> Result<serde_json::Value> {
+    serde_json::to_value(value).map_err(|error| {
+        DbError::internal(format!("failed to serialize sync JSON response: {error}"))
+    })
+}
+
 #[no_mangle]
 pub extern "C" fn ddb_abi_version() -> u32 {
     DDB_ABI_VERSION
@@ -684,6 +1146,307 @@ pub extern "C" fn ddb_db_open_or_create(path: *const c_char, out_db: *mut *mut D
             db: Db::open_or_create(path, DbConfig::default())?,
         });
         *out_ptr(out_db, "out_db")? = Box::into_raw(handle);
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_db_sync_execute_json(
+    db: *mut DbHandle,
+    request_json: *const c_char,
+    out_json: *mut *mut c_char,
+) -> u32 {
+    ffi_boundary(|| {
+        let db = handle_ref(db, "db")?;
+        let request_json = utf8_arg(request_json, "request_json")?;
+        let request = sync_request_root(&request_json)?;
+        let request_object = sync_request_object(&request, "request")?;
+        let op = sync_request_op(request_object)?;
+        let response =
+            match op.as_str() {
+                "status" => sync_to_value(db.db.sync_status()?)?,
+                "init_replica" => {
+                    let replica_id = sync_request_string_field(request_object, &op, "replica_id")?;
+                    db.db.sync_init_replica(&replica_id)?;
+                    sync_to_value(db.db.sync_status()?)?
+                }
+                "set_enabled" => {
+                    let enabled = sync_request_bool_field(request_object, &op, "enabled")?;
+                    db.db.sync_set_enabled(enabled)?;
+                    sync_to_value(db.db.sync_status()?)?
+                }
+                "pending_changes" => {
+                    let since = sync_request_u64_field(request_object, &op, "since")?;
+                    let limit = sync_request_usize_field(request_object, &op, "limit")?;
+                    sync_to_value(db.db.sync_pending_changes(since, limit)?)?
+                }
+                "export_batch" => {
+                    let since = sync_request_u64_field(request_object, &op, "since")?;
+                    let limit = sync_request_usize_field(request_object, &op, "limit")?;
+                    let scope = sync_request_optional_string_field(request_object, &op, "scope")?;
+                    match scope.as_deref() {
+                        Some(scope) => {
+                            sync_to_value(db.db.sync_export_batch_for_scope(scope, since, limit)?)?
+                        }
+                        None => sync_to_value(db.db.sync_export_batch(since, limit)?)?,
+                    }
+                }
+                "import_batch" => {
+                    let batch = sync_request_json_value_field(request_object, &op, "batch")?;
+                    let batch: crate::sync::SyncChangeBatch = serde_json::from_value(batch)
+                        .map_err(|error| {
+                            DbError::sql(format!("invalid sync batch request body: {error}"))
+                        })?;
+                    let scope = sync_request_optional_string_field(request_object, &op, "scope")?;
+                    let conflict_policy =
+                        sync_request_optional_string_field(request_object, &op, "conflict_policy")?;
+                    let summary = match (scope.as_deref(), conflict_policy.as_deref()) {
+                        (Some(scope), Some(policy)) => {
+                            let policy = crate::sync::SyncConflictPolicy::from_str(policy)?;
+                            db.db
+                                .sync_import_batch_for_scope_with_policy(scope, &batch, policy)?
+                        }
+                        (Some(scope), None) => db.db.sync_import_batch_for_scope(scope, &batch)?,
+                        (None, Some(policy)) => {
+                            let policy = crate::sync::SyncConflictPolicy::from_str(policy)?;
+                            db.db.sync_import_batch_with_policy(&batch, policy)?
+                        }
+                        (None, None) => db.db.sync_import_batch(&batch)?,
+                    };
+                    sync_to_value(summary)?
+                }
+                "add_peer" => {
+                    let name = sync_request_string_field(request_object, &op, "name")?;
+                    let endpoint = sync_request_string_field(request_object, &op, "endpoint")?;
+                    let token_env =
+                        sync_request_optional_string_field(request_object, &op, "token_env")?;
+                    db.db
+                        .sync_add_peer(&name, &endpoint, token_env.as_deref())?;
+                    sync_to_value(
+                        db.db.sync_peer(&name)?.ok_or_else(|| {
+                            DbError::internal("sync peer missing after add/update")
+                        })?,
+                    )?
+                }
+                "remove_peer" => {
+                    let name = sync_request_string_field(request_object, &op, "name")?;
+                    sync_to_value(serde_json::json!({
+                        "removed": db.db.sync_remove_peer(&name)?,
+                    }))?
+                }
+                "peers" => sync_to_value(db.db.sync_peers()?)?,
+                "create_scope" => {
+                    let name = sync_request_string_field(request_object, &op, "name")?;
+                    let include_tables =
+                        sync_request_string_list_field(request_object, &op, "include_tables")?;
+                    let row_filter =
+                        sync_request_optional_string_field(request_object, &op, "row_filter")?;
+                    let include_table_refs = include_tables
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>();
+                    db.db
+                        .sync_create_scope(&name, &include_table_refs, row_filter.as_deref())?;
+                    sync_to_value(db.db.sync_scope(&name)?.ok_or_else(|| {
+                        DbError::internal("sync scope missing after create/update")
+                    })?)?
+                }
+                "drop_scope" => {
+                    let name = sync_request_string_field(request_object, &op, "name")?;
+                    sync_to_value(serde_json::json!({
+                        "removed": db.db.sync_drop_scope(&name)?,
+                    }))?
+                }
+                "scopes" => sync_to_value(db.db.sync_scopes()?)?,
+                "bind_peer_scope" => {
+                    let peer_name = sync_request_string_field(request_object, &op, "peer_name")?;
+                    let scope_name = sync_request_string_field(request_object, &op, "scope_name")?;
+                    db.db.sync_bind_peer_scope(&peer_name, &scope_name)?;
+                    sync_to_value(db.db.sync_peer_scope(&peer_name)?.ok_or_else(|| {
+                        DbError::internal("sync peer scope binding missing after bind")
+                    })?)?
+                }
+                "unbind_peer_scope" => {
+                    let peer_name = sync_request_string_field(request_object, &op, "peer_name")?;
+                    sync_to_value(serde_json::json!({
+                        "removed": db.db.sync_unbind_peer_scope(&peer_name)?,
+                    }))?
+                }
+                "peer_scope_bindings" => sync_to_value(db.db.sync_peer_scope_bindings()?)?,
+                "sessions" => sync_to_value(db.db.sync_sessions()?)?,
+                "conflicts" => {
+                    let all = sync_request_bool_field(request_object, &op, "all")?;
+                    if all {
+                        sync_to_value(db.db.sync_conflicts_all()?)?
+                    } else {
+                        sync_to_value(db.db.sync_conflicts()?)?
+                    }
+                }
+                "conflict" => {
+                    let id = sync_request_i64_field(request_object, &op, "id")?;
+                    match db.db.sync_conflict(id)? {
+                        Some(conflict) => sync_to_value(conflict)?,
+                        None => serde_json::Value::Null,
+                    }
+                }
+                "resolve_conflict" => {
+                    let id = sync_request_i64_field(request_object, &op, "id")?;
+                    let action = sync_request_string_field(request_object, &op, "action")?;
+                    let by = sync_request_optional_string_field(request_object, &op, "by")?;
+                    let note = sync_request_optional_string_field(request_object, &op, "note")?;
+                    match action.as_str() {
+                        "keep_local" => {
+                            let _ = db.db.sync_resolve_conflict_keep_local(
+                                id,
+                                by.as_deref(),
+                                note.as_deref(),
+                            )?;
+                        }
+                        "apply_remote" => {
+                            let _ = db.db.sync_resolve_conflict_apply_remote(
+                                id,
+                                by.as_deref(),
+                                note.as_deref(),
+                            )?;
+                        }
+                        other => {
+                            return Err(DbError::sql(format!(
+                                "unsupported sync conflict resolution action '{other}'"
+                            )));
+                        }
+                    }
+                    match db.db.sync_conflict(id)? {
+                        Some(conflict) => sync_to_value(conflict)?,
+                        None => serde_json::Value::Null,
+                    }
+                }
+                "reopen_conflict" => {
+                    let id = sync_request_i64_field(request_object, &op, "id")?;
+                    let _ = db.db.sync_reopen_conflict(id)?;
+                    match db.db.sync_conflict(id)? {
+                        Some(conflict) => sync_to_value(conflict)?,
+                        None => serde_json::Value::Null,
+                    }
+                }
+                "conflict_policy" => sync_to_value(db.db.sync_conflict_policy()?)?,
+                "set_conflict_policy" => {
+                    let policy = sync_request_string_field(request_object, &op, "policy")?;
+                    let origin_priority = sync_request_optional_string_list_field(
+                        request_object,
+                        &op,
+                        "origin_priority",
+                    )?;
+                    let origin_priority_refs = origin_priority
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>();
+                    let policy = crate::sync::SyncConflictPolicy::from_str(&policy)?;
+                    db.db
+                        .sync_set_conflict_policy(policy, &origin_priority_refs)?;
+                    sync_to_value(db.db.sync_conflict_policy()?)?
+                }
+                "doctor" => sync_to_value(db.db.sync_operational_doctor_report()?)?,
+                "retention" => sync_to_value(db.db.sync_retention_report()?)?,
+                "peer_lag" => sync_to_value(db.db.sync_peer_lag_report()?)?,
+                "prune" => {
+                    let through = sync_request_u64_field(request_object, &op, "through")?;
+                    let dry_run = sync_request_bool_field(request_object, &op, "dry_run")?;
+                    let allow_data_loss =
+                        sync_request_bool_field(request_object, &op, "allow_data_loss")?;
+                    sync_to_value(
+                        db.db
+                            .sync_prune_journal(through, dry_run, allow_data_loss)?,
+                    )?
+                }
+                other => {
+                    return Err(DbError::sql(format!("unsupported sync JSON op '{other}'")));
+                }
+            };
+        *out_ptr(out_json, "out_json")? = sync_json_response(&response)?;
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_db_branch_execute_json(
+    db: *mut DbHandle,
+    request_json: *const c_char,
+    out_json: *mut *mut c_char,
+) -> u32 {
+    ffi_boundary(|| {
+        let db = handle_ref(db, "db")?;
+        let request_json = utf8_arg(request_json, "request_json")?;
+        let request = sync_request_root(&request_json)?;
+        let request_object = sync_request_object(&request, "request")?;
+        let op = sync_request_op(request_object)?;
+        let response = match op.as_str() {
+            "snapshot_create" => {
+                let name = sync_request_string_field(request_object, &op, "name")?;
+                sync_to_value(db.db.snapshot_create(&name)?)?
+            }
+            "snapshot_list" => sync_to_value(db.db.snapshot_list()?)?,
+            "snapshot_delete" => {
+                let name = sync_request_string_field(request_object, &op, "name")?;
+                sync_to_value(serde_json::json!({
+                    "name": name,
+                    "deleted": db.db.snapshot_delete(&name)?,
+                }))?
+            }
+            "branch_create" => {
+                let name = sync_request_string_field(request_object, &op, "name")?;
+                let from = sync_request_optional_string_field(request_object, &op, "from")?;
+                sync_to_value(db.db.branch_create(&name, from.as_deref())?)?
+            }
+            "branch_list" => sync_to_value(db.db.branch_list()?)?,
+            "branch_delete" => {
+                let name = sync_request_string_field(request_object, &op, "name")?;
+                sync_to_value(serde_json::json!({
+                    "name": name,
+                    "deleted": db.db.branch_delete(&name)?,
+                }))?
+            }
+            "branch_rename" => {
+                let name = sync_request_string_field(request_object, &op, "name")?;
+                let new_name = sync_request_string_field(request_object, &op, "new_name")?;
+                sync_to_value(serde_json::json!({
+                    "old_name": name,
+                    "new_name": new_name,
+                    "renamed": db.db.branch_rename(&name, &new_name)?,
+                }))?
+            }
+            "branch_commit" => {
+                let name = sync_request_string_field(request_object, &op, "name")?;
+                let message = sync_request_string_field(request_object, &op, "message")?;
+                sync_to_value(db.db.branch_commit(&name, &message)?)?
+            }
+            "branch_log" => {
+                let name = sync_request_string_field(request_object, &op, "name")?;
+                sync_to_value(db.db.branch_log(&name)?)?
+            }
+            "branch_diff" => {
+                let left = sync_request_string_field(request_object, &op, "left")?;
+                let right = sync_request_string_field(request_object, &op, "right")?;
+                sync_to_value(db.db.branch_diff(&left, &right)?)?
+            }
+            "branch_restore" => {
+                let name = sync_request_string_field(request_object, &op, "name")?;
+                let target = sync_request_string_field(request_object, &op, "target")?;
+                let dry_run = sync_request_bool_field(request_object, &op, "dry_run")?;
+                sync_to_value(db.db.branch_restore(&name, &target, dry_run)?)?
+            }
+            "branch_merge" => {
+                let source = sync_request_string_field(request_object, &op, "source")?;
+                let target = sync_request_string_field(request_object, &op, "target")?;
+                let dry_run = sync_request_bool_field(request_object, &op, "dry_run")?;
+                sync_to_value(db.db.branch_merge(&source, &target, dry_run)?)?
+            }
+            other => {
+                return Err(DbError::sql(format!(
+                    "unsupported branch JSON op '{other}'"
+                )));
+            }
+        };
+        *out_ptr(out_json, "out_json")? = sync_json_response(&response)?;
         Ok(())
     })
 }
@@ -1037,6 +1800,40 @@ pub extern "C" fn ddb_stmt_bind_blob(
         let stmt = handle_mut(stmt, "stmt")?;
         let slot = ensure_stmt_binding_slot(stmt, index_1_based)?;
         stmt.bindings[slot] = Value::Blob(bytes.to_vec());
+        invalidate_stmt_result(stmt);
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_stmt_bind_geometry_wkb(
+    stmt: *mut StmtHandle,
+    index_1_based: usize,
+    data: *const u8,
+    byte_len: usize,
+) -> u32 {
+    ffi_boundary(|| {
+        let bytes = borrowed_bytes(data, byte_len)?;
+        let stmt = handle_mut(stmt, "stmt")?;
+        let slot = ensure_stmt_binding_slot(stmt, index_1_based)?;
+        stmt.bindings[slot] = Value::Geometry(bytes.to_vec());
+        invalidate_stmt_result(stmt);
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_stmt_bind_geography_wkb(
+    stmt: *mut StmtHandle,
+    index_1_based: usize,
+    data: *const u8,
+    byte_len: usize,
+) -> u32 {
+    ffi_boundary(|| {
+        let bytes = borrowed_bytes(data, byte_len)?;
+        let stmt = handle_mut(stmt, "stmt")?;
+        let slot = ensure_stmt_binding_slot(stmt, index_1_based)?;
+        stmt.bindings[slot] = Value::Geography(bytes.to_vec());
         invalidate_stmt_result(stmt);
         Ok(())
     })
@@ -1754,6 +2551,32 @@ pub extern "C" fn ddb_db_get_schema_snapshot_json(
 }
 
 #[no_mangle]
+pub extern "C" fn ddb_db_get_tooling_metadata_json(
+    db: *mut DbHandle,
+    out_json: *mut *mut c_char,
+) -> u32 {
+    ffi_boundary(|| {
+        let metadata = handle_ref(db, "db")?.db.get_tooling_metadata()?;
+        *out_ptr(out_json, "out_json")? = cstring_from_string(to_json_string(&metadata)?)?;
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_db_describe_query_json(
+    db: *mut DbHandle,
+    sql: *const c_char,
+    out_json: *mut *mut c_char,
+) -> u32 {
+    ffi_boundary(|| {
+        let sql = utf8_arg(sql, "sql")?;
+        let contract = handle_ref(db, "db")?.db.describe_query_contract(&sql)?;
+        *out_ptr(out_json, "out_json")? = cstring_from_string(to_json_string(&contract)?)?;
+        Ok(())
+    })
+}
+
+#[no_mangle]
 pub extern "C" fn ddb_db_inspect_storage_state_json(
     db: *mut DbHandle,
     out_json: *mut *mut c_char,
@@ -1894,10 +2717,20 @@ mod tests {
         serde_json::from_str(&take_json(slot)).expect("valid JSON payload")
     }
 
+    fn sync_exec_json(db: *mut DbHandle, request: &JsonValue) -> JsonValue {
+        let mut out = ptr::null_mut();
+        let request = CString::new(request.to_string()).expect("request json");
+        assert_eq!(
+            ddb_db_sync_execute_json(db, request.as_ptr(), &mut out),
+            DDB_OK
+        );
+        parse_json(&mut out)
+    }
+
     #[test]
     fn abi_shape_matches_expected_layout() {
         let _execute: ExecuteFn = ddb_db_execute;
-        assert_eq!(std::mem::size_of::<DdbValue>(), 88);
+        assert_eq!(std::mem::size_of::<DdbValue>(), 168);
         assert_eq!(std::mem::align_of::<DdbValue>(), 8);
     }
 
@@ -2032,6 +2865,121 @@ mod tests {
     }
 
     #[test]
+    fn ffi_roundtrip_copies_semantic_value_tags() {
+        let mut db = ptr::null_mut();
+        let path = CString::new(":memory:").expect("path");
+        assert_eq!(ddb_db_open_or_create(path.as_ptr(), &mut db), DDB_OK);
+
+        let create = CString::new(
+            "CREATE TABLE semantic_values (
+                id INT64 PRIMARY KEY,
+                ip IPADDR,
+                network CIDR,
+                day DATE,
+                tod TIME,
+                tsz TIMESTAMPTZ,
+                span INTERVAL,
+                mac MACADDR
+            )",
+        )
+        .expect("create");
+        let mut result = ptr::null_mut();
+        assert_eq!(
+            ddb_db_execute(db, create.as_ptr(), ptr::null(), 0, &mut result),
+            DDB_OK
+        );
+        assert_eq!(ddb_result_free(&mut result), DDB_OK);
+
+        let insert = CString::new(
+            "INSERT INTO semantic_values VALUES (
+                1,
+                '10.1.2.3',
+                '10.1.2.99/24',
+                '1970-01-03',
+                '01:02:03.004005',
+                '1970-01-01T00:00:00Z',
+                '12 -3 4000000',
+                '08:00:2b:01:02:03'
+            )",
+        )
+        .expect("insert");
+        let insert_status = ddb_db_execute(db, insert.as_ptr(), ptr::null(), 0, &mut result);
+        assert_eq!(
+            insert_status,
+            DDB_OK,
+            "insert failed: {}",
+            unsafe { CStr::from_ptr(ddb_last_error_message()) }
+                .to_str()
+                .expect("utf8")
+        );
+        assert_eq!(ddb_result_free(&mut result), DDB_OK);
+
+        let select =
+            CString::new("SELECT ip, network, day, tod, tsz, span, mac FROM semantic_values")
+                .expect("select");
+        assert_eq!(
+            ddb_db_execute(db, select.as_ptr(), ptr::null(), 0, &mut result),
+            DDB_OK
+        );
+
+        let mut rows = 0;
+        let mut columns = 0;
+        assert_eq!(ddb_result_row_count(result, &mut rows), DDB_OK);
+        assert_eq!(ddb_result_column_count(result, &mut columns), DDB_OK);
+        assert_eq!(rows, 1);
+        assert_eq!(columns, 7);
+
+        let mut copied = DdbValue::default();
+
+        assert_eq!(ddb_result_value_copy(result, 0, 0, &mut copied), DDB_OK);
+        assert_eq!(copied.tag, DdbValueTag::IpAddr as u32);
+        assert_eq!(copied.ip_family, 4);
+        assert_eq!(copied.ip_cidr_addr_bytes[..4], [10, 1, 2, 3]);
+        assert_eq!(ddb_value_dispose(&mut copied), DDB_OK);
+
+        assert_eq!(ddb_result_value_copy(result, 0, 1, &mut copied), DDB_OK);
+        assert_eq!(copied.tag, DdbValueTag::Cidr as u32);
+        assert_eq!(copied.ip_family, 4);
+        assert_eq!(copied.cidr_prefix_len, 24);
+        assert_eq!(copied.ip_cidr_addr_bytes[..4], [10, 1, 2, 0]);
+        assert_eq!(ddb_value_dispose(&mut copied), DDB_OK);
+
+        assert_eq!(ddb_result_value_copy(result, 0, 2, &mut copied), DDB_OK);
+        assert_eq!(copied.tag, DdbValueTag::Date as u32);
+        assert_eq!(copied.date_days, 2);
+        assert_eq!(ddb_value_dispose(&mut copied), DDB_OK);
+
+        assert_eq!(ddb_result_value_copy(result, 0, 3, &mut copied), DDB_OK);
+        assert_eq!(copied.tag, DdbValueTag::Time as u32);
+        assert_eq!(copied.time_micros, 3_723_004_005);
+        assert_eq!(ddb_value_dispose(&mut copied), DDB_OK);
+
+        assert_eq!(ddb_result_value_copy(result, 0, 4, &mut copied), DDB_OK);
+        assert_eq!(copied.tag, DdbValueTag::TimestamptzMicros as u32);
+        assert_eq!(copied.timestamptz_micros, 0);
+        assert_eq!(ddb_value_dispose(&mut copied), DDB_OK);
+
+        assert_eq!(ddb_result_value_copy(result, 0, 5, &mut copied), DDB_OK);
+        assert_eq!(copied.tag, DdbValueTag::Interval as u32);
+        assert_eq!(copied.interval_months, 12);
+        assert_eq!(copied.interval_days, -3);
+        assert_eq!(copied.interval_micros, 4_000_000);
+        assert_eq!(ddb_value_dispose(&mut copied), DDB_OK);
+
+        assert_eq!(ddb_result_value_copy(result, 0, 6, &mut copied), DDB_OK);
+        assert_eq!(copied.tag, DdbValueTag::MacAddr as u32);
+        assert_eq!(copied.ip_family, 6);
+        assert_eq!(
+            copied.ip_cidr_addr_bytes[..6],
+            [0x08, 0x00, 0x2b, 0x01, 0x02, 0x03]
+        );
+        assert_eq!(ddb_value_dispose(&mut copied), DDB_OK);
+
+        assert_eq!(ddb_result_free(&mut result), DDB_OK);
+        assert_eq!(ddb_db_free(&mut db), DDB_OK);
+    }
+
+    #[test]
     fn metadata_json_helpers_return_current_catalog_state() {
         let mut db = ptr::null_mut();
         let path = CString::new(":memory:").expect("path");
@@ -2140,6 +3088,80 @@ mod tests {
         let schema_snapshot = parse_json(&mut schema_snapshot_json);
         assert_eq!(schema_snapshot["snapshot_version"].as_u64(), Some(1));
         assert!(schema_snapshot["schema_cookie"].as_u64().is_some());
+
+        let mut tooling_metadata_json = ptr::null_mut();
+        assert_eq!(
+            ddb_db_get_tooling_metadata_json(db, &mut tooling_metadata_json),
+            DDB_OK
+        );
+        let tooling_metadata = parse_json(&mut tooling_metadata_json);
+        assert_eq!(tooling_metadata["metadata_version"].as_u64(), Some(1));
+        assert_eq!(
+            tooling_metadata["schema_fingerprint_algorithm"].as_str(),
+            Some("sha256:decentdb-tooling-schema-v1")
+        );
+        assert_eq!(
+            tooling_metadata["schema_fingerprint"]
+                .as_str()
+                .expect("schema fingerprint")
+                .len(),
+            64
+        );
+        assert_eq!(
+            tooling_metadata["schema"]["snapshot_version"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            tooling_metadata["capabilities"]["query_contract_version"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            tooling_metadata["capabilities"]["query_describe"].as_bool(),
+            Some(true)
+        );
+        let child_parent_type = tooling_metadata["column_type_metadata"]
+            .as_array()
+            .expect("column type metadata array")
+            .iter()
+            .find(|column| column["table_name"] == "child" && column["column_name"] == "parent_id")
+            .expect("child parent_id tooling type metadata");
+        assert_eq!(child_parent_type["column_type"].as_str(), Some("INT64"));
+        assert_eq!(
+            child_parent_type["type_info"]["c_value_tag"].as_u64(),
+            Some(1)
+        );
+
+        let describe_sql =
+            CString::new("SELECT id, parent_id FROM child WHERE parent_id = $1").expect("sql");
+        let mut query_contract_json = ptr::null_mut();
+        assert_eq!(
+            ddb_db_describe_query_json(db, describe_sql.as_ptr(), &mut query_contract_json),
+            DDB_OK
+        );
+        let query_contract = parse_json(&mut query_contract_json);
+        assert_eq!(query_contract["contract_version"].as_u64(), Some(1));
+        assert_eq!(query_contract["statement_kind"].as_str(), Some("query"));
+        assert_eq!(query_contract["read_only"].as_bool(), Some(true));
+        assert_eq!(
+            query_contract["schema_fingerprint"],
+            tooling_metadata["schema_fingerprint"]
+        );
+        assert_eq!(
+            query_contract["parameters"][0]["type_name"].as_str(),
+            Some("INT64")
+        );
+        assert_eq!(
+            query_contract["parameters"][0]["source_column"].as_str(),
+            Some("parent_id")
+        );
+        assert_eq!(
+            query_contract["result_columns"][0]["name"].as_str(),
+            Some("id")
+        );
+        assert_eq!(
+            query_contract["result_columns"][1]["type_name"].as_str(),
+            Some("INT64")
+        );
 
         let mut storage_state_json = ptr::null_mut();
         assert_eq!(
@@ -2433,6 +3455,62 @@ mod tests {
     }
 
     #[test]
+    fn ffi_stmt_bind_geography_wkb_round_trips_spatial_value() {
+        let mut db = ptr::null_mut();
+        let path = CString::new(":memory:").expect("path");
+        assert_eq!(ddb_db_open_or_create(path.as_ptr(), &mut db), DDB_OK);
+
+        let create =
+            CString::new("CREATE TABLE places (id INT64 PRIMARY KEY, geog GEOGRAPHY(POINT,4326))")
+                .expect("create");
+        let mut result = ptr::null_mut();
+        assert_eq!(
+            ddb_db_execute(db, create.as_ptr(), ptr::null(), 0, &mut result),
+            DDB_OK
+        );
+        assert_eq!(ddb_result_free(&mut result), DDB_OK);
+
+        let insert = CString::new("INSERT INTO places VALUES ($1, $2)").expect("insert");
+        let mut insert_stmt = ptr::null_mut();
+        assert_eq!(
+            ddb_db_prepare(db, insert.as_ptr(), &mut insert_stmt),
+            DDB_OK
+        );
+
+        let mut point_wkb = vec![1_u8];
+        point_wkb.extend_from_slice(&1_u32.to_le_bytes());
+        point_wkb.extend_from_slice(&(-97.7431_f64).to_le_bytes());
+        point_wkb.extend_from_slice(&30.2672_f64.to_le_bytes());
+        assert_eq!(ddb_stmt_bind_int64(insert_stmt, 1, 1), DDB_OK);
+        assert_eq!(
+            ddb_stmt_bind_geography_wkb(insert_stmt, 2, point_wkb.as_ptr(), point_wkb.len()),
+            DDB_OK
+        );
+        let mut has_row = 1;
+        assert_eq!(ddb_stmt_step(insert_stmt, &mut has_row), DDB_OK);
+        assert_eq!(has_row, 0);
+        assert_eq!(ddb_stmt_free(&mut insert_stmt), DDB_OK);
+
+        let select = CString::new("SELECT geog FROM places WHERE id = 1").expect("select");
+        let mut select_stmt = ptr::null_mut();
+        assert_eq!(
+            ddb_db_prepare(db, select.as_ptr(), &mut select_stmt),
+            DDB_OK
+        );
+        assert_eq!(ddb_stmt_step(select_stmt, &mut has_row), DDB_OK);
+        assert_eq!(has_row, 1);
+
+        let mut geog = DdbValue::default();
+        assert_eq!(ddb_stmt_value_copy(select_stmt, 0, &mut geog), DDB_OK);
+        assert_eq!(geog.tag, DdbValueTag::Geography as u32);
+        assert!(geog.len > point_wkb.len());
+        assert_eq!(ddb_value_dispose(&mut geog), DDB_OK);
+
+        assert_eq!(ddb_stmt_free(&mut select_stmt), DDB_OK);
+        assert_eq!(ddb_db_free(&mut db), DDB_OK);
+    }
+
+    #[test]
     fn ffi_prepared_explicit_txn_can_commit_after_checkpoint_truncates_wal() {
         let unique = format!(
             "ffi-checkpoint-{}-{}.ddb",
@@ -2622,5 +3700,92 @@ mod tests {
         let _ = std::fs::remove_file(&path_buf);
         let _ = std::fs::remove_file(path_buf.with_extension("ddb.wal"));
         let _ = std::fs::remove_file(path_buf.with_extension("ddb.shm"));
+    }
+
+    #[test]
+    fn ffi_sync_json_bridge_covers_status_init_peer_scope_and_doctor() {
+        let dir = tempfile::TempDir::with_prefix("decentdb-c-api-sync-json").unwrap();
+        let path = dir.path().join("sync-json.ddb");
+        let path = CString::new(path.to_string_lossy().as_bytes()).expect("path");
+        let mut db = ptr::null_mut();
+        assert_eq!(ddb_db_open_or_create(path.as_ptr(), &mut db), DDB_OK);
+
+        let create = CString::new("CREATE TABLE items (id INT64 PRIMARY KEY, name TEXT)").unwrap();
+        let mut result = ptr::null_mut();
+        assert_eq!(
+            ddb_db_execute(db, create.as_ptr(), ptr::null(), 0, &mut result),
+            DDB_OK
+        );
+        assert_eq!(ddb_result_free(&mut result), DDB_OK);
+
+        let status = sync_exec_json(db, &serde_json::json!({"op":"status"}));
+        assert_eq!(status["enabled"], false);
+        assert_eq!(status["replica_id"], serde_json::Value::Null);
+
+        let status = sync_exec_json(
+            db,
+            &serde_json::json!({"op":"init_replica","replica_id":"node-a"}),
+        );
+        assert_eq!(status["enabled"], true);
+        assert_eq!(status["replica_id"], "node-a");
+
+        let peer = sync_exec_json(
+            db,
+            &serde_json::json!({
+                "op":"add_peer",
+                "name":"central",
+                "endpoint":"https://central.example"
+            }),
+        );
+        assert_eq!(peer["name"], "central");
+        assert_eq!(peer["endpoint"], "https://central.example");
+
+        let scope = sync_exec_json(
+            db,
+            &serde_json::json!({
+                "op":"create_scope",
+                "name":"tenant_42",
+                "include_tables":["items"]
+            }),
+        );
+        assert_eq!(scope["name"], "tenant_42");
+
+        let binding = sync_exec_json(
+            db,
+            &serde_json::json!({
+                "op":"bind_peer_scope",
+                "peer_name":"central",
+                "scope_name":"tenant_42"
+            }),
+        );
+        assert_eq!(binding["peer_name"], "central");
+        assert_eq!(binding["scope_name"], "tenant_42");
+
+        let doctor = sync_exec_json(db, &serde_json::json!({"op":"doctor"}));
+        assert!(doctor["highest_severity"].is_string());
+
+        let batch = sync_exec_json(
+            db,
+            &serde_json::json!({
+                "op":"export_batch",
+                "since":0,
+                "limit":10
+            }),
+        );
+        assert_eq!(batch["record_count"], 0);
+
+        let policy = sync_exec_json(
+            db,
+            &serde_json::json!({
+                "op":"set_conflict_policy",
+                "policy":"record"
+            }),
+        );
+        assert_eq!(policy["default_policy"], "record");
+        assert!(policy["origin_priority"]
+            .as_array()
+            .is_some_and(|items| items.is_empty()));
+
+        assert_eq!(ddb_db_free(&mut db), DDB_OK);
     }
 }

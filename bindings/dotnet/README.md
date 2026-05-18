@@ -78,6 +78,39 @@ public class Album
 
 Bindable types (auto-included by MicroOrm): all primitives, `string`, `Guid`, `DateTime`, `DateTimeOffset`, `DateOnly`, `TimeOnly`, `TimeSpan`, `byte[]`, `enum`, and `Nullable<T>` of any of these.
 
+Native semantic reads are exposed through the low-level value-object path:
+`ENUM` returns `DecentDBEnumValue`, `INTERVAL` returns `DecentDBIntervalValue`
+or `TimeSpan` when representable, `DATE` returns `DateOnly`, `TIME` returns
+`TimeOnly`, `TIMESTAMPTZ` returns `DateTimeOffset`, and `IPADDR`, `CIDR`, and
+`MACADDR` return canonical strings.
+
+## Sync SDK quickstart
+
+The .NET binding exposes an engine-local sync surface through
+`DecentDB.Native` and `DecentDB.AdoNet`. Use it to initialize replicas, manage
+peers and scopes, inspect doctor output, and exchange batches without shelling
+out to the CLI.
+
+- [Sync quickstart sample](examples/sync-quickstart.md)
+
+Example calls:
+
+```csharp
+using System.Collections.Generic;
+using System.Threading.Tasks;
+
+await connection.Sync.InitializeReplicaAsync("node-a");
+await connection.Sync.AddPeerAsync(new DecentDB.Native.SyncPeer { Name = "central", Endpoint = "https://sync.example" });
+await connection.Sync.CreateScopeAsync(new DecentDB.Native.SyncScope { Name = "tenant_42", IncludeTables = new List<string> { "items" } });
+await connection.Sync.BindPeerScopeAsync("central", "tenant_42");
+var doctor = await connection.Sync.GetDoctorReportAsync();
+var batch = await connection.Sync.ExportBatchAsync();
+var summary = await connection.Sync.ImportBatchAsync(batch);
+```
+
+HTTP `sync run` transport parity remains future adapter work; the current SDK
+surface is engine-local.
+
 ## Per-database vs per-binding views
 
 Views are per-database (`CREATE VIEW` persists in the file). Apps that share a file across bindings only need to issue the DDL once. Apps that use separate files per binding must re-create each view per file.

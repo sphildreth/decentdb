@@ -72,6 +72,28 @@ def test_inspect_storage_state(db):
     assert "active_readers" in payload
 
 
+def test_tooling_metadata_and_query_contract(db):
+    db.execute("CREATE TABLE contract_users (id INT64 PRIMARY KEY, email TEXT NOT NULL)")
+    db.commit()
+
+    metadata = db.get_tooling_metadata()
+    assert metadata["metadata_version"] == 1
+    assert metadata["schema_fingerprint_algorithm"] == "sha256:decentdb-tooling-schema-v1"
+    assert len(metadata["schema_fingerprint"]) == 64
+
+    contract = db.describe_query_contract(
+        "SELECT id, email FROM contract_users WHERE id = $1"
+    )
+    assert contract["contract_version"] == 1
+    assert contract["statement_kind"] == "query"
+    assert contract["read_only"] is True
+    assert contract["schema_fingerprint"] == metadata["schema_fingerprint"]
+    assert contract["parameters"][0]["type_name"] == "INT64"
+    assert contract["parameters"][0]["source_column"] == "id"
+    assert contract["result_columns"][1]["name"] == "email"
+    assert contract["result_columns"][1]["type_name"] == "TEXT"
+
+
 def test_auto_increment_insert(db):
     db.execute("CREATE TABLE auto (id INTEGER PRIMARY KEY, val TEXT)")
     db.execute("INSERT INTO auto (val) VALUES ($1)", ["a"])

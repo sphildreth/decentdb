@@ -4,6 +4,191 @@ This page documents SQL functions and aggregate/window additions recently implem
 
 For broader syntax coverage, see the SQL reference and feature matrix.
 
+## Sync inspection views
+
+DecentDB exposes sync state through read-only `sys_sync_*` inspection queries.
+These are engine inspection surfaces, not persistent catalog views and not
+parameterized functions. Use the documented `SELECT *` forms; arbitrary
+projection, joins, `LIMIT`, and bind parameters are not part of this surface.
+
+### `sys_sync_status`
+
+Columns:
+
+- `enabled`
+- `replica_id`
+- `next_sequence`
+- `journal_path`
+- `journal_size_bytes`
+
+Example:
+
+```sql
+SELECT * FROM sys_sync_status;
+```
+
+### `sys_sync_journal`
+
+Columns:
+
+- `sequence`
+- `replica_id`
+- `transaction_lsn`
+- `table_name`
+- `operation`
+- `primary_key_json`
+- `after_json`
+- `schema_cookie`
+- `committed_at_micros`
+
+Notes:
+
+- `SELECT * FROM sys_sync_journal` returns the full journal.
+- `SELECT * FROM sys_sync_journal WHERE sequence > 42` is also recognized by
+  the engine for incremental inspection.
+- Ordered variants on `sequence` are accepted.
+
+Example:
+
+```sql
+SELECT * FROM sys_sync_journal WHERE sequence > 100 ORDER BY sequence;
+```
+
+### `sys_sync_peers`
+
+Columns:
+
+- `name`
+- `endpoint`
+- `token_env`
+- `created_at_micros`
+- `updated_at_micros`
+
+### `sys_sync_retention`
+
+Columns:
+
+- `journal_records`
+- `first_sequence`
+- `last_sequence`
+- `safe_prune_through`
+- `prunable_records`
+- `blocked_by_json`
+- `journal_size_bytes`
+
+### `sys_sync_peer_lag`
+
+Columns:
+
+- `peer_name`
+- `remote_replica_id`
+- `in_watermark`
+- `out_watermark`
+- `local_high_watermark`
+- `in_lag`
+- `out_lag`
+
+### `sys_sync_doctor`
+
+Columns:
+
+- `enabled`
+- `replica_id`
+- `highest_severity`
+- `journal_records`
+- `journal_size_bytes`
+- `unresolved_conflicts`
+- `guidance_json`
+
+### `sys_sync_scopes`
+
+Columns:
+
+- `name`
+- `include_tables_json`
+- `row_filter`
+- `filter_columns_json`
+- `created_at_micros`
+- `updated_at_micros`
+
+### `sys_sync_scope_tables`
+
+Columns:
+
+- `scope_name`
+- `table_name`
+
+### `sys_sync_peer_scopes`
+
+Columns:
+
+- `peer_name`
+- `scope_name`
+- `created_at_micros`
+- `updated_at_micros`
+
+### `sys_sync_sessions`
+
+Columns:
+
+- `session_id`
+- `peer_name`
+- `direction`
+- `remote_replica_id`
+- `started_at_micros`
+- `ended_at_micros`
+- `status`
+- `error`
+- `pushed_batch_id`
+- `pulled_batch_id`
+- `pushed_seen`
+- `pushed_applied`
+- `pushed_skipped`
+- `pushed_conflicted`
+- `pulled_seen`
+- `pulled_applied`
+- `pulled_skipped`
+- `pulled_conflicted`
+- `retry_count`
+
+### `sys_sync_conflict_policy`
+
+Columns:
+
+- `default_policy`
+- `origin_priority_json`
+
+### `sys_sync_conflicts`
+
+Columns:
+
+- `conflict_id`
+- `batch_id`
+- `remote_replica_id`
+- `remote_sequence`
+- `table_name`
+- `operation`
+- `conflict_type`
+- `message`
+- `primary_key_json`
+- `remote_record_json`
+- `local_row_json`
+- `created_at_micros`
+- `resolved`
+- `resolution`
+- `resolved_at_micros`
+- `resolved_by`
+- `resolution_note`
+- `policy_name`
+- `local_record_json`
+
+Example:
+
+```sql
+SELECT * FROM sys_sync_conflicts ORDER BY conflict_id;
+SELECT * FROM sys_sync_conflict_policy;
+```
+
 ## Subquery operators
 
 Supported:
@@ -183,6 +368,44 @@ SELECT SPLIT_PART('a,b,c', ',', 2);
 SELECT STRING_TO_ARRAY('a,b,c', ',');
 SELECT QUOTE_IDENT('table name'), QUOTE_LITERAL('O''Brien');
 SELECT MD5('hello'), SHA256('hello');
+```
+
+## Spatial functions
+
+Spatial functions operate on native `GEOMETRY` and `GEOGRAPHY` values. Spatial values are stored as normalized EWKB; `GEOGRAPHY` uses SRID 4326 and lon/lat coordinates.
+
+Supported:
+
+- Constructors: `ST_Point`, `ST_MakePoint`, `ST_PointZ`, `ST_PointM`, `ST_PointZM`
+- Geography point constructors: `ST_GeogPoint`, `ST_GeogPointZ`, `ST_GeogPointM`, `ST_GeogPointZM`
+- Import/export: `ST_GeomFromText`, `ST_GeogFromText`, `ST_GeomFromWKB`, `ST_GeogFromWKB`, `ST_GeomFromGeoJSON`, `ST_GeogFromGeoJSON`, `ST_AsText`, `ST_AsBinary`, `ST_AsGeoJSON`
+- Accessors: `ST_SRID`, `ST_SetSRID`, `ST_GeometryType`, `ST_X`, `ST_Y`, `ST_Z`, `ST_M`, `ST_IsValid`
+- Predicates: `ST_DWithin`, `ST_Intersects`, `ST_Contains`, `ST_Within`, `ST_Equals`
+- Measurements: `ST_Distance`, `ST_Length`, `ST_Area`
+- Distance ordering: `<->`
+
+Behavior notes:
+
+- `ST_Distance` returns meters for `GEOGRAPHY` point-to-point distance and planar units for `GEOMETRY`.
+- `ST_DWithin` uses the same units as `ST_Distance`.
+- `ST_Length` and `ST_Area` are planar for `GEOMETRY`; GEOGRAPHY uses spherical approximations.
+- Spatial indexes (`CREATE INDEX ... USING spatial`) are single-column indexes for `GEOMETRY` and `GEOGRAPHY`.
+
+Examples:
+
+```sql
+CREATE TABLE places (id INT PRIMARY KEY, geog GEOGRAPHY(POINT,4326));
+CREATE INDEX idx_places_geog ON places USING spatial(geog);
+
+INSERT INTO places VALUES (1, ST_GeogPoint(-97.7431, 30.2672));
+
+SELECT id
+FROM places
+WHERE ST_DWithin(geog, ST_GeogPoint(-97.7431, 30.2672), 5000);
+
+SELECT ST_AsText(ST_GeomFromText('POINT(1 2)'));
+SELECT ST_Area(ST_GeomFromText('POLYGON((0 0,10 0,10 10,0 10,0 0))'));
+SELECT id FROM places ORDER BY geog <-> ST_GeogPoint(-97.7431, 30.2672) LIMIT 10;
 ```
 
 ## Aggregate functions

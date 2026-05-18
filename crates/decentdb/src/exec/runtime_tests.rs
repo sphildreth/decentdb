@@ -195,6 +195,8 @@ mod tests {
         let col = ColumnSchema {
             name: "a".to_string(),
             column_type: ColumnType::Int64,
+            spatial_type: None,
+            enum_type: None,
             nullable: false,
             default_sql: None,
             generated_sql: Some("g()".to_string()),
@@ -256,6 +258,8 @@ mod tests {
         let col = ColumnSchema {
             name: "id".to_string(),
             column_type: ColumnType::Int64,
+            spatial_type: None,
+            enum_type: None,
             nullable: false,
             default_sql: None,
             generated_sql: None,
@@ -309,6 +313,8 @@ mod tests {
         let col = ColumnSchema {
             name: "c".to_string(),
             column_type: ColumnType::Int64,
+            spatial_type: None,
+            enum_type: None,
             nullable: false,
             default_sql: None,
             generated_sql: None,
@@ -409,6 +415,8 @@ mod tests {
         let col = ColumnSchema {
             name: "id".to_string(),
             column_type: ColumnType::Int64,
+            spatial_type: None,
+            enum_type: None,
             nullable: false,
             default_sql: None,
             generated_sql: None,
@@ -459,6 +467,8 @@ mod tests {
         let col = ColumnSchema {
             name: "id".to_string(),
             column_type: ColumnType::Int64,
+            spatial_type: None,
+            enum_type: None,
             nullable: false,
             default_sql: None,
             generated_sql: None,
@@ -557,6 +567,8 @@ mod tests {
         let col = ColumnSchema {
             name: "id".to_string(),
             column_type: ColumnType::Int64,
+            spatial_type: None,
+            enum_type: None,
             nullable: false,
             default_sql: None,
             generated_sql: None,
@@ -657,6 +669,8 @@ mod tests {
         let col_g = ColumnSchema {
             name: "g".to_string(),
             column_type: ColumnType::Text,
+            spatial_type: None,
+            enum_type: None,
             nullable: false,
             default_sql: None,
             generated_sql: None,
@@ -670,6 +684,8 @@ mod tests {
         let col_v = ColumnSchema {
             name: "v".to_string(),
             column_type: ColumnType::Int64,
+            spatial_type: None,
+            enum_type: None,
             nullable: false,
             default_sql: None,
             generated_sql: None,
@@ -733,6 +749,8 @@ mod tests {
         let col = ColumnSchema {
             name: "v".to_string(),
             column_type: ColumnType::Text,
+            spatial_type: None,
+            enum_type: None,
             nullable: false,
             default_sql: None,
             generated_sql: None,
@@ -791,6 +809,8 @@ mod tests {
         let col_a_id = ColumnSchema {
             name: "id".to_string(),
             column_type: ColumnType::Int64,
+            spatial_type: None,
+            enum_type: None,
             nullable: false,
             default_sql: None,
             generated_sql: None,
@@ -804,6 +824,8 @@ mod tests {
         let col_a_filter = ColumnSchema {
             name: "filter".to_string(),
             column_type: ColumnType::Int64,
+            spatial_type: None,
+            enum_type: None,
             nullable: false,
             default_sql: None,
             generated_sql: None,
@@ -846,6 +868,8 @@ mod tests {
         let col_b_id = ColumnSchema {
             name: "id".to_string(),
             column_type: ColumnType::Int64,
+            spatial_type: None,
+            enum_type: None,
             nullable: false,
             default_sql: None,
             generated_sql: None,
@@ -859,6 +883,8 @@ mod tests {
         let col_b_ref = ColumnSchema {
             name: "ref".to_string(),
             column_type: ColumnType::Int64,
+            spatial_type: None,
+            enum_type: None,
             nullable: false,
             default_sql: None,
             generated_sql: None,
@@ -872,6 +898,8 @@ mod tests {
         let col_b_payload = ColumnSchema {
             name: "payload".to_string(),
             column_type: ColumnType::Text,
+            spatial_type: None,
+            enum_type: None,
             nullable: false,
             default_sql: None,
             generated_sql: None,

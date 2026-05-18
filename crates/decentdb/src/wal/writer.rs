@@ -100,8 +100,9 @@ pub(crate) fn commit_pages(
             .expect("wal index lock should not be poisoned");
         // Check inside the index lock so begin_reader() cannot register
         // between the count check and the version clear (TOCTOU fix).
-        let retain_history =
-            retain_history_hint || wal.inner.reader_registry.active_reader_count()? > 0;
+        let retain_history = retain_history_hint
+            || wal.inner.reader_registry.active_reader_count()? > 0
+            || wal.retained_snapshot_lsn().is_some();
         let mut sidecar = wal.inner.index_sidecar.as_ref().map(|sidecar| {
             sidecar
                 .lock()
@@ -240,8 +241,9 @@ pub(crate) fn commit_pages_if_latest(
             .expect("wal index lock should not be poisoned");
         // Check inside the index lock so begin_reader() cannot register
         // between the count check and the version clear (TOCTOU fix).
-        let retain_history =
-            retain_history_hint || wal.inner.reader_registry.active_reader_count()? > 0;
+        let retain_history = retain_history_hint
+            || wal.inner.reader_registry.active_reader_count()? > 0
+            || wal.retained_snapshot_lsn().is_some();
         let mut sidecar = wal.inner.index_sidecar.as_ref().map(|sidecar| {
             sidecar
                 .lock()
@@ -429,7 +431,8 @@ fn lookup_base_pages_batch(
         .index
         .lock()
         .expect("wal index lock should not be poisoned");
-    let retain_history_hint = wal.inner.reader_registry.active_reader_count()? > 0;
+    let retain_history_hint = wal.inner.reader_registry.active_reader_count()? > 0
+        || wal.retained_snapshot_lsn().is_some();
     let pages = pages
         .iter()
         .map(|(page_id, _)| {
@@ -455,7 +458,15 @@ fn lookup_base_pages_batch(
 
 fn demote_cold_versions(wal: &WalHandle) -> Result<()> {
     let retain_recent = wal.inner.resident_versions_per_page;
-    let min_reader_snapshot = wal.inner.reader_registry.min_snapshot_lsn()?;
+    let min_reader_snapshot = match (
+        wal.inner.reader_registry.min_snapshot_lsn()?,
+        wal.retained_snapshot_lsn(),
+    ) {
+        (Some(reader_lsn), Some(retained_lsn)) => Some(reader_lsn.min(retained_lsn)),
+        (Some(reader_lsn), None) => Some(reader_lsn),
+        (None, Some(retained_lsn)) => Some(retained_lsn),
+        (None, None) => None,
+    };
     let mut index = wal
         .inner
         .index
@@ -519,7 +530,8 @@ fn maybe_auto_checkpoint(wal: &WalHandle, pager: &PagerHandle) -> Result<()> {
     // Skip when readers are active so we preserve ADR 0019 retention semantics
     // and avoid a redundant `prune_at_or_below` pass that would not actually
     // free memory.
-    if wal.inner.reader_registry.active_reader_count()? > 0 {
+    if wal.inner.reader_registry.active_reader_count()? > 0 || wal.retained_snapshot_lsn().is_some()
+    {
         return Ok(());
     }
 

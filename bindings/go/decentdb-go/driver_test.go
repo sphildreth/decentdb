@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestDriver(t *testing.T) {
@@ -248,6 +249,84 @@ func TestDriver_Decimal(t *testing.T) {
 	if got.Unscaled != 123456789012 || got.Scale != 9 {
 		t.Errorf("expected %v, got %v", val, got)
 	}
+}
+
+func TestSemanticDecodeHelpers(t *testing.T) {
+	t.Run("semantic tags", func(t *testing.T) {
+		enumVal := decodeSemanticTag(valueTagEnum, 42, 7, 0, 0, [16]byte{}, 0, 0, 0, 0, 0, 0)
+		gotEnum, ok := enumVal.(EnumValue)
+		if !ok {
+			t.Fatalf("expected EnumValue, got %T", enumVal)
+		}
+		if gotEnum.TypeID != 42 || gotEnum.LabelID != 7 {
+			t.Fatalf("unexpected enum value: %+v", gotEnum)
+		}
+
+		intervalVal := decodeSemanticTag(valueTagInterval, 0, 0, 0, 0, [16]byte{}, 0, 0, 0, 2, -3, 456)
+		gotInterval, ok := intervalVal.(IntervalValue)
+		if !ok {
+			t.Fatalf("expected IntervalValue, got %T", intervalVal)
+		}
+		if gotInterval.Months != 2 || gotInterval.Days != -3 || gotInterval.Micros != 456 {
+			t.Fatalf("unexpected interval value: %+v", gotInterval)
+		}
+
+		macBytes := [16]byte{0x08, 0x00, 0x2b, 0x01, 0x02, 0x03}
+		if got := decodeSemanticTag(valueTagMACAddr, 0, 0, 6, 0, macBytes, 0, 0, 0, 0, 0, 0); got != "08:00:2b:01:02:03" {
+			t.Fatalf("expected MACADDR string, got %v", got)
+		}
+	})
+
+	t.Run("ipaddr v4 and v6", func(t *testing.T) {
+		v4 := [16]byte{127, 0, 0, 1}
+		if got := decodeIPAddrString(4, v4); got != "127.0.0.1" {
+			t.Fatalf("expected 127.0.0.1, got %v", got)
+		}
+
+		v6 := [16]byte{0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}
+		if got := decodeIPAddrString(6, v6); got != "2001:db8::1" {
+			t.Fatalf("expected 2001:db8::1, got %v", got)
+		}
+
+		if got := decodeIPAddrString(9, v4); got != nil {
+			t.Fatalf("expected nil for unknown family, got %v", got)
+		}
+	})
+
+	t.Run("cidr v4 and v6", func(t *testing.T) {
+		v4 := [16]byte{192, 168, 10, 0}
+		if got := decodeCIDRString(4, 24, v4); got != "192.168.10.0/24" {
+			t.Fatalf("expected 192.168.10.0/24, got %v", got)
+		}
+		if got := decodeCIDRString(4, 40, v4); got != nil {
+			t.Fatalf("expected nil for invalid v4 prefix, got %v", got)
+		}
+
+		v6 := [16]byte{0x20, 0x01, 0x0d, 0xb8}
+		if got := decodeCIDRString(6, 32, v6); got != "2001:db8::/32" {
+			t.Fatalf("expected 2001:db8::/32, got %v", got)
+		}
+	})
+
+	t.Run("date time timestamptz", func(t *testing.T) {
+		gotDate := decodeDateDaysValue(2)
+		wantDate := time.Date(1970, 1, 3, 0, 0, 0, 0, time.UTC)
+		if !gotDate.Equal(wantDate) {
+			t.Fatalf("expected %v, got %v", wantDate, gotDate)
+		}
+
+		gotTime := decodeTimeMicrosValue(3_723_004_005)
+		wantTime := 1*time.Hour + 2*time.Minute + 3*time.Second + 4*time.Millisecond + 5*time.Microsecond
+		if gotTime != wantTime {
+			t.Fatalf("expected %v, got %v", wantTime, gotTime)
+		}
+
+		gotTS := decodeTimestampMicrosValue(-1)
+		wantTS := time.UnixMicro(-1).UTC()
+		if !gotTS.Equal(wantTS) {
+			t.Fatalf("expected %v, got %v", wantTS, gotTS)
+		}
+	})
 }
 
 func TestDriver_Bool(t *testing.T) {

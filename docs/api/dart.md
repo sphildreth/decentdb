@@ -95,6 +95,32 @@ Supported high-level bind values in `bindAll(...)`:
 - `DateTime`
 - `DecimalValue`
 
+### Result type mapping
+
+Rows returned from `query()`, `step()` / `readRow()`, and `nextPage()` decode
+native values into Dart objects:
+
+| DecentDB type | Dart result value |
+|---|---|
+| `INT64` | `int` |
+| `FLOAT64` | `double` |
+| `BOOL` | `bool` |
+| `TEXT` | `String` |
+| `BLOB`, `UUID`, `GEOMETRY`, `GEOGRAPHY` | `Uint8List` |
+| `DECIMAL` | `DecimalValue` |
+| `TIMESTAMP` | UTC `DateTime` |
+| `ENUM` | `DecentDBEnumValue(typeId, labelId)` |
+| `IPADDR` / `INET` | canonical `String` |
+| `CIDR` | canonical `String` |
+| `DATE` | UTC `DateTime` at midnight |
+| `TIME` | `Duration` since midnight |
+| `TIMESTAMPTZ` | UTC `DateTime` |
+| `INTERVAL` | `DecentDBIntervalValue(months, days, microseconds)` |
+| `MACADDR` / `MACADDR8` | canonical lowercase `String` |
+
+String parameters can be used for typed semantic columns when the SQL target
+column is known.
+
 Rows use an O(1) column-name index map, so `row['column_name']` no longer performs a linear scan.
 
 ### Streaming and pagination
@@ -198,6 +224,8 @@ The packaged wrapper exposes:
 - `db.schema.listViews()` / `listViewsInfo()`
 - `db.schema.getViewDdl(name)`
 - `db.schema.listTriggers()`
+- `db.schema.getToolingMetadata()`
+- `db.schema.describeQueryContract(sql)`
 
 ### Rich schema snapshot
 

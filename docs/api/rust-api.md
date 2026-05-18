@@ -65,6 +65,22 @@ Available helpers:
 - `Db::rollback_transaction()`
 - `Db::in_transaction()`
 
+## Branching and time travel
+
+The Rust API exposes the same branch workflow used by the CLI:
+
+- `Db::snapshot_create`, `snapshot_list`, `snapshot_delete`
+- `Db::execute_batch_at_snapshot`, `execute_batch_at_snapshot_lsn`
+- `Db::branch_create`, `branch_list`, `branch_rename`, `branch_delete`
+- `Db::execute_batch_on_branch`
+- `Db::branch_commit`, `branch_log`
+- `Db::branch_diff`
+- `Db::branch_restore`
+- `Db::branch_merge`
+
+Report types such as `BranchDiffReport`, `BranchRestoreReport`, and
+`BranchMergeReport` are serializable for tooling.
+
 ## Metadata and maintenance
 
 The crate exposes structured inspection helpers for the CLI and higher-level bindings:
@@ -76,8 +92,17 @@ The crate exposes structured inspection helpers for the CLI and higher-level bin
 - `Db::list_indexes()`
 - `Db::list_views()`
 - `Db::list_triggers()`
+- `Db::get_schema_snapshot()`
+- `Db::get_tooling_metadata()`
+- `Db::describe_query_contract(sql)`
 - `Db::verify_index(name)`
 - `Db::dump_sql()`
+
+`get_tooling_metadata()` returns the versioned schema contract used by external
+tooling, including a deterministic schema fingerprint and native type metadata.
+`describe_query_contract(sql)` parses and analyzes a statement without executing
+it, returning parameter and result-column metadata plus diagnostics for unknown
+inference.
 
 Maintenance helpers:
 
@@ -122,3 +147,8 @@ All fallible operations return `decentdb::Result<T>`, which aliases `std::result
 - SQL errors
 - internal engine errors
 - panic boundaries
+
+## Related Native Surfaces
+
+- [C/C++ ABI](c-cpp.md) documents the stable `include/decentdb.h` surface for
+  C callers and C++ callers that want to consume DecentDB through C linkage.

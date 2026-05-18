@@ -2,6 +2,8 @@ import collections
 import ctypes
 import datetime
 import decimal
+from dataclasses import dataclass
+import ipaddress
 import json
 import os
 import re
@@ -23,9 +25,19 @@ from .native import (
     DDB_VALUE_BLOB,
     DDB_VALUE_BOOL,
     DDB_VALUE_DECIMAL,
+    DDB_VALUE_CIDR,
+    DDB_VALUE_DATE,
+    DDB_VALUE_ENUM,
     DDB_VALUE_FLOAT64,
+    DDB_VALUE_GEOGRAPHY,
+    DDB_VALUE_GEOMETRY,
+    DDB_VALUE_INTERVAL,
     DDB_VALUE_INT64,
     DDB_VALUE_NULL,
+    DDB_VALUE_IPADDR,
+    DDB_VALUE_MACADDR,
+    DDB_VALUE_TIME,
+    DDB_VALUE_TIMESTAMPTZ_MICROS,
     DDB_VALUE_TEXT,
     DDB_VALUE_TIMESTAMP_MICROS,
     DDB_VALUE_UUID,
@@ -52,6 +64,8 @@ from .native import (
 apilevel = "2.0"
 threadsafety = 1
 paramstyle = "qmark"
+
+_BINARY_BYTES_TAGS = (DDB_VALUE_BLOB, DDB_VALUE_GEOMETRY, DDB_VALUE_GEOGRAPHY)
 
 
 class Error(Exception):
@@ -90,6 +104,29 @@ class DataError(DatabaseError):
     pass
 
 
+class GeometryWKB:
+    def __init__(self, data):
+        self.data = bytes(data)
+
+
+class GeographyWKB:
+    def __init__(self, data):
+        self.data = bytes(data)
+
+
+@dataclass(frozen=True, slots=True)
+class EnumValue:
+    type_id: int
+    label_id: int
+
+
+@dataclass(frozen=True, slots=True)
+class IntervalValue:
+    months: int
+    days: int
+    micros: int
+
+
 class NotSupportedError(DatabaseError):
     pass
 
@@ -107,6 +144,7 @@ NUMBER = float
 DATETIME = datetime.datetime
 ROWID = int
 _UNIX_EPOCH_UTC = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+_UNIX_EPOCH_DATE = datetime.date(1970, 1, 1)
 
 
 def DateFromTicks(ticks):
@@ -293,6 +331,84 @@ def _is_direct_execute_sql(sql):
     return _TXN_CONTROL_RE.match(sql) is not None
 
 
+def _decode_ip_address_value(value):
+    family = int(value.ip_family)
+    if family == 4:
+        return ipaddress.ip_address(ipaddress.IPv4Address(bytes(value.ip_cidr_addr_bytes[:4])))
+    if family == 6:
+        return ipaddress.ip_address(ipaddress.IPv6Address(bytes(value.ip_cidr_addr_bytes)))
+    return None
+
+
+def _decode_cidr_value(value):
+    family = int(value.ip_family)
+    prefix_len = int(value.cidr_prefix_len)
+    if family == 4:
+        addr = ipaddress.IPv4Address(bytes(value.ip_cidr_addr_bytes[:4]))
+        return ipaddress.ip_network(f"{addr}/{prefix_len}", strict=True)
+    if family == 6:
+        addr = ipaddress.IPv6Address(bytes(value.ip_cidr_addr_bytes))
+        return ipaddress.ip_network(f"{addr}/{prefix_len}", strict=True)
+    return None
+
+
+def _decode_date_value(value):
+    return _UNIX_EPOCH_DATE + datetime.timedelta(days=int(value.date_days))
+
+
+def _decode_time_value(value):
+    micros = int(value.time_micros)
+    seconds, microseconds = divmod(micros, 1_000_000)
+    minutes, second = divmod(seconds, 60)
+    hour, minute = divmod(minutes, 60)
+    return datetime.time(hour, minute, second, microseconds)
+
+
+def _decode_timestamptz_value(value):
+    return _UNIX_EPOCH_UTC + datetime.timedelta(
+        microseconds=int(value.timestamptz_micros)
+    )
+
+
+def _decode_interval_value(value):
+    return IntervalValue(
+        months=int(value.interval_months),
+        days=int(value.interval_days),
+        micros=int(value.interval_micros),
+    )
+
+
+def _decode_macaddr_value(value):
+    length = int(value.ip_family)
+    if length not in (6, 8):
+        return None
+    return ":".join(f"{int(value.ip_cidr_addr_bytes[i]):02x}" for i in range(length))
+
+
+def _decode_semantic_value(value):
+    tag = int(value.tag)
+    if tag == DDB_VALUE_ENUM:
+        return EnumValue(
+            type_id=int(value.enum_type_id),
+            label_id=int(value.enum_label_id),
+        )
+    if tag == DDB_VALUE_IPADDR:
+        return _decode_ip_address_value(value)
+    if tag == DDB_VALUE_CIDR:
+        return _decode_cidr_value(value)
+    if tag == DDB_VALUE_DATE:
+        return _decode_date_value(value)
+    if tag == DDB_VALUE_TIME:
+        return _decode_time_value(value)
+    if tag == DDB_VALUE_TIMESTAMPTZ_MICROS:
+        return _decode_timestamptz_value(value)
+    if tag == DDB_VALUE_INTERVAL:
+        return _decode_interval_value(value)
+    if tag == DDB_VALUE_MACADDR:
+        return _decode_macaddr_value(value)
+    return None
+
+
 def _decode_ffi_value(lib, value):
     tag = int(value.tag)
     if tag == DDB_VALUE_NULL:
@@ -307,7 +423,7 @@ def _decode_ffi_value(lib, value):
         if not value.data or value.len == 0:
             return ""
         return ctypes.string_at(value.data, value.len).decode("utf-8")
-    if tag == DDB_VALUE_BLOB:
+    if tag in _BINARY_BYTES_TAGS:
         if not value.data or value.len == 0:
             return b""
         return bytes(ctypes.string_at(value.data, value.len))
@@ -321,7 +437,7 @@ def _decode_ffi_value(lib, value):
         return _UNIX_EPOCH_UTC + datetime.timedelta(
             microseconds=int(value.timestamp_micros)
         )
-    return None
+    return _decode_semantic_value(value)
 
 
 def _string_out(lib, func, *args):
@@ -731,6 +847,30 @@ class Cursor:
             code = self._lib.ddb_stmt_bind_text(
                 self._stmt, index_1_based, raw, len(raw)
             )
+        elif isinstance(param, GeometryWKB):
+            raw = param.data
+            if raw:
+                array_type = ctypes.c_uint8 * len(raw)
+                payload = array_type.from_buffer_copy(raw)
+                code = self._lib.ddb_stmt_bind_geometry_wkb(
+                    self._stmt, index_1_based, payload, len(raw)
+                )
+            else:
+                code = self._lib.ddb_stmt_bind_geometry_wkb(
+                    self._stmt, index_1_based, None, 0
+                )
+        elif isinstance(param, GeographyWKB):
+            raw = param.data
+            if raw:
+                array_type = ctypes.c_uint8 * len(raw)
+                payload = array_type.from_buffer_copy(raw)
+                code = self._lib.ddb_stmt_bind_geography_wkb(
+                    self._stmt, index_1_based, payload, len(raw)
+                )
+            else:
+                code = self._lib.ddb_stmt_bind_geography_wkb(
+                    self._stmt, index_1_based, None, 0
+                )
         elif isinstance(param, (bytes, bytearray, memoryview)):
             raw = bytes(param)
             if raw:
@@ -779,14 +919,15 @@ class Cursor:
             code = self._lib.ddb_stmt_bind_timestamp_micros(
                 self._stmt, index_1_based, micros
             )
-        elif isinstance(param, datetime.date):
-            epoch = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
-            dt = datetime.datetime(
-                param.year, param.month, param.day, tzinfo=datetime.timezone.utc
+        elif isinstance(param, datetime.time):
+            encoded = param.isoformat().encode("utf-8")
+            code = self._lib.ddb_stmt_bind_text(
+                self._stmt, index_1_based, encoded, len(encoded)
             )
-            micros = int((dt - epoch).total_seconds() * 1_000_000)
-            code = self._lib.ddb_stmt_bind_timestamp_micros(
-                self._stmt, index_1_based, micros
+        elif isinstance(param, datetime.date):
+            encoded = param.isoformat().encode("utf-8")
+            code = self._lib.ddb_stmt_bind_text(
+                self._stmt, index_1_based, encoded, len(encoded)
             )
         else:
             raw = str(param).encode("utf-8")
@@ -2264,7 +2405,7 @@ class Cursor:
         ddb_value_dispose = self._lib.ddb_value_dispose
         byref = ctypes.byref
         text_tag = DDB_VALUE_TEXT
-        blob_tag = DDB_VALUE_BLOB
+        binary_tags = _BINARY_BYTES_TAGS
         try:
             for column_index in range(self._col_count):
                 if needs_dispose:
@@ -2292,7 +2433,7 @@ class Cursor:
                     else:
                         append_row(string_at(value.data, value.len).decode("utf-8"))
                     needs_dispose = True
-                elif tag == blob_tag:
+                elif tag in binary_tags:
                     if not value.data or value.len == 0:
                         append_row(b"")
                     else:
@@ -2438,7 +2579,7 @@ class Cursor:
                     append_row("")
                 else:
                     append_row(string_at(value.data, value.len).decode("utf-8"))
-            elif tag == DDB_VALUE_BLOB:
+            elif tag in _BINARY_BYTES_TAGS:
                 if not value.data or value.len == 0:
                     append_row(b"")
                 else:
@@ -2456,7 +2597,7 @@ class Cursor:
                     + datetime.timedelta(microseconds=int(value.timestamp_micros))
                 )
             else:
-                append_row(None)
+                append_row(_decode_ffi_value(self._lib, value))
         return tuple(row)
 
     def _decode_row_view_matrix(self, values_ptr, row_count, col_count):
@@ -2550,7 +2691,7 @@ class Cursor:
                                 append_row(
                                     string_at(value.data, value.len).decode("utf-8")
                                 )
-                        elif tag == DDB_VALUE_BLOB:
+                        elif tag in _BINARY_BYTES_TAGS:
                             if not value.data or value.len == 0:
                                 append_row(b"")
                             else:
@@ -2570,7 +2711,7 @@ class Cursor:
                                 )
                             )
                         else:
-                            append_row(None)
+                            append_row(_decode_ffi_value(self._lib, value))
                     append_rows(tuple(row))
                 return rows
             if (
@@ -2627,7 +2768,7 @@ class Cursor:
                                 append_row(
                                     string_at(value.data, value.len).decode("utf-8")
                                 )
-                        elif tag == DDB_VALUE_BLOB:
+                        elif tag in _BINARY_BYTES_TAGS:
                             if not value.data or value.len == 0:
                                 append_row(b"")
                             else:
@@ -2647,7 +2788,7 @@ class Cursor:
                                 )
                             )
                         else:
-                            append_row(None)
+                            append_row(_decode_ffi_value(self._lib, value))
                     append_rows(tuple(row))
                 return rows
             if (
@@ -2704,7 +2845,7 @@ class Cursor:
                                 append_row(
                                     string_at(value.data, value.len).decode("utf-8")
                                 )
-                        elif tag == DDB_VALUE_BLOB:
+                        elif tag in _BINARY_BYTES_TAGS:
                             if not value.data or value.len == 0:
                                 append_row(b"")
                             else:
@@ -2724,7 +2865,7 @@ class Cursor:
                                 )
                             )
                         else:
-                            append_row(None)
+                            append_row(_decode_ffi_value(self._lib, value))
                     append_rows(tuple(row))
                 return rows
             for row_index in range(row_count):
@@ -2762,7 +2903,7 @@ class Cursor:
                             append_row("")
                         else:
                             append_row(string_at(value.data, value.len).decode("utf-8"))
-                    elif tag == DDB_VALUE_BLOB:
+                    elif tag in _BINARY_BYTES_TAGS:
                         if not value.data or value.len == 0:
                             append_row(b"")
                         else:
@@ -2782,7 +2923,7 @@ class Cursor:
                             )
                         )
                     else:
-                        append_row(None)
+                        append_row(_decode_ffi_value(self._lib, value))
                 append_rows(tuple(row))
             return rows
 
@@ -2814,7 +2955,7 @@ class Cursor:
                         append_rows(("",))
                     else:
                         append_rows((string_at(value.data, value.len).decode("utf-8"),))
-                elif tag == DDB_VALUE_BLOB:
+                elif tag in _BINARY_BYTES_TAGS:
                     if not value.data or value.len == 0:
                         append_rows((b"",))
                     else:
@@ -2840,7 +2981,7 @@ class Cursor:
                         )
                     )
                 else:
-                    append_rows((None,))
+                    append_rows((_decode_ffi_value(self._lib, value),))
             return rows
 
         if col_count == 6:
@@ -2887,7 +3028,7 @@ class Cursor:
                         append_row("")
                     else:
                         append_row(string_at(value.data, value.len).decode("utf-8"))
-                elif tag == DDB_VALUE_BLOB:
+                elif tag in _BINARY_BYTES_TAGS:
                     if not value.data or value.len == 0:
                         append_row(b"")
                     else:
@@ -2905,7 +3046,7 @@ class Cursor:
                         + datetime.timedelta(microseconds=int(value.timestamp_micros))
                     )
                 else:
-                    append_row(None)
+                    append_row(_decode_ffi_value(self._lib, value))
             append_rows(tuple(row))
         return rows
 
@@ -3348,6 +3489,27 @@ class Connection:
 
     def list_triggers(self):
         return self._call_json_api(self._lib.ddb_db_list_triggers_json)
+
+    def get_tooling_metadata(self):
+        func = getattr(self._lib, "ddb_db_get_tooling_metadata_json", None)
+        if func is None:
+            raise NotSupportedError(
+                "This DecentDB native library does not expose tooling metadata"
+            )
+        return self._call_json_api(func)
+
+    def describe_query_contract(self, sql):
+        if not isinstance(sql, str):
+            raise TypeError("sql must be a string")
+        func = getattr(self._lib, "ddb_db_describe_query_json", None)
+        if func is None:
+            raise NotSupportedError(
+                "This DecentDB native library does not expose query-contract metadata"
+            )
+        return self._call_json_api(func, sql.encode("utf-8"))
+
+    def describe_query(self, sql):
+        return self.describe_query_contract(sql)
 
     def inspect_storage_state(self):
         func = getattr(self._lib, "ddb_db_inspect_storage_state_json", None)

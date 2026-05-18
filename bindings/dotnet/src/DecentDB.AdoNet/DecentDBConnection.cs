@@ -231,6 +231,8 @@ namespace DecentDB.AdoNet
             return _db.ListTriggersJson();
         }
 
+        public DecentDB.Native.DecentDBSyncClient Sync => GetNativeDb().Sync;
+
         public static uint AbiVersion() => Native.DecentDB.AbiVersion();
         public static string EngineVersion() => Native.DecentDB.EngineVersion();
 
@@ -596,6 +598,22 @@ namespace DecentDB.AdoNet
         public string ListIndexesJson()
         {
             return GetNativeDb().ListIndexesJson();
+        }
+
+        /// <summary>
+        /// Returns the stable tooling metadata contract as JSON.
+        /// </summary>
+        public string GetToolingMetadataJson()
+        {
+            return GetNativeDb().GetToolingMetadataJson();
+        }
+
+        /// <summary>
+        /// Returns the stable non-executing query contract as JSON.
+        /// </summary>
+        public string DescribeQueryJson(string sql)
+        {
+            return GetNativeDb().DescribeQueryJson(sql);
         }
 
         // ───── ADO.NET GetSchema ─────
