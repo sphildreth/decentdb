@@ -21,6 +21,7 @@ public sealed class DecentDB : IDisposable
     private string _lastErrorMessage = string.Empty;
 
     public IntPtr Handle => _handle.Handle;
+    public DecentDBSyncClient Sync { get; }
 
     internal DecentDBHandle DbHandle => _handle;
 
@@ -59,6 +60,7 @@ public sealed class DecentDB : IDisposable
         }
 
         _handle = new DecentDBHandle(ptr);
+        Sync = new DecentDBSyncClient(this);
         _ = options;
     }
 
@@ -204,6 +206,26 @@ public sealed class DecentDB : IDisposable
     {
         var res = RecordStatus(DecentDBNative.ddb_db_list_triggers_json(Handle, out var ptr));
         if (res != 0) throw new DecentDBException(_lastErrorCode, LastErrorMessage, "ListTriggersJson");
+        return FreeStringOrEmpty(ptr);
+    }
+
+    public string SyncExecuteJson(string requestJson)
+    {
+        ArgumentNullException.ThrowIfNull(requestJson);
+        var requestBytes = Encoding.UTF8.GetBytes(requestJson + "\0");
+        IntPtr ptr;
+        unsafe
+        {
+            fixed (byte* pRequest = requestBytes)
+            {
+                var res = RecordStatus(DecentDBNativeUnsafe.ddb_db_sync_execute_json(Handle, pRequest, out ptr));
+                if (res != 0)
+                {
+                    throw new DecentDBException(_lastErrorCode, LastErrorMessage, "SyncExecuteJson");
+                }
+            }
+        }
+
         return FreeStringOrEmpty(ptr);
     }
 

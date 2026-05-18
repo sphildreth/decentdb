@@ -231,6 +231,8 @@ namespace DecentDB.AdoNet
             return _db.ListTriggersJson();
         }
 
+        public DecentDB.Native.DecentDBSyncClient Sync => GetNativeDb().Sync;
+
         public static uint AbiVersion() => Native.DecentDB.AbiVersion();
         public static string EngineVersion() => Native.DecentDB.EngineVersion();
 

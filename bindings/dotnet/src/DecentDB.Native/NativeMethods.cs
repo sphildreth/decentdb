@@ -259,6 +259,9 @@ public static unsafe class DecentDBNativeUnsafe
     [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_db_open_or_create")]
     internal static extern uint ddb_db_open_or_create(byte* pathUtf8, out IntPtr outDb);
 
+    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_db_sync_execute_json")]
+    internal static extern uint ddb_db_sync_execute_json(IntPtr db, byte* requestJsonUtf8, out IntPtr outJson);
+
     [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_db_prepare")]
     internal static extern uint ddb_db_prepare(IntPtr db, byte* sqlUtf8, out IntPtr outStmt);
 

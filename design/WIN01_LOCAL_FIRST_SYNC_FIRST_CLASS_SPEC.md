@@ -1,6 +1,6 @@
 # Local-First Sync as a First-Class Capability
 
-**Status:** Active spec — Slices 1-6 complete (2026-05-17); later slices remain TODO
+**Status:** Active spec — Slices 1-7 complete (2026-05-17); later slices remain TODO
 **Project:** DecentDB  
 **Document Type:** Implementation SPEC  
 **Audience:** Core engine developers, storage/replication implementers, SDK maintainers, CLI maintainers, documentation authors, coding agents  
@@ -1378,6 +1378,22 @@ Implementation notes:
 
 Make local-first sync pleasant to integrate from real apps.
 
+### Status
+
+Complete (2026-05-17).
+
+- The flagship .NET SDK now exposes a single JSON request/response native
+  bridge for sync operations.
+- Strongly typed SDK models and convenience methods are layered above the
+  bridge in `DecentDB.Native`.
+- The ADO.NET surface now exposes the same sync client through open
+  connections.
+- Manual local batch export/import, peer/scope/session workflows, conflict
+  workflows, doctor/retention/prune, and agent-friendly raw JSON helpers are
+  all available without shelling out to the CLI.
+- Built-in HTTP transport parity for `sync run` remains future adapter work
+  and is not part of Slice 7.
+
 ### Tasks
 
 1. Finalize flagship SDK API surface.
@@ -1394,6 +1410,7 @@ Make local-first sync pleasant to integrate from real apps.
 ### Exit Criteria
 
 - developers can integrate sync without relying primarily on shell commands
+- `.NET` is the minimum polished SDK surface for sync v1
 
 ---
 

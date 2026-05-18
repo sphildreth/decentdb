@@ -20,7 +20,7 @@ Future version values are planning buckets, not release commitments.
 
 | Priority | Future Version | Status | Feature | Current Source Of Truth | Why This Rank |
 |---:|---|---|---|---|---|
-| 1 | vNext | IN PROGRESS | Native local-first sync, changesets, CDC, and merge | [`WIN01_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md`](WIN01_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md), ADR 0147, ADR 0148, ADR 0149, ADR 0150, ADR 0151 | Strongest identity-level differentiator and real application painkiller |
+| 1 | vNext | IN PROGRESS | Native local-first sync, changesets, CDC, and merge | [`WIN01_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md`](WIN01_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md), ADR 0147, ADR 0148, ADR 0149, ADR 0150, ADR 0151, ADR 0152 | Strongest identity-level differentiator and real application painkiller |
 | 2 | vNext | BACKLOG | Branch, diff, restore, and time-travel workflows | Needs ADR/spec | Memorable workflow for agents, test environments, migration rehearsal, and support |
 | 3 | vNext | BACKLOG | Schema-first strongly typed SDK generation | [`WIN02_SCHEMA_FIRST_STRONGLY_TYPED_SDK_GENERATION_SPEC.md`](WIN02_SCHEMA_FIRST_STRONGLY_TYPED_SDK_GENERATION_SPEC.md), ADR 0116, ADR 0129 | Adoption accelerator across languages; DecentDB metadata foundation exists |
 | 4 | vNext+1 | BACKLOG | WASM and browser OPFS support | [`WIN03_WASM_SUPPORT_IMPLEMENTATION.md`](WIN03_WASM_SUPPORT_IMPLEMENTATION.md) | Essential enabler for browser local-first apps, but no longer unique by itself |
@@ -58,7 +58,7 @@ than future roadmap claims:
 - Cost-based optimizer and `ANALYZE`
 - In-memory VFS for testing
 - Bulk-load API foundation
-- Local sync Slices 1-6 complete: durable journal capture, batch-envelope export/import, conflict inspection, peer catalog, session tracking, scoped replication, HTTP client transport, dev sync server, `sync run`, retry handling, session inspection, conflict workflows, retention hardening, and operational doctor/reporting
+- Local sync Slices 1-7 complete: durable journal capture, batch-envelope export/import, conflict inspection, peer catalog, session tracking, scoped replication, HTTP client transport, dev sync server, `sync run`, retry handling, session inspection, conflict workflows, retention hardening, operational doctor/reporting, and SDK polish through the flagship .NET JSON bridge
 - Same-process shared WAL visibility
 - Mature C ABI and multi-language binding surface
 - Doctor/advisor v1 CLI, JSON, Markdown, and safe `--fix` surface
@@ -87,9 +87,9 @@ The remaining roadmap should support one clear lane:
 
 ## 1. Native Local-First Sync, Changesets, CDC, And Merge
 
-**Status:** `TODO`  
+**Status:** `IN PROGRESS`
 **Future Version:** vNext  
-**Source of truth:** [`WIN01_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md`](WIN01_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md), ADR 0147, ADR 0148, ADR 0149, ADR 0150, ADR 0151
+**Source of truth:** [`WIN01_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md`](WIN01_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md), ADR 0147, ADR 0148, ADR 0149, ADR 0150, ADR 0151, ADR 0152
 
 ### Why This Is First
 
@@ -103,7 +103,7 @@ semantics as an engine capability.
 
 ### Completed Foundation
 
-Slices 1-6 are complete:
+Slices 1-7 are complete:
 
 - replica identity
 - sync enablement metadata
@@ -128,21 +128,22 @@ Slices 1-6 are complete:
 - structured conflict payload/resolution fields and compatible table upgrades
 - operational doctor reports with retention, peer lag, and guidance summaries
 - safe/default prune, dry-run, and explicit data-loss override flows
+- flagship .NET sync SDK via the in-process JSON C ABI bridge
 
 ### Next Implementable Slice
 
-The remaining sync work now moves to Slice 7 SDK polish:
+The remaining sync work now moves past Slice 7 into Slice 8 documentation and examples:
 
-- flagship SDK API surface completion
-- convenience wrappers for peer/scope/session operations
-- typed result objects and error codes
-- end-to-end samples and integration polish
+- conceptual overview and quickstart docs
+- CLI / SQL / SDK reference completion
+- architecture, troubleshooting, and operations guides
+- sample apps and copy-pasteable examples
 
 ### Later Slices
 
 - manual exchange hardening beyond the Slice 3 transport foundation
 - future retention ergonomics, crash-hardened prune rewrites, and deeper sync doctor checks
-- post-SDK-publish documentation and bindings follow-ons
+- any post-SDK-publish binding follow-ons that are not required for the flagship .NET surface
 
 ### Guardrails
 
