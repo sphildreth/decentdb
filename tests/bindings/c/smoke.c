@@ -14,6 +14,48 @@ static void check(ddb_status_t status, const char *context) {
   }
 }
 
+static void expect_u8_eq(uint8_t actual, uint8_t expected,
+                         const char *context) {
+  if (actual != expected) {
+    fprintf(stderr, "%s expected %u, got %u\n", context, expected, actual);
+    exit(1);
+  }
+}
+
+static void expect_i32_eq(int32_t actual, int32_t expected,
+                          const char *context) {
+  if (actual != expected) {
+    fprintf(stderr, "%s expected %d, got %d\n", context, expected, actual);
+    exit(1);
+  }
+}
+
+static void expect_i64_eq(int64_t actual, int64_t expected,
+                          const char *context) {
+  if (actual != expected) {
+    fprintf(stderr, "%s expected %lld, got %lld\n", context,
+            (long long)expected, (long long)actual);
+    exit(1);
+  }
+}
+
+static void expect_tag(const ddb_value_t *value, ddb_value_tag_t expected,
+                       const char *context) {
+  if (value->tag != (uint32_t)expected) {
+    fprintf(stderr, "%s expected tag %u, got %u\n", context,
+            (uint32_t)expected, value->tag);
+    exit(1);
+  }
+}
+
+static void expect_bytes(const uint8_t *actual, const uint8_t *expected,
+                         size_t len, const char *context) {
+  if (memcmp(actual, expected, len) != 0) {
+    fprintf(stderr, "%s bytes did not match\n", context);
+    exit(1);
+  }
+}
+
 int main(void) {
   ddb_db_t *db = NULL;
   ddb_result_t *result = NULL;
@@ -69,6 +111,119 @@ int main(void) {
     return 1;
   }
   check(ddb_string_free(&json), "free branch list json");
+
+  check(ddb_db_execute(
+            db,
+            "CREATE TABLE semantic ("
+            "id INT64 PRIMARY KEY,"
+            "status ENUM('new', 'paid'),"
+            "host IPADDR,"
+            "block CIDR,"
+            "day DATE,"
+            "clock TIME,"
+            "observed TIMESTAMPTZ,"
+            "delay INTERVAL,"
+            "mac MACADDR,"
+            "eui MACADDR8)",
+            NULL, 0, &result),
+        "create semantic");
+  check(ddb_result_free(&result), "free create semantic");
+
+  check(ddb_db_execute(
+            db,
+            "INSERT INTO semantic VALUES ("
+            "1,"
+            "'paid',"
+            "'192.168.10.20',"
+            "'192.168.10.99/24',"
+            "'2026-05-18',"
+            "'09:30:00.123456',"
+            "'2026-05-18T09:10:11.123456-05:00',"
+            "'1 year 2 months 3 days 4.5 seconds',"
+            "'08:00:2b:01:02:03',"
+            "'08:00:2b:ff:fe:01:02:03')",
+            NULL, 0, &result),
+        "insert semantic");
+  check(ddb_result_free(&result), "free insert semantic");
+
+  check(ddb_db_execute(
+            db,
+            "SELECT status, host, block, day, clock, observed, delay, mac, eui "
+            "FROM semantic",
+            NULL, 0, &result),
+        "select semantic");
+  check(ddb_result_row_count(result, &rows), "semantic row_count");
+  if (rows != 1) {
+    fprintf(stderr, "expected 1 semantic row, got %zu\n", rows);
+    return 1;
+  }
+
+  ddb_value_t value;
+  check(ddb_result_value_copy(result, 0, 0, &value), "copy enum");
+  expect_tag(&value, DDB_VALUE_ENUM, "semantic enum");
+  if (value.enum_type_id == 0 || value.enum_label_id != 1) {
+    fprintf(stderr, "unexpected enum ids: type=%llu label=%llu\n",
+            (unsigned long long)value.enum_type_id,
+            (unsigned long long)value.enum_label_id);
+    return 1;
+  }
+  check(ddb_value_dispose(&value), "dispose enum");
+
+  const uint8_t ip_v4[] = {192, 168, 10, 20};
+  check(ddb_result_value_copy(result, 0, 1, &value), "copy ipaddr");
+  expect_tag(&value, DDB_VALUE_IPADDR, "semantic ipaddr");
+  expect_u8_eq(value.ip_family, 4, "ipaddr family");
+  expect_bytes(value.ip_cidr_addr_bytes, ip_v4, sizeof(ip_v4), "ipaddr bytes");
+  check(ddb_value_dispose(&value), "dispose ipaddr");
+
+  const uint8_t cidr_v4[] = {192, 168, 10, 0};
+  check(ddb_result_value_copy(result, 0, 2, &value), "copy cidr");
+  expect_tag(&value, DDB_VALUE_CIDR, "semantic cidr");
+  expect_u8_eq(value.ip_family, 4, "cidr family");
+  expect_u8_eq(value.cidr_prefix_len, 24, "cidr prefix");
+  expect_bytes(value.ip_cidr_addr_bytes, cidr_v4, sizeof(cidr_v4),
+               "cidr bytes");
+  check(ddb_value_dispose(&value), "dispose cidr");
+
+  check(ddb_result_value_copy(result, 0, 3, &value), "copy date");
+  expect_tag(&value, DDB_VALUE_DATE, "semantic date");
+  expect_i32_eq(value.date_days, 20591, "date days");
+  check(ddb_value_dispose(&value), "dispose date");
+
+  check(ddb_result_value_copy(result, 0, 4, &value), "copy time");
+  expect_tag(&value, DDB_VALUE_TIME, "semantic time");
+  expect_i64_eq(value.time_micros, 34200123456LL, "time micros");
+  check(ddb_value_dispose(&value), "dispose time");
+
+  check(ddb_result_value_copy(result, 0, 5, &value), "copy timestamptz");
+  expect_tag(&value, DDB_VALUE_TIMESTAMPTZ_MICROS, "semantic timestamptz");
+  expect_i64_eq(value.timestamptz_micros, 1779113411123456LL,
+                "timestamptz micros");
+  check(ddb_value_dispose(&value), "dispose timestamptz");
+
+  check(ddb_result_value_copy(result, 0, 6, &value), "copy interval");
+  expect_tag(&value, DDB_VALUE_INTERVAL, "semantic interval");
+  expect_i32_eq(value.interval_months, 14, "interval months");
+  expect_i32_eq(value.interval_days, 3, "interval days");
+  expect_i64_eq(value.interval_micros, 4500000LL, "interval micros");
+  check(ddb_value_dispose(&value), "dispose interval");
+
+  const uint8_t mac48[] = {0x08, 0x00, 0x2b, 0x01, 0x02, 0x03};
+  check(ddb_result_value_copy(result, 0, 7, &value), "copy macaddr");
+  expect_tag(&value, DDB_VALUE_MACADDR, "semantic macaddr");
+  expect_u8_eq(value.ip_family, 6, "macaddr length");
+  expect_bytes(value.ip_cidr_addr_bytes, mac48, sizeof(mac48), "macaddr bytes");
+  check(ddb_value_dispose(&value), "dispose macaddr");
+
+  const uint8_t mac64[] = {0x08, 0x00, 0x2b, 0xff,
+                           0xfe, 0x01, 0x02, 0x03};
+  check(ddb_result_value_copy(result, 0, 8, &value), "copy macaddr8");
+  expect_tag(&value, DDB_VALUE_MACADDR, "semantic macaddr8");
+  expect_u8_eq(value.ip_family, 8, "macaddr8 length");
+  expect_bytes(value.ip_cidr_addr_bytes, mac64, sizeof(mac64),
+               "macaddr8 bytes");
+  check(ddb_value_dispose(&value), "dispose macaddr8");
+  check(ddb_result_free(&result), "free semantic select");
 
   if (ddb_db_execute(db, "SELECT * FROM nope", NULL, 0, &result) !=
       DDB_ERR_SQL) {

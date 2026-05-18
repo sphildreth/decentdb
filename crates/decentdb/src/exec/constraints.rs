@@ -33,7 +33,7 @@ impl EngineRuntime {
             .columns
             .iter()
             .zip(values)
-            .map(|(column, value)| coerce_value(column, value))
+            .map(|(column, value)| coerce_column_value(column, value))
             .collect()
     }
 
@@ -332,7 +332,7 @@ pub(super) fn auto_index_name(prefix: &str, table_name: &str, columns: &[String]
     format!("{prefix}_{}_{}", table_name, columns.join("_"))
 }
 
-fn coerce_value(column: &ColumnSchema, value: Value) -> Result<Value> {
+pub(super) fn coerce_column_value(column: &ColumnSchema, value: Value) -> Result<Value> {
     if matches!(value, Value::Null) {
         return Ok(Value::Null);
     }

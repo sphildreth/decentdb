@@ -512,6 +512,13 @@ impl EngineRuntime {
         let table = self
             .table_schema(&statement.table_name)
             .ok_or_else(|| DbError::sql(format!("unknown table {}", statement.table_name)))?;
+        if table
+            .columns
+            .iter()
+            .any(|column| column.column_type == ColumnType::Enum)
+        {
+            return Ok(None);
+        }
         let InsertSource::Values(rows) = &statement.source else {
             return Ok(None);
         };
@@ -697,6 +704,9 @@ impl EngineRuntime {
         };
         let column = &table.columns[column_index];
         if column.generated_sql.is_some() {
+            return Ok(None);
+        }
+        if column.column_type == ColumnType::Enum {
             return Ok(None);
         }
 
@@ -1628,7 +1638,7 @@ impl EngineRuntime {
                     None,
                 )?;
                 next_values[*column_index] =
-                    super::cast_value(value, table.columns[*column_index].column_type)?;
+                    super::constraints::coerce_column_value(&table.columns[*column_index], value)?;
             }
             apply_generated_columns(self, table, &mut next_values, params)?;
             if next_values == current_row.values {
@@ -1960,8 +1970,10 @@ impl EngineRuntime {
                         "parameter ${param_index} was not provided"
                     )));
                 };
-                let next_email =
-                    super::cast_value(new_email, table.columns[column_index].column_type)?;
+                let next_email = super::constraints::coerce_column_value(
+                    &table.columns[column_index],
+                    new_email,
+                )?;
                 if indexes_to_update.is_empty() {
                     if !table.columns[column_index].nullable && matches!(next_email, Value::Null) {
                         return Err(DbError::constraint(format!(
@@ -2114,7 +2126,7 @@ impl EngineRuntime {
                     None,
                 )?;
                 next_values[*column_index] =
-                    super::cast_value(value, table.columns[*column_index].column_type)?;
+                    super::constraints::coerce_column_value(&table.columns[*column_index], value)?;
             }
             apply_generated_columns(self, &table, &mut next_values, params)?;
             if next_values == current_row.values {
@@ -2538,7 +2550,7 @@ impl EngineRuntime {
                 Some(&excluded),
             )?;
             next_values[column_index] =
-                super::cast_value(value, table.columns[column_index].column_type)?;
+                super::constraints::coerce_column_value(&table.columns[column_index], value)?;
         }
         apply_generated_columns(self, &table, &mut next_values, params)?;
         let assignment_columns = assignments
@@ -3097,7 +3109,7 @@ fn apply_generated_columns(
             &std::collections::BTreeMap::new(),
             None,
         )?;
-        row[index] = super::cast_value(value, column.column_type)?;
+        row[index] = super::constraints::coerce_column_value(column, value)?;
     }
     Ok(())
 }

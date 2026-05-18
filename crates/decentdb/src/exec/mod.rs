@@ -22560,7 +22560,7 @@ impl EngineRuntime {
             let dataset = table_row_dataset(table, &base_values, &table.name);
             let eval_row = dataset.rows.first().map(Vec::as_slice).unwrap_or(&[]);
             let value = self.eval_expr(&expr, &dataset, eval_row, &[], &BTreeMap::new(), None)?;
-            let cast_value = cast_value(value, column.column_type)?;
+            let cast_value = self::constraints::coerce_column_value(column, value)?;
             if let Some(slot) = row.get_mut(index) {
                 *slot = cast_value.clone();
             } else {

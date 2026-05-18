@@ -5,7 +5,7 @@ All notable changes to DecentDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [2.5.0] - [UNRELEASED] [WIP]
+## [2.5.0] - 2026-05-18
 
 ### Changed
 
@@ -13,6 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Fixed single-row `ENUM` inserts and updates after reopen so column label
+  metadata is used during write coercion instead of falling through to the
+  metadata-free generic cast path.
 - Removed three stale `#[ignore]` test annotations: the zero-byte WAL design-choice test, the `INSERT DEFAULT VALUES` missing-feature test, and the decimal negative-precision ordering test (the underlying sortable encoding was already correct, validated by the now-active test).
 
 ### Added

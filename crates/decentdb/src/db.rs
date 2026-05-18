@@ -11364,10 +11364,22 @@ mod tests {
         drop(db);
 
         let reopened = Db::open(&path, DbConfig::default())?;
+        reopened.execute("INSERT INTO tickets VALUES (3, 'blocked')")?;
+        reopened.execute("UPDATE tickets SET state = 'closed' WHERE id = 3")?;
+        assert!(reopened
+            .execute("INSERT INTO tickets VALUES (4, 'missing')")
+            .is_err());
         let reopened_result = reopened.execute("SELECT state FROM tickets ORDER BY id")?;
         assert_eq!(
             reopened_result.rows()[0].values()[0],
             result.rows()[0].values()[0]
+        );
+        assert_eq!(
+            reopened_result.rows()[2].values()[0],
+            Value::Enum {
+                enum_type_id,
+                label_id: 1
+            }
         );
         Ok(())
     }

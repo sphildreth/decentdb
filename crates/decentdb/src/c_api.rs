@@ -2865,6 +2865,121 @@ mod tests {
     }
 
     #[test]
+    fn ffi_roundtrip_copies_semantic_value_tags() {
+        let mut db = ptr::null_mut();
+        let path = CString::new(":memory:").expect("path");
+        assert_eq!(ddb_db_open_or_create(path.as_ptr(), &mut db), DDB_OK);
+
+        let create = CString::new(
+            "CREATE TABLE semantic_values (
+                id INT64 PRIMARY KEY,
+                ip IPADDR,
+                network CIDR,
+                day DATE,
+                tod TIME,
+                tsz TIMESTAMPTZ,
+                span INTERVAL,
+                mac MACADDR
+            )",
+        )
+        .expect("create");
+        let mut result = ptr::null_mut();
+        assert_eq!(
+            ddb_db_execute(db, create.as_ptr(), ptr::null(), 0, &mut result),
+            DDB_OK
+        );
+        assert_eq!(ddb_result_free(&mut result), DDB_OK);
+
+        let insert = CString::new(
+            "INSERT INTO semantic_values VALUES (
+                1,
+                '10.1.2.3',
+                '10.1.2.99/24',
+                '1970-01-03',
+                '01:02:03.004005',
+                '1970-01-01T00:00:00Z',
+                '12 -3 4000000',
+                '08:00:2b:01:02:03'
+            )",
+        )
+        .expect("insert");
+        let insert_status = ddb_db_execute(db, insert.as_ptr(), ptr::null(), 0, &mut result);
+        assert_eq!(
+            insert_status,
+            DDB_OK,
+            "insert failed: {}",
+            unsafe { CStr::from_ptr(ddb_last_error_message()) }
+                .to_str()
+                .expect("utf8")
+        );
+        assert_eq!(ddb_result_free(&mut result), DDB_OK);
+
+        let select =
+            CString::new("SELECT ip, network, day, tod, tsz, span, mac FROM semantic_values")
+                .expect("select");
+        assert_eq!(
+            ddb_db_execute(db, select.as_ptr(), ptr::null(), 0, &mut result),
+            DDB_OK
+        );
+
+        let mut rows = 0;
+        let mut columns = 0;
+        assert_eq!(ddb_result_row_count(result, &mut rows), DDB_OK);
+        assert_eq!(ddb_result_column_count(result, &mut columns), DDB_OK);
+        assert_eq!(rows, 1);
+        assert_eq!(columns, 7);
+
+        let mut copied = DdbValue::default();
+
+        assert_eq!(ddb_result_value_copy(result, 0, 0, &mut copied), DDB_OK);
+        assert_eq!(copied.tag, DdbValueTag::IpAddr as u32);
+        assert_eq!(copied.ip_family, 4);
+        assert_eq!(copied.ip_cidr_addr_bytes[..4], [10, 1, 2, 3]);
+        assert_eq!(ddb_value_dispose(&mut copied), DDB_OK);
+
+        assert_eq!(ddb_result_value_copy(result, 0, 1, &mut copied), DDB_OK);
+        assert_eq!(copied.tag, DdbValueTag::Cidr as u32);
+        assert_eq!(copied.ip_family, 4);
+        assert_eq!(copied.cidr_prefix_len, 24);
+        assert_eq!(copied.ip_cidr_addr_bytes[..4], [10, 1, 2, 0]);
+        assert_eq!(ddb_value_dispose(&mut copied), DDB_OK);
+
+        assert_eq!(ddb_result_value_copy(result, 0, 2, &mut copied), DDB_OK);
+        assert_eq!(copied.tag, DdbValueTag::Date as u32);
+        assert_eq!(copied.date_days, 2);
+        assert_eq!(ddb_value_dispose(&mut copied), DDB_OK);
+
+        assert_eq!(ddb_result_value_copy(result, 0, 3, &mut copied), DDB_OK);
+        assert_eq!(copied.tag, DdbValueTag::Time as u32);
+        assert_eq!(copied.time_micros, 3_723_004_005);
+        assert_eq!(ddb_value_dispose(&mut copied), DDB_OK);
+
+        assert_eq!(ddb_result_value_copy(result, 0, 4, &mut copied), DDB_OK);
+        assert_eq!(copied.tag, DdbValueTag::TimestamptzMicros as u32);
+        assert_eq!(copied.timestamptz_micros, 0);
+        assert_eq!(ddb_value_dispose(&mut copied), DDB_OK);
+
+        assert_eq!(ddb_result_value_copy(result, 0, 5, &mut copied), DDB_OK);
+        assert_eq!(copied.tag, DdbValueTag::Interval as u32);
+        assert_eq!(copied.interval_months, 12);
+        assert_eq!(copied.interval_days, -3);
+        assert_eq!(copied.interval_micros, 4_000_000);
+        assert_eq!(ddb_value_dispose(&mut copied), DDB_OK);
+
+        assert_eq!(ddb_result_value_copy(result, 0, 6, &mut copied), DDB_OK);
+        assert_eq!(copied.tag, DdbValueTag::MacAddr as u32);
+        assert_eq!(copied.ip_family, 6);
+        assert_eq!(
+            copied.ip_cidr_addr_bytes[..6],
+            [0x08, 0x00, 0x2b, 0x01, 0x02, 0x03]
+        );
+        assert_eq!(ddb_value_dispose(&mut copied), DDB_OK);
+
+        assert_eq!(ddb_result_free(&mut result), DDB_OK);
+        assert_eq!(ddb_db_free(&mut db), DDB_OK);
+    }
+
+    #[test]
     fn metadata_json_helpers_return_current_catalog_state() {
         let mut db = ptr::null_mut();
         let path = CString::new(":memory:").expect("path");
