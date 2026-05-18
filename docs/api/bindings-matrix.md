@@ -2,7 +2,7 @@
 
 | Binding surface | Current in-tree scope | Source of truth |
 |---|---|---|
-| C ABI | Stable handle/result core surface | `include/decentdb.h`, `crates/decentdb/src/c_api.rs` |
+| C ABI | Stable handle/result core surface plus C/C++ integration path | `include/decentdb.h`, `crates/decentdb/src/c_api.rs`, `tests/bindings/c/` |
 | .NET | `DecentDB.Native`, `DecentDB.AdoNet`, `DecentDB.MicroOrm`, EF Core provider family, migration/query/failure-path coverage, plus smoke validation | `bindings/dotnet/src/`, `bindings/dotnet/tests/`, `tests/bindings/dotnet/Smoke/` |
 | Python | DB-API driver, SQLAlchemy dialect, import tools, plus direct native validation | `bindings/python/`, `bindings/python/tests/`, `tests/bindings/python/test_ffi.py` |
 | Go | `database/sql` driver, direct DecentDB helper API, plus release smoke | `bindings/go/decentdb-go/`, `tests/bindings/go/smoke.go` |

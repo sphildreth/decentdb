@@ -122,3 +122,8 @@ All fallible operations return `decentdb::Result<T>`, which aliases `std::result
 - SQL errors
 - internal engine errors
 - panic boundaries
+
+## Related Native Surfaces
+
+- [C/C++ ABI](c-cpp.md) documents the stable `include/decentdb.h` surface for
+  C callers and C++ callers that want to consume DecentDB through C linkage.

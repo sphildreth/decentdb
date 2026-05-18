@@ -21,7 +21,7 @@ Future version values are planning buckets, not release commitments.
 
 | Priority | Future Version | Status | Feature | Current Source Of Truth | Why This Rank |
 |---:|---|---|---|---|---|
-| 1 | vNext | TODO | Branch, diff, restore, and time-travel workflows | Needs ADR/spec | Memorable workflow for agents, test environments, migration rehearsal, and support |
+| 1 | vNext | TODO | Branch, diff, restore, and time-travel workflows | [`WIN05_BRANCH_DIFF_RESTORE_TIME_TRAVEL_IMPLEMENTATION_GUIDE.md`](WIN05_BRANCH_DIFF_RESTORE_TIME_TRAVEL_IMPLEMENTATION_GUIDE.md) | Memorable workflow for agents, test environments, migration rehearsal, and support |
 | 2 | vNext | TODO | Native geospatial types and spatial indexes | [`WIN03_GEOSPATIAL_DATA_SUPPORT.md`](WIN03_GEOSPATIAL_DATA_SUPPORT.md), ADR 0124-0128 | Strong local-first wedge for mobile, field service, logistics, IoT, and offline map workflows |
 | 3 | vNext | TODO | Schema-first strongly typed SDK generation | [`WIN02_SCHEMA_FIRST_STRONGLY_TYPED_SDK_GENERATION_SPEC.md`](WIN02_SCHEMA_FIRST_STRONGLY_TYPED_SDK_GENERATION_SPEC.md), ADR 0116, ADR 0129 | Adoption accelerator across languages; DecentDB metadata foundation exists |
 | 4 | vNext+1 | TODO | WASM and browser OPFS support | [`WIN03_WASM_SUPPORT_IMPLEMENTATION.md`](WIN03_WASM_SUPPORT_IMPLEMENTATION.md) | Essential enabler for browser local-first apps, especially with sync, typed SDKs, and geospatial data |
@@ -91,7 +91,7 @@ The remaining roadmap should support one clear lane:
 
 **Status:** `TODO`
 **Future Version:** vNext
-**Source of truth:** Needs ADR/spec before implementation.
+**Source of truth:** [`WIN05_BRANCH_DIFF_RESTORE_TIME_TRAVEL_IMPLEMENTATION_GUIDE.md`](WIN05_BRANCH_DIFF_RESTORE_TIME_TRAVEL_IMPLEMENTATION_GUIDE.md)
 
 ### Why This Matters
 
@@ -109,7 +109,8 @@ This supports:
 
 ### Recommended First Work
 
-Write an ADR/spec before code. It must define:
+Use the implementation guide to drive the ADR sequence before code. The first
+ADRs must define:
 
 - branch identity and metadata
 - snapshot retention

@@ -99,9 +99,9 @@ decentdb sync pending --db ./app.ddb --since 0 --limit 10 --format table
 - Comparing engines: [Comparison Overview](user-guide/comparison.md),
   [DecentDB vs SQLite](user-guide/decentdb-vs-sqlite.md), and
   [DecentDB vs DuckDB](user-guide/decentdb-vs-duckdb.md)
-- Language integrations: [.NET](api/dotnet.md), [Go](api/go.md),
-  [Python](api/python.md), [Node.js](api/node.md), [Dart/Flutter](api/dart.md),
-  and [JDBC](api/jdbc.md)
+- Language integrations: [C/C++ ABI](api/c-cpp.md), [.NET](api/dotnet.md),
+  [Go](api/go.md), [Python](api/python.md), [Node.js](api/node.md),
+  [Dart/Flutter](api/dart.md), and [JDBC](api/jdbc.md)
 - CLI users: [Interactive SQL Shell](user-guide/repl.md) and
   [CLI Reference](api/cli-reference.md)
 
@@ -126,6 +126,7 @@ the [sync quickstart](user-guide/sync/quickstart.md).
 
 | Language | Surface |
 |---|---|
+| C/C++ | [Stable C ABI](api/c-cpp.md) through `include/decentdb.h`; C++ consumers can include the same header directly |
 | .NET | Native wrapper, ADO.NET provider, Micro ORM, EF Core provider, NodaTime support, and typed sync SDK |
 | Go | `database/sql` driver with DecentDB-specific helpers |
 | Python | DB-API and SQLAlchemy dialect |

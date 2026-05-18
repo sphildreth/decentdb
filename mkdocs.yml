@@ -52,6 +52,7 @@ nav:
     - Error Codes: api/error-codes.md
     - Configuration: api/configuration.md
     - Language Bindings:
+      - C/C++ ABI: api/c-cpp.md
       - .NET (C#): api/dotnet.md
       - Dart/Flutter: api/dart.md
       - Go: api/go.md
