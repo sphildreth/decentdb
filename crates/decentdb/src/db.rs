@@ -1279,6 +1279,364 @@ impl Db {
         self.execute_batch_with_params(sql, &[])
     }
 
+    /// Executes one or more read-only SQL statements against a retained WAL LSN.
+    pub fn execute_batch_at_snapshot_lsn(
+        &self,
+        sql: &str,
+        snapshot_lsn: u64,
+    ) -> Result<Vec<QueryResult>> {
+        self.execute_batch_at_snapshot_lsn_with_params(sql, snapshot_lsn, &[])
+    }
+
+    /// Executes one or more read-only SQL statements with `$n` parameters against a retained WAL LSN.
+    pub fn execute_batch_at_snapshot_lsn_with_params(
+        &self,
+        sql: &str,
+        snapshot_lsn: u64,
+        params: &[Value],
+    ) -> Result<Vec<QueryResult>> {
+        let latest_lsn = self.inner.wal.latest_snapshot();
+        if snapshot_lsn > latest_lsn {
+            return Err(DbError::transaction(format!(
+                "snapshot LSN {snapshot_lsn} is newer than WAL end LSN {latest_lsn}"
+            )));
+        }
+
+        let mut statements = Vec::new();
+        for statement_sql in split_sql_batch(sql) {
+            let trimmed = statement_sql.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if parse_transaction_control(trimmed).is_some()
+                || parse_pragma_command(trimmed)?.is_some()
+            {
+                return Err(DbError::transaction(
+                    "time-travel execution only supports read-only SQL statements",
+                ));
+            }
+            let statement = self.parsed_statement(trimmed)?;
+            if !statement_is_read_only(&statement) {
+                return Err(DbError::transaction(
+                    "time-travel execution is read-only; mutating statements are not allowed",
+                ));
+            }
+            statements.push(statement);
+        }
+        if statements.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let schema_cookie = self.current_schema_cookie_at_snapshot(snapshot_lsn)?;
+        let mut runtime = EngineRuntime::load_from_storage_at_snapshot(
+            &self.inner.pager,
+            &self.inner.wal,
+            schema_cookie,
+            &self.inner.config,
+            snapshot_lsn,
+        )?;
+        runtime.load_deferred_tables_at_snapshot(
+            &self.inner.pager,
+            &self.inner.wal,
+            self.inner.config.page_size,
+            snapshot_lsn,
+        )?;
+
+        statements
+            .iter()
+            .map(|statement| {
+                runtime.execute_read_statement(statement, params, self.inner.config.page_size)
+            })
+            .collect()
+    }
+
+    /// Executes SQL on a branch. Non-`main` branches are read-only until branch-local writes land.
+    pub fn execute_batch_on_branch(
+        &self,
+        sql: &str,
+        branch_name: &str,
+    ) -> Result<Vec<QueryResult>> {
+        self.execute_batch_on_branch_with_params(sql, branch_name, &[])
+    }
+
+    /// Executes SQL with `$n` parameters on a branch.
+    pub fn execute_batch_on_branch_with_params(
+        &self,
+        sql: &str,
+        branch_name: &str,
+        params: &[Value],
+    ) -> Result<Vec<QueryResult>> {
+        if branch_name == crate::branch::DEFAULT_BRANCH_NAME {
+            return self.execute_batch_with_params(sql, params);
+        }
+        let branch = crate::branch::branch_by_name(self, branch_name)?
+            .ok_or_else(|| DbError::transaction(format!("unknown branch '{branch_name}'")))?;
+        let read_only = self.sql_batch_is_read_only(sql)?;
+        if !read_only && !params.is_empty() {
+            return Err(DbError::transaction(
+                "branch-local writes with SQL parameters are not supported yet",
+            ));
+        }
+        let branch_db = self.materialize_branch_db(&branch)?;
+        let results = branch_db.execute_batch_with_params(sql, params)?;
+        if !read_only {
+            crate::branch::append_branch_sql_log(self, &branch, sql)?;
+            self.refresh_named_snapshot_retention()?;
+        }
+        Ok(results)
+    }
+
+    fn sql_batch_is_read_only(&self, sql: &str) -> Result<bool> {
+        for statement_sql in split_sql_batch(sql) {
+            let trimmed = statement_sql.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if parse_transaction_control(trimmed).is_some()
+                || parse_pragma_command(trimmed)?.is_some()
+            {
+                return Ok(false);
+            }
+            let statement = self.parsed_statement(trimmed)?;
+            if !statement_is_read_only(&statement) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn materialize_branch_db(&self, branch: &crate::branch::BranchInfo) -> Result<Db> {
+        let head_id = branch
+            .current_head_id
+            .as_deref()
+            .ok_or_else(|| DbError::internal("branch is missing a current head"))?;
+        let branch_lsn = crate::branch::branch_head_lsn_by_id(self, head_id)?
+            .ok_or_else(|| DbError::internal("branch current head is missing"))?;
+        let dump = self.dump_sql_at_snapshot_lsn(branch_lsn)?;
+        let branch_db = Db::open_or_create(":memory:", self.inner.config.clone())?;
+        if !dump.trim().is_empty() {
+            branch_db.execute_batch(&dump)?;
+        }
+        for entry in crate::branch::branch_sql_log_for_head(self, head_id)? {
+            branch_db.execute_batch(&entry.sql)?;
+        }
+        Ok(branch_db)
+    }
+
+    fn materialize_branch_head_db(&self, head_id: &str) -> Result<Db> {
+        let branch_lsn = crate::branch::branch_head_lsn_by_id(self, head_id)?
+            .ok_or_else(|| DbError::transaction(format!("unknown branch head '{head_id}'")))?;
+        let dump = self.dump_sql_at_snapshot_lsn(branch_lsn)?;
+        let branch_db = self.materialize_dump_db(&dump)?;
+        for entry in crate::branch::branch_sql_log_for_head(self, head_id)? {
+            branch_db.execute_batch(&entry.sql)?;
+        }
+        Ok(branch_db)
+    }
+
+    fn materialize_snapshot_lsn_db(&self, snapshot_lsn: u64) -> Result<Db> {
+        let dump = self.dump_sql_at_snapshot_lsn(snapshot_lsn)?;
+        self.materialize_dump_db(&dump)
+    }
+
+    fn materialize_current_db(&self) -> Result<Db> {
+        let dump = self.dump_sql()?;
+        self.materialize_dump_db(&dump)
+    }
+
+    fn materialize_dump_db(&self, dump: &str) -> Result<Db> {
+        let db = Db::open_or_create(":memory:", self.inner.config.clone())?;
+        if !dump.trim().is_empty() {
+            db.execute_batch(dump)?;
+        }
+        Ok(db)
+    }
+
+    fn materialize_ref_db(&self, reference: &str) -> Result<Db> {
+        if reference == crate::branch::DEFAULT_BRANCH_NAME {
+            return self.materialize_current_db();
+        }
+        if let Some(branch) = crate::branch::branch_by_name(self, reference)? {
+            return self.materialize_branch_db(&branch);
+        }
+        if let Some(snapshot) = self.snapshot_get(reference)? {
+            return self.materialize_snapshot_lsn_db(snapshot.snapshot_lsn);
+        }
+        if crate::branch::branch_head_by_id(self, reference)?.is_some() {
+            return self.materialize_branch_head_db(reference);
+        }
+        Err(DbError::transaction(format!(
+            "unknown branch, snapshot, or head '{reference}'"
+        )))
+    }
+
+    fn resolve_branch_target_head(
+        &self,
+        reference: &str,
+    ) -> Result<crate::branch::BranchHeadMetadata> {
+        if reference == crate::branch::DEFAULT_BRANCH_NAME {
+            return Err(DbError::transaction(
+                "use a named snapshot, branch, or head ID as the restore target",
+            ));
+        }
+        if let Some(branch) = crate::branch::branch_by_name(self, reference)? {
+            let head_id = branch
+                .current_head_id
+                .as_deref()
+                .ok_or_else(|| DbError::transaction(format!("branch '{reference}' has no head")))?;
+            return crate::branch::branch_head_by_id(self, head_id)?
+                .ok_or_else(|| DbError::corruption(format!("branch head '{head_id}' is missing")));
+        }
+        if let Some(snapshot) = self.snapshot_get(reference)? {
+            return crate::branch::branch_head_by_id(self, &snapshot.head_id)?.ok_or_else(|| {
+                DbError::corruption(format!(
+                    "snapshot '{}' references missing head '{}'",
+                    snapshot.name, snapshot.head_id
+                ))
+            });
+        }
+        if let Some(head) = crate::branch::branch_head_by_id(self, reference)? {
+            return Ok(head);
+        }
+        Err(DbError::transaction(format!(
+            "unknown branch, snapshot, or head '{reference}'"
+        )))
+    }
+
+    /// Compares two refs (`main`, branch name, named snapshot, or branch head ID).
+    pub fn branch_diff(
+        &self,
+        left_ref: &str,
+        right_ref: &str,
+    ) -> Result<crate::branch::BranchDiffReport> {
+        let left_db = self.materialize_ref_db(left_ref)?;
+        let right_db = self.materialize_ref_db(right_ref)?;
+        diff_materialized_refs(left_ref, right_ref, &left_db, &right_db)
+    }
+
+    /// Restores a non-main branch head to another branch, named snapshot, or head ID.
+    pub fn branch_restore(
+        &self,
+        branch_name: &str,
+        target_ref: &str,
+        dry_run: bool,
+    ) -> Result<crate::branch::BranchRestoreReport> {
+        if self.inner.sql_txn_active.load(Ordering::Acquire) {
+            return Err(DbError::transaction(
+                "cannot restore a branch while a SQL transaction is active",
+            ));
+        }
+        if branch_name == crate::branch::DEFAULT_BRANCH_NAME {
+            return Err(DbError::transaction(
+                "restore currently targets non-main branches; create a branch from the restore point to inspect main rollback candidates",
+            ));
+        }
+        let branch = crate::branch::branch_by_name(self, branch_name)?
+            .ok_or_else(|| DbError::transaction(format!("unknown branch '{branch_name}'")))?;
+        let target_head = self.resolve_branch_target_head(target_ref)?;
+        let diff = self.branch_diff(branch_name, target_ref)?;
+        if dry_run {
+            return Ok(crate::branch::BranchRestoreReport {
+                branch: branch_name.to_string(),
+                target_ref: target_ref.to_string(),
+                dry_run: true,
+                previous_head_id: branch.current_head_id,
+                target_head_id: target_head.head_id,
+                new_head_id: None,
+                changed_table_count: diff.changed_table_count,
+                added_row_count: diff.added_row_count,
+                updated_row_count: diff.updated_row_count,
+                deleted_row_count: diff.deleted_row_count,
+            });
+        }
+        let new_head = crate::branch::restore_branch_head(self, &branch, &target_head, target_ref)?;
+        self.refresh_named_snapshot_retention()?;
+        Ok(crate::branch::BranchRestoreReport {
+            branch: branch_name.to_string(),
+            target_ref: target_ref.to_string(),
+            dry_run: false,
+            previous_head_id: branch.current_head_id,
+            target_head_id: target_head.head_id,
+            new_head_id: Some(new_head.head_id),
+            changed_table_count: diff.changed_table_count,
+            added_row_count: diff.added_row_count,
+            updated_row_count: diff.updated_row_count,
+            deleted_row_count: diff.deleted_row_count,
+        })
+    }
+
+    /// Merges clean primary-key row changes from a source branch into a target ref.
+    pub fn branch_merge(
+        &self,
+        source_branch: &str,
+        target_ref: &str,
+        dry_run: bool,
+    ) -> Result<crate::branch::BranchMergeReport> {
+        if self.inner.sql_txn_active.load(Ordering::Acquire) {
+            return Err(DbError::transaction(
+                "cannot merge a branch while a SQL transaction is active",
+            ));
+        }
+        if source_branch == crate::branch::DEFAULT_BRANCH_NAME {
+            return Err(DbError::transaction(
+                "merge source must be a non-main branch",
+            ));
+        }
+        let source = crate::branch::branch_by_name(self, source_branch)?
+            .ok_or_else(|| DbError::transaction(format!("unknown branch '{source_branch}'")))?;
+        let base_head_id = source.base_head_id.clone().ok_or_else(|| {
+            DbError::transaction(format!("branch '{source_branch}' has no merge base"))
+        })?;
+        if target_ref != crate::branch::DEFAULT_BRANCH_NAME
+            && crate::branch::branch_by_name(self, target_ref)?.is_none()
+        {
+            return Err(DbError::transaction(format!(
+                "merge target must be 'main' or a branch; got '{target_ref}'"
+            )));
+        }
+
+        let base_db = self.materialize_branch_head_db(&base_head_id)?;
+        let source_db = self.materialize_branch_db(&source)?;
+        let target_db = self.materialize_ref_db(target_ref)?;
+        let plan = build_merge_plan(
+            source_branch,
+            target_ref,
+            &base_head_id,
+            &base_db,
+            &source_db,
+            &target_db,
+        )?;
+        if dry_run || !plan.conflicts.is_empty() {
+            return Ok(plan.into_report(dry_run));
+        }
+        let sql = plan
+            .changes
+            .iter()
+            .map(|change| change.sql.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !sql.trim().is_empty() {
+            if target_ref == crate::branch::DEFAULT_BRANCH_NAME {
+                self.execute_batch(&sql)?;
+            } else {
+                self.execute_batch_on_branch(&sql, target_ref)?;
+            }
+        }
+        Ok(plan.into_report(false))
+    }
+
+    /// Executes one or more read-only SQL statements against a named snapshot.
+    pub fn execute_batch_at_snapshot(
+        &self,
+        sql: &str,
+        snapshot_name: &str,
+    ) -> Result<Vec<QueryResult>> {
+        let snapshot_lsn = self.snapshot_lsn_for_ref(snapshot_name)?.ok_or_else(|| {
+            DbError::transaction(format!("unknown snapshot or branch head '{snapshot_name}'"))
+        })?;
+        self.execute_batch_at_snapshot_lsn(sql, snapshot_lsn)
+    }
+
     /// Executes one or more semicolon-delimited SQL statements with `$n` parameters.
     pub fn execute_batch_with_params(
         &self,
@@ -1500,6 +1858,157 @@ impl Db {
         self.read_page_at_snapshot_lsn(page_id, snapshot_lsn)
     }
 
+    /// Creates an immutable named snapshot of the current durable `main` state.
+    pub fn snapshot_create(&self, name: &str) -> Result<crate::branch::NamedSnapshot> {
+        if self.inner.sql_txn_active.load(Ordering::Acquire) {
+            return Err(DbError::transaction(
+                "cannot create a named snapshot while a SQL transaction is active",
+            ));
+        }
+        let initial_lsn = self.inner.wal.latest_snapshot();
+        self.inner.wal.set_retained_snapshot_lsn(Some(initial_lsn));
+        self.checkpoint_wal()?;
+        let snapshot_lsn = self.inner.wal.latest_snapshot();
+        let schema_cookie = self.current_schema_cookie_at_snapshot(snapshot_lsn)?;
+        self.inner.wal.set_retained_snapshot_lsn(Some(snapshot_lsn));
+        let result = crate::branch::create_named_snapshot(self, name, snapshot_lsn, schema_cookie);
+        self.refresh_named_snapshot_retention()?;
+        result
+    }
+
+    /// Lists retained named snapshots.
+    pub fn snapshot_list(&self) -> Result<Vec<crate::branch::NamedSnapshot>> {
+        crate::branch::list_named_snapshots(self)
+    }
+
+    /// Returns one retained named snapshot by name.
+    pub fn snapshot_get(&self, name: &str) -> Result<Option<crate::branch::NamedSnapshot>> {
+        crate::branch::snapshot_by_name(self, name)
+    }
+
+    /// Resolves a named snapshot or branch-head ID to its retained WAL LSN.
+    pub fn snapshot_lsn_for_ref(&self, reference: &str) -> Result<Option<u64>> {
+        if let Some(snapshot) = self.snapshot_get(reference)? {
+            return Ok(Some(snapshot.snapshot_lsn));
+        }
+        crate::branch::branch_head_lsn_by_id(self, reference)
+    }
+
+    /// Creates a branch from `main`, another branch, a named snapshot, or a branch head.
+    pub fn branch_create(
+        &self,
+        name: &str,
+        from: Option<&str>,
+    ) -> Result<crate::branch::BranchInfo> {
+        let source = from.unwrap_or(crate::branch::DEFAULT_BRANCH_NAME);
+        let (source_lsn, parent_head_id) = if source == crate::branch::DEFAULT_BRANCH_NAME {
+            let initial_lsn = self.inner.wal.latest_snapshot();
+            self.inner.wal.set_retained_snapshot_lsn(Some(initial_lsn));
+            self.checkpoint_wal()?;
+            let source_lsn = self.inner.wal.latest_snapshot();
+            let parent_head_id = crate::branch::main_branch_head(self)?.map(|head| head.head_id);
+            (source_lsn, parent_head_id)
+        } else if let Some(branch) = crate::branch::branch_by_name(self, source)? {
+            let source_lsn = self.branch_lsn(source)?.ok_or_else(|| {
+                DbError::transaction(format!("branch '{source}' has no current head"))
+            })?;
+            (source_lsn, branch.current_head_id)
+        } else if let Some(snapshot) = self.snapshot_get(source)? {
+            (snapshot.snapshot_lsn, Some(snapshot.head_id))
+        } else if let Some(source_lsn) = crate::branch::branch_head_lsn_by_id(self, source)? {
+            (source_lsn, Some(source.to_string()))
+        } else {
+            return Err(DbError::transaction(format!(
+                "unknown branch, snapshot, or head '{source}'"
+            )));
+        };
+        self.inner.wal.set_retained_snapshot_lsn(Some(source_lsn));
+        let schema_cookie = self.current_schema_cookie_at_snapshot(source_lsn)?;
+        let result = crate::branch::create_branch(
+            self,
+            name,
+            source_lsn,
+            schema_cookie,
+            parent_head_id.as_deref(),
+        );
+        self.refresh_named_snapshot_retention()?;
+        result
+    }
+
+    /// Lists branches.
+    pub fn branch_list(&self) -> Result<Vec<crate::branch::BranchInfo>> {
+        crate::branch::list_branches(self)
+    }
+
+    /// Deletes a non-main branch.
+    pub fn branch_delete(&self, name: &str) -> Result<bool> {
+        let deleted = crate::branch::delete_branch(self, name)?;
+        if deleted {
+            self.refresh_named_snapshot_retention()?;
+        }
+        Ok(deleted)
+    }
+
+    /// Renames a non-main branch.
+    pub fn branch_rename(&self, old_name: &str, new_name: &str) -> Result<bool> {
+        crate::branch::rename_branch(self, old_name, new_name)
+    }
+
+    /// Resolves a branch name to its current retained WAL LSN.
+    pub fn branch_lsn(&self, name: &str) -> Result<Option<u64>> {
+        crate::branch::branch_lsn_by_name(self, name)
+    }
+
+    /// Adds a named commit marker to a non-main branch.
+    pub fn branch_commit(
+        &self,
+        name: &str,
+        message: &str,
+    ) -> Result<crate::branch::BranchLogEntry> {
+        if self.inner.sql_txn_active.load(Ordering::Acquire) {
+            return Err(DbError::transaction(
+                "cannot create a branch commit marker while a SQL transaction is active",
+            ));
+        }
+        if name == crate::branch::DEFAULT_BRANCH_NAME {
+            return Err(DbError::transaction(
+                "branch commit markers are only supported on non-main branches",
+            ));
+        }
+        let branch = crate::branch::branch_by_name(self, name)?
+            .ok_or_else(|| DbError::transaction(format!("unknown branch '{name}'")))?;
+        let head = crate::branch::commit_branch(self, &branch, message)?;
+        self.refresh_named_snapshot_retention()?;
+        Ok(crate::branch::BranchLogEntry {
+            head_id: head.head_id,
+            branch_id: head.branch_id,
+            parent_head_id: head.parent_head_id,
+            message: head.message,
+            created_at_micros: head.created_at_micros,
+            sql: None,
+        })
+    }
+
+    /// Returns branch head history newest first.
+    pub fn branch_log(&self, name: &str) -> Result<Vec<crate::branch::BranchLogEntry>> {
+        crate::branch::branch_log(self, name)
+    }
+
+    /// Deletes a named snapshot and refreshes the WAL retention floor.
+    pub fn snapshot_delete(&self, name: &str) -> Result<bool> {
+        let deleted = crate::branch::delete_named_snapshot(self, name)?;
+        if deleted {
+            self.refresh_named_snapshot_retention()?;
+        }
+        Ok(deleted)
+    }
+
+    pub(crate) fn refresh_named_snapshot_retention(&self) -> Result<()> {
+        let retained_lsn = crate::branch::retained_snapshot_lsn(self)?;
+        self.inner.wal.set_retained_snapshot_lsn(retained_lsn);
+        Ok(())
+    }
+
     /// Returns a deterministic JSON summary of storage state for the harness.
     pub fn inspect_storage_state_json(&self) -> Result<String> {
         let header = self.inner.pager.header_snapshot()?;
@@ -1561,6 +2070,15 @@ impl Db {
             ));
         }
         Ok(tables)
+    }
+
+    pub(crate) fn internal_table_exists(&self, name: &str) -> Result<bool> {
+        let runtime = self.runtime_for_metadata_inspection()?;
+        Ok(runtime
+            .catalog
+            .tables
+            .values()
+            .any(|table| identifiers_equal(&table.name, name)))
     }
 
     /// Returns a single table definition by name.
@@ -1675,6 +2193,19 @@ impl Db {
     pub fn dump_sql(&self) -> Result<String> {
         let (mut runtime, snapshot_lsn) = self.runtime_for_targeted_row_source_inspection()?;
         render_runtime_dump(self, &mut runtime, snapshot_lsn)
+    }
+
+    /// Dumps a retained historical snapshot as deterministic SQL.
+    pub fn dump_sql_at_snapshot_lsn(&self, snapshot_lsn: u64) -> Result<String> {
+        let schema_cookie = self.current_schema_cookie_at_snapshot(snapshot_lsn)?;
+        let mut runtime = EngineRuntime::load_from_storage_at_snapshot(
+            &self.inner.pager,
+            &self.inner.wal,
+            schema_cookie,
+            &self.inner.config,
+            snapshot_lsn,
+        )?;
+        render_runtime_dump(self, &mut runtime, Some(snapshot_lsn))
     }
 
     /// Installs a global FaultyVfs failpoint used by the storage harness.
@@ -1825,6 +2356,7 @@ impl Db {
         };
         db.backfill_missing_persistent_pk_indexes()?;
         db.backfill_paged_row_storage()?;
+        db.refresh_named_snapshot_retention()?;
         drop(open_guard);
         drop(open_lock);
         if let Some(canonical_path) = open_lock_key {
@@ -9353,6 +9885,600 @@ fn runtime_index_entry_count(index: &RuntimeIndex) -> usize {
     }
 }
 
+struct MergePlan {
+    source: String,
+    target: String,
+    base_head_id: String,
+    table_count: usize,
+    changes: Vec<MergeChangePlan>,
+    conflicts: Vec<crate::branch::BranchMergeConflict>,
+}
+
+impl MergePlan {
+    fn into_report(self, dry_run: bool) -> crate::branch::BranchMergeReport {
+        crate::branch::BranchMergeReport {
+            source: self.source,
+            target: self.target,
+            dry_run,
+            clean: self.conflicts.is_empty(),
+            base_head_id: self.base_head_id,
+            table_count: self.table_count,
+            applied_change_count: if dry_run || !self.conflicts.is_empty() {
+                0
+            } else {
+                self.changes.len()
+            },
+            conflict_count: self.conflicts.len(),
+            applied: if dry_run || !self.conflicts.is_empty() {
+                Vec::new()
+            } else {
+                self.changes
+                    .into_iter()
+                    .map(|change| change.change)
+                    .collect()
+            },
+            conflicts: self.conflicts,
+        }
+    }
+}
+
+struct MergeChangePlan {
+    change: crate::branch::BranchMergeChange,
+    sql: String,
+}
+
+struct MergeTableInputs<'a> {
+    base_db: &'a Db,
+    source_db: &'a Db,
+    target_db: &'a Db,
+    base_table: &'a TableInfo,
+    source_table: &'a TableInfo,
+    target_table: &'a TableInfo,
+}
+
+fn build_merge_plan(
+    source_ref: &str,
+    target_ref: &str,
+    base_head_id: &str,
+    base_db: &Db,
+    source_db: &Db,
+    target_db: &Db,
+) -> Result<MergePlan> {
+    let base_tables = table_info_map(base_db)?;
+    let source_tables = table_info_map(source_db)?;
+    let target_tables = table_info_map(target_db)?;
+    let mut table_names = BTreeSet::new();
+    table_names.extend(base_tables.keys().cloned());
+    table_names.extend(source_tables.keys().cloned());
+    table_names.extend(target_tables.keys().cloned());
+
+    let mut changes = Vec::new();
+    let mut conflicts = Vec::new();
+    for table_name in &table_names {
+        let Some(base_table) = base_tables.get(table_name) else {
+            if source_tables.get(table_name) != target_tables.get(table_name) {
+                conflicts.push(merge_conflict(
+                    table_name,
+                    Vec::new(),
+                    "schema_change",
+                    "merge does not support tables created after the branch base",
+                ));
+            }
+            continue;
+        };
+        let Some(source_table) = source_tables.get(table_name) else {
+            conflicts.push(merge_conflict(
+                table_name,
+                Vec::new(),
+                "schema_change",
+                "merge does not support dropped source tables",
+            ));
+            continue;
+        };
+        let Some(target_table) = target_tables.get(table_name) else {
+            conflicts.push(merge_conflict(
+                table_name,
+                Vec::new(),
+                "schema_change",
+                "merge does not support dropped target tables",
+            ));
+            continue;
+        };
+        if !merge_table_schema_equal(base_table, source_table)
+            || !merge_table_schema_equal(base_table, target_table)
+        {
+            conflicts.push(merge_conflict(
+                table_name,
+                Vec::new(),
+                "schema_change",
+                "merge supports identical table schemas only",
+            ));
+            continue;
+        }
+        if base_table.primary_key_columns.is_empty() {
+            conflicts.push(merge_conflict(
+                table_name,
+                Vec::new(),
+                "missing_primary_key",
+                "merge requires primary-key tables",
+            ));
+            continue;
+        }
+        merge_table_rows(
+            MergeTableInputs {
+                base_db,
+                source_db,
+                target_db,
+                base_table,
+                source_table,
+                target_table,
+            },
+            &mut changes,
+            &mut conflicts,
+        )?;
+    }
+
+    Ok(MergePlan {
+        source: source_ref.to_string(),
+        target: target_ref.to_string(),
+        base_head_id: base_head_id.to_string(),
+        table_count: table_names.len(),
+        changes,
+        conflicts,
+    })
+}
+
+fn table_info_map(db: &Db) -> Result<BTreeMap<String, TableInfo>> {
+    Ok(db
+        .list_tables()?
+        .into_iter()
+        .map(|table| (table.name.clone(), table))
+        .collect())
+}
+
+fn merge_table_rows(
+    inputs: MergeTableInputs<'_>,
+    changes: &mut Vec<MergeChangePlan>,
+    conflicts: &mut Vec<crate::branch::BranchMergeConflict>,
+) -> Result<()> {
+    let base_rows = diff_table_rows(inputs.base_db, inputs.base_table)?;
+    let source_rows = diff_table_rows(inputs.source_db, inputs.source_table)?;
+    let target_rows = diff_table_rows(inputs.target_db, inputs.target_table)?;
+    let mut row_keys = BTreeSet::new();
+    row_keys.extend(base_rows.keys().cloned());
+    row_keys.extend(source_rows.keys().cloned());
+    row_keys.extend(target_rows.keys().cloned());
+
+    for primary_key in row_keys {
+        let base = base_rows.get(&primary_key);
+        let source = source_rows.get(&primary_key);
+        let target = target_rows.get(&primary_key);
+        let source_changed = source != base;
+        if !source_changed {
+            continue;
+        }
+        let target_changed = target != base;
+        if target_changed {
+            if target == source {
+                continue;
+            }
+            conflicts.push(merge_conflict(
+                &inputs.base_table.name,
+                primary_key,
+                merge_conflict_type(base, source, target),
+                "source and target changed the same primary-key row differently",
+            ));
+            continue;
+        }
+        let Some(change) =
+            merge_change_for_source_delta(inputs.base_table, &primary_key, base, source)?
+        else {
+            continue;
+        };
+        changes.push(change);
+    }
+    Ok(())
+}
+
+fn merge_change_for_source_delta(
+    table: &TableInfo,
+    primary_key: &[String],
+    base: Option<&Vec<String>>,
+    source: Option<&Vec<String>>,
+) -> Result<Option<MergeChangePlan>> {
+    match (base, source) {
+        (None, Some(after)) => Ok(Some(MergeChangePlan {
+            change: crate::branch::BranchMergeChange {
+                table: table.name.clone(),
+                primary_key: primary_key.to_vec(),
+                operation: crate::branch::BranchMergeOperation::Insert,
+            },
+            sql: merge_insert_sql(table, after),
+        })),
+        (Some(_), None) => Ok(Some(MergeChangePlan {
+            change: crate::branch::BranchMergeChange {
+                table: table.name.clone(),
+                primary_key: primary_key.to_vec(),
+                operation: crate::branch::BranchMergeOperation::Delete,
+            },
+            sql: merge_delete_sql(table, primary_key)?,
+        })),
+        (Some(_), Some(after)) => {
+            let Some(sql) = merge_update_sql(table, primary_key, after)? else {
+                return Ok(None);
+            };
+            Ok(Some(MergeChangePlan {
+                change: crate::branch::BranchMergeChange {
+                    table: table.name.clone(),
+                    primary_key: primary_key.to_vec(),
+                    operation: crate::branch::BranchMergeOperation::Update,
+                },
+                sql,
+            }))
+        }
+        (None, None) => Ok(None),
+    }
+}
+
+fn merge_insert_sql(table: &TableInfo, after: &[String]) -> String {
+    let columns = table
+        .columns
+        .iter()
+        .map(|column| sql_identifier(&column.name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "INSERT INTO {} ({columns}) VALUES ({});",
+        sql_identifier(&table.name),
+        after.join(", ")
+    )
+}
+
+fn merge_delete_sql(table: &TableInfo, primary_key: &[String]) -> Result<String> {
+    Ok(format!(
+        "DELETE FROM {} WHERE {};",
+        sql_identifier(&table.name),
+        merge_where_clause(table, primary_key)?
+    ))
+}
+
+fn merge_update_sql(
+    table: &TableInfo,
+    primary_key: &[String],
+    after: &[String],
+) -> Result<Option<String>> {
+    let assignments = table
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(_, column)| {
+            !table
+                .primary_key_columns
+                .iter()
+                .any(|primary_key| identifiers_equal(primary_key, &column.name))
+        })
+        .map(|(index, column)| format!("{} = {}", sql_identifier(&column.name), after[index]))
+        .collect::<Vec<_>>();
+    if assignments.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "UPDATE {} SET {} WHERE {};",
+        sql_identifier(&table.name),
+        assignments.join(", "),
+        merge_where_clause(table, primary_key)?
+    )))
+}
+
+fn merge_where_clause(table: &TableInfo, primary_key: &[String]) -> Result<String> {
+    if primary_key.len() != table.primary_key_columns.len() {
+        return Err(DbError::internal("merge primary-key arity mismatch"));
+    }
+    Ok(table
+        .primary_key_columns
+        .iter()
+        .zip(primary_key.iter())
+        .map(|(column, value)| format!("{} = {value}", sql_identifier(column)))
+        .collect::<Vec<_>>()
+        .join(" AND "))
+}
+
+fn merge_conflict_type(
+    base: Option<&Vec<String>>,
+    source: Option<&Vec<String>>,
+    target: Option<&Vec<String>>,
+) -> &'static str {
+    match (base, source, target) {
+        (None, Some(_), Some(_)) => "duplicate_insert",
+        (Some(_), None, Some(_)) => "delete_update",
+        (Some(_), Some(_), None) => "update_delete",
+        (Some(_), Some(_), Some(_)) => "update_update",
+        _ => "row_conflict",
+    }
+}
+
+fn merge_conflict(
+    table: &str,
+    primary_key: Vec<String>,
+    conflict_type: &str,
+    message: &str,
+) -> crate::branch::BranchMergeConflict {
+    crate::branch::BranchMergeConflict {
+        table: table.to_string(),
+        primary_key,
+        conflict_type: conflict_type.to_string(),
+        message: message.to_string(),
+    }
+}
+
+fn merge_table_schema_equal(left: &TableInfo, right: &TableInfo) -> bool {
+    left.columns == right.columns
+        && left.checks == right.checks
+        && left.foreign_keys == right.foreign_keys
+        && left.primary_key_columns == right.primary_key_columns
+}
+
+fn diff_materialized_refs(
+    left_ref: &str,
+    right_ref: &str,
+    left_db: &Db,
+    right_db: &Db,
+) -> Result<crate::branch::BranchDiffReport> {
+    let left_tables = left_db
+        .list_tables()?
+        .into_iter()
+        .map(|table| (table.name.clone(), table))
+        .collect::<BTreeMap<_, _>>();
+    let right_tables = right_db
+        .list_tables()?
+        .into_iter()
+        .map(|table| (table.name.clone(), table))
+        .collect::<BTreeMap<_, _>>();
+    let mut table_names = BTreeSet::new();
+    table_names.extend(left_tables.keys().cloned());
+    table_names.extend(right_tables.keys().cloned());
+
+    let mut tables = Vec::new();
+    for table_name in table_names {
+        let table_diff = match (left_tables.get(&table_name), right_tables.get(&table_name)) {
+            (None, Some(right_table)) => {
+                let (added, message) = diff_rows_for_added_table(right_db, right_table)?;
+                crate::branch::BranchTableDiff {
+                    table: table_name,
+                    status: crate::branch::BranchTableDiffStatus::Added,
+                    schema_changed: true,
+                    added,
+                    updated: Vec::new(),
+                    deleted: Vec::new(),
+                    message,
+                }
+            }
+            (Some(left_table), None) => {
+                let (deleted, message) = diff_rows_for_removed_table(left_db, left_table)?;
+                crate::branch::BranchTableDiff {
+                    table: table_name,
+                    status: crate::branch::BranchTableDiffStatus::Removed,
+                    schema_changed: true,
+                    added: Vec::new(),
+                    updated: Vec::new(),
+                    deleted,
+                    message,
+                }
+            }
+            (Some(left_table), Some(right_table)) => {
+                diff_existing_table(left_db, right_db, left_table, right_table)?
+            }
+            (None, None) => continue,
+        };
+        tables.push(table_diff);
+    }
+
+    let added_row_count = tables.iter().map(|table| table.added.len()).sum();
+    let updated_row_count = tables.iter().map(|table| table.updated.len()).sum();
+    let deleted_row_count = tables.iter().map(|table| table.deleted.len()).sum();
+    let changed_table_count = tables
+        .iter()
+        .filter(|table| table.status != crate::branch::BranchTableDiffStatus::Unchanged)
+        .count();
+
+    Ok(crate::branch::BranchDiffReport {
+        left_ref: left_ref.to_string(),
+        right_ref: right_ref.to_string(),
+        table_count: tables.len(),
+        changed_table_count,
+        added_row_count,
+        updated_row_count,
+        deleted_row_count,
+        tables,
+    })
+}
+
+fn diff_existing_table(
+    left_db: &Db,
+    right_db: &Db,
+    left_table: &TableInfo,
+    right_table: &TableInfo,
+) -> Result<crate::branch::BranchTableDiff> {
+    let schema_changed = left_table.columns != right_table.columns
+        || left_table.checks != right_table.checks
+        || left_table.foreign_keys != right_table.foreign_keys
+        || left_table.primary_key_columns != right_table.primary_key_columns;
+    if left_table.primary_key_columns.is_empty() || right_table.primary_key_columns.is_empty() {
+        let changed = schema_changed || left_table.row_count != right_table.row_count;
+        return Ok(crate::branch::BranchTableDiff {
+            table: left_table.name.clone(),
+            status: if changed {
+                crate::branch::BranchTableDiffStatus::Unsupported
+            } else {
+                crate::branch::BranchTableDiffStatus::Unchanged
+            },
+            schema_changed,
+            added: Vec::new(),
+            updated: Vec::new(),
+            deleted: Vec::new(),
+            message: Some(
+                "row diff requires a primary key; table-level metadata was compared only"
+                    .to_string(),
+            ),
+        });
+    }
+    if left_table.primary_key_columns != right_table.primary_key_columns {
+        return Ok(crate::branch::BranchTableDiff {
+            table: left_table.name.clone(),
+            status: crate::branch::BranchTableDiffStatus::Unsupported,
+            schema_changed,
+            added: Vec::new(),
+            updated: Vec::new(),
+            deleted: Vec::new(),
+            message: Some("primary-key columns differ; row diff is not supported".to_string()),
+        });
+    }
+
+    let left_rows = diff_table_rows(left_db, left_table)?;
+    let right_rows = diff_table_rows(right_db, right_table)?;
+    let mut keys = BTreeSet::new();
+    keys.extend(left_rows.keys().cloned());
+    keys.extend(right_rows.keys().cloned());
+
+    let mut added = Vec::new();
+    let mut updated = Vec::new();
+    let mut deleted = Vec::new();
+    for key in keys {
+        match (left_rows.get(&key), right_rows.get(&key)) {
+            (None, Some(after)) => added.push(crate::branch::BranchRowDiff {
+                primary_key: key,
+                before: None,
+                after: Some(after.clone()),
+            }),
+            (Some(before), None) => deleted.push(crate::branch::BranchRowDiff {
+                primary_key: key,
+                before: Some(before.clone()),
+                after: None,
+            }),
+            (Some(before), Some(after)) if before != after => {
+                updated.push(crate::branch::BranchRowDiff {
+                    primary_key: key,
+                    before: Some(before.clone()),
+                    after: Some(after.clone()),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    let changed = schema_changed || !added.is_empty() || !updated.is_empty() || !deleted.is_empty();
+    Ok(crate::branch::BranchTableDiff {
+        table: left_table.name.clone(),
+        status: if changed {
+            crate::branch::BranchTableDiffStatus::Changed
+        } else {
+            crate::branch::BranchTableDiffStatus::Unchanged
+        },
+        schema_changed,
+        added,
+        updated,
+        deleted,
+        message: None,
+    })
+}
+
+fn diff_rows_for_added_table(
+    db: &Db,
+    table: &TableInfo,
+) -> Result<(Vec<crate::branch::BranchRowDiff>, Option<String>)> {
+    if table.primary_key_columns.is_empty() {
+        return Ok((
+            Vec::new(),
+            Some("row diff requires a primary key; table is reported as added".to_string()),
+        ));
+    }
+    let rows = diff_table_rows(db, table)?
+        .into_iter()
+        .map(|(primary_key, after)| crate::branch::BranchRowDiff {
+            primary_key,
+            before: None,
+            after: Some(after),
+        })
+        .collect();
+    Ok((rows, None))
+}
+
+fn diff_rows_for_removed_table(
+    db: &Db,
+    table: &TableInfo,
+) -> Result<(Vec<crate::branch::BranchRowDiff>, Option<String>)> {
+    if table.primary_key_columns.is_empty() {
+        return Ok((
+            Vec::new(),
+            Some("row diff requires a primary key; table is reported as removed".to_string()),
+        ));
+    }
+    let rows = diff_table_rows(db, table)?
+        .into_iter()
+        .map(|(primary_key, before)| crate::branch::BranchRowDiff {
+            primary_key,
+            before: Some(before),
+            after: None,
+        })
+        .collect();
+    Ok((rows, None))
+}
+
+fn diff_table_rows(db: &Db, table: &TableInfo) -> Result<BTreeMap<Vec<String>, Vec<String>>> {
+    let columns = table
+        .columns
+        .iter()
+        .map(|column| sql_identifier(&column.name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let order_by = table
+        .primary_key_columns
+        .iter()
+        .map(|column| sql_identifier(column))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT {columns} FROM {} ORDER BY {order_by}",
+        sql_identifier(&table.name)
+    );
+    let result = db.execute(&sql)?;
+    let primary_key_indexes = table
+        .primary_key_columns
+        .iter()
+        .map(|primary_key| {
+            table
+                .columns
+                .iter()
+                .position(|column| identifiers_equal(&column.name, primary_key))
+                .ok_or_else(|| {
+                    DbError::corruption(format!(
+                        "primary-key column '{primary_key}' missing from table '{}'",
+                        table.name
+                    ))
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut rows = BTreeMap::new();
+    for row in result.rows() {
+        let values = row
+            .values()
+            .iter()
+            .map(diff_value_string)
+            .collect::<Vec<_>>();
+        let primary_key = primary_key_indexes
+            .iter()
+            .map(|index| values[*index].clone())
+            .collect::<Vec<_>>();
+        rows.insert(primary_key, values);
+    }
+    Ok(rows)
+}
+
+fn diff_value_string(value: &Value) -> String {
+    render_value_sql(value)
+}
+
 fn render_runtime_dump(
     db: &Db,
     runtime: &mut EngineRuntime,
@@ -9396,6 +10522,13 @@ fn render_runtime_dump(
         lines.push(render_create_view(view));
     }
     for index in runtime.catalog.indexes.values() {
+        if runtime
+            .catalog
+            .table(&index.table_name)
+            .is_some_and(|table| is_auto_table_index(table, index))
+        {
+            continue;
+        }
         lines.push(render_create_index(index));
     }
     for trigger in runtime.catalog.triggers.values() {
@@ -9421,9 +10554,6 @@ fn render_create_table(table: &TableSchema) -> String {
         }
         if column.unique {
             definition.push_str(" UNIQUE");
-        }
-        if column.auto_increment {
-            definition.push_str(" AUTOINCREMENT");
         }
         if let Some(generated_sql) = &column.generated_sql {
             definition.push_str(" GENERATED ALWAYS AS (");
@@ -9588,6 +10718,73 @@ fn render_create_index(index: &IndexSchema) -> String {
         sql_identifier(&index.name),
         sql_identifier(&index.table_name)
     )
+}
+
+fn is_auto_table_index(table: &TableSchema, index: &IndexSchema) -> bool {
+    let Some(column_names) = index_column_names(index) else {
+        return false;
+    };
+    if !index.include_columns.is_empty() || index.predicate_sql.is_some() {
+        return false;
+    }
+    if !identifiers_equal(&index.table_name, &table.name) || index.kind != IndexKind::Btree {
+        return false;
+    }
+    if !table.primary_key_columns.is_empty()
+        && index.unique
+        && identifier_lists_equal(&column_names, &table.primary_key_columns)
+        && identifiers_equal(
+            &index.name,
+            &dump_auto_index_name("pk", &table.name, &table.primary_key_columns),
+        )
+    {
+        return true;
+    }
+    if column_names.len() == 1
+        && index.unique
+        && table.columns.iter().any(|column| {
+            column.unique
+                && !column.primary_key
+                && identifiers_equal(&column.name, &column_names[0])
+                && identifiers_equal(
+                    &index.name,
+                    &dump_auto_index_name("uq", &table.name, &column_names),
+                )
+        })
+    {
+        return true;
+    }
+    table.foreign_keys.iter().any(|foreign_key| {
+        !index.unique
+            && identifier_lists_equal(&column_names, &foreign_key.columns)
+            && identifiers_equal(
+                &index.name,
+                &format!(
+                    "{}_idx",
+                    dump_auto_index_name("fk", &table.name, &foreign_key.columns)
+                ),
+            )
+    })
+}
+
+fn index_column_names(index: &IndexSchema) -> Option<Vec<String>> {
+    index
+        .columns
+        .iter()
+        .map(|column| column.column_name.clone())
+        .collect()
+}
+
+fn identifier_lists_equal(left: &[String], right: &[String]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right.iter())
+            .all(|(left, right)| identifiers_equal(left, right))
+}
+
+fn dump_auto_index_name(prefix: &str, table_name: &str, columns: &[String]) -> String {
+    format!("{prefix}_{}_{}", table_name, columns.join("_"))
 }
 
 fn render_create_trigger(trigger: &TriggerSchema) -> String {

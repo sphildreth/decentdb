@@ -65,6 +65,22 @@ Available helpers:
 - `Db::rollback_transaction()`
 - `Db::in_transaction()`
 
+## Branching and time travel
+
+The Rust API exposes the same branch workflow used by the CLI:
+
+- `Db::snapshot_create`, `snapshot_list`, `snapshot_delete`
+- `Db::execute_batch_at_snapshot`, `execute_batch_at_snapshot_lsn`
+- `Db::branch_create`, `branch_list`, `branch_rename`, `branch_delete`
+- `Db::execute_batch_on_branch`
+- `Db::branch_commit`, `branch_log`
+- `Db::branch_diff`
+- `Db::branch_restore`
+- `Db::branch_merge`
+
+Report types such as `BranchDiffReport`, `BranchRestoreReport`, and
+`BranchMergeReport` are serializable for tooling.
+
 ## Metadata and maintenance
 
 The crate exposes structured inspection helpers for the CLI and higher-level bindings:

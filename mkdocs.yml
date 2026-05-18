@@ -18,6 +18,7 @@ nav:
     - SQL Feature Matrix: user-guide/sql-feature-matrix.md
     - Data Types: user-guide/data-types.md
     - Interactive SQL Shell: user-guide/repl.md
+    - Branching, Diff, Restore, And Time Travel: user-guide/branching.md
     - Migrations: user-guide/migration.md
     - Transactions: user-guide/transactions.md
     - Local-first sync:

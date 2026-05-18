@@ -174,6 +174,337 @@ fn checkpoint_command_flushes_wal_and_preserves_data_without_wal_file() {
 }
 
 #[test]
+fn snapshot_commands_and_exec_as_of_work() {
+    let dir = temp_dir();
+    let db = dir.join("snapshots.ddb");
+    let db_str = db.display().to_string();
+
+    run(&[
+        "exec",
+        "--db",
+        &db_str,
+        "--sql",
+        "CREATE TABLE items (id INT64 PRIMARY KEY, name TEXT); \
+         INSERT INTO items (id, name) VALUES (1, 'before');",
+        "--format",
+        "json",
+    ]);
+
+    let created = run(&[
+        "snapshot",
+        "create",
+        "--db",
+        &db_str,
+        "--name",
+        "before-update",
+        "--format",
+        "json",
+    ]);
+    assert!(created.contains("before-update"));
+    assert!(created.contains("snapshot_lsn"));
+
+    run(&[
+        "exec",
+        "--db",
+        &db_str,
+        "--sql",
+        "UPDATE items SET name = 'after' WHERE id = 1;",
+        "--format",
+        "json",
+    ]);
+
+    let historical = run(&[
+        "exec",
+        "--db",
+        &db_str,
+        "--sql",
+        "SELECT name FROM items WHERE id = 1;",
+        "--as-of",
+        "before-update",
+        "--format",
+        "json",
+    ]);
+    assert!(
+        historical.contains("\"rows\":[[\"before\"]]"),
+        "historical output: {historical}"
+    );
+
+    let latest = run(&[
+        "exec",
+        "--db",
+        &db_str,
+        "--sql",
+        "SELECT name FROM items WHERE id = 1;",
+        "--format",
+        "json",
+    ]);
+    assert!(latest.contains("\"rows\":[[\"after\"]]"));
+
+    let listed = run(&["snapshot", "list", "--db", &db_str, "--format", "table"]);
+    assert!(listed.contains("before-update"));
+
+    let deleted = run(&[
+        "snapshot",
+        "delete",
+        "--db",
+        &db_str,
+        "--name",
+        "before-update",
+        "--format",
+        "json",
+    ]);
+    assert!(deleted.contains("before-update"));
+    assert!(deleted.contains("true"));
+}
+
+#[test]
+fn branch_commands_and_exec_branch_work() {
+    let dir = temp_dir();
+    let db = dir.join("branches.ddb");
+    let db_str = db.display().to_string();
+
+    run(&[
+        "exec",
+        "--db",
+        &db_str,
+        "--sql",
+        "CREATE TABLE items (id INT64 PRIMARY KEY, name TEXT); \
+         INSERT INTO items (id, name) VALUES (1, 'before');",
+        "--format",
+        "json",
+    ]);
+
+    let created = run(&[
+        "branch", "create", "--db", &db_str, "--name", "work", "--format", "json",
+    ]);
+    assert!(created.contains("work"));
+    assert!(created.contains("current_head_id"));
+
+    run(&[
+        "exec",
+        "--db",
+        &db_str,
+        "--sql",
+        "UPDATE items SET name = 'after' WHERE id = 1;",
+        "--format",
+        "json",
+    ]);
+
+    let branch_read = run(&[
+        "exec",
+        "--db",
+        &db_str,
+        "--branch",
+        "work",
+        "--sql",
+        "SELECT name FROM items WHERE id = 1;",
+        "--format",
+        "json",
+    ]);
+    assert!(branch_read.contains("\"rows\":[[\"before\"]]"));
+
+    run(&[
+        "exec",
+        "--db",
+        &db_str,
+        "--branch",
+        "work",
+        "--sql",
+        "UPDATE items SET name = 'branch' WHERE id = 1;",
+        "--format",
+        "json",
+    ]);
+    let branch_after_write = run(&[
+        "exec",
+        "--db",
+        &db_str,
+        "--branch",
+        "work",
+        "--sql",
+        "SELECT name FROM items WHERE id = 1;",
+        "--format",
+        "json",
+    ]);
+    assert!(branch_after_write.contains("\"rows\":[[\"branch\"]]"));
+    let main_after_branch_write = run(&[
+        "exec",
+        "--db",
+        &db_str,
+        "--sql",
+        "SELECT name FROM items WHERE id = 1;",
+        "--format",
+        "json",
+    ]);
+    assert!(main_after_branch_write.contains("\"rows\":[[\"after\"]]"));
+
+    let committed = run(&[
+        "branch",
+        "commit",
+        "--db",
+        &db_str,
+        "--name",
+        "work",
+        "--message",
+        "reviewed branch change",
+        "--format",
+        "json",
+    ]);
+    assert!(committed.contains("reviewed branch change"));
+    let log = run(&[
+        "branch", "log", "--db", &db_str, "--name", "work", "--format", "json",
+    ]);
+    assert!(log.contains("reviewed branch change"));
+    assert!(log.contains("UPDATE items SET name = 'branch' WHERE id = 1"));
+
+    let diff = run(&[
+        "branch", "diff", "--db", &db_str, "--left", "main", "--right", "work", "--format", "json",
+    ]);
+    assert!(diff.contains("\"changed_table_count\": 1"));
+    assert!(diff.contains("\"updated_row_count\": 1"));
+    assert!(diff.contains("\"table\": \"items\""));
+
+    run(&[
+        "snapshot",
+        "create",
+        "--db",
+        &db_str,
+        "--name",
+        "main-after-update",
+        "--format",
+        "json",
+    ]);
+    let restore_dry_run = run(&[
+        "branch",
+        "restore",
+        "--db",
+        &db_str,
+        "--name",
+        "work",
+        "--to",
+        "main-after-update",
+        "--dry-run",
+        "--format",
+        "json",
+    ]);
+    assert!(restore_dry_run.contains("\"dry_run\": true"));
+    assert!(restore_dry_run.contains("\"updated_row_count\": 1"));
+    let restored = run(&[
+        "branch",
+        "restore",
+        "--db",
+        &db_str,
+        "--name",
+        "work",
+        "--to",
+        "main-after-update",
+        "--confirm",
+        "--format",
+        "json",
+    ]);
+    assert!(restored.contains("\"dry_run\": false"));
+    let branch_after_restore = run(&[
+        "exec",
+        "--db",
+        &db_str,
+        "--branch",
+        "work",
+        "--sql",
+        "SELECT name FROM items WHERE id = 1;",
+        "--format",
+        "json",
+    ]);
+    assert!(branch_after_restore.contains("\"rows\":[[\"after\"]]"));
+
+    run(&[
+        "branch",
+        "create",
+        "--db",
+        &db_str,
+        "--name",
+        "mergework",
+        "--from",
+        "main-after-update",
+        "--format",
+        "json",
+    ]);
+    run(&[
+        "exec",
+        "--db",
+        &db_str,
+        "--branch",
+        "mergework",
+        "--sql",
+        "UPDATE items SET name = 'merged' WHERE id = 1;",
+        "--format",
+        "json",
+    ]);
+    let merge_dry_run = run(&[
+        "branch",
+        "merge",
+        "--db",
+        &db_str,
+        "--source",
+        "mergework",
+        "--target",
+        "main",
+        "--dry-run",
+        "--format",
+        "json",
+    ]);
+    assert!(merge_dry_run.contains("\"clean\": true"));
+    assert!(merge_dry_run.contains("\"conflict_count\": 0"));
+    let merged = run(&[
+        "branch",
+        "merge",
+        "--db",
+        &db_str,
+        "--source",
+        "mergework",
+        "--target",
+        "main",
+        "--confirm",
+        "--format",
+        "json",
+    ]);
+    assert!(merged.contains("\"applied_change_count\": 1"));
+    let main_after_merge = run(&[
+        "exec",
+        "--db",
+        &db_str,
+        "--sql",
+        "SELECT name FROM items WHERE id = 1;",
+        "--format",
+        "json",
+    ]);
+    assert!(main_after_merge.contains("\"rows\":[[\"merged\"]]"));
+
+    let listed = run(&["branch", "list", "--db", &db_str, "--format", "table"]);
+    assert!(listed.contains("main"));
+    assert!(listed.contains("work"));
+
+    let renamed = run(&[
+        "branch",
+        "rename",
+        "--db",
+        &db_str,
+        "--name",
+        "work",
+        "--new-name",
+        "review",
+        "--format",
+        "json",
+    ]);
+    assert!(renamed.contains("review"));
+    assert!(renamed.contains("true"));
+
+    let deleted = run(&[
+        "branch", "delete", "--db", &db_str, "--name", "review", "--format", "json",
+    ]);
+    assert!(deleted.contains("review"));
+    assert!(deleted.contains("true"));
+}
+
+#[test]
 fn import_export_bulk_load_and_maintenance_commands_work() {
     let dir = temp_dir();
     let db = dir.join("ops.ddb");

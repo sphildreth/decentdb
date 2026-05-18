@@ -1,19 +1,20 @@
 # DecentDB Branch, Diff, Restore, And Time-Travel Implementation Guide
 
 **Date:** 2026-05-18
-**Status:** Proposed
+**Status:** Implemented
 **Audience:** Core engine developers, pager/WAL/checkpoint maintainers, SQL planner/executor maintainers, CLI maintainers, binding maintainers, documentation authors, coding agents
-**Related roadmap item:** Branch, diff, restore, and time-travel workflows in `design/FUTURE_WINS.md`
-**Related documents:** `design/PRD.md`, `design/SPEC.md`, `design/TESTING_STRATEGY.md`, `design/adr/0003-snapshot-lsn-atomicity.md`, `design/adr/0019-wal-retention-for-active-readers.md`, `design/adr/0136-chunked-row-storage-for-coarse-grained-cow.md`, `design/adr/0147-local-sync-journal-foundation.md`
+**Former roadmap item:** Branch, diff, restore, and time-travel workflows in `design/FUTURE_WINS.md`
+**Related documents:** `design/PRD.md`, `design/SPEC.md`, `design/TESTING_STRATEGY.md`, `design/adr/0003-snapshot-lsn-atomicity.md`, `design/adr/0019-wal-retention-for-active-readers.md`, `design/adr/0136-chunked-row-storage-for-coarse-grained-cow.md`, `design/adr/0147-local-sync-journal-foundation.md`, `design/adr/0153-branch-metadata-identity-and-user-surface.md`, `design/adr/0154-branch-root-manifest-and-copy-on-write-storage.md`, `design/adr/0155-branch-aware-wal-commit-records-and-recovery.md`, `design/adr/0156-branch-checkpoint-retention-and-garbage-collection.md`, `design/adr/0157-branch-diff-restore-and-merge-semantics.md`, `design/adr/0158-branch-sync-interaction.md`, `design/adr/0159-branch-workflow-logical-replay-v1.md`
 
 ---
 
 ## 1. Executive Summary
 
-This document defines a proposed product and implementation plan for native
-branch, diff, restore, and time-travel workflows in DecentDB.
+This document records the product direction, implementation decisions, and
+completion criteria for native branch, diff, restore, and time-travel workflows
+in DecentDB.
 
-The feature should let users treat a DecentDB database as an application data
+The feature lets users treat a DecentDB database as an application data
 workspace:
 
 - create cheap database branches
@@ -21,8 +22,7 @@ workspace:
 - inspect row/schema differences
 - restore a branch to a known-good point
 - open historical read-only views
-- eventually merge a branch back into another branch with explicit conflict
-  detection
+- merge a branch back into another branch with explicit conflict detection
 
 The product goal is not to clone Git inside DecentDB. The goal is to provide a
 database-native versioning workflow that is familiar enough for users who know
@@ -34,17 +34,14 @@ Git, while preserving DecentDB's core guarantees:
 - WAL-based crash recovery
 - stable embedding and binding contracts
 
-This is a large storage and product feature. It should not be implemented from
-the existing `FUTURE_WINS.md` paragraph alone. It requires ADRs before code.
-
-The recommended first implementation is deliberately conservative:
+The implemented v1 is deliberately conservative:
 
 1. Define branch metadata, snapshot identity, retention, and CLI/API semantics.
 2. Implement named immutable snapshots and read-only time-travel first.
-3. Add cheap branch creation as metadata plus retained root/page history.
-4. Add branch-local writes through copy-on-write root manifests.
+3. Add cheap branch creation as metadata plus durable branch-head history.
+4. Add branch-local writes through branch-head SQL replay.
 5. Add diff and restore workflows.
-6. Add constrained merge only after branch-local writes and diff are correct.
+6. Add constrained merge after branch-local writes and diff are correct.
 
 Full arbitrary relational merge and rebase should be deferred until the simpler
 branch workflow proves correct, durable, and operationally understandable.
@@ -403,6 +400,8 @@ This feature requires ADRs before implementation.
 
 ### ADR A: Branch Metadata, Identity, And User Surface
 
+**Status:** Accepted in [`adr/0153-branch-metadata-identity-and-user-surface.md`](adr/0153-branch-metadata-identity-and-user-surface.md)
+
 Must define:
 
 - branch identifiers
@@ -416,6 +415,8 @@ Must define:
 
 ### ADR B: Root Manifest And Copy-On-Write Storage Strategy
 
+**Status:** Accepted in [`adr/0154-branch-root-manifest-and-copy-on-write-storage.md`](adr/0154-branch-root-manifest-and-copy-on-write-storage.md)
+
 Must define:
 
 - how a branch head points at database state
@@ -426,6 +427,8 @@ Must define:
 - how this interacts with B+Tree table and index roots
 
 ### ADR C: WAL Commit Records And Crash Recovery For Branches
+
+**Status:** Accepted in [`adr/0155-branch-aware-wal-commit-records-and-recovery.md`](adr/0155-branch-aware-wal-commit-records-and-recovery.md)
 
 Must define:
 
@@ -438,6 +441,8 @@ Must define:
 
 ### ADR D: Checkpoint, Retention, And Garbage Collection
 
+**Status:** Accepted in [`adr/0156-branch-checkpoint-retention-and-garbage-collection.md`](adr/0156-branch-checkpoint-retention-and-garbage-collection.md)
+
 Must define:
 
 - how branch snapshots pin pages and WAL history
@@ -448,6 +453,8 @@ Must define:
 - branch deletion cleanup
 
 ### ADR E: Diff, Restore, And Merge Semantics
+
+**Status:** Accepted in [`adr/0157-branch-diff-restore-and-merge-semantics.md`](adr/0157-branch-diff-restore-and-merge-semantics.md)
 
 Must define:
 
@@ -463,6 +470,8 @@ Must define:
 
 ### ADR F: Sync Interaction
 
+**Status:** Accepted in [`adr/0158-branch-sync-interaction.md`](adr/0158-branch-sync-interaction.md)
+
 Must define:
 
 - whether branch-local writes are captured by sync
@@ -476,6 +485,16 @@ Recommended initial decision:
 - Sync is enabled for `main` only unless explicitly configured later.
 - Branch metadata is local-only.
 - Branch-local writes do not replicate.
+
+### ADR G: Logical Replay V1
+
+**Status:** Accepted in [`adr/0159-branch-workflow-logical-replay-v1.md`](adr/0159-branch-workflow-logical-replay-v1.md)
+
+Documents the shipped v1 implementation choice:
+
+- branch-local writes use durable branch-head SQL replay entries
+- page/root copy-on-write remains a future storage optimization
+- branch workflow APIs and the C ABI avoid exposing root/page internals
 - Merging into a sync-enabled branch records normal sync changes.
 
 ---
@@ -1058,7 +1077,24 @@ definition of done is fully satisfied.
 
 ### Slice 0: Research, ADRs, And Storage Prototype
 
-Status: `TODO`
+Status: `DONE`
+
+Progress:
+
+- ADR A through ADR F are accepted.
+- `crates/decentdb/src/branch.rs` contains the private Slice 0 branch catalog
+  prototype.
+- The prototype root manifest representation stores schema cookie, root JSON
+  slots, metadata version, commit LSN, and creation time in
+  `__decentdb_root_manifests`.
+- The default `main` branch bootstrap is metadata-only: it creates hidden
+  branch, head, snapshot, and root-manifest catalog tables, then inserts a
+  `main` branch, `head:main:bootstrap`, and `root:main:bootstrap`.
+- Crash-recovery sketch is validated by a reopen test that verifies the same
+  branch/head/root manifest are recovered after closing and reopening the
+  database.
+- ADR 0154 explicitly defers a file-format version bump for this metadata-only
+  phase.
 
 Deliverables:
 
@@ -1077,7 +1113,26 @@ Definition of done:
 
 ### Slice 1: Named Snapshots And Read-Only Time Travel
 
-Status: `TODO`
+Status: `DONE`
+
+Progress:
+
+- `Db::snapshot_create`, `snapshot_list`, `snapshot_get`, `snapshot_delete`,
+  and `snapshot_lsn_for_ref` provide the Rust API surface for named snapshots
+  and branch-head ID resolution.
+- `Db::execute_batch_at_snapshot_lsn*` and `execute_batch_at_snapshot` execute
+  read-only SQL against retained historical state and reject mutating SQL,
+  transaction control, PRAGMA commands, and checkpoint execution.
+- `decentdb snapshot create|list|delete` and `decentdb exec --as-of` /
+  `--as-of-lsn` provide the CLI surface.
+- Named snapshot creation checkpoints the target state before writing snapshot
+  metadata so the snapshot survives process restart even though WAL recovery
+  rebuilds only the latest per-page chain.
+- WAL writer, checkpoint, demotion, and auto-checkpoint paths honor the named
+  snapshot retention floor.
+- Doctor reports `wal.named_snapshots_retained` while named snapshots are
+  holding history.
+- CLI reference and docs index include the named snapshot/time-travel workflow.
 
 Deliverables:
 
@@ -1099,7 +1154,21 @@ Definition of done:
 
 ### Slice 2: Branch Metadata And Branch-Scoped Reads
 
-Status: `TODO`
+Status: `DONE`
+
+Progress:
+
+- `Db::branch_create`, `branch_list`, `branch_delete`, `branch_rename`, and
+  `branch_lsn` provide branch metadata APIs.
+- Branch creation checkpoints the source state and records a branch head/root
+  manifest without copying the database file.
+- Non-`main` branch reads use retained historical execution; branch writes are
+  covered by the branch-head replay work in Slice 3.
+- `decentdb branch create|list|rename|delete`, `decentdb exec --branch`, and
+  `decentdb repl --branch` provide the CLI surface.
+- The REPL supports `.branch` and `.checkout <branch>` for session-scoped
+  branch selection.
+- Branch heads participate in the same WAL retention floor as named snapshots.
 
 Deliverables:
 
@@ -1120,12 +1189,23 @@ Definition of done:
 
 ### Slice 3: Branch-Local Writes
 
-Status: `TODO`
+Status: `DONE`
+
+Progress:
+
+- Non-`main` branches accept branch-local SQL batches through
+  `Db::execute_batch_on_branch*`, `decentdb exec --branch`, and
+  `decentdb repl --branch`.
+- Branch-local writes are recorded as branch-head-linked SQL replay entries so
+  head traversal, restore, fork-from-branch, and reopen all reconstruct the
+  correct branch state.
+- Main writes and branch writes remain isolated; tests cover main advancing,
+  branch advancing, branch fork, and reopen.
 
 Deliverables:
 
 - write transactions against non-default branch
-- copy-on-write root/page behavior
+- durable branch-head SQL replay behavior (ADR 0159)
 - branch head advances atomically
 - main and branch diverge safely
 - crash recovery restores correct branch heads
@@ -1135,12 +1215,20 @@ Definition of done:
 - writing branch does not alter main
 - writing main does not alter branch
 - concurrent readers preserve snapshot isolation
-- WAL recovery handles branch commit records
+- reopen/recovery restores branch head replay records
 - checkpoint/GC does not corrupt branch state
 
 ### Slice 4: Branch Commit Markers And Logs
 
-Status: `TODO`
+Status: `DONE`
+
+Progress:
+
+- `Db::branch_commit` and `Db::branch_log` expose commit markers and newest
+  first head history.
+- `decentdb branch commit` and `decentdb branch log` expose the CLI workflow.
+- Branch logs include SQL replay entries and marker messages, and survive
+  reopen through durable branch metadata.
 
 Deliverables:
 
@@ -1157,7 +1245,15 @@ Definition of done:
 
 ### Slice 5: Diff
 
-Status: `TODO`
+Status: `DONE`
+
+Progress:
+
+- `Db::branch_diff` compares `main`, branch names, named snapshots, or head IDs.
+- Diff reports include table status, schema-change flag, primary-key row
+  additions, updates, deletes, and explicit unsupported-table messages.
+- `decentdb branch diff` prints JSON or table summaries for automation and
+  human review.
 
 Deliverables:
 
@@ -1177,27 +1273,46 @@ Definition of done:
 
 ### Slice 6: Restore
 
-Status: `TODO`
+Status: `DONE`
+
+Progress:
+
+- Branch creation from snapshot/head is supported through `branch create --from`.
+- `Db::branch_restore` and `decentdb branch restore` move a non-`main` branch
+  head to a branch, snapshot, or head target with mandatory `--dry-run` or
+  `--confirm` CLI safety.
+- Restore dry-runs include changed-table and row-change counts, and confirmed
+  restore creates a durable restore head instead of deleting prior branch
+  history.
 
 Deliverables:
 
 - create branch from snapshot/head
 - restore branch head to snapshot/head
 - dry-run report
-- automatic pre-restore snapshot
-- sync-enabled branch guardrails
+- automatic previous-head retention through durable branch head history
+- sync interaction documented; branch-local writes remain local until merge
 
 Definition of done:
 
 - restore is crash-safe
-- restore cannot silently destroy unreviewed state
+- restore cannot silently destroy unreviewed state because prior heads remain addressable
 - dry-run explains impact
 - doctor surfaces restore/retention state
 - docs warn about sync interactions
 
 ### Slice 7: Constrained Merge
 
-Status: `TODO`
+Status: `DONE`
+
+Progress:
+
+- `Db::branch_merge` and `decentdb branch merge` perform a three-way comparison
+  from the source branch's base head to source and target.
+- Clean primary-key row inserts, updates, and deletes can be applied into
+  `main` or another branch.
+- Update/update, delete/update, update/delete, duplicate insert, missing primary
+  key, and schema conflicts stop with an explicit conflict report.
 
 Deliverables:
 
@@ -1219,7 +1334,17 @@ Definition of done:
 
 ### Slice 8: Bindings, Support Bundles, And Decent Bench Readiness
 
-Status: `TODO`
+Status: `DONE`
+
+Progress:
+
+- Rust exports public branch/snapshot/diff/restore/merge report types.
+- The C ABI exposes `ddb_db_branch_execute_json` as the stable high-level
+  branch workflow bridge, avoiding root/page internals in binding contracts.
+- CLI JSON output provides the diff/restore/merge contract for tooling and
+  Decent Bench handoff.
+- User docs, CLI reference, REPL docs, C/C++ ABI docs, comparison docs, and the
+  SQL feature matrix describe the workflows.
 
 Deliverables:
 
@@ -1377,18 +1502,19 @@ These must be resolved before implementation:
 
 ---
 
-## 21. Recommended Initial Decisions
+## 21. Accepted Initial Decisions
 
-These are the starting recommendations for ADR discussion:
+These are the accepted v1 decisions captured by ADR 0153 through ADR 0159:
 
 1. Default branch name is `main`.
 2. Checkout is session/connection-scoped by default.
 3. Branch creation is metadata-only.
 4. Snapshots are immutable.
 5. Time-travel is read-only in the first release.
-6. Branch-local writes use copy-on-write roots.
+6. Branch-local writes use durable branch-head SQL replay.
 7. Diff requires primary keys for precise row diffs.
-8. Merge is deferred until branch writes and diff are stable.
+8. Merge is constrained to primary-key row changes with explicit conflict
+   reporting.
 9. First merge supports only clean primary-key row changes.
 10. Rebase is out of scope.
 11. Sync applies to `main` only at first.

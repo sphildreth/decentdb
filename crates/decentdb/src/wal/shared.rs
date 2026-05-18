@@ -104,6 +104,7 @@ fn build_handle(
         allocated_len: AtomicU64::new(allocated_len),
         write_lock: Mutex::new(WalWriteState::new()),
         reader_registry: ReaderRegistry::default(),
+        retained_snapshot_lsn: AtomicU64::new(u64::MAX),
         checkpoint_pending: AtomicBool::new(false),
         checkpoint_epoch: AtomicU64::new(0),
         async_commit,

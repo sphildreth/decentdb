@@ -7,6 +7,7 @@
 
 #[cfg(feature = "bench-internals")]
 pub mod benchmark;
+mod branch;
 mod btree;
 mod c_api;
 mod catalog;
@@ -28,6 +29,11 @@ mod sync;
 mod vfs;
 mod wal;
 
+pub use crate::branch::{
+    BranchDiffReport, BranchInfo, BranchLogEntry, BranchMergeChange, BranchMergeConflict,
+    BranchMergeOperation, BranchMergeReport, BranchRestoreReport, BranchRowDiff, BranchTableDiff,
+    BranchTableDiffStatus, NamedSnapshot,
+};
 pub use crate::config::{DbConfig, WalSyncMode};
 pub use crate::db::{evict_shared_wal, Db, PreparedStatement, SqlTransaction};
 pub use crate::doctor::{

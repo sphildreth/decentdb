@@ -10,11 +10,13 @@ use std::time::Instant;
 use anyhow::{anyhow, Result};
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use decentdb::{
-    evict_shared_wal, render_markdown, run_doctor, BulkLoadOptions, Db, DbConfig, DoctorCategory,
-    DoctorCheckSelection, DoctorIndexVerification, DoctorOptions, DoctorPathMode, DoctorReport,
-    DoctorSeverity, HeaderInfo, IndexVerification, QueryResult, StorageInfo, SyncChangeBatch,
-    SyncConflict, SyncConflictPolicy, SyncHandshake, SyncImportSummary, SyncPeer,
-    SyncPeerScopeBinding, SyncRunDirection, SyncRunSummary, SyncScope, TableInfo, Value,
+    evict_shared_wal, render_markdown, run_doctor, BranchDiffReport, BranchInfo, BranchLogEntry,
+    BranchMergeOperation, BranchMergeReport, BranchRestoreReport, BranchTableDiffStatus,
+    BulkLoadOptions, Db, DbConfig, DoctorCategory, DoctorCheckSelection, DoctorIndexVerification,
+    DoctorOptions, DoctorPathMode, DoctorReport, DoctorSeverity, HeaderInfo, IndexVerification,
+    NamedSnapshot, QueryResult, StorageInfo, SyncChangeBatch, SyncConflict, SyncConflictPolicy,
+    SyncHandshake, SyncImportSummary, SyncPeer, SyncPeerScopeBinding, SyncRunDirection,
+    SyncRunSummary, SyncScope, TableInfo, Value,
 };
 
 use crate::output::{
@@ -57,6 +59,12 @@ pub enum Commands {
     Checkpoint(DbCommand),
     /// Export the database to a new on-disk file (snapshot backup)
     SaveAs(SaveAsCommand),
+    /// Manage named time-travel snapshots
+    #[command(subcommand)]
+    Snapshot(SnapshotCommand),
+    /// Manage database branches
+    #[command(subcommand)]
+    Branch(BranchCommand),
     /// Quick diagnostic view of database file headers, format version, and WAL state
     Info(InfoCommand),
     /// Describe table structure
@@ -124,6 +132,12 @@ pub struct ExecCommand {
     pub checkpoint: bool,
     #[arg(long = "dbInfo")]
     pub db_info: bool,
+    #[arg(long = "as-of")]
+    pub as_of: Option<String>,
+    #[arg(long = "as-of-lsn")]
+    pub as_of_lsn: Option<u64>,
+    #[arg(long)]
+    pub branch: Option<String>,
 }
 
 #[derive(Clone, Debug, Parser)]
@@ -132,6 +146,8 @@ pub struct ReplCommand {
     pub db: String,
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,
+    #[arg(long)]
+    pub branch: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -190,6 +206,174 @@ pub struct SaveAsCommand {
     pub db: String,
     #[arg(long)]
     pub output: PathBuf,
+}
+
+#[derive(Clone, Debug, Subcommand)]
+pub enum SnapshotCommand {
+    /// Create a named snapshot of the current durable main state
+    Create(SnapshotCreateCommand),
+    /// List named snapshots
+    List(SnapshotListCommand),
+    /// Delete a named snapshot
+    Delete(SnapshotDeleteCommand),
+}
+
+#[derive(Clone, Debug, Subcommand)]
+pub enum BranchCommand {
+    /// Create a branch
+    Create(BranchCreateCommand),
+    /// List branches
+    List(BranchListCommand),
+    /// Add a commit marker to a branch
+    Commit(BranchCommitCommand),
+    /// Show branch head history
+    Log(BranchLogCommand),
+    /// Compare two branches, snapshots, or heads
+    Diff(BranchDiffCommand),
+    /// Restore a branch head to a branch, snapshot, or head
+    Restore(BranchRestoreCommand),
+    /// Merge clean primary-key row changes into a branch or main
+    Merge(BranchMergeCommand),
+    /// Delete a branch
+    Delete(BranchDeleteCommand),
+    /// Rename a branch
+    Rename(BranchRenameCommand),
+}
+
+#[derive(Clone, Debug, Parser)]
+pub struct BranchCreateCommand {
+    #[arg(long)]
+    pub db: String,
+    #[arg(long)]
+    pub name: String,
+    #[arg(long)]
+    pub from: Option<String>,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+    pub format: OutputFormat,
+}
+
+#[derive(Clone, Debug, Parser)]
+pub struct BranchListCommand {
+    #[arg(long)]
+    pub db: String,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+    pub format: OutputFormat,
+}
+
+#[derive(Clone, Debug, Parser)]
+pub struct BranchCommitCommand {
+    #[arg(long)]
+    pub db: String,
+    #[arg(long)]
+    pub name: String,
+    #[arg(long)]
+    pub message: String,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+    pub format: OutputFormat,
+}
+
+#[derive(Clone, Debug, Parser)]
+pub struct BranchLogCommand {
+    #[arg(long)]
+    pub db: String,
+    #[arg(long)]
+    pub name: String,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+    pub format: OutputFormat,
+}
+
+#[derive(Clone, Debug, Parser)]
+pub struct BranchDiffCommand {
+    #[arg(long)]
+    pub db: String,
+    #[arg(long)]
+    pub left: String,
+    #[arg(long)]
+    pub right: String,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+    pub format: OutputFormat,
+}
+
+#[derive(Clone, Debug, Parser)]
+pub struct BranchRestoreCommand {
+    #[arg(long)]
+    pub db: String,
+    #[arg(long)]
+    pub name: String,
+    #[arg(long = "to")]
+    pub target: String,
+    #[arg(long = "dry-run", default_value_t = false)]
+    pub dry_run: bool,
+    #[arg(long, default_value_t = false)]
+    pub confirm: bool,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+    pub format: OutputFormat,
+}
+
+#[derive(Clone, Debug, Parser)]
+pub struct BranchMergeCommand {
+    #[arg(long)]
+    pub db: String,
+    #[arg(long)]
+    pub source: String,
+    #[arg(long)]
+    pub target: String,
+    #[arg(long = "dry-run", default_value_t = false)]
+    pub dry_run: bool,
+    #[arg(long, default_value_t = false)]
+    pub confirm: bool,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+    pub format: OutputFormat,
+}
+
+#[derive(Clone, Debug, Parser)]
+pub struct BranchDeleteCommand {
+    #[arg(long)]
+    pub db: String,
+    #[arg(long)]
+    pub name: String,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+    pub format: OutputFormat,
+}
+
+#[derive(Clone, Debug, Parser)]
+pub struct BranchRenameCommand {
+    #[arg(long)]
+    pub db: String,
+    #[arg(long)]
+    pub name: String,
+    #[arg(long = "new-name")]
+    pub new_name: String,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+    pub format: OutputFormat,
+}
+
+#[derive(Clone, Debug, Parser)]
+pub struct SnapshotCreateCommand {
+    #[arg(long)]
+    pub db: String,
+    #[arg(long)]
+    pub name: String,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+    pub format: OutputFormat,
+}
+
+#[derive(Clone, Debug, Parser)]
+pub struct SnapshotListCommand {
+    #[arg(long)]
+    pub db: String,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+    pub format: OutputFormat,
+}
+
+#[derive(Clone, Debug, Parser)]
+pub struct SnapshotDeleteCommand {
+    #[arg(long)]
+    pub db: String,
+    #[arg(long)]
+    pub name: String,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+    pub format: OutputFormat,
 }
 
 #[derive(Clone, Debug, Parser)]
@@ -831,7 +1015,11 @@ fn dispatch(cli: Cli) -> Result<()> {
             }
         }
         Commands::Repl(command) => {
-            run_repl(open_db(&command.db, true, 0, 0)?, command.format)?;
+            run_repl(
+                open_db(&command.db, true, 0, 0)?,
+                command.format,
+                command.branch.as_deref(),
+            )?;
         }
         Commands::Import(command) => run_import(command)?,
         Commands::Export(command) => run_export(command)?,
@@ -844,6 +1032,8 @@ fn dispatch(cli: Cli) -> Result<()> {
             open_db(&command.db, false, 0, 0)?.save_as(&command.output)?;
             println!("{}", command.output.display());
         }
+        Commands::Snapshot(command) => run_snapshot(command)?,
+        Commands::Branch(command) => run_branch(command)?,
         Commands::Info(command) => run_info(command)?,
         Commands::Describe(command) => run_describe(command)?,
         Commands::ListTables(command) => run_list_tables(command)?,
@@ -897,8 +1087,40 @@ fn run_exec(command: &ExecCommand) -> Result<()> {
         .iter()
         .map(|param| parse_param(param))
         .collect::<Result<Vec<_>>>()?;
+    if command.as_of.is_some() && command.as_of_lsn.is_some() {
+        return Err(anyhow!("use only one of --as-of or --as-of-lsn"));
+    }
+    if command.branch.is_some() && (command.as_of.is_some() || command.as_of_lsn.is_some()) {
+        return Err(anyhow!("use --branch or time-travel execution, not both"));
+    }
+    if (command.as_of.is_some() || command.as_of_lsn.is_some()) && command.checkpoint {
+        return Err(anyhow!(
+            "--checkpoint is not supported with time-travel execution"
+        ));
+    }
+    if command
+        .branch
+        .as_deref()
+        .is_some_and(|branch| branch != "main")
+        && command.checkpoint
+    {
+        return Err(anyhow!(
+            "--checkpoint is not supported with read-only branch execution"
+        ));
+    }
     let started = Instant::now();
-    let mut results = db.execute_batch_with_params(sql, &params)?;
+    let mut results = if let Some(snapshot_name) = command.as_of.as_deref() {
+        let snapshot_lsn = db
+            .snapshot_lsn_for_ref(snapshot_name)?
+            .ok_or_else(|| anyhow!("unknown snapshot or branch head '{snapshot_name}'"))?;
+        db.execute_batch_at_snapshot_lsn_with_params(sql, snapshot_lsn, &params)?
+    } else if let Some(snapshot_lsn) = command.as_of_lsn {
+        db.execute_batch_at_snapshot_lsn_with_params(sql, snapshot_lsn, &params)?
+    } else if let Some(branch_name) = command.branch.as_deref() {
+        db.execute_batch_on_branch_with_params(sql, branch_name, &params)?
+    } else {
+        db.execute_batch_with_params(sql, &params)?
+    };
     if command.no_rows && results.len() == 1 {
         let row_count = results[0].rows().len();
         results = vec![QueryResult::with_affected_rows(row_count as u64)];
@@ -933,6 +1155,304 @@ fn run_exec(command: &ExecCommand) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn run_snapshot(command: SnapshotCommand) -> Result<()> {
+    match command {
+        SnapshotCommand::Create(command) => {
+            let db = open_db(&command.db, true, 0, 0)?;
+            let snapshot = db.snapshot_create(&command.name)?;
+            print_snapshots(command.format, &[snapshot]);
+        }
+        SnapshotCommand::List(command) => {
+            let db = open_db(&command.db, false, 0, 0)?;
+            let snapshots = db.snapshot_list()?;
+            print_snapshots(command.format, &snapshots);
+        }
+        SnapshotCommand::Delete(command) => {
+            let db = open_db(&command.db, true, 0, 0)?;
+            let deleted = db.snapshot_delete(&command.name)?;
+            let columns = vec!["name".to_string(), "deleted".to_string()];
+            let rows = vec![vec![command.name, deleted.to_string()]];
+            println!("{}", render_rows(command.format, &columns, &rows, true));
+        }
+    }
+    Ok(())
+}
+
+fn print_snapshots(format: OutputFormat, snapshots: &[NamedSnapshot]) {
+    let columns = vec![
+        "name".to_string(),
+        "snapshot_lsn".to_string(),
+        "created_at_micros".to_string(),
+        "branch_id".to_string(),
+        "head_id".to_string(),
+    ];
+    let rows = snapshots
+        .iter()
+        .map(|snapshot| {
+            vec![
+                snapshot.name.clone(),
+                snapshot.snapshot_lsn.to_string(),
+                snapshot.created_at_micros.to_string(),
+                snapshot.branch_id.clone(),
+                snapshot.head_id.clone(),
+            ]
+        })
+        .collect::<Vec<_>>();
+    println!("{}", render_rows(format, &columns, &rows, true));
+}
+
+fn run_branch(command: BranchCommand) -> Result<()> {
+    match command {
+        BranchCommand::Create(command) => {
+            let db = open_db(&command.db, true, 0, 0)?;
+            let branch = db.branch_create(&command.name, command.from.as_deref())?;
+            print_branches(command.format, &[branch]);
+        }
+        BranchCommand::List(command) => {
+            let db = open_db(&command.db, false, 0, 0)?;
+            let branches = db.branch_list()?;
+            print_branches(command.format, &branches);
+        }
+        BranchCommand::Commit(command) => {
+            let db = open_db(&command.db, true, 0, 0)?;
+            let entry = db.branch_commit(&command.name, &command.message)?;
+            print_branch_log(command.format, &[entry]);
+        }
+        BranchCommand::Log(command) => {
+            let db = open_db(&command.db, false, 0, 0)?;
+            let entries = db.branch_log(&command.name)?;
+            print_branch_log(command.format, &entries);
+        }
+        BranchCommand::Diff(command) => {
+            let db = open_db(&command.db, false, 0, 0)?;
+            let report = db.branch_diff(&command.left, &command.right)?;
+            print_branch_diff(command.format, &report)?;
+        }
+        BranchCommand::Restore(command) => {
+            if !command.dry_run && !command.confirm {
+                return Err(anyhow!("branch restore requires --dry-run or --confirm"));
+            }
+            let db = open_db(&command.db, true, 0, 0)?;
+            let report = db.branch_restore(&command.name, &command.target, command.dry_run)?;
+            print_branch_restore(command.format, &report)?;
+        }
+        BranchCommand::Merge(command) => {
+            if !command.dry_run && !command.confirm {
+                return Err(anyhow!("branch merge requires --dry-run or --confirm"));
+            }
+            let db = open_db(&command.db, true, 0, 0)?;
+            let report = db.branch_merge(&command.source, &command.target, command.dry_run)?;
+            print_branch_merge(command.format, &report)?;
+        }
+        BranchCommand::Delete(command) => {
+            let db = open_db(&command.db, true, 0, 0)?;
+            let deleted = db.branch_delete(&command.name)?;
+            let columns = vec!["name".to_string(), "deleted".to_string()];
+            let rows = vec![vec![command.name, deleted.to_string()]];
+            println!("{}", render_rows(command.format, &columns, &rows, true));
+        }
+        BranchCommand::Rename(command) => {
+            let db = open_db(&command.db, true, 0, 0)?;
+            let renamed = db.branch_rename(&command.name, &command.new_name)?;
+            let columns = vec![
+                "old_name".to_string(),
+                "new_name".to_string(),
+                "renamed".to_string(),
+            ];
+            let rows = vec![vec![command.name, command.new_name, renamed.to_string()]];
+            println!("{}", render_rows(command.format, &columns, &rows, true));
+        }
+    }
+    Ok(())
+}
+
+fn print_branches(format: OutputFormat, branches: &[BranchInfo]) {
+    let columns = vec![
+        "name".to_string(),
+        "branch_id".to_string(),
+        "current_head_id".to_string(),
+        "base_head_id".to_string(),
+        "created_at_micros".to_string(),
+        "updated_at_micros".to_string(),
+    ];
+    let rows = branches
+        .iter()
+        .map(|branch| {
+            vec![
+                branch.name.clone(),
+                branch.branch_id.clone(),
+                branch.current_head_id.clone().unwrap_or_default(),
+                branch.base_head_id.clone().unwrap_or_default(),
+                branch.created_at_micros.to_string(),
+                branch.updated_at_micros.to_string(),
+            ]
+        })
+        .collect::<Vec<_>>();
+    println!("{}", render_rows(format, &columns, &rows, true));
+}
+
+fn print_branch_log(format: OutputFormat, entries: &[BranchLogEntry]) {
+    let columns = vec![
+        "head_id".to_string(),
+        "branch_id".to_string(),
+        "parent_head_id".to_string(),
+        "message".to_string(),
+        "created_at_micros".to_string(),
+        "sql".to_string(),
+    ];
+    let rows = entries
+        .iter()
+        .map(|entry| {
+            vec![
+                entry.head_id.clone(),
+                entry.branch_id.clone(),
+                entry.parent_head_id.clone().unwrap_or_default(),
+                entry.message.clone().unwrap_or_default(),
+                entry.created_at_micros.to_string(),
+                entry.sql.clone().unwrap_or_default(),
+            ]
+        })
+        .collect::<Vec<_>>();
+    println!("{}", render_rows(format, &columns, &rows, true));
+}
+
+fn print_branch_merge(format: OutputFormat, report: &BranchMergeReport) -> Result<()> {
+    if format == OutputFormat::Json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+        return Ok(());
+    }
+    let columns = vec![
+        "kind".to_string(),
+        "table".to_string(),
+        "primary_key".to_string(),
+        "operation".to_string(),
+        "message".to_string(),
+    ];
+    let mut rows = Vec::new();
+    for change in &report.applied {
+        rows.push(vec![
+            "applied".to_string(),
+            change.table.clone(),
+            change.primary_key.join(","),
+            branch_merge_operation_name(&change.operation).to_string(),
+            String::new(),
+        ]);
+    }
+    for conflict in &report.conflicts {
+        rows.push(vec![
+            "conflict".to_string(),
+            conflict.table.clone(),
+            conflict.primary_key.join(","),
+            conflict.conflict_type.clone(),
+            conflict.message.clone(),
+        ]);
+    }
+    if rows.is_empty() {
+        rows.push(vec![
+            if report.clean { "clean" } else { "conflict" }.to_string(),
+            String::new(),
+            String::new(),
+            String::new(),
+            format!(
+                "changes={}, conflicts={}",
+                report.applied_change_count, report.conflict_count
+            ),
+        ]);
+    }
+    println!("{}", render_rows(format, &columns, &rows, true));
+    Ok(())
+}
+
+fn branch_merge_operation_name(operation: &BranchMergeOperation) -> &'static str {
+    match operation {
+        BranchMergeOperation::Insert => "insert",
+        BranchMergeOperation::Update => "update",
+        BranchMergeOperation::Delete => "delete",
+    }
+}
+
+fn print_branch_restore(format: OutputFormat, report: &BranchRestoreReport) -> Result<()> {
+    if format == OutputFormat::Json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+        return Ok(());
+    }
+    let rows = vec![
+        ("branch".to_string(), report.branch.clone()),
+        ("target_ref".to_string(), report.target_ref.clone()),
+        ("dry_run".to_string(), report.dry_run.to_string()),
+        (
+            "previous_head_id".to_string(),
+            report.previous_head_id.clone().unwrap_or_default(),
+        ),
+        ("target_head_id".to_string(), report.target_head_id.clone()),
+        (
+            "new_head_id".to_string(),
+            report.new_head_id.clone().unwrap_or_default(),
+        ),
+        (
+            "changed_table_count".to_string(),
+            report.changed_table_count.to_string(),
+        ),
+        (
+            "added_row_count".to_string(),
+            report.added_row_count.to_string(),
+        ),
+        (
+            "updated_row_count".to_string(),
+            report.updated_row_count.to_string(),
+        ),
+        (
+            "deleted_row_count".to_string(),
+            report.deleted_row_count.to_string(),
+        ),
+    ];
+    println!("{}", render_key_value_rows(format, &rows));
+    Ok(())
+}
+
+fn print_branch_diff(format: OutputFormat, report: &BranchDiffReport) -> Result<()> {
+    if format == OutputFormat::Json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+        return Ok(());
+    }
+    let columns = vec![
+        "table".to_string(),
+        "status".to_string(),
+        "schema_changed".to_string(),
+        "added".to_string(),
+        "updated".to_string(),
+        "deleted".to_string(),
+        "message".to_string(),
+    ];
+    let rows = report
+        .tables
+        .iter()
+        .map(|table| {
+            vec![
+                table.table.clone(),
+                branch_diff_status_name(&table.status).to_string(),
+                table.schema_changed.to_string(),
+                table.added.len().to_string(),
+                table.updated.len().to_string(),
+                table.deleted.len().to_string(),
+                table.message.clone().unwrap_or_default(),
+            ]
+        })
+        .collect::<Vec<_>>();
+    println!("{}", render_rows(format, &columns, &rows, true));
+    Ok(())
+}
+
+fn branch_diff_status_name(status: &BranchTableDiffStatus) -> &'static str {
+    match status {
+        BranchTableDiffStatus::Unchanged => "unchanged",
+        BranchTableDiffStatus::Added => "added",
+        BranchTableDiffStatus::Removed => "removed",
+        BranchTableDiffStatus::Changed => "changed",
+        BranchTableDiffStatus::Unsupported => "unsupported",
+    }
 }
 
 fn run_import(command: ImportCommand) -> Result<()> {

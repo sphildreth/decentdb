@@ -31,6 +31,7 @@ SQLite and DuckDB are used as behavioral baselines for many SQL features, but De
 | SQL breadth | Subset (deliberately small) | Very broad (plus extensions) | Very broad (esp. analytical SQL) |
 | Extensibility | No loadable extension / UDF plugin surface in the current baseline (extend by contributing to core) | Rich extension ecosystem (loadable extensions, virtual tables, UDFs) | Rich extension ecosystem (install/load extensions, UDFs) |
 | Local-first sync | Built-in durable change journal, batch exchange, scoped peers, conflict workflows, doctor/retention tooling, CLI, and .NET SDK | Not built in; usually application middleware or third-party replication layers | Not built in; not a local-first replication focus |
+| Branch/diff/restore workflows | Built-in named snapshots, branch-local writes, primary-key row diff, guarded restore, and constrained merge | Not built in; use file copies, backup APIs, sessions, or app tooling | Not built in; typically use external copies or app/tooling |
 | Substring search (`LIKE '%pattern%'`) | Built-in trigram index option (purpose-built for interactive “contains” queries) | Typically full scan or use FTS/extensions | Typically scan or use extensions (e.g., FTS) |
 | Durability fault-injection hooks | Built-in WAL failpoints + FaultyVFS for deterministic crash/torn-write testing | Not typically exposed as a first-class user feature | Not typically exposed as a first-class user feature |
 

@@ -39,6 +39,16 @@ decentdb repl --db ./app.ddb --format markdown
 
 `table` is the default because the REPL is primarily meant for humans.
 
+Open a branch-scoped REPL with `--branch`:
+
+```bash
+decentdb repl --db ./app.ddb --branch work
+```
+
+Branch-local writes are isolated from `main`. For full branch workflows,
+including diff, restore, and merge, see
+[Branching, Diff, Restore, And Time Travel](branching.md).
+
 ## Basic Session
 
 ```sql
@@ -69,6 +79,8 @@ The REPL currently supports a small command set:
 
 | Command | Meaning |
 |---|---|
+| `.branch` | Print the active branch name. |
+| `.checkout <branch>` | Switch the current REPL session to another branch. |
 | `.help` | Print the available REPL commands. |
 | `.exit` | Exit the REPL. |
 | `.quit` | Exit the REPL. |

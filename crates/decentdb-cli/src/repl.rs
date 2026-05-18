@@ -7,33 +7,60 @@ use rustyline::DefaultEditor;
 
 use crate::output::{render_exec_success_json, render_rows, rows_from_query_result, OutputFormat};
 
-pub fn run_repl(db: Db, format: OutputFormat) -> Result<()> {
+pub fn run_repl(db: Db, format: OutputFormat, branch: Option<&str>) -> Result<()> {
     let mut editor = DefaultEditor::new()?;
     let history_path = history_path();
     let _ = editor.load_history(&history_path);
 
+    let mut current_branch = branch.unwrap_or("main").to_string();
+    if current_branch != "main" && db.branch_lsn(&current_branch)?.is_none() {
+        anyhow::bail!("unknown branch '{}'", current_branch);
+    }
+
     let mut buffer = String::new();
     loop {
-        let prompt = if db.in_transaction().unwrap_or(false) {
+        let prompt = if current_branch != "main" {
             if buffer.is_empty() {
-                "decentdb*> "
+                format!("decentdb({})> ", current_branch)
             } else {
-                "...*> "
+                "...> ".to_string()
+            }
+        } else if db.in_transaction().unwrap_or(false) {
+            if buffer.is_empty() {
+                "decentdb*> ".to_string()
+            } else {
+                "...*> ".to_string()
             }
         } else if buffer.is_empty() {
-            "decentdb> "
+            "decentdb> ".to_string()
         } else {
-            "...> "
+            "...> ".to_string()
         };
 
-        match editor.readline(prompt) {
+        match editor.readline(&prompt) {
             Ok(line) => {
                 let trimmed = line.trim();
                 if trimmed.eq_ignore_ascii_case(".quit") || trimmed.eq_ignore_ascii_case(".exit") {
                     break;
                 }
                 if trimmed.eq_ignore_ascii_case(".help") {
-                    println!(".help\n.quit\n.exit");
+                    println!(".branch\n.checkout <branch>\n.help\n.quit\n.exit");
+                    continue;
+                }
+                if trimmed.eq_ignore_ascii_case(".branch") {
+                    println!("{current_branch}");
+                    continue;
+                }
+                if let Some(next_branch) = trimmed.strip_prefix(".checkout ") {
+                    let next_branch = next_branch.trim();
+                    if next_branch.is_empty() {
+                        eprintln!("branch name is required");
+                    } else if next_branch == "main" || db.branch_lsn(next_branch)?.is_some() {
+                        current_branch = next_branch.to_string();
+                        println!("{current_branch}");
+                    } else {
+                        eprintln!("unknown branch '{next_branch}'");
+                    }
                     continue;
                 }
                 if !trimmed.is_empty() {
@@ -49,7 +76,12 @@ pub fn run_repl(db: Db, format: OutputFormat) -> Result<()> {
                     continue;
                 }
 
-                match db.execute_batch(&buffer) {
+                let result = if current_branch == "main" {
+                    db.execute_batch(&buffer)
+                } else {
+                    db.execute_batch_on_branch(&buffer, &current_branch)
+                };
+                match result {
                     Ok(results) => print_results(format, &results),
                     Err(error) => eprintln!("{error}"),
                 }

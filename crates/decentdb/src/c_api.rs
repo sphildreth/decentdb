@@ -1091,6 +1091,90 @@ pub extern "C" fn ddb_db_sync_execute_json(
 }
 
 #[no_mangle]
+pub extern "C" fn ddb_db_branch_execute_json(
+    db: *mut DbHandle,
+    request_json: *const c_char,
+    out_json: *mut *mut c_char,
+) -> u32 {
+    ffi_boundary(|| {
+        let db = handle_ref(db, "db")?;
+        let request_json = utf8_arg(request_json, "request_json")?;
+        let request = sync_request_root(&request_json)?;
+        let request_object = sync_request_object(&request, "request")?;
+        let op = sync_request_op(request_object)?;
+        let response = match op.as_str() {
+            "snapshot_create" => {
+                let name = sync_request_string_field(request_object, &op, "name")?;
+                sync_to_value(db.db.snapshot_create(&name)?)?
+            }
+            "snapshot_list" => sync_to_value(db.db.snapshot_list()?)?,
+            "snapshot_delete" => {
+                let name = sync_request_string_field(request_object, &op, "name")?;
+                sync_to_value(serde_json::json!({
+                    "name": name,
+                    "deleted": db.db.snapshot_delete(&name)?,
+                }))?
+            }
+            "branch_create" => {
+                let name = sync_request_string_field(request_object, &op, "name")?;
+                let from = sync_request_optional_string_field(request_object, &op, "from")?;
+                sync_to_value(db.db.branch_create(&name, from.as_deref())?)?
+            }
+            "branch_list" => sync_to_value(db.db.branch_list()?)?,
+            "branch_delete" => {
+                let name = sync_request_string_field(request_object, &op, "name")?;
+                sync_to_value(serde_json::json!({
+                    "name": name,
+                    "deleted": db.db.branch_delete(&name)?,
+                }))?
+            }
+            "branch_rename" => {
+                let name = sync_request_string_field(request_object, &op, "name")?;
+                let new_name = sync_request_string_field(request_object, &op, "new_name")?;
+                sync_to_value(serde_json::json!({
+                    "old_name": name,
+                    "new_name": new_name,
+                    "renamed": db.db.branch_rename(&name, &new_name)?,
+                }))?
+            }
+            "branch_commit" => {
+                let name = sync_request_string_field(request_object, &op, "name")?;
+                let message = sync_request_string_field(request_object, &op, "message")?;
+                sync_to_value(db.db.branch_commit(&name, &message)?)?
+            }
+            "branch_log" => {
+                let name = sync_request_string_field(request_object, &op, "name")?;
+                sync_to_value(db.db.branch_log(&name)?)?
+            }
+            "branch_diff" => {
+                let left = sync_request_string_field(request_object, &op, "left")?;
+                let right = sync_request_string_field(request_object, &op, "right")?;
+                sync_to_value(db.db.branch_diff(&left, &right)?)?
+            }
+            "branch_restore" => {
+                let name = sync_request_string_field(request_object, &op, "name")?;
+                let target = sync_request_string_field(request_object, &op, "target")?;
+                let dry_run = sync_request_bool_field(request_object, &op, "dry_run")?;
+                sync_to_value(db.db.branch_restore(&name, &target, dry_run)?)?
+            }
+            "branch_merge" => {
+                let source = sync_request_string_field(request_object, &op, "source")?;
+                let target = sync_request_string_field(request_object, &op, "target")?;
+                let dry_run = sync_request_bool_field(request_object, &op, "dry_run")?;
+                sync_to_value(db.db.branch_merge(&source, &target, dry_run)?)?
+            }
+            other => {
+                return Err(DbError::sql(format!(
+                    "unsupported branch JSON op '{other}'"
+                )));
+            }
+        };
+        *out_ptr(out_json, "out_json")? = sync_json_response(&response)?;
+        Ok(())
+    })
+}
+
+#[no_mangle]
 /// Frees a database handle returned by `ddb_db_create`, `ddb_db_open`, or
 /// `ddb_db_open_or_create`.
 ///

@@ -518,6 +518,7 @@ struct CollectedData {
     header: Option<HeaderInfo>,
     schema: Option<SchemaSnapshot>,
     indexes: Vec<IndexInfo>,
+    named_snapshot_count: usize,
     physical_bytes: u64,
 }
 
@@ -530,6 +531,7 @@ fn collect_facts(db: &Db, path: &Path) -> Result<CollectedData> {
     let header = db.header_info().ok();
     let schema = db.get_schema_snapshot().ok();
     let indexes = db.list_indexes().unwrap_or_default();
+    let named_snapshot_count = crate::branch::named_snapshot_count(db).unwrap_or(0);
 
     let database = DoctorDatabaseSummary {
         path: path.display().to_string(),
@@ -546,6 +548,7 @@ fn collect_facts(db: &Db, path: &Path) -> Result<CollectedData> {
         header,
         schema,
         indexes,
+        named_snapshot_count,
         physical_bytes,
     })
 }
@@ -631,6 +634,10 @@ fn evaluate_rules(data: &CollectedData) -> Vec<DoctorFinding> {
 
         if st.shared_wal {
             findings.push(wal_shared_enabled());
+        }
+
+        if data.named_snapshot_count > 0 {
+            findings.push(wal_named_snapshots_retained(data.named_snapshot_count));
         }
     }
 
@@ -1551,6 +1558,26 @@ fn wal_shared_enabled() -> DoctorFinding {
     }
 }
 
+fn wal_named_snapshots_retained(snapshot_count: usize) -> DoctorFinding {
+    DoctorFinding {
+        id: "wal.named_snapshots_retained".into(),
+        severity: DoctorSeverity::Warning,
+        category: DoctorCategory::Wal,
+        title: "Named snapshots are retaining WAL history".into(),
+        message: "Named time-travel snapshots keep historical page versions until deleted.".into(),
+        evidence: vec![DoctorEvidence {
+            field: "snapshot_count".into(),
+            value: DoctorEvidenceValue::Uint(snapshot_count as u64),
+            unit: None,
+        }],
+        recommendation: Some(DoctorRecommendation {
+            summary: "Delete named snapshots that are no longer needed.".into(),
+            commands: vec!["decentdb snapshot delete --db <path> --name <snapshot>".into()],
+            safe_to_automate: false,
+        }),
+    }
+}
+
 fn fragmentation_high(page_count: u32, freelist_page_count: u32, pct: f64) -> DoctorFinding {
     DoctorFinding {
         id: "fragmentation.high".into(),
@@ -2401,6 +2428,18 @@ mod tests {
         assert_eq!(f.severity, DoctorSeverity::Info);
     }
 
+    #[test]
+    fn named_snapshots_retained_warns() {
+        let mut data = fresh_collected();
+        data.named_snapshot_count = 2;
+        let findings = evaluate_rules(&data);
+        let f = findings
+            .iter()
+            .find(|f| f.id == "wal.named_snapshots_retained")
+            .expect("named snapshot finding missing");
+        assert_eq!(f.severity, DoctorSeverity::Warning);
+    }
+
     // -- fragmentation.high / fragmentation.moderate --------------------
 
     #[test]
@@ -3037,6 +3076,7 @@ mod tests {
                 triggers: vec![],
             }),
             indexes: vec![],
+            named_snapshot_count: 0,
             physical_bytes: 8192,
         }
     }

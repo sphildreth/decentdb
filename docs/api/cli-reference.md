@@ -29,6 +29,13 @@ Supported options:
 - `--noRows` discard result rows and report only the affected row count
 - `--cachePages=<n>` cache size in 4KB pages
 - `--cacheMb=<n>` cache size in megabytes, overrides `--cachePages`
+- `--as-of=<snapshot-name>` execute read-only SQL against a named snapshot
+- `--as-of-lsn=<lsn>` execute read-only SQL against a retained WAL LSN
+- `--branch=<branch>` execute against a branch
+
+`--as-of` and `--as-of-lsn` are read-only time-travel modes. Mutating SQL,
+transaction control, PRAGMA commands, and `--checkpoint` are rejected in this
+mode.
 
 ### repl
 
@@ -93,6 +100,49 @@ Write a checkpointed snapshot into a new on-disk database file.
 ```bash
 decentdb save-as --db=<path> --output=<dest>
 ```
+
+### snapshot
+
+Manage named time-travel snapshots. A named snapshot records the current durable
+`main` state and keeps the required history retained until the snapshot is
+deleted.
+
+```bash
+decentdb snapshot create --db=<path> --name=<snapshot> [--format=<json|table>]
+decentdb snapshot list --db=<path> [--format=<json|table>]
+decentdb snapshot delete --db=<path> --name=<snapshot> [--format=<json|table>]
+decentdb exec --db=<path> --as-of=<snapshot> --sql="SELECT ..."
+```
+
+Snapshot rows include `name`, `snapshot_lsn`, `created_at_micros`, `branch_id`,
+and `head_id`.
+
+### branch
+
+Manage branch metadata and branch state. Branch creation is metadata-only after
+the source state is checkpointed for durability.
+
+```bash
+decentdb branch create --db=<path> --name=<branch> [--from=<main|branch|snapshot|head>] [--format=<json|table>]
+decentdb branch list --db=<path> [--format=<json|table>]
+decentdb branch commit --db=<path> --name=<branch> --message=<message> [--format=<json|table>]
+decentdb branch log --db=<path> --name=<branch> [--format=<json|table>]
+decentdb branch diff --db=<path> --left=<main|branch|snapshot|head> --right=<main|branch|snapshot|head> [--format=<json|table>]
+decentdb branch restore --db=<path> --name=<branch> --to=<branch|snapshot|head> (--dry-run|--confirm) [--format=<json|table>]
+decentdb branch merge --db=<path> --source=<branch> --target=<main|branch> (--dry-run|--confirm) [--format=<json|table>]
+decentdb branch rename --db=<path> --name=<branch> --new-name=<new-name> [--format=<json|table>]
+decentdb branch delete --db=<path> --name=<branch> [--format=<json|table>]
+decentdb exec --db=<path> --branch=<branch> --sql="SELECT ..."
+decentdb repl --db=<path> --branch=<branch>
+```
+
+Branch rows include `name`, `branch_id`, `current_head_id`, `base_head_id`,
+`created_at_micros`, and `updated_at_micros`.
+
+Branch-local writes are isolated from `main` until an explicit merge. Diff and
+merge operate on primary-key tables; unsupported schema/table cases are reported
+as conflicts instead of being applied implicitly. `restore` currently moves a
+non-`main` branch head to a branch, snapshot, or head target.
 
 ### migrate
 

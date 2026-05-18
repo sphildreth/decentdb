@@ -328,6 +328,34 @@ The higher-level sync command set is documented in
 [Local-first sync](../user-guide/sync/index.md) and
 [CLI Reference](cli-reference.md#sync-commands).
 
+## Branch Workflow JSON Bridge
+
+The C ABI also exposes snapshot, branch, diff, restore, and merge workflows
+through a JSON bridge:
+
+```c
+char *response = NULL;
+check(ddb_db_branch_execute_json(
+          db,
+          "{\"op\":\"branch_create\",\"name\":\"work\",\"from\":\"main\"}",
+          &response),
+      "create branch");
+puts(response);
+check(ddb_string_free(&response), "free branch response");
+```
+
+Supported `op` values are:
+
+- `snapshot_create`, `snapshot_list`, `snapshot_delete`
+- `branch_create`, `branch_list`, `branch_delete`, `branch_rename`
+- `branch_commit`, `branch_log`, `branch_diff`
+- `branch_restore`
+- `branch_merge`
+
+See [Branching, Diff, Restore, And Time Travel](../user-guide/branching.md)
+and [CLI Reference](cli-reference.md#branch) for command semantics and safety
+rules.
+
 ## C++ Usage
 
 C++ code can include `decentdb.h` directly:

@@ -41,6 +41,35 @@ int main(void) {
   }
   check(ddb_result_free(&result), "free select");
 
+  char *json = NULL;
+  check(ddb_db_branch_execute_json(
+            db, "{\"op\":\"snapshot_create\",\"name\":\"c-snapshot\"}", &json),
+        "snapshot_create json");
+  if (strstr(json, "c-snapshot") == NULL) {
+    fprintf(stderr, "snapshot JSON did not mention c-snapshot: %s\n", json);
+    return 1;
+  }
+  check(ddb_string_free(&json), "free snapshot json");
+
+  check(ddb_db_branch_execute_json(
+            db,
+            "{\"op\":\"branch_create\",\"name\":\"work\",\"from\":\"c-snapshot\"}",
+            &json),
+        "branch_create json");
+  if (strstr(json, "work") == NULL) {
+    fprintf(stderr, "branch JSON did not mention work: %s\n", json);
+    return 1;
+  }
+  check(ddb_string_free(&json), "free branch json");
+
+  check(ddb_db_branch_execute_json(db, "{\"op\":\"branch_list\"}", &json),
+        "branch_list json");
+  if (strstr(json, "work") == NULL || strstr(json, "main") == NULL) {
+    fprintf(stderr, "branch list JSON missing expected branches: %s\n", json);
+    return 1;
+  }
+  check(ddb_string_free(&json), "free branch list json");
+
   if (ddb_db_execute(db, "SELECT * FROM nope", NULL, 0, &result) !=
       DDB_ERR_SQL) {
     fprintf(stderr, "expected SQL error for missing table\n");

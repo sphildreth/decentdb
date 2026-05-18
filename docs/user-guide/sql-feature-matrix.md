@@ -46,6 +46,22 @@ SELECT * FROM sys_sync_doctor;
 
 See [Local-first sync](sync/index.md) for the full guide.
 
+## Branch, diff, restore, and time travel
+
+This section compares built-in database workflow surfaces. Other engines can
+approximate many workflows with file copies, backups, transactions, sessions,
+or external tools; DecentDB exposes these as named database operations.
+
+| Feature | DecentDB | SQLite | PostgreSQL | DuckDB |
+|---------|----------|--------|------------|--------|
+| Named retained snapshots | ✅ (`snapshot create/list/delete`) | ⚠️ (backup/session APIs; app-managed names/retention) | ⚠️ (server backups, restore points, PITR; server-managed) | ⚠️ (database/file snapshots; app-managed) |
+| Read-only time-travel query by name | ✅ (`exec --as-of`) | ❌ | ⚠️ (PITR/temporal patterns, not embedded per-DB named snapshots) | ❌ |
+| Branch-local writes | ✅ (`exec --branch`, `repl --branch`) | ❌ | ❌ | ❌ |
+| Branch diff | ✅ (primary-key row diff; JSON/table output) | ❌ | ❌ | ❌ |
+| Guarded branch restore | ✅ (`branch restore --dry-run/--confirm`) | ❌ | ⚠️ (restore/PITR outside a live embedded DB workflow) | ❌ |
+| Constrained branch merge | ✅ (clean primary-key row changes; conflicts stop) | ❌ | ❌ | ❌ |
+| C ABI workflow bridge | ✅ (`ddb_db_branch_execute_json`) | N/A | N/A | N/A |
+
 ## DDL (Data Definition Language)
 
 | Feature | DecentDB | SQLite | PostgreSQL | DuckDB |

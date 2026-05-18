@@ -17,6 +17,7 @@ queries, syncable offline data, and language bindings that feel native.
 |---|---|
 | Durable ACID storage | WAL-based persistence and crash-safe recovery are central design goals. |
 | Local-first sync | Built-in change journals, batch exchange, scoped peer replication, conflict workflows, retention tooling, sync doctor, CLI commands, and a typed .NET sync SDK. |
+| Branch, diff, restore, and time travel | Durable named snapshots, branch-local writes, diff reports, guarded restore, and constrained merge workflows for migration rehearsal and support/debugging. |
 | Practical PostgreSQL-like SQL | Familiar DDL/DML, joins, CTEs, window functions, set operations, upsert, `RETURNING`, savepoints, triggers, generated columns, JSON functions, and rich scalar functions. |
 | Application-friendly types | Native `INT64`, `FLOAT64`, `BOOL`, `TEXT`, `BLOB`, `DECIMAL`, `UUID`, `DATE`, and `TIMESTAMP`. |
 | Indexed substring search | Native trigram indexes accelerate interactive `LIKE '%pattern%'` queries. |
@@ -37,6 +38,9 @@ queries, syncable offline data, and language bindings that feel native.
 - **Triggers** for application-side logic, including supported `AFTER` and
   `INSTEAD OF` trigger paths.
 - **Bulk-load, CSV, and JSON import/export** workflows.
+- **Branch, diff, restore, and time-travel workflows** with named snapshots,
+  branch-local writes, primary-key row diffs, guarded restore, and constrained
+  merge.
 - **In-memory databases** using `:memory:` plus save-as support for snapshots.
 - **Cross-platform release builds** for Linux x86_64/arm64, macOS, and Windows.
 
@@ -145,9 +149,9 @@ authoritative implementation.
   tests, and short-lived relay workflows; it is not a hardened public server.
 - DecentDB does not currently expose a general-purpose loadable SQL extension
   or UDF plugin system.
-- Some roadmap items, including native geospatial types, branch/time-travel
-  workflows, WASM/OPFS, policy-aware SQL, vector search, and full-text ranking,
-  are planned work rather than shipped features.
+- Some roadmap items, including native geospatial types, WASM/OPFS,
+  policy-aware SQL, vector search, and full-text ranking, are planned work
+  rather than shipped features.
 
 ## Releases And Packages
 

@@ -102,6 +102,7 @@ ddb_status_t ddb_db_create(const char *path, ddb_db_t **out_db);
 ddb_status_t ddb_db_open(const char *path, ddb_db_t **out_db);
 ddb_status_t ddb_db_open_or_create(const char *path, ddb_db_t **out_db);
 ddb_status_t ddb_db_sync_execute_json(ddb_db_t *db, const char *request_json, char **out_json);
+ddb_status_t ddb_db_branch_execute_json(ddb_db_t *db, const char *request_json, char **out_json);
 
 /*
  * Frees a database handle returned by ddb_db_create, ddb_db_open, or ddb_db_open_or_create.
