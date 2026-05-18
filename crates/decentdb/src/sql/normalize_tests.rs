@@ -64,4 +64,40 @@ mod tests {
             other => panic!("unexpected: {:?}", other),
         }
     }
+
+    #[test]
+    fn spatial_type_modifiers_parse_and_validate() {
+        let stmt = normalize_statement_text(
+            "CREATE TABLE places(
+                geog GEOGRAPHY(POINT,4326),
+                geom GEOMETRY(POLYGON,3857)
+            )",
+        )
+        .expect("parsed");
+        let Statement::CreateTable(table) = stmt else {
+            panic!("unexpected statement");
+        };
+        assert_eq!(
+            table.columns[0].column_type,
+            crate::catalog::ColumnType::Geography
+        );
+        assert_eq!(
+            table.columns[0]
+                .spatial_type
+                .expect("geography typmod")
+                .srid,
+            4326
+        );
+        assert_eq!(
+            table.columns[1].column_type,
+            crate::catalog::ColumnType::Geometry
+        );
+        assert_eq!(
+            table.columns[1].spatial_type.expect("geometry typmod").srid,
+            3857
+        );
+
+        assert!(normalize_statement_text("CREATE TABLE t(g GEOGRAPHY(POINT,3857))").is_err());
+        assert!(normalize_statement_text("CREATE TABLE t(g GEOGRAPHY(LINESTRING,4326))").is_err());
+    }
 }

@@ -121,6 +121,10 @@ type Decimal struct {
 	Scale    int
 }
 
+type GeometryWKB []byte
+
+type GeographyWKB []byte
+
 func (e *DecentDBError) Error() string {
 	return fmt.Sprintf("decentdb error %d: %s", e.Code, e.Message)
 }
@@ -671,6 +675,11 @@ func valueToGo(val C.ddb_value_t) interface{} {
 			return []byte{}
 		}
 		return C.GoBytes(unsafe.Pointer(val.data), C.int(val.len))
+	case C.DDB_VALUE_GEOMETRY, C.DDB_VALUE_GEOGRAPHY:
+		if val.data == nil || val.len == 0 {
+			return []byte{}
+		}
+		return C.GoBytes(unsafe.Pointer(val.data), C.int(val.len))
 	case C.DDB_VALUE_UUID:
 		return C.GoBytes(unsafe.Pointer(&val.uuid_bytes[0]), 16)
 	case C.DDB_VALUE_DECIMAL:
@@ -853,6 +862,24 @@ func (s *stmtStruct) bind(args []driver.NamedValue) error {
 			cs := C.CString(v)
 			status = C.ddb_stmt_bind_text(s.stmt, idx, cs, C.size_t(len(v)))
 			C.free(unsafe.Pointer(cs))
+		case GeometryWKB:
+			if len(v) == 0 {
+				status = C.ddb_stmt_bind_geometry_wkb(s.stmt, idx, nil, 0)
+			} else {
+				var pinner runtime.Pinner
+				pinner.Pin(&v[0])
+				defer pinner.Unpin()
+				status = C.ddb_stmt_bind_geometry_wkb(s.stmt, idx, (*C.uint8_t)(unsafe.Pointer(&v[0])), C.size_t(len(v)))
+			}
+		case GeographyWKB:
+			if len(v) == 0 {
+				status = C.ddb_stmt_bind_geography_wkb(s.stmt, idx, nil, 0)
+			} else {
+				var pinner runtime.Pinner
+				pinner.Pin(&v[0])
+				defer pinner.Unpin()
+				status = C.ddb_stmt_bind_geography_wkb(s.stmt, idx, (*C.uint8_t)(unsafe.Pointer(&v[0])), C.size_t(len(v)))
+			}
 		case []byte:
 			if len(v) == 0 {
 				status = C.ddb_stmt_bind_blob(s.stmt, idx, nil, 0)
@@ -1106,6 +1133,12 @@ func (r *rows) Next(dest []driver.Value) error {
 			}
 			dest[i] = C.GoStringN((*C.char)(unsafe.Pointer(v.data)), C.int(v.len))
 		case C.DDB_VALUE_BLOB:
+			if v.len == 0 || v.data == nil {
+				dest[i] = []byte{}
+				continue
+			}
+			dest[i] = C.GoBytes(unsafe.Pointer(v.data), C.int(v.len))
+		case C.DDB_VALUE_GEOMETRY, C.DDB_VALUE_GEOGRAPHY:
 			if v.len == 0 || v.data == nil {
 				dest[i] = []byte{}
 				continue

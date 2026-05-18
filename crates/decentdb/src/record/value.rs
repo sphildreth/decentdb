@@ -15,6 +15,8 @@ pub enum Value {
     Decimal { scaled: i64, scale: u8 },
     Uuid([u8; 16]),
     TimestampMicros(i64),
+    Geometry(Vec<u8>),
+    Geography(Vec<u8>),
 }
 
 impl Value {
@@ -39,7 +41,7 @@ impl Value {
             | Value::Uuid(_)
             | Value::TimestampMicros(_) => 0,
             Value::Text(s) => s.capacity(),
-            Value::Blob(b) => b.capacity(),
+            Value::Blob(b) | Value::Geometry(b) | Value::Geography(b) => b.capacity(),
         }
     }
 }

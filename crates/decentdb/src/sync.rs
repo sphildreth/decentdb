@@ -789,6 +789,9 @@ fn validate_sync_scope_filter_expr_inner(
             BinaryOp::JsonExtract | BinaryOp::JsonExtractText => Err(DbError::sql(
                 "JSON path operators are not supported in sync row filters",
             )),
+            BinaryOp::Distance => Err(DbError::sql(
+                "spatial distance operators are not supported in sync row filters",
+            )),
             BinaryOp::IsDistinctFrom | BinaryOp::IsNotDistinctFrom => Err(DbError::sql(
                 "IS DISTINCT FROM is not supported in sync row filters",
             )),
@@ -960,6 +963,9 @@ fn sync_scope_filter_disallowed_operand(expr: &Expr) -> Option<DbError> {
             )),
             BinaryOp::JsonExtract | BinaryOp::JsonExtractText => Some(DbError::sql(
                 "JSON path operators are not supported in sync row filters",
+            )),
+            BinaryOp::Distance => Some(DbError::sql(
+                "spatial distance operators are not supported in sync row filters",
             )),
             BinaryOp::IsDistinctFrom | BinaryOp::IsNotDistinctFrom => Some(DbError::sql(
                 "IS DISTINCT FROM is not supported in sync row filters",
@@ -1299,7 +1305,7 @@ fn value_to_json(val: &Value) -> serde_json::Value {
             .unwrap_or(serde_json::Value::Null),
         Value::Bool(b) => serde_json::Value::Bool(*b),
         Value::Text(s) => serde_json::Value::String(s.clone()),
-        Value::Blob(b) => {
+        Value::Blob(b) | Value::Geometry(b) | Value::Geography(b) => {
             let hex: String = b.iter().map(|byte| format!("{byte:02x}")).collect();
             serde_json::Value::String(hex)
         }

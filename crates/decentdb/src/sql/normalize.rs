@@ -3,7 +3,7 @@
 use libpg_query_sys::protobuf;
 use libpg_query_sys::protobuf::node::Node as NodeEnum;
 
-use crate::catalog::ColumnType;
+use crate::catalog::{ColumnType, SpatialDimensions, SpatialSubtype, SpatialTypeInfo};
 use crate::error::{DbError, Result};
 use crate::record::value::Value;
 
@@ -643,14 +643,16 @@ fn normalize_column_definition(
         }
     }
 
+    let (column_type, spatial_type) = normalize_type_name_with_spatial(
+        column
+            .type_name
+            .as_ref()
+            .ok_or_else(|| unsupported("column definition is missing a type"))?,
+    )?;
     Ok(ColumnDefinition {
         name: column.colname.clone(),
-        column_type: normalize_type_name(
-            column
-                .type_name
-                .as_ref()
-                .ok_or_else(|| unsupported("column definition is missing a type"))?,
-        )?,
+        column_type,
+        spatial_type,
         nullable: !not_null && !primary_key,
         default,
         generated,
@@ -1589,6 +1591,7 @@ fn normalize_aexpr(expr: &protobuf::AExpr) -> Result<Expr> {
                     (_, "||") => BinaryOp::Concat,
                     (_, "->") => BinaryOp::JsonExtract,
                     (_, "->>") => BinaryOp::JsonExtractText,
+                    (_, "<->") => BinaryOp::Distance,
                     _ => return Err(unsupported(format!("operator {operator} is not supported"))),
                 },
                 right: Box::new(normalize_expr_node(expr.rexpr.as_deref().ok_or_else(
@@ -2197,27 +2200,186 @@ fn normalize_range_var(range: &protobuf::RangeVar) -> Result<String> {
 }
 
 fn normalize_type_name(type_name: &protobuf::TypeName) -> Result<ColumnType> {
+    normalize_type_name_with_spatial(type_name).map(|(column_type, _)| column_type)
+}
+
+fn normalize_type_name_with_spatial(
+    type_name: &protobuf::TypeName,
+) -> Result<(ColumnType, Option<SpatialTypeInfo>)> {
     let raw = normalize_qualified_name(&type_name.names)?.to_ascii_lowercase();
     match raw.as_str() {
         "int" | "int8" | "integer" | "bigint" | "int64" | "smallint" | "pg_catalog.int2"
-        | "pg_catalog.int4" | "pg_catalog.int8" => Ok(ColumnType::Int64),
+        | "pg_catalog.int4" | "pg_catalog.int8" => Ok((ColumnType::Int64, None)),
         "real" | "double precision" | "float4" | "float8" | "float64" | "pg_catalog.float4"
-        | "pg_catalog.float8" => Ok(ColumnType::Float64),
+        | "pg_catalog.float8" => Ok((ColumnType::Float64, None)),
         "text" | "varchar" | "character varying" | "char" | "character" | "pg_catalog.text"
-        | "pg_catalog.varchar" | "pg_catalog.bpchar" => Ok(ColumnType::Text),
-        "bool" | "boolean" | "pg_catalog.bool" => Ok(ColumnType::Bool),
-        "bytea" | "blob" | "pg_catalog.bytea" => Ok(ColumnType::Blob),
-        "decimal" | "numeric" | "pg_catalog.numeric" => Ok(ColumnType::Decimal),
-        "uuid" | "pg_catalog.uuid" => Ok(ColumnType::Uuid),
+        | "pg_catalog.varchar" | "pg_catalog.bpchar" => Ok((ColumnType::Text, None)),
+        "bool" | "boolean" | "pg_catalog.bool" => Ok((ColumnType::Bool, None)),
+        "bytea" | "blob" | "pg_catalog.bytea" => Ok((ColumnType::Blob, None)),
+        "decimal" | "numeric" | "pg_catalog.numeric" => Ok((ColumnType::Decimal, None)),
+        "uuid" | "pg_catalog.uuid" => Ok((ColumnType::Uuid, None)),
         "timestamp"
         | "timestamp without time zone"
         | "timestamp with time zone"
         | "pg_catalog.timestamp"
         | "pg_catalog.timestamptz"
         | "datetime"
-        | "date" => Ok(ColumnType::Timestamp),
+        | "date" => Ok((ColumnType::Timestamp, None)),
+        "geometry" | "pg_catalog.geometry" => Ok((
+            ColumnType::Geometry,
+            Some(normalize_spatial_type_modifier(
+                ColumnType::Geometry,
+                &type_name.typmods,
+            )?),
+        )),
+        "geography" | "pg_catalog.geography" => Ok((
+            ColumnType::Geography,
+            Some(normalize_spatial_type_modifier(
+                ColumnType::Geography,
+                &type_name.typmods,
+            )?),
+        )),
         _ => Err(unsupported(format!("type {raw} is not supported"))),
     }
+}
+
+fn normalize_spatial_type_modifier(
+    column_type: ColumnType,
+    typmods: &[protobuf::Node],
+) -> Result<SpatialTypeInfo> {
+    let default_srid = if column_type == ColumnType::Geography {
+        4326
+    } else {
+        0
+    };
+    let mut subtype = SpatialSubtype::Any;
+    let mut dimensions = SpatialDimensions::Any;
+    let mut srid = default_srid;
+
+    if let Some(first) = typmods.first() {
+        let token = normalize_spatial_typmod_token(first)?.to_ascii_uppercase();
+        let (parsed_subtype, parsed_dimensions) = parse_spatial_subtype_token(&token)?;
+        subtype = parsed_subtype;
+        dimensions = parsed_dimensions;
+    }
+    if let Some(second) = typmods.get(1) {
+        srid = normalize_spatial_typmod_srid(second)?;
+    }
+    if typmods.len() > 2 {
+        return Err(unsupported(
+            "spatial types accept at most subtype and SRID modifiers",
+        ));
+    }
+
+    if column_type == ColumnType::Geography {
+        if srid != 4326 {
+            return Err(unsupported(
+                "GEOGRAPHY supports only SRID 4326 in DecentDB 1.0",
+            ));
+        }
+        match subtype {
+            SpatialSubtype::Any
+            | SpatialSubtype::Point
+            | SpatialSubtype::Polygon
+            | SpatialSubtype::MultiPolygon => {}
+            SpatialSubtype::LineString
+            | SpatialSubtype::MultiPoint
+            | SpatialSubtype::MultiLineString => {
+                return Err(unsupported(
+                    "GEOGRAPHY supports POINT, POLYGON, and MULTIPOLYGON in DecentDB 1.0",
+                ))
+            }
+        }
+    }
+
+    Ok(SpatialTypeInfo {
+        subtype,
+        dimensions,
+        srid,
+    })
+}
+
+fn normalize_spatial_typmod_token(node: &protobuf::Node) -> Result<String> {
+    match node_kind(node)? {
+        NodeEnum::AConst(value) => match value.val.as_ref() {
+            Some(protobuf::a_const::Val::Sval(value)) => Ok(value.sval.clone()),
+            Some(protobuf::a_const::Val::Ival(value)) => Ok(value.ival.to_string()),
+            _ => Err(unsupported(
+                "spatial subtype modifier must be an identifier",
+            )),
+        },
+        NodeEnum::ColumnRef(column) => {
+            let parts = column
+                .fields
+                .iter()
+                .map(normalize_string_node)
+                .collect::<Result<Vec<_>>>()?;
+            if parts.len() == 1 {
+                Ok(parts[0].clone())
+            } else {
+                Err(unsupported("spatial subtype modifier must be unqualified"))
+            }
+        }
+        NodeEnum::String(value) => Ok(value.sval.clone()),
+        other => Err(unsupported(format!(
+            "spatial subtype modifier {} is not supported",
+            describe_node(other)
+        ))),
+    }
+}
+
+fn normalize_spatial_typmod_srid(node: &protobuf::Node) -> Result<i32> {
+    match node_kind(node)? {
+        NodeEnum::AConst(value) => match value.val.as_ref() {
+            Some(protobuf::a_const::Val::Ival(value)) if value.ival >= 0 => Ok(value.ival),
+            Some(protobuf::a_const::Val::Fval(value)) => {
+                let parsed = value.fval.parse::<i32>().map_err(|_| {
+                    unsupported("spatial SRID modifier must be a non-negative integer")
+                })?;
+                if parsed < 0 {
+                    Err(unsupported(
+                        "spatial SRID modifier must be a non-negative integer",
+                    ))
+                } else {
+                    Ok(parsed)
+                }
+            }
+            _ => Err(unsupported(
+                "spatial SRID modifier must be a non-negative integer",
+            )),
+        },
+        other => Err(unsupported(format!(
+            "spatial SRID modifier {} is not supported",
+            describe_node(other)
+        ))),
+    }
+}
+
+fn parse_spatial_subtype_token(token: &str) -> Result<(SpatialSubtype, SpatialDimensions)> {
+    let (base, dimensions) = if let Some(base) = token.strip_suffix("ZM") {
+        (base, SpatialDimensions::Xyzm)
+    } else if let Some(base) = token.strip_suffix('Z') {
+        (base, SpatialDimensions::Xyz)
+    } else if let Some(base) = token.strip_suffix('M') {
+        (base, SpatialDimensions::Xym)
+    } else {
+        (token, SpatialDimensions::Xy)
+    };
+    let subtype = match base {
+        "POINT" => SpatialSubtype::Point,
+        "LINESTRING" => SpatialSubtype::LineString,
+        "POLYGON" => SpatialSubtype::Polygon,
+        "MULTIPOINT" => SpatialSubtype::MultiPoint,
+        "MULTILINESTRING" => SpatialSubtype::MultiLineString,
+        "MULTIPOLYGON" => SpatialSubtype::MultiPolygon,
+        "ANY" => SpatialSubtype::Any,
+        _ => {
+            return Err(unsupported(format!(
+                "spatial subtype {token} is not supported"
+            )))
+        }
+    };
+    Ok((subtype, dimensions))
 }
 
 fn normalize_string_node(node: &protobuf::Node) -> Result<String> {

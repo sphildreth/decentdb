@@ -25,10 +25,11 @@ pub(crate) fn plan_statement(
 pub(crate) fn plan_query(query: &Query, catalog: &CatalogState) -> Result<PhysicalPlan> {
     let mut plan = plan_query_body(&query.body, catalog)?;
     if !query.order_by.is_empty() {
-        plan = PhysicalPlan::Sort {
-            input: Box::new(plan),
-            order_by: query.order_by.clone(),
-        };
+        plan =
+            maybe_spatial_knn_plan(&plan, query, catalog).unwrap_or_else(|| PhysicalPlan::Sort {
+                input: Box::new(plan),
+                order_by: query.order_by.clone(),
+            });
     }
     if query.limit.is_some() || query.offset.is_some() {
         plan = PhysicalPlan::Limit {
@@ -115,13 +116,93 @@ fn plan_from_item(item: &FromItem, catalog: &CatalogState) -> Result<PhysicalPla
             right,
             kind,
             constraint,
-        } => PhysicalPlan::NestedLoopJoin {
-            left: Box::new(plan_from_item(left, catalog)?),
-            right: Box::new(plan_from_item(right, catalog)?),
-            kind: *kind,
-            constraint: constraint.clone(),
-        },
+        } => {
+            if let Some(plan) = maybe_spatial_join_plan(left, right, *kind, constraint, catalog)? {
+                plan
+            } else {
+                PhysicalPlan::NestedLoopJoin {
+                    left: Box::new(plan_from_item(left, catalog)?),
+                    right: Box::new(plan_from_item(right, catalog)?),
+                    kind: *kind,
+                    constraint: constraint.clone(),
+                }
+            }
+        }
     })
+}
+
+fn maybe_spatial_join_plan(
+    left: &FromItem,
+    right: &FromItem,
+    kind: JoinKind,
+    constraint: &JoinConstraint,
+    catalog: &CatalogState,
+) -> Result<Option<PhysicalPlan>> {
+    if kind != JoinKind::Inner {
+        return Ok(None);
+    }
+    let JoinConstraint::On(on) = constraint else {
+        return Ok(None);
+    };
+    let FromItem::Table {
+        name: left_name,
+        alias: left_alias,
+    } = left
+    else {
+        return Ok(None);
+    };
+    let FromItem::Table {
+        name: right_name,
+        alias: right_alias,
+    } = right
+    else {
+        return Ok(None);
+    };
+    let left_binding = TableBindingRef {
+        name: left_name,
+        alias: left_alias,
+    };
+    let right_binding = TableBindingRef {
+        name: right_name,
+        alias: right_alias,
+    };
+    let Some(predicate) = simple_spatial_join_predicate(on, left_binding, right_binding) else {
+        return Ok(None);
+    };
+    for indexed_ref in [predicate.left, predicate.right] {
+        let table = if matches_table_binding(left_binding, indexed_ref.table) {
+            left_binding
+        } else if matches_table_binding(right_binding, indexed_ref.table) {
+            right_binding
+        } else {
+            continue;
+        };
+        let Some(index) = catalog.indexes.values().find(|index| {
+            identifiers_equal(&index.table_name, table.name)
+                && index.kind == IndexKind::Spatial
+                && index.fresh
+                && index.predicate_sql.is_none()
+                && index.columns.len() == 1
+                && index.columns[0]
+                    .column_name
+                    .as_ref()
+                    .is_some_and(|indexed| identifiers_equal(indexed, indexed_ref.column))
+        }) else {
+            continue;
+        };
+        return Ok(Some(PhysicalPlan::SpatialJoin {
+            table: table.name.to_string(),
+            index: index.name.clone(),
+            predicate: on.clone(),
+            input: Box::new(PhysicalPlan::NestedLoopJoin {
+                left: Box::new(plan_from_item(left, catalog)?),
+                right: Box::new(plan_from_item(right, catalog)?),
+                kind,
+                constraint: constraint.clone(),
+            }),
+        }));
+    }
+    Ok(None)
 }
 
 fn maybe_index_plan(
@@ -133,6 +214,24 @@ fn maybe_index_plan(
         return None;
     };
     let table = catalog.table(name)?;
+    if let Some(column_name) = simple_spatial_indexable_filter(filter) {
+        let index = catalog.indexes.values().find(|index| {
+            identifiers_equal(&index.table_name, &table.name)
+                && index.columns.len() == 1
+                && index.predicate_sql.is_none()
+                && index.columns[0]
+                    .column_name
+                    .as_ref()
+                    .is_some_and(|indexed| identifiers_equal(indexed, column_name))
+                && index.kind == IndexKind::Spatial
+                && index.fresh
+        })?;
+        return Some(PhysicalPlan::SpatialFilter {
+            table: table.name.clone(),
+            index: index.name.clone(),
+            predicate: filter.clone(),
+        });
+    }
     let (column_name, uses_like) = simple_indexable_filter(filter)?;
     let index = catalog.indexes.values().find(|index| {
         identifiers_equal(&index.table_name, &table.name)
@@ -181,6 +280,243 @@ fn should_use_btree_index(table_name: &str, index_name: &str, catalog: &CatalogS
         (i128::from(index_stats.entry_count) + i128::from(index_stats.distinct_key_count) - 1)
             / i128::from(index_stats.distinct_key_count);
     estimated_matches * 4 < i128::from(table_stats.row_count)
+}
+
+fn maybe_spatial_knn_plan(
+    input: &PhysicalPlan,
+    query: &Query,
+    catalog: &CatalogState,
+) -> Option<PhysicalPlan> {
+    let QueryBody::Select(select) = &query.body else {
+        return None;
+    };
+    if select.from.len() != 1 || query.order_by.len() != 1 {
+        return None;
+    }
+    let FromItem::Table { name, .. } = &select.from[0] else {
+        return None;
+    };
+    let table = catalog.table(name)?;
+    let order = &query.order_by[0];
+    if order.descending {
+        return None;
+    }
+    let column_name = simple_spatial_order_column(&order.expr)?;
+    let index = catalog.indexes.values().find(|index| {
+        identifiers_equal(&index.table_name, &table.name)
+            && index.columns.len() == 1
+            && index.predicate_sql.is_none()
+            && index.columns[0]
+                .column_name
+                .as_ref()
+                .is_some_and(|indexed| identifiers_equal(indexed, column_name))
+            && index.kind == IndexKind::Spatial
+            && index.fresh
+    })?;
+    Some(PhysicalPlan::SpatialKnn {
+        table: table.name.clone(),
+        index: index.name.clone(),
+        order: order.expr.clone(),
+        input: Box::new(input.clone()),
+    })
+}
+
+#[derive(Clone, Copy)]
+struct TableBindingRef<'a> {
+    name: &'a str,
+    alias: &'a Option<String>,
+}
+
+impl<'a> TableBindingRef<'a> {
+    fn binding_name(self) -> &'a str {
+        self.alias.as_deref().unwrap_or(self.name)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct QualifiedColumnRef<'a> {
+    table: Option<&'a str>,
+    column: &'a str,
+}
+
+#[derive(Clone, Copy)]
+struct SimpleSpatialJoinPredicate<'a> {
+    left: QualifiedColumnRef<'a>,
+    right: QualifiedColumnRef<'a>,
+}
+
+fn simple_spatial_join_predicate<'a>(
+    expr: &'a Expr,
+    left_binding: TableBindingRef<'a>,
+    right_binding: TableBindingRef<'a>,
+) -> Option<SimpleSpatialJoinPredicate<'a>> {
+    let Expr::Function { name, args } = expr else {
+        return None;
+    };
+    let lower = name.to_ascii_lowercase();
+    let (left, right) = if lower == "st_dwithin" {
+        let [left, right, radius] = args.as_slice() else {
+            return None;
+        };
+        if expr_has_column_ref(radius) {
+            return None;
+        }
+        (left, right)
+    } else if matches!(
+        lower.as_str(),
+        "st_intersects" | "st_contains" | "st_within" | "st_equals"
+    ) {
+        let [left, right] = args.as_slice() else {
+            return None;
+        };
+        (left, right)
+    } else {
+        return None;
+    };
+    let left_ref = qualified_column_ref_expr(left)?;
+    let right_ref = qualified_column_ref_expr(right)?;
+    let left_is_left = matches_table_binding(left_binding, left_ref.table);
+    let left_is_right = matches_table_binding(right_binding, left_ref.table);
+    let right_is_left = matches_table_binding(left_binding, right_ref.table);
+    let right_is_right = matches_table_binding(right_binding, right_ref.table);
+    if (left_is_left && right_is_right) || (left_is_right && right_is_left) {
+        Some(SimpleSpatialJoinPredicate {
+            left: left_ref,
+            right: right_ref,
+        })
+    } else {
+        None
+    }
+}
+
+fn qualified_column_ref_expr(expr: &Expr) -> Option<QualifiedColumnRef<'_>> {
+    let Expr::Column { table, column } = expr else {
+        return None;
+    };
+    Some(QualifiedColumnRef {
+        table: table.as_deref(),
+        column,
+    })
+}
+
+fn matches_table_binding(table: TableBindingRef<'_>, qualifier: Option<&str>) -> bool {
+    qualifier.is_some_and(|qualifier| identifiers_equal(qualifier, table.binding_name()))
+}
+
+fn simple_spatial_order_column(expr: &Expr) -> Option<&str> {
+    let Expr::Binary {
+        left,
+        op: BinaryOp::Distance,
+        right,
+    } = expr
+    else {
+        return None;
+    };
+    match (&**left, &**right) {
+        (Expr::Column { column, .. }, value) if !expr_has_column_ref(value) => {
+            Some(column.as_str())
+        }
+        (value, Expr::Column { column, .. }) if !expr_has_column_ref(value) => {
+            Some(column.as_str())
+        }
+        _ => None,
+    }
+}
+
+fn simple_spatial_indexable_filter(filter: &Expr) -> Option<&str> {
+    match filter {
+        Expr::Function { name, args } if name.eq_ignore_ascii_case("st_dwithin") => {
+            let [left, right, _] = args.as_slice() else {
+                return None;
+            };
+            simple_spatial_column_value_pair(left, right)
+        }
+        Expr::Function { name, args }
+            if name.eq_ignore_ascii_case("st_intersects")
+                || name.eq_ignore_ascii_case("st_contains")
+                || name.eq_ignore_ascii_case("st_within")
+                || name.eq_ignore_ascii_case("st_equals") =>
+        {
+            let [left, right] = args.as_slice() else {
+                return None;
+            };
+            simple_spatial_column_value_pair(left, right)
+        }
+        Expr::Binary {
+            left,
+            op: BinaryOp::And,
+            right,
+        } => {
+            simple_spatial_indexable_filter(left).or_else(|| simple_spatial_indexable_filter(right))
+        }
+        _ => None,
+    }
+}
+
+fn simple_spatial_column_value_pair<'a>(left: &'a Expr, right: &'a Expr) -> Option<&'a str> {
+    match (left, right) {
+        (Expr::Column { column, .. }, value) if !expr_has_column_ref(value) => {
+            Some(column.as_str())
+        }
+        (value, Expr::Column { column, .. }) if !expr_has_column_ref(value) => {
+            Some(column.as_str())
+        }
+        _ => None,
+    }
+}
+
+fn expr_has_column_ref(expr: &Expr) -> bool {
+    match expr {
+        Expr::Column { .. } => true,
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+            expr_has_column_ref(expr)
+        }
+        Expr::Binary { left, right, .. } => expr_has_column_ref(left) || expr_has_column_ref(right),
+        Expr::Between {
+            expr, low, high, ..
+        } => expr_has_column_ref(expr) || expr_has_column_ref(low) || expr_has_column_ref(high),
+        Expr::InList { expr, items, .. } => {
+            expr_has_column_ref(expr) || items.iter().any(expr_has_column_ref)
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            expr_has_column_ref(expr)
+                || expr_has_column_ref(pattern)
+                || escape.as_deref().is_some_and(expr_has_column_ref)
+        }
+        Expr::Function { args, .. } => args.iter().any(expr_has_column_ref),
+        Expr::Aggregate { args, order_by, .. } => {
+            args.iter().any(expr_has_column_ref)
+                || order_by
+                    .iter()
+                    .any(|order| expr_has_column_ref(&order.expr))
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            operand.as_deref().is_some_and(expr_has_column_ref)
+                || branches.iter().any(|(condition, value)| {
+                    expr_has_column_ref(condition) || expr_has_column_ref(value)
+                })
+                || else_expr.as_deref().is_some_and(expr_has_column_ref)
+        }
+        Expr::Row(items) => items.iter().any(expr_has_column_ref),
+        Expr::InSubquery { expr, .. } | Expr::CompareSubquery { expr, .. } => {
+            expr_has_column_ref(expr)
+        }
+        Expr::Literal(_)
+        | Expr::Parameter(_)
+        | Expr::RowNumber { .. }
+        | Expr::WindowFunction { .. }
+        | Expr::ScalarSubquery(_)
+        | Expr::Exists(_) => false,
+    }
 }
 
 fn simple_indexable_filter(filter: &Expr) -> Option<(&str, bool)> {

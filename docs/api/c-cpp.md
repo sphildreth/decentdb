@@ -177,8 +177,10 @@ if (value.tag == DDB_VALUE_TEXT) {
 check(ddb_value_dispose(&value), "dispose value");
 ```
 
-Text and blob values are byte buffers. They are not guaranteed to be
-NUL-terminated; always use the returned length.
+Text, blob, geometry, and geography values are byte buffers. They are not
+guaranteed to be NUL-terminated; always use the returned length. Spatial values
+are returned as normalized EWKB with `DDB_VALUE_GEOMETRY` or
+`DDB_VALUE_GEOGRAPHY` tags.
 
 For read-heavy streaming paths, prefer the statement row-view APIs described
 below to avoid per-cell heap allocation.
@@ -211,9 +213,14 @@ Available typed bind helpers include:
 - `ddb_stmt_bind_bool`
 - `ddb_stmt_bind_text`
 - `ddb_stmt_bind_blob`
+- `ddb_stmt_bind_geometry_wkb`
+- `ddb_stmt_bind_geography_wkb`
 - `ddb_stmt_bind_uuid`
 - `ddb_stmt_bind_decimal`
 - `ddb_stmt_bind_timestamp_micros`
+
+The spatial bind helpers accept WKB/EWKB byte buffers. GEOGRAPHY bindings are
+normalized to SRID 4326 on insert.
 
 Use `ddb_stmt_reset` to clear a statement's result cursor and
 `ddb_stmt_clear_bindings` to remove existing parameter values.

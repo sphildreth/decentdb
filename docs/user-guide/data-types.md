@@ -148,6 +148,35 @@ SELECT EXTRACT(YEAR FROM created_at) FROM events;
 To minimize disk footprint and align with SQLite's size, they use Varint encoding (1 to 9 bytes).
 String literals are parsed on INSERT and converted transparently.
 
+### GEOMETRY
+
+Planar spatial value stored as normalized EWKB. Use `GEOMETRY` for Cartesian coordinates such as projected map coordinates, CAD data, and local coordinate systems.
+
+Optional type modifiers constrain subtype, dimensionality, and SRID:
+
+```sql
+CREATE TABLE parcels (
+    id INTEGER PRIMARY KEY,
+    boundary GEOMETRY(POLYGON,3857),
+    centroid GEOMETRY(POINT,3857)
+);
+```
+
+Supported subtypes are `POINT`, `LINESTRING`, `POLYGON`, `MULTIPOINT`, `MULTILINESTRING`, and `MULTIPOLYGON`. Dimensional suffixes `Z`, `M`, and `ZM` are supported, for example `GEOMETRY(POINTZ,3857)`.
+
+### GEOGRAPHY
+
+WGS84 lon/lat spatial value stored as normalized EWKB with SRID 4326. Use `GEOGRAPHY` for earth-distance queries in meters.
+
+```sql
+CREATE TABLE places (
+    id INTEGER PRIMARY KEY,
+    location GEOGRAPHY(POINT,4326)
+);
+```
+
+Initial GEOGRAPHY support accepts SRID 4326 and the subtypes `POINT`, `POLYGON`, and `MULTIPOLYGON`. Coordinates are validated as longitude in `[-180, 180]` and latitude in `[-90, 90]`.
+
 ### NULL
 
 Represents missing or unknown values.
@@ -181,6 +210,8 @@ All columns can contain NULL unless marked NOT NULL.
 | TIMESTAMP | TIMESTAMP (native datetime) |
 | TIMESTAMPTZ | TIMESTAMP (native datetime) |
 | DATETIME | TIMESTAMP (native datetime) |
+| GEOMETRY | GEOMETRY |
+| GEOGRAPHY | GEOGRAPHY |
 
 ## Type Conversion
 
@@ -205,6 +236,8 @@ SELECT CAST(price AS INT) FROM products;
 | TIMESTAMP | 1 to 9 bytes (Varint) | Never |
 | TEXT | Variable, up to 512 bytes | > 512 bytes |
 | BLOB | Variable, up to 512 bytes | > 512 bytes |
+| GEOMETRY | Variable EWKB | > 512 bytes |
+| GEOGRAPHY | Variable EWKB | > 512 bytes |
 | NULL | 0 payload bytes (1-byte tag)| Never |
 
 ### Compression
@@ -218,4 +251,5 @@ TEXT and BLOB values are automatically compressed with zlib when stored on overf
 3. Use BLOB for binary data, images
 4. Use BOOL for flags and states
 5. Use FLOAT for measurements and prices
+6. Use GEOGRAPHY for lon/lat distances in meters, and GEOMETRY for planar spatial work
 6. Avoid storing large BLOBs if possible (consider file storage with path in DB)

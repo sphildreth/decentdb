@@ -968,6 +968,8 @@ static int col_type_for_tag(uint32_t tag, const ddb_value_view_t *v) {
         case DDB_VALUE_FLOAT64: return 3;
         case DDB_VALUE_TEXT: return 4;
         case DDB_VALUE_BLOB: return 5;
+        case DDB_VALUE_GEOMETRY: return 5;
+        case DDB_VALUE_GEOGRAPHY: return 5;
         case DDB_VALUE_UUID: return 5;
         case DDB_VALUE_DECIMAL: return 12;
         case DDB_VALUE_TIMESTAMP_MICROS: return 17;
@@ -1087,7 +1089,7 @@ Java_com_decentdb_jdbc_DecentDBNative_colBlob(JNIEnv *env, jclass cls, jlong s, 
     if (row_view_at(s, index, &v, NULL) != 0) return NULL;
     const uint8_t *data = NULL;
     size_t len = 0;
-    if (v->tag == DDB_VALUE_BLOB) {
+    if (v->tag == DDB_VALUE_BLOB || v->tag == DDB_VALUE_GEOMETRY || v->tag == DDB_VALUE_GEOGRAPHY) {
         data = v->data;
         len = v->len;
     } else if (v->tag == DDB_VALUE_UUID) {

@@ -370,6 +370,44 @@ SELECT QUOTE_IDENT('table name'), QUOTE_LITERAL('O''Brien');
 SELECT MD5('hello'), SHA256('hello');
 ```
 
+## Spatial functions
+
+Spatial functions operate on native `GEOMETRY` and `GEOGRAPHY` values. Spatial values are stored as normalized EWKB; `GEOGRAPHY` uses SRID 4326 and lon/lat coordinates.
+
+Supported:
+
+- Constructors: `ST_Point`, `ST_MakePoint`, `ST_PointZ`, `ST_PointM`, `ST_PointZM`
+- Geography point constructors: `ST_GeogPoint`, `ST_GeogPointZ`, `ST_GeogPointM`, `ST_GeogPointZM`
+- Import/export: `ST_GeomFromText`, `ST_GeogFromText`, `ST_GeomFromWKB`, `ST_GeogFromWKB`, `ST_GeomFromGeoJSON`, `ST_GeogFromGeoJSON`, `ST_AsText`, `ST_AsBinary`, `ST_AsGeoJSON`
+- Accessors: `ST_SRID`, `ST_SetSRID`, `ST_GeometryType`, `ST_X`, `ST_Y`, `ST_Z`, `ST_M`, `ST_IsValid`
+- Predicates: `ST_DWithin`, `ST_Intersects`, `ST_Contains`, `ST_Within`, `ST_Equals`
+- Measurements: `ST_Distance`, `ST_Length`, `ST_Area`
+- Distance ordering: `<->`
+
+Behavior notes:
+
+- `ST_Distance` returns meters for `GEOGRAPHY` point-to-point distance and planar units for `GEOMETRY`.
+- `ST_DWithin` uses the same units as `ST_Distance`.
+- `ST_Length` and `ST_Area` are planar for `GEOMETRY`; GEOGRAPHY uses spherical approximations.
+- Spatial indexes (`CREATE INDEX ... USING spatial`) are single-column indexes for `GEOMETRY` and `GEOGRAPHY`.
+
+Examples:
+
+```sql
+CREATE TABLE places (id INT PRIMARY KEY, geog GEOGRAPHY(POINT,4326));
+CREATE INDEX idx_places_geog ON places USING spatial(geog);
+
+INSERT INTO places VALUES (1, ST_GeogPoint(-97.7431, 30.2672));
+
+SELECT id
+FROM places
+WHERE ST_DWithin(geog, ST_GeogPoint(-97.7431, 30.2672), 5000);
+
+SELECT ST_AsText(ST_GeomFromText('POINT(1 2)'));
+SELECT ST_Area(ST_GeomFromText('POLYGON((0 0,10 0,10 10,0 10,0 0))'));
+SELECT id FROM places ORDER BY geog <-> ST_GeogPoint(-97.7431, 30.2672) LIMIT 10;
+```
+
 ## Aggregate functions
 
 ### Statistical aggregates

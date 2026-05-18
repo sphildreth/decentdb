@@ -35,7 +35,9 @@ typedef enum ddb_value_tag_t {
   DDB_VALUE_BLOB = 5,
   DDB_VALUE_DECIMAL = 6,
   DDB_VALUE_UUID = 7,
-  DDB_VALUE_TIMESTAMP_MICROS = 8
+  DDB_VALUE_TIMESTAMP_MICROS = 8,
+  DDB_VALUE_GEOMETRY = 9,
+  DDB_VALUE_GEOGRAPHY = 10
 } ddb_value_tag_t;
 
 typedef struct ddb_value_t {
@@ -156,6 +158,16 @@ ddb_status_t ddb_stmt_bind_text(
     const char *value,
     size_t byte_len);
 ddb_status_t ddb_stmt_bind_blob(
+    ddb_stmt_t *stmt,
+    size_t index_1_based,
+    const uint8_t *data,
+    size_t byte_len);
+ddb_status_t ddb_stmt_bind_geometry_wkb(
+    ddb_stmt_t *stmt,
+    size_t index_1_based,
+    const uint8_t *data,
+    size_t byte_len);
+ddb_status_t ddb_stmt_bind_geography_wkb(
     ddb_stmt_t *stmt,
     size_t index_1_based,
     const uint8_t *data,

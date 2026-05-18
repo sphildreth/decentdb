@@ -15,13 +15,14 @@ Status values:
 
 - `TODO`: prioritized roadmap work that is not actively being implemented right now.
 - `IN PROGRESS`: active implementation or design work is underway right now.
+- `SHIPPED`: implemented in the current codebase and documented as an available foundation.
 - `BACKLOG`: valuable, but not part of the near-term implementation path.
 
 Future version values are planning buckets, not release commitments.
 
 | Priority | Future Version | Status | Feature | Current Source Of Truth | Why This Rank |
 |---:|---|---|---|---|---|
-| 1 | vNext | TODO | Native geospatial types and spatial indexes | [`WIN_GEOSPATIAL_DATA_SUPPORT.md`](WIN_GEOSPATIAL_DATA_SUPPORT.md), ADR 0124-0128 | Strong local-first wedge for mobile, field service, logistics, IoT, and offline map workflows |
+| 1 | vNext | SHIPPED | Native geospatial types and spatial indexes | [`WIN_GEOSPATIAL_DATA_SUPPORT.md`](WIN_GEOSPATIAL_DATA_SUPPORT.md), ADR 0124-0128 | Strong local-first wedge for mobile, field service, logistics, IoT, and offline map workflows |
 | 2 | vNext | TODO | Schema-first strongly typed SDK generation | [`WIN_SCHEMA_FIRST_STRONGLY_TYPED_SDK_GENERATION_SPEC.md`](WIN_SCHEMA_FIRST_STRONGLY_TYPED_SDK_GENERATION_SPEC.md), ADR 0116, ADR 0129 | Adoption accelerator across languages; DecentDB metadata foundation exists |
 | 3 | vNext+1 | TODO | WASM and browser OPFS support | [`WIN_WASM_SUPPORT_IMPLEMENTATION.md`](WIN_WASM_SUPPORT_IMPLEMENTATION.md) | Essential enabler for browser local-first apps, especially with sync, typed SDKs, and geospatial data |
 | 4 | vNext+1 | TODO | Policy-aware embedded SQL | Needs ADR/spec | Strong regulated/offline/enterprise story beyond encryption alone |
@@ -63,6 +64,7 @@ than future roadmap claims:
 - Branch, diff, restore, and time-travel workflows: named snapshots, branch-local writes, branch commit/log, primary-key row diff, guarded branch restore, constrained merge, CLI, REPL, Rust API, and C ABI JSON bridge
 - Same-process shared WAL visibility
 - Mature C ABI and multi-language binding surface
+- Native geospatial types and spatial indexes: `GEOMETRY` / `GEOGRAPHY`, normalized EWKB interchange, WKT/WKB/GeoJSON I/O, `ST_*` predicates and measurements, `<->` distance ordering, planner-visible `USING spatial` indexes, and point-in-polygon spatial join acceleration
 - Doctor/advisor v1 CLI, JSON, Markdown, and safe `--fix` surface
 - Paged row storage, deferred table materialization, and WAL/page-cache memory work for larger embedded workloads
 
@@ -91,7 +93,7 @@ The remaining roadmap should support one clear lane:
 
 ## 1. Native Geospatial Types And Spatial Indexes
 
-**Status:** `TODO`
+**Status:** `SHIPPED`
 **Future Version:** vNext
 **Source of truth:** [`WIN_GEOSPATIAL_DATA_SUPPORT.md`](WIN_GEOSPATIAL_DATA_SUPPORT.md), ADR 0124-0128
 

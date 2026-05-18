@@ -65,6 +65,9 @@ pub(crate) fn encode_index_key(value: &Value) -> Result<Vec<u8>> {
             encoded.extend_from_slice(value);
             Ok(encoded)
         }
+        Value::Geometry(_) | Value::Geography(_) => Err(DbError::constraint(
+            "spatial values cannot be encoded as generic BTREE index keys",
+        )),
     }
 }
 
@@ -93,6 +96,11 @@ pub(crate) fn compare_index_values(left: &Value, right: &Value) -> Result<Orderi
         (Value::Uuid(left), Value::Uuid(right)) => Ok(left.cmp(right)),
         (Value::Text(left), Value::Text(right)) => Ok(left.as_bytes().cmp(right.as_bytes())),
         (Value::Blob(left), Value::Blob(right)) => Ok(left.cmp(right)),
+        (Value::Geometry(_), Value::Geometry(_)) | (Value::Geography(_), Value::Geography(_)) => {
+            Err(DbError::constraint(
+                "spatial values cannot use generic index-key comparison",
+            ))
+        }
         _ => Err(DbError::constraint(
             "index-key comparison requires values of the same indexed type",
         )),

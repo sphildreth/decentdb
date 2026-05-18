@@ -17,6 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Native geospatial types and spatial indexes:** added `GEOMETRY` and
+  `GEOGRAPHY` column types with EWKB-backed storage, WKB/WKT/GeoJSON
+  conversion functions, core `ST_*` accessors/predicates/measurements,
+  indexed spatial filters, distance ordering via `<->`, point-in-polygon
+  spatial joins, C ABI bind/read support, and binding updates across Python,
+  Go, .NET, Node.js, Java JNI, and Dart.
 - **Branch, diff, restore, and time-travel workflows:** added named snapshots,
   read-only historical execution, branch metadata, branch-local writes,
   branch commit/log markers, primary-key row diffs, guarded restore,

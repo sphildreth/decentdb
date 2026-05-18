@@ -69,6 +69,7 @@ or external tools; DecentDB exposes these as named database operations.
 | CREATE TABLE | ✅ | ✅ | ✅ | ✅ |
 | DROP TABLE | ✅ | ✅ | ✅ | ✅ |
 | CREATE INDEX | ✅ | ✅ | ✅ | ✅ |
+| Spatial indexes | ✅ (`USING spatial`) | ⚠️ (RTree extension) | ✅ (GiST/SP-GiST via PostGIS) | ✅ (spatial extension) |
 | Covering indexes (`INCLUDE (...)`) | ✅ (BTREE key-column indexes) | ❌ | ✅ | ❌ |
 | DROP INDEX | ✅ | ✅ | ✅ | ✅ |
 | ALTER TABLE ADD COLUMN | ✅ | ✅ | ✅ | ✅ |
@@ -113,6 +114,7 @@ CREATE TABLE order_items (
 -- CREATE INDEX
 CREATE INDEX idx_users_name ON users (name);
 CREATE INDEX idx_orders_user ON orders (user_id) WHERE user_id IS NOT NULL;
+CREATE INDEX idx_places_geog ON places USING spatial(geog);
 
 -- ALTER TABLE
 ALTER TABLE users ADD COLUMN email TEXT;
@@ -532,6 +534,17 @@ FROM orders;
 | json_each() | ✅ | ✅ | ❌ | ❌ (use unnest) |
 | json_tree() | ✅ | ✅ | ❌ | ❌ |
 
+### Spatial Functions
+
+| Function | DecentDB | SQLite | PostgreSQL | DuckDB |
+|----------|----------|--------|------------|--------|
+| GEOMETRY / GEOGRAPHY constructors | ✅ | ⚠️ (extension) | ✅ (PostGIS) | ✅ (spatial extension) |
+| WKT/WKB/GeoJSON import/export | ✅ | ⚠️ (extension) | ✅ (PostGIS) | ✅ (spatial extension) |
+| ST_Distance() / ST_DWithin() | ✅ | ⚠️ (extension) | ✅ (PostGIS) | ✅ (spatial extension) |
+| ST_Intersects()/ST_Contains()/ST_Within()/ST_Equals() | ✅ | ⚠️ (extension) | ✅ (PostGIS) | ✅ (spatial extension) |
+| ST_Length()/ST_Area() | ✅ | ⚠️ (extension) | ✅ (PostGIS) | ✅ (spatial extension) |
+| Distance operator `<->` | ✅ | ❌ | ✅ (PostGIS) | ❌ |
+
 ### Math Examples
 
 ```sql
@@ -619,6 +632,25 @@ SELECT key, value FROM json_each('{"a":1,"b":2}');
 
 -- Table-valued: json_tree (recursive traversal)
 SELECT key, value, type FROM json_tree('{"a":{"b":1},"c":[2,3]}');
+```
+
+### Spatial Examples
+
+```sql
+CREATE TABLE places (id INT PRIMARY KEY, geog GEOGRAPHY(POINT,4326));
+CREATE INDEX idx_places_geog ON places USING spatial(geog);
+INSERT INTO places VALUES (1, ST_GeogPoint(-97.7431, 30.2672));
+
+SELECT id
+FROM places
+WHERE ST_DWithin(geog, ST_GeogPoint(-97.7431, 30.2672), 5000);
+
+SELECT h.id, z.id
+FROM houses h
+JOIN zones z
+  ON ST_Contains(z.boundary, h.location);
+
+SELECT ST_Area(ST_GeomFromText('POLYGON((0 0,10 0,10 10,0 10,0 0))'));
 ```
 
 ## Operators
@@ -771,6 +803,8 @@ PRAGMA cache_size = 1024;
 | DECIMAL/NUMERIC | ✅ | ✅ | ✅ | ✅ |
 | DATE | ✅ (native int64 µs UTC) | ✅ | ✅ | ✅ (native) |
 | TIMESTAMP | ✅ (native int64 µs UTC) | ✅ | ✅ | ✅ (native) |
+| GEOMETRY | ✅ | ⚠️ (extension) | ✅ (PostGIS) | ✅ (spatial extension) |
+| GEOGRAPHY | ✅ (SRID 4326) | ⚠️ (extension) | ✅ (PostGIS) | ⚠️ (via GEOMETRY) |
 
 ### Examples
 
@@ -792,6 +826,10 @@ CREATE TABLE t5 (price DECIMAL(10,2), tax NUMERIC(5,4));
 
 -- UUID
 CREATE TABLE t6 (id UUID PRIMARY KEY DEFAULT GEN_RANDOM_UUID());
+
+-- Spatial
+CREATE TABLE places (id INTEGER PRIMARY KEY, geog GEOGRAPHY(POINT,4326));
+CREATE TABLE parcels (id INTEGER PRIMARY KEY, boundary GEOMETRY(POLYGON,3857));
 
 -- Date and Timestamp (accepted as ISO-format TEXT literals; stored internally as native int64 microseconds in DecentDB)
 CREATE TABLE events (

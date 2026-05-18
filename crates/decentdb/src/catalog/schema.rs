@@ -25,6 +25,8 @@ pub(crate) enum ColumnType {
     Decimal,
     Uuid,
     Timestamp,
+    Geometry,
+    Geography,
 }
 
 impl ColumnType {
@@ -39,8 +41,42 @@ impl ColumnType {
             Self::Decimal => "DECIMAL",
             Self::Uuid => "UUID",
             Self::Timestamp => "TIMESTAMP",
+            Self::Geometry => "GEOMETRY",
+            Self::Geography => "GEOGRAPHY",
         }
     }
+
+    #[must_use]
+    pub(crate) fn is_spatial(self) -> bool {
+        matches!(self, Self::Geometry | Self::Geography)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SpatialDimensions {
+    Any,
+    Xy,
+    Xyz,
+    Xym,
+    Xyzm,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SpatialSubtype {
+    Any,
+    Point,
+    LineString,
+    Polygon,
+    MultiPoint,
+    MultiLineString,
+    MultiPolygon,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SpatialTypeInfo {
+    pub(crate) subtype: SpatialSubtype,
+    pub(crate) dimensions: SpatialDimensions,
+    pub(crate) srid: i32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -71,6 +107,7 @@ pub(crate) struct ForeignKeyConstraint {
 pub(crate) struct ColumnSchema {
     pub(crate) name: String,
     pub(crate) column_type: ColumnType,
+    pub(crate) spatial_type: Option<SpatialTypeInfo>,
     pub(crate) nullable: bool,
     pub(crate) default_sql: Option<String>,
     pub(crate) generated_sql: Option<String>,
@@ -86,6 +123,7 @@ pub(crate) struct ColumnSchema {
 pub(crate) enum IndexKind {
     Btree,
     Trigram,
+    Spatial,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -250,6 +288,8 @@ mod tests {
         assert_eq!(ColumnType::Decimal.as_str(), "DECIMAL");
         assert_eq!(ColumnType::Uuid.as_str(), "UUID");
         assert_eq!(ColumnType::Timestamp.as_str(), "TIMESTAMP");
+        assert_eq!(ColumnType::Geometry.as_str(), "GEOMETRY");
+        assert_eq!(ColumnType::Geography.as_str(), "GEOGRAPHY");
     }
 
     #[test]
@@ -268,6 +308,9 @@ mod tests {
         let kind = IndexKind::Trigram;
         let copied = kind;
         assert_eq!(copied, IndexKind::Trigram);
+        let kind = IndexKind::Spatial;
+        let copied = kind;
+        assert_eq!(copied, IndexKind::Spatial);
     }
 
     #[test]
@@ -398,6 +441,7 @@ mod tests {
         let col = ColumnSchema {
             name: "id".to_string(),
             column_type: ColumnType::Int64,
+            spatial_type: None,
             nullable: false,
             default_sql: None,
             generated_sql: None,

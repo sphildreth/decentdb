@@ -45,7 +45,9 @@ enum {
   DECENTDB_KIND_TEXT = DDB_VALUE_TEXT,
   DECENTDB_KIND_BLOB = DDB_VALUE_BLOB,
   DECENTDB_KIND_DECIMAL = DDB_VALUE_DECIMAL,
-  DECENTDB_KIND_DATETIME = DDB_VALUE_TIMESTAMP_MICROS
+  DECENTDB_KIND_DATETIME = DDB_VALUE_TIMESTAMP_MICROS,
+  DECENTDB_KIND_GEOMETRY = DDB_VALUE_GEOMETRY,
+  DECENTDB_KIND_GEOGRAPHY = DDB_VALUE_GEOGRAPHY
 };
 
 typedef struct {
@@ -1146,6 +1148,8 @@ static napi_value build_row_array(napi_env env, const decentdb_native_api* api, 
           break;
         }
         case DECENTDB_KIND_BLOB:
+        case DECENTDB_KIND_GEOMETRY:
+        case DECENTDB_KIND_GEOGRAPHY:
         case DDB_VALUE_UUID: {
           const uint8_t* b = v->tag == DDB_VALUE_UUID ? v->uuid_bytes : v->data;
           size_t len = v->tag == DDB_VALUE_UUID ? 16u : v->len;
@@ -1716,7 +1720,9 @@ static napi_value js_stmt_step_row_view(napi_env env, napi_callback_info info) {
         NAPI_CALL(env, st);
         break;
       }
-      case DDB_VALUE_BLOB: {
+      case DDB_VALUE_BLOB:
+      case DDB_VALUE_GEOMETRY:
+      case DDB_VALUE_GEOGRAPHY: {
         st = napi_create_buffer_copy(env, v->len, v->data, NULL, &cell);
         NAPI_CALL(env, st);
         break;

@@ -24,6 +24,8 @@ from .native import (
     DDB_VALUE_BOOL,
     DDB_VALUE_DECIMAL,
     DDB_VALUE_FLOAT64,
+    DDB_VALUE_GEOGRAPHY,
+    DDB_VALUE_GEOMETRY,
     DDB_VALUE_INT64,
     DDB_VALUE_NULL,
     DDB_VALUE_TEXT,
@@ -52,6 +54,8 @@ from .native import (
 apilevel = "2.0"
 threadsafety = 1
 paramstyle = "qmark"
+
+_BINARY_BYTES_TAGS = (DDB_VALUE_BLOB, DDB_VALUE_GEOMETRY, DDB_VALUE_GEOGRAPHY)
 
 
 class Error(Exception):
@@ -88,6 +92,16 @@ class IntegrityError(DatabaseError):
 
 class DataError(DatabaseError):
     pass
+
+
+class GeometryWKB:
+    def __init__(self, data):
+        self.data = bytes(data)
+
+
+class GeographyWKB:
+    def __init__(self, data):
+        self.data = bytes(data)
 
 
 class NotSupportedError(DatabaseError):
@@ -307,7 +321,7 @@ def _decode_ffi_value(lib, value):
         if not value.data or value.len == 0:
             return ""
         return ctypes.string_at(value.data, value.len).decode("utf-8")
-    if tag == DDB_VALUE_BLOB:
+    if tag in _BINARY_BYTES_TAGS:
         if not value.data or value.len == 0:
             return b""
         return bytes(ctypes.string_at(value.data, value.len))
@@ -731,6 +745,30 @@ class Cursor:
             code = self._lib.ddb_stmt_bind_text(
                 self._stmt, index_1_based, raw, len(raw)
             )
+        elif isinstance(param, GeometryWKB):
+            raw = param.data
+            if raw:
+                array_type = ctypes.c_uint8 * len(raw)
+                payload = array_type.from_buffer_copy(raw)
+                code = self._lib.ddb_stmt_bind_geometry_wkb(
+                    self._stmt, index_1_based, payload, len(raw)
+                )
+            else:
+                code = self._lib.ddb_stmt_bind_geometry_wkb(
+                    self._stmt, index_1_based, None, 0
+                )
+        elif isinstance(param, GeographyWKB):
+            raw = param.data
+            if raw:
+                array_type = ctypes.c_uint8 * len(raw)
+                payload = array_type.from_buffer_copy(raw)
+                code = self._lib.ddb_stmt_bind_geography_wkb(
+                    self._stmt, index_1_based, payload, len(raw)
+                )
+            else:
+                code = self._lib.ddb_stmt_bind_geography_wkb(
+                    self._stmt, index_1_based, None, 0
+                )
         elif isinstance(param, (bytes, bytearray, memoryview)):
             raw = bytes(param)
             if raw:
@@ -2264,7 +2302,7 @@ class Cursor:
         ddb_value_dispose = self._lib.ddb_value_dispose
         byref = ctypes.byref
         text_tag = DDB_VALUE_TEXT
-        blob_tag = DDB_VALUE_BLOB
+        binary_tags = _BINARY_BYTES_TAGS
         try:
             for column_index in range(self._col_count):
                 if needs_dispose:
@@ -2292,7 +2330,7 @@ class Cursor:
                     else:
                         append_row(string_at(value.data, value.len).decode("utf-8"))
                     needs_dispose = True
-                elif tag == blob_tag:
+                elif tag in binary_tags:
                     if not value.data or value.len == 0:
                         append_row(b"")
                     else:
@@ -2438,7 +2476,7 @@ class Cursor:
                     append_row("")
                 else:
                     append_row(string_at(value.data, value.len).decode("utf-8"))
-            elif tag == DDB_VALUE_BLOB:
+            elif tag in _BINARY_BYTES_TAGS:
                 if not value.data or value.len == 0:
                     append_row(b"")
                 else:
@@ -2550,7 +2588,7 @@ class Cursor:
                                 append_row(
                                     string_at(value.data, value.len).decode("utf-8")
                                 )
-                        elif tag == DDB_VALUE_BLOB:
+                        elif tag in _BINARY_BYTES_TAGS:
                             if not value.data or value.len == 0:
                                 append_row(b"")
                             else:
@@ -2627,7 +2665,7 @@ class Cursor:
                                 append_row(
                                     string_at(value.data, value.len).decode("utf-8")
                                 )
-                        elif tag == DDB_VALUE_BLOB:
+                        elif tag in _BINARY_BYTES_TAGS:
                             if not value.data or value.len == 0:
                                 append_row(b"")
                             else:
@@ -2704,7 +2742,7 @@ class Cursor:
                                 append_row(
                                     string_at(value.data, value.len).decode("utf-8")
                                 )
-                        elif tag == DDB_VALUE_BLOB:
+                        elif tag in _BINARY_BYTES_TAGS:
                             if not value.data or value.len == 0:
                                 append_row(b"")
                             else:
@@ -2762,7 +2800,7 @@ class Cursor:
                             append_row("")
                         else:
                             append_row(string_at(value.data, value.len).decode("utf-8"))
-                    elif tag == DDB_VALUE_BLOB:
+                    elif tag in _BINARY_BYTES_TAGS:
                         if not value.data or value.len == 0:
                             append_row(b"")
                         else:
@@ -2814,7 +2852,7 @@ class Cursor:
                         append_rows(("",))
                     else:
                         append_rows((string_at(value.data, value.len).decode("utf-8"),))
-                elif tag == DDB_VALUE_BLOB:
+                elif tag in _BINARY_BYTES_TAGS:
                     if not value.data or value.len == 0:
                         append_rows((b"",))
                     else:
@@ -2887,7 +2925,7 @@ class Cursor:
                         append_row("")
                     else:
                         append_row(string_at(value.data, value.len).decode("utf-8"))
-                elif tag == DDB_VALUE_BLOB:
+                elif tag in _BINARY_BYTES_TAGS:
                     if not value.data or value.len == 0:
                         append_row(b"")
                     else:

@@ -1,6 +1,6 @@
 //! Strongly typed internal AST for the supported DecentDB 1.0 SQL subset.
 
-use crate::catalog::ColumnType;
+use crate::catalog::{ColumnType, SpatialTypeInfo};
 use crate::record::value::Value;
 use std::collections::BTreeSet;
 
@@ -311,6 +311,7 @@ pub(crate) enum BinaryOp {
     Concat,
     JsonExtract,
     JsonExtractText,
+    Distance,
     IsDistinctFrom,
     IsNotDistinctFrom,
 }
@@ -399,6 +400,7 @@ pub(crate) struct CreateTableAsStatement {
 pub(crate) struct ColumnDefinition {
     pub(crate) name: String,
     pub(crate) column_type: ColumnType,
+    pub(crate) spatial_type: Option<SpatialTypeInfo>,
     pub(crate) nullable: bool,
     pub(crate) default: Option<Expr>,
     pub(crate) generated: Option<Expr>,
@@ -869,6 +871,7 @@ impl Expr {
                     BinaryOp::Concat => "||",
                     BinaryOp::JsonExtract => "->",
                     BinaryOp::JsonExtractText => "->>",
+                    BinaryOp::Distance => "<->",
                     BinaryOp::IsDistinctFrom => "IS DISTINCT FROM",
                     BinaryOp::IsNotDistinctFrom => "IS NOT DISTINCT FROM",
                 },
@@ -939,6 +942,7 @@ impl Expr {
                     BinaryOp::Concat => "||",
                     BinaryOp::JsonExtract => "->",
                     BinaryOp::JsonExtractText => "->>",
+                    BinaryOp::Distance => "<->",
                     BinaryOp::IsDistinctFrom => "IS DISTINCT FROM",
                     BinaryOp::IsNotDistinctFrom => "IS NOT DISTINCT FROM",
                 },
@@ -1172,7 +1176,7 @@ fn literal_to_sql(value: &Value) -> String {
             }
         }
         Value::Text(value) => format!("'{}'", value.replace('\'', "''")),
-        Value::Blob(bytes) => {
+        Value::Blob(bytes) | Value::Geometry(bytes) | Value::Geography(bytes) => {
             let hex = bytes
                 .iter()
                 .map(|byte| format!("{byte:02x}"))

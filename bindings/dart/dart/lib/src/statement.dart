@@ -187,7 +187,8 @@ class Statement {
   /// Column names do not change between resets within the same prepared
   /// statement, so this method short-circuits on subsequent calls (D7).
   void _loadColumnMetadata() {
-    if (_columnMetadataLoaded) return; // D7: only load once per statement lifetime
+    if (_columnMetadataLoaded)
+      return; // D7: only load once per statement lifetime
     final countPtr = calloc<IntPtr>();
     try {
       final status = _bindings.stmtColumnCount(_stmtPtr!, countPtr);
@@ -371,8 +372,7 @@ class Statement {
     _checkNotDisposed();
     _invalidateExecution();
     if (bytes.length != 16) {
-      throw ArgumentError(
-          'UUID bytes must be exactly 16, got ${bytes.length}');
+      throw ArgumentError('UUID bytes must be exactly 16, got ${bytes.length}');
     }
     final data = malloc<Uint8>(16);
     try {
@@ -1031,6 +1031,8 @@ Object? _decodeValueView(DdbValueView value) {
       if (value.data == nullptr || value.len == 0) return '';
       return value.data.cast<Utf8>().toDartString(length: value.len);
     case ddbTagBlob:
+    case ddbTagGeometry:
+    case ddbTagGeography:
       if (value.data == nullptr || value.len == 0) return Uint8List(0);
       return Uint8List.fromList(value.data.asTypedList(value.len));
     case ddbTagDecimal:

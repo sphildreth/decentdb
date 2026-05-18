@@ -4,6 +4,7 @@ use crate::catalog::{identifiers_equal, ColumnSchema, IndexKind, IndexSchema, Ta
 use crate::error::{DbError, Result};
 use crate::record::row::Row;
 use crate::record::value::Value;
+use crate::spatial::types::{CoordinateDimensions, SpatialGeometry, SpatialKind, SpatialValue};
 use crate::sql::ast::ConflictTarget;
 use crate::sql::parser::parse_expression_sql;
 
@@ -103,6 +104,7 @@ impl EngineRuntime {
                     table.name, column.name
                 )));
             }
+            validate_spatial_column_value(&table.name, column, value)?;
             for check in &column.checks {
                 self.assert_check(table, row_for_eval, &check.expression_sql, params)?;
             }
@@ -335,6 +337,151 @@ fn coerce_value(column: &ColumnSchema, value: Value) -> Result<Value> {
     super::cast_value(value, column.column_type)
 }
 
+fn validate_spatial_column_value(
+    table_name: &str,
+    column: &ColumnSchema,
+    value: &Value,
+) -> Result<()> {
+    let Some(spatial_type) = column.spatial_type else {
+        return Ok(());
+    };
+    let (is_geography, bytes) = match (column.column_type, value) {
+        (_, Value::Null) => return Ok(()),
+        (crate::catalog::ColumnType::Geometry, Value::Geometry(bytes)) => (false, bytes),
+        (crate::catalog::ColumnType::Geography, Value::Geography(bytes)) => (true, bytes),
+        _ => {
+            return Err(DbError::constraint(format!(
+                "column {}.{} requires {} values",
+                table_name,
+                column.name,
+                column.column_type.as_str()
+            )))
+        }
+    };
+    let spatial = crate::spatial::ewkb::from_ewkb(bytes)
+        .map_err(|error| DbError::constraint(error.to_string()))?;
+    if is_geography && spatial.srid != 4326 {
+        return Err(DbError::constraint(
+            "GEOGRAPHY supports only SRID 4326 in DecentDB 1.0",
+        ));
+    }
+    if spatial_type.srid >= 0 && u32::try_from(spatial_type.srid).ok() != Some(spatial.srid) {
+        return Err(DbError::constraint(format!(
+            "column {}.{} requires SRID {}",
+            table_name, column.name, spatial_type.srid
+        )));
+    }
+    if let Some(expected_kind) = spatial_subtype_kind(spatial_type.subtype) {
+        if spatial.kind() != expected_kind {
+            return Err(DbError::constraint(format!(
+                "column {}.{} requires {} values",
+                table_name,
+                column.name,
+                column.column_type.as_str()
+            )));
+        }
+    }
+    if let Some(expected_dimensions) = spatial_dimensions(spatial_type.dimensions) {
+        if spatial.dimensions != expected_dimensions {
+            return Err(DbError::constraint(format!(
+                "column {}.{} requires {:?} coordinates",
+                table_name, column.name, spatial_type.dimensions
+            )));
+        }
+    }
+    validate_spatial_coordinates(is_geography, &spatial).map_err(DbError::constraint)
+}
+
+fn spatial_subtype_kind(subtype: crate::catalog::SpatialSubtype) -> Option<SpatialKind> {
+    match subtype {
+        crate::catalog::SpatialSubtype::Any => None,
+        crate::catalog::SpatialSubtype::Point => Some(SpatialKind::Point),
+        crate::catalog::SpatialSubtype::LineString => Some(SpatialKind::LineString),
+        crate::catalog::SpatialSubtype::Polygon => Some(SpatialKind::Polygon),
+        crate::catalog::SpatialSubtype::MultiPoint => Some(SpatialKind::MultiPoint),
+        crate::catalog::SpatialSubtype::MultiLineString => Some(SpatialKind::MultiLineString),
+        crate::catalog::SpatialSubtype::MultiPolygon => Some(SpatialKind::MultiPolygon),
+    }
+}
+
+fn spatial_dimensions(
+    dimensions: crate::catalog::SpatialDimensions,
+) -> Option<CoordinateDimensions> {
+    match dimensions {
+        crate::catalog::SpatialDimensions::Any => None,
+        crate::catalog::SpatialDimensions::Xy => Some(CoordinateDimensions::Xy),
+        crate::catalog::SpatialDimensions::Xyz => Some(CoordinateDimensions::Xyz),
+        crate::catalog::SpatialDimensions::Xym => Some(CoordinateDimensions::Xym),
+        crate::catalog::SpatialDimensions::Xyzm => Some(CoordinateDimensions::Xyzm),
+    }
+}
+
+fn validate_spatial_coordinates(
+    geography: bool,
+    spatial: &SpatialValue,
+) -> std::result::Result<(), String> {
+    for position in spatial.geometry.all_positions() {
+        if !position.x.is_finite()
+            || !position.y.is_finite()
+            || position.z.is_some_and(|z| !z.is_finite())
+            || position.m.is_some_and(|m| !m.is_finite())
+        {
+            return Err("spatial coordinates must be finite".to_string());
+        }
+        if geography
+            && (!(-180.0..=180.0).contains(&position.x) || !(-90.0..=90.0).contains(&position.y))
+        {
+            return Err("GEOGRAPHY coordinates must be lon/lat in valid WGS84 ranges".to_string());
+        }
+    }
+    match &spatial.geometry {
+        SpatialGeometry::Point(_) | SpatialGeometry::MultiPoint(_) => Ok(()),
+        SpatialGeometry::LineString(line) => {
+            if line.len() < 2 {
+                Err("LINESTRING requires at least two points".to_string())
+            } else {
+                Ok(())
+            }
+        }
+        SpatialGeometry::Polygon(polygon) => validate_polygon_coordinates(polygon),
+        SpatialGeometry::MultiLineString(lines) => {
+            for line in lines {
+                if line.len() < 2 {
+                    return Err("MULTILINESTRING members require at least two points".to_string());
+                }
+            }
+            Ok(())
+        }
+        SpatialGeometry::MultiPolygon(polygons) => {
+            for polygon in polygons {
+                validate_polygon_coordinates(polygon)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn validate_polygon_coordinates(
+    polygon: &[Vec<crate::spatial::types::Position>],
+) -> std::result::Result<(), String> {
+    if polygon.is_empty() {
+        return Err("POLYGON requires at least one ring".to_string());
+    }
+    for ring in polygon {
+        if ring.len() < 4 {
+            return Err("POLYGON rings require at least four points".to_string());
+        }
+        if !ring
+            .first()
+            .zip(ring.last())
+            .is_some_and(|(first, last)| first.xy_equals(*last))
+        {
+            return Err("POLYGON rings must be closed".to_string());
+        }
+    }
+    Ok(())
+}
+
 fn unique_indexes_for_table<'a>(
     runtime: &'a EngineRuntime,
     table_name: &str,
@@ -565,6 +712,7 @@ mod tests {
         ColumnSchema {
             name: name.to_string(),
             column_type: crate::catalog::ColumnType::Int64,
+            spatial_type: None,
             nullable,
             default_sql: None,
             generated_sql: None,

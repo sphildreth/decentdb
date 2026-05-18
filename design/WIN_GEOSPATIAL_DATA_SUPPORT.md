@@ -1,6 +1,6 @@
 # DecentDB Geospatial Data Support Implementation SPEC
 **Date:** 2026-03-28  
-**Status:** Proposed  
+**Status:** Implemented  
 **Audience:** Core engine developers, parser/planner/executor maintainers, storage/indexing implementers, C ABI maintainers, binding maintainers, CLI maintainers, documentation authors, coding agents  
 **Related roadmap item:** Native geospatial types and spatial indexes in [`FUTURE_WINS.md`](FUTURE_WINS.md)  
 **Related vision documents:** `design/FUTURE_WINS.md`, `design/PRD.md`, `design/TESTING_STRATEGY.md`, `docs/design/spec.md`

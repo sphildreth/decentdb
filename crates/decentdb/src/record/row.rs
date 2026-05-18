@@ -20,6 +20,8 @@ const TAG_UUID: u8 = 7;
 const TAG_TIMESTAMP: u8 = 8;
 const TAG_TEXT_OVERFLOW: u8 = 9;
 const TAG_BLOB_OVERFLOW: u8 = 10;
+const TAG_GEOMETRY: u8 = 11;
+const TAG_GEOGRAPHY: u8 = 12;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Row {
@@ -174,6 +176,24 @@ impl Row {
                     );
                     output.extend_from_slice(blob);
                 }
+                Value::Geometry(bytes) => {
+                    output.push(TAG_GEOMETRY);
+                    encode_varint_u64_into(
+                        u64::try_from(bytes.len())
+                            .map_err(|_| DbError::constraint("GEOMETRY payload exceeds u64"))?,
+                        output,
+                    );
+                    output.extend_from_slice(bytes);
+                }
+                Value::Geography(bytes) => {
+                    output.push(TAG_GEOGRAPHY);
+                    encode_varint_u64_into(
+                        u64::try_from(bytes.len())
+                            .map_err(|_| DbError::constraint("GEOGRAPHY payload exceeds u64"))?,
+                        output,
+                    );
+                    output.extend_from_slice(bytes);
+                }
                 Value::Decimal { scaled, scale } => {
                     let mut encoded = [0_u8; 10];
                     let len = encode_varint_u64_fixed(zigzag_encode_i64(*scaled), &mut encoded);
@@ -249,6 +269,8 @@ impl Row {
                 },
                 TAG_TEXT => Value::text_from_bytes(payload.to_vec())?,
                 TAG_BLOB => Value::Blob(payload.to_vec()),
+                TAG_GEOMETRY => Value::Geometry(payload.to_vec()),
+                TAG_GEOGRAPHY => Value::Geography(payload.to_vec()),
                 TAG_DECIMAL => {
                     let scale = *payload
                         .first()

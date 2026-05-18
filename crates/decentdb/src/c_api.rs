@@ -25,6 +25,8 @@ pub enum DdbValueTag {
     Decimal = 6,
     Uuid = 7,
     TimestampMicros = 8,
+    Geometry = 9,
+    Geography = 10,
 }
 
 #[repr(C)]
@@ -293,6 +295,14 @@ fn value_from_ffi(value: &DdbValue) -> Result<Value> {
             let bytes = borrowed_bytes(value.data.cast_const(), value.len)?;
             Ok(Value::Blob(bytes.to_vec()))
         }
+        x if x == DdbValueTag::Geometry as u32 => {
+            let bytes = borrowed_bytes(value.data.cast_const(), value.len)?;
+            Ok(Value::Geometry(bytes.to_vec()))
+        }
+        x if x == DdbValueTag::Geography as u32 => {
+            let bytes = borrowed_bytes(value.data.cast_const(), value.len)?;
+            Ok(Value::Geography(bytes.to_vec()))
+        }
         x if x == DdbValueTag::Decimal as u32 => Ok(Value::Decimal {
             scaled: value.decimal_scaled,
             scale: value.decimal_scale,
@@ -321,7 +331,10 @@ fn borrowed_bytes<'a>(data: *const u8, len: usize) -> Result<&'a [u8]> {
 fn fill_ffi_value(out: &mut DdbValue, value: &Value) {
     if matches!(
         out.tag,
-        x if x == DdbValueTag::Text as u32 || x == DdbValueTag::Blob as u32
+        x if x == DdbValueTag::Text as u32
+            || x == DdbValueTag::Blob as u32
+            || x == DdbValueTag::Geometry as u32
+            || x == DdbValueTag::Geography as u32
     ) {
         free_owned_bytes(out.data, out.len);
     }
@@ -347,6 +360,16 @@ fn fill_ffi_value(out: &mut DdbValue, value: &Value) {
         }
         Value::Blob(inner) => {
             out.tag = DdbValueTag::Blob as u32;
+            out.data = owned_bytes(inner.clone());
+            out.len = inner.len();
+        }
+        Value::Geometry(inner) => {
+            out.tag = DdbValueTag::Geometry as u32;
+            out.data = owned_bytes(inner.clone());
+            out.len = inner.len();
+        }
+        Value::Geography(inner) => {
+            out.tag = DdbValueTag::Geography as u32;
             out.data = owned_bytes(inner.clone());
             out.len = inner.len();
         }
@@ -388,6 +411,16 @@ fn fill_ffi_value_view(out: &mut DdbValueView, value: &Value) {
         }
         Value::Blob(inner) => {
             out.tag = DdbValueTag::Blob as u32;
+            out.data = inner.as_ptr();
+            out.len = inner.len();
+        }
+        Value::Geometry(inner) => {
+            out.tag = DdbValueTag::Geometry as u32;
+            out.data = inner.as_ptr();
+            out.len = inner.len();
+        }
+        Value::Geography(inner) => {
+            out.tag = DdbValueTag::Geography as u32;
             out.data = inner.as_ptr();
             out.len = inner.len();
         }
@@ -1523,6 +1556,40 @@ pub extern "C" fn ddb_stmt_bind_blob(
         let stmt = handle_mut(stmt, "stmt")?;
         let slot = ensure_stmt_binding_slot(stmt, index_1_based)?;
         stmt.bindings[slot] = Value::Blob(bytes.to_vec());
+        invalidate_stmt_result(stmt);
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_stmt_bind_geometry_wkb(
+    stmt: *mut StmtHandle,
+    index_1_based: usize,
+    data: *const u8,
+    byte_len: usize,
+) -> u32 {
+    ffi_boundary(|| {
+        let bytes = borrowed_bytes(data, byte_len)?;
+        let stmt = handle_mut(stmt, "stmt")?;
+        let slot = ensure_stmt_binding_slot(stmt, index_1_based)?;
+        stmt.bindings[slot] = Value::Geometry(bytes.to_vec());
+        invalidate_stmt_result(stmt);
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_stmt_bind_geography_wkb(
+    stmt: *mut StmtHandle,
+    index_1_based: usize,
+    data: *const u8,
+    byte_len: usize,
+) -> u32 {
+    ffi_boundary(|| {
+        let bytes = borrowed_bytes(data, byte_len)?;
+        let stmt = handle_mut(stmt, "stmt")?;
+        let slot = ensure_stmt_binding_slot(stmt, index_1_based)?;
+        stmt.bindings[slot] = Value::Geography(bytes.to_vec());
         invalidate_stmt_result(stmt);
         Ok(())
     })
@@ -2923,6 +2990,62 @@ mod tests {
         assert_eq!(ddb_stmt_value_copy(select_stmt, 0, &mut id), DDB_OK);
         assert_eq!(id.int64_value, 1);
         assert_eq!(ddb_value_dispose(&mut id), DDB_OK);
+
+        assert_eq!(ddb_stmt_free(&mut select_stmt), DDB_OK);
+        assert_eq!(ddb_db_free(&mut db), DDB_OK);
+    }
+
+    #[test]
+    fn ffi_stmt_bind_geography_wkb_round_trips_spatial_value() {
+        let mut db = ptr::null_mut();
+        let path = CString::new(":memory:").expect("path");
+        assert_eq!(ddb_db_open_or_create(path.as_ptr(), &mut db), DDB_OK);
+
+        let create =
+            CString::new("CREATE TABLE places (id INT64 PRIMARY KEY, geog GEOGRAPHY(POINT,4326))")
+                .expect("create");
+        let mut result = ptr::null_mut();
+        assert_eq!(
+            ddb_db_execute(db, create.as_ptr(), ptr::null(), 0, &mut result),
+            DDB_OK
+        );
+        assert_eq!(ddb_result_free(&mut result), DDB_OK);
+
+        let insert = CString::new("INSERT INTO places VALUES ($1, $2)").expect("insert");
+        let mut insert_stmt = ptr::null_mut();
+        assert_eq!(
+            ddb_db_prepare(db, insert.as_ptr(), &mut insert_stmt),
+            DDB_OK
+        );
+
+        let mut point_wkb = vec![1_u8];
+        point_wkb.extend_from_slice(&1_u32.to_le_bytes());
+        point_wkb.extend_from_slice(&(-97.7431_f64).to_le_bytes());
+        point_wkb.extend_from_slice(&30.2672_f64.to_le_bytes());
+        assert_eq!(ddb_stmt_bind_int64(insert_stmt, 1, 1), DDB_OK);
+        assert_eq!(
+            ddb_stmt_bind_geography_wkb(insert_stmt, 2, point_wkb.as_ptr(), point_wkb.len()),
+            DDB_OK
+        );
+        let mut has_row = 1;
+        assert_eq!(ddb_stmt_step(insert_stmt, &mut has_row), DDB_OK);
+        assert_eq!(has_row, 0);
+        assert_eq!(ddb_stmt_free(&mut insert_stmt), DDB_OK);
+
+        let select = CString::new("SELECT geog FROM places WHERE id = 1").expect("select");
+        let mut select_stmt = ptr::null_mut();
+        assert_eq!(
+            ddb_db_prepare(db, select.as_ptr(), &mut select_stmt),
+            DDB_OK
+        );
+        assert_eq!(ddb_stmt_step(select_stmt, &mut has_row), DDB_OK);
+        assert_eq!(has_row, 1);
+
+        let mut geog = DdbValue::default();
+        assert_eq!(ddb_stmt_value_copy(select_stmt, 0, &mut geog), DDB_OK);
+        assert_eq!(geog.tag, DdbValueTag::Geography as u32);
+        assert!(geog.len > point_wkb.len());
+        assert_eq!(ddb_value_dispose(&mut geog), DDB_OK);
 
         assert_eq!(ddb_stmt_free(&mut select_stmt), DDB_OK);
         assert_eq!(ddb_db_free(&mut db), DDB_OK);

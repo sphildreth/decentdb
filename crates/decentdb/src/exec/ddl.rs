@@ -312,6 +312,7 @@ impl EngineRuntime {
         let kind = match access_method.as_str() {
             "btree" => IndexKind::Btree,
             "gin" | "trigram" => IndexKind::Trigram,
+            "spatial" => IndexKind::Spatial,
             other => {
                 return Err(DbError::sql(format!(
                     "unsupported index access method {other}"
@@ -338,6 +339,42 @@ impl EngineRuntime {
             if !statement.include_columns.is_empty() {
                 return Err(DbError::sql(
                     "trigram indexes do not support INCLUDE columns",
+                ));
+            }
+        }
+        if kind == IndexKind::Spatial {
+            if statement.unique {
+                return Err(DbError::sql("spatial indexes cannot be UNIQUE"));
+            }
+            if statement.columns.len() != 1 || has_expression {
+                return Err(DbError::sql(
+                    "spatial indexes require a single plain spatial column",
+                ));
+            }
+            if statement.predicate.is_some() {
+                return Err(DbError::sql("partial spatial indexes are not supported"));
+            }
+            if !statement.include_columns.is_empty() {
+                return Err(DbError::sql(
+                    "spatial indexes do not support INCLUDE columns",
+                ));
+            }
+            let IndexExpression::Column(column_name) = &statement.columns[0] else {
+                unreachable!("spatial index expression already rejected");
+            };
+            let column = table
+                .columns
+                .iter()
+                .find(|column| identifiers_equal(&column.name, column_name))
+                .ok_or_else(|| {
+                    DbError::sql(format!(
+                        "index column {} does not exist on {}",
+                        column_name, table.name
+                    ))
+                })?;
+            if !column.column_type.is_spatial() {
+                return Err(DbError::sql(
+                    "spatial indexes require GEOMETRY or GEOGRAPHY columns",
                 ));
             }
         }
@@ -1337,6 +1374,7 @@ fn column_schema_from_definition(definition: &ColumnDefinition) -> Result<Column
     Ok(ColumnSchema {
         name: definition.name.clone(),
         column_type: definition.column_type,
+        spatial_type: definition.spatial_type,
         nullable: definition.nullable && !definition.primary_key,
         default_sql: definition
             .generated

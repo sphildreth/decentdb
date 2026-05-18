@@ -39,8 +39,8 @@ use crate::btree::read::find_exact as btree_find_exact;
 use crate::btree::table::free_table_btree;
 use crate::btree::write::Btree;
 use crate::catalog::{
-    identifiers_equal, CatalogState, ColumnSchema, IndexKind, IndexSchema, IndexStats, SchemaInfo,
-    TableSchema, TableStats, ViewSchema,
+    identifiers_equal, CatalogState, ColumnSchema, ColumnType, IndexKind, IndexSchema, IndexStats,
+    SchemaInfo, TableSchema, TableStats, ViewSchema,
 };
 use crate::error::{DbError, Result};
 use crate::json::{parse_json, parse_json_path, JsonValue};
@@ -55,6 +55,10 @@ use crate::record::overflow::{
 use crate::record::row::Row;
 use crate::record::value::{compare_decimal, parse_decimal_text, Value};
 use crate::search::{TrigramIndex, TrigramQueryResult};
+use crate::spatial::index::{SpatialEnvelope, SpatialIndexBackend, SpatialRuntimeIndex};
+use crate::spatial::types::{
+    CoordinateDimensions, Position, SpatialError, SpatialGeometry, SpatialKind, SpatialValue,
+};
 use crate::sql::ast::{
     BinaryOp, ColumnDefinition, CommonTableExpr, CreateTableAsStatement, CreateTableStatement,
     Expr, FromItem, JoinConstraint, JoinKind, Query, QueryBody, Select, SelectItem, Statement,
@@ -86,6 +90,7 @@ const GENERATED_COLUMNS_SECTION_MAGIC: &[u8; 8] = b"DDBGCM02";
 const INDEX_INCLUDE_COLUMNS_SECTION_MAGIC: &[u8; 8] = b"DDBICL1\0";
 const SCHEMAS_SECTION_MAGIC: &[u8; 8] = b"DDBSCH01";
 const PK_INDEX_ROOTS_SECTION_MAGIC: &[u8; 8] = b"DDBPKR01";
+const SPATIAL_COLUMNS_SECTION_MAGIC: &[u8; 8] = b"DDBSPT01";
 const SIGNED_ROW_ID_BIAS: u64 = 0x8000_0000_0000_0000;
 const DEFERRED_COMPRESSED_LOOKUP_CACHE_LIMIT: usize = 32;
 static RANDOM_STATE: AtomicU64 = AtomicU64::new(0);
@@ -1301,6 +1306,7 @@ impl RuntimeBtreeKeys {
 pub(crate) enum RuntimeIndex {
     Btree { keys: RuntimeBtreeKeys },
     Trigram { index: TrigramIndex },
+    Spatial { index: SpatialRuntimeIndex },
 }
 
 #[derive(Debug)]
@@ -1314,6 +1320,11 @@ pub(super) enum PendingIndexInsert {
         name: String,
         row_id: u64,
         text: String,
+    },
+    Spatial {
+        name: String,
+        row_id: i64,
+        value: SpatialValue,
     },
 }
 
@@ -3344,6 +3355,17 @@ impl EngineRuntime {
                         text,
                     });
                 }
+                IndexKind::Spatial => {
+                    if let Some(value) =
+                        spatial_index_value_for_row(self, &index, &table, &row.values)?
+                    {
+                        updates.push(PendingIndexInsert::Spatial {
+                            name: index.name.clone(),
+                            row_id: row.row_id,
+                            value,
+                        });
+                    }
+                }
             }
         }
 
@@ -3378,6 +3400,25 @@ impl EngineRuntime {
                     Some(_) => {
                         return Err(DbError::internal(format!(
                             "runtime index {name} is not a trigram index"
+                        )))
+                    }
+                    None => {
+                        return Err(DbError::internal(format!(
+                            "runtime index {name} is missing"
+                        )))
+                    }
+                },
+                PendingIndexInsert::Spatial {
+                    name,
+                    row_id,
+                    value,
+                } => match self.index_mut(&name) {
+                    Some(RuntimeIndex::Spatial { index }) => {
+                        index.insert(row_id, value).map_err(spatial_error)?;
+                    }
+                    Some(_) => {
+                        return Err(DbError::internal(format!(
+                            "runtime index {name} is not a SPATIAL index"
                         )))
                     }
                     None => {
@@ -3575,6 +3616,7 @@ impl EngineRuntime {
             .map(|(index, name)| ColumnDefinition {
                 name: name.clone(),
                 column_type: infer_column_type_for_ctas(&source.rows, index),
+                spatial_type: None,
                 nullable: true,
                 default: None,
                 generated: None,
@@ -7575,24 +7617,34 @@ impl EngineRuntime {
             let Some(index) = self.catalog.index(&index_name).cloned() else {
                 continue;
             };
-            if index.kind != IndexKind::Btree {
-                continue;
-            }
-            let Some(RuntimeIndex::Btree { keys }) = self.index(&index.name) else {
-                continue;
+            let (entry_count, distinct_key_count) = match self.index(&index.name) {
+                Some(RuntimeIndex::Btree { keys }) => {
+                    let entry_count = i64::try_from(keys.total_row_id_count()).map_err(|_| {
+                        DbError::sql(format!(
+                            "index {} exceeds ANALYZE entry-count limits",
+                            index.name
+                        ))
+                    })?;
+                    let distinct_key_count =
+                        i64::try_from(keys.distinct_key_count()).map_err(|_| {
+                            DbError::sql(format!(
+                                "index {} exceeds ANALYZE distinct-count limits",
+                                index.name
+                            ))
+                        })?;
+                    (entry_count, distinct_key_count)
+                }
+                Some(RuntimeIndex::Spatial { index: spatial }) => {
+                    let entry_count = i64::try_from(spatial.len()).map_err(|_| {
+                        DbError::sql(format!(
+                            "index {} exceeds ANALYZE entry-count limits",
+                            index.name
+                        ))
+                    })?;
+                    (entry_count, entry_count)
+                }
+                Some(RuntimeIndex::Trigram { .. }) | None => continue,
             };
-            let entry_count = i64::try_from(keys.total_row_id_count()).map_err(|_| {
-                DbError::sql(format!(
-                    "index {} exceeds ANALYZE entry-count limits",
-                    index.name
-                ))
-            })?;
-            let distinct_key_count = i64::try_from(keys.distinct_key_count()).map_err(|_| {
-                DbError::sql(format!(
-                    "index {} exceeds ANALYZE distinct-count limits",
-                    index.name
-                ))
-            })?;
             self.catalog_mut().index_stats.insert(
                 index.name.clone(),
                 IndexStats {
@@ -10556,6 +10608,8 @@ impl EngineRuntime {
         let mut dataset = if !has_lateral {
             if let Some(dataset) = self.try_indexed_scan(select, params, ctes)? {
                 dataset
+            } else if let Some(dataset) = self.try_spatial_join(select, params, ctes)? {
+                dataset
             } else if let Some(dataset) = self.try_indexed_join(select, params, ctes)? {
                 dataset
             } else if let Some(dataset) =
@@ -10686,6 +10740,70 @@ impl EngineRuntime {
         }
         let row_source = self.table_row_source(name);
 
+        if let Some(spatial_lookup) = simple_spatial_lookup(filter) {
+            if !matches_filter_binding(name, alias, spatial_lookup.table_qualifier) {
+                return Ok(None);
+            }
+            if let Some(index) = self.catalog.indexes.values().find(|index| {
+                identifiers_equal(&index.table_name, name)
+                    && index.fresh
+                    && index.kind == IndexKind::Spatial
+                    && index.predicate_sql.is_none()
+                    && index.columns.len() == 1
+                    && index.columns[0]
+                        .column_name
+                        .as_deref()
+                        .is_some_and(|index_column| {
+                            identifiers_equal(index_column, spatial_lookup.column_name)
+                        })
+                    && index.columns[0].expression_sql.is_none()
+            }) {
+                let query_value = self.eval_expr(
+                    spatial_lookup.value_expr,
+                    &Dataset::empty(),
+                    &[],
+                    params,
+                    ctes,
+                    None,
+                )?;
+                let Some((query_is_geography, query_spatial)) =
+                    spatial_value_from_db(&query_value)?
+                else {
+                    return Ok(None);
+                };
+                let Some(RuntimeIndex::Spatial { index: spatial }) = self.index(&index.name) else {
+                    return Ok(None);
+                };
+                match (spatial.backend(), query_is_geography) {
+                    (SpatialIndexBackend::GeographyS2, true)
+                    | (SpatialIndexBackend::GeometryQuadCell, false) => {}
+                    _ => return Ok(None),
+                }
+                let mut envelope =
+                    SpatialEnvelope::from_value(&query_spatial).map_err(spatial_error)?;
+                if let Some(radius_expr) = spatial_lookup.radius_expr {
+                    let radius_value =
+                        self.eval_expr(radius_expr, &Dataset::empty(), &[], params, ctes, None)?;
+                    let radius = numeric_value_as_f64("ST_DWithin", "third", &radius_value)?;
+                    envelope = match spatial.backend() {
+                        SpatialIndexBackend::GeographyS2 => {
+                            envelope.expand_geography_meters(radius)
+                        }
+                        SpatialIndexBackend::GeometryQuadCell => envelope.expand_planar(radius),
+                    };
+                }
+                let row_ids = spatial.candidate_row_ids(envelope);
+                return self
+                    .dataset_from_row_id_set(
+                        table,
+                        row_source,
+                        alias,
+                        RuntimeRowIdSet::Many(&row_ids),
+                    )
+                    .map(Some);
+            }
+        }
+
         if let Some((table_qualifier, column_name, value_expr)) = simple_btree_lookup(filter) {
             if !matches_filter_binding(name, alias, table_qualifier) {
                 return Ok(None);
@@ -10814,6 +10932,243 @@ impl EngineRuntime {
             result_rows.push(values);
         }
         Ok(Dataset::with_rows(columns, result_rows))
+    }
+
+    fn try_spatial_join(
+        &self,
+        select: &Select,
+        params: &[Value],
+        ctes: &BTreeMap<String, Dataset>,
+    ) -> Result<Option<Dataset>> {
+        if select.from.len() != 1 {
+            return Ok(None);
+        }
+        let FromItem::Join {
+            left,
+            right,
+            kind: JoinKind::Inner,
+            constraint,
+        } = &select.from[0]
+        else {
+            return Ok(None);
+        };
+        let JoinConstraint::On(on) = constraint else {
+            return Ok(None);
+        };
+        let (left_name, left_alias) = match &**left {
+            FromItem::Table { name, alias } => (name, alias),
+            _ => return Ok(None),
+        };
+        let (right_name, right_alias) = match &**right {
+            FromItem::Table { name, alias } => (name, alias),
+            _ => return Ok(None),
+        };
+        if ctes.contains_key(left_name)
+            || ctes.contains_key(right_name)
+            || self
+                .visible_view(left_name, NameResolutionScope::Session)
+                .is_some()
+            || self
+                .visible_view(right_name, NameResolutionScope::Session)
+                .is_some()
+            || self.visible_table_is_temporary(left_name)
+            || self.visible_table_is_temporary(right_name)
+        {
+            return Ok(None);
+        }
+
+        let left_binding = TableBindingRef {
+            name: left_name,
+            alias: left_alias,
+        };
+        let right_binding = TableBindingRef {
+            name: right_name,
+            alias: right_alias,
+        };
+        let Some(join_predicate) = simple_spatial_join_predicate(on, left_binding, right_binding)
+        else {
+            return Ok(None);
+        };
+
+        for (indexed_ref, probe_ref) in [
+            (join_predicate.left, join_predicate.right),
+            (join_predicate.right, join_predicate.left),
+        ] {
+            let Some((indexed_table, probe_table, indexed_on_left)) =
+                spatial_join_argument_orientation(
+                    left_binding,
+                    right_binding,
+                    indexed_ref,
+                    probe_ref,
+                )
+            else {
+                continue;
+            };
+            if let Some(dataset) = self.try_spatial_join_orientation(SpatialJoinOrientation {
+                indexed_table,
+                indexed_ref,
+                probe_table,
+                probe_ref,
+                indexed_on_left,
+                left_alias,
+                right_alias,
+                constraint,
+                radius_expr: join_predicate.radius_expr,
+                params,
+                ctes,
+            })? {
+                return Ok(Some(dataset));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn try_spatial_join_orientation(
+        &self,
+        plan: SpatialJoinOrientation<'_>,
+    ) -> Result<Option<Dataset>> {
+        if !matches_table_binding(plan.indexed_table, plan.indexed_ref.table)
+            || !matches_table_binding(plan.probe_table, plan.probe_ref.table)
+        {
+            return Ok(None);
+        }
+        let Some(index_schema) =
+            self.spatial_index_for_table_column(plan.indexed_table.name, plan.indexed_ref.column)
+        else {
+            return Ok(None);
+        };
+        let indexed_table = self.table_schema(plan.indexed_table.name).ok_or_else(|| {
+            DbError::sql(format!("unknown table or view {}", plan.indexed_table.name))
+        })?;
+        let probe_table = self.table_schema(plan.probe_table.name).ok_or_else(|| {
+            DbError::sql(format!("unknown table or view {}", plan.probe_table.name))
+        })?;
+        if !generated_columns_are_stored(indexed_table)
+            || !generated_columns_are_stored(probe_table)
+        {
+            return Ok(None);
+        }
+        let Some(indexed_source) = self.table_row_source(plan.indexed_table.name) else {
+            return Ok(None);
+        };
+        let Some(probe_source) = self.table_row_source(plan.probe_table.name) else {
+            return Ok(None);
+        };
+        let Some(probe_column_index) = schema_column_index(probe_table, plan.probe_ref.column)
+        else {
+            return Ok(None);
+        };
+        let Some(RuntimeIndex::Spatial { index: spatial }) = self.index(&index_schema.name) else {
+            return Ok(None);
+        };
+
+        let left_table = if plan.indexed_on_left {
+            indexed_table
+        } else {
+            probe_table
+        };
+        let right_table = if plan.indexed_on_left {
+            probe_table
+        } else {
+            indexed_table
+        };
+        let left_columns = table_output_columns(left_table, plan.left_alias);
+        let right_columns = table_output_columns(right_table, plan.right_alias);
+        let mut eval_columns = left_columns.clone();
+        eval_columns.extend(right_columns.clone());
+        let eval_dataset = Dataset::with_rows(eval_columns, Vec::new());
+        let eval_context = JoinEvalContext {
+            dataset: &eval_dataset,
+            runtime: self,
+            params: plan.params,
+            ctes: plan.ctes,
+        };
+        let columns = join_output_columns(
+            &Dataset::with_rows(left_columns, Vec::new()),
+            &Dataset::with_rows(right_columns, Vec::new()),
+            &[],
+        );
+        let mut rows = Vec::new();
+
+        for probe_row in probe_source.rows() {
+            let probe_row = probe_row?;
+            let Some(probe_value) = probe_row.values().get(probe_column_index) else {
+                return Err(DbError::internal(
+                    "spatial join probe row is shorter than schema",
+                ));
+            };
+            let Some((probe_is_geography, probe_spatial)) = spatial_value_from_db(probe_value)?
+            else {
+                continue;
+            };
+            match (spatial.backend(), probe_is_geography) {
+                (SpatialIndexBackend::GeographyS2, true)
+                | (SpatialIndexBackend::GeometryQuadCell, false) => {}
+                _ => return Ok(None),
+            }
+            let mut envelope =
+                SpatialEnvelope::from_value(&probe_spatial).map_err(spatial_error)?;
+            if let Some(radius_expr) = plan.radius_expr {
+                let radius_value = self.eval_expr(
+                    radius_expr,
+                    &Dataset::empty(),
+                    &[],
+                    plan.params,
+                    plan.ctes,
+                    None,
+                )?;
+                let radius = numeric_value_as_f64("ST_DWithin", "third", &radius_value)?;
+                envelope = match spatial.backend() {
+                    SpatialIndexBackend::GeographyS2 => envelope.expand_geography_meters(radius),
+                    SpatialIndexBackend::GeometryQuadCell => envelope.expand_planar(radius),
+                };
+            }
+
+            for indexed_row_id in spatial.candidate_row_ids(envelope) {
+                let Some(indexed_row) = indexed_source.row_by_id(indexed_row_id)? else {
+                    continue;
+                };
+                let (left_values, right_values) = if plan.indexed_on_left {
+                    (indexed_row.values(), probe_row.values())
+                } else {
+                    (probe_row.values(), indexed_row.values())
+                };
+                let mut eval_row = left_values.to_vec();
+                eval_row.extend_from_slice(right_values);
+                if join_rows_match(
+                    plan.constraint,
+                    &[],
+                    &eval_row,
+                    left_values,
+                    right_values,
+                    &eval_context,
+                )? {
+                    rows.push(join_output_row(left_values, right_values, &[])?);
+                }
+            }
+        }
+
+        Ok(Some(Dataset::with_rows(columns, rows)))
+    }
+
+    fn spatial_index_for_table_column(
+        &self,
+        table_name: &str,
+        column_name: &str,
+    ) -> Option<&IndexSchema> {
+        self.catalog.indexes.values().find(|index| {
+            identifiers_equal(&index.table_name, table_name)
+                && index.fresh
+                && index.kind == IndexKind::Spatial
+                && index.predicate_sql.is_none()
+                && index.columns.len() == 1
+                && index.columns[0].expression_sql.is_none()
+                && index.columns[0]
+                    .column_name
+                    .as_deref()
+                    .is_some_and(|indexed| identifiers_equal(indexed, column_name))
+        })
     }
 
     fn try_indexed_join(
@@ -12432,6 +12787,19 @@ fn build_runtime_index(
             trigram.checkpoint()?;
             Ok(RuntimeIndex::Trigram { index: trigram })
         }
+        IndexKind::Spatial => {
+            let backend = spatial_index_backend(index, table)?;
+            let mut spatial = SpatialRuntimeIndex::new(backend);
+            for row in source.rows() {
+                let row = row?;
+                if let Some(value) =
+                    spatial_index_value_for_row(runtime, index, table, row.values())?
+                {
+                    spatial.insert(row.row_id(), value).map_err(spatial_error)?;
+                }
+            }
+            Ok(RuntimeIndex::Spatial { index: spatial })
+        }
     }
 }
 
@@ -12475,6 +12843,80 @@ pub(super) fn compute_index_key(
         Row::new(values).encode()?
     };
     Ok(Some(RuntimeBtreeKey::Encoded(key)))
+}
+
+pub(super) fn spatial_index_backend(
+    index: &IndexSchema,
+    table: &TableSchema,
+) -> Result<SpatialIndexBackend> {
+    let column_index = spatial_index_column_index(index, table)?;
+    match table.columns[column_index].column_type {
+        ColumnType::Geography => Ok(SpatialIndexBackend::GeographyS2),
+        ColumnType::Geometry => Ok(SpatialIndexBackend::GeometryQuadCell),
+        _ => Err(DbError::internal(format!(
+            "SPATIAL index {} targets a non-spatial column",
+            index.name
+        ))),
+    }
+}
+
+pub(super) fn spatial_index_value_for_row(
+    runtime: &EngineRuntime,
+    index: &IndexSchema,
+    table: &TableSchema,
+    row_values: &[Value],
+) -> Result<Option<SpatialValue>> {
+    if !row_satisfies_index_predicate(runtime, index, table, row_values)? {
+        return Ok(None);
+    }
+    let column_index = spatial_index_column_index(index, table)?;
+    let value = row_values
+        .get(column_index)
+        .ok_or_else(|| DbError::internal("row is shorter than table schema"))?;
+    let Some((is_geography, spatial)) = spatial_value_from_db(value)? else {
+        return Ok(None);
+    };
+    match (table.columns[column_index].column_type, is_geography) {
+        (ColumnType::Geography, true) | (ColumnType::Geometry, false) => Ok(Some(spatial)),
+        (ColumnType::Geography, false) => Err(DbError::constraint(format!(
+            "SPATIAL index {} expected GEOGRAPHY values",
+            index.name
+        ))),
+        (ColumnType::Geometry, true) => Err(DbError::constraint(format!(
+            "SPATIAL index {} expected GEOMETRY values",
+            index.name
+        ))),
+        _ => Err(DbError::internal(format!(
+            "SPATIAL index {} targets a non-spatial column",
+            index.name
+        ))),
+    }
+}
+
+fn spatial_index_column_index(index: &IndexSchema, table: &TableSchema) -> Result<usize> {
+    if index.kind != IndexKind::Spatial || index.columns.len() != 1 {
+        return Err(DbError::internal(format!(
+            "SPATIAL index {} must target exactly one column",
+            index.name
+        )));
+    }
+    let column_name = index.columns[0].column_name.as_deref().ok_or_else(|| {
+        DbError::internal(format!(
+            "SPATIAL index {} must target a plain column",
+            index.name
+        ))
+    })?;
+    if index.columns[0].expression_sql.is_some() {
+        return Err(DbError::internal(format!(
+            "SPATIAL index {} cannot target an expression",
+            index.name
+        )));
+    }
+    table
+        .columns
+        .iter()
+        .position(|entry| identifiers_equal(&entry.name, column_name))
+        .ok_or_else(|| DbError::constraint(format!("index column {} does not exist", column_name)))
 }
 
 fn btree_uses_typed_int64_keys(index: &IndexSchema, table: &TableSchema) -> bool {
@@ -12714,6 +13156,7 @@ fn encode_runtime_payload(runtime: &EngineRuntime) -> Result<Vec<u8>> {
     encode_schemas_section(&mut output, &runtime.catalog.schemas)?;
     encode_index_include_columns_section(&mut output, &runtime.catalog.indexes)?;
     encode_generated_columns_section(&mut output, &runtime.catalog.tables)?;
+    encode_spatial_columns_section(&mut output, &runtime.catalog.tables)?;
     Ok(output)
 }
 
@@ -12763,6 +13206,7 @@ fn decode_runtime_payload(bytes: &[u8]) -> Result<EngineRuntime> {
             table.columns.push(crate::catalog::ColumnSchema {
                 name,
                 column_type,
+                spatial_type: None,
                 nullable,
                 default_sql,
                 generated_sql: None,
@@ -12871,6 +13315,9 @@ fn decode_runtime_payload(bytes: &[u8]) -> Result<EngineRuntime> {
     }
     if cursor.offset < cursor.bytes.len() {
         decode_generated_columns_section(&mut cursor, &mut runtime.catalog_mut().tables)?;
+    }
+    if cursor.offset < cursor.bytes.len() {
+        decode_spatial_columns_section(&mut cursor, &mut runtime.catalog_mut().tables)?;
     }
     if cursor.offset < cursor.bytes.len() {
         decode_pk_index_roots_section(&mut cursor, &mut runtime.catalog_mut().tables)?;
@@ -12997,6 +13444,7 @@ fn encode_manifest_payload_with_offsets(
     encode_schemas_section(&mut output, &runtime.catalog.schemas)?;
     encode_index_include_columns_section(&mut output, &runtime.catalog.indexes)?;
     encode_generated_columns_section(&mut output, &runtime.catalog.tables)?;
+    encode_spatial_columns_section(&mut output, &runtime.catalog.tables)?;
     encode_pk_index_roots_section(
         &mut output,
         &runtime.catalog.tables,
@@ -13110,6 +13558,7 @@ fn decode_manifest_payload<S: PageStore>(_store: &S, bytes: &[u8]) -> Result<Eng
             table.columns.push(crate::catalog::ColumnSchema {
                 name,
                 column_type,
+                spatial_type: None,
                 nullable,
                 default_sql,
                 generated_sql: None,
@@ -13254,6 +13703,9 @@ fn decode_manifest_payload<S: PageStore>(_store: &S, bytes: &[u8]) -> Result<Eng
     }
     if cursor.offset < cursor.bytes.len() {
         decode_generated_columns_section(&mut cursor, &mut runtime.catalog_mut().tables)?;
+    }
+    if cursor.offset < cursor.bytes.len() {
+        decode_spatial_columns_section(&mut cursor, &mut runtime.catalog_mut().tables)?;
     }
     if cursor.offset < cursor.bytes.len() {
         decode_pk_index_roots_section(&mut cursor, &mut runtime.catalog_mut().tables)?;
@@ -14740,6 +15192,39 @@ fn encode_generated_columns_section(
     Ok(())
 }
 
+fn encode_spatial_columns_section(
+    output: &mut Vec<u8>,
+    tables: &BTreeMap<String, TableSchema>,
+) -> Result<()> {
+    let spatial_columns = tables
+        .values()
+        .flat_map(|table| {
+            table.columns.iter().filter_map(move |column| {
+                column
+                    .spatial_type
+                    .map(|spatial_type| (table.name.as_str(), column.name.as_str(), spatial_type))
+            })
+        })
+        .collect::<Vec<_>>();
+    output.extend_from_slice(SPATIAL_COLUMNS_SECTION_MAGIC);
+    output.push(1);
+    encode_u32(
+        output,
+        u32::try_from(spatial_columns.len())
+            .map_err(|_| DbError::constraint("spatial column count exceeds u32"))?,
+    );
+    for (table_name, column_name, spatial_type) in spatial_columns {
+        encode_string(output, table_name)?;
+        encode_string(output, column_name)?;
+        output.push(encode_spatial_subtype_tag(spatial_type.subtype));
+        output.push(encode_spatial_dimensions_tag(spatial_type.dimensions));
+        let srid = u32::try_from(spatial_type.srid)
+            .map_err(|_| DbError::constraint("spatial SRID must be non-negative"))?;
+        encode_u32(output, srid);
+    }
+    Ok(())
+}
+
 fn encode_index_include_columns_section(
     output: &mut Vec<u8>,
     indexes: &BTreeMap<String, IndexSchema>,
@@ -14942,6 +15427,56 @@ fn decode_generated_columns_section(
     Ok(())
 }
 
+fn decode_spatial_columns_section(
+    cursor: &mut Cursor<'_>,
+    tables: &mut BTreeMap<String, TableSchema>,
+) -> Result<()> {
+    let section_is_present = cursor
+        .bytes
+        .get(cursor.offset..cursor.offset + SPATIAL_COLUMNS_SECTION_MAGIC.len())
+        .is_some_and(|magic| magic == SPATIAL_COLUMNS_SECTION_MAGIC);
+    if !section_is_present {
+        return Ok(());
+    }
+    cursor.offset += SPATIAL_COLUMNS_SECTION_MAGIC.len();
+    let version = cursor.read_u8()?;
+    if version != 1 {
+        return Err(DbError::corruption(format!(
+            "unknown spatial columns section version {version}"
+        )));
+    }
+    let entry_count = cursor.read_u32()?;
+    for _ in 0..entry_count {
+        let table_name = cursor.read_string()?;
+        let column_name = cursor.read_string()?;
+        let subtype = decode_spatial_subtype_tag(cursor.read_u8()?)?;
+        let dimensions = decode_spatial_dimensions_tag(cursor.read_u8()?)?;
+        let srid = i32::try_from(cursor.read_u32()?)
+            .map_err(|_| DbError::corruption("spatial SRID exceeds i32"))?;
+        let table = tables.get_mut(&table_name).ok_or_else(|| {
+            DbError::corruption(format!(
+                "spatial column metadata referenced unknown table {table_name}"
+            ))
+        })?;
+        let column = table
+            .columns
+            .iter_mut()
+            .find(|column| identifiers_equal(&column.name, &column_name))
+            .ok_or_else(|| {
+                DbError::corruption(format!(
+                    "spatial column metadata referenced unknown column {}.{}",
+                    table_name, column_name
+                ))
+            })?;
+        column.spatial_type = Some(crate::catalog::SpatialTypeInfo {
+            subtype,
+            dimensions,
+            srid,
+        });
+    }
+    Ok(())
+}
+
 fn decode_pk_index_roots_section(
     cursor: &mut Cursor<'_>,
     tables: &mut BTreeMap<String, TableSchema>,
@@ -14977,6 +15512,52 @@ fn decode_pk_index_roots_section(
     Ok(())
 }
 
+fn encode_spatial_subtype_tag(subtype: crate::catalog::SpatialSubtype) -> u8 {
+    match subtype {
+        crate::catalog::SpatialSubtype::Any => 0,
+        crate::catalog::SpatialSubtype::Point => 1,
+        crate::catalog::SpatialSubtype::LineString => 2,
+        crate::catalog::SpatialSubtype::Polygon => 3,
+        crate::catalog::SpatialSubtype::MultiPoint => 4,
+        crate::catalog::SpatialSubtype::MultiLineString => 5,
+        crate::catalog::SpatialSubtype::MultiPolygon => 6,
+    }
+}
+
+fn decode_spatial_subtype_tag(tag: u8) -> Result<crate::catalog::SpatialSubtype> {
+    match tag {
+        0 => Ok(crate::catalog::SpatialSubtype::Any),
+        1 => Ok(crate::catalog::SpatialSubtype::Point),
+        2 => Ok(crate::catalog::SpatialSubtype::LineString),
+        3 => Ok(crate::catalog::SpatialSubtype::Polygon),
+        4 => Ok(crate::catalog::SpatialSubtype::MultiPoint),
+        5 => Ok(crate::catalog::SpatialSubtype::MultiLineString),
+        6 => Ok(crate::catalog::SpatialSubtype::MultiPolygon),
+        _ => Err(DbError::corruption("unknown spatial subtype tag")),
+    }
+}
+
+fn encode_spatial_dimensions_tag(dimensions: crate::catalog::SpatialDimensions) -> u8 {
+    match dimensions {
+        crate::catalog::SpatialDimensions::Any => 0,
+        crate::catalog::SpatialDimensions::Xy => 1,
+        crate::catalog::SpatialDimensions::Xyz => 2,
+        crate::catalog::SpatialDimensions::Xym => 3,
+        crate::catalog::SpatialDimensions::Xyzm => 4,
+    }
+}
+
+fn decode_spatial_dimensions_tag(tag: u8) -> Result<crate::catalog::SpatialDimensions> {
+    match tag {
+        0 => Ok(crate::catalog::SpatialDimensions::Any),
+        1 => Ok(crate::catalog::SpatialDimensions::Xy),
+        2 => Ok(crate::catalog::SpatialDimensions::Xyz),
+        3 => Ok(crate::catalog::SpatialDimensions::Xym),
+        4 => Ok(crate::catalog::SpatialDimensions::Xyzm),
+        _ => Err(DbError::corruption("unknown spatial dimensions tag")),
+    }
+}
+
 fn decode_column_type(tag: u8) -> Result<crate::catalog::ColumnType> {
     match tag {
         0 => Ok(crate::catalog::ColumnType::Int64),
@@ -14987,6 +15568,8 @@ fn decode_column_type(tag: u8) -> Result<crate::catalog::ColumnType> {
         5 => Ok(crate::catalog::ColumnType::Decimal),
         6 => Ok(crate::catalog::ColumnType::Uuid),
         7 => Ok(crate::catalog::ColumnType::Timestamp),
+        8 => Ok(crate::catalog::ColumnType::Geometry),
+        9 => Ok(crate::catalog::ColumnType::Geography),
         _ => Err(DbError::corruption("unknown column type tag")),
     }
 }
@@ -14995,6 +15578,7 @@ fn decode_index_kind(tag: u8) -> Result<crate::catalog::IndexKind> {
     match tag {
         0 => Ok(crate::catalog::IndexKind::Btree),
         1 => Ok(crate::catalog::IndexKind::Trigram),
+        2 => Ok(crate::catalog::IndexKind::Spatial),
         _ => Err(DbError::corruption("unknown index kind tag")),
     }
 }
@@ -16484,6 +17068,21 @@ impl<'a> TableBindingRef<'a> {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct SpatialJoinOrientation<'a> {
+    indexed_table: TableBindingRef<'a>,
+    indexed_ref: QualifiedColumnRef<'a>,
+    probe_table: TableBindingRef<'a>,
+    probe_ref: QualifiedColumnRef<'a>,
+    indexed_on_left: bool,
+    left_alias: &'a Option<String>,
+    right_alias: &'a Option<String>,
+    constraint: &'a JoinConstraint,
+    radius_expr: Option<&'a Expr>,
+    params: &'a [Value],
+    ctes: &'a BTreeMap<String, Dataset>,
+}
+
 #[derive(Clone, Debug)]
 struct IndexedJoinPlan<'a> {
     filtered_table: TableBindingRef<'a>,
@@ -16492,6 +17091,37 @@ struct IndexedJoinPlan<'a> {
     probe_table: TableBindingRef<'a>,
     probe_join_columns: Vec<&'a str>,
     filtered_on_left: bool,
+}
+
+fn table_output_columns(table: &TableSchema, alias: &Option<String>) -> Vec<ColumnBinding> {
+    let table_name = alias.clone().unwrap_or_else(|| table.name.clone());
+    table
+        .columns
+        .iter()
+        .map(|column| ColumnBinding::visible(Some(table_name.clone()), column.name.clone()))
+        .collect()
+}
+
+fn spatial_join_argument_orientation<'a>(
+    left_binding: TableBindingRef<'a>,
+    right_binding: TableBindingRef<'a>,
+    indexed_ref: QualifiedColumnRef<'a>,
+    probe_ref: QualifiedColumnRef<'a>,
+) -> Option<(TableBindingRef<'a>, TableBindingRef<'a>, bool)> {
+    let indexed_on_left = matches_table_binding(left_binding, indexed_ref.table);
+    let indexed_on_right = matches_table_binding(right_binding, indexed_ref.table);
+    let probe_on_left = matches_table_binding(left_binding, probe_ref.table);
+    let probe_on_right = matches_table_binding(right_binding, probe_ref.table);
+    match (
+        indexed_on_left,
+        indexed_on_right,
+        probe_on_left,
+        probe_on_right,
+    ) {
+        (true, false, false, true) => Some((left_binding, right_binding, true)),
+        (false, true, true, false) => Some((right_binding, left_binding, false)),
+        _ => None,
+    }
 }
 
 fn simple_join_equality(on: &Expr) -> Option<(QualifiedColumnRef<'_>, QualifiedColumnRef<'_>)> {
@@ -19103,6 +19733,187 @@ fn simple_trigram_lookup(filter: &Expr) -> Option<(&str, &Expr, bool)> {
                 simple_trigram_lookup(right).map(|(column, pattern, _)| (column, pattern, true))
             }),
         _ => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SimpleSpatialLookup<'a> {
+    table_qualifier: Option<&'a str>,
+    column_name: &'a str,
+    value_expr: &'a Expr,
+    radius_expr: Option<&'a Expr>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SimpleSpatialJoinPredicate<'a> {
+    left: QualifiedColumnRef<'a>,
+    right: QualifiedColumnRef<'a>,
+    radius_expr: Option<&'a Expr>,
+}
+
+fn simple_spatial_join_predicate<'a>(
+    expr: &'a Expr,
+    left_binding: TableBindingRef<'a>,
+    right_binding: TableBindingRef<'a>,
+) -> Option<SimpleSpatialJoinPredicate<'a>> {
+    let Expr::Function { name, args } = expr else {
+        return None;
+    };
+    let lower = name.to_ascii_lowercase();
+    let (left, right, radius_expr) = if lower == "st_dwithin" {
+        let [left, right, radius] = args.as_slice() else {
+            return None;
+        };
+        if expr_has_column_ref(radius) {
+            return None;
+        }
+        (left, right, Some(radius))
+    } else if matches!(
+        lower.as_str(),
+        "st_intersects" | "st_contains" | "st_within" | "st_equals"
+    ) {
+        let [left, right] = args.as_slice() else {
+            return None;
+        };
+        (left, right, None)
+    } else {
+        return None;
+    };
+    let left_ref = qualified_column_ref_expr(left)?;
+    let right_ref = qualified_column_ref_expr(right)?;
+    let left_is_left = matches_table_binding(left_binding, left_ref.table);
+    let left_is_right = matches_table_binding(right_binding, left_ref.table);
+    let right_is_left = matches_table_binding(left_binding, right_ref.table);
+    let right_is_right = matches_table_binding(right_binding, right_ref.table);
+    if (left_is_left && right_is_right) || (left_is_right && right_is_left) {
+        Some(SimpleSpatialJoinPredicate {
+            left: left_ref,
+            right: right_ref,
+            radius_expr,
+        })
+    } else {
+        None
+    }
+}
+
+fn qualified_column_ref_expr(expr: &Expr) -> Option<QualifiedColumnRef<'_>> {
+    let Expr::Column { table, column } = expr else {
+        return None;
+    };
+    Some(QualifiedColumnRef {
+        table: table.as_deref(),
+        column,
+    })
+}
+
+fn simple_spatial_lookup(filter: &Expr) -> Option<SimpleSpatialLookup<'_>> {
+    match filter {
+        Expr::Function { name, args } if name.eq_ignore_ascii_case("st_dwithin") => {
+            let [left, right, radius] = args.as_slice() else {
+                return None;
+            };
+            simple_spatial_column_value_pair(left, right).map(
+                |(table_qualifier, column_name, value_expr)| SimpleSpatialLookup {
+                    table_qualifier,
+                    column_name,
+                    value_expr,
+                    radius_expr: Some(radius),
+                },
+            )
+        }
+        Expr::Function { name, args }
+            if matches!(
+                name.to_ascii_lowercase().as_str(),
+                "st_intersects" | "st_contains" | "st_within" | "st_equals"
+            ) =>
+        {
+            let [left, right] = args.as_slice() else {
+                return None;
+            };
+            simple_spatial_column_value_pair(left, right).map(
+                |(table_qualifier, column_name, value_expr)| SimpleSpatialLookup {
+                    table_qualifier,
+                    column_name,
+                    value_expr,
+                    radius_expr: None,
+                },
+            )
+        }
+        Expr::Binary {
+            left,
+            op: BinaryOp::And,
+            right,
+        } => simple_spatial_lookup(left).or_else(|| simple_spatial_lookup(right)),
+        _ => None,
+    }
+}
+
+fn simple_spatial_column_value_pair<'a>(
+    left: &'a Expr,
+    right: &'a Expr,
+) -> Option<(Option<&'a str>, &'a str, &'a Expr)> {
+    match (left, right) {
+        (Expr::Column { table, column }, value) if !expr_has_column_ref(value) => {
+            Some((table.as_deref(), column.as_str(), value))
+        }
+        (value, Expr::Column { table, column }) if !expr_has_column_ref(value) => {
+            Some((table.as_deref(), column.as_str(), value))
+        }
+        _ => None,
+    }
+}
+
+fn expr_has_column_ref(expr: &Expr) -> bool {
+    match expr {
+        Expr::Column { .. } => true,
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+            expr_has_column_ref(expr)
+        }
+        Expr::Binary { left, right, .. } => expr_has_column_ref(left) || expr_has_column_ref(right),
+        Expr::Between {
+            expr, low, high, ..
+        } => expr_has_column_ref(expr) || expr_has_column_ref(low) || expr_has_column_ref(high),
+        Expr::InList { expr, items, .. } => {
+            expr_has_column_ref(expr) || items.iter().any(expr_has_column_ref)
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            expr_has_column_ref(expr)
+                || expr_has_column_ref(pattern)
+                || escape.as_deref().is_some_and(expr_has_column_ref)
+        }
+        Expr::Function { args, .. } => args.iter().any(expr_has_column_ref),
+        Expr::Aggregate { args, order_by, .. } => {
+            args.iter().any(expr_has_column_ref)
+                || order_by
+                    .iter()
+                    .any(|order| expr_has_column_ref(&order.expr))
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            operand.as_deref().is_some_and(expr_has_column_ref)
+                || branches.iter().any(|(condition, value)| {
+                    expr_has_column_ref(condition) || expr_has_column_ref(value)
+                })
+                || else_expr.as_deref().is_some_and(expr_has_column_ref)
+        }
+        Expr::Row(items) => items.iter().any(expr_has_column_ref),
+        Expr::InSubquery { expr, .. } | Expr::CompareSubquery { expr, .. } => {
+            expr_has_column_ref(expr)
+        }
+        Expr::Literal(_)
+        | Expr::Parameter(_)
+        | Expr::RowNumber { .. }
+        | Expr::WindowFunction { .. }
+        | Expr::ScalarSubquery(_)
+        | Expr::Exists(_) => false,
     }
 }
 
@@ -22699,7 +23510,800 @@ fn eval_function(
         "json_object" | "pg_catalog.json_object" => eval_json_object(values),
         "json_type" | "pg_catalog.json_type" => eval_json_type(values),
         "json_valid" | "pg_catalog.json_valid" => eval_json_valid(values),
+        "st_point" | "st_makepoint" => eval_spatial_point_constructor(&values, false, false),
+        "st_pointz" => eval_spatial_point_constructor(&values, false, true),
+        "st_pointm" => eval_spatial_point_m_constructor(&values, false),
+        "st_pointzm" => eval_spatial_point_zm_constructor(&values, false),
+        "st_geogpoint" => eval_spatial_point_constructor(&values, true, false),
+        "st_geogpointz" => eval_spatial_point_constructor(&values, true, true),
+        "st_geogpointm" => eval_spatial_point_m_constructor(&values, true),
+        "st_geogpointzm" => eval_spatial_point_zm_constructor(&values, true),
+        "st_asbinary" => eval_spatial_as_binary(&values),
+        "st_astext" => eval_spatial_as_text(&values),
+        "st_asgeojson" => eval_spatial_as_geojson(&values),
+        "st_srid" => eval_spatial_srid(&values),
+        "st_geometrytype" => eval_spatial_geometry_type(&values),
+        "st_x" => eval_spatial_point_accessor(&values, SpatialAccessor::X),
+        "st_y" => eval_spatial_point_accessor(&values, SpatialAccessor::Y),
+        "st_z" => eval_spatial_point_accessor(&values, SpatialAccessor::Z),
+        "st_m" => eval_spatial_point_accessor(&values, SpatialAccessor::M),
+        "st_setsrid" => eval_spatial_set_srid(&values),
+        "st_isvalid" => eval_spatial_is_valid(&values),
+        "st_distance" => eval_spatial_distance(&values),
+        "st_dwithin" => eval_spatial_dwithin(&values),
+        "st_intersects" => eval_spatial_predicate(&values, SpatialPredicate::Intersects),
+        "st_contains" => eval_spatial_predicate(&values, SpatialPredicate::Contains),
+        "st_within" => eval_spatial_predicate(&values, SpatialPredicate::Within),
+        "st_equals" => eval_spatial_predicate(&values, SpatialPredicate::Equals),
+        "st_length" => eval_spatial_length(&values),
+        "st_area" => eval_spatial_area(&values),
+        "st_geomfromwkb" => eval_spatial_from_wkb(&values, false),
+        "st_geogfromwkb" => eval_spatial_from_wkb(&values, true),
+        "st_geomfromtext" => eval_spatial_from_text(&values, false),
+        "st_geogfromtext" => eval_spatial_from_text(&values, true),
+        "st_geomfromgeojson" => eval_spatial_from_geojson(&values, false),
+        "st_geogfromgeojson" => eval_spatial_from_geojson(&values, true),
         other => Err(DbError::sql(format!("unsupported scalar function {other}"))),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SpatialAccessor {
+    X,
+    Y,
+    Z,
+    M,
+}
+
+#[derive(Clone, Copy)]
+enum SpatialPredicate {
+    Intersects,
+    Contains,
+    Within,
+    Equals,
+}
+
+fn spatial_error(error: SpatialError) -> DbError {
+    DbError::sql(error.to_string())
+}
+
+fn eval_spatial_point_constructor(
+    values: &[Value],
+    geography: bool,
+    with_z: bool,
+) -> Result<Value> {
+    let expected = if with_z { 3 } else { 2 };
+    if values.len() != expected {
+        return Err(DbError::sql(format!(
+            "{} expects {expected} arguments",
+            if geography {
+                "ST_GeogPoint"
+            } else {
+                "ST_Point"
+            }
+        )));
+    }
+    if values.iter().any(|value| matches!(value, Value::Null)) {
+        return Ok(Value::Null);
+    }
+    let x = numeric_value_as_f64("spatial point", "first", &values[0])?;
+    let y = numeric_value_as_f64("spatial point", "second", &values[1])?;
+    let z = if with_z {
+        Some(numeric_value_as_f64("spatial point", "third", &values[2])?)
+    } else {
+        None
+    };
+    let dimensions = if with_z {
+        CoordinateDimensions::Xyz
+    } else {
+        CoordinateDimensions::Xy
+    };
+    spatial_point_value(geography, x, y, z, None, dimensions)
+}
+
+fn eval_spatial_point_m_constructor(values: &[Value], geography: bool) -> Result<Value> {
+    if values.len() != 3 {
+        return Err(DbError::sql(if geography {
+            "ST_GeogPointM expects 3 arguments"
+        } else {
+            "ST_PointM expects 3 arguments"
+        }));
+    }
+    if values.iter().any(|value| matches!(value, Value::Null)) {
+        return Ok(Value::Null);
+    }
+    let x = numeric_value_as_f64("spatial point", "first", &values[0])?;
+    let y = numeric_value_as_f64("spatial point", "second", &values[1])?;
+    let m = numeric_value_as_f64("spatial point", "third", &values[2])?;
+    spatial_point_value(geography, x, y, None, Some(m), CoordinateDimensions::Xym)
+}
+
+fn eval_spatial_point_zm_constructor(values: &[Value], geography: bool) -> Result<Value> {
+    if values.len() != 4 {
+        return Err(DbError::sql(if geography {
+            "ST_GeogPointZM expects 4 arguments"
+        } else {
+            "ST_PointZM expects 4 arguments"
+        }));
+    }
+    if values.iter().any(|value| matches!(value, Value::Null)) {
+        return Ok(Value::Null);
+    }
+    let x = numeric_value_as_f64("spatial point", "first", &values[0])?;
+    let y = numeric_value_as_f64("spatial point", "second", &values[1])?;
+    let z = numeric_value_as_f64("spatial point", "third", &values[2])?;
+    let m = numeric_value_as_f64("spatial point", "fourth", &values[3])?;
+    spatial_point_value(
+        geography,
+        x,
+        y,
+        Some(z),
+        Some(m),
+        CoordinateDimensions::Xyzm,
+    )
+}
+
+fn spatial_point_value(
+    geography: bool,
+    x: f64,
+    y: f64,
+    z: Option<f64>,
+    m: Option<f64>,
+    dimensions: CoordinateDimensions,
+) -> Result<Value> {
+    let position = Position::for_dimensions(x, y, z, m, dimensions).map_err(spatial_error)?;
+    let value = SpatialValue::new(
+        if geography { 4326 } else { 0 },
+        dimensions,
+        SpatialGeometry::Point(position),
+    )
+    .map_err(spatial_error)?;
+    validate_spatial_value(&value, geography)?;
+    let bytes = crate::spatial::ewkb::to_ewkb(&value);
+    Ok(if geography {
+        Value::Geography(bytes)
+    } else {
+        Value::Geometry(bytes)
+    })
+}
+
+fn eval_spatial_from_wkb(values: &[Value], geography: bool) -> Result<Value> {
+    let valid_arity = if geography {
+        values.len() == 1
+    } else {
+        values.len() == 1 || values.len() == 2
+    };
+    if !valid_arity {
+        return Err(DbError::sql(if geography {
+            "ST_GeogFromWKB expects 1 argument"
+        } else {
+            "ST_GeomFromWKB expects 1 or 2 arguments"
+        }));
+    }
+    if values.iter().any(|value| matches!(value, Value::Null)) {
+        return Ok(Value::Null);
+    }
+    let bytes = expect_blob_arg(
+        if geography {
+            "ST_GeogFromWKB"
+        } else {
+            "ST_GeomFromWKB"
+        },
+        "first",
+        &values[0],
+    )?;
+    let default_srid = if geography {
+        4326
+    } else if values.len() == 2 {
+        u32::try_from(expect_int_arg("ST_GeomFromWKB", "second", &values[1])?.unwrap_or(0))
+            .map_err(|_| DbError::sql("ST_GeomFromWKB SRID must be non-negative"))?
+    } else {
+        0
+    };
+    let mut spatial = crate::spatial::ewkb::from_wkb_with_default_srid(bytes, default_srid)
+        .map_err(spatial_error)?;
+    if !geography && values.len() == 2 && spatial.srid != default_srid {
+        return Err(DbError::sql(
+            "ST_GeomFromWKB explicit SRID does not match EWKB SRID",
+        ));
+    }
+    if geography {
+        spatial.srid = 4326;
+    }
+    validate_spatial_value(&spatial, geography)?;
+    let bytes = crate::spatial::ewkb::to_ewkb(&spatial);
+    Ok(if geography {
+        Value::Geography(bytes)
+    } else {
+        Value::Geometry(bytes)
+    })
+}
+
+fn eval_spatial_from_text(values: &[Value], geography: bool) -> Result<Value> {
+    let valid_arity = if geography {
+        values.len() == 1
+    } else {
+        values.len() == 1 || values.len() == 2
+    };
+    if !valid_arity {
+        return Err(DbError::sql(if geography {
+            "ST_GeogFromText expects 1 argument"
+        } else {
+            "ST_GeomFromText expects 1 or 2 arguments"
+        }));
+    }
+    if values.iter().any(|value| matches!(value, Value::Null)) {
+        return Ok(Value::Null);
+    }
+    let Some(text) = expect_text_arg(
+        if geography {
+            "ST_GeogFromText"
+        } else {
+            "ST_GeomFromText"
+        },
+        "first",
+        &values[0],
+    )?
+    else {
+        return Ok(Value::Null);
+    };
+    let default_srid = if geography {
+        4326
+    } else if values.len() == 2 {
+        u32::try_from(expect_int_arg("ST_GeomFromText", "second", &values[1])?.unwrap_or(0))
+            .map_err(|_| DbError::sql("ST_GeomFromText SRID must be non-negative"))?
+    } else {
+        0
+    };
+    let mut spatial = crate::spatial::wkt::from_wkt(text, default_srid).map_err(spatial_error)?;
+    if !geography && values.len() == 2 && spatial.srid != default_srid {
+        return Err(DbError::sql(
+            "ST_GeomFromText explicit SRID does not match EWKT SRID",
+        ));
+    }
+    if geography {
+        spatial.srid = 4326;
+    }
+    validate_spatial_value(&spatial, geography)?;
+    let bytes = crate::spatial::ewkb::to_ewkb(&spatial);
+    Ok(if geography {
+        Value::Geography(bytes)
+    } else {
+        Value::Geometry(bytes)
+    })
+}
+
+fn eval_spatial_from_geojson(values: &[Value], geography: bool) -> Result<Value> {
+    let valid_arity = if geography {
+        values.len() == 1
+    } else {
+        values.len() == 1 || values.len() == 2
+    };
+    if !valid_arity {
+        return Err(DbError::sql(if geography {
+            "ST_GeogFromGeoJSON expects 1 argument"
+        } else {
+            "ST_GeomFromGeoJSON expects 1 or 2 arguments"
+        }));
+    }
+    if values.iter().any(|value| matches!(value, Value::Null)) {
+        return Ok(Value::Null);
+    }
+    let Some(text) = expect_text_arg(
+        if geography {
+            "ST_GeogFromGeoJSON"
+        } else {
+            "ST_GeomFromGeoJSON"
+        },
+        "first",
+        &values[0],
+    )?
+    else {
+        return Ok(Value::Null);
+    };
+    let srid = if geography {
+        4326
+    } else if values.len() == 2 {
+        u32::try_from(expect_int_arg("ST_GeomFromGeoJSON", "second", &values[1])?.unwrap_or(0))
+            .map_err(|_| DbError::sql("ST_GeomFromGeoJSON SRID must be non-negative"))?
+    } else {
+        0
+    };
+    let spatial = crate::spatial::geojson::from_geojson(text, srid).map_err(spatial_error)?;
+    validate_spatial_value(&spatial, geography)?;
+    let bytes = crate::spatial::ewkb::to_ewkb(&spatial);
+    Ok(if geography {
+        Value::Geography(bytes)
+    } else {
+        Value::Geometry(bytes)
+    })
+}
+
+fn eval_spatial_as_binary(values: &[Value]) -> Result<Value> {
+    expect_arity("ST_AsBinary", values, 1)?;
+    match &values[0] {
+        Value::Null => Ok(Value::Null),
+        Value::Geometry(bytes) | Value::Geography(bytes) => Ok(Value::Blob(bytes.clone())),
+        other => Err(DbError::sql(format!(
+            "ST_AsBinary expects spatial input, got {other:?}"
+        ))),
+    }
+}
+
+fn eval_spatial_as_text(values: &[Value]) -> Result<Value> {
+    expect_arity("ST_AsText", values, 1)?;
+    let Some((_, spatial)) = spatial_value_from_db(&values[0])? else {
+        return Ok(Value::Null);
+    };
+    Ok(Value::Text(crate::spatial::wkt::to_wkt(&spatial)))
+}
+
+fn eval_spatial_as_geojson(values: &[Value]) -> Result<Value> {
+    expect_arity("ST_AsGeoJSON", values, 1)?;
+    let Some((_, spatial)) = spatial_value_from_db(&values[0])? else {
+        return Ok(Value::Null);
+    };
+    Ok(Value::Text(
+        crate::spatial::geojson::to_geojson(&spatial).map_err(spatial_error)?,
+    ))
+}
+
+fn eval_spatial_srid(values: &[Value]) -> Result<Value> {
+    expect_arity("ST_SRID", values, 1)?;
+    let Some((_, spatial)) = spatial_value_from_db(&values[0])? else {
+        return Ok(Value::Null);
+    };
+    Ok(Value::Int64(i64::from(spatial.srid)))
+}
+
+fn eval_spatial_geometry_type(values: &[Value]) -> Result<Value> {
+    expect_arity("ST_GeometryType", values, 1)?;
+    let Some((_, spatial)) = spatial_value_from_db(&values[0])? else {
+        return Ok(Value::Null);
+    };
+    Ok(Value::Text(spatial_kind_name(spatial.kind()).to_string()))
+}
+
+fn eval_spatial_point_accessor(values: &[Value], accessor: SpatialAccessor) -> Result<Value> {
+    expect_arity("spatial coordinate accessor", values, 1)?;
+    let Some((_, spatial)) = spatial_value_from_db(&values[0])? else {
+        return Ok(Value::Null);
+    };
+    let SpatialGeometry::Point(point) = spatial.geometry else {
+        return Err(DbError::sql(
+            "spatial coordinate accessors require POINT input",
+        ));
+    };
+    match accessor {
+        SpatialAccessor::X => Ok(Value::Float64(point.x)),
+        SpatialAccessor::Y => Ok(Value::Float64(point.y)),
+        SpatialAccessor::Z => Ok(point.z.map(Value::Float64).unwrap_or(Value::Null)),
+        SpatialAccessor::M => Ok(point.m.map(Value::Float64).unwrap_or(Value::Null)),
+    }
+}
+
+fn eval_spatial_set_srid(values: &[Value]) -> Result<Value> {
+    expect_arity("ST_SetSRID", values, 2)?;
+    if values.iter().any(|value| matches!(value, Value::Null)) {
+        return Ok(Value::Null);
+    }
+    let srid = u32::try_from(expect_int_arg("ST_SetSRID", "second", &values[1])?.unwrap_or(0))
+        .map_err(|_| DbError::sql("ST_SetSRID SRID must be non-negative"))?;
+    let Some((geography, mut spatial)) = spatial_value_from_db(&values[0])? else {
+        return Ok(Value::Null);
+    };
+    if geography && srid != 4326 {
+        return Err(DbError::sql(
+            "GEOGRAPHY supports only SRID 4326 in DecentDB 1.0",
+        ));
+    }
+    spatial.srid = srid;
+    validate_spatial_value(&spatial, geography)?;
+    let bytes = crate::spatial::ewkb::to_ewkb(&spatial);
+    Ok(if geography {
+        Value::Geography(bytes)
+    } else {
+        Value::Geometry(bytes)
+    })
+}
+
+fn eval_spatial_is_valid(values: &[Value]) -> Result<Value> {
+    expect_arity("ST_IsValid", values, 1)?;
+    match &values[0] {
+        Value::Null => Ok(Value::Null),
+        Value::Geometry(bytes) => Ok(Value::Bool(
+            crate::spatial::ewkb::from_ewkb(bytes)
+                .and_then(|value| validate_spatial_value_spatial_error(&value, false))
+                .is_ok(),
+        )),
+        Value::Geography(bytes) => Ok(Value::Bool(
+            crate::spatial::ewkb::from_ewkb(bytes)
+                .and_then(|value| validate_spatial_value_spatial_error(&value, true))
+                .is_ok(),
+        )),
+        other => Err(DbError::sql(format!(
+            "ST_IsValid expects spatial input, got {other:?}"
+        ))),
+    }
+}
+
+fn eval_spatial_distance(values: &[Value]) -> Result<Value> {
+    expect_arity("ST_Distance", values, 2)?;
+    if values.iter().any(|value| matches!(value, Value::Null)) {
+        return Ok(Value::Null);
+    }
+    Ok(Value::Float64(spatial_distance_values(
+        &values[0], &values[1],
+    )?))
+}
+
+fn eval_spatial_dwithin(values: &[Value]) -> Result<Value> {
+    expect_arity("ST_DWithin", values, 3)?;
+    if values.iter().any(|value| matches!(value, Value::Null)) {
+        return Ok(Value::Null);
+    }
+    let distance = numeric_value_as_f64("ST_DWithin", "third", &values[2])?;
+    if distance < 0.0 {
+        return Ok(Value::Bool(false));
+    }
+    Ok(Value::Bool(
+        spatial_distance_values(&values[0], &values[1])? <= distance,
+    ))
+}
+
+fn eval_spatial_predicate(values: &[Value], predicate: SpatialPredicate) -> Result<Value> {
+    expect_arity("spatial predicate", values, 2)?;
+    if values.iter().any(|value| matches!(value, Value::Null)) {
+        return Ok(Value::Null);
+    }
+    let (left_geography, left) = spatial_value_from_db_required(&values[0])?;
+    let (right_geography, right) = spatial_value_from_db_required(&values[1])?;
+    ensure_spatial_compatible(left_geography, &left, right_geography, &right)?;
+    let result = match predicate {
+        SpatialPredicate::Intersects => {
+            crate::spatial::predicate::intersects(&left.geometry, &right.geometry)
+        }
+        SpatialPredicate::Contains => {
+            crate::spatial::predicate::contains(&left.geometry, &right.geometry)
+        }
+        SpatialPredicate::Within => {
+            crate::spatial::predicate::within(&left.geometry, &right.geometry)
+        }
+        SpatialPredicate::Equals => {
+            crate::spatial::predicate::equals(&left.geometry, &right.geometry)
+        }
+    }
+    .map_err(spatial_error)?;
+    Ok(Value::Bool(result))
+}
+
+fn eval_spatial_length(values: &[Value]) -> Result<Value> {
+    expect_arity("ST_Length", values, 1)?;
+    let Some((geography, spatial)) = spatial_value_from_db(&values[0])? else {
+        return Ok(Value::Null);
+    };
+    if geography {
+        return Err(DbError::sql("ST_Length for GEOGRAPHY is not supported"));
+    }
+    Ok(Value::Float64(geometry_length(&spatial.geometry)?))
+}
+
+fn eval_spatial_area(values: &[Value]) -> Result<Value> {
+    expect_arity("ST_Area", values, 1)?;
+    let Some((geography, spatial)) = spatial_value_from_db(&values[0])? else {
+        return Ok(Value::Null);
+    };
+    let area = if geography {
+        geography_area_approx_meters(&spatial.geometry)?
+    } else {
+        geometry_area(&spatial.geometry)?
+    };
+    Ok(Value::Float64(area))
+}
+
+fn spatial_distance_values(left: &Value, right: &Value) -> Result<f64> {
+    let (left_geography, left) = spatial_value_from_db_required(left)?;
+    let (right_geography, right) = spatial_value_from_db_required(right)?;
+    ensure_spatial_compatible(left_geography, &left, right_geography, &right)?;
+    if left_geography {
+        let (SpatialGeometry::Point(left_point), SpatialGeometry::Point(right_point)) =
+            (&left.geometry, &right.geometry)
+        else {
+            return Err(DbError::sql(
+                "ST_Distance for GEOGRAPHY supports POINT inputs in this release",
+            ));
+        };
+        Ok(crate::spatial::distance::geography_point_distance_meters(
+            *left_point,
+            *right_point,
+        ))
+    } else {
+        crate::spatial::distance::planar_geometry_distance(&left.geometry, &right.geometry)
+            .map_err(spatial_error)
+    }
+}
+
+fn spatial_value_from_db_required(value: &Value) -> Result<(bool, SpatialValue)> {
+    spatial_value_from_db(value)?.ok_or_else(|| DbError::sql("spatial input must not be NULL"))
+}
+
+fn spatial_value_from_db(value: &Value) -> Result<Option<(bool, SpatialValue)>> {
+    match value {
+        Value::Null => Ok(None),
+        Value::Geometry(bytes) => Ok(Some((
+            false,
+            crate::spatial::ewkb::from_ewkb(bytes).map_err(spatial_error)?,
+        ))),
+        Value::Geography(bytes) => Ok(Some((
+            true,
+            crate::spatial::ewkb::from_ewkb(bytes).map_err(spatial_error)?,
+        ))),
+        other => Err(DbError::sql(format!(
+            "expected spatial value, got {other:?}"
+        ))),
+    }
+}
+
+fn ensure_spatial_compatible(
+    left_geography: bool,
+    left: &SpatialValue,
+    right_geography: bool,
+    right: &SpatialValue,
+) -> Result<()> {
+    if left_geography != right_geography {
+        return Err(DbError::sql(
+            "spatial predicates require matching GEOMETRY/GEOGRAPHY families",
+        ));
+    }
+    if left.srid != right.srid {
+        return Err(DbError::sql("spatial predicates require matching SRIDs"));
+    }
+    Ok(())
+}
+
+fn normalize_geometry_bytes(bytes: &[u8]) -> Result<Vec<u8>> {
+    let value =
+        crate::spatial::ewkb::from_wkb_with_default_srid(bytes, 0).map_err(spatial_error)?;
+    validate_spatial_value(&value, false)?;
+    Ok(crate::spatial::ewkb::to_ewkb(&value))
+}
+
+fn normalize_geography_bytes(bytes: &[u8]) -> Result<Vec<u8>> {
+    let mut value =
+        crate::spatial::ewkb::from_wkb_with_default_srid(bytes, 4326).map_err(spatial_error)?;
+    value.srid = 4326;
+    validate_spatial_value(&value, true)?;
+    Ok(crate::spatial::ewkb::to_ewkb(&value))
+}
+
+fn validate_spatial_value(value: &SpatialValue, geography: bool) -> Result<()> {
+    validate_spatial_value_spatial_error(value, geography).map_err(spatial_error)
+}
+
+fn validate_spatial_value_spatial_error(
+    value: &SpatialValue,
+    geography: bool,
+) -> std::result::Result<(), SpatialError> {
+    if geography && value.srid != 4326 {
+        return Err(SpatialError::InvalidInput(
+            "GEOGRAPHY supports only SRID 4326 in DecentDB 1.0".to_string(),
+        ));
+    }
+    if !geography && value.srid > i32::MAX as u32 {
+        return Err(SpatialError::InvalidInput(
+            "GEOMETRY SRID exceeds supported range".to_string(),
+        ));
+    }
+    for position in value.geometry.all_positions() {
+        if !position.x.is_finite()
+            || !position.y.is_finite()
+            || position.z.is_some_and(|z| !z.is_finite())
+            || position.m.is_some_and(|m| !m.is_finite())
+        {
+            return Err(SpatialError::InvalidInput(
+                "spatial coordinates must be finite".to_string(),
+            ));
+        }
+        if geography
+            && !((-180.0..=180.0).contains(&position.x) && (-90.0..=90.0).contains(&position.y))
+        {
+            return Err(SpatialError::InvalidInput(
+                "GEOGRAPHY coordinates must be lon/lat in valid WGS84 ranges".to_string(),
+            ));
+        }
+    }
+    validate_shape_minimums(&value.geometry)
+}
+
+fn validate_shape_minimums(geometry: &SpatialGeometry) -> std::result::Result<(), SpatialError> {
+    match geometry {
+        SpatialGeometry::Point(_) => Ok(()),
+        SpatialGeometry::LineString(line) => {
+            if line.len() < 2 {
+                Err(SpatialError::InvalidInput(
+                    "LINESTRING requires at least two points".to_string(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        SpatialGeometry::Polygon(polygon) => validate_polygon_minimums(polygon),
+        SpatialGeometry::MultiPoint(points) => {
+            if points.is_empty() {
+                Err(SpatialError::InvalidInput(
+                    "MULTIPOINT requires at least one point".to_string(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        SpatialGeometry::MultiLineString(lines) => {
+            for line in lines {
+                if line.len() < 2 {
+                    return Err(SpatialError::InvalidInput(
+                        "MULTILINESTRING members require at least two points".to_string(),
+                    ));
+                }
+            }
+            Ok(())
+        }
+        SpatialGeometry::MultiPolygon(polygons) => {
+            for polygon in polygons {
+                validate_polygon_minimums(polygon)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn validate_polygon_minimums(polygon: &[Vec<Position>]) -> std::result::Result<(), SpatialError> {
+    if polygon.is_empty() {
+        return Err(SpatialError::InvalidInput(
+            "POLYGON requires at least one ring".to_string(),
+        ));
+    }
+    for ring in polygon {
+        if ring.len() < 4 {
+            return Err(SpatialError::InvalidInput(
+                "POLYGON rings require at least four points".to_string(),
+            ));
+        }
+        if !ring
+            .first()
+            .zip(ring.last())
+            .is_some_and(|(first, last)| first.xy_equals(*last))
+        {
+            return Err(SpatialError::InvalidInput(
+                "POLYGON rings must be closed".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn expect_arity(function_name: &str, values: &[Value], expected: usize) -> Result<()> {
+    if values.len() != expected {
+        return Err(DbError::sql(format!(
+            "{function_name} expects {expected} argument{}",
+            if expected == 1 { "" } else { "s" }
+        )));
+    }
+    Ok(())
+}
+
+fn expect_blob_arg<'a>(function_name: &str, ordinal: &str, value: &'a Value) -> Result<&'a [u8]> {
+    match value {
+        Value::Blob(value) => Ok(value),
+        other => Err(DbError::sql(format!(
+            "{function_name} expects BLOB for {ordinal} argument, got {other:?}"
+        ))),
+    }
+}
+
+fn numeric_value_as_f64(function_name: &str, ordinal: &str, value: &Value) -> Result<f64> {
+    let Some(number) = expect_numeric_arg(function_name, ordinal, value)? else {
+        return Err(DbError::sql(format!(
+            "{function_name} {ordinal} argument must not be NULL"
+        )));
+    };
+    let value = number.as_f64();
+    if !value.is_finite() {
+        return Err(DbError::sql(format!(
+            "{function_name} {ordinal} argument must be finite"
+        )));
+    }
+    Ok(value)
+}
+
+fn spatial_kind_name(kind: SpatialKind) -> &'static str {
+    match kind {
+        SpatialKind::Point => "POINT",
+        SpatialKind::LineString => "LINESTRING",
+        SpatialKind::Polygon => "POLYGON",
+        SpatialKind::MultiPoint => "MULTIPOINT",
+        SpatialKind::MultiLineString => "MULTILINESTRING",
+        SpatialKind::MultiPolygon => "MULTIPOLYGON",
+    }
+}
+
+fn geometry_length(geometry: &SpatialGeometry) -> Result<f64> {
+    match geometry {
+        SpatialGeometry::LineString(line) => Ok(line_length(line)),
+        SpatialGeometry::MultiLineString(lines) => {
+            Ok(lines.iter().map(|line| line_length(line)).sum())
+        }
+        _ => Err(DbError::sql(
+            "ST_Length supports LINESTRING geometry inputs",
+        )),
+    }
+}
+
+fn line_length(line: &[Position]) -> f64 {
+    line.windows(2)
+        .map(|segment| crate::spatial::distance::point_distance_xy(segment[0], segment[1]))
+        .sum()
+}
+
+fn geometry_area(geometry: &SpatialGeometry) -> Result<f64> {
+    match geometry {
+        SpatialGeometry::Polygon(polygon) => Ok(polygon_area(polygon).abs()),
+        SpatialGeometry::MultiPolygon(polygons) => Ok(polygons
+            .iter()
+            .map(|polygon| polygon_area(polygon).abs())
+            .sum()),
+        _ => Err(DbError::sql("ST_Area supports POLYGON geometry inputs")),
+    }
+}
+
+fn polygon_area(polygon: &[Vec<Position>]) -> f64 {
+    let Some(shell) = polygon.first() else {
+        return 0.0;
+    };
+    let shell_area = ring_area(shell).abs();
+    let holes = polygon
+        .iter()
+        .skip(1)
+        .map(|ring| ring_area(ring).abs())
+        .sum::<f64>();
+    shell_area - holes
+}
+
+fn ring_area(ring: &[Position]) -> f64 {
+    if ring.len() < 3 {
+        return 0.0;
+    }
+    ring.windows(2)
+        .map(|segment| segment[0].x * segment[1].y - segment[1].x * segment[0].y)
+        .sum::<f64>()
+        * 0.5
+}
+
+fn geography_area_approx_meters(geometry: &SpatialGeometry) -> Result<f64> {
+    const DEG_TO_RAD: f64 = std::f64::consts::PI / 180.0;
+    let scale_polygon = |polygon: &[Vec<Position>]| -> f64 {
+        let mean_lat = polygon
+            .first()
+            .map(|ring| ring.iter().map(|p| p.y).sum::<f64>() / ring.len().max(1) as f64)
+            .unwrap_or(0.0)
+            .to_radians();
+        let meters_per_degree_lat = crate::spatial::distance::EARTH_RADIUS_METERS * DEG_TO_RAD;
+        let meters_per_degree_lon = meters_per_degree_lat * mean_lat.cos().abs().max(1e-12);
+        let scaled = polygon
+            .iter()
+            .map(|ring| {
+                ring.iter()
+                    .map(|p| Position::xy(p.x * meters_per_degree_lon, p.y * meters_per_degree_lat))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        polygon_area(&scaled).abs()
+    };
+    match geometry {
+        SpatialGeometry::Polygon(polygon) => Ok(scale_polygon(polygon)),
+        SpatialGeometry::MultiPolygon(polygons) => {
+            Ok(polygons.iter().map(|polygon| scale_polygon(polygon)).sum())
+        }
+        _ => Err(DbError::sql("ST_Area supports POLYGON geography inputs")),
     }
 }
 
@@ -23978,7 +25582,9 @@ fn json_value_from_value(value: &Value) -> Result<JsonValue> {
         Value::Float64(value) => Ok(JsonValue::Number(value.to_string())),
         Value::Bool(value) => Ok(JsonValue::Bool(*value)),
         Value::Text(value) => Ok(JsonValue::String(value.clone())),
-        Value::Blob(_) => Err(DbError::sql("cannot encode BLOB value as JSON")),
+        Value::Blob(_) | Value::Geometry(_) | Value::Geography(_) => {
+            Err(DbError::sql("cannot encode binary value as JSON"))
+        }
         Value::Decimal { scaled, scale } => {
             Ok(JsonValue::Number(decimal_to_string(*scaled, *scale)))
         }
@@ -24463,6 +26069,9 @@ fn value_to_text(value: &Value) -> Result<String> {
             value[8], value[9], value[10], value[11], value[12], value[13], value[14], value[15]
         )),
         Value::TimestampMicros(value) => Ok(value.to_string()),
+        Value::Geometry(_) | Value::Geography(_) => {
+            Err(DbError::sql("use ST_AsText to render spatial values"))
+        }
     }
 }
 
@@ -24512,6 +26121,18 @@ fn cast_value(value: Value, target_type: crate::catalog::ColumnType) -> Result<V
             Value::Blob(value) => Ok(Value::Blob(value)),
             Value::Uuid(value) => Ok(Value::Blob(value.to_vec())),
             other => Err(DbError::sql(format!("cannot cast {other:?} to BLOB"))),
+        },
+        crate::catalog::ColumnType::Geometry => match value {
+            Value::Geometry(value) => Ok(Value::Geometry(normalize_geometry_bytes(&value)?)),
+            other => Err(DbError::sql(format!(
+                "cannot cast {other:?} to GEOMETRY; use ST_GeomFromWKB or ST_GeomFromText"
+            ))),
+        },
+        crate::catalog::ColumnType::Geography => match value {
+            Value::Geography(value) => Ok(Value::Geography(normalize_geography_bytes(&value)?)),
+            other => Err(DbError::sql(format!(
+                "cannot cast {other:?} to GEOGRAPHY; use ST_GeogFromWKB or ST_GeogFromText"
+            ))),
         },
         crate::catalog::ColumnType::Decimal => match value {
             Value::Decimal { scaled, scale } => Ok(Value::Decimal { scaled, scale }),
@@ -24581,6 +26202,8 @@ fn infer_column_type_for_ctas(
             Value::Decimal { .. } => return crate::catalog::ColumnType::Decimal,
             Value::Uuid(_) => return crate::catalog::ColumnType::Uuid,
             Value::TimestampMicros(_) => return crate::catalog::ColumnType::Timestamp,
+            Value::Geometry(_) => return crate::catalog::ColumnType::Geometry,
+            Value::Geography(_) => return crate::catalog::ColumnType::Geography,
         }
     }
     crate::catalog::ColumnType::Text
@@ -24613,6 +26236,13 @@ fn eval_binary(op: &BinaryOp, left: Value, right: Value) -> Result<Value> {
         },
         BinaryOp::JsonExtract => eval_json_binary_operator(&left, &right, false),
         BinaryOp::JsonExtractText => eval_json_binary_operator(&left, &right, true),
+        BinaryOp::Distance => {
+            if matches!(left, Value::Null) || matches!(right, Value::Null) {
+                Ok(Value::Null)
+            } else {
+                Ok(Value::Float64(spatial_distance_values(&left, &right)?))
+            }
+        }
         BinaryOp::RegexMatch => eval_regex(left, right, false, false),
         BinaryOp::RegexMatchCaseInsensitive => eval_regex(left, right, true, false),
         BinaryOp::RegexNotMatch => eval_regex(left, right, false, true),
@@ -28578,6 +30208,11 @@ fn compare_values(left: &Value, right: &Value) -> Result<std::cmp::Ordering> {
         (Value::TimestampMicros(left), Value::TimestampMicros(right)) => Ok(left.cmp(right)),
         (Value::Blob(left), Value::Uuid(right)) => Ok(left.as_slice().cmp(right.as_slice())),
         (Value::Uuid(left), Value::Blob(right)) => Ok(left.as_slice().cmp(right.as_slice())),
+        (Value::Geometry(_), Value::Geometry(_)) | (Value::Geography(_), Value::Geography(_)) => {
+            Err(DbError::sql(
+                "spatial values do not have generic comparison semantics; use ST_Equals or spatial predicates",
+            ))
+        }
         _ => Err(DbError::sql(format!(
             "cannot compare values {left:?} and {right:?}"
         ))),
@@ -28795,6 +30430,7 @@ mod exec_mod_private_tests {
             columns: vec![crate::catalog::ColumnSchema {
                 name: "a".to_string(),
                 column_type: crate::catalog::ColumnType::Int64,
+                spatial_type: None,
                 nullable: false,
                 default_sql: None,
                 generated_sql: None,
@@ -28819,6 +30455,7 @@ mod exec_mod_private_tests {
             columns: vec![crate::catalog::ColumnSchema {
                 name: "g".to_string(),
                 column_type: crate::catalog::ColumnType::Int64,
+                spatial_type: None,
                 nullable: false,
                 default_sql: None,
                 generated_sql: Some("1".to_string()),
@@ -28843,6 +30480,7 @@ mod exec_mod_private_tests {
             columns: vec![crate::catalog::ColumnSchema {
                 name: "g".to_string(),
                 column_type: crate::catalog::ColumnType::Int64,
+                spatial_type: None,
                 nullable: false,
                 default_sql: None,
                 generated_sql: Some("1".to_string()),

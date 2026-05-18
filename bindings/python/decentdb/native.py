@@ -43,6 +43,8 @@ DDB_VALUE_BLOB = 5
 DDB_VALUE_DECIMAL = 6
 DDB_VALUE_UUID = 7
 DDB_VALUE_TIMESTAMP_MICROS = 8
+DDB_VALUE_GEOMETRY = 9
+DDB_VALUE_GEOGRAPHY = 10
 
 
 class DdbValue(Structure):
@@ -261,6 +263,20 @@ def load_library():
     _lib.ddb_stmt_bind_text.restype = c_uint32
     _lib.ddb_stmt_bind_blob.argtypes = [c_void_p, c_size_t, POINTER(c_uint8), c_size_t]
     _lib.ddb_stmt_bind_blob.restype = c_uint32
+    _lib.ddb_stmt_bind_geometry_wkb.argtypes = [
+        c_void_p,
+        c_size_t,
+        POINTER(c_uint8),
+        c_size_t,
+    ]
+    _lib.ddb_stmt_bind_geometry_wkb.restype = c_uint32
+    _lib.ddb_stmt_bind_geography_wkb.argtypes = [
+        c_void_p,
+        c_size_t,
+        POINTER(c_uint8),
+        c_size_t,
+    ]
+    _lib.ddb_stmt_bind_geography_wkb.restype = c_uint32
     _lib.ddb_stmt_bind_decimal.argtypes = [c_void_p, c_size_t, c_int64, c_uint8]
     _lib.ddb_stmt_bind_decimal.restype = c_uint32
     _lib.ddb_stmt_bind_timestamp_micros.argtypes = [c_void_p, c_size_t, c_int64]

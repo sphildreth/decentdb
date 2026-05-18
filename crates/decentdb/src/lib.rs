@@ -23,6 +23,7 @@ mod metadata;
 mod planner;
 mod record;
 mod search;
+pub(crate) mod spatial;
 mod sql;
 mod storage;
 mod sync;

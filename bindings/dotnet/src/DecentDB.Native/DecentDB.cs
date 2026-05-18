@@ -703,6 +703,49 @@ public sealed class PreparedStatement : IDisposable
         return this;
     }
 
+    public PreparedStatement BindGeometryWkb(int index1Based, byte[] bytes)
+    {
+        return BindSpatialWkb(index1Based, bytes, geography: false);
+    }
+
+    public PreparedStatement BindGeographyWkb(int index1Based, byte[] bytes)
+    {
+        return BindSpatialWkb(index1Based, bytes, geography: true);
+    }
+
+    private PreparedStatement BindSpatialWkb(int index1Based, byte[] bytes, bool geography)
+    {
+        var len = bytes?.Length ?? 0;
+        unsafe
+        {
+            if (len == 0)
+            {
+                var emptyStatus = geography
+                    ? DecentDBNativeUnsafe.ddb_stmt_bind_geography_wkb(Handle, checked((nuint)index1Based), null, 0)
+                    : DecentDBNativeUnsafe.ddb_stmt_bind_geometry_wkb(Handle, checked((nuint)index1Based), null, 0);
+                var emptyRes = _db.RecordStatus(emptyStatus);
+                if (emptyRes != 0)
+                {
+                    throw new DecentDBException(_db.LastErrorCode, _db.LastErrorMessage, _sql);
+                }
+                return this;
+            }
+
+            fixed (byte* pBytes = bytes)
+            {
+                var status = geography
+                    ? DecentDBNativeUnsafe.ddb_stmt_bind_geography_wkb(Handle, checked((nuint)index1Based), pBytes, checked((nuint)len))
+                    : DecentDBNativeUnsafe.ddb_stmt_bind_geometry_wkb(Handle, checked((nuint)index1Based), pBytes, checked((nuint)len));
+                var res = _db.RecordStatus(status);
+                if (res != 0)
+                {
+                    throw new DecentDBException(_db.LastErrorCode, _db.LastErrorMessage, _sql);
+                }
+            }
+        }
+        return this;
+    }
+
     public int Step()
     {
         var res = _db.RecordStatus(DecentDBNative.ddb_stmt_step(Handle, out var hasRow));
@@ -945,6 +988,8 @@ public sealed class PreparedStatement : IDisposable
                 DdbValueTag.Float64 => value.float64_value,
                 DdbValueTag.Text => GetTextFromValue(value),
                 DdbValueTag.Blob => GetBlobFromValue(value),
+                DdbValueTag.Geometry => GetBlobFromValue(value),
+                DdbValueTag.Geography => GetBlobFromValue(value),
                 DdbValueTag.Decimal => GetDecimalValue(value),
                 DdbValueTag.Uuid => GetBlobFromValue(value),
                 DdbValueTag.TimestampMicros => FromUnixEpochMicroseconds(value.timestamp_micros),
@@ -1292,6 +1337,8 @@ public sealed class PreparedStatement : IDisposable
             DdbValueTag.Float64 => (int)DbValueKind.Float64,
             DdbValueTag.Text => (int)DbValueKind.Text,
             DdbValueTag.Blob => (int)DbValueKind.Blob,
+            DdbValueTag.Geometry => (int)DbValueKind.Blob,
+            DdbValueTag.Geography => (int)DbValueKind.Blob,
             DdbValueTag.Uuid => (int)DbValueKind.Blob,
             DdbValueTag.Decimal => (int)DbValueKind.Decimal,
             DdbValueTag.TimestampMicros => (int)DbValueKind.Timestamp,
@@ -1321,6 +1368,8 @@ public sealed class PreparedStatement : IDisposable
         return (DdbValueTag)value.tag switch
         {
             DdbValueTag.Blob => CopyBytes(value.data, value.len),
+            DdbValueTag.Geometry => CopyBytes(value.data, value.len),
+            DdbValueTag.Geography => CopyBytes(value.data, value.len),
             DdbValueTag.Uuid =>
                 value.len == 0
                     ? CopyUuidBytes(value)

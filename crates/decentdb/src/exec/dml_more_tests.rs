@@ -18,6 +18,7 @@ mod tests {
                 crate::catalog::ColumnSchema {
                     name: "id".to_string(),
                     column_type: crate::catalog::ColumnType::Int64,
+                    spatial_type: None,
                     nullable: false,
                     default_sql: None,
                     generated_sql: None,
@@ -31,6 +32,7 @@ mod tests {
                 crate::catalog::ColumnSchema {
                     name: "val".to_string(),
                     column_type: crate::catalog::ColumnType::Int64,
+                    spatial_type: None,
                     nullable: false,
                     default_sql: None,
                     generated_sql: None,
@@ -95,6 +97,7 @@ mod tests {
                 crate::catalog::ColumnSchema {
                     name: "id".to_string(),
                     column_type: crate::catalog::ColumnType::Int64,
+                    spatial_type: None,
                     nullable: false,
                     default_sql: None,
                     generated_sql: None,
@@ -108,6 +111,7 @@ mod tests {
                 crate::catalog::ColumnSchema {
                     name: "val".to_string(),
                     column_type: crate::catalog::ColumnType::Int64,
+                    spatial_type: None,
                     nullable: false,
                     default_sql: None,
                     generated_sql: None,
@@ -172,6 +176,7 @@ mod tests {
                 crate::catalog::ColumnSchema {
                     name: "a".to_string(),
                     column_type: crate::catalog::ColumnType::Int64,
+                    spatial_type: None,
                     nullable: false,
                     default_sql: None,
                     generated_sql: None,
@@ -185,6 +190,7 @@ mod tests {
                 crate::catalog::ColumnSchema {
                     name: "b".to_string(),
                     column_type: crate::catalog::ColumnType::Int64,
+                    spatial_type: None,
                     nullable: false,
                     default_sql: None,
                     generated_sql: None,
@@ -220,6 +226,7 @@ mod tests {
                 crate::catalog::ColumnSchema {
                     name: "g".to_string(),
                     column_type: crate::catalog::ColumnType::Int64,
+                    spatial_type: None,
                     nullable: false,
                     default_sql: None,
                     generated_sql: Some("expr".to_string()),
@@ -233,6 +240,7 @@ mod tests {
                 crate::catalog::ColumnSchema {
                     name: "a".to_string(),
                     column_type: crate::catalog::ColumnType::Int64,
+                    spatial_type: None,
                     nullable: false,
                     default_sql: None,
                     generated_sql: None,
@@ -273,6 +281,7 @@ mod tests {
             columns: vec![crate::catalog::ColumnSchema {
                 name: "a".to_string(),
                 column_type: crate::catalog::ColumnType::Int64,
+                spatial_type: None,
                 nullable: false,
                 default_sql: None,
                 generated_sql: None,
@@ -313,6 +322,7 @@ mod tests {
                 crate::catalog::ColumnSchema {
                     name: "a".to_string(),
                     column_type: crate::catalog::ColumnType::Int64,
+                    spatial_type: None,
                     nullable: true,
                     default_sql: None,
                     generated_sql: None,
@@ -326,6 +336,7 @@ mod tests {
                 crate::catalog::ColumnSchema {
                     name: "b".to_string(),
                     column_type: crate::catalog::ColumnType::Int64,
+                    spatial_type: None,
                     nullable: true,
                     default_sql: None,
                     generated_sql: None,
@@ -392,6 +403,7 @@ mod tests {
             columns: vec![crate::catalog::ColumnSchema {
                 name: "id".to_string(),
                 column_type: crate::catalog::ColumnType::Int64,
+                spatial_type: None,
                 nullable: false,
                 default_sql: None,
                 generated_sql: None,

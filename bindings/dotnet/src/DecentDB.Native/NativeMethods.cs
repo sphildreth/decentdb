@@ -286,6 +286,12 @@ public static unsafe class DecentDBNativeUnsafe
     [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_stmt_bind_blob")]
     internal static extern uint ddb_stmt_bind_blob(IntPtr stmt, nuint index1Based, byte* data, nuint byteLen);
 
+    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_stmt_bind_geometry_wkb")]
+    internal static extern uint ddb_stmt_bind_geometry_wkb(IntPtr stmt, nuint index1Based, byte* data, nuint byteLen);
+
+    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_stmt_bind_geography_wkb")]
+    internal static extern uint ddb_stmt_bind_geography_wkb(IntPtr stmt, nuint index1Based, byte* data, nuint byteLen);
+
     [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_stmt_bind_uuid")]
     internal static extern uint ddb_stmt_bind_uuid(IntPtr stmt, nuint index1Based, byte* uuidBytes);
 
@@ -360,7 +366,9 @@ internal enum DdbValueTag : uint
     Blob = 5,
     Decimal = 6,
     Uuid = 7,
-    TimestampMicros = 8
+    TimestampMicros = 8,
+    Geometry = 9,
+    Geography = 10
 }
 
 [StructLayout(LayoutKind.Sequential)]

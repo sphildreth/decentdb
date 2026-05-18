@@ -17,7 +17,9 @@ pub fn stringify_value(value: &Value) -> String {
         Value::Float64(value) => value.to_string(),
         Value::Bool(value) => value.to_string(),
         Value::Text(value) => value.clone(),
-        Value::Blob(value) => format!("0x{}", hex_encode(value)),
+        Value::Blob(value) | Value::Geometry(value) | Value::Geography(value) => {
+            format!("0x{}", hex_encode(value))
+        }
         Value::Decimal { scaled, scale } => {
             if *scale == 0 {
                 scaled.to_string()

@@ -9142,6 +9142,18 @@ fn json_to_typed_value(
                 "column '{column_name}' in table '{table_name}' must be BLOB"
             ))),
         },
+        ColumnType::Geometry => match value {
+            JsonValue::String(value) => Ok(Value::Geometry(parse_json_blob(value)?)),
+            _ => Err(DbError::sql(format!(
+                "column '{column_name}' in table '{table_name}' must be GEOMETRY EWKB hex text"
+            ))),
+        },
+        ColumnType::Geography => match value {
+            JsonValue::String(value) => Ok(Value::Geography(parse_json_blob(value)?)),
+            _ => Err(DbError::sql(format!(
+                "column '{column_name}' in table '{table_name}' must be GEOGRAPHY EWKB hex text"
+            ))),
+        },
         ColumnType::Decimal => {
             let text = match value {
                 JsonValue::Number(value) => value.to_string(),
@@ -9662,6 +9674,7 @@ fn index_info(index: &IndexSchema) -> IndexInfo {
         kind: match index.kind {
             IndexKind::Btree => "btree",
             IndexKind::Trigram => "trigram",
+            IndexKind::Spatial => "spatial",
         }
         .to_string(),
         unique: index.unique,
@@ -9801,6 +9814,7 @@ fn schema_index_info(index: &IndexSchema) -> SchemaIndexInfo {
         kind: match index.kind {
             IndexKind::Btree => "btree",
             IndexKind::Trigram => "trigram",
+            IndexKind::Spatial => "spatial",
         }
         .to_string(),
         unique: index.unique,
@@ -9882,6 +9896,7 @@ fn runtime_index_entry_count(index: &RuntimeIndex) -> usize {
     match index {
         RuntimeIndex::Btree { keys } => keys.total_row_id_count(),
         RuntimeIndex::Trigram { index } => index.entry_count(),
+        RuntimeIndex::Spatial { index } => index.len(),
     }
 }
 
@@ -10688,6 +10703,7 @@ fn render_create_index(index: &IndexSchema) -> String {
     let using = match index.kind {
         IndexKind::Btree => String::new(),
         IndexKind::Trigram => " USING trigram".to_string(),
+        IndexKind::Spatial => " USING spatial".to_string(),
     };
     let columns = index
         .columns
@@ -10818,6 +10834,7 @@ fn render_value_sql(value: &Value) -> String {
         }
         Value::Text(value) => format!("'{}'", value.replace('\'', "''")),
         Value::Blob(value) => format!("X'{}'", hex_encode(value)),
+        Value::Geometry(value) | Value::Geography(value) => format!("X'{}'", hex_encode(value)),
         Value::Decimal { scaled, scale } => {
             if *scale == 0 {
                 scaled.to_string()
@@ -11021,6 +11038,7 @@ mod tests {
             columns: vec![ColumnSchema {
                 name: "id".to_string(),
                 column_type: ColumnType::Int64,
+                spatial_type: None,
                 nullable: false,
                 default_sql: None,
                 generated_sql: None,
@@ -11133,6 +11151,210 @@ mod tests {
                 Value::Text(":memory:".to_string())
             ]
         );
+    }
+
+    #[test]
+    fn spatial_geography_points_and_indexed_radius_query() {
+        let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
+        db.execute(
+            "CREATE TABLE places(
+                id INT PRIMARY KEY,
+                name TEXT,
+                geog GEOGRAPHY(POINT,4326)
+            )",
+        )
+        .expect("create places");
+        db.execute("CREATE INDEX places_geog_spatial ON places USING spatial (geog)")
+            .expect("create spatial index");
+        db.execute(
+            "INSERT INTO places VALUES
+                (1, 'austin', ST_GeogPoint(-97.7431, 30.2672)),
+                (2, 'dallas', ST_GeogPoint(-96.7970, 32.7767)),
+                (3, 'houston', ST_GeogPoint(-95.3698, 29.7604))",
+        )
+        .expect("insert places");
+
+        let nearby = db
+            .execute(
+                "SELECT id FROM places
+                 WHERE ST_DWithin(geog, ST_GeogPoint(-97.7431, 30.2672), 5000)
+                 ORDER BY id",
+            )
+            .expect("radius query");
+        assert_eq!(nearby.rows().len(), 1);
+        assert_eq!(nearby.rows()[0].values(), &[Value::Int64(1)]);
+
+        let accessors = db
+            .execute("SELECT ST_SRID(geog), ST_X(geog), ST_Y(geog) FROM places WHERE id = 1")
+            .expect("spatial accessors");
+        assert_eq!(accessors.rows()[0].values()[0], Value::Int64(4326));
+        assert!(
+            matches!(accessors.rows()[0].values()[1], Value::Float64(x) if (x + 97.7431).abs() < 1e-9)
+        );
+        assert!(
+            matches!(accessors.rows()[0].values()[2], Value::Float64(y) if (y - 30.2672).abs() < 1e-9)
+        );
+
+        let explain = db
+            .execute(
+                "EXPLAIN SELECT id FROM places
+                 WHERE ST_DWithin(geog, ST_GeogPoint(-97.7431, 30.2672), 5000)",
+            )
+            .expect("explain spatial filter");
+        assert!(explain
+            .explain_lines()
+            .iter()
+            .any(|line| line.contains("SpatialFilter")));
+
+        let knn = db
+            .execute(
+                "EXPLAIN SELECT id FROM places
+                 ORDER BY geog <-> ST_GeogPoint(-97.7431, 30.2672)
+                 LIMIT 1",
+            )
+            .expect("explain spatial knn");
+        assert!(knn
+            .explain_lines()
+            .iter()
+            .any(|line| line.contains("SpatialKnn")));
+    }
+
+    #[test]
+    fn spatial_geometry_polygons_predicates_and_measurements() {
+        let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
+        db.execute(
+            "CREATE TABLE regions(
+                id INT PRIMARY KEY,
+                area GEOMETRY(POLYGON,0)
+            )",
+        )
+        .expect("create regions");
+        db.execute("CREATE INDEX regions_area_spatial ON regions USING spatial (area)")
+            .expect("create spatial index");
+        db.execute(
+            "INSERT INTO regions VALUES
+             (1, ST_GeomFromText('POLYGON((0 0,10 0,10 10,0 10,0 0))'))",
+        )
+        .expect("insert polygon");
+
+        let result = db
+            .execute(
+                "SELECT
+                    ST_Contains(area, ST_GeomFromText('POINT(2 2)')),
+                    ST_Within(ST_GeomFromText('POINT(2 2)'), area),
+                    ST_Intersects(area, ST_GeomFromText('POINT(12 12)')),
+                    ST_Area(area)
+                 FROM regions
+                 WHERE ST_Intersects(area, ST_GeomFromText('POINT(2 2)'))",
+            )
+            .expect("polygon predicates");
+        assert_eq!(result.rows().len(), 1);
+        assert_eq!(result.rows()[0].values()[0], Value::Bool(true));
+        assert_eq!(result.rows()[0].values()[1], Value::Bool(true));
+        assert_eq!(result.rows()[0].values()[2], Value::Bool(false));
+        assert!(
+            matches!(result.rows()[0].values()[3], Value::Float64(area) if (area - 100.0).abs() < 1e-9)
+        );
+    }
+
+    #[test]
+    fn spatial_geometry_point_in_polygon_join_uses_spatial_index() {
+        let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
+        db.execute(
+            "CREATE TABLE houses(
+                id INT PRIMARY KEY,
+                location GEOMETRY(POINT,0)
+            )",
+        )
+        .expect("create houses");
+        db.execute(
+            "CREATE TABLE zones(
+                id INT PRIMARY KEY,
+                boundary GEOMETRY(POLYGON,0)
+            )",
+        )
+        .expect("create zones");
+        db.execute("CREATE INDEX zones_boundary_spatial ON zones USING spatial(boundary)")
+            .expect("create spatial index");
+        db.execute(
+            "INSERT INTO houses VALUES
+                (1, ST_GeomFromText('POINT(2 2)')),
+                (2, ST_GeomFromText('POINT(12 12)')),
+                (3, ST_GeomFromText('POINT(22 22)'))",
+        )
+        .expect("insert houses");
+        db.execute(
+            "INSERT INTO zones VALUES
+                (10, ST_GeomFromText('POLYGON((0 0,10 0,10 10,0 10,0 0))')),
+                (20, ST_GeomFromText('POLYGON((10 10,20 10,20 20,10 20,10 10))'))",
+        )
+        .expect("insert zones");
+
+        let result = db
+            .execute(
+                "SELECT h.id, z.id
+                 FROM houses h JOIN zones z
+                   ON ST_Contains(z.boundary, h.location)",
+            )
+            .expect("spatial join");
+        assert_eq!(result.rows().len(), 2);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[Value::Int64(1), Value::Int64(10)]
+        );
+        assert_eq!(
+            result.rows()[1].values(),
+            &[Value::Int64(2), Value::Int64(20)]
+        );
+
+        let explain = db
+            .execute(
+                "EXPLAIN SELECT h.id, z.id
+                 FROM houses h JOIN zones z
+                   ON ST_Contains(z.boundary, h.location)",
+            )
+            .expect("explain spatial join");
+        assert!(explain
+            .explain_lines()
+            .iter()
+            .any(|line| line.contains("SpatialJoin")));
+    }
+
+    #[test]
+    fn spatial_schema_values_and_indexes_persist_after_reopen() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("spatial.ddb");
+        let path = path.to_string_lossy().to_string();
+        {
+            let db = Db::open_or_create(&path, DbConfig::default()).expect("open db");
+            db.execute(
+                "CREATE TABLE places(
+                    id INT PRIMARY KEY,
+                    geog GEOGRAPHY(POINT,4326)
+                )",
+            )
+            .expect("create places");
+            db.execute("CREATE INDEX idx_places_geog ON places USING spatial(geog)")
+                .expect("create spatial index");
+            db.execute("INSERT INTO places VALUES (1, ST_GeogPoint(-97.7431, 30.2672))")
+                .expect("insert place");
+        }
+
+        let db = Db::open_or_create(&path, DbConfig::default()).expect("reopen db");
+        let result = db
+            .execute(
+                "SELECT ST_SRID(geog), ST_DWithin(geog, ST_GeogPoint(-97.7431, 30.2672), 1)
+                 FROM places",
+            )
+            .expect("query reopened spatial data");
+        assert_eq!(result.rows().len(), 1);
+        assert_eq!(result.rows()[0].values()[0], Value::Int64(4326));
+        assert_eq!(result.rows()[0].values()[1], Value::Bool(true));
+
+        let indexes = db.list_indexes().expect("list indexes");
+        assert!(indexes
+            .iter()
+            .any(|index| index.name == "idx_places_geog" && index.kind == "spatial"));
     }
 
     #[test]

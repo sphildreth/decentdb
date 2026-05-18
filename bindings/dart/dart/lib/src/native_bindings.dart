@@ -14,6 +14,8 @@ const int ddbTagBlob = 5;
 const int ddbTagDecimal = 6;
 const int ddbTagUuid = 7;
 const int ddbTagTimestampMicros = 8;
+const int ddbTagGeometry = 9;
+const int ddbTagGeography = 10;
 
 final class DdbDb extends Opaque {}
 
@@ -705,9 +707,8 @@ class NativeBindings {
         dbGetSchemaSnapshotJson =
             _lib.lookupFunction<_DbStringOutC, _DbStringOutDart>(
                 'ddb_db_get_schema_snapshot_json'),
-        dbInspectStorageStateJson = _lib.lookupFunction<
-                _DbInspectStorageStateC, _DbInspectStorageStateDart>(
-            'ddb_db_inspect_storage_state_json'),
+        dbInspectStorageStateJson = _lib.lookupFunction<_DbInspectStorageStateC,
+            _DbInspectStorageStateDart>('ddb_db_inspect_storage_state_json'),
         evictSharedWal =
             _lib.lookupFunction<_EvictSharedWalC, _EvictSharedWalDart>(
                 'ddb_evict_shared_wal'),
@@ -798,9 +799,8 @@ class NativeBindings {
                 _StmtBindInt64StepI64TextF64C,
                 _StmtBindInt64StepI64TextF64Dart>(
             'ddb_stmt_bind_int64_step_i64_text_f64'),
-        stmtBindUuid =
-            _lib.lookupFunction<_StmtBindUuidC, _StmtBindUuidDart>(
-                'ddb_stmt_bind_uuid');
+        stmtBindUuid = _lib.lookupFunction<_StmtBindUuidC, _StmtBindUuidDart>(
+            'ddb_stmt_bind_uuid');
 
   // ignore: unused_field – kept so DynamicLibrary stays live and symbols remain resolved
   final DynamicLibrary _lib;
