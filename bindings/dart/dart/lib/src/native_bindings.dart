@@ -707,6 +707,12 @@ class NativeBindings {
         dbGetSchemaSnapshotJson =
             _lib.lookupFunction<_DbStringOutC, _DbStringOutDart>(
                 'ddb_db_get_schema_snapshot_json'),
+        dbGetToolingMetadataJson =
+            _lib.lookupFunction<_DbStringOutC, _DbStringOutDart>(
+                'ddb_db_get_tooling_metadata_json'),
+        dbDescribeQueryJson =
+            _lib.lookupFunction<_DbNamedStringOutC, _DbNamedStringOutDart>(
+                'ddb_db_describe_query_json'),
         dbInspectStorageStateJson = _lib.lookupFunction<_DbInspectStorageStateC,
             _DbInspectStorageStateDart>('ddb_db_inspect_storage_state_json'),
         evictSharedWal =
@@ -837,6 +843,8 @@ class NativeBindings {
   final _DbNamedStringOutDart dbGetViewDdl;
   final _DbStringOutDart dbListTriggersJson;
   final _DbStringOutDart dbGetSchemaSnapshotJson;
+  final _DbStringOutDart dbGetToolingMetadataJson;
+  final _DbNamedStringOutDart dbDescribeQueryJson;
   final _DbInspectStorageStateDart dbInspectStorageStateJson;
   final _EvictSharedWalDart evictSharedWal;
 

@@ -374,6 +374,27 @@ class Database {
     return normalizeTriggers(JSON.parse(this._native.dbListTriggersJson(this._handle)));
   }
 
+  getToolingMetadata() {
+    if (!this._handle) throw new Error('Database is closed');
+    if (typeof this._native.dbGetToolingMetadataJson !== 'function') {
+      throw new Error('dbGetToolingMetadataJson not available in this build');
+    }
+    return JSON.parse(this._native.dbGetToolingMetadataJson(this._handle));
+  }
+
+  describeQueryContract(sql) {
+    if (!this._handle) throw new Error('Database is closed');
+    if (typeof sql !== 'string') throw new TypeError('sql must be a string');
+    if (typeof this._native.dbDescribeQueryJson !== 'function') {
+      throw new Error('dbDescribeQueryJson not available in this build');
+    }
+    return JSON.parse(this._native.dbDescribeQueryJson(this._handle, sql));
+  }
+
+  describeQuery(sql) {
+    return this.describeQueryContract(sql);
+  }
+
   get inTransaction() {
     if (!this._handle) throw new Error('Database is closed');
     if (typeof this._native.dbInTransaction !== 'function') return false;

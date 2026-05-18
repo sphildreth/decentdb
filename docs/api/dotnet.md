@@ -22,8 +22,8 @@ and `bindings/dotnet/benchmarks/`.
 
 ## C ABI coverage
 
-The .NET binding declares and exposes **all 50 C ABI functions** defined in
-`include/decentdb.h`. Performance-critical paths (batch execution, fused
+The .NET binding declares the C ABI functions used by the native, ADO.NET, EF
+Core, and MicroORM surfaces. Performance-critical paths (batch execution, fused
 bind+step, re-execute, zero-copy row views) are exposed through
 `DecentDBNativeUnsafe` and wrapped by the `PreparedStatement` class.
 
@@ -305,10 +305,16 @@ string viewDdl = db.GetViewDdl("v_active_users");      // CREATE VIEW ...
 // Triggers
 string triggersJson = db.ListTriggersJson();
 
+// Stable tooling metadata
+string metadataJson = db.GetToolingMetadataJson();
+string contractJson = db.DescribeQueryJson("SELECT id FROM users WHERE id = $1");
+
 // Via ADO.NET
 string ddl = conn.GetTableDdl("users");
 string views = conn.ListViewsJson();
 string triggers = conn.ListTriggersJson();
+string metadata = conn.GetToolingMetadataJson();
+string contract = conn.DescribeQueryJson("SELECT id FROM users WHERE id = $1");
 bool inTxn = conn.InTransaction;
 ```
 

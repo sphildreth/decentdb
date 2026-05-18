@@ -74,6 +74,33 @@ describe('Schema introspection', () => {
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it('returns tooling metadata and query contracts', () => {
+    const { db, dir } = tmpDb();
+    try {
+      db.exec('CREATE TABLE contract_users (id INT64 PRIMARY KEY, email TEXT NOT NULL)');
+
+      const metadata = db.getToolingMetadata();
+      assert.strictEqual(metadata.metadata_version, 1);
+      assert.strictEqual(metadata.schema_fingerprint_algorithm, 'sha256:decentdb-tooling-schema-v1');
+      assert.strictEqual(metadata.schema_fingerprint.length, 64);
+
+      const contract = db.describeQueryContract(
+        'SELECT id, email FROM contract_users WHERE id = $1'
+      );
+      assert.strictEqual(contract.contract_version, 1);
+      assert.strictEqual(contract.statement_kind, 'query');
+      assert.strictEqual(contract.read_only, true);
+      assert.strictEqual(contract.schema_fingerprint, metadata.schema_fingerprint);
+      assert.strictEqual(contract.parameters[0].type_name, 'INT64');
+      assert.strictEqual(contract.parameters[0].source_column, 'id');
+      assert.strictEqual(contract.result_columns[1].name, 'email');
+      assert.strictEqual(contract.result_columns[1].type_name, 'TEXT');
+    } finally {
+      db.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('Checkpoint', () => {

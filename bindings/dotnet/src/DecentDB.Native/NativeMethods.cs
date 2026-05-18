@@ -245,6 +245,9 @@ public static class DecentDBNative
     [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_db_list_triggers_json")]
     internal static extern uint ddb_db_list_triggers_json(IntPtr db, out IntPtr outJson);
 
+    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_db_get_tooling_metadata_json")]
+    internal static extern uint ddb_db_get_tooling_metadata_json(IntPtr db, out IntPtr outJson);
+
 }
 
 public static unsafe class DecentDBNativeUnsafe
@@ -312,6 +315,9 @@ public static unsafe class DecentDBNativeUnsafe
 
     [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_db_get_view_ddl")]
     internal static extern uint ddb_db_get_view_ddl(IntPtr db, byte* viewNameUtf8, out IntPtr outDdl);
+
+    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_db_describe_query_json")]
+    internal static extern uint ddb_db_describe_query_json(IntPtr db, byte* sqlUtf8, out IntPtr outJson);
 
     [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_stmt_bind_int64_step_row_view")]
     internal static extern uint ddb_stmt_bind_int64_step_row_view(IntPtr stmt, nuint index1Based, long value,

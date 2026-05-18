@@ -69,6 +69,7 @@ Unsupported arbitrary open-option strings are rejected instead of being silently
 - `inTransaction`
 - `listTables()`, `getTableColumns(name)`, `listIndexes()`
 - `getTableDdl(name)`, `listViewsInfo()`, `listViews()`, `getViewDdl(name)`, `listTriggers()`
+- `getToolingMetadata()`, `describeQueryContract(sql)`
 - instance getters: `abiVersion`, `engineVersion`
 - static helpers: `Database.abiVersion()`, `Database.version()`, `Database.evictSharedWal(path)`
 

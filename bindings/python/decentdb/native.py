@@ -216,6 +216,16 @@ def load_library():
     _lib.ddb_db_describe_table_json.restype = c_uint32
     _lib.ddb_db_list_indexes_json.argtypes = [c_void_p, POINTER(c_char_p)]
     _lib.ddb_db_list_indexes_json.restype = c_uint32
+    if hasattr(_lib, "ddb_db_get_tooling_metadata_json"):
+        _lib.ddb_db_get_tooling_metadata_json.argtypes = [c_void_p, POINTER(c_char_p)]
+        _lib.ddb_db_get_tooling_metadata_json.restype = c_uint32
+    if hasattr(_lib, "ddb_db_describe_query_json"):
+        _lib.ddb_db_describe_query_json.argtypes = [
+            c_void_p,
+            c_char_p,
+            POINTER(c_char_p),
+        ]
+        _lib.ddb_db_describe_query_json.restype = c_uint32
     if hasattr(_lib, "ddb_db_inspect_storage_state_json"):
         _lib.ddb_db_inspect_storage_state_json.argtypes = [c_void_p, POINTER(c_char_p)]
         _lib.ddb_db_inspect_storage_state_json.restype = c_uint32

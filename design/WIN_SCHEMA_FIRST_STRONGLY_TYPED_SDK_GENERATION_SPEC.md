@@ -6,8 +6,8 @@
   primitives, ABI/binding guarantees, and any low-level metadata export needed by
   Decent Bench.
 - **Audience:** Core DecentDB maintainers, Decent Bench maintainers, SDK/codegen contributors, documentation contributors, coding agents
-- **Related DecentDB roadmap item:** Stable schema and query-contract metadata
-  for tooling in [`FUTURE_WINS.md`](FUTURE_WINS.md)
+- **Related DecentDB foundation:** Stable schema and query-contract metadata
+  for tooling in [`STABLE_TOOLING_METADATA_CONTRACT.md`](STABLE_TOOLING_METADATA_CONTRACT.md)
 - **Related Decent Bench roadmap item:** Schema-first strongly typed SDK
   generation in `decent-bench/design/FUTURE_WINS.md`
 - **Suggested ADRs:**

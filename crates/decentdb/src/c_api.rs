@@ -2307,6 +2307,32 @@ pub extern "C" fn ddb_db_get_schema_snapshot_json(
 }
 
 #[no_mangle]
+pub extern "C" fn ddb_db_get_tooling_metadata_json(
+    db: *mut DbHandle,
+    out_json: *mut *mut c_char,
+) -> u32 {
+    ffi_boundary(|| {
+        let metadata = handle_ref(db, "db")?.db.get_tooling_metadata()?;
+        *out_ptr(out_json, "out_json")? = cstring_from_string(to_json_string(&metadata)?)?;
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_db_describe_query_json(
+    db: *mut DbHandle,
+    sql: *const c_char,
+    out_json: *mut *mut c_char,
+) -> u32 {
+    ffi_boundary(|| {
+        let sql = utf8_arg(sql, "sql")?;
+        let contract = handle_ref(db, "db")?.db.describe_query_contract(&sql)?;
+        *out_ptr(out_json, "out_json")? = cstring_from_string(to_json_string(&contract)?)?;
+        Ok(())
+    })
+}
+
+#[no_mangle]
 pub extern "C" fn ddb_db_inspect_storage_state_json(
     db: *mut DbHandle,
     out_json: *mut *mut c_char,
@@ -2703,6 +2729,80 @@ mod tests {
         let schema_snapshot = parse_json(&mut schema_snapshot_json);
         assert_eq!(schema_snapshot["snapshot_version"].as_u64(), Some(1));
         assert!(schema_snapshot["schema_cookie"].as_u64().is_some());
+
+        let mut tooling_metadata_json = ptr::null_mut();
+        assert_eq!(
+            ddb_db_get_tooling_metadata_json(db, &mut tooling_metadata_json),
+            DDB_OK
+        );
+        let tooling_metadata = parse_json(&mut tooling_metadata_json);
+        assert_eq!(tooling_metadata["metadata_version"].as_u64(), Some(1));
+        assert_eq!(
+            tooling_metadata["schema_fingerprint_algorithm"].as_str(),
+            Some("sha256:decentdb-tooling-schema-v1")
+        );
+        assert_eq!(
+            tooling_metadata["schema_fingerprint"]
+                .as_str()
+                .expect("schema fingerprint")
+                .len(),
+            64
+        );
+        assert_eq!(
+            tooling_metadata["schema"]["snapshot_version"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            tooling_metadata["capabilities"]["query_contract_version"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            tooling_metadata["capabilities"]["query_describe"].as_bool(),
+            Some(true)
+        );
+        let child_parent_type = tooling_metadata["column_type_metadata"]
+            .as_array()
+            .expect("column type metadata array")
+            .iter()
+            .find(|column| column["table_name"] == "child" && column["column_name"] == "parent_id")
+            .expect("child parent_id tooling type metadata");
+        assert_eq!(child_parent_type["column_type"].as_str(), Some("INT64"));
+        assert_eq!(
+            child_parent_type["type_info"]["c_value_tag"].as_u64(),
+            Some(1)
+        );
+
+        let describe_sql =
+            CString::new("SELECT id, parent_id FROM child WHERE parent_id = $1").expect("sql");
+        let mut query_contract_json = ptr::null_mut();
+        assert_eq!(
+            ddb_db_describe_query_json(db, describe_sql.as_ptr(), &mut query_contract_json),
+            DDB_OK
+        );
+        let query_contract = parse_json(&mut query_contract_json);
+        assert_eq!(query_contract["contract_version"].as_u64(), Some(1));
+        assert_eq!(query_contract["statement_kind"].as_str(), Some("query"));
+        assert_eq!(query_contract["read_only"].as_bool(), Some(true));
+        assert_eq!(
+            query_contract["schema_fingerprint"],
+            tooling_metadata["schema_fingerprint"]
+        );
+        assert_eq!(
+            query_contract["parameters"][0]["type_name"].as_str(),
+            Some("INT64")
+        );
+        assert_eq!(
+            query_contract["parameters"][0]["source_column"].as_str(),
+            Some("parent_id")
+        );
+        assert_eq!(
+            query_contract["result_columns"][0]["name"].as_str(),
+            Some("id")
+        );
+        assert_eq!(
+            query_contract["result_columns"][1]["type_name"].as_str(),
+            Some("INT64")
+        );
 
         let mut storage_state_json = ptr::null_mut();
         assert_eq!(

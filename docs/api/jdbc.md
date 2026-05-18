@@ -218,5 +218,7 @@ The driver includes:
 - JDBC metadata for tables, columns, indexes, keys, and type mapping
 - DecentDB-specific schema helpers on `DecentDBDatabaseMetaData` for table DDL
   and trigger listing
+- stable tooling metadata helpers on `DecentDBDatabaseMetaData`:
+  `getToolingMetadataJson()` and `describeQueryJson(sql)`
 
 For DBeaver integration details, see the [DBeaver guide](../user-guide/dbeaver.md).

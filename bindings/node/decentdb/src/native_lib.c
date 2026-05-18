@@ -88,6 +88,8 @@ typedef ddb_status_t (*fn_db_list_indexes_json_t)(ddb_db_t* db, char** out_json)
 typedef ddb_status_t (*fn_db_list_views_json_t)(ddb_db_t* db, char** out_json);
 typedef ddb_status_t (*fn_db_get_view_ddl_t)(ddb_db_t* db, const char* name, char** out_ddl);
 typedef ddb_status_t (*fn_db_list_triggers_json_t)(ddb_db_t* db, char** out_json);
+typedef ddb_status_t (*fn_db_get_tooling_metadata_json_t)(ddb_db_t* db, char** out_json);
+typedef ddb_status_t (*fn_db_describe_query_json_t)(ddb_db_t* db, const char* sql, char** out_json);
 typedef ddb_status_t (*fn_stmt_bind_timestamp_micros_t)(ddb_stmt_t* stmt, size_t index_1_based, int64_t micros);
 typedef ddb_status_t (*fn_stmt_step_row_view_t)(ddb_stmt_t* stmt, const ddb_value_view_t** out_values, size_t* out_columns, uint8_t* out_has_row);
 typedef ddb_status_t (*fn_stmt_rebind_int64_execute_t)(ddb_stmt_t* stmt, int64_t value, uint64_t* out_affected);
@@ -137,6 +139,8 @@ static struct {
   fn_db_list_views_json_t db_list_views_json;
   fn_db_get_view_ddl_t db_get_view_ddl;
   fn_db_list_triggers_json_t db_list_triggers_json;
+  fn_db_get_tooling_metadata_json_t db_get_tooling_metadata_json;
+  fn_db_describe_query_json_t db_describe_query_json;
   /* Optional extensions: present in current library but may be absent in older builds. */
   fn_stmt_bind_timestamp_micros_t stmt_bind_timestamp_micros;
   fn_stmt_step_row_view_t stmt_step_row_view;
@@ -521,6 +525,34 @@ static const char* wrap_list_triggers_json(decentdb_db* db, int* out_len) {
   return json;
 }
 
+static const char* wrap_get_tooling_metadata_json(decentdb_db* db, int* out_len) {
+  if (!g_sym.db_get_tooling_metadata_json) {
+    set_last_error("ddb_db_get_tooling_metadata_json not available");
+    t_last_status = 6;
+    return NULL;
+  }
+  char* json = NULL;
+  ddb_status_t status = g_sym.db_get_tooling_metadata_json(db, &json);
+  set_status(status);
+  if (status != DDB_OK || json == NULL) return NULL;
+  *out_len = (int)strlen(json);
+  return json;
+}
+
+static const char* wrap_describe_query_json(decentdb_db* db, const char* sql_utf8, int* out_len) {
+  if (!g_sym.db_describe_query_json) {
+    set_last_error("ddb_db_describe_query_json not available");
+    t_last_status = 6;
+    return NULL;
+  }
+  char* json = NULL;
+  ddb_status_t status = g_sym.db_describe_query_json(db, sql_utf8, &json);
+  set_status(status);
+  if (status != DDB_OK || json == NULL) return NULL;
+  *out_len = (int)strlen(json);
+  return json;
+}
+
 static int wrap_bind_timestamp_micros(decentdb_stmt* stmt, int index_1_based, int64_t micros) {
   if (!g_sym.stmt_bind_timestamp_micros) {
     set_last_error("ddb_stmt_bind_timestamp_micros not available");
@@ -677,6 +709,10 @@ static int resolve_all(DL_HANDLE h) {
   g_sym.db_list_views_json = (fn_db_list_views_json_t)load_sym(h, "ddb_db_list_views_json");
   g_sym.db_get_view_ddl = (fn_db_get_view_ddl_t)load_sym(h, "ddb_db_get_view_ddl");
   g_sym.db_list_triggers_json = (fn_db_list_triggers_json_t)load_sym(h, "ddb_db_list_triggers_json");
+  g_sym.db_get_tooling_metadata_json =
+      (fn_db_get_tooling_metadata_json_t)load_sym(h, "ddb_db_get_tooling_metadata_json");
+  g_sym.db_describe_query_json =
+      (fn_db_describe_query_json_t)load_sym(h, "ddb_db_describe_query_json");
 
   /* Optional extensions: do not fail loading if these are absent. */
   g_sym.stmt_bind_timestamp_micros =
@@ -769,6 +805,8 @@ static int resolve_all(DL_HANDLE h) {
   g_api.list_views_json = wrap_list_views_json;
   g_api.get_view_ddl = wrap_get_view_ddl;
   g_api.list_triggers_json = wrap_list_triggers_json;
+  g_api.get_tooling_metadata_json = wrap_get_tooling_metadata_json;
+  g_api.describe_query_json = wrap_describe_query_json;
   g_api.bind_timestamp_micros = wrap_bind_timestamp_micros;
   g_api.step_row_view = wrap_step_row_view;
   g_api.rebind_int64_execute = wrap_rebind_int64_execute;

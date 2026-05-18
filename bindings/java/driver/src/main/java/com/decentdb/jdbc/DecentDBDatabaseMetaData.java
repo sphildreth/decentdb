@@ -90,6 +90,16 @@ public final class DecentDBDatabaseMetaData implements DatabaseMetaData {
         return DecentDBNative.metaListTriggers(connection.getDbHandle());
     }
 
+    public String getToolingMetadataJson() throws SQLException {
+        connection.checkOpen();
+        return DecentDBNative.metaGetToolingMetadata(connection.getDbHandle());
+    }
+
+    public String describeQueryJson(String sql) throws SQLException {
+        connection.checkOpen();
+        return DecentDBNative.metaDescribeQuery(connection.getDbHandle(), sql);
+    }
+
     @Override
     public boolean nullsAreSortedHigh() { return false; }
 

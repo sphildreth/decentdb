@@ -105,6 +105,8 @@ typedef struct decentdb_native_api {
   const char* (*list_views_json)(decentdb_db* db, int* out_len);
   const char* (*get_view_ddl)(decentdb_db* db, const char* view_utf8, int* out_len);
   const char* (*list_triggers_json)(decentdb_db* db, int* out_len);
+  const char* (*get_tooling_metadata_json)(decentdb_db* db, int* out_len);
+  const char* (*describe_query_json)(decentdb_db* db, const char* sql_utf8, int* out_len);
 
   /* Library metadata (may be NULL if the loaded library pre-dates these exports). */
   uint32_t (*abi_version)(void);

@@ -209,6 +209,30 @@ public sealed class DecentDB : IDisposable
         return FreeStringOrEmpty(ptr);
     }
 
+    public string GetToolingMetadataJson()
+    {
+        var res = RecordStatus(DecentDBNative.ddb_db_get_tooling_metadata_json(Handle, out var ptr));
+        if (res != 0) throw new DecentDBException(_lastErrorCode, LastErrorMessage, "GetToolingMetadataJson");
+        return FreeStringOrEmpty(ptr);
+    }
+
+    public string DescribeQueryJson(string sql)
+    {
+        ArgumentNullException.ThrowIfNull(sql);
+        var sqlBytes = Encoding.UTF8.GetBytes(sql + "\0");
+        IntPtr ptr;
+        unsafe
+        {
+            fixed (byte* pSql = sqlBytes)
+            {
+                var res = RecordStatus(DecentDBNativeUnsafe.ddb_db_describe_query_json(Handle, pSql, out ptr));
+                if (res != 0) throw new DecentDBException(_lastErrorCode, LastErrorMessage, "DescribeQueryJson");
+            }
+        }
+
+        return FreeStringOrEmpty(ptr);
+    }
+
     public string SyncExecuteJson(string requestJson)
     {
         ArgumentNullException.ThrowIfNull(requestJson);

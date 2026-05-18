@@ -27,6 +27,7 @@ pub(crate) mod spatial;
 mod sql;
 mod storage;
 mod sync;
+mod tooling;
 mod vfs;
 mod wal;
 
@@ -48,8 +49,10 @@ pub use crate::error::{DbError, DbErrorCode, Result};
 pub use crate::exec::{BulkLoadOptions, QueryResult, QueryRow};
 pub use crate::metadata::{
     CheckConstraintInfo, ColumnInfo, ForeignKeyInfo, HeaderInfo, IndexInfo, IndexVerification,
-    SchemaColumnInfo, SchemaIndexInfo, SchemaSnapshot, SchemaTableInfo, SchemaTriggerInfo,
-    SchemaViewInfo, StorageInfo, TableInfo, TriggerInfo, ViewInfo,
+    QueryContract, QueryParameterInfo, QueryResultColumnInfo, SchemaColumnInfo, SchemaIndexInfo,
+    SchemaSnapshot, SchemaTableInfo, SchemaTriggerInfo, SchemaViewInfo, StorageInfo, TableInfo,
+    ToolingCapabilities, ToolingColumnTypeMetadata, ToolingMetadata, ToolingSpatialTypeInfo,
+    ToolingTypeInfo, TriggerInfo, ViewInfo,
 };
 pub use crate::record::value::Value;
 pub use crate::storage::DB_FORMAT_VERSION;

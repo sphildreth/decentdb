@@ -143,4 +143,30 @@ void main() {
     expect(indexNames, equals([...indexNames]..sort()));
     expect(triggerNames, equals([...triggerNames]..sort()));
   });
+
+  test('tooling metadata and query contract are exposed', () {
+    db.execute(
+        'CREATE TABLE contract_users (id INT64 PRIMARY KEY, email TEXT NOT NULL)');
+
+    final metadata = db.schema.getToolingMetadata();
+    expect(metadata['metadata_version'], 1);
+    expect(metadata['schema_fingerprint_algorithm'],
+        'sha256:decentdb-tooling-schema-v1');
+    expect((metadata['schema_fingerprint'] as String).length, 64);
+
+    final contract = db.schema.describeQueryContract(
+        'SELECT id, email FROM contract_users WHERE id = \$1');
+    expect(contract['contract_version'], 1);
+    expect(contract['statement_kind'], 'query');
+    expect(contract['read_only'], isTrue);
+    expect(contract['schema_fingerprint'], metadata['schema_fingerprint']);
+
+    final parameters = contract['parameters'] as List<dynamic>;
+    expect(parameters.single['type_name'], 'INT64');
+    expect(parameters.single['source_column'], 'id');
+
+    final columns = contract['result_columns'] as List<dynamic>;
+    expect(columns[1]['name'], 'email');
+    expect(columns[1]['type_name'], 'TEXT');
+  });
 }

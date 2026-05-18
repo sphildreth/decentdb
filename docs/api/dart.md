@@ -198,6 +198,8 @@ The packaged wrapper exposes:
 - `db.schema.listViews()` / `listViewsInfo()`
 - `db.schema.getViewDdl(name)`
 - `db.schema.listTriggers()`
+- `db.schema.getToolingMetadata()`
+- `db.schema.describeQueryContract(sql)`
 
 ### Rich schema snapshot
 

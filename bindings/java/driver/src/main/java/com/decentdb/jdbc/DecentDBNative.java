@@ -185,6 +185,12 @@ final class DecentDBNative {
     /** Returns JSON array of trigger metadata objects. */
     static native String metaListTriggers(long dbHandle);
 
+    /** Returns the stable tooling metadata contract as JSON. */
+    static native String metaGetToolingMetadata(long dbHandle);
+
+    /** Returns the stable non-executing query contract as JSON. */
+    static native String metaDescribeQuery(long dbHandle, String sql);
+
     // ---- Value kind constants (must match the DecentDB C ABI) ----------
     static final int KIND_NULL    = 0;
     static final int KIND_INT64   = 1;

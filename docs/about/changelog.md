@@ -17,6 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Stable schema and query-contract metadata for tooling:** added
+  `Db::get_tooling_metadata()`, `Db::describe_query_contract(sql)`, C ABI JSON
+  helpers, deterministic schema fingerprints, native type metadata, query
+  parameter/result-column contracts, and binding exposure across Python, Go,
+  .NET, Node.js, Java/JDBC, and Dart.
 - **Native geospatial types and spatial indexes:** added `GEOMETRY` and
   `GEOGRAPHY` column types with EWKB-backed storage, WKB/WKT/GeoJSON
   conversion functions, core `ST_*` accessors/predicates/measurements,

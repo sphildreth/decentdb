@@ -31,8 +31,9 @@ use crate::exec::{
 };
 use crate::metadata::{
     CheckConstraintInfo, ColumnInfo, ForeignKeyInfo, HeaderInfo, IndexInfo, IndexVerification,
-    SchemaColumnInfo, SchemaIndexInfo, SchemaSnapshot, SchemaTableInfo, SchemaTriggerInfo,
-    SchemaViewInfo, StorageInfo, TableInfo, TriggerInfo, ViewInfo,
+    QueryContract, SchemaColumnInfo, SchemaIndexInfo, SchemaSnapshot, SchemaTableInfo,
+    SchemaTriggerInfo, SchemaViewInfo, StorageInfo, TableInfo, ToolingMetadata, TriggerInfo,
+    ViewInfo,
 };
 use crate::record::overflow::read_overflow;
 use crate::record::value::{normalize_decimal, parse_decimal_text, Value};
@@ -2162,6 +2163,28 @@ impl Db {
     pub fn get_schema_snapshot(&self) -> Result<SchemaSnapshot> {
         let runtime = self.runtime_for_metadata_inspection()?;
         schema_snapshot(self, &runtime)
+    }
+
+    /// Returns the stable metadata contract intended for external tooling.
+    pub fn get_tooling_metadata(&self) -> Result<ToolingMetadata> {
+        let runtime = self.runtime_for_metadata_inspection()?;
+        let snapshot = schema_snapshot(self, &runtime)?;
+        crate::tooling::build_tooling_metadata(&snapshot, &runtime)
+    }
+
+    /// Describes a single SQL statement without executing it.
+    pub fn describe_query_contract(&self, sql: &str) -> Result<QueryContract> {
+        let runtime = self.runtime_for_metadata_inspection()?;
+        let prepared_sql = prepared_statement_sql(sql)?;
+        let statement = self.parsed_statement(&prepared_sql)?;
+        let snapshot = schema_snapshot(self, &runtime)?;
+        let metadata = crate::tooling::build_tooling_metadata(&snapshot, &runtime)?;
+        crate::tooling::describe_query_contract(
+            &prepared_sql,
+            statement.as_ref(),
+            &runtime,
+            &metadata.schema_fingerprint,
+        )
     }
 
     /// Verifies that a named index can be rebuilt logically from the persisted table state.
@@ -21868,6 +21891,187 @@ mod tests {
             .map(|trigger| trigger.name.clone())
             .collect::<Vec<_>>();
         assert_sorted_names(&trigger_names);
+    }
+
+    #[test]
+    fn tooling_metadata_fingerprint_ignores_row_counts_and_captures_spatial_types() {
+        let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
+        db.execute(
+            "CREATE TABLE sites (
+                id INT PRIMARY KEY,
+                name TEXT NOT NULL,
+                location GEOGRAPHY(POINT,4326),
+                boundary GEOMETRY(POLYGON,0)
+            )",
+        )
+        .expect("create sites");
+
+        let metadata = db.get_tooling_metadata().expect("tooling metadata");
+        assert_eq!(metadata.metadata_version, 1);
+        assert_eq!(
+            metadata.schema_fingerprint_algorithm,
+            "sha256:decentdb-tooling-schema-v1"
+        );
+        assert_eq!(metadata.schema_fingerprint.len(), 64);
+        assert!(metadata.capabilities.query_describe);
+        assert!(metadata.capabilities.deterministic_json);
+
+        let location_type = metadata
+            .column_type_metadata
+            .iter()
+            .find(|column| column.table_name == "sites" && column.column_name == "location")
+            .expect("location type metadata");
+        assert_eq!(location_type.column_type, "GEOGRAPHY");
+        assert_eq!(location_type.type_info.value_kind, "geography_ewkb");
+        assert_eq!(location_type.type_info.c_value_tag, 10);
+        let spatial = location_type
+            .type_info
+            .spatial
+            .as_ref()
+            .expect("location spatial metadata");
+        assert_eq!(spatial.subtype, "POINT");
+        assert_eq!(spatial.dimensions, "XY");
+        assert_eq!(spatial.srid, 4326);
+        let name_type = metadata
+            .column_type_metadata
+            .iter()
+            .find(|column| column.table_name == "sites" && column.column_name == "name")
+            .expect("name type metadata");
+        assert_eq!(name_type.type_info.c_value_tag, 4);
+
+        db.execute(
+            "INSERT INTO sites (id, name, location)
+             VALUES (1, 'austin', ST_GeogPoint(-97.7431, 30.2672))",
+        )
+        .expect("insert site");
+        let after_insert = db.get_tooling_metadata().expect("metadata after insert");
+        assert_eq!(
+            metadata.schema_fingerprint, after_insert.schema_fingerprint,
+            "data-only row-count changes must not alter the tooling schema fingerprint"
+        );
+
+        db.execute("CREATE INDEX sites_name_idx ON sites(name)")
+            .expect("create index");
+        let after_index = db.get_tooling_metadata().expect("metadata after index");
+        assert_ne!(
+            metadata.schema_fingerprint, after_index.schema_fingerprint,
+            "schema/index changes must alter the tooling schema fingerprint"
+        );
+    }
+
+    #[test]
+    fn describe_query_contract_infers_select_parameters_and_result_columns() {
+        let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
+        db.execute(
+            "CREATE TABLE users (
+                id INT64 PRIMARY KEY,
+                email TEXT NOT NULL,
+                location GEOGRAPHY(POINT,4326)
+            )",
+        )
+        .expect("create users");
+
+        let contract = db
+            .describe_query_contract(
+                "SELECT id, email, ST_DWithin(location, $1, $2) AS nearby
+                 FROM users
+                 WHERE id = $3 AND email ILIKE $4",
+            )
+            .expect("describe select");
+        assert_eq!(contract.contract_version, 1);
+        assert_eq!(contract.statement_kind, "query");
+        assert!(contract.read_only);
+        assert_eq!(contract.parameters.len(), 4);
+        assert_eq!(contract.parameters[0].name, "$1");
+        assert_eq!(
+            contract.parameters[0].type_name.as_deref(),
+            Some("GEOGRAPHY")
+        );
+        assert_eq!(contract.parameters[1].name, "$2");
+        assert_eq!(contract.parameters[1].type_name.as_deref(), Some("FLOAT64"));
+        assert_eq!(contract.parameters[2].name, "$3");
+        assert_eq!(contract.parameters[2].type_name.as_deref(), Some("INT64"));
+        assert_eq!(
+            contract.parameters[2].source_table.as_deref(),
+            Some("users")
+        );
+        assert_eq!(contract.parameters[2].source_column.as_deref(), Some("id"));
+        assert_eq!(contract.parameters[3].name, "$4");
+        assert_eq!(contract.parameters[3].type_name.as_deref(), Some("TEXT"));
+
+        assert_eq!(contract.result_columns.len(), 3);
+        assert_eq!(contract.result_columns[0].name, "id");
+        assert_eq!(
+            contract.result_columns[0].type_name.as_deref(),
+            Some("INT64")
+        );
+        assert_eq!(contract.result_columns[0].nullable, Some(false));
+        assert_eq!(
+            contract.result_columns[0].source_table.as_deref(),
+            Some("users")
+        );
+        assert_eq!(
+            contract.result_columns[0].source_column.as_deref(),
+            Some("id")
+        );
+        assert_eq!(contract.result_columns[1].name, "email");
+        assert_eq!(
+            contract.result_columns[1].type_name.as_deref(),
+            Some("TEXT")
+        );
+        assert_eq!(contract.result_columns[1].nullable, Some(false));
+        assert_eq!(contract.result_columns[2].name, "nearby");
+        assert_eq!(
+            contract.result_columns[2].type_name.as_deref(),
+            Some("BOOL")
+        );
+    }
+
+    #[test]
+    fn describe_query_contract_infers_insert_returning_contracts() {
+        let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
+        db.execute(
+            "CREATE TABLE users (
+                id INT64 PRIMARY KEY,
+                email TEXT NOT NULL
+            )",
+        )
+        .expect("create users");
+
+        let contract = db
+            .describe_query_contract(
+                "INSERT INTO users (id, email) VALUES ($1, $2) RETURNING id, email",
+            )
+            .expect("describe insert returning");
+        assert_eq!(contract.statement_kind, "insert");
+        assert!(!contract.read_only);
+        assert_eq!(contract.parameters.len(), 2);
+        assert_eq!(contract.parameters[0].type_name.as_deref(), Some("INT64"));
+        assert_eq!(
+            contract.parameters[0].source_table.as_deref(),
+            Some("users")
+        );
+        assert_eq!(contract.parameters[0].source_column.as_deref(), Some("id"));
+        assert_eq!(contract.parameters[1].type_name.as_deref(), Some("TEXT"));
+        assert_eq!(
+            contract.parameters[1].source_table.as_deref(),
+            Some("users")
+        );
+        assert_eq!(
+            contract.parameters[1].source_column.as_deref(),
+            Some("email")
+        );
+        assert_eq!(contract.result_columns.len(), 2);
+        assert_eq!(contract.result_columns[0].name, "id");
+        assert_eq!(
+            contract.result_columns[0].type_name.as_deref(),
+            Some("INT64")
+        );
+        assert_eq!(contract.result_columns[1].name, "email");
+        assert_eq!(
+            contract.result_columns[1].type_name.as_deref(),
+            Some("TEXT")
+        );
     }
 
     #[test]

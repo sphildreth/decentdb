@@ -600,6 +600,22 @@ namespace DecentDB.AdoNet
             return GetNativeDb().ListIndexesJson();
         }
 
+        /// <summary>
+        /// Returns the stable tooling metadata contract as JSON.
+        /// </summary>
+        public string GetToolingMetadataJson()
+        {
+            return GetNativeDb().GetToolingMetadataJson();
+        }
+
+        /// <summary>
+        /// Returns the stable non-executing query contract as JSON.
+        /// </summary>
+        public string DescribeQueryJson(string sql)
+        {
+            return GetNativeDb().DescribeQueryJson(sql);
+        }
+
         // ───── ADO.NET GetSchema ─────
 
         /// <summary>

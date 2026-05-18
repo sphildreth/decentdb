@@ -21,10 +21,11 @@ bindings/python/tests/
 
 ## C ABI coverage
 
-The Python binding declares and exposes **all 50 C ABI functions** defined in
-`include/decentdb.h`. Performance-critical paths (batch execution, fused
-bind+step, re-execute, zero-copy row views) are accelerated by the
-`_fastdecode.c` C extension when available, falling back to ctypes otherwise.
+The Python binding declares the C ABI functions used by the packaged DB-API,
+metadata, maintenance, and fast-path surfaces. Performance-critical paths
+(batch execution, fused bind+step, re-execute, zero-copy row views) are
+accelerated by the `_fastdecode.c` C extension when available, falling back to
+ctypes otherwise.
 
 ## Use the packaged Python binding
 
@@ -126,6 +127,12 @@ view_ddl = conn.get_view_ddl("v_active_users")
 
 # Triggers
 triggers = conn.list_triggers()           # [...]
+
+# Stable tooling metadata
+metadata = conn.get_tooling_metadata()
+contract = conn.describe_query_contract(
+    "SELECT id, name FROM users WHERE id = $1"
+)
 ```
 
 ## Version introspection

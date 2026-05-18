@@ -1512,6 +1512,59 @@ static napi_value js_db_list_indexes_json(napi_env env, napi_callback_info info)
   return json_api_call(env, w, api, api->list_indexes_json);
 }
 
+static napi_value js_db_get_tooling_metadata_json(napi_env env, napi_callback_info info) {
+  const decentdb_native_api* api = require_api(env);
+
+  size_t argc = 1;
+  napi_value argv[1];
+  napi_status st = napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
+  NAPI_CALL(env, st);
+
+  db_wrap* w = unwrap_db(env, argv[0]);
+  if (!w) return NULL;
+  if (!api->get_tooling_metadata_json) {
+    return throw_error(env, "DECENTDB_UNSUPPORTED", "ddb_db_get_tooling_metadata_json not available");
+  }
+  return json_api_call(env, w, api, api->get_tooling_metadata_json);
+}
+
+static napi_value js_db_describe_query_json(napi_env env, napi_callback_info info) {
+  const decentdb_native_api* api = require_api(env);
+
+  size_t argc = 2;
+  napi_value argv[2];
+  napi_status st = napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
+  NAPI_CALL(env, st);
+
+  db_wrap* w = unwrap_db(env, argv[0]);
+  if (!w) return NULL;
+  if (!api->describe_query_json) {
+    return throw_error(env, "DECENTDB_UNSUPPORTED", "ddb_db_describe_query_json not available");
+  }
+
+  size_t sql_len = 0;
+  st = napi_get_value_string_utf8(env, argv[1], NULL, 0, &sql_len);
+  if (st != napi_ok) return throw_error(env, "DECENTDB_ARGS", "sql must be a string");
+
+  char* sql = (char*)malloc(sql_len + 1);
+  if (!sql) return throw_error(env, "DECENTDB_OOM", "out of memory");
+  st = napi_get_value_string_utf8(env, argv[1], sql, sql_len + 1, &sql_len);
+  if (st != napi_ok) { free(sql); NAPI_CALL(env, st); }
+
+  int out_len = 0;
+  const char* ptr = api->describe_query_json(w->db, sql, &out_len);
+  free(sql);
+  if (!ptr) {
+    const char* msg = api->last_error_message(w->db);
+    return throw_error(env, "DECENTDB_ERR", msg ? msg : "native error");
+  }
+  napi_value result;
+  st = napi_create_string_utf8(env, ptr, (size_t)out_len, &result);
+  NAPI_CALL(env, st);
+  api->free((void*)ptr);
+  return result;
+}
+
 static napi_value string_api_result(napi_env env, const decentdb_native_api* api, const char* ptr, int out_len) {
   if (!ptr) {
     const char* msg = api->last_error_message(NULL);
@@ -2037,6 +2090,8 @@ static napi_value init(napi_env env, napi_value exports) {
      {"dbListViewsJson", 0, js_db_list_views_json, 0, 0, 0, napi_default, 0},
      {"dbGetViewDdl", 0, js_db_get_view_ddl, 0, 0, 0, napi_default, 0},
      {"dbListTriggersJson", 0, js_db_list_triggers_json, 0, 0, 0, napi_default, 0},
+     {"dbGetToolingMetadataJson", 0, js_db_get_tooling_metadata_json, 0, 0, 0, napi_default, 0},
+     {"dbDescribeQueryJson", 0, js_db_describe_query_json, 0, 0, 0, napi_default, 0},
      /* New in v2: in_transaction, evict_wal, version info */
     {"dbInTransaction", 0, js_db_in_transaction, 0, 0, 0, napi_default, 0},
     {"dbEvictSharedWal", 0, js_db_evict_shared_wal, 0, 0, 0, napi_default, 0},

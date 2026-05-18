@@ -4,10 +4,10 @@ DecentDB ships an in-tree Go package under `bindings/go/decentdb-go/`.
 
 ## C ABI coverage
 
-The Go binding exposes 28 of 50 C ABI functions directly through cgo.
-Performance-critical fused `step_row_view` is implemented (reduces cgo crossings
-per row from 2 to 1). Batch, re-execute, and fused bind+step operations remain
-as future optimizations.
+The Go binding exposes the `database/sql` driver plus DecentDB-specific direct
+helpers through cgo. Performance-critical fused `step_row_view` is implemented
+(reduces cgo crossings per row from 2 to 1). Batch, re-execute, and fused
+bind+step operations remain as future optimizations.
 
 ## Package surface
 
@@ -86,6 +86,8 @@ ddl, _ := db.GetTableDdl("users")
 views, _ := db.ListViews()
 viewDdl, _ := db.GetViewDdl("v_active_users")
 triggers, _ := db.ListTriggers()
+toolingMetadata, _ := db.GetToolingMetadataJson()
+queryContract, _ := db.DescribeQueryJson("SELECT id FROM users WHERE id = $1")
 
 // Transaction state
 if db.InTransaction() {

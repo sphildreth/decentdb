@@ -92,8 +92,17 @@ The crate exposes structured inspection helpers for the CLI and higher-level bin
 - `Db::list_indexes()`
 - `Db::list_views()`
 - `Db::list_triggers()`
+- `Db::get_schema_snapshot()`
+- `Db::get_tooling_metadata()`
+- `Db::describe_query_contract(sql)`
 - `Db::verify_index(name)`
 - `Db::dump_sql()`
+
+`get_tooling_metadata()` returns the versioned schema contract used by external
+tooling, including a deterministic schema fingerprint and native type metadata.
+`describe_query_contract(sql)` parses and analyzes a statement without executing
+it, returning parameter and result-column metadata plus diagnostics for unknown
+inference.
 
 Maintenance helpers:
 

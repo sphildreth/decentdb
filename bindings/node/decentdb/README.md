@@ -7,7 +7,8 @@ Node.js bindings for DecentDB via N-API.
 - explicit open modes: `Database.openOrCreate()`, `openExisting()`, `create()`
 - sync `exec()` and promise-based `execAsync()`
 - native prepared statements via `Database.prepare()` / `Statement`
-- schema helpers: tables, columns, indexes, table DDL, views, view DDL, triggers
+- schema helpers: tables, columns, indexes, table DDL, views, view DDL, triggers,
+  tooling metadata, and query contracts
 - transaction helpers plus `db.inTransaction`
 - version helpers: `Database.abiVersion()`, `Database.version()`
 - timestamp binding via `Statement.bindTimestamp(...)` or `timestampMicros(...)`

@@ -3387,6 +3387,27 @@ class Connection:
     def list_triggers(self):
         return self._call_json_api(self._lib.ddb_db_list_triggers_json)
 
+    def get_tooling_metadata(self):
+        func = getattr(self._lib, "ddb_db_get_tooling_metadata_json", None)
+        if func is None:
+            raise NotSupportedError(
+                "This DecentDB native library does not expose tooling metadata"
+            )
+        return self._call_json_api(func)
+
+    def describe_query_contract(self, sql):
+        if not isinstance(sql, str):
+            raise TypeError("sql must be a string")
+        func = getattr(self._lib, "ddb_db_describe_query_json", None)
+        if func is None:
+            raise NotSupportedError(
+                "This DecentDB native library does not expose query-contract metadata"
+            )
+        return self._call_json_api(func, sql.encode("utf-8"))
+
+    def describe_query(self, sql):
+        return self.describe_query_contract(sql)
+
     def inspect_storage_state(self):
         func = getattr(self._lib, "ddb_db_inspect_storage_state_json", None)
         if func is None:

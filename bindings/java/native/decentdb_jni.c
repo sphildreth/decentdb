@@ -1223,3 +1223,26 @@ Java_com_decentdb_jdbc_DecentDBNative_metaListTriggers(JNIEnv *env, jclass cls, 
     ddb_status_t status = ddb_db_list_triggers_json(as_db(dbHandle), &json);
     return json_from_statused_string(env, status, json);
 }
+
+JNIEXPORT jstring JNICALL
+Java_com_decentdb_jdbc_DecentDBNative_metaGetToolingMetadata(JNIEnv *env, jclass cls, jlong dbHandle)
+{
+    (void)cls;
+    char *json = NULL;
+    ddb_status_t status = ddb_db_get_tooling_metadata_json(as_db(dbHandle), &json);
+    return json_from_statused_string(env, status, json);
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_decentdb_jdbc_DecentDBNative_metaDescribeQuery(JNIEnv *env, jclass cls,
+    jlong dbHandle, jstring jsql)
+{
+    (void)cls;
+    if (dbHandle == 0 || jsql == NULL) return NULL;
+    char *sql = jstring_to_cstr(env, jsql);
+    if (sql == NULL) return NULL;
+    char *json = NULL;
+    ddb_status_t status = ddb_db_describe_query_json(as_db(dbHandle), sql, &json);
+    free(sql);
+    return json_from_statused_string(env, status, json);
+}

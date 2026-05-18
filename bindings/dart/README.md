@@ -34,6 +34,8 @@ idiomatic Dart API for desktop and CLI applications.
 - Rich schema metadata via `Schema.getSchemaSnapshot()` with typed Dart models
   (`SchemaSnapshot`, `SchemaTableInfo`, `SchemaColumnInfo`, `SchemaViewInfo`,
   `SchemaIndexInfo`, `SchemaTriggerInfo`, `SchemaCheckConstraintInfo`)
+- Stable tooling metadata and query contracts via `Schema.getToolingMetadata()`
+  and `Schema.describeQueryContract(sql)`
 - `ErrorCode.fromCode` throws `StateError` on unrecognised codes
 - `sqlite3` moved to `dev_dependencies` (only used by the benchmark)
 

@@ -299,6 +299,8 @@ The C ABI exposes JSON-returning helpers for schema and storage metadata:
 - `ddb_db_get_view_ddl`
 - `ddb_db_list_triggers_json`
 - `ddb_db_get_schema_snapshot_json`
+- `ddb_db_get_tooling_metadata_json`
+- `ddb_db_describe_query_json`
 - `ddb_db_inspect_storage_state_json`
 
 Each successful string-returning call transfers ownership of a `char *` to the
@@ -309,6 +311,22 @@ char *json = NULL;
 check(ddb_db_list_tables_json(db, &json), "list tables");
 puts(json);
 check(ddb_string_free(&json), "free json");
+```
+
+`ddb_db_get_tooling_metadata_json` returns the stable schema/tooling contract:
+engine version, format version, schema cookies, deterministic schema
+fingerprint, rich schema snapshot, native type metadata, and capability flags.
+
+`ddb_db_describe_query_json` parses and analyzes SQL without executing it:
+
+```c
+char *contract = NULL;
+check(ddb_db_describe_query_json(db,
+                                 "SELECT id, email FROM users WHERE id = $1",
+                                 &contract),
+      "describe query");
+puts(contract);
+check(ddb_string_free(&contract), "free contract");
 ```
 
 Maintenance helpers:

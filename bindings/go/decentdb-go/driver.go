@@ -239,6 +239,12 @@ func (d *DB) ListIndexes() ([]IndexInfo, error) { return d.c.ListIndexes() }
 // GetTableDdl returns the CREATE TABLE DDL for the given table.
 func (d *DB) GetTableDdl(tableName string) (string, error) { return d.c.GetTableDdl(tableName) }
 
+// GetToolingMetadataJson returns the stable tooling metadata contract as JSON.
+func (d *DB) GetToolingMetadataJson() (string, error) { return d.c.GetToolingMetadataJson() }
+
+// DescribeQueryJson returns the stable non-executing query contract as JSON.
+func (d *DB) DescribeQueryJson(sql string) (string, error) { return d.c.DescribeQueryJson(sql) }
+
 // ListViews returns metadata about all views as a JSON array.
 func (d *DB) ListViews() (string, error) { return d.c.ListViews() }
 
@@ -528,6 +534,36 @@ func (c *conn) GetTableDdl(tableName string) (string, error) {
 	status := C.ddb_db_get_table_ddl(c.db, cName, &ptr)
 	if status != C.DDB_OK {
 		return "", statusError(status, "")
+	}
+	defer freeAPIString(ptr)
+	return C.GoString(ptr), nil
+}
+
+// GetToolingMetadataJson returns the stable tooling metadata contract as JSON.
+func (c *conn) GetToolingMetadataJson() (string, error) {
+	if c.db == nil {
+		return "", driver.ErrBadConn
+	}
+	var ptr *C.char
+	status := C.ddb_db_get_tooling_metadata_json(c.db, &ptr)
+	if status != C.DDB_OK {
+		return "", statusError(status, "")
+	}
+	defer freeAPIString(ptr)
+	return C.GoString(ptr), nil
+}
+
+// DescribeQueryJson returns the stable non-executing query contract as JSON.
+func (c *conn) DescribeQueryJson(sql string) (string, error) {
+	if c.db == nil {
+		return "", driver.ErrBadConn
+	}
+	cSQL := C.CString(sql)
+	defer C.free(unsafe.Pointer(cSQL))
+	var ptr *C.char
+	status := C.ddb_db_describe_query_json(c.db, cSQL, &ptr)
+	if status != C.DDB_OK {
+		return "", statusError(status, sql)
 	}
 	defer freeAPIString(ptr)
 	return C.GoString(ptr), nil
