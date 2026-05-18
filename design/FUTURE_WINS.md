@@ -112,7 +112,10 @@ planner-aware, syncable, and portable across bindings.
 - normalized EWKB storage and ABI interchange
 - `SPATIAL` secondary indexes backed by covering cells in existing B+Tree storage
 - planner-native candidate generation and exact refinement
-- initial high-value slice: `GEOGRAPHY(POINT,4326)` nearest-neighbor and radius queries
+- richer first geospatial release: `GEOGRAPHY(POINT,4326)` nearest-neighbor and
+  radius queries, geography polygon containment/intersection workflows, planar
+  `GEOMETRY` point/line/polygon workflows, GeoJSON/WKT/WKB I/O, and a narrow
+  point-in-polygon spatial join path
 
 ### Guardrails
 
@@ -736,8 +739,10 @@ operational foundations.
 
 ## Near-Term Sequence
 
-1. Refresh the native geospatial first-slice spec around
-   `GEOGRAPHY(POINT,4326)`, radius queries, nearest-neighbor queries, and
+1. Refresh and accept the native geospatial ADRs around a richer first release:
+   `GEOGRAPHY(POINT,4326)` radius/KNN, geography polygon containment and
+   intersection, planar `GEOMETRY` point/line/polygon support,
+   GeoJSON/WKT/WKB I/O, a narrow point-in-polygon spatial join path, and
    planner-visible `SPATIAL` indexes before implementation.
 2. Continue schema-first SDK generation through Decent Bench while keeping
    DecentDB metadata authoritative.

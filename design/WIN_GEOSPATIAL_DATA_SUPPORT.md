@@ -39,9 +39,12 @@ The core decisions in this SPEC are:
    PROJ, GDAL, or other large C/C++ native stacks in the initial slices.
 7. Preserve `Z/M/ZM` dimensions from the first release, while defining initial
    query and index semantics on the **XY projection** only.
-8. Deliver the feature in explicit slices, starting with the highest-value,
-   easiest-to-validate workload: **`GEOGRAPHY(POINT,4326)` nearest-neighbor and
-   radius search**.
+8. Deliver the feature in explicit slices, but target a richer first shipping
+   geospatial release instead of a point-only preview. The first release should
+   cover **`GEOGRAPHY(POINT,4326)` radius/KNN**, **geography polygon
+   containment/intersection workflows**, **planar `GEOMETRY` point/line/polygon
+   workflows**, core `ST_*` predicates, GeoJSON/WKT/WKB I/O, and planner-visible
+   `SPATIAL` indexes for supported shapes.
 
 This document is intentionally written to be implementation-ready. It specifies:
 
@@ -263,14 +266,17 @@ executor.
 
 ### 5.7 Phased Delivery Is Mandatory
 
-This feature must not be implemented as a single large change.
+This feature must not be implemented as a single large change, but the first
+public release should be broad enough that real application teams can adopt it
+without immediately running into "toy GIS" limits.
 
 The initial slices are:
 
 1. type-system and binary format foundation
 2. `GEOGRAPHY(POINT,4326)` + spatial radius / KNN
-3. planar `GEOMETRY` + polygon/line support
-4. broader geography and planner/operator improvements
+3. geography polygon and point-in-polygon workflows
+4. planar `GEOMETRY` point/line/polygon workflows
+5. release-hardening planner/operator improvements
 
 ---
 
@@ -284,17 +290,22 @@ The initial slices are:
    - nearest neighbor
    - radius filtering
    - exact distance ordering
-4. Support exact spatial predicates for supported shapes.
-5. Preserve DecentDB's existing durability and single-writer safety model.
-6. Keep the C ABI and all bindings aligned on one canonical spatial format.
-7. Preserve compatibility with WASM/browser plans.
+4. Support common polygon workflows:
+   - points inside service areas, territories, parcels, or custom map shapes
+   - polygon intersection against indexed data
+   - GeoJSON import/export for app and map tooling
+5. Support exact spatial predicates for supported shapes.
+6. Preserve DecentDB's existing durability and single-writer safety model.
+7. Keep the C ABI and all bindings aligned on one canonical spatial format.
+8. Preserve compatibility with WASM/browser plans.
 
 ### 6.2 Secondary Goals
 
 1. Make spatial behavior inspectable in `EXPLAIN`.
 2. Provide GeoJSON/WKT/WKB input and output.
 3. Allow later exposure of cell-covering helper functions.
-4. Lay the groundwork for planner-native spatial joins.
+4. Provide a narrow first spatial-join path for common point-in-polygon joins,
+   while leaving arbitrary spatial joins for later optimization work.
 
 ---
 
@@ -317,21 +328,23 @@ The initial implementation will not attempt to provide all of GIS.
 11. Multi-column spatial indexes.
 12. Partial spatial indexes.
 13. Expression spatial indexes.
-14. Full planner-native spatial joins in the first shipping slice.
+14. Full arbitrary planner-native spatial joins in the first shipping release.
 
 ### 7.2 Deferred Areas
 
 - `ST_Transform`
-- `ST_Buffer`
-  - until `ST_Buffer` lands, `ST_DWithin(geom, other, distance)` is the
-    recommended substitute for common proximity-search workflows
+- full `ST_Buffer` coverage for all geometry/geography shapes
+  - a basic point-buffer helper may ship in the first release if it can be
+    implemented in pure Rust with stable, documented approximation semantics
+  - `ST_DWithin(geom, other, distance)` remains the preferred proximity-search
+    primitive for radius queries
 - advanced polygon overlay functions
 - true 3D semantics and 3D-aware indexing
 - measure-aware spatial semantics
 - `GEOGRAPHY` non-point KNN
 - `GEOMETRYCOLLECTION`
 - explicit geohash/H3 helper functions
-- planner-native `SPATIAL_JOIN`
+- arbitrary planner-native `SPATIAL_JOIN`
 - spatial statistics in `ANALYZE`
 
 ---
@@ -342,15 +355,19 @@ The intended end state for this workstream is:
 
 - typed `GEOMETRY` and `GEOGRAPHY`
 - indexable spatial columns through `USING SPATIAL`
-- exact distance and predicate functions
+- exact distance and predicate functions for points, lines, and polygons
 - parameterized prepared statements that still use spatial indexes
 - KNN ordering support for point columns
+- geography polygon containment/intersection workflows
+- a narrow index-assisted point-in-polygon spatial join path
 - WKB, WKT, and GeoJSON I/O
 - stable ABI-visible binary value transport
 - full docs and binding support
 
-The initial shipping slices will deliver this incrementally rather than all at
-once.
+The implementation should still land incrementally, but the first public
+geospatial release should not stop at point radius search. It should include the
+polygon and predicate workflows that application developers reasonably expect
+from native `GEOGRAPHY` / `GEOMETRY` support.
 
 ---
 
@@ -426,14 +443,19 @@ Rules:
 
 #### Slice 2
 
+- `GEOGRAPHY(POLYGON|MULTIPOLYGON,4326)`
+- polygon dimensions may preserve `XY`, `XYZ`, `XYM`, or `XYZM`
+- bare `GEOGRAPHY` accepts supported point and polygon geography values
+
+#### Slice 3
+
 - `GEOMETRY(POINT|LINESTRING|POLYGON, srid)`
 - those geometry subtypes may carry `XY`, `XYZ`, `XYM`, or `XYZM`
 - bare `GEOMETRY` allowed for those supported subtypes
 
-#### Slice 3
+#### Slice 4
 
-- `MULTI*` geometry/geography types
-- geography polygons
+- `MULTI*` planar geometry types
 
 ### 9.1.4 Rejected Forms
 
@@ -629,8 +651,9 @@ Rules:
   operates on XY only
 - `ST_Area` is initially supported for `GEOMETRY(POLYGON, ...)` and operates on
   XY only
-- geography variants are deferred until the corresponding non-point geography
-  slices land
+- geography polygon `ST_Area` lands with Slice 2 and must use documented
+  spherical approximation semantics until more advanced ellipsoidal behavior is
+  explicitly designed
 
 ### 9.3.5 Validation Helpers
 
@@ -1167,7 +1190,7 @@ Rules:
   touching the base table row
 - non-point envelope payload enables an extra cheap envelope pre-filter before
   exact geometry evaluation
-- geography non-point envelope payloads introduced in Slice 3 must be
+- geography non-point envelope payloads introduced in Slice 2 must be
   antimeridian-aware and must not assume a simple wrapped-longitude envelope
 
 ### 14.4.3 Why Rowid Is in the Key
@@ -1646,9 +1669,11 @@ Initial comparison set:
 - point WKT/WKB roundtrip across `XY`, `XYZ`, `XYM`, and `XYZM`
 - point-to-point `ST_Distance`
 - `ST_DWithin`
+- geography polygon `ST_Intersects`, `ST_Contains`, and `ST_Within`
 - planar `ST_Intersects`, `ST_Contains`, `ST_Within` once geometry slices land
 
-When geography polygons land, add explicit antimeridian and hemisphere cases.
+Slice 2 must include explicit geography polygon antimeridian and hemisphere
+cases.
 
 ## 20.4 Crash and Recovery Tests
 
@@ -1730,7 +1755,7 @@ Exit criteria:
 - parser/type metadata shape settled
 - value and catalog tag assignments frozen
 
-## 21.2 Slice 1: `GEOGRAPHY(POINT,4326)` Core
+## 21.2 Slice 1: `GEOGRAPHY(POINT,4326)` Radius And KNN Core
 
 Scope:
 
@@ -1756,7 +1781,7 @@ Semantic constraint:
 Explicitly out of scope in Slice 1:
 
 - geography polygons
-- geometry lines/polygons
+- geometry points/lines/polygons
 - `ST_Contains`
 - `ST_Within`
 - `ST_Intersects`
@@ -1767,7 +1792,47 @@ Exit criteria:
 - KNN point queries return exact top-k
 - WKB/WKT/GeoJSON roundtrip tests pass
 
-## 21.3 Slice 2: Planar `GEOMETRY`
+## 21.3 Slice 2: Geography Polygons And Containment
+
+Scope:
+
+- `GEOGRAPHY(POLYGON,4326)` and `GEOGRAPHY(MULTIPOLYGON,4326)`
+- WKB/WKT/GeoJSON input and output for supported geography polygons
+- polygon structural validation sufficient for safe predicate evaluation
+- antimeridian-safe geography polygon envelopes and coverings
+- `ST_Contains`
+- `ST_Within`
+- `ST_Intersects`
+- `ST_Equals`
+- `ST_Area`
+- `ST_IsValid`
+- index-assisted point-in-polygon and polygon-intersection query shapes where
+  one side is an indexed geography column and the other side is a literal or
+  bound parameter
+- a narrow point-in-polygon spatial join shape:
+
+```sql
+SELECT h.*, z.id AS zone_id
+FROM houses h
+JOIN zones z
+  ON ST_Contains(z.boundary, h.location);
+```
+
+Explicitly out of scope in Slice 2:
+
+- arbitrary geography spatial joins
+- geography line strings
+- non-point geography KNN
+- full geography buffer/overlay operations
+
+Exit criteria:
+
+- no false negatives across antimeridian tests
+- index-assisted point-in-polygon works for supported query shapes
+- spatial join result sets match exact nested-loop evaluation for the supported
+  point-in-polygon shape
+
+## 21.4 Slice 3: Planar `GEOMETRY`
 
 Scope:
 
@@ -1790,41 +1855,43 @@ Scope:
 - `ST_Length`
 - `ST_Area`
 - point KNN for geometry point columns
+- optional basic point `ST_Buffer` with documented approximation semantics,
+  if it remains pure Rust, deterministic, and WASM-compatible
 
-Explicitly out of scope in Slice 2:
+Explicitly out of scope in Slice 3:
 
-- multipolygon / multilinestring
-- geography polygons
-- spatial joins
+- geometry collection
+- arbitrary spatial joins
+- full buffer coverage for lines and polygons
+- topology editing and overlay operations
 
 Exit criteria:
 
 - geometry scan vs index equivalence tests pass
 - differential tests against PostGIS supported subset pass
 
-## 21.4 Slice 3: Multi-Geometry and Geography Polygons
+## 21.5 Slice 4: Multi-Geometry And Release Hardening
 
 Scope:
 
-- `MULTIPOINT`, `MULTILINESTRING`, `MULTIPOLYGON`
-- geography polygons
-- point-in-polygon on geography
-- `ST_Area` for supported geography polygons
-- `ST_IsValid` for supported geography polygon values
-- antimeridian-safe coverings for geography polygons
+- `MULTIPOINT`, `MULTILINESTRING`, and `MULTIPOLYGON` for planar geometry
+- better `EXPLAIN ANALYZE` reporting
+- binding and CLI examples for point, polygon, and spatial-join workflows
+- first-release polish for supported predicate recognition
 
 Exit criteria:
 
-- no false negatives across antimeridian tests
-- index-assisted point-in-polygon works for supported query shapes
+- planner output makes candidate/refinement behavior visible
+- docs include radius, nearest-neighbor, point-in-polygon, and spatial-join
+  examples
 
-## 21.5 Slice 4: Planner/Operator Improvements
+## 21.6 Slice 5: Post-Release Planner/Operator Improvements
 
 Scope:
 
 - broader boolean predicate recognition
 - better `EXPLAIN ANALYZE` reporting
-- optional early spatial join prototype
+- broader spatial join support beyond the first point-in-polygon join shape
 - optional covering helper functions for advanced users
 
 Possible helper functions:
@@ -1836,7 +1903,7 @@ ST_S2Covering(geography, max_cells, max_level)
 
 These are deferred and not required for the first shipping geospatial release.
 
-## 21.6 Slice 5: True 3D and Measure-Aware Extensions
+## 21.7 Slice 6: True 3D and Measure-Aware Extensions
 
 This slice requires acceptance of:
 

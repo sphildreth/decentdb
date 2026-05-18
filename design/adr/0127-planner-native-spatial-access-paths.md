@@ -26,6 +26,15 @@ The required decisions are:
    new spatial statistics in `ANALYZE`.
 8. Extend `EXPLAIN` / `EXPLAIN ANALYZE` to show spatial plan nodes and their
    candidate/refinement counters.
+9. Allow one narrow first-release spatial join shape for indexed
+   point-in-polygon workflows, while deferring arbitrary spatial joins:
+
+```sql
+SELECT h.*, z.id
+FROM houses h
+JOIN zones z
+  ON ST_Contains(z.boundary, h.location);
+```
 
 ## Rationale
 
@@ -72,12 +81,14 @@ Rejected.
 Prepared statements with bound parameters must still benefit from spatial
 indexes.
 
-### 3. Full Spatial Join Operator in the First Slice
+### 3. Full Arbitrary Spatial Join Operator in the First Release
 
 Rejected for the initial release.
 
-The first steps are single-table spatial filters and point KNN. Spatial joins
-can follow after those paths are stable and benchmarked.
+The first release may include one narrow, benchmarked point-in-polygon join
+shape for common application workflows. Arbitrary spatial joins should follow
+after single-table filters, KNN, and that constrained join path are stable and
+benchmarked.
 
 ### 4. Add Spatial Statistics Before Any Spatial Planning
 
