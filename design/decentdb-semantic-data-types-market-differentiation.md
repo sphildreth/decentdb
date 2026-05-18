@@ -21,9 +21,10 @@ DATE
 TIME
 TIMESTAMPTZ
 INTERVAL
+MACADDR (Phase 4)
 ```
 
-These are the only type additions justified at this time. Types such as `EMAIL`, `URL`, `PHONE`, `JSON`, `SEMVER`, `MONEY`, `GEOPOINT`, `VECTOR`, `MACADDR`, `HOSTNAME`, and `DOMAIN` are **rejected** as `ColumnType` variants. When in doubt, DecentDB follows PostgreSQL semantics; deviations are documented with rationale. Their validation and query value can be delivered through the existing `CHECK` constraint evaluator plus SQL functions, which is sufficient and avoids permanent type-system tax (see §2).
+`MACADDR` is approved but deferred to Phase 4. Types such as `EMAIL`, `URL`, `PHONE`, `JSON`, `SEMVER`, `MONEY`, `GEOPOINT`, `VECTOR`, `HOSTNAME`, and `DOMAIN` are **rejected** as `ColumnType` variants. When in doubt, DecentDB follows PostgreSQL semantics; deviations are documented with rationale. Their validation and query value can be delivered through the existing `CHECK` constraint evaluator plus SQL functions, which is sufficient and avoids permanent type-system tax (see §2).
 
 ---
 
@@ -529,8 +530,8 @@ time_extract_hour(t)        → INTEGER
 time_extract_minute(t)      → INTEGER
 time_extract_second(t)      → INTEGER
 time_extract_micros(t)      → INTEGER
-time_add_duration(t, d)     → TIME
-time_diff_micros(a, b)      → INTEGER (DURATION)
+time_add_interval(t, i)    → TIME       -- add interval to time (days/months ignored)
+time_diff_micros(a, b)  → INTERVAL
 time_to_text(t)             → TEXT
 time_from_text(text)        → TIME
 ```
@@ -558,7 +559,7 @@ Hash:                 Based on int64 value
 Index support:        B-tree
 Casts from:           TEXT, TIMESTAMP
 Casts to:             TEXT
-Functions:            time_extract_*(), time_add_duration(), time_diff_micros(), time_to_text(), time_from_text()
+Functions:            time_extract_*(), time_add_interval(), time_diff_micros(), time_to_text(), time_from_text()
 Binding behavior:     Phase A: canonical string; Phase B+: binding-native time type
 Migration:            ALTER COLUMN TYPE with USING time_from_text(old_col)
 Error codes:          E_TYPE_INVALID_TIME
@@ -616,85 +617,106 @@ WAL encoding:         Reuses TAG_TIMESTAMP (8); discrimination by catalog column
 
 ---
 
-### 5.7 `DURATION`
+### 5.7 `INTERVAL`
 
 #### Motivation
 
-Durations (elapsed time intervals) appear in jobs, timers, performance metrics, lease TTLs, cache expirations, retry policies, task estimates, telemetry, and billing. Storing them as text strings (`'30s'`, `'5m'`) requires parsing at query time and produces incorrect ordering (`'9s' < '100ms'` lexicographically).
+Intervals (elapsed time and calendar durations) appear in jobs, timers, performance metrics, lease TTLs, cache expirations, retry policies, task estimates, telemetry, and billing. Storing them as text strings (`'30s'`, `'5m'`) requires parsing at query time and produces incorrect ordering (`'9s' < '100ms'` lexicographically).
+
+DecentDB follows PostgreSQL's `INTERVAL` model: intervals are composed of a months component, a days component, and a microseconds component. This tripartite representation is necessary because `1 month` and `30 days` are not equivalent (months vary in length), and `1 day` and `86400 seconds` are not equivalent across DST boundaries. A single scalar (e.g., raw microseconds) cannot represent calendar-relative durations correctly.
 
 #### Storage format
 
-Signed 64-bit integer: microseconds. Encoded as zigzag varint.
+Three-field structure matching PostgreSQL's internal representation:
+
+```
+[months: zigzag-varint i32] [days: zigzag-varint i32] [microseconds: zigzag-varint i64]
+```
+
+Example encodings:
+
+| Input | months | days | microseconds | Total bytes (approx.) |
+|---|---|---|---|---|
+| `INTERVAL '30s'` | 0 | 0 | 30,000,000 | ~6 |
+| `INTERVAL '7d'` | 0 | 7 | 0 | ~3 |
+| `INTERVAL '1 month'` | 1 | 0 | 0 | ~2 |
+| `INTERVAL '1 year 2 months 3 days 4 hours'` | 14 | 3 | 14,400,000,000 | ~7 |
+
+The `months` field allows values ≥ 12 to represent multi-year intervals. The `days` and `microseconds` fields store non-calendar units. This is identical to PostgreSQL's approach: `INTERVAL '1 year'` is stored as `{months: 12, days: 0, usecs: 0}`.
 
 #### SQL syntax
 
 ```sql
 CREATE TABLE jobs (
     id INT PRIMARY KEY,
-    timeout DURATION NOT NULL,
-    retry_delay DURATION NOT NULL
+    timeout INTERVAL NOT NULL,
+    retry_delay INTERVAL NOT NULL
 );
 ```
 
 #### Literal syntax
 
 ```sql
-DURATION '30s'
-DURATION '5m'
-DURATION '2h'
-DURATION '7d'
-DURATION '1500ms'
-DURATION '500us'
+INTERVAL '30 seconds'
+INTERVAL '5 minutes'
+INTERVAL '2 hours'
+INTERVAL '7 days'
+INTERVAL '1 month'
+INTERVAL '1 year 2 months 3 days 4 hours 5 minutes 6.789 seconds'
 ```
 
-Units: `us` (microseconds), `ms` (milliseconds), `s` (seconds), `m` (minutes), `h` (hours), `d` (days).
+Units: `microseconds`/`ms`/`seconds`/`minutes`/`hours`/`days`/`weeks`/`months`/`years`, plus standard abbreviations. `days` (1 day = calendar day, not necessarily 86400 seconds across DST transitions), `months` (1 month = calendar month, 28–31 days), and `years` (1 year = 12 months) are calendar units stored in their respective fields. Sub-day units (hours, minutes, seconds, ms, µs) are accumulated into the `microseconds` field.
 
 #### Ordering
 
-Natural integer ordering (microseconds). `DURATION '9s' > DURATION '100ms'` correctly.
+Component-wise ordering: months first, then days, then microseconds. This matches PostgreSQL's interval comparison semantics. Note: intervals with different compositions can be semantically inequivalent but compare equal (e.g., `1 month` vs `30 days` — months=1/days=0 vs months=0/days=30 — months field decides: `1 month > 30 days`).
 
 #### Functions
 
 ```sql
-duration_micros(d)          → INTEGER
-duration_millis(d)          → INTEGER
-duration_seconds(d)         → INTEGER
-duration_from_micros(n)     → DURATION
-duration_from_millis(n)     → DURATION
-duration_from_seconds(n)    → DURATION
-duration_to_text(d)         → TEXT
-duration_from_text(text)    → DURATION
+interval_months(i)          → INTEGER       -- months field
+interval_days(i)            → INTEGER       -- days field
+interval_micros(i)          → INTEGER       -- microseconds field (absolute)
+interval_from_days(n)       → INTERVAL      -- days-only interval
+interval_from_micros(n)     → INTERVAL      -- microseconds-only interval
+interval_from_seconds(n)    → INTERVAL      -- seconds-only interval
+interval_to_text(i)         → TEXT
+interval_from_text(text)    → INTERVAL
 ```
 
 #### Arithmetic
 
 ```sql
-TIMESTAMPTZ '2026-01-01 00:00:00Z' + DURATION '30d'
-TIME '09:00:00' + DURATION '90m'
-date + DURATION '7d'
+TIMESTAMPTZ '2026-01-01 00:00:00Z' + INTERVAL '30 days'
+TIMESTAMPTZ '2026-03-15 12:00:00Z' + INTERVAL '1 month'   -- yields 2026-04-15
+TIME '09:00:00' + INTERVAL '90 minutes'
+DATE '2026-05-18' + INTERVAL '7 days'
+TIMESTAMP '2026-01-01 00:00:00' + INTERVAL '1 day'       -- note: naive timestamp, no DST awareness
 ```
+
+Calendar-aware arithmetic (months, days) requires a temporal operand (TIMESTAMPTZ, DATE). Adding `INTERVAL '1 month'` to `TIMESTAMPTZ` uses calendar arithmetic; adding `INTERVAL '30 seconds'` uses simple µs addition.
 
 #### Per-type checklist
 
 ```
-Type name:            DURATION
-Aliases:              INTERVAL (subset — only elapsed duration, not calendar intervals)
-Storage class:        Zigzag-varint int64 (microseconds)
-Inline size:          1–9 bytes (varint)
+Type name:            INTERVAL
+Aliases:              —
+Storage class:        Tripartite (zigzag-varint i32 months + i32 days + i64 microseconds)
+Inline size:          3–14 bytes (varint fields)
 Overflow behavior:    N/A (fixed width)
-Literal syntax:       DURATION 'N unit'
-Accepted inputs:      Number + unit (us, ms, s, m, h, d)
-Canonical format:     Highest-magnitude unit that preserves precision
-Comparison:           Integer ordering
-Hash:                 Based on int64 value
+Literal syntax:       INTERVAL 'N unit [N unit ...]'
+Accepted inputs:      PostgreSQL-compatible interval literals
+Canonical format:     Months-days-microseconds decomposition
+Comparison:           Component-wise (months, days, microseconds)
+Hash:                 Based on (months, days, microseconds) tuple
 Index support:        B-tree
 Casts from:           TEXT
 Casts to:             TEXT
-Functions:            duration_micros(), duration_millis(), duration_seconds(), duration_from_*(), duration_to_text(), duration_from_text()
-Binding behavior:     Phase A: canonical string; Phase B+: binding-native duration type
-Migration:            ALTER COLUMN TYPE with USING duration_from_text(old_col)
-Error codes:          E_TYPE_INVALID_DURATION
-WAL encoding:         Tag 18 + zigzag-varint int64
+Functions:            interval_months(), interval_days(), interval_micros(), interval_from_*(), interval_to_text(), interval_from_text()
+Binding behavior:     Phase A: canonical string (e.g., '1 mon 3 days 04:05:06'); Phase B+: binding-native interval type
+Migration:            ALTER COLUMN TYPE with USING interval_from_text(old_col)
+Error codes:          E_TYPE_INVALID_INTERVAL
+WAL encoding:         Tag 18 + varint months + varint days + varint microseconds
 ```
 
 ---
@@ -716,10 +738,10 @@ IPADDR
 CIDR
 DATE
 TIME
-DURATION
+INTERVAL
 ```
 
-`CIDR` depends on `IPADDR`. The three temporal types are independent of each other and of the network types. `DATE` and `TIME` fix the semantic collapse from ADR 0114.
+`CIDR` depends on `IPADDR`. The three temporal types are independent of each other and of the network types. `DATE` and `TIME` fix the semantic collapse from ADR 0114. `INTERVAL` follows PostgreSQL's tripartite model to correctly handle calendar-relative durations.
 
 ### Phase 3: Timezone semantics
 
@@ -728,6 +750,14 @@ TIMESTAMPTZ
 ```
 
 Already has native storage (`TAG_TIMESTAMP`). The addition is catalog-level semantic distinction and session display behavior. This can ship with or after the other temporal types.
+
+### Phase 4: Network address completion
+
+```
+MACADDR
+```
+
+`MACADDR` meets the storage (6/8 bytes vs 17-byte text) and ordering criteria but is lower priority than IPADDR/CIDR. Deferring to Phase 4 avoids overloading the initial implementation surface.
 
 ---
 
@@ -739,7 +769,7 @@ SQLite's dynamic type system associates the datatype with the value, not the col
 
 ### PostgreSQL
 
-PostgreSQL has `inet`, `cidr`, `macaddr`, and enum types. DecentDB's `IPADDR` and `CIDR` align with PostgreSQL's network address types conceptually but use a simpler binary encoding. DecentDB's `ENUM` follows PostgreSQL's model (ordered label set) but with stable-identifier storage rather than OID-based storage.
+PostgreSQL has `inet`, `cidr`, `macaddr`, `enum`, and `interval` types. DecentDB's `IPADDR` and `CIDR` align with PostgreSQL's network address types conceptually but use a simpler binary encoding. DecentDB's `ENUM` follows PostgreSQL's model (ordered label set) but with stable-identifier storage rather than OID-based storage. DecentDB's `INTERVAL` follows PostgreSQL's tripartite `{months, days, microseconds}` storage model directly.
 
 ### DuckDB
 
@@ -753,7 +783,7 @@ Semantic types are exposed to bindings in three maturity phases:
 
 | Phase | Behavior |
 |---|---|
-| Phase A | All values read as canonical strings via the C ABI. Type metadata exposed through `column_type` introspection. |
+| Phase A | New `ddb_value_tag_t` entries (11–18) are added to `include/decentdb.h`. All values read as canonical strings through the existing `ddb_value_t.data`/`len` path. Type metadata exposed through `column_type` introspection. Bindings that have not been updated still see these columns as TEXT-like string values. |
 | Phase B | Optional helper types in each language binding (e.g., `DecentDB.IpAddr` in .NET, `decentdb.IPAddr` in Go). |
 | Phase C | Typed parameter binding — `stmt.BindIpAddr(1, addr)` rather than binding as bytes/text. |
 
@@ -767,10 +797,13 @@ Phase A is the acceptance criterion for engine implementation. Phases B and C ar
 |---|---|---|
 | ENUM schema evolution breaks rows | High | Stable label identifiers decouple storage from declaration order |
 | IPADDR unified 16-byte encoding wastes space for IPv4-heavy datasets | Medium | Tagged encoding (4/16 byte select) benchmarked before final storage decision |
-| DATE/TIME/DURATION zigzag-varint encoding underflows on extreme negative values | Low | DATE epoch covers all practical ranges; DURATION negative values are uncommon but supported |
+| DATE/TIME/INTERVAL zigzag-varint encoding underflows on extreme negative values | Low | DATE epoch covers all practical ranges; INTERVAL negative values are uncommon but supported |
 | TIMESTAMPTZ session timezone requires global state | Medium | Default to UTC; session timezone is a connection-level setting, not engine-global |
+| INTERVAL tripartite storage is larger than a single int64 | Medium | Varint encoding compresses zero fields; most intervals use 1–2 of 3 fields. Matches PostgreSQL semantics; avoids DST/calendar bugs |
+| INTERVAL component-wise ordering can be unintuitive (1 month ≠ 30 days) | Medium | Documented explicitly; matches PostgreSQL behavior |
 | ~18 modification sites per type is maintenance burden | Medium | Each type documents its match sites; regression test suite covers type-dependent paths |
-| Row tag namespace exhaustion (255 max) | Low | 7 new tags use 13–18 of 255 available; room for ~237 more types before rework needed |
+| Row tag namespace exhaustion (255 max) | Low | 8 new types use 13–18 of 255 available (including MACADDR); room for ~237 more before rework needed |
+| ADR 0114 reversal (re-introducing DATE as distinct from TIMESTAMP) | Medium | Formal ADR to be created documenting the reversal and rationale before implementation |
 
 ---
 
@@ -778,7 +811,7 @@ Phase A is the acceptance criterion for engine implementation. Phases B and C ar
 
 The guiding question for every type decision is: **Does this require a `ColumnType` variant, or can `TEXT + CHECK + functions` deliver equivalent value?**
 
-Seven types pass this bar:
+Eight types pass this bar:
 
 | Type | Primary justification |
 |---|---|
@@ -788,6 +821,7 @@ Seven types pass this bar:
 | `DATE` | Compact storage (int32 days) + semantic correctness (date ≠ timestamp) |
 | `TIME` | Compact storage (int64 µs) + semantic correctness (time-of-day ≠ timestamp) |
 | `TIMESTAMPTZ` | Schema identity (distinct from naive TIMESTAMP) + session display semantics |
-| `DURATION` | Compact storage (int64 µs) + correct ordering + arithmetic integration with temporal types |
+| `INTERVAL` | Compact storage (tripartite 12–20 B vs text) + correct calendar ordering + arithmetic integration with temporal types + parametric (months/days/µs fields) |
+| `MACADDR` | Compact storage (6/8 B vs 17 B text) + correct binary ordering (Phase 4) |
 
-Types rejected (`EMAIL`, `URL`, `PHONE`, `SEMVER`, `JSON`, `MONEY`, `GEOPOINT`, `VECTOR`, `MACADDR`, `HOSTNAME`, `DOMAIN`) are better served by `TEXT` with `CHECK` constraints and SQL functions. Their schema-level identity wins do not justify permanent `ColumnType` expansion.
+Types rejected (`EMAIL`, `URL`, `PHONE`, `SEMVER`, `JSON`, `MONEY`, `GEOPOINT`, `VECTOR`, `HOSTNAME`, `DOMAIN`) are better served by `TEXT` with `CHECK` constraints and SQL functions. Their schema-level identity wins do not justify permanent `ColumnType` expansion. `MACADDR` is deferred to Phase 4 — it meets the storage and ordering criteria but is lower priority than the initial 8 types.
