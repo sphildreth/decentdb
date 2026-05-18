@@ -17,6 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Branch, diff, restore, and time-travel workflows:** added named snapshots,
+  read-only historical execution, branch metadata, branch-local writes,
+  branch commit/log markers, primary-key row diffs, guarded restore,
+  constrained merge, CLI and REPL support, Rust APIs, and a C ABI JSON bridge.
 - 12 proptest-based property tests for WAL delta encoding (roundtrip, no-op, size bounds, determinism, corruption rejection) and WAL frame format (page/commit/checkpoint roundtrips, header identity, invalid frame types, encoded-len consistency).
 - 4 crash-recovery edge-case tests: checkpoint survival, uncommitted transaction discard, WAL growth-and-truncation cycle, and SQL-level transaction isolation.
 - `wal_fuzz` standalone binary exercising 6 WAL-corruption strategies across 75+ DB states to verify recovery never panics.
