@@ -3,7 +3,11 @@
 use crate::error::{DbError, Result};
 use crate::record::compression::CompressionMode;
 use crate::record::overflow::{read_overflow, write_overflow, OverflowPointer};
-use crate::record::value::Value;
+use crate::record::value::{
+    cidr_payload_len, decode_cidr_payload, decode_ip_addr_payload, decode_mac_addr_payload,
+    encode_cidr_payload, encode_ip_addr_payload, encode_mac_addr_payload, ip_addr_payload_len,
+    mac_addr_payload_len, Value,
+};
 use crate::record::{
     decode_varint_u64, encode_varint_u64_into, zigzag_decode_u64, zigzag_encode_i64,
 };
@@ -22,6 +26,14 @@ const TAG_TEXT_OVERFLOW: u8 = 9;
 const TAG_BLOB_OVERFLOW: u8 = 10;
 const TAG_GEOMETRY: u8 = 11;
 const TAG_GEOGRAPHY: u8 = 12;
+const TAG_ENUM: u8 = 13;
+const TAG_IPADDR: u8 = 14;
+const TAG_CIDR: u8 = 15;
+const TAG_DATE: u8 = 16;
+const TAG_TIME: u8 = 17;
+const TAG_TIMESTAMP_TZ: u8 = 18;
+const TAG_INTERVAL: u8 = 19;
+const TAG_MACADDR: u8 = 20;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Row {
@@ -176,6 +188,71 @@ impl Row {
                     );
                     output.extend_from_slice(blob);
                 }
+                Value::Enum {
+                    enum_type_id,
+                    label_id,
+                } => {
+                    let mut payload = Vec::with_capacity(20);
+                    encode_varint_u64_into(*enum_type_id, &mut payload);
+                    encode_varint_u64_into(*label_id, &mut payload);
+                    output.push(TAG_ENUM);
+                    encode_varint_u64_into(payload.len() as u64, output);
+                    output.extend_from_slice(&payload);
+                }
+                Value::IpAddr { family, addr } => {
+                    output.push(TAG_IPADDR);
+                    encode_varint_u64_into(ip_addr_payload_len(*family)? as u64, output);
+                    encode_ip_addr_payload(*family, addr, output)?;
+                }
+                Value::Cidr {
+                    family,
+                    prefix_len,
+                    network,
+                } => {
+                    output.push(TAG_CIDR);
+                    encode_varint_u64_into(cidr_payload_len(*family)? as u64, output);
+                    encode_cidr_payload(*family, *prefix_len, network, output)?;
+                }
+                Value::MacAddr { len, bytes } => {
+                    output.push(TAG_MACADDR);
+                    encode_varint_u64_into(mac_addr_payload_len(*len)? as u64, output);
+                    encode_mac_addr_payload(*len, bytes, output)?;
+                }
+                Value::DateDays(value) => {
+                    let mut encoded = [0_u8; 10];
+                    let len =
+                        encode_varint_u64_fixed(zigzag_encode_i64(i64::from(*value)), &mut encoded);
+                    output.push(TAG_DATE);
+                    encode_varint_u64_into(len as u64, output);
+                    output.extend_from_slice(&encoded[..len]);
+                }
+                Value::TimeMicros(value) => {
+                    let mut encoded = [0_u8; 10];
+                    let len = encode_varint_u64_fixed(zigzag_encode_i64(*value), &mut encoded);
+                    output.push(TAG_TIME);
+                    encode_varint_u64_into(len as u64, output);
+                    output.extend_from_slice(&encoded[..len]);
+                }
+                Value::TimestampTzMicros(value) => {
+                    let mut encoded = [0_u8; 10];
+                    let len = encode_varint_u64_fixed(zigzag_encode_i64(*value), &mut encoded);
+                    output.push(TAG_TIMESTAMP_TZ);
+                    encode_varint_u64_into(len as u64, output);
+                    output.extend_from_slice(&encoded[..len]);
+                }
+                Value::Interval {
+                    months,
+                    days,
+                    micros,
+                } => {
+                    let mut payload = Vec::with_capacity(24);
+                    encode_varint_u64_into(zigzag_encode_i64(i64::from(*months)), &mut payload);
+                    encode_varint_u64_into(zigzag_encode_i64(i64::from(*days)), &mut payload);
+                    encode_varint_u64_into(zigzag_encode_i64(*micros), &mut payload);
+                    output.push(TAG_INTERVAL);
+                    encode_varint_u64_into(payload.len() as u64, output);
+                    output.extend_from_slice(&payload);
+                }
                 Value::Geometry(bytes) => {
                     output.push(TAG_GEOMETRY);
                     encode_varint_u64_into(
@@ -269,6 +346,78 @@ impl Row {
                 },
                 TAG_TEXT => Value::text_from_bytes(payload.to_vec())?,
                 TAG_BLOB => Value::Blob(payload.to_vec()),
+                TAG_ENUM => {
+                    let (enum_type_id, consumed_a) = decode_varint_u64(payload)?;
+                    let (label_id, consumed_b) = decode_varint_u64(&payload[consumed_a..])?;
+                    if consumed_a + consumed_b != payload.len() {
+                        return Err(DbError::corruption("ENUM payload has trailing bytes"));
+                    }
+                    Value::Enum {
+                        enum_type_id,
+                        label_id,
+                    }
+                }
+                TAG_IPADDR => {
+                    let (family, addr) = decode_ip_addr_payload(payload)?;
+                    Value::IpAddr { family, addr }
+                }
+                TAG_CIDR => {
+                    let (family, prefix_len, network) = decode_cidr_payload(payload)?;
+                    Value::Cidr {
+                        family,
+                        prefix_len,
+                        network,
+                    }
+                }
+                TAG_MACADDR => {
+                    let (len, bytes) = decode_mac_addr_payload(payload)?;
+                    Value::MacAddr { len, bytes }
+                }
+                TAG_DATE => {
+                    let (encoded, consumed) = decode_varint_u64(payload)?;
+                    if consumed != payload.len() {
+                        return Err(DbError::corruption("DATE payload has trailing bytes"));
+                    }
+                    let value = zigzag_decode_u64(encoded);
+                    let date = i32::try_from(value)
+                        .map_err(|_| DbError::corruption("DATE payload exceeds i32 range"))?;
+                    Value::DateDays(date)
+                }
+                TAG_TIME => {
+                    let (encoded, consumed) = decode_varint_u64(payload)?;
+                    if consumed != payload.len() {
+                        return Err(DbError::corruption("TIME payload has trailing bytes"));
+                    }
+                    Value::TimeMicros(zigzag_decode_u64(encoded))
+                }
+                TAG_TIMESTAMP_TZ => {
+                    let (encoded, consumed) = decode_varint_u64(payload)?;
+                    if consumed != payload.len() {
+                        return Err(DbError::corruption(
+                            "TIMESTAMPTZ payload has trailing bytes",
+                        ));
+                    }
+                    Value::TimestampTzMicros(zigzag_decode_u64(encoded))
+                }
+                TAG_INTERVAL => {
+                    let (months_encoded, consumed_a) = decode_varint_u64(payload)?;
+                    let (days_encoded, consumed_b) = decode_varint_u64(&payload[consumed_a..])?;
+                    let (micros_encoded, consumed_c) =
+                        decode_varint_u64(&payload[consumed_a + consumed_b..])?;
+                    if consumed_a + consumed_b + consumed_c != payload.len() {
+                        return Err(DbError::corruption("INTERVAL payload has trailing bytes"));
+                    }
+                    let months = i32::try_from(zigzag_decode_u64(months_encoded))
+                        .map_err(|_| DbError::corruption("INTERVAL months exceed i32 range"))?;
+                    let days = i32::try_from(zigzag_decode_u64(days_encoded))
+                        .map_err(|_| DbError::corruption("INTERVAL days exceed i32 range"))?;
+                    let micros = zigzag_decode_u64(micros_encoded);
+                    Value::Interval {
+                        months,
+                        days,
+                        micros,
+                    }
+                }
                 TAG_GEOMETRY => Value::Geometry(payload.to_vec()),
                 TAG_GEOGRAPHY => Value::Geography(payload.to_vec()),
                 TAG_DECIMAL => {
@@ -385,6 +534,48 @@ mod tests {
                 .prop_map(|(scaled, scale)| Value::Decimal { scaled, scale }),
             proptest::array::uniform16(any::<u8>()).prop_map(Value::Uuid),
             any::<i64>().prop_map(Value::TimestampMicros),
+            (any::<u64>(), any::<u64>()).prop_map(|(enum_type_id, label_id)| Value::Enum {
+                enum_type_id,
+                label_id,
+            }),
+            proptest::array::uniform4(any::<u8>()).prop_map(|octets| {
+                let mut addr = [0_u8; 16];
+                addr[..4].copy_from_slice(&octets);
+                Value::IpAddr { family: 4, addr }
+            }),
+            proptest::array::uniform16(any::<u8>())
+                .prop_map(|addr| Value::IpAddr { family: 6, addr }),
+            prop_oneof![
+                Just(Value::Cidr {
+                    family: 4,
+                    prefix_len: 24,
+                    network: [10, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                }),
+                Just(Value::Cidr {
+                    family: 6,
+                    prefix_len: 64,
+                    network: [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                }),
+            ],
+            prop_oneof![
+                proptest::collection::vec(any::<u8>(), 6).prop_map(|octets| {
+                    let mut bytes = [0_u8; 8];
+                    bytes[..6].copy_from_slice(&octets);
+                    Value::MacAddr { len: 6, bytes }
+                }),
+                proptest::array::uniform8(any::<u8>())
+                    .prop_map(|bytes| Value::MacAddr { len: 8, bytes }),
+            ],
+            any::<i32>().prop_map(Value::DateDays),
+            (0_i64..86_400_000_000_i64).prop_map(Value::TimeMicros),
+            any::<i64>().prop_map(Value::TimestampTzMicros),
+            (any::<i32>(), any::<i32>(), any::<i64>()).prop_map(|(months, days, micros)| {
+                Value::Interval {
+                    months,
+                    days,
+                    micros,
+                }
+            }),
         ]
     }
 
@@ -428,6 +619,47 @@ mod tests {
             Value::Int64(i64::MAX),
             Value::TimestampMicros(i64::MIN),
             Value::TimestampMicros(i64::MAX),
+            Value::Enum {
+                enum_type_id: 7,
+                label_id: u64::MAX,
+            },
+            Value::IpAddr {
+                family: 4,
+                addr: [127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            },
+            Value::IpAddr {
+                family: 6,
+                addr: [0xff; 16],
+            },
+            Value::Cidr {
+                family: 4,
+                prefix_len: 0,
+                network: [0; 16],
+            },
+            Value::Cidr {
+                family: 6,
+                prefix_len: 128,
+                network: [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            },
+            Value::MacAddr {
+                len: 6,
+                bytes: [0, 1, 2, 3, 4, 5, 0, 0],
+            },
+            Value::MacAddr {
+                len: 8,
+                bytes: [0, 1, 2, 3, 4, 5, 6, 7],
+            },
+            Value::DateDays(i32::MIN),
+            Value::DateDays(i32::MAX),
+            Value::TimeMicros(0),
+            Value::TimeMicros(86_399_999_999),
+            Value::TimestampTzMicros(i64::MIN),
+            Value::TimestampTzMicros(i64::MAX),
+            Value::Interval {
+                months: i32::MIN,
+                days: i32::MAX,
+                micros: i64::MIN,
+            },
             Value::Decimal {
                 scaled: i64::MIN,
                 scale: u8::MAX,
@@ -439,6 +671,54 @@ mod tests {
             Value::Text(String::new()),
             Value::Text("Grüße, 世界".to_string()),
             Value::Blob(Vec::new()),
+        ]);
+
+        let encoded = row.encode().expect("encode");
+        let decoded = Row::decode(&encoded).expect("decode");
+        assert_eq!(decoded, row);
+    }
+
+    #[test]
+    fn semantic_values_roundtrip_compact_payloads() {
+        let row = Row::new(vec![
+            Value::Enum {
+                enum_type_id: 128,
+                label_id: 3,
+            },
+            Value::IpAddr {
+                family: 4,
+                addr: [10, 1, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            },
+            Value::IpAddr {
+                family: 6,
+                addr: [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            },
+            Value::Cidr {
+                family: 4,
+                prefix_len: 24,
+                network: [10, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            },
+            Value::Cidr {
+                family: 6,
+                prefix_len: 64,
+                network: [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            },
+            Value::MacAddr {
+                len: 6,
+                bytes: [8, 0, 0x2b, 1, 2, 3, 0, 0],
+            },
+            Value::MacAddr {
+                len: 8,
+                bytes: [8, 0, 0x2b, 1, 2, 3, 4, 5],
+            },
+            Value::DateDays(20_000),
+            Value::TimeMicros(12_345_678),
+            Value::TimestampTzMicros(-9_876_543),
+            Value::Interval {
+                months: 14,
+                days: -3,
+                micros: 30_000_000,
+            },
         ]);
 
         let encoded = row.encode().expect("encode");

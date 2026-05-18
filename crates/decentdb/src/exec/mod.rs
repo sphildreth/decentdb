@@ -39,8 +39,8 @@ use crate::btree::read::find_exact as btree_find_exact;
 use crate::btree::table::free_table_btree;
 use crate::btree::write::Btree;
 use crate::catalog::{
-    identifiers_equal, CatalogState, ColumnSchema, ColumnType, IndexKind, IndexSchema, IndexStats,
-    SchemaInfo, TableSchema, TableStats, ViewSchema,
+    identifiers_equal, CatalogState, ColumnSchema, ColumnType, EnumLabel, EnumTypeInfo, IndexKind,
+    IndexSchema, IndexStats, SchemaInfo, TableSchema, TableStats, ViewSchema,
 };
 use crate::error::{DbError, Result};
 use crate::json::{parse_json, parse_json_path, JsonValue};
@@ -53,7 +53,13 @@ use crate::record::overflow::{
     OverflowTailInfo, OVERFLOW_HEADER_SIZE,
 };
 use crate::record::row::Row;
-use crate::record::value::{compare_decimal, parse_decimal_text, Value};
+use crate::record::value::{
+    compare_cidr, compare_decimal, compare_interval, compare_ip_addr, compare_mac_addr,
+    format_cidr, format_date_days, format_interval, format_ip_addr, format_mac_addr,
+    format_time_micros, format_timestamp_tz_micros, parse_cidr, parse_date_days,
+    parse_decimal_text, parse_interval, parse_ip_addr, parse_mac_addr, parse_time_micros,
+    parse_timestamp_tz_micros, Value,
+};
 use crate::search::{TrigramIndex, TrigramQueryResult};
 use crate::spatial::index::{SpatialEnvelope, SpatialIndexBackend, SpatialRuntimeIndex};
 use crate::spatial::types::{
@@ -91,11 +97,13 @@ const INDEX_INCLUDE_COLUMNS_SECTION_MAGIC: &[u8; 8] = b"DDBICL1\0";
 const SCHEMAS_SECTION_MAGIC: &[u8; 8] = b"DDBSCH01";
 const PK_INDEX_ROOTS_SECTION_MAGIC: &[u8; 8] = b"DDBPKR01";
 const SPATIAL_COLUMNS_SECTION_MAGIC: &[u8; 8] = b"DDBSPT01";
+const ENUM_COLUMNS_SECTION_MAGIC: &[u8; 8] = b"DDBENU01";
 const SIGNED_ROW_ID_BIAS: u64 = 0x8000_0000_0000_0000;
 const DEFERRED_COMPRESSED_LOOKUP_CACHE_LIMIT: usize = 32;
 static RANDOM_STATE: AtomicU64 = AtomicU64::new(0);
 static DEFERRED_COMPRESSED_LOOKUP_CACHE: OnceLock<Mutex<DeferredCompressedLookupCache>> =
     OnceLock::new();
+const EXEC_MICROS_PER_DAY: i64 = 86_400_000_000;
 
 fn generated_columns_are_stored(table: &TableSchema) -> bool {
     table
@@ -3617,6 +3625,7 @@ impl EngineRuntime {
                 name: name.clone(),
                 column_type: infer_column_type_for_ctas(&source.rows, index),
                 spatial_type: None,
+                enum_type: None,
                 nullable: true,
                 default: None,
                 generated: None,
@@ -13082,7 +13091,7 @@ fn encode_runtime_payload(runtime: &EngineRuntime) -> Result<Vec<u8>> {
         encode_u32(&mut output, table.columns.len() as u32);
         for column in &table.columns {
             encode_string(&mut output, &column.name)?;
-            output.push(column.column_type as u8);
+            output.push(encode_column_type(column.column_type));
             output.push(u8::from(column.nullable));
             encode_optional_string(&mut output, column.default_sql.as_deref())?;
             output.push(u8::from(column.primary_key));
@@ -13157,6 +13166,7 @@ fn encode_runtime_payload(runtime: &EngineRuntime) -> Result<Vec<u8>> {
     encode_index_include_columns_section(&mut output, &runtime.catalog.indexes)?;
     encode_generated_columns_section(&mut output, &runtime.catalog.tables)?;
     encode_spatial_columns_section(&mut output, &runtime.catalog.tables)?;
+    encode_enum_columns_section(&mut output, &runtime.catalog.tables)?;
     Ok(output)
 }
 
@@ -13207,6 +13217,7 @@ fn decode_runtime_payload(bytes: &[u8]) -> Result<EngineRuntime> {
                 name,
                 column_type,
                 spatial_type: None,
+                enum_type: None,
                 nullable,
                 default_sql,
                 generated_sql: None,
@@ -13320,6 +13331,9 @@ fn decode_runtime_payload(bytes: &[u8]) -> Result<EngineRuntime> {
         decode_spatial_columns_section(&mut cursor, &mut runtime.catalog_mut().tables)?;
     }
     if cursor.offset < cursor.bytes.len() {
+        decode_enum_columns_section(&mut cursor, &mut runtime.catalog_mut().tables)?;
+    }
+    if cursor.offset < cursor.bytes.len() {
         decode_pk_index_roots_section(&mut cursor, &mut runtime.catalog_mut().tables)?;
     }
     Ok(runtime)
@@ -13349,7 +13363,7 @@ fn encode_manifest_payload_with_offsets(
         encode_u32(&mut output, table.columns.len() as u32);
         for column in &table.columns {
             encode_string(&mut output, &column.name)?;
-            output.push(column.column_type as u8);
+            output.push(encode_column_type(column.column_type));
             output.push(u8::from(column.nullable));
             encode_optional_string(&mut output, column.default_sql.as_deref())?;
             output.push(u8::from(column.primary_key));
@@ -13445,6 +13459,7 @@ fn encode_manifest_payload_with_offsets(
     encode_index_include_columns_section(&mut output, &runtime.catalog.indexes)?;
     encode_generated_columns_section(&mut output, &runtime.catalog.tables)?;
     encode_spatial_columns_section(&mut output, &runtime.catalog.tables)?;
+    encode_enum_columns_section(&mut output, &runtime.catalog.tables)?;
     encode_pk_index_roots_section(
         &mut output,
         &runtime.catalog.tables,
@@ -13559,6 +13574,7 @@ fn decode_manifest_payload<S: PageStore>(_store: &S, bytes: &[u8]) -> Result<Eng
                 name,
                 column_type,
                 spatial_type: None,
+                enum_type: None,
                 nullable,
                 default_sql,
                 generated_sql: None,
@@ -13706,6 +13722,9 @@ fn decode_manifest_payload<S: PageStore>(_store: &S, bytes: &[u8]) -> Result<Eng
     }
     if cursor.offset < cursor.bytes.len() {
         decode_spatial_columns_section(&mut cursor, &mut runtime.catalog_mut().tables)?;
+    }
+    if cursor.offset < cursor.bytes.len() {
+        decode_enum_columns_section(&mut cursor, &mut runtime.catalog_mut().tables)?;
     }
     if cursor.offset < cursor.bytes.len() {
         decode_pk_index_roots_section(&mut cursor, &mut runtime.catalog_mut().tables)?;
@@ -15101,6 +15120,10 @@ fn encode_u32(output: &mut Vec<u8>, value: u32) {
     output.extend_from_slice(&value.to_le_bytes());
 }
 
+fn encode_u64(output: &mut Vec<u8>, value: u64) {
+    output.extend_from_slice(&value.to_le_bytes());
+}
+
 fn encode_i64(output: &mut Vec<u8>, value: i64) {
     output.extend_from_slice(&value.to_le_bytes());
 }
@@ -15221,6 +15244,45 @@ fn encode_spatial_columns_section(
         let srid = u32::try_from(spatial_type.srid)
             .map_err(|_| DbError::constraint("spatial SRID must be non-negative"))?;
         encode_u32(output, srid);
+    }
+    Ok(())
+}
+
+fn encode_enum_columns_section(
+    output: &mut Vec<u8>,
+    tables: &BTreeMap<String, TableSchema>,
+) -> Result<()> {
+    let enum_columns = tables
+        .values()
+        .flat_map(|table| {
+            table.columns.iter().filter_map(move |column| {
+                column
+                    .enum_type
+                    .as_ref()
+                    .map(|enum_type| (table.name.as_str(), column.name.as_str(), enum_type))
+            })
+        })
+        .collect::<Vec<_>>();
+    output.extend_from_slice(ENUM_COLUMNS_SECTION_MAGIC);
+    output.push(1);
+    encode_u32(
+        output,
+        u32::try_from(enum_columns.len())
+            .map_err(|_| DbError::constraint("enum column count exceeds u32"))?,
+    );
+    for (table_name, column_name, enum_type) in enum_columns {
+        encode_string(output, table_name)?;
+        encode_string(output, column_name)?;
+        encode_u64(output, enum_type.type_id);
+        encode_u32(
+            output,
+            u32::try_from(enum_type.labels.len())
+                .map_err(|_| DbError::constraint("enum label count exceeds u32"))?,
+        );
+        for label in &enum_type.labels {
+            encode_u64(output, label.id);
+            encode_string(output, &label.label)?;
+        }
     }
     Ok(())
 }
@@ -15477,6 +15539,57 @@ fn decode_spatial_columns_section(
     Ok(())
 }
 
+fn decode_enum_columns_section(
+    cursor: &mut Cursor<'_>,
+    tables: &mut BTreeMap<String, TableSchema>,
+) -> Result<()> {
+    let section_is_present = cursor
+        .bytes
+        .get(cursor.offset..cursor.offset + ENUM_COLUMNS_SECTION_MAGIC.len())
+        .is_some_and(|magic| magic == ENUM_COLUMNS_SECTION_MAGIC);
+    if !section_is_present {
+        return Ok(());
+    }
+    cursor.offset += ENUM_COLUMNS_SECTION_MAGIC.len();
+    let version = cursor.read_u8()?;
+    if version != 1 {
+        return Err(DbError::corruption(format!(
+            "unknown enum columns section version {version}"
+        )));
+    }
+    let entry_count = cursor.read_u32()?;
+    for _ in 0..entry_count {
+        let table_name = cursor.read_string()?;
+        let column_name = cursor.read_string()?;
+        let type_id = cursor.read_u64()?;
+        let label_count = cursor.read_u32()?;
+        let mut labels = Vec::with_capacity(label_count as usize);
+        for _ in 0..label_count {
+            labels.push(EnumLabel {
+                id: cursor.read_u64()?,
+                label: cursor.read_string()?,
+            });
+        }
+        let table = tables.get_mut(&table_name).ok_or_else(|| {
+            DbError::corruption(format!(
+                "enum column metadata referenced unknown table {table_name}"
+            ))
+        })?;
+        let column = table
+            .columns
+            .iter_mut()
+            .find(|column| identifiers_equal(&column.name, &column_name))
+            .ok_or_else(|| {
+                DbError::corruption(format!(
+                    "enum column metadata referenced unknown column {}.{}",
+                    table_name, column_name
+                ))
+            })?;
+        column.enum_type = Some(EnumTypeInfo { type_id, labels });
+    }
+    Ok(())
+}
+
 fn decode_pk_index_roots_section(
     cursor: &mut Cursor<'_>,
     tables: &mut BTreeMap<String, TableSchema>,
@@ -15558,6 +15671,29 @@ fn decode_spatial_dimensions_tag(tag: u8) -> Result<crate::catalog::SpatialDimen
     }
 }
 
+fn encode_column_type(column_type: crate::catalog::ColumnType) -> u8 {
+    match column_type {
+        crate::catalog::ColumnType::Int64 => 0,
+        crate::catalog::ColumnType::Float64 => 1,
+        crate::catalog::ColumnType::Text => 2,
+        crate::catalog::ColumnType::Bool => 3,
+        crate::catalog::ColumnType::Blob => 4,
+        crate::catalog::ColumnType::Decimal => 5,
+        crate::catalog::ColumnType::Uuid => 6,
+        crate::catalog::ColumnType::Timestamp => 7,
+        crate::catalog::ColumnType::Geometry => 8,
+        crate::catalog::ColumnType::Geography => 9,
+        crate::catalog::ColumnType::Enum => 10,
+        crate::catalog::ColumnType::IpAddr => 11,
+        crate::catalog::ColumnType::Cidr => 12,
+        crate::catalog::ColumnType::Date => 13,
+        crate::catalog::ColumnType::Time => 14,
+        crate::catalog::ColumnType::TimestampTz => 15,
+        crate::catalog::ColumnType::Interval => 16,
+        crate::catalog::ColumnType::MacAddr => 17,
+    }
+}
+
 fn decode_column_type(tag: u8) -> Result<crate::catalog::ColumnType> {
     match tag {
         0 => Ok(crate::catalog::ColumnType::Int64),
@@ -15570,6 +15706,14 @@ fn decode_column_type(tag: u8) -> Result<crate::catalog::ColumnType> {
         7 => Ok(crate::catalog::ColumnType::Timestamp),
         8 => Ok(crate::catalog::ColumnType::Geometry),
         9 => Ok(crate::catalog::ColumnType::Geography),
+        10 => Ok(crate::catalog::ColumnType::Enum),
+        11 => Ok(crate::catalog::ColumnType::IpAddr),
+        12 => Ok(crate::catalog::ColumnType::Cidr),
+        13 => Ok(crate::catalog::ColumnType::Date),
+        14 => Ok(crate::catalog::ColumnType::Time),
+        15 => Ok(crate::catalog::ColumnType::TimestampTz),
+        16 => Ok(crate::catalog::ColumnType::Interval),
+        17 => Ok(crate::catalog::ColumnType::MacAddr),
         _ => Err(DbError::corruption("unknown column type tag")),
     }
 }
@@ -15660,6 +15804,11 @@ impl<'a> Cursor<'a> {
     fn read_u32(&mut self) -> Result<u32> {
         let bytes = self.read_slice(4)?;
         Ok(u32::from_le_bytes(bytes.try_into().expect("u32")))
+    }
+
+    fn read_u64(&mut self) -> Result<u64> {
+        let bytes = self.read_slice(8)?;
+        Ok(u64::from_le_bytes(bytes.try_into().expect("u64")))
     }
 
     fn read_i64(&mut self) -> Result<i64> {
@@ -24571,28 +24720,32 @@ fn eval_current_timestamp(values: Vec<Value>) -> Result<Value> {
     if !values.is_empty() {
         return Err(DbError::sql("CURRENT_TIMESTAMP expects 0 arguments"));
     }
-    Ok(Value::TimestampMicros(current_utc_timestamp_micros()?))
+    Ok(Value::TimestampTzMicros(current_utc_timestamp_micros()?))
 }
 
 fn eval_current_date(values: Vec<Value>) -> Result<Value> {
     if !values.is_empty() {
         return Err(DbError::sql("CURRENT_DATE expects 0 arguments"));
     }
-    Ok(Value::Text(format_date(current_utc_datetime())))
+    Ok(Value::DateDays(parse_date_days(&format_date(
+        current_utc_datetime(),
+    ))?))
 }
 
 fn eval_current_time(values: Vec<Value>) -> Result<Value> {
     if !values.is_empty() {
         return Err(DbError::sql("CURRENT_TIME expects 0 arguments"));
     }
-    Ok(Value::Text(format_time(current_utc_datetime())))
+    Ok(Value::TimeMicros(parse_time_micros(&format_time(
+        current_utc_datetime(),
+    ))?))
 }
 
 fn eval_date(values: Vec<Value>) -> Result<Value> {
     let Some(datetime) = resolve_datetime_arguments("DATE", &values, true)? else {
         return Ok(Value::Null);
     };
-    Ok(Value::Text(format_date(datetime)))
+    Ok(Value::DateDays(parse_date_days(&format_date(datetime))?))
 }
 
 fn eval_datetime(values: Vec<Value>) -> Result<Value> {
@@ -24829,8 +24982,12 @@ fn eval_interval(values: Vec<Value>) -> Result<Value> {
             )))
         }
     };
-    let micros = parse_interval_micros(raw)?;
-    Ok(Value::Int64(micros))
+    let (months, days, micros) = parse_interval(raw)?;
+    Ok(Value::Interval {
+        months,
+        days,
+        micros,
+    })
 }
 
 fn eval_age(values: Vec<Value>) -> Result<Value> {
@@ -25011,71 +25168,6 @@ fn parse_to_timestamp_with_format(text: &str, format: &str) -> Result<DateTime<U
     }
 }
 
-fn parse_interval_micros(text: &str) -> Result<i64> {
-    let mut tokens = text.split_whitespace();
-    let mut total_micros: i64 = 0;
-    let mut saw_any = false;
-    while let Some(amount_token) = tokens.next() {
-        let unit_token = tokens
-            .next()
-            .ok_or_else(|| DbError::sql("INTERVAL text must be pairs of amount and unit"))?;
-        let amount = amount_token
-            .parse::<i64>()
-            .map_err(|_| DbError::sql("INTERVAL amount must be an integer"))?;
-        let unit = unit_token.to_ascii_lowercase();
-        let unit = unit.trim_end_matches('s');
-        let unit_micros = match unit {
-            "year" => 365_i64
-                .checked_mul(24)
-                .and_then(|v| v.checked_mul(60))
-                .and_then(|v| v.checked_mul(60))
-                .and_then(|v| v.checked_mul(1_000_000))
-                .ok_or_else(|| DbError::sql("INTERVAL value overflowed"))?,
-            "month" => 30_i64
-                .checked_mul(24)
-                .and_then(|v| v.checked_mul(60))
-                .and_then(|v| v.checked_mul(60))
-                .and_then(|v| v.checked_mul(1_000_000))
-                .ok_or_else(|| DbError::sql("INTERVAL value overflowed"))?,
-            "week" => 7_i64
-                .checked_mul(24)
-                .and_then(|v| v.checked_mul(60))
-                .and_then(|v| v.checked_mul(60))
-                .and_then(|v| v.checked_mul(1_000_000))
-                .ok_or_else(|| DbError::sql("INTERVAL value overflowed"))?,
-            "day" => 24_i64
-                .checked_mul(60)
-                .and_then(|v| v.checked_mul(60))
-                .and_then(|v| v.checked_mul(1_000_000))
-                .ok_or_else(|| DbError::sql("INTERVAL value overflowed"))?,
-            "hour" => 60_i64
-                .checked_mul(60)
-                .and_then(|v| v.checked_mul(1_000_000))
-                .ok_or_else(|| DbError::sql("INTERVAL value overflowed"))?,
-            "minute" => 60_i64
-                .checked_mul(1_000_000)
-                .ok_or_else(|| DbError::sql("INTERVAL value overflowed"))?,
-            "second" => 1_000_000_i64,
-            _ => {
-                return Err(DbError::sql(format!(
-                    "INTERVAL unit {unit_token} is not supported"
-                )))
-            }
-        };
-        let delta = amount
-            .checked_mul(unit_micros)
-            .ok_or_else(|| DbError::sql("INTERVAL value overflowed"))?;
-        total_micros = total_micros
-            .checked_add(delta)
-            .ok_or_else(|| DbError::sql("INTERVAL value overflowed"))?;
-        saw_any = true;
-    }
-    if !saw_any {
-        return Err(DbError::sql("INTERVAL text must not be empty"));
-    }
-    Ok(total_micros)
-}
-
 fn format_age_interval(delta_micros: i64) -> String {
     let negative = delta_micros < 0;
     let mut remainder = delta_micros.unsigned_abs();
@@ -25181,15 +25273,26 @@ fn datetime_from_value(function_name: &str, value: &Value) -> Result<Option<Date
     match value {
         Value::Null => Ok(None),
         Value::Text(value) => parse_datetime_text(function_name, value).map(Some),
-        Value::TimestampMicros(value) => Utc
-            .timestamp_micros(*value)
-            .single()
-            .map(Some)
-            .ok_or_else(|| DbError::sql(format!("{function_name} timestamp is out of range"))),
+        Value::TimestampMicros(value) | Value::TimestampTzMicros(value) => {
+            datetime_from_epoch_micros(function_name, *value).map(Some)
+        }
+        Value::DateDays(days) => {
+            let micros = i64::from(*days)
+                .checked_mul(EXEC_MICROS_PER_DAY)
+                .ok_or_else(|| DbError::sql(format!("{function_name} date is out of range")))?;
+            datetime_from_epoch_micros(function_name, micros).map(Some)
+        }
+        Value::TimeMicros(micros) => datetime_from_epoch_micros(function_name, *micros).map(Some),
         other => Err(DbError::sql(format!(
-            "{function_name} expects text or TIMESTAMP input, got {other:?}"
+            "{function_name} expects text or date/time input, got {other:?}"
         ))),
     }
+}
+
+fn datetime_from_epoch_micros(function_name: &str, micros: i64) -> Result<DateTime<Utc>> {
+    Utc.timestamp_micros(micros)
+        .single()
+        .ok_or_else(|| DbError::sql(format!("{function_name} timestamp is out of range")))
 }
 
 fn parse_datetime_text(function_name: &str, value: &str) -> Result<DateTime<Utc>> {
@@ -25590,6 +25693,31 @@ fn json_value_from_value(value: &Value) -> Result<JsonValue> {
         }
         Value::Uuid(value) => Ok(JsonValue::String(value_to_text(&Value::Uuid(*value))?)),
         Value::TimestampMicros(value) => Ok(JsonValue::Number(value.to_string())),
+        Value::Enum {
+            enum_type_id,
+            label_id,
+        } => Ok(JsonValue::String(format!("{enum_type_id}:{label_id}"))),
+        Value::IpAddr { family, addr } => Ok(JsonValue::String(format_ip_addr(*family, addr)?)),
+        Value::Cidr {
+            family,
+            prefix_len,
+            network,
+        } => Ok(JsonValue::String(format_cidr(
+            *family,
+            *prefix_len,
+            network,
+        )?)),
+        Value::MacAddr { len, bytes } => Ok(JsonValue::String(format_mac_addr(*len, bytes)?)),
+        Value::DateDays(days) => Ok(JsonValue::String(format_date_days(*days))),
+        Value::TimeMicros(micros) => Ok(JsonValue::String(format_time_micros(*micros)?)),
+        Value::TimestampTzMicros(micros) => {
+            Ok(JsonValue::String(format_timestamp_tz_micros(*micros)))
+        }
+        Value::Interval {
+            months,
+            days,
+            micros,
+        } => Ok(JsonValue::String(format_interval(*months, *days, *micros))),
     }
 }
 
@@ -26069,6 +26197,25 @@ fn value_to_text(value: &Value) -> Result<String> {
             value[8], value[9], value[10], value[11], value[12], value[13], value[14], value[15]
         )),
         Value::TimestampMicros(value) => Ok(value.to_string()),
+        Value::Enum {
+            enum_type_id,
+            label_id,
+        } => Ok(format!("{enum_type_id}:{label_id}")),
+        Value::IpAddr { family, addr } => format_ip_addr(*family, addr),
+        Value::Cidr {
+            family,
+            prefix_len,
+            network,
+        } => format_cidr(*family, *prefix_len, network),
+        Value::MacAddr { len, bytes } => format_mac_addr(*len, bytes),
+        Value::DateDays(days) => Ok(format_date_days(*days)),
+        Value::TimeMicros(micros) => format_time_micros(*micros),
+        Value::TimestampTzMicros(micros) => Ok(format_timestamp_tz_micros(*micros)),
+        Value::Interval {
+            months,
+            days,
+            micros,
+        } => Ok(format_interval(*months, *days, *micros)),
         Value::Geometry(_) | Value::Geography(_) => {
             Err(DbError::sql("use ST_AsText to render spatial values"))
         }
@@ -26106,6 +26253,25 @@ fn cast_value(value: Value, target_type: crate::catalog::ColumnType) -> Result<V
             Value::Int64(value) => value.to_string(),
             Value::Float64(value) => value.to_string(),
             Value::Bool(value) => value.to_string(),
+            Value::Enum {
+                enum_type_id,
+                label_id,
+            } => format!("{enum_type_id}:{label_id}"),
+            Value::IpAddr { family, addr } => format_ip_addr(family, &addr)?,
+            Value::Cidr {
+                family,
+                prefix_len,
+                network,
+            } => format_cidr(family, prefix_len, &network)?,
+            Value::MacAddr { len, bytes } => format_mac_addr(len, &bytes)?,
+            Value::DateDays(days) => format_date_days(days),
+            Value::TimeMicros(micros) => format_time_micros(micros)?,
+            Value::TimestampTzMicros(micros) => format_timestamp_tz_micros(micros),
+            Value::Interval {
+                months,
+                days,
+                micros,
+            } => format_interval(months, days, micros),
             other => return Err(DbError::sql(format!("cannot cast {other:?} to TEXT"))),
         })),
         crate::catalog::ColumnType::Bool => match value {
@@ -26161,11 +26327,110 @@ fn cast_value(value: Value, target_type: crate::catalog::ColumnType) -> Result<V
         },
         crate::catalog::ColumnType::Timestamp => match value {
             Value::TimestampMicros(value) => Ok(Value::TimestampMicros(value)),
+            Value::TimestampTzMicros(value) => Ok(Value::TimestampMicros(value)),
             Value::Int64(value) => Ok(Value::TimestampMicros(value)),
             Value::Text(value) => Ok(Value::TimestampMicros(
                 parse_datetime_text("TIMESTAMP cast", &value)?.timestamp_micros(),
             )),
             other => Err(DbError::sql(format!("cannot cast {other:?} to TIMESTAMP"))),
+        },
+        crate::catalog::ColumnType::Enum => match value {
+            Value::Enum {
+                enum_type_id,
+                label_id,
+            } => Ok(Value::Enum {
+                enum_type_id,
+                label_id,
+            }),
+            other => Err(DbError::sql(format!(
+                "cannot cast {other:?} to ENUM without column enum metadata"
+            ))),
+        },
+        crate::catalog::ColumnType::IpAddr => match value {
+            Value::IpAddr { family, addr } => Ok(Value::IpAddr { family, addr }),
+            Value::Text(value) => {
+                let (family, addr) = parse_ip_addr(&value)?;
+                Ok(Value::IpAddr { family, addr })
+            }
+            other => Err(DbError::sql(format!("cannot cast {other:?} to IPADDR"))),
+        },
+        crate::catalog::ColumnType::Cidr => match value {
+            Value::Cidr {
+                family,
+                prefix_len,
+                network,
+            } => Ok(Value::Cidr {
+                family,
+                prefix_len,
+                network,
+            }),
+            Value::Text(value) => {
+                let (family, prefix_len, network) = parse_cidr(&value)?;
+                Ok(Value::Cidr {
+                    family,
+                    prefix_len,
+                    network,
+                })
+            }
+            other => Err(DbError::sql(format!("cannot cast {other:?} to CIDR"))),
+        },
+        crate::catalog::ColumnType::MacAddr => match value {
+            Value::MacAddr { len, bytes } => Ok(Value::MacAddr { len, bytes }),
+            Value::Text(value) => {
+                let (len, bytes) = parse_mac_addr(&value)?;
+                Ok(Value::MacAddr { len, bytes })
+            }
+            other => Err(DbError::sql(format!("cannot cast {other:?} to MACADDR"))),
+        },
+        crate::catalog::ColumnType::Date => match value {
+            Value::DateDays(days) => Ok(Value::DateDays(days)),
+            Value::Int64(value) => {
+                let days = i32::try_from(value).map_err(|_| DbError::sql("invalid DATE cast"))?;
+                Ok(Value::DateDays(days))
+            }
+            Value::Text(value) => Ok(Value::DateDays(parse_date_days(&value)?)),
+            other => Err(DbError::sql(format!("cannot cast {other:?} to DATE"))),
+        },
+        crate::catalog::ColumnType::Time => match value {
+            Value::TimeMicros(micros) => Ok(Value::TimeMicros(micros)),
+            Value::Int64(value) => Ok(Value::TimeMicros(value)),
+            Value::Text(value) => Ok(Value::TimeMicros(parse_time_micros(&value)?)),
+            other => Err(DbError::sql(format!("cannot cast {other:?} to TIME"))),
+        },
+        crate::catalog::ColumnType::TimestampTz => match value {
+            Value::TimestampTzMicros(value) => Ok(Value::TimestampTzMicros(value)),
+            Value::TimestampMicros(value) | Value::Int64(value) => {
+                Ok(Value::TimestampTzMicros(value))
+            }
+            Value::Text(value) => Ok(Value::TimestampTzMicros(parse_timestamp_tz_micros(&value)?)),
+            other => Err(DbError::sql(format!(
+                "cannot cast {other:?} to TIMESTAMPTZ"
+            ))),
+        },
+        crate::catalog::ColumnType::Interval => match value {
+            Value::Interval {
+                months,
+                days,
+                micros,
+            } => Ok(Value::Interval {
+                months,
+                days,
+                micros,
+            }),
+            Value::Int64(value) => Ok(Value::Interval {
+                months: 0,
+                days: 0,
+                micros: value,
+            }),
+            Value::Text(value) => {
+                let (months, days, micros) = parse_interval(&value)?;
+                Ok(Value::Interval {
+                    months,
+                    days,
+                    micros,
+                })
+            }
+            other => Err(DbError::sql(format!("cannot cast {other:?} to INTERVAL"))),
         },
     }
 }
@@ -26202,6 +26467,14 @@ fn infer_column_type_for_ctas(
             Value::Decimal { .. } => return crate::catalog::ColumnType::Decimal,
             Value::Uuid(_) => return crate::catalog::ColumnType::Uuid,
             Value::TimestampMicros(_) => return crate::catalog::ColumnType::Timestamp,
+            Value::Enum { .. } => return crate::catalog::ColumnType::Enum,
+            Value::IpAddr { .. } => return crate::catalog::ColumnType::IpAddr,
+            Value::Cidr { .. } => return crate::catalog::ColumnType::Cidr,
+            Value::MacAddr { .. } => return crate::catalog::ColumnType::MacAddr,
+            Value::DateDays(_) => return crate::catalog::ColumnType::Date,
+            Value::TimeMicros(_) => return crate::catalog::ColumnType::Time,
+            Value::TimestampTzMicros(_) => return crate::catalog::ColumnType::TimestampTz,
+            Value::Interval { .. } => return crate::catalog::ColumnType::Interval,
             Value::Geometry(_) => return crate::catalog::ColumnType::Geometry,
             Value::Geography(_) => return crate::catalog::ColumnType::Geography,
         }
@@ -30082,40 +30355,164 @@ fn timestamp_interval_arithmetic(
                 true,
             )?)))
         }
-        (BinaryOp::Add, Value::Text(timestamp), Value::Text(interval_text)) => {
-            Ok(Some(Value::TimestampMicros(apply_interval_micros(
-                parse_datetime_text("interval arithmetic", timestamp)?.timestamp_micros(),
-                parse_interval_micros(interval_text)?,
+        (
+            BinaryOp::Add,
+            Value::TimestampMicros(timestamp),
+            Value::Interval {
+                months,
+                days,
+                micros,
+            },
+        ) => Ok(Some(Value::TimestampMicros(
+            apply_interval_to_timestamp_micros(*timestamp, *months, *days, *micros, true)?,
+        ))),
+        (
+            BinaryOp::Sub,
+            Value::TimestampMicros(timestamp),
+            Value::Interval {
+                months,
+                days,
+                micros,
+            },
+        ) => Ok(Some(Value::TimestampMicros(
+            apply_interval_to_timestamp_micros(*timestamp, *months, *days, *micros, false)?,
+        ))),
+        (
+            BinaryOp::Add,
+            Value::Interval {
+                months,
+                days,
+                micros,
+            },
+            Value::TimestampMicros(timestamp),
+        ) => Ok(Some(Value::TimestampMicros(
+            apply_interval_to_timestamp_micros(*timestamp, *months, *days, *micros, true)?,
+        ))),
+        (
+            BinaryOp::Add,
+            Value::TimestampTzMicros(timestamp),
+            Value::Interval {
+                months,
+                days,
+                micros,
+            },
+        ) => Ok(Some(Value::TimestampTzMicros(
+            apply_interval_to_timestamp_micros(*timestamp, *months, *days, *micros, true)?,
+        ))),
+        (
+            BinaryOp::Sub,
+            Value::TimestampTzMicros(timestamp),
+            Value::Interval {
+                months,
+                days,
+                micros,
+            },
+        ) => Ok(Some(Value::TimestampTzMicros(
+            apply_interval_to_timestamp_micros(*timestamp, *months, *days, *micros, false)?,
+        ))),
+        (
+            BinaryOp::Add,
+            Value::Interval {
+                months,
+                days,
+                micros,
+            },
+            Value::TimestampTzMicros(timestamp),
+        ) => Ok(Some(Value::TimestampTzMicros(
+            apply_interval_to_timestamp_micros(*timestamp, *months, *days, *micros, true)?,
+        ))),
+        (
+            BinaryOp::Add,
+            Value::DateDays(days_since_epoch),
+            Value::Interval {
+                months,
+                days,
+                micros,
+            },
+        ) => Ok(Some(Value::TimestampMicros(
+            apply_interval_to_timestamp_micros(
+                date_days_to_micros(*days_since_epoch)?,
+                *months,
+                *days,
+                *micros,
                 true,
-            )?)))
+            )?,
+        ))),
+        (
+            BinaryOp::Sub,
+            Value::DateDays(days_since_epoch),
+            Value::Interval {
+                months,
+                days,
+                micros,
+            },
+        ) => Ok(Some(Value::TimestampMicros(
+            apply_interval_to_timestamp_micros(
+                date_days_to_micros(*days_since_epoch)?,
+                *months,
+                *days,
+                *micros,
+                false,
+            )?,
+        ))),
+        (
+            BinaryOp::Add,
+            Value::Interval {
+                months,
+                days,
+                micros,
+            },
+            Value::DateDays(days_since_epoch),
+        ) => Ok(Some(Value::TimestampMicros(
+            apply_interval_to_timestamp_micros(
+                date_days_to_micros(*days_since_epoch)?,
+                *months,
+                *days,
+                *micros,
+                true,
+            )?,
+        ))),
+        (BinaryOp::Add, Value::Text(timestamp), Value::Text(interval_text)) => {
+            let (months, days, micros) = parse_interval(interval_text)?;
+            Ok(Some(Value::TimestampMicros(
+                apply_interval_to_timestamp_micros(
+                    parse_datetime_text("interval arithmetic", timestamp)?.timestamp_micros(),
+                    months,
+                    days,
+                    micros,
+                    true,
+                )?,
+            )))
         }
         (BinaryOp::Sub, Value::Text(timestamp), Value::Text(interval_text)) => {
-            Ok(Some(Value::TimestampMicros(apply_interval_micros(
-                parse_datetime_text("interval arithmetic", timestamp)?.timestamp_micros(),
-                parse_interval_micros(interval_text)?,
-                false,
-            )?)))
+            let (months, days, micros) = parse_interval(interval_text)?;
+            Ok(Some(Value::TimestampMicros(
+                apply_interval_to_timestamp_micros(
+                    parse_datetime_text("interval arithmetic", timestamp)?.timestamp_micros(),
+                    months,
+                    days,
+                    micros,
+                    false,
+                )?,
+            )))
         }
         (BinaryOp::Add, Value::TimestampMicros(timestamp), Value::Text(interval_text)) => {
-            Ok(Some(Value::TimestampMicros(apply_interval_micros(
-                *timestamp,
-                parse_interval_micros(interval_text)?,
-                true,
-            )?)))
+            let (months, days, micros) = parse_interval(interval_text)?;
+            Ok(Some(Value::TimestampMicros(
+                apply_interval_to_timestamp_micros(*timestamp, months, days, micros, true)?,
+            )))
         }
         (BinaryOp::Sub, Value::TimestampMicros(timestamp), Value::Text(interval_text)) => {
-            Ok(Some(Value::TimestampMicros(apply_interval_micros(
-                *timestamp,
-                parse_interval_micros(interval_text)?,
-                false,
-            )?)))
+            let (months, days, micros) = parse_interval(interval_text)?;
+            Ok(Some(Value::TimestampMicros(
+                apply_interval_to_timestamp_micros(*timestamp, months, days, micros, false)?,
+            )))
         }
         (BinaryOp::Add, Value::Text(interval_text), Value::TimestampMicros(timestamp)) => {
-            Ok(Some(Value::TimestampMicros(apply_interval_micros(
-                *timestamp,
-                parse_interval_micros(interval_text)?,
-                true,
-            )?)))
+            let (months, days, micros) = parse_interval(interval_text)?;
+            Ok(Some(Value::TimestampMicros(
+                apply_interval_to_timestamp_micros(*timestamp, months, days, micros, true)?,
+            )))
         }
         _ => Ok(None),
     }
@@ -30131,6 +30528,57 @@ fn apply_interval_micros(timestamp_micros: i64, interval_micros: i64, add: bool)
             .checked_sub(interval_micros)
             .ok_or_else(|| DbError::sql("timestamp subtraction overflowed"))
     }
+}
+
+fn apply_interval_to_timestamp_micros(
+    timestamp_micros: i64,
+    months: i32,
+    days: i32,
+    micros: i64,
+    add: bool,
+) -> Result<i64> {
+    let mut datetime = datetime_from_epoch_micros("interval arithmetic", timestamp_micros)?;
+    let month_delta = if add {
+        i64::from(months)
+    } else {
+        -i64::from(months)
+    };
+    if month_delta != 0 {
+        datetime = shift_datetime_by_months(datetime, month_delta)?;
+    }
+    let day_delta = if add {
+        i64::from(days)
+    } else {
+        -i64::from(days)
+    };
+    if day_delta != 0 {
+        datetime = shift_datetime_by_duration(
+            "interval arithmetic",
+            datetime,
+            ChronoDuration::days(day_delta),
+        )?;
+    }
+    let micros_delta = if add {
+        micros
+    } else {
+        micros
+            .checked_neg()
+            .ok_or_else(|| DbError::sql("INTERVAL value overflowed"))?
+    };
+    if micros_delta != 0 {
+        datetime = shift_datetime_by_duration(
+            "interval arithmetic",
+            datetime,
+            ChronoDuration::microseconds(micros_delta),
+        )?;
+    }
+    Ok(datetime.timestamp_micros())
+}
+
+fn date_days_to_micros(days: i32) -> Result<i64> {
+    i64::from(days)
+        .checked_mul(EXEC_MICROS_PER_DAY)
+        .ok_or_else(|| DbError::sql("DATE value is out of range"))
 }
 
 fn compare_values(left: &Value, right: &Value) -> Result<std::cmp::Ordering> {
@@ -30206,6 +30654,77 @@ fn compare_values(left: &Value, right: &Value) -> Result<std::cmp::Ordering> {
         (Value::Blob(left), Value::Blob(right)) => Ok(left.cmp(right)),
         (Value::Uuid(left), Value::Uuid(right)) => Ok(left.cmp(right)),
         (Value::TimestampMicros(left), Value::TimestampMicros(right)) => Ok(left.cmp(right)),
+        (Value::TimestampTzMicros(left), Value::TimestampTzMicros(right)) => Ok(left.cmp(right)),
+        (Value::DateDays(left), Value::DateDays(right)) => Ok(left.cmp(right)),
+        (Value::TimeMicros(left), Value::TimeMicros(right)) => Ok(left.cmp(right)),
+        (
+            Value::Enum {
+                enum_type_id: left_type,
+                label_id: left_label,
+            },
+            Value::Enum {
+                enum_type_id: right_type,
+                label_id: right_label,
+            },
+        ) => Ok(left_type.cmp(right_type).then_with(|| left_label.cmp(right_label))),
+        (
+            Value::IpAddr {
+                family: left_family,
+                addr: left_addr,
+            },
+            Value::IpAddr {
+                family: right_family,
+                addr: right_addr,
+            },
+        ) => compare_ip_addr(*left_family, left_addr, *right_family, right_addr),
+        (
+            Value::Cidr {
+                family: left_family,
+                prefix_len: left_prefix,
+                network: left_network,
+            },
+            Value::Cidr {
+                family: right_family,
+                prefix_len: right_prefix,
+                network: right_network,
+            },
+        ) => compare_cidr(
+            *left_family,
+            *left_prefix,
+            left_network,
+            *right_family,
+            *right_prefix,
+            right_network,
+        ),
+        (
+            Value::MacAddr {
+                len: left_len,
+                bytes: left_bytes,
+            },
+            Value::MacAddr {
+                len: right_len,
+                bytes: right_bytes,
+            },
+        ) => compare_mac_addr(*left_len, left_bytes, *right_len, right_bytes),
+        (
+            Value::Interval {
+                months: left_months,
+                days: left_days,
+                micros: left_micros,
+            },
+            Value::Interval {
+                months: right_months,
+                days: right_days,
+                micros: right_micros,
+            },
+        ) => Ok(compare_interval(
+            *left_months,
+            *left_days,
+            *left_micros,
+            *right_months,
+            *right_days,
+            *right_micros,
+        )),
         (Value::Blob(left), Value::Uuid(right)) => Ok(left.as_slice().cmp(right.as_slice())),
         (Value::Uuid(left), Value::Blob(right)) => Ok(left.as_slice().cmp(right.as_slice())),
         (Value::Geometry(_), Value::Geometry(_)) | (Value::Geography(_), Value::Geography(_)) => {
@@ -30431,6 +30950,7 @@ mod exec_mod_private_tests {
                 name: "a".to_string(),
                 column_type: crate::catalog::ColumnType::Int64,
                 spatial_type: None,
+                enum_type: None,
                 nullable: false,
                 default_sql: None,
                 generated_sql: None,
@@ -30456,6 +30976,7 @@ mod exec_mod_private_tests {
                 name: "g".to_string(),
                 column_type: crate::catalog::ColumnType::Int64,
                 spatial_type: None,
+                enum_type: None,
                 nullable: false,
                 default_sql: None,
                 generated_sql: Some("1".to_string()),
@@ -30481,6 +31002,7 @@ mod exec_mod_private_tests {
                 name: "g".to_string(),
                 column_type: crate::catalog::ColumnType::Int64,
                 spatial_type: None,
+                enum_type: None,
                 nullable: false,
                 default_sql: None,
                 generated_sql: Some("1".to_string()),

@@ -21,10 +21,10 @@ DATE
 TIME
 TIMESTAMPTZ
 INTERVAL
-MACADDR (Phase 4)
+MACADDR
 ```
 
-`MACADDR` is approved but deferred to Phase 4. Types such as `EMAIL`, `URL`, `PHONE`, `JSON`, `SEMVER`, `MONEY`, `GEOPOINT`, `VECTOR`, `HOSTNAME`, and `DOMAIN` are **rejected** as `ColumnType` variants. When in doubt, DecentDB follows PostgreSQL semantics; deviations are documented with rationale. Their validation and query value can be delivered through the existing `CHECK` constraint evaluator plus SQL functions, which is sufficient and avoids permanent type-system tax (see §2).
+Types such as `EMAIL`, `URL`, `PHONE`, `JSON`, `SEMVER`, `MONEY`, `GEOPOINT`, `VECTOR`, `HOSTNAME`, and `DOMAIN` are **rejected** as `ColumnType` variants. When in doubt, DecentDB follows PostgreSQL semantics; deviations are documented with rationale. Their validation and query value can be delivered through the existing `CHECK` constraint evaluator plus SQL functions, which is sufficient and avoids permanent type-system tax (see §2).
 
 ---
 
@@ -62,7 +62,7 @@ Adding a `ColumnType` variant is a **permanent tax**. Every future type-related 
 | `MONEY` | No (same as DECIMAL) | Same as DECIMAL | Yes | No | **Reject** |
 | `GEOPOINT` | Yes (16 B) | Same | Yes | No | **Reject** (use GEOMETRY) |
 | `VECTOR` | Minor | Specialized | Yes | Yes (dimensions) | **Reject** (future ADR) |
-| `MACADDR` | Yes (6/8 B vs 17 B) | Lexical = desired | Yes | Yes (v4/v6) | **Keep** (Phase 4) |
+| `MACADDR` | Yes (6/8 B vs 17 B) | Lexical = desired | Yes | Yes (6/8-byte form) | **Keep** |
 | `HOSTNAME` | No | Lexical = desired | Yes | No | **Reject** |
 | `DOMAIN` | No | Lexical = desired | Yes | No | **Reject** |
 
@@ -146,9 +146,11 @@ Row tags allocated:
 | 15 | `CIDR` |
 | 16 | `DATE` |
 | 17 | `TIME` |
-| 18 | `INTERVAL` |
+| 18 | `TIMESTAMPTZ` |
+| 19 | `INTERVAL` |
+| 20 | `MACADDR` |
 
-`TIMESTAMPTZ` reuses the existing `TAG_TIMESTAMP = 8` with distinct catalog semantics. This is safe because `TIMESTAMPTZ` and `TIMESTAMP` have identical binary encoding (zigzag-varint i64 µs since epoch); the tag carries no type-identity information that differs between them. WAL replay does not need to distinguish them — both decode as `Value::TimestampMicros(i64)`. The distinction exists only at the catalog/DDL layer (input interpretation and display formatting).
+`TIMESTAMPTZ` has the same binary payload as `TIMESTAMP` (zigzag-varint i64 µs since epoch), but it receives a distinct row tag because DecentDB's current row decoder is schema-agnostic. Preserving the semantic `Value::TimestampTzMicros` at row decode time keeps WAL replay, JSON rendering, C ABI views, and bindings from needing column-catalog context for every decoded value.
 
 **ADR requirement:** This document reverses ADR 0114's decision to collapse `DATE` and `TIMESTAMP` into a single type. A formal ADR (To be numbered) should be created to record this reversal before implementation begins.
 
@@ -612,7 +614,7 @@ Functions:            Same as TIMESTAMP functions
 Binding behavior:     Phase A: canonical string; Phase B+: timezone-aware native types
 Migration:            ALTER COLUMN TYPE with USING CAST(old_col AS TIMESTAMPTZ)
 Error codes:          E_TYPE_INVALID_TIMESTAMPTZ
-WAL encoding:         Reuses TAG_TIMESTAMP (8); discrimination by catalog column type
+WAL encoding:         Tag 18 + zigzag-varint i64; separate tag preserves schema-agnostic decode
 ```
 
 ---
@@ -757,7 +759,7 @@ Already has native storage (`TAG_TIMESTAMP`). The addition is catalog-level sema
 MACADDR
 ```
 
-`MACADDR` meets the storage (6/8 bytes vs 17-byte text) and ordering criteria but is lower priority than IPADDR/CIDR. Deferring to Phase 4 avoids overloading the initial implementation surface.
+`MACADDR` meets the storage (6/8 bytes vs 17-byte text) and ordering criteria. It is represented as a native 6- or 8-byte payload with a one-byte length marker.
 
 ---
 
@@ -802,7 +804,7 @@ Phase A is the acceptance criterion for engine implementation. Phases B and C ar
 | INTERVAL tripartite storage is larger than a single int64 | Medium | Varint encoding compresses zero fields; most intervals use 1–2 of 3 fields. Matches PostgreSQL semantics; avoids DST/calendar bugs |
 | INTERVAL component-wise ordering can be unintuitive (1 month ≠ 30 days) | Medium | Documented explicitly; matches PostgreSQL behavior |
 | ~18 modification sites per type is maintenance burden | Medium | Each type documents its match sites; regression test suite covers type-dependent paths |
-| Row tag namespace exhaustion (255 max) | Low | 8 new types use 13–18 of 255 available (including MACADDR); room for ~237 more before rework needed |
+| Row tag namespace exhaustion (255 max) | Low | 8 new types use 13–20 of 255 available (including MACADDR); room for ~235 more before rework needed |
 | ADR 0114 reversal (re-introducing DATE as distinct from TIMESTAMP) | Medium | Formal ADR to be created documenting the reversal and rationale before implementation |
 
 ---
@@ -822,6 +824,6 @@ Eight types pass this bar:
 | `TIME` | Compact storage (int64 µs) + semantic correctness (time-of-day ≠ timestamp) |
 | `TIMESTAMPTZ` | Schema identity (distinct from naive TIMESTAMP) + session display semantics |
 | `INTERVAL` | Compact storage (tripartite 12–20 B vs text) + correct calendar ordering + arithmetic integration with temporal types + parametric (months/days/µs fields) |
-| `MACADDR` | Compact storage (6/8 B vs 17 B text) + correct binary ordering (Phase 4) |
+| `MACADDR` | Compact storage (6/8 B vs 17 B text) + correct binary ordering |
 
-Types rejected (`EMAIL`, `URL`, `PHONE`, `SEMVER`, `JSON`, `MONEY`, `GEOPOINT`, `VECTOR`, `HOSTNAME`, `DOMAIN`) are better served by `TEXT` with `CHECK` constraints and SQL functions. Their schema-level identity wins do not justify permanent `ColumnType` expansion. `MACADDR` is deferred to Phase 4 — it meets the storage and ordering criteria but is lower priority than the initial 8 types.
+Types rejected (`EMAIL`, `URL`, `PHONE`, `SEMVER`, `JSON`, `MONEY`, `GEOPOINT`, `VECTOR`, `HOSTNAME`, `DOMAIN`) are better served by `TEXT` with `CHECK` constraints and SQL functions. Their schema-level identity wins do not justify permanent `ColumnType` expansion.

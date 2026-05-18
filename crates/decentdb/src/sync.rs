@@ -8,10 +8,13 @@ use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
-use crate::catalog::{identifiers_equal, TableSchema};
+use crate::catalog::{identifiers_equal, ColumnSchema, ColumnType, TableSchema};
 use crate::error::{DbError, Result};
 use crate::exec::EngineRuntime;
-use crate::record::value::Value;
+use crate::record::value::{
+    format_cidr, format_date_days, format_interval, format_ip_addr, format_mac_addr,
+    format_time_micros, format_timestamp_tz_micros, Value,
+};
 use crate::sql::ast::{BinaryOp, Expr};
 use crate::sql::parser::parse_expression_sql;
 use crate::vfs::{self, FileKind, OpenMode, VfsFile, VfsHandle};
@@ -1279,7 +1282,7 @@ fn journal_path_for(db_path: &Path) -> PathBuf {
 pub(crate) fn build_after_json(schema: &TableSchema, values: &[Value]) -> serde_json::Value {
     let mut map = serde_json::Map::new();
     for (col, val) in schema.columns.iter().zip(values) {
-        map.insert(col.name.clone(), value_to_json(val));
+        map.insert(col.name.clone(), column_value_to_json(col, val));
     }
     serde_json::Value::Object(map)
 }
@@ -1289,11 +1292,33 @@ pub(crate) fn build_primary_key_json(schema: &TableSchema, values: &[Value]) -> 
     for pk_col in &schema.primary_key_columns {
         if let Some(pos) = schema.columns.iter().position(|c| &c.name == pk_col) {
             if let Some(val) = values.get(pos) {
-                map.insert(pk_col.clone(), value_to_json(val));
+                map.insert(
+                    pk_col.clone(),
+                    column_value_to_json(&schema.columns[pos], val),
+                );
             }
         }
     }
     serde_json::Value::Object(map)
+}
+
+fn column_value_to_json(column: &ColumnSchema, val: &Value) -> serde_json::Value {
+    if let (
+        ColumnType::Enum,
+        Some(enum_type),
+        Value::Enum {
+            enum_type_id,
+            label_id,
+        },
+    ) = (column.column_type, &column.enum_type, val)
+    {
+        if *enum_type_id == enum_type.type_id {
+            if let Some(label) = enum_type.label_for_id(*label_id) {
+                return serde_json::Value::String(label.to_string());
+            }
+        }
+    }
+    value_to_json(val)
 }
 
 fn value_to_json(val: &Value) -> serde_json::Value {
@@ -1321,6 +1346,35 @@ fn value_to_json(val: &Value) -> serde_json::Value {
             serde_json::Value::String(s)
         }
         Value::TimestampMicros(ts) => serde_json::Value::Number(serde_json::Number::from(*ts)),
+        Value::Enum {
+            enum_type_id,
+            label_id,
+        } => serde_json::Value::String(format!("{enum_type_id}:{label_id}")),
+        Value::IpAddr { family, addr } => format_ip_addr(*family, addr)
+            .map(serde_json::Value::String)
+            .unwrap_or(serde_json::Value::Null),
+        Value::Cidr {
+            family,
+            prefix_len,
+            network,
+        } => format_cidr(*family, *prefix_len, network)
+            .map(serde_json::Value::String)
+            .unwrap_or(serde_json::Value::Null),
+        Value::MacAddr { len, bytes } => format_mac_addr(*len, bytes)
+            .map(serde_json::Value::String)
+            .unwrap_or(serde_json::Value::Null),
+        Value::DateDays(days) => serde_json::Value::String(format_date_days(*days)),
+        Value::TimeMicros(micros) => format_time_micros(*micros)
+            .map(serde_json::Value::String)
+            .unwrap_or(serde_json::Value::Null),
+        Value::TimestampTzMicros(micros) => {
+            serde_json::Value::String(format_timestamp_tz_micros(*micros))
+        }
+        Value::Interval {
+            months,
+            days,
+            micros,
+        } => serde_json::Value::String(format_interval(*months, *days, *micros)),
     }
 }
 

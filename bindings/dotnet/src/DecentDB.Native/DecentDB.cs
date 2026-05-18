@@ -1,5 +1,7 @@
 using System;
 using System.Buffers;
+using System.Globalization;
+using System.Net;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
@@ -11,6 +13,61 @@ public enum DbOpenMode
     OpenOrCreate = 0,
     Create = 1,
     Open = 2
+}
+
+public readonly struct DecentDBEnumValue
+{
+    public DecentDBEnumValue(ulong typeId, ulong labelId)
+    {
+        TypeId = typeId;
+        LabelId = labelId;
+    }
+
+    public ulong TypeId { get; }
+
+    public ulong LabelId { get; }
+
+    public override string ToString() => $"enum:{TypeId}:{LabelId}";
+}
+
+public readonly struct DecentDBIntervalValue
+{
+    public DecentDBIntervalValue(int months, int days, long microseconds)
+    {
+        Months = months;
+        Days = days;
+        Microseconds = microseconds;
+    }
+
+    public int Months { get; }
+
+    public int Days { get; }
+
+    public long Microseconds { get; }
+
+    public bool TryAsTimeSpan(out TimeSpan value)
+    {
+        if (Months != 0)
+        {
+            value = default;
+            return false;
+        }
+
+        try
+        {
+            var dayTicks = checked((long)Days * TimeSpan.TicksPerDay);
+            var microTicks = checked(Microseconds * 10L);
+            value = new TimeSpan(checked(dayTicks + microTicks));
+            return true;
+        }
+        catch (OverflowException)
+        {
+            value = default;
+            return false;
+        }
+    }
+
+    public override string ToString() => $"months={Months},days={Days},micros={Microseconds}";
 }
 
 public sealed class DecentDB : IDisposable
@@ -908,6 +965,7 @@ public sealed class PreparedStatement : IDisposable
             return (DdbValueTag)value.tag switch
             {
                 DdbValueTag.TimestampMicros => value.timestamp_micros,
+                DdbValueTag.TimestamptzMicros => value.timestamptz_micros,
                 DdbValueTag.Int64 => value.int64_value,
                 DdbValueTag.Bool => value.bool_value != 0 ? 1L : 0L,
                 _ => 0L
@@ -929,6 +987,9 @@ public sealed class PreparedStatement : IDisposable
                 DdbValueTag.Int64 => value.int64_value,
                 DdbValueTag.Bool => value.bool_value != 0 ? 1L : 0L,
                 DdbValueTag.TimestampMicros => value.timestamp_micros,
+                DdbValueTag.TimestamptzMicros => value.timestamptz_micros,
+                DdbValueTag.Date => value.date_days,
+                DdbValueTag.Time => value.time_micros,
                 _ => 0L
             };
         }
@@ -1017,6 +1078,14 @@ public sealed class PreparedStatement : IDisposable
                 DdbValueTag.Decimal => GetDecimalValue(value),
                 DdbValueTag.Uuid => GetBlobFromValue(value),
                 DdbValueTag.TimestampMicros => FromUnixEpochMicroseconds(value.timestamp_micros),
+                DdbValueTag.Enum => new DecentDBEnumValue(value.enum_type_id, value.enum_label_id),
+                DdbValueTag.IpAddr => GetIpAddressString(value),
+                DdbValueTag.Cidr => GetCidrString(value),
+                DdbValueTag.Date => GetDateValue(value.date_days),
+                DdbValueTag.Time => GetTimeValue(value.time_micros),
+                DdbValueTag.TimestamptzMicros => FromUnixEpochMicrosecondsOffset(value.timestamptz_micros),
+                DdbValueTag.Interval => GetIntervalValue(value.interval_months, value.interval_days, value.interval_micros),
+                DdbValueTag.MacAddr => GetMacAddressString(value),
                 _ => DBNull.Value
             };
         }
@@ -1366,6 +1435,14 @@ public sealed class PreparedStatement : IDisposable
             DdbValueTag.Uuid => (int)DbValueKind.Blob,
             DdbValueTag.Decimal => (int)DbValueKind.Decimal,
             DdbValueTag.TimestampMicros => (int)DbValueKind.Timestamp,
+            DdbValueTag.TimestamptzMicros => (int)DbValueKind.Timestamp,
+            DdbValueTag.IpAddr => (int)DbValueKind.Text,
+            DdbValueTag.Cidr => (int)DbValueKind.Text,
+            DdbValueTag.Enum => (int)DbValueKind.Text,
+            DdbValueTag.Interval => (int)DbValueKind.Text,
+            DdbValueTag.Date => (int)DbValueKind.Int64,
+            DdbValueTag.Time => (int)DbValueKind.Int64,
+            DdbValueTag.MacAddr => (int)DbValueKind.Text,
             _ => (int)DbValueKind.Null
         };
     }
@@ -1383,6 +1460,14 @@ public sealed class PreparedStatement : IDisposable
             DdbValueTag.Bool => value.bool_value != 0 ? bool.TrueString : bool.FalseString,
             DdbValueTag.Decimal => GetDecimalString(value),
             DdbValueTag.TimestampMicros => value.timestamp_micros.ToString(),
+            DdbValueTag.TimestamptzMicros => FromUnixEpochMicrosecondsOffset(value.timestamptz_micros).ToString("O", CultureInfo.InvariantCulture),
+            DdbValueTag.Enum => new DecentDBEnumValue(value.enum_type_id, value.enum_label_id).ToString(),
+            DdbValueTag.IpAddr => GetIpAddressString(value),
+            DdbValueTag.Cidr => GetCidrString(value),
+            DdbValueTag.Date => GetDateString(value.date_days),
+            DdbValueTag.Time => GetTimeString(value.time_micros),
+            DdbValueTag.Interval => new DecentDBIntervalValue(value.interval_months, value.interval_days, value.interval_micros).ToString(),
+            DdbValueTag.MacAddr => GetMacAddressString(value),
             _ => string.Empty
         };
     }
@@ -1451,6 +1536,111 @@ public sealed class PreparedStatement : IDisposable
     private static DateTime FromUnixEpochMicroseconds(long micros)
         => new DateTime(micros * 10L + DateTime.UnixEpoch.Ticks, DateTimeKind.Utc);
 
+    private static DateTimeOffset FromUnixEpochMicrosecondsOffset(long micros)
+        => new DateTimeOffset(micros * 10L + DateTime.UnixEpoch.Ticks, TimeSpan.Zero);
+
+    private static object GetDateValue(int dateDays)
+    {
+#if NET6_0_OR_GREATER
+        var epoch = DateOnly.FromDateTime(DateTime.UnixEpoch);
+        return epoch.AddDays(dateDays);
+#else
+        return DateTime.UnixEpoch.Date.AddDays(dateDays);
+#endif
+    }
+
+    private static string GetDateString(int dateDays)
+    {
+#if NET6_0_OR_GREATER
+        return ((DateOnly)GetDateValue(dateDays)).ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+#else
+        return ((DateTime)GetDateValue(dateDays)).ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+#endif
+    }
+
+    private static object GetTimeValue(long microsAfterMidnight)
+    {
+        var ticks = checked(microsAfterMidnight * 10L);
+#if NET6_0_OR_GREATER
+        return new TimeOnly(ticks);
+#else
+        return TimeSpan.FromTicks(ticks);
+#endif
+    }
+
+    private static string GetTimeString(long microsAfterMidnight)
+    {
+        var value = GetTimeValue(microsAfterMidnight);
+#if NET6_0_OR_GREATER
+        return ((TimeOnly)value).ToString("HH':'mm':'ss'.'FFFFFF", CultureInfo.InvariantCulture);
+#else
+        return ((TimeSpan)value).ToString("c", CultureInfo.InvariantCulture);
+#endif
+    }
+
+    private static object GetIntervalValue(int months, int days, long micros)
+    {
+        var interval = new DecentDBIntervalValue(months, days, micros);
+        return interval.TryAsTimeSpan(out var span) ? span : interval;
+    }
+
+    private static unsafe string GetIpAddressString(DdbValueNative value)
+    {
+        var family = value.ip_family;
+        var len = family switch
+        {
+            4 => 4,
+            6 => 16,
+            _ => 0
+        };
+        if (len == 0)
+        {
+            return string.Empty;
+        }
+
+        var bytes = new byte[len];
+        for (var i = 0; i < len; i++)
+        {
+            bytes[i] = value.ip_cidr_addr_bytes[i];
+        }
+
+        return new IPAddress(bytes).ToString();
+    }
+
+    private static string GetCidrString(DdbValueNative value)
+    {
+        var ipText = GetIpAddressString(value);
+        if (ipText.Length == 0)
+        {
+            return string.Empty;
+        }
+
+        return $"{ipText}/{value.cidr_prefix_len.ToString(CultureInfo.InvariantCulture)}";
+    }
+
+    private static string GetMacAddressString(DdbValueNative value)
+    {
+        var len = value.ip_family;
+        if (len != 6 && len != 8)
+        {
+            return string.Empty;
+        }
+
+        Span<char> chars = stackalloc char[len * 3 - 1];
+        const string hex = "0123456789abcdef";
+        for (var i = 0; i < len; i++)
+        {
+            if (i > 0)
+            {
+                chars[i * 3 - 1] = ':';
+            }
+            var b = value.ip_cidr_addr_bytes[i];
+            chars[i * 3] = hex[b >> 4];
+            chars[i * 3 + 1] = hex[b & 0x0f];
+        }
+        return new string(chars);
+    }
+
     private static DecentdbValueView ToRowViewValue(DdbValueNative value)
     {
         var tag = (DdbValueTag)value.tag;
@@ -1464,6 +1654,9 @@ public sealed class PreparedStatement : IDisposable
                 DdbValueTag.Bool => value.bool_value != 0 ? 1L : 0L,
                 DdbValueTag.Decimal => value.decimal_scaled,
                 DdbValueTag.TimestampMicros => value.timestamp_micros,
+                DdbValueTag.TimestamptzMicros => value.timestamptz_micros,
+                DdbValueTag.Date => value.date_days,
+                DdbValueTag.Time => value.time_micros,
                 _ => 0L
             },
             float64_val = tag == DdbValueTag.Float64 ? value.float64_value : 0.0,

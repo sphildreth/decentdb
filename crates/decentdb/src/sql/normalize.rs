@@ -3,7 +3,9 @@
 use libpg_query_sys::protobuf;
 use libpg_query_sys::protobuf::node::Node as NodeEnum;
 
-use crate::catalog::{ColumnType, SpatialDimensions, SpatialSubtype, SpatialTypeInfo};
+use crate::catalog::{
+    ColumnType, EnumLabel, EnumTypeInfo, SpatialDimensions, SpatialSubtype, SpatialTypeInfo,
+};
 use crate::error::{DbError, Result};
 use crate::record::value::Value;
 
@@ -643,7 +645,7 @@ fn normalize_column_definition(
         }
     }
 
-    let (column_type, spatial_type) = normalize_type_name_with_spatial(
+    let (column_type, spatial_type, enum_type) = normalize_column_type_name(
         column
             .type_name
             .as_ref()
@@ -653,6 +655,7 @@ fn normalize_column_definition(
         name: column.colname.clone(),
         column_type,
         spatial_type,
+        enum_type,
         nullable: !not_null && !primary_key,
         default,
         generated,
@@ -2200,37 +2203,50 @@ fn normalize_range_var(range: &protobuf::RangeVar) -> Result<String> {
 }
 
 fn normalize_type_name(type_name: &protobuf::TypeName) -> Result<ColumnType> {
-    normalize_type_name_with_spatial(type_name).map(|(column_type, _)| column_type)
+    normalize_column_type_name(type_name).map(|(column_type, _, _)| column_type)
 }
 
-fn normalize_type_name_with_spatial(
+fn normalize_column_type_name(
     type_name: &protobuf::TypeName,
-) -> Result<(ColumnType, Option<SpatialTypeInfo>)> {
+) -> Result<(ColumnType, Option<SpatialTypeInfo>, Option<EnumTypeInfo>)> {
     let raw = normalize_qualified_name(&type_name.names)?.to_ascii_lowercase();
     match raw.as_str() {
         "int" | "int8" | "integer" | "bigint" | "int64" | "smallint" | "pg_catalog.int2"
-        | "pg_catalog.int4" | "pg_catalog.int8" => Ok((ColumnType::Int64, None)),
+        | "pg_catalog.int4" | "pg_catalog.int8" => Ok((ColumnType::Int64, None, None)),
         "real" | "double precision" | "float4" | "float8" | "float64" | "pg_catalog.float4"
-        | "pg_catalog.float8" => Ok((ColumnType::Float64, None)),
+        | "pg_catalog.float8" => Ok((ColumnType::Float64, None, None)),
         "text" | "varchar" | "character varying" | "char" | "character" | "pg_catalog.text"
-        | "pg_catalog.varchar" | "pg_catalog.bpchar" => Ok((ColumnType::Text, None)),
-        "bool" | "boolean" | "pg_catalog.bool" => Ok((ColumnType::Bool, None)),
-        "bytea" | "blob" | "pg_catalog.bytea" => Ok((ColumnType::Blob, None)),
-        "decimal" | "numeric" | "pg_catalog.numeric" => Ok((ColumnType::Decimal, None)),
-        "uuid" | "pg_catalog.uuid" => Ok((ColumnType::Uuid, None)),
-        "timestamp"
-        | "timestamp without time zone"
-        | "timestamp with time zone"
-        | "pg_catalog.timestamp"
-        | "pg_catalog.timestamptz"
-        | "datetime"
-        | "date" => Ok((ColumnType::Timestamp, None)),
+        | "pg_catalog.varchar" | "pg_catalog.bpchar" => Ok((ColumnType::Text, None, None)),
+        "bool" | "boolean" | "pg_catalog.bool" => Ok((ColumnType::Bool, None, None)),
+        "bytea" | "blob" | "pg_catalog.bytea" => Ok((ColumnType::Blob, None, None)),
+        "decimal" | "numeric" | "pg_catalog.numeric" => Ok((ColumnType::Decimal, None, None)),
+        "uuid" | "pg_catalog.uuid" => Ok((ColumnType::Uuid, None, None)),
+        "timestamp" | "timestamp without time zone" | "pg_catalog.timestamp" | "datetime" => {
+            Ok((ColumnType::Timestamp, None, None))
+        }
+        "timestamp with time zone" | "pg_catalog.timestamptz" | "timestamptz" => {
+            Ok((ColumnType::TimestampTz, None, None))
+        }
+        "date" | "pg_catalog.date" => Ok((ColumnType::Date, None, None)),
+        "time" | "time without time zone" | "pg_catalog.time" => Ok((ColumnType::Time, None, None)),
+        "interval" | "pg_catalog.interval" => Ok((ColumnType::Interval, None, None)),
+        "ipaddr" | "inet" => Ok((ColumnType::IpAddr, None, None)),
+        "cidr" => Ok((ColumnType::Cidr, None, None)),
+        "macaddr" | "macaddr8" | "pg_catalog.macaddr" | "pg_catalog.macaddr8" => {
+            Ok((ColumnType::MacAddr, None, None))
+        }
+        "enum" => Ok((
+            ColumnType::Enum,
+            None,
+            Some(normalize_enum_type_modifier(&type_name.typmods)?),
+        )),
         "geometry" | "pg_catalog.geometry" => Ok((
             ColumnType::Geometry,
             Some(normalize_spatial_type_modifier(
                 ColumnType::Geometry,
                 &type_name.typmods,
             )?),
+            None,
         )),
         "geography" | "pg_catalog.geography" => Ok((
             ColumnType::Geography,
@@ -2238,8 +2254,40 @@ fn normalize_type_name_with_spatial(
                 ColumnType::Geography,
                 &type_name.typmods,
             )?),
+            None,
         )),
         _ => Err(unsupported(format!("type {raw} is not supported"))),
+    }
+}
+
+fn normalize_enum_type_modifier(typmods: &[protobuf::Node]) -> Result<EnumTypeInfo> {
+    if typmods.is_empty() {
+        return Err(unsupported("ENUM columns require inline labels"));
+    }
+    let mut labels = Vec::with_capacity(typmods.len());
+    for node in typmods {
+        let label = normalize_enum_label(node)?;
+        if labels.iter().any(|entry: &EnumLabel| entry.label == label) {
+            return Err(unsupported(format!("duplicate ENUM label {label}")));
+        }
+        labels.push(EnumLabel {
+            label,
+            id: labels.len() as u64,
+        });
+    }
+    Ok(EnumTypeInfo { type_id: 0, labels })
+}
+
+fn normalize_enum_label(node: &protobuf::Node) -> Result<String> {
+    match node_kind(node)? {
+        NodeEnum::AConst(value) => match value.val.as_ref() {
+            Some(protobuf::a_const::Val::Sval(value)) => Ok(value.sval.clone()),
+            _ => Err(unsupported("ENUM labels must be string literals")),
+        },
+        other => Err(unsupported(format!(
+            "ENUM label {} is not supported",
+            describe_node(other)
+        ))),
     }
 }
 
@@ -2627,14 +2675,14 @@ mod tests {
         if let Statement::CreateTable(ct) =
             norm("CREATE TABLE t (id INT PRIMARY KEY, a TIMESTAMP WITH TIME ZONE)")
         {
-            assert_eq!(ct.columns[1].column_type, ColumnType::Timestamp);
+            assert_eq!(ct.columns[1].column_type, ColumnType::TimestampTz);
         }
     }
 
     #[test]
     fn type_date() {
         if let Statement::CreateTable(ct) = norm("CREATE TABLE t (id INT PRIMARY KEY, a DATE)") {
-            assert_eq!(ct.columns[1].column_type, ColumnType::Timestamp);
+            assert_eq!(ct.columns[1].column_type, ColumnType::Date);
         }
     }
 

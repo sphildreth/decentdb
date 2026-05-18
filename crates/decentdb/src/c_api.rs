@@ -11,7 +11,7 @@ use crate::error::{DbError, DbErrorCode, Result};
 use crate::{evict_shared_wal, Db, DbConfig, QueryResult, Value};
 
 const DDB_OK: u32 = 0;
-const DDB_ABI_VERSION: u32 = 1;
+const DDB_ABI_VERSION: u32 = 2;
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -27,6 +27,14 @@ pub enum DdbValueTag {
     TimestampMicros = 8,
     Geometry = 9,
     Geography = 10,
+    Enum = 11,
+    IpAddr = 12,
+    Cidr = 13,
+    Date = 14,
+    Time = 15,
+    TimestamptzMicros = 16,
+    Interval = 17,
+    MacAddr = 18,
 }
 
 #[repr(C)]
@@ -44,6 +52,18 @@ pub struct DdbValue {
     pub len: usize,
     pub uuid_bytes: [u8; 16],
     pub timestamp_micros: i64,
+    pub enum_type_id: u64,
+    pub enum_label_id: u64,
+    pub ip_family: u8,
+    pub cidr_prefix_len: u8,
+    pub reserved2: [u8; 6],
+    pub ip_cidr_addr_bytes: [u8; 16],
+    pub date_days: i32,
+    pub time_micros: i64,
+    pub timestamptz_micros: i64,
+    pub interval_months: i32,
+    pub interval_days: i32,
+    pub interval_micros: i64,
 }
 
 impl Default for DdbValue {
@@ -61,6 +81,18 @@ impl Default for DdbValue {
             len: 0,
             uuid_bytes: [0; 16],
             timestamp_micros: 0,
+            enum_type_id: 0,
+            enum_label_id: 0,
+            ip_family: 0,
+            cidr_prefix_len: 0,
+            reserved2: [0; 6],
+            ip_cidr_addr_bytes: [0; 16],
+            date_days: 0,
+            time_micros: 0,
+            timestamptz_micros: 0,
+            interval_months: 0,
+            interval_days: 0,
+            interval_micros: 0,
         }
     }
 }
@@ -80,6 +112,18 @@ pub struct DdbValueView {
     pub len: usize,
     pub uuid_bytes: [u8; 16],
     pub timestamp_micros: i64,
+    pub enum_type_id: u64,
+    pub enum_label_id: u64,
+    pub ip_family: u8,
+    pub cidr_prefix_len: u8,
+    pub reserved2: [u8; 6],
+    pub ip_cidr_addr_bytes: [u8; 16],
+    pub date_days: i32,
+    pub time_micros: i64,
+    pub timestamptz_micros: i64,
+    pub interval_months: i32,
+    pub interval_days: i32,
+    pub interval_micros: i64,
 }
 
 impl Default for DdbValueView {
@@ -97,6 +141,18 @@ impl Default for DdbValueView {
             len: 0,
             uuid_bytes: [0; 16],
             timestamp_micros: 0,
+            enum_type_id: 0,
+            enum_label_id: 0,
+            ip_family: 0,
+            cidr_prefix_len: 0,
+            reserved2: [0; 6],
+            ip_cidr_addr_bytes: [0; 16],
+            date_days: 0,
+            time_micros: 0,
+            timestamptz_micros: 0,
+            interval_months: 0,
+            interval_days: 0,
+            interval_micros: 0,
         }
     }
 }
@@ -311,6 +367,40 @@ fn value_from_ffi(value: &DdbValue) -> Result<Value> {
         x if x == DdbValueTag::TimestampMicros as u32 => {
             Ok(Value::TimestampMicros(value.timestamp_micros))
         }
+        x if x == DdbValueTag::Enum as u32 => Ok(Value::Enum {
+            enum_type_id: value.enum_type_id,
+            label_id: value.enum_label_id,
+        }),
+        x if x == DdbValueTag::IpAddr as u32 => Ok(Value::IpAddr {
+            family: value.ip_family,
+            addr: value.ip_cidr_addr_bytes,
+        }),
+        x if x == DdbValueTag::Cidr as u32 => Ok(Value::Cidr {
+            family: value.ip_family,
+            prefix_len: value.cidr_prefix_len,
+            network: value.ip_cidr_addr_bytes,
+        }),
+        x if x == DdbValueTag::Date as u32 => Ok(Value::DateDays(value.date_days)),
+        x if x == DdbValueTag::Time as u32 => Ok(Value::TimeMicros(value.time_micros)),
+        x if x == DdbValueTag::TimestamptzMicros as u32 => {
+            Ok(Value::TimestampTzMicros(value.timestamptz_micros))
+        }
+        x if x == DdbValueTag::Interval as u32 => Ok(Value::Interval {
+            months: value.interval_months,
+            days: value.interval_days,
+            micros: value.interval_micros,
+        }),
+        x if x == DdbValueTag::MacAddr as u32 => {
+            let len = value.ip_family;
+            let copy_len = match len {
+                crate::record::value::MACADDR_LEN_6 => 6,
+                crate::record::value::MACADDR_LEN_8 => 8,
+                _ => return Err(DbError::sql("invalid MACADDR parameter length")),
+            };
+            let mut bytes = [0_u8; 8];
+            bytes[..copy_len].copy_from_slice(&value.ip_cidr_addr_bytes[..copy_len]);
+            Ok(Value::MacAddr { len, bytes })
+        }
         other => Err(DbError::sql(format!("unsupported DDB value tag {other}"))),
     }
 }
@@ -339,6 +429,9 @@ fn fill_ffi_value(out: &mut DdbValue, value: &Value) {
         free_owned_bytes(out.data, out.len);
     }
     ddb_value_reset(out);
+    if fill_semantic_ffi_value(out, value) {
+        return;
+    }
     match value {
         Value::Null => out.tag = DdbValueTag::Null as u32,
         Value::Int64(inner) => {
@@ -386,10 +479,23 @@ fn fill_ffi_value(out: &mut DdbValue, value: &Value) {
             out.tag = DdbValueTag::TimestampMicros as u32;
             out.timestamp_micros = *inner;
         }
+        Value::Enum { .. }
+        | Value::IpAddr { .. }
+        | Value::Cidr { .. }
+        | Value::MacAddr { .. }
+        | Value::DateDays(_)
+        | Value::TimeMicros(_)
+        | Value::TimestampTzMicros(_)
+        | Value::Interval { .. } => {
+            unreachable!("semantic values are handled before scalar C ABI fill")
+        }
     }
 }
 
 fn fill_ffi_value_view(out: &mut DdbValueView, value: &Value) {
+    if fill_semantic_ffi_value_view(out, value) {
+        return;
+    }
     match value {
         Value::Null => out.tag = DdbValueTag::Null as u32,
         Value::Int64(inner) => {
@@ -437,6 +543,144 @@ fn fill_ffi_value_view(out: &mut DdbValueView, value: &Value) {
             out.tag = DdbValueTag::TimestampMicros as u32;
             out.timestamp_micros = *inner;
         }
+        Value::Enum { .. }
+        | Value::IpAddr { .. }
+        | Value::Cidr { .. }
+        | Value::MacAddr { .. }
+        | Value::DateDays(_)
+        | Value::TimeMicros(_)
+        | Value::TimestampTzMicros(_)
+        | Value::Interval { .. } => {
+            unreachable!("semantic values are handled before scalar C ABI view fill")
+        }
+    }
+}
+
+fn fill_semantic_ffi_value(_out: &mut DdbValue, _value: &Value) -> bool {
+    match _value {
+        Value::Enum {
+            enum_type_id,
+            label_id,
+        } => {
+            _out.tag = DdbValueTag::Enum as u32;
+            _out.enum_type_id = *enum_type_id;
+            _out.enum_label_id = *label_id;
+            true
+        }
+        Value::IpAddr { family, addr } => {
+            _out.tag = DdbValueTag::IpAddr as u32;
+            _out.ip_family = *family;
+            _out.ip_cidr_addr_bytes = *addr;
+            true
+        }
+        Value::Cidr {
+            family,
+            prefix_len,
+            network,
+        } => {
+            _out.tag = DdbValueTag::Cidr as u32;
+            _out.ip_family = *family;
+            _out.cidr_prefix_len = *prefix_len;
+            _out.ip_cidr_addr_bytes = *network;
+            true
+        }
+        Value::MacAddr { len, bytes } => {
+            _out.tag = DdbValueTag::MacAddr as u32;
+            _out.ip_family = *len;
+            _out.ip_cidr_addr_bytes[..8].copy_from_slice(bytes);
+            true
+        }
+        Value::DateDays(days) => {
+            _out.tag = DdbValueTag::Date as u32;
+            _out.date_days = *days;
+            true
+        }
+        Value::TimeMicros(micros) => {
+            _out.tag = DdbValueTag::Time as u32;
+            _out.time_micros = *micros;
+            true
+        }
+        Value::TimestampTzMicros(micros) => {
+            _out.tag = DdbValueTag::TimestamptzMicros as u32;
+            _out.timestamptz_micros = *micros;
+            true
+        }
+        Value::Interval {
+            months,
+            days,
+            micros,
+        } => {
+            _out.tag = DdbValueTag::Interval as u32;
+            _out.interval_months = *months;
+            _out.interval_days = *days;
+            _out.interval_micros = *micros;
+            true
+        }
+        _ => false,
+    }
+}
+
+fn fill_semantic_ffi_value_view(_out: &mut DdbValueView, _value: &Value) -> bool {
+    match _value {
+        Value::Enum {
+            enum_type_id,
+            label_id,
+        } => {
+            _out.tag = DdbValueTag::Enum as u32;
+            _out.enum_type_id = *enum_type_id;
+            _out.enum_label_id = *label_id;
+            true
+        }
+        Value::IpAddr { family, addr } => {
+            _out.tag = DdbValueTag::IpAddr as u32;
+            _out.ip_family = *family;
+            _out.ip_cidr_addr_bytes = *addr;
+            true
+        }
+        Value::Cidr {
+            family,
+            prefix_len,
+            network,
+        } => {
+            _out.tag = DdbValueTag::Cidr as u32;
+            _out.ip_family = *family;
+            _out.cidr_prefix_len = *prefix_len;
+            _out.ip_cidr_addr_bytes = *network;
+            true
+        }
+        Value::MacAddr { len, bytes } => {
+            _out.tag = DdbValueTag::MacAddr as u32;
+            _out.ip_family = *len;
+            _out.ip_cidr_addr_bytes[..8].copy_from_slice(bytes);
+            true
+        }
+        Value::DateDays(days) => {
+            _out.tag = DdbValueTag::Date as u32;
+            _out.date_days = *days;
+            true
+        }
+        Value::TimeMicros(micros) => {
+            _out.tag = DdbValueTag::Time as u32;
+            _out.time_micros = *micros;
+            true
+        }
+        Value::TimestampTzMicros(micros) => {
+            _out.tag = DdbValueTag::TimestamptzMicros as u32;
+            _out.timestamptz_micros = *micros;
+            true
+        }
+        Value::Interval {
+            months,
+            days,
+            micros,
+        } => {
+            _out.tag = DdbValueTag::Interval as u32;
+            _out.interval_months = *months;
+            _out.interval_days = *days;
+            _out.interval_micros = *micros;
+            true
+        }
+        _ => false,
     }
 }
 
@@ -2486,7 +2730,7 @@ mod tests {
     #[test]
     fn abi_shape_matches_expected_layout() {
         let _execute: ExecuteFn = ddb_db_execute;
-        assert_eq!(std::mem::size_of::<DdbValue>(), 88);
+        assert_eq!(std::mem::size_of::<DdbValue>(), 168);
         assert_eq!(std::mem::align_of::<DdbValue>(), 8);
     }
 

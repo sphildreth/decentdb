@@ -1,6 +1,8 @@
 //! Constraint enforcement helpers.
 
-use crate::catalog::{identifiers_equal, ColumnSchema, IndexKind, IndexSchema, TableSchema};
+use crate::catalog::{
+    identifiers_equal, ColumnSchema, ColumnType, IndexKind, IndexSchema, TableSchema,
+};
 use crate::error::{DbError, Result};
 use crate::record::row::Row;
 use crate::record::value::Value;
@@ -334,7 +336,48 @@ fn coerce_value(column: &ColumnSchema, value: Value) -> Result<Value> {
     if matches!(value, Value::Null) {
         return Ok(Value::Null);
     }
+    if column.column_type == ColumnType::Enum {
+        return coerce_enum_value(column, value);
+    }
     super::cast_value(value, column.column_type)
+}
+
+fn coerce_enum_value(column: &ColumnSchema, value: Value) -> Result<Value> {
+    let enum_type = column
+        .enum_type
+        .as_ref()
+        .ok_or_else(|| DbError::sql("ENUM column is missing label metadata"))?;
+    match value {
+        Value::Text(label) => {
+            let label_id = enum_type.label_id(&label).ok_or_else(|| {
+                DbError::constraint(format!(
+                    "invalid ENUM label {} for column {}",
+                    label, column.name
+                ))
+            })?;
+            Ok(Value::Enum {
+                enum_type_id: enum_type.type_id,
+                label_id,
+            })
+        }
+        Value::Enum {
+            enum_type_id,
+            label_id,
+        } if enum_type_id == enum_type.type_id && enum_type.label_for_id(label_id).is_some() => {
+            Ok(Value::Enum {
+                enum_type_id,
+                label_id,
+            })
+        }
+        Value::Enum { .. } => Err(DbError::constraint(format!(
+            "invalid ENUM value for column {}",
+            column.name
+        ))),
+        other => Err(DbError::sql(format!(
+            "cannot cast {other:?} to ENUM for column {}",
+            column.name
+        ))),
+    }
 }
 
 fn validate_spatial_column_value(
@@ -713,6 +756,7 @@ mod tests {
             name: name.to_string(),
             column_type: crate::catalog::ColumnType::Int64,
             spatial_type: None,
+            enum_type: None,
             nullable,
             default_sql: None,
             generated_sql: None,

@@ -56,7 +56,17 @@ final class TypeMapping {
                 return Types.TIME;
             case "TIMESTAMP":
             case "TIMESTAMPTZ":
+            case "TIMESTAMPTZ_MICROS":
                 return Types.TIMESTAMP;
+            case "ENUM":
+            case "IPADDR":
+            case "INET":
+            case "CIDR":
+            case "INTERVAL":
+                return Types.VARCHAR;
+            case "MACADDR":
+            case "MACADDR8":
+                return Types.OTHER;
             case "UUID":
                 // Stored as 16-byte blob at rest.
                 return Types.BINARY;
@@ -86,6 +96,15 @@ final class TypeMapping {
                 return Types.BOOLEAN;
             case DecentDBNative.KIND_DECIMAL: return Types.DECIMAL;
             case DecentDBNative.KIND_DATETIME: return Types.TIMESTAMP;
+            case DecentDBNative.KIND_ENUM:
+            case DecentDBNative.KIND_IPADDR:
+            case DecentDBNative.KIND_CIDR:
+            case DecentDBNative.KIND_INTERVAL:
+                return Types.VARCHAR;
+            case DecentDBNative.KIND_DATE: return Types.DATE;
+            case DecentDBNative.KIND_TIME: return Types.TIME;
+            case DecentDBNative.KIND_TIMESTAMPTZ: return Types.TIMESTAMP;
+            case DecentDBNative.KIND_MACADDR: return Types.OTHER;
             case DecentDBNative.KIND_NULL:    return Types.NULL;
             default:                          return Types.OTHER;
         }

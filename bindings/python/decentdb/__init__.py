@@ -2,6 +2,8 @@ import collections
 import ctypes
 import datetime
 import decimal
+from dataclasses import dataclass
+import ipaddress
 import json
 import os
 import re
@@ -23,11 +25,19 @@ from .native import (
     DDB_VALUE_BLOB,
     DDB_VALUE_BOOL,
     DDB_VALUE_DECIMAL,
+    DDB_VALUE_CIDR,
+    DDB_VALUE_DATE,
+    DDB_VALUE_ENUM,
     DDB_VALUE_FLOAT64,
     DDB_VALUE_GEOGRAPHY,
     DDB_VALUE_GEOMETRY,
+    DDB_VALUE_INTERVAL,
     DDB_VALUE_INT64,
     DDB_VALUE_NULL,
+    DDB_VALUE_IPADDR,
+    DDB_VALUE_MACADDR,
+    DDB_VALUE_TIME,
+    DDB_VALUE_TIMESTAMPTZ_MICROS,
     DDB_VALUE_TEXT,
     DDB_VALUE_TIMESTAMP_MICROS,
     DDB_VALUE_UUID,
@@ -104,6 +114,19 @@ class GeographyWKB:
         self.data = bytes(data)
 
 
+@dataclass(frozen=True, slots=True)
+class EnumValue:
+    type_id: int
+    label_id: int
+
+
+@dataclass(frozen=True, slots=True)
+class IntervalValue:
+    months: int
+    days: int
+    micros: int
+
+
 class NotSupportedError(DatabaseError):
     pass
 
@@ -121,6 +144,7 @@ NUMBER = float
 DATETIME = datetime.datetime
 ROWID = int
 _UNIX_EPOCH_UTC = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+_UNIX_EPOCH_DATE = datetime.date(1970, 1, 1)
 
 
 def DateFromTicks(ticks):
@@ -307,6 +331,84 @@ def _is_direct_execute_sql(sql):
     return _TXN_CONTROL_RE.match(sql) is not None
 
 
+def _decode_ip_address_value(value):
+    family = int(value.ip_family)
+    if family == 4:
+        return ipaddress.ip_address(ipaddress.IPv4Address(bytes(value.ip_cidr_addr_bytes[:4])))
+    if family == 6:
+        return ipaddress.ip_address(ipaddress.IPv6Address(bytes(value.ip_cidr_addr_bytes)))
+    return None
+
+
+def _decode_cidr_value(value):
+    family = int(value.ip_family)
+    prefix_len = int(value.cidr_prefix_len)
+    if family == 4:
+        addr = ipaddress.IPv4Address(bytes(value.ip_cidr_addr_bytes[:4]))
+        return ipaddress.ip_network(f"{addr}/{prefix_len}", strict=True)
+    if family == 6:
+        addr = ipaddress.IPv6Address(bytes(value.ip_cidr_addr_bytes))
+        return ipaddress.ip_network(f"{addr}/{prefix_len}", strict=True)
+    return None
+
+
+def _decode_date_value(value):
+    return _UNIX_EPOCH_DATE + datetime.timedelta(days=int(value.date_days))
+
+
+def _decode_time_value(value):
+    micros = int(value.time_micros)
+    seconds, microseconds = divmod(micros, 1_000_000)
+    minutes, second = divmod(seconds, 60)
+    hour, minute = divmod(minutes, 60)
+    return datetime.time(hour, minute, second, microseconds)
+
+
+def _decode_timestamptz_value(value):
+    return _UNIX_EPOCH_UTC + datetime.timedelta(
+        microseconds=int(value.timestamptz_micros)
+    )
+
+
+def _decode_interval_value(value):
+    return IntervalValue(
+        months=int(value.interval_months),
+        days=int(value.interval_days),
+        micros=int(value.interval_micros),
+    )
+
+
+def _decode_macaddr_value(value):
+    length = int(value.ip_family)
+    if length not in (6, 8):
+        return None
+    return ":".join(f"{int(value.ip_cidr_addr_bytes[i]):02x}" for i in range(length))
+
+
+def _decode_semantic_value(value):
+    tag = int(value.tag)
+    if tag == DDB_VALUE_ENUM:
+        return EnumValue(
+            type_id=int(value.enum_type_id),
+            label_id=int(value.enum_label_id),
+        )
+    if tag == DDB_VALUE_IPADDR:
+        return _decode_ip_address_value(value)
+    if tag == DDB_VALUE_CIDR:
+        return _decode_cidr_value(value)
+    if tag == DDB_VALUE_DATE:
+        return _decode_date_value(value)
+    if tag == DDB_VALUE_TIME:
+        return _decode_time_value(value)
+    if tag == DDB_VALUE_TIMESTAMPTZ_MICROS:
+        return _decode_timestamptz_value(value)
+    if tag == DDB_VALUE_INTERVAL:
+        return _decode_interval_value(value)
+    if tag == DDB_VALUE_MACADDR:
+        return _decode_macaddr_value(value)
+    return None
+
+
 def _decode_ffi_value(lib, value):
     tag = int(value.tag)
     if tag == DDB_VALUE_NULL:
@@ -335,7 +437,7 @@ def _decode_ffi_value(lib, value):
         return _UNIX_EPOCH_UTC + datetime.timedelta(
             microseconds=int(value.timestamp_micros)
         )
-    return None
+    return _decode_semantic_value(value)
 
 
 def _string_out(lib, func, *args):
@@ -2494,7 +2596,7 @@ class Cursor:
                     + datetime.timedelta(microseconds=int(value.timestamp_micros))
                 )
             else:
-                append_row(None)
+                append_row(_decode_ffi_value(self._lib, value))
         return tuple(row)
 
     def _decode_row_view_matrix(self, values_ptr, row_count, col_count):
@@ -2608,7 +2710,7 @@ class Cursor:
                                 )
                             )
                         else:
-                            append_row(None)
+                            append_row(_decode_ffi_value(self._lib, value))
                     append_rows(tuple(row))
                 return rows
             if (
@@ -2685,7 +2787,7 @@ class Cursor:
                                 )
                             )
                         else:
-                            append_row(None)
+                            append_row(_decode_ffi_value(self._lib, value))
                     append_rows(tuple(row))
                 return rows
             if (
@@ -2762,7 +2864,7 @@ class Cursor:
                                 )
                             )
                         else:
-                            append_row(None)
+                            append_row(_decode_ffi_value(self._lib, value))
                     append_rows(tuple(row))
                 return rows
             for row_index in range(row_count):
@@ -2820,9 +2922,9 @@ class Cursor:
                             )
                         )
                     else:
-                        append_row(None)
+                        append_row(_decode_ffi_value(self._lib, value))
                 append_rows(tuple(row))
-            return rows
+        return rows
 
         if col_count == 1:
             sql = self._last_sql
@@ -2878,7 +2980,7 @@ class Cursor:
                         )
                     )
                 else:
-                    append_rows((None,))
+                    append_rows((_decode_ffi_value(self._lib, value),))
             return rows
 
         if col_count == 6:
@@ -2943,7 +3045,7 @@ class Cursor:
                         + datetime.timedelta(microseconds=int(value.timestamp_micros))
                     )
                 else:
-                    append_row(None)
+                    append_row(_decode_ffi_value(self._lib, value))
             append_rows(tuple(row))
         return rows
 

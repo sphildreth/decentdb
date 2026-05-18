@@ -36,7 +36,12 @@ use crate::metadata::{
     ViewInfo,
 };
 use crate::record::overflow::read_overflow;
-use crate::record::value::{normalize_decimal, parse_decimal_text, Value};
+use crate::record::value::{
+    format_cidr, format_date_days, format_interval, format_ip_addr, format_mac_addr,
+    format_time_micros, format_timestamp_tz_micros, normalize_decimal, parse_cidr, parse_date_days,
+    parse_decimal_text, parse_interval, parse_ip_addr, parse_mac_addr, parse_time_micros,
+    parse_timestamp_tz_micros, Value,
+};
 use crate::sql::ast::Statement as SqlStatement;
 use crate::sql::parser::{parse_expression_sql, parse_sql_statement, rewrite_legacy_trigger_body};
 use crate::storage::freelist::{decode_freelist_next, encode_freelist_page};
@@ -6379,12 +6384,7 @@ impl Db {
                     table.name, column.name
                 ))
             })?;
-            values.push(json_to_typed_value(
-                &table.name,
-                &column.name,
-                &column.column_type,
-                json_value,
-            )?);
+            values.push(json_to_column_value(&table.name, column, json_value)?);
         }
 
         row_satisfies_expression(&runtime, &table.name, &scope.filter_columns, &values, &expr)
@@ -6460,12 +6460,7 @@ impl Db {
                             table.name, column.name
                         ))
                     })?;
-                    values.push(json_to_typed_value(
-                        &table.name,
-                        &column.name,
-                        &column.column_type,
-                        json_value,
-                    )?);
+                    values.push(json_to_column_value(&table.name, column, json_value)?);
                 }
                 if !row_satisfies_expression(
                     &runtime,
@@ -7253,8 +7248,7 @@ impl Db {
                         table.name
                     ))
                 })?;
-                let expected =
-                    json_to_typed_value(&table.name, pk_col, &column.column_type, json_value)?;
+                let expected = json_to_column_value(&table.name, column, json_value)?;
                 let Some(actual) = values.get(
                     table
                         .columns
@@ -7358,12 +7352,7 @@ impl Db {
                         table.name
                     ))
                 })?;
-                where_values.push(json_to_typed_value(
-                    &table.name,
-                    pk_col,
-                    &column.column_type,
-                    json_value,
-                )?);
+                where_values.push(json_to_column_value(&table.name, column, json_value)?);
             }
             let _ = self.execute_with_params(&sql, &where_values)?;
 
@@ -7387,12 +7376,7 @@ impl Db {
                     ))
                 })?;
                 columns.push(sql_identifier(&column.name));
-                values.push(json_to_typed_value(
-                    &table.name,
-                    &column.name,
-                    &column.column_type,
-                    json_value,
-                )?);
+                values.push(json_to_column_value(&table.name, column, json_value)?);
             }
             let sql = format!(
                 "INSERT INTO {} ({}) VALUES ({})",
@@ -7425,12 +7409,7 @@ impl Db {
                         ))
                     })?;
                     columns.push(sql_identifier(&column.name));
-                    values.push(json_to_typed_value(
-                        &table.name,
-                        &column.name,
-                        &column.column_type,
-                        json_value,
-                    )?);
+                    values.push(json_to_column_value(&table.name, column, json_value)?);
                 }
                 let sql = format!(
                     "INSERT INTO {} ({}) VALUES ({})",
@@ -7501,12 +7480,7 @@ impl Db {
                             column.name, table.name
                         ))
                     })?;
-                    params.push(json_to_typed_value(
-                        &table.name,
-                        &column.name,
-                        &column.column_type,
-                        json_value,
-                    )?);
+                    params.push(json_to_column_value(&table.name, column, json_value)?);
                     expressions.push(format!(
                         "{} = ${}",
                         sql_identifier(&column.name),
@@ -7530,12 +7504,7 @@ impl Db {
                             table.name
                         ))
                     })?;
-                    params.push(json_to_typed_value(
-                        &table.name,
-                        pk_col,
-                        &column.column_type,
-                        json_value,
-                    )?);
+                    params.push(json_to_column_value(&table.name, column, json_value)?);
                 }
                 let sql = format!(
                     "UPDATE {} SET {} WHERE {}",
@@ -7628,12 +7597,7 @@ impl Db {
                             table.name
                         ))
                     })?;
-                    where_values.push(json_to_typed_value(
-                        &table.name,
-                        pk_col,
-                        &column.column_type,
-                        json_value,
-                    )?);
+                    where_values.push(json_to_column_value(&table.name, column, json_value)?);
                     where_parts.push(format!(
                         "{} = ${}",
                         sql_identifier(pk_col),
@@ -9098,6 +9062,38 @@ fn parse_json_blob(input: &str) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+fn json_to_column_value(
+    table_name: &str,
+    column: &ColumnSchema,
+    value: &JsonValue,
+) -> Result<Value> {
+    if column.column_type == ColumnType::Enum {
+        let label = value.as_str().ok_or_else(|| {
+            DbError::sql(format!(
+                "column '{}' in table '{table_name}' must be ENUM label text",
+                column.name
+            ))
+        })?;
+        let enum_type = column.enum_type.as_ref().ok_or_else(|| {
+            DbError::sql(format!(
+                "column '{}' in table '{table_name}' cannot import ENUM without enum metadata",
+                column.name
+            ))
+        })?;
+        let label_id = enum_type.label_id(label).ok_or_else(|| {
+            DbError::sql(format!(
+                "column '{}' in table '{table_name}' has invalid ENUM label '{label}'",
+                column.name
+            ))
+        })?;
+        return Ok(Value::Enum {
+            enum_type_id: enum_type.type_id,
+            label_id,
+        });
+    }
+    json_to_typed_value(table_name, &column.name, &column.column_type, value)
+}
+
 fn json_to_typed_value(
     table_name: &str,
     column_name: &str,
@@ -9219,6 +9215,83 @@ fn json_to_typed_value(
                 "column '{column_name}' in table '{table_name}' must be TIMESTAMP"
             ))),
         },
+        ColumnType::Enum => Err(DbError::sql(format!(
+            "column '{column_name}' in table '{table_name}' cannot import ENUM without enum metadata"
+        ))),
+        ColumnType::IpAddr => {
+            let text = value.as_str().ok_or_else(|| {
+                DbError::sql(format!(
+                    "column '{column_name}' in table '{table_name}' must be IPADDR text"
+                ))
+            })?;
+            let (family, addr) = parse_ip_addr(text)?;
+            Ok(Value::IpAddr { family, addr })
+        }
+        ColumnType::Cidr => {
+            let text = value.as_str().ok_or_else(|| {
+                DbError::sql(format!(
+                    "column '{column_name}' in table '{table_name}' must be CIDR text"
+                ))
+            })?;
+            let (family, prefix_len, network) = parse_cidr(text)?;
+            Ok(Value::Cidr {
+                family,
+                prefix_len,
+                network,
+            })
+        }
+        ColumnType::MacAddr => {
+            let text = value.as_str().ok_or_else(|| {
+                DbError::sql(format!(
+                    "column '{column_name}' in table '{table_name}' must be MACADDR text"
+                ))
+            })?;
+            let (len, bytes) = parse_mac_addr(text)?;
+            Ok(Value::MacAddr { len, bytes })
+        }
+        ColumnType::Date => {
+            let text = value.as_str().ok_or_else(|| {
+                DbError::sql(format!(
+                    "column '{column_name}' in table '{table_name}' must be DATE text"
+                ))
+            })?;
+            Ok(Value::DateDays(parse_date_days(text)?))
+        }
+        ColumnType::Time => {
+            let text = value.as_str().ok_or_else(|| {
+                DbError::sql(format!(
+                    "column '{column_name}' in table '{table_name}' must be TIME text"
+                ))
+            })?;
+            Ok(Value::TimeMicros(parse_time_micros(text)?))
+        }
+        ColumnType::TimestampTz => match value {
+            JsonValue::Number(value) => value
+                .as_i64()
+                .map(Value::TimestampTzMicros)
+                .ok_or_else(|| {
+                    DbError::sql(format!(
+                        "column '{column_name}' in table '{table_name}' is not a valid TIMESTAMPTZ"
+                    ))
+                }),
+            JsonValue::String(value) => Ok(Value::TimestampTzMicros(parse_timestamp_tz_micros(value)?)),
+            _ => Err(DbError::sql(format!(
+                "column '{column_name}' in table '{table_name}' must be TIMESTAMPTZ"
+            ))),
+        },
+        ColumnType::Interval => {
+            let text = value.as_str().ok_or_else(|| {
+                DbError::sql(format!(
+                    "column '{column_name}' in table '{table_name}' must be INTERVAL text"
+                ))
+            })?;
+            let (months, days, micros) = parse_interval(text)?;
+            Ok(Value::Interval {
+                months,
+                days,
+                micros,
+            })
+        }
     }
 }
 
@@ -10582,7 +10655,7 @@ fn render_create_table(table: &TableSchema) -> String {
         let mut definition = format!(
             "{} {}",
             sql_identifier(&column.name),
-            column.column_type.as_str()
+            render_column_type(column)
         );
         if !column.nullable {
             definition.push_str(" NOT NULL");
@@ -10691,13 +10764,48 @@ fn render_insert(table: &TableSchema, values: &[Value]) -> String {
         .join(", ");
     let values = values
         .iter()
-        .map(render_value_sql)
+        .zip(table.columns.iter())
+        .map(|(value, column)| render_column_value_sql(column, value))
         .collect::<Vec<_>>()
         .join(", ");
     format!(
         "INSERT INTO {} ({columns}) VALUES ({values});",
         sql_identifier(&table.name)
     )
+}
+
+fn render_column_type(column: &crate::catalog::ColumnSchema) -> String {
+    if column.column_type == crate::catalog::ColumnType::Enum {
+        if let Some(enum_type) = &column.enum_type {
+            let labels = enum_type
+                .labels
+                .iter()
+                .map(|label| sql_string_literal(&label.label))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return format!("ENUM({labels})");
+        }
+    }
+    column.column_type.as_str().to_string()
+}
+
+fn render_column_value_sql(column: &crate::catalog::ColumnSchema, value: &Value) -> String {
+    if let (
+        crate::catalog::ColumnType::Enum,
+        Some(enum_type),
+        Value::Enum {
+            enum_type_id,
+            label_id,
+        },
+    ) = (column.column_type, &column.enum_type, value)
+    {
+        if *enum_type_id == enum_type.type_id {
+            if let Some(label) = enum_type.label_for_id(*label_id) {
+                return sql_string_literal(label);
+            }
+        }
+    }
+    render_value_sql(value)
 }
 
 fn render_create_view(view: &ViewSchema) -> String {
@@ -10855,7 +10963,7 @@ fn render_value_sql(value: &Value) -> String {
                 "FALSE".to_string()
             }
         }
-        Value::Text(value) => format!("'{}'", value.replace('\'', "''")),
+        Value::Text(value) => sql_string_literal(value),
         Value::Blob(value) => format!("X'{}'", hex_encode(value)),
         Value::Geometry(value) | Value::Geography(value) => format!("X'{}'", hex_encode(value)),
         Value::Decimal { scaled, scale } => {
@@ -10880,11 +10988,48 @@ fn render_value_sql(value: &Value) -> String {
         }
         Value::Uuid(value) => format!("X'{}'", hex_encode(value)),
         Value::TimestampMicros(value) => value.to_string(),
+        Value::Enum {
+            enum_type_id,
+            label_id,
+        } => format!("'{enum_type_id}:{label_id}'"),
+        Value::IpAddr { family, addr } => match format_ip_addr(*family, addr) {
+            Ok(value) => format!("'{value}'"),
+            Err(_) => "NULL".to_string(),
+        },
+        Value::Cidr {
+            family,
+            prefix_len,
+            network,
+        } => match format_cidr(*family, *prefix_len, network) {
+            Ok(value) => format!("'{value}'"),
+            Err(_) => "NULL".to_string(),
+        },
+        Value::MacAddr { len, bytes } => match format_mac_addr(*len, bytes) {
+            Ok(value) => format!("'{value}'"),
+            Err(_) => "NULL".to_string(),
+        },
+        Value::DateDays(days) => format!("'{}'", format_date_days(*days)),
+        Value::TimeMicros(micros) => match format_time_micros(*micros) {
+            Ok(value) => format!("'{value}'"),
+            Err(_) => "NULL".to_string(),
+        },
+        Value::TimestampTzMicros(micros) => {
+            format!("'{}'", format_timestamp_tz_micros(*micros))
+        }
+        Value::Interval {
+            months,
+            days,
+            micros,
+        } => format!("'{}'", format_interval(*months, *days, *micros)),
     }
 }
 
 fn sql_identifier(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+fn sql_string_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -11062,6 +11207,7 @@ mod tests {
                 name: "id".to_string(),
                 column_type: ColumnType::Int64,
                 spatial_type: None,
+                enum_type: None,
                 nullable: false,
                 default_sql: None,
                 generated_sql: None,
@@ -11174,6 +11320,95 @@ mod tests {
                 Value::Text(":memory:".to_string())
             ]
         );
+    }
+
+    #[test]
+    fn enum_columns_store_label_ids_and_dump_labels() -> Result<()> {
+        let dir = TempDir::new().expect("create temp dir");
+        let path = dir.path().join("enum.ddb");
+        let db = Db::open_or_create(&path, DbConfig::default())?;
+        db.execute(
+            "CREATE TABLE tickets(
+                id INT PRIMARY KEY,
+                state ENUM('open', 'closed', 'blocked') NOT NULL
+            )",
+        )?;
+        db.execute("INSERT INTO tickets VALUES (1, 'open'), (2, 'closed')")?;
+
+        let result = db.execute("SELECT state FROM tickets ORDER BY id")?;
+        let Value::Enum {
+            enum_type_id,
+            label_id,
+        } = result.rows()[0].values()[0]
+        else {
+            panic!("expected enum value");
+        };
+        assert_ne!(enum_type_id, 0);
+        assert_eq!(label_id, 0);
+        assert_eq!(
+            result.rows()[1].values()[0],
+            Value::Enum {
+                enum_type_id,
+                label_id: 1
+            }
+        );
+        assert!(db
+            .execute("INSERT INTO tickets VALUES (3, 'missing')")
+            .is_err());
+
+        let ddl = db.table_ddl("tickets")?;
+        assert!(ddl.contains("ENUM('open', 'closed', 'blocked')"));
+        let dump = db.dump_sql()?;
+        assert!(dump.contains("\"state\" ENUM('open', 'closed', 'blocked') NOT NULL"));
+        assert!(dump.contains("VALUES (1, 'open')"));
+        drop(db);
+
+        let reopened = Db::open(&path, DbConfig::default())?;
+        let reopened_result = reopened.execute("SELECT state FROM tickets ORDER BY id")?;
+        assert_eq!(
+            reopened_result.rows()[0].values()[0],
+            result.rows()[0].values()[0]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn macaddr_columns_store_binary_and_dump_text() -> Result<()> {
+        let dir = TempDir::new().expect("create temp dir");
+        let path = dir.path().join("macaddr.ddb");
+        let db = Db::open_or_create(&path, DbConfig::default())?;
+        db.execute("CREATE TABLE devices(id INT PRIMARY KEY, mac MACADDR UNIQUE)")?;
+        db.execute(
+            "INSERT INTO devices VALUES
+                (1, '08:00:2b:01:02:03'),
+                (2, '08:00:2b:01:02:03:04:05')",
+        )?;
+
+        let result = db.execute("SELECT mac FROM devices ORDER BY mac")?;
+        assert_eq!(
+            result.rows()[0].values()[0],
+            Value::MacAddr {
+                len: 6,
+                bytes: [0x08, 0x00, 0x2b, 0x01, 0x02, 0x03, 0, 0]
+            }
+        );
+        assert_eq!(
+            result.rows()[1].values()[0],
+            Value::MacAddr {
+                len: 8,
+                bytes: [0x08, 0x00, 0x2b, 0x01, 0x02, 0x03, 0x04, 0x05]
+            }
+        );
+        assert!(db.execute("INSERT INTO devices VALUES (3, 'bad')").is_err());
+        let dump = db.dump_sql()?;
+        assert!(dump.contains("\"mac\" MACADDR UNIQUE"));
+        assert!(dump.contains("'08:00:2b:01:02:03'"));
+        drop(db);
+
+        let reopened = Db::open(&path, DbConfig::default())?;
+        let reopened_result = reopened.execute("SELECT COUNT(*) FROM devices")?;
+        assert_eq!(reopened_result.rows()[0].values(), &[Value::Int64(2)]);
+        Ok(())
     }
 
     #[test]

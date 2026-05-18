@@ -3,7 +3,7 @@ import 'dart:io' show Platform;
 
 import 'package:ffi/ffi.dart';
 
-const int expectedAbiVersion = 1;
+const int expectedAbiVersion = 2;
 const int ddbOk = 0;
 const int ddbTagNull = 0;
 const int ddbTagInt64 = 1;
@@ -16,6 +16,14 @@ const int ddbTagUuid = 7;
 const int ddbTagTimestampMicros = 8;
 const int ddbTagGeometry = 9;
 const int ddbTagGeography = 10;
+const int ddbTagEnum = 11;
+const int ddbTagIpAddr = 12;
+const int ddbTagCidr = 13;
+const int ddbTagDate = 14;
+const int ddbTagTime = 15;
+const int ddbTagTimestamptzMicros = 16;
+const int ddbTagInterval = 17;
+const int ddbTagMacaddr = 18;
 
 final class DdbDb extends Opaque {}
 
@@ -59,6 +67,42 @@ final class DdbValue extends Struct {
 
   @Int64()
   external int timestampMicros;
+
+  @Uint64()
+  external int enumTypeId;
+
+  @Uint64()
+  external int enumLabelId;
+
+  @Uint8()
+  external int ipFamily;
+
+  @Uint8()
+  external int cidrPrefixLen;
+
+  @Array(6)
+  external Array<Uint8> reserved2;
+
+  @Array(16)
+  external Array<Uint8> ipCidrAddrBytes;
+
+  @Int32()
+  external int dateDays;
+
+  @Int64()
+  external int timeMicros;
+
+  @Int64()
+  external int timestamptzMicros;
+
+  @Int32()
+  external int intervalMonths;
+
+  @Int32()
+  external int intervalDays;
+
+  @Int64()
+  external int intervalMicros;
 }
 
 final class DdbValueView extends Struct {
@@ -96,6 +140,42 @@ final class DdbValueView extends Struct {
 
   @Int64()
   external int timestampMicros;
+
+  @Uint64()
+  external int enumTypeId;
+
+  @Uint64()
+  external int enumLabelId;
+
+  @Uint8()
+  external int ipFamily;
+
+  @Uint8()
+  external int cidrPrefixLen;
+
+  @Array(6)
+  external Array<Uint8> reserved2;
+
+  @Array(16)
+  external Array<Uint8> ipCidrAddrBytes;
+
+  @Int32()
+  external int dateDays;
+
+  @Int64()
+  external int timeMicros;
+
+  @Int64()
+  external int timestamptzMicros;
+
+  @Int32()
+  external int intervalMonths;
+
+  @Int32()
+  external int intervalDays;
+
+  @Int64()
+  external int intervalMicros;
 }
 
 final class DdbRowI64TextF64View extends Struct {

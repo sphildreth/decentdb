@@ -374,7 +374,15 @@ internal enum DdbValueTag : uint
     Uuid = 7,
     TimestampMicros = 8,
     Geometry = 9,
-    Geography = 10
+    Geography = 10,
+    Enum = 11,
+    IpAddr = 12,
+    Cidr = 13,
+    Date = 14,
+    Time = 15,
+    TimestamptzMicros = 16,
+    Interval = 17,
+    MacAddr = 18
 }
 
 [StructLayout(LayoutKind.Sequential)]
@@ -392,6 +400,47 @@ internal unsafe struct DdbValueNative
     public nuint len;
     public fixed byte uuid_bytes[16];
     public long timestamp_micros;
+    public ulong enum_type_id;
+    public ulong enum_label_id;
+    public byte ip_family;
+    public byte cidr_prefix_len;
+    public fixed byte reserved2[6];
+    public fixed byte ip_cidr_addr_bytes[16];
+    public int date_days;
+    public long time_micros;
+    public long timestamptz_micros;
+    public int interval_months;
+    public int interval_days;
+    public long interval_micros;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct DdbValueViewNative
+{
+    public uint tag;
+    public byte bool_value;
+    public fixed byte reserved0[7];
+    public long int64_value;
+    public double float64_value;
+    public long decimal_scaled;
+    public byte decimal_scale;
+    public fixed byte reserved1[7];
+    public byte* data;
+    public nuint len;
+    public fixed byte uuid_bytes[16];
+    public long timestamp_micros;
+    public ulong enum_type_id;
+    public ulong enum_label_id;
+    public byte ip_family;
+    public byte cidr_prefix_len;
+    public fixed byte reserved2[6];
+    public fixed byte ip_cidr_addr_bytes[16];
+    public int date_days;
+    public long time_micros;
+    public long timestamptz_micros;
+    public int interval_months;
+    public int interval_days;
+    public long interval_micros;
 }
 
 [StructLayout(LayoutKind.Sequential)]

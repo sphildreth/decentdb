@@ -24,6 +24,18 @@ class DdbValue(ctypes.Structure):
         ("len", ctypes.c_size_t),
         ("uuid_bytes", ctypes.c_uint8 * 16),
         ("timestamp_micros", ctypes.c_int64),
+        ("enum_type_id", ctypes.c_uint64),
+        ("enum_label_id", ctypes.c_uint64),
+        ("ip_family", ctypes.c_uint8),
+        ("cidr_prefix_len", ctypes.c_uint8),
+        ("reserved2", ctypes.c_uint8 * 6),
+        ("ip_cidr_addr_bytes", ctypes.c_uint8 * 16),
+        ("date_days", ctypes.c_int32),
+        ("time_micros", ctypes.c_int64),
+        ("timestamptz_micros", ctypes.c_int64),
+        ("interval_months", ctypes.c_int32),
+        ("interval_days", ctypes.c_int32),
+        ("interval_micros", ctypes.c_int64),
     ]
 
 

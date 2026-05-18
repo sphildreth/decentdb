@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/netip"
 	"net/url"
 	"runtime"
 	"strings"
@@ -121,9 +122,31 @@ type Decimal struct {
 	Scale    int
 }
 
+type EnumValue struct {
+	TypeID  uint64
+	LabelID uint64
+}
+
+type IntervalValue struct {
+	Months int32
+	Days   int32
+	Micros int64
+}
+
 type GeometryWKB []byte
 
 type GeographyWKB []byte
+
+const (
+	valueTagEnum              = 11
+	valueTagIPAddr            = 12
+	valueTagCIDR              = 13
+	valueTagDate              = 14
+	valueTagTime              = 15
+	valueTagTimestamptzMicros = 16
+	valueTagInterval          = 17
+	valueTagMACAddr           = 18
+)
 
 func (e *DecentDBError) Error() string {
 	return fmt.Sprintf("decentdb error %d: %s", e.Code, e.Message)
@@ -721,8 +744,155 @@ func valueToGo(val C.ddb_value_t) interface{} {
 	case C.DDB_VALUE_DECIMAL:
 		return Decimal{Unscaled: int64(val.decimal_scaled), Scale: int(val.decimal_scale)}
 	case C.DDB_VALUE_TIMESTAMP_MICROS:
-		micros := int64(val.timestamp_micros)
-		return time.Unix(micros/1_000_000, (micros%1_000_000)*1_000).UTC()
+		return decodeTimestampMicrosValue(int64(val.timestamp_micros))
+	case C.DDB_VALUE_ENUM, C.DDB_VALUE_IPADDR, C.DDB_VALUE_CIDR,
+		C.DDB_VALUE_DATE, C.DDB_VALUE_TIME, C.DDB_VALUE_TIMESTAMPTZ_MICROS,
+		C.DDB_VALUE_INTERVAL, C.DDB_VALUE_MACADDR:
+		return decodeSemanticTag(
+			uint32(val.tag),
+			uint64(val.enum_type_id),
+			uint64(val.enum_label_id),
+			uint8(val.ip_family),
+			uint8(val.cidr_prefix_len),
+			ipCIDRBytesFromValue(val),
+			int32(val.date_days),
+			int64(val.time_micros),
+			int64(val.timestamptz_micros),
+			int32(val.interval_months),
+			int32(val.interval_days),
+			int64(val.interval_micros),
+		)
+	default:
+		return nil
+	}
+}
+
+func ipCIDRBytesFromValue(val C.ddb_value_t) [16]byte {
+	var out [16]byte
+	for i := 0; i < len(out); i++ {
+		out[i] = byte(val.ip_cidr_addr_bytes[i])
+	}
+	return out
+}
+
+func ipCIDRBytesFromView(val C.ddb_value_view_t) [16]byte {
+	var out [16]byte
+	for i := 0; i < len(out); i++ {
+		out[i] = byte(val.ip_cidr_addr_bytes[i])
+	}
+	return out
+}
+
+func decodeMACAddrString(length uint8, addrBytes [16]byte) interface{} {
+	if length != 6 && length != 8 {
+		return nil
+	}
+	out := make([]byte, 0, int(length)*3-1)
+	for i := 0; i < int(length); i++ {
+		if i > 0 {
+			out = append(out, ':')
+		}
+		out = append(out, "0123456789abcdef"[addrBytes[i]>>4])
+		out = append(out, "0123456789abcdef"[addrBytes[i]&0x0f])
+	}
+	return string(out)
+}
+
+func decodeIPAddrString(family uint8, addrBytes [16]byte) interface{} {
+	switch family {
+	case 4:
+		var addr4 [4]byte
+		for i := 0; i < len(addr4); i++ {
+			addr4[i] = addrBytes[i]
+		}
+		return netip.AddrFrom4(addr4).String()
+	case 6:
+		var addr6 [16]byte
+		for i := 0; i < len(addr6); i++ {
+			addr6[i] = addrBytes[i]
+		}
+		return netip.AddrFrom16(addr6).String()
+	default:
+		return nil
+	}
+}
+
+func decodeCIDRString(family uint8, prefixLen uint8, addrBytes [16]byte) interface{} {
+	var addr netip.Addr
+	switch family {
+	case 4:
+		var addr4 [4]byte
+		for i := 0; i < len(addr4); i++ {
+			addr4[i] = addrBytes[i]
+		}
+		addr = netip.AddrFrom4(addr4)
+	case 6:
+		var addr6 [16]byte
+		for i := 0; i < len(addr6); i++ {
+			addr6[i] = addrBytes[i]
+		}
+		addr = netip.AddrFrom16(addr6)
+	default:
+		return nil
+	}
+
+	prefix := netip.PrefixFrom(addr, int(prefixLen))
+	if !prefix.IsValid() {
+		return nil
+	}
+	return prefix.Masked().String()
+}
+
+func decodeDateDaysValue(days int32) time.Time {
+	return time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC).AddDate(0, 0, int(days))
+}
+
+func decodeTimeMicrosValue(micros int64) time.Duration {
+	return time.Duration(micros) * time.Microsecond
+}
+
+func decodeTimestampMicrosValue(micros int64) time.Time {
+	return time.UnixMicro(micros).UTC()
+}
+
+func decodeSemanticTag(
+	tag uint32,
+	enumTypeID uint64,
+	enumLabelID uint64,
+	ipFamily uint8,
+	cidrPrefixLen uint8,
+	ipCIDRAddrBytes [16]byte,
+	dateDays int32,
+	timeMicros int64,
+	timestamptzMicros int64,
+	intervalMonths int32,
+	intervalDays int32,
+	intervalMicros int64,
+) interface{} {
+	switch tag {
+	case valueTagEnum:
+		return EnumValue{
+			TypeID:  enumTypeID,
+			LabelID: enumLabelID,
+		}
+	case valueTagIPAddr:
+		return decodeIPAddrString(ipFamily, ipCIDRAddrBytes)
+	case valueTagCIDR:
+		return decodeCIDRString(ipFamily, cidrPrefixLen, ipCIDRAddrBytes)
+	case valueTagDate:
+		return decodeDateDaysValue(dateDays)
+	case valueTagTime:
+		return decodeTimeMicrosValue(timeMicros)
+	case valueTagTimestamptzMicros:
+		return decodeTimestampMicrosValue(timestamptzMicros)
+	case valueTagInterval:
+		return IntervalValue{
+			Months: intervalMonths,
+			Days:   intervalDays,
+			Micros: intervalMicros,
+		}
+	case valueTagMACAddr:
+		return decodeMACAddrString(ipFamily, ipCIDRAddrBytes)
 	default:
 		return nil
 	}
@@ -1188,8 +1358,24 @@ func (r *rows) Next(dest []driver.Value) error {
 				Scale:    int(v.decimal_scale),
 			}
 		case C.DDB_VALUE_TIMESTAMP_MICROS:
-			micros := int64(v.timestamp_micros)
-			dest[i] = time.Unix(micros/1_000_000, (micros%1_000_000)*1_000).UTC()
+			dest[i] = decodeTimestampMicrosValue(int64(v.timestamp_micros))
+		case C.DDB_VALUE_ENUM, C.DDB_VALUE_IPADDR, C.DDB_VALUE_CIDR,
+			C.DDB_VALUE_DATE, C.DDB_VALUE_TIME, C.DDB_VALUE_TIMESTAMPTZ_MICROS,
+			C.DDB_VALUE_INTERVAL, C.DDB_VALUE_MACADDR:
+			dest[i] = decodeSemanticTag(
+				uint32(v.tag),
+				uint64(v.enum_type_id),
+				uint64(v.enum_label_id),
+				uint8(v.ip_family),
+				uint8(v.cidr_prefix_len),
+				ipCIDRBytesFromView(v),
+				int32(v.date_days),
+				int64(v.time_micros),
+				int64(v.timestamptz_micros),
+				int32(v.interval_months),
+				int32(v.interval_days),
+				int64(v.interval_micros),
+			)
 		default:
 			dest[i] = nil
 		}

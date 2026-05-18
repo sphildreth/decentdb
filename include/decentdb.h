@@ -37,7 +37,15 @@ typedef enum ddb_value_tag_t {
   DDB_VALUE_UUID = 7,
   DDB_VALUE_TIMESTAMP_MICROS = 8,
   DDB_VALUE_GEOMETRY = 9,
-  DDB_VALUE_GEOGRAPHY = 10
+  DDB_VALUE_GEOGRAPHY = 10,
+  DDB_VALUE_ENUM = 11,
+  DDB_VALUE_IPADDR = 12,
+  DDB_VALUE_CIDR = 13,
+  DDB_VALUE_DATE = 14,
+  DDB_VALUE_TIME = 15,
+  DDB_VALUE_TIMESTAMPTZ_MICROS = 16,
+  DDB_VALUE_INTERVAL = 17,
+  DDB_VALUE_MACADDR = 18
 } ddb_value_tag_t;
 
 typedef struct ddb_value_t {
@@ -53,6 +61,18 @@ typedef struct ddb_value_t {
   size_t len;
   uint8_t uuid_bytes[16];
   int64_t timestamp_micros;
+  uint64_t enum_type_id;
+  uint64_t enum_label_id;
+  uint8_t ip_family;
+  uint8_t cidr_prefix_len;
+  uint8_t reserved2[6];
+  uint8_t ip_cidr_addr_bytes[16];
+  int32_t date_days;
+  int64_t time_micros;
+  int64_t timestamptz_micros;
+  int32_t interval_months;
+  int32_t interval_days;
+  int64_t interval_micros;
 } ddb_value_t;
 
 typedef struct ddb_value_view_t {
@@ -68,6 +88,18 @@ typedef struct ddb_value_view_t {
   size_t len;
   uint8_t uuid_bytes[16];
   int64_t timestamp_micros;
+  uint64_t enum_type_id;
+  uint64_t enum_label_id;
+  uint8_t ip_family;
+  uint8_t cidr_prefix_len;
+  uint8_t reserved2[6];
+  uint8_t ip_cidr_addr_bytes[16];
+  int32_t date_days;
+  int64_t time_micros;
+  int64_t timestamptz_micros;
+  int32_t interval_months;
+  int32_t interval_days;
+  int64_t interval_micros;
 } ddb_value_view_t;
 
 typedef struct ddb_row_i64_text_f64_view_t {

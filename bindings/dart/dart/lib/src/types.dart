@@ -41,6 +41,47 @@ class DecimalValue {
   String toString() => 'DecimalValue($scaled, scale: $scale)';
 }
 
+class DecentDBEnumValue {
+  const DecentDBEnumValue(this.typeId, this.labelId);
+
+  final int typeId;
+  final int labelId;
+
+  @override
+  bool operator ==(Object other) =>
+      other is DecentDBEnumValue &&
+      other.typeId == typeId &&
+      other.labelId == labelId;
+
+  @override
+  int get hashCode => Object.hash(typeId, labelId);
+
+  @override
+  String toString() => 'DecentDBEnumValue($typeId, labelId: $labelId)';
+}
+
+class DecentDBIntervalValue {
+  const DecentDBIntervalValue(this.months, this.days, this.microseconds);
+
+  final int months;
+  final int days;
+  final int microseconds;
+
+  @override
+  bool operator ==(Object other) =>
+      other is DecentDBIntervalValue &&
+      other.months == months &&
+      other.days == days &&
+      other.microseconds == microseconds;
+
+  @override
+  int get hashCode => Object.hash(months, days, microseconds);
+
+  @override
+  String toString() =>
+      'DecentDBIntervalValue($months, days: $days, microseconds: $microseconds)';
+}
+
 /// A canonical 16-byte UUID value.
 ///
 /// Bytes are stored in native order (hex byte 0 first, matching the engine's
@@ -90,8 +131,7 @@ final class UuidValue {
         i++;
         continue;
       }
-      result[byteIdx++] =
-          (_hexNibble(text, i) << 4) | _hexNibble(text, i + 1);
+      result[byteIdx++] = (_hexNibble(text, i) << 4) | _hexNibble(text, i + 1);
       i += 2;
     }
     // Use internal constructor to avoid a second copy.
@@ -107,8 +147,7 @@ final class UuidValue {
     if (v >= 0x30 && v <= 0x39) return v - 0x30; // 0-9
     if (v >= 0x61 && v <= 0x66) return v - 0x57; // a-f
     if (v >= 0x41 && v <= 0x46) return v - 0x37; // A-F
-    throw FormatException(
-        'Invalid hex character "${s[index]}" in UUID "$s"');
+    throw FormatException('Invalid hex character "${s[index]}" in UUID "$s"');
   }
 
   /// Returns the canonical lowercase hyphenated text representation.

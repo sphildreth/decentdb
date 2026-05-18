@@ -1048,7 +1048,57 @@ Object? _decodeValueView(DdbValueView value) {
         value.timestampMicros,
         isUtc: true,
       );
+    case ddbTagEnum:
+      return DecentDBEnumValue(value.enumTypeId, value.enumLabelId);
+    case ddbTagIpAddr:
+      return _formatIpAddr(value.ipFamily, value.ipCidrAddrBytes);
+    case ddbTagCidr:
+      return '${_formatIpAddr(value.ipFamily, value.ipCidrAddrBytes)}/${value.cidrPrefixLen}';
+    case ddbTagDate:
+      return DateTime.fromMicrosecondsSinceEpoch(
+        value.dateDays * 86400000000,
+        isUtc: true,
+      );
+    case ddbTagTime:
+      return Duration(microseconds: value.timeMicros);
+    case ddbTagTimestamptzMicros:
+      return DateTime.fromMicrosecondsSinceEpoch(
+        value.timestamptzMicros,
+        isUtc: true,
+      );
+    case ddbTagInterval:
+      return DecentDBIntervalValue(
+        value.intervalMonths,
+        value.intervalDays,
+        value.intervalMicros,
+      );
+    case ddbTagMacaddr:
+      return _formatMacAddr(value.ipFamily, value.ipCidrAddrBytes);
     default:
       throw StateError('Unsupported DecentDB value tag ${value.tag}');
   }
+}
+
+String _formatMacAddr(int length, Array<Uint8> bytes) {
+  if (length != 6 && length != 8) {
+    return '<invalid-macaddr-length-$length>';
+  }
+  return List.generate(
+    length,
+    (index) => bytes[index].toRadixString(16).padLeft(2, '0'),
+  ).join(':');
+}
+
+String _formatIpAddr(int family, Array<Uint8> bytes) {
+  if (family == 4) {
+    return '${bytes[0]}.${bytes[1]}.${bytes[2]}.${bytes[3]}';
+  }
+  if (family == 6) {
+    final groups = <String>[];
+    for (var i = 0; i < 16; i += 2) {
+      groups.add(((bytes[i] << 8) | bytes[i + 1]).toRadixString(16));
+    }
+    return groups.join(':');
+  }
+  return '<invalid-ip-family-$family>';
 }

@@ -25,6 +25,14 @@ pub(crate) enum ColumnType {
     Decimal,
     Uuid,
     Timestamp,
+    Enum,
+    IpAddr,
+    Cidr,
+    MacAddr,
+    Date,
+    Time,
+    TimestampTz,
+    Interval,
     Geometry,
     Geography,
 }
@@ -41,6 +49,14 @@ impl ColumnType {
             Self::Decimal => "DECIMAL",
             Self::Uuid => "UUID",
             Self::Timestamp => "TIMESTAMP",
+            Self::Enum => "ENUM",
+            Self::IpAddr => "IPADDR",
+            Self::Cidr => "CIDR",
+            Self::MacAddr => "MACADDR",
+            Self::Date => "DATE",
+            Self::Time => "TIME",
+            Self::TimestampTz => "TIMESTAMPTZ",
+            Self::Interval => "INTERVAL",
             Self::Geometry => "GEOMETRY",
             Self::Geography => "GEOGRAPHY",
         }
@@ -80,6 +96,36 @@ pub(crate) struct SpatialTypeInfo {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct EnumLabel {
+    pub(crate) label: String,
+    pub(crate) id: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct EnumTypeInfo {
+    pub(crate) type_id: u64,
+    pub(crate) labels: Vec<EnumLabel>,
+}
+
+impl EnumTypeInfo {
+    #[must_use]
+    pub(crate) fn label_id(&self, label: &str) -> Option<u64> {
+        self.labels
+            .iter()
+            .find(|entry| entry.label == label)
+            .map(|entry| entry.id)
+    }
+
+    #[must_use]
+    pub(crate) fn label_for_id(&self, id: u64) -> Option<&str> {
+        self.labels
+            .iter()
+            .find(|entry| entry.id == id)
+            .map(|entry| entry.label.as_str())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CheckConstraint {
     pub(crate) name: Option<String>,
     pub(crate) expression_sql: String,
@@ -108,6 +154,7 @@ pub(crate) struct ColumnSchema {
     pub(crate) name: String,
     pub(crate) column_type: ColumnType,
     pub(crate) spatial_type: Option<SpatialTypeInfo>,
+    pub(crate) enum_type: Option<EnumTypeInfo>,
     pub(crate) nullable: bool,
     pub(crate) default_sql: Option<String>,
     pub(crate) generated_sql: Option<String>,
@@ -288,6 +335,14 @@ mod tests {
         assert_eq!(ColumnType::Decimal.as_str(), "DECIMAL");
         assert_eq!(ColumnType::Uuid.as_str(), "UUID");
         assert_eq!(ColumnType::Timestamp.as_str(), "TIMESTAMP");
+        assert_eq!(ColumnType::Enum.as_str(), "ENUM");
+        assert_eq!(ColumnType::IpAddr.as_str(), "IPADDR");
+        assert_eq!(ColumnType::Cidr.as_str(), "CIDR");
+        assert_eq!(ColumnType::MacAddr.as_str(), "MACADDR");
+        assert_eq!(ColumnType::Date.as_str(), "DATE");
+        assert_eq!(ColumnType::Time.as_str(), "TIME");
+        assert_eq!(ColumnType::TimestampTz.as_str(), "TIMESTAMPTZ");
+        assert_eq!(ColumnType::Interval.as_str(), "INTERVAL");
         assert_eq!(ColumnType::Geometry.as_str(), "GEOMETRY");
         assert_eq!(ColumnType::Geography.as_str(), "GEOGRAPHY");
     }
@@ -442,6 +497,7 @@ mod tests {
             name: "id".to_string(),
             column_type: ColumnType::Int64,
             spatial_type: None,
+            enum_type: None,
             nullable: false,
             default_sql: None,
             generated_sql: None,

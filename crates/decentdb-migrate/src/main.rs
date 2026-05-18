@@ -88,6 +88,10 @@ fn main() -> Result<()> {
             println!("Detected DecentDB Version 9 format.");
             migrate_v9_file(&source_path, &dest_path)?;
         }
+        10 => {
+            println!("Detected DecentDB Version 10 format.");
+            migrate_v10_file(&source_path, &dest_path)?;
+        }
         _ => {
             return Err(anyhow!("Migration for format version {} is not supported by this version of decentdb-migrate.", header.format_version));
         }
@@ -120,6 +124,10 @@ fn migrate_v8_file(source: &PathBuf, dest: &PathBuf) -> Result<()> {
 
 fn migrate_v9_file(source: &PathBuf, dest: &PathBuf) -> Result<()> {
     copy_file_and_patch_format_version(source, dest, 9)
+}
+
+fn migrate_v10_file(source: &PathBuf, dest: &PathBuf) -> Result<()> {
+    copy_file_and_patch_format_version(source, dest, 10)
 }
 
 fn copy_file_and_patch_format_version(
@@ -234,7 +242,7 @@ const fn build_crc32c_table() -> [u32; 256] {
 
 #[cfg(test)]
 mod tests {
-    use super::{migrate_v8_file, migrate_v9_file, patch_header_format_version};
+    use super::{migrate_v10_file, migrate_v8_file, migrate_v9_file, patch_header_format_version};
     use decentdb::{Db, DbConfig, DB_FORMAT_VERSION};
     use tempfile::TempDir;
 
@@ -355,6 +363,41 @@ mod tests {
         std::fs::write(&source, bytes).expect("write v9 header");
 
         migrate_v9_file(&source, &dest).expect("migrate v9 file");
+        let header = Db::read_header_info(&dest).expect("read migrated header");
+        assert_eq!(header.format_version, DB_FORMAT_VERSION);
+
+        let reopened = Db::open_or_create(&dest, DbConfig::default()).expect("open migrated db");
+        let result = reopened
+            .execute("SELECT val FROM t WHERE id = 1")
+            .expect("query migrated row");
+        assert_eq!(
+            result.rows()[0].values()[0],
+            decentdb::Value::Text("alpha".to_string())
+        );
+    }
+
+    #[test]
+    fn migrate_v10_copy_upgrades_header_version() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let source = tempdir.path().join("source-v10.ddb");
+        let dest = tempdir.path().join("dest-v10.ddb");
+
+        let db = Db::open_or_create(&source, DbConfig::default()).expect("create source");
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+            .expect("create table");
+        db.execute("INSERT INTO t VALUES (1, 'alpha')")
+            .expect("insert row");
+        db.checkpoint().expect("checkpoint");
+        drop(db);
+
+        let mut bytes = std::fs::read(&source).expect("read source");
+        let mut header = [0_u8; super::DB_HEADER_SIZE];
+        header.copy_from_slice(&bytes[..super::DB_HEADER_SIZE]);
+        patch_header_format_version(&mut header, 10);
+        bytes[..super::DB_HEADER_SIZE].copy_from_slice(&header);
+        std::fs::write(&source, bytes).expect("write v10 header");
+
+        migrate_v10_file(&source, &dest).expect("migrate v10 file");
         let header = Db::read_header_info(&dest).expect("read migrated header");
         assert_eq!(header.format_version, DB_FORMAT_VERSION);
 
