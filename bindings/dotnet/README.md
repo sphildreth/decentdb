@@ -80,10 +80,10 @@ Bindable types (auto-included by MicroOrm): all primitives, `string`, `Guid`, `D
 
 ## Sync SDK quickstart
 
-Slice 7 adds the flagship engine-local sync surface to `DecentDB.Native` and
-`DecentDB.AdoNet`. Use it when you want to initialize replicas, manage peers
-and scopes, inspect doctor output, and exchange batches without shelling out to
-the CLI.
+The .NET binding exposes an engine-local sync surface through
+`DecentDB.Native` and `DecentDB.AdoNet`. Use it to initialize replicas, manage
+peers and scopes, inspect doctor output, and exchange batches without shelling
+out to the CLI.
 
 - [Sync quickstart sample](examples/sync-quickstart.md)
 

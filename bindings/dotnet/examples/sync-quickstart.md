@@ -2,7 +2,8 @@
 
 This sample shows the flagship sync surface exposed through
 `DecentDB.AdoNet.DecentDBConnection.Sync` or `DecentDB.Native.DecentDB.Sync`.
-It uses the local engine JSON bridge added for Slice 7.
+It uses the local engine JSON bridge, so applications can call sync operations
+directly without shelling out to the CLI.
 
 ```csharp
 using System.Collections.Generic;
@@ -47,5 +48,5 @@ var doctorJson = await connection.Sync.ExecuteRawJsonAsync("{\"op\":\"doctor\"}"
 Console.WriteLine(doctorJson);
 ```
 
-Built-in HTTP transport parity for `sync run` is still future adapter work in
-this slice. The SDK here is engine-local only.
+Built-in HTTP transport parity for `sync run` is still future adapter work.
+The SDK here is engine-local only.

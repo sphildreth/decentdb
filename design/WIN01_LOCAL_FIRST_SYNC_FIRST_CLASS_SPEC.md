@@ -1,6 +1,6 @@
 # Local-First Sync as a First-Class Capability
 
-**Status:** Active spec — Slices 1-7 complete (2026-05-17); later slices remain TODO
+**Status:** Active spec — Slices 1-8 complete (2026-05-17); later slices remain TODO
 **Project:** DecentDB  
 **Document Type:** Implementation SPEC  
 **Audience:** Core engine developers, storage/replication implementers, SDK maintainers, CLI maintainers, documentation authors, coding agents  
@@ -1419,6 +1419,16 @@ Complete (2026-05-17).
 ### Objectives
 
 Ship comprehensive docs and examples that make the feature learnable and adoptable.
+
+### Completion Note
+
+Slice 8 is complete as of 2026-05-17. The shipped documentation and example
+set covers:
+
+- conceptual overview and quickstart docs
+- CLI / SQL / SDK reference completion
+- architecture, troubleshooting, and operations guides
+- sample apps and copy-pasteable examples
 
 ### Tasks
 
