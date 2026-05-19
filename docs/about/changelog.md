@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Fixed .NET `Cache Size` and related native connection options so they are passed through the C ABI at open time instead of being parsed and ignored by the managed binding.
+- Fixed C ABI owned-value disposal for native `GEOMETRY` and `GEOGRAPHY` result values so sanitizer runs no longer report leaked copied spatial cells.
+- Fixed the Node Knex lifecycle tests to always close pools after success or failure and clean up DecentDB WAL sidecar files between tests, avoiding hung nightly binding lifecycle runs after transaction failures.
   
 
 ## [2.5.0] - 2026-05-18

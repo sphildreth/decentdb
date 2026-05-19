@@ -418,14 +418,15 @@ fn borrowed_bytes<'a>(data: *const u8, len: usize) -> Result<&'a [u8]> {
     Ok(unsafe { std::slice::from_raw_parts(data, len) })
 }
 
+fn value_tag_owns_bytes(tag: u32) -> bool {
+    tag == DdbValueTag::Text as u32
+        || tag == DdbValueTag::Blob as u32
+        || tag == DdbValueTag::Geometry as u32
+        || tag == DdbValueTag::Geography as u32
+}
+
 fn fill_ffi_value(out: &mut DdbValue, value: &Value) {
-    if matches!(
-        out.tag,
-        x if x == DdbValueTag::Text as u32
-            || x == DdbValueTag::Blob as u32
-            || x == DdbValueTag::Geometry as u32
-            || x == DdbValueTag::Geography as u32
-    ) {
+    if value_tag_owns_bytes(out.tag) {
         free_owned_bytes(out.data, out.len);
     }
     ddb_value_reset(out);
@@ -1059,10 +1060,7 @@ pub extern "C" fn ddb_value_init(value: *mut DdbValue) -> u32 {
 pub extern "C" fn ddb_value_dispose(value: *mut DdbValue) -> u32 {
     ffi_boundary(|| {
         let value = out_ptr(value, "value")?;
-        if matches!(
-            value.tag,
-            x if x == DdbValueTag::Text as u32 || x == DdbValueTag::Blob as u32
-        ) {
+        if value_tag_owns_bytes(value.tag) {
             free_owned_bytes(value.data, value.len);
         }
         ddb_value_reset(value);

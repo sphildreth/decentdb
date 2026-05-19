@@ -159,6 +159,7 @@ int main(void) {
   }
 
   ddb_value_t value;
+  check(ddb_value_init(&value), "init copied semantic value");
   check(ddb_result_value_copy(result, 0, 0, &value), "copy enum");
   expect_tag(&value, DDB_VALUE_ENUM, "semantic enum");
   if (value.enum_type_id == 0 || value.enum_label_id != 1) {

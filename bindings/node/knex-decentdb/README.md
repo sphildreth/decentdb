@@ -22,6 +22,12 @@ const db = knex({
 });
 ```
 
+## Lifecycle
+
+Call `await db.destroy()` when the Knex instance is no longer needed, including
+after failed transactions. This closes the native DecentDB connection held by
+the Knex pool and releases associated database/WAL file handles.
+
 ## Benchmark
 
 ```bash

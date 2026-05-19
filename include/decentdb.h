@@ -114,6 +114,10 @@ uint32_t ddb_abi_version(void);
 const char *ddb_version(void);
 const char *ddb_last_error_message(void);
 
+/*
+ * Initializes an owned value slot for use with ddb_*_value_copy APIs.
+ * Call ddb_value_dispose when done with any initialized value slot.
+ */
 ddb_status_t ddb_value_init(ddb_value_t *value);
 ddb_status_t ddb_value_dispose(ddb_value_t *value);
 
@@ -277,6 +281,11 @@ ddb_status_t ddb_stmt_rebind_int64_text_execute(
  * functions, which return borrowed pointers into the result set without heap
  * allocation. Use ddb_*_value_copy functions when ownership transfer is
  * required.
+ *
+ * Initialize out_value with ddb_value_init before first use, then call
+ * ddb_value_dispose when done. Reusing the same initialized ddb_value_t for
+ * multiple value-copy calls is supported; previous owned cell storage is
+ * released before the new value is written.
  */
 ddb_status_t ddb_stmt_value_copy(
     ddb_stmt_t *stmt,
@@ -356,6 +365,11 @@ ddb_status_t ddb_result_column_name_copy(
 /*
  * Performance note: ddb_result_value_copy returns owned values and may allocate
  * per cell. For streaming read-heavy paths, prefer statement row-view APIs.
+ *
+ * Initialize out_value with ddb_value_init before first use, then call
+ * ddb_value_dispose when done. Reusing the same initialized ddb_value_t for
+ * multiple value-copy calls is supported; previous owned cell storage is
+ * released before the new value is written.
  */
 ddb_status_t ddb_result_value_copy(
     ddb_result_t *result,
