@@ -513,10 +513,44 @@ namespace DecentDB.AdoNet
             if (kvps.TryGetValue("Cache Size", out var cacheSize) && !string.IsNullOrWhiteSpace(cacheSize))
             {
                 // Delegate parsing to the native layer. Supports pages (int) or e.g. "64MB".
-                options.Append("cache_size=").Append(cacheSize.Trim());
+                AppendNativeOption(options, "cache_size", cacheSize);
+            }
+
+            if (kvps.TryGetValue("Retain Paged Row Sources After Commit", out var retainPagedRows) &&
+                !string.IsNullOrWhiteSpace(retainPagedRows))
+            {
+                AppendNativeOption(options, "retain_paged_row_sources_after_commit", retainPagedRows);
+            }
+
+            if (kvps.TryGetValue("Paged Row Storage", out var pagedRowStorage) &&
+                !string.IsNullOrWhiteSpace(pagedRowStorage))
+            {
+                AppendNativeOption(options, "paged_row_storage", pagedRowStorage);
+            }
+
+            if (kvps.TryGetValue("Persistent PK Index", out var persistentPkIndex) &&
+                !string.IsNullOrWhiteSpace(persistentPkIndex))
+            {
+                AppendNativeOption(options, "persistent_pk_index", persistentPkIndex);
+            }
+
+            if (kvps.TryGetValue("WAL Auto Checkpoint", out var walAutoCheckpoint) &&
+                !string.IsNullOrWhiteSpace(walAutoCheckpoint))
+            {
+                AppendNativeOption(options, "wal_autocheckpoint", walAutoCheckpoint);
             }
 
             return options.ToString();
+        }
+
+        private static void AppendNativeOption(StringBuilder options, string key, string value)
+        {
+            if (options.Length > 0)
+            {
+                options.Append(';');
+            }
+
+            options.Append(key).Append('=').Append(value.Trim());
         }
 
         private static bool TryParseBool(string? value, out bool result)

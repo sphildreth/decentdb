@@ -32,6 +32,13 @@ const BENCH_RUNS: usize = 5;
 const CONCURRENT_READ_THREADS: usize = 4;
 const CONCURRENT_READS_PER_THREAD: usize = READ_COUNT / CONCURRENT_READ_THREADS;
 
+const DECENTDB_DEFAULT_DURABLE_PROFILE: &str = "decentdb_default_durable";
+const DECENTDB_TUNED_DURABLE_PROFILE: &str = "decentdb_tuned_durable";
+const SQLITE_WAL_FULL_PROFILE: &str = "sqlite_wal_full";
+
+const DECENTDB_DEFAULT_CACHE_MB: usize = 4;
+const DECENTDB_TUNED_CACHE_MB: usize = 64;
+
 fn elapsed_nanos(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
@@ -117,6 +124,64 @@ struct EngineMetrics {
     concurrent_read_threads: usize,
 }
 
+#[derive(Clone, Copy)]
+enum DecentDbProfile {
+    DefaultDurable,
+    TunedDurable,
+}
+
+impl DecentDbProfile {
+    fn engine_name(&self) -> &'static str {
+        match self {
+            Self::DefaultDurable => DECENTDB_DEFAULT_DURABLE_PROFILE,
+            Self::TunedDurable => DECENTDB_TUNED_DURABLE_PROFILE,
+        }
+    }
+
+    fn cache_size_mb(&self) -> usize {
+        match self {
+            Self::DefaultDurable => DECENTDB_DEFAULT_CACHE_MB,
+            Self::TunedDurable => DECENTDB_TUNED_CACHE_MB,
+        }
+    }
+
+    fn retain_paged_row_sources_after_commit(&self) -> bool {
+        match self {
+            Self::DefaultDurable => false,
+            Self::TunedDurable => true,
+        }
+    }
+
+    fn paged_row_storage(&self) -> bool {
+        match self {
+            Self::DefaultDurable => true,
+            Self::TunedDurable => false,
+        }
+    }
+}
+
+fn decentdb_config_for_profile(profile: DecentDbProfile, temp_dir: PathBuf) -> decentdb::DbConfig {
+    decentdb::DbConfig {
+        cache_size_mb: profile.cache_size_mb(),
+        temp_dir,
+        retain_paged_row_sources_after_commit: profile.retain_paged_row_sources_after_commit(),
+        paged_row_storage: profile.paged_row_storage(),
+        wal_checkpoint_threshold_pages: match profile {
+            DecentDbProfile::DefaultDurable => {
+                decentdb::DbConfig::default().wal_checkpoint_threshold_pages
+            }
+            DecentDbProfile::TunedDurable => 0,
+        },
+        wal_checkpoint_threshold_bytes: match profile {
+            DecentDbProfile::DefaultDurable => {
+                decentdb::DbConfig::default().wal_checkpoint_threshold_bytes
+            }
+            DecentDbProfile::TunedDurable => 0,
+        },
+        ..decentdb::DbConfig::default()
+    }
+}
+
 trait DatabaseBenchmarker {
     fn name(&self) -> &'static str;
     fn setup(&mut self, path: &Path);
@@ -182,6 +247,7 @@ impl DatabaseBenchmarker for SqliteBenchmarker {
 
     fn setup(&mut self, path: &Path) {
         self.db_path = path.join("sqlite.db");
+        self.join_seeded = false;
         let conn = SqliteConnection::open(&self.db_path).unwrap();
 
         let journal_mode: String = conn
@@ -214,21 +280,21 @@ impl DatabaseBenchmarker for SqliteBenchmarker {
 
     fn insert_batch(&mut self) -> Vec<u64> {
         let conn = self.conn.as_mut().unwrap();
-        let start = Instant::now();
 
         let tx = conn.transaction().unwrap();
-        {
+        let duration = {
             let mut stmt = tx
                 .prepare("INSERT INTO users (id, name) VALUES (?, ?)")
                 .unwrap();
+            let start = Instant::now();
             for i in 0..INSERT_COUNT {
                 stmt.execute(rusqlite::params![i, format!("User {}", i)])
                     .unwrap();
             }
-        }
+            start.elapsed()
+        };
         tx.commit().unwrap();
 
-        let duration = start.elapsed();
         vec![duration.as_nanos() as u64]
     }
 
@@ -442,6 +508,7 @@ impl DatabaseBenchmarker for DuckDbBenchmarker {
 
     fn setup(&mut self, path: &Path) {
         self.db_path = path.join("duck.db");
+        self.join_seeded = false;
         let conn = DuckdbConnection::open(&self.db_path).unwrap();
 
         conn.execute_batch(
@@ -458,21 +525,21 @@ impl DatabaseBenchmarker for DuckDbBenchmarker {
 
     fn insert_batch(&mut self) -> Vec<u64> {
         let conn = self.conn.as_mut().unwrap();
-        let start = Instant::now();
 
         conn.execute_batch("BEGIN TRANSACTION;").unwrap();
-        {
+        let duration = {
             let mut stmt = conn
                 .prepare("INSERT INTO users (id, name) VALUES (?, ?)")
                 .unwrap();
+            let start = Instant::now();
             for i in 0..INSERT_COUNT {
                 stmt.execute(duckdb::params![i, format!("User {}", i)])
                     .unwrap();
             }
-        }
+            start.elapsed()
+        };
         conn.execute_batch("COMMIT;").unwrap();
 
-        let duration = start.elapsed();
         vec![duration.as_nanos() as u64]
     }
 
@@ -613,14 +680,16 @@ struct DecentDbBenchmarker {
     db: Option<decentdb::Db>,
     db_path: PathBuf,
     join_seeded: bool,
+    profile: DecentDbProfile,
 }
 
 impl DecentDbBenchmarker {
-    fn new() -> Self {
+    fn new(profile: DecentDbProfile) -> Self {
         Self {
             db: None,
             db_path: PathBuf::new(),
             join_seeded: false,
+            profile,
         }
     }
 
@@ -663,17 +732,14 @@ impl DecentDbBenchmarker {
 
 impl DatabaseBenchmarker for DecentDbBenchmarker {
     fn name(&self) -> &'static str {
-        "decentdb"
+        self.profile.engine_name()
     }
 
     fn setup(&mut self, path: &Path) {
         self.db_path = path.join("decent.db");
+        self.join_seeded = false;
 
-        let config = decentdb::DbConfig {
-            wal_sync_mode: decentdb::WalSyncMode::Full,
-            temp_dir: path.to_path_buf(),
-            ..decentdb::DbConfig::default()
-        };
+        let config = decentdb_config_for_profile(self.profile, path.to_path_buf());
 
         let db = decentdb::Db::create(&self.db_path, config).unwrap();
 
@@ -691,25 +757,23 @@ impl DatabaseBenchmarker for DecentDbBenchmarker {
 
     fn insert_batch(&mut self) -> Vec<u64> {
         let db = self.db.as_ref().unwrap();
-        let start = Instant::now();
         let mut txn = db.transaction().unwrap();
         let insert = txn
             .prepare("INSERT INTO users (id, name) VALUES ($1, $2);")
             .unwrap();
+        let mut params = vec![
+            decentdb::Value::Int64(0),
+            decentdb::Value::Text(String::new()),
+        ];
+        let start = Instant::now();
         for i in 0..INSERT_COUNT {
-            insert
-                .execute_in(
-                    &mut txn,
-                    &[
-                        decentdb::Value::Int64(i as i64),
-                        decentdb::Value::Text(format!("User {}", i)),
-                    ],
-                )
-                .unwrap();
+            params[0] = decentdb::Value::Int64(i as i64);
+            params[1] = decentdb::Value::Text(format!("User {i}"));
+            insert.execute_in_mut(&mut txn, &mut params).unwrap();
         }
+        let duration = start.elapsed();
         txn.commit().unwrap();
 
-        let duration = start.elapsed();
         vec![duration.as_nanos() as u64]
     }
 
@@ -747,24 +811,21 @@ impl DatabaseBenchmarker for DecentDbBenchmarker {
             .prepare("INSERT INTO orders (id, user_id, amount) VALUES ($1, $2, $3);")
             .unwrap();
         let mut latencies = Vec::with_capacity(COMMIT_COUNT);
+        let mut params = vec![
+            decentdb::Value::Int64(0),
+            decentdb::Value::Int64(0),
+            decentdb::Value::Float64(9.99),
+        ];
 
-        insert
-            .execute(&[
-                decentdb::Value::Int64(-1),
-                decentdb::Value::Int64(0),
-                decentdb::Value::Float64(9.99),
-            ])
-            .unwrap();
+        params[0] = decentdb::Value::Int64(-1);
+        insert.execute_mut(&mut params).unwrap();
 
         for i in 0..COMMIT_COUNT {
+            params[0] = decentdb::Value::Int64(i as i64);
+            params[1] = decentdb::Value::Int64((i % 100) as i64);
+            params[2] = decentdb::Value::Float64(9.99);
             let start = Instant::now();
-            insert
-                .execute(&[
-                    decentdb::Value::Int64(i as i64),
-                    decentdb::Value::Int64((i % 100) as i64),
-                    decentdb::Value::Float64(9.99),
-                ])
-                .unwrap();
+            insert.execute_mut(&mut params).unwrap();
             latencies.push(elapsed_nanos(start));
         }
 
@@ -997,6 +1058,7 @@ fn run_engine(benchmarker: &mut dyn DatabaseBenchmarker) -> EngineMetrics {
     let mut range_p95_samples: Vec<f64> = Vec::with_capacity(BENCH_RUNS);
     let mut agg_p95_samples: Vec<f64> = Vec::with_capacity(BENCH_RUNS);
     let mut concurrent_p95_samples: Vec<f64> = Vec::with_capacity(BENCH_RUNS);
+    let mut db_size_samples: Vec<f64> = Vec::with_capacity(BENCH_RUNS);
 
     for run in 0..BENCH_RUNS {
         println!(
@@ -1013,6 +1075,7 @@ fn run_engine(benchmarker: &mut dyn DatabaseBenchmarker) -> EngineMetrics {
         range_p95_samples.push(single.range_scan_p95_ms);
         agg_p95_samples.push(single.aggregate_p95_ms);
         concurrent_p95_samples.push(single.concurrent_read_p95_ms);
+        db_size_samples.push(single.db_size_mb);
     }
 
     let aggregated = EngineMetrics {
@@ -1031,10 +1094,9 @@ fn run_engine(benchmarker: &mut dyn DatabaseBenchmarker) -> EngineMetrics {
         concurrent_read_p95_ms: mean_f64(&concurrent_p95_samples),
         concurrent_read_p95_stddev_ms: stddev_f64(&concurrent_p95_samples),
         concurrent_read_threads: CONCURRENT_READ_THREADS,
-        ..Default::default()
+        db_size_mb: mean_f64(&db_size_samples),
     };
 
-    // Use the last run's DB size (all runs are on fresh temp dirs)
     println!("\n  === {} aggregated results ===", benchmarker.name());
     println!(
         "  -> Insert throughput: {:.0} +/- {:.0} rows/sec",
@@ -1112,11 +1174,29 @@ fn main() {
     // Durability profiles
     summary.metadata.insert(
         "durability_profile".to_string(),
-        "engine_specific".to_string(),
+        "engine_specific_with_profile_pairs".to_string(),
+    );
+    summary.metadata.insert(
+        "sqlite_profile".to_string(),
+        SQLITE_WAL_FULL_PROFILE.to_string(),
     );
     summary.metadata.insert(
         "sqlite_durability".to_string(),
         "wal+synchronous_full+wal_autocheckpoint_0".to_string(),
+    );
+    summary.metadata.insert(
+        "decentdb_profile_default".to_string(),
+        format!(
+            "{}:wal_sync_full cache_size_mb={}",
+            DECENTDB_DEFAULT_DURABLE_PROFILE, DECENTDB_DEFAULT_CACHE_MB
+        ),
+    );
+    summary.metadata.insert(
+        "decentdb_profile_tuned".to_string(),
+        format!(
+            "{}:wal_sync_full cache_size_mb={} retain_paged_row_sources_after_commit=true paged_row_storage=false wal_autocheckpoint=0",
+            DECENTDB_TUNED_DURABLE_PROFILE, DECENTDB_TUNED_CACHE_MB
+        ),
     );
     summary.metadata.insert(
         "duckdb_durability".to_string(),
@@ -1134,7 +1214,11 @@ fn main() {
     );
     summary.metadata.insert(
         "insert_workload".to_string(),
-        "prepared_single_row_insert_loop_in_one_explicit_transaction".to_string(),
+        "prepared_single_row_insert_loop_inside_one_explicit_transaction".to_string(),
+    );
+    summary.metadata.insert(
+        "insert_timing_scope".to_string(),
+        "prepared_transaction_body_excludes_begin_prepare_and_final_commit; durable commit cost is reported separately as commit_workload".to_string(),
     );
     summary.metadata.insert(
         "read_workload".to_string(),
@@ -1225,10 +1309,16 @@ fn main() {
         .insert(duckdb.name().to_string(), run_engine(&mut duckdb));
 
     // DecentDB
-    let mut decentdb = DecentDbBenchmarker::new();
+    let mut decentdb = DecentDbBenchmarker::new(DecentDbProfile::DefaultDurable);
     summary
         .engines
         .insert(decentdb.name().to_string(), run_engine(&mut decentdb));
+
+    let mut tuned_decentdb = DecentDbBenchmarker::new(DecentDbProfile::TunedDurable);
+    summary.engines.insert(
+        tuned_decentdb.name().to_string(),
+        run_engine(&mut tuned_decentdb),
+    );
 
     let out_dir = Path::new("../../data");
     fs::create_dir_all(out_dir).unwrap();

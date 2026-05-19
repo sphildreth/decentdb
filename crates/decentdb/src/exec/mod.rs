@@ -48,9 +48,9 @@ use crate::planner;
 use crate::record::compression::{CompressionMode, AUTO_MIN_PAYLOAD_BYTES};
 use crate::record::key::encode_index_key;
 use crate::record::overflow::{
-    build_overflow_chain_cache, free_overflow, read_overflow, read_uncompressed_overflow_tail,
-    rewrite_overflow, rewrite_overflow_cached, write_overflow, OverflowChainCache, OverflowPointer,
-    OverflowTailInfo, OVERFLOW_HEADER_SIZE,
+    append_uncompressed_with_first_page_patch, build_overflow_chain_cache, free_overflow,
+    read_overflow, read_uncompressed_overflow_tail, rewrite_overflow, rewrite_overflow_cached,
+    write_overflow, OverflowChainCache, OverflowPointer, OverflowTailInfo, OVERFLOW_HEADER_SIZE,
 };
 use crate::record::row::Row;
 use crate::record::value::{
@@ -1362,6 +1362,7 @@ pub(crate) struct EngineRuntime {
     manifest_template: Option<ManifestTemplate>,
     overflow_chain_caches: BTreeMap<String, OverflowChainCache>,
     manifest_chain_cache: Option<OverflowChainCache>,
+    sync_capture_active: bool,
     pub(crate) sync_mutations: Vec<crate::sync::SyncMutation>,
 }
 
@@ -1538,6 +1539,7 @@ impl Clone for EngineRuntime {
             manifest_template: None,
             overflow_chain_caches: BTreeMap::new(),
             manifest_chain_cache: None,
+            sync_capture_active: self.sync_capture_active,
             sync_mutations: self.sync_mutations.clone(),
         }
     }
@@ -1578,8 +1580,26 @@ impl EngineRuntime {
             manifest_template: None,
             overflow_chain_caches: BTreeMap::new(),
             manifest_chain_cache: None,
+            sync_capture_active: false,
             sync_mutations: Vec::new(),
         }
+    }
+
+    pub(crate) fn set_sync_capture_active(&mut self, active: bool) {
+        self.sync_capture_active = active;
+        if !active {
+            self.sync_mutations.clear();
+        }
+    }
+
+    pub(crate) fn sync_capture_active(&self) -> bool {
+        self.sync_capture_active
+    }
+
+    pub(crate) fn should_record_sync_mutation_for_table(&self, table: &TableSchema) -> bool {
+        self.sync_capture_active
+            && !table.temporary
+            && !crate::sync::is_internal_table_name(&table.name)
     }
 
     pub(crate) fn record_sync_mutation(
@@ -1590,6 +1610,9 @@ impl EngineRuntime {
         after: Option<serde_json::Value>,
         schema_cookie: u32,
     ) {
+        if !self.sync_capture_active {
+            return;
+        }
         self.sync_mutations.push(crate::sync::SyncMutation {
             table: table_name.to_string(),
             operation,
@@ -1744,13 +1767,25 @@ impl EngineRuntime {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn has_deferred_paged_row_locator_cache_for_tests(&self, table_name: &str) -> bool {
+        self.deferred_paged_row_locator_caches
+            .contains_key(table_name)
+    }
+
     fn should_cache_deferred_paged_row_locators(&self, table_name: &str) -> bool {
-        self.catalog.indexes.values().any(|index| {
+        let has_runtime_btree = self.catalog.indexes.values().any(|index| {
             identifiers_equal(&index.table_name, table_name)
                 && index.fresh
                 && index.kind == IndexKind::Btree
                 && matches!(self.index(&index.name), Some(RuntimeIndex::Btree { .. }))
-        })
+        });
+        has_runtime_btree
+            || self
+                .catalog
+                .table(table_name)
+                .and_then(row_id_alias_column_name)
+                .is_some()
     }
 
     fn refresh_paged_lookup_cache_and_pk_index(
@@ -2309,11 +2344,53 @@ impl EngineRuntime {
                     if existing_count <= data.rows.len() {
                         let appended_rows = encode_appended_table_rows(data, existing_count)?;
                         if !appended_rows.is_empty() {
+                            if !db.config().persistent_pk_index {
+                                let row_count = data.rows.len();
+                                let row_count_bytes = u32::try_from(row_count)
+                                    .map_err(|_| {
+                                        DbError::constraint("table row count exceeds u32")
+                                    })?
+                                    .to_le_bytes();
+                                let (ptr, checksum, new_chain_cache, tail) =
+                                    append_uncompressed_with_first_page_patch(
+                                        &mut store,
+                                        previous_pointer,
+                                        TABLE_PAYLOAD_MAGIC.len(),
+                                        &row_count_bytes,
+                                        &appended_rows,
+                                    )?;
+                                self.overflow_chain_caches
+                                    .insert(canonical_table_name.clone(), new_chain_cache);
+                                self.persisted_tables_mut().insert(
+                                    canonical_table_name.clone(),
+                                    PersistedTableState {
+                                        pointer: ptr,
+                                        checksum,
+                                        row_count,
+                                        tail,
+                                        pk_index_root: previous_state.pk_index_root,
+                                    },
+                                );
+                                replace_table_pk_index_root(self, db, &canonical_table_name, None)?;
+                                self.cache_payload_remove(&canonical_table_name);
+                                continue;
+                            }
+
                             let new_payload = if let Some(cached) = cached_payload {
-                                append_table_payload_from_cached(cached, data)?
+                                let previous = Arc::try_unwrap(cached)
+                                    .unwrap_or_else(|arc| arc.as_slice().to_vec());
+                                append_encoded_rows_to_table_payload(
+                                    previous,
+                                    data.rows.len(),
+                                    &appended_rows,
+                                )?
                             } else {
                                 let previous_payload = read_overflow(&store, previous_pointer)?;
-                                append_table_payload(previous_payload, data)?
+                                append_encoded_rows_to_table_payload(
+                                    previous_payload,
+                                    data.rows.len(),
+                                    &appended_rows,
+                                )?
                             };
                             let checksum = crc32c_parts(&[new_payload.as_slice()]);
                             let ptr = rewrite_overflow(
@@ -3020,6 +3097,10 @@ impl EngineRuntime {
         self.tables.get(&table_name)
     }
 
+    pub(super) fn prepared_insert_target_loaded(&self, table_name: &str) -> bool {
+        self.tables.contains_key(table_name) || self.temp_tables.contains_key(table_name)
+    }
+
     fn visible_table_row_source_in_scope(
         &self,
         name: &str,
@@ -3283,12 +3364,21 @@ impl EngineRuntime {
         if self.visible_table_is_temporary(table_name) {
             return;
         }
+        if let Some(delta) = self.paged_mutations.get_mut(table_name) {
+            delta.append_count += 1;
+            return;
+        }
+        if self.dirty_tables.contains(table_name) {
+            return;
+        }
         let Some(table_name) = self.canonical_catalog_table_name(table_name) else {
             return;
         };
-        if self.dirty_tables.contains(&table_name)
-            && !self.paged_mutations.contains_key(&table_name)
-        {
+        if let Some(delta) = self.paged_mutations.get_mut(table_name.as_str()) {
+            delta.append_count += 1;
+            return;
+        }
+        if self.dirty_tables.contains(table_name.as_str()) {
             return;
         }
         self.dirty_tables_mut().insert(table_name.clone());
@@ -3729,6 +3819,21 @@ impl EngineRuntime {
                     return Ok(result);
                 }
                 if let Some(result) = self.try_execute_general_grouped_query(query, params)? {
+                    return Ok(result);
+                }
+                if let Some(result) =
+                    self.try_execute_indexed_join_grouped_count_query(query, params)?
+                {
+                    return Ok(result);
+                }
+                if let Some(result) =
+                    self.try_execute_simple_view_projection_limit_query(query, params)?
+                {
+                    return Ok(result);
+                }
+                if let Some(result) =
+                    self.try_execute_indexed_join_limit_projection_query(query, params)?
+                {
                     return Ok(result);
                 }
                 if let Some(result) = self.try_execute_benchmark_history_query(query, params)? {
@@ -4544,7 +4649,6 @@ impl EngineRuntime {
         if select.distinct
             || !select.distinct_on.is_empty()
             || select.from.len() != 1
-            || select.group_by.is_empty()
             || select.projection.len() <= select.group_by.len()
         {
             return Ok(None);
@@ -4674,13 +4778,7 @@ impl EngineRuntime {
                     .unwrap_or_else(|| infer_expr_name(projection_expr, projection_index + 1)),
             );
             if let Some(binding) = binding {
-                if !aggregate_bindings.iter().any(|existing| {
-                    existing.kind == binding.kind
-                        && existing.source_column_name == binding.source_column_name
-                        && existing.source_expr == binding.source_expr
-                }) {
-                    aggregate_bindings.push(binding);
-                }
+                aggregate_bindings.push(binding);
             }
         }
         let mut having_requires_projection_rewrite = false;
@@ -4830,9 +4928,22 @@ impl EngineRuntime {
         plan: &SimpleGroupedNumericAggregatePlan<'_>,
         params: &[Value],
     ) -> Result<QueryResult> {
+        if let Some(result) =
+            self.try_simple_scalar_filtered_numeric_aggregate_from_source(row_source, plan, params)?
+        {
+            return Ok(result);
+        }
+
         let mut groups = Vec::<SimpleGroupedNumericAggregate>::new();
         let mut group_positions = BTreeMap::<Vec<u8>, usize>::new();
         let group_dataset = Dataset::with_rows(plan.group_eval_bindings.clone(), Vec::new());
+        if plan.group_exprs.is_empty() {
+            groups.push(SimpleGroupedNumericAggregate::new(
+                Vec::new(),
+                plan.aggregate_bindings.len(),
+            ));
+            group_positions.insert(row_identity(&[])?, 0);
+        }
         for stored_row in row_source.rows() {
             let stored_row = stored_row?;
             if let Some(filter_expr) = plan.filter_expr.as_ref() {
@@ -5050,6 +5161,200 @@ impl EngineRuntime {
         render_simple_grouped_numeric_aggregate_groups(self, groups, plan, params)
     }
 
+    fn try_simple_scalar_filtered_numeric_aggregate_from_source(
+        &self,
+        row_source: VisibleTableRowSource<'_>,
+        plan: &SimpleGroupedNumericAggregatePlan<'_>,
+        params: &[Value],
+    ) -> Result<Option<QueryResult>> {
+        if !plan.group_exprs.is_empty()
+            || plan.projection_exprs.is_some()
+            || plan.having.is_some()
+            || plan.order_by.is_some()
+            || plan.limit.is_some()
+            || plan.offset != 0
+        {
+            return Ok(None);
+        }
+        let Some(filter_expr) = plan.filter_expr.as_ref() else {
+            return Ok(None);
+        };
+        let Some((_filter_table, filter_column, filter_value_expr)) =
+            simple_btree_lookup(filter_expr)
+        else {
+            return Ok(None);
+        };
+        let Some(table_schema) = self.table_schema(plan.table_name) else {
+            return Ok(None);
+        };
+        let Some(filter_column_index) = schema_column_index(table_schema, filter_column) else {
+            return Ok(None);
+        };
+        if plan.aggregate_bindings.iter().any(|aggregate| {
+            !matches!(
+                aggregate.kind,
+                SimpleGroupedNumericAggregateKind::CountRows
+                    | SimpleGroupedNumericAggregateKind::Sum
+            ) || (matches!(aggregate.kind, SimpleGroupedNumericAggregateKind::Sum)
+                && aggregate.source_column_index.is_none())
+        }) {
+            return Ok(None);
+        }
+
+        let filter_value = self.eval_expr(
+            filter_value_expr,
+            &Dataset::empty(),
+            &[],
+            params,
+            &BTreeMap::new(),
+            None,
+        )?;
+        let mut row_count = 0_i64;
+        let mut numeric_states = vec![
+            SimpleGroupedNumericState {
+                numeric_count: 0,
+                total_int: 0,
+                total_float: 0.0,
+                saw_float: false,
+                saw_value: false,
+            };
+            plan.aggregate_bindings.len()
+        ];
+
+        for stored_row in row_source.rows() {
+            let stored_row = stored_row?;
+            if compare_values(&stored_row.values()[filter_column_index], &filter_value)?
+                != std::cmp::Ordering::Equal
+            {
+                continue;
+            }
+            row_count += 1;
+            for (aggregate_index, aggregate) in plan.aggregate_bindings.iter().enumerate() {
+                if matches!(aggregate.kind, SimpleGroupedNumericAggregateKind::Sum) {
+                    let source_column_index = aggregate.source_column_index.ok_or_else(|| {
+                        DbError::internal("simple scalar SUM missing source column")
+                    })?;
+                    numeric_states[aggregate_index]
+                        .add(&stored_row.values()[source_column_index])?;
+                }
+            }
+        }
+
+        let values = plan
+            .aggregate_bindings
+            .iter()
+            .enumerate()
+            .map(|(aggregate_index, aggregate)| match aggregate.kind {
+                SimpleGroupedNumericAggregateKind::CountRows => Value::Int64(row_count),
+                SimpleGroupedNumericAggregateKind::Sum => {
+                    numeric_states[aggregate_index].value(aggregate.kind)
+                }
+                _ => Value::Null,
+            })
+            .collect::<Vec<_>>();
+        Ok(Some(QueryResult::with_rows(
+            plan.column_names.clone(),
+            vec![QueryRow::new(values)],
+        )))
+    }
+
+    fn try_simple_scalar_filtered_numeric_aggregate_from_persisted_state<S: PageStore>(
+        &self,
+        store: &S,
+        state: PersistedTableState,
+        plan: &SimpleGroupedNumericAggregatePlan<'_>,
+        params: &[Value],
+    ) -> Result<Option<QueryResult>> {
+        if !plan.group_exprs.is_empty()
+            || plan.projection_exprs.is_some()
+            || plan.having.is_some()
+            || plan.order_by.is_some()
+            || plan.limit.is_some()
+            || plan.offset != 0
+        {
+            return Ok(None);
+        }
+        let Some(filter_expr) = plan.filter_expr.as_ref() else {
+            return Ok(None);
+        };
+        let Some((_filter_table, filter_column, filter_value_expr)) =
+            simple_btree_lookup(filter_expr)
+        else {
+            return Ok(None);
+        };
+        let Some(table_schema) = self.table_schema(plan.table_name) else {
+            return Ok(None);
+        };
+        let Some(filter_column_index) = schema_column_index(table_schema, filter_column) else {
+            return Ok(None);
+        };
+        if plan.aggregate_bindings.iter().any(|aggregate| {
+            !matches!(
+                aggregate.kind,
+                SimpleGroupedNumericAggregateKind::CountRows
+                    | SimpleGroupedNumericAggregateKind::Sum
+            ) || (matches!(aggregate.kind, SimpleGroupedNumericAggregateKind::Sum)
+                && aggregate.source_column_index.is_none())
+        }) {
+            return Ok(None);
+        }
+
+        let filter_value = self.eval_expr(
+            filter_value_expr,
+            &Dataset::empty(),
+            &[],
+            params,
+            &BTreeMap::new(),
+            None,
+        )?;
+        let mut row_count = 0_i64;
+        let mut numeric_states = vec![
+            SimpleGroupedNumericState {
+                numeric_count: 0,
+                total_int: 0,
+                total_float: 0.0,
+                saw_float: false,
+                saw_value: false,
+            };
+            plan.aggregate_bindings.len()
+        ];
+
+        visit_persisted_table_rows(store, state, |_, values| {
+            if compare_values(&values[filter_column_index], &filter_value)?
+                != std::cmp::Ordering::Equal
+            {
+                return Ok(());
+            }
+            row_count += 1;
+            for (aggregate_index, aggregate) in plan.aggregate_bindings.iter().enumerate() {
+                if matches!(aggregate.kind, SimpleGroupedNumericAggregateKind::Sum) {
+                    let source_column_index = aggregate.source_column_index.ok_or_else(|| {
+                        DbError::internal("simple scalar SUM missing source column")
+                    })?;
+                    numeric_states[aggregate_index].add(&values[source_column_index])?;
+                }
+            }
+            Ok(())
+        })?;
+
+        let values = plan
+            .aggregate_bindings
+            .iter()
+            .enumerate()
+            .map(|(aggregate_index, aggregate)| match aggregate.kind {
+                SimpleGroupedNumericAggregateKind::CountRows => Value::Int64(row_count),
+                SimpleGroupedNumericAggregateKind::Sum => {
+                    numeric_states[aggregate_index].value(aggregate.kind)
+                }
+                _ => Value::Null,
+            })
+            .collect::<Vec<_>>();
+        Ok(Some(QueryResult::with_rows(
+            plan.column_names.clone(),
+            vec![QueryRow::new(values)],
+        )))
+    }
+
     fn simple_grouped_numeric_aggregate_result_from_persisted_state<S: PageStore>(
         &self,
         store: &S,
@@ -5057,9 +5362,24 @@ impl EngineRuntime {
         plan: &SimpleGroupedNumericAggregatePlan<'_>,
         params: &[Value],
     ) -> Result<QueryResult> {
+        if let Some(result) = self
+            .try_simple_scalar_filtered_numeric_aggregate_from_persisted_state(
+                store, state, plan, params,
+            )?
+        {
+            return Ok(result);
+        }
+
         let mut groups = Vec::<SimpleGroupedNumericAggregate>::new();
         let mut group_positions = BTreeMap::<Vec<u8>, usize>::new();
         let group_dataset = Dataset::with_rows(plan.group_eval_bindings.clone(), Vec::new());
+        if plan.group_exprs.is_empty() {
+            groups.push(SimpleGroupedNumericAggregate::new(
+                Vec::new(),
+                plan.aggregate_bindings.len(),
+            ));
+            group_positions.insert(row_identity(&[])?, 0);
+        }
         visit_persisted_table_rows(store, state, |_, values| {
             if let Some(filter_expr) = plan.filter_expr.as_ref() {
                 if !matches!(
@@ -5629,6 +5949,725 @@ impl EngineRuntime {
         Ok(QueryResult::with_rows(column_names, rows))
     }
 
+    fn try_execute_indexed_join_grouped_count_query(
+        &self,
+        query: &Query,
+        params: &[Value],
+    ) -> Result<Option<QueryResult>> {
+        let Some(plan) = self.analyze_indexed_join_grouped_count_query(query, params)? else {
+            return Ok(None);
+        };
+        let Some(parent_source) = self.visible_table_row_source(plan.parent_table_name) else {
+            return Ok(None);
+        };
+        let Some(RuntimeIndex::Btree { keys }) = self.index(&plan.child_index_name) else {
+            return Ok(None);
+        };
+        let parent_table = self.table_schema(plan.parent_table_name).ok_or_else(|| {
+            DbError::internal(format!(
+                "table {} not found for indexed grouped join count",
+                plan.parent_table_name
+            ))
+        })?;
+        let parent_join_index = parent_table
+            .columns
+            .iter()
+            .position(|column| identifiers_equal(&column.name, plan.parent_join_column))
+            .ok_or_else(|| {
+                DbError::internal(format!(
+                    "join column {}.{} not found",
+                    plan.parent_table_name, plan.parent_join_column
+                ))
+            })?;
+
+        let mut rows = Vec::new();
+        for parent_row in parent_source.rows() {
+            let parent_row = parent_row?;
+            let parent_values = parent_row.values();
+            let Some(join_value) = parent_values.get(parent_join_index) else {
+                return Err(DbError::internal("parent join row is shorter than schema"));
+            };
+            if matches!(join_value, Value::Null) {
+                continue;
+            }
+            let child_count = keys.row_ids_for_value_set(join_value)?.len();
+            if child_count == 0 {
+                continue;
+            }
+            let child_count = i64::try_from(child_count).map_err(|_| {
+                DbError::sql(format!(
+                    "join count for table {} exceeds INT64 limits",
+                    plan.parent_table_name
+                ))
+            })?;
+
+            let mut output = Vec::with_capacity(plan.group_column_indexes.len() + 1);
+            for index in &plan.group_column_indexes {
+                output.push(parent_values[*index].clone());
+            }
+            output.push(Value::Int64(child_count));
+            rows.push(QueryRow::new(output));
+        }
+
+        Ok(Some(apply_simple_projection_postprocessing_with_order(
+            rows,
+            plan.column_names,
+            plan.order_by.as_deref(),
+            plan.limit,
+            plan.offset,
+        )?))
+    }
+
+    fn analyze_indexed_join_grouped_count_query<'a>(
+        &'a self,
+        query: &'a Query,
+        params: &[Value],
+    ) -> Result<Option<IndexedJoinGroupedCountPlan<'a>>> {
+        if !query.ctes.is_empty() || query.recursive {
+            return Ok(None);
+        }
+        let QueryBody::Select(select) = &query.body else {
+            return Ok(None);
+        };
+        if select.distinct
+            || !select.distinct_on.is_empty()
+            || select.filter.is_some()
+            || select.having.is_some()
+            || select.group_by.is_empty()
+            || select.from.len() != 1
+            || select.projection.len() != select.group_by.len() + 1
+        {
+            return Ok(None);
+        }
+        let FromItem::Join {
+            left,
+            right,
+            kind,
+            constraint,
+        } = &select.from[0]
+        else {
+            return Ok(None);
+        };
+        if !matches!(kind, JoinKind::Inner) {
+            return Ok(None);
+        }
+        let (left_name, left_alias) = match &**left {
+            FromItem::Table { name, alias } => (name.as_str(), alias),
+            _ => return Ok(None),
+        };
+        let (right_name, right_alias) = match &**right {
+            FromItem::Table { name, alias } => (name.as_str(), alias),
+            _ => return Ok(None),
+        };
+        if self
+            .visible_view(left_name, NameResolutionScope::Session)
+            .is_some()
+            || self
+                .visible_view(right_name, NameResolutionScope::Session)
+                .is_some()
+            || self.visible_table_is_temporary(left_name)
+            || self.visible_table_is_temporary(right_name)
+        {
+            return Ok(None);
+        }
+        let Some(left_schema) = self.table_schema(left_name) else {
+            return Ok(None);
+        };
+        let Some(right_schema) = self.table_schema(right_name) else {
+            return Ok(None);
+        };
+        if !generated_columns_are_stored(left_schema) || !generated_columns_are_stored(right_schema)
+        {
+            return Ok(None);
+        }
+
+        let left_binding = TableBindingRef {
+            name: left_name,
+            alias: left_alias,
+        };
+        let right_binding = TableBindingRef {
+            name: right_name,
+            alias: right_alias,
+        };
+        let left_group_indexes =
+            indexed_join_group_column_indexes(&select.group_by, left_binding, left_schema);
+        let right_group_indexes =
+            indexed_join_group_column_indexes(&select.group_by, right_binding, right_schema);
+        let (
+            parent_name,
+            parent_binding,
+            parent_schema,
+            child_name,
+            child_binding,
+            child_schema,
+            group_column_indexes,
+        ) = match (left_group_indexes, right_group_indexes) {
+            (Some(group_column_indexes), None) => (
+                left_name,
+                left_binding,
+                left_schema,
+                right_name,
+                right_binding,
+                right_schema,
+                group_column_indexes,
+            ),
+            (None, Some(group_column_indexes)) => (
+                right_name,
+                right_binding,
+                right_schema,
+                left_name,
+                left_binding,
+                left_schema,
+                group_column_indexes,
+            ),
+            _ => return Ok(None),
+        };
+
+        let SelectItem::Expr {
+            expr: count_expr,
+            alias: count_alias,
+        } = &select.projection[select.group_by.len()]
+        else {
+            return Ok(None);
+        };
+        if !indexed_join_grouped_count_is_safe(count_expr, child_binding, child_schema) {
+            return Ok(None);
+        }
+
+        let mut column_names = Vec::with_capacity(select.projection.len());
+        for (projection_item, group_expr) in select
+            .projection
+            .iter()
+            .take(select.group_by.len())
+            .zip(&select.group_by)
+        {
+            let SelectItem::Expr {
+                expr: projection_expr,
+                alias,
+            } = projection_item
+            else {
+                return Ok(None);
+            };
+            if !grouped_projection_expr_matches_group_expr(
+                projection_expr,
+                group_expr,
+                parent_binding,
+            ) {
+                return Ok(None);
+            }
+            column_names.push(
+                alias
+                    .clone()
+                    .unwrap_or_else(|| infer_expr_name(projection_expr, column_names.len() + 1)),
+            );
+        }
+        column_names.push(
+            count_alias
+                .clone()
+                .unwrap_or_else(|| infer_expr_name(count_expr, select.group_by.len() + 1)),
+        );
+
+        let Some(join_equalities) = simple_indexed_join_constraint_equalities(
+            constraint,
+            left_binding,
+            right_binding,
+            left_schema,
+            right_schema,
+        ) else {
+            return Ok(None);
+        };
+        let Some((parent_join_columns, child_join_columns)) =
+            orient_join_equalities(&join_equalities, parent_binding, child_binding)
+        else {
+            return Ok(None);
+        };
+        if parent_join_columns.len() != 1 || child_join_columns.len() != 1 {
+            return Ok(None);
+        }
+        let parent_join_column = parent_join_columns[0];
+        let child_join_column = child_join_columns[0];
+        if parent_schema
+            .columns
+            .iter()
+            .all(|column| !identifiers_equal(&column.name, parent_join_column))
+        {
+            return Ok(None);
+        }
+        let Some(child_index_name) = self
+            .catalog
+            .indexes
+            .values()
+            .find(|index| {
+                identifiers_equal(&index.table_name, child_name)
+                    && index.fresh
+                    && index.kind == IndexKind::Btree
+                    && index.predicate_sql.is_none()
+                    && index.columns.len() == 1
+                    && index.columns[0].expression_sql.is_none()
+                    && index.columns[0]
+                        .column_name
+                        .as_deref()
+                        .is_some_and(|column| identifiers_equal(column, child_join_column))
+            })
+            .map(|index| index.name.clone())
+        else {
+            return Ok(None);
+        };
+
+        let order_by = projection_order_by_plan(&query.order_by, &select.projection);
+        if !query.order_by.is_empty() && order_by.is_none() {
+            return Ok(None);
+        }
+        let limit = query
+            .limit
+            .as_ref()
+            .map(|expr| self.eval_constant_i64(expr, params, &BTreeMap::new()))
+            .transpose()?
+            .map(|value| usize::try_from(value.max(0)).unwrap_or(usize::MAX));
+        let offset = query
+            .offset
+            .as_ref()
+            .map(|expr| self.eval_constant_i64(expr, params, &BTreeMap::new()))
+            .transpose()?
+            .map(|value| usize::try_from(value.max(0)).unwrap_or(usize::MAX))
+            .unwrap_or(0);
+
+        Ok(Some(IndexedJoinGroupedCountPlan {
+            parent_table_name: parent_name,
+            parent_join_column,
+            child_index_name,
+            group_column_indexes,
+            column_names,
+            order_by,
+            limit,
+            offset,
+        }))
+    }
+
+    fn try_execute_simple_view_projection_limit_query(
+        &self,
+        query: &Query,
+        params: &[Value],
+    ) -> Result<Option<QueryResult>> {
+        if query.recursive || !query.ctes.is_empty() || !query.order_by.is_empty() {
+            return Ok(None);
+        }
+        let Some(limit_expr) = query.limit.as_ref() else {
+            return Ok(None);
+        };
+        let ctes = BTreeMap::new();
+        let limit = usize::try_from(self.eval_constant_i64(limit_expr, params, &ctes)?.max(0))
+            .unwrap_or(usize::MAX);
+        let offset = query
+            .offset
+            .as_ref()
+            .map(|expr| self.eval_constant_i64(expr, params, &ctes))
+            .transpose()?
+            .map(|value| usize::try_from(value.max(0)).unwrap_or(usize::MAX))
+            .unwrap_or(0);
+        let QueryBody::Select(select) = &query.body else {
+            return Ok(None);
+        };
+        if select.distinct
+            || !select.distinct_on.is_empty()
+            || select.filter.is_some()
+            || !select.group_by.is_empty()
+            || select.having.is_some()
+            || projection_has_aggregate_items(&select.projection)
+            || select.from.len() != 1
+        {
+            return Ok(None);
+        }
+        let FromItem::Table { name, alias } = &select.from[0] else {
+            return Ok(None);
+        };
+        let Some(view) = self.visible_view(name, NameResolutionScope::Session) else {
+            return Ok(None);
+        };
+        let view_binding = alias.as_deref().unwrap_or(name.as_str());
+        let view_statement = parse_sql_statement(&view.sql_text)?;
+        let Statement::Query(view_query) = view_statement else {
+            return Err(DbError::corruption(format!(
+                "view {} does not contain a SELECT statement",
+                view.name
+            )));
+        };
+        if view_query.recursive
+            || !view_query.ctes.is_empty()
+            || !view_query.order_by.is_empty()
+            || view_query.limit.is_some()
+            || view_query.offset.is_some()
+        {
+            return Ok(None);
+        }
+        let QueryBody::Select(view_select) = &view_query.body else {
+            return Ok(None);
+        };
+        if view_select.distinct
+            || !view_select.distinct_on.is_empty()
+            || view_select.filter.is_some()
+            || !view_select.group_by.is_empty()
+            || view_select.having.is_some()
+            || projection_has_aggregate_items(&view_select.projection)
+        {
+            return Ok(None);
+        }
+
+        let mut pushed_projection = Vec::with_capacity(select.projection.len());
+        for (index, item) in select.projection.iter().enumerate() {
+            let SelectItem::Expr { expr, alias } = item else {
+                return Ok(None);
+            };
+            let Expr::Column { table, column } = expr else {
+                return Ok(None);
+            };
+            if table
+                .as_deref()
+                .is_some_and(|qualifier| !identifiers_equal(qualifier, view_binding))
+            {
+                return Ok(None);
+            }
+            let Some(view_expr) =
+                view_projection_expr_for_output_column(&view_select.projection, column)
+            else {
+                return Ok(None);
+            };
+            pushed_projection.push(SelectItem::Expr {
+                expr: view_expr,
+                alias: Some(
+                    alias
+                        .clone()
+                        .unwrap_or_else(|| infer_expr_name(expr, index + 1)),
+                ),
+            });
+        }
+
+        if view.temporary {
+            self.try_execute_indexed_join_limit_projection_select(
+                view_select,
+                &pushed_projection,
+                limit,
+                offset,
+            )
+        } else {
+            let persistent_runtime = self.persistent_resolution_runtime();
+            persistent_runtime.try_execute_indexed_join_limit_projection_select(
+                view_select,
+                &pushed_projection,
+                limit,
+                offset,
+            )
+        }
+    }
+
+    fn try_execute_indexed_join_limit_projection_query(
+        &self,
+        query: &Query,
+        params: &[Value],
+    ) -> Result<Option<QueryResult>> {
+        if query.recursive || !query.ctes.is_empty() || !query.order_by.is_empty() {
+            return Ok(None);
+        }
+        let Some(limit_expr) = query.limit.as_ref() else {
+            return Ok(None);
+        };
+        let ctes = BTreeMap::new();
+        let limit = usize::try_from(self.eval_constant_i64(limit_expr, params, &ctes)?.max(0))
+            .unwrap_or(usize::MAX);
+        let offset = query
+            .offset
+            .as_ref()
+            .map(|expr| self.eval_constant_i64(expr, params, &ctes))
+            .transpose()?
+            .map(|value| usize::try_from(value.max(0)).unwrap_or(usize::MAX))
+            .unwrap_or(0);
+        let QueryBody::Select(select) = &query.body else {
+            return Ok(None);
+        };
+        self.try_execute_indexed_join_limit_projection_select(
+            select,
+            &select.projection,
+            limit,
+            offset,
+        )
+    }
+
+    fn try_execute_indexed_join_limit_projection_select(
+        &self,
+        select: &Select,
+        projection: &[SelectItem],
+        limit: usize,
+        offset: usize,
+    ) -> Result<Option<QueryResult>> {
+        if limit == 0 {
+            let column_names = projection
+                .iter()
+                .enumerate()
+                .map(|(index, item)| match item {
+                    SelectItem::Expr { expr, alias } => alias
+                        .clone()
+                        .unwrap_or_else(|| infer_expr_name(expr, index + 1)),
+                    _ => format!("col{}", index + 1),
+                })
+                .collect();
+            return Ok(Some(QueryResult::with_rows(column_names, Vec::new())));
+        }
+        let Some(plan) =
+            self.analyze_indexed_join_limit_projection_select(select, projection, limit, offset)?
+        else {
+            return Ok(None);
+        };
+        self.execute_indexed_join_limit_projection_plan(&plan)
+            .map(Some)
+    }
+
+    fn analyze_indexed_join_limit_projection_select<'a>(
+        &'a self,
+        select: &'a Select,
+        projection: &'a [SelectItem],
+        limit: usize,
+        offset: usize,
+    ) -> Result<Option<IndexedJoinLimitPlan<'a>>> {
+        if select.distinct
+            || !select.distinct_on.is_empty()
+            || select.filter.is_some()
+            || !select.group_by.is_empty()
+            || select.having.is_some()
+            || projection_has_aggregate_items(projection)
+            || select.from.len() != 1
+        {
+            return Ok(None);
+        }
+        let mut tables = Vec::new();
+        let mut constraints = Vec::new();
+        if !flatten_left_deep_inner_join_tables(&select.from[0], &mut tables, &mut constraints) {
+            return Ok(None);
+        }
+        if !(2..=3).contains(&tables.len()) || constraints.len() + 1 != tables.len() {
+            return Ok(None);
+        }
+        for table in &tables {
+            if self
+                .visible_view(table.name, NameResolutionScope::Session)
+                .is_some()
+                || self.visible_table_is_temporary(table.name)
+            {
+                return Ok(None);
+            }
+            let Some(schema) = self.table_schema(table.name) else {
+                return Ok(None);
+            };
+            if !generated_columns_are_stored(schema)
+                || self.visible_table_row_source(table.name).is_none()
+            {
+                return Ok(None);
+            }
+        }
+
+        let mut steps = Vec::with_capacity(constraints.len());
+        for (right_table_index, constraint) in
+            constraints.iter().enumerate().map(|(i, c)| (i + 1, c))
+        {
+            let Some(step) = self.indexed_join_limit_step_for_constraint(
+                &tables,
+                right_table_index,
+                constraint,
+            )?
+            else {
+                return Ok(None);
+            };
+            steps.push(step);
+        }
+
+        let mut projections = Vec::with_capacity(projection.len());
+        for (index, item) in projection.iter().enumerate() {
+            let SelectItem::Expr { expr, alias } = item else {
+                return Ok(None);
+            };
+            let Some((table_index, column_index)) =
+                indexed_join_limit_projection_column(expr, &tables, self)
+            else {
+                return Ok(None);
+            };
+            projections.push(IndexedJoinLimitProjection {
+                table_index,
+                column_index,
+                column_name: alias
+                    .clone()
+                    .unwrap_or_else(|| infer_expr_name(expr, index + 1)),
+            });
+        }
+
+        Ok(Some(IndexedJoinLimitPlan {
+            tables,
+            steps,
+            projections,
+            limit,
+            offset,
+        }))
+    }
+
+    fn indexed_join_limit_step_for_constraint(
+        &self,
+        tables: &[IndexedJoinLimitTablePlan<'_>],
+        right_table_index: usize,
+        constraint: &JoinConstraint,
+    ) -> Result<Option<IndexedJoinLimitStep>> {
+        let JoinConstraint::On(on) = constraint else {
+            return Ok(None);
+        };
+        let Some(equalities) = simple_join_equalities(on) else {
+            return Ok(None);
+        };
+        if equalities.len() != 1 {
+            return Ok(None);
+        }
+        let right_table = tables[right_table_index];
+        let right_binding = TableBindingRef {
+            name: right_table.name,
+            alias: right_table.alias,
+        };
+        let (left_ref, right_ref) = equalities[0];
+        let (previous_ref, right_ref) = if matches_table_binding(right_binding, right_ref.table) {
+            (left_ref, right_ref)
+        } else if matches_table_binding(right_binding, left_ref.table) {
+            (right_ref, left_ref)
+        } else {
+            return Ok(None);
+        };
+
+        let Some(previous_table_index) = (0..right_table_index).find(|index| {
+            let table = tables[*index];
+            matches_table_binding(
+                TableBindingRef {
+                    name: table.name,
+                    alias: table.alias,
+                },
+                previous_ref.table,
+            )
+        }) else {
+            return Ok(None);
+        };
+        let previous_schema = self
+            .table_schema(tables[previous_table_index].name)
+            .ok_or_else(|| DbError::internal("indexed join previous table missing"))?;
+        let right_schema = self
+            .table_schema(right_table.name)
+            .ok_or_else(|| DbError::internal("indexed join right table missing"))?;
+        let Some(previous_column_index) = schema_column_index(previous_schema, previous_ref.column)
+        else {
+            return Ok(None);
+        };
+        let Some(right_column_index) = schema_column_index(right_schema, right_ref.column) else {
+            return Ok(None);
+        };
+        let Some(index) = self.catalog.indexes.values().find(|index| {
+            identifiers_equal(&index.table_name, right_table.name)
+                && index.fresh
+                && index.kind == IndexKind::Btree
+                && index.predicate_sql.is_none()
+                && index.columns.len() == 1
+                && index.columns[0].expression_sql.is_none()
+                && index.columns[0]
+                    .column_name
+                    .as_deref()
+                    .is_some_and(|column| identifiers_equal(column, right_ref.column))
+        }) else {
+            let _ = right_column_index;
+            return Ok(None);
+        };
+        let _ = right_column_index;
+        Ok(Some(IndexedJoinLimitStep {
+            previous_table_index,
+            previous_column_index,
+            right_index_name: index.name.clone(),
+        }))
+    }
+
+    fn execute_indexed_join_limit_projection_plan(
+        &self,
+        plan: &IndexedJoinLimitPlan<'_>,
+    ) -> Result<QueryResult> {
+        let sources = plan
+            .tables
+            .iter()
+            .map(|table| {
+                self.visible_table_row_source(table.name).ok_or_else(|| {
+                    DbError::internal(format!("table {} row source is missing", table.name))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let keys = plan
+            .steps
+            .iter()
+            .map(|step| {
+                let Some(RuntimeIndex::Btree { keys }) = self.index(&step.right_index_name) else {
+                    return Err(DbError::internal(format!(
+                        "index {} is missing for indexed join limit plan",
+                        step.right_index_name
+                    )));
+                };
+                Ok(keys)
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut rows = Vec::new();
+        let mut offset_remaining = plan.offset;
+        let mut limit_remaining = plan.limit;
+        for root_row in sources[0].rows() {
+            let root_row = root_row?;
+            let current0 = root_row.values().to_vec();
+            if plan.tables.len() == 2 {
+                let step0 = &plan.steps[0];
+                let Some(probe_value) = current0.get(step0.previous_column_index) else {
+                    return Err(DbError::internal("join probe row is shorter than schema"));
+                };
+                for row1 in indexed_join_limit_rows_for_value(sources[1], keys[0], probe_value)? {
+                    let current = [&current0[..], &row1[..]];
+                    if push_indexed_join_limit_projection(
+                        &current,
+                        &plan.projections,
+                        &mut offset_remaining,
+                        &mut limit_remaining,
+                        &mut rows,
+                    ) {
+                        return Ok(indexed_join_limit_result(plan, rows));
+                    }
+                }
+            } else {
+                let step0 = &plan.steps[0];
+                let Some(probe_value0) = current0.get(step0.previous_column_index) else {
+                    return Err(DbError::internal("join probe row is shorter than schema"));
+                };
+                for row1 in indexed_join_limit_rows_for_value(sources[1], keys[0], probe_value0)? {
+                    let current01 = [&current0[..], &row1[..]];
+                    let step1 = &plan.steps[1];
+                    let Some(probe_value1) = current01
+                        .get(step1.previous_table_index)
+                        .and_then(|row| row.get(step1.previous_column_index))
+                    else {
+                        return Err(DbError::internal("join probe row is shorter than schema"));
+                    };
+                    for row2 in
+                        indexed_join_limit_rows_for_value(sources[2], keys[1], probe_value1)?
+                    {
+                        let current = [&current0[..], &row1[..], &row2[..]];
+                        if push_indexed_join_limit_projection(
+                            &current,
+                            &plan.projections,
+                            &mut offset_remaining,
+                            &mut limit_remaining,
+                            &mut rows,
+                        ) {
+                            return Ok(indexed_join_limit_result(plan, rows));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(indexed_join_limit_result(plan, rows))
+    }
+
     fn try_execute_base_table_join(
         &self,
         query: &Query,
@@ -6185,20 +7224,6 @@ impl EngineRuntime {
             source_join_indexes.push(source_join_index);
         }
         let source_row_ids = if let Some((filter_column, value_expr)) = source_filter {
-            let Some(filter_index) = self.catalog.indexes.values().find(|index| {
-                identifiers_equal(&index.table_name, source_table)
-                    && index.fresh
-                    && index.kind == IndexKind::Btree
-                    && index.predicate_sql.is_none()
-                    && index.columns.len() == 1
-                    && index.columns[0]
-                        .column_name
-                        .as_deref()
-                        .is_some_and(|index_column| identifiers_equal(index_column, filter_column))
-                    && index.columns[0].expression_sql.is_none()
-            }) else {
-                return Ok(None);
-            };
             let filter_value = self.eval_expr(
                 value_expr,
                 &Dataset::empty(),
@@ -6207,10 +7232,35 @@ impl EngineRuntime {
                 &BTreeMap::new(),
                 None,
             )?;
-            let Some(RuntimeIndex::Btree { keys }) = self.index(&filter_index.name) else {
-                return Ok(None);
-            };
-            Some(keys.row_ids_for_value_set(&filter_value)?)
+            if crate::exec::dml::row_id_alias_column_name(source_schema)
+                .is_some_and(|name| identifiers_equal(name, filter_column))
+            {
+                Some(match filter_value {
+                    Value::Int64(row_id) => RuntimeRowIdSet::Single(row_id),
+                    _ => RuntimeRowIdSet::Empty,
+                })
+            } else {
+                let Some(filter_index) = self.catalog.indexes.values().find(|index| {
+                    identifiers_equal(&index.table_name, source_table)
+                        && index.fresh
+                        && index.kind == IndexKind::Btree
+                        && index.predicate_sql.is_none()
+                        && index.columns.len() == 1
+                        && index.columns[0]
+                            .column_name
+                            .as_deref()
+                            .is_some_and(|index_column| {
+                                identifiers_equal(index_column, filter_column)
+                            })
+                        && index.columns[0].expression_sql.is_none()
+                }) else {
+                    return Ok(None);
+                };
+                let Some(RuntimeIndex::Btree { keys }) = self.index(&filter_index.name) else {
+                    return Ok(None);
+                };
+                Some(keys.row_ids_for_value_set(&filter_value)?)
+            }
         } else {
             None
         };
@@ -7848,17 +8898,6 @@ impl EngineRuntime {
             })
             .transpose()?;
 
-        let order_by = self.simple_projection_order_by_plan(
-            query,
-            table_schema,
-            name,
-            binding_name,
-            &projection_indexes,
-        )?;
-        if !query.order_by.is_empty() && order_by.is_none() {
-            return Ok(None);
-        }
-
         let limit = query
             .limit
             .as_ref()
@@ -7875,6 +8914,33 @@ impl EngineRuntime {
         let Some(row_source) = row_source else {
             return Ok(None);
         };
+        if !select.distinct {
+            if let Some(result) = self.try_simple_rowid_range_projection_result(
+                row_source,
+                table_schema,
+                TableBindingRef { name, alias },
+                filter_column,
+                lower_bound.as_ref(),
+                upper_bound.as_ref(),
+                &projection_indexes,
+                column_names.clone(),
+                &query.order_by,
+                limit,
+                offset,
+            )? {
+                return Ok(Some(result));
+            }
+        }
+        let order_by = self.simple_projection_order_by_plan(
+            query,
+            table_schema,
+            name,
+            binding_name,
+            &projection_indexes,
+        )?;
+        if !query.order_by.is_empty() && order_by.is_none() {
+            return Ok(None);
+        }
         Ok(Some(self.simple_filtered_projection_result_from_source(
             row_source,
             filter_column_index,
@@ -7886,6 +8952,189 @@ impl EngineRuntime {
             limit,
             offset,
         )?))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_simple_rowid_range_projection_result(
+        &self,
+        row_source: VisibleTableRowSource<'_>,
+        table_schema: &TableSchema,
+        table_binding: TableBindingRef<'_>,
+        filter_column: &str,
+        lower_bound: Option<&SimpleRangeBoundValue>,
+        upper_bound: Option<&SimpleRangeBoundValue>,
+        projection_indexes: &[usize],
+        column_names: Vec<String>,
+        order_by: &[crate::sql::ast::OrderBy],
+        limit: Option<usize>,
+        offset: usize,
+    ) -> Result<Option<QueryResult>> {
+        if lower_bound.is_none() || upper_bound.is_none() {
+            return Ok(None);
+        }
+        if order_by.len() != 1 || order_by[0].descending {
+            return Ok(None);
+        }
+        let Expr::Column {
+            table: order_table,
+            column: order_column,
+        } = &order_by[0].expr
+        else {
+            return Ok(None);
+        };
+        if !identifiers_equal(order_column, filter_column)
+            || order_table
+                .as_deref()
+                .is_some_and(|qualifier| !matches_table_binding(table_binding, Some(qualifier)))
+        {
+            return Ok(None);
+        }
+        if !table_schema
+            .primary_key_columns
+            .iter()
+            .any(|column| identifiers_equal(column, filter_column))
+        {
+            return Ok(None);
+        }
+        let Some(filter_column_index) = schema_column_index(table_schema, filter_column) else {
+            return Ok(None);
+        };
+        if table_schema.columns[filter_column_index].column_type
+            != crate::catalog::ColumnType::Int64
+        {
+            return Ok(None);
+        }
+        let Some(start) = simple_int64_range_start(lower_bound) else {
+            return Ok(None);
+        };
+        let Some(end_exclusive) = simple_int64_range_end_exclusive(upper_bound) else {
+            return Ok(None);
+        };
+        if end_exclusive <= start || limit == Some(0) {
+            return Ok(Some(QueryResult::with_rows(column_names, Vec::new())));
+        }
+
+        let take = limit.unwrap_or(usize::MAX);
+        let mut skipped = 0usize;
+        let mut rows = Vec::with_capacity(take.min(64));
+        let mut row_id = start;
+        while row_id < end_exclusive && rows.len() < take {
+            if let Some(row) = row_source.row_by_id(row_id)? {
+                if skipped < offset {
+                    skipped += 1;
+                } else {
+                    rows.push(project_simple_projection_values(
+                        row.values(),
+                        projection_indexes,
+                    ));
+                }
+            }
+            let Some(next_row_id) = row_id.checked_add(1) else {
+                break;
+            };
+            row_id = next_row_id;
+        }
+        Ok(Some(QueryResult::with_rows(column_names, rows)))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_simple_deferred_rowid_range_projection_result<S: PageStore>(
+        &self,
+        store: &S,
+        state: PersistedTableState,
+        table_schema: &TableSchema,
+        table_binding: TableBindingRef<'_>,
+        filter_column: &str,
+        lower_bound: Option<&SimpleRangeBoundValue>,
+        upper_bound: Option<&SimpleRangeBoundValue>,
+        projection_indexes: &[usize],
+        column_names: Vec<String>,
+        order_by: &[crate::sql::ast::OrderBy],
+        limit: Option<usize>,
+        offset: usize,
+        use_persistent_pk_index: bool,
+        paged_locator_cache: Option<&DeferredPagedRowLocatorCache>,
+    ) -> Result<Option<QueryResult>> {
+        if lower_bound.is_none() || upper_bound.is_none() {
+            return Ok(None);
+        }
+        if order_by.len() != 1 || order_by[0].descending {
+            return Ok(None);
+        }
+        let Expr::Column {
+            table: order_table,
+            column: order_column,
+        } = &order_by[0].expr
+        else {
+            return Ok(None);
+        };
+        if !identifiers_equal(order_column, filter_column)
+            || order_table
+                .as_deref()
+                .is_some_and(|qualifier| !matches_table_binding(table_binding, Some(qualifier)))
+        {
+            return Ok(None);
+        }
+        if !table_schema
+            .primary_key_columns
+            .iter()
+            .any(|column| identifiers_equal(column, filter_column))
+        {
+            return Ok(None);
+        }
+        let Some(filter_column_index) = schema_column_index(table_schema, filter_column) else {
+            return Ok(None);
+        };
+        if table_schema.columns[filter_column_index].column_type
+            != crate::catalog::ColumnType::Int64
+        {
+            return Ok(None);
+        }
+
+        let has_matching_locator_cache =
+            paged_locator_cache.is_some_and(|cache| cache.matches_state(state));
+        let has_persistent_pk_locator =
+            use_persistent_pk_index && table_schema.pk_index_root.is_some();
+        let has_compressed_lookup = state.pointer.is_compressed();
+        if !has_matching_locator_cache && !has_persistent_pk_locator && !has_compressed_lookup {
+            return Ok(None);
+        }
+
+        let Some(start) = simple_int64_range_start(lower_bound) else {
+            return Ok(None);
+        };
+        let Some(end_exclusive) = simple_int64_range_end_exclusive(upper_bound) else {
+            return Ok(None);
+        };
+        if end_exclusive <= start || limit == Some(0) {
+            return Ok(Some(QueryResult::with_rows(column_names, Vec::new())));
+        }
+
+        let take = limit.unwrap_or(usize::MAX);
+        let mut skipped = 0usize;
+        let mut rows = Vec::with_capacity(take.min(64));
+        let mut row_id = start;
+        while row_id < end_exclusive && rows.len() < take {
+            if let Some(row) = read_deferred_stored_row_by_id(
+                store,
+                state,
+                table_schema,
+                row_id,
+                use_persistent_pk_index,
+                paged_locator_cache,
+            )? {
+                if skipped < offset {
+                    skipped += 1;
+                } else {
+                    rows.push(project_simple_projection_row(&row, projection_indexes));
+                }
+            }
+            let Some(next_row_id) = row_id.checked_add(1) else {
+                break;
+            };
+            row_id = next_row_id;
+        }
+        Ok(Some(QueryResult::with_rows(column_names, rows)))
     }
 
     fn try_execute_simple_distinct_projection_query(
@@ -8774,7 +10023,67 @@ impl EngineRuntime {
         let Some(plan) = self.analyze_simple_indexed_projection_query(query, params)? else {
             return Ok(None);
         };
-        if self.table_row_source(plan.table_name).is_some() || !self.has_deferred_tables() {
+        if let Some(row_source) = self.visible_table_row_source(plan.table_name) {
+            if plan.limit == Some(0) {
+                return Ok(Some(QueryResult::with_rows(plan.column_names, Vec::new())));
+            }
+            if row_id_alias_column_name(plan.table_schema)
+                .is_some_and(|column_name| identifiers_equal(column_name, plan.filter_column))
+            {
+                let mut rows = Vec::new();
+                if let Some(row_id) = value_as_int64(&plan.lookup_value) {
+                    if let Some(stored_row) = row_source.row_by_id(row_id)? {
+                        rows.push(project_simple_projection_values(
+                            stored_row.values(),
+                            &plan.projection_indexes,
+                        ));
+                    }
+                }
+                return Ok(Some(QueryResult::with_rows(plan.column_names, rows)));
+            }
+
+            let Some(index) = self.catalog.indexes.values().find(|index| {
+                identifiers_equal(&index.table_name, plan.table_name)
+                    && index.fresh
+                    && index.kind == IndexKind::Btree
+                    && index.predicate_sql.is_none()
+                    && index.columns.len() == 1
+                    && index.columns[0]
+                        .column_name
+                        .as_deref()
+                        .is_some_and(|index_column| {
+                            identifiers_equal(index_column, plan.filter_column)
+                        })
+                    && index.columns[0].expression_sql.is_none()
+            }) else {
+                return Ok(None);
+            };
+            let Some(RuntimeIndex::Btree { keys }) = self.index(&index.name) else {
+                return Ok(None);
+            };
+            let row_ids = keys.row_ids_for_value_set(&plan.lookup_value)?;
+            let limit = plan.limit.unwrap_or(usize::MAX);
+            let mut rows = Vec::with_capacity(row_ids.len().min(limit));
+            let mut row_lookup_error = None;
+            row_ids.for_each(|row_id| {
+                if row_lookup_error.is_some() || rows.len() >= limit {
+                    return;
+                }
+                match row_source.row_by_id(row_id) {
+                    Ok(Some(stored_row)) => rows.push(project_simple_projection_values(
+                        stored_row.values(),
+                        &plan.projection_indexes,
+                    )),
+                    Ok(None) => {}
+                    Err(error) => row_lookup_error = Some(error),
+                }
+            });
+            if let Some(error) = row_lookup_error {
+                return Err(error);
+            }
+            return Ok(Some(QueryResult::with_rows(plan.column_names, rows)));
+        }
+        if !self.has_deferred_tables() {
             return Ok(None);
         }
         if plan.limit == Some(0) {
@@ -8870,6 +10179,335 @@ impl EngineRuntime {
         Ok(Some(QueryResult::with_rows(plan.column_names, rows)))
     }
 
+    fn try_execute_simple_deferred_rowid_join_projection_query(
+        &self,
+        query: &Query,
+        params: &[Value],
+        pager: &PagerHandle,
+        wal: &WalHandle,
+        snapshot_lsn: u64,
+        use_persistent_pk_index: bool,
+    ) -> Result<Option<QueryResult>> {
+        if !query.ctes.is_empty() || !query.order_by.is_empty() || query.limit.is_some() {
+            return Ok(None);
+        }
+        let QueryBody::Select(select) = &query.body else {
+            return Ok(None);
+        };
+        if !select.group_by.is_empty()
+            || select.having.is_some()
+            || select.distinct
+            || !select.distinct_on.is_empty()
+            || projection_has_aggregate_items(&select.projection)
+            || select.from.len() != 1
+        {
+            return Ok(None);
+        }
+        let Some(filter) = select.filter.as_ref() else {
+            return Ok(None);
+        };
+        let FromItem::Join {
+            left,
+            right,
+            kind: JoinKind::Inner,
+            constraint,
+        } = &select.from[0]
+        else {
+            return Ok(None);
+        };
+        let FromItem::Table {
+            name: left_name,
+            alias: left_alias,
+        } = &**left
+        else {
+            return Ok(None);
+        };
+        let FromItem::Table {
+            name: right_name,
+            alias: right_alias,
+        } = &**right
+        else {
+            return Ok(None);
+        };
+        if self
+            .visible_view(left_name, NameResolutionScope::Session)
+            .is_some()
+            || self
+                .visible_view(right_name, NameResolutionScope::Session)
+                .is_some()
+            || self.visible_table_is_temporary(left_name)
+            || self.visible_table_is_temporary(right_name)
+        {
+            return Ok(None);
+        }
+
+        let left_schema = match self.table_schema(left_name) {
+            Some(table) => table,
+            None => return Ok(None),
+        };
+        let right_schema = match self.table_schema(right_name) {
+            Some(table) => table,
+            None => return Ok(None),
+        };
+        if !generated_columns_are_stored(left_schema) || !generated_columns_are_stored(right_schema)
+        {
+            return Ok(None);
+        }
+        let left_binding = TableBindingRef {
+            name: left_name,
+            alias: left_alias,
+        };
+        let right_binding = TableBindingRef {
+            name: right_name,
+            alias: right_alias,
+        };
+        let Some(join_equalities) = simple_indexed_join_constraint_equalities(
+            constraint,
+            left_binding,
+            right_binding,
+            left_schema,
+            right_schema,
+        ) else {
+            return Ok(None);
+        };
+        let Some((left_join_columns, right_join_columns)) =
+            orient_join_equalities(&join_equalities, left_binding, right_binding)
+        else {
+            return Ok(None);
+        };
+        if left_join_columns.len() != 1 || right_join_columns.len() != 1 {
+            return Ok(None);
+        }
+        let Some(left_rowid_column) = crate::exec::dml::row_id_alias_column_name(left_schema)
+        else {
+            return Ok(None);
+        };
+        let Some(right_rowid_column) = crate::exec::dml::row_id_alias_column_name(right_schema)
+        else {
+            return Ok(None);
+        };
+        if !identifiers_equal(left_join_columns[0], left_rowid_column)
+            || !identifiers_equal(right_join_columns[0], right_rowid_column)
+        {
+            return Ok(None);
+        }
+
+        let Some((filter_table, filter_column, value_expr)) = simple_btree_lookup(filter) else {
+            return Ok(None);
+        };
+        let filter_value = self.eval_expr(
+            value_expr,
+            &Dataset::empty(),
+            &[],
+            params,
+            &BTreeMap::new(),
+            None,
+        )?;
+        let Value::Int64(source_row_id) = filter_value else {
+            return Ok(None);
+        };
+
+        let source_is_left = if matches_table_binding(left_binding, filter_table)
+            && identifiers_equal(filter_column, left_rowid_column)
+        {
+            true
+        } else if matches_table_binding(right_binding, filter_table)
+            && identifiers_equal(filter_column, right_rowid_column)
+        {
+            false
+        } else {
+            return Ok(None);
+        };
+        let using_join_columns =
+            simple_indexed_join_using_columns(constraint, left_schema, right_schema);
+        let join_eval_bindings = simple_join_projection_eval_bindings(
+            left_name,
+            left_alias,
+            left_schema,
+            right_name,
+            right_alias,
+            right_schema,
+        );
+        let join_eval_dataset = Dataset::with_rows(join_eval_bindings, Vec::new());
+        let Some((projection_plan, column_names)) = simple_join_projection_plan(
+            &select.projection,
+            &join_eval_dataset,
+            left_name,
+            left_alias,
+            left_schema,
+            right_name,
+            right_alias,
+            right_schema,
+            &using_join_columns,
+        ) else {
+            return Ok(None);
+        };
+
+        let source_join_column = if source_is_left {
+            left_join_columns[0]
+        } else {
+            right_join_columns[0]
+        };
+        if let (Some(left_source), Some(right_source)) = (
+            self.visible_table_row_source(left_name),
+            self.visible_table_row_source(right_name),
+        ) {
+            let (source_source, source_schema, probe_source) = if source_is_left {
+                (left_source, left_schema, right_source)
+            } else {
+                (right_source, right_schema, left_source)
+            };
+            let Some(source_row) = source_source.row_by_id(source_row_id)? else {
+                return Ok(Some(QueryResult::with_rows(column_names, Vec::new())));
+            };
+            let Some(source_join_index) = schema_column_index(source_schema, source_join_column)
+            else {
+                return Ok(None);
+            };
+            let Some(Value::Int64(probe_row_id)) = source_row.values().get(source_join_index)
+            else {
+                return Ok(Some(QueryResult::with_rows(column_names, Vec::new())));
+            };
+            let Some(probe_row) = probe_source.row_by_id(*probe_row_id)? else {
+                return Ok(Some(QueryResult::with_rows(column_names, Vec::new())));
+            };
+            let left_values = if source_is_left {
+                source_row.values()
+            } else {
+                probe_row.values()
+            };
+            let right_values = if source_is_left {
+                probe_row.values()
+            } else {
+                source_row.values()
+            };
+            let row = project_simple_join_row(
+                self,
+                &projection_plan,
+                &join_eval_dataset,
+                Some(left_values),
+                left_schema.columns.len(),
+                Some(right_values),
+                right_schema.columns.len(),
+                params,
+            )?;
+            return Ok(Some(QueryResult::with_rows(
+                column_names,
+                vec![QueryRow::new(row)],
+            )));
+        }
+
+        let store = SnapshotPageStore {
+            pager,
+            wal,
+            snapshot_lsn,
+        };
+        let Some(left_state) = self.persisted_table_state(left_name) else {
+            return Ok(None);
+        };
+        let Some(right_state) = self.persisted_table_state(right_name) else {
+            return Ok(None);
+        };
+        let left_cache = self
+            .catalog
+            .table(left_name)
+            .and_then(|table| self.deferred_paged_row_locator_caches.get(&table.name))
+            .map(|cache| cache.as_ref());
+        let right_cache = self
+            .catalog
+            .table(right_name)
+            .and_then(|table| self.deferred_paged_row_locator_caches.get(&table.name))
+            .map(|cache| cache.as_ref());
+        if !deferred_rowid_lookup_available(
+            left_state,
+            left_schema,
+            use_persistent_pk_index,
+            left_cache,
+        ) || !deferred_rowid_lookup_available(
+            right_state,
+            right_schema,
+            use_persistent_pk_index,
+            right_cache,
+        ) {
+            return Ok(None);
+        }
+
+        let (source_state, source_schema, source_cache, probe_state, probe_schema, probe_cache) =
+            if source_is_left {
+                (
+                    left_state,
+                    left_schema,
+                    left_cache,
+                    right_state,
+                    right_schema,
+                    right_cache,
+                )
+            } else {
+                (
+                    right_state,
+                    right_schema,
+                    right_cache,
+                    left_state,
+                    left_schema,
+                    left_cache,
+                )
+            };
+        let Some(source_row) = read_deferred_stored_row_by_id(
+            &store,
+            source_state,
+            source_schema,
+            source_row_id,
+            use_persistent_pk_index,
+            source_cache,
+        )?
+        else {
+            return Ok(Some(QueryResult::with_rows(column_names, Vec::new())));
+        };
+        let Some(source_join_index) = schema_column_index(source_schema, source_join_column) else {
+            return Ok(None);
+        };
+        let join_value = source_row.values.get(source_join_index);
+        let Some(Value::Int64(probe_row_id)) = join_value else {
+            return Ok(Some(QueryResult::with_rows(column_names, Vec::new())));
+        };
+        let Some(probe_row) = read_deferred_stored_row_by_id(
+            &store,
+            probe_state,
+            probe_schema,
+            *probe_row_id,
+            use_persistent_pk_index,
+            probe_cache,
+        )?
+        else {
+            return Ok(Some(QueryResult::with_rows(column_names, Vec::new())));
+        };
+
+        let left_values = if source_is_left {
+            source_row.values.as_slice()
+        } else {
+            probe_row.values.as_slice()
+        };
+        let right_values = if source_is_left {
+            probe_row.values.as_slice()
+        } else {
+            source_row.values.as_slice()
+        };
+        let row = project_simple_join_row(
+            self,
+            &projection_plan,
+            &join_eval_dataset,
+            Some(left_values),
+            left_schema.columns.len(),
+            Some(right_values),
+            right_schema.columns.len(),
+            params,
+        )?;
+        Ok(Some(QueryResult::with_rows(
+            column_names,
+            vec![QueryRow::new(row)],
+        )))
+    }
+
     pub(crate) fn try_execute_simple_deferred_paged_query(
         &self,
         query: &Query,
@@ -8877,6 +10515,7 @@ impl EngineRuntime {
         pager: &PagerHandle,
         wal: &WalHandle,
         snapshot_lsn: u64,
+        use_persistent_pk_index: bool,
     ) -> Result<Option<QueryResult>> {
         if let Some(result) = self.try_execute_simple_deferred_paged_grouped_count_query(
             query,
@@ -8898,12 +10537,13 @@ impl EngineRuntime {
         {
             return Ok(Some(result));
         }
-        if let Some(result) = self.try_execute_simple_deferred_expression_projection_query(
+        if let Some(result) = self.try_execute_simple_deferred_rowid_join_projection_query(
             query,
             params,
             pager,
             wal,
             snapshot_lsn,
+            use_persistent_pk_index,
         )? {
             return Ok(Some(result));
         }
@@ -8926,6 +10566,16 @@ impl EngineRuntime {
             return Ok(Some(result));
         }
         if let Some(result) = self.try_execute_simple_deferred_filtered_projection_query(
+            query,
+            params,
+            pager,
+            wal,
+            snapshot_lsn,
+            use_persistent_pk_index,
+        )? {
+            return Ok(Some(result));
+        }
+        if let Some(result) = self.try_execute_simple_deferred_expression_projection_query(
             query,
             params,
             pager,
@@ -9407,6 +11057,7 @@ impl EngineRuntime {
         pager: &PagerHandle,
         wal: &WalHandle,
         snapshot_lsn: u64,
+        use_persistent_pk_index: bool,
     ) -> Result<Option<QueryResult>> {
         if !query.ctes.is_empty() {
             return Ok(None);
@@ -9505,17 +11156,6 @@ impl EngineRuntime {
             })
             .transpose()?;
 
-        let order_by = self.simple_projection_order_by_plan(
-            query,
-            table_schema,
-            name,
-            binding_name,
-            &projection_indexes,
-        )?;
-        if !query.order_by.is_empty() && order_by.is_none() {
-            return Ok(None);
-        }
-
         let limit = query
             .limit
             .as_ref()
@@ -9537,6 +11177,40 @@ impl EngineRuntime {
             wal,
             snapshot_lsn,
         };
+        let paged_locator_cache = self
+            .catalog
+            .table(name)
+            .and_then(|table| self.deferred_paged_row_locator_caches.get(&table.name))
+            .map(|cache| cache.as_ref());
+        if let Some(result) = self.try_simple_deferred_rowid_range_projection_result(
+            &store,
+            state,
+            table_schema,
+            TableBindingRef { name, alias },
+            filter_column,
+            lower_bound.as_ref(),
+            upper_bound.as_ref(),
+            &projection_indexes,
+            column_names.clone(),
+            &query.order_by,
+            limit,
+            offset,
+            use_persistent_pk_index,
+            paged_locator_cache,
+        )? {
+            return Ok(Some(result));
+        }
+
+        let order_by = self.simple_projection_order_by_plan(
+            query,
+            table_schema,
+            name,
+            binding_name,
+            &projection_indexes,
+        )?;
+        if !query.order_by.is_empty() && order_by.is_none() {
+            return Ok(None);
+        }
         Ok(Some(
             self.simple_filtered_projection_result_from_persisted_state(
                 &store,
@@ -10615,7 +12289,9 @@ impl EngineRuntime {
     ) -> Result<Dataset> {
         let has_lateral = select.from.iter().any(from_item_contains_lateral);
         let mut dataset = if !has_lateral {
-            if let Some(dataset) = self.try_indexed_scan(select, params, ctes)? {
+            if let Some(dataset) = self.try_view_filter_pushdown(select, params, ctes)? {
+                dataset
+            } else if let Some(dataset) = self.try_indexed_scan(select, params, ctes)? {
                 dataset
             } else if let Some(dataset) = self.try_spatial_join(select, params, ctes)? {
                 dataset
@@ -10643,6 +12319,98 @@ impl EngineRuntime {
         }
 
         Ok(dataset)
+    }
+
+    fn try_view_filter_pushdown(
+        &self,
+        select: &Select,
+        params: &[Value],
+        ctes: &BTreeMap<String, Dataset>,
+    ) -> Result<Option<Dataset>> {
+        let Some(filter) = select.filter.as_ref() else {
+            return Ok(None);
+        };
+        if select.from.len() != 1 {
+            return Ok(None);
+        }
+        let FromItem::Table { name, alias } = &select.from[0] else {
+            return Ok(None);
+        };
+        if ctes.contains_key(name) {
+            return Ok(None);
+        }
+        let Some(view) = self.visible_view(name, NameResolutionScope::Session) else {
+            return Ok(None);
+        };
+        let Some((table_qualifier, filter_column, value_expr)) = simple_btree_lookup(filter) else {
+            return Ok(None);
+        };
+        let view_binding = alias.as_deref().unwrap_or(name.as_str());
+        if table_qualifier.is_some_and(|table| !identifiers_equal(table, view_binding)) {
+            return Ok(None);
+        }
+
+        let view_statement = parse_sql_statement(&view.sql_text)?;
+        let Statement::Query(mut query) = view_statement else {
+            return Err(DbError::corruption(format!(
+                "view {} does not contain a SELECT statement",
+                view.name
+            )));
+        };
+        if query.recursive
+            || !query.ctes.is_empty()
+            || !query.order_by.is_empty()
+            || query.limit.is_some()
+            || query.offset.is_some()
+        {
+            return Ok(None);
+        }
+        let QueryBody::Select(view_select) = &mut query.body else {
+            return Ok(None);
+        };
+        if view_select.distinct
+            || !view_select.distinct_on.is_empty()
+            || !view_select.group_by.is_empty()
+            || view_select.having.is_some()
+            || projection_has_aggregate_items(&view_select.projection)
+        {
+            return Ok(None);
+        }
+        let Some(view_expr) =
+            view_projection_expr_for_output_column(&view_select.projection, filter_column)
+        else {
+            return Ok(None);
+        };
+        let pushed_filter = Expr::Binary {
+            left: Box::new(view_expr),
+            op: BinaryOp::Eq,
+            right: Box::new(value_expr.clone()),
+        };
+        view_select.filter = match view_select.filter.take() {
+            Some(existing) => Some(Expr::Binary {
+                left: Box::new(existing),
+                op: BinaryOp::And,
+                right: Box::new(pushed_filter),
+            }),
+            None => Some(pushed_filter),
+        };
+
+        let mut dataset = if view.temporary {
+            self.evaluate_query(&query, params, ctes)?
+        } else {
+            let persistent_runtime = self.persistent_resolution_runtime();
+            persistent_runtime.evaluate_query(&query, params, ctes)?
+        };
+        if let Some(alias) = alias {
+            for column in &mut dataset.columns {
+                column.table = Some(alias.clone());
+            }
+        } else {
+            for column in &mut dataset.columns {
+                column.table = Some(view.name.clone());
+            }
+        }
+        Ok(Some(dataset))
     }
 
     fn build_select_dataset_with_outer(
@@ -12361,6 +14129,43 @@ struct GeneralGroupedSingleTablePlan<'a> {
     distinct: bool,
     limit: Option<&'a Expr>,
     offset: Option<&'a Expr>,
+}
+
+struct IndexedJoinGroupedCountPlan<'a> {
+    parent_table_name: &'a str,
+    parent_join_column: &'a str,
+    child_index_name: String,
+    group_column_indexes: Vec<usize>,
+    column_names: Vec<String>,
+    order_by: Option<Vec<SimpleOrderByPlan>>,
+    limit: Option<usize>,
+    offset: usize,
+}
+
+#[derive(Clone, Copy)]
+struct IndexedJoinLimitTablePlan<'a> {
+    name: &'a str,
+    alias: &'a Option<String>,
+}
+
+struct IndexedJoinLimitStep {
+    previous_table_index: usize,
+    previous_column_index: usize,
+    right_index_name: String,
+}
+
+struct IndexedJoinLimitProjection {
+    table_index: usize,
+    column_index: usize,
+    column_name: String,
+}
+
+struct IndexedJoinLimitPlan<'a> {
+    tables: Vec<IndexedJoinLimitTablePlan<'a>>,
+    steps: Vec<IndexedJoinLimitStep>,
+    projections: Vec<IndexedJoinLimitProjection>,
+    limit: usize,
+    offset: usize,
 }
 
 struct BaseTableJoinPlan<'a> {
@@ -15043,12 +16848,29 @@ fn encode_appended_table_rows(data: &TableData, existing_count: usize) -> Result
     Ok(appended)
 }
 
-fn append_table_payload_from_cached(cached: Arc<Vec<u8>>, data: &TableData) -> Result<Vec<u8>> {
-    if data.rows.is_empty() {
-        return Ok(Vec::new());
+fn append_encoded_rows_to_table_payload(
+    mut previous: Vec<u8>,
+    row_count: usize,
+    appended_rows: &[u8],
+) -> Result<Vec<u8>> {
+    if appended_rows.is_empty() {
+        return Ok(previous);
     }
-    let previous = Arc::try_unwrap(cached).unwrap_or_else(|arc| arc.as_slice().to_vec());
-    append_table_payload(previous, data)
+    let count_offset = TABLE_PAYLOAD_MAGIC.len();
+    if previous.len() < count_offset + 4 {
+        return Err(DbError::corruption("table payload header is truncated"));
+    }
+    if previous[..count_offset] != *TABLE_PAYLOAD_MAGIC {
+        return Err(DbError::corruption("table payload magic is invalid"));
+    }
+
+    previous[count_offset..count_offset + 4].copy_from_slice(
+        &u32::try_from(row_count)
+            .map_err(|_| DbError::constraint("table row count exceeds u32"))?
+            .to_le_bytes(),
+    );
+    previous.extend_from_slice(appended_rows);
+    Ok(previous)
 }
 
 fn append_table_payload(mut previous: Vec<u8>, data: &TableData) -> Result<Vec<u8>> {
@@ -15875,6 +17697,22 @@ fn simple_btree_lookup(filter: &Expr) -> Option<(Option<&str>, &str, &Expr)> {
         },
         _ => None,
     }
+}
+
+fn view_projection_expr_for_output_column(items: &[SelectItem], column: &str) -> Option<Expr> {
+    for (index, item) in items.iter().enumerate() {
+        let SelectItem::Expr { expr, alias } = item else {
+            continue;
+        };
+        let output_name = alias
+            .as_deref()
+            .map(std::borrow::Cow::Borrowed)
+            .unwrap_or_else(|| std::borrow::Cow::Owned(infer_expr_name(expr, index + 1)));
+        if identifiers_equal(output_name.as_ref(), column) {
+            return Some(expr.clone());
+        }
+    }
+    None
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -17199,6 +19037,36 @@ fn simple_range_bound_matches(
     Ok(true)
 }
 
+fn simple_int64_range_start(bound: Option<&SimpleRangeBoundValue>) -> Option<i64> {
+    let Some(bound) = bound else {
+        return Some(i64::MIN);
+    };
+    let Value::Int64(value) = &bound.value else {
+        return None;
+    };
+    let value = *value;
+    if bound.inclusive {
+        Some(value)
+    } else {
+        value.checked_add(1)
+    }
+}
+
+fn simple_int64_range_end_exclusive(bound: Option<&SimpleRangeBoundValue>) -> Option<i64> {
+    let Some(bound) = bound else {
+        return Some(i64::MAX);
+    };
+    let Value::Int64(value) = &bound.value else {
+        return None;
+    };
+    let value = *value;
+    if bound.inclusive {
+        value.checked_add(1)
+    } else {
+        Some(value)
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct QualifiedColumnRef<'a> {
     table: Option<&'a str>,
@@ -17437,6 +19305,215 @@ fn simple_indexed_join_natural_columns<'a>(
         })
         .map(|column| column.name.as_str())
         .collect()
+}
+
+fn flatten_left_deep_inner_join_tables<'a>(
+    item: &'a FromItem,
+    tables: &mut Vec<IndexedJoinLimitTablePlan<'a>>,
+    constraints: &mut Vec<&'a JoinConstraint>,
+) -> bool {
+    match item {
+        FromItem::Table { name, alias } => {
+            if !tables.is_empty() {
+                return false;
+            }
+            tables.push(IndexedJoinLimitTablePlan {
+                name: name.as_str(),
+                alias,
+            });
+            true
+        }
+        FromItem::Join {
+            left,
+            right,
+            kind: JoinKind::Inner,
+            constraint,
+        } => {
+            if !flatten_left_deep_inner_join_tables(left, tables, constraints) {
+                return false;
+            }
+            let FromItem::Table { name, alias } = &**right else {
+                return false;
+            };
+            tables.push(IndexedJoinLimitTablePlan {
+                name: name.as_str(),
+                alias,
+            });
+            constraints.push(constraint);
+            true
+        }
+        _ => false,
+    }
+}
+
+fn indexed_join_group_column_indexes(
+    group_by: &[Expr],
+    binding: TableBindingRef<'_>,
+    schema: &TableSchema,
+) -> Option<Vec<usize>> {
+    group_by
+        .iter()
+        .map(|expr| {
+            let Expr::Column { table, column } = expr else {
+                return None;
+            };
+            if !matches_table_binding(binding, table.as_deref()) {
+                return None;
+            }
+            schema
+                .columns
+                .iter()
+                .position(|candidate| identifiers_equal(&candidate.name, column))
+        })
+        .collect()
+}
+
+fn indexed_join_grouped_count_is_safe(
+    expr: &Expr,
+    child_binding: TableBindingRef<'_>,
+    child_schema: &TableSchema,
+) -> bool {
+    let Expr::Aggregate {
+        name,
+        args,
+        distinct,
+        star,
+        order_by,
+        within_group,
+    } = expr
+    else {
+        return false;
+    };
+    if !name.eq_ignore_ascii_case("count") || *distinct || !order_by.is_empty() || *within_group {
+        return false;
+    }
+    if *star {
+        return args.is_empty();
+    }
+    if args.len() != 1 {
+        return false;
+    }
+    let Expr::Column { table, column } = &args[0] else {
+        return false;
+    };
+    if !matches_table_binding(child_binding, table.as_deref()) {
+        return false;
+    }
+    child_schema
+        .columns
+        .iter()
+        .find(|candidate| identifiers_equal(&candidate.name, column))
+        .is_some_and(|column| column.primary_key || !column.nullable)
+}
+
+fn indexed_join_limit_projection_column(
+    expr: &Expr,
+    tables: &[IndexedJoinLimitTablePlan<'_>],
+    runtime: &EngineRuntime,
+) -> Option<(usize, usize)> {
+    let Expr::Column {
+        table: qualifier,
+        column,
+    } = expr
+    else {
+        return None;
+    };
+    let mut matched = None;
+    let unqualified_unique = qualifier.is_none()
+        && tables
+            .iter()
+            .filter(|candidate| {
+                runtime
+                    .table_schema(candidate.name)
+                    .is_some_and(|schema| schema_column_index(schema, column).is_some())
+            })
+            .count()
+            == 1;
+    for (table_index, table_plan) in tables.iter().enumerate() {
+        let binding = TableBindingRef {
+            name: table_plan.name,
+            alias: table_plan.alias,
+        };
+        let qualifier_matches = qualifier
+            .as_deref()
+            .is_some_and(|qualifier| matches_table_binding(binding, Some(qualifier)));
+        let schema = runtime.table_schema(table_plan.name)?;
+        let Some(column_index) = schema_column_index(schema, column) else {
+            continue;
+        };
+        if (qualifier_matches || unqualified_unique)
+            && matched.replace((table_index, column_index)).is_some()
+        {
+            return None;
+        }
+    }
+    matched
+}
+
+fn indexed_join_limit_rows_for_value(
+    source: VisibleTableRowSource<'_>,
+    keys: &RuntimeBtreeKeys,
+    value: &Value,
+) -> Result<Vec<Vec<Value>>> {
+    if matches!(value, Value::Null) {
+        return Ok(Vec::new());
+    }
+    let row_ids = keys.row_ids_for_value_set(value)?;
+    let mut rows = Vec::with_capacity(row_ids.len());
+    let mut row_error = None;
+    row_ids.for_each(|row_id| {
+        if row_error.is_some() {
+            return;
+        }
+        match source.row_by_id(row_id) {
+            Ok(Some(row)) => rows.push(row.values().to_vec()),
+            Ok(None) => {}
+            Err(error) => row_error = Some(error),
+        }
+    });
+    if let Some(error) = row_error {
+        return Err(error);
+    }
+    Ok(rows)
+}
+
+fn push_indexed_join_limit_projection(
+    current_rows: &[&[Value]],
+    projections: &[IndexedJoinLimitProjection],
+    offset_remaining: &mut usize,
+    limit_remaining: &mut usize,
+    rows: &mut Vec<QueryRow>,
+) -> bool {
+    if *offset_remaining > 0 {
+        *offset_remaining -= 1;
+        return false;
+    }
+    if *limit_remaining == 0 {
+        return true;
+    }
+    let mut output = Vec::with_capacity(projections.len());
+    for projection in projections {
+        let Some(row) = current_rows.get(projection.table_index) else {
+            return true;
+        };
+        let Some(value) = row.get(projection.column_index) else {
+            return true;
+        };
+        output.push(value.clone());
+    }
+    rows.push(QueryRow::new(output));
+    *limit_remaining = (*limit_remaining).saturating_sub(1);
+    *limit_remaining == 0
+}
+
+fn indexed_join_limit_result(plan: &IndexedJoinLimitPlan<'_>, rows: Vec<QueryRow>) -> QueryResult {
+    QueryResult::with_rows(
+        plan.projections
+            .iter()
+            .map(|projection| projection.column_name.clone())
+            .collect(),
+        rows,
+    )
 }
 
 fn row_id_alias_column_name(table: &TableSchema) -> Option<&str> {
@@ -18141,6 +20218,17 @@ fn read_deferred_stored_row_by_id<S: PageStore>(
     }
 
     read_deferred_row_by_id_from_table_payload(store, state, row_id)
+}
+
+fn deferred_rowid_lookup_available(
+    state: PersistedTableState,
+    table_schema: &TableSchema,
+    use_persistent_pk_index: bool,
+    paged_locator_cache: Option<&DeferredPagedRowLocatorCache>,
+) -> bool {
+    state.pointer.is_compressed()
+        || (use_persistent_pk_index && table_schema.pk_index_root.is_some())
+        || paged_locator_cache.is_some_and(|cache| cache.matches_state(state))
 }
 
 fn read_table_payload_row_count<S: PageStore>(
@@ -27534,6 +29622,51 @@ mod tests {
     }
 
     #[test]
+    fn simple_indexed_join_filters_source_rowid_alias_without_secondary_index() {
+        let mut runtime = EngineRuntime::empty(1);
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE join_users (id INT64 PRIMARY KEY, name TEXT)",
+        );
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE join_profiles (id INT64 PRIMARY KEY, bio TEXT)",
+        );
+        for id in 1..=3 {
+            execute_sql(
+                &mut runtime,
+                &format!("INSERT INTO join_users (id, name) VALUES ({id}, 'u{id}')"),
+            );
+            execute_sql(
+                &mut runtime,
+                &format!("INSERT INTO join_profiles (id, bio) VALUES ({id}, 'b{id}')"),
+            );
+        }
+
+        let statement = parse_sql_statement(
+            "SELECT u.name, p.bio \
+             FROM join_users AS u \
+             JOIN join_profiles AS p ON u.id = p.id \
+             WHERE u.id = $1",
+        )
+        .expect("parse indexed join");
+        let crate::sql::ast::Statement::Query(query) = &statement else {
+            panic!("expected query statement");
+        };
+
+        let result = runtime
+            .try_execute_simple_indexed_join_projection_query(query, &[Value::Int64(2)])
+            .expect("execute indexed join")
+            .expect("rowid-filtered join query should stay on fast path");
+
+        assert_eq!(result.rows().len(), 1);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[Value::Text("u2".to_string()), Value::Text("b2".to_string())]
+        );
+    }
+
+    #[test]
     fn indexed_right_join_with_right_table_probe_preserves_unmatched_right_rows() {
         let mut runtime = EngineRuntime::empty(1);
         execute_sql(
@@ -29995,7 +32128,6 @@ mod tests {
         let crate::sql::ast::Statement::Query(query) = &statement else {
             panic!("expected query");
         };
-
         let result = runtime
             .try_execute_general_grouped_query(query, &[])
             .expect("execute")
@@ -30054,7 +32186,6 @@ mod tests {
         let crate::sql::ast::Statement::Query(query) = &statement else {
             panic!("expected query");
         };
-
         let result = runtime
             .try_execute_general_grouped_query(query, &[])
             .expect("execute")
@@ -30120,6 +32251,417 @@ mod tests {
                 Value::Int64(5),
             ]
         );
+    }
+
+    #[test]
+    fn simple_numeric_aggregate_without_group_streams_rows() {
+        let mut runtime = EngineRuntime::empty(1);
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE metrics (id INT64 PRIMARY KEY, val INT64)",
+        );
+        for (id, val) in [(1, 10), (2, 20), (3, 30)] {
+            execute_sql(
+                &mut runtime,
+                &format!("INSERT INTO metrics (id, val) VALUES ({id}, {val})"),
+            );
+        }
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO metrics (id, val) VALUES (4, NULL)",
+        );
+
+        let statement = parse_sql_statement(
+            "SELECT COUNT(*), SUM(val), AVG(val), MIN(val), MAX(val) FROM metrics",
+        )
+        .expect("parse");
+        let crate::sql::ast::Statement::Query(query) = &statement else {
+            panic!("expected query");
+        };
+
+        let result = runtime
+            .try_execute_simple_grouped_numeric_aggregate_query(query, &[])
+            .expect("execute")
+            .expect("simple numeric aggregate path should handle scalar aggregates");
+
+        assert_eq!(result.rows().len(), 1);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[
+                Value::Int64(4),
+                Value::Int64(60),
+                Value::Float64(20.0),
+                Value::Int64(10),
+                Value::Int64(30),
+            ]
+        );
+    }
+
+    #[test]
+    fn simple_numeric_aggregate_without_group_returns_empty_group_defaults() {
+        let mut runtime = EngineRuntime::empty(1);
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE metrics (id INT64 PRIMARY KEY, val INT64)",
+        );
+
+        let statement = parse_sql_statement(
+            "SELECT COUNT(*), SUM(val), AVG(val), MIN(val), MAX(val) \
+             FROM metrics WHERE val > 100",
+        )
+        .expect("parse");
+        let crate::sql::ast::Statement::Query(query) = &statement else {
+            panic!("expected query");
+        };
+
+        let result = runtime
+            .try_execute_simple_grouped_numeric_aggregate_query(query, &[])
+            .expect("execute")
+            .expect("simple numeric aggregate path should keep scalar empty-group semantics");
+
+        assert_eq!(result.rows().len(), 1);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[
+                Value::Int64(0),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+            ]
+        );
+    }
+
+    #[test]
+    fn simple_scalar_filtered_count_sum_uses_fast_path() {
+        let mut runtime = EngineRuntime::empty(1);
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE orders (id INT64 PRIMARY KEY, user_id INT64, amount FLOAT64)",
+        );
+        for (id, user_id, amount) in [(1, 7, 1.5), (2, 8, 10.0), (3, 7, 2.25)] {
+            execute_sql(
+                &mut runtime,
+                &format!(
+                    "INSERT INTO orders (id, user_id, amount) VALUES ({id}, {user_id}, {amount})"
+                ),
+            );
+        }
+
+        let statement =
+            parse_sql_statement("SELECT COUNT(*), SUM(amount) FROM orders WHERE user_id = $1")
+                .expect("parse");
+        let crate::sql::ast::Statement::Query(query) = &statement else {
+            panic!("expected query");
+        };
+
+        let result = runtime
+            .try_execute_simple_grouped_numeric_aggregate_query(query, &[Value::Int64(7)])
+            .expect("execute")
+            .expect("simple scalar filtered aggregate should stay on fast path");
+
+        assert_eq!(result.rows().len(), 1);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[Value::Int64(2), Value::Float64(3.75)]
+        );
+    }
+
+    #[test]
+    fn indexed_join_grouped_count_uses_child_index_counts() {
+        let mut runtime = EngineRuntime::empty(1);
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE artists (id INT64 PRIMARY KEY, name TEXT NOT NULL)",
+        );
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE songs (id INT64 PRIMARY KEY, artist_id INT64 NOT NULL, title TEXT)",
+        );
+        execute_sql(
+            &mut runtime,
+            "CREATE INDEX idx_songs_artist ON songs (artist_id)",
+        );
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO artists (id, name) VALUES (1, 'a')",
+        );
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO artists (id, name) VALUES (2, 'b')",
+        );
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO artists (id, name) VALUES (3, 'c')",
+        );
+        for (id, artist_id) in [(1, 1), (2, 1), (3, 2), (4, 2), (5, 2)] {
+            execute_sql(
+                &mut runtime,
+                &format!(
+                    "INSERT INTO songs (id, artist_id, title) VALUES ({id}, {artist_id}, 's')"
+                ),
+            );
+        }
+
+        let statement = parse_sql_statement(
+            "SELECT a.id, a.name, COUNT(s.id) AS song_count \
+             FROM artists a JOIN songs s ON s.artist_id = a.id \
+             GROUP BY a.id, a.name ORDER BY song_count DESC, a.id ASC LIMIT 2",
+        )
+        .expect("parse");
+        let crate::sql::ast::Statement::Query(query) = &statement else {
+            panic!("expected query");
+        };
+
+        let result = runtime
+            .try_execute_indexed_join_grouped_count_query(query, &[])
+            .expect("execute")
+            .expect("indexed grouped join count path should match this query");
+
+        assert_eq!(result.rows().len(), 2);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[
+                Value::Int64(2),
+                Value::Text("b".to_string()),
+                Value::Int64(3)
+            ]
+        );
+        assert_eq!(
+            result.rows()[1].values(),
+            &[
+                Value::Int64(1),
+                Value::Text("a".to_string()),
+                Value::Int64(2)
+            ]
+        );
+    }
+
+    #[test]
+    fn indexed_join_grouped_count_rejects_nullable_count_column() {
+        let mut runtime = EngineRuntime::empty(1);
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE artists (id INT64 PRIMARY KEY, name TEXT NOT NULL)",
+        );
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE songs (id INT64 PRIMARY KEY, artist_id INT64 NOT NULL, title TEXT)",
+        );
+        execute_sql(
+            &mut runtime,
+            "CREATE INDEX idx_songs_artist ON songs (artist_id)",
+        );
+
+        let statement = parse_sql_statement(
+            "SELECT a.id, COUNT(s.title) AS titled_songs \
+             FROM artists a JOIN songs s ON s.artist_id = a.id \
+             GROUP BY a.id ORDER BY titled_songs DESC",
+        )
+        .expect("parse");
+        let crate::sql::ast::Statement::Query(query) = &statement else {
+            panic!("expected query");
+        };
+
+        assert!(
+            runtime
+                .try_execute_indexed_join_grouped_count_query(query, &[])
+                .expect("analyze")
+                .is_none(),
+            "nullable COUNT(child.column) must keep general SQL semantics"
+        );
+    }
+
+    #[test]
+    fn indexed_join_limit_projection_stops_after_limit() {
+        let mut runtime = EngineRuntime::empty(1);
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE artists (id INT64 PRIMARY KEY, name TEXT NOT NULL)",
+        );
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE albums (id INT64 PRIMARY KEY, artist_id INT64 NOT NULL, title TEXT)",
+        );
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE songs (id INT64 PRIMARY KEY, album_id INT64 NOT NULL, title TEXT)",
+        );
+        execute_sql(
+            &mut runtime,
+            "CREATE INDEX idx_albums_artist ON albums (artist_id)",
+        );
+        execute_sql(
+            &mut runtime,
+            "CREATE INDEX idx_songs_album ON songs (album_id)",
+        );
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO artists (id, name) VALUES (1, 'a')",
+        );
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO artists (id, name) VALUES (2, 'b')",
+        );
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO albums (id, artist_id, title) VALUES (10, 1, 'a1')",
+        );
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO albums (id, artist_id, title) VALUES (20, 2, 'b1')",
+        );
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO songs (id, album_id, title) VALUES (100, 10, 's1')",
+        );
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO songs (id, album_id, title) VALUES (101, 10, 's2')",
+        );
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO songs (id, album_id, title) VALUES (200, 20, 's3')",
+        );
+
+        let statement = parse_sql_statement(
+            "SELECT a.id AS artist_id, a.name AS artist_name, al.title AS album_title, \
+                    s.title AS song_title \
+             FROM artists a JOIN albums al ON al.artist_id = a.id \
+             JOIN songs s ON s.album_id = al.id LIMIT 2",
+        )
+        .expect("parse");
+        let crate::sql::ast::Statement::Query(query) = &statement else {
+            panic!("expected query");
+        };
+        let result = runtime
+            .try_execute_indexed_join_limit_projection_query(query, &[])
+            .expect("execute")
+            .expect("indexed join limit projection path should match this query");
+
+        assert_eq!(result.rows().len(), 2);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[
+                Value::Int64(1),
+                Value::Text("a".to_string()),
+                Value::Text("a1".to_string()),
+                Value::Text("s1".to_string()),
+            ]
+        );
+        assert_eq!(
+            result.rows()[1].values(),
+            &[
+                Value::Int64(1),
+                Value::Text("a".to_string()),
+                Value::Text("a1".to_string()),
+                Value::Text("s2".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn view_projection_limit_pushes_into_indexed_join_chain() {
+        let mut runtime = EngineRuntime::empty(1);
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE artists (id INT64 PRIMARY KEY, name TEXT NOT NULL)",
+        );
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE albums (id INT64 PRIMARY KEY, artist_id INT64 NOT NULL, title TEXT)",
+        );
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE songs (id INT64 PRIMARY KEY, album_id INT64 NOT NULL, title TEXT)",
+        );
+        execute_sql(
+            &mut runtime,
+            "CREATE INDEX idx_albums_artist ON albums (artist_id)",
+        );
+        execute_sql(
+            &mut runtime,
+            "CREATE INDEX idx_songs_album ON songs (album_id)",
+        );
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO artists (id, name) VALUES (1, 'a')",
+        );
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO albums (id, artist_id, title) VALUES (10, 1, 'a1')",
+        );
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO songs (id, album_id, title) VALUES (100, 10, 's1')",
+        );
+        execute_sql(
+            &mut runtime,
+            "CREATE VIEW v_artist_songs AS \
+             SELECT a.id AS artist_id, a.name AS artist_name, al.title AS album_title, \
+                    s.title AS song_title \
+             FROM artists a JOIN albums al ON al.artist_id = a.id \
+             JOIN songs s ON s.album_id = al.id",
+        );
+
+        let statement = parse_sql_statement(
+            "SELECT artist_id, artist_name, album_title, song_title FROM v_artist_songs LIMIT 1",
+        )
+        .expect("parse");
+        let crate::sql::ast::Statement::Query(query) = &statement else {
+            panic!("expected query");
+        };
+
+        let result = runtime
+            .try_execute_simple_view_projection_limit_query(query, &[])
+            .expect("execute")
+            .expect("view projection limit path should match this query");
+
+        assert_eq!(result.rows().len(), 1);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[
+                Value::Int64(1),
+                Value::Text("a".to_string()),
+                Value::Text("a1".to_string()),
+                Value::Text("s1".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn rowid_range_projection_allows_order_by_unprojected_key() {
+        let mut runtime = EngineRuntime::empty(1);
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE users (id INT64 PRIMARY KEY, name TEXT NOT NULL)",
+        );
+        for id in 0..5 {
+            execute_sql(
+                &mut runtime,
+                &format!("INSERT INTO users (id, name) VALUES ({id}, 'u{id}')"),
+            );
+        }
+
+        let statement = parse_sql_statement(
+            "SELECT name FROM users WHERE id >= $1 AND id < $2 ORDER BY id LIMIT $3",
+        )
+        .expect("parse");
+        let crate::sql::ast::Statement::Query(query) = &statement else {
+            panic!("expected query");
+        };
+
+        let result = runtime
+            .try_execute_simple_filtered_projection_query(
+                query,
+                &[Value::Int64(1), Value::Int64(4), Value::Int64(2)],
+            )
+            .expect("execute")
+            .expect("rowid range projection path should handle ORDER BY id outside projection");
+
+        assert_eq!(result.rows().len(), 2);
+        assert_eq!(result.rows()[0].values(), &[Value::Text("u1".to_string())]);
+        assert_eq!(result.rows()[1].values(), &[Value::Text("u2".to_string())]);
     }
 
     #[test]

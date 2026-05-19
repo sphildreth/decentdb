@@ -52,6 +52,27 @@ pub(crate) trait VfsFile: Send + Sync + std::fmt::Debug {
     fn path(&self) -> &Path;
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize>;
     fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize>;
+    fn write_all_at_many(&self, writes: &[(u64, &[u8])]) -> Result<()> {
+        for (offset, buf) in writes {
+            let mut cursor = 0;
+            while cursor < buf.len() {
+                let written = self.write_at(*offset + cursor as u64, &buf[cursor..])?;
+                if written == 0 {
+                    return Err(DbError::io(
+                        format!(
+                            "short write on {} at offset {}: expected {} bytes, got {cursor}",
+                            self.path().display(),
+                            *offset + cursor as u64,
+                            buf.len()
+                        ),
+                        std::io::Error::new(std::io::ErrorKind::WriteZero, "short write"),
+                    ));
+                }
+                cursor += written;
+            }
+        }
+        Ok(())
+    }
     fn advise_sequential(&self) -> Result<()>;
     fn sync_data(&self) -> Result<()>;
     fn sync_metadata(&self) -> Result<()>;
@@ -165,6 +186,10 @@ pub(crate) fn write_all_at(file: &dyn VfsFile, offset: u64, buf: &[u8]) -> Resul
         cursor += written;
     }
     Ok(())
+}
+
+pub(crate) fn write_all_at_many(file: &dyn VfsFile, writes: &[(u64, &[u8])]) -> Result<()> {
+    file.write_all_at_many(writes)
 }
 
 #[cfg(test)]

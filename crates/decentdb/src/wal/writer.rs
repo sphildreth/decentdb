@@ -10,7 +10,7 @@ use crate::config::WalSyncMode;
 use crate::error::{DbError, Result};
 use crate::storage::page::PageId;
 use crate::storage::PagerHandle;
-use crate::vfs::write_all_at;
+use crate::vfs::write_all_at_many;
 
 use super::delta::encode_page_delta_into;
 use super::format::{
@@ -18,18 +18,11 @@ use super::format::{
 };
 use super::index::WalVersion;
 use super::recovery;
-use super::WalHandle;
-use super::WalWriteState;
+use super::{WalBasePage, WalHandle, WalWriteState};
 
-const WAL_PREALLOC_CHUNK_BYTES: u64 = 64 << 20;
+const WAL_PREALLOC_CHUNK_BYTES: u64 = 16 << 20;
 const COMMIT_FRAME_BYTES: [u8; FRAME_HEADER_SIZE + FRAME_TRAILER_SIZE] =
     [FrameType::Commit as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-
-#[derive(Clone)]
-struct DeltaBasePage {
-    data: Arc<[u8]>,
-    from_wal: bool,
-}
 
 pub(crate) fn commit_pages(
     wal: &WalHandle,
@@ -52,6 +45,7 @@ pub(crate) fn commit_pages(
     let WalWriteState {
         page_batch,
         prepared_pages,
+        base_pages,
         delta_scratch,
     } = &mut *writer_state;
     page_batch.clear();
@@ -59,36 +53,54 @@ pub(crate) fn commit_pages(
     let latest_snapshot = wal.latest_snapshot();
 
     // Look up all base pages under a single index lock for delta encoding.
-    let (base_pages, retain_history_hint) =
-        lookup_base_pages_batch(wal, pager, &pages, latest_snapshot)?;
+    let retain_history_hint =
+        lookup_base_pages_batch(wal, pager, &pages, latest_snapshot, base_pages)?;
 
     prepared_pages.clear();
     prepared_pages.reserve(pages.len());
     for (i, (page_id, payload)) in pages.into_iter().enumerate() {
-        let base = base_pages
-            .get(i)
-            .and_then(|b| b.as_ref())
-            .map(|base| (&base.data[..], base.from_wal));
         let frame_offset = offset + page_batch.len() as u64;
-        let (encoded_len, encoding) = append_best_page_frame_with_base(
-            page_batch,
-            delta_scratch,
-            wal,
-            page_id,
-            &payload,
-            base,
-            retain_history_hint,
-        )?;
+        let duplicate_in_batch = prepared_pages
+            .iter()
+            .any(|(prior_page_id, ..)| *prior_page_id == page_id);
+        // Delta frames are replayed against the immediately preceding page
+        // image during recovery. If a commit contains the same page twice,
+        // emit later copies as full pages so recovery and demotion never have
+        // to infer an intra-commit delta base.
+        let (encoded_len, encoding) = if duplicate_in_batch {
+            (
+                append_page_frame(page_batch, page_id, &payload, wal.inner.page_size)?,
+                FrameEncoding::Page,
+            )
+        } else {
+            let base = base_pages
+                .get(i)
+                .and_then(|b| b.as_ref())
+                .map(|(data, from_wal)| (&data[..], *from_wal));
+            append_best_page_frame_with_base(
+                page_batch,
+                delta_scratch,
+                wal,
+                page_id,
+                &payload,
+                base,
+                retain_history_hint,
+            )?
+        };
         prepared_pages.push((page_id, payload, encoded_len, encoding, frame_offset));
     }
+    base_pages.clear();
     let commit_start_lsn = offset;
     page_batch.extend_from_slice(&COMMIT_FRAME_BYTES);
     let new_offset = offset + page_batch.len() as u64;
     let metadata_changed = ensure_capacity(wal, new_offset)?;
-    write_all_at(wal.inner.file.as_ref(), offset, page_batch.as_slice())?;
+    let end_offset_bytes = new_offset.to_le_bytes();
+    write_all_at_many(
+        wal.inner.file.as_ref(),
+        &[(offset, page_batch.as_slice()), (16, &end_offset_bytes)],
+    )?;
     // Publish the logical end only after the frame bytes are in place so a
     // concurrent opener never trusts a WAL tail that has not been written yet.
-    recovery::persist_header(&wal.inner.file, wal.inner.page_size, new_offset)?;
     offset = new_offset;
     sync_for_mode(wal, metadata_changed, new_offset)?;
 
@@ -131,6 +143,9 @@ pub(crate) fn commit_pages(
                 ),
                 retain_history,
             );
+            if !retain_history && wal.inner.resident_versions_per_page > 0 {
+                index.unmark_dirty_since_demote(page_id);
+            }
         }
         // Update wal_end_lsn inside the index lock so that begin_reader()
         // (which also holds the index lock) always sees a wal_end_lsn
@@ -195,41 +210,58 @@ pub(crate) fn commit_pages_if_latest(
     let WalWriteState {
         page_batch,
         prepared_pages,
+        base_pages,
         delta_scratch,
     } = &mut *writer_state;
     page_batch.clear();
     page_batch.reserve(page_frame_len * pages.len() + COMMIT_FRAME_BYTES.len());
 
     // Look up all base pages under a single index lock for delta encoding.
-    let (base_pages, retain_history_hint) = lookup_base_pages_batch(wal, pager, &pages, latest)?;
+    let retain_history_hint = lookup_base_pages_batch(wal, pager, &pages, latest, base_pages)?;
 
     prepared_pages.clear();
     prepared_pages.reserve(pages.len());
     for (i, (page_id, payload)) in pages.into_iter().enumerate() {
-        let base = base_pages
-            .get(i)
-            .and_then(|b| b.as_ref())
-            .map(|base| (&base.data[..], base.from_wal));
         let frame_offset = offset + page_batch.len() as u64;
-        let (encoded_len, encoding) = append_best_page_frame_with_base(
-            page_batch,
-            delta_scratch,
-            wal,
-            page_id,
-            &payload,
-            base,
-            retain_history_hint,
-        )?;
+        let duplicate_in_batch = prepared_pages
+            .iter()
+            .any(|(prior_page_id, ..)| *prior_page_id == page_id);
+        // See commit_pages: duplicate pages in one commit must not encode a
+        // delta against the pre-commit base.
+        let (encoded_len, encoding) = if duplicate_in_batch {
+            (
+                append_page_frame(page_batch, page_id, &payload, wal.inner.page_size)?,
+                FrameEncoding::Page,
+            )
+        } else {
+            let base = base_pages
+                .get(i)
+                .and_then(|b| b.as_ref())
+                .map(|(data, from_wal)| (&data[..], *from_wal));
+            append_best_page_frame_with_base(
+                page_batch,
+                delta_scratch,
+                wal,
+                page_id,
+                &payload,
+                base,
+                retain_history_hint,
+            )?
+        };
         prepared_pages.push((page_id, payload, encoded_len, encoding, frame_offset));
     }
+    base_pages.clear();
     let commit_start_lsn = offset;
     page_batch.extend_from_slice(&COMMIT_FRAME_BYTES);
     let new_offset = offset + page_batch.len() as u64;
     let metadata_changed = ensure_capacity(wal, new_offset)?;
-    write_all_at(wal.inner.file.as_ref(), offset, page_batch.as_slice())?;
+    let end_offset_bytes = new_offset.to_le_bytes();
+    write_all_at_many(
+        wal.inner.file.as_ref(),
+        &[(offset, page_batch.as_slice()), (16, &end_offset_bytes)],
+    )?;
     // Publish the logical end only after the frame bytes are in place so a
     // concurrent opener never trusts a WAL tail that has not been written yet.
-    recovery::persist_header(&wal.inner.file, wal.inner.page_size, new_offset)?;
     offset = new_offset;
     sync_for_mode(wal, metadata_changed, new_offset)?;
 
@@ -272,6 +304,9 @@ pub(crate) fn commit_pages_if_latest(
                 ),
                 retain_history,
             );
+            if !retain_history && wal.inner.resident_versions_per_page > 0 {
+                index.unmark_dirty_since_demote(page_id);
+            }
         }
         // Update wal_end_lsn inside the index lock — same rationale as
         // commit_pages above.
@@ -300,8 +335,11 @@ pub(crate) fn append_checkpoint_frame(wal: &WalHandle, checkpoint_lsn: u64) -> R
     let bytes = frame.encode(wal.inner.page_size)?;
     let new_offset = offset + bytes.len() as u64;
     let metadata_changed = ensure_capacity(wal, new_offset)?;
-    write_all_at(wal.inner.file.as_ref(), offset, &bytes)?;
-    recovery::persist_header(&wal.inner.file, wal.inner.page_size, new_offset)?;
+    let end_offset_bytes = new_offset.to_le_bytes();
+    write_all_at_many(
+        wal.inner.file.as_ref(),
+        &[(offset, bytes.as_slice()), (16, &end_offset_bytes)],
+    )?;
     offset = new_offset;
     // Checkpoint frames are a critical recovery boundary: even under
     // AsyncCommit, we want them durable before advancing wal_end_lsn so
@@ -391,12 +429,10 @@ fn append_page_frame(
         )));
     }
     let frame_len = FRAME_HEADER_SIZE + payload.len() + FRAME_TRAILER_SIZE;
-    let start = output.len();
-    output.resize(start + frame_len, 0);
-    output[start] = FrameType::Page as u8;
-    output[start + 1..start + FRAME_HEADER_SIZE].copy_from_slice(&page_id.to_le_bytes());
-    let payload_start = start + FRAME_HEADER_SIZE;
-    output[payload_start..payload_start + payload.len()].copy_from_slice(payload);
+    output.push(FrameType::Page as u8);
+    output.extend_from_slice(&page_id.to_le_bytes());
+    output.extend_from_slice(payload);
+    output.extend_from_slice(&[0_u8; FRAME_TRAILER_SIZE]);
     Ok(frame_len)
 }
 
@@ -409,8 +445,17 @@ fn append_best_page_frame_with_base(
     base_page: Option<(&[u8], bool)>,
     _retain_history_hint: bool,
 ) -> Result<(usize, FrameEncoding)> {
+    // Page 1 carries the fixed database header and is also updated directly
+    // when the schema cookie changes. Replaying old header deltas against a
+    // newer on-disk header is unsafe, so keep header WAL frames self-contained.
+    if page_id == crate::storage::page::HEADER_PAGE_ID {
+        return append_page_frame(output, page_id, payload, wal.inner.page_size)
+            .map(|len| (len, FrameEncoding::Page));
+    }
     if let Some((base, from_wal)) = base_page {
-        if !from_wal && encode_page_delta_into(delta_scratch, base, payload) {
+        if (!from_wal || can_encode_against_resident_wal_base(wal))
+            && encode_page_delta_into(delta_scratch, base, payload)
+        {
             return append_page_delta_frame(output, page_id, delta_scratch)
                 .map(|len| (len, FrameEncoding::PageDelta));
         }
@@ -425,7 +470,8 @@ fn lookup_base_pages_batch(
     pager: &PagerHandle,
     pages: &[(PageId, Vec<u8>)],
     snapshot_lsn: u64,
-) -> Result<(Vec<Option<DeltaBasePage>>, bool)> {
+    output: &mut Vec<WalBasePage>,
+) -> Result<bool> {
     let index = wal
         .inner
         .index
@@ -433,27 +479,24 @@ fn lookup_base_pages_batch(
         .expect("wal index lock should not be poisoned");
     let retain_history_hint = wal.inner.reader_registry.active_reader_count()? > 0
         || wal.retained_snapshot_lsn().is_some();
-    let pages = pages
-        .iter()
-        .map(|(page_id, _)| {
-            if let Some(page) =
-                wal.materialize_latest_visible_locked(&index, pager, *page_id, snapshot_lsn)?
-            {
-                Ok(Some(DeltaBasePage {
-                    data: page,
-                    from_wal: true,
-                }))
-            } else if let Ok(page) = pager.read_page(*page_id) {
-                Ok(Some(DeltaBasePage {
-                    data: page,
-                    from_wal: false,
-                }))
-            } else {
-                Ok(None)
-            }
-        })
-        .collect::<Result<Vec<_>>>()?;
-    Ok((pages, retain_history_hint))
+    output.clear();
+    output.reserve(pages.len());
+    for (page_id, _) in pages {
+        if let Some(page) =
+            wal.materialize_latest_visible_locked(&index, pager, *page_id, snapshot_lsn)?
+        {
+            output.push(Some((page, true)));
+        } else if let Ok(page) = pager.read_page(*page_id) {
+            output.push(Some((page, false)));
+        } else {
+            output.push(None);
+        }
+    }
+    Ok(retain_history_hint)
+}
+
+fn can_encode_against_resident_wal_base(wal: &WalHandle) -> bool {
+    wal.inner.resident_versions_per_page > 0 && wal.inner.wal_index_hot_set_pages == 0
 }
 
 fn demote_cold_versions(wal: &WalHandle) -> Result<()> {
@@ -545,12 +588,10 @@ fn append_page_delta_frame(output: &mut Vec<u8>, page_id: PageId, payload: &[u8]
         ));
     }
     let frame_len = FRAME_HEADER_SIZE + payload.len() + FRAME_TRAILER_SIZE;
-    let start = output.len();
-    output.resize(start + frame_len, 0);
-    output[start] = FrameType::PageDelta as u8;
-    output[start + 1..start + FRAME_HEADER_SIZE].copy_from_slice(&page_id.to_le_bytes());
-    let payload_start = start + FRAME_HEADER_SIZE;
-    output[payload_start..payload_start + payload.len()].copy_from_slice(payload);
+    output.push(FrameType::PageDelta as u8);
+    output.extend_from_slice(&page_id.to_le_bytes());
+    output.extend_from_slice(payload);
+    output.extend_from_slice(&[0_u8; FRAME_TRAILER_SIZE]);
     Ok(frame_len)
 }
 

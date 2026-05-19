@@ -154,6 +154,15 @@ public class AdoNetLayerTests : IDisposable
     }
 
     [Fact]
+    public void DecentDBConnection_Open_AppliesNativeOptions()
+    {
+        var connStr = $"Data Source={_dbPath};Cache Size=64MB;Retain Paged Row Sources After Commit=True;Paged Row Storage=False;WAL Auto Checkpoint=0";
+        using var conn = new DecentDBConnection(connStr);
+        conn.Open();
+        Assert.Equal(ConnectionState.Open, conn.State);
+    }
+
+    [Fact]
     public void DecentDBConnection_ParseConnectionString_WithDifferentDataSourceKeys()
     {
         // Test different variations of data source key

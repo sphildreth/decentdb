@@ -2942,8 +2942,18 @@ mod tests {
         db.execute("INSERT INTO t VALUES (1, 'a')").expect("insert");
         db.execute("CREATE INDEX t_v ON t(v)")
             .expect("create index");
-        // Invalidate the index by rebuilding it, which shouldn't mark it stale.
         drop(db);
+        // Fix-mode reports should carry planned/applied fixes when a fixable
+        // finding exists. The default WAL preallocation is now intentionally
+        // below the doctor "large WAL" threshold, so extend this test WAL
+        // explicitly instead of depending on default allocation size.
+        let wal_path = path.with_extension("ddb.wal");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&wal_path)
+            .expect("open wal")
+            .set_len(WAL_LARGE_FILE_BYTES)
+            .expect("extend wal");
 
         let report = run_doctor(
             &path,

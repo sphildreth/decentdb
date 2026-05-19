@@ -127,6 +127,7 @@ fn aggregate_stddev_and_variance() {
         )
         .unwrap();
     let values = r.rows()[0].values();
+    assert_eq!(values.len(), 6);
     assert_float_close(&values[0], 1.5811388300841898);
     assert_float_close(&values[1], std::f64::consts::SQRT_2);
     assert_float_close(&values[2], 2.5);

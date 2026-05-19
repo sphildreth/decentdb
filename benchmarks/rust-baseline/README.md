@@ -50,15 +50,31 @@ cargo build --release
 ./target/release/rust-baseline --scale medium
 ./target/release/rust-baseline --scale full
 ./target/release/rust-baseline --scale huge
+./target/release/rust-baseline --scale full --profile resident-hot-read
 ./target/release/rust-baseline --report
 ./target/release/rust-baseline --report --report-file /tmp/rust-baseline-report.html
 ```
 
+## Profiles
+
+The default profile uses `DbConfig::default()`: durable WAL, deferred table
+materialization, and paged row storage with post-commit re-deferral. It is the
+low-memory profile and should remain the default historical comparison.
+
+`--profile resident-hot-read` is a durable tuned profile for workloads that bulk
+load data and immediately run read-heavy analytics on the same handle. It sets
+`retain_paged_row_sources_after_commit=true`, keeping just-written paged row
+sources resident after commit instead of dropping them back to the deferred set.
+This is a fair profile only when reported separately from default because it
+trades higher process memory for lower repeated read cost.
+
 ## Results
 
-JSON reports are written to `results/<datetime>-rust-baseline-<scale>.json` where
-`<datetime>` is `YYYY-MM-DD-HHMM` (e.g., `2026-04-26-1430`). This timestamped
-naming enables historical comparisons across multiple runs:
+JSON reports are written to
+`results/<datetime>-rust-baseline-<profile>-<scale>.json` where `<datetime>` is
+`YYYY-MM-DD-HHMM` (e.g., `2026-04-26-1430`). Older checked-in reports omit the
+profile segment and are treated as the default profile. This timestamped naming
+enables historical comparisons across multiple runs:
 
 ```
 results/

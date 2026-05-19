@@ -24,14 +24,18 @@ OUT_SPEEDUP = ROOT / "assets" / "decentdb-speedup.png"
 BASELINE_ENGINE = "sqlite"
 
 METRICS = [
-    ("read_p95_ms", "Read Latency", "lower"),
-    ("join_p95_ms", "Join Latency", "lower"),
-    ("commit_p95_ms", "Commit Latency", "lower"),
-    ("insert_rows_per_sec", "Insert Throughput", "higher"),
+    ("read_p95_ms", "Point read p95 (ms)", "lower"),
+    ("join_p95_ms", "Join p95 (ms)", "lower"),
+    ("range_scan_p95_ms", "Range scan p95 (ms)", "lower"),
+    ("aggregate_p95_ms", "Aggregate p95 (ms)", "lower"),
+    ("concurrent_read_p95_ms", "Concurrent read p95 (ms)", "lower"),
+    ("commit_p95_ms", "Commit p95 (ms)", "lower"),
+    ("insert_rows_per_sec", "Insert throughput (rows/s)", "higher"),
 ]
 
 ENGINE_LABELS = {
-    "decentdb": "DecentDB",
+    "decentdb_default_durable": "DecentDB (default durable)",
+    "decentdb_tuned_durable": "DecentDB (tuned durable)",
     "duckdb": "DuckDB",
     "sqlite": "SQLite",
 }
@@ -44,7 +48,8 @@ def display_engine_name(engine: str) -> str:
 def ordered_display_engines(engines: list[str]) -> list[str]:
     engine_set = set(engines)
     preferred = [
-        display_engine_name("decentdb"),
+        display_engine_name("decentdb_tuned_durable"),
+        display_engine_name("decentdb_default_durable"),
         display_engine_name(BASELINE_ENGINE),
         display_engine_name("duckdb"),
         "H2",
@@ -90,31 +95,36 @@ def normalize_radar(engines: dict[str, dict[str, object]]) -> tuple[list[tuple[s
     if not metrics:
         raise SystemExit("No plottable metrics found for radar chart.")
 
+    metric_index = {key: idx for idx, (key, _, _) in enumerate(metrics)}
     normalized: dict[str, list[float]] = {}
     for engine, values in engines.items():
         display_name = display_engine_name(engine)
-        normalized[display_name] = []
+        normalized[display_name] = [math.nan for _ in metrics]
         for key, _, direction in metrics:
             candidates = [
                 to_float(candidate_values.get(key))
                 for candidate_values in engines.values()
             ]
-            finite = [candidate for candidate in candidates if candidate is not None]
+            finite = [
+                candidate for candidate in candidates if candidate is not None and candidate > 0.0
+            ]
             if not finite:
-                normalized[display_name].append(math.nan)
                 continue
 
             value = to_float(values.get(key))
             if value is None:
-                normalized[display_name].append(math.nan)
                 continue
+            if value <= 0.0:
+                continue
+
+            idx = metric_index[key]
 
             if direction == "lower":
                 best_value = min(finite)
-                normalized[display_name].append(best_value / value if value > 0 else math.nan)
+                normalized[display_name][idx] = best_value / value
             else:
                 best_value = max(finite)
-                normalized[display_name].append(value / best_value if best_value > 0 else math.nan)
+                normalized[display_name][idx] = value / best_value
 
     return metrics, normalized
 
@@ -144,12 +154,36 @@ def plot_radar(engines: dict[str, dict[str, object]]) -> None:
         ["C0", "C1", "C2", "C3", "C4", "C5", "C6"],
     )
 
-    for index, engine in enumerate(ordered_display_engines(list(normalized.keys()))):
-        values = [0.0 if math.isnan(value) else value for value in normalized[engine]]
-        values += values[:1]
+    engines_for_radar = ordered_display_engines(list(normalized.keys()))
+    complete_engines = [
+        engine
+        for engine in engines_for_radar
+        if engine in normalized and all(not math.isnan(value) for value in normalized[engine])
+    ]
+    incomplete_engines = [
+        engine for engine in engines_for_radar if engine in normalized and engine not in complete_engines
+    ]
+    if incomplete_engines:
+        print(
+            "Skipping these engines from radar due incomplete metric coverage: "
+            + ", ".join(incomplete_engines)
+        )
+
+    for index, engine in enumerate(complete_engines):
+        values = normalized[engine]
+        wrapped = np.array(values + values[:1], dtype=float)
         color = colors[index % len(colors)]
-        ax.plot(angles, values, linewidth=2, linestyle="solid", label=engine, color=color)
-        ax.fill(angles, values, color, alpha=0.1)
+        ax.plot(
+            angles,
+            wrapped,
+            linewidth=2,
+            linestyle="solid",
+            label=engine,
+            color=color,
+        )
+        if not np.all(np.isnan(wrapped)):
+            fill = np.ma.array(wrapped, mask=np.isnan(wrapped))
+            ax.fill(angles, fill, color, alpha=0.1)
 
     plt.title("Overall Performance (Outer is Better)", size=16, y=1.1)
     plt.legend(loc="upper right", bbox_to_anchor=(0.1, 1.1))
@@ -198,10 +232,25 @@ def plot_speedup(engines: dict[str, dict[str, object]]) -> None:
     for index, engine in enumerate(engine_names):
         values = np.array(normalized[engine], dtype=float)
         y_pos = positions + (len(engine_names) - 1 - index) * height
-        ax.barh(y_pos, values, height, label=engine)
+        first_bar = True
         for metric_index, value in enumerate(values):
-            if not math.isnan(float(value)):
-                ax.text(float(value) + 0.05, y_pos[metric_index], f"{float(value):.2f}x", va="center", size=9)
+            if math.isnan(float(value)):
+                ax.text(0.02, y_pos[metric_index], "n/a", va="center", size=9, color="gray")
+            else:
+                ax.barh(
+                    y_pos[metric_index],
+                    float(value),
+                    height,
+                    label=engine if first_bar else None,
+                )
+                first_bar = False
+                ax.text(
+                    float(value) + 0.05,
+                    y_pos[metric_index],
+                    f"{float(value):.2f}x",
+                    va="center",
+                    size=9,
+                )
 
     baseline_label = display_engine_name(BASELINE_ENGINE)
     ax.axvline(
@@ -214,6 +263,7 @@ def plot_speedup(engines: dict[str, dict[str, object]]) -> None:
 
     ax.set_yticks(positions + height * (len(engine_names) - 1) / 2)
     ax.set_yticklabels(labels)
+    ax.set_xlim(left=0)
     ax.set_xlabel(f"Speedup / Efficiency vs {baseline_label} (Higher is Better)")
     ax.set_title(f"Relative Performance vs {baseline_label}")
     ax.legend()

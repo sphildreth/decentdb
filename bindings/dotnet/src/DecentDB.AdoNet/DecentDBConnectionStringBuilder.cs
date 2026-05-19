@@ -14,6 +14,10 @@ public sealed class DecentDBConnectionStringBuilder : DbConnectionStringBuilder
     private const string LogLevelKey = "LogLevel";
     private const string CommandTimeoutKey = "Command Timeout";
     private const string PoolingKey = "Pooling";
+    private const string RetainPagedRowSourcesAfterCommitKey = "Retain Paged Row Sources After Commit";
+    private const string PagedRowStorageKey = "Paged Row Storage";
+    private const string PersistentPkIndexKey = "Persistent PK Index";
+    private const string WalAutoCheckpointKey = "WAL Auto Checkpoint";
 
     public DecentDBConnectionStringBuilder()
     {
@@ -44,6 +48,46 @@ public sealed class DecentDBConnectionStringBuilder : DbConnectionStringBuilder
         {
             if (value == null) Remove(CacheSizeKey);
             else this[CacheSizeKey] = value;
+        }
+    }
+
+    /// <summary>
+    /// Keeps paged row sources resident after commits on this handle. Optional; engine default is <c>false</c>.
+    /// </summary>
+    public bool? RetainPagedRowSourcesAfterCommit
+    {
+        get => GetNullableBool(RetainPagedRowSourcesAfterCommitKey);
+        set => SetNullableBool(RetainPagedRowSourcesAfterCommitKey, value);
+    }
+
+    /// <summary>
+    /// Enables paged row storage. Optional; engine default is <c>true</c>.
+    /// </summary>
+    public bool? PagedRowStorage
+    {
+        get => GetNullableBool(PagedRowStorageKey);
+        set => SetNullableBool(PagedRowStorageKey, value);
+    }
+
+    /// <summary>
+    /// Enables the persistent primary-key locator index. Optional; engine default is <c>false</c>.
+    /// </summary>
+    public bool? PersistentPkIndex
+    {
+        get => GetNullableBool(PersistentPkIndexKey);
+        set => SetNullableBool(PersistentPkIndexKey, value);
+    }
+
+    /// <summary>
+    /// WAL auto-checkpoint page threshold. Use <c>0</c> to disable. Optional.
+    /// </summary>
+    public string? WalAutoCheckpoint
+    {
+        get => TryGetValue(WalAutoCheckpointKey, out var v) ? (string)v : null;
+        set
+        {
+            if (value == null) Remove(WalAutoCheckpointKey);
+            else this[WalAutoCheckpointKey] = value;
         }
     }
 
@@ -99,5 +143,29 @@ public sealed class DecentDBConnectionStringBuilder : DbConnectionStringBuilder
             return true;
         }
         set => this[PoolingKey] = value ? "True" : "False";
+    }
+
+    private bool? GetNullableBool(string key)
+    {
+        if (!TryGetValue(key, out var v) || v is not string s)
+        {
+            return null;
+        }
+
+        if (bool.TryParse(s, out var b)) return b;
+        if (s == "1") return true;
+        if (s == "0") return false;
+        return null;
+    }
+
+    private void SetNullableBool(string key, bool? value)
+    {
+        if (value == null)
+        {
+            Remove(key);
+            return;
+        }
+
+        this[key] = value.Value ? "True" : "False";
     }
 }

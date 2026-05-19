@@ -15,6 +15,10 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <InternalsVisibleTo Include="DecentDB.AdoNet" />
+  </ItemGroup>
+
+  <ItemGroup>
     <Content Include="$(DecentDBLinuxRuntimeAssetSource)"
              Condition="'$(DecentDBLinuxRuntimeAssetSource)' != '' and Exists('$(DecentDBLinuxRuntimeAssetSource)')">
       <TargetPath>libdecentdb.so</TargetPath>

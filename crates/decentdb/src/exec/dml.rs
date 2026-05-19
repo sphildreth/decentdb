@@ -73,6 +73,7 @@ pub(crate) enum PreparedSimpleValueSource {
 #[derive(Clone, Debug)]
 pub(crate) struct PreparedSimpleInsert {
     pub(crate) table_name: String,
+    pub(crate) row_source_dependency_tables: Vec<String>,
     pub(crate) columns: Vec<PreparedInsertColumn>,
     pub(crate) primary_auto_row_id_column_index: Option<usize>,
     pub(crate) value_sources: Vec<PreparedInsertValueSource>,
@@ -82,6 +83,8 @@ pub(crate) struct PreparedSimpleInsert {
     pub(crate) insert_indexes: Vec<PreparedBtreeIndex>,
     pub(crate) use_generic_validation: bool,
     pub(crate) use_generic_index_updates: bool,
+    pub(crate) direct_positional_param_count: Option<usize>,
+    pub(crate) has_auto_increment: bool,
     pub(crate) compiled_index_state_epoch: u64,
 }
 
@@ -127,7 +130,7 @@ impl EngineRuntime {
         table: &crate::catalog::TableSchema,
         values: &[Value],
     ) {
-        if table.temporary || sync::is_internal_table_name(&table.name) {
+        if !self.should_record_sync_mutation_for_table(table) {
             return;
         }
         let pk = sync::build_primary_key_json(table, values);
@@ -146,7 +149,7 @@ impl EngineRuntime {
         table: &crate::catalog::TableSchema,
         values: &[Value],
     ) {
-        if table.temporary || sync::is_internal_table_name(&table.name) {
+        if !self.should_record_sync_mutation_for_table(table) {
             return;
         }
         let pk = sync::build_primary_key_json(table, values);
@@ -605,6 +608,26 @@ impl EngineRuntime {
                 })
             })
             .collect::<Vec<_>>();
+        let direct_positional_param_count = if value_sources
+            .iter()
+            .enumerate()
+            .all(|(index, source)| {
+                matches!(source, PreparedInsertValueSource::Parameter(position) if *position == index + 1)
+            }) {
+            Some(value_sources.len())
+        } else {
+            None
+        };
+        let has_auto_increment = columns.iter().any(|column| column.auto_increment);
+        let mut row_source_dependency_tables: Vec<String> = Vec::new();
+        for foreign_key in &table.foreign_keys {
+            if !row_source_dependency_tables
+                .iter()
+                .any(|name| identifiers_equal(name, &foreign_key.referenced_table))
+            {
+                row_source_dependency_tables.push(foreign_key.referenced_table.clone());
+            }
+        }
         let mut use_generic_validation =
             table.columns.iter().any(|column| !column.checks.is_empty())
                 || !table.checks.is_empty();
@@ -642,7 +665,8 @@ impl EngineRuntime {
         }
 
         Ok(Some(PreparedSimpleInsert {
-            table_name: statement.table_name.clone(),
+            table_name: table.name.clone(),
+            row_source_dependency_tables,
             columns,
             primary_auto_row_id_column_index,
             value_sources,
@@ -652,6 +676,8 @@ impl EngineRuntime {
             insert_indexes,
             use_generic_validation,
             use_generic_index_updates,
+            direct_positional_param_count,
+            has_auto_increment,
             compiled_index_state_epoch: self.index_state_epoch,
         }))
     }
@@ -796,26 +822,27 @@ impl EngineRuntime {
                         row_id,
                         &updated_values,
                     );
-                    let sync_info = self
-                        .catalog
-                        .table(prepared.table_name.as_str())
-                        .filter(|s| !s.temporary && !sync::is_internal_table_name(&s.name))
-                        .map(|schema| {
-                            (
-                                sync::build_primary_key_json(schema, &updated_values),
-                                sync::build_after_json(schema, &updated_values),
-                                schema.primary_key_columns.clone(),
-                            )
-                        });
-                    if let Some((pk, after, _)) = sync_info {
-                        let schema_cookie = self.catalog.schema_cookie;
-                        self.record_sync_mutation(
-                            &prepared.table_name,
-                            SyncOperation::Update,
-                            pk,
-                            Some(after),
-                            schema_cookie,
-                        );
+                    if self.sync_capture_active() {
+                        let sync_info = self
+                            .catalog
+                            .table(prepared.table_name.as_str())
+                            .filter(|schema| self.should_record_sync_mutation_for_table(schema))
+                            .map(|schema| {
+                                (
+                                    sync::build_primary_key_json(schema, &updated_values),
+                                    sync::build_after_json(schema, &updated_values),
+                                )
+                            });
+                        if let Some((pk, after)) = sync_info {
+                            let schema_cookie = self.catalog.schema_cookie;
+                            self.record_sync_mutation(
+                                &prepared.table_name,
+                                SyncOperation::Update,
+                                pk,
+                                Some(after),
+                                schema_cookie,
+                            );
+                        }
                     }
                 }
                 Ok(QueryResult::with_affected_rows(1))
@@ -845,25 +872,27 @@ impl EngineRuntime {
                         TableRowSource::Paged(Arc::new(updated_manifest)),
                     )?;
                     self.mark_table_dirty(&prepared.table_name);
-                    let sync_data = self
-                        .catalog
-                        .table(prepared.table_name.as_str())
-                        .filter(|s| !s.temporary && !sync::is_internal_table_name(&s.name))
-                        .map(|schema| {
-                            (
-                                sync::build_primary_key_json(schema, &updated_values),
-                                sync::build_after_json(schema, &updated_values),
-                            )
-                        });
-                    if let Some((pk, after)) = sync_data {
-                        let schema_cookie = self.catalog.schema_cookie;
-                        self.record_sync_mutation(
-                            &prepared.table_name,
-                            SyncOperation::Update,
-                            pk,
-                            Some(after),
-                            schema_cookie,
-                        );
+                    if self.sync_capture_active() {
+                        let sync_data = self
+                            .catalog
+                            .table(prepared.table_name.as_str())
+                            .filter(|schema| self.should_record_sync_mutation_for_table(schema))
+                            .map(|schema| {
+                                (
+                                    sync::build_primary_key_json(schema, &updated_values),
+                                    sync::build_after_json(schema, &updated_values),
+                                )
+                            });
+                        if let Some((pk, after)) = sync_data {
+                            let schema_cookie = self.catalog.schema_cookie;
+                            self.record_sync_mutation(
+                                &prepared.table_name,
+                                SyncOperation::Update,
+                                pk,
+                                Some(after),
+                                schema_cookie,
+                            );
+                        }
                     }
                 }
                 Ok(QueryResult::with_affected_rows(1))
@@ -1083,7 +1112,7 @@ impl EngineRuntime {
         }
 
         self.mark_table_dirty(&prepared.table.name);
-        if !prepared.table.temporary && !sync::is_internal_table_name(&prepared.table.name) {
+        if self.should_record_sync_mutation_for_table(&prepared.table) {
             for row in &removed_rows {
                 let pk = sync::build_primary_key_json(&prepared.table, &row.values);
                 self.record_sync_mutation(
@@ -1176,7 +1205,12 @@ impl EngineRuntime {
 
             candidate.push(super::cast_value(value, column.column_type)?);
         }
-        let candidate_clone = candidate.clone();
+        let sync_schema = self
+            .catalog
+            .table(prepared.table_name.as_str())
+            .filter(|schema| self.should_record_sync_mutation_for_table(schema))
+            .cloned();
+        let candidate_clone = sync_schema.as_ref().map(|_| candidate.clone());
         let affected = self.apply_prepared_simple_insert_candidate(
             prepared,
             candidate,
@@ -1185,17 +1219,9 @@ impl EngineRuntime {
             page_size,
         )?;
         if affected > 0 {
-            let sync_data = self
-                .catalog
-                .table(prepared.table_name.as_str())
-                .filter(|s| !s.temporary && !sync::is_internal_table_name(&s.name))
-                .map(|schema| {
-                    (
-                        sync::build_primary_key_json(schema, &candidate_clone),
-                        sync::build_after_json(schema, &candidate_clone),
-                    )
-                });
-            if let Some((pk, after)) = sync_data {
+            if let (Some(schema), Some(values)) = (sync_schema.as_ref(), candidate_clone.as_ref()) {
+                let pk = sync::build_primary_key_json(schema, values);
+                let after = sync::build_after_json(schema, values);
                 let schema_cookie = self.catalog.schema_cookie;
                 self.record_sync_mutation(
                     &prepared.table_name,
@@ -1230,30 +1256,37 @@ impl EngineRuntime {
             )));
         }
 
-        for (param, column) in params.iter_mut().zip(&prepared.columns) {
-            let mut value = std::mem::replace(param, Value::Null);
+        if prepared.has_auto_increment {
+            for (param, column) in params.iter_mut().zip(&prepared.columns) {
+                let mut value = std::mem::replace(param, Value::Null);
 
-            if column.auto_increment {
-                match value {
-                    Value::Null => {
-                        value = Value::Int64(next_row_id);
-                        next_row_id += 1;
-                    }
-                    Value::Int64(explicit) => {
-                        if explicit >= next_row_id {
-                            next_row_id = explicit + 1;
+                if column.auto_increment {
+                    match value {
+                        Value::Null => {
+                            value = Value::Int64(next_row_id);
+                            next_row_id += 1;
+                        }
+                        Value::Int64(explicit) => {
+                            if explicit >= next_row_id {
+                                next_row_id = explicit + 1;
+                            }
+                        }
+                        _ => {
+                            return Err(DbError::constraint(format!(
+                                "auto-increment column {}.{} requires INT64 values",
+                                table_name, column.name
+                            )));
                         }
                     }
-                    _ => {
-                        return Err(DbError::constraint(format!(
-                            "auto-increment column {}.{} requires INT64 values",
-                            table_name, column.name
-                        )));
-                    }
                 }
-            }
 
-            candidate.push(super::cast_value(value, column.column_type)?);
+                candidate.push(super::cast_value(value, column.column_type)?);
+            }
+        } else {
+            for (param, column) in params.iter_mut().zip(&prepared.columns) {
+                let value = std::mem::replace(param, Value::Null);
+                candidate.push(super::cast_value(value, column.column_type)?);
+            }
         }
 
         self.apply_prepared_simple_insert_candidate(
@@ -1312,7 +1345,7 @@ impl EngineRuntime {
         self.catalog_table_mut(table_name)
             .ok_or_else(|| DbError::sql(format!("unknown table {table_name}")))?
             .next_row_id = next_row_id;
-        self.append_stored_row_to_table_row_source(table_name, &stored_row, page_size)?;
+        self.append_owned_stored_row_to_table_row_source(table_name, stored_row, page_size)?;
         if prepared.use_generic_index_updates {
             self.apply_insert_index_updates(index_updates)?;
         }
@@ -1326,7 +1359,21 @@ impl EngineRuntime {
         stored_row: &StoredRow,
         page_size: u32,
     ) -> Result<()> {
-        self.append_stored_row_to_table_row_source_with_mode(
+        self.append_owned_stored_row_to_table_row_source_with_mode(
+            table_name,
+            stored_row.clone(),
+            page_size,
+            false,
+        )
+    }
+
+    pub(crate) fn append_owned_stored_row_to_table_row_source(
+        &mut self,
+        table_name: &str,
+        stored_row: StoredRow,
+        page_size: u32,
+    ) -> Result<()> {
+        self.append_owned_stored_row_to_table_row_source_with_mode(
             table_name, stored_row, page_size, false,
         )
     }
@@ -1337,15 +1384,18 @@ impl EngineRuntime {
         stored_row: &StoredRow,
         page_size: u32,
     ) -> Result<()> {
-        self.append_stored_row_to_table_row_source_with_mode(
-            table_name, stored_row, page_size, true,
+        self.append_owned_stored_row_to_table_row_source_with_mode(
+            table_name,
+            stored_row.clone(),
+            page_size,
+            true,
         )
     }
 
-    fn append_stored_row_to_table_row_source_with_mode(
+    fn append_owned_stored_row_to_table_row_source_with_mode(
         &mut self,
         table_name: &str,
-        stored_row: &StoredRow,
+        stored_row: StoredRow,
         page_size: u32,
         _preserve_paged: bool,
     ) -> Result<()> {
@@ -1355,7 +1405,7 @@ impl EngineRuntime {
                     DbError::internal(format!("table data for {table_name} is missing"))
                 })?
                 .rows
-                .push(stored_row.clone());
+                .push(stored_row);
             return Ok(());
         }
         let use_paged_row_storage = self.paged_row_storage;
@@ -1367,7 +1417,7 @@ impl EngineRuntime {
         match row_source {
             TableRowSource::Resident(data) => {
                 let data = Arc::make_mut(data);
-                data.rows.push(stored_row.clone());
+                data.rows.push(stored_row);
                 if use_paged_row_storage
                     && data.rows.len() >= PAGED_TABLE_RESIDENT_APPEND_ROW_THRESHOLD
                 {
@@ -1378,7 +1428,7 @@ impl EngineRuntime {
                 Ok(())
             }
             TableRowSource::Paged(manifest) => {
-                Arc::make_mut(manifest).append_row(stored_row, page_size)
+                Arc::make_mut(manifest).append_row(&stored_row, page_size)
             }
         }
     }

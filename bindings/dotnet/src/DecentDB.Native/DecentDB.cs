@@ -98,17 +98,36 @@ public sealed class DecentDB : IDisposable
     public DecentDB(string path, DbOpenMode mode, string? options = null)
     {
         var pathBytes = Encoding.UTF8.GetBytes(path + "\0");
+        var optionsBytes = string.IsNullOrWhiteSpace(options)
+            ? null
+            : Encoding.UTF8.GetBytes(options + "\0");
         IntPtr ptr;
         unsafe
         {
             fixed (byte* pPath = pathBytes)
             {
-                uint res = mode switch
+                uint res;
+                if (optionsBytes == null)
                 {
-                    DbOpenMode.Create => RecordStatus(DecentDBNativeUnsafe.ddb_db_create(pPath, out ptr)),
-                    DbOpenMode.Open => RecordStatus(DecentDBNativeUnsafe.ddb_db_open(pPath, out ptr)),
-                    _ => RecordStatus(DecentDBNativeUnsafe.ddb_db_open_or_create(pPath, out ptr))
-                };
+                    res = mode switch
+                    {
+                        DbOpenMode.Create => RecordStatus(DecentDBNativeUnsafe.ddb_db_create(pPath, out ptr)),
+                        DbOpenMode.Open => RecordStatus(DecentDBNativeUnsafe.ddb_db_open(pPath, out ptr)),
+                        _ => RecordStatus(DecentDBNativeUnsafe.ddb_db_open_or_create(pPath, out ptr))
+                    };
+                }
+                else
+                {
+                    fixed (byte* pOptions = optionsBytes)
+                    {
+                        res = mode switch
+                        {
+                            DbOpenMode.Create => RecordStatus(DecentDBNativeUnsafe.ddb_db_create_with_options(pPath, pOptions, out ptr)),
+                            DbOpenMode.Open => RecordStatus(DecentDBNativeUnsafe.ddb_db_open_with_options(pPath, pOptions, out ptr)),
+                            _ => RecordStatus(DecentDBNativeUnsafe.ddb_db_open_or_create_with_options(pPath, pOptions, out ptr))
+                        };
+                    }
+                }
                 if (res != 0 || ptr == IntPtr.Zero)
                 {
                     throw new DecentDBException(_lastErrorCode, LastErrorMessage, $"Open({mode})");
@@ -118,7 +137,6 @@ public sealed class DecentDB : IDisposable
 
         _handle = new DecentDBHandle(ptr);
         Sync = new DecentDBSyncClient(this);
-        _ = options;
     }
 
     public int LastErrorCode => _lastErrorCode;
@@ -527,6 +545,8 @@ public sealed class PreparedStatement : IDisposable
     private readonly string _sql;
     private readonly int _parameterCount;
     private int _columnCount = -1;
+    private DdbValueViewNative[]? _currentRowViews;
+    private bool _currentRowViewsCaptured;
 
     public IntPtr Handle => _handle.Handle;
 
@@ -551,6 +571,7 @@ public sealed class PreparedStatement : IDisposable
 
     public PreparedStatement Reset()
     {
+        InvalidateRowViewCache();
         var res = _db.RecordStatus(DecentDBNative.ddb_stmt_reset(Handle));
         if (res != 0)
         {
@@ -561,6 +582,7 @@ public sealed class PreparedStatement : IDisposable
 
     public PreparedStatement ClearBindings()
     {
+        InvalidateRowViewCache();
         var res = _db.RecordStatus(DecentDBNative.ddb_stmt_clear_bindings(Handle));
         if (res != 0)
         {
@@ -726,6 +748,7 @@ public sealed class PreparedStatement : IDisposable
 
     private PreparedStatement BindTextSpan(int index1Based, ReadOnlySpan<byte> bytes)
     {
+        InvalidateRowViewCache();
         var len = bytes.Length;
         if (len == 0)
         {
@@ -756,6 +779,7 @@ public sealed class PreparedStatement : IDisposable
 
     public PreparedStatement BindBlob(int index1Based, byte[] bytes)
     {
+        InvalidateRowViewCache();
         var len = bytes?.Length ?? 0;
         if (len == 0)
         {
@@ -796,6 +820,7 @@ public sealed class PreparedStatement : IDisposable
 
     private PreparedStatement BindSpatialWkb(int index1Based, byte[] bytes, bool geography)
     {
+        InvalidateRowViewCache();
         var len = bytes?.Length ?? 0;
         unsafe
         {
@@ -829,13 +854,48 @@ public sealed class PreparedStatement : IDisposable
 
     public int Step()
     {
-        var res = _db.RecordStatus(DecentDBNative.ddb_stmt_step(Handle, out var hasRow));
+        InvalidateRowViewCache();
+        var res = _db.RecordStatus(DecentDBNativeUnsafe.ddb_stmt_step_row_view(Handle, out var values, out var count, out var hasRow));
         if (res != 0)
         {
             return -checked((int)res);
         }
 
-        return hasRow != 0 ? 1 : 0;
+        if (hasRow != 0)
+        {
+            CaptureRowViews(values, count);
+            return 1;
+        }
+
+        InvalidateRowViewCache();
+        return 0;
+    }
+
+    internal int BindInt64StepAndCaptureRowView(int index1Based, long value)
+    {
+        ValidateBindIndex(index1Based);
+        var res = _db.RecordStatus(
+            DecentDBNativeUnsafe.ddb_stmt_bind_int64_step_row_view(
+                Handle,
+                checked((nuint)index1Based),
+                value,
+                out var values,
+                out var count,
+                out var hasRow));
+        if (res != 0)
+        {
+            InvalidateRowViewCache();
+            return -checked((int)res);
+        }
+
+        if (hasRow != 0)
+        {
+            CaptureRowViews(values, count);
+            return 1;
+        }
+
+        InvalidateRowViewCache();
+        return 0;
     }
 
     public int ColumnCount
@@ -886,6 +946,11 @@ public sealed class PreparedStatement : IDisposable
 
     public int ColumnType(int col0Based)
     {
+        if (TryGetCachedLegacyColumnType(col0Based, out var cached))
+        {
+            return cached;
+        }
+
         var value = CopyValue(col0Based);
         try
         {
@@ -899,6 +964,11 @@ public sealed class PreparedStatement : IDisposable
 
     public bool IsNull(int col0Based)
     {
+        if (TryGetCachedIsNull(col0Based, out var cached))
+        {
+            return cached;
+        }
+
         var value = CopyValue(col0Based);
         try
         {
@@ -959,6 +1029,11 @@ public sealed class PreparedStatement : IDisposable
 
     public long GetTimestampMicros(int col0Based)
     {
+        if (TryGetCachedTimestampMicros(col0Based, out var cached))
+        {
+            return cached;
+        }
+
         var value = CopyValue(col0Based);
         try
         {
@@ -979,6 +1054,11 @@ public sealed class PreparedStatement : IDisposable
 
     public long GetInt64(int col0Based)
     {
+        if (TryGetCachedInt64(col0Based, out var cached))
+        {
+            return cached;
+        }
+
         var value = CopyValue(col0Based);
         try
         {
@@ -1001,6 +1081,11 @@ public sealed class PreparedStatement : IDisposable
 
     public double GetFloat64(int col0Based)
     {
+        if (TryGetCachedFloat64(col0Based, out var cached))
+        {
+            return cached;
+        }
+
         var value = CopyValue(col0Based);
         try
         {
@@ -1019,6 +1104,11 @@ public sealed class PreparedStatement : IDisposable
 
     public decimal GetDecimal(int col0Based)
     {
+        if (TryGetCachedDecimal(col0Based, out var cached))
+        {
+            return cached;
+        }
+
         var value = CopyValue(col0Based);
         try
         {
@@ -1036,6 +1126,11 @@ public sealed class PreparedStatement : IDisposable
 
     public string GetText(int col0Based)
     {
+        if (TryGetCachedText(col0Based, out var cached))
+        {
+            return cached;
+        }
+
         var value = CopyValue(col0Based);
         try
         {
@@ -1049,6 +1144,11 @@ public sealed class PreparedStatement : IDisposable
 
     public byte[] GetBlob(int col0Based)
     {
+        if (TryGetCachedBlob(col0Based, out var cached))
+        {
+            return cached;
+        }
+
         var value = CopyValue(col0Based);
         try
         {
@@ -1062,6 +1162,11 @@ public sealed class PreparedStatement : IDisposable
 
     public object GetValueObject(int col0Based)
     {
+        if (TryGetCachedValueObject(col0Based, out var cached))
+        {
+            return cached;
+        }
+
         var value = CopyValue(col0Based);
         try
         {
@@ -1111,6 +1216,7 @@ public sealed class PreparedStatement : IDisposable
 
     public long StepRowsAffected()
     {
+        InvalidateRowViewCache();
         var res = _db.RecordStatus(DecentDBNative.ddb_stmt_step(Handle, out _));
         if (res != 0)
         {
@@ -1121,6 +1227,7 @@ public sealed class PreparedStatement : IDisposable
 
     public long ExecuteBatchInt64(ReadOnlySpan<long> values)
     {
+        InvalidateRowViewCache();
         unsafe
         {
             fixed (long* pValues = values)
@@ -1141,6 +1248,7 @@ public sealed class PreparedStatement : IDisposable
         byte[]? text1,
         int textCount)
     {
+        InvalidateRowViewCache();
         unsafe
         {
             fixed (byte* pSignature = signatureUtf8)
@@ -1299,8 +1407,44 @@ public sealed class PreparedStatement : IDisposable
         }
     }
 
+    public long ExecuteBatchInt64TextFloat64OneRow(long intValue, ReadOnlySpan<byte> textUtf8, double floatValue)
+    {
+        InvalidateRowViewCache();
+        unsafe
+        {
+            long* ids = stackalloc long[1];
+            double* floats = stackalloc double[1];
+            byte** textPtrs = stackalloc byte*[1];
+            nuint* textLens = stackalloc nuint[1];
+            ids[0] = intValue;
+            floats[0] = floatValue;
+
+            fixed (byte* pText = textUtf8)
+            {
+                textPtrs[0] = pText;
+                textLens[0] = checked((nuint)textUtf8.Length);
+                var res = _db.RecordStatus(
+                    DecentDBNativeUnsafe.ddb_stmt_execute_batch_i64_text_f64(
+                        Handle,
+                        1,
+                        ids,
+                        textPtrs,
+                        textLens,
+                        floats,
+                        out var affected));
+                if (res != 0)
+                {
+                    throw new DecentDBException(_db.LastErrorCode, _db.LastErrorMessage, _sql);
+                }
+
+                return (long)affected;
+            }
+        }
+    }
+
     public long RebindInt64Execute(long value)
     {
+        InvalidateRowViewCache();
         var res = _db.RecordStatus(
             DecentDBNativeUnsafe.ddb_stmt_rebind_int64_execute(Handle, value, out var affected));
         if (res != 0) throw new DecentDBException(_db.LastErrorCode, _db.LastErrorMessage, _sql);
@@ -1309,6 +1453,7 @@ public sealed class PreparedStatement : IDisposable
 
     public long RebindTextInt64Execute(byte[] utf8Text, long intValue)
     {
+        InvalidateRowViewCache();
         unsafe
         {
             fixed (byte* pText = utf8Text)
@@ -1323,6 +1468,7 @@ public sealed class PreparedStatement : IDisposable
 
     public long RebindInt64TextExecute(long intValue, byte[] utf8Text)
     {
+        InvalidateRowViewCache();
         unsafe
         {
             fixed (byte* pText = utf8Text)
@@ -1371,6 +1517,289 @@ public sealed class PreparedStatement : IDisposable
         return value;
     }
 
+    private void InvalidateRowViewCache()
+    {
+        _currentRowViewsCaptured = false;
+    }
+
+    private unsafe void CaptureRowViews(IntPtr values, nuint count)
+    {
+        var len = checked((int)count);
+        if (len == 0 || values == IntPtr.Zero)
+        {
+            _currentRowViews = Array.Empty<DdbValueViewNative>();
+            _currentRowViewsCaptured = true;
+            return;
+        }
+
+        var target = _currentRowViews;
+        if (target == null || target.Length != len)
+        {
+            target = new DdbValueViewNative[len];
+        }
+
+        new ReadOnlySpan<DdbValueViewNative>((void*)values, len).CopyTo(target);
+        _currentRowViews = target;
+        _currentRowViewsCaptured = true;
+    }
+
+    private bool TryGetCachedView(int col0Based, out DdbValueViewNative view)
+    {
+        var views = _currentRowViews;
+        if (!_currentRowViewsCaptured || views == null || (uint)col0Based >= (uint)views.Length)
+        {
+            view = default;
+            return false;
+        }
+
+        view = views[col0Based];
+        return true;
+    }
+
+    internal bool TryGetCachedLegacyColumnType(int col0Based, out int type)
+    {
+        if (!TryGetCachedView(col0Based, out var view))
+        {
+            type = default;
+            return false;
+        }
+
+        type = LegacyColumnTypeFromTag((DdbValueTag)view.tag);
+        return true;
+    }
+
+    internal bool TryGetCachedIsNull(int col0Based, out bool isNull)
+    {
+        if (!TryGetCachedView(col0Based, out var view))
+        {
+            isNull = default;
+            return false;
+        }
+
+        isNull = (DdbValueTag)view.tag == DdbValueTag.Null;
+        return true;
+    }
+
+    internal bool TryGetCachedInt64(int col0Based, out long value)
+    {
+        if (!TryGetCachedView(col0Based, out var view))
+        {
+            value = default;
+            return false;
+        }
+
+        value = (DdbValueTag)view.tag switch
+        {
+            DdbValueTag.Int64 => view.int64_value,
+            DdbValueTag.Bool => view.bool_value != 0 ? 1L : 0L,
+            DdbValueTag.TimestampMicros => view.timestamp_micros,
+            DdbValueTag.TimestamptzMicros => view.timestamptz_micros,
+            DdbValueTag.Date => view.date_days,
+            DdbValueTag.Time => view.time_micros,
+            _ => 0L
+        };
+        return true;
+    }
+
+    internal bool TryGetCachedFloat64(int col0Based, out double value)
+    {
+        if (!TryGetCachedView(col0Based, out var view))
+        {
+            value = default;
+            return false;
+        }
+
+        value = (DdbValueTag)view.tag switch
+        {
+            DdbValueTag.Float64 => view.float64_value,
+            DdbValueTag.Int64 => view.int64_value,
+            _ => 0.0
+        };
+        return true;
+    }
+
+    internal bool TryGetCachedTimestampMicros(int col0Based, out long value)
+    {
+        if (!TryGetCachedView(col0Based, out var view))
+        {
+            value = default;
+            return false;
+        }
+
+        value = (DdbValueTag)view.tag switch
+        {
+            DdbValueTag.TimestampMicros => view.timestamp_micros,
+            DdbValueTag.TimestamptzMicros => view.timestamptz_micros,
+            DdbValueTag.Int64 => view.int64_value,
+            DdbValueTag.Bool => view.bool_value != 0 ? 1L : 0L,
+            _ => 0L
+        };
+        return true;
+    }
+
+    internal bool TryGetCachedDecimal(int col0Based, out decimal value)
+    {
+        if (!TryGetCachedView(col0Based, out var view))
+        {
+            value = default;
+            return false;
+        }
+
+        if ((DdbValueTag)view.tag != DdbValueTag.Decimal)
+        {
+            value = default;
+            return false;
+        }
+
+        value = GetDecimalValue(view.decimal_scaled, view.decimal_scale);
+        return true;
+    }
+
+    internal bool TryGetCachedText(int col0Based, out string text)
+    {
+        if (!TryGetCachedView(col0Based, out var view))
+        {
+            text = string.Empty;
+            return false;
+        }
+
+        switch ((DdbValueTag)view.tag)
+        {
+            case DdbValueTag.Null:
+                text = string.Empty;
+                return true;
+            case DdbValueTag.Text:
+                unsafe
+                {
+                    text = view.data == null || view.len == 0
+                        ? string.Empty
+                        : Marshal.PtrToStringUTF8((IntPtr)view.data, checked((int)view.len)) ?? string.Empty;
+                }
+                return true;
+            case DdbValueTag.Uuid:
+                unsafe
+                {
+                    text = GetGuidString(view);
+                }
+                return true;
+            case DdbValueTag.Int64:
+                text = view.int64_value.ToString();
+                return true;
+            case DdbValueTag.Float64:
+                text = view.float64_value.ToString();
+                return true;
+            case DdbValueTag.Bool:
+                text = view.bool_value != 0 ? bool.TrueString : bool.FalseString;
+                return true;
+            case DdbValueTag.Decimal:
+                text = GetDecimalValue(view.decimal_scaled, view.decimal_scale).ToString();
+                return true;
+            case DdbValueTag.TimestampMicros:
+                text = view.timestamp_micros.ToString();
+                return true;
+            case DdbValueTag.TimestamptzMicros:
+                text = FromUnixEpochMicrosecondsOffset(view.timestamptz_micros).ToString("O", CultureInfo.InvariantCulture);
+                return true;
+            case DdbValueTag.Enum:
+                text = new DecentDBEnumValue(view.enum_type_id, view.enum_label_id).ToString();
+                return true;
+            case DdbValueTag.Date:
+                text = GetDateString(view.date_days);
+                return true;
+            case DdbValueTag.Time:
+                text = GetTimeString(view.time_micros);
+                return true;
+            case DdbValueTag.Interval:
+                text = new DecentDBIntervalValue(view.interval_months, view.interval_days, view.interval_micros).ToString();
+                return true;
+            default:
+                text = string.Empty;
+                return false;
+        }
+    }
+
+    internal bool TryGetCachedBlob(int col0Based, out byte[] bytes)
+    {
+        if (!TryGetCachedView(col0Based, out var view))
+        {
+            bytes = Array.Empty<byte>();
+            return false;
+        }
+
+        unsafe
+        {
+            bytes = (DdbValueTag)view.tag switch
+            {
+                DdbValueTag.Blob => CopyBytes(view.data, view.len),
+                DdbValueTag.Geometry => CopyBytes(view.data, view.len),
+                DdbValueTag.Geography => CopyBytes(view.data, view.len),
+                DdbValueTag.Uuid => view.len == 0 ? CopyUuidBytes(view) : CopyBytes(view.data, view.len),
+                _ => Array.Empty<byte>()
+            };
+        }
+        return true;
+    }
+
+    internal bool TryGetCachedValueObject(int col0Based, out object value)
+    {
+        if (!TryGetCachedView(col0Based, out var view))
+        {
+            value = DBNull.Value;
+            return false;
+        }
+
+        switch ((DdbValueTag)view.tag)
+        {
+            case DdbValueTag.Null:
+                value = DBNull.Value;
+                return true;
+            case DdbValueTag.Int64:
+                value = view.int64_value;
+                return true;
+            case DdbValueTag.Bool:
+                value = view.bool_value != 0;
+                return true;
+            case DdbValueTag.Float64:
+                value = view.float64_value;
+                return true;
+            case DdbValueTag.Text:
+                _ = TryGetCachedText(col0Based, out var text);
+                value = text;
+                return true;
+            case DdbValueTag.Blob:
+            case DdbValueTag.Geometry:
+            case DdbValueTag.Geography:
+            case DdbValueTag.Uuid:
+                _ = TryGetCachedBlob(col0Based, out var bytes);
+                value = bytes;
+                return true;
+            case DdbValueTag.Decimal:
+                value = GetDecimalValue(view.decimal_scaled, view.decimal_scale);
+                return true;
+            case DdbValueTag.TimestampMicros:
+                value = FromUnixEpochMicroseconds(view.timestamp_micros);
+                return true;
+            case DdbValueTag.Enum:
+                value = new DecentDBEnumValue(view.enum_type_id, view.enum_label_id);
+                return true;
+            case DdbValueTag.Date:
+                value = GetDateValue(view.date_days);
+                return true;
+            case DdbValueTag.Time:
+                value = GetTimeValue(view.time_micros);
+                return true;
+            case DdbValueTag.TimestamptzMicros:
+                value = FromUnixEpochMicrosecondsOffset(view.timestamptz_micros);
+                return true;
+            case DdbValueTag.Interval:
+                value = GetIntervalValue(view.interval_months, view.interval_days, view.interval_micros);
+                return true;
+            default:
+                value = DBNull.Value;
+                return false;
+        }
+    }
+
     private bool IsAccessibleColumnIndex(int col0Based)
     {
         if (col0Based < 0)
@@ -1389,6 +1818,8 @@ public sealed class PreparedStatement : IDisposable
             _db.SetManagedError(5, message);
             throw new DecentDBException(_db.LastErrorCode, _db.LastErrorMessage, _sql);
         }
+
+        InvalidateRowViewCache();
     }
 
     private static int DetectParameterCount(string sql)
@@ -1508,7 +1939,22 @@ public sealed class PreparedStatement : IDisposable
         return bytes;
     }
 
+    private static unsafe byte[] CopyUuidBytes(DdbValueViewNative value)
+    {
+        var bytes = new byte[16];
+        byte* uuidBytes = value.uuid_bytes;
+        Marshal.Copy((IntPtr)uuidBytes, bytes, 0, bytes.Length);
+
+        return bytes;
+    }
+
     private static unsafe string GetGuidString(DdbValueNative value)
+    {
+        byte* uuidBytes = value.uuid_bytes;
+        return new Guid(new ReadOnlySpan<byte>(uuidBytes, 16)).ToString();
+    }
+
+    private static unsafe string GetGuidString(DdbValueViewNative value)
     {
         byte* uuidBytes = value.uuid_bytes;
         return new Guid(new ReadOnlySpan<byte>(uuidBytes, 16)).ToString();
@@ -1521,16 +1967,21 @@ public sealed class PreparedStatement : IDisposable
 
     private static decimal GetDecimalValue(DdbValueNative value)
     {
-        bool isNegative = value.decimal_scaled < 0;
+        return GetDecimalValue(value.decimal_scaled, value.decimal_scale);
+    }
+
+    private static decimal GetDecimalValue(long decimalScaled, byte decimalScale)
+    {
+        bool isNegative = decimalScaled < 0;
         ulong magnitude = isNegative
-            ? unchecked((ulong)(-value.decimal_scaled))
-            : unchecked((ulong)value.decimal_scaled);
+            ? unchecked((ulong)(-decimalScaled))
+            : unchecked((ulong)decimalScaled);
 
         int lo = (int)(magnitude & 0xFFFFFFFF);
         int mid = (int)(magnitude >> 32);
         int hi = 0;
 
-        return new decimal(lo, mid, hi, isNegative, value.decimal_scale);
+        return new decimal(lo, mid, hi, isNegative, decimalScale);
     }
 
     private static DateTime FromUnixEpochMicroseconds(long micros)

@@ -122,10 +122,13 @@ impl AutoCheckpointConfig {
     }
 }
 
+pub(crate) type WalBasePage = Option<(Arc<[u8]>, bool)>;
+
 #[derive(Debug)]
 pub(crate) struct WalWriteState {
     pub(crate) page_batch: Vec<u8>,
     pub(crate) prepared_pages: Vec<(PageId, Vec<u8>, usize, format::FrameEncoding, u64)>,
+    pub(crate) base_pages: Vec<WalBasePage>,
     /// Reusable scratch buffer for the per-page delta payload (slice M6).
     /// `encode_page_delta_into` clears and refills this buffer on every
     /// page rather than allocating a fresh `Vec<u8>` per page in the
@@ -139,6 +142,7 @@ impl WalWriteState {
         Self {
             page_batch: Vec::new(),
             prepared_pages: Vec::new(),
+            base_pages: Vec::new(),
             delta_scratch: Vec::new(),
         }
     }

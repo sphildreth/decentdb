@@ -166,6 +166,16 @@ pub struct DbConfig {
     /// See ADR 0145 — Paged Table Row Source.
     pub paged_row_storage: bool,
 
+    /// Keep paged row sources resident on the current handle after successful
+    /// write commits instead of immediately returning them to the deferred set.
+    ///
+    /// Default: `false`. The default preserves the low-memory profile where
+    /// committed paged tables can be dropped and reloaded on demand. Set this
+    /// to `true` for hot-read workloads that bulk load data and then run many
+    /// reads on the same handle, accepting higher process memory in exchange
+    /// for avoiding repeated row-source reloads.
+    pub retain_paged_row_sources_after_commit: bool,
+
     /// If non-zero, `Db::open` will run a synchronous checkpoint when the
     /// existing WAL file size on disk exceeds this threshold (in MiB).
     /// This drops the in-memory WAL page-version index and lets steady-
@@ -219,6 +229,7 @@ impl Default for DbConfig {
             defer_table_materialization: true,
             persistent_pk_index: false,
             paged_row_storage: true,
+            retain_paged_row_sources_after_commit: false,
             auto_checkpoint_on_open_mb: 16,
         }
     }
@@ -247,6 +258,7 @@ mod tests {
         assert!(config.defer_table_materialization);
         assert!(!config.persistent_pk_index);
         assert!(config.paged_row_storage);
+        assert!(!config.retain_paged_row_sources_after_commit);
         // Default depends on platform; just assert the field is reachable.
         let _ = config.release_freed_memory_after_checkpoint;
     }

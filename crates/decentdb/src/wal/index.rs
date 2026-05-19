@@ -288,6 +288,18 @@ impl WalIndex {
         }
     }
 
+    pub(crate) fn unmark_dirty_since_demote(&mut self, page_id: PageId) {
+        if !self.dirty_since_demote_set.remove(&page_id) {
+            return;
+        }
+        self.dirty_since_demote
+            .retain(|candidate| *candidate != page_id);
+        if self.dirty_since_demote.is_empty() {
+            self.dirty_since_demote.shrink_to_fit();
+            self.dirty_since_demote_set.shrink_to_fit();
+        }
+    }
+
     pub(crate) fn spill_one_cold_latest(
         &mut self,
         hot_set_pages: usize,
@@ -445,6 +457,29 @@ mod tests {
         }
 
         assert_eq!(index.demote_cold(None, 1), 1);
+    }
+
+    #[test]
+    fn unmark_dirty_since_demote_skips_replaced_latest_versions() {
+        let mut index = WalIndex::default();
+        index.add_version(
+            1,
+            WalVersion::resident(
+                10,
+                6,
+                4,
+                FrameEncoding::Page,
+                Arc::<[u8]>::from(vec![0x11; 16]),
+            ),
+            false,
+        );
+        index.unmark_dirty_since_demote(1);
+
+        assert_eq!(index.demote_cold(None, 1), 0);
+        assert!(matches!(
+            index.latest_visible(1, 10).unwrap().payload,
+            WalVersionPayload::Resident { .. }
+        ));
     }
 
     #[test]

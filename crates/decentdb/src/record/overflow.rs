@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use crate::error::{DbError, Result};
 use crate::record::compression::{decompress, maybe_compress, CompressionMode};
-use crate::storage::checksum::crc32c_parts;
+use crate::storage::checksum::crc32c_extend;
 use crate::storage::page::{PageId, PageStore};
 
 type ChainPages = Vec<(PageId, Arc<[u8]>)>;
@@ -499,7 +499,7 @@ pub(crate) fn append_uncompressed_with_first_page_patch<S: PageStore>(
     patch_offset: usize,
     patch_bytes: &[u8],
     appended: &[u8],
-) -> Result<(OverflowPointer, u32)> {
+) -> Result<(OverflowPointer, u32, OverflowChainCache, OverflowTailInfo)> {
     if previous.head_page_id == 0 {
         return Err(DbError::internal(
             "append_uncompressed_with_first_page_patch requires an existing overflow chain",
@@ -537,7 +537,7 @@ pub(crate) fn append_uncompressed_with_first_page_patch<S: PageStore>(
         }
         logical_len = logical_len.saturating_add(chunk_len as usize);
         page_ids.push(page_id);
-        pages.push(page.to_vec());
+        pages.push(page);
         chunk_lens.push(chunk_len as usize);
         page_id = next_page_id;
     }
@@ -562,19 +562,28 @@ pub(crate) fn append_uncompressed_with_first_page_patch<S: PageStore>(
         ));
     }
     let patch_start = OVERFLOW_HEADER_SIZE + patch_offset;
-    pages[0][patch_start..patch_start + patch_bytes.len()].copy_from_slice(patch_bytes);
+    let mut head_page = pages[0].as_ref().to_vec();
+    head_page[patch_start..patch_start + patch_bytes.len()].copy_from_slice(patch_bytes);
 
     let mut remaining = appended;
     let tail_index = page_ids.len() - 1;
+    let mut tail_page = (tail_index != 0).then(|| pages[tail_index].as_ref().to_vec());
     if !remaining.is_empty() {
         let tail_chunk_len = chunk_lens[tail_index];
         let available = chunk_capacity.saturating_sub(tail_chunk_len);
         if available > 0 {
             let take = available.min(remaining.len());
             let start = OVERFLOW_HEADER_SIZE + tail_chunk_len;
-            pages[tail_index][start..start + take].copy_from_slice(&remaining[..take]);
+            let page = if tail_index == 0 {
+                &mut head_page
+            } else {
+                tail_page
+                    .as_mut()
+                    .expect("tail page should be cloned when tail_index != 0")
+            };
+            page[start..start + take].copy_from_slice(&remaining[..take]);
             chunk_lens[tail_index] += take;
-            pages[tail_index][4..8].copy_from_slice(
+            page[4..8].copy_from_slice(
                 &(u32::try_from(chunk_lens[tail_index])
                     .map_err(|_| DbError::constraint("overflow chunk length exceeds u32"))?)
                 .to_le_bytes(),
@@ -603,35 +612,68 @@ pub(crate) fn append_uncompressed_with_first_page_patch<S: PageStore>(
             new_pages.push(page);
         }
 
-        pages[tail_index][0..4].copy_from_slice(&new_page_ids[0].to_le_bytes());
+        let page = if tail_index == 0 {
+            &mut head_page
+        } else {
+            tail_page
+                .as_mut()
+                .expect("tail page should be cloned when tail_index != 0")
+        };
+        page[0..4].copy_from_slice(&new_page_ids[0].to_le_bytes());
         for index in 0..new_pages.len().saturating_sub(1) {
             new_pages[index][0..4].copy_from_slice(&new_page_ids[index + 1].to_le_bytes());
         }
     }
 
-    let mut checksum_parts = Vec::with_capacity(pages.len() + new_pages.len());
-    for (page, chunk_len) in pages.iter().zip(chunk_lens.iter().copied()) {
-        checksum_parts.push(&page[OVERFLOW_HEADER_SIZE..OVERFLOW_HEADER_SIZE + chunk_len]);
+    let tail = if let (Some(&page_id), Some(page)) = (new_page_ids.last(), new_pages.last()) {
+        let chunk_len =
+            u32::from_le_bytes(page[4..8].try_into().expect("header chunk len")) as usize;
+        OverflowTailInfo { page_id, chunk_len }
+    } else {
+        OverflowTailInfo {
+            page_id: page_ids[tail_index],
+            chunk_len: chunk_lens[tail_index],
+        }
+    };
+
+    let mut checksum = 0;
+    for (index, chunk_len) in chunk_lens.iter().copied().enumerate() {
+        let page = if index == 0 {
+            head_page.as_slice()
+        } else if index == tail_index {
+            tail_page
+                .as_deref()
+                .expect("tail page should be cloned when tail_index != 0")
+        } else {
+            pages[index].as_ref()
+        };
+        checksum = crc32c_extend(
+            checksum,
+            &[&page[OVERFLOW_HEADER_SIZE..OVERFLOW_HEADER_SIZE + chunk_len]],
+        );
     }
     for page in &new_pages {
         let chunk_len =
             u32::from_le_bytes(page[4..8].try_into().expect("header chunk len")) as usize;
-        checksum_parts.push(&page[OVERFLOW_HEADER_SIZE..OVERFLOW_HEADER_SIZE + chunk_len]);
+        checksum = crc32c_extend(
+            checksum,
+            &[&page[OVERFLOW_HEADER_SIZE..OVERFLOW_HEADER_SIZE + chunk_len]],
+        );
     }
-    let checksum = crc32c_parts(&checksum_parts);
 
     if tail_index == 0 {
-        store.write_page_owned(page_ids[0], pages.swap_remove(0))?;
-    } else {
-        let tail_page_id = page_ids[tail_index];
-        let tail_page = pages.swap_remove(tail_index);
-        let head_page = pages.swap_remove(0);
         store.write_page_owned(page_ids[0], head_page)?;
-        store.write_page_owned(tail_page_id, tail_page)?;
+    } else {
+        store.write_page_owned(page_ids[0], head_page)?;
+        store.write_page_owned(
+            page_ids[tail_index],
+            tail_page.expect("tail page should be cloned when tail_index != 0"),
+        )?;
     }
-    for (new_page_id, new_page) in new_page_ids.into_iter().zip(new_pages) {
+    for (new_page_id, new_page) in new_page_ids.iter().copied().zip(new_pages) {
         store.write_page_owned(new_page_id, new_page)?;
     }
+    page_ids.extend(new_page_ids);
 
     Ok((
         OverflowPointer {
@@ -644,6 +686,8 @@ pub(crate) fn append_uncompressed_with_first_page_patch<S: PageStore>(
             flags: previous.flags,
         },
         checksum,
+        OverflowChainCache { page_ids },
+        tail,
     ))
 }
 
@@ -889,7 +933,7 @@ mod tests {
             1
         );
 
-        let (updated, checksum) = append_uncompressed_with_first_page_patch(
+        let (updated, checksum, cache, tail) = append_uncompressed_with_first_page_patch(
             &mut store,
             pointer,
             8,
@@ -908,6 +952,9 @@ mod tests {
             crate::storage::checksum::crc32c_parts(&[decoded.as_slice()]),
             checksum
         );
+        assert_eq!(cache.page_ids.first().copied(), Some(updated.head_page_id));
+        assert!(tail.page_id > 0);
+        assert!(tail.chunk_len > 0);
     }
 
     // ── Compression mode tests ──────────────────────────────────────
