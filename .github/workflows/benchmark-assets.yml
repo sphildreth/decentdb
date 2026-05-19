@@ -339,7 +339,14 @@ jobs:
           import sys
           from pathlib import Path
 
-          expected = {"decentdb", "duckdb", "sqlite", "H2", "HSQLDB"}
+          expected = {
+              "decentdb_default_durable",
+              "decentdb_tuned_durable",
+              "duckdb",
+              "sqlite",
+              "H2",
+              "HSQLDB",
+          }
           summary = json.loads(Path("data/bench_summary.json").read_text(encoding="utf-8"))
           present = set(summary.get("engines", {}))
           missing = sorted(expected - present)

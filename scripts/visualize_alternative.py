@@ -16,12 +16,17 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
+from benchmark_chart_style import (
+    BASELINE_ENGINE,
+    display_engine_color,
+    display_engine_name,
+    ordered_display_engines,
+)
+
 ROOT = Path(__file__).resolve().parents[1]
 DATA = ROOT / "data" / "bench_summary.json"
 OUT_RADAR = ROOT / "assets" / "decentdb-radar.png"
 OUT_SPEEDUP = ROOT / "assets" / "decentdb-speedup.png"
-
-BASELINE_ENGINE = "sqlite"
 
 METRICS = [
     ("read_p95_ms", "Point read p95 (ms)", "lower"),
@@ -32,36 +37,6 @@ METRICS = [
     ("commit_p95_ms", "Commit p95 (ms)", "lower"),
     ("insert_rows_per_sec", "Insert throughput (rows/s)", "higher"),
 ]
-
-ENGINE_LABELS = {
-    "decentdb_default_durable": "DecentDB (default durable)",
-    "decentdb_tuned_durable": "DecentDB (tuned durable)",
-    "duckdb": "DuckDB",
-    "sqlite": "SQLite",
-}
-
-
-def display_engine_name(engine: str) -> str:
-    return ENGINE_LABELS.get(engine, engine)
-
-
-def ordered_display_engines(engines: list[str]) -> list[str]:
-    engine_set = set(engines)
-    preferred = [
-        display_engine_name("decentdb_tuned_durable"),
-        display_engine_name("decentdb_default_durable"),
-        display_engine_name(BASELINE_ENGINE),
-        display_engine_name("duckdb"),
-        "H2",
-        "LiteDB",
-        "Apache Derby",
-        "HSQLDB",
-        "Firebird",
-    ]
-    ordered = [engine for engine in preferred if engine in engine_set]
-    ordered.extend(engine for engine in engines if engine not in ordered)
-    return ordered
-
 
 def to_float(value: object) -> float | None:
     if value is None:
@@ -149,11 +124,6 @@ def plot_radar(engines: dict[str, dict[str, object]]) -> None:
     )
     plt.ylim(0, 1.1)
 
-    colors = plt.rcParams["axes.prop_cycle"].by_key().get(
-        "color",
-        ["C0", "C1", "C2", "C3", "C4", "C5", "C6"],
-    )
-
     engines_for_radar = ordered_display_engines(list(normalized.keys()))
     complete_engines = [
         engine
@@ -172,7 +142,7 @@ def plot_radar(engines: dict[str, dict[str, object]]) -> None:
     for index, engine in enumerate(complete_engines):
         values = normalized[engine]
         wrapped = np.array(values + values[:1], dtype=float)
-        color = colors[index % len(colors)]
+        color = display_engine_color(engine, index)
         ax.plot(
             angles,
             wrapped,
@@ -186,7 +156,14 @@ def plot_radar(engines: dict[str, dict[str, object]]) -> None:
             ax.fill(angles, fill, color, alpha=0.1)
 
     plt.title("Overall Performance (Outer is Better)", size=16, y=1.1)
-    plt.legend(loc="upper right", bbox_to_anchor=(0.1, 1.1))
+    handles, labels = ax.get_legend_handles_labels()
+    fig.legend(
+        handles,
+        labels,
+        loc="upper left",
+        bbox_to_anchor=(0.02, 0.98),
+        borderaxespad=0.0,
+    )
 
     OUT_RADAR.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(OUT_RADAR, dpi=150)
@@ -232,6 +209,7 @@ def plot_speedup(engines: dict[str, dict[str, object]]) -> None:
     for index, engine in enumerate(engine_names):
         values = np.array(normalized[engine], dtype=float)
         y_pos = positions + (len(engine_names) - 1 - index) * height
+        color = display_engine_color(engine, index)
         first_bar = True
         for metric_index, value in enumerate(values):
             if math.isnan(float(value)):
@@ -241,6 +219,7 @@ def plot_speedup(engines: dict[str, dict[str, object]]) -> None:
                     y_pos[metric_index],
                     float(value),
                     height,
+                    color=color,
                     label=engine if first_bar else None,
                 )
                 first_bar = False
