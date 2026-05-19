@@ -16,6 +16,13 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
+from benchmark_chart_style import (
+    BASELINE_ENGINE,
+    display_engine_color,
+    display_engine_name,
+    ordered_display_engines,
+)
+
 ROOT = Path(__file__).resolve().parents[1]
 DATA = ROOT / "data" / "bench_summary.json"
 OUT_SVG = ROOT / "assets" / "decentdb-benchmarks.svg"
@@ -31,38 +38,6 @@ METRICS = [
     ("insert_rows_per_sec", "Insert (rows/s)", "higher"),
 ]
 
-BASELINE_ENGINE = "sqlite"
-
-ENGINE_LABELS = {
-    "decentdb_default_durable": "DecentDB (default durable)",
-    "decentdb_tuned_durable": "DecentDB (tuned durable)",
-    "duckdb": "DuckDB",
-    "sqlite": "SQLite",
-}
-
-
-def display_engine_name(engine: str) -> str:
-    return ENGINE_LABELS.get(engine, engine)
-
-
-def ordered_display_engines(engines: list[str]) -> list[str]:
-    engine_set = set(engines)
-    preferred = [
-        display_engine_name("decentdb_tuned_durable"),
-        display_engine_name("decentdb_default_durable"),
-        display_engine_name(BASELINE_ENGINE),
-        display_engine_name("duckdb"),
-        "H2",
-        "LiteDB",
-        "Apache Derby",
-        "HSQLDB",
-        "Firebird",
-    ]
-    ordered = [engine for engine in preferred if engine in engine_set]
-    ordered.extend(engine for engine in engines if engine not in ordered)
-    return ordered
-
-
 def to_float(value: object) -> float | None:
     if value is None:
         return None
@@ -70,6 +45,13 @@ def to_float(value: object) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def strip_trailing_whitespace(path: Path) -> None:
+    text = path.read_text(encoding="utf-8")
+    lines = [line.rstrip() for line in text.splitlines()]
+    suffix = "\n" if text.endswith("\n") else ""
+    path.write_text("\n".join(lines) + suffix, encoding="utf-8")
 
 
 def load() -> tuple[list[dict[str, object]], dict[str, object]]:
@@ -135,7 +117,13 @@ def plot(rows: list[dict[str, object]], meta: dict[str, object]) -> None:
             to_float(row.get(key)) if row.get(key) is not None else math.nan
             for key, _ in available_metrics
         ]
-        ax.bar(positions + offsets[index], values, width=width, label=engine)
+        ax.bar(
+            positions + offsets[index],
+            values,
+            width=width,
+            label=engine,
+            color=display_engine_color(engine, index),
+        )
 
     ax.set_ylabel(
         f"Normalized score vs {display_engine_name(BASELINE_ENGINE)} (higher is better)"
@@ -150,6 +138,7 @@ def plot(rows: list[dict[str, object]], meta: dict[str, object]) -> None:
     plt.tight_layout()
     OUT_SVG.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(OUT_SVG, format="svg")
+    strip_trailing_whitespace(OUT_SVG)
     plt.savefig(OUT_PNG, format="png", dpi=180)
     plt.close(fig)
 
