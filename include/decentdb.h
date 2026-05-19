@@ -114,6 +114,10 @@ uint32_t ddb_abi_version(void);
 const char *ddb_version(void);
 const char *ddb_last_error_message(void);
 
+/*
+ * Initializes an owned value slot for use with ddb_*_value_copy APIs.
+ * Call ddb_value_dispose when done with any initialized value slot.
+ */
 ddb_status_t ddb_value_init(ddb_value_t *value);
 ddb_status_t ddb_value_dispose(ddb_value_t *value);
 
@@ -135,6 +139,16 @@ ddb_status_t ddb_string_free(char **value);
 ddb_status_t ddb_db_create(const char *path, ddb_db_t **out_db);
 ddb_status_t ddb_db_open(const char *path, ddb_db_t **out_db);
 ddb_status_t ddb_db_open_or_create(const char *path, ddb_db_t **out_db);
+/*
+ * Option-aware open variants. `options` is a UTF-8 key=value list separated
+ * by whitespace, commas, or semicolons. Supported keys include cache_size,
+ * retain_paged_row_sources_after_commit, paged_row_storage,
+ * persistent_pk_index, wal_autocheckpoint, wal_checkpoint_threshold_pages,
+ * and wal_checkpoint_threshold_bytes.
+ */
+ddb_status_t ddb_db_create_with_options(const char *path, const char *options, ddb_db_t **out_db);
+ddb_status_t ddb_db_open_with_options(const char *path, const char *options, ddb_db_t **out_db);
+ddb_status_t ddb_db_open_or_create_with_options(const char *path, const char *options, ddb_db_t **out_db);
 ddb_status_t ddb_db_sync_execute_json(ddb_db_t *db, const char *request_json, char **out_json);
 ddb_status_t ddb_db_branch_execute_json(ddb_db_t *db, const char *request_json, char **out_json);
 
@@ -267,6 +281,11 @@ ddb_status_t ddb_stmt_rebind_int64_text_execute(
  * functions, which return borrowed pointers into the result set without heap
  * allocation. Use ddb_*_value_copy functions when ownership transfer is
  * required.
+ *
+ * Initialize out_value with ddb_value_init before first use, then call
+ * ddb_value_dispose when done. Reusing the same initialized ddb_value_t for
+ * multiple value-copy calls is supported; previous owned cell storage is
+ * released before the new value is written.
  */
 ddb_status_t ddb_stmt_value_copy(
     ddb_stmt_t *stmt,
@@ -346,6 +365,11 @@ ddb_status_t ddb_result_column_name_copy(
 /*
  * Performance note: ddb_result_value_copy returns owned values and may allocate
  * per cell. For streaming read-heavy paths, prefer statement row-view APIs.
+ *
+ * Initialize out_value with ddb_value_init before first use, then call
+ * ddb_value_dispose when done. Reusing the same initialized ddb_value_t for
+ * multiple value-copy calls is supported; previous owned cell storage is
+ * released before the new value is written.
  */
 ddb_status_t ddb_result_value_copy(
     ddb_result_t *result,

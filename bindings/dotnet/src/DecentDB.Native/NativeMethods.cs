@@ -262,6 +262,9 @@ public static unsafe class DecentDBNativeUnsafe
     [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_db_open_or_create")]
     internal static extern uint ddb_db_open_or_create(byte* pathUtf8, out IntPtr outDb);
 
+    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_db_open_or_create_with_options")]
+    internal static extern uint ddb_db_open_or_create_with_options(byte* pathUtf8, byte* optionsUtf8, out IntPtr outDb);
+
     [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_db_sync_execute_json")]
     internal static extern uint ddb_db_sync_execute_json(IntPtr db, byte* requestJsonUtf8, out IntPtr outJson);
 
@@ -307,8 +310,14 @@ public static unsafe class DecentDBNativeUnsafe
     [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_db_open")]
     internal static extern uint ddb_db_open(byte* pathUtf8, out IntPtr outDb);
 
+    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_db_open_with_options")]
+    internal static extern uint ddb_db_open_with_options(byte* pathUtf8, byte* optionsUtf8, out IntPtr outDb);
+
     [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_db_create")]
     internal static extern uint ddb_db_create(byte* pathUtf8, out IntPtr outDb);
+
+    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_db_create_with_options")]
+    internal static extern uint ddb_db_create_with_options(byte* pathUtf8, byte* optionsUtf8, out IntPtr outDb);
 
     [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_db_get_table_ddl")]
     internal static extern uint ddb_db_get_table_ddl(IntPtr db, byte* tableNameUtf8, out IntPtr outDdl);
@@ -325,7 +334,7 @@ public static unsafe class DecentDBNativeUnsafe
 
     [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_stmt_bind_int64_step_i64_text_f64")]
     internal static extern uint ddb_stmt_bind_int64_step_i64_text_f64(IntPtr stmt, nuint index1Based, long value,
-        out long outInt, out IntPtr outTextPtr, out nuint outTextLen, out double outFloat, out nuint outCount, out byte outHasRow);
+        out long outInt, out IntPtr outTextPtr, out nuint outTextLen, out double outFloat, out byte outHasRow);
 
     [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_stmt_step_row_view")]
     internal static extern uint ddb_stmt_step_row_view(IntPtr stmt, out IntPtr outValues, out nuint outCount, out byte outHasRow);

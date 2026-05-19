@@ -5,6 +5,19 @@ All notable changes to DecentDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.1] - 2026-05-19
+
+### Changed
+
+- Updated the .NET benchmark harness to use the same tuned durable read profile as the native benchmark (`64MB` cache, resident row sources after commit, paged row storage disabled, and WAL auto-checkpoint disabled), primary-key point-read schema parity for SQLite and DecentDB, parameterized batched Dapper inserts, larger EF Core `SaveChanges` batches, and only like-for-like paired provider comparisons.
+
+### Fixed
+
+- Fixed .NET `Cache Size` and related native connection options so they are passed through the C ABI at open time instead of being parsed and ignored by the managed binding.
+- Fixed C ABI owned-value disposal for native `GEOMETRY` and `GEOGRAPHY` result values so sanitizer runs no longer report leaked copied spatial cells.
+- Fixed the Node Knex lifecycle tests to always close pools after success or failure and clean up DecentDB WAL sidecar files between tests, avoiding hung nightly binding lifecycle runs after transaction failures.
+  
+
 ## [2.5.0] - 2026-05-18
 
 ### Changed
@@ -25,6 +38,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   helpers, deterministic schema fingerprints, native type metadata, query
   parameter/result-column contracts, and binding exposure across Python, Go,
   .NET, Node.js, Java/JDBC, and Dart.
+- C ABI open-with-options entry points (`ddb_db_create_with_options`,
+  `ddb_db_open_with_options`, and `ddb_db_open_or_create_with_options`) for
+  open-time tuning from bindings, including cache size, paged row-source
+  residency, paged row storage, persistent primary-key index, and WAL
+  auto-checkpoint thresholds.
 - **Binding-native semantic data types:** added compact native storage and C ABI
   value tags for `ENUM`, `IPADDR`/`INET`, `CIDR`, `DATE`, `TIME`,
   `TIMESTAMPTZ`, `INTERVAL`, and `MACADDR`/`MACADDR8`, including SQL casts,

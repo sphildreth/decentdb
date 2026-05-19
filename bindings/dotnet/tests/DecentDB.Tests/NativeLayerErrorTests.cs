@@ -282,14 +282,7 @@ public class NativeLayerErrorTests : IDisposable
     [Fact]
     public void DecentDB_WithInvalidOptions_Throws()
     {
-        // Test opening database with invalid options
         var invalidOptions = "invalid_option_that_does_not_exist=1";
-        using var db = new DecentDB.Native.DecentDB(_dbPath, invalidOptions);
-        
-        // The database should still open, but the invalid option might cause issues later
-        // depending on how the native library handles invalid options
-        using var stmt = db.Prepare("SELECT 1");
-        var result = stmt.Step();
-        Assert.Equal(1, result); // Should return a row
+        Assert.Throws<DecentDBException>(() => new DecentDB.Native.DecentDB(_dbPath, invalidOptions));
     }
 }

@@ -3,6 +3,7 @@ using System.Data.Common;
 using System.Diagnostics;
 using System.Globalization;
 using System.Runtime;
+using System.Text;
 using Dapper;
 using DecentDB.AdoNet;
 using DecentDB.EntityFrameworkCore;
@@ -13,8 +14,12 @@ using Microsoft.EntityFrameworkCore;
 const int DefaultCount = BenchmarkDefaults.Count;
 const int DefaultPointReads = BenchmarkDefaults.PointReads;
 const int DefaultPointSeed = BenchmarkDefaults.PointSeed;
+const string DefaultDecentDbCacheSize = BenchmarkDefaults.DecentDbCacheSize;
 const int DefaultFetchmanyBatch = BenchmarkDefaults.FetchmanyBatch;
+const int DefaultDapperInsertBatch = BenchmarkDefaults.DapperInsertBatch;
 const int DefaultEfInsertBatch = BenchmarkDefaults.EfInsertBatch;
+const string AdoPointReadSql = "SELECT id FROM bench WHERE id = @id";
+const string DapperPointReadSql = "SELECT id AS Id FROM bench WHERE id = @Id";
 
 var options = ParseArgs(args);
 if (options.ShowHelp)
@@ -61,7 +66,7 @@ static OfferingResult RunAdoBenchmark(OfferingKind offering, string dbPath, Benc
     Console.WriteLine($"=== {offering.ToDisplayName()} ===");
     Console.WriteLine("Setting up data...");
 
-    using var conn = OpenAdoConnection(offering, dbPath);
+    using var conn = OpenAdoConnection(offering, dbPath, options);
     SetupSchema(conn, offering.IsSqlite());
 
     WarmInsertPrepared(conn);
@@ -114,7 +119,7 @@ static OfferingResult RunAdoBenchmark(OfferingKind offering, string dbPath, Benc
     Console.WriteLine($"Fetchmany({options.FetchmanyBatch:N0}) {options.Count:N0} rows: {fetchmanySeconds:0.0000}s");
 
     using var pointCmd = conn.CreateCommand();
-    pointCmd.CommandText = "SELECT id, val, f FROM bench WHERE id = @id";
+    pointCmd.CommandText = AdoPointReadSql;
     var pointIdParam = pointCmd.CreateParameter();
     pointIdParam.ParameterName = "@id";
     pointIdParam.DbType = DbType.Int64;
@@ -123,13 +128,12 @@ static OfferingResult RunAdoBenchmark(OfferingKind offering, string dbPath, Benc
 
     var pointIds = BuildPointReadIds(options.Count, options.PointReads, options.PointSeed);
     pointIdParam.Value = pointIds[pointIds.Length / 2];
-    using (var warm = pointCmd.ExecuteReader())
+    var warmScalar = pointCmd.ExecuteScalar();
+    if (warmScalar == null || warmScalar == DBNull.Value)
     {
-        if (!warm.Read())
-        {
-            throw new InvalidOperationException("Warmup point read missed expected row");
-        }
+        throw new InvalidOperationException("Warmup point read missed expected row");
     }
+    _ = Convert.ToInt64(warmScalar, CultureInfo.InvariantCulture);
 
     var latencies = RunWithGcDisabled(() =>
     {
@@ -138,15 +142,13 @@ static OfferingResult RunAdoBenchmark(OfferingKind offering, string dbPath, Benc
         {
             var started = Stopwatch.GetTimestamp();
             pointIdParam.Value = pointIds[i];
-            using var reader = pointCmd.ExecuteReader();
-            if (!reader.Read())
+            var scalar = pointCmd.ExecuteScalar();
+            if (scalar == null || scalar == DBNull.Value)
             {
                 throw new InvalidOperationException($"Point read missed id={pointIds[i]}");
             }
 
-            _ = reader.GetInt64(0);
-            _ = reader.GetString(1);
-            _ = reader.GetDouble(2);
+            _ = Convert.ToInt64(scalar, CultureInfo.InvariantCulture);
             samples[i] = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
         }
 
@@ -178,7 +180,7 @@ static OfferingResult RunDapperBenchmark(OfferingKind offering, string dbPath, B
     Console.WriteLine($"=== {offering.ToDisplayName()} ===");
     Console.WriteLine("Setting up data...");
 
-    using var conn = OpenAdoConnection(offering, dbPath);
+    using var conn = OpenAdoConnection(offering, dbPath, options);
     SetupSchema(conn, offering.IsSqlite());
 
     using (var tx = conn.BeginTransaction())
@@ -187,11 +189,12 @@ static OfferingResult RunDapperBenchmark(OfferingKind offering, string dbPath, B
         tx.Rollback();
     }
 
+    var insertRows = BuildDapperRows(options.Count).ToArray();
     var insertSeconds = RunWithGcDisabled(() =>
     {
         var started = Stopwatch.GetTimestamp();
         using var tx = conn.BeginTransaction();
-        _ = conn.Execute("INSERT INTO bench VALUES (@Id, @Val, @F)", BuildDapperRows(options.Count), tx);
+        ExecuteDapperBatchInsert(conn, tx, insertRows, options.DapperInsertBatch);
         tx.Commit();
         return Stopwatch.GetElapsedTime(started).TotalSeconds;
     });
@@ -235,8 +238,8 @@ static OfferingResult RunDapperBenchmark(OfferingKind offering, string dbPath, B
 
     var pointIds = BuildPointReadIds(options.Count, options.PointReads, options.PointSeed);
     var pointParam = new DapperPointParam { Id = pointIds[pointIds.Length / 2] };
-    _ = conn.QueryFirstOrDefault<DapperBenchRow>(
-        "SELECT id AS Id, val AS Val, f AS F FROM bench WHERE id = @Id",
+    _ = conn.ExecuteScalar<long?>(
+        DapperPointReadSql,
         pointParam) ?? throw new InvalidOperationException("Warmup point read missed expected row");
 
     var latencies = RunWithGcDisabled(() =>
@@ -246,17 +249,15 @@ static OfferingResult RunDapperBenchmark(OfferingKind offering, string dbPath, B
         {
             pointParam.Id = pointIds[i];
             var started = Stopwatch.GetTimestamp();
-            var row = conn.QueryFirstOrDefault<DapperBenchRow>(
-                "SELECT id AS Id, val AS Val, f AS F FROM bench WHERE id = @Id",
+            var pointId = conn.ExecuteScalar<long?>(
+                DapperPointReadSql,
                 pointParam);
-            if (row == null)
+            if (pointId == null)
             {
                 throw new InvalidOperationException($"Point read missed id={pointIds[i]}");
             }
 
-            _ = row.Id;
-            _ = row.Val;
-            _ = row.F;
+            _ = pointId.Value;
             samples[i] = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
         }
 
@@ -288,7 +289,7 @@ static OfferingResult RunMicroOrmBenchmark(string dbPath, BenchmarkOptions optio
     Console.WriteLine($"=== {OfferingKind.DecentDbMicroOrm.ToDisplayName()} ===");
     Console.WriteLine("Setting up data...");
 
-    using (var conn = new DecentDBConnection($"Data Source={dbPath}"))
+    using (var conn = new DecentDBConnection(BuildDecentDbConnectionString(dbPath, options.DecentDbCacheSize)))
     {
         conn.Open();
         SetupSchema(conn, isSqlite: false);
@@ -351,9 +352,6 @@ static OfferingResult RunMicroOrmBenchmark(string dbPath, BenchmarkOptions optio
                 throw new InvalidOperationException($"Point read missed id={pointIds[i]}");
             }
 
-            _ = row.Id;
-            _ = row.Val;
-            _ = row.F;
             samples[i] = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
         }
 
@@ -379,15 +377,19 @@ static OfferingResult RunEfCoreBenchmark(OfferingKind offering, string dbPath, B
     Console.WriteLine($"=== {offering.ToDisplayName()} ===");
     Console.WriteLine("Setting up data...");
 
-    using var setupContext = CreateEfContext(offering, dbPath);
+    using var setupContext = CreateEfContext(offering, dbPath, options);
     SetupSchemaEf(setupContext, offering.IsSqlite());
     setupContext.Dispose();
 
-    using var ctx = CreateEfContext(offering, dbPath);
+    using var ctx = CreateEfContext(offering, dbPath, options);
     ctx.ChangeTracker.AutoDetectChangesEnabled = false;
     ctx.Database.OpenConnection();
     var pointRowByIdQuery = EF.CompileQuery(
-        (BenchEfContext c, long id) => c.BenchRows.AsNoTracking().FirstOrDefault(r => r.Id == id));
+        (BenchEfContext c, long id) => c.BenchRows
+            .AsNoTracking()
+            .Where(r => r.Id == id)
+            .Select(r => r.Id)
+            .FirstOrDefault());
 
     using (var warmTx = ctx.Database.BeginTransaction())
     {
@@ -465,8 +467,11 @@ static OfferingResult RunEfCoreBenchmark(OfferingKind offering, string dbPath, B
     Console.WriteLine($"Fetchmany({options.FetchmanyBatch:N0}) {options.Count:N0} rows: {fetchmanySeconds:0.0000}s");
 
     var pointIds = BuildPointReadIds(options.Count, options.PointReads, options.PointSeed);
-    _ = pointRowByIdQuery(ctx, pointIds[pointIds.Length / 2]) ??
+    var warmPointId = pointIds[pointIds.Length / 2];
+    if (pointRowByIdQuery(ctx, warmPointId) != warmPointId)
+    {
         throw new InvalidOperationException("Warmup point read missed expected row");
+    }
 
     var latencies = RunWithGcDisabled(() =>
     {
@@ -476,14 +481,10 @@ static OfferingResult RunEfCoreBenchmark(OfferingKind offering, string dbPath, B
             var started = Stopwatch.GetTimestamp();
             var id = pointIds[i];
             var row = pointRowByIdQuery(ctx, id);
-            if (row == null)
+            if (row != id)
             {
                 throw new InvalidOperationException($"Point read missed id={id}");
             }
-
-            _ = row.Id;
-            _ = row.Val;
-            _ = row.F;
             samples[i] = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
         }
 
@@ -509,7 +510,10 @@ static OfferingResult RunEfCoreBenchmark(OfferingKind offering, string dbPath, B
     return new OfferingResult(offering, insertSeconds, insertRowsPerSecond, fetchallSeconds, fetchmanySeconds, pointP50Ms, pointP95Ms);
 }
 
-static BenchEfContext CreateEfContext(OfferingKind offering, string dbPath)
+static string BuildDecentDbConnectionString(string dbPath, string cacheSize) =>
+    $"Data Source={dbPath};Cache Size={cacheSize};Retain Paged Row Sources After Commit=True;Paged Row Storage=False;WAL Auto Checkpoint=0";
+
+static BenchEfContext CreateEfContext(OfferingKind offering, string dbPath, BenchmarkOptions options)
 {
     var builder = new DbContextOptionsBuilder<BenchEfContext>();
     if (offering.IsSqlite())
@@ -518,7 +522,7 @@ static BenchEfContext CreateEfContext(OfferingKind offering, string dbPath)
     }
     else
     {
-        builder.UseDecentDB($"Data Source={dbPath}");
+        builder.UseDecentDB(BuildDecentDbConnectionString(dbPath, options.DecentDbCacheSize));
     }
 
     return new BenchEfContext(builder.Options);
@@ -531,21 +535,19 @@ static void SetupSchemaEf(BenchEfContext context, bool isSqlite)
         context.Database.ExecuteSqlRaw("PRAGMA journal_mode=WAL");
         context.Database.ExecuteSqlRaw("PRAGMA synchronous=FULL");
         context.Database.ExecuteSqlRaw("PRAGMA wal_autocheckpoint=0");
-        context.Database.ExecuteSqlRaw("CREATE TABLE bench (id INTEGER, val TEXT, f REAL)");
+        context.Database.ExecuteSqlRaw("CREATE TABLE bench (id INTEGER PRIMARY KEY, val TEXT, f REAL)");
     }
     else
     {
-        context.Database.ExecuteSqlRaw("CREATE TABLE bench (id INT64, val TEXT, f FLOAT64)");
+        context.Database.ExecuteSqlRaw("CREATE TABLE bench (id INT64 PRIMARY KEY, val TEXT, f FLOAT64)");
     }
-
-    context.Database.ExecuteSqlRaw("CREATE INDEX bench_id_idx ON bench(id)");
 }
 
-static DbConnection OpenAdoConnection(OfferingKind offering, string dbPath)
+static DbConnection OpenAdoConnection(OfferingKind offering, string dbPath, BenchmarkOptions options)
 {
     DbConnection conn = offering.IsSqlite()
         ? new SqliteConnection($"Data Source={dbPath}")
-        : new DecentDBConnection($"Data Source={dbPath}");
+        : new DecentDBConnection(BuildDecentDbConnectionString(dbPath, options.DecentDbCacheSize));
     conn.Open();
     return conn;
 }
@@ -557,14 +559,12 @@ static void SetupSchema(DbConnection conn, bool isSqlite)
         ExecNonQuery(conn, "PRAGMA journal_mode=WAL");
         ExecNonQuery(conn, "PRAGMA synchronous=FULL");
         ExecNonQuery(conn, "PRAGMA wal_autocheckpoint=0");
-        ExecNonQuery(conn, "CREATE TABLE bench (id INTEGER, val TEXT, f REAL)");
+        ExecNonQuery(conn, "CREATE TABLE bench (id INTEGER PRIMARY KEY, val TEXT, f REAL)");
     }
     else
     {
-        ExecNonQuery(conn, "CREATE TABLE bench (id INT64, val TEXT, f FLOAT64)");
+        ExecNonQuery(conn, "CREATE TABLE bench (id INT64 PRIMARY KEY, val TEXT, f FLOAT64)");
     }
-
-    ExecNonQuery(conn, "CREATE INDEX bench_id_idx ON bench(id)");
 }
 
 static void WarmInsertPrepared(DbConnection conn)
@@ -723,6 +723,48 @@ static IEnumerable<DapperBenchRow> BuildDapperRows(int count)
     }
 }
 
+static void ExecuteDapperBatchInsert(
+    DbConnection conn,
+    DbTransaction tx,
+    IReadOnlyList<DapperBenchRow> rows,
+    int batchSize)
+{
+    for (var offset = 0; offset < rows.Count; offset += batchSize)
+    {
+        var count = Math.Min(batchSize, rows.Count - offset);
+        var sql = BuildDapperBatchInsertSql(count);
+        var parameters = new DynamicParameters();
+        for (var i = 0; i < count; i++)
+        {
+            var row = rows[offset + i];
+            parameters.Add($"Id{i}", row.Id, DbType.Int64);
+            parameters.Add($"Val{i}", row.Val, DbType.String);
+            parameters.Add($"F{i}", row.F, DbType.Double);
+        }
+
+        _ = conn.Execute(sql, parameters, tx);
+    }
+}
+
+static string BuildDapperBatchInsertSql(int rowCount)
+{
+    var sb = new StringBuilder("INSERT INTO bench (id, val, f) VALUES ");
+    for (var i = 0; i < rowCount; i++)
+    {
+        if (i > 0)
+        {
+            sb.Append(", ");
+        }
+
+        sb.Append("(@Id").Append(i)
+            .Append(", @Val").Append(i)
+            .Append(", @F").Append(i)
+            .Append(')');
+    }
+
+    return sb.ToString();
+}
+
 static IEnumerable<MicroOrmBenchRow> BuildMicroOrmRows(int count)
 {
     for (var i = 0; i < count; i++)
@@ -736,12 +778,12 @@ static IEnumerable<MicroOrmBenchRow> BuildMicroOrmRows(int count)
     }
 }
 
-static int[] BuildPointReadIds(int rowCount, int pointReads, int seed)
+static long[] BuildPointReadIds(int rowCount, int pointReads, int seed)
 {
     var rng = new Random(seed);
     if (pointReads <= rowCount)
     {
-        var ids = new int[rowCount];
+        var ids = new long[rowCount];
         for (var i = 0; i < rowCount; i++)
         {
             ids[i] = i;
@@ -753,12 +795,12 @@ static int[] BuildPointReadIds(int rowCount, int pointReads, int seed)
             (ids[i], ids[j]) = (ids[j], ids[i]);
         }
 
-        var sampled = new int[pointReads];
+        var sampled = new long[pointReads];
         Array.Copy(ids, sampled, pointReads);
         return sampled;
     }
 
-    var outIds = new int[pointReads];
+    var outIds = new long[pointReads];
     for (var i = 0; i < pointReads; i++)
     {
         outIds[i] = rng.Next(rowCount);
@@ -786,7 +828,6 @@ static void PrintPairedComparisons(IReadOnlyDictionary<OfferingKind, OfferingRes
         new PairedComparison(OfferingKind.DecentDbAdo, OfferingKind.SqliteAdo, "ADO.NET"),
         new PairedComparison(OfferingKind.DecentDbDapper, OfferingKind.SqliteDapper, "Dapper"),
         new PairedComparison(OfferingKind.DecentDbEfCore, OfferingKind.SqliteEfCore, "EF Core"),
-        new PairedComparison(OfferingKind.DecentDbMicroOrm, OfferingKind.SqliteAdo, "MicroOrm vs SQLite ADO.NET"),
     };
 
     foreach (var pair in pairs)
@@ -832,6 +873,13 @@ static void PrintPairedComparisons(IReadOnlyDictionary<OfferingKind, OfferingRes
                 Console.WriteLine($"- {line}");
             }
         }
+    }
+
+    if (results.ContainsKey(OfferingKind.DecentDbMicroOrm))
+    {
+        Console.WriteLine();
+        Console.WriteLine("=== DecentDB MicroOrm ===");
+        Console.WriteLine("MicroOrm is reported in the overall ranking only because this harness has no SQLite MicroOrm provider for a like-for-like paired comparison.");
     }
 }
 
@@ -1020,6 +1068,12 @@ static BenchmarkOptions ParseArgs(string[] args)
             case "--point-seed":
                 options.PointSeed = ParseInt(NextArg(args, ref i, "--point-seed"), "--point-seed");
                 break;
+            case "--decentdb-cache-size":
+                options.DecentDbCacheSize = NextArg(args, ref i, "--decentdb-cache-size");
+                break;
+            case "--dapper-insert-batch":
+                options.DapperInsertBatch = ParseInt(NextArg(args, ref i, "--dapper-insert-batch"), "--dapper-insert-batch");
+                break;
             case "--ef-insert-batch":
                 options.EfInsertBatch = ParseInt(NextArg(args, ref i, "--ef-insert-batch"), "--ef-insert-batch");
                 break;
@@ -1037,6 +1091,7 @@ static BenchmarkOptions ParseArgs(string[] args)
     if (options.Count <= 0) throw new ArgumentException("--count must be > 0");
     if (options.FetchmanyBatch <= 0) throw new ArgumentException("--fetchmany-batch must be > 0");
     if (options.PointReads <= 0) throw new ArgumentException("--point-reads must be > 0");
+    if (options.DapperInsertBatch <= 0) throw new ArgumentException("--dapper-insert-batch must be > 0");
     if (options.EfInsertBatch <= 0) throw new ArgumentException("--ef-insert-batch must be > 0");
     if (options.Engine is not ("all" or "decentdb" or "sqlite"))
     {
@@ -1079,6 +1134,8 @@ static void PrintUsage()
     Console.WriteLine($"  --fetchmany-batch <n>            Batch size for fetchmany metric (default: {DefaultFetchmanyBatch})");
     Console.WriteLine($"  --point-reads <n>                Random indexed point lookups (default: {DefaultPointReads})");
     Console.WriteLine($"  --point-seed <n>                 RNG seed for point lookups (default: {DefaultPointSeed})");
+    Console.WriteLine($"  --decentdb-cache-size <n|size>    DecentDB cache size (default: {DefaultDecentDbCacheSize})");
+    Console.WriteLine($"  --dapper-insert-batch <n>        Rows per Dapper multi-row insert (default: {DefaultDapperInsertBatch})");
     Console.WriteLine($"  --ef-insert-batch <n>            EF SaveChanges batch size (default: {DefaultEfInsertBatch})");
     Console.WriteLine("  --db-prefix <path_prefix>        Database path prefix (default: dotnet_bench_fetch)");
     Console.WriteLine("                                  DecentDB files use .ddb by default; SQLite files use .db.");
@@ -1171,7 +1228,9 @@ static class BenchmarkDefaults
     public const int PointReads = 10_000;
     public const int PointSeed = 1337;
     public const int FetchmanyBatch = 4096;
-    public const int EfInsertBatch = 2000;
+    public const int DapperInsertBatch = 128;
+    public const int EfInsertBatch = 50_000;
+    public const string DecentDbCacheSize = "64MB";
 }
 
 sealed class BenchmarkOptions
@@ -1181,7 +1240,9 @@ sealed class BenchmarkOptions
     public int FetchmanyBatch { get; set; } = BenchmarkDefaults.FetchmanyBatch;
     public int PointReads { get; set; } = BenchmarkDefaults.PointReads;
     public int PointSeed { get; set; } = BenchmarkDefaults.PointSeed;
+    public int DapperInsertBatch { get; set; } = BenchmarkDefaults.DapperInsertBatch;
     public int EfInsertBatch { get; set; } = BenchmarkDefaults.EfInsertBatch;
+    public string DecentDbCacheSize { get; set; } = BenchmarkDefaults.DecentDbCacheSize;
     public string DbPrefix { get; set; } = "dotnet_bench_fetch";
     public bool KeepDb { get; set; }
     public bool ShowHelp { get; set; }

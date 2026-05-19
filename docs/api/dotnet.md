@@ -160,7 +160,10 @@ by the ADO.NET and EF Core providers:
 var csb = new DecentDBConnectionStringBuilder
 {
     DataSource = "/path/to/shop.ddb",
-    CacheSize = "268435456",   // optional native cache size
+    CacheSize = "64MB",        // optional native cache size
+    RetainPagedRowSourcesAfterCommit = true,
+    PagedRowStorage = false,
+    WalAutoCheckpoint = "0",
     Logging = true,            // optional SQL logging
     LogLevel = "Info",         // optional log level
     CommandTimeout = 120,      // default command timeout in seconds

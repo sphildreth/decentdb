@@ -50,6 +50,10 @@ Supported keys:
 |-----|------|---------|-------------|
 | `Data Source` | string | *required* | Path to the database file. |
 | `Cache Size` | string | engine default | Cache size: integer (pages) or with unit (`64MB`). |
+| `Retain Paged Row Sources After Commit` | bool | engine default | Keep paged row sources resident after commits on this handle for hot read workloads. |
+| `Paged Row Storage` | bool | engine default | Enable the paged row storage format; set `False` for the tuned resident-read profile used by benchmarks. |
+| `Persistent PK Index` | bool | engine default | Enable the persistent primary-key locator index. |
+| `WAL Auto Checkpoint` | int | engine default | WAL auto-checkpoint page threshold; use `0` to disable for controlled benchmark runs. |
 | `Logging` | bool | `false` | Fire `SqlExecuting`/`SqlExecuted` events. |
 | `LogLevel` | enum | `Debug` | Minimum log severity. |
 | `Command Timeout` | int | `30` | Command timeout in seconds. |

@@ -14,6 +14,8 @@ namespace DecentDB.AdoNet
 {
     public sealed class DecentDBCommand : DbCommand
     {
+        private const int StackallocTextByteLimit = 256;
+
         private DecentDBConnection? _connection;
         private string _commandText = string.Empty;
         private int _commandTimeout = 30;
@@ -25,6 +27,7 @@ namespace DecentDB.AdoNet
         private string? _preparedSql;
         private Native.DecentDB? _preparedDb;
         private bool _preparedStatementFromConnectionCache;
+        private bool _statementCanSkipFinalizeReset;
         private string? _cachedSplitSql;
         private List<string>? _cachedSplitStatements;
         private string? _cachedRewriteSourceSql;
@@ -33,6 +36,7 @@ namespace DecentDB.AdoNet
         private DbParameter[]? _cachedRewriteParameterRefs;
         private string?[]? _cachedRewriteParameterNames;
         private bool _cachedRewriteNeedsOffsetClamp;
+        private Int64TextFloat64NonQueryPlan? _cachedInt64TextFloat64NonQueryPlan;
         private bool _disposed;
 
         public DecentDBCommand()
@@ -153,6 +157,7 @@ namespace DecentDB.AdoNet
         {
             if (_statement != null)
             {
+                _statementCanSkipFinalizeReset = false;
                 if (ReferenceEquals(_statement, _preparedStatement))
                 {
                     _statement.Reset().ClearBindings();
@@ -206,12 +211,83 @@ namespace DecentDB.AdoNet
                 return pragmaValue;
             }
 
+            if (TryExecuteSingleInt64Scalar(out var fastValue))
+            {
+                return fastValue;
+            }
+
             using var reader = ExecuteDbDataReader(CommandBehavior.Default);
             if (reader.Read())
             {
                 return reader[0];
             }
             return null;
+        }
+
+        private bool TryExecuteSingleInt64Scalar(out object? value)
+        {
+            value = null;
+            if (_connection == null)
+            {
+                throw new InvalidOperationException("Command has no connection");
+            }
+
+            if (GetSplitStatements().Count != 1)
+            {
+                return false;
+            }
+
+            var db = _connection.GetNativeDb();
+            var (sql, paramMap, needsOffsetClamp) = GetRewrittenSqlAndParameters();
+            if (needsOffsetClamp)
+            {
+                SqlParameterRewriter.ClampOffsetParameters(sql, paramMap);
+            }
+
+            if (!TryGetSingleInt64Parameter(paramMap, out var fastIndex, out var fastParamValue))
+            {
+                return false;
+            }
+
+            var observation = StartSqlObservationIfEnabled(_connection, sql, paramMap);
+            try
+            {
+                for (var attempt = 0; ; attempt++)
+                {
+                    var stmt = EnsurePreparedStatement(sql, resetForExecution: false);
+                    var stepResult = stmt.BindInt64StepAndCaptureRowView(fastIndex, fastParamValue);
+                    if (stepResult < 0)
+                    {
+                        InvalidatePreparedStatement(discardFromConnectionCache: true);
+
+                        var ex = new DecentDBException(stepResult, db.LastErrorMessage, sql);
+                        if (attempt == 0 && IsSchemaChangedPreparedStatementError(ex))
+                        {
+                            _connection.ClearPreparedStatementCacheForSchemaChange();
+                            continue;
+                        }
+
+                        throw ex;
+                    }
+
+                    value = stepResult == 1 ? stmt.GetValueObject(0) : null;
+                    if (observation != null)
+                    {
+                        _connection.CompleteSqlObservation(observation, stepResult == 1 ? 1 : 0, exception: null);
+                    }
+
+                    return true;
+                }
+            }
+            catch (Exception ex)
+            {
+                if (observation != null)
+                {
+                    _connection.CompleteSqlObservation(observation, rowsAffected: 0, ex);
+                }
+
+                throw;
+            }
         }
 
         public override Task<int> ExecuteNonQueryAsync(CancellationToken cancellationToken)
@@ -240,6 +316,7 @@ namespace DecentDB.AdoNet
                 SqlParameterRewriter.ClampOffsetParameters(sql, paramMap);
             }
             var observation = StartSqlObservationIfEnabled(_connection, sql, paramMap);
+            var canUseSingleInt64Step = TryGetSingleInt64Parameter(paramMap, out var fastIndex, out var fastValue);
 
             PreparedStatement? stmt = null;
             var usingPreparedStatementCache = false;
@@ -251,7 +328,7 @@ namespace DecentDB.AdoNet
                     usingPreparedStatementCache = false;
                     if (GetSplitStatements().Count <= 1)
                     {
-                        stmt = EnsurePreparedStatement(sql, resetForExecution: true);
+                        stmt = EnsurePreparedStatement(sql, resetForExecution: !canUseSingleInt64Step);
                         usingPreparedStatementCache = true;
                     }
                     else
@@ -259,6 +336,40 @@ namespace DecentDB.AdoNet
                         stmt = db.Prepare(sql);
                     }
 
+                    if (canUseSingleInt64Step)
+                    {
+                        _statement = stmt;
+                        _statementCanSkipFinalizeReset = true;
+
+                        var fastStepResult = stmt.BindInt64StepAndCaptureRowView(fastIndex, fastValue);
+                        if (fastStepResult < 0)
+                        {
+                            _statement = null;
+                            _statementCanSkipFinalizeReset = false;
+
+                            if (usingPreparedStatementCache)
+                            {
+                                InvalidatePreparedStatement(discardFromConnectionCache: true);
+                            }
+                            else
+                            {
+                                stmt.Dispose();
+                            }
+
+                            var ex = new DecentDBException(fastStepResult, db.LastErrorMessage, sql);
+                            if (attempt == 0 && IsSchemaChangedPreparedStatementError(ex))
+                            {
+                                _connection.ClearPreparedStatementCacheForSchemaChange();
+                                continue;
+                            }
+
+                            throw ex;
+                        }
+
+                        return new DecentDBDataReader(this, stmt, fastStepResult, observation);
+                    }
+
+                    _statementCanSkipFinalizeReset = false;
                     foreach (var kvp in paramMap)
                     {
                         BindParameter(stmt, kvp.Key, kvp.Value);
@@ -270,6 +381,7 @@ namespace DecentDB.AdoNet
                     if (stepResult < 0)
                     {
                         _statement = null;
+                        _statementCanSkipFinalizeReset = false;
 
                         if (usingPreparedStatementCache)
                         {
@@ -303,6 +415,7 @@ namespace DecentDB.AdoNet
                     }
                 }
                 _statement = null;
+                _statementCanSkipFinalizeReset = false;
 
                 if (observation != null)
                 {
@@ -448,6 +561,7 @@ namespace DecentDB.AdoNet
             _cachedRewriteParameterRefs = null;
             _cachedRewriteParameterNames = null;
             _cachedRewriteNeedsOffsetClamp = false;
+            _cachedInt64TextFloat64NonQueryPlan = null;
         }
 
         protected override Task<DbDataReader> ExecuteDbDataReaderAsync(CommandBehavior behavior, CancellationToken cancellationToken)
@@ -690,6 +804,66 @@ namespace DecentDB.AdoNet
             throw new NotSupportedException($"Unsupported parameter type: {value.GetType().FullName}");
         }
 
+        private static bool TryGetSingleInt64Parameter(
+            Dictionary<int, DbParameter> paramMap,
+            out int index1Based,
+            out long value)
+        {
+            index1Based = 0;
+            value = 0;
+            if (paramMap.Count != 1)
+            {
+                return false;
+            }
+
+            foreach (var kvp in paramMap)
+            {
+                if (!TryGetInt64ParameterValue(kvp.Value.Value, out value))
+                {
+                    return false;
+                }
+
+                index1Based = kvp.Key;
+                return true;
+            }
+
+            return false;
+        }
+
+        private static bool TryGetInt64ParameterValue(object? rawValue, out long value)
+        {
+            switch (rawValue)
+            {
+                case long l:
+                    value = l;
+                    return true;
+                case int i32:
+                    value = i32;
+                    return true;
+                case short i16:
+                    value = i16;
+                    return true;
+                case sbyte si8:
+                    value = si8;
+                    return true;
+                case byte u8:
+                    value = u8;
+                    return true;
+                case uint u32:
+                    value = u32;
+                    return true;
+                case ushort u16:
+                    value = u16;
+                    return true;
+                case ulong u64 when u64 <= long.MaxValue:
+                    value = (long)u64;
+                    return true;
+                default:
+                    value = 0;
+                    return false;
+            }
+        }
+
         private static decimal NormalizeDecimalScale(DbParameter parameter, decimal value)
         {
             if (parameter is not DecentDBParameter decentParameter || !decentParameter.HasScale)
@@ -709,6 +883,13 @@ namespace DecentDB.AdoNet
 
             if (ReferenceEquals(_statement, _preparedStatement))
             {
+                if (_statementCanSkipFinalizeReset)
+                {
+                    _statementCanSkipFinalizeReset = false;
+                    _statement = null;
+                    return;
+                }
+
                 _statement.Reset().ClearBindings();
                 _statement = null;
                 return;
@@ -716,6 +897,7 @@ namespace DecentDB.AdoNet
 
             _statement.Dispose();
             _statement = null;
+            _statementCanSkipFinalizeReset = false;
         }
 
         private int ExecuteSingleNonQuery()
@@ -725,9 +907,14 @@ namespace DecentDB.AdoNet
                 throw new InvalidOperationException("Command has no connection");
             }
 
-            if (TryExecutePragmaNonQuery(out var pragmaRowsAffected))
+            if (_parameters.Count == 0 && TryExecutePragmaNonQuery(out var pragmaRowsAffected))
             {
                 return pragmaRowsAffected;
+            }
+
+            if (TryExecuteCachedInt64TextFloat64NonQuery(out var fastRowsAffected))
+            {
+                return fastRowsAffected;
             }
 
             var (sql, paramMap, needsOffsetClamp) = GetRewrittenSqlAndParameters();
@@ -747,7 +934,8 @@ namespace DecentDB.AdoNet
                     int rowsAffected;
                     try
                     {
-                        if (!TryExecuteTypedSingleNonQuery(stmt, paramMap, out rowsAffected))
+                        if (!TryExecuteInt64TextFloat64SingleNonQuery(stmt, paramMap, out rowsAffected) &&
+                            !TryExecuteTypedSingleNonQuery(stmt, paramMap, out rowsAffected))
                         {
                             stmt.Reset().ClearBindings();
                             foreach (var kvp in paramMap)
@@ -804,6 +992,185 @@ namespace DecentDB.AdoNet
 
                 throw;
             }
+        }
+
+        private bool TryExecuteInt64TextFloat64SingleNonQuery(
+            PreparedStatement stmt,
+            Dictionary<int, DbParameter> paramMap,
+            out int rowsAffected)
+        {
+            rowsAffected = 0;
+            if (paramMap.Count != 3 ||
+                !paramMap.TryGetValue(1, out var intParameter) ||
+                !paramMap.TryGetValue(2, out var textParameter) ||
+                !paramMap.TryGetValue(3, out var floatParameter))
+            {
+                return false;
+            }
+
+            return TryExecuteInt64TextFloat64SingleNonQuery(
+                stmt,
+                intParameter,
+                textParameter,
+                floatParameter,
+                out rowsAffected);
+        }
+
+        private bool TryExecuteCachedInt64TextFloat64NonQuery(out int rowsAffected)
+        {
+            rowsAffected = 0;
+            if (_connection == null ||
+                _connection.IsSqlObservationEnabled ||
+                !TryGetCachedInt64TextFloat64NonQueryPlan(out var plan))
+            {
+                return false;
+            }
+
+            for (var attempt = 0; ; attempt++)
+            {
+                var stmt = EnsurePreparedStatement(plan.Sql, resetForExecution: false);
+                try
+                {
+                    if (!TryExecuteInt64TextFloat64SingleNonQuery(
+                            stmt,
+                            plan.IntParameter,
+                            plan.TextParameter,
+                            plan.FloatParameter,
+                            out rowsAffected))
+                    {
+                        return false;
+                    }
+
+                    return true;
+                }
+                catch (DecentDBException ex)
+                {
+                    InvalidatePreparedStatement(discardFromConnectionCache: true);
+                    if (attempt == 0 && IsSchemaChangedPreparedStatementError(ex))
+                    {
+                        _connection.ClearPreparedStatementCacheForSchemaChange();
+                        continue;
+                    }
+
+                    throw;
+                }
+                catch
+                {
+                    InvalidatePreparedStatement(discardFromConnectionCache: true);
+                    throw;
+                }
+            }
+        }
+
+        private bool TryGetCachedInt64TextFloat64NonQueryPlan(
+            [NotNullWhen(true)] out Int64TextFloat64NonQueryPlan? plan)
+        {
+            if (_cachedInt64TextFloat64NonQueryPlan != null &&
+                _cachedInt64TextFloat64NonQueryPlan.Matches(_commandText, _parameters))
+            {
+                plan = _cachedInt64TextFloat64NonQueryPlan;
+                return true;
+            }
+
+            plan = null;
+            if (_parameters.Count != 3 || GetSplitStatements().Count != 1)
+            {
+                return false;
+            }
+
+            var (sql, paramMap, needsOffsetClamp) = GetRewrittenSqlAndParameters();
+            if (needsOffsetClamp ||
+                paramMap.Count != 3 ||
+                !paramMap.TryGetValue(1, out var intParameter) ||
+                !paramMap.TryGetValue(2, out var textParameter) ||
+                !paramMap.TryGetValue(3, out var floatParameter))
+            {
+                return false;
+            }
+
+            plan = new Int64TextFloat64NonQueryPlan(
+                _commandText,
+                sql,
+                _parameters,
+                intParameter,
+                textParameter,
+                floatParameter);
+            _cachedInt64TextFloat64NonQueryPlan = plan;
+            return true;
+        }
+
+        private bool TryExecuteInt64TextFloat64SingleNonQuery(
+            PreparedStatement stmt,
+            DbParameter intParameter,
+            DbParameter textParameter,
+            DbParameter floatParameter,
+            out int rowsAffected)
+        {
+            rowsAffected = 0;
+            var intRaw = intParameter.Value;
+            var textRaw = textParameter.Value;
+            var floatRaw = floatParameter.Value;
+            if (intRaw == null ||
+                intRaw == DBNull.Value ||
+                textRaw == null ||
+                textRaw == DBNull.Value ||
+                floatRaw == null ||
+                floatRaw == DBNull.Value)
+            {
+                return false;
+            }
+
+            if (!TryGetOptimizedInt64(intParameter, intRaw, out var intValue) ||
+                !TryGetOptimizedFloat64(floatRaw, out var floatValue) ||
+                textParameter.DbType == DbType.Guid ||
+                textRaw is not string text)
+            {
+                return false;
+            }
+
+            if (textParameter.Size > 0)
+            {
+                var byteCount = Encoding.UTF8.GetByteCount(text);
+                if (byteCount > textParameter.Size)
+                {
+                    throw new ArgumentException(
+                        $"Value exceeds Size({textParameter.Size}) bytes (UTF-8). Actual: {byteCount} bytes.");
+                }
+            }
+
+            var maxByteCount = Encoding.UTF8.GetMaxByteCount(text.Length);
+            if (maxByteCount <= StackallocTextByteLimit)
+            {
+                Span<byte> textBuffer = stackalloc byte[maxByteCount];
+                var actualByteCount = EncodeUtf8Parameter(text, textBuffer);
+                rowsAffected = checked((int)stmt.ExecuteBatchInt64TextFloat64OneRow(
+                    intValue,
+                    textBuffer[..actualByteCount],
+                    floatValue));
+                return true;
+            }
+
+            rowsAffected = checked((int)stmt.ExecuteBatchInt64TextFloat64OneRow(
+                intValue,
+                Encoding.UTF8.GetBytes(text),
+                floatValue));
+            return true;
+        }
+
+        private static int EncodeUtf8Parameter(string text, Span<byte> destination)
+        {
+            for (var i = 0; i < text.Length; i++)
+            {
+                var ch = text[i];
+                if (ch > 0x7F)
+                {
+                    return Encoding.UTF8.GetBytes(text.AsSpan(), destination);
+                }
+
+                destination[i] = (byte)ch;
+            }
+
+            return text.Length;
         }
 
         private bool TryExecuteTypedSingleNonQuery(
@@ -1136,6 +1503,76 @@ namespace DecentDB.AdoNet
             return true;
         }
 
+        private sealed class Int64TextFloat64NonQueryPlan
+        {
+            public Int64TextFloat64NonQueryPlan(
+                string sourceSql,
+                string sql,
+                IReadOnlyList<DecentDBParameter> parameterCollection,
+                DbParameter intParameter,
+                DbParameter textParameter,
+                DbParameter floatParameter)
+            {
+                SourceSql = sourceSql;
+                Sql = sql;
+                Parameter0 = parameterCollection[0];
+                Parameter1 = parameterCollection[1];
+                Parameter2 = parameterCollection[2];
+                IntParameter = intParameter;
+                TextParameter = textParameter;
+                FloatParameter = floatParameter;
+                Parameter0Name = parameterCollection[0].ParameterName;
+                Parameter1Name = parameterCollection[1].ParameterName;
+                Parameter2Name = parameterCollection[2].ParameterName;
+                IntParameterName = intParameter.ParameterName;
+                TextParameterName = textParameter.ParameterName;
+                FloatParameterName = floatParameter.ParameterName;
+            }
+
+            public string SourceSql { get; }
+
+            public string Sql { get; }
+
+            public DbParameter IntParameter { get; }
+
+            public DbParameter TextParameter { get; }
+
+            public DbParameter FloatParameter { get; }
+
+            private DbParameter Parameter0 { get; }
+
+            private DbParameter Parameter1 { get; }
+
+            private DbParameter Parameter2 { get; }
+
+            private string Parameter0Name { get; }
+
+            private string Parameter1Name { get; }
+
+            private string Parameter2Name { get; }
+
+            private string IntParameterName { get; }
+
+            private string TextParameterName { get; }
+
+            private string FloatParameterName { get; }
+
+            public bool Matches(string commandText, IReadOnlyList<DecentDBParameter> parameters)
+            {
+                return parameters.Count == 3 &&
+                       string.Equals(SourceSql, commandText, StringComparison.Ordinal) &&
+                       ReferenceEquals(Parameter0, parameters[0]) &&
+                       ReferenceEquals(Parameter1, parameters[1]) &&
+                       ReferenceEquals(Parameter2, parameters[2]) &&
+                       string.Equals(Parameter0Name, parameters[0].ParameterName, StringComparison.Ordinal) &&
+                       string.Equals(Parameter1Name, parameters[1].ParameterName, StringComparison.Ordinal) &&
+                       string.Equals(Parameter2Name, parameters[2].ParameterName, StringComparison.Ordinal) &&
+                       string.Equals(IntParameterName, IntParameter.ParameterName, StringComparison.Ordinal) &&
+                       string.Equals(TextParameterName, TextParameter.ParameterName, StringComparison.Ordinal) &&
+                       string.Equals(FloatParameterName, FloatParameter.ParameterName, StringComparison.Ordinal);
+            }
+        }
+
         private PreparedStatement EnsurePreparedStatement(string sql, bool resetForExecution)
         {
             if (_connection == null)
@@ -1175,6 +1612,7 @@ namespace DecentDB.AdoNet
             {
                 _statement = null;
             }
+            _statementCanSkipFinalizeReset = false;
 
             if (_preparedStatement != null)
             {

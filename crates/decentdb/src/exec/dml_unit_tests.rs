@@ -76,6 +76,69 @@ mod tests {
     }
 
     #[test]
+    fn prepare_simple_insert_caches_hot_path_metadata() {
+        let mut runtime = EngineRuntime::empty(1);
+        let table = crate::catalog::TableSchema {
+            name: "t".to_string(),
+            temporary: false,
+            columns: vec![
+                crate::catalog::ColumnSchema {
+                    name: "id".to_string(),
+                    column_type: crate::catalog::ColumnType::Int64,
+                    spatial_type: None,
+                    enum_type: None,
+                    nullable: false,
+                    default_sql: None,
+                    generated_sql: None,
+                    generated_stored: false,
+                    primary_key: true,
+                    unique: false,
+                    auto_increment: true,
+                    checks: vec![],
+                    foreign_key: None,
+                },
+                crate::catalog::ColumnSchema {
+                    name: "name".to_string(),
+                    column_type: crate::catalog::ColumnType::Text,
+                    spatial_type: None,
+                    enum_type: None,
+                    nullable: false,
+                    default_sql: None,
+                    generated_sql: None,
+                    generated_stored: false,
+                    primary_key: false,
+                    unique: false,
+                    auto_increment: false,
+                    checks: vec![],
+                    foreign_key: None,
+                },
+            ],
+            checks: vec![],
+            foreign_keys: vec![],
+            primary_key_columns: vec!["id".to_string()],
+            next_row_id: 1,
+            pk_index_root: None,
+        };
+        runtime.catalog_mut().tables.insert("t".to_string(), table);
+
+        let stmt = parse_sql_statement("INSERT INTO t (id, name) VALUES ($1, $2)").unwrap();
+        let insert = match stmt {
+            Statement::Insert(insert) => insert,
+            _ => panic!("expected insert"),
+        };
+        let prepared = runtime
+            .prepare_simple_insert(&insert)
+            .expect("prepare")
+            .expect("prepared insert");
+        assert_eq!(
+            prepared.direct_positional_param_count,
+            Some(2),
+            "all value sources should be direct positional"
+        );
+        assert!(prepared.has_auto_increment);
+    }
+
+    #[test]
     fn prepare_simple_insert_mismatched_values_error() {
         let mut runtime = EngineRuntime::empty(1);
         let table = crate::catalog::TableSchema {
@@ -266,6 +329,7 @@ mod tests {
 
         let prepared = PreparedSimpleInsert {
             table_name: "t".to_string(),
+            row_source_dependency_tables: vec![],
             columns: vec![],
             primary_auto_row_id_column_index: None,
             value_sources: vec![],
@@ -275,6 +339,8 @@ mod tests {
             insert_indexes: vec![],
             use_generic_validation: false,
             use_generic_index_updates: false,
+            direct_positional_param_count: Some(0),
+            has_auto_increment: false,
             compiled_index_state_epoch: runtime.index_state_epoch,
         };
         assert!(runtime.can_reuse_prepared_simple_insert(&prepared));

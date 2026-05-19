@@ -418,14 +418,15 @@ fn borrowed_bytes<'a>(data: *const u8, len: usize) -> Result<&'a [u8]> {
     Ok(unsafe { std::slice::from_raw_parts(data, len) })
 }
 
+fn value_tag_owns_bytes(tag: u32) -> bool {
+    tag == DdbValueTag::Text as u32
+        || tag == DdbValueTag::Blob as u32
+        || tag == DdbValueTag::Geometry as u32
+        || tag == DdbValueTag::Geography as u32
+}
+
 fn fill_ffi_value(out: &mut DdbValue, value: &Value) {
-    if matches!(
-        out.tag,
-        x if x == DdbValueTag::Text as u32
-            || x == DdbValueTag::Blob as u32
-            || x == DdbValueTag::Geometry as u32
-            || x == DdbValueTag::Geography as u32
-    ) {
+    if value_tag_owns_bytes(out.tag) {
         free_owned_bytes(out.data, out.len);
     }
     ddb_value_reset(out);
@@ -1059,10 +1060,7 @@ pub extern "C" fn ddb_value_init(value: *mut DdbValue) -> u32 {
 pub extern "C" fn ddb_value_dispose(value: *mut DdbValue) -> u32 {
     ffi_boundary(|| {
         let value = out_ptr(value, "value")?;
-        if matches!(
-            value.tag,
-            x if x == DdbValueTag::Text as u32 || x == DdbValueTag::Blob as u32
-        ) {
+        if value_tag_owns_bytes(value.tag) {
             free_owned_bytes(value.data, value.len);
         }
         ddb_value_reset(value);
@@ -1111,6 +1109,154 @@ pub extern "C" fn ddb_db_create(path: *const c_char, out_db: *mut *mut DbHandle)
     })
 }
 
+fn parse_bool_option(value: &str, key: &str) -> Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(DbError::sql(format!(
+            "invalid boolean value for option {key}: {value}"
+        ))),
+    }
+}
+
+fn parse_u32_option(value: &str, key: &str) -> Result<u32> {
+    value.trim().parse::<u32>().map_err(|_| {
+        DbError::sql(format!(
+            "invalid unsigned integer value for option {key}: {value}"
+        ))
+    })
+}
+
+fn parse_u64_option(value: &str, key: &str) -> Result<u64> {
+    value.trim().parse::<u64>().map_err(|_| {
+        DbError::sql(format!(
+            "invalid unsigned integer value for option {key}: {value}"
+        ))
+    })
+}
+
+fn parse_cache_size_mb_option(value: &str, page_size: u32) -> Result<usize> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(DbError::sql("cache_size option requires a value"));
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    if let Some(number) = lower.strip_suffix("mb").or_else(|| lower.strip_suffix("m")) {
+        return number
+            .trim()
+            .parse::<usize>()
+            .map_err(|_| DbError::sql(format!("invalid cache_size value: {value}")));
+    }
+    if let Some(number) = lower.strip_suffix("gb").or_else(|| lower.strip_suffix("g")) {
+        let gb = number
+            .trim()
+            .parse::<usize>()
+            .map_err(|_| DbError::sql(format!("invalid cache_size value: {value}")))?;
+        return gb
+            .checked_mul(1024)
+            .ok_or_else(|| DbError::sql(format!("cache_size value is too large: {value}")));
+    }
+
+    let pages = lower
+        .parse::<usize>()
+        .map_err(|_| DbError::sql(format!("invalid cache_size value: {value}")))?;
+    let bytes = pages
+        .checked_mul(page_size as usize)
+        .ok_or_else(|| DbError::sql(format!("cache_size value is too large: {value}")))?;
+    Ok(bytes.div_ceil(1024 * 1024).max(1))
+}
+
+fn db_config_from_options(options: Option<&str>) -> Result<DbConfig> {
+    let mut config = DbConfig::default();
+    let Some(options) = options else {
+        return Ok(config);
+    };
+    let trimmed = options.trim();
+    if trimmed.is_empty() {
+        return Ok(config);
+    }
+
+    for token in trimmed.split(|ch: char| ch == ';' || ch == ',' || ch.is_whitespace()) {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = token.split_once('=') else {
+            return Err(DbError::sql(format!(
+                "database option must be key=value: {token}"
+            )));
+        };
+        let key = key.trim().to_ascii_lowercase();
+        let value = value.trim();
+        match key.as_str() {
+            "cache_size" | "cache_size_mb" => {
+                config.cache_size_mb = parse_cache_size_mb_option(value, config.page_size)?;
+            }
+            "retain_paged_row_sources_after_commit" => {
+                config.retain_paged_row_sources_after_commit =
+                    parse_bool_option(value, key.as_str())?;
+            }
+            "paged_row_storage" => {
+                config.paged_row_storage = parse_bool_option(value, key.as_str())?;
+            }
+            "persistent_pk_index" => {
+                config.persistent_pk_index = parse_bool_option(value, key.as_str())?;
+            }
+            "wal_autocheckpoint" => {
+                let pages = parse_u32_option(value, key.as_str())?;
+                config.wal_checkpoint_threshold_pages = pages;
+                if pages == 0 {
+                    config.wal_checkpoint_threshold_bytes = 0;
+                }
+            }
+            "wal_checkpoint_threshold_pages" => {
+                config.wal_checkpoint_threshold_pages = parse_u32_option(value, key.as_str())?;
+            }
+            "wal_checkpoint_threshold_bytes" => {
+                config.wal_checkpoint_threshold_bytes = parse_u64_option(value, key.as_str())?;
+            }
+            _ => {
+                return Err(DbError::sql(format!("unsupported database option: {key}")));
+            }
+        }
+    }
+
+    Ok(config)
+}
+
+fn options_arg(options: *const c_char) -> Result<Option<String>> {
+    if options.is_null() {
+        return Ok(None);
+    }
+    Ok(Some(utf8_arg(options, "options")?.to_string()))
+}
+
+#[no_mangle]
+/// Creates a database with open-time configuration options.
+///
+/// Options are a UTF-8 string of `key=value` pairs separated by whitespace,
+/// comma, or semicolon. Supported keys include `cache_size`,
+/// `retain_paged_row_sources_after_commit`, `paged_row_storage`,
+/// `persistent_pk_index`, `wal_autocheckpoint`,
+/// `wal_checkpoint_threshold_pages`, and `wal_checkpoint_threshold_bytes`.
+pub extern "C" fn ddb_db_create_with_options(
+    path: *const c_char,
+    options: *const c_char,
+    out_db: *mut *mut DbHandle,
+) -> u32 {
+    ffi_boundary(|| {
+        let path = utf8_arg(path, "path")?;
+        let options = options_arg(options)?;
+        let config = db_config_from_options(options.as_deref())?;
+        let handle = Box::new(DbHandle {
+            db: Db::create(path, config)?,
+        });
+        *out_ptr(out_db, "out_db")? = Box::into_raw(handle);
+        Ok(())
+    })
+}
+
 #[no_mangle]
 /// Opens a database and transfers ownership of the returned handle to the
 /// caller.
@@ -1131,6 +1277,25 @@ pub extern "C" fn ddb_db_open(path: *const c_char, out_db: *mut *mut DbHandle) -
 }
 
 #[no_mangle]
+/// Opens a database with open-time configuration options.
+pub extern "C" fn ddb_db_open_with_options(
+    path: *const c_char,
+    options: *const c_char,
+    out_db: *mut *mut DbHandle,
+) -> u32 {
+    ffi_boundary(|| {
+        let path = utf8_arg(path, "path")?;
+        let options = options_arg(options)?;
+        let config = db_config_from_options(options.as_deref())?;
+        let handle = Box::new(DbHandle {
+            db: Db::open(path, config)?,
+        });
+        *out_ptr(out_db, "out_db")? = Box::into_raw(handle);
+        Ok(())
+    })
+}
+
+#[no_mangle]
 /// Opens or creates a database and transfers ownership of the returned handle
 /// to the caller.
 ///
@@ -1144,6 +1309,25 @@ pub extern "C" fn ddb_db_open_or_create(path: *const c_char, out_db: *mut *mut D
         let path = utf8_arg(path, "path")?;
         let handle = Box::new(DbHandle {
             db: Db::open_or_create(path, DbConfig::default())?,
+        });
+        *out_ptr(out_db, "out_db")? = Box::into_raw(handle);
+        Ok(())
+    })
+}
+
+#[no_mangle]
+/// Opens or creates a database with open-time configuration options.
+pub extern "C" fn ddb_db_open_or_create_with_options(
+    path: *const c_char,
+    options: *const c_char,
+    out_db: *mut *mut DbHandle,
+) -> u32 {
+    ffi_boundary(|| {
+        let path = utf8_arg(path, "path")?;
+        let options = options_arg(options)?;
+        let config = db_config_from_options(options.as_deref())?;
+        let handle = Box::new(DbHandle {
+            db: Db::open_or_create(path, config)?,
         });
         *out_ptr(out_db, "out_db")? = Box::into_raw(handle);
         Ok(())
@@ -2737,6 +2921,19 @@ mod tests {
     #[test]
     fn abi_version_is_stable() {
         assert_eq!(ddb_abi_version(), DDB_ABI_VERSION);
+    }
+
+    #[test]
+    fn db_config_options_parse_tuned_profile() {
+        let config = db_config_from_options(Some(
+            "cache_size=64MB;retain_paged_row_sources_after_commit=true;paged_row_storage=false;wal_autocheckpoint=0",
+        ))
+        .expect("options should parse");
+        assert_eq!(config.cache_size_mb, 64);
+        assert!(config.retain_paged_row_sources_after_commit);
+        assert!(!config.paged_row_storage);
+        assert_eq!(config.wal_checkpoint_threshold_pages, 0);
+        assert_eq!(config.wal_checkpoint_threshold_bytes, 0);
     }
 
     #[test]

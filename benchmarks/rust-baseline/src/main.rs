@@ -21,7 +21,7 @@ use std::time::Instant;
 
 use anyhow::{bail, Context};
 use chrono::{TimeZone, Utc};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use decentdb::{DbConfig, PreparedStatement, Value};
 use serde::{Deserialize, Serialize};
 
@@ -40,12 +40,46 @@ struct Cli {
     /// Seed for the deterministic plan.
     #[arg(long, default_value_t = 42u64)]
     seed: u64,
+    /// Engine profile: default | resident-hot-read.
+    #[arg(long, value_enum, default_value_t = BenchmarkProfile::Default)]
+    profile: BenchmarkProfile,
     /// Generate an HTML report from historical JSON files in the output directory.
     #[arg(long)]
     report: bool,
     /// HTML output path for --report (defaults to <out-dir>/report.html).
     #[arg(long)]
     report_file: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum BenchmarkProfile {
+    /// Default durable engine configuration.
+    Default,
+    /// Durable profile for bulk-load-then-read workloads on one handle.
+    ResidentHotRead,
+}
+
+impl BenchmarkProfile {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::ResidentHotRead => "resident-hot-read",
+        }
+    }
+
+    fn db_config(self) -> DbConfig {
+        match self {
+            Self::Default => DbConfig::default(),
+            Self::ResidentHotRead => DbConfig {
+                retain_paged_row_sources_after_commit: true,
+                ..DbConfig::default()
+            },
+        }
+    }
+}
+
+fn default_benchmark_profile() -> String {
+    "default".to_string()
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -278,6 +312,8 @@ struct StepMetric {
 struct RunReport {
     binding: String,
     scale_name: String,
+    #[serde(default = "default_benchmark_profile")]
+    benchmark_profile: String,
     target_artists: u32,
     target_albums: u32,
     target_songs_cap: u64,
@@ -499,6 +535,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     let mut report = RunReport {
         binding: "RustRaw".to_string(),
         scale_name: scale.name.to_string(),
+        benchmark_profile: cli.profile.as_str().to_string(),
         target_artists: scale.artists,
         target_albums: scale.albums,
         target_songs_cap: scale.songs_cap,
@@ -510,7 +547,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     let mut rec = Recorder::new(&mut report);
 
     let db = rec.measure("connect_open", None, || {
-        decentdb::Db::create(&db_path, DbConfig::default()).expect("Db::create")
+        decentdb::Db::create(&db_path, cli.profile.db_config()).expect("Db::create")
     });
 
     rec.measure("schema_create", None, || {
@@ -658,7 +695,8 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     fs::create_dir_all(&cli.out_dir)?;
     let datetime_stamp = Utc::now().format("%Y-%m-%d-%H%M").to_string();
     let out_path = cli.out_dir.join(format!(
-        "{datetime_stamp}-rust-baseline-{}.json",
+        "{datetime_stamp}-rust-baseline-{}-{}.json",
+        cli.profile.as_str(),
         scale.name
     ));
     fs::write(&out_path, serde_json::to_string_pretty(&report)?)?;

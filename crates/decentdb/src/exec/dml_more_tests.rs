@@ -374,6 +374,7 @@ mod tests {
             .insert(table.name.clone(), TableData::from_rows(vec![]).into());
         let prepared = crate::exec::dml::PreparedSimpleInsert {
             table_name: "t".to_string(),
+            row_source_dependency_tables: vec![],
             columns: vec![
                 crate::exec::dml::PreparedInsertColumn {
                     name: "a".to_string(),
@@ -394,6 +395,8 @@ mod tests {
             insert_indexes: vec![],
             use_generic_validation: false,
             use_generic_index_updates: false,
+            direct_positional_param_count: None,
+            has_auto_increment: false,
             compiled_index_state_epoch: runtime.index_state_epoch,
         };
         let mut params = vec![Value::Int64(1)];
@@ -441,6 +444,7 @@ mod tests {
             .insert(table.name.clone(), TableData::from_rows(vec![]).into());
         let prepared = crate::exec::dml::PreparedSimpleInsert {
             table_name: "t2".to_string(),
+            row_source_dependency_tables: vec![],
             columns: vec![crate::exec::dml::PreparedInsertColumn {
                 name: "id".to_string(),
                 column_type: crate::catalog::ColumnType::Int64,
@@ -454,6 +458,8 @@ mod tests {
             insert_indexes: vec![],
             use_generic_validation: false,
             use_generic_index_updates: false,
+            direct_positional_param_count: None,
+            has_auto_increment: true,
             compiled_index_state_epoch: runtime.index_state_epoch,
         };
         let mut params = vec![Value::Text("bad".to_string())];

@@ -115,6 +115,42 @@ impl VfsFile for OsVfsFile {
         })
     }
 
+    fn write_all_at_many(&self, writes: &[(u64, &[u8])]) -> Result<()> {
+        let _guard = self
+            .path_lock
+            .write()
+            .map_err(|_| DbError::internal("VFS path lock poisoned"))?;
+        for (offset, buf) in writes {
+            let mut cursor = 0;
+            while cursor < buf.len() {
+                let written = write_at(&self.file, *offset + cursor as u64, &buf[cursor..])
+                    .map_err(|source| {
+                        DbError::io(
+                            format!(
+                                "write {} file at {}",
+                                self.kind.label(),
+                                self.path.display()
+                            ),
+                            source,
+                        )
+                    })?;
+                if written == 0 {
+                    return Err(DbError::io(
+                        format!(
+                            "short write on {} at offset {}: expected {} bytes, got {cursor}",
+                            self.path.display(),
+                            *offset + cursor as u64,
+                            buf.len()
+                        ),
+                        std::io::Error::new(std::io::ErrorKind::WriteZero, "short write"),
+                    ));
+                }
+                cursor += written;
+            }
+        }
+        Ok(())
+    }
+
     fn advise_sequential(&self) -> Result<()> {
         advise_sequential(&self.file).map_err(|source| {
             DbError::io(

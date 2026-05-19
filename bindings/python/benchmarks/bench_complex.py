@@ -151,6 +151,8 @@ def setup_schema(conn, engine_name):
     # Indexes
     cur.execute("CREATE INDEX idx_orders_user_id ON orders(user_id)")
     cur.execute("CREATE INDEX idx_orders_status ON orders(status)")
+    cur.execute("CREATE INDEX idx_orders_total_amount ON orders(total_amount)")
+    cur.execute("CREATE INDEX idx_items_price ON items(price)")
     cur.execute("CREATE INDEX idx_order_items_order_id ON order_items(order_id)")
     cur.execute("CREATE INDEX idx_order_items_item_id ON order_items(item_id)")
     cur.execute("CREATE INDEX idx_payments_order_id ON payments(order_id)")

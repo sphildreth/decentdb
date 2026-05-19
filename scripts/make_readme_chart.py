@@ -22,16 +22,20 @@ OUT_SVG = ROOT / "assets" / "decentdb-benchmarks.svg"
 OUT_PNG = ROOT / "assets" / "decentdb-benchmarks.png"
 
 METRICS = [
-    ("read_p95_ms", "Point read p95", "lower"),
-    ("join_p95_ms", "Join p95", "lower"),
-    ("commit_p95_ms", "Commit p95", "lower"),
+    ("read_p95_ms", "Point read p95 (ms)", "lower"),
+    ("join_p95_ms", "Join p95 (ms)", "lower"),
+    ("range_scan_p95_ms", "Range scan p95 (ms)", "lower"),
+    ("aggregate_p95_ms", "Aggregate p95 (ms)", "lower"),
+    ("concurrent_read_p95_ms", "Concurrent read p95 (ms)", "lower"),
+    ("commit_p95_ms", "Commit p95 (ms)", "lower"),
     ("insert_rows_per_sec", "Insert (rows/s)", "higher"),
 ]
 
 BASELINE_ENGINE = "sqlite"
 
 ENGINE_LABELS = {
-    "decentdb": "DecentDB",
+    "decentdb_default_durable": "DecentDB (default durable)",
+    "decentdb_tuned_durable": "DecentDB (tuned durable)",
     "duckdb": "DuckDB",
     "sqlite": "SQLite",
 }
@@ -44,7 +48,8 @@ def display_engine_name(engine: str) -> str:
 def ordered_display_engines(engines: list[str]) -> list[str]:
     engine_set = set(engines)
     preferred = [
-        display_engine_name("decentdb"),
+        display_engine_name("decentdb_tuned_durable"),
+        display_engine_name("decentdb_default_durable"),
         display_engine_name(BASELINE_ENGINE),
         display_engine_name("duckdb"),
         "H2",

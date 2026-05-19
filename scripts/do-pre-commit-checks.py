@@ -523,7 +523,7 @@ def build_checks() -> list[Check]:
                 "dotnet restore DecentDB.Benchmarks.csproj && "
                 "dotnet clean DecentDB.Benchmarks.csproj -c Release --nologo && "
                 "dotnet run -c Release --no-restore --project DecentDB.Benchmarks.csproj -- "
-                "--count 50000 --point-reads 2000 --fetchmany-batch 1000"
+                "--count 50000 --point-reads 50000 --fetchmany-batch 1000"
             ),
             env={},
             stage=5,

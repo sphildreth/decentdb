@@ -81,14 +81,20 @@ It targets a single process with **one writer** and **many concurrent readers** 
 - The native benchmark summary is generated with `cargo bench -p decentdb --bench embedded_compare`.
 - Optional Python-harness engines (for example `H2` and `HSQLDB`) are merged into the README summary with `python scripts/aggregate_benchmarks.py`.
 - The README chart assets are rendered from `data/bench_summary.json` by `python scripts/make_readme_chart.py` and `python scripts/visualize_alternative.py`.
-- Values are **normalized vs SQLite** (baseline = 1.0).
-- For "lower is better" metrics (latency, DB size), the score is inverted so **higher bars mean better**.
-- Full methodology lives in `crates/decentdb/benches/embedded_compare.rs`, and the generated summary lives in `data/bench_summary.json`.
+- Native runs now keep DecentDB rows separate by profile:
+  - `decentdb_default_durable` — durability-focused default config (`wal_sync_full`, 4 MB cache)
+  - `decentdb_tuned_durable` — durability-preserving tuned config (`wal_sync_full`, 64 MB cache, `retain_paged_row_sources_after_commit`)
+- SQLite results are reported as `sqlite_wal_full` (WAL+FULL sync); relaxed durability variants can be added as separate profiles when collected.
+- Chart values are **normalized vs SQLite** (baseline = 1.0), and the charted metric set is the full native set collected in the benchmark JSON:
+  - `read_p95_ms`, `join_p95_ms`, `range_scan_p95_ms`, `aggregate_p95_ms`, `concurrent_read_p95_ms`, `commit_p95_ms`, `insert_rows_per_sec`.
+- For "lower is better" latency metrics, inversion is applied so **higher bars mean better**.
+- For missing per-metric coverage, chart scripts render explicit N/A markers and keep H2/HSQLDB out of the all-axis radar panel rather than forcing zero scores.
+- Full methodology and all profile metadata lives in `crates/decentdb/benches/embedded_compare.rs`, and the generated summary lives in `data/bench_summary.json`.
 
 **Regenerate**
 
 ```bash
-# Build the native 3-engine benchmark summary
+# Build the native benchmark summary
 cargo bench -p decentdb --bench embedded_compare
 
 # After running benchmarks/python_embedded_compare, merge its extra engines
