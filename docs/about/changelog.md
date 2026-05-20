@@ -5,28 +5,7 @@ All notable changes to DecentDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-
-### Added
-
-- Added WASM/browser support: the `decentdb` crate now checks for
-  `wasm32-unknown-unknown`, exposes wasm-bindgen browser exports, and includes
-  an OPFS-backed VFS intended for Dedicated Worker use.
-- Added the `@decentdb/web` TypeScript binding with an async worker-owned API,
-  OPFS host bridge, explicit `wasmUrl` loading, `exec`/`query`/`prepare`,
-  binary result transport, checkpoint, import/export, persistence helper,
-  worker metrics, automated Chromium OPFS browser smoke coverage, and scheduled
-  browser transport benchmark coverage.
-- Added ADR 0161 documenting the browser WASM/OPFS runtime and its one-worker
-  ownership model.
-- Added the WASM / Browser API documentation page.
-
-### Changed
-
-- Gated the native C-backed `pg_query` parser out of `wasm32-unknown-unknown`
-  builds and added a documented wasm parser for the browser v1 SQL subset.
-
-## [2.6.0] - 2026-05-19
+## [2.6.0] - [UNREALEASED] [WIP] [CURRENT WORK BRANCH VERSION]
 
 ### Added
 
@@ -45,6 +24,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `.export`), explain helpers (`.explain`, `.plan`, `.explain-analyze`),
   positional parameter helpers (`.param`), repeat-last-SQL (`.g`), session
   history (`.s`), and branch creation/checkout helpers.
+- Added WASM/browser support: the `decentdb` crate now checks for
+  `wasm32-unknown-unknown`, exposes wasm-bindgen browser exports, and includes
+  an OPFS-backed VFS intended for Dedicated Worker use.
+- Added the `@decentdb/web` TypeScript binding with an async worker-owned API,
+  OPFS host bridge, explicit `wasmUrl` loading, `exec`/`query`/`prepare`,
+  binary result transport, checkpoint, import/export, persistence helper,
+  worker metrics, automated Chromium OPFS browser smoke coverage, and scheduled
+  browser transport benchmark coverage.
+- Added ADR 0161 documenting the browser WASM/OPFS runtime and its one-worker
+  ownership model.
+- Added the WASM / Browser API documentation page.
+
+### Changed
+
+- Gated the native C-backed `pg_query` parser out of `wasm32-unknown-unknown`
+  builds and added a documented wasm parser for the browser v1 SQL subset.
 
 ### Fixed
 
