@@ -52,11 +52,17 @@ use crate::storage::page::{self, PageId, PageStore};
 use crate::storage::{self, DatabaseHeader, PagerHandle};
 use crate::sync::SyncContext;
 use crate::sync::{
-    current_time_micros, validate_sync_scope_definition, SyncChangeBatch, SyncConflict,
-    SyncConflictPolicy, SyncConflictPolicyConfig, SyncDoctorSeverity, SyncImportSummary,
-    SyncJournalIntegrityReport, SyncJournalIssue, SyncJournalRecord, SyncOperation,
-    SyncOperationalDoctorReport, SyncPeer, SyncPeerLag, SyncPeerScopeBinding, SyncPruneSummary,
-    SyncRetentionReport, SyncRunDirection, SyncRunSummary, SyncScope, SyncSession, SyncStatus,
+    current_time_micros, validate_sync_scope_definition, ApplyChangesetOptions,
+    CreateChangesetOptions, CreateShapeOptions, InspectChangesetOptions, InvertChangesetOptions,
+    ShapeAckOptions, SyncChangeBatch, SyncChangeset, SyncChangesetApplyResult,
+    SyncChangesetCapabilities, SyncChangesetCheckpoint, SyncChangesetCompatibility,
+    SyncChangesetHistory, SyncChangesetInspection, SyncChangesetLimits, SyncChangesetRecord,
+    SyncChangesetSource, SyncConflict, SyncConflictPolicy, SyncConflictPolicyConfig,
+    SyncDoctorSeverity, SyncImportSummary, SyncJournalIntegrityReport, SyncJournalIssue,
+    SyncJournalRecord, SyncOperation, SyncOperationalDoctorReport, SyncPeer, SyncPeerLag,
+    SyncPeerScopeBinding, SyncPrincipal, SyncPruneSummary, SyncRelaySession, SyncRelayStatus,
+    SyncRetentionReport, SyncRunDirection, SyncRunSummary, SyncScope, SyncSession, SyncShape,
+    SyncShapeCheckpoint, SyncShapeClient, SyncShapeDelivery, SyncStatus,
 };
 use crate::vfs::faulty::{self, FailAction, Failpoint};
 use crate::vfs::{is_memory_path, write_all_at, FileKind, OpenMode, VfsHandle};
@@ -65,6 +71,7 @@ use crate::wal::savepoint::StatementSavepoint;
 use crate::wal::WalHandle;
 use crate::write_queue::{QueuedWriteOptions, WriteQueue, WriteQueueMetricsSnapshot};
 use serde_json::Value as JsonValue;
+use sha2::{Digest, Sha256};
 
 /// Stable engine owner used across later storage, SQL, and FFI slices.
 #[derive(Clone, Debug)]
@@ -6916,6 +6923,20 @@ impl Db {
             })
             .collect::<Vec<_>>();
         watermark_entries.extend(self.sync_peer_watermark_entries()?);
+        watermark_entries.extend(
+            self.sync_shape_clients()?
+                .into_iter()
+                .filter(|client| client.retention_blocking)
+                .map(|client| {
+                    (
+                        format!(
+                            "shape:{}:client:{}",
+                            client.shape_id, client.client_replica_id
+                        ),
+                        client.last_ack_watermark,
+                    )
+                }),
+        );
         watermark_entries.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
         watermark_entries.dedup();
         let lowest_watermark = watermark_entries
@@ -7265,6 +7286,1236 @@ impl Db {
     pub fn sync_export_batch(&self, since_seq: u64, limit: usize) -> Result<SyncChangeBatch> {
         let records = self.sync_pending_changes(since_seq, limit)?;
         SyncChangeBatch::from_records(records)
+    }
+
+    pub fn sync_create_changeset(
+        &self,
+        mut options: CreateChangesetOptions,
+    ) -> Result<SyncChangeset> {
+        self.ensure_sync_tables()?;
+        let mut scoped_from_shape = false;
+        if let Some(principal) = options.principal.as_ref() {
+            principal.validate()?;
+        }
+        if let Some(shape_id) = options.shape_id.as_deref() {
+            let shape = self.sync_shape(shape_id)?.ok_or_else(|| {
+                DbError::sql(format!(
+                    "SHAPE_NOT_FOUND: sync shape '{shape_id}' not found"
+                ))
+            })?;
+            self.sync_authorize_shape(options.principal.as_ref(), &shape)?;
+            options.scope_name = Some(shape.scope_name);
+            scoped_from_shape = true;
+        }
+        if let Some(scope_name) = options.scope_name.as_deref() {
+            if !scoped_from_shape {
+                self.sync_authorize_scope(options.principal.as_ref(), scope_name)?;
+            }
+        }
+
+        let max_records = options
+            .max_records
+            .map(usize::try_from)
+            .transpose()
+            .map_err(|_| DbError::sql("max_records is too large"))?
+            .unwrap_or(usize::MAX);
+        let created_at_micros = current_time_micros();
+        let tooling = self.get_tooling_metadata()?;
+        let runtime = self.runtime_for_metadata_inspection()?;
+        let schema_cookie = runtime.catalog.schema_cookie;
+        let tenant_id = options
+            .principal
+            .as_ref()
+            .map(|principal| principal.tenant_id.clone())
+            .or_else(|| {
+                options
+                    .shape_id
+                    .as_deref()
+                    .and_then(|shape_id| self.sync_shape(shape_id).ok().flatten())
+                    .map(|shape| shape.tenant_id)
+            });
+
+        let mut changeset = match &options.source {
+            SyncChangesetSource::Checkpoint {
+                peer,
+                since_sequence,
+            } => {
+                let batch = match options.scope_name.as_deref() {
+                    Some(scope_name) => {
+                        self.sync_export_batch_for_scope(scope_name, *since_sequence, max_records)?
+                    }
+                    None => self.sync_export_batch(*since_sequence, max_records)?,
+                };
+                let source_replica_id = batch
+                    .source_replica_id
+                    .clone()
+                    .or_else(|| self.sync_status().ok().and_then(|status| status.replica_id))
+                    .unwrap_or_else(|| "unknown".to_string());
+                let records = batch
+                    .records
+                    .iter()
+                    .map(sync_changeset_record_from_journal_record)
+                    .collect::<Vec<_>>();
+                let start_checkpoint = batch.first_sequence;
+                let end_checkpoint = batch.last_sequence;
+                let source_high_watermark = batch
+                    .source_high_watermark
+                    .or(batch.last_sequence)
+                    .or_else(|| {
+                        self.sync_integrity_report()
+                            .ok()
+                            .and_then(|report| report.last_sequence)
+                    });
+                let changeset_id = sync_changeset_id(
+                    "checkpoint",
+                    &source_replica_id,
+                    created_at_micros,
+                    records.len(),
+                );
+                SyncChangeset {
+                    changeset_version: crate::sync::SYNC_CHANGESET_VERSION,
+                    changeset_id,
+                    source_replica_id,
+                    source_kind: options.source.kind(),
+                    tenant_id,
+                    scope_name: options.scope_name.clone(),
+                    shape_id: options.shape_id.clone(),
+                    base_kind: "checkpoint".to_string(),
+                    base_checkpoint: Some(SyncChangesetCheckpoint {
+                        peer: peer.clone(),
+                        sequence: *since_sequence,
+                    }),
+                    base_branch: None,
+                    base_snapshot: None,
+                    start_checkpoint,
+                    end_checkpoint,
+                    source_high_watermark,
+                    schema_fingerprint: tooling.schema_fingerprint.clone(),
+                    schema_cookie,
+                    sync_contract_version: crate::sync::SYNC_CONTRACT_VERSION,
+                    query_contract_fingerprint: None,
+                    producer_capabilities: SyncChangesetCapabilities::default(),
+                    limits: SyncChangesetLimits::default(),
+                    records,
+                    conflict_policy_hint: None,
+                    created_at_micros,
+                    integrity_hash: None,
+                }
+            }
+            SyncChangesetSource::Branch { from, to } => {
+                self.sync_create_diff_changeset(SyncDiffChangesetContext {
+                    base_kind: "branch",
+                    from_ref: from,
+                    to_ref: to,
+                    scope_name: options.scope_name.as_deref(),
+                    shape_id: options.shape_id.as_deref(),
+                    tenant_id: tenant_id.as_deref(),
+                    schema_fingerprint: &tooling.schema_fingerprint,
+                    schema_cookie,
+                    created_at_micros,
+                    max_records,
+                })?
+            }
+            SyncChangesetSource::Snapshot { from, to } => {
+                self.sync_create_diff_changeset(SyncDiffChangesetContext {
+                    base_kind: "snapshot",
+                    from_ref: from,
+                    to_ref: to,
+                    scope_name: options.scope_name.as_deref(),
+                    shape_id: options.shape_id.as_deref(),
+                    tenant_id: tenant_id.as_deref(),
+                    schema_fingerprint: &tooling.schema_fingerprint,
+                    schema_cookie,
+                    created_at_micros,
+                    max_records,
+                })?
+            }
+        };
+        self.sync_finalize_changeset(&mut changeset, options.max_bytes)?;
+        self.sync_record_changeset_history(&changeset, "created", None)?;
+        Ok(changeset)
+    }
+
+    fn sync_create_diff_changeset(
+        &self,
+        ctx: SyncDiffChangesetContext<'_>,
+    ) -> Result<SyncChangeset> {
+        let diff = self.branch_diff(ctx.from_ref, ctx.to_ref)?;
+        let table_infos = self
+            .list_tables()?
+            .into_iter()
+            .map(|table| (table.name.clone(), table))
+            .collect::<BTreeMap<_, _>>();
+        let mut records = Vec::new();
+        let source_replica_id = format!("{}:{}:{}", ctx.base_kind, ctx.from_ref, ctx.to_ref);
+        let mut sequence = 1u64;
+        for table_diff in &diff.tables {
+            if matches!(
+                table_diff.status,
+                crate::branch::BranchTableDiffStatus::Unsupported
+            ) {
+                return Err(DbError::sql(format!(
+                    "CHANGESET_UNSUPPORTED: branch/snapshot diff for table '{}' is unsupported: {}",
+                    table_diff.table,
+                    table_diff
+                        .message
+                        .clone()
+                        .unwrap_or_else(|| "unsupported row diff".to_string())
+                )));
+            }
+            if table_diff.schema_changed {
+                return Err(DbError::sql(format!(
+                    "SCHEMA_INCOMPATIBLE: changeset diff for table '{}' changes schema",
+                    table_diff.table
+                )));
+            }
+            let Some(table) = table_infos.get(&table_diff.table) else {
+                continue;
+            };
+            let pk_names = &table.primary_key_columns;
+            let column_names = table
+                .columns
+                .iter()
+                .map(|column| column.name.clone())
+                .collect::<Vec<_>>();
+            let table_context = BranchChangesetTableContext {
+                source_replica_id: &source_replica_id,
+                table_name: &table.name,
+                primary_key_columns: pk_names,
+                column_names: &column_names,
+                schema_cookie: ctx.schema_cookie,
+                created_at_micros: ctx.created_at_micros,
+            };
+            for row in &table_diff.added {
+                records.push(sync_changeset_record_from_branch_row(
+                    &table_context,
+                    sequence,
+                    "insert",
+                    row,
+                )?);
+                sequence += 1;
+            }
+            for row in &table_diff.updated {
+                records.push(sync_changeset_record_from_branch_row(
+                    &table_context,
+                    sequence,
+                    "update",
+                    row,
+                )?);
+                sequence += 1;
+            }
+            for row in &table_diff.deleted {
+                records.push(sync_changeset_record_from_branch_row(
+                    &table_context,
+                    sequence,
+                    "delete",
+                    row,
+                )?);
+                sequence += 1;
+            }
+            if records.len() > ctx.max_records {
+                return Err(DbError::sql(
+                    "BATCH_TOO_LARGE: changeset exceeds max_records",
+                ));
+            }
+        }
+
+        let source_kind = if ctx.base_kind == "branch" {
+            crate::sync::SyncChangesetSourceKind::Branch
+        } else {
+            crate::sync::SyncChangesetSourceKind::Snapshot
+        };
+        let changeset_id = sync_changeset_id(
+            ctx.base_kind,
+            &source_replica_id,
+            ctx.created_at_micros,
+            records.len(),
+        );
+        Ok(SyncChangeset {
+            changeset_version: crate::sync::SYNC_CHANGESET_VERSION,
+            changeset_id,
+            source_replica_id,
+            source_kind,
+            tenant_id: ctx.tenant_id.map(str::to_string),
+            scope_name: ctx.scope_name.map(str::to_string),
+            shape_id: ctx.shape_id.map(str::to_string),
+            base_kind: ctx.base_kind.to_string(),
+            base_checkpoint: None,
+            base_branch: (ctx.base_kind == "branch").then(|| ctx.from_ref.to_string()),
+            base_snapshot: (ctx.base_kind == "snapshot").then(|| ctx.from_ref.to_string()),
+            start_checkpoint: records.first().map(|record| record.origin_sequence),
+            end_checkpoint: records.last().map(|record| record.origin_sequence),
+            source_high_watermark: records.last().map(|record| record.origin_sequence),
+            schema_fingerprint: ctx.schema_fingerprint.to_string(),
+            schema_cookie: ctx.schema_cookie,
+            sync_contract_version: crate::sync::SYNC_CONTRACT_VERSION,
+            query_contract_fingerprint: None,
+            producer_capabilities: SyncChangesetCapabilities {
+                before_images: true,
+                ..SyncChangesetCapabilities::default()
+            },
+            limits: SyncChangesetLimits::default(),
+            records,
+            conflict_policy_hint: None,
+            created_at_micros: ctx.created_at_micros,
+            integrity_hash: None,
+        })
+    }
+
+    pub fn sync_inspect_changeset(
+        &self,
+        changeset: &SyncChangeset,
+        options: InspectChangesetOptions,
+    ) -> Result<SyncChangesetInspection> {
+        self.sync_validate_changeset_envelope(changeset)?;
+        let bytes = serde_json::to_vec(changeset)
+            .map_err(|error| DbError::internal(format!("failed to serialize changeset: {error}")))?
+            .len() as u64;
+        let mut tables = BTreeSet::new();
+        let mut operations = BTreeMap::new();
+        let mut warnings = Vec::new();
+        for record in &changeset.records {
+            tables.insert(record.table.clone());
+            *operations.entry(record.operation.clone()).or_insert(0u64) += 1;
+            if record.operation == "delete" && record.before.is_none() {
+                warnings.push(format!(
+                    "delete record for table '{}' cannot be inverted without before image",
+                    record.table
+                ));
+            }
+        }
+        let compatibility = if options.check_local_compatibility {
+            match self.sync_check_changeset_compatibility(changeset) {
+                Ok(()) => SyncChangesetCompatibility {
+                    checked_against_local_db: true,
+                    status: "compatible".to_string(),
+                    message: None,
+                },
+                Err(error) => SyncChangesetCompatibility {
+                    checked_against_local_db: true,
+                    status: "incompatible".to_string(),
+                    message: Some(error.to_string()),
+                },
+            }
+        } else {
+            SyncChangesetCompatibility {
+                checked_against_local_db: false,
+                status: "not_checked".to_string(),
+                message: None,
+            }
+        };
+        Ok(SyncChangesetInspection {
+            changeset_id: changeset.changeset_id.clone(),
+            valid_envelope: true,
+            source_kind: changeset.source_kind.clone(),
+            scope_name: changeset.scope_name.clone(),
+            shape_id: changeset.shape_id.clone(),
+            record_count: changeset.records.len() as u64,
+            bytes,
+            tables: tables.into_iter().collect(),
+            operations,
+            start_checkpoint: changeset.start_checkpoint,
+            end_checkpoint: changeset.end_checkpoint,
+            schema_fingerprint: changeset.schema_fingerprint.clone(),
+            compatibility,
+            warnings,
+        })
+    }
+
+    pub fn sync_apply_changeset(
+        &self,
+        changeset: &SyncChangeset,
+        options: ApplyChangesetOptions,
+    ) -> Result<SyncChangesetApplyResult> {
+        self.ensure_sync_tables()?;
+        self.sync_validate_changeset_envelope(changeset)?;
+        if !options.atomic {
+            return Err(DbError::sql(
+                "CHANGESET_UNSUPPORTED: non-atomic changeset apply is not supported",
+            ));
+        }
+        if let Some(principal) = options.principal.as_ref() {
+            principal.validate()?;
+        }
+        let mut scope_authorized_via_shape = false;
+        if let Some(shape_id) = changeset.shape_id.as_deref() {
+            let shape = self.sync_shape(shape_id)?.ok_or_else(|| {
+                DbError::sql(format!(
+                    "SHAPE_NOT_FOUND: sync shape '{shape_id}' not found"
+                ))
+            })?;
+            scope_authorized_via_shape = true;
+            self.sync_authorize_shape(options.principal.as_ref(), &shape)?;
+        }
+        if let Some(scope_name) = changeset.scope_name.as_deref() {
+            if !scope_authorized_via_shape {
+                self.sync_authorize_scope(options.principal.as_ref(), scope_name)?;
+            }
+        }
+        if matches!(
+            options.compatibility_mode,
+            crate::sync::SyncCompatibilityMode::Strict
+        ) {
+            self.sync_check_changeset_compatibility(changeset)?;
+        }
+        let integrity_hash = self.sync_changeset_integrity_hash(changeset)?;
+        if let Some(existing) =
+            self.sync_read_metadata(&changeset_applied_key(&changeset.changeset_id))?
+        {
+            if existing != integrity_hash {
+                return Err(DbError::sql(format!(
+                    "CHANGESET_ID_COLLISION: changeset '{}' was already applied with a different integrity hash",
+                    changeset.changeset_id
+                )));
+            }
+            return Ok(SyncChangesetApplyResult {
+                outcome: "already_applied".to_string(),
+                changeset_id: changeset.changeset_id.clone(),
+                rows_seen: changeset.records.len() as u64,
+                rows_applied: 0,
+                rows_skipped: changeset.records.len() as u64,
+                rows_conflicted: 0,
+                checkpoint_after: changeset.source_high_watermark.or(changeset.end_checkpoint),
+            });
+        }
+
+        let journal_records = changeset
+            .records
+            .iter()
+            .map(sync_journal_record_from_changeset_record)
+            .collect::<Result<Vec<_>>>()?;
+        let batch = SyncChangeBatch::scoped_from_records(
+            journal_records,
+            Some(changeset.source_replica_id.clone()),
+            changeset.source_high_watermark.or(changeset.end_checkpoint),
+        )?;
+        let summary = match (changeset.scope_name.as_deref(), options.conflict_policy) {
+            (Some(scope_name), Some(policy)) => {
+                self.sync_import_batch_for_scope_with_policy(scope_name, &batch, policy)?
+            }
+            (Some(scope_name), None) => self.sync_import_batch_for_scope(scope_name, &batch)?,
+            (None, Some(policy)) => self.sync_import_batch_with_policy(&batch, policy)?,
+            (None, None) => self.sync_import_batch(&batch)?,
+        };
+        self.sync_upsert_metadata(
+            &changeset_applied_key(&changeset.changeset_id),
+            &integrity_hash,
+        )?;
+        self.sync_record_changeset_history(changeset, "applied", Some(current_time_micros()))?;
+        Ok(SyncChangesetApplyResult {
+            outcome: if summary.conflicted > 0 {
+                "conflict_recorded".to_string()
+            } else {
+                "applied".to_string()
+            },
+            changeset_id: changeset.changeset_id.clone(),
+            rows_seen: summary.seen as u64,
+            rows_applied: summary.applied as u64,
+            rows_skipped: summary.skipped as u64,
+            rows_conflicted: summary.conflicted as u64,
+            checkpoint_after: changeset.source_high_watermark.or(changeset.end_checkpoint),
+        })
+    }
+
+    pub fn sync_invert_changeset(
+        &self,
+        changeset: &SyncChangeset,
+        _options: InvertChangesetOptions,
+    ) -> Result<SyncChangeset> {
+        self.sync_validate_changeset_envelope(changeset)?;
+        let created_at_micros = current_time_micros();
+        let mut inverse_records = Vec::with_capacity(changeset.records.len());
+        for (index, record) in changeset.records.iter().enumerate() {
+            let operation = match record.operation.as_str() {
+                "insert" => "delete",
+                "delete" if record.before.is_some() => "insert",
+                "update" if record.before.is_some() => "update",
+                "delete" | "update" => {
+                    return Err(DbError::sql(format!(
+                        "CHANGESET_INVERSION_UNSUPPORTED: record {index} lacks before image"
+                    )));
+                }
+                other => {
+                    return Err(DbError::sql(format!(
+                        "CHANGESET_INVALID: unsupported record operation '{other}'"
+                    )));
+                }
+            };
+            inverse_records.push(SyncChangesetRecord {
+                record_version: record.record_version,
+                table: record.table.clone(),
+                operation: operation.to_string(),
+                primary_key: record.primary_key.clone(),
+                origin_replica_id: format!("inverse:{}", changeset.changeset_id),
+                origin_sequence: (index as u64) + 1,
+                transaction_id: format!("txn:inverse:{}", changeset.changeset_id),
+                transaction_lsn: (index as u64) + 1,
+                schema_cookie: record.schema_cookie,
+                before_hash: None,
+                before: record.after.clone(),
+                after: if operation == "delete" {
+                    None
+                } else {
+                    record.before.clone()
+                },
+                column_mask: record.column_mask.clone(),
+                tombstone: operation == "delete",
+                conflict_metadata: None,
+            });
+        }
+        let source_replica_id = format!("inverse:{}", changeset.source_replica_id);
+        let mut inverse = SyncChangeset {
+            changeset_version: crate::sync::SYNC_CHANGESET_VERSION,
+            changeset_id: sync_changeset_id(
+                "inverse",
+                &source_replica_id,
+                created_at_micros,
+                inverse_records.len(),
+            ),
+            source_replica_id,
+            source_kind: changeset.source_kind.clone(),
+            tenant_id: changeset.tenant_id.clone(),
+            scope_name: changeset.scope_name.clone(),
+            shape_id: changeset.shape_id.clone(),
+            base_kind: format!("inverse:{}", changeset.base_kind),
+            base_checkpoint: changeset.base_checkpoint.clone(),
+            base_branch: changeset.base_branch.clone(),
+            base_snapshot: changeset.base_snapshot.clone(),
+            start_checkpoint: inverse_records.first().map(|record| record.origin_sequence),
+            end_checkpoint: inverse_records.last().map(|record| record.origin_sequence),
+            source_high_watermark: inverse_records.last().map(|record| record.origin_sequence),
+            schema_fingerprint: changeset.schema_fingerprint.clone(),
+            schema_cookie: changeset.schema_cookie,
+            sync_contract_version: changeset.sync_contract_version,
+            query_contract_fingerprint: changeset.query_contract_fingerprint.clone(),
+            producer_capabilities: SyncChangesetCapabilities {
+                before_images: true,
+                ..SyncChangesetCapabilities::default()
+            },
+            limits: SyncChangesetLimits::default(),
+            records: inverse_records,
+            conflict_policy_hint: changeset.conflict_policy_hint.clone(),
+            created_at_micros,
+            integrity_hash: None,
+        };
+        self.sync_finalize_changeset(&mut inverse, None)?;
+        Ok(inverse)
+    }
+
+    pub fn sync_create_shape(&self, options: CreateShapeOptions) -> Result<SyncShape> {
+        self.ensure_sync_tables()?;
+        let shape_id = options.shape_id.trim();
+        let scope_name = options.scope_name.trim();
+        let tenant_id = options.tenant_id.trim();
+        if shape_id.is_empty() {
+            return Err(DbError::sql("sync shape_id must not be empty"));
+        }
+        if scope_name.is_empty() {
+            return Err(DbError::sql("sync shape scope_name must not be empty"));
+        }
+        if tenant_id.is_empty() {
+            return Err(DbError::sql(
+                "TENANT_REQUIRED: sync shape tenant_id is required",
+            ));
+        }
+        let scope = self
+            .sync_scope(scope_name)?
+            .ok_or_else(|| DbError::sql(format!("sync scope '{scope_name}' not found")))?;
+        if scope.include_tables.is_empty() {
+            return Err(DbError::sql(format!(
+                "sync scope '{scope_name}' has no included tables"
+            )));
+        }
+        let name = options.name.as_deref().unwrap_or(shape_id).trim();
+        if name.is_empty() {
+            return Err(DbError::sql("sync shape name must not be empty"));
+        }
+        let now = current_time_micros();
+        let existing = self.sync_shape(shape_id)?;
+        let created_at_micros = existing
+            .as_ref()
+            .map(|shape| shape.created_at_micros)
+            .unwrap_or(now);
+        let retention_ttl_micros = options
+            .retention_ttl_micros
+            .unwrap_or(30 * 24 * 60 * 60 * 1_000_000);
+        let max_records = options.max_records.unwrap_or(50_000);
+        let ack_deadline_micros = options.ack_deadline_micros.unwrap_or(30_000_000);
+        let heartbeat_micros = options.heartbeat_micros.unwrap_or(20_000_000);
+        let allowed_roles_json =
+            serde_json::to_string(&options.allowed_roles).map_err(|error| {
+                DbError::internal(format!("failed to encode shape allowed roles: {error}"))
+            })?;
+        let allowed_subjects_json =
+            serde_json::to_string(&options.allowed_subjects).map_err(|error| {
+                DbError::internal(format!("failed to encode shape allowed subjects: {error}"))
+            })?;
+        let sql = format!(
+            "INSERT INTO {table} (shape_id, name, scope_name, tenant_id, allowed_roles_json, allowed_subjects_json, created_at_micros, updated_at_micros, retention_ttl_micros, max_records, ack_deadline_micros, heartbeat_micros) VALUES ({shape_id}, {name}, {scope_name}, {tenant_id}, {allowed_roles_json}, {allowed_subjects_json}, {created_at_micros}, {updated_at_micros}, {retention_ttl_micros}, {max_records}, {ack_deadline_micros}, {heartbeat_micros}) ON CONFLICT (shape_id) DO UPDATE SET name = {name}, scope_name = {scope_name}, tenant_id = {tenant_id}, allowed_roles_json = {allowed_roles_json}, allowed_subjects_json = {allowed_subjects_json}, updated_at_micros = {updated_at_micros}, retention_ttl_micros = {retention_ttl_micros}, max_records = {max_records}, ack_deadline_micros = {ack_deadline_micros}, heartbeat_micros = {heartbeat_micros}",
+            table = crate::sync::SHAPES_TABLE,
+            shape_id = sql_text_literal(shape_id),
+            name = sql_text_literal(name),
+            scope_name = sql_text_literal(&scope.name),
+            tenant_id = sql_text_literal(tenant_id),
+            allowed_roles_json = sql_text_literal(&allowed_roles_json),
+            allowed_subjects_json = sql_text_literal(&allowed_subjects_json),
+            created_at_micros = created_at_micros,
+            updated_at_micros = now,
+            retention_ttl_micros = retention_ttl_micros,
+            max_records = max_records,
+            ack_deadline_micros = ack_deadline_micros,
+            heartbeat_micros = heartbeat_micros,
+        );
+        let _ = self.execute(&sql)?;
+        self.sync_shape(shape_id)?
+            .ok_or_else(|| DbError::internal("sync shape missing after create/update"))
+    }
+
+    pub fn sync_drop_shape(&self, shape_id: &str) -> Result<bool> {
+        self.ensure_sync_tables()?;
+        let shape_id = shape_id.trim();
+        if shape_id.is_empty() {
+            return Err(DbError::sql("sync shape_id must not be empty"));
+        }
+        let _ = self.execute(&format!(
+            "DELETE FROM {} WHERE shape_id = {}",
+            crate::sync::SHAPE_CLIENTS_TABLE,
+            sql_text_literal(shape_id)
+        ))?;
+        let result = self.execute(&format!(
+            "DELETE FROM {} WHERE shape_id = {}",
+            crate::sync::SHAPES_TABLE,
+            sql_text_literal(shape_id)
+        ))?;
+        Ok(result.affected_rows() > 0)
+    }
+
+    pub fn sync_shape(&self, shape_id: &str) -> Result<Option<SyncShape>> {
+        self.ensure_sync_tables()?;
+        let sql = format!(
+            "SELECT shape_id, name, scope_name, tenant_id, allowed_roles_json, allowed_subjects_json, created_at_micros, updated_at_micros, retention_ttl_micros, max_records, ack_deadline_micros, heartbeat_micros FROM {} WHERE shape_id = {}",
+            crate::sync::SHAPES_TABLE,
+            sql_text_literal(shape_id)
+        );
+        match self.execute(&sql) {
+            Ok(result) => result.rows().first().map(sync_shape_from_row).transpose(),
+            Err(error) => {
+                let message = error.to_string();
+                if message.contains("no such table") || message.contains("unknown table") {
+                    Ok(None)
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    pub fn sync_shapes(&self) -> Result<Vec<SyncShape>> {
+        self.ensure_sync_tables()?;
+        let sql = format!(
+            "SELECT shape_id, name, scope_name, tenant_id, allowed_roles_json, allowed_subjects_json, created_at_micros, updated_at_micros, retention_ttl_micros, max_records, ack_deadline_micros, heartbeat_micros FROM {} ORDER BY shape_id",
+            crate::sync::SHAPES_TABLE,
+        );
+        match self.execute(&sql) {
+            Ok(result) => result.rows().iter().map(sync_shape_from_row).collect(),
+            Err(error) => {
+                let message = error.to_string();
+                if message.contains("no such table") || message.contains("unknown table") {
+                    Ok(Vec::new())
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    pub fn sync_shape_clients(&self) -> Result<Vec<SyncShapeClient>> {
+        self.ensure_sync_tables()?;
+        let sql = format!(
+            "SELECT shape_id, tenant_id, client_replica_id, subject_id, session_id, last_ack_sequence, last_ack_watermark, last_changeset_id, last_seen_at_micros, retention_blocking, status FROM {} ORDER BY shape_id, client_replica_id",
+            crate::sync::SHAPE_CLIENTS_TABLE,
+        );
+        match self.execute(&sql) {
+            Ok(result) => result
+                .rows()
+                .iter()
+                .map(sync_shape_client_from_row)
+                .collect(),
+            Err(error) => {
+                let message = error.to_string();
+                if message.contains("no such table") || message.contains("unknown table") {
+                    Ok(Vec::new())
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    pub fn sync_shape_snapshot(
+        &self,
+        shape_id: &str,
+        _client_replica_id: &str,
+        principal: Option<SyncPrincipal>,
+    ) -> Result<SyncShapeDelivery> {
+        self.ensure_sync_tables()?;
+        let shape = self.sync_shape(shape_id)?.ok_or_else(|| {
+            DbError::sql(format!(
+                "SHAPE_NOT_FOUND: sync shape '{shape_id}' not found"
+            ))
+        })?;
+        self.sync_authorize_shape(principal.as_ref(), &shape)?;
+        let scope = self
+            .sync_scope(&shape.scope_name)?
+            .ok_or_else(|| DbError::sql(format!("sync scope '{}' not found", shape.scope_name)))?;
+        let changeset =
+            self.sync_create_shape_snapshot_changeset(&shape, &scope, principal.as_ref())?;
+        let shape_sequence = changeset
+            .source_high_watermark
+            .or(changeset.end_checkpoint)
+            .unwrap_or(0);
+        Ok(SyncShapeDelivery {
+            message_type: "snapshot".to_string(),
+            shape_id: shape.shape_id,
+            shape_sequence,
+            ack_deadline_micros: current_time_micros() + shape.ack_deadline_micros,
+            checkpoint: SyncShapeCheckpoint {
+                shape_sequence,
+                source_high_watermark: changeset.source_high_watermark.unwrap_or(shape_sequence),
+            },
+            changeset,
+        })
+    }
+
+    pub fn sync_shape_changes(
+        &self,
+        shape_id: &str,
+        since_watermark: u64,
+        principal: Option<SyncPrincipal>,
+    ) -> Result<SyncShapeDelivery> {
+        let shape = self.sync_shape(shape_id)?.ok_or_else(|| {
+            DbError::sql(format!(
+                "SHAPE_NOT_FOUND: sync shape '{shape_id}' not found"
+            ))
+        })?;
+        self.sync_authorize_shape(principal.as_ref(), &shape)?;
+        let retention = self.sync_retention_report()?;
+        if let Some(first_sequence) = retention.first_sequence {
+            if since_watermark > 0 && since_watermark < first_sequence {
+                return Err(DbError::sql(format!(
+                    "SHAPE_RESYNC_REQUIRED: since checkpoint {since_watermark} is below retained first sequence {first_sequence}"
+                )));
+            }
+        }
+        let changeset = self.sync_create_changeset(CreateChangesetOptions {
+            source: SyncChangesetSource::Checkpoint {
+                peer: shape_id.to_string(),
+                since_sequence: since_watermark,
+            },
+            scope_name: Some(shape.scope_name.clone()),
+            shape_id: Some(shape.shape_id.clone()),
+            max_records: Some(shape.max_records),
+            max_bytes: None,
+            principal,
+        })?;
+        let shape_sequence = changeset
+            .source_high_watermark
+            .or(changeset.end_checkpoint)
+            .unwrap_or(since_watermark);
+        Ok(SyncShapeDelivery {
+            message_type: "changeset".to_string(),
+            shape_id: shape.shape_id,
+            shape_sequence,
+            ack_deadline_micros: current_time_micros() + shape.ack_deadline_micros,
+            checkpoint: SyncShapeCheckpoint {
+                shape_sequence,
+                source_high_watermark: changeset.source_high_watermark.unwrap_or(shape_sequence),
+            },
+            changeset,
+        })
+    }
+
+    pub fn sync_ack_shape(&self, ack: ShapeAckOptions) -> Result<SyncShapeClient> {
+        self.sync_ack_shape_with_principal(ack, None)
+    }
+
+    pub fn sync_ack_shape_with_principal(
+        &self,
+        ack: ShapeAckOptions,
+        principal: Option<&SyncPrincipal>,
+    ) -> Result<SyncShapeClient> {
+        self.ensure_sync_tables()?;
+        let shape = self.sync_shape(&ack.shape_id)?.ok_or_else(|| {
+            DbError::sql(format!(
+                "SHAPE_NOT_FOUND: sync shape '{}' not found",
+                ack.shape_id
+            ))
+        })?;
+        self.sync_authorize_shape(principal, &shape)?;
+        if !shape.tenant_id.eq_ignore_ascii_case(&ack.tenant_id) {
+            return Err(DbError::sql(format!(
+                "AUTH_FORBIDDEN: shape '{}' belongs to tenant '{}'",
+                shape.shape_id, shape.tenant_id
+            )));
+        }
+        let now = current_time_micros();
+        let sql = format!(
+            "INSERT INTO {table} (shape_id, tenant_id, client_replica_id, subject_id, session_id, last_ack_sequence, last_ack_watermark, last_changeset_id, last_seen_at_micros, retention_blocking, status) VALUES ({shape_id}, {tenant_id}, {client_replica_id}, {subject_id}, {session_id}, {last_ack_sequence}, {last_ack_watermark}, {last_changeset_id}, {last_seen_at_micros}, 1, 'active') ON CONFLICT (shape_id, client_replica_id) DO UPDATE SET tenant_id = {tenant_id}, subject_id = {subject_id}, session_id = {session_id}, last_ack_sequence = {last_ack_sequence}, last_ack_watermark = {last_ack_watermark}, last_changeset_id = {last_changeset_id}, last_seen_at_micros = {last_seen_at_micros}, retention_blocking = 1, status = 'active'",
+            table = crate::sync::SHAPE_CLIENTS_TABLE,
+            shape_id = sql_text_literal(&shape.shape_id),
+            tenant_id = sql_text_literal(&ack.tenant_id),
+            client_replica_id = sql_text_literal(&ack.client_replica_id),
+            subject_id = sql_text_literal(&ack.subject_id),
+            session_id = sql_nullable_text_literal(ack.session_id.as_deref()),
+            last_ack_sequence = ack.shape_sequence,
+            last_ack_watermark = ack.source_high_watermark,
+            last_changeset_id = sql_nullable_text_literal(ack.changeset_id.as_deref()),
+            last_seen_at_micros = now,
+        );
+        let _ = self.execute(&sql)?;
+        self.sync_shape_clients()?
+            .into_iter()
+            .find(|client| {
+                client.shape_id == shape.shape_id
+                    && client.client_replica_id == ack.client_replica_id
+            })
+            .ok_or_else(|| DbError::internal("sync shape client missing after ack"))
+    }
+
+    pub fn sync_relay_status(
+        &self,
+        relay_id: Option<&str>,
+        production_mode: bool,
+        secure_transport_required: bool,
+        insecure_override_enabled: bool,
+        started_at_micros: Option<i64>,
+    ) -> Result<SyncRelayStatus> {
+        let status = self.sync_status()?;
+        let active_sessions = self
+            .sync_relay_sessions()?
+            .into_iter()
+            .filter(|session| session.ended_at_micros.is_none() && session.status == "started")
+            .count() as u64;
+        Ok(SyncRelayStatus {
+            relay_id: relay_id.unwrap_or("relay-local").to_string(),
+            protocol_version: crate::sync::SYNC_RELAY_PROTOCOL_VERSION,
+            database_replica_id: status.replica_id,
+            production_mode,
+            secure_transport_required,
+            insecure_override_enabled,
+            active_sessions,
+            active_streams: 0,
+            started_at_micros: started_at_micros.unwrap_or_else(current_time_micros),
+        })
+    }
+
+    pub fn sync_relay_sessions(&self) -> Result<Vec<SyncRelaySession>> {
+        self.ensure_sync_tables()?;
+        let sql = format!(
+            "SELECT session_id, tenant_id, subject_id, subject_kind, request_id, operation, scope_name, shape_id, started_at_micros, ended_at_micros, status, error, rows_seen, bytes_seen FROM {} ORDER BY started_at_micros, session_id",
+            crate::sync::RELAY_SESSIONS_TABLE,
+        );
+        match self.execute(&sql) {
+            Ok(result) => result
+                .rows()
+                .iter()
+                .map(sync_relay_session_from_row)
+                .collect(),
+            Err(error) => {
+                let message = error.to_string();
+                if message.contains("no such table") || message.contains("unknown table") {
+                    Ok(Vec::new())
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    pub fn sync_start_relay_session(
+        &self,
+        principal: &SyncPrincipal,
+        operation: &str,
+        scope_name: Option<&str>,
+        shape_id: Option<&str>,
+    ) -> Result<SyncRelaySession> {
+        self.ensure_sync_tables()?;
+        principal.validate()?;
+        let started_at_micros = current_time_micros();
+        let session_id = principal.session_id.clone();
+        let sql = format!(
+            "INSERT INTO {table} (session_id, tenant_id, subject_id, subject_kind, request_id, operation, scope_name, shape_id, started_at_micros, ended_at_micros, status, error, rows_seen, bytes_seen) VALUES ({session_id}, {tenant_id}, {subject_id}, {subject_kind}, {request_id}, {operation}, {scope_name}, {shape_id}, {started_at_micros}, NULL, 'started', NULL, 0, 0) ON CONFLICT (session_id) DO UPDATE SET tenant_id = {tenant_id}, subject_id = {subject_id}, subject_kind = {subject_kind}, request_id = {request_id}, operation = {operation}, scope_name = {scope_name}, shape_id = {shape_id}, started_at_micros = {started_at_micros}, ended_at_micros = NULL, status = 'started', error = NULL",
+            table = crate::sync::RELAY_SESSIONS_TABLE,
+            session_id = sql_text_literal(&session_id),
+            tenant_id = sql_text_literal(&principal.tenant_id),
+            subject_id = sql_text_literal(&principal.subject_id),
+            subject_kind = sql_text_literal(principal.subject_kind.as_str()),
+            request_id = sql_text_literal(&principal.request_id),
+            operation = sql_text_literal(operation),
+            scope_name = sql_nullable_text_literal(scope_name),
+            shape_id = sql_nullable_text_literal(shape_id),
+            started_at_micros = started_at_micros,
+        );
+        let _ = self.execute(&sql)?;
+        self.sync_relay_sessions()?
+            .into_iter()
+            .find(|session| session.session_id == session_id)
+            .ok_or_else(|| DbError::internal("sync relay session missing after start"))
+    }
+
+    pub fn sync_finish_relay_session(
+        &self,
+        session_id: &str,
+        status: &str,
+        error: Option<&str>,
+        rows_seen: u64,
+        bytes_seen: u64,
+    ) -> Result<()> {
+        self.ensure_sync_tables()?;
+        let sql = format!(
+            "UPDATE {table} SET ended_at_micros = {ended_at_micros}, status = {status}, error = {error}, rows_seen = {rows_seen}, bytes_seen = {bytes_seen} WHERE session_id = {session_id}",
+            table = crate::sync::RELAY_SESSIONS_TABLE,
+            ended_at_micros = current_time_micros(),
+            status = sql_text_literal(status),
+            error = sql_nullable_text_literal(error),
+            rows_seen = rows_seen,
+            bytes_seen = bytes_seen,
+            session_id = sql_text_literal(session_id),
+        );
+        let _ = self.execute(&sql)?;
+        Ok(())
+    }
+
+    pub fn sync_changeset_history(&self) -> Result<Vec<SyncChangesetHistory>> {
+        self.ensure_sync_tables()?;
+        let sql = format!(
+            "SELECT changeset_id, source_replica_id, source_kind, scope_name, shape_id, record_count, bytes, created_at_micros, applied_at_micros, outcome, integrity_hash FROM {} ORDER BY created_at_micros, changeset_id",
+            crate::sync::CHANGESET_HISTORY_TABLE,
+        );
+        match self.execute(&sql) {
+            Ok(result) => result
+                .rows()
+                .iter()
+                .map(sync_changeset_history_from_row)
+                .collect(),
+            Err(error) => {
+                let message = error.to_string();
+                if message.contains("no such table") || message.contains("unknown table") {
+                    Ok(Vec::new())
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    fn sync_authorize_scope(
+        &self,
+        principal: Option<&SyncPrincipal>,
+        scope_name: &str,
+    ) -> Result<()> {
+        if let Some(principal) = principal {
+            if !principal.allows_scope(scope_name) {
+                return Err(DbError::sql(format!(
+                    "SCOPE_UNAUTHORIZED: principal '{}' cannot access scope '{}'",
+                    principal.subject_id, scope_name
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn sync_authorize_shape(
+        &self,
+        principal: Option<&SyncPrincipal>,
+        shape: &SyncShape,
+    ) -> Result<()> {
+        let Some(principal) = principal else {
+            return Ok(());
+        };
+        if !principal.tenant_id.eq_ignore_ascii_case(&shape.tenant_id) {
+            return Err(DbError::sql(format!(
+                "AUTH_FORBIDDEN: shape '{}' belongs to tenant '{}'",
+                shape.shape_id, shape.tenant_id
+            )));
+        }
+        if !principal.allows_shape(&shape.shape_id) {
+            return Err(DbError::sql(format!(
+                "AUTH_FORBIDDEN: principal '{}' cannot access shape '{}'",
+                principal.subject_id, shape.shape_id
+            )));
+        }
+        if !shape.allowed_subjects.is_empty()
+            && !shape
+                .allowed_subjects
+                .iter()
+                .any(|subject| subject == "*" || subject == &principal.subject_id)
+        {
+            return Err(DbError::sql(format!(
+                "AUTH_FORBIDDEN: subject '{}' is not allowed for shape '{}'",
+                principal.subject_id, shape.shape_id
+            )));
+        }
+        if !shape.allowed_roles.is_empty()
+            && !principal.roles.iter().any(|role| {
+                shape
+                    .allowed_roles
+                    .iter()
+                    .any(|allowed| allowed == "*" || allowed == role)
+            })
+        {
+            return Err(DbError::sql(format!(
+                "AUTH_FORBIDDEN: principal '{}' lacks a role for shape '{}'",
+                principal.subject_id, shape.shape_id
+            )));
+        }
+        Ok(())
+    }
+
+    fn sync_create_shape_snapshot_changeset(
+        &self,
+        shape: &SyncShape,
+        scope: &SyncScope,
+        principal: Option<&SyncPrincipal>,
+    ) -> Result<SyncChangeset> {
+        let created_at_micros = current_time_micros();
+        let tooling = self.get_tooling_metadata()?;
+        let runtime = self.runtime_for_metadata_inspection()?;
+        let schema_cookie = runtime.catalog.schema_cookie;
+        let source_replica_id = self
+            .sync_status()
+            .ok()
+            .and_then(|status| status.replica_id)
+            .unwrap_or_else(|| "snapshot".to_string());
+        let mut records = Vec::new();
+        let mut origin_sequence = 1u64;
+        for table_name in &scope.include_tables {
+            let table = runtime.catalog.table(table_name).ok_or_else(|| {
+                DbError::sql(format!("sync scope table '{table_name}' does not exist"))
+            })?;
+            let column_sql = table
+                .columns
+                .iter()
+                .map(|column| sql_identifier(&column.name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let order_by = table
+                .primary_key_columns
+                .iter()
+                .map(|column| sql_identifier(column))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let where_sql = scope
+                .row_filter
+                .as_ref()
+                .map(|filter| format!(" WHERE {filter}"))
+                .unwrap_or_default();
+            let sql = format!(
+                "SELECT {column_sql} FROM {}{where_sql} ORDER BY {order_by}",
+                sql_identifier(&table.name)
+            );
+            let result = self.execute(&sql)?;
+            for row in result.rows() {
+                let after = crate::sync::build_after_json(table, row.values());
+                let primary_key = crate::sync::build_primary_key_json(table, row.values());
+                records.push(SyncChangesetRecord {
+                    record_version: 1,
+                    table: table.name.clone(),
+                    operation: "insert".to_string(),
+                    primary_key,
+                    origin_replica_id: source_replica_id.clone(),
+                    origin_sequence,
+                    transaction_id: format!("shape-snapshot:{}:{origin_sequence}", shape.shape_id),
+                    transaction_lsn: origin_sequence,
+                    schema_cookie,
+                    before_hash: None,
+                    before: None,
+                    after: Some(after),
+                    column_mask: table
+                        .columns
+                        .iter()
+                        .map(|column| column.name.clone())
+                        .collect(),
+                    tombstone: false,
+                    conflict_metadata: None,
+                });
+                origin_sequence += 1;
+                if records.len() as u64 > shape.max_records {
+                    return Err(DbError::sql(
+                        "BATCH_TOO_LARGE: shape snapshot exceeds max_records",
+                    ));
+                }
+            }
+        }
+        let high_watermark = self.sync_integrity_report()?.last_sequence.unwrap_or(0);
+        let mut changeset = SyncChangeset {
+            changeset_version: crate::sync::SYNC_CHANGESET_VERSION,
+            changeset_id: sync_changeset_id(
+                "shape_snapshot",
+                &source_replica_id,
+                created_at_micros,
+                records.len(),
+            ),
+            source_replica_id,
+            source_kind: crate::sync::SyncChangesetSourceKind::Snapshot,
+            tenant_id: Some(
+                principal
+                    .map(|principal| principal.tenant_id.clone())
+                    .unwrap_or_else(|| shape.tenant_id.clone()),
+            ),
+            scope_name: Some(scope.name.clone()),
+            shape_id: Some(shape.shape_id.clone()),
+            base_kind: "snapshot".to_string(),
+            base_checkpoint: None,
+            base_branch: None,
+            base_snapshot: Some(format!("shape:{}", shape.shape_id)),
+            start_checkpoint: records.first().map(|record| record.origin_sequence),
+            end_checkpoint: records.last().map(|record| record.origin_sequence),
+            source_high_watermark: Some(high_watermark),
+            schema_fingerprint: tooling.schema_fingerprint,
+            schema_cookie,
+            sync_contract_version: crate::sync::SYNC_CONTRACT_VERSION,
+            query_contract_fingerprint: None,
+            producer_capabilities: SyncChangesetCapabilities::default(),
+            limits: SyncChangesetLimits::default(),
+            records,
+            conflict_policy_hint: None,
+            created_at_micros,
+            integrity_hash: None,
+        };
+        self.sync_finalize_changeset(&mut changeset, None)?;
+        self.sync_record_changeset_history(&changeset, "created", None)?;
+        Ok(changeset)
+    }
+
+    fn sync_finalize_changeset(
+        &self,
+        changeset: &mut SyncChangeset,
+        max_bytes: Option<u64>,
+    ) -> Result<()> {
+        changeset.limits.record_count = changeset.records.len() as u64;
+        changeset.limits.uncompressed_bytes = 0;
+        changeset.integrity_hash = None;
+        let bytes = serde_json::to_vec(changeset)
+            .map_err(|error| DbError::internal(format!("failed to serialize changeset: {error}")))?
+            .len() as u64;
+        if max_bytes.is_some_and(|limit| bytes > limit) {
+            return Err(DbError::sql(format!(
+                "BATCH_TOO_LARGE: changeset is {bytes} bytes"
+            )));
+        }
+        changeset.limits.uncompressed_bytes = bytes;
+        let hash = self.sync_changeset_integrity_hash(changeset)?;
+        changeset.integrity_hash = Some(hash);
+        Ok(())
+    }
+
+    fn sync_validate_changeset_envelope(&self, changeset: &SyncChangeset) -> Result<()> {
+        if changeset.changeset_version != crate::sync::SYNC_CHANGESET_VERSION {
+            return Err(DbError::sql(format!(
+                "CHANGESET_UNSUPPORTED: unsupported changeset version {}",
+                changeset.changeset_version
+            )));
+        }
+        if changeset.sync_contract_version != crate::sync::SYNC_CONTRACT_VERSION {
+            return Err(DbError::sql(format!(
+                "CHANGESET_UNSUPPORTED: unsupported sync contract version {}",
+                changeset.sync_contract_version
+            )));
+        }
+        if changeset.changeset_id.trim().is_empty() {
+            return Err(DbError::sql("CHANGESET_INVALID: changeset_id is required"));
+        }
+        let Some(expected_hash) = changeset.integrity_hash.as_deref() else {
+            return Err(DbError::sql(
+                "CHANGESET_INVALID: integrity_hash is required",
+            ));
+        };
+        let actual_hash = self.sync_changeset_integrity_hash(changeset)?;
+        if expected_hash != actual_hash {
+            return Err(DbError::sql(
+                "CHANGESET_INVALID: integrity_hash does not match payload",
+            ));
+        }
+        for (index, record) in changeset.records.iter().enumerate() {
+            if record.record_version != 1 {
+                return Err(DbError::sql(format!(
+                    "CHANGESET_UNSUPPORTED: record {index} uses version {}",
+                    record.record_version
+                )));
+            }
+            match record.operation.as_str() {
+                "insert" | "update" if record.after.is_none() => {
+                    return Err(DbError::sql(format!(
+                        "CHANGESET_INVALID: record {index} operation '{}' requires after image",
+                        record.operation
+                    )));
+                }
+                "insert" | "update" | "delete" => {}
+                other => {
+                    return Err(DbError::sql(format!(
+                        "CHANGESET_INVALID: unsupported record operation '{other}'"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn sync_check_changeset_compatibility(&self, changeset: &SyncChangeset) -> Result<()> {
+        let tooling = self.get_tooling_metadata()?;
+        if tooling.schema_fingerprint != changeset.schema_fingerprint {
+            return Err(DbError::sql(format!(
+                "SCHEMA_INCOMPATIBLE: local schema fingerprint {} does not match changeset {}",
+                tooling.schema_fingerprint, changeset.schema_fingerprint
+            )));
+        }
+        let runtime = self.runtime_for_metadata_inspection()?;
+        if runtime.catalog.schema_cookie != changeset.schema_cookie {
+            return Err(DbError::sql(format!(
+                "SCHEMA_INCOMPATIBLE: local schema_cookie {} does not match changeset {}",
+                runtime.catalog.schema_cookie, changeset.schema_cookie
+            )));
+        }
+        Ok(())
+    }
+
+    fn sync_changeset_integrity_hash(&self, changeset: &SyncChangeset) -> Result<String> {
+        let mut clone = changeset.clone();
+        clone.integrity_hash = None;
+        let bytes = serde_json::to_vec(&clone).map_err(|error| {
+            DbError::internal(format!("failed to serialize changeset: {error}"))
+        })?;
+        let digest = Sha256::digest(&bytes);
+        Ok(format!("sha256:{}", hex_encode(&digest)))
+    }
+
+    fn sync_record_changeset_history(
+        &self,
+        changeset: &SyncChangeset,
+        outcome: &str,
+        applied_at_micros: Option<i64>,
+    ) -> Result<()> {
+        self.ensure_sync_tables()?;
+        let sql = format!(
+            "INSERT INTO {table} (changeset_id, source_replica_id, source_kind, scope_name, shape_id, record_count, bytes, created_at_micros, applied_at_micros, outcome, integrity_hash) VALUES ({changeset_id}, {source_replica_id}, {source_kind}, {scope_name}, {shape_id}, {record_count}, {bytes}, {created_at_micros}, {applied_at_micros}, {outcome}, {integrity_hash}) ON CONFLICT (changeset_id) DO UPDATE SET applied_at_micros = COALESCE({applied_at_micros}, applied_at_micros), outcome = {outcome}, integrity_hash = {integrity_hash}",
+            table = crate::sync::CHANGESET_HISTORY_TABLE,
+            changeset_id = sql_text_literal(&changeset.changeset_id),
+            source_replica_id = sql_text_literal(&changeset.source_replica_id),
+            source_kind = sql_text_literal(changeset.source_kind.as_str()),
+            scope_name = sql_nullable_text_literal(changeset.scope_name.as_deref()),
+            shape_id = sql_nullable_text_literal(changeset.shape_id.as_deref()),
+            record_count = changeset.records.len(),
+            bytes = changeset.limits.uncompressed_bytes,
+            created_at_micros = changeset.created_at_micros,
+            applied_at_micros = applied_at_micros
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "NULL".to_string()),
+            outcome = sql_text_literal(outcome),
+            integrity_hash = sql_nullable_text_literal(changeset.integrity_hash.as_deref()),
+        );
+        let _ = self.execute(&sql)?;
+        Ok(())
     }
 
     pub fn sync_conflict_policy(&self) -> Result<SyncConflictPolicyConfig> {
@@ -8575,6 +9826,10 @@ impl Db {
         let _ = self.execute(crate::sync::SCOPES_TABLE_DDL)?;
         let _ = self.execute(crate::sync::PEER_SCOPES_TABLE_DDL)?;
         let _ = self.execute(crate::sync::CONFLICTS_TABLE_DDL)?;
+        let _ = self.execute(crate::sync::CHANGESET_HISTORY_TABLE_DDL)?;
+        let _ = self.execute(crate::sync::RELAY_SESSIONS_TABLE_DDL)?;
+        let _ = self.execute(crate::sync::SHAPES_TABLE_DDL)?;
+        let _ = self.execute(crate::sync::SHAPE_CLIENTS_TABLE_DDL)?;
         self.ensure_sync_conflict_columns()?;
         Ok(())
     }
@@ -8737,6 +9992,13 @@ impl Db {
                 self.sync_conflict_policy_query_result().map(Some)
             }
             SyncInspectionQuery::Conflicts => self.sync_conflicts_query_result().map(Some),
+            SyncInspectionQuery::RelayStatus => self.sync_relay_status_query_result().map(Some),
+            SyncInspectionQuery::RelaySessions => self.sync_relay_sessions_query_result().map(Some),
+            SyncInspectionQuery::Shapes => self.sync_shapes_query_result().map(Some),
+            SyncInspectionQuery::ShapeClients => self.sync_shape_clients_query_result().map(Some),
+            SyncInspectionQuery::ChangesetHistory => {
+                self.sync_changeset_history_query_result().map(Some)
+            }
         }
     }
 
@@ -9329,6 +10591,152 @@ impl Db {
         }
     }
 
+    fn sync_relay_status_query_result(&self) -> Result<QueryResult> {
+        let status = self.sync_relay_status(None, false, false, false, None)?;
+        Ok(QueryResult::with_rows(
+            vec![
+                "relay_id".to_string(),
+                "protocol_version".to_string(),
+                "database_replica_id".to_string(),
+                "production_mode".to_string(),
+                "secure_transport_required".to_string(),
+                "insecure_override_enabled".to_string(),
+                "active_sessions".to_string(),
+                "active_streams".to_string(),
+                "started_at_micros".to_string(),
+            ],
+            vec![QueryRow::new(vec![
+                Value::Text(status.relay_id),
+                Value::Int64(i64::from(status.protocol_version)),
+                status
+                    .database_replica_id
+                    .map(Value::Text)
+                    .unwrap_or(Value::Null),
+                Value::Bool(status.production_mode),
+                Value::Bool(status.secure_transport_required),
+                Value::Bool(status.insecure_override_enabled),
+                sync_u64_to_i64(status.active_sessions, "active_sessions")?,
+                sync_u64_to_i64(status.active_streams, "active_streams")?,
+                Value::Int64(status.started_at_micros),
+            ])],
+        ))
+    }
+
+    fn sync_relay_sessions_query_result(&self) -> Result<QueryResult> {
+        self.query_table_or_empty(
+            crate::sync::RELAY_SESSIONS_TABLE,
+            &[
+                "session_id",
+                "tenant_id",
+                "subject_id",
+                "subject_kind",
+                "request_id",
+                "operation",
+                "scope_name",
+                "shape_id",
+                "started_at_micros",
+                "ended_at_micros",
+                "status",
+                "error",
+                "rows_seen",
+                "bytes_seen",
+            ],
+            "started_at_micros, session_id",
+        )
+    }
+
+    fn sync_shapes_query_result(&self) -> Result<QueryResult> {
+        self.query_table_or_empty(
+            crate::sync::SHAPES_TABLE,
+            &[
+                "shape_id",
+                "name",
+                "scope_name",
+                "tenant_id",
+                "allowed_roles_json",
+                "allowed_subjects_json",
+                "created_at_micros",
+                "updated_at_micros",
+                "retention_ttl_micros",
+                "max_records",
+                "ack_deadline_micros",
+                "heartbeat_micros",
+            ],
+            "shape_id",
+        )
+    }
+
+    fn sync_shape_clients_query_result(&self) -> Result<QueryResult> {
+        self.query_table_or_empty(
+            crate::sync::SHAPE_CLIENTS_TABLE,
+            &[
+                "shape_id",
+                "tenant_id",
+                "client_replica_id",
+                "subject_id",
+                "session_id",
+                "last_ack_sequence",
+                "last_ack_watermark",
+                "last_changeset_id",
+                "last_seen_at_micros",
+                "retention_blocking",
+                "status",
+            ],
+            "shape_id, client_replica_id",
+        )
+    }
+
+    fn sync_changeset_history_query_result(&self) -> Result<QueryResult> {
+        self.query_table_or_empty(
+            crate::sync::CHANGESET_HISTORY_TABLE,
+            &[
+                "changeset_id",
+                "source_replica_id",
+                "source_kind",
+                "scope_name",
+                "shape_id",
+                "record_count",
+                "bytes",
+                "created_at_micros",
+                "applied_at_micros",
+                "outcome",
+                "integrity_hash",
+            ],
+            "created_at_micros, changeset_id",
+        )
+    }
+
+    fn query_table_or_empty(
+        &self,
+        table_name: &str,
+        columns: &[&str],
+        order_by: &str,
+    ) -> Result<QueryResult> {
+        let sql = format!(
+            "SELECT {} FROM {} ORDER BY {order_by}",
+            columns
+                .iter()
+                .map(|column| sql_identifier(column))
+                .collect::<Vec<_>>()
+                .join(", "),
+            sql_identifier(table_name)
+        );
+        match self.execute(&sql) {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                let message = error.to_string();
+                if message.contains("no such table") || message.contains("unknown table") {
+                    Ok(QueryResult::with_rows(
+                        columns.iter().map(|column| (*column).to_string()).collect(),
+                        Vec::new(),
+                    ))
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
     pub(crate) fn sync_post_commit(
         &self,
         runtime: &mut EngineRuntime,
@@ -9495,6 +10903,11 @@ enum SyncInspectionQuery {
     Sessions,
     ConflictPolicy,
     Conflicts,
+    RelayStatus,
+    RelaySessions,
+    Shapes,
+    ShapeClients,
+    ChangesetHistory,
 }
 
 impl SyncInspectionQuery {
@@ -9524,7 +10937,9 @@ impl SyncInspectionQuery {
             "select * from sys_sync_peers order by name" => Some(Self::Peers),
             "select * from sys_sync_peers order by name asc" => Some(Self::Peers),
             "select * from sys_sync_retention" => Some(Self::Retention),
+            "select * from sys.sync_retention" => Some(Self::Retention),
             "select * from sys_sync_peer_lag" => Some(Self::PeerLag),
+            "select * from sys.sync_peer_lag" => Some(Self::PeerLag),
             "select * from sys_sync_peer_lag order by peer_name" => Some(Self::PeerLag),
             "select * from sys_sync_peer_lag order by peer_name asc" => Some(Self::PeerLag),
             "select * from sys_sync_doctor" => Some(Self::Doctor),
@@ -9551,6 +10966,21 @@ impl SyncInspectionQuery {
             "select * from sys_sync_conflicts" => Some(Self::Conflicts),
             "select * from sys_sync_conflicts order by conflict_id" => Some(Self::Conflicts),
             "select * from sys_sync_conflicts order by conflict_id asc" => Some(Self::Conflicts),
+            "select * from sys.sync_relay_status" => Some(Self::RelayStatus),
+            "select * from sys.sync_relay_sessions" => Some(Self::RelaySessions),
+            "select * from sys.sync_relay_sessions order by started_at_micros, session_id" => {
+                Some(Self::RelaySessions)
+            }
+            "select * from sys.sync_shapes" => Some(Self::Shapes),
+            "select * from sys.sync_shapes order by shape_id" => Some(Self::Shapes),
+            "select * from sys.sync_shape_clients" => Some(Self::ShapeClients),
+            "select * from sys.sync_shape_clients order by shape_id, client_replica_id" => {
+                Some(Self::ShapeClients)
+            }
+            "select * from sys.sync_changeset_history" => Some(Self::ChangesetHistory),
+            "select * from sys.sync_changeset_history order by created_at_micros, changeset_id" => {
+                Some(Self::ChangesetHistory)
+            }
             _ => parse_sync_journal_where_sequence(normalized)
                 .map(|since_sequence| Self::Journal { since_sequence }),
         }
@@ -9584,6 +11014,334 @@ fn sync_usize_to_i64(value: usize, field_name: &str) -> Result<Value> {
         .and_then(i64::try_from)
         .map(Value::Int64)
         .map_err(|_| DbError::internal(format!("{field_name} exceeds INT64 range")))
+}
+
+struct SyncDiffChangesetContext<'a> {
+    base_kind: &'a str,
+    from_ref: &'a str,
+    to_ref: &'a str,
+    scope_name: Option<&'a str>,
+    shape_id: Option<&'a str>,
+    tenant_id: Option<&'a str>,
+    schema_fingerprint: &'a str,
+    schema_cookie: u32,
+    created_at_micros: i64,
+    max_records: usize,
+}
+
+struct BranchChangesetTableContext<'a> {
+    source_replica_id: &'a str,
+    table_name: &'a str,
+    primary_key_columns: &'a [String],
+    column_names: &'a [String],
+    schema_cookie: u32,
+    created_at_micros: i64,
+}
+
+fn sync_changeset_record_from_journal_record(record: &SyncJournalRecord) -> SyncChangesetRecord {
+    SyncChangesetRecord {
+        record_version: 1,
+        table: record.table.clone(),
+        operation: record.operation.clone(),
+        primary_key: record.primary_key.clone(),
+        origin_replica_id: record.replica_id.clone(),
+        origin_sequence: record.sequence,
+        transaction_id: format!("txn:{}", record.transaction_lsn),
+        transaction_lsn: record.transaction_lsn,
+        schema_cookie: record.schema_cookie,
+        before_hash: None,
+        before: None,
+        after: record.after.clone(),
+        column_mask: Vec::new(),
+        tombstone: record.operation == "delete",
+        conflict_metadata: None,
+    }
+}
+
+fn sync_journal_record_from_changeset_record(
+    record: &SyncChangesetRecord,
+) -> Result<SyncJournalRecord> {
+    let after = match record.operation.as_str() {
+        "insert" | "update" => Some(record.after.clone().ok_or_else(|| {
+            DbError::sql("CHANGESET_INVALID: insert/update changeset record missing after")
+        })?),
+        "delete" => None,
+        other => {
+            return Err(DbError::sql(format!(
+                "CHANGESET_INVALID: unsupported operation '{other}'"
+            )));
+        }
+    };
+    Ok(SyncJournalRecord {
+        schema_version: 1,
+        sequence: record.origin_sequence,
+        replica_id: record.origin_replica_id.clone(),
+        transaction_lsn: record.transaction_lsn,
+        table: record.table.clone(),
+        operation: record.operation.clone(),
+        primary_key: record.primary_key.clone(),
+        after,
+        schema_cookie: record.schema_cookie,
+        committed_at_micros: current_time_micros(),
+    })
+}
+
+fn sync_changeset_record_from_branch_row(
+    ctx: &BranchChangesetTableContext<'_>,
+    origin_sequence: u64,
+    operation: &str,
+    row: &crate::branch::BranchRowDiff,
+) -> Result<SyncChangesetRecord> {
+    let primary_key = branch_primary_key_object(ctx.primary_key_columns, &row.primary_key)?;
+    let before = row
+        .before
+        .as_ref()
+        .map(|values| branch_row_object(ctx.column_names, values))
+        .transpose()?;
+    let after = row
+        .after
+        .as_ref()
+        .map(|values| branch_row_object(ctx.column_names, values))
+        .transpose()?;
+    Ok(SyncChangesetRecord {
+        record_version: 1,
+        table: ctx.table_name.to_string(),
+        operation: operation.to_string(),
+        primary_key,
+        origin_replica_id: ctx.source_replica_id.to_string(),
+        origin_sequence,
+        transaction_id: format!("txn:{}:{origin_sequence}", ctx.source_replica_id),
+        transaction_lsn: origin_sequence,
+        schema_cookie: ctx.schema_cookie,
+        before_hash: before.as_ref().map(json_hash).transpose()?,
+        before,
+        after,
+        column_mask: ctx.column_names.to_vec(),
+        tombstone: operation == "delete",
+        conflict_metadata: Some(serde_json::json!({
+            "source": "branch_diff",
+            "created_at_micros": ctx.created_at_micros
+        })),
+    })
+}
+
+fn branch_primary_key_object(columns: &[String], values: &[String]) -> Result<serde_json::Value> {
+    if columns.len() != values.len() {
+        return Err(DbError::sql("branch diff primary-key width mismatch"));
+    }
+    let mut object = serde_json::Map::new();
+    for (column, value) in columns.iter().zip(values) {
+        object.insert(column.clone(), json_from_branch_value(value));
+    }
+    Ok(serde_json::Value::Object(object))
+}
+
+fn branch_row_object(columns: &[String], values: &[String]) -> Result<serde_json::Value> {
+    if columns.len() != values.len() {
+        return Err(DbError::sql("branch diff row width mismatch"));
+    }
+    let mut object = serde_json::Map::new();
+    for (column, value) in columns.iter().zip(values) {
+        object.insert(column.clone(), json_from_branch_value(value));
+    }
+    Ok(serde_json::Value::Object(object))
+}
+
+fn json_from_branch_value(value: &str) -> serde_json::Value {
+    let trimmed = value.trim();
+    if trimmed.eq_ignore_ascii_case("null") {
+        return serde_json::Value::Null;
+    }
+    if trimmed.eq_ignore_ascii_case("true") {
+        return serde_json::Value::Bool(true);
+    }
+    if trimmed.eq_ignore_ascii_case("false") {
+        return serde_json::Value::Bool(false);
+    }
+    if let Some(quoted) = trimmed
+        .strip_prefix('\'')
+        .and_then(|value| value.strip_suffix('\''))
+    {
+        return serde_json::Value::String(quoted.replace("''", "'"));
+    }
+    if let Ok(value) = trimmed.parse::<i64>() {
+        return serde_json::Value::Number(value.into());
+    }
+    if let Ok(value) = trimmed.parse::<f64>() {
+        if let Some(number) = serde_json::Number::from_f64(value) {
+            return serde_json::Value::Number(number);
+        }
+    }
+    serde_json::Value::String(trimmed.to_string())
+}
+
+fn sync_changeset_id(kind: &str, source: &str, created_at_micros: i64, count: usize) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(kind.as_bytes());
+    hasher.update(source.as_bytes());
+    hasher.update(created_at_micros.to_le_bytes());
+    hasher.update((count as u64).to_le_bytes());
+    let digest = hasher.finalize();
+    format!(
+        "dcs_{created_at_micros:016x}_{}",
+        &hex_encode(&digest)[..16]
+    )
+}
+
+fn changeset_applied_key(changeset_id: &str) -> String {
+    format!("changeset_applied:{changeset_id}")
+}
+
+fn json_hash(value: &serde_json::Value) -> Result<String> {
+    let bytes = serde_json::to_vec(value).map_err(|error| {
+        DbError::internal(format!("failed to serialize JSON hash input: {error}"))
+    })?;
+    let digest = Sha256::digest(&bytes);
+    Ok(format!("sha256:{}", hex_encode(&digest)))
+}
+
+fn sync_shape_from_row(row: &QueryRow) -> Result<SyncShape> {
+    let values = row.values();
+    Ok(SyncShape {
+        shape_id: parse_text_value(values.first(), "shape_id")?,
+        name: parse_text_value(values.get(1), "name")?,
+        scope_name: parse_text_value(values.get(2), "scope_name")?,
+        tenant_id: parse_text_value(values.get(3), "tenant_id")?,
+        allowed_roles: serde_json::from_str(&parse_text_value(
+            values.get(4),
+            "allowed_roles_json",
+        )?)
+        .map_err(|error| DbError::corruption(format!("malformed allowed_roles_json: {error}")))?,
+        allowed_subjects: serde_json::from_str(&parse_text_value(
+            values.get(5),
+            "allowed_subjects_json",
+        )?)
+        .map_err(|error| {
+            DbError::corruption(format!("malformed allowed_subjects_json: {error}"))
+        })?,
+        created_at_micros: parse_sync_i64(values.get(6), "created_at_micros")?,
+        updated_at_micros: parse_sync_i64(values.get(7), "updated_at_micros")?,
+        retention_ttl_micros: parse_sync_i64(values.get(8), "retention_ttl_micros")?,
+        max_records: parse_u64_value(values.get(9), "max_records")?,
+        ack_deadline_micros: parse_sync_i64(values.get(10), "ack_deadline_micros")?,
+        heartbeat_micros: parse_sync_i64(values.get(11), "heartbeat_micros")?,
+    })
+}
+
+fn sync_shape_client_from_row(row: &QueryRow) -> Result<SyncShapeClient> {
+    let values = row.values();
+    Ok(SyncShapeClient {
+        shape_id: parse_text_value(values.first(), "shape_id")?,
+        tenant_id: parse_text_value(values.get(1), "tenant_id")?,
+        client_replica_id: parse_text_value(values.get(2), "client_replica_id")?,
+        subject_id: parse_text_value(values.get(3), "subject_id")?,
+        session_id: parse_optional_text_value(values.get(4), "session_id")?,
+        last_ack_sequence: parse_u64_value(values.get(5), "last_ack_sequence")?,
+        last_ack_watermark: parse_u64_value(values.get(6), "last_ack_watermark")?,
+        last_changeset_id: parse_optional_text_value(values.get(7), "last_changeset_id")?,
+        last_seen_at_micros: parse_sync_i64(values.get(8), "last_seen_at_micros")?,
+        retention_blocking: parse_boolish_value(values.get(9), "retention_blocking")?,
+        status: parse_text_value(values.get(10), "status")?,
+    })
+}
+
+fn sync_relay_session_from_row(row: &QueryRow) -> Result<SyncRelaySession> {
+    let values = row.values();
+    Ok(SyncRelaySession {
+        session_id: parse_text_value(values.first(), "session_id")?,
+        tenant_id: parse_text_value(values.get(1), "tenant_id")?,
+        subject_id: parse_text_value(values.get(2), "subject_id")?,
+        subject_kind: crate::sync::SyncSubjectKind::from_str(&parse_text_value(
+            values.get(3),
+            "subject_kind",
+        )?)?,
+        request_id: parse_text_value(values.get(4), "request_id")?,
+        operation: parse_text_value(values.get(5), "operation")?,
+        scope_name: parse_optional_text_value(values.get(6), "scope_name")?,
+        shape_id: parse_optional_text_value(values.get(7), "shape_id")?,
+        started_at_micros: parse_sync_i64(values.get(8), "started_at_micros")?,
+        ended_at_micros: parse_optional_i64_value(values.get(9), "ended_at_micros")?,
+        status: parse_text_value(values.get(10), "status")?,
+        error: parse_optional_text_value(values.get(11), "error")?,
+        rows_seen: parse_u64_value(values.get(12), "rows_seen")?,
+        bytes_seen: parse_u64_value(values.get(13), "bytes_seen")?,
+    })
+}
+
+fn sync_changeset_history_from_row(row: &QueryRow) -> Result<SyncChangesetHistory> {
+    let values = row.values();
+    let source_kind = match parse_text_value(values.get(2), "source_kind")?.as_str() {
+        "checkpoint" => crate::sync::SyncChangesetSourceKind::Checkpoint,
+        "branch" => crate::sync::SyncChangesetSourceKind::Branch,
+        "snapshot" => crate::sync::SyncChangesetSourceKind::Snapshot,
+        other => {
+            return Err(DbError::corruption(format!(
+                "malformed changeset history source_kind '{other}'"
+            )));
+        }
+    };
+    Ok(SyncChangesetHistory {
+        changeset_id: parse_text_value(values.first(), "changeset_id")?,
+        source_replica_id: parse_text_value(values.get(1), "source_replica_id")?,
+        source_kind,
+        scope_name: parse_optional_text_value(values.get(3), "scope_name")?,
+        shape_id: parse_optional_text_value(values.get(4), "shape_id")?,
+        record_count: parse_u64_value(values.get(5), "record_count")?,
+        bytes: parse_u64_value(values.get(6), "bytes")?,
+        created_at_micros: parse_sync_i64(values.get(7), "created_at_micros")?,
+        applied_at_micros: parse_optional_i64_value(values.get(8), "applied_at_micros")?,
+        outcome: parse_text_value(values.get(9), "outcome")?,
+        integrity_hash: parse_optional_text_value(values.get(10), "integrity_hash")?,
+    })
+}
+
+fn parse_text_value(value: Option<&Value>, field_name: &str) -> Result<String> {
+    match value {
+        Some(Value::Text(value)) => Ok(value.clone()),
+        _ => Err(DbError::corruption(format!(
+            "malformed sync row: {field_name}"
+        ))),
+    }
+}
+
+fn parse_optional_text_value(value: Option<&Value>, field_name: &str) -> Result<Option<String>> {
+    match value {
+        Some(Value::Null) | None => Ok(None),
+        Some(Value::Text(value)) => Ok(Some(value.clone())),
+        _ => Err(DbError::corruption(format!(
+            "malformed sync row: {field_name}"
+        ))),
+    }
+}
+
+fn parse_optional_i64_value(value: Option<&Value>, field_name: &str) -> Result<Option<i64>> {
+    match value {
+        Some(Value::Null) | None => Ok(None),
+        Some(Value::Int64(value)) => Ok(Some(*value)),
+        Some(Value::Bool(value)) => Ok(Some(i64::from(*value))),
+        _ => Err(DbError::corruption(format!(
+            "malformed sync row: {field_name}"
+        ))),
+    }
+}
+
+fn parse_u64_value(value: Option<&Value>, field_name: &str) -> Result<u64> {
+    let value = parse_sync_i64(value, field_name)?;
+    u64::try_from(value).map_err(|_| {
+        DbError::corruption(format!(
+            "malformed sync row: {field_name} must be non-negative"
+        ))
+    })
+}
+
+fn parse_boolish_value(value: Option<&Value>, field_name: &str) -> Result<bool> {
+    match value {
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(Value::Int64(value)) => Ok(*value != 0),
+        _ => Err(DbError::corruption(format!(
+            "malformed sync row: {field_name}"
+        ))),
+    }
 }
 
 fn sync_conflict_from_row(row: &QueryRow) -> Result<SyncConflict> {

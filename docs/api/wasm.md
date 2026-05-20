@@ -161,8 +161,8 @@ Set `resultTransport: "json"` only for debugging or compatibility comparisons.
 Use `metrics()` when validating browser performance-sensitive changes. It
 returns available worker-side samples such as current WASM linear-memory bytes,
 pages, owner id/runtime, attached client count, coordination model, parser
-profile, sync-deferred status, quota/usage estimates, persistent-storage state,
-and Chrome JS heap samples when exposed.
+profile, sync transport status, quota/usage estimates, persistent-storage
+state, and Chrome JS heap samples when exposed.
 
 Browser-only system views are intercepted by the web runtime:
 
@@ -174,6 +174,44 @@ SELECT * FROM sys.browser_sync;
 ```
 
 These views report browser runtime state without adding native hot-path cost.
+
+## Production Relay Sync
+
+The browser package exposes owner-routed relay helpers under `db.sync`:
+
+```ts
+await db.sync.configurePeer({
+  name: "relay",
+  endpoint: "https://relay.example.com",
+  token,
+  headers: {
+    "x-decentdb-tenant": "tenant_42",
+    "x-decentdb-subject": "user_123",
+    "x-decentdb-roles": "user",
+    "x-decentdb-shapes": "tenant_42_tasks_v1",
+  },
+});
+
+const snapshot = await db.sync.shapeSnapshot({
+  peer: "relay",
+  shapeId: "tenant_42_tasks_v1",
+  clientReplicaId: "web_123",
+});
+
+const subscription = db.sync.subscribeShape({
+  peer: "relay",
+  shapeId: "tenant_42_tasks_v1",
+  clientReplicaId: "web_123",
+  onMessage(message) {
+    // Apply or inspect the delivered changeset in application code.
+    subscription.ack(message);
+  },
+});
+```
+
+HTTP helpers use normal fetch headers. WebSocket subscriptions pass short-lived
+principal context in the stream URL because browser WebSocket APIs cannot set
+custom headers; deploy relay streams over TLS.
 
 ## Persistence And Durability
 
@@ -211,9 +249,9 @@ await db.import(restoredBytes);
   and smoke workflows: `CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`,
   `DROP INDEX`, `INSERT ... VALUES`, `UPDATE`, `DELETE`, and basic `SELECT`
   with simple boolean/comparison `WHERE`, `ORDER BY`, `LIMIT`, and `OFFSET`.
-- Browser sync exposes an owner-routed API shell, but production relay transport
-  remains deferred to the production sync relay phase and returns explicit
-  deferred results/errors.
+- Browser sync relay helpers require an application-hosted production relay.
+  The legacy `sync.run()` peer-to-peer workflow remains a compatibility shell
+  for builds that have not configured a relay.
 
 ## Browser Smoke
 
@@ -306,5 +344,9 @@ tabs can open the same path; the runtime routes through one active owner.
   replay WAL through normal open.
 - `ERR_BROWSER_SERVICE_WORKER_UNSUPPORTED`: open the database from an
   application page/runtime owner instead of a service worker.
-- `ERR_BROWSER_SYNC_DEFERRED`: browser sync API shape is present, but production
-  sync transport is deferred to the sync relay work.
+- `ERR_BROWSER_SYNC_PEER_NOT_CONFIGURED`: configure the relay with
+  `db.sync.configurePeer()` before calling relay helpers.
+- `ERR_BROWSER_SYNC_PRINCIPAL_REQUIRED`: provide relay principal context for a
+  WebSocket shape subscription.
+- `ERR_BROWSER_SYNC_WEBSOCKET`: the relay stream could not be opened or was
+  closed by the browser/runtime.

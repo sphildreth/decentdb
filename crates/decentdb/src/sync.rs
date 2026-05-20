@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::{Display, Formatter};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -43,6 +43,27 @@ pub(crate) const SCOPES_TABLE_DDL: &str = "CREATE TABLE IF NOT EXISTS __decentdb
 pub(crate) const PEER_SCOPES_TABLE: &str = "__decentdb_sync_peer_scopes";
 
 pub(crate) const PEER_SCOPES_TABLE_DDL: &str = "CREATE TABLE IF NOT EXISTS __decentdb_sync_peer_scopes (peer_name TEXT PRIMARY KEY, scope_name TEXT NOT NULL, created_at_micros INT64 NOT NULL, updated_at_micros INT64 NOT NULL)";
+
+pub(crate) const CHANGESET_HISTORY_TABLE: &str = "__decentdb_sync_changeset_history";
+
+pub(crate) const CHANGESET_HISTORY_TABLE_DDL: &str = "CREATE TABLE IF NOT EXISTS __decentdb_sync_changeset_history (changeset_id TEXT PRIMARY KEY, source_replica_id TEXT NOT NULL, source_kind TEXT NOT NULL, scope_name TEXT, shape_id TEXT, record_count INT64 NOT NULL, bytes INT64 NOT NULL, created_at_micros INT64 NOT NULL, applied_at_micros INT64, outcome TEXT NOT NULL, integrity_hash TEXT)";
+
+pub(crate) const RELAY_SESSIONS_TABLE: &str = "__decentdb_sync_relay_sessions";
+
+pub(crate) const RELAY_SESSIONS_TABLE_DDL: &str = "CREATE TABLE IF NOT EXISTS __decentdb_sync_relay_sessions (session_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, subject_id TEXT NOT NULL, subject_kind TEXT NOT NULL, request_id TEXT NOT NULL, operation TEXT NOT NULL, scope_name TEXT, shape_id TEXT, started_at_micros INT64 NOT NULL, ended_at_micros INT64, status TEXT NOT NULL, error TEXT, rows_seen INT64 NOT NULL, bytes_seen INT64 NOT NULL)";
+
+pub(crate) const SHAPES_TABLE: &str = "__decentdb_sync_shapes";
+
+pub(crate) const SHAPES_TABLE_DDL: &str = "CREATE TABLE IF NOT EXISTS __decentdb_sync_shapes (shape_id TEXT PRIMARY KEY, name TEXT NOT NULL, scope_name TEXT NOT NULL, tenant_id TEXT NOT NULL, allowed_roles_json TEXT NOT NULL, allowed_subjects_json TEXT NOT NULL, created_at_micros INT64 NOT NULL, updated_at_micros INT64 NOT NULL, retention_ttl_micros INT64 NOT NULL, max_records INT64 NOT NULL, ack_deadline_micros INT64 NOT NULL, heartbeat_micros INT64 NOT NULL)";
+
+pub(crate) const SHAPE_CLIENTS_TABLE: &str = "__decentdb_sync_shape_clients";
+
+pub(crate) const SHAPE_CLIENTS_TABLE_DDL: &str = "CREATE TABLE IF NOT EXISTS __decentdb_sync_shape_clients (shape_id TEXT NOT NULL, tenant_id TEXT NOT NULL, client_replica_id TEXT NOT NULL, subject_id TEXT NOT NULL, session_id TEXT, last_ack_sequence INT64 NOT NULL, last_ack_watermark INT64 NOT NULL, last_changeset_id TEXT, last_seen_at_micros INT64 NOT NULL, retention_blocking INT64 NOT NULL, status TEXT NOT NULL, PRIMARY KEY (shape_id, client_replica_id))";
+
+pub const SYNC_CHANGESET_VERSION: u32 = 1;
+pub const SYNC_CONTRACT_VERSION: u32 = 1;
+pub const SYNC_RELAY_PROTOCOL_VERSION: u32 = 2;
+pub const SYNC_SHAPE_STREAM_VERSION: u32 = 1;
 
 pub(crate) fn is_internal_table_name(name: &str) -> bool {
     name.starts_with("__decentdb_")
@@ -264,6 +285,487 @@ impl SyncChangeBatch {
             _ => "sync-batch:v1:empty:0:0:0".to_string(),
         }
     }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncSubjectKind {
+    User,
+    Device,
+    Service,
+    Agent,
+}
+
+impl SyncSubjectKind {
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Device => "device",
+            Self::Service => "service",
+            Self::Agent => "agent",
+        }
+    }
+}
+
+impl Display for SyncSubjectKind {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for SyncSubjectKind {
+    type Err = DbError;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "user" => Ok(Self::User),
+            "device" => Ok(Self::Device),
+            "service" => Ok(Self::Service),
+            "agent" => Ok(Self::Agent),
+            other => Err(DbError::sql(format!(
+                "unsupported sync subject kind '{other}'"
+            ))),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncPrincipal {
+    pub tenant_id: String,
+    pub subject_id: String,
+    pub subject_kind: SyncSubjectKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_issuer: Option<String>,
+    #[serde(default)]
+    pub roles: Vec<String>,
+    #[serde(default)]
+    pub allowed_scopes: Vec<String>,
+    #[serde(default)]
+    pub allowed_shapes: Vec<String>,
+    pub session_id: String,
+    pub request_id: String,
+}
+
+impl SyncPrincipal {
+    pub fn validate(&self) -> Result<()> {
+        for (field, value) in [
+            ("tenant_id", self.tenant_id.as_str()),
+            ("subject_id", self.subject_id.as_str()),
+            ("session_id", self.session_id.as_str()),
+            ("request_id", self.request_id.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                return Err(DbError::sql(format!("sync principal {field} is required")));
+            }
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn allows_scope(&self, scope_name: &str) -> bool {
+        self.allowed_scopes
+            .iter()
+            .any(|scope| scope == "*" || scope.eq_ignore_ascii_case(scope_name))
+    }
+
+    #[must_use]
+    pub fn allows_shape(&self, shape_id: &str) -> bool {
+        self.allowed_shapes
+            .iter()
+            .any(|shape| shape == "*" || shape.eq_ignore_ascii_case(shape_id))
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncChangesetSourceKind {
+    Checkpoint,
+    Branch,
+    Snapshot,
+}
+
+impl SyncChangesetSourceKind {
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Checkpoint => "checkpoint",
+            Self::Branch => "branch",
+            Self::Snapshot => "snapshot",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SyncChangesetSource {
+    Checkpoint { peer: String, since_sequence: u64 },
+    Branch { from: String, to: String },
+    Snapshot { from: String, to: String },
+}
+
+impl SyncChangesetSource {
+    #[must_use]
+    pub const fn kind(&self) -> SyncChangesetSourceKind {
+        match self {
+            Self::Checkpoint { .. } => SyncChangesetSourceKind::Checkpoint,
+            Self::Branch { .. } => SyncChangesetSourceKind::Branch,
+            Self::Snapshot { .. } => SyncChangesetSourceKind::Snapshot,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncChangesetCheckpoint {
+    pub peer: String,
+    pub sequence: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncChangesetCapabilities {
+    pub before_images: bool,
+    pub compression: Vec<String>,
+    pub conflict_policies: Vec<String>,
+}
+
+impl Default for SyncChangesetCapabilities {
+    fn default() -> Self {
+        Self {
+            before_images: false,
+            compression: vec!["none".to_string()],
+            conflict_policies: vec![
+                "record".to_string(),
+                "stop".to_string(),
+                "last_writer_wins".to_string(),
+                "origin_priority".to_string(),
+            ],
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncChangesetLimits {
+    pub record_count: u64,
+    pub uncompressed_bytes: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SyncChangesetRecord {
+    pub record_version: u32,
+    pub table: String,
+    pub operation: String,
+    pub primary_key: serde_json::Value,
+    pub origin_replica_id: String,
+    pub origin_sequence: u64,
+    pub transaction_id: String,
+    pub transaction_lsn: u64,
+    pub schema_cookie: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<serde_json::Value>,
+    #[serde(default)]
+    pub column_mask: Vec<String>,
+    #[serde(default)]
+    pub tombstone: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conflict_metadata: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SyncChangeset {
+    pub changeset_version: u32,
+    pub changeset_id: String,
+    pub source_replica_id: String,
+    pub source_kind: SyncChangesetSourceKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shape_id: Option<String>,
+    pub base_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_checkpoint: Option<SyncChangesetCheckpoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_snapshot: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_checkpoint: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_checkpoint: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_high_watermark: Option<u64>,
+    pub schema_fingerprint: String,
+    pub schema_cookie: u32,
+    pub sync_contract_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_contract_fingerprint: Option<String>,
+    pub producer_capabilities: SyncChangesetCapabilities,
+    pub limits: SyncChangesetLimits,
+    pub records: Vec<SyncChangesetRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conflict_policy_hint: Option<SyncConflictPolicy>,
+    pub created_at_micros: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integrity_hash: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct CreateChangesetOptions {
+    pub source: SyncChangesetSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shape_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_records: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<SyncPrincipal>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncCompatibilityMode {
+    #[default]
+    Strict,
+    InspectOnly,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ApplyChangesetOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<SyncPrincipal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conflict_policy: Option<SyncConflictPolicy>,
+    #[serde(default)]
+    pub compatibility_mode: SyncCompatibilityMode,
+    #[serde(default = "default_atomic_apply")]
+    pub atomic: bool,
+}
+
+fn default_atomic_apply() -> bool {
+    true
+}
+
+impl Default for ApplyChangesetOptions {
+    fn default() -> Self {
+        Self {
+            principal: None,
+            conflict_policy: None,
+            compatibility_mode: SyncCompatibilityMode::Strict,
+            atomic: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct InspectChangesetOptions {
+    #[serde(default)]
+    pub check_local_compatibility: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct InvertChangesetOptions {}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncChangesetInspection {
+    pub changeset_id: String,
+    pub valid_envelope: bool,
+    pub source_kind: SyncChangesetSourceKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shape_id: Option<String>,
+    pub record_count: u64,
+    pub bytes: u64,
+    pub tables: Vec<String>,
+    pub operations: BTreeMap<String, u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_checkpoint: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_checkpoint: Option<u64>,
+    pub schema_fingerprint: String,
+    pub compatibility: SyncChangesetCompatibility,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncChangesetCompatibility {
+    pub checked_against_local_db: bool,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncChangesetApplyResult {
+    pub outcome: String,
+    pub changeset_id: String,
+    pub rows_seen: u64,
+    pub rows_applied: u64,
+    pub rows_skipped: u64,
+    pub rows_conflicted: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_after: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncShape {
+    pub shape_id: String,
+    pub name: String,
+    pub scope_name: String,
+    pub tenant_id: String,
+    pub allowed_roles: Vec<String>,
+    pub allowed_subjects: Vec<String>,
+    pub created_at_micros: i64,
+    pub updated_at_micros: i64,
+    pub retention_ttl_micros: i64,
+    pub max_records: u64,
+    pub ack_deadline_micros: i64,
+    pub heartbeat_micros: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncShapeClient {
+    pub shape_id: String,
+    pub tenant_id: String,
+    pub client_replica_id: String,
+    pub subject_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    pub last_ack_sequence: u64,
+    pub last_ack_watermark: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_changeset_id: Option<String>,
+    pub last_seen_at_micros: i64,
+    pub retention_blocking: bool,
+    pub status: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncRelaySession {
+    pub session_id: String,
+    pub tenant_id: String,
+    pub subject_id: String,
+    pub subject_kind: SyncSubjectKind,
+    pub request_id: String,
+    pub operation: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shape_id: Option<String>,
+    pub started_at_micros: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at_micros: Option<i64>,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub rows_seen: u64,
+    pub bytes_seen: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncChangesetHistory {
+    pub changeset_id: String,
+    pub source_replica_id: String,
+    pub source_kind: SyncChangesetSourceKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shape_id: Option<String>,
+    pub record_count: u64,
+    pub bytes: u64,
+    pub created_at_micros: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_at_micros: Option<i64>,
+    pub outcome: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integrity_hash: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncRelayStatus {
+    pub relay_id: String,
+    pub protocol_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database_replica_id: Option<String>,
+    pub production_mode: bool,
+    pub secure_transport_required: bool,
+    pub insecure_override_enabled: bool,
+    pub active_sessions: u64,
+    pub active_streams: u64,
+    pub started_at_micros: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CreateShapeOptions {
+    pub shape_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub scope_name: String,
+    pub tenant_id: String,
+    #[serde(default)]
+    pub allowed_roles: Vec<String>,
+    #[serde(default)]
+    pub allowed_subjects: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention_ttl_micros: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_records: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ack_deadline_micros: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heartbeat_micros: Option<i64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShapeAckOptions {
+    pub shape_id: String,
+    pub tenant_id: String,
+    pub client_replica_id: String,
+    pub subject_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    pub shape_sequence: u64,
+    pub source_high_watermark: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changeset_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SyncShapeDelivery {
+    pub message_type: String,
+    pub shape_id: String,
+    pub shape_sequence: u64,
+    pub ack_deadline_micros: i64,
+    pub checkpoint: SyncShapeCheckpoint,
+    pub changeset: SyncChangeset,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncShapeCheckpoint {
+    pub shape_sequence: u64,
+    pub source_high_watermark: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncRelayHello {
+    pub protocol_version: u32,
+    pub engine_version: String,
+    pub relay_id: String,
+    pub changeset_versions: Vec<u32>,
+    pub shape_stream_versions: Vec<u32>,
+    pub auth_required: bool,
+    pub compression: Vec<String>,
+    pub conflict_policies: Vec<String>,
+    pub features: BTreeMap<String, serde_json::Value>,
+    pub limits: BTreeMap<String, u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

@@ -69,11 +69,18 @@ pub use crate::reactive::{
 pub use crate::record::value::Value;
 pub use crate::storage::DB_FORMAT_VERSION;
 pub use crate::sync::{
-    SyncChangeBatch, SyncConflict, SyncConflictPolicy, SyncConflictPolicyConfig,
-    SyncDoctorSeverity, SyncHandshake, SyncImportSummary, SyncJournalIntegrityReport,
-    SyncJournalIssue, SyncJournalRecord, SyncOperationalDoctorReport, SyncPeer, SyncPeerLag,
-    SyncPeerScopeBinding, SyncPruneSummary, SyncRetentionReport, SyncRunDirection, SyncRunSummary,
-    SyncScope, SyncSession, SyncStatus,
+    ApplyChangesetOptions, CreateChangesetOptions, CreateShapeOptions, InspectChangesetOptions,
+    InvertChangesetOptions, ShapeAckOptions, SyncChangeBatch, SyncChangeset,
+    SyncChangesetApplyResult, SyncChangesetCapabilities, SyncChangesetCheckpoint,
+    SyncChangesetCompatibility, SyncChangesetHistory, SyncChangesetInspection, SyncChangesetLimits,
+    SyncChangesetRecord, SyncChangesetSource, SyncChangesetSourceKind, SyncCompatibilityMode,
+    SyncConflict, SyncConflictPolicy, SyncConflictPolicyConfig, SyncDoctorSeverity, SyncHandshake,
+    SyncImportSummary, SyncJournalIntegrityReport, SyncJournalIssue, SyncJournalRecord,
+    SyncOperationalDoctorReport, SyncPeer, SyncPeerLag, SyncPeerScopeBinding, SyncPrincipal,
+    SyncPruneSummary, SyncRelayHello, SyncRelaySession, SyncRelayStatus, SyncRetentionReport,
+    SyncRunDirection, SyncRunSummary, SyncScope, SyncSession, SyncShape, SyncShapeCheckpoint,
+    SyncShapeClient, SyncShapeDelivery, SyncStatus, SyncSubjectKind, SYNC_CHANGESET_VERSION,
+    SYNC_CONTRACT_VERSION, SYNC_RELAY_PROTOCOL_VERSION, SYNC_SHAPE_STREAM_VERSION,
 };
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 pub use crate::wasm::WebDb;

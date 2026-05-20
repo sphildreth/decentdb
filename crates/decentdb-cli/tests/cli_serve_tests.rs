@@ -3,6 +3,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 fn temp_dir(prefix: &str) -> PathBuf {
@@ -40,6 +41,11 @@ fn next_free_port() -> u16 {
     port
 }
 
+fn port_allocation_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
 struct ChildGuard(Child);
 
 impl Drop for ChildGuard {
@@ -56,6 +62,7 @@ fn spawn_serve(
     max_result_rows: usize,
     max_body_size: &str,
 ) -> (ChildGuard, u16) {
+    let _port_guard = port_allocation_lock().lock().expect("port lock");
     let port = next_free_port();
     let mut command = Command::new(bin());
     command
@@ -89,6 +96,7 @@ fn spawn_serve(
 }
 
 fn spawn_serve_no_auth(db: &Path) -> (ChildGuard, u16) {
+    let _port_guard = port_allocation_lock().lock().expect("port lock");
     let port = next_free_port();
     let mut command = Command::new(bin());
     command
@@ -112,6 +120,7 @@ fn spawn_serve_no_auth(db: &Path) -> (ChildGuard, u16) {
 }
 
 fn spawn_serve_remote_with_token(db: &Path, token_name: &str, token: &str) -> (ChildGuard, u16) {
+    let _port_guard = port_allocation_lock().lock().expect("port lock");
     let port = next_free_port();
     let mut command = Command::new(bin());
     command

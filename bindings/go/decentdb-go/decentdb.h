@@ -179,6 +179,10 @@ ddb_status_t ddb_db_open_with_options(const char *path, const char *options, ddb
 ddb_status_t ddb_db_open_or_create_with_options(const char *path, const char *options, ddb_db_t **out_db);
 ddb_status_t ddb_db_sync_execute_json(ddb_db_t *db, const char *request_json, char **out_json);
 ddb_status_t ddb_db_branch_execute_json(ddb_db_t *db, const char *request_json, char **out_json);
+ddb_status_t ddb_sync_changeset_create_json(ddb_db_t *db, const char *request_json, char **out_json);
+ddb_status_t ddb_sync_changeset_apply_json(ddb_db_t *db, const char *request_json, char **out_json);
+ddb_status_t ddb_sync_changeset_inspect_json(ddb_db_t *db, const char *request_json, char **out_json);
+ddb_status_t ddb_sync_changeset_invert_json(ddb_db_t *db, const char *request_json, char **out_json);
 
 /*
  * Frees a database handle returned by ddb_db_create, ddb_db_open, or ddb_db_open_or_create.

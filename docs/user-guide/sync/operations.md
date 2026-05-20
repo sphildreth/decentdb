@@ -33,6 +33,19 @@ Use it before prune or before upgrading a schema.
 The `sync doctor` and `sys_sync_peer_lag` surfaces show inbound and outbound
 lag per peer. If lag grows, inspect the latest sessions and the peer binding.
 
+## Relay Diagnostics
+
+```bash
+decentdb relay status --db=app.ddb --format=table
+decentdb relay doctor --db=app.ddb --format=json
+```
+
+Relay diagnostics include protocol version, database replica ID, production
+security posture, relay sessions, shape clients, retention blockers, sync
+doctor output, and changeset history. The same data is available through
+`sys.sync_relay_status`, `sys.sync_relay_sessions`, `sys.sync_shapes`,
+`sys.sync_shape_clients`, and `sys.sync_changeset_history`.
+
 ## Retention
 
 Use dry run first:
@@ -43,6 +56,10 @@ decentdb sync prune --db=app.ddb --through=42 --dry-run --format=table
 
 If the safe watermark is lower than the requested prune point, the command
 fails unless `--allow-data-loss` is set.
+
+Active shape client checkpoints block pruning. If a client is stale, inspect
+`decentdb relay shape status` before deciding whether to force a prune and make
+that client resync from a new snapshot.
 
 `--allow-data-loss` is a deliberate override. It should be used only when you
 have another copy of the data or you are intentionally discarding history.
@@ -55,8 +72,9 @@ Recommended order for a healthy replica:
 2. `sync pending`
 3. `sync conflicts`
 4. `sync doctor`
-5. `sync prune --dry-run`
-6. `sync prune` only when the dry run is safe
+5. `relay doctor` when production relay/shapes are configured
+6. `sync prune --dry-run`
+7. `sync prune` only when the dry run is safe
 
 ## Output Shapes
 
@@ -64,4 +82,3 @@ Recommended order for a healthy replica:
 - `sync doctor` is a report object in JSON or a human table with extra sections.
 - `sync prune` returns `requested_through`, `effective_through`, `pruned`,
   `dry_run`, `allow_data_loss`, and `blocked_by_json`.
-

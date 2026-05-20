@@ -68,6 +68,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   handles, Python and Go direct watch helpers, `sys.reactive_metrics`,
   `sys.reactive_subscriptions`, ADR 0164, and a full implementation spec for
   the reactive contract.
+- Added the production sync relay and public changeset surface: Rust
+  changeset create/inspect/apply/invert APIs, C ABI JSON entry points,
+  `decentdb sync changeset`, authenticated `decentdb relay serve` v2 HTTP and
+  WebSocket routes, sync shapes backed by scopes, durable shape acks and
+  retention blockers, relay/shape/changeset `sys.*` diagnostics, browser relay
+  helpers, .NET JSON helpers, user docs, and ADR 0166-0168 delivery context.
 
 ### Changed
 
@@ -81,6 +87,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   append-`.wal` sidecar convention, copying the v10 WAL forward, and upgrading
   any page-1 database-header frames inside the copied WAL so a later checkpoint
   cannot restore a legacy v10 header.
+- Fixed production relay shape HTTP endpoints to authorize by shape ACL/allowlist for
+  shape-based streams and snapshots, avoiding a false `SCOPE_UNAUTHORIZED` rejection
+  when callers present valid shape permissions but no explicit scope list.
 
 ## [2.5.1] - 2026-05-19
 

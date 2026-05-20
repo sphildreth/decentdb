@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::convert::TryFrom;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -5,7 +6,7 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
@@ -14,9 +15,11 @@ use decentdb::{
     BranchMergeOperation, BranchMergeReport, BranchRestoreReport, BranchTableDiffStatus,
     BulkLoadOptions, ColumnInfo, Db, DbConfig, DoctorCategory, DoctorCheckSelection,
     DoctorIndexVerification, DoctorOptions, DoctorPathMode, DoctorReport, DoctorSeverity,
-    ForeignKeyInfo, HeaderInfo, IndexVerification, NamedSnapshot, QueryResult, StorageInfo,
-    SyncChangeBatch, SyncConflict, SyncConflictPolicy, SyncHandshake, SyncImportSummary, SyncPeer,
-    SyncPeerScopeBinding, SyncRunDirection, SyncRunSummary, SyncScope, TableInfo, Value,
+    ForeignKeyInfo, HeaderInfo, IndexVerification, NamedSnapshot, QueryResult, ShapeAckOptions,
+    StorageInfo, SyncChangeBatch, SyncChangeset, SyncChangesetSource, SyncConflict,
+    SyncConflictPolicy, SyncHandshake, SyncImportSummary, SyncPeer, SyncPeerScopeBinding,
+    SyncPrincipal, SyncRelayHello, SyncRunDirection, SyncRunSummary, SyncScope, SyncShape,
+    SyncSubjectKind, TableInfo, Value,
 };
 
 use crate::output::{
@@ -100,6 +103,9 @@ pub enum Commands {
     /// Local-first sync journal management
     #[command(subcommand)]
     Sync(SyncCommand),
+    /// Production sync relay and shape management
+    #[command(subcommand)]
+    Relay(RelayCommand),
     /// Serve a local HTTP API and web console
     Serve(ServeCommand),
 }
@@ -575,6 +581,9 @@ pub enum SyncCommand {
     Export(SyncExportCommand),
     /// Import sync records into the database
     Import(SyncImportCommand),
+    /// Create, inspect, apply, or invert public changesets
+    #[command(subcommand)]
+    Changeset(SyncChangesetCommand),
     /// Inspect unresolved sync conflicts
     Conflicts(SyncConflictsCommand),
     /// Inspect and resolve sync conflicts
@@ -592,6 +601,199 @@ pub enum SyncCommand {
     Run(SyncRunCommand),
     /// Serve sync protocol endpoints for tests and dev
     Serve(SyncServeCommand),
+}
+
+#[derive(Clone, Debug, Subcommand)]
+pub enum SyncChangesetCommand {
+    /// Create a public changeset
+    Create(SyncChangesetCreateCommand),
+    /// Inspect a public changeset
+    Inspect(SyncChangesetInspectCommand),
+    /// Apply a public changeset transactionally
+    Apply(SyncChangesetApplyCommand),
+    /// Invert a public changeset when enough before state exists
+    Invert(SyncChangesetInvertCommand),
+}
+
+#[derive(Clone, Debug, Parser)]
+pub struct SyncChangesetCreateCommand {
+    #[arg(long)]
+    pub db: String,
+    #[arg(long = "from-checkpoint")]
+    pub from_checkpoint: Option<String>,
+    #[arg(long = "from-branch")]
+    pub from_branch: Option<String>,
+    #[arg(long = "to-branch")]
+    pub to_branch: Option<String>,
+    #[arg(long = "from-snapshot")]
+    pub from_snapshot: Option<String>,
+    #[arg(long = "to-snapshot")]
+    pub to_snapshot: Option<String>,
+    #[arg(long)]
+    pub scope: Option<String>,
+    #[arg(long = "shape")]
+    pub shape_id: Option<String>,
+    #[arg(long = "max-records")]
+    pub max_records: Option<u64>,
+    #[arg(long = "max-bytes")]
+    pub max_bytes: Option<u64>,
+    #[arg(long)]
+    pub output: PathBuf,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
+    pub format: OutputFormat,
+}
+
+#[derive(Clone, Debug, Parser)]
+pub struct SyncChangesetInspectCommand {
+    #[arg(long)]
+    pub db: Option<String>,
+    #[arg(long)]
+    pub input: PathBuf,
+    #[arg(long = "check-local", default_value_t = false)]
+    pub check_local: bool,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
+    pub format: OutputFormat,
+}
+
+#[derive(Clone, Debug, Parser)]
+pub struct SyncChangesetApplyCommand {
+    #[arg(long)]
+    pub db: String,
+    #[arg(long)]
+    pub input: PathBuf,
+    #[arg(long = "conflict-policy")]
+    pub conflict_policy: Option<SyncConflictPolicyCli>,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
+    pub format: OutputFormat,
+}
+
+#[derive(Clone, Debug, Parser)]
+pub struct SyncChangesetInvertCommand {
+    #[arg(long)]
+    pub db: Option<String>,
+    #[arg(long)]
+    pub input: PathBuf,
+    #[arg(long)]
+    pub output: PathBuf,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
+    pub format: OutputFormat,
+}
+
+#[derive(Clone, Debug, Subcommand)]
+pub enum RelayCommand {
+    /// Serve production sync relay v2 HTTP routes
+    Serve(RelayServeCommand),
+    /// Show relay status
+    Status(RelayStatusCommand),
+    /// Run relay doctor checks
+    Doctor(RelayStatusCommand),
+    /// Manage shape definitions
+    #[command(subcommand)]
+    Shape(RelayShapeCommand),
+}
+
+#[derive(Clone, Debug, Parser)]
+pub struct RelayServeCommand {
+    #[arg(long)]
+    pub db: String,
+    #[arg(long, default_value = "127.0.0.1:8080")]
+    pub listen: String,
+    #[arg(long = "public-url")]
+    pub public_url: Option<String>,
+    #[arg(long = "auth-token-env")]
+    pub auth_token_env: Option<String>,
+    #[arg(long = "require-tls", default_value_t = false)]
+    pub require_tls: bool,
+    #[arg(long = "allow-insecure", default_value_t = false)]
+    pub allow_insecure: bool,
+    #[arg(long = "ready-file")]
+    pub ready_file: Option<PathBuf>,
+    #[arg(long = "max-requests")]
+    pub max_requests: Option<usize>,
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+#[derive(Clone, Debug, Parser)]
+pub struct RelayStatusCommand {
+    #[arg(long)]
+    pub db: String,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
+    pub format: OutputFormat,
+}
+
+#[derive(Clone, Debug, Subcommand)]
+pub enum RelayShapeCommand {
+    /// Create or update a shape
+    Create(RelayShapeCreateCommand),
+    /// List shapes
+    List(RelayShapeListCommand),
+    /// Drop a shape
+    Drop(RelayShapeDropCommand),
+    /// Show shape status and clients
+    Status(RelayShapeStatusCommand),
+    /// Create an initial shape snapshot
+    Snapshot(RelayShapeSnapshotCommand),
+}
+
+#[derive(Clone, Debug, Parser)]
+pub struct RelayShapeCreateCommand {
+    #[arg(long)]
+    pub db: String,
+    #[arg(long = "shape")]
+    pub shape_id: String,
+    #[arg(long)]
+    pub scope: String,
+    #[arg(long)]
+    pub tenant: String,
+    #[arg(long = "allow-role")]
+    pub allow_role: Vec<String>,
+    #[arg(long = "allow-subject")]
+    pub allow_subject: Vec<String>,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
+    pub format: OutputFormat,
+}
+
+#[derive(Clone, Debug, Parser)]
+pub struct RelayShapeListCommand {
+    #[arg(long)]
+    pub db: String,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+    pub format: OutputFormat,
+}
+
+#[derive(Clone, Debug, Parser)]
+pub struct RelayShapeDropCommand {
+    #[arg(long)]
+    pub db: String,
+    #[arg(long = "shape")]
+    pub shape_id: String,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
+    pub format: OutputFormat,
+}
+
+#[derive(Clone, Debug, Parser)]
+pub struct RelayShapeStatusCommand {
+    #[arg(long)]
+    pub db: String,
+    #[arg(long = "shape")]
+    pub shape_id: Option<String>,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
+    pub format: OutputFormat,
+}
+
+#[derive(Clone, Debug, Parser)]
+pub struct RelayShapeSnapshotCommand {
+    #[arg(long)]
+    pub db: String,
+    #[arg(long = "shape")]
+    pub shape_id: String,
+    #[arg(long = "client-replica-id", default_value = "cli-client")]
+    pub client_replica_id: String,
+    #[arg(long)]
+    pub output: PathBuf,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
+    pub format: OutputFormat,
 }
 
 #[derive(Clone, Debug, Subcommand)]
@@ -1095,6 +1297,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         Commands::VerifyIndex(command) => run_verify_index(command)?,
         Commands::Migrate(command) => run_migrate(command)?,
         Commands::Sync(command) => run_sync(command)?,
+        Commands::Relay(command) => run_relay(command)?,
         Commands::Serve(command) => run_serve(command)?,
         Commands::Doctor(_) => unreachable!("Doctor is handled in run()"),
     }
@@ -2033,6 +2236,7 @@ fn run_sync(command: SyncCommand) -> Result<()> {
             );
             Ok(())
         }
+        SyncCommand::Changeset(cmd) => run_sync_changeset(cmd),
         SyncCommand::Conflicts(cmd) => {
             let db = open_db(&cmd.db, false, 0, 0)?;
             let conflicts = if cmd.all {
@@ -2094,6 +2298,1518 @@ fn run_sync(command: SyncCommand) -> Result<()> {
         SyncCommand::Run(cmd) => run_sync_run(cmd),
         SyncCommand::Serve(cmd) => run_sync_serve(cmd),
     }
+}
+
+fn run_sync_changeset(command: SyncChangesetCommand) -> Result<()> {
+    match command {
+        SyncChangesetCommand::Create(command) => run_sync_changeset_create(command),
+        SyncChangesetCommand::Inspect(command) => run_sync_changeset_inspect(command),
+        SyncChangesetCommand::Apply(command) => run_sync_changeset_apply(command),
+        SyncChangesetCommand::Invert(command) => run_sync_changeset_invert(command),
+    }
+}
+
+fn run_sync_changeset_create(command: SyncChangesetCreateCommand) -> Result<()> {
+    let db = open_db(&command.db, false, 0, 0)?;
+    let source = sync_changeset_source_from_cli(&command)?;
+    let changeset = db.sync_create_changeset(decentdb::CreateChangesetOptions {
+        source,
+        scope_name: command.scope,
+        shape_id: command.shape_id,
+        max_records: command.max_records,
+        max_bytes: command.max_bytes,
+        principal: None,
+    })?;
+    fs::write(&command.output, serde_json::to_string_pretty(&changeset)?)?;
+    match command.format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&changeset)?),
+        OutputFormat::Table => print_changeset_summary(&changeset),
+        _ => {
+            return Err(anyhow!(
+                "sync changeset create supports only json or table output"
+            ))
+        }
+    }
+    Ok(())
+}
+
+fn run_sync_changeset_inspect(command: SyncChangesetInspectCommand) -> Result<()> {
+    let changeset = parse_changeset_file(&command.input)?;
+    let inspection = match command.db.as_deref() {
+        Some(path) => open_db(path, false, 0, 0)?.sync_inspect_changeset(
+            &changeset,
+            decentdb::InspectChangesetOptions {
+                check_local_compatibility: command.check_local,
+            },
+        )?,
+        None => {
+            let temp = tempfile_like_memory_db_for_changeset_inspect()?;
+            temp.sync_inspect_changeset(
+                &changeset,
+                decentdb::InspectChangesetOptions {
+                    check_local_compatibility: false,
+                },
+            )?
+        }
+    };
+    match command.format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&inspection)?),
+        OutputFormat::Table => {
+            println!(
+                "{}",
+                render_key_value_rows(
+                    OutputFormat::Table,
+                    &[
+                        ("changeset_id".to_string(), inspection.changeset_id),
+                        (
+                            "record_count".to_string(),
+                            inspection.record_count.to_string()
+                        ),
+                        ("tables".to_string(), inspection.tables.join(",")),
+                        ("compatibility".to_string(), inspection.compatibility.status,),
+                    ],
+                )
+            );
+        }
+        _ => {
+            return Err(anyhow!(
+                "sync changeset inspect supports only json or table output"
+            ))
+        }
+    }
+    Ok(())
+}
+
+fn run_sync_changeset_apply(command: SyncChangesetApplyCommand) -> Result<()> {
+    let db = open_db(&command.db, true, 0, 0)?;
+    let changeset = parse_changeset_file(&command.input)?;
+    let result = db.sync_apply_changeset(
+        &changeset,
+        decentdb::ApplyChangesetOptions {
+            conflict_policy: command.conflict_policy.map(sync_policy_from_cli),
+            ..decentdb::ApplyChangesetOptions::default()
+        },
+    )?;
+    match command.format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&result)?),
+        OutputFormat::Table => println!(
+            "{}",
+            render_key_value_rows(
+                OutputFormat::Table,
+                &[
+                    ("outcome".to_string(), result.outcome),
+                    ("changeset_id".to_string(), result.changeset_id),
+                    ("rows_seen".to_string(), result.rows_seen.to_string()),
+                    ("rows_applied".to_string(), result.rows_applied.to_string()),
+                    ("rows_skipped".to_string(), result.rows_skipped.to_string()),
+                    (
+                        "rows_conflicted".to_string(),
+                        result.rows_conflicted.to_string()
+                    ),
+                ],
+            )
+        ),
+        _ => {
+            return Err(anyhow!(
+                "sync changeset apply supports only json or table output"
+            ))
+        }
+    }
+    Ok(())
+}
+
+fn run_sync_changeset_invert(command: SyncChangesetInvertCommand) -> Result<()> {
+    let changeset = parse_changeset_file(&command.input)?;
+    let db = match command.db.as_deref() {
+        Some(path) => open_db(path, false, 0, 0)?,
+        None => tempfile_like_memory_db_for_changeset_inspect()?,
+    };
+    let inverse =
+        db.sync_invert_changeset(&changeset, decentdb::InvertChangesetOptions::default())?;
+    fs::write(&command.output, serde_json::to_string_pretty(&inverse)?)?;
+    match command.format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&inverse)?),
+        OutputFormat::Table => print_changeset_summary(&inverse),
+        _ => {
+            return Err(anyhow!(
+                "sync changeset invert supports only json or table output"
+            ))
+        }
+    }
+    Ok(())
+}
+
+fn sync_changeset_source_from_cli(
+    command: &SyncChangesetCreateCommand,
+) -> Result<SyncChangesetSource> {
+    let selected = command.from_checkpoint.is_some() as u8
+        + command.from_branch.is_some() as u8
+        + command.from_snapshot.is_some() as u8;
+    if selected != 1 {
+        return Err(anyhow!(
+            "choose exactly one of --from-checkpoint, --from-branch, or --from-snapshot"
+        ));
+    }
+    if let Some(value) = command.from_checkpoint.as_deref() {
+        let (peer, sequence) = value
+            .rsplit_once(':')
+            .ok_or_else(|| anyhow!("--from-checkpoint must use peer:sequence"))?;
+        return Ok(SyncChangesetSource::Checkpoint {
+            peer: peer.to_string(),
+            since_sequence: sequence.parse::<u64>()?,
+        });
+    }
+    if let Some(from) = command.from_branch.as_deref() {
+        let to = command
+            .to_branch
+            .as_deref()
+            .ok_or_else(|| anyhow!("--to-branch is required with --from-branch"))?;
+        return Ok(SyncChangesetSource::Branch {
+            from: from.to_string(),
+            to: to.to_string(),
+        });
+    }
+    let from = command
+        .from_snapshot
+        .as_deref()
+        .ok_or_else(|| anyhow!("missing changeset source"))?;
+    let to = command
+        .to_snapshot
+        .as_deref()
+        .or(command.to_branch.as_deref())
+        .ok_or_else(|| anyhow!("--to-snapshot or --to-branch is required with --from-snapshot"))?;
+    Ok(SyncChangesetSource::Snapshot {
+        from: from.to_string(),
+        to: to.to_string(),
+    })
+}
+
+fn parse_changeset_file(path: &Path) -> Result<SyncChangeset> {
+    let content = fs::read_to_string(path)?;
+    serde_json::from_str(&content).map_err(|error| anyhow!("malformed changeset: {error}"))
+}
+
+fn print_changeset_summary(changeset: &SyncChangeset) {
+    println!(
+        "{}",
+        render_key_value_rows(
+            OutputFormat::Table,
+            &[
+                ("changeset_id".to_string(), changeset.changeset_id.clone()),
+                (
+                    "source_replica_id".to_string(),
+                    changeset.source_replica_id.clone(),
+                ),
+                (
+                    "record_count".to_string(),
+                    changeset.records.len().to_string()
+                ),
+                (
+                    "source_high_watermark".to_string(),
+                    changeset
+                        .source_high_watermark
+                        .map_or_else(|| "-".to_string(), |value| value.to_string()),
+                ),
+            ],
+        )
+    );
+}
+
+fn tempfile_like_memory_db_for_changeset_inspect() -> Result<Db> {
+    Db::create(":memory:", DbConfig::default()).map_err(Into::into)
+}
+
+fn run_relay(command: RelayCommand) -> Result<()> {
+    match command {
+        RelayCommand::Serve(command) => run_relay_serve(command),
+        RelayCommand::Status(command) => run_relay_status(command),
+        RelayCommand::Doctor(command) => run_relay_doctor(command),
+        RelayCommand::Shape(command) => match command {
+            RelayShapeCommand::Create(command) => run_relay_shape_create(command),
+            RelayShapeCommand::List(command) => run_relay_shape_list(command),
+            RelayShapeCommand::Drop(command) => run_relay_shape_drop(command),
+            RelayShapeCommand::Status(command) => run_relay_shape_status(command),
+            RelayShapeCommand::Snapshot(command) => run_relay_shape_snapshot(command),
+        },
+    }
+}
+
+fn run_relay_status(command: RelayStatusCommand) -> Result<()> {
+    let db = open_db(&command.db, false, 0, 0)?;
+    let status = db.sync_relay_status(None, false, false, false, None)?;
+    match command.format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&status)?),
+        OutputFormat::Table => println!(
+            "{}",
+            render_key_value_rows(
+                OutputFormat::Table,
+                &[
+                    ("relay_id".to_string(), status.relay_id),
+                    (
+                        "protocol_version".to_string(),
+                        status.protocol_version.to_string(),
+                    ),
+                    (
+                        "database_replica_id".to_string(),
+                        status
+                            .database_replica_id
+                            .unwrap_or_else(|| "-".to_string()),
+                    ),
+                    (
+                        "active_sessions".to_string(),
+                        status.active_sessions.to_string(),
+                    ),
+                ],
+            )
+        ),
+        _ => return Err(anyhow!("relay status supports only json or table output")),
+    }
+    Ok(())
+}
+
+fn run_relay_doctor(command: RelayStatusCommand) -> Result<()> {
+    let db = open_db(&command.db, false, 0, 0)?;
+    let report = serde_json::json!({
+        "relay_status": db.sync_relay_status(None, false, false, false, None)?,
+        "sync_doctor": db.sync_operational_doctor_report()?,
+        "shapes": db.sync_shapes()?,
+        "shape_clients": db.sync_shape_clients()?,
+        "changeset_history": db.sync_changeset_history()?,
+    });
+    match command.format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
+        OutputFormat::Table => println!(
+            "{}",
+            render_key_value_rows(
+                OutputFormat::Table,
+                &[
+                    (
+                        "shapes".to_string(),
+                        report["shapes"].as_array().map_or(0, Vec::len).to_string(),
+                    ),
+                    (
+                        "shape_clients".to_string(),
+                        report["shape_clients"]
+                            .as_array()
+                            .map_or(0, Vec::len)
+                            .to_string(),
+                    ),
+                    (
+                        "changesets".to_string(),
+                        report["changeset_history"]
+                            .as_array()
+                            .map_or(0, Vec::len)
+                            .to_string(),
+                    ),
+                ],
+            )
+        ),
+        _ => return Err(anyhow!("relay doctor supports only json or table output")),
+    }
+    Ok(())
+}
+
+fn run_relay_shape_create(command: RelayShapeCreateCommand) -> Result<()> {
+    let db = open_db(&command.db, true, 0, 0)?;
+    let shape = db.sync_create_shape(decentdb::CreateShapeOptions {
+        shape_id: command.shape_id,
+        name: None,
+        scope_name: command.scope,
+        tenant_id: command.tenant,
+        allowed_roles: command.allow_role,
+        allowed_subjects: command.allow_subject,
+        retention_ttl_micros: None,
+        max_records: None,
+        ack_deadline_micros: None,
+        heartbeat_micros: None,
+    })?;
+    print_shape_output(command.format, &shape)?;
+    Ok(())
+}
+
+fn run_relay_shape_list(command: RelayShapeListCommand) -> Result<()> {
+    let db = open_db(&command.db, false, 0, 0)?;
+    print_shapes_output(command.format, &db.sync_shapes()?)?;
+    Ok(())
+}
+
+fn run_relay_shape_drop(command: RelayShapeDropCommand) -> Result<()> {
+    let db = open_db(&command.db, true, 0, 0)?;
+    let removed = db.sync_drop_shape(&command.shape_id)?;
+    match command.format {
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({ "removed": removed }))?
+        ),
+        OutputFormat::Table => println!("removed={removed}"),
+        _ => {
+            return Err(anyhow!(
+                "relay shape drop supports only json or table output"
+            ))
+        }
+    }
+    Ok(())
+}
+
+fn run_relay_shape_status(command: RelayShapeStatusCommand) -> Result<()> {
+    let db = open_db(&command.db, false, 0, 0)?;
+    let mut shapes = db.sync_shapes()?;
+    if let Some(shape_id) = command.shape_id.as_deref() {
+        shapes.retain(|shape| shape.shape_id == shape_id);
+    }
+    let clients = db.sync_shape_clients()?;
+    match command.format {
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "shapes": shapes,
+                "clients": clients,
+            }))?
+        ),
+        OutputFormat::Table => print_shapes_output(OutputFormat::Table, &shapes)?,
+        _ => {
+            return Err(anyhow!(
+                "relay shape status supports only json or table output"
+            ))
+        }
+    }
+    Ok(())
+}
+
+fn run_relay_shape_snapshot(command: RelayShapeSnapshotCommand) -> Result<()> {
+    let db = open_db(&command.db, false, 0, 0)?;
+    let delivery = db.sync_shape_snapshot(&command.shape_id, &command.client_replica_id, None)?;
+    fs::write(
+        &command.output,
+        serde_json::to_string_pretty(&delivery.changeset)?,
+    )?;
+    match command.format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&delivery)?),
+        OutputFormat::Table => print_changeset_summary(&delivery.changeset),
+        _ => {
+            return Err(anyhow!(
+                "relay shape snapshot supports only json or table output"
+            ))
+        }
+    }
+    Ok(())
+}
+
+fn print_shape_output(format: OutputFormat, shape: &SyncShape) -> Result<()> {
+    match format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(shape)?),
+        OutputFormat::Table => print_shapes_output(format, std::slice::from_ref(shape))?,
+        _ => {
+            return Err(anyhow!(
+                "relay shape output supports only json or table output"
+            ))
+        }
+    }
+    Ok(())
+}
+
+fn print_shapes_output(format: OutputFormat, shapes: &[SyncShape]) -> Result<()> {
+    match format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(shapes)?),
+        OutputFormat::Table => {
+            let columns = vec![
+                "shape_id".to_string(),
+                "tenant_id".to_string(),
+                "scope_name".to_string(),
+                "max_records".to_string(),
+            ];
+            let rows = shapes
+                .iter()
+                .map(|shape| {
+                    vec![
+                        shape.shape_id.clone(),
+                        shape.tenant_id.clone(),
+                        shape.scope_name.clone(),
+                        shape.max_records.to_string(),
+                    ]
+                })
+                .collect::<Vec<_>>();
+            println!("{}", render_rows(format, &columns, &rows, true));
+        }
+        _ => {
+            return Err(anyhow!(
+                "relay shape output supports only json or table output"
+            ))
+        }
+    }
+    Ok(())
+}
+
+fn run_relay_serve(command: RelayServeCommand) -> Result<()> {
+    if command.require_tls
+        && !command.allow_insecure
+        && !command
+            .public_url
+            .as_deref()
+            .is_some_and(|url| url.starts_with("https://"))
+    {
+        return Err(anyhow!(
+            "INSECURE_TRANSPORT: --require-tls needs an https --public-url or --allow-insecure"
+        ));
+    }
+    let expected_token = match command.auth_token_env.as_deref() {
+        Some(env_name) => {
+            Some(std::env::var(env_name).map_err(|_| {
+                anyhow!("AUTH_REQUIRED: environment variable {env_name} is not set")
+            })?)
+        }
+        None if command.allow_insecure => None,
+        None => {
+            return Err(anyhow!(
+                "AUTH_REQUIRED: production relay serve requires --auth-token-env or --allow-insecure"
+            ));
+        }
+    };
+    let db = open_db(&command.db, true, 0, 0)?;
+    let listener = TcpListener::bind(&command.listen)?;
+    let bound_addr = listener.local_addr()?;
+    if let Some(path) = &command.ready_file {
+        fs::write(path, bound_addr.to_string())?;
+    }
+    if command.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "listening": command.listen,
+                "protocol_version": decentdb::SYNC_RELAY_PROTOCOL_VERSION,
+                "auth_required": expected_token.is_some(),
+                "insecure_override_enabled": command.allow_insecure,
+            }))?
+        );
+    } else {
+        println!("relay listening on {}", command.listen);
+    }
+    let started_at_micros = current_time_micros_cli();
+    let mut handled = 0usize;
+    let mut handles = Vec::new();
+    for stream in listener.incoming() {
+        let stream = stream?;
+        let db = db.clone();
+        let expected_token = expected_token.clone();
+        let require_tls = command.require_tls;
+        let allow_insecure = command.allow_insecure;
+        let handle = thread::spawn(move || {
+            if let Err(error) = handle_relay_http_connection(
+                stream,
+                &db,
+                expected_token.as_deref(),
+                require_tls,
+                allow_insecure,
+                started_at_micros,
+            ) {
+                eprintln!("relay connection error: {error}");
+            }
+        });
+        handled += 1;
+        if let Some(max_requests) = command.max_requests {
+            handles.push(handle);
+            if handled >= max_requests {
+                break;
+            }
+        } else {
+            drop(handle);
+        }
+    }
+    for handle in handles {
+        let _ = handle.join();
+    }
+    Ok(())
+}
+
+fn handle_relay_http_connection(
+    stream: TcpStream,
+    db: &Db,
+    expected_token: Option<&str>,
+    require_tls: bool,
+    allow_insecure: bool,
+    started_at_micros: i64,
+) -> Result<()> {
+    let mut reader = BufReader::new(stream);
+    let mut request_line = String::new();
+    reader.read_line(&mut request_line)?;
+    if request_line.trim().is_empty() {
+        return Ok(());
+    }
+    let mut content_length = 0usize;
+    let mut authorization: Option<String> = None;
+    let mut headers = BTreeMap::new();
+    loop {
+        let mut line = String::new();
+        reader.read_line(&mut line)?;
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = trimmed.split_once(':') {
+            let name = name.trim().to_ascii_lowercase();
+            let value = value.trim().to_string();
+            if name == "content-length" {
+                content_length = value
+                    .parse::<usize>()
+                    .map_err(|_| anyhow!("invalid Content-Length header"))?;
+            } else if name == "authorization" {
+                authorization = Some(value.clone());
+            }
+            headers.insert(name, value);
+        }
+    }
+    let mut body = vec![0u8; content_length];
+    reader.read_exact(&mut body)?;
+    let mut stream = reader.into_inner();
+    let request_line = request_line.trim_end_matches(['\r', '\n']);
+    let mut parts = request_line.split_whitespace();
+    let method = parts
+        .next()
+        .ok_or_else(|| anyhow!("malformed request line"))?;
+    let target = parts
+        .next()
+        .ok_or_else(|| anyhow!("malformed request line"))?;
+    let _version = parts
+        .next()
+        .ok_or_else(|| anyhow!("malformed request line"))?;
+    let (path, query) = split_request_target(target);
+    if path != "/decentdb/sync/v2/hello" {
+        if let Some(token) = expected_token {
+            let expected = format!("Bearer {token}");
+            let query_token = relay_query_param(query, "token");
+            if authorization.as_deref() != Some(expected.as_str())
+                && query_token.as_deref() != Some(token)
+            {
+                return write_sync_json_response(
+                    &mut stream,
+                    401,
+                    relay_error("AUTH_INVALID", "invalid or missing bearer token"),
+                );
+            }
+        }
+    }
+    if path == "/decentdb/sync/v2/stream" {
+        if method != "GET" {
+            return write_sync_json_response(
+                &mut stream,
+                405,
+                relay_error("METHOD_NOT_ALLOWED", "shape streams require GET"),
+            );
+        }
+        if !relay_is_websocket_upgrade(&headers) {
+            return write_sync_json_response(
+                &mut stream,
+                426,
+                relay_error(
+                    "UPGRADE_REQUIRED",
+                    "shape streams require a WebSocket upgrade",
+                ),
+            );
+        }
+        let principal_body = relay_principal_body_from_query(query);
+        let principal = match relay_principal_from_request(&headers, &principal_body) {
+            Ok(principal) => principal,
+            Err(error) => {
+                return write_sync_json_response(
+                    &mut stream,
+                    400,
+                    relay_error("RELAY_ERROR", &error.to_string()),
+                );
+            }
+        };
+        return handle_relay_websocket_stream(
+            stream,
+            db,
+            &headers,
+            principal,
+            expected_token.is_some(),
+        );
+    }
+
+    let response = relay_http_response(
+        db,
+        method,
+        path,
+        query,
+        &headers,
+        &body,
+        require_tls,
+        allow_insecure,
+        started_at_micros,
+        expected_token.is_some(),
+    );
+    match response {
+        Ok(body) => write_sync_json_response(&mut stream, 200, body),
+        Err(error) => write_sync_json_response(
+            &mut stream,
+            400,
+            relay_error("RELAY_ERROR", &error.to_string()),
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn relay_http_response(
+    db: &Db,
+    method: &str,
+    path: &str,
+    query: Option<&str>,
+    headers: &BTreeMap<String, String>,
+    body: &[u8],
+    require_tls: bool,
+    allow_insecure: bool,
+    started_at_micros: i64,
+    auth_required: bool,
+) -> Result<serde_json::Value> {
+    match (method, path) {
+        ("GET", "/decentdb/sync/v2/hello") => Ok(serde_json::to_value(relay_hello(auth_required))?),
+        ("GET", "/decentdb/sync/v2/status") => Ok(serde_json::to_value(db.sync_relay_status(
+            Some("relay-cli"),
+            true,
+            require_tls,
+            allow_insecure,
+            Some(started_at_micros),
+        )?)?),
+        ("GET", "/decentdb/sync/v2/sessions") => {
+            Ok(serde_json::to_value(db.sync_relay_sessions()?)?)
+        }
+        ("POST", "/decentdb/sync/v2/sessions") => {
+            let body_json = parse_optional_json_body(body)?;
+            let principal = relay_principal_from_request(headers, &body_json)?;
+            let operation = body_json
+                .get("operation")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("session");
+            Ok(serde_json::to_value(db.sync_start_relay_session(
+                &principal, operation, None, None,
+            )?)?)
+        }
+        ("POST", "/decentdb/sync/v2/changesets/export") => {
+            let body_json = parse_optional_json_body(body)?;
+            let mut options: decentdb::CreateChangesetOptions = serde_json::from_value(
+                body_json
+                    .get("options")
+                    .cloned()
+                    .unwrap_or(body_json.clone()),
+            )?;
+            if options.principal.is_none() {
+                options.principal = Some(relay_principal_from_request(headers, &body_json)?);
+            }
+            Ok(serde_json::to_value(db.sync_create_changeset(options)?)?)
+        }
+        ("POST", "/decentdb/sync/v2/changesets/apply") => {
+            let body_json = parse_optional_json_body(body)?;
+            let changeset: SyncChangeset = serde_json::from_value(
+                body_json
+                    .get("changeset")
+                    .cloned()
+                    .ok_or_else(|| anyhow!("missing changeset"))?,
+            )?;
+            let mut options: decentdb::ApplyChangesetOptions = serde_json::from_value(
+                body_json
+                    .get("options")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({})),
+            )?;
+            if options.principal.is_none() {
+                options.principal = Some(relay_principal_from_request(headers, &body_json)?);
+            }
+            Ok(serde_json::to_value(
+                db.sync_apply_changeset(&changeset, options)?,
+            )?)
+        }
+        ("POST", "/decentdb/sync/v2/changesets/inspect") => {
+            let body_json = parse_optional_json_body(body)?;
+            let changeset: SyncChangeset = serde_json::from_value(
+                body_json
+                    .get("changeset")
+                    .cloned()
+                    .ok_or_else(|| anyhow!("missing changeset"))?,
+            )?;
+            let options: decentdb::InspectChangesetOptions = serde_json::from_value(
+                body_json
+                    .get("options")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({})),
+            )?;
+            Ok(serde_json::to_value(
+                db.sync_inspect_changeset(&changeset, options)?,
+            )?)
+        }
+        ("POST", "/decentdb/sync/v2/changesets/invert") => {
+            let body_json = parse_optional_json_body(body)?;
+            let changeset: SyncChangeset = serde_json::from_value(
+                body_json
+                    .get("changeset")
+                    .cloned()
+                    .ok_or_else(|| anyhow!("missing changeset"))?,
+            )?;
+            Ok(serde_json::to_value(db.sync_invert_changeset(
+                &changeset,
+                decentdb::InvertChangesetOptions::default(),
+            )?)?)
+        }
+        ("GET", "/decentdb/sync/v2/shapes") => {
+            let principal = relay_principal_from_request(headers, &serde_json::json!({}))?;
+            let shapes = db
+                .sync_shapes()?
+                .into_iter()
+                .filter(|shape| {
+                    principal.tenant_id.eq_ignore_ascii_case(&shape.tenant_id)
+                        && principal.allowed_shapes.iter().any(|allowed| {
+                            allowed == "*" || allowed.eq_ignore_ascii_case(&shape.shape_id)
+                        })
+                })
+                .collect::<Vec<_>>();
+            Ok(serde_json::to_value(shapes)?)
+        }
+        ("GET", "/decentdb/sync/v2/conflicts") => Ok(serde_json::to_value(db.sync_conflicts()?)?),
+        ("GET", "/decentdb/sync/v2/diagnostics") => Ok(serde_json::json!({
+            "relay_status": db.sync_relay_status(Some("relay-cli"), true, require_tls, allow_insecure, Some(started_at_micros))?,
+            "sync_doctor": db.sync_operational_doctor_report()?,
+            "shapes": db.sync_shapes()?,
+            "shape_clients": db.sync_shape_clients()?,
+            "changeset_history": db.sync_changeset_history()?,
+        })),
+        _ if method == "POST"
+            && path.starts_with("/decentdb/sync/v2/shapes/")
+            && path.ends_with("/snapshot") =>
+        {
+            let shape_id = relay_shape_id_from_path(path, "snapshot")?;
+            let body_json = parse_optional_json_body(body)?;
+            let client_replica_id = body_json
+                .get("client_replica_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("relay-http-client");
+            let principal = relay_principal_from_request(headers, &body_json)?;
+            Ok(serde_json::to_value(db.sync_shape_snapshot(
+                &shape_id,
+                client_replica_id,
+                Some(principal),
+            )?)?)
+        }
+        _ if method == "GET"
+            && path.starts_with("/decentdb/sync/v2/shapes/")
+            && path.ends_with("/changes") =>
+        {
+            let shape_id = relay_shape_id_from_path(path, "changes")?;
+            let since = parse_sync_query_param_u64(query, "since")?;
+            let principal = relay_principal_from_request(headers, &serde_json::json!({}))?;
+            Ok(serde_json::to_value(db.sync_shape_changes(
+                &shape_id,
+                since,
+                Some(principal),
+            )?)?)
+        }
+        ("POST", "/decentdb/sync/v2/acks") => {
+            let ack: ShapeAckOptions = serde_json::from_slice(body)?;
+            let principal = relay_principal_from_request(headers, &serde_json::json!({}))?;
+            Ok(serde_json::to_value(
+                db.sync_ack_shape_with_principal(ack, Some(&principal))?,
+            )?)
+        }
+        _ => Ok(relay_error("NOT_FOUND", "relay route not found")),
+    }
+}
+
+fn relay_hello(auth_required: bool) -> SyncRelayHello {
+    SyncRelayHello {
+        protocol_version: decentdb::SYNC_RELAY_PROTOCOL_VERSION,
+        engine_version: decentdb::version().to_string(),
+        relay_id: "relay-cli".to_string(),
+        changeset_versions: vec![decentdb::SYNC_CHANGESET_VERSION],
+        shape_stream_versions: vec![decentdb::SYNC_SHAPE_STREAM_VERSION],
+        auth_required,
+        compression: vec!["none".to_string()],
+        conflict_policies: vec![
+            "record".to_string(),
+            "stop".to_string(),
+            "last_writer_wins".to_string(),
+            "origin_priority".to_string(),
+        ],
+        features: BTreeMap::from([
+            ("checkpoint_changesets".to_string(), serde_json::json!(true)),
+            ("branch_changesets".to_string(), serde_json::json!(true)),
+            ("snapshot_changesets".to_string(), serde_json::json!(true)),
+            (
+                "changeset_inversion".to_string(),
+                serde_json::json!("conditional"),
+            ),
+            ("websocket_shapes".to_string(), serde_json::json!(true)),
+            ("http_shape_pull".to_string(), serde_json::json!(true)),
+        ]),
+        limits: BTreeMap::from([
+            ("max_changeset_bytes".to_string(), 10_485_760),
+            ("max_records_per_changeset".to_string(), 50_000),
+            ("max_stream_queue_bytes".to_string(), 10_485_760),
+        ]),
+    }
+}
+
+fn parse_optional_json_body(body: &[u8]) -> Result<serde_json::Value> {
+    if body.is_empty() {
+        return Ok(serde_json::json!({}));
+    }
+    serde_json::from_slice(body).map_err(Into::into)
+}
+
+fn relay_principal_from_request(
+    headers: &BTreeMap<String, String>,
+    body: &serde_json::Value,
+) -> Result<SyncPrincipal> {
+    if let Some(principal) = body.get("principal") {
+        return serde_json::from_value(principal.clone()).map_err(Into::into);
+    }
+    let tenant_id = relay_header(headers, "x-decentdb-tenant")
+        .ok_or_else(|| anyhow!("TENANT_REQUIRED: x-decentdb-tenant is required"))?;
+    let subject_id = relay_header(headers, "x-decentdb-subject")
+        .ok_or_else(|| anyhow!("AUTH_REQUIRED: x-decentdb-subject is required"))?;
+    let subject_kind = relay_header(headers, "x-decentdb-subject-kind")
+        .map(|value| value.parse::<SyncSubjectKind>())
+        .transpose()
+        .map_err(|error| anyhow!(error.to_string()))?
+        .unwrap_or(SyncSubjectKind::User);
+    Ok(SyncPrincipal {
+        tenant_id,
+        subject_id,
+        subject_kind,
+        auth_issuer: relay_header(headers, "x-decentdb-issuer"),
+        roles: relay_header_list(headers, "x-decentdb-roles"),
+        allowed_scopes: relay_header_list(headers, "x-decentdb-scopes"),
+        allowed_shapes: relay_header_list(headers, "x-decentdb-shapes"),
+        session_id: relay_header(headers, "x-decentdb-session")
+            .unwrap_or_else(|| format!("sess_{}", current_time_micros_cli())),
+        request_id: relay_header(headers, "x-decentdb-request")
+            .unwrap_or_else(|| format!("req_{}", current_time_micros_cli())),
+    })
+}
+
+fn relay_header(headers: &BTreeMap<String, String>, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn relay_header_list(headers: &BTreeMap<String, String>, name: &str) -> Vec<String> {
+    relay_header(headers, name)
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn relay_principal_body_from_query(query: Option<&str>) -> serde_json::Value {
+    let Some(tenant_id) = relay_query_param(query, "tenant") else {
+        return serde_json::json!({});
+    };
+    let Some(subject_id) = relay_query_param(query, "subject") else {
+        return serde_json::json!({});
+    };
+    serde_json::json!({
+        "principal": {
+            "tenant_id": tenant_id,
+            "subject_id": subject_id,
+            "subject_kind": relay_query_param(query, "subject_kind").unwrap_or_else(|| "user".to_string()),
+            "auth_issuer": relay_query_param(query, "issuer"),
+            "roles": relay_query_list_param(query, "roles"),
+            "allowed_scopes": relay_query_list_param(query, "scopes"),
+            "allowed_shapes": relay_query_list_param(query, "shapes"),
+            "session_id": relay_query_param(query, "session").unwrap_or_else(|| format!("sess_{}", current_time_micros_cli())),
+            "request_id": relay_query_param(query, "request").unwrap_or_else(|| format!("req_{}", current_time_micros_cli())),
+        }
+    })
+}
+
+fn relay_shape_id_from_path(path: &str, tail: &str) -> Result<String> {
+    let prefix = "/decentdb/sync/v2/shapes/";
+    let suffix = format!("/{tail}");
+    path.strip_prefix(prefix)
+        .and_then(|value| value.strip_suffix(&suffix))
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("invalid shape route"))
+}
+
+#[derive(Clone, Debug)]
+struct RelayStreamSubscription {
+    shape_id: String,
+    client_replica_id: String,
+    last_acked_watermark: u64,
+    awaiting_ack: bool,
+    ack_deadline_micros: i64,
+    last_changeset_id: Option<String>,
+    last_heartbeat_micros: i64,
+    last_lagged_micros: i64,
+}
+
+#[derive(Debug)]
+enum RelayWsFrame {
+    Text(String),
+    Close,
+    Ping(Vec<u8>),
+    Pong,
+}
+
+fn relay_is_websocket_upgrade(headers: &BTreeMap<String, String>) -> bool {
+    relay_header(headers, "upgrade").is_some_and(|value| value.eq_ignore_ascii_case("websocket"))
+        && relay_header(headers, "connection").is_some_and(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .any(|part| part.eq_ignore_ascii_case("upgrade"))
+        })
+}
+
+fn handle_relay_websocket_stream(
+    mut stream: TcpStream,
+    db: &Db,
+    headers: &BTreeMap<String, String>,
+    principal: SyncPrincipal,
+    auth_required: bool,
+) -> Result<()> {
+    let key = relay_header(headers, "sec-websocket-key")
+        .ok_or_else(|| anyhow!("WEBSOCKET_BAD_REQUEST: Sec-WebSocket-Key is required"))?;
+    let accept = websocket_accept_key(&key);
+    write!(
+        stream,
+        "HTTP/1.1 101 Switching Protocols\r\n\
+         Upgrade: websocket\r\n\
+         Connection: Upgrade\r\n\
+         Sec-WebSocket-Accept: {accept}\r\n\
+         Sec-WebSocket-Protocol: decentdb.sync.v2\r\n\
+         \r\n"
+    )?;
+    stream.flush()?;
+    stream.set_read_timeout(Some(Duration::from_secs(1)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+
+    websocket_write_json(
+        &mut stream,
+        serde_json::json!({
+            "type": "hello",
+            "relay": relay_hello(auth_required),
+            "server_time_micros": current_time_micros_cli(),
+        }),
+    )?;
+
+    let mut subscriptions = Vec::new();
+    loop {
+        match websocket_read_frame(&mut stream) {
+            Ok(Some(RelayWsFrame::Text(text))) => {
+                let message: serde_json::Value = serde_json::from_str(&text)?;
+                if relay_handle_websocket_message(
+                    db,
+                    &mut stream,
+                    &principal,
+                    &mut subscriptions,
+                    message,
+                    auth_required,
+                )? {
+                    break;
+                }
+            }
+            Ok(Some(RelayWsFrame::Ping(payload))) => {
+                websocket_write_frame(&mut stream, 0xA, &payload)?;
+            }
+            Ok(Some(RelayWsFrame::Pong)) => {}
+            Ok(Some(RelayWsFrame::Close)) | Ok(None) => {
+                let _ = websocket_write_frame(&mut stream, 0x8, &[]);
+                break;
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                relay_poll_websocket_subscriptions(
+                    db,
+                    &mut stream,
+                    &principal,
+                    &mut subscriptions,
+                )?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+fn relay_handle_websocket_message(
+    db: &Db,
+    stream: &mut TcpStream,
+    principal: &SyncPrincipal,
+    subscriptions: &mut Vec<RelayStreamSubscription>,
+    message: serde_json::Value,
+    auth_required: bool,
+) -> Result<bool> {
+    let message_type = message
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow!("WEBSOCKET_BAD_REQUEST: message type is required"))?;
+    let request_id = message
+        .get("request_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    match message_type {
+        "hello" => {
+            websocket_write_json(
+                stream,
+                serde_json::json!({
+                    "type": "hello",
+                    "request_id": request_id,
+                    "relay": relay_hello(auth_required),
+                    "server_time_micros": current_time_micros_cli(),
+                }),
+            )?;
+        }
+        "subscribe_shape" => {
+            let shape_id = message
+                .get("shape_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow!("WEBSOCKET_BAD_REQUEST: shape_id is required"))?;
+            let client_replica_id = message
+                .get("client_replica_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow!("WEBSOCKET_BAD_REQUEST: client_replica_id is required"))?;
+            let mode = message
+                .get("mode")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("snapshot");
+            let saved_checkpoint = relay_saved_shape_checkpoint(db, shape_id, client_replica_id)?;
+            let requested_checkpoint = relay_checkpoint_watermark(&message);
+            let since_watermark = requested_checkpoint.or(saved_checkpoint);
+            let delivery = if mode == "resume" {
+                match since_watermark {
+                    Some(watermark) => {
+                        db.sync_shape_changes(shape_id, watermark, Some(principal.clone()))?
+                    }
+                    None => db.sync_shape_snapshot(
+                        shape_id,
+                        client_replica_id,
+                        Some(principal.clone()),
+                    )?,
+                }
+            } else {
+                db.sync_shape_snapshot(shape_id, client_replica_id, Some(principal.clone()))?
+            };
+            websocket_write_json(
+                stream,
+                relay_delivery_ws_message(delivery.clone(), request_id.clone()),
+            )?;
+            subscriptions.retain(|subscription| {
+                !(subscription.shape_id == shape_id
+                    && subscription.client_replica_id == client_replica_id)
+            });
+            subscriptions.push(RelayStreamSubscription {
+                shape_id: shape_id.to_string(),
+                client_replica_id: client_replica_id.to_string(),
+                last_acked_watermark: since_watermark.unwrap_or(0),
+                awaiting_ack: true,
+                ack_deadline_micros: delivery.ack_deadline_micros,
+                last_changeset_id: Some(delivery.changeset.changeset_id),
+                last_heartbeat_micros: current_time_micros_cli(),
+                last_lagged_micros: 0,
+            });
+        }
+        "ack" => {
+            let ack = relay_ack_from_ws_message(&message, principal)?;
+            let client = db.sync_ack_shape_with_principal(ack.clone(), Some(principal))?;
+            for subscription in subscriptions.iter_mut() {
+                if subscription.shape_id == ack.shape_id
+                    && subscription.client_replica_id == ack.client_replica_id
+                {
+                    subscription.last_acked_watermark = ack.source_high_watermark;
+                    subscription.awaiting_ack = false;
+                    subscription.last_changeset_id = ack.changeset_id.clone();
+                    subscription.ack_deadline_micros = 0;
+                }
+            }
+            websocket_write_json(
+                stream,
+                serde_json::json!({
+                    "type": "ack",
+                    "request_id": request_id,
+                    "client": client,
+                }),
+            )?;
+        }
+        "close" => return Ok(true),
+        other => {
+            websocket_write_json(
+                stream,
+                serde_json::json!({
+                    "type": "error",
+                    "request_id": request_id,
+                    "error_code": "WEBSOCKET_BAD_REQUEST",
+                    "error": format!("unsupported message type '{other}'"),
+                }),
+            )?;
+        }
+    }
+    Ok(false)
+}
+
+fn relay_poll_websocket_subscriptions(
+    db: &Db,
+    stream: &mut TcpStream,
+    principal: &SyncPrincipal,
+    subscriptions: &mut [RelayStreamSubscription],
+) -> Result<()> {
+    if subscriptions.is_empty() {
+        return Ok(());
+    }
+    let now = current_time_micros_cli();
+    let high_watermark = db.sync_integrity_report()?.last_sequence.unwrap_or(0);
+    for subscription in subscriptions {
+        if subscription.awaiting_ack {
+            if subscription.ack_deadline_micros > 0
+                && now >= subscription.ack_deadline_micros
+                && now.saturating_sub(subscription.last_lagged_micros) >= 5_000_000
+            {
+                subscription.last_lagged_micros = now;
+                websocket_write_json(
+                    stream,
+                    serde_json::json!({
+                        "type": "lagged",
+                        "shape_id": subscription.shape_id,
+                        "client_replica_id": subscription.client_replica_id,
+                        "last_sent_changeset_id": subscription.last_changeset_id,
+                        "last_acked_watermark": subscription.last_acked_watermark,
+                        "server_high_watermark": high_watermark,
+                    }),
+                )?;
+            }
+            continue;
+        }
+
+        if high_watermark > subscription.last_acked_watermark {
+            let delivery = db.sync_shape_changes(
+                &subscription.shape_id,
+                subscription.last_acked_watermark,
+                Some(principal.clone()),
+            )?;
+            if delivery.checkpoint.source_high_watermark > subscription.last_acked_watermark {
+                subscription.awaiting_ack = true;
+                subscription.ack_deadline_micros = delivery.ack_deadline_micros;
+                subscription.last_changeset_id = Some(delivery.changeset.changeset_id.clone());
+                websocket_write_json(stream, relay_delivery_ws_message(delivery, None))?;
+                continue;
+            }
+        }
+
+        if now.saturating_sub(subscription.last_heartbeat_micros) >= 20_000_000 {
+            subscription.last_heartbeat_micros = now;
+            websocket_write_json(
+                stream,
+                serde_json::json!({
+                    "type": "heartbeat",
+                    "shape_id": subscription.shape_id,
+                    "client_replica_id": subscription.client_replica_id,
+                    "last_acked_watermark": subscription.last_acked_watermark,
+                    "server_high_watermark": high_watermark,
+                    "server_time_micros": now,
+                }),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn relay_delivery_ws_message(
+    delivery: decentdb::SyncShapeDelivery,
+    request_id: Option<String>,
+) -> serde_json::Value {
+    let mut value = serde_json::to_value(delivery).unwrap_or_else(|error| {
+        serde_json::json!({
+            "message_type": "error",
+            "error": error.to_string(),
+        })
+    });
+    if let Some(object) = value.as_object_mut() {
+        let message_type = object
+            .get("message_type")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!("changeset"));
+        object.insert("type".to_string(), message_type);
+        if let Some(request_id) = request_id {
+            object.insert("request_id".to_string(), serde_json::json!(request_id));
+        }
+    }
+    value
+}
+
+fn relay_saved_shape_checkpoint(
+    db: &Db,
+    shape_id: &str,
+    client_replica_id: &str,
+) -> Result<Option<u64>> {
+    Ok(db
+        .sync_shape_clients()?
+        .into_iter()
+        .find(|client| client.shape_id == shape_id && client.client_replica_id == client_replica_id)
+        .map(|client| client.last_ack_watermark))
+}
+
+fn relay_checkpoint_watermark(message: &serde_json::Value) -> Option<u64> {
+    message
+        .get("last_ack_checkpoint")
+        .and_then(|checkpoint| {
+            checkpoint
+                .get("source_high_watermark")
+                .or_else(|| checkpoint.get("shape_sequence"))
+        })
+        .and_then(serde_json::Value::as_u64)
+}
+
+fn relay_ack_from_ws_message(
+    message: &serde_json::Value,
+    principal: &SyncPrincipal,
+) -> Result<ShapeAckOptions> {
+    let checkpoint = message.get("checkpoint");
+    let shape_sequence = message
+        .get("shape_sequence")
+        .or_else(|| checkpoint.and_then(|value| value.get("shape_sequence")))
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| anyhow!("WEBSOCKET_BAD_REQUEST: ack shape_sequence is required"))?;
+    let source_high_watermark = message
+        .get("source_high_watermark")
+        .or_else(|| checkpoint.and_then(|value| value.get("source_high_watermark")))
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| anyhow!("WEBSOCKET_BAD_REQUEST: ack source_high_watermark is required"))?;
+    Ok(ShapeAckOptions {
+        shape_id: message
+            .get("shape_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow!("WEBSOCKET_BAD_REQUEST: ack shape_id is required"))?
+            .to_string(),
+        tenant_id: principal.tenant_id.clone(),
+        client_replica_id: message
+            .get("client_replica_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow!("WEBSOCKET_BAD_REQUEST: ack client_replica_id is required"))?
+            .to_string(),
+        subject_id: principal.subject_id.clone(),
+        session_id: Some(principal.session_id.clone()),
+        shape_sequence,
+        source_high_watermark,
+        changeset_id: message
+            .get("changeset_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+    })
+}
+
+fn websocket_write_json(stream: &mut TcpStream, value: serde_json::Value) -> Result<()> {
+    websocket_write_frame(stream, 0x1, serde_json::to_string(&value)?.as_bytes())?;
+    Ok(())
+}
+
+fn websocket_read_frame(stream: &mut TcpStream) -> std::io::Result<Option<RelayWsFrame>> {
+    let mut header = [0u8; 2];
+    match stream.read_exact(&mut header) {
+        Ok(()) => {}
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    }
+    let opcode = header[0] & 0x0f;
+    let masked = (header[1] & 0x80) != 0;
+    let mut len = u64::from(header[1] & 0x7f);
+    if len == 126 {
+        let mut extended = [0u8; 2];
+        stream.read_exact(&mut extended)?;
+        len = u64::from(u16::from_be_bytes(extended));
+    } else if len == 127 {
+        let mut extended = [0u8; 8];
+        stream.read_exact(&mut extended)?;
+        len = u64::from_be_bytes(extended);
+    }
+    if len > 10_485_760 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "WebSocket frame exceeds relay limit",
+        ));
+    }
+    let mut mask = [0u8; 4];
+    if masked {
+        stream.read_exact(&mut mask)?;
+    }
+    let mut payload = vec![
+        0u8;
+        usize::try_from(len).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "WebSocket frame too large")
+        })?
+    ];
+    stream.read_exact(&mut payload)?;
+    if masked {
+        for (index, byte) in payload.iter_mut().enumerate() {
+            *byte ^= mask[index % 4];
+        }
+    }
+    match opcode {
+        0x1 => String::from_utf8(payload)
+            .map(RelayWsFrame::Text)
+            .map(Some)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+        0x8 => Ok(Some(RelayWsFrame::Close)),
+        0x9 => Ok(Some(RelayWsFrame::Ping(payload))),
+        0xA => Ok(Some(RelayWsFrame::Pong)),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unsupported WebSocket opcode {opcode}"),
+        )),
+    }
+}
+
+fn websocket_write_frame(
+    stream: &mut TcpStream,
+    opcode: u8,
+    payload: &[u8],
+) -> std::io::Result<()> {
+    let mut header = Vec::with_capacity(10);
+    header.push(0x80 | (opcode & 0x0f));
+    match payload.len() {
+        len if len < 126 => header.push(u8::try_from(len).expect("small WebSocket frame length")),
+        len if len <= u16::MAX as usize => {
+            header.push(126);
+            header.extend_from_slice(&(len as u16).to_be_bytes());
+        }
+        len => {
+            header.push(127);
+            header.extend_from_slice(&(len as u64).to_be_bytes());
+        }
+    }
+    stream.write_all(&header)?;
+    stream.write_all(payload)?;
+    stream.flush()
+}
+
+fn websocket_accept_key(key: &str) -> String {
+    let mut bytes = key.trim().as_bytes().to_vec();
+    bytes.extend_from_slice(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+    base64_encode(&sha1_digest(&bytes))
+}
+
+fn base64_encode(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = *chunk.get(1).unwrap_or(&0);
+        let b2 = *chunk.get(2).unwrap_or(&0);
+        output.push(TABLE[(b0 >> 2) as usize] as char);
+        output.push(TABLE[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            output.push(TABLE[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char);
+        } else {
+            output.push('=');
+        }
+        if chunk.len() > 2 {
+            output.push(TABLE[(b2 & 0x3f) as usize] as char);
+        } else {
+            output.push('=');
+        }
+    }
+    output
+}
+
+fn sha1_digest(input: &[u8]) -> [u8; 20] {
+    let mut h0 = 0x6745_2301u32;
+    let mut h1 = 0xEFCD_AB89u32;
+    let mut h2 = 0x98BA_DCFEu32;
+    let mut h3 = 0x1032_5476u32;
+    let mut h4 = 0xC3D2_E1F0u32;
+
+    let bit_len = (input.len() as u64) * 8;
+    let mut message = input.to_vec();
+    message.push(0x80);
+    while (message.len() % 64) != 56 {
+        message.push(0);
+    }
+    message.extend_from_slice(&bit_len.to_be_bytes());
+
+    for chunk in message.chunks(64) {
+        let mut words = [0u32; 80];
+        for (index, word) in words.iter_mut().take(16).enumerate() {
+            let start = index * 4;
+            *word = u32::from_be_bytes([
+                chunk[start],
+                chunk[start + 1],
+                chunk[start + 2],
+                chunk[start + 3],
+            ]);
+        }
+        for index in 16..80 {
+            words[index] =
+                (words[index - 3] ^ words[index - 8] ^ words[index - 14] ^ words[index - 16])
+                    .rotate_left(1);
+        }
+
+        let mut a = h0;
+        let mut b = h1;
+        let mut c = h2;
+        let mut d = h3;
+        let mut e = h4;
+
+        for (index, word) in words.iter().enumerate() {
+            let (f, k) = match index {
+                0..=19 => ((b & c) | ((!b) & d), 0x5A82_7999),
+                20..=39 => (b ^ c ^ d, 0x6ED9_EBA1),
+                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1B_BCDC),
+                _ => (b ^ c ^ d, 0xCA62_C1D6),
+            };
+            let temp = a
+                .rotate_left(5)
+                .wrapping_add(f)
+                .wrapping_add(e)
+                .wrapping_add(k)
+                .wrapping_add(*word);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = temp;
+        }
+
+        h0 = h0.wrapping_add(a);
+        h1 = h1.wrapping_add(b);
+        h2 = h2.wrapping_add(c);
+        h3 = h3.wrapping_add(d);
+        h4 = h4.wrapping_add(e);
+    }
+
+    let mut digest = [0u8; 20];
+    for (offset, word) in [h0, h1, h2, h3, h4].into_iter().enumerate() {
+        digest[offset * 4..offset * 4 + 4].copy_from_slice(&word.to_be_bytes());
+    }
+    digest
+}
+
+fn relay_error(code: &str, message: &str) -> serde_json::Value {
+    serde_json::json!({
+        "error_code": code,
+        "error": message,
+    })
+}
+
+fn current_time_micros_cli() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_micros() as i64)
+        .unwrap_or(0)
 }
 
 fn run_sync_export(command: SyncExportCommand) -> Result<()> {
@@ -3150,6 +4866,7 @@ fn write_sync_json_response(
         401 => "Unauthorized",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        426 => "Upgrade Required",
         _ => "OK",
     };
     write!(
@@ -3167,6 +4884,51 @@ fn split_request_target(target: &str) -> (&str, Option<&str>) {
         Some((path, query)) => (path, Some(query)),
         None => (target, None),
     }
+}
+
+fn relay_query_param(query: Option<&str>, key: &str) -> Option<String> {
+    query?.split('&').find_map(|part| {
+        let (name, value) = part.split_once('=')?;
+        (name == key)
+            .then(|| percent_decode_query_value(value).ok())
+            .flatten()
+    })
+}
+
+fn relay_query_list_param(query: Option<&str>, key: &str) -> Vec<String> {
+    relay_query_param(query, key)
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|part| !part.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn percent_decode_query_value(value: &str) -> Result<String> {
+    let mut bytes = Vec::with_capacity(value.len());
+    let mut chars = value.as_bytes().iter().copied();
+    while let Some(byte) = chars.next() {
+        match byte {
+            b'+' => bytes.push(b' '),
+            b'%' => {
+                let high = chars
+                    .next()
+                    .ok_or_else(|| anyhow!("invalid percent-encoded query value"))?;
+                let low = chars
+                    .next()
+                    .ok_or_else(|| anyhow!("invalid percent-encoded query value"))?;
+                let hex = [high, low];
+                let text = std::str::from_utf8(&hex)?;
+                bytes.push(u8::from_str_radix(text, 16)?);
+            }
+            other => bytes.push(other),
+        }
+    }
+    String::from_utf8(bytes).map_err(Into::into)
 }
 
 fn parse_sync_query_param_u64(query: Option<&str>, key: &str) -> Result<u64> {
@@ -3853,5 +5615,26 @@ fn exit_code(report: &DoctorReport, fail_on: DoctorSeverity) -> i32 {
         2
     } else {
         0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn websocket_accept_key_matches_rfc_example() {
+        assert_eq!(
+            websocket_accept_key("dGhlIHNhbXBsZSBub25jZQ=="),
+            "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+        );
+    }
+
+    #[test]
+    fn base64_encoder_handles_padding() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
     }
 }

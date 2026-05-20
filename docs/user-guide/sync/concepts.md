@@ -28,6 +28,23 @@ suffix.
 A progress marker for what has already been exchanged with a peer. Watermarks
 are used to avoid replaying records that have already been applied.
 
+### Changeset
+
+A public, versioned sync envelope created from a checkpoint, branch diff, or
+snapshot boundary. Changesets are stable application/relay/SDK contracts; the
+raw journal remains an internal capture format.
+
+### Relay
+
+A self-hosted process that authenticates clients, attaches tenant and subject
+identity, and transports changesets without changing DecentDB's
+one-writer/many-readers engine model.
+
+### Shape
+
+A named subscription backed by a sync scope. Shape snapshots and incremental
+changesets are resumable by checkpoint and must be acknowledged durably.
+
 ### Tombstone
 
 A durable delete marker. Tombstones preserve replication correctness until

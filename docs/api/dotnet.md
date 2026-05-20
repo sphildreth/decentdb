@@ -411,6 +411,10 @@ same client is also exposed from `DecentDB.Native.DecentDB.Sync`.
 - `GetRetentionReport` / `GetRetentionReportAsync`
 - `GetPeerLag` / `GetPeerLagAsync`
 - `Prune` / `PruneAsync`
+- `CreateChangeset` / `CreateChangesetAsync`
+- `InspectChangeset` / `InspectChangesetAsync`
+- `ApplyChangeset` / `ApplyChangesetAsync`
+- `InvertChangeset` / `InvertChangesetAsync`
 
 Returned models include:
 
@@ -463,6 +467,19 @@ var doctor = await connection.Sync.GetDoctorReportAsync();
 var retention = await connection.Sync.GetRetentionReportAsync();
 var conflicts = await connection.Sync.ListConflictsAsync();
 var raw = await connection.Sync.ExecuteRawJsonAsync("{\"op\":\"status\"}");
+```
+
+Changeset helpers accept and return `JsonElement` so .NET applications can use
+the stable JSON envelope while typed models evolve:
+
+```csharp
+using System.Text.Json;
+
+var options = JsonSerializer.Deserialize<JsonElement>(
+    "{\"source\":{\"kind\":\"checkpoint\",\"peer\":\"relay\",\"since_sequence\":0}}");
+var changeset = await connection.Sync.CreateChangesetAsync(options);
+var inspection = await connection.Sync.InspectChangesetAsync(changeset);
+var applyResult = await connection.Sync.ApplyChangesetAsync(changeset);
 ```
 
 ## Performance sanity guidance

@@ -118,6 +118,50 @@ fn setup_tenant_sync_db(
     ]);
 }
 
+fn setup_tenant_shape_relay_db(path: &Path, shape_id: &str, replica_id: &str, tenant_id: &str) {
+    let db_str = path.display().to_string();
+    run(&[
+        "exec",
+        "--db",
+        &db_str,
+        "--sql",
+        "CREATE TABLE tasks (tenant_id INT64, id INT64, title TEXT, PRIMARY KEY (tenant_id, id));",
+        "--format",
+        "json",
+    ]);
+    run(&["sync", "init", "--db", &db_str, "--replica-id", replica_id]);
+    run(&[
+        "sync",
+        "scope",
+        "create",
+        "--db",
+        &db_str,
+        "--name",
+        "tenant_scope",
+        "--include",
+        "tasks",
+        "--row-filter",
+        &format!("tenant_id = {tenant_id}"),
+        "--format",
+        "json",
+    ]);
+    run(&[
+        "relay",
+        "shape",
+        "create",
+        "--db",
+        &db_str,
+        "--shape",
+        shape_id,
+        "--scope",
+        "tenant_scope",
+        "--tenant",
+        tenant_id,
+        "--format",
+        "json",
+    ]);
+}
+
 fn open_db(path: &Path) -> Db {
     Db::open(path, DbConfig::default()).expect("open db")
 }
@@ -207,6 +251,31 @@ fn spawn_sync_serve_scoped_with_policy(
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn sync serve");
+
+    let addr = wait_for_ready_file(&ready_file);
+    (ChildGuard(child), addr)
+}
+
+fn spawn_sync_relay_serve(db: &Path, max_requests: usize) -> (ChildGuard, String) {
+    let ready_file = db.with_extension("relay-ready");
+    let child = Command::new(bin())
+        .args([
+            "relay",
+            "serve",
+            "--db",
+            &db.display().to_string(),
+            "--listen",
+            "127.0.0.1:0",
+            "--ready-file",
+            &ready_file.display().to_string(),
+            "--allow-insecure",
+            "--max-requests",
+            &max_requests.to_string(),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn sync relay");
 
     let addr = wait_for_ready_file(&ready_file);
     (ChildGuard(child), addr)
@@ -1002,6 +1071,210 @@ fn sync_run_retries_transient_hello_failure() {
     assert_eq!(query_users(&local), vec![(1, "alice".to_string())]);
 }
 
+#[test]
+fn sync_relay_v2_stream_requires_websocket_upgrade() {
+    let dir = temp_dir("decentdb-relay-v2-upgrade");
+    let db = dir.join("relay.ddb");
+    let db_str = db.display().to_string();
+    run(&[
+        "exec",
+        "--db",
+        &db_str,
+        "--sql",
+        "CREATE TABLE tasks (tenant_id INT64, id INT64, title TEXT, PRIMARY KEY (tenant_id, id));",
+        "--format",
+        "json",
+    ]);
+    run(&["sync", "init", "--db", &db_str, "--replica-id", "node-a"]);
+
+    let (_server, addr) = spawn_sync_relay_serve(&db, 1);
+    let (status, body) =
+        send_http_json_request(&addr, "GET", "/decentdb/sync/v2/stream", &[], None);
+    assert_eq!(status, 426);
+    assert_eq!(body["error_code"], "UPGRADE_REQUIRED");
+}
+
+#[test]
+fn sync_relay_v2_websocket_snapshot_ack_persists_checkpoint() {
+    let dir = temp_dir("decentdb-relay-v2-ws");
+    let db = dir.join("relay.ddb");
+    setup_tenant_shape_relay_db(&db, "tenant-shape", "relay-node", "1");
+    run(&[
+        "exec",
+        "--db",
+        &db.display().to_string(),
+        "--sql",
+        "INSERT INTO tasks (tenant_id, id, title) VALUES (1, 1, 'seed')",
+        "--format",
+        "json",
+    ]);
+
+    let (server, addr) = spawn_sync_relay_serve(&db, 1);
+    let mut stream = std::net::TcpStream::connect(&addr).expect("connect websocket relay");
+    let request = format!(
+        "GET /decentdb/sync/v2/stream?tenant=1&subject=user-1&shapes=tenant-shape HTTP/1.1\r\n\
+         Host: {addr}\r\n\
+         Upgrade: websocket\r\n\
+         Connection: Upgrade\r\n\
+         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+         Sec-WebSocket-Version: 13\r\n\
+         \r\n"
+    );
+    stream
+        .write_all(request.as_bytes())
+        .expect("write websocket handshake");
+    stream.flush().expect("flush websocket handshake");
+
+    let mut reader = BufReader::new(stream.try_clone().expect("clone websocket"));
+    let mut status_line = String::new();
+    reader
+        .read_line(&mut status_line)
+        .expect("websocket status");
+    assert!(status_line.contains("101"));
+    loop {
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("websocket header");
+        if line.trim_end_matches(['\r', '\n']).is_empty() {
+            break;
+        }
+    }
+    let mut stream = reader.into_inner();
+    let hello = read_websocket_json_frame(&mut stream);
+    assert_eq!(hello["type"], "hello");
+
+    write_websocket_json_frame(
+        &mut stream,
+        &serde_json::json!({
+            "type": "subscribe_shape",
+            "request_id": "req-1",
+            "shape_id": "tenant-shape",
+            "client_replica_id": "web-1",
+            "mode": "snapshot"
+        }),
+    );
+    let snapshot = read_websocket_json_frame(&mut stream);
+    assert_eq!(snapshot["type"], "snapshot");
+    let checkpoint = snapshot["checkpoint"].clone();
+    write_websocket_json_frame(
+        &mut stream,
+        &serde_json::json!({
+            "type": "ack",
+            "request_id": "req-ack",
+            "shape_id": "tenant-shape",
+            "client_replica_id": "web-1",
+            "checkpoint": checkpoint,
+            "changeset_id": snapshot["changeset"]["changeset_id"]
+        }),
+    );
+    let ack = read_websocket_json_frame(&mut stream);
+    assert_eq!(ack["type"], "ack");
+    drop(stream);
+    drop(server);
+
+    let db = open_db(&db);
+    let clients = db.sync_shape_clients().expect("shape clients");
+    assert_eq!(clients.len(), 1);
+    assert_eq!(clients[0].shape_id, "tenant-shape");
+    assert_eq!(clients[0].client_replica_id, "web-1");
+    assert!(clients[0].last_ack_watermark > 0);
+}
+
+#[test]
+fn sync_relay_v2_changes_requires_since_query_param() {
+    let dir = temp_dir("decentdb-relay-v2-since");
+    let db = dir.join("relay.ddb");
+    setup_tenant_shape_relay_db(&db, "tenant-shape", "relay-node", "1");
+    run(&[
+        "exec",
+        "--db",
+        &db.display().to_string(),
+        "--sql",
+        "INSERT INTO tasks (tenant_id, id, title) VALUES (1, 1, 'task-1')",
+        "--format",
+        "json",
+    ]);
+
+    let headers = [
+        ("x-decentdb-tenant", "1"),
+        ("x-decentdb-subject", "user-1"),
+        ("x-decentdb-shapes", "tenant-shape"),
+    ];
+    let (_server, addr) = spawn_sync_relay_serve(&db, 1);
+    let (status, body) = send_http_json_request(
+        &addr,
+        "GET",
+        "/decentdb/sync/v2/shapes/tenant-shape/changes?tenant=1&subject=user-1&shapes=tenant-shape",
+        &headers,
+        None,
+    );
+    assert_eq!(status, 400);
+    assert_eq!(body["error_code"], "RELAY_ERROR");
+    assert!(body["error"]
+        .as_str()
+        .is_some_and(|value| value.contains("since")));
+}
+
+#[test]
+fn sync_relay_v2_shape_snapshot_and_changes_return_delta() {
+    let dir = temp_dir("decentdb-relay-v2-shape");
+    let db = dir.join("relay.ddb");
+    setup_tenant_shape_relay_db(&db, "tenant-shape", "relay-node", "1");
+    run(&[
+        "exec",
+        "--db",
+        &db.display().to_string(),
+        "--sql",
+        "INSERT INTO tasks (tenant_id, id, title) VALUES (1, 1, 'seed')",
+        "--format",
+        "json",
+    ]);
+    let headers = [
+        ("x-decentdb-tenant", "1"),
+        ("x-decentdb-subject", "user-1"),
+        ("x-decentdb-shapes", "tenant-shape"),
+    ];
+    let (server, addr) = spawn_sync_relay_serve(&db, 3);
+    let (snapshot_status, snapshot_body) = send_http_json_request(
+        &addr,
+        "POST",
+        "/decentdb/sync/v2/shapes/tenant-shape/snapshot",
+        &headers,
+        None,
+    );
+    assert_eq!(snapshot_status, 200);
+    assert_eq!(snapshot_body["message_type"], "snapshot");
+
+    run(&[
+        "exec",
+        "--db",
+        &db.display().to_string(),
+        "--sql",
+        "INSERT INTO tasks (tenant_id, id, title) VALUES (1, 2, 'next')",
+        "--format",
+        "json",
+    ]);
+
+    let checkpoint = snapshot_body["checkpoint"]["shape_sequence"]
+        .as_u64()
+        .unwrap();
+    let (changes_status, changes_body) = send_http_json_request(
+        &addr,
+        "GET",
+        &format!(
+            "/decentdb/sync/v2/shapes/tenant-shape/changes?since={checkpoint}&tenant=1&subject=user-1&shapes=tenant-shape"
+        ),
+        &headers,
+        None,
+    );
+    assert_eq!(changes_status, 200, "{changes_body}");
+    assert_eq!(changes_body["message_type"], "changeset");
+    assert!(changes_body["changeset"]["records"]
+        .as_array()
+        .is_some_and(|records| !records.is_empty()));
+
+    drop(server);
+}
+
 fn spawn_retry_server() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind retry server");
     let addr = listener.local_addr().expect("addr");
@@ -1053,6 +1326,135 @@ fn spawn_retry_server() -> String {
     });
 
     format!("http://{addr}")
+}
+
+fn send_http_json_request(
+    addr: &str,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: Option<&serde_json::Value>,
+) -> (u16, serde_json::Value) {
+    let stream = std::net::TcpStream::connect(addr).expect("connect relay");
+    let mut payload = Vec::new();
+    if let Some(body_value) = body {
+        payload = serde_json::to_vec(body_value).expect("serialize request payload");
+    }
+
+    let mut request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nContent-Length: {}\r\n",
+        payload.len()
+    );
+    for (name, value) in headers {
+        request.push_str(name);
+        request.push_str(": ");
+        request.push_str(value);
+        request.push_str("\r\n");
+    }
+    request.push_str("\r\n");
+
+    let mut stream = stream;
+    stream
+        .write_all(request.as_bytes())
+        .expect("send request line");
+    if !payload.is_empty() {
+        stream.write_all(&payload).expect("send request payload");
+    }
+    stream.flush().expect("flush relay request");
+
+    let mut reader = BufReader::new(stream);
+    let mut status_line = String::new();
+    reader.read_line(&mut status_line).expect("status line");
+    let status = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|value| value.parse::<u16>().ok())
+        .expect("parse status");
+
+    let mut content_length = 0usize;
+    loop {
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("response header");
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            break;
+        }
+        if trimmed.to_ascii_lowercase().starts_with("content-length:") {
+            if let Some((_, value)) = trimmed.split_once(':') {
+                content_length = value.trim().parse().unwrap_or(0);
+            }
+        }
+    }
+    let mut response = vec![0u8; content_length];
+    reader.read_exact(&mut response).expect("response body");
+    (
+        status,
+        serde_json::from_slice(&response).expect("parse relay json"),
+    )
+}
+
+fn write_websocket_json_frame(stream: &mut std::net::TcpStream, value: &serde_json::Value) {
+    let payload = serde_json::to_vec(value).expect("serialize websocket json");
+    let mask = [1u8, 2, 3, 4];
+    let mut header = Vec::new();
+    header.push(0x81);
+    match payload.len() {
+        len if len < 126 => header.push(0x80 | u8::try_from(len).expect("small frame")),
+        len if len <= u16::MAX as usize => {
+            header.push(0x80 | 126);
+            header.extend_from_slice(&(len as u16).to_be_bytes());
+        }
+        len => {
+            header.push(0x80 | 127);
+            header.extend_from_slice(&(len as u64).to_be_bytes());
+        }
+    }
+    header.extend_from_slice(&mask);
+    let masked = payload
+        .into_iter()
+        .enumerate()
+        .map(|(index, byte)| byte ^ mask[index % 4])
+        .collect::<Vec<_>>();
+    stream.write_all(&header).expect("write websocket header");
+    stream.write_all(&masked).expect("write websocket payload");
+    stream.flush().expect("flush websocket frame");
+}
+
+fn read_websocket_json_frame(stream: &mut std::net::TcpStream) -> serde_json::Value {
+    let mut header = [0u8; 2];
+    stream
+        .read_exact(&mut header)
+        .expect("read websocket header");
+    assert_eq!(header[0] & 0x0f, 0x1);
+    let masked = (header[1] & 0x80) != 0;
+    let mut len = u64::from(header[1] & 0x7f);
+    if len == 126 {
+        let mut extended = [0u8; 2];
+        stream
+            .read_exact(&mut extended)
+            .expect("read websocket extended len");
+        len = u64::from(u16::from_be_bytes(extended));
+    } else if len == 127 {
+        let mut extended = [0u8; 8];
+        stream
+            .read_exact(&mut extended)
+            .expect("read websocket extended len");
+        len = u64::from_be_bytes(extended);
+    }
+    let mut mask = [0u8; 4];
+    if masked {
+        stream.read_exact(&mut mask).expect("read websocket mask");
+    }
+    let mut payload = vec![0u8; usize::try_from(len).expect("frame too large")];
+    stream
+        .read_exact(&mut payload)
+        .expect("read websocket payload");
+    if masked {
+        for (index, byte) in payload.iter_mut().enumerate() {
+            *byte ^= mask[index % 4];
+        }
+    }
+    serde_json::from_slice(&payload).expect("parse websocket json")
 }
 
 fn read_http_request(stream: &mut std::net::TcpStream) -> (String, String, Vec<u8>) {

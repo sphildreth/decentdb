@@ -35,8 +35,9 @@ await db.close();
 - OPFS sync access handles provide the browser VFS.
 - Writes from all attached tabs are serialized through the owner.
 - Service workers cannot own database handles.
-- The browser sync API is owner-routed but transport is explicitly deferred
-  until production sync relay work lands.
+- The browser sync API is owner-routed. Production relay helpers support
+  `relayHello`, HTTP shape snapshot/pull/ack, and WebSocket shape
+  subscriptions from supported page/worker contexts.
 
 `metrics()` reports owner id/runtime, attached clients, parser profile,
 quota/usage, persistence state, and WASM memory samples. Browser system views

@@ -449,6 +449,29 @@ The higher-level sync command set is documented in
 [Local-first sync](../user-guide/sync/index.md) and
 [CLI Reference](cli-reference.md#sync-commands).
 
+Production changesets also have dedicated C ABI JSON entry points:
+
+```c
+char *changeset = NULL;
+check(ddb_sync_changeset_create_json(
+          db,
+          "{\"source\":{\"kind\":\"checkpoint\",\"peer\":\"relay\",\"since_sequence\":0}}",
+          &changeset),
+      "create changeset");
+puts(changeset);
+check(ddb_string_free(&changeset), "free changeset");
+```
+
+Available functions:
+
+- `ddb_sync_changeset_create_json`
+- `ddb_sync_changeset_apply_json`
+- `ddb_sync_changeset_inspect_json`
+- `ddb_sync_changeset_invert_json`
+
+Each function returns an owned JSON string that must be freed with
+`ddb_string_free`.
+
 ## Branch Workflow JSON Bridge
 
 The C ABI also exposes snapshot, branch, diff, restore, and merge workflows

@@ -266,6 +266,10 @@ Columns:
 - `blocked_by_json`
 - `journal_size_bytes`
 
+`SELECT * FROM sys.sync_retention` is the canonical dotted alias. Shape client
+checkpoints are retention blockers and appear as `shape:<shape>:client:<id>` in
+`blocked_by_json`.
+
 ### `sys_sync_peer_lag`
 
 Columns:
@@ -277,6 +281,90 @@ Columns:
 - `local_high_watermark`
 - `in_lag`
 - `out_lag`
+
+`SELECT * FROM sys.sync_peer_lag` is the canonical dotted alias.
+
+### `sys.sync_relay_status`
+
+Columns:
+
+- `relay_id`
+- `protocol_version`
+- `database_replica_id`
+- `production_mode`
+- `secure_transport_required`
+- `insecure_override_enabled`
+- `active_sessions`
+- `active_streams`
+- `started_at_micros`
+
+### `sys.sync_relay_sessions`
+
+Columns:
+
+- `session_id`
+- `tenant_id`
+- `subject_id`
+- `subject_kind`
+- `request_id`
+- `operation`
+- `scope_name`
+- `shape_id`
+- `started_at_micros`
+- `ended_at_micros`
+- `status`
+- `error`
+- `rows_seen`
+- `bytes_seen`
+
+### `sys.sync_shapes`
+
+Columns:
+
+- `shape_id`
+- `name`
+- `scope_name`
+- `tenant_id`
+- `allowed_roles_json`
+- `allowed_subjects_json`
+- `created_at_micros`
+- `updated_at_micros`
+- `retention_ttl_micros`
+- `max_records`
+- `ack_deadline_micros`
+- `heartbeat_micros`
+
+### `sys.sync_shape_clients`
+
+Columns:
+
+- `shape_id`
+- `tenant_id`
+- `client_replica_id`
+- `subject_id`
+- `session_id`
+- `last_ack_sequence`
+- `last_ack_watermark`
+- `last_changeset_id`
+- `last_seen_at_micros`
+- `retention_blocking`
+- `status`
+
+### `sys.sync_changeset_history`
+
+Columns:
+
+- `changeset_id`
+- `source_replica_id`
+- `source_kind`
+- `scope_name`
+- `shape_id`
+- `record_count`
+- `bytes`
+- `created_at_micros`
+- `applied_at_micros`
+- `outcome`
+- `integrity_hash`
 
 ### `sys_sync_doctor`
 

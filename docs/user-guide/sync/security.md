@@ -6,11 +6,12 @@ Sync is local-first, but it still handles credentials and transport endpoints.
 
 Peer endpoints must use `http://` or `https://`.
 
-The built-in CLI transport does not provide TLS termination, certificate
-management, or hardened public-server behavior.
+`decentdb sync serve` is a development transport and does not provide TLS
+termination, certificate management, or hardened public-server behavior.
 
 Use it on trusted loopback networks, in local development, or behind a secure
-reverse proxy until future transport hardening exists.
+reverse proxy. Use `decentdb relay serve` for authenticated production v2 sync
+routes and configure TLS at a reverse proxy or trusted internal boundary.
 
 ## Token Handling
 
@@ -23,6 +24,10 @@ Example:
 export DECENTDB_SYNC_TOKEN='super-secret'
 decentdb sync peer add --db=app.ddb --name=central --endpoint=http://127.0.0.1:43123 --token-env=DECENTDB_SYNC_TOKEN
 ```
+
+For `decentdb relay serve`, pass `--auth-token-env=<ENV>`. Browser WebSocket
+clients may need to pass a short-lived token in the stream URL because browser
+WebSocket APIs cannot set custom headers; only do this over TLS.
 
 ## Logging and Redaction
 

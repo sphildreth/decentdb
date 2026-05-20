@@ -257,6 +257,8 @@ export interface MetricsResult {
   parserProfile?: string;
   syncConfiguredPeers?: number;
   syncDeferred?: boolean;
+  syncRelayHttpPull?: boolean;
+  syncRelayWebSocketShapes?: boolean;
 }
 
 export interface SyncRunResult {

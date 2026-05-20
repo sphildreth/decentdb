@@ -313,11 +313,13 @@ function runBrowserSystemView(owner: OwnerRecord, sql: string): EngineResult | u
 
   if (normalized === "select * from sys.browser_sync") {
     return {
-      columns: ["configured_peers", "deferred"],
+      columns: ["configured_peers", "relay_http_pull", "relay_websocket_shapes", "legacy_run_deferred"],
       rows: [
         {
           configured_peers: owner.syncPeers.size,
-          deferred: true,
+          relay_http_pull: true,
+          relay_websocket_shapes: true,
+          legacy_run_deferred: true,
         },
       ],
       affectedRows: 1,
@@ -612,6 +614,8 @@ async function handleMetrics(request: RpcRequest): Promise<RpcResponse> {
     parserProfile: owner.parserProfile,
     syncConfiguredPeers: owner.syncPeers.size,
     syncDeferred: true,
+    syncRelayHttpPull: true,
+    syncRelayWebSocketShapes: true,
   };
   if (owner.wasmMemory) {
     result.wasmMemoryBytes = owner.wasmMemory.buffer.byteLength;

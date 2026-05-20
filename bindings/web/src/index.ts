@@ -58,12 +58,72 @@ export interface OpenOptions {
 export interface SyncConfigurePeerOptions {
   name: string;
   endpoint: string;
+  token?: string;
+  headers?: Record<string, string>;
 }
 
 export interface SyncRunOptions {
   peer: string;
   direction: "push" | "pull" | "both";
   timeoutMs?: number;
+}
+
+export interface RelayRequestOptions {
+  peer: string;
+  headers?: Record<string, string>;
+}
+
+export interface ShapePullOptions extends RelayRequestOptions {
+  shapeId: string;
+  since?: number;
+}
+
+export interface ShapeSnapshotOptions extends RelayRequestOptions {
+  shapeId: string;
+  clientReplicaId: string;
+}
+
+export interface ShapeAckOptions extends RelayRequestOptions {
+  shapeId: string;
+  tenantId: string;
+  clientReplicaId: string;
+  subjectId: string;
+  shapeSequence: number;
+  sourceHighWatermark: number;
+  changesetId?: string;
+  sessionId?: string;
+}
+
+export interface RelayPrincipalOptions {
+  tenantId: string;
+  subjectId: string;
+  subjectKind?: "user" | "device" | "service" | "agent";
+  issuer?: string;
+  roles?: string[];
+  allowedScopes?: string[];
+  allowedShapes?: string[];
+  sessionId?: string;
+  requestId?: string;
+}
+
+export interface ShapeStreamCheckpoint {
+  shape_sequence: number;
+  source_high_watermark: number;
+}
+
+export interface ShapeSubscribeOptions extends RelayRequestOptions {
+  shapeId: string;
+  clientReplicaId: string;
+  mode?: "snapshot" | "resume";
+  principal?: RelayPrincipalOptions;
+  lastAckCheckpoint?: ShapeStreamCheckpoint;
+  onMessage?: (message: unknown) => void;
+  onError?: (error: Error) => void;
+}
+
+export interface ShapeSubscription {
+  close: () => void;
+  ack: (message: unknown) => void;
 }
 
 export type Params = QueryValue[];
@@ -695,10 +755,13 @@ export class Statement {
 }
 
 class SyncController {
+  private readonly peers = new Map<string, SyncConfigurePeerOptions>();
+
   constructor(private readonly db: Database) {}
 
   async configurePeer(options: SyncConfigurePeerOptions): Promise<void> {
     this.db.assertOpen();
+    this.peers.set(options.name, options);
     await this.db.execRequest("sync_configure_peer", {
       dbId: this.db.id,
       name: options.name,
@@ -719,6 +782,247 @@ class SyncController {
       message: "Browser sync transport is deferred for this build profile.",
     };
   }
+
+  async relayHello(options: RelayRequestOptions): Promise<unknown> {
+    return this.fetchRelay(options.peer, "/decentdb/sync/v2/hello", {
+      method: "GET",
+      headers: options.headers,
+    });
+  }
+
+  async pullShape(options: ShapePullOptions): Promise<unknown> {
+    const since = options.since ?? 0;
+    return this.fetchRelay(
+      options.peer,
+      `/decentdb/sync/v2/shapes/${encodeURIComponent(options.shapeId)}/changes?since=${since}`,
+      {
+        method: "GET",
+        headers: options.headers,
+      }
+    );
+  }
+
+  async shapeSnapshot(options: ShapeSnapshotOptions): Promise<unknown> {
+    return this.fetchRelay(
+      options.peer,
+      `/decentdb/sync/v2/shapes/${encodeURIComponent(options.shapeId)}/snapshot`,
+      {
+        method: "POST",
+        headers: options.headers,
+        body: JSON.stringify({ client_replica_id: options.clientReplicaId }),
+      }
+    );
+  }
+
+  async ackShape(options: ShapeAckOptions): Promise<unknown> {
+    return this.fetchRelay(options.peer, "/decentdb/sync/v2/acks", {
+      method: "POST",
+      headers: options.headers,
+      body: JSON.stringify({
+        shape_id: options.shapeId,
+        tenant_id: options.tenantId,
+        client_replica_id: options.clientReplicaId,
+        subject_id: options.subjectId,
+        session_id: options.sessionId ?? null,
+        shape_sequence: options.shapeSequence,
+        source_high_watermark: options.sourceHighWatermark,
+        changeset_id: options.changesetId ?? null,
+      }),
+    });
+  }
+
+  subscribeShape(options: ShapeSubscribeOptions): ShapeSubscription {
+    this.db.assertOpen();
+    const peer = this.requirePeer(options.peer);
+    const principal = options.principal ?? this.principalFromHeaders(peer, options);
+    if (!principal) {
+      throw new DecentDBWebError({
+        code: "ERR_BROWSER_SYNC_PRINCIPAL_REQUIRED",
+        message: "WebSocket shape subscriptions require relay principal context.",
+        details: "Pass options.principal or configure x-decentdb-* peer headers.",
+      });
+    }
+    const socket = new WebSocket(
+      this.relayWebSocketUrl(peer, "/decentdb/sync/v2/stream", principal, options.shapeId),
+      "decentdb.sync.v2"
+    );
+    const send = (payload: unknown): void => {
+      const text = JSON.stringify(payload);
+      if (socket.readyState === WebSocket.OPEN) {
+        socket.send(text);
+      } else {
+        socket.addEventListener("open", () => socket.send(text), { once: true });
+      }
+    };
+    socket.addEventListener("open", () => {
+      send({
+        type: "hello",
+        request_id: principal.requestId,
+        client_replica_id: options.clientReplicaId,
+        supported_changeset_versions: [1],
+        supported_shape_stream_versions: [1],
+        supported_compression: ["none"],
+      });
+      send({
+        type: "subscribe_shape",
+        request_id: principal.requestId,
+        shape_id: options.shapeId,
+        client_replica_id: options.clientReplicaId,
+        mode: options.mode ?? "snapshot",
+        last_ack_checkpoint: options.lastAckCheckpoint ?? null,
+      });
+    });
+    socket.addEventListener("message", (event: MessageEvent<string>) => {
+      try {
+        options.onMessage?.(JSON.parse(event.data));
+      } catch (error) {
+        options.onError?.(error instanceof Error ? error : new Error(String(error)));
+      }
+    });
+    socket.addEventListener("error", () => {
+      options.onError?.(
+        new DecentDBWebError({
+          code: "ERR_BROWSER_SYNC_WEBSOCKET",
+          message: "Relay WebSocket failed.",
+          details: peer.endpoint,
+        })
+      );
+    });
+    return {
+      close: () => socket.close(),
+      ack: (message: unknown): void => {
+        const value = message as Record<string, unknown>;
+        const checkpoint = (value.checkpoint ?? {}) as Record<string, unknown>;
+        const changeset = (value.changeset ?? {}) as Record<string, unknown>;
+        send({
+          type: "ack",
+          shape_id: String(value.shape_id ?? options.shapeId),
+          client_replica_id: options.clientReplicaId,
+          shape_sequence: Number(value.shape_sequence ?? checkpoint.shape_sequence ?? 0),
+          source_high_watermark: Number(
+            checkpoint.source_high_watermark ?? value.source_high_watermark ?? 0
+          ),
+          changeset_id:
+            typeof changeset.changeset_id === "string"
+              ? changeset.changeset_id
+              : typeof value.changeset_id === "string"
+                ? value.changeset_id
+                : undefined,
+        });
+      },
+    };
+  }
+
+  private async fetchRelay(
+    peerName: string,
+    path: string,
+    init: RequestInit
+  ): Promise<unknown> {
+    this.db.assertOpen();
+    const peer = this.requirePeer(peerName);
+    const headers = new Headers(init.headers);
+    headers.set("content-type", "application/json");
+    for (const [name, value] of Object.entries(peer.headers ?? {})) {
+      headers.set(name, value);
+    }
+    if (peer.token) {
+      headers.set("authorization", `Bearer ${peer.token}`);
+    }
+    const endpoint = `${peer.endpoint.replace(/\/$/, "")}${path}`;
+    const response = await fetch(endpoint, { ...init, headers });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new DecentDBWebError({
+        code: String(payload.error_code ?? "ERR_BROWSER_SYNC_RELAY"),
+        message: String(payload.error ?? `Relay request failed with ${response.status}.`),
+        details: endpoint,
+      });
+    }
+    return payload;
+  }
+
+  private requirePeer(peerName: string): SyncConfigurePeerOptions {
+    const peer = this.peers.get(peerName);
+    if (!peer) {
+      throw new DecentDBWebError({
+        code: "ERR_BROWSER_SYNC_PEER_NOT_CONFIGURED",
+        message: `Sync peer '${peerName}' is not configured for this runtime owner.`,
+        details: "Call db.sync.configurePeer() with a production relay endpoint first.",
+      });
+    }
+    return peer;
+  }
+
+  private principalFromHeaders(
+    peer: SyncConfigurePeerOptions,
+    options: RelayRequestOptions
+  ): RelayPrincipalOptions | undefined {
+    const headers = new Map<string, string>();
+    for (const [name, value] of Object.entries(peer.headers ?? {})) {
+      headers.set(name.toLowerCase(), value);
+    }
+    for (const [name, value] of Object.entries(options.headers ?? {})) {
+      headers.set(name.toLowerCase(), value);
+    }
+    const tenantId = headers.get("x-decentdb-tenant");
+    const subjectId = headers.get("x-decentdb-subject");
+    if (!tenantId || !subjectId) {
+      return undefined;
+    }
+    return {
+      tenantId,
+      subjectId,
+      subjectKind: (headers.get("x-decentdb-subject-kind") as RelayPrincipalOptions["subjectKind"]) ?? "user",
+      issuer: headers.get("x-decentdb-issuer"),
+      roles: splitHeaderList(headers.get("x-decentdb-roles")),
+      allowedScopes: splitHeaderList(headers.get("x-decentdb-scopes")),
+      allowedShapes: splitHeaderList(headers.get("x-decentdb-shapes")),
+      sessionId: headers.get("x-decentdb-session"),
+      requestId: headers.get("x-decentdb-request"),
+    };
+  }
+
+  private relayWebSocketUrl(
+    peer: SyncConfigurePeerOptions,
+    path: string,
+    principal: RelayPrincipalOptions,
+    shapeId: string
+  ): string {
+    const url = new URL(`${peer.endpoint.replace(/\/$/, "")}${path}`);
+    url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+    if (peer.token) {
+      url.searchParams.set("token", peer.token);
+    }
+    url.searchParams.set("tenant", principal.tenantId);
+    url.searchParams.set("subject", principal.subjectId);
+    url.searchParams.set("subject_kind", principal.subjectKind ?? "user");
+    if (principal.issuer) {
+      url.searchParams.set("issuer", principal.issuer);
+    }
+    if (principal.roles?.length) {
+      url.searchParams.set("roles", principal.roles.join(","));
+    }
+    if (principal.allowedScopes?.length) {
+      url.searchParams.set("scopes", principal.allowedScopes.join(","));
+    }
+    url.searchParams.set("shapes", (principal.allowedShapes ?? [shapeId]).join(","));
+    if (principal.sessionId) {
+      url.searchParams.set("session", principal.sessionId);
+    }
+    if (principal.requestId) {
+      url.searchParams.set("request", principal.requestId);
+    }
+    return url.toString();
+  }
+}
+
+function splitHeaderList(value: string | undefined): string[] {
+  return value
+    ? value
+        .split(",")
+        .map((part) => part.trim())
+        .filter(Boolean)
+    : [];
 }
 
 export class Database {

@@ -1,6 +1,6 @@
 # Production Sync Relay And Public Changeset API
 
-**Status:** Active spec - governing ADRs accepted, implementation pending
+**Status:** Implemented - governing ADRs accepted
 **Project:** DecentDB
 **Document Type:** Implementation SPEC
 **Audience:** Core engine developers, sync implementers, CLI maintainers, web

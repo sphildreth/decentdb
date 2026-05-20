@@ -574,6 +574,62 @@ Expected `sync run` table output includes:
 - `pushed`
 - `pulled`
 
+### sync changeset
+
+```bash
+decentdb sync changeset create --db=<path> --from-checkpoint=<peer:sequence> --output=<changeset.json> [--scope=<scope>] [--shape=<shape>] [--max-records=<n>] [--max-bytes=<n>]
+decentdb sync changeset create --db=<path> --from-branch=<left> --to-branch=<right> --output=<changeset.json>
+decentdb sync changeset create --db=<path> --from-snapshot=<snapshot> --to-branch=<branch> --output=<changeset.json>
+decentdb sync changeset inspect --input=<changeset.json> [--db=<path>] [--check-local] [--format=<json|table>]
+decentdb sync changeset apply --db=<path> --input=<changeset.json> [--conflict-policy=<record|stop|last-writer-wins|origin-priority>] [--format=<json|table>]
+decentdb sync changeset invert --input=<changeset.json> --output=<inverse.json> [--db=<path>] [--format=<json|table>]
+```
+
+- Checkpoint changesets are created from the durable sync journal.
+- Branch and snapshot changesets reuse branch diff semantics and reject
+  unsupported row-diff cases before producing output.
+- `inspect --check-local` validates local schema/query compatibility without
+  mutating data.
+- `apply` is transactional by default and idempotent for already-applied
+  changeset IDs with the same integrity hash.
+- `invert` only succeeds when enough before-state is available.
+
+### relay
+
+```bash
+decentdb relay serve --db=<path> --listen=<host:port> --auth-token-env=<ENV> [--public-url=<https-url>] [--require-tls] [--allow-insecure] [--ready-file=<path>] [--max-requests=<n>] [--json]
+decentdb relay status --db=<path> [--format=<json|table>]
+decentdb relay doctor --db=<path> [--format=<json|table>]
+decentdb relay shape create --db=<path> --shape=<shape> --scope=<scope> --tenant=<tenant> [--allow-role=<role>] [--allow-subject=<subject>] [--format=<json|table>]
+decentdb relay shape list --db=<path> [--format=<json|table>]
+decentdb relay shape drop --db=<path> --shape=<shape> [--format=<json|table>]
+decentdb relay shape status --db=<path> --shape=<shape> [--format=<json|table>]
+decentdb relay shape snapshot --db=<path> --shape=<shape> --client-replica-id=<replica> --output=<changeset.json> [--format=<json|table>]
+```
+
+`relay serve` exposes production v2 routes under `/decentdb/sync/v2`:
+
+- `GET /hello`
+- `GET /status`
+- `GET /sessions`
+- `POST /sessions`
+- `POST /changesets/export`
+- `POST /changesets/apply`
+- `POST /changesets/inspect`
+- `POST /changesets/invert`
+- `GET /shapes`
+- `POST /shapes/{shape_id}/snapshot`
+- `GET /shapes/{shape_id}/changes?since=<watermark>`
+- `POST /acks`
+- `GET /conflicts`
+- `GET /diagnostics`
+- `GET /stream` with a WebSocket upgrade
+
+Production requests require a bearer token unless `--allow-insecure` is set.
+Principal context is provided by `x-decentdb-*` headers. Browser WebSocket
+clients can use short-lived query parameters on `/stream` because the browser
+WebSocket API cannot set custom headers.
+
 ### sync conflicts / conflict
 
 ```bash
