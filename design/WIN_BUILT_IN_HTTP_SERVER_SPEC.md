@@ -356,6 +356,8 @@ Recommended behavior:
 
 - `decentdb serve --db ./app.ddb --open` opens a local URL containing a
   short-lived bootstrap token.
+- If `--open` is omitted, startup output should still provide a local Web UI URL
+  that lets the user enter the console without understanding auth mechanics.
 - The Web Console exchanges or stores that token in browser session scope.
 - The Web Console sends `Authorization: Bearer <token>` for API requests.
 - The startup output describes this as `Access: local browser session` rather
@@ -542,7 +544,7 @@ At runtime, the Web Console may only make same-origin requests to the DecentDB s
  /assets/console.js
  /api/v1/info
  /api/v1/schema
- /api/v1/query
+ /api/v1/sql
 ```
 
 It must not call external domains.
@@ -1015,7 +1017,7 @@ decentdb-web-console
 
 ### 17.2 Core Engine Boundary
 
-The core engine should expose clean APIs such as:
+The HTTP layer should consume existing clean core APIs such as:
 
 ```rust
 database.schema()
@@ -1186,13 +1188,16 @@ Deliverables:
 
 - `decentdb serve --db <file>.ddb`.
 - Bind to `127.0.0.1:7373`.
+- `--read-only`.
+- Transparent ephemeral auth for default localhost sessions.
+- `--open`.
 - Serve `/`.
 - Serve local static assets.
 - `GET /healthz`.
 - `GET /readyz`.
 - `GET /api/v1/info`.
 - `GET /api/v1/schema`.
-- `POST /api/v1/query`.
+- `POST /api/v1/sql`.
 - Basic Web Console layout.
 - Schema sidebar.
 - Query textarea.
@@ -1206,8 +1211,6 @@ Deliverables:
 
 Deliverables:
 
-- `--read-only`.
-- `--open`.
 - `--host`.
 - `--port`.
 - `--max-result-rows`.
@@ -1224,7 +1227,8 @@ Deliverables:
 Deliverables:
 
 - `--token-env`.
-- Auth middleware.
+- `--show-token`.
+- Localhost-only `--no-auth` for debugging.
 - Remote bind safety checks.
 - Optional CORS configuration.
 - JSON log mode.
@@ -1252,7 +1256,8 @@ Deliverables:
 
 - Running `decentdb serve --db ./app.ddb` starts a server.
 - The server binds to `127.0.0.1:7373` by default.
-- Startup output shows database, mode, Web UI URL, API URL, and bind address.
+- Startup output shows database, mode, Web UI URL, API URL, bind address, and
+  local browser session access.
 - Ctrl+C shuts the server down cleanly.
 
 ### 23.2 Web Console
@@ -1281,11 +1286,20 @@ Deliverables:
 - Mutation attempts are rejected with a structured `READ_ONLY` error.
 - The database file is not modified by read-only usage.
 
-### 23.5 API
+### 23.5 Transparent Local Auth
+
+- Default localhost sessions require an ephemeral bearer token internally.
+- `--open` launches a browser session that works without manual token copy/paste.
+- API requests without the token are rejected with `AUTH_REQUIRED` or
+  `AUTH_INVALID`.
+- The startup output does not expose the token unless `--show-token` is used.
+
+### 23.6 API
 
 - `/api/v1/info` returns database and server metadata.
 - `/api/v1/schema` returns schema metadata.
-- `/api/v1/query` returns columns, rows, row count, elapsed time, and truncation status.
+- `/api/v1/sql` returns columns, rows, affected row counts, elapsed time, and
+  truncation status using DecentDB statement-batch semantics.
 - Errors use the standard structured error shape.
 - Query limits are enforced.
 
@@ -1306,7 +1320,8 @@ Mitigation:
 Mitigation:
 
 - Bind to localhost by default.
-- Require auth or explicit unsafe override for remote bind.
+- Use transparent ephemeral auth for localhost.
+- Require auth for remote bind.
 - Disable CORS by default.
 - Support read-only mode.
 - Enforce request and query limits.
@@ -1347,11 +1362,9 @@ Mitigation:
 3. Should the Web Console have a default starter query?
 4. Should SQL query history be enabled by default?
 5. Should query history be per database file or global per browser origin?
-6. Should the server expose `/api/v1/execute` in v1, or should v1 only support query execution through one endpoint?
-7. Should remote binding require a token always, or allow an explicit `--unsafe-no-auth` option?
-8. Should CSV export be generated client-side or server-side?
-9. Should the Web Console show full database file paths or only file names by default?
-10. Should the Web Console include a visible “Use Decent Bench for advanced workflows” link or hint?
+6. Should CSV export be generated client-side or server-side?
+7. Should the Web Console show full database file paths or only file names by default?
+8. Should the Web Console include a visible “Use Decent Bench for advanced workflows” link or hint?
 
 ---
 
@@ -1364,6 +1377,7 @@ Default host: 127.0.0.1
 Default port: 7373
 Default mode: read-write, with visible banner
 Read-only flag: supported
+Default localhost auth: transparent ephemeral token
 Frontend: HTML5 + CSS3 + vanilla JS
 External assets: prohibited
 Telemetry: prohibited
@@ -1373,6 +1387,7 @@ Query history: localStorage
 Result limit: 1,000 rows
 Query timeout: 30 seconds
 Remote auth: required for non-localhost bind
+Unauthenticated remote bind: not allowed in v1
 Decent Bench overlap: explicitly avoided
 ```
 
