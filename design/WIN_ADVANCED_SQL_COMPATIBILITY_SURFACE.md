@@ -48,7 +48,8 @@ storage fundamentals.
 ## Moved Out Of This Track
 
 - Full-text search with BM25 ranking is tracked in [`FUTURE_WINS.md`](FUTURE_WINS.md) as its own roadmap item.
-- Native geospatial types and spatial indexes are tracked in [`WIN_GEOSPATIAL_DATA_SUPPORT.md`](WIN_GEOSPATIAL_DATA_SUPPORT.md) and ADR 0124 through ADR 0128.
+- Native geospatial types and spatial indexes are shipped foundations covered by
+  ADR 0124 through ADR 0128 and the user-guide data type/index docs.
 - Lua extensions are tracked in [`WIN_LUA_EXTENSION_RUNTIME_SPEC.md`](WIN_LUA_EXTENSION_RUNTIME_SPEC.md) as the extension runtime and package model.
 - Access control, `GRANT`, and `REVOKE` belong with policy-aware embedded SQL only if DecentDB later adds a product-level role or policy model.
 

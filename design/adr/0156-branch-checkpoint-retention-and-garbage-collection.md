@@ -140,7 +140,6 @@ automatic cleanup. Disk growth is visible and diagnosable rather than hidden.
 
 ## References
 
-- `design/WIN_BRANCH_DIFF_RESTORE_TIME_TRAVEL_IMPLEMENTATION_GUIDE.md`
 - `design/adr/0019-wal-retention-for-active-readers.md`
 - `design/adr/0137-size-based-auto-checkpoint-trigger.md`
 - `design/adr/0153-branch-metadata-identity-and-user-surface.md`

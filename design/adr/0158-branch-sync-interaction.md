@@ -134,7 +134,6 @@ being silently exported.
 
 ## References
 
-- `design/WIN_BRANCH_DIFF_RESTORE_TIME_TRAVEL_IMPLEMENTATION_GUIDE.md`
 - `design/WIN_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md`
 - `design/adr/0147-local-sync-journal-foundation.md`
 - `design/adr/0148-sync-http-transport-and-peer-management.md`

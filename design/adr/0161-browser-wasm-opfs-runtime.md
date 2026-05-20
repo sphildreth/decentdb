@@ -60,7 +60,7 @@ coordination is not promised.
 ### References
 
 - `design/FUTURE_WINS.md`
-- `design/WIN_WASM_SUPPORT_IMPLEMENTATION.md`
+- `docs/api/wasm.md`
 - `crates/decentdb/src/vfs/opfs.rs`
 - `crates/decentdb/src/wasm.rs`
 - `bindings/web/`

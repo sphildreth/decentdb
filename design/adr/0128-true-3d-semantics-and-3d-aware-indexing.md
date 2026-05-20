@@ -185,8 +185,6 @@ Rejected.
 
 ## References
 
-- `design/WIN_GEOSPATIAL_DATA_SUPPORT.md`
 - `design/adr/0124-geospatial-type-system-and-ewkb-storage.md`
 - `design/adr/0125-spatial-covering-cell-secondary-index.md`
 - `design/adr/0127-planner-native-spatial-access-paths.md`
-

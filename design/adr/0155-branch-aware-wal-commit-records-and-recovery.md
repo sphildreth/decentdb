@@ -4,8 +4,8 @@
 
 ## Context
 
-FUTURE_WINS #1 requires branch-local writes, branch logs, restore, and time-travel
-workflows without weakening existing WAL correctness guarantees.
+Branch-local writes, branch logs, restore, and time-travel workflows must not
+weaken existing WAL correctness guarantees.
 
 Current WAL behavior already establishes key invariants:
 
@@ -90,7 +90,6 @@ crash recovery reconstructs branch state deterministically.
 
 ## References
 
-- `design/WIN_BRANCH_DIFF_RESTORE_TIME_TRAVEL_IMPLEMENTATION_GUIDE.md` (Section 8, ADR C)
 - `design/adr/0002-wal-commit-record-format.md`
 - `design/adr/0003-snapshot-lsn-atomicity.md`
 - `design/adr/0019-wal-retention-for-active-readers.md`

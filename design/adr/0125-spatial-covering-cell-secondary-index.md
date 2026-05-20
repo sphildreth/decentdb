@@ -132,7 +132,6 @@ strategy can be derived from the spatial type family and column metadata.
 
 ## References
 
-- `design/WIN_GEOSPATIAL_DATA_SUPPORT.md`
 - `design/adr/0120-core-storage-engine-btree.md`
 - `design/adr/0123-phase1-table-btree-foundation.md`
 - `design/adr/0128-true-3d-semantics-and-3d-aware-indexing.md`

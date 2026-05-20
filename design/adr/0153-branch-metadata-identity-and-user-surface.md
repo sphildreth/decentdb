@@ -4,13 +4,11 @@
 
 ## Context
 
-FUTURE_WINS #1 (branch, diff, restore, and time-travel workflows) requires a
-stable user and metadata contract before storage/WAL implementation details are
-chosen. Section 8 of
-`design/WIN_BRANCH_DIFF_RESTORE_TIME_TRAVEL_IMPLEMENTATION_GUIDE.md` requires
-ADR A to define identity, default branch behavior, checkout scope, branch
-commit semantics, naming, metadata catalog direction, and compatibility for
-existing databases.
+Branch, diff, restore, and time-travel workflows require a stable user and
+metadata contract before storage/WAL implementation details are chosen. This ADR
+defines identity, default branch behavior, checkout scope, branch commit
+semantics, naming, metadata catalog direction, and compatibility for existing
+databases.
 
 This ADR intentionally does not decide root-manifest layout, WAL encoding,
 checkpoint retention/GC, or merge conflict algorithms; those are covered by ADR
@@ -118,6 +116,5 @@ B through ADR F.
 
 ## References
 
-- `design/WIN_BRANCH_DIFF_RESTORE_TIME_TRAVEL_IMPLEMENTATION_GUIDE.md`
 - `design/FUTURE_WINS.md`
 - `design/adr/0147-local-sync-journal-foundation.md`
