@@ -145,3 +145,219 @@ fn sync_sql_inspection_views_expose_scopes_and_bindings() {
         Value::Text("tenant_1".to_string())
     );
 }
+
+#[test]
+fn sys_views_expose_operational_metrics() {
+    let dir = tempfile::TempDir::with_prefix("decentdb-sys-metrics").unwrap();
+    let path = dir.path().join("test.ddb");
+    let db = Db::create(&path, DbConfig::default()).unwrap();
+    db.execute("CREATE TABLE users (id INT64 PRIMARY KEY, name TEXT)")
+        .unwrap();
+
+    let legacy_status = db.execute("SELECT * FROM sys_sync_status").unwrap();
+    assert_eq!(
+        legacy_status.columns(),
+        &[
+            "enabled",
+            "replica_id",
+            "next_sequence",
+            "journal_path",
+            "journal_size_bytes"
+        ]
+    );
+    assert_eq!(legacy_status.rows().len(), 1);
+    assert_eq!(legacy_status.rows()[0].values()[0], Value::Bool(false));
+
+    let canonical_status = db.execute("SELECT * FROM sys.sync_status").unwrap();
+    assert_eq!(canonical_status.columns(), legacy_status.columns());
+    assert_eq!(canonical_status.rows(), legacy_status.rows());
+
+    db.sync_init_replica("node-a").unwrap();
+    db.execute("INSERT INTO users (id, name) VALUES (1, 'Ada')")
+        .unwrap();
+
+    let status = db.execute("SELECT * FROM sys.sync_status").unwrap();
+    assert_eq!(status.rows().len(), 1);
+    assert_eq!(status.rows()[0].values()[0], Value::Bool(true));
+    assert_eq!(
+        status.rows()[0].values()[1],
+        Value::Text("node-a".to_string())
+    );
+
+    let queue = db.write_queue_metrics();
+    let queue_view = db.execute("SELECT * FROM sys.write_queue_metrics").unwrap();
+    assert_eq!(
+        queue_view.columns(),
+        &[
+            "capacity",
+            "current_depth",
+            "admitted",
+            "rejected",
+            "timed_out",
+            "canceled",
+            "executed",
+            "committed",
+            "failed",
+            "group_commit_batches",
+            "group_commit_syncs",
+            "group_commit_max_batch",
+            "group_commit_commits_covered",
+            "physical_syncs_saved",
+            "total_queue_wait_ns",
+        ]
+    );
+    assert_eq!(queue_view.rows().len(), 1);
+    assert_eq!(
+        queue_view.rows()[0].values()[0],
+        Value::Int64(queue.capacity as i64)
+    );
+    assert_eq!(
+        queue_view.rows()[0].values()[1],
+        Value::Int64(queue.current_depth as i64)
+    );
+    assert_eq!(
+        queue_view.rows()[0].values()[2],
+        Value::Int64(queue.admitted as i64)
+    );
+    assert_eq!(
+        queue_view.rows()[0].values()[3],
+        Value::Int64(queue.rejected as i64)
+    );
+    assert_eq!(
+        queue_view.rows()[0].values()[4],
+        Value::Int64(queue.timed_out as i64)
+    );
+    assert_eq!(
+        queue_view.rows()[0].values()[5],
+        Value::Int64(queue.canceled as i64)
+    );
+    assert_eq!(
+        queue_view.rows()[0].values()[6],
+        Value::Int64(queue.executed as i64)
+    );
+    assert_eq!(
+        queue_view.rows()[0].values()[7],
+        Value::Int64(queue.committed as i64)
+    );
+    assert_eq!(
+        queue_view.rows()[0].values()[8],
+        Value::Int64(queue.failed as i64)
+    );
+    assert_eq!(
+        queue_view.rows()[0].values()[9],
+        Value::Int64(queue.group_commit_batches as i64)
+    );
+    assert_eq!(
+        queue_view.rows()[0].values()[10],
+        Value::Int64(queue.group_commit_syncs as i64)
+    );
+    assert_eq!(
+        queue_view.rows()[0].values()[11],
+        Value::Int64(queue.group_commit_max_batch as i64)
+    );
+    assert_eq!(
+        queue_view.rows()[0].values()[12],
+        Value::Int64(queue.group_commit_commits_covered as i64)
+    );
+    assert_eq!(
+        queue_view.rows()[0].values()[13],
+        Value::Int64(queue.physical_syncs_saved as i64)
+    );
+    assert_eq!(
+        queue_view.rows()[0].values()[14],
+        Value::Int64(queue.total_queue_wait_ns as i64)
+    );
+
+    let storage = db.storage_info().unwrap();
+    let wal_view = db.execute("SELECT * FROM sys.wal_metrics").unwrap();
+    assert_eq!(
+        wal_view.columns(),
+        &[
+            "latest_lsn",
+            "file_size_bytes",
+            "active_readers",
+            "max_page_count",
+            "checkpoint_epoch",
+            "warning_count",
+            "version_count",
+            "resident_versions",
+            "on_disk_versions",
+            "shared_wal",
+        ]
+    );
+    assert_eq!(wal_view.rows().len(), 1);
+    assert_eq!(
+        wal_view.rows()[0].values()[0],
+        Value::Int64(storage.wal_end_lsn as i64)
+    );
+    assert_eq!(
+        wal_view.rows()[0].values()[1],
+        Value::Int64(storage.wal_file_size as i64)
+    );
+    assert_eq!(
+        wal_view.rows()[0].values()[2],
+        Value::Int64(storage.active_readers as i64)
+    );
+    assert_eq!(
+        wal_view.rows()[0].values()[5],
+        Value::Int64(storage.warning_count as i64)
+    );
+    assert_eq!(
+        wal_view.rows()[0].values()[6],
+        Value::Int64(storage.wal_versions as i64)
+    );
+    assert_eq!(
+        wal_view.rows()[0].values()[9],
+        Value::Bool(storage.shared_wal)
+    );
+
+    let storage_view = db.execute("SELECT * FROM sys.storage_metrics").unwrap();
+    assert_eq!(
+        storage_view.columns(),
+        &[
+            "path",
+            "wal_path",
+            "format_version",
+            "page_size",
+            "cache_size_mb",
+            "page_count",
+            "schema_cookie",
+            "wal_end_lsn",
+            "wal_file_size",
+            "last_checkpoint_lsn",
+            "active_readers",
+            "wal_versions",
+            "warning_count",
+            "shared_wal",
+        ]
+    );
+    assert_eq!(storage_view.rows().len(), 1);
+    assert_eq!(
+        storage_view.rows()[0].values()[0],
+        Value::Text(db.path().to_string_lossy().to_string())
+    );
+    assert_eq!(
+        storage_view.rows()[0].values()[2],
+        Value::Int64(storage.format_version as i64)
+    );
+    assert_eq!(
+        storage_view.rows()[0].values()[3],
+        Value::Int64(storage.page_size as i64)
+    );
+    assert_eq!(
+        storage_view.rows()[0].values()[4],
+        Value::Int64(storage.cache_size_mb as i64)
+    );
+    assert_eq!(
+        storage_view.rows()[0].values()[5],
+        Value::Int64(storage.page_count as i64)
+    );
+    assert_eq!(
+        storage_view.rows()[0].values()[12],
+        Value::Int64(storage.warning_count as i64)
+    );
+    assert_eq!(
+        storage_view.rows()[0].values()[13],
+        Value::Bool(storage.shared_wal)
+    );
+}

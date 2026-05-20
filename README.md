@@ -37,6 +37,7 @@ It targets a single process with **one writer** and **many concurrent readers** 
 - 🕒 **Native TIMESTAMP Type** - DATE/TIMESTAMP columns stored as int64 microseconds since Unix epoch (UTC); correct `ORDER BY` and `EXTRACT(YEAR|MONTH|DAY|HOUR|MINUTE|SECOND FROM ...)`, with native bind/read in all bindings
 - 👥 **Concurrent Reads** - Snapshot isolation allows multiple readers with one writer
 - 🚦 **Queued Write Concurrency** - Engine-owned bounded write queue with timeouts, metrics, and strict durable group commit for predictable in-process concurrent writes
+- 📈 **Queryable Operational Metrics** - Stable `sys.*` inspection views expose WAL, write-queue, storage, and sync status snapshots without telemetry writes
 - 🌿 **Branch, Diff, Restore, And Time Travel** - Named snapshots, isolated branch writes, branch diffs, guarded restore, and constrained merge for migration rehearsal and agent sandboxes
 - 🔎 **Trigram Index** - Fast text search for `LIKE '%pattern%'` queries
 - 🗺️ **Native Geospatial** - `GEOMETRY` / `GEOGRAPHY` values, `ST_*` functions, and `USING spatial` indexes

@@ -57,8 +57,9 @@ The current sync surface includes:
 - scoped replication with validated primary-key-based row filters
 - conservative conflict recording by default, plus manual show/resolve/reopen
   workflows and configurable policies
-- `sys_sync_*` inspection queries for status, journals, peers, scopes,
-  sessions, conflicts, peer lag, retention, and doctor summaries
+- canonical `sys.*` operational inspection views plus `sys_sync_*`
+  compatibility queries for journals, peers, scopes, sessions, conflicts, peer
+  lag, retention, and doctor summaries
 - retention reports, safe prune dry-runs, explicit data-loss override, and sync
   doctor guidance
 - a typed .NET `DecentDBSyncClient` for app integration

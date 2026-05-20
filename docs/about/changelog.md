@@ -49,6 +49,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added queued-write binding coverage across Python, Go, Dart, Node, .NET
   native, Java/JDBC status/config mapping, Knex unbound writes, and C ABI smoke
   tests for maintained binding surfaces.
+- Added built-in operational metrics `sys.*` inspection views:
+  `sys.wal_metrics`, `sys.write_queue_metrics`, `sys.storage_metrics`, and
+  canonical `sys.sync_status` while preserving `sys_sync_*` compatibility
+  inspection names. Added deterministic Rust regression tests and SQL API
+  documentation plus ADR 0163 covering column contracts, metric snapshots, and
+  lifecycle semantics.
 
 ### Changed
 

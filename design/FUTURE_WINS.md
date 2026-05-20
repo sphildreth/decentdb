@@ -74,7 +74,7 @@ Future version values are planning buckets, not release commitments.
 | Priority | Future Version | Status | Feature | Current Source Of Truth | Why This Rank |
 |---:|---|---|---|---|---|
 | 1 | vNext | COMPLETE | Concurrent write ergonomics: write queue plus strict group commit | [`WIN_CONCURRENT_WRITE_ERGONOMICS_PHASED_APPROACH.md`](WIN_CONCURRENT_WRITE_ERGONOMICS_PHASED_APPROACH.md); ADR 0162 for durable queue/group commit; ADR 0135 for async commit distinction | Removes the most visible one-writer friction while preserving durability |
-| 2 | vNext+1 | TODO | Built-in operational metrics and `sys.*` tables | Needs ADR/spec; write queue metrics, storage info, sync inspection, and Doctor v1 are foundations | Makes write queue, WAL, sync, and storage state inspectable without hidden runtime tracing cost |
+| 2 | vNext+1 | COMPLETE | Built-in operational metrics and `sys.*` tables | ADR 0163; [`docs/api/sql-functions.md`](../docs/api/sql-functions.md#operational-inspection-views) | Makes write queue, WAL, sync, and storage state inspectable without hidden runtime tracing cost |
 | 3 | vNext+1 | TODO | Reactive query subscriptions and change streams | Needs ADR/spec; sync journal and branch diff are inputs | Modern local-first apps need live query invalidation without polling |
 | 4 | vNext+2 | TODO | Production browser runtime | ADR 0161 and [`docs/api/wasm.md`](../docs/api/wasm.md); needs follow-up ADR/spec | Browser is a primary local-first runtime, and v1 intentionally lacks multi-tab/service-worker/write coordination |
 | 5 | vNext+2 | TODO | Production sync relay and public changeset API | [`WIN_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md`](WIN_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md); needs follow-up ADR/spec | Turns shipped sync into a production application platform surface |
@@ -187,12 +187,14 @@ than hand-rolled binding-side marshalling.
 
 ## 2. Built-In Operational Metrics And `sys.*` Tables
 
-**Status:** `TODO`
+**Status:** `COMPLETE`
 
 **Future Version:** vNext+1
 
-**Source of truth:** Needs ADR/spec. Write queue metrics, storage info, sync
-inspection, and Doctor v1 are foundations.
+**Source of truth:** ADR 0163 and
+[`docs/api/sql-functions.md`](../docs/api/sql-functions.md#operational-inspection-views).
+Write queue metrics, storage info, sync inspection, and Doctor v1 are
+foundations.
 
 ### Why This Matters
 
@@ -227,6 +229,16 @@ Canonical `sys.*` names may coexist with existing compatibility names such as
   users
 - sync status has a canonical `sys.*` surface without breaking existing
   `sys_sync_*` queries
+
+### Delivered Contract
+
+The implemented contract is a set of read-only virtual inspection rows for the
+documented `SELECT * FROM sys.*` forms. The canonical surfaces are
+`sys.sync_status`, `sys.wal_metrics`, `sys.write_queue_metrics`, and
+`sys.storage_metrics`. Existing `sys_sync_*` compatibility names continue to
+work for sync inspection. Queue counters are handle-lifetime snapshots, WAL and
+storage rows read existing runtime metadata, and no tracing/advisor/Doctor
+findings surfaces are included in this item.
 
 ### Guardrails
 
@@ -913,9 +925,8 @@ performance, and operational foundations.
 
 1. Protect the completed concurrent write queue plus strict durable group commit
    with docs, metrics, and benchmark guardrails.
-2. Draft ADR/spec for operational `sys.*` metrics and implement
-   `sys.write_queue_metrics`, `sys.wal_metrics`, `sys.storage_metrics`, and
-   `sys.sync_status`.
+2. Build on the completed ADR 0163 operational `sys.*` metrics contract when
+   designing runtime tracing, advisors, and Doctor integration.
 3. Design reactive subscriptions around committed-state invalidation and binding
    APIs.
 4. Design production browser and sync follow-ons together so browser transport,

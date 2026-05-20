@@ -19,7 +19,7 @@ inspection, and SDK surfaces.
 | Manual batch export/import | ✅ (`sync export` / `sync import`) | ⚠️ (changesets via optional extension) | ⚠️ (logical replication/dump tooling) | ❌ |
 | Scoped row replication | ✅ (named scopes with validated row filters) | ❌ | ⚠️ (publication filters; server replication) | ❌ |
 | Conflict recording and manual resolution | ✅ (`sync conflicts`, `sync conflict show/resolve/reopen`) | ❌ | ⚠️ (replication conflicts exist, but no embedded app conflict workflow) | ❌ |
-| Operational sync inspection | ✅ (`sys_sync_*` inspection queries) | ❌ | ⚠️ (system catalogs and monitoring views, server-oriented) | ❌ |
+| Operational sync inspection | ✅ (`sys.*` inspection views; `sys_sync_*` compatibility) | ❌ | ⚠️ (system catalogs and monitoring views, server-oriented) | ❌ |
 | Sync doctor, retention, peer lag, prune | ✅ | ❌ | ⚠️ (separate server administration surfaces) | ❌ |
 | Local HTTP sync dev transport | ✅ (`sync run` / `sync serve`) | ❌ | ⚠️ (server replication protocols) | ❌ |
 | Typed .NET sync SDK | ✅ (`DecentDBSyncClient`) | ❌ | ❌ | ❌ |
@@ -39,6 +39,10 @@ decentdb sync conflicts --db=peer.ddb --format=table
 
 ```sql
 SELECT * FROM sys_sync_status;
+SELECT * FROM sys.sync_status;
+SELECT * FROM sys.wal_metrics;
+SELECT * FROM sys.write_queue_metrics;
+SELECT * FROM sys.storage_metrics;
 SELECT * FROM sys_sync_journal WHERE sequence > 100 ORDER BY sequence;
 SELECT * FROM sys_sync_conflicts ORDER BY conflict_id;
 SELECT * FROM sys_sync_doctor;

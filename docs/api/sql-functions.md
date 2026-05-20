@@ -4,12 +4,152 @@ This page documents SQL functions and aggregate/window additions recently implem
 
 For broader syntax coverage, see the SQL reference and feature matrix.
 
-## Sync inspection views
+## Operational inspection views
 
-DecentDB exposes sync state through read-only `sys_sync_*` inspection queries.
-These are engine inspection surfaces, not persistent catalog views and not
-parameterized functions. Use the documented `SELECT *` forms; arbitrary
-projection, joins, `LIMIT`, and bind parameters are not part of this surface.
+DecentDB exposes operational inspection surfaces through stable, read-only `sys.*`
+views. These are not persistent catalog tables and do not accept bind
+parameters. Use the documented `SELECT *` forms; arbitrary projection, joins,
+`LIMIT`, and bind parameters are not part of this surface.
+
+The canonical operational surfaces are:
+
+```sql
+SELECT * FROM sys.sync_status;
+SELECT * FROM sys.wal_metrics;
+SELECT * FROM sys.write_queue_metrics;
+SELECT * FROM sys.storage_metrics;
+```
+
+Legacy `sys_sync_*` names remain for sync inspection compatibility:
+
+- `sys_sync_status`
+- `sys_sync_journal`
+- `sys_sync_retention`
+- `sys_sync_peer_lag`
+- `sys_sync_peers`
+- `sys_sync_scopes`
+- `sys_sync_scope_tables`
+- `sys_sync_peer_scopes`
+- `sys_sync_sessions`
+- `sys_sync_conflict_policy`
+- `sys_sync_conflicts`
+- `sys_sync_doctor`
+
+### `sys.sync_status`
+
+One row describing the local sync state. It has the same shape and values as
+legacy `sys_sync_status`.
+
+| Column | Type | Nullable | Unit / meaning |
+|---|---|---:|---|
+| `enabled` | `BOOL` | no | Whether sync capture is enabled. |
+| `replica_id` | `TEXT` | yes | Local replica identity, or `NULL` before sync initialization. |
+| `next_sequence` | `INT64` | no | Next local sync journal sequence number. |
+| `journal_path` | `TEXT` | no | Sync journal sidecar path for this database handle. |
+| `journal_size_bytes` | `INT64` | no | Current sync journal size in bytes. |
+
+Example:
+
+```sql
+SELECT * FROM sys.sync_status;
+SELECT * FROM sys_sync_status; -- legacy compatibility
+```
+
+### `sys.write_queue_metrics`
+
+One row describing the current engine-owned write queue snapshot. All columns
+are non-null. Calling this view may initialize the lazy queue object, but it
+does not route direct writes through queued execution.
+
+| Column | Type | Unit / meaning |
+|---|---|---|
+| `capacity` | `INT64` | Maximum admitted queued requests for this handle. |
+| `current_depth` | `INT64` | Requests currently waiting in the queue. |
+| `admitted` | `INT64` | Requests admitted since this handle's queue was initialized. |
+| `rejected` | `INT64` | Requests rejected because immediate admission was impossible. |
+| `timed_out` | `INT64` | Requests timed out before admission or execution start. |
+| `canceled` | `INT64` | Requests canceled before execution start. |
+| `executed` | `INT64` | Requests whose SQL execution started. |
+| `committed` | `INT64` | Successfully committed queued requests. |
+| `failed` | `INT64` | Queued requests that failed during execution or group sync. |
+| `group_commit_batches` | `INT64` | Successful queued batches covered by strict group commit accounting. |
+| `group_commit_syncs` | `INT64` | Physical WAL syncs performed for grouped queued batches. |
+| `group_commit_max_batch` | `INT64` | Largest successful queued batch size observed. |
+| `group_commit_commits_covered` | `INT64` | Successful queued commits covered by group commit accounting. |
+| `physical_syncs_saved` | `INT64` | Estimated syncs avoided by grouped queued commits. |
+| `total_queue_wait_ns` | `INT64` | Sum of queue wait time for executed requests, in nanoseconds. |
+
+Example:
+
+```sql
+SELECT * FROM sys.write_queue_metrics;
+```
+
+### `sys.wal_metrics`
+
+One row describing the current WAL runtime state. All columns are non-null.
+
+| Column | Type | Unit / meaning |
+|---|---|---|
+| `latest_lsn` | `INT64` | Current WAL end offset / latest visible snapshot boundary. |
+| `file_size_bytes` | `INT64` | WAL sidecar file size in bytes. |
+| `active_readers` | `INT64` | Active WAL reader snapshots registered on this shared WAL. |
+| `max_page_count` | `INT64` | Maximum page count currently known to the WAL handle. |
+| `checkpoint_epoch` | `INT64` | In-memory checkpoint epoch counter for this WAL handle. |
+| `warning_count` | `INT64` | Current reader-retention warning count. |
+| `version_count` | `INT64` | WAL page versions tracked in memory or sidecar index. |
+| `resident_versions` | `INT64` | WAL page versions with resident payloads. |
+| `on_disk_versions` | `INT64` | WAL page versions whose payload is read back from WAL storage. |
+| `shared_wal` | `BOOL` | Whether this handle is using the process shared-WAL registry. |
+
+Example:
+
+```sql
+SELECT * FROM sys.wal_metrics;
+```
+
+### `sys.storage_metrics`
+
+One row describing the current database file and storage snapshot. All columns
+are non-null.
+
+| Column | Type | Unit / meaning |
+|---|---|---|
+| `path` | `TEXT` | Database path for this handle. |
+| `wal_path` | `TEXT` | WAL sidecar path for this handle. |
+| `format_version` | `INT64` | Decoded database file-format version. |
+| `page_size` | `INT64` | Database page size in bytes. |
+| `cache_size_mb` | `INT64` | Configured page cache size in MiB. |
+| `page_count` | `INT64` | Database file page count on disk. |
+| `schema_cookie` | `INT64` | Current schema cookie from the database header. |
+| `wal_end_lsn` | `INT64` | Current WAL end offset / latest visible snapshot boundary. |
+| `wal_file_size` | `INT64` | WAL sidecar file size in bytes. |
+| `last_checkpoint_lsn` | `INT64` | Last checkpoint LSN persisted in the database header. |
+| `active_readers` | `INT64` | Active WAL reader snapshots. |
+| `wal_versions` | `INT64` | WAL page versions tracked in memory or sidecar index. |
+| `warning_count` | `INT64` | Current reader-retention warning count. |
+| `shared_wal` | `BOOL` | Whether this handle is using the process shared-WAL registry. |
+
+Example:
+
+```sql
+SELECT * FROM sys.storage_metrics;
+```
+
+### Lifecycle and compatibility notes
+
+- `sys.write_queue_metrics` is a one-row snapshot of `Db::write_queue_metrics`
+  and the C ABI `ddb_db_write_queue_metrics` values. Counter values are
+  accumulated for the current database handle's lazy queue lifetime and reset
+  when the database is reopened through a new handle.
+- `sys.storage_metrics` is a one-row snapshot equivalent to `Db::storage_info`
+  for stable fields, and includes both database and WAL paths.
+- `sys.wal_metrics` is a one-row snapshot of internal WAL runtime counters such
+  as active readers, warning state, payload versions, and checkpoint state.
+- `sys.sync_status` is the canonical name for the sync status row. The
+  `sys_sync_status` compatibility name remains supported.
+- These surfaces do not write telemetry rows, create catalog objects, or enable
+  slow-query, lock-wait, index-usage, advisor, or Doctor findings tracing.
 
 ### `sys_sync_status`
 

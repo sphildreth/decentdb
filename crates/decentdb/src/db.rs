@@ -8502,7 +8502,7 @@ impl Db {
         };
         if !params.is_empty() {
             return Err(DbError::sql(
-                "sync inspection system views do not accept parameters",
+                "system inspection views do not accept parameters",
             ));
         }
         match query {
@@ -8510,6 +8510,11 @@ impl Db {
             SyncInspectionQuery::Journal { since_sequence } => {
                 self.sync_journal_query_result(since_sequence).map(Some)
             }
+            SyncInspectionQuery::WalMetrics => self.wal_metrics_query_result().map(Some),
+            SyncInspectionQuery::WriteQueueMetrics => {
+                self.write_queue_metrics_query_result().map(Some)
+            }
+            SyncInspectionQuery::StorageMetrics => self.storage_metrics_query_result().map(Some),
             SyncInspectionQuery::Peers => self.sync_peers_query_result().map(Some),
             SyncInspectionQuery::Retention => self.sync_retention_query_result().map(Some),
             SyncInspectionQuery::PeerLag => self.sync_peer_lag_query_result().map(Some),
@@ -8541,6 +8546,124 @@ impl Db {
                 sync_u64_to_i64(status.next_sequence, "next_sequence")?,
                 status.journal_path.map_or(Value::Null, Value::Text),
                 sync_u64_to_i64(status.journal_size_bytes, "journal_size_bytes")?,
+            ])],
+        ))
+    }
+
+    fn wal_metrics_query_result(&self) -> Result<QueryResult> {
+        let latest_lsn = self.inner.wal.latest_snapshot();
+        let file_size = self.inner.wal.file_size()?;
+        let active_readers = self.inner.wal.active_reader_count()?;
+        let max_page_count = self.inner.wal.max_page_count();
+        let checkpoint_epoch = self.inner.wal.checkpoint_epoch();
+        let warning_count = self.inner.wal.warnings()?.len();
+        let version_count = self.inner.wal.version_count()?;
+        let (resident_versions, on_disk_versions) = self.inner.wal.version_counts_by_payload()?;
+        Ok(QueryResult::with_rows(
+            vec![
+                "latest_lsn".to_string(),
+                "file_size_bytes".to_string(),
+                "active_readers".to_string(),
+                "max_page_count".to_string(),
+                "checkpoint_epoch".to_string(),
+                "warning_count".to_string(),
+                "version_count".to_string(),
+                "resident_versions".to_string(),
+                "on_disk_versions".to_string(),
+                "shared_wal".to_string(),
+            ],
+            vec![QueryRow::new(vec![
+                sync_u64_to_i64(latest_lsn, "latest_lsn")?,
+                sync_u64_to_i64(file_size, "file_size_bytes")?,
+                sync_usize_to_i64(active_readers, "active_readers")?,
+                sync_u64_to_i64(max_page_count as u64, "max_page_count")?,
+                sync_u64_to_i64(checkpoint_epoch, "checkpoint_epoch")?,
+                sync_u64_to_i64(warning_count as u64, "warning_count")?,
+                sync_u64_to_i64(version_count as u64, "version_count")?,
+                sync_u64_to_i64(resident_versions as u64, "resident_versions")?,
+                sync_u64_to_i64(on_disk_versions as u64, "on_disk_versions")?,
+                Value::Bool(self.inner.wal.is_shared()),
+            ])],
+        ))
+    }
+
+    fn write_queue_metrics_query_result(&self) -> Result<QueryResult> {
+        let metrics = self.write_queue_metrics();
+        Ok(QueryResult::with_rows(
+            vec![
+                "capacity".to_string(),
+                "current_depth".to_string(),
+                "admitted".to_string(),
+                "rejected".to_string(),
+                "timed_out".to_string(),
+                "canceled".to_string(),
+                "executed".to_string(),
+                "committed".to_string(),
+                "failed".to_string(),
+                "group_commit_batches".to_string(),
+                "group_commit_syncs".to_string(),
+                "group_commit_max_batch".to_string(),
+                "group_commit_commits_covered".to_string(),
+                "physical_syncs_saved".to_string(),
+                "total_queue_wait_ns".to_string(),
+            ],
+            vec![QueryRow::new(vec![
+                sync_usize_to_i64(metrics.capacity, "capacity")?,
+                sync_usize_to_i64(metrics.current_depth, "current_depth")?,
+                sync_u64_to_i64(metrics.admitted, "admitted")?,
+                sync_u64_to_i64(metrics.rejected, "rejected")?,
+                sync_u64_to_i64(metrics.timed_out, "timed_out")?,
+                sync_u64_to_i64(metrics.canceled, "canceled")?,
+                sync_u64_to_i64(metrics.executed, "executed")?,
+                sync_u64_to_i64(metrics.committed, "committed")?,
+                sync_u64_to_i64(metrics.failed, "failed")?,
+                sync_u64_to_i64(metrics.group_commit_batches, "group_commit_batches")?,
+                sync_u64_to_i64(metrics.group_commit_syncs, "group_commit_syncs")?,
+                sync_u64_to_i64(metrics.group_commit_max_batch, "group_commit_max_batch")?,
+                sync_u64_to_i64(
+                    metrics.group_commit_commits_covered,
+                    "group_commit_commits_covered",
+                )?,
+                sync_u64_to_i64(metrics.physical_syncs_saved, "physical_syncs_saved")?,
+                sync_u64_to_i64(metrics.total_queue_wait_ns, "total_queue_wait_ns")?,
+            ])],
+        ))
+    }
+
+    fn storage_metrics_query_result(&self) -> Result<QueryResult> {
+        let storage = self.storage_info()?;
+        Ok(QueryResult::with_rows(
+            vec![
+                "path".to_string(),
+                "wal_path".to_string(),
+                "format_version".to_string(),
+                "page_size".to_string(),
+                "cache_size_mb".to_string(),
+                "page_count".to_string(),
+                "schema_cookie".to_string(),
+                "wal_end_lsn".to_string(),
+                "wal_file_size".to_string(),
+                "last_checkpoint_lsn".to_string(),
+                "active_readers".to_string(),
+                "wal_versions".to_string(),
+                "warning_count".to_string(),
+                "shared_wal".to_string(),
+            ],
+            vec![QueryRow::new(vec![
+                Value::Text(storage.path.to_string_lossy().to_string()),
+                Value::Text(storage.wal_path.to_string_lossy().to_string()),
+                sync_u64_to_i64(storage.format_version as u64, "format_version")?,
+                sync_u64_to_i64(storage.page_size as u64, "page_size")?,
+                sync_usize_to_i64(storage.cache_size_mb, "cache_size_mb")?,
+                sync_u64_to_i64(storage.page_count as u64, "page_count")?,
+                sync_u64_to_i64(storage.schema_cookie as u64, "schema_cookie")?,
+                sync_u64_to_i64(storage.wal_end_lsn, "wal_end_lsn")?,
+                sync_u64_to_i64(storage.wal_file_size, "wal_file_size")?,
+                sync_u64_to_i64(storage.last_checkpoint_lsn, "last_checkpoint_lsn")?,
+                sync_usize_to_i64(storage.active_readers, "active_readers")?,
+                sync_u64_to_i64(storage.wal_versions as u64, "wal_versions")?,
+                sync_u64_to_i64(storage.warning_count as u64, "warning_count")?,
+                Value::Bool(storage.shared_wal),
             ])],
         ))
     }
@@ -9030,6 +9153,9 @@ fn sync_read_metadata_from_runtime(runtime: &EngineRuntime, key: &str) -> Result
 enum SyncInspectionQuery {
     Status,
     Journal { since_sequence: u64 },
+    WalMetrics,
+    WriteQueueMetrics,
+    StorageMetrics,
     Peers,
     Retention,
     PeerLag,
@@ -9046,6 +9172,7 @@ impl SyncInspectionQuery {
     fn parse(normalized: &str) -> Option<Self> {
         match normalized {
             "select * from sys_sync_status" => Some(Self::Status),
+            "select * from sys.sync_status" => Some(Self::Status),
             "select * from sys_sync_journal" => Some(Self::Journal { since_sequence: 0 }),
             "select * from sys_sync_journal order by sequence" => {
                 Some(Self::Journal { since_sequence: 0 })
@@ -9053,6 +9180,9 @@ impl SyncInspectionQuery {
             "select * from sys_sync_journal order by sequence asc" => {
                 Some(Self::Journal { since_sequence: 0 })
             }
+            "select * from sys.wal_metrics" => Some(Self::WalMetrics),
+            "select * from sys.write_queue_metrics" => Some(Self::WriteQueueMetrics),
+            "select * from sys.storage_metrics" => Some(Self::StorageMetrics),
             "select * from sys_sync_peers" => Some(Self::Peers),
             "select * from sys_sync_peers order by name" => Some(Self::Peers),
             "select * from sys_sync_peers order by name asc" => Some(Self::Peers),
@@ -9108,6 +9238,13 @@ fn parse_sync_journal_where_sequence(normalized: &str) -> Option<u64> {
 
 fn sync_u64_to_i64(value: u64, field_name: &str) -> Result<Value> {
     i64::try_from(value)
+        .map(Value::Int64)
+        .map_err(|_| DbError::internal(format!("{field_name} exceeds INT64 range")))
+}
+
+fn sync_usize_to_i64(value: usize, field_name: &str) -> Result<Value> {
+    u64::try_from(value)
+        .and_then(i64::try_from)
         .map(Value::Int64)
         .map_err(|_| DbError::internal(format!("{field_name} exceeds INT64 range")))
 }

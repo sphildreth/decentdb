@@ -90,9 +90,8 @@ database configured default timeout. Pass `0` for immediate timeout behavior.
 
 Queue metrics include current depth, admissions, rejections, timeouts,
 cancellations, executions, commits, failures, grouped batches, physical syncs,
-and estimated physical syncs saved. These counters are available now through
-Rust and C ABI snapshots and are intended to feed future `sys.*` observability
-surfaces.
+and estimated physical syncs saved. These counters are now also available via
+`SELECT * FROM sys.write_queue_metrics;` alongside Rust and C ABI snapshots.
 
 ## Limitations
 

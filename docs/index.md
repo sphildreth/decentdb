@@ -24,7 +24,7 @@ queries, syncable offline data, and language bindings that feel native.
 | Application-friendly types | Native `INT64`, `FLOAT64`, `BOOL`, `TEXT`, `BLOB`, `DECIMAL`, `UUID`, `DATE`, and `TIMESTAMP`. |
 | Indexed substring search | Native trigram indexes accelerate interactive `LIKE '%pattern%'` queries. |
 | Multi-language embedding | C ABI plus .NET, Go, Python, Node.js, Dart/Flutter, and JDBC bindings. |
-| Operational tooling | CLI inspection, stats, checkpoints, index rebuilds, import/export, bulk load, doctor reports, and DBeaver/JDBC integration. |
+| Operational tooling | Queryable `sys.*` metrics for WAL, write queue, storage, and sync status; CLI inspection, checkpoints, index rebuilds, import/export, bulk load, doctor reports, and DBeaver/JDBC integration. |
 
 ## Core Features
 
@@ -40,6 +40,8 @@ queries, syncable offline data, and language bindings that feel native.
 - **Triggers** for application-side logic, including supported `AFTER` and
   `INSTEAD OF` trigger paths.
 - **Bulk-load, CSV, and JSON import/export** workflows.
+- **Queryable operational metrics** through stable `sys.*` inspection views for
+  WAL, write queue, storage, and sync status snapshots.
 - **Branch, diff, restore, and time-travel workflows** with named snapshots,
   branch-local writes, primary-key row diffs, guarded restore, and constrained
   merge.
@@ -161,7 +163,8 @@ inspection surfaces, and .NET APIs. The current sync surface includes:
 - localhost/dev HTTP `sync run` and `sync serve` workflows
 - scoped replication with validated row filters
 - conflict recording, inspection, resolution, reopen, and policy commands
-- `sys_sync_*` inspection queries
+- canonical `sys.*` operational inspection views with `sys_sync_*`
+  compatibility names
 - retention reports, safe prune dry-runs, peer lag, and sync doctor guidance
 
 Start with the [sync overview](user-guide/sync/index.md) or jump directly to
