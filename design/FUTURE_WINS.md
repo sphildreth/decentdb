@@ -72,7 +72,7 @@ Future version values are planning buckets, not release commitments.
 
 | Priority | Future Version | Status | Feature | Current Source Of Truth | Why This Rank |
 |---:|---|---|---|---|---|
-| 1 | vNext+1 | TODO | Concurrent write ergonomics: write queue plus strict group commit | ADR 0135 for async commit; needs ADR/spec for durable queue/group commit | Removes the most visible one-writer friction while preserving durability |
+| 1 | vNext | IN PROGRESS | Concurrent write ergonomics: write queue plus strict group commit | [`WIN_CONCURRENT_WRITE_ERGONOMICS_PHASED_APPROACH.md`](WIN_CONCURRENT_WRITE_ERGONOMICS_PHASED_APPROACH.md); ADR 0135 for async commit; needs ADR/spec for durable queue/group commit | Removes the most visible one-writer friction while preserving durability |
 | 2 | vNext+1 | TODO | Built-in observability and `sys.*` virtual tables | Needs ADR/spec; Doctor v1 is foundation | Makes performance, locks, WAL, sync, and storage state inspectable |
 | 3 | vNext+1 | TODO | Reactive query subscriptions and change streams | Needs ADR/spec; sync journal and branch diff are inputs | Modern local-first apps need live query invalidation without polling |
 | 4 | vNext+2 | TODO | Production browser runtime | ADR 0161 and [`docs/api/wasm.md`](../docs/api/wasm.md); needs follow-up ADR/spec | Browser is a primary local-first runtime, and v1 intentionally lacks multi-tab/service-worker/write coordination |
@@ -137,12 +137,13 @@ server database.
 
 ## 1. Concurrent Write Ergonomics: Write Queue Plus Strict Group Commit
 
-**Status:** `TODO`
+**Status:** `IN PROGRESS`
 
-**Future Version:** vNext+1
+**Future Version:** vNext
 
-**Source of truth:** ADR 0135 for current async commit behavior; needs ADR/spec
-for the durable queue and strict group commit contract.
+**Source of truth:** [`WIN_CONCURRENT_WRITE_ERGONOMICS_PHASED_APPROACH.md`](WIN_CONCURRENT_WRITE_ERGONOMICS_PHASED_APPROACH.md)
+for phased delivery scope; ADR 0135 for current async commit behavior; needs
+ADR/spec for the durable queue and strict group commit contract.
 
 ### Why This Matters
 
