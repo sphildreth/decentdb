@@ -31,6 +31,8 @@ It targets a single process with **one writer** and **many concurrent readers** 
 - 🔒 **ACID Transactions** - Write-ahead logging with crash-safe recovery
 - 🌳 **B+Tree Storage** - Efficient tables and secondary indexes with page caching
 - 🔁 **Local-First Sync** - Durable change journals, scoped peer replication, conflict workflows, operational doctor tooling, CLI commands, and a typed .NET sync SDK
+- 🖥️ **Built-In HTTP Server And Web Console** - `decentdb serve` exposes a local HTTP API and embedded browser console for inspection, SQL execution, schema browsing, EXPLAIN, CSV export, and scripting
+- 🌐 **WASM Browser OPFS Support** - `@decentdb/web` runs DecentDB in a Dedicated Worker with an OPFS-backed VFS, async TypeScript API, binary result transport, checkpoint, import/export, persistence helpers, and browser smoke/benchmark coverage
 - 🐘 **PostgreSQL-like SQL** - Familiar DDL/DML syntax with JOINs (INNER, LEFT, RIGHT, FULL OUTER, CROSS, NATURAL), CTEs (including WITH RECURSIVE), subqueries, window functions, and rich types (UUID, DECIMAL, native TIMESTAMP)
 - 🕒 **Native TIMESTAMP Type** - DATE/TIMESTAMP columns stored as int64 microseconds since Unix epoch (UTC); correct `ORDER BY` and `EXTRACT(YEAR|MONTH|DAY|HOUR|MINUTE|SECOND FROM ...)`, with native bind/read in all bindings
 - 👥 **Concurrent Reads** - Snapshot isolation allows multiple readers with one writer
@@ -64,6 +66,7 @@ It targets a single process with **one writer** and **many concurrent readers** 
 | Go       | `database/sql` driver                        | Embedded `database/sql` driver with `$N` positional parameters                                                      | [decentdb.org/api/go](https://decentdb.org/api/go/)         |
 | Node.js  | N-API + Knex                                 | Embedded native addon + Knex client for building/issuing queries                                                    | [decentdb.org/api/node](https://decentdb.org/api/node/)     |
 | Python 3 | SQLAlchemy                                   | Embedded DB-API driver + SQLAlchemy dialect                                                                         | [decentdb.org/api/python](https://decentdb.org/api/python/) |
+| Web      | TypeScript + WASM + OPFS                     | Browser binding with a Dedicated Worker runtime and OPFS persistence                                                | [decentdb.org/api/wasm](https://decentdb.org/api/wasm/)     |
 
 ## Tools
 

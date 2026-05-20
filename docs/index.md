@@ -17,6 +17,8 @@ queries, syncable offline data, and language bindings that feel native.
 |---|---|
 | Durable ACID storage | WAL-based persistence and crash-safe recovery are central design goals. |
 | Local-first sync | Built-in change journals, batch exchange, scoped peer replication, conflict workflows, retention tooling, sync doctor, CLI commands, and a typed .NET sync SDK. |
+| Built-in HTTP and web console | `decentdb serve` exposes a local HTTP API and embedded browser console for inspection, SQL execution, EXPLAIN, schema browsing, CSV export, and scripting. |
+| Browser WASM and OPFS | `@decentdb/web` runs DecentDB in a Dedicated Worker with OPFS persistence, an async TypeScript API, binary result transport, and browser smoke/benchmark coverage. |
 | Branch, diff, restore, and time travel | Durable named snapshots, branch-local writes, diff reports, guarded restore, and constrained merge workflows for migration rehearsal and support/debugging. |
 | Practical PostgreSQL-like SQL | Familiar DDL/DML, joins, CTEs, window functions, set operations, upsert, `RETURNING`, savepoints, triggers, generated columns, JSON functions, and rich scalar functions. |
 | Application-friendly types | Native `INT64`, `FLOAT64`, `BOOL`, `TEXT`, `BLOB`, `DECIMAL`, `UUID`, `DATE`, and `TIMESTAMP`. |
@@ -41,6 +43,11 @@ queries, syncable offline data, and language bindings that feel native.
 - **Branch, diff, restore, and time-travel workflows** with named snapshots,
   branch-local writes, primary-key row diffs, guarded restore, and constrained
   merge.
+- **Built-in HTTP API and Web Console** through `decentdb serve` for local
+  inspection, schema browsing, SQL/EXPLAIN execution, CSV export, and scripting.
+- **Browser WASM/OPFS binding** through `@decentdb/web`, with a Dedicated
+  Worker runtime, OPFS-backed persistence, binary result transport, checkpoint,
+  import/export, and persistence helpers.
 - **In-memory databases** using `:memory:` plus save-as support for snapshots.
 - **Cross-platform release builds** for Linux x86_64/arm64, macOS, and Windows.
 
@@ -97,6 +104,7 @@ decentdb sync pending --db ./app.ddb --since 0 --limit 10 --format table
   [SQL Feature Matrix](user-guide/sql-feature-matrix.md), and
   [Data Types](user-guide/data-types.md)
 - Local-first applications: [Local-first sync](user-guide/sync/index.md)
+- Browser applications: [WASM / Browser](api/wasm.md)
 - Operational workflows: [Doctor](user-guide/doctor.md),
   [Performance Tuning](user-guide/performance.md), and
   [Benchmarks](user-guide/benchmarks.md)
@@ -105,7 +113,8 @@ decentdb sync pending --db ./app.ddb --since 0 --limit 10 --format table
   [DecentDB vs DuckDB](user-guide/decentdb-vs-duckdb.md)
 - Language integrations: [C/C++ ABI](api/c-cpp.md), [.NET](api/dotnet.md),
   [Go](api/go.md), [Python](api/python.md), [Node.js](api/node.md),
-  [Dart/Flutter](api/dart.md), and [JDBC](api/jdbc.md)
+  [Dart/Flutter](api/dart.md), [JDBC](api/jdbc.md), and
+  [WASM / Browser](api/wasm.md)
 - CLI users: [Interactive SQL Shell](user-guide/repl.md),
   [Built-In Web Console](user-guide/web-console.md), and
   [CLI Reference](api/cli-reference.md)
@@ -125,6 +134,21 @@ full IDE.
 - table detail, schema, query, explain, CSV export, and local query history
 
 Start with the [Built-In Web Console](user-guide/web-console.md) guide.
+
+## Browser WASM At A Glance
+
+`@decentdb/web` loads the Rust engine compiled to WASM inside a Dedicated
+Worker and stores database bytes in OPFS through synchronous access handles. The
+main-thread API stays async while the engine preserves the same one-writer,
+WAL-first design.
+
+- OPFS-backed browser persistence
+- async TypeScript API for `open`, `exec`, `query`, `prepare`, checkpoint,
+  import/export, and persistence requests
+- binary worker result transport with JSON retained for compatibility/debugging
+- automated Chromium OPFS smoke and scheduled transport benchmark coverage
+
+Start with the [WASM / Browser](api/wasm.md) guide.
 
 ## Local-First Sync At A Glance
 
@@ -154,6 +178,7 @@ the [sync quickstart](user-guide/sync/quickstart.md).
 | Node.js | Native addon and Knex dialect |
 | Dart/Flutter | FFI binding for desktop Flutter applications |
 | Java/JDBC | In-process JNI-backed JDBC driver, including DBeaver integration |
+| Web | TypeScript API over WASM and OPFS in a Dedicated Worker |
 
 All bindings sit above the native C ABI. The Rust engine remains the
 authoritative implementation.
@@ -166,11 +191,12 @@ authoritative implementation.
   non-localhost host only with explicit bearer-token configuration, but it is
   still a lightweight inspection/API server rather than a hardened public
   database service.
+- Browser v1 support is worker-owned OPFS storage. It does not provide
+  cross-tab writes, service worker ownership, or cross-worker WAL coordination.
 - DecentDB does not currently expose a general-purpose loadable SQL extension
   or UDF plugin system.
-- Some roadmap items, including native geospatial types, WASM/OPFS,
-  policy-aware SQL, vector search, and full-text ranking, are planned work
-  rather than shipped features.
+- Some roadmap items, including policy-aware SQL, vector search, and full-text
+  ranking, are planned work rather than shipped features.
 
 ## Releases And Packages
 
