@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Added `decentdb serve`, a CLI-hosted local HTTP API and lightweight Web
+  Console with embedded offline assets, transparent localhost auth,
+  read-only mode, schema/table/index/view/trigger inspection, SQL and EXPLAIN
+  execution, result limits, request limits, query history, CSV export, optional
+  CORS, JSON request logging, and remote-bind safety checks.
 - Completed the interactive SQL shell ergonomics roadmap slice with a version
   banner, `help`/quit aliases, topic-specific help, schema inspection commands
   (`.tables`, `.dt`, `.d <table>`, `.schema`, `.indexes`, `.views`), function

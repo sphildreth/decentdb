@@ -59,6 +59,39 @@ Special commands:
 
 See [Interactive SQL Shell](../user-guide/repl.md) for the full user guide.
 
+### serve
+
+Start a local HTTP API and lightweight Web Console for a database.
+
+```bash
+decentdb serve --db=<path> [options]
+decentdb serve <path> [options]
+```
+
+Supported options:
+- `--host=<host>` bind host, default `127.0.0.1`
+- `--port=<port>` bind port, default `7373`
+- `--read-only` reject mutating SQL
+- `--open` open the default browser
+- `--max-result-rows=<n>` maximum rows returned per result set, default `1000`
+- `--query-timeout=<duration>` query timeout reporting limit, default `30s`
+- `--max-body-size=<size>` maximum request body size, default `4mb`
+- `--max-concurrent-requests=<n>` concurrent request cap, default `32`
+- `--busy-timeout=<duration>` busy timeout configuration, default `5s`
+- `--token-env=<name>` environment variable containing the bearer token
+- `--show-token` print the bearer token for API clients/debugging
+- `--no-auth` disable auth for localhost-only debugging
+- `--cors-origin=<origin>` allow one explicit CORS origin
+- `--log-format=<text|json>` request log format, default `text`
+
+The default localhost workflow uses transparent ephemeral auth. The Web Console
+receives the token in the initial local page; API calls without the token are
+rejected. Non-localhost binding requires `--token-env`, and `--no-auth` is
+accepted only for localhost binding.
+
+See [Built-In Web Console](../user-guide/web-console.md) for the full user
+guide and HTTP API routes.
+
 ### import
 
 Import CSV data into a table using the bulk-load path.

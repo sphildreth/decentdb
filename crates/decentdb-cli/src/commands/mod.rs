@@ -100,12 +100,54 @@ pub enum Commands {
     /// Local-first sync journal management
     #[command(subcommand)]
     Sync(SyncCommand),
+    /// Serve a local HTTP API and web console
+    Serve(ServeCommand),
 }
 
 #[derive(Clone, Debug, Parser)]
 pub struct DbCommand {
     #[arg(long)]
     pub db: String,
+}
+
+#[derive(Clone, Debug, Parser)]
+pub struct ServeCommand {
+    /// Database file to serve. Equivalent to --db.
+    #[arg(value_name = "DB")]
+    pub db_path: Option<String>,
+    #[arg(long)]
+    pub db: Option<String>,
+    #[arg(long, default_value = "127.0.0.1")]
+    pub host: String,
+    #[arg(long, default_value_t = 7373)]
+    pub port: u16,
+    /// Compatibility form for host:port binding.
+    #[arg(long, hide = true)]
+    pub bind: Option<String>,
+    #[arg(long, default_value_t = false)]
+    pub read_only: bool,
+    #[arg(long, default_value_t = false)]
+    pub open: bool,
+    #[arg(long, default_value_t = 1000)]
+    pub max_result_rows: usize,
+    #[arg(long, default_value = "30s")]
+    pub query_timeout: String,
+    #[arg(long, default_value = "4mb")]
+    pub max_body_size: String,
+    #[arg(long, default_value_t = 32)]
+    pub max_concurrent_requests: usize,
+    #[arg(long, default_value = "5s")]
+    pub busy_timeout: String,
+    #[arg(long = "token-env")]
+    pub token_env: Option<String>,
+    #[arg(long, default_value_t = false)]
+    pub show_token: bool,
+    #[arg(long, default_value_t = false)]
+    pub no_auth: bool,
+    #[arg(long)]
+    pub cors_origin: Option<String>,
+    #[arg(long, default_value = "text", value_parser = ["text", "json"])]
+    pub log_format: String,
 }
 
 #[derive(Clone, Debug, Parser)]
@@ -1053,8 +1095,38 @@ fn dispatch(cli: Cli) -> Result<()> {
         Commands::VerifyIndex(command) => run_verify_index(command)?,
         Commands::Migrate(command) => run_migrate(command)?,
         Commands::Sync(command) => run_sync(command)?,
+        Commands::Serve(command) => run_serve(command)?,
         Commands::Doctor(_) => unreachable!("Doctor is handled in run()"),
     }
+    Ok(())
+}
+
+fn run_serve(command: ServeCommand) -> Result<()> {
+    let db = match (command.db, command.db_path) {
+        (Some(_), Some(_)) => {
+            return Err(anyhow!("provide either --db or positional DB, not both"))
+        }
+        (Some(db), None) | (None, Some(db)) => db,
+        (None, None) => return Err(anyhow!("missing database path; use --db <file>.ddb")),
+    };
+    crate::serve::run_serve(crate::serve::ServeCommandOptions {
+        db,
+        host: command.host,
+        port: command.port,
+        bind: command.bind,
+        read_only: command.read_only,
+        open: command.open,
+        max_result_rows: command.max_result_rows,
+        query_timeout: command.query_timeout,
+        max_body_size: command.max_body_size,
+        max_concurrent_requests: command.max_concurrent_requests,
+        busy_timeout: command.busy_timeout,
+        token_env: command.token_env,
+        show_token: command.show_token,
+        no_auth: command.no_auth,
+        cors_origin: command.cors_origin,
+        log_format: command.log_format,
+    })?;
     Ok(())
 }
 

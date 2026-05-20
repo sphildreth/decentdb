@@ -106,8 +106,25 @@ decentdb sync pending --db ./app.ddb --since 0 --limit 10 --format table
 - Language integrations: [C/C++ ABI](api/c-cpp.md), [.NET](api/dotnet.md),
   [Go](api/go.md), [Python](api/python.md), [Node.js](api/node.md),
   [Dart/Flutter](api/dart.md), and [JDBC](api/jdbc.md)
-- CLI users: [Interactive SQL Shell](user-guide/repl.md) and
+- CLI users: [Interactive SQL Shell](user-guide/repl.md),
+  [Built-In Web Console](user-guide/web-console.md), and
   [CLI Reference](api/cli-reference.md)
+
+## Built-In Web Console At A Glance
+
+`decentdb serve --db ./app.ddb` starts a local HTTP API and lightweight browser
+console at `http://localhost:7373`. It is designed for quick inspection,
+simple ad hoc SQL, schema browsing, and scripting support without installing a
+full IDE.
+
+- embedded HTML, CSS, and vanilla JavaScript served from the CLI binary
+- no CDN, external fonts, telemetry, frontend build pipeline, or internet
+  dependency
+- transparent ephemeral auth for default localhost sessions
+- read-only mode for safe inspection
+- table detail, schema, query, explain, CSV export, and local query history
+
+Start with the [Built-In Web Console](user-guide/web-console.md) guide.
 
 ## Local-First Sync At A Glance
 
@@ -145,8 +162,10 @@ authoritative implementation.
 
 - DecentDB is an embedded, single-process database engine.
 - The concurrency model is one writer with many concurrent readers.
-- The current local HTTP sync server is intended for localhost, development,
-  tests, and short-lived relay workflows; it is not a hardened public server.
+- The built-in HTTP surfaces are local-first. `decentdb serve` can bind to a
+  non-localhost host only with explicit bearer-token configuration, but it is
+  still a lightweight inspection/API server rather than a hardened public
+  database service.
 - DecentDB does not currently expose a general-purpose loadable SQL extension
   or UDF plugin system.
 - Some roadmap items, including native geospatial types, WASM/OPFS,

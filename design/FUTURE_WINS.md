@@ -31,7 +31,7 @@ Future version values are planning buckets, not release commitments.
 | 6 | v2.6.0 | DONE | Mature interactive SQL shell and CLI ergonomics | [`../docs/user-guide/repl.md`](../docs/user-guide/repl.md) | Baseline developer experience and SQLite migration comfort; not identity-defining but highly visible |
 | 7 | vNext+2 | TODO | Transparent write queuing and pipelining | Needs ADR/spec | Makes one-writer reality feel modern under concurrent application writes |
 | 8 | vNext+2 | TODO | Group commit / WAL batching refinements | ADR 0135 | Async commit exists; strict durable group commit refinements remain |
-| 9 | vNext+2 | BACKLOG | Built-in HTTP / remote server mode | Needs ADR/spec | Useful deployment multiplier, especially after write queuing exists |
+| 9 | v2.6.0 | DONE | Built-in HTTP / remote server mode | [`WIN_BUILT_IN_HTTP_SERVER_SPEC.md`](WIN_BUILT_IN_HTTP_SERVER_SPEC.md); [`../docs/user-guide/web-console.md`](../docs/user-guide/web-console.md) | Lightweight local inspection/API surface shipped in the CLI while keeping the core engine network-free |
 | 10 | vNext+2 | BACKLOG | Cross-process WAL coordination | Needs ADR/spec | Useful for Electron, helper processes, and background sync workers |
 | 11 | vNext+3 | BACKLOG | JSONB binary storage | Needs ADR/spec | Better JSON performance, but less identity-defining after SQLite JSONB |
 | 12 | vNext+3 | TODO | Transparent data compression | Existing compression foundation; needs product spec | Storage/cache multiplier, especially for large overflow payloads |
@@ -71,6 +71,11 @@ than future roadmap claims:
   aliases, topic-specific help, schema inspection, output controls, script and
   redirection workflows, CSV import/table export shortcuts, explain helpers,
   positional parameters, command history, repeat-last-SQL, and branch helpers
+- Built-in HTTP server and Web Console: `decentdb serve`, embedded offline
+  assets, transparent localhost auth, read-only mode, SQL and EXPLAIN API,
+  schema/table/index/view/trigger inspection, result/request limits, local
+  query history, CSV export, CORS opt-in, JSON request logs, and remote-bind
+  token safety.
 - Paged row storage, deferred table materialization, and WAL/page-cache memory work for larger embedded workloads
 
 ## Positioning
@@ -379,24 +384,29 @@ with write queuing:
 
 ## 9. Built-In HTTP / Remote Server Mode
 
-**Status:** `BACKLOG`
-**Future Version:** vNext+2
-**Source of truth:** Needs ADR/spec before implementation.
+**Status:** `DONE`  
+**Future Version:** v2.6.0  
+**Source of truth:** [`WIN_BUILT_IN_HTTP_SERVER_SPEC.md`](WIN_BUILT_IN_HTTP_SERVER_SPEC.md) and [`../docs/user-guide/web-console.md`](../docs/user-guide/web-console.md)
 
 ### Why This Matters
 
 Some users need a tiny server wrapper for edge functions, local tools, BI,
-automation, or helper processes. This should remain a CLI feature, not a core
-engine concern.
+automation, or helper processes. This remains a CLI feature, not a core engine
+concern.
 
-### Required Boundaries
+### Shipped Boundaries
 
 - keep `crates/decentdb` network-free
 - implement server logic in `crates/decentdb-cli`
 - use a stateless request model for statement batches
 - use simple bearer-token authentication
 - avoid engine-level RBAC in this slice
-- integrate with write queuing when available
+- keep remote binding opt-in and token-protected
+- keep the bundled Web Console lightweight and separate from Decent Bench
+
+Future refinement can integrate with write queuing when that roadmap item
+lands, but the v2.6.0 server already covers local inspection, scripting, and
+sidecar use cases.
 
 ## 10. Cross-Process WAL Coordination
 

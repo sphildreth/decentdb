@@ -2,7 +2,7 @@
 
 **Product:** DecentDB  
 **Feature:** `decentdb serve` — Built-In HTTP Server + Lightweight Web Console  
-**Status:** Draft PRD  
+**Status:** Implemented in v2.6.0  
 **Owner:** TBD  
 **Last Updated:** 2026-05-19  
 
