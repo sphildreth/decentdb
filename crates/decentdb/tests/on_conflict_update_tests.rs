@@ -44,6 +44,6 @@ fn on_conflict_do_update_filter_and_apply() {
 
     let _ = std::fs::remove_file(&path);
     let mut wal_path = path.clone();
-    wal_path.set_extension("wal");
+    wal_path.as_mut_os_string().push(".wal");
     let _ = std::fs::remove_file(&wal_path);
 }

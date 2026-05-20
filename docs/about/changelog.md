@@ -5,6 +5,27 @@ All notable changes to DecentDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.6.0] - 2026-05-19
+
+### Added
+
+- Completed the interactive SQL shell ergonomics roadmap slice with a version
+  banner, `help`/quit aliases, topic-specific help, schema inspection commands
+  (`.tables`, `.dt`, `.d <table>`, `.schema`, `.indexes`, `.views`), function
+  listing (`.df`), output controls (`.mode`, `.headers`, `.nullvalue`,
+  `.width`, `.timer`), file workflows (`.read`, `.output`, `.once`, `.import`,
+  `.export`), explain helpers (`.explain`, `.plan`, `.explain-analyze`),
+  positional parameter helpers (`.param`), repeat-last-SQL (`.g`), session
+  history (`.s`), and branch creation/checkout helpers.
+
+### Fixed
+
+- Fixed `decentdb-migrate` v10 → v11 upgrades for databases with an existing
+  `<db>.wal` sidecar by standardizing migration tooling on the engine's
+  append-`.wal` sidecar convention, copying the v10 WAL forward, and upgrading
+  any page-1 database-header frames inside the copied WAL so a later checkpoint
+  cannot restore a legacy v10 header.
+
 ## [2.5.1] - 2026-05-19
 
 ### Changed

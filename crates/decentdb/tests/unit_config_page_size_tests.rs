@@ -26,7 +26,8 @@ fn unique_db_path(label: &str) -> PathBuf {
 
 fn cleanup(path: &PathBuf) {
     let _ = fs::remove_file(path);
-    let wal_path = path.with_extension("ddb-wal");
+    let mut wal_path = path.clone();
+    wal_path.as_mut_os_string().push(".wal");
     let _ = fs::remove_file(&wal_path);
 }
 

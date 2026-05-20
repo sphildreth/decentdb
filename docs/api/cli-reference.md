@@ -49,9 +49,13 @@ decentdb repl --db=<path> [--format=<json|csv|table|markdown>]
 ```
 
 Special commands:
-- `.help`
-- `.quit`
-- `.exit`
+- help aliases: `help`, `\?`, `/?`, `/help`, `\help`, `.help`
+- quit aliases: `.quit`, `.exit`, `\q`
+- schema inspection: `.tables`, `.dt`, `.d <table>`, `.schema [object]`, `.indexes [table]`, `.views`
+- output controls: `.mode`, `.headers`, `.nullvalue`, `.width`, `.timer`
+- file workflows: `.read`, `.output`, `.once`, `.import`, `.export`
+- query helpers: `.explain`, `.plan`, `.explain-analyze`, `.param`
+- session helpers: `.g`, `.s`, `.branch`, `.checkout`
 
 See [Interactive SQL Shell](../user-guide/repl.md) for the full user guide.
 

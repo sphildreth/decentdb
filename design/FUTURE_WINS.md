@@ -15,6 +15,8 @@ Status values:
 
 - `TODO`: prioritized roadmap work that is not actively being implemented right now.
 - `IN PROGRESS`: active implementation or design work is underway right now.
+- `DONE`: shipped foundation that should be tracked under Current Foundations
+  rather than future roadmap work.
 - `BACKLOG`: valuable, but not part of the near-term implementation path.
 
 Future version values are planning buckets, not release commitments.
@@ -26,7 +28,7 @@ Future version values are planning buckets, not release commitments.
 | 3 | vNext+1 | TODO | Application database bundle format | Needs ADR/spec | Makes DecentDB a portable app artifact, support bundle, and sharable dataset format |
 | 4 | vNext+1 | TODO | Built-in observability and `sys.*` virtual tables | Needs ADR/spec; doctor v1 is foundation | Complements doctor and makes operational state queryable |
 | 5 | vNext+1 | TODO | Lua extension runtime and package model | [`WIN_LUA_EXTENSION_RUNTIME_SPEC.md`](WIN_LUA_EXTENSION_RUNTIME_SPEC.md) | One official extension language gives DecentDB a supportable extensibility story without arbitrary native loading |
-| 6 | vNext+1 | TODO | Mature interactive SQL shell and CLI ergonomics | [`../docs/user-guide/repl.md`](../docs/user-guide/repl.md); needs product spec | Baseline developer experience and SQLite migration comfort; not identity-defining but highly visible |
+| 6 | v2.6.0 | DONE | Mature interactive SQL shell and CLI ergonomics | [`../docs/user-guide/repl.md`](../docs/user-guide/repl.md) | Baseline developer experience and SQLite migration comfort; not identity-defining but highly visible |
 | 7 | vNext+2 | TODO | Transparent write queuing and pipelining | Needs ADR/spec | Makes one-writer reality feel modern under concurrent application writes |
 | 8 | vNext+2 | TODO | Group commit / WAL batching refinements | ADR 0135 | Async commit exists; strict durable group commit refinements remain |
 | 9 | vNext+2 | BACKLOG | Built-in HTTP / remote server mode | Needs ADR/spec | Useful deployment multiplier, especially after write queuing exists |
@@ -65,6 +67,10 @@ than future roadmap claims:
 - Stable schema and query-contract metadata for tooling: versioned metadata JSON, deterministic schema fingerprints, native type metadata including spatial values, non-executing query contracts, Rust API, C ABI, and binding exposure across Python, Go, .NET, Node.js, Java/JDBC, and Dart
 - Native geospatial types and spatial indexes: `GEOMETRY` / `GEOGRAPHY`, normalized EWKB interchange, WKT/WKB/GeoJSON I/O, `ST_*` predicates and measurements, `<->` distance ordering, planner-visible `USING spatial` indexes, and point-in-polygon spatial join acceleration
 - Doctor/advisor v1 CLI, JSON, Markdown, and safe `--fix` surface
+- Mature interactive SQL shell and CLI ergonomics: startup banner, help/quit
+  aliases, topic-specific help, schema inspection, output controls, script and
+  redirection workflows, CSV import/table export shortcuts, explain helpers,
+  positional parameters, command history, repeat-last-SQL, and branch helpers
 - Paged row storage, deferred table materialization, and WAL/page-cache memory work for larger embedded workloads
 
 ## Positioning
@@ -276,35 +282,34 @@ systems or unbounded native plugins.
 
 ## 6. Mature Interactive SQL Shell And CLI Ergonomics
 
-**Status:** `TODO`
-**Future Version:** vNext+1
-**Source of truth:** [`../docs/user-guide/repl.md`](../docs/user-guide/repl.md). Needs product spec before broad implementation.
+**Status:** `DONE`
+**Shipped Version:** v2.6.0
+**Source of truth:** [`../docs/user-guide/repl.md`](../docs/user-guide/repl.md).
 
 ### Why This Matters
 
 SQLite's `sqlite3` shell sets a strong baseline expectation for embedded
-database usability. DecentDB already has `decentdb repl`, but it is intentionally
-small today. A more capable shell would make DecentDB easier to learn, debug,
-demo, script, and migrate to from SQLite-style workflows.
+database usability. DecentDB now has a capable `decentdb repl` shell for
+learning, debugging, demoing, scripting, and migrating SQLite-style workflows.
 
 This is not the primary market differentiator. It is visible developer
 experience work that keeps the product from feeling immature next to SQLite.
 
-### Target Capabilities
+### Completed Capabilities
 
 - richer `.help` output with topic-specific help
-- schema inspection commands such as `.tables`, `.schema`, `.indexes`, and
-  `.views`
-- output controls such as `.mode`, `.headers`, `.nullvalue`, `.width`, and
-  `.timer`
-- script/file workflows such as `.read`, `.output`, `.once`, and safe
-  interrupt/error behavior
-- import/export shortcuts that delegate to existing CSV/JSON code paths
-- explain/plan helpers for `EXPLAIN`, `EXPLAIN ANALYZE`, and future advisor
-  surfaces
-- optional parameter helpers for repeatable interactive query testing
-- deeper automated coverage for piped input, interactive-style sessions,
-  multiline SQL, quoted semicolons, transaction prompts, and error recovery
+- schema inspection commands: `.tables`, `.dt`, `.d <table>`, `.schema`,
+  `.indexes`, and `.views`
+- output controls: `.mode`, `.headers`, `.nullvalue`, `.width`, and `.timer`
+- script/file workflows: `.read`, `.output`, `.once`, safe interruption of
+  incomplete statements, and non-fatal command errors
+- CSV import and table export shortcuts backed by existing bulk-load/export
+  behavior
+- explain/plan helpers for `EXPLAIN` and `EXPLAIN ANALYZE`
+- positional parameter helpers for repeatable interactive query testing
+- automated coverage for piped interactive-style sessions, schema inspection,
+  output controls, file workflows, import/export, explain, parameters, history,
+  and repeat-last-SQL
 
 ### Guardrails
 

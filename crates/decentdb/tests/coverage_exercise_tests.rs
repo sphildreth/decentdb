@@ -122,6 +122,6 @@ fn exercise_engine_broad_paths() {
     // Clean up
     let _ = std::fs::remove_file(&path);
     let mut wal_path = path.clone();
-    wal_path.set_extension("wal");
+    wal_path.as_mut_os_string().push(".wal");
     let _ = std::fs::remove_file(&wal_path);
 }

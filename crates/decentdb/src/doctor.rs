@@ -2947,7 +2947,8 @@ mod tests {
         // finding exists. The default WAL preallocation is now intentionally
         // below the doctor "large WAL" threshold, so extend this test WAL
         // explicitly instead of depending on default allocation size.
-        let wal_path = path.with_extension("ddb.wal");
+        let mut wal_path = path.clone();
+        wal_path.as_mut_os_string().push(".wal");
         std::fs::OpenOptions::new()
             .write(true)
             .open(&wal_path)

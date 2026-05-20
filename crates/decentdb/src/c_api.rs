@@ -3764,7 +3764,9 @@ mod tests {
         assert_eq!(ddb_db_free(&mut db), DDB_OK);
 
         let _ = std::fs::remove_file(&path_buf);
-        let _ = std::fs::remove_file(path_buf.with_extension("ddb.wal"));
+        let mut wal_path = path_buf.clone();
+        wal_path.as_mut_os_string().push(".wal");
+        let _ = std::fs::remove_file(wal_path);
         let _ = std::fs::remove_file(path_buf.with_extension("ddb.shm"));
     }
 
@@ -3833,7 +3835,9 @@ mod tests {
         assert_eq!(ddb_db_free(&mut db), DDB_OK);
 
         let _ = std::fs::remove_file(&path_buf);
-        let _ = std::fs::remove_file(path_buf.with_extension("ddb.wal"));
+        let mut wal_path = path_buf.clone();
+        wal_path.as_mut_os_string().push(".wal");
+        let _ = std::fs::remove_file(wal_path);
         let _ = std::fs::remove_file(path_buf.with_extension("ddb.shm"));
     }
 
@@ -3895,7 +3899,9 @@ mod tests {
         assert_eq!(ddb_db_free(&mut db), DDB_OK);
 
         let _ = std::fs::remove_file(&path_buf);
-        let _ = std::fs::remove_file(path_buf.with_extension("ddb.wal"));
+        let mut wal_path = path_buf.clone();
+        wal_path.as_mut_os_string().push(".wal");
+        let _ = std::fs::remove_file(wal_path);
         let _ = std::fs::remove_file(path_buf.with_extension("ddb.shm"));
     }
 
