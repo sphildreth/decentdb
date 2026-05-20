@@ -84,7 +84,7 @@ shipped foundation affects follow-on roadmap decisions.
 |---:|---|---|---|---|---|
 | 1 | vNext+2 | TODO | Local data security: TDE, policies, masking, audit context | Needs ADR/spec | TDE is table stakes for SQLCipher-style onboarding; policy is the differentiated regulated/offline story |
 | 2 | vNext+2 | TODO | Lua extension runtime and package model | [`WIN_LUA_EXTENSION_RUNTIME_SPEC.md`](WIN_LUA_EXTENSION_RUNTIME_SPEC.md) | One sandboxed extension language is supportable across native, mobile, and WASM targets |
-| 3 | vNext+2 | TODO | SQL and PRAGMA compatibility quick wins | [`WIN_ADVANCED_SQL_COMPATIBILITY_SURFACE.md`](WIN_ADVANCED_SQL_COMPATIBILITY_SURFACE.md); needs focused slice spec | Low-friction onboarding from SQLite/PostgreSQL code without chasing full clone compatibility |
+| 3 | vNext+2 | TODO | SQL and PRAGMA compatibility quick wins | [`WIN_SQL_PRAGMA_COMPATIBILITY_QUICK_WINS_SPEC.md`](WIN_SQL_PRAGMA_COMPATIBILITY_QUICK_WINS_SPEC.md) | Low-friction onboarding from SQLite/PostgreSQL code without chasing full clone compatibility |
 | 4 | vNext+3 | TODO | Full-text search with BM25 ranking | Needs ADR/spec | Expected by app databases and a real SQLite FTS migration blocker |
 | 5 | vNext+3 | TODO | Cross-process WAL coordination | Needs ADR/spec | Important for Electron/Tauri, helper processes, CLI coexistence, and background sync workers |
 | 6 | vNext+3 | TODO | Runtime tracing, advisors, and Doctor integration | Needs ADR/spec; follows shipped operational metrics | Adds slow-query/lock-wait history, index usage, doctor findings, and advisor surfaces once the metrics contract is stable |
@@ -234,8 +234,7 @@ systems or unbounded native plugins.
 
 **Future Version:** vNext+2
 
-**Source of truth:** [`WIN_ADVANCED_SQL_COMPATIBILITY_SURFACE.md`](WIN_ADVANCED_SQL_COMPATIBILITY_SURFACE.md);
-needs focused slice spec.
+**Source of truth:** [`WIN_SQL_PRAGMA_COMPATIBILITY_QUICK_WINS_SPEC.md`](WIN_SQL_PRAGMA_COMPATIBILITY_QUICK_WINS_SPEC.md).
 
 ### Why This Matters
 
@@ -243,16 +242,14 @@ Some compatibility items are low-effort, high-visibility onboarding wins. They
 make SQLite and PostgreSQL-adjacent code feel less foreign without committing
 DecentDB to clone every behavior.
 
-### Recommended Slice
+### Completion Target
 
-- common SQLite-style inspection PRAGMAs such as `table_info` equivalents
-- compatibility views/functions for common schema inspection workflows
-- schema-qualified object name parsing where it maps cleanly to DecentDB's
-  catalog model
-- `generate_series(...)` and other small built-in table-valued helpers
-- explicit collation syntax and a small set of built-in collations
-- clearer `PRAGMA`/option mapping for cache, synchronous mode, and foreign-key
-  enforcement where DecentDB already has equivalent configuration
+This is a single completion milestone, not an open-ended initial slice. The
+spec covers safe SQLite-style PRAGMA probes and assignments, schema
+introspection PRAGMAs, SQLite compatibility catalog views, minimal
+`information_schema`, `generate_series(...)`, narrow `main`/`temp`
+schema-qualified names, query-time built-in collations, and explicit unsupported
+behavior for compatibility features DecentDB should not emulate.
 
 ### Guardrails
 
