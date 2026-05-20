@@ -14,6 +14,11 @@ pub enum DbErrorCode {
     Internal = 6,
     Panic = 7,
     UnsupportedFormatVersion = 8,
+    Busy = 9,
+    Timeout = 10,
+    Canceled = 11,
+    QueueFull = 12,
+    QueueClosed = 13,
 }
 
 impl DbErrorCode {
@@ -49,6 +54,16 @@ pub enum DbError {
     Panic { message: String },
     #[error("unsupported database format version: {version}")]
     UnsupportedFormatVersion { version: u32 },
+    #[error("busy: {message}")]
+    Busy { message: String },
+    #[error("operation timed out: {message}")]
+    Timeout { message: String },
+    #[error("operation canceled: {message}")]
+    Canceled { message: String },
+    #[error("write queue full: {message}")]
+    QueueFull { message: String },
+    #[error("write queue closed: {message}")]
+    QueueClosed { message: String },
 }
 
 impl DbError {
@@ -108,6 +123,41 @@ impl DbError {
     }
 
     #[must_use]
+    pub fn busy(message: impl Into<String>) -> Self {
+        Self::Busy {
+            message: message.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn timeout(message: impl Into<String>) -> Self {
+        Self::Timeout {
+            message: message.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn canceled(message: impl Into<String>) -> Self {
+        Self::Canceled {
+            message: message.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn queue_full(message: impl Into<String>) -> Self {
+        Self::QueueFull {
+            message: message.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn queue_closed(message: impl Into<String>) -> Self {
+        Self::QueueClosed {
+            message: message.into(),
+        }
+    }
+
+    #[must_use]
     pub fn code(&self) -> DbErrorCode {
         match self {
             Self::Io { .. } => DbErrorCode::Io,
@@ -118,6 +168,11 @@ impl DbError {
             Self::Internal { .. } => DbErrorCode::Internal,
             Self::Panic { .. } => DbErrorCode::Panic,
             Self::UnsupportedFormatVersion { .. } => DbErrorCode::UnsupportedFormatVersion,
+            Self::Busy { .. } => DbErrorCode::Busy,
+            Self::Timeout { .. } => DbErrorCode::Timeout,
+            Self::Canceled { .. } => DbErrorCode::Canceled,
+            Self::QueueFull { .. } => DbErrorCode::QueueFull,
+            Self::QueueClosed { .. } => DbErrorCode::QueueClosed,
         }
     }
 
@@ -150,6 +205,14 @@ mod tests {
                 DbError::unsupported_format_version(7),
                 DbErrorCode::UnsupportedFormatVersion,
             ),
+            (DbError::busy("writer busy"), DbErrorCode::Busy),
+            (DbError::timeout("queue wait"), DbErrorCode::Timeout),
+            (DbError::canceled("before run"), DbErrorCode::Canceled),
+            (
+                DbError::queue_full("capacity reached"),
+                DbErrorCode::QueueFull,
+            ),
+            (DbError::queue_closed("shutdown"), DbErrorCode::QueueClosed),
         ];
 
         for (error, expected_code) in cases {

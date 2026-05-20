@@ -34,6 +34,7 @@ mod vfs;
 mod wal;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 mod wasm;
+mod write_queue;
 
 pub use crate::branch::{
     BranchDiffReport, BranchInfo, BranchLogEntry, BranchMergeChange, BranchMergeConflict,
@@ -69,6 +70,7 @@ pub use crate::sync::{
 };
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 pub use crate::wasm::WebDb;
+pub use crate::write_queue::{QueuedWriteOptions, WriteQueueMetricsSnapshot};
 
 /// Returns the DecentDB crate version.
 #[must_use]

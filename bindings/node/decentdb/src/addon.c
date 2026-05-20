@@ -433,6 +433,126 @@ static napi_value js_db_close(napi_env env, napi_callback_info info) {
   return undef;
 }
 
+static int read_timeout_ms(napi_env env, napi_value value, uint64_t* out_timeout_ms) {
+  *out_timeout_ms = DDB_WRITE_QUEUE_TIMEOUT_DEFAULT;
+  if (value == NULL) return 0;
+
+  napi_valuetype type;
+  napi_status st = napi_typeof(env, value, &type);
+  if (st != napi_ok) return -1;
+  if (type == napi_undefined || type == napi_null) return 0;
+  if (type == napi_bigint) {
+    bool lossless = false;
+    st = napi_get_value_bigint_uint64(env, value, out_timeout_ms, &lossless);
+    return st == napi_ok && lossless ? 0 : -1;
+  }
+  if (type == napi_number) {
+    double number = 0.0;
+    st = napi_get_value_double(env, value, &number);
+    if (st != napi_ok || !isfinite(number) || number < 0.0) return -1;
+    *out_timeout_ms = (uint64_t)number;
+    return 0;
+  }
+  return -1;
+}
+
+static napi_value create_u64_value(napi_env env, uint64_t value) {
+  napi_value out;
+  napi_status st = napi_create_bigint_uint64(env, value, &out);
+  NAPI_CALL(env, st);
+  return out;
+}
+
+static void set_u64_prop(napi_env env, napi_value object, const char* name, uint64_t value) {
+  napi_value v = create_u64_value(env, value);
+  napi_set_named_property(env, object, name, v);
+}
+
+static napi_value js_db_execute_queued(napi_env env, napi_callback_info info) {
+  const decentdb_native_api* api = require_api(env);
+
+  size_t argc = 3;
+  napi_value argv[3];
+  napi_status st = napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
+  NAPI_CALL(env, st);
+
+  if (argc < 2) {
+    return throw_error(env, "DECENTDB_ARGS", "dbExecuteQueued(handle, sql, timeoutMs?) requires a handle and SQL");
+  }
+  if (!api->execute_queued) {
+    return throw_error(env, "DECENTDB_UNAVAILABLE", "ddb_db_execute_queued is not available in this build");
+  }
+
+  db_wrap* dbw = unwrap_db(env, argv[0]);
+  if (!dbw) return NULL;
+
+  size_t sql_len = 0;
+  st = napi_get_value_string_utf8(env, argv[1], NULL, 0, &sql_len);
+  if (st != napi_ok) return throw_error(env, "DECENTDB_ARGS", "sql must be a string");
+
+  char* sql = (char*)malloc(sql_len + 1);
+  if (!sql) return throw_error(env, "DECENTDB_NOMEM", "Out of memory");
+  st = napi_get_value_string_utf8(env, argv[1], sql, sql_len + 1, &sql_len);
+  if (st != napi_ok) {
+    free(sql);
+    NAPI_CALL(env, st);
+  }
+
+  uint64_t timeout_ms = DDB_WRITE_QUEUE_TIMEOUT_DEFAULT;
+  if (argc >= 3 && read_timeout_ms(env, argv[2], &timeout_ms) != 0) {
+    free(sql);
+    return throw_error(env, "DECENTDB_ARGS", "timeoutMs must be a non-negative number or BigInt");
+  }
+
+  uint64_t affected = 0;
+  int rc = api->execute_queued(dbw->db, sql, timeout_ms, &affected);
+  free(sql);
+  if (rc != 0) return throw_last_native_error(env, api);
+  return create_u64_value(env, affected);
+}
+
+static napi_value js_db_write_queue_metrics(napi_env env, napi_callback_info info) {
+  const decentdb_native_api* api = require_api(env);
+
+  size_t argc = 1;
+  napi_value argv[1];
+  napi_status st = napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
+  NAPI_CALL(env, st);
+
+  if (argc < 1) return throw_error(env, "DECENTDB_ARGS", "dbWriteQueueMetrics(handle) requires a handle");
+  if (!api->write_queue_metrics) {
+    return throw_error(env, "DECENTDB_UNAVAILABLE", "ddb_db_write_queue_metrics is not available in this build");
+  }
+
+  db_wrap* dbw = unwrap_db(env, argv[0]);
+  if (!dbw) return NULL;
+
+  ddb_write_queue_metrics_t metrics;
+  memset(&metrics, 0, sizeof(metrics));
+  int rc = api->write_queue_metrics(dbw->db, &metrics);
+  if (rc != 0) return throw_last_native_error(env, api);
+
+  napi_value out;
+  st = napi_create_object(env, &out);
+  NAPI_CALL(env, st);
+  set_u64_prop(env, out, "capacity", (uint64_t)metrics.capacity);
+  set_u64_prop(env, out, "currentDepth", (uint64_t)metrics.current_depth);
+  set_u64_prop(env, out, "admitted", metrics.admitted);
+  set_u64_prop(env, out, "rejected", metrics.rejected);
+  set_u64_prop(env, out, "timedOut", metrics.timed_out);
+  set_u64_prop(env, out, "canceled", metrics.canceled);
+  set_u64_prop(env, out, "executed", metrics.executed);
+  set_u64_prop(env, out, "committed", metrics.committed);
+  set_u64_prop(env, out, "failed", metrics.failed);
+  set_u64_prop(env, out, "groupCommitBatches", metrics.group_commit_batches);
+  set_u64_prop(env, out, "groupCommitSyncs", metrics.group_commit_syncs);
+  set_u64_prop(env, out, "groupCommitMaxBatch", metrics.group_commit_max_batch);
+  set_u64_prop(env, out, "groupCommitCommitsCovered", metrics.group_commit_commits_covered);
+  set_u64_prop(env, out, "physicalSyncsSaved", metrics.physical_syncs_saved);
+  set_u64_prop(env, out, "totalQueueWaitNs", metrics.total_queue_wait_ns);
+  return out;
+}
+
 static napi_value js_stmt_prepare(napi_env env, napi_callback_info info) {
   const decentdb_native_api* api = require_api(env);
 
@@ -2413,6 +2533,8 @@ static napi_value init(napi_env env, napi_value exports) {
   napi_property_descriptor props[] = {
     {"dbOpen", 0, js_db_open, 0, 0, 0, napi_default, 0},
     {"dbClose", 0, js_db_close, 0, 0, 0, napi_default, 0},
+    {"dbExecuteQueued", 0, js_db_execute_queued, 0, 0, 0, napi_default, 0},
+    {"dbWriteQueueMetrics", 0, js_db_write_queue_metrics, 0, 0, 0, napi_default, 0},
 
     {"stmtPrepare", 0, js_stmt_prepare, 0, 0, 0, napi_default, 0},
     {"stmtFinalize", 0, js_stmt_finalize, 0, 0, 0, napi_default, 0},

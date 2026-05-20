@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"database/sql/driver"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -197,6 +199,74 @@ func TestDriver(t *testing.T) {
 	// 6. Reject unsupported parameter styles
 	if _, err := conn.PrepareContext(context.Background(), "SELECT id FROM users WHERE id = ?"); err == nil {
 		t.Fatalf("expected error for '?' parameters")
+	}
+}
+
+func TestDriver_WriteQueue_DSNOptionsAndDirectHelpers(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "decentdb-test-write-queue-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	dbPath := filepath.Join(tmpDir, "queue.ddb")
+	dsn := fmt.Sprintf(
+		"file:%s?write_queue_enabled=true&write_queue_default_timeout_ms=5000&write_queue_capacity=64",
+		dbPath,
+	)
+
+	db, err := sql.Open("decentdb", dsn)
+	if err != nil {
+		t.Fatalf("failed to open with write queue options: %v", err)
+	}
+	defer db.Close()
+
+	sqlConn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqlConn.Close()
+
+	err = sqlConn.Raw(func(raw any) error {
+		c, ok := raw.(*conn)
+		if !ok {
+			return errors.New("unexpected underlying connection type")
+		}
+		if !c.useWriteQueue {
+			return errors.New("write queue not enabled from DSN options")
+		}
+		if c.writeQueueDefaultMs == nil || *c.writeQueueDefaultMs != 5000 {
+			return fmt.Errorf("unexpected queue default timeout: %#v", c.writeQueueDefaultMs)
+		}
+
+		if _, err := c.ExecContext(context.Background(), "CREATE TABLE queued_users (id INT PRIMARY KEY, name TEXT)", nil); err != nil {
+			return fmt.Errorf("queued create table failed: %w", err)
+		}
+		if _, err := c.execQueuedDriverValues(
+			context.Background(),
+			"INSERT INTO queued_users (id, name) VALUES ($1, $2)",
+			[]driver.Value{int64(1), "Ada"},
+		); err != nil {
+			return fmt.Errorf("queued insert failed: %w", err)
+		}
+
+		metrics, err := c.writeQueueMetrics()
+		if err != nil {
+			return fmt.Errorf("fetching queue metrics failed: %w", err)
+		}
+		if metrics.Admitted == 0 {
+			return errors.New("expected admitted queue metrics to be > 0")
+		}
+		if metrics.Committed == 0 {
+			return errors.New("expected committed queue metrics to be > 0")
+		}
+		if metrics.CurrentDepth != 0 {
+			return errors.New("expected queue to drain to depth 0")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("write queue dsn/options helpers failed: %v", err)
 	}
 }
 

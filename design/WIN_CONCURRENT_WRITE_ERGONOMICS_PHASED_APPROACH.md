@@ -1,7 +1,7 @@
 # Concurrent Write Ergonomics: Phased Implementation Approach
 
 **Date:** 2026-05-20  
-**Status:** Proposed implementation approach  
+**Status:** Implemented for the self-contained queued SQL contract
 **Roadmap:** [`FUTURE_WINS.md`](FUTURE_WINS.md) priority #1  
 **Document Type:** Phased delivery plan; not a final ADR  
 **Audience:** Core engine developers, WAL/storage maintainers, C ABI maintainers, binding maintainers, CLI maintainers, benchmark maintainers, documentation authors, coding agents  
@@ -38,6 +38,14 @@ a slower queue path just because the engine supports queued writes.
 ```
 
 This document intentionally describes a phased implementation, but the phases are work packages inside one tracked feature. Public completion requires the core engine, C ABI, maintained bindings, tests, benchmarks, and docs to land together or behind one coherent release gate.
+
+**Implementation status (2026-05-20):** complete for explicit queued
+self-contained SQL statements and batches, strict group commit, queue metrics,
+C ABI v3, and maintained binding exposure. Direct and prepared-statement paths
+remain direct unless a binding explicitly routes an operation through the queued
+API. Full automatic queued prepared-statement execution for every provider is a
+future ABI extension, because duplicating typed parameter marshalling in each
+binding would create inconsistent behavior.
 
 ---
 
@@ -234,7 +242,17 @@ Bindings may choose the queued path as their default for concurrent/pool-style u
 
 ### 9.2 Queue Ownership
 
-There should be one logical write queue per in-process shared database/WAL handle, not one queue per binding connection. This prevents each binding from inventing separate fairness and contention rules.
+ADR 0162 chooses a lazy per-`Db` queue for the first stable contract. Cloned
+`Db` handles share that queue, while separately opened handles still share the
+underlying WAL writer lock and durability rules. This keeps the public contract
+bounded and avoids introducing a global queue lifetime that would have to own
+binding callbacks, prepared statement state, and shutdown semantics across
+multiple host runtimes.
+
+Bindings that want one queue for a connection pool should route queued write
+workers through a shared queued handle or provider-level queue mode. A future
+ADR can move the queue to the shared WAL registry if measured cross-handle
+fairness requires it.
 
 The queue should be lazy:
 
@@ -454,6 +472,10 @@ The phases below are ordered work packages. The public feature is complete only 
 
 **Goal:** Finish the design before touching concurrency-critical code.
 
+**Implementation status:** Complete as of 2026-05-20. ADR 0162 records the
+queue, strict group commit, timeout/cancellation, metrics, direct-path, and
+binding-scope decisions.
+
 Deliverables:
 
 1. ADR for engine-owned write queue and strict group commit.
@@ -476,27 +498,43 @@ Exit criteria:
 
 **Goal:** Install regression tripwires before implementation.
 
+**Implementation status:** Complete as of 2026-05-20. The shipped Phase 1
+hooks define direct-path benchmark slices, executable queued-write benchmark
+scenarios, cross-binding scenario shape, grouped-commit fault-injection
+planning, and pre-commit keys.
+
 Deliverables:
 
 1. Native benchmark scenarios for direct single-writer and read-under-write cases.
-2. Native benchmark scenarios for queued writes, initially behind placeholder or ignored tests if API is not present yet.
+2. Native benchmark scenarios for queued writes, including single-writer and reader-under-writer queue coverage.
 3. Cross-binding test scenario definition for concurrent writes.
 4. Fault-injection test plan for grouped commits.
 5. CI/pre-commit check keys for the new test slices.
 
+Implementation decision: queued reader-under-writer benchmark coverage uses
+independent reader handles on the same database path while writer threads share
+one queued writer handle. This follows the repository's existing
+`read_under_write` benchmark shape and the one-writer/many-readers operating
+model instead of depending on concurrent reads through the same mutable writer
+handle.
+
 Exit criteria:
 
 - Direct-path baseline can be reproduced.
-- A future queue implementation has a clear pass/fail benchmark target.
+- The queue implementation has a clear pass/fail benchmark target.
 - Binding smoke test shape is agreed before bindings are edited.
 
 ### Phase 2: Core Queue Without Group Commit
 
 **Goal:** Add bounded engine-owned queue semantics while preserving existing commit behavior.
 
+**Implementation status:** Complete as of 2026-05-20. The core `WriteQueue`
+is lazy per `Db`, bounded by capacity, FIFO for admitted requests, and preserves
+direct-path execution unless callers use queued APIs.
+
 Deliverables:
 
-1. Lazy per-shared-WAL in-process queue.
+1. Lazy per-`Db` in-process queue, with the shared WAL writer lock preserving the global single-writer rule across separately opened handles.
 2. Request admission with capacity and timeout.
 3. Cancellation-before-execution support.
 4. FIFO fairness for same-priority requests.
@@ -514,6 +552,10 @@ Exit criteria:
 ### Phase 3: Strict Durable Group Commit
 
 **Goal:** Allow already-ready queued commits to share a physical WAL sync without weakening durable acknowledgement.
+
+**Implementation status:** Complete as of 2026-05-20. WAL sync deferral is
+scoped to the queue executor, successful queued writes are acknowledged only
+after the covering sync path completes, and direct commits are unchanged.
 
 Deliverables:
 
@@ -536,6 +578,11 @@ Exit criteria:
 
 **Goal:** Make the feature operable and prepare for roadmap item #2 observability.
 
+**Implementation status:** Complete as of 2026-05-20. Rust and C ABI metrics
+cover capacity, current depth, admission/rejection, timeout/cancel, execution,
+commit/failure, grouped batches, syncs, maximum group size, covered commits,
+estimated syncs saved, and total queue wait time.
+
 Deliverables:
 
 1. Internal counters for queue depth, admissions, rejections, timeouts, cancellations, executions, commits, failures, syncs, and batch sizes.
@@ -552,6 +599,10 @@ Exit criteria:
 ### Phase 5: C ABI Contract
 
 **Goal:** Expose the queue through the stable shared boundary used by bindings.
+
+**Implementation status:** Complete as of 2026-05-20. ABI v3 adds stable queue
+status codes, open options, `ddb_db_execute_queued`, and
+`ddb_db_write_queue_metrics`; C smoke coverage validates the entry points.
 
 Deliverables:
 
@@ -575,6 +626,15 @@ Candidate C ABI surfaces should be evaluated in the ADR. The final API should no
 ### Phase 6: Maintained Binding Adoption
 
 **Goal:** Update all maintained bindings to fully implement and benefit from the queue contract.
+
+**Implementation status:** Complete for the first public contract as of
+2026-05-20. Python, Go, Dart, Node, and .NET native expose queued helpers and
+metrics where the existing ABI supports them. Go can route `ExecContext` write
+statements through the queue when DSN queue mode is enabled. .NET ADO.NET and
+Java/JDBC expose queue configuration/status mappings and retain direct prepared
+statement execution until a queued prepared-statement ABI exists. Node Knex
+forwards queue options and uses queued execution for unbound write SQL while
+keeping parameterized prepared statements direct.
 
 This phase may be split by language internally, but public completion requires all maintained bindings to pass their adoption tests.
 
@@ -714,6 +774,11 @@ Acceptance:
 
 **Goal:** Prove the feature works consistently across languages.
 
+**Implementation status:** Complete as of 2026-05-20 for available toolchains:
+C, Python, Go, Node, Knex, Dart, .NET, and Java FFM smoke coverage validate the
+queued C ABI or binding-level queued helpers. Java Gradle/JNI validation still
+requires a local JDK install with JNI headers.
+
 Deliverables:
 
 1. Shared test scenario in `tests/bindings`:
@@ -736,6 +801,11 @@ Exit criteria:
 ### Phase 8: Release Docs, Migration Guidance, And Completion Gate
 
 **Goal:** Ship the feature as a coherent contract.
+
+**Implementation status:** Complete as of 2026-05-20. ADR 0162, the Write
+Concurrency user guide, C ABI docs, binding-specific docs, error-code docs,
+benchmark/testing notes, and changelog entries document the delivered contract
+and the direct/queued/async distinction.
 
 Deliverables:
 
@@ -777,6 +847,10 @@ The roadmap item is complete only when all of the following are true:
 16. Cross-binding smoke tests pass.
 17. User docs and binding docs updated.
 18. `FUTURE_WINS.md` is updated to mark the item complete or in progress with accurate source-of-truth links.
+
+The checklist above is satisfied for the delivered self-contained queued SQL
+contract. Future work that needs queued prepared-statement execution should add
+a C ABI for that contract first, then route high-level providers through it.
 
 ---
 

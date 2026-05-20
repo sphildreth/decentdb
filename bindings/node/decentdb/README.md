@@ -13,6 +13,8 @@ Node.js bindings for DecentDB via N-API.
 - version helpers: `Database.abiVersion()`, `Database.version()`
 - timestamp binding via `Statement.bindTimestamp(...)` or `timestampMicros(...)`
 - re-execute helpers for common keyed DML patterns
+- explicit queued write helpers via `Database.execQueued(...)` and
+  `Database.writeQueueMetrics()`
 - GC safety net via `FinalizationRegistry`
 
 ## Quick start
@@ -28,6 +30,25 @@ db.close();
 ```
 
 DecentDB-native uses engine-native placeholders: `$1`, `$2`, ...
+
+## Queued Writes
+
+```js
+const db = new Database({
+  path: 'app.ddb',
+  writeQueueEnabled: true,
+  writeQueueCapacity: 128,
+  writeQueueDefaultTimeoutMs: 1000,
+});
+
+db.exec("CREATE TABLE events (id INT64 PRIMARY KEY, name TEXT)");
+db.execQueued("INSERT INTO events VALUES (1, 'queued')");
+console.log(db.writeQueueMetrics().committed);
+```
+
+`execQueued` currently accepts self-contained SQL without bound parameters.
+Prepared statements and parameterized `exec` calls remain on the direct path
+until the C ABI has a queued prepared-statement contract.
 
 ## Semantic result values
 

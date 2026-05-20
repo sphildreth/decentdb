@@ -50,13 +50,9 @@ void main() {
   // -------------------------------------------------------------------------
   // 2. DDL
   // -------------------------------------------------------------------------
-  db.execute(
-    'CREATE TABLE smoke (id INT64 PRIMARY KEY, name TEXT NOT NULL)',
-  );
+  db.execute('CREATE TABLE smoke (id INT64 PRIMARY KEY, name TEXT NOT NULL)');
   db.execute('CREATE TABLE smoke_audit (msg TEXT)');
-  db.execute(
-    "CREATE VIEW smoke_view AS SELECT id, name FROM smoke",
-  );
+  db.execute("CREATE VIEW smoke_view AS SELECT id, name FROM smoke");
   db.execute(
     "CREATE TRIGGER smoke_ai AFTER INSERT ON smoke FOR EACH ROW EXECUTE FUNCTION decentdb_exec_sql('INSERT INTO smoke_audit VALUES (''inserted'')')",
   );
@@ -71,7 +67,9 @@ void main() {
       [2, 'reuse'],
     ]);
     _check(
-        affected == 2, 'executeBatchTyped should affect 2 rows, got $affected');
+      affected == 2,
+      'executeBatchTyped should affect 2 rows, got $affected',
+    );
   } finally {
     insert.dispose();
   }
@@ -112,8 +110,10 @@ void main() {
     final page3 = pageStmt.nextPage(1);
     _check(page1.rows.length == 1, 'page1 should have 1 row');
     _check(page2.rows.length == 1, 'page2 should have 1 row');
-    _check(page2.isLast == false,
-        'page2 should not report last at exact boundary');
+    _check(
+      page2.isLast == false,
+      'page2 should not report last at exact boundary',
+    );
     _check(page3.rows.isEmpty, 'page3 should be empty');
     _check(page3.isLast, 'page3 should be last');
   } finally {
@@ -142,6 +142,18 @@ void main() {
   final cnt2 = db.query('SELECT COUNT(*) AS n FROM smoke').single['n'] as int;
   _check(cnt2 == 3, 'expected 3 rows after committed transaction, got $cnt2');
 
+  final queuedAffected = db.executeQueued(
+    "INSERT INTO smoke VALUES (5, 'queued')",
+  );
+  _check(queuedAffected == 1, 'queued insert affected $queuedAffected rows');
+  final queueMetrics = db.writeQueueMetrics();
+  _check(queueMetrics['admitted'] == 1, 'queued admitted metric mismatch');
+  _check(queueMetrics['committed'] == 1, 'queued committed metric mismatch');
+  _check(queueMetrics['failed'] == 0, 'queued failed metric mismatch');
+  final cntQueued =
+      db.query('SELECT COUNT(*) AS n FROM smoke').single['n'] as int;
+  _check(cntQueued == 4, 'expected 4 rows after queued insert, got $cntQueued');
+
   // -------------------------------------------------------------------------
   // 9. transaction() helper – rollback on exception
   // -------------------------------------------------------------------------
@@ -154,7 +166,7 @@ void main() {
     // expected
   }
   final cnt3 = db.query('SELECT COUNT(*) AS n FROM smoke').single['n'] as int;
-  _check(cnt3 == 3, 'expected 3 rows after failed transaction, got $cnt3');
+  _check(cnt3 == 4, 'expected 4 rows after failed transaction, got $cnt3');
 
   // -------------------------------------------------------------------------
   // 10. Error handling – bad SQL produces DecentDbException with sql error code
@@ -182,8 +194,10 @@ void main() {
   final typedInsert = db.prepare(r'INSERT INTO typed VALUES ($1, $2, $3, $4)');
   final blobIn = Uint8List.fromList([0xDE, 0xAD, 0xBE, 0xEF]);
   final decIn = const DecimalValue(99999, 3);
-  final tsIn =
-      DateTime.fromMicrosecondsSinceEpoch(1711540800000000, isUtc: true);
+  final tsIn = DateTime.fromMicrosecondsSinceEpoch(
+    1711540800000000,
+    isUtc: true,
+  );
   try {
     typedInsert.bindInt64(1, 1);
     typedInsert.bindBlob(2, blobIn);
@@ -194,8 +208,9 @@ void main() {
     typedInsert.dispose();
   }
 
-  final typedRow =
-      db.query('SELECT blob, dec, ts FROM typed WHERE id = 1').single;
+  final typedRow = db
+      .query('SELECT blob, dec, ts FROM typed WHERE id = 1')
+      .single;
   _check(
     (typedRow['blob'] as Uint8List).toString() == blobIn.toString(),
     'blob round-trip failed',

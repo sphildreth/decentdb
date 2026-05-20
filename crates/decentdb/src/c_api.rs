@@ -5,13 +5,15 @@ use std::ffi::{c_char, CStr, CString};
 use std::panic::{self, AssertUnwindSafe};
 use std::ptr;
 use std::str::FromStr;
+use std::time::Duration;
 
 use crate::db::PreparedStatement;
 use crate::error::{DbError, DbErrorCode, Result};
-use crate::{evict_shared_wal, Db, DbConfig, QueryResult, Value};
+use crate::{evict_shared_wal, Db, DbConfig, QueryResult, QueuedWriteOptions, Value};
 
 const DDB_OK: u32 = 0;
-const DDB_ABI_VERSION: u32 = 2;
+const DDB_ABI_VERSION: u32 = 3;
+const DDB_WRITE_QUEUE_TIMEOUT_DEFAULT: u64 = u64::MAX;
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -64,6 +66,26 @@ pub struct DdbValue {
     pub interval_months: i32,
     pub interval_days: i32,
     pub interval_micros: i64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DdbWriteQueueMetrics {
+    pub capacity: usize,
+    pub current_depth: usize,
+    pub admitted: u64,
+    pub rejected: u64,
+    pub timed_out: u64,
+    pub canceled: u64,
+    pub executed: u64,
+    pub committed: u64,
+    pub failed: u64,
+    pub group_commit_batches: u64,
+    pub group_commit_syncs: u64,
+    pub group_commit_max_batch: u64,
+    pub group_commit_commits_covered: u64,
+    pub physical_syncs_saved: u64,
+    pub total_queue_wait_ns: u64,
 }
 
 impl Default for DdbValue {
@@ -1135,6 +1157,14 @@ fn parse_u64_option(value: &str, key: &str) -> Result<u64> {
     })
 }
 
+fn parse_usize_option(value: &str, key: &str) -> Result<usize> {
+    value.trim().parse::<usize>().map_err(|_| {
+        DbError::sql(format!(
+            "invalid unsigned integer value for option {key}: {value}"
+        ))
+    })
+}
+
 fn parse_cache_size_mb_option(value: &str, page_size: u32) -> Result<usize> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -1215,6 +1245,24 @@ fn db_config_from_options(options: Option<&str>) -> Result<DbConfig> {
             }
             "wal_checkpoint_threshold_bytes" => {
                 config.wal_checkpoint_threshold_bytes = parse_u64_option(value, key.as_str())?;
+            }
+            "write_queue_enabled" => {
+                config.write_queue_enabled = parse_bool_option(value, key.as_str())?;
+            }
+            "write_queue_capacity" => {
+                config.write_queue_capacity = parse_usize_option(value, key.as_str())?.max(1);
+            }
+            "write_queue_default_timeout_ms" => {
+                config.write_queue_default_timeout_ms = parse_u64_option(value, key.as_str())?;
+            }
+            "write_queue_strict_group_commit" | "write_queue_group_commit" => {
+                config.write_queue_strict_group_commit = parse_bool_option(value, key.as_str())?;
+            }
+            "write_queue_max_batch" => {
+                config.write_queue_max_batch = parse_usize_option(value, key.as_str())?.max(1);
+            }
+            "write_queue_max_group_delay_us" => {
+                config.write_queue_max_group_delay_us = parse_u64_option(value, key.as_str())?;
             }
             _ => {
                 return Err(DbError::sql(format!("unsupported database option: {key}")));
@@ -1682,6 +1730,81 @@ pub extern "C" fn ddb_db_execute(
             .collect::<Result<Vec<_>>>()?;
         let result = db.db.execute_with_params(&sql, &rust_params)?;
         *out_ptr(out_result, "out_result")? = Box::into_raw(Box::new(ResultHandle { result }));
+        Ok(())
+    })
+}
+
+#[no_mangle]
+/// Executes SQL through the engine-owned write queue.
+///
+/// Pass `UINT64_MAX` for `timeout_ms` to use the database's configured
+/// default queue timeout. Pass `0` for immediate timeout behavior.
+/// Call `ddb_result_free` exactly once for each successful call.
+pub extern "C" fn ddb_db_execute_queued(
+    db: *mut DbHandle,
+    sql: *const c_char,
+    params: *const DdbValue,
+    params_len: usize,
+    timeout_ms: u64,
+    out_result: *mut *mut ResultHandle,
+) -> u32 {
+    ffi_boundary(|| {
+        let db = handle_ref(db, "db")?;
+        let sql = utf8_arg(sql, "sql")?;
+        let rust_params = params_slice(params, params_len)?
+            .iter()
+            .map(value_from_ffi)
+            .collect::<Result<Vec<_>>>()?;
+        let timeout = if timeout_ms == DDB_WRITE_QUEUE_TIMEOUT_DEFAULT {
+            None
+        } else {
+            Some(Duration::from_millis(timeout_ms))
+        };
+        let mut result = db.db.execute_queued_batch_with_options(
+            &sql,
+            &rust_params,
+            QueuedWriteOptions {
+                timeout,
+                cancel_token: None,
+            },
+        )?;
+        if result.len() != 1 {
+            return Err(DbError::sql(format!(
+                "expected exactly one SQL statement, got {}",
+                result.len()
+            )));
+        }
+        *out_ptr(out_result, "out_result")? = Box::into_raw(Box::new(ResultHandle {
+            result: result.remove(0),
+        }));
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_db_write_queue_metrics(
+    db: *mut DbHandle,
+    out_metrics: *mut DdbWriteQueueMetrics,
+) -> u32 {
+    ffi_boundary(|| {
+        let metrics = handle_ref(db, "db")?.db.write_queue_metrics();
+        *out_ptr(out_metrics, "out_metrics")? = DdbWriteQueueMetrics {
+            capacity: metrics.capacity,
+            current_depth: metrics.current_depth,
+            admitted: metrics.admitted,
+            rejected: metrics.rejected,
+            timed_out: metrics.timed_out,
+            canceled: metrics.canceled,
+            executed: metrics.executed,
+            committed: metrics.committed,
+            failed: metrics.failed,
+            group_commit_batches: metrics.group_commit_batches,
+            group_commit_syncs: metrics.group_commit_syncs,
+            group_commit_max_batch: metrics.group_commit_max_batch,
+            group_commit_commits_covered: metrics.group_commit_commits_covered,
+            physical_syncs_saved: metrics.physical_syncs_saved,
+            total_queue_wait_ns: metrics.total_queue_wait_ns,
+        };
         Ok(())
     })
 }
@@ -2914,8 +3037,18 @@ mod tests {
     #[test]
     fn abi_shape_matches_expected_layout() {
         let _execute: ExecuteFn = ddb_db_execute;
+        let _execute_queued: extern "C" fn(
+            *mut DbHandle,
+            *const c_char,
+            *const DdbValue,
+            usize,
+            u64,
+            *mut *mut ResultHandle,
+        ) -> u32 = ddb_db_execute_queued;
         assert_eq!(std::mem::size_of::<DdbValue>(), 168);
         assert_eq!(std::mem::align_of::<DdbValue>(), 8);
+        assert_eq!(std::mem::size_of::<DdbWriteQueueMetrics>(), 120);
+        assert_eq!(std::mem::align_of::<DdbWriteQueueMetrics>(), 8);
     }
 
     #[test]
@@ -2926,7 +3059,7 @@ mod tests {
     #[test]
     fn db_config_options_parse_tuned_profile() {
         let config = db_config_from_options(Some(
-            "cache_size=64MB;retain_paged_row_sources_after_commit=true;paged_row_storage=false;wal_autocheckpoint=0",
+            "cache_size=64MB;retain_paged_row_sources_after_commit=true;paged_row_storage=false;wal_autocheckpoint=0;write_queue_enabled=true;write_queue_capacity=17;write_queue_default_timeout_ms=25;write_queue_strict_group_commit=true;write_queue_max_batch=9;write_queue_max_group_delay_us=1000",
         ))
         .expect("options should parse");
         assert_eq!(config.cache_size_mb, 64);
@@ -2934,6 +3067,12 @@ mod tests {
         assert!(!config.paged_row_storage);
         assert_eq!(config.wal_checkpoint_threshold_pages, 0);
         assert_eq!(config.wal_checkpoint_threshold_bytes, 0);
+        assert!(config.write_queue_enabled);
+        assert_eq!(config.write_queue_capacity, 17);
+        assert_eq!(config.write_queue_default_timeout_ms, 25);
+        assert!(config.write_queue_strict_group_commit);
+        assert_eq!(config.write_queue_max_batch, 9);
+        assert_eq!(config.write_queue_max_group_delay_us, 1000);
     }
 
     #[test]
@@ -2971,6 +3110,46 @@ mod tests {
         assert_eq!(ddb_result_free(&mut result), DDB_OK);
         assert_eq!(ddb_result_free(&mut result), DDB_OK);
         assert_eq!(ddb_db_free(&mut db), DDB_OK);
+        assert_eq!(ddb_db_free(&mut db), DDB_OK);
+    }
+
+    #[test]
+    fn ddb_db_execute_queued_updates_queue_metrics() {
+        let mut db = ptr::null_mut();
+        let path = CString::new(":memory:").expect("path");
+        assert_eq!(ddb_db_open_or_create(path.as_ptr(), &mut db), DDB_OK);
+
+        let create =
+            CString::new("CREATE TABLE queued_items (id INTEGER PRIMARY KEY)").expect("sql");
+        let mut result = ptr::null_mut();
+        assert_eq!(
+            ddb_db_execute(db, create.as_ptr(), ptr::null(), 0, &mut result),
+            DDB_OK
+        );
+        assert_eq!(ddb_result_free(&mut result), DDB_OK);
+
+        let insert = CString::new("INSERT INTO queued_items (id) VALUES (1)").expect("sql");
+        assert_eq!(
+            ddb_db_execute_queued(
+                db,
+                insert.as_ptr(),
+                ptr::null(),
+                0,
+                DDB_WRITE_QUEUE_TIMEOUT_DEFAULT,
+                &mut result,
+            ),
+            DDB_OK,
+            "queued execute failed: {:?}",
+            unsafe { CStr::from_ptr(ddb_last_error_message()) }
+        );
+        assert_eq!(ddb_result_free(&mut result), DDB_OK);
+
+        let mut metrics = DdbWriteQueueMetrics::default();
+        assert_eq!(ddb_db_write_queue_metrics(db, &mut metrics), DDB_OK);
+        assert_eq!(metrics.admitted, 1);
+        assert_eq!(metrics.executed, 1);
+        assert_eq!(metrics.committed, 1);
+        assert_eq!(metrics.failed, 0);
         assert_eq!(ddb_db_free(&mut db), DDB_OK);
     }
 

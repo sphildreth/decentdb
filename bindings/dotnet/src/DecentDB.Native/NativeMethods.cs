@@ -369,6 +369,44 @@ public static unsafe class DecentDBNativeUnsafe
 
     [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_stmt_rebind_int64_text_execute")]
     internal static extern uint ddb_stmt_rebind_int64_text_execute(IntPtr stmt, long intValue, byte* text, nuint textLen, out ulong outAffected);
+
+    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_db_execute_queued")]
+    internal static extern uint ddb_db_execute_queued(
+        IntPtr db,
+        byte* sqlUtf8,
+        DdbValueNative* parameters,
+        nuint parametersLen,
+        ulong timeoutMs,
+        out IntPtr outResult);
+
+    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_result_affected_rows")]
+    internal static extern uint ddb_result_affected_rows(IntPtr result, out ulong outRows);
+
+    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_result_free")]
+    internal static extern uint ddb_result_free(ref IntPtr result);
+
+    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_db_write_queue_metrics")]
+    internal static extern uint ddb_db_write_queue_metrics(IntPtr db, out DdbWriteQueueMetrics metrics);
+}
+
+[StructLayout(LayoutKind.Sequential)]
+public struct DdbWriteQueueMetrics
+{
+    public nuint Capacity;
+    public nuint CurrentDepth;
+    public ulong Admitted;
+    public ulong Rejected;
+    public ulong TimedOut;
+    public ulong Canceled;
+    public ulong Executed;
+    public ulong Committed;
+    public ulong Failed;
+    public ulong GroupCommitBatches;
+    public ulong GroupCommitSyncs;
+    public ulong GroupCommitMaxBatch;
+    public ulong GroupCommitCommitsCovered;
+    public ulong PhysicalSyncsSaved;
+    public ulong TotalQueueWaitNs;
 }
 
 internal enum DdbValueTag : uint

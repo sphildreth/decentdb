@@ -60,11 +60,11 @@ void main() {
       }
     });
 
-    test('rejects unsupported native open options', () {
+    test('surfaces unsupported native open options from the engine', () {
       expect(
         () => Database.open(':memory:',
             libraryPath: libPath, options: 'cache_mb=8'),
-        throwsArgumentError,
+        throwsA(isA<DecentDbException>()),
       );
     });
 

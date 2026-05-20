@@ -16,7 +16,7 @@ use decentdb::benchmark::{
     reset_read_path_counters, snapshot_vfs_stats, take_read_path_counters, ReadPathCounters,
     VfsStats, VfsStatsScope,
 };
-use decentdb::{Db, DbConfig, QueryResult, Value, WalSyncMode};
+use decentdb::{Db, DbConfig, QueryResult, Value, WalSyncMode, WriteQueueMetricsSnapshot};
 
 use crate::cli::{ColdPointLookupProbeArgs, InternalCommand, RecoveryReopenProbeArgs};
 use crate::profiles::ResolvedProfile;
@@ -45,6 +45,10 @@ pub(crate) fn run_scenario(
         ScenarioId::Checkpoint => checkpoint(profile, scenario_scratch),
         ScenarioId::RecoveryReopen => recovery_reopen(profile, scenario_scratch),
         ScenarioId::ReadUnderWrite => read_under_write(profile, scenario_scratch),
+        ScenarioId::QueuedWriterSingle => queued_writer_single(profile, scenario_scratch),
+        ScenarioId::QueuedWriterReadUnderWrite => {
+            queued_writer_read_under_write(profile, scenario_scratch)
+        }
         ScenarioId::StorageEfficiency => storage_efficiency(profile, scenario_scratch),
         ScenarioId::MemoryFootprint => memory_footprint(profile, scenario_scratch),
     }
@@ -565,6 +569,325 @@ fn durable_commit_batch(
         ],
         scale: profile.scale_json(),
         histograms: Some(commit_summary),
+        vfs_stats: vfs_stats_accum.map(vfs_stats_to_json),
+        artifacts: Vec::new(),
+    })
+}
+
+fn queued_writer_single(
+    profile: &ResolvedProfile,
+    scenario_scratch: &Path,
+) -> Result<ScenarioResult> {
+    let mut queued_collector = LatencyCollector::new()?;
+    let mut vfs_stats_accum = None;
+    let mut queue_metrics = WriteQueueMetricsSnapshot::default();
+    let measured_writes_per_trial = profile.writer_ops.max(profile.durable_commits).max(1);
+    let mut total_rows_written = 0_u64;
+
+    for trial in 0..profile.trials {
+        let trial_dir = scenario_scratch.join(format!("trial-{}", trial + 1));
+        fs::create_dir_all(&trial_dir)
+            .with_context(|| format!("create queued writer trial dir {}", trial_dir.display()))?;
+        let db_path = trial_dir.join("queued_writer_single.ddb");
+
+        let config = real_fs_write_queue_config(&trial_dir, 0);
+        let db = Db::open_or_create(&db_path, config).with_context(|| {
+            format!(
+                "open or create queued_writer_single database {}",
+                db_path.display()
+            )
+        })?;
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS bench_queued_writer (id INT64 PRIMARY KEY, payload TEXT NOT NULL)",
+        )?;
+
+        let trial_base = u64::from(trial)
+            .saturating_mul(profile.warmup_ops.saturating_add(measured_writes_per_trial))
+            .saturating_add(1);
+        for offset in 0..profile.warmup_ops {
+            let id = to_i64(trial_base.saturating_add(offset))?;
+            let params = [
+                Value::Int64(id),
+                Value::Text(format!("queued-warmup-{trial}-{offset}")),
+            ];
+            db.execute_queued_with_params(
+                "INSERT INTO bench_queued_writer (id, payload) VALUES ($1, $2)",
+                &params,
+            )?;
+        }
+
+        let trial_vfs_stats = {
+            let _vfs_scope = VfsStatsScope::begin(true);
+            for offset in 0..measured_writes_per_trial {
+                let id = to_i64(
+                    trial_base
+                        .saturating_add(profile.warmup_ops)
+                        .saturating_add(offset),
+                )?;
+                let params = [
+                    Value::Int64(id),
+                    Value::Text(format!("queued-single-{trial}-{offset}")),
+                ];
+                let started = Instant::now();
+                db.execute_queued_with_params(
+                    "INSERT INTO bench_queued_writer (id, payload) VALUES ($1, $2)",
+                    &params,
+                )?;
+                queued_collector.record(started.elapsed())?;
+                total_rows_written = total_rows_written.saturating_add(1);
+            }
+            snapshot_vfs_stats()
+        };
+        add_vfs_stats(&mut vfs_stats_accum, trial_vfs_stats);
+
+        let expected_rows = profile.warmup_ops.saturating_add(measured_writes_per_trial);
+        let count = extract_single_count(db.execute("SELECT COUNT(*) FROM bench_queued_writer")?)?;
+        if count != expected_rows {
+            return Err(anyhow!(
+                "queued_writer_single expected {expected_rows} rows, found {count}"
+            ));
+        }
+        add_write_queue_snapshot(&mut queue_metrics, &db.write_queue_metrics());
+        db.checkpoint()?;
+    }
+
+    let summary = queued_collector.summary();
+    let mut metrics = BTreeMap::new();
+    metrics.insert("queued_write_p50_us".to_string(), json!(summary.p50_us));
+    metrics.insert("queued_write_p95_us".to_string(), json!(summary.p95_us));
+    metrics.insert("queued_write_p99_us".to_string(), json!(summary.p99_us));
+    metrics.insert("queued_write_max_us".to_string(), json!(summary.max_us));
+    metrics.insert("queued_write_mean_us".to_string(), json!(summary.mean_us));
+    metrics.insert(
+        "queued_write_stddev_us".to_string(),
+        json!(summary.stddev_us),
+    );
+    metrics.insert(
+        "queued_writes_measured".to_string(),
+        json!(summary.sample_count),
+    );
+    metrics.insert(
+        "queued_writes_per_sec".to_string(),
+        json!(queued_collector.ops_per_sec()),
+    );
+    metrics.insert("rows_written".to_string(), json!(total_rows_written));
+    metrics.insert(
+        "warmup_writes_per_trial".to_string(),
+        json!(profile.warmup_ops),
+    );
+    insert_write_queue_metrics(&mut metrics, &queue_metrics);
+    if let Some(vfs) = vfs_stats_accum {
+        let total = vfs.total();
+        let writes = summary.sample_count.max(1) as f64;
+        metrics.insert(
+            "bytes_written_per_queued_write".to_string(),
+            json!(total.bytes_written as f64 / writes),
+        );
+        metrics.insert(
+            "write_calls_per_queued_write".to_string(),
+            json!(total.write_calls as f64 / writes),
+        );
+        metrics.insert(
+            "fsyncs_per_queued_write".to_string(),
+            json!(total.sync_calls() as f64 / writes),
+        );
+    }
+
+    Ok(ScenarioResult {
+        status: ScenarioStatus::Passed,
+        error_class: None,
+        scenario_id: ScenarioId::QueuedWriterSingle,
+        profile: profile.kind,
+        workload: ScenarioId::QueuedWriterSingle.default_workload().to_string(),
+        durability_mode: "full".to_string(),
+        cache_mode: "real_fs".to_string(),
+        trial_count: profile.trials,
+        metrics,
+        warnings: Vec::new(),
+        notes: vec![
+            "Queued single-writer workload uses the engine-owned write queue with zero group delay."
+                .to_string(),
+            "Each measured operation is one durable queued INSERT acknowledged after strict group commit."
+                .to_string(),
+        ],
+        scale: profile.scale_json(),
+        histograms: Some(summary),
+        vfs_stats: vfs_stats_accum.map(vfs_stats_to_json),
+        artifacts: Vec::new(),
+    })
+}
+
+fn queued_writer_read_under_write(
+    profile: &ResolvedProfile,
+    scenario_scratch: &Path,
+) -> Result<ScenarioResult> {
+    let mut reader_agg = LatencyCollector::new()?;
+    let mut writer_agg = LatencyCollector::new()?;
+    let mut vfs_stats_accum = None;
+    let mut queue_metrics = WriteQueueMetricsSnapshot::default();
+    let mut read_counters = ReadPathCounters::default();
+
+    let writer_threads = profile.reader_threads.max(2);
+    let reader_threads = profile.reader_threads.max(1);
+    let measured_writes_per_trial = profile.writer_ops.max(u64::from(writer_threads)).max(1);
+    let measured_reads_per_trial = profile.point_reads.max(u64::from(reader_threads)).max(1);
+
+    for trial in 0..profile.trials {
+        let trial_dir = scenario_scratch.join(format!("trial-{}", trial + 1));
+        fs::create_dir_all(&trial_dir).with_context(|| {
+            format!(
+                "create queued writer read-under-write trial dir {}",
+                trial_dir.display()
+            )
+        })?;
+        let db_path = trial_dir.join("queued_writer_read_under_write.ddb");
+        let config = real_fs_write_queue_config(&trial_dir, 500);
+        let db = Db::open_or_create(&db_path, config).with_context(|| {
+            format!(
+                "open or create queued_writer_read_under_write database {}",
+                db_path.display()
+            )
+        })?;
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS bench_queued_rw (id INT64 PRIMARY KEY, payload TEXT NOT NULL)",
+        )?;
+        seed_queued_rw_table(&db, profile.rows.max(1), profile.batch_size.max(1))?;
+
+        reset_read_path_counters();
+        let trial_vfs_stats = {
+            let _vfs_scope = VfsStatsScope::begin(true);
+            let (reader_trial, writer_trial) = run_queued_rw_threads(
+                db.clone(),
+                db_path.clone(),
+                profile,
+                QueuedRwThreadPlan {
+                    trial,
+                    reader_threads,
+                    writer_threads,
+                    read_ops: measured_reads_per_trial,
+                    write_ops: measured_writes_per_trial,
+                },
+            )?;
+            reader_agg.merge(reader_trial)?;
+            writer_agg.merge(writer_trial)?;
+            snapshot_vfs_stats()
+        };
+        add_vfs_stats(&mut vfs_stats_accum, trial_vfs_stats);
+        add_read_path_counters(&mut read_counters, take_read_path_counters());
+
+        let expected_rows = profile
+            .rows
+            .max(1)
+            .saturating_add(measured_writes_per_trial);
+        let count = extract_single_count(db.execute("SELECT COUNT(*) FROM bench_queued_rw")?)?;
+        if count != expected_rows {
+            return Err(anyhow!(
+                "queued_writer_read_under_write expected {expected_rows} rows, found {count}"
+            ));
+        }
+        add_write_queue_snapshot(&mut queue_metrics, &db.write_queue_metrics());
+        db.checkpoint()?;
+    }
+
+    let reader_summary = reader_agg.summary();
+    let writer_summary = writer_agg.summary();
+    let mut metrics = BTreeMap::new();
+    metrics.insert(
+        "queued_reader_p50_us".to_string(),
+        json!(reader_summary.p50_us),
+    );
+    metrics.insert(
+        "queued_reader_p95_us".to_string(),
+        json!(reader_summary.p95_us),
+    );
+    metrics.insert(
+        "queued_reader_p99_us".to_string(),
+        json!(reader_summary.p99_us),
+    );
+    metrics.insert(
+        "queued_reader_max_us".to_string(),
+        json!(reader_summary.max_us),
+    );
+    metrics.insert(
+        "queued_writer_p50_us".to_string(),
+        json!(writer_summary.p50_us),
+    );
+    metrics.insert(
+        "queued_writer_p95_us".to_string(),
+        json!(writer_summary.p95_us),
+    );
+    metrics.insert(
+        "queued_writer_p99_us".to_string(),
+        json!(writer_summary.p99_us),
+    );
+    metrics.insert(
+        "queued_writer_max_us".to_string(),
+        json!(writer_summary.max_us),
+    );
+    metrics.insert(
+        "queued_writer_ops_per_sec".to_string(),
+        json!(writer_agg.ops_per_sec()),
+    );
+    metrics.insert(
+        "queued_reader_ops_per_sec".to_string(),
+        json!(reader_agg.ops_per_sec()),
+    );
+    metrics.insert("reader_threads".to_string(), json!(reader_threads));
+    metrics.insert("writer_threads".to_string(), json!(writer_threads));
+    metrics.insert(
+        "queued_writes_measured".to_string(),
+        json!(writer_summary.sample_count),
+    );
+    metrics.insert(
+        "reads_measured".to_string(),
+        json!(reader_summary.sample_count),
+    );
+    insert_write_queue_metrics(&mut metrics, &queue_metrics);
+    insert_read_path_counter_metrics(
+        &mut metrics,
+        "queued_reader_under_write",
+        read_counters,
+        reader_summary
+            .sample_count
+            .saturating_add(writer_summary.sample_count),
+        "per_measured_operation",
+    );
+    if let Some(vfs) = vfs_stats_accum {
+        let total = vfs.total();
+        let writes = writer_summary.sample_count.max(1) as f64;
+        metrics.insert(
+            "bytes_written_per_queued_write".to_string(),
+            json!(total.bytes_written as f64 / writes),
+        );
+        metrics.insert(
+            "fsyncs_per_queued_write".to_string(),
+            json!(total.sync_calls() as f64 / writes),
+        );
+    }
+
+    Ok(ScenarioResult {
+        status: ScenarioStatus::Passed,
+        error_class: None,
+        scenario_id: ScenarioId::QueuedWriterReadUnderWrite,
+        profile: profile.kind,
+        workload: ScenarioId::QueuedWriterReadUnderWrite
+            .default_workload()
+            .to_string(),
+        durability_mode: "full".to_string(),
+        cache_mode: "warm_cache".to_string(),
+        trial_count: profile.trials,
+        metrics,
+        warnings: Vec::new(),
+        notes: vec![
+            "Concurrent queued writer threads share one cloned Db handle and one engine-owned write queue."
+                .to_string(),
+            "Reader threads issue indexed point reads while queued writers perform durable INSERTs."
+                .to_string(),
+            "A 500us group-delay setting is used here to make bursty strict group-commit batching observable."
+                .to_string(),
+        ],
+        scale: profile.scale_json(),
+        histograms: Some(writer_summary),
         vfs_stats: vfs_stats_accum.map(vfs_stats_to_json),
         artifacts: Vec::new(),
     })
@@ -2106,6 +2429,204 @@ fn insert_read_path_counter_metrics(
     );
 }
 
+fn seed_queued_rw_table(db: &Db, rows: u64, batch_size: u64) -> Result<()> {
+    let mut inserted = 0_u64;
+    while inserted < rows {
+        let mut txn = db.transaction()?;
+        let insert =
+            txn.prepare("INSERT INTO bench_queued_rw (id, payload) VALUES ($1, 'queued-seed')")?;
+        let end = (inserted + batch_size).min(rows);
+        while inserted < end {
+            inserted = inserted.saturating_add(1);
+            insert.execute_in(&mut txn, &[Value::Int64(to_i64(inserted)?)])?;
+        }
+        txn.commit()?;
+    }
+    db.checkpoint()?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct QueuedRwThreadPlan {
+    trial: u32,
+    reader_threads: u32,
+    writer_threads: u32,
+    read_ops: u64,
+    write_ops: u64,
+}
+
+fn run_queued_rw_threads(
+    db: Db,
+    db_path: PathBuf,
+    profile: &ResolvedProfile,
+    plan: QueuedRwThreadPlan,
+) -> Result<(LatencyCollector, LatencyCollector)> {
+    let participant_count = plan
+        .reader_threads
+        .saturating_add(plan.writer_threads)
+        .max(1);
+    let barrier = Arc::new(Barrier::new(participant_count as usize));
+    let mut reader_handles = Vec::with_capacity(plan.reader_threads as usize);
+    let mut writer_handles = Vec::with_capacity(plan.writer_threads as usize);
+
+    for thread_index in 0..plan.writer_threads {
+        let writer_db = db.clone();
+        let writer_barrier = Arc::clone(&barrier);
+        let (start_op, op_count) = split_ops(plan.write_ops, plan.writer_threads, thread_index);
+        let base_id = profile.rows.max(1);
+        let trial = plan.trial;
+        writer_handles.push(thread::spawn(move || -> Result<LatencyCollector> {
+            let mut collector = LatencyCollector::new()?;
+            writer_barrier.wait();
+            for offset in 0..op_count {
+                let op = start_op.saturating_add(offset);
+                let id = base_id.saturating_add(op).saturating_add(1);
+                let params = [
+                    Value::Int64(to_i64(id)?),
+                    Value::Text(format!("queued-rw-{trial}-{thread_index}-{offset}")),
+                ];
+                let started = Instant::now();
+                writer_db.execute_queued_with_params(
+                    "INSERT INTO bench_queued_rw (id, payload) VALUES ($1, $2)",
+                    &params,
+                )?;
+                collector.record(started.elapsed())?;
+            }
+            Ok(collector)
+        }));
+    }
+
+    for thread_index in 0..plan.reader_threads {
+        let reader_path = db_path.clone();
+        let reader_barrier = Arc::clone(&barrier);
+        let (start_op, op_count) = split_ops(plan.read_ops, plan.reader_threads, thread_index);
+        let seed = profile.seed;
+        let rows = profile.rows.max(1);
+        let trial = plan.trial;
+        reader_handles.push(thread::spawn(move || -> Result<LatencyCollector> {
+            let reader_db = Db::open(
+                &reader_path,
+                real_fs_full_durability_config(path_parent(&reader_path)?),
+            )
+            .with_context(|| {
+                format!(
+                    "open queued read-under-write reader database {}",
+                    reader_path.display()
+                )
+            })?;
+            let select = reader_db.prepare("SELECT payload FROM bench_queued_rw WHERE id = $1")?;
+            let mut collector = LatencyCollector::new()?;
+            reader_barrier.wait();
+            for offset in 0..op_count {
+                let op = start_op.saturating_add(offset);
+                let key = deterministic_id(seed ^ 0x5151_f00d, op, rows, trial);
+                let started = Instant::now();
+                let result = select.execute(&[Value::Int64(to_i64(key)?)])?;
+                validate_single_row(&result, "queued read-under-write reader lookup")?;
+                collector.record(started.elapsed())?;
+            }
+            Ok(collector)
+        }));
+    }
+
+    let mut writer_agg = LatencyCollector::new()?;
+    for handle in writer_handles {
+        let collector = handle
+            .join()
+            .map_err(|_| anyhow!("queued writer thread panicked"))??;
+        writer_agg.merge(collector)?;
+    }
+
+    let mut reader_agg = LatencyCollector::new()?;
+    for handle in reader_handles {
+        let collector = handle
+            .join()
+            .map_err(|_| anyhow!("queued reader thread panicked"))??;
+        reader_agg.merge(collector)?;
+    }
+
+    Ok((reader_agg, writer_agg))
+}
+
+fn add_write_queue_snapshot(
+    total: &mut WriteQueueMetricsSnapshot,
+    sample: &WriteQueueMetricsSnapshot,
+) {
+    total.capacity = total.capacity.max(sample.capacity);
+    total.current_depth = total.current_depth.max(sample.current_depth);
+    total.admitted = total.admitted.saturating_add(sample.admitted);
+    total.rejected = total.rejected.saturating_add(sample.rejected);
+    total.timed_out = total.timed_out.saturating_add(sample.timed_out);
+    total.canceled = total.canceled.saturating_add(sample.canceled);
+    total.executed = total.executed.saturating_add(sample.executed);
+    total.committed = total.committed.saturating_add(sample.committed);
+    total.failed = total.failed.saturating_add(sample.failed);
+    total.group_commit_batches = total
+        .group_commit_batches
+        .saturating_add(sample.group_commit_batches);
+    total.group_commit_syncs = total
+        .group_commit_syncs
+        .saturating_add(sample.group_commit_syncs);
+    total.group_commit_max_batch = total
+        .group_commit_max_batch
+        .max(sample.group_commit_max_batch);
+    total.group_commit_commits_covered = total
+        .group_commit_commits_covered
+        .saturating_add(sample.group_commit_commits_covered);
+    total.physical_syncs_saved = total
+        .physical_syncs_saved
+        .saturating_add(sample.physical_syncs_saved);
+    total.total_queue_wait_ns = total
+        .total_queue_wait_ns
+        .saturating_add(sample.total_queue_wait_ns);
+}
+
+fn insert_write_queue_metrics(
+    metrics: &mut BTreeMap<String, serde_json::Value>,
+    snapshot: &WriteQueueMetricsSnapshot,
+) {
+    metrics.insert("queue_capacity".to_string(), json!(snapshot.capacity));
+    metrics.insert(
+        "queue_depth_max_observed".to_string(),
+        json!(snapshot.current_depth),
+    );
+    metrics.insert("queue_admitted".to_string(), json!(snapshot.admitted));
+    metrics.insert("queue_rejected".to_string(), json!(snapshot.rejected));
+    metrics.insert("queue_timed_out".to_string(), json!(snapshot.timed_out));
+    metrics.insert("queue_canceled".to_string(), json!(snapshot.canceled));
+    metrics.insert("queue_executed".to_string(), json!(snapshot.executed));
+    metrics.insert("queue_committed".to_string(), json!(snapshot.committed));
+    metrics.insert("queue_failed".to_string(), json!(snapshot.failed));
+    metrics.insert(
+        "queue_group_commit_batches".to_string(),
+        json!(snapshot.group_commit_batches),
+    );
+    metrics.insert(
+        "queue_group_commit_syncs".to_string(),
+        json!(snapshot.group_commit_syncs),
+    );
+    metrics.insert(
+        "queue_group_commit_max_batch".to_string(),
+        json!(snapshot.group_commit_max_batch),
+    );
+    metrics.insert(
+        "queue_group_commit_commits_covered".to_string(),
+        json!(snapshot.group_commit_commits_covered),
+    );
+    metrics.insert(
+        "queue_physical_syncs_saved".to_string(),
+        json!(snapshot.physical_syncs_saved),
+    );
+    metrics.insert(
+        "queue_avg_wait_us".to_string(),
+        json!(if snapshot.admitted == 0 {
+            0.0
+        } else {
+            ns_to_us_f64(snapshot.total_queue_wait_ns as f64 / snapshot.admitted as f64)
+        }),
+    );
+}
+
 fn storage_efficiency(
     profile: &ResolvedProfile,
     scenario_scratch: &Path,
@@ -2948,6 +3469,20 @@ fn real_fs_full_durability_config(temp_dir: &Path) -> DbConfig {
     }
 }
 
+fn real_fs_write_queue_config(temp_dir: &Path, max_group_delay_us: u64) -> DbConfig {
+    DbConfig {
+        temp_dir: temp_dir.to_path_buf(),
+        wal_sync_mode: WalSyncMode::Full,
+        write_queue_enabled: true,
+        write_queue_capacity: 4_096,
+        write_queue_default_timeout_ms: 30_000,
+        write_queue_strict_group_commit: true,
+        write_queue_max_batch: 64,
+        write_queue_max_group_delay_us: max_group_delay_us,
+        ..DbConfig::default()
+    }
+}
+
 fn real_fs_default_config(temp_dir: &Path) -> DbConfig {
     DbConfig {
         temp_dir: temp_dir.to_path_buf(),
@@ -3163,6 +3698,31 @@ mod tests {
         assert!(result
             .metrics
             .contains_key("writer_throughput_degradation_ratio"));
+    }
+
+    #[test]
+    fn queued_writer_single_scenario_runs_with_tiny_profile() {
+        let temp = TempDir::new().expect("tempdir");
+        let result = run_scenario(ScenarioId::QueuedWriterSingle, &tiny_profile(), temp.path())
+            .expect("run queued writer single scenario");
+        assert!(matches!(result.status, ScenarioStatus::Passed));
+        assert!(result.metrics.contains_key("queued_write_p95_us"));
+        assert!(result.metrics.contains_key("queue_committed"));
+    }
+
+    #[test]
+    fn queued_writer_read_under_write_scenario_runs_with_tiny_profile() {
+        let temp = TempDir::new().expect("tempdir");
+        let result = run_scenario(
+            ScenarioId::QueuedWriterReadUnderWrite,
+            &tiny_profile(),
+            temp.path(),
+        )
+        .expect("run queued writer read-under-write scenario");
+        assert!(matches!(result.status, ScenarioStatus::Passed));
+        assert!(result.metrics.contains_key("queued_writer_p95_us"));
+        assert!(result.metrics.contains_key("queued_reader_p95_us"));
+        assert!(result.metrics.contains_key("queue_committed"));
     }
 
     #[test]

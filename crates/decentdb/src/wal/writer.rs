@@ -3,6 +3,7 @@
 //! Implements:
 //! - design/adr/0003-snapshot-lsn-atomicity.md
 
+use std::cell::RefCell;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -23,6 +24,86 @@ use super::{WalBasePage, WalHandle, WalWriteState};
 const WAL_PREALLOC_CHUNK_BYTES: u64 = 16 << 20;
 const COMMIT_FRAME_BYTES: [u8; FRAME_HEADER_SIZE + FRAME_TRAILER_SIZE] =
     [FrameType::Commit as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+thread_local! {
+    static DEFERRED_GROUP_COMMIT: RefCell<Option<DeferredGroupCommitState>> =
+        const { RefCell::new(None) };
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct DeferredGroupCommitState {
+    pending: bool,
+    metadata_changed: bool,
+}
+
+/// Thread-local guard used by the queued write executor to make several
+/// synchronous commits share one physical WAL sync without acknowledging any
+/// successful queued request before the covering sync completes.
+#[derive(Debug)]
+pub(crate) struct DeferredGroupCommitGuard {
+    active: bool,
+}
+
+impl Drop for DeferredGroupCommitGuard {
+    fn drop(&mut self) {
+        if self.active {
+            DEFERRED_GROUP_COMMIT.with(|slot| {
+                *slot.borrow_mut() = None;
+            });
+        }
+    }
+}
+
+pub(crate) fn begin_deferred_group_commit() -> DeferredGroupCommitGuard {
+    DEFERRED_GROUP_COMMIT.with(|slot| {
+        *slot.borrow_mut() = Some(DeferredGroupCommitState::default());
+    });
+    DeferredGroupCommitGuard { active: true }
+}
+
+pub(crate) fn flush_deferred_group_commit(wal: &WalHandle) -> Result<bool> {
+    let state = DEFERRED_GROUP_COMMIT.with(|slot| *slot.borrow());
+    let Some(state) = state else {
+        return Ok(false);
+    };
+    if !state.pending {
+        return Ok(false);
+    }
+
+    match wal.inner.sync_mode {
+        WalSyncMode::Full => {
+            if state.metadata_changed {
+                wal.inner.file.sync_metadata()?;
+            } else {
+                wal.inner.file.sync_data()?;
+            }
+        }
+        WalSyncMode::Normal => {
+            wal.inner.file.sync_data()?;
+        }
+        WalSyncMode::AsyncCommit { .. } | WalSyncMode::TestingOnlyUnsafeNoSync => {}
+    }
+
+    DEFERRED_GROUP_COMMIT.with(|slot| {
+        if let Some(state) = slot.borrow_mut().as_mut() {
+            state.pending = false;
+            state.metadata_changed = false;
+        }
+    });
+    Ok(true)
+}
+
+fn defer_sync_if_active(metadata_changed: bool) -> bool {
+    DEFERRED_GROUP_COMMIT.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let Some(state) = slot.as_mut() else {
+            return false;
+        };
+        state.pending = true;
+        state.metadata_changed |= metadata_changed;
+        true
+    })
+}
 
 pub(crate) fn commit_pages(
     wal: &WalHandle,
@@ -367,13 +448,21 @@ pub(crate) fn truncate_to_header(wal: &WalHandle) -> Result<()> {
 fn sync_for_mode(wal: &WalHandle, metadata_changed: bool, new_end_lsn: u64) -> Result<()> {
     match wal.inner.sync_mode {
         WalSyncMode::Full => {
+            if defer_sync_if_active(metadata_changed) {
+                return Ok(());
+            }
             if metadata_changed {
                 wal.inner.file.sync_metadata()
             } else {
                 wal.inner.file.sync_data()
             }
         }
-        WalSyncMode::Normal => wal.inner.file.sync_data(),
+        WalSyncMode::Normal => {
+            if defer_sync_if_active(metadata_changed) {
+                return Ok(());
+            }
+            wal.inner.file.sync_data()
+        }
         WalSyncMode::AsyncCommit { .. } => {
             // SAFETY (durability): we publish the new dirty watermark *before*
             // returning so a subsequent `Db::sync()` cannot complete without

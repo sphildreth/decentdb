@@ -54,7 +54,17 @@ The native wrapper now exposes explicit open-mode helpers:
 - `Database.create(path)`
 - `new Database({ path, mode: 'openOrCreate' | 'open' | 'create' })`
 
-Unsupported arbitrary open-option strings are rejected instead of being silently ignored.
+Native open options can include write-queue settings such as
+`write_queue_enabled=true`, `write_queue_capacity=128`, and
+`write_queue_default_timeout_ms=1000`. The wrapper also accepts camel-cased
+constructor fields such as `writeQueueEnabled` and `writeQueueCapacity`.
+
+The N-API layer maps queue status codes distinctly, including timeout,
+canceled, queue-full, and queue-closed outcomes. `Database.execQueued(sql)`
+submits unbound self-contained write SQL to `ddb_db_execute_queued`, and
+`Database.writeQueueMetrics()` returns the native queue counters. Parameterized
+prepared statements remain on the direct path until the C ABI grows a queued
+prepared-statement contract.
 
 ## Native wrapper API highlights
 
@@ -62,6 +72,8 @@ Unsupported arbitrary open-option strings are rejected instead of being silently
 
 - `exec(sql, bindings?)`
 - `execAsync(sql, bindings?)`
+- `execQueued(sql, { timeoutMs }?)`
+- `writeQueueMetrics()`
 - `prepare(sql)`
 - `beginTransaction()`, `commitTransaction()`, `rollbackTransaction()`
 - `checkpoint()`

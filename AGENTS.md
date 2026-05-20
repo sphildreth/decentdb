@@ -131,6 +131,7 @@ Create an ADR before implementing any of the following:
 - Keep changes incremental and scoped.
 - If the compiler reports ownership or lifetime errors, fix them systematically; do not guess.
 - Update rustdoc and user-facing docs when public behavior changes.
+- **NEVER** update `CHANGELOG.md`; it is a placeholder document. All changelog entries **MUST** go into `docs/about/changelog.md`.
 
 ## 10. Commit / PR hygiene
 

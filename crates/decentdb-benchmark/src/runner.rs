@@ -331,6 +331,19 @@ fn headline_metrics(result: &ScenarioResult) -> BTreeMap<String, serde_json::Val
             "writer_throughput_under_readers_ops_per_sec",
             "writer_throughput_degradation_ratio",
         ],
+        ScenarioId::QueuedWriterSingle => &[
+            "queued_write_p95_us",
+            "queued_writes_per_sec",
+            "queue_group_commit_batches",
+            "queue_physical_syncs_saved",
+        ],
+        ScenarioId::QueuedWriterReadUnderWrite => &[
+            "queued_writer_p95_us",
+            "queued_reader_p95_us",
+            "queued_writer_ops_per_sec",
+            "queue_group_commit_max_batch",
+            "queue_physical_syncs_saved",
+        ],
         ScenarioId::StorageEfficiency => &[
             "space_amplification",
             "bytes_per_logical_row",

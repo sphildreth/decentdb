@@ -186,6 +186,48 @@ pub struct DbConfig {
     ///
     /// See ADR 0143 — engine-memory plan, open-time checkpoint heuristic.
     pub auto_checkpoint_on_open_mb: u32,
+
+    /// Advertises that high-level bindings may use the engine-owned write
+    /// queue for normal execution paths.
+    ///
+    /// The native Rust direct APIs remain direct unless callers explicitly use
+    /// the queued execution APIs. This preserves low-contention direct-path
+    /// behavior while letting bindings opt into a consistent queue contract.
+    ///
+    /// Default: `false`.
+    pub write_queue_enabled: bool,
+
+    /// Maximum number of admitted queued write requests waiting for execution.
+    /// Must be at least `1`; `Db::open` and `Db::create` clamp `0` to `1`.
+    ///
+    /// Default: `1024`.
+    pub write_queue_capacity: usize,
+
+    /// Default queued-write timeout in milliseconds. `0` means no default
+    /// timeout; callers can still pass an explicit per-call timeout.
+    ///
+    /// Default: `0`.
+    pub write_queue_default_timeout_ms: u64,
+
+    /// When `true`, queued commits under synchronous WAL modes may share one
+    /// physical WAL sync, and callers receive success only after the covering
+    /// sync completes.
+    ///
+    /// Default: `true`.
+    pub write_queue_strict_group_commit: bool,
+
+    /// Maximum number of ready queued requests drained by one queue executor
+    /// pass before yielding to waiters.
+    ///
+    /// Default: `64`.
+    pub write_queue_max_batch: usize,
+
+    /// Optional delay used to collect more ready queued writes before a strict
+    /// group-commit sync. The default `0` avoids sleeping on the single-writer
+    /// path and only batches work already ready in the queue.
+    ///
+    /// Default: `0`.
+    pub write_queue_max_group_delay_us: u64,
 }
 
 impl DbConfig {
@@ -231,6 +273,12 @@ impl Default for DbConfig {
             paged_row_storage: true,
             retain_paged_row_sources_after_commit: false,
             auto_checkpoint_on_open_mb: 16,
+            write_queue_enabled: false,
+            write_queue_capacity: 1024,
+            write_queue_default_timeout_ms: 0,
+            write_queue_strict_group_commit: true,
+            write_queue_max_batch: 64,
+            write_queue_max_group_delay_us: 0,
         }
     }
 }
@@ -269,6 +317,12 @@ mod tests {
         assert!(!config.persistent_pk_index);
         assert!(config.paged_row_storage);
         assert!(!config.retain_paged_row_sources_after_commit);
+        assert!(!config.write_queue_enabled);
+        assert_eq!(config.write_queue_capacity, 1024);
+        assert_eq!(config.write_queue_default_timeout_ms, 0);
+        assert!(config.write_queue_strict_group_commit);
+        assert_eq!(config.write_queue_max_batch, 64);
+        assert_eq!(config.write_queue_max_group_delay_us, 0);
         // Default depends on platform; just assert the field is reachable.
         let _ = config.release_freed_memory_after_checkpoint;
     }

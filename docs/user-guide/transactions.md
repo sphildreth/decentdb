@@ -89,6 +89,13 @@ DecentDB enforces single writer semantics:
 - No deadlocks possible
 - Readers see stable snapshots
 
+For applications with many in-process writer threads or tasks, use the
+engine-owned write queue described in [Write Concurrency](write-concurrency.md).
+Queued writes preserve the one-writer model while adding bounded admission,
+timeout/cancel behavior before execution, metrics, and strict durable group
+commit. Direct explicit transactions remain the right API for long-lived
+`BEGIN`/`COMMIT` workflows.
+
 ## Durability
 
 By default, DecentDB commits are durable: a successful `COMMIT` is persisted via the WAL before the command returns.
@@ -228,7 +235,8 @@ decentdb info --db=my.ddb
 ## Limitations
 
 - No distributed transactions
-- Single writer only (no concurrent write transactions)
+- Single writer only. Queue-backed write APIs are planned, but current
+  releases still require callers to use the existing direct write surfaces.
 - Foreign keys enforced at statement time, not commit time
 - Savepoints are only supported within explicit `BEGIN`/`COMMIT` blocks
 - Multi-statement `exec` strings are bound against the starting schema (DDL in the same string doesn't affect later statements)

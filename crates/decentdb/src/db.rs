@@ -58,6 +58,7 @@ use crate::vfs::{is_memory_path, write_all_at, FileKind, OpenMode, VfsHandle};
 use crate::wal::reader_registry::ReaderGuard;
 use crate::wal::savepoint::StatementSavepoint;
 use crate::wal::WalHandle;
+use crate::write_queue::{QueuedWriteOptions, WriteQueue, WriteQueueMetricsSnapshot};
 use serde_json::Value as JsonValue;
 
 /// Stable engine owner used across later storage, SQL, and FFI slices.
@@ -332,6 +333,7 @@ struct DbInner {
     held_snapshots: Mutex<HashMap<u64, ReaderGuard>>,
     sync_ctx: SyncContext,
     read_only_paged_row_source_residency: Mutex<ReadOnlyPagedRowSourceResidency>,
+    write_queue: OnceLock<WriteQueue>,
 }
 
 impl Drop for DbInner {
@@ -1359,6 +1361,69 @@ impl Db {
         self.execute_batch_with_params(sql, &[])
     }
 
+    /// Executes one SQL statement through the engine-owned write queue.
+    ///
+    /// The queued path preserves the existing single-writer model while
+    /// centralizing backpressure, timeout, cancellation-before-run, and strict
+    /// group-commit behavior. Explicit `BEGIN`, `COMMIT`, `ROLLBACK`, and
+    /// savepoint control statements are intentionally rejected on the queued
+    /// path in this first contract; callers should use the direct transaction
+    /// APIs for long-lived explicit transactions.
+    pub fn execute_queued(&self, sql: &str) -> Result<QueryResult> {
+        self.execute_queued_with_params(sql, &[])
+    }
+
+    /// Executes one SQL statement with positional `$n` parameters through the
+    /// engine-owned write queue.
+    pub fn execute_queued_with_params(&self, sql: &str, params: &[Value]) -> Result<QueryResult> {
+        let mut results = self.execute_queued_batch_with_params(sql, params)?;
+        if results.len() != 1 {
+            return Err(DbError::sql(format!(
+                "expected exactly one SQL statement, got {}",
+                results.len()
+            )));
+        }
+        Ok(results.remove(0))
+    }
+
+    /// Executes one or more SQL statements through the engine-owned write
+    /// queue using configured default timeout behavior.
+    pub fn execute_queued_batch(&self, sql: &str) -> Result<Vec<QueryResult>> {
+        self.execute_queued_batch_with_params(sql, &[])
+    }
+
+    /// Executes one or more SQL statements with positional `$n` parameters
+    /// through the engine-owned write queue using configured default timeout
+    /// behavior.
+    pub fn execute_queued_batch_with_params(
+        &self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Vec<QueryResult>> {
+        self.execute_queued_batch_with_options(sql, params, QueuedWriteOptions::default())
+    }
+
+    /// Executes one or more SQL statements through the write queue with
+    /// per-call timeout and cancellation options.
+    pub fn execute_queued_batch_with_options(
+        &self,
+        sql: &str,
+        params: &[Value],
+        options: QueuedWriteOptions,
+    ) -> Result<Vec<QueryResult>> {
+        self.reject_transaction_control_for_queued_sql(sql)?;
+        self.write_queue()
+            .execute_batch_with_params(self, sql, params, options)
+    }
+
+    /// Returns a snapshot of current write-queue counters. Calling this method
+    /// initializes the lazy queue metadata but does not route direct writes
+    /// through the queue.
+    #[must_use]
+    pub fn write_queue_metrics(&self) -> WriteQueueMetricsSnapshot {
+        self.write_queue().snapshot()
+    }
+
     /// Executes one or more read-only SQL statements against a retained WAL LSN.
     pub fn execute_batch_at_snapshot_lsn(
         &self,
@@ -1723,6 +1788,14 @@ impl Db {
         sql: &str,
         params: &[Value],
     ) -> Result<Vec<QueryResult>> {
+        self.execute_batch_direct_with_params(sql, params)
+    }
+
+    pub(crate) fn execute_batch_direct_with_params(
+        &self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Vec<QueryResult>> {
         let mut results = Vec::new();
         for statement_sql in split_sql_batch(sql) {
             let trimmed = statement_sql.trim();
@@ -1767,6 +1840,37 @@ impl Db {
             results.push(result);
         }
         Ok(results)
+    }
+
+    pub(crate) fn begin_deferred_group_commit(
+        &self,
+    ) -> crate::wal::writer::DeferredGroupCommitGuard {
+        self.inner.wal.begin_deferred_group_commit()
+    }
+
+    pub(crate) fn flush_deferred_group_commit(&self) -> Result<bool> {
+        self.inner.wal.flush_deferred_group_commit()
+    }
+
+    fn write_queue(&self) -> &WriteQueue {
+        self.inner
+            .write_queue
+            .get_or_init(|| WriteQueue::new(&self.inner.config))
+    }
+
+    fn reject_transaction_control_for_queued_sql(&self, sql: &str) -> Result<()> {
+        for statement_sql in split_sql_batch(sql) {
+            let trimmed = statement_sql.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if parse_transaction_control(trimmed).is_some() {
+                return Err(DbError::transaction(
+                    "queued execution does not support explicit transaction control; use direct transaction APIs",
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Prepares a single SQL statement for repeated execution.
@@ -2457,6 +2561,7 @@ impl Db {
                 read_only_paged_row_source_residency: Mutex::new(
                     ReadOnlyPagedRowSourceResidency::default(),
                 ),
+                write_queue: OnceLock::new(),
             }),
         };
         db.backfill_missing_persistent_pk_indexes()?;
@@ -11551,6 +11656,7 @@ fn json_escape(input: String) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
     use std::sync::{Arc, Barrier};
     use std::thread;
     use std::time::{Duration, Instant};
@@ -11570,7 +11676,7 @@ mod tests {
 
     use crate::exec::dml::{PreparedInsertColumn, PreparedInsertValueSource, PreparedSimpleInsert};
     use crate::sql::parser::parse_sql_statement;
-    use crate::{BulkLoadOptions, Db, Value};
+    use crate::{BulkLoadOptions, Db, QueuedWriteOptions, Value};
 
     use super::{split_sql_batch, PreparedInsertCache, StatementCache, TempSchemaState};
 
@@ -11609,6 +11715,147 @@ mod tests {
                 "PagerReadStore does not support writing pages",
             ))
         }
+    }
+
+    #[test]
+    fn queued_writes_batch_ready_commits_and_preserve_results() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir.path().join("queued-group-commit.ddb");
+        let mut config = DbConfig {
+            write_queue_capacity: 32,
+            write_queue_max_batch: 32,
+            write_queue_max_group_delay_us: 50_000,
+            ..DbConfig::default()
+        };
+        config.release_freed_memory_after_checkpoint = false;
+        let db = Arc::new(Db::create(&path, config).expect("create db"));
+        db.execute("CREATE TABLE queued_items (id INTEGER PRIMARY KEY, value TEXT)")
+            .expect("create table");
+
+        let writers = 8;
+        let barrier = Arc::new(Barrier::new(writers + 1));
+        let mut handles = Vec::new();
+        for index in 0..writers {
+            let db = Arc::clone(&db);
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                db.execute_queued_with_params(
+                    "INSERT INTO queued_items (id, value) VALUES ($1, $2)",
+                    &[
+                        Value::Int64(i64::try_from(index).expect("index fits")),
+                        Value::Text(format!("value-{index}")),
+                    ],
+                )
+                .expect("queued insert");
+            }));
+        }
+        barrier.wait();
+        for handle in handles {
+            handle.join().expect("writer thread");
+        }
+
+        let result = db
+            .execute("SELECT COUNT(*) FROM queued_items")
+            .expect("count rows");
+        assert_eq!(result.rows()[0].values()[0], Value::Int64(writers as i64));
+
+        let metrics = db.write_queue_metrics();
+        assert_eq!(metrics.admitted, writers as u64);
+        assert_eq!(metrics.committed, writers as u64);
+        assert!(metrics.group_commit_batches >= 1);
+        assert!(
+            metrics.group_commit_max_batch > 1,
+            "expected at least one grouped batch, got {metrics:?}"
+        );
+        assert!(metrics.group_commit_syncs >= 1);
+        assert!(metrics.physical_syncs_saved >= 1);
+    }
+
+    #[test]
+    fn queued_write_timeout_before_execution_has_no_effect() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir.path().join("queued-timeout.ddb");
+        let db = Arc::new(Db::create(&path, DbConfig::default()).expect("create db"));
+        db.execute("CREATE TABLE queued_items (id INTEGER PRIMARY KEY)")
+            .expect("create table");
+
+        let writer_guard = db
+            .inner
+            .sql_write_lock
+            .lock()
+            .expect("writer lock should not be poisoned");
+        let started = Arc::new(AtomicBool::new(false));
+        let worker_db = Arc::clone(&db);
+        let worker_started = Arc::clone(&started);
+        let handle = thread::spawn(move || {
+            worker_started.store(true, AtomicOrdering::Release);
+            worker_db
+                .execute_queued("INSERT INTO queued_items (id) VALUES (1)")
+                .expect("first queued insert");
+        });
+        while !started.load(AtomicOrdering::Acquire) || db.write_queue_metrics().executed == 0 {
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        let error = db
+            .execute_queued_batch_with_options(
+                "INSERT INTO queued_items (id) VALUES (2)",
+                &[],
+                QueuedWriteOptions {
+                    timeout: Some(Duration::from_millis(10)),
+                    cancel_token: None,
+                },
+            )
+            .expect_err("second queued insert should time out before execution");
+        assert_eq!(error.code(), crate::DbErrorCode::Timeout);
+
+        drop(writer_guard);
+        handle.join().expect("writer thread");
+        db.execute_queued("INSERT INTO queued_items (id) VALUES (3)")
+            .expect("third queued insert drains canceled request");
+
+        let result = db
+            .execute("SELECT COUNT(*) FROM queued_items WHERE id IN (1, 3)")
+            .expect("count committed rows");
+        assert_eq!(result.rows()[0].values()[0], Value::Int64(2));
+        let missing = db
+            .execute("SELECT COUNT(*) FROM queued_items WHERE id = 2")
+            .expect("count timed-out row");
+        assert_eq!(missing.rows()[0].values()[0], Value::Int64(0));
+    }
+
+    #[test]
+    fn queued_execution_rejects_explicit_transaction_control() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir.path().join("queued-transaction-control.ddb");
+        let db = Db::create(&path, DbConfig::default()).expect("create db");
+
+        let error = db
+            .execute_queued_batch("BEGIN; CREATE TABLE t (id INTEGER); COMMIT")
+            .expect_err("queued transaction control should be rejected");
+        assert_eq!(error.code(), crate::DbErrorCode::Transaction);
+    }
+
+    #[test]
+    fn queued_execution_honors_cancel_before_admission() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir.path().join("queued-cancel.ddb");
+        let db = Db::create(&path, DbConfig::default()).expect("create db");
+        let cancel_token = Arc::new(AtomicBool::new(true));
+
+        let error = db
+            .execute_queued_batch_with_options(
+                "CREATE TABLE t (id INTEGER)",
+                &[],
+                QueuedWriteOptions {
+                    timeout: None,
+                    cancel_token: Some(cancel_token),
+                },
+            )
+            .expect_err("pre-canceled queued write should not be admitted");
+        assert_eq!(error.code(), crate::DbErrorCode::Canceled);
+        assert_eq!(db.write_queue_metrics().canceled, 1);
     }
 
     #[test]

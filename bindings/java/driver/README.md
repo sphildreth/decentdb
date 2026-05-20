@@ -9,6 +9,19 @@ types. `ENUM`, `IPADDR`, `CIDR`, and `INTERVAL` are exposed as strings,
 `MACADDR` as `Types.OTHER` with a canonical string value, and `TIMESTAMPTZ`
 values are normalized to UTC timestamps.
 
+## Queued write options
+
+JDBC URLs and `Properties` may pass native queue options through at open time:
+
+```text
+jdbc:decentdb:/tmp/app.ddb?write_queue_enabled=true&write_queue_capacity=128&write_queue_default_timeout_ms=1000
+```
+
+The JNI layer maps queue timeout, cancel, queue-full, queue-closed, and busy
+statuses to distinct JDBC transient/timeout exceptions. Prepared statements
+remain on the direct prepared path until the C ABI exposes queued
+prepared-statement execution.
+
 ## Standalone example
 
 Run the standalone JDBC example:

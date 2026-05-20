@@ -74,11 +74,28 @@ int main(void) {
         "insert");
   check(ddb_result_free(&result), "free insert");
 
+  check(ddb_db_execute_queued(
+            db, "INSERT INTO smoke (id, name) VALUES (2, 'c-queued')", NULL, 0,
+            DDB_WRITE_QUEUE_TIMEOUT_DEFAULT, &result),
+        "queued insert");
+  check(ddb_result_free(&result), "free queued insert");
+  ddb_write_queue_metrics_t queue_metrics;
+  check(ddb_db_write_queue_metrics(db, &queue_metrics), "queue metrics");
+  if (queue_metrics.admitted != 1 || queue_metrics.committed != 1 ||
+      queue_metrics.failed != 0) {
+    fprintf(stderr,
+            "unexpected queue metrics: admitted=%llu committed=%llu failed=%llu\n",
+            (unsigned long long)queue_metrics.admitted,
+            (unsigned long long)queue_metrics.committed,
+            (unsigned long long)queue_metrics.failed);
+    return 1;
+  }
+
   check(ddb_db_execute(db, "SELECT id, name FROM smoke", NULL, 0, &result),
         "select");
   check(ddb_result_row_count(result, &rows), "row_count");
-  if (rows != 1) {
-    fprintf(stderr, "expected 1 row, got %zu\n", rows);
+  if (rows != 2) {
+    fprintf(stderr, "expected 2 rows, got %zu\n", rows);
     return 1;
   }
   check(ddb_result_free(&result), "free select");

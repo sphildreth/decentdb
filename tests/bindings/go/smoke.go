@@ -42,12 +42,23 @@ func main() {
 	check(C.ddb_db_execute(db, insert, nil, 0, &result), "insert")
 	check(C.ddb_result_free(&result), "free insert")
 
+	queuedInsert := C.CString("INSERT INTO smoke (id, name) VALUES (2, 'go-queued')")
+	defer C.free(unsafe.Pointer(queuedInsert))
+	check(C.ddb_db_execute_queued(db, queuedInsert, nil, 0, C.DDB_WRITE_QUEUE_TIMEOUT_DEFAULT, &result), "queued insert")
+	check(C.ddb_result_free(&result), "free queued insert")
+	var metrics C.ddb_write_queue_metrics_t
+	check(C.ddb_db_write_queue_metrics(db, &metrics), "queue metrics")
+	if metrics.admitted != 1 || metrics.committed != 1 || metrics.failed != 0 {
+		panic(fmt.Sprintf("unexpected queue metrics admitted=%d committed=%d failed=%d",
+			uint64(metrics.admitted), uint64(metrics.committed), uint64(metrics.failed)))
+	}
+
 	selectSQL := C.CString("SELECT id, name FROM smoke")
 	defer C.free(unsafe.Pointer(selectSQL))
 	check(C.ddb_db_execute(db, selectSQL, nil, 0, &result), "select")
 	check(C.ddb_result_row_count(result, &rows), "row count")
-	if rows != 1 {
-		panic(fmt.Sprintf("expected 1 row, got %d", uint64(rows)))
+	if rows != 2 {
+		panic(fmt.Sprintf("expected 2 rows, got %d", uint64(rows)))
 	}
 	check(C.ddb_result_free(&result), "free select")
 

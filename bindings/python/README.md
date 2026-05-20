@@ -48,6 +48,47 @@ DecentDB operates as an embedded database with the following concurrency model:
 
 **Recommendation**: Ensure your application architecture enforces a single-writer pattern (e.g. via a dedicated writer thread or queue).
 
+## Bounded Write Queue (DDB v3)
+
+Python now exposes write-queue execution through both low-level C bindings and the DB-API path.
+
+```python
+from decentdb import connect
+
+with connect(
+    "queue_demo.ddb",
+    write_queue_enabled=True,
+    write_queue_capacity=128,
+    write_queue_default_timeout_ms=500,
+    write_queue_group_commit=True,
+) as con:
+    con.execute("CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY, payload TEXT)")
+    con.execute_queued(
+        "INSERT INTO events(id, payload) VALUES (?, ?)",
+        (1, "queued"),
+        timeout_ms=250,
+    )
+    metrics = con.write_queue_metrics()
+    print(metrics["admitted"], metrics["committed"])
+```
+
+`write_queue_default_timeout_ms` can be omitted to use the engine default; pass
+`DDB_WRITE_QUEUE_TIMEOUT_DEFAULT` to leave a single `execute_queued` call at the native
+default.
+
+- `write_queue_enabled`
+  Enables queued writer mode for the connection.
+- `write_queue_capacity`
+  Maximum in-flight queued write entries.
+- `write_queue_group_commit`
+  Enables queue grouping for durable batching behavior.
+- `write_queue_max_batch`
+  Maximum statements per commit group.
+- `write_queue_max_group_delay_us`
+  Maximum delay before a partial batch is forced to commit.
+- `write_queue_default_timeout_ms`
+  Default timeout applied by direct queued API calls when no explicit timeout is passed.
+
 ## Benchmarks
 
 To run the fetch benchmark:

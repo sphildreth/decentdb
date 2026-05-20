@@ -189,6 +189,14 @@ impl WalHandle {
         )
     }
 
+    pub(crate) fn begin_deferred_group_commit(&self) -> writer::DeferredGroupCommitGuard {
+        writer::begin_deferred_group_commit()
+    }
+
+    pub(crate) fn flush_deferred_group_commit(&self) -> Result<bool> {
+        writer::flush_deferred_group_commit(self)
+    }
+
     pub(crate) fn checkpoint(&self, pager: &PagerHandle, timeout_sec: u64) -> Result<()> {
         checkpoint::checkpoint(self, pager, timeout_sec)
     }

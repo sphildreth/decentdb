@@ -18,6 +18,12 @@ typedef ddb_row_i64_text_f64_view_t decentdb_row_i64_text_f64_view;
 typedef struct decentdb_native_api {
   decentdb_db* (*open)(const char* path_utf8, const char* options_utf8);
   int (*close)(decentdb_db* db);
+  int (*execute_queued)(
+      decentdb_db* db,
+      const char* sql_utf8,
+      uint64_t timeout_ms,
+      uint64_t* out_affected_rows);
+  int (*write_queue_metrics)(decentdb_db* db, ddb_write_queue_metrics_t* out_metrics);
 
   int (*last_error_code)(decentdb_db* db);
   const char* (*last_error_message)(decentdb_db* db);

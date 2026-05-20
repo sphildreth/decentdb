@@ -224,4 +224,9 @@ final class DecentDBNative {
     static final int ERR_INTERNAL    = 6;
     static final int ERR_PANIC       = 7;
     static final int ERR_UNSUPPORTED_FORMAT_VERSION = 8;
+    static final int ERR_BUSY        = 9;
+    static final int ERR_TIMEOUT     = 10;
+    static final int ERR_CANCELED    = 11;
+    static final int ERR_QUEUE_FULL  = 12;
+    static final int ERR_QUEUE_CLOSED = 13;
 }

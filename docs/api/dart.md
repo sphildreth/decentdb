@@ -319,6 +319,10 @@ DECENTDB_NATIVE_LIB=../../../target/debug/libdecentdb.so dart run benchmarks/ben
 ```
 
 ## Notes
-- the stable C ABI still does not expose open-with-config, so non-empty `options` strings are rejected
+- `Database.open(options: ...)` passes native open options through the stable C
+  ABI, including write-queue options such as `write_queue_enabled`,
+  `write_queue_capacity`, and `write_queue_default_timeout_ms`
+- `Database.executeQueued(sql)` and `Database.writeQueueMetrics()` expose the
+  engine-owned write queue for self-contained queued writes
 - the example under `bindings/dart/examples/flutter_desktop/` is still a desktop-oriented reference rather than a real Flutter SDK app
 - DecentDB remains a one-writer / many-readers engine; keep that concurrency model in mind when sharing database handles across isolates or threads

@@ -9,6 +9,11 @@ helpers through cgo. Performance-critical fused `step_row_view` is implemented
 (reduces cgo crossings per row from 2 to 1). Batch, re-execute, and fused
 bind+step operations remain as future optimizations.
 
+The Go binding also maps the C ABI write-queue status codes to sentinel errors
+(`ErrBusy`, `ErrTimeout`, `ErrCanceled`, `ErrQueueFull`, and
+`ErrQueueClosed`), supports write-queue DSN options, and exposes direct queued
+execution and queue metrics through `OpenDirect`.
+
 ## Package surface
 
 The Go package:
@@ -56,6 +61,26 @@ import (
 )
 
 db, err := sql.Open("decentdb", "file:/tmp/app.ddb")
+```
+
+### Write Queue
+
+Enable queue-backed write execution for connection-level writes with DSN
+options:
+
+```go
+db, err := sql.Open(
+    "decentdb",
+    "file:/tmp/app.ddb?write_queue_enabled=true&write_queue_capacity=128&write_queue_default_timeout_ms=1000",
+)
+```
+
+For direct use:
+
+```go
+direct, _ := decentdb.OpenDirect("/tmp/app.ddb")
+affected, err := direct.ExecQueued(ctx, "INSERT INTO events (id, name) VALUES ($1, $2)", int64(1), "queued")
+metrics, err := direct.WriteQueueMetrics()
 ```
 
 ### DSN modes

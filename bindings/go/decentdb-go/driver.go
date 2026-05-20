@@ -20,11 +20,14 @@ import (
 	"net/netip"
 	"net/url"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
 	"unsafe"
 )
+
+const writeQueueTimeoutDefault = ^uint64(0)
 
 func init() {
 	sql.Register("decentdb", &Driver{})
@@ -62,6 +65,9 @@ func (c *connector) Connect(ctx context.Context) (driver.Conn, error) {
 	// Parse DSN: file:/path/to.ddb?opt=val or :memory:
 	var path string
 	var rawQuery string
+	var options string
+	useWriteQueue := false
+	var queueDefaultTimeoutMs *uint64
 
 	if c.dsn == ":memory:" {
 		path = ":memory:"
@@ -77,6 +83,65 @@ func (c *connector) Connect(ctx context.Context) (driver.Conn, error) {
 			path = c.dsn
 		}
 		rawQuery = u.RawQuery
+
+		if rawQuery != "" {
+			query, err := url.ParseQuery(rawQuery)
+			if err != nil {
+				return nil, err
+			}
+			if opt := query.Get("options"); opt != "" {
+				options += opt
+			}
+			if enabledValue, ok := query["write_queue_enabled"]; ok && len(enabledValue) > 0 {
+				enabled, err := strconv.ParseBool(enabledValue[0])
+				if err != nil {
+					return nil, fmt.Errorf("invalid write_queue_enabled value %q: %w", enabledValue[0], err)
+				}
+				if enabled {
+					useWriteQueue = true
+				}
+				options = appendOption(options, "write_queue_enabled", fmt.Sprintf("%v", enabled))
+			}
+			if capacityValue, ok := query["write_queue_capacity"]; ok && len(capacityValue) > 0 {
+				if _, err := strconv.ParseUint(capacityValue[0], 10, 64); err != nil {
+					return nil, fmt.Errorf("invalid write_queue_capacity value %q: %w", capacityValue[0], err)
+				}
+				useWriteQueue = true
+				options = appendOption(options, "write_queue_capacity", capacityValue[0])
+			}
+			if timeoutValue, ok := query["write_queue_default_timeout_ms"]; ok && len(timeoutValue) > 0 {
+				parsed, err := strconv.ParseUint(timeoutValue[0], 10, 64)
+				if err != nil {
+					return nil, fmt.Errorf("invalid write_queue_default_timeout_ms value %q: %w", timeoutValue[0], err)
+				}
+				useWriteQueue = true
+				tmp := parsed
+				queueDefaultTimeoutMs = &tmp
+				options = appendOption(options, "write_queue_default_timeout_ms", timeoutValue[0])
+			}
+			if value, ok := query["write_queue_group_commit"]; ok && len(value) > 0 {
+				commit, err := strconv.ParseBool(value[0])
+				if err != nil {
+					return nil, fmt.Errorf("invalid write_queue_group_commit value %q: %w", value[0], err)
+				}
+				useWriteQueue = true
+				options = appendOption(options, "write_queue_group_commit", fmt.Sprintf("%v", commit))
+			}
+			if maxBatchValue, ok := query["write_queue_max_batch"]; ok && len(maxBatchValue) > 0 {
+				if _, err := strconv.ParseUint(maxBatchValue[0], 10, 64); err != nil {
+					return nil, fmt.Errorf("invalid write_queue_max_batch value %q: %w", maxBatchValue[0], err)
+				}
+				useWriteQueue = true
+				options = appendOption(options, "write_queue_max_batch", maxBatchValue[0])
+			}
+			if value, ok := query["write_queue_max_group_delay_us"]; ok && len(value) > 0 {
+				if _, err := strconv.ParseUint(value[0], 10, 64); err != nil {
+					return nil, fmt.Errorf("invalid write_queue_max_group_delay_us value %q: %w", value[0], err)
+				}
+				useWriteQueue = true
+				options = appendOption(options, "write_queue_max_group_delay_us", value[0])
+			}
+		}
 	}
 
 	// Parse mode before any native call to avoid the open-then-recreate bug
@@ -86,25 +151,56 @@ func (c *connector) Connect(ctx context.Context) (driver.Conn, error) {
 			mode = q.Get("mode")
 		}
 	}
-
 	cPath := C.CString(path)
 	defer C.free(unsafe.Pointer(cPath))
 
 	var db *C.ddb_db_t
 	var status C.ddb_status_t
-	switch mode {
-	case "create":
-		status = C.ddb_db_create(cPath, &db)
-	case "open":
-		status = C.ddb_db_open(cPath, &db)
-	default:
-		status = C.ddb_db_open_or_create(cPath, &db)
+	usingOptions := options != ""
+	if usingOptions {
+		cOptions := C.CString(options)
+		defer C.free(unsafe.Pointer(cOptions))
+
+		switch mode {
+		case "create":
+			if queryHasQueueOpenSupport() {
+				status = C.ddb_db_create_with_options(cPath, cOptions, &db)
+			} else {
+				status = C.ddb_db_create(cPath, &db)
+			}
+		case "open":
+			if queryHasQueueOpenSupport() {
+				status = C.ddb_db_open_with_options(cPath, cOptions, &db)
+			} else {
+				status = C.ddb_db_open(cPath, &db)
+			}
+		default:
+			if queryHasQueueOpenSupport() {
+				status = C.ddb_db_open_or_create_with_options(cPath, cOptions, &db)
+			} else {
+				status = C.ddb_db_open_or_create(cPath, &db)
+			}
+		}
+	} else {
+		switch mode {
+		case "create":
+			status = C.ddb_db_create(cPath, &db)
+		case "open":
+			status = C.ddb_db_open(cPath, &db)
+		default:
+			status = C.ddb_db_open_or_create(cPath, &db)
+		}
 	}
 	if status != C.DDB_OK || db == nil {
 		return nil, statusError(status, "")
 	}
 
-	return &conn{db: db}, nil
+	conn := &conn{db: db, useWriteQueue: useWriteQueue}
+	if queueDefaultTimeoutMs != nil {
+		conn.writeQueueDefaultMs = queueDefaultTimeoutMs
+	}
+
+	return conn, nil
 }
 
 func (c *connector) Driver() driver.Driver {
@@ -115,6 +211,7 @@ type DecentDBError struct {
 	Code    int
 	Message string
 	SQL     string
+	Err     error
 }
 
 type Decimal struct {
@@ -149,8 +246,24 @@ const (
 )
 
 func (e *DecentDBError) Error() string {
+	if e.Err != nil {
+		return fmt.Sprintf("decentdb error %d: %s (%s) %v", e.Code, e.Message, e.SQL, e.Err)
+	}
 	return fmt.Sprintf("decentdb error %d: %s", e.Code, e.Message)
 }
+
+func (e *DecentDBError) Unwrap() error {
+	return e.Err
+}
+
+var (
+	ErrBusy        = errors.New("decentdb is busy")
+	ErrTimeout     = errors.New("decentdb operation timed out")
+	ErrCanceled    = errors.New("decentdb request was canceled")
+	ErrQueueFull   = errors.New("decentdb queue is full")
+	ErrQueueClosed = errors.New("decentdb queue is closed")
+	ErrQueueClose  = ErrQueueClosed
+)
 
 func statusCode(status C.ddb_status_t) int {
 	switch status {
@@ -172,6 +285,16 @@ func statusCode(status C.ddb_status_t) int {
 		return 7
 	case C.DDB_ERR_UNSUPPORTED_FORMAT_VERSION:
 		return 8
+	case C.DDB_ERR_BUSY:
+		return 9
+	case C.DDB_ERR_TIMEOUT:
+		return 10
+	case C.DDB_ERR_CANCELED:
+		return 11
+	case C.DDB_ERR_QUEUE_FULL:
+		return 12
+	case C.DDB_ERR_QUEUE_CLOSED:
+		return 13
 	default:
 		return 6
 	}
@@ -179,11 +302,24 @@ func statusCode(status C.ddb_status_t) int {
 
 func statusError(status C.ddb_status_t, sql string) error {
 	msg := C.GoString(C.ddb_last_error_message())
-	return &DecentDBError{
-		Code:    statusCode(status),
-		Message: msg,
-		SQL:     sql,
+	code := statusCode(status)
+	v := &DecentDBError{Code: code, Message: msg, SQL: sql}
+	switch status {
+	case C.DDB_ERR_BUSY:
+		v.Err = ErrBusy
+	case C.DDB_ERR_TIMEOUT:
+		v.Err = ErrTimeout
+	case C.DDB_ERR_CANCELED:
+		v.Err = ErrCanceled
+	case C.DDB_ERR_QUEUE_FULL:
+		v.Err = ErrQueueFull
+	case C.DDB_ERR_QUEUE_CLOSED:
+		v.Err = ErrQueueClosed
 	}
+	if v.Err != nil {
+		return fmt.Errorf("%w: %w", v.Err, v)
+	}
+	return v
 }
 
 func freeAPIString(ptr *C.char) {
@@ -194,8 +330,22 @@ func freeAPIString(ptr *C.char) {
 	C.ddb_string_free(&p)
 }
 
+func appendOption(options string, key string, value string) string {
+	part := fmt.Sprintf("%s=%s", key, value)
+	if options == "" {
+		return part
+	}
+	return options + " " + part
+}
+
+func queryHasQueueOpenSupport() bool {
+	return true
+}
+
 type conn struct {
-	db *C.ddb_db_t
+	db                  *C.ddb_db_t
+	useWriteQueue       bool
+	writeQueueDefaultMs *uint64
 }
 
 // DB provides direct access to DecentDB-specific operations beyond
@@ -203,6 +353,24 @@ type conn struct {
 type DB struct {
 	c      *conn
 	closed uint32
+}
+
+type WriteQueueMetrics struct {
+	Capacity            uint64
+	CurrentDepth        uint64
+	Admitted            uint64
+	Rejected            uint64
+	TimedOut            uint64
+	Canceled            uint64
+	Executed            uint64
+	Committed           uint64
+	Failed              uint64
+	GroupCommitBatches  uint64
+	GroupCommitSyncs    uint64
+	GroupCommitMaxBatch uint64
+	GroupCommitCommits  uint64
+	PhysicalSyncsSaved  uint64
+	TotalQueueWaitNS    uint64
 }
 
 type closeHook func()
@@ -240,6 +408,29 @@ func (d *DB) Close() error {
 		(*hook)()
 	}
 	return d.c.Close()
+}
+
+// ExecQueued executes a single SQL statement through the engine write queue,
+// converting driver args to queue parameters and honoring context deadline.
+func (d *DB) ExecQueued(ctx context.Context, query string, args ...driver.Value) (int64, error) {
+	if d.closed != 0 {
+		return 0, driver.ErrBadConn
+	}
+	return d.c.execQueuedDriverValues(ctx, query, args)
+}
+
+// ExecQueuedDefaultTimeout executes through the write queue using the
+// connection's configured default timeout.
+func (d *DB) ExecQueuedDefaultTimeout(query string, args ...driver.Value) (int64, error) {
+	return d.ExecQueued(context.Background(), query, args...)
+}
+
+// WriteQueueMetrics returns engine write queue metrics.
+func (d *DB) WriteQueueMetrics() (WriteQueueMetrics, error) {
+	if d.closed != 0 {
+		return WriteQueueMetrics{}, driver.ErrBadConn
+	}
+	return d.c.writeQueueMetrics()
 }
 
 // Checkpoint flushes the WAL to the main database file.
@@ -350,6 +541,99 @@ func hasUnsupportedParamStyle(sqlText string) bool {
 	return false
 }
 
+type queuedArgSet struct {
+	Values  []C.ddb_value_t
+	Buffers []unsafe.Pointer
+}
+
+func (q *queuedArgSet) Free() {
+	for _, b := range q.Buffers {
+		C.free(b)
+	}
+	q.Values = nil
+	q.Buffers = nil
+}
+
+func convertQueueArgs(args []driver.NamedValue) (*queuedArgSet, error) {
+	if len(args) == 0 {
+		return &queuedArgSet{}, nil
+	}
+	out := &queuedArgSet{
+		Values:  make([]C.ddb_value_t, len(args)),
+		Buffers: make([]unsafe.Pointer, 0, len(args)),
+	}
+
+	for i, arg := range args {
+		switch value := arg.Value.(type) {
+		case nil:
+			out.Values[i].tag = C.DDB_VALUE_NULL
+		case int:
+			out.Values[i].tag = C.DDB_VALUE_INT64
+			out.Values[i].int64_value = C.int64_t(int64(value))
+		case int64:
+			out.Values[i].tag = C.DDB_VALUE_INT64
+			out.Values[i].int64_value = C.int64_t(value)
+		case float64:
+			out.Values[i].tag = C.DDB_VALUE_FLOAT64
+			out.Values[i].float64_value = C.double(value)
+		case bool:
+			out.Values[i].tag = C.DDB_VALUE_BOOL
+			if value {
+				out.Values[i].bool_value = C.uint8_t(1)
+			}
+		case string:
+			out.Values[i].tag = C.DDB_VALUE_TEXT
+			if len(value) > 0 {
+				ptr := C.CBytes([]byte(value))
+				out.Values[i].data = (*C.uint8_t)(ptr)
+				out.Values[i].len = C.size_t(len(value))
+				out.Buffers = append(out.Buffers, ptr)
+			}
+		case []byte:
+			out.Values[i].tag = C.DDB_VALUE_BLOB
+			if len(value) > 0 {
+				ptr := C.CBytes(value)
+				out.Values[i].data = (*C.uint8_t)(ptr)
+				out.Values[i].len = C.size_t(len(value))
+				out.Buffers = append(out.Buffers, ptr)
+			}
+		case Decimal:
+			out.Values[i].tag = C.DDB_VALUE_DECIMAL
+			out.Values[i].decimal_scaled = C.int64_t(value.Unscaled)
+			scale := value.Scale
+			if scale < 0 {
+				scale = 0
+			} else if scale > 255 {
+				scale = 255
+			}
+			out.Values[i].decimal_scale = C.uint8_t(scale)
+		case GeometryWKB:
+			out.Values[i].tag = C.DDB_VALUE_GEOMETRY
+			if len(value) > 0 {
+				ptr := C.CBytes(value)
+				out.Values[i].data = (*C.uint8_t)(ptr)
+				out.Values[i].len = C.size_t(len(value))
+				out.Buffers = append(out.Buffers, ptr)
+			}
+		case GeographyWKB:
+			out.Values[i].tag = C.DDB_VALUE_GEOGRAPHY
+			if len(value) > 0 {
+				ptr := C.CBytes(value)
+				out.Values[i].data = (*C.uint8_t)(ptr)
+				out.Values[i].len = C.size_t(len(value))
+				out.Buffers = append(out.Buffers, ptr)
+			}
+		case time.Time:
+			out.Values[i].tag = C.DDB_VALUE_TIMESTAMP_MICROS
+			out.Values[i].timestamp_micros = C.int64_t(value.UnixNano() / 1e3)
+		default:
+			return nil, fmt.Errorf("unsupported parameter type %T", arg.Value)
+		}
+	}
+
+	return out, nil
+}
+
 func (c *conn) Prepare(query string) (driver.Stmt, error) {
 	return c.PrepareContext(context.Background(), query)
 }
@@ -395,6 +679,139 @@ func (c *conn) Checkpoint() error {
 		return statusError(status, "")
 	}
 	return nil
+}
+
+func (c *conn) queueTimeoutFromContext(ctx context.Context) C.uint64_t {
+	if c == nil {
+		return C.uint64_t(writeQueueTimeoutDefault)
+	}
+	if ctx == nil || ctx == context.Background() || ctx == context.TODO() {
+		if c.writeQueueDefaultMs != nil {
+			return C.uint64_t(*c.writeQueueDefaultMs)
+		}
+		return C.uint64_t(writeQueueTimeoutDefault)
+	}
+
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return 0
+		}
+		remainingMs := uint64(remaining.Milliseconds())
+		if remainingMs < 1 {
+			remainingMs = 1
+		}
+		if c.writeQueueDefaultMs == nil {
+			return C.uint64_t(remainingMs)
+		}
+		if *c.writeQueueDefaultMs == 0 {
+			return 0
+		}
+		if *c.writeQueueDefaultMs <= remainingMs {
+			return C.uint64_t(*c.writeQueueDefaultMs)
+		}
+		return C.uint64_t(remainingMs)
+	}
+
+	if c.writeQueueDefaultMs != nil {
+		return C.uint64_t(*c.writeQueueDefaultMs)
+	}
+	return C.uint64_t(writeQueueTimeoutDefault)
+}
+
+func (c *conn) writeQueueMetrics() (WriteQueueMetrics, error) {
+	if c.db == nil {
+		return WriteQueueMetrics{}, driver.ErrBadConn
+	}
+	var cMetrics C.ddb_write_queue_metrics_t
+	status := C.ddb_db_write_queue_metrics(c.db, &cMetrics)
+	if status != C.DDB_OK {
+		return WriteQueueMetrics{}, statusError(status, "write_queue_metrics")
+	}
+	return WriteQueueMetrics{
+		Capacity:            uint64(cMetrics.capacity),
+		CurrentDepth:        uint64(cMetrics.current_depth),
+		Admitted:            uint64(cMetrics.admitted),
+		Rejected:            uint64(cMetrics.rejected),
+		TimedOut:            uint64(cMetrics.timed_out),
+		Canceled:            uint64(cMetrics.canceled),
+		Executed:            uint64(cMetrics.executed),
+		Committed:           uint64(cMetrics.committed),
+		Failed:              uint64(cMetrics.failed),
+		GroupCommitBatches:  uint64(cMetrics.group_commit_batches),
+		GroupCommitSyncs:    uint64(cMetrics.group_commit_syncs),
+		GroupCommitMaxBatch: uint64(cMetrics.group_commit_max_batch),
+		GroupCommitCommits:  uint64(cMetrics.group_commit_commits_covered),
+		PhysicalSyncsSaved:  uint64(cMetrics.physical_syncs_saved),
+		TotalQueueWaitNS:    uint64(cMetrics.total_queue_wait_ns),
+	}, nil
+}
+
+func (c *conn) execQueuedNamed(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if c.db == nil {
+		return nil, driver.ErrBadConn
+	}
+
+	for _, arg := range args {
+		if arg.Ordinal <= 0 {
+			return nil, fmt.Errorf("invalid parameter index %d", arg.Ordinal)
+		}
+	}
+
+	queueArgs, err := convertQueueArgs(args)
+	if err != nil {
+		return nil, err
+	}
+	defer queueArgs.Free()
+
+	cQuery := C.CString(query)
+	defer C.free(unsafe.Pointer(cQuery))
+
+	var result *C.ddb_result_t
+	var values *C.ddb_value_t
+	if len(queueArgs.Values) > 0 {
+		values = &queueArgs.Values[0]
+	}
+	status := C.ddb_db_execute_queued(
+		c.db,
+		cQuery,
+		values,
+		C.size_t(len(queueArgs.Values)),
+		c.queueTimeoutFromContext(ctx),
+		&result,
+	)
+	if status != C.DDB_OK {
+		return nil, statusError(status, query)
+	}
+	defer C.ddb_result_free(&result)
+
+	var affected C.uint64_t
+	status = C.ddb_result_affected_rows(result, &affected)
+	if status != C.DDB_OK {
+		return nil, statusError(status, query)
+	}
+	return driver.RowsAffected(affected), nil
+}
+
+func (c *conn) execQueuedDriverValues(ctx context.Context, query string, args []driver.Value) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if c.db == nil {
+		return 0, driver.ErrBadConn
+	}
+	namedArgs := make([]driver.NamedValue, len(args))
+	for i, value := range args {
+		namedArgs[i] = driver.NamedValue{Ordinal: i + 1, Value: value}
+	}
+	result, err := c.execQueuedNamed(ctx, query, namedArgs)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 // SaveAs exports the database to a new on-disk file at destPath.
@@ -936,6 +1353,27 @@ func isTransactionControlQuery(query string, args []driver.NamedValue) string {
 	}
 }
 
+func isLikelyWriteQuery(query string) bool {
+	normalized := strings.TrimSpace(strings.ToUpper(strings.TrimSuffix(strings.TrimSpace(query), ";")))
+	if normalized == "" {
+		return false
+	}
+	writePrefixes := []string{
+		"INSERT ",
+		"INSERT\t", "UPDATE ", "UPDATE\t", "DELETE ", "DELETE\t", "CREATE ",
+		"CREATE\t", "ALTER ", "ALTER\t", "DROP ", "DROP\t", "TRUNCATE ",
+		"TRUNCATE\t", "RENAME ", "RENAME\t", "REINDEX ", "REINDEX\t", "VACUUM ",
+		"VACUUM\t", "ANALYZE ", "ANALYZE\t", "ATTACH ", "ATTACH\t", "DETACH ",
+		"DETACH\t", "INSERT", "UPDATE", "DELETE", "CREATE", "ALTER", "DROP", "TRUNCATE", "VACUUM",
+	}
+	for _, prefix := range writePrefixes {
+		if strings.HasPrefix(normalized, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 func (c *conn) executeTransactionControl(ctx context.Context, control string) (driver.Result, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -961,6 +1399,9 @@ func (c *conn) executeTransactionControl(ctx context.Context, control string) (d
 func (c *conn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
 	if control := isTransactionControlQuery(query, args); control != "" {
 		return c.executeTransactionControl(ctx, control)
+	}
+	if c.useWriteQueue && isLikelyWriteQuery(query) {
+		return c.execQueuedNamed(ctx, query, args)
 	}
 	s, err := c.PrepareContext(ctx, query)
 	if err != nil {

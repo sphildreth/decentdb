@@ -75,6 +75,8 @@ public final class DecentDBDriver implements Driver {
         if (!"openOrCreate".equals(effectiveMode)) {
             appendOpt(opts, "mode=" + modeToNative(effectiveMode));
         }
+        appendNativeQueueOptions(opts, parsed.nativeOptions);
+        appendNativeQueueOptions(opts, queueOptionsFromProperties(info));
 
         NativeLibLoader.ensureLoaded();
         long dbHandle = DecentDBNative.dbOpen(parsed.filePath, opts.toString());
@@ -135,13 +137,15 @@ public final class DecentDBDriver implements Driver {
         final boolean readOnly;
         final int busyTimeoutMs;
         final int cachePages;
+        final String nativeOptions;
 
-        ParsedUrl(String filePath, String mode, boolean readOnly, int busyTimeoutMs, int cachePages) {
+        ParsedUrl(String filePath, String mode, boolean readOnly, int busyTimeoutMs, int cachePages, String nativeOptions) {
             this.filePath = filePath;
             this.mode = mode;
             this.readOnly = readOnly;
             this.busyTimeoutMs = busyTimeoutMs;
             this.cachePages = cachePages;
+            this.nativeOptions = nativeOptions;
         }
 
         static ParsedUrl parse(String url) {
@@ -163,6 +167,7 @@ public final class DecentDBDriver implements Driver {
             boolean readOnly = false;
             int busyTimeoutMs = 0;
             int cachePages = 0;
+            StringBuilder nativeOptions = new StringBuilder();
 
             for (String part : query.split("&")) {
                 if (part.isEmpty()) continue;
@@ -186,9 +191,18 @@ public final class DecentDBDriver implements Driver {
                     case "cachepages":
                         try { cachePages = Integer.parseInt(v); } catch (NumberFormatException ignored) {}
                         break;
+                    case "write_queue_enabled":
+                    case "write_queue_capacity":
+                    case "write_queue_default_timeout_ms":
+                    case "write_queue_strict_group_commit":
+                    case "write_queue_group_commit":
+                    case "write_queue_max_batch":
+                    case "write_queue_max_group_delay_us":
+                        appendOpt(nativeOptions, k + "=" + v);
+                        break;
                 }
             }
-            return new ParsedUrl(filePath, mode, readOnly, busyTimeoutMs, cachePages);
+            return new ParsedUrl(filePath, mode, readOnly, busyTimeoutMs, cachePages, nativeOptions.toString());
         }
     }
 
@@ -217,6 +231,33 @@ public final class DecentDBDriver implements Driver {
     private static void appendOpt(StringBuilder sb, String kv) {
         if (sb.length() > 0) sb.append('&');
         sb.append(kv);
+    }
+
+    private static void appendNativeQueueOptions(StringBuilder sb, String options) {
+        if (options == null || options.isBlank()) return;
+        for (String part : options.split("[&;]")) {
+            if (!part.isBlank()) appendOpt(sb, part);
+        }
+    }
+
+    private static String queueOptionsFromProperties(Properties props) {
+        if (props == null) return "";
+        StringBuilder sb = new StringBuilder();
+        appendPropertyOption(props, sb, "write_queue_enabled");
+        appendPropertyOption(props, sb, "write_queue_capacity");
+        appendPropertyOption(props, sb, "write_queue_default_timeout_ms");
+        appendPropertyOption(props, sb, "write_queue_strict_group_commit");
+        appendPropertyOption(props, sb, "write_queue_group_commit");
+        appendPropertyOption(props, sb, "write_queue_max_batch");
+        appendPropertyOption(props, sb, "write_queue_max_group_delay_us");
+        return sb.toString();
+    }
+
+    private static void appendPropertyOption(Properties props, StringBuilder sb, String key) {
+        String value = props.getProperty(key);
+        if (value != null && !value.isBlank()) {
+            appendOpt(sb, key + "=" + value.trim());
+        }
     }
 
     private static String normalizeMode(String mode) {

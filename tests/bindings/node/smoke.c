@@ -46,6 +46,21 @@ static napi_value run_smoke(napi_env env, napi_callback_info info) {
     return fail(env, error);
   }
   ddb_result_free(&result);
+  if (!check(ddb_db_execute_queued(
+                 db, "INSERT INTO smoke (id, name) VALUES (2, 'node-queued')",
+                 NULL, 0, DDB_WRITE_QUEUE_TIMEOUT_DEFAULT, &result),
+             error, sizeof(error), "queued insert")) {
+    return fail(env, error);
+  }
+  ddb_result_free(&result);
+  ddb_write_queue_metrics_t metrics;
+  if (!check(ddb_db_write_queue_metrics(db, &metrics), error, sizeof(error),
+             "queue metrics")) {
+    return fail(env, error);
+  }
+  if (metrics.admitted != 1 || metrics.committed != 1 || metrics.failed != 0) {
+    return fail(env, "unexpected queue metrics");
+  }
   if (!check(ddb_db_execute(db, "SELECT id, name FROM smoke", NULL, 0, &result),
              error, sizeof(error), "select")) {
     return fail(env, error);
@@ -55,8 +70,8 @@ static napi_value run_smoke(napi_env env, napi_callback_info info) {
     return fail(env, error);
   }
   ddb_result_free(&result);
-  if (rows != 1) {
-    return fail(env, "expected 1 row");
+  if (rows != 2) {
+    return fail(env, "expected 2 rows");
   }
   if (ddb_db_execute(db, "SELECT * FROM nope", NULL, 0, &result) !=
       DDB_ERR_SQL) {

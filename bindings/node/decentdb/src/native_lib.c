@@ -43,9 +43,22 @@ typedef const char* (*fn_version_t)(void);
 typedef const char* (*fn_last_error_message_t)(void);
 typedef ddb_status_t (*fn_string_free_t)(char** value);
 typedef ddb_status_t (*fn_db_create_t)(const char* path, ddb_db_t** out_db);
+typedef ddb_status_t (*fn_db_create_with_options_t)(const char* path, const char* options, ddb_db_t** out_db);
 typedef ddb_status_t (*fn_db_open_t)(const char* path, ddb_db_t** out_db);
+typedef ddb_status_t (*fn_db_open_with_options_t)(const char* path, const char* options, ddb_db_t** out_db);
 typedef ddb_status_t (*fn_db_open_or_create_t)(const char* path, ddb_db_t** out_db);
+typedef ddb_status_t (*fn_db_open_or_create_with_options_t)(const char* path, const char* options, ddb_db_t** out_db);
 typedef ddb_status_t (*fn_db_free_t)(ddb_db_t** db);
+typedef ddb_status_t (*fn_db_execute_queued_t)(
+    ddb_db_t* db,
+    const char* sql,
+    const ddb_value_t* params,
+    size_t params_len,
+    uint64_t timeout_ms,
+    ddb_result_t** out_result);
+typedef ddb_status_t (*fn_db_write_queue_metrics_t)(ddb_db_t* db, ddb_write_queue_metrics_t* out_metrics);
+typedef ddb_status_t (*fn_result_affected_rows_t)(const ddb_result_t* result, uint64_t* out_rows);
+typedef ddb_status_t (*fn_result_free_t)(ddb_result_t** result);
 typedef ddb_status_t (*fn_db_prepare_t)(ddb_db_t* db, const char* sql, ddb_stmt_t** out_stmt);
 typedef ddb_status_t (*fn_stmt_free_t)(ddb_stmt_t** stmt);
 typedef ddb_status_t (*fn_stmt_reset_t)(ddb_stmt_t* stmt);
@@ -106,9 +119,16 @@ static struct {
   fn_last_error_message_t last_error_message;
   fn_string_free_t string_free;
   fn_db_create_t db_create;
+  fn_db_create_with_options_t db_create_with_options;
   fn_db_open_t db_open;
+  fn_db_open_with_options_t db_open_with_options;
   fn_db_open_or_create_t db_open_or_create;
+  fn_db_open_or_create_with_options_t db_open_or_create_with_options;
   fn_db_free_t db_free;
+  fn_db_execute_queued_t db_execute_queued;
+  fn_db_write_queue_metrics_t db_write_queue_metrics;
+  fn_result_affected_rows_t result_affected_rows;
+  fn_result_free_t result_free;
   fn_db_prepare_t db_prepare;
   fn_stmt_free_t stmt_free;
   fn_stmt_reset_t stmt_reset;
@@ -188,6 +208,16 @@ static int status_to_legacy_code(ddb_status_t status) {
       return 7;
     case DDB_ERR_UNSUPPORTED_FORMAT_VERSION:
       return 8;
+    case DDB_ERR_BUSY:
+      return 9;
+    case DDB_ERR_TIMEOUT:
+      return 10;
+    case DDB_ERR_CANCELED:
+      return 11;
+    case DDB_ERR_QUEUE_FULL:
+      return 12;
+    case DDB_ERR_QUEUE_CLOSED:
+      return 13;
     default:
       return 6;
   }
@@ -218,27 +248,105 @@ static int maybe_zero_length_db_file(const char* path_utf8) {
   return len == 0;
 }
 
+static int ci_equal_n(const char* a, size_t a_len, const char* b) {
+  size_t b_len = strlen(b);
+  if (a_len != b_len) return 0;
+  for (size_t i = 0; i < a_len; i++) {
+    char ca = a[i];
+    char cb = b[i];
+    if (ca >= 'A' && ca <= 'Z') ca = (char)(ca - 'A' + 'a');
+    if (cb >= 'A' && cb <= 'Z') cb = (char)(cb - 'A' + 'a');
+    if (ca != cb) return 0;
+  }
+  return 1;
+}
+
+static int parse_mode_token(const char* token, size_t len) {
+  if (len < 5 || !ci_equal_n(token, 5, "mode=")) return 0;
+  const char* value = token + 5;
+  size_t value_len = len - 5;
+  if (ci_equal_n(value, value_len, "create")) return 1;
+  if (ci_equal_n(value, value_len, "open")) return 2;
+  return 0;
+}
+
+static char* copy_options_without_mode(const char* options_utf8, int* out_mode) {
+  if (out_mode) *out_mode = 0;
+  if (!options_utf8 || options_utf8[0] == '\0') return NULL;
+
+  size_t len = strlen(options_utf8);
+  char* out = (char*)malloc(len + 1);
+  if (!out) return NULL;
+  size_t out_len = 0;
+
+  const char* cursor = options_utf8;
+  while (*cursor != '\0') {
+    while (*cursor == ';' || *cursor == ',' || *cursor == '&' || *cursor == ' ' ||
+           *cursor == '\t' || *cursor == '\r' || *cursor == '\n') {
+      cursor++;
+    }
+    if (*cursor == '\0') break;
+
+    const char* start = cursor;
+    while (*cursor != '\0' && *cursor != ';' && *cursor != ',' && *cursor != '&' &&
+           *cursor != ' ' && *cursor != '\t' && *cursor != '\r' && *cursor != '\n') {
+      cursor++;
+    }
+    size_t token_len = (size_t)(cursor - start);
+    int mode = parse_mode_token(start, token_len);
+    if (token_len >= 5 && ci_equal_n(start, 5, "mode=")) {
+      if (out_mode) *out_mode = mode;
+      continue;
+    }
+
+    if (out_len != 0) out[out_len++] = ';';
+    memcpy(out + out_len, start, token_len);
+    out_len += token_len;
+  }
+
+  out[out_len] = '\0';
+  if (out_len == 0) {
+    free(out);
+    return NULL;
+  }
+  return out;
+}
+
 static decentdb_db* wrap_open(const char* path_utf8, const char* options_utf8) {
   ddb_db_t* db = NULL;
   ddb_status_t status = DDB_ERR_INTERNAL;
+  int mode = 0;
+  char* native_options = copy_options_without_mode(options_utf8, &mode);
 
-  if (options_utf8 && options_utf8[0] != '\0') {
-    if (strcmp(options_utf8, "mode=create") == 0) {
+  if (native_options && native_options[0] != '\0') {
+    if (mode == 1 && g_sym.db_create_with_options) {
+      status = g_sym.db_create_with_options(path_utf8, native_options, &db);
+    } else if (mode == 2 && g_sym.db_open_with_options) {
+      status = g_sym.db_open_with_options(path_utf8, native_options, &db);
+    } else if (g_sym.db_open_or_create_with_options) {
+      status = g_sym.db_open_or_create_with_options(path_utf8, native_options, &db);
+    } else {
+      status = DDB_ERR_INTERNAL;
+    }
+  } else {
+    if (mode == 1) {
       status = g_sym.db_create(path_utf8, &db);
-    } else if (strcmp(options_utf8, "mode=open") == 0) {
+    } else if (mode == 2) {
       status = g_sym.db_open(path_utf8, &db);
     } else {
       status = g_sym.db_open_or_create(path_utf8, &db);
     }
-  } else {
-    status = g_sym.db_open_or_create(path_utf8, &db);
   }
-
   if ((status != DDB_OK || db == NULL) && maybe_zero_length_db_file(path_utf8)) {
     remove(path_utf8);
     db = NULL;
-    status = g_sym.db_open_or_create(path_utf8, &db);
+    if (native_options && native_options[0] != '\0' && g_sym.db_open_or_create_with_options) {
+      status = g_sym.db_open_or_create_with_options(path_utf8, native_options, &db);
+    } else {
+      status = g_sym.db_open_or_create(path_utf8, &db);
+    }
   }
+  free(native_options);
 
   set_status(status);
   if (status != DDB_OK || db == NULL) return NULL;
@@ -248,6 +356,49 @@ static decentdb_db* wrap_open(const char* path_utf8, const char* options_utf8) {
 static int wrap_close(decentdb_db* db) {
   ddb_db_t* dbp = db;
   ddb_status_t status = g_sym.db_free(&dbp);
+  set_status(status);
+  return status == DDB_OK ? 0 : -1;
+}
+
+static int wrap_execute_queued(
+    decentdb_db* db,
+    const char* sql_utf8,
+    uint64_t timeout_ms,
+    uint64_t* out_affected_rows) {
+  if (!g_sym.db_execute_queued || !g_sym.result_affected_rows || !g_sym.result_free) {
+    set_status(DDB_ERR_INTERNAL);
+    return -1;
+  }
+
+  ddb_result_t* result = NULL;
+  ddb_status_t status = g_sym.db_execute_queued(
+      db,
+      sql_utf8,
+      NULL,
+      0,
+      timeout_ms,
+      &result);
+  set_status(status);
+  if (status != DDB_OK) return -1;
+
+  uint64_t affected = 0;
+  if (result != NULL) {
+    status = g_sym.result_affected_rows(result, &affected);
+    ddb_status_t free_status = g_sym.result_free(&result);
+    if (status == DDB_OK) status = free_status;
+  }
+  set_status(status);
+  if (status != DDB_OK) return -1;
+  if (out_affected_rows) *out_affected_rows = affected;
+  return 0;
+}
+
+static int wrap_write_queue_metrics(decentdb_db* db, ddb_write_queue_metrics_t* out_metrics) {
+  if (!g_sym.db_write_queue_metrics) {
+    set_status(DDB_ERR_INTERNAL);
+    return -1;
+  }
+  ddb_status_t status = g_sym.db_write_queue_metrics(db, out_metrics);
   set_status(status);
   return status == DDB_OK ? 0 : -1;
 }
@@ -674,9 +825,22 @@ static int resolve_all(DL_HANDLE h) {
   g_sym.last_error_message = (fn_last_error_message_t)load_sym(h, "ddb_last_error_message");
   g_sym.string_free = (fn_string_free_t)load_sym(h, "ddb_string_free");
   g_sym.db_create = (fn_db_create_t)load_sym(h, "ddb_db_create");
+  g_sym.db_create_with_options =
+      (fn_db_create_with_options_t)load_sym(h, "ddb_db_create_with_options");
   g_sym.db_open = (fn_db_open_t)load_sym(h, "ddb_db_open");
+  g_sym.db_open_with_options =
+      (fn_db_open_with_options_t)load_sym(h, "ddb_db_open_with_options");
   g_sym.db_open_or_create = (fn_db_open_or_create_t)load_sym(h, "ddb_db_open_or_create");
+  g_sym.db_open_or_create_with_options =
+      (fn_db_open_or_create_with_options_t)load_sym(h, "ddb_db_open_or_create_with_options");
   g_sym.db_free = (fn_db_free_t)load_sym(h, "ddb_db_free");
+  g_sym.db_execute_queued =
+      (fn_db_execute_queued_t)load_sym(h, "ddb_db_execute_queued");
+  g_sym.db_write_queue_metrics =
+      (fn_db_write_queue_metrics_t)load_sym(h, "ddb_db_write_queue_metrics");
+  g_sym.result_affected_rows =
+      (fn_result_affected_rows_t)load_sym(h, "ddb_result_affected_rows");
+  g_sym.result_free = (fn_result_free_t)load_sym(h, "ddb_result_free");
   g_sym.db_prepare = (fn_db_prepare_t)load_sym(h, "ddb_db_prepare");
   g_sym.stmt_free = (fn_stmt_free_t)load_sym(h, "ddb_stmt_free");
   g_sym.stmt_reset = (fn_stmt_reset_t)load_sym(h, "ddb_stmt_reset");
@@ -772,6 +936,8 @@ static int resolve_all(DL_HANDLE h) {
 
   g_api.open = wrap_open;
   g_api.close = wrap_close;
+  g_api.execute_queued = wrap_execute_queued;
+  g_api.write_queue_metrics = wrap_write_queue_metrics;
   g_api.last_error_code = wrap_last_error_code;
   g_api.last_error_message = wrap_last_error_message;
   g_api.prepare = wrap_prepare;

@@ -35,6 +35,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added ADR 0161 documenting the browser WASM/OPFS runtime and its one-worker
   ownership model.
 - Added the WASM / Browser API documentation page.
+- Added concurrent-write benchmark coverage: native benchmark hooks for direct
+  single-writer and read-under-write regression slices, executable queued-write
+  single-writer and reader-under-writer scenarios, a shared cross-binding
+  concurrent-write scenario definition, a grouped-commit fault-injection test
+  plan, and pre-commit check keys for the new slices.
+- Added the engine-owned queued write path with strict durable group commit,
+  bounded admission, timeout and cancellation-before-run errors, Rust and C ABI
+  queue metrics, C ABI status codes and execution entry points, and ADR 0162.
+- Added the Write Concurrency user guide and C ABI documentation for queued
+  writes, queue configuration, queue metrics, and the distinction between
+  strict group commit and async commit.
+- Added queued-write binding coverage across Python, Go, Dart, Node, .NET
+  native, Java/JDBC status/config mapping, Knex unbound writes, and C ABI smoke
+  tests for maintained binding surfaces.
 
 ### Changed
 

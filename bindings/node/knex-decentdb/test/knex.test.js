@@ -87,6 +87,31 @@ test('Knex transaction', async (t) => {
   }
 });
 
+test('Knex forwards write queue options for unbound writes', async (t) => {
+  cleanup();
+
+  const k = knex({
+    client: Client_DecentDB,
+    connection: {
+      filename: DB_PATH,
+      writeQueueEnabled: true,
+      writeQueueCapacity: 16,
+      writeQueueDefaultTimeoutMs: 1000
+    },
+    useNullAsDefault: true
+  });
+
+  try {
+    await k.raw('CREATE TABLE queued_knex (id INT64 PRIMARY KEY, name TEXT)');
+    await k.raw("INSERT INTO queued_knex VALUES (1, 'queued')");
+    const rows = await k.raw('SELECT name FROM queued_knex WHERE id = 1');
+    assert.equal(rows.rows[0].name, 'queued');
+  } finally {
+    await k.destroy();
+    cleanup();
+  }
+});
+
 test('Knex transaction closes pool after failure', async (t) => {
   cleanup();
 

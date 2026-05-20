@@ -5,6 +5,7 @@ const uint DdbOk = 0;
 const uint DdbErrSql = 5;
 const uint DdbValueInt64 = 1;
 const uint DdbValueText = 4;
+const ulong DdbWriteQueueTimeoutDefault = ulong.MaxValue;
 
 Run();
 
@@ -83,6 +84,36 @@ static unsafe void Run()
         throw new InvalidOperationException("expected positive commit LSN");
     }
 
+    using (var sql = Utf8CString.FromString("INSERT INTO items (id, name) VALUES ($1, $2)"))
+    using (var text = Utf8CString.FromString("Queue"))
+    {
+        var values = new DdbValue[2];
+        values[0].Tag = DdbValueInt64;
+        values[0].Int64Value = 3;
+        values[1].Tag = DdbValueText;
+        values[1].Data = text.Pointer;
+        values[1].Len = (nuint)text.ByteLength;
+        fixed (DdbValue* ptr = values)
+        {
+            Check(Native.ddb_db_execute_queued(
+                db,
+                sql.Pointer,
+                (IntPtr)ptr,
+                (nuint)values.Length,
+                DdbWriteQueueTimeoutDefault,
+                ref result), "queued insert");
+        }
+        Check(Native.ddb_result_free(ref result), "free queued insert result");
+    }
+
+    var queueMetrics = new DdbWriteQueueMetrics();
+    Check(Native.ddb_db_write_queue_metrics(db, ref queueMetrics), "queue metrics");
+    if (queueMetrics.Admitted != 1 || queueMetrics.Committed != 1 || queueMetrics.Failed != 0)
+    {
+        throw new InvalidOperationException(
+            $"unexpected queue metrics admitted={queueMetrics.Admitted} committed={queueMetrics.Committed} failed={queueMetrics.Failed}");
+    }
+
     using (var sql = Utf8CString.FromString("SELECT id, name FROM items ORDER BY id"))
     {
         Check(Native.ddb_db_execute(db, sql.Pointer, IntPtr.Zero, 0, ref result), "select committed rows");
@@ -90,7 +121,7 @@ static unsafe void Run()
         nuint columns = 0;
         Check(Native.ddb_result_row_count(result, ref rows), "row count");
         Check(Native.ddb_result_column_count(result, ref columns), "column count");
-        if (rows != 1 || columns != 2)
+        if (rows != 2 || columns != 2)
         {
             throw new InvalidOperationException($"unexpected result shape rows={rows} columns={columns}");
         }
@@ -234,6 +265,26 @@ internal unsafe struct DdbValue
     public long IntervalMicros;
 }
 
+[StructLayout(LayoutKind.Sequential)]
+internal struct DdbWriteQueueMetrics
+{
+    public nuint Capacity;
+    public nuint CurrentDepth;
+    public ulong Admitted;
+    public ulong Rejected;
+    public ulong TimedOut;
+    public ulong Canceled;
+    public ulong Executed;
+    public ulong Committed;
+    public ulong Failed;
+    public ulong GroupCommitBatches;
+    public ulong GroupCommitSyncs;
+    public ulong GroupCommitMaxBatch;
+    public ulong GroupCommitCommitsCovered;
+    public ulong PhysicalSyncsSaved;
+    public ulong TotalQueueWaitNs;
+}
+
 internal static partial class Native
 {
     [LibraryImport("decentdb")]
@@ -252,6 +303,20 @@ internal static partial class Native
         IntPtr values,
         nuint valueCount,
         ref IntPtr result);
+
+    [LibraryImport("decentdb")]
+    internal static partial uint ddb_db_execute_queued(
+        IntPtr db,
+        IntPtr sql,
+        IntPtr values,
+        nuint valueCount,
+        ulong timeoutMs,
+        ref IntPtr result);
+
+    [LibraryImport("decentdb")]
+    internal static partial uint ddb_db_write_queue_metrics(
+        IntPtr db,
+        ref DdbWriteQueueMetrics metrics);
 
     [LibraryImport("decentdb")]
     internal static partial uint ddb_db_begin_transaction(IntPtr db);

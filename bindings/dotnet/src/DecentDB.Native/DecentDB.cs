@@ -328,6 +328,58 @@ public sealed class DecentDB : IDisposable
         return FreeStringOrEmpty(ptr);
     }
 
+    public ulong ExecuteQueued(string sql, ulong timeoutMs = ulong.MaxValue)
+    {
+        ArgumentNullException.ThrowIfNull(sql);
+        var sqlBytes = Encoding.UTF8.GetBytes(sql + "\0");
+        IntPtr result = IntPtr.Zero;
+        unsafe
+        {
+            fixed (byte* pSql = sqlBytes)
+            {
+                var res = RecordStatus(DecentDBNativeUnsafe.ddb_db_execute_queued(
+                    Handle,
+                    pSql,
+                    null,
+                    0,
+                    timeoutMs,
+                    out result));
+                if (res != 0)
+                {
+                    throw new DecentDBException(_lastErrorCode, LastErrorMessage, sql);
+                }
+            }
+        }
+
+        try
+        {
+            var affectedStatus = RecordStatus(DecentDBNativeUnsafe.ddb_result_affected_rows(result, out var affected));
+            if (affectedStatus != 0)
+            {
+                throw new DecentDBException(_lastErrorCode, LastErrorMessage, sql);
+            }
+            return affected;
+        }
+        finally
+        {
+            if (result != IntPtr.Zero)
+            {
+                RecordStatus(DecentDBNativeUnsafe.ddb_result_free(ref result));
+            }
+        }
+    }
+
+    public DdbWriteQueueMetrics WriteQueueMetrics()
+    {
+        var res = RecordStatus(DecentDBNativeUnsafe.ddb_db_write_queue_metrics(Handle, out var metrics));
+        if (res != 0)
+        {
+            throw new DecentDBException(_lastErrorCode, LastErrorMessage, "WriteQueueMetrics");
+        }
+
+        return metrics;
+    }
+
     private static string FreeStringOrEmpty(IntPtr ptr)
     {
         if (ptr == IntPtr.Zero) return string.Empty;

@@ -20,7 +20,8 @@ enum _OpenMode { create, open, openOrCreate }
 /// the object is garbage collected, a Dart [Finalizer] will release the native
 /// handle automatically.
 class Database {
-  Database._(this._bindings, Pointer<DdbDb> dbPtr, {int stmtCacheCapacity = 128})
+  Database._(this._bindings, Pointer<DdbDb> dbPtr,
+      {int stmtCacheCapacity = 128})
       : _dbPtr = dbPtr,
         _cap = stmtCacheCapacity,
         _lru = LinkedHashMap<String, Statement>() {
@@ -78,22 +79,32 @@ class Database {
   static Database _openWith(
     _OpenMode mode,
     String path, {
+    String? options,
     String? libraryPath,
     NativeBindings? bindings,
     int stmtCacheCapacity = 128,
   }) {
     final nb = _resolveBindings(libraryPath, bindings);
     final nativePath = path.toNativeUtf8();
+    final nativeOptions = options == null || options.trim().isEmpty
+        ? null
+        : options.toNativeUtf8();
     final outDb = calloc<Pointer<DdbDb>>();
     try {
       final int status;
       switch (mode) {
         case _OpenMode.create:
-          status = nb.dbCreate(nativePath, outDb);
+          status = nativeOptions == null
+              ? nb.dbCreate(nativePath, outDb)
+              : nb.dbCreateWithOptions(nativePath, nativeOptions, outDb);
         case _OpenMode.open:
-          status = nb.dbOpen(nativePath, outDb);
+          status = nativeOptions == null
+              ? nb.dbOpen(nativePath, outDb)
+              : nb.dbOpenWithOptions(nativePath, nativeOptions, outDb);
         case _OpenMode.openOrCreate:
-          status = nb.dbOpenOrCreate(nativePath, outDb);
+          status = nativeOptions == null
+              ? nb.dbOpenOrCreate(nativePath, outDb)
+              : nb.dbOpenOrCreateWithOptions(nativePath, nativeOptions, outDb);
       }
       if (status != ddbOk) {
         final msgPtr = nb.lastErrorMessage();
@@ -105,14 +116,19 @@ class Database {
       return Database._(nb, outDb.value, stmtCacheCapacity: stmtCacheCapacity);
     } finally {
       calloc.free(outDb);
+      if (nativeOptions != null) {
+        calloc.free(nativeOptions);
+      }
       calloc.free(nativePath);
     }
   }
 
   /// Open or create a database at [path].
   ///
-  /// The [options] parameter is reserved for future ABI extension; passing a
-  /// non-empty string currently throws [ArgumentError].
+  /// [options] is passed to the native open-with-options ABI. Queue options
+  /// include `write_queue_enabled`, `write_queue_capacity`,
+  /// `write_queue_default_timeout_ms`, `write_queue_strict_group_commit`,
+  /// `write_queue_max_batch`, and `write_queue_max_group_delay_us`.
   ///
   /// [stmtCacheCapacity] sets the maximum number of prepared statements held
   /// in the internal LRU cache.  Pass `0` to disable caching.
@@ -123,14 +139,10 @@ class Database {
     NativeBindings? bindings,
     int stmtCacheCapacity = 128,
   }) {
-    if (options != null && options.trim().isNotEmpty) {
-      throw ArgumentError(
-        'Database.open(options: ...) is not exposed by the current stable ddb_* ABI.',
-      );
-    }
     return _openWith(
       _OpenMode.openOrCreate,
       path,
+      options: options,
       libraryPath: libraryPath,
       bindings: bindings,
       stmtCacheCapacity: stmtCacheCapacity,
@@ -140,11 +152,13 @@ class Database {
   /// Create a new database at [path], failing if it already exists.
   static Database create(
     String path, {
+    String? options,
     String? libraryPath,
     NativeBindings? bindings,
     int stmtCacheCapacity = 128,
   }) =>
       _openWith(_OpenMode.create, path,
+          options: options,
           libraryPath: libraryPath,
           bindings: bindings,
           stmtCacheCapacity: stmtCacheCapacity);
@@ -152,11 +166,13 @@ class Database {
   /// Open an existing database at [path], failing if it does not exist.
   static Database openExisting(
     String path, {
+    String? options,
     String? libraryPath,
     NativeBindings? bindings,
     int stmtCacheCapacity = 128,
   }) =>
       _openWith(_OpenMode.open, path,
+          options: options,
           libraryPath: libraryPath,
           bindings: bindings,
           stmtCacheCapacity: stmtCacheCapacity);
@@ -349,10 +365,81 @@ class Database {
       }
       return outAffected.value;
     } finally {
-      _bindings.resultFree(outResult); // best-effort; errors here must not mask a primary exception
+      _bindings.resultFree(
+          outResult); // best-effort; errors here must not mask a primary exception
       calloc.free(outAffected);
       calloc.free(outResult);
       calloc.free(nativeSql);
+    }
+  }
+
+  /// Execute [sql] through the engine-owned write queue with no parameters.
+  ///
+  /// Pass [timeoutMs] to override the database configured queue timeout. When
+  /// omitted, the native configured default is used.
+  int executeQueued(String sql, {int? timeoutMs}) {
+    _checkOpen();
+    final nativeSql = sql.toNativeUtf8();
+    final outResult = calloc<Pointer<DdbResult>>();
+    final outAffected = calloc<Uint64>();
+    try {
+      final status = _bindings.dbExecuteQueued(
+        _dbPtr!,
+        nativeSql,
+        nullptr.cast<DdbValue>(),
+        0,
+        timeoutMs ?? ddbWriteQueueTimeoutDefault,
+        outResult,
+      );
+      if (status != ddbOk) {
+        _throwStatus(status, 'Failed to execute queued SQL');
+      }
+
+      final affectedStatus = _bindings.resultAffectedRows(
+        outResult.value,
+        outAffected,
+      );
+      if (affectedStatus != ddbOk) {
+        _throwStatus(affectedStatus, 'Failed to read queued affected rows');
+      }
+      return outAffected.value;
+    } finally {
+      _bindings.resultFree(outResult);
+      calloc.free(outAffected);
+      calloc.free(outResult);
+      calloc.free(nativeSql);
+    }
+  }
+
+  /// Return a snapshot of native write-queue metrics.
+  Map<String, int> writeQueueMetrics() {
+    _checkOpen();
+    final metrics = calloc<DdbWriteQueueMetrics>();
+    try {
+      final status = _bindings.dbWriteQueueMetrics(_dbPtr!, metrics);
+      if (status != ddbOk) {
+        _throwStatus(status, 'Failed to read write queue metrics');
+      }
+      final value = metrics.ref;
+      return {
+        'capacity': value.capacity,
+        'currentDepth': value.currentDepth,
+        'admitted': value.admitted,
+        'rejected': value.rejected,
+        'timedOut': value.timedOut,
+        'canceled': value.canceled,
+        'executed': value.executed,
+        'committed': value.committed,
+        'failed': value.failed,
+        'groupCommitBatches': value.groupCommitBatches,
+        'groupCommitSyncs': value.groupCommitSyncs,
+        'groupCommitMaxBatch': value.groupCommitMaxBatch,
+        'groupCommitCommitsCovered': value.groupCommitCommitsCovered,
+        'physicalSyncsSaved': value.physicalSyncsSaved,
+        'totalQueueWaitNs': value.totalQueueWaitNs,
+      };
+    } finally {
+      calloc.free(metrics);
     }
   }
 
@@ -422,7 +509,8 @@ class Database {
   /// unit < 0x20).
   void _assertValidIdent(String name) {
     if (name.isEmpty) {
-      throw ArgumentError.value(name, 'name', 'Savepoint name must not be empty');
+      throw ArgumentError.value(
+          name, 'name', 'Savepoint name must not be empty');
     }
     if (name.length > 128) {
       throw ArgumentError.value(
@@ -431,8 +519,8 @@ class Database {
     for (var i = 0; i < name.length; i++) {
       final c = name.codeUnitAt(i);
       if (c == 0x22) {
-        throw ArgumentError.value(
-            name, 'name', 'Savepoint name must not contain double-quote characters');
+        throw ArgumentError.value(name, 'name',
+            'Savepoint name must not contain double-quote characters');
       }
       if (c < 0x20) {
         throw ArgumentError.value(
@@ -531,8 +619,7 @@ class Database {
       }
       final decoded = jsonDecode(rawJson);
       if (decoded is! Map<String, Object?>) {
-        throw FormatException(
-            'Storage state JSON is not an object: $rawJson');
+        throw FormatException('Storage state JSON is not an object: $rawJson');
       }
       return StorageStateSnapshot.fromJson(decoded, rawJson: rawJson);
     } finally {

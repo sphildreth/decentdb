@@ -77,6 +77,11 @@ Common status codes:
 | `DDB_ERR_INTERNAL` | Internal engine error |
 | `DDB_ERR_PANIC` | Panic caught at the ABI boundary |
 | `DDB_ERR_UNSUPPORTED_FORMAT_VERSION` | Database file format is newer than this engine |
+| `DDB_ERR_BUSY` | Resource is busy |
+| `DDB_ERR_TIMEOUT` | Operation timed out before it could run or complete |
+| `DDB_ERR_CANCELED` | Operation was canceled before execution started |
+| `DDB_ERR_QUEUE_FULL` | Write queue capacity is exhausted |
+| `DDB_ERR_QUEUE_CLOSED` | Write queue is shutting down or closed |
 
 `ddb_last_error_message()` returns a borrowed thread-local error string. Treat
 the pointer as valid only until the next DecentDB call on the same thread.
@@ -104,6 +109,40 @@ Rules:
   must be released with `ddb_value_dispose`.
 - Do not call free functions concurrently from multiple threads on the same
   pointer or handle.
+
+## Queued Writes
+
+`ddb_db_execute_queued` submits one SQL statement to the engine-owned write
+queue. It returns the same result handle shape as `ddb_db_execute`.
+
+```c
+ddb_result_t *result = NULL;
+check(ddb_db_execute_queued(
+          db,
+          "INSERT INTO events (id, name) VALUES (1, 'queued')",
+          NULL,
+          0,
+          DDB_WRITE_QUEUE_TIMEOUT_DEFAULT,
+          &result),
+      "queued insert");
+check(ddb_result_free(&result), "free queued result");
+```
+
+Pass `DDB_WRITE_QUEUE_TIMEOUT_DEFAULT` to use the database configured default
+timeout. Pass `0` for immediate timeout behavior.
+
+Queue behavior and strict group commit are documented in
+[Write Concurrency](../user-guide/write-concurrency.md). Metrics are available
+through `ddb_db_write_queue_metrics`:
+
+```c
+ddb_write_queue_metrics_t metrics;
+check(ddb_db_write_queue_metrics(db, &metrics), "queue metrics");
+printf("admitted=%llu committed=%llu syncs=%llu\n",
+       (unsigned long long)metrics.admitted,
+       (unsigned long long)metrics.committed,
+       (unsigned long long)metrics.group_commit_syncs);
+```
 
 ## Minimal C Example
 

@@ -66,13 +66,14 @@ Status values:
 - `TODO`: prioritized roadmap work that is not actively being implemented right
   now.
 - `IN PROGRESS`: active implementation or design work is underway right now.
+- `COMPLETE`: roadmap work delivered for the current public contract.
 - `BACKLOG`: valuable, but not part of the near-term implementation path.
 
 Future version values are planning buckets, not release commitments.
 
 | Priority | Future Version | Status | Feature | Current Source Of Truth | Why This Rank |
 |---:|---|---|---|---|---|
-| 1 | vNext | IN PROGRESS | Concurrent write ergonomics: write queue plus strict group commit | [`WIN_CONCURRENT_WRITE_ERGONOMICS_PHASED_APPROACH.md`](WIN_CONCURRENT_WRITE_ERGONOMICS_PHASED_APPROACH.md); ADR 0135 for async commit; needs ADR/spec for durable queue/group commit | Removes the most visible one-writer friction while preserving durability |
+| 1 | vNext | COMPLETE | Concurrent write ergonomics: write queue plus strict group commit | [`WIN_CONCURRENT_WRITE_ERGONOMICS_PHASED_APPROACH.md`](WIN_CONCURRENT_WRITE_ERGONOMICS_PHASED_APPROACH.md); ADR 0162 for durable queue/group commit; ADR 0135 for async commit distinction | Removes the most visible one-writer friction while preserving durability |
 | 2 | vNext+1 | TODO | Built-in observability and `sys.*` virtual tables | Needs ADR/spec; Doctor v1 is foundation | Makes performance, locks, WAL, sync, and storage state inspectable |
 | 3 | vNext+1 | TODO | Reactive query subscriptions and change streams | Needs ADR/spec; sync journal and branch diff are inputs | Modern local-first apps need live query invalidation without polling |
 | 4 | vNext+2 | TODO | Production browser runtime | ADR 0161 and [`docs/api/wasm.md`](../docs/api/wasm.md); needs follow-up ADR/spec | Browser is a primary local-first runtime, and v1 intentionally lacks multi-tab/service-worker/write coordination |
@@ -137,13 +138,13 @@ server database.
 
 ## 1. Concurrent Write Ergonomics: Write Queue Plus Strict Group Commit
 
-**Status:** `IN PROGRESS`
+**Status:** `COMPLETE`
 
 **Future Version:** vNext
 
 **Source of truth:** [`WIN_CONCURRENT_WRITE_ERGONOMICS_PHASED_APPROACH.md`](WIN_CONCURRENT_WRITE_ERGONOMICS_PHASED_APPROACH.md)
-for phased delivery scope; ADR 0135 for current async commit behavior; needs
-ADR/spec for the durable queue and strict group commit contract.
+for phased delivery scope; ADR 0162 for the durable queue and strict group
+commit contract; ADR 0135 for current async commit behavior.
 
 ### Why This Matters
 
@@ -172,6 +173,16 @@ Strict group commit is the durable batching mode for queued writes:
 - no hidden downgrade from durable commit to async commit
 - no cross-process promises until cross-process WAL coordination exists
 - binding APIs must expose errors consistently instead of spinning internally
+
+### Delivered Contract
+
+The implemented contract is an explicit queued path for self-contained SQL
+statements and batches. Direct writes remain direct. Bindings expose queue
+configuration, status/error mappings, smoke coverage, and queued helpers where
+their current public surface can do so without duplicating the C ABI's typed
+parameter contract. Prepared-statement auto-queueing for every high-level
+provider is intentionally left to a future queued prepared-statement ABI rather
+than hand-rolled binding-side marshalling.
 
 ## 2. Built-In Observability And `sys.*` Virtual Tables
 

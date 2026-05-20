@@ -81,33 +81,52 @@ function normalizeTriggers(parsed) {
   }));
 }
 
-function normalizeOpenOptions({ mode, options } = {}) {
-  const legacy = options == null ? '' : String(options).trim();
-  if (mode != null && legacy !== '') {
-    throw new TypeError('Use either mode or options, not both');
-  }
-
-  const requested =
-    mode != null
-      ? String(mode)
-      : legacy === 'mode=open' || legacy === 'mode=create' || legacy === 'mode=openOrCreate'
-        ? legacy.slice('mode='.length)
-        : legacy === ''
-          ? 'openOrCreate'
-          : null;
-
+function normalizeOpenOptions({
+  mode,
+  options,
+  writeQueueEnabled,
+  writeQueueCapacity,
+  writeQueueDefaultTimeoutMs,
+  writeQueueStrictGroupCommit,
+  writeQueueMaxBatch,
+  writeQueueMaxGroupDelayUs,
+} = {}) {
+  const tokens = [];
+  const requested = mode == null ? 'openOrCreate' : String(mode);
   switch (requested) {
     case 'openOrCreate':
-      return 'mode=openOrCreate';
+      tokens.push('mode=openOrCreate');
+      break;
     case 'open':
-      return 'mode=open';
+      tokens.push('mode=open');
+      break;
     case 'create':
-      return 'mode=create';
+      tokens.push('mode=create');
+      break;
     default:
-      throw new TypeError(
-        "Unsupported native open options. Use mode: 'openOrCreate', 'open', or 'create'.",
-      );
+      throw new TypeError("Unsupported native open mode. Use 'openOrCreate', 'open', or 'create'.");
   }
+
+  if (typeof options === 'string' && options.trim() !== '') {
+    tokens.push(options.trim());
+  } else if (options && typeof options === 'object') {
+    for (const [key, value] of Object.entries(options)) {
+      if (value !== undefined && value !== null) tokens.push(`${key}=${String(value)}`);
+    }
+  } else if (options != null) {
+    throw new TypeError('options must be a native option string or object');
+  }
+
+  const add = (key, value) => {
+    if (value !== undefined && value !== null) tokens.push(`${key}=${String(value)}`);
+  };
+  add('write_queue_enabled', writeQueueEnabled);
+  add('write_queue_capacity', writeQueueCapacity);
+  add('write_queue_default_timeout_ms', writeQueueDefaultTimeoutMs);
+  add('write_queue_strict_group_commit', writeQueueStrictGroupCommit);
+  add('write_queue_max_batch', writeQueueMaxBatch);
+  add('write_queue_max_group_delay_us', writeQueueMaxGroupDelayUs);
+  return tokens.join(';');
 }
 
 function inferNativeLibPath() {
@@ -160,13 +179,32 @@ function normalizeControlSql(sql) {
 }
 
 class Database {
-  constructor({ path, mode, options } = {}) {
+  constructor({
+    path,
+    mode,
+    options,
+    writeQueueEnabled,
+    writeQueueCapacity,
+    writeQueueDefaultTimeoutMs,
+    writeQueueStrictGroupCommit,
+    writeQueueMaxBatch,
+    writeQueueMaxGroupDelayUs,
+  } = {}) {
     if (!path || typeof path !== 'string') {
       throw new TypeError('Database requires { path: string }');
     }
     this._native = loadNative();
     this.path = path;
-    this._handle = this._native.dbOpen(path, normalizeOpenOptions({ mode, options }));
+    this._handle = this._native.dbOpen(path, normalizeOpenOptions({
+      mode,
+      options,
+      writeQueueEnabled,
+      writeQueueCapacity,
+      writeQueueDefaultTimeoutMs,
+      writeQueueStrictGroupCommit,
+      writeQueueMaxBatch,
+      writeQueueMaxGroupDelayUs,
+    }));
     _dbRegistry.register(this, this._handle, this);
   }
 
@@ -289,6 +327,26 @@ class Database {
     } finally {
       stmt.finalize();
     }
+  }
+
+  execQueued(sql, { timeoutMs } = {}) {
+    if (!this._handle) throw new Error('Database is closed');
+    if (typeof sql !== 'string') throw new TypeError('sql must be a string');
+    const affected = this._native.dbExecuteQueued(
+      this._handle,
+      sql,
+      timeoutMs == null ? 0xffffffffffffffffn : BigInt(timeoutMs),
+    );
+    return { rows: [], rowsAffected: affected };
+  }
+
+  async execQueuedAsync(sql, options) {
+    return this.execQueued(sql, options);
+  }
+
+  writeQueueMetrics() {
+    if (!this._handle) throw new Error('Database is closed');
+    return this._native.dbWriteQueueMetrics(this._handle);
   }
 
   checkpoint() {

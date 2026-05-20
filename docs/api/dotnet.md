@@ -27,6 +27,15 @@ Core, and MicroORM surfaces. Performance-critical paths (batch execution, fused
 bind+step, re-execute, zero-copy row views) are exposed through
 `DecentDBNativeUnsafe` and wrapped by the `PreparedStatement` class.
 
+ADO.NET connection strings pass native write-queue options through to the C ABI:
+`Write Queue Enabled`, `Write Queue Capacity`, `Write Queue Default Timeout Ms`,
+`Write Queue Strict Group Commit`, `Write Queue Max Batch`, and
+`Write Queue Max Group Delay Us`. The `DecentDB.Native.DecentDB` class also
+exposes `ExecuteQueued(sql)` for self-contained queued SQL and
+`WriteQueueMetrics()` for native queue counters. ADO.NET prepared statements
+remain on the direct prepared path until the C ABI adds queued
+prepared-statement execution.
+
 ## Use via NuGet
 
 For normal application development, prefer the published NuGet packages. You do

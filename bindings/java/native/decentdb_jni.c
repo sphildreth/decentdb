@@ -28,6 +28,11 @@ static int map_status_to_legacy_code(ddb_status_t status) {
         case DDB_ERR_INTERNAL: return 6;
         case DDB_ERR_PANIC: return 7;
         case DDB_ERR_UNSUPPORTED_FORMAT_VERSION: return 8;
+        case DDB_ERR_BUSY: return 9;
+        case DDB_ERR_TIMEOUT: return 10;
+        case DDB_ERR_CANCELED: return 11;
+        case DDB_ERR_QUEUE_FULL: return 12;
+        case DDB_ERR_QUEUE_CLOSED: return 13;
         default: return 6;
     }
 }
@@ -267,6 +272,42 @@ static int parse_open_mode(const char *opts) {
     return 0;
 }
 
+static char *native_options_without_mode(const char *opts) {
+    if (opts == NULL || opts[0] == '\0') return NULL;
+    size_t len = strlen(opts);
+    char *out = (char *)malloc(len + 1);
+    if (out == NULL) return NULL;
+    size_t out_len = 0;
+
+    const char *cursor = opts;
+    while (*cursor != '\0') {
+        while (*cursor == '&' || *cursor == ';' || *cursor == ',' || *cursor == ' ' ||
+               *cursor == '\t' || *cursor == '\r' || *cursor == '\n') {
+            cursor++;
+        }
+        if (*cursor == '\0') break;
+
+        const char *start = cursor;
+        while (*cursor != '\0' && *cursor != '&' && *cursor != ';' && *cursor != ',' &&
+               *cursor != ' ' && *cursor != '\t' && *cursor != '\r' && *cursor != '\n') {
+            cursor++;
+        }
+        size_t entry_len = (size_t)(cursor - start);
+        if (entry_len >= 5 && strncmp(start, "mode=", 5) == 0) continue;
+
+        if (out_len != 0) out[out_len++] = ';';
+        memcpy(out + out_len, start, entry_len);
+        out_len += entry_len;
+    }
+
+    out[out_len] = '\0';
+    if (out_len == 0) {
+        free(out);
+        return NULL;
+    }
+    return out;
+}
+
 JNIEXPORT jlong JNICALL
 Java_com_decentdb_jdbc_DecentDBNative_dbOpen(JNIEnv *env, jclass cls,
     jstring jpath, jstring joptions)
@@ -283,7 +324,16 @@ Java_com_decentdb_jdbc_DecentDBNative_dbOpen(JNIEnv *env, jclass cls,
     ddb_db_t *db = NULL;
     ddb_status_t status = DDB_ERR_INTERNAL;
     int mode = parse_open_mode(opts);
-    if (mode == 1) {
+    char *native_opts = native_options_without_mode(opts);
+    if (native_opts != NULL && native_opts[0] != '\0') {
+        if (mode == 1) {
+            status = ddb_db_create_with_options(path, native_opts, &db);
+        } else if (mode == 2) {
+            status = ddb_db_open_with_options(path, native_opts, &db);
+        } else {
+            status = ddb_db_open_or_create_with_options(path, native_opts, &db);
+        }
+    } else if (mode == 1) {
         status = ddb_db_create(path, &db);
     } else if (mode == 2) {
         status = ddb_db_open(path, &db);
@@ -294,6 +344,7 @@ Java_com_decentdb_jdbc_DecentDBNative_dbOpen(JNIEnv *env, jclass cls,
 
     free(path);
     free(opts);
+    free(native_opts);
     clear_row_cache();
 
     if (status != DDB_OK || db == NULL) return 0;
