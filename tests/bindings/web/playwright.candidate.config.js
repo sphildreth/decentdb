@@ -8,8 +8,8 @@ const ROOT_DIR = path.resolve(__dirname, "../..", "..");
 module.exports = defineConfig({
   testDir: __dirname,
   testMatch: /(smoke|multitab)\.spec\.js$/,
-  outputDir: path.resolve(ROOT_DIR, ".tmp/playwright-web"),
-  timeout: 90_000,
+  outputDir: path.resolve(ROOT_DIR, ".tmp/playwright-web-candidate"),
+  timeout: 120_000,
   fullyParallel: false,
   workers: 1,
   use: {
@@ -25,32 +25,10 @@ module.exports = defineConfig({
   },
   projects: [
     {
-      name: "chromium-tier1",
+      name: "firefox-candidate",
       use: {
-        browserName: "chromium",
+        browserName: "firefox",
       },
     },
-    ...(process.env.DDB_WEB_INCLUDE_CHROME === "1"
-      ? [
-          {
-            name: "chrome-tier1",
-            use: {
-              browserName: "chromium",
-              channel: "chrome",
-            },
-          },
-        ]
-      : []),
-    ...(process.env.DDB_WEB_INCLUDE_EDGE === "1"
-      ? [
-          {
-            name: "edge-tier1",
-            use: {
-              browserName: "chromium",
-              channel: "msedge",
-            },
-          },
-        ]
-      : []),
   ],
 });

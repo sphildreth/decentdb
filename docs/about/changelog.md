@@ -35,6 +35,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added ADR 0161 documenting the browser WASM/OPFS runtime and its one-worker
   ownership model.
 - Added the WASM / Browser API documentation page.
+- Completed the production browser runtime phase with ADR 0165, `probeRuntime()`,
+  stable browser error codes, Dedicated Worker owner coordination through Web
+  Locks and BroadcastChannel, multi-tab owner routing and recovery coverage,
+  explicit service-worker exclusion, owner/quota/persistence diagnostics through
+  `metrics()` and `sys.browser_*` views, tagged browser parameters, an expanded
+  `browser-app-v1` SQL profile, and tier/candidate Playwright browser matrix
+  scripts.
 - Added concurrent-write benchmark coverage: native benchmark hooks for direct
   single-writer and read-under-write regression slices, executable queued-write
   single-writer and reader-under-writer scenarios, a shared cross-binding

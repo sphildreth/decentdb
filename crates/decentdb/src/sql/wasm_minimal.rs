@@ -9,8 +9,9 @@ use crate::error::{DbError, Result};
 use crate::record::value::Value;
 
 use super::ast::{
-    BinaryOp, ColumnDefinition, CreateTableStatement, DeleteStatement, Expr, FromItem,
-    InsertSource, InsertStatement, OrderBy, Query, QueryBody, Select, SelectItem, Statement,
+    Assignment, BinaryOp, ColumnDefinition, CreateIndexStatement, CreateTableStatement,
+    DeleteStatement, Expr, FromItem, IndexExpression, InsertSource, InsertStatement, OrderBy,
+    Query, QueryBody, Select, SelectItem, Statement, UpdateStatement,
 };
 
 pub(crate) fn parse_sql_batch(sql: &str) -> Result<Vec<Statement>> {
@@ -28,14 +29,22 @@ fn parse_statement(sql: &str) -> Result<Statement> {
     let trimmed = sql.trim();
     if starts_with_keyword(trimmed, "CREATE TABLE") {
         parse_create_table(trimmed).map(Statement::CreateTable)
+    } else if starts_with_keyword(trimmed, "CREATE INDEX")
+        || starts_with_keyword(trimmed, "CREATE UNIQUE INDEX")
+    {
+        parse_create_index(trimmed).map(Statement::CreateIndex)
     } else if starts_with_keyword(trimmed, "INSERT INTO") {
         parse_insert(trimmed).map(Statement::Insert)
+    } else if starts_with_keyword(trimmed, "UPDATE") {
+        parse_update(trimmed).map(Statement::Update)
     } else if starts_with_keyword(trimmed, "DELETE FROM") {
         parse_delete(trimmed).map(Statement::Delete)
     } else if starts_with_keyword(trimmed, "SELECT") {
         parse_select(trimmed).map(Statement::Query)
     } else if starts_with_keyword(trimmed, "DROP TABLE") {
         parse_drop_table(trimmed)
+    } else if starts_with_keyword(trimmed, "DROP INDEX") {
+        parse_drop_index(trimmed)
     } else {
         Err(DbError::sql(format!(
             "unsupported SQL in initial wasm parser: {trimmed}"
@@ -153,6 +162,61 @@ fn parse_drop_table(sql: &str) -> Result<Statement> {
     })
 }
 
+fn parse_create_index(sql: &str) -> Result<CreateIndexStatement> {
+    let after_create = consume_keyword(sql, "CREATE")?;
+    let (unique, after_unique) =
+        if let Some(rest) = consume_keyword_optional(after_create, "UNIQUE") {
+            (true, rest)
+        } else {
+            (false, after_create)
+        };
+    let after_index = consume_keyword(after_unique, "INDEX")?;
+    let (if_not_exists, rest) = if let Some(after_if_not_exists) =
+        consume_keywords_optional(after_index, &["IF", "NOT", "EXISTS"])
+    {
+        (true, after_if_not_exists)
+    } else {
+        (false, after_index)
+    };
+    let on_index =
+        find_keyword(rest, "ON").ok_or_else(|| DbError::sql("CREATE INDEX requires ON table"))?;
+    let index_name = clean_identifier(rest[..on_index].trim())?;
+    let after_on = rest[on_index + "ON".len()..].trim();
+    let open = after_on
+        .find('(')
+        .ok_or_else(|| DbError::sql("CREATE INDEX requires a column list"))?;
+    let table_name = clean_identifier(after_on[..open].trim())?;
+    let close = matching_final_paren(after_on)?;
+    let columns = split_top_level(&after_on[open + 1..close], ',')
+        .into_iter()
+        .map(|column| clean_identifier(column.trim()).map(IndexExpression::Column))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(CreateIndexStatement {
+        index_name,
+        table_name,
+        unique,
+        if_not_exists,
+        access_method: "btree".to_string(),
+        columns,
+        include_columns: Vec::new(),
+        predicate: None,
+    })
+}
+
+fn parse_drop_index(sql: &str) -> Result<Statement> {
+    let after_index = consume_keywords(sql, &["DROP", "INDEX"])?;
+    let (if_exists, rest) =
+        if let Some(after_if_exists) = consume_keywords_optional(after_index, &["IF", "EXISTS"]) {
+            (true, after_if_exists)
+        } else {
+            (false, after_index)
+        };
+    Ok(Statement::DropIndex {
+        name: clean_identifier(rest)?,
+        if_exists,
+    })
+}
+
 fn parse_insert(sql: &str) -> Result<InsertStatement> {
     let rest = consume_keywords(sql, &["INSERT", "INTO"])?;
     let values_index = find_keyword(rest, "VALUES")
@@ -197,6 +261,42 @@ fn parse_delete(sql: &str) -> Result<DeleteStatement> {
     })
 }
 
+fn parse_update(sql: &str) -> Result<UpdateStatement> {
+    let rest = consume_keyword(sql, "UPDATE")?;
+    let set_index = find_keyword(rest, "SET").ok_or_else(|| DbError::sql("UPDATE requires SET"))?;
+    let table_name = clean_identifier(rest[..set_index].trim())?;
+    let after_set = rest[set_index + "SET".len()..].trim();
+    let where_index = find_keyword(after_set, "WHERE");
+    let (assignments_sql, filter_sql) = match where_index {
+        Some(index) => (
+            after_set[..index].trim(),
+            Some(after_set[index + "WHERE".len()..].trim()),
+        ),
+        None => (after_set, None),
+    };
+    let assignments = split_top_level(assignments_sql, ',')
+        .into_iter()
+        .map(|assignment| parse_assignment(&assignment))
+        .collect::<Result<Vec<_>>>()?;
+    if assignments.is_empty() {
+        return Err(DbError::sql("UPDATE requires at least one assignment"));
+    }
+    Ok(UpdateStatement {
+        table_name,
+        assignments,
+        filter: filter_sql.map(parse_expr).transpose()?,
+        returning: Vec::new(),
+    })
+}
+
+fn parse_assignment(sql: &str) -> Result<Assignment> {
+    let index = find_operator(sql, "=").ok_or_else(|| DbError::sql("assignment requires ="))?;
+    Ok(Assignment {
+        column_name: clean_identifier(sql[..index].trim())?,
+        expr: parse_expr(&sql[index + 1..])?,
+    })
+}
+
 fn parse_values_rows(sql: &str) -> Result<Vec<Vec<Expr>>> {
     let mut rows = Vec::new();
     for row_sql in split_top_level(sql.trim(), ',') {
@@ -216,14 +316,34 @@ fn parse_values_rows(sql: &str) -> Result<Vec<Vec<Expr>>> {
 
 fn parse_select(sql: &str) -> Result<Query> {
     let rest = consume_keyword(sql, "SELECT")?;
-    let order_index = find_keyword(rest, "ORDER")
-        .filter(|index| consume_keyword_optional(&rest[index + "ORDER".len()..], "BY").is_some());
-    let (main_sql, order_by) = match order_index {
+    let offset_index = find_keyword(rest, "OFFSET");
+    let (before_offset, offset) = match offset_index {
         Some(index) => (
             rest[..index].trim(),
-            parse_order_by(consume_keyword(&rest[index + "ORDER".len()..], "BY")?)?,
+            Some(parse_expr(rest[index + "OFFSET".len()..].trim())?),
         ),
-        None => (rest, Vec::new()),
+        None => (rest, None),
+    };
+    let limit_index = find_keyword(before_offset, "LIMIT");
+    let (before_limit, limit) = match limit_index {
+        Some(index) => (
+            before_offset[..index].trim(),
+            Some(parse_expr(before_offset[index + "LIMIT".len()..].trim())?),
+        ),
+        None => (before_offset, None),
+    };
+    let order_index = find_keyword(before_limit, "ORDER").filter(|index| {
+        consume_keyword_optional(&before_limit[index + "ORDER".len()..], "BY").is_some()
+    });
+    let (main_sql, order_by) = match order_index {
+        Some(index) => (
+            before_limit[..index].trim(),
+            parse_order_by(consume_keyword(
+                &before_limit[index + "ORDER".len()..],
+                "BY",
+            )?)?,
+        ),
+        None => (before_limit, Vec::new()),
     };
     let from_index = find_keyword(main_sql, "FROM");
     let (projection_sql, from_sql) = match from_index {
@@ -270,8 +390,8 @@ fn parse_select(sql: &str) -> Result<Query> {
             distinct_on: Vec::new(),
         }),
         order_by,
-        limit: None,
-        offset: None,
+        limit,
+        offset,
     })
 }
 
@@ -317,10 +437,59 @@ fn parse_select_item(sql: &str) -> Result<SelectItem> {
 
 fn parse_expr(sql: &str) -> Result<Expr> {
     let trimmed = sql.trim();
+    if let Some(index) = find_keyword(trimmed, "OR") {
+        return Ok(Expr::Binary {
+            left: Box::new(parse_expr(&trimmed[..index])?),
+            op: BinaryOp::Or,
+            right: Box::new(parse_expr(&trimmed[index + "OR".len()..])?),
+        });
+    }
+    if let Some(index) = find_keyword(trimmed, "AND") {
+        return Ok(Expr::Binary {
+            left: Box::new(parse_expr(&trimmed[..index])?),
+            op: BinaryOp::And,
+            right: Box::new(parse_expr(&trimmed[index + "AND".len()..])?),
+        });
+    }
+    if let Some(index) = find_operator(trimmed, "<>") {
+        return Ok(Expr::Binary {
+            left: Box::new(parse_expr(&trimmed[..index])?),
+            op: BinaryOp::NotEq,
+            right: Box::new(parse_expr(&trimmed[index + 2..])?),
+        });
+    }
+    if let Some(index) = find_operator(trimmed, "!=") {
+        return Ok(Expr::Binary {
+            left: Box::new(parse_expr(&trimmed[..index])?),
+            op: BinaryOp::NotEq,
+            right: Box::new(parse_expr(&trimmed[index + 2..])?),
+        });
+    }
+    if let Some(index) = find_operator(trimmed, "<=") {
+        return Ok(Expr::Binary {
+            left: Box::new(parse_expr(&trimmed[..index])?),
+            op: BinaryOp::LtEq,
+            right: Box::new(parse_expr(&trimmed[index + 2..])?),
+        });
+    }
+    if let Some(index) = find_operator(trimmed, ">=") {
+        return Ok(Expr::Binary {
+            left: Box::new(parse_expr(&trimmed[..index])?),
+            op: BinaryOp::GtEq,
+            right: Box::new(parse_expr(&trimmed[index + 2..])?),
+        });
+    }
     if let Some(index) = find_operator(trimmed, "=") {
         return Ok(Expr::Binary {
             left: Box::new(parse_expr(&trimmed[..index])?),
             op: BinaryOp::Eq,
+            right: Box::new(parse_expr(&trimmed[index + 1..])?),
+        });
+    }
+    if let Some(index) = find_operator(trimmed, "<") {
+        return Ok(Expr::Binary {
+            left: Box::new(parse_expr(&trimmed[..index])?),
+            op: BinaryOp::Lt,
             right: Box::new(parse_expr(&trimmed[index + 1..])?),
         });
     }
@@ -648,18 +817,24 @@ mod tests {
         let statements = parse_sql_batch(
             "CREATE TABLE IF NOT EXISTS notes(id INT64 PRIMARY KEY, body TEXT);
              INSERT INTO notes(id, body) VALUES ($1, 'semi; colon'), (2, 'second');
-             SELECT id, body FROM notes WHERE id = $1 ORDER BY id ASC;
+             CREATE INDEX IF NOT EXISTS notes_body_idx ON notes(body);
+             UPDATE notes SET body = 'updated' WHERE id = $1;
+             SELECT id, body FROM notes WHERE id = $1 AND body <> 'x' ORDER BY id ASC LIMIT 10 OFFSET 0;
              DELETE FROM notes WHERE id = 2;
+             DROP INDEX IF EXISTS notes_body_idx;
              DROP TABLE IF EXISTS notes;",
         )
         .expect("browser smoke SQL should parse");
 
-        assert_eq!(statements.len(), 5);
+        assert_eq!(statements.len(), 8);
         assert!(matches!(statements[0], Statement::CreateTable(_)));
         assert!(matches!(statements[1], Statement::Insert(_)));
-        assert!(matches!(statements[2], Statement::Query(_)));
-        assert!(matches!(statements[3], Statement::Delete(_)));
-        assert!(matches!(statements[4], Statement::DropTable { .. }));
+        assert!(matches!(statements[2], Statement::CreateIndex(_)));
+        assert!(matches!(statements[3], Statement::Update(_)));
+        assert!(matches!(statements[4], Statement::Query(_)));
+        assert!(matches!(statements[5], Statement::Delete(_)));
+        assert!(matches!(statements[6], Statement::DropIndex { .. }));
+        assert!(matches!(statements[7], Statement::DropTable { .. }));
     }
 
     #[test]
@@ -678,7 +853,7 @@ mod tests {
 
     #[test]
     fn rejects_sql_outside_initial_browser_subset() {
-        let error = parse_sql_batch("UPDATE notes SET body = 'x' WHERE id = 1")
+        let error = parse_sql_batch("ALTER TABLE notes ADD COLUMN done BOOL")
             .expect_err("unsupported SQL must be rejected explicitly");
 
         assert!(error

@@ -1,4 +1,4 @@
-import { DecentDBWebError, open } from "../../../bindings/web/dist/index.js";
+import { DecentDBWebError, open, probeRuntime } from "../../../bindings/web/dist/index.js";
 
 const output = document.getElementById("output");
 const button = document.getElementById("run");
@@ -52,6 +52,10 @@ async function runSmokeScenario(options = {}) {
   const { workerUrl, wasmUrl } = withDatabaseUrls(options);
 
   const seedId = options.seedId ?? 1_000_001;
+  const probe = await probeRuntime({
+    wasmUrl,
+    resultTransport: "binary",
+  });
   let db = null;
   let reopenedDb = null;
   let importDb = null;
@@ -69,7 +73,26 @@ async function runSmokeScenario(options = {}) {
     await db.exec(`CREATE TABLE IF NOT EXISTS ${DB_TABLE}(id INT64 PRIMARY KEY, name TEXT)`);
     await db.exec(`DELETE FROM ${DB_TABLE}`);
     await db.exec(`INSERT INTO ${DB_TABLE}(id, name) VALUES ($1, $2)`, [seedId, `scenario:${scenarioId}`]);
+    await db.exec("CREATE TABLE IF NOT EXISTS smoke_blob(id INT64 PRIMARY KEY, body BLOB)");
+    await db.exec("DELETE FROM smoke_blob");
+    await db.exec("INSERT INTO smoke_blob(id, body) VALUES ($1, $2)", [seedId, new Uint8Array([1, 2, 3, 4])]);
     const created = await db.query(`SELECT id, name FROM ${DB_TABLE} ORDER BY id ASC`);
+    const blobResult = await db.query("SELECT body FROM smoke_blob WHERE id = $1", [seedId]);
+    const blobBytes = Array.from(blobResult.rows[0]?.body ?? []);
+    const browserRuntimeView = await db.query("SELECT * FROM sys.browser_runtime");
+    const browserOwnerView = await db.query("SELECT * FROM sys.browser_owner");
+    const browserStorageView = await db.query("SELECT * FROM sys.browser_storage");
+    const browserSyncView = await db.query("SELECT * FROM sys.browser_sync");
+    await db.sync.configurePeer({
+      name: "cloud",
+      endpoint: "https://sync.example.invalid",
+    });
+    const syncRun = await db.sync.run({
+      peer: "cloud",
+      direction: "both",
+      timeoutMs: 1000,
+    });
+    const metrics = await db.metrics();
     const checkpointResult = await db.checkpoint();
     const exported = await db.export();
     const persisted = await db.persist();
@@ -112,6 +135,14 @@ async function runSmokeScenario(options = {}) {
       checkpointBytes: checkpointResult.truncatedWalBytes ?? 0,
       exportedSize: exported.size,
       persisted,
+      blobBytes,
+      probe,
+      metrics,
+      browserRuntimeView,
+      browserOwnerView,
+      browserStorageView,
+      browserSyncView,
+      syncRun,
     };
   } finally {
     await closeIfOpen(db);

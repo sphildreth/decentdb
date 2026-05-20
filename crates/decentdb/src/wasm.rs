@@ -139,10 +139,173 @@ fn json_to_value(value: JsonValue) -> Result<Value> {
             }
         }
         JsonValue::String(value) => Ok(Value::Text(value)),
-        JsonValue::Array(_) | JsonValue::Object(_) => Err(DbError::sql(
-            "browser parameters currently support null, bool, number, and string values",
+        JsonValue::Array(_) => Err(DbError::sql(
+            "browser parameters currently do not accept bare array values; use tagged values",
         )),
+        JsonValue::Object(value) => json_object_to_value(value),
     }
+}
+
+fn json_object_to_value(value: serde_json::Map<String, JsonValue>) -> Result<Value> {
+    let Some(kind) = value.get("kind").and_then(JsonValue::as_str) else {
+        return Err(DbError::sql(
+            "browser object parameters require a string 'kind' field",
+        ));
+    };
+
+    match kind {
+        "bytes" => {
+            let base64 = value
+                .get("base64")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| DbError::sql("bytes parameter requires base64"))?;
+            Ok(Value::Blob(base64_decode(base64)?))
+        }
+        "int64" => {
+            let encoded = value
+                .get("value")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| DbError::sql("int64 parameter requires string value"))?;
+            let parsed = encoded
+                .parse::<i64>()
+                .map_err(|_| DbError::sql("invalid int64 parameter"))?;
+            Ok(Value::Int64(parsed))
+        }
+        "decimal" => {
+            let scaled = value
+                .get("scaled")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| DbError::sql("decimal parameter requires scaled string"))?;
+            let scaled = scaled
+                .parse::<i64>()
+                .map_err(|_| DbError::sql("invalid decimal scaled value"))?;
+            let scale = value
+                .get("scale")
+                .and_then(JsonValue::as_u64)
+                .ok_or_else(|| DbError::sql("decimal parameter requires numeric scale"))?;
+            let scale =
+                u8::try_from(scale).map_err(|_| DbError::sql("decimal scale is too large"))?;
+            Ok(Value::Decimal { scaled, scale })
+        }
+        "uuid" => {
+            let bytes = parse_fixed_bytes(&value, "bytes", 16)?;
+            let mut uuid = [0u8; 16];
+            uuid.copy_from_slice(&bytes);
+            Ok(Value::Uuid(uuid))
+        }
+        "timestampMicros" => {
+            let encoded = value
+                .get("value")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| DbError::sql("timestampMicros requires string value"))?;
+            let parsed = encoded
+                .parse::<i64>()
+                .map_err(|_| DbError::sql("invalid timestampMicros value"))?;
+            Ok(Value::TimestampMicros(parsed))
+        }
+        "dateDays" => {
+            let parsed = value
+                .get("value")
+                .and_then(JsonValue::as_i64)
+                .ok_or_else(|| DbError::sql("dateDays requires numeric value"))?;
+            let parsed =
+                i32::try_from(parsed).map_err(|_| DbError::sql("dateDays value out of range"))?;
+            Ok(Value::DateDays(parsed))
+        }
+        "timeMicros" => {
+            let encoded = value
+                .get("value")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| DbError::sql("timeMicros requires string value"))?;
+            let parsed = encoded
+                .parse::<i64>()
+                .map_err(|_| DbError::sql("invalid timeMicros value"))?;
+            Ok(Value::TimeMicros(parsed))
+        }
+        "timestampTzMicros" => {
+            let encoded = value
+                .get("value")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| DbError::sql("timestampTzMicros requires string value"))?;
+            let parsed = encoded
+                .parse::<i64>()
+                .map_err(|_| DbError::sql("invalid timestampTzMicros value"))?;
+            Ok(Value::TimestampTzMicros(parsed))
+        }
+        "interval" => {
+            let months = value
+                .get("months")
+                .and_then(JsonValue::as_i64)
+                .ok_or_else(|| DbError::sql("interval requires numeric months"))?;
+            let days = value
+                .get("days")
+                .and_then(JsonValue::as_i64)
+                .ok_or_else(|| DbError::sql("interval requires numeric days"))?;
+            let micros = value
+                .get("micros")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| DbError::sql("interval requires string micros"))?;
+            let months =
+                i32::try_from(months).map_err(|_| DbError::sql("interval months out of range"))?;
+            let days =
+                i32::try_from(days).map_err(|_| DbError::sql("interval days out of range"))?;
+            let micros = micros
+                .parse::<i64>()
+                .map_err(|_| DbError::sql("interval micros is invalid"))?;
+            Ok(Value::Interval {
+                months,
+                days,
+                micros,
+            })
+        }
+        "geometry" => Ok(Value::Geometry(parse_dynamic_bytes(&value)?)),
+        "geography" => Ok(Value::Geography(parse_dynamic_bytes(&value)?)),
+        _ => Err(DbError::sql(format!(
+            "unsupported browser tagged parameter kind: {kind}"
+        ))),
+    }
+}
+
+fn parse_dynamic_bytes(value: &serde_json::Map<String, JsonValue>) -> Result<Vec<u8>> {
+    if let Some(base64) = value.get("base64").and_then(JsonValue::as_str) {
+        return base64_decode(base64);
+    }
+    if let Some(bytes_value) = value.get("bytes") {
+        return parse_vec_bytes(bytes_value);
+    }
+    Err(DbError::sql("tagged bytes value requires base64 or bytes"))
+}
+
+fn parse_fixed_bytes(
+    value: &serde_json::Map<String, JsonValue>,
+    key: &str,
+    len: usize,
+) -> Result<Vec<u8>> {
+    let Some(bytes_value) = value.get(key) else {
+        return Err(DbError::sql(format!("{key} is required")));
+    };
+    let parsed = parse_vec_bytes(bytes_value)?;
+    if parsed.len() != len {
+        return Err(DbError::sql(format!(
+            "{key} must contain exactly {len} bytes"
+        )));
+    }
+    Ok(parsed)
+}
+
+fn parse_vec_bytes(value: &JsonValue) -> Result<Vec<u8>> {
+    let JsonValue::Array(items) = value else {
+        return Err(DbError::sql("bytes must be an array of numbers"));
+    };
+    items
+        .iter()
+        .map(|item| {
+            let value = item
+                .as_u64()
+                .ok_or_else(|| DbError::sql("bytes array contains non-numeric value"))?;
+            u8::try_from(value).map_err(|_| DbError::sql("bytes array value out of range"))
+        })
+        .collect()
 }
 
 fn result_to_json_string(result: &crate::QueryResult) -> Result<String> {
@@ -249,6 +412,56 @@ fn base64_encode(bytes: &[u8]) -> String {
         }
     }
     output
+}
+
+fn base64_decode(encoded: &str) -> Result<Vec<u8>> {
+    fn decode_char(byte: u8) -> Option<u8> {
+        match byte {
+            b'A'..=b'Z' => Some(byte - b'A'),
+            b'a'..=b'z' => Some(byte - b'a' + 26),
+            b'0'..=b'9' => Some(byte - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+
+    let bytes = encoded.as_bytes();
+    if bytes.len() % 4 != 0 {
+        return Err(DbError::sql("base64 string length must be a multiple of 4"));
+    }
+
+    let mut output = Vec::with_capacity((bytes.len() / 4) * 3);
+    for chunk in bytes.chunks(4) {
+        let c0 = chunk[0];
+        let c1 = chunk[1];
+        let c2 = chunk[2];
+        let c3 = chunk[3];
+
+        let v0 = decode_char(c0).ok_or_else(|| DbError::sql("invalid base64 character"))?;
+        let v1 = decode_char(c1).ok_or_else(|| DbError::sql("invalid base64 character"))?;
+        let v2 = if c2 == b'=' {
+            0
+        } else {
+            decode_char(c2).ok_or_else(|| DbError::sql("invalid base64 character"))?
+        };
+        let v3 = if c3 == b'=' {
+            0
+        } else {
+            decode_char(c3).ok_or_else(|| DbError::sql("invalid base64 character"))?
+        };
+
+        let triple =
+            (u32::from(v0) << 18) | (u32::from(v1) << 12) | (u32::from(v2) << 6) | u32::from(v3);
+        output.push(((triple >> 16) & 0xff) as u8);
+        if c2 != b'=' {
+            output.push(((triple >> 8) & 0xff) as u8);
+        }
+        if c3 != b'=' {
+            output.push((triple & 0xff) as u8);
+        }
+    }
+    Ok(output)
 }
 
 fn js_db_error(error: DbError) -> JsValue {

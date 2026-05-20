@@ -645,7 +645,7 @@ interface BrowserMetrics {
   quotaBytes?: number;
   storageUsageBytes?: number;
   ownerId?: string;
-  ownerRuntime?: "dedicated-worker" | "shared-worker";
+  ownerRuntime?: "dedicated-worker" | "remote-owner";
   attachedClientCount?: number;
   staleOwnerRecoveries?: number;
   coordinationModel?: string;
@@ -1056,3 +1056,51 @@ This Future Win is complete when:
 
 Once these are done, remove the roadmap item from `FUTURE_WINS.md` and keep only
 a delivered-context entry describing the shipped production browser runtime.
+
+---
+
+## 24. Phase #1 Implementation Status (2026-05-20)
+
+This section records the concrete implementation decisions and slice status for
+the first production-browser-runtime phase execution.
+
+### Accepted decisions
+
+1. Support tiers and capability contract are defined by ADR 0165.
+2. Owner coordination model is a Dedicated Worker owner guarded by Web Locks and
+   discovered/routed through BroadcastChannel for one logical path.
+3. Service workers cannot own browser database handles.
+4. Browser sync is exposed as an owner-routed API shell with explicit deferred
+   status/errors until production relay transport follow-up work is promoted.
+5. Browser SQL profile is named `browser-app-v1`.
+6. Browser diagnostics are exposed through `metrics()` and browser `sys.*`
+   views in wasm builds (`sys.browser_runtime`, `sys.browser_owner`,
+   `sys.browser_storage`, `sys.browser_sync`).
+7. No silent durability fallback was added.
+
+### Slice tracking (phase #1)
+
+- Slice 0: complete (ADR 0165 + matrix/docs policy captured).
+- Slice 1: complete (probe API + stable browser errors + startup probe path).
+- Slice 2: complete (owner abstraction and routing path).
+- Slice 3: implemented and test-scaffolded (multi-tab owner routing tests added).
+- Slice 4: implemented and test-scaffolded (owner timeout/stale-owner surfaces).
+- Slice 5: complete (service worker explicit unsupported policy).
+- Slice 6: complete for the production-browser-runtime contract (owner-routed
+  sync API shell; production relay transport remains in the separate sync relay
+  roadmap item and returns stable deferred status here).
+- Slice 7: complete for phase scope (tagged/binary/browser typed params in wasm
+  bridge + compatibility coverage updates).
+- Slice 8: complete for phase scope (quota/persistence/owner diagnostics in
+  metrics + `sys.browser_*` system views + error mapping).
+- Slice 9: complete for phase scope (tier-1/candidate Playwright matrix configs
+  and scripts; candidate path is non-blocking).
+- Slice 10: complete (wasm/web docs and troubleshooting guidance updated).
+
+### Environment note
+
+SharedWorker ownership was rejected during implementation because Playwright
+bundled Chromium in this execution environment does not provide the required
+OPFS synchronous access-handle behavior in SharedWorker contexts. The accepted
+model keeps OPFS ownership in a Dedicated Worker and uses BroadcastChannel plus
+Web Locks for cross-tab coordination.

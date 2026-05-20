@@ -1,7 +1,7 @@
 # Browser binding smoke
 
 This directory contains browser integration coverage for `@decentdb/web` in a real
-browser (Playwright) and OPFS-backed worker runtime.
+browser (Playwright) and OPFS-backed owner runtime.
 
 ## Automated OPFS smoke (S9 coverage)
 
@@ -31,6 +31,9 @@ npm run browser:smoke
 
 `npm run browser:smoke` exercises:
 
+- capability probes and stable unsupported-runtime errors
+- Dedicated Worker owner routing through BroadcastChannel and Web Locks
+- multi-tab owner sharing and recovery after the original owner tab closes
 - create/open flow
 - query
 - reopen with `open`
@@ -39,6 +42,7 @@ npm run browser:smoke
 - checkpoint
 - persist helper
 - import into a second database handle
+- browser runtime/storage/sync diagnostics
 
 ## Transport benchmark (S7 coverage)
 

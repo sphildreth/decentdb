@@ -1,7 +1,7 @@
 const path = require("node:path");
 const { test, expect } = require(path.resolve(__dirname, "../../..", "bindings/web/node_modules/@playwright/test"));
 
-test("web package OPFS smoke: create/open/query/reopen + export/import + checkpoint/persist", async ({ page }) => {
+test("web package OPFS smoke: probe + owner diagnostics + create/open/query/reopen + export/import", async ({ page }) => {
   await page.goto("/tests/bindings/web/smoke.html", { waitUntil: "domcontentloaded" });
   try {
     await page.waitForFunction(() => typeof globalThis.__runDecentDBWebSmoke === "function", null, { timeout: 10_000 });
@@ -55,4 +55,17 @@ test("web package OPFS smoke: create/open/query/reopen + export/import + checkpo
   expect(result.exportedSize).toBeGreaterThan(0);
   expect(result.checkpointBytes).toBeGreaterThanOrEqual(0);
   expect(typeof result.persisted).toBe("boolean");
+  expect(result.blobBytes).toEqual([1, 2, 3, 4]);
+  expect(result.probe.supported).toBe(true);
+  expect(result.probe.runtime.dedicatedWorker).toBe(true);
+  expect(result.probe.runtime.broadcastChannel).toBe(true);
+  expect(result.probe.runtime.webLocks).toBe(true);
+  expect(result.probe.storage.opfsDirectory).toBe(true);
+  expect(result.browserRuntimeView.rowCount).toBe(1);
+  expect(result.browserOwnerView.rowCount).toBe(1);
+  expect(result.browserStorageView.rowCount).toBe(1);
+  expect(result.browserSyncView.rowCount).toBe(1);
+  expect(result.syncRun.status).toBe("deferred");
+  expect(result.metrics.ownerRuntime).toBe("dedicated-worker");
+  expect(result.metrics.coordinationModel).toBe("broadcastchannel-weblocks-dedicated-owner");
 });
