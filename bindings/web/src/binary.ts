@@ -1,4 +1,4 @@
-import type { QueryRow, QueryValue } from "./protocol";
+import type { QueryRow, QueryValue } from "./protocol.js";
 
 export interface BinaryQueryResult {
   columns: string[];

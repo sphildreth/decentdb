@@ -1,6 +1,7 @@
 import {
   type CheckpointResult,
   type ExportResult,
+  type MetricsResult,
   type OpenMode,
   type ResultTransport,
   type OpenResult,
@@ -16,9 +17,9 @@ import {
   type PrepareResult,
   createErrorPayload,
   ERR_OPERATION_FAILED,
-} from "./protocol";
+} from "./protocol.js";
 
-export type { OpenMode, ResultTransport, QueryRow, QueryValue, OpenResult, ExecResult, QueryResult, CheckpointResult, PersistResult };
+export type { OpenMode, ResultTransport, QueryRow, QueryValue, OpenResult, ExecResult, QueryResult, CheckpointResult, PersistResult, MetricsResult };
 
 export interface OpenOptions {
   path: string;
@@ -300,6 +301,12 @@ export class Database {
     const response = await this.execRequest("persist", { dbId: this.id });
     const result = response.result as PersistResult | undefined;
     return result?.persisted ?? false;
+  }
+
+  async metrics(): Promise<MetricsResult> {
+    this.assertOpen();
+    const response = await this.execRequest("metrics", { dbId: this.id });
+    return (response.result as MetricsResult | undefined) ?? {};
   }
 
   async close(): Promise<void> {

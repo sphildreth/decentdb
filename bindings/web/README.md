@@ -9,11 +9,13 @@ const db = await open({
   path: "app.ddb",
   mode: "openOrCreate",
   wasmUrl: new URL("./decentdb_wasm.js", import.meta.url).toString(),
+  resultTransport: "binary",
 });
 
 await db.exec("CREATE TABLE IF NOT EXISTS notes(id INT64 PRIMARY KEY, body TEXT)");
 await db.exec("INSERT INTO notes(id, body) VALUES ($1, $2)", [1, "hello"]);
 const result = await db.query("SELECT id, body FROM notes");
+const metrics = await db.metrics();
 await db.close();
 ```
 
@@ -44,14 +46,32 @@ From the package root:
 
 ```bash
 cd bindings/web
-npm install
+npm ci
 npm run build
 ```
 
-Run the deterministic Playwright OPFS smoke suite:
+Build the wasm-bindgen artifact, then run the deterministic Playwright OPFS
+smoke suite:
+
+```bash
+cd ../..
+cargo build -p decentdb --target wasm32-unknown-unknown --release
+wasm-bindgen target/wasm32-unknown-unknown/release/decentdb.wasm \
+  --target web \
+  --out-dir bindings/web/dist \
+  --out-name decentdb_wasm
+cd bindings/web
+```
 
 ```bash
 npm run browser:smoke
+```
+
+Run the large-result transport benchmark when changing the worker protocol or
+result decoding path:
+
+```bash
+npm run browser:bench
 ```
 
 If the environment does not have browser binaries installed:
@@ -61,15 +81,19 @@ npm run browser:install
 ```
 
 This runs `tests/bindings/web/smoke.spec.js` with a real browser and OPFS-backed
-storage assertions for create/open/query/reopen, export/import, checkpoint, and
-persist coverage.
+storage assertions for create/open/query/reopen, binary and JSON result
+transports, export/import, checkpoint, and persist coverage.
+
+`browser:bench` runs `tests/bindings/web/transport-bench.spec.js` and reports
+binary-vs-JSON result transport timings plus WASM memory samples.
 
 ## Current Limits
 
-The initial wasm parser is intentionally narrow because the native `pg_query`
-C parser is not available on `wasm32-unknown-unknown`. Simple browser workflows
-cover `CREATE TABLE`, `INSERT ... VALUES`, and basic `SELECT`; native DecentDB
-continues to provide the broader SQL surface.
+The browser v1 wasm parser is intentionally scoped because the native `pg_query`
+C parser is not available on `wasm32-unknown-unknown`. Browser workflows cover
+`CREATE TABLE`, `DROP TABLE`, `INSERT ... VALUES`, `DELETE`, and basic `SELECT`
+with simple `WHERE` and `ORDER BY`; native DecentDB continues to provide the
+broader SQL surface.
 
 OPFS persistence is browser-managed storage, not a replacement for explicit
 sync/export of important data.

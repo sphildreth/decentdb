@@ -9,8 +9,8 @@ use crate::error::{DbError, Result};
 use crate::record::value::Value;
 
 use super::ast::{
-    BinaryOp, ColumnDefinition, CreateTableStatement, Expr, FromItem, InsertSource,
-    InsertStatement, Query, QueryBody, Select, SelectItem, Statement,
+    BinaryOp, ColumnDefinition, CreateTableStatement, DeleteStatement, Expr, FromItem,
+    InsertSource, InsertStatement, OrderBy, Query, QueryBody, Select, SelectItem, Statement,
 };
 
 pub(crate) fn parse_sql_batch(sql: &str) -> Result<Vec<Statement>> {
@@ -30,8 +30,12 @@ fn parse_statement(sql: &str) -> Result<Statement> {
         parse_create_table(trimmed).map(Statement::CreateTable)
     } else if starts_with_keyword(trimmed, "INSERT INTO") {
         parse_insert(trimmed).map(Statement::Insert)
+    } else if starts_with_keyword(trimmed, "DELETE FROM") {
+        parse_delete(trimmed).map(Statement::Delete)
     } else if starts_with_keyword(trimmed, "SELECT") {
         parse_select(trimmed).map(Statement::Query)
+    } else if starts_with_keyword(trimmed, "DROP TABLE") {
+        parse_drop_table(trimmed)
     } else {
         Err(DbError::sql(format!(
             "unsupported SQL in initial wasm parser: {trimmed}"
@@ -135,6 +139,20 @@ fn parse_column_definition(sql: &str) -> Result<ColumnDefinition> {
     })
 }
 
+fn parse_drop_table(sql: &str) -> Result<Statement> {
+    let after_table = consume_keywords(sql, &["DROP", "TABLE"])?;
+    let (if_exists, rest) =
+        if let Some(after_if_exists) = consume_keywords_optional(after_table, &["IF", "EXISTS"]) {
+            (true, after_if_exists)
+        } else {
+            (false, after_table)
+        };
+    Ok(Statement::DropTable {
+        name: clean_identifier(rest)?,
+        if_exists,
+    })
+}
+
 fn parse_insert(sql: &str) -> Result<InsertStatement> {
     let rest = consume_keywords(sql, &["INSERT", "INTO"])?;
     let values_index = find_keyword(rest, "VALUES")
@@ -162,6 +180,23 @@ fn parse_insert(sql: &str) -> Result<InsertStatement> {
     })
 }
 
+fn parse_delete(sql: &str) -> Result<DeleteStatement> {
+    let rest = consume_keywords(sql, &["DELETE", "FROM"])?;
+    let where_index = find_keyword(rest, "WHERE");
+    let (table_sql, filter_sql) = match where_index {
+        Some(index) => (
+            rest[..index].trim(),
+            Some(rest[index + "WHERE".len()..].trim()),
+        ),
+        None => (rest.trim(), None),
+    };
+    Ok(DeleteStatement {
+        table_name: clean_identifier(table_sql)?,
+        filter: filter_sql.map(parse_expr).transpose()?,
+        returning: Vec::new(),
+    })
+}
+
 fn parse_values_rows(sql: &str) -> Result<Vec<Vec<Expr>>> {
     let mut rows = Vec::new();
     for row_sql in split_top_level(sql.trim(), ',') {
@@ -181,10 +216,22 @@ fn parse_values_rows(sql: &str) -> Result<Vec<Vec<Expr>>> {
 
 fn parse_select(sql: &str) -> Result<Query> {
     let rest = consume_keyword(sql, "SELECT")?;
-    let from_index = find_keyword(rest, "FROM");
+    let order_index = find_keyword(rest, "ORDER")
+        .filter(|index| consume_keyword_optional(&rest[index + "ORDER".len()..], "BY").is_some());
+    let (main_sql, order_by) = match order_index {
+        Some(index) => (
+            rest[..index].trim(),
+            parse_order_by(consume_keyword(&rest[index + "ORDER".len()..], "BY")?)?,
+        ),
+        None => (rest, Vec::new()),
+    };
+    let from_index = find_keyword(main_sql, "FROM");
     let (projection_sql, from_sql) = match from_index {
-        Some(index) => (&rest[..index], Some(rest[index + "FROM".len()..].trim())),
-        None => (rest, None),
+        Some(index) => (
+            &main_sql[..index],
+            Some(main_sql[index + "FROM".len()..].trim()),
+        ),
+        None => (main_sql, None),
     };
     let projection = split_top_level(projection_sql, ',')
         .into_iter()
@@ -222,10 +269,32 @@ fn parse_select(sql: &str) -> Result<Query> {
             distinct: false,
             distinct_on: Vec::new(),
         }),
-        order_by: Vec::new(),
+        order_by,
         limit: None,
         offset: None,
     })
+}
+
+fn parse_order_by(sql: &str) -> Result<Vec<OrderBy>> {
+    split_top_level(sql, ',')
+        .into_iter()
+        .map(|item| {
+            let tokens = tokenize_words(&item);
+            let (expr_sql, descending) = match tokens.last() {
+                Some(last) if token_eq(last, "DESC") => {
+                    (item[..item.len().saturating_sub(last.len())].trim(), true)
+                }
+                Some(last) if token_eq(last, "ASC") => {
+                    (item[..item.len().saturating_sub(last.len())].trim(), false)
+                }
+                _ => (item.trim(), false),
+            };
+            Ok(OrderBy {
+                expr: parse_expr(expr_sql)?,
+                descending,
+            })
+        })
+        .collect()
 }
 
 fn parse_select_item(sql: &str) -> Result<SelectItem> {
@@ -579,14 +648,18 @@ mod tests {
         let statements = parse_sql_batch(
             "CREATE TABLE IF NOT EXISTS notes(id INT64 PRIMARY KEY, body TEXT);
              INSERT INTO notes(id, body) VALUES ($1, 'semi; colon'), (2, 'second');
-             SELECT id, body FROM notes WHERE id = $1;",
+             SELECT id, body FROM notes WHERE id = $1 ORDER BY id ASC;
+             DELETE FROM notes WHERE id = 2;
+             DROP TABLE IF EXISTS notes;",
         )
         .expect("browser smoke SQL should parse");
 
-        assert_eq!(statements.len(), 3);
+        assert_eq!(statements.len(), 5);
         assert!(matches!(statements[0], Statement::CreateTable(_)));
         assert!(matches!(statements[1], Statement::Insert(_)));
         assert!(matches!(statements[2], Statement::Query(_)));
+        assert!(matches!(statements[3], Statement::Delete(_)));
+        assert!(matches!(statements[4], Statement::DropTable { .. }));
     }
 
     #[test]

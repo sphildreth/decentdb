@@ -23,7 +23,7 @@ Future version values are planning buckets, not release commitments.
 
 | Priority | Future Version | Status | Feature | Current Source Of Truth | Why This Rank |
 |---:|---|---|---|---|---|
-| 1 | vNext+1 | IN PROGRESS | WASM and browser OPFS support | [`WIN_WASM_SUPPORT_IMPLEMENTATION.md`](WIN_WASM_SUPPORT_IMPLEMENTATION.md) | Essential enabler for browser local-first apps, especially with sync, typed SDKs, and geospatial data |
+| 1 | vNext+1 | DONE | WASM and browser OPFS support | [`WIN_WASM_SUPPORT_IMPLEMENTATION.md`](WIN_WASM_SUPPORT_IMPLEMENTATION.md) | Essential enabler for browser local-first apps, especially with sync, typed SDKs, and geospatial data |
 | 2 | vNext+1 | TODO | Policy-aware embedded SQL | Needs ADR/spec | Strong regulated/offline/enterprise story beyond encryption alone |
 | 3 | vNext+1 | TODO | Application database bundle format | Needs ADR/spec | Makes DecentDB a portable app artifact, support bundle, and sharable dataset format |
 | 4 | vNext+1 | TODO | Built-in observability and `sys.*` virtual tables | Needs ADR/spec; doctor v1 is foundation | Complements doctor and makes operational state queryable |
@@ -103,7 +103,7 @@ The remaining roadmap should support one clear lane:
 
 ## 1. WASM And Browser OPFS Support
 
-**Status:** `IN PROGRESS`
+**Status:** `DONE`
 **Future Version:** vNext+1
 **Source of truth:** [`WIN_WASM_SUPPORT_IMPLEMENTATION.md`](WIN_WASM_SUPPORT_IMPLEMENTATION.md)
 

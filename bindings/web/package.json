@@ -16,6 +16,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "browser:install": "playwright install chromium",
+    "browser:install:ci": "playwright install --with-deps chromium",
+    "browser:bench": "playwright test --config ../../tests/bindings/web/playwright.bench.config.js",
     "browser:smoke": "playwright test --config ../../tests/bindings/web/playwright.config.js",
     "smoke": "npm run browser:smoke",
     "smoke:manual": "echo \"Manual browser smoke remains at tests/bindings/web/smoke.html and is covered via browser:smoke\"",

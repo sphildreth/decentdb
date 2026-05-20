@@ -28,6 +28,7 @@ type OpenMode = "createNew" | "openExisting" | "openOrCreate";
 type FileRecord = {
   path: string;
   exists: boolean;
+  refs: number;
   handle: FileSystemFileHandleLike;
   access: FileSystemSyncAccessHandleLike;
 };
@@ -49,7 +50,7 @@ function fileNameForPath(path: string): string {
 }
 
 function walPathForDb(path: string): string {
-  return `opfs://${path}.wal`;
+  return `${path}.wal`;
 }
 
 async function fileExists(root: FileSystemDirectoryHandleLike, path: string): Promise<boolean> {
@@ -81,6 +82,7 @@ async function prepareFile(root: FileSystemDirectoryHandleLike, path: string, mo
   files.set(path, {
     path,
     exists: existing,
+    refs: 0,
     handle,
     access,
   });
@@ -147,6 +149,7 @@ export function installOpfsHost(): void {
       throw new Error(`OPFS file does not exist: ${path}`);
     }
     record.exists = true;
+    record.refs += 1;
   };
 
   target.__decentdb_opfs_exists = (path: string): boolean => {
@@ -200,8 +203,11 @@ export function installOpfsHost(): void {
     if (!record) {
       return;
     }
-    record.access.close();
-    files.delete(path);
+    record.refs = Math.max(0, record.refs - 1);
+    if (record.refs === 0) {
+      record.access.close();
+      files.delete(path);
+    }
   };
 
   target.__decentdb_opfs_export_db = (path: string): Uint8Array => {

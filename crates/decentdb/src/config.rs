@@ -216,7 +216,7 @@ impl Default for DbConfig {
             wal_sync_mode: WalSyncMode::Full,
             checkpoint_timeout_sec: 30,
             trigram_postings_threshold: 100_000,
-            temp_dir: std::env::temp_dir(),
+            temp_dir: default_temp_dir(),
             wal_checkpoint_threshold_pages: 4096,
             wal_checkpoint_threshold_bytes: 64 * 1024 * 1024,
             release_freed_memory_after_checkpoint: cfg!(all(
@@ -233,6 +233,16 @@ impl Default for DbConfig {
             auto_checkpoint_on_open_mb: 16,
         }
     }
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+fn default_temp_dir() -> PathBuf {
+    PathBuf::from("/tmp")
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+fn default_temp_dir() -> PathBuf {
+    std::env::temp_dir()
 }
 
 #[cfg(test)]

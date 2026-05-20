@@ -7,9 +7,9 @@ const ROOT_DIR = path.resolve(__dirname, "../..", "..");
 /** @type {import('@playwright/test').PlaywrightTestConfig} */
 module.exports = defineConfig({
   testDir: __dirname,
-  testMatch: /smoke\.spec\.js$/,
-  outputDir: path.resolve(ROOT_DIR, ".tmp/playwright-web"),
-  timeout: 90_000,
+  testMatch: /transport-bench\.spec\.js$/,
+  outputDir: path.resolve(ROOT_DIR, ".tmp/playwright-web-bench"),
+  timeout: 180_000,
   fullyParallel: false,
   workers: 1,
   use: {

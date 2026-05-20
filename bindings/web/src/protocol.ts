@@ -13,7 +13,8 @@ export type RpcKind =
   | "checkpoint"
   | "export"
   | "import"
-  | "persist";
+  | "persist"
+  | "metrics";
 
 export type QueryValue =
   | null
@@ -143,6 +144,14 @@ export interface PersistRequest {
   };
 }
 
+export interface MetricsRequest {
+  kind: "metrics";
+  requestId: number;
+  payload: {
+    dbId: number;
+  };
+}
+
 export type RpcRequest =
   | OpenRequest
   | CloseRequest
@@ -155,7 +164,8 @@ export type RpcRequest =
   | CheckpointRequest
   | ExportRequest
   | ImportRequest
-  | PersistRequest;
+  | PersistRequest
+  | MetricsRequest;
 
 export interface OpenResult {
   dbId: number;
@@ -199,11 +209,17 @@ export interface PersistResult {
   persisted: boolean;
 }
 
+export interface MetricsResult {
+  wasmMemoryBytes?: number;
+  wasmMemoryPages?: number;
+  jsHeapBytes?: number;
+}
+
 export interface RpcResponse {
   requestId: number;
   kind: RpcKind;
   ok: boolean;
-  result?: OpenResult | ExecResult | QueryResult | PrepareResult | StatementStepResult | CheckpointResult | ExportResult | PersistResult;
+  result?: OpenResult | ExecResult | QueryResult | PrepareResult | StatementStepResult | CheckpointResult | ExportResult | PersistResult | MetricsResult;
   error?: QueryErrorPayload;
 }
 

@@ -12,14 +12,35 @@ test("web package OPFS smoke: create/open/query/reopen + export/import + checkpo
     );
   }
 
-  const result = await page.evaluate(async () =>
-    globalThis.__runDecentDBWebSmoke({
-      scenarioId: "playwright",
-      seedId: 4242,
-      path: `decentdb-web-smoke-playwright.ddb`,
-      importPath: `decentdb-web-smoke-playwright-import.ddb`,
-    })
-  );
+  const resultEnvelope = await page.evaluate(async () => {
+    try {
+      return {
+        ok: true,
+        result: await globalThis.__runDecentDBWebSmoke({
+          scenarioId: "playwright",
+          seedId: 4242,
+          path: `decentdb-web-smoke-playwright.ddb`,
+          importPath: `decentdb-web-smoke-playwright-import.ddb`,
+        }),
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        error: {
+          name: error instanceof Error ? error.name : "Error",
+          message: error instanceof Error ? error.message : String(error),
+          code: error && typeof error === "object" && "code" in error ? error.code : undefined,
+          details: error && typeof error === "object" && "details" in error ? error.details : undefined,
+        },
+      };
+    }
+  });
+
+  if (!resultEnvelope.ok) {
+    const output = await page.locator("#output").textContent().catch(() => "");
+    throw new Error(`Browser smoke failed: ${JSON.stringify(resultEnvelope.error)}${output ? `\nBrowser output:\n${output}` : ""}`);
+  }
+  const result = resultEnvelope.result;
 
   expect(result.path).toContain("decentdb-web-smoke-playwright.ddb");
   expect(result.createdRows).toHaveLength(1);

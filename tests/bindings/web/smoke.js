@@ -1,4 +1,4 @@
-import { DecentDBWebError, open } from "../../bindings/web/dist/index.js";
+import { DecentDBWebError, open } from "../../../bindings/web/dist/index.js";
 
 const output = document.getElementById("output");
 const button = document.getElementById("run");
@@ -25,8 +25,8 @@ function normalizeUrl(url) {
 function withDatabaseUrls(overrides = {}) {
   const base = window.location.href;
   return {
-    workerUrl: normalizeUrl(overrides.workerUrl ?? new URL("../../bindings/web/dist/worker.js", base)),
-    wasmUrl: normalizeUrl(overrides.wasmUrl ?? new URL("../../bindings/web/dist/decentdb_wasm.js", base)),
+    workerUrl: normalizeUrl(overrides.workerUrl ?? new URL("../../../bindings/web/dist/worker.js", base)),
+    wasmUrl: normalizeUrl(overrides.wasmUrl ?? new URL("../../../bindings/web/dist/decentdb_wasm.js", base)),
   };
 }
 

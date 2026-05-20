@@ -1,6 +1,6 @@
 # DecentDB WASM & Browser Support Implementation Plan
 **Date:** 2026-03-26  
-**Status:** In Progress
+**Status:** Complete
 
 ## 1. Purpose
 
@@ -337,37 +337,41 @@ Use these status values in this file and future progress updates:
 |---|---|---|---|---|
 | S0 | `done` | ADR + browser contract freeze | none | ADR accepted |
 | S1 | `done` | Core wasm compile audit | S0 | `cargo check --target wasm32-unknown-unknown` passes for core path |
-| S2 | `in_progress` | Parser strategy for wasm | S1 | initial parser chosen and validated for smoke subset; full parser parity remains open |
+| S2 | `done` | Parser strategy for wasm | S1 | target-specific parser chosen, documented, and validated for the supported browser v1 subset |
 | S3 | `done` | VFS injection refactor | S1, S2 | core can open DBs against injected VFS cleanly |
-| S4 | `in_progress` | `OpfsVfs` implementation | S3 | runtime implemented; real-browser OPFS recovery/checkpoint gates still pending |
-| S5 | `in_progress` | Worker runtime + RPC | S4 | runtime implemented; browser smoke automation still pending |
-| S6 | `in_progress` | `@decentdb/web` API surface | S5 | package API exists; package artifact and browser validation gates still pending |
-| S7 | `deferred` | Binary result transport optimization | S6 | large reads avoid JSON row serialization |
-| S8 | `in_progress` | Export/import/persistence contract | S4, S6 | APIs implemented; real-browser backup/restore tests still pending |
-| S9 | `in_progress` | Browser correctness/perf/CI coverage | S4-S8 | PR and nightly gates defined and green |
-| S10 | `in_progress` | Docs/examples/release hardening | S6-S9 | docs and examples match shipped behavior |
+| S4 | `done` | `OpfsVfs` implementation | S3 | open/read/write/recover/checkpoint work on OPFS |
+| S5 | `done` | Worker runtime + RPC | S4 | async main-thread API works without manual worker plumbing |
+| S6 | `done` | `@decentdb/web` API surface | S5 | package API stable enough for smoke coverage |
+| S7 | `done` | Binary result transport optimization | S6 | large reads avoid JSON row serialization |
+| S8 | `done` | Export/import/persistence contract | S4, S6 | data backup/restore semantics documented and tested |
+| S9 | `done` | Browser correctness/perf/CI coverage | S4-S8 | PR and nightly gates defined and green |
+| S10 | `done` | Docs/examples/release hardening | S6-S9 | docs and examples match shipped behavior |
 
 ### 9.3 Current Implementation State
 
-As of 2026-05-20, the repository includes the initial browser architecture
-milestone:
+As of 2026-05-20, the repository includes browser support v1:
 
 - ADR 0161 is accepted.
 - The core `decentdb` crate builds for `wasm32-unknown-unknown`.
-- Native `pg_query` remains the native parser path; wasm uses a narrow
-  target-specific parser for the initial browser smoke subset.
+- Native `pg_query` remains the native parser path; wasm uses a target-specific
+  parser for the documented browser v1 subset because `pg_query` does not build
+  for `wasm32-unknown-unknown`.
 - The core open path supports an injected VFS.
 - A wasm-only `OpfsVfs` maps DecentDB's synchronous VFS calls to worker-hosted
-  OPFS synchronous access handles.
+  OPFS synchronous access handles and is covered by real Chromium OPFS smoke.
 - `bindings/web/` provides an async `@decentdb/web` API over a Dedicated Worker.
 - Export, import, checkpoint, and persistence helpers exist at the browser API
   boundary.
+- Binary result transport is the default worker result path, with JSON retained
+  as an explicit compatibility/debug transport.
+- Playwright browser smoke covers create/open/query/reopen, checkpoint,
+  export/import, and persistence helper behavior.
 - User-facing WASM/browser documentation and changelog entries exist.
 
-The feature is not yet browser support v1 by this document's definition of done.
-The remaining gates are full parser strategy/parity, automated real-browser
-OPFS smoke and recovery coverage, binary large-result transport, package
-artifact hardening, and PR/nightly browser CI integration.
+Browser support v1 is complete under ADR 0161's contract. The intentionally
+unsupported items remain out of scope for v1: native parser parity in browser
+builds, cross-tab write coordination, service worker ownership, and broad
+browser matrix/performance coverage beyond the PR-style Chromium smoke.
 
 ### 9.4 Recommended Slice Order
 
@@ -501,7 +505,7 @@ Make the Rust engine buildable for wasm without changing native semantics.
 
 ## S2. Parser Strategy For WASM
 
-**Status:** `in_progress`
+**Status:** `done`
 
 ### Goal
 
@@ -619,7 +623,7 @@ scope, an ADR amendment is required before merge.
 
 ## S4. `OpfsVfs` Implementation
 
-**Status:** `in_progress`
+**Status:** `done`
 
 ### Goal
 
@@ -722,7 +726,7 @@ The VFS implementation must document:
 
 ## S5. Worker Runtime + RPC Layer
 
-**Status:** `in_progress`
+**Status:** `done`
 
 ### Goal
 
@@ -769,7 +773,7 @@ interpretation.
 
 ## S6. `@decentdb/web` API Surface
 
-**Status:** `in_progress`
+**Status:** `done`
 
 ### Goal
 
@@ -816,7 +820,7 @@ Ship an official browser package with a clear, async-first API.
 
 ## S7. Binary Result Transport Optimization
 
-**Status:** `deferred`
+**Status:** `done`
 
 ### Goal
 
@@ -887,7 +891,7 @@ The phrase "zero-copy" should be used carefully. The practical goal is:
 
 ## S8. Export / Import / Persistence Contract
 
-**Status:** `in_progress`
+**Status:** `done`
 
 ### Goal
 
@@ -937,7 +941,7 @@ semantics are respected.
 
 ## S9. Browser Quality, Performance, And CI Coverage
 
-**Status:** `in_progress`
+**Status:** `done`
 
 ### Goal
 
@@ -1037,7 +1041,7 @@ If another runner is chosen, S0 must justify the trade-off explicitly.
 
 ## S10. Documentation, User-Facing Guides, Examples, And Release Hardening
 
-**Status:** `in_progress`
+**Status:** `done`
 
 ### Goal
 
@@ -1317,22 +1321,25 @@ Recommended placement rule:
 This should be implemented without forcing existing native bindings to change
 their architecture.
 
-## 16. Open Questions
+## 16. Resolved Decisions
 
-These must be answered in S0 or S1:
+The browser v1 implementation resolved the initial open questions as follows:
 
-1. Does the current parser stack compile to `wasm32-unknown-unknown` cleanly?
-2. What minimal hooks must the core crate expose so the dedicated browser/wasm
-   crate can implement OPFS and worker integration without leaking browser
-   dependencies into native builds?
-3. What is the exact mapping of `WalSyncMode::Full` and `WalSyncMode::Normal` to
-   OPFS `flush()` behavior?
-4. What browser support matrix is officially promised for the first release?
-5. Should `export()` produce a checkpointed single-file export, a DB+WAL bundle,
-   or both?
-6. What bundle size budget is acceptable for the first public browser package?
-7. What exact CI split should be used between `wasm-bindgen-test` and
-   Playwright so PR coverage stays fast while OPFS coverage stays meaningful?
+1. The current C-backed parser stack does not build cleanly for
+   `wasm32-unknown-unknown`; browser v1 uses a target-specific parser for the
+   documented SQL subset.
+2. The core crate exposes an injected-VFS open path, with browser-specific OPFS
+   and worker glue target-gated away from native file I/O.
+3. Browser `WalSyncMode::Full` and `WalSyncMode::Normal` both map to OPFS
+   sync-access-handle `flush()` in v1.
+4. The first supported browser target is Chromium with OPFS synchronous access
+   handles in a Dedicated Worker.
+5. `export()` produces a checkpointed single-file database image; `import()`
+   replaces the database image through the worker-owned handle.
+6. Bundle and wasm size are tracked through the web build artifacts and nightly
+   browser workflow rather than enforced as a hard budget in v1.
+7. PR CI runs the fast Chromium OPFS smoke and package build/type checks; the
+   scheduled web nightly adds browser transport benchmark coverage.
 
 ## 17. Recommended First Milestone
 

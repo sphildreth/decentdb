@@ -1,5 +1,6 @@
 //! Browser-facing wasm exports for `@decentdb/web`.
 
+use std::error::Error;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -251,5 +252,10 @@ fn base64_encode(bytes: &[u8]) -> String {
 }
 
 fn js_db_error(error: DbError) -> JsValue {
-    JsValue::from_str(&error.to_string())
+    let mut message = error.to_string();
+    if let Some(source) = error.source() {
+        message.push_str(": ");
+        message.push_str(&source.to_string());
+    }
+    JsValue::from_str(&message)
 }

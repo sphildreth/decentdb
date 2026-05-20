@@ -82,7 +82,7 @@ impl Vfs for OpfsVfs {
     }
 
     fn canonicalize_path(&self, path: &Path) -> Result<PathBuf> {
-        Ok(PathBuf::from(format!("opfs://{}", path.display())))
+        Ok(path.to_path_buf())
     }
 }
 
@@ -234,9 +234,12 @@ fn kind_label(kind: FileKind) -> &'static str {
 }
 
 fn opfs_error(context: impl Into<String>, source: JsValue) -> DbError {
-    let message = source
-        .as_string()
-        .unwrap_or_else(|| "JavaScript OPFS host error".to_string());
+    let message = source.as_string().unwrap_or_else(|| {
+        js_sys::Error::from(source)
+            .message()
+            .as_string()
+            .unwrap_or_else(|| "JavaScript OPFS host error".to_string())
+    });
     DbError::io(
         context.into(),
         std::io::Error::new(std::io::ErrorKind::Other, message),

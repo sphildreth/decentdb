@@ -1,5 +1,5 @@
-import { installOpfsHost, prepareDatabase, replaceDatabaseBytes } from "./opfs-host";
-import { decodeBinaryResult } from "./binary";
+import { installOpfsHost, prepareDatabase, replaceDatabaseBytes } from "./opfs-host.js";
+import { decodeBinaryResult } from "./binary.js";
 import {
   ERR_ENGINE_NOT_AVAILABLE,
   ERR_NOT_FOUND,
@@ -7,6 +7,7 @@ import {
   type CheckpointResult,
   type ExecResult,
   type ExportResult,
+  type MetricsResult,
   type OpenMode,
   type OpenResult,
   type PersistResult,
@@ -20,7 +21,7 @@ import {
   type RpcResponse,
   type StatementStepResult,
   createErrorPayload,
-} from "./protocol";
+} from "./protocol.js";
 
 type WasmDb = {
   execJson(sql: string, paramsJson: string): string;
@@ -32,9 +33,18 @@ type WasmDb = {
 };
 
 type WasmModule = {
-  default?: (input?: unknown) => Promise<unknown>;
+  default?: (input?: unknown) => Promise<WasmInitOutput>;
   decentdbOpen(path: string, mode: OpenMode): WasmDb;
   decentdbVersion?: () => string;
+};
+
+type WasmInitOutput = {
+  memory?: WebAssembly.Memory;
+};
+
+type LoadedWasmModule = {
+  module: WasmModule;
+  memory?: WebAssembly.Memory;
 };
 
 type EngineResult = {
@@ -47,6 +57,7 @@ type DatabaseRecord = {
   path: string;
   mode: OpenMode;
   wasmUrl: string;
+  wasmMemory?: WebAssembly.Memory;
   resultTransport: ResultTransport;
   handle: WasmDb;
 };
@@ -63,7 +74,7 @@ interface DbState {
   nextStmtId: number;
   dbById: Map<number, DatabaseRecord>;
   stmtToDb: Map<number, StatementRecord>;
-  wasmByUrl: Map<string, Promise<WasmModule>>;
+  wasmByUrl: Map<string, Promise<LoadedWasmModule>>;
 }
 
 const state: DbState = {
@@ -71,7 +82,7 @@ const state: DbState = {
   nextStmtId: 1,
   dbById: new Map<number, DatabaseRecord>(),
   stmtToDb: new Map<number, StatementRecord>(),
-  wasmByUrl: new Map<string, Promise<WasmModule>>(),
+  wasmByUrl: new Map<string, Promise<LoadedWasmModule>>(),
 };
 
 installOpfsHost();
@@ -80,18 +91,22 @@ function wasmUrlFromRequest(request: Extract<RpcRequest, { kind: "open" }>): str
   return request.payload.options?.wasmUrl ?? new URL("./decentdb_wasm.js", import.meta.url).toString();
 }
 
-async function loadWasm(wasmUrl: string): Promise<WasmModule> {
+async function loadWasm(wasmUrl: string): Promise<LoadedWasmModule> {
   let existing = state.wasmByUrl.get(wasmUrl);
   if (!existing) {
     existing = import(/* @vite-ignore */ wasmUrl)
       .then(async (module: WasmModule) => {
+        let initOutput: WasmInitOutput | undefined;
         if (typeof module.default === "function") {
-          await module.default();
+          initOutput = await module.default();
         }
         if (typeof module.decentdbOpen !== "function") {
           throw new Error("WASM module does not export decentdbOpen(path, mode).");
         }
-        return module;
+        return {
+          module,
+          memory: initOutput?.memory,
+        };
       })
       .catch((error: unknown) => {
         throw createErrorPayload(
@@ -199,12 +214,13 @@ async function handleOpen(request: RpcRequest): Promise<RpcResponse> {
   await prepareDatabase(request.payload.path, request.payload.mode);
   const wasmUrl = wasmUrlFromRequest(request);
   const wasm = await loadWasm(wasmUrl);
-  const handle = wasm.decentdbOpen(request.payload.path, request.payload.mode);
+  const handle = wasm.module.decentdbOpen(request.payload.path, request.payload.mode);
   const dbId = state.nextDbId++;
   state.dbById.set(dbId, {
     path: request.payload.path,
     mode: request.payload.mode,
     wasmUrl,
+    wasmMemory: wasm.memory,
     resultTransport: request.payload.options?.resultTransport ?? "binary",
     handle,
   });
@@ -347,7 +363,8 @@ async function handleImport(request: RpcRequest): Promise<RpcResponse> {
   db.handle.close();
   await replaceDatabaseBytes(db.path, new Uint8Array(request.payload.bytes));
   const wasm = await loadWasm(db.wasmUrl);
-  db.handle = wasm.decentdbOpen(db.path, "openOrCreate");
+  db.handle = wasm.module.decentdbOpen(db.path, "openOrCreate");
+  db.wasmMemory = wasm.memory;
   return successResponse(request.requestId, "import", undefined);
 }
 
@@ -360,6 +377,23 @@ async function handlePersist(request: RpcRequest): Promise<RpcResponse> {
     persisted: typeof navigator.storage.persist === "function" ? await navigator.storage.persist() : false,
   };
   return successResponse(request.requestId, "persist", result);
+}
+
+async function handleMetrics(request: RpcRequest): Promise<RpcResponse> {
+  if (request.kind !== "metrics") {
+    return errorResponse(request.requestId, request.kind, createErrorPayload(ERR_OPERATION_FAILED, "Wrong handler", "Expected metrics request"));
+  }
+  const db = withDatabase(request.payload.dbId);
+  const result: MetricsResult = {};
+  if (db.wasmMemory) {
+    result.wasmMemoryBytes = db.wasmMemory.buffer.byteLength;
+    result.wasmMemoryPages = Math.floor(db.wasmMemory.buffer.byteLength / 65_536);
+  }
+  const performanceWithMemory = performance as Performance & { memory?: { usedJSHeapSize?: number } };
+  if (typeof performanceWithMemory.memory?.usedJSHeapSize === "number") {
+    result.jsHeapBytes = performanceWithMemory.memory.usedJSHeapSize;
+  }
+  return successResponse(request.requestId, "metrics", result);
 }
 
 async function dispatch(request: RpcRequest): Promise<RpcResponse> {
@@ -388,6 +422,8 @@ async function dispatch(request: RpcRequest): Promise<RpcResponse> {
       return handleImport(request);
     case "persist":
       return handlePersist(request);
+    case "metrics":
+      return handleMetrics(request);
     default: {
       const unknownRequest = request as RpcRequest;
       return errorResponse(unknownRequest.requestId, unknownRequest.kind, createErrorPayload(ERR_OPERATION_FAILED, "Unsupported request", `Unhandled kind ${unknownRequest.kind}`));
@@ -401,13 +437,15 @@ self.onmessage = async (event: MessageEvent<RpcRequest>): Promise<void> => {
     if (error && typeof error === "object" && "code" in error && "message" in error) {
       return errorResponse(request.requestId, request.kind, error as QueryErrorPayload);
     }
+    const details = error instanceof Error ? (error.stack ?? error.message) : String(error);
+    console.error("DecentDB worker error", details);
     return errorResponse(
       request.requestId,
       request.kind,
       createErrorPayload(
         ERR_OPERATION_FAILED,
         "Unhandled worker error",
-        error instanceof Error ? error.message : String(error)
+        details
       )
     );
   });

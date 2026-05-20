@@ -9,12 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Added initial WASM/browser support: the `decentdb` crate now checks for
+- Added WASM/browser support: the `decentdb` crate now checks for
   `wasm32-unknown-unknown`, exposes wasm-bindgen browser exports, and includes
   an OPFS-backed VFS intended for Dedicated Worker use.
 - Added the `@decentdb/web` TypeScript binding with an async worker-owned API,
   OPFS host bridge, explicit `wasmUrl` loading, `exec`/`query`/`prepare`,
-  checkpoint, import/export, persistence helper, and browser smoke scaffolding.
+  binary result transport, checkpoint, import/export, persistence helper,
+  worker metrics, automated Chromium OPFS browser smoke coverage, and scheduled
+  browser transport benchmark coverage.
 - Added ADR 0161 documenting the browser WASM/OPFS runtime and its one-worker
   ownership model.
 - Added the WASM / Browser API documentation page.
@@ -22,8 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Gated the native C-backed `pg_query` parser out of `wasm32-unknown-unknown`
-  builds and added a narrow initial wasm parser for simple browser smoke
-  workflows.
+  builds and added a documented wasm parser for the browser v1 SQL subset.
 
 ## [2.6.0] - 2026-05-19
 
