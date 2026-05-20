@@ -131,6 +131,39 @@ fn exec_and_schema_introspection_commands_work() {
 }
 
 #[test]
+fn describe_command_shows_foreign_keys() {
+    let dir = temp_dir();
+    let db = dir.join("foreign-keys.ddb");
+    let db_str = db.display().to_string();
+
+    run(&[
+        "exec",
+        "--db",
+        &db_str,
+        "--sql",
+        "CREATE TABLE artists (id INT64 PRIMARY KEY); \
+         CREATE TABLE albums (id INT64 PRIMARY KEY, artist_id INT64, \
+           FOREIGN KEY (artist_id) REFERENCES artists(id) \
+           ON DELETE CASCADE ON UPDATE SET NULL);",
+        "--format",
+        "json",
+    ]);
+
+    let describe = run(&[
+        "describe", "--db", &db_str, "--table", "albums", "--format", "table",
+    ]);
+    assert!(describe.contains("foreign_key"));
+    assert!(describe.contains("artist_id"));
+    assert!(describe.contains("REFERENCES artists(id) ON DELETE CASCADE ON UPDATE SET NULL"));
+
+    let json = run(&[
+        "describe", "--db", &db_str, "--table", "albums", "--format", "json",
+    ]);
+    assert!(json.contains("\"foreign_key\""));
+    assert!(json.contains("REFERENCES artists(id)"));
+}
+
+#[test]
 fn checkpoint_command_flushes_wal_and_preserves_data_without_wal_file() {
     let dir = temp_dir();
     let db = dir.join("checkpoint.ddb");

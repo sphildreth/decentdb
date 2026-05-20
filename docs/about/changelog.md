@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   read-only mode, schema/table/index/view/trigger inspection, SQL and EXPLAIN
   execution, result limits, request limits, query history, CSV export, optional
   CORS, JSON request logging, and remote-bind safety checks.
+- Enhanced `decentdb describe` and the REPL `.d <table>` command to show
+  foreign key references, including table-level foreign key constraints.
 - Completed the interactive SQL shell ergonomics roadmap slice with a version
   banner, `help`/quit aliases, topic-specific help, schema inspection commands
   (`.tables`, `.dt`, `.d <table>`, `.schema`, `.indexes`, `.views`), function

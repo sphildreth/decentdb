@@ -12,11 +12,11 @@ use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use decentdb::{
     evict_shared_wal, render_markdown, run_doctor, BranchDiffReport, BranchInfo, BranchLogEntry,
     BranchMergeOperation, BranchMergeReport, BranchRestoreReport, BranchTableDiffStatus,
-    BulkLoadOptions, Db, DbConfig, DoctorCategory, DoctorCheckSelection, DoctorIndexVerification,
-    DoctorOptions, DoctorPathMode, DoctorReport, DoctorSeverity, HeaderInfo, IndexVerification,
-    NamedSnapshot, QueryResult, StorageInfo, SyncChangeBatch, SyncConflict, SyncConflictPolicy,
-    SyncHandshake, SyncImportSummary, SyncPeer, SyncPeerScopeBinding, SyncRunDirection,
-    SyncRunSummary, SyncScope, TableInfo, Value,
+    BulkLoadOptions, ColumnInfo, Db, DbConfig, DoctorCategory, DoctorCheckSelection,
+    DoctorIndexVerification, DoctorOptions, DoctorPathMode, DoctorReport, DoctorSeverity,
+    ForeignKeyInfo, HeaderInfo, IndexVerification, NamedSnapshot, QueryResult, StorageInfo,
+    SyncChangeBatch, SyncConflict, SyncConflictPolicy, SyncHandshake, SyncImportSummary, SyncPeer,
+    SyncPeerScopeBinding, SyncRunDirection, SyncRunSummary, SyncScope, TableInfo, Value,
 };
 
 use crate::output::{
@@ -1654,6 +1654,7 @@ fn run_describe(command: DescribeCommand) -> Result<()> {
                 column.unique.to_string(),
                 column.auto_increment.to_string(),
                 column.default_sql.clone().unwrap_or_default(),
+                describe_column_foreign_keys(&table, column),
             ]
         })
         .collect::<Vec<_>>();
@@ -1665,9 +1666,50 @@ fn run_describe(command: DescribeCommand) -> Result<()> {
         "unique".to_string(),
         "auto_increment".to_string(),
         "default".to_string(),
+        "foreign_key".to_string(),
     ];
     println!("{}", render_rows(command.format, &columns, &rows, true));
     Ok(())
+}
+
+fn describe_column_foreign_keys(table: &TableInfo, column: &ColumnInfo) -> String {
+    let mut foreign_keys = Vec::new();
+    if let Some(foreign_key) = &column.foreign_key {
+        foreign_keys.push(format_foreign_key_for_column(foreign_key, &column.name));
+    }
+    for foreign_key in table
+        .foreign_keys
+        .iter()
+        .filter(|foreign_key| foreign_key.columns.iter().any(|name| name == &column.name))
+    {
+        foreign_keys.push(format_foreign_key_for_column(foreign_key, &column.name));
+    }
+    foreign_keys.dedup();
+    foreign_keys.join("; ")
+}
+
+fn format_foreign_key_for_column(foreign_key: &ForeignKeyInfo, column_name: &str) -> String {
+    let target = format!(
+        "REFERENCES {}({})",
+        foreign_key.referenced_table,
+        foreign_key.referenced_columns.join(", ")
+    );
+    let mut formatted = if foreign_key.columns.len() == 1
+        && foreign_key.columns.first().map(String::as_str) == Some(column_name)
+    {
+        target
+    } else {
+        format!("FOREIGN KEY ({}) {target}", foreign_key.columns.join(", "))
+    };
+    if !foreign_key.on_delete.eq_ignore_ascii_case("NO ACTION") {
+        formatted.push_str(" ON DELETE ");
+        formatted.push_str(&foreign_key.on_delete);
+    }
+    if !foreign_key.on_update.eq_ignore_ascii_case("NO ACTION") {
+        formatted.push_str(" ON UPDATE ");
+        formatted.push_str(&foreign_key.on_update);
+    }
+    formatted
 }
 
 fn run_list_tables(command: ListTablesCommand) -> Result<()> {

@@ -200,7 +200,7 @@ decentdb info --db=<path> [--schema-summary] [--format=<json|csv|table>]
 
 ### describe
 
-Describe one table.
+Describe one table, including column flags and foreign key references.
 
 ```bash
 decentdb describe --db=<path> --table=<name> [--format=<json|csv|table>]

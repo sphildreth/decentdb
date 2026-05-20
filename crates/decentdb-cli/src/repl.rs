@@ -751,8 +751,16 @@ fn column_constraints(table: &TableInfo, column: &ColumnInfo) -> String {
         constraints.push(format!("CHECK ({check})"));
     }
     if let Some(foreign_key) = &column.foreign_key {
-        constraints.push(format_foreign_key(foreign_key));
+        constraints.push(format_foreign_key_for_column(foreign_key, &column.name));
     }
+    for foreign_key in table
+        .foreign_keys
+        .iter()
+        .filter(|foreign_key| foreign_key.columns.iter().any(|name| name == &column.name))
+    {
+        constraints.push(format_foreign_key_for_column(foreign_key, &column.name));
+    }
+    constraints.dedup();
     if constraints.is_empty() {
         "-".to_string()
     } else {
@@ -760,9 +768,28 @@ fn column_constraints(table: &TableInfo, column: &ColumnInfo) -> String {
     }
 }
 
-fn format_foreign_key(foreign_key: &ForeignKeyInfo) -> String {
-    let columns = foreign_key.referenced_columns.join(", ");
-    format!("REFERENCES {}({columns})", foreign_key.referenced_table)
+fn format_foreign_key_for_column(foreign_key: &ForeignKeyInfo, column_name: &str) -> String {
+    let target = format!(
+        "REFERENCES {}({})",
+        foreign_key.referenced_table,
+        foreign_key.referenced_columns.join(", ")
+    );
+    let mut formatted = if foreign_key.columns.len() == 1
+        && foreign_key.columns.first().map(String::as_str) == Some(column_name)
+    {
+        target
+    } else {
+        format!("FOREIGN KEY ({}) {target}", foreign_key.columns.join(", "))
+    };
+    if !foreign_key.on_delete.eq_ignore_ascii_case("NO ACTION") {
+        formatted.push_str(" ON DELETE ");
+        formatted.push_str(&foreign_key.on_delete);
+    }
+    if !foreign_key.on_update.eq_ignore_ascii_case("NO ACTION") {
+        formatted.push_str(" ON UPDATE ");
+        formatted.push_str(&foreign_key.on_update);
+    }
+    formatted
 }
 
 fn print_help(topic: &str) -> String {
