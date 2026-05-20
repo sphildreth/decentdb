@@ -23,7 +23,7 @@ commands.
 
 Accepted high-leverage themes:
 
-- recover performance credibility before adding broad new surface area
+- keep performance protected through benchmarks and regression guardrails
 - make the one-writer model ergonomic through engine-owned write queuing
 - expose operational state through queryable `sys.*` surfaces
 - add reactive query and change-stream APIs for modern app frameworks
@@ -72,28 +72,27 @@ Future version values are planning buckets, not release commitments.
 
 | Priority | Future Version | Status | Feature | Current Source Of Truth | Why This Rank |
 |---:|---|---|---|---|---|
-| 1 | vNext+1 | TODO | Performance parity and regression recovery | [`2026-05-18.PERFORMANCE_IMPROVEMENT_PLAN.md`](2026-05-18.PERFORMANCE_IMPROVEMENT_PLAN.md), ADR 0112 | Credibility prerequisite; current benchmark gaps undermine every adoption story |
-| 2 | vNext+1 | TODO | Concurrent write ergonomics: write queue plus strict group commit | ADR 0135 for async commit; needs ADR/spec for durable queue/group commit | Removes the most visible one-writer friction while preserving durability |
-| 3 | vNext+1 | TODO | Built-in observability and `sys.*` virtual tables | Needs ADR/spec; Doctor v1 is foundation | Makes performance, locks, WAL, sync, and storage state inspectable |
-| 4 | vNext+1 | TODO | Reactive query subscriptions and change streams | Needs ADR/spec; sync journal and branch diff are inputs | Modern local-first apps need live query invalidation without polling |
-| 5 | vNext+2 | TODO | Production browser runtime | ADR 0161 and [`docs/api/wasm.md`](../docs/api/wasm.md); needs follow-up ADR/spec | Browser is a primary local-first runtime, and v1 intentionally lacks multi-tab/service-worker/write coordination |
-| 6 | vNext+2 | TODO | Production sync relay and public changeset API | [`WIN_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md`](WIN_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md); needs follow-up ADR/spec | Turns shipped sync into a production application platform surface |
-| 7 | vNext+2 | TODO | Local data security: TDE, policies, masking, audit context | Needs ADR/spec | TDE is table stakes for SQLCipher-style onboarding; policy is the differentiated regulated/offline story |
-| 8 | vNext+2 | TODO | Lua extension runtime and package model | [`WIN_LUA_EXTENSION_RUNTIME_SPEC.md`](WIN_LUA_EXTENSION_RUNTIME_SPEC.md) | One sandboxed extension language is supportable across native, mobile, and WASM targets |
-| 9 | vNext+2 | TODO | SQL and PRAGMA compatibility quick wins | [`WIN_ADVANCED_SQL_COMPATIBILITY_SURFACE.md`](WIN_ADVANCED_SQL_COMPATIBILITY_SURFACE.md); needs focused slice spec | Low-friction onboarding from SQLite/PostgreSQL code without chasing full clone compatibility |
-| 10 | vNext+3 | TODO | Full-text search with BM25 ranking | Needs ADR/spec | Expected by app databases and a real SQLite FTS migration blocker |
-| 11 | vNext+3 | TODO | Cross-process WAL coordination | Needs ADR/spec | Important for Electron/Tauri, helper processes, CLI coexistence, and background sync workers |
-| 12 | vNext+3 | BACKLOG | Branch-aware migration rehearsal and promotion | ADR 0153-0159 and branch CLI/API docs; needs ADR/spec | More distinctive than generic online migration and uses shipped branch/diff foundations |
-| 13 | vNext+3 | BACKLOG | Agent and tooling integration mode | [`STABLE_TOOLING_METADATA_CONTRACT.md`](STABLE_TOOLING_METADATA_CONTRACT.md); needs ADR/spec | Makes the "agent-friendly" promise concrete without putting LLM behavior in the engine |
-| 14 | vNext+3 | BACKLOG | Application and support bundle format | Needs ADR/spec | Useful portable artifact and diagnostics story, but not more urgent than runtime friction |
-| 15 | vNext+3 | BACKLOG | Incrementally maintained projections | Needs ADR/spec | Accelerates dashboards, local read models, and reactive query workloads |
-| 16 | vNext+3 | BACKLOG | JSONB binary storage | Needs ADR/spec | Important for JSON-heavy workloads, but less urgent than FTS and runtime fundamentals |
-| 17 | Later | BACKLOG | Native vector / HNSW index | Needs ADR/spec | Valuable for offline AI/RAG, but less universal than FTS and security |
-| 18 | Later | BACKLOG | Temporal row history and auditable state | Needs ADR/spec | Strong regulated/support workflow, but should follow security and sync hardening |
-| 19 | Later | BACKLOG | Advanced geospatial semantics and analytics | ADR 0128 deferred work; needs follow-up ADR/spec | Builds on shipped spatial support without implying the foundation is unfinished |
-| 20 | Later | BACKLOG | Advanced SQL compatibility surface | [`WIN_ADVANCED_SQL_COMPATIBILITY_SURFACE.md`](WIN_ADVANCED_SQL_COMPATIBILITY_SURFACE.md) | Useful adoption polish after quick wins and higher-impact app workflows |
-| 21 | Later | BACKLOG | WAL streaming replication | Needs ADR/spec | Useful HA/read-scale story, but weaker than local-first sync for DecentDB identity |
-| 22 | Later | BACKLOG | Cloud-native object storage VFS | Needs ADR/spec | Interesting edge/serverless story with high durability and consistency complexity |
+| 1 | vNext+1 | TODO | Concurrent write ergonomics: write queue plus strict group commit | ADR 0135 for async commit; needs ADR/spec for durable queue/group commit | Removes the most visible one-writer friction while preserving durability |
+| 2 | vNext+1 | TODO | Built-in observability and `sys.*` virtual tables | Needs ADR/spec; Doctor v1 is foundation | Makes performance, locks, WAL, sync, and storage state inspectable |
+| 3 | vNext+1 | TODO | Reactive query subscriptions and change streams | Needs ADR/spec; sync journal and branch diff are inputs | Modern local-first apps need live query invalidation without polling |
+| 4 | vNext+2 | TODO | Production browser runtime | ADR 0161 and [`docs/api/wasm.md`](../docs/api/wasm.md); needs follow-up ADR/spec | Browser is a primary local-first runtime, and v1 intentionally lacks multi-tab/service-worker/write coordination |
+| 5 | vNext+2 | TODO | Production sync relay and public changeset API | [`WIN_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md`](WIN_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md); needs follow-up ADR/spec | Turns shipped sync into a production application platform surface |
+| 6 | vNext+2 | TODO | Local data security: TDE, policies, masking, audit context | Needs ADR/spec | TDE is table stakes for SQLCipher-style onboarding; policy is the differentiated regulated/offline story |
+| 7 | vNext+2 | TODO | Lua extension runtime and package model | [`WIN_LUA_EXTENSION_RUNTIME_SPEC.md`](WIN_LUA_EXTENSION_RUNTIME_SPEC.md) | One sandboxed extension language is supportable across native, mobile, and WASM targets |
+| 8 | vNext+2 | TODO | SQL and PRAGMA compatibility quick wins | [`WIN_ADVANCED_SQL_COMPATIBILITY_SURFACE.md`](WIN_ADVANCED_SQL_COMPATIBILITY_SURFACE.md); needs focused slice spec | Low-friction onboarding from SQLite/PostgreSQL code without chasing full clone compatibility |
+| 9 | vNext+3 | TODO | Full-text search with BM25 ranking | Needs ADR/spec | Expected by app databases and a real SQLite FTS migration blocker |
+| 10 | vNext+3 | TODO | Cross-process WAL coordination | Needs ADR/spec | Important for Electron/Tauri, helper processes, CLI coexistence, and background sync workers |
+| 11 | vNext+3 | BACKLOG | Branch-aware migration rehearsal and promotion | ADR 0153-0159 and branch CLI/API docs; needs ADR/spec | More distinctive than generic online migration and uses shipped branch/diff foundations |
+| 12 | vNext+3 | BACKLOG | Agent and tooling integration mode | [`STABLE_TOOLING_METADATA_CONTRACT.md`](STABLE_TOOLING_METADATA_CONTRACT.md); needs ADR/spec | Makes the "agent-friendly" promise concrete without putting LLM behavior in the engine |
+| 13 | vNext+3 | BACKLOG | Application and support bundle format | Needs ADR/spec | Useful portable artifact and diagnostics story, but not more urgent than runtime friction |
+| 14 | vNext+3 | BACKLOG | Incrementally maintained projections | Needs ADR/spec | Accelerates dashboards, local read models, and reactive query workloads |
+| 15 | vNext+3 | BACKLOG | JSONB binary storage | Needs ADR/spec | Important for JSON-heavy workloads, but less urgent than FTS and runtime fundamentals |
+| 16 | Later | BACKLOG | Native vector / HNSW index | Needs ADR/spec | Valuable for offline AI/RAG, but less universal than FTS and security |
+| 17 | Later | BACKLOG | Temporal row history and auditable state | Needs ADR/spec | Strong regulated/support workflow, but should follow security and sync hardening |
+| 18 | Later | BACKLOG | Advanced geospatial semantics and analytics | ADR 0128 deferred work; needs follow-up ADR/spec | Builds on shipped spatial support without implying the foundation is unfinished |
+| 19 | Later | BACKLOG | Advanced SQL compatibility surface | [`WIN_ADVANCED_SQL_COMPATIBILITY_SURFACE.md`](WIN_ADVANCED_SQL_COMPATIBILITY_SURFACE.md) | Useful adoption polish after quick wins and higher-impact app workflows |
+| 20 | Later | BACKLOG | WAL streaming replication | Needs ADR/spec | Useful HA/read-scale story, but weaker than local-first sync for DecentDB identity |
+| 21 | Later | BACKLOG | Cloud-native object storage VFS | Needs ADR/spec | Interesting edge/serverless story with high durability and consistency complexity |
 
 ## Positioning
 
@@ -136,42 +135,7 @@ This should be stated plainly in user docs so developers understand that
 DecentDB optimizes the single-writer model rather than pretending it is a
 server database.
 
-## 1. Performance Parity And Regression Recovery
-
-**Status:** `TODO`
-
-**Future Version:** vNext+1
-
-**Source of truth:** [`2026-05-18.PERFORMANCE_IMPROVEMENT_PLAN.md`](2026-05-18.PERFORMANCE_IMPROVEMENT_PLAN.md), ADR 0112.
-
-### Why This Matters
-
-Durability remains priority #1, but adoption fails if normal reads, joins,
-inserts, and durable commits are visibly slower than SQLite in fair benchmarks.
-The performance plan documents current read and write regressions and a
-concrete recovery sequence.
-
-### Required Work
-
-- benchmark integrity and fair profile metadata
-- recover read regression from row-source re-deferral and materialization costs
-- recover insert/write throughput regression
-- prepared physical read plans for point lookups, indexed projections, simple
-  indexed joins, range scans, and simple aggregates
-- replace benchmark-named fast paths with generic planner capabilities
-- reduce unnecessary result materialization and `Value` cloning on hot paths
-- profile durable commit path before changing WAL behavior
-- continuous benchmark reporting with regression alerts and raw result context
-
-### Guardrails
-
-- no benchmark claim may weaken ACID durability
-- keep durable, relaxed, default, and tuned profiles visibly separate
-- use `.tmp/` for ad hoc local performance output
-- do not hide losing metrics by changing chart shape
-- keep crash recovery and binding smoke tests green while optimizing
-
-## 2. Concurrent Write Ergonomics: Write Queue Plus Strict Group Commit
+## 1. Concurrent Write Ergonomics: Write Queue Plus Strict Group Commit
 
 **Status:** `TODO`
 
@@ -208,7 +172,7 @@ Strict group commit is the durable batching mode for queued writes:
 - no cross-process promises until cross-process WAL coordination exists
 - binding APIs must expose errors consistently instead of spinning internally
 
-## 3. Built-In Observability And `sys.*` Virtual Tables
+## 2. Built-In Observability And `sys.*` Virtual Tables
 
 **Status:** `TODO`
 
@@ -220,7 +184,7 @@ Strict group commit is the durable batching mode for queued writes:
 
 Doctor answers "what is wrong now?" Observability answers "what is happening
 while the application runs?" Queryable diagnostics are also required to make
-performance recovery, write queuing, sync hardening, and policy auditing
+write queuing, sync hardening, policy auditing, and future performance work
 operationally visible.
 
 ### Target Surfaces
@@ -253,7 +217,7 @@ SELECT * FROM sys.sync_status;
 - in-memory ring buffers for slow queries and lock waits
 - no recursive disk writes for telemetry
 
-## 4. Reactive Query Subscriptions And Change Streams
+## 3. Reactive Query Subscriptions And Change Streams
 
 **Status:** `TODO`
 
@@ -286,7 +250,7 @@ invalidation bugs into every host language.
 - subscriptions observe committed state only
 - query re-execution and diff calculation must have bounded cost controls
 
-## 5. Production Browser Runtime
+## 4. Production Browser Runtime
 
 **Status:** `TODO`
 
@@ -321,7 +285,7 @@ a production story for tabs, workers, browser storage pressure, and sync.
 - avoid silent fallback to weaker storage
 - keep native hot paths unaffected by browser-only code
 
-## 6. Production Sync Relay And Public Changeset API
+## 5. Production Sync Relay And Public Changeset API
 
 **Status:** `TODO`
 
@@ -357,7 +321,7 @@ changeset, and shape APIs so sync is not merely a dev workflow.
   become a core import/export replacement
 - all sync metadata writes must preserve crash recovery guarantees
 
-## 7. Local Data Security: TDE, Policies, Masking, Audit Context
+## 6. Local Data Security: TDE, Policies, Masking, Audit Context
 
 **Status:** `TODO`
 
@@ -402,7 +366,7 @@ CREATE MASK ssn_mask
 - audit metadata must be explicit and queryable
 - key material must never be written to database pages, WAL, or telemetry
 
-## 8. Lua Extension Runtime And Package Model
+## 7. Lua Extension Runtime And Package Model
 
 **Status:** `TODO`
 
@@ -444,7 +408,7 @@ systems or unbounded native plugins.
 - Lua execution must be resource-bounded, cancellable, and converted into SQL
   errors without process corruption
 
-## 9. SQL And PRAGMA Compatibility Quick Wins
+## 8. SQL And PRAGMA Compatibility Quick Wins
 
 **Status:** `TODO`
 
@@ -479,7 +443,7 @@ DecentDB to clone every behavior.
   advanced SQL track unless a separate ADR narrows them
 - do not add core import/export features in this slice
 
-## 10. Full-Text Search With BM25 Ranking
+## 9. Full-Text Search With BM25 Ranking
 
 **Status:** `TODO`
 
@@ -512,7 +476,7 @@ tokenization, phrase search, and ranking.
 - define crash recovery and rebuild behavior before implementation
 - benchmark against representative SQLite FTS workloads
 
-## 11. Cross-Process WAL Coordination
+## 10. Cross-Process WAL Coordination
 
 **Status:** `TODO`
 
@@ -542,7 +506,7 @@ coexistence, and background sync workers.
 - ADR required because this changes locking and `Send`/`Sync` boundaries
 - browser multi-tab coordination is related but tracked separately
 
-## 12. Branch-Aware Migration Rehearsal And Promotion
+## 11. Branch-Aware Migration Rehearsal And Promotion
 
 **Status:** `BACKLOG`
 
@@ -573,7 +537,7 @@ safe workflow: branch, migrate, validate, diff, detect drift, and promote.
 - branch merge semantics must stay conservative
 - do not hide destructive schema changes behind automatic promotion
 
-## 13. Agent And Tooling Integration Mode
+## 12. Agent And Tooling Integration Mode
 
 **Status:** `BACKLOG`
 
@@ -608,7 +572,7 @@ guessing.
 - Decent Bench remains the product home for rich visual workflows and generated
   SDK output
 
-## 14. Application And Support Bundle Format
+## 13. Application And Support Bundle Format
 
 **Status:** `BACKLOG`
 
@@ -643,7 +607,7 @@ A DecentDB bundle may contain:
 - support bundles must have a sanitization/redaction story before use with
   regulated data
 
-## 15. Incrementally Maintained Projections
+## 14. Incrementally Maintained Projections
 
 **Status:** `BACKLOG`
 
@@ -672,7 +636,7 @@ database-native capability that also accelerates reactive queries.
 - keep maintenance work visible in write latency and `sys.*`
 - define crash recovery and rebuild semantics before implementation
 
-## 16. JSONB Binary Storage
+## 15. JSONB Binary Storage
 
 **Status:** `BACKLOG`
 
@@ -695,7 +659,7 @@ more effective.
 - large JSONB uses existing overflow page mechanics
 - partial updates rebuild the binary blob through the single writer
 
-## 17. Native Vector / HNSW Index
+## 16. Native Vector / HNSW Index
 
 **Status:** `BACKLOG`
 
@@ -710,7 +674,7 @@ also becoming a baseline checkbox in modern data products.
 
 ### Why It Is Not Higher
 
-FTS, security, write ergonomics, and performance recovery affect more existing
+FTS, security, and write ergonomics affect more existing
 embedded database users. Vector search should follow the runtime fundamentals
 and avoid becoming a large storage/index project before the core engine is
 faster and easier to operate.
@@ -724,7 +688,7 @@ faster and easier to operate.
 - WASM/mobile portability story
 - benchmarks against common vector-search extensions
 
-## 18. Temporal Row History And Auditable State
+## 17. Temporal Row History And Auditable State
 
 **Status:** `BACKLOG`
 
@@ -753,7 +717,7 @@ auditable local data. Some regulated and support-heavy apps need to answer:
 - redaction must be compatible with retention and audit requirements
 - do not conflate branch snapshots with row-level audit history
 
-## 19. Advanced Geospatial Semantics And Analytics
+## 18. Advanced Geospatial Semantics And Analytics
 
 **Status:** `BACKLOG`
 
@@ -785,7 +749,7 @@ the completed native geospatial feature does not appear unfinished.
 - avoid native GEOS/PROJ/GDAL dependencies unless an ADR justifies the tradeoff
 - keep WASM compatibility as a design constraint
 
-## 20. Advanced SQL Compatibility Surface
+## 19. Advanced SQL Compatibility Surface
 
 **Status:** `BACKLOG`
 
@@ -821,7 +785,7 @@ this item is for heavier compatibility work.
   ergonomics
 - avoid expanding core import/export features in this track
 
-## 21. WAL Streaming Replication
+## 20. WAL Streaming Replication
 
 **Status:** `BACKLOG`
 
@@ -846,7 +810,7 @@ traditional HA problem.
 - quorum acknowledgement
 - explicit consistency/durability tradeoffs
 
-## 22. Cloud-Native Object Storage VFS
+## 21. Cloud-Native Object Storage VFS
 
 **Status:** `BACKLOG`
 
@@ -875,16 +839,14 @@ performance, and operational foundations.
 
 ## Near-Term Sequence
 
-1. Implement benchmark integrity and the highest-impact performance recovery
-   phases from the 2026-05-18 performance plan.
-2. Draft ADR/spec for concurrent write queuing plus strict durable group commit.
-3. Draft ADR/spec for `sys.*` observability and wire its first counters into the
+1. Draft ADR/spec for concurrent write queuing plus strict durable group commit.
+2. Draft ADR/spec for `sys.*` observability and wire its first counters into the
    performance/write-queue work.
-4. Design reactive subscriptions around committed-state invalidation and binding
+3. Design reactive subscriptions around committed-state invalidation and binding
    APIs.
-5. Design production browser and sync follow-ons together so browser transport,
+4. Design production browser and sync follow-ons together so browser transport,
    multi-tab ownership, relay shape, and changeset APIs do not conflict.
-6. Advance local data security and Lua extension work after the runtime
+5. Advance local data security and Lua extension work after the runtime
    foundations above are underway.
 
 ## Market Notes

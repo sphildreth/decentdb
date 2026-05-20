@@ -22,5 +22,4 @@ Remove per-frame CRC32C validation for WAL frames in format v5. The checksum fie
 - This is a durability/corruption-detection semantic change and requires a format version bump.
 
 ### References
-- `design/SQLITE_PERF_GAP_PLAN.md` (Section 1: WAL Frame Format Overhead)
 - `design/SPEC.md` §4.1 (WAL frame format)

@@ -12,8 +12,8 @@ buffered `vfs.write` path.
 Commit latency is dominated by WAL append overhead and syscall cost. Mapping the WAL
 file and writing frames directly into the mapped region removes the extra buffer
 copy and reduces per-commit syscall overhead while preserving current durability
-semantics. This aligns with the performance plan for closing the SQLite commit
-latency gap without changing WAL format or recovery logic.
+semantics. This supports the commit-latency work for closing the SQLite gap
+without changing WAL format or recovery logic.
 
 ### Alternatives Considered
 - Keep the existing `write` path only (no improvement).
@@ -28,4 +28,6 @@ latency gap without changing WAL format or recovery logic.
 - Fault-injection VFS paths must remain in use when mmap is unavailable.
 
 ### References
-- `design/SQLITE_PERF_GAP_PLAN.md` (Section 2: Memory Copying and Buffer Allocation)
+
+- WAL commit latency benchmark and profiling notes from the implementation
+  branch.
