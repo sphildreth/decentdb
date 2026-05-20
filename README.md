@@ -30,7 +30,7 @@ It targets a single process with **one writer** and **many concurrent readers** 
 
 - 🔒 **ACID Transactions** - Write-ahead logging with crash-safe recovery
 - 🌳 **B+Tree Storage** - Efficient tables and secondary indexes with page caching
-- 🔁 **Local-First Sync** - Durable change journals, scoped peer replication, conflict workflows, operational doctor tooling, CLI commands, and a typed .NET sync SDK
+- 🔁 **Local-First Sync** - Durable change journals, public changeset APIs, production HTTP/WebSocket relay, shape subscriptions, scoped peer replication, conflict workflows, operational doctor tooling, CLI commands, and .NET/web helpers
 - 📡 **Reactive Subscriptions** - In-process table, range, query, and change-stream watches deliver committed invalidation events with LSN boundaries, bounded lag handling, C ABI JSON polling, and Python/Go direct helpers
 - 🖥️ **Built-In HTTP Server And Web Console** - `decentdb serve` exposes a local HTTP API and embedded browser console for inspection, SQL execution, schema browsing, EXPLAIN, CSV export, and scripting
 - 🌐 **WASM Browser OPFS Support** - `@decentdb/web` runs DecentDB in a Dedicated Worker with an OPFS-backed VFS, async TypeScript API, binary result transport, checkpoint, import/export, persistence helpers, and browser smoke/benchmark coverage
