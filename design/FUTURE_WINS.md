@@ -74,7 +74,7 @@ Future version values are planning buckets, not release commitments.
 | Priority | Future Version | Status | Feature | Current Source Of Truth | Why This Rank |
 |---:|---|---|---|---|---|
 | 1 | vNext | COMPLETE | Concurrent write ergonomics: write queue plus strict group commit | [`WIN_CONCURRENT_WRITE_ERGONOMICS_PHASED_APPROACH.md`](WIN_CONCURRENT_WRITE_ERGONOMICS_PHASED_APPROACH.md); ADR 0162 for durable queue/group commit; ADR 0135 for async commit distinction | Removes the most visible one-writer friction while preserving durability |
-| 2 | vNext+1 | TODO | Built-in observability and `sys.*` virtual tables | Needs ADR/spec; Doctor v1 is foundation | Makes performance, locks, WAL, sync, and storage state inspectable |
+| 2 | vNext+1 | TODO | Built-in operational metrics and `sys.*` tables | Needs ADR/spec; write queue metrics, storage info, sync inspection, and Doctor v1 are foundations | Makes write queue, WAL, sync, and storage state inspectable without hidden runtime tracing cost |
 | 3 | vNext+1 | TODO | Reactive query subscriptions and change streams | Needs ADR/spec; sync journal and branch diff are inputs | Modern local-first apps need live query invalidation without polling |
 | 4 | vNext+2 | TODO | Production browser runtime | ADR 0161 and [`docs/api/wasm.md`](../docs/api/wasm.md); needs follow-up ADR/spec | Browser is a primary local-first runtime, and v1 intentionally lacks multi-tab/service-worker/write coordination |
 | 5 | vNext+2 | TODO | Production sync relay and public changeset API | [`WIN_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md`](WIN_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md); needs follow-up ADR/spec | Turns shipped sync into a production application platform surface |
@@ -83,17 +83,18 @@ Future version values are planning buckets, not release commitments.
 | 8 | vNext+2 | TODO | SQL and PRAGMA compatibility quick wins | [`WIN_ADVANCED_SQL_COMPATIBILITY_SURFACE.md`](WIN_ADVANCED_SQL_COMPATIBILITY_SURFACE.md); needs focused slice spec | Low-friction onboarding from SQLite/PostgreSQL code without chasing full clone compatibility |
 | 9 | vNext+3 | TODO | Full-text search with BM25 ranking | Needs ADR/spec | Expected by app databases and a real SQLite FTS migration blocker |
 | 10 | vNext+3 | TODO | Cross-process WAL coordination | Needs ADR/spec | Important for Electron/Tauri, helper processes, CLI coexistence, and background sync workers |
-| 11 | vNext+3 | BACKLOG | Branch-aware migration rehearsal and promotion | ADR 0153-0159 and branch CLI/API docs; needs ADR/spec | More distinctive than generic online migration and uses shipped branch/diff foundations |
-| 12 | vNext+3 | BACKLOG | Agent and tooling integration mode | [`STABLE_TOOLING_METADATA_CONTRACT.md`](STABLE_TOOLING_METADATA_CONTRACT.md); needs ADR/spec | Makes the "agent-friendly" promise concrete without putting LLM behavior in the engine |
-| 13 | vNext+3 | BACKLOG | Application and support bundle format | Needs ADR/spec | Useful portable artifact and diagnostics story, but not more urgent than runtime friction |
-| 14 | vNext+3 | BACKLOG | Incrementally maintained projections | Needs ADR/spec | Accelerates dashboards, local read models, and reactive query workloads |
-| 15 | vNext+3 | BACKLOG | JSONB binary storage | Needs ADR/spec | Important for JSON-heavy workloads, but less urgent than FTS and runtime fundamentals |
-| 16 | Later | BACKLOG | Native vector / HNSW index | Needs ADR/spec | Valuable for offline AI/RAG, but less universal than FTS and security |
-| 17 | Later | BACKLOG | Temporal row history and auditable state | Needs ADR/spec | Strong regulated/support workflow, but should follow security and sync hardening |
-| 18 | Later | BACKLOG | Advanced geospatial semantics and analytics | ADR 0128 deferred work; needs follow-up ADR/spec | Builds on shipped spatial support without implying the foundation is unfinished |
-| 19 | Later | BACKLOG | Advanced SQL compatibility surface | [`WIN_ADVANCED_SQL_COMPATIBILITY_SURFACE.md`](WIN_ADVANCED_SQL_COMPATIBILITY_SURFACE.md) | Useful adoption polish after quick wins and higher-impact app workflows |
-| 20 | Later | BACKLOG | WAL streaming replication | Needs ADR/spec | Useful HA/read-scale story, but weaker than local-first sync for DecentDB identity |
-| 21 | Later | BACKLOG | Cloud-native object storage VFS | Needs ADR/spec | Interesting edge/serverless story with high durability and consistency complexity |
+| 11 | vNext+3 | TODO | Runtime tracing, advisors, and Doctor integration | Needs ADR/spec; follows operational metrics | Adds slow-query/lock-wait history, index usage, doctor findings, and advisor surfaces once the metrics contract is stable |
+| 12 | vNext+3 | BACKLOG | Branch-aware migration rehearsal and promotion | ADR 0153-0159 and branch CLI/API docs; needs ADR/spec | More distinctive than generic online migration and uses shipped branch/diff foundations |
+| 13 | vNext+3 | BACKLOG | Agent and tooling integration mode | [`STABLE_TOOLING_METADATA_CONTRACT.md`](STABLE_TOOLING_METADATA_CONTRACT.md); needs ADR/spec | Makes the "agent-friendly" promise concrete without putting LLM behavior in the engine |
+| 14 | vNext+3 | BACKLOG | Application and support bundle format | Needs ADR/spec | Useful portable artifact and diagnostics story, but not more urgent than runtime friction |
+| 15 | vNext+3 | BACKLOG | Incrementally maintained projections | Needs ADR/spec | Accelerates dashboards, local read models, and reactive query workloads |
+| 16 | vNext+3 | BACKLOG | JSONB binary storage | Needs ADR/spec | Important for JSON-heavy workloads, but less urgent than FTS and runtime fundamentals |
+| 17 | Later | BACKLOG | Native vector / HNSW index | Needs ADR/spec | Valuable for offline AI/RAG, but less universal than FTS and security |
+| 18 | Later | BACKLOG | Temporal row history and auditable state | Needs ADR/spec | Strong regulated/support workflow, but should follow security and sync hardening |
+| 19 | Later | BACKLOG | Advanced geospatial semantics and analytics | ADR 0128 deferred work; needs follow-up ADR/spec | Builds on shipped spatial support without implying the foundation is unfinished |
+| 20 | Later | BACKLOG | Advanced SQL compatibility surface | [`WIN_ADVANCED_SQL_COMPATIBILITY_SURFACE.md`](WIN_ADVANCED_SQL_COMPATIBILITY_SURFACE.md) | Useful adoption polish after quick wins and higher-impact app workflows |
+| 21 | Later | BACKLOG | WAL streaming replication | Needs ADR/spec | Useful HA/read-scale story, but weaker than local-first sync for DecentDB identity |
+| 22 | Later | BACKLOG | Cloud-native object storage VFS | Needs ADR/spec | Interesting edge/serverless story with high durability and consistency complexity |
 
 ## Positioning
 
@@ -184,49 +185,55 @@ parameter contract. Prepared-statement auto-queueing for every high-level
 provider is intentionally left to a future queued prepared-statement ABI rather
 than hand-rolled binding-side marshalling.
 
-## 2. Built-In Observability And `sys.*` Virtual Tables
+## 2. Built-In Operational Metrics And `sys.*` Tables
 
 **Status:** `TODO`
 
 **Future Version:** vNext+1
 
-**Source of truth:** Needs ADR/spec. Doctor v1 is the foundation.
+**Source of truth:** Needs ADR/spec. Write queue metrics, storage info, sync
+inspection, and Doctor v1 are foundations.
 
 ### Why This Matters
 
-Doctor answers "what is wrong now?" Observability answers "what is happening
-while the application runs?" Queryable diagnostics are also required to make
-write queuing, sync hardening, policy auditing, and future performance work
-operationally visible.
+Doctor answers "what is wrong now?" Operational metrics answer "what is the
+engine state right now?" Queryable low-overhead diagnostics are required to make
+write queuing, WAL behavior, sync hardening, and storage state visible without
+requiring every application or binding to build its own inspection layer.
+
+This item is intentionally bounded so it can be completed as a durable product
+surface. Runtime tracing, advisors, and Doctor integration are split into
+roadmap item #11.
 
 ### Target Surfaces
 
 ```sql
 SELECT * FROM sys.wal_metrics;
-SELECT * FROM sys.slow_queries;
-SELECT * FROM sys.lock_waits;
+SELECT * FROM sys.write_queue_metrics;
 SELECT * FROM sys.storage_metrics;
-SELECT * FROM sys.index_usage;
 SELECT * FROM sys.sync_status;
 ```
 
-### Advisor Extensions
+Canonical `sys.*` names may coexist with existing compatibility names such as
+`sys_sync_*`, but the ADR should define which names are stable going forward.
 
-- `PRAGMA doctor`
-- `sys.doctor_findings`
-- Decent Bench doctor panel
-- explicit `doctor --fix-plan`
-- query-plan advisor
-- missing/unused index advisor
-- JSON path advisor after JSONB exists
-- sync, branch, and browser diagnostics as those surfaces mature
+### Complete When
+
+- the four target surfaces above have stable column names, units, and nullability
+- Rust tests validate deterministic row shapes and values
+- docs explain the table contracts, lifetime/reset semantics, and relationship
+  to existing Rust/C ABI snapshots
+- write queue metrics are visible without forcing queued execution on direct
+  users
+- sync status has a canonical `sys.*` surface without breaking existing
+  `sys_sync_*` queries
 
 ### Guardrails
 
 - near-zero overhead by default
 - simple atomic counters for always-on metrics
-- expensive tracing only after explicit configuration
-- in-memory ring buffers for slow queries and lock waits
+- no slow-query, lock-wait, or index-usage tracing in this item
+- no advisors, `PRAGMA doctor`, or `sys.doctor_findings` in this item
 - no recursive disk writes for telemetry
 
 ## 3. Reactive Query Subscriptions And Change Streams
@@ -518,7 +525,60 @@ coexistence, and background sync workers.
 - ADR required because this changes locking and `Send`/`Sync` boundaries
 - browser multi-tab coordination is related but tracked separately
 
-## 11. Branch-Aware Migration Rehearsal And Promotion
+## 11. Runtime Tracing, Advisors, And Doctor Integration
+
+**Status:** `TODO`
+
+**Future Version:** vNext+3
+
+**Source of truth:** Needs ADR/spec. Follows the operational metrics contract in
+roadmap item #2.
+
+### Why This Matters
+
+Operational metrics expose current state cheaply. Runtime tracing and advisors
+explain why performance, contention, or maintenance problems are happening over
+time. This work is valuable, but it should not block the smaller, complete
+`sys.*` metrics contract or quietly add overhead to hot paths.
+
+### Target Surfaces
+
+```sql
+SELECT * FROM sys.slow_queries;
+SELECT * FROM sys.lock_waits;
+SELECT * FROM sys.index_usage;
+SELECT * FROM sys.doctor_findings;
+```
+
+### Advisor Extensions
+
+- `PRAGMA doctor`
+- Decent Bench doctor panel
+- explicit `doctor --fix-plan`
+- query-plan advisor
+- missing/unused index advisor
+- JSON path advisor after JSONB exists
+- sync, branch, and browser diagnostics as those surfaces mature
+
+### Required Design Topics
+
+- explicit opt-in configuration for expensive tracing
+- in-memory ring buffer sizes, eviction policy, and reset semantics
+- SQL text and parameter redaction policy
+- lock-wait source classification
+- index-usage attribution from planner and executor paths
+- Doctor report projection into queryable rows
+- advisor severity, confidence, and automation boundaries
+
+### Guardrails
+
+- no recursive disk writes for telemetry
+- no tracing while internal locks are held longer than necessary
+- no sensitive parameter values in default telemetry
+- advisor output must be reviewable and must not auto-apply destructive fixes
+- keep hot-path overhead measurable and benchmarked
+
+## 12. Branch-Aware Migration Rehearsal And Promotion
 
 **Status:** `BACKLOG`
 
@@ -549,7 +609,7 @@ safe workflow: branch, migrate, validate, diff, detect drift, and promote.
 - branch merge semantics must stay conservative
 - do not hide destructive schema changes behind automatic promotion
 
-## 12. Agent And Tooling Integration Mode
+## 13. Agent And Tooling Integration Mode
 
 **Status:** `BACKLOG`
 
@@ -584,7 +644,7 @@ guessing.
 - Decent Bench remains the product home for rich visual workflows and generated
   SDK output
 
-## 13. Application And Support Bundle Format
+## 14. Application And Support Bundle Format
 
 **Status:** `BACKLOG`
 
@@ -619,7 +679,7 @@ A DecentDB bundle may contain:
 - support bundles must have a sanitization/redaction story before use with
   regulated data
 
-## 14. Incrementally Maintained Projections
+## 15. Incrementally Maintained Projections
 
 **Status:** `BACKLOG`
 
@@ -648,7 +708,7 @@ database-native capability that also accelerates reactive queries.
 - keep maintenance work visible in write latency and `sys.*`
 - define crash recovery and rebuild semantics before implementation
 
-## 15. JSONB Binary Storage
+## 16. JSONB Binary Storage
 
 **Status:** `BACKLOG`
 
@@ -671,7 +731,7 @@ more effective.
 - large JSONB uses existing overflow page mechanics
 - partial updates rebuild the binary blob through the single writer
 
-## 16. Native Vector / HNSW Index
+## 17. Native Vector / HNSW Index
 
 **Status:** `BACKLOG`
 
@@ -700,7 +760,7 @@ faster and easier to operate.
 - WASM/mobile portability story
 - benchmarks against common vector-search extensions
 
-## 17. Temporal Row History And Auditable State
+## 18. Temporal Row History And Auditable State
 
 **Status:** `BACKLOG`
 
@@ -729,7 +789,7 @@ auditable local data. Some regulated and support-heavy apps need to answer:
 - redaction must be compatible with retention and audit requirements
 - do not conflate branch snapshots with row-level audit history
 
-## 18. Advanced Geospatial Semantics And Analytics
+## 19. Advanced Geospatial Semantics And Analytics
 
 **Status:** `BACKLOG`
 
@@ -761,7 +821,7 @@ the completed native geospatial feature does not appear unfinished.
 - avoid native GEOS/PROJ/GDAL dependencies unless an ADR justifies the tradeoff
 - keep WASM compatibility as a design constraint
 
-## 19. Advanced SQL Compatibility Surface
+## 20. Advanced SQL Compatibility Surface
 
 **Status:** `BACKLOG`
 
@@ -797,7 +857,7 @@ this item is for heavier compatibility work.
   ergonomics
 - avoid expanding core import/export features in this track
 
-## 20. WAL Streaming Replication
+## 21. WAL Streaming Replication
 
 **Status:** `BACKLOG`
 
@@ -822,7 +882,7 @@ traditional HA problem.
 - quorum acknowledgement
 - explicit consistency/durability tradeoffs
 
-## 21. Cloud-Native Object Storage VFS
+## 22. Cloud-Native Object Storage VFS
 
 **Status:** `BACKLOG`
 
@@ -851,15 +911,19 @@ performance, and operational foundations.
 
 ## Near-Term Sequence
 
-1. Draft ADR/spec for concurrent write queuing plus strict durable group commit.
-2. Draft ADR/spec for `sys.*` observability and wire its first counters into the
-   performance/write-queue work.
+1. Protect the completed concurrent write queue plus strict durable group commit
+   with docs, metrics, and benchmark guardrails.
+2. Draft ADR/spec for operational `sys.*` metrics and implement
+   `sys.write_queue_metrics`, `sys.wal_metrics`, `sys.storage_metrics`, and
+   `sys.sync_status`.
 3. Design reactive subscriptions around committed-state invalidation and binding
    APIs.
 4. Design production browser and sync follow-ons together so browser transport,
    multi-tab ownership, relay shape, and changeset APIs do not conflict.
 5. Advance local data security and Lua extension work after the runtime
    foundations above are underway.
+6. Return to runtime tracing, advisors, and Doctor integration after the
+   low-overhead metrics contract is stable and hot-path overhead is benchmarked.
 
 ## Market Notes
 
