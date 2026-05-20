@@ -11,6 +11,9 @@ This directory contains the historical and active ADRs for DecentDB.
 - **0118-rust-ffi-panic-safety.md**: Mandates `catch_unwind` on all C-ABI boundaries.
 - **0119-rust-vfs-pread-pwrite.md**: Mandates standard file positional I/O over `unsafe mmap` for the Virtual File System.
 - **0120-core-storage-engine-btree.md**: Formalizes the choice of an optimized B+Tree over an LSM-Tree for the core storage engine.
+- **0168-sync-shape-streaming-subscriptions.md**: Defines production sync shapes as durable scoped subscriptions backed by sync scopes and public changesets, with ack/resume and retention behavior.
+- **0167-public-changeset-api.md**: Defines the stable logical changeset envelope, source boundaries, transactional apply, idempotency, inspection, inversion limits, and JSON bridge baseline.
+- **0166-production-sync-relay-boundary-and-identity.md**: Defines the self-hosted relay boundary, v2 protocol namespace, principal model, authorization split, transport security posture, and relay diagnostics.
 - **0165-production-browser-runtime-contract.md**: Defines browser support tiers, Dedicated Worker owner coordination through BroadcastChannel/Web Locks, service-worker exclusion, diagnostics, and browser sync deferral.
 - **0164-reactive-query-subscriptions-and-change-streams.md**: Defines the in-process reactive event hub, watch kinds, post-commit delivery contract, row-diff bounds, and C ABI watch-handle model.
 - **0163-operational-sys-metrics.md**: Defines the canonical read-only `sys.*` operational metrics surfaces and legacy `sys_sync_*` compatibility.

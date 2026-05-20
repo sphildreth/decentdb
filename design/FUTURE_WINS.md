@@ -81,7 +81,7 @@ shipped foundation affects follow-on roadmap decisions.
 
 | Priority | Future Version | Status | Feature | Current Source Of Truth | Why This Rank |
 |---:|---|---|---|---|---|
-| 1 | vNext+2 | TODO | Production sync relay and public changeset API | [`WIN_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md`](WIN_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md); needs follow-up ADR/spec | Turns shipped sync into a production application platform surface |
+| 1 | vNext+2 | TODO | Production sync relay and public changeset API | [`WIN_PRODUCTION_RELAY_SPEC.md`](WIN_PRODUCTION_RELAY_SPEC.md); ADR 0166-0168; builds on [`WIN_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md`](WIN_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md) | Turns shipped sync into a production application platform surface |
 | 2 | vNext+2 | TODO | Local data security: TDE, policies, masking, audit context | Needs ADR/spec | TDE is table stakes for SQLCipher-style onboarding; policy is the differentiated regulated/offline story |
 | 3 | vNext+2 | TODO | Lua extension runtime and package model | [`WIN_LUA_EXTENSION_RUNTIME_SPEC.md`](WIN_LUA_EXTENSION_RUNTIME_SPEC.md) | One sandboxed extension language is supportable across native, mobile, and WASM targets |
 | 4 | vNext+2 | TODO | SQL and PRAGMA compatibility quick wins | [`WIN_ADVANCED_SQL_COMPATIBILITY_SURFACE.md`](WIN_ADVANCED_SQL_COMPATIBILITY_SURFACE.md); needs focused slice spec | Low-friction onboarding from SQLite/PostgreSQL code without chasing full clone compatibility |
@@ -147,8 +147,11 @@ server database.
 
 **Future Version:** vNext+2
 
-**Source of truth:** [`WIN_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md`](WIN_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md);
-needs follow-up ADR/spec.
+**Source of truth:** [`WIN_PRODUCTION_RELAY_SPEC.md`](WIN_PRODUCTION_RELAY_SPEC.md);
+[ADR 0166](adr/0166-production-sync-relay-boundary-and-identity.md),
+[ADR 0167](adr/0167-public-changeset-api.md), and
+[ADR 0168](adr/0168-sync-shape-streaming-subscriptions.md). Builds on
+[`WIN_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md`](WIN_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md).
 
 ### Why This Matters
 
