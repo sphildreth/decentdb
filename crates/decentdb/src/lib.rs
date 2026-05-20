@@ -8,6 +8,8 @@
 #[cfg(feature = "bench-internals")]
 pub mod benchmark;
 mod branch;
+#[cfg(any(all(target_arch = "wasm32", target_os = "unknown"), test))]
+mod browser_result;
 mod btree;
 mod c_api;
 mod catalog;
@@ -30,6 +32,8 @@ mod sync;
 mod tooling;
 mod vfs;
 mod wal;
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+mod wasm;
 
 pub use crate::branch::{
     BranchDiffReport, BranchInfo, BranchLogEntry, BranchMergeChange, BranchMergeConflict,
@@ -63,6 +67,8 @@ pub use crate::sync::{
     SyncPeerScopeBinding, SyncPruneSummary, SyncRetentionReport, SyncRunDirection, SyncRunSummary,
     SyncScope, SyncSession, SyncStatus,
 };
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+pub use crate::wasm::WebDb;
 
 /// Returns the DecentDB crate version.
 #[must_use]

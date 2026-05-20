@@ -1,6 +1,6 @@
 # DecentDB WASM & Browser Support Implementation Plan
 **Date:** 2026-03-26  
-**Status:** Proposed
+**Status:** In Progress
 
 ## 1. Purpose
 
@@ -335,19 +335,41 @@ Use these status values in this file and future progress updates:
 
 | Slice | Status | Name | Depends On | Exit Gate |
 |---|---|---|---|---|
-| S0 | `proposed` | ADR + browser contract freeze | none | ADR accepted |
-| S1 | `blocked` | Core wasm compile audit | S0 | `cargo check --target wasm32-unknown-unknown` passes for core path |
-| S2 | `blocked` | Parser strategy for wasm | S1 | parser chosen and validated for wasm |
-| S3 | `blocked` | VFS injection refactor | S1, S2 | core can open DBs against injected VFS cleanly |
-| S4 | `blocked` | `OpfsVfs` implementation | S3 | open/read/write/recover/checkpoint work on OPFS |
-| S5 | `blocked` | Worker runtime + RPC | S4 | async main-thread API works without manual worker plumbing |
-| S6 | `blocked` | `@decentdb/web` API surface | S5 | package API stable enough for smoke coverage |
-| S7 | `blocked` | Binary result transport optimization | S6 | large reads avoid JSON row serialization |
-| S8 | `blocked` | Export/import/persistence contract | S4, S6 | data backup/restore semantics documented and tested |
-| S9 | `blocked` | Browser correctness/perf/CI coverage | S4-S8 | PR and nightly gates defined and green |
-| S10 | `blocked` | Docs/examples/release hardening | S6-S9 | docs and examples match shipped behavior |
+| S0 | `done` | ADR + browser contract freeze | none | ADR accepted |
+| S1 | `done` | Core wasm compile audit | S0 | `cargo check --target wasm32-unknown-unknown` passes for core path |
+| S2 | `in_progress` | Parser strategy for wasm | S1 | initial parser chosen and validated for smoke subset; full parser parity remains open |
+| S3 | `done` | VFS injection refactor | S1, S2 | core can open DBs against injected VFS cleanly |
+| S4 | `in_progress` | `OpfsVfs` implementation | S3 | runtime implemented; real-browser OPFS recovery/checkpoint gates still pending |
+| S5 | `in_progress` | Worker runtime + RPC | S4 | runtime implemented; browser smoke automation still pending |
+| S6 | `in_progress` | `@decentdb/web` API surface | S5 | package API exists; package artifact and browser validation gates still pending |
+| S7 | `deferred` | Binary result transport optimization | S6 | large reads avoid JSON row serialization |
+| S8 | `in_progress` | Export/import/persistence contract | S4, S6 | APIs implemented; real-browser backup/restore tests still pending |
+| S9 | `in_progress` | Browser correctness/perf/CI coverage | S4-S8 | PR and nightly gates defined and green |
+| S10 | `in_progress` | Docs/examples/release hardening | S6-S9 | docs and examples match shipped behavior |
 
-### 9.3 Recommended Slice Order
+### 9.3 Current Implementation State
+
+As of 2026-05-20, the repository includes the initial browser architecture
+milestone:
+
+- ADR 0161 is accepted.
+- The core `decentdb` crate builds for `wasm32-unknown-unknown`.
+- Native `pg_query` remains the native parser path; wasm uses a narrow
+  target-specific parser for the initial browser smoke subset.
+- The core open path supports an injected VFS.
+- A wasm-only `OpfsVfs` maps DecentDB's synchronous VFS calls to worker-hosted
+  OPFS synchronous access handles.
+- `bindings/web/` provides an async `@decentdb/web` API over a Dedicated Worker.
+- Export, import, checkpoint, and persistence helpers exist at the browser API
+  boundary.
+- User-facing WASM/browser documentation and changelog entries exist.
+
+The feature is not yet browser support v1 by this document's definition of done.
+The remaining gates are full parser strategy/parity, automated real-browser
+OPFS smoke and recovery coverage, binary large-result transport, package
+artifact hardening, and PR/nightly browser CI integration.
+
+### 9.4 Recommended Slice Order
 
 The recommended delivery order is:
 
@@ -376,7 +398,7 @@ Reasoning:
 
 ## S0. ADR + Browser Contract Freeze
 
-**Status:** `proposed`
+**Status:** `done`
 
 ### Goal
 
@@ -429,7 +451,7 @@ contract before implementation.
 
 ## S1. Core WASM Compile Audit
 
-**Status:** `blocked`
+**Status:** `done`
 
 ### Goal
 
@@ -479,7 +501,7 @@ Make the Rust engine buildable for wasm without changing native semantics.
 
 ## S2. Parser Strategy For WASM
 
-**Status:** `blocked`
+**Status:** `in_progress`
 
 ### Goal
 
@@ -542,7 +564,7 @@ be made wasm-compatible without unacceptable complexity.
 
 ## S3. VFS Injection Refactor
 
-**Status:** `blocked`
+**Status:** `done`
 
 ### Goal
 
@@ -597,7 +619,7 @@ scope, an ADR amendment is required before merge.
 
 ## S4. `OpfsVfs` Implementation
 
-**Status:** `blocked`
+**Status:** `in_progress`
 
 ### Goal
 
@@ -700,7 +722,7 @@ The VFS implementation must document:
 
 ## S5. Worker Runtime + RPC Layer
 
-**Status:** `blocked`
+**Status:** `in_progress`
 
 ### Goal
 
@@ -747,7 +769,7 @@ interpretation.
 
 ## S6. `@decentdb/web` API Surface
 
-**Status:** `blocked`
+**Status:** `in_progress`
 
 ### Goal
 
@@ -794,7 +816,7 @@ Ship an official browser package with a clear, async-first API.
 
 ## S7. Binary Result Transport Optimization
 
-**Status:** `blocked`
+**Status:** `deferred`
 
 ### Goal
 
@@ -865,7 +887,7 @@ The phrase "zero-copy" should be used carefully. The practical goal is:
 
 ## S8. Export / Import / Persistence Contract
 
-**Status:** `blocked`
+**Status:** `in_progress`
 
 ### Goal
 
@@ -915,7 +937,7 @@ semantics are respected.
 
 ## S9. Browser Quality, Performance, And CI Coverage
 
-**Status:** `blocked`
+**Status:** `in_progress`
 
 ### Goal
 
@@ -1015,7 +1037,7 @@ If another runner is chosen, S0 must justify the trade-off explicitly.
 
 ## S10. Documentation, User-Facing Guides, Examples, And Release Hardening
 
-**Status:** `blocked`
+**Status:** `in_progress`
 
 ### Goal
 

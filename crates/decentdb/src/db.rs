@@ -653,8 +653,17 @@ impl Db {
     /// reserved catalog root page.
     pub fn create(path: impl AsRef<Path>, config: DbConfig) -> Result<Self> {
         let path = path.as_ref();
-        config.validate_for_create()?;
         let vfs = VfsHandle::for_path(path);
+        Self::create_with_vfs(path, config, vfs)
+    }
+
+    pub(crate) fn create_with_vfs(
+        path: impl AsRef<Path>,
+        config: DbConfig,
+        vfs: VfsHandle,
+    ) -> Result<Self> {
+        let path = path.as_ref();
+        config.validate_for_create()?;
         let open_mode = if vfs.is_memory() {
             OpenMode::OpenOrCreate
         } else {
@@ -672,6 +681,15 @@ impl Db {
     pub fn open(path: impl AsRef<Path>, config: DbConfig) -> Result<Self> {
         let path = path.as_ref();
         let vfs = VfsHandle::for_path(path);
+        Self::open_existing_with_vfs(path, config, vfs)
+    }
+
+    pub(crate) fn open_existing_with_vfs(
+        path: impl AsRef<Path>,
+        config: DbConfig,
+        vfs: VfsHandle,
+    ) -> Result<Self> {
+        let path = path.as_ref();
         let mode = if vfs.is_memory() {
             OpenMode::OpenOrCreate
         } else {
@@ -691,10 +709,19 @@ impl Db {
     pub fn open_or_create(path: impl AsRef<Path>, config: DbConfig) -> Result<Self> {
         let path = path.as_ref();
         let vfs = VfsHandle::for_path(path);
+        Self::open_or_create_with_vfs(path, config, vfs)
+    }
+
+    pub(crate) fn open_or_create_with_vfs(
+        path: impl AsRef<Path>,
+        config: DbConfig,
+        vfs: VfsHandle,
+    ) -> Result<Self> {
+        let path = path.as_ref();
         if vfs.is_memory() || vfs.file_exists(path)? {
-            Self::open(path, config)
+            Self::open_existing_with_vfs(path, config, vfs)
         } else {
-            Self::create(path, config)
+            Self::create_with_vfs(path, config, vfs)
         }
     }
 

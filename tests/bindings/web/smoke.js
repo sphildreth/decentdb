@@ -1,0 +1,157 @@
+import { DecentDBWebError, open } from "../../bindings/web/dist/index.js";
+
+const output = document.getElementById("output");
+const button = document.getElementById("run");
+
+const DB_TABLE = "smoke";
+
+function log(message) {
+  if (!output) {
+    return;
+  }
+  output.textContent = `${output.textContent}\n${message}`;
+}
+
+function clearOutput() {
+  if (output) {
+    output.textContent = "";
+  }
+}
+
+function normalizeUrl(url) {
+  return url instanceof URL ? url.toString() : String(url);
+}
+
+function withDatabaseUrls(overrides = {}) {
+  const base = window.location.href;
+  return {
+    workerUrl: normalizeUrl(overrides.workerUrl ?? new URL("../../bindings/web/dist/worker.js", base)),
+    wasmUrl: normalizeUrl(overrides.wasmUrl ?? new URL("../../bindings/web/dist/decentdb_wasm.js", base)),
+  };
+}
+
+function formatRows(rows) {
+  return rows.map((row) => `${row.id}:${row.name}`).join(",");
+}
+
+async function closeIfOpen(db) {
+  if (!db) {
+    return;
+  }
+  try {
+    await db.close();
+  } catch {
+    // best effort close in shared-page cleanup paths
+  }
+}
+
+async function runSmokeScenario(options = {}) {
+  const scenarioId = options.scenarioId ?? "manual";
+  const path = options.path ?? `decentdb-web-smoke-${scenarioId}.ddb`;
+  const importPath = options.importPath ?? `decentdb-web-smoke-import-${scenarioId}.ddb`;
+  const { workerUrl, wasmUrl } = withDatabaseUrls(options);
+
+  const seedId = options.seedId ?? 1_000_001;
+  let db = null;
+  let reopenedDb = null;
+  let importDb = null;
+
+  try {
+    log("opening primary database");
+    db = await open({
+      path,
+      mode: options.mode ?? "openOrCreate",
+      workerUrl,
+      wasmUrl,
+      resultTransport: "binary",
+    });
+
+    await db.exec(`CREATE TABLE IF NOT EXISTS ${DB_TABLE}(id INT64 PRIMARY KEY, name TEXT)`);
+    await db.exec(`DELETE FROM ${DB_TABLE}`);
+    await db.exec(`INSERT INTO ${DB_TABLE}(id, name) VALUES ($1, $2)`, [seedId, `scenario:${scenarioId}`]);
+    const created = await db.query(`SELECT id, name FROM ${DB_TABLE} ORDER BY id ASC`);
+    const checkpointResult = await db.checkpoint();
+    const exported = await db.export();
+    const persisted = await db.persist();
+    log(`primary rows=${formatRows(created.rows)}`);
+    log(`checkpoint truncatedWalBytes=${checkpointResult.truncatedWalBytes ?? 0}`);
+    log(`export size=${exported.size}`);
+    await db.close();
+    db = null;
+
+    log("reopen primary database");
+    reopenedDb = await open({
+      path,
+      mode: "open",
+      workerUrl,
+      wasmUrl,
+      resultTransport: "json",
+    });
+    const reopened = await reopenedDb.query(`SELECT id, name FROM ${DB_TABLE} ORDER BY id ASC`);
+    log(`reopen rows=${formatRows(reopened.rows)}`);
+
+    log("run import path");
+    importDb = await open({
+      path: importPath,
+      mode: "openOrCreate",
+      workerUrl,
+      wasmUrl,
+    });
+    await importDb.exec(`DROP TABLE IF EXISTS ${DB_TABLE}`);
+    await importDb.import(exported.bytes);
+    const imported = await importDb.query(`SELECT id, name FROM ${DB_TABLE} ORDER BY id ASC`);
+    log(`import rows=${formatRows(imported.rows)}`);
+
+    return {
+      path,
+      importPath,
+      seedId,
+      createdRows: created.rows,
+      reopenedRows: reopened.rows,
+      importedRows: imported.rows,
+      checkpointBytes: checkpointResult.truncatedWalBytes ?? 0,
+      exportedSize: exported.size,
+      persisted,
+    };
+  } finally {
+    await closeIfOpen(db);
+    await closeIfOpen(reopenedDb);
+    await closeIfOpen(importDb);
+  }
+}
+
+globalThis.__runDecentDBWebSmoke = async function (options) {
+  clearOutput();
+  return runSmokeScenario(options);
+};
+
+button?.addEventListener("click", async () => {
+  clearOutput();
+  log("starting");
+  try {
+    const result = await runSmokeScenario({
+      scenarioId: "manual",
+      seedId: Date.now(),
+      path: "decentdb-web-smoke.ddb",
+      importPath: "decentdb-web-smoke-import.ddb",
+    });
+    log(`open/reopen/export/import smoke passed`);
+    log(`created=${result.createdRows.length} reopen=${result.reopenedRows.length} import=${result.importedRows.length}`);
+    log(`checkpoint truncatedWalBytes=${result.checkpointBytes}`);
+    log(`export size=${result.exportedSize}`);
+    log(`persisted=${result.persisted}`);
+  } catch (error) {
+    if (error instanceof DecentDBWebError) {
+      log(`web failure: ${error.code}: ${error.message}`);
+      if (error.details) {
+        log(error.details);
+      }
+      return;
+    }
+    if (error instanceof Error) {
+      log(`open failure: ${error.name}: ${error.message}`);
+    } else {
+      log(`open failure: ${String(error)}`);
+    }
+  }
+});

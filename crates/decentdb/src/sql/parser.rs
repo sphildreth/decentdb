@@ -5,6 +5,7 @@ use std::borrow::Cow;
 use crate::error::{DbError, Result};
 
 use super::ast::{Expr, SelectItem, Statement};
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use super::normalize::{normalize_statement_text, normalize_statement_text_with_generated_modes};
 
 pub(crate) fn parse_sql_statement(sql: &str) -> Result<Statement> {
@@ -18,6 +19,19 @@ pub(crate) fn parse_sql_statement(sql: &str) -> Result<Statement> {
     Ok(statements.remove(0))
 }
 
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+pub(crate) fn parse_sql_batch(sql: &str) -> Result<Vec<Statement>> {
+    let (generated_modes, sql_with_generated_rewrite) = rewrite_generated_virtual_columns(sql);
+    if !generated_modes.is_empty() {
+        return Err(DbError::sql(
+            "generated columns are not supported by the initial wasm parser",
+        ));
+    }
+    let compat_sql = rewrite_legacy_trigger_body(sql_with_generated_rewrite.as_ref());
+    super::wasm_minimal::parse_sql_batch(compat_sql.as_ref())
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) fn parse_sql_batch(sql: &str) -> Result<Vec<Statement>> {
     let (generated_modes, sql_with_generated_rewrite) = rewrite_generated_virtual_columns(sql);
     let compat_sql = rewrite_legacy_trigger_body(sql_with_generated_rewrite.as_ref());
@@ -297,6 +311,7 @@ fn rewrite_generated_virtual_columns(sql: &str) -> (Vec<bool>, Cow<'_, str>) {
     }
 }
 
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 fn count_generated_columns(sql: &str) -> usize {
     let mut count = 0_usize;
     let mut in_single = false;

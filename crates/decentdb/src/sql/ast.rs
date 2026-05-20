@@ -1,4 +1,5 @@
 //! Strongly typed internal AST for the supported DecentDB 1.0 SQL subset.
+#![cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
 
 use crate::catalog::{ColumnType, EnumTypeInfo, SpatialTypeInfo};
 use crate::record::value::{

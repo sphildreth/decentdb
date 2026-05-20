@@ -60,6 +60,7 @@ nav:
       - JDBC Driver (Java): api/jdbc.md      
       - Node.js: api/node.md
       - Python: api/python.md
+      - WASM / Browser: api/wasm.md
   - Architecture:
     - Overview: architecture/overview.md
     - Storage Engine: architecture/storage.md
