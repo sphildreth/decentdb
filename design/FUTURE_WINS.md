@@ -562,13 +562,12 @@ operational foundations.
 
 ## Near-Term Sequence
 
-1. Continue schema-first SDK generation through Decent Bench while keeping
+1. Advance policy, bundle, `sys.*`, and Lua extension ADRs/specs for the top
+   roadmap items.
+2. Continue schema-first SDK generation through Decent Bench while keeping
    DecentDB metadata authoritative.
-2. Start WASM only after the browser-facing parser/durability gates are
-   accepted.
-3. Advance policy, bundle, `sys.*`, Lua extension ADRs, and interactive SQL
-   shell designs after the top roadmap items have accepted implementation
-   specs.
+3. Sequence write queuing and durable group-commit refinements together so the
+   concurrency and durability contracts stay explicit.
 
 ## Market Notes
 
