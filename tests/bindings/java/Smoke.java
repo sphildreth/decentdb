@@ -15,6 +15,7 @@ import static java.lang.foreign.ValueLayout.JAVA_LONG;
 public final class Smoke {
     private static final int DDB_OK = 0;
     private static final int DDB_ERR_SQL = 5;
+    private static final int DDB_ERR_TIMEOUT = 10;
     private static final long DDB_WRITE_QUEUE_TIMEOUT_DEFAULT = -1L;
 
     public static void main(String[] args) throws Throwable {
@@ -40,6 +41,18 @@ public final class Smoke {
             MethodHandle queueMetrics = linker.downcallHandle(
                 lookup.find("ddb_db_write_queue_metrics").orElseThrow(),
                 FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS));
+            MethodHandle watchQuery = linker.downcallHandle(
+                lookup.find("ddb_db_watch_query_json").orElseThrow(),
+                FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS));
+            MethodHandle watchNext = linker.downcallHandle(
+                lookup.find("ddb_watch_next_json").orElseThrow(),
+                FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT, ADDRESS));
+            MethodHandle watchClose = linker.downcallHandle(
+                lookup.find("ddb_watch_close").orElseThrow(),
+                FunctionDescriptor.of(JAVA_INT, ADDRESS));
+            MethodHandle stringFree = linker.downcallHandle(
+                lookup.find("ddb_string_free").orElseThrow(),
+                FunctionDescriptor.of(JAVA_INT, ADDRESS));
             MethodHandle resultFree = linker.downcallHandle(
                 lookup.find("ddb_result_free").orElseThrow(),
                 FunctionDescriptor.of(JAVA_INT, ADDRESS));
@@ -88,6 +101,41 @@ public final class Smoke {
                 throw new IllegalStateException("unexpected queue metrics");
             }
 
+            MemorySegment watchSlot = arena.allocate(ADDRESS);
+            check((int) watchQuery.invokeExact(
+                db,
+                arena.allocateFrom("{\"sql\":\"SELECT id, name FROM smoke ORDER BY id\"}"),
+                watchSlot
+            ), "watch query", lastError);
+            MemorySegment watch = watchSlot.get(ADDRESS, 0);
+            MemorySegment eventSlot = arena.allocate(ADDRESS);
+            check((int) watchNext.invokeExact(watch, 1000, eventSlot), "watch initial", lastError);
+            String initial = eventSlot.get(ADDRESS, 0).reinterpret(Long.MAX_VALUE).getString(0);
+            if (!initial.contains("\"type\":\"initial\"")) {
+                throw new IllegalStateException("unexpected initial watch event: " + initial);
+            }
+            check((int) stringFree.invokeExact(eventSlot), "free watch initial", lastError);
+
+            check((int) execute.invokeExact(
+                db,
+                arena.allocateFrom("INSERT INTO smoke (id, name) VALUES (3, 'java-watch')"),
+                MemorySegment.NULL,
+                0L,
+                resultSlot
+            ), "watch insert", lastError);
+            check((int) resultFree.invokeExact(resultSlot), "free watch insert", lastError);
+            check((int) watchNext.invokeExact(watch, 1000, eventSlot), "watch invalidate", lastError);
+            String invalidate = eventSlot.get(ADDRESS, 0).reinterpret(Long.MAX_VALUE).getString(0);
+            if (!invalidate.contains("\"type\":\"invalidate\"") || !invalidate.contains("\"smoke\"")) {
+                throw new IllegalStateException("unexpected invalidate watch event: " + invalidate);
+            }
+            check((int) stringFree.invokeExact(eventSlot), "free watch invalidate", lastError);
+            int timeoutStatus = (int) watchNext.invokeExact(watch, 1, eventSlot);
+            if (timeoutStatus != DDB_ERR_TIMEOUT) {
+                throw new IllegalStateException("expected watch timeout, got " + timeoutStatus);
+            }
+            check((int) watchClose.invokeExact(watchSlot), "watch close", lastError);
+
             check((int) execute.invokeExact(
                 db,
                 arena.allocateFrom("SELECT id, name FROM smoke"),
@@ -98,8 +146,8 @@ public final class Smoke {
             MemorySegment rows = arena.allocate(JAVA_LONG);
             MemorySegment result = resultSlot.get(ADDRESS, 0);
             check((int) rowCount.invokeExact(result, rows), "row count", lastError);
-            if (rows.get(JAVA_LONG, 0) != 2L) {
-                throw new IllegalStateException("expected 2 rows");
+            if (rows.get(JAVA_LONG, 0) != 3L) {
+                throw new IllegalStateException("expected 3 rows");
             }
             check((int) resultFree.invokeExact(resultSlot), "free select", lastError);
 

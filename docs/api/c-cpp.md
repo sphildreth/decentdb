@@ -96,6 +96,7 @@ results:
 | `ddb_db_t *` | `ddb_db_free(&db)` |
 | `ddb_stmt_t *` | `ddb_stmt_free(&stmt)` |
 | `ddb_result_t *` | `ddb_result_free(&result)` |
+| `ddb_watch_t *` | `ddb_watch_close(&watch)` |
 | owned strings returned as `char *` | `ddb_string_free(&value)` |
 | owned copied cell values | `ddb_value_dispose(&value)` |
 
@@ -143,6 +144,45 @@ printf("admitted=%llu committed=%llu syncs=%llu\n",
        (unsigned long long)metrics.committed,
        (unsigned long long)metrics.group_commit_syncs);
 ```
+
+## Reactive Watch Handles
+
+The C ABI exposes reactive subscriptions as opaque `ddb_watch_t` handles with
+JSON requests and JSON event polling. Watches are in-process only and observe
+committed state after the initial event.
+
+```c
+ddb_watch_t *watch = NULL;
+check(ddb_db_watch_query_json(
+          db,
+          "{\"sql\":\"SELECT name FROM users ORDER BY id\"}",
+          &watch),
+      "watch query");
+
+char *event_json = NULL;
+check(ddb_watch_next_json(watch, 1000, &event_json), "initial event");
+puts(event_json);
+check(ddb_string_free(&event_json), "free initial event");
+
+/* Run writes through any handle in the same process. */
+
+check(ddb_watch_next_json(watch, 1000, &event_json), "invalidation event");
+puts(event_json);
+check(ddb_string_free(&event_json), "free invalidation event");
+
+check(ddb_watch_close(&watch), "close watch");
+```
+
+Available creation functions:
+
+- `ddb_db_watch_table_json`
+- `ddb_db_watch_range_json`
+- `ddb_db_watch_query_json`
+- `ddb_db_change_stream_json`
+
+`ddb_watch_next_json` returns `DDB_ERR_TIMEOUT` when no event is available
+before the requested timeout. Returned event strings are freed with
+`ddb_string_free`.
 
 ## Minimal C Example
 

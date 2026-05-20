@@ -89,6 +89,25 @@ default.
 - `write_queue_default_timeout_ms`
   Default timeout applied by direct queued API calls when no explicit timeout is passed.
 
+## Reactive Subscriptions
+
+Python exposes watch handles for committed-state reactive updates:
+
+```python
+with connect("reactive_demo.ddb") as con:
+    con.execute("CREATE TABLE IF NOT EXISTS events(id INT64 PRIMARY KEY, payload TEXT)")
+    watch = con.watch_query("SELECT id, payload FROM events ORDER BY id")
+    print(watch.next(timeout_ms=1000))  # initial event
+
+    con.execute("INSERT INTO events VALUES (?, ?)", (1, "created"))
+    print(watch.next(timeout_ms=1000))  # invalidation event
+    watch.close()
+```
+
+Use `watch_table`, `watch_range`, `watch_query`, and `change_stream` for table,
+range, query, and ordered change-stream events. `Watch.next` returns `None` on
+timeout.
+
 ## Benchmarks
 
 To run the fetch benchmark:

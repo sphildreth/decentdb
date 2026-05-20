@@ -31,13 +31,14 @@ It targets a single process with **one writer** and **many concurrent readers** 
 - 🔒 **ACID Transactions** - Write-ahead logging with crash-safe recovery
 - 🌳 **B+Tree Storage** - Efficient tables and secondary indexes with page caching
 - 🔁 **Local-First Sync** - Durable change journals, scoped peer replication, conflict workflows, operational doctor tooling, CLI commands, and a typed .NET sync SDK
+- 📡 **Reactive Subscriptions** - In-process table, range, query, and change-stream watches deliver committed invalidation events with LSN boundaries, bounded lag handling, C ABI JSON polling, and Python/Go direct helpers
 - 🖥️ **Built-In HTTP Server And Web Console** - `decentdb serve` exposes a local HTTP API and embedded browser console for inspection, SQL execution, schema browsing, EXPLAIN, CSV export, and scripting
 - 🌐 **WASM Browser OPFS Support** - `@decentdb/web` runs DecentDB in a Dedicated Worker with an OPFS-backed VFS, async TypeScript API, binary result transport, checkpoint, import/export, persistence helpers, and browser smoke/benchmark coverage
 - 🐘 **PostgreSQL-like SQL** - Familiar DDL/DML syntax with JOINs (INNER, LEFT, RIGHT, FULL OUTER, CROSS, NATURAL), CTEs (including WITH RECURSIVE), subqueries, window functions, and rich types (UUID, DECIMAL, native TIMESTAMP)
 - 🕒 **Native TIMESTAMP Type** - DATE/TIMESTAMP columns stored as int64 microseconds since Unix epoch (UTC); correct `ORDER BY` and `EXTRACT(YEAR|MONTH|DAY|HOUR|MINUTE|SECOND FROM ...)`, with native bind/read in all bindings
 - 👥 **Concurrent Reads** - Snapshot isolation allows multiple readers with one writer
 - 🚦 **Queued Write Concurrency** - Engine-owned bounded write queue with timeouts, metrics, and strict durable group commit for predictable in-process concurrent writes
-- 📈 **Queryable Operational Metrics** - Stable `sys.*` inspection views expose WAL, write-queue, storage, and sync status snapshots without telemetry writes
+- 📈 **Queryable Operational Metrics** - Stable `sys.*` inspection views expose WAL, write-queue, storage, reactive subscription, and sync status snapshots without telemetry writes
 - 🌿 **Branch, Diff, Restore, And Time Travel** - Named snapshots, isolated branch writes, branch diffs, guarded restore, and constrained merge for migration rehearsal and agent sandboxes
 - 🔎 **Trigram Index** - Fast text search for `LIKE '%pattern%'` queries
 - 🗺️ **Native Geospatial** - `GEOMETRY` / `GEOGRAPHY` values, `ST_*` functions, and `USING spatial` indexes

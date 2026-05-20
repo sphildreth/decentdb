@@ -34,6 +34,7 @@ enum {
 typedef struct ddb_db_handle ddb_db_t;
 typedef struct ddb_result_handle ddb_result_t;
 typedef struct ddb_stmt_handle ddb_stmt_t;
+typedef struct ddb_watch_handle ddb_watch_t;
 
 typedef enum ddb_value_tag_t {
   DDB_VALUE_NULL = 0,
@@ -372,6 +373,33 @@ ddb_status_t ddb_db_execute_queued(
 ddb_status_t ddb_db_write_queue_metrics(
     ddb_db_t *db,
     ddb_write_queue_metrics_t *out_metrics);
+
+ddb_status_t ddb_db_watch_table_json(
+    ddb_db_t *db,
+    const char *request_json,
+    ddb_watch_t **out_watch);
+
+ddb_status_t ddb_db_watch_range_json(
+    ddb_db_t *db,
+    const char *request_json,
+    ddb_watch_t **out_watch);
+
+ddb_status_t ddb_db_watch_query_json(
+    ddb_db_t *db,
+    const char *request_json,
+    ddb_watch_t **out_watch);
+
+ddb_status_t ddb_db_change_stream_json(
+    ddb_db_t *db,
+    const char *request_json,
+    ddb_watch_t **out_watch);
+
+ddb_status_t ddb_watch_next_json(
+    ddb_watch_t *watch,
+    uint32_t timeout_ms,
+    char **out_json);
+
+ddb_status_t ddb_watch_close(ddb_watch_t **watch);
 
 ddb_status_t ddb_db_checkpoint(ddb_db_t *db);
 ddb_status_t ddb_db_begin_transaction(ddb_db_t *db);

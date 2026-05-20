@@ -3,7 +3,7 @@ import 'dart:io' show Platform;
 
 import 'package:ffi/ffi.dart';
 
-const int expectedAbiVersion = 3;
+const int expectedAbiVersion = 4;
 const int ddbOk = 0;
 const int ddbWriteQueueTimeoutDefault = 0xFFFFFFFFFFFFFFFF;
 const int ddbTagNull = 0;

@@ -23,6 +23,7 @@ mod json;
 mod json_tests;
 mod metadata;
 mod planner;
+mod reactive;
 mod record;
 mod search;
 pub(crate) mod spatial;
@@ -58,6 +59,12 @@ pub use crate::metadata::{
     SchemaSnapshot, SchemaTableInfo, SchemaTriggerInfo, SchemaViewInfo, StorageInfo, TableInfo,
     ToolingCapabilities, ToolingColumnTypeMetadata, ToolingMetadata, ToolingSpatialTypeInfo,
     ToolingTypeInfo, TriggerInfo, ViewInfo,
+};
+pub use crate::reactive::{
+    ChangeSource, ChangeStreamEvent, ChangeStreamOptions, InitialWatchEvent, InvalidationEvent,
+    LaggedWatchEvent, QueryWatchOptions, RangeWatchOptions, ReactiveMetricsSnapshot,
+    ReactiveSubscriptionSnapshot, RowChange, RowChangeDetail, RowOperation, TableChange,
+    TableWatchOptions, WatchEvent, WatchHandle, WatchKind,
 };
 pub use crate::record::value::Value;
 pub use crate::storage::DB_FORMAT_VERSION;

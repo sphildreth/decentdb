@@ -57,6 +57,8 @@ The current sync surface includes:
 - scoped replication with validated primary-key-based row filters
 - conservative conflict recording by default, plus manual show/resolve/reopen
   workflows and configurable policies
+- in-process reactive subscriptions for table, range, query, and change-stream
+  invalidation without polling
 - canonical `sys.*` operational inspection views plus `sys_sync_*`
   compatibility queries for journals, peers, scopes, sessions, conflicts, peer
   lag, retention, and doctor summaries

@@ -320,7 +320,9 @@ impl WriteQueue {
                 .total_queue_wait_ns
                 .fetch_add(nanos_since(request.enqueued_at), Ordering::Relaxed);
 
-            match db.execute_batch_direct_with_params(&request.sql, &request.params) {
+            match crate::reactive::with_change_source(crate::reactive::ChangeSource::Queued, || {
+                db.execute_batch_direct_with_params(&request.sql, &request.params)
+            }) {
                 Ok(result) => {
                     successes.push((request, result));
                 }

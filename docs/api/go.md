@@ -83,6 +83,33 @@ affected, err := direct.ExecQueued(ctx, "INSERT INTO events (id, name) VALUES ($
 metrics, err := direct.WriteQueueMetrics()
 ```
 
+### Reactive Subscriptions
+
+`OpenDirect` exposes reactive watch handles backed by the C ABI JSON event
+stream:
+
+```go
+direct, _ := decentdb.OpenDirect("/tmp/app.ddb")
+defer direct.Close()
+
+watch, err := direct.WatchQueryJson(
+    "SELECT id, name FROM items ORDER BY id",
+    nil,
+)
+if err != nil { log.Fatal(err) }
+defer watch.Close()
+
+event, ok, err := watch.Next(time.Second)
+if err != nil { log.Fatal(err) }
+if ok && event["type"] == "initial" {
+    // use initial snapshot
+}
+```
+
+The direct API includes `WatchTableJson`, `WatchRangeJson`, `WatchQueryJson`,
+and `ChangeStreamJson`. `Watch.Next(...)` returns `ok=false` on timeout;
+`Watch.NextJson(...)` returns the raw JSON payload.
+
 ### DSN modes
 
 ```go
@@ -99,7 +126,7 @@ db, err := sql.Open("decentdb", "file:/tmp/app.ddb?mode=open")
 ## Version introspection
 
 ```go
-abi := decentdb.AbiVersion()       // e.g. 2
+abi := decentdb.AbiVersion()       // e.g. 4
 ver := decentdb.EngineVersion()    // e.g. "2.0.0"
 ```
 

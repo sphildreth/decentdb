@@ -10,6 +10,7 @@ import "C"
 
 import (
 	"fmt"
+	"strings"
 	"unsafe"
 )
 
@@ -44,7 +45,7 @@ func main() {
 
 	queuedInsert := C.CString("INSERT INTO smoke (id, name) VALUES (2, 'go-queued')")
 	defer C.free(unsafe.Pointer(queuedInsert))
-	check(C.ddb_db_execute_queued(db, queuedInsert, nil, 0, C.DDB_WRITE_QUEUE_TIMEOUT_DEFAULT, &result), "queued insert")
+	check(C.ddb_db_execute_queued(db, queuedInsert, nil, 0, C.uint64_t(^uint64(0)), &result), "queued insert")
 	check(C.ddb_result_free(&result), "free queued insert")
 	var metrics C.ddb_write_queue_metrics_t
 	check(C.ddb_db_write_queue_metrics(db, &metrics), "queue metrics")
@@ -53,12 +54,38 @@ func main() {
 			uint64(metrics.admitted), uint64(metrics.committed), uint64(metrics.failed)))
 	}
 
+	var watch *C.ddb_watch_t
+	watchRequest := C.CString(`{"sql":"SELECT id, name FROM smoke ORDER BY id"}`)
+	defer C.free(unsafe.Pointer(watchRequest))
+	check(C.ddb_db_watch_query_json(db, watchRequest, &watch), "watch query")
+	var watchEvent *C.char
+	check(C.ddb_watch_next_json(watch, 1000, &watchEvent), "watch initial")
+	if !strings.Contains(C.GoString(watchEvent), `"type":"initial"`) {
+		panic("unexpected initial watch event")
+	}
+	check(C.ddb_string_free(&watchEvent), "free watch initial")
+
+	watchInsert := C.CString("INSERT INTO smoke (id, name) VALUES (3, 'go-watch')")
+	defer C.free(unsafe.Pointer(watchInsert))
+	check(C.ddb_db_execute(db, watchInsert, nil, 0, &result), "watch insert")
+	check(C.ddb_result_free(&result), "free watch insert")
+	check(C.ddb_watch_next_json(watch, 1000, &watchEvent), "watch invalidate")
+	invalidate := C.GoString(watchEvent)
+	if !strings.Contains(invalidate, `"type":"invalidate"`) || !strings.Contains(invalidate, `"smoke"`) {
+		panic(fmt.Sprintf("unexpected invalidate watch event: %s", invalidate))
+	}
+	check(C.ddb_string_free(&watchEvent), "free watch invalidate")
+	if status := C.ddb_watch_next_json(watch, 1, &watchEvent); status != C.DDB_ERR_TIMEOUT {
+		panic(fmt.Sprintf("expected watch timeout, got %d", uint32(status)))
+	}
+	check(C.ddb_watch_close(&watch), "watch close")
+
 	selectSQL := C.CString("SELECT id, name FROM smoke")
 	defer C.free(unsafe.Pointer(selectSQL))
 	check(C.ddb_db_execute(db, selectSQL, nil, 0, &result), "select")
 	check(C.ddb_result_row_count(result, &rows), "row count")
-	if rows != 2 {
-		panic(fmt.Sprintf("expected 2 rows, got %d", uint64(rows)))
+	if rows != 3 {
+		panic(fmt.Sprintf("expected 3 rows, got %d", uint64(rows)))
 	}
 	check(C.ddb_result_free(&result), "free select")
 

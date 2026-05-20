@@ -9,10 +9,13 @@ use std::time::Duration;
 
 use crate::db::PreparedStatement;
 use crate::error::{DbError, DbErrorCode, Result};
-use crate::{evict_shared_wal, Db, DbConfig, QueryResult, QueuedWriteOptions, Value};
+use crate::{
+    evict_shared_wal, ChangeStreamOptions, Db, DbConfig, QueryResult, QueryWatchOptions,
+    QueuedWriteOptions, RangeWatchOptions, TableWatchOptions, Value,
+};
 
 const DDB_OK: u32 = 0;
-const DDB_ABI_VERSION: u32 = 3;
+const DDB_ABI_VERSION: u32 = 4;
 const DDB_WRITE_QUEUE_TIMEOUT_DEFAULT: u64 = u64::MAX;
 
 #[repr(u32)]
@@ -209,6 +212,12 @@ pub struct DbHandle {
 #[derive(Debug)]
 pub struct ResultHandle {
     result: QueryResult,
+}
+
+#[repr(C)]
+#[derive(Debug)]
+pub struct WatchHandle {
+    watch: crate::WatchHandle,
 }
 
 #[repr(C)]
@@ -867,6 +876,121 @@ fn to_json_string<T: serde::Serialize>(value: &T) -> Result<String> {
 fn sync_request_root(request_json: &str) -> Result<serde_json::Value> {
     serde_json::from_str(request_json)
         .map_err(|error| DbError::sql(format!("invalid sync JSON request: {error}")))
+}
+
+fn watch_request_root(request_json: &str) -> Result<serde_json::Value> {
+    serde_json::from_str(request_json)
+        .map_err(|error| DbError::sql(format!("invalid watch JSON request: {error}")))
+}
+
+fn watch_request_object(
+    request: &serde_json::Value,
+) -> Result<&serde_json::Map<String, serde_json::Value>> {
+    request
+        .as_object()
+        .ok_or_else(|| DbError::sql("watch JSON request must be an object"))
+}
+
+fn watch_string_list(
+    request: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<Vec<String>> {
+    match request.get(field) {
+        None | Some(serde_json::Value::Null) => Ok(Vec::new()),
+        Some(serde_json::Value::Array(values)) => values
+            .iter()
+            .map(|value| match value {
+                serde_json::Value::String(value) => Ok(value.clone()),
+                other => Err(DbError::sql(format!(
+                    "watch field '{field}' must contain strings, got {other}"
+                ))),
+            })
+            .collect(),
+        Some(other) => Err(DbError::sql(format!(
+            "watch field '{field}' must be an array of strings, got {other}"
+        ))),
+    }
+}
+
+fn watch_string_field(
+    request: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<String> {
+    match request.get(field) {
+        Some(serde_json::Value::String(value)) => Ok(value.clone()),
+        Some(other) => Err(DbError::sql(format!(
+            "watch field '{field}' must be a string, got {other}"
+        ))),
+        None => Err(DbError::sql(format!("watch field '{field}' is required"))),
+    }
+}
+
+fn watch_optional_usize(
+    request: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<Option<usize>> {
+    match request.get(field) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Number(value)) => value
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+            .map(Some)
+            .ok_or_else(|| DbError::sql(format!("watch field '{field}' must fit in usize"))),
+        Some(other) => Err(DbError::sql(format!(
+            "watch field '{field}' must be an unsigned integer, got {other}"
+        ))),
+    }
+}
+
+fn watch_optional_bool(
+    request: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    default: bool,
+) -> Result<bool> {
+    match request.get(field) {
+        None | Some(serde_json::Value::Null) => Ok(default),
+        Some(serde_json::Value::Bool(value)) => Ok(*value),
+        Some(other) => Err(DbError::sql(format!(
+            "watch field '{field}' must be a bool, got {other}"
+        ))),
+    }
+}
+
+fn watch_optional_json(
+    request: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Option<serde_json::Value> {
+    request.get(field).filter(|value| !value.is_null()).cloned()
+}
+
+fn watch_params(request: &serde_json::Map<String, serde_json::Value>) -> Result<Vec<Value>> {
+    match request.get("params") {
+        None | Some(serde_json::Value::Null) => Ok(Vec::new()),
+        Some(serde_json::Value::Array(values)) => values.iter().map(value_from_json).collect(),
+        Some(other) => Err(DbError::sql(format!(
+            "watch field 'params' must be an array, got {other}"
+        ))),
+    }
+}
+
+fn value_from_json(value: &serde_json::Value) -> Result<Value> {
+    match value {
+        serde_json::Value::Null => Ok(Value::Null),
+        serde_json::Value::Bool(value) => Ok(Value::Bool(*value)),
+        serde_json::Value::Number(value) => {
+            if let Some(value) = value.as_i64() {
+                Ok(Value::Int64(value))
+            } else if let Some(value) = value.as_f64() {
+                Ok(Value::Float64(value))
+            } else {
+                Err(DbError::sql("JSON number cannot be represented"))
+            }
+        }
+        serde_json::Value::String(value) => Ok(Value::Text(value.clone())),
+        other => Err(DbError::sql(format!(
+            "watch params support null, bool, number, and string values; got {other}"
+        ))),
+    }
 }
 
 fn sync_request_object<'a>(
@@ -1805,6 +1929,124 @@ pub extern "C" fn ddb_db_write_queue_metrics(
             physical_syncs_saved: metrics.physical_syncs_saved,
             total_queue_wait_ns: metrics.total_queue_wait_ns,
         };
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_db_watch_table_json(
+    db: *mut DbHandle,
+    request_json: *const c_char,
+    out_watch: *mut *mut WatchHandle,
+) -> u32 {
+    ffi_boundary(|| {
+        let db = handle_ref(db, "db")?;
+        let request = watch_request_root(&utf8_arg(request_json, "request_json")?)?;
+        let object = watch_request_object(&request)?;
+        let watch = db.db.watch_table(TableWatchOptions {
+            tables: watch_string_list(object, "tables")?,
+            queue_capacity: watch_optional_usize(object, "queue_capacity")?,
+        })?;
+        *out_ptr(out_watch, "out_watch")? = Box::into_raw(Box::new(WatchHandle { watch }));
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_db_watch_range_json(
+    db: *mut DbHandle,
+    request_json: *const c_char,
+    out_watch: *mut *mut WatchHandle,
+) -> u32 {
+    ffi_boundary(|| {
+        let db = handle_ref(db, "db")?;
+        let request = watch_request_root(&utf8_arg(request_json, "request_json")?)?;
+        let object = watch_request_object(&request)?;
+        let watch = db.db.watch_range(RangeWatchOptions {
+            table: watch_string_field(object, "table")?,
+            lower: watch_optional_json(object, "lower"),
+            upper: watch_optional_json(object, "upper"),
+            lower_inclusive: watch_optional_bool(object, "lower_inclusive", true)?,
+            upper_inclusive: watch_optional_bool(object, "upper_inclusive", true)?,
+            queue_capacity: watch_optional_usize(object, "queue_capacity")?,
+        })?;
+        *out_ptr(out_watch, "out_watch")? = Box::into_raw(Box::new(WatchHandle { watch }));
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_db_watch_query_json(
+    db: *mut DbHandle,
+    request_json: *const c_char,
+    out_watch: *mut *mut WatchHandle,
+) -> u32 {
+    ffi_boundary(|| {
+        let db = handle_ref(db, "db")?;
+        let request = watch_request_root(&utf8_arg(request_json, "request_json")?)?;
+        let object = watch_request_object(&request)?;
+        let sql = watch_string_field(object, "sql")?;
+        let params = watch_params(object)?;
+        let watch = db.db.watch_query(
+            &sql,
+            &params,
+            QueryWatchOptions {
+                queue_capacity: watch_optional_usize(object, "queue_capacity")?,
+            },
+        )?;
+        *out_ptr(out_watch, "out_watch")? = Box::into_raw(Box::new(WatchHandle { watch }));
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_db_change_stream_json(
+    db: *mut DbHandle,
+    request_json: *const c_char,
+    out_watch: *mut *mut WatchHandle,
+) -> u32 {
+    ffi_boundary(|| {
+        let db = handle_ref(db, "db")?;
+        let request = watch_request_root(&utf8_arg(request_json, "request_json")?)?;
+        let object = watch_request_object(&request)?;
+        let watch = db.db.change_stream(ChangeStreamOptions {
+            tables: watch_string_list(object, "tables")?,
+            queue_capacity: watch_optional_usize(object, "queue_capacity")?,
+        })?;
+        *out_ptr(out_watch, "out_watch")? = Box::into_raw(Box::new(WatchHandle { watch }));
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_watch_next_json(
+    watch: *mut WatchHandle,
+    timeout_ms: u32,
+    out_json: *mut *mut c_char,
+) -> u32 {
+    ffi_boundary(|| {
+        let watch = handle_ref(watch, "watch")?;
+        let timeout = Duration::from_millis(u64::from(timeout_ms));
+        let Some(json) = watch.watch.next_json_timeout(timeout)? else {
+            return Err(DbError::timeout("watch receive timed out"));
+        };
+        *out_ptr(out_json, "out_json")? = cstring_from_string(json)?;
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_watch_close(watch: *mut *mut WatchHandle) -> u32 {
+    ffi_boundary(|| {
+        let watch = out_ptr(watch, "watch")?;
+        if (*watch).is_null() {
+            return Ok(());
+        }
+        // SAFETY: pointer was created by `Box::into_raw` in this module.
+        unsafe {
+            drop(Box::from_raw(*watch));
+        }
+        *watch = ptr::null_mut();
         Ok(())
     })
 }
@@ -4168,6 +4410,51 @@ mod tests {
             .as_array()
             .is_some_and(|items| items.is_empty()));
 
+        assert_eq!(ddb_db_free(&mut db), DDB_OK);
+    }
+
+    #[test]
+    fn ffi_watch_query_json_delivers_initial_and_invalidation_events() {
+        let dir = tempfile::TempDir::with_prefix("decentdb-c-api-reactive").unwrap();
+        let path = dir.path().join("reactive-json.ddb");
+        let path = CString::new(path.to_string_lossy().as_bytes()).expect("path");
+        let mut db = ptr::null_mut();
+        assert_eq!(ddb_db_open_or_create(path.as_ptr(), &mut db), DDB_OK);
+
+        let create = CString::new("CREATE TABLE users (id INT64 PRIMARY KEY, name TEXT)").unwrap();
+        let mut result = ptr::null_mut();
+        assert_eq!(
+            ddb_db_execute(db, create.as_ptr(), ptr::null(), 0, &mut result),
+            DDB_OK
+        );
+        assert_eq!(ddb_result_free(&mut result), DDB_OK);
+
+        let request = CString::new(r#"{"sql":"SELECT name FROM users ORDER BY id"}"#).unwrap();
+        let mut watch = ptr::null_mut();
+        assert_eq!(
+            ddb_db_watch_query_json(db, request.as_ptr(), &mut watch),
+            DDB_OK
+        );
+
+        let mut json_ptr = ptr::null_mut();
+        assert_eq!(ddb_watch_next_json(watch, 1000, &mut json_ptr), DDB_OK);
+        let initial = parse_json(&mut json_ptr);
+        assert_eq!(initial["type"], "initial");
+
+        let insert = CString::new("INSERT INTO users (id, name) VALUES (1, 'Ada')").unwrap();
+        assert_eq!(
+            ddb_db_execute(db, insert.as_ptr(), ptr::null(), 0, &mut result),
+            DDB_OK
+        );
+        assert_eq!(ddb_result_free(&mut result), DDB_OK);
+
+        assert_eq!(ddb_watch_next_json(watch, 1000, &mut json_ptr), DDB_OK);
+        let event = parse_json(&mut json_ptr);
+        assert_eq!(event["type"], "invalidate");
+        assert_eq!(event["tables"][0], "users");
+
+        assert_eq!(ddb_watch_close(&mut watch), DDB_OK);
+        assert!(watch.is_null());
         assert_eq!(ddb_db_free(&mut db), DDB_OK);
     }
 }

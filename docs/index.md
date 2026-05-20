@@ -17,6 +17,7 @@ queries, syncable offline data, and language bindings that feel native.
 |---|---|
 | Durable ACID storage | WAL-based persistence and crash-safe recovery are central design goals. |
 | Local-first sync | Built-in change journals, batch exchange, scoped peer replication, conflict workflows, retention tooling, sync doctor, CLI commands, and a typed .NET sync SDK. |
+| Reactive subscriptions | In-process table, range, query, and change-stream watches deliver committed invalidation events with LSN boundaries, bounded lag handling, and Rust/C/Python/Go entry points. |
 | Built-in HTTP and web console | `decentdb serve` exposes a local HTTP API and embedded browser console for inspection, SQL execution, EXPLAIN, schema browsing, CSV export, and scripting. |
 | Browser WASM and OPFS | `@decentdb/web` runs DecentDB in a Dedicated Worker with OPFS persistence, an async TypeScript API, binary result transport, and browser smoke/benchmark coverage. |
 | Branch, diff, restore, and time travel | Durable named snapshots, branch-local writes, diff reports, guarded restore, and constrained merge workflows for migration rehearsal and support/debugging. |
@@ -24,7 +25,7 @@ queries, syncable offline data, and language bindings that feel native.
 | Application-friendly types | Native `INT64`, `FLOAT64`, `BOOL`, `TEXT`, `BLOB`, `DECIMAL`, `UUID`, `DATE`, and `TIMESTAMP`. |
 | Indexed substring search | Native trigram indexes accelerate interactive `LIKE '%pattern%'` queries. |
 | Multi-language embedding | C ABI plus .NET, Go, Python, Node.js, Dart/Flutter, and JDBC bindings. |
-| Operational tooling | Queryable `sys.*` metrics for WAL, write queue, storage, and sync status; CLI inspection, checkpoints, index rebuilds, import/export, bulk load, doctor reports, and DBeaver/JDBC integration. |
+| Operational tooling | Queryable `sys.*` metrics for WAL, write queue, storage, reactive subscriptions, and sync status; CLI inspection, checkpoints, index rebuilds, import/export, bulk load, doctor reports, and DBeaver/JDBC integration. |
 
 ## Core Features
 
@@ -41,7 +42,9 @@ queries, syncable offline data, and language bindings that feel native.
   `INSTEAD OF` trigger paths.
 - **Bulk-load, CSV, and JSON import/export** workflows.
 - **Queryable operational metrics** through stable `sys.*` inspection views for
-  WAL, write queue, storage, and sync status snapshots.
+  WAL, write queue, storage, reactive subscription, and sync status snapshots.
+- **Reactive subscriptions and change streams** with table, primary-key range,
+  query, and change-stream watches for committed in-process invalidation.
 - **Branch, diff, restore, and time-travel workflows** with named snapshots,
   branch-local writes, primary-key row diffs, guarded restore, and constrained
   merge.

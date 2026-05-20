@@ -228,6 +228,23 @@ pub struct DbConfig {
     ///
     /// Default: `0`.
     pub write_queue_max_group_delay_us: u64,
+
+    /// Default per-watch event queue capacity for reactive subscriptions.
+    ///
+    /// Default: `1024`.
+    pub reactive_watch_queue_capacity: usize,
+
+    /// Maximum per-watch event queue capacity accepted from callers.
+    ///
+    /// Default: `8192`.
+    pub reactive_watch_queue_max_capacity: usize,
+
+    /// Maximum row-level changes retained in one reactive commit event before
+    /// degrading to table-level invalidation. `0` disables row-change capture
+    /// limits.
+    ///
+    /// Default: `4096`.
+    pub reactive_max_row_changes_per_event: usize,
 }
 
 impl DbConfig {
@@ -279,6 +296,9 @@ impl Default for DbConfig {
             write_queue_strict_group_commit: true,
             write_queue_max_batch: 64,
             write_queue_max_group_delay_us: 0,
+            reactive_watch_queue_capacity: 1024,
+            reactive_watch_queue_max_capacity: 8192,
+            reactive_max_row_changes_per_event: 4096,
         }
     }
 }
@@ -323,6 +343,9 @@ mod tests {
         assert!(config.write_queue_strict_group_commit);
         assert_eq!(config.write_queue_max_batch, 64);
         assert_eq!(config.write_queue_max_group_delay_us, 0);
+        assert_eq!(config.reactive_watch_queue_capacity, 1024);
+        assert_eq!(config.reactive_watch_queue_max_capacity, 8192);
+        assert_eq!(config.reactive_max_row_changes_per_event, 4096);
         // Default depends on platform; just assert the field is reachable.
         let _ = config.release_freed_memory_after_checkpoint;
     }

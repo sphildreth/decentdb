@@ -81,6 +81,51 @@ The Rust API exposes the same branch workflow used by the CLI:
 Report types such as `BranchDiffReport`, `BranchRestoreReport`, and
 `BranchMergeReport` are serializable for tooling.
 
+## Reactive subscriptions
+
+The Rust API exposes in-process reactive watches:
+
+- `Db::watch_table(TableWatchOptions)`
+- `Db::watch_range(RangeWatchOptions)`
+- `Db::watch_query(sql, params, QueryWatchOptions)`
+- `Db::change_stream(ChangeStreamOptions)`
+- `Db::reactive_metrics()`
+- `Db::reactive_subscriptions()`
+
+Query watches deliver an initial `QueryResult`, then invalidation events for
+committed changes to dependent tables. Table, range, and change-stream watches
+deliver initial snapshot metadata followed by committed events with LSN
+boundaries. Watch queues are bounded; a slow consumer receives `WatchEvent::Lagged`
+and should resynchronize from a fresh query.
+
+```rust
+use std::time::Duration;
+
+use decentdb::{Db, DbConfig, TableWatchOptions, WatchEvent};
+
+let db = Db::open(":memory:", DbConfig::default())?;
+db.execute("CREATE TABLE users (id INT64 PRIMARY KEY, name TEXT)")?;
+
+let watch = db.watch_table(TableWatchOptions {
+    tables: vec!["users".to_string()],
+    queue_capacity: None,
+})?;
+
+assert!(matches!(
+    watch.recv_timeout(Duration::from_secs(1))?,
+    Some(WatchEvent::Initial(_))
+));
+
+db.execute("INSERT INTO users (id, name) VALUES (1, 'Ada')")?;
+
+if let Some(WatchEvent::Invalidate(event)) =
+    watch.recv_timeout(Duration::from_secs(1))?
+{
+    assert_eq!(event.tables, vec!["users"]);
+}
+# Ok::<(), decentdb::DbError>(())
+```
+
 ## Metadata and maintenance
 
 The crate exposes structured inspection helpers for the CLI and higher-level bindings:

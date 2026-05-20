@@ -142,6 +142,65 @@ class PerformanceWarning(UserWarning):
     pass
 
 
+class Watch:
+    def __init__(self, lib, watch):
+        self._lib = lib
+        self._watch = ctypes.c_void_p(watch.value if hasattr(watch, "value") else watch)
+        self._closed = False
+
+    def _ensure_open(self):
+        if self._closed or not self._watch:
+            raise ProgrammingError("Watch closed")
+
+    def next_json(self, timeout_ms=0):
+        self._ensure_open()
+        if not hasattr(self._lib, "ddb_watch_next_json"):
+            raise NotSupportedError("ddb_watch_next_json is not available in this native library")
+        out = ctypes.c_char_p()
+        code = self._lib.ddb_watch_next_json(
+            self._watch,
+            ctypes.c_uint32(int(timeout_ms)),
+            ctypes.byref(out),
+        )
+        if code == ERR_TIMEOUT:
+            return None
+        if code != ERR_OK:
+            _raise_error(code)
+        try:
+            return out.value.decode("utf-8") if out.value else ""
+        finally:
+            self._lib.ddb_string_free(ctypes.byref(out))
+
+    def next(self, timeout_ms=0):
+        raw = self.next_json(timeout_ms=timeout_ms)
+        return None if raw is None else json.loads(raw)
+
+    def close(self):
+        if self._closed:
+            return
+        if self._watch and hasattr(self._lib, "ddb_watch_close"):
+            ptr = ctypes.c_void_p(self._watch.value)
+            code = self._lib.ddb_watch_close(ctypes.byref(ptr))
+            if code != ERR_OK:
+                _raise_error(code)
+            self._watch = ptr
+        self._closed = True
+
+    def __enter__(self):
+        self._ensure_open()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
 Date = datetime.date
 Time = datetime.time
 Timestamp = datetime.datetime
@@ -3471,6 +3530,7 @@ class Connection:
         self._closed = False
         self._in_explicit_txn = False
         self.cursors = weakref.WeakSet()
+        self._watches = weakref.WeakSet()
         self._stmt_cache = collections.OrderedDict()
         self._stmt_cache_size = stmt_cache_size
         self._stats = collections.Counter()
@@ -3597,6 +3657,8 @@ class Connection:
     def close(self):
         if self._closed:
             return
+        for watch in list(self._watches):
+            watch.close()
         for cursor in list(self.cursors):
             cursor.close()
         for stmt in list(self._stmt_cache.values()):
@@ -3714,6 +3776,68 @@ class Connection:
             "physical_syncs_saved": int(metrics.physical_syncs_saved),
             "total_queue_wait_ns": int(metrics.total_queue_wait_ns),
         }
+
+    def _create_watch(self, function_name, request):
+        self._ensure_open()
+        if not hasattr(self._lib, function_name):
+            raise NotSupportedError(f"{function_name} is not available in this native library")
+        out = ctypes.c_void_p()
+        payload = json.dumps(request, separators=(",", ":")).encode("utf-8")
+        code = getattr(self._lib, function_name)(self._db, payload, ctypes.byref(out))
+        if code != ERR_OK:
+            _raise_error(code)
+        watch = Watch(self._lib, out)
+        self._watches.add(watch)
+        return watch
+
+    def watch_table(self, tables, *, queue_capacity=None):
+        if isinstance(tables, str):
+            tables = [tables]
+        request = {"tables": list(tables)}
+        if queue_capacity is not None:
+            request["queue_capacity"] = int(queue_capacity)
+        return self._create_watch("ddb_db_watch_table_json", request)
+
+    def watch_range(
+        self,
+        table,
+        *,
+        lower=None,
+        upper=None,
+        lower_inclusive=True,
+        upper_inclusive=True,
+        queue_capacity=None,
+    ):
+        request = {
+            "table": table,
+            "lower_inclusive": bool(lower_inclusive),
+            "upper_inclusive": bool(upper_inclusive),
+        }
+        if lower is not None:
+            request["lower"] = lower
+        if upper is not None:
+            request["upper"] = upper
+        if queue_capacity is not None:
+            request["queue_capacity"] = int(queue_capacity)
+        return self._create_watch("ddb_db_watch_range_json", request)
+
+    def watch_query(self, sql, params=None, *, queue_capacity=None):
+        request = {"sql": sql}
+        if params is not None:
+            request["params"] = list(params)
+        if queue_capacity is not None:
+            request["queue_capacity"] = int(queue_capacity)
+        return self._create_watch("ddb_db_watch_query_json", request)
+
+    def change_stream(self, tables=None, *, queue_capacity=None):
+        request = {}
+        if tables is not None:
+            if isinstance(tables, str):
+                tables = [tables]
+            request["tables"] = list(tables)
+        if queue_capacity is not None:
+            request["queue_capacity"] = int(queue_capacity)
+        return self._create_watch("ddb_db_change_stream_json", request)
 
     def _call_json_api(self, func, *args):
         self._ensure_open()

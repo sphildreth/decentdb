@@ -43,6 +43,8 @@ SELECT * FROM sys.sync_status;
 SELECT * FROM sys.wal_metrics;
 SELECT * FROM sys.write_queue_metrics;
 SELECT * FROM sys.storage_metrics;
+SELECT * FROM sys.reactive_metrics;
+SELECT * FROM sys.reactive_subscriptions;
 SELECT * FROM sys_sync_journal WHERE sequence > 100 ORDER BY sequence;
 SELECT * FROM sys_sync_conflicts ORDER BY conflict_id;
 SELECT * FROM sys_sync_doctor;

@@ -55,6 +55,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   inspection names. Added deterministic Rust regression tests and SQL API
   documentation plus ADR 0163 covering column contracts, metric snapshots, and
   lifecycle semantics.
+- Added in-process reactive subscriptions and change streams with Rust watch
+  handles, table/range/query/change-stream watch kinds, bounded lag reporting,
+  post-commit LSN events, queued/sync/branch source tagging, C ABI JSON watch
+  handles, Python and Go direct watch helpers, `sys.reactive_metrics`,
+  `sys.reactive_subscriptions`, ADR 0164, and a full implementation spec for
+  the reactive contract.
 
 ### Changed
 

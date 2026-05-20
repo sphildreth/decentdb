@@ -75,7 +75,7 @@ Future version values are planning buckets, not release commitments.
 |---:|---|---|---|---|---|
 | 1 | vNext | COMPLETE | Concurrent write ergonomics: write queue plus strict group commit | [`WIN_CONCURRENT_WRITE_ERGONOMICS_PHASED_APPROACH.md`](WIN_CONCURRENT_WRITE_ERGONOMICS_PHASED_APPROACH.md); ADR 0162 for durable queue/group commit; ADR 0135 for async commit distinction | Removes the most visible one-writer friction while preserving durability |
 | 2 | vNext+1 | COMPLETE | Built-in operational metrics and `sys.*` tables | ADR 0163; [`docs/api/sql-functions.md`](../docs/api/sql-functions.md#operational-inspection-views) | Makes write queue, WAL, sync, and storage state inspectable without hidden runtime tracing cost |
-| 3 | vNext+1 | TODO | Reactive query subscriptions and change streams | Needs ADR/spec; sync journal and branch diff are inputs | Modern local-first apps need live query invalidation without polling |
+| 3 | vNext+1 | COMPLETE | Reactive query subscriptions and change streams | [ADR 0164](adr/0164-reactive-query-subscriptions-and-change-streams.md); [`WIN_REACTIVE_QUERY_SUBSCRIPTIONS_CHANGE_STREAMS_SPEC.md`](WIN_REACTIVE_QUERY_SUBSCRIPTIONS_CHANGE_STREAMS_SPEC.md) | Modern local-first apps need live query invalidation without polling |
 | 4 | vNext+2 | TODO | Production browser runtime | ADR 0161 and [`docs/api/wasm.md`](../docs/api/wasm.md); needs follow-up ADR/spec | Browser is a primary local-first runtime, and v1 intentionally lacks multi-tab/service-worker/write coordination |
 | 5 | vNext+2 | TODO | Production sync relay and public changeset API | [`WIN_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md`](WIN_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md); needs follow-up ADR/spec | Turns shipped sync into a production application platform surface |
 | 6 | vNext+2 | TODO | Local data security: TDE, policies, masking, audit context | Needs ADR/spec | TDE is table stakes for SQLCipher-style onboarding; policy is the differentiated regulated/offline story |
@@ -250,11 +250,12 @@ findings surfaces are included in this item.
 
 ## 3. Reactive Query Subscriptions And Change Streams
 
-**Status:** `TODO`
+**Status:** `COMPLETE`
 
 **Future Version:** vNext+1
 
-**Source of truth:** Needs ADR/spec before implementation.
+**Source of truth:** [ADR 0164](adr/0164-reactive-query-subscriptions-and-change-streams.md),
+[`design/WIN_REACTIVE_QUERY_SUBSCRIPTIONS_CHANGE_STREAMS_SPEC.md`](WIN_REACTIVE_QUERY_SUBSCRIPTIONS_CHANGE_STREAMS_SPEC.md).
 
 ### Why This Matters
 

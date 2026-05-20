@@ -31,6 +31,32 @@ def test_engine_version_returns_str():
 
 
 # ---------------------------------------------------------------------------
+# Reactive subscriptions
+# ---------------------------------------------------------------------------
+
+
+def test_reactive_query_watch_delivers_initial_and_invalidation(tmp_path):
+    conn = decentdb.connect(str(tmp_path / "reactive.ddb"))
+    conn.execute("CREATE TABLE items (id INT64 PRIMARY KEY, name TEXT)")
+
+    watch = conn.watch_query("SELECT id, name FROM items ORDER BY id")
+    initial = watch.next(timeout_ms=1000)
+    assert initial["type"] == "initial"
+    assert initial["rows"] == []
+
+    conn.execute("INSERT INTO items (id, name) VALUES (?, ?)", (1, "Ada"))
+    event = watch.next(timeout_ms=1000)
+    assert event["type"] == "invalidate"
+    assert event["tables"] == ["items"]
+    assert event["row_changes"][0]["operation"] == "insert"
+    assert event["row_changes"][0]["primary_key"] == {"id": 1}
+    assert watch.next(timeout_ms=1) is None
+
+    watch.close()
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
 # Connection modes
 # ---------------------------------------------------------------------------
 

@@ -229,7 +229,7 @@ The current in-tree provider validation covers:
 ## Version introspection
 
 ```csharp
-uint abi = DecentDB.AbiVersion();       // e.g. 2
+uint abi = DecentDB.AbiVersion();       // e.g. 4
 string ver = DecentDB.EngineVersion();  // e.g. "2.0.0"
 
 // Via ADO.NET

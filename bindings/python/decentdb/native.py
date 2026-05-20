@@ -303,6 +303,44 @@ def load_library():
     if hasattr(_lib, "ddb_db_write_queue_metrics"):
         _lib.ddb_db_write_queue_metrics.argtypes = [c_void_p, POINTER(DdbWriteQueueMetrics)]
         _lib.ddb_db_write_queue_metrics.restype = c_uint32
+    if hasattr(_lib, "ddb_db_watch_table_json"):
+        _lib.ddb_db_watch_table_json.argtypes = [
+            c_void_p,
+            c_char_p,
+            POINTER(c_void_p),
+        ]
+        _lib.ddb_db_watch_table_json.restype = c_uint32
+    if hasattr(_lib, "ddb_db_watch_range_json"):
+        _lib.ddb_db_watch_range_json.argtypes = [
+            c_void_p,
+            c_char_p,
+            POINTER(c_void_p),
+        ]
+        _lib.ddb_db_watch_range_json.restype = c_uint32
+    if hasattr(_lib, "ddb_db_watch_query_json"):
+        _lib.ddb_db_watch_query_json.argtypes = [
+            c_void_p,
+            c_char_p,
+            POINTER(c_void_p),
+        ]
+        _lib.ddb_db_watch_query_json.restype = c_uint32
+    if hasattr(_lib, "ddb_db_change_stream_json"):
+        _lib.ddb_db_change_stream_json.argtypes = [
+            c_void_p,
+            c_char_p,
+            POINTER(c_void_p),
+        ]
+        _lib.ddb_db_change_stream_json.restype = c_uint32
+    if hasattr(_lib, "ddb_watch_next_json"):
+        _lib.ddb_watch_next_json.argtypes = [
+            c_void_p,
+            c_uint32,
+            POINTER(c_char_p),
+        ]
+        _lib.ddb_watch_next_json.restype = c_uint32
+    if hasattr(_lib, "ddb_watch_close"):
+        _lib.ddb_watch_close.argtypes = [POINTER(c_void_p)]
+        _lib.ddb_watch_close.restype = c_uint32
     _lib.ddb_evict_shared_wal.argtypes = [c_char_p]
     _lib.ddb_evict_shared_wal.restype = c_uint32
 

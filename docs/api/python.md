@@ -88,6 +88,27 @@ metrics = conn.write_queue_metrics()
 Queued writes preserve DecentDB's one-writer model and use strict group commit
 without weakening default durable acknowledgement semantics.
 
+### Reactive Subscriptions
+
+Python exposes reactive watch handles over the C ABI JSON event stream:
+
+```python
+conn = decentdb.connect("/tmp/app.ddb")
+conn.execute("CREATE TABLE items (id INT64 PRIMARY KEY, name TEXT)")
+
+watch = conn.watch_query("SELECT id, name FROM items ORDER BY id")
+initial = watch.next(timeout_ms=1000)      # {"type": "initial", ...}
+
+conn.execute("INSERT INTO items VALUES (?, ?)", (1, "Ada"))
+event = watch.next(timeout_ms=1000)        # {"type": "invalidate", ...}
+
+watch.close()
+```
+
+Available helpers are `watch_table(...)`, `watch_range(...)`,
+`watch_query(...)`, and `change_stream(...)`. `Watch.next(...)` returns `None`
+on timeout; `Watch.next_json(...)` returns the raw event JSON.
+
 ## Executing queries
 
 ```python
@@ -163,7 +184,7 @@ contract = conn.describe_query_contract(
 ## Version introspection
 
 ```python
-abi = decentdb.abi_version()        # e.g. 2
+abi = decentdb.abi_version()        # e.g. 4
 ver = decentdb.engine_version()     # e.g. "2.0.0"
 ```
 

@@ -18,6 +18,8 @@ SELECT * FROM sys.sync_status;
 SELECT * FROM sys.wal_metrics;
 SELECT * FROM sys.write_queue_metrics;
 SELECT * FROM sys.storage_metrics;
+SELECT * FROM sys.reactive_metrics;
+SELECT * FROM sys.reactive_subscriptions;
 ```
 
 Legacy `sys_sync_*` names remain for sync inspection compatibility:
@@ -136,12 +138,60 @@ Example:
 SELECT * FROM sys.storage_metrics;
 ```
 
+### `sys.reactive_metrics`
+
+One row describing in-process reactive subscription state.
+
+| Column | Type | Unit / meaning |
+|---|---|---|
+| `active_watch_count` | `INT64` | Active table, range, query, and change-stream watches. |
+| `table_watch_count` | `INT64` | Active table watches. |
+| `range_watch_count` | `INT64` | Active primary-key range watches. |
+| `query_watch_count` | `INT64` | Active query watches. |
+| `change_stream_count` | `INT64` | Active change streams. |
+| `events_published` | `INT64` | Commit events published by the reactive hub. |
+| `events_delivered` | `INT64` | Events delivered to watch queues without overflow. |
+| `events_dropped` | `INT64` | Events dropped because a watch queue lagged. |
+| `lagged_watch_count` | `INT64` | Watches currently marked lagged. |
+| `row_change_events_truncated` | `INT64` | Commit events whose row details were reduced to table invalidation. |
+
+Example:
+
+```sql
+SELECT * FROM sys.reactive_metrics;
+```
+
+### `sys.reactive_subscriptions`
+
+One row per active in-process watch.
+
+| Column | Type | Unit / meaning |
+|---|---|---|
+| `watch_id` | `INT64` | In-process watch identifier. |
+| `kind` | `TEXT` | `table`, `range`, `query`, or `change_stream`. |
+| `created_at_micros` | `INT64` | Watch creation timestamp in Unix microseconds. |
+| `queue_capacity` | `INT64` | Per-watch event queue capacity. |
+| `queue_depth` | `INT64` | Events currently waiting in the watch queue. |
+| `last_delivered_event_id` | `INT64` | Last event ID read by the watch handle. |
+| `dropped_events` | `INT64` | Events dropped for this watch because of queue overflow. |
+| `lagged` | `BOOL` | Whether the watch is currently lagged and must resynchronize. |
+| `dependencies_json` | `TEXT` | Watch dependency description as JSON. |
+
+Example:
+
+```sql
+SELECT * FROM sys.reactive_subscriptions ORDER BY watch_id;
+```
+
 ### Lifecycle and compatibility notes
 
 - `sys.write_queue_metrics` is a one-row snapshot of `Db::write_queue_metrics`
   and the C ABI `ddb_db_write_queue_metrics` values. Counter values are
   accumulated for the current database handle's lazy queue lifetime and reset
   when the database is reopened through a new handle.
+- `sys.reactive_metrics` and `sys.reactive_subscriptions` describe only
+  in-process watch handles. They are not durable changefeed state and reset
+  when the process exits.
 - `sys.storage_metrics` is a one-row snapshot equivalent to `Db::storage_info`
   for stable fields, and includes both database and WAL paths.
 - `sys.wal_metrics` is a one-row snapshot of internal WAL runtime counters such

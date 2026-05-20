@@ -373,6 +373,12 @@ type WriteQueueMetrics struct {
 	TotalQueueWaitNS    uint64
 }
 
+// Watch is an in-process reactive subscription handle.
+type Watch struct {
+	ptr    *C.ddb_watch_t
+	closed uint32
+}
+
 type closeHook func()
 
 var dbCloseHook atomic.Pointer[closeHook]
@@ -473,6 +479,27 @@ func (d *DB) InTransaction() bool { return d.c.InTransaction() }
 
 // ExecImmediate executes a SQL statement without parameters, returning JSON result info.
 func (d *DB) ExecImmediate(sqlText string) (string, error) { return d.c.ExecImmediate(sqlText) }
+
+// WatchTableJson subscribes to committed changes for one or more tables.
+func (d *DB) WatchTableJson(tables []string) (*Watch, error) {
+	return d.c.WatchTableJson(tables)
+}
+
+// WatchRangeJson subscribes to committed changes inside a primary-key JSON range.
+func (d *DB) WatchRangeJson(table string, lower any, upper any) (*Watch, error) {
+	return d.c.WatchRangeJson(table, lower, upper)
+}
+
+// WatchQueryJson subscribes to a SELECT query and receives an initial result
+// followed by invalidation events for dependent tables.
+func (d *DB) WatchQueryJson(sqlText string, params []any) (*Watch, error) {
+	return d.c.WatchQueryJson(sqlText, params)
+}
+
+// ChangeStreamJson subscribes to ordered committed change events.
+func (d *DB) ChangeStreamJson(tables []string) (*Watch, error) {
+	return d.c.ChangeStreamJson(tables)
+}
 
 // EvictSharedWAL evicts the shared WAL file for the given database path.
 func EvictSharedWAL(path string) error {
@@ -745,6 +772,165 @@ func (c *conn) writeQueueMetrics() (WriteQueueMetrics, error) {
 		PhysicalSyncsSaved:  uint64(cMetrics.physical_syncs_saved),
 		TotalQueueWaitNS:    uint64(cMetrics.total_queue_wait_ns),
 	}, nil
+}
+
+func newWatch(ptr *C.ddb_watch_t) *Watch {
+	watch := &Watch{ptr: ptr}
+	runtime.SetFinalizer(watch, func(w *Watch) {
+		_ = w.Close()
+	})
+	return watch
+}
+
+func watchTimeoutMillis(timeout time.Duration) C.uint32_t {
+	if timeout <= 0 {
+		return 0
+	}
+	ms := uint64(timeout.Milliseconds())
+	if ms == 0 {
+		ms = 1
+	}
+	max := uint64(^uint32(0))
+	if ms > max {
+		ms = max
+	}
+	return C.uint32_t(ms)
+}
+
+// NextJson returns the next watch event as JSON. ok is false when the timeout
+// expires without an event.
+func (w *Watch) NextJson(timeout time.Duration) (jsonText string, ok bool, err error) {
+	if w == nil || atomic.LoadUint32(&w.closed) == 1 || w.ptr == nil {
+		return "", false, driver.ErrBadConn
+	}
+	var ptr *C.char
+	status := C.ddb_watch_next_json(w.ptr, watchTimeoutMillis(timeout), &ptr)
+	if status == C.DDB_ERR_TIMEOUT {
+		return "", false, nil
+	}
+	if status != C.DDB_OK {
+		return "", false, statusError(status, "watch next")
+	}
+	defer freeAPIString(ptr)
+	return C.GoString(ptr), true, nil
+}
+
+// Next returns the next watch event decoded from JSON. ok is false when the
+// timeout expires without an event.
+func (w *Watch) Next(timeout time.Duration) (event map[string]any, ok bool, err error) {
+	jsonText, ok, err := w.NextJson(timeout)
+	if err != nil || !ok {
+		return nil, ok, err
+	}
+	if err := json.Unmarshal([]byte(jsonText), &event); err != nil {
+		return nil, false, err
+	}
+	return event, true, nil
+}
+
+// Close releases the native watch handle.
+func (w *Watch) Close() error {
+	if w == nil || !atomic.CompareAndSwapUint32(&w.closed, 0, 1) {
+		return nil
+	}
+	runtime.SetFinalizer(w, nil)
+	if w.ptr == nil {
+		return nil
+	}
+	ptr := w.ptr
+	status := C.ddb_watch_close(&ptr)
+	w.ptr = ptr
+	if status != C.DDB_OK {
+		return statusError(status, "watch close")
+	}
+	return nil
+}
+
+func (c *conn) watchRequestPayload(request map[string]any) (*C.char, func(), error) {
+	if c.db == nil {
+		return nil, nil, driver.ErrBadConn
+	}
+	payload, err := json.Marshal(request)
+	if err != nil {
+		return nil, nil, err
+	}
+	cPayload := C.CString(string(payload))
+	return cPayload, func() { C.free(unsafe.Pointer(cPayload)) }, nil
+}
+
+func (c *conn) WatchTableJson(tables []string) (*Watch, error) {
+	cPayload, cleanup, err := c.watchRequestPayload(map[string]any{"tables": tables})
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
+	var watch *C.ddb_watch_t
+	status := C.ddb_db_watch_table_json(c.db, cPayload, &watch)
+	if status != C.DDB_OK || watch == nil {
+		return nil, statusError(status, "watch create")
+	}
+	return newWatch(watch), nil
+}
+
+func (c *conn) WatchRangeJson(table string, lower any, upper any) (*Watch, error) {
+	request := map[string]any{
+		"table":           table,
+		"lower_inclusive": true,
+		"upper_inclusive": true,
+	}
+	if lower != nil {
+		request["lower"] = lower
+	}
+	if upper != nil {
+		request["upper"] = upper
+	}
+	cPayload, cleanup, err := c.watchRequestPayload(request)
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
+	var watch *C.ddb_watch_t
+	status := C.ddb_db_watch_range_json(c.db, cPayload, &watch)
+	if status != C.DDB_OK || watch == nil {
+		return nil, statusError(status, "watch create")
+	}
+	return newWatch(watch), nil
+}
+
+func (c *conn) WatchQueryJson(sqlText string, params []any) (*Watch, error) {
+	request := map[string]any{"sql": sqlText}
+	if params != nil {
+		request["params"] = params
+	}
+	cPayload, cleanup, err := c.watchRequestPayload(request)
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
+	var watch *C.ddb_watch_t
+	status := C.ddb_db_watch_query_json(c.db, cPayload, &watch)
+	if status != C.DDB_OK || watch == nil {
+		return nil, statusError(status, "watch create")
+	}
+	return newWatch(watch), nil
+}
+
+func (c *conn) ChangeStreamJson(tables []string) (*Watch, error) {
+	request := map[string]any{}
+	if tables != nil {
+		request["tables"] = tables
+	}
+	cPayload, cleanup, err := c.watchRequestPayload(request)
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
+	var watch *C.ddb_watch_t
+	status := C.ddb_db_change_stream_json(c.db, cPayload, &watch)
+	if status != C.DDB_OK || watch == nil {
+		return nil, statusError(status, "watch create")
+	}
+	return newWatch(watch), nil
 }
 
 func (c *conn) execQueuedNamed(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {

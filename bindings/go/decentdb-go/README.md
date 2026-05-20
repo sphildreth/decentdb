@@ -55,6 +55,26 @@ If write queue mode is not configured, these helpers return `ErrQueueClosed`.
 
 where `dbDirect` is the custom binding type returned by `OpenDirect(...)` or a direct queue-enabled handle.
 
+## Reactive subscriptions
+
+Direct handles expose reactive watches:
+
+```go
+watch, err := dbDirect.WatchQueryJson("SELECT id, name FROM users ORDER BY id", nil)
+if err != nil { ... }
+defer watch.Close()
+
+event, ok, err := watch.Next(time.Second)
+if err != nil { ... }
+if ok && event["type"] == "initial" {
+    // initial rows are in the JSON event payload
+}
+```
+
+Use `WatchTableJson`, `WatchRangeJson`, `WatchQueryJson`, or
+`ChangeStreamJson`. `Watch.NextJson` returns the raw event JSON when callers
+prefer to decode into their own structs.
+
 ## Validation
 
 Run the Go binding test suite, including the strict cgo pointer checker:

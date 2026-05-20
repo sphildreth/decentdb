@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestAbiVersion(t *testing.T) {
@@ -22,6 +23,51 @@ func TestEngineVersion(t *testing.T) {
 	}
 	if !strings.Contains(ver, ".") {
 		t.Fatalf("EngineVersion() = %q, expected semver-like string", ver)
+	}
+}
+
+func TestOpenDirect_ReactiveQueryWatch(t *testing.T) {
+	tmp := filepath.Join(t.TempDir(), "reactive.ddb")
+	db, err := OpenDirect(tmp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if _, err := db.Exec("CREATE TABLE items (id INT64 PRIMARY KEY, name TEXT)"); err != nil {
+		t.Fatal(err)
+	}
+
+	watch, err := db.WatchQueryJson("SELECT id, name FROM items ORDER BY id", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer watch.Close()
+
+	initial, ok, err := watch.Next(1 * time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || initial["type"] != "initial" {
+		t.Fatalf("unexpected initial event: ok=%v event=%v", ok, initial)
+	}
+
+	if _, err := db.Exec("INSERT INTO items (id, name) VALUES ($1, $2)", 1, "Ada"); err != nil {
+		t.Fatal(err)
+	}
+	event, ok, err := watch.Next(1 * time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || event["type"] != "invalidate" {
+		t.Fatalf("unexpected invalidation event: ok=%v event=%v", ok, event)
+	}
+	tables, ok := event["tables"].([]any)
+	if !ok || len(tables) != 1 || tables[0] != "items" {
+		t.Fatalf("unexpected tables: %v", event["tables"])
+	}
+	if _, ok, err := watch.Next(1 * time.Millisecond); err != nil || ok {
+		t.Fatalf("expected timeout after draining events, ok=%v err=%v", ok, err)
 	}
 }
 

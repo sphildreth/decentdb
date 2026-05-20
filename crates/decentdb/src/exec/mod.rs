@@ -1364,6 +1364,8 @@ pub(crate) struct EngineRuntime {
     manifest_chain_cache: Option<OverflowChainCache>,
     sync_capture_active: bool,
     pub(crate) sync_mutations: Vec<crate::sync::SyncMutation>,
+    reactive_capture_active: bool,
+    pub(crate) reactive_mutations: Vec<crate::reactive::RowChange>,
 }
 
 #[derive(Debug)]
@@ -1541,6 +1543,8 @@ impl Clone for EngineRuntime {
             manifest_chain_cache: None,
             sync_capture_active: self.sync_capture_active,
             sync_mutations: self.sync_mutations.clone(),
+            reactive_capture_active: self.reactive_capture_active,
+            reactive_mutations: self.reactive_mutations.clone(),
         }
     }
 }
@@ -1582,6 +1586,8 @@ impl EngineRuntime {
             manifest_chain_cache: None,
             sync_capture_active: false,
             sync_mutations: Vec::new(),
+            reactive_capture_active: false,
+            reactive_mutations: Vec::new(),
         }
     }
 
@@ -1592,12 +1598,19 @@ impl EngineRuntime {
         }
     }
 
+    pub(crate) fn set_reactive_capture_active(&mut self, active: bool) {
+        self.reactive_capture_active = active;
+        if !active {
+            self.reactive_mutations.clear();
+        }
+    }
+
     pub(crate) fn sync_capture_active(&self) -> bool {
         self.sync_capture_active
     }
 
     pub(crate) fn should_record_sync_mutation_for_table(&self, table: &TableSchema) -> bool {
-        self.sync_capture_active
+        (self.sync_capture_active || self.reactive_capture_active)
             && !table.temporary
             && !crate::sync::is_internal_table_name(&table.name)
     }
@@ -1610,20 +1623,33 @@ impl EngineRuntime {
         after: Option<serde_json::Value>,
         schema_cookie: u32,
     ) {
-        if !self.sync_capture_active {
-            return;
+        if self.sync_capture_active {
+            self.sync_mutations.push(crate::sync::SyncMutation {
+                table: table_name.to_string(),
+                operation,
+                primary_key: primary_key.clone(),
+                after: after.clone(),
+                schema_cookie,
+            });
         }
-        self.sync_mutations.push(crate::sync::SyncMutation {
-            table: table_name.to_string(),
-            operation,
-            primary_key,
-            after,
-            schema_cookie,
-        });
+        if self.reactive_capture_active {
+            self.reactive_mutations
+                .push(crate::reactive::RowChange::new(
+                    table_name.to_string(),
+                    crate::reactive::row_operation_from_sync(operation),
+                    primary_key,
+                    None,
+                    after,
+                ));
+        }
     }
 
     pub(crate) fn take_sync_mutations(&mut self) -> Vec<crate::sync::SyncMutation> {
         std::mem::take(&mut self.sync_mutations)
+    }
+
+    pub(crate) fn take_reactive_mutations(&mut self) -> Vec<crate::reactive::RowChange> {
+        std::mem::take(&mut self.reactive_mutations)
     }
 
     pub(super) fn bump_temp_schema_cookie(&mut self) {

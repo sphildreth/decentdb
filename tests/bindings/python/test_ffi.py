@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import ctypes
+import json
 import os
 import tempfile
 from pathlib import Path
@@ -77,6 +78,8 @@ def load_library():
 
     lib = ctypes.CDLL(str(LIB_PATH))
     lib.ddb_last_error_message.restype = ctypes.c_char_p
+    lib.ddb_string_free.argtypes = [ctypes.POINTER(ctypes.c_char_p)]
+    lib.ddb_string_free.restype = ctypes.c_uint32
 
     lib.ddb_db_open_or_create.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p)]
     lib.ddb_db_open_or_create.restype = ctypes.c_uint32
@@ -104,6 +107,20 @@ def load_library():
         ctypes.POINTER(DdbWriteQueueMetrics),
     ]
     lib.ddb_db_write_queue_metrics.restype = ctypes.c_uint32
+    lib.ddb_db_watch_query_json.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_char_p,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    lib.ddb_db_watch_query_json.restype = ctypes.c_uint32
+    lib.ddb_watch_next_json.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_char_p),
+    ]
+    lib.ddb_watch_next_json.restype = ctypes.c_uint32
+    lib.ddb_watch_close.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
+    lib.ddb_watch_close.restype = ctypes.c_uint32
     lib.ddb_db_begin_transaction.argtypes = [ctypes.c_void_p]
     lib.ddb_db_begin_transaction.restype = ctypes.c_uint32
     lib.ddb_db_commit_transaction.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint64)]
@@ -160,6 +177,18 @@ def make_text(value: str):
 def copied_text(ffi_value: DdbValue) -> str:
     buffer = ctypes.string_at(ffi_value.data, ffi_value.len)
     return buffer.decode("utf-8")
+
+
+def watch_event(lib, watch, timeout_ms=1000):
+    out = ctypes.c_char_p()
+    status = lib.ddb_watch_next_json(watch, timeout_ms, ctypes.byref(out))
+    if status == DDB_ERR_TIMEOUT:
+        return None
+    check(lib, status, "watch next")
+    try:
+        return json.loads(out.value.decode("utf-8"))
+    finally:
+        check(lib, lib.ddb_string_free(ctypes.byref(out)), "free watch event")
 
 
 def run() -> None:
@@ -267,6 +296,41 @@ def run() -> None:
     assert metrics.committed == 1
     assert metrics.failed == 0
 
+    watch = ctypes.c_void_p()
+    request = json.dumps({"sql": "SELECT id, name FROM items ORDER BY id"}).encode("utf-8")
+    check(
+        lib,
+        lib.ddb_db_watch_query_json(db, request, ctypes.byref(watch)),
+        "watch query",
+    )
+    initial = watch_event(lib, watch)
+    assert initial["type"] == "initial"
+    assert initial["rows"] == [[2, "Grace"], [3, "Queue"]]
+
+    text_param, text_backing = make_text("Watch")
+    params = (DdbValue * 2)(make_int64(4), text_param)
+    check(
+        lib,
+        lib.ddb_db_execute(
+            db,
+            b"INSERT INTO items (id, name) VALUES ($1, $2)",
+            params,
+            2,
+            ctypes.byref(result),
+        ),
+        "watch insert",
+    )
+    check(lib, lib.ddb_result_free(ctypes.byref(result)), "free watch insert result")
+    del text_backing
+
+    invalidate = watch_event(lib, watch)
+    assert invalidate["type"] == "invalidate"
+    assert invalidate["tables"] == ["items"]
+    assert invalidate["row_changes"][0]["operation"] == "insert"
+    assert watch_event(lib, watch, timeout_ms=1) is None
+    check(lib, lib.ddb_watch_close(ctypes.byref(watch)), "watch close")
+    assert not watch.value
+
     check(
         lib,
         lib.ddb_db_execute(
@@ -282,7 +346,7 @@ def run() -> None:
     column_count = ctypes.c_size_t()
     check(lib, lib.ddb_result_row_count(result, ctypes.byref(row_count)), "row count")
     check(lib, lib.ddb_result_column_count(result, ctypes.byref(column_count)), "column count")
-    assert row_count.value == 2
+    assert row_count.value == 3
     assert column_count.value == 2
 
     value = DdbValue()

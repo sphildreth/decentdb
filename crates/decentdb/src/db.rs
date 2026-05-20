@@ -33,6 +33,11 @@ use crate::metadata::{
     SchemaTriggerInfo, SchemaViewInfo, StorageInfo, TableInfo, ToolingMetadata, TriggerInfo,
     ViewInfo,
 };
+use crate::reactive::{
+    ChangeSource, ChangeStreamOptions, PendingReactiveCommit, QueryWatchOptions, RangeWatchOptions,
+    ReactiveHub, ReactiveMetricsSnapshot, ReactiveSubscriptionSnapshot, TableWatchOptions,
+    WatchHandle,
+};
 use crate::record::overflow::read_overflow;
 use crate::record::value::{
     format_cidr, format_date_days, format_interval, format_ip_addr, format_mac_addr,
@@ -332,6 +337,7 @@ struct DbInner {
     prepared_insert_cache: Mutex<PreparedInsertCache>,
     held_snapshots: Mutex<HashMap<u64, ReaderGuard>>,
     sync_ctx: SyncContext,
+    reactive_hub: Arc<ReactiveHub>,
     read_only_paged_row_source_residency: Mutex<ReadOnlyPagedRowSourceResidency>,
     write_queue: OnceLock<WriteQueue>,
 }
@@ -1424,6 +1430,79 @@ impl Db {
         self.write_queue().snapshot()
     }
 
+    /// Subscribes to committed changes for one or more persistent user tables.
+    pub fn watch_table(&self, options: TableWatchOptions) -> Result<WatchHandle> {
+        let tables = self.validate_watch_tables(&options.tables)?;
+        self.inner.reactive_hub.watch_table(
+            tables,
+            options.queue_capacity,
+            self.inner.wal.latest_snapshot(),
+            self.schema_cookie()?,
+        )
+    }
+
+    /// Subscribes to committed changes intersecting a primary-key range.
+    pub fn watch_range(&self, mut options: RangeWatchOptions) -> Result<WatchHandle> {
+        let canonical = self.validate_watch_range_table(&options.table)?;
+        options.table = canonical;
+        self.inner.reactive_hub.watch_range(
+            options,
+            self.inner.wal.latest_snapshot(),
+            self.schema_cookie()?,
+        )
+    }
+
+    /// Executes a SELECT and subscribes to invalidations for its dependencies.
+    pub fn watch_query(
+        &self,
+        sql: &str,
+        params: &[Value],
+        options: QueryWatchOptions,
+    ) -> Result<WatchHandle> {
+        let statement = self.parsed_statement(sql)?;
+        if !statement_is_read_only(&statement) {
+            return Err(DbError::sql(
+                "query subscriptions require a read-only SELECT",
+            ));
+        }
+        let dependencies = self.query_watch_dependencies(&statement)?;
+        let result = self.execute_with_params(sql, params)?;
+        self.inner.reactive_hub.watch_query(
+            dependencies,
+            options.queue_capacity,
+            self.inner.wal.latest_snapshot(),
+            self.schema_cookie()?,
+            result,
+        )
+    }
+
+    /// Subscribes to ordered committed change events.
+    pub fn change_stream(&self, options: ChangeStreamOptions) -> Result<WatchHandle> {
+        let tables = if options.tables.is_empty() {
+            None
+        } else {
+            Some(self.validate_watch_tables(&options.tables)?)
+        };
+        self.inner.reactive_hub.change_stream(
+            tables,
+            options.queue_capacity,
+            self.inner.wal.latest_snapshot(),
+            self.schema_cookie()?,
+        )
+    }
+
+    /// Returns current reactive subscription counters.
+    #[must_use]
+    pub fn reactive_metrics(&self) -> ReactiveMetricsSnapshot {
+        self.inner.reactive_hub.metrics_snapshot()
+    }
+
+    /// Returns current reactive subscription details.
+    #[must_use]
+    pub fn reactive_subscriptions(&self) -> Vec<ReactiveSubscriptionSnapshot> {
+        self.inner.reactive_hub.subscription_snapshots()
+    }
+
     /// Executes one or more read-only SQL statements against a retained WAL LSN.
     pub fn execute_batch_at_snapshot_lsn(
         &self,
@@ -1762,7 +1841,9 @@ impl Db {
             .join("\n");
         if !sql.trim().is_empty() {
             if target_ref == crate::branch::DEFAULT_BRANCH_NAME {
-                self.execute_batch(&sql)?;
+                crate::reactive::with_change_source(ChangeSource::BranchMerge, || {
+                    self.execute_batch(&sql)
+                })?;
             } else {
                 self.execute_batch_on_branch(&sql, target_ref)?;
             }
@@ -2535,6 +2616,7 @@ impl Db {
             EngineRuntime::load_from_storage(&pager, &wal, schema_cookie, &effective_config)?;
         let catalog = CatalogHandle::new(runtime.catalog.as_ref().clone());
         let last_seen_checkpoint_epoch = wal.checkpoint_epoch();
+        let reactive_hub = crate::reactive::acquire_hub(open_lock_key.clone(), &effective_config);
 
         let db = Self {
             inner: Arc::new(DbInner {
@@ -2558,6 +2640,7 @@ impl Db {
                 prepared_insert_cache: Mutex::new(PreparedInsertCache::default()),
                 held_snapshots: Mutex::new(HashMap::new()),
                 sync_ctx: SyncContext::new(&path),
+                reactive_hub,
                 read_only_paged_row_source_residency: Mutex::new(
                     ReadOnlyPagedRowSourceResidency::default(),
                 ),
@@ -3551,6 +3634,7 @@ impl Db {
             }
         };
         runtime.rebuild_stale_indexes(self.inner.config.page_size)?;
+        let reactive_pending = self.take_reactive_pending_commit(&mut runtime);
         self.begin_write()?;
         if let Err(error) = runtime.persist_to_db(self) {
             let _ = self.rollback();
@@ -3576,6 +3660,7 @@ impl Db {
             .writer_last_commit_lsn
             .store(committed_lsn, Ordering::Release);
         drop(runtime);
+        self.publish_reactive_commit(reactive_pending, committed_lsn);
         self.redefer_persisted_tables_after_write(&table_refs)?;
         Ok(result)
     }
@@ -3618,6 +3703,7 @@ impl Db {
             }
         };
         runtime.rebuild_stale_indexes(self.inner.config.page_size)?;
+        let reactive_pending = self.take_reactive_pending_commit(&mut runtime);
         self.begin_write()?;
         if let Err(error) = runtime.persist_to_db(self) {
             let _ = self.rollback();
@@ -3643,6 +3729,7 @@ impl Db {
             .writer_last_commit_lsn
             .store(committed_lsn, Ordering::Release);
         drop(runtime);
+        self.publish_reactive_commit(reactive_pending, committed_lsn);
         self.redefer_persisted_tables_after_write(&[prepared_update.table_name.as_str()])?;
         Ok(result)
     }
@@ -3687,6 +3774,7 @@ impl Db {
             }
         };
         runtime.rebuild_stale_indexes(self.inner.config.page_size)?;
+        let reactive_pending = self.take_reactive_pending_commit(&mut runtime);
         self.begin_write()?;
         if let Err(error) = runtime.persist_to_db(self) {
             let _ = self.rollback();
@@ -3710,6 +3798,7 @@ impl Db {
             .writer_last_commit_lsn
             .store(committed_lsn, Ordering::Release);
         drop(runtime);
+        self.publish_reactive_commit(reactive_pending, committed_lsn);
         self.redefer_persisted_tables_after_write(&table_names)?;
         Ok(result)
     }
@@ -3767,6 +3856,7 @@ impl Db {
             }
         };
         runtime.rebuild_stale_indexes(self.inner.config.page_size)?;
+        let reactive_pending = self.take_reactive_pending_commit(&mut runtime);
         self.begin_write()?;
         if let Err(error) = runtime.persist_to_db(self) {
             let _ = self.rollback();
@@ -3790,6 +3880,7 @@ impl Db {
             .writer_last_commit_lsn
             .store(committed_lsn, Ordering::Release);
         drop(runtime);
+        self.publish_reactive_commit(reactive_pending, committed_lsn);
         self.redefer_persisted_tables_after_write(table_refs)?;
         Ok(Some(result))
     }
@@ -3849,6 +3940,7 @@ impl Db {
             }
         };
         runtime.rebuild_stale_indexes(self.inner.config.page_size)?;
+        let reactive_pending = self.take_reactive_pending_commit(&mut runtime);
         self.begin_write()?;
         if let Err(error) = runtime.persist_to_db(self) {
             let _ = self.rollback();
@@ -3872,6 +3964,7 @@ impl Db {
             .writer_last_commit_lsn
             .store(committed_lsn, Ordering::Release);
         drop(runtime);
+        self.publish_reactive_commit(reactive_pending, committed_lsn);
         self.redefer_persisted_tables_after_write(table_refs)?;
         Ok(Some(QueryResult::with_affected_rows(affected)))
     }
@@ -3911,6 +4004,7 @@ impl Db {
             }
         };
         runtime.rebuild_stale_indexes(self.inner.config.page_size)?;
+        let reactive_pending = self.take_reactive_pending_commit(&mut runtime);
         self.begin_write()?;
         if let Err(error) = runtime.persist_to_db(self) {
             let _ = self.rollback();
@@ -3940,6 +4034,7 @@ impl Db {
             .writer_last_commit_lsn
             .store(committed_lsn, Ordering::Release);
         drop(runtime);
+        self.publish_reactive_commit(reactive_pending, committed_lsn);
         self.redefer_persisted_tables_after_write(&[prepared_update.table_name.as_str()])?;
         Ok(Some(result))
     }
@@ -3981,6 +4076,7 @@ impl Db {
             }
         };
         runtime.rebuild_stale_indexes(self.inner.config.page_size)?;
+        let reactive_pending = self.take_reactive_pending_commit(&mut runtime);
         self.begin_write()?;
         if let Err(error) = runtime.persist_to_db(self) {
             let _ = self.rollback();
@@ -4010,6 +4106,7 @@ impl Db {
             .writer_last_commit_lsn
             .store(committed_lsn, Ordering::Release);
         drop(runtime);
+        self.publish_reactive_commit(reactive_pending, committed_lsn);
         self.redefer_persisted_tables_after_write(&table_names)?;
         Ok(Some(result))
     }
@@ -4032,6 +4129,7 @@ impl Db {
             }
         };
         runtime.rebuild_stale_indexes(self.inner.config.page_size)?;
+        let reactive_pending = self.take_reactive_pending_commit(&mut runtime);
         self.begin_write()?;
         if let Err(error) = runtime.persist_to_db(self) {
             let _ = self.rollback();
@@ -4060,6 +4158,8 @@ impl Db {
         self.inner
             .writer_last_commit_lsn
             .store(committed_lsn, Ordering::Release);
+        drop(runtime);
+        self.publish_reactive_commit(reactive_pending, committed_lsn);
         Ok(result)
     }
 
@@ -4469,6 +4569,7 @@ impl Db {
                 .runtime
                 .rebuild_stale_indexes(self.inner.config.page_size)?;
         }
+        let reactive_pending = self.take_reactive_pending_commit(&mut state.runtime);
         self.begin_write()?;
         if let Err(error) = state.runtime.persist_to_db(self) {
             let _ = self.rollback();
@@ -4501,6 +4602,8 @@ impl Db {
         self.inner
             .writer_last_commit_lsn
             .store(committed_lsn, Ordering::Release);
+        drop(state);
+        self.publish_reactive_commit(reactive_pending, committed_lsn);
         Ok(committed_lsn)
     }
 
@@ -4519,6 +4622,7 @@ impl Db {
         if rebuild_stale_indexes {
             runtime.rebuild_stale_indexes(self.inner.config.page_size)?;
         }
+        let reactive_pending = self.take_reactive_pending_commit(&mut runtime);
         self.begin_write()?;
         if let Err(error) = runtime.persist_to_db(self) {
             let _ = self.rollback();
@@ -4559,6 +4663,7 @@ impl Db {
             .writer_last_commit_lsn
             .store(committed_lsn, Ordering::Release);
         drop(guard);
+        self.publish_reactive_commit(reactive_pending, committed_lsn);
 
         Ok(committed_lsn)
     }
@@ -4576,6 +4681,107 @@ impl Db {
         self.refresh_engine_from_snapshot(snapshot_lsn)?;
         drop(reader);
         Ok((self.engine_snapshot()?, Some(snapshot_lsn)))
+    }
+
+    fn validate_watch_tables(&self, tables: &[String]) -> Result<BTreeSet<String>> {
+        if tables.is_empty() {
+            return Err(DbError::sql("watch table list must not be empty"));
+        }
+        let runtime = self
+            .inner
+            .engine
+            .read()
+            .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+        let mut canonical = BTreeSet::new();
+        for table in tables {
+            let schema = runtime
+                .catalog
+                .table(table)
+                .ok_or_else(|| DbError::sql(format!("unknown watch table {table}")))?;
+            if schema.temporary || crate::sync::is_internal_table_name(&schema.name) {
+                return Err(DbError::sql(format!(
+                    "table {} is not watchable",
+                    schema.name
+                )));
+            }
+            canonical.insert(schema.name.clone());
+        }
+        Ok(canonical)
+    }
+
+    fn validate_watch_range_table(&self, table: &str) -> Result<String> {
+        let runtime = self
+            .inner
+            .engine
+            .read()
+            .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+        let schema = runtime
+            .catalog
+            .table(table)
+            .ok_or_else(|| DbError::sql(format!("unknown watch table {table}")))?;
+        if schema.temporary || crate::sync::is_internal_table_name(&schema.name) {
+            return Err(DbError::sql(format!(
+                "table {} is not watchable",
+                schema.name
+            )));
+        }
+        if schema.primary_key_columns.is_empty() {
+            return Err(DbError::sql(format!(
+                "range watch requires a primary key on table {}",
+                schema.name
+            )));
+        }
+        Ok(schema.name.clone())
+    }
+
+    fn query_watch_dependencies(
+        &self,
+        statement: &crate::sql::ast::Statement,
+    ) -> Result<BTreeSet<String>> {
+        let referenced = crate::sql::ast::safe_referenced_tables(statement)
+            .ok_or_else(|| DbError::sql("query dependencies are not watchable for this SELECT"))?;
+        let runtime = self
+            .inner
+            .engine
+            .read()
+            .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+        let mut dependencies = BTreeSet::new();
+        for name in referenced {
+            if let Some(table) = runtime.catalog.table(&name) {
+                if table.temporary || crate::sync::is_internal_table_name(&table.name) {
+                    return Err(DbError::sql(format!(
+                        "table {} is not watchable",
+                        table.name
+                    )));
+                }
+                dependencies.insert(table.name.clone());
+            } else if let Some(view) = runtime.catalog.view(&name) {
+                if view.temporary || crate::sync::is_internal_table_name(&view.name) {
+                    return Err(DbError::sql(format!("view {} is not watchable", view.name)));
+                }
+                for dependency in &view.dependencies {
+                    let table = runtime.catalog.table(dependency).ok_or_else(|| {
+                        DbError::sql(format!(
+                            "view {} depends on unknown table {}",
+                            view.name, dependency
+                        ))
+                    })?;
+                    if !table.temporary && !crate::sync::is_internal_table_name(&table.name) {
+                        dependencies.insert(table.name.clone());
+                    }
+                }
+            } else {
+                return Err(DbError::sql(format!(
+                    "query dependency {name} is not a watchable table or view"
+                )));
+            }
+        }
+        if dependencies.is_empty() {
+            return Err(DbError::sql(
+                "query subscription has no watchable table dependencies",
+            ));
+        }
+        Ok(dependencies)
     }
 
     fn ensure_inspection_table_row_source(
@@ -7281,7 +7487,7 @@ impl Db {
             self.sync_upsert_metadata(&peer_watermark_key(replica_id), &watermark.to_string())?;
         }
 
-        tx.commit()?;
+        crate::reactive::with_change_source(ChangeSource::SyncApply, || tx.commit())?;
         Ok(SyncImportSummary {
             seen: batch.record_count,
             applied,
@@ -8515,6 +8721,10 @@ impl Db {
                 self.write_queue_metrics_query_result().map(Some)
             }
             SyncInspectionQuery::StorageMetrics => self.storage_metrics_query_result().map(Some),
+            SyncInspectionQuery::ReactiveMetrics => self.reactive_metrics_query_result().map(Some),
+            SyncInspectionQuery::ReactiveSubscriptions => {
+                self.reactive_subscriptions_query_result().map(Some)
+            }
             SyncInspectionQuery::Peers => self.sync_peers_query_result().map(Some),
             SyncInspectionQuery::Retention => self.sync_retention_query_result().map(Some),
             SyncInspectionQuery::PeerLag => self.sync_peer_lag_query_result().map(Some),
@@ -8665,6 +8875,76 @@ impl Db {
                 sync_u64_to_i64(storage.warning_count as u64, "warning_count")?,
                 Value::Bool(storage.shared_wal),
             ])],
+        ))
+    }
+
+    fn reactive_metrics_query_result(&self) -> Result<QueryResult> {
+        let metrics = self.reactive_metrics();
+        Ok(QueryResult::with_rows(
+            vec![
+                "active_watch_count".to_string(),
+                "table_watch_count".to_string(),
+                "range_watch_count".to_string(),
+                "query_watch_count".to_string(),
+                "change_stream_count".to_string(),
+                "events_published".to_string(),
+                "events_delivered".to_string(),
+                "events_dropped".to_string(),
+                "lagged_watch_count".to_string(),
+                "row_change_events_truncated".to_string(),
+            ],
+            vec![QueryRow::new(vec![
+                sync_usize_to_i64(metrics.active_watch_count, "active_watch_count")?,
+                sync_usize_to_i64(metrics.table_watch_count, "table_watch_count")?,
+                sync_usize_to_i64(metrics.range_watch_count, "range_watch_count")?,
+                sync_usize_to_i64(metrics.query_watch_count, "query_watch_count")?,
+                sync_usize_to_i64(metrics.change_stream_count, "change_stream_count")?,
+                sync_u64_to_i64(metrics.events_published, "events_published")?,
+                sync_u64_to_i64(metrics.events_delivered, "events_delivered")?,
+                sync_u64_to_i64(metrics.events_dropped, "events_dropped")?,
+                sync_usize_to_i64(metrics.lagged_watch_count, "lagged_watch_count")?,
+                sync_u64_to_i64(
+                    metrics.row_change_events_truncated,
+                    "row_change_events_truncated",
+                )?,
+            ])],
+        ))
+    }
+
+    fn reactive_subscriptions_query_result(&self) -> Result<QueryResult> {
+        let rows = self
+            .reactive_subscriptions()
+            .into_iter()
+            .map(|subscription| {
+                Ok(QueryRow::new(vec![
+                    sync_u64_to_i64(subscription.watch_id, "watch_id")?,
+                    Value::Text(subscription.kind.as_str().to_string()),
+                    Value::Int64(subscription.created_at_micros),
+                    sync_usize_to_i64(subscription.queue_capacity, "queue_capacity")?,
+                    sync_usize_to_i64(subscription.queue_depth, "queue_depth")?,
+                    sync_u64_to_i64(
+                        subscription.last_delivered_event_id,
+                        "last_delivered_event_id",
+                    )?,
+                    sync_u64_to_i64(subscription.dropped_events, "dropped_events")?,
+                    Value::Bool(subscription.lagged),
+                    Value::Text(subscription.dependencies_json),
+                ]))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(QueryResult::with_rows(
+            vec![
+                "watch_id".to_string(),
+                "kind".to_string(),
+                "created_at_micros".to_string(),
+                "queue_capacity".to_string(),
+                "queue_depth".to_string(),
+                "last_delivered_event_id".to_string(),
+                "dropped_events".to_string(),
+                "lagged".to_string(),
+                "dependencies_json".to_string(),
+            ],
+            rows,
         ))
     }
 
@@ -9089,9 +9369,56 @@ impl Db {
         Ok(())
     }
 
+    fn take_reactive_pending_commit(
+        &self,
+        runtime: &mut EngineRuntime,
+    ) -> Option<PendingReactiveCommit> {
+        if !self.inner.reactive_hub.has_watchers() {
+            let _ = runtime.take_reactive_mutations();
+            return None;
+        }
+        let mut changed = runtime
+            .dirty_tables
+            .iter()
+            .filter(|table| !crate::sync::is_internal_table_name(table))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let mut row_changes = runtime.take_reactive_mutations();
+        for change in &row_changes {
+            changed.insert(change.table.clone());
+        }
+        let schema_changed = match self.inner.catalog.schema_cookie() {
+            Ok(cookie) => cookie != runtime.catalog.schema_cookie,
+            Err(_) => false,
+        };
+        if changed.is_empty() && row_changes.is_empty() && !schema_changed {
+            return None;
+        }
+        let max_rows = self.inner.reactive_hub.max_row_changes_per_event();
+        let row_changes_truncated = max_rows > 0 && row_changes.len() > max_rows;
+        if row_changes_truncated {
+            row_changes.clear();
+        }
+        Some(PendingReactiveCommit {
+            source: crate::reactive::current_change_source(),
+            schema_cookie: runtime.catalog.schema_cookie,
+            changed_tables: changed.into_iter().collect(),
+            row_changes,
+            row_changes_truncated,
+            schema_changed,
+        })
+    }
+
+    fn publish_reactive_commit(&self, pending: Option<PendingReactiveCommit>, committed_lsn: u64) {
+        if let Some(pending) = pending {
+            self.inner.reactive_hub.publish(pending, committed_lsn);
+        }
+    }
+
     fn configure_runtime_sync_capture(&self, runtime: &mut EngineRuntime) -> Result<()> {
         let active = self.runtime_sync_capture_should_be_active(runtime)?;
         runtime.set_sync_capture_active(active);
+        runtime.set_reactive_capture_active(self.inner.reactive_hub.has_watchers());
         Ok(())
     }
 
@@ -9156,6 +9483,8 @@ enum SyncInspectionQuery {
     WalMetrics,
     WriteQueueMetrics,
     StorageMetrics,
+    ReactiveMetrics,
+    ReactiveSubscriptions,
     Peers,
     Retention,
     PeerLag,
@@ -9183,6 +9512,14 @@ impl SyncInspectionQuery {
             "select * from sys.wal_metrics" => Some(Self::WalMetrics),
             "select * from sys.write_queue_metrics" => Some(Self::WriteQueueMetrics),
             "select * from sys.storage_metrics" => Some(Self::StorageMetrics),
+            "select * from sys.reactive_metrics" => Some(Self::ReactiveMetrics),
+            "select * from sys.reactive_subscriptions" => Some(Self::ReactiveSubscriptions),
+            "select * from sys.reactive_subscriptions order by watch_id" => {
+                Some(Self::ReactiveSubscriptions)
+            }
+            "select * from sys.reactive_subscriptions order by watch_id asc" => {
+                Some(Self::ReactiveSubscriptions)
+            }
             "select * from sys_sync_peers" => Some(Self::Peers),
             "select * from sys_sync_peers order by name" => Some(Self::Peers),
             "select * from sys_sync_peers order by name asc" => Some(Self::Peers),

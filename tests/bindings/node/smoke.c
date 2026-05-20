@@ -61,6 +61,44 @@ static napi_value run_smoke(napi_env env, napi_callback_info info) {
   if (metrics.admitted != 1 || metrics.committed != 1 || metrics.failed != 0) {
     return fail(env, "unexpected queue metrics");
   }
+  ddb_watch_t *watch = NULL;
+  char *watch_event = NULL;
+  if (!check(ddb_db_watch_query_json(
+                 db, "{\"sql\":\"SELECT id, name FROM smoke ORDER BY id\"}",
+                 &watch),
+             error, sizeof(error), "watch query")) {
+    return fail(env, error);
+  }
+  if (!check(ddb_watch_next_json(watch, 1000, &watch_event), error,
+             sizeof(error), "watch initial")) {
+    return fail(env, error);
+  }
+  if (strstr(watch_event, "\"type\":\"initial\"") == NULL) {
+    return fail(env, "unexpected initial watch event");
+  }
+  ddb_string_free(&watch_event);
+  if (!check(ddb_db_execute(
+                 db, "INSERT INTO smoke (id, name) VALUES (3, 'node-watch')",
+                 NULL, 0, &result),
+             error, sizeof(error), "watch insert")) {
+    return fail(env, error);
+  }
+  ddb_result_free(&result);
+  if (!check(ddb_watch_next_json(watch, 1000, &watch_event), error,
+             sizeof(error), "watch invalidate")) {
+    return fail(env, error);
+  }
+  if (strstr(watch_event, "\"type\":\"invalidate\"") == NULL ||
+      strstr(watch_event, "\"smoke\"") == NULL) {
+    return fail(env, "unexpected invalidate watch event");
+  }
+  ddb_string_free(&watch_event);
+  if (ddb_watch_next_json(watch, 1, &watch_event) != DDB_ERR_TIMEOUT) {
+    return fail(env, "expected watch timeout");
+  }
+  if (!check(ddb_watch_close(&watch), error, sizeof(error), "watch close")) {
+    return fail(env, error);
+  }
   if (!check(ddb_db_execute(db, "SELECT id, name FROM smoke", NULL, 0, &result),
              error, sizeof(error), "select")) {
     return fail(env, error);
@@ -70,8 +108,8 @@ static napi_value run_smoke(napi_env env, napi_callback_info info) {
     return fail(env, error);
   }
   ddb_result_free(&result);
-  if (rows != 2) {
-    return fail(env, "expected 2 rows");
+  if (rows != 3) {
+    return fail(env, "expected 3 rows");
   }
   if (ddb_db_execute(db, "SELECT * FROM nope", NULL, 0, &result) !=
       DDB_ERR_SQL) {
