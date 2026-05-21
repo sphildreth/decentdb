@@ -12,12 +12,14 @@ elif [ -d "$node_prefix/include" ] && [ -f "$node_prefix/include/node_api.h" ]; 
 elif [ -n "${nodedir:-}" ] && [ -d "$nodedir/include/node" ]; then
   node_include="$nodedir/include/node"
 else
-  # Add node-api header as npm package if it doesn't exist
-  # (sometimes github actions node doesn't include headers in prefix)
+  # Add Node-API headers as a local npm package if the Node distribution does
+  # not ship headers in its prefix. Keep this under .tmp so validation never
+  # requires global npm write permissions.
   echo "Fetching node-addon-api headers..."
-  npm install -g node-api-headers || true
-  node_headers_dir=$(npm root -g)/node-api-headers/include
-  if [ -d "$node_headers_dir" ]; then
+  headers_prefix="${NODE_API_HEADERS_PREFIX:-$root/.tmp/node-api-headers}"
+  npm install --prefix "$headers_prefix" --no-audit --no-fund node-api-headers
+  node_headers_dir="$headers_prefix/node_modules/node-api-headers/include"
+  if [ -f "$node_headers_dir/node_api.h" ]; then
       node_include="$node_headers_dir"
   else
       # fallback / debug
