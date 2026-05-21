@@ -3,8 +3,9 @@ import 'dart:io' show Platform;
 
 import 'package:ffi/ffi.dart';
 
-const int expectedAbiVersion = 2;
+const int expectedAbiVersion = 4;
 const int ddbOk = 0;
+const int ddbWriteQueueTimeoutDefault = 0xFFFFFFFFFFFFFFFF;
 const int ddbTagNull = 0;
 const int ddbTagInt64 = 1;
 const int ddbTagFloat64 = 2;
@@ -103,6 +104,53 @@ final class DdbValue extends Struct {
 
   @Int64()
   external int intervalMicros;
+}
+
+final class DdbWriteQueueMetrics extends Struct {
+  @IntPtr()
+  external int capacity;
+
+  @IntPtr()
+  external int currentDepth;
+
+  @Uint64()
+  external int admitted;
+
+  @Uint64()
+  external int rejected;
+
+  @Uint64()
+  external int timedOut;
+
+  @Uint64()
+  external int canceled;
+
+  @Uint64()
+  external int executed;
+
+  @Uint64()
+  external int committed;
+
+  @Uint64()
+  external int failed;
+
+  @Uint64()
+  external int groupCommitBatches;
+
+  @Uint64()
+  external int groupCommitSyncs;
+
+  @Uint64()
+  external int groupCommitMaxBatch;
+
+  @Uint64()
+  external int groupCommitCommitsCovered;
+
+  @Uint64()
+  external int physicalSyncsSaved;
+
+  @Uint64()
+  external int totalQueueWaitNs;
 }
 
 final class DdbValueView extends Struct {
@@ -223,6 +271,17 @@ typedef _DbPathOutDart = int Function(
   Pointer<Pointer<DdbDb>> outDb,
 );
 
+typedef _DbPathOptionsOutC = Uint32 Function(
+  Pointer<Utf8> path,
+  Pointer<Utf8> options,
+  Pointer<Pointer<DdbDb>> outDb,
+);
+typedef _DbPathOptionsOutDart = int Function(
+  Pointer<Utf8> path,
+  Pointer<Utf8> options,
+  Pointer<Pointer<DdbDb>> outDb,
+);
+
 typedef _DbFreeC = Uint32 Function(Pointer<Pointer<DdbDb>> db);
 typedef _DbFreeDart = int Function(Pointer<Pointer<DdbDb>> db);
 
@@ -243,6 +302,32 @@ typedef _DbExecuteDart = int Function(
   Pointer<DdbValue> params,
   int paramsLen,
   Pointer<Pointer<DdbResult>> outResult,
+);
+
+typedef _DbExecuteQueuedC = Uint32 Function(
+  Pointer<DdbDb> db,
+  Pointer<Utf8> sql,
+  Pointer<DdbValue> params,
+  IntPtr paramsLen,
+  Uint64 timeoutMs,
+  Pointer<Pointer<DdbResult>> outResult,
+);
+typedef _DbExecuteQueuedDart = int Function(
+  Pointer<DdbDb> db,
+  Pointer<Utf8> sql,
+  Pointer<DdbValue> params,
+  int paramsLen,
+  int timeoutMs,
+  Pointer<Pointer<DdbResult>> outResult,
+);
+
+typedef _DbWriteQueueMetricsC = Uint32 Function(
+  Pointer<DdbDb> db,
+  Pointer<DdbWriteQueueMetrics> outMetrics,
+);
+typedef _DbWriteQueueMetricsDart = int Function(
+  Pointer<DdbDb> db,
+  Pointer<DdbWriteQueueMetrics> outMetrics,
 );
 
 typedef _DbPrepareC = Uint32 Function(
@@ -747,9 +832,23 @@ class NativeBindings {
             _lib.lookupFunction<_DbPathOutC, _DbPathOutDart>('ddb_db_open'),
         dbOpenOrCreate = _lib.lookupFunction<_DbPathOutC, _DbPathOutDart>(
             'ddb_db_open_or_create'),
+        dbCreateWithOptions =
+            _lib.lookupFunction<_DbPathOptionsOutC, _DbPathOptionsOutDart>(
+                'ddb_db_create_with_options'),
+        dbOpenWithOptions =
+            _lib.lookupFunction<_DbPathOptionsOutC, _DbPathOptionsOutDart>(
+                'ddb_db_open_with_options'),
+        dbOpenOrCreateWithOptions =
+            _lib.lookupFunction<_DbPathOptionsOutC, _DbPathOptionsOutDart>(
+                'ddb_db_open_or_create_with_options'),
         dbFree = _lib.lookupFunction<_DbFreeC, _DbFreeDart>('ddb_db_free'),
         dbExecute =
             _lib.lookupFunction<_DbExecuteC, _DbExecuteDart>('ddb_db_execute'),
+        dbExecuteQueued =
+            _lib.lookupFunction<_DbExecuteQueuedC, _DbExecuteQueuedDart>(
+                'ddb_db_execute_queued'),
+        dbWriteQueueMetrics = _lib.lookupFunction<_DbWriteQueueMetricsC,
+            _DbWriteQueueMetricsDart>('ddb_db_write_queue_metrics'),
         dbPrepare =
             _lib.lookupFunction<_DbPrepareC, _DbPrepareDart>('ddb_db_prepare'),
         dbCheckpoint =
@@ -902,10 +1001,15 @@ class NativeBindings {
   final _DbPathOutDart dbCreate;
   final _DbPathOutDart dbOpen;
   final _DbPathOutDart dbOpenOrCreate;
+  final _DbPathOptionsOutDart dbCreateWithOptions;
+  final _DbPathOptionsOutDart dbOpenWithOptions;
+  final _DbPathOptionsOutDart dbOpenOrCreateWithOptions;
   final _DbFreeDart dbFree;
 
   // DB ops
   final _DbExecuteDart dbExecute;
+  final _DbExecuteQueuedDart dbExecuteQueued;
+  final _DbWriteQueueMetricsDart dbWriteQueueMetrics;
   final _DbPrepareDart dbPrepare;
   final _DbSimpleDart dbCheckpoint;
   final _DbSimpleDart dbBeginTransaction;

@@ -4,12 +4,286 @@ This page documents SQL functions and aggregate/window additions recently implem
 
 For broader syntax coverage, see the SQL reference and feature matrix.
 
-## Sync inspection views
+## Compatibility catalog and introspection surfaces
 
-DecentDB exposes sync state through read-only `sys_sync_*` inspection queries.
-These are engine inspection surfaces, not persistent catalog views and not
-parameterized functions. Use the documented `SELECT *` forms; arbitrary
-projection, joins, `LIMIT`, and bind parameters are not part of this surface.
+DecentDB exposes a narrow read-only compatibility layer for SQLite and
+PostgreSQL-adjacent tooling. These are virtual SQL surfaces, not persistent
+catalog tables.
+
+### SQLite compatibility catalog views
+
+```sql
+SELECT * FROM sqlite_schema;
+SELECT * FROM sqlite_master;
+SELECT * FROM sqlite_temp_schema;
+SELECT * FROM temp.sqlite_schema;
+```
+
+`sqlite_schema` and `sqlite_master` expose `type`, `name`, `tbl_name`,
+`rootpage`, and `sql`. `rootpage` is always `0` because DecentDB does not expose
+SQLite B-tree root pages. Temporary schema aliases expose session-scoped temp
+tables, views, and indexes.
+
+### Minimal `information_schema`
+
+```sql
+SELECT * FROM information_schema.schemata;
+SELECT * FROM information_schema.tables;
+SELECT * FROM information_schema.columns;
+```
+
+`information_schema.schemata` includes `main`, `temp`, and registered schemas.
+`information_schema.tables` and `information_schema.columns` expose visible
+persistent and temporary table/view metadata with DecentDB type names.
+
+### SQLite-compatible PRAGMA table functions
+
+The following functions mirror the corresponding PRAGMA shapes and may be used
+in `FROM` clauses, joins, filters, and projections:
+
+```sql
+SELECT * FROM pragma_table_info('users');
+SELECT * FROM pragma_table_xinfo('users');
+SELECT * FROM pragma_table_list();
+SELECT * FROM pragma_index_list('users');
+SELECT * FROM pragma_index_info('users_name_idx');
+SELECT * FROM pragma_index_xinfo('users_name_idx');
+SELECT * FROM pragma_foreign_key_list('orders');
+SELECT * FROM pragma_database_list();
+```
+
+`main.` and `temp.` prefixes are accepted for these functions. Unknown table or
+index names return an empty result set for the table-valued helpers.
+
+### `generate_series`
+
+`generate_series(start, stop [, step])` returns one visible column named
+`value`. It supports inclusive integer series with an optional integer step,
+timestamp series with an explicit `INTERVAL`, and date series with an explicit
+whole-day `INTERVAL`.
+
+```sql
+SELECT value FROM generate_series(1, 5);
+SELECT value FROM generate_series(5, 1, -1);
+SELECT value FROM generate_series(
+  TIMESTAMP '2026-01-01 00:00:00',
+  TIMESTAMP '2026-01-01 02:00:00',
+  INTERVAL '1 hour'
+);
+```
+
+Zero steps are rejected, temporal series require an explicit interval, and a
+series may not produce more than 1,000,000 rows.
+
+### Compatibility scalar helpers
+
+- `current_database()` and `current_schema()` return `main`.
+- `database()` and `schema()` are compatibility aliases returning `main`.
+- `version()` returns a DecentDB version string.
+- `sqlite_version()` and `pg_backend_pid()` are rejected rather than returning
+  misleading SQLite or PostgreSQL server values.
+
+## Operational inspection views
+
+DecentDB exposes operational inspection surfaces through stable, read-only `sys.*`
+views. These are not persistent catalog tables and do not accept bind
+parameters. Use the documented `SELECT *` forms; arbitrary projection, joins,
+`LIMIT`, and bind parameters are not part of this surface.
+
+The canonical operational surfaces are:
+
+```sql
+SELECT * FROM sys.sync_status;
+SELECT * FROM sys.wal_metrics;
+SELECT * FROM sys.write_queue_metrics;
+SELECT * FROM sys.storage_metrics;
+SELECT * FROM sys.reactive_metrics;
+SELECT * FROM sys.reactive_subscriptions;
+SELECT * FROM sys.extensions;
+SELECT * FROM sys.extension_functions;
+SELECT * FROM sys.extension_collations;
+SELECT * FROM sys.extension_dependencies;
+SELECT * FROM sys.extension_validation;
+```
+
+Legacy `sys_sync_*` names remain for sync inspection compatibility:
+
+- `sys_sync_status`
+- `sys_sync_journal`
+- `sys_sync_retention`
+- `sys_sync_peer_lag`
+- `sys_sync_peers`
+- `sys_sync_scopes`
+- `sys_sync_scope_tables`
+- `sys_sync_peer_scopes`
+- `sys_sync_sessions`
+- `sys_sync_conflict_policy`
+- `sys_sync_conflicts`
+- `sys_sync_doctor`
+
+### `sys.sync_status`
+
+One row describing the local sync state. It has the same shape and values as
+legacy `sys_sync_status`.
+
+| Column | Type | Nullable | Unit / meaning |
+|---|---|---:|---|
+| `enabled` | `BOOL` | no | Whether sync capture is enabled. |
+| `replica_id` | `TEXT` | yes | Local replica identity, or `NULL` before sync initialization. |
+| `next_sequence` | `INT64` | no | Next local sync journal sequence number. |
+| `journal_path` | `TEXT` | no | Sync journal sidecar path for this database handle. |
+| `journal_size_bytes` | `INT64` | no | Current sync journal size in bytes. |
+
+Example:
+
+```sql
+SELECT * FROM sys.sync_status;
+SELECT * FROM sys_sync_status; -- legacy compatibility
+```
+
+### `sys.write_queue_metrics`
+
+One row describing the current engine-owned write queue snapshot. All columns
+are non-null. Calling this view may initialize the lazy queue object, but it
+does not route direct writes through queued execution.
+
+| Column | Type | Unit / meaning |
+|---|---|---|
+| `capacity` | `INT64` | Maximum admitted queued requests for this handle. |
+| `current_depth` | `INT64` | Requests currently waiting in the queue. |
+| `admitted` | `INT64` | Requests admitted since this handle's queue was initialized. |
+| `rejected` | `INT64` | Requests rejected because immediate admission was impossible. |
+| `timed_out` | `INT64` | Requests timed out before admission or execution start. |
+| `canceled` | `INT64` | Requests canceled before execution start. |
+| `executed` | `INT64` | Requests whose SQL execution started. |
+| `committed` | `INT64` | Successfully committed queued requests. |
+| `failed` | `INT64` | Queued requests that failed during execution or group sync. |
+| `group_commit_batches` | `INT64` | Successful queued batches covered by strict group commit accounting. |
+| `group_commit_syncs` | `INT64` | Physical WAL syncs performed for grouped queued batches. |
+| `group_commit_max_batch` | `INT64` | Largest successful queued batch size observed. |
+| `group_commit_commits_covered` | `INT64` | Successful queued commits covered by group commit accounting. |
+| `physical_syncs_saved` | `INT64` | Estimated syncs avoided by grouped queued commits. |
+| `total_queue_wait_ns` | `INT64` | Sum of queue wait time for executed requests, in nanoseconds. |
+
+Example:
+
+```sql
+SELECT * FROM sys.write_queue_metrics;
+```
+
+### `sys.wal_metrics`
+
+One row describing the current WAL runtime state. All columns are non-null.
+
+| Column | Type | Unit / meaning |
+|---|---|---|
+| `latest_lsn` | `INT64` | Current WAL end offset / latest visible snapshot boundary. |
+| `file_size_bytes` | `INT64` | WAL sidecar file size in bytes. |
+| `active_readers` | `INT64` | Active WAL reader snapshots registered on this shared WAL. |
+| `max_page_count` | `INT64` | Maximum page count currently known to the WAL handle. |
+| `checkpoint_epoch` | `INT64` | In-memory checkpoint epoch counter for this WAL handle. |
+| `warning_count` | `INT64` | Current reader-retention warning count. |
+| `version_count` | `INT64` | WAL page versions tracked in memory or sidecar index. |
+| `resident_versions` | `INT64` | WAL page versions with resident payloads. |
+| `on_disk_versions` | `INT64` | WAL page versions whose payload is read back from WAL storage. |
+| `shared_wal` | `BOOL` | Whether this handle is using the process shared-WAL registry. |
+
+Example:
+
+```sql
+SELECT * FROM sys.wal_metrics;
+```
+
+### `sys.storage_metrics`
+
+One row describing the current database file and storage snapshot. All columns
+are non-null.
+
+| Column | Type | Unit / meaning |
+|---|---|---|
+| `path` | `TEXT` | Database path for this handle. |
+| `wal_path` | `TEXT` | WAL sidecar path for this handle. |
+| `format_version` | `INT64` | Decoded database file-format version. |
+| `page_size` | `INT64` | Database page size in bytes. |
+| `cache_size_mb` | `INT64` | Configured page cache size in MiB. |
+| `page_count` | `INT64` | Database file page count on disk. |
+| `schema_cookie` | `INT64` | Current schema cookie from the database header. |
+| `wal_end_lsn` | `INT64` | Current WAL end offset / latest visible snapshot boundary. |
+| `wal_file_size` | `INT64` | WAL sidecar file size in bytes. |
+| `last_checkpoint_lsn` | `INT64` | Last checkpoint LSN persisted in the database header. |
+| `active_readers` | `INT64` | Active WAL reader snapshots. |
+| `wal_versions` | `INT64` | WAL page versions tracked in memory or sidecar index. |
+| `warning_count` | `INT64` | Current reader-retention warning count. |
+| `shared_wal` | `BOOL` | Whether this handle is using the process shared-WAL registry. |
+
+Example:
+
+```sql
+SELECT * FROM sys.storage_metrics;
+```
+
+### `sys.reactive_metrics`
+
+One row describing in-process reactive subscription state.
+
+| Column | Type | Unit / meaning |
+|---|---|---|
+| `active_watch_count` | `INT64` | Active table, range, query, and change-stream watches. |
+| `table_watch_count` | `INT64` | Active table watches. |
+| `range_watch_count` | `INT64` | Active primary-key range watches. |
+| `query_watch_count` | `INT64` | Active query watches. |
+| `change_stream_count` | `INT64` | Active change streams. |
+| `events_published` | `INT64` | Commit events published by the reactive hub. |
+| `events_delivered` | `INT64` | Events delivered to watch queues without overflow. |
+| `events_dropped` | `INT64` | Events dropped because a watch queue lagged. |
+| `lagged_watch_count` | `INT64` | Watches currently marked lagged. |
+| `row_change_events_truncated` | `INT64` | Commit events whose row details were reduced to table invalidation. |
+
+Example:
+
+```sql
+SELECT * FROM sys.reactive_metrics;
+```
+
+### `sys.reactive_subscriptions`
+
+One row per active in-process watch.
+
+| Column | Type | Unit / meaning |
+|---|---|---|
+| `watch_id` | `INT64` | In-process watch identifier. |
+| `kind` | `TEXT` | `table`, `range`, `query`, or `change_stream`. |
+| `created_at_micros` | `INT64` | Watch creation timestamp in Unix microseconds. |
+| `queue_capacity` | `INT64` | Per-watch event queue capacity. |
+| `queue_depth` | `INT64` | Events currently waiting in the watch queue. |
+| `last_delivered_event_id` | `INT64` | Last event ID read by the watch handle. |
+| `dropped_events` | `INT64` | Events dropped for this watch because of queue overflow. |
+| `lagged` | `BOOL` | Whether the watch is currently lagged and must resynchronize. |
+| `dependencies_json` | `TEXT` | Watch dependency description as JSON. |
+
+Example:
+
+```sql
+SELECT * FROM sys.reactive_subscriptions ORDER BY watch_id;
+```
+
+### Lifecycle and compatibility notes
+
+- `sys.write_queue_metrics` is a one-row snapshot of `Db::write_queue_metrics`
+  and the C ABI `ddb_db_write_queue_metrics` values. Counter values are
+  accumulated for the current database handle's lazy queue lifetime and reset
+  when the database is reopened through a new handle.
+- `sys.reactive_metrics` and `sys.reactive_subscriptions` describe only
+  in-process watch handles. They are not durable changefeed state and reset
+  when the process exits.
+- `sys.storage_metrics` is a one-row snapshot equivalent to `Db::storage_info`
+  for stable fields, and includes both database and WAL paths.
+- `sys.wal_metrics` is a one-row snapshot of internal WAL runtime counters such
+  as active readers, warning state, payload versions, and checkpoint state.
+- `sys.sync_status` is the canonical name for the sync status row. The
+  `sys_sync_status` compatibility name remains supported.
+- These surfaces do not write telemetry rows, create catalog objects, or enable
+  slow-query, lock-wait, index-usage, advisor, or Doctor findings tracing.
 
 ### `sys_sync_status`
 
@@ -76,6 +350,10 @@ Columns:
 - `blocked_by_json`
 - `journal_size_bytes`
 
+`SELECT * FROM sys.sync_retention` is the canonical dotted alias. Shape client
+checkpoints are retention blockers and appear as `shape:<shape>:client:<id>` in
+`blocked_by_json`.
+
 ### `sys_sync_peer_lag`
 
 Columns:
@@ -87,6 +365,90 @@ Columns:
 - `local_high_watermark`
 - `in_lag`
 - `out_lag`
+
+`SELECT * FROM sys.sync_peer_lag` is the canonical dotted alias.
+
+### `sys.sync_relay_status`
+
+Columns:
+
+- `relay_id`
+- `protocol_version`
+- `database_replica_id`
+- `production_mode`
+- `secure_transport_required`
+- `insecure_override_enabled`
+- `active_sessions`
+- `active_streams`
+- `started_at_micros`
+
+### `sys.sync_relay_sessions`
+
+Columns:
+
+- `session_id`
+- `tenant_id`
+- `subject_id`
+- `subject_kind`
+- `request_id`
+- `operation`
+- `scope_name`
+- `shape_id`
+- `started_at_micros`
+- `ended_at_micros`
+- `status`
+- `error`
+- `rows_seen`
+- `bytes_seen`
+
+### `sys.sync_shapes`
+
+Columns:
+
+- `shape_id`
+- `name`
+- `scope_name`
+- `tenant_id`
+- `allowed_roles_json`
+- `allowed_subjects_json`
+- `created_at_micros`
+- `updated_at_micros`
+- `retention_ttl_micros`
+- `max_records`
+- `ack_deadline_micros`
+- `heartbeat_micros`
+
+### `sys.sync_shape_clients`
+
+Columns:
+
+- `shape_id`
+- `tenant_id`
+- `client_replica_id`
+- `subject_id`
+- `session_id`
+- `last_ack_sequence`
+- `last_ack_watermark`
+- `last_changeset_id`
+- `last_seen_at_micros`
+- `retention_blocking`
+- `status`
+
+### `sys.sync_changeset_history`
+
+Columns:
+
+- `changeset_id`
+- `source_replica_id`
+- `source_kind`
+- `scope_name`
+- `shape_id`
+- `record_count`
+- `bytes`
+- `created_at_micros`
+- `applied_at_micros`
+- `outcome`
+- `integrity_hash`
 
 ### `sys_sync_doctor`
 

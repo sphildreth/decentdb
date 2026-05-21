@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DecentDB Web Smoke</title>
+  <style>
+    body {
+      font-family: Inter, system-ui, sans-serif;
+      margin: 0;
+      padding: 1rem;
+    }
+    pre {
+      background: #111827;
+      color: #f9fafb;
+      border-radius: 8px;
+      padding: 1rem;
+      white-space: pre-wrap;
+    }
+    button {
+      padding: 0.5rem 1rem;
+      margin-right: 0.5rem;
+    }
+  </style>
+</head>
+<body>
+  <h1>@decentdb/web browser smoke</h1>
+  <p>Browser smoke for worker bootstrap, WASM loading, OPFS open, writes, and reads.</p>
+  <button id="run">Run smoke</button>
+  <pre id="output">ready</pre>
+
+  <script type="module" src="./smoke.js"></script>
+</body>
+</html>

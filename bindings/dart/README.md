@@ -194,8 +194,14 @@ into `Database.open(..., libraryPath: ...)`. See
 
 ## Current limitations
 
-- `Database.open(options: ...)` is not exposed by the current stable `ddb_*`
-  ABI; the Dart wrapper rejects non-empty `options` values.
+- `Database.open(options: ...)`, `Database.create(options: ...)`, and
+  `Database.openExisting(options: ...)` pass native open options through the
+  stable C ABI. Queue options include `write_queue_enabled`,
+  `write_queue_capacity`, `write_queue_default_timeout_ms`,
+  `write_queue_strict_group_commit`, `write_queue_max_batch`, and
+  `write_queue_max_group_delay_us`.
+- `Database.executeQueued(sql)` and `Database.writeQueueMetrics()` expose the
+  engine-owned write queue for self-contained queued writes.
 - The package uses the stable C ABI from `include/decentdb.h`; the reference
   header under `bindings/dart/native/decentdb.h` includes that file so the two
   surfaces stay in sync.

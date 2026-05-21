@@ -14,6 +14,12 @@ fn temp_dir() -> PathBuf {
     path
 }
 
+fn wal_path(db: &std::path::Path) -> PathBuf {
+    let mut wal = db.as_os_str().to_os_string();
+    wal.push(".wal");
+    PathBuf::from(wal)
+}
+
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_decentdb")
 }
@@ -125,6 +131,69 @@ fn exec_and_schema_introspection_commands_work() {
 }
 
 #[test]
+fn exec_supports_sql_and_pragma_compatibility_quick_wins() {
+    let dir = temp_dir();
+    let db = dir.join("compatibility.ddb");
+    let db_str = db.display().to_string();
+
+    let json = run(&[
+        "exec",
+        "--db",
+        &db_str,
+        "--sql",
+        "CREATE TABLE names(name TEXT); \
+         INSERT INTO names VALUES ('b'), ('A'); \
+         PRAGMA foreign_keys; \
+         PRAGMA journal_mode = WAL; \
+         SELECT name FROM sqlite_schema WHERE type = 'table' AND name = 'names'; \
+         SELECT value FROM generate_series(1, 3); \
+         SELECT name FROM names ORDER BY name COLLATE NOCASE;",
+        "--format",
+        "json",
+    ]);
+    assert!(json.contains("\"columns\":[\"foreign_keys\"]"));
+    assert!(json.contains("\"rows\":[[\"1\"]]"));
+    assert!(json.contains("\"columns\":[\"journal_mode\"]"));
+    assert!(json.contains("\"rows\":[[\"wal\"]]"));
+    assert!(json.contains("\"rows\":[[\"names\"]]"));
+    assert!(json.contains("\"rows\":[[\"1\"],[\"2\"],[\"3\"]]"));
+    assert!(json.contains("\"rows\":[[\"A\"],[\"b\"]]"));
+}
+
+#[test]
+fn describe_command_shows_foreign_keys() {
+    let dir = temp_dir();
+    let db = dir.join("foreign-keys.ddb");
+    let db_str = db.display().to_string();
+
+    run(&[
+        "exec",
+        "--db",
+        &db_str,
+        "--sql",
+        "CREATE TABLE artists (id INT64 PRIMARY KEY); \
+         CREATE TABLE albums (id INT64 PRIMARY KEY, artist_id INT64, \
+           FOREIGN KEY (artist_id) REFERENCES artists(id) \
+           ON DELETE CASCADE ON UPDATE SET NULL);",
+        "--format",
+        "json",
+    ]);
+
+    let describe = run(&[
+        "describe", "--db", &db_str, "--table", "albums", "--format", "table",
+    ]);
+    assert!(describe.contains("foreign_key"));
+    assert!(describe.contains("artist_id"));
+    assert!(describe.contains("REFERENCES artists(id) ON DELETE CASCADE ON UPDATE SET NULL"));
+
+    let json = run(&[
+        "describe", "--db", &db_str, "--table", "albums", "--format", "json",
+    ]);
+    assert!(json.contains("\"foreign_key\""));
+    assert!(json.contains("REFERENCES artists(id)"));
+}
+
+#[test]
 fn checkpoint_command_flushes_wal_and_preserves_data_without_wal_file() {
     let dir = temp_dir();
     let db = dir.join("checkpoint.ddb");
@@ -143,7 +212,7 @@ fn checkpoint_command_flushes_wal_and_preserves_data_without_wal_file() {
     ]);
     assert!(result.contains("\"ok\":true"));
 
-    let wal = db.with_extension("ddb.wal");
+    let wal = wal_path(&db);
     let wal_size_before = fs::metadata(&wal)
         .expect("stat WAL before checkpoint")
         .len();
@@ -611,7 +680,7 @@ fn header_only_commands_ignore_sparse_huge_wal_files() {
         "json",
     ]);
 
-    let wal = db.with_extension("ddb.wal");
+    let wal = wal_path(&db);
     let wal_file = fs::OpenOptions::new()
         .create(true)
         .write(true)
@@ -641,6 +710,23 @@ fn completion_and_repl_smoke_work() {
     let dir = temp_dir();
     let db = dir.join("repl.ddb");
     let db_str = db.display().to_string();
+    let script = dir.join("script.sql");
+    let import_csv = dir.join("import.csv");
+    let export_csv = dir.join("export.csv");
+    let once_output = dir.join("once.txt");
+    let redirected_output = dir.join("redirected.txt");
+    fs::write(
+        &script,
+        "CREATE VIEW item_names AS SELECT name FROM items;\n\
+         CREATE INDEX items_name_idx ON items(name);\n",
+    )
+    .expect("write script");
+    fs::write(&import_csv, "id,name\n2,Bob\n3,\n").expect("write import csv");
+    let script_str = script.display().to_string();
+    let import_csv_str = import_csv.display().to_string();
+    let export_csv_str = export_csv.display().to_string();
+    let once_output_str = once_output.display().to_string();
+    let redirected_output_str = redirected_output.display().to_string();
 
     let mut child = Command::new(bin())
         .args(["repl", "--db", &db_str, "--format", "table"])
@@ -653,10 +739,39 @@ fn completion_and_repl_smoke_work() {
         let stdin = child.stdin.as_mut().expect("stdin");
         writeln!(
             stdin,
-            "CREATE TABLE items (id INT64 PRIMARY KEY, name TEXT);\n\
+            "help schema\n\
+             CREATE TABLE items (id INT64 PRIMARY KEY, name TEXT);\n\
              INSERT INTO items (id, name) VALUES (1, 'Ada');\n\
+             .read {script_str}\n\
              SELECT id, name FROM items;\n\
-             .exit"
+             .tables\n\
+             .dt\n\
+             .d items\n\
+             .schema items\n\
+             .indexes items\n\
+             .views\n\
+             .df\n\
+             .mode csv\n\
+             .headers off\n\
+             .nullvalue (null)\n\
+             SELECT NULL AS missing;\n\
+             .mode table\n\
+             .headers on\n\
+             .timer on\n\
+             .explain SELECT id FROM items;\n\
+             .param set 1 int:1\n\
+             SELECT name FROM items WHERE id = $1;\n\
+             .param list\n\
+             .import {import_csv_str} items\n\
+             .export items {export_csv_str} csv\n\
+             .once {once_output_str}\n\
+             SELECT name FROM items WHERE id = 2;\n\
+             .output {redirected_output_str}\n\
+             SELECT name FROM items WHERE id = 1;\n\
+             .output stdout\n\
+             .s\n\
+             .g\n\
+             \\q"
         )
         .expect("write repl input");
     }
@@ -667,8 +782,35 @@ fn completion_and_repl_smoke_work() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8(output.stdout).expect("stdout");
+    assert!(stdout.contains("DecentDB CLI"));
+    assert!(stdout.contains("Type \"help\" for help."));
+    assert!(stdout.contains(".schema <object>"));
+    assert!(stdout.contains(".dt"));
     assert!(stdout.contains("id | name"));
     assert!(stdout.contains("1  | Ada"));
+    assert!(stdout.contains("items"));
+    assert!(stdout.contains("row_count"));
+    assert!(stdout.contains("constraints"));
+    assert!(stdout.contains("PRIMARY KEY"));
+    assert!(stdout.contains("CREATE TABLE"));
+    assert!(stdout.contains("items_name_idx"));
+    assert!(stdout.contains("item_names"));
+    assert!(stdout.contains("length"));
+    assert!(stdout.contains("(null)"));
+    assert!(stdout.contains("plan"));
+    assert!(stdout.contains("Time:"));
+    assert!(stdout.contains("1     | 1"));
+    assert!(stdout.contains("3"));
+    assert!(stdout.contains("SELECT id, name FROM items;"));
+    assert!(fs::read_to_string(&export_csv)
+        .expect("read export csv")
+        .contains("2,Bob"));
+    assert!(fs::read_to_string(&once_output)
+        .expect("read once output")
+        .contains("Bob"));
+    assert!(fs::read_to_string(&redirected_output)
+        .expect("read redirected output")
+        .contains("Ada"));
 }
 
 #[test]

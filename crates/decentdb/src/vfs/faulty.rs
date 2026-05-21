@@ -1,4 +1,5 @@
 //! Deterministic fault-injection VFS wrapper.
+#![cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

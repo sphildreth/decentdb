@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockWriteGuard, Weak};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 #[cfg(feature = "bench-internals")]
 use crate::benchmark::{
@@ -19,7 +19,7 @@ use crate::catalog::{
     ForeignKeyConstraint, IndexColumn, IndexKind, IndexSchema, TableSchema, TriggerEvent,
     TriggerKind, TriggerSchema, ViewSchema,
 };
-use crate::config::DbConfig;
+use crate::config::{DbConfig, WalSyncMode};
 use crate::error::{DbError, Result};
 use crate::exec::dml::{PreparedSimpleDelete, PreparedSimpleInsert, PreparedSimpleUpdate};
 use crate::exec::{
@@ -32,6 +32,11 @@ use crate::metadata::{
     QueryContract, SchemaColumnInfo, SchemaIndexInfo, SchemaSnapshot, SchemaTableInfo,
     SchemaTriggerInfo, SchemaViewInfo, StorageInfo, TableInfo, ToolingMetadata, TriggerInfo,
     ViewInfo,
+};
+use crate::reactive::{
+    ChangeSource, ChangeStreamOptions, PendingReactiveCommit, QueryWatchOptions, RangeWatchOptions,
+    ReactiveHub, ReactiveMetricsSnapshot, ReactiveSubscriptionSnapshot, TableWatchOptions,
+    WatchHandle,
 };
 use crate::record::overflow::read_overflow;
 use crate::record::value::{
@@ -47,18 +52,28 @@ use crate::storage::page::{self, PageId, PageStore};
 use crate::storage::{self, DatabaseHeader, PagerHandle};
 use crate::sync::SyncContext;
 use crate::sync::{
-    current_time_micros, validate_sync_scope_definition, SyncChangeBatch, SyncConflict,
-    SyncConflictPolicy, SyncConflictPolicyConfig, SyncDoctorSeverity, SyncImportSummary,
-    SyncJournalIntegrityReport, SyncJournalIssue, SyncJournalRecord, SyncOperation,
-    SyncOperationalDoctorReport, SyncPeer, SyncPeerLag, SyncPeerScopeBinding, SyncPruneSummary,
-    SyncRetentionReport, SyncRunDirection, SyncRunSummary, SyncScope, SyncSession, SyncStatus,
+    current_time_micros, validate_sync_scope_definition, ApplyChangesetOptions,
+    CreateChangesetOptions, CreateShapeOptions, InspectChangesetOptions, InvertChangesetOptions,
+    ShapeAckOptions, SyncChangeBatch, SyncChangeset, SyncChangesetApplyResult,
+    SyncChangesetCapabilities, SyncChangesetCheckpoint, SyncChangesetCompatibility,
+    SyncChangesetHistory, SyncChangesetInspection, SyncChangesetLimits, SyncChangesetRecord,
+    SyncChangesetSource, SyncConflict, SyncConflictPolicy, SyncConflictPolicyConfig,
+    SyncDoctorSeverity, SyncImportSummary, SyncJournalIntegrityReport, SyncJournalIssue,
+    SyncJournalRecord, SyncOperation, SyncOperationalDoctorReport, SyncPeer, SyncPeerLag,
+    SyncPeerScopeBinding, SyncPrincipal, SyncPruneSummary, SyncRelaySession, SyncRelayStatus,
+    SyncRetentionReport, SyncRunDirection, SyncRunSummary, SyncScope, SyncSession, SyncShape,
+    SyncShapeCheckpoint, SyncShapeClient, SyncShapeDelivery, SyncStatus,
 };
 use crate::vfs::faulty::{self, FailAction, Failpoint};
 use crate::vfs::{is_memory_path, write_all_at, FileKind, OpenMode, VfsHandle};
 use crate::wal::reader_registry::ReaderGuard;
 use crate::wal::savepoint::StatementSavepoint;
 use crate::wal::WalHandle;
+use crate::write_queue::{QueuedWriteOptions, WriteQueue, WriteQueueMetricsSnapshot};
 use serde_json::Value as JsonValue;
+use sha2::{Digest, Sha256};
+
+const APPLICATION_PRAGMA_TABLE: &str = "__decentdb_application_pragmas";
 
 /// Stable engine owner used across later storage, SQL, and FFI slices.
 #[derive(Clone, Debug)]
@@ -326,12 +341,15 @@ struct DbInner {
     sql_txn_active: AtomicBool,
     write_txn_active: AtomicBool,
     write_txn: Mutex<WriteTxn>,
+    busy_timeout_ms: AtomicU64,
     temp_state: Mutex<TempSchemaState>,
     statement_cache: Mutex<StatementCache>,
     prepared_insert_cache: Mutex<PreparedInsertCache>,
     held_snapshots: Mutex<HashMap<u64, ReaderGuard>>,
     sync_ctx: SyncContext,
+    reactive_hub: Arc<ReactiveHub>,
     read_only_paged_row_source_residency: Mutex<ReadOnlyPagedRowSourceResidency>,
+    write_queue: OnceLock<WriteQueue>,
 }
 
 impl Drop for DbInner {
@@ -653,8 +671,17 @@ impl Db {
     /// reserved catalog root page.
     pub fn create(path: impl AsRef<Path>, config: DbConfig) -> Result<Self> {
         let path = path.as_ref();
-        config.validate_for_create()?;
         let vfs = VfsHandle::for_path(path);
+        Self::create_with_vfs(path, config, vfs)
+    }
+
+    pub(crate) fn create_with_vfs(
+        path: impl AsRef<Path>,
+        config: DbConfig,
+        vfs: VfsHandle,
+    ) -> Result<Self> {
+        let path = path.as_ref();
+        config.validate_for_create()?;
         let open_mode = if vfs.is_memory() {
             OpenMode::OpenOrCreate
         } else {
@@ -672,6 +699,15 @@ impl Db {
     pub fn open(path: impl AsRef<Path>, config: DbConfig) -> Result<Self> {
         let path = path.as_ref();
         let vfs = VfsHandle::for_path(path);
+        Self::open_existing_with_vfs(path, config, vfs)
+    }
+
+    pub(crate) fn open_existing_with_vfs(
+        path: impl AsRef<Path>,
+        config: DbConfig,
+        vfs: VfsHandle,
+    ) -> Result<Self> {
+        let path = path.as_ref();
         let mode = if vfs.is_memory() {
             OpenMode::OpenOrCreate
         } else {
@@ -691,10 +727,19 @@ impl Db {
     pub fn open_or_create(path: impl AsRef<Path>, config: DbConfig) -> Result<Self> {
         let path = path.as_ref();
         let vfs = VfsHandle::for_path(path);
+        Self::open_or_create_with_vfs(path, config, vfs)
+    }
+
+    pub(crate) fn open_or_create_with_vfs(
+        path: impl AsRef<Path>,
+        config: DbConfig,
+        vfs: VfsHandle,
+    ) -> Result<Self> {
+        let path = path.as_ref();
         if vfs.is_memory() || vfs.file_exists(path)? {
-            Self::open(path, config)
+            Self::open_existing_with_vfs(path, config, vfs)
         } else {
-            Self::create(path, config)
+            Self::create_with_vfs(path, config, vfs)
         }
     }
 
@@ -1332,6 +1377,148 @@ impl Db {
         self.execute_batch_with_params(sql, &[])
     }
 
+    /// Executes one SQL statement through the engine-owned write queue.
+    ///
+    /// The queued path preserves the existing single-writer model while
+    /// centralizing backpressure, timeout, cancellation-before-run, and strict
+    /// group-commit behavior. Explicit `BEGIN`, `COMMIT`, `ROLLBACK`, and
+    /// savepoint control statements are intentionally rejected on the queued
+    /// path in this first contract; callers should use the direct transaction
+    /// APIs for long-lived explicit transactions.
+    pub fn execute_queued(&self, sql: &str) -> Result<QueryResult> {
+        self.execute_queued_with_params(sql, &[])
+    }
+
+    /// Executes one SQL statement with positional `$n` parameters through the
+    /// engine-owned write queue.
+    pub fn execute_queued_with_params(&self, sql: &str, params: &[Value]) -> Result<QueryResult> {
+        let mut results = self.execute_queued_batch_with_params(sql, params)?;
+        if results.len() != 1 {
+            return Err(DbError::sql(format!(
+                "expected exactly one SQL statement, got {}",
+                results.len()
+            )));
+        }
+        Ok(results.remove(0))
+    }
+
+    /// Executes one or more SQL statements through the engine-owned write
+    /// queue using configured default timeout behavior.
+    pub fn execute_queued_batch(&self, sql: &str) -> Result<Vec<QueryResult>> {
+        self.execute_queued_batch_with_params(sql, &[])
+    }
+
+    /// Executes one or more SQL statements with positional `$n` parameters
+    /// through the engine-owned write queue using configured default timeout
+    /// behavior.
+    pub fn execute_queued_batch_with_params(
+        &self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Vec<QueryResult>> {
+        self.execute_queued_batch_with_options(sql, params, QueuedWriteOptions::default())
+    }
+
+    /// Executes one or more SQL statements through the write queue with
+    /// per-call timeout and cancellation options.
+    pub fn execute_queued_batch_with_options(
+        &self,
+        sql: &str,
+        params: &[Value],
+        mut options: QueuedWriteOptions,
+    ) -> Result<Vec<QueryResult>> {
+        self.reject_transaction_control_for_queued_sql(sql)?;
+        if options.timeout.is_none() {
+            let timeout_ms = self.inner.busy_timeout_ms.load(Ordering::Acquire);
+            if timeout_ms > 0 {
+                options.timeout = Some(Duration::from_millis(timeout_ms));
+            }
+        }
+        self.write_queue()
+            .execute_batch_with_params(self, sql, params, options)
+    }
+
+    /// Returns a snapshot of current write-queue counters. Calling this method
+    /// initializes the lazy queue metadata but does not route direct writes
+    /// through the queue.
+    #[must_use]
+    pub fn write_queue_metrics(&self) -> WriteQueueMetricsSnapshot {
+        self.write_queue().snapshot()
+    }
+
+    /// Subscribes to committed changes for one or more persistent user tables.
+    pub fn watch_table(&self, options: TableWatchOptions) -> Result<WatchHandle> {
+        let tables = self.validate_watch_tables(&options.tables)?;
+        self.inner.reactive_hub.watch_table(
+            tables,
+            options.queue_capacity,
+            self.inner.wal.latest_snapshot(),
+            self.schema_cookie()?,
+        )
+    }
+
+    /// Subscribes to committed changes intersecting a primary-key range.
+    pub fn watch_range(&self, mut options: RangeWatchOptions) -> Result<WatchHandle> {
+        let canonical = self.validate_watch_range_table(&options.table)?;
+        options.table = canonical;
+        self.inner.reactive_hub.watch_range(
+            options,
+            self.inner.wal.latest_snapshot(),
+            self.schema_cookie()?,
+        )
+    }
+
+    /// Executes a SELECT and subscribes to invalidations for its dependencies.
+    pub fn watch_query(
+        &self,
+        sql: &str,
+        params: &[Value],
+        options: QueryWatchOptions,
+    ) -> Result<WatchHandle> {
+        let statement = self.parsed_statement(sql)?;
+        if !statement_is_read_only(&statement) {
+            return Err(DbError::sql(
+                "query subscriptions require a read-only SELECT",
+            ));
+        }
+        let dependencies = self.query_watch_dependencies(&statement)?;
+        let result = self.execute_with_params(sql, params)?;
+        self.inner.reactive_hub.watch_query(
+            dependencies,
+            options.queue_capacity,
+            self.inner.wal.latest_snapshot(),
+            self.schema_cookie()?,
+            result,
+        )
+    }
+
+    /// Subscribes to ordered committed change events.
+    pub fn change_stream(&self, options: ChangeStreamOptions) -> Result<WatchHandle> {
+        let tables = if options.tables.is_empty() {
+            None
+        } else {
+            Some(self.validate_watch_tables(&options.tables)?)
+        };
+        self.inner.reactive_hub.change_stream(
+            tables,
+            options.queue_capacity,
+            self.inner.wal.latest_snapshot(),
+            self.schema_cookie()?,
+        )
+    }
+
+    /// Returns current reactive subscription counters.
+    #[must_use]
+    pub fn reactive_metrics(&self) -> ReactiveMetricsSnapshot {
+        self.inner.reactive_hub.metrics_snapshot()
+    }
+
+    /// Returns current reactive subscription details.
+    #[must_use]
+    pub fn reactive_subscriptions(&self) -> Vec<ReactiveSubscriptionSnapshot> {
+        self.inner.reactive_hub.subscription_snapshots()
+    }
+
     /// Executes one or more read-only SQL statements against a retained WAL LSN.
     pub fn execute_batch_at_snapshot_lsn(
         &self,
@@ -1670,7 +1857,9 @@ impl Db {
             .join("\n");
         if !sql.trim().is_empty() {
             if target_ref == crate::branch::DEFAULT_BRANCH_NAME {
-                self.execute_batch(&sql)?;
+                crate::reactive::with_change_source(ChangeSource::BranchMerge, || {
+                    self.execute_batch(&sql)
+                })?;
             } else {
                 self.execute_batch_on_branch(&sql, target_ref)?;
             }
@@ -1692,6 +1881,14 @@ impl Db {
 
     /// Executes one or more semicolon-delimited SQL statements with `$n` parameters.
     pub fn execute_batch_with_params(
+        &self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Vec<QueryResult>> {
+        self.execute_batch_direct_with_params(sql, params)
+    }
+
+    pub(crate) fn execute_batch_direct_with_params(
         &self,
         sql: &str,
         params: &[Value],
@@ -1726,11 +1923,23 @@ impl Db {
                 results.push(result);
                 continue;
             }
+            if let Some(command) = crate::extensions::parse_extension_sql(trimmed)? {
+                let result = crate::extensions::execute_extension_sql(self, command)?;
+                results.push(result);
+                continue;
+            }
             if let Some(result) = self.try_execute_sync_inspection_query(trimmed, params)? {
                 results.push(result);
                 continue;
             }
+            if let Some(result) =
+                crate::extensions::try_execute_extension_inspection_query(self, trimmed, params)?
+            {
+                results.push(result);
+                continue;
+            }
 
+            reject_unsupported_collated_key_sql(trimmed)?;
             let statement = self.parsed_statement(trimmed)?;
             let result = if statement_is_read_only(&statement) {
                 self.execute_read_statement(&statement, params)?
@@ -1740,6 +1949,37 @@ impl Db {
             results.push(result);
         }
         Ok(results)
+    }
+
+    pub(crate) fn begin_deferred_group_commit(
+        &self,
+    ) -> crate::wal::writer::DeferredGroupCommitGuard {
+        self.inner.wal.begin_deferred_group_commit()
+    }
+
+    pub(crate) fn flush_deferred_group_commit(&self) -> Result<bool> {
+        self.inner.wal.flush_deferred_group_commit()
+    }
+
+    fn write_queue(&self) -> &WriteQueue {
+        self.inner
+            .write_queue
+            .get_or_init(|| WriteQueue::new(&self.inner.config))
+    }
+
+    fn reject_transaction_control_for_queued_sql(&self, sql: &str) -> Result<()> {
+        for statement_sql in split_sql_batch(sql) {
+            let trimmed = statement_sql.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if parse_transaction_control(trimmed).is_some() {
+                return Err(DbError::transaction(
+                    "queued execution does not support explicit transaction control; use direct transaction APIs",
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Prepares a single SQL statement for repeated execution.
@@ -2404,6 +2644,8 @@ impl Db {
             EngineRuntime::load_from_storage(&pager, &wal, schema_cookie, &effective_config)?;
         let catalog = CatalogHandle::new(runtime.catalog.as_ref().clone());
         let last_seen_checkpoint_epoch = wal.checkpoint_epoch();
+        let reactive_hub = crate::reactive::acquire_hub(open_lock_key.clone(), &effective_config);
+        let busy_timeout_ms = effective_config.write_queue_default_timeout_ms;
 
         let db = Self {
             inner: Arc::new(DbInner {
@@ -2422,14 +2664,17 @@ impl Db {
                 sql_txn_active: AtomicBool::new(false),
                 write_txn: Mutex::new(WriteTxn::default()),
                 write_txn_active: AtomicBool::new(false),
+                busy_timeout_ms: AtomicU64::new(busy_timeout_ms),
                 temp_state: Mutex::new(TempSchemaState::default()),
                 statement_cache: Mutex::new(StatementCache::default()),
                 prepared_insert_cache: Mutex::new(PreparedInsertCache::default()),
                 held_snapshots: Mutex::new(HashMap::new()),
                 sync_ctx: SyncContext::new(&path),
+                reactive_hub,
                 read_only_paged_row_source_residency: Mutex::new(
                     ReadOnlyPagedRowSourceResidency::default(),
                 ),
+                write_queue: OnceLock::new(),
             }),
         };
         db.backfill_missing_persistent_pk_indexes()?;
@@ -2455,6 +2700,11 @@ impl Db {
 
     pub fn schema_cookie(&self) -> Result<u32> {
         self.inner.catalog.schema_cookie()
+    }
+
+    #[must_use]
+    pub fn extensions(&self) -> crate::extensions::ExtensionManager<'_> {
+        crate::extensions::ExtensionManager::new(self)
     }
 
     pub(crate) fn set_schema_cookie(&self, schema_cookie: u32) -> Result<()> {
@@ -2504,7 +2754,9 @@ impl Db {
                 .read()
                 .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
             self.validate_prepared_against_runtime(prepared, &runtime)?;
-            if self.statement_is_temp_only(&runtime, statement) {
+            let extension_execution_enabled = self.inner.config.extension_unsigned_development_mode
+                || !self.inner.config.extension_trust_anchors.is_empty();
+            if !extension_execution_enabled && self.statement_is_temp_only(&runtime, statement) {
                 drop(runtime);
                 return self.execute_autocommit_temp_only_statement(statement, params);
             }
@@ -2526,6 +2778,14 @@ impl Db {
         let reader = self.inner.wal.begin_reader()?;
         let snapshot_lsn = reader.snapshot_lsn();
         self.refresh_engine_from_snapshot(snapshot_lsn)?;
+        if self.inner.config.extension_unsigned_development_mode
+            || !self.inner.config.extension_trust_anchors.is_empty()
+        {
+            self.ensure_tables_loaded_at_snapshot(
+                &crate::extensions::extension_catalog_table_names(),
+                Some(snapshot_lsn),
+            )?;
+        }
         if let SqlStatement::Query(query) = statement {
             let runtime = self
                 .inner
@@ -2608,7 +2868,12 @@ impl Db {
                 if let Some(base_tables) =
                     self.safe_referenced_base_tables_in_runtime(&runtime, statement)
                 {
-                    let names: Vec<&str> = base_tables.iter().map(|s| s.as_str()).collect();
+                    let mut names: Vec<&str> = base_tables.iter().map(|s| s.as_str()).collect();
+                    if self.inner.config.extension_unsigned_development_mode
+                        || !self.inner.config.extension_trust_anchors.is_empty()
+                    {
+                        names.extend(crate::extensions::extension_catalog_table_names());
+                    }
                     drop(runtime);
                     self.ensure_table_row_sources_loaded_at_snapshot(&names, snapshot_lsn)?;
                     drop(reader);
@@ -2668,19 +2933,27 @@ impl Db {
 
     fn execute_pragma_command(&self, command: PragmaCommand) -> Result<QueryResult> {
         match command {
-            PragmaCommand::Query(PragmaName::PageSize) => Ok(QueryResult::with_rows(
+            PragmaCommand::Query(target) => self.execute_pragma_query(target),
+            PragmaCommand::Call { target, argument } => self.execute_pragma_call(target, argument),
+            PragmaCommand::Set(target, value) => self.execute_pragma_set(target, value),
+        }
+    }
+
+    fn execute_pragma_query(&self, target: PragmaTarget) -> Result<QueryResult> {
+        match target.name {
+            PragmaName::PageSize => Ok(QueryResult::with_rows(
                 vec!["page_size".to_string()],
                 vec![QueryRow::new(vec![Value::Int64(i64::from(
                     self.inner.config.page_size,
                 ))])],
             )),
-            PragmaCommand::Query(PragmaName::CacheSize) => Ok(QueryResult::with_rows(
+            PragmaName::CacheSize => Ok(QueryResult::with_rows(
                 vec!["cache_size".to_string()],
                 vec![QueryRow::new(vec![Value::Int64(cache_size_pages(
                     &self.inner.config,
                 ))])],
             )),
-            PragmaCommand::Query(PragmaName::DatabaseList) => {
+            PragmaName::DatabaseList => {
                 let file_name = if is_memory_path(&self.inner.path) {
                     ":memory:".to_string()
                 } else {
@@ -2695,113 +2968,347 @@ impl Db {
                     ])],
                 ))
             }
-            PragmaCommand::Query(PragmaName::TableInfo) => Err(DbError::sql(
+            PragmaName::TableInfo => Err(DbError::sql(
                 "PRAGMA table_info(table_name) requires a table name argument",
             )),
-            PragmaCommand::TableInfo(table_name) => {
-                let info = self.describe_table(&table_name)?;
-                let rows = info
-                    .columns
-                    .into_iter()
-                    .enumerate()
-                    .map(|(cid, column)| {
-                        QueryRow::new(vec![
-                            Value::Int64(i64::try_from(cid).unwrap_or(i64::MAX)),
-                            Value::Text(column.name),
-                            Value::Text(column.column_type),
-                            Value::Int64(if column.nullable { 0 } else { 1 }),
-                            column.default_sql.map_or(Value::Null, Value::Text),
-                            Value::Int64(if column.primary_key { 1 } else { 0 }),
-                        ])
-                    })
-                    .collect();
+            PragmaName::TableXInfo => Err(DbError::sql(
+                "PRAGMA table_xinfo(table_name) requires a table name argument",
+            )),
+            PragmaName::IndexList => Err(DbError::sql(
+                "PRAGMA index_list(table_name) requires a table name argument",
+            )),
+            PragmaName::IndexInfo => Err(DbError::sql(
+                "PRAGMA index_info(index_name) requires an index name argument",
+            )),
+            PragmaName::IndexXInfo => Err(DbError::sql(
+                "PRAGMA index_xinfo(index_name) requires an index name argument",
+            )),
+            PragmaName::ForeignKeyList => Err(DbError::sql(
+                "PRAGMA foreign_key_list(table_name) requires a table name argument",
+            )),
+            PragmaName::TableList => self.execute_compatibility_select(&format!(
+                "SELECT * FROM {}pragma_table_list()",
+                pragma_schema_function_prefix(target.schema)
+            )),
+            PragmaName::IntegrityCheck | PragmaName::QuickCheck => self.integrity_check_results(),
+            PragmaName::ForeignKeys => Ok(QueryResult::with_rows(
+                vec!["foreign_keys".to_string()],
+                vec![QueryRow::new(vec![Value::Int64(1)])],
+            )),
+            PragmaName::JournalMode => Ok(QueryResult::with_rows(
+                vec!["journal_mode".to_string()],
+                vec![QueryRow::new(vec![Value::Text("wal".to_string())])],
+            )),
+            PragmaName::Synchronous => Ok(QueryResult::with_rows(
+                vec!["synchronous".to_string()],
+                vec![QueryRow::new(vec![Value::Int64(
+                    pragma_synchronous_mode_value(self.inner.config.wal_sync_mode),
+                )])],
+            )),
+            PragmaName::WalCheckpoint => self.execute_pragma_wal_checkpoint(None),
+            PragmaName::SchemaVersion => {
+                let runtime = self.runtime_for_metadata_inspection()?;
+                let version = match target.schema {
+                    Some(PragmaSchema::Temp) => runtime.temp_schema_cookie,
+                    _ => runtime.catalog.schema_cookie,
+                };
                 Ok(QueryResult::with_rows(
-                    vec![
-                        "cid".to_string(),
-                        "name".to_string(),
-                        "type".to_string(),
-                        "notnull".to_string(),
-                        "dflt_value".to_string(),
-                        "pk".to_string(),
-                    ],
-                    rows,
+                    vec!["schema_version".to_string()],
+                    vec![QueryRow::new(vec![Value::Int64(i64::from(version))])],
                 ))
             }
-            PragmaCommand::Query(PragmaName::IntegrityCheck) => {
-                let (mut runtime, snapshot_lsn) =
-                    self.runtime_for_targeted_row_source_inspection()?;
-                runtime.rebuild_stale_indexes(self.inner.config.page_size)?;
-                let mut errors = Vec::new();
-                let table_names = runtime.catalog.tables.keys().cloned().collect::<Vec<_>>();
-                for table_name in table_names {
-                    self.ensure_inspection_table_row_source(
-                        &mut runtime,
-                        &table_name,
-                        snapshot_lsn,
-                    )?;
-                    let Some(table) = runtime.catalog.table(&table_name).cloned() else {
-                        errors.push(format!("table {table_name} is missing schema"));
-                        continue;
-                    };
-                    let Some(row_source) = runtime.table_row_source(&table_name) else {
-                        errors.push(format!("table {} is missing row storage", table.name));
-                        continue;
-                    };
-                    for row in row_source.rows() {
-                        let row = row?;
-                        if row.values().len() != table.columns.len() {
-                            errors.push(format!(
-                                "table {} row {} has {} values but schema defines {} columns",
-                                table_name,
-                                row.row_id(),
-                                row.values().len(),
-                                table.columns.len()
-                            ));
-                            break;
-                        }
-                    }
-                    self.redefer_inspection_table_row_source(
-                        &mut runtime,
-                        &table_name,
-                        snapshot_lsn,
-                    );
-                }
-                for index in runtime.catalog.indexes.values() {
-                    if runtime.catalog.table(&index.table_name).is_none() {
-                        errors.push(format!(
-                            "index {} references missing table {}",
-                            index.name, index.table_name
-                        ));
-                    }
-                    let table_deferred = runtime
-                        .deferred_table_names()
-                        .any(|table_name| identifiers_equal(table_name, &index.table_name));
-                    if !table_deferred && !runtime.indexes.contains_key(&index.name) {
-                        errors.push(format!("runtime index {} is missing", index.name));
-                    }
-                }
-                if errors.is_empty() {
-                    Ok(QueryResult::with_rows(
-                        vec!["integrity_check".to_string()],
-                        vec![QueryRow::new(vec![Value::Text("ok".to_string())])],
-                    ))
-                } else {
-                    Ok(QueryResult::with_rows(
-                        vec!["integrity_check".to_string()],
-                        errors
-                            .into_iter()
-                            .map(|error| QueryRow::new(vec![Value::Text(error)]))
-                            .collect(),
-                    ))
-                }
-            }
-            PragmaCommand::Set(name, value) => self.execute_pragma_set(name, value),
+            PragmaName::UserVersion => self.execute_application_pragma_query("user_version"),
+            PragmaName::ApplicationId => self.execute_application_pragma_query("application_id"),
+            PragmaName::Encoding => Ok(QueryResult::with_rows(
+                vec!["encoding".to_string()],
+                vec![QueryRow::new(vec![Value::Text("UTF-8".to_string())])],
+            )),
+            PragmaName::LockingMode => Ok(QueryResult::with_rows(
+                vec!["locking_mode".to_string()],
+                vec![QueryRow::new(vec![Value::Text("normal".to_string())])],
+            )),
+            PragmaName::TempStore => Ok(QueryResult::with_rows(
+                vec!["temp_store".to_string()],
+                vec![QueryRow::new(vec![Value::Int64(1)])],
+            )),
+            PragmaName::BusyTimeout => Ok(QueryResult::with_rows(
+                vec!["busy_timeout".to_string()],
+                vec![QueryRow::new(vec![Value::Int64(
+                    i64::try_from(self.inner.busy_timeout_ms.load(Ordering::Acquire))
+                        .unwrap_or(i64::MAX),
+                )])],
+            )),
         }
     }
 
-    fn execute_pragma_set(&self, name: PragmaName, value: i64) -> Result<QueryResult> {
-        match name {
+    fn execute_pragma_call(
+        &self,
+        target: PragmaTarget,
+        argument: Option<String>,
+    ) -> Result<QueryResult> {
+        match target.name {
+            PragmaName::TableInfo => {
+                let table_name = pragma_required_argument(&target, argument)?;
+                self.execute_pragma_table_info(&table_name, target.schema, false)
+            }
+            PragmaName::TableXInfo => {
+                let table_name = pragma_required_argument(&target, argument)?;
+                self.execute_compatibility_select(&format!(
+                    "SELECT * FROM {}pragma_table_xinfo({})",
+                    pragma_schema_function_prefix(target.schema),
+                    sql_string_literal(&table_name)
+                ))
+            }
+            PragmaName::IndexList => {
+                let table_name = pragma_required_argument(&target, argument)?;
+                self.execute_compatibility_select(&format!(
+                    "SELECT * FROM {}pragma_index_list({})",
+                    pragma_schema_function_prefix(target.schema),
+                    sql_string_literal(&table_name)
+                ))
+            }
+            PragmaName::IndexInfo => {
+                let index_name = pragma_required_argument(&target, argument)?;
+                self.execute_compatibility_select(&format!(
+                    "SELECT * FROM {}pragma_index_info({})",
+                    pragma_schema_function_prefix(target.schema),
+                    sql_string_literal(&index_name)
+                ))
+            }
+            PragmaName::IndexXInfo => {
+                let index_name = pragma_required_argument(&target, argument)?;
+                self.execute_compatibility_select(&format!(
+                    "SELECT * FROM {}pragma_index_xinfo({})",
+                    pragma_schema_function_prefix(target.schema),
+                    sql_string_literal(&index_name)
+                ))
+            }
+            PragmaName::ForeignKeyList => {
+                let table_name = pragma_required_argument(&target, argument)?;
+                self.execute_compatibility_select(&format!(
+                    "SELECT * FROM {}pragma_foreign_key_list({})",
+                    pragma_schema_function_prefix(target.schema),
+                    sql_string_literal(&table_name)
+                ))
+            }
+            PragmaName::WalCheckpoint => self.execute_pragma_wal_checkpoint(argument.as_deref()),
+            other => Err(DbError::sql(format!(
+                "PRAGMA {} does not accept call syntax",
+                pragma_name_sql(&other)
+            ))),
+        }
+    }
+
+    fn execute_pragma_table_info(
+        &self,
+        table_name: &str,
+        schema: Option<PragmaSchema>,
+        extended: bool,
+    ) -> Result<QueryResult> {
+        let runtime = self.runtime_for_metadata_inspection()?;
+        let table = match schema {
+            Some(PragmaSchema::Temp) => runtime
+                .temp_table_schema(table_name)
+                .ok_or_else(|| DbError::sql(format!("unknown temporary table {table_name}")))?,
+            Some(PragmaSchema::Main) => runtime
+                .catalog
+                .table(table_name)
+                .ok_or_else(|| DbError::sql(format!("unknown table {table_name}")))?,
+            None => runtime
+                .table_schema(table_name)
+                .ok_or_else(|| DbError::sql(format!("unknown table {table_name}")))?,
+        };
+        let rows = table
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(cid, column)| {
+                let mut values = vec![
+                    Value::Int64(i64::try_from(cid).unwrap_or(i64::MAX)),
+                    Value::Text(column.name.clone()),
+                    Value::Text(column.column_type.as_str().to_string()),
+                    Value::Int64(if column.nullable { 0 } else { 1 }),
+                    column.default_sql.clone().map_or(Value::Null, Value::Text),
+                    Value::Int64(if column.primary_key { 1 } else { 0 }),
+                ];
+                if extended {
+                    let hidden = if column.generated_sql.is_none() {
+                        0
+                    } else if column.generated_stored {
+                        3
+                    } else {
+                        2
+                    };
+                    values.push(Value::Int64(hidden));
+                }
+                QueryRow::new(values)
+            })
+            .collect();
+        let mut columns = vec![
+            "cid".to_string(),
+            "name".to_string(),
+            "type".to_string(),
+            "notnull".to_string(),
+            "dflt_value".to_string(),
+            "pk".to_string(),
+        ];
+        if extended {
+            columns.push("hidden".to_string());
+        }
+        Ok(QueryResult::with_rows(columns, rows))
+    }
+
+    fn execute_compatibility_select(&self, sql: &str) -> Result<QueryResult> {
+        self.execute(sql)
+    }
+
+    fn execute_application_pragma_query(&self, key: &str) -> Result<QueryResult> {
+        let value = self.application_pragma_value(key)?;
+        Ok(QueryResult::with_rows(
+            vec![key.to_string()],
+            vec![QueryRow::new(vec![Value::Int64(value)])],
+        ))
+    }
+
+    fn application_pragma_value(&self, key: &str) -> Result<i64> {
+        let sql = format!(
+            "SELECT value FROM {} WHERE name = {}",
+            sql_identifier(APPLICATION_PRAGMA_TABLE),
+            sql_string_literal(key)
+        );
+        match self.execute(&sql) {
+            Ok(result) => Ok(result
+                .rows()
+                .first()
+                .and_then(|row| row.values().first())
+                .and_then(|value| match value {
+                    Value::Int64(value) => Some(*value),
+                    _ => None,
+                })
+                .unwrap_or(0)),
+            Err(DbError::Sql { message }) if message.contains("unknown table") => Ok(0),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn execute_application_pragma_set(
+        &self,
+        key: &str,
+        value: &PragmaValue,
+    ) -> Result<QueryResult> {
+        let value = pragma_value_i64(value)?;
+        if !(i64::from(i32::MIN)..=i64::from(i32::MAX)).contains(&value) {
+            return Err(DbError::sql(format!(
+                "PRAGMA {key} requires a signed 32-bit integer value"
+            )));
+        }
+        let table = sql_identifier(APPLICATION_PRAGMA_TABLE);
+        let key_sql = sql_string_literal(key);
+        self.execute(&format!(
+            "CREATE TABLE IF NOT EXISTS {table} (name TEXT PRIMARY KEY, value INT64 NOT NULL)"
+        ))?;
+        self.execute(&format!("DELETE FROM {table} WHERE name = {key_sql}"))?;
+        self.execute(&format!(
+            "INSERT INTO {table} (name, value) VALUES ({key_sql}, {value})"
+        ))?;
+        Ok(QueryResult::with_affected_rows(0))
+    }
+
+    fn execute_pragma_wal_checkpoint(&self, mode: Option<&str>) -> Result<QueryResult> {
+        if let Some(mode) = mode {
+            match mode.trim().to_ascii_uppercase().as_str() {
+                "PASSIVE" | "FULL" | "RESTART" | "TRUNCATE" => {}
+                other => {
+                    return Err(DbError::sql(format!(
+                        "PRAGMA wal_checkpoint mode {other} is not supported; expected PASSIVE, FULL, RESTART, or TRUNCATE"
+                    )))
+                }
+            }
+        }
+        let active_readers = self.inner.wal.active_reader_count()?;
+        let retained_snapshot = self.inner.wal.retained_snapshot_lsn().is_some();
+        let before_versions = self.inner.wal.version_count()?;
+        self.checkpoint()?;
+        let after_versions = self.inner.wal.version_count()?;
+        let checkpointed = before_versions.saturating_sub(after_versions);
+        Ok(QueryResult::with_rows(
+            vec![
+                "busy".to_string(),
+                "log".to_string(),
+                "checkpointed".to_string(),
+            ],
+            vec![QueryRow::new(vec![
+                Value::Int64(i64::from(active_readers > 0 || retained_snapshot)),
+                Value::Int64(i64::try_from(before_versions).unwrap_or(i64::MAX)),
+                Value::Int64(i64::try_from(checkpointed).unwrap_or(i64::MAX)),
+            ])],
+        ))
+    }
+
+    fn integrity_check_results(&self) -> Result<QueryResult> {
+        let (mut runtime, snapshot_lsn) = self.runtime_for_targeted_row_source_inspection()?;
+        runtime.rebuild_stale_indexes(self.inner.config.page_size)?;
+        let mut errors = Vec::new();
+        let table_names = runtime.catalog.tables.keys().cloned().collect::<Vec<_>>();
+        for table_name in table_names {
+            self.ensure_inspection_table_row_source(&mut runtime, &table_name, snapshot_lsn)?;
+            let Some(table) = runtime.catalog.table(&table_name).cloned() else {
+                errors.push(format!("table {table_name} is missing schema"));
+                continue;
+            };
+            let Some(row_source) = runtime.table_row_source(&table_name) else {
+                errors.push(format!("table {} is missing row storage", table.name));
+                continue;
+            };
+            for row in row_source.rows() {
+                let row = row?;
+                if row.values().len() != table.columns.len() {
+                    errors.push(format!(
+                        "table {} row {} has {} values but schema defines {} columns",
+                        table_name,
+                        row.row_id(),
+                        row.values().len(),
+                        table.columns.len()
+                    ));
+                    break;
+                }
+            }
+            self.redefer_inspection_table_row_source(&mut runtime, &table_name, snapshot_lsn);
+        }
+        for index in runtime.catalog.indexes.values() {
+            if runtime.catalog.table(&index.table_name).is_none() {
+                errors.push(format!(
+                    "index {} references missing table {}",
+                    index.name, index.table_name
+                ));
+            }
+            let table_deferred = runtime
+                .deferred_table_names()
+                .any(|table_name| identifiers_equal(table_name, &index.table_name));
+            if !table_deferred && !runtime.indexes.contains_key(&index.name) {
+                errors.push(format!("runtime index {} is missing", index.name));
+            }
+        }
+        if errors.is_empty() {
+            Ok(QueryResult::with_rows(
+                vec!["integrity_check".to_string()],
+                vec![QueryRow::new(vec![Value::Text("ok".to_string())])],
+            ))
+        } else {
+            Ok(QueryResult::with_rows(
+                vec!["integrity_check".to_string()],
+                errors
+                    .into_iter()
+                    .map(|error| QueryRow::new(vec![Value::Text(error)]))
+                    .collect(),
+            ))
+        }
+    }
+
+    fn execute_pragma_set(&self, target: PragmaTarget, value: PragmaValue) -> Result<QueryResult> {
+        match target.name {
             PragmaName::PageSize => {
+                let value = pragma_value_i64(&value)?;
                 if value == i64::from(self.inner.config.page_size) {
                     Ok(QueryResult::with_affected_rows(0))
                 } else {
@@ -2811,7 +3318,7 @@ impl Db {
                 }
             }
             PragmaName::CacheSize => {
-                if value == cache_size_pages(&self.inner.config) {
+                if pragma_value_i64(&value)? == cache_size_pages(&self.inner.config) {
                     Ok(QueryResult::with_affected_rows(0))
                 } else {
                     Err(DbError::sql(
@@ -2819,11 +3326,129 @@ impl Db {
                     ))
                 }
             }
-            PragmaName::IntegrityCheck | PragmaName::DatabaseList | PragmaName::TableInfo => {
-                Err(DbError::sql(format!(
-                    "PRAGMA {} does not support assignment",
-                    pragma_name_sql(name)
-                )))
+            PragmaName::IntegrityCheck
+            | PragmaName::DatabaseList
+            | PragmaName::TableInfo
+            | PragmaName::TableXInfo
+            | PragmaName::TableList
+            | PragmaName::IndexList
+            | PragmaName::IndexInfo
+            | PragmaName::IndexXInfo
+            | PragmaName::ForeignKeyList
+            | PragmaName::WalCheckpoint
+            | PragmaName::QuickCheck => Err(DbError::sql(format!(
+                "PRAGMA {} does not support assignment",
+                pragma_name_sql(&target.name)
+            ))),
+            PragmaName::ForeignKeys => {
+                let value = parse_pragma_bool_value(&value, "PRAGMA foreign_keys")?;
+                if value {
+                    Ok(QueryResult::with_affected_rows(0))
+                } else {
+                    Err(DbError::sql(
+                        "PRAGMA foreign_keys cannot disable foreign key enforcement in DecentDB",
+                    ))
+                }
+            }
+            PragmaName::JournalMode => {
+                let mode = parse_pragma_text_or_mode(&value, "PRAGMA journal_mode")?;
+                if mode == "WAL" {
+                    Ok(QueryResult::with_rows(
+                        vec!["journal_mode".to_string()],
+                        vec![QueryRow::new(vec![Value::Text("wal".to_string())])],
+                    ))
+                } else {
+                    Err(DbError::sql(
+                        "PRAGMA journal_mode supports only WAL in this compatibility slice",
+                    ))
+                }
+            }
+            PragmaName::Synchronous => {
+                let requested = parse_pragma_synchronous_request(&value, "PRAGMA synchronous")?;
+                let current = self.inner.config.wal_sync_mode;
+                match requested {
+                    SynchronousRequest::Full => {
+                        if current == WalSyncMode::Full {
+                            Ok(QueryResult::with_affected_rows(0))
+                        } else {
+                            Err(DbError::sql(
+                                "PRAGMA synchronous = FULL requires reopening with DbConfig::wal_sync_mode = Full",
+                            ))
+                        }
+                    }
+                    SynchronousRequest::Normal => {
+                        if current == WalSyncMode::Normal
+                            || matches!(current, WalSyncMode::AsyncCommit { .. })
+                        {
+                            Ok(QueryResult::with_affected_rows(0))
+                        } else {
+                            Err(DbError::sql(
+                                "PRAGMA synchronous = NORMAL requires reopening with DbConfig::wal_sync_mode = Normal or AsyncCommit",
+                            ))
+                        }
+                    }
+                    SynchronousRequest::Off => {
+                        if current == WalSyncMode::TestingOnlyUnsafeNoSync {
+                            Ok(QueryResult::with_affected_rows(0))
+                        } else {
+                            Err(DbError::sql(
+                                "PRAGMA synchronous = OFF requires reopening with DbConfig::wal_sync_mode = TestingOnlyUnsafeNoSync",
+                            ))
+                        }
+                    }
+                    SynchronousRequest::Extra => Err(DbError::sql(
+                        "PRAGMA synchronous = EXTRA is not supported by DecentDB",
+                    )),
+                }
+            }
+            PragmaName::SchemaVersion => Err(DbError::sql(
+                "PRAGMA schema_version does not support assignment",
+            )),
+            PragmaName::UserVersion => self.execute_application_pragma_set("user_version", &value),
+            PragmaName::ApplicationId => {
+                self.execute_application_pragma_set("application_id", &value)
+            }
+            PragmaName::Encoding => {
+                let mode = parse_pragma_text_or_mode(&value, "PRAGMA encoding")?;
+                if mode == "UTF-8" || mode == "UTF8" {
+                    Ok(QueryResult::with_affected_rows(0))
+                } else {
+                    Err(DbError::sql(
+                        "PRAGMA encoding can only be set to UTF-8 in this compatibility slice",
+                    ))
+                }
+            }
+            PragmaName::LockingMode => {
+                let mode = parse_pragma_text_or_mode(&value, "PRAGMA locking_mode")?;
+                if mode == "NORMAL" {
+                    Ok(QueryResult::with_affected_rows(0))
+                } else {
+                    Err(DbError::sql(
+                        "PRAGMA locking_mode supports only NORMAL in this compatibility slice",
+                    ))
+                }
+            }
+            PragmaName::TempStore => {
+                let value = parse_pragma_text_or_mode(&value, "PRAGMA temp_store")?;
+                if matches!(value.as_str(), "DEFAULT" | "FILE" | "0" | "1") {
+                    Ok(QueryResult::with_affected_rows(0))
+                } else if value == "MEMORY" {
+                    Err(DbError::sql(
+                        "PRAGMA temp_store = MEMORY is not supported in this compatibility slice",
+                    ))
+                } else {
+                    Err(DbError::sql(
+                        "PRAGMA temp_store accepts 0, 1, 'DEFAULT', or 'FILE' only",
+                    ))
+                }
+            }
+            PragmaName::BusyTimeout => {
+                let value = pragma_value_i64(&value)?;
+                let value = u64::try_from(value).map_err(|_| {
+                    DbError::sql("PRAGMA busy_timeout requires a non-negative integer")
+                })?;
+                self.inner.busy_timeout_ms.store(value, Ordering::Release);
+                Ok(QueryResult::with_affected_rows(0))
             }
         }
     }
@@ -3419,6 +4044,7 @@ impl Db {
             }
         };
         runtime.rebuild_stale_indexes(self.inner.config.page_size)?;
+        let reactive_pending = self.take_reactive_pending_commit(&mut runtime);
         self.begin_write()?;
         if let Err(error) = runtime.persist_to_db(self) {
             let _ = self.rollback();
@@ -3444,6 +4070,7 @@ impl Db {
             .writer_last_commit_lsn
             .store(committed_lsn, Ordering::Release);
         drop(runtime);
+        self.publish_reactive_commit(reactive_pending, committed_lsn);
         self.redefer_persisted_tables_after_write(&table_refs)?;
         Ok(result)
     }
@@ -3486,6 +4113,7 @@ impl Db {
             }
         };
         runtime.rebuild_stale_indexes(self.inner.config.page_size)?;
+        let reactive_pending = self.take_reactive_pending_commit(&mut runtime);
         self.begin_write()?;
         if let Err(error) = runtime.persist_to_db(self) {
             let _ = self.rollback();
@@ -3511,6 +4139,7 @@ impl Db {
             .writer_last_commit_lsn
             .store(committed_lsn, Ordering::Release);
         drop(runtime);
+        self.publish_reactive_commit(reactive_pending, committed_lsn);
         self.redefer_persisted_tables_after_write(&[prepared_update.table_name.as_str()])?;
         Ok(result)
     }
@@ -3555,6 +4184,7 @@ impl Db {
             }
         };
         runtime.rebuild_stale_indexes(self.inner.config.page_size)?;
+        let reactive_pending = self.take_reactive_pending_commit(&mut runtime);
         self.begin_write()?;
         if let Err(error) = runtime.persist_to_db(self) {
             let _ = self.rollback();
@@ -3578,6 +4208,7 @@ impl Db {
             .writer_last_commit_lsn
             .store(committed_lsn, Ordering::Release);
         drop(runtime);
+        self.publish_reactive_commit(reactive_pending, committed_lsn);
         self.redefer_persisted_tables_after_write(&table_names)?;
         Ok(result)
     }
@@ -3635,6 +4266,7 @@ impl Db {
             }
         };
         runtime.rebuild_stale_indexes(self.inner.config.page_size)?;
+        let reactive_pending = self.take_reactive_pending_commit(&mut runtime);
         self.begin_write()?;
         if let Err(error) = runtime.persist_to_db(self) {
             let _ = self.rollback();
@@ -3658,6 +4290,7 @@ impl Db {
             .writer_last_commit_lsn
             .store(committed_lsn, Ordering::Release);
         drop(runtime);
+        self.publish_reactive_commit(reactive_pending, committed_lsn);
         self.redefer_persisted_tables_after_write(table_refs)?;
         Ok(Some(result))
     }
@@ -3717,6 +4350,7 @@ impl Db {
             }
         };
         runtime.rebuild_stale_indexes(self.inner.config.page_size)?;
+        let reactive_pending = self.take_reactive_pending_commit(&mut runtime);
         self.begin_write()?;
         if let Err(error) = runtime.persist_to_db(self) {
             let _ = self.rollback();
@@ -3740,6 +4374,7 @@ impl Db {
             .writer_last_commit_lsn
             .store(committed_lsn, Ordering::Release);
         drop(runtime);
+        self.publish_reactive_commit(reactive_pending, committed_lsn);
         self.redefer_persisted_tables_after_write(table_refs)?;
         Ok(Some(QueryResult::with_affected_rows(affected)))
     }
@@ -3779,6 +4414,7 @@ impl Db {
             }
         };
         runtime.rebuild_stale_indexes(self.inner.config.page_size)?;
+        let reactive_pending = self.take_reactive_pending_commit(&mut runtime);
         self.begin_write()?;
         if let Err(error) = runtime.persist_to_db(self) {
             let _ = self.rollback();
@@ -3808,6 +4444,7 @@ impl Db {
             .writer_last_commit_lsn
             .store(committed_lsn, Ordering::Release);
         drop(runtime);
+        self.publish_reactive_commit(reactive_pending, committed_lsn);
         self.redefer_persisted_tables_after_write(&[prepared_update.table_name.as_str()])?;
         Ok(Some(result))
     }
@@ -3849,6 +4486,7 @@ impl Db {
             }
         };
         runtime.rebuild_stale_indexes(self.inner.config.page_size)?;
+        let reactive_pending = self.take_reactive_pending_commit(&mut runtime);
         self.begin_write()?;
         if let Err(error) = runtime.persist_to_db(self) {
             let _ = self.rollback();
@@ -3878,6 +4516,7 @@ impl Db {
             .writer_last_commit_lsn
             .store(committed_lsn, Ordering::Release);
         drop(runtime);
+        self.publish_reactive_commit(reactive_pending, committed_lsn);
         self.redefer_persisted_tables_after_write(&table_names)?;
         Ok(Some(result))
     }
@@ -3900,6 +4539,7 @@ impl Db {
             }
         };
         runtime.rebuild_stale_indexes(self.inner.config.page_size)?;
+        let reactive_pending = self.take_reactive_pending_commit(&mut runtime);
         self.begin_write()?;
         if let Err(error) = runtime.persist_to_db(self) {
             let _ = self.rollback();
@@ -3928,6 +4568,8 @@ impl Db {
         self.inner
             .writer_last_commit_lsn
             .store(committed_lsn, Ordering::Release);
+        drop(runtime);
+        self.publish_reactive_commit(reactive_pending, committed_lsn);
         Ok(result)
     }
 
@@ -4337,6 +4979,7 @@ impl Db {
                 .runtime
                 .rebuild_stale_indexes(self.inner.config.page_size)?;
         }
+        let reactive_pending = self.take_reactive_pending_commit(&mut state.runtime);
         self.begin_write()?;
         if let Err(error) = state.runtime.persist_to_db(self) {
             let _ = self.rollback();
@@ -4369,6 +5012,8 @@ impl Db {
         self.inner
             .writer_last_commit_lsn
             .store(committed_lsn, Ordering::Release);
+        drop(state);
+        self.publish_reactive_commit(reactive_pending, committed_lsn);
         Ok(committed_lsn)
     }
 
@@ -4387,6 +5032,7 @@ impl Db {
         if rebuild_stale_indexes {
             runtime.rebuild_stale_indexes(self.inner.config.page_size)?;
         }
+        let reactive_pending = self.take_reactive_pending_commit(&mut runtime);
         self.begin_write()?;
         if let Err(error) = runtime.persist_to_db(self) {
             let _ = self.rollback();
@@ -4427,6 +5073,7 @@ impl Db {
             .writer_last_commit_lsn
             .store(committed_lsn, Ordering::Release);
         drop(guard);
+        self.publish_reactive_commit(reactive_pending, committed_lsn);
 
         Ok(committed_lsn)
     }
@@ -4444,6 +5091,107 @@ impl Db {
         self.refresh_engine_from_snapshot(snapshot_lsn)?;
         drop(reader);
         Ok((self.engine_snapshot()?, Some(snapshot_lsn)))
+    }
+
+    fn validate_watch_tables(&self, tables: &[String]) -> Result<BTreeSet<String>> {
+        if tables.is_empty() {
+            return Err(DbError::sql("watch table list must not be empty"));
+        }
+        let runtime = self
+            .inner
+            .engine
+            .read()
+            .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+        let mut canonical = BTreeSet::new();
+        for table in tables {
+            let schema = runtime
+                .catalog
+                .table(table)
+                .ok_or_else(|| DbError::sql(format!("unknown watch table {table}")))?;
+            if schema.temporary || crate::sync::is_internal_table_name(&schema.name) {
+                return Err(DbError::sql(format!(
+                    "table {} is not watchable",
+                    schema.name
+                )));
+            }
+            canonical.insert(schema.name.clone());
+        }
+        Ok(canonical)
+    }
+
+    fn validate_watch_range_table(&self, table: &str) -> Result<String> {
+        let runtime = self
+            .inner
+            .engine
+            .read()
+            .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+        let schema = runtime
+            .catalog
+            .table(table)
+            .ok_or_else(|| DbError::sql(format!("unknown watch table {table}")))?;
+        if schema.temporary || crate::sync::is_internal_table_name(&schema.name) {
+            return Err(DbError::sql(format!(
+                "table {} is not watchable",
+                schema.name
+            )));
+        }
+        if schema.primary_key_columns.is_empty() {
+            return Err(DbError::sql(format!(
+                "range watch requires a primary key on table {}",
+                schema.name
+            )));
+        }
+        Ok(schema.name.clone())
+    }
+
+    fn query_watch_dependencies(
+        &self,
+        statement: &crate::sql::ast::Statement,
+    ) -> Result<BTreeSet<String>> {
+        let referenced = crate::sql::ast::safe_referenced_tables(statement)
+            .ok_or_else(|| DbError::sql("query dependencies are not watchable for this SELECT"))?;
+        let runtime = self
+            .inner
+            .engine
+            .read()
+            .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+        let mut dependencies = BTreeSet::new();
+        for name in referenced {
+            if let Some(table) = runtime.catalog.table(&name) {
+                if table.temporary || crate::sync::is_internal_table_name(&table.name) {
+                    return Err(DbError::sql(format!(
+                        "table {} is not watchable",
+                        table.name
+                    )));
+                }
+                dependencies.insert(table.name.clone());
+            } else if let Some(view) = runtime.catalog.view(&name) {
+                if view.temporary || crate::sync::is_internal_table_name(&view.name) {
+                    return Err(DbError::sql(format!("view {} is not watchable", view.name)));
+                }
+                for dependency in &view.dependencies {
+                    let table = runtime.catalog.table(dependency).ok_or_else(|| {
+                        DbError::sql(format!(
+                            "view {} depends on unknown table {}",
+                            view.name, dependency
+                        ))
+                    })?;
+                    if !table.temporary && !crate::sync::is_internal_table_name(&table.name) {
+                        dependencies.insert(table.name.clone());
+                    }
+                }
+            } else {
+                return Err(DbError::sql(format!(
+                    "query dependency {name} is not a watchable table or view"
+                )));
+            }
+        }
+        if dependencies.is_empty() {
+            return Err(DbError::sql(
+                "query subscription has no watchable table dependencies",
+            ));
+        }
+        Ok(dependencies)
     }
 
     fn ensure_inspection_table_row_source(
@@ -5718,10 +6466,15 @@ impl Db {
             };
             base_tables
         };
-        if names.is_empty() {
+        let should_load_extension_catalog = self.inner.config.extension_unsigned_development_mode
+            || !self.inner.config.extension_trust_anchors.is_empty();
+        if names.is_empty() && !should_load_extension_catalog {
             return Ok(true);
         }
-        let names_refs: Vec<&str> = names.iter().map(|s: &String| s.as_str()).collect();
+        let mut names_refs: Vec<&str> = names.iter().map(|s: &String| s.as_str()).collect();
+        if should_load_extension_catalog {
+            names_refs.extend(crate::extensions::extension_catalog_table_names());
+        }
         self.ensure_tables_loaded_at_snapshot(&names_refs, snapshot_lsn)?;
         Ok(true)
     }
@@ -6578,6 +7331,20 @@ impl Db {
             })
             .collect::<Vec<_>>();
         watermark_entries.extend(self.sync_peer_watermark_entries()?);
+        watermark_entries.extend(
+            self.sync_shape_clients()?
+                .into_iter()
+                .filter(|client| client.retention_blocking)
+                .map(|client| {
+                    (
+                        format!(
+                            "shape:{}:client:{}",
+                            client.shape_id, client.client_replica_id
+                        ),
+                        client.last_ack_watermark,
+                    )
+                }),
+        );
         watermark_entries.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
         watermark_entries.dedup();
         let lowest_watermark = watermark_entries
@@ -6929,6 +7696,1236 @@ impl Db {
         SyncChangeBatch::from_records(records)
     }
 
+    pub fn sync_create_changeset(
+        &self,
+        mut options: CreateChangesetOptions,
+    ) -> Result<SyncChangeset> {
+        self.ensure_sync_tables()?;
+        let mut scoped_from_shape = false;
+        if let Some(principal) = options.principal.as_ref() {
+            principal.validate()?;
+        }
+        if let Some(shape_id) = options.shape_id.as_deref() {
+            let shape = self.sync_shape(shape_id)?.ok_or_else(|| {
+                DbError::sql(format!(
+                    "SHAPE_NOT_FOUND: sync shape '{shape_id}' not found"
+                ))
+            })?;
+            self.sync_authorize_shape(options.principal.as_ref(), &shape)?;
+            options.scope_name = Some(shape.scope_name);
+            scoped_from_shape = true;
+        }
+        if let Some(scope_name) = options.scope_name.as_deref() {
+            if !scoped_from_shape {
+                self.sync_authorize_scope(options.principal.as_ref(), scope_name)?;
+            }
+        }
+
+        let max_records = options
+            .max_records
+            .map(usize::try_from)
+            .transpose()
+            .map_err(|_| DbError::sql("max_records is too large"))?
+            .unwrap_or(usize::MAX);
+        let created_at_micros = current_time_micros();
+        let tooling = self.get_tooling_metadata()?;
+        let runtime = self.runtime_for_metadata_inspection()?;
+        let schema_cookie = runtime.catalog.schema_cookie;
+        let tenant_id = options
+            .principal
+            .as_ref()
+            .map(|principal| principal.tenant_id.clone())
+            .or_else(|| {
+                options
+                    .shape_id
+                    .as_deref()
+                    .and_then(|shape_id| self.sync_shape(shape_id).ok().flatten())
+                    .map(|shape| shape.tenant_id)
+            });
+
+        let mut changeset = match &options.source {
+            SyncChangesetSource::Checkpoint {
+                peer,
+                since_sequence,
+            } => {
+                let batch = match options.scope_name.as_deref() {
+                    Some(scope_name) => {
+                        self.sync_export_batch_for_scope(scope_name, *since_sequence, max_records)?
+                    }
+                    None => self.sync_export_batch(*since_sequence, max_records)?,
+                };
+                let source_replica_id = batch
+                    .source_replica_id
+                    .clone()
+                    .or_else(|| self.sync_status().ok().and_then(|status| status.replica_id))
+                    .unwrap_or_else(|| "unknown".to_string());
+                let records = batch
+                    .records
+                    .iter()
+                    .map(sync_changeset_record_from_journal_record)
+                    .collect::<Vec<_>>();
+                let start_checkpoint = batch.first_sequence;
+                let end_checkpoint = batch.last_sequence;
+                let source_high_watermark = batch
+                    .source_high_watermark
+                    .or(batch.last_sequence)
+                    .or_else(|| {
+                        self.sync_integrity_report()
+                            .ok()
+                            .and_then(|report| report.last_sequence)
+                    });
+                let changeset_id = sync_changeset_id(
+                    "checkpoint",
+                    &source_replica_id,
+                    created_at_micros,
+                    records.len(),
+                );
+                SyncChangeset {
+                    changeset_version: crate::sync::SYNC_CHANGESET_VERSION,
+                    changeset_id,
+                    source_replica_id,
+                    source_kind: options.source.kind(),
+                    tenant_id,
+                    scope_name: options.scope_name.clone(),
+                    shape_id: options.shape_id.clone(),
+                    base_kind: "checkpoint".to_string(),
+                    base_checkpoint: Some(SyncChangesetCheckpoint {
+                        peer: peer.clone(),
+                        sequence: *since_sequence,
+                    }),
+                    base_branch: None,
+                    base_snapshot: None,
+                    start_checkpoint,
+                    end_checkpoint,
+                    source_high_watermark,
+                    schema_fingerprint: tooling.schema_fingerprint.clone(),
+                    schema_cookie,
+                    sync_contract_version: crate::sync::SYNC_CONTRACT_VERSION,
+                    query_contract_fingerprint: None,
+                    producer_capabilities: SyncChangesetCapabilities::default(),
+                    limits: SyncChangesetLimits::default(),
+                    records,
+                    conflict_policy_hint: None,
+                    created_at_micros,
+                    integrity_hash: None,
+                }
+            }
+            SyncChangesetSource::Branch { from, to } => {
+                self.sync_create_diff_changeset(SyncDiffChangesetContext {
+                    base_kind: "branch",
+                    from_ref: from,
+                    to_ref: to,
+                    scope_name: options.scope_name.as_deref(),
+                    shape_id: options.shape_id.as_deref(),
+                    tenant_id: tenant_id.as_deref(),
+                    schema_fingerprint: &tooling.schema_fingerprint,
+                    schema_cookie,
+                    created_at_micros,
+                    max_records,
+                })?
+            }
+            SyncChangesetSource::Snapshot { from, to } => {
+                self.sync_create_diff_changeset(SyncDiffChangesetContext {
+                    base_kind: "snapshot",
+                    from_ref: from,
+                    to_ref: to,
+                    scope_name: options.scope_name.as_deref(),
+                    shape_id: options.shape_id.as_deref(),
+                    tenant_id: tenant_id.as_deref(),
+                    schema_fingerprint: &tooling.schema_fingerprint,
+                    schema_cookie,
+                    created_at_micros,
+                    max_records,
+                })?
+            }
+        };
+        self.sync_finalize_changeset(&mut changeset, options.max_bytes)?;
+        self.sync_record_changeset_history(&changeset, "created", None)?;
+        Ok(changeset)
+    }
+
+    fn sync_create_diff_changeset(
+        &self,
+        ctx: SyncDiffChangesetContext<'_>,
+    ) -> Result<SyncChangeset> {
+        let diff = self.branch_diff(ctx.from_ref, ctx.to_ref)?;
+        let table_infos = self
+            .list_tables()?
+            .into_iter()
+            .map(|table| (table.name.clone(), table))
+            .collect::<BTreeMap<_, _>>();
+        let mut records = Vec::new();
+        let source_replica_id = format!("{}:{}:{}", ctx.base_kind, ctx.from_ref, ctx.to_ref);
+        let mut sequence = 1u64;
+        for table_diff in &diff.tables {
+            if matches!(
+                table_diff.status,
+                crate::branch::BranchTableDiffStatus::Unsupported
+            ) {
+                return Err(DbError::sql(format!(
+                    "CHANGESET_UNSUPPORTED: branch/snapshot diff for table '{}' is unsupported: {}",
+                    table_diff.table,
+                    table_diff
+                        .message
+                        .clone()
+                        .unwrap_or_else(|| "unsupported row diff".to_string())
+                )));
+            }
+            if table_diff.schema_changed {
+                return Err(DbError::sql(format!(
+                    "SCHEMA_INCOMPATIBLE: changeset diff for table '{}' changes schema",
+                    table_diff.table
+                )));
+            }
+            let Some(table) = table_infos.get(&table_diff.table) else {
+                continue;
+            };
+            let pk_names = &table.primary_key_columns;
+            let column_names = table
+                .columns
+                .iter()
+                .map(|column| column.name.clone())
+                .collect::<Vec<_>>();
+            let table_context = BranchChangesetTableContext {
+                source_replica_id: &source_replica_id,
+                table_name: &table.name,
+                primary_key_columns: pk_names,
+                column_names: &column_names,
+                schema_cookie: ctx.schema_cookie,
+                created_at_micros: ctx.created_at_micros,
+            };
+            for row in &table_diff.added {
+                records.push(sync_changeset_record_from_branch_row(
+                    &table_context,
+                    sequence,
+                    "insert",
+                    row,
+                )?);
+                sequence += 1;
+            }
+            for row in &table_diff.updated {
+                records.push(sync_changeset_record_from_branch_row(
+                    &table_context,
+                    sequence,
+                    "update",
+                    row,
+                )?);
+                sequence += 1;
+            }
+            for row in &table_diff.deleted {
+                records.push(sync_changeset_record_from_branch_row(
+                    &table_context,
+                    sequence,
+                    "delete",
+                    row,
+                )?);
+                sequence += 1;
+            }
+            if records.len() > ctx.max_records {
+                return Err(DbError::sql(
+                    "BATCH_TOO_LARGE: changeset exceeds max_records",
+                ));
+            }
+        }
+
+        let source_kind = if ctx.base_kind == "branch" {
+            crate::sync::SyncChangesetSourceKind::Branch
+        } else {
+            crate::sync::SyncChangesetSourceKind::Snapshot
+        };
+        let changeset_id = sync_changeset_id(
+            ctx.base_kind,
+            &source_replica_id,
+            ctx.created_at_micros,
+            records.len(),
+        );
+        Ok(SyncChangeset {
+            changeset_version: crate::sync::SYNC_CHANGESET_VERSION,
+            changeset_id,
+            source_replica_id,
+            source_kind,
+            tenant_id: ctx.tenant_id.map(str::to_string),
+            scope_name: ctx.scope_name.map(str::to_string),
+            shape_id: ctx.shape_id.map(str::to_string),
+            base_kind: ctx.base_kind.to_string(),
+            base_checkpoint: None,
+            base_branch: (ctx.base_kind == "branch").then(|| ctx.from_ref.to_string()),
+            base_snapshot: (ctx.base_kind == "snapshot").then(|| ctx.from_ref.to_string()),
+            start_checkpoint: records.first().map(|record| record.origin_sequence),
+            end_checkpoint: records.last().map(|record| record.origin_sequence),
+            source_high_watermark: records.last().map(|record| record.origin_sequence),
+            schema_fingerprint: ctx.schema_fingerprint.to_string(),
+            schema_cookie: ctx.schema_cookie,
+            sync_contract_version: crate::sync::SYNC_CONTRACT_VERSION,
+            query_contract_fingerprint: None,
+            producer_capabilities: SyncChangesetCapabilities {
+                before_images: true,
+                ..SyncChangesetCapabilities::default()
+            },
+            limits: SyncChangesetLimits::default(),
+            records,
+            conflict_policy_hint: None,
+            created_at_micros: ctx.created_at_micros,
+            integrity_hash: None,
+        })
+    }
+
+    pub fn sync_inspect_changeset(
+        &self,
+        changeset: &SyncChangeset,
+        options: InspectChangesetOptions,
+    ) -> Result<SyncChangesetInspection> {
+        self.sync_validate_changeset_envelope(changeset)?;
+        let bytes = serde_json::to_vec(changeset)
+            .map_err(|error| DbError::internal(format!("failed to serialize changeset: {error}")))?
+            .len() as u64;
+        let mut tables = BTreeSet::new();
+        let mut operations = BTreeMap::new();
+        let mut warnings = Vec::new();
+        for record in &changeset.records {
+            tables.insert(record.table.clone());
+            *operations.entry(record.operation.clone()).or_insert(0u64) += 1;
+            if record.operation == "delete" && record.before.is_none() {
+                warnings.push(format!(
+                    "delete record for table '{}' cannot be inverted without before image",
+                    record.table
+                ));
+            }
+        }
+        let compatibility = if options.check_local_compatibility {
+            match self.sync_check_changeset_compatibility(changeset) {
+                Ok(()) => SyncChangesetCompatibility {
+                    checked_against_local_db: true,
+                    status: "compatible".to_string(),
+                    message: None,
+                },
+                Err(error) => SyncChangesetCompatibility {
+                    checked_against_local_db: true,
+                    status: "incompatible".to_string(),
+                    message: Some(error.to_string()),
+                },
+            }
+        } else {
+            SyncChangesetCompatibility {
+                checked_against_local_db: false,
+                status: "not_checked".to_string(),
+                message: None,
+            }
+        };
+        Ok(SyncChangesetInspection {
+            changeset_id: changeset.changeset_id.clone(),
+            valid_envelope: true,
+            source_kind: changeset.source_kind.clone(),
+            scope_name: changeset.scope_name.clone(),
+            shape_id: changeset.shape_id.clone(),
+            record_count: changeset.records.len() as u64,
+            bytes,
+            tables: tables.into_iter().collect(),
+            operations,
+            start_checkpoint: changeset.start_checkpoint,
+            end_checkpoint: changeset.end_checkpoint,
+            schema_fingerprint: changeset.schema_fingerprint.clone(),
+            compatibility,
+            warnings,
+        })
+    }
+
+    pub fn sync_apply_changeset(
+        &self,
+        changeset: &SyncChangeset,
+        options: ApplyChangesetOptions,
+    ) -> Result<SyncChangesetApplyResult> {
+        self.ensure_sync_tables()?;
+        self.sync_validate_changeset_envelope(changeset)?;
+        if !options.atomic {
+            return Err(DbError::sql(
+                "CHANGESET_UNSUPPORTED: non-atomic changeset apply is not supported",
+            ));
+        }
+        if let Some(principal) = options.principal.as_ref() {
+            principal.validate()?;
+        }
+        let mut scope_authorized_via_shape = false;
+        if let Some(shape_id) = changeset.shape_id.as_deref() {
+            let shape = self.sync_shape(shape_id)?.ok_or_else(|| {
+                DbError::sql(format!(
+                    "SHAPE_NOT_FOUND: sync shape '{shape_id}' not found"
+                ))
+            })?;
+            scope_authorized_via_shape = true;
+            self.sync_authorize_shape(options.principal.as_ref(), &shape)?;
+        }
+        if let Some(scope_name) = changeset.scope_name.as_deref() {
+            if !scope_authorized_via_shape {
+                self.sync_authorize_scope(options.principal.as_ref(), scope_name)?;
+            }
+        }
+        if matches!(
+            options.compatibility_mode,
+            crate::sync::SyncCompatibilityMode::Strict
+        ) {
+            self.sync_check_changeset_compatibility(changeset)?;
+        }
+        let integrity_hash = self.sync_changeset_integrity_hash(changeset)?;
+        if let Some(existing) =
+            self.sync_read_metadata(&changeset_applied_key(&changeset.changeset_id))?
+        {
+            if existing != integrity_hash {
+                return Err(DbError::sql(format!(
+                    "CHANGESET_ID_COLLISION: changeset '{}' was already applied with a different integrity hash",
+                    changeset.changeset_id
+                )));
+            }
+            return Ok(SyncChangesetApplyResult {
+                outcome: "already_applied".to_string(),
+                changeset_id: changeset.changeset_id.clone(),
+                rows_seen: changeset.records.len() as u64,
+                rows_applied: 0,
+                rows_skipped: changeset.records.len() as u64,
+                rows_conflicted: 0,
+                checkpoint_after: changeset.source_high_watermark.or(changeset.end_checkpoint),
+            });
+        }
+
+        let journal_records = changeset
+            .records
+            .iter()
+            .map(sync_journal_record_from_changeset_record)
+            .collect::<Result<Vec<_>>>()?;
+        let batch = SyncChangeBatch::scoped_from_records(
+            journal_records,
+            Some(changeset.source_replica_id.clone()),
+            changeset.source_high_watermark.or(changeset.end_checkpoint),
+        )?;
+        let summary = match (changeset.scope_name.as_deref(), options.conflict_policy) {
+            (Some(scope_name), Some(policy)) => {
+                self.sync_import_batch_for_scope_with_policy(scope_name, &batch, policy)?
+            }
+            (Some(scope_name), None) => self.sync_import_batch_for_scope(scope_name, &batch)?,
+            (None, Some(policy)) => self.sync_import_batch_with_policy(&batch, policy)?,
+            (None, None) => self.sync_import_batch(&batch)?,
+        };
+        self.sync_upsert_metadata(
+            &changeset_applied_key(&changeset.changeset_id),
+            &integrity_hash,
+        )?;
+        self.sync_record_changeset_history(changeset, "applied", Some(current_time_micros()))?;
+        Ok(SyncChangesetApplyResult {
+            outcome: if summary.conflicted > 0 {
+                "conflict_recorded".to_string()
+            } else {
+                "applied".to_string()
+            },
+            changeset_id: changeset.changeset_id.clone(),
+            rows_seen: summary.seen as u64,
+            rows_applied: summary.applied as u64,
+            rows_skipped: summary.skipped as u64,
+            rows_conflicted: summary.conflicted as u64,
+            checkpoint_after: changeset.source_high_watermark.or(changeset.end_checkpoint),
+        })
+    }
+
+    pub fn sync_invert_changeset(
+        &self,
+        changeset: &SyncChangeset,
+        _options: InvertChangesetOptions,
+    ) -> Result<SyncChangeset> {
+        self.sync_validate_changeset_envelope(changeset)?;
+        let created_at_micros = current_time_micros();
+        let mut inverse_records = Vec::with_capacity(changeset.records.len());
+        for (index, record) in changeset.records.iter().enumerate() {
+            let operation = match record.operation.as_str() {
+                "insert" => "delete",
+                "delete" if record.before.is_some() => "insert",
+                "update" if record.before.is_some() => "update",
+                "delete" | "update" => {
+                    return Err(DbError::sql(format!(
+                        "CHANGESET_INVERSION_UNSUPPORTED: record {index} lacks before image"
+                    )));
+                }
+                other => {
+                    return Err(DbError::sql(format!(
+                        "CHANGESET_INVALID: unsupported record operation '{other}'"
+                    )));
+                }
+            };
+            inverse_records.push(SyncChangesetRecord {
+                record_version: record.record_version,
+                table: record.table.clone(),
+                operation: operation.to_string(),
+                primary_key: record.primary_key.clone(),
+                origin_replica_id: format!("inverse:{}", changeset.changeset_id),
+                origin_sequence: (index as u64) + 1,
+                transaction_id: format!("txn:inverse:{}", changeset.changeset_id),
+                transaction_lsn: (index as u64) + 1,
+                schema_cookie: record.schema_cookie,
+                before_hash: None,
+                before: record.after.clone(),
+                after: if operation == "delete" {
+                    None
+                } else {
+                    record.before.clone()
+                },
+                column_mask: record.column_mask.clone(),
+                tombstone: operation == "delete",
+                conflict_metadata: None,
+            });
+        }
+        let source_replica_id = format!("inverse:{}", changeset.source_replica_id);
+        let mut inverse = SyncChangeset {
+            changeset_version: crate::sync::SYNC_CHANGESET_VERSION,
+            changeset_id: sync_changeset_id(
+                "inverse",
+                &source_replica_id,
+                created_at_micros,
+                inverse_records.len(),
+            ),
+            source_replica_id,
+            source_kind: changeset.source_kind.clone(),
+            tenant_id: changeset.tenant_id.clone(),
+            scope_name: changeset.scope_name.clone(),
+            shape_id: changeset.shape_id.clone(),
+            base_kind: format!("inverse:{}", changeset.base_kind),
+            base_checkpoint: changeset.base_checkpoint.clone(),
+            base_branch: changeset.base_branch.clone(),
+            base_snapshot: changeset.base_snapshot.clone(),
+            start_checkpoint: inverse_records.first().map(|record| record.origin_sequence),
+            end_checkpoint: inverse_records.last().map(|record| record.origin_sequence),
+            source_high_watermark: inverse_records.last().map(|record| record.origin_sequence),
+            schema_fingerprint: changeset.schema_fingerprint.clone(),
+            schema_cookie: changeset.schema_cookie,
+            sync_contract_version: changeset.sync_contract_version,
+            query_contract_fingerprint: changeset.query_contract_fingerprint.clone(),
+            producer_capabilities: SyncChangesetCapabilities {
+                before_images: true,
+                ..SyncChangesetCapabilities::default()
+            },
+            limits: SyncChangesetLimits::default(),
+            records: inverse_records,
+            conflict_policy_hint: changeset.conflict_policy_hint.clone(),
+            created_at_micros,
+            integrity_hash: None,
+        };
+        self.sync_finalize_changeset(&mut inverse, None)?;
+        Ok(inverse)
+    }
+
+    pub fn sync_create_shape(&self, options: CreateShapeOptions) -> Result<SyncShape> {
+        self.ensure_sync_tables()?;
+        let shape_id = options.shape_id.trim();
+        let scope_name = options.scope_name.trim();
+        let tenant_id = options.tenant_id.trim();
+        if shape_id.is_empty() {
+            return Err(DbError::sql("sync shape_id must not be empty"));
+        }
+        if scope_name.is_empty() {
+            return Err(DbError::sql("sync shape scope_name must not be empty"));
+        }
+        if tenant_id.is_empty() {
+            return Err(DbError::sql(
+                "TENANT_REQUIRED: sync shape tenant_id is required",
+            ));
+        }
+        let scope = self
+            .sync_scope(scope_name)?
+            .ok_or_else(|| DbError::sql(format!("sync scope '{scope_name}' not found")))?;
+        if scope.include_tables.is_empty() {
+            return Err(DbError::sql(format!(
+                "sync scope '{scope_name}' has no included tables"
+            )));
+        }
+        let name = options.name.as_deref().unwrap_or(shape_id).trim();
+        if name.is_empty() {
+            return Err(DbError::sql("sync shape name must not be empty"));
+        }
+        let now = current_time_micros();
+        let existing = self.sync_shape(shape_id)?;
+        let created_at_micros = existing
+            .as_ref()
+            .map(|shape| shape.created_at_micros)
+            .unwrap_or(now);
+        let retention_ttl_micros = options
+            .retention_ttl_micros
+            .unwrap_or(30 * 24 * 60 * 60 * 1_000_000);
+        let max_records = options.max_records.unwrap_or(50_000);
+        let ack_deadline_micros = options.ack_deadline_micros.unwrap_or(30_000_000);
+        let heartbeat_micros = options.heartbeat_micros.unwrap_or(20_000_000);
+        let allowed_roles_json =
+            serde_json::to_string(&options.allowed_roles).map_err(|error| {
+                DbError::internal(format!("failed to encode shape allowed roles: {error}"))
+            })?;
+        let allowed_subjects_json =
+            serde_json::to_string(&options.allowed_subjects).map_err(|error| {
+                DbError::internal(format!("failed to encode shape allowed subjects: {error}"))
+            })?;
+        let sql = format!(
+            "INSERT INTO {table} (shape_id, name, scope_name, tenant_id, allowed_roles_json, allowed_subjects_json, created_at_micros, updated_at_micros, retention_ttl_micros, max_records, ack_deadline_micros, heartbeat_micros) VALUES ({shape_id}, {name}, {scope_name}, {tenant_id}, {allowed_roles_json}, {allowed_subjects_json}, {created_at_micros}, {updated_at_micros}, {retention_ttl_micros}, {max_records}, {ack_deadline_micros}, {heartbeat_micros}) ON CONFLICT (shape_id) DO UPDATE SET name = {name}, scope_name = {scope_name}, tenant_id = {tenant_id}, allowed_roles_json = {allowed_roles_json}, allowed_subjects_json = {allowed_subjects_json}, updated_at_micros = {updated_at_micros}, retention_ttl_micros = {retention_ttl_micros}, max_records = {max_records}, ack_deadline_micros = {ack_deadline_micros}, heartbeat_micros = {heartbeat_micros}",
+            table = crate::sync::SHAPES_TABLE,
+            shape_id = sql_text_literal(shape_id),
+            name = sql_text_literal(name),
+            scope_name = sql_text_literal(&scope.name),
+            tenant_id = sql_text_literal(tenant_id),
+            allowed_roles_json = sql_text_literal(&allowed_roles_json),
+            allowed_subjects_json = sql_text_literal(&allowed_subjects_json),
+            created_at_micros = created_at_micros,
+            updated_at_micros = now,
+            retention_ttl_micros = retention_ttl_micros,
+            max_records = max_records,
+            ack_deadline_micros = ack_deadline_micros,
+            heartbeat_micros = heartbeat_micros,
+        );
+        let _ = self.execute(&sql)?;
+        self.sync_shape(shape_id)?
+            .ok_or_else(|| DbError::internal("sync shape missing after create/update"))
+    }
+
+    pub fn sync_drop_shape(&self, shape_id: &str) -> Result<bool> {
+        self.ensure_sync_tables()?;
+        let shape_id = shape_id.trim();
+        if shape_id.is_empty() {
+            return Err(DbError::sql("sync shape_id must not be empty"));
+        }
+        let _ = self.execute(&format!(
+            "DELETE FROM {} WHERE shape_id = {}",
+            crate::sync::SHAPE_CLIENTS_TABLE,
+            sql_text_literal(shape_id)
+        ))?;
+        let result = self.execute(&format!(
+            "DELETE FROM {} WHERE shape_id = {}",
+            crate::sync::SHAPES_TABLE,
+            sql_text_literal(shape_id)
+        ))?;
+        Ok(result.affected_rows() > 0)
+    }
+
+    pub fn sync_shape(&self, shape_id: &str) -> Result<Option<SyncShape>> {
+        self.ensure_sync_tables()?;
+        let sql = format!(
+            "SELECT shape_id, name, scope_name, tenant_id, allowed_roles_json, allowed_subjects_json, created_at_micros, updated_at_micros, retention_ttl_micros, max_records, ack_deadline_micros, heartbeat_micros FROM {} WHERE shape_id = {}",
+            crate::sync::SHAPES_TABLE,
+            sql_text_literal(shape_id)
+        );
+        match self.execute(&sql) {
+            Ok(result) => result.rows().first().map(sync_shape_from_row).transpose(),
+            Err(error) => {
+                let message = error.to_string();
+                if message.contains("no such table") || message.contains("unknown table") {
+                    Ok(None)
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    pub fn sync_shapes(&self) -> Result<Vec<SyncShape>> {
+        self.ensure_sync_tables()?;
+        let sql = format!(
+            "SELECT shape_id, name, scope_name, tenant_id, allowed_roles_json, allowed_subjects_json, created_at_micros, updated_at_micros, retention_ttl_micros, max_records, ack_deadline_micros, heartbeat_micros FROM {} ORDER BY shape_id",
+            crate::sync::SHAPES_TABLE,
+        );
+        match self.execute(&sql) {
+            Ok(result) => result.rows().iter().map(sync_shape_from_row).collect(),
+            Err(error) => {
+                let message = error.to_string();
+                if message.contains("no such table") || message.contains("unknown table") {
+                    Ok(Vec::new())
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    pub fn sync_shape_clients(&self) -> Result<Vec<SyncShapeClient>> {
+        self.ensure_sync_tables()?;
+        let sql = format!(
+            "SELECT shape_id, tenant_id, client_replica_id, subject_id, session_id, last_ack_sequence, last_ack_watermark, last_changeset_id, last_seen_at_micros, retention_blocking, status FROM {} ORDER BY shape_id, client_replica_id",
+            crate::sync::SHAPE_CLIENTS_TABLE,
+        );
+        match self.execute(&sql) {
+            Ok(result) => result
+                .rows()
+                .iter()
+                .map(sync_shape_client_from_row)
+                .collect(),
+            Err(error) => {
+                let message = error.to_string();
+                if message.contains("no such table") || message.contains("unknown table") {
+                    Ok(Vec::new())
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    pub fn sync_shape_snapshot(
+        &self,
+        shape_id: &str,
+        _client_replica_id: &str,
+        principal: Option<SyncPrincipal>,
+    ) -> Result<SyncShapeDelivery> {
+        self.ensure_sync_tables()?;
+        let shape = self.sync_shape(shape_id)?.ok_or_else(|| {
+            DbError::sql(format!(
+                "SHAPE_NOT_FOUND: sync shape '{shape_id}' not found"
+            ))
+        })?;
+        self.sync_authorize_shape(principal.as_ref(), &shape)?;
+        let scope = self
+            .sync_scope(&shape.scope_name)?
+            .ok_or_else(|| DbError::sql(format!("sync scope '{}' not found", shape.scope_name)))?;
+        let changeset =
+            self.sync_create_shape_snapshot_changeset(&shape, &scope, principal.as_ref())?;
+        let shape_sequence = changeset
+            .source_high_watermark
+            .or(changeset.end_checkpoint)
+            .unwrap_or(0);
+        Ok(SyncShapeDelivery {
+            message_type: "snapshot".to_string(),
+            shape_id: shape.shape_id,
+            shape_sequence,
+            ack_deadline_micros: current_time_micros() + shape.ack_deadline_micros,
+            checkpoint: SyncShapeCheckpoint {
+                shape_sequence,
+                source_high_watermark: changeset.source_high_watermark.unwrap_or(shape_sequence),
+            },
+            changeset,
+        })
+    }
+
+    pub fn sync_shape_changes(
+        &self,
+        shape_id: &str,
+        since_watermark: u64,
+        principal: Option<SyncPrincipal>,
+    ) -> Result<SyncShapeDelivery> {
+        let shape = self.sync_shape(shape_id)?.ok_or_else(|| {
+            DbError::sql(format!(
+                "SHAPE_NOT_FOUND: sync shape '{shape_id}' not found"
+            ))
+        })?;
+        self.sync_authorize_shape(principal.as_ref(), &shape)?;
+        let retention = self.sync_retention_report()?;
+        if let Some(first_sequence) = retention.first_sequence {
+            if since_watermark > 0 && since_watermark < first_sequence {
+                return Err(DbError::sql(format!(
+                    "SHAPE_RESYNC_REQUIRED: since checkpoint {since_watermark} is below retained first sequence {first_sequence}"
+                )));
+            }
+        }
+        let changeset = self.sync_create_changeset(CreateChangesetOptions {
+            source: SyncChangesetSource::Checkpoint {
+                peer: shape_id.to_string(),
+                since_sequence: since_watermark,
+            },
+            scope_name: Some(shape.scope_name.clone()),
+            shape_id: Some(shape.shape_id.clone()),
+            max_records: Some(shape.max_records),
+            max_bytes: None,
+            principal,
+        })?;
+        let shape_sequence = changeset
+            .source_high_watermark
+            .or(changeset.end_checkpoint)
+            .unwrap_or(since_watermark);
+        Ok(SyncShapeDelivery {
+            message_type: "changeset".to_string(),
+            shape_id: shape.shape_id,
+            shape_sequence,
+            ack_deadline_micros: current_time_micros() + shape.ack_deadline_micros,
+            checkpoint: SyncShapeCheckpoint {
+                shape_sequence,
+                source_high_watermark: changeset.source_high_watermark.unwrap_or(shape_sequence),
+            },
+            changeset,
+        })
+    }
+
+    pub fn sync_ack_shape(&self, ack: ShapeAckOptions) -> Result<SyncShapeClient> {
+        self.sync_ack_shape_with_principal(ack, None)
+    }
+
+    pub fn sync_ack_shape_with_principal(
+        &self,
+        ack: ShapeAckOptions,
+        principal: Option<&SyncPrincipal>,
+    ) -> Result<SyncShapeClient> {
+        self.ensure_sync_tables()?;
+        let shape = self.sync_shape(&ack.shape_id)?.ok_or_else(|| {
+            DbError::sql(format!(
+                "SHAPE_NOT_FOUND: sync shape '{}' not found",
+                ack.shape_id
+            ))
+        })?;
+        self.sync_authorize_shape(principal, &shape)?;
+        if !shape.tenant_id.eq_ignore_ascii_case(&ack.tenant_id) {
+            return Err(DbError::sql(format!(
+                "AUTH_FORBIDDEN: shape '{}' belongs to tenant '{}'",
+                shape.shape_id, shape.tenant_id
+            )));
+        }
+        let now = current_time_micros();
+        let sql = format!(
+            "INSERT INTO {table} (shape_id, tenant_id, client_replica_id, subject_id, session_id, last_ack_sequence, last_ack_watermark, last_changeset_id, last_seen_at_micros, retention_blocking, status) VALUES ({shape_id}, {tenant_id}, {client_replica_id}, {subject_id}, {session_id}, {last_ack_sequence}, {last_ack_watermark}, {last_changeset_id}, {last_seen_at_micros}, 1, 'active') ON CONFLICT (shape_id, client_replica_id) DO UPDATE SET tenant_id = {tenant_id}, subject_id = {subject_id}, session_id = {session_id}, last_ack_sequence = {last_ack_sequence}, last_ack_watermark = {last_ack_watermark}, last_changeset_id = {last_changeset_id}, last_seen_at_micros = {last_seen_at_micros}, retention_blocking = 1, status = 'active'",
+            table = crate::sync::SHAPE_CLIENTS_TABLE,
+            shape_id = sql_text_literal(&shape.shape_id),
+            tenant_id = sql_text_literal(&ack.tenant_id),
+            client_replica_id = sql_text_literal(&ack.client_replica_id),
+            subject_id = sql_text_literal(&ack.subject_id),
+            session_id = sql_nullable_text_literal(ack.session_id.as_deref()),
+            last_ack_sequence = ack.shape_sequence,
+            last_ack_watermark = ack.source_high_watermark,
+            last_changeset_id = sql_nullable_text_literal(ack.changeset_id.as_deref()),
+            last_seen_at_micros = now,
+        );
+        let _ = self.execute(&sql)?;
+        self.sync_shape_clients()?
+            .into_iter()
+            .find(|client| {
+                client.shape_id == shape.shape_id
+                    && client.client_replica_id == ack.client_replica_id
+            })
+            .ok_or_else(|| DbError::internal("sync shape client missing after ack"))
+    }
+
+    pub fn sync_relay_status(
+        &self,
+        relay_id: Option<&str>,
+        production_mode: bool,
+        secure_transport_required: bool,
+        insecure_override_enabled: bool,
+        started_at_micros: Option<i64>,
+    ) -> Result<SyncRelayStatus> {
+        let status = self.sync_status()?;
+        let active_sessions = self
+            .sync_relay_sessions()?
+            .into_iter()
+            .filter(|session| session.ended_at_micros.is_none() && session.status == "started")
+            .count() as u64;
+        Ok(SyncRelayStatus {
+            relay_id: relay_id.unwrap_or("relay-local").to_string(),
+            protocol_version: crate::sync::SYNC_RELAY_PROTOCOL_VERSION,
+            database_replica_id: status.replica_id,
+            production_mode,
+            secure_transport_required,
+            insecure_override_enabled,
+            active_sessions,
+            active_streams: 0,
+            started_at_micros: started_at_micros.unwrap_or_else(current_time_micros),
+        })
+    }
+
+    pub fn sync_relay_sessions(&self) -> Result<Vec<SyncRelaySession>> {
+        self.ensure_sync_tables()?;
+        let sql = format!(
+            "SELECT session_id, tenant_id, subject_id, subject_kind, request_id, operation, scope_name, shape_id, started_at_micros, ended_at_micros, status, error, rows_seen, bytes_seen FROM {} ORDER BY started_at_micros, session_id",
+            crate::sync::RELAY_SESSIONS_TABLE,
+        );
+        match self.execute(&sql) {
+            Ok(result) => result
+                .rows()
+                .iter()
+                .map(sync_relay_session_from_row)
+                .collect(),
+            Err(error) => {
+                let message = error.to_string();
+                if message.contains("no such table") || message.contains("unknown table") {
+                    Ok(Vec::new())
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    pub fn sync_start_relay_session(
+        &self,
+        principal: &SyncPrincipal,
+        operation: &str,
+        scope_name: Option<&str>,
+        shape_id: Option<&str>,
+    ) -> Result<SyncRelaySession> {
+        self.ensure_sync_tables()?;
+        principal.validate()?;
+        let started_at_micros = current_time_micros();
+        let session_id = principal.session_id.clone();
+        let sql = format!(
+            "INSERT INTO {table} (session_id, tenant_id, subject_id, subject_kind, request_id, operation, scope_name, shape_id, started_at_micros, ended_at_micros, status, error, rows_seen, bytes_seen) VALUES ({session_id}, {tenant_id}, {subject_id}, {subject_kind}, {request_id}, {operation}, {scope_name}, {shape_id}, {started_at_micros}, NULL, 'started', NULL, 0, 0) ON CONFLICT (session_id) DO UPDATE SET tenant_id = {tenant_id}, subject_id = {subject_id}, subject_kind = {subject_kind}, request_id = {request_id}, operation = {operation}, scope_name = {scope_name}, shape_id = {shape_id}, started_at_micros = {started_at_micros}, ended_at_micros = NULL, status = 'started', error = NULL",
+            table = crate::sync::RELAY_SESSIONS_TABLE,
+            session_id = sql_text_literal(&session_id),
+            tenant_id = sql_text_literal(&principal.tenant_id),
+            subject_id = sql_text_literal(&principal.subject_id),
+            subject_kind = sql_text_literal(principal.subject_kind.as_str()),
+            request_id = sql_text_literal(&principal.request_id),
+            operation = sql_text_literal(operation),
+            scope_name = sql_nullable_text_literal(scope_name),
+            shape_id = sql_nullable_text_literal(shape_id),
+            started_at_micros = started_at_micros,
+        );
+        let _ = self.execute(&sql)?;
+        self.sync_relay_sessions()?
+            .into_iter()
+            .find(|session| session.session_id == session_id)
+            .ok_or_else(|| DbError::internal("sync relay session missing after start"))
+    }
+
+    pub fn sync_finish_relay_session(
+        &self,
+        session_id: &str,
+        status: &str,
+        error: Option<&str>,
+        rows_seen: u64,
+        bytes_seen: u64,
+    ) -> Result<()> {
+        self.ensure_sync_tables()?;
+        let sql = format!(
+            "UPDATE {table} SET ended_at_micros = {ended_at_micros}, status = {status}, error = {error}, rows_seen = {rows_seen}, bytes_seen = {bytes_seen} WHERE session_id = {session_id}",
+            table = crate::sync::RELAY_SESSIONS_TABLE,
+            ended_at_micros = current_time_micros(),
+            status = sql_text_literal(status),
+            error = sql_nullable_text_literal(error),
+            rows_seen = rows_seen,
+            bytes_seen = bytes_seen,
+            session_id = sql_text_literal(session_id),
+        );
+        let _ = self.execute(&sql)?;
+        Ok(())
+    }
+
+    pub fn sync_changeset_history(&self) -> Result<Vec<SyncChangesetHistory>> {
+        self.ensure_sync_tables()?;
+        let sql = format!(
+            "SELECT changeset_id, source_replica_id, source_kind, scope_name, shape_id, record_count, bytes, created_at_micros, applied_at_micros, outcome, integrity_hash FROM {} ORDER BY created_at_micros, changeset_id",
+            crate::sync::CHANGESET_HISTORY_TABLE,
+        );
+        match self.execute(&sql) {
+            Ok(result) => result
+                .rows()
+                .iter()
+                .map(sync_changeset_history_from_row)
+                .collect(),
+            Err(error) => {
+                let message = error.to_string();
+                if message.contains("no such table") || message.contains("unknown table") {
+                    Ok(Vec::new())
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    fn sync_authorize_scope(
+        &self,
+        principal: Option<&SyncPrincipal>,
+        scope_name: &str,
+    ) -> Result<()> {
+        if let Some(principal) = principal {
+            if !principal.allows_scope(scope_name) {
+                return Err(DbError::sql(format!(
+                    "SCOPE_UNAUTHORIZED: principal '{}' cannot access scope '{}'",
+                    principal.subject_id, scope_name
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn sync_authorize_shape(
+        &self,
+        principal: Option<&SyncPrincipal>,
+        shape: &SyncShape,
+    ) -> Result<()> {
+        let Some(principal) = principal else {
+            return Ok(());
+        };
+        if !principal.tenant_id.eq_ignore_ascii_case(&shape.tenant_id) {
+            return Err(DbError::sql(format!(
+                "AUTH_FORBIDDEN: shape '{}' belongs to tenant '{}'",
+                shape.shape_id, shape.tenant_id
+            )));
+        }
+        if !principal.allows_shape(&shape.shape_id) {
+            return Err(DbError::sql(format!(
+                "AUTH_FORBIDDEN: principal '{}' cannot access shape '{}'",
+                principal.subject_id, shape.shape_id
+            )));
+        }
+        if !shape.allowed_subjects.is_empty()
+            && !shape
+                .allowed_subjects
+                .iter()
+                .any(|subject| subject == "*" || subject == &principal.subject_id)
+        {
+            return Err(DbError::sql(format!(
+                "AUTH_FORBIDDEN: subject '{}' is not allowed for shape '{}'",
+                principal.subject_id, shape.shape_id
+            )));
+        }
+        if !shape.allowed_roles.is_empty()
+            && !principal.roles.iter().any(|role| {
+                shape
+                    .allowed_roles
+                    .iter()
+                    .any(|allowed| allowed == "*" || allowed == role)
+            })
+        {
+            return Err(DbError::sql(format!(
+                "AUTH_FORBIDDEN: principal '{}' lacks a role for shape '{}'",
+                principal.subject_id, shape.shape_id
+            )));
+        }
+        Ok(())
+    }
+
+    fn sync_create_shape_snapshot_changeset(
+        &self,
+        shape: &SyncShape,
+        scope: &SyncScope,
+        principal: Option<&SyncPrincipal>,
+    ) -> Result<SyncChangeset> {
+        let created_at_micros = current_time_micros();
+        let tooling = self.get_tooling_metadata()?;
+        let runtime = self.runtime_for_metadata_inspection()?;
+        let schema_cookie = runtime.catalog.schema_cookie;
+        let source_replica_id = self
+            .sync_status()
+            .ok()
+            .and_then(|status| status.replica_id)
+            .unwrap_or_else(|| "snapshot".to_string());
+        let mut records = Vec::new();
+        let mut origin_sequence = 1u64;
+        for table_name in &scope.include_tables {
+            let table = runtime.catalog.table(table_name).ok_or_else(|| {
+                DbError::sql(format!("sync scope table '{table_name}' does not exist"))
+            })?;
+            let column_sql = table
+                .columns
+                .iter()
+                .map(|column| sql_identifier(&column.name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let order_by = table
+                .primary_key_columns
+                .iter()
+                .map(|column| sql_identifier(column))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let where_sql = scope
+                .row_filter
+                .as_ref()
+                .map(|filter| format!(" WHERE {filter}"))
+                .unwrap_or_default();
+            let sql = format!(
+                "SELECT {column_sql} FROM {}{where_sql} ORDER BY {order_by}",
+                sql_identifier(&table.name)
+            );
+            let result = self.execute(&sql)?;
+            for row in result.rows() {
+                let after = crate::sync::build_after_json(table, row.values());
+                let primary_key = crate::sync::build_primary_key_json(table, row.values());
+                records.push(SyncChangesetRecord {
+                    record_version: 1,
+                    table: table.name.clone(),
+                    operation: "insert".to_string(),
+                    primary_key,
+                    origin_replica_id: source_replica_id.clone(),
+                    origin_sequence,
+                    transaction_id: format!("shape-snapshot:{}:{origin_sequence}", shape.shape_id),
+                    transaction_lsn: origin_sequence,
+                    schema_cookie,
+                    before_hash: None,
+                    before: None,
+                    after: Some(after),
+                    column_mask: table
+                        .columns
+                        .iter()
+                        .map(|column| column.name.clone())
+                        .collect(),
+                    tombstone: false,
+                    conflict_metadata: None,
+                });
+                origin_sequence += 1;
+                if records.len() as u64 > shape.max_records {
+                    return Err(DbError::sql(
+                        "BATCH_TOO_LARGE: shape snapshot exceeds max_records",
+                    ));
+                }
+            }
+        }
+        let high_watermark = self.sync_integrity_report()?.last_sequence.unwrap_or(0);
+        let mut changeset = SyncChangeset {
+            changeset_version: crate::sync::SYNC_CHANGESET_VERSION,
+            changeset_id: sync_changeset_id(
+                "shape_snapshot",
+                &source_replica_id,
+                created_at_micros,
+                records.len(),
+            ),
+            source_replica_id,
+            source_kind: crate::sync::SyncChangesetSourceKind::Snapshot,
+            tenant_id: Some(
+                principal
+                    .map(|principal| principal.tenant_id.clone())
+                    .unwrap_or_else(|| shape.tenant_id.clone()),
+            ),
+            scope_name: Some(scope.name.clone()),
+            shape_id: Some(shape.shape_id.clone()),
+            base_kind: "snapshot".to_string(),
+            base_checkpoint: None,
+            base_branch: None,
+            base_snapshot: Some(format!("shape:{}", shape.shape_id)),
+            start_checkpoint: records.first().map(|record| record.origin_sequence),
+            end_checkpoint: records.last().map(|record| record.origin_sequence),
+            source_high_watermark: Some(high_watermark),
+            schema_fingerprint: tooling.schema_fingerprint,
+            schema_cookie,
+            sync_contract_version: crate::sync::SYNC_CONTRACT_VERSION,
+            query_contract_fingerprint: None,
+            producer_capabilities: SyncChangesetCapabilities::default(),
+            limits: SyncChangesetLimits::default(),
+            records,
+            conflict_policy_hint: None,
+            created_at_micros,
+            integrity_hash: None,
+        };
+        self.sync_finalize_changeset(&mut changeset, None)?;
+        self.sync_record_changeset_history(&changeset, "created", None)?;
+        Ok(changeset)
+    }
+
+    fn sync_finalize_changeset(
+        &self,
+        changeset: &mut SyncChangeset,
+        max_bytes: Option<u64>,
+    ) -> Result<()> {
+        changeset.limits.record_count = changeset.records.len() as u64;
+        changeset.limits.uncompressed_bytes = 0;
+        changeset.integrity_hash = None;
+        let bytes = serde_json::to_vec(changeset)
+            .map_err(|error| DbError::internal(format!("failed to serialize changeset: {error}")))?
+            .len() as u64;
+        if max_bytes.is_some_and(|limit| bytes > limit) {
+            return Err(DbError::sql(format!(
+                "BATCH_TOO_LARGE: changeset is {bytes} bytes"
+            )));
+        }
+        changeset.limits.uncompressed_bytes = bytes;
+        let hash = self.sync_changeset_integrity_hash(changeset)?;
+        changeset.integrity_hash = Some(hash);
+        Ok(())
+    }
+
+    fn sync_validate_changeset_envelope(&self, changeset: &SyncChangeset) -> Result<()> {
+        if changeset.changeset_version != crate::sync::SYNC_CHANGESET_VERSION {
+            return Err(DbError::sql(format!(
+                "CHANGESET_UNSUPPORTED: unsupported changeset version {}",
+                changeset.changeset_version
+            )));
+        }
+        if changeset.sync_contract_version != crate::sync::SYNC_CONTRACT_VERSION {
+            return Err(DbError::sql(format!(
+                "CHANGESET_UNSUPPORTED: unsupported sync contract version {}",
+                changeset.sync_contract_version
+            )));
+        }
+        if changeset.changeset_id.trim().is_empty() {
+            return Err(DbError::sql("CHANGESET_INVALID: changeset_id is required"));
+        }
+        let Some(expected_hash) = changeset.integrity_hash.as_deref() else {
+            return Err(DbError::sql(
+                "CHANGESET_INVALID: integrity_hash is required",
+            ));
+        };
+        let actual_hash = self.sync_changeset_integrity_hash(changeset)?;
+        if expected_hash != actual_hash {
+            return Err(DbError::sql(
+                "CHANGESET_INVALID: integrity_hash does not match payload",
+            ));
+        }
+        for (index, record) in changeset.records.iter().enumerate() {
+            if record.record_version != 1 {
+                return Err(DbError::sql(format!(
+                    "CHANGESET_UNSUPPORTED: record {index} uses version {}",
+                    record.record_version
+                )));
+            }
+            match record.operation.as_str() {
+                "insert" | "update" if record.after.is_none() => {
+                    return Err(DbError::sql(format!(
+                        "CHANGESET_INVALID: record {index} operation '{}' requires after image",
+                        record.operation
+                    )));
+                }
+                "insert" | "update" | "delete" => {}
+                other => {
+                    return Err(DbError::sql(format!(
+                        "CHANGESET_INVALID: unsupported record operation '{other}'"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn sync_check_changeset_compatibility(&self, changeset: &SyncChangeset) -> Result<()> {
+        let tooling = self.get_tooling_metadata()?;
+        if tooling.schema_fingerprint != changeset.schema_fingerprint {
+            return Err(DbError::sql(format!(
+                "SCHEMA_INCOMPATIBLE: local schema fingerprint {} does not match changeset {}",
+                tooling.schema_fingerprint, changeset.schema_fingerprint
+            )));
+        }
+        let runtime = self.runtime_for_metadata_inspection()?;
+        if runtime.catalog.schema_cookie != changeset.schema_cookie {
+            return Err(DbError::sql(format!(
+                "SCHEMA_INCOMPATIBLE: local schema_cookie {} does not match changeset {}",
+                runtime.catalog.schema_cookie, changeset.schema_cookie
+            )));
+        }
+        Ok(())
+    }
+
+    fn sync_changeset_integrity_hash(&self, changeset: &SyncChangeset) -> Result<String> {
+        let mut clone = changeset.clone();
+        clone.integrity_hash = None;
+        let bytes = serde_json::to_vec(&clone).map_err(|error| {
+            DbError::internal(format!("failed to serialize changeset: {error}"))
+        })?;
+        let digest = Sha256::digest(&bytes);
+        Ok(format!("sha256:{}", hex_encode(&digest)))
+    }
+
+    fn sync_record_changeset_history(
+        &self,
+        changeset: &SyncChangeset,
+        outcome: &str,
+        applied_at_micros: Option<i64>,
+    ) -> Result<()> {
+        self.ensure_sync_tables()?;
+        let sql = format!(
+            "INSERT INTO {table} (changeset_id, source_replica_id, source_kind, scope_name, shape_id, record_count, bytes, created_at_micros, applied_at_micros, outcome, integrity_hash) VALUES ({changeset_id}, {source_replica_id}, {source_kind}, {scope_name}, {shape_id}, {record_count}, {bytes}, {created_at_micros}, {applied_at_micros}, {outcome}, {integrity_hash}) ON CONFLICT (changeset_id) DO UPDATE SET applied_at_micros = COALESCE({applied_at_micros}, applied_at_micros), outcome = {outcome}, integrity_hash = {integrity_hash}",
+            table = crate::sync::CHANGESET_HISTORY_TABLE,
+            changeset_id = sql_text_literal(&changeset.changeset_id),
+            source_replica_id = sql_text_literal(&changeset.source_replica_id),
+            source_kind = sql_text_literal(changeset.source_kind.as_str()),
+            scope_name = sql_nullable_text_literal(changeset.scope_name.as_deref()),
+            shape_id = sql_nullable_text_literal(changeset.shape_id.as_deref()),
+            record_count = changeset.records.len(),
+            bytes = changeset.limits.uncompressed_bytes,
+            created_at_micros = changeset.created_at_micros,
+            applied_at_micros = applied_at_micros
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "NULL".to_string()),
+            outcome = sql_text_literal(outcome),
+            integrity_hash = sql_nullable_text_literal(changeset.integrity_hash.as_deref()),
+        );
+        let _ = self.execute(&sql)?;
+        Ok(())
+    }
+
     pub fn sync_conflict_policy(&self) -> Result<SyncConflictPolicyConfig> {
         let default_policy = self
             .sync_read_metadata("conflict_policy")?
@@ -7149,7 +9146,7 @@ impl Db {
             self.sync_upsert_metadata(&peer_watermark_key(replica_id), &watermark.to_string())?;
         }
 
-        tx.commit()?;
+        crate::reactive::with_change_source(ChangeSource::SyncApply, || tx.commit())?;
         Ok(SyncImportSummary {
             seen: batch.record_count,
             applied,
@@ -8237,6 +10234,10 @@ impl Db {
         let _ = self.execute(crate::sync::SCOPES_TABLE_DDL)?;
         let _ = self.execute(crate::sync::PEER_SCOPES_TABLE_DDL)?;
         let _ = self.execute(crate::sync::CONFLICTS_TABLE_DDL)?;
+        let _ = self.execute(crate::sync::CHANGESET_HISTORY_TABLE_DDL)?;
+        let _ = self.execute(crate::sync::RELAY_SESSIONS_TABLE_DDL)?;
+        let _ = self.execute(crate::sync::SHAPES_TABLE_DDL)?;
+        let _ = self.execute(crate::sync::SHAPE_CLIENTS_TABLE_DDL)?;
         self.ensure_sync_conflict_columns()?;
         Ok(())
     }
@@ -8370,13 +10371,22 @@ impl Db {
         };
         if !params.is_empty() {
             return Err(DbError::sql(
-                "sync inspection system views do not accept parameters",
+                "system inspection views do not accept parameters",
             ));
         }
         match query {
             SyncInspectionQuery::Status => self.sync_status_query_result().map(Some),
             SyncInspectionQuery::Journal { since_sequence } => {
                 self.sync_journal_query_result(since_sequence).map(Some)
+            }
+            SyncInspectionQuery::WalMetrics => self.wal_metrics_query_result().map(Some),
+            SyncInspectionQuery::WriteQueueMetrics => {
+                self.write_queue_metrics_query_result().map(Some)
+            }
+            SyncInspectionQuery::StorageMetrics => self.storage_metrics_query_result().map(Some),
+            SyncInspectionQuery::ReactiveMetrics => self.reactive_metrics_query_result().map(Some),
+            SyncInspectionQuery::ReactiveSubscriptions => {
+                self.reactive_subscriptions_query_result().map(Some)
             }
             SyncInspectionQuery::Peers => self.sync_peers_query_result().map(Some),
             SyncInspectionQuery::Retention => self.sync_retention_query_result().map(Some),
@@ -8390,6 +10400,13 @@ impl Db {
                 self.sync_conflict_policy_query_result().map(Some)
             }
             SyncInspectionQuery::Conflicts => self.sync_conflicts_query_result().map(Some),
+            SyncInspectionQuery::RelayStatus => self.sync_relay_status_query_result().map(Some),
+            SyncInspectionQuery::RelaySessions => self.sync_relay_sessions_query_result().map(Some),
+            SyncInspectionQuery::Shapes => self.sync_shapes_query_result().map(Some),
+            SyncInspectionQuery::ShapeClients => self.sync_shape_clients_query_result().map(Some),
+            SyncInspectionQuery::ChangesetHistory => {
+                self.sync_changeset_history_query_result().map(Some)
+            }
         }
     }
 
@@ -8410,6 +10427,194 @@ impl Db {
                 status.journal_path.map_or(Value::Null, Value::Text),
                 sync_u64_to_i64(status.journal_size_bytes, "journal_size_bytes")?,
             ])],
+        ))
+    }
+
+    fn wal_metrics_query_result(&self) -> Result<QueryResult> {
+        let latest_lsn = self.inner.wal.latest_snapshot();
+        let file_size = self.inner.wal.file_size()?;
+        let active_readers = self.inner.wal.active_reader_count()?;
+        let max_page_count = self.inner.wal.max_page_count();
+        let checkpoint_epoch = self.inner.wal.checkpoint_epoch();
+        let warning_count = self.inner.wal.warnings()?.len();
+        let version_count = self.inner.wal.version_count()?;
+        let (resident_versions, on_disk_versions) = self.inner.wal.version_counts_by_payload()?;
+        Ok(QueryResult::with_rows(
+            vec![
+                "latest_lsn".to_string(),
+                "file_size_bytes".to_string(),
+                "active_readers".to_string(),
+                "max_page_count".to_string(),
+                "checkpoint_epoch".to_string(),
+                "warning_count".to_string(),
+                "version_count".to_string(),
+                "resident_versions".to_string(),
+                "on_disk_versions".to_string(),
+                "shared_wal".to_string(),
+            ],
+            vec![QueryRow::new(vec![
+                sync_u64_to_i64(latest_lsn, "latest_lsn")?,
+                sync_u64_to_i64(file_size, "file_size_bytes")?,
+                sync_usize_to_i64(active_readers, "active_readers")?,
+                sync_u64_to_i64(max_page_count as u64, "max_page_count")?,
+                sync_u64_to_i64(checkpoint_epoch, "checkpoint_epoch")?,
+                sync_u64_to_i64(warning_count as u64, "warning_count")?,
+                sync_u64_to_i64(version_count as u64, "version_count")?,
+                sync_u64_to_i64(resident_versions as u64, "resident_versions")?,
+                sync_u64_to_i64(on_disk_versions as u64, "on_disk_versions")?,
+                Value::Bool(self.inner.wal.is_shared()),
+            ])],
+        ))
+    }
+
+    fn write_queue_metrics_query_result(&self) -> Result<QueryResult> {
+        let metrics = self.write_queue_metrics();
+        Ok(QueryResult::with_rows(
+            vec![
+                "capacity".to_string(),
+                "current_depth".to_string(),
+                "admitted".to_string(),
+                "rejected".to_string(),
+                "timed_out".to_string(),
+                "canceled".to_string(),
+                "executed".to_string(),
+                "committed".to_string(),
+                "failed".to_string(),
+                "group_commit_batches".to_string(),
+                "group_commit_syncs".to_string(),
+                "group_commit_max_batch".to_string(),
+                "group_commit_commits_covered".to_string(),
+                "physical_syncs_saved".to_string(),
+                "total_queue_wait_ns".to_string(),
+            ],
+            vec![QueryRow::new(vec![
+                sync_usize_to_i64(metrics.capacity, "capacity")?,
+                sync_usize_to_i64(metrics.current_depth, "current_depth")?,
+                sync_u64_to_i64(metrics.admitted, "admitted")?,
+                sync_u64_to_i64(metrics.rejected, "rejected")?,
+                sync_u64_to_i64(metrics.timed_out, "timed_out")?,
+                sync_u64_to_i64(metrics.canceled, "canceled")?,
+                sync_u64_to_i64(metrics.executed, "executed")?,
+                sync_u64_to_i64(metrics.committed, "committed")?,
+                sync_u64_to_i64(metrics.failed, "failed")?,
+                sync_u64_to_i64(metrics.group_commit_batches, "group_commit_batches")?,
+                sync_u64_to_i64(metrics.group_commit_syncs, "group_commit_syncs")?,
+                sync_u64_to_i64(metrics.group_commit_max_batch, "group_commit_max_batch")?,
+                sync_u64_to_i64(
+                    metrics.group_commit_commits_covered,
+                    "group_commit_commits_covered",
+                )?,
+                sync_u64_to_i64(metrics.physical_syncs_saved, "physical_syncs_saved")?,
+                sync_u64_to_i64(metrics.total_queue_wait_ns, "total_queue_wait_ns")?,
+            ])],
+        ))
+    }
+
+    fn storage_metrics_query_result(&self) -> Result<QueryResult> {
+        let storage = self.storage_info()?;
+        Ok(QueryResult::with_rows(
+            vec![
+                "path".to_string(),
+                "wal_path".to_string(),
+                "format_version".to_string(),
+                "page_size".to_string(),
+                "cache_size_mb".to_string(),
+                "page_count".to_string(),
+                "schema_cookie".to_string(),
+                "wal_end_lsn".to_string(),
+                "wal_file_size".to_string(),
+                "last_checkpoint_lsn".to_string(),
+                "active_readers".to_string(),
+                "wal_versions".to_string(),
+                "warning_count".to_string(),
+                "shared_wal".to_string(),
+            ],
+            vec![QueryRow::new(vec![
+                Value::Text(storage.path.to_string_lossy().to_string()),
+                Value::Text(storage.wal_path.to_string_lossy().to_string()),
+                sync_u64_to_i64(storage.format_version as u64, "format_version")?,
+                sync_u64_to_i64(storage.page_size as u64, "page_size")?,
+                sync_usize_to_i64(storage.cache_size_mb, "cache_size_mb")?,
+                sync_u64_to_i64(storage.page_count as u64, "page_count")?,
+                sync_u64_to_i64(storage.schema_cookie as u64, "schema_cookie")?,
+                sync_u64_to_i64(storage.wal_end_lsn, "wal_end_lsn")?,
+                sync_u64_to_i64(storage.wal_file_size, "wal_file_size")?,
+                sync_u64_to_i64(storage.last_checkpoint_lsn, "last_checkpoint_lsn")?,
+                sync_usize_to_i64(storage.active_readers, "active_readers")?,
+                sync_u64_to_i64(storage.wal_versions as u64, "wal_versions")?,
+                sync_u64_to_i64(storage.warning_count as u64, "warning_count")?,
+                Value::Bool(storage.shared_wal),
+            ])],
+        ))
+    }
+
+    fn reactive_metrics_query_result(&self) -> Result<QueryResult> {
+        let metrics = self.reactive_metrics();
+        Ok(QueryResult::with_rows(
+            vec![
+                "active_watch_count".to_string(),
+                "table_watch_count".to_string(),
+                "range_watch_count".to_string(),
+                "query_watch_count".to_string(),
+                "change_stream_count".to_string(),
+                "events_published".to_string(),
+                "events_delivered".to_string(),
+                "events_dropped".to_string(),
+                "lagged_watch_count".to_string(),
+                "row_change_events_truncated".to_string(),
+            ],
+            vec![QueryRow::new(vec![
+                sync_usize_to_i64(metrics.active_watch_count, "active_watch_count")?,
+                sync_usize_to_i64(metrics.table_watch_count, "table_watch_count")?,
+                sync_usize_to_i64(metrics.range_watch_count, "range_watch_count")?,
+                sync_usize_to_i64(metrics.query_watch_count, "query_watch_count")?,
+                sync_usize_to_i64(metrics.change_stream_count, "change_stream_count")?,
+                sync_u64_to_i64(metrics.events_published, "events_published")?,
+                sync_u64_to_i64(metrics.events_delivered, "events_delivered")?,
+                sync_u64_to_i64(metrics.events_dropped, "events_dropped")?,
+                sync_usize_to_i64(metrics.lagged_watch_count, "lagged_watch_count")?,
+                sync_u64_to_i64(
+                    metrics.row_change_events_truncated,
+                    "row_change_events_truncated",
+                )?,
+            ])],
+        ))
+    }
+
+    fn reactive_subscriptions_query_result(&self) -> Result<QueryResult> {
+        let rows = self
+            .reactive_subscriptions()
+            .into_iter()
+            .map(|subscription| {
+                Ok(QueryRow::new(vec![
+                    sync_u64_to_i64(subscription.watch_id, "watch_id")?,
+                    Value::Text(subscription.kind.as_str().to_string()),
+                    Value::Int64(subscription.created_at_micros),
+                    sync_usize_to_i64(subscription.queue_capacity, "queue_capacity")?,
+                    sync_usize_to_i64(subscription.queue_depth, "queue_depth")?,
+                    sync_u64_to_i64(
+                        subscription.last_delivered_event_id,
+                        "last_delivered_event_id",
+                    )?,
+                    sync_u64_to_i64(subscription.dropped_events, "dropped_events")?,
+                    Value::Bool(subscription.lagged),
+                    Value::Text(subscription.dependencies_json),
+                ]))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(QueryResult::with_rows(
+            vec![
+                "watch_id".to_string(),
+                "kind".to_string(),
+                "created_at_micros".to_string(),
+                "queue_capacity".to_string(),
+                "queue_depth".to_string(),
+                "last_delivered_event_id".to_string(),
+                "dropped_events".to_string(),
+                "lagged".to_string(),
+                "dependencies_json".to_string(),
+            ],
+            rows,
         ))
     }
 
@@ -8794,6 +10999,152 @@ impl Db {
         }
     }
 
+    fn sync_relay_status_query_result(&self) -> Result<QueryResult> {
+        let status = self.sync_relay_status(None, false, false, false, None)?;
+        Ok(QueryResult::with_rows(
+            vec![
+                "relay_id".to_string(),
+                "protocol_version".to_string(),
+                "database_replica_id".to_string(),
+                "production_mode".to_string(),
+                "secure_transport_required".to_string(),
+                "insecure_override_enabled".to_string(),
+                "active_sessions".to_string(),
+                "active_streams".to_string(),
+                "started_at_micros".to_string(),
+            ],
+            vec![QueryRow::new(vec![
+                Value::Text(status.relay_id),
+                Value::Int64(i64::from(status.protocol_version)),
+                status
+                    .database_replica_id
+                    .map(Value::Text)
+                    .unwrap_or(Value::Null),
+                Value::Bool(status.production_mode),
+                Value::Bool(status.secure_transport_required),
+                Value::Bool(status.insecure_override_enabled),
+                sync_u64_to_i64(status.active_sessions, "active_sessions")?,
+                sync_u64_to_i64(status.active_streams, "active_streams")?,
+                Value::Int64(status.started_at_micros),
+            ])],
+        ))
+    }
+
+    fn sync_relay_sessions_query_result(&self) -> Result<QueryResult> {
+        self.query_table_or_empty(
+            crate::sync::RELAY_SESSIONS_TABLE,
+            &[
+                "session_id",
+                "tenant_id",
+                "subject_id",
+                "subject_kind",
+                "request_id",
+                "operation",
+                "scope_name",
+                "shape_id",
+                "started_at_micros",
+                "ended_at_micros",
+                "status",
+                "error",
+                "rows_seen",
+                "bytes_seen",
+            ],
+            "started_at_micros, session_id",
+        )
+    }
+
+    fn sync_shapes_query_result(&self) -> Result<QueryResult> {
+        self.query_table_or_empty(
+            crate::sync::SHAPES_TABLE,
+            &[
+                "shape_id",
+                "name",
+                "scope_name",
+                "tenant_id",
+                "allowed_roles_json",
+                "allowed_subjects_json",
+                "created_at_micros",
+                "updated_at_micros",
+                "retention_ttl_micros",
+                "max_records",
+                "ack_deadline_micros",
+                "heartbeat_micros",
+            ],
+            "shape_id",
+        )
+    }
+
+    fn sync_shape_clients_query_result(&self) -> Result<QueryResult> {
+        self.query_table_or_empty(
+            crate::sync::SHAPE_CLIENTS_TABLE,
+            &[
+                "shape_id",
+                "tenant_id",
+                "client_replica_id",
+                "subject_id",
+                "session_id",
+                "last_ack_sequence",
+                "last_ack_watermark",
+                "last_changeset_id",
+                "last_seen_at_micros",
+                "retention_blocking",
+                "status",
+            ],
+            "shape_id, client_replica_id",
+        )
+    }
+
+    fn sync_changeset_history_query_result(&self) -> Result<QueryResult> {
+        self.query_table_or_empty(
+            crate::sync::CHANGESET_HISTORY_TABLE,
+            &[
+                "changeset_id",
+                "source_replica_id",
+                "source_kind",
+                "scope_name",
+                "shape_id",
+                "record_count",
+                "bytes",
+                "created_at_micros",
+                "applied_at_micros",
+                "outcome",
+                "integrity_hash",
+            ],
+            "created_at_micros, changeset_id",
+        )
+    }
+
+    fn query_table_or_empty(
+        &self,
+        table_name: &str,
+        columns: &[&str],
+        order_by: &str,
+    ) -> Result<QueryResult> {
+        let sql = format!(
+            "SELECT {} FROM {} ORDER BY {order_by}",
+            columns
+                .iter()
+                .map(|column| sql_identifier(column))
+                .collect::<Vec<_>>()
+                .join(", "),
+            sql_identifier(table_name)
+        );
+        match self.execute(&sql) {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                let message = error.to_string();
+                if message.contains("no such table") || message.contains("unknown table") {
+                    Ok(QueryResult::with_rows(
+                        columns.iter().map(|column| (*column).to_string()).collect(),
+                        Vec::new(),
+                    ))
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
     pub(crate) fn sync_post_commit(
         &self,
         runtime: &mut EngineRuntime,
@@ -8834,9 +11185,56 @@ impl Db {
         Ok(())
     }
 
+    fn take_reactive_pending_commit(
+        &self,
+        runtime: &mut EngineRuntime,
+    ) -> Option<PendingReactiveCommit> {
+        if !self.inner.reactive_hub.has_watchers() {
+            let _ = runtime.take_reactive_mutations();
+            return None;
+        }
+        let mut changed = runtime
+            .dirty_tables
+            .iter()
+            .filter(|table| !crate::sync::is_internal_table_name(table))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let mut row_changes = runtime.take_reactive_mutations();
+        for change in &row_changes {
+            changed.insert(change.table.clone());
+        }
+        let schema_changed = match self.inner.catalog.schema_cookie() {
+            Ok(cookie) => cookie != runtime.catalog.schema_cookie,
+            Err(_) => false,
+        };
+        if changed.is_empty() && row_changes.is_empty() && !schema_changed {
+            return None;
+        }
+        let max_rows = self.inner.reactive_hub.max_row_changes_per_event();
+        let row_changes_truncated = max_rows > 0 && row_changes.len() > max_rows;
+        if row_changes_truncated {
+            row_changes.clear();
+        }
+        Some(PendingReactiveCommit {
+            source: crate::reactive::current_change_source(),
+            schema_cookie: runtime.catalog.schema_cookie,
+            changed_tables: changed.into_iter().collect(),
+            row_changes,
+            row_changes_truncated,
+            schema_changed,
+        })
+    }
+
+    fn publish_reactive_commit(&self, pending: Option<PendingReactiveCommit>, committed_lsn: u64) {
+        if let Some(pending) = pending {
+            self.inner.reactive_hub.publish(pending, committed_lsn);
+        }
+    }
+
     fn configure_runtime_sync_capture(&self, runtime: &mut EngineRuntime) -> Result<()> {
         let active = self.runtime_sync_capture_should_be_active(runtime)?;
         runtime.set_sync_capture_active(active);
+        runtime.set_reactive_capture_active(self.inner.reactive_hub.has_watchers());
         Ok(())
     }
 
@@ -8898,6 +11296,11 @@ fn sync_read_metadata_from_runtime(runtime: &EngineRuntime, key: &str) -> Result
 enum SyncInspectionQuery {
     Status,
     Journal { since_sequence: u64 },
+    WalMetrics,
+    WriteQueueMetrics,
+    StorageMetrics,
+    ReactiveMetrics,
+    ReactiveSubscriptions,
     Peers,
     Retention,
     PeerLag,
@@ -8908,12 +11311,18 @@ enum SyncInspectionQuery {
     Sessions,
     ConflictPolicy,
     Conflicts,
+    RelayStatus,
+    RelaySessions,
+    Shapes,
+    ShapeClients,
+    ChangesetHistory,
 }
 
 impl SyncInspectionQuery {
     fn parse(normalized: &str) -> Option<Self> {
         match normalized {
             "select * from sys_sync_status" => Some(Self::Status),
+            "select * from sys.sync_status" => Some(Self::Status),
             "select * from sys_sync_journal" => Some(Self::Journal { since_sequence: 0 }),
             "select * from sys_sync_journal order by sequence" => {
                 Some(Self::Journal { since_sequence: 0 })
@@ -8921,11 +11330,24 @@ impl SyncInspectionQuery {
             "select * from sys_sync_journal order by sequence asc" => {
                 Some(Self::Journal { since_sequence: 0 })
             }
+            "select * from sys.wal_metrics" => Some(Self::WalMetrics),
+            "select * from sys.write_queue_metrics" => Some(Self::WriteQueueMetrics),
+            "select * from sys.storage_metrics" => Some(Self::StorageMetrics),
+            "select * from sys.reactive_metrics" => Some(Self::ReactiveMetrics),
+            "select * from sys.reactive_subscriptions" => Some(Self::ReactiveSubscriptions),
+            "select * from sys.reactive_subscriptions order by watch_id" => {
+                Some(Self::ReactiveSubscriptions)
+            }
+            "select * from sys.reactive_subscriptions order by watch_id asc" => {
+                Some(Self::ReactiveSubscriptions)
+            }
             "select * from sys_sync_peers" => Some(Self::Peers),
             "select * from sys_sync_peers order by name" => Some(Self::Peers),
             "select * from sys_sync_peers order by name asc" => Some(Self::Peers),
             "select * from sys_sync_retention" => Some(Self::Retention),
+            "select * from sys.sync_retention" => Some(Self::Retention),
             "select * from sys_sync_peer_lag" => Some(Self::PeerLag),
+            "select * from sys.sync_peer_lag" => Some(Self::PeerLag),
             "select * from sys_sync_peer_lag order by peer_name" => Some(Self::PeerLag),
             "select * from sys_sync_peer_lag order by peer_name asc" => Some(Self::PeerLag),
             "select * from sys_sync_doctor" => Some(Self::Doctor),
@@ -8952,6 +11374,21 @@ impl SyncInspectionQuery {
             "select * from sys_sync_conflicts" => Some(Self::Conflicts),
             "select * from sys_sync_conflicts order by conflict_id" => Some(Self::Conflicts),
             "select * from sys_sync_conflicts order by conflict_id asc" => Some(Self::Conflicts),
+            "select * from sys.sync_relay_status" => Some(Self::RelayStatus),
+            "select * from sys.sync_relay_sessions" => Some(Self::RelaySessions),
+            "select * from sys.sync_relay_sessions order by started_at_micros, session_id" => {
+                Some(Self::RelaySessions)
+            }
+            "select * from sys.sync_shapes" => Some(Self::Shapes),
+            "select * from sys.sync_shapes order by shape_id" => Some(Self::Shapes),
+            "select * from sys.sync_shape_clients" => Some(Self::ShapeClients),
+            "select * from sys.sync_shape_clients order by shape_id, client_replica_id" => {
+                Some(Self::ShapeClients)
+            }
+            "select * from sys.sync_changeset_history" => Some(Self::ChangesetHistory),
+            "select * from sys.sync_changeset_history order by created_at_micros, changeset_id" => {
+                Some(Self::ChangesetHistory)
+            }
             _ => parse_sync_journal_where_sequence(normalized)
                 .map(|since_sequence| Self::Journal { since_sequence }),
         }
@@ -8978,6 +11415,341 @@ fn sync_u64_to_i64(value: u64, field_name: &str) -> Result<Value> {
     i64::try_from(value)
         .map(Value::Int64)
         .map_err(|_| DbError::internal(format!("{field_name} exceeds INT64 range")))
+}
+
+fn sync_usize_to_i64(value: usize, field_name: &str) -> Result<Value> {
+    u64::try_from(value)
+        .and_then(i64::try_from)
+        .map(Value::Int64)
+        .map_err(|_| DbError::internal(format!("{field_name} exceeds INT64 range")))
+}
+
+struct SyncDiffChangesetContext<'a> {
+    base_kind: &'a str,
+    from_ref: &'a str,
+    to_ref: &'a str,
+    scope_name: Option<&'a str>,
+    shape_id: Option<&'a str>,
+    tenant_id: Option<&'a str>,
+    schema_fingerprint: &'a str,
+    schema_cookie: u32,
+    created_at_micros: i64,
+    max_records: usize,
+}
+
+struct BranchChangesetTableContext<'a> {
+    source_replica_id: &'a str,
+    table_name: &'a str,
+    primary_key_columns: &'a [String],
+    column_names: &'a [String],
+    schema_cookie: u32,
+    created_at_micros: i64,
+}
+
+fn sync_changeset_record_from_journal_record(record: &SyncJournalRecord) -> SyncChangesetRecord {
+    SyncChangesetRecord {
+        record_version: 1,
+        table: record.table.clone(),
+        operation: record.operation.clone(),
+        primary_key: record.primary_key.clone(),
+        origin_replica_id: record.replica_id.clone(),
+        origin_sequence: record.sequence,
+        transaction_id: format!("txn:{}", record.transaction_lsn),
+        transaction_lsn: record.transaction_lsn,
+        schema_cookie: record.schema_cookie,
+        before_hash: None,
+        before: None,
+        after: record.after.clone(),
+        column_mask: Vec::new(),
+        tombstone: record.operation == "delete",
+        conflict_metadata: None,
+    }
+}
+
+fn sync_journal_record_from_changeset_record(
+    record: &SyncChangesetRecord,
+) -> Result<SyncJournalRecord> {
+    let after = match record.operation.as_str() {
+        "insert" | "update" => Some(record.after.clone().ok_or_else(|| {
+            DbError::sql("CHANGESET_INVALID: insert/update changeset record missing after")
+        })?),
+        "delete" => None,
+        other => {
+            return Err(DbError::sql(format!(
+                "CHANGESET_INVALID: unsupported operation '{other}'"
+            )));
+        }
+    };
+    Ok(SyncJournalRecord {
+        schema_version: 1,
+        sequence: record.origin_sequence,
+        replica_id: record.origin_replica_id.clone(),
+        transaction_lsn: record.transaction_lsn,
+        table: record.table.clone(),
+        operation: record.operation.clone(),
+        primary_key: record.primary_key.clone(),
+        after,
+        schema_cookie: record.schema_cookie,
+        committed_at_micros: current_time_micros(),
+    })
+}
+
+fn sync_changeset_record_from_branch_row(
+    ctx: &BranchChangesetTableContext<'_>,
+    origin_sequence: u64,
+    operation: &str,
+    row: &crate::branch::BranchRowDiff,
+) -> Result<SyncChangesetRecord> {
+    let primary_key = branch_primary_key_object(ctx.primary_key_columns, &row.primary_key)?;
+    let before = row
+        .before
+        .as_ref()
+        .map(|values| branch_row_object(ctx.column_names, values))
+        .transpose()?;
+    let after = row
+        .after
+        .as_ref()
+        .map(|values| branch_row_object(ctx.column_names, values))
+        .transpose()?;
+    Ok(SyncChangesetRecord {
+        record_version: 1,
+        table: ctx.table_name.to_string(),
+        operation: operation.to_string(),
+        primary_key,
+        origin_replica_id: ctx.source_replica_id.to_string(),
+        origin_sequence,
+        transaction_id: format!("txn:{}:{origin_sequence}", ctx.source_replica_id),
+        transaction_lsn: origin_sequence,
+        schema_cookie: ctx.schema_cookie,
+        before_hash: before.as_ref().map(json_hash).transpose()?,
+        before,
+        after,
+        column_mask: ctx.column_names.to_vec(),
+        tombstone: operation == "delete",
+        conflict_metadata: Some(serde_json::json!({
+            "source": "branch_diff",
+            "created_at_micros": ctx.created_at_micros
+        })),
+    })
+}
+
+fn branch_primary_key_object(columns: &[String], values: &[String]) -> Result<serde_json::Value> {
+    if columns.len() != values.len() {
+        return Err(DbError::sql("branch diff primary-key width mismatch"));
+    }
+    let mut object = serde_json::Map::new();
+    for (column, value) in columns.iter().zip(values) {
+        object.insert(column.clone(), json_from_branch_value(value));
+    }
+    Ok(serde_json::Value::Object(object))
+}
+
+fn branch_row_object(columns: &[String], values: &[String]) -> Result<serde_json::Value> {
+    if columns.len() != values.len() {
+        return Err(DbError::sql("branch diff row width mismatch"));
+    }
+    let mut object = serde_json::Map::new();
+    for (column, value) in columns.iter().zip(values) {
+        object.insert(column.clone(), json_from_branch_value(value));
+    }
+    Ok(serde_json::Value::Object(object))
+}
+
+fn json_from_branch_value(value: &str) -> serde_json::Value {
+    let trimmed = value.trim();
+    if trimmed.eq_ignore_ascii_case("null") {
+        return serde_json::Value::Null;
+    }
+    if trimmed.eq_ignore_ascii_case("true") {
+        return serde_json::Value::Bool(true);
+    }
+    if trimmed.eq_ignore_ascii_case("false") {
+        return serde_json::Value::Bool(false);
+    }
+    if let Some(quoted) = trimmed
+        .strip_prefix('\'')
+        .and_then(|value| value.strip_suffix('\''))
+    {
+        return serde_json::Value::String(quoted.replace("''", "'"));
+    }
+    if let Ok(value) = trimmed.parse::<i64>() {
+        return serde_json::Value::Number(value.into());
+    }
+    if let Ok(value) = trimmed.parse::<f64>() {
+        if let Some(number) = serde_json::Number::from_f64(value) {
+            return serde_json::Value::Number(number);
+        }
+    }
+    serde_json::Value::String(trimmed.to_string())
+}
+
+fn sync_changeset_id(kind: &str, source: &str, created_at_micros: i64, count: usize) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(kind.as_bytes());
+    hasher.update(source.as_bytes());
+    hasher.update(created_at_micros.to_le_bytes());
+    hasher.update((count as u64).to_le_bytes());
+    let digest = hasher.finalize();
+    format!(
+        "dcs_{created_at_micros:016x}_{}",
+        &hex_encode(&digest)[..16]
+    )
+}
+
+fn changeset_applied_key(changeset_id: &str) -> String {
+    format!("changeset_applied:{changeset_id}")
+}
+
+fn json_hash(value: &serde_json::Value) -> Result<String> {
+    let bytes = serde_json::to_vec(value).map_err(|error| {
+        DbError::internal(format!("failed to serialize JSON hash input: {error}"))
+    })?;
+    let digest = Sha256::digest(&bytes);
+    Ok(format!("sha256:{}", hex_encode(&digest)))
+}
+
+fn sync_shape_from_row(row: &QueryRow) -> Result<SyncShape> {
+    let values = row.values();
+    Ok(SyncShape {
+        shape_id: parse_text_value(values.first(), "shape_id")?,
+        name: parse_text_value(values.get(1), "name")?,
+        scope_name: parse_text_value(values.get(2), "scope_name")?,
+        tenant_id: parse_text_value(values.get(3), "tenant_id")?,
+        allowed_roles: serde_json::from_str(&parse_text_value(
+            values.get(4),
+            "allowed_roles_json",
+        )?)
+        .map_err(|error| DbError::corruption(format!("malformed allowed_roles_json: {error}")))?,
+        allowed_subjects: serde_json::from_str(&parse_text_value(
+            values.get(5),
+            "allowed_subjects_json",
+        )?)
+        .map_err(|error| {
+            DbError::corruption(format!("malformed allowed_subjects_json: {error}"))
+        })?,
+        created_at_micros: parse_sync_i64(values.get(6), "created_at_micros")?,
+        updated_at_micros: parse_sync_i64(values.get(7), "updated_at_micros")?,
+        retention_ttl_micros: parse_sync_i64(values.get(8), "retention_ttl_micros")?,
+        max_records: parse_u64_value(values.get(9), "max_records")?,
+        ack_deadline_micros: parse_sync_i64(values.get(10), "ack_deadline_micros")?,
+        heartbeat_micros: parse_sync_i64(values.get(11), "heartbeat_micros")?,
+    })
+}
+
+fn sync_shape_client_from_row(row: &QueryRow) -> Result<SyncShapeClient> {
+    let values = row.values();
+    Ok(SyncShapeClient {
+        shape_id: parse_text_value(values.first(), "shape_id")?,
+        tenant_id: parse_text_value(values.get(1), "tenant_id")?,
+        client_replica_id: parse_text_value(values.get(2), "client_replica_id")?,
+        subject_id: parse_text_value(values.get(3), "subject_id")?,
+        session_id: parse_optional_text_value(values.get(4), "session_id")?,
+        last_ack_sequence: parse_u64_value(values.get(5), "last_ack_sequence")?,
+        last_ack_watermark: parse_u64_value(values.get(6), "last_ack_watermark")?,
+        last_changeset_id: parse_optional_text_value(values.get(7), "last_changeset_id")?,
+        last_seen_at_micros: parse_sync_i64(values.get(8), "last_seen_at_micros")?,
+        retention_blocking: parse_boolish_value(values.get(9), "retention_blocking")?,
+        status: parse_text_value(values.get(10), "status")?,
+    })
+}
+
+fn sync_relay_session_from_row(row: &QueryRow) -> Result<SyncRelaySession> {
+    let values = row.values();
+    Ok(SyncRelaySession {
+        session_id: parse_text_value(values.first(), "session_id")?,
+        tenant_id: parse_text_value(values.get(1), "tenant_id")?,
+        subject_id: parse_text_value(values.get(2), "subject_id")?,
+        subject_kind: crate::sync::SyncSubjectKind::from_str(&parse_text_value(
+            values.get(3),
+            "subject_kind",
+        )?)?,
+        request_id: parse_text_value(values.get(4), "request_id")?,
+        operation: parse_text_value(values.get(5), "operation")?,
+        scope_name: parse_optional_text_value(values.get(6), "scope_name")?,
+        shape_id: parse_optional_text_value(values.get(7), "shape_id")?,
+        started_at_micros: parse_sync_i64(values.get(8), "started_at_micros")?,
+        ended_at_micros: parse_optional_i64_value(values.get(9), "ended_at_micros")?,
+        status: parse_text_value(values.get(10), "status")?,
+        error: parse_optional_text_value(values.get(11), "error")?,
+        rows_seen: parse_u64_value(values.get(12), "rows_seen")?,
+        bytes_seen: parse_u64_value(values.get(13), "bytes_seen")?,
+    })
+}
+
+fn sync_changeset_history_from_row(row: &QueryRow) -> Result<SyncChangesetHistory> {
+    let values = row.values();
+    let source_kind = match parse_text_value(values.get(2), "source_kind")?.as_str() {
+        "checkpoint" => crate::sync::SyncChangesetSourceKind::Checkpoint,
+        "branch" => crate::sync::SyncChangesetSourceKind::Branch,
+        "snapshot" => crate::sync::SyncChangesetSourceKind::Snapshot,
+        other => {
+            return Err(DbError::corruption(format!(
+                "malformed changeset history source_kind '{other}'"
+            )));
+        }
+    };
+    Ok(SyncChangesetHistory {
+        changeset_id: parse_text_value(values.first(), "changeset_id")?,
+        source_replica_id: parse_text_value(values.get(1), "source_replica_id")?,
+        source_kind,
+        scope_name: parse_optional_text_value(values.get(3), "scope_name")?,
+        shape_id: parse_optional_text_value(values.get(4), "shape_id")?,
+        record_count: parse_u64_value(values.get(5), "record_count")?,
+        bytes: parse_u64_value(values.get(6), "bytes")?,
+        created_at_micros: parse_sync_i64(values.get(7), "created_at_micros")?,
+        applied_at_micros: parse_optional_i64_value(values.get(8), "applied_at_micros")?,
+        outcome: parse_text_value(values.get(9), "outcome")?,
+        integrity_hash: parse_optional_text_value(values.get(10), "integrity_hash")?,
+    })
+}
+
+fn parse_text_value(value: Option<&Value>, field_name: &str) -> Result<String> {
+    match value {
+        Some(Value::Text(value)) => Ok(value.clone()),
+        _ => Err(DbError::corruption(format!(
+            "malformed sync row: {field_name}"
+        ))),
+    }
+}
+
+fn parse_optional_text_value(value: Option<&Value>, field_name: &str) -> Result<Option<String>> {
+    match value {
+        Some(Value::Null) | None => Ok(None),
+        Some(Value::Text(value)) => Ok(Some(value.clone())),
+        _ => Err(DbError::corruption(format!(
+            "malformed sync row: {field_name}"
+        ))),
+    }
+}
+
+fn parse_optional_i64_value(value: Option<&Value>, field_name: &str) -> Result<Option<i64>> {
+    match value {
+        Some(Value::Null) | None => Ok(None),
+        Some(Value::Int64(value)) => Ok(Some(*value)),
+        Some(Value::Bool(value)) => Ok(Some(i64::from(*value))),
+        _ => Err(DbError::corruption(format!(
+            "malformed sync row: {field_name}"
+        ))),
+    }
+}
+
+fn parse_u64_value(value: Option<&Value>, field_name: &str) -> Result<u64> {
+    let value = parse_sync_i64(value, field_name)?;
+    u64::try_from(value).map_err(|_| {
+        DbError::corruption(format!(
+            "malformed sync row: {field_name} must be non-negative"
+        ))
+    })
+}
+
+fn parse_boolish_value(value: Option<&Value>, field_name: &str) -> Result<bool> {
+    match value {
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(Value::Int64(value)) => Ok(*value != 0),
+        _ => Err(DbError::corruption(format!(
+            "malformed sync row: {field_name}"
+        ))),
+    }
 }
 
 fn sync_conflict_from_row(row: &QueryRow) -> Result<SyncConflict> {
@@ -9848,9 +12620,30 @@ enum TransactionControl {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum PragmaCommand {
-    Query(PragmaName),
-    TableInfo(String),
-    Set(PragmaName, i64),
+    Query(PragmaTarget),
+    Call {
+        target: PragmaTarget,
+        argument: Option<String>,
+    },
+    Set(PragmaTarget, PragmaValue),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PragmaTarget {
+    name: PragmaName,
+    schema: Option<PragmaSchema>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PragmaSchema {
+    Main,
+    Temp,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PragmaValue {
+    Int(i64),
+    Text(String),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -9859,7 +12652,25 @@ enum PragmaName {
     CacheSize,
     IntegrityCheck,
     DatabaseList,
+    QuickCheck,
+    ForeignKeys,
+    JournalMode,
+    Synchronous,
+    WalCheckpoint,
+    SchemaVersion,
+    UserVersion,
+    ApplicationId,
+    Encoding,
+    BusyTimeout,
+    LockingMode,
+    TempStore,
     TableInfo,
+    TableXInfo,
+    TableList,
+    IndexList,
+    IndexInfo,
+    IndexXInfo,
+    ForeignKeyList,
 }
 
 fn parse_transaction_control(sql: &str) -> Option<TransactionControl> {
@@ -9912,19 +12723,34 @@ fn parse_pragma_command(sql: &str) -> Result<Option<PragmaCommand>> {
             return Err(DbError::sql("PRAGMA call has unexpected trailing content"));
         }
         let name = parse_pragma_name(name)?;
-        if argument.is_empty() {
+        if argument.is_empty() && name.name != PragmaName::WalCheckpoint {
             return Err(DbError::sql("PRAGMA call requires an argument"));
         }
-        return match name {
-            PragmaName::TableInfo => {
-                let table_name = parse_pragma_table_argument(argument)?;
-                Ok(Some(PragmaCommand::TableInfo(table_name)))
-            }
-            _ => Err(DbError::sql(format!(
+        let accepts_call = matches!(
+            name.name,
+            PragmaName::TableInfo
+                | PragmaName::TableXInfo
+                | PragmaName::IndexList
+                | PragmaName::IndexInfo
+                | PragmaName::IndexXInfo
+                | PragmaName::ForeignKeyList
+                | PragmaName::WalCheckpoint
+        );
+        if !accepts_call {
+            return Err(DbError::sql(format!(
                 "PRAGMA {} does not accept call syntax",
-                pragma_name_sql(name)
-            ))),
+                pragma_name_sql(&name.name)
+            )));
+        }
+        let argument = if argument.is_empty() {
+            None
+        } else {
+            Some(parse_pragma_table_argument(argument)?)
         };
+        return Ok(Some(PragmaCommand::Call {
+            target: name,
+            argument,
+        }));
     }
 
     let (name, value) = if let Some(eq_index) = body.find('=') {
@@ -9939,12 +12765,7 @@ fn parse_pragma_command(sql: &str) -> Result<Option<PragmaCommand>> {
     };
     let pragma_name = parse_pragma_name(name)?;
     let command = if let Some(value) = value {
-        let value = value.parse::<i64>().map_err(|_| {
-            DbError::sql(format!(
-                "PRAGMA {} expects an integer value",
-                name.to_ascii_lowercase()
-            ))
-        })?;
+        let value = parse_pragma_value(value)?;
         PragmaCommand::Set(pragma_name, value)
     } else {
         PragmaCommand::Query(pragma_name)
@@ -9952,25 +12773,228 @@ fn parse_pragma_command(sql: &str) -> Result<Option<PragmaCommand>> {
     Ok(Some(command))
 }
 
-fn parse_pragma_name(name: &str) -> Result<PragmaName> {
+fn parse_pragma_name(name: &str) -> Result<PragmaTarget> {
     let normalized = name.trim().to_ascii_lowercase();
-    match normalized.as_str() {
+    let (schema, pragma_name) = match normalized.split_once('.') {
+        Some((schema, pragma_name)) => {
+            let schema = match schema.trim() {
+                "main" => Some(PragmaSchema::Main),
+                "temp" => Some(PragmaSchema::Temp),
+                _ => {
+                    return Err(DbError::sql(format!(
+                        "unsupported PRAGMA schema qualifier '{}'; supported qualifiers are main and temp",
+                        schema
+                    )));
+                }
+            };
+            (schema, pragma_name.trim())
+        }
+        None => (None, normalized.as_str()),
+    };
+    if pragma_name.is_empty() {
+        return Err(DbError::sql("PRAGMA requires a name"));
+    }
+    let name = match pragma_name {
         "page_size" => Ok(PragmaName::PageSize),
         "cache_size" => Ok(PragmaName::CacheSize),
         "integrity_check" => Ok(PragmaName::IntegrityCheck),
         "database_list" => Ok(PragmaName::DatabaseList),
+        "quick_check" => Ok(PragmaName::QuickCheck),
+        "foreign_keys" => Ok(PragmaName::ForeignKeys),
+        "journal_mode" => Ok(PragmaName::JournalMode),
+        "synchronous" => Ok(PragmaName::Synchronous),
+        "wal_checkpoint" => Ok(PragmaName::WalCheckpoint),
+        "schema_version" => Ok(PragmaName::SchemaVersion),
+        "user_version" => Ok(PragmaName::UserVersion),
+        "application_id" => Ok(PragmaName::ApplicationId),
+        "encoding" => Ok(PragmaName::Encoding),
+        "busy_timeout" => Ok(PragmaName::BusyTimeout),
+        "locking_mode" => Ok(PragmaName::LockingMode),
+        "temp_store" => Ok(PragmaName::TempStore),
         "table_info" => Ok(PragmaName::TableInfo),
-        _ => Err(DbError::sql(format!("unsupported PRAGMA {}", normalized))),
+        "table_xinfo" => Ok(PragmaName::TableXInfo),
+        "table_list" => Ok(PragmaName::TableList),
+        "index_list" => Ok(PragmaName::IndexList),
+        "index_info" => Ok(PragmaName::IndexInfo),
+        "index_xinfo" => Ok(PragmaName::IndexXInfo),
+        "foreign_key_list" => Ok(PragmaName::ForeignKeyList),
+        "auto_vacuum" => Err(DbError::sql(
+            "PRAGMA auto_vacuum is not supported; not applicable to DecentDB storage/checkpointing",
+        )),
+        "cache_spill" => Err(DbError::sql(
+            "PRAGMA cache_spill is not supported; no DecentDB page-cache spill policy",
+        )),
+        "case_sensitive_like" => Err(DbError::sql(
+            "PRAGMA case_sensitive_like is not supported unless the SQL engine explicitly exposes it",
+        )),
+        "defer_foreign_keys" => Err(DbError::sql(
+            "PRAGMA defer_foreign_keys is not supported; deferred constraints are advanced compatibility work",
+        )),
+        "ignore_check_constraints" => Err(DbError::sql(
+            "PRAGMA ignore_check_constraints is not supported; constraints cannot be disabled",
+        )),
+        "mmap_size" => Err(DbError::sql(
+            "PRAGMA mmap_size is not supported as a SQL runtime tuning knob",
+        )),
+        "optimize" => Err(DbError::sql(
+            "PRAGMA optimize is not supported in this compatibility slice",
+        )),
+        "read_uncommitted" => Err(DbError::sql(
+            "PRAGMA read_uncommitted is not supported; DecentDB does not expose dirty reads",
+        )),
+        "recursive_triggers" => Err(DbError::sql(
+            "PRAGMA recursive_triggers is not supported without trigger recursion semantics",
+        )),
+        "secure_delete" => Err(DbError::sql(
+            "PRAGMA secure_delete is not supported; no exact SQLite free-page overwrite mode",
+        )),
+        "trusted_schema" => Err(DbError::sql(
+            "PRAGMA trusted_schema is not supported; DecentDB does not expose that extension model",
+        )),
+        _ => Err(DbError::sql(format!("unsupported PRAGMA {}", pragma_name))),
+    }?;
+    Ok(PragmaTarget { name, schema })
+}
+
+fn parse_pragma_value(value: &str) -> Result<PragmaValue> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(DbError::sql("PRAGMA assignment requires a value"));
+    }
+    if value.starts_with('"') {
+        if !value.ends_with('"') || value.len() < 2 {
+            return Err(DbError::sql("PRAGMA assignment has invalid quoted value"));
+        }
+        return Ok(PragmaValue::Text(
+            value[1..value.len() - 1].replace("\"\"", "\""),
+        ));
+    }
+    if value.starts_with('\'') {
+        if !value.ends_with('\'') || value.len() < 2 {
+            return Err(DbError::sql("PRAGMA assignment has invalid quoted value"));
+        }
+        return Ok(PragmaValue::Text(
+            value[1..value.len() - 1].replace("''", "'"),
+        ));
+    }
+    if let Ok(value) = value.parse::<i64>() {
+        return Ok(PragmaValue::Int(value));
+    }
+    Ok(PragmaValue::Text(value.to_string()))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SynchronousRequest {
+    Full,
+    Normal,
+    Off,
+    Extra,
+}
+
+fn pragma_synchronous_mode_value(mode: WalSyncMode) -> i64 {
+    match mode {
+        WalSyncMode::Full => 2,
+        WalSyncMode::Normal | WalSyncMode::AsyncCommit { .. } => 1,
+        WalSyncMode::TestingOnlyUnsafeNoSync => 0,
     }
 }
 
-fn pragma_name_sql(name: PragmaName) -> &'static str {
+fn pragma_value_i64(value: &PragmaValue) -> Result<i64> {
+    match value {
+        PragmaValue::Int(value) => Ok(*value),
+        PragmaValue::Text(value) => Err(DbError::sql(format!(
+            "PRAGMA assignment expects a numeric value, got '{value}'"
+        ))),
+    }
+}
+
+fn parse_pragma_bool_value(value: &PragmaValue, pragma: &str) -> Result<bool> {
+    let normalized = match value {
+        PragmaValue::Int(value) => value.to_string(),
+        PragmaValue::Text(value) => value.clone(),
+    };
+    match normalized.to_ascii_uppercase().as_str() {
+        "1" | "ON" | "TRUE" | "YES" => Ok(true),
+        "0" | "OFF" | "FALSE" | "NO" => Ok(false),
+        _ => Err(DbError::sql(format!(
+            "{} accepts ON/TRUE/YES/1 or OFF/FALSE/NO/0",
+            pragma
+        ))),
+    }
+}
+
+fn parse_pragma_text_or_mode(value: &PragmaValue, pragma: &str) -> Result<String> {
+    let value = match value {
+        PragmaValue::Text(value) => value.clone(),
+        PragmaValue::Int(value) => value.to_string(),
+    };
+    let normalized = value.trim().to_ascii_uppercase();
+    if normalized.is_empty() {
+        return Err(DbError::sql(format!("{pragma} requires a mode/value",)));
+    }
+    Ok(normalized)
+}
+
+fn parse_pragma_synchronous_request(
+    value: &PragmaValue,
+    pragma: &str,
+) -> Result<SynchronousRequest> {
+    match parse_pragma_text_or_mode(value, pragma)?.as_str() {
+        "FULL" => Ok(SynchronousRequest::Full),
+        "NORMAL" => Ok(SynchronousRequest::Normal),
+        "OFF" => Ok(SynchronousRequest::Off),
+        "EXTRA" | "3" => Ok(SynchronousRequest::Extra),
+        "0" => Ok(SynchronousRequest::Off),
+        "1" => Ok(SynchronousRequest::Normal),
+        "2" => Ok(SynchronousRequest::Full),
+        _ => Err(DbError::sql(
+            "PRAGMA synchronous accepts OFF, NORMAL, FULL, EXTRA, 0, 1, 2, or 3",
+        )),
+    }
+}
+
+fn pragma_required_argument(target: &PragmaTarget, argument: Option<String>) -> Result<String> {
+    argument.ok_or_else(|| {
+        DbError::sql(format!(
+            "PRAGMA {} requires an argument",
+            pragma_name_sql(&target.name)
+        ))
+    })
+}
+
+fn pragma_schema_function_prefix(schema: Option<PragmaSchema>) -> &'static str {
+    match schema {
+        Some(PragmaSchema::Main) => "main.",
+        Some(PragmaSchema::Temp) => "temp.",
+        None => "",
+    }
+}
+
+fn pragma_name_sql(name: &PragmaName) -> &'static str {
     match name {
         PragmaName::PageSize => "page_size",
         PragmaName::CacheSize => "cache_size",
         PragmaName::IntegrityCheck => "integrity_check",
         PragmaName::DatabaseList => "database_list",
+        PragmaName::QuickCheck => "quick_check",
+        PragmaName::ForeignKeys => "foreign_keys",
+        PragmaName::JournalMode => "journal_mode",
+        PragmaName::Synchronous => "synchronous",
+        PragmaName::WalCheckpoint => "wal_checkpoint",
+        PragmaName::SchemaVersion => "schema_version",
+        PragmaName::UserVersion => "user_version",
+        PragmaName::ApplicationId => "application_id",
+        PragmaName::Encoding => "encoding",
+        PragmaName::BusyTimeout => "busy_timeout",
+        PragmaName::LockingMode => "locking_mode",
+        PragmaName::TempStore => "temp_store",
         PragmaName::TableInfo => "table_info",
+        PragmaName::TableXInfo => "table_xinfo",
+        PragmaName::TableList => "table_list",
+        PragmaName::IndexList => "index_list",
+        PragmaName::IndexInfo => "index_info",
+        PragmaName::IndexXInfo => "index_xinfo",
+        PragmaName::ForeignKeyList => "foreign_key_list",
     }
 }
 
@@ -10187,7 +13211,42 @@ fn prepared_statement_sql(sql: &str) -> Result<String> {
             "prepared statements do not support transaction control",
         ));
     }
+    reject_unsupported_collated_key_sql(&statement)?;
     Ok(statement)
+}
+
+fn reject_unsupported_collated_key_sql(sql: &str) -> Result<()> {
+    let upper = sql.to_ascii_uppercase();
+    if let Some(select_index) = upper.find("SELECT DISTINCT") {
+        let after_distinct = select_index + "SELECT DISTINCT".len();
+        let projection_end = upper[after_distinct..]
+            .find(" FROM ")
+            .map(|offset| after_distinct + offset)
+            .unwrap_or(upper.len());
+        if upper[after_distinct..projection_end].contains(" COLLATE ") {
+            return Err(DbError::sql(
+                "COLLATE in DISTINCT keys is not supported in this compatibility slice",
+            ));
+        }
+    }
+    if let Some(group_by_index) = upper.find(" GROUP BY ") {
+        let group_start = group_by_index + " GROUP BY ".len();
+        let group_end = [" HAVING ", " ORDER BY ", " LIMIT ", " OFFSET "]
+            .iter()
+            .filter_map(|marker| {
+                upper[group_start..]
+                    .find(marker)
+                    .map(|offset| group_start + offset)
+            })
+            .min()
+            .unwrap_or(upper.len());
+        if upper[group_start..group_end].contains(" COLLATE ") {
+            return Err(DbError::sql(
+                "COLLATE in GROUP BY keys is not supported in this compatibility slice",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn table_info(table: &TableSchema, row_count: usize) -> TableInfo {
@@ -11524,6 +14583,7 @@ fn json_escape(input: String) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
     use std::sync::{Arc, Barrier};
     use std::thread;
     use std::time::{Duration, Instant};
@@ -11543,7 +14603,7 @@ mod tests {
 
     use crate::exec::dml::{PreparedInsertColumn, PreparedInsertValueSource, PreparedSimpleInsert};
     use crate::sql::parser::parse_sql_statement;
-    use crate::{BulkLoadOptions, Db, Value};
+    use crate::{BulkLoadOptions, Db, QueuedWriteOptions, Value, WalSyncMode};
 
     use super::{split_sql_batch, PreparedInsertCache, StatementCache, TempSchemaState};
 
@@ -11582,6 +14642,147 @@ mod tests {
                 "PagerReadStore does not support writing pages",
             ))
         }
+    }
+
+    #[test]
+    fn queued_writes_batch_ready_commits_and_preserve_results() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir.path().join("queued-group-commit.ddb");
+        let mut config = DbConfig {
+            write_queue_capacity: 32,
+            write_queue_max_batch: 32,
+            write_queue_max_group_delay_us: 50_000,
+            ..DbConfig::default()
+        };
+        config.release_freed_memory_after_checkpoint = false;
+        let db = Arc::new(Db::create(&path, config).expect("create db"));
+        db.execute("CREATE TABLE queued_items (id INTEGER PRIMARY KEY, value TEXT)")
+            .expect("create table");
+
+        let writers = 8;
+        let barrier = Arc::new(Barrier::new(writers + 1));
+        let mut handles = Vec::new();
+        for index in 0..writers {
+            let db = Arc::clone(&db);
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                db.execute_queued_with_params(
+                    "INSERT INTO queued_items (id, value) VALUES ($1, $2)",
+                    &[
+                        Value::Int64(i64::try_from(index).expect("index fits")),
+                        Value::Text(format!("value-{index}")),
+                    ],
+                )
+                .expect("queued insert");
+            }));
+        }
+        barrier.wait();
+        for handle in handles {
+            handle.join().expect("writer thread");
+        }
+
+        let result = db
+            .execute("SELECT COUNT(*) FROM queued_items")
+            .expect("count rows");
+        assert_eq!(result.rows()[0].values()[0], Value::Int64(writers as i64));
+
+        let metrics = db.write_queue_metrics();
+        assert_eq!(metrics.admitted, writers as u64);
+        assert_eq!(metrics.committed, writers as u64);
+        assert!(metrics.group_commit_batches >= 1);
+        assert!(
+            metrics.group_commit_max_batch > 1,
+            "expected at least one grouped batch, got {metrics:?}"
+        );
+        assert!(metrics.group_commit_syncs >= 1);
+        assert!(metrics.physical_syncs_saved >= 1);
+    }
+
+    #[test]
+    fn queued_write_timeout_before_execution_has_no_effect() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir.path().join("queued-timeout.ddb");
+        let db = Arc::new(Db::create(&path, DbConfig::default()).expect("create db"));
+        db.execute("CREATE TABLE queued_items (id INTEGER PRIMARY KEY)")
+            .expect("create table");
+
+        let writer_guard = db
+            .inner
+            .sql_write_lock
+            .lock()
+            .expect("writer lock should not be poisoned");
+        let started = Arc::new(AtomicBool::new(false));
+        let worker_db = Arc::clone(&db);
+        let worker_started = Arc::clone(&started);
+        let handle = thread::spawn(move || {
+            worker_started.store(true, AtomicOrdering::Release);
+            worker_db
+                .execute_queued("INSERT INTO queued_items (id) VALUES (1)")
+                .expect("first queued insert");
+        });
+        while !started.load(AtomicOrdering::Acquire) || db.write_queue_metrics().executed == 0 {
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        let error = db
+            .execute_queued_batch_with_options(
+                "INSERT INTO queued_items (id) VALUES (2)",
+                &[],
+                QueuedWriteOptions {
+                    timeout: Some(Duration::from_millis(10)),
+                    cancel_token: None,
+                },
+            )
+            .expect_err("second queued insert should time out before execution");
+        assert_eq!(error.code(), crate::DbErrorCode::Timeout);
+
+        drop(writer_guard);
+        handle.join().expect("writer thread");
+        db.execute_queued("INSERT INTO queued_items (id) VALUES (3)")
+            .expect("third queued insert drains canceled request");
+
+        let result = db
+            .execute("SELECT COUNT(*) FROM queued_items WHERE id IN (1, 3)")
+            .expect("count committed rows");
+        assert_eq!(result.rows()[0].values()[0], Value::Int64(2));
+        let missing = db
+            .execute("SELECT COUNT(*) FROM queued_items WHERE id = 2")
+            .expect("count timed-out row");
+        assert_eq!(missing.rows()[0].values()[0], Value::Int64(0));
+    }
+
+    #[test]
+    fn queued_execution_rejects_explicit_transaction_control() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir.path().join("queued-transaction-control.ddb");
+        let db = Db::create(&path, DbConfig::default()).expect("create db");
+
+        let error = db
+            .execute_queued_batch("BEGIN; CREATE TABLE t (id INTEGER); COMMIT")
+            .expect_err("queued transaction control should be rejected");
+        assert_eq!(error.code(), crate::DbErrorCode::Transaction);
+    }
+
+    #[test]
+    fn queued_execution_honors_cancel_before_admission() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir.path().join("queued-cancel.ddb");
+        let db = Db::create(&path, DbConfig::default()).expect("create db");
+        let cancel_token = Arc::new(AtomicBool::new(true));
+
+        let error = db
+            .execute_queued_batch_with_options(
+                "CREATE TABLE t (id INTEGER)",
+                &[],
+                QueuedWriteOptions {
+                    timeout: None,
+                    cancel_token: Some(cancel_token),
+                },
+            )
+            .expect_err("pre-canceled queued write should not be admitted");
+        assert_eq!(error.code(), crate::DbErrorCode::Canceled);
+        assert_eq!(db.write_queue_metrics().canceled, 1);
     }
 
     #[test]
@@ -12183,9 +15384,718 @@ mod tests {
     fn unsupported_pragma_reports_sql_error() {
         let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
         let error = db
-            .execute("PRAGMA foreign_keys")
+            .execute("PRAGMA auto_vacuum")
             .expect_err("unsupported pragma should fail");
-        assert!(error.to_string().contains("unsupported PRAGMA"));
+        assert!(error.to_string().contains("not supported"));
+    }
+
+    #[test]
+    fn pragma_compat_queries_are_implemented() {
+        let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
+        db.execute("CREATE TABLE t(id INT PRIMARY KEY, val TEXT)")
+            .expect("create table");
+        assert_eq!(
+            db.execute("PRAGMA quick_check")
+                .expect("quick_check")
+                .rows()[0]
+                .values(),
+            &[Value::Text("ok".to_string())]
+        );
+        assert_eq!(
+            db.execute("PRAGMA foreign_keys")
+                .expect("foreign_keys")
+                .rows()[0]
+                .values(),
+            &[Value::Int64(1)]
+        );
+        assert_eq!(
+            db.execute("PRAGMA journal_mode")
+                .expect("journal_mode")
+                .rows()[0]
+                .values(),
+            &[Value::Text("wal".to_string())]
+        );
+        assert_eq!(
+            db.execute("PRAGMA synchronous")
+                .expect("synchronous")
+                .rows()[0]
+                .values(),
+            &[Value::Int64(2)]
+        );
+        assert_eq!(
+            db.execute("PRAGMA schema_version")
+                .expect("schema_version")
+                .rows()[0]
+                .values(),
+            &[Value::Int64(1)]
+        );
+        assert_eq!(
+            db.execute("PRAGMA encoding").expect("encoding").rows()[0].values(),
+            &[Value::Text("UTF-8".to_string())]
+        );
+        assert_eq!(
+            db.execute("PRAGMA locking_mode")
+                .expect("locking_mode")
+                .rows()[0]
+                .values(),
+            &[Value::Text("normal".to_string())]
+        );
+        assert_eq!(
+            db.execute("PRAGMA temp_store").expect("temp_store").rows()[0].values(),
+            &[Value::Int64(1)]
+        );
+    }
+
+    #[test]
+    fn pragma_pragma_assignment_compatibility_is_narrow() {
+        let wal_async = DbConfig {
+            wal_sync_mode: WalSyncMode::AsyncCommit { interval_ms: 16 },
+            ..DbConfig::default()
+        };
+        let normal_db = Db::open_or_create(":memory:", DbConfig::default())
+            .expect("open database for full-mode sync test");
+        let normal_assign = normal_db.execute("PRAGMA synchronous = FULL");
+        assert!(normal_assign.is_ok(), "expected sync mode match to succeed");
+        let async_db = Db::open_or_create(":memory:", wal_async)
+            .expect("open database for normal-mode sync test");
+        let async_assign = async_db.execute("PRAGMA synchronous = NORMAL");
+        assert!(
+            async_assign.is_ok(),
+            "expected async mode sync update to succeed"
+        );
+        let off_reject = normal_db
+            .execute("PRAGMA synchronous = OFF")
+            .expect_err("unsafe sync assignment should fail");
+        assert!(off_reject.to_string().contains("reopening"));
+
+        assert!(
+            normal_db
+                .execute("PRAGMA foreign_keys = ON")
+                .expect("foreign keys no-op")
+                .affected_rows()
+                == 0
+        );
+        assert!(
+            normal_db
+                .execute("PRAGMA foreign_keys = TRUE")
+                .expect("foreign keys no-op")
+                .affected_rows()
+                == 0
+        );
+        let foreign_keys_off = normal_db
+            .execute("PRAGMA foreign_keys = OFF")
+            .expect_err("disabling foreign_keys should fail");
+        assert!(foreign_keys_off
+            .to_string()
+            .contains("cannot disable foreign key enforcement"));
+
+        assert_eq!(
+            normal_db
+                .execute("PRAGMA journal_mode = wal")
+                .expect("journal_mode wal")
+                .rows()[0]
+                .values(),
+            &[Value::Text("wal".to_string())]
+        );
+        let journal_mode_reject = normal_db
+            .execute("PRAGMA journal_mode = OFF")
+            .expect_err("unsupported journal mode should fail");
+        assert!(journal_mode_reject
+            .to_string()
+            .contains("supports only WAL"));
+
+        assert!(
+            normal_db
+                .execute("PRAGMA encoding = utf8")
+                .expect("encoding utf-8")
+                .affected_rows()
+                == 0
+        );
+        let encoding_reject = normal_db
+            .execute("PRAGMA encoding = latin1")
+            .expect_err("non-UTF8 encoding should fail");
+        assert!(encoding_reject
+            .to_string()
+            .contains("can only be set to UTF-8"));
+
+        assert!(
+            normal_db
+                .execute("PRAGMA locking_mode = normal")
+                .expect("locking mode")
+                .affected_rows()
+                == 0
+        );
+        let locking_mode_reject = normal_db
+            .execute("PRAGMA locking_mode = exclusive")
+            .expect_err("unsupported locking mode should fail");
+        assert!(locking_mode_reject
+            .to_string()
+            .contains("supports only NORMAL"));
+
+        assert!(
+            normal_db
+                .execute("PRAGMA temp_store = 1")
+                .expect("temp_store")
+                .affected_rows()
+                == 0
+        );
+        assert!(
+            normal_db
+                .execute("PRAGMA temp_store = DEFAULT")
+                .expect("temp_store")
+                .affected_rows()
+                == 0
+        );
+        let temp_store_reject = normal_db
+            .execute("PRAGMA temp_store = memory")
+            .expect_err("unsupported temp_store should fail");
+        assert!(temp_store_reject.to_string().contains("not supported"));
+    }
+
+    #[test]
+    fn pragma_main_and_temp_qualifiers_are_supported() {
+        let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
+        db.execute("CREATE TABLE main_table(id INT)")
+            .expect("create main table");
+        db.execute("CREATE TEMP TABLE temp_table(id INT)")
+            .expect("create temp table");
+
+        assert_eq!(
+            db.execute("PRAGMA main.table_info(main_table)")
+                .expect("main.schema-qualified table_info")
+                .rows()
+                .len(),
+            1
+        );
+        assert_eq!(
+            db.execute("PRAGMA temp.table_info(temp_table)")
+                .expect("temp.schema-qualified table_info")
+                .rows()
+                .len(),
+            1
+        );
+
+        let unsupported_schema = db
+            .execute("PRAGMA foo.table_info(main_table)")
+            .expect_err("unsupported pragma schema qualifier");
+        assert!(unsupported_schema
+            .to_string()
+            .contains("unsupported PRAGMA schema qualifier"));
+    }
+
+    #[test]
+    fn pragma_extended_compatibility_surface_is_implemented() -> Result<()> {
+        let db = Db::open_or_create(":memory:", DbConfig::default())?;
+        db.execute("CREATE TABLE parent(id INT PRIMARY KEY)")?;
+        db.execute(
+            "CREATE TABLE child(
+                id INT PRIMARY KEY,
+                parent_id INT REFERENCES parent(id) ON DELETE CASCADE ON UPDATE SET NULL,
+                name TEXT,
+                doubled INT GENERATED ALWAYS AS (id * 2) STORED
+            )",
+        )?;
+        db.execute("CREATE INDEX child_name_idx ON child(name) INCLUDE(parent_id)")?;
+
+        let xinfo = db.execute("PRAGMA table_xinfo(child)")?;
+        assert_eq!(
+            xinfo.columns(),
+            &[
+                "cid".to_string(),
+                "name".to_string(),
+                "type".to_string(),
+                "notnull".to_string(),
+                "dflt_value".to_string(),
+                "pk".to_string(),
+                "hidden".to_string()
+            ]
+        );
+        assert!(xinfo.rows().iter().any(|row| {
+            row.values()[1] == Value::Text("doubled".to_string())
+                && row.values()[6] == Value::Int64(3)
+        }));
+
+        let table_list = db.execute("PRAGMA table_list")?;
+        assert!(table_list.rows().iter().any(|row| {
+            row.values()[0] == Value::Text("main".to_string())
+                && row.values()[1] == Value::Text("child".to_string())
+                && row.values()[2] == Value::Text("table".to_string())
+                && row.values()[3] == Value::Int64(4)
+        }));
+
+        let index_list = db.execute("PRAGMA index_list(child)")?;
+        assert!(index_list
+            .rows()
+            .iter()
+            .any(|row| row.values()[1] == Value::Text("child_name_idx".to_string())));
+
+        let index_xinfo = db.execute("PRAGMA index_xinfo(child_name_idx)")?;
+        assert!(index_xinfo.rows().iter().any(|row| {
+            row.values()[2] == Value::Text("parent_id".to_string())
+                && row.values()[5] == Value::Int64(0)
+        }));
+
+        let foreign_keys = db.execute("PRAGMA foreign_key_list(child)")?;
+        assert_eq!(foreign_keys.rows().len(), 1);
+        assert_eq!(
+            foreign_keys.rows()[0].values()[2],
+            Value::Text("parent".to_string())
+        );
+        assert_eq!(
+            foreign_keys.rows()[0].values()[6],
+            Value::Text("CASCADE".to_string())
+        );
+
+        let checkpoint = db.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        assert_eq!(
+            checkpoint.columns(),
+            &[
+                "busy".to_string(),
+                "log".to_string(),
+                "checkpointed".to_string()
+            ]
+        );
+        assert!(checkpoint.rows()[0]
+            .values()
+            .iter()
+            .all(|value| matches!(value, Value::Int64(v) if *v >= 0)));
+
+        assert_eq!(
+            db.execute("PRAGMA busy_timeout")?.rows()[0].values(),
+            &[Value::Int64(0)]
+        );
+        db.execute("PRAGMA busy_timeout = 1250")?;
+        assert_eq!(
+            db.execute("PRAGMA busy_timeout")?.rows()[0].values(),
+            &[Value::Int64(1_250)]
+        );
+        assert_eq!(
+            db.execute("PRAGMA journal_mode = WAL")?.rows()[0].values(),
+            &[Value::Text("wal".to_string())]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn application_metadata_pragmas_are_durable_and_transactional() -> Result<()> {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("application-pragmas.ddb");
+        {
+            let db = Db::open_or_create(&path, DbConfig::default())?;
+            assert_eq!(
+                db.execute("PRAGMA user_version")?.rows()[0].values(),
+                &[Value::Int64(0)]
+            );
+            db.execute("PRAGMA user_version = 42")?;
+            db.execute("PRAGMA application_id = -7")?;
+            db.execute("BEGIN")?;
+            db.execute("PRAGMA user_version = 99")?;
+            assert_eq!(
+                db.execute("PRAGMA user_version")?.rows()[0].values(),
+                &[Value::Int64(99)]
+            );
+            db.execute("ROLLBACK")?;
+            assert_eq!(
+                db.execute("PRAGMA user_version")?.rows()[0].values(),
+                &[Value::Int64(42)]
+            );
+        }
+
+        let reopened = Db::open_or_create(&path, DbConfig::default())?;
+        assert_eq!(
+            reopened.execute("PRAGMA user_version")?.rows()[0].values(),
+            &[Value::Int64(42)]
+        );
+        assert_eq!(
+            reopened.execute("PRAGMA application_id")?.rows()[0].values(),
+            &[Value::Int64(-7)]
+        );
+        let out_of_range = reopened
+            .execute("PRAGMA user_version = 2147483648")
+            .expect_err("out-of-range user_version should fail");
+        assert!(out_of_range.to_string().contains("signed 32-bit"));
+        Ok(())
+    }
+
+    #[test]
+    fn compatibility_catalog_views_and_pragma_table_functions_work() -> Result<()> {
+        let db = Db::open_or_create(":memory:", DbConfig::default())?;
+        db.execute("CREATE TABLE audit(id INT)")?;
+        db.execute("CREATE TABLE users(id INT PRIMARY KEY, name TEXT)")?;
+        db.execute("CREATE INDEX users_name_idx ON users(name)")?;
+        db.execute("CREATE VIEW user_names AS SELECT name FROM users")?;
+        db.execute(
+            "CREATE TRIGGER users_ai AFTER INSERT ON users
+             FOR EACH ROW EXECUTE FUNCTION decentdb_exec_sql('INSERT INTO audit VALUES (1)')",
+        )?;
+        db.execute("CREATE TEMP TABLE temp_users(id INT)")?;
+        db.execute("CREATE TEMP VIEW temp_user_ids AS SELECT id FROM temp_users")?;
+
+        let schema = db.execute("SELECT type, name, tbl_name FROM sqlite_schema ORDER BY name")?;
+        let schema_rows = schema
+            .rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>();
+        assert!(schema_rows.contains(&vec![
+            Value::Text("table".to_string()),
+            Value::Text("users".to_string()),
+            Value::Text("users".to_string())
+        ]));
+        assert!(schema_rows.contains(&vec![
+            Value::Text("index".to_string()),
+            Value::Text("users_name_idx".to_string()),
+            Value::Text("users".to_string())
+        ]));
+        assert!(schema_rows.contains(&vec![
+            Value::Text("view".to_string()),
+            Value::Text("user_names".to_string()),
+            Value::Text("user_names".to_string())
+        ]));
+        assert!(schema_rows.contains(&vec![
+            Value::Text("trigger".to_string()),
+            Value::Text("users_ai".to_string()),
+            Value::Text("users".to_string())
+        ]));
+        assert!(!schema_rows.iter().any(|row| {
+            row.iter()
+                .any(|value| matches!(value, Value::Text(text) if text.starts_with("__decentdb_")))
+        }));
+
+        let temp_schema = db.execute("SELECT type, name FROM temp.sqlite_schema ORDER BY name")?;
+        assert!(temp_schema.rows().iter().any(|row| {
+            row.values()[0] == Value::Text("table".to_string())
+                && row.values()[1] == Value::Text("temp_users".to_string())
+        }));
+        assert!(temp_schema.rows().iter().any(|row| {
+            row.values()[0] == Value::Text("view".to_string())
+                && row.values()[1] == Value::Text("temp_user_ids".to_string())
+        }));
+        assert!(db
+            .execute("INSERT INTO sqlite_schema(type, name, tbl_name, rootpage, sql) VALUES ('table', 'x', 'x', 0, NULL)")
+            .is_err());
+
+        let table_info = db.execute("SELECT name FROM pragma_table_info('users') WHERE pk = 1")?;
+        assert_eq!(
+            table_info.rows()[0].values(),
+            &[Value::Text("id".to_string())]
+        );
+        let table_list =
+            db.execute("SELECT name FROM pragma_table_list() WHERE schema = 'main' ORDER BY name")?;
+        assert!(table_list
+            .rows()
+            .iter()
+            .any(|row| row.values()[0] == Value::Text("users".to_string())));
+        let index_info = db.execute("SELECT name FROM pragma_index_info('users_name_idx')")?;
+        assert_eq!(
+            index_info.rows()[0].values(),
+            &[Value::Text("name".to_string())]
+        );
+        let databases = db.execute("SELECT name FROM pragma_database_list()")?;
+        assert_eq!(
+            databases.rows()[0].values(),
+            &[Value::Text("main".to_string())]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn information_schema_views_expose_minimal_metadata() -> Result<()> {
+        let db = Db::open_or_create(":memory:", DbConfig::default())?;
+        db.execute("CREATE SCHEMA app")?;
+        db.execute("CREATE TABLE users(id INT PRIMARY KEY, name TEXT NOT NULL)")?;
+        db.execute("CREATE VIEW user_names AS SELECT name FROM users")?;
+        db.execute("CREATE TEMP TABLE temp_users(id INT)")?;
+
+        let schemata =
+            db.execute("SELECT schema_name FROM information_schema.schemata ORDER BY schema_name")?;
+        let schema_names = schemata
+            .rows()
+            .iter()
+            .map(|row| row.values()[0].clone())
+            .collect::<Vec<_>>();
+        assert!(schema_names.contains(&Value::Text("app".to_string())));
+        assert!(schema_names.contains(&Value::Text("main".to_string())));
+        assert!(schema_names.contains(&Value::Text("temp".to_string())));
+
+        let tables = db.execute(
+            "SELECT table_schema, table_name, table_type FROM information_schema.tables ORDER BY table_name",
+        )?;
+        assert!(tables.rows().iter().any(|row| {
+            row.values()
+                == [
+                    Value::Text("main".to_string()),
+                    Value::Text("users".to_string()),
+                    Value::Text("BASE TABLE".to_string()),
+                ]
+        }));
+        assert!(tables.rows().iter().any(|row| {
+            row.values()
+                == [
+                    Value::Text("temp".to_string()),
+                    Value::Text("temp_users".to_string()),
+                    Value::Text("LOCAL TEMPORARY".to_string()),
+                ]
+        }));
+
+        let columns = db.execute(
+            "SELECT column_name, ordinal_position, is_nullable, data_type
+             FROM information_schema.columns
+             WHERE table_name = 'users'
+             ORDER BY ordinal_position",
+        )?;
+        assert_eq!(
+            columns.rows()[0].values(),
+            &[
+                Value::Text("id".to_string()),
+                Value::Int64(1),
+                Value::Text("NO".to_string()),
+                Value::Text("INT64".to_string())
+            ]
+        );
+        assert_eq!(
+            columns.rows()[1].values(),
+            &[
+                Value::Text("name".to_string()),
+                Value::Int64(2),
+                Value::Text("NO".to_string()),
+                Value::Text("TEXT".to_string())
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn generate_series_supports_required_integer_and_temporal_forms() -> Result<()> {
+        let db = Db::open_or_create(":memory:", DbConfig::default())?;
+        let ints = db.execute("SELECT value FROM generate_series(1, 5, 2)")?;
+        assert_eq!(
+            ints.rows()
+                .iter()
+                .map(|row| row.values()[0].clone())
+                .collect::<Vec<_>>(),
+            vec![Value::Int64(1), Value::Int64(3), Value::Int64(5)]
+        );
+        let descending = db.execute("SELECT value FROM generate_series(3, 1, -1)")?;
+        assert_eq!(
+            descending
+                .rows()
+                .iter()
+                .map(|row| row.values()[0].clone())
+                .collect::<Vec<_>>(),
+            vec![Value::Int64(3), Value::Int64(2), Value::Int64(1)]
+        );
+        assert_eq!(
+            db.execute("SELECT value FROM generate_series(5, 1)")?
+                .rows()
+                .len(),
+            0
+        );
+        assert!(db
+            .execute("SELECT value FROM generate_series(1, 5, 0)")
+            .expect_err("zero step should fail")
+            .to_string()
+            .contains("step cannot be zero"));
+        assert!(db
+            .execute("SELECT value FROM generate_series(1, 1000002)")
+            .expect_err("large series should fail")
+            .to_string()
+            .contains("1000000"));
+
+        let timestamps = db.execute(
+            "SELECT value FROM generate_series(
+                TIMESTAMP '2026-01-01 00:00:00',
+                TIMESTAMP '2026-01-01 02:00:00',
+                INTERVAL '1 hour'
+            )",
+        )?;
+        assert_eq!(
+            timestamps
+                .rows()
+                .iter()
+                .map(|row| row.values()[0].clone())
+                .collect::<Vec<_>>(),
+            vec![
+                Value::TimestampMicros(1_767_225_600_000_000),
+                Value::TimestampMicros(1_767_229_200_000_000),
+                Value::TimestampMicros(1_767_232_800_000_000)
+            ]
+        );
+        let dates = db.execute(
+            "SELECT value FROM generate_series(
+                DATE '2026-01-01',
+                DATE '2026-01-03',
+                INTERVAL '1 day'
+            )",
+        )?;
+        assert_eq!(
+            dates
+                .rows()
+                .iter()
+                .map(|row| row.values()[0].clone())
+                .collect::<Vec<_>>(),
+            vec![
+                Value::DateDays(20_454),
+                Value::DateDays(20_455),
+                Value::DateDays(20_456)
+            ]
+        );
+
+        let prepared = db.prepare("SELECT value FROM generate_series($1, $2, $3)")?;
+        let prepared_rows =
+            prepared.execute(&[Value::Int64(2), Value::Int64(6), Value::Int64(2)])?;
+        assert_eq!(
+            prepared_rows
+                .rows()
+                .iter()
+                .map(|row| row.values()[0].clone())
+                .collect::<Vec<_>>(),
+            vec![Value::Int64(2), Value::Int64(4), Value::Int64(6)]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn main_and_temp_schema_qualified_names_are_narrowly_supported() -> Result<()> {
+        let db = Db::open_or_create(":memory:", DbConfig::default())?;
+        db.execute("CREATE TABLE main.shadow(id INT PRIMARY KEY, note TEXT)")?;
+        db.execute("CREATE TEMP TABLE temp.shadow(id INT PRIMARY KEY)")?;
+        db.execute("INSERT INTO main.shadow VALUES (1, 'main')")?;
+        db.execute("INSERT INTO temp.shadow VALUES (2)")?;
+
+        assert_eq!(
+            db.execute("SELECT id FROM shadow")?.rows()[0].values(),
+            &[Value::Int64(2)]
+        );
+        assert_eq!(
+            db.execute("SELECT id FROM main.shadow")?.rows()[0].values(),
+            &[Value::Int64(1)]
+        );
+        assert_eq!(
+            db.execute("SELECT id FROM temp.shadow")?.rows()[0].values(),
+            &[Value::Int64(2)]
+        );
+
+        db.execute("UPDATE main.shadow SET note = 'updated' WHERE id = 1")?;
+        db.execute("DELETE FROM temp.shadow WHERE id = 2")?;
+        assert_eq!(
+            db.execute("SELECT note FROM main.shadow")?.rows()[0].values(),
+            &[Value::Text("updated".to_string())]
+        );
+        assert_eq!(db.execute("SELECT * FROM temp.shadow")?.rows().len(), 0);
+
+        db.execute("CREATE VIEW main.shadow_view AS SELECT id FROM main.shadow")?;
+        assert_eq!(
+            db.execute("SELECT id FROM main.shadow_view")?.rows()[0].values(),
+            &[Value::Int64(1)]
+        );
+        db.execute("CREATE TEMP VIEW temp.empty_shadow AS SELECT id FROM temp.shadow")?;
+        assert_eq!(
+            db.execute("SELECT * FROM temp.empty_shadow")?.rows().len(),
+            0
+        );
+        db.execute("CREATE INDEX shadow_note_idx ON main.shadow(note)")?;
+        db.execute("DROP INDEX shadow_note_idx")?;
+        db.execute("ALTER TABLE main.shadow ADD COLUMN extra TEXT")?;
+        db.execute("DROP VIEW main.shadow_view")?;
+        db.execute("DROP TABLE main.shadow")?;
+        db.execute("DROP TABLE temp.shadow")?;
+
+        db.execute("CREATE SCHEMA app")?;
+        let schema_error = db
+            .execute("SELECT * FROM app.shadow")
+            .expect_err("registered schema object lookup should fail");
+        assert!(schema_error.to_string().contains("schema 'app'"));
+        assert!(schema_error
+            .to_string()
+            .contains("advanced compatibility work"));
+        Ok(())
+    }
+
+    #[test]
+    fn query_time_collations_and_scalar_compatibility_helpers_work() -> Result<()> {
+        let db = Db::open_or_create(":memory:", DbConfig::default())?;
+        db.execute("CREATE TABLE names(name TEXT)")?;
+        db.execute("INSERT INTO names VALUES ('b'), ('A'), ('a'), ('a ')")?;
+
+        let ordered = db.execute("SELECT name FROM names ORDER BY name COLLATE NOCASE")?;
+        assert_eq!(
+            ordered
+                .rows()
+                .iter()
+                .map(|row| row.values()[0].clone())
+                .collect::<Vec<_>>(),
+            vec![
+                Value::Text("A".to_string()),
+                Value::Text("a".to_string()),
+                Value::Text("a ".to_string()),
+                Value::Text("b".to_string())
+            ]
+        );
+        assert_eq!(
+            db.execute("SELECT COUNT(*) FROM names WHERE name COLLATE NOCASE = 'a'")?
+                .rows()[0]
+                .values(),
+            &[Value::Int64(2)]
+        );
+        assert_eq!(
+            db.execute("SELECT 'a ' COLLATE RTRIM = 'a'")?.rows()[0].values(),
+            &[Value::Bool(true)]
+        );
+        assert!(db
+            .execute("SELECT 'a' COLLATE unicode = 'A'")
+            .expect_err("unsupported collation should fail")
+            .to_string()
+            .contains("unsupported collation"));
+        assert!(db
+            .execute("CREATE INDEX names_nocase_idx ON names(name COLLATE NOCASE)")
+            .expect_err("persistent non-binary index collation should fail")
+            .to_string()
+            .contains("persistent index collations"));
+        assert!(db
+            .execute("SELECT DISTINCT name COLLATE NOCASE FROM names")
+            .expect_err("collated distinct should fail clearly")
+            .to_string()
+            .contains("COLLATE in DISTINCT"));
+        assert!(db
+            .execute("SELECT name COLLATE NOCASE FROM names GROUP BY name COLLATE NOCASE")
+            .expect_err("collated group by should fail clearly")
+            .to_string()
+            .contains("COLLATE in GROUP BY"));
+
+        let helpers = db.execute(
+            "SELECT current_database(), current_schema(), database(), schema(), version()",
+        )?;
+        assert_eq!(
+            helpers.rows()[0].values()[0],
+            Value::Text("main".to_string())
+        );
+        assert_eq!(
+            helpers.rows()[0].values()[1],
+            Value::Text("main".to_string())
+        );
+        assert_eq!(
+            helpers.rows()[0].values()[2],
+            Value::Text("main".to_string())
+        );
+        assert_eq!(
+            helpers.rows()[0].values()[3],
+            Value::Text("main".to_string())
+        );
+        assert!(
+            matches!(&helpers.rows()[0].values()[4], Value::Text(version) if version.starts_with("DecentDB "))
+        );
+        assert!(db
+            .execute("SELECT sqlite_version()")
+            .expect_err("sqlite_version should not lie")
+            .to_string()
+            .contains("not SQLite"));
+        assert!(db
+            .execute("SELECT pg_backend_pid()")
+            .expect_err("pg_backend_pid should not be faked")
+            .to_string()
+            .contains("embedded"));
+        Ok(())
     }
 
     #[test]

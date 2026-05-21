@@ -22,6 +22,27 @@ const db = knex({
 });
 ```
 
+## Queued writes
+
+Queue options are forwarded to `decentdb-native`:
+
+```js
+const db = knex({
+  client: Client_DecentDB,
+  connection: {
+    filename: 'app.ddb',
+    writeQueueEnabled: true,
+    writeQueueCapacity: 128,
+    writeQueueDefaultTimeoutMs: 1000,
+  },
+  useNullAsDefault: true,
+});
+```
+
+Unbound write SQL uses the native queued execution helper when queue mode is
+enabled. Parameterized Knex queries still use prepared statements directly until
+the DecentDB C ABI exposes queued prepared-statement execution.
+
 ## Lifecycle
 
 Call `await db.destroy()` when the Knex instance is no longer needed, including
@@ -37,4 +58,5 @@ npm run benchmark:fetch -- --count 100000 --point-reads 5000 --fetchmany-batch 1
 ## Current limitations
 
 - the current fast path is still specialized for benchmark-shaped `(int64, text, float64)` inserts and fetches
+- queued execution currently applies only to unbound write SQL
 - Knex schema-builder customization for DecentDB-specific SQL types is still minimal

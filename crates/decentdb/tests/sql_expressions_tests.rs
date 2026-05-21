@@ -3061,15 +3061,18 @@ fn select_from_nonexistent_table() {
 }
 
 #[test]
-fn select_from_table_valued_function_unsupported() {
+fn select_from_generate_series_table_valued_function() {
     let db = mem_db();
-    // generate_series may not be supported; exercise the error path
-    let err = exec_err(&db, "SELECT * FROM generate_series(1, 5)");
-    assert!(
-        err.to_lowercase().contains("not supported")
-            || err.to_lowercase().contains("function")
-            || err.to_lowercase().contains("generate_series"),
-        "got: {err}"
+    let result = exec(&db, "SELECT value FROM generate_series(1, 5)");
+    assert_eq!(
+        rows(&result),
+        vec![
+            vec![Value::Int64(1)],
+            vec![Value::Int64(2)],
+            vec![Value::Int64(3)],
+            vec![Value::Int64(4)],
+            vec![Value::Int64(5)],
+        ]
     );
 }
 

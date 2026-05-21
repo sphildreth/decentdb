@@ -138,6 +138,28 @@ The repository currently ships the `release_metrics` benchmark target:
 cargo bench -p decentdb
 ```
 
+The Rust-native benchmark runner also owns the Phase 1 concurrent-write
+regression hooks:
+
+```bash
+cargo run -p decentdb-benchmark -- run --profile smoke \
+  --scenario durable_commit_single --scenario read_under_write
+cargo run -p decentdb-benchmark -- run --profile smoke \
+  --scenario queued_writer_single --scenario queued_writer_read_under_write
+```
+
+The queued-writer scenarios execute the engine-owned write queue directly:
+`queued_writer_single` measures the single-writer queued overhead with zero
+group delay, and `queued_writer_read_under_write` runs concurrent queued
+writers beside point readers while reporting strict group-commit counters.
+
+Pre-commit exposes those slices as:
+
+```bash
+python scripts/do-pre-commit-checks.py --only rust-benchmark-phase1-native
+python scripts/do-pre-commit-checks.py --only rust-benchmark-phase1-queued-writers
+```
+
 ## Adding new tests
 
 - Add unit tests next to the Rust module they exercise via `#[cfg(test)]`.

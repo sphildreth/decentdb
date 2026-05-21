@@ -45,6 +45,10 @@ pub enum ScenarioId {
     RecoveryReopen,
     #[value(name = "read_under_write")]
     ReadUnderWrite,
+    #[value(name = "queued_writer_single")]
+    QueuedWriterSingle,
+    #[value(name = "queued_writer_read_under_write")]
+    QueuedWriterReadUnderWrite,
     #[value(name = "storage_efficiency")]
     StorageEfficiency,
     #[value(name = "memory_footprint")]
@@ -52,7 +56,7 @@ pub enum ScenarioId {
 }
 
 impl ScenarioId {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 13] = [
         Self::DurableCommitSingle,
         Self::DurableCommitBatch,
         Self::ComplexEcommerce,
@@ -62,6 +66,8 @@ impl ScenarioId {
         Self::Checkpoint,
         Self::RecoveryReopen,
         Self::ReadUnderWrite,
+        Self::QueuedWriterSingle,
+        Self::QueuedWriterReadUnderWrite,
         Self::StorageEfficiency,
         Self::MemoryFootprint,
     ];
@@ -78,6 +84,8 @@ impl ScenarioId {
             Self::Checkpoint => "checkpoint",
             Self::RecoveryReopen => "recovery_reopen",
             Self::ReadUnderWrite => "read_under_write",
+            Self::QueuedWriterSingle => "queued_writer_single",
+            Self::QueuedWriterReadUnderWrite => "queued_writer_read_under_write",
             Self::StorageEfficiency => "storage_efficiency",
             Self::MemoryFootprint => "memory_footprint",
         }
@@ -100,6 +108,8 @@ impl ScenarioId {
             | Self::Checkpoint
             | Self::RecoveryReopen
             | Self::ReadUnderWrite
+            | Self::QueuedWriterSingle
+            | Self::QueuedWriterReadUnderWrite
             | Self::StorageEfficiency
             | Self::MemoryFootprint => "full",
             Self::PointLookupWarm | Self::PointLookupCold | Self::RangeScanWarm => "n/a",
@@ -112,12 +122,14 @@ impl ScenarioId {
             Self::DurableCommitSingle
             | Self::DurableCommitBatch
             | Self::Checkpoint
+            | Self::QueuedWriterSingle
             | Self::StorageEfficiency
             | Self::MemoryFootprint => "real_fs",
             Self::ComplexEcommerce => "mixed",
             Self::PointLookupWarm | Self::RangeScanWarm => "in_memory",
             Self::PointLookupCold | Self::RecoveryReopen => "cold_process",
             Self::ReadUnderWrite => "warm_cache",
+            Self::QueuedWriterReadUnderWrite => "warm_cache",
         }
     }
 }

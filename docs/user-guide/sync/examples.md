@@ -35,6 +35,41 @@ reopens it.
 
 See [conflicts](conflicts.md) and the sample script.
 
+## Changeset Review
+
+```bash
+decentdb sync changeset create \
+  --db=app.ddb \
+  --from-branch=main \
+  --to-branch=review \
+  --output=.tmp/review.dcs.json
+
+decentdb sync changeset inspect --input=.tmp/review.dcs.json --db=app.ddb --check-local
+```
+
+Use this when an application or agent needs a durable, inspectable data patch
+without merging a branch yet.
+
+## Relay Shape Snapshot
+
+```bash
+decentdb relay shape create \
+  --db=app.ddb \
+  --shape=tenant_42_tasks_v1 \
+  --scope=tenant_42_tasks \
+  --tenant=tenant_42 \
+  --allow-role=user
+
+decentdb relay shape snapshot \
+  --db=app.ddb \
+  --shape=tenant_42_tasks_v1 \
+  --client-replica-id=web_123 \
+  --output=.tmp/tenant_42_tasks.snapshot.dcs.json
+```
+
+Use this to test the same shape contract that browser and mobile clients
+consume through the production relay.
+
 ## Doctor and Retention Workflow
 
 ```bash
@@ -43,4 +78,3 @@ decentdb sync prune --db=app.ddb --through=100 --dry-run --format=table
 ```
 
 Use this pair before any pruning decision.
-

@@ -10,12 +10,12 @@ use crate::error::{DbError, Result};
 use crate::record::value::Value;
 
 use super::ast::{
-    AlterTableAction, Assignment, BinaryOp, ColumnDefinition, CommonTableExpr, ConflictAction,
-    ConflictTarget, CreateIndexStatement, CreateTableAsStatement, CreateTableStatement,
-    CreateTriggerStatement, CreateViewStatement, DeleteStatement, ExplainStatement, Expr,
-    ForeignKeyActionSpec, ForeignKeyDefinition, FromItem, IndexExpression, InsertSource,
-    InsertStatement, JoinConstraint, JoinKind, OrderBy, Query, QueryBody, Select, SelectItem,
-    SetOperation, Statement, SubqueryQuantifier, TableConstraint, TriggerEventSpec,
+    AlterTableAction, Assignment, BinaryOp, Collation, ColumnDefinition, CommonTableExpr,
+    ConflictAction, ConflictTarget, CreateIndexStatement, CreateTableAsStatement,
+    CreateTableStatement, CreateTriggerStatement, CreateViewStatement, DeleteStatement,
+    ExplainStatement, Expr, ForeignKeyActionSpec, ForeignKeyDefinition, FromItem, IndexExpression,
+    InsertSource, InsertStatement, JoinConstraint, JoinKind, OrderBy, Query, QueryBody, Select,
+    SelectItem, SetOperation, Statement, SubqueryQuantifier, TableConstraint, TriggerEventSpec,
     TriggerKindSpec, TruncateIdentityMode, UnaryOp, UpdateStatement, WindowFrame, WindowFrameBound,
     WindowFrameUnit,
 };
@@ -579,6 +579,15 @@ fn normalize_column_definition(
     column: &protobuf::ColumnDef,
     generated_stored: bool,
 ) -> Result<ColumnDefinition> {
+    if let Some(collation) = &column.coll_clause {
+        let collation = normalize_collation_name(&collation.collname)?;
+        if collation != Collation::Binary {
+            return Err(unsupported(
+                "persistent column collations other than BINARY are not supported in this compatibility slice",
+            ));
+        }
+    }
+
     let mut primary_key = false;
     let mut unique = false;
     let mut not_null = column.is_not_null;
@@ -761,9 +770,11 @@ fn normalize_create_index(statement: &protobuf::IndexStmt) -> Result<CreateIndex
             .iter()
             .map(|node| match node_kind(node)? {
                 NodeEnum::IndexElem(index) if !index.name.is_empty() => {
+                    normalize_index_collation(index)?;
                     Ok(IndexExpression::Column(index.name.clone()))
                 }
                 NodeEnum::IndexElem(index) if index.expr.is_some() => {
+                    normalize_index_collation(index)?;
                     Ok(IndexExpression::Expr(normalize_expr_node(
                         index
                             .expr
@@ -788,6 +799,20 @@ fn normalize_create_index(statement: &protobuf::IndexStmt) -> Result<CreateIndex
             .map(normalize_expr_node)
             .transpose()?,
     })
+}
+
+fn normalize_index_collation(index: &protobuf::IndexElem) -> Result<()> {
+    if index.collation.is_empty() {
+        return Ok(());
+    }
+    let collation = normalize_collation_name(&index.collation)?;
+    if collation == Collation::Binary {
+        Ok(())
+    } else {
+        Err(unsupported(
+            "persistent index collations other than BINARY are not supported in this compatibility slice",
+        ))
+    }
 }
 
 fn normalize_create_view(
@@ -1267,14 +1292,6 @@ fn normalize_range_function(range: &protobuf::RangeFunction) -> Result<FromItem>
         return Err(unsupported("table function entry is malformed"));
     };
     let name = normalize_qualified_name(&call.funcname)?;
-    if !matches!(
-        name.as_str(),
-        "json_each" | "json_tree" | "pg_catalog.json_each" | "pg_catalog.json_tree"
-    ) {
-        return Err(unsupported(format!(
-            "table function {name} is not supported"
-        )));
-    }
     let args = call
         .args
         .iter()
@@ -1312,22 +1329,34 @@ fn normalize_assignment(node: &protobuf::Node) -> Result<Assignment> {
 
 fn normalize_order_by_node(node: &protobuf::Node) -> Result<OrderBy> {
     match node_kind(node)? {
-        NodeEnum::SortBy(sort) => Ok(OrderBy {
-            expr: normalize_expr_node(
+        NodeEnum::SortBy(sort) => {
+            let expr = normalize_expr_node(
                 sort.node
                     .as_deref()
                     .ok_or_else(|| unsupported("ORDER BY term is missing its expression"))?,
-            )?,
-            descending: matches!(
-                protobuf::SortByDir::try_from(sort.sortby_dir)
-                    .unwrap_or(protobuf::SortByDir::SortbyDefault),
-                protobuf::SortByDir::SortbyDesc
-            ),
-        }),
+            )?;
+            let (expr, collation) = split_collation_expr(expr);
+            Ok(OrderBy {
+                expr,
+                descending: matches!(
+                    protobuf::SortByDir::try_from(sort.sortby_dir)
+                        .unwrap_or(protobuf::SortByDir::SortbyDefault),
+                    protobuf::SortByDir::SortbyDesc
+                ),
+                collation,
+            })
+        }
         other => Err(unsupported(format!(
             "ORDER BY node {} is not supported",
             describe_node(other)
         ))),
+    }
+}
+
+fn split_collation_expr(expr: Expr) -> (Expr, Option<Collation>) {
+    match expr {
+        Expr::Collate { expr, collation } => (*expr, Some(collation)),
+        other => (other, None),
     }
 }
 
@@ -1413,10 +1442,35 @@ fn normalize_expr_node(node: &protobuf::Node) -> Result<Expr> {
         }),
         NodeEnum::JsonArrayConstructor(array) => normalize_json_array_constructor(array),
         NodeEnum::JsonValueExpr(expr) => normalize_json_value_expr(expr),
+        NodeEnum::CollateClause(collate) => {
+            let collation = normalize_collation_name(&collate.collname)?;
+            Ok(Expr::Collate {
+                expr: Box::new(normalize_expr_node(collate.arg.as_deref().ok_or_else(
+                    || unsupported("COLLATE clause is missing its expression"),
+                )?)?),
+                collation,
+            })
+        }
+        NodeEnum::CollateExpr(collate) => Ok(Expr::Collate {
+            expr: Box::new(normalize_expr_node(collate.arg.as_deref().ok_or_else(
+                || unsupported("COLLATE expression is missing its expression"),
+            )?)?),
+            collation: Collation::Binary,
+        }),
         other => Err(unsupported(format!(
             "expression node {} is not supported",
             describe_node(other)
         ))),
+    }
+}
+
+fn normalize_collation_name(nodes: &[protobuf::Node]) -> Result<Collation> {
+    let name = normalize_qualified_name(nodes)?.to_ascii_lowercase();
+    match name.as_str() {
+        "binary" | "pg_catalog.binary" => Ok(Collation::Binary),
+        "nocase" | "no_case" => Ok(Collation::NoCase),
+        "rtrim" => Ok(Collation::RTrim),
+        other => Ok(Collation::Extension(other.to_string())),
     }
 }
 
@@ -2191,13 +2245,21 @@ fn normalize_target_column(node: &protobuf::Node) -> Result<String> {
 }
 
 fn normalize_range_var(range: &protobuf::RangeVar) -> Result<String> {
-    if !range.catalogname.is_empty() || !range.schemaname.is_empty() {
-        return Err(unsupported(
-            "catalog-qualified and schema-qualified names are not supported",
-        ));
+    if !range.catalogname.is_empty() {
+        return Err(unsupported("catalog-qualified names are not supported"));
     }
     if range.relname.is_empty() {
         return Err(unsupported("relation name must not be empty"));
+    }
+    if !range.schemaname.is_empty() {
+        let schema = range.schemaname.to_ascii_lowercase();
+        return match schema.as_str() {
+            "main" => Ok(format!("main.{}", range.relname)),
+            "temp" | "information_schema" => Ok(format!("{schema}.{}", range.relname)),
+            other => Err(unsupported(format!(
+                "schema-qualified objects outside main/temp are not supported yet; schema '{other}' is registered but object ownership by schema is advanced compatibility work"
+            ))),
+        };
     }
     Ok(range.relname.clone())
 }
@@ -2569,6 +2631,8 @@ fn describe_node(node: &NodeEnum) -> &'static str {
         NodeEnum::NullTest(_) => "NullTest",
         NodeEnum::SubLink(_) => "SubLink",
         NodeEnum::MinMaxExpr(_) => "MinMaxExpr",
+        NodeEnum::CollateClause(_) => "CollateClause",
+        NodeEnum::CollateExpr(_) => "CollateExpr",
         NodeEnum::String(_) => "String",
         NodeEnum::List(_) => "List",
         _ => "Node",
@@ -3476,9 +3540,16 @@ mod tests {
 
     #[test]
     fn from_function_call() {
-        // generate_series is rejected at normalization; test that it returns an error
-        let err = norm_err("SELECT * FROM generate_series(1, 5)");
-        assert!(err.contains("not supported"), "got: {err}");
+        if let Statement::Query(q) = norm("SELECT * FROM generate_series(1, 5)") {
+            if let QueryBody::Select(s) = q.body {
+                assert!(matches!(
+                    &s.from[0],
+                    FromItem::Function { name, .. } if name == "generate_series"
+                ));
+            }
+        } else {
+            panic!("expected Query");
+        }
     }
 
     // ── normalize_select_item paths ────────────────────────────────

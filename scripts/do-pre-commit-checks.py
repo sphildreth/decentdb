@@ -500,6 +500,49 @@ def build_checks() -> list[Check]:
         ),
         # ── Stage 5: Benchmarks (parallel) ──
         Check(
+            key="rust-benchmark-phase1-native",
+            title="Rust benchmark phase 1 direct scenarios",
+            cwd=REPO_ROOT,
+            command=(
+                "cargo run -p decentdb-benchmark -- run "
+                "--profile smoke "
+                "--scenario durable_commit_single "
+                "--scenario read_under_write "
+                "--durable-commits 120 "
+                "--rows 2000 "
+                "--point-reads 1000 "
+                "--writer-ops 120 "
+                "--reader-threads 2 "
+                "--trials 1 "
+                "--scratch-root .tmp/decentdb-benchmark-phase1-direct "
+                "--artifact-root .tmp/decentdb-benchmark-phase1-direct-artifacts"
+            ),
+            env={},
+            stage=5,
+            cargo_bound=True,
+        ),
+        Check(
+            key="rust-benchmark-phase1-queued-writers",
+            title="Rust benchmark queued write scenarios",
+            cwd=REPO_ROOT,
+            command=(
+                "cargo run -p decentdb-benchmark -- run "
+                "--profile smoke "
+                "--scenario queued_writer_single "
+                "--scenario queued_writer_read_under_write "
+                "--point-reads 100 "
+                "--writer-ops 20 "
+                "--durable-commits 30 "
+                "--rows 500 "
+                "--trials 1 "
+                "--scratch-root .tmp/decentdb-benchmark-phase1-queued "
+                "--artifact-root .tmp/decentdb-benchmark-phase1-queued-artifacts"
+            ),
+            env={},
+            stage=5,
+            cargo_bound=True,
+        ),
+        Check(
             key="python-benchmark",
             title="Python complex benchmark",
             cwd=REPO_ROOT / "bindings" / "python",

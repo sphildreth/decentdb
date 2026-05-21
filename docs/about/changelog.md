@@ -5,6 +5,107 @@ All notable changes to DecentDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.6.0] - 2026-05-21
+
+### Added
+
+- Added `decentdb serve`, a CLI-hosted local HTTP API and lightweight Web
+  Console with embedded offline assets, transparent localhost auth,
+  read-only mode, schema/table/index/view/trigger inspection, SQL and EXPLAIN
+  execution, result limits, request limits, query history, CSV export, optional
+  CORS, JSON request logging, and remote-bind safety checks.
+- Enhanced `decentdb describe` and the REPL `.d <table>` command to show
+  foreign key references, including table-level foreign key constraints.
+- Completed the interactive SQL shell ergonomics roadmap slice with a version
+  banner, `help`/quit aliases, topic-specific help, schema inspection commands
+  (`.tables`, `.dt`, `.d <table>`, `.schema`, `.indexes`, `.views`), function
+  listing (`.df`), output controls (`.mode`, `.headers`, `.nullvalue`,
+  `.width`, `.timer`), file workflows (`.read`, `.output`, `.once`, `.import`,
+  `.export`), explain helpers (`.explain`, `.plan`, `.explain-analyze`),
+  positional parameter helpers (`.param`), repeat-last-SQL (`.g`), session
+  history (`.s`), and branch creation/checkout helpers.
+- Added WASM/browser support: the `decentdb` crate now checks for
+  `wasm32-unknown-unknown`, exposes wasm-bindgen browser exports, and includes
+  an OPFS-backed VFS intended for Dedicated Worker use.
+- Added the `@decentdb/web` TypeScript binding with an async worker-owned API,
+  OPFS host bridge, explicit `wasmUrl` loading, `exec`/`query`/`prepare`,
+  binary result transport, checkpoint, import/export, persistence helper,
+  worker metrics, automated Chromium OPFS browser smoke coverage, and scheduled
+  browser transport benchmark coverage.
+- Added ADR 0161 documenting the browser WASM/OPFS runtime and its one-worker
+  ownership model.
+- Added the WASM / Browser API documentation page.
+- Completed the production browser runtime phase with ADR 0165, `probeRuntime()`,
+  stable browser error codes, Dedicated Worker owner coordination through Web
+  Locks and BroadcastChannel, multi-tab owner routing and recovery coverage,
+  explicit service-worker exclusion, owner/quota/persistence diagnostics through
+  `metrics()` and `sys.browser_*` views, tagged browser parameters, an expanded
+  `browser-app-v1` SQL profile, and tier/candidate Playwright browser matrix
+  scripts.
+- Added concurrent-write benchmark coverage: native benchmark hooks for direct
+  single-writer and read-under-write regression slices, executable queued-write
+  single-writer and reader-under-writer scenarios, a shared cross-binding
+  concurrent-write scenario definition, a grouped-commit fault-injection test
+  plan, and pre-commit check keys for the new slices.
+- Added the engine-owned queued write path with strict durable group commit,
+  bounded admission, timeout and cancellation-before-run errors, Rust and C ABI
+  queue metrics, C ABI status codes and execution entry points, and ADR 0162.
+- Added the Write Concurrency user guide and C ABI documentation for queued
+  writes, queue configuration, queue metrics, and the distinction between
+  strict group commit and async commit.
+- Added queued-write binding coverage across Python, Go, Dart, Node, .NET
+  native, Java/JDBC status/config mapping, Knex unbound writes, and C ABI smoke
+  tests for maintained binding surfaces.
+- Added built-in operational metrics `sys.*` inspection views:
+  `sys.wal_metrics`, `sys.write_queue_metrics`, `sys.storage_metrics`, and
+  canonical `sys.sync_status` while preserving `sys_sync_*` compatibility
+  inspection names. Added deterministic Rust regression tests and SQL API
+  documentation plus ADR 0163 covering column contracts, metric snapshots, and
+  lifecycle semantics.
+- Added in-process reactive subscriptions and change streams with Rust watch
+  handles, table/range/query/change-stream watch kinds, bounded lag reporting,
+  post-commit LSN events, queued/sync/branch source tagging, C ABI JSON watch
+  handles, Python and Go direct watch helpers, `sys.reactive_metrics`,
+  `sys.reactive_subscriptions`, ADR 0164, and a full implementation spec for
+  the reactive contract.
+- Added the production sync relay and public changeset surface: Rust
+  changeset create/inspect/apply/invert APIs, C ABI JSON entry points,
+  `decentdb sync changeset`, authenticated `decentdb relay serve` v2 HTTP and
+  WebSocket routes, sync shapes backed by scopes, durable shape acks and
+  retention blockers, relay/shape/changeset `sys.*` diagnostics, browser relay
+  helpers, .NET JSON helpers, user docs, and ADR 0166-0168 delivery context.
+- Completed the SQL and PRAGMA compatibility quick-wins roadmap item with safe
+  SQLite-style PRAGMA probes and assignments, durable transactional
+  `user_version`/`application_id` metadata, extended schema-introspection
+  PRAGMAs, PRAGMA table functions, read-only `sqlite_schema` and minimal
+  `information_schema` views, `generate_series`, narrow `main.`/`temp.`
+  qualifiers, query-time `BINARY`/`NOCASE`/`RTRIM` collations, scalar
+  compatibility helpers, docs, and CLI smoke coverage.
+- Added the sandboxed Lua extension runtime and package model: manifest
+  validation, stable package hashing, Ed25519 signature verification,
+  database-owned package catalogs, explicit install/enable/disable/purge
+  lifecycle, connection-level content-hash trust, development-only unsigned
+  overrides, scalar functions, table-valued functions, aggregate functions,
+  query-time Lua collations, runtime resource limits, `sys.extension_*`
+  inspection views, Rust APIs, `decentdb extension` CLI commands, C ABI JSON
+  lifecycle bridges, docs, and a full example extension package.
+
+### Changed
+
+- Gated the native C-backed `pg_query` parser out of `wasm32-unknown-unknown`
+  builds and added a documented wasm parser for the browser v1 SQL subset.
+
+### Fixed
+
+- Fixed `decentdb-migrate` v10 → v11 upgrades for databases with an existing
+  `<db>.wal` sidecar by standardizing migration tooling on the engine's
+  append-`.wal` sidecar convention, copying the v10 WAL forward, and upgrading
+  any page-1 database-header frames inside the copied WAL so a later checkpoint
+  cannot restore a legacy v10 header.
+- Fixed production relay shape HTTP endpoints to authorize by shape ACL/allowlist for
+  shape-based streams and snapshots, avoiding a false `SCOPE_UNAUTHORIZED` rejection
+  when callers present valid shape permissions but no explicit scope list.
+
 ## [2.5.1] - 2026-05-19
 
 ### Changed

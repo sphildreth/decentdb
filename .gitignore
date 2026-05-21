@@ -35,6 +35,7 @@ tests/bindings/**/obj/
 tests/bindings/**/build/
 tests/bindings/**/dist/
 tests/bindings/**/out/
+tests/bindings/**/test-results/
 tests/bindings/**/target/
 tests/bindings/**/node_modules/
 tests/bindings/**/.dart_tool/
@@ -58,6 +59,7 @@ tests/bindings/**/*.node
 /bindings/**/build/
 /bindings/**/dist/
 /bindings/**/out/
+/bindings/**/test-results/
 /bindings/**/target/
 /bindings/**/node_modules/
 /bindings/**/.dart_tool/

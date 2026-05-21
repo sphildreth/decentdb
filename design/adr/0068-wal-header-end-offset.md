@@ -22,6 +22,3 @@ in the header preserves recovery correctness while enabling mmap-based appends.
 - WAL format change (requires format bump and migration notes).
 - Minor additional header write per commit (mmap path updates header in memory).
 - Slightly more recovery logic (header validation + bounded scan).
-
-### References
-- `design/SQLITE_PERF_GAP_PLAN.md` (WAL/mmap follow-up)

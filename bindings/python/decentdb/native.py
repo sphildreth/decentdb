@@ -24,6 +24,14 @@ ERR_SQL = 5
 ERR_INTERNAL = 6
 ERR_PANIC = 7
 ERR_UNSUPPORTED_FORMAT_VERSION = 8
+ERR_BUSY = 9
+ERR_TIMEOUT = 10
+ERR_CANCELED = 11
+ERR_QUEUE_FULL = 12
+ERR_QUEUE_CLOSED = 13
+
+# Queue timeout sentinel from include/decentdb.h.
+DDB_WRITE_QUEUE_TIMEOUT_DEFAULT = (2**64 - 1)
 
 # Legacy compatibility aliases kept for higher-level Python imports/tests.
 ERR_ERROR = 100
@@ -111,6 +119,26 @@ class DdbValueView(Structure):
         ("interval_months", c_int32),
         ("interval_days", c_int32),
         ("interval_micros", c_int64),
+    ]
+
+
+class DdbWriteQueueMetrics(Structure):
+    _fields_ = [
+        ("capacity", c_size_t),
+        ("current_depth", c_size_t),
+        ("admitted", c_uint64),
+        ("rejected", c_uint64),
+        ("timed_out", c_uint64),
+        ("canceled", c_uint64),
+        ("executed", c_uint64),
+        ("committed", c_uint64),
+        ("failed", c_uint64),
+        ("group_commit_batches", c_uint64),
+        ("group_commit_syncs", c_uint64),
+        ("group_commit_max_batch", c_uint64),
+        ("group_commit_commits_covered", c_uint64),
+        ("physical_syncs_saved", c_uint64),
+        ("total_queue_wait_ns", c_uint64),
     ]
 
 
@@ -229,6 +257,16 @@ def load_library():
         POINTER(c_void_p),
     ]
     _lib.ddb_db_execute.restype = c_uint32
+    if hasattr(_lib, "ddb_db_execute_queued"):
+        _lib.ddb_db_execute_queued.argtypes = [
+            c_void_p,
+            c_char_p,
+            POINTER(DdbValue),
+            c_size_t,
+            c_uint64,
+            POINTER(c_void_p),
+        ]
+        _lib.ddb_db_execute_queued.restype = c_uint32
     _lib.ddb_result_free.argtypes = [POINTER(c_void_p)]
     _lib.ddb_result_free.restype = c_uint32
     _lib.ddb_db_begin_transaction.argtypes = [c_void_p]
@@ -262,6 +300,47 @@ def load_library():
     if hasattr(_lib, "ddb_db_inspect_storage_state_json"):
         _lib.ddb_db_inspect_storage_state_json.argtypes = [c_void_p, POINTER(c_char_p)]
         _lib.ddb_db_inspect_storage_state_json.restype = c_uint32
+    if hasattr(_lib, "ddb_db_write_queue_metrics"):
+        _lib.ddb_db_write_queue_metrics.argtypes = [c_void_p, POINTER(DdbWriteQueueMetrics)]
+        _lib.ddb_db_write_queue_metrics.restype = c_uint32
+    if hasattr(_lib, "ddb_db_watch_table_json"):
+        _lib.ddb_db_watch_table_json.argtypes = [
+            c_void_p,
+            c_char_p,
+            POINTER(c_void_p),
+        ]
+        _lib.ddb_db_watch_table_json.restype = c_uint32
+    if hasattr(_lib, "ddb_db_watch_range_json"):
+        _lib.ddb_db_watch_range_json.argtypes = [
+            c_void_p,
+            c_char_p,
+            POINTER(c_void_p),
+        ]
+        _lib.ddb_db_watch_range_json.restype = c_uint32
+    if hasattr(_lib, "ddb_db_watch_query_json"):
+        _lib.ddb_db_watch_query_json.argtypes = [
+            c_void_p,
+            c_char_p,
+            POINTER(c_void_p),
+        ]
+        _lib.ddb_db_watch_query_json.restype = c_uint32
+    if hasattr(_lib, "ddb_db_change_stream_json"):
+        _lib.ddb_db_change_stream_json.argtypes = [
+            c_void_p,
+            c_char_p,
+            POINTER(c_void_p),
+        ]
+        _lib.ddb_db_change_stream_json.restype = c_uint32
+    if hasattr(_lib, "ddb_watch_next_json"):
+        _lib.ddb_watch_next_json.argtypes = [
+            c_void_p,
+            c_uint32,
+            POINTER(c_char_p),
+        ]
+        _lib.ddb_watch_next_json.restype = c_uint32
+    if hasattr(_lib, "ddb_watch_close"):
+        _lib.ddb_watch_close.argtypes = [POINTER(c_void_p)]
+        _lib.ddb_watch_close.restype = c_uint32
     _lib.ddb_evict_shared_wal.argtypes = [c_char_p]
     _lib.ddb_evict_shared_wal.restype = c_uint32
 

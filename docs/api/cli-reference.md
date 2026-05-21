@@ -32,6 +32,10 @@ Supported options:
 - `--as-of=<snapshot-name>` execute read-only SQL against a named snapshot
 - `--as-of-lsn=<lsn>` execute read-only SQL against a retained WAL LSN
 - `--branch=<branch>` execute against a branch
+- `--allow-extension=<name@sha256:hash>` allow an installed and enabled Lua
+  extension package to execute on this connection; may be repeated
+- `--allow-unsigned-extensions` development-only override that allows unsigned
+  installed Lua packages to execute without a hash allowlist
 
 `--as-of` and `--as-of-lsn` are read-only time-travel modes. Mutating SQL,
 transaction control, PRAGMA commands, and `--checkpoint` are rejected in this
@@ -45,15 +49,82 @@ Interactive SQL shell with:
 - transaction-aware prompt state
 
 ```bash
-decentdb repl --db=<path> [--format=<json|csv|table|markdown>]
+decentdb repl --db=<path> [--format=<json|csv|table|markdown>] [--allow-extension=<name@sha256:hash>]
 ```
 
 Special commands:
-- `.help`
-- `.quit`
-- `.exit`
+- help aliases: `help`, `\?`, `/?`, `/help`, `\help`, `.help`
+- quit aliases: `.quit`, `.exit`, `\q`
+- schema inspection: `.tables`, `.dt`, `.d <table>`, `.schema [object]`, `.indexes [table]`, `.views`
+- output controls: `.mode`, `.headers`, `.nullvalue`, `.width`, `.timer`
+- file workflows: `.read`, `.output`, `.once`, `.import`, `.export`
+- query helpers: `.explain`, `.plan`, `.explain-analyze`, `.param`
+- session helpers: `.g`, `.s`, `.branch`, `.checkout`
 
 See [Interactive SQL Shell](../user-guide/repl.md) for the full user guide.
+
+### extension
+
+Validate, test, install, enable, disable, inspect, and purge sandboxed Lua
+extension packages.
+
+```bash
+decentdb extension validate <package-dir> [--allow-unsigned] [--trust-extension=<name@sha256:hash>] [--format=<json|table>]
+decentdb extension test <package-dir> [--allow-unsigned] [--trust-extension=<name@sha256:hash>] [--format=<json|table>]
+decentdb extension install --db=<path> <package-dir> [--allow-unsigned] [--trust-extension=<name@sha256:hash>] [--format=<json|table>]
+decentdb extension list --db=<path> [--format=<json|table>]
+decentdb extension show --db=<path> <name> [--format=<json|table>]
+decentdb extension enable --db=<path> <name> [--format=<json|table>]
+decentdb extension disable --db=<path> <name> [--format=<json|table>]
+decentdb extension purge --db=<path> <name> --confirm [--format=<json|table>]
+decentdb extension dependencies --db=<path> [--format=<json|table>]
+decentdb extension rebuild --db=<path> <name> [--format=<json|table>]
+```
+
+Trust entries use `name@sha256:<hash>` or
+`name@sha256:<hash>@<key_id>@<public_key>`. Public keys and signatures use the
+same `base64:<value>` or `hex:<value>` encoding accepted by the Rust API.
+
+`validate` and `install` reject unsigned packages unless `--allow-unsigned` is
+present. `exec` and `repl` do not run enabled Lua code unless the connection was
+opened with `--allow-extension` for the exact package hash or with the
+development-only `--allow-unsigned-extensions` override.
+
+See [Lua Extensions](../user-guide/lua-extensions.md) for package authoring,
+manifest, trust, and sandbox details.
+
+### serve
+
+Start a local HTTP API and lightweight Web Console for a database.
+
+```bash
+decentdb serve --db=<path> [options]
+decentdb serve <path> [options]
+```
+
+Supported options:
+- `--host=<host>` bind host, default `127.0.0.1`
+- `--port=<port>` bind port, default `7373`
+- `--read-only` reject mutating SQL
+- `--open` open the default browser
+- `--max-result-rows=<n>` maximum rows returned per result set, default `1000`
+- `--query-timeout=<duration>` query timeout reporting limit, default `30s`
+- `--max-body-size=<size>` maximum request body size, default `4mb`
+- `--max-concurrent-requests=<n>` concurrent request cap, default `32`
+- `--busy-timeout=<duration>` busy timeout configuration, default `5s`
+- `--token-env=<name>` environment variable containing the bearer token
+- `--show-token` print the bearer token for API clients/debugging
+- `--no-auth` disable auth for localhost-only debugging
+- `--cors-origin=<origin>` allow one explicit CORS origin
+- `--log-format=<text|json>` request log format, default `text`
+
+The default localhost workflow uses transparent ephemeral auth. The Web Console
+receives the token in the initial local page; API calls without the token are
+rejected. Non-localhost binding requires `--token-env`, and `--no-auth` is
+accepted only for localhost binding.
+
+See [Built-In Web Console](../user-guide/web-console.md) for the full user
+guide and HTTP API routes.
 
 ### import
 
@@ -163,7 +234,7 @@ decentdb info --db=<path> [--schema-summary] [--format=<json|csv|table>]
 
 ### describe
 
-Describe one table.
+Describe one table, including column flags and foreign key references.
 
 ```bash
 decentdb describe --db=<path> --table=<name> [--format=<json|csv|table>]
@@ -536,6 +607,62 @@ Expected `sync run` table output includes:
 - `pulled_batch_id`
 - `pushed`
 - `pulled`
+
+### sync changeset
+
+```bash
+decentdb sync changeset create --db=<path> --from-checkpoint=<peer:sequence> --output=<changeset.json> [--scope=<scope>] [--shape=<shape>] [--max-records=<n>] [--max-bytes=<n>]
+decentdb sync changeset create --db=<path> --from-branch=<left> --to-branch=<right> --output=<changeset.json>
+decentdb sync changeset create --db=<path> --from-snapshot=<snapshot> --to-branch=<branch> --output=<changeset.json>
+decentdb sync changeset inspect --input=<changeset.json> [--db=<path>] [--check-local] [--format=<json|table>]
+decentdb sync changeset apply --db=<path> --input=<changeset.json> [--conflict-policy=<record|stop|last-writer-wins|origin-priority>] [--format=<json|table>]
+decentdb sync changeset invert --input=<changeset.json> --output=<inverse.json> [--db=<path>] [--format=<json|table>]
+```
+
+- Checkpoint changesets are created from the durable sync journal.
+- Branch and snapshot changesets reuse branch diff semantics and reject
+  unsupported row-diff cases before producing output.
+- `inspect --check-local` validates local schema/query compatibility without
+  mutating data.
+- `apply` is transactional by default and idempotent for already-applied
+  changeset IDs with the same integrity hash.
+- `invert` only succeeds when enough before-state is available.
+
+### relay
+
+```bash
+decentdb relay serve --db=<path> --listen=<host:port> --auth-token-env=<ENV> [--public-url=<https-url>] [--require-tls] [--allow-insecure] [--ready-file=<path>] [--max-requests=<n>] [--json]
+decentdb relay status --db=<path> [--format=<json|table>]
+decentdb relay doctor --db=<path> [--format=<json|table>]
+decentdb relay shape create --db=<path> --shape=<shape> --scope=<scope> --tenant=<tenant> [--allow-role=<role>] [--allow-subject=<subject>] [--format=<json|table>]
+decentdb relay shape list --db=<path> [--format=<json|table>]
+decentdb relay shape drop --db=<path> --shape=<shape> [--format=<json|table>]
+decentdb relay shape status --db=<path> --shape=<shape> [--format=<json|table>]
+decentdb relay shape snapshot --db=<path> --shape=<shape> --client-replica-id=<replica> --output=<changeset.json> [--format=<json|table>]
+```
+
+`relay serve` exposes production v2 routes under `/decentdb/sync/v2`:
+
+- `GET /hello`
+- `GET /status`
+- `GET /sessions`
+- `POST /sessions`
+- `POST /changesets/export`
+- `POST /changesets/apply`
+- `POST /changesets/inspect`
+- `POST /changesets/invert`
+- `GET /shapes`
+- `POST /shapes/{shape_id}/snapshot`
+- `GET /shapes/{shape_id}/changes?since=<watermark>`
+- `POST /acks`
+- `GET /conflicts`
+- `GET /diagnostics`
+- `GET /stream` with a WebSocket upgrade
+
+Production requests require a bearer token unless `--allow-insecure` is set.
+Principal context is provided by `x-decentdb-*` headers. Browser WebSocket
+clients can use short-lived query parameters on `/stream` because the browser
+WebSocket API cannot set custom headers.
 
 ### sync conflicts / conflict
 

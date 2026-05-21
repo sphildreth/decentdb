@@ -92,6 +92,25 @@ Transaction-related failures.
 - Keep transactions short
 - Use appropriate isolation level
 
+### ERR_TIMEOUT / ERR_CANCELED / ERR_QUEUE_FULL / ERR_QUEUE_CLOSED
+
+Write-queue control failures.
+
+**Common Causes:**
+- The bounded write queue is at capacity
+- A queued request timed out before execution started
+- A queued request was canceled before execution started
+- The database handle is closing while work is waiting
+
+**Resolution:**
+- Increase `write_queue_capacity` for bursty in-process workloads
+- Increase the per-call or configured queue timeout
+- Keep explicit transactions on the direct transaction APIs
+- Inspect queue metrics to identify sustained pressure
+
+See [Write Concurrency](../user-guide/write-concurrency.md) for the queued
+write contract and strict group-commit behavior.
+
 ### ERR_SQL (SQL Error)
 
 Invalid SQL syntax or semantic error.

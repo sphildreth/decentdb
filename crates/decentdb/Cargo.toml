@@ -6,13 +6,13 @@ authors.workspace = true
 license.workspace = true
 
 [features]
-default = []
+default = ["lua-extensions"]
 bench-internals = []
+lua-extensions = ["dep:mlua"]
 
 [dependencies]
 thiserror.workspace = true
 miniz_oxide.workspace = true
-libpg_query_sys = { path = "../libpg_query_sys" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 chrono = "0.4"
@@ -20,6 +20,17 @@ regex = "1.11"
 md5 = "0.7"
 sha2 = "0.10"
 smallvec = "1.15"
+toml = "0.8"
+base64 = "0.22"
+ed25519-dalek = { version = "2.1", default-features = false, features = ["std"] }
+
+[target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies]
+libpg_query_sys = { path = "../libpg_query_sys" }
+mlua = { version = "0.11", optional = true, features = ["lua54", "vendored", "send"] }
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+js-sys = "0.3"
+wasm-bindgen = "0.2"
 
 [dev-dependencies]
 criterion = "0.5"

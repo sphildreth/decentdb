@@ -58,6 +58,25 @@ test('create/openExisting helpers honor explicit open modes', () => {
   }
 });
 
+test('write queue executes unbound writes and exposes metrics', () => {
+  const db = new Database({
+    path: ':memory:',
+    writeQueueEnabled: true,
+    writeQueueCapacity: 16,
+    writeQueueDefaultTimeoutMs: 1000,
+  });
+  db.exec('CREATE TABLE queued (id INTEGER PRIMARY KEY, name TEXT)');
+  const result = db.execQueued("INSERT INTO queued VALUES (1, 'node')");
+  assert.equal(result.rowsAffected, 1n);
+  const metrics = db.writeQueueMetrics();
+  assert.equal(metrics.admitted, 1n);
+  assert.equal(metrics.committed, 1n);
+  assert.equal(metrics.failed, 0n);
+  const rows = db.exec('SELECT name FROM queued WHERE id = 1').rows;
+  assert.equal(rows[0][0], 'node');
+  db.close();
+});
+
 // ---------------------------------------------------------------------------
 // Timestamp binding
 // ---------------------------------------------------------------------------

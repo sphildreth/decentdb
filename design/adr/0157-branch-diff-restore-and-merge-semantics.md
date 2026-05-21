@@ -10,9 +10,9 @@ operations must use database semantics, not text-file Git semantics. They must
 respect primary keys, constraints, triggers, generated columns, transaction
 atomicity, and the single-writer model.
 
-The implementation guide identifies diff, restore, and merge as separate
-capabilities, but they share one semantic foundation: each operation compares or
-moves named branch heads and immutable snapshots.
+Diff, restore, and merge are separate capabilities, but they share one semantic
+foundation: each operation compares or moves named branch heads and immutable
+snapshots.
 
 ## Decision
 
@@ -175,7 +175,6 @@ would bypass too many engine semantics.
 
 ## References
 
-- `design/WIN_BRANCH_DIFF_RESTORE_TIME_TRAVEL_IMPLEMENTATION_GUIDE.md`
 - `design/adr/0153-branch-metadata-identity-and-user-surface.md`
 - `design/adr/0154-branch-root-manifest-and-copy-on-write-storage.md`
 - `design/adr/0155-branch-aware-wal-commit-records-and-recovery.md`

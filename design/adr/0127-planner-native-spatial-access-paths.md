@@ -117,7 +117,8 @@ project.
 
 ## References
 
-- `design/WIN_GEOSPATIAL_DATA_SUPPORT.md`
+- `design/adr/0124-geospatial-type-system-and-ewkb-storage.md`
+- `design/adr/0125-spatial-covering-cell-secondary-index.md`
 - `design/adr/0112-cost-based-optimizer-with-stats.md`
 - `design/adr/0128-true-3d-semantics-and-3d-aware-indexing.md`
 - DuckDB spatial join discussion:

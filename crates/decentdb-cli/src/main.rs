@@ -1,6 +1,7 @@
 mod commands;
 mod output;
 mod repl;
+mod serve;
 
 use clap::Parser;
 

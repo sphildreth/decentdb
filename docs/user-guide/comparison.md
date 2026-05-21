@@ -2,13 +2,13 @@
 
 This page summarizes high-level feature differences between **DecentDB**, **SQLite**, and **DuckDB**.
 
-## Versions (as of 2026-05-18)
+## Versions (as of 2026-05-21)
 
 This comparison was written against:
 - SQLite `3.51.2` (sqlite3 CLI)
 - DuckDB `v1.4.3` (duckdb CLI)
 
-DecentDB is currently at **v2.5.1**. This document describes the current feature set and constraints; details may change
+DecentDB's current work branch is **v2.6.0 [unreleased]**. This document describes the current feature set and constraints; details may change
 as DecentDB continues to evolve.
 
 DecentDB is intentionally scoped around:
@@ -29,7 +29,7 @@ SQLite and DuckDB are used as behavioral baselines for many SQL features, but De
 | Durability model | WAL-based, fsync-on-commit by default | WAL or rollback journal, configurable | Depends on storage mode; optimized for analytics workflows |
 | Concurrency | Single writer, many readers (threads, same process) | Multi-reader, single-writer (process-safe) | Parallel query execution; analytics-oriented |
 | SQL breadth | Subset (deliberately small) | Very broad (plus extensions) | Very broad (esp. analytical SQL) |
-| Extensibility | No loadable extension / UDF plugin surface in the current baseline (extend by contributing to core) | Rich extension ecosystem (loadable extensions, virtual tables, UDFs) | Rich extension ecosystem (install/load extensions, UDFs) |
+| Extensibility | Sandboxed Lua packages for scalar functions, table-valued functions, aggregates, and query-time collations; no arbitrary native loading | Rich extension ecosystem (loadable extensions, virtual tables, UDFs) | Rich extension ecosystem (install/load extensions, UDFs) |
 | Local-first sync | Built-in durable change journal, batch exchange, scoped peers, conflict workflows, doctor/retention tooling, CLI, and .NET SDK | Not built in; usually application middleware or third-party replication layers | Not built in; not a local-first replication focus |
 | Branch/diff/restore workflows | Built-in named snapshots, branch-local writes, primary-key row diff, guarded restore, and constrained merge | Not built in; use file copies, backup APIs, sessions, or app tooling | Not built in; typically use external copies or app/tooling |
 | Substring search (`LIKE '%pattern%'`) | Built-in trigram index option (purpose-built for interactive “contains” queries) | Typically full scan or use FTS/extensions | Typically scan or use extensions (e.g., FTS) |
@@ -40,7 +40,7 @@ Notes:
 
 What “extensions” means here:
 - The ability to add new SQL features without modifying the database core (e.g., new scalar/aggregate functions, new table-like modules such as SQLite virtual tables, or optional subsystems like full-text search).
-- DecentDB does support multiple language bindings, but those bindings are about how you *call* DecentDB, not a general-purpose SQL extension/plugin system.
+- DecentDB's extension answer is a sandboxed Lua package model with manifest-declared SQL objects and explicit content-hash trust. It is not SQLite `.load`, DuckDB native extensions, or host-language callbacks.
 
 ## Local-first sync
 
@@ -57,8 +57,11 @@ The current sync surface includes:
 - scoped replication with validated primary-key-based row filters
 - conservative conflict recording by default, plus manual show/resolve/reopen
   workflows and configurable policies
-- `sys_sync_*` inspection queries for status, journals, peers, scopes,
-  sessions, conflicts, peer lag, retention, and doctor summaries
+- in-process reactive subscriptions for table, range, query, and change-stream
+  invalidation without polling
+- canonical `sys.*` operational inspection views plus `sys_sync_*`
+  compatibility queries for journals, peers, scopes, sessions, conflicts, peer
+  lag, retention, and doctor summaries
 - retention reports, safe prune dry-runs, explicit data-loss override, and sync
   doctor guidance
 - a typed .NET `DecentDBSyncClient` for app integration
@@ -87,9 +90,12 @@ DecentDB's current baseline includes:
 - String functions: `LENGTH`, `LOWER`, `UPPER`, `TRIM`, `LTRIM`, `RTRIM`, `REPLACE`, `SUBSTRING`/`SUBSTR`, `INSTR`, `LEFT`, `RIGHT`, `LPAD`, `RPAD`, `REPEAT`, `REVERSE`, `CHR`, `HEX`
 - Date/time functions: `NOW()`, `CURRENT_TIMESTAMP`, `CURRENT_DATE`, `CURRENT_TIME`, `date()`, `datetime()`, `strftime()`, `EXTRACT()`
 - JSON functions: `JSON_EXTRACT`, `JSON_ARRAY_LENGTH`, `json_type`, `json_valid`, `json_object`, `json_array`, `->`, `->>`
-- Table-valued functions: `json_each()`, `json_tree()`
+- Table-valued functions: `json_each()`, `json_tree()`, `generate_series()`, and SQLite-compatible `pragma_*()` introspection helpers
+- Compatibility catalog views: `sqlite_schema` / `sqlite_master`, temp schema aliases, and minimal `information_schema.schemata`, `information_schema.tables`, and `information_schema.columns`
+- Query-time compatibility syntax: `main.` / `temp.` qualified names for local objects, and `COLLATE BINARY|NOCASE|RTRIM` for ordering and comparisons
 - Generated columns: `GENERATED ALWAYS AS (expr)` in `STORED` and `VIRTUAL` modes
-- Other functions: `COALESCE`, `NULLIF`, `CAST`, `CASE`, `GEN_RANDOM_UUID`, `UUID_PARSE`, `UUID_TO_STRING`, `PRINTF`
+- Other functions: `COALESCE`, `NULLIF`, `CAST`, `CASE`, `GEN_RANDOM_UUID`, `UUID_PARSE`, `UUID_TO_STRING`, `PRINTF`, `current_database()`, `current_schema()`, `database()`, `schema()`, `version()`
+- SQLite-style PRAGMAs for safe configuration probes and schema introspection, including `foreign_keys`, `journal_mode`, `synchronous`, `wal_checkpoint`, `user_version`, `application_id`, `table_xinfo`, `table_list`, `index_list`, `index_info`, `index_xinfo`, and `foreign_key_list`
 - Operators: `+`, `-`, `*`, `/`, `%` (modulo), `||` (string concatenation)
 - Transaction control: `BEGIN`, `BEGIN IMMEDIATE`/`BEGIN EXCLUSIVE` (treated as `BEGIN`), `COMMIT`, `ROLLBACK`, `SAVEPOINT`, `RELEASE SAVEPOINT`, `ROLLBACK TO SAVEPOINT`
 - Parameters: positional `$1, $2, ...` (Postgres-style)
@@ -127,6 +133,10 @@ DecentDB has implemented many previously planned baseline features, including:
 - `DEFAULT` and generated columns (STORED + VIRTUAL)
 - `CREATE TEMP TABLE` / `CREATE TEMP VIEW` (session-scoped)
 - `SAVEPOINT` / `RELEASE SAVEPOINT` / `ROLLBACK TO SAVEPOINT`
+- SQL and PRAGMA compatibility quick wins, including safe SQLite-style
+  PRAGMA probes, `sqlite_schema`, minimal `information_schema`,
+  `generate_series`, `main.`/`temp.` qualifiers, and query-time built-in
+  collations
 
 For remaining roadmap and deferred capabilities, see:
 - [Road to RTM](../design/road-to-rtm.md)
@@ -155,16 +165,23 @@ DecentDB intentionally does not support certain SQLite-specific features. This s
 
 ### PRAGMA
 
-DecentDB supports a small compatibility subset of SQLite-style PRAGMAs (`page_size`, `cache_size`, `integrity_check`, `database_list`, `table_info(table)`) and intentionally does not implement SQLite's broader PRAGMA surface.
+DecentDB supports a practical compatibility subset of SQLite-style PRAGMAs for
+tooling probes and schema discovery. These PRAGMAs are intentionally safe:
+configuration PRAGMAs report DecentDB's actual behavior, and assignment forms
+are accepted only as no-ops or for DecentDB-owned metadata.
 
 | Common PRAGMA | DecentDB Alternative |
 |---|---|
-| `PRAGMA journal_mode` | Not applicable; DecentDB uses WAL-only mode |
-| `PRAGMA foreign_keys` | Always enabled; cannot be disabled |
-| `PRAGMA synchronous` | Not configurable; commits are durable by default (fsync-on-commit). Use `bulk-load --durability=...` for ingestion tradeoffs |
-| `PRAGMA cache_size` | Query is supported. Changing cache size requires reopen: CLI `--cachePages/--cacheMb`, Rust `openDb(..., cachePages=...)` |
-| `PRAGMA page_size` | Query is supported. Changing page size requires reopening with matching `DbConfig.page_size` |
-| `PRAGMA table_info(t)` | Supported via `PRAGMA table_info(t)` and via `decentdb describe --db=... --table=t` |
+| `PRAGMA journal_mode` | Supported as a WAL-only compatibility probe. `PRAGMA journal_mode = WAL` succeeds and returns `wal`; rollback/off/delete modes are rejected. |
+| `PRAGMA foreign_keys` | Supported and returns `1`. `ON` is a no-op; disabling foreign keys is rejected. |
+| `PRAGMA synchronous` | Supported as a compatibility probe. Assignments succeed only when they match the open-time WAL sync mode; use bulk-load durability options for ingestion tradeoffs. |
+| `PRAGMA cache_size` | Query is supported. Changing cache size requires reopen: CLI `--cachePages/--cacheMb`, Rust `openDb(..., cachePages=...)`. |
+| `PRAGMA page_size` | Query is supported. Changing page size requires reopening with matching `DbConfig.page_size`. |
+| `PRAGMA table_info(t)` / `table_xinfo(t)` | Supported, including generated-column visibility through `hidden` in `table_xinfo`. |
+| `PRAGMA table_list`, `index_list`, `index_info`, `index_xinfo`, `foreign_key_list` | Supported for SQLite-style schema browsers and ORMs. |
+| `PRAGMA user_version`, `application_id` | Supported as durable, transactional signed 32-bit application metadata. |
+| `PRAGMA busy_timeout` | Supported for connection-local queued-write timeout defaults. |
+| `PRAGMA read_uncommitted`, `ignore_check_constraints`, `defer_foreign_keys` | Rejected; DecentDB does not expose dirty reads or constraint-disabling modes. |
 
 ### rowid / _rowid_ Pseudo-Columns
 

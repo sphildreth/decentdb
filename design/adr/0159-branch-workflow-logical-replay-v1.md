@@ -69,4 +69,3 @@ The implementation includes tests for:
 
 - ADR 0154: Branch Root Manifest And Copy-On-Write Storage
 - ADR 0157: Branch Diff, Restore, And Merge Semantics
-- `design/WIN_BRANCH_DIFF_RESTORE_TIME_TRAVEL_IMPLEMENTATION_GUIDE.md`

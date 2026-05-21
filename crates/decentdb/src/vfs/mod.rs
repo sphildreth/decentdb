@@ -6,6 +6,9 @@
 
 pub(crate) mod faulty;
 pub(crate) mod mem;
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+pub(crate) mod opfs;
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) mod os;
 #[cfg(feature = "bench-internals")]
 pub(crate) mod stats;
@@ -15,8 +18,10 @@ use std::sync::Arc;
 
 use crate::error::{DbError, Result};
 
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use self::faulty::FaultyVfs;
 use self::mem::MemVfs;
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use self::os::OsVfs;
 #[cfg(feature = "bench-internals")]
 use self::stats::StatsVfs;
@@ -92,16 +97,25 @@ impl VfsHandle {
                 inner: Arc::new(MemVfs::default()),
             }
         } else {
-            let os_vfs: Arc<dyn Vfs> = Arc::new(OsVfs);
-            #[cfg(feature = "bench-internals")]
-            let os_vfs: Arc<dyn Vfs> = Arc::new(StatsVfs::wrap(os_vfs));
-            Self {
-                inner: Arc::new(FaultyVfs::wrap(os_vfs)),
+            #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+            {
+                Self {
+                    inner: Arc::new(MemVfs::default()),
+                }
+            }
+            #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+            {
+                let os_vfs: Arc<dyn Vfs> = Arc::new(OsVfs);
+                #[cfg(feature = "bench-internals")]
+                let os_vfs: Arc<dyn Vfs> = Arc::new(StatsVfs::wrap(os_vfs));
+                Self {
+                    inner: Arc::new(FaultyVfs::wrap(os_vfs)),
+                }
             }
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, all(target_arch = "wasm32", target_os = "unknown")))]
     pub(crate) fn from_vfs(inner: Arc<dyn Vfs>) -> Self {
         Self { inner }
     }

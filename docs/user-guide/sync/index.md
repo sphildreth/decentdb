@@ -38,6 +38,13 @@ the built-in HTTP transport.
 `decentdb sync serve` exposes the sync protocol over HTTP for localhost and dev
 workflows. It is useful for tests, demos, and short-lived relay processes.
 
+### Production relay
+
+`decentdb relay serve` exposes the production v2 sync relay routes for
+authenticated application clients. The production relay uses public changesets,
+tenant/user/device/service principal context, sync shapes backed by scopes,
+HTTP pull, and WebSocket shape streaming.
+
 ### Scoped replication
 
 Peers can be bound to a named scope so only a subset of rows moves between them.
@@ -50,17 +57,19 @@ full distributed-systems maturity.
 
 - No automatic peer discovery.
 - No mesh routing or multi-hop topology management.
-- No browser transport.
 - No built-in TLS termination or certificate management.
 - No hidden last-write-wins default for all conflicts.
 - Row filters are intentionally narrow and validated.
-- Sync serve is a development transport, not a hardened public server.
+- `sync serve` is a development transport; use `relay serve` for the
+  authenticated v2 production relay protocol.
 
 ## Quick Links
 
 - [Quickstart](quickstart.md)
 - [Concepts](concepts.md)
 - [Scopes](scopes.md)
+- [Public changesets](changesets.md)
+- [Production relay and shapes](relay.md)
 - [Conflicts](conflicts.md)
 - [Schema compatibility](schema-compatibility.md)
 - [Security](security.md)

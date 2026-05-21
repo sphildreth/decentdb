@@ -18,5 +18,4 @@ Remove the `payload_length` field from WAL frame headers in format v7. Payload s
 - This is a format change and requires a version bump (v7).
 
 ### References
-- `design/SQLITE_PERF_GAP_PLAN.md` (Section 1: WAL Frame Format Overhead)
 - `design/SPEC.md` §4.1 (WAL frame format)

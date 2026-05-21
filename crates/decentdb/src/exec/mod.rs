@@ -39,8 +39,9 @@ use crate::btree::read::find_exact as btree_find_exact;
 use crate::btree::table::free_table_btree;
 use crate::btree::write::Btree;
 use crate::catalog::{
-    identifiers_equal, CatalogState, ColumnSchema, ColumnType, EnumLabel, EnumTypeInfo, IndexKind,
-    IndexSchema, IndexStats, SchemaInfo, TableSchema, TableStats, ViewSchema,
+    identifiers_equal, CatalogState, ColumnSchema, ColumnType, EnumLabel, EnumTypeInfo,
+    ForeignKeyAction, IndexKind, IndexSchema, IndexStats, SchemaInfo, TableSchema, TableStats,
+    TriggerEvent, TriggerKind, ViewSchema,
 };
 use crate::error::{DbError, Result};
 use crate::json::{parse_json, parse_json_path, JsonValue};
@@ -66,9 +67,9 @@ use crate::spatial::types::{
     CoordinateDimensions, Position, SpatialError, SpatialGeometry, SpatialKind, SpatialValue,
 };
 use crate::sql::ast::{
-    BinaryOp, ColumnDefinition, CommonTableExpr, CreateTableAsStatement, CreateTableStatement,
-    Expr, FromItem, JoinConstraint, JoinKind, Query, QueryBody, Select, SelectItem, Statement,
-    SubqueryQuantifier, TruncateIdentityMode, UnaryOp,
+    BinaryOp, Collation, ColumnDefinition, CommonTableExpr, CreateTableAsStatement,
+    CreateTableStatement, Expr, FromItem, JoinConstraint, JoinKind, OrderBy, Query, QueryBody,
+    Select, SelectItem, Statement, SubqueryQuantifier, TruncateIdentityMode, UnaryOp,
 };
 use crate::sql::parser::parse_sql_statement;
 use crate::storage::checksum::crc32c_parts;
@@ -77,7 +78,7 @@ use crate::storage::PagerHandle;
 use crate::wal::WalHandle;
 
 use self::cte::*;
-use self::row::{ColumnBinding, Dataset};
+pub(crate) use self::row::{ColumnBinding, Dataset};
 
 pub use row::{QueryResult, QueryRow};
 
@@ -85,6 +86,7 @@ const ENGINE_ROOT_MAGIC: [u8; 8] = *b"DDBSQL1\0";
 const ENGINE_ROOT_VERSION: u32 = 1;
 const ENGINE_ROOT_HEADER_SIZE: usize = 32;
 const RECURSIVE_CTE_MAX_ITERATIONS: usize = 1000;
+const GENERATE_SERIES_MAX_ROWS: usize = 1_000_000;
 const LEGACY_RUNTIME_PAYLOAD_MAGIC: &[u8; 9] = b"DDBSTATE1";
 const MANIFEST_PAYLOAD_MAGIC: &[u8; 8] = b"DDBMANF1";
 const TABLE_PAYLOAD_MAGIC: &[u8; 8] = b"DDBTBL01";
@@ -115,6 +117,28 @@ fn generated_columns_are_stored(table: &TableSchema) -> bool {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum NameResolutionScope {
     Session,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum CompatSchemaQualifier {
+    Main,
+    Temp,
+}
+
+pub(super) fn compat_schema_qualified_name(name: &str) -> (Option<CompatSchemaQualifier>, &str) {
+    match name.split_once('.') {
+        Some((schema, object)) if schema.eq_ignore_ascii_case("main") => {
+            (Some(CompatSchemaQualifier::Main), object)
+        }
+        Some((schema, object)) if schema.eq_ignore_ascii_case("temp") => {
+            (Some(CompatSchemaQualifier::Temp), object)
+        }
+        _ => (None, name),
+    }
+}
+
+pub(super) fn compat_unqualified_name(name: &str) -> &str {
+    compat_schema_qualified_name(name).1
 }
 
 fn map_get_ci<'a, V>(map: &'a BTreeMap<String, V>, name: &str) -> Option<&'a V> {
@@ -1364,6 +1388,10 @@ pub(crate) struct EngineRuntime {
     manifest_chain_cache: Option<OverflowChainCache>,
     sync_capture_active: bool,
     pub(crate) sync_mutations: Vec<crate::sync::SyncMutation>,
+    reactive_capture_active: bool,
+    pub(crate) reactive_mutations: Vec<crate::reactive::RowChange>,
+    pub(crate) extension_trust_anchors: Arc<Vec<crate::extensions::ExtensionTrustAnchor>>,
+    pub(crate) extension_unsigned_development_mode: bool,
 }
 
 #[derive(Debug)]
@@ -1541,6 +1569,10 @@ impl Clone for EngineRuntime {
             manifest_chain_cache: None,
             sync_capture_active: self.sync_capture_active,
             sync_mutations: self.sync_mutations.clone(),
+            reactive_capture_active: self.reactive_capture_active,
+            reactive_mutations: self.reactive_mutations.clone(),
+            extension_trust_anchors: Arc::clone(&self.extension_trust_anchors),
+            extension_unsigned_development_mode: self.extension_unsigned_development_mode,
         }
     }
 }
@@ -1582,6 +1614,10 @@ impl EngineRuntime {
             manifest_chain_cache: None,
             sync_capture_active: false,
             sync_mutations: Vec::new(),
+            reactive_capture_active: false,
+            reactive_mutations: Vec::new(),
+            extension_trust_anchors: Arc::new(config.extension_trust_anchors.clone()),
+            extension_unsigned_development_mode: config.extension_unsigned_development_mode,
         }
     }
 
@@ -1592,12 +1628,19 @@ impl EngineRuntime {
         }
     }
 
+    pub(crate) fn set_reactive_capture_active(&mut self, active: bool) {
+        self.reactive_capture_active = active;
+        if !active {
+            self.reactive_mutations.clear();
+        }
+    }
+
     pub(crate) fn sync_capture_active(&self) -> bool {
         self.sync_capture_active
     }
 
     pub(crate) fn should_record_sync_mutation_for_table(&self, table: &TableSchema) -> bool {
-        self.sync_capture_active
+        (self.sync_capture_active || self.reactive_capture_active)
             && !table.temporary
             && !crate::sync::is_internal_table_name(&table.name)
     }
@@ -1610,20 +1653,33 @@ impl EngineRuntime {
         after: Option<serde_json::Value>,
         schema_cookie: u32,
     ) {
-        if !self.sync_capture_active {
-            return;
+        if self.sync_capture_active {
+            self.sync_mutations.push(crate::sync::SyncMutation {
+                table: table_name.to_string(),
+                operation,
+                primary_key: primary_key.clone(),
+                after: after.clone(),
+                schema_cookie,
+            });
         }
-        self.sync_mutations.push(crate::sync::SyncMutation {
-            table: table_name.to_string(),
-            operation,
-            primary_key,
-            after,
-            schema_cookie,
-        });
+        if self.reactive_capture_active {
+            self.reactive_mutations
+                .push(crate::reactive::RowChange::new(
+                    table_name.to_string(),
+                    crate::reactive::row_operation_from_sync(operation),
+                    primary_key,
+                    None,
+                    after,
+                ));
+        }
     }
 
     pub(crate) fn take_sync_mutations(&mut self) -> Vec<crate::sync::SyncMutation> {
         std::mem::take(&mut self.sync_mutations)
+    }
+
+    pub(crate) fn take_reactive_mutations(&mut self) -> Vec<crate::reactive::RowChange> {
+        std::mem::take(&mut self.reactive_mutations)
     }
 
     pub(super) fn bump_temp_schema_cookie(&mut self) {
@@ -1868,6 +1924,9 @@ impl EngineRuntime {
             };
             runtime.root_state = Some(root);
             runtime.paged_row_storage = config.paged_row_storage;
+            runtime.extension_trust_anchors = Arc::new(config.extension_trust_anchors.clone());
+            runtime.extension_unsigned_development_mode =
+                config.extension_unsigned_development_mode;
             runtime
         } else {
             Self::from_config(schema_cookie, config)
@@ -3008,23 +3067,40 @@ impl EngineRuntime {
     }
 
     pub(super) fn temp_table_schema(&self, name: &str) -> Option<&TableSchema> {
-        map_get_ci(&self.temp_tables, name)
+        match compat_schema_qualified_name(name) {
+            (Some(CompatSchemaQualifier::Main), _) => None,
+            (_, object) => map_get_ci(&self.temp_tables, object),
+        }
     }
 
     pub(super) fn temp_table_schema_mut(&mut self, name: &str) -> Option<&mut TableSchema> {
-        map_get_ci_mut(self.temp_tables_mut(), name)
+        let (qualifier, object) = compat_schema_qualified_name(name);
+        if qualifier == Some(CompatSchemaQualifier::Main) {
+            return None;
+        }
+        map_get_ci_mut(self.temp_tables_mut(), object)
     }
 
     pub(super) fn temp_table_data(&self, name: &str) -> Option<&TableData> {
-        map_get_ci(&self.temp_table_data, name).map(|arc| arc.as_ref())
+        match compat_schema_qualified_name(name) {
+            (Some(CompatSchemaQualifier::Main), _) => None,
+            (_, object) => map_get_ci(&self.temp_table_data, object).map(|arc| arc.as_ref()),
+        }
     }
 
     pub(super) fn temp_table_data_mut(&mut self, name: &str) -> Option<&mut TableData> {
-        self.entry_temp_table_data_mut(name)
+        let (qualifier, object) = compat_schema_qualified_name(name);
+        if qualifier == Some(CompatSchemaQualifier::Main) {
+            return None;
+        }
+        self.entry_temp_table_data_mut(object)
     }
 
     pub(super) fn temp_view(&self, name: &str) -> Option<&ViewSchema> {
-        map_get_ci(&self.temp_views, name)
+        match compat_schema_qualified_name(name) {
+            (Some(CompatSchemaQualifier::Main), _) => None,
+            (_, object) => map_get_ci(&self.temp_views, object),
+        }
     }
 
     pub(super) fn visible_view(
@@ -3032,13 +3108,21 @@ impl EngineRuntime {
         name: &str,
         _scope: NameResolutionScope,
     ) -> Option<&ViewSchema> {
+        let (qualifier, object) = compat_schema_qualified_name(name);
+        if qualifier == Some(CompatSchemaQualifier::Main) {
+            return self.catalog.view(object);
+        }
         if let Some(view) = self.temp_view(name) {
             return Some(view);
         }
         if self.temp_table_schema(name).is_some() {
             return None;
         }
-        self.catalog.view(name)
+        if qualifier == Some(CompatSchemaQualifier::Temp) {
+            None
+        } else {
+            self.catalog.view(object)
+        }
     }
 
     pub(super) fn visible_table_is_temporary(&self, name: &str) -> bool {
@@ -3050,13 +3134,21 @@ impl EngineRuntime {
         name: &str,
         _scope: NameResolutionScope,
     ) -> Option<&TableSchema> {
+        let (qualifier, object) = compat_schema_qualified_name(name);
+        if qualifier == Some(CompatSchemaQualifier::Main) {
+            return self.catalog.table(object);
+        }
         if self.temp_view(name).is_some() {
             return None;
         }
         if let Some(table) = self.temp_table_schema(name) {
             return Some(table);
         }
-        self.catalog.table(name)
+        if qualifier == Some(CompatSchemaQualifier::Temp) {
+            None
+        } else {
+            self.catalog.table(object)
+        }
     }
 
     pub(super) fn table_schema(&self, name: &str) -> Option<&TableSchema> {
@@ -3064,12 +3156,20 @@ impl EngineRuntime {
     }
 
     pub(super) fn catalog_table_mut(&mut self, name: &str) -> Option<&mut TableSchema> {
+        let (qualifier, object) = compat_schema_qualified_name(name);
+        if qualifier == Some(CompatSchemaQualifier::Temp) {
+            return None;
+        }
         let catalog = self.catalog_mut();
-        map_get_ci_mut(&mut catalog.tables, name)
+        map_get_ci_mut(&mut catalog.tables, object)
     }
 
     pub(super) fn canonical_catalog_table_name(&self, name: &str) -> Option<String> {
-        self.catalog.table(name).map(|table| table.name.clone())
+        let (qualifier, object) = compat_schema_qualified_name(name);
+        if qualifier == Some(CompatSchemaQualifier::Temp) {
+            return None;
+        }
+        self.catalog.table(object).map(|table| table.name.clone())
     }
 
     pub(super) fn table_data_in_scope(
@@ -3077,23 +3177,39 @@ impl EngineRuntime {
         name: &str,
         _scope: NameResolutionScope,
     ) -> Option<&TableData> {
+        let (qualifier, object) = compat_schema_qualified_name(name);
+        if qualifier == Some(CompatSchemaQualifier::Main) {
+            let table_name = self.catalog.table(object)?.name.clone();
+            return self
+                .tables
+                .get(&table_name)
+                .map(TableRowSource::resident_data);
+        }
         if self.temp_view(name).is_some() {
             return None;
         }
         if let Some(table) = self.temp_table_schema(name) {
             return self.temp_table_data(&table.name);
         }
-        let table_name = self.catalog.table(name)?.name.clone();
-        self.tables
-            .get(&table_name)
-            .map(TableRowSource::resident_data)
+        if qualifier == Some(CompatSchemaQualifier::Temp) {
+            None
+        } else {
+            let table_name = self.catalog.table(object)?.name.clone();
+            self.tables
+                .get(&table_name)
+                .map(TableRowSource::resident_data)
+        }
     }
 
     pub(super) fn table_row_source(&self, name: &str) -> Option<&TableRowSource> {
+        let (qualifier, object) = compat_schema_qualified_name(name);
+        if qualifier == Some(CompatSchemaQualifier::Temp) {
+            return None;
+        }
         if self.temp_view(name).is_some() {
             return None;
         }
-        let table_name = self.catalog.table(name)?.name.clone();
+        let table_name = self.catalog.table(object)?.name.clone();
         self.tables.get(&table_name)
     }
 
@@ -3106,6 +3222,14 @@ impl EngineRuntime {
         name: &str,
         _scope: NameResolutionScope,
     ) -> Option<VisibleTableRowSource<'_>> {
+        let (qualifier, object) = compat_schema_qualified_name(name);
+        if qualifier == Some(CompatSchemaQualifier::Main) {
+            let table_name = self.catalog.table(object)?.name.clone();
+            return self
+                .tables
+                .get(&table_name)
+                .map(VisibleTableRowSource::Base);
+        }
         if self.temp_view(name).is_some() {
             return None;
         }
@@ -3114,10 +3238,14 @@ impl EngineRuntime {
                 .temp_table_data(&table.name)
                 .map(VisibleTableRowSource::Temp);
         }
-        let table_name = self.catalog.table(name)?.name.clone();
-        self.tables
-            .get(&table_name)
-            .map(VisibleTableRowSource::Base)
+        if qualifier == Some(CompatSchemaQualifier::Temp) {
+            None
+        } else {
+            let table_name = self.catalog.table(object)?.name.clone();
+            self.tables
+                .get(&table_name)
+                .map(VisibleTableRowSource::Base)
+        }
     }
 
     fn visible_table_row_source(&self, name: &str) -> Option<VisibleTableRowSource<'_>> {
@@ -3138,13 +3266,21 @@ impl EngineRuntime {
         name: &str,
         _scope: NameResolutionScope,
     ) -> Option<&mut TableData> {
+        let (qualifier, object) = compat_schema_qualified_name(name);
+        if qualifier == Some(CompatSchemaQualifier::Main) {
+            return self.entry_table_data_mut(object);
+        }
         if self.temp_view(name).is_some() {
             return None;
         }
         if self.temp_table_schema(name).is_some() {
             return self.temp_table_data_mut(name);
         }
-        self.entry_table_data_mut(name)
+        if qualifier == Some(CompatSchemaQualifier::Temp) {
+            None
+        } else {
+            self.entry_table_data_mut(object)
+        }
     }
 
     pub(super) fn table_data_mut(&mut self, name: &str) -> Option<&mut TableData> {
@@ -3273,11 +3409,14 @@ impl EngineRuntime {
         if self.visible_table_is_temporary(table_name) {
             return;
         }
+        let Some(table_name) = self.canonical_catalog_table_name(table_name) else {
+            return;
+        };
         let index_names = self
             .catalog
             .indexes
             .values()
-            .filter(|index| identifiers_equal(&index.table_name, table_name))
+            .filter(|index| identifiers_equal(&index.table_name, &table_name))
             .map(|index| index.name.clone())
             .collect::<Vec<_>>();
         if index_names.is_empty() {
@@ -3286,7 +3425,7 @@ impl EngineRuntime {
 
         let mut changed = false;
         for index in self.catalog_mut().indexes.values_mut() {
-            if identifiers_equal(&index.table_name, table_name) && index.fresh {
+            if identifiers_equal(&index.table_name, &table_name) && index.fresh {
                 index.fresh = false;
                 changed = true;
             }
@@ -3403,6 +3542,9 @@ impl EngineRuntime {
         if self.visible_table_is_temporary(table_name) {
             return Ok(Vec::new());
         }
+        let Some(canonical_table_name) = self.canonical_catalog_table_name(table_name) else {
+            return Ok(Vec::new());
+        };
         let table = self
             .table_schema(table_name)
             .cloned()
@@ -3411,7 +3553,9 @@ impl EngineRuntime {
             .catalog
             .indexes
             .values()
-            .filter(|index| identifiers_equal(&index.table_name, table_name) && index.fresh)
+            .filter(|index| {
+                identifiers_equal(&index.table_name, &canonical_table_name) && index.fresh
+            })
             .cloned()
             .collect::<Vec<_>>();
         let mut updates = Vec::new();
@@ -3661,25 +3805,31 @@ impl EngineRuntime {
         params: &[Value],
         page_size: u32,
     ) -> Result<QueryResult> {
-        if statement.temporary {
-            if self.temp_relation_exists(&statement.table_name) {
-                if statement.if_not_exists
-                    && self.temp_table_schema(&statement.table_name).is_some()
-                {
+        let (qualifier, object_name) = compat_schema_qualified_name(&statement.table_name);
+        if statement.temporary && qualifier == Some(CompatSchemaQualifier::Main) {
+            return Err(DbError::sql(
+                "temporary tables cannot be created in the main schema",
+            ));
+        }
+        let temporary = statement.temporary || qualifier == Some(CompatSchemaQualifier::Temp);
+        let table_name = object_name.to_string();
+        if temporary {
+            if self.temp_relation_exists(&table_name) {
+                if statement.if_not_exists && self.temp_table_schema(&table_name).is_some() {
                     return Ok(QueryResult::with_affected_rows(0));
                 }
                 return Err(DbError::sql(format!(
                     "object {} already exists",
-                    statement.table_name
+                    table_name
                 )));
             }
-        } else if self.catalog.contains_object(&statement.table_name) {
-            if statement.if_not_exists && self.catalog.table(&statement.table_name).is_some() {
+        } else if self.catalog.contains_object(&table_name) {
+            if statement.if_not_exists && self.catalog.table(&table_name).is_some() {
                 return Ok(QueryResult::with_affected_rows(0));
             }
             return Err(DbError::sql(format!(
                 "object {} already exists",
-                statement.table_name
+                table_name
             )));
         }
 
@@ -3727,8 +3877,8 @@ impl EngineRuntime {
             })
             .collect::<Vec<_>>();
         let create_statement = CreateTableStatement {
-            table_name: statement.table_name.clone(),
-            temporary: statement.temporary,
+            table_name: table_name.clone(),
+            temporary,
             if_not_exists: false,
             columns,
             constraints: Vec::new(),
@@ -3738,7 +3888,6 @@ impl EngineRuntime {
             return Ok(QueryResult::with_affected_rows(0));
         }
 
-        let table_name = statement.table_name.clone();
         let temporary = self.visible_table_is_temporary(&table_name);
         let mut affected_rows = 0_u64;
         for source_row in source.take_rows() {
@@ -5879,7 +6028,12 @@ impl EngineRuntime {
                 if let Some(order_plan) = &projection_order_plan {
                     let mut ord = std::cmp::Ordering::Equal;
                     for (i, plan) in order_plan.iter().enumerate() {
-                        match compare_values(&left_order[i], &right_order[i]) {
+                        match compare_values_with_runtime_collation(
+                            Some(self),
+                            &left_order[i],
+                            &right_order[i],
+                            plan.collation.clone(),
+                        ) {
                             Ok(std::cmp::Ordering::Equal) => continue,
                             Ok(o) => {
                                 ord = if plan.descending { o.reverse() } else { o };
@@ -5895,7 +6049,12 @@ impl EngineRuntime {
                     }
                     ord
                 } else {
-                    match compare_query_row_order_values(left_order, right_order, plan.order_by) {
+                    match compare_query_row_order_values(
+                        Some(self),
+                        left_order,
+                        right_order,
+                        plan.order_by,
+                    ) {
                         Ok(ordering) => ordering,
                         Err(error) => {
                             if sort_error.is_none() {
@@ -6010,6 +6169,7 @@ impl EngineRuntime {
         }
 
         Ok(Some(apply_simple_projection_postprocessing_with_order(
+            Some(self),
             rows,
             plan.column_names,
             plan.order_by.as_deref(),
@@ -6961,7 +7121,12 @@ impl EngineRuntime {
         if has_order_by {
             let mut sort_error = None;
             rows_with_order.sort_by(|(_, left_order), (_, right_order)| {
-                match compare_query_row_order_values(left_order, right_order, plan.order_by) {
+                match compare_query_row_order_values(
+                    Some(self),
+                    left_order,
+                    right_order,
+                    plan.order_by,
+                ) {
                     Ok(ordering) => ordering,
                     Err(error) => {
                         if sort_error.is_none() {
@@ -7504,6 +7669,7 @@ impl EngineRuntime {
             rows = dedup_query_rows(rows)?;
         }
         Ok(Some(apply_simple_projection_postprocessing_with_order(
+            Some(self),
             rows,
             column_names,
             order_by.as_deref(),
@@ -8811,6 +8977,9 @@ impl EngineRuntime {
         {
             return Ok(None);
         }
+        if select_requires_grouped_evaluation(self, select)? {
+            return Ok(None);
+        }
         if select.distinct
             && (!query.order_by.is_empty() || query.limit.is_some() || query.offset.is_some())
         {
@@ -9373,6 +9542,9 @@ impl EngineRuntime {
         {
             return Ok(None);
         }
+        if select_requires_grouped_evaluation(self, select)? {
+            return Ok(None);
+        }
         if select.distinct
             && (!query.order_by.is_empty() || query.limit.is_some() || query.offset.is_some())
         {
@@ -9492,6 +9664,7 @@ impl EngineRuntime {
             ));
         }
         apply_simple_projection_postprocessing_with_order(
+            Some(self),
             rows,
             column_names,
             order_by.as_deref(),
@@ -9520,6 +9693,7 @@ impl EngineRuntime {
             }
         }
         apply_simple_projection_postprocessing_with_order(
+            Some(self),
             rows,
             column_names,
             order_by.as_deref(),
@@ -9545,6 +9719,7 @@ impl EngineRuntime {
             Ok(())
         })?;
         apply_simple_projection_postprocessing_with_order(
+            Some(self),
             rows,
             column_names,
             order_by.as_deref(),
@@ -9574,6 +9749,7 @@ impl EngineRuntime {
             Ok(())
         })?;
         apply_simple_projection_postprocessing_with_order(
+            Some(self),
             rows,
             column_names,
             order_by.as_deref(),
@@ -9665,7 +9841,13 @@ impl EngineRuntime {
                         rows.push(row);
                     }
                 } else {
-                    push_bounded_ordered_query_row(&mut rows, row, order_by, bounded_row_count)?;
+                    push_bounded_ordered_query_row(
+                        Some(self),
+                        &mut rows,
+                        row,
+                        order_by,
+                        bounded_row_count,
+                    )?;
                 }
             } else {
                 rows.push(row);
@@ -9674,7 +9856,7 @@ impl EngineRuntime {
         })?;
 
         if !order_by.is_empty() {
-            sort_query_rows_by_order_values(&mut rows, order_by)?;
+            sort_query_rows_by_order_values(Some(self), &mut rows, order_by)?;
         }
 
         let rows = rows
@@ -9773,7 +9955,13 @@ impl EngineRuntime {
                         break;
                     }
                 } else {
-                    push_bounded_ordered_query_row(&mut rows, row, order_by, bounded_row_count)?;
+                    push_bounded_ordered_query_row(
+                        Some(self),
+                        &mut rows,
+                        row,
+                        order_by,
+                        bounded_row_count,
+                    )?;
                 }
             } else {
                 rows.push(row);
@@ -9781,7 +9969,7 @@ impl EngineRuntime {
         }
 
         if !order_by.is_empty() {
-            sort_query_rows_by_order_values(&mut rows, order_by)?;
+            sort_query_rows_by_order_values(Some(self), &mut rows, order_by)?;
         }
 
         let rows = rows
@@ -9819,6 +10007,7 @@ impl EngineRuntime {
             ));
         }
         apply_simple_projection_postprocessing_with_order(
+            Some(self),
             rows,
             column_names,
             order_by.as_deref(),
@@ -9855,6 +10044,7 @@ impl EngineRuntime {
             }
         }
         apply_simple_projection_postprocessing_with_order(
+            Some(self),
             rows,
             column_names,
             order_by.as_deref(),
@@ -9887,6 +10077,7 @@ impl EngineRuntime {
             Ok(())
         })?;
         apply_simple_projection_postprocessing_with_order(
+            Some(self),
             rows,
             column_names,
             order_by.as_deref(),
@@ -9923,6 +10114,7 @@ impl EngineRuntime {
             Ok(())
         })?;
         apply_simple_projection_postprocessing_with_order(
+            Some(self),
             rows,
             column_names,
             order_by.as_deref(),
@@ -10612,6 +10804,9 @@ impl EngineRuntime {
             || !select.distinct_on.is_empty()
             || select.from.len() != 1
         {
+            return Ok(None);
+        }
+        if select_requires_grouped_evaluation(self, select)? {
             return Ok(None);
         }
         if select.distinct
@@ -11408,6 +11603,7 @@ impl EngineRuntime {
                 Some(SimpleOrderByPlan {
                     projection_index: order_projection_index,
                     descending: entry.descending,
+                    collation: entry.collation.clone(),
                 })
             })
             .collect::<Option<Vec<_>>>();
@@ -11474,6 +11670,7 @@ impl EngineRuntime {
                 Some(SimpleOrderByPlan {
                     projection_index,
                     descending: entry.descending,
+                    collation: entry.collation.clone(),
                 })
             })
             .collect::<Option<Vec<_>>>();
@@ -11829,6 +12026,7 @@ impl EngineRuntime {
             rows
         };
         apply_simple_projection_postprocessing_with_order(
+            Some(self),
             rows,
             column_names,
             order_by,
@@ -11856,27 +12054,29 @@ impl EngineRuntime {
 
         let mut sorted_during_select = false;
         let mut dataset = match &query.body {
-            QueryBody::Select(select)
-                if !select.group_by.is_empty()
-                    || projection_has_aggregate_items(&select.projection) =>
-            {
-                self.evaluate_select(select, params, &ctes)?
-            }
             QueryBody::Select(select) => {
-                let projection_order_by =
-                    projection_order_by_plan(&query.order_by, &select.projection);
-                let mut source = self.build_select_dataset(select, params, &ctes)?;
-                if !query.order_by.is_empty() && projection_order_by.is_none() {
-                    self.sort_dataset(&mut source, &query.order_by, params, &ctes)?;
-                    sorted_during_select = true;
+                if select_requires_grouped_evaluation(self, select)? {
+                    self.evaluate_select(select, params, &ctes)?
+                } else {
+                    let projection_order_by =
+                        projection_order_by_plan(&query.order_by, &select.projection);
+                    let mut source = self.build_select_dataset(select, params, &ctes)?;
+                    if !query.order_by.is_empty() && projection_order_by.is_none() {
+                        self.sort_dataset(&mut source, &query.order_by, params, &ctes)?;
+                        sorted_during_select = true;
+                    }
+                    let mut projected =
+                        self.project_dataset(&source, &select.projection, params, &ctes, None)?;
+                    if let Some(order_by_plan) = projection_order_by.as_deref() {
+                        sort_dataset_by_projection_order(
+                            Some(self),
+                            &mut projected,
+                            order_by_plan,
+                        )?;
+                        sorted_during_select = true;
+                    }
+                    projected
                 }
-                let mut projected =
-                    self.project_dataset(&source, &select.projection, params, &ctes, None)?;
-                if let Some(order_by_plan) = projection_order_by.as_deref() {
-                    sort_dataset_by_projection_order(&mut projected, order_by_plan)?;
-                    sorted_during_select = true;
-                }
-                projected
             }
             _ => self.evaluate_query_body(&query.body, params, &ctes)?,
         };
@@ -12077,33 +12277,41 @@ impl EngineRuntime {
 
         let mut sorted_during_select = false;
         let mut dataset = match &query.body {
-            QueryBody::Select(select)
-                if !select.group_by.is_empty()
-                    || projection_has_aggregate_items(&select.projection) =>
-            {
-                self.evaluate_select_with_outer(select, params, &ctes, outer_dataset, outer_row)?
-            }
             QueryBody::Select(select) => {
-                let projection_order_by =
-                    projection_order_by_plan(&query.order_by, &select.projection);
-                let mut source = self.build_select_dataset_with_outer(
-                    select,
-                    params,
-                    &ctes,
-                    outer_dataset,
-                    outer_row,
-                )?;
-                if !query.order_by.is_empty() && projection_order_by.is_none() {
-                    self.sort_dataset(&mut source, &query.order_by, params, &ctes)?;
-                    sorted_during_select = true;
+                if select_requires_grouped_evaluation(self, select)? {
+                    self.evaluate_select_with_outer(
+                        select,
+                        params,
+                        &ctes,
+                        outer_dataset,
+                        outer_row,
+                    )?
+                } else {
+                    let projection_order_by =
+                        projection_order_by_plan(&query.order_by, &select.projection);
+                    let mut source = self.build_select_dataset_with_outer(
+                        select,
+                        params,
+                        &ctes,
+                        outer_dataset,
+                        outer_row,
+                    )?;
+                    if !query.order_by.is_empty() && projection_order_by.is_none() {
+                        self.sort_dataset(&mut source, &query.order_by, params, &ctes)?;
+                        sorted_during_select = true;
+                    }
+                    let mut projected =
+                        self.project_dataset(&source, &select.projection, params, &ctes, None)?;
+                    if let Some(order_by_plan) = projection_order_by.as_deref() {
+                        sort_dataset_by_projection_order(
+                            Some(self),
+                            &mut projected,
+                            order_by_plan,
+                        )?;
+                        sorted_during_select = true;
+                    }
+                    projected
                 }
-                let mut projected =
-                    self.project_dataset(&source, &select.projection, params, &ctes, None)?;
-                if let Some(order_by_plan) = projection_order_by.as_deref() {
-                    sort_dataset_by_projection_order(&mut projected, order_by_plan)?;
-                    sorted_during_select = true;
-                }
-                projected
             }
             _ => self.evaluate_query_body_with_outer(
                 &query.body,
@@ -12223,7 +12431,7 @@ impl EngineRuntime {
         ctes: &BTreeMap<String, Dataset>,
     ) -> Result<Dataset> {
         let dataset = self.build_select_dataset(select, params, ctes)?;
-        if !select.group_by.is_empty() || projection_has_aggregate_items(&select.projection) {
+        if select_requires_grouped_evaluation(self, select)? {
             self.evaluate_grouped_select(select, dataset, params, ctes)
         } else {
             self.project_dataset(&dataset, &select.projection, params, ctes, None)
@@ -12240,7 +12448,7 @@ impl EngineRuntime {
     ) -> Result<Dataset> {
         let dataset =
             self.build_select_dataset_with_outer(select, params, ctes, outer_dataset, outer_row)?;
-        if !select.group_by.is_empty() || projection_has_aggregate_items(&select.projection) {
+        if select_requires_grouped_evaluation(self, select)? {
             self.evaluate_grouped_select(select, dataset, params, ctes)
         } else {
             self.project_dataset(&dataset, &select.projection, params, ctes, None)
@@ -12256,6 +12464,13 @@ impl EngineRuntime {
     ) -> Result<Dataset> {
         if !select.distinct {
             return Ok(dataset);
+        }
+        if select.distinct_on.iter().any(expr_contains_collation)
+            || select.projection.iter().any(select_item_contains_collation)
+        {
+            return Err(DbError::sql(
+                "COLLATE in DISTINCT keys is not supported in this compatibility slice",
+            ));
         }
 
         let Dataset { columns, rows } = dataset;
@@ -12509,9 +12724,9 @@ impl EngineRuntime {
         {
             return Ok(None);
         }
-        let table = self
-            .table_schema(name)
-            .ok_or_else(|| DbError::sql(format!("unknown table or view {name}")))?;
+        let Some(table) = self.table_schema(name) else {
+            return Ok(None);
+        };
         if !generated_columns_are_stored(table) {
             return Ok(None);
         }
@@ -13781,6 +13996,14 @@ impl EngineRuntime {
                     }
                     return Ok(dataset.share_rows(columns));
                 }
+                if let Some(mut dataset) = self.compatibility_virtual_table(name)? {
+                    if let Some(alias) = alias {
+                        for column in &mut dataset.columns {
+                            column.table = Some(alias.clone());
+                        }
+                    }
+                    return Ok(dataset);
+                }
                 if let Some(view) = self.visible_view(name, NameResolutionScope::Session) {
                     let view_statement = parse_sql_statement(&view.sql_text)?;
                     let Statement::Query(query) = view_statement else {
@@ -13963,7 +14186,469 @@ impl EngineRuntime {
             "json_tree" | "pg_catalog.json_tree" => {
                 self.evaluate_json_table_function(table_name, values, true)
             }
-            other => Err(DbError::sql(format!("unsupported table function {other}"))),
+            "generate_series" | "pg_catalog.generate_series" => {
+                self.evaluate_generate_series(table_name, values)
+            }
+            "pragma_table_info" | "main.pragma_table_info" | "temp.pragma_table_info" => {
+                self.evaluate_pragma_table_info_function(table_name, values, false)
+            }
+            "pragma_table_xinfo" | "main.pragma_table_xinfo" | "temp.pragma_table_xinfo" => {
+                self.evaluate_pragma_table_info_function(table_name, values, true)
+            }
+            "pragma_table_list" | "main.pragma_table_list" | "temp.pragma_table_list" => {
+                self.evaluate_pragma_table_list_function(table_name, values)
+            }
+            "pragma_index_list" | "main.pragma_index_list" | "temp.pragma_index_list" => {
+                self.evaluate_pragma_index_list_function(table_name, values)
+            }
+            "pragma_index_info" | "main.pragma_index_info" | "temp.pragma_index_info" => {
+                self.evaluate_pragma_index_info_function(table_name, values, false)
+            }
+            "pragma_index_xinfo" | "main.pragma_index_xinfo" | "temp.pragma_index_xinfo" => {
+                self.evaluate_pragma_index_info_function(table_name, values, true)
+            }
+            "pragma_foreign_key_list"
+            | "main.pragma_foreign_key_list"
+            | "temp.pragma_foreign_key_list" => {
+                self.evaluate_pragma_foreign_key_list_function(table_name, values)
+            }
+            "pragma_database_list" | "main.pragma_database_list" | "temp.pragma_database_list" => {
+                self.evaluate_pragma_database_list_function(table_name, values)
+            }
+            other => {
+                if let Some(dataset) = crate::extensions::evaluate_table_function_from_runtime(
+                    self, other, values, table_name,
+                )? {
+                    return Ok(dataset);
+                }
+                Err(DbError::sql(format!("unsupported table function {other}")))
+            }
+        }
+    }
+
+    fn compatibility_virtual_table(&self, name: &str) -> Result<Option<Dataset>> {
+        let normalized = name.to_ascii_lowercase();
+        let table_name = match normalized.as_str() {
+            "sqlite_schema" | "sqlite_master" | "main.sqlite_schema" | "main.sqlite_master" => {
+                return Ok(Some(self.sqlite_schema_dataset("sqlite_schema", false)));
+            }
+            "sqlite_temp_schema" | "sqlite_temp_master" | "temp.sqlite_schema"
+            | "temp.sqlite_master" => {
+                return Ok(Some(self.sqlite_schema_dataset("sqlite_temp_schema", true)));
+            }
+            "information_schema.schemata" => {
+                return Ok(Some(self.information_schema_schemata_dataset()));
+            }
+            "information_schema.tables" => {
+                return Ok(Some(self.information_schema_tables_dataset()));
+            }
+            "information_schema.columns" => {
+                return Ok(Some(self.information_schema_columns_dataset()));
+            }
+            _ => name,
+        };
+        let _ = table_name;
+        Ok(None)
+    }
+
+    fn evaluate_generate_series(&self, table_name: String, values: Vec<Value>) -> Result<Dataset> {
+        if !(values.len() == 2 || values.len() == 3) {
+            return Err(DbError::sql("generate_series expects 2 or 3 arguments"));
+        }
+        let rows = generate_series_rows(&values)?;
+        Ok(Dataset::with_rows(
+            vec![ColumnBinding::visible(
+                Some(table_name),
+                "value".to_string(),
+            )],
+            rows.into_iter().map(|value| vec![value]).collect(),
+        ))
+    }
+
+    fn evaluate_pragma_table_info_function(
+        &self,
+        table_name: String,
+        values: Vec<Value>,
+        extended: bool,
+    ) -> Result<Dataset> {
+        let target = one_text_arg("pragma_table_info", values)?;
+        let Some(table) = self.table_schema(&target) else {
+            return Ok(pragma_table_info_dataset(table_name, &[], extended));
+        };
+        Ok(pragma_table_info_dataset(
+            table_name,
+            &table.columns,
+            extended,
+        ))
+    }
+
+    fn evaluate_pragma_table_list_function(
+        &self,
+        table_name: String,
+        values: Vec<Value>,
+    ) -> Result<Dataset> {
+        if !values.is_empty() {
+            return Err(DbError::sql("pragma_table_list expects no arguments"));
+        }
+        Ok(self.pragma_table_list_dataset(table_name))
+    }
+
+    fn evaluate_pragma_index_list_function(
+        &self,
+        table_name: String,
+        values: Vec<Value>,
+    ) -> Result<Dataset> {
+        let target = one_text_arg("pragma_index_list", values)?;
+        let mut rows = Vec::new();
+        for (seq, index) in self.indexes_for_table(&target).into_iter().enumerate() {
+            rows.push(vec![
+                Value::Int64(seq as i64),
+                Value::Text(index.name.clone()),
+                Value::Int64(i64::from(index.unique)),
+                Value::Text(if index.unique { "u" } else { "c" }.to_string()),
+                Value::Int64(i64::from(index.predicate_sql.is_some())),
+            ]);
+        }
+        Ok(Dataset::with_rows(
+            visible_columns(&table_name, &["seq", "name", "unique", "origin", "partial"]),
+            rows,
+        ))
+    }
+
+    fn evaluate_pragma_index_info_function(
+        &self,
+        table_name: String,
+        values: Vec<Value>,
+        extended: bool,
+    ) -> Result<Dataset> {
+        let target = one_text_arg("pragma_index_info", values)?;
+        let rows = self
+            .index_by_name(&target)
+            .map(|index| index_info_rows(index, extended))
+            .unwrap_or_default();
+        let columns = if extended {
+            visible_columns(
+                &table_name,
+                &["seqno", "cid", "name", "desc", "coll", "key"],
+            )
+        } else {
+            visible_columns(&table_name, &["seqno", "cid", "name"])
+        };
+        Ok(Dataset::with_rows(columns, rows))
+    }
+
+    fn evaluate_pragma_foreign_key_list_function(
+        &self,
+        table_name: String,
+        values: Vec<Value>,
+    ) -> Result<Dataset> {
+        let target = one_text_arg("pragma_foreign_key_list", values)?;
+        let mut rows = Vec::new();
+        if let Some(table) = self.table_schema(&target) {
+            rows.extend(foreign_key_rows(table));
+        }
+        Ok(Dataset::with_rows(
+            visible_columns(
+                &table_name,
+                &[
+                    "id",
+                    "seq",
+                    "table",
+                    "from",
+                    "to",
+                    "on_update",
+                    "on_delete",
+                    "match",
+                ],
+            ),
+            rows,
+        ))
+    }
+
+    fn evaluate_pragma_database_list_function(
+        &self,
+        table_name: String,
+        values: Vec<Value>,
+    ) -> Result<Dataset> {
+        if !values.is_empty() {
+            return Err(DbError::sql("pragma_database_list expects no arguments"));
+        }
+        Ok(Dataset::with_rows(
+            visible_columns(&table_name, &["seq", "name", "file"]),
+            vec![vec![
+                Value::Int64(0),
+                Value::Text("main".to_string()),
+                Value::Text("main".to_string()),
+            ]],
+        ))
+    }
+
+    fn pragma_table_list_dataset(&self, table_name: String) -> Dataset {
+        let mut rows = Vec::new();
+        for table in self.catalog.tables.values() {
+            if !compat_catalog_object_is_visible(&table.name) {
+                continue;
+            }
+            rows.push(table_list_row(
+                "main",
+                &table.name,
+                "table",
+                table.columns.len(),
+            ));
+        }
+        for view in self.catalog.views.values() {
+            rows.push(table_list_row(
+                "main",
+                &view.name,
+                "view",
+                view.column_names.len(),
+            ));
+        }
+        for table in self.temp_tables.values() {
+            rows.push(table_list_row(
+                "temp",
+                &table.name,
+                "table",
+                table.columns.len(),
+            ));
+        }
+        for view in self.temp_views.values() {
+            rows.push(table_list_row(
+                "temp",
+                &view.name,
+                "view",
+                view.column_names.len(),
+            ));
+        }
+        Dataset::with_rows(
+            visible_columns(
+                &table_name,
+                &["schema", "name", "type", "ncol", "wr", "strict"],
+            ),
+            rows,
+        )
+    }
+
+    fn sqlite_schema_dataset(&self, table_name: &str, temporary: bool) -> Dataset {
+        let mut rows = Vec::new();
+        if temporary {
+            for table in self.temp_tables.values() {
+                if !compat_catalog_object_is_visible(&table.name) {
+                    continue;
+                }
+                rows.push(sqlite_schema_row(
+                    "table",
+                    &table.name,
+                    &table.name,
+                    Some(render_compat_create_table(table)),
+                ));
+            }
+            for view in self.temp_views.values() {
+                rows.push(sqlite_schema_row(
+                    "view",
+                    &view.name,
+                    &view.name,
+                    Some(render_compat_create_view(view)),
+                ));
+            }
+            for index in self.temp_indexes.values() {
+                if !compat_catalog_object_is_visible(&index.name)
+                    || !compat_catalog_object_is_visible(&index.table_name)
+                {
+                    continue;
+                }
+                rows.push(sqlite_schema_row(
+                    "index",
+                    &index.name,
+                    &index.table_name,
+                    Some(render_compat_create_index(index)),
+                ));
+            }
+        } else {
+            for table in self.catalog.tables.values() {
+                if !compat_catalog_object_is_visible(&table.name) {
+                    continue;
+                }
+                rows.push(sqlite_schema_row(
+                    "table",
+                    &table.name,
+                    &table.name,
+                    Some(render_compat_create_table(table)),
+                ));
+            }
+            for view in self.catalog.views.values() {
+                rows.push(sqlite_schema_row(
+                    "view",
+                    &view.name,
+                    &view.name,
+                    Some(render_compat_create_view(view)),
+                ));
+            }
+            for index in self.catalog.indexes.values() {
+                if !compat_catalog_object_is_visible(&index.name)
+                    || !compat_catalog_object_is_visible(&index.table_name)
+                {
+                    continue;
+                }
+                rows.push(sqlite_schema_row(
+                    "index",
+                    &index.name,
+                    &index.table_name,
+                    Some(render_compat_create_index(index)),
+                ));
+            }
+            for trigger in self.catalog.triggers.values() {
+                rows.push(sqlite_schema_row(
+                    "trigger",
+                    &trigger.name,
+                    &trigger.target_name,
+                    Some(render_compat_create_trigger(trigger)),
+                ));
+            }
+        }
+        Dataset::with_rows(
+            visible_columns(table_name, &["type", "name", "tbl_name", "rootpage", "sql"]),
+            rows,
+        )
+    }
+
+    fn information_schema_schemata_dataset(&self) -> Dataset {
+        let table_name = "schemata";
+        let mut rows = vec![
+            information_schema_schemata_row("main"),
+            information_schema_schemata_row("temp"),
+        ];
+        for schema in self.catalog.schemas.values() {
+            if !identifiers_equal(&schema.name, "main") && !identifiers_equal(&schema.name, "temp")
+            {
+                rows.push(information_schema_schemata_row(&schema.name));
+            }
+        }
+        Dataset::with_rows(
+            visible_columns(
+                table_name,
+                &[
+                    "catalog_name",
+                    "schema_name",
+                    "schema_owner",
+                    "default_character_set_catalog",
+                    "default_character_set_schema",
+                    "default_character_set_name",
+                ],
+            ),
+            rows,
+        )
+    }
+
+    fn information_schema_tables_dataset(&self) -> Dataset {
+        let table_name = "tables";
+        let mut rows = Vec::new();
+        for table in self.catalog.tables.values() {
+            if !compat_catalog_object_is_visible(&table.name) {
+                continue;
+            }
+            rows.push(information_schema_table_row(
+                "main",
+                &table.name,
+                "BASE TABLE",
+            ));
+        }
+        for view in self.catalog.views.values() {
+            rows.push(information_schema_table_row("main", &view.name, "VIEW"));
+        }
+        for table in self.temp_tables.values() {
+            if !compat_catalog_object_is_visible(&table.name) {
+                continue;
+            }
+            rows.push(information_schema_table_row(
+                "temp",
+                &table.name,
+                "LOCAL TEMPORARY",
+            ));
+        }
+        for view in self.temp_views.values() {
+            rows.push(information_schema_table_row(
+                "temp",
+                &view.name,
+                "LOCAL TEMPORARY",
+            ));
+        }
+        Dataset::with_rows(
+            visible_columns(
+                table_name,
+                &["table_catalog", "table_schema", "table_name", "table_type"],
+            ),
+            rows,
+        )
+    }
+
+    fn information_schema_columns_dataset(&self) -> Dataset {
+        let table_name = "columns";
+        let mut rows = Vec::new();
+        for table in self.catalog.tables.values() {
+            if !compat_catalog_object_is_visible(&table.name) {
+                continue;
+            }
+            rows.extend(information_schema_column_rows(
+                "main",
+                &table.name,
+                &table.columns,
+            ));
+        }
+        for table in self.temp_tables.values() {
+            if !compat_catalog_object_is_visible(&table.name) {
+                continue;
+            }
+            rows.extend(information_schema_column_rows(
+                "temp",
+                &table.name,
+                &table.columns,
+            ));
+        }
+        Dataset::with_rows(
+            visible_columns(
+                table_name,
+                &[
+                    "table_catalog",
+                    "table_schema",
+                    "table_name",
+                    "column_name",
+                    "ordinal_position",
+                    "column_default",
+                    "is_nullable",
+                    "data_type",
+                ],
+            ),
+            rows,
+        )
+    }
+
+    fn indexes_for_table(&self, table_name: &str) -> Vec<&IndexSchema> {
+        let (qualifier, object) = compat_schema_qualified_name(table_name);
+        let mut indexes = self
+            .catalog
+            .indexes
+            .values()
+            .filter(|index| {
+                qualifier != Some(CompatSchemaQualifier::Temp)
+                    && identifiers_equal(&index.table_name, object)
+            })
+            .chain(self.temp_indexes.values().filter(|index| {
+                qualifier != Some(CompatSchemaQualifier::Main)
+                    && identifiers_equal(&index.table_name, object)
+            }))
+            .collect::<Vec<_>>();
+        indexes.sort_by(|left, right| left.name.cmp(&right.name));
+        indexes
+    }
+
+    fn index_by_name(&self, index_name: &str) -> Option<&IndexSchema> {
+        let (qualifier, object) = compat_schema_qualified_name(index_name);
+        match qualifier {
+            Some(CompatSchemaQualifier::Main) => map_get_ci(&self.catalog.indexes, object),
+            Some(CompatSchemaQualifier::Temp) => map_get_ci(&self.temp_indexes, object),
+            None => map_get_ci(&self.catalog.indexes, object)
+                .or_else(|| map_get_ci(&self.temp_indexes, object)),
         }
     }
 
@@ -14481,7 +15166,7 @@ fn build_runtime_index(
     runtime: &EngineRuntime,
     page_size: u32,
 ) -> Result<RuntimeIndex> {
-    let table = runtime.table_schema(&index.table_name).ok_or_else(|| {
+    let table = runtime.catalog.table(&index.table_name).ok_or_else(|| {
         DbError::corruption(format!(
             "index {} references missing table {}",
             index.name, index.table_name
@@ -17680,6 +18365,42 @@ pub(crate) fn projection_has_aggregate_items(items: &[SelectItem]) -> bool {
     })
 }
 
+fn select_requires_grouped_evaluation(runtime: &EngineRuntime, select: &Select) -> Result<bool> {
+    if !select.group_by.is_empty() || projection_has_aggregate_items(&select.projection) {
+        return Ok(true);
+    }
+    if select.having.as_ref().is_some_and(expr_contains_aggregate) {
+        return Ok(true);
+    }
+    projection_has_runtime_extension_aggregate_items(runtime, &select.projection).and_then(
+        |has_projection_aggregate| {
+            if has_projection_aggregate {
+                return Ok(true);
+            }
+            select
+                .having
+                .as_ref()
+                .map(|expr| expr_contains_runtime_extension_aggregate(runtime, expr))
+                .transpose()
+                .map(Option::unwrap_or_default)
+        },
+    )
+}
+
+fn projection_has_runtime_extension_aggregate_items(
+    runtime: &EngineRuntime,
+    items: &[SelectItem],
+) -> Result<bool> {
+    for item in items {
+        if let SelectItem::Expr { expr, .. } = item {
+            if expr_contains_runtime_extension_aggregate(runtime, expr)? {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 fn simple_btree_lookup(filter: &Expr) -> Option<(Option<&str>, &str, &Expr)> {
     match filter {
         Expr::Binary { left, op, right } if *op == BinaryOp::Eq => match (&**left, &**right) {
@@ -18170,6 +18891,7 @@ fn render_simple_grouped_numeric_aggregate_groups(
             rows.push(QueryRow::new(output));
         }
         return apply_simple_projection_postprocessing_with_order(
+            Some(runtime),
             rows,
             plan.column_names.clone(),
             plan.order_by.as_deref(),
@@ -18239,6 +18961,7 @@ fn render_simple_grouped_count_groups(
             rows.push(QueryRow::new(output));
         }
         return apply_simple_projection_postprocessing_with_order(
+            Some(runtime),
             rows,
             plan.column_names.clone(),
             plan.order_by.as_deref(),
@@ -18289,9 +19012,10 @@ fn expr_references_only_binding(expr: &Expr, binding: TableBindingRef<'_>) -> bo
         Expr::Column { table, .. } => table
             .as_deref()
             .is_none_or(|qualifier| identifiers_equal(qualifier, binding.binding_name())),
-        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
-            expr_references_only_binding(expr, binding)
-        }
+        Expr::Unary { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Collate { expr, .. } => expr_references_only_binding(expr, binding),
         Expr::Binary { left, right, .. } => {
             expr_references_only_binding(left, binding)
                 && expr_references_only_binding(right, binding)
@@ -18359,7 +19083,10 @@ fn expr_references_binding_names(expr: &Expr, table_name: &str, binding_name: &s
         Expr::Column { table, .. } => table.as_deref().is_none_or(|qualifier| {
             identifiers_equal(qualifier, table_name) || identifiers_equal(qualifier, binding_name)
         }),
-        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+        Expr::Unary { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Collate { expr, .. } => {
             expr_references_binding_names(expr, table_name, binding_name)
         }
         Expr::Binary { left, right, .. } => {
@@ -18429,9 +19156,10 @@ fn expr_resolves_against_dataset(expr: &Expr, dataset: &Dataset) -> bool {
         Expr::Column { table, column } => {
             simple_select_item_column_index(dataset, table.as_deref(), column).is_some()
         }
-        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
-            expr_resolves_against_dataset(expr, dataset)
-        }
+        Expr::Unary { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Collate { expr, .. } => expr_resolves_against_dataset(expr, dataset),
         Expr::Binary { left, right, .. } => {
             expr_resolves_against_dataset(left, dataset)
                 && expr_resolves_against_dataset(right, dataset)
@@ -18729,6 +19457,18 @@ fn rewrite_simple_grouped_output_expr(
             )?),
             negated: *negated,
         }),
+        Expr::Collate { expr, collation } => Some(Expr::Collate {
+            expr: Box::new(rewrite_simple_grouped_output_expr(
+                expr,
+                group_exprs,
+                table_name,
+                binding_name,
+                table_binding,
+                synthetic_names,
+                aggregate_bindings,
+            )?),
+            collation: collation.clone(),
+        }),
         Expr::Function { name, args } => Some(Expr::Function {
             name: name.clone(),
             args: args
@@ -18871,10 +19611,11 @@ impl BenchmarkReportAggregate {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct SimpleOrderByPlan {
     projection_index: usize,
     descending: bool,
+    collation: Option<Collation>,
 }
 
 #[derive(Clone, Debug)]
@@ -19541,6 +20282,7 @@ fn project_simple_projection_values(values: &[Value], projection_indexes: &[usiz
 }
 
 fn apply_simple_projection_postprocessing_with_order(
+    runtime: Option<&EngineRuntime>,
     mut rows: Vec<QueryRow>,
     column_names: Vec<String>,
     order_by: Option<&[SimpleOrderByPlan]>,
@@ -19548,7 +20290,7 @@ fn apply_simple_projection_postprocessing_with_order(
     offset: usize,
 ) -> Result<QueryResult> {
     if let Some(order_by) = order_by {
-        sort_query_rows_by_projection_order(&mut rows, order_by)?;
+        sort_query_rows_by_projection_order(runtime, &mut rows, order_by)?;
     }
     let rows = rows
         .into_iter()
@@ -19570,12 +20312,18 @@ fn dedup_query_rows(rows: Vec<QueryRow>) -> Result<Vec<QueryRow>> {
 }
 
 fn compare_query_row_order_values(
+    runtime: Option<&EngineRuntime>,
     left_order: &[Value],
     right_order: &[Value],
     order_by: &[crate::sql::ast::OrderBy],
 ) -> Result<std::cmp::Ordering> {
     for (index, order) in order_by.iter().enumerate() {
-        let ordering = compare_values(&left_order[index], &right_order[index])?;
+        let ordering = compare_values_with_runtime_collation(
+            runtime,
+            &left_order[index],
+            &right_order[index],
+            order.collation.clone(),
+        )?;
         if ordering == std::cmp::Ordering::Equal {
             continue;
         }
@@ -19589,12 +20337,13 @@ fn compare_query_row_order_values(
 }
 
 fn sort_query_rows_by_order_values(
+    runtime: Option<&EngineRuntime>,
     rows: &mut [(QueryRow, Vec<Value>)],
     order_by: &[crate::sql::ast::OrderBy],
 ) -> Result<()> {
     let mut sort_error = None;
     rows.sort_by(|(_, left_order), (_, right_order)| {
-        match compare_query_row_order_values(left_order, right_order, order_by) {
+        match compare_query_row_order_values(runtime, left_order, right_order, order_by) {
             Ok(ordering) => ordering,
             Err(error) => {
                 if sort_error.is_none() {
@@ -19611,6 +20360,7 @@ fn sort_query_rows_by_order_values(
 }
 
 fn push_bounded_ordered_query_row(
+    runtime: Option<&EngineRuntime>,
     rows: &mut Vec<(QueryRow, Vec<Value>)>,
     row: (QueryRow, Vec<Value>),
     order_by: &[crate::sql::ast::OrderBy],
@@ -19625,13 +20375,13 @@ fn push_bounded_ordered_query_row(
     }
     let mut worst_index = 0;
     for index in 1..rows.len() {
-        if compare_query_row_order_values(&rows[index].1, &rows[worst_index].1, order_by)?
+        if compare_query_row_order_values(runtime, &rows[index].1, &rows[worst_index].1, order_by)?
             == std::cmp::Ordering::Greater
         {
             worst_index = index;
         }
     }
-    if compare_query_row_order_values(&row.1, &rows[worst_index].1, order_by)?
+    if compare_query_row_order_values(runtime, &row.1, &rows[worst_index].1, order_by)?
         == std::cmp::Ordering::Less
     {
         rows[worst_index] = row;
@@ -19640,15 +20390,18 @@ fn push_bounded_ordered_query_row(
 }
 
 fn sort_query_rows_by_projection_order(
+    runtime: Option<&EngineRuntime>,
     rows: &mut [QueryRow],
     order_by: &[SimpleOrderByPlan],
 ) -> Result<()> {
     let mut sort_error = None;
     rows.sort_by(|left, right| {
         for order in order_by {
-            let ordering = compare_values(
+            let ordering = compare_values_with_runtime_collation(
+                runtime,
                 &left.values()[order.projection_index],
                 &right.values()[order.projection_index],
+                order.collation.clone(),
             );
             match ordering {
                 Ok(std::cmp::Ordering::Equal) => continue,
@@ -20584,6 +21337,7 @@ fn projection_order_by_plan(
             order_by_projection_index(entry, projection).map(|projection_index| SimpleOrderByPlan {
                 projection_index,
                 descending: entry.descending,
+                collation: entry.collation.clone(),
             })
         })
         .collect()
@@ -20614,15 +21368,18 @@ fn order_by_projection_index(
 }
 
 fn sort_dataset_by_projection_order(
+    runtime: Option<&EngineRuntime>,
     dataset: &mut Dataset,
     order_by: &[SimpleOrderByPlan],
 ) -> Result<()> {
     let mut sort_error = None;
     dataset.rows_mut().sort_by(|left, right| {
         for order in order_by {
-            let ordering = compare_values(
+            let ordering = compare_values_with_runtime_collation(
+                runtime,
                 &left[order.projection_index],
                 &right[order.projection_index],
+                order.collation.clone(),
             );
             match ordering {
                 Ok(std::cmp::Ordering::Equal) => continue,
@@ -20982,17 +21739,18 @@ fn collect_simple_grouped_numeric_projection_aggregates(
 ) -> Option<()> {
     match expr {
         Expr::Literal(_) | Expr::Parameter(_) => Some(()),
-        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
-            collect_simple_grouped_numeric_projection_aggregates(
-                expr,
-                table_name,
-                binding_name,
-                table_binding,
-                table_schema,
-                aggregate_bindings,
-                saw_supported_aggregate,
-            )
-        }
+        Expr::Unary { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Collate { expr, .. } => collect_simple_grouped_numeric_projection_aggregates(
+            expr,
+            table_name,
+            binding_name,
+            table_binding,
+            table_schema,
+            aggregate_bindings,
+            saw_supported_aggregate,
+        ),
         Expr::Binary { left, right, .. } => {
             collect_simple_grouped_numeric_projection_aggregates(
                 left,
@@ -21210,17 +21968,18 @@ fn collect_simple_grouped_numeric_having_aggregates(
 ) -> Option<()> {
     match expr {
         Expr::Literal(_) | Expr::Parameter(_) | Expr::Column { .. } => Some(()),
-        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
-            collect_simple_grouped_numeric_having_aggregates(
-                expr,
-                table_name,
-                binding_name,
-                table_binding,
-                table_schema,
-                aggregate_bindings,
-                saw_supported_aggregate,
-            )
-        }
+        Expr::Unary { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Collate { expr, .. } => collect_simple_grouped_numeric_having_aggregates(
+            expr,
+            table_name,
+            binding_name,
+            table_binding,
+            table_schema,
+            aggregate_bindings,
+            saw_supported_aggregate,
+        ),
         Expr::Binary { left, right, .. } => {
             collect_simple_grouped_numeric_having_aggregates(
                 left,
@@ -21763,6 +22522,7 @@ fn simple_join_projection_order_by_plan(
             projection_index.map(|projection_index| SimpleOrderByPlan {
                 projection_index,
                 descending: entry.descending,
+                collation: entry.collation.clone(),
             })
         })
         .collect::<Option<Vec<_>>>();
@@ -22103,9 +22863,10 @@ fn simple_spatial_column_value_pair<'a>(
 fn expr_has_column_ref(expr: &Expr) -> bool {
     match expr {
         Expr::Column { .. } => true,
-        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
-            expr_has_column_ref(expr)
-        }
+        Expr::Unary { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Collate { expr, .. } => expr_has_column_ref(expr),
         Expr::Binary { left, right, .. } => expr_has_column_ref(left) || expr_has_column_ref(right),
         Expr::Between {
             expr, low, high, ..
@@ -22157,7 +22918,7 @@ fn expr_has_column_ref(expr: &Expr) -> bool {
 fn expr_contains_aggregate(expr: &Expr) -> bool {
     match expr {
         Expr::Aggregate { .. } => true,
-        Expr::Unary { expr, .. } => expr_contains_aggregate(expr),
+        Expr::Unary { expr, .. } | Expr::Collate { expr, .. } => expr_contains_aggregate(expr),
         Expr::Binary { left, right, .. } => {
             expr_contains_aggregate(left) || expr_contains_aggregate(right)
         }
@@ -22204,12 +22965,108 @@ fn expr_contains_aggregate(expr: &Expr) -> bool {
     }
 }
 
+fn expr_contains_runtime_extension_aggregate(runtime: &EngineRuntime, expr: &Expr) -> Result<bool> {
+    Ok(match expr {
+        Expr::Aggregate { .. } => true,
+        Expr::Function { name, args } => {
+            crate::extensions::runtime_has_aggregate_function(runtime, name)?
+                || args.iter().try_fold(false, |found, arg| {
+                    if found {
+                        Ok(true)
+                    } else {
+                        expr_contains_runtime_extension_aggregate(runtime, arg)
+                    }
+                })?
+        }
+        Expr::Unary { expr, .. } | Expr::Collate { expr, .. } | Expr::Cast { expr, .. } => {
+            expr_contains_runtime_extension_aggregate(runtime, expr)?
+        }
+        Expr::Binary { left, right, .. } => {
+            expr_contains_runtime_extension_aggregate(runtime, left)?
+                || expr_contains_runtime_extension_aggregate(runtime, right)?
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            expr_contains_runtime_extension_aggregate(runtime, expr)?
+                || expr_contains_runtime_extension_aggregate(runtime, low)?
+                || expr_contains_runtime_extension_aggregate(runtime, high)?
+        }
+        Expr::InList { expr, items, .. } => {
+            expr_contains_runtime_extension_aggregate(runtime, expr)?
+                || items.iter().try_fold(false, |found, item| {
+                    if found {
+                        Ok(true)
+                    } else {
+                        expr_contains_runtime_extension_aggregate(runtime, item)
+                    }
+                })?
+        }
+        Expr::InSubquery { expr, .. } | Expr::CompareSubquery { expr, .. } => {
+            expr_contains_runtime_extension_aggregate(runtime, expr)?
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            expr_contains_runtime_extension_aggregate(runtime, expr)?
+                || expr_contains_runtime_extension_aggregate(runtime, pattern)?
+                || escape
+                    .as_deref()
+                    .map(|expr| expr_contains_runtime_extension_aggregate(runtime, expr))
+                    .transpose()?
+                    .unwrap_or(false)
+        }
+        Expr::IsNull { expr, .. } => expr_contains_runtime_extension_aggregate(runtime, expr)?,
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            operand
+                .as_deref()
+                .map(|expr| expr_contains_runtime_extension_aggregate(runtime, expr))
+                .transpose()?
+                .unwrap_or(false)
+                || branches.iter().try_fold(false, |found, (left, right)| {
+                    if found {
+                        Ok(true)
+                    } else {
+                        Ok(expr_contains_runtime_extension_aggregate(runtime, left)?
+                            || expr_contains_runtime_extension_aggregate(runtime, right)?)
+                    }
+                })?
+                || else_expr
+                    .as_deref()
+                    .map(|expr| expr_contains_runtime_extension_aggregate(runtime, expr))
+                    .transpose()?
+                    .unwrap_or(false)
+        }
+        Expr::Row(items) => items.iter().try_fold(false, |found, item| {
+            if found {
+                Ok(true)
+            } else {
+                expr_contains_runtime_extension_aggregate(runtime, item)
+            }
+        })?,
+        Expr::ScalarSubquery(_) | Expr::Exists(_) => false,
+        Expr::RowNumber { .. }
+        | Expr::WindowFunction { .. }
+        | Expr::Literal(_)
+        | Expr::Column { .. }
+        | Expr::Parameter(_) => false,
+    })
+}
+
 fn expr_contains_window(expr: &Expr) -> bool {
     match expr {
         Expr::RowNumber { .. } | Expr::WindowFunction { .. } => true,
-        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
-            expr_contains_window(expr)
-        }
+        Expr::Unary { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Collate { expr, .. } => expr_contains_window(expr),
         Expr::Binary { left, right, .. } => {
             expr_contains_window(left) || expr_contains_window(right)
         }
@@ -23639,6 +24496,11 @@ impl EngineRuntime {
         params: &[Value],
         ctes: &BTreeMap<String, Dataset>,
     ) -> Result<Dataset> {
+        if select.group_by.iter().any(expr_contains_collation) {
+            return Err(DbError::sql(
+                "COLLATE in GROUP BY keys is not supported in this compatibility slice",
+            ));
+        }
         let mut groups = BTreeMap::<Vec<u8>, Vec<usize>>::new();
         if dataset.rows.is_empty() && select.group_by.is_empty() {
             groups.insert(Vec::new(), Vec::new());
@@ -23729,6 +24591,7 @@ impl EngineRuntime {
             })
             .collect::<Vec<_>>();
 
+        let mut sort_error = None;
         let mut order = (0..dataset.rows.len()).collect::<Vec<_>>();
         order.sort_by(|left_index, right_index| {
             let left_key = &sort_keys[*left_index];
@@ -23736,8 +24599,20 @@ impl EngineRuntime {
             for (order_clause, (left_value, right_value)) in
                 order_by.iter().zip(left_key.iter().zip(right_key.iter()))
             {
-                let ordering =
-                    compare_values(left_value, right_value).unwrap_or(std::cmp::Ordering::Equal);
+                let ordering = match compare_values_with_runtime_collation(
+                    Some(self),
+                    left_value,
+                    right_value,
+                    order_clause.collation.clone(),
+                ) {
+                    Ok(ordering) => ordering,
+                    Err(error) => {
+                        if sort_error.is_none() {
+                            sort_error = Some(error);
+                        }
+                        std::cmp::Ordering::Equal
+                    }
+                };
                 if ordering != std::cmp::Ordering::Equal {
                     return if order_clause.descending {
                         ordering.reverse()
@@ -23748,6 +24623,9 @@ impl EngineRuntime {
             }
             left_index.cmp(right_index)
         });
+        if let Some(error) = sort_error {
+            return Err(error);
+        }
 
         let mut rows = dataset
             .take_rows()
@@ -24085,9 +24963,29 @@ impl EngineRuntime {
                     order_by,
                     name,
                 ),
-                other => Err(DbError::sql(format!(
-                    "unsupported aggregate function {other}"
-                ))),
+                other => {
+                    let mut arg_rows = Vec::with_capacity(group_row_indexes.len());
+                    for row_index in group_row_indexes {
+                        let row = dataset
+                            .rows
+                            .get(*row_index)
+                            .map(Vec::as_slice)
+                            .ok_or_else(|| DbError::internal("group row index is invalid"))?;
+                        let values = args
+                            .iter()
+                            .map(|arg| self.eval_expr(arg, dataset, row, params, ctes, None))
+                            .collect::<Result<Vec<_>>>()?;
+                        arg_rows.push(values);
+                    }
+                    if let Some(value) =
+                        crate::extensions::invoke_aggregate_from_runtime(self, other, arg_rows)?
+                    {
+                        return Ok(value);
+                    }
+                    Err(DbError::sql(format!(
+                        "unsupported aggregate function {other}"
+                    )))
+                }
             },
             Expr::Unary { op, expr } => {
                 let value = self.eval_group_expr(expr, dataset, group_row_indexes, params, ctes)?;
@@ -24104,11 +25002,16 @@ impl EngineRuntime {
                     },
                 }
             }
-            Expr::Binary { left, op, right } => eval_binary(
-                op,
-                self.eval_group_expr(left, dataset, group_row_indexes, params, ctes)?,
-                self.eval_group_expr(right, dataset, group_row_indexes, params, ctes)?,
-            ),
+            Expr::Binary { left, op, right } => {
+                let collation = expr_collation(left).or_else(|| expr_collation(right));
+                eval_binary_with_collation(
+                    Some(self),
+                    op,
+                    self.eval_group_expr(left, dataset, group_row_indexes, params, ctes)?,
+                    self.eval_group_expr(right, dataset, group_row_indexes, params, ctes)?,
+                    collation,
+                )
+            }
             Expr::Between {
                 expr,
                 low,
@@ -24124,8 +25027,15 @@ impl EngineRuntime {
                 {
                     return Ok(Value::Null);
                 }
-                let in_range = compare_values(&value, &low)? != std::cmp::Ordering::Less
-                    && compare_values(&value, &high)? != std::cmp::Ordering::Greater;
+                let collation = expr_collation(expr);
+                let in_range = compare_values_with_runtime_collation(
+                    Some(self),
+                    &value,
+                    &low,
+                    collation.clone(),
+                )? != std::cmp::Ordering::Less
+                    && compare_values_with_runtime_collation(Some(self), &value, &high, collation)?
+                        != std::cmp::Ordering::Greater;
                 Ok(Value::Bool(if *negated { !in_range } else { in_range }))
             }
             Expr::InList {
@@ -24191,6 +25101,34 @@ impl EngineRuntime {
                 Ok(Value::Bool(if *negated { !is_null } else { is_null }))
             }
             Expr::Function { name, args } => {
+                let args_contain_aggregate = args.iter().any(expr_contains_aggregate)
+                    || args.iter().try_fold(false, |found, arg| {
+                        if found {
+                            Ok(true)
+                        } else {
+                            expr_contains_runtime_extension_aggregate(self, arg)
+                        }
+                    })?;
+                if !args_contain_aggregate {
+                    let mut arg_rows = Vec::with_capacity(group_row_indexes.len());
+                    for row_index in group_row_indexes {
+                        let row = dataset
+                            .rows
+                            .get(*row_index)
+                            .map(Vec::as_slice)
+                            .ok_or_else(|| DbError::internal("group row index is invalid"))?;
+                        let values = args
+                            .iter()
+                            .map(|arg| self.eval_expr(arg, dataset, row, params, ctes, None))
+                            .collect::<Result<Vec<_>>>()?;
+                        arg_rows.push(values);
+                    }
+                    if let Some(value) =
+                        crate::extensions::invoke_aggregate_from_runtime(self, name, arg_rows)?
+                    {
+                        return Ok(value);
+                    }
+                }
                 let row = if let Some(row_index) = group_row_indexes.first().copied() {
                     dataset
                         .rows
@@ -24294,6 +25232,9 @@ impl EngineRuntime {
                 self.eval_group_expr(expr, dataset, group_row_indexes, params, ctes)?,
                 *target_type,
             ),
+            Expr::Collate { expr, .. } => {
+                self.eval_group_expr(expr, dataset, group_row_indexes, params, ctes)
+            }
             Expr::Row(_) => Err(DbError::sql(
                 "row values are only supported in IN comparisons",
             )),
@@ -24349,9 +25290,10 @@ impl EngineRuntime {
                 }
             }
             Expr::Binary { left, op, right } => {
+                let collation = expr_collation(left).or_else(|| expr_collation(right));
                 let left = self.eval_expr(left, dataset, row, params, ctes, excluded)?;
                 let right = self.eval_expr(right, dataset, row, params, ctes, excluded)?;
-                eval_binary(op, left, right)
+                eval_binary_with_collation(Some(self), op, left, right, collation)
             }
             Expr::Between {
                 expr,
@@ -24368,8 +25310,15 @@ impl EngineRuntime {
                 {
                     return Ok(Value::Null);
                 }
-                let in_range = compare_values(&value, &low)? != std::cmp::Ordering::Less
-                    && compare_values(&value, &high)? != std::cmp::Ordering::Greater;
+                let collation = expr_collation(expr);
+                let in_range = compare_values_with_runtime_collation(
+                    Some(self),
+                    &value,
+                    &low,
+                    collation.clone(),
+                )? != std::cmp::Ordering::Less
+                    && compare_values_with_runtime_collation(Some(self), &value, &high, collation)?
+                        != std::cmp::Ordering::Greater;
                 Ok(Value::Bool(if *negated { !in_range } else { in_range }))
             }
             Expr::InList {
@@ -24459,7 +25408,13 @@ impl EngineRuntime {
                 for subquery_row in subquery.rows.iter() {
                     saw_row = true;
                     let candidate = subquery_row.first().cloned().unwrap_or(Value::Null);
-                    match eval_binary(op, left_value.clone(), candidate)? {
+                    match eval_binary_with_collation(
+                        Some(self),
+                        op,
+                        left_value.clone(),
+                        candidate,
+                        expr_collation(expr),
+                    )? {
                         Value::Bool(result) => match quantifier {
                             SubqueryQuantifier::Any if result => return Ok(Value::Bool(true)),
                             SubqueryQuantifier::All if !result => return Ok(Value::Bool(false)),
@@ -24569,6 +25524,9 @@ impl EngineRuntime {
                 self.eval_expr(expr, dataset, row, params, ctes, excluded)?,
                 *target_type,
             ),
+            Expr::Collate { expr, .. } => {
+                self.eval_expr(expr, dataset, row, params, ctes, excluded)
+            }
             Expr::Row(_) => Err(DbError::sql(
                 "row values are only supported in IN comparisons",
             )),
@@ -24667,6 +25625,7 @@ pub(crate) fn statement_is_read_only(statement: &Statement) -> bool {
 fn infer_expr_name(expr: &Expr, ordinal: usize) -> String {
     match expr {
         Expr::Column { column, .. } => column.clone(),
+        Expr::Collate { expr, .. } => infer_expr_name(expr, ordinal),
         Expr::RowNumber { .. } => "row_number".to_string(),
         Expr::WindowFunction { name, .. } => name.clone(),
         _ => format!("col{ordinal}"),
@@ -24995,6 +25954,30 @@ fn eval_function(
         .map(|expr| runtime.eval_expr(expr, dataset, row, params, ctes, excluded))
         .collect::<Result<Vec<_>>>()?;
     match name {
+        "current_database" | "current_schema" | "database" | "schema" => {
+            if !values.is_empty() {
+                return Err(DbError::sql(format!(
+                    "{} expects 0 arguments",
+                    name.to_ascii_uppercase()
+                )));
+            }
+            Ok(Value::Text("main".to_string()))
+        }
+        "version" => {
+            if !values.is_empty() {
+                return Err(DbError::sql("VERSION expects 0 arguments"));
+            }
+            Ok(Value::Text(format!(
+                "DecentDB {}",
+                env!("CARGO_PKG_VERSION")
+            )))
+        }
+        "sqlite_version" => Err(DbError::sql(
+            "sqlite_version() is not supported; DecentDB is not SQLite",
+        )),
+        "pg_backend_pid" => Err(DbError::sql(
+            "pg_backend_pid() is not supported; DecentDB is embedded and has no server backend PID",
+        )),
         "coalesce" => Ok(values
             .into_iter()
             .find(|value| !matches!(value, Value::Null))
@@ -25780,7 +26763,14 @@ fn eval_function(
         "st_geogfromtext" => eval_spatial_from_text(&values, true),
         "st_geomfromgeojson" => eval_spatial_from_geojson(&values, false),
         "st_geogfromgeojson" => eval_spatial_from_geojson(&values, true),
-        other => Err(DbError::sql(format!("unsupported scalar function {other}"))),
+        other => {
+            if let Some(value) =
+                crate::extensions::invoke_scalar_from_runtime(runtime, other, &values)?
+            {
+                return Ok(value);
+            }
+            Err(DbError::sql(format!("unsupported scalar function {other}")))
+        }
     }
 }
 
@@ -27650,6 +28640,446 @@ fn json_table_input(function_name: &str, value: &Value) -> Result<Option<JsonVal
     }
 }
 
+fn generate_series_rows(values: &[Value]) -> Result<Vec<Value>> {
+    if values.iter().any(|value| matches!(value, Value::Null)) {
+        return Ok(Vec::new());
+    }
+    match values {
+        [Value::Int64(start), Value::Int64(stop)] => {
+            generate_int_series_rows(*start, *stop, 1)
+        }
+        [Value::Int64(start), Value::Int64(stop), Value::Int64(step)] => {
+            generate_int_series_rows(*start, *stop, *step)
+        }
+        [
+            Value::TimestampMicros(start),
+            Value::TimestampMicros(stop),
+            Value::Interval {
+                months,
+                days,
+                micros,
+            },
+        ] => generate_timestamp_series_rows(*start, *stop, *months, *days, *micros),
+        [
+            Value::DateDays(start),
+            Value::DateDays(stop),
+            Value::Interval {
+                months,
+                days,
+                micros,
+            },
+        ] => generate_date_series_rows(*start, *stop, *months, *days, *micros),
+        [Value::TimestampMicros(_), Value::TimestampMicros(_)]
+        | [Value::DateDays(_), Value::DateDays(_)] => Err(DbError::sql(
+            "temporal generate_series requires an INTERVAL step argument",
+        )),
+        _ => Err(DbError::sql(
+            "generate_series supports INT64 start/stop[/step], TIMESTAMP start/stop/INTERVAL step, and DATE start/stop/INTERVAL step",
+        )),
+    }
+}
+
+fn generate_int_series_rows(start: i64, stop: i64, step: i64) -> Result<Vec<Value>> {
+    if step == 0 {
+        return Err(DbError::sql("generate_series step cannot be zero"));
+    }
+    let ascending = step > 0;
+    if (ascending && start > stop) || (!ascending && start < stop) {
+        return Ok(Vec::new());
+    }
+    let mut rows = Vec::new();
+    let mut current = start;
+    loop {
+        push_generate_series_value(&mut rows, Value::Int64(current))?;
+        match current.checked_add(step) {
+            Some(next) if (ascending && next <= stop) || (!ascending && next >= stop) => {
+                current = next;
+            }
+            Some(_) => break,
+            None => break,
+        }
+    }
+    Ok(rows)
+}
+
+fn generate_timestamp_series_rows(
+    start: i64,
+    stop: i64,
+    months: i32,
+    days: i32,
+    micros: i64,
+) -> Result<Vec<Value>> {
+    let first_next = apply_interval_to_timestamp_micros(start, months, days, micros, true)?;
+    let direction = first_next.cmp(&start);
+    if direction == std::cmp::Ordering::Equal {
+        return Err(DbError::sql("generate_series step cannot be zero"));
+    }
+    if (direction == std::cmp::Ordering::Greater && start > stop)
+        || (direction == std::cmp::Ordering::Less && start < stop)
+    {
+        return Ok(Vec::new());
+    }
+
+    let mut rows = Vec::new();
+    let mut current = start;
+    loop {
+        push_generate_series_value(&mut rows, Value::TimestampMicros(current))?;
+        let next = apply_interval_to_timestamp_micros(current, months, days, micros, true)?;
+        if next == current {
+            return Err(DbError::sql("generate_series step cannot be zero"));
+        }
+        let in_range = if direction == std::cmp::Ordering::Greater {
+            next <= stop
+        } else {
+            next >= stop
+        };
+        if !in_range {
+            break;
+        }
+        current = next;
+    }
+    Ok(rows)
+}
+
+fn generate_date_series_rows(
+    start: i32,
+    stop: i32,
+    months: i32,
+    days: i32,
+    micros: i64,
+) -> Result<Vec<Value>> {
+    if months != 0 || micros != 0 {
+        return Err(DbError::sql(
+            "DATE generate_series currently requires an INTERVAL with whole days only",
+        ));
+    }
+    if days == 0 {
+        return Err(DbError::sql("generate_series step cannot be zero"));
+    }
+    let ascending = days > 0;
+    if (ascending && start > stop) || (!ascending && start < stop) {
+        return Ok(Vec::new());
+    }
+    let mut rows = Vec::new();
+    let mut current = start;
+    loop {
+        push_generate_series_value(&mut rows, Value::DateDays(current))?;
+        match current.checked_add(days) {
+            Some(next) if (ascending && next <= stop) || (!ascending && next >= stop) => {
+                current = next;
+            }
+            Some(_) => break,
+            None => break,
+        }
+    }
+    Ok(rows)
+}
+
+fn push_generate_series_value(rows: &mut Vec<Value>, value: Value) -> Result<()> {
+    if rows.len() >= GENERATE_SERIES_MAX_ROWS {
+        return Err(DbError::sql(format!(
+            "generate_series produced more than {GENERATE_SERIES_MAX_ROWS} rows"
+        )));
+    }
+    rows.push(value);
+    Ok(())
+}
+
+fn one_text_arg(function_name: &str, values: Vec<Value>) -> Result<String> {
+    if values.len() != 1 {
+        return Err(DbError::sql(format!("{function_name} expects 1 argument")));
+    }
+    match values.into_iter().next().unwrap_or(Value::Null) {
+        Value::Text(value) => Ok(value),
+        Value::Null => Ok(String::new()),
+        other => Err(DbError::sql(format!(
+            "{function_name} expects a text argument, got {other:?}"
+        ))),
+    }
+}
+
+fn visible_columns(table_name: &str, names: &[&str]) -> Vec<ColumnBinding> {
+    names
+        .iter()
+        .map(|name| ColumnBinding::visible(Some(table_name.to_string()), (*name).to_string()))
+        .collect()
+}
+
+fn compat_catalog_object_is_visible(name: &str) -> bool {
+    !name.starts_with("__decentdb_")
+}
+
+fn pragma_table_info_dataset(
+    table_name: String,
+    columns: &[ColumnSchema],
+    extended: bool,
+) -> Dataset {
+    let mut rows = Vec::new();
+    for (cid, column) in columns.iter().enumerate() {
+        let mut row = vec![
+            Value::Int64(i64::try_from(cid).unwrap_or(i64::MAX)),
+            Value::Text(column.name.clone()),
+            Value::Text(column.column_type.as_str().to_string()),
+            Value::Int64(if column.nullable { 0 } else { 1 }),
+            column.default_sql.clone().map_or(Value::Null, Value::Text),
+            Value::Int64(if column.primary_key { 1 } else { 0 }),
+        ];
+        if extended {
+            let hidden = if column.generated_sql.is_none() {
+                0
+            } else if column.generated_stored {
+                3
+            } else {
+                2
+            };
+            row.push(Value::Int64(hidden));
+        }
+        rows.push(row);
+    }
+    let names = if extended {
+        vec![
+            "cid",
+            "name",
+            "type",
+            "notnull",
+            "dflt_value",
+            "pk",
+            "hidden",
+        ]
+    } else {
+        vec!["cid", "name", "type", "notnull", "dflt_value", "pk"]
+    };
+    Dataset::with_rows(visible_columns(&table_name, &names), rows)
+}
+
+fn table_list_row(schema: &str, name: &str, kind: &str, column_count: usize) -> Vec<Value> {
+    vec![
+        Value::Text(schema.to_string()),
+        Value::Text(name.to_string()),
+        Value::Text(kind.to_string()),
+        Value::Int64(i64::try_from(column_count).unwrap_or(i64::MAX)),
+        Value::Int64(0),
+        Value::Int64(0),
+    ]
+}
+
+fn index_info_rows(index: &IndexSchema, extended: bool) -> Vec<Vec<Value>> {
+    let mut rows = Vec::new();
+    for (seqno, column) in index.columns.iter().enumerate() {
+        let cid = if column.column_name.is_some() {
+            seqno as i64
+        } else {
+            -2
+        };
+        let name = column
+            .column_name
+            .clone()
+            .or_else(|| column.expression_sql.clone())
+            .map_or(Value::Null, Value::Text);
+        let mut row = vec![
+            Value::Int64(i64::try_from(seqno).unwrap_or(i64::MAX)),
+            Value::Int64(cid),
+            name,
+        ];
+        if extended {
+            row.extend([
+                Value::Int64(0),
+                Value::Text("BINARY".to_string()),
+                Value::Int64(1),
+            ]);
+        }
+        rows.push(row);
+    }
+    if extended {
+        let base = rows.len();
+        for (offset, include) in index.include_columns.iter().enumerate() {
+            rows.push(vec![
+                Value::Int64(i64::try_from(base + offset).unwrap_or(i64::MAX)),
+                Value::Int64(-1),
+                Value::Text(include.clone()),
+                Value::Int64(0),
+                Value::Text("BINARY".to_string()),
+                Value::Int64(0),
+            ]);
+        }
+    }
+    rows
+}
+
+fn foreign_key_rows(table: &TableSchema) -> Vec<Vec<Value>> {
+    let mut rows = Vec::new();
+    for (id, foreign_key) in table.foreign_keys.iter().enumerate() {
+        for (seq, (from, to)) in foreign_key
+            .columns
+            .iter()
+            .zip(foreign_key.referenced_columns.iter())
+            .enumerate()
+        {
+            rows.push(vec![
+                Value::Int64(i64::try_from(id).unwrap_or(i64::MAX)),
+                Value::Int64(i64::try_from(seq).unwrap_or(i64::MAX)),
+                Value::Text(foreign_key.referenced_table.clone()),
+                Value::Text(from.clone()),
+                Value::Text(to.clone()),
+                Value::Text(foreign_key_action_sqlite_name(foreign_key.on_update)),
+                Value::Text(foreign_key_action_sqlite_name(foreign_key.on_delete)),
+                Value::Text("NONE".to_string()),
+            ]);
+        }
+    }
+    rows
+}
+
+fn foreign_key_action_sqlite_name(action: ForeignKeyAction) -> String {
+    match action {
+        ForeignKeyAction::NoAction => "NO ACTION",
+        ForeignKeyAction::Restrict => "RESTRICT",
+        ForeignKeyAction::Cascade => "CASCADE",
+        ForeignKeyAction::SetNull => "SET NULL",
+    }
+    .to_string()
+}
+
+fn sqlite_schema_row(kind: &str, name: &str, tbl_name: &str, sql: Option<String>) -> Vec<Value> {
+    vec![
+        Value::Text(kind.to_string()),
+        Value::Text(name.to_string()),
+        Value::Text(tbl_name.to_string()),
+        Value::Int64(0),
+        sql.map_or(Value::Null, Value::Text),
+    ]
+}
+
+fn information_schema_schemata_row(schema: &str) -> Vec<Value> {
+    vec![
+        Value::Text("main".to_string()),
+        Value::Text(schema.to_string()),
+        Value::Text("decentdb".to_string()),
+        Value::Text("main".to_string()),
+        Value::Text(schema.to_string()),
+        Value::Text("UTF-8".to_string()),
+    ]
+}
+
+fn information_schema_table_row(schema: &str, name: &str, table_type: &str) -> Vec<Value> {
+    vec![
+        Value::Text("main".to_string()),
+        Value::Text(schema.to_string()),
+        Value::Text(name.to_string()),
+        Value::Text(table_type.to_string()),
+    ]
+}
+
+fn information_schema_column_rows(
+    schema: &str,
+    table_name: &str,
+    columns: &[ColumnSchema],
+) -> Vec<Vec<Value>> {
+    columns
+        .iter()
+        .enumerate()
+        .map(|(index, column)| {
+            vec![
+                Value::Text("main".to_string()),
+                Value::Text(schema.to_string()),
+                Value::Text(table_name.to_string()),
+                Value::Text(column.name.clone()),
+                Value::Int64(i64::try_from(index + 1).unwrap_or(i64::MAX)),
+                column.default_sql.clone().map_or(Value::Null, Value::Text),
+                Value::Text(if column.nullable { "YES" } else { "NO" }.to_string()),
+                Value::Text(column.column_type.as_str().to_string()),
+            ]
+        })
+        .collect()
+}
+
+fn render_compat_create_table(table: &TableSchema) -> String {
+    let columns = table
+        .columns
+        .iter()
+        .map(|column| {
+            format!(
+                "{} {}",
+                sql_identifier_exec(&column.name),
+                column.column_type.as_str()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "CREATE {}TABLE {} ({});",
+        if table.temporary { "TEMP " } else { "" },
+        sql_identifier_exec(&table.name),
+        columns
+    )
+}
+
+fn render_compat_create_view(view: &ViewSchema) -> String {
+    format!(
+        "CREATE {}VIEW {} AS {};",
+        if view.temporary { "TEMP " } else { "" },
+        sql_identifier_exec(&view.name),
+        view.sql_text
+    )
+}
+
+fn render_compat_create_index(index: &IndexSchema) -> String {
+    let columns = index
+        .columns
+        .iter()
+        .map(|column| {
+            column
+                .column_name
+                .as_deref()
+                .map(sql_identifier_exec)
+                .or_else(|| column.expression_sql.clone())
+                .unwrap_or_else(|| "\"expr\"".to_string())
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "CREATE {}INDEX {} ON {} ({});",
+        if index.unique { "UNIQUE " } else { "" },
+        sql_identifier_exec(&index.name),
+        sql_identifier_exec(&index.table_name),
+        columns
+    )
+}
+
+fn render_compat_create_trigger(trigger: &crate::catalog::TriggerSchema) -> String {
+    format!(
+        "CREATE TRIGGER {} {} {} ON {} FOR EACH ROW EXECUTE FUNCTION decentdb_exec_sql({});",
+        sql_identifier_exec(&trigger.name),
+        trigger_kind_name_exec(trigger.kind),
+        trigger_event_name_exec(trigger.event),
+        sql_identifier_exec(&trigger.target_name),
+        sql_string_literal_exec(&trigger.action_sql)
+    )
+}
+
+fn trigger_kind_name_exec(kind: TriggerKind) -> &'static str {
+    match kind {
+        TriggerKind::After => "AFTER",
+        TriggerKind::InsteadOf => "INSTEAD OF",
+    }
+}
+
+fn trigger_event_name_exec(event: TriggerEvent) -> &'static str {
+    match event {
+        TriggerEvent::Insert => "INSERT",
+        TriggerEvent::Update => "UPDATE",
+        TriggerEvent::Delete => "DELETE",
+    }
+}
+
+fn sql_identifier_exec(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+fn sql_string_literal_exec(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
 fn append_json_tree_rows(
     key: Value,
     value: JsonValue,
@@ -27835,9 +29265,23 @@ fn sort_aggregate_row_indexes(
             Ok((*row_index, keys))
         })
         .collect::<Result<Vec<_>>>()?;
+    let mut sort_error = None;
     keyed.sort_by(|(left_index, left_keys), (right_index, right_keys)| {
         for (order, (left, right)) in order_by.iter().zip(left_keys.iter().zip(right_keys.iter())) {
-            let ordering = compare_values(left, right).unwrap_or(std::cmp::Ordering::Equal);
+            let ordering = match compare_values_with_runtime_collation(
+                Some(runtime),
+                left,
+                right,
+                order.collation.clone(),
+            ) {
+                Ok(ordering) => ordering,
+                Err(error) => {
+                    if sort_error.is_none() {
+                        sort_error = Some(error);
+                    }
+                    std::cmp::Ordering::Equal
+                }
+            };
             if ordering != std::cmp::Ordering::Equal {
                 return if order.descending {
                     ordering.reverse()
@@ -27848,6 +29292,9 @@ fn sort_aggregate_row_indexes(
         }
         left_index.cmp(right_index)
     });
+    if let Some(error) = sort_error {
+        return Err(error);
+    }
     Ok(keyed.into_iter().map(|(row_index, _)| row_index).collect())
 }
 
@@ -28632,6 +30079,70 @@ fn eval_binary(op: &BinaryOp, left: Value, right: Value) -> Result<Value> {
                 _ => unreachable!(),
             }))
         }
+    }
+}
+
+fn compare_values_with_runtime_collation(
+    runtime: Option<&EngineRuntime>,
+    left: &Value,
+    right: &Value,
+    collation: Option<Collation>,
+) -> Result<std::cmp::Ordering> {
+    match (&collation, left, right) {
+        (Some(Collation::Extension(name)), Value::Text(left), Value::Text(right)) => {
+            let Some(runtime) = runtime else {
+                return Err(DbError::sql(format!(
+                    "extension collation {name} requires runtime-aware comparison"
+                )));
+            };
+            crate::extensions::compare_with_collation_from_runtime(runtime, name, left, right)?
+                .ok_or_else(|| DbError::sql(format!("unsupported collation {name}")))
+        }
+        _ => compare_values_with_collation(left, right, collation),
+    }
+}
+
+fn eval_binary_with_collation(
+    runtime: Option<&EngineRuntime>,
+    op: &BinaryOp,
+    left: Value,
+    right: Value,
+    collation: Option<Collation>,
+) -> Result<Value> {
+    if collation.is_none() {
+        return eval_binary(op, left, right);
+    }
+    match op {
+        BinaryOp::IsDistinctFrom => Ok(Value::Bool(
+            compare_values_with_runtime_collation(runtime, &left, &right, collation.clone())?
+                != std::cmp::Ordering::Equal,
+        )),
+        BinaryOp::IsNotDistinctFrom => Ok(Value::Bool(
+            compare_values_with_runtime_collation(runtime, &left, &right, collation.clone())?
+                == std::cmp::Ordering::Equal,
+        )),
+        BinaryOp::Eq
+        | BinaryOp::NotEq
+        | BinaryOp::Lt
+        | BinaryOp::LtEq
+        | BinaryOp::Gt
+        | BinaryOp::GtEq => {
+            if matches!(left, Value::Null) || matches!(right, Value::Null) {
+                return Ok(Value::Null);
+            }
+            let ordering =
+                compare_values_with_runtime_collation(runtime, &left, &right, collation)?;
+            Ok(Value::Bool(match op {
+                BinaryOp::Eq => ordering == std::cmp::Ordering::Equal,
+                BinaryOp::NotEq => ordering != std::cmp::Ordering::Equal,
+                BinaryOp::Lt => ordering == std::cmp::Ordering::Less,
+                BinaryOp::LtEq => ordering != std::cmp::Ordering::Greater,
+                BinaryOp::Gt => ordering == std::cmp::Ordering::Greater,
+                BinaryOp::GtEq => ordering != std::cmp::Ordering::Less,
+                _ => unreachable!(),
+            }))
+        }
+        _ => eval_binary(op, left, right),
     }
 }
 
@@ -33121,6 +34632,127 @@ fn date_days_to_micros(days: i32) -> Result<i64> {
     i64::from(days)
         .checked_mul(EXEC_MICROS_PER_DAY)
         .ok_or_else(|| DbError::sql("DATE value is out of range"))
+}
+
+fn expr_collation(expr: &Expr) -> Option<Collation> {
+    match expr {
+        Expr::Collate { collation, .. } => Some(collation.clone()),
+        _ => None,
+    }
+}
+
+fn select_item_contains_collation(item: &SelectItem) -> bool {
+    match item {
+        SelectItem::Expr { expr, .. } => expr_contains_collation(expr),
+        SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => false,
+    }
+}
+
+fn expr_contains_collation(expr: &Expr) -> bool {
+    match expr {
+        Expr::Collate { .. } => true,
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+            expr_contains_collation(expr)
+        }
+        Expr::Binary { left, right, .. } => {
+            expr_contains_collation(left) || expr_contains_collation(right)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            expr_contains_collation(expr)
+                || expr_contains_collation(low)
+                || expr_contains_collation(high)
+        }
+        Expr::InList { expr, items, .. } => {
+            expr_contains_collation(expr) || items.iter().any(expr_contains_collation)
+        }
+        Expr::InSubquery { expr, .. } | Expr::CompareSubquery { expr, .. } => {
+            expr_contains_collation(expr)
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            expr_contains_collation(expr)
+                || expr_contains_collation(pattern)
+                || escape.as_deref().is_some_and(expr_contains_collation)
+        }
+        Expr::Function { args, .. } => args.iter().any(expr_contains_collation),
+        Expr::Aggregate { args, order_by, .. } => {
+            args.iter().any(expr_contains_collation)
+                || order_by.iter().any(order_by_contains_collation)
+        }
+        Expr::RowNumber {
+            partition_by,
+            order_by,
+            ..
+        } => {
+            partition_by.iter().any(expr_contains_collation)
+                || order_by.iter().any(order_by_contains_collation)
+        }
+        Expr::WindowFunction {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            args.iter().any(expr_contains_collation)
+                || partition_by.iter().any(expr_contains_collation)
+                || order_by.iter().any(order_by_contains_collation)
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            operand.as_deref().is_some_and(expr_contains_collation)
+                || branches.iter().any(|(when, then)| {
+                    expr_contains_collation(when) || expr_contains_collation(then)
+                })
+                || else_expr.as_deref().is_some_and(expr_contains_collation)
+        }
+        Expr::Row(exprs) => exprs.iter().any(expr_contains_collation),
+        Expr::Literal(_)
+        | Expr::Column { .. }
+        | Expr::Parameter(_)
+        | Expr::ScalarSubquery(_)
+        | Expr::Exists(_) => false,
+    }
+}
+
+fn order_by_contains_collation(order_by: &OrderBy) -> bool {
+    order_by.collation.is_some() || expr_contains_collation(&order_by.expr)
+}
+
+fn compare_values_with_collation(
+    left: &Value,
+    right: &Value,
+    collation: Option<Collation>,
+) -> Result<std::cmp::Ordering> {
+    match (collation, left, right) {
+        (Some(Collation::Binary), Value::Text(left), Value::Text(right)) => Ok(left.cmp(right)),
+        (Some(Collation::NoCase), Value::Text(left), Value::Text(right)) => {
+            Ok(compare_ascii_nocase(left, right))
+        }
+        (Some(Collation::RTrim), Value::Text(left), Value::Text(right)) => {
+            Ok(left.trim_end_matches(' ').cmp(right.trim_end_matches(' ')))
+        }
+        (Some(Collation::Extension(name)), Value::Text(_), Value::Text(_)) => {
+            Err(DbError::sql(format!(
+                "extension collation {name} requires runtime-aware comparison and is not supported in this execution path"
+            )))
+        }
+        _ => compare_values(left, right),
+    }
+}
+
+fn compare_ascii_nocase(left: &str, right: &str) -> std::cmp::Ordering {
+    left.bytes()
+        .map(|byte| byte.to_ascii_lowercase())
+        .cmp(right.bytes().map(|byte| byte.to_ascii_lowercase()))
 }
 
 fn compare_values(left: &Value, right: &Value) -> Result<std::cmp::Ordering> {

@@ -8,7 +8,9 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+use std::time::Instant;
 
 use crate::error::{DbError, Result};
 
@@ -28,8 +30,14 @@ struct ReaderRegistryInner {
 #[derive(Clone, Debug)]
 struct ReaderInfo {
     snapshot_lsn: u64,
-    started_at: Instant,
+    started_at: ReaderStartedAt,
 }
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+type ReaderStartedAt = Instant;
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+type ReaderStartedAt = ();
 
 #[derive(Debug)]
 pub(crate) struct ReaderGuard {
@@ -49,7 +57,7 @@ impl ReaderRegistry {
                 reader_id,
                 ReaderInfo {
                     snapshot_lsn,
-                    started_at: Instant::now(),
+                    started_at: reader_started_at(),
                 },
             );
         self.inner.active_count.fetch_add(1, Ordering::Release);
@@ -82,8 +90,7 @@ impl ReaderRegistry {
             .map_err(|_| DbError::internal("reader registry lock poisoned"))?;
         let mut warnings = Vec::new();
         for (reader_id, reader) in readers.iter() {
-            let age = reader.started_at.elapsed();
-            if age >= threshold {
+            if let Some(age) = reader_age(&reader.started_at).filter(|age| *age >= threshold) {
                 warnings.push(format!(
                     "reader {reader_id} has held snapshot {} for {}s",
                     reader.snapshot_lsn,
@@ -109,6 +116,24 @@ impl ReaderRegistry {
             .map(|warnings| warnings.clone())
             .map_err(|_| DbError::internal("reader warning log poisoned"))
     }
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+fn reader_started_at() -> ReaderStartedAt {
+    Instant::now()
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+fn reader_started_at() -> ReaderStartedAt {}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+fn reader_age(started_at: &ReaderStartedAt) -> Option<Duration> {
+    Some(started_at.elapsed())
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+fn reader_age(_started_at: &ReaderStartedAt) -> Option<Duration> {
+    None
 }
 
 impl ReaderGuard {

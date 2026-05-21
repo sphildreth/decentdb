@@ -48,6 +48,12 @@ from .native import (
     ERR_ERROR,
     ERR_FULL,
     ERR_INTERNAL,
+    ERR_BUSY,
+    ERR_TIMEOUT,
+    ERR_CANCELED,
+    ERR_QUEUE_FULL,
+    ERR_QUEUE_CLOSED,
+    DDB_WRITE_QUEUE_TIMEOUT_DEFAULT,
     ERR_INVALID,
     ERR_IO,
     ERR_LOCKED,
@@ -55,6 +61,7 @@ from .native import (
     ERR_NOT_FOUND,
     ERR_OK,
     ERR_PERMISSION,
+    DdbWriteQueueMetrics,
     ERR_SQL,
     ERR_TRANSACTION,
     load_library,
@@ -133,6 +140,65 @@ class NotSupportedError(DatabaseError):
 
 class PerformanceWarning(UserWarning):
     pass
+
+
+class Watch:
+    def __init__(self, lib, watch):
+        self._lib = lib
+        self._watch = ctypes.c_void_p(watch.value if hasattr(watch, "value") else watch)
+        self._closed = False
+
+    def _ensure_open(self):
+        if self._closed or not self._watch:
+            raise ProgrammingError("Watch closed")
+
+    def next_json(self, timeout_ms=0):
+        self._ensure_open()
+        if not hasattr(self._lib, "ddb_watch_next_json"):
+            raise NotSupportedError("ddb_watch_next_json is not available in this native library")
+        out = ctypes.c_char_p()
+        code = self._lib.ddb_watch_next_json(
+            self._watch,
+            ctypes.c_uint32(int(timeout_ms)),
+            ctypes.byref(out),
+        )
+        if code == ERR_TIMEOUT:
+            return None
+        if code != ERR_OK:
+            _raise_error(code)
+        try:
+            return out.value.decode("utf-8") if out.value else ""
+        finally:
+            self._lib.ddb_string_free(ctypes.byref(out))
+
+    def next(self, timeout_ms=0):
+        raw = self.next_json(timeout_ms=timeout_ms)
+        return None if raw is None else json.loads(raw)
+
+    def close(self):
+        if self._closed:
+            return
+        if self._watch and hasattr(self._lib, "ddb_watch_close"):
+            ptr = ctypes.c_void_p(self._watch.value)
+            code = self._lib.ddb_watch_close(ctypes.byref(ptr))
+            if code != ERR_OK:
+                _raise_error(code)
+            self._watch = ptr
+        self._closed = True
+
+    def __enter__(self):
+        self._ensure_open()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 Date = datetime.date
@@ -233,7 +299,17 @@ def _raise_error(code, *, sql=None, params=None):
 
     if native_code == ERR_CONSTRAINT:
         raise IntegrityError(message)
-    if native_code in (ERR_TRANSACTION, ERR_IO, ERR_LOCKED, ERR_NOT_FOUND):
+    if native_code in (
+        ERR_TRANSACTION,
+        ERR_IO,
+        ERR_LOCKED,
+        ERR_NOT_FOUND,
+        ERR_BUSY,
+        ERR_TIMEOUT,
+        ERR_CANCELED,
+        ERR_QUEUE_FULL,
+        ERR_QUEUE_CLOSED,
+    ):
         raise OperationalError(message)
     if native_code == ERR_SQL:
         raise ProgrammingError(message)
@@ -244,6 +320,147 @@ def _raise_error(code, *, sql=None, params=None):
     if native_code in (ERR_INVALID, ERR_PERMISSION, ERR_FULL, ERR_NOMEM, ERR_ERROR):
         raise DatabaseError(message)
     raise DatabaseError(message)
+
+
+def _encode_queued_param(value):
+    native = DdbValue()
+    native.tag = DDB_VALUE_NULL
+    keep_alive = []
+
+    if value is None:
+        return native, keep_alive
+    if isinstance(value, bool):
+        native.tag = DDB_VALUE_BOOL
+        native.bool_value = 1 if value else 0
+        return native, keep_alive
+    if isinstance(value, int):
+        native.tag = DDB_VALUE_INT64
+        native.int64_value = value
+        return native, keep_alive
+    if isinstance(value, float):
+        native.tag = DDB_VALUE_FLOAT64
+        native.float64_value = value
+        return native, keep_alive
+    if isinstance(value, str):
+        raw = value.encode("utf-8")
+        native.tag = DDB_VALUE_TEXT
+        native.data = (ctypes.c_uint8 * len(raw)).from_buffer_copy(raw)
+        keep_alive.append(native.data)
+        native.len = len(raw)
+        return native, keep_alive
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        raw = bytes(value)
+        native.tag = DDB_VALUE_BLOB
+        native.data = (ctypes.c_uint8 * len(raw)).from_buffer_copy(raw)
+        keep_alive.append(native.data)
+        native.len = len(raw)
+        return native, keep_alive
+    if isinstance(value, decimal.Decimal):
+        t = value.as_tuple()
+        exponent = t.exponent
+        if not isinstance(exponent, int):
+            raise DataError("Decimal NaN/Inf not supported")
+        scale = -exponent
+        if scale < 0:
+            int_val = int(value)
+            scale = 0
+        elif scale > 18:
+            quantized = value.quantize(decimal.Decimal(10) ** -18)
+            scale = 18
+            int_val = int(quantized * (decimal.Decimal(10) ** 18))
+        else:
+            int_val = int(value * (decimal.Decimal(10) ** scale))
+        if int_val < -(2 ** 63) or int_val > (2 ** 63 - 1):
+            raise DataError("Decimal value too large for DecentDB")
+        native.tag = DDB_VALUE_DECIMAL
+        native.decimal_scaled = int_val
+        native.decimal_scale = int(scale)
+        return native, keep_alive
+    if isinstance(value, uuid.UUID):
+        native.tag = DDB_VALUE_BLOB
+        raw = value.bytes
+        native.data = (ctypes.c_uint8 * len(raw)).from_buffer_copy(raw)
+        keep_alive.append(native.data)
+        native.len = len(raw)
+        return native, keep_alive
+    if isinstance(value, datetime.datetime):
+        epoch = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+        aware = value.astimezone(datetime.timezone.utc) if value.tzinfo else value.replace(
+            tzinfo=datetime.timezone.utc
+        )
+        native.tag = DDB_VALUE_TIMESTAMP_MICROS
+        native.timestamp_micros = int((aware - epoch).total_seconds() * 1_000_000)
+        return native, keep_alive
+    if isinstance(value, datetime.time):
+        raw = value.isoformat().encode("utf-8")
+        native.tag = DDB_VALUE_TIME
+        native.data = (ctypes.c_uint8 * len(raw)).from_buffer_copy(raw)
+        keep_alive.append(native.data)
+        native.len = len(raw)
+        return native, keep_alive
+    if isinstance(value, datetime.date):
+        raw = value.isoformat().encode("utf-8")
+        native.tag = DDB_VALUE_DATE
+        native.data = (ctypes.c_uint8 * len(raw)).from_buffer_copy(raw)
+        keep_alive.append(native.data)
+        native.len = len(raw)
+        return native, keep_alive
+
+    raw = str(value).encode("utf-8")
+    native.tag = DDB_VALUE_TEXT
+    native.data = (ctypes.c_uint8 * len(raw)).from_buffer_copy(raw)
+    keep_alive.append(native.data)
+    native.len = len(raw)
+    return native, keep_alive
+
+
+def _prepare_queued_params(params):
+    if not params:
+        return [], []
+    values = [DdbValue() for _ in params]
+    keep_alive = []
+    for index, value in enumerate(params):
+        native, kept = _encode_queued_param(value)
+        values[index] = native
+        keep_alive.extend(kept)
+    return values, keep_alive
+
+
+def _build_open_options(
+    options="",
+    *,
+    write_queue_enabled=None,
+    write_queue_capacity=None,
+    write_queue_default_timeout_ms=None,
+    write_queue_group_commit=None,
+    write_queue_max_batch=None,
+    write_queue_max_group_delay_us=None,
+):
+    option_items = []
+    if options:
+        if isinstance(options, str):
+            stripped = options.strip()
+            if stripped:
+                option_items.append(stripped)
+        else:
+            option_items.append(str(options))
+    if write_queue_enabled is not None:
+        option_items.append(f"write_queue_enabled={str(bool(write_queue_enabled)).lower()}")
+    if write_queue_capacity is not None:
+        option_items.append(f"write_queue_capacity={int(write_queue_capacity)}")
+    if write_queue_default_timeout_ms is not None:
+        option_items.append(
+            f"write_queue_default_timeout_ms={int(write_queue_default_timeout_ms)}"
+        )
+    if write_queue_group_commit is not None:
+        option_items.append(f"write_queue_group_commit={str(write_queue_group_commit).lower()}")
+    if write_queue_max_batch is not None:
+        option_items.append(f"write_queue_max_batch={int(write_queue_max_batch)}")
+    if write_queue_max_group_delay_us is not None:
+        option_items.append(
+            f"write_queue_max_group_delay_us={int(write_queue_max_group_delay_us)}"
+        )
+    return " ".join(option_items)
 
 
 def _convert_params(sql, params):
@@ -2140,6 +2357,26 @@ class Cursor:
                 self.rowcount = affected_rowcount
         return self
 
+    def execute_queued(
+        self, operation, parameters=None, *, timeout_ms=DDB_WRITE_QUEUE_TIMEOUT_DEFAULT
+    ):
+        self._ensure_open()
+        self._has_buffered_row = False
+        self._buffered_row = None
+        self._prefetched_rows = None
+        self._query_active = False
+        self.description = None
+        self._col_count = 0
+
+        sql, params = self._resolve_sql_and_params(operation, parameters)
+        if _transaction_control_kind(sql) is not None:
+            raise ProgrammingError("cannot use execute_queued for transaction control SQL")
+
+        self.rowcount = self._connection._execute_queued(
+            sql, params, timeout_ms=timeout_ms
+        )
+        return self
+
     def executemany(self, operation, seq_of_parameters):
         self._ensure_open()
         iterator = iter(seq_of_parameters)
@@ -3274,26 +3511,108 @@ def engine_version():
 
 
 class Connection:
-    def __init__(self, path, *, stmt_cache_size=128, mode="open_or_create"):
+    def __init__(
+        self,
+        path,
+        *,
+        stmt_cache_size=128,
+        mode="open_or_create",
+        options="",
+        write_queue_enabled=None,
+        write_queue_capacity=None,
+        write_queue_default_timeout_ms=None,
+        write_queue_group_commit=None,
+        write_queue_max_batch=None,
+        write_queue_max_group_delay_us=None,
+    ):
         self._lib = load_library()
         self._db = ctypes.c_void_p()
         self._closed = False
         self._in_explicit_txn = False
         self.cursors = weakref.WeakSet()
+        self._watches = weakref.WeakSet()
         self._stmt_cache = collections.OrderedDict()
         self._stmt_cache_size = stmt_cache_size
         self._stats = collections.Counter()
 
         fs_path = os.fspath(path)
         raw_path = fs_path.encode("utf-8") if isinstance(fs_path, str) else fs_path
+        db_options = _build_open_options(
+            options,
+            write_queue_enabled=write_queue_enabled,
+            write_queue_capacity=write_queue_capacity,
+            write_queue_default_timeout_ms=write_queue_default_timeout_ms,
+            write_queue_group_commit=write_queue_group_commit,
+            write_queue_max_batch=write_queue_max_batch,
+            write_queue_max_group_delay_us=write_queue_max_group_delay_us,
+        )
+        using_options = bool(db_options)
+        option_bytes = (
+            ctypes.c_char_p(db_options.encode("utf-8")) if using_options else None
+        )
         if mode == "create":
-            code = self._lib.ddb_db_create(raw_path, ctypes.byref(self._db))
+            if using_options:
+                if hasattr(self._lib, "ddb_db_create_with_options"):
+                    code = self._lib.ddb_db_create_with_options(
+                        raw_path, option_bytes, ctypes.byref(self._db)
+                    )
+                else:
+                    code = self._lib.ddb_db_create(raw_path, ctypes.byref(self._db))
+            else:
+                code = self._lib.ddb_db_create(raw_path, ctypes.byref(self._db))
         elif mode == "open":
-            code = self._lib.ddb_db_open(raw_path, ctypes.byref(self._db))
+            if using_options:
+                if hasattr(self._lib, "ddb_db_open_with_options"):
+                    code = self._lib.ddb_db_open_with_options(
+                        raw_path, option_bytes, ctypes.byref(self._db)
+                    )
+                else:
+                    code = self._lib.ddb_db_open(raw_path, ctypes.byref(self._db))
+            else:
+                code = self._lib.ddb_db_open(raw_path, ctypes.byref(self._db))
         else:
-            code = self._lib.ddb_db_open_or_create(raw_path, ctypes.byref(self._db))
+            if using_options:
+                if hasattr(self._lib, "ddb_db_open_or_create_with_options"):
+                    code = self._lib.ddb_db_open_or_create_with_options(
+                        raw_path, option_bytes, ctypes.byref(self._db)
+                    )
+                else:
+                    code = self._lib.ddb_db_open_or_create(
+                        raw_path, ctypes.byref(self._db)
+                    )
+            else:
+                code = self._lib.ddb_db_open_or_create(raw_path, ctypes.byref(self._db))
         if code != ERR_OK:
             _raise_error(code)
+
+    def _execute_queued(self, sql, params, timeout_ms=DDB_WRITE_QUEUE_TIMEOUT_DEFAULT):
+        if not hasattr(self._lib, "ddb_db_execute_queued"):
+            raise NotSupportedError(
+                "ddb_db_execute_queued is not available in this native library"
+            )
+        values, keep_alive = _prepare_queued_params(params)
+        c_params = None
+        if values:
+            c_params = (DdbValue * len(values))(*values)
+        result = ctypes.c_void_p()
+        code = self._lib.ddb_db_execute_queued(
+            self._db,
+            sql.encode("utf-8"),
+            c_params,
+            len(values),
+            ctypes.c_uint64(timeout_ms),
+            ctypes.byref(result),
+        )
+        if code != ERR_OK:
+            _raise_error(code, sql=sql, params=params)
+        try:
+            affected = ctypes.c_uint64()
+            code = self._lib.ddb_result_affected_rows(result, ctypes.byref(affected))
+            if code != ERR_OK:
+                _raise_error(code, sql=sql, params=params)
+            return int(affected.value)
+        finally:
+            self._lib.ddb_result_free(ctypes.byref(result))
 
     def _ensure_open(self):
         if self._closed:
@@ -3338,6 +3657,8 @@ class Connection:
     def close(self):
         if self._closed:
             return
+        for watch in list(self._watches):
+            watch.close()
         for cursor in list(self.cursors):
             cursor.close()
         for stmt in list(self._stmt_cache.values()):
@@ -3420,6 +3741,103 @@ class Connection:
         cur = self.cursor()
         cur.execute(operation, parameters)
         return cur
+
+    def execute_queued(
+        self, operation, parameters=None, *, timeout_ms=DDB_WRITE_QUEUE_TIMEOUT_DEFAULT
+    ):
+        cur = self.cursor()
+        cur.execute_queued(operation, parameters, timeout_ms=timeout_ms)
+        return cur
+
+    def write_queue_metrics(self):
+        self._ensure_open()
+        if not hasattr(self._lib, "ddb_db_write_queue_metrics"):
+            raise NotSupportedError(
+                "ddb_db_write_queue_metrics is not available in this native library"
+            )
+        metrics = DdbWriteQueueMetrics()
+        code = self._lib.ddb_db_write_queue_metrics(self._db, ctypes.byref(metrics))
+        if code != ERR_OK:
+            _raise_error(code, sql="write_queue_metrics", params=None)
+        return {
+            "capacity": int(metrics.capacity),
+            "current_depth": int(metrics.current_depth),
+            "admitted": int(metrics.admitted),
+            "rejected": int(metrics.rejected),
+            "timed_out": int(metrics.timed_out),
+            "canceled": int(metrics.canceled),
+            "executed": int(metrics.executed),
+            "committed": int(metrics.committed),
+            "failed": int(metrics.failed),
+            "group_commit_batches": int(metrics.group_commit_batches),
+            "group_commit_syncs": int(metrics.group_commit_syncs),
+            "group_commit_max_batch": int(metrics.group_commit_max_batch),
+            "group_commit_commits_covered": int(metrics.group_commit_commits_covered),
+            "physical_syncs_saved": int(metrics.physical_syncs_saved),
+            "total_queue_wait_ns": int(metrics.total_queue_wait_ns),
+        }
+
+    def _create_watch(self, function_name, request):
+        self._ensure_open()
+        if not hasattr(self._lib, function_name):
+            raise NotSupportedError(f"{function_name} is not available in this native library")
+        out = ctypes.c_void_p()
+        payload = json.dumps(request, separators=(",", ":")).encode("utf-8")
+        code = getattr(self._lib, function_name)(self._db, payload, ctypes.byref(out))
+        if code != ERR_OK:
+            _raise_error(code)
+        watch = Watch(self._lib, out)
+        self._watches.add(watch)
+        return watch
+
+    def watch_table(self, tables, *, queue_capacity=None):
+        if isinstance(tables, str):
+            tables = [tables]
+        request = {"tables": list(tables)}
+        if queue_capacity is not None:
+            request["queue_capacity"] = int(queue_capacity)
+        return self._create_watch("ddb_db_watch_table_json", request)
+
+    def watch_range(
+        self,
+        table,
+        *,
+        lower=None,
+        upper=None,
+        lower_inclusive=True,
+        upper_inclusive=True,
+        queue_capacity=None,
+    ):
+        request = {
+            "table": table,
+            "lower_inclusive": bool(lower_inclusive),
+            "upper_inclusive": bool(upper_inclusive),
+        }
+        if lower is not None:
+            request["lower"] = lower
+        if upper is not None:
+            request["upper"] = upper
+        if queue_capacity is not None:
+            request["queue_capacity"] = int(queue_capacity)
+        return self._create_watch("ddb_db_watch_range_json", request)
+
+    def watch_query(self, sql, params=None, *, queue_capacity=None):
+        request = {"sql": sql}
+        if params is not None:
+            request["params"] = list(params)
+        if queue_capacity is not None:
+            request["queue_capacity"] = int(queue_capacity)
+        return self._create_watch("ddb_db_watch_query_json", request)
+
+    def change_stream(self, tables=None, *, queue_capacity=None):
+        request = {}
+        if tables is not None:
+            if isinstance(tables, str):
+                tables = [tables]
+            request["tables"] = list(tables)
+        if queue_capacity is not None:
+            request["queue_capacity"] = int(queue_capacity)
+        return self._create_watch("ddb_db_change_stream_json", request)
 
     def _call_json_api(self, func, *args):
         self._ensure_open()
@@ -3547,7 +3965,25 @@ class Connection:
 def connect(dsn, **kwargs):
     stmt_cache_size = kwargs.pop("stmt_cache_size", 128)
     mode = kwargs.pop("mode", "open_or_create")
-    return Connection(dsn, stmt_cache_size=stmt_cache_size, mode=mode)
+    options = kwargs.pop("options", "")
+    write_queue_enabled = kwargs.pop("write_queue_enabled", None)
+    write_queue_capacity = kwargs.pop("write_queue_capacity", None)
+    write_queue_default_timeout_ms = kwargs.pop("write_queue_default_timeout_ms", None)
+    write_queue_group_commit = kwargs.pop("write_queue_group_commit", None)
+    write_queue_max_batch = kwargs.pop("write_queue_max_batch", None)
+    write_queue_max_group_delay_us = kwargs.pop("write_queue_max_group_delay_us", None)
+    return Connection(
+        dsn,
+        stmt_cache_size=stmt_cache_size,
+        mode=mode,
+        options=options,
+        write_queue_enabled=write_queue_enabled,
+        write_queue_capacity=write_queue_capacity,
+        write_queue_default_timeout_ms=write_queue_default_timeout_ms,
+        write_queue_group_commit=write_queue_group_commit,
+        write_queue_max_batch=write_queue_max_batch,
+        write_queue_max_group_delay_us=write_queue_max_group_delay_us,
+    )
 
 
 def evict_shared_wal(path):

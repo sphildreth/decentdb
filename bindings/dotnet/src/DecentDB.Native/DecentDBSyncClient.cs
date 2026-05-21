@@ -286,6 +286,42 @@ public sealed class DecentDBSyncClient
         return Task.FromResult(Prune(through, dryRun, allowDataLoss));
     }
 
+    public JsonElement CreateChangeset(JsonElement options) =>
+        Execute<JsonElement>(new { op = "changeset_create", options });
+
+    public Task<JsonElement> CreateChangesetAsync(JsonElement options, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return Task.FromResult(CreateChangeset(options));
+    }
+
+    public JsonElement InspectChangeset(JsonElement changeset, JsonElement? options = null) =>
+        Execute<JsonElement>(new { op = "changeset_inspect", changeset, options });
+
+    public Task<JsonElement> InspectChangesetAsync(JsonElement changeset, JsonElement? options = null, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return Task.FromResult(InspectChangeset(changeset, options));
+    }
+
+    public JsonElement ApplyChangeset(JsonElement changeset, JsonElement? options = null) =>
+        Execute<JsonElement>(new { op = "changeset_apply", changeset, options });
+
+    public Task<JsonElement> ApplyChangesetAsync(JsonElement changeset, JsonElement? options = null, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return Task.FromResult(ApplyChangeset(changeset, options));
+    }
+
+    public JsonElement InvertChangeset(JsonElement changeset, JsonElement? options = null) =>
+        Execute<JsonElement>(new { op = "changeset_invert", changeset, options });
+
+    public Task<JsonElement> InvertChangesetAsync(JsonElement changeset, JsonElement? options = null, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return Task.FromResult(InvertChangeset(changeset, options));
+    }
+
     private T Execute<T>(object request)
     {
         var json = ExecuteRawJson(JsonSerializer.Serialize(request, SyncJson.Options));

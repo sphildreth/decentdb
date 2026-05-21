@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use crate::error::{DbError, Result};
+use crate::extensions::ExtensionTrustAnchor;
 use crate::storage::page;
 
 /// WAL sync policy used by the engine.
@@ -186,6 +187,81 @@ pub struct DbConfig {
     ///
     /// See ADR 0143 — engine-memory plan, open-time checkpoint heuristic.
     pub auto_checkpoint_on_open_mb: u32,
+
+    /// Advertises that high-level bindings may use the engine-owned write
+    /// queue for normal execution paths.
+    ///
+    /// The native Rust direct APIs remain direct unless callers explicitly use
+    /// the queued execution APIs. This preserves low-contention direct-path
+    /// behavior while letting bindings opt into a consistent queue contract.
+    ///
+    /// Default: `false`.
+    pub write_queue_enabled: bool,
+
+    /// Maximum number of admitted queued write requests waiting for execution.
+    /// Must be at least `1`; `Db::open` and `Db::create` clamp `0` to `1`.
+    ///
+    /// Default: `1024`.
+    pub write_queue_capacity: usize,
+
+    /// Default queued-write timeout in milliseconds. `0` means no default
+    /// timeout; callers can still pass an explicit per-call timeout.
+    ///
+    /// Default: `0`.
+    pub write_queue_default_timeout_ms: u64,
+
+    /// When `true`, queued commits under synchronous WAL modes may share one
+    /// physical WAL sync, and callers receive success only after the covering
+    /// sync completes.
+    ///
+    /// Default: `true`.
+    pub write_queue_strict_group_commit: bool,
+
+    /// Maximum number of ready queued requests drained by one queue executor
+    /// pass before yielding to waiters.
+    ///
+    /// Default: `64`.
+    pub write_queue_max_batch: usize,
+
+    /// Optional delay used to collect more ready queued writes before a strict
+    /// group-commit sync. The default `0` avoids sleeping on the single-writer
+    /// path and only batches work already ready in the queue.
+    ///
+    /// Default: `0`.
+    pub write_queue_max_group_delay_us: u64,
+
+    /// Default per-watch event queue capacity for reactive subscriptions.
+    ///
+    /// Default: `1024`.
+    pub reactive_watch_queue_capacity: usize,
+
+    /// Maximum per-watch event queue capacity accepted from callers.
+    ///
+    /// Default: `8192`.
+    pub reactive_watch_queue_max_capacity: usize,
+
+    /// Maximum row-level changes retained in one reactive commit event before
+    /// degrading to table-level invalidation. `0` disables row-change capture
+    /// limits.
+    ///
+    /// Default: `4096`.
+    pub reactive_max_row_changes_per_event: usize,
+
+    /// Connection-level allowlist for enabled Lua extension packages.
+    ///
+    /// Installed packages are inert until enabled in the database and allowed
+    /// by the connection. Each entry must match the extension name and exact
+    /// `sha256:...` package content hash.
+    ///
+    /// Default: empty, so no Lua extension code executes.
+    pub extension_trust_anchors: Vec<ExtensionTrustAnchor>,
+
+    /// Development-only override that allows unsigned extension installation
+    /// and execution without a name/hash allowlist.
+    ///
+    /// This is intentionally off by default. Production callers should prefer
+    /// exact `extension_trust_anchors`.
+    pub extension_unsigned_development_mode: bool,
 }
 
 impl DbConfig {
@@ -216,7 +292,7 @@ impl Default for DbConfig {
             wal_sync_mode: WalSyncMode::Full,
             checkpoint_timeout_sec: 30,
             trigram_postings_threshold: 100_000,
-            temp_dir: std::env::temp_dir(),
+            temp_dir: default_temp_dir(),
             wal_checkpoint_threshold_pages: 4096,
             wal_checkpoint_threshold_bytes: 64 * 1024 * 1024,
             release_freed_memory_after_checkpoint: cfg!(all(
@@ -231,8 +307,29 @@ impl Default for DbConfig {
             paged_row_storage: true,
             retain_paged_row_sources_after_commit: false,
             auto_checkpoint_on_open_mb: 16,
+            write_queue_enabled: false,
+            write_queue_capacity: 1024,
+            write_queue_default_timeout_ms: 0,
+            write_queue_strict_group_commit: true,
+            write_queue_max_batch: 64,
+            write_queue_max_group_delay_us: 0,
+            reactive_watch_queue_capacity: 1024,
+            reactive_watch_queue_max_capacity: 8192,
+            reactive_max_row_changes_per_event: 4096,
+            extension_trust_anchors: Vec::new(),
+            extension_unsigned_development_mode: false,
         }
     }
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+fn default_temp_dir() -> PathBuf {
+    PathBuf::from("/tmp")
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+fn default_temp_dir() -> PathBuf {
+    std::env::temp_dir()
 }
 
 #[cfg(test)]
@@ -259,6 +356,17 @@ mod tests {
         assert!(!config.persistent_pk_index);
         assert!(config.paged_row_storage);
         assert!(!config.retain_paged_row_sources_after_commit);
+        assert!(!config.write_queue_enabled);
+        assert_eq!(config.write_queue_capacity, 1024);
+        assert_eq!(config.write_queue_default_timeout_ms, 0);
+        assert!(config.write_queue_strict_group_commit);
+        assert_eq!(config.write_queue_max_batch, 64);
+        assert_eq!(config.write_queue_max_group_delay_us, 0);
+        assert_eq!(config.reactive_watch_queue_capacity, 1024);
+        assert_eq!(config.reactive_watch_queue_max_capacity, 8192);
+        assert_eq!(config.reactive_max_row_changes_per_event, 4096);
+        assert!(config.extension_trust_anchors.is_empty());
+        assert!(!config.extension_unsigned_development_mode);
         // Default depends on platform; just assert the field is reachable.
         let _ = config.release_freed_memory_after_checkpoint;
     }

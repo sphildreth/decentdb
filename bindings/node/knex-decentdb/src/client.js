@@ -41,7 +41,20 @@ class Client_DecentDB extends (Client ?? class {}) {
       throw new Error('DecentDB connection requires { filename }');
     }
     const options = conn.options || null;
-    const db = new Database({ path: filename, options });
+    const db = new Database({
+      path: filename,
+      options,
+      writeQueueEnabled: conn.writeQueueEnabled,
+      writeQueueCapacity: conn.writeQueueCapacity,
+      writeQueueDefaultTimeoutMs: conn.writeQueueDefaultTimeoutMs,
+      writeQueueStrictGroupCommit: conn.writeQueueStrictGroupCommit,
+      writeQueueMaxBatch: conn.writeQueueMaxBatch,
+      writeQueueMaxGroupDelayUs: conn.writeQueueMaxGroupDelayUs,
+    });
+    db.__decentUseWriteQueue =
+      conn.writeQueueEnabled === true ||
+      (typeof options === 'string' && /(?:^|[;,&\s])write_queue_enabled\s*=\s*true(?:$|[;,&\s])/i.test(options));
+    db.__decentWriteQueueTimeoutMs = conn.writeQueueDefaultTimeoutMs ?? null;
     db.__decentStmtCache = new Map();
     return db;
   }
@@ -91,6 +104,19 @@ class Client_DecentDB extends (Client ?? class {}) {
       if (maybeFast) {
         return maybeFast;
       }
+    }
+
+    if (
+      connection.__decentUseWriteQueue &&
+      bindings.length === 0 &&
+      !isReadStatement(sql) &&
+      typeof connection.execQueued === 'function'
+    ) {
+      const response = connection.execQueued(sql, {
+        timeoutMs: connection.__decentWriteQueueTimeoutMs ?? undefined,
+      });
+      obj.response = { rows: [], rowCount: response.rowsAffected };
+      return obj;
     }
 
     let stmt;
@@ -262,6 +288,12 @@ function extractThreeColumnInsertPrefix(sql) {
   );
   if (!match) return null;
   return match[1];
+}
+
+function isReadStatement(sql) {
+  if (typeof sql !== 'string') return false;
+  const first = sql.trimStart().split(/\s+/, 1)[0]?.toUpperCase();
+  return first === 'SELECT' || first === 'WITH' || first === 'EXPLAIN' || first === 'PRAGMA';
 }
 
 function executeI64TextF64BatchInsert(connection, obj, insertPrefix, bindings) {

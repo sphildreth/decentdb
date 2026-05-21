@@ -8,6 +8,8 @@
 #[cfg(feature = "bench-internals")]
 pub mod benchmark;
 mod branch;
+#[cfg(any(all(target_arch = "wasm32", target_os = "unknown"), test))]
+mod browser_result;
 mod btree;
 mod c_api;
 mod catalog;
@@ -16,11 +18,13 @@ mod db;
 mod doctor;
 mod error;
 mod exec;
+mod extensions;
 mod json;
 #[cfg(test)]
 mod json_tests;
 mod metadata;
 mod planner;
+mod reactive;
 mod record;
 mod search;
 pub(crate) mod spatial;
@@ -30,6 +34,9 @@ mod sync;
 mod tooling;
 mod vfs;
 mod wal;
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+mod wasm;
+mod write_queue;
 
 pub use crate::branch::{
     BranchDiffReport, BranchInfo, BranchLogEntry, BranchMergeChange, BranchMergeConflict,
@@ -47,6 +54,14 @@ pub use crate::doctor::{
 };
 pub use crate::error::{DbError, DbErrorCode, Result};
 pub use crate::exec::{BulkLoadOptions, QueryResult, QueryRow};
+pub use crate::extensions::{
+    validate_extension_package, Ed25519SignatureVerifier, ExtensionDependencyRecord,
+    ExtensionFunctionManifest, ExtensionManager, ExtensionManifest, ExtensionNullHandling,
+    ExtensionPackageDependency, ExtensionPackageFile, ExtensionPermissions, ExtensionRuntimeLimits,
+    ExtensionSignature, ExtensionSignatureVerifier, ExtensionSqlType, ExtensionTrustAnchor,
+    ExtensionValidationOptions, ExtensionValidationReport, InstalledExtensionPackage,
+    SUPPORTED_EXTENSION_API_VERSION,
+};
 pub use crate::metadata::{
     CheckConstraintInfo, ColumnInfo, ForeignKeyInfo, HeaderInfo, IndexInfo, IndexVerification,
     QueryContract, QueryParameterInfo, QueryResultColumnInfo, SchemaColumnInfo, SchemaIndexInfo,
@@ -54,15 +69,31 @@ pub use crate::metadata::{
     ToolingCapabilities, ToolingColumnTypeMetadata, ToolingMetadata, ToolingSpatialTypeInfo,
     ToolingTypeInfo, TriggerInfo, ViewInfo,
 };
+pub use crate::reactive::{
+    ChangeSource, ChangeStreamEvent, ChangeStreamOptions, InitialWatchEvent, InvalidationEvent,
+    LaggedWatchEvent, QueryWatchOptions, RangeWatchOptions, ReactiveMetricsSnapshot,
+    ReactiveSubscriptionSnapshot, RowChange, RowChangeDetail, RowOperation, TableChange,
+    TableWatchOptions, WatchEvent, WatchHandle, WatchKind,
+};
 pub use crate::record::value::Value;
 pub use crate::storage::DB_FORMAT_VERSION;
 pub use crate::sync::{
-    SyncChangeBatch, SyncConflict, SyncConflictPolicy, SyncConflictPolicyConfig,
-    SyncDoctorSeverity, SyncHandshake, SyncImportSummary, SyncJournalIntegrityReport,
-    SyncJournalIssue, SyncJournalRecord, SyncOperationalDoctorReport, SyncPeer, SyncPeerLag,
-    SyncPeerScopeBinding, SyncPruneSummary, SyncRetentionReport, SyncRunDirection, SyncRunSummary,
-    SyncScope, SyncSession, SyncStatus,
+    ApplyChangesetOptions, CreateChangesetOptions, CreateShapeOptions, InspectChangesetOptions,
+    InvertChangesetOptions, ShapeAckOptions, SyncChangeBatch, SyncChangeset,
+    SyncChangesetApplyResult, SyncChangesetCapabilities, SyncChangesetCheckpoint,
+    SyncChangesetCompatibility, SyncChangesetHistory, SyncChangesetInspection, SyncChangesetLimits,
+    SyncChangesetRecord, SyncChangesetSource, SyncChangesetSourceKind, SyncCompatibilityMode,
+    SyncConflict, SyncConflictPolicy, SyncConflictPolicyConfig, SyncDoctorSeverity, SyncHandshake,
+    SyncImportSummary, SyncJournalIntegrityReport, SyncJournalIssue, SyncJournalRecord,
+    SyncOperationalDoctorReport, SyncPeer, SyncPeerLag, SyncPeerScopeBinding, SyncPrincipal,
+    SyncPruneSummary, SyncRelayHello, SyncRelaySession, SyncRelayStatus, SyncRetentionReport,
+    SyncRunDirection, SyncRunSummary, SyncScope, SyncSession, SyncShape, SyncShapeCheckpoint,
+    SyncShapeClient, SyncShapeDelivery, SyncStatus, SyncSubjectKind, SYNC_CHANGESET_VERSION,
+    SYNC_CONTRACT_VERSION, SYNC_RELAY_PROTOCOL_VERSION, SYNC_SHAPE_STREAM_VERSION,
 };
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+pub use crate::wasm::WebDb;
+pub use crate::write_queue::{QueuedWriteOptions, WriteQueueMetricsSnapshot};
 
 /// Returns the DecentDB crate version.
 #[must_use]

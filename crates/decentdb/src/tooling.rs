@@ -719,6 +719,9 @@ fn infer_params_from_expr(
             let cast_type = DescribedType::scalar(*target_type, true);
             infer_params_from_expr(expr, scope, params, diagnostics, Some(&cast_type));
         }
+        Expr::Collate { expr, .. } => {
+            infer_params_from_expr(expr, scope, params, diagnostics, expected)
+        }
         Expr::Unary { expr, .. } => {
             infer_params_from_expr(expr, scope, params, diagnostics, expected)
         }
@@ -875,6 +878,7 @@ fn infer_expr_type(
         Expr::Column { table, column } => scope.resolve(table.as_deref(), column),
         Expr::Parameter(_) => None,
         Expr::Cast { target_type, .. } => Some(DescribedType::scalar(*target_type, true)),
+        Expr::Collate { expr, .. } => infer_expr_type(expr, scope, diagnostics),
         Expr::Unary { op, expr } => match op {
             crate::sql::ast::UnaryOp::Not => Some(DescribedType::scalar(ColumnType::Bool, false)),
             crate::sql::ast::UnaryOp::Negate => infer_expr_type(expr, scope, diagnostics),
@@ -1398,7 +1402,9 @@ fn collect_params_in_expr(expr: &Expr, params: &mut ParameterAccumulator) {
     match expr {
         Expr::Parameter(position) => params.observe(*position, None),
         Expr::Literal(_) | Expr::Column { .. } | Expr::RowNumber { .. } => {}
-        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } => collect_params_in_expr(expr, params),
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::Collate { expr, .. } => {
+            collect_params_in_expr(expr, params)
+        }
         Expr::Binary { left, right, .. } => {
             collect_params_in_expr(left, params);
             collect_params_in_expr(right, params);

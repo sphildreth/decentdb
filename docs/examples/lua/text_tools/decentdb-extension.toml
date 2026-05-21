@@ -1,0 +1,60 @@
+name = "text_tools"
+version = "1.0.0"
+language = "lua"
+api_version = 1
+entry = "main.lua"
+strict_types = true
+
+[permissions]
+filesystem = false
+network = false
+process = false
+database_read = false
+database_write = false
+native_modules = false
+clock = false
+random = false
+
+[runtime]
+max_steps = 100000
+max_memory_bytes = 1048576
+max_string_bytes = 1048576
+max_blob_bytes = 1048576
+max_rows = 10000
+max_row_bytes = 65536
+max_aggregate_state_bytes = 1048576
+max_collation_steps = 10000
+
+[[functions]]
+name = "slugify"
+export = "slugify"
+kind = "scalar"
+args = ["TEXT"]
+returns = "TEXT"
+deterministic = true
+null_handling = "returns_null"
+
+[[functions]]
+name = "split_words"
+export = "split_words"
+kind = "table"
+args = ["TEXT"]
+
+[[functions.columns]]
+name = "word"
+type = "TEXT"
+
+[[functions]]
+name = "lua_sum"
+kind = "aggregate"
+args = ["INT64"]
+returns = "INT64"
+step = "lua_sum_step"
+finalize = "lua_sum_final"
+null_handling = "called_on_null"
+
+[[functions]]
+name = "reverse_text"
+export = "reverse_text"
+kind = "collation"
+deterministic = true

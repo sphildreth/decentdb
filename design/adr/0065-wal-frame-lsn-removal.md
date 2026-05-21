@@ -19,5 +19,4 @@ Remove the per-frame LSN field from WAL frame trailers in format v6. LSNs are no
 - This is a format change and requires a format version bump (v6).
 
 ### References
-- `design/SQLITE_PERF_GAP_PLAN.md` (Section 1: WAL Frame Format Overhead)
 - `design/SPEC.md` §4.1 (WAL frame format)

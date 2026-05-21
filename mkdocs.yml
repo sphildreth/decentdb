@@ -21,6 +21,8 @@ nav:
     - Branching, Diff, Restore, And Time Travel: user-guide/branching.md
     - Migrations: user-guide/migration.md
     - Transactions: user-guide/transactions.md
+    - Write Concurrency: user-guide/write-concurrency.md
+    - Lua Extensions: user-guide/lua-extensions.md
     - Local-first sync:
       - Overview: user-guide/sync/index.md
       - Quickstart: user-guide/sync/quickstart.md
@@ -60,6 +62,7 @@ nav:
       - JDBC Driver (Java): api/jdbc.md      
       - Node.js: api/node.md
       - Python: api/python.md
+      - WASM / Browser: api/wasm.md
   - Architecture:
     - Overview: architecture/overview.md
     - Storage Engine: architecture/storage.md

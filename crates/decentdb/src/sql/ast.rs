@@ -1,4 +1,5 @@
 //! Strongly typed internal AST for the supported DecentDB 1.0 SQL subset.
+#![cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
 
 use crate::catalog::{ColumnType, EnumTypeInfo, SpatialTypeInfo};
 use crate::record::value::{
@@ -172,6 +173,15 @@ pub(crate) enum JoinConstraint {
 pub(crate) struct OrderBy {
     pub(crate) expr: Expr,
     pub(crate) descending: bool,
+    pub(crate) collation: Option<Collation>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum Collation {
+    Binary,
+    NoCase,
+    RTrim,
+    Extension(String),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -251,6 +261,10 @@ pub(crate) enum Expr {
     Function {
         name: String,
         args: Vec<Expr>,
+    },
+    Collate {
+        expr: Box<Expr>,
+        collation: Collation,
     },
     Aggregate {
         name: String,
@@ -793,10 +807,27 @@ impl JoinConstraint {
 impl OrderBy {
     #[must_use]
     pub(crate) fn to_sql(&self) -> String {
+        let mut sql = self.expr.to_sql();
+        if let Some(collation) = &self.collation {
+            sql.push_str(" COLLATE ");
+            sql.push_str(&collation.to_sql());
+        }
         if self.descending {
-            format!("{} DESC", self.expr.to_sql())
+            format!("{sql} DESC")
         } else {
-            self.expr.to_sql()
+            sql
+        }
+    }
+}
+
+impl Collation {
+    #[must_use]
+    pub(crate) fn to_sql(&self) -> String {
+        match self {
+            Self::Binary => "BINARY".to_string(),
+            Self::NoCase => "NOCASE".to_string(),
+            Self::RTrim => "RTRIM".to_string(),
+            Self::Extension(name) => name.clone(),
         }
     }
 }
@@ -1002,6 +1033,9 @@ impl Expr {
                 name,
                 args.iter().map(Expr::to_sql).collect::<Vec<_>>().join(", ")
             ),
+            Self::Collate { expr, collation } => {
+                format!("{} COLLATE {}", expr.to_sql(), collation.to_sql())
+            }
             Self::Aggregate {
                 name,
                 args,
@@ -1535,6 +1569,7 @@ fn is_safe_expr(
                     .all(|i| is_safe_expr(i, tables, available_ctes, local_ctes))
         }
         Expr::IsNull { expr, .. } => is_safe_expr(expr, tables, available_ctes, local_ctes),
+        Expr::Collate { expr, .. } => is_safe_expr(expr, tables, available_ctes, local_ctes),
         Expr::Case {
             operand,
             branches,

@@ -14,7 +14,7 @@ This document helps developers decide between **DecentDB** and **SQLite** for em
 | **Concurrency model** | One writer, many concurrent reader threads (single process) | One writer, many readers (process-safe, file-locking) |
 | **Default durability** | WAL + fsync-on-commit, always | WAL or rollback journal, configurable via PRAGMA |
 | **Crash safety testing** | Built-in fault-injection hooks (FaultyVFS, WAL failpoints) | Relies on external testing |
-| **Extension ecosystem** | None (extend via core contribution) | Rich (loadable extensions, virtual tables, FTS5, JSON1, etc.) |
+| **Extension ecosystem** | Sandboxed Lua packages; no arbitrary native `.load` | Rich (loadable extensions, virtual tables, FTS5, JSON1, etc.) |
 | **SQL breadth** | Deliberate Postgres-like subset | Very broad, plus extensions |
 | **Bindings** | C ABI, Rust, Python, .NET, Go, Java, Node.js, Dart | Ubiquitous (every language has mature SQLite bindings) |
 | **File format stability** | Stable from 2.0.0 | Decades-stable, specification published |
@@ -179,9 +179,11 @@ SELECT department, STRING_AGG(name, ', ' ORDER BY name) FROM employees GROUP BY 
 
 SQLite is one of the most tested pieces of software ever written. Its file format has been stable for over 20 years. If you need to write a `.sqlite` file today and read it in 2040, SQLite is the safe bet. DecentDB is pre-1.0 with an evolving on-disk format.
 
-### 2. You need broad SQL coverage or extensions
+### 2. You need broad SQL coverage or arbitrary native extensions
 
-SQLite's SQL surface is far wider than DecentDB's, and its extension ecosystem (FTS5, R-Tree, JSON1, virtual tables, custom functions via C) is unmatched in the embedded space.
+SQLite's SQL surface is far wider than DecentDB's, and its extension ecosystem
+(FTS5, R-Tree, JSON1, virtual tables, custom functions via C) is unmatched in
+the embedded space.
 
 ```sql
 -- SQLite: FTS5 full-text search (no equivalent in DecentDB)
@@ -193,7 +195,10 @@ SELECT * FROM docs WHERE docs MATCH 'database';
 .load ./my_extension
 ```
 
-DecentDB has no extension/plugin mechanism. If you need a SQL feature DecentDB doesn't have, you contribute to the core or work around it in application code.
+DecentDB supports sandboxed Lua extension packages for scalar functions,
+table-valued functions, aggregates, and query-time collations. It does not
+support arbitrary native extensions, SQLite virtual-table modules, or
+SQLite-compatible `.load`.
 
 ### 3. You need cross-process access
 
@@ -340,7 +345,7 @@ FROM employees;
 | Need Postgres-like SQL to reduce dialect drift | **DecentDB** |
 | Need crash-injection testing hooks | **DecentDB** |
 | Decades-stable file format, maximum compatibility | **SQLite** |
-| Need loadable extensions, FTS5, R-Tree, virtual tables | **SQLite** |
+| Need arbitrary native loadable extensions, FTS5, R-Tree, virtual tables | **SQLite** |
 | Multiple processes sharing one database file | **SQLite** |
 | Embedded on exotic platforms (microcontrollers, etc.) | **SQLite** |
 | Need extensive `PRAGMA` runtime tuning | **SQLite** |

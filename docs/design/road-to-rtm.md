@@ -6,6 +6,5 @@ For now, see:
 
 - `design/PRD.md`
 - `design/SPEC.md`
-- `design/SQLITE_PERF_GAP_PLAN.md`
 - `design/TESTING_STRATEGY.md`
-
+- `docs/user-guide/benchmarks.md`

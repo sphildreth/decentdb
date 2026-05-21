@@ -18,21 +18,24 @@ The driver accepts URLs of the form:
 jdbc:decentdb:/absolute/path/to/db.ddb
 jdbc:decentdb:/absolute/path/to/db.ddb?mode=open
 jdbc:decentdb:/absolute/path/to/db.ddb?readOnly=true
+jdbc:decentdb:/absolute/path/to/db.ddb?write_queue_enabled=true&write_queue_capacity=128
 ```
 
 Supported connection properties:
 
 - `mode` — `openOrCreate` (default), `open`, or `create`
 - `readOnly` — `true` or `false` (default `false`)
+- `write_queue_enabled`, `write_queue_capacity`,
+  `write_queue_default_timeout_ms`, `write_queue_strict_group_commit`,
+  `write_queue_max_batch`, and `write_queue_max_group_delay_us` are passed
+  through to the native open options.
 
-Currently unsupported at open time:
-
-- `busyTimeoutMs`
-- `cachePages`
-
-The stable C ABI currently exposes only default `create`, `open`, and
-`open_or_create` entry points. The Java driver therefore rejects
-`busyTimeoutMs` and `cachePages` instead of silently pretending they work.
+The JNI bridge maps the stable write-queue status codes distinctly:
+`DDB_ERR_BUSY`, `DDB_ERR_TIMEOUT`, `DDB_ERR_CANCELED`,
+`DDB_ERR_QUEUE_FULL`, and `DDB_ERR_QUEUE_CLOSED`. The raw Java FFM smoke test
+also validates the new queued C ABI entry points. JDBC prepared statements stay
+on the direct prepared path until the C ABI adds queued prepared-statement
+execution.
 
 ## Build locally
 

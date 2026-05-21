@@ -39,6 +39,13 @@ decentdb repl --db ./app.ddb --format markdown
 
 `table` is the default because the REPL is primarily meant for humans.
 
+When the shell starts it prints the DecentDB CLI version, the DecentDB banner,
+and:
+
+```text
+Type "help" for help.
+```
+
 Open a branch-scoped REPL with `--branch`:
 
 ```bash
@@ -67,27 +74,58 @@ FROM users
 ORDER BY id;
 ```
 
-Exit the session with `.exit`, `.quit`, or end-of-file.
+Exit the session with `.exit`, `.quit`, `\q`, or end-of-file.
 
 ```text
 decentdb> .exit
 ```
 
-## Special Commands
+## Help And Special Commands
 
-The REPL currently supports a small command set:
+Help is available through `help`, `\?`, `/?`, `/help`, `\help`, and `.help`.
+Use topic-specific help for focused command groups:
+
+```text
+help schema
+help output
+help files
+help parameters
+help branches
+help explain
+```
+
+The REPL supports these dot commands:
 
 | Command | Meaning |
 |---|---|
+| `.tables`, `.dt` | List tables and row counts. |
+| `.d <table>` | Show columns, types, and constraints. |
+| `.schema [object]` | Show DDL for all schema objects or one object. |
+| `.indexes [table]` | List indexes, optionally for one table. |
+| `.views` | List views. |
+| `.df`, `.functions` | List built-in functions. |
+| `.g` | Run the last completed SQL command again. |
+| `.s`, `.history` | Show commands entered in this session. |
+| `.mode <mode>` | Set `table`, `csv`, `json`, or `markdown` output. |
+| `.headers on\|off` | Show or hide headers in table, CSV, and Markdown output. |
+| `.nullvalue <text>` | Set rendered NULL text for text outputs. |
+| `.width [n ...\|auto]` | Set table column widths or return to automatic widths. |
+| `.timer on\|off` | Show elapsed time after SQL execution. |
+| `.read <file>` | Run SQL and dot commands from a file. |
+| `.output <file\|stdout>` | Redirect subsequent command output. |
+| `.once <file>` | Redirect the next command output only. |
+| `.import <csv-file> <table> [batch-size]` | Bulk-load CSV rows into a table. |
+| `.export <table> <file> [csv\|json]` | Export a table to CSV or JSON. |
+| `.explain <sql>`, `.plan <sql>` | Run `EXPLAIN`. |
+| `.explain-analyze <sql>` | Run `EXPLAIN ANALYZE`. |
+| `.param list` | Show positional parameter values. |
+| `.param set <index> <type:value>` | Set a `$1`-style positional parameter. |
+| `.param unset <index>` | Reset a parameter to NULL. |
+| `.param clear` | Clear all parameters. |
 | `.branch` | Print the active branch name. |
-| `.checkout <branch>` | Switch the current REPL session to another branch. |
-| `.help` | Print the available REPL commands. |
-| `.exit` | Exit the REPL. |
-| `.quit` | Exit the REPL. |
-
-Other administrative operations, such as `sync`, `doctor`, `import`, `export`,
-`describe`, and `list-tables`, are CLI commands. Run those in your shell rather
-than inside the REPL.
+| `.branch <branch>` | Create a branch from the current branch and check it out. |
+| `.checkout <branch>` | Switch to another branch or `main`. |
+| `.quit`, `.exit`, `\q` | Exit the REPL. |
 
 ## Statement Completion
 
@@ -206,6 +244,92 @@ printf "SELECT 1 AS n;\n.exit\n" | decentdb repl --db ./app.ddb --format json
 `--format csv` and `--format markdown` are useful for copying result sets into
 other tools or documentation.
 
+You can also change output while the REPL is running:
+
+```text
+.mode csv
+.headers off
+.nullvalue (null)
+.timer on
+```
+
+Use `.output` to redirect subsequent output and `.once` to redirect only the
+next output:
+
+```text
+.output report.csv
+SELECT * FROM users;
+.output stdout
+
+.once one-query.md
+.mode markdown
+SELECT id, name FROM users;
+```
+
+## Schema Inspection
+
+Use `.tables` or `.dt` to list tables, `.d <table>` to inspect a table, and
+`.schema` to print canonical schema DDL.
+
+```text
+.tables
+.d users
+.schema users
+.indexes users
+.views
+```
+
+## Files, Import, And Export
+
+`.read <file>` executes SQL and REPL dot commands from a file. If the file ends
+with an incomplete SQL statement, the REPL reports the incomplete statement and
+returns to the prompt without poisoning the next interactive command.
+
+```text
+.read ./setup.sql
+```
+
+CSV import uses the same bulk-load path as the CLI `import` command:
+
+```text
+.import ./users.csv users
+.import ./large-users.csv users 50000
+```
+
+Export table rows to CSV or JSON:
+
+```text
+.export users ./users.csv csv
+.export users ./users.json json
+```
+
+## Parameters
+
+Use `$1`, `$2`, and later positional parameters in SQL, then set values with
+`.param`:
+
+```text
+.param set 1 int:42
+.param set 2 text:Alice
+SELECT * FROM users WHERE id = $1 OR name = $2;
+.param list
+.param clear
+```
+
+Supported parameter values are `null`, `int:value`, `float:value`,
+`bool:value`, `text:value`, `timestamp:value`, and `blob:hex`.
+
+## Explain Helpers
+
+Use `.explain`, `.plan`, and `.explain-analyze` for interactive planning:
+
+```text
+.explain SELECT * FROM users WHERE id = 1;
+.explain-analyze SELECT * FROM users;
+```
+
+When no SQL is supplied, the explain helper uses the last completed SQL command.
+
 ## History
 
 The REPL stores command history in:
@@ -216,17 +340,6 @@ The REPL stores command history in:
 
 History loading and saving are best-effort. If the history file does not exist
 or cannot be written, the REPL still runs.
-
-## Current Limits
-
-- The REPL is a SQL shell, not a full administrative shell.
-- It does not currently support `.tables`, `.schema`, `.read`, `.mode`, or
-  other SQLite-style meta commands.
-- It does not provide per-statement parameter binding like `decentdb exec
-  --params`; write literal SQL values or use an application binding when you
-  need bound parameters.
-- The local HTTP sync transport is managed through `decentdb sync ...` commands
-  outside the REPL.
 
 ## Related Pages
 

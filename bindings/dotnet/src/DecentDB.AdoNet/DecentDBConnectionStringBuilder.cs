@@ -18,6 +18,12 @@ public sealed class DecentDBConnectionStringBuilder : DbConnectionStringBuilder
     private const string PagedRowStorageKey = "Paged Row Storage";
     private const string PersistentPkIndexKey = "Persistent PK Index";
     private const string WalAutoCheckpointKey = "WAL Auto Checkpoint";
+    private const string WriteQueueEnabledKey = "Write Queue Enabled";
+    private const string WriteQueueCapacityKey = "Write Queue Capacity";
+    private const string WriteQueueDefaultTimeoutMsKey = "Write Queue Default Timeout Ms";
+    private const string WriteQueueStrictGroupCommitKey = "Write Queue Strict Group Commit";
+    private const string WriteQueueMaxBatchKey = "Write Queue Max Batch";
+    private const string WriteQueueMaxGroupDelayUsKey = "Write Queue Max Group Delay Us";
 
     public DecentDBConnectionStringBuilder()
     {
@@ -89,6 +95,60 @@ public sealed class DecentDBConnectionStringBuilder : DbConnectionStringBuilder
             if (value == null) Remove(WalAutoCheckpointKey);
             else this[WalAutoCheckpointKey] = value;
         }
+    }
+
+    /// <summary>
+    /// Enables engine-owned queued writes for connection-level write execution. Optional.
+    /// </summary>
+    public bool? WriteQueueEnabled
+    {
+        get => GetNullableBool(WriteQueueEnabledKey);
+        set => SetNullableBool(WriteQueueEnabledKey, value);
+    }
+
+    /// <summary>
+    /// Maximum admitted queued writes waiting for execution. Optional.
+    /// </summary>
+    public int? WriteQueueCapacity
+    {
+        get => GetNullableInt(WriteQueueCapacityKey);
+        set => SetNullableInt(WriteQueueCapacityKey, value);
+    }
+
+    /// <summary>
+    /// Default queued-write timeout in milliseconds. Optional; 0 means no default timeout.
+    /// </summary>
+    public int? WriteQueueDefaultTimeoutMs
+    {
+        get => GetNullableInt(WriteQueueDefaultTimeoutMsKey);
+        set => SetNullableInt(WriteQueueDefaultTimeoutMsKey, value);
+    }
+
+    /// <summary>
+    /// Enables strict durable group commit for queued writes. Optional.
+    /// </summary>
+    public bool? WriteQueueStrictGroupCommit
+    {
+        get => GetNullableBool(WriteQueueStrictGroupCommitKey);
+        set => SetNullableBool(WriteQueueStrictGroupCommitKey, value);
+    }
+
+    /// <summary>
+    /// Maximum ready queued requests drained in one executor pass. Optional.
+    /// </summary>
+    public int? WriteQueueMaxBatch
+    {
+        get => GetNullableInt(WriteQueueMaxBatchKey);
+        set => SetNullableInt(WriteQueueMaxBatchKey, value);
+    }
+
+    /// <summary>
+    /// Optional group-commit collection delay in microseconds. Optional.
+    /// </summary>
+    public int? WriteQueueMaxGroupDelayUs
+    {
+        get => GetNullableInt(WriteQueueMaxGroupDelayUsKey);
+        set => SetNullableInt(WriteQueueMaxGroupDelayUsKey, value);
     }
 
     /// <summary>
@@ -167,5 +227,27 @@ public sealed class DecentDBConnectionStringBuilder : DbConnectionStringBuilder
         }
 
         this[key] = value.Value ? "True" : "False";
+    }
+
+    private int? GetNullableInt(string key)
+    {
+        if (!TryGetValue(key, out var v) || v is not string s)
+        {
+            return null;
+        }
+
+        return int.TryParse(s, out var i) ? i : null;
+    }
+
+    private void SetNullableInt(string key, int? value)
+    {
+        if (value == null)
+        {
+            Remove(key);
+            return;
+        }
+
+        if (value.Value < 0) throw new ArgumentOutOfRangeException(nameof(value));
+        this[key] = value.Value.ToString();
     }
 }

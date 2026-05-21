@@ -1,0 +1,62 @@
+name: Web WASM Nightly
+
+on:
+  schedule:
+    # Run after the main nightly memory-safety workflow.
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+
+jobs:
+  browser-opfs:
+    runs-on: ubuntu-latest
+    env:
+      CI: "true"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: bindings/web/package-lock.json
+
+      - name: Install wasm-bindgen CLI
+        run: cargo install wasm-bindgen-cli --version 0.2.114 --locked
+
+      - name: Install web package dependencies
+        working-directory: bindings/web
+        run: npm ci
+
+      - name: Build web package
+        working-directory: bindings/web
+        run: npm run build
+
+      - name: Build wasm package artifact
+        run: |
+          cargo build -p decentdb --target wasm32-unknown-unknown --release
+          wasm-bindgen target/wasm32-unknown-unknown/release/decentdb.wasm \
+            --target web \
+            --out-dir bindings/web/dist \
+            --out-name decentdb_wasm
+
+      - name: Install browser
+        working-directory: bindings/web
+        run: npm run browser:install:ci
+
+      - name: Browser OPFS smoke
+        working-directory: bindings/web
+        run: npm run browser:smoke:ci
+
+      - name: Browser transport benchmark
+        working-directory: bindings/web
+        run: npm run browser:bench

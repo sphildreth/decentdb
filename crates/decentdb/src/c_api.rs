@@ -5,13 +5,18 @@ use std::ffi::{c_char, CStr, CString};
 use std::panic::{self, AssertUnwindSafe};
 use std::ptr;
 use std::str::FromStr;
+use std::time::Duration;
 
 use crate::db::PreparedStatement;
 use crate::error::{DbError, DbErrorCode, Result};
-use crate::{evict_shared_wal, Db, DbConfig, QueryResult, Value};
+use crate::{
+    evict_shared_wal, ChangeStreamOptions, Db, DbConfig, QueryResult, QueryWatchOptions,
+    QueuedWriteOptions, RangeWatchOptions, TableWatchOptions, Value,
+};
 
 const DDB_OK: u32 = 0;
-const DDB_ABI_VERSION: u32 = 2;
+const DDB_ABI_VERSION: u32 = 4;
+const DDB_WRITE_QUEUE_TIMEOUT_DEFAULT: u64 = u64::MAX;
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -64,6 +69,26 @@ pub struct DdbValue {
     pub interval_months: i32,
     pub interval_days: i32,
     pub interval_micros: i64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DdbWriteQueueMetrics {
+    pub capacity: usize,
+    pub current_depth: usize,
+    pub admitted: u64,
+    pub rejected: u64,
+    pub timed_out: u64,
+    pub canceled: u64,
+    pub executed: u64,
+    pub committed: u64,
+    pub failed: u64,
+    pub group_commit_batches: u64,
+    pub group_commit_syncs: u64,
+    pub group_commit_max_batch: u64,
+    pub group_commit_commits_covered: u64,
+    pub physical_syncs_saved: u64,
+    pub total_queue_wait_ns: u64,
 }
 
 impl Default for DdbValue {
@@ -187,6 +212,12 @@ pub struct DbHandle {
 #[derive(Debug)]
 pub struct ResultHandle {
     result: QueryResult,
+}
+
+#[repr(C)]
+#[derive(Debug)]
+pub struct WatchHandle {
+    watch: crate::WatchHandle,
 }
 
 #[repr(C)]
@@ -847,6 +878,121 @@ fn sync_request_root(request_json: &str) -> Result<serde_json::Value> {
         .map_err(|error| DbError::sql(format!("invalid sync JSON request: {error}")))
 }
 
+fn watch_request_root(request_json: &str) -> Result<serde_json::Value> {
+    serde_json::from_str(request_json)
+        .map_err(|error| DbError::sql(format!("invalid watch JSON request: {error}")))
+}
+
+fn watch_request_object(
+    request: &serde_json::Value,
+) -> Result<&serde_json::Map<String, serde_json::Value>> {
+    request
+        .as_object()
+        .ok_or_else(|| DbError::sql("watch JSON request must be an object"))
+}
+
+fn watch_string_list(
+    request: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<Vec<String>> {
+    match request.get(field) {
+        None | Some(serde_json::Value::Null) => Ok(Vec::new()),
+        Some(serde_json::Value::Array(values)) => values
+            .iter()
+            .map(|value| match value {
+                serde_json::Value::String(value) => Ok(value.clone()),
+                other => Err(DbError::sql(format!(
+                    "watch field '{field}' must contain strings, got {other}"
+                ))),
+            })
+            .collect(),
+        Some(other) => Err(DbError::sql(format!(
+            "watch field '{field}' must be an array of strings, got {other}"
+        ))),
+    }
+}
+
+fn watch_string_field(
+    request: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<String> {
+    match request.get(field) {
+        Some(serde_json::Value::String(value)) => Ok(value.clone()),
+        Some(other) => Err(DbError::sql(format!(
+            "watch field '{field}' must be a string, got {other}"
+        ))),
+        None => Err(DbError::sql(format!("watch field '{field}' is required"))),
+    }
+}
+
+fn watch_optional_usize(
+    request: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<Option<usize>> {
+    match request.get(field) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Number(value)) => value
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+            .map(Some)
+            .ok_or_else(|| DbError::sql(format!("watch field '{field}' must fit in usize"))),
+        Some(other) => Err(DbError::sql(format!(
+            "watch field '{field}' must be an unsigned integer, got {other}"
+        ))),
+    }
+}
+
+fn watch_optional_bool(
+    request: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    default: bool,
+) -> Result<bool> {
+    match request.get(field) {
+        None | Some(serde_json::Value::Null) => Ok(default),
+        Some(serde_json::Value::Bool(value)) => Ok(*value),
+        Some(other) => Err(DbError::sql(format!(
+            "watch field '{field}' must be a bool, got {other}"
+        ))),
+    }
+}
+
+fn watch_optional_json(
+    request: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Option<serde_json::Value> {
+    request.get(field).filter(|value| !value.is_null()).cloned()
+}
+
+fn watch_params(request: &serde_json::Map<String, serde_json::Value>) -> Result<Vec<Value>> {
+    match request.get("params") {
+        None | Some(serde_json::Value::Null) => Ok(Vec::new()),
+        Some(serde_json::Value::Array(values)) => values.iter().map(value_from_json).collect(),
+        Some(other) => Err(DbError::sql(format!(
+            "watch field 'params' must be an array, got {other}"
+        ))),
+    }
+}
+
+fn value_from_json(value: &serde_json::Value) -> Result<Value> {
+    match value {
+        serde_json::Value::Null => Ok(Value::Null),
+        serde_json::Value::Bool(value) => Ok(Value::Bool(*value)),
+        serde_json::Value::Number(value) => {
+            if let Some(value) = value.as_i64() {
+                Ok(Value::Int64(value))
+            } else if let Some(value) = value.as_f64() {
+                Ok(Value::Float64(value))
+            } else {
+                Err(DbError::sql("JSON number cannot be represented"))
+            }
+        }
+        serde_json::Value::String(value) => Ok(Value::Text(value.clone())),
+        other => Err(DbError::sql(format!(
+            "watch params support null, bool, number, and string values; got {other}"
+        ))),
+    }
+}
+
 fn sync_request_object<'a>(
     request: &'a serde_json::Value,
     op: &str,
@@ -1135,6 +1281,14 @@ fn parse_u64_option(value: &str, key: &str) -> Result<u64> {
     })
 }
 
+fn parse_usize_option(value: &str, key: &str) -> Result<usize> {
+    value.trim().parse::<usize>().map_err(|_| {
+        DbError::sql(format!(
+            "invalid unsigned integer value for option {key}: {value}"
+        ))
+    })
+}
+
 fn parse_cache_size_mb_option(value: &str, page_size: u32) -> Result<usize> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -1165,6 +1319,29 @@ fn parse_cache_size_mb_option(value: &str, page_size: u32) -> Result<usize> {
         .checked_mul(page_size as usize)
         .ok_or_else(|| DbError::sql(format!("cache_size value is too large: {value}")))?;
     Ok(bytes.div_ceil(1024 * 1024).max(1))
+}
+
+fn parse_extension_trust_anchor_option(
+    value: &str,
+) -> Result<crate::extensions::ExtensionTrustAnchor> {
+    let (name, rest) = value
+        .split_once('@')
+        .ok_or_else(|| DbError::sql("allow_extension option must be name@sha256:<hash>"))?;
+    let parts = rest.split('@').collect::<Vec<_>>();
+    match parts.as_slice() {
+        [hash] => Ok(crate::extensions::ExtensionTrustAnchor::new(name, *hash)),
+        [hash, key_id, public_key] => Ok(
+            crate::extensions::ExtensionTrustAnchor::with_public_key(
+                name,
+                *hash,
+                *key_id,
+                *public_key,
+            ),
+        ),
+        _ => Err(DbError::sql(
+            "allow_extension option must be name@sha256:<hash> or name@sha256:<hash>@key_id@public_key",
+        )),
+    }
 }
 
 fn db_config_from_options(options: Option<&str>) -> Result<DbConfig> {
@@ -1215,6 +1392,33 @@ fn db_config_from_options(options: Option<&str>) -> Result<DbConfig> {
             }
             "wal_checkpoint_threshold_bytes" => {
                 config.wal_checkpoint_threshold_bytes = parse_u64_option(value, key.as_str())?;
+            }
+            "write_queue_enabled" => {
+                config.write_queue_enabled = parse_bool_option(value, key.as_str())?;
+            }
+            "write_queue_capacity" => {
+                config.write_queue_capacity = parse_usize_option(value, key.as_str())?.max(1);
+            }
+            "write_queue_default_timeout_ms" => {
+                config.write_queue_default_timeout_ms = parse_u64_option(value, key.as_str())?;
+            }
+            "write_queue_strict_group_commit" | "write_queue_group_commit" => {
+                config.write_queue_strict_group_commit = parse_bool_option(value, key.as_str())?;
+            }
+            "write_queue_max_batch" => {
+                config.write_queue_max_batch = parse_usize_option(value, key.as_str())?.max(1);
+            }
+            "write_queue_max_group_delay_us" => {
+                config.write_queue_max_group_delay_us = parse_u64_option(value, key.as_str())?;
+            }
+            "allow_extension" => {
+                config
+                    .extension_trust_anchors
+                    .push(parse_extension_trust_anchor_option(value)?);
+            }
+            "allow_unsigned_extensions" => {
+                config.extension_unsigned_development_mode =
+                    parse_bool_option(value, key.as_str())?;
             }
             _ => {
                 return Err(DbError::sql(format!("unsupported database option: {key}")));
@@ -1346,207 +1550,588 @@ pub extern "C" fn ddb_db_sync_execute_json(
         let request = sync_request_root(&request_json)?;
         let request_object = sync_request_object(&request, "request")?;
         let op = sync_request_op(request_object)?;
-        let response =
-            match op.as_str() {
-                "status" => sync_to_value(db.db.sync_status()?)?,
-                "init_replica" => {
-                    let replica_id = sync_request_string_field(request_object, &op, "replica_id")?;
-                    db.db.sync_init_replica(&replica_id)?;
-                    sync_to_value(db.db.sync_status()?)?
-                }
-                "set_enabled" => {
-                    let enabled = sync_request_bool_field(request_object, &op, "enabled")?;
-                    db.db.sync_set_enabled(enabled)?;
-                    sync_to_value(db.db.sync_status()?)?
-                }
-                "pending_changes" => {
-                    let since = sync_request_u64_field(request_object, &op, "since")?;
-                    let limit = sync_request_usize_field(request_object, &op, "limit")?;
-                    sync_to_value(db.db.sync_pending_changes(since, limit)?)?
-                }
-                "export_batch" => {
-                    let since = sync_request_u64_field(request_object, &op, "since")?;
-                    let limit = sync_request_usize_field(request_object, &op, "limit")?;
-                    let scope = sync_request_optional_string_field(request_object, &op, "scope")?;
-                    match scope.as_deref() {
-                        Some(scope) => {
-                            sync_to_value(db.db.sync_export_batch_for_scope(scope, since, limit)?)?
-                        }
-                        None => sync_to_value(db.db.sync_export_batch(since, limit)?)?,
+        let response = match op.as_str() {
+            "status" => sync_to_value(db.db.sync_status()?)?,
+            "init_replica" => {
+                let replica_id = sync_request_string_field(request_object, &op, "replica_id")?;
+                db.db.sync_init_replica(&replica_id)?;
+                sync_to_value(db.db.sync_status()?)?
+            }
+            "set_enabled" => {
+                let enabled = sync_request_bool_field(request_object, &op, "enabled")?;
+                db.db.sync_set_enabled(enabled)?;
+                sync_to_value(db.db.sync_status()?)?
+            }
+            "pending_changes" => {
+                let since = sync_request_u64_field(request_object, &op, "since")?;
+                let limit = sync_request_usize_field(request_object, &op, "limit")?;
+                sync_to_value(db.db.sync_pending_changes(since, limit)?)?
+            }
+            "export_batch" => {
+                let since = sync_request_u64_field(request_object, &op, "since")?;
+                let limit = sync_request_usize_field(request_object, &op, "limit")?;
+                let scope = sync_request_optional_string_field(request_object, &op, "scope")?;
+                match scope.as_deref() {
+                    Some(scope) => {
+                        sync_to_value(db.db.sync_export_batch_for_scope(scope, since, limit)?)?
                     }
+                    None => sync_to_value(db.db.sync_export_batch(since, limit)?)?,
                 }
-                "import_batch" => {
-                    let batch = sync_request_json_value_field(request_object, &op, "batch")?;
-                    let batch: crate::sync::SyncChangeBatch = serde_json::from_value(batch)
-                        .map_err(|error| {
-                            DbError::sql(format!("invalid sync batch request body: {error}"))
-                        })?;
-                    let scope = sync_request_optional_string_field(request_object, &op, "scope")?;
-                    let conflict_policy =
-                        sync_request_optional_string_field(request_object, &op, "conflict_policy")?;
-                    let summary = match (scope.as_deref(), conflict_policy.as_deref()) {
-                        (Some(scope), Some(policy)) => {
-                            let policy = crate::sync::SyncConflictPolicy::from_str(policy)?;
-                            db.db
-                                .sync_import_batch_for_scope_with_policy(scope, &batch, policy)?
-                        }
-                        (Some(scope), None) => db.db.sync_import_batch_for_scope(scope, &batch)?,
-                        (None, Some(policy)) => {
-                            let policy = crate::sync::SyncConflictPolicy::from_str(policy)?;
-                            db.db.sync_import_batch_with_policy(&batch, policy)?
-                        }
-                        (None, None) => db.db.sync_import_batch(&batch)?,
-                    };
-                    sync_to_value(summary)?
-                }
-                "add_peer" => {
-                    let name = sync_request_string_field(request_object, &op, "name")?;
-                    let endpoint = sync_request_string_field(request_object, &op, "endpoint")?;
-                    let token_env =
-                        sync_request_optional_string_field(request_object, &op, "token_env")?;
-                    db.db
-                        .sync_add_peer(&name, &endpoint, token_env.as_deref())?;
-                    sync_to_value(
-                        db.db.sync_peer(&name)?.ok_or_else(|| {
-                            DbError::internal("sync peer missing after add/update")
-                        })?,
-                    )?
-                }
-                "remove_peer" => {
-                    let name = sync_request_string_field(request_object, &op, "name")?;
-                    sync_to_value(serde_json::json!({
-                        "removed": db.db.sync_remove_peer(&name)?,
-                    }))?
-                }
-                "peers" => sync_to_value(db.db.sync_peers()?)?,
-                "create_scope" => {
-                    let name = sync_request_string_field(request_object, &op, "name")?;
-                    let include_tables =
-                        sync_request_string_list_field(request_object, &op, "include_tables")?;
-                    let row_filter =
-                        sync_request_optional_string_field(request_object, &op, "row_filter")?;
-                    let include_table_refs = include_tables
-                        .iter()
-                        .map(String::as_str)
-                        .collect::<Vec<_>>();
-                    db.db
-                        .sync_create_scope(&name, &include_table_refs, row_filter.as_deref())?;
-                    sync_to_value(db.db.sync_scope(&name)?.ok_or_else(|| {
-                        DbError::internal("sync scope missing after create/update")
-                    })?)?
-                }
-                "drop_scope" => {
-                    let name = sync_request_string_field(request_object, &op, "name")?;
-                    sync_to_value(serde_json::json!({
-                        "removed": db.db.sync_drop_scope(&name)?,
-                    }))?
-                }
-                "scopes" => sync_to_value(db.db.sync_scopes()?)?,
-                "bind_peer_scope" => {
-                    let peer_name = sync_request_string_field(request_object, &op, "peer_name")?;
-                    let scope_name = sync_request_string_field(request_object, &op, "scope_name")?;
-                    db.db.sync_bind_peer_scope(&peer_name, &scope_name)?;
-                    sync_to_value(db.db.sync_peer_scope(&peer_name)?.ok_or_else(|| {
-                        DbError::internal("sync peer scope binding missing after bind")
-                    })?)?
-                }
-                "unbind_peer_scope" => {
-                    let peer_name = sync_request_string_field(request_object, &op, "peer_name")?;
-                    sync_to_value(serde_json::json!({
-                        "removed": db.db.sync_unbind_peer_scope(&peer_name)?,
-                    }))?
-                }
-                "peer_scope_bindings" => sync_to_value(db.db.sync_peer_scope_bindings()?)?,
-                "sessions" => sync_to_value(db.db.sync_sessions()?)?,
-                "conflicts" => {
-                    let all = sync_request_bool_field(request_object, &op, "all")?;
-                    if all {
-                        sync_to_value(db.db.sync_conflicts_all()?)?
-                    } else {
-                        sync_to_value(db.db.sync_conflicts()?)?
-                    }
-                }
-                "conflict" => {
-                    let id = sync_request_i64_field(request_object, &op, "id")?;
-                    match db.db.sync_conflict(id)? {
-                        Some(conflict) => sync_to_value(conflict)?,
-                        None => serde_json::Value::Null,
-                    }
-                }
-                "resolve_conflict" => {
-                    let id = sync_request_i64_field(request_object, &op, "id")?;
-                    let action = sync_request_string_field(request_object, &op, "action")?;
-                    let by = sync_request_optional_string_field(request_object, &op, "by")?;
-                    let note = sync_request_optional_string_field(request_object, &op, "note")?;
-                    match action.as_str() {
-                        "keep_local" => {
-                            let _ = db.db.sync_resolve_conflict_keep_local(
-                                id,
-                                by.as_deref(),
-                                note.as_deref(),
-                            )?;
-                        }
-                        "apply_remote" => {
-                            let _ = db.db.sync_resolve_conflict_apply_remote(
-                                id,
-                                by.as_deref(),
-                                note.as_deref(),
-                            )?;
-                        }
-                        other => {
-                            return Err(DbError::sql(format!(
-                                "unsupported sync conflict resolution action '{other}'"
-                            )));
-                        }
-                    }
-                    match db.db.sync_conflict(id)? {
-                        Some(conflict) => sync_to_value(conflict)?,
-                        None => serde_json::Value::Null,
-                    }
-                }
-                "reopen_conflict" => {
-                    let id = sync_request_i64_field(request_object, &op, "id")?;
-                    let _ = db.db.sync_reopen_conflict(id)?;
-                    match db.db.sync_conflict(id)? {
-                        Some(conflict) => sync_to_value(conflict)?,
-                        None => serde_json::Value::Null,
-                    }
-                }
-                "conflict_policy" => sync_to_value(db.db.sync_conflict_policy()?)?,
-                "set_conflict_policy" => {
-                    let policy = sync_request_string_field(request_object, &op, "policy")?;
-                    let origin_priority = sync_request_optional_string_list_field(
-                        request_object,
-                        &op,
-                        "origin_priority",
-                    )?;
-                    let origin_priority_refs = origin_priority
-                        .iter()
-                        .map(String::as_str)
-                        .collect::<Vec<_>>();
-                    let policy = crate::sync::SyncConflictPolicy::from_str(&policy)?;
-                    db.db
-                        .sync_set_conflict_policy(policy, &origin_priority_refs)?;
-                    sync_to_value(db.db.sync_conflict_policy()?)?
-                }
-                "doctor" => sync_to_value(db.db.sync_operational_doctor_report()?)?,
-                "retention" => sync_to_value(db.db.sync_retention_report()?)?,
-                "peer_lag" => sync_to_value(db.db.sync_peer_lag_report()?)?,
-                "prune" => {
-                    let through = sync_request_u64_field(request_object, &op, "through")?;
-                    let dry_run = sync_request_bool_field(request_object, &op, "dry_run")?;
-                    let allow_data_loss =
-                        sync_request_bool_field(request_object, &op, "allow_data_loss")?;
-                    sync_to_value(
+            }
+            "changeset_create" => {
+                let options = sync_request_json_value_field(request_object, &op, "options")?;
+                let options: crate::sync::CreateChangesetOptions = serde_json::from_value(options)
+                    .map_err(|error| {
+                        DbError::sql(format!("invalid changeset create options: {error}"))
+                    })?;
+                sync_to_value(db.db.sync_create_changeset(options)?)?
+            }
+            "changeset_apply" => {
+                let changeset = sync_request_json_value_field(request_object, &op, "changeset")?;
+                let changeset: crate::sync::SyncChangeset = serde_json::from_value(changeset)
+                    .map_err(|error| DbError::sql(format!("invalid changeset payload: {error}")))?;
+                let options = request_object
+                    .get("options")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
+                let options: crate::sync::ApplyChangesetOptions = serde_json::from_value(options)
+                    .map_err(|error| {
+                    DbError::sql(format!("invalid changeset apply options: {error}"))
+                })?;
+                sync_to_value(db.db.sync_apply_changeset(&changeset, options)?)?
+            }
+            "changeset_inspect" => {
+                let changeset = sync_request_json_value_field(request_object, &op, "changeset")?;
+                let changeset: crate::sync::SyncChangeset = serde_json::from_value(changeset)
+                    .map_err(|error| DbError::sql(format!("invalid changeset payload: {error}")))?;
+                let options = request_object
+                    .get("options")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
+                let options: crate::sync::InspectChangesetOptions = serde_json::from_value(options)
+                    .map_err(|error| {
+                        DbError::sql(format!("invalid changeset inspect options: {error}"))
+                    })?;
+                sync_to_value(db.db.sync_inspect_changeset(&changeset, options)?)?
+            }
+            "changeset_invert" => {
+                let changeset = sync_request_json_value_field(request_object, &op, "changeset")?;
+                let changeset: crate::sync::SyncChangeset = serde_json::from_value(changeset)
+                    .map_err(|error| DbError::sql(format!("invalid changeset payload: {error}")))?;
+                let options = request_object
+                    .get("options")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
+                let options: crate::sync::InvertChangesetOptions = serde_json::from_value(options)
+                    .map_err(|error| {
+                        DbError::sql(format!("invalid changeset invert options: {error}"))
+                    })?;
+                sync_to_value(db.db.sync_invert_changeset(&changeset, options)?)?
+            }
+            "import_batch" => {
+                let batch = sync_request_json_value_field(request_object, &op, "batch")?;
+                let batch: crate::sync::SyncChangeBatch =
+                    serde_json::from_value(batch).map_err(|error| {
+                        DbError::sql(format!("invalid sync batch request body: {error}"))
+                    })?;
+                let scope = sync_request_optional_string_field(request_object, &op, "scope")?;
+                let conflict_policy =
+                    sync_request_optional_string_field(request_object, &op, "conflict_policy")?;
+                let summary = match (scope.as_deref(), conflict_policy.as_deref()) {
+                    (Some(scope), Some(policy)) => {
+                        let policy = crate::sync::SyncConflictPolicy::from_str(policy)?;
                         db.db
-                            .sync_prune_journal(through, dry_run, allow_data_loss)?,
-                    )?
+                            .sync_import_batch_for_scope_with_policy(scope, &batch, policy)?
+                    }
+                    (Some(scope), None) => db.db.sync_import_batch_for_scope(scope, &batch)?,
+                    (None, Some(policy)) => {
+                        let policy = crate::sync::SyncConflictPolicy::from_str(policy)?;
+                        db.db.sync_import_batch_with_policy(&batch, policy)?
+                    }
+                    (None, None) => db.db.sync_import_batch(&batch)?,
+                };
+                sync_to_value(summary)?
+            }
+            "add_peer" => {
+                let name = sync_request_string_field(request_object, &op, "name")?;
+                let endpoint = sync_request_string_field(request_object, &op, "endpoint")?;
+                let token_env =
+                    sync_request_optional_string_field(request_object, &op, "token_env")?;
+                db.db
+                    .sync_add_peer(&name, &endpoint, token_env.as_deref())?;
+                sync_to_value(
+                    db.db
+                        .sync_peer(&name)?
+                        .ok_or_else(|| DbError::internal("sync peer missing after add/update"))?,
+                )?
+            }
+            "remove_peer" => {
+                let name = sync_request_string_field(request_object, &op, "name")?;
+                sync_to_value(serde_json::json!({
+                    "removed": db.db.sync_remove_peer(&name)?,
+                }))?
+            }
+            "peers" => sync_to_value(db.db.sync_peers()?)?,
+            "create_scope" => {
+                let name = sync_request_string_field(request_object, &op, "name")?;
+                let include_tables =
+                    sync_request_string_list_field(request_object, &op, "include_tables")?;
+                let row_filter =
+                    sync_request_optional_string_field(request_object, &op, "row_filter")?;
+                let include_table_refs = include_tables
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>();
+                db.db
+                    .sync_create_scope(&name, &include_table_refs, row_filter.as_deref())?;
+                sync_to_value(
+                    db.db.sync_scope(&name)?.ok_or_else(|| {
+                        DbError::internal("sync scope missing after create/update")
+                    })?,
+                )?
+            }
+            "drop_scope" => {
+                let name = sync_request_string_field(request_object, &op, "name")?;
+                sync_to_value(serde_json::json!({
+                    "removed": db.db.sync_drop_scope(&name)?,
+                }))?
+            }
+            "scopes" => sync_to_value(db.db.sync_scopes()?)?,
+            "bind_peer_scope" => {
+                let peer_name = sync_request_string_field(request_object, &op, "peer_name")?;
+                let scope_name = sync_request_string_field(request_object, &op, "scope_name")?;
+                db.db.sync_bind_peer_scope(&peer_name, &scope_name)?;
+                sync_to_value(db.db.sync_peer_scope(&peer_name)?.ok_or_else(|| {
+                    DbError::internal("sync peer scope binding missing after bind")
+                })?)?
+            }
+            "unbind_peer_scope" => {
+                let peer_name = sync_request_string_field(request_object, &op, "peer_name")?;
+                sync_to_value(serde_json::json!({
+                    "removed": db.db.sync_unbind_peer_scope(&peer_name)?,
+                }))?
+            }
+            "peer_scope_bindings" => sync_to_value(db.db.sync_peer_scope_bindings()?)?,
+            "sessions" => sync_to_value(db.db.sync_sessions()?)?,
+            "conflicts" => {
+                let all = sync_request_bool_field(request_object, &op, "all")?;
+                if all {
+                    sync_to_value(db.db.sync_conflicts_all()?)?
+                } else {
+                    sync_to_value(db.db.sync_conflicts()?)?
                 }
-                other => {
-                    return Err(DbError::sql(format!("unsupported sync JSON op '{other}'")));
+            }
+            "conflict" => {
+                let id = sync_request_i64_field(request_object, &op, "id")?;
+                match db.db.sync_conflict(id)? {
+                    Some(conflict) => sync_to_value(conflict)?,
+                    None => serde_json::Value::Null,
                 }
-            };
+            }
+            "resolve_conflict" => {
+                let id = sync_request_i64_field(request_object, &op, "id")?;
+                let action = sync_request_string_field(request_object, &op, "action")?;
+                let by = sync_request_optional_string_field(request_object, &op, "by")?;
+                let note = sync_request_optional_string_field(request_object, &op, "note")?;
+                match action.as_str() {
+                    "keep_local" => {
+                        let _ = db.db.sync_resolve_conflict_keep_local(
+                            id,
+                            by.as_deref(),
+                            note.as_deref(),
+                        )?;
+                    }
+                    "apply_remote" => {
+                        let _ = db.db.sync_resolve_conflict_apply_remote(
+                            id,
+                            by.as_deref(),
+                            note.as_deref(),
+                        )?;
+                    }
+                    other => {
+                        return Err(DbError::sql(format!(
+                            "unsupported sync conflict resolution action '{other}'"
+                        )));
+                    }
+                }
+                match db.db.sync_conflict(id)? {
+                    Some(conflict) => sync_to_value(conflict)?,
+                    None => serde_json::Value::Null,
+                }
+            }
+            "reopen_conflict" => {
+                let id = sync_request_i64_field(request_object, &op, "id")?;
+                let _ = db.db.sync_reopen_conflict(id)?;
+                match db.db.sync_conflict(id)? {
+                    Some(conflict) => sync_to_value(conflict)?,
+                    None => serde_json::Value::Null,
+                }
+            }
+            "conflict_policy" => sync_to_value(db.db.sync_conflict_policy()?)?,
+            "set_conflict_policy" => {
+                let policy = sync_request_string_field(request_object, &op, "policy")?;
+                let origin_priority = sync_request_optional_string_list_field(
+                    request_object,
+                    &op,
+                    "origin_priority",
+                )?;
+                let origin_priority_refs = origin_priority
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>();
+                let policy = crate::sync::SyncConflictPolicy::from_str(&policy)?;
+                db.db
+                    .sync_set_conflict_policy(policy, &origin_priority_refs)?;
+                sync_to_value(db.db.sync_conflict_policy()?)?
+            }
+            "doctor" => sync_to_value(db.db.sync_operational_doctor_report()?)?,
+            "retention" => sync_to_value(db.db.sync_retention_report()?)?,
+            "peer_lag" => sync_to_value(db.db.sync_peer_lag_report()?)?,
+            "shape_create" => {
+                let options = sync_request_json_value_field(request_object, &op, "options")?;
+                let options: crate::sync::CreateShapeOptions = serde_json::from_value(options)
+                    .map_err(|error| {
+                        DbError::sql(format!("invalid shape create options: {error}"))
+                    })?;
+                sync_to_value(db.db.sync_create_shape(options)?)?
+            }
+            "shape_drop" => {
+                let shape_id = sync_request_string_field(request_object, &op, "shape_id")?;
+                sync_to_value(serde_json::json!({
+                    "removed": db.db.sync_drop_shape(&shape_id)?,
+                }))?
+            }
+            "shape_list" => sync_to_value(db.db.sync_shapes()?)?,
+            "shape_snapshot" => {
+                let shape_id = sync_request_string_field(request_object, &op, "shape_id")?;
+                let client_replica_id =
+                    sync_request_string_field(request_object, &op, "client_replica_id")?;
+                let principal = request_object
+                    .get("principal")
+                    .cloned()
+                    .map(serde_json::from_value::<crate::sync::SyncPrincipal>)
+                    .transpose()
+                    .map_err(|error| DbError::sql(format!("invalid principal: {error}")))?;
+                sync_to_value(db.db.sync_shape_snapshot(
+                    &shape_id,
+                    &client_replica_id,
+                    principal,
+                )?)?
+            }
+            "shape_changes" => {
+                let shape_id = sync_request_string_field(request_object, &op, "shape_id")?;
+                let since_watermark =
+                    sync_request_u64_field(request_object, &op, "since_watermark")?;
+                let principal = request_object
+                    .get("principal")
+                    .cloned()
+                    .map(serde_json::from_value::<crate::sync::SyncPrincipal>)
+                    .transpose()
+                    .map_err(|error| DbError::sql(format!("invalid principal: {error}")))?;
+                sync_to_value(
+                    db.db
+                        .sync_shape_changes(&shape_id, since_watermark, principal)?,
+                )?
+            }
+            "shape_ack" => {
+                let ack = sync_request_json_value_field(request_object, &op, "ack")?;
+                let ack: crate::sync::ShapeAckOptions = serde_json::from_value(ack)
+                    .map_err(|error| DbError::sql(format!("invalid shape ack options: {error}")))?;
+                sync_to_value(db.db.sync_ack_shape(ack)?)?
+            }
+            "shape_clients" => sync_to_value(db.db.sync_shape_clients()?)?,
+            "changeset_history" => sync_to_value(db.db.sync_changeset_history()?)?,
+            "relay_sessions" => sync_to_value(db.db.sync_relay_sessions()?)?,
+            "prune" => {
+                let through = sync_request_u64_field(request_object, &op, "through")?;
+                let dry_run = sync_request_bool_field(request_object, &op, "dry_run")?;
+                let allow_data_loss =
+                    sync_request_bool_field(request_object, &op, "allow_data_loss")?;
+                sync_to_value(
+                    db.db
+                        .sync_prune_journal(through, dry_run, allow_data_loss)?,
+                )?
+            }
+            other => {
+                return Err(DbError::sql(format!("unsupported sync JSON op '{other}'")));
+            }
+        };
         *out_ptr(out_json, "out_json")? = sync_json_response(&response)?;
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_sync_changeset_create_json(
+    db: *mut DbHandle,
+    request_json: *const c_char,
+    out_json: *mut *mut c_char,
+) -> u32 {
+    ffi_boundary(|| {
+        let db = handle_ref(db, "db")?;
+        let request_json = utf8_arg(request_json, "request_json")?;
+        let request = sync_request_root(&request_json)?;
+        let options: crate::sync::CreateChangesetOptions = serde_json::from_value(request)
+            .map_err(|error| {
+                DbError::sql(format!("invalid changeset create JSON request: {error}"))
+            })?;
+        *out_ptr(out_json, "out_json")? =
+            sync_json_response(&db.db.sync_create_changeset(options)?)?;
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_sync_changeset_apply_json(
+    db: *mut DbHandle,
+    request_json: *const c_char,
+    out_json: *mut *mut c_char,
+) -> u32 {
+    ffi_boundary(|| {
+        let db = handle_ref(db, "db")?;
+        let request_json = utf8_arg(request_json, "request_json")?;
+        let request = sync_request_root(&request_json)?;
+        let object = sync_request_object(&request, "changeset_apply")?;
+        let changeset: crate::sync::SyncChangeset = serde_json::from_value(
+            sync_request_json_value_field(object, "changeset_apply", "changeset")?,
+        )
+        .map_err(|error| DbError::sql(format!("invalid changeset payload: {error}")))?;
+        let options = object
+            .get("options")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        let options: crate::sync::ApplyChangesetOptions = serde_json::from_value(options)
+            .map_err(|error| DbError::sql(format!("invalid changeset apply options: {error}")))?;
+        *out_ptr(out_json, "out_json")? =
+            sync_json_response(&db.db.sync_apply_changeset(&changeset, options)?)?;
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_sync_changeset_inspect_json(
+    db: *mut DbHandle,
+    request_json: *const c_char,
+    out_json: *mut *mut c_char,
+) -> u32 {
+    ffi_boundary(|| {
+        let db = handle_ref(db, "db")?;
+        let request_json = utf8_arg(request_json, "request_json")?;
+        let request = sync_request_root(&request_json)?;
+        let object = sync_request_object(&request, "changeset_inspect")?;
+        let changeset: crate::sync::SyncChangeset = serde_json::from_value(
+            sync_request_json_value_field(object, "changeset_inspect", "changeset")?,
+        )
+        .map_err(|error| DbError::sql(format!("invalid changeset payload: {error}")))?;
+        let options = object
+            .get("options")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        let options: crate::sync::InspectChangesetOptions = serde_json::from_value(options)
+            .map_err(|error| DbError::sql(format!("invalid changeset inspect options: {error}")))?;
+        *out_ptr(out_json, "out_json")? =
+            sync_json_response(&db.db.sync_inspect_changeset(&changeset, options)?)?;
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_sync_changeset_invert_json(
+    db: *mut DbHandle,
+    request_json: *const c_char,
+    out_json: *mut *mut c_char,
+) -> u32 {
+    ffi_boundary(|| {
+        let db = handle_ref(db, "db")?;
+        let request_json = utf8_arg(request_json, "request_json")?;
+        let request = sync_request_root(&request_json)?;
+        let object = sync_request_object(&request, "changeset_invert")?;
+        let changeset: crate::sync::SyncChangeset = serde_json::from_value(
+            sync_request_json_value_field(object, "changeset_invert", "changeset")?,
+        )
+        .map_err(|error| DbError::sql(format!("invalid changeset payload: {error}")))?;
+        let options = object
+            .get("options")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        let options: crate::sync::InvertChangesetOptions = serde_json::from_value(options)
+            .map_err(|error| DbError::sql(format!("invalid changeset invert options: {error}")))?;
+        *out_ptr(out_json, "out_json")? =
+            sync_json_response(&db.db.sync_invert_changeset(&changeset, options)?)?;
+        Ok(())
+    })
+}
+
+fn extension_validation_options_from_request(
+    object: &serde_json::Map<String, serde_json::Value>,
+    op: &str,
+) -> Result<crate::extensions::ExtensionValidationOptions> {
+    let allow_unsigned = object
+        .get("allow_unsigned")
+        .map(|value| match value {
+            serde_json::Value::Bool(value) => Ok(*value),
+            other => Err(DbError::sql(format!(
+                "extension request field 'allow_unsigned' for op '{op}' must be a boolean, got {other}"
+            ))),
+        })
+        .transpose()?
+        .unwrap_or(false);
+    let trust_extensions = sync_request_optional_string_list_field(object, op, "trust_extensions")?;
+    Ok(crate::extensions::ExtensionValidationOptions {
+        allow_unsigned,
+        trust_anchors: trust_extensions
+            .iter()
+            .map(|value| parse_extension_trust_anchor_option(value))
+            .collect::<Result<Vec<_>>>()?,
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_extension_validate_json(
+    request_json: *const c_char,
+    out_json: *mut *mut c_char,
+) -> u32 {
+    ffi_boundary(|| {
+        let request_json = utf8_arg(request_json, "request_json")?;
+        let request = sync_request_root(&request_json)?;
+        let object = sync_request_object(&request, "extension_validate")?;
+        let path = sync_request_string_field(object, "extension_validate", "path")?;
+        let options = extension_validation_options_from_request(object, "extension_validate")?;
+        *out_ptr(out_json, "out_json")? = sync_json_response(
+            &crate::extensions::validate_extension_package(path, options)?,
+        )?;
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_extension_install_json(
+    db: *mut DbHandle,
+    request_json: *const c_char,
+    out_json: *mut *mut c_char,
+) -> u32 {
+    ffi_boundary(|| {
+        let db = handle_ref(db, "db")?;
+        let request_json = utf8_arg(request_json, "request_json")?;
+        let request = sync_request_root(&request_json)?;
+        let object = sync_request_object(&request, "extension_install")?;
+        let path = sync_request_string_field(object, "extension_install", "path")?;
+        let options = extension_validation_options_from_request(object, "extension_install")?;
+        *out_ptr(out_json, "out_json")? =
+            sync_json_response(&db.db.extensions().install_with_options(path, options)?)?;
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_extension_enable_json(
+    db: *mut DbHandle,
+    request_json: *const c_char,
+    out_json: *mut *mut c_char,
+) -> u32 {
+    ffi_boundary(|| {
+        let db = handle_ref(db, "db")?;
+        let request_json = utf8_arg(request_json, "request_json")?;
+        let request = sync_request_root(&request_json)?;
+        let object = sync_request_object(&request, "extension_enable")?;
+        let name = sync_request_string_field(object, "extension_enable", "name")?;
+        db.db.extensions().enable(&name)?;
+        *out_ptr(out_json, "out_json")? =
+            sync_json_response(&serde_json::json!({"name": name, "enabled": true}))?;
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_extension_disable_json(
+    db: *mut DbHandle,
+    request_json: *const c_char,
+    out_json: *mut *mut c_char,
+) -> u32 {
+    ffi_boundary(|| {
+        let db = handle_ref(db, "db")?;
+        let request_json = utf8_arg(request_json, "request_json")?;
+        let request = sync_request_root(&request_json)?;
+        let object = sync_request_object(&request, "extension_disable")?;
+        let name = sync_request_string_field(object, "extension_disable", "name")?;
+        db.db.extensions().disable(&name)?;
+        *out_ptr(out_json, "out_json")? =
+            sync_json_response(&serde_json::json!({"name": name, "enabled": false}))?;
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_extension_list_json(
+    db: *mut DbHandle,
+    request_json: *const c_char,
+    out_json: *mut *mut c_char,
+) -> u32 {
+    ffi_boundary(|| {
+        let db = handle_ref(db, "db")?;
+        if !request_json.is_null() {
+            let request_json = utf8_arg(request_json, "request_json")?;
+            let _ = sync_request_root(&request_json)?;
+        }
+        *out_ptr(out_json, "out_json")? = sync_json_response(&db.db.extensions().list()?)?;
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_extension_dependencies_json(
+    db: *mut DbHandle,
+    request_json: *const c_char,
+    out_json: *mut *mut c_char,
+) -> u32 {
+    ffi_boundary(|| {
+        let db = handle_ref(db, "db")?;
+        if !request_json.is_null() {
+            let request_json = utf8_arg(request_json, "request_json")?;
+            let _ = sync_request_root(&request_json)?;
+        }
+        *out_ptr(out_json, "out_json")? = sync_json_response(&db.db.extensions().dependencies()?)?;
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_extension_rebuild_json(
+    db: *mut DbHandle,
+    request_json: *const c_char,
+    out_json: *mut *mut c_char,
+) -> u32 {
+    ffi_boundary(|| {
+        let db = handle_ref(db, "db")?;
+        let request_json = utf8_arg(request_json, "request_json")?;
+        let request = sync_request_root(&request_json)?;
+        let object = sync_request_object(&request, "extension_rebuild")?;
+        let name = sync_request_string_field(object, "extension_rebuild", "name")?;
+        *out_ptr(out_json, "out_json")? =
+            sync_json_response(&db.db.extensions().rebuild_dependents(&name)?)?;
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_extension_purge_json(
+    db: *mut DbHandle,
+    request_json: *const c_char,
+    out_json: *mut *mut c_char,
+) -> u32 {
+    ffi_boundary(|| {
+        let db = handle_ref(db, "db")?;
+        let request_json = utf8_arg(request_json, "request_json")?;
+        let request = sync_request_root(&request_json)?;
+        let object = sync_request_object(&request, "extension_purge")?;
+        let name = sync_request_string_field(object, "extension_purge", "name")?;
+        let confirm = sync_request_bool_field(object, "extension_purge", "confirm")?;
+        if !confirm {
+            return Err(DbError::sql("extension purge requires confirm=true"));
+        }
+        db.db.extensions().purge(&name)?;
+        *out_ptr(out_json, "out_json")? =
+            sync_json_response(&serde_json::json!({"name": name, "purged": true}))?;
         Ok(())
     })
 }
@@ -1682,6 +2267,199 @@ pub extern "C" fn ddb_db_execute(
             .collect::<Result<Vec<_>>>()?;
         let result = db.db.execute_with_params(&sql, &rust_params)?;
         *out_ptr(out_result, "out_result")? = Box::into_raw(Box::new(ResultHandle { result }));
+        Ok(())
+    })
+}
+
+#[no_mangle]
+/// Executes SQL through the engine-owned write queue.
+///
+/// Pass `UINT64_MAX` for `timeout_ms` to use the database's configured
+/// default queue timeout. Pass `0` for immediate timeout behavior.
+/// Call `ddb_result_free` exactly once for each successful call.
+pub extern "C" fn ddb_db_execute_queued(
+    db: *mut DbHandle,
+    sql: *const c_char,
+    params: *const DdbValue,
+    params_len: usize,
+    timeout_ms: u64,
+    out_result: *mut *mut ResultHandle,
+) -> u32 {
+    ffi_boundary(|| {
+        let db = handle_ref(db, "db")?;
+        let sql = utf8_arg(sql, "sql")?;
+        let rust_params = params_slice(params, params_len)?
+            .iter()
+            .map(value_from_ffi)
+            .collect::<Result<Vec<_>>>()?;
+        let timeout = if timeout_ms == DDB_WRITE_QUEUE_TIMEOUT_DEFAULT {
+            None
+        } else {
+            Some(Duration::from_millis(timeout_ms))
+        };
+        let mut result = db.db.execute_queued_batch_with_options(
+            &sql,
+            &rust_params,
+            QueuedWriteOptions {
+                timeout,
+                cancel_token: None,
+            },
+        )?;
+        if result.len() != 1 {
+            return Err(DbError::sql(format!(
+                "expected exactly one SQL statement, got {}",
+                result.len()
+            )));
+        }
+        *out_ptr(out_result, "out_result")? = Box::into_raw(Box::new(ResultHandle {
+            result: result.remove(0),
+        }));
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_db_write_queue_metrics(
+    db: *mut DbHandle,
+    out_metrics: *mut DdbWriteQueueMetrics,
+) -> u32 {
+    ffi_boundary(|| {
+        let metrics = handle_ref(db, "db")?.db.write_queue_metrics();
+        *out_ptr(out_metrics, "out_metrics")? = DdbWriteQueueMetrics {
+            capacity: metrics.capacity,
+            current_depth: metrics.current_depth,
+            admitted: metrics.admitted,
+            rejected: metrics.rejected,
+            timed_out: metrics.timed_out,
+            canceled: metrics.canceled,
+            executed: metrics.executed,
+            committed: metrics.committed,
+            failed: metrics.failed,
+            group_commit_batches: metrics.group_commit_batches,
+            group_commit_syncs: metrics.group_commit_syncs,
+            group_commit_max_batch: metrics.group_commit_max_batch,
+            group_commit_commits_covered: metrics.group_commit_commits_covered,
+            physical_syncs_saved: metrics.physical_syncs_saved,
+            total_queue_wait_ns: metrics.total_queue_wait_ns,
+        };
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_db_watch_table_json(
+    db: *mut DbHandle,
+    request_json: *const c_char,
+    out_watch: *mut *mut WatchHandle,
+) -> u32 {
+    ffi_boundary(|| {
+        let db = handle_ref(db, "db")?;
+        let request = watch_request_root(&utf8_arg(request_json, "request_json")?)?;
+        let object = watch_request_object(&request)?;
+        let watch = db.db.watch_table(TableWatchOptions {
+            tables: watch_string_list(object, "tables")?,
+            queue_capacity: watch_optional_usize(object, "queue_capacity")?,
+        })?;
+        *out_ptr(out_watch, "out_watch")? = Box::into_raw(Box::new(WatchHandle { watch }));
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_db_watch_range_json(
+    db: *mut DbHandle,
+    request_json: *const c_char,
+    out_watch: *mut *mut WatchHandle,
+) -> u32 {
+    ffi_boundary(|| {
+        let db = handle_ref(db, "db")?;
+        let request = watch_request_root(&utf8_arg(request_json, "request_json")?)?;
+        let object = watch_request_object(&request)?;
+        let watch = db.db.watch_range(RangeWatchOptions {
+            table: watch_string_field(object, "table")?,
+            lower: watch_optional_json(object, "lower"),
+            upper: watch_optional_json(object, "upper"),
+            lower_inclusive: watch_optional_bool(object, "lower_inclusive", true)?,
+            upper_inclusive: watch_optional_bool(object, "upper_inclusive", true)?,
+            queue_capacity: watch_optional_usize(object, "queue_capacity")?,
+        })?;
+        *out_ptr(out_watch, "out_watch")? = Box::into_raw(Box::new(WatchHandle { watch }));
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_db_watch_query_json(
+    db: *mut DbHandle,
+    request_json: *const c_char,
+    out_watch: *mut *mut WatchHandle,
+) -> u32 {
+    ffi_boundary(|| {
+        let db = handle_ref(db, "db")?;
+        let request = watch_request_root(&utf8_arg(request_json, "request_json")?)?;
+        let object = watch_request_object(&request)?;
+        let sql = watch_string_field(object, "sql")?;
+        let params = watch_params(object)?;
+        let watch = db.db.watch_query(
+            &sql,
+            &params,
+            QueryWatchOptions {
+                queue_capacity: watch_optional_usize(object, "queue_capacity")?,
+            },
+        )?;
+        *out_ptr(out_watch, "out_watch")? = Box::into_raw(Box::new(WatchHandle { watch }));
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_db_change_stream_json(
+    db: *mut DbHandle,
+    request_json: *const c_char,
+    out_watch: *mut *mut WatchHandle,
+) -> u32 {
+    ffi_boundary(|| {
+        let db = handle_ref(db, "db")?;
+        let request = watch_request_root(&utf8_arg(request_json, "request_json")?)?;
+        let object = watch_request_object(&request)?;
+        let watch = db.db.change_stream(ChangeStreamOptions {
+            tables: watch_string_list(object, "tables")?,
+            queue_capacity: watch_optional_usize(object, "queue_capacity")?,
+        })?;
+        *out_ptr(out_watch, "out_watch")? = Box::into_raw(Box::new(WatchHandle { watch }));
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_watch_next_json(
+    watch: *mut WatchHandle,
+    timeout_ms: u32,
+    out_json: *mut *mut c_char,
+) -> u32 {
+    ffi_boundary(|| {
+        let watch = handle_ref(watch, "watch")?;
+        let timeout = Duration::from_millis(u64::from(timeout_ms));
+        let Some(json) = watch.watch.next_json_timeout(timeout)? else {
+            return Err(DbError::timeout("watch receive timed out"));
+        };
+        *out_ptr(out_json, "out_json")? = cstring_from_string(json)?;
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_watch_close(watch: *mut *mut WatchHandle) -> u32 {
+    ffi_boundary(|| {
+        let watch = out_ptr(watch, "watch")?;
+        if (*watch).is_null() {
+            return Ok(());
+        }
+        // SAFETY: pointer was created by `Box::into_raw` in this module.
+        unsafe {
+            drop(Box::from_raw(*watch));
+        }
+        *watch = ptr::null_mut();
         Ok(())
     })
 }
@@ -2911,11 +3689,32 @@ mod tests {
         parse_json(&mut out)
     }
 
+    fn changeset_exec_json(
+        db: *mut DbHandle,
+        f: extern "C" fn(*mut DbHandle, *const c_char, *mut *mut c_char) -> u32,
+        request: &JsonValue,
+    ) -> JsonValue {
+        let mut out = ptr::null_mut();
+        let request = CString::new(request.to_string()).expect("request json");
+        assert_eq!(f(db, request.as_ptr(), &mut out), DDB_OK);
+        parse_json(&mut out)
+    }
+
     #[test]
     fn abi_shape_matches_expected_layout() {
         let _execute: ExecuteFn = ddb_db_execute;
+        let _execute_queued: extern "C" fn(
+            *mut DbHandle,
+            *const c_char,
+            *const DdbValue,
+            usize,
+            u64,
+            *mut *mut ResultHandle,
+        ) -> u32 = ddb_db_execute_queued;
         assert_eq!(std::mem::size_of::<DdbValue>(), 168);
         assert_eq!(std::mem::align_of::<DdbValue>(), 8);
+        assert_eq!(std::mem::size_of::<DdbWriteQueueMetrics>(), 120);
+        assert_eq!(std::mem::align_of::<DdbWriteQueueMetrics>(), 8);
     }
 
     #[test]
@@ -2926,7 +3725,7 @@ mod tests {
     #[test]
     fn db_config_options_parse_tuned_profile() {
         let config = db_config_from_options(Some(
-            "cache_size=64MB;retain_paged_row_sources_after_commit=true;paged_row_storage=false;wal_autocheckpoint=0",
+            "cache_size=64MB;retain_paged_row_sources_after_commit=true;paged_row_storage=false;wal_autocheckpoint=0;write_queue_enabled=true;write_queue_capacity=17;write_queue_default_timeout_ms=25;write_queue_strict_group_commit=true;write_queue_max_batch=9;write_queue_max_group_delay_us=1000",
         ))
         .expect("options should parse");
         assert_eq!(config.cache_size_mb, 64);
@@ -2934,6 +3733,12 @@ mod tests {
         assert!(!config.paged_row_storage);
         assert_eq!(config.wal_checkpoint_threshold_pages, 0);
         assert_eq!(config.wal_checkpoint_threshold_bytes, 0);
+        assert!(config.write_queue_enabled);
+        assert_eq!(config.write_queue_capacity, 17);
+        assert_eq!(config.write_queue_default_timeout_ms, 25);
+        assert!(config.write_queue_strict_group_commit);
+        assert_eq!(config.write_queue_max_batch, 9);
+        assert_eq!(config.write_queue_max_group_delay_us, 1000);
     }
 
     #[test]
@@ -2971,6 +3776,46 @@ mod tests {
         assert_eq!(ddb_result_free(&mut result), DDB_OK);
         assert_eq!(ddb_result_free(&mut result), DDB_OK);
         assert_eq!(ddb_db_free(&mut db), DDB_OK);
+        assert_eq!(ddb_db_free(&mut db), DDB_OK);
+    }
+
+    #[test]
+    fn ddb_db_execute_queued_updates_queue_metrics() {
+        let mut db = ptr::null_mut();
+        let path = CString::new(":memory:").expect("path");
+        assert_eq!(ddb_db_open_or_create(path.as_ptr(), &mut db), DDB_OK);
+
+        let create =
+            CString::new("CREATE TABLE queued_items (id INTEGER PRIMARY KEY)").expect("sql");
+        let mut result = ptr::null_mut();
+        assert_eq!(
+            ddb_db_execute(db, create.as_ptr(), ptr::null(), 0, &mut result),
+            DDB_OK
+        );
+        assert_eq!(ddb_result_free(&mut result), DDB_OK);
+
+        let insert = CString::new("INSERT INTO queued_items (id) VALUES (1)").expect("sql");
+        assert_eq!(
+            ddb_db_execute_queued(
+                db,
+                insert.as_ptr(),
+                ptr::null(),
+                0,
+                DDB_WRITE_QUEUE_TIMEOUT_DEFAULT,
+                &mut result,
+            ),
+            DDB_OK,
+            "queued execute failed: {:?}",
+            unsafe { CStr::from_ptr(ddb_last_error_message()) }
+        );
+        assert_eq!(ddb_result_free(&mut result), DDB_OK);
+
+        let mut metrics = DdbWriteQueueMetrics::default();
+        assert_eq!(ddb_db_write_queue_metrics(db, &mut metrics), DDB_OK);
+        assert_eq!(metrics.admitted, 1);
+        assert_eq!(metrics.executed, 1);
+        assert_eq!(metrics.committed, 1);
+        assert_eq!(metrics.failed, 0);
         assert_eq!(ddb_db_free(&mut db), DDB_OK);
     }
 
@@ -3764,7 +4609,9 @@ mod tests {
         assert_eq!(ddb_db_free(&mut db), DDB_OK);
 
         let _ = std::fs::remove_file(&path_buf);
-        let _ = std::fs::remove_file(path_buf.with_extension("ddb.wal"));
+        let mut wal_path = path_buf.clone();
+        wal_path.as_mut_os_string().push(".wal");
+        let _ = std::fs::remove_file(wal_path);
         let _ = std::fs::remove_file(path_buf.with_extension("ddb.shm"));
     }
 
@@ -3833,7 +4680,9 @@ mod tests {
         assert_eq!(ddb_db_free(&mut db), DDB_OK);
 
         let _ = std::fs::remove_file(&path_buf);
-        let _ = std::fs::remove_file(path_buf.with_extension("ddb.wal"));
+        let mut wal_path = path_buf.clone();
+        wal_path.as_mut_os_string().push(".wal");
+        let _ = std::fs::remove_file(wal_path);
         let _ = std::fs::remove_file(path_buf.with_extension("ddb.shm"));
     }
 
@@ -3895,7 +4744,9 @@ mod tests {
         assert_eq!(ddb_db_free(&mut db), DDB_OK);
 
         let _ = std::fs::remove_file(&path_buf);
-        let _ = std::fs::remove_file(path_buf.with_extension("ddb.wal"));
+        let mut wal_path = path_buf.clone();
+        wal_path.as_mut_os_string().push(".wal");
+        let _ = std::fs::remove_file(wal_path);
         let _ = std::fs::remove_file(path_buf.with_extension("ddb.shm"));
     }
 
@@ -3983,6 +4834,140 @@ mod tests {
             .as_array()
             .is_some_and(|items| items.is_empty()));
 
+        assert_eq!(ddb_db_free(&mut db), DDB_OK);
+    }
+
+    #[test]
+    fn ffi_sync_changeset_json_entrypoints_round_trip() {
+        let dir = tempfile::TempDir::with_prefix("decentdb-c-api-changeset").unwrap();
+        let src_path = CString::new(dir.path().join("src.ddb").to_string_lossy().as_bytes())
+            .expect("src path");
+        let dst_path = CString::new(dir.path().join("dst.ddb").to_string_lossy().as_bytes())
+            .expect("dst path");
+        let mut src = ptr::null_mut();
+        let mut dst = ptr::null_mut();
+        assert_eq!(ddb_db_open_or_create(src_path.as_ptr(), &mut src), DDB_OK);
+        assert_eq!(ddb_db_open_or_create(dst_path.as_ptr(), &mut dst), DDB_OK);
+
+        let create = CString::new("CREATE TABLE items (id INT64 PRIMARY KEY, name TEXT)").unwrap();
+        for db in [src, dst] {
+            let mut result = ptr::null_mut();
+            assert_eq!(
+                ddb_db_execute(db, create.as_ptr(), ptr::null(), 0, &mut result),
+                DDB_OK
+            );
+            assert_eq!(ddb_result_free(&mut result), DDB_OK);
+        }
+        let _ = sync_exec_json(
+            src,
+            &serde_json::json!({"op":"init_replica","replica_id":"src"}),
+        );
+        let _ = sync_exec_json(
+            dst,
+            &serde_json::json!({"op":"init_replica","replica_id":"dst"}),
+        );
+
+        let insert = CString::new("INSERT INTO items (id, name) VALUES (1, 'one')").unwrap();
+        let mut result = ptr::null_mut();
+        assert_eq!(
+            ddb_db_execute(src, insert.as_ptr(), ptr::null(), 0, &mut result),
+            DDB_OK
+        );
+        assert_eq!(ddb_result_free(&mut result), DDB_OK);
+
+        let changeset = changeset_exec_json(
+            src,
+            ddb_sync_changeset_create_json,
+            &serde_json::json!({
+                "source": {
+                    "kind": "checkpoint",
+                    "peer": "dst",
+                    "since_sequence": 0
+                }
+            }),
+        );
+        assert_eq!(changeset["changeset_version"], 1);
+        assert_eq!(changeset["records"].as_array().map(Vec::len), Some(1));
+
+        let inspection = changeset_exec_json(
+            src,
+            ddb_sync_changeset_inspect_json,
+            &serde_json::json!({
+                "changeset": changeset,
+                "options": {"check_local_compatibility": true}
+            }),
+        );
+        assert_eq!(inspection["valid_envelope"], true);
+        assert_eq!(inspection["record_count"], 1);
+
+        let apply = changeset_exec_json(
+            dst,
+            ddb_sync_changeset_apply_json,
+            &serde_json::json!({ "changeset": changeset }),
+        );
+        assert_eq!(apply["outcome"], "applied");
+        assert_eq!(apply["rows_applied"], 1);
+
+        let replay = changeset_exec_json(
+            dst,
+            ddb_sync_changeset_apply_json,
+            &serde_json::json!({ "changeset": changeset }),
+        );
+        assert_eq!(replay["outcome"], "already_applied");
+
+        let inverse = changeset_exec_json(
+            src,
+            ddb_sync_changeset_invert_json,
+            &serde_json::json!({ "changeset": changeset }),
+        );
+        assert_eq!(inverse["records"][0]["operation"], "delete");
+
+        assert_eq!(ddb_db_free(&mut src), DDB_OK);
+        assert_eq!(ddb_db_free(&mut dst), DDB_OK);
+    }
+
+    #[test]
+    fn ffi_watch_query_json_delivers_initial_and_invalidation_events() {
+        let dir = tempfile::TempDir::with_prefix("decentdb-c-api-reactive").unwrap();
+        let path = dir.path().join("reactive-json.ddb");
+        let path = CString::new(path.to_string_lossy().as_bytes()).expect("path");
+        let mut db = ptr::null_mut();
+        assert_eq!(ddb_db_open_or_create(path.as_ptr(), &mut db), DDB_OK);
+
+        let create = CString::new("CREATE TABLE users (id INT64 PRIMARY KEY, name TEXT)").unwrap();
+        let mut result = ptr::null_mut();
+        assert_eq!(
+            ddb_db_execute(db, create.as_ptr(), ptr::null(), 0, &mut result),
+            DDB_OK
+        );
+        assert_eq!(ddb_result_free(&mut result), DDB_OK);
+
+        let request = CString::new(r#"{"sql":"SELECT name FROM users ORDER BY id"}"#).unwrap();
+        let mut watch = ptr::null_mut();
+        assert_eq!(
+            ddb_db_watch_query_json(db, request.as_ptr(), &mut watch),
+            DDB_OK
+        );
+
+        let mut json_ptr = ptr::null_mut();
+        assert_eq!(ddb_watch_next_json(watch, 1000, &mut json_ptr), DDB_OK);
+        let initial = parse_json(&mut json_ptr);
+        assert_eq!(initial["type"], "initial");
+
+        let insert = CString::new("INSERT INTO users (id, name) VALUES (1, 'Ada')").unwrap();
+        assert_eq!(
+            ddb_db_execute(db, insert.as_ptr(), ptr::null(), 0, &mut result),
+            DDB_OK
+        );
+        assert_eq!(ddb_result_free(&mut result), DDB_OK);
+
+        assert_eq!(ddb_watch_next_json(watch, 1000, &mut json_ptr), DDB_OK);
+        let event = parse_json(&mut json_ptr);
+        assert_eq!(event["type"], "invalidate");
+        assert_eq!(event["tables"][0], "users");
+
+        assert_eq!(ddb_watch_close(&mut watch), DDB_OK);
+        assert!(watch.is_null());
         assert_eq!(ddb_db_free(&mut db), DDB_OK);
     }
 }

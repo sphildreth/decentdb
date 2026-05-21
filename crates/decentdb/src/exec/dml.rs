@@ -117,6 +117,7 @@ pub(crate) struct PreparedSimpleDeleteRestrictChild {
 
 #[derive(Clone, Debug)]
 pub(crate) struct PreparedSimpleDelete {
+    pub(crate) table_name: String,
     pub(crate) table: crate::catalog::TableSchema,
     pub(crate) indexes: Vec<crate::catalog::IndexSchema>,
     pub(crate) lookup: PreparedDeleteLookup,
@@ -225,7 +226,7 @@ impl EngineRuntime {
             }
         }
         if assignment_targets_referenced_parent_key_columns(self, table, &assignment_columns) {
-            for child in collect_direct_referencing_tables(self, &statement.table_name) {
+            for child in collect_direct_referencing_tables(self, &table.name) {
                 if dependencies
                     .iter()
                     .any(|name| identifiers_equal(name, child.as_str()))
@@ -281,7 +282,7 @@ impl EngineRuntime {
                 }
             }
             if assignment_targets_referenced_parent_key_columns(self, table, &assignment_columns) {
-                for child in collect_direct_referencing_tables(self, &statement.table_name) {
+                for child in collect_direct_referencing_tables(self, &table.name) {
                     if dependencies
                         .iter()
                         .any(|name| identifiers_equal(name, child.as_str()))
@@ -307,6 +308,12 @@ impl EngineRuntime {
     }
 
     fn can_execute_update_in_state_without_clone(&self, statement: &UpdateStatement) -> bool {
+        if super::compat_schema_qualified_name(&statement.table_name)
+            .0
+            .is_some()
+        {
+            return false;
+        }
         if !statement.returning.is_empty() {
             return false;
         }
@@ -362,7 +369,7 @@ impl EngineRuntime {
             .catalog
             .indexes
             .values()
-            .filter(|index| identifiers_equal(&index.table_name, &statement.table_name))
+            .filter(|index| identifiers_equal(&index.table_name, &table.name))
             .collect::<Vec<_>>();
         if table_indexes.iter().any(|index| {
             !index.fresh
@@ -379,6 +386,12 @@ impl EngineRuntime {
     }
 
     fn can_execute_delete_in_state_without_clone(&self, statement: &DeleteStatement) -> bool {
+        if super::compat_schema_qualified_name(&statement.table_name)
+            .0
+            .is_some()
+        {
+            return false;
+        }
         if !statement.returning.is_empty() {
             return false;
         }
@@ -399,7 +412,7 @@ impl EngineRuntime {
             .catalog
             .indexes
             .values()
-            .filter(|index| identifiers_equal(&index.table_name, &statement.table_name))
+            .filter(|index| identifiers_equal(&index.table_name, &table.name))
             .collect::<Vec<_>>();
         if table_indexes.iter().any(|index| {
             !index.fresh
@@ -416,6 +429,7 @@ impl EngineRuntime {
     }
 
     fn has_table_trigger(&self, table_name: &str, event: TriggerEvent) -> bool {
+        let table_name = super::compat_unqualified_name(table_name);
         self.catalog.triggers.values().any(|trigger| {
             !trigger.on_view
                 && identifiers_equal(&trigger.target_name, table_name)
@@ -424,6 +438,12 @@ impl EngineRuntime {
     }
 
     pub(crate) fn can_execute_insert_in_place(&self, statement: &InsertStatement) -> bool {
+        if super::compat_schema_qualified_name(&statement.table_name)
+            .0
+            .is_some()
+        {
+            return false;
+        }
         if self
             .visible_view(&statement.table_name, super::NameResolutionScope::Session)
             .is_some()
@@ -446,11 +466,7 @@ impl EngineRuntime {
         if !matches!(&statement.source, InsertSource::Values(rows) if rows.len() == 1) {
             return false;
         }
-        !self.catalog.triggers.values().any(|trigger| {
-            !trigger.on_view
-                && identifiers_equal(&trigger.target_name, &statement.table_name)
-                && trigger.event == TriggerEvent::Insert
-        })
+        !self.has_table_trigger(&statement.table_name, TriggerEvent::Insert)
     }
 
     fn can_execute_insert_in_state_without_clone(&self, statement: &InsertStatement) -> bool {
@@ -641,9 +657,12 @@ impl EngineRuntime {
             foreign_keys.push(prepared_foreign_key);
         }
         let mut unique_indexes = Vec::new();
-        for index in self.catalog.indexes.values().filter(|index| {
-            identifiers_equal(&index.table_name, &statement.table_name) && index.unique
-        }) {
+        for index in self
+            .catalog
+            .indexes
+            .values()
+            .filter(|index| identifiers_equal(&index.table_name, &table.name) && index.unique)
+        {
             let Some(prepared_index) = prepare_btree_insert_index(self, table, index)? else {
                 use_generic_validation = true;
                 unique_indexes.clear();
@@ -653,9 +672,12 @@ impl EngineRuntime {
         }
         let mut use_generic_index_updates = false;
         let mut insert_indexes = Vec::new();
-        for index in self.catalog.indexes.values().filter(|index| {
-            identifiers_equal(&index.table_name, &statement.table_name) && index.fresh
-        }) {
+        for index in self
+            .catalog
+            .indexes
+            .values()
+            .filter(|index| identifiers_equal(&index.table_name, &table.name) && index.fresh)
+        {
             let Some(prepared_index) = prepare_btree_insert_index(self, table, index)? else {
                 use_generic_index_updates = true;
                 insert_indexes.clear();
@@ -664,8 +686,14 @@ impl EngineRuntime {
             insert_indexes.push(prepared_index);
         }
 
+        let prepared_table_name = match super::compat_schema_qualified_name(&statement.table_name).0
+        {
+            Some(super::CompatSchemaQualifier::Main) => format!("main.{}", table.name),
+            _ => table.name.clone(),
+        };
+
         Ok(Some(PreparedSimpleInsert {
-            table_name: table.name.clone(),
+            table_name: prepared_table_name,
             row_source_dependency_tables,
             columns,
             primary_auto_row_id_column_index,
@@ -750,8 +778,14 @@ impl EngineRuntime {
             return Ok(None);
         }
 
+        let prepared_table_name = match super::compat_schema_qualified_name(&statement.table_name).0
+        {
+            Some(super::CompatSchemaQualifier::Main) => format!("main.{}", table.name),
+            _ => table.name.clone(),
+        };
+
         Ok(Some(PreparedSimpleUpdate {
-            table_name: table.name.clone(),
+            table_name: prepared_table_name,
             column_index,
             column_type: column.column_type,
             nullable: column.nullable,
@@ -824,19 +858,20 @@ impl EngineRuntime {
                     );
                     if self.sync_capture_active() {
                         let sync_info = self
-                            .catalog
-                            .table(prepared.table_name.as_str())
+                            .table_schema(prepared.table_name.as_str())
+                            .filter(|schema| !schema.temporary)
                             .filter(|schema| self.should_record_sync_mutation_for_table(schema))
                             .map(|schema| {
                                 (
+                                    schema.name.clone(),
                                     sync::build_primary_key_json(schema, &updated_values),
                                     sync::build_after_json(schema, &updated_values),
                                 )
                             });
-                        if let Some((pk, after)) = sync_info {
+                        if let Some((table_name, pk, after)) = sync_info {
                             let schema_cookie = self.catalog.schema_cookie;
                             self.record_sync_mutation(
-                                &prepared.table_name,
+                                &table_name,
                                 SyncOperation::Update,
                                 pk,
                                 Some(after),
@@ -874,19 +909,20 @@ impl EngineRuntime {
                     self.mark_table_dirty(&prepared.table_name);
                     if self.sync_capture_active() {
                         let sync_data = self
-                            .catalog
-                            .table(prepared.table_name.as_str())
+                            .table_schema(prepared.table_name.as_str())
+                            .filter(|schema| !schema.temporary)
                             .filter(|schema| self.should_record_sync_mutation_for_table(schema))
                             .map(|schema| {
                                 (
+                                    schema.name.clone(),
                                     sync::build_primary_key_json(schema, &updated_values),
                                     sync::build_after_json(schema, &updated_values),
                                 )
                             });
-                        if let Some((pk, after)) = sync_data {
+                        if let Some((table_name, pk, after)) = sync_data {
                             let schema_cookie = self.catalog.schema_cookie;
                             self.record_sync_mutation(
-                                &prepared.table_name,
+                                &table_name,
                                 SyncOperation::Update,
                                 pk,
                                 Some(after),
@@ -967,7 +1003,14 @@ impl EngineRuntime {
             }
         };
 
+        let prepared_table_name = match super::compat_schema_qualified_name(&statement.table_name).0
+        {
+            Some(super::CompatSchemaQualifier::Main) => format!("main.{}", table.name),
+            _ => table.name.clone(),
+        };
+
         Ok(Some(PreparedSimpleDelete {
+            table_name: prepared_table_name,
             table,
             indexes,
             lookup,
@@ -979,7 +1022,7 @@ impl EngineRuntime {
     pub(crate) fn can_reuse_prepared_simple_delete(&self, prepared: &PreparedSimpleDelete) -> bool {
         // Schema cookie is validated before this is called, so the table exists.
         // Only check temp-table shadowing and index state.
-        !self.visible_table_is_temporary(&prepared.table.name)
+        !self.visible_table_is_temporary(&prepared.table_name)
             && prepared.compiled_index_state_epoch == self.index_state_epoch
             && prepared
                 .restrict_children
@@ -999,7 +1042,7 @@ impl EngineRuntime {
                 else {
                     return Ok(QueryResult::with_affected_rows(0));
                 };
-                match self.visible_table_row_source(&prepared.table.name) {
+                match self.visible_table_row_source(&prepared.table_name) {
                     Some(row_source) if row_source.row_by_id(row_id)?.is_some() => vec![row_id],
                     _ => Vec::new(),
                 }
@@ -1023,9 +1066,9 @@ impl EngineRuntime {
         }
 
         let row_source = self
-            .table_row_source(&prepared.table.name)
+            .table_row_source(&prepared.table_name)
             .ok_or_else(|| {
-                DbError::internal(format!("table data for {} is missing", prepared.table.name))
+                DbError::internal(format!("table data for {} is missing", prepared.table_name))
             })?
             .clone();
         let mut removed_rows = Vec::with_capacity(matching_row_ids.len());
@@ -1055,10 +1098,10 @@ impl EngineRuntime {
         match row_source {
             TableRowSource::Resident(_) => {
                 let mut row_indices = {
-                    let table_data = self.table_data(&prepared.table.name).ok_or_else(|| {
+                    let table_data = self.table_data(&prepared.table_name).ok_or_else(|| {
                         DbError::internal(format!(
                             "table data for {} is missing",
-                            prepared.table.name
+                            prepared.table_name
                         ))
                     })?;
                     let mut indices = Vec::with_capacity(matching_row_ids.len());
@@ -1073,10 +1116,10 @@ impl EngineRuntime {
                 row_indices.sort_unstable_by(|left, right| right.cmp(left));
                 {
                     let table_data =
-                        self.table_data_mut(&prepared.table.name).ok_or_else(|| {
+                        self.table_data_mut(&prepared.table_name).ok_or_else(|| {
                             DbError::internal(format!(
                                 "table data for {} is missing",
-                                prepared.table.name
+                                prepared.table_name
                             ))
                         })?;
                     for &row_index in &row_indices {
@@ -1093,7 +1136,7 @@ impl EngineRuntime {
                 let updated_manifest =
                     super::apply_paged_row_changes_to_manifest(manifest.as_ref(), &row_changes)?;
                 self.replace_table_row_source(
-                    &prepared.table.name,
+                    &prepared.table_name,
                     TableRowSource::Paged(Arc::new(updated_manifest)),
                 )?;
             }
@@ -1111,7 +1154,7 @@ impl EngineRuntime {
             }
         }
 
-        self.mark_table_dirty(&prepared.table.name);
+        self.mark_table_dirty(&prepared.table_name);
         if self.should_record_sync_mutation_for_table(&prepared.table) {
             for row in &removed_rows {
                 let pk = sync::build_primary_key_json(&prepared.table, &row.values);
@@ -1206,8 +1249,8 @@ impl EngineRuntime {
             candidate.push(super::cast_value(value, column.column_type)?);
         }
         let sync_schema = self
-            .catalog
-            .table(prepared.table_name.as_str())
+            .table_schema(prepared.table_name.as_str())
+            .filter(|schema| !schema.temporary)
             .filter(|schema| self.should_record_sync_mutation_for_table(schema))
             .cloned();
         let candidate_clone = sync_schema.as_ref().map(|_| candidate.clone());
@@ -1224,7 +1267,7 @@ impl EngineRuntime {
                 let after = sync::build_after_json(schema, values);
                 let schema_cookie = self.catalog.schema_cookie;
                 self.record_sync_mutation(
-                    &prepared.table_name,
+                    &schema.name,
                     SyncOperation::Insert,
                     pk,
                     Some(after),
@@ -1408,8 +1451,13 @@ impl EngineRuntime {
                 .push(stored_row);
             return Ok(());
         }
+        let Some(canonical_table_name) = self.canonical_catalog_table_name(table_name) else {
+            return Err(DbError::internal(format!(
+                "table row source for {table_name} is missing"
+            )));
+        };
         let use_paged_row_storage = self.paged_row_storage;
-        let Some(row_source) = self.entry_table_row_source_mut(table_name) else {
+        let Some(row_source) = self.entry_table_row_source_mut(&canonical_table_name) else {
             return Err(DbError::internal(format!(
                 "table row source for {table_name} is missing"
             )));
@@ -1920,12 +1968,13 @@ impl EngineRuntime {
             .table_schema(&table_name)
             .cloned()
             .ok_or_else(|| DbError::sql(format!("unknown table {}", table_name)))?;
-        let matching_row_ids = matching_row_ids(self, &table, statement.filter.as_ref(), params)?;
+        let matching_row_ids =
+            matching_row_ids(self, &table_name, &table, statement.filter.as_ref(), params)?;
         let table_indexes = self
             .catalog
             .indexes
             .values()
-            .filter(|index| identifiers_equal(&index.table_name, &table_name))
+            .filter(|index| identifiers_equal(&index.table_name, &table.name))
             .cloned()
             .collect::<Vec<_>>();
         let mut indexes_remain_fresh = table_indexes.iter().all(|index| index.fresh);
@@ -1975,20 +2024,22 @@ impl EngineRuntime {
             && !has_referencing_tables
             && !updates_foreign_key_columns
             && matching_row_ids.len() == 1;
-        if let Some(result) = self.try_execute_paged_generic_update(
-            statement,
-            &table,
-            &matching_row_ids,
-            &assignment_columns,
-            assignment_only_validation,
-            updates_foreign_key_columns,
-            has_referencing_tables,
-            &table_indexes,
-            &indexes_to_update,
-            params,
-            page_size,
-        )? {
-            return Ok(result);
+        if !table.temporary {
+            if let Some(result) = self.try_execute_paged_generic_update(
+                statement,
+                &table,
+                &matching_row_ids,
+                &assignment_columns,
+                assignment_only_validation,
+                updates_foreign_key_columns,
+                has_referencing_tables,
+                &table_indexes,
+                &indexes_to_update,
+                params,
+                page_size,
+            )? {
+                return Ok(result);
+            }
         }
         if updates_single_row_fast_path && assignment_columns.len() == 1 {
             let Some(single_row_id) = matching_row_ids.first().copied() else {
@@ -2293,32 +2344,35 @@ impl EngineRuntime {
             .table_schema(&table_name)
             .cloned()
             .ok_or_else(|| DbError::sql(format!("unknown table {}", table_name)))?;
-        let matching_row_ids = matching_row_ids(self, &table, statement.filter.as_ref(), params)?;
+        let matching_row_ids =
+            matching_row_ids(self, &table_name, &table, statement.filter.as_ref(), params)?;
         let restrict_children = if table.temporary {
             Vec::new()
         } else {
             prepare_simple_delete_restrict_children(self, &table)?.unwrap_or_default()
         };
         let has_referencing_tables =
-            !table.temporary && !collect_direct_referencing_tables(self, &table_name).is_empty();
+            !table.temporary && !collect_direct_referencing_tables(self, &table.name).is_empty();
         let table_indexes = self
             .catalog
             .indexes
             .values()
-            .filter(|index| identifiers_equal(&index.table_name, &table_name))
+            .filter(|index| identifiers_equal(&index.table_name, &table.name))
             .cloned()
             .collect::<Vec<_>>();
-        if let Some(result) = self.try_execute_paged_generic_delete(
-            statement,
-            &table,
-            &matching_row_ids,
-            has_referencing_tables,
-            &restrict_children,
-            &table_indexes,
-            params,
-            page_size,
-        )? {
-            return Ok(result);
+        if !table.temporary {
+            if let Some(result) = self.try_execute_paged_generic_delete(
+                statement,
+                &table,
+                &matching_row_ids,
+                has_referencing_tables,
+                &restrict_children,
+                &table_indexes,
+                params,
+                page_size,
+            )? {
+                return Ok(result);
+            }
         }
         if statement.returning.is_empty() && !has_referencing_tables {
             let mut row_indices = {
@@ -2993,7 +3047,10 @@ fn can_execute_row_local_update_assignment_expr(expr: &Expr, table_name: &str) -
         Expr::Function { args, .. } => args
             .iter()
             .all(|arg| can_execute_row_local_update_assignment_expr(arg, table_name)),
-        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+        Expr::Unary { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Collate { expr, .. } => {
             can_execute_row_local_update_assignment_expr(expr, table_name)
         }
         Expr::Binary { left, right, .. } => {
@@ -3637,14 +3694,17 @@ pub(super) fn primary_row_id(table: &crate::catalog::TableSchema, row: &[Value])
 
 fn matching_row_ids(
     runtime: &EngineRuntime,
+    table_ref: &str,
     table: &crate::catalog::TableSchema,
     filter: Option<&Expr>,
     params: &[Value],
 ) -> Result<Vec<i64>> {
-    if let Some(indexed_row_ids) = indexed_row_ids_for_filter(runtime, table, filter, params)? {
+    if let Some(indexed_row_ids) =
+        indexed_row_ids_for_filter(runtime, table_ref, table, filter, params)?
+    {
         return Ok(indexed_row_ids);
     }
-    let Some(row_source) = runtime.visible_table_row_source(&table.name) else {
+    let Some(row_source) = runtime.visible_table_row_source(table_ref) else {
         return Ok(Vec::new());
     };
     let mut matching = Vec::new();
@@ -3663,6 +3723,7 @@ fn matching_row_ids(
 
 fn indexed_row_ids_for_filter(
     runtime: &EngineRuntime,
+    table_ref: &str,
     table: &crate::catalog::TableSchema,
     filter: Option<&Expr>,
     params: &[Value],
@@ -3677,7 +3738,9 @@ fn indexed_row_ids_for_filter(
         return Ok(None);
     };
     if let Some(filter_table) = filter_table {
-        if !identifiers_equal(filter_table, &table.name) {
+        if !identifiers_equal(filter_table, &table.name)
+            && !identifiers_equal(filter_table, table_ref)
+        {
             return Ok(None);
         }
     }
@@ -3694,12 +3757,15 @@ fn indexed_row_ids_for_filter(
     }
     if row_id_alias_column_name(table).is_some_and(|entry| identifiers_equal(entry, column_name)) {
         return Ok(Some(match value {
-            Value::Int64(row_id) => match runtime.visible_table_row_source(&table.name) {
+            Value::Int64(row_id) => match runtime.visible_table_row_source(table_ref) {
                 Some(row_source) if row_source.row_by_id(row_id)?.is_some() => vec![row_id],
                 _ => Vec::new(),
             },
             _ => Vec::new(),
         }));
+    }
+    if runtime.visible_table_is_temporary(table_ref) {
+        return Ok(None);
     }
 
     let Some(index) = runtime.catalog.indexes.values().find(|index| {

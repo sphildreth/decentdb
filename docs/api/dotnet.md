@@ -27,6 +27,15 @@ Core, and MicroORM surfaces. Performance-critical paths (batch execution, fused
 bind+step, re-execute, zero-copy row views) are exposed through
 `DecentDBNativeUnsafe` and wrapped by the `PreparedStatement` class.
 
+ADO.NET connection strings pass native write-queue options through to the C ABI:
+`Write Queue Enabled`, `Write Queue Capacity`, `Write Queue Default Timeout Ms`,
+`Write Queue Strict Group Commit`, `Write Queue Max Batch`, and
+`Write Queue Max Group Delay Us`. The `DecentDB.Native.DecentDB` class also
+exposes `ExecuteQueued(sql)` for self-contained queued SQL and
+`WriteQueueMetrics()` for native queue counters. ADO.NET prepared statements
+remain on the direct prepared path until the C ABI adds queued
+prepared-statement execution.
+
 ## Use via NuGet
 
 For normal application development, prefer the published NuGet packages. You do
@@ -220,7 +229,7 @@ The current in-tree provider validation covers:
 ## Version introspection
 
 ```csharp
-uint abi = DecentDB.AbiVersion();       // e.g. 2
+uint abi = DecentDB.AbiVersion();       // e.g. 4
 string ver = DecentDB.EngineVersion();  // e.g. "2.0.0"
 
 // Via ADO.NET
@@ -402,6 +411,10 @@ same client is also exposed from `DecentDB.Native.DecentDB.Sync`.
 - `GetRetentionReport` / `GetRetentionReportAsync`
 - `GetPeerLag` / `GetPeerLagAsync`
 - `Prune` / `PruneAsync`
+- `CreateChangeset` / `CreateChangesetAsync`
+- `InspectChangeset` / `InspectChangesetAsync`
+- `ApplyChangeset` / `ApplyChangesetAsync`
+- `InvertChangeset` / `InvertChangesetAsync`
 
 Returned models include:
 
@@ -454,6 +467,19 @@ var doctor = await connection.Sync.GetDoctorReportAsync();
 var retention = await connection.Sync.GetRetentionReportAsync();
 var conflicts = await connection.Sync.ListConflictsAsync();
 var raw = await connection.Sync.ExecuteRawJsonAsync("{\"op\":\"status\"}");
+```
+
+Changeset helpers accept and return `JsonElement` so .NET applications can use
+the stable JSON envelope while typed models evolve:
+
+```csharp
+using System.Text.Json;
+
+var options = JsonSerializer.Deserialize<JsonElement>(
+    "{\"source\":{\"kind\":\"checkpoint\",\"peer\":\"relay\",\"since_sequence\":0}}");
+var changeset = await connection.Sync.CreateChangesetAsync(options);
+var inspection = await connection.Sync.InspectChangesetAsync(changeset);
+var applyResult = await connection.Sync.ApplyChangesetAsync(changeset);
 ```
 
 ## Performance sanity guidance

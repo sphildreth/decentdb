@@ -74,11 +74,65 @@ int main(void) {
         "insert");
   check(ddb_result_free(&result), "free insert");
 
+  check(ddb_db_execute_queued(
+            db, "INSERT INTO smoke (id, name) VALUES (2, 'c-queued')", NULL, 0,
+            DDB_WRITE_QUEUE_TIMEOUT_DEFAULT, &result),
+        "queued insert");
+  check(ddb_result_free(&result), "free queued insert");
+  ddb_write_queue_metrics_t queue_metrics;
+  check(ddb_db_write_queue_metrics(db, &queue_metrics), "queue metrics");
+  if (queue_metrics.admitted != 1 || queue_metrics.committed != 1 ||
+      queue_metrics.failed != 0) {
+    fprintf(stderr,
+            "unexpected queue metrics: admitted=%llu committed=%llu failed=%llu\n",
+            (unsigned long long)queue_metrics.admitted,
+            (unsigned long long)queue_metrics.committed,
+            (unsigned long long)queue_metrics.failed);
+    return 1;
+  }
+
+  ddb_watch_t *watch = NULL;
+  char *watch_event = NULL;
+  check(ddb_db_watch_query_json(
+            db, "{\"sql\":\"SELECT id, name FROM smoke ORDER BY id\"}",
+            &watch),
+        "watch query");
+  check(ddb_watch_next_json(watch, 1000, &watch_event), "watch initial");
+  if (strstr(watch_event, "\"type\":\"initial\"") == NULL ||
+      strstr(watch_event, "\"rows\"") == NULL) {
+    fprintf(stderr, "unexpected initial watch event: %s\n", watch_event);
+    return 1;
+  }
+  check(ddb_string_free(&watch_event), "free watch initial");
+
+  check(ddb_db_execute(db,
+                       "INSERT INTO smoke (id, name) VALUES (3, 'c-watch')",
+                       NULL, 0, &result),
+        "watch insert");
+  check(ddb_result_free(&result), "free watch insert");
+  check(ddb_watch_next_json(watch, 1000, &watch_event), "watch invalidate");
+  if (strstr(watch_event, "\"type\":\"invalidate\"") == NULL ||
+      strstr(watch_event, "\"smoke\"") == NULL ||
+      strstr(watch_event, "\"insert\"") == NULL) {
+    fprintf(stderr, "unexpected invalidate watch event: %s\n", watch_event);
+    return 1;
+  }
+  check(ddb_string_free(&watch_event), "free watch invalidate");
+  if (ddb_watch_next_json(watch, 1, &watch_event) != DDB_ERR_TIMEOUT) {
+    fprintf(stderr, "expected watch timeout after draining events\n");
+    return 1;
+  }
+  check(ddb_watch_close(&watch), "close watch");
+  if (watch != NULL) {
+    fprintf(stderr, "watch close did not null the handle\n");
+    return 1;
+  }
+
   check(ddb_db_execute(db, "SELECT id, name FROM smoke", NULL, 0, &result),
         "select");
   check(ddb_result_row_count(result, &rows), "row_count");
-  if (rows != 1) {
-    fprintf(stderr, "expected 1 row, got %zu\n", rows);
+  if (rows != 3) {
+    fprintf(stderr, "expected 3 rows, got %zu\n", rows);
     return 1;
   }
   check(ddb_result_free(&result), "free select");

@@ -2,6 +2,8 @@ package com.decentdb.jdbc;
 
 import java.sql.SQLException;
 import java.sql.SQLFeatureNotSupportedException;
+import java.sql.SQLTimeoutException;
+import java.sql.SQLTransientException;
 
 /**
  * Builds {@link SQLException} instances with appropriate SQLState codes.
@@ -61,6 +63,14 @@ final class Errors {
             case DecentDBNative.ERR_IO:
             case DecentDBNative.ERR_CORRUPTION:
                 return new SQLException(msg, "08006", code);
+            case DecentDBNative.ERR_TIMEOUT:
+                return new SQLTimeoutException(msg, "HYT00", code);
+            case DecentDBNative.ERR_BUSY:
+            case DecentDBNative.ERR_QUEUE_FULL:
+            case DecentDBNative.ERR_QUEUE_CLOSED:
+                return new SQLTransientException(msg, "HYT00", code);
+            case DecentDBNative.ERR_CANCELED:
+                return new SQLTransientException(msg, "57014", code);
             default:
                 return general(msg, code);
         }

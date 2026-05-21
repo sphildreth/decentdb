@@ -30,10 +30,17 @@ It targets a single process with **one writer** and **many concurrent readers** 
 
 - 🔒 **ACID Transactions** - Write-ahead logging with crash-safe recovery
 - 🌳 **B+Tree Storage** - Efficient tables and secondary indexes with page caching
-- 🔁 **Local-First Sync** - Durable change journals, scoped peer replication, conflict workflows, operational doctor tooling, CLI commands, and a typed .NET sync SDK
+- 🔁 **Local-First Sync** - Durable change journals, public changeset APIs, production HTTP/WebSocket relay, shape subscriptions, scoped peer replication, conflict workflows, operational doctor tooling, CLI commands, and .NET/web helpers
+- 📡 **Reactive Subscriptions** - In-process table, range, query, and change-stream watches deliver committed invalidation events with LSN boundaries, bounded lag handling, C ABI JSON polling, and Python/Go direct helpers
+- 🖥️ **Built-In HTTP Server And Web Console** - `decentdb serve` exposes a local HTTP API and embedded browser console for inspection, SQL execution, schema browsing, EXPLAIN, CSV export, and scripting
+- 🌐 **WASM Browser OPFS Support** - `@decentdb/web` runs DecentDB in a Dedicated Worker with an OPFS-backed VFS, async TypeScript API, binary result transport, checkpoint, import/export, persistence helpers, and browser smoke/benchmark coverage
 - 🐘 **PostgreSQL-like SQL** - Familiar DDL/DML syntax with JOINs (INNER, LEFT, RIGHT, FULL OUTER, CROSS, NATURAL), CTEs (including WITH RECURSIVE), subqueries, window functions, and rich types (UUID, DECIMAL, native TIMESTAMP)
+- 🔎 **SQLite/PostgreSQL Compatibility Helpers** - Safe SQLite-style PRAGMAs, `sqlite_schema`, minimal `information_schema`, `generate_series`, `main.`/`temp.` qualifiers, and query-time built-in collations for easier tool and migration onboarding
+- 🧩 **Lua Extensions** - Manifest-declared Lua packages add scalar functions, table-valued functions, aggregates, and query-time collations with explicit install, enable, content-hash trust, CLI, Rust, and C ABI lifecycle APIs
 - 🕒 **Native TIMESTAMP Type** - DATE/TIMESTAMP columns stored as int64 microseconds since Unix epoch (UTC); correct `ORDER BY` and `EXTRACT(YEAR|MONTH|DAY|HOUR|MINUTE|SECOND FROM ...)`, with native bind/read in all bindings
 - 👥 **Concurrent Reads** - Snapshot isolation allows multiple readers with one writer
+- 🚦 **Queued Write Concurrency** - Engine-owned bounded write queue with timeouts, metrics, and strict durable group commit for predictable in-process concurrent writes
+- 📈 **Queryable Operational Metrics** - Stable `sys.*` inspection views expose WAL, write-queue, storage, reactive subscription, and sync status snapshots without telemetry writes
 - 🌿 **Branch, Diff, Restore, And Time Travel** - Named snapshots, isolated branch writes, branch diffs, guarded restore, and constrained merge for migration rehearsal and agent sandboxes
 - 🔎 **Trigram Index** - Fast text search for `LIKE '%pattern%'` queries
 - 🗺️ **Native Geospatial** - `GEOMETRY` / `GEOGRAPHY` values, `ST_*` functions, and `USING spatial` indexes
@@ -64,6 +71,7 @@ It targets a single process with **one writer** and **many concurrent readers** 
 | Go       | `database/sql` driver                        | Embedded `database/sql` driver with `$N` positional parameters                                                      | [decentdb.org/api/go](https://decentdb.org/api/go/)         |
 | Node.js  | N-API + Knex                                 | Embedded native addon + Knex client for building/issuing queries                                                    | [decentdb.org/api/node](https://decentdb.org/api/node/)     |
 | Python 3 | SQLAlchemy                                   | Embedded DB-API driver + SQLAlchemy dialect                                                                         | [decentdb.org/api/python](https://decentdb.org/api/python/) |
+| Web      | TypeScript + WASM + OPFS                     | Browser binding with a Dedicated Worker runtime and OPFS persistence                                                | [decentdb.org/api/wasm](https://decentdb.org/api/wasm/)     |
 
 ## Tools
 
@@ -230,6 +238,7 @@ Common commands:
 
 - `exec` - Execute SQL statements
 - `repl` - Interactive SQL shell
+- `extension` - Validate, install, enable, and inspect Lua extension packages
 - `import` / `export` - Data transfer
 - `bulk-load` - High-performance data loading
 - `checkpoint` - WAL maintenance

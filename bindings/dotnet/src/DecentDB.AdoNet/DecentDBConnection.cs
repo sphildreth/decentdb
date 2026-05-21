@@ -540,6 +540,42 @@ namespace DecentDB.AdoNet
                 AppendNativeOption(options, "wal_autocheckpoint", walAutoCheckpoint);
             }
 
+            if (kvps.TryGetValue("Write Queue Enabled", out var writeQueueEnabled) &&
+                !string.IsNullOrWhiteSpace(writeQueueEnabled))
+            {
+                AppendNativeOption(options, "write_queue_enabled", writeQueueEnabled);
+            }
+
+            if (kvps.TryGetValue("Write Queue Capacity", out var writeQueueCapacity) &&
+                !string.IsNullOrWhiteSpace(writeQueueCapacity))
+            {
+                AppendNativeOption(options, "write_queue_capacity", writeQueueCapacity);
+            }
+
+            if (kvps.TryGetValue("Write Queue Default Timeout Ms", out var writeQueueTimeout) &&
+                !string.IsNullOrWhiteSpace(writeQueueTimeout))
+            {
+                AppendNativeOption(options, "write_queue_default_timeout_ms", writeQueueTimeout);
+            }
+
+            if (kvps.TryGetValue("Write Queue Strict Group Commit", out var writeQueueGroupCommit) &&
+                !string.IsNullOrWhiteSpace(writeQueueGroupCommit))
+            {
+                AppendNativeOption(options, "write_queue_strict_group_commit", writeQueueGroupCommit);
+            }
+
+            if (kvps.TryGetValue("Write Queue Max Batch", out var writeQueueMaxBatch) &&
+                !string.IsNullOrWhiteSpace(writeQueueMaxBatch))
+            {
+                AppendNativeOption(options, "write_queue_max_batch", writeQueueMaxBatch);
+            }
+
+            if (kvps.TryGetValue("Write Queue Max Group Delay Us", out var writeQueueGroupDelay) &&
+                !string.IsNullOrWhiteSpace(writeQueueGroupDelay))
+            {
+                AppendNativeOption(options, "write_queue_max_group_delay_us", writeQueueGroupDelay);
+            }
+
             return options.ToString();
         }
 

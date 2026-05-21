@@ -19,7 +19,7 @@ inspection, and SDK surfaces.
 | Manual batch export/import | ✅ (`sync export` / `sync import`) | ⚠️ (changesets via optional extension) | ⚠️ (logical replication/dump tooling) | ❌ |
 | Scoped row replication | ✅ (named scopes with validated row filters) | ❌ | ⚠️ (publication filters; server replication) | ❌ |
 | Conflict recording and manual resolution | ✅ (`sync conflicts`, `sync conflict show/resolve/reopen`) | ❌ | ⚠️ (replication conflicts exist, but no embedded app conflict workflow) | ❌ |
-| Operational sync inspection | ✅ (`sys_sync_*` inspection queries) | ❌ | ⚠️ (system catalogs and monitoring views, server-oriented) | ❌ |
+| Operational sync inspection | ✅ (`sys.*` inspection views; `sys_sync_*` compatibility) | ❌ | ⚠️ (system catalogs and monitoring views, server-oriented) | ❌ |
 | Sync doctor, retention, peer lag, prune | ✅ | ❌ | ⚠️ (separate server administration surfaces) | ❌ |
 | Local HTTP sync dev transport | ✅ (`sync run` / `sync serve`) | ❌ | ⚠️ (server replication protocols) | ❌ |
 | Typed .NET sync SDK | ✅ (`DecentDBSyncClient`) | ❌ | ❌ | ❌ |
@@ -39,6 +39,12 @@ decentdb sync conflicts --db=peer.ddb --format=table
 
 ```sql
 SELECT * FROM sys_sync_status;
+SELECT * FROM sys.sync_status;
+SELECT * FROM sys.wal_metrics;
+SELECT * FROM sys.write_queue_metrics;
+SELECT * FROM sys.storage_metrics;
+SELECT * FROM sys.reactive_metrics;
+SELECT * FROM sys.reactive_subscriptions;
 SELECT * FROM sys_sync_journal WHERE sequence > 100 ORDER BY sequence;
 SELECT * FROM sys_sync_conflicts ORDER BY conflict_id;
 SELECT * FROM sys_sync_doctor;
@@ -534,6 +540,23 @@ FROM orders;
 | json_each() | ✅ | ✅ | ❌ | ❌ (use unnest) |
 | json_tree() | ✅ | ✅ | ❌ | ❌ |
 
+### Table-Valued And Compatibility Functions
+
+| Function / Surface | DecentDB | SQLite | PostgreSQL | DuckDB |
+|----------|----------|--------|------------|--------|
+| generate_series() | ✅ | ❌ | ✅ | ✅ |
+| pragma_table_info() | ✅ | ✅ | ❌ | ❌ |
+| pragma_table_xinfo() | ✅ | ✅ | ❌ | ❌ |
+| pragma_table_list() | ✅ | ✅ | ❌ | ❌ |
+| pragma_index_list() | ✅ | ✅ | ❌ | ❌ |
+| pragma_index_info() | ✅ | ✅ | ❌ | ❌ |
+| pragma_index_xinfo() | ✅ | ✅ | ❌ | ❌ |
+| pragma_foreign_key_list() | ✅ | ✅ | ❌ | ❌ |
+| pragma_database_list() | ✅ | ✅ | ❌ | ❌ |
+| current_database() / current_schema() | ✅ | ❌ | ✅ | ❌ |
+| database() / schema() | ✅ | ❌ | ❌ | ✅ |
+| version() | ✅ | ✅ | ✅ | ✅ |
+
 ### Spatial Functions
 
 | Function | DecentDB | SQLite | PostgreSQL | DuckDB |
@@ -661,6 +684,7 @@ SELECT ST_Area(ST_GeomFromText('POLYGON((0 0,10 0,10 10,0 10,0 0))'));
 | % (modulo) | ✅ | ✅ | ✅ | ✅ |
 | \|\| (concat) | ✅ | ✅ | ✅ | ✅ |
 | LIKE/ILIKE | ✅ | ✅ | ✅ | ✅ |
+| `COLLATE BINARY` / `NOCASE` / `RTRIM` in queries | ✅ | ✅ | ⚠️ (different names/semantics) | ⚠️ |
 | BETWEEN | ✅ | ✅ | ✅ | ✅ |
 | IN | ✅ | ✅ | ✅ | ✅ |
 | EXISTS / NOT EXISTS | ✅ | ✅ | ✅ | ✅ |
@@ -763,9 +787,28 @@ COMMIT;  -- only X is committed
 | `PRAGMA page_size` | ✅ | ✅ | ❌ | ❌ |
 | `PRAGMA cache_size` | ✅ | ✅ | ❌ | ❌ |
 | `PRAGMA integrity_check` | ✅ | ✅ | ❌ | ❌ |
+| `PRAGMA quick_check` | ✅ | ✅ | ❌ | ❌ |
 | `PRAGMA database_list` | ✅ | ✅ | ❌ | ❌ |
 | `PRAGMA table_info(table)` | ✅ | ✅ | ❌ | ❌ |
-| Broad SQLite PRAGMA surface | ⚠️ (limited subset only) | ✅ | ❌ | ❌ |
+| `PRAGMA table_xinfo(table)` | ✅ | ✅ | ❌ | ❌ |
+| `PRAGMA table_list` | ✅ | ✅ | ❌ | ❌ |
+| `PRAGMA index_list(table)` | ✅ | ✅ | ❌ | ❌ |
+| `PRAGMA index_info(index)` | ✅ | ✅ | ❌ | ❌ |
+| `PRAGMA index_xinfo(index)` | ✅ | ✅ | ❌ | ❌ |
+| `PRAGMA foreign_key_list(table)` | ✅ | ✅ | ❌ | ❌ |
+| `PRAGMA foreign_keys` | ✅ (always `1`) | ✅ | ❌ | ❌ |
+| `PRAGMA journal_mode` | ✅ (WAL-only) | ✅ | ❌ | ❌ |
+| `PRAGMA synchronous` | ✅ (safe no-op assignment only) | ✅ | ❌ | ❌ |
+| `PRAGMA wal_checkpoint` | ✅ | ✅ | ❌ | ❌ |
+| `PRAGMA schema_version` | ✅ (read-only) | ✅ | ❌ | ❌ |
+| `PRAGMA user_version` / `application_id` | ✅ | ✅ | ❌ | ❌ |
+| `PRAGMA encoding` | ✅ (UTF-8 only) | ✅ | ❌ | ❌ |
+| `PRAGMA busy_timeout` | ✅ (queued writes) | ✅ | ❌ | ❌ |
+| `sqlite_schema` / `sqlite_master` | ✅ | ✅ | ❌ | ❌ |
+| `sqlite_temp_schema` / `temp.sqlite_schema` | ✅ | ✅ | ❌ | ❌ |
+| Minimal `information_schema` views | ✅ | ❌ | ✅ | ✅ |
+| `main.` / `temp.` qualified local objects | ✅ | ✅ | ✅ (different schema model) | ✅ |
+| Broad SQLite PRAGMA surface | ⚠️ (safe subset only) | ✅ | ❌ | ❌ |
 
 ### Examples
 
@@ -778,13 +821,28 @@ EXPLAIN ANALYZE SELECT * FROM orders WHERE user_id = 1;
 PRAGMA page_size;
 PRAGMA cache_size;
 PRAGMA integrity_check;
+PRAGMA quick_check;
 PRAGMA database_list;
 PRAGMA table_info(users);
+PRAGMA table_xinfo(users);
+PRAGMA table_list;
+PRAGMA index_list(users);
+PRAGMA index_info(users_name_idx);
+PRAGMA foreign_key_list(orders);
 
 -- Assignment form has constrained behavior in DecentDB:
--- no-op only when value matches current open configuration.
+-- no-op only when value matches current open configuration or a safe fixed mode.
 PRAGMA page_size = 4096;
 PRAGMA cache_size = 1024;
+PRAGMA foreign_keys = ON;
+PRAGMA journal_mode = WAL;
+PRAGMA user_version = 7;
+
+-- Compatibility catalog and helper surfaces
+SELECT type, name, tbl_name FROM sqlite_schema;
+SELECT table_schema, table_name FROM information_schema.tables;
+SELECT value FROM generate_series(1, 5);
+SELECT name FROM users ORDER BY name COLLATE NOCASE;
 ```
 
 ## Data Types

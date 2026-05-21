@@ -5,10 +5,10 @@
 
 ## Context
 
-FUTURE_WINS #1 requires branch, diff, restore, and time-travel workflows that
-preserve DecentDB's existing durability and snapshot guarantees.
+Branch, diff, restore, and time-travel workflows must preserve DecentDB's
+existing durability and snapshot guarantees.
 
-The implementation guide requires ADR B to decide:
+This ADR decides:
 
 - how a branch head points at database state
 - root manifest shape
@@ -136,8 +136,6 @@ metadata plus pager/WAL-managed page allocation.
 
 ## References
 
-- `design/WIN_BRANCH_DIFF_RESTORE_TIME_TRAVEL_IMPLEMENTATION_GUIDE.md` (sections
-  8 and 9)
 - `design/adr/0003-snapshot-lsn-atomicity.md`
 - `design/adr/0019-wal-retention-for-active-readers.md`
 - `design/adr/0120-core-storage-engine-btree.md`

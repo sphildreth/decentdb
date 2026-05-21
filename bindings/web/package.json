@@ -1,0 +1,35 @@
+{
+  "name": "@decentdb/web",
+  "version": "0.0.1",
+  "description": "Web binding scaffold for DecentDB via browser worker + WASM runtime",
+  "license": "Apache-2.0",
+  "private": false,
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist/",
+    "README.md",
+    "src/",
+    "tests/"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "browser:install": "playwright install chromium",
+    "browser:install:ci": "playwright install --with-deps chromium",
+    "browser:install:matrix": "playwright install chromium chrome firefox",
+    "browser:bench": "playwright test --config ../../tests/bindings/web/playwright.bench.config.js",
+    "browser:smoke": "playwright test --config ../../tests/bindings/web/playwright.config.js",
+    "browser:smoke:chrome": "DDB_WEB_INCLUDE_CHROME=1 playwright test --config ../../tests/bindings/web/playwright.config.js",
+    "browser:smoke:edge": "DDB_WEB_INCLUDE_EDGE=1 playwright test --config ../../tests/bindings/web/playwright.config.js",
+    "browser:smoke:candidate": "playwright test --config ../../tests/bindings/web/playwright.candidate.config.js",
+    "smoke": "npm run browser:smoke",
+    "smoke:manual": "echo \"Manual browser smoke remains at tests/bindings/web/smoke.html and is covered via browser:smoke\"",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "browser:smoke:ci": "playwright test --config ../../tests/bindings/web/playwright.config.js --reporter=dot"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.5",
+    "@playwright/test": "^1.48.0"
+  }
+}

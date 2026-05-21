@@ -19,12 +19,22 @@ enum {
   DDB_ERR_SQL = 5,
   DDB_ERR_INTERNAL = 6,
   DDB_ERR_PANIC = 7,
-  DDB_ERR_UNSUPPORTED_FORMAT_VERSION = 8
+  DDB_ERR_UNSUPPORTED_FORMAT_VERSION = 8,
+  DDB_ERR_BUSY = 9,
+  DDB_ERR_TIMEOUT = 10,
+  DDB_ERR_CANCELED = 11,
+  DDB_ERR_QUEUE_FULL = 12,
+  DDB_ERR_QUEUE_CLOSED = 13
+};
+
+enum {
+  DDB_WRITE_QUEUE_TIMEOUT_DEFAULT = UINT64_MAX
 };
 
 typedef struct ddb_db_handle ddb_db_t;
 typedef struct ddb_result_handle ddb_result_t;
 typedef struct ddb_stmt_handle ddb_stmt_t;
+typedef struct ddb_watch_handle ddb_watch_t;
 
 typedef enum ddb_value_tag_t {
   DDB_VALUE_NULL = 0,
@@ -74,6 +84,24 @@ typedef struct ddb_value_t {
   int32_t interval_days;
   int64_t interval_micros;
 } ddb_value_t;
+
+typedef struct ddb_write_queue_metrics_t {
+  size_t capacity;
+  size_t current_depth;
+  uint64_t admitted;
+  uint64_t rejected;
+  uint64_t timed_out;
+  uint64_t canceled;
+  uint64_t executed;
+  uint64_t committed;
+  uint64_t failed;
+  uint64_t group_commit_batches;
+  uint64_t group_commit_syncs;
+  uint64_t group_commit_max_batch;
+  uint64_t group_commit_commits_covered;
+  uint64_t physical_syncs_saved;
+  uint64_t total_queue_wait_ns;
+} ddb_write_queue_metrics_t;
 
 typedef struct ddb_value_view_t {
   uint32_t tag;
@@ -151,6 +179,10 @@ ddb_status_t ddb_db_open_with_options(const char *path, const char *options, ddb
 ddb_status_t ddb_db_open_or_create_with_options(const char *path, const char *options, ddb_db_t **out_db);
 ddb_status_t ddb_db_sync_execute_json(ddb_db_t *db, const char *request_json, char **out_json);
 ddb_status_t ddb_db_branch_execute_json(ddb_db_t *db, const char *request_json, char **out_json);
+ddb_status_t ddb_sync_changeset_create_json(ddb_db_t *db, const char *request_json, char **out_json);
+ddb_status_t ddb_sync_changeset_apply_json(ddb_db_t *db, const char *request_json, char **out_json);
+ddb_status_t ddb_sync_changeset_inspect_json(ddb_db_t *db, const char *request_json, char **out_json);
+ddb_status_t ddb_sync_changeset_invert_json(ddb_db_t *db, const char *request_json, char **out_json);
 
 /*
  * Frees a database handle returned by ddb_db_create, ddb_db_open, or ddb_db_open_or_create.
@@ -328,6 +360,51 @@ ddb_status_t ddb_db_execute(
     size_t params_len,
     ddb_result_t **out_result);
 
+/*
+ * Executes one SQL statement through the engine-owned write queue.
+ * Pass DDB_WRITE_QUEUE_TIMEOUT_DEFAULT to use the database configured default.
+ * Pass 0 for immediate timeout behavior. On success, ownership of the returned
+ * result handle transfers to the caller.
+ */
+ddb_status_t ddb_db_execute_queued(
+    ddb_db_t *db,
+    const char *sql,
+    const ddb_value_t *params,
+    size_t params_len,
+    uint64_t timeout_ms,
+    ddb_result_t **out_result);
+
+ddb_status_t ddb_db_write_queue_metrics(
+    ddb_db_t *db,
+    ddb_write_queue_metrics_t *out_metrics);
+
+ddb_status_t ddb_db_watch_table_json(
+    ddb_db_t *db,
+    const char *request_json,
+    ddb_watch_t **out_watch);
+
+ddb_status_t ddb_db_watch_range_json(
+    ddb_db_t *db,
+    const char *request_json,
+    ddb_watch_t **out_watch);
+
+ddb_status_t ddb_db_watch_query_json(
+    ddb_db_t *db,
+    const char *request_json,
+    ddb_watch_t **out_watch);
+
+ddb_status_t ddb_db_change_stream_json(
+    ddb_db_t *db,
+    const char *request_json,
+    ddb_watch_t **out_watch);
+
+ddb_status_t ddb_watch_next_json(
+    ddb_watch_t *watch,
+    uint32_t timeout_ms,
+    char **out_json);
+
+ddb_status_t ddb_watch_close(ddb_watch_t **watch);
+
 ddb_status_t ddb_db_checkpoint(ddb_db_t *db);
 ddb_status_t ddb_db_begin_transaction(ddb_db_t *db);
 ddb_status_t ddb_db_commit_transaction(ddb_db_t *db, uint64_t *out_lsn);
@@ -345,6 +422,42 @@ ddb_status_t ddb_db_get_schema_snapshot_json(ddb_db_t *db, char **out_json);
 ddb_status_t ddb_db_get_tooling_metadata_json(ddb_db_t *db, char **out_json);
 ddb_status_t ddb_db_describe_query_json(ddb_db_t *db, const char *sql, char **out_json);
 ddb_status_t ddb_db_inspect_storage_state_json(ddb_db_t *db, char **out_json);
+
+/*
+ * Lua extension package lifecycle JSON APIs.
+ *
+ * Returned JSON strings are owned by the caller and must be released with
+ * ddb_string_free.
+ */
+ddb_status_t ddb_extension_validate_json(const char *request_json, char **out_json);
+ddb_status_t ddb_extension_install_json(
+    ddb_db_t *db,
+    const char *request_json,
+    char **out_json);
+ddb_status_t ddb_extension_enable_json(
+    ddb_db_t *db,
+    const char *request_json,
+    char **out_json);
+ddb_status_t ddb_extension_disable_json(
+    ddb_db_t *db,
+    const char *request_json,
+    char **out_json);
+ddb_status_t ddb_extension_list_json(
+    ddb_db_t *db,
+    const char *request_json,
+    char **out_json);
+ddb_status_t ddb_extension_dependencies_json(
+    ddb_db_t *db,
+    const char *request_json,
+    char **out_json);
+ddb_status_t ddb_extension_rebuild_json(
+    ddb_db_t *db,
+    const char *request_json,
+    char **out_json);
+ddb_status_t ddb_extension_purge_json(
+    ddb_db_t *db,
+    const char *request_json,
+    char **out_json);
 
 ddb_status_t ddb_evict_shared_wal(const char *path);
 

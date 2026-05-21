@@ -77,6 +77,11 @@ Common status codes:
 | `DDB_ERR_INTERNAL` | Internal engine error |
 | `DDB_ERR_PANIC` | Panic caught at the ABI boundary |
 | `DDB_ERR_UNSUPPORTED_FORMAT_VERSION` | Database file format is newer than this engine |
+| `DDB_ERR_BUSY` | Resource is busy |
+| `DDB_ERR_TIMEOUT` | Operation timed out before it could run or complete |
+| `DDB_ERR_CANCELED` | Operation was canceled before execution started |
+| `DDB_ERR_QUEUE_FULL` | Write queue capacity is exhausted |
+| `DDB_ERR_QUEUE_CLOSED` | Write queue is shutting down or closed |
 
 `ddb_last_error_message()` returns a borrowed thread-local error string. Treat
 the pointer as valid only until the next DecentDB call on the same thread.
@@ -91,6 +96,7 @@ results:
 | `ddb_db_t *` | `ddb_db_free(&db)` |
 | `ddb_stmt_t *` | `ddb_stmt_free(&stmt)` |
 | `ddb_result_t *` | `ddb_result_free(&result)` |
+| `ddb_watch_t *` | `ddb_watch_close(&watch)` |
 | owned strings returned as `char *` | `ddb_string_free(&value)` |
 | owned copied cell values | `ddb_value_dispose(&value)` |
 
@@ -104,6 +110,143 @@ Rules:
   must be released with `ddb_value_dispose`.
 - Do not call free functions concurrently from multiple threads on the same
   pointer or handle.
+
+## Queued Writes
+
+`ddb_db_execute_queued` submits one SQL statement to the engine-owned write
+queue. It returns the same result handle shape as `ddb_db_execute`.
+
+```c
+ddb_result_t *result = NULL;
+check(ddb_db_execute_queued(
+          db,
+          "INSERT INTO events (id, name) VALUES (1, 'queued')",
+          NULL,
+          0,
+          DDB_WRITE_QUEUE_TIMEOUT_DEFAULT,
+          &result),
+      "queued insert");
+check(ddb_result_free(&result), "free queued result");
+```
+
+Pass `DDB_WRITE_QUEUE_TIMEOUT_DEFAULT` to use the database configured default
+timeout. Pass `0` for immediate timeout behavior.
+
+Queue behavior and strict group commit are documented in
+[Write Concurrency](../user-guide/write-concurrency.md). Metrics are available
+through `ddb_db_write_queue_metrics`:
+
+```c
+ddb_write_queue_metrics_t metrics;
+check(ddb_db_write_queue_metrics(db, &metrics), "queue metrics");
+printf("admitted=%llu committed=%llu syncs=%llu\n",
+       (unsigned long long)metrics.admitted,
+       (unsigned long long)metrics.committed,
+       (unsigned long long)metrics.group_commit_syncs);
+```
+
+## Reactive Watch Handles
+
+The C ABI exposes reactive subscriptions as opaque `ddb_watch_t` handles with
+JSON requests and JSON event polling. Watches are in-process only and observe
+committed state after the initial event.
+
+```c
+ddb_watch_t *watch = NULL;
+check(ddb_db_watch_query_json(
+          db,
+          "{\"sql\":\"SELECT name FROM users ORDER BY id\"}",
+          &watch),
+      "watch query");
+
+char *event_json = NULL;
+check(ddb_watch_next_json(watch, 1000, &event_json), "initial event");
+puts(event_json);
+check(ddb_string_free(&event_json), "free initial event");
+
+/* Run writes through any handle in the same process. */
+
+check(ddb_watch_next_json(watch, 1000, &event_json), "invalidation event");
+puts(event_json);
+check(ddb_string_free(&event_json), "free invalidation event");
+
+check(ddb_watch_close(&watch), "close watch");
+```
+
+Available creation functions:
+
+- `ddb_db_watch_table_json`
+- `ddb_db_watch_range_json`
+- `ddb_db_watch_query_json`
+- `ddb_db_change_stream_json`
+
+`ddb_watch_next_json` returns `DDB_ERR_TIMEOUT` when no event is available
+before the requested timeout. Returned event strings are freed with
+`ddb_string_free`.
+
+## Lua Extension JSON Bridge
+
+Lua extension package lifecycle APIs are exposed as JSON bridges. Each
+successful call that returns JSON transfers ownership of a `char *` that must be
+freed with `ddb_string_free`.
+
+Available functions:
+
+- `ddb_extension_validate_json`
+- `ddb_extension_install_json`
+- `ddb_extension_enable_json`
+- `ddb_extension_disable_json`
+- `ddb_extension_list_json`
+- `ddb_extension_dependencies_json`
+- `ddb_extension_rebuild_json`
+- `ddb_extension_purge_json`
+
+Validate a local package:
+
+```c
+char *json = NULL;
+check(ddb_extension_validate_json(
+          "{\"path\":\"./text_tools\",\"allow_unsigned\":true}",
+          &json),
+      "validate extension");
+puts(json);
+check(ddb_string_free(&json), "free validation json");
+```
+
+Install and enable an extension:
+
+```c
+check(ddb_extension_install_json(
+          db,
+          "{\"path\":\"./text_tools\",\"allow_unsigned\":true}",
+          &json),
+      "install extension");
+check(ddb_string_free(&json), "free install json");
+
+check(ddb_extension_enable_json(db, "{\"name\":\"text_tools\"}", &json),
+      "enable extension");
+check(ddb_string_free(&json), "free enable json");
+```
+
+Open-time extension trust is configured through the open-with-options entry
+points:
+
+```c
+ddb_db_t *db = NULL;
+check(ddb_db_open_or_create_with_options(
+          "app.ddb",
+          "allow_extension=text_tools@sha256:7b3f...",
+          &db),
+      "open with extension trust");
+```
+
+Use `allow_unsigned_extensions=true` only for local development databases. For
+production, pass exact `allow_extension=name@sha256:<hash>` entries. A trust
+entry may also include a key id and public key:
+`name@sha256:<hash>@<key_id>@base64:<public_key>`.
+
+See [Lua Extensions](../user-guide/lua-extensions.md) for the manifest,
+sandbox, signature, and SQL invocation contract.
 
 ## Minimal C Example
 
@@ -370,6 +513,29 @@ The higher-level sync command set is documented in
 [Local-first sync](../user-guide/sync/index.md) and
 [CLI Reference](cli-reference.md#sync-commands).
 
+Production changesets also have dedicated C ABI JSON entry points:
+
+```c
+char *changeset = NULL;
+check(ddb_sync_changeset_create_json(
+          db,
+          "{\"source\":{\"kind\":\"checkpoint\",\"peer\":\"relay\",\"since_sequence\":0}}",
+          &changeset),
+      "create changeset");
+puts(changeset);
+check(ddb_string_free(&changeset), "free changeset");
+```
+
+Available functions:
+
+- `ddb_sync_changeset_create_json`
+- `ddb_sync_changeset_apply_json`
+- `ddb_sync_changeset_inspect_json`
+- `ddb_sync_changeset_invert_json`
+
+Each function returns an owned JSON string that must be freed with
+`ddb_string_free`.
+
 ## Branch Workflow JSON Bridge
 
 The C ABI also exposes snapshot, branch, diff, restore, and merge workflows
@@ -453,8 +619,6 @@ where available.
 ## Current Limits
 
 - There is no separate C++ package or object-oriented C++ API.
-- Open-with-config options such as cache size are not currently exposed through
-  the C ABI open functions.
 - The C ABI is intentionally lower level than the .NET, Go, Python, Node,
   Dart, and JDBC bindings.
 - Dot commands from `decentdb repl` are CLI behavior, not C ABI behavior.

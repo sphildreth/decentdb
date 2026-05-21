@@ -27,6 +27,10 @@ metadata, maintenance, and fast-path surfaces. Performance-critical paths
 accelerated by the `_fastdecode.c` C extension when available, falling back to
 ctypes otherwise.
 
+The DB-API layer also declares the C ABI write-queue entry points. Queue
+configuration can be passed through `connect(...)`, and queued execution is
+available as `Connection.execute_queued(...)` or `Cursor.execute_queued(...)`.
+
 ## Use the packaged Python binding
 
 For application development, prefer the packaged `decentdb` Python binding
@@ -62,6 +66,48 @@ conn = decentdb.connect("/path/to/data.ddb", mode="open")
 # Or use Connection directly
 conn = decentdb.Connection("/path/to/data.ddb", mode="open_or_create", stmt_cache_size=256)
 ```
+
+### Write Queue
+
+```python
+conn = decentdb.connect(
+    "/path/to/data.ddb",
+    write_queue_enabled=True,
+    write_queue_capacity=128,
+    write_queue_default_timeout_ms=1000,
+)
+
+conn.execute_queued(
+    "INSERT INTO events (id, name) VALUES (?, ?)",
+    (1, "queued"),
+)
+
+metrics = conn.write_queue_metrics()
+```
+
+Queued writes preserve DecentDB's one-writer model and use strict group commit
+without weakening default durable acknowledgement semantics.
+
+### Reactive Subscriptions
+
+Python exposes reactive watch handles over the C ABI JSON event stream:
+
+```python
+conn = decentdb.connect("/tmp/app.ddb")
+conn.execute("CREATE TABLE items (id INT64 PRIMARY KEY, name TEXT)")
+
+watch = conn.watch_query("SELECT id, name FROM items ORDER BY id")
+initial = watch.next(timeout_ms=1000)      # {"type": "initial", ...}
+
+conn.execute("INSERT INTO items VALUES (?, ?)", (1, "Ada"))
+event = watch.next(timeout_ms=1000)        # {"type": "invalidate", ...}
+
+watch.close()
+```
+
+Available helpers are `watch_table(...)`, `watch_range(...)`,
+`watch_query(...)`, and `change_stream(...)`. `Watch.next(...)` returns `None`
+on timeout; `Watch.next_json(...)` returns the raw event JSON.
 
 ## Executing queries
 
@@ -138,7 +184,7 @@ contract = conn.describe_query_contract(
 ## Version introspection
 
 ```python
-abi = decentdb.abi_version()        # e.g. 2
+abi = decentdb.abi_version()        # e.g. 4
 ver = decentdb.engine_version()     # e.g. "2.0.0"
 ```
 
