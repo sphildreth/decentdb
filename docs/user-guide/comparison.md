@@ -29,7 +29,7 @@ SQLite and DuckDB are used as behavioral baselines for many SQL features, but De
 | Durability model | WAL-based, fsync-on-commit by default | WAL or rollback journal, configurable | Depends on storage mode; optimized for analytics workflows |
 | Concurrency | Single writer, many readers (threads, same process) | Multi-reader, single-writer (process-safe) | Parallel query execution; analytics-oriented |
 | SQL breadth | Subset (deliberately small) | Very broad (plus extensions) | Very broad (esp. analytical SQL) |
-| Extensibility | No loadable extension / UDF plugin surface in the current baseline (extend by contributing to core) | Rich extension ecosystem (loadable extensions, virtual tables, UDFs) | Rich extension ecosystem (install/load extensions, UDFs) |
+| Extensibility | Sandboxed Lua packages for scalar functions, table-valued functions, aggregates, and query-time collations; no arbitrary native loading | Rich extension ecosystem (loadable extensions, virtual tables, UDFs) | Rich extension ecosystem (install/load extensions, UDFs) |
 | Local-first sync | Built-in durable change journal, batch exchange, scoped peers, conflict workflows, doctor/retention tooling, CLI, and .NET SDK | Not built in; usually application middleware or third-party replication layers | Not built in; not a local-first replication focus |
 | Branch/diff/restore workflows | Built-in named snapshots, branch-local writes, primary-key row diff, guarded restore, and constrained merge | Not built in; use file copies, backup APIs, sessions, or app tooling | Not built in; typically use external copies or app/tooling |
 | Substring search (`LIKE '%pattern%'`) | Built-in trigram index option (purpose-built for interactive “contains” queries) | Typically full scan or use FTS/extensions | Typically scan or use extensions (e.g., FTS) |
@@ -40,7 +40,7 @@ Notes:
 
 What “extensions” means here:
 - The ability to add new SQL features without modifying the database core (e.g., new scalar/aggregate functions, new table-like modules such as SQLite virtual tables, or optional subsystems like full-text search).
-- DecentDB does support multiple language bindings, but those bindings are about how you *call* DecentDB, not a general-purpose SQL extension/plugin system.
+- DecentDB's extension answer is a sandboxed Lua package model with manifest-declared SQL objects and explicit content-hash trust. It is not SQLite `.load`, DuckDB native extensions, or host-language callbacks.
 
 ## Local-first sync
 

@@ -1292,11 +1292,6 @@ fn normalize_range_function(range: &protobuf::RangeFunction) -> Result<FromItem>
         return Err(unsupported("table function entry is malformed"));
     };
     let name = normalize_qualified_name(&call.funcname)?;
-    if !is_supported_table_function(&name) {
-        return Err(unsupported(format!(
-            "table function {name} is not supported"
-        )));
-    }
     let args = call
         .args
         .iter()
@@ -1308,42 +1303,6 @@ fn normalize_range_function(range: &protobuf::RangeFunction) -> Result<FromItem>
         alias: range.alias.as_ref().map(|alias| alias.aliasname.clone()),
         lateral: range.lateral,
     })
-}
-
-fn is_supported_table_function(name: &str) -> bool {
-    matches!(
-        name,
-        "json_each"
-            | "json_tree"
-            | "pg_catalog.json_each"
-            | "pg_catalog.json_tree"
-            | "generate_series"
-            | "pg_catalog.generate_series"
-            | "pragma_table_info"
-            | "pragma_table_xinfo"
-            | "pragma_table_list"
-            | "pragma_index_list"
-            | "pragma_index_info"
-            | "pragma_index_xinfo"
-            | "pragma_foreign_key_list"
-            | "pragma_database_list"
-            | "main.pragma_table_info"
-            | "main.pragma_table_xinfo"
-            | "main.pragma_table_list"
-            | "main.pragma_index_list"
-            | "main.pragma_index_info"
-            | "main.pragma_index_xinfo"
-            | "main.pragma_foreign_key_list"
-            | "main.pragma_database_list"
-            | "temp.pragma_table_info"
-            | "temp.pragma_table_xinfo"
-            | "temp.pragma_table_list"
-            | "temp.pragma_index_list"
-            | "temp.pragma_index_info"
-            | "temp.pragma_index_xinfo"
-            | "temp.pragma_foreign_key_list"
-            | "temp.pragma_database_list"
-    )
 }
 
 fn normalize_assignment(node: &protobuf::Node) -> Result<Assignment> {
@@ -1511,9 +1470,7 @@ fn normalize_collation_name(nodes: &[protobuf::Node]) -> Result<Collation> {
         "binary" | "pg_catalog.binary" => Ok(Collation::Binary),
         "nocase" | "no_case" => Ok(Collation::NoCase),
         "rtrim" => Ok(Collation::RTrim),
-        other => Err(unsupported(format!(
-            "unsupported collation {other}; supported collations are BINARY, NOCASE, and RTRIM"
-        ))),
+        other => Ok(Collation::Extension(other.to_string())),
     }
 }
 

@@ -1321,6 +1321,29 @@ fn parse_cache_size_mb_option(value: &str, page_size: u32) -> Result<usize> {
     Ok(bytes.div_ceil(1024 * 1024).max(1))
 }
 
+fn parse_extension_trust_anchor_option(
+    value: &str,
+) -> Result<crate::extensions::ExtensionTrustAnchor> {
+    let (name, rest) = value
+        .split_once('@')
+        .ok_or_else(|| DbError::sql("allow_extension option must be name@sha256:<hash>"))?;
+    let parts = rest.split('@').collect::<Vec<_>>();
+    match parts.as_slice() {
+        [hash] => Ok(crate::extensions::ExtensionTrustAnchor::new(name, *hash)),
+        [hash, key_id, public_key] => Ok(
+            crate::extensions::ExtensionTrustAnchor::with_public_key(
+                name,
+                *hash,
+                *key_id,
+                *public_key,
+            ),
+        ),
+        _ => Err(DbError::sql(
+            "allow_extension option must be name@sha256:<hash> or name@sha256:<hash>@key_id@public_key",
+        )),
+    }
+}
+
 fn db_config_from_options(options: Option<&str>) -> Result<DbConfig> {
     let mut config = DbConfig::default();
     let Some(options) = options else {
@@ -1387,6 +1410,15 @@ fn db_config_from_options(options: Option<&str>) -> Result<DbConfig> {
             }
             "write_queue_max_group_delay_us" => {
                 config.write_queue_max_group_delay_us = parse_u64_option(value, key.as_str())?;
+            }
+            "allow_extension" => {
+                config
+                    .extension_trust_anchors
+                    .push(parse_extension_trust_anchor_option(value)?);
+            }
+            "allow_unsigned_extensions" => {
+                config.extension_unsigned_development_mode =
+                    parse_bool_option(value, key.as_str())?;
             }
             _ => {
                 return Err(DbError::sql(format!("unsupported database option: {key}")));
@@ -1926,6 +1958,180 @@ pub extern "C" fn ddb_sync_changeset_invert_json(
             .map_err(|error| DbError::sql(format!("invalid changeset invert options: {error}")))?;
         *out_ptr(out_json, "out_json")? =
             sync_json_response(&db.db.sync_invert_changeset(&changeset, options)?)?;
+        Ok(())
+    })
+}
+
+fn extension_validation_options_from_request(
+    object: &serde_json::Map<String, serde_json::Value>,
+    op: &str,
+) -> Result<crate::extensions::ExtensionValidationOptions> {
+    let allow_unsigned = object
+        .get("allow_unsigned")
+        .map(|value| match value {
+            serde_json::Value::Bool(value) => Ok(*value),
+            other => Err(DbError::sql(format!(
+                "extension request field 'allow_unsigned' for op '{op}' must be a boolean, got {other}"
+            ))),
+        })
+        .transpose()?
+        .unwrap_or(false);
+    let trust_extensions = sync_request_optional_string_list_field(object, op, "trust_extensions")?;
+    Ok(crate::extensions::ExtensionValidationOptions {
+        allow_unsigned,
+        trust_anchors: trust_extensions
+            .iter()
+            .map(|value| parse_extension_trust_anchor_option(value))
+            .collect::<Result<Vec<_>>>()?,
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_extension_validate_json(
+    request_json: *const c_char,
+    out_json: *mut *mut c_char,
+) -> u32 {
+    ffi_boundary(|| {
+        let request_json = utf8_arg(request_json, "request_json")?;
+        let request = sync_request_root(&request_json)?;
+        let object = sync_request_object(&request, "extension_validate")?;
+        let path = sync_request_string_field(object, "extension_validate", "path")?;
+        let options = extension_validation_options_from_request(object, "extension_validate")?;
+        *out_ptr(out_json, "out_json")? = sync_json_response(
+            &crate::extensions::validate_extension_package(path, options)?,
+        )?;
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_extension_install_json(
+    db: *mut DbHandle,
+    request_json: *const c_char,
+    out_json: *mut *mut c_char,
+) -> u32 {
+    ffi_boundary(|| {
+        let db = handle_ref(db, "db")?;
+        let request_json = utf8_arg(request_json, "request_json")?;
+        let request = sync_request_root(&request_json)?;
+        let object = sync_request_object(&request, "extension_install")?;
+        let path = sync_request_string_field(object, "extension_install", "path")?;
+        let options = extension_validation_options_from_request(object, "extension_install")?;
+        *out_ptr(out_json, "out_json")? =
+            sync_json_response(&db.db.extensions().install_with_options(path, options)?)?;
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_extension_enable_json(
+    db: *mut DbHandle,
+    request_json: *const c_char,
+    out_json: *mut *mut c_char,
+) -> u32 {
+    ffi_boundary(|| {
+        let db = handle_ref(db, "db")?;
+        let request_json = utf8_arg(request_json, "request_json")?;
+        let request = sync_request_root(&request_json)?;
+        let object = sync_request_object(&request, "extension_enable")?;
+        let name = sync_request_string_field(object, "extension_enable", "name")?;
+        db.db.extensions().enable(&name)?;
+        *out_ptr(out_json, "out_json")? =
+            sync_json_response(&serde_json::json!({"name": name, "enabled": true}))?;
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_extension_disable_json(
+    db: *mut DbHandle,
+    request_json: *const c_char,
+    out_json: *mut *mut c_char,
+) -> u32 {
+    ffi_boundary(|| {
+        let db = handle_ref(db, "db")?;
+        let request_json = utf8_arg(request_json, "request_json")?;
+        let request = sync_request_root(&request_json)?;
+        let object = sync_request_object(&request, "extension_disable")?;
+        let name = sync_request_string_field(object, "extension_disable", "name")?;
+        db.db.extensions().disable(&name)?;
+        *out_ptr(out_json, "out_json")? =
+            sync_json_response(&serde_json::json!({"name": name, "enabled": false}))?;
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_extension_list_json(
+    db: *mut DbHandle,
+    request_json: *const c_char,
+    out_json: *mut *mut c_char,
+) -> u32 {
+    ffi_boundary(|| {
+        let db = handle_ref(db, "db")?;
+        if !request_json.is_null() {
+            let request_json = utf8_arg(request_json, "request_json")?;
+            let _ = sync_request_root(&request_json)?;
+        }
+        *out_ptr(out_json, "out_json")? = sync_json_response(&db.db.extensions().list()?)?;
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_extension_dependencies_json(
+    db: *mut DbHandle,
+    request_json: *const c_char,
+    out_json: *mut *mut c_char,
+) -> u32 {
+    ffi_boundary(|| {
+        let db = handle_ref(db, "db")?;
+        if !request_json.is_null() {
+            let request_json = utf8_arg(request_json, "request_json")?;
+            let _ = sync_request_root(&request_json)?;
+        }
+        *out_ptr(out_json, "out_json")? = sync_json_response(&db.db.extensions().dependencies()?)?;
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_extension_rebuild_json(
+    db: *mut DbHandle,
+    request_json: *const c_char,
+    out_json: *mut *mut c_char,
+) -> u32 {
+    ffi_boundary(|| {
+        let db = handle_ref(db, "db")?;
+        let request_json = utf8_arg(request_json, "request_json")?;
+        let request = sync_request_root(&request_json)?;
+        let object = sync_request_object(&request, "extension_rebuild")?;
+        let name = sync_request_string_field(object, "extension_rebuild", "name")?;
+        *out_ptr(out_json, "out_json")? =
+            sync_json_response(&db.db.extensions().rebuild_dependents(&name)?)?;
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_extension_purge_json(
+    db: *mut DbHandle,
+    request_json: *const c_char,
+    out_json: *mut *mut c_char,
+) -> u32 {
+    ffi_boundary(|| {
+        let db = handle_ref(db, "db")?;
+        let request_json = utf8_arg(request_json, "request_json")?;
+        let request = sync_request_root(&request_json)?;
+        let object = sync_request_object(&request, "extension_purge")?;
+        let name = sync_request_string_field(object, "extension_purge", "name")?;
+        let confirm = sync_request_bool_field(object, "extension_purge", "confirm")?;
+        if !confirm {
+            return Err(DbError::sql("extension purge requires confirm=true"));
+        }
+        db.db.extensions().purge(&name)?;
+        *out_ptr(out_json, "out_json")? =
+            sync_json_response(&serde_json::json!({"name": name, "purged": true}))?;
         Ok(())
     })
 }

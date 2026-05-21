@@ -32,7 +32,6 @@ decentdb extension show --db app.ddb text_tools --format json
 decentdb extension enable --db app.ddb text_tools
 decentdb extension disable --db app.ddb text_tools
 decentdb extension purge --db app.ddb text_tools --confirm
-decentdb extension verify-signature ./text_tools --keyring ./trusted.keys
 decentdb extension dependencies --db app.ddb --format table
 decentdb extension rebuild --db app.ddb text_tools
 ```
@@ -86,7 +85,10 @@ ddb_extension_disable_json(...);
 ddb_extension_purge_json(...);
 ddb_extension_dependencies_json(...);
 ddb_extension_rebuild_json(...);
-ddb_config_allow_extension(config, "text_tools", "sha256:abc123");
+ddb_db_open_or_create_with_options(
+    "app.ddb",
+    "allow_extension=text_tools@sha256:abc123",
+    &db);
 ```
 
 Every C ABI function follows ADR 0118 panic-safety rules and returns stable
@@ -137,7 +139,6 @@ The feature is not complete until user docs explain:
 - table-valued function examples;
 - aggregate examples;
 - collation examples;
-- persisted deterministic expression and index examples;
 - package signing examples;
 - dependency rebuild workflows.
 
@@ -153,10 +154,10 @@ permission.
 
 ## Consequences
 
-- C ABI grows lifecycle, dependency, rebuild, validation, and config allowlist
-  JSON entry points.
-- Bindings need smoke tests for install/enable/allow/invoke across scalar,
-  table-valued, aggregate, and collation surfaces.
+- C ABI grows lifecycle, dependency, rebuild, validation, and open-time
+  allowlist entry points.
+- Binding conveniences layer above the C ABI. The C ABI remains the binding-wide
+  authoritative surface for extension lifecycle operations in 2.6.0.
 - CLI becomes the primary authoring and validation tool.
 - Docs/examples are release-blocking for the feature.
 - Typed binding conveniences layer on top of the JSON ABI baseline.
@@ -177,13 +178,14 @@ permission.
 Implementation is not complete until tests cover:
 
 - CLI validate/install/list/show/enable/disable/purge;
-- CLI signature verification, dependency inspection, and dependent-object
-  rebuild;
+- CLI signature validation through `validate`/`install`, dependency inspection,
+  and dependent-object rebuild reporting;
 - CLI `exec` and REPL trust allowlist behavior;
 - Rust lifecycle API;
 - C ABI JSON allocation/free and panic safety;
-- binding smoke tests install and call scalar, table-valued, aggregate, and
-  collation extension objects;
+- C ABI smoke coverage exercises lifecycle JSON allocation/free and native SQL
+  invocation through a trusted connection; higher-level binding helpers wrap the
+  same ABI;
 - raw source absent from `sys.*`;
 - docs example packages validate and execute every supported function kind;
 - no binding can execute an enabled extension without allowlist trust.

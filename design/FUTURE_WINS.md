@@ -64,6 +64,7 @@ instead of brand-new roadmap items.
 | Native geospatial foundation | ADR 0124-0128, [`docs/user-guide/data-types.md`](../docs/user-guide/data-types.md#geometry), [`docs/user-guide/indexes.md`](../docs/user-guide/indexes.md#spatial-indexes) | Future spatial work is advanced analytics and planner breadth, not proving DecentDB can store spatial values. |
 | Built-in HTTP server and web console | [`docs/user-guide/web-console.md`](../docs/user-guide/web-console.md), [`docs/api/cli-reference.md`](../docs/api/cli-reference.md#serve) | Future agent/tooling surfaces can reuse the local HTTP shape, but Decent Bench remains the full IDE. |
 | Stable tooling metadata and query contracts | [`STABLE_TOOLING_METADATA_CONTRACT.md`](STABLE_TOOLING_METADATA_CONTRACT.md) | DecentDB owns metadata/query-contract truth. Decent Bench owns generated SDK workflows. |
+| Lua extension runtime and package model | [`WIN_LUA_EXTENSION_RUNTIME_SPEC.md`](WIN_LUA_EXTENSION_RUNTIME_SPEC.md); ADR 0169-0173; [`docs/user-guide/lua-extensions.md`](../docs/user-guide/lua-extensions.md) | Sandboxed Lua packages now provide DecentDB's safe extensibility story: manifest validation, install/enable/trust lifecycle, scalar functions, table-valued functions, aggregates, query-time collations, Rust/CLI/C ABI surfaces, and examples. |
 
 ## Status Map
 
@@ -86,29 +87,28 @@ documented, remove it from this roadmap. Completed and delivered work is no
 longer a Future Win. Keep only a concise `Delivered Context` entry when the
 shipped foundation affects follow-on roadmap decisions.
 
-Current `2.6.0` scope decision: Lua extension runtime and package model is the
-only remaining Future Win accepted as a `vNext` implementation candidate. All
-other remaining Future Wins should move to a post-2.6 feature bucket unless
-release scope is explicitly reopened again.
+Current `2.6.0` scope decision: after delivering Lua extensions, no remaining
+Future Win is accepted as a `vNext` implementation candidate. Remaining items
+belong to post-2.6 feature buckets unless release scope is explicitly reopened
+again.
 
 | Priority | Future Version | Status | Feature | Current Source Of Truth | Why This Rank |
 |---:|---|---|---|---|---|
 | 1 | vNext+1 | TODO | Local data security: TDE, policies, masking, audit context | Needs ADR/spec | TDE is table stakes for SQLCipher-style onboarding; policy is the differentiated regulated/offline story |
-| 2 | vNext | IN PROGRESS | Lua extension runtime and package model | [`WIN_LUA_EXTENSION_RUNTIME_SPEC.md`](WIN_LUA_EXTENSION_RUNTIME_SPEC.md); ADR 0169-0173 | One sandboxed extension language is supportable across native, mobile, and WASM targets |
-| 3 | vNext+2 | TODO | Full-text search with BM25 ranking | Needs ADR/spec | Expected by app databases and a real SQLite FTS migration blocker |
-| 4 | vNext+2 | TODO | Cross-process WAL coordination | Needs ADR/spec | Important for Electron/Tauri, helper processes, CLI coexistence, and background sync workers |
-| 5 | vNext+2 | TODO | Runtime tracing, advisors, and Doctor integration | Needs ADR/spec; follows shipped operational metrics | Adds slow-query/lock-wait history, index usage, doctor findings, and advisor surfaces once the metrics contract is stable |
-| 6 | Later | BACKLOG | Branch-aware migration rehearsal and promotion | ADR 0153-0159 and branch CLI/API docs; needs ADR/spec | More distinctive than generic online migration and uses shipped branch/diff foundations |
-| 7 | Later | BACKLOG | Agent and tooling integration mode | [`STABLE_TOOLING_METADATA_CONTRACT.md`](STABLE_TOOLING_METADATA_CONTRACT.md); needs ADR/spec | Makes the "agent-friendly" promise concrete without putting LLM behavior in the engine |
-| 8 | Later | BACKLOG | Application and support bundle format | Needs ADR/spec | Useful portable artifact and diagnostics story, but not more urgent than runtime friction |
-| 9 | Later | BACKLOG | Incrementally maintained projections | Needs ADR/spec | Accelerates dashboards, local read models, and reactive query workloads |
-| 10 | Later | BACKLOG | JSONB binary storage | Needs ADR/spec | Important for JSON-heavy workloads, but less urgent than FTS and runtime fundamentals |
-| 11 | Later | BACKLOG | Native vector / HNSW index | Needs ADR/spec | Valuable for offline AI/RAG, but less universal than FTS and security |
-| 12 | Later | BACKLOG | Temporal row history and auditable state | Needs ADR/spec | Strong regulated/support workflow, but should follow security and sync hardening |
-| 13 | Later | BACKLOG | Advanced geospatial semantics and analytics | ADR 0128 deferred work; needs follow-up ADR/spec | Builds on shipped spatial support without implying the foundation is unfinished |
-| 14 | Later | BACKLOG | Advanced SQL compatibility surface | [`WIN_ADVANCED_SQL_COMPATIBILITY_SURFACE.md`](WIN_ADVANCED_SQL_COMPATIBILITY_SURFACE.md) | Useful adoption polish after quick wins and higher-impact app workflows |
-| 15 | Later | BACKLOG | WAL streaming replication | Needs ADR/spec | Useful HA/read-scale story, but weaker than local-first sync for DecentDB identity |
-| 16 | Later | BACKLOG | Cloud-native object storage VFS | Needs ADR/spec | Interesting edge/serverless story with high durability and consistency complexity |
+| 2 | vNext+2 | TODO | Full-text search with BM25 ranking | Needs ADR/spec | Expected by app databases and a real SQLite FTS migration blocker |
+| 3 | vNext+2 | TODO | Cross-process WAL coordination | Needs ADR/spec | Important for Electron/Tauri, helper processes, CLI coexistence, and background sync workers |
+| 4 | vNext+2 | TODO | Runtime tracing, advisors, and Doctor integration | Needs ADR/spec; follows shipped operational metrics | Adds slow-query/lock-wait history, index usage, doctor findings, and advisor surfaces once the metrics contract is stable |
+| 5 | Later | BACKLOG | Branch-aware migration rehearsal and promotion | ADR 0153-0159 and branch CLI/API docs; needs ADR/spec | More distinctive than generic online migration and uses shipped branch/diff foundations |
+| 6 | Later | BACKLOG | Agent and tooling integration mode | [`STABLE_TOOLING_METADATA_CONTRACT.md`](STABLE_TOOLING_METADATA_CONTRACT.md); needs ADR/spec | Makes the "agent-friendly" promise concrete without putting LLM behavior in the engine |
+| 7 | Later | BACKLOG | Application and support bundle format | Needs ADR/spec | Useful portable artifact and diagnostics story, but not more urgent than runtime friction |
+| 8 | Later | BACKLOG | Incrementally maintained projections | Needs ADR/spec | Accelerates dashboards, local read models, and reactive query workloads |
+| 9 | Later | BACKLOG | JSONB binary storage | Needs ADR/spec | Important for JSON-heavy workloads, but less urgent than FTS and runtime fundamentals |
+| 10 | Later | BACKLOG | Native vector / HNSW index | Needs ADR/spec | Valuable for offline AI/RAG, but less universal than FTS and security |
+| 11 | Later | BACKLOG | Temporal row history and auditable state | Needs ADR/spec | Strong regulated/support workflow, but should follow security and sync hardening |
+| 12 | Later | BACKLOG | Advanced geospatial semantics and analytics | ADR 0128 deferred work; needs follow-up ADR/spec | Builds on shipped spatial support without implying the foundation is unfinished |
+| 13 | Later | BACKLOG | Advanced SQL compatibility surface | [`WIN_ADVANCED_SQL_COMPATIBILITY_SURFACE.md`](WIN_ADVANCED_SQL_COMPATIBILITY_SURFACE.md) | Useful adoption polish after quick wins and higher-impact app workflows |
+| 14 | Later | BACKLOG | WAL streaming replication | Needs ADR/spec | Useful HA/read-scale story, but weaker than local-first sync for DecentDB identity |
+| 15 | Later | BACKLOG | Cloud-native object storage VFS | Needs ADR/spec | Interesting edge/serverless story with high durability and consistency complexity |
 
 ## Positioning
 
@@ -196,62 +196,7 @@ CREATE MASK ssn_mask
 - audit metadata must be explicit and queryable
 - key material must never be written to database pages, WAL, or telemetry
 
-## 2. Lua Extension Runtime And Package Model
-
-**Status:** `IN PROGRESS`
-
-**Future Version:** vNext
-
-**Source of truth:** [`WIN_LUA_EXTENSION_RUNTIME_SPEC.md`](WIN_LUA_EXTENSION_RUNTIME_SPEC.md);
-[ADR 0169](adr/0169-lua-extension-runtime-dependency-and-sandbox.md),
-[ADR 0170](adr/0170-lua-extension-package-catalog-and-trust.md),
-[ADR 0171](adr/0171-lua-extension-sql-type-and-planner-contract.md),
-[ADR 0172](adr/0172-lua-extension-cli-c-abi-and-binding-contract.md), and
-[ADR 0173](adr/0173-lua-extension-function-kind-phasing.md).
-
-### Why This Matters
-
-SQLite and DuckDB have strong extension ecosystems. DecentDB should not clone
-SQLite's arbitrary native `.load` model, but it does need a credible and
-supportable extensibility story.
-
-Lua gives DecentDB one official extension language, one package model, one
-runtime contract, one docs path, and one binding surface. That is a better fit
-for a durable embedded database than supporting many host-language callback
-systems or unbounded native plugins.
-
-### Recommended Direction
-
-- extension packages with `decentdb-extension.toml` manifests
-- Lua 5.4 language target
-- explicit install/enable/trust lifecycle
-- no auto-running extension code when an untrusted database is opened
-- scalar functions
-- table-valued functions
-- aggregate functions
-- Lua-backed collations
-- deterministic persisted schema expression and index support with exact
-  extension dependency tracking
-- DecentDB-owned typed wrappers for `DECIMAL`, `UUID`, date/time, `BLOB`, JSON,
-  and later rich-type expansion
-- package signing and content-hash trust
-- CLI and binding APIs for validate, install, list, enable, disable, purge,
-  test, dependency inspection, and rebuild workflows
-
-### Guardrails
-
-- no SQLite-style `.load` support
-- no filesystem, network, process, native-module, or database-write access from
-  Lua by default
-- no direct WAL, pager, B+Tree, catalog, or transaction internals
-- no dynamic SQL signatures or runtime-discovered return schemas
-- no loose or lossy type coercions
-- Lua execution must be resource-bounded, cancellable, and converted into SQL
-  errors without process corruption
-- persisted Lua functions and collations require exact package-hash dependency
-  metadata and rebuild diagnostics
-
-## 3. Full-Text Search With BM25 Ranking
+## 2. Full-Text Search With BM25 Ranking
 
 **Status:** `TODO`
 
@@ -284,7 +229,7 @@ tokenization, phrase search, and ranking.
 - define crash recovery and rebuild behavior before implementation
 - benchmark against representative SQLite FTS workloads
 
-## 4. Cross-Process WAL Coordination
+## 3. Cross-Process WAL Coordination
 
 **Status:** `TODO`
 
@@ -314,7 +259,7 @@ coexistence, and background sync workers.
 - ADR required because this changes locking and `Send`/`Sync` boundaries
 - browser multi-tab coordination is related but tracked separately
 
-## 5. Runtime Tracing, Advisors, And Doctor Integration
+## 4. Runtime Tracing, Advisors, And Doctor Integration
 
 **Status:** `TODO`
 
@@ -367,7 +312,7 @@ SELECT * FROM sys.doctor_findings;
 - advisor output must be reviewable and must not auto-apply destructive fixes
 - keep hot-path overhead measurable and benchmarked
 
-## 6. Branch-Aware Migration Rehearsal And Promotion
+## 5. Branch-Aware Migration Rehearsal And Promotion
 
 **Status:** `BACKLOG`
 
@@ -398,7 +343,7 @@ safe workflow: branch, migrate, validate, diff, detect drift, and promote.
 - branch merge semantics must stay conservative
 - do not hide destructive schema changes behind automatic promotion
 
-## 7. Agent And Tooling Integration Mode
+## 6. Agent And Tooling Integration Mode
 
 **Status:** `BACKLOG`
 
@@ -433,7 +378,7 @@ guessing.
 - Decent Bench remains the product home for rich visual workflows and generated
   SDK output
 
-## 8. Application And Support Bundle Format
+## 7. Application And Support Bundle Format
 
 **Status:** `BACKLOG`
 
@@ -468,7 +413,7 @@ A DecentDB bundle may contain:
 - support bundles must have a sanitization/redaction story before use with
   regulated data
 
-## 9. Incrementally Maintained Projections
+## 8. Incrementally Maintained Projections
 
 **Status:** `BACKLOG`
 
@@ -497,7 +442,7 @@ database-native capability that also accelerates reactive queries.
 - keep maintenance work visible in write latency and `sys.*`
 - define crash recovery and rebuild semantics before implementation
 
-## 10. JSONB Binary Storage
+## 9. JSONB Binary Storage
 
 **Status:** `BACKLOG`
 
@@ -520,7 +465,7 @@ more effective.
 - large JSONB uses existing overflow page mechanics
 - partial updates rebuild the binary blob through the single writer
 
-## 11. Native Vector / HNSW Index
+## 10. Native Vector / HNSW Index
 
 **Status:** `BACKLOG`
 
@@ -549,7 +494,7 @@ faster and easier to operate.
 - WASM/mobile portability story
 - benchmarks against common vector-search extensions
 
-## 12. Temporal Row History And Auditable State
+## 11. Temporal Row History And Auditable State
 
 **Status:** `BACKLOG`
 
@@ -578,7 +523,7 @@ auditable local data. Some regulated and support-heavy apps need to answer:
 - redaction must be compatible with retention and audit requirements
 - do not conflate branch snapshots with row-level audit history
 
-## 13. Advanced Geospatial Semantics And Analytics
+## 12. Advanced Geospatial Semantics And Analytics
 
 **Status:** `BACKLOG`
 
@@ -610,7 +555,7 @@ the completed native geospatial feature does not appear unfinished.
 - avoid native GEOS/PROJ/GDAL dependencies unless an ADR justifies the tradeoff
 - keep WASM compatibility as a design constraint
 
-## 14. Advanced SQL Compatibility Surface
+## 13. Advanced SQL Compatibility Surface
 
 **Status:** `BACKLOG`
 
@@ -646,7 +591,7 @@ layer is delivered; this item is for heavier compatibility work.
   ergonomics
 - avoid expanding core import/export features in this track
 
-## 15. WAL Streaming Replication
+## 14. WAL Streaming Replication
 
 **Status:** `BACKLOG`
 
@@ -671,7 +616,7 @@ traditional HA problem.
 - quorum acknowledgement
 - explicit consistency/durability tradeoffs
 
-## 16. Cloud-Native Object Storage VFS
+## 15. Cloud-Native Object Storage VFS
 
 **Status:** `BACKLOG`
 
@@ -700,25 +645,20 @@ performance, and operational foundations.
 
 ## Near-Term Sequence
 
-1. Complete the full ADR-backed Lua extension scope as the final accepted 2.6.0
-   Future Win implementation: package lifecycle, trust, signing, sandboxed
-   scalar functions, table-valued functions, aggregates, collations,
-   deterministic persisted schema/index support, dependency rebuild workflows,
-   strict types, CLI/C ABI/binding surface, docs, and examples.
-2. Stabilize and release the current 2.6.0 foundations before adding any other
+1. Stabilize and release the current 2.6.0 foundations before adding any other
    Future Win implementation to the branch.
-3. Write the local data security ADR/spec first because TDE, key management,
+2. Write the local data security ADR/spec first because TDE, key management,
    policy semantics, masking, audit context, sync, branches, and backups all
    need one coherent boundary.
-4. Draft the full-text search ADR/spec and benchmark targets so BM25, phrase
+3. Draft the full-text search ADR/spec and benchmark targets so BM25, phrase
    search, tokenization, recovery, and planner integration are designed before
    storage/index code lands.
-5. Design cross-process WAL coordination with Electron/Tauri, CLI coexistence,
+4. Design cross-process WAL coordination with Electron/Tauri, CLI coexistence,
    background workers, browser ownership, and crash/stale-owner diagnostics in
    one portability-aware plan.
-6. Extend shipped `sys.*` metrics into opt-in tracing, advisors, and Doctor
+5. Extend shipped `sys.*` metrics into opt-in tracing, advisors, and Doctor
    integration once the hot-path overhead budget is explicit.
-7. Promote backlog items into TODO only after the top adoption blockers have
+6. Promote backlog items into TODO only after the top adoption blockers have
    ADR/spec coverage or active implementation ownership.
 
 ## Market Notes
@@ -737,7 +677,7 @@ clone checklist:
 - Local-first stacks such as PGlite/Electric and PowerSync make reactive
   queries, browser/mobile sync, and shape subscriptions part of the expected
   developer conversation.
-- SQLite and DuckDB have mature extension ecosystems. DecentDB's proposed
+- SQLite and DuckDB have mature extension ecosystems. DecentDB's shipped
   response is one official Lua extension language with strict manifests,
   sandboxing, and explicit trust rather than arbitrary native extension loading.
 - The largest DecentDB opportunity is integrated durable local-first workflow:

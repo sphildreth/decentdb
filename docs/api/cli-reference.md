@@ -32,6 +32,10 @@ Supported options:
 - `--as-of=<snapshot-name>` execute read-only SQL against a named snapshot
 - `--as-of-lsn=<lsn>` execute read-only SQL against a retained WAL LSN
 - `--branch=<branch>` execute against a branch
+- `--allow-extension=<name@sha256:hash>` allow an installed and enabled Lua
+  extension package to execute on this connection; may be repeated
+- `--allow-unsigned-extensions` development-only override that allows unsigned
+  installed Lua packages to execute without a hash allowlist
 
 `--as-of` and `--as-of-lsn` are read-only time-travel modes. Mutating SQL,
 transaction control, PRAGMA commands, and `--checkpoint` are rejected in this
@@ -45,7 +49,7 @@ Interactive SQL shell with:
 - transaction-aware prompt state
 
 ```bash
-decentdb repl --db=<path> [--format=<json|csv|table|markdown>]
+decentdb repl --db=<path> [--format=<json|csv|table|markdown>] [--allow-extension=<name@sha256:hash>]
 ```
 
 Special commands:
@@ -58,6 +62,36 @@ Special commands:
 - session helpers: `.g`, `.s`, `.branch`, `.checkout`
 
 See [Interactive SQL Shell](../user-guide/repl.md) for the full user guide.
+
+### extension
+
+Validate, test, install, enable, disable, inspect, and purge sandboxed Lua
+extension packages.
+
+```bash
+decentdb extension validate <package-dir> [--allow-unsigned] [--trust-extension=<name@sha256:hash>] [--format=<json|table>]
+decentdb extension test <package-dir> [--allow-unsigned] [--trust-extension=<name@sha256:hash>] [--format=<json|table>]
+decentdb extension install --db=<path> <package-dir> [--allow-unsigned] [--trust-extension=<name@sha256:hash>] [--format=<json|table>]
+decentdb extension list --db=<path> [--format=<json|table>]
+decentdb extension show --db=<path> <name> [--format=<json|table>]
+decentdb extension enable --db=<path> <name> [--format=<json|table>]
+decentdb extension disable --db=<path> <name> [--format=<json|table>]
+decentdb extension purge --db=<path> <name> --confirm [--format=<json|table>]
+decentdb extension dependencies --db=<path> [--format=<json|table>]
+decentdb extension rebuild --db=<path> <name> [--format=<json|table>]
+```
+
+Trust entries use `name@sha256:<hash>` or
+`name@sha256:<hash>@<key_id>@<public_key>`. Public keys and signatures use the
+same `base64:<value>` or `hex:<value>` encoding accepted by the Rust API.
+
+`validate` and `install` reject unsigned packages unless `--allow-unsigned` is
+present. `exec` and `repl` do not run enabled Lua code unless the connection was
+opened with `--allow-extension` for the exact package hash or with the
+development-only `--allow-unsigned-extensions` override.
+
+See [Lua Extensions](../user-guide/lua-extensions.md) for package authoring,
+manifest, trust, and sandbox details.
 
 ### serve
 

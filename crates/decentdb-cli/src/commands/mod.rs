@@ -15,11 +15,11 @@ use decentdb::{
     BranchMergeOperation, BranchMergeReport, BranchRestoreReport, BranchTableDiffStatus,
     BulkLoadOptions, ColumnInfo, Db, DbConfig, DoctorCategory, DoctorCheckSelection,
     DoctorIndexVerification, DoctorOptions, DoctorPathMode, DoctorReport, DoctorSeverity,
-    ForeignKeyInfo, HeaderInfo, IndexVerification, NamedSnapshot, QueryResult, ShapeAckOptions,
-    StorageInfo, SyncChangeBatch, SyncChangeset, SyncChangesetSource, SyncConflict,
-    SyncConflictPolicy, SyncHandshake, SyncImportSummary, SyncPeer, SyncPeerScopeBinding,
-    SyncPrincipal, SyncRelayHello, SyncRunDirection, SyncRunSummary, SyncScope, SyncShape,
-    SyncSubjectKind, TableInfo, Value,
+    ExtensionTrustAnchor, ExtensionValidationOptions, ForeignKeyInfo, HeaderInfo,
+    IndexVerification, NamedSnapshot, QueryResult, ShapeAckOptions, StorageInfo, SyncChangeBatch,
+    SyncChangeset, SyncChangesetSource, SyncConflict, SyncConflictPolicy, SyncHandshake,
+    SyncImportSummary, SyncPeer, SyncPeerScopeBinding, SyncPrincipal, SyncRelayHello,
+    SyncRunDirection, SyncRunSummary, SyncScope, SyncShape, SyncSubjectKind, TableInfo, Value,
 };
 
 use crate::output::{
@@ -106,6 +106,9 @@ pub enum Commands {
     /// Production sync relay and shape management
     #[command(subcommand)]
     Relay(RelayCommand),
+    /// Validate, install, enable, and inspect Lua extension packages
+    #[command(subcommand)]
+    Extension(ExtensionCommand),
     /// Serve a local HTTP API and web console
     Serve(ServeCommand),
 }
@@ -186,6 +189,10 @@ pub struct ExecCommand {
     pub as_of_lsn: Option<u64>,
     #[arg(long)]
     pub branch: Option<String>,
+    #[arg(long = "allow-extension")]
+    pub allow_extensions: Vec<String>,
+    #[arg(long = "allow-unsigned-extensions", default_value_t = false)]
+    pub allow_unsigned_extensions: bool,
 }
 
 #[derive(Clone, Debug, Parser)]
@@ -196,6 +203,86 @@ pub struct ReplCommand {
     pub format: OutputFormat,
     #[arg(long)]
     pub branch: Option<String>,
+    #[arg(long = "allow-extension")]
+    pub allow_extensions: Vec<String>,
+    #[arg(long = "allow-unsigned-extensions", default_value_t = false)]
+    pub allow_unsigned_extensions: bool,
+}
+
+#[derive(Clone, Debug, Subcommand)]
+pub enum ExtensionCommand {
+    /// Validate a Lua extension package directory
+    Validate(ExtensionValidateCommand),
+    /// Run package self-tests where present
+    Test(ExtensionValidateCommand),
+    /// Install a package into the database-owned extension catalog
+    Install(ExtensionInstallCommand),
+    /// List installed extension packages
+    List(ExtensionDbCommand),
+    /// Show one installed extension package
+    Show(ExtensionNamedCommand),
+    /// Enable an installed package for SQL use
+    Enable(ExtensionNamedCommand),
+    /// Disable an extension package
+    Disable(ExtensionNamedCommand),
+    /// Remove installed package content
+    Purge(ExtensionPurgeCommand),
+    /// List recorded extension dependencies
+    Dependencies(ExtensionDbCommand),
+    /// Report persisted objects that depend on an extension
+    Rebuild(ExtensionNamedCommand),
+}
+
+#[derive(Clone, Debug, Parser)]
+pub struct ExtensionValidateCommand {
+    pub path: PathBuf,
+    #[arg(long = "allow-unsigned", default_value_t = false)]
+    pub allow_unsigned: bool,
+    #[arg(long = "trust-extension")]
+    pub trust_extensions: Vec<String>,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+    pub format: OutputFormat,
+}
+
+#[derive(Clone, Debug, Parser)]
+pub struct ExtensionInstallCommand {
+    #[arg(long)]
+    pub db: String,
+    pub path: PathBuf,
+    #[arg(long = "allow-unsigned", default_value_t = false)]
+    pub allow_unsigned: bool,
+    #[arg(long = "trust-extension")]
+    pub trust_extensions: Vec<String>,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+    pub format: OutputFormat,
+}
+
+#[derive(Clone, Debug, Parser)]
+pub struct ExtensionDbCommand {
+    #[arg(long)]
+    pub db: String,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+    pub format: OutputFormat,
+}
+
+#[derive(Clone, Debug, Parser)]
+pub struct ExtensionNamedCommand {
+    #[arg(long)]
+    pub db: String,
+    pub name: String,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+    pub format: OutputFormat,
+}
+
+#[derive(Clone, Debug, Parser)]
+pub struct ExtensionPurgeCommand {
+    #[arg(long)]
+    pub db: String,
+    pub name: String,
+    #[arg(long, default_value_t = false)]
+    pub confirm: bool,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+    pub format: OutputFormat,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -1260,7 +1347,14 @@ fn dispatch(cli: Cli) -> Result<()> {
         }
         Commands::Repl(command) => {
             run_repl(
-                open_db(&command.db, true, 0, 0)?,
+                open_db_with_extension_options(
+                    &command.db,
+                    true,
+                    0,
+                    0,
+                    &command.allow_extensions,
+                    command.allow_unsigned_extensions,
+                )?,
                 command.format,
                 command.branch.as_deref(),
             )?;
@@ -1298,10 +1392,214 @@ fn dispatch(cli: Cli) -> Result<()> {
         Commands::Migrate(command) => run_migrate(command)?,
         Commands::Sync(command) => run_sync(command)?,
         Commands::Relay(command) => run_relay(command)?,
+        Commands::Extension(command) => run_extension(command)?,
         Commands::Serve(command) => run_serve(command)?,
         Commands::Doctor(_) => unreachable!("Doctor is handled in run()"),
     }
     Ok(())
+}
+
+fn run_extension(command: ExtensionCommand) -> Result<()> {
+    match command {
+        ExtensionCommand::Validate(command) => {
+            let report = decentdb::validate_extension_package(
+                &command.path,
+                extension_validation_options(command.allow_unsigned, &command.trust_extensions)?,
+            )?;
+            print_json_or_rows(
+                command.format,
+                &report,
+                vec![
+                    ("valid".to_string(), report.valid.to_string()),
+                    (
+                        "name".to_string(),
+                        report.name.clone().unwrap_or_else(|| "-".to_string()),
+                    ),
+                    (
+                        "version".to_string(),
+                        report.version.clone().unwrap_or_else(|| "-".to_string()),
+                    ),
+                    (
+                        "content_hash".to_string(),
+                        report
+                            .content_hash
+                            .clone()
+                            .unwrap_or_else(|| "-".to_string()),
+                    ),
+                    ("errors".to_string(), report.errors.join("; ")),
+                ],
+            )?;
+        }
+        ExtensionCommand::Test(command) => run_extension_test(command)?,
+        ExtensionCommand::Install(command) => {
+            let db = open_db(&command.db, true, 0, 0)?;
+            let installed = db.extensions().install_with_options(
+                &command.path,
+                extension_validation_options(command.allow_unsigned, &command.trust_extensions)?,
+            )?;
+            print_json_or_rows(
+                command.format,
+                &installed,
+                vec![
+                    ("name".to_string(), installed.name.clone()),
+                    ("version".to_string(), installed.version.clone()),
+                    ("content_hash".to_string(), installed.content_hash.clone()),
+                    ("enabled".to_string(), installed.enabled.to_string()),
+                ],
+            )?;
+        }
+        ExtensionCommand::List(command) => {
+            let db = open_db(&command.db, true, 0, 0)?;
+            let items = db.extensions().list()?;
+            print_json_or_query_rows(
+                command.format,
+                &items,
+                &["name", "version", "content_hash", "enabled"],
+                items.iter().map(|item| {
+                    vec![
+                        item.name.clone(),
+                        item.version.clone(),
+                        item.content_hash.clone(),
+                        item.enabled.to_string(),
+                    ]
+                }),
+            )?;
+        }
+        ExtensionCommand::Show(command) => {
+            let db = open_db(&command.db, true, 0, 0)?;
+            let package = db
+                .extensions()
+                .show(&command.name)?
+                .ok_or_else(|| anyhow!("extension '{}' is not installed", command.name))?;
+            print_json_or_rows(
+                command.format,
+                &package,
+                vec![
+                    ("name".to_string(), package.manifest.name.clone()),
+                    ("version".to_string(), package.manifest.version.clone()),
+                    ("content_hash".to_string(), package.content_hash.clone()),
+                    (
+                        "functions".to_string(),
+                        package
+                            .manifest
+                            .functions
+                            .iter()
+                            .map(|function| function.name.clone())
+                            .collect::<Vec<_>>()
+                            .join(","),
+                    ),
+                ],
+            )?;
+        }
+        ExtensionCommand::Enable(command) => {
+            let db = open_db(&command.db, true, 0, 0)?;
+            db.extensions().enable(&command.name)?;
+            print_action(command.format, "enabled", &command.name)?;
+        }
+        ExtensionCommand::Disable(command) => {
+            let db = open_db(&command.db, true, 0, 0)?;
+            db.extensions().disable(&command.name)?;
+            print_action(command.format, "disabled", &command.name)?;
+        }
+        ExtensionCommand::Purge(command) => {
+            if !command.confirm {
+                return Err(anyhow!("extension purge requires --confirm"));
+            }
+            let db = open_db(&command.db, true, 0, 0)?;
+            db.extensions().purge(&command.name)?;
+            print_action(command.format, "purged", &command.name)?;
+        }
+        ExtensionCommand::Dependencies(command) => {
+            let db = open_db(&command.db, true, 0, 0)?;
+            let items = db.extensions().dependencies()?;
+            print_json_or_query_rows(
+                command.format,
+                &items,
+                &[
+                    "object_kind",
+                    "object_name",
+                    "extension_name",
+                    "dependency_name",
+                    "dependency_kind",
+                    "content_hash",
+                ],
+                items.iter().map(|item| {
+                    vec![
+                        item.object_kind.clone(),
+                        item.object_name.clone(),
+                        item.extension_name.clone(),
+                        item.dependency_name.clone(),
+                        item.dependency_kind.clone(),
+                        item.content_hash.clone(),
+                    ]
+                }),
+            )?;
+        }
+        ExtensionCommand::Rebuild(command) => {
+            let db = open_db(&command.db, true, 0, 0)?;
+            let items = db.extensions().rebuild_dependents(&command.name)?;
+            print_json_or_query_rows(
+                command.format,
+                &items,
+                &[
+                    "object_kind",
+                    "object_name",
+                    "dependency_name",
+                    "content_hash",
+                ],
+                items.iter().map(|item| {
+                    vec![
+                        item.object_kind.clone(),
+                        item.object_name.clone(),
+                        item.dependency_name.clone(),
+                        item.content_hash.clone(),
+                    ]
+                }),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn run_extension_test(command: ExtensionValidateCommand) -> Result<()> {
+    let options = extension_validation_options(command.allow_unsigned, &command.trust_extensions)?;
+    let report = decentdb::validate_extension_package(&command.path, options.clone())?;
+    if !report.valid {
+        return Err(anyhow!(
+            "extension validation failed: {}",
+            report.errors.join("; ")
+        ));
+    }
+    let mut config = DbConfig {
+        extension_unsigned_development_mode: command.allow_unsigned,
+        extension_trust_anchors: options.trust_anchors.clone(),
+        ..DbConfig::default()
+    };
+    if command.allow_unsigned {
+        config.extension_unsigned_development_mode = true;
+    }
+    let db = Db::open_or_create(":memory:", config)?;
+    db.extensions()
+        .install_with_options(&command.path, options)?;
+    if let Some(name) = report.name.as_deref() {
+        db.extensions().enable(name)?;
+    }
+    let behavior_sql = command.path.join("tests").join("behavior.sql");
+    if behavior_sql.exists() {
+        let sql = fs::read_to_string(&behavior_sql)?;
+        db.execute_batch(&sql)?;
+    }
+    print_json_or_rows(
+        command.format,
+        &serde_json::json!({"ok": true, "behavior_sql": behavior_sql.exists()}),
+        vec![
+            ("ok".to_string(), "true".to_string()),
+            (
+                "behavior_sql".to_string(),
+                behavior_sql.exists().to_string(),
+            ),
+        ],
+    )
 }
 
 fn run_serve(command: ServeCommand) -> Result<()> {
@@ -1334,7 +1632,14 @@ fn run_serve(command: ServeCommand) -> Result<()> {
 }
 
 fn run_exec(command: &ExecCommand) -> Result<()> {
-    let db = open_db(&command.db, true, command.cache_pages, command.cache_mb)?;
+    let db = open_db_with_extension_options(
+        &command.db,
+        true,
+        command.cache_pages,
+        command.cache_mb,
+        &command.allow_extensions,
+        command.allow_unsigned_extensions,
+    )?;
 
     if command.db_info {
         print_storage_info(command.format, &db.storage_info()?);
@@ -5385,17 +5690,124 @@ fn print_index_verification(format: OutputFormat, verification: &IndexVerificati
 }
 
 fn open_db(db: &str, create_if_missing: bool, cache_pages: usize, cache_mb: usize) -> Result<Db> {
+    open_db_with_extension_options(db, create_if_missing, cache_pages, cache_mb, &[], false)
+}
+
+fn open_db_with_extension_options(
+    db: &str,
+    create_if_missing: bool,
+    cache_pages: usize,
+    cache_mb: usize,
+    allow_extensions: &[String],
+    allow_unsigned_extensions: bool,
+) -> Result<Db> {
     let mut config = DbConfig::default();
     if cache_mb > 0 {
         config.cache_size_mb = cache_mb;
     } else if cache_pages > 0 {
         config.cache_size_mb = ((cache_pages * 4096) / (1024 * 1024)).max(1);
     }
+    config.extension_trust_anchors = allow_extensions
+        .iter()
+        .map(|raw| parse_extension_trust_anchor(raw))
+        .collect::<Result<Vec<_>>>()?;
+    config.extension_unsigned_development_mode = allow_unsigned_extensions;
     if create_if_missing {
         Ok(Db::open_or_create(db, config)?)
     } else {
         Ok(Db::open(db, config)?)
     }
+}
+
+fn extension_validation_options(
+    allow_unsigned: bool,
+    trust_extensions: &[String],
+) -> Result<ExtensionValidationOptions> {
+    Ok(ExtensionValidationOptions {
+        allow_unsigned,
+        trust_anchors: trust_extensions
+            .iter()
+            .map(|raw| parse_extension_trust_anchor(raw))
+            .collect::<Result<Vec<_>>>()?,
+    })
+}
+
+fn parse_extension_trust_anchor(raw: &str) -> Result<ExtensionTrustAnchor> {
+    let (name, rest) = raw
+        .split_once('@')
+        .ok_or_else(|| anyhow!("extension trust entry must be name@sha256:<hash>"))?;
+    let parts = rest.split('@').collect::<Vec<_>>();
+    match parts.as_slice() {
+        [hash] => Ok(ExtensionTrustAnchor::new(name, *hash)),
+        [hash, key_id, public_key] => Ok(ExtensionTrustAnchor::with_public_key(
+            name,
+            *hash,
+            *key_id,
+            *public_key,
+        )),
+        _ => Err(anyhow!(
+            "extension trust entry must be name@sha256:<hash> or name@sha256:<hash>@key_id@public_key"
+        )),
+    }
+}
+
+fn print_json_or_rows<T: serde::Serialize>(
+    format: OutputFormat,
+    value: &T,
+    rows: Vec<(String, String)>,
+) -> Result<()> {
+    match format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(value)?),
+        _ => println!("{}", render_key_value_rows(format, &rows)),
+    }
+    Ok(())
+}
+
+fn print_json_or_query_rows<T, I>(
+    format: OutputFormat,
+    value: &T,
+    columns: &[&str],
+    rows: I,
+) -> Result<()>
+where
+    T: serde::Serialize,
+    I: IntoIterator<Item = Vec<String>>,
+{
+    match format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(value)?),
+        _ => {
+            let query_rows = rows
+                .into_iter()
+                .map(|values| values.into_iter().map(Value::Text).collect::<Vec<_>>())
+                .map(decentdb::QueryRow::new)
+                .collect::<Vec<_>>();
+            let result = QueryResult::with_rows(
+                columns.iter().map(|column| (*column).to_string()).collect(),
+                query_rows,
+            );
+            println!(
+                "{}",
+                render_rows(
+                    format,
+                    result.columns(),
+                    &rows_from_query_result(&result),
+                    true
+                )
+            );
+        }
+    }
+    Ok(())
+}
+
+fn print_action(format: OutputFormat, action: &str, name: &str) -> Result<()> {
+    print_json_or_rows(
+        format,
+        &serde_json::json!({"action": action, "name": name}),
+        vec![
+            ("action".to_string(), action.to_string()),
+            ("name".to_string(), name.to_string()),
+        ],
+    )
 }
 
 fn split_scope_tables(raw: &str) -> Vec<String> {

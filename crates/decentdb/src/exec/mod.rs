@@ -78,7 +78,7 @@ use crate::storage::PagerHandle;
 use crate::wal::WalHandle;
 
 use self::cte::*;
-use self::row::{ColumnBinding, Dataset};
+pub(crate) use self::row::{ColumnBinding, Dataset};
 
 pub use row::{QueryResult, QueryRow};
 
@@ -1390,6 +1390,8 @@ pub(crate) struct EngineRuntime {
     pub(crate) sync_mutations: Vec<crate::sync::SyncMutation>,
     reactive_capture_active: bool,
     pub(crate) reactive_mutations: Vec<crate::reactive::RowChange>,
+    pub(crate) extension_trust_anchors: Arc<Vec<crate::extensions::ExtensionTrustAnchor>>,
+    pub(crate) extension_unsigned_development_mode: bool,
 }
 
 #[derive(Debug)]
@@ -1569,6 +1571,8 @@ impl Clone for EngineRuntime {
             sync_mutations: self.sync_mutations.clone(),
             reactive_capture_active: self.reactive_capture_active,
             reactive_mutations: self.reactive_mutations.clone(),
+            extension_trust_anchors: Arc::clone(&self.extension_trust_anchors),
+            extension_unsigned_development_mode: self.extension_unsigned_development_mode,
         }
     }
 }
@@ -1612,6 +1616,8 @@ impl EngineRuntime {
             sync_mutations: Vec::new(),
             reactive_capture_active: false,
             reactive_mutations: Vec::new(),
+            extension_trust_anchors: Arc::new(config.extension_trust_anchors.clone()),
+            extension_unsigned_development_mode: config.extension_unsigned_development_mode,
         }
     }
 
@@ -1918,6 +1924,9 @@ impl EngineRuntime {
             };
             runtime.root_state = Some(root);
             runtime.paged_row_storage = config.paged_row_storage;
+            runtime.extension_trust_anchors = Arc::new(config.extension_trust_anchors.clone());
+            runtime.extension_unsigned_development_mode =
+                config.extension_unsigned_development_mode;
             runtime
         } else {
             Self::from_config(schema_cookie, config)
@@ -6019,10 +6028,11 @@ impl EngineRuntime {
                 if let Some(order_plan) = &projection_order_plan {
                     let mut ord = std::cmp::Ordering::Equal;
                     for (i, plan) in order_plan.iter().enumerate() {
-                        match compare_values_with_collation(
+                        match compare_values_with_runtime_collation(
+                            Some(self),
                             &left_order[i],
                             &right_order[i],
-                            plan.collation,
+                            plan.collation.clone(),
                         ) {
                             Ok(std::cmp::Ordering::Equal) => continue,
                             Ok(o) => {
@@ -6039,7 +6049,12 @@ impl EngineRuntime {
                     }
                     ord
                 } else {
-                    match compare_query_row_order_values(left_order, right_order, plan.order_by) {
+                    match compare_query_row_order_values(
+                        Some(self),
+                        left_order,
+                        right_order,
+                        plan.order_by,
+                    ) {
                         Ok(ordering) => ordering,
                         Err(error) => {
                             if sort_error.is_none() {
@@ -6154,6 +6169,7 @@ impl EngineRuntime {
         }
 
         Ok(Some(apply_simple_projection_postprocessing_with_order(
+            Some(self),
             rows,
             plan.column_names,
             plan.order_by.as_deref(),
@@ -7105,7 +7121,12 @@ impl EngineRuntime {
         if has_order_by {
             let mut sort_error = None;
             rows_with_order.sort_by(|(_, left_order), (_, right_order)| {
-                match compare_query_row_order_values(left_order, right_order, plan.order_by) {
+                match compare_query_row_order_values(
+                    Some(self),
+                    left_order,
+                    right_order,
+                    plan.order_by,
+                ) {
                     Ok(ordering) => ordering,
                     Err(error) => {
                         if sort_error.is_none() {
@@ -7648,6 +7669,7 @@ impl EngineRuntime {
             rows = dedup_query_rows(rows)?;
         }
         Ok(Some(apply_simple_projection_postprocessing_with_order(
+            Some(self),
             rows,
             column_names,
             order_by.as_deref(),
@@ -8955,6 +8977,9 @@ impl EngineRuntime {
         {
             return Ok(None);
         }
+        if select_requires_grouped_evaluation(self, select)? {
+            return Ok(None);
+        }
         if select.distinct
             && (!query.order_by.is_empty() || query.limit.is_some() || query.offset.is_some())
         {
@@ -9517,6 +9542,9 @@ impl EngineRuntime {
         {
             return Ok(None);
         }
+        if select_requires_grouped_evaluation(self, select)? {
+            return Ok(None);
+        }
         if select.distinct
             && (!query.order_by.is_empty() || query.limit.is_some() || query.offset.is_some())
         {
@@ -9636,6 +9664,7 @@ impl EngineRuntime {
             ));
         }
         apply_simple_projection_postprocessing_with_order(
+            Some(self),
             rows,
             column_names,
             order_by.as_deref(),
@@ -9664,6 +9693,7 @@ impl EngineRuntime {
             }
         }
         apply_simple_projection_postprocessing_with_order(
+            Some(self),
             rows,
             column_names,
             order_by.as_deref(),
@@ -9689,6 +9719,7 @@ impl EngineRuntime {
             Ok(())
         })?;
         apply_simple_projection_postprocessing_with_order(
+            Some(self),
             rows,
             column_names,
             order_by.as_deref(),
@@ -9718,6 +9749,7 @@ impl EngineRuntime {
             Ok(())
         })?;
         apply_simple_projection_postprocessing_with_order(
+            Some(self),
             rows,
             column_names,
             order_by.as_deref(),
@@ -9809,7 +9841,13 @@ impl EngineRuntime {
                         rows.push(row);
                     }
                 } else {
-                    push_bounded_ordered_query_row(&mut rows, row, order_by, bounded_row_count)?;
+                    push_bounded_ordered_query_row(
+                        Some(self),
+                        &mut rows,
+                        row,
+                        order_by,
+                        bounded_row_count,
+                    )?;
                 }
             } else {
                 rows.push(row);
@@ -9818,7 +9856,7 @@ impl EngineRuntime {
         })?;
 
         if !order_by.is_empty() {
-            sort_query_rows_by_order_values(&mut rows, order_by)?;
+            sort_query_rows_by_order_values(Some(self), &mut rows, order_by)?;
         }
 
         let rows = rows
@@ -9917,7 +9955,13 @@ impl EngineRuntime {
                         break;
                     }
                 } else {
-                    push_bounded_ordered_query_row(&mut rows, row, order_by, bounded_row_count)?;
+                    push_bounded_ordered_query_row(
+                        Some(self),
+                        &mut rows,
+                        row,
+                        order_by,
+                        bounded_row_count,
+                    )?;
                 }
             } else {
                 rows.push(row);
@@ -9925,7 +9969,7 @@ impl EngineRuntime {
         }
 
         if !order_by.is_empty() {
-            sort_query_rows_by_order_values(&mut rows, order_by)?;
+            sort_query_rows_by_order_values(Some(self), &mut rows, order_by)?;
         }
 
         let rows = rows
@@ -9963,6 +10007,7 @@ impl EngineRuntime {
             ));
         }
         apply_simple_projection_postprocessing_with_order(
+            Some(self),
             rows,
             column_names,
             order_by.as_deref(),
@@ -9999,6 +10044,7 @@ impl EngineRuntime {
             }
         }
         apply_simple_projection_postprocessing_with_order(
+            Some(self),
             rows,
             column_names,
             order_by.as_deref(),
@@ -10031,6 +10077,7 @@ impl EngineRuntime {
             Ok(())
         })?;
         apply_simple_projection_postprocessing_with_order(
+            Some(self),
             rows,
             column_names,
             order_by.as_deref(),
@@ -10067,6 +10114,7 @@ impl EngineRuntime {
             Ok(())
         })?;
         apply_simple_projection_postprocessing_with_order(
+            Some(self),
             rows,
             column_names,
             order_by.as_deref(),
@@ -11552,7 +11600,7 @@ impl EngineRuntime {
                 Some(SimpleOrderByPlan {
                     projection_index: order_projection_index,
                     descending: entry.descending,
-                    collation: entry.collation,
+                    collation: entry.collation.clone(),
                 })
             })
             .collect::<Option<Vec<_>>>();
@@ -11619,7 +11667,7 @@ impl EngineRuntime {
                 Some(SimpleOrderByPlan {
                     projection_index,
                     descending: entry.descending,
-                    collation: entry.collation,
+                    collation: entry.collation.clone(),
                 })
             })
             .collect::<Option<Vec<_>>>();
@@ -11975,6 +12023,7 @@ impl EngineRuntime {
             rows
         };
         apply_simple_projection_postprocessing_with_order(
+            Some(self),
             rows,
             column_names,
             order_by,
@@ -12002,27 +12051,29 @@ impl EngineRuntime {
 
         let mut sorted_during_select = false;
         let mut dataset = match &query.body {
-            QueryBody::Select(select)
-                if !select.group_by.is_empty()
-                    || projection_has_aggregate_items(&select.projection) =>
-            {
-                self.evaluate_select(select, params, &ctes)?
-            }
             QueryBody::Select(select) => {
-                let projection_order_by =
-                    projection_order_by_plan(&query.order_by, &select.projection);
-                let mut source = self.build_select_dataset(select, params, &ctes)?;
-                if !query.order_by.is_empty() && projection_order_by.is_none() {
-                    self.sort_dataset(&mut source, &query.order_by, params, &ctes)?;
-                    sorted_during_select = true;
+                if select_requires_grouped_evaluation(self, select)? {
+                    self.evaluate_select(select, params, &ctes)?
+                } else {
+                    let projection_order_by =
+                        projection_order_by_plan(&query.order_by, &select.projection);
+                    let mut source = self.build_select_dataset(select, params, &ctes)?;
+                    if !query.order_by.is_empty() && projection_order_by.is_none() {
+                        self.sort_dataset(&mut source, &query.order_by, params, &ctes)?;
+                        sorted_during_select = true;
+                    }
+                    let mut projected =
+                        self.project_dataset(&source, &select.projection, params, &ctes, None)?;
+                    if let Some(order_by_plan) = projection_order_by.as_deref() {
+                        sort_dataset_by_projection_order(
+                            Some(self),
+                            &mut projected,
+                            order_by_plan,
+                        )?;
+                        sorted_during_select = true;
+                    }
+                    projected
                 }
-                let mut projected =
-                    self.project_dataset(&source, &select.projection, params, &ctes, None)?;
-                if let Some(order_by_plan) = projection_order_by.as_deref() {
-                    sort_dataset_by_projection_order(&mut projected, order_by_plan)?;
-                    sorted_during_select = true;
-                }
-                projected
             }
             _ => self.evaluate_query_body(&query.body, params, &ctes)?,
         };
@@ -12223,33 +12274,41 @@ impl EngineRuntime {
 
         let mut sorted_during_select = false;
         let mut dataset = match &query.body {
-            QueryBody::Select(select)
-                if !select.group_by.is_empty()
-                    || projection_has_aggregate_items(&select.projection) =>
-            {
-                self.evaluate_select_with_outer(select, params, &ctes, outer_dataset, outer_row)?
-            }
             QueryBody::Select(select) => {
-                let projection_order_by =
-                    projection_order_by_plan(&query.order_by, &select.projection);
-                let mut source = self.build_select_dataset_with_outer(
-                    select,
-                    params,
-                    &ctes,
-                    outer_dataset,
-                    outer_row,
-                )?;
-                if !query.order_by.is_empty() && projection_order_by.is_none() {
-                    self.sort_dataset(&mut source, &query.order_by, params, &ctes)?;
-                    sorted_during_select = true;
+                if select_requires_grouped_evaluation(self, select)? {
+                    self.evaluate_select_with_outer(
+                        select,
+                        params,
+                        &ctes,
+                        outer_dataset,
+                        outer_row,
+                    )?
+                } else {
+                    let projection_order_by =
+                        projection_order_by_plan(&query.order_by, &select.projection);
+                    let mut source = self.build_select_dataset_with_outer(
+                        select,
+                        params,
+                        &ctes,
+                        outer_dataset,
+                        outer_row,
+                    )?;
+                    if !query.order_by.is_empty() && projection_order_by.is_none() {
+                        self.sort_dataset(&mut source, &query.order_by, params, &ctes)?;
+                        sorted_during_select = true;
+                    }
+                    let mut projected =
+                        self.project_dataset(&source, &select.projection, params, &ctes, None)?;
+                    if let Some(order_by_plan) = projection_order_by.as_deref() {
+                        sort_dataset_by_projection_order(
+                            Some(self),
+                            &mut projected,
+                            order_by_plan,
+                        )?;
+                        sorted_during_select = true;
+                    }
+                    projected
                 }
-                let mut projected =
-                    self.project_dataset(&source, &select.projection, params, &ctes, None)?;
-                if let Some(order_by_plan) = projection_order_by.as_deref() {
-                    sort_dataset_by_projection_order(&mut projected, order_by_plan)?;
-                    sorted_during_select = true;
-                }
-                projected
             }
             _ => self.evaluate_query_body_with_outer(
                 &query.body,
@@ -12369,7 +12428,7 @@ impl EngineRuntime {
         ctes: &BTreeMap<String, Dataset>,
     ) -> Result<Dataset> {
         let dataset = self.build_select_dataset(select, params, ctes)?;
-        if !select.group_by.is_empty() || projection_has_aggregate_items(&select.projection) {
+        if select_requires_grouped_evaluation(self, select)? {
             self.evaluate_grouped_select(select, dataset, params, ctes)
         } else {
             self.project_dataset(&dataset, &select.projection, params, ctes, None)
@@ -12386,7 +12445,7 @@ impl EngineRuntime {
     ) -> Result<Dataset> {
         let dataset =
             self.build_select_dataset_with_outer(select, params, ctes, outer_dataset, outer_row)?;
-        if !select.group_by.is_empty() || projection_has_aggregate_items(&select.projection) {
+        if select_requires_grouped_evaluation(self, select)? {
             self.evaluate_grouped_select(select, dataset, params, ctes)
         } else {
             self.project_dataset(&dataset, &select.projection, params, ctes, None)
@@ -14153,7 +14212,14 @@ impl EngineRuntime {
             "pragma_database_list" | "main.pragma_database_list" | "temp.pragma_database_list" => {
                 self.evaluate_pragma_database_list_function(table_name, values)
             }
-            other => Err(DbError::sql(format!("unsupported table function {other}"))),
+            other => {
+                if let Some(dataset) = crate::extensions::evaluate_table_function_from_runtime(
+                    self, other, values, table_name,
+                )? {
+                    return Ok(dataset);
+                }
+                Err(DbError::sql(format!("unsupported table function {other}")))
+            }
         }
     }
 
@@ -18296,6 +18362,43 @@ pub(crate) fn projection_has_aggregate_items(items: &[SelectItem]) -> bool {
     })
 }
 
+fn select_requires_grouped_evaluation(runtime: &EngineRuntime, select: &Select) -> Result<bool> {
+    if !select.group_by.is_empty() || projection_has_aggregate_items(&select.projection) {
+        return Ok(true);
+    }
+    if select.having.as_ref().is_some_and(expr_contains_aggregate) {
+        return Ok(true);
+    }
+    projection_has_runtime_extension_aggregate_items(runtime, &select.projection).and_then(
+        |has_projection_aggregate| {
+            eprintln!("has_projection_aggregate={has_projection_aggregate}");
+            if has_projection_aggregate {
+                return Ok(true);
+            }
+            select
+                .having
+                .as_ref()
+                .map(|expr| expr_contains_runtime_extension_aggregate(runtime, expr))
+                .transpose()
+                .map(Option::unwrap_or_default)
+        },
+    )
+}
+
+fn projection_has_runtime_extension_aggregate_items(
+    runtime: &EngineRuntime,
+    items: &[SelectItem],
+) -> Result<bool> {
+    for item in items {
+        if let SelectItem::Expr { expr, .. } = item {
+            if expr_contains_runtime_extension_aggregate(runtime, expr)? {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 fn simple_btree_lookup(filter: &Expr) -> Option<(Option<&str>, &str, &Expr)> {
     match filter {
         Expr::Binary { left, op, right } if *op == BinaryOp::Eq => match (&**left, &**right) {
@@ -18786,6 +18889,7 @@ fn render_simple_grouped_numeric_aggregate_groups(
             rows.push(QueryRow::new(output));
         }
         return apply_simple_projection_postprocessing_with_order(
+            Some(runtime),
             rows,
             plan.column_names.clone(),
             plan.order_by.as_deref(),
@@ -18855,6 +18959,7 @@ fn render_simple_grouped_count_groups(
             rows.push(QueryRow::new(output));
         }
         return apply_simple_projection_postprocessing_with_order(
+            Some(runtime),
             rows,
             plan.column_names.clone(),
             plan.order_by.as_deref(),
@@ -19360,7 +19465,7 @@ fn rewrite_simple_grouped_output_expr(
                 synthetic_names,
                 aggregate_bindings,
             )?),
-            collation: *collation,
+            collation: collation.clone(),
         }),
         Expr::Function { name, args } => Some(Expr::Function {
             name: name.clone(),
@@ -19504,7 +19609,7 @@ impl BenchmarkReportAggregate {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct SimpleOrderByPlan {
     projection_index: usize,
     descending: bool,
@@ -20175,6 +20280,7 @@ fn project_simple_projection_values(values: &[Value], projection_indexes: &[usiz
 }
 
 fn apply_simple_projection_postprocessing_with_order(
+    runtime: Option<&EngineRuntime>,
     mut rows: Vec<QueryRow>,
     column_names: Vec<String>,
     order_by: Option<&[SimpleOrderByPlan]>,
@@ -20182,7 +20288,7 @@ fn apply_simple_projection_postprocessing_with_order(
     offset: usize,
 ) -> Result<QueryResult> {
     if let Some(order_by) = order_by {
-        sort_query_rows_by_projection_order(&mut rows, order_by)?;
+        sort_query_rows_by_projection_order(runtime, &mut rows, order_by)?;
     }
     let rows = rows
         .into_iter()
@@ -20204,15 +20310,17 @@ fn dedup_query_rows(rows: Vec<QueryRow>) -> Result<Vec<QueryRow>> {
 }
 
 fn compare_query_row_order_values(
+    runtime: Option<&EngineRuntime>,
     left_order: &[Value],
     right_order: &[Value],
     order_by: &[crate::sql::ast::OrderBy],
 ) -> Result<std::cmp::Ordering> {
     for (index, order) in order_by.iter().enumerate() {
-        let ordering = compare_values_with_collation(
+        let ordering = compare_values_with_runtime_collation(
+            runtime,
             &left_order[index],
             &right_order[index],
-            order.collation,
+            order.collation.clone(),
         )?;
         if ordering == std::cmp::Ordering::Equal {
             continue;
@@ -20227,12 +20335,13 @@ fn compare_query_row_order_values(
 }
 
 fn sort_query_rows_by_order_values(
+    runtime: Option<&EngineRuntime>,
     rows: &mut [(QueryRow, Vec<Value>)],
     order_by: &[crate::sql::ast::OrderBy],
 ) -> Result<()> {
     let mut sort_error = None;
     rows.sort_by(|(_, left_order), (_, right_order)| {
-        match compare_query_row_order_values(left_order, right_order, order_by) {
+        match compare_query_row_order_values(runtime, left_order, right_order, order_by) {
             Ok(ordering) => ordering,
             Err(error) => {
                 if sort_error.is_none() {
@@ -20249,6 +20358,7 @@ fn sort_query_rows_by_order_values(
 }
 
 fn push_bounded_ordered_query_row(
+    runtime: Option<&EngineRuntime>,
     rows: &mut Vec<(QueryRow, Vec<Value>)>,
     row: (QueryRow, Vec<Value>),
     order_by: &[crate::sql::ast::OrderBy],
@@ -20263,13 +20373,13 @@ fn push_bounded_ordered_query_row(
     }
     let mut worst_index = 0;
     for index in 1..rows.len() {
-        if compare_query_row_order_values(&rows[index].1, &rows[worst_index].1, order_by)?
+        if compare_query_row_order_values(runtime, &rows[index].1, &rows[worst_index].1, order_by)?
             == std::cmp::Ordering::Greater
         {
             worst_index = index;
         }
     }
-    if compare_query_row_order_values(&row.1, &rows[worst_index].1, order_by)?
+    if compare_query_row_order_values(runtime, &row.1, &rows[worst_index].1, order_by)?
         == std::cmp::Ordering::Less
     {
         rows[worst_index] = row;
@@ -20278,16 +20388,18 @@ fn push_bounded_ordered_query_row(
 }
 
 fn sort_query_rows_by_projection_order(
+    runtime: Option<&EngineRuntime>,
     rows: &mut [QueryRow],
     order_by: &[SimpleOrderByPlan],
 ) -> Result<()> {
     let mut sort_error = None;
     rows.sort_by(|left, right| {
         for order in order_by {
-            let ordering = compare_values_with_collation(
+            let ordering = compare_values_with_runtime_collation(
+                runtime,
                 &left.values()[order.projection_index],
                 &right.values()[order.projection_index],
-                order.collation,
+                order.collation.clone(),
             );
             match ordering {
                 Ok(std::cmp::Ordering::Equal) => continue,
@@ -21223,7 +21335,7 @@ fn projection_order_by_plan(
             order_by_projection_index(entry, projection).map(|projection_index| SimpleOrderByPlan {
                 projection_index,
                 descending: entry.descending,
-                collation: entry.collation,
+                collation: entry.collation.clone(),
             })
         })
         .collect()
@@ -21254,16 +21366,18 @@ fn order_by_projection_index(
 }
 
 fn sort_dataset_by_projection_order(
+    runtime: Option<&EngineRuntime>,
     dataset: &mut Dataset,
     order_by: &[SimpleOrderByPlan],
 ) -> Result<()> {
     let mut sort_error = None;
     dataset.rows_mut().sort_by(|left, right| {
         for order in order_by {
-            let ordering = compare_values_with_collation(
+            let ordering = compare_values_with_runtime_collation(
+                runtime,
                 &left[order.projection_index],
                 &right[order.projection_index],
-                order.collation,
+                order.collation.clone(),
             );
             match ordering {
                 Ok(std::cmp::Ordering::Equal) => continue,
@@ -22406,7 +22520,7 @@ fn simple_join_projection_order_by_plan(
             projection_index.map(|projection_index| SimpleOrderByPlan {
                 projection_index,
                 descending: entry.descending,
-                collation: entry.collation,
+                collation: entry.collation.clone(),
             })
         })
         .collect::<Option<Vec<_>>>();
@@ -22847,6 +22961,101 @@ fn expr_contains_aggregate(expr: &Expr) -> bool {
         Expr::Cast { expr, .. } => expr_contains_aggregate(expr),
         Expr::Literal(_) | Expr::Column { .. } | Expr::Parameter(_) => false,
     }
+}
+
+fn expr_contains_runtime_extension_aggregate(runtime: &EngineRuntime, expr: &Expr) -> Result<bool> {
+    Ok(match expr {
+        Expr::Aggregate { .. } => true,
+        Expr::Function { name, args } => {
+            crate::extensions::runtime_has_aggregate_function(runtime, name)?
+                || args.iter().try_fold(false, |found, arg| {
+                    if found {
+                        Ok(true)
+                    } else {
+                        expr_contains_runtime_extension_aggregate(runtime, arg)
+                    }
+                })?
+        }
+        Expr::Unary { expr, .. } | Expr::Collate { expr, .. } | Expr::Cast { expr, .. } => {
+            expr_contains_runtime_extension_aggregate(runtime, expr)?
+        }
+        Expr::Binary { left, right, .. } => {
+            expr_contains_runtime_extension_aggregate(runtime, left)?
+                || expr_contains_runtime_extension_aggregate(runtime, right)?
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            expr_contains_runtime_extension_aggregate(runtime, expr)?
+                || expr_contains_runtime_extension_aggregate(runtime, low)?
+                || expr_contains_runtime_extension_aggregate(runtime, high)?
+        }
+        Expr::InList { expr, items, .. } => {
+            expr_contains_runtime_extension_aggregate(runtime, expr)?
+                || items.iter().try_fold(false, |found, item| {
+                    if found {
+                        Ok(true)
+                    } else {
+                        expr_contains_runtime_extension_aggregate(runtime, item)
+                    }
+                })?
+        }
+        Expr::InSubquery { expr, .. } | Expr::CompareSubquery { expr, .. } => {
+            expr_contains_runtime_extension_aggregate(runtime, expr)?
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            expr_contains_runtime_extension_aggregate(runtime, expr)?
+                || expr_contains_runtime_extension_aggregate(runtime, pattern)?
+                || escape
+                    .as_deref()
+                    .map(|expr| expr_contains_runtime_extension_aggregate(runtime, expr))
+                    .transpose()?
+                    .unwrap_or(false)
+        }
+        Expr::IsNull { expr, .. } => expr_contains_runtime_extension_aggregate(runtime, expr)?,
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            operand
+                .as_deref()
+                .map(|expr| expr_contains_runtime_extension_aggregate(runtime, expr))
+                .transpose()?
+                .unwrap_or(false)
+                || branches.iter().try_fold(false, |found, (left, right)| {
+                    if found {
+                        Ok(true)
+                    } else {
+                        Ok(expr_contains_runtime_extension_aggregate(runtime, left)?
+                            || expr_contains_runtime_extension_aggregate(runtime, right)?)
+                    }
+                })?
+                || else_expr
+                    .as_deref()
+                    .map(|expr| expr_contains_runtime_extension_aggregate(runtime, expr))
+                    .transpose()?
+                    .unwrap_or(false)
+        }
+        Expr::Row(items) => items.iter().try_fold(false, |found, item| {
+            if found {
+                Ok(true)
+            } else {
+                expr_contains_runtime_extension_aggregate(runtime, item)
+            }
+        })?,
+        Expr::ScalarSubquery(_) | Expr::Exists(_) => false,
+        Expr::RowNumber { .. }
+        | Expr::WindowFunction { .. }
+        | Expr::Literal(_)
+        | Expr::Column { .. }
+        | Expr::Parameter(_) => false,
+    })
 }
 
 fn expr_contains_window(expr: &Expr) -> bool {
@@ -24380,6 +24589,7 @@ impl EngineRuntime {
             })
             .collect::<Vec<_>>();
 
+        let mut sort_error = None;
         let mut order = (0..dataset.rows.len()).collect::<Vec<_>>();
         order.sort_by(|left_index, right_index| {
             let left_key = &sort_keys[*left_index];
@@ -24387,9 +24597,20 @@ impl EngineRuntime {
             for (order_clause, (left_value, right_value)) in
                 order_by.iter().zip(left_key.iter().zip(right_key.iter()))
             {
-                let ordering =
-                    compare_values_with_collation(left_value, right_value, order_clause.collation)
-                        .unwrap_or(std::cmp::Ordering::Equal);
+                let ordering = match compare_values_with_runtime_collation(
+                    Some(self),
+                    left_value,
+                    right_value,
+                    order_clause.collation.clone(),
+                ) {
+                    Ok(ordering) => ordering,
+                    Err(error) => {
+                        if sort_error.is_none() {
+                            sort_error = Some(error);
+                        }
+                        std::cmp::Ordering::Equal
+                    }
+                };
                 if ordering != std::cmp::Ordering::Equal {
                     return if order_clause.descending {
                         ordering.reverse()
@@ -24400,6 +24621,9 @@ impl EngineRuntime {
             }
             left_index.cmp(right_index)
         });
+        if let Some(error) = sort_error {
+            return Err(error);
+        }
 
         let mut rows = dataset
             .take_rows()
@@ -24737,9 +24961,29 @@ impl EngineRuntime {
                     order_by,
                     name,
                 ),
-                other => Err(DbError::sql(format!(
-                    "unsupported aggregate function {other}"
-                ))),
+                other => {
+                    let mut arg_rows = Vec::with_capacity(group_row_indexes.len());
+                    for row_index in group_row_indexes {
+                        let row = dataset
+                            .rows
+                            .get(*row_index)
+                            .map(Vec::as_slice)
+                            .ok_or_else(|| DbError::internal("group row index is invalid"))?;
+                        let values = args
+                            .iter()
+                            .map(|arg| self.eval_expr(arg, dataset, row, params, ctes, None))
+                            .collect::<Result<Vec<_>>>()?;
+                        arg_rows.push(values);
+                    }
+                    if let Some(value) =
+                        crate::extensions::invoke_aggregate_from_runtime(self, other, arg_rows)?
+                    {
+                        return Ok(value);
+                    }
+                    Err(DbError::sql(format!(
+                        "unsupported aggregate function {other}"
+                    )))
+                }
             },
             Expr::Unary { op, expr } => {
                 let value = self.eval_group_expr(expr, dataset, group_row_indexes, params, ctes)?;
@@ -24759,6 +25003,7 @@ impl EngineRuntime {
             Expr::Binary { left, op, right } => {
                 let collation = expr_collation(left).or_else(|| expr_collation(right));
                 eval_binary_with_collation(
+                    Some(self),
                     op,
                     self.eval_group_expr(left, dataset, group_row_indexes, params, ctes)?,
                     self.eval_group_expr(right, dataset, group_row_indexes, params, ctes)?,
@@ -24781,9 +25026,13 @@ impl EngineRuntime {
                     return Ok(Value::Null);
                 }
                 let collation = expr_collation(expr);
-                let in_range = compare_values_with_collation(&value, &low, collation)?
-                    != std::cmp::Ordering::Less
-                    && compare_values_with_collation(&value, &high, collation)?
+                let in_range = compare_values_with_runtime_collation(
+                    Some(self),
+                    &value,
+                    &low,
+                    collation.clone(),
+                )? != std::cmp::Ordering::Less
+                    && compare_values_with_runtime_collation(Some(self), &value, &high, collation)?
                         != std::cmp::Ordering::Greater;
                 Ok(Value::Bool(if *negated { !in_range } else { in_range }))
             }
@@ -24850,6 +25099,26 @@ impl EngineRuntime {
                 Ok(Value::Bool(if *negated { !is_null } else { is_null }))
             }
             Expr::Function { name, args } => {
+                if !args.iter().any(expr_contains_aggregate) {
+                    let mut arg_rows = Vec::with_capacity(group_row_indexes.len());
+                    for row_index in group_row_indexes {
+                        let row = dataset
+                            .rows
+                            .get(*row_index)
+                            .map(Vec::as_slice)
+                            .ok_or_else(|| DbError::internal("group row index is invalid"))?;
+                        let values = args
+                            .iter()
+                            .map(|arg| self.eval_expr(arg, dataset, row, params, ctes, None))
+                            .collect::<Result<Vec<_>>>()?;
+                        arg_rows.push(values);
+                    }
+                    if let Some(value) =
+                        crate::extensions::invoke_aggregate_from_runtime(self, name, arg_rows)?
+                    {
+                        return Ok(value);
+                    }
+                }
                 let row = if let Some(row_index) = group_row_indexes.first().copied() {
                     dataset
                         .rows
@@ -25014,7 +25283,7 @@ impl EngineRuntime {
                 let collation = expr_collation(left).or_else(|| expr_collation(right));
                 let left = self.eval_expr(left, dataset, row, params, ctes, excluded)?;
                 let right = self.eval_expr(right, dataset, row, params, ctes, excluded)?;
-                eval_binary_with_collation(op, left, right, collation)
+                eval_binary_with_collation(Some(self), op, left, right, collation)
             }
             Expr::Between {
                 expr,
@@ -25032,9 +25301,13 @@ impl EngineRuntime {
                     return Ok(Value::Null);
                 }
                 let collation = expr_collation(expr);
-                let in_range = compare_values_with_collation(&value, &low, collation)?
-                    != std::cmp::Ordering::Less
-                    && compare_values_with_collation(&value, &high, collation)?
+                let in_range = compare_values_with_runtime_collation(
+                    Some(self),
+                    &value,
+                    &low,
+                    collation.clone(),
+                )? != std::cmp::Ordering::Less
+                    && compare_values_with_runtime_collation(Some(self), &value, &high, collation)?
                         != std::cmp::Ordering::Greater;
                 Ok(Value::Bool(if *negated { !in_range } else { in_range }))
             }
@@ -25126,6 +25399,7 @@ impl EngineRuntime {
                     saw_row = true;
                     let candidate = subquery_row.first().cloned().unwrap_or(Value::Null);
                     match eval_binary_with_collation(
+                        Some(self),
                         op,
                         left_value.clone(),
                         candidate,
@@ -26479,7 +26753,14 @@ fn eval_function(
         "st_geogfromtext" => eval_spatial_from_text(&values, true),
         "st_geomfromgeojson" => eval_spatial_from_geojson(&values, false),
         "st_geogfromgeojson" => eval_spatial_from_geojson(&values, true),
-        other => Err(DbError::sql(format!("unsupported scalar function {other}"))),
+        other => {
+            if let Some(value) =
+                crate::extensions::invoke_scalar_from_runtime(runtime, other, &values)?
+            {
+                return Ok(value);
+            }
+            Err(DbError::sql(format!("unsupported scalar function {other}")))
+        }
     }
 }
 
@@ -28974,10 +29255,23 @@ fn sort_aggregate_row_indexes(
             Ok((*row_index, keys))
         })
         .collect::<Result<Vec<_>>>()?;
+    let mut sort_error = None;
     keyed.sort_by(|(left_index, left_keys), (right_index, right_keys)| {
         for (order, (left, right)) in order_by.iter().zip(left_keys.iter().zip(right_keys.iter())) {
-            let ordering = compare_values_with_collation(left, right, order.collation)
-                .unwrap_or(std::cmp::Ordering::Equal);
+            let ordering = match compare_values_with_runtime_collation(
+                Some(runtime),
+                left,
+                right,
+                order.collation.clone(),
+            ) {
+                Ok(ordering) => ordering,
+                Err(error) => {
+                    if sort_error.is_none() {
+                        sort_error = Some(error);
+                    }
+                    std::cmp::Ordering::Equal
+                }
+            };
             if ordering != std::cmp::Ordering::Equal {
                 return if order.descending {
                     ordering.reverse()
@@ -28988,6 +29282,9 @@ fn sort_aggregate_row_indexes(
         }
         left_index.cmp(right_index)
     });
+    if let Some(error) = sort_error {
+        return Err(error);
+    }
     Ok(keyed.into_iter().map(|(row_index, _)| row_index).collect())
 }
 
@@ -29775,7 +30072,28 @@ fn eval_binary(op: &BinaryOp, left: Value, right: Value) -> Result<Value> {
     }
 }
 
+fn compare_values_with_runtime_collation(
+    runtime: Option<&EngineRuntime>,
+    left: &Value,
+    right: &Value,
+    collation: Option<Collation>,
+) -> Result<std::cmp::Ordering> {
+    match (&collation, left, right) {
+        (Some(Collation::Extension(name)), Value::Text(left), Value::Text(right)) => {
+            let Some(runtime) = runtime else {
+                return Err(DbError::sql(format!(
+                    "extension collation {name} requires runtime-aware comparison"
+                )));
+            };
+            crate::extensions::compare_with_collation_from_runtime(runtime, name, left, right)?
+                .ok_or_else(|| DbError::sql(format!("unsupported collation {name}")))
+        }
+        _ => compare_values_with_collation(left, right, collation),
+    }
+}
+
 fn eval_binary_with_collation(
+    runtime: Option<&EngineRuntime>,
     op: &BinaryOp,
     left: Value,
     right: Value,
@@ -29786,10 +30104,12 @@ fn eval_binary_with_collation(
     }
     match op {
         BinaryOp::IsDistinctFrom => Ok(Value::Bool(
-            compare_values_with_collation(&left, &right, collation)? != std::cmp::Ordering::Equal,
+            compare_values_with_runtime_collation(runtime, &left, &right, collation.clone())?
+                != std::cmp::Ordering::Equal,
         )),
         BinaryOp::IsNotDistinctFrom => Ok(Value::Bool(
-            compare_values_with_collation(&left, &right, collation)? == std::cmp::Ordering::Equal,
+            compare_values_with_runtime_collation(runtime, &left, &right, collation.clone())?
+                == std::cmp::Ordering::Equal,
         )),
         BinaryOp::Eq
         | BinaryOp::NotEq
@@ -29800,7 +30120,8 @@ fn eval_binary_with_collation(
             if matches!(left, Value::Null) || matches!(right, Value::Null) {
                 return Ok(Value::Null);
             }
-            let ordering = compare_values_with_collation(&left, &right, collation)?;
+            let ordering =
+                compare_values_with_runtime_collation(runtime, &left, &right, collation)?;
             Ok(Value::Bool(match op {
                 BinaryOp::Eq => ordering == std::cmp::Ordering::Equal,
                 BinaryOp::NotEq => ordering != std::cmp::Ordering::Equal,
@@ -34305,7 +34626,7 @@ fn date_days_to_micros(days: i32) -> Result<i64> {
 
 fn expr_collation(expr: &Expr) -> Option<Collation> {
     match expr {
-        Expr::Collate { collation, .. } => Some(*collation),
+        Expr::Collate { collation, .. } => Some(collation.clone()),
         _ => None,
     }
 }
@@ -34408,6 +34729,11 @@ fn compare_values_with_collation(
         }
         (Some(Collation::RTrim), Value::Text(left), Value::Text(right)) => {
             Ok(left.trim_end_matches(' ').cmp(right.trim_end_matches(' ')))
+        }
+        (Some(Collation::Extension(name)), Value::Text(_), Value::Text(_)) => {
+            Err(DbError::sql(format!(
+                "extension collation {name} requires runtime-aware comparison and is not supported in this execution path"
+            )))
         }
         _ => compare_values(left, right),
     }

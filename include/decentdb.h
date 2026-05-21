@@ -423,6 +423,42 @@ ddb_status_t ddb_db_get_tooling_metadata_json(ddb_db_t *db, char **out_json);
 ddb_status_t ddb_db_describe_query_json(ddb_db_t *db, const char *sql, char **out_json);
 ddb_status_t ddb_db_inspect_storage_state_json(ddb_db_t *db, char **out_json);
 
+/*
+ * Lua extension package lifecycle JSON APIs.
+ *
+ * Returned JSON strings are owned by the caller and must be released with
+ * ddb_string_free.
+ */
+ddb_status_t ddb_extension_validate_json(const char *request_json, char **out_json);
+ddb_status_t ddb_extension_install_json(
+    ddb_db_t *db,
+    const char *request_json,
+    char **out_json);
+ddb_status_t ddb_extension_enable_json(
+    ddb_db_t *db,
+    const char *request_json,
+    char **out_json);
+ddb_status_t ddb_extension_disable_json(
+    ddb_db_t *db,
+    const char *request_json,
+    char **out_json);
+ddb_status_t ddb_extension_list_json(
+    ddb_db_t *db,
+    const char *request_json,
+    char **out_json);
+ddb_status_t ddb_extension_dependencies_json(
+    ddb_db_t *db,
+    const char *request_json,
+    char **out_json);
+ddb_status_t ddb_extension_rebuild_json(
+    ddb_db_t *db,
+    const char *request_json,
+    char **out_json);
+ddb_status_t ddb_extension_purge_json(
+    ddb_db_t *db,
+    const char *request_json,
+    char **out_json);
+
 ddb_status_t ddb_evict_shared_wal(const char *path);
 
 /*

@@ -26,10 +26,10 @@ Native builds use `mlua` with Lua 5.4 and vendored Lua enabled. The runtime
 crate is an implementation detail. Public Rust, C ABI, CLI, and binding APIs
 must not expose `mlua` types.
 
-The selected feature direction is:
+The selected native feature direction is:
 
 ```text
-mlua = { features = ["lua54", "vendored"] }
+mlua = { features = ["lua54", "vendored", "send"] }
 ```
 
 The implementation must avoid optional `mlua` features that expand the runtime
@@ -39,16 +39,16 @@ and cross-thread Lua state sharing are not part of the public contract.
 
 ### 2. Build and release policy
 
-Official 2.6.0 artifacts include Lua extension support by default for supported
-targets that expose SQL execution. Embedders may build without Lua through a
-cargo feature if they need a smaller or stricter binary.
+Official native 2.6.0 artifacts include Lua extension support by default.
+Embedders may build without Lua through the `lua-extensions` cargo feature if
+they need a smaller or stricter binary.
 
-The complete Future Win #2 scope includes browser/wasm behavior. If `mlua`
-with vendored Lua cannot satisfy the repository's wasm/browser target
-constraints, the implementation must use the DecentDB-owned runtime trait layer
-to provide an equivalent Lua 5.4 backend for that target before #2 can be
-marked complete. A supported official artifact must not silently omit Lua
-extension execution unless it is explicitly built with the no-Lua feature.
+Browser/WASM artifacts keep the same package catalog, manifest validation,
+trust, and inspection data model, but do not execute Lua in 2.6.0. This is an
+intentional target policy: DecentDB should not advertise browser-side execution
+until the browser runtime has an equivalently audited Lua 5.4 backend and
+resource-limit story. When Lua execution is unavailable, SQL invocation returns
+an explicit unsupported-runtime error rather than silently omitting the feature.
 
 ### 3. DecentDB-owned runtime boundary
 
@@ -153,8 +153,8 @@ without exposing third-party runtime types.
 - Native release artifacts gain a vendored Lua dependency.
 - The implementation must maintain a no-Lua build path for embedders that
   disable the feature.
-- Browser/wasm artifacts that advertise Lua extension support must execute the
-  same package model and sandbox contract as native artifacts.
+- Browser/wasm artifacts retain lifecycle metadata but do not execute Lua until
+  a target-specific runtime decision is accepted.
 - Security tests must verify denied modules and capabilities.
 - Runtime resource limits become part of the public extension contract.
 
@@ -169,10 +169,9 @@ without exposing third-party runtime types.
    extension language.
 4. **Expose host-language callbacks instead.** Rejected because each binding
    would grow a different extension model.
-5. **Omit Lua execution from browser/wasm artifacts.** Rejected because the
-   roadmap positions Lua as one supportable extension language across native,
-   mobile, and WASM targets. Package delivery and sandbox policy must be tested
-   as part of the complete feature.
+5. **Execute Lua in browser/wasm artifacts immediately.** Rejected for 2.6.0
+   because shipping a second target runtime without equivalent resource-limit
+   validation would weaken the extension trust contract.
 
 ## Validation Requirements
 
@@ -180,8 +179,8 @@ Implementation is not complete until tests cover:
 
 - native build with Lua enabled;
 - build with Lua disabled;
-- wasm/browser build with Lua enabled, package lifecycle available, and
-  extension execution covered by target-appropriate tests;
+- no-Lua and browser/wasm builds expose lifecycle metadata but reject execution
+  with an explicit unsupported-runtime error;
 - denied `io`, `os`, `debug`, `package.loadlib`, `dofile`, and `loadfile`;
 - denied arbitrary `require`;
 - CPU/step limit failures;

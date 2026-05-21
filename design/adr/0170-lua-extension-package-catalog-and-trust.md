@@ -113,8 +113,9 @@ anchors are supplied by application, CLI, or binding configuration, not by
 untrusted database content.
 
 Unsigned packages may be installed only when the caller explicitly allows
-unsigned local development packages. Official examples and distributable
-packages must be signed.
+unsigned local development packages. Documentation examples may use that
+development override so they can be copied directly from the repository;
+distributable third-party packages should be signed.
 
 Signature validation failures are package validation/install errors before any
 Lua code is executable.

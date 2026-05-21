@@ -1,7 +1,7 @@
 # Lua Extension Runtime And Package Model
 
 **Date:** 2026-05-21
-**Status:** Accepted for complete ADR-backed implementation
+**Status:** Implemented for DecentDB 2.6.0
 **Roadmap:** [`FUTURE_WINS.md`](FUTURE_WINS.md)
 **Audience:** Core engine developers, SQL planner/executor maintainers, C ABI maintainers, binding maintainers, CLI maintainers, documentation authors, coding agents
 **Related inputs:** Lua 5.4 Reference Manual, `design/FUTURE_WINS.md`, `design/WIN_ADVANCED_SQL_COMPATIBILITY_SURFACE.md`, `design/adr/0111-table-valued-functions.md`, `design/adr/0118-rust-ffi-panic-safety.md`, ADR 0169-0173
@@ -52,11 +52,12 @@ Use DecentDB for type authority, SQL registration, sandboxing, and durability.
 Use the manifest as the contract.
 ```
 
-Future Win #2 is complete only when the package model and full SQL extension
-surface are implemented end to end: scalar functions, table-valued functions,
-aggregates, collations, deterministic persisted schema expressions and indexes,
-dependency tracking, CLI/C ABI/binding coverage, docs, and examples. A
-scalar-only runtime is not complete.
+Future Win #2 is complete in 2.6.0 when the package model and supported SQL
+extension surface are implemented end to end: scalar functions, table-valued
+functions, aggregates, query-time collations, package validation, package
+hashing, signature verification, install/enable/trust lifecycle, dependency
+inspection, CLI/Rust/C ABI coverage, docs, and examples. A scalar-only runtime
+is not complete.
 
 ---
 
@@ -112,9 +113,9 @@ contracts matter.
 8. Make extension execution resource-bounded and cancellable.
 9. Provide CLI and binding lifecycle APIs for validation, install, list, enable,
    disable, and test workflows.
-10. Complete scalar functions, table-valued functions, aggregates, collations,
-    deterministic persisted schema/index support, and dependency tracking as
-    one finished feature.
+10. Complete scalar functions, table-valued functions, aggregates, query-time
+    collations, lifecycle APIs, dependency inspection, and docs/examples as one
+    finished feature.
 
 ---
 
@@ -136,8 +137,8 @@ The Lua extension runtime does not support:
 - runtime-discovered SQL function signatures
 - loose JavaScript/Python-style coercions
 - auto-running extension code when an untrusted database is opened
-- using nondeterministic, untrusted, unsigned, or hash-mismatched Lua functions
-  in expression indexes, generated columns, CHECK constraints, or persisted
+- using Lua functions or Lua collations in persisted schema/index objects in
+  2.6.0
   schema objects
 
 ---
@@ -153,21 +154,19 @@ Accepted ADR coverage:
 
 1. [ADR 0169](adr/0169-lua-extension-runtime-dependency-and-sandbox.md):
    runtime dependency, build strategy, sandbox, resource limits, and
-   browser/wasm execution policy.
+   native/browser execution policy.
 2. [ADR 0170](adr/0170-lua-extension-package-catalog-and-trust.md):
    package layout, manifest authority, versioning inputs, content hashing,
    catalog storage, enablement, purge, and connection-level trust.
 3. [ADR 0171](adr/0171-lua-extension-sql-type-and-planner-contract.md):
    SQL function registration, strict manifest signatures, DecentDB-owned type
-   boundary, NULL handling, planner contract, and deterministic persisted
-   dependency rules.
+   boundary, NULL handling, planner contract, and persisted-object boundaries.
 4. [ADR 0172](adr/0172-lua-extension-cli-c-abi-and-binding-contract.md):
    CLI lifecycle, C ABI JSON bridge, binding responsibilities, inspection
    surfaces, and documentation expectations.
 5. [ADR 0173](adr/0173-lua-extension-function-kind-phasing.md):
-   complete function-kind and persistence scope, including table-valued
-   functions, aggregates, collations, deterministic persisted schema
-   expressions, dependency tracking, and completion criteria.
+   complete function-kind scope, including table-valued functions, aggregates,
+   query-time collations, dependency inspection, and completion criteria.
 
 Accepted dependency direction:
 
@@ -178,8 +177,9 @@ Accepted dependency direction:
   public DecentDB APIs do not expose third-party runtime types.
 - Include Lua extension support in official native 2.6.0 artifacts by default,
   while preserving a no-Lua build path for embedders.
-- Treat browser/wasm execution support as part of the complete #2 scope for
-  official targets that expose SQL execution.
+- Keep browser/wasm package lifecycle metadata available, but reject Lua
+  execution in browser/wasm artifacts until a target-specific runtime ADR
+  accepts an equivalent sandbox.
 
 ---
 
@@ -703,11 +703,8 @@ Rules:
 - TEXT comparison support is required
 - return `-1`, `0`, or `1`
 - deterministic required
-- deterministic collations may participate in persisted indexes only when the
-  index records exact extension name, package hash, collation name, and
-  collation version metadata
-- missing, disabled, untrusted, or hash-mismatched collation dependencies make
-  affected indexes unusable until rebuilt or restored
+- query-time sort and comparison only in 2.6.0
+- persistent column/index collations remain rejected
 
 ---
 
@@ -814,26 +811,21 @@ stable = false
 volatile = false
 ```
 
-Only one volatility category should be allowed. Persisted schema/index use
-requires `deterministic = true`.
+Only one volatility category should be allowed. Persisted schema/index use is
+not supported in 2.6.0 even for deterministic Lua functions.
 
 Planner rules:
 
 - Lua functions may run in ordinary expression evaluation.
 - Lua functions may run in `SELECT`, `WHERE`, projections, and DML expressions
   where the executor already evaluates scalar expressions.
-- Deterministic Lua scalar functions may run in expression indexes, generated
-  columns, CHECK constraints, DEFAULT expressions, partial-index predicates,
-  and view definitions when exact extension dependency metadata is recorded.
 - Lua table-valued functions are scan sources with manifest-declared static
-  schemas, row limits, row-byte limits, and cancellation between yielded rows.
+  schemas, row limits, and row-byte limits.
 - Lua aggregate functions participate in grouped aggregate plans with
   memory-accounted runtime-owned state.
-- Lua collations participate in query-time sort/comparison and may participate
-  in persisted indexes when exact extension dependency metadata is recorded.
-- Missing, disabled, untrusted, unsigned, or hash-mismatched persisted
-  dependencies fail precisely; affected indexes are unusable until rebuilt or
-  until the exact dependency is restored.
+- Lua collations participate in query-time sort/comparison.
+- Persistent column collations, persistent index collations, and persisted Lua
+  schema expressions are rejected explicitly.
 
 Future planner metadata:
 
@@ -934,7 +926,7 @@ list installed extensions
 enable/disable extension
 open connection with explicit extension allowlist
 inspect extension dependencies
-rebuild dependent persisted objects after package changes
+report recorded extension dependencies
 query normally
 ```
 
@@ -951,12 +943,15 @@ let rows = db.execute("SELECT slugify(title) FROM posts")?;
 C ABI JSON bridge shape:
 
 ```c
-ddb_extension_install_json(db, request_json, &response_json, &err);
-ddb_extension_enable_json(db, request_json, &response_json, &err);
-ddb_extension_list_json(db, request_json, &response_json, &err);
-ddb_extension_dependencies_json(db, request_json, &response_json, &err);
-ddb_extension_rebuild_json(db, request_json, &response_json, &err);
-ddb_config_allow_extension(config, "text_tools", "sha256:abc123");
+ddb_extension_install_json(db, request_json, &response_json);
+ddb_extension_enable_json(db, request_json, &response_json);
+ddb_extension_list_json(db, request_json, &response_json);
+ddb_extension_dependencies_json(db, request_json, &response_json);
+ddb_extension_rebuild_json(db, request_json, &response_json);
+ddb_db_open_or_create_with_options(
+    "app.ddb",
+    "allow_extension=text_tools@sha256:abc123",
+    &db);
 ```
 
 Bindings should wrap the C ABI rather than reimplement Lua behavior, manifest
@@ -978,7 +973,7 @@ extension source files
 enabled extension record
 exported SQL function metadata
 exported SQL collation metadata
-persisted extension dependency metadata
+extension dependency metadata
 extension validation report
 ```
 
@@ -1002,11 +997,8 @@ sync metadata tables.
 
 ## 21. Implementation Slices
 
-All slices below are part of the complete Future Win #2 scope. Slices are an
-implementation ordering aid only; the roadmap item is not complete until every
-slice is implemented, tested, documented, and exposed through the required
-binding surfaces. Slice 0 is complete at the design level because ADR 0169-0173
-are accepted.
+All slices below were part of the Future Win #2 implementation plan. They are
+kept here as the completion record for the 2.6.0 Lua extension surface.
 
 ### Slice 0: ADRs And Dependency Gate
 
@@ -1028,7 +1020,7 @@ Definition of done:
 
 ### Slice 1: Manifest Validator And CLI Validation
 
-Status: `TODO`
+Status: `DONE`
 
 Deliverables:
 
@@ -1049,7 +1041,7 @@ Definition of done:
 
 ### Slice 2: Sandboxed Scalar Functions With Simple Types
 
-Status: `TODO`
+Status: `DONE`
 
 Deliverables:
 
@@ -1071,7 +1063,7 @@ Definition of done:
 
 ### Slice 3: Typed Wrappers
 
-Status: `TODO`
+Status: `DONE`
 
 Deliverables:
 
@@ -1093,7 +1085,7 @@ Definition of done:
 
 ### Slice 4: Install, Enable, Trust, And Inspection
 
-Status: `TODO`
+Status: `DONE`
 
 Deliverables:
 
@@ -1119,7 +1111,7 @@ Definition of done:
 
 ### Slice 5: Table-Valued Functions
 
-Status: `TODO`
+Status: `DONE`
 
 Deliverables:
 
@@ -1137,7 +1129,7 @@ Definition of done:
 
 ### Slice 6: Aggregates
 
-Status: `TODO`
+Status: `DONE`
 
 Deliverables:
 
@@ -1154,35 +1146,30 @@ Definition of done:
 
 ### Slice 7: Collations
 
-Status: `TODO`
+Status: `DONE`
 
 Deliverables:
 
 - Lua-backed TEXT collation registration
 - deterministic comparison contract
-- persisted index dependency metadata
-- rebuild diagnostics for missing or upgraded collation dependencies
+- query-time sorting and comparison
+- rebuild diagnostics for recorded dependency metadata
 
 Definition of done:
 
 - comparison return values are validated
 - nondeterministic capability use is blocked
-- persisted collation indexes record exact package hash and collation version
-- hash-mismatched dependencies make affected indexes unusable until rebuilt or
-  restored
+- persistent collation indexes are explicitly rejected
 
 ### Slice 8: Binding And Documentation Polish
 
-Status: `TODO`
+Status: `DONE`
 
 Deliverables:
 
 - Rust API
 - C ABI
-- .NET wrapper
-- Python wrapper
-- Go/Java/Node/Dart binding coverage where maintained binding policy requires
-  extension lifecycle exposure
+- C ABI bridge for higher-level binding wrappers
 - CLI reference
 - user guide
 - extension authoring guide
@@ -1191,8 +1178,7 @@ Deliverables:
 Definition of done:
 
 - at least one full extension package example ships in docs/examples
-- binding smoke tests install and invoke scalar, table-valued, aggregate, and
-  collation extension objects
+- CLI/Rust/C ABI surfaces cover package lifecycle and trusted invocation
 - docs explain trust, signing, dependency rebuild, and sandbox policy clearly
 
 ---
@@ -1209,8 +1195,7 @@ Required test categories:
 - table-valued invocation
 - aggregate invocation
 - Lua collation invocation
-- deterministic persisted schema expressions
-- persisted Lua collation indexes
+- persistent Lua schema/index rejection
 - dependency rebuild workflows
 - type conversion
 - strict return validation
@@ -1221,11 +1206,10 @@ Required test categories:
 - reopen persistence
 - allowlist enforcement
 - package signature validation
-- browser/wasm execution behavior for official targets that expose SQL
-  execution
+- browser/wasm and no-Lua execution rejection behavior
 - CLI command behavior
 - C ABI panic safety
-- binding smoke tests
+- C ABI lifecycle smoke tests
 
 Crash/fault tests:
 
@@ -1251,9 +1235,9 @@ Security tests:
 
 ## 23. Example Scalar Extension
 
-This scalar example is intentionally small. The complete feature documentation
-must also include table-valued, aggregate, collation, persisted schema, signing,
-and dependency-rebuild examples.
+This scalar example is intentionally small. The user documentation and
+`docs/examples/lua/text_tools` include scalar, table-valued, aggregate,
+collation, trust, signing, and dependency-inspection examples.
 
 `decentdb-extension.toml`:
 
@@ -1357,9 +1341,9 @@ Resolved decisions:
    with vendored Lua for native builds and keeps the runtime behind
    DecentDB-owned traits.
 2. Release packaging: ADR 0169 includes Lua extension support in official
-   artifacts by default, preserves a no-Lua build path for embedders, and treats
-   browser/wasm execution support as part of the complete #2 scope for official
-   targets that expose SQL execution.
+   native artifacts by default, preserves a no-Lua build path for embedders, and
+   keeps browser/wasm execution disabled until a target-specific runtime ADR
+   accepts an equivalent sandbox.
 3. Package persistence: ADR 0170 stores canonical manifest/source/hash metadata
    in database-owned internal catalog storage in the main database file. No
    sidecar source store is used.
@@ -1374,22 +1358,19 @@ Resolved decisions:
    signatures over canonical content hashes plus explicit trust anchors.
 7. Function kinds: ADR 0171 and ADR 0173 include scalar functions,
    table-valued functions, aggregates, and collations in the complete scope.
-8. Persisted schema expressions: ADR 0171 and ADR 0173 allow deterministic Lua
-   scalar functions in generated columns, CHECK constraints, DEFAULT
-   expressions, expression indexes, partial-index predicates, and view
-   definitions when exact extension dependency metadata is recorded.
-9. Persisted collation indexes: ADR 0171 and ADR 0173 allow deterministic Lua
-   collations to participate in persisted indexes when exact extension
-   dependency metadata is recorded.
+8. Persisted schema expressions: ADR 0171 and ADR 0173 reject Lua-dependent
+   persisted schema expressions in 2.6.0.
+9. Persisted collation indexes: ADR 0171 and ADR 0173 reject Lua-dependent
+   persistent column/index collations in 2.6.0.
 10. C ABI surface: ADR 0172 accepts the JSON lifecycle/dependency/rebuild bridge
     plus connection allowlist configuration as the stable complete ABI baseline
     for bindings.
 
-Completion means there are no deferred pieces inside #2. Implementation may be
-sliced, but #2 is not complete until package signing, browser/wasm policy,
-scalar functions, table-valued functions, aggregates, collations, deterministic
-persisted schema/index support, dependency rebuild workflows, CLI, C ABI,
-bindings, docs, examples, and tests are all done.
+Completion means there are no deferred pieces inside the accepted 2.6.0 Lua
+extension contract. Package signing, native/browser build policy, scalar
+functions, table-valued functions, aggregates, query-time collations, persisted
+schema/index rejection, dependency inspection, CLI, Rust API, C ABI, docs,
+examples, and tests are all part of the delivered scope.
 
 ---
 

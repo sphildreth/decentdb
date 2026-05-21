@@ -1923,7 +1923,18 @@ impl Db {
                 results.push(result);
                 continue;
             }
+            if let Some(command) = crate::extensions::parse_extension_sql(trimmed)? {
+                let result = crate::extensions::execute_extension_sql(self, command)?;
+                results.push(result);
+                continue;
+            }
             if let Some(result) = self.try_execute_sync_inspection_query(trimmed, params)? {
+                results.push(result);
+                continue;
+            }
+            if let Some(result) =
+                crate::extensions::try_execute_extension_inspection_query(self, trimmed, params)?
+            {
                 results.push(result);
                 continue;
             }
@@ -2691,6 +2702,11 @@ impl Db {
         self.inner.catalog.schema_cookie()
     }
 
+    #[must_use]
+    pub fn extensions(&self) -> crate::extensions::ExtensionManager<'_> {
+        crate::extensions::ExtensionManager::new(self)
+    }
+
     pub(crate) fn set_schema_cookie(&self, schema_cookie: u32) -> Result<()> {
         self.inner.pager.set_schema_cookie(schema_cookie)
     }
@@ -2738,7 +2754,9 @@ impl Db {
                 .read()
                 .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
             self.validate_prepared_against_runtime(prepared, &runtime)?;
-            if self.statement_is_temp_only(&runtime, statement) {
+            let extension_execution_enabled = self.inner.config.extension_unsigned_development_mode
+                || !self.inner.config.extension_trust_anchors.is_empty();
+            if !extension_execution_enabled && self.statement_is_temp_only(&runtime, statement) {
                 drop(runtime);
                 return self.execute_autocommit_temp_only_statement(statement, params);
             }
@@ -2760,6 +2778,14 @@ impl Db {
         let reader = self.inner.wal.begin_reader()?;
         let snapshot_lsn = reader.snapshot_lsn();
         self.refresh_engine_from_snapshot(snapshot_lsn)?;
+        if self.inner.config.extension_unsigned_development_mode
+            || !self.inner.config.extension_trust_anchors.is_empty()
+        {
+            self.ensure_tables_loaded_at_snapshot(
+                &crate::extensions::extension_catalog_table_names(),
+                Some(snapshot_lsn),
+            )?;
+        }
         if let SqlStatement::Query(query) = statement {
             let runtime = self
                 .inner
@@ -2842,7 +2868,12 @@ impl Db {
                 if let Some(base_tables) =
                     self.safe_referenced_base_tables_in_runtime(&runtime, statement)
                 {
-                    let names: Vec<&str> = base_tables.iter().map(|s| s.as_str()).collect();
+                    let mut names: Vec<&str> = base_tables.iter().map(|s| s.as_str()).collect();
+                    if self.inner.config.extension_unsigned_development_mode
+                        || !self.inner.config.extension_trust_anchors.is_empty()
+                    {
+                        names.extend(crate::extensions::extension_catalog_table_names());
+                    }
                     drop(runtime);
                     self.ensure_table_row_sources_loaded_at_snapshot(&names, snapshot_lsn)?;
                     drop(reader);
@@ -6435,10 +6466,15 @@ impl Db {
             };
             base_tables
         };
-        if names.is_empty() {
+        let should_load_extension_catalog = self.inner.config.extension_unsigned_development_mode
+            || !self.inner.config.extension_trust_anchors.is_empty();
+        if names.is_empty() && !should_load_extension_catalog {
             return Ok(true);
         }
-        let names_refs: Vec<&str> = names.iter().map(|s: &String| s.as_str()).collect();
+        let mut names_refs: Vec<&str> = names.iter().map(|s: &String| s.as_str()).collect();
+        if should_load_extension_catalog {
+            names_refs.extend(crate::extensions::extension_catalog_table_names());
+        }
         self.ensure_tables_loaded_at_snapshot(&names_refs, snapshot_lsn)?;
         Ok(true)
     }

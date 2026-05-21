@@ -81,6 +81,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `information_schema` views, `generate_series`, narrow `main.`/`temp.`
   qualifiers, query-time `BINARY`/`NOCASE`/`RTRIM` collations, scalar
   compatibility helpers, docs, and CLI smoke coverage.
+- Added the sandboxed Lua extension runtime and package model: manifest
+  validation, stable package hashing, Ed25519 signature verification,
+  database-owned package catalogs, explicit install/enable/disable/purge
+  lifecycle, connection-level content-hash trust, development-only unsigned
+  overrides, scalar functions, table-valued functions, aggregate functions,
+  query-time Lua collations, runtime resource limits, `sys.extension_*`
+  inspection views, Rust APIs, `decentdb extension` CLI commands, C ABI JSON
+  lifecycle bridges, docs, and a full example extension package.
 
 ### Changed
 

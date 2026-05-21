@@ -24,7 +24,7 @@ Choosing between them is less about feature checklists and more about what your 
 | **Concurrency model** | One writer, many concurrent reader threads (single process) | Single-connection writes; parallel within one query |
 | **Default durability** | WAL + fsync-on-commit, always | Configurable; optimized for bulk analytics workflows |
 | **Crash safety testing** | Built-in FaultyVFS + WAL failpoint hooks | Not a first-class testing surface |
-| **Extension ecosystem** | None (extend via core contribution) | Rich (install extensions, UDFs) |
+| **Extension ecosystem** | Sandboxed Lua packages; no arbitrary native loading | Rich (install extensions, UDFs) |
 | **External data access** | Single `.ddb` file | Parquet, CSV, JSON, Iceberg, S3/GCS/Azure, HTTP |
 | **SQL breadth** | Deliberate Postgres-like subset | Very broad, Postgres-compatible dialect |
 | **Bindings** | C ABI, Rust, Python, .NET, Go, Java, Node.js, Dart | C/C++, Python, Java, Node.js, R, Go, Rust, Julia |
@@ -332,7 +332,10 @@ LOAD httpfs;
 SELECT * FROM 'https://example.com/data.parquet';
 ```
 
-DecentDB has no extension mechanism. All features are built into the core.
+DecentDB supports sandboxed Lua packages for scalar functions, table-valued
+functions, aggregates, and query-time collations. It does not support DuckDB's
+native extension ecosystem, external-file extensions, or arbitrary native
+module loading.
 
 ### 9. You need to work with Pandas, Arrow, or Polars
 

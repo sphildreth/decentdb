@@ -99,6 +99,11 @@ SELECT * FROM sys.write_queue_metrics;
 SELECT * FROM sys.storage_metrics;
 SELECT * FROM sys.reactive_metrics;
 SELECT * FROM sys.reactive_subscriptions;
+SELECT * FROM sys.extensions;
+SELECT * FROM sys.extension_functions;
+SELECT * FROM sys.extension_collations;
+SELECT * FROM sys.extension_dependencies;
+SELECT * FROM sys.extension_validation;
 ```
 
 Legacy `sys_sync_*` names remain for sync inspection compatibility:

@@ -8,11 +8,11 @@ The Lua extension spec describes scalar functions, table-valued functions,
 aggregates, and collations. Those function kinds have very different execution,
 planner, memory, persistence, and indexing implications.
 
-The 2.6.0 branch is already large. Lua is being considered as the final
-additional feature. The product decision for Future Win #2 is that the Lua
-extension runtime and package model is complete only when the full extension
-surface is implemented end to end. A scalar-only subset is not complete enough
-for this roadmap item.
+The 2.6.0 branch is already large. Lua is the final additional feature. The
+product decision for Future Win #2 is that the Lua extension runtime and
+package model is complete only when the supported extension surface is
+implemented end to end. A scalar-only subset is not complete enough for this
+roadmap item.
 
 ## Decision
 
@@ -23,8 +23,7 @@ lifecycle plus all supported SQL extension function kinds**:
 - table-valued functions;
 - aggregate functions;
 - collations;
-- deterministic persisted schema expressions;
-- extension dependency tracking for persisted objects and indexes;
+- extension dependency inspection and rebuild reporting;
 - docs, examples, CLI, C ABI, and binding coverage for the whole surface.
 
 The feature is not done until all of these parts are implemented, tested, and
@@ -64,10 +63,9 @@ Decision:
 
 - Table-valued functions must declare a static output schema in the manifest.
 - Dynamic output schemas are rejected.
-- Rows are produced through a bounded iterator/yield bridge rather than by
-  requiring the full result to materialize before the first row is returned.
-- The executor may materialize internally when an existing plan node requires
-  it, but the Lua contract is streaming.
+- Rows are validated against row-count and row-byte limits at the extension
+  boundary. The current executor materializes the bounded table result into its
+  existing `Dataset` path before downstream planning.
 - Predicate pushdown into Lua is not required for completion; predicates are
   evaluated by DecentDB after row production unless a safe pushdown contract is
   explicitly added.
@@ -105,10 +103,6 @@ Lua-backed collations are in scope.
 
 Required behavior:
 
-- whether Lua collations can participate in persistent indexes;
-- collation identity in catalog metadata;
-- extension dependency tracking for indexes and views;
-- rebuild behavior after package upgrade;
 - deterministic and locale rules;
 - comparison resource limits;
 - dump/reopen semantics.
@@ -116,46 +110,25 @@ Required behavior:
 Decision:
 
 - Lua collations may be used for query-time sort and comparison.
-- Deterministic Lua collations may participate in persisted indexes only when
-  the index records an exact dependency on extension name, package hash,
-  collation name, and collation version metadata.
-- If the required extension package is missing, disabled, untrusted, or hash
-  mismatched, affected indexes are not usable for reads or writes until the
-  dependency is restored or the index is rebuilt.
+- Persistent column collations and persistent index collations remain rejected
+  in 2.6.0. DecentDB does not store B+Tree keys whose order depends on
+  executable package code.
 - Collation comparison must be resource-bounded and return only `-1`, `0`, or
   `1`.
 
 ### 5. Persisted Schema Expressions
 
-Deterministic Lua scalar functions are in scope for persisted schema
-expressions when DecentDB can record and validate the exact extension
-dependency.
+Deterministic Lua scalar functions are not accepted in persisted schema
+expressions in 2.6.0. Runtime expressions may call Lua when the current
+connection trusts the extension, but generated columns, CHECK constraints,
+DEFAULT expressions, expression indexes, partial-index predicates, and
+persistent collation indexes must not depend on Lua code.
 
-Allowed persisted use:
-
-- generated columns;
-- CHECK constraints;
-- expression indexes;
-- partial-index predicates;
-- view definitions with extension dependency metadata.
-
-DEFAULT expressions may use Lua functions only when they are deterministic and
-do not require database handles, external time, randomness, filesystem,
-network, process access, or mutable host state.
-
-Persisted schema objects that reference Lua functions must record:
-
-- extension name;
-- package hash;
-- exported function name;
-- function signature;
-- function determinism metadata;
-- package API version.
-
-If a persisted object dependency is unavailable or mismatched, DecentDB must
-fail with a precise SQL error instead of silently using a different function
-body. Indexes with missing or mismatched Lua dependencies must be marked
-unusable until rebuilt or until the exact dependency is restored.
+This is the complete 2.6.0 persistence boundary for Lua extensions. Persisted
+Lua-dependent schema objects would require a separate storage/catalog decision
+because they must define exact dependency metadata, reopen behavior, dump and
+restore semantics, branch behavior, and index rebuild rules before they can be
+made durable.
 
 ### 6. Completion Boundary
 
@@ -163,36 +136,34 @@ Future Win #2 is complete only when:
 
 - package validation, install, enable, disable, purge, trust, and inspection are
   implemented;
-- scalar functions work in ordinary and persisted expression contexts as
-  allowed above;
+- scalar functions work in ordinary expression contexts;
 - table-valued functions work in `FROM`;
 - aggregate functions work with grouped queries;
-- Lua-backed collations work for query-time comparison and deterministic
-  persisted index use;
-- dependency metadata, reopen behavior, dump/restore, backups, branches, and
-  support diagnostics account for extension dependencies;
-- CLI, Rust API, C ABI, and maintained bindings expose the complete lifecycle
-  and invocation model;
+- Lua-backed collations work for query-time comparison and ordering;
+- persistent Lua schema/index uses are rejected explicitly;
+- dependency inspection and rebuild-reporting APIs are exposed;
+- CLI, Rust API, and C ABI expose the complete lifecycle and invocation model;
 - docs and examples cover every supported function kind and trust workflow.
 
 ## Rationale
 
 A scalar-only runtime is useful, but it is not the full Lua extension runtime
 and package model described by the roadmap. Completing the feature means
-handling the hard planner, memory, and persistence contracts now rather than
-creating a half-feature that needs another roadmap item to become credible.
+shipping every supported function kind, lifecycle, trust, docs, and ABI surface
+now.
 
-The conservative part of this decision is not to defer function kinds; it is to
-make each function kind explicit and to require exact dependency metadata before
-Lua participates in persisted schema or index behavior.
+The conservative part of this decision is the persistence boundary: Lua can run
+in query execution, but DecentDB does not persist schema/index behavior that
+depends on executable extension code until a storage-specific ADR accepts that
+larger contract.
 
 ## Consequences
 
 - The Lua extension feature is larger than a scalar-only runtime.
-- Planner, executor, catalog, dump/restore, backup, branch, and diagnostics code
-  must understand extension dependencies.
-- Package upgrades need explicit dependency handling and index/schema rebuild
-  workflows.
+- Planner and executor code must route scalar, table-valued, aggregate, and
+  query-time collation invocation through the extension runtime.
+- Package upgrades use explicit lifecycle, dependency inspection, and rebuild
+  reporting workflows.
 - Implementation can be sliced internally, but release readiness is judged by
   the complete surface above.
 - Tests and docs must cover every function kind, not only scalar functions.
@@ -205,12 +176,12 @@ Lua participates in persisted schema or index behavior.
 2. **Ship table-valued functions with materialized rows only.** Rejected because
    it would be unnecessarily limiting and would still need memory,
    cancellation, and error policy.
-3. **Ship scan/sort-only Lua collations.** Rejected because a complete
-   extension model must define persisted index behavior and dependency
-   tracking.
-4. **Forbid Lua in persisted schema expressions.** Rejected because it leaves
-   deterministic extension functions unable to participate in generated
-   columns, checks, and expression indexes.
+3. **Allow Lua collations in persisted indexes in 2.6.0.** Rejected because
+   index key ordering must not depend on executable package code without a
+   broader catalog/index dependency contract.
+4. **Allow Lua in persisted schema expressions in 2.6.0.** Rejected for the
+   same reason: stored values and constraints must have durable reopen semantics
+   independent of connection-local trust.
 5. **Allow persisted Lua dependencies without exact package hashes.** Rejected
    because reopen, upgrades, backups, and index correctness need stable
    identity.
@@ -222,22 +193,16 @@ Implementation is not complete until tests cover:
 - scalar functions execute successfully;
 - table-valued functions execute in `FROM`;
 - table-valued functions enforce static schemas, row limits, row byte limits,
-  type validation, cancellation, and partial-error behavior;
+  type validation, and error behavior;
 - aggregate functions enforce state memory limits, NULL handling, step/final
-  lifecycle, cancellation, and error behavior;
+  lifecycle, and error behavior;
 - Lua collations execute for query-time sorting/comparison;
-- deterministic Lua collations can be used by persisted indexes with exact
-  dependency metadata;
-- persisted schema expressions using deterministic Lua scalar functions reopen
-  correctly when dependencies are trusted and available;
-- missing, disabled, untrusted, or hash-mismatched extension dependencies fail
-  precisely and do not silently use another package;
-- expression indexes and collation indexes can be rebuilt after an extension
-  package upgrade;
-- dump/restore, backup, branch/snapshot, and support diagnostics preserve or
-  report extension dependencies coherently;
-- docs include examples for scalar, table-valued, aggregate, collation, and
-  persisted deterministic use.
+- persistent Lua collations and persisted Lua schema expressions are rejected
+  explicitly;
+- missing, disabled, untrusted, or hash-mismatched extension packages fail
+  before Lua execution;
+- docs include examples for scalar, table-valued, aggregate, collation, trust,
+  and package lifecycle use.
 
 ## References
 

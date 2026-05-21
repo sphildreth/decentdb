@@ -18,6 +18,7 @@ mod db;
 mod doctor;
 mod error;
 mod exec;
+mod extensions;
 mod json;
 #[cfg(test)]
 mod json_tests;
@@ -53,6 +54,14 @@ pub use crate::doctor::{
 };
 pub use crate::error::{DbError, DbErrorCode, Result};
 pub use crate::exec::{BulkLoadOptions, QueryResult, QueryRow};
+pub use crate::extensions::{
+    validate_extension_package, Ed25519SignatureVerifier, ExtensionDependencyRecord,
+    ExtensionFunctionManifest, ExtensionManager, ExtensionManifest, ExtensionNullHandling,
+    ExtensionPackageDependency, ExtensionPackageFile, ExtensionPermissions, ExtensionRuntimeLimits,
+    ExtensionSignature, ExtensionSignatureVerifier, ExtensionSqlType, ExtensionTrustAnchor,
+    ExtensionValidationOptions, ExtensionValidationReport, InstalledExtensionPackage,
+    SUPPORTED_EXTENSION_API_VERSION,
+};
 pub use crate::metadata::{
     CheckConstraintInfo, ColumnInfo, ForeignKeyInfo, HeaderInfo, IndexInfo, IndexVerification,
     QueryContract, QueryParameterInfo, QueryResultColumnInfo, SchemaColumnInfo, SchemaIndexInfo,

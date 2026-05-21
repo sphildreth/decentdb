@@ -36,6 +36,7 @@ It targets a single process with **one writer** and **many concurrent readers** 
 - 🌐 **WASM Browser OPFS Support** - `@decentdb/web` runs DecentDB in a Dedicated Worker with an OPFS-backed VFS, async TypeScript API, binary result transport, checkpoint, import/export, persistence helpers, and browser smoke/benchmark coverage
 - 🐘 **PostgreSQL-like SQL** - Familiar DDL/DML syntax with JOINs (INNER, LEFT, RIGHT, FULL OUTER, CROSS, NATURAL), CTEs (including WITH RECURSIVE), subqueries, window functions, and rich types (UUID, DECIMAL, native TIMESTAMP)
 - 🔎 **SQLite/PostgreSQL Compatibility Helpers** - Safe SQLite-style PRAGMAs, `sqlite_schema`, minimal `information_schema`, `generate_series`, `main.`/`temp.` qualifiers, and query-time built-in collations for easier tool and migration onboarding
+- 🧩 **Lua Extensions** - Manifest-declared Lua packages add scalar functions, table-valued functions, aggregates, and query-time collations with explicit install, enable, content-hash trust, CLI, Rust, and C ABI lifecycle APIs
 - 🕒 **Native TIMESTAMP Type** - DATE/TIMESTAMP columns stored as int64 microseconds since Unix epoch (UTC); correct `ORDER BY` and `EXTRACT(YEAR|MONTH|DAY|HOUR|MINUTE|SECOND FROM ...)`, with native bind/read in all bindings
 - 👥 **Concurrent Reads** - Snapshot isolation allows multiple readers with one writer
 - 🚦 **Queued Write Concurrency** - Engine-owned bounded write queue with timeouts, metrics, and strict durable group commit for predictable in-process concurrent writes
@@ -237,6 +238,7 @@ Common commands:
 
 - `exec` - Execute SQL statements
 - `repl` - Interactive SQL shell
+- `extension` - Validate, install, enable, and inspect Lua extension packages
 - `import` / `export` - Data transfer
 - `bulk-load` - High-performance data loading
 - `checkpoint` - WAL maintenance

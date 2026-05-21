@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use crate::error::{DbError, Result};
+use crate::extensions::ExtensionTrustAnchor;
 use crate::storage::page;
 
 /// WAL sync policy used by the engine.
@@ -245,6 +246,22 @@ pub struct DbConfig {
     ///
     /// Default: `4096`.
     pub reactive_max_row_changes_per_event: usize,
+
+    /// Connection-level allowlist for enabled Lua extension packages.
+    ///
+    /// Installed packages are inert until enabled in the database and allowed
+    /// by the connection. Each entry must match the extension name and exact
+    /// `sha256:...` package content hash.
+    ///
+    /// Default: empty, so no Lua extension code executes.
+    pub extension_trust_anchors: Vec<ExtensionTrustAnchor>,
+
+    /// Development-only override that allows unsigned extension installation
+    /// and execution without a name/hash allowlist.
+    ///
+    /// This is intentionally off by default. Production callers should prefer
+    /// exact `extension_trust_anchors`.
+    pub extension_unsigned_development_mode: bool,
 }
 
 impl DbConfig {
@@ -299,6 +316,8 @@ impl Default for DbConfig {
             reactive_watch_queue_capacity: 1024,
             reactive_watch_queue_max_capacity: 8192,
             reactive_max_row_changes_per_event: 4096,
+            extension_trust_anchors: Vec::new(),
+            extension_unsigned_development_mode: false,
         }
     }
 }
@@ -346,6 +365,8 @@ mod tests {
         assert_eq!(config.reactive_watch_queue_capacity, 1024);
         assert_eq!(config.reactive_watch_queue_max_capacity, 8192);
         assert_eq!(config.reactive_max_row_changes_per_event, 4096);
+        assert!(config.extension_trust_anchors.is_empty());
+        assert!(!config.extension_unsigned_development_mode);
         // Default depends on platform; just assert the field is reachable.
         let _ = config.release_freed_memory_after_checkpoint;
     }

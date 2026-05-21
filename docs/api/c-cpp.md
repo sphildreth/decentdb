@@ -184,6 +184,70 @@ Available creation functions:
 before the requested timeout. Returned event strings are freed with
 `ddb_string_free`.
 
+## Lua Extension JSON Bridge
+
+Lua extension package lifecycle APIs are exposed as JSON bridges. Each
+successful call that returns JSON transfers ownership of a `char *` that must be
+freed with `ddb_string_free`.
+
+Available functions:
+
+- `ddb_extension_validate_json`
+- `ddb_extension_install_json`
+- `ddb_extension_enable_json`
+- `ddb_extension_disable_json`
+- `ddb_extension_list_json`
+- `ddb_extension_dependencies_json`
+- `ddb_extension_rebuild_json`
+- `ddb_extension_purge_json`
+
+Validate a local package:
+
+```c
+char *json = NULL;
+check(ddb_extension_validate_json(
+          "{\"path\":\"./text_tools\",\"allow_unsigned\":true}",
+          &json),
+      "validate extension");
+puts(json);
+check(ddb_string_free(&json), "free validation json");
+```
+
+Install and enable an extension:
+
+```c
+check(ddb_extension_install_json(
+          db,
+          "{\"path\":\"./text_tools\",\"allow_unsigned\":true}",
+          &json),
+      "install extension");
+check(ddb_string_free(&json), "free install json");
+
+check(ddb_extension_enable_json(db, "{\"name\":\"text_tools\"}", &json),
+      "enable extension");
+check(ddb_string_free(&json), "free enable json");
+```
+
+Open-time extension trust is configured through the open-with-options entry
+points:
+
+```c
+ddb_db_t *db = NULL;
+check(ddb_db_open_or_create_with_options(
+          "app.ddb",
+          "allow_extension=text_tools@sha256:7b3f...",
+          &db),
+      "open with extension trust");
+```
+
+Use `allow_unsigned_extensions=true` only for local development databases. For
+production, pass exact `allow_extension=name@sha256:<hash>` entries. A trust
+entry may also include a key id and public key:
+`name@sha256:<hash>@<key_id>@base64:<public_key>`.
+
+See [Lua Extensions](../user-guide/lua-extensions.md) for the manifest,
+sandbox, signature, and SQL invocation contract.
+
 ## Minimal C Example
 
 This example mirrors the repository smoke test.
@@ -555,8 +619,6 @@ where available.
 ## Current Limits
 
 - There is no separate C++ package or object-oriented C++ API.
-- Open-with-config options such as cache size are not currently exposed through
-  the C ABI open functions.
 - The C ABI is intentionally lower level than the .NET, Go, Python, Node,
   Dart, and JDBC bindings.
 - Dot commands from `decentdb repl` are CLI behavior, not C ABI behavior.

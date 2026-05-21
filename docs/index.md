@@ -23,6 +23,7 @@ queries, syncable offline data, and language bindings that feel native.
 | Branch, diff, restore, and time travel | Durable named snapshots, branch-local writes, diff reports, guarded restore, and constrained merge workflows for migration rehearsal and support/debugging. |
 | Practical PostgreSQL-like SQL | Familiar DDL/DML, joins, CTEs, window functions, set operations, upsert, `RETURNING`, savepoints, triggers, generated columns, JSON functions, and rich scalar functions. |
 | SQL compatibility helpers | Safe SQLite-style PRAGMAs, `sqlite_schema`, minimal `information_schema`, `generate_series`, `main.`/`temp.` qualifiers, and query-time built-in collations ease tool and migration onboarding. |
+| Sandboxed Lua extensions | Manifest-declared Lua packages add scalar functions, table-valued functions, aggregates, and query-time collations through explicit install, enable, and per-connection trust. |
 | Application-friendly types | Native `INT64`, `FLOAT64`, `BOOL`, `TEXT`, `BLOB`, `DECIMAL`, `UUID`, `DATE`, and `TIMESTAMP`. |
 | Indexed substring search | Native trigram indexes accelerate interactive `LIKE '%pattern%'` queries. |
 | Multi-language embedding | C ABI plus .NET, Go, Python, Node.js, Dart/Flutter, and JDBC bindings. |
@@ -43,6 +44,10 @@ queries, syncable offline data, and language bindings that feel native.
   `sqlite_schema`, minimal `information_schema`, `generate_series`,
   `main.`/`temp.` qualifiers, and query-time `BINARY`, `NOCASE`, and `RTRIM`
   collations.
+- **Sandboxed Lua extensions** with manifest validation, package hashing,
+  Ed25519 signature checks, explicit install/enable/trust lifecycle, scalar
+  functions, table-valued functions, aggregates, query-time collations, Rust
+  APIs, CLI commands, C ABI JSON bridges, and `sys.*` inspection views.
 - **Triggers** for application-side logic, including supported `AFTER` and
   `INSTEAD OF` trigger paths.
 - **Bulk-load, CSV, and JSON import/export** workflows.
@@ -118,6 +123,7 @@ decentdb sync pending --db ./app.ddb --since 0 --limit 10 --format table
   [Data Types](user-guide/data-types.md)
 - Local-first applications: [Local-first sync](user-guide/sync/index.md)
 - Browser applications: [WASM / Browser](api/wasm.md)
+- Extensibility: [Lua Extensions](user-guide/lua-extensions.md)
 - Operational workflows: [Doctor](user-guide/doctor.md),
   [Performance Tuning](user-guide/performance.md), and
   [Benchmarks](user-guide/benchmarks.md)
@@ -211,8 +217,9 @@ authoritative implementation.
   database service.
 - Browser v1 support is worker-owned OPFS storage. It does not provide
   cross-tab writes, service worker ownership, or cross-worker WAL coordination.
-- DecentDB does not currently expose a general-purpose loadable SQL extension
-  or UDF plugin system.
+- DecentDB exposes a sandboxed Lua extension model. It does not support
+  arbitrary native extension loading, SQLite-style `.load`, direct database
+  handles inside extension code, or Lua execution in browser/WASM artifacts.
 - Some roadmap items, including policy-aware SQL, vector search, and full-text
   ranking, are planned work rather than shipped features.
 

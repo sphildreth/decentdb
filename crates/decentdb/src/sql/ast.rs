@@ -176,11 +176,12 @@ pub(crate) struct OrderBy {
     pub(crate) collation: Option<Collation>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum Collation {
     Binary,
     NoCase,
     RTrim,
+    Extension(String),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -807,9 +808,9 @@ impl OrderBy {
     #[must_use]
     pub(crate) fn to_sql(&self) -> String {
         let mut sql = self.expr.to_sql();
-        if let Some(collation) = self.collation {
+        if let Some(collation) = &self.collation {
             sql.push_str(" COLLATE ");
-            sql.push_str(collation.to_sql());
+            sql.push_str(&collation.to_sql());
         }
         if self.descending {
             format!("{sql} DESC")
@@ -821,11 +822,12 @@ impl OrderBy {
 
 impl Collation {
     #[must_use]
-    pub(crate) fn to_sql(self) -> &'static str {
+    pub(crate) fn to_sql(&self) -> String {
         match self {
-            Self::Binary => "BINARY",
-            Self::NoCase => "NOCASE",
-            Self::RTrim => "RTRIM",
+            Self::Binary => "BINARY".to_string(),
+            Self::NoCase => "NOCASE".to_string(),
+            Self::RTrim => "RTRIM".to_string(),
+            Self::Extension(name) => name.clone(),
         }
     }
 }

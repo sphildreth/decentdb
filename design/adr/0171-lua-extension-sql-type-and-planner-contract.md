@@ -19,7 +19,8 @@ with strict DecentDB-owned type validation:
 - table-valued functions;
 - aggregate functions;
 - collations;
-- deterministic persisted schema expression dependencies.
+- deterministic metadata for dependency inspection and future persisted-schema
+  eligibility.
 
 ### 1. SQL-visible registration
 
@@ -164,36 +165,21 @@ Lua aggregate functions may execute in grouped aggregate plans. Aggregate state
 is owned by the extension runtime boundary and accounted against explicit
 memory limits.
 
-Lua collations may execute in query-time sort/comparison and may participate in
-persisted indexes when the collation is deterministic and exact extension
-dependency metadata is recorded.
+Lua collations execute in query-time sort/comparison. Persistent column
+collations and persisted index collations remain rejected in 2.6.0 because the
+current storage/index metadata does not persist collation semantics in a way
+that can safely make a B+Tree key depend on executable package code.
 
-Deterministic Lua scalar functions may be used in persisted schema expressions
-when DecentDB records the exact extension dependency:
+Deterministic Lua scalar functions execute in ordinary runtime expression
+contexts. Persisted schema expressions that would store Lua-dependent values or
+index keys remain rejected unless a later ADR adds exact persisted dependency
+metadata to the relevant schema object and proves rebuild/reopen semantics for
+that object kind.
 
-- expression indexes;
-- generated columns;
-- CHECK constraints;
-- DEFAULT expressions;
-- partial-index predicates;
-- view definitions with extension dependency metadata.
-
-Persisted schema objects cannot use nondeterministic Lua functions. They also
-cannot use functions that request filesystem, network, process, randomness,
-database handles, or mutable host state.
-
-Persisted objects that reference Lua functions or collations must record:
-
-- extension name;
-- package hash;
-- function or collation name;
-- signature or collation version;
-- package API version.
-
-If a persisted object dependency is missing, disabled, untrusted, or hash
-mismatched, DecentDB fails with a precise SQL error. Indexes with missing or
-mismatched Lua dependencies are unusable until rebuilt or until the exact
-dependency is restored.
+The extension dependency catalog and rebuild-reporting APIs are included for
+inspection and future persisted-object compatibility. They do not make current
+persistent indexes, generated columns, CHECK constraints, DEFAULT expressions,
+partial-index predicates, or view definitions depend on Lua code.
 
 ### 6. Determinism metadata
 
@@ -205,10 +191,9 @@ stable = false
 volatile = false
 ```
 
-Only one volatility category may be true. Persisted schema expressions and
-persisted collation indexes require `deterministic = true`. The planner may use
-deterministic metadata for persisted expression validation, index eligibility,
-diagnostics, and cost estimates.
+Only one volatility category may be true. The planner may use deterministic
+metadata for diagnostics and cost estimates. Persisted expression and persisted
+collation-index eligibility is not granted in 2.6.0.
 
 ### 7. Error behavior
 
@@ -224,26 +209,30 @@ planning, dependency tracking, and persistence. Strict typing preserves
 DecentDB's cross-binding behavior and prevents Lua from introducing lossy
 coercions that would be hard to debug.
 
-Allowing deterministic persisted use makes the feature complete, but exact
-package-hash dependency metadata prevents silent behavior changes after package
-upgrades or untrusted database opens.
+Keeping persisted schema/index use out of the initial execution contract keeps
+DecentDB from storing values or B+Tree keys whose meaning depends on executable
+code that may be disabled, untrusted, or upgraded at reopen. The extension
+catalog still records the dependency model needed for administrative inspection
+and future persisted-object work.
 
 ## Consequences
 
-- The feature covers scalar, table-valued, aggregate, collation, and
-  deterministic persisted schema use.
+- The feature covers scalar, table-valued, aggregate, and query-time collation
+  use.
 - Function name collision rules are conservative.
 - The type wrapper API must be implemented before rich DecentDB types are safe
   across Lua.
-- Extension dependency metadata is required for persisted schema objects and
-  persisted collation indexes.
+- Persistent schema objects and persistent collation indexes do not execute Lua
+  in 2.6.0.
 
 ## Alternatives Considered
 
 1. **Let Lua functions dynamically accept/return any value.** Rejected because
    it breaks DecentDB's typed SQL and binding contracts.
-2. **Reject deterministic Lua functions in indexes and schema expressions.**
-   Rejected because it would leave the extension model incomplete.
+2. **Allow deterministic Lua functions in persisted indexes and schema
+   expressions immediately.** Rejected because the current catalog and index
+   metadata cannot yet make stored values depend on executable package code
+   without a broader persistence decision.
 3. **Allow persisted Lua use without dependency metadata.** Rejected because
    package upgrades, trust changes, and index rebuilds need explicit dependency
    semantics.
@@ -261,7 +250,7 @@ Implementation is not complete until tests cover:
 - table-valued invocation in `FROM`;
 - aggregate invocation in grouped plans;
 - Lua collation invocation in query-time sorts;
-- deterministic Lua collation indexes with exact dependency metadata;
+- query-time Lua collation sorting and comparison;
 - manifest overload resolution;
 - unknown function and ambiguous function errors;
 - built-in name collision rejection;
@@ -269,13 +258,8 @@ Implementation is not complete until tests cover:
 - typed wrapper conversions;
 - strict return validation;
 - all NULL handling modes;
-- deterministic persisted schema expressions succeed when dependencies are
-  trusted and available;
-- nondeterministic Lua functions are rejected in persisted schema expressions;
-- missing, disabled, untrusted, or hash-mismatched persisted dependencies fail
-  precisely;
-- expression indexes and collation indexes can be rebuilt after package
-  upgrades;
+- persisted column/index collations and persisted Lua schema expressions are
+  rejected with explicit errors;
 - extension errors leave statement and transaction state coherent.
 
 ## References

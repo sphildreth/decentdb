@@ -175,6 +175,34 @@ To override checkpoint/reader settings for a single `exec` invocation, use:
 - `--forceTruncateOnTimeout`
 
 For embedded Rust usage, call `setCheckpointConfig(db.wal, ...)` after opening the database.
+
+### Lua Extension Trust
+
+Lua extension execution is configured when a database connection is opened.
+Installed and enabled packages are inert unless the current connection allows
+the package by name and exact content hash.
+
+**Configuration:**
+
+- CLI: `--allow-extension=<name@sha256:hash>` on `exec` and `repl`
+- CLI development override: `--allow-unsigned-extensions`
+- Rust API: `DbConfig::extension_trust_anchors`
+- Rust API development override:
+  `DbConfig::extension_unsigned_development_mode = true`
+- C ABI open options:
+  `allow_extension=<name@sha256:hash>` and
+  `allow_unsigned_extensions=true`
+
+Trust entries may include Ed25519 publisher keys:
+
+```text
+text_tools@sha256:7b3f...@publisher-key-1@base64:...
+```
+
+The unsigned-development override is intended only for local authoring and test
+databases. Production applications should validate signed packages and open
+connections with explicit package-hash allowlists.
+
 ## Configuration File
 
 Create `~/.decentdb/config` for default settings:

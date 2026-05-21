@@ -126,6 +126,48 @@ if let Some(WatchEvent::Invalidate(event)) =
 # Ok::<(), decentdb::DbError>(())
 ```
 
+## Lua extensions
+
+The Rust API exposes the Lua extension package lifecycle through
+`Db::extensions()` and open-time trust through `DbConfig`.
+
+```rust
+use decentdb::{
+    Db, DbConfig, ExtensionTrustAnchor, ExtensionValidationOptions,
+};
+
+let report = decentdb::validate_extension_package(
+    "./text_tools",
+    ExtensionValidationOptions::unsigned_development(),
+)?;
+let hash = report.content_hash.expect("validated package hash");
+
+let mut config = DbConfig::default();
+config.extension_trust_anchors.push(ExtensionTrustAnchor::new(
+    "text_tools",
+    hash,
+));
+
+let db = Db::open_or_create("app.ddb", config)?;
+db.extensions().install_with_options(
+    "./text_tools",
+    ExtensionValidationOptions::unsigned_development(),
+)?;
+db.extensions().enable("text_tools")?;
+
+let result = db.execute("SELECT slugify('Hello, DecentDB')")?;
+assert_eq!(result.rows().len(), 1);
+# Ok::<(), decentdb::DbError>(())
+```
+
+Lifecycle helpers include `validate_package`, `install`, `install_with_options`,
+`enable`, `disable`, `purge`, `list`, `show`, `dependencies`, and
+`rebuild_dependents`.
+
+Use `DbConfig::extension_unsigned_development_mode` only for local package
+authoring. Production connections should pass exact `ExtensionTrustAnchor`
+entries for the package content hashes they allow to execute.
+
 ## Metadata and maintenance
 
 The crate exposes structured inspection helpers for the CLI and higher-level bindings:
