@@ -47,9 +47,13 @@ source files do not affect runtime behavior.
 - exported SQL functions;
 - argument and return types;
 - determinism and NULL handling;
+- table-valued output schemas;
+- aggregate lifecycle exports;
+- collation exports and version metadata;
+- persisted-schema eligibility metadata;
 - requested permissions;
 - runtime limits;
-- static table-valued schemas if a later ADR enables table functions.
+- package signing metadata.
 
 `install.sql` may create ordinary SQL objects, but it cannot define
 SQL-visible Lua function signatures that are missing from the manifest.
@@ -74,8 +78,8 @@ of the manifest, Lua source files, package metadata, validation report, and
 content hash inside DecentDB-owned internal catalog storage in the main
 database file.
 
-No sidecar source store is used for v1. Bundles and support artifacts can
-include extension package records later by reading the database-owned catalog.
+No sidecar source store is used. Bundles and support artifacts include
+extension package records by reading the database-owned catalog.
 
 Internal extension catalog objects are hidden from ordinary schema listings,
 dump output by default, SQLite compatibility catalog views, and user table
@@ -95,10 +99,27 @@ Package removal is an explicit administrative operation:
 decentdb extension purge --db app.ddb text_tools --confirm
 ```
 
-`CREATE EXTENSION FROM '/path'` is rejected in v1 because SQL text must not
+`CREATE EXTENSION FROM '/path'` is rejected because SQL text must not
 become a filesystem code-loading surface.
 
-### 6. Connection trust
+### 6. Package Signatures
+
+Package signing is part of the complete package model.
+
+The package signature covers the canonical package hash. The accepted signing
+algorithm is Ed25519 with explicit key identifiers. Signatures establish package
+publisher identity; they do not replace the connection-level allowlist. Trust
+anchors are supplied by application, CLI, or binding configuration, not by
+untrusted database content.
+
+Unsigned packages may be installed only when the caller explicitly allows
+unsigned local development packages. Official examples and distributable
+packages must be signed.
+
+Signature validation failures are package validation/install errors before any
+Lua code is executable.
+
+### 7. Connection trust
 
 Even when a package is installed and enabled, extension execution is allowed
 only when the current connection explicitly allows the package name and content
@@ -120,7 +141,7 @@ Hash mismatch, missing allowlist entry, disabled package, missing installed
 package, or manifest/API incompatibility is a SQL error before any Lua code is
 executed.
 
-### 7. Transaction boundaries
+### 8. Transaction Boundaries
 
 Install, enable, disable, and purge operations are normal durable writes.
 Enable and disable participate in SQL transactions. Package install and purge
@@ -154,16 +175,20 @@ primitive.
    portable and make backups non-self-contained.
 3. **Allow SQL to install from arbitrary paths.** Rejected because SQL should
    not become a filesystem code-loader.
-4. **Use sidecar package storage in v1.** Rejected to keep the backup and branch
-   story simple for the first implementation.
-5. **Require signed packages in v1.** Deferred. Hash allowlists provide the
-   minimum trust boundary; signatures can layer onto bundles later.
+4. **Use sidecar package storage.** Rejected to keep the backup, branch, and
+   bundle story simple.
+5. **Defer signed packages.** Rejected because the complete package model needs
+   publisher identity in addition to exact content hashes.
 
 ## Validation Requirements
 
 Implementation is not complete until tests cover:
 
 - stable package hashes across repeated validation;
+- valid signed packages pass signature validation;
+- invalid signatures, unknown signing keys, and tampered package content fail
+  validation before installation;
+- unsigned package installation requires an explicit development override;
 - invalid manifest rejection;
 - install persists package metadata/source across reopen;
 - `CREATE EXTENSION` enablement is transactional;

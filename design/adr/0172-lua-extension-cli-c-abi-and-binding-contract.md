@@ -14,9 +14,10 @@ testing.
 
 ## Decision
 
-DecentDB will expose extension lifecycle operations through engine-owned Rust
-APIs, CLI commands, and C ABI JSON request/response entry points. Bindings wrap
-the C ABI or Rust APIs and do not reimplement Lua behavior.
+DecentDB will expose the complete extension lifecycle and invocation-management
+surface through engine-owned Rust APIs, CLI commands, and C ABI JSON
+request/response entry points. Bindings wrap the C ABI or Rust APIs and do not
+reimplement Lua behavior.
 
 ### 1. CLI surface
 
@@ -31,6 +32,9 @@ decentdb extension show --db app.ddb text_tools --format json
 decentdb extension enable --db app.ddb text_tools
 decentdb extension disable --db app.ddb text_tools
 decentdb extension purge --db app.ddb text_tools --confirm
+decentdb extension verify-signature ./text_tools --keyring ./trusted.keys
+decentdb extension dependencies --db app.ddb --format table
+decentdb extension rebuild --db app.ddb text_tools
 ```
 
 SQL execution commands require explicit connection trust:
@@ -57,16 +61,19 @@ db.extensions().enable("text_tools")?;
 db.extensions().disable("text_tools")?;
 db.extensions().purge("text_tools")?;
 db.extensions().list()?;
+db.extensions().dependencies()?;
+db.extensions().rebuild_dependents("text_tools")?;
 ```
 
 Connection trust is configured through `DbConfig`, not through SQL.
 
 ### 3. C ABI baseline
 
-The first C ABI surface uses JSON request/response entry points for lifecycle
-operations and connection allowlist configuration. This mirrors the binding
-strategy used by public sync JSON bridges and avoids baking a large struct graph
-into the ABI before the package format stabilizes.
+The C ABI surface uses JSON request/response entry points for lifecycle,
+dependency, rebuild, validation, and connection allowlist configuration. This
+mirrors the binding strategy used by public sync JSON bridges and avoids baking
+a large struct graph into the ABI. The JSON bridge is the stable complete ABI
+for this feature; typed binding conveniences are layered above it.
 
 Conceptual C ABI:
 
@@ -77,6 +84,8 @@ ddb_extension_list_json(...);
 ddb_extension_enable_json(...);
 ddb_extension_disable_json(...);
 ddb_extension_purge_json(...);
+ddb_extension_dependencies_json(...);
+ddb_extension_rebuild_json(...);
 ddb_config_allow_extension(config, "text_tools", "sha256:abc123");
 ```
 
@@ -105,6 +114,8 @@ SQL inspection surfaces are read-only:
 SELECT * FROM sys.extensions;
 SELECT * FROM sys.extension_functions;
 SELECT * FROM sys.extension_validation;
+SELECT * FROM sys.extension_dependencies;
+SELECT * FROM sys.extension_collations;
 ```
 
 Raw Lua source is not exposed through `sys.*`. Administrative CLI/API commands
@@ -121,8 +132,14 @@ The feature is not complete until user docs explain:
 - CLI lifecycle;
 - binding lifecycle;
 - SQL usage;
-- unsupported browser behavior;
-- at least one complete scalar extension example.
+- browser/wasm behavior;
+- scalar function examples;
+- table-valued function examples;
+- aggregate examples;
+- collation examples;
+- persisted deterministic expression and index examples;
+- package signing examples;
+- dependency rebuild workflows.
 
 ## Rationale
 
@@ -136,11 +153,13 @@ permission.
 
 ## Consequences
 
-- C ABI grows lifecycle JSON entry points and config allowlist helpers.
-- Bindings need smoke tests for install/enable/allow/invoke.
+- C ABI grows lifecycle, dependency, rebuild, validation, and config allowlist
+  JSON entry points.
+- Bindings need smoke tests for install/enable/allow/invoke across scalar,
+  table-valued, aggregate, and collation surfaces.
 - CLI becomes the primary authoring and validation tool.
 - Docs/examples are release-blocking for the feature.
-- Any future typed ABI can layer on top of the JSON baseline.
+- Typed binding conveniences layer on top of the JSON ABI baseline.
 
 ## Alternatives Considered
 
@@ -148,8 +167,8 @@ permission.
    binding-wide.
 2. **Give each binding its own manifest parser.** Rejected because it would
    split package and trust semantics.
-3. **Design a large typed C ABI first.** Rejected because the package format and
-   validation report may evolve during v1.
+3. **Design a large typed C ABI first.** Rejected because the JSON bridge is
+   already the complete public ABI pattern for complex DecentDB surfaces.
 4. **Let SQL grant trust.** Rejected because trust is an application/runtime
    decision, not database content.
 
@@ -158,12 +177,15 @@ permission.
 Implementation is not complete until tests cover:
 
 - CLI validate/install/list/show/enable/disable/purge;
+- CLI signature verification, dependency inspection, and dependent-object
+  rebuild;
 - CLI `exec` and REPL trust allowlist behavior;
 - Rust lifecycle API;
 - C ABI JSON allocation/free and panic safety;
-- binding smoke tests install and call a scalar function;
+- binding smoke tests install and call scalar, table-valued, aggregate, and
+  collation extension objects;
 - raw source absent from `sys.*`;
-- docs example package validates and executes;
+- docs example packages validate and execute every supported function kind;
 - no binding can execute an enabled extension without allowlist trust.
 
 ## References

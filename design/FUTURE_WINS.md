@@ -226,15 +226,21 @@ systems or unbounded native plugins.
 - Lua 5.4 language target
 - explicit install/enable/trust lifecycle
 - no auto-running extension code when an untrusted database is opened
-- scalar functions first
+- scalar functions
+- table-valued functions
+- aggregate functions
+- Lua-backed collations
+- deterministic persisted schema expression and index support with exact
+  extension dependency tracking
 - DecentDB-owned typed wrappers for `DECIMAL`, `UUID`, date/time, `BLOB`, JSON,
   and later rich-type expansion
-- table-valued functions, aggregates, and collations in later slices
-- CLI and binding APIs for validate, install, list, enable, disable, and test
+- package signing and content-hash trust
+- CLI and binding APIs for validate, install, list, enable, disable, purge,
+  test, dependency inspection, and rebuild workflows
 
 ### Guardrails
 
-- no SQLite-style `.load` support in v1
+- no SQLite-style `.load` support
 - no filesystem, network, process, native-module, or database-write access from
   Lua by default
 - no direct WAL, pager, B+Tree, catalog, or transaction internals
@@ -242,6 +248,8 @@ systems or unbounded native plugins.
 - no loose or lossy type coercions
 - Lua execution must be resource-bounded, cancellable, and converted into SQL
   errors without process corruption
+- persisted Lua functions and collations require exact package-hash dependency
+  metadata and rebuild diagnostics
 
 ## 3. Full-Text Search With BM25 Ranking
 
@@ -692,9 +700,11 @@ performance, and operational foundations.
 
 ## Near-Term Sequence
 
-1. Complete the ADR-backed Lua extension v1 scope as the final accepted 2.6.0
-   Future Win implementation: package lifecycle, trust, sandboxed scalar
-   functions, strict types, CLI/C ABI/binding surface, docs, and examples.
+1. Complete the full ADR-backed Lua extension scope as the final accepted 2.6.0
+   Future Win implementation: package lifecycle, trust, signing, sandboxed
+   scalar functions, table-valued functions, aggregates, collations,
+   deterministic persisted schema/index support, dependency rebuild workflows,
+   strict types, CLI/C ABI/binding surface, docs, and examples.
 2. Stabilize and release the current 2.6.0 foundations before adding any other
    Future Win implementation to the branch.
 3. Write the local data security ADR/spec first because TDE, key management,

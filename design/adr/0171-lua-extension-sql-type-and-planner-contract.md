@@ -12,8 +12,14 @@ The extension language must not take ownership of DecentDB's type system.
 
 ## Decision
 
-The first Lua extension runtime supports **manifest-declared scalar functions**
-with strict DecentDB-owned type validation.
+The Lua extension runtime supports **manifest-declared SQL extension objects**
+with strict DecentDB-owned type validation:
+
+- scalar functions;
+- table-valued functions;
+- aggregate functions;
+- collations;
+- deterministic persisted schema expression dependencies.
 
 ### 1. SQL-visible registration
 
@@ -23,17 +29,37 @@ Extension functions become visible only when all conditions are true:
 2. the package is enabled through `CREATE EXTENSION`;
 3. the current connection allowlist accepts the package name and content hash;
 4. the manifest declares the function signature;
-5. the function kind is supported by the current runtime.
+5. the function or collation kind is declared in the manifest.
 
-Functions are invoked with ordinary SQL function syntax:
+Scalar functions are invoked with ordinary SQL function syntax:
 
 ```sql
 SELECT slugify(title) FROM posts;
 ```
 
-The function namespace is the ordinary scalar-function namespace in v1. Name
-collisions with built-in functions are rejected at extension enable time unless
-a later ADR defines namespacing or override rules.
+Table-valued functions are invoked in `FROM`:
+
+```sql
+SELECT *
+FROM parse_log_blob(payload);
+```
+
+Aggregate functions are invoked through ordinary aggregate syntax:
+
+```sql
+SELECT account_id, risk_score(events)
+FROM account_events
+GROUP BY account_id;
+```
+
+Lua collations are referenced through ordinary collation syntax:
+
+```sql
+SELECT title FROM posts ORDER BY title COLLATE natural_title;
+```
+
+Function and collation namespace collisions with built-ins are rejected at
+extension enable time. Extension objects must not override built-ins.
 
 ### 2. Manifest-declared signatures
 
@@ -48,6 +74,29 @@ Every function declares:
 - NULL handling mode;
 - runtime limits or package defaults.
 
+Table-valued functions also declare:
+
+- static output column names;
+- static output column types;
+- row and row-byte limits;
+- streaming/materialization policy hints.
+
+Aggregate functions also declare:
+
+- Lua step export;
+- Lua final export;
+- aggregate state type;
+- aggregate state memory budget;
+- NULL handling for step/final behavior.
+
+Collations declare:
+
+- collation name;
+- Lua comparison export;
+- deterministic flag;
+- version metadata;
+- comparison resource budget.
+
 No runtime-discovered SQL signatures are allowed. Lua does not inspect values to
 choose overloads. DecentDB resolves the SQL call before Lua execution.
 
@@ -56,7 +105,7 @@ choose overloads. DecentDB resolves the SQL call before Lua execution.
 DecentDB values convert to Lua-safe primitives or wrappers and back to DecentDB
 values. Strict type mode is mandatory.
 
-Primitive v1 values:
+Primitive values:
 
 - `NULL`;
 - `BOOL`;
@@ -107,63 +156,101 @@ Lua scalar functions may execute in ordinary expression evaluation:
 - `HAVING`;
 - DML expressions where scalar functions are already evaluated.
 
-Lua functions are not allowed in persisted schema expressions in the first
-runtime:
+Lua table-valued functions may execute as scan sources in `FROM`. The planner
+may estimate table-valued function cost and row counts from manifest metadata
+and observed runtime statistics. Predicate pushdown into Lua is not required.
+
+Lua aggregate functions may execute in grouped aggregate plans. Aggregate state
+is owned by the extension runtime boundary and accounted against explicit
+memory limits.
+
+Lua collations may execute in query-time sort/comparison and may participate in
+persisted indexes when the collation is deterministic and exact extension
+dependency metadata is recorded.
+
+Deterministic Lua scalar functions may be used in persisted schema expressions
+when DecentDB records the exact extension dependency:
 
 - expression indexes;
 - generated columns;
 - CHECK constraints;
 - DEFAULT expressions;
-- foreign-key actions;
 - partial-index predicates;
-- view definitions stored without extension dependency metadata.
+- view definitions with extension dependency metadata.
 
-This restriction holds even when a manifest marks a function deterministic.
-Persisted expression support requires a later ADR covering trust, dependency
-tracking, dump/reopen behavior, index rebuilds, and extension upgrades.
+Persisted schema objects cannot use nondeterministic Lua functions. They also
+cannot use functions that request filesystem, network, process, randomness,
+database handles, or mutable host state.
+
+Persisted objects that reference Lua functions or collations must record:
+
+- extension name;
+- package hash;
+- function or collation name;
+- signature or collation version;
+- package API version.
+
+If a persisted object dependency is missing, disabled, untrusted, or hash
+mismatched, DecentDB fails with a precise SQL error. Indexes with missing or
+mismatched Lua dependencies are unusable until rebuilt or until the exact
+dependency is restored.
 
 ### 6. Determinism metadata
 
-The first runtime accepts `deterministic = true` or `deterministic = false`.
-The planner may use deterministic metadata only for diagnostics and future
-costing. It must not use Lua determinism to persist results, fold constants in
-schema objects, or build indexes in v1.
+The runtime accepts explicit volatility metadata:
+
+```toml
+deterministic = true
+stable = false
+volatile = false
+```
+
+Only one volatility category may be true. Persisted schema expressions and
+persisted collation indexes require `deterministic = true`. The planner may use
+deterministic metadata for persisted expression validation, index eligibility,
+diagnostics, and cost estimates.
 
 ### 7. Error behavior
 
-Type mismatch, missing function, missing package trust, Lua runtime errors, and
-return conversion errors are SQL errors naming the extension and function.
-Panic payloads and host internals are not exposed.
+Type mismatch, missing function, missing collation, missing package trust, Lua
+runtime errors, row conversion errors, aggregate state errors, collation return
+errors, and return conversion errors are SQL errors naming the extension and
+object. Panic payloads and host internals are not exposed.
 
 ## Rationale
 
-Manifest-declared scalar functions make the first runtime useful while keeping
-the planner and storage contracts conservative. Strict typing preserves
+Manifest-declared SQL objects keep DecentDB, not Lua, in charge of typing,
+planning, dependency tracking, and persistence. Strict typing preserves
 DecentDB's cross-binding behavior and prevents Lua from introducing lossy
 coercions that would be hard to debug.
 
-Forbidding persisted schema expressions avoids the hardest upgrade/reopen/index
-questions in the first implementation.
+Allowing deterministic persisted use makes the feature complete, but exact
+package-hash dependency metadata prevents silent behavior changes after package
+upgrades or untrusted database opens.
 
 ## Consequences
 
-- The first feature is scalar-function focused.
-- Extension functions are unavailable for schema-level constraints and indexes.
+- The feature covers scalar, table-valued, aggregate, collation, and
+  deterministic persisted schema use.
 - Function name collision rules are conservative.
 - The type wrapper API must be implemented before rich DecentDB types are safe
   across Lua.
-- Future persisted-expression support will need extension dependency metadata.
+- Extension dependency metadata is required for persisted schema objects and
+  persisted collation indexes.
 
 ## Alternatives Considered
 
 1. **Let Lua functions dynamically accept/return any value.** Rejected because
    it breaks DecentDB's typed SQL and binding contracts.
-2. **Allow deterministic Lua functions in indexes immediately.** Rejected
-   because package upgrades, trust changes, and index rebuilds need explicit
-   dependency semantics.
-3. **Namespace all extension functions as `extension.function`.** Deferred.
-   Ordinary function syntax is simpler for v1; collisions are rejected.
-4. **Expose database handles to Lua for richer functions.** Rejected because it
+2. **Reject deterministic Lua functions in indexes and schema expressions.**
+   Rejected because it would leave the extension model incomplete.
+3. **Allow persisted Lua use without dependency metadata.** Rejected because
+   package upgrades, trust changes, and index rebuilds need explicit dependency
+   semantics.
+4. **Namespace all extension functions as `extension.function`.** Rejected for
+   the initial complete model. Ordinary function syntax is simpler; collisions
+   are rejected.
+5. **Expose database handles to Lua for richer functions.** Rejected because it
    would break transaction, mutation, and sandbox boundaries.
 
 ## Validation Requirements
@@ -171,6 +258,10 @@ questions in the first implementation.
 Implementation is not complete until tests cover:
 
 - scalar invocation in projections and filters;
+- table-valued invocation in `FROM`;
+- aggregate invocation in grouped plans;
+- Lua collation invocation in query-time sorts;
+- deterministic Lua collation indexes with exact dependency metadata;
 - manifest overload resolution;
 - unknown function and ambiguous function errors;
 - built-in name collision rejection;
@@ -178,8 +269,13 @@ Implementation is not complete until tests cover:
 - typed wrapper conversions;
 - strict return validation;
 - all NULL handling modes;
-- use in persisted schema expressions is rejected;
-- deterministic metadata is parsed but not used for index/schema persistence;
+- deterministic persisted schema expressions succeed when dependencies are
+  trusted and available;
+- nondeterministic Lua functions are rejected in persisted schema expressions;
+- missing, disabled, untrusted, or hash-mismatched persisted dependencies fail
+  precisely;
+- expression indexes and collation indexes can be rebuilt after package
+  upgrades;
 - extension errors leave statement and transaction state coherent.
 
 ## References

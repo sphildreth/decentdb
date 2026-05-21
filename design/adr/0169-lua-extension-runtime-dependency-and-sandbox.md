@@ -7,7 +7,7 @@
 `design/FUTURE_WINS.md` tracks a Lua extension runtime and package model as the
 final candidate for additional 2.6.0 feature work. The companion spec,
 `design/WIN_LUA_EXTENSION_RUNTIME_SPEC.md`, requires a runtime dependency,
-build strategy, sandbox boundary, resource-limit model, and wasm/browser policy
+build strategy, sandbox boundary, resource-limit model, and cross-target policy
 before implementation.
 
 The extension runtime must let applications add SQL-visible behavior without
@@ -17,7 +17,7 @@ network, filesystem, or database mutation APIs.
 
 ## Decision
 
-DecentDB will implement the first Lua extension runtime with **Lua 5.4 semantics
+DecentDB will implement the Lua extension runtime with **Lua 5.4 semantics
 through `mlua` using vendored Lua** behind DecentDB-owned runtime traits.
 
 ### 1. Runtime dependency
@@ -33,20 +33,22 @@ mlua = { features = ["lua54", "vendored"] }
 ```
 
 The implementation must avoid optional `mlua` features that expand the runtime
-surface unless a later ADR accepts them. In particular, the first runtime does
-not require async execution, native Lua modules, serde-based dynamic conversion,
-or cross-thread Lua state sharing.
+surface unless this ADR or the Lua extension spec requires them. Native Lua
+modules, unrestricted package loading, direct serde-based dynamic conversion,
+and cross-thread Lua state sharing are not part of the public contract.
 
 ### 2. Build and release policy
 
-Official native 2.6.0 artifacts include Lua extension support by default.
-Embedders may build without Lua through a cargo feature if they need a smaller
-or stricter binary.
+Official 2.6.0 artifacts include Lua extension support by default for supported
+targets that expose SQL execution. Embedders may build without Lua through a
+cargo feature if they need a smaller or stricter binary.
 
-WASM/browser builds do not execute Lua extensions in this phase. They must
-compile with stable unsupported-capability errors rather than trying to load or
-emulate Lua in the browser runtime. Browser support requires a later ADR because
-the sandbox, package delivery, and resource-limit model are different in wasm.
+The complete Future Win #2 scope includes browser/wasm behavior. If `mlua`
+with vendored Lua cannot satisfy the repository's wasm/browser target
+constraints, the implementation must use the DecentDB-owned runtime trait layer
+to provide an equivalent Lua 5.4 backend for that target before #2 can be
+marked complete. A supported official artifact must not silently omit Lua
+extension execution unless it is explicitly built with the no-Lua feature.
 
 ### 3. DecentDB-owned runtime boundary
 
@@ -60,6 +62,21 @@ pub(crate) trait ExtensionRuntime {
         function: &ExtensionFunction,
         args: &[Value],
     ) -> Result<Value>;
+    fn invoke_table(
+        &mut self,
+        function: &ExtensionFunction,
+        args: &[Value],
+    ) -> Result<ExtensionRowStream>;
+    fn create_aggregate(
+        &mut self,
+        function: &ExtensionFunction,
+    ) -> Result<ExtensionAggregateState>;
+    fn compare_collation(
+        &mut self,
+        collation: &ExtensionCollation,
+        left: &str,
+        right: &str,
+    ) -> Result<Ordering>;
 }
 ```
 
@@ -74,7 +91,7 @@ must invalidate when the enabled package version/hash changes.
 
 ### 5. Sandbox contract
 
-The first runtime exposes only a small safe host API:
+The runtime exposes only a small safe host API:
 
 - selected base Lua functions needed for ordinary pure computation;
 - `string`;
@@ -108,11 +125,12 @@ Every Lua invocation runs under explicit limits:
 - memory allocation budget;
 - maximum returned string size;
 - maximum returned BLOB size;
+- maximum table-valued rows;
+- maximum table-valued row bytes;
+- maximum aggregate state size;
+- maximum collation comparison budget;
 - recursion depth limit where supported by the runtime boundary;
 - cancellation checks integrated with existing statement cancellation paths.
-
-Table-valued row limits and aggregate state limits are not part of the first
-runtime slice because those function kinds are deferred by ADR 0173.
 
 Resource-limit and sandbox failures are SQL errors that name the extension and
 function. They must not panic, poison process state, or leave transactions in a
@@ -126,17 +144,17 @@ the crate behind DecentDB-owned traits preserves the option to change the
 implementation later.
 
 Vendoring Lua keeps Linux, macOS, Windows, CI, and binding packages aligned.
-Disabling Lua execution in wasm/browser for the first slice avoids making the
-browser runtime responsible for another sandbox and package-delivery model in
-the same release.
+The DecentDB-owned runtime trait layer keeps the public contract independent
+from the selected Rust binding and leaves room for target-specific backend work
+without exposing third-party runtime types.
 
 ## Consequences
 
 - Native release artifacts gain a vendored Lua dependency.
 - The implementation must maintain a no-Lua build path for embedders that
   disable the feature.
-- WASM/browser builds expose unsupported errors for extension execution until a
-  future browser extension ADR is accepted.
+- Browser/wasm artifacts that advertise Lua extension support must execute the
+  same package model and sandbox contract as native artifacts.
 - Security tests must verify denied modules and capabilities.
 - Runtime resource limits become part of the public extension contract.
 
@@ -144,15 +162,17 @@ the same release.
 
 1. **Use system Lua.** Rejected because official artifacts would depend on host
    package managers and platform-specific library discovery.
-2. **Use LuaJIT.** Rejected for v1 because the spec targets Lua 5.4 semantics
-   and portable official builds.
+2. **Use LuaJIT.** Rejected because the spec targets Lua 5.4 semantics and
+   portable official builds.
 3. **Use a pure Rust scripting language.** Rejected because the roadmap item is
    specifically a Lua package model and Lua is familiar as an embeddable
    extension language.
 4. **Expose host-language callbacks instead.** Rejected because each binding
    would grow a different extension model.
-5. **Support Lua in browser immediately.** Rejected because browser extension
-   code delivery and sandbox policy need separate design.
+5. **Omit Lua execution from browser/wasm artifacts.** Rejected because the
+   roadmap positions Lua as one supportable extension language across native,
+   mobile, and WASM targets. Package delivery and sandbox policy must be tested
+   as part of the complete feature.
 
 ## Validation Requirements
 
@@ -160,12 +180,16 @@ Implementation is not complete until tests cover:
 
 - native build with Lua enabled;
 - build with Lua disabled;
-- wasm/browser unsupported behavior compiles and returns stable errors;
+- wasm/browser build with Lua enabled, package lifecycle available, and
+  extension execution covered by target-appropriate tests;
 - denied `io`, `os`, `debug`, `package.loadlib`, `dofile`, and `loadfile`;
 - denied arbitrary `require`;
 - CPU/step limit failures;
 - memory limit failures where supported;
 - returned string/BLOB size failures;
+- table-valued row and row-byte limit failures;
+- aggregate state limit failures;
+- collation comparison budget failures;
 - cancellation during extension execution;
 - Lua runtime errors converted to SQL errors;
 - no panic crossing Rust or C ABI boundaries.
