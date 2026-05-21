@@ -11,6 +11,11 @@ This directory contains the historical and active ADRs for DecentDB.
 - **0118-rust-ffi-panic-safety.md**: Mandates `catch_unwind` on all C-ABI boundaries.
 - **0119-rust-vfs-pread-pwrite.md**: Mandates standard file positional I/O over `unsafe mmap` for the Virtual File System.
 - **0120-core-storage-engine-btree.md**: Formalizes the choice of an optimized B+Tree over an LSM-Tree for the core storage engine.
+- **0173-lua-extension-function-kind-phasing.md**: Defines Lua extension v1 as package lifecycle plus sandboxed scalar functions, with table-valued functions, aggregates, collations, and persisted schema expressions deferred behind later ADRs.
+- **0172-lua-extension-cli-c-abi-and-binding-contract.md**: Defines CLI lifecycle commands, C ABI JSON bridge shape, binding responsibilities, trust configuration, and extension inspection surfaces.
+- **0171-lua-extension-sql-type-and-planner-contract.md**: Defines SQL registration, strict manifest-declared scalar signatures, DecentDB-owned type conversion, NULL handling, planner limits, and persisted-expression restrictions.
+- **0170-lua-extension-package-catalog-and-trust.md**: Defines package layout, manifest authority, SHA-256 package hashing, database-owned internal package storage, enablement, purge, and connection-level trust.
+- **0169-lua-extension-runtime-dependency-and-sandbox.md**: Defines the Lua 5.4 `mlua` vendored runtime direction, native/browser build policy, DecentDB-owned runtime abstraction, sandbox, and resource limits.
 - **0168-sync-shape-streaming-subscriptions.md**: Defines production sync shapes as durable scoped subscriptions backed by sync scopes and public changesets, with ack/resume and retention behavior.
 - **0167-public-changeset-api.md**: Defines the stable logical changeset envelope, source boundaries, transactional apply, idempotency, inspection, inversion limits, and JSON bridge baseline.
 - **0166-production-sync-relay-boundary-and-identity.md**: Defines the self-hosted relay boundary, v2 protocol namespace, principal model, authorization split, transport security posture, and relay diagnostics.

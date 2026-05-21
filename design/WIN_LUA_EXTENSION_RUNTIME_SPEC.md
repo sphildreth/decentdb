@@ -1,10 +1,10 @@
 # Lua Extension Runtime And Package Model
 
-**Date:** 2026-05-18  
-**Status:** Proposed  
-**Roadmap:** [`FUTURE_WINS.md`](FUTURE_WINS.md)  
-**Audience:** Core engine developers, SQL planner/executor maintainers, C ABI maintainers, binding maintainers, CLI maintainers, documentation authors, coding agents  
-**Related inputs:** Lua 5.4 Reference Manual, `design/FUTURE_WINS.md`, `design/WIN_ADVANCED_SQL_COMPATIBILITY_SURFACE.md`, `design/adr/0111-table-valued-functions.md`, `design/adr/0118-rust-ffi-panic-safety.md`
+**Date:** 2026-05-21
+**Status:** Accepted for ADR-backed v1 implementation
+**Roadmap:** [`FUTURE_WINS.md`](FUTURE_WINS.md)
+**Audience:** Core engine developers, SQL planner/executor maintainers, C ABI maintainers, binding maintainers, CLI maintainers, documentation authors, coding agents
+**Related inputs:** Lua 5.4 Reference Manual, `design/FUTURE_WINS.md`, `design/WIN_ADVANCED_SQL_COMPATIBILITY_SURFACE.md`, `design/adr/0111-table-valued-functions.md`, `design/adr/0118-rust-ffi-panic-safety.md`, ADR 0169-0173
 
 ---
 
@@ -38,7 +38,6 @@ CREATE EXTENSION text_tools;
 
 SELECT slugify(title) FROM posts;
 SELECT score_email(subject, body) FROM messages;
-SELECT * FROM parse_log_blob(payload);
 ```
 
 Lua should only implement behavior. DecentDB remains the authority for SQL
@@ -52,6 +51,11 @@ Use Lua for behavior.
 Use DecentDB for type authority, SQL registration, sandboxing, and durability.
 Use the manifest as the contract.
 ```
+
+2.6.0 v1 scope is package lifecycle plus sandboxed scalar functions. Lua
+table-valued functions, aggregates, collations, and persisted schema
+expressions are deliberately deferred by
+[ADR 0173](adr/0173-lua-extension-function-kind-phasing.md).
 
 ---
 
@@ -136,35 +140,42 @@ The first Lua extension runtime does not support:
 
 ---
 
-## 5. Required ADRs
+## 5. Accepted ADRs
 
-This feature requires ADRs before implementation because it introduces a major
+This feature required ADRs before implementation because it introduces a major
 runtime dependency, a new SQL-visible extension surface, C ABI impact, sandbox
-rules, and catalog/trust policy.
+rules, and catalog/trust policy. The required decision topics are now covered
+by the accepted ADRs below.
 
-Required ADRs:
+Accepted ADR coverage:
 
-1. Lua runtime dependency and build strategy.
-2. Extension package manifest and versioning.
-3. Extension trust, allowlist, and activation policy.
-4. Extension catalog and persistence model.
-5. SQL function registration and planner contract.
-6. Lua type boundary and strict return validation.
-7. Sandbox and resource-limit contract.
-8. C ABI and binding lifecycle APIs.
-9. Table-valued function streaming and ownership model before table functions.
-10. Collation/index interaction before Lua-backed collations.
+1. [ADR 0169](adr/0169-lua-extension-runtime-dependency-and-sandbox.md):
+   runtime dependency, build strategy, sandbox, resource limits, and
+   wasm/browser deferral.
+2. [ADR 0170](adr/0170-lua-extension-package-catalog-and-trust.md):
+   package layout, manifest authority, versioning inputs, content hashing,
+   catalog storage, enablement, purge, and connection-level trust.
+3. [ADR 0171](adr/0171-lua-extension-sql-type-and-planner-contract.md):
+   SQL function registration, strict manifest signatures, DecentDB-owned type
+   boundary, NULL handling, planner contract, and persisted-expression
+   restrictions.
+4. [ADR 0172](adr/0172-lua-extension-cli-c-abi-and-binding-contract.md):
+   CLI lifecycle, C ABI JSON bridge, binding responsibilities, inspection
+   surfaces, and documentation expectations.
+5. [ADR 0173](adr/0173-lua-extension-function-kind-phasing.md):
+   v1 scalar-function scope and explicit deferral of table-valued functions,
+   aggregates, collations, and persisted schema expressions.
 
-Recommended dependency direction:
+Accepted dependency direction:
 
-- Use Lua 5.4 semantics as the language target.
-- Prefer a vendored Lua build through a Rust Lua binding crate so official
-  release artifacts do not require a system Lua installation.
+- Use Lua 5.4 semantics as the language target through `mlua`.
+- Use vendored Lua for official native release artifacts so they do not require
+  a system Lua installation.
 - Hide the selected Rust crate behind DecentDB-owned extension runtime traits so
   public DecentDB APIs do not expose third-party runtime types.
-
-The ADR must make the exact crate and feature decision. That decision is not
-made by this document.
+- Include Lua extension support in official native 2.6.0 artifacts by default,
+  while preserving a no-Lua build path for embedders and stable unsupported
+  behavior in wasm/browser builds.
 
 ---
 
@@ -323,7 +334,7 @@ let db = Db::open_with_config(
 )?;
 ```
 
-The ADR must choose the exact persistence storage, but the recommended model is:
+ADR 0170 chooses the exact persistence storage:
 
 - `extension install` stores a canonical manifest, Lua source, and content hash
   in DecentDB-owned internal catalog storage.
@@ -332,8 +343,9 @@ The ADR must choose the exact persistence storage, but the recommended model is:
   grant for every connection.
 - the connection or CLI invocation still decides whether Lua execution is
   allowed.
-- `DROP EXTENSION` disables the SQL-visible extension objects and optionally
-  removes installed package content with an explicit purge command.
+- `DROP EXTENSION` disables the SQL-visible extension objects.
+- `decentdb extension purge --db app.ddb text_tools --confirm` removes
+  installed package content through an explicit administrative command.
 
 This keeps databases portable while avoiding silent code execution when a user
 opens a database from an untrusted source.
@@ -372,7 +384,8 @@ SELECT score_email(subject, body) FROM messages;
 SELECT tax_amount(subtotal, tax_rate) FROM invoices;
 ```
 
-Table-valued functions, after the table-function slice:
+Table-valued functions are deferred by ADR 0173. A future table-function slice
+may support:
 
 ```sql
 SELECT *
@@ -618,6 +631,9 @@ return M
 
 ### Table-Valued Functions
 
+Deferred by [ADR 0173](adr/0173-lua-extension-function-kind-phasing.md);
+not part of the 2.6.0 v1 implementation scope.
+
 Table-valued functions must declare a static schema.
 
 Manifest:
@@ -653,7 +669,9 @@ Rules:
 
 ### Aggregate Functions
 
-Aggregate functions are later than scalar and table-valued functions.
+Deferred by [ADR 0173](adr/0173-lua-extension-function-kind-phasing.md);
+not part of the 2.6.0 v1 implementation scope. Aggregate functions are later
+than scalar and table-valued functions.
 
 Rules:
 
@@ -665,8 +683,10 @@ Rules:
 
 ### Collations
 
-Lua-backed collations are later than scalar and table-valued functions because
-they can affect indexes and persistent ordering.
+Deferred by [ADR 0173](adr/0173-lua-extension-function-kind-phasing.md);
+not part of the 2.6.0 v1 implementation scope. Lua-backed collations are later
+than scalar and table-valued functions because they can affect indexes and
+persistent ordering.
 
 Rules:
 
@@ -743,16 +763,19 @@ Disabled or restricted:
 - `loadfile`
 - environment-variable access
 
-Required resource limits:
+Required v1 scalar resource limits:
 
 - instruction/step limit
 - memory allocation limit
 - maximum returned string size
 - maximum returned BLOB size
-- maximum table-valued rows
-- maximum aggregate state size
 - recursion depth limit
 - cancellation check integration
+
+Future function-kind limits:
+
+- maximum table-valued rows
+- maximum aggregate state size
 
 Resource-limit errors must be SQL errors:
 
@@ -788,11 +811,13 @@ V1 planner rules:
   where the executor already evaluates scalar expressions.
 - Lua functions are not allowed in expression indexes, generated columns, CHECK
   constraints, foreign-key actions, or persisted schema expressions until a
-  determinism and trust ADR allows it.
-- Lua table-valued functions are scan sources only; no predicate pushdown in the
-  first table-function slice.
-- Lua collations do not participate in persisted indexes until collation
-  persistence and rebuild semantics are accepted.
+  later determinism, trust, and dependency-tracking ADR allows it.
+- Lua table-valued function planner rules are deferred by ADR 0173. A later ADR
+  must decide scan ownership, predicate pushdown, row limits, lateral behavior,
+  and cancellation.
+- Lua collation planner/index rules are deferred by ADR 0173. A later ADR must
+  decide persistent index participation, rebuild semantics, and package
+  dependency tracking.
 
 Future planner metadata:
 
@@ -844,6 +869,8 @@ Runtime errors:
 
 ## 18. CLI Surface
 
+ADR 0172 accepts the CLI lifecycle surface below.
+
 Recommended commands:
 
 ```bash
@@ -879,7 +906,8 @@ release.
 
 ## 19. Binding Surface
 
-The runtime lives in DecentDB, not in each host binding.
+ADR 0172 accepts the binding and C ABI direction. The runtime lives in
+DecentDB, not in each host binding.
 
 Every binding should expose the same lifecycle shape:
 
@@ -902,15 +930,17 @@ let db = Db::open_with_config(path, config_with_extension_allowlist)?;
 let rows = db.execute("SELECT slugify(title) FROM posts")?;
 ```
 
-C ABI shape:
+C ABI JSON bridge shape:
 
 ```c
-ddb_extension_install(db, "./text_tools", &err);
-ddb_extension_enable(db, "text_tools", &err);
+ddb_extension_install_json(db, request_json, &response_json, &err);
+ddb_extension_enable_json(db, request_json, &response_json, &err);
+ddb_extension_list_json(db, request_json, &response_json, &err);
 ddb_config_allow_extension(config, "text_tools", "sha256:abc123");
 ```
 
-Bindings should wrap the C ABI rather than reimplement Lua behavior.
+Bindings should wrap the C ABI rather than reimplement Lua behavior, manifest
+parsing, package hashing, or trust policy.
 
 ---
 
@@ -947,9 +977,13 @@ sync metadata tables.
 
 ## 21. Implementation Slices
 
+2.6.0 v1 implementation scope includes slices 1-4 plus the scalar-function
+parts of slice 8. Slice 0 is complete at the design level because ADR
+0169-0173 are accepted. Slices 5-7 are explicit post-v1 follow-ons.
+
 ### Slice 0: ADRs And Dependency Gate
 
-Status: `TODO`
+Status: `DONE`
 
 Deliverables:
 
@@ -1053,7 +1087,7 @@ Definition of done:
 
 ### Slice 5: Table-Valued Functions
 
-Status: `TODO`
+Status: `DEFERRED BY ADR 0173`
 
 Deliverables:
 
@@ -1071,7 +1105,7 @@ Definition of done:
 
 ### Slice 6: Aggregates
 
-Status: `TODO`
+Status: `DEFERRED BY ADR 0173`
 
 Deliverables:
 
@@ -1088,7 +1122,7 @@ Definition of done:
 
 ### Slice 7: Collations
 
-Status: `TODO`
+Status: `DEFERRED BY ADR 0173`
 
 Deliverables:
 
@@ -1260,24 +1294,54 @@ SELECT tax_amount(subtotal, tax_rate) FROM invoices;
 
 ---
 
-## 24. Open Questions
+## 24. Resolved Decisions And Remaining Follow-Ups
 
-1. Which Rust Lua binding and build flags should DecentDB use?
-2. Should official builds always include Lua extension support, or should it be
-   a cargo feature plus release-build variant?
-3. Should installed extension source live inside the main database file, a
-   sidecar store, or both?
-4. What is the exact SQL syntax for `CREATE EXTENSION` version/hash selection?
-5. Should `CREATE EXTENSION` be transactional with package enablement only, or
-   should package installation also be available through SQL?
-6. How should extension lifecycle interact with application database bundles?
-7. Should deterministic Lua functions ever be allowed in generated columns,
-   CHECK constraints, or expression indexes?
-8. How should Lua extension execution work in future WASM/browser builds?
-9. What is the minimum C ABI surface required before higher-level bindings can
-   expose extension lifecycle APIs?
-10. Should extension packages support signed manifests in v1 or defer signing to
-    the application bundle format?
+The original open questions for this spec are resolved for the 2.6.0 v1
+implementation by ADR 0169-0173.
+
+Resolved decisions:
+
+1. Runtime binding and build flags: ADR 0169 selects Lua 5.4 through `mlua`
+   with vendored Lua for native builds.
+2. Release packaging: ADR 0169 includes Lua extension support in official
+   native 2.6.0 artifacts by default, preserves a no-Lua build path for
+   embedders, and makes wasm/browser execution unsupported with stable errors
+   until a later browser ADR.
+3. Package persistence: ADR 0170 stores canonical manifest/source/hash metadata
+   in database-owned internal catalog storage in the main database file. No
+   sidecar source store is used in v1.
+4. SQL syntax and trust: ADR 0170 makes `CREATE EXTENSION name` transactional
+   enablement for an already installed package. SQL does not load extension
+   packages from filesystem paths, and execution still requires a connection
+   name/hash allowlist.
+5. Lifecycle split: ADR 0170 keeps package install and purge as administrative
+   CLI/API operations while `CREATE EXTENSION` and `DROP EXTENSION` handle
+   database enablement.
+6. Bundle interaction: ADR 0170 keeps package content in the database-owned
+   catalog so future bundle/support-artifact work can include extension records
+   through existing database inspection rather than chasing sidecars.
+7. Persisted schema expressions: ADR 0171 and ADR 0173 reject Lua functions in
+   generated columns, CHECK constraints, DEFAULT expressions, expression
+   indexes, partial indexes, and other persisted schema expressions in v1.
+8. WASM/browser behavior: ADR 0169 defers browser Lua execution and requires
+   stable unsupported-capability behavior.
+9. C ABI minimum surface: ADR 0172 accepts JSON lifecycle entry points plus
+   connection allowlist configuration as the v1 ABI baseline.
+10. Signatures: ADR 0170 defers signed packages and uses exact content hashes
+    plus explicit allowlists as the v1 trust mechanism.
+
+Remaining follow-ups after v1:
+
+- table-valued functions, including row streaming/materialization, lateral
+  behavior, cancellation, and row limits
+- aggregate functions, including aggregate state representation, memory limits,
+  and error behavior
+- Lua-backed collations, including persisted index participation and rebuild
+  semantics
+- persisted schema expression support with extension dependency tracking
+- browser/wasm Lua execution and package delivery
+- signed package manifests and bundle-level trust chains
+- typed C ABI structs after the JSON bridge has stabilized
 
 ---
 
@@ -1286,5 +1350,10 @@ SELECT tax_amount(subtotal, tax_rate) FROM invoices;
 - Lua 5.4 Reference Manual: https://www.lua.org/manual/5.4/
 - `design/adr/0111-table-valued-functions.md`
 - `design/adr/0118-rust-ffi-panic-safety.md`
+- `design/adr/0169-lua-extension-runtime-dependency-and-sandbox.md`
+- `design/adr/0170-lua-extension-package-catalog-and-trust.md`
+- `design/adr/0171-lua-extension-sql-type-and-planner-contract.md`
+- `design/adr/0172-lua-extension-cli-c-abi-and-binding-contract.md`
+- `design/adr/0173-lua-extension-function-kind-phasing.md`
 - `design/WIN_ADVANCED_SQL_COMPATIBILITY_SURFACE.md`
 - `design/FUTURE_WINS.md`

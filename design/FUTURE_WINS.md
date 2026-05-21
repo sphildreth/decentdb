@@ -74,25 +74,35 @@ Status values:
 - `IN PROGRESS`: active implementation or design work is underway right now.
 - `BACKLOG`: valuable, but not part of the near-term implementation path.
 
-Future version values are planning buckets, not release commitments.
+Future version values are planning buckets, not release commitments. While the
+current unreleased work branch is `2.6.0` and the latest public release is
+`2.5.1`, `vNext` means the active `2.6.0` branch. Use `vNext` only for
+remaining work intentionally accepted into the current release scope. `vNext+1`
+means the first feature bucket after `2.6.0`; `vNext+2` is the next follow-on
+bucket. These are planning labels, not exact semantic versions.
 
 Roadmap lifecycle: once a Future Win is 100% implemented, tested, and
 documented, remove it from this roadmap. Completed and delivered work is no
 longer a Future Win. Keep only a concise `Delivered Context` entry when the
 shipped foundation affects follow-on roadmap decisions.
 
+Current `2.6.0` scope decision: Lua extension runtime and package model is the
+only remaining Future Win accepted as a `vNext` implementation candidate. All
+other remaining Future Wins should move to a post-2.6 feature bucket unless
+release scope is explicitly reopened again.
+
 | Priority | Future Version | Status | Feature | Current Source Of Truth | Why This Rank |
 |---:|---|---|---|---|---|
-| 1 | vNext+2 | TODO | Local data security: TDE, policies, masking, audit context | Needs ADR/spec | TDE is table stakes for SQLCipher-style onboarding; policy is the differentiated regulated/offline story |
-| 2 | vNext+2 | TODO | Lua extension runtime and package model | [`WIN_LUA_EXTENSION_RUNTIME_SPEC.md`](WIN_LUA_EXTENSION_RUNTIME_SPEC.md) | One sandboxed extension language is supportable across native, mobile, and WASM targets |
-| 3 | vNext+3 | TODO | Full-text search with BM25 ranking | Needs ADR/spec | Expected by app databases and a real SQLite FTS migration blocker |
-| 4 | vNext+3 | TODO | Cross-process WAL coordination | Needs ADR/spec | Important for Electron/Tauri, helper processes, CLI coexistence, and background sync workers |
-| 5 | vNext+3 | TODO | Runtime tracing, advisors, and Doctor integration | Needs ADR/spec; follows shipped operational metrics | Adds slow-query/lock-wait history, index usage, doctor findings, and advisor surfaces once the metrics contract is stable |
-| 6 | vNext+3 | BACKLOG | Branch-aware migration rehearsal and promotion | ADR 0153-0159 and branch CLI/API docs; needs ADR/spec | More distinctive than generic online migration and uses shipped branch/diff foundations |
-| 7 | vNext+3 | BACKLOG | Agent and tooling integration mode | [`STABLE_TOOLING_METADATA_CONTRACT.md`](STABLE_TOOLING_METADATA_CONTRACT.md); needs ADR/spec | Makes the "agent-friendly" promise concrete without putting LLM behavior in the engine |
-| 8 | vNext+3 | BACKLOG | Application and support bundle format | Needs ADR/spec | Useful portable artifact and diagnostics story, but not more urgent than runtime friction |
-| 9 | vNext+3 | BACKLOG | Incrementally maintained projections | Needs ADR/spec | Accelerates dashboards, local read models, and reactive query workloads |
-| 10 | vNext+3 | BACKLOG | JSONB binary storage | Needs ADR/spec | Important for JSON-heavy workloads, but less urgent than FTS and runtime fundamentals |
+| 1 | vNext+1 | TODO | Local data security: TDE, policies, masking, audit context | Needs ADR/spec | TDE is table stakes for SQLCipher-style onboarding; policy is the differentiated regulated/offline story |
+| 2 | vNext | IN PROGRESS | Lua extension runtime and package model | [`WIN_LUA_EXTENSION_RUNTIME_SPEC.md`](WIN_LUA_EXTENSION_RUNTIME_SPEC.md); ADR 0169-0173 | One sandboxed extension language is supportable across native, mobile, and WASM targets |
+| 3 | vNext+2 | TODO | Full-text search with BM25 ranking | Needs ADR/spec | Expected by app databases and a real SQLite FTS migration blocker |
+| 4 | vNext+2 | TODO | Cross-process WAL coordination | Needs ADR/spec | Important for Electron/Tauri, helper processes, CLI coexistence, and background sync workers |
+| 5 | vNext+2 | TODO | Runtime tracing, advisors, and Doctor integration | Needs ADR/spec; follows shipped operational metrics | Adds slow-query/lock-wait history, index usage, doctor findings, and advisor surfaces once the metrics contract is stable |
+| 6 | Later | BACKLOG | Branch-aware migration rehearsal and promotion | ADR 0153-0159 and branch CLI/API docs; needs ADR/spec | More distinctive than generic online migration and uses shipped branch/diff foundations |
+| 7 | Later | BACKLOG | Agent and tooling integration mode | [`STABLE_TOOLING_METADATA_CONTRACT.md`](STABLE_TOOLING_METADATA_CONTRACT.md); needs ADR/spec | Makes the "agent-friendly" promise concrete without putting LLM behavior in the engine |
+| 8 | Later | BACKLOG | Application and support bundle format | Needs ADR/spec | Useful portable artifact and diagnostics story, but not more urgent than runtime friction |
+| 9 | Later | BACKLOG | Incrementally maintained projections | Needs ADR/spec | Accelerates dashboards, local read models, and reactive query workloads |
+| 10 | Later | BACKLOG | JSONB binary storage | Needs ADR/spec | Important for JSON-heavy workloads, but less urgent than FTS and runtime fundamentals |
 | 11 | Later | BACKLOG | Native vector / HNSW index | Needs ADR/spec | Valuable for offline AI/RAG, but less universal than FTS and security |
 | 12 | Later | BACKLOG | Temporal row history and auditable state | Needs ADR/spec | Strong regulated/support workflow, but should follow security and sync hardening |
 | 13 | Later | BACKLOG | Advanced geospatial semantics and analytics | ADR 0128 deferred work; needs follow-up ADR/spec | Builds on shipped spatial support without implying the foundation is unfinished |
@@ -145,7 +155,7 @@ server database.
 
 **Status:** `TODO`
 
-**Future Version:** vNext+2
+**Future Version:** vNext+1
 
 **Source of truth:** Needs ADR/spec before implementation.
 
@@ -188,11 +198,16 @@ CREATE MASK ssn_mask
 
 ## 2. Lua Extension Runtime And Package Model
 
-**Status:** `TODO`
+**Status:** `IN PROGRESS`
 
-**Future Version:** vNext+2
+**Future Version:** vNext
 
-**Source of truth:** [`WIN_LUA_EXTENSION_RUNTIME_SPEC.md`](WIN_LUA_EXTENSION_RUNTIME_SPEC.md)
+**Source of truth:** [`WIN_LUA_EXTENSION_RUNTIME_SPEC.md`](WIN_LUA_EXTENSION_RUNTIME_SPEC.md);
+[ADR 0169](adr/0169-lua-extension-runtime-dependency-and-sandbox.md),
+[ADR 0170](adr/0170-lua-extension-package-catalog-and-trust.md),
+[ADR 0171](adr/0171-lua-extension-sql-type-and-planner-contract.md),
+[ADR 0172](adr/0172-lua-extension-cli-c-abi-and-binding-contract.md), and
+[ADR 0173](adr/0173-lua-extension-function-kind-phasing.md).
 
 ### Why This Matters
 
@@ -213,7 +228,7 @@ systems or unbounded native plugins.
 - no auto-running extension code when an untrusted database is opened
 - scalar functions first
 - DecentDB-owned typed wrappers for `DECIMAL`, `UUID`, date/time, `BLOB`, JSON,
-  and spatial values
+  and later rich-type expansion
 - table-valued functions, aggregates, and collations in later slices
 - CLI and binding APIs for validate, install, list, enable, disable, and test
 
@@ -232,7 +247,7 @@ systems or unbounded native plugins.
 
 **Status:** `TODO`
 
-**Future Version:** vNext+3
+**Future Version:** vNext+2
 
 **Source of truth:** Needs ADR/spec before implementation.
 
@@ -265,7 +280,7 @@ tokenization, phrase search, and ranking.
 
 **Status:** `TODO`
 
-**Future Version:** vNext+3
+**Future Version:** vNext+2
 
 **Source of truth:** Needs ADR/spec before implementation.
 
@@ -295,7 +310,7 @@ coexistence, and background sync workers.
 
 **Status:** `TODO`
 
-**Future Version:** vNext+3
+**Future Version:** vNext+2
 
 **Source of truth:** Needs ADR/spec. Follows the shipped operational metrics
 contract.
@@ -348,7 +363,7 @@ SELECT * FROM sys.doctor_findings;
 
 **Status:** `BACKLOG`
 
-**Future Version:** vNext+3
+**Future Version:** Later
 
 **Source of truth:** ADR 0153-0159 and branch CLI/API docs; needs ADR/spec
 before implementation.
@@ -379,7 +394,7 @@ safe workflow: branch, migrate, validate, diff, detect drift, and promote.
 
 **Status:** `BACKLOG`
 
-**Future Version:** vNext+3
+**Future Version:** Later
 
 **Source of truth:** [`STABLE_TOOLING_METADATA_CONTRACT.md`](STABLE_TOOLING_METADATA_CONTRACT.md);
 needs ADR/spec.
@@ -414,7 +429,7 @@ guessing.
 
 **Status:** `BACKLOG`
 
-**Future Version:** vNext+3
+**Future Version:** Later
 
 **Source of truth:** Needs ADR/spec before implementation.
 
@@ -449,7 +464,7 @@ A DecentDB bundle may contain:
 
 **Status:** `BACKLOG`
 
-**Future Version:** vNext+3
+**Future Version:** Later
 
 **Source of truth:** Needs ADR/spec before implementation.
 
@@ -478,7 +493,7 @@ database-native capability that also accelerates reactive queries.
 
 **Status:** `BACKLOG`
 
-**Future Version:** vNext+3
+**Future Version:** Later
 
 **Source of truth:** Needs ADR/spec before implementation.
 
@@ -677,18 +692,24 @@ performance, and operational foundations.
 
 ## Near-Term Sequence
 
-1. Protect the completed concurrent write queue plus strict durable group commit
-   with docs, metrics, and benchmark guardrails.
-2. Build on the completed ADR 0163 operational `sys.*` metrics contract when
-   designing runtime tracing, advisors, and Doctor integration.
-3. Design reactive subscriptions around committed-state invalidation and binding
-   APIs.
-4. Design production browser and sync follow-ons together so browser transport,
-   multi-tab ownership, relay shape, and changeset APIs do not conflict.
-5. Advance local data security and Lua extension work after the runtime
-   foundations above are underway.
-6. Return to runtime tracing, advisors, and Doctor integration after the
-   low-overhead metrics contract is stable and hot-path overhead is benchmarked.
+1. Complete the ADR-backed Lua extension v1 scope as the final accepted 2.6.0
+   Future Win implementation: package lifecycle, trust, sandboxed scalar
+   functions, strict types, CLI/C ABI/binding surface, docs, and examples.
+2. Stabilize and release the current 2.6.0 foundations before adding any other
+   Future Win implementation to the branch.
+3. Write the local data security ADR/spec first because TDE, key management,
+   policy semantics, masking, audit context, sync, branches, and backups all
+   need one coherent boundary.
+4. Draft the full-text search ADR/spec and benchmark targets so BM25, phrase
+   search, tokenization, recovery, and planner integration are designed before
+   storage/index code lands.
+5. Design cross-process WAL coordination with Electron/Tauri, CLI coexistence,
+   background workers, browser ownership, and crash/stale-owner diagnostics in
+   one portability-aware plan.
+6. Extend shipped `sys.*` metrics into opt-in tracing, advisors, and Doctor
+   integration once the hot-path overhead budget is explicit.
+7. Promote backlog items into TODO only after the top adoption blockers have
+   ADR/spec coverage or active implementation ownership.
 
 ## Market Notes
 
