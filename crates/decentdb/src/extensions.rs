@@ -1986,6 +1986,7 @@ mod lua_support {
         .map_err(lua_err)?;
         lua.set_memory_limit(package.manifest.runtime.max_memory_bytes)
             .map_err(lua_err)?;
+        disable_lua_random(&lua)?;
         let steps = Arc::new(AtomicU64::new(0));
         let limit = max_steps.max(1);
         let hook_steps = Arc::clone(&steps);
@@ -2007,6 +2008,23 @@ mod lua_support {
         .map_err(lua_err)?;
         install_ddb_namespace(&lua)?;
         Ok(lua)
+    }
+
+    fn disable_lua_random(lua: &Lua) -> Result<()> {
+        let math = lua.globals().get::<Table>("math").map_err(lua_err)?;
+        for name in ["random", "randomseed"] {
+            math.set(
+                name,
+                lua.create_function(|_, _: MultiValue| -> mlua::Result<LuaValue> {
+                    Err(LuaError::RuntimeError(
+                        "math.random is disabled in the DecentDB Lua sandbox".to_string(),
+                    ))
+                })
+                .map_err(lua_err)?,
+            )
+            .map_err(lua_err)?;
+        }
+        Ok(())
     }
 
     fn install_ddb_namespace(lua: &Lua) -> Result<()> {

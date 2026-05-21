@@ -10806,6 +10806,9 @@ impl EngineRuntime {
         {
             return Ok(None);
         }
+        if select_requires_grouped_evaluation(self, select)? {
+            return Ok(None);
+        }
         if select.distinct
             && (!query.order_by.is_empty() || query.limit.is_some() || query.offset.is_some())
         {
@@ -18371,7 +18374,6 @@ fn select_requires_grouped_evaluation(runtime: &EngineRuntime, select: &Select) 
     }
     projection_has_runtime_extension_aggregate_items(runtime, &select.projection).and_then(
         |has_projection_aggregate| {
-            eprintln!("has_projection_aggregate={has_projection_aggregate}");
             if has_projection_aggregate {
                 return Ok(true);
             }
@@ -25099,7 +25101,15 @@ impl EngineRuntime {
                 Ok(Value::Bool(if *negated { !is_null } else { is_null }))
             }
             Expr::Function { name, args } => {
-                if !args.iter().any(expr_contains_aggregate) {
+                let args_contain_aggregate = args.iter().any(expr_contains_aggregate)
+                    || args.iter().try_fold(false, |found, arg| {
+                        if found {
+                            Ok(true)
+                        } else {
+                            expr_contains_runtime_extension_aggregate(self, arg)
+                        }
+                    })?;
+                if !args_contain_aggregate {
                     let mut arg_rows = Vec::with_capacity(group_row_indexes.len());
                     for row_index in group_row_indexes {
                         let row = dataset

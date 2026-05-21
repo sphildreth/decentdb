@@ -24,6 +24,21 @@ DecentDB does not support SQLite-style `.load`, native modules, filesystem
 access, network access, process execution, direct database handles inside Lua,
 or database writes from extension code.
 
+## Getting Started
+
+The shortest development loop is:
+
+1. Create a package directory with `decentdb-extension.toml`, `main.lua`, and
+   optional `tests/behavior.sql`.
+2. Declare every SQL-visible object in the manifest.
+3. Return a Lua table from `main.lua` with matching exports.
+4. Run `decentdb extension test ./text_tools --allow-unsigned` while editing
+   the local unsigned package.
+5. Install and enable the package in a database.
+6. Open application connections with either an exact
+   `--allow-extension name@sha256:<hash>` allowlist or, for local development
+   only, `--allow-unsigned-extensions`.
+
 ## Package Layout
 
 The repository includes a complete example package at
@@ -36,7 +51,6 @@ text_tools/
   main.lua
   tests/
     behavior.sql
-  README.md
 ```
 
 `decentdb-extension.toml` is the contract. Lua source cannot add SQL-visible
@@ -97,7 +111,7 @@ args = ["INT64"]
 returns = "INT64"
 step = "lua_sum_step"
 finalize = "lua_sum_final"
-null_handling = "returns_null"
+null_handling = "called_on_null"
 
 [[functions]]
 name = "reverse_text"
@@ -105,6 +119,34 @@ export = "reverse_text"
 kind = "collation"
 deterministic = true
 ```
+
+Top-level manifest fields:
+
+| Field | Meaning |
+|---|---|
+| `name` | SQL extension name. It must be a valid DecentDB identifier. |
+| `version` | Package author's version string. DecentDB stores it for inspection and lifecycle output. |
+| `language` | Must be `lua` in DecentDB 2.6.0. |
+| `api_version` | Must equal DecentDB's supported extension API version. 2.6.0 supports API version `1`; mismatches fail validation and install. |
+| `entry` | Lua file loaded as the package entry module. It must return a table of exports. |
+| `strict_types` | Must be `true` in 2.6.0. DecentDB validates arguments and results against manifest-declared SQL types instead of allowing Lua-side implicit coercion. |
+
+All permission fields must remain `false` in DecentDB 2.6.0. A package that
+requests filesystem, network, process, database, native-module, clock, or random
+permissions fails validation before any Lua code runs.
+
+Runtime limit fields are optional. If omitted, DecentDB applies these defaults:
+
+| Field | Default |
+|---|---:|
+| `max_steps` | `100000` |
+| `max_memory_bytes` | `4194304` |
+| `max_string_bytes` | `1048576` |
+| `max_blob_bytes` | `1048576` |
+| `max_rows` | `10000` |
+| `max_row_bytes` | `65536` |
+| `max_aggregate_state_bytes` | `1048576` |
+| `max_collation_steps` | `10000` |
 
 Supported manifest function kinds are:
 
@@ -114,6 +156,34 @@ Supported manifest function kinds are:
 | `table` | `SELECT word FROM split_words(body)` |
 | `aggregate` | `SELECT lua_sum(amount) FROM invoices` |
 | `collation` | `ORDER BY title COLLATE reverse_text` |
+
+Every function may declare at most one volatility marker:
+
+```toml
+deterministic = true
+stable = true
+volatile = true
+```
+
+Use `deterministic = true` when equal arguments always produce equal results.
+Use `stable = true` for behavior that should be treated as stable for a
+statement or package revision but not necessarily timeless. Use
+`volatile = true` for behavior that can change from call to call. In 2.6.0
+these markers are validation and inspection metadata; they do not make Lua
+functions eligible for persisted generated columns or persisted index keys.
+
+Packages can also declare package-level dependencies:
+
+```toml
+[[dependencies]]
+name = "text_core"
+version = "1.2.0"
+content_hash = "sha256:..."
+```
+
+`version` and `content_hash` are optional metadata fields. DecentDB stores this
+dependency metadata for inspection; dependency resolution and package download
+remain application/package-manager responsibilities.
 
 ## Lua Entry Module
 
@@ -160,11 +230,32 @@ small `ddb` namespace for strict typed wrappers. Denied Lua libraries include
 `io`, `os`, `debug`, unrestricted `require`, `dofile`, `loadfile`, and native
 module loading.
 
+`math.random` and `math.randomseed` are disabled. They raise Lua runtime errors
+because `permissions.random = true` is rejected in the 2.6.0 sandbox.
+
+The `ddb` namespace includes:
+
+| Helper | Purpose |
+|---|---|
+| `ddb.null()` | Return SQL `NULL`. |
+| `ddb.text(value)`, `ddb.bool(value)`, `ddb.int64(value)`, `ddb.float64(value)` | Return primitive SQL values with explicit intent. |
+| `ddb.decimal(value)`, `ddb.uuid(value)`, `ddb.date(value)`, `ddb.timestamp(value)`, `ddb.blob(value)`, `ddb.json(value)` | Return typed wrapper values for strict SQL conversion. |
+| `ddb.blob_hex(value)`, `ddb.blob_base64(value)` | Return BLOB wrapper values from encoded text. |
+| `ddb.type_of(value)` | Return the Lua/DecentDB wrapper type name. |
+| `ddb.is_null(value)`, `ddb.is_text(value)`, `ddb.is_bool(value)`, `ddb.is_int64(value)`, `ddb.is_float64(value)` | Test primitive values. |
+| `ddb.is_decimal(value)`, `ddb.is_uuid(value)`, `ddb.is_date(value)`, `ddb.is_timestamp(value)`, `ddb.is_blob(value)`, `ddb.is_json(value)` | Test DecentDB wrapper values. |
+
+Decimal wrappers expose `to_string()`, `add(...)`, `sub(...)`, `mul(...)`,
+`div(...)`, and `cmp(...)` methods. BLOB wrappers expose `len()` and
+`to_string()`.
+
 ## Behavior Test Example
 
 `decentdb extension test` looks for `tests/behavior.sql` in the package
 directory. Use that file for smoke tests that exercise every exported SQL
 object before installing the package into an application database.
+Lua-native test files such as `tests/main_test.lua` are not executed by the
+2.6.0 CLI.
 
 ```sql
 CREATE TABLE words(name TEXT);
@@ -252,9 +343,15 @@ end
 `null_handling = "returns_null"` skips scalar Lua execution when any argument
 is `NULL` and returns SQL `NULL`. `null_handling = "called_on_null"` passes Lua
 `nil`. `null_handling = "rejects_null"` raises a SQL error before Lua runs.
+For aggregates, `returns_null` skips the `step` call for rows whose aggregate
+arguments contain `NULL`, but `finalize` still runs once for the aggregate
+group. Use `called_on_null` when the aggregate `step` function needs to see
+`nil` values.
 
 Table-valued functions return an array-like Lua table of row tables. Every
 output column must be declared statically in the manifest.
+Column `nullable` defaults to `true`; set `nullable = false` when `nil` should
+fail result conversion instead of becoming SQL `NULL`.
 
 ```toml
 [[functions]]
@@ -266,10 +363,12 @@ args = ["TEXT"]
 [[functions.columns]]
 name = "key"
 type = "TEXT"
+nullable = false
 
 [[functions.columns]]
 name = "value"
 type = "TEXT"
+nullable = true
 ```
 
 ```lua
@@ -319,6 +418,9 @@ end
 ```
 
 Collations receive two text values and must return `-1`, `0`, or `1`.
+Collation manifests must not declare `args` or `returns`; DecentDB supplies the
+two text arguments implicitly. `export` is optional for all function kinds and
+defaults to `name`.
 
 ```toml
 [[functions]]
@@ -339,6 +441,13 @@ end
 ```
 
 ## CLI Lifecycle
+
+There are two unsigned-development flags with different scopes:
+
+| Context | Flag | Meaning |
+|---|---|---|
+| `extension validate`, `extension install`, `extension test` | `--allow-unsigned` | Allows validation/install/test of an unsigned package artifact. It does not by itself grant future SQL execution on other connections. |
+| `exec`, `repl` | `--allow-unsigned-extensions` | Allows the current database connection to execute installed unsigned extension packages without an exact hash allowlist. Use only for local development. |
 
 Validate a local package:
 
@@ -364,6 +473,14 @@ decentdb exec \
   --sql "SELECT slugify('Hello, DecentDB')"
 ```
 
+The REPL uses the same connection-level trust flags:
+
+```bash
+decentdb repl \
+  --db app.ddb \
+  --allow-extension text_tools@sha256:7b3f...
+```
+
 For local package development only, `--allow-unsigned-extensions` allows the
 current connection to execute installed unsigned packages without a hash
 allowlist. Do not use it for untrusted databases or production applications.
@@ -379,6 +496,13 @@ decentdb extension purge --db app.ddb text_tools --confirm
 decentdb extension dependencies --db app.ddb
 decentdb extension rebuild --db app.ddb text_tools
 ```
+
+`extension rebuild` currently reports recorded persisted objects that depend on
+the named extension. Because DecentDB 2.6.0 rejects persisted Lua-backed
+collations, generated columns, and indexes, this command normally reports an
+empty set. It is present so package upgrades and future persisted-object
+compatibility have an explicit inspection/rebuild surface instead of silently
+using stale executable-code dependencies.
 
 JSON output is useful for packaging automation:
 
@@ -472,6 +596,18 @@ CREATE INDEX words_name_reverse ON words(name COLLATE reverse_text);
 
 Internal extension catalog tables are hidden from ordinary schema listings.
 
+## Error Behavior
+
+Validation errors fail `extension validate`, `extension install`, and package
+tests before Lua code runs. Execution-time failures are SQL errors, not panics:
+type mismatches, missing exports, missing connection trust, Lua runtime errors,
+table-row conversion errors, aggregate state limit errors, invalid collation
+return values, and invalid return conversions all abort the current statement.
+
+Error messages include the extension subsystem context and, for conversion
+errors, the SQL object or manifest return type involved. Host panics, process
+internals, and raw database handles are not exposed to Lua code.
+
 ## Rust API
 
 ```rust
@@ -497,6 +633,18 @@ db.extensions().install_with_options(
 )?;
 db.extensions().enable("text_tools")?;
 # Ok::<(), decentdb::DbError>(())
+```
+
+For signed packages, include the Ed25519 key id and public key in the trust
+anchor:
+
+```rust
+config.extension_trust_anchors.push(ExtensionTrustAnchor::with_public_key(
+    "text_tools",
+    "sha256:7b3f...",
+    "release-2026-05",
+    "base64:PUBLIC_KEY",
+));
 ```
 
 List installed packages and inspect dependencies:

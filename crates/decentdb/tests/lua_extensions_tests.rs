@@ -51,7 +51,15 @@ args = ["INT64"]
 returns = "INT64"
 step = "lua_sum_step"
 finalize = "lua_sum_final"
-null_handling = "returns_null"
+null_handling = "called_on_null"
+
+[[functions]]
+name = "random_value"
+export = "random_value"
+kind = "scalar"
+args = []
+returns = "FLOAT64"
+volatile = true
 
 [[functions]]
 name = "rev"
@@ -88,6 +96,10 @@ end
 
 function M.lua_sum_final(state)
   return state or 0
+end
+
+function M.random_value()
+  return math.random()
 end
 
 function M.rev(left, right)
@@ -145,6 +157,11 @@ fn lua_extension_lifecycle_and_sql_invocation() {
         scalar.rows()[0].values(),
         &[Value::Text("hello-world".to_string())]
     );
+
+    let random_error = db
+        .execute("SELECT random_value()")
+        .expect_err("math.random should be disabled");
+    assert!(random_error.to_string().contains("math.random is disabled"));
 
     let table = db
         .execute("SELECT word FROM split_words('a bb c')")
