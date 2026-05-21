@@ -2,8 +2,9 @@
 ///
 /// Run from the repository root:
 ///   cargo build -p decentdb
-///   cd bindings/dart/dart
-///   DECENTDB_NATIVE_LIB=../../../target/debug/libdecentdb.so dart run ../examples/console/main.dart
+///   cd bindings/dart/examples/console
+///   dart pub get
+///   DECENTDB_NATIVE_LIB=../../../../target/debug/libdecentdb.so dart run main.dart
 import 'dart:io';
 
 import 'package:decentdb/decentdb.dart';
@@ -47,12 +48,22 @@ void main() {
   final insert = db.prepare(r'INSERT INTO users VALUES ($1, $2, $3, $4, $5)');
   try {
     db.transaction(() {
-      insert.executeBatchTyped('ittfb', [
-        [1, 'Alice', 'alice@example.com', 95.5, true],
-        [2, 'Bob', 'bob@example.com', 87.3, true],
-        [3, 'Charlie', 'charlie@example.com', 72.1, false],
-        [4, 'Diana', 'diana@example.com', 91.8, true],
-      ]);
+      for (final row in [
+        (1, 'Alice', 'alice@example.com', 95.5, true),
+        (2, 'Bob', 'bob@example.com', 87.3, true),
+        (3, 'Charlie', 'charlie@example.com', 72.1, false),
+        (4, 'Diana', 'diana@example.com', 91.8, true),
+      ]) {
+        insert
+          ..reset()
+          ..clearBindings()
+          ..bindInt64(1, row.$1)
+          ..bindText(2, row.$2)
+          ..bindText(3, row.$3)
+          ..bindFloat64(4, row.$4)
+          ..bindBool(5, row.$5)
+          ..execute();
+      }
     });
   } finally {
     insert.dispose();

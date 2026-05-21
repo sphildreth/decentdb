@@ -564,6 +564,28 @@ See [Branching, Diff, Restore, And Time Travel](../user-guide/branching.md)
 and [CLI Reference](cli-reference.md#branch) for command semantics and safety
 rules.
 
+For typed branch-local SQL execution, use `ddb_db_execute_on_branch`. It
+returns the same owned `ddb_result_t` shape as `ddb_db_execute`, so callers read
+columns, rows, values, and affected-row counts through the normal result
+accessors and release the handle with `ddb_result_free`:
+
+```c
+ddb_result_t *result = NULL;
+ddb_value_t params[1] = {0};
+params[0].tag = DDB_VALUE_INT64;
+params[0].int64_value = 42;
+
+check(ddb_db_execute_on_branch(
+          db,
+          "work",
+          "SELECT id, name FROM items WHERE id = $1",
+          params,
+          1,
+          &result),
+      "query branch");
+check(ddb_result_free(&result), "free branch result");
+```
+
 ## C++ Usage
 
 C++ code can include `decentdb.h` directly:

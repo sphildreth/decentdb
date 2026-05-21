@@ -36,6 +36,10 @@ idiomatic Dart API for desktop and CLI applications.
   `SchemaIndexInfo`, `SchemaTriggerInfo`, `SchemaCheckConstraintInfo`)
 - Stable tooling metadata and query contracts via `Schema.getToolingMetadata()`
   and `Schema.describeQueryContract(sql)`
+- Native branch and named-snapshot workflows via `Database.branchWorkflow`,
+  including snapshot list/create/delete, branch list/create/delete/rename,
+  branch commit/log/diff/restore/merge, and branch-local SQL execution/query
+  with typed positional parameters
 - `ErrorCode.fromCode` throws `StateError` on unrecognised codes
 - `sqlite3` moved to `dev_dependencies` (only used by the benchmark)
 
@@ -161,6 +165,36 @@ Semantic result values decode to Dart-native shapes:
 - `DATE`, `TIMESTAMPTZ` -> UTC `DateTime`
 - `TIME` -> `Duration`
 - `INTERVAL` -> `DecentDBIntervalValue(months, days, microseconds)`
+
+## Branch and snapshot workflow
+
+```dart
+final workflow = db.branchWorkflow;
+
+final baseline = workflow.createSnapshot('baseline');
+final branch = workflow.createBranch('scratch', from: baseline.name);
+
+workflow.executeSql(
+  branch.name,
+  r'INSERT INTO users VALUES ($1, $2)',
+  [3, 'Carol'],
+);
+
+final page = workflow.querySql(
+  branch.name,
+  'SELECT id, name FROM users ORDER BY id',
+  pageSize: 100,
+);
+for (final row in page.rows) {
+  print('${row['id']}: ${row['name']}');
+}
+
+final diff = workflow.diff('main', branch.name);
+print('Changed rows: ${diff.addedRowCount + diff.updatedRowCount + diff.deletedRowCount}');
+
+final mergePreview = workflow.merge(branch.name, 'main', dryRun: true);
+print('Merge clean: ${mergePreview.clean}');
+```
 
 ## Schema metadata
 

@@ -265,6 +265,78 @@ The snapshot model includes:
 
 All collections are deterministically ordered by name.
 
+## Branch and snapshot workflow
+
+`Database.branchWorkflow` exposes native named-snapshot and branch workflows
+through the stable C ABI. Branch-local SQL can target `main` or any named branch
+and supports typed positional parameters.
+
+```dart
+final workflow = db.branchWorkflow;
+
+final baseline = workflow.createSnapshot('baseline');
+final scratch = workflow.createBranch('scratch', from: baseline.name);
+
+final write = workflow.executeSql(
+  scratch.name,
+  r'INSERT INTO users VALUES ($1, $2)',
+  [3, 'Carol'],
+);
+print('affected=${write.affectedRows}');
+
+final page = workflow.querySql(
+  scratch.name,
+  r'SELECT id, name FROM users WHERE id >= $1 ORDER BY id',
+  params: [1],
+  pageSize: 100,
+);
+for (final row in page.rows) {
+  print("${row['id']}: ${row['name']}");
+}
+
+final diff = workflow.diff('main', scratch.name);
+print('added=${diff.addedRowCount}, updated=${diff.updatedRowCount}');
+
+final preview = workflow.merge(scratch.name, 'main', dryRun: true);
+print('clean=${preview.clean}, conflicts=${preview.conflictCount}');
+```
+
+Available operations:
+
+- `createSnapshot(name)` / `listSnapshots()` / `deleteSnapshot(name)`
+- `createBranch(name, from: ref)` / `listBranches()` / `deleteBranch(name)`
+- `renameBranch(name, newName)`
+- `commitBranch(name, message)` / `branchLog(name)`
+- `diff(leftRef, rightRef)`
+- `restore(branchName, targetRef, dryRun: true)`
+- `merge(sourceBranch, targetRef, dryRun: true)`
+- `executeSql(branchName, sql, [params])`
+- `querySql(branchName, sql, params: [...], pageSize: n)`
+
+Branch references can be `main`, a branch name, a named snapshot, or a head ID
+where the operation supports historical refs. `restore` and `merge` default to
+dry-run mode so callers can inspect the effect before mutating branch state.
+
+Branch SQL parameters support `null`, `int`, `bool`, `double`, `String`,
+`Uint8List`, `DateTime`, `DecimalValue`, and `UuidValue`. Results use the same
+`Row` and `ResultPage` shapes as normal queries; `executeSql` returns a
+`BranchExecutionResult` with `columns`, `rows`, `affectedRows`, `returnsRows`,
+and `firstPage(pageSize)`.
+
+The branch model types are:
+
+- `BranchInfo` — branch identity, current/base head IDs, timestamps, and
+  `isMain`
+- `NamedSnapshot` — retained snapshot identity, source branch/head, LSN, and
+  timestamp
+- `BranchLogEntry` — head history entries with parent head, optional message,
+  optional SQL, and timestamp
+- `BranchDiffReport`, `BranchTableDiff`, and `BranchRowDiff` — row-level
+  primary-key diff summaries
+- `BranchRestoreReport` — dry-run or applied restore summary
+- `BranchMergeReport`, `BranchMergeChange`, and `BranchMergeConflict` — merge
+  preview/application summaries and conflict details
+
 ## WAL maintenance
 
 ```dart

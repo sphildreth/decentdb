@@ -4,6 +4,7 @@ import 'dart:ffi';
 
 import 'package:ffi/ffi.dart';
 
+import 'branch.dart';
 import 'errors.dart';
 import 'native_bindings.dart';
 import 'schema.dart';
@@ -585,6 +586,12 @@ class Database {
   Schema get schema {
     _checkOpen();
     return Schema.fromNative(_bindings, _dbPtr!);
+  }
+
+  /// Access native branch and named-snapshot workflow operations.
+  BranchWorkflow get branchWorkflow {
+    _checkOpen();
+    return BranchWorkflow.fromNative(_bindings, _dbPtr!);
   }
 
   // ---------------------------------------------------------------------------

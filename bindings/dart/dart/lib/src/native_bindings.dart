@@ -3,7 +3,7 @@ import 'dart:io' show Platform;
 
 import 'package:ffi/ffi.dart';
 
-const int expectedAbiVersion = 4;
+const int expectedAbiVersion = 5;
 const int ddbOk = 0;
 const int ddbWriteQueueTimeoutDefault = 0xFFFFFFFFFFFFFFFF;
 const int ddbTagNull = 0;
@@ -304,6 +304,23 @@ typedef _DbExecuteDart = int Function(
   Pointer<Pointer<DdbResult>> outResult,
 );
 
+typedef _DbExecuteOnBranchC = Uint32 Function(
+  Pointer<DdbDb> db,
+  Pointer<Utf8> branchName,
+  Pointer<Utf8> sql,
+  Pointer<DdbValue> params,
+  IntPtr paramsLen,
+  Pointer<Pointer<DdbResult>> outResult,
+);
+typedef _DbExecuteOnBranchDart = int Function(
+  Pointer<DdbDb> db,
+  Pointer<Utf8> branchName,
+  Pointer<Utf8> sql,
+  Pointer<DdbValue> params,
+  int paramsLen,
+  Pointer<Pointer<DdbResult>> outResult,
+);
+
 typedef _DbExecuteQueuedC = Uint32 Function(
   Pointer<DdbDb> db,
   Pointer<Utf8> sql,
@@ -378,6 +395,17 @@ typedef _DbStringOutC = Uint32 Function(
 typedef _DbStringOutDart = int Function(
   Pointer<DdbDb> db,
   Pointer<Pointer<Utf8>> outValue,
+);
+
+typedef _DbJsonRequestC = Uint32 Function(
+  Pointer<DdbDb> db,
+  Pointer<Utf8> requestJson,
+  Pointer<Pointer<Utf8>> outJson,
+);
+typedef _DbJsonRequestDart = int Function(
+  Pointer<DdbDb> db,
+  Pointer<Utf8> requestJson,
+  Pointer<Pointer<Utf8>> outJson,
 );
 
 typedef _DbInspectStorageStateC = Uint32 Function(
@@ -844,6 +872,9 @@ class NativeBindings {
         dbFree = _lib.lookupFunction<_DbFreeC, _DbFreeDart>('ddb_db_free'),
         dbExecute =
             _lib.lookupFunction<_DbExecuteC, _DbExecuteDart>('ddb_db_execute'),
+        dbExecuteOnBranch =
+            _lib.lookupFunction<_DbExecuteOnBranchC, _DbExecuteOnBranchDart>(
+                'ddb_db_execute_on_branch'),
         dbExecuteQueued =
             _lib.lookupFunction<_DbExecuteQueuedC, _DbExecuteQueuedDart>(
                 'ddb_db_execute_queued'),
@@ -886,6 +917,9 @@ class NativeBindings {
         dbGetSchemaSnapshotJson =
             _lib.lookupFunction<_DbStringOutC, _DbStringOutDart>(
                 'ddb_db_get_schema_snapshot_json'),
+        dbBranchExecuteJson =
+            _lib.lookupFunction<_DbJsonRequestC, _DbJsonRequestDart>(
+                'ddb_db_branch_execute_json'),
         dbGetToolingMetadataJson =
             _lib.lookupFunction<_DbStringOutC, _DbStringOutDart>(
                 'ddb_db_get_tooling_metadata_json'),
@@ -1008,6 +1042,7 @@ class NativeBindings {
 
   // DB ops
   final _DbExecuteDart dbExecute;
+  final _DbExecuteOnBranchDart dbExecuteOnBranch;
   final _DbExecuteQueuedDart dbExecuteQueued;
   final _DbWriteQueueMetricsDart dbWriteQueueMetrics;
   final _DbPrepareDart dbPrepare;
@@ -1027,6 +1062,7 @@ class NativeBindings {
   final _DbNamedStringOutDart dbGetViewDdl;
   final _DbStringOutDart dbListTriggersJson;
   final _DbStringOutDart dbGetSchemaSnapshotJson;
+  final _DbJsonRequestDart dbBranchExecuteJson;
   final _DbStringOutDart dbGetToolingMetadataJson;
   final _DbNamedStringOutDart dbDescribeQueryJson;
   final _DbInspectStorageStateDart dbInspectStorageStateJson;

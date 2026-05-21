@@ -1612,15 +1612,15 @@ impl Db {
         let branch = crate::branch::branch_by_name(self, branch_name)?
             .ok_or_else(|| DbError::transaction(format!("unknown branch '{branch_name}'")))?;
         let read_only = self.sql_batch_is_read_only(sql)?;
-        if !read_only && !params.is_empty() {
-            return Err(DbError::transaction(
-                "branch-local writes with SQL parameters are not supported yet",
-            ));
-        }
         let branch_db = self.materialize_branch_db(&branch)?;
         let results = branch_db.execute_batch_with_params(sql, params)?;
         if !read_only {
-            crate::branch::append_branch_sql_log(self, &branch, sql)?;
+            let log_sql = if params.is_empty() {
+                sql.to_string()
+            } else {
+                expand_sql_parameters_for_branch_log(sql, params)?
+            };
+            crate::branch::append_branch_sql_log(self, &branch, &log_sql)?;
             self.refresh_named_snapshot_retention()?;
         }
         Ok(results)
@@ -13190,6 +13190,101 @@ fn split_sql_batch(sql: &str) -> Vec<String> {
     statements
 }
 
+fn expand_sql_parameters_for_branch_log(sql: &str, params: &[Value]) -> Result<String> {
+    let mut expanded = String::with_capacity(sql.len());
+    let mut chars = sql.chars().peekable();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+
+    while let Some(ch) = chars.next() {
+        if in_line_comment {
+            expanded.push(ch);
+            if ch == '\n' {
+                in_line_comment = false;
+            }
+            continue;
+        }
+
+        if in_block_comment {
+            expanded.push(ch);
+            if ch == '*' && matches!(chars.peek(), Some('/')) {
+                expanded.push(chars.next().expect("comment terminator"));
+                in_block_comment = false;
+            }
+            continue;
+        }
+
+        if in_single {
+            expanded.push(ch);
+            if ch == '\'' {
+                if matches!(chars.peek(), Some('\'')) {
+                    expanded.push(chars.next().expect("escaped quote"));
+                } else {
+                    in_single = false;
+                }
+            }
+            continue;
+        }
+
+        if in_double {
+            expanded.push(ch);
+            if ch == '"' {
+                if matches!(chars.peek(), Some('"')) {
+                    expanded.push(chars.next().expect("escaped quote"));
+                } else {
+                    in_double = false;
+                }
+            }
+            continue;
+        }
+
+        match ch {
+            '\'' => {
+                in_single = true;
+                expanded.push(ch);
+            }
+            '"' => {
+                in_double = true;
+                expanded.push(ch);
+            }
+            '-' if matches!(chars.peek(), Some('-')) => {
+                expanded.push(ch);
+                expanded.push(chars.next().expect("line comment start"));
+                in_line_comment = true;
+            }
+            '/' if matches!(chars.peek(), Some('*')) => {
+                expanded.push(ch);
+                expanded.push(chars.next().expect("block comment start"));
+                in_block_comment = true;
+            }
+            '$' if chars.peek().is_some_and(|next| next.is_ascii_digit()) => {
+                let mut digits = String::new();
+                while let Some(next) = chars.peek().copied() {
+                    if !next.is_ascii_digit() {
+                        break;
+                    }
+                    digits.push(chars.next().expect("peeked digit"));
+                }
+                let index = digits
+                    .parse::<usize>()
+                    .map_err(|_| DbError::sql(format!("invalid parameter reference: ${digits}")))?;
+                if index == 0 {
+                    return Err(DbError::sql("parameter indexes are 1-based"));
+                }
+                let value = params
+                    .get(index - 1)
+                    .ok_or_else(|| DbError::sql(format!("parameter ${index} was not provided")))?;
+                expanded.push_str(&render_branch_parameter_value_sql(value)?);
+            }
+            _ => expanded.push(ch),
+        }
+    }
+
+    Ok(expanded)
+}
+
 fn prepared_statement_sql(sql: &str) -> Result<String> {
     let statements = split_sql_batch(sql)
         .into_iter()
@@ -14497,26 +14592,7 @@ fn render_value_sql(value: &Value) -> String {
         Value::Text(value) => sql_string_literal(value),
         Value::Blob(value) => format!("X'{}'", hex_encode(value)),
         Value::Geometry(value) | Value::Geography(value) => format!("X'{}'", hex_encode(value)),
-        Value::Decimal { scaled, scale } => {
-            if *scale == 0 {
-                scaled.to_string()
-            } else {
-                let negative = *scaled < 0;
-                let digits = scaled.unsigned_abs().to_string();
-                let scale = usize::from(*scale);
-                let padded = if digits.len() <= scale {
-                    format!("{}{}", "0".repeat(scale + 1 - digits.len()), digits)
-                } else {
-                    digits
-                };
-                let split = padded.len() - scale;
-                let mut decimal = format!("{}.{}", &padded[..split], &padded[split..]);
-                if negative {
-                    decimal.insert(0, '-');
-                }
-                decimal
-            }
-        }
+        Value::Decimal { scaled, scale } => decimal_sql_text(*scaled, *scale),
         Value::Uuid(value) => format!("X'{}'", hex_encode(value)),
         Value::TimestampMicros(value) => value.to_string(),
         Value::Enum {
@@ -14552,6 +14628,83 @@ fn render_value_sql(value: &Value) -> String {
             days,
             micros,
         } => format!("'{}'", format_interval(*months, *days, *micros)),
+    }
+}
+
+fn render_branch_parameter_value_sql(value: &Value) -> Result<String> {
+    match value {
+        Value::Decimal { scaled, scale } => Ok(format!(
+            "CAST({} AS DECIMAL)",
+            sql_string_literal(&decimal_sql_text(*scaled, *scale))
+        )),
+        Value::Uuid(value) => Ok(format!(
+            "UUID_PARSE({})",
+            sql_string_literal(&hex_encode(value))
+        )),
+        Value::TimestampMicros(value) => Ok(format!(
+            "CAST({} AS TIMESTAMP)",
+            sql_string_literal(&format_timestamp_tz_micros(*value))
+        )),
+        Value::TimestampTzMicros(value) => Ok(format!(
+            "CAST({} AS TIMESTAMP WITH TIME ZONE)",
+            sql_string_literal(&format_timestamp_tz_micros(*value))
+        )),
+        Value::DateDays(days) => Ok(format!(
+            "CAST({} AS DATE)",
+            sql_string_literal(&format_date_days(*days))
+        )),
+        Value::TimeMicros(micros) => Ok(format!(
+            "CAST({} AS TIME)",
+            sql_string_literal(&format_time_micros(*micros)?)
+        )),
+        Value::Interval {
+            months,
+            days,
+            micros,
+        } => Ok(format!(
+            "CAST({} AS INTERVAL)",
+            sql_string_literal(&format_interval(*months, *days, *micros))
+        )),
+        Value::IpAddr { family, addr } => Ok(format!(
+            "CAST({} AS IPADDR)",
+            sql_string_literal(&format_ip_addr(*family, addr)?)
+        )),
+        Value::Cidr {
+            family,
+            prefix_len,
+            network,
+        } => Ok(format!(
+            "CAST({} AS CIDR)",
+            sql_string_literal(&format_cidr(*family, *prefix_len, network)?)
+        )),
+        Value::MacAddr { len, bytes } => Ok(format!(
+            "CAST({} AS MACADDR)",
+            sql_string_literal(&format_mac_addr(*len, bytes)?)
+        )),
+        Value::Geometry(value) => Ok(format!("ST_GeomFromWKB(X'{}')", hex_encode(value))),
+        Value::Geography(value) => Ok(format!("ST_GeogFromWKB(X'{}')", hex_encode(value))),
+        _ => Ok(render_value_sql(value)),
+    }
+}
+
+fn decimal_sql_text(scaled: i64, scale: u8) -> String {
+    if scale == 0 {
+        scaled.to_string()
+    } else {
+        let negative = scaled < 0;
+        let digits = scaled.unsigned_abs().to_string();
+        let scale = usize::from(scale);
+        let padded = if digits.len() <= scale {
+            format!("{}{}", "0".repeat(scale + 1 - digits.len()), digits)
+        } else {
+            digits
+        };
+        let split = padded.len() - scale;
+        let mut decimal = format!("{}.{}", &padded[..split], &padded[split..]);
+        if negative {
+            decimal.insert(0, '-');
+        }
+        decimal
     }
 }
 
