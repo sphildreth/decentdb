@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockWriteGuard, Weak};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 #[cfg(feature = "bench-internals")]
 use crate::benchmark::{
@@ -19,7 +19,7 @@ use crate::catalog::{
     ForeignKeyConstraint, IndexColumn, IndexKind, IndexSchema, TableSchema, TriggerEvent,
     TriggerKind, TriggerSchema, ViewSchema,
 };
-use crate::config::DbConfig;
+use crate::config::{DbConfig, WalSyncMode};
 use crate::error::{DbError, Result};
 use crate::exec::dml::{PreparedSimpleDelete, PreparedSimpleInsert, PreparedSimpleUpdate};
 use crate::exec::{
@@ -72,6 +72,8 @@ use crate::wal::WalHandle;
 use crate::write_queue::{QueuedWriteOptions, WriteQueue, WriteQueueMetricsSnapshot};
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
+
+const APPLICATION_PRAGMA_TABLE: &str = "__decentdb_application_pragmas";
 
 /// Stable engine owner used across later storage, SQL, and FFI slices.
 #[derive(Clone, Debug)]
@@ -339,6 +341,7 @@ struct DbInner {
     sql_txn_active: AtomicBool,
     write_txn_active: AtomicBool,
     write_txn: Mutex<WriteTxn>,
+    busy_timeout_ms: AtomicU64,
     temp_state: Mutex<TempSchemaState>,
     statement_cache: Mutex<StatementCache>,
     prepared_insert_cache: Mutex<PreparedInsertCache>,
@@ -1422,9 +1425,15 @@ impl Db {
         &self,
         sql: &str,
         params: &[Value],
-        options: QueuedWriteOptions,
+        mut options: QueuedWriteOptions,
     ) -> Result<Vec<QueryResult>> {
         self.reject_transaction_control_for_queued_sql(sql)?;
+        if options.timeout.is_none() {
+            let timeout_ms = self.inner.busy_timeout_ms.load(Ordering::Acquire);
+            if timeout_ms > 0 {
+                options.timeout = Some(Duration::from_millis(timeout_ms));
+            }
+        }
         self.write_queue()
             .execute_batch_with_params(self, sql, params, options)
     }
@@ -1919,6 +1928,7 @@ impl Db {
                 continue;
             }
 
+            reject_unsupported_collated_key_sql(trimmed)?;
             let statement = self.parsed_statement(trimmed)?;
             let result = if statement_is_read_only(&statement) {
                 self.execute_read_statement(&statement, params)?
@@ -2624,6 +2634,7 @@ impl Db {
         let catalog = CatalogHandle::new(runtime.catalog.as_ref().clone());
         let last_seen_checkpoint_epoch = wal.checkpoint_epoch();
         let reactive_hub = crate::reactive::acquire_hub(open_lock_key.clone(), &effective_config);
+        let busy_timeout_ms = effective_config.write_queue_default_timeout_ms;
 
         let db = Self {
             inner: Arc::new(DbInner {
@@ -2642,6 +2653,7 @@ impl Db {
                 sql_txn_active: AtomicBool::new(false),
                 write_txn: Mutex::new(WriteTxn::default()),
                 write_txn_active: AtomicBool::new(false),
+                busy_timeout_ms: AtomicU64::new(busy_timeout_ms),
                 temp_state: Mutex::new(TempSchemaState::default()),
                 statement_cache: Mutex::new(StatementCache::default()),
                 prepared_insert_cache: Mutex::new(PreparedInsertCache::default()),
@@ -2890,19 +2902,27 @@ impl Db {
 
     fn execute_pragma_command(&self, command: PragmaCommand) -> Result<QueryResult> {
         match command {
-            PragmaCommand::Query(PragmaName::PageSize) => Ok(QueryResult::with_rows(
+            PragmaCommand::Query(target) => self.execute_pragma_query(target),
+            PragmaCommand::Call { target, argument } => self.execute_pragma_call(target, argument),
+            PragmaCommand::Set(target, value) => self.execute_pragma_set(target, value),
+        }
+    }
+
+    fn execute_pragma_query(&self, target: PragmaTarget) -> Result<QueryResult> {
+        match target.name {
+            PragmaName::PageSize => Ok(QueryResult::with_rows(
                 vec!["page_size".to_string()],
                 vec![QueryRow::new(vec![Value::Int64(i64::from(
                     self.inner.config.page_size,
                 ))])],
             )),
-            PragmaCommand::Query(PragmaName::CacheSize) => Ok(QueryResult::with_rows(
+            PragmaName::CacheSize => Ok(QueryResult::with_rows(
                 vec!["cache_size".to_string()],
                 vec![QueryRow::new(vec![Value::Int64(cache_size_pages(
                     &self.inner.config,
                 ))])],
             )),
-            PragmaCommand::Query(PragmaName::DatabaseList) => {
+            PragmaName::DatabaseList => {
                 let file_name = if is_memory_path(&self.inner.path) {
                     ":memory:".to_string()
                 } else {
@@ -2917,113 +2937,347 @@ impl Db {
                     ])],
                 ))
             }
-            PragmaCommand::Query(PragmaName::TableInfo) => Err(DbError::sql(
+            PragmaName::TableInfo => Err(DbError::sql(
                 "PRAGMA table_info(table_name) requires a table name argument",
             )),
-            PragmaCommand::TableInfo(table_name) => {
-                let info = self.describe_table(&table_name)?;
-                let rows = info
-                    .columns
-                    .into_iter()
-                    .enumerate()
-                    .map(|(cid, column)| {
-                        QueryRow::new(vec![
-                            Value::Int64(i64::try_from(cid).unwrap_or(i64::MAX)),
-                            Value::Text(column.name),
-                            Value::Text(column.column_type),
-                            Value::Int64(if column.nullable { 0 } else { 1 }),
-                            column.default_sql.map_or(Value::Null, Value::Text),
-                            Value::Int64(if column.primary_key { 1 } else { 0 }),
-                        ])
-                    })
-                    .collect();
+            PragmaName::TableXInfo => Err(DbError::sql(
+                "PRAGMA table_xinfo(table_name) requires a table name argument",
+            )),
+            PragmaName::IndexList => Err(DbError::sql(
+                "PRAGMA index_list(table_name) requires a table name argument",
+            )),
+            PragmaName::IndexInfo => Err(DbError::sql(
+                "PRAGMA index_info(index_name) requires an index name argument",
+            )),
+            PragmaName::IndexXInfo => Err(DbError::sql(
+                "PRAGMA index_xinfo(index_name) requires an index name argument",
+            )),
+            PragmaName::ForeignKeyList => Err(DbError::sql(
+                "PRAGMA foreign_key_list(table_name) requires a table name argument",
+            )),
+            PragmaName::TableList => self.execute_compatibility_select(&format!(
+                "SELECT * FROM {}pragma_table_list()",
+                pragma_schema_function_prefix(target.schema)
+            )),
+            PragmaName::IntegrityCheck | PragmaName::QuickCheck => self.integrity_check_results(),
+            PragmaName::ForeignKeys => Ok(QueryResult::with_rows(
+                vec!["foreign_keys".to_string()],
+                vec![QueryRow::new(vec![Value::Int64(1)])],
+            )),
+            PragmaName::JournalMode => Ok(QueryResult::with_rows(
+                vec!["journal_mode".to_string()],
+                vec![QueryRow::new(vec![Value::Text("wal".to_string())])],
+            )),
+            PragmaName::Synchronous => Ok(QueryResult::with_rows(
+                vec!["synchronous".to_string()],
+                vec![QueryRow::new(vec![Value::Int64(
+                    pragma_synchronous_mode_value(self.inner.config.wal_sync_mode),
+                )])],
+            )),
+            PragmaName::WalCheckpoint => self.execute_pragma_wal_checkpoint(None),
+            PragmaName::SchemaVersion => {
+                let runtime = self.runtime_for_metadata_inspection()?;
+                let version = match target.schema {
+                    Some(PragmaSchema::Temp) => runtime.temp_schema_cookie,
+                    _ => runtime.catalog.schema_cookie,
+                };
                 Ok(QueryResult::with_rows(
-                    vec![
-                        "cid".to_string(),
-                        "name".to_string(),
-                        "type".to_string(),
-                        "notnull".to_string(),
-                        "dflt_value".to_string(),
-                        "pk".to_string(),
-                    ],
-                    rows,
+                    vec!["schema_version".to_string()],
+                    vec![QueryRow::new(vec![Value::Int64(i64::from(version))])],
                 ))
             }
-            PragmaCommand::Query(PragmaName::IntegrityCheck) => {
-                let (mut runtime, snapshot_lsn) =
-                    self.runtime_for_targeted_row_source_inspection()?;
-                runtime.rebuild_stale_indexes(self.inner.config.page_size)?;
-                let mut errors = Vec::new();
-                let table_names = runtime.catalog.tables.keys().cloned().collect::<Vec<_>>();
-                for table_name in table_names {
-                    self.ensure_inspection_table_row_source(
-                        &mut runtime,
-                        &table_name,
-                        snapshot_lsn,
-                    )?;
-                    let Some(table) = runtime.catalog.table(&table_name).cloned() else {
-                        errors.push(format!("table {table_name} is missing schema"));
-                        continue;
-                    };
-                    let Some(row_source) = runtime.table_row_source(&table_name) else {
-                        errors.push(format!("table {} is missing row storage", table.name));
-                        continue;
-                    };
-                    for row in row_source.rows() {
-                        let row = row?;
-                        if row.values().len() != table.columns.len() {
-                            errors.push(format!(
-                                "table {} row {} has {} values but schema defines {} columns",
-                                table_name,
-                                row.row_id(),
-                                row.values().len(),
-                                table.columns.len()
-                            ));
-                            break;
-                        }
-                    }
-                    self.redefer_inspection_table_row_source(
-                        &mut runtime,
-                        &table_name,
-                        snapshot_lsn,
-                    );
-                }
-                for index in runtime.catalog.indexes.values() {
-                    if runtime.catalog.table(&index.table_name).is_none() {
-                        errors.push(format!(
-                            "index {} references missing table {}",
-                            index.name, index.table_name
-                        ));
-                    }
-                    let table_deferred = runtime
-                        .deferred_table_names()
-                        .any(|table_name| identifiers_equal(table_name, &index.table_name));
-                    if !table_deferred && !runtime.indexes.contains_key(&index.name) {
-                        errors.push(format!("runtime index {} is missing", index.name));
-                    }
-                }
-                if errors.is_empty() {
-                    Ok(QueryResult::with_rows(
-                        vec!["integrity_check".to_string()],
-                        vec![QueryRow::new(vec![Value::Text("ok".to_string())])],
-                    ))
-                } else {
-                    Ok(QueryResult::with_rows(
-                        vec!["integrity_check".to_string()],
-                        errors
-                            .into_iter()
-                            .map(|error| QueryRow::new(vec![Value::Text(error)]))
-                            .collect(),
-                    ))
-                }
-            }
-            PragmaCommand::Set(name, value) => self.execute_pragma_set(name, value),
+            PragmaName::UserVersion => self.execute_application_pragma_query("user_version"),
+            PragmaName::ApplicationId => self.execute_application_pragma_query("application_id"),
+            PragmaName::Encoding => Ok(QueryResult::with_rows(
+                vec!["encoding".to_string()],
+                vec![QueryRow::new(vec![Value::Text("UTF-8".to_string())])],
+            )),
+            PragmaName::LockingMode => Ok(QueryResult::with_rows(
+                vec!["locking_mode".to_string()],
+                vec![QueryRow::new(vec![Value::Text("normal".to_string())])],
+            )),
+            PragmaName::TempStore => Ok(QueryResult::with_rows(
+                vec!["temp_store".to_string()],
+                vec![QueryRow::new(vec![Value::Int64(1)])],
+            )),
+            PragmaName::BusyTimeout => Ok(QueryResult::with_rows(
+                vec!["busy_timeout".to_string()],
+                vec![QueryRow::new(vec![Value::Int64(
+                    i64::try_from(self.inner.busy_timeout_ms.load(Ordering::Acquire))
+                        .unwrap_or(i64::MAX),
+                )])],
+            )),
         }
     }
 
-    fn execute_pragma_set(&self, name: PragmaName, value: i64) -> Result<QueryResult> {
-        match name {
+    fn execute_pragma_call(
+        &self,
+        target: PragmaTarget,
+        argument: Option<String>,
+    ) -> Result<QueryResult> {
+        match target.name {
+            PragmaName::TableInfo => {
+                let table_name = pragma_required_argument(&target, argument)?;
+                self.execute_pragma_table_info(&table_name, target.schema, false)
+            }
+            PragmaName::TableXInfo => {
+                let table_name = pragma_required_argument(&target, argument)?;
+                self.execute_compatibility_select(&format!(
+                    "SELECT * FROM {}pragma_table_xinfo({})",
+                    pragma_schema_function_prefix(target.schema),
+                    sql_string_literal(&table_name)
+                ))
+            }
+            PragmaName::IndexList => {
+                let table_name = pragma_required_argument(&target, argument)?;
+                self.execute_compatibility_select(&format!(
+                    "SELECT * FROM {}pragma_index_list({})",
+                    pragma_schema_function_prefix(target.schema),
+                    sql_string_literal(&table_name)
+                ))
+            }
+            PragmaName::IndexInfo => {
+                let index_name = pragma_required_argument(&target, argument)?;
+                self.execute_compatibility_select(&format!(
+                    "SELECT * FROM {}pragma_index_info({})",
+                    pragma_schema_function_prefix(target.schema),
+                    sql_string_literal(&index_name)
+                ))
+            }
+            PragmaName::IndexXInfo => {
+                let index_name = pragma_required_argument(&target, argument)?;
+                self.execute_compatibility_select(&format!(
+                    "SELECT * FROM {}pragma_index_xinfo({})",
+                    pragma_schema_function_prefix(target.schema),
+                    sql_string_literal(&index_name)
+                ))
+            }
+            PragmaName::ForeignKeyList => {
+                let table_name = pragma_required_argument(&target, argument)?;
+                self.execute_compatibility_select(&format!(
+                    "SELECT * FROM {}pragma_foreign_key_list({})",
+                    pragma_schema_function_prefix(target.schema),
+                    sql_string_literal(&table_name)
+                ))
+            }
+            PragmaName::WalCheckpoint => self.execute_pragma_wal_checkpoint(argument.as_deref()),
+            other => Err(DbError::sql(format!(
+                "PRAGMA {} does not accept call syntax",
+                pragma_name_sql(&other)
+            ))),
+        }
+    }
+
+    fn execute_pragma_table_info(
+        &self,
+        table_name: &str,
+        schema: Option<PragmaSchema>,
+        extended: bool,
+    ) -> Result<QueryResult> {
+        let runtime = self.runtime_for_metadata_inspection()?;
+        let table = match schema {
+            Some(PragmaSchema::Temp) => runtime
+                .temp_table_schema(table_name)
+                .ok_or_else(|| DbError::sql(format!("unknown temporary table {table_name}")))?,
+            Some(PragmaSchema::Main) => runtime
+                .catalog
+                .table(table_name)
+                .ok_or_else(|| DbError::sql(format!("unknown table {table_name}")))?,
+            None => runtime
+                .table_schema(table_name)
+                .ok_or_else(|| DbError::sql(format!("unknown table {table_name}")))?,
+        };
+        let rows = table
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(cid, column)| {
+                let mut values = vec![
+                    Value::Int64(i64::try_from(cid).unwrap_or(i64::MAX)),
+                    Value::Text(column.name.clone()),
+                    Value::Text(column.column_type.as_str().to_string()),
+                    Value::Int64(if column.nullable { 0 } else { 1 }),
+                    column.default_sql.clone().map_or(Value::Null, Value::Text),
+                    Value::Int64(if column.primary_key { 1 } else { 0 }),
+                ];
+                if extended {
+                    let hidden = if column.generated_sql.is_none() {
+                        0
+                    } else if column.generated_stored {
+                        3
+                    } else {
+                        2
+                    };
+                    values.push(Value::Int64(hidden));
+                }
+                QueryRow::new(values)
+            })
+            .collect();
+        let mut columns = vec![
+            "cid".to_string(),
+            "name".to_string(),
+            "type".to_string(),
+            "notnull".to_string(),
+            "dflt_value".to_string(),
+            "pk".to_string(),
+        ];
+        if extended {
+            columns.push("hidden".to_string());
+        }
+        Ok(QueryResult::with_rows(columns, rows))
+    }
+
+    fn execute_compatibility_select(&self, sql: &str) -> Result<QueryResult> {
+        self.execute(sql)
+    }
+
+    fn execute_application_pragma_query(&self, key: &str) -> Result<QueryResult> {
+        let value = self.application_pragma_value(key)?;
+        Ok(QueryResult::with_rows(
+            vec![key.to_string()],
+            vec![QueryRow::new(vec![Value::Int64(value)])],
+        ))
+    }
+
+    fn application_pragma_value(&self, key: &str) -> Result<i64> {
+        let sql = format!(
+            "SELECT value FROM {} WHERE name = {}",
+            sql_identifier(APPLICATION_PRAGMA_TABLE),
+            sql_string_literal(key)
+        );
+        match self.execute(&sql) {
+            Ok(result) => Ok(result
+                .rows()
+                .first()
+                .and_then(|row| row.values().first())
+                .and_then(|value| match value {
+                    Value::Int64(value) => Some(*value),
+                    _ => None,
+                })
+                .unwrap_or(0)),
+            Err(DbError::Sql { message }) if message.contains("unknown table") => Ok(0),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn execute_application_pragma_set(
+        &self,
+        key: &str,
+        value: &PragmaValue,
+    ) -> Result<QueryResult> {
+        let value = pragma_value_i64(value)?;
+        if !(i64::from(i32::MIN)..=i64::from(i32::MAX)).contains(&value) {
+            return Err(DbError::sql(format!(
+                "PRAGMA {key} requires a signed 32-bit integer value"
+            )));
+        }
+        let table = sql_identifier(APPLICATION_PRAGMA_TABLE);
+        let key_sql = sql_string_literal(key);
+        self.execute(&format!(
+            "CREATE TABLE IF NOT EXISTS {table} (name TEXT PRIMARY KEY, value INT64 NOT NULL)"
+        ))?;
+        self.execute(&format!("DELETE FROM {table} WHERE name = {key_sql}"))?;
+        self.execute(&format!(
+            "INSERT INTO {table} (name, value) VALUES ({key_sql}, {value})"
+        ))?;
+        Ok(QueryResult::with_affected_rows(0))
+    }
+
+    fn execute_pragma_wal_checkpoint(&self, mode: Option<&str>) -> Result<QueryResult> {
+        if let Some(mode) = mode {
+            match mode.trim().to_ascii_uppercase().as_str() {
+                "PASSIVE" | "FULL" | "RESTART" | "TRUNCATE" => {}
+                other => {
+                    return Err(DbError::sql(format!(
+                        "PRAGMA wal_checkpoint mode {other} is not supported; expected PASSIVE, FULL, RESTART, or TRUNCATE"
+                    )))
+                }
+            }
+        }
+        let active_readers = self.inner.wal.active_reader_count()?;
+        let retained_snapshot = self.inner.wal.retained_snapshot_lsn().is_some();
+        let before_versions = self.inner.wal.version_count()?;
+        self.checkpoint()?;
+        let after_versions = self.inner.wal.version_count()?;
+        let checkpointed = before_versions.saturating_sub(after_versions);
+        Ok(QueryResult::with_rows(
+            vec![
+                "busy".to_string(),
+                "log".to_string(),
+                "checkpointed".to_string(),
+            ],
+            vec![QueryRow::new(vec![
+                Value::Int64(i64::from(active_readers > 0 || retained_snapshot)),
+                Value::Int64(i64::try_from(before_versions).unwrap_or(i64::MAX)),
+                Value::Int64(i64::try_from(checkpointed).unwrap_or(i64::MAX)),
+            ])],
+        ))
+    }
+
+    fn integrity_check_results(&self) -> Result<QueryResult> {
+        let (mut runtime, snapshot_lsn) = self.runtime_for_targeted_row_source_inspection()?;
+        runtime.rebuild_stale_indexes(self.inner.config.page_size)?;
+        let mut errors = Vec::new();
+        let table_names = runtime.catalog.tables.keys().cloned().collect::<Vec<_>>();
+        for table_name in table_names {
+            self.ensure_inspection_table_row_source(&mut runtime, &table_name, snapshot_lsn)?;
+            let Some(table) = runtime.catalog.table(&table_name).cloned() else {
+                errors.push(format!("table {table_name} is missing schema"));
+                continue;
+            };
+            let Some(row_source) = runtime.table_row_source(&table_name) else {
+                errors.push(format!("table {} is missing row storage", table.name));
+                continue;
+            };
+            for row in row_source.rows() {
+                let row = row?;
+                if row.values().len() != table.columns.len() {
+                    errors.push(format!(
+                        "table {} row {} has {} values but schema defines {} columns",
+                        table_name,
+                        row.row_id(),
+                        row.values().len(),
+                        table.columns.len()
+                    ));
+                    break;
+                }
+            }
+            self.redefer_inspection_table_row_source(&mut runtime, &table_name, snapshot_lsn);
+        }
+        for index in runtime.catalog.indexes.values() {
+            if runtime.catalog.table(&index.table_name).is_none() {
+                errors.push(format!(
+                    "index {} references missing table {}",
+                    index.name, index.table_name
+                ));
+            }
+            let table_deferred = runtime
+                .deferred_table_names()
+                .any(|table_name| identifiers_equal(table_name, &index.table_name));
+            if !table_deferred && !runtime.indexes.contains_key(&index.name) {
+                errors.push(format!("runtime index {} is missing", index.name));
+            }
+        }
+        if errors.is_empty() {
+            Ok(QueryResult::with_rows(
+                vec!["integrity_check".to_string()],
+                vec![QueryRow::new(vec![Value::Text("ok".to_string())])],
+            ))
+        } else {
+            Ok(QueryResult::with_rows(
+                vec!["integrity_check".to_string()],
+                errors
+                    .into_iter()
+                    .map(|error| QueryRow::new(vec![Value::Text(error)]))
+                    .collect(),
+            ))
+        }
+    }
+
+    fn execute_pragma_set(&self, target: PragmaTarget, value: PragmaValue) -> Result<QueryResult> {
+        match target.name {
             PragmaName::PageSize => {
+                let value = pragma_value_i64(&value)?;
                 if value == i64::from(self.inner.config.page_size) {
                     Ok(QueryResult::with_affected_rows(0))
                 } else {
@@ -3033,7 +3287,7 @@ impl Db {
                 }
             }
             PragmaName::CacheSize => {
-                if value == cache_size_pages(&self.inner.config) {
+                if pragma_value_i64(&value)? == cache_size_pages(&self.inner.config) {
                     Ok(QueryResult::with_affected_rows(0))
                 } else {
                     Err(DbError::sql(
@@ -3041,11 +3295,129 @@ impl Db {
                     ))
                 }
             }
-            PragmaName::IntegrityCheck | PragmaName::DatabaseList | PragmaName::TableInfo => {
-                Err(DbError::sql(format!(
-                    "PRAGMA {} does not support assignment",
-                    pragma_name_sql(name)
-                )))
+            PragmaName::IntegrityCheck
+            | PragmaName::DatabaseList
+            | PragmaName::TableInfo
+            | PragmaName::TableXInfo
+            | PragmaName::TableList
+            | PragmaName::IndexList
+            | PragmaName::IndexInfo
+            | PragmaName::IndexXInfo
+            | PragmaName::ForeignKeyList
+            | PragmaName::WalCheckpoint
+            | PragmaName::QuickCheck => Err(DbError::sql(format!(
+                "PRAGMA {} does not support assignment",
+                pragma_name_sql(&target.name)
+            ))),
+            PragmaName::ForeignKeys => {
+                let value = parse_pragma_bool_value(&value, "PRAGMA foreign_keys")?;
+                if value {
+                    Ok(QueryResult::with_affected_rows(0))
+                } else {
+                    Err(DbError::sql(
+                        "PRAGMA foreign_keys cannot disable foreign key enforcement in DecentDB",
+                    ))
+                }
+            }
+            PragmaName::JournalMode => {
+                let mode = parse_pragma_text_or_mode(&value, "PRAGMA journal_mode")?;
+                if mode == "WAL" {
+                    Ok(QueryResult::with_rows(
+                        vec!["journal_mode".to_string()],
+                        vec![QueryRow::new(vec![Value::Text("wal".to_string())])],
+                    ))
+                } else {
+                    Err(DbError::sql(
+                        "PRAGMA journal_mode supports only WAL in this compatibility slice",
+                    ))
+                }
+            }
+            PragmaName::Synchronous => {
+                let requested = parse_pragma_synchronous_request(&value, "PRAGMA synchronous")?;
+                let current = self.inner.config.wal_sync_mode;
+                match requested {
+                    SynchronousRequest::Full => {
+                        if current == WalSyncMode::Full {
+                            Ok(QueryResult::with_affected_rows(0))
+                        } else {
+                            Err(DbError::sql(
+                                "PRAGMA synchronous = FULL requires reopening with DbConfig::wal_sync_mode = Full",
+                            ))
+                        }
+                    }
+                    SynchronousRequest::Normal => {
+                        if current == WalSyncMode::Normal
+                            || matches!(current, WalSyncMode::AsyncCommit { .. })
+                        {
+                            Ok(QueryResult::with_affected_rows(0))
+                        } else {
+                            Err(DbError::sql(
+                                "PRAGMA synchronous = NORMAL requires reopening with DbConfig::wal_sync_mode = Normal or AsyncCommit",
+                            ))
+                        }
+                    }
+                    SynchronousRequest::Off => {
+                        if current == WalSyncMode::TestingOnlyUnsafeNoSync {
+                            Ok(QueryResult::with_affected_rows(0))
+                        } else {
+                            Err(DbError::sql(
+                                "PRAGMA synchronous = OFF requires reopening with DbConfig::wal_sync_mode = TestingOnlyUnsafeNoSync",
+                            ))
+                        }
+                    }
+                    SynchronousRequest::Extra => Err(DbError::sql(
+                        "PRAGMA synchronous = EXTRA is not supported by DecentDB",
+                    )),
+                }
+            }
+            PragmaName::SchemaVersion => Err(DbError::sql(
+                "PRAGMA schema_version does not support assignment",
+            )),
+            PragmaName::UserVersion => self.execute_application_pragma_set("user_version", &value),
+            PragmaName::ApplicationId => {
+                self.execute_application_pragma_set("application_id", &value)
+            }
+            PragmaName::Encoding => {
+                let mode = parse_pragma_text_or_mode(&value, "PRAGMA encoding")?;
+                if mode == "UTF-8" || mode == "UTF8" {
+                    Ok(QueryResult::with_affected_rows(0))
+                } else {
+                    Err(DbError::sql(
+                        "PRAGMA encoding can only be set to UTF-8 in this compatibility slice",
+                    ))
+                }
+            }
+            PragmaName::LockingMode => {
+                let mode = parse_pragma_text_or_mode(&value, "PRAGMA locking_mode")?;
+                if mode == "NORMAL" {
+                    Ok(QueryResult::with_affected_rows(0))
+                } else {
+                    Err(DbError::sql(
+                        "PRAGMA locking_mode supports only NORMAL in this compatibility slice",
+                    ))
+                }
+            }
+            PragmaName::TempStore => {
+                let value = parse_pragma_text_or_mode(&value, "PRAGMA temp_store")?;
+                if matches!(value.as_str(), "DEFAULT" | "FILE" | "0" | "1") {
+                    Ok(QueryResult::with_affected_rows(0))
+                } else if value == "MEMORY" {
+                    Err(DbError::sql(
+                        "PRAGMA temp_store = MEMORY is not supported in this compatibility slice",
+                    ))
+                } else {
+                    Err(DbError::sql(
+                        "PRAGMA temp_store accepts 0, 1, 'DEFAULT', or 'FILE' only",
+                    ))
+                }
+            }
+            PragmaName::BusyTimeout => {
+                let value = pragma_value_i64(&value)?;
+                let value = u64::try_from(value).map_err(|_| {
+                    DbError::sql("PRAGMA busy_timeout requires a non-negative integer")
+                })?;
+                self.inner.busy_timeout_ms.store(value, Ordering::Release);
+                Ok(QueryResult::with_affected_rows(0))
             }
         }
     }
@@ -12212,9 +12584,30 @@ enum TransactionControl {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum PragmaCommand {
-    Query(PragmaName),
-    TableInfo(String),
-    Set(PragmaName, i64),
+    Query(PragmaTarget),
+    Call {
+        target: PragmaTarget,
+        argument: Option<String>,
+    },
+    Set(PragmaTarget, PragmaValue),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PragmaTarget {
+    name: PragmaName,
+    schema: Option<PragmaSchema>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PragmaSchema {
+    Main,
+    Temp,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PragmaValue {
+    Int(i64),
+    Text(String),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -12223,7 +12616,25 @@ enum PragmaName {
     CacheSize,
     IntegrityCheck,
     DatabaseList,
+    QuickCheck,
+    ForeignKeys,
+    JournalMode,
+    Synchronous,
+    WalCheckpoint,
+    SchemaVersion,
+    UserVersion,
+    ApplicationId,
+    Encoding,
+    BusyTimeout,
+    LockingMode,
+    TempStore,
     TableInfo,
+    TableXInfo,
+    TableList,
+    IndexList,
+    IndexInfo,
+    IndexXInfo,
+    ForeignKeyList,
 }
 
 fn parse_transaction_control(sql: &str) -> Option<TransactionControl> {
@@ -12276,19 +12687,34 @@ fn parse_pragma_command(sql: &str) -> Result<Option<PragmaCommand>> {
             return Err(DbError::sql("PRAGMA call has unexpected trailing content"));
         }
         let name = parse_pragma_name(name)?;
-        if argument.is_empty() {
+        if argument.is_empty() && name.name != PragmaName::WalCheckpoint {
             return Err(DbError::sql("PRAGMA call requires an argument"));
         }
-        return match name {
-            PragmaName::TableInfo => {
-                let table_name = parse_pragma_table_argument(argument)?;
-                Ok(Some(PragmaCommand::TableInfo(table_name)))
-            }
-            _ => Err(DbError::sql(format!(
+        let accepts_call = matches!(
+            name.name,
+            PragmaName::TableInfo
+                | PragmaName::TableXInfo
+                | PragmaName::IndexList
+                | PragmaName::IndexInfo
+                | PragmaName::IndexXInfo
+                | PragmaName::ForeignKeyList
+                | PragmaName::WalCheckpoint
+        );
+        if !accepts_call {
+            return Err(DbError::sql(format!(
                 "PRAGMA {} does not accept call syntax",
-                pragma_name_sql(name)
-            ))),
+                pragma_name_sql(&name.name)
+            )));
+        }
+        let argument = if argument.is_empty() {
+            None
+        } else {
+            Some(parse_pragma_table_argument(argument)?)
         };
+        return Ok(Some(PragmaCommand::Call {
+            target: name,
+            argument,
+        }));
     }
 
     let (name, value) = if let Some(eq_index) = body.find('=') {
@@ -12303,12 +12729,7 @@ fn parse_pragma_command(sql: &str) -> Result<Option<PragmaCommand>> {
     };
     let pragma_name = parse_pragma_name(name)?;
     let command = if let Some(value) = value {
-        let value = value.parse::<i64>().map_err(|_| {
-            DbError::sql(format!(
-                "PRAGMA {} expects an integer value",
-                name.to_ascii_lowercase()
-            ))
-        })?;
+        let value = parse_pragma_value(value)?;
         PragmaCommand::Set(pragma_name, value)
     } else {
         PragmaCommand::Query(pragma_name)
@@ -12316,25 +12737,228 @@ fn parse_pragma_command(sql: &str) -> Result<Option<PragmaCommand>> {
     Ok(Some(command))
 }
 
-fn parse_pragma_name(name: &str) -> Result<PragmaName> {
+fn parse_pragma_name(name: &str) -> Result<PragmaTarget> {
     let normalized = name.trim().to_ascii_lowercase();
-    match normalized.as_str() {
+    let (schema, pragma_name) = match normalized.split_once('.') {
+        Some((schema, pragma_name)) => {
+            let schema = match schema.trim() {
+                "main" => Some(PragmaSchema::Main),
+                "temp" => Some(PragmaSchema::Temp),
+                _ => {
+                    return Err(DbError::sql(format!(
+                        "unsupported PRAGMA schema qualifier '{}'; supported qualifiers are main and temp",
+                        schema
+                    )));
+                }
+            };
+            (schema, pragma_name.trim())
+        }
+        None => (None, normalized.as_str()),
+    };
+    if pragma_name.is_empty() {
+        return Err(DbError::sql("PRAGMA requires a name"));
+    }
+    let name = match pragma_name {
         "page_size" => Ok(PragmaName::PageSize),
         "cache_size" => Ok(PragmaName::CacheSize),
         "integrity_check" => Ok(PragmaName::IntegrityCheck),
         "database_list" => Ok(PragmaName::DatabaseList),
+        "quick_check" => Ok(PragmaName::QuickCheck),
+        "foreign_keys" => Ok(PragmaName::ForeignKeys),
+        "journal_mode" => Ok(PragmaName::JournalMode),
+        "synchronous" => Ok(PragmaName::Synchronous),
+        "wal_checkpoint" => Ok(PragmaName::WalCheckpoint),
+        "schema_version" => Ok(PragmaName::SchemaVersion),
+        "user_version" => Ok(PragmaName::UserVersion),
+        "application_id" => Ok(PragmaName::ApplicationId),
+        "encoding" => Ok(PragmaName::Encoding),
+        "busy_timeout" => Ok(PragmaName::BusyTimeout),
+        "locking_mode" => Ok(PragmaName::LockingMode),
+        "temp_store" => Ok(PragmaName::TempStore),
         "table_info" => Ok(PragmaName::TableInfo),
-        _ => Err(DbError::sql(format!("unsupported PRAGMA {}", normalized))),
+        "table_xinfo" => Ok(PragmaName::TableXInfo),
+        "table_list" => Ok(PragmaName::TableList),
+        "index_list" => Ok(PragmaName::IndexList),
+        "index_info" => Ok(PragmaName::IndexInfo),
+        "index_xinfo" => Ok(PragmaName::IndexXInfo),
+        "foreign_key_list" => Ok(PragmaName::ForeignKeyList),
+        "auto_vacuum" => Err(DbError::sql(
+            "PRAGMA auto_vacuum is not supported; not applicable to DecentDB storage/checkpointing",
+        )),
+        "cache_spill" => Err(DbError::sql(
+            "PRAGMA cache_spill is not supported; no DecentDB page-cache spill policy",
+        )),
+        "case_sensitive_like" => Err(DbError::sql(
+            "PRAGMA case_sensitive_like is not supported unless the SQL engine explicitly exposes it",
+        )),
+        "defer_foreign_keys" => Err(DbError::sql(
+            "PRAGMA defer_foreign_keys is not supported; deferred constraints are advanced compatibility work",
+        )),
+        "ignore_check_constraints" => Err(DbError::sql(
+            "PRAGMA ignore_check_constraints is not supported; constraints cannot be disabled",
+        )),
+        "mmap_size" => Err(DbError::sql(
+            "PRAGMA mmap_size is not supported as a SQL runtime tuning knob",
+        )),
+        "optimize" => Err(DbError::sql(
+            "PRAGMA optimize is not supported in this compatibility slice",
+        )),
+        "read_uncommitted" => Err(DbError::sql(
+            "PRAGMA read_uncommitted is not supported; DecentDB does not expose dirty reads",
+        )),
+        "recursive_triggers" => Err(DbError::sql(
+            "PRAGMA recursive_triggers is not supported without trigger recursion semantics",
+        )),
+        "secure_delete" => Err(DbError::sql(
+            "PRAGMA secure_delete is not supported; no exact SQLite free-page overwrite mode",
+        )),
+        "trusted_schema" => Err(DbError::sql(
+            "PRAGMA trusted_schema is not supported; DecentDB does not expose that extension model",
+        )),
+        _ => Err(DbError::sql(format!("unsupported PRAGMA {}", pragma_name))),
+    }?;
+    Ok(PragmaTarget { name, schema })
+}
+
+fn parse_pragma_value(value: &str) -> Result<PragmaValue> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(DbError::sql("PRAGMA assignment requires a value"));
+    }
+    if value.starts_with('"') {
+        if !value.ends_with('"') || value.len() < 2 {
+            return Err(DbError::sql("PRAGMA assignment has invalid quoted value"));
+        }
+        return Ok(PragmaValue::Text(
+            value[1..value.len() - 1].replace("\"\"", "\""),
+        ));
+    }
+    if value.starts_with('\'') {
+        if !value.ends_with('\'') || value.len() < 2 {
+            return Err(DbError::sql("PRAGMA assignment has invalid quoted value"));
+        }
+        return Ok(PragmaValue::Text(
+            value[1..value.len() - 1].replace("''", "'"),
+        ));
+    }
+    if let Ok(value) = value.parse::<i64>() {
+        return Ok(PragmaValue::Int(value));
+    }
+    Ok(PragmaValue::Text(value.to_string()))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SynchronousRequest {
+    Full,
+    Normal,
+    Off,
+    Extra,
+}
+
+fn pragma_synchronous_mode_value(mode: WalSyncMode) -> i64 {
+    match mode {
+        WalSyncMode::Full => 2,
+        WalSyncMode::Normal | WalSyncMode::AsyncCommit { .. } => 1,
+        WalSyncMode::TestingOnlyUnsafeNoSync => 0,
     }
 }
 
-fn pragma_name_sql(name: PragmaName) -> &'static str {
+fn pragma_value_i64(value: &PragmaValue) -> Result<i64> {
+    match value {
+        PragmaValue::Int(value) => Ok(*value),
+        PragmaValue::Text(value) => Err(DbError::sql(format!(
+            "PRAGMA assignment expects a numeric value, got '{value}'"
+        ))),
+    }
+}
+
+fn parse_pragma_bool_value(value: &PragmaValue, pragma: &str) -> Result<bool> {
+    let normalized = match value {
+        PragmaValue::Int(value) => value.to_string(),
+        PragmaValue::Text(value) => value.clone(),
+    };
+    match normalized.to_ascii_uppercase().as_str() {
+        "1" | "ON" | "TRUE" | "YES" => Ok(true),
+        "0" | "OFF" | "FALSE" | "NO" => Ok(false),
+        _ => Err(DbError::sql(format!(
+            "{} accepts ON/TRUE/YES/1 or OFF/FALSE/NO/0",
+            pragma
+        ))),
+    }
+}
+
+fn parse_pragma_text_or_mode(value: &PragmaValue, pragma: &str) -> Result<String> {
+    let value = match value {
+        PragmaValue::Text(value) => value.clone(),
+        PragmaValue::Int(value) => value.to_string(),
+    };
+    let normalized = value.trim().to_ascii_uppercase();
+    if normalized.is_empty() {
+        return Err(DbError::sql(format!("{pragma} requires a mode/value",)));
+    }
+    Ok(normalized)
+}
+
+fn parse_pragma_synchronous_request(
+    value: &PragmaValue,
+    pragma: &str,
+) -> Result<SynchronousRequest> {
+    match parse_pragma_text_or_mode(value, pragma)?.as_str() {
+        "FULL" => Ok(SynchronousRequest::Full),
+        "NORMAL" => Ok(SynchronousRequest::Normal),
+        "OFF" => Ok(SynchronousRequest::Off),
+        "EXTRA" | "3" => Ok(SynchronousRequest::Extra),
+        "0" => Ok(SynchronousRequest::Off),
+        "1" => Ok(SynchronousRequest::Normal),
+        "2" => Ok(SynchronousRequest::Full),
+        _ => Err(DbError::sql(
+            "PRAGMA synchronous accepts OFF, NORMAL, FULL, EXTRA, 0, 1, 2, or 3",
+        )),
+    }
+}
+
+fn pragma_required_argument(target: &PragmaTarget, argument: Option<String>) -> Result<String> {
+    argument.ok_or_else(|| {
+        DbError::sql(format!(
+            "PRAGMA {} requires an argument",
+            pragma_name_sql(&target.name)
+        ))
+    })
+}
+
+fn pragma_schema_function_prefix(schema: Option<PragmaSchema>) -> &'static str {
+    match schema {
+        Some(PragmaSchema::Main) => "main.",
+        Some(PragmaSchema::Temp) => "temp.",
+        None => "",
+    }
+}
+
+fn pragma_name_sql(name: &PragmaName) -> &'static str {
     match name {
         PragmaName::PageSize => "page_size",
         PragmaName::CacheSize => "cache_size",
         PragmaName::IntegrityCheck => "integrity_check",
         PragmaName::DatabaseList => "database_list",
+        PragmaName::QuickCheck => "quick_check",
+        PragmaName::ForeignKeys => "foreign_keys",
+        PragmaName::JournalMode => "journal_mode",
+        PragmaName::Synchronous => "synchronous",
+        PragmaName::WalCheckpoint => "wal_checkpoint",
+        PragmaName::SchemaVersion => "schema_version",
+        PragmaName::UserVersion => "user_version",
+        PragmaName::ApplicationId => "application_id",
+        PragmaName::Encoding => "encoding",
+        PragmaName::BusyTimeout => "busy_timeout",
+        PragmaName::LockingMode => "locking_mode",
+        PragmaName::TempStore => "temp_store",
         PragmaName::TableInfo => "table_info",
+        PragmaName::TableXInfo => "table_xinfo",
+        PragmaName::TableList => "table_list",
+        PragmaName::IndexList => "index_list",
+        PragmaName::IndexInfo => "index_info",
+        PragmaName::IndexXInfo => "index_xinfo",
+        PragmaName::ForeignKeyList => "foreign_key_list",
     }
 }
 
@@ -12551,7 +13175,42 @@ fn prepared_statement_sql(sql: &str) -> Result<String> {
             "prepared statements do not support transaction control",
         ));
     }
+    reject_unsupported_collated_key_sql(&statement)?;
     Ok(statement)
+}
+
+fn reject_unsupported_collated_key_sql(sql: &str) -> Result<()> {
+    let upper = sql.to_ascii_uppercase();
+    if let Some(select_index) = upper.find("SELECT DISTINCT") {
+        let after_distinct = select_index + "SELECT DISTINCT".len();
+        let projection_end = upper[after_distinct..]
+            .find(" FROM ")
+            .map(|offset| after_distinct + offset)
+            .unwrap_or(upper.len());
+        if upper[after_distinct..projection_end].contains(" COLLATE ") {
+            return Err(DbError::sql(
+                "COLLATE in DISTINCT keys is not supported in this compatibility slice",
+            ));
+        }
+    }
+    if let Some(group_by_index) = upper.find(" GROUP BY ") {
+        let group_start = group_by_index + " GROUP BY ".len();
+        let group_end = [" HAVING ", " ORDER BY ", " LIMIT ", " OFFSET "]
+            .iter()
+            .filter_map(|marker| {
+                upper[group_start..]
+                    .find(marker)
+                    .map(|offset| group_start + offset)
+            })
+            .min()
+            .unwrap_or(upper.len());
+        if upper[group_start..group_end].contains(" COLLATE ") {
+            return Err(DbError::sql(
+                "COLLATE in GROUP BY keys is not supported in this compatibility slice",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn table_info(table: &TableSchema, row_count: usize) -> TableInfo {
@@ -13908,7 +14567,7 @@ mod tests {
 
     use crate::exec::dml::{PreparedInsertColumn, PreparedInsertValueSource, PreparedSimpleInsert};
     use crate::sql::parser::parse_sql_statement;
-    use crate::{BulkLoadOptions, Db, QueuedWriteOptions, Value};
+    use crate::{BulkLoadOptions, Db, QueuedWriteOptions, Value, WalSyncMode};
 
     use super::{split_sql_batch, PreparedInsertCache, StatementCache, TempSchemaState};
 
@@ -14689,9 +15348,718 @@ mod tests {
     fn unsupported_pragma_reports_sql_error() {
         let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
         let error = db
-            .execute("PRAGMA foreign_keys")
+            .execute("PRAGMA auto_vacuum")
             .expect_err("unsupported pragma should fail");
-        assert!(error.to_string().contains("unsupported PRAGMA"));
+        assert!(error.to_string().contains("not supported"));
+    }
+
+    #[test]
+    fn pragma_compat_queries_are_implemented() {
+        let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
+        db.execute("CREATE TABLE t(id INT PRIMARY KEY, val TEXT)")
+            .expect("create table");
+        assert_eq!(
+            db.execute("PRAGMA quick_check")
+                .expect("quick_check")
+                .rows()[0]
+                .values(),
+            &[Value::Text("ok".to_string())]
+        );
+        assert_eq!(
+            db.execute("PRAGMA foreign_keys")
+                .expect("foreign_keys")
+                .rows()[0]
+                .values(),
+            &[Value::Int64(1)]
+        );
+        assert_eq!(
+            db.execute("PRAGMA journal_mode")
+                .expect("journal_mode")
+                .rows()[0]
+                .values(),
+            &[Value::Text("wal".to_string())]
+        );
+        assert_eq!(
+            db.execute("PRAGMA synchronous")
+                .expect("synchronous")
+                .rows()[0]
+                .values(),
+            &[Value::Int64(2)]
+        );
+        assert_eq!(
+            db.execute("PRAGMA schema_version")
+                .expect("schema_version")
+                .rows()[0]
+                .values(),
+            &[Value::Int64(1)]
+        );
+        assert_eq!(
+            db.execute("PRAGMA encoding").expect("encoding").rows()[0].values(),
+            &[Value::Text("UTF-8".to_string())]
+        );
+        assert_eq!(
+            db.execute("PRAGMA locking_mode")
+                .expect("locking_mode")
+                .rows()[0]
+                .values(),
+            &[Value::Text("normal".to_string())]
+        );
+        assert_eq!(
+            db.execute("PRAGMA temp_store").expect("temp_store").rows()[0].values(),
+            &[Value::Int64(1)]
+        );
+    }
+
+    #[test]
+    fn pragma_pragma_assignment_compatibility_is_narrow() {
+        let wal_async = DbConfig {
+            wal_sync_mode: WalSyncMode::AsyncCommit { interval_ms: 16 },
+            ..DbConfig::default()
+        };
+        let normal_db = Db::open_or_create(":memory:", DbConfig::default())
+            .expect("open database for full-mode sync test");
+        let normal_assign = normal_db.execute("PRAGMA synchronous = FULL");
+        assert!(normal_assign.is_ok(), "expected sync mode match to succeed");
+        let async_db = Db::open_or_create(":memory:", wal_async)
+            .expect("open database for normal-mode sync test");
+        let async_assign = async_db.execute("PRAGMA synchronous = NORMAL");
+        assert!(
+            async_assign.is_ok(),
+            "expected async mode sync update to succeed"
+        );
+        let off_reject = normal_db
+            .execute("PRAGMA synchronous = OFF")
+            .expect_err("unsafe sync assignment should fail");
+        assert!(off_reject.to_string().contains("reopening"));
+
+        assert!(
+            normal_db
+                .execute("PRAGMA foreign_keys = ON")
+                .expect("foreign keys no-op")
+                .affected_rows()
+                == 0
+        );
+        assert!(
+            normal_db
+                .execute("PRAGMA foreign_keys = TRUE")
+                .expect("foreign keys no-op")
+                .affected_rows()
+                == 0
+        );
+        let foreign_keys_off = normal_db
+            .execute("PRAGMA foreign_keys = OFF")
+            .expect_err("disabling foreign_keys should fail");
+        assert!(foreign_keys_off
+            .to_string()
+            .contains("cannot disable foreign key enforcement"));
+
+        assert_eq!(
+            normal_db
+                .execute("PRAGMA journal_mode = wal")
+                .expect("journal_mode wal")
+                .rows()[0]
+                .values(),
+            &[Value::Text("wal".to_string())]
+        );
+        let journal_mode_reject = normal_db
+            .execute("PRAGMA journal_mode = OFF")
+            .expect_err("unsupported journal mode should fail");
+        assert!(journal_mode_reject
+            .to_string()
+            .contains("supports only WAL"));
+
+        assert!(
+            normal_db
+                .execute("PRAGMA encoding = utf8")
+                .expect("encoding utf-8")
+                .affected_rows()
+                == 0
+        );
+        let encoding_reject = normal_db
+            .execute("PRAGMA encoding = latin1")
+            .expect_err("non-UTF8 encoding should fail");
+        assert!(encoding_reject
+            .to_string()
+            .contains("can only be set to UTF-8"));
+
+        assert!(
+            normal_db
+                .execute("PRAGMA locking_mode = normal")
+                .expect("locking mode")
+                .affected_rows()
+                == 0
+        );
+        let locking_mode_reject = normal_db
+            .execute("PRAGMA locking_mode = exclusive")
+            .expect_err("unsupported locking mode should fail");
+        assert!(locking_mode_reject
+            .to_string()
+            .contains("supports only NORMAL"));
+
+        assert!(
+            normal_db
+                .execute("PRAGMA temp_store = 1")
+                .expect("temp_store")
+                .affected_rows()
+                == 0
+        );
+        assert!(
+            normal_db
+                .execute("PRAGMA temp_store = DEFAULT")
+                .expect("temp_store")
+                .affected_rows()
+                == 0
+        );
+        let temp_store_reject = normal_db
+            .execute("PRAGMA temp_store = memory")
+            .expect_err("unsupported temp_store should fail");
+        assert!(temp_store_reject.to_string().contains("not supported"));
+    }
+
+    #[test]
+    fn pragma_main_and_temp_qualifiers_are_supported() {
+        let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
+        db.execute("CREATE TABLE main_table(id INT)")
+            .expect("create main table");
+        db.execute("CREATE TEMP TABLE temp_table(id INT)")
+            .expect("create temp table");
+
+        assert_eq!(
+            db.execute("PRAGMA main.table_info(main_table)")
+                .expect("main.schema-qualified table_info")
+                .rows()
+                .len(),
+            1
+        );
+        assert_eq!(
+            db.execute("PRAGMA temp.table_info(temp_table)")
+                .expect("temp.schema-qualified table_info")
+                .rows()
+                .len(),
+            1
+        );
+
+        let unsupported_schema = db
+            .execute("PRAGMA foo.table_info(main_table)")
+            .expect_err("unsupported pragma schema qualifier");
+        assert!(unsupported_schema
+            .to_string()
+            .contains("unsupported PRAGMA schema qualifier"));
+    }
+
+    #[test]
+    fn pragma_extended_compatibility_surface_is_implemented() -> Result<()> {
+        let db = Db::open_or_create(":memory:", DbConfig::default())?;
+        db.execute("CREATE TABLE parent(id INT PRIMARY KEY)")?;
+        db.execute(
+            "CREATE TABLE child(
+                id INT PRIMARY KEY,
+                parent_id INT REFERENCES parent(id) ON DELETE CASCADE ON UPDATE SET NULL,
+                name TEXT,
+                doubled INT GENERATED ALWAYS AS (id * 2) STORED
+            )",
+        )?;
+        db.execute("CREATE INDEX child_name_idx ON child(name) INCLUDE(parent_id)")?;
+
+        let xinfo = db.execute("PRAGMA table_xinfo(child)")?;
+        assert_eq!(
+            xinfo.columns(),
+            &[
+                "cid".to_string(),
+                "name".to_string(),
+                "type".to_string(),
+                "notnull".to_string(),
+                "dflt_value".to_string(),
+                "pk".to_string(),
+                "hidden".to_string()
+            ]
+        );
+        assert!(xinfo.rows().iter().any(|row| {
+            row.values()[1] == Value::Text("doubled".to_string())
+                && row.values()[6] == Value::Int64(3)
+        }));
+
+        let table_list = db.execute("PRAGMA table_list")?;
+        assert!(table_list.rows().iter().any(|row| {
+            row.values()[0] == Value::Text("main".to_string())
+                && row.values()[1] == Value::Text("child".to_string())
+                && row.values()[2] == Value::Text("table".to_string())
+                && row.values()[3] == Value::Int64(4)
+        }));
+
+        let index_list = db.execute("PRAGMA index_list(child)")?;
+        assert!(index_list
+            .rows()
+            .iter()
+            .any(|row| row.values()[1] == Value::Text("child_name_idx".to_string())));
+
+        let index_xinfo = db.execute("PRAGMA index_xinfo(child_name_idx)")?;
+        assert!(index_xinfo.rows().iter().any(|row| {
+            row.values()[2] == Value::Text("parent_id".to_string())
+                && row.values()[5] == Value::Int64(0)
+        }));
+
+        let foreign_keys = db.execute("PRAGMA foreign_key_list(child)")?;
+        assert_eq!(foreign_keys.rows().len(), 1);
+        assert_eq!(
+            foreign_keys.rows()[0].values()[2],
+            Value::Text("parent".to_string())
+        );
+        assert_eq!(
+            foreign_keys.rows()[0].values()[6],
+            Value::Text("CASCADE".to_string())
+        );
+
+        let checkpoint = db.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        assert_eq!(
+            checkpoint.columns(),
+            &[
+                "busy".to_string(),
+                "log".to_string(),
+                "checkpointed".to_string()
+            ]
+        );
+        assert!(checkpoint.rows()[0]
+            .values()
+            .iter()
+            .all(|value| matches!(value, Value::Int64(v) if *v >= 0)));
+
+        assert_eq!(
+            db.execute("PRAGMA busy_timeout")?.rows()[0].values(),
+            &[Value::Int64(0)]
+        );
+        db.execute("PRAGMA busy_timeout = 1250")?;
+        assert_eq!(
+            db.execute("PRAGMA busy_timeout")?.rows()[0].values(),
+            &[Value::Int64(1_250)]
+        );
+        assert_eq!(
+            db.execute("PRAGMA journal_mode = WAL")?.rows()[0].values(),
+            &[Value::Text("wal".to_string())]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn application_metadata_pragmas_are_durable_and_transactional() -> Result<()> {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("application-pragmas.ddb");
+        {
+            let db = Db::open_or_create(&path, DbConfig::default())?;
+            assert_eq!(
+                db.execute("PRAGMA user_version")?.rows()[0].values(),
+                &[Value::Int64(0)]
+            );
+            db.execute("PRAGMA user_version = 42")?;
+            db.execute("PRAGMA application_id = -7")?;
+            db.execute("BEGIN")?;
+            db.execute("PRAGMA user_version = 99")?;
+            assert_eq!(
+                db.execute("PRAGMA user_version")?.rows()[0].values(),
+                &[Value::Int64(99)]
+            );
+            db.execute("ROLLBACK")?;
+            assert_eq!(
+                db.execute("PRAGMA user_version")?.rows()[0].values(),
+                &[Value::Int64(42)]
+            );
+        }
+
+        let reopened = Db::open_or_create(&path, DbConfig::default())?;
+        assert_eq!(
+            reopened.execute("PRAGMA user_version")?.rows()[0].values(),
+            &[Value::Int64(42)]
+        );
+        assert_eq!(
+            reopened.execute("PRAGMA application_id")?.rows()[0].values(),
+            &[Value::Int64(-7)]
+        );
+        let out_of_range = reopened
+            .execute("PRAGMA user_version = 2147483648")
+            .expect_err("out-of-range user_version should fail");
+        assert!(out_of_range.to_string().contains("signed 32-bit"));
+        Ok(())
+    }
+
+    #[test]
+    fn compatibility_catalog_views_and_pragma_table_functions_work() -> Result<()> {
+        let db = Db::open_or_create(":memory:", DbConfig::default())?;
+        db.execute("CREATE TABLE audit(id INT)")?;
+        db.execute("CREATE TABLE users(id INT PRIMARY KEY, name TEXT)")?;
+        db.execute("CREATE INDEX users_name_idx ON users(name)")?;
+        db.execute("CREATE VIEW user_names AS SELECT name FROM users")?;
+        db.execute(
+            "CREATE TRIGGER users_ai AFTER INSERT ON users
+             FOR EACH ROW EXECUTE FUNCTION decentdb_exec_sql('INSERT INTO audit VALUES (1)')",
+        )?;
+        db.execute("CREATE TEMP TABLE temp_users(id INT)")?;
+        db.execute("CREATE TEMP VIEW temp_user_ids AS SELECT id FROM temp_users")?;
+
+        let schema = db.execute("SELECT type, name, tbl_name FROM sqlite_schema ORDER BY name")?;
+        let schema_rows = schema
+            .rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>();
+        assert!(schema_rows.contains(&vec![
+            Value::Text("table".to_string()),
+            Value::Text("users".to_string()),
+            Value::Text("users".to_string())
+        ]));
+        assert!(schema_rows.contains(&vec![
+            Value::Text("index".to_string()),
+            Value::Text("users_name_idx".to_string()),
+            Value::Text("users".to_string())
+        ]));
+        assert!(schema_rows.contains(&vec![
+            Value::Text("view".to_string()),
+            Value::Text("user_names".to_string()),
+            Value::Text("user_names".to_string())
+        ]));
+        assert!(schema_rows.contains(&vec![
+            Value::Text("trigger".to_string()),
+            Value::Text("users_ai".to_string()),
+            Value::Text("users".to_string())
+        ]));
+        assert!(!schema_rows.iter().any(|row| {
+            row.iter()
+                .any(|value| matches!(value, Value::Text(text) if text.starts_with("__decentdb_")))
+        }));
+
+        let temp_schema = db.execute("SELECT type, name FROM temp.sqlite_schema ORDER BY name")?;
+        assert!(temp_schema.rows().iter().any(|row| {
+            row.values()[0] == Value::Text("table".to_string())
+                && row.values()[1] == Value::Text("temp_users".to_string())
+        }));
+        assert!(temp_schema.rows().iter().any(|row| {
+            row.values()[0] == Value::Text("view".to_string())
+                && row.values()[1] == Value::Text("temp_user_ids".to_string())
+        }));
+        assert!(db
+            .execute("INSERT INTO sqlite_schema(type, name, tbl_name, rootpage, sql) VALUES ('table', 'x', 'x', 0, NULL)")
+            .is_err());
+
+        let table_info = db.execute("SELECT name FROM pragma_table_info('users') WHERE pk = 1")?;
+        assert_eq!(
+            table_info.rows()[0].values(),
+            &[Value::Text("id".to_string())]
+        );
+        let table_list =
+            db.execute("SELECT name FROM pragma_table_list() WHERE schema = 'main' ORDER BY name")?;
+        assert!(table_list
+            .rows()
+            .iter()
+            .any(|row| row.values()[0] == Value::Text("users".to_string())));
+        let index_info = db.execute("SELECT name FROM pragma_index_info('users_name_idx')")?;
+        assert_eq!(
+            index_info.rows()[0].values(),
+            &[Value::Text("name".to_string())]
+        );
+        let databases = db.execute("SELECT name FROM pragma_database_list()")?;
+        assert_eq!(
+            databases.rows()[0].values(),
+            &[Value::Text("main".to_string())]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn information_schema_views_expose_minimal_metadata() -> Result<()> {
+        let db = Db::open_or_create(":memory:", DbConfig::default())?;
+        db.execute("CREATE SCHEMA app")?;
+        db.execute("CREATE TABLE users(id INT PRIMARY KEY, name TEXT NOT NULL)")?;
+        db.execute("CREATE VIEW user_names AS SELECT name FROM users")?;
+        db.execute("CREATE TEMP TABLE temp_users(id INT)")?;
+
+        let schemata =
+            db.execute("SELECT schema_name FROM information_schema.schemata ORDER BY schema_name")?;
+        let schema_names = schemata
+            .rows()
+            .iter()
+            .map(|row| row.values()[0].clone())
+            .collect::<Vec<_>>();
+        assert!(schema_names.contains(&Value::Text("app".to_string())));
+        assert!(schema_names.contains(&Value::Text("main".to_string())));
+        assert!(schema_names.contains(&Value::Text("temp".to_string())));
+
+        let tables = db.execute(
+            "SELECT table_schema, table_name, table_type FROM information_schema.tables ORDER BY table_name",
+        )?;
+        assert!(tables.rows().iter().any(|row| {
+            row.values()
+                == [
+                    Value::Text("main".to_string()),
+                    Value::Text("users".to_string()),
+                    Value::Text("BASE TABLE".to_string()),
+                ]
+        }));
+        assert!(tables.rows().iter().any(|row| {
+            row.values()
+                == [
+                    Value::Text("temp".to_string()),
+                    Value::Text("temp_users".to_string()),
+                    Value::Text("LOCAL TEMPORARY".to_string()),
+                ]
+        }));
+
+        let columns = db.execute(
+            "SELECT column_name, ordinal_position, is_nullable, data_type
+             FROM information_schema.columns
+             WHERE table_name = 'users'
+             ORDER BY ordinal_position",
+        )?;
+        assert_eq!(
+            columns.rows()[0].values(),
+            &[
+                Value::Text("id".to_string()),
+                Value::Int64(1),
+                Value::Text("NO".to_string()),
+                Value::Text("INT64".to_string())
+            ]
+        );
+        assert_eq!(
+            columns.rows()[1].values(),
+            &[
+                Value::Text("name".to_string()),
+                Value::Int64(2),
+                Value::Text("NO".to_string()),
+                Value::Text("TEXT".to_string())
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn generate_series_supports_required_integer_and_temporal_forms() -> Result<()> {
+        let db = Db::open_or_create(":memory:", DbConfig::default())?;
+        let ints = db.execute("SELECT value FROM generate_series(1, 5, 2)")?;
+        assert_eq!(
+            ints.rows()
+                .iter()
+                .map(|row| row.values()[0].clone())
+                .collect::<Vec<_>>(),
+            vec![Value::Int64(1), Value::Int64(3), Value::Int64(5)]
+        );
+        let descending = db.execute("SELECT value FROM generate_series(3, 1, -1)")?;
+        assert_eq!(
+            descending
+                .rows()
+                .iter()
+                .map(|row| row.values()[0].clone())
+                .collect::<Vec<_>>(),
+            vec![Value::Int64(3), Value::Int64(2), Value::Int64(1)]
+        );
+        assert_eq!(
+            db.execute("SELECT value FROM generate_series(5, 1)")?
+                .rows()
+                .len(),
+            0
+        );
+        assert!(db
+            .execute("SELECT value FROM generate_series(1, 5, 0)")
+            .expect_err("zero step should fail")
+            .to_string()
+            .contains("step cannot be zero"));
+        assert!(db
+            .execute("SELECT value FROM generate_series(1, 1000002)")
+            .expect_err("large series should fail")
+            .to_string()
+            .contains("1000000"));
+
+        let timestamps = db.execute(
+            "SELECT value FROM generate_series(
+                TIMESTAMP '2026-01-01 00:00:00',
+                TIMESTAMP '2026-01-01 02:00:00',
+                INTERVAL '1 hour'
+            )",
+        )?;
+        assert_eq!(
+            timestamps
+                .rows()
+                .iter()
+                .map(|row| row.values()[0].clone())
+                .collect::<Vec<_>>(),
+            vec![
+                Value::TimestampMicros(1_767_225_600_000_000),
+                Value::TimestampMicros(1_767_229_200_000_000),
+                Value::TimestampMicros(1_767_232_800_000_000)
+            ]
+        );
+        let dates = db.execute(
+            "SELECT value FROM generate_series(
+                DATE '2026-01-01',
+                DATE '2026-01-03',
+                INTERVAL '1 day'
+            )",
+        )?;
+        assert_eq!(
+            dates
+                .rows()
+                .iter()
+                .map(|row| row.values()[0].clone())
+                .collect::<Vec<_>>(),
+            vec![
+                Value::DateDays(20_454),
+                Value::DateDays(20_455),
+                Value::DateDays(20_456)
+            ]
+        );
+
+        let prepared = db.prepare("SELECT value FROM generate_series($1, $2, $3)")?;
+        let prepared_rows =
+            prepared.execute(&[Value::Int64(2), Value::Int64(6), Value::Int64(2)])?;
+        assert_eq!(
+            prepared_rows
+                .rows()
+                .iter()
+                .map(|row| row.values()[0].clone())
+                .collect::<Vec<_>>(),
+            vec![Value::Int64(2), Value::Int64(4), Value::Int64(6)]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn main_and_temp_schema_qualified_names_are_narrowly_supported() -> Result<()> {
+        let db = Db::open_or_create(":memory:", DbConfig::default())?;
+        db.execute("CREATE TABLE main.shadow(id INT PRIMARY KEY, note TEXT)")?;
+        db.execute("CREATE TEMP TABLE temp.shadow(id INT PRIMARY KEY)")?;
+        db.execute("INSERT INTO main.shadow VALUES (1, 'main')")?;
+        db.execute("INSERT INTO temp.shadow VALUES (2)")?;
+
+        assert_eq!(
+            db.execute("SELECT id FROM shadow")?.rows()[0].values(),
+            &[Value::Int64(2)]
+        );
+        assert_eq!(
+            db.execute("SELECT id FROM main.shadow")?.rows()[0].values(),
+            &[Value::Int64(1)]
+        );
+        assert_eq!(
+            db.execute("SELECT id FROM temp.shadow")?.rows()[0].values(),
+            &[Value::Int64(2)]
+        );
+
+        db.execute("UPDATE main.shadow SET note = 'updated' WHERE id = 1")?;
+        db.execute("DELETE FROM temp.shadow WHERE id = 2")?;
+        assert_eq!(
+            db.execute("SELECT note FROM main.shadow")?.rows()[0].values(),
+            &[Value::Text("updated".to_string())]
+        );
+        assert_eq!(db.execute("SELECT * FROM temp.shadow")?.rows().len(), 0);
+
+        db.execute("CREATE VIEW main.shadow_view AS SELECT id FROM main.shadow")?;
+        assert_eq!(
+            db.execute("SELECT id FROM main.shadow_view")?.rows()[0].values(),
+            &[Value::Int64(1)]
+        );
+        db.execute("CREATE TEMP VIEW temp.empty_shadow AS SELECT id FROM temp.shadow")?;
+        assert_eq!(
+            db.execute("SELECT * FROM temp.empty_shadow")?.rows().len(),
+            0
+        );
+        db.execute("CREATE INDEX shadow_note_idx ON main.shadow(note)")?;
+        db.execute("DROP INDEX shadow_note_idx")?;
+        db.execute("ALTER TABLE main.shadow ADD COLUMN extra TEXT")?;
+        db.execute("DROP VIEW main.shadow_view")?;
+        db.execute("DROP TABLE main.shadow")?;
+        db.execute("DROP TABLE temp.shadow")?;
+
+        db.execute("CREATE SCHEMA app")?;
+        let schema_error = db
+            .execute("SELECT * FROM app.shadow")
+            .expect_err("registered schema object lookup should fail");
+        assert!(schema_error.to_string().contains("schema 'app'"));
+        assert!(schema_error
+            .to_string()
+            .contains("advanced compatibility work"));
+        Ok(())
+    }
+
+    #[test]
+    fn query_time_collations_and_scalar_compatibility_helpers_work() -> Result<()> {
+        let db = Db::open_or_create(":memory:", DbConfig::default())?;
+        db.execute("CREATE TABLE names(name TEXT)")?;
+        db.execute("INSERT INTO names VALUES ('b'), ('A'), ('a'), ('a ')")?;
+
+        let ordered = db.execute("SELECT name FROM names ORDER BY name COLLATE NOCASE")?;
+        assert_eq!(
+            ordered
+                .rows()
+                .iter()
+                .map(|row| row.values()[0].clone())
+                .collect::<Vec<_>>(),
+            vec![
+                Value::Text("A".to_string()),
+                Value::Text("a".to_string()),
+                Value::Text("a ".to_string()),
+                Value::Text("b".to_string())
+            ]
+        );
+        assert_eq!(
+            db.execute("SELECT COUNT(*) FROM names WHERE name COLLATE NOCASE = 'a'")?
+                .rows()[0]
+                .values(),
+            &[Value::Int64(2)]
+        );
+        assert_eq!(
+            db.execute("SELECT 'a ' COLLATE RTRIM = 'a'")?.rows()[0].values(),
+            &[Value::Bool(true)]
+        );
+        assert!(db
+            .execute("SELECT 'a' COLLATE unicode = 'A'")
+            .expect_err("unsupported collation should fail")
+            .to_string()
+            .contains("unsupported collation"));
+        assert!(db
+            .execute("CREATE INDEX names_nocase_idx ON names(name COLLATE NOCASE)")
+            .expect_err("persistent non-binary index collation should fail")
+            .to_string()
+            .contains("persistent index collations"));
+        assert!(db
+            .execute("SELECT DISTINCT name COLLATE NOCASE FROM names")
+            .expect_err("collated distinct should fail clearly")
+            .to_string()
+            .contains("COLLATE in DISTINCT"));
+        assert!(db
+            .execute("SELECT name COLLATE NOCASE FROM names GROUP BY name COLLATE NOCASE")
+            .expect_err("collated group by should fail clearly")
+            .to_string()
+            .contains("COLLATE in GROUP BY"));
+
+        let helpers = db.execute(
+            "SELECT current_database(), current_schema(), database(), schema(), version()",
+        )?;
+        assert_eq!(
+            helpers.rows()[0].values()[0],
+            Value::Text("main".to_string())
+        );
+        assert_eq!(
+            helpers.rows()[0].values()[1],
+            Value::Text("main".to_string())
+        );
+        assert_eq!(
+            helpers.rows()[0].values()[2],
+            Value::Text("main".to_string())
+        );
+        assert_eq!(
+            helpers.rows()[0].values()[3],
+            Value::Text("main".to_string())
+        );
+        assert!(
+            matches!(&helpers.rows()[0].values()[4], Value::Text(version) if version.starts_with("DecentDB "))
+        );
+        assert!(db
+            .execute("SELECT sqlite_version()")
+            .expect_err("sqlite_version should not lie")
+            .to_string()
+            .contains("not SQLite"));
+        assert!(db
+            .execute("SELECT pg_backend_pid()")
+            .expect_err("pg_backend_pid should not be faked")
+            .to_string()
+            .contains("embedded"));
+        Ok(())
     }
 
     #[test]

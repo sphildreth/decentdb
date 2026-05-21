@@ -119,9 +119,10 @@ pub(crate) fn expr_references_outer(
                     .iter()
                     .any(|local_table| identifiers_equal(local_table, table_name))
         }),
-        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
-            expr_references_outer(expr, outer_tables, local_tables)
-        }
+        Expr::Unary { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Collate { expr, .. } => expr_references_outer(expr, outer_tables, local_tables),
         Expr::Binary { left, right, .. } => {
             expr_references_outer(left, outer_tables, local_tables)
                 || expr_references_outer(right, outer_tables, local_tables)
@@ -325,9 +326,10 @@ pub(crate) fn expr_contains_recursive_unsupported_feature(expr: &Expr) -> bool {
         | Expr::CompareSubquery { .. }
         | Expr::ScalarSubquery(_)
         | Expr::Exists(_) => true,
-        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
-            expr_contains_recursive_unsupported_feature(expr)
-        }
+        Expr::Unary { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Collate { expr, .. } => expr_contains_recursive_unsupported_feature(expr),
         Expr::Binary { left, right, .. } => {
             expr_contains_recursive_unsupported_feature(left)
                 || expr_contains_recursive_unsupported_feature(right)

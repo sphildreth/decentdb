@@ -2,7 +2,7 @@
 
 **Status:** Consolidated roadmap
 
-**Updated:** 2026-05-20
+**Updated:** 2026-05-21
 
 **Supersedes:** earlier DecentDB future-wins roadmap drafts for roadmap prioritization
 
@@ -57,6 +57,7 @@ instead of brand-new roadmap items.
 | Reactive subscriptions and change streams | [ADR 0164](adr/0164-reactive-query-subscriptions-and-change-streams.md), [`WIN_REACTIVE_QUERY_SUBSCRIPTIONS_CHANGE_STREAMS_SPEC.md`](WIN_REACTIVE_QUERY_SUBSCRIPTIONS_CHANGE_STREAMS_SPEC.md) | Future projection and sync-shape work can reuse committed invalidation/change-stream semantics instead of inventing another notification layer. |
 | Local-first sync slices 1-8 | [`WIN_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md`](WIN_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md) | Future work should harden production relay, browser/mobile transport, public changesets, and diagnostics rather than rebuild sync from scratch. |
 | Production sync relay and public changeset API | [`WIN_PRODUCTION_RELAY_SPEC.md`](WIN_PRODUCTION_RELAY_SPEC.md); ADR 0166-0168; [`docs/user-guide/sync/relay.md`](../docs/user-guide/sync/relay.md); [`docs/user-guide/sync/changesets.md`](../docs/user-guide/sync/changesets.md) | Public changesets, authenticated relay v2 HTTP/WebSocket routes, sync shapes, browser relay helpers, C ABI JSON entry points, .NET JSON helpers, and relay diagnostics are now delivered foundations. |
+| SQL and PRAGMA compatibility quick wins | [`WIN_SQL_PRAGMA_COMPATIBILITY_QUICK_WINS_SPEC.md`](WIN_SQL_PRAGMA_COMPATIBILITY_QUICK_WINS_SPEC.md); [`docs/user-guide/sql-reference.md`](../docs/user-guide/sql-reference.md); [`docs/api/configuration.md`](../docs/api/configuration.md) | Safe SQLite-style PRAGMAs, compatibility catalog views, minimal `information_schema`, `generate_series`, `main.`/`temp.` qualifiers, query-time built-in collations, and scalar compatibility helpers are delivered onboarding surfaces. |
 | Branch, diff, restore, and time travel | ADR 0153-0159, [`docs/api/cli-reference.md`](../docs/api/cli-reference.md#branch) | Future migration and agent workflows should use branches as the safe rehearsal layer. |
 | WASM/OPFS browser v1 | ADR 0161, [`docs/api/wasm.md`](../docs/api/wasm.md) | Future browser work is about multi-tab coordination, parser/API parity, sync transport, quota diagnostics, and performance. |
 | Production browser runtime | [`WIN_PRODUCTION_BROWSER_RUNTIM.md`](WIN_PRODUCTION_BROWSER_RUNTIM.md), [ADR 0165](adr/0165-production-browser-runtime-contract.md), [`docs/api/wasm.md`](../docs/api/wasm.md), and `@decentdb/web` updates | Browser runtime now has explicit capability probes, owner coordination policy, service-worker policy, browser diagnostics, and tiered matrix guidance; follow-on work remains under sync relay and cross-process coordination wins. |
@@ -84,21 +85,20 @@ shipped foundation affects follow-on roadmap decisions.
 |---:|---|---|---|---|---|
 | 1 | vNext+2 | TODO | Local data security: TDE, policies, masking, audit context | Needs ADR/spec | TDE is table stakes for SQLCipher-style onboarding; policy is the differentiated regulated/offline story |
 | 2 | vNext+2 | TODO | Lua extension runtime and package model | [`WIN_LUA_EXTENSION_RUNTIME_SPEC.md`](WIN_LUA_EXTENSION_RUNTIME_SPEC.md) | One sandboxed extension language is supportable across native, mobile, and WASM targets |
-| 3 | vNext+2 | TODO | SQL and PRAGMA compatibility quick wins | [`WIN_SQL_PRAGMA_COMPATIBILITY_QUICK_WINS_SPEC.md`](WIN_SQL_PRAGMA_COMPATIBILITY_QUICK_WINS_SPEC.md) | Low-friction onboarding from SQLite/PostgreSQL code without chasing full clone compatibility |
-| 4 | vNext+3 | TODO | Full-text search with BM25 ranking | Needs ADR/spec | Expected by app databases and a real SQLite FTS migration blocker |
-| 5 | vNext+3 | TODO | Cross-process WAL coordination | Needs ADR/spec | Important for Electron/Tauri, helper processes, CLI coexistence, and background sync workers |
-| 6 | vNext+3 | TODO | Runtime tracing, advisors, and Doctor integration | Needs ADR/spec; follows shipped operational metrics | Adds slow-query/lock-wait history, index usage, doctor findings, and advisor surfaces once the metrics contract is stable |
-| 7 | vNext+3 | BACKLOG | Branch-aware migration rehearsal and promotion | ADR 0153-0159 and branch CLI/API docs; needs ADR/spec | More distinctive than generic online migration and uses shipped branch/diff foundations |
-| 8 | vNext+3 | BACKLOG | Agent and tooling integration mode | [`STABLE_TOOLING_METADATA_CONTRACT.md`](STABLE_TOOLING_METADATA_CONTRACT.md); needs ADR/spec | Makes the "agent-friendly" promise concrete without putting LLM behavior in the engine |
-| 9 | vNext+3 | BACKLOG | Application and support bundle format | Needs ADR/spec | Useful portable artifact and diagnostics story, but not more urgent than runtime friction |
-| 10 | vNext+3 | BACKLOG | Incrementally maintained projections | Needs ADR/spec | Accelerates dashboards, local read models, and reactive query workloads |
-| 11 | vNext+3 | BACKLOG | JSONB binary storage | Needs ADR/spec | Important for JSON-heavy workloads, but less urgent than FTS and runtime fundamentals |
-| 12 | Later | BACKLOG | Native vector / HNSW index | Needs ADR/spec | Valuable for offline AI/RAG, but less universal than FTS and security |
-| 13 | Later | BACKLOG | Temporal row history and auditable state | Needs ADR/spec | Strong regulated/support workflow, but should follow security and sync hardening |
-| 14 | Later | BACKLOG | Advanced geospatial semantics and analytics | ADR 0128 deferred work; needs follow-up ADR/spec | Builds on shipped spatial support without implying the foundation is unfinished |
-| 15 | Later | BACKLOG | Advanced SQL compatibility surface | [`WIN_ADVANCED_SQL_COMPATIBILITY_SURFACE.md`](WIN_ADVANCED_SQL_COMPATIBILITY_SURFACE.md) | Useful adoption polish after quick wins and higher-impact app workflows |
-| 16 | Later | BACKLOG | WAL streaming replication | Needs ADR/spec | Useful HA/read-scale story, but weaker than local-first sync for DecentDB identity |
-| 17 | Later | BACKLOG | Cloud-native object storage VFS | Needs ADR/spec | Interesting edge/serverless story with high durability and consistency complexity |
+| 3 | vNext+3 | TODO | Full-text search with BM25 ranking | Needs ADR/spec | Expected by app databases and a real SQLite FTS migration blocker |
+| 4 | vNext+3 | TODO | Cross-process WAL coordination | Needs ADR/spec | Important for Electron/Tauri, helper processes, CLI coexistence, and background sync workers |
+| 5 | vNext+3 | TODO | Runtime tracing, advisors, and Doctor integration | Needs ADR/spec; follows shipped operational metrics | Adds slow-query/lock-wait history, index usage, doctor findings, and advisor surfaces once the metrics contract is stable |
+| 6 | vNext+3 | BACKLOG | Branch-aware migration rehearsal and promotion | ADR 0153-0159 and branch CLI/API docs; needs ADR/spec | More distinctive than generic online migration and uses shipped branch/diff foundations |
+| 7 | vNext+3 | BACKLOG | Agent and tooling integration mode | [`STABLE_TOOLING_METADATA_CONTRACT.md`](STABLE_TOOLING_METADATA_CONTRACT.md); needs ADR/spec | Makes the "agent-friendly" promise concrete without putting LLM behavior in the engine |
+| 8 | vNext+3 | BACKLOG | Application and support bundle format | Needs ADR/spec | Useful portable artifact and diagnostics story, but not more urgent than runtime friction |
+| 9 | vNext+3 | BACKLOG | Incrementally maintained projections | Needs ADR/spec | Accelerates dashboards, local read models, and reactive query workloads |
+| 10 | vNext+3 | BACKLOG | JSONB binary storage | Needs ADR/spec | Important for JSON-heavy workloads, but less urgent than FTS and runtime fundamentals |
+| 11 | Later | BACKLOG | Native vector / HNSW index | Needs ADR/spec | Valuable for offline AI/RAG, but less universal than FTS and security |
+| 12 | Later | BACKLOG | Temporal row history and auditable state | Needs ADR/spec | Strong regulated/support workflow, but should follow security and sync hardening |
+| 13 | Later | BACKLOG | Advanced geospatial semantics and analytics | ADR 0128 deferred work; needs follow-up ADR/spec | Builds on shipped spatial support without implying the foundation is unfinished |
+| 14 | Later | BACKLOG | Advanced SQL compatibility surface | [`WIN_ADVANCED_SQL_COMPATIBILITY_SURFACE.md`](WIN_ADVANCED_SQL_COMPATIBILITY_SURFACE.md) | Useful adoption polish after quick wins and higher-impact app workflows |
+| 15 | Later | BACKLOG | WAL streaming replication | Needs ADR/spec | Useful HA/read-scale story, but weaker than local-first sync for DecentDB identity |
+| 16 | Later | BACKLOG | Cloud-native object storage VFS | Needs ADR/spec | Interesting edge/serverless story with high durability and consistency complexity |
 
 ## Positioning
 
@@ -228,39 +228,7 @@ systems or unbounded native plugins.
 - Lua execution must be resource-bounded, cancellable, and converted into SQL
   errors without process corruption
 
-## 3. SQL And PRAGMA Compatibility Quick Wins
-
-**Status:** `TODO`
-
-**Future Version:** vNext+2
-
-**Source of truth:** [`WIN_SQL_PRAGMA_COMPATIBILITY_QUICK_WINS_SPEC.md`](WIN_SQL_PRAGMA_COMPATIBILITY_QUICK_WINS_SPEC.md).
-
-### Why This Matters
-
-Some compatibility items are low-effort, high-visibility onboarding wins. They
-make SQLite and PostgreSQL-adjacent code feel less foreign without committing
-DecentDB to clone every behavior.
-
-### Completion Target
-
-This is a single completion milestone, not an open-ended initial slice. The
-spec covers safe SQLite-style PRAGMA probes and assignments, schema
-introspection PRAGMAs, SQLite compatibility catalog views, minimal
-`information_schema`, `generate_series(...)`, narrow `main`/`temp`
-schema-qualified names, query-time built-in collations, and explicit unsupported
-behavior for compatibility features DecentDB should not emulate.
-
-### Guardrails
-
-- do not add a compatibility alias if it implies different durability semantics
-- do not make PRAGMA behavior silently diverge from SQLite in dangerous ways
-- keep heavier features such as user-defined types, exclusion constraints,
-  broad materialized-view semantics, and complex `MERGE` behavior in the
-  advanced SQL track unless a separate ADR narrows them
-- do not add core import/export features in this slice
-
-## 4. Full-Text Search With BM25 Ranking
+## 3. Full-Text Search With BM25 Ranking
 
 **Status:** `TODO`
 
@@ -293,7 +261,7 @@ tokenization, phrase search, and ranking.
 - define crash recovery and rebuild behavior before implementation
 - benchmark against representative SQLite FTS workloads
 
-## 5. Cross-Process WAL Coordination
+## 4. Cross-Process WAL Coordination
 
 **Status:** `TODO`
 
@@ -323,7 +291,7 @@ coexistence, and background sync workers.
 - ADR required because this changes locking and `Send`/`Sync` boundaries
 - browser multi-tab coordination is related but tracked separately
 
-## 6. Runtime Tracing, Advisors, And Doctor Integration
+## 5. Runtime Tracing, Advisors, And Doctor Integration
 
 **Status:** `TODO`
 
@@ -376,7 +344,7 @@ SELECT * FROM sys.doctor_findings;
 - advisor output must be reviewable and must not auto-apply destructive fixes
 - keep hot-path overhead measurable and benchmarked
 
-## 7. Branch-Aware Migration Rehearsal And Promotion
+## 6. Branch-Aware Migration Rehearsal And Promotion
 
 **Status:** `BACKLOG`
 
@@ -407,7 +375,7 @@ safe workflow: branch, migrate, validate, diff, detect drift, and promote.
 - branch merge semantics must stay conservative
 - do not hide destructive schema changes behind automatic promotion
 
-## 8. Agent And Tooling Integration Mode
+## 7. Agent And Tooling Integration Mode
 
 **Status:** `BACKLOG`
 
@@ -442,7 +410,7 @@ guessing.
 - Decent Bench remains the product home for rich visual workflows and generated
   SDK output
 
-## 9. Application And Support Bundle Format
+## 8. Application And Support Bundle Format
 
 **Status:** `BACKLOG`
 
@@ -477,7 +445,7 @@ A DecentDB bundle may contain:
 - support bundles must have a sanitization/redaction story before use with
   regulated data
 
-## 10. Incrementally Maintained Projections
+## 9. Incrementally Maintained Projections
 
 **Status:** `BACKLOG`
 
@@ -506,7 +474,7 @@ database-native capability that also accelerates reactive queries.
 - keep maintenance work visible in write latency and `sys.*`
 - define crash recovery and rebuild semantics before implementation
 
-## 11. JSONB Binary Storage
+## 10. JSONB Binary Storage
 
 **Status:** `BACKLOG`
 
@@ -529,7 +497,7 @@ more effective.
 - large JSONB uses existing overflow page mechanics
 - partial updates rebuild the binary blob through the single writer
 
-## 12. Native Vector / HNSW Index
+## 11. Native Vector / HNSW Index
 
 **Status:** `BACKLOG`
 
@@ -558,7 +526,7 @@ faster and easier to operate.
 - WASM/mobile portability story
 - benchmarks against common vector-search extensions
 
-## 13. Temporal Row History And Auditable State
+## 12. Temporal Row History And Auditable State
 
 **Status:** `BACKLOG`
 
@@ -587,7 +555,7 @@ auditable local data. Some regulated and support-heavy apps need to answer:
 - redaction must be compatible with retention and audit requirements
 - do not conflate branch snapshots with row-level audit history
 
-## 14. Advanced Geospatial Semantics And Analytics
+## 13. Advanced Geospatial Semantics And Analytics
 
 **Status:** `BACKLOG`
 
@@ -619,7 +587,7 @@ the completed native geospatial feature does not appear unfinished.
 - avoid native GEOS/PROJ/GDAL dependencies unless an ADR justifies the tradeoff
 - keep WASM compatibility as a design constraint
 
-## 15. Advanced SQL Compatibility Surface
+## 14. Advanced SQL Compatibility Surface
 
 **Status:** `BACKLOG`
 
@@ -631,8 +599,8 @@ the completed native geospatial feature does not appear unfinished.
 
 DecentDB already has a broad practical SQL surface for an embedded engine. The
 remaining advanced compatibility work is useful for migrations, ORMs, power
-users, and PostgreSQL-adjacent application code. Quick wins are tracked earlier;
-this item is for heavier compatibility work.
+users, and PostgreSQL-adjacent application code. The quick-win compatibility
+layer is delivered; this item is for heavier compatibility work.
 
 ### Current Direction
 
@@ -655,7 +623,7 @@ this item is for heavier compatibility work.
   ergonomics
 - avoid expanding core import/export features in this track
 
-## 16. WAL Streaming Replication
+## 15. WAL Streaming Replication
 
 **Status:** `BACKLOG`
 
@@ -680,7 +648,7 @@ traditional HA problem.
 - quorum acknowledgement
 - explicit consistency/durability tradeoffs
 
-## 17. Cloud-Native Object Storage VFS
+## 16. Cloud-Native Object Storage VFS
 
 **Status:** `BACKLOG`
 

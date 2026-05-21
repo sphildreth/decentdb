@@ -22,6 +22,7 @@ queries, syncable offline data, and language bindings that feel native.
 | Browser WASM and OPFS | `@decentdb/web` runs DecentDB in a Dedicated Worker with OPFS persistence, an async TypeScript API, binary result transport, and browser smoke/benchmark coverage. |
 | Branch, diff, restore, and time travel | Durable named snapshots, branch-local writes, diff reports, guarded restore, and constrained merge workflows for migration rehearsal and support/debugging. |
 | Practical PostgreSQL-like SQL | Familiar DDL/DML, joins, CTEs, window functions, set operations, upsert, `RETURNING`, savepoints, triggers, generated columns, JSON functions, and rich scalar functions. |
+| SQL compatibility helpers | Safe SQLite-style PRAGMAs, `sqlite_schema`, minimal `information_schema`, `generate_series`, `main.`/`temp.` qualifiers, and query-time built-in collations ease tool and migration onboarding. |
 | Application-friendly types | Native `INT64`, `FLOAT64`, `BOOL`, `TEXT`, `BLOB`, `DECIMAL`, `UUID`, `DATE`, and `TIMESTAMP`. |
 | Indexed substring search | Native trigram indexes accelerate interactive `LIKE '%pattern%'` queries. |
 | Multi-language embedding | C ABI plus .NET, Go, Python, Node.js, Dart/Flutter, and JDBC bindings. |
@@ -38,6 +39,10 @@ queries, syncable offline data, and language bindings that feel native.
 - **Temporary tables and views** scoped to the current session.
 - **JSON support** including scalar functions and table-valued functions such
   as `json_each` and `json_tree`.
+- **SQL compatibility helpers** including safe SQLite-style PRAGMAs,
+  `sqlite_schema`, minimal `information_schema`, `generate_series`,
+  `main.`/`temp.` qualifiers, and query-time `BINARY`, `NOCASE`, and `RTRIM`
+  collations.
 - **Triggers** for application-side logic, including supported `AFTER` and
   `INSTEAD OF` trigger paths.
 - **Bulk-load, CSV, and JSON import/export** workflows.

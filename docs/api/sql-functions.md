@@ -4,6 +4,85 @@ This page documents SQL functions and aggregate/window additions recently implem
 
 For broader syntax coverage, see the SQL reference and feature matrix.
 
+## Compatibility catalog and introspection surfaces
+
+DecentDB exposes a narrow read-only compatibility layer for SQLite and
+PostgreSQL-adjacent tooling. These are virtual SQL surfaces, not persistent
+catalog tables.
+
+### SQLite compatibility catalog views
+
+```sql
+SELECT * FROM sqlite_schema;
+SELECT * FROM sqlite_master;
+SELECT * FROM sqlite_temp_schema;
+SELECT * FROM temp.sqlite_schema;
+```
+
+`sqlite_schema` and `sqlite_master` expose `type`, `name`, `tbl_name`,
+`rootpage`, and `sql`. `rootpage` is always `0` because DecentDB does not expose
+SQLite B-tree root pages. Temporary schema aliases expose session-scoped temp
+tables, views, and indexes.
+
+### Minimal `information_schema`
+
+```sql
+SELECT * FROM information_schema.schemata;
+SELECT * FROM information_schema.tables;
+SELECT * FROM information_schema.columns;
+```
+
+`information_schema.schemata` includes `main`, `temp`, and registered schemas.
+`information_schema.tables` and `information_schema.columns` expose visible
+persistent and temporary table/view metadata with DecentDB type names.
+
+### SQLite-compatible PRAGMA table functions
+
+The following functions mirror the corresponding PRAGMA shapes and may be used
+in `FROM` clauses, joins, filters, and projections:
+
+```sql
+SELECT * FROM pragma_table_info('users');
+SELECT * FROM pragma_table_xinfo('users');
+SELECT * FROM pragma_table_list();
+SELECT * FROM pragma_index_list('users');
+SELECT * FROM pragma_index_info('users_name_idx');
+SELECT * FROM pragma_index_xinfo('users_name_idx');
+SELECT * FROM pragma_foreign_key_list('orders');
+SELECT * FROM pragma_database_list();
+```
+
+`main.` and `temp.` prefixes are accepted for these functions. Unknown table or
+index names return an empty result set for the table-valued helpers.
+
+### `generate_series`
+
+`generate_series(start, stop [, step])` returns one visible column named
+`value`. It supports inclusive integer series with an optional integer step,
+timestamp series with an explicit `INTERVAL`, and date series with an explicit
+whole-day `INTERVAL`.
+
+```sql
+SELECT value FROM generate_series(1, 5);
+SELECT value FROM generate_series(5, 1, -1);
+SELECT value FROM generate_series(
+  TIMESTAMP '2026-01-01 00:00:00',
+  TIMESTAMP '2026-01-01 02:00:00',
+  INTERVAL '1 hour'
+);
+```
+
+Zero steps are rejected, temporal series require an explicit interval, and a
+series may not produce more than 1,000,000 rows.
+
+### Compatibility scalar helpers
+
+- `current_database()` and `current_schema()` return `main`.
+- `database()` and `schema()` are compatibility aliases returning `main`.
+- `version()` returns a DecentDB version string.
+- `sqlite_version()` and `pg_backend_pid()` are rejected rather than returning
+  misleading SQLite or PostgreSQL server values.
+
 ## Operational inspection views
 
 DecentDB exposes operational inspection surfaces through stable, read-only `sys.*`

@@ -38,34 +38,42 @@ impl EngineRuntime {
     }
 
     pub(super) fn execute_create_table(&mut self, statement: &CreateTableStatement) -> Result<()> {
-        if statement.temporary {
-            if self.temp_relation_exists(&statement.table_name) {
-                if statement.if_not_exists
-                    && self.temp_table_schema(&statement.table_name).is_some()
-                {
+        let (qualifier, object_name) = super::compat_schema_qualified_name(&statement.table_name);
+        if statement.temporary && qualifier == Some(super::CompatSchemaQualifier::Main) {
+            return Err(DbError::sql(
+                "temporary tables cannot be created in the main schema",
+            ));
+        }
+        let temporary =
+            statement.temporary || qualifier == Some(super::CompatSchemaQualifier::Temp);
+        let table_name = object_name.to_string();
+
+        if temporary {
+            if self.temp_relation_exists(&table_name) {
+                if statement.if_not_exists && self.temp_table_schema(&table_name).is_some() {
                     return Ok(());
                 }
                 return Err(DbError::sql(format!(
                     "object {} already exists",
-                    statement.table_name
+                    table_name
                 )));
             }
-        } else if self.catalog.contains_object(&statement.table_name) {
-            if statement.if_not_exists && self.catalog.table(&statement.table_name).is_some() {
+        } else if self.catalog.contains_object(&table_name) {
+            if statement.if_not_exists && self.catalog.table(&table_name).is_some() {
                 return Ok(());
             }
             return Err(DbError::sql(format!(
                 "object {} already exists",
-                statement.table_name
+                table_name
             )));
         }
 
         let mut columns = statement
             .columns
             .iter()
-            .map(|definition| column_schema_from_definition(&statement.table_name, definition))
+            .map(|definition| column_schema_from_definition(&table_name, definition))
             .collect::<Result<Vec<_>>>()?;
-        ensure_unique_column_names(&columns, &statement.table_name)?;
+        ensure_unique_column_names(&columns, &table_name)?;
 
         let mut table_checks = Vec::new();
         let mut foreign_keys = Vec::new();
@@ -112,7 +120,7 @@ impl EngineRuntime {
                 .ok_or_else(|| {
                     DbError::sql(format!(
                         "primary key column {} does not exist on {}",
-                        primary_key_column, statement.table_name
+                        primary_key_column, table_name
                     ))
                 })?;
             if column.generated_sql.is_some() {
@@ -130,8 +138,8 @@ impl EngineRuntime {
         }
 
         let table = TableSchema {
-            name: statement.table_name.clone(),
-            temporary: statement.temporary,
+            name: table_name.clone(),
+            temporary,
             columns,
             checks: table_checks,
             foreign_keys,
@@ -184,10 +192,9 @@ impl EngineRuntime {
                     fresh: false,
                 });
             }
-            self.temp_tables_mut()
-                .insert(statement.table_name.clone(), table);
+            self.temp_tables_mut().insert(table_name.clone(), table);
             self.temp_table_data_map_mut()
-                .insert(statement.table_name.clone(), Arc::new(TableData::default()));
+                .insert(table_name.clone(), Arc::new(TableData::default()));
             for index in temp_indexes {
                 self.temp_indexes_mut().insert(index.name.clone(), index);
             }
@@ -198,9 +205,9 @@ impl EngineRuntime {
 
         self.catalog_mut()
             .tables
-            .insert(statement.table_name.clone(), table.clone());
+            .insert(table_name.clone(), table.clone());
         self.tables_mut()
-            .insert(statement.table_name.clone(), TableData::default().into());
+            .insert(table_name.clone(), TableData::default().into());
 
         if !table.primary_key_columns.is_empty() {
             self.insert_index_schema(IndexSchema {
@@ -276,13 +283,21 @@ impl EngineRuntime {
         statement: &CreateIndexStatement,
         _page_size: u32,
     ) -> Result<()> {
-        if self.catalog.contains_object(&statement.index_name) {
-            if statement.if_not_exists && self.catalog.indexes.contains_key(&statement.index_name) {
+        let (index_qualifier, index_object) =
+            super::compat_schema_qualified_name(&statement.index_name);
+        if index_qualifier == Some(super::CompatSchemaQualifier::Temp) {
+            return Err(DbError::sql(
+                "CREATE INDEX in the temp schema is not supported; temporary tables are connection-local",
+            ));
+        }
+        let index_name = index_object.to_string();
+        if self.catalog.contains_object(&index_name) {
+            if statement.if_not_exists && self.catalog.indexes.contains_key(&index_name) {
                 return Ok(());
             }
             return Err(DbError::sql(format!(
                 "object {} already exists",
-                statement.index_name
+                index_name
             )));
         }
         if self.visible_table_is_temporary(&statement.table_name) {
@@ -303,6 +318,7 @@ impl EngineRuntime {
         let table = self
             .table_schema(&statement.table_name)
             .ok_or_else(|| DbError::sql(format!("unknown table {}", statement.table_name)))?;
+        let table_name = table.name.clone();
 
         let access_method = if statement.access_method.is_empty() {
             "btree".to_string()
@@ -466,8 +482,8 @@ impl EngineRuntime {
         }
 
         self.insert_index_schema(IndexSchema {
-            name: statement.index_name.clone(),
-            table_name: statement.table_name.clone(),
+            name: index_name,
+            table_name: table_name.clone(),
             kind,
             unique: statement.unique,
             columns: statement
@@ -506,10 +522,8 @@ impl EngineRuntime {
                 })
                 .collect();
             if !column_names.is_empty() {
-                let fk_auto_name = format!(
-                    "{}_idx",
-                    auto_index_name("fk", &statement.table_name, &column_names)
-                );
+                let fk_auto_name =
+                    format!("{}_idx", auto_index_name("fk", &table_name, &column_names));
                 if self.catalog.indexes.contains_key(&fk_auto_name) {
                     self.catalog_mut().indexes.remove(&fk_auto_name);
                     self.indexes_mut().remove(&fk_auto_name);
@@ -549,7 +563,7 @@ impl EngineRuntime {
             self.bump_temp_schema_cookie();
             return Ok(());
         }
-        let Some(table_name) = self.catalog.table(name).map(|table| table.name.clone()) else {
+        let Some(table_name) = self.canonical_catalog_table_name(name) else {
             if if_exists {
                 return Ok(());
             }
@@ -595,20 +609,39 @@ impl EngineRuntime {
     }
 
     pub(super) fn execute_drop_index(&mut self, name: &str, if_exists: bool) -> Result<()> {
-        let Some(index) = self.catalog.indexes.get(name).cloned() else {
+        let (qualifier, object) = super::compat_schema_qualified_name(name);
+        if qualifier == Some(super::CompatSchemaQualifier::Temp) {
+            if if_exists {
+                return Ok(());
+            }
+            return Err(DbError::sql(format!("unknown index {name}")));
+        }
+        let Some(index_name) = self
+            .catalog
+            .indexes
+            .keys()
+            .find(|index_name| identifiers_equal(index_name, object))
+            .cloned()
+        else {
             if if_exists {
                 return Ok(());
             }
             return Err(DbError::sql(format!("unknown index {name}")));
         };
+        let index = self
+            .catalog
+            .indexes
+            .get(&index_name)
+            .cloned()
+            .ok_or_else(|| DbError::internal(format!("index {index_name} disappeared")))?;
         if index.unique {
             return Err(DbError::sql(format!(
                 "dropping unique index {} is not supported in DecentDB 1.0",
-                name
+                index_name
             )));
         }
-        self.catalog_mut().indexes.remove(name);
-        self.indexes_mut().remove(name);
+        self.catalog_mut().indexes.remove(&index_name);
+        self.indexes_mut().remove(&index_name);
         self.bump_schema_cookie();
         Ok(())
     }
@@ -630,9 +663,7 @@ impl EngineRuntime {
         }
 
         let table_name = self
-            .catalog
-            .table(table_name)
-            .map(|table| table.name.clone())
+            .canonical_catalog_table_name(table_name)
             .ok_or_else(|| DbError::sql(format!("unknown table {}", table_name)))?;
         let mut targets = Vec::new();
         let mut visited = std::collections::BTreeSet::new();
@@ -686,6 +717,10 @@ impl EngineRuntime {
         if self.temp_view(table_name).is_some() && self.catalog.table(table_name).is_none() {
             return Err(DbError::sql(format!("unknown table {table_name}")));
         }
+        let canonical_table_name = self
+            .canonical_catalog_table_name(table_name)
+            .ok_or_else(|| DbError::sql(format!("unknown table {table_name}")))?;
+        let table_name = canonical_table_name.as_str();
         if actions
             .iter()
             .any(|action| matches!(action, AlterTableAction::RenameTable { .. }))
@@ -1252,7 +1287,14 @@ impl EngineRuntime {
     }
 
     fn execute_alter_table_rename(&mut self, table_name: &str, new_name: &str) -> Result<()> {
-        if self.catalog.contains_object(new_name) {
+        let (new_qualifier, new_object) = super::compat_schema_qualified_name(new_name);
+        if new_qualifier == Some(super::CompatSchemaQualifier::Temp) {
+            return Err(DbError::sql(
+                "ALTER TABLE RENAME TO cannot move a persistent table into temp",
+            ));
+        }
+        let new_name = new_object.to_string();
+        if self.catalog.contains_object(&new_name) {
             return Err(DbError::sql(format!("object {} already exists", new_name)));
         }
         let old_table_name = self
@@ -1275,33 +1317,30 @@ impl EngineRuntime {
             .ok_or_else(|| {
                 DbError::internal(format!("table schema for {} is missing", table_name))
             })?;
-        table.name = new_name.to_string();
-        self.catalog_mut()
-            .tables
-            .insert(new_name.to_string(), table);
+        table.name = new_name.clone();
+        self.catalog_mut().tables.insert(new_name.clone(), table);
 
         let data = self.tables_mut().remove(&old_table_name).ok_or_else(|| {
             DbError::internal(format!("table data for {} is missing", table_name))
         })?;
-        self.tables_mut().insert(new_name.to_string(), data);
+        self.tables_mut().insert(new_name.clone(), data);
 
         if let Some(state) = self.persisted_tables_mut().remove(&old_table_name) {
-            self.persisted_tables_mut()
-                .insert(new_name.to_string(), state);
+            self.persisted_tables_mut().insert(new_name.clone(), state);
         }
         if let Some(stats) = self.catalog_mut().table_stats.remove(&old_table_name) {
             self.catalog_mut()
                 .table_stats
-                .insert(new_name.to_string(), stats);
+                .insert(new_name.clone(), stats);
         }
         if self.dirty_tables_mut().remove(&old_table_name) {
-            self.dirty_tables_mut().insert(new_name.to_string());
+            self.dirty_tables_mut().insert(new_name.clone());
         }
         if let Some(delta) = self.paged_mutations.remove(&old_table_name) {
-            self.paged_mutations.insert(new_name.to_string(), delta);
+            self.paged_mutations.insert(new_name.clone(), delta);
         }
 
-        rename_table_references(self, &old_table_name, new_name);
+        rename_table_references(self, &old_table_name, &new_name);
         self.bump_schema_cookie();
         Ok(())
     }
@@ -1624,9 +1663,10 @@ fn validate_generated_expr(
         | Expr::CompareSubquery { .. } => {
             Err(DbError::sql("generated columns may not use subqueries"))
         }
-        Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } | Expr::Cast { expr, .. } => {
-            validate_generated_expr(expr, table, generated_column_name)
-        }
+        Expr::Unary { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. } => validate_generated_expr(expr, table, generated_column_name),
         Expr::Binary { left, right, .. } => {
             validate_generated_expr(left, table, generated_column_name)?;
             validate_generated_expr(right, table, generated_column_name)

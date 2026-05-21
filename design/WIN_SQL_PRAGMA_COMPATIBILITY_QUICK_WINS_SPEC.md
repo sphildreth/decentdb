@@ -1,10 +1,10 @@
 # SQL And PRAGMA Compatibility Quick Wins Spec
 
-**Document Status:** Draft / implementation spec
+**Document Status:** Completed implementation spec
 
-**Future Version:** vNext+2
+**Delivered In:** v2.6.0 work branch
 
-**Roadmap:** [`FUTURE_WINS.md`](FUTURE_WINS.md), priority 3
+**Roadmap:** Delivered; removed from active Future Wins
 
 **Related:** [`WIN_ADVANCED_SQL_COMPATIBILITY_SURFACE.md`](WIN_ADVANCED_SQL_COMPATIBILITY_SURFACE.md),
 [`docs/user-guide/comparison.md`](../docs/user-guide/comparison.md),
@@ -13,7 +13,7 @@
 
 ## Purpose
 
-This spec defines the complete implementation target for roadmap item 3,
+This spec defines the completed implementation target for roadmap item 3,
 "SQL and PRAGMA compatibility quick wins."
 
 The goal is to remove high-friction migration and tooling failures caused by
@@ -22,9 +22,10 @@ introspection queries. The goal is not to make DecentDB a SQLite clone or a
 PostgreSQL server. Compatibility work in this spec must be narrow, explicit,
 tested, and safe under DecentDB's durability-first embedded model.
 
-When this spec is fully implemented, roadmap item 3 should be removed from
-`FUTURE_WINS.md`. Remaining heavyweight SQL compatibility work stays in the
-later advanced compatibility track.
+This spec has been implemented. Roadmap item 3 has been removed from active
+`FUTURE_WINS.md` entries and retained only as delivered context. Remaining
+heavyweight SQL compatibility work stays in the later advanced compatibility
+track.
 
 ## Summary
 
@@ -139,7 +140,10 @@ ADR before implementing that item.
    Python, Go, Node, Dart, and browser execution paths because it is ordinary
    SQL.
 
-## Current State
+## Pre-Implementation Baseline
+
+This section captures the baseline that existed before this spec was
+implemented.
 
 ### Shipped PRAGMA State
 
@@ -919,45 +923,50 @@ Built-in collations here are engine-owned and fixed.
 `busy_timeout`, `locking_mode`, and `wal_checkpoint` must not imply
 cross-process writer coordination. That remains a separate roadmap item.
 
-## Open Decisions To Resolve Before Implementation
+## Resolved Implementation Decisions
 
-These decisions should be made in the implementation PR or a short design note
-before code changes begin. They do not require a separate ADR unless the answer
-changes durability, file format, or catalog semantics.
+The implementation made the following best-practice decisions without requiring
+a new ADR because none changed file format, WAL semantics, broad ABI contracts,
+or durability guarantees:
 
-1. Should `quick_check` be a strict alias for `integrity_check`, or a cheaper
-   subset? Recommended: alias initially; document it.
-2. Should `sqlite_schema.rootpage` be `0` or `NULL`? Recommended: `0` for
-   SQLite shape compatibility.
-3. Should `table_info` unknown table return an error or zero rows?
-   Recommended: keep current direct PRAGMA behavior stable; table-valued helper
-   may return zero rows if that better matches SQLite and is documented.
-4. Should `generate_series` output column be `value` or `generate_series`?
-   Recommended: choose one and document; `value` is more DecentDB-consistent,
-   `generate_series` is more PostgreSQL-compatible.
-5. Should `temp` appear in `information_schema.schemata` with no temp objects?
-   Recommended: yes, for predictable introspection.
-6. Should `PRAGMA busy_timeout` affect only queued writes or also direct APIs?
-   Recommended: queued writes only unless a broader connection timeout model
-   already exists.
+1. `quick_check` is a strict alias for the existing logical
+   `integrity_check`.
+2. `sqlite_schema.rootpage` is `0` for SQLite result-shape compatibility.
+3. Direct `PRAGMA table_info(...)` keeps DecentDB's existing behavior for
+   unknown tables. Table-valued PRAGMA helpers return zero rows for unknown
+   table or index names where SQLite-style tooling expects filterable
+   introspection.
+4. `generate_series` returns a single output column named `value`, matching
+   DecentDB table-valued function conventions.
+5. `temp` always appears in `information_schema.schemata`, even when no temp
+   objects exist.
+6. `PRAGMA busy_timeout` affects the connection-local default for queued
+   writes only. Direct APIs keep their existing behavior.
+7. `PRAGMA wal_checkpoint(...)` maps supported checkpoint modes to DecentDB's
+   safe checkpoint operation and returns non-negative SQLite-shaped counters.
+8. Query-time `BINARY`, `NOCASE`, and `RTRIM` collations are supported for
+   `ORDER BY`, comparisons, and `BETWEEN`; collated `DISTINCT` and `GROUP BY`
+   keys are rejected until DecentDB has full key-equivalence semantics.
+9. `user_version` and `application_id` are stored as durable transactional
+   signed 32-bit application metadata in an internal hidden table.
 
 ## Done Checklist
 
-- [ ] PRAGMA parser accepts required forms and known values.
-- [ ] Required PRAGMA matrix implemented.
-- [ ] Required unsupported PRAGMAs produce deliberate errors.
-- [ ] Persistent application metadata PRAGMAs are transactional and durable.
-- [ ] SQLite schema views implemented and read-only.
-- [ ] Table-valued PRAGMA helpers implemented.
-- [ ] Minimal `information_schema` implemented.
-- [ ] `generate_series` integer/date/timestamp variants implemented.
-- [ ] `main.` and `temp.` qualified names implemented.
-- [ ] Non-main registered schema qualifiers rejected clearly.
-- [ ] Query-time `BINARY`, `NOCASE`, and `RTRIM` collations implemented.
-- [ ] Persistent collation DDL policy implemented and tested.
-- [ ] Scalar compatibility helpers implemented.
-- [ ] Docs updated.
-- [ ] Changelog updated in `docs/about/changelog.md`.
-- [ ] Engine, CLI, binding smoke, workspace tests, and lint pass.
-- [ ] Roadmap item 3 removed from active Future Wins or moved to Delivered
+- [x] PRAGMA parser accepts required forms and known values.
+- [x] Required PRAGMA matrix implemented.
+- [x] Required unsupported PRAGMAs produce deliberate errors.
+- [x] Persistent application metadata PRAGMAs are transactional and durable.
+- [x] SQLite schema views implemented and read-only.
+- [x] Table-valued PRAGMA helpers implemented.
+- [x] Minimal `information_schema` implemented.
+- [x] `generate_series` integer/date/timestamp variants implemented.
+- [x] `main.` and `temp.` qualified names implemented.
+- [x] Non-main registered schema qualifiers rejected clearly.
+- [x] Query-time `BINARY`, `NOCASE`, and `RTRIM` collations implemented.
+- [x] Persistent collation DDL policy implemented and tested.
+- [x] Scalar compatibility helpers implemented.
+- [x] Docs updated.
+- [x] Changelog updated in `docs/about/changelog.md`.
+- [x] Engine, CLI, binding smoke, workspace tests, and lint pass.
+- [x] Roadmap item 3 removed from active Future Wins or moved to Delivered
       Context after implementation is complete.

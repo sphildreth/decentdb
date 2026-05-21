@@ -917,12 +917,28 @@ fn matrix_intentional_rejections_remain_explicit() {
     );
 
     let generate_series = db
-        .execute("SELECT * FROM generate_series(1, 10)")
+        .execute("SELECT value FROM generate_series(1, 3)")
+        .unwrap();
+    assert_eq!(
+        generate_series
+            .rows()
+            .iter()
+            .map(|row| row.values()[0].clone())
+            .collect::<Vec<_>>(),
+        vec![Value::Int64(1), Value::Int64(2), Value::Int64(3)]
+    );
+
+    let unknown_table_function = db
+        .execute("SELECT * FROM unknown_series(1, 10)")
         .unwrap_err();
     assert!(
-        generate_series.to_string().contains("set-returning")
-            || generate_series.to_string().contains("generate_series")
-            || generate_series.to_string().contains("not supported"),
-        "unexpected error: {generate_series}"
+        unknown_table_function
+            .to_string()
+            .contains("table-valued function")
+            || unknown_table_function
+                .to_string()
+                .contains("unknown_series")
+            || unknown_table_function.to_string().contains("not supported"),
+        "unexpected error: {unknown_table_function}"
     );
 }

@@ -412,6 +412,7 @@ fn parse_order_by(sql: &str) -> Result<Vec<OrderBy>> {
             Ok(OrderBy {
                 expr: parse_expr(expr_sql)?,
                 descending,
+                collation: None,
             })
         })
         .collect()

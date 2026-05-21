@@ -147,7 +147,7 @@ fn pragma_assignment_semantics_are_enforced() {
 #[test]
 fn pragma_unknown_name_is_rejected() {
     let db = mem_db();
-    let err = exec_err(&db, "PRAGMA foreign_keys");
+    let err = exec_err(&db, "PRAGMA imaginary_setting");
     assert!(
         err.contains("unsupported PRAGMA"),
         "unexpected error: {err}"

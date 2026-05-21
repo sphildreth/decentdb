@@ -12,10 +12,26 @@ impl EngineRuntime {
         &mut self,
         statement: &CreateTriggerStatement,
     ) -> Result<()> {
-        if self.catalog.contains_object(&statement.trigger_name) {
+        let (trigger_qualifier, trigger_object) =
+            super::compat_schema_qualified_name(&statement.trigger_name);
+        if trigger_qualifier == Some(super::CompatSchemaQualifier::Temp) {
+            return Err(DbError::sql(
+                "temporary triggers are not supported in this compatibility slice",
+            ));
+        }
+        let trigger_name = trigger_object.to_string();
+        let (target_qualifier, target_object) =
+            super::compat_schema_qualified_name(&statement.target_name);
+        if target_qualifier == Some(super::CompatSchemaQualifier::Temp) {
+            return Err(DbError::sql(
+                "triggers on temporary tables or views are not supported",
+            ));
+        }
+        let target_name = target_object.to_string();
+        if self.catalog.contains_object(&trigger_name) {
             return Err(DbError::sql(format!(
                 "object {} already exists",
-                statement.trigger_name
+                trigger_name
             )));
         }
         let action = parse_sql_statement(&statement.action_sql)?;
@@ -38,13 +54,13 @@ impl EngineRuntime {
             ));
         }
         if on_view {
-            if self.catalog.view(&statement.target_name).is_none() {
+            if self.catalog.view(&target_name).is_none() {
                 return Err(DbError::sql(format!(
                     "INSTEAD OF triggers require an existing target view {}",
                     statement.target_name
                 )));
             }
-        } else if self.catalog.table(&statement.target_name).is_none() {
+        } else if self.catalog.table(&target_name).is_none() {
             return Err(DbError::sql(format!(
                 "AFTER triggers require an existing target table {}",
                 statement.target_name
@@ -52,10 +68,10 @@ impl EngineRuntime {
         }
 
         self.catalog_mut().triggers.insert(
-            statement.trigger_name.clone(),
+            trigger_name.clone(),
             TriggerSchema {
-                name: statement.trigger_name.clone(),
-                target_name: statement.target_name.clone(),
+                name: trigger_name,
+                target_name,
                 kind,
                 event: match statement.event {
                     TriggerEventSpec::Insert => TriggerEvent::Insert,
@@ -76,19 +92,21 @@ impl EngineRuntime {
         table_name: &str,
         if_exists: bool,
     ) -> Result<()> {
-        let Some(trigger) = self.catalog.triggers.get(name).cloned() else {
+        let trigger_name = super::compat_unqualified_name(name);
+        let Some(trigger) = self.catalog.triggers.get(trigger_name).cloned() else {
             if if_exists {
                 return Ok(());
             }
             return Err(DbError::sql(format!("unknown trigger {name}")));
         };
-        if trigger.target_name != table_name {
+        let target_name = super::compat_unqualified_name(table_name);
+        if trigger.target_name != target_name {
             return Err(DbError::sql(format!(
                 "trigger {} is defined on {}, not {}",
-                name, trigger.target_name, table_name
+                trigger_name, trigger.target_name, table_name
             )));
         }
-        self.catalog_mut().triggers.remove(name);
+        self.catalog_mut().triggers.remove(trigger_name);
         self.bump_schema_cookie();
         Ok(())
     }

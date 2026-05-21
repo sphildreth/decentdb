@@ -74,6 +74,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   WebSocket routes, sync shapes backed by scopes, durable shape acks and
   retention blockers, relay/shape/changeset `sys.*` diagnostics, browser relay
   helpers, .NET JSON helpers, user docs, and ADR 0166-0168 delivery context.
+- Completed the SQL and PRAGMA compatibility quick-wins roadmap item with safe
+  SQLite-style PRAGMA probes and assignments, durable transactional
+  `user_version`/`application_id` metadata, extended schema-introspection
+  PRAGMAs, PRAGMA table functions, read-only `sqlite_schema` and minimal
+  `information_schema` views, `generate_series`, narrow `main.`/`temp.`
+  qualifiers, query-time `BINARY`/`NOCASE`/`RTRIM` collations, scalar
+  compatibility helpers, docs, and CLI smoke coverage.
 
 ### Changed
 

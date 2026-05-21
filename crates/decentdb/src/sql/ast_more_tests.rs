@@ -145,6 +145,7 @@ mod tests {
                     column: "o".to_string(),
                 },
                 descending: true,
+                collation: None,
             }],
             frame: Some(WindowFrame {
                 unit: WindowFrameUnit::Rows,
@@ -196,6 +197,7 @@ mod tests {
         let ob = OrderBy {
             expr: Expr::Literal(Value::Int64(1)),
             descending: true,
+            collation: None,
         };
         assert_eq!(ob.to_sql(), "1 DESC");
     }

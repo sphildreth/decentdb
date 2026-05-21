@@ -22,6 +22,7 @@ mod tests {
             "SELECT '{\"name\":\"Alice\",\"meta\":{\"version\":2}}'->>'name', '{\"name\":\"Alice\",\"meta\":{\"version\":2}}'->'meta'->>'version'",
             "SELECT key, value FROM json_each('[10,20]')",
             "SELECT key, value, type FROM json_tree('{\"a\":1}')",
+            "SELECT * FROM generate_series(1, 10)",
             "ANALYZE",
             "ANALYZE users",
             "TRUNCATE TABLE users",
@@ -45,7 +46,6 @@ mod tests {
     fn explicit_rejection_tests_for_unsupported_syntax() {
         let invalid_statements = [
             "CREATE MATERIALIZED VIEW mv AS SELECT 1", // Unsupported DDL
-            "SELECT * FROM generate_series(1, 10)", // generic set returning functions are still out of baseline scope
         ];
 
         for stmt in invalid_statements {

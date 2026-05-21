@@ -131,6 +131,36 @@ fn exec_and_schema_introspection_commands_work() {
 }
 
 #[test]
+fn exec_supports_sql_and_pragma_compatibility_quick_wins() {
+    let dir = temp_dir();
+    let db = dir.join("compatibility.ddb");
+    let db_str = db.display().to_string();
+
+    let json = run(&[
+        "exec",
+        "--db",
+        &db_str,
+        "--sql",
+        "CREATE TABLE names(name TEXT); \
+         INSERT INTO names VALUES ('b'), ('A'); \
+         PRAGMA foreign_keys; \
+         PRAGMA journal_mode = WAL; \
+         SELECT name FROM sqlite_schema WHERE type = 'table' AND name = 'names'; \
+         SELECT value FROM generate_series(1, 3); \
+         SELECT name FROM names ORDER BY name COLLATE NOCASE;",
+        "--format",
+        "json",
+    ]);
+    assert!(json.contains("\"columns\":[\"foreign_keys\"]"));
+    assert!(json.contains("\"rows\":[[\"1\"]]"));
+    assert!(json.contains("\"columns\":[\"journal_mode\"]"));
+    assert!(json.contains("\"rows\":[[\"wal\"]]"));
+    assert!(json.contains("\"rows\":[[\"names\"]]"));
+    assert!(json.contains("\"rows\":[[\"1\"],[\"2\"],[\"3\"]]"));
+    assert!(json.contains("\"rows\":[[\"A\"],[\"b\"]]"));
+}
+
+#[test]
 fn describe_command_shows_foreign_keys() {
     let dir = temp_dir();
     let db = dir.join("foreign-keys.ddb");

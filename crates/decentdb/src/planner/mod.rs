@@ -468,9 +468,10 @@ fn simple_spatial_column_value_pair<'a>(left: &'a Expr, right: &'a Expr) -> Opti
 fn expr_has_column_ref(expr: &Expr) -> bool {
     match expr {
         Expr::Column { .. } => true,
-        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
-            expr_has_column_ref(expr)
-        }
+        Expr::Unary { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Collate { expr, .. } => expr_has_column_ref(expr),
         Expr::Binary { left, right, .. } => expr_has_column_ref(left) || expr_has_column_ref(right),
         Expr::Between {
             expr, low, high, ..
@@ -559,7 +560,7 @@ fn select_item_has_aggregate(item: &crate::sql::ast::SelectItem) -> bool {
 fn expr_has_aggregate(expr: &Expr) -> bool {
     match expr {
         Expr::Aggregate { .. } => true,
-        Expr::Unary { expr, .. } => expr_has_aggregate(expr),
+        Expr::Unary { expr, .. } | Expr::Collate { expr, .. } => expr_has_aggregate(expr),
         Expr::Binary { left, right, .. } => expr_has_aggregate(left) || expr_has_aggregate(right),
         Expr::Between {
             expr, low, high, ..

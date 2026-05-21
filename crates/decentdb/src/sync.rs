@@ -1358,6 +1358,9 @@ fn validate_sync_scope_filter_expr_inner(
                 ))
             }
         }
+        Expr::Collate { expr, .. } => {
+            validate_sync_scope_filter_expr_inner(expr, referenced_columns)
+        }
         Expr::Column {
             table: Some(table),
             column,
@@ -1408,6 +1411,8 @@ fn validate_sync_scope_filter_expr_inner(
 
 fn sync_scope_filter_column_name(left: &Expr, right: &Expr) -> Option<String> {
     match (left, right) {
+        (Expr::Collate { expr, .. }, right) => sync_scope_filter_column_name(expr, right),
+        (left, Expr::Collate { expr, .. }) => sync_scope_filter_column_name(left, expr),
         (
             Expr::Column {
                 table: None,
@@ -1422,6 +1427,7 @@ fn sync_scope_filter_column_name(left: &Expr, right: &Expr) -> Option<String> {
 fn sync_scope_filter_column(expr: &Expr) -> Result<()> {
     match expr {
         Expr::Column { table: None, .. } => Ok(()),
+        Expr::Collate { expr, .. } => sync_scope_filter_column(expr),
         Expr::Column {
             table: Some(table),
             column,
@@ -1445,6 +1451,7 @@ fn sync_scope_filter_disallowed_operand(expr: &Expr) -> Option<DbError> {
         Expr::Function { name, .. } => Some(DbError::sql(format!(
             "functions are not supported in sync row filters: {name}()"
         ))),
+        Expr::Collate { expr, .. } => sync_scope_filter_disallowed_operand(expr),
         Expr::Aggregate { name, .. } => Some(DbError::sql(format!(
             "aggregate-like function calls are not supported in sync row filters: {name}"
         ))),
@@ -1515,6 +1522,7 @@ fn sync_scope_filter_disallowed_operand(expr: &Expr) -> Option<DbError> {
 
 fn sync_scope_filter_literal(expr: &Expr) -> Result<()> {
     match expr {
+        Expr::Collate { expr, .. } => sync_scope_filter_literal(expr),
         Expr::Literal(Value::Int64(_))
         | Expr::Literal(Value::Text(_))
         | Expr::Literal(Value::Null)

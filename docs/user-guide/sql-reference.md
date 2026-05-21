@@ -54,7 +54,11 @@ CREATE SCHEMA IF NOT EXISTS analytics;
 
 Notes:
 - Schemas are currently catalog namespaces only (name registration and persistence).
-- Schema-qualified relation names (for example `app.users`) are not yet supported.
+- `main.` and `temp.` qualified local object names are supported as compatibility
+  aliases for persisted and session-scoped objects.
+- Registered application schemas are not object owners yet. Schema-qualified
+  relation names outside `main`, `temp`, and built-in compatibility namespaces
+  (for example `app.users`) are rejected.
 - `CREATE SCHEMA ... AUTHORIZATION ...` and inline schema elements are not supported.
 
 ### CREATE INDEX
@@ -92,6 +96,9 @@ Notes:
   - `CAST(col AS INT64|FLOAT64|TEXT|BOOL)`
 - `UNIQUE` expression indexes, partial expression indexes, and multi-expression index keys are not supported.
 - `INCLUDE (...)` is not supported on expression or trigram indexes, and included columns cannot duplicate key columns.
+- `COLLATE BINARY` in persistent column and index definitions is accepted as
+  the default binary behavior. Persistent `NOCASE` and `RTRIM` column/index
+  collations are rejected; query-time collations are supported separately.
 
 ### DROP TABLE / DROP INDEX
 
@@ -348,6 +355,30 @@ SELECT * FROM users WHERE name LIKE 'a\_%' ESCAPE '\';
 SELECT * FROM users WHERE status IS DISTINCT FROM 'active';
 ```
 
+### Collations
+
+DecentDB supports built-in query-time collations for compatibility SQL:
+
+- `BINARY` — default byte/codepoint comparison.
+- `NOCASE` — ASCII case-insensitive comparison for `A-Z` and `a-z`.
+- `RTRIM` — compares text after trimming trailing ASCII spaces.
+
+Supported forms include `ORDER BY expression COLLATE <name>` and comparison
+expressions where either side is explicitly collated.
+
+```sql
+SELECT name FROM users ORDER BY name COLLATE NOCASE;
+SELECT * FROM users WHERE name COLLATE NOCASE = 'alice';
+SELECT 'a ' COLLATE RTRIM = 'a';
+```
+
+Current limits:
+
+- `COLLATE` in `GROUP BY` keys and `DISTINCT` keys is rejected.
+- Persistent non-binary column and index collations are rejected. This avoids
+  claiming that a binary index satisfies non-binary collation semantics.
+- `NOCASE` is ASCII-only; it is not a Unicode collation.
+
 ### Scalar Functions
 
 Supported scalar functions:
@@ -418,6 +449,12 @@ Supported scalar functions:
 
 **Other:**
 - `PRINTF(format, args...)` — formatted string output (SQLite-compatible)
+- `current_database()` / `current_schema()` — return `main`
+- `database()` / `schema()` — compatibility aliases returning `main`
+- `version()` — returns the DecentDB engine version string
+
+`sqlite_version()` and `pg_backend_pid()` are deliberately rejected instead of
+returning misleading SQLite or PostgreSQL server values.
 
 **Spatial:**
 - Constructors: `ST_Point`, `ST_MakePoint`, `ST_PointZ`, `ST_PointM`, `ST_PointZM`, `ST_GeogPoint`, `ST_GeogPointZ`, `ST_GeogPointM`, `ST_GeogPointZM`
@@ -649,6 +686,82 @@ Executes the query and produces the execution plan annotated with actual row cou
 and execution time. The parenthesized form `EXPLAIN (ANALYZE) ...` is also supported.
 `EXPLAIN ANALYZE` currently supports `SELECT` queries only.
 
+### PRAGMA Compatibility
+
+DecentDB supports a safe SQLite-style PRAGMA subset for configuration probes,
+schema discovery, application metadata, and WAL maintenance:
+
+```sql
+PRAGMA page_size;
+PRAGMA cache_size;
+PRAGMA integrity_check;
+PRAGMA quick_check;
+PRAGMA database_list;
+PRAGMA foreign_keys;
+PRAGMA journal_mode;
+PRAGMA synchronous;
+PRAGMA wal_checkpoint(TRUNCATE);
+PRAGMA schema_version;
+PRAGMA user_version;
+PRAGMA application_id;
+PRAGMA encoding;
+PRAGMA busy_timeout;
+PRAGMA locking_mode;
+PRAGMA temp_store;
+PRAGMA table_info(users);
+PRAGMA table_xinfo(users);
+PRAGMA table_list;
+PRAGMA index_list(users);
+PRAGMA index_info(users_name_idx);
+PRAGMA index_xinfo(users_name_idx);
+PRAGMA foreign_key_list(orders);
+```
+
+Assignment behavior is constrained:
+
+- `page_size` and `cache_size` assignments are no-ops only when the assigned
+  value matches the open database configuration.
+- `foreign_keys = ON`, `journal_mode = WAL`, `encoding = UTF-8`,
+  `locking_mode = NORMAL`, and `temp_store = DEFAULT|FILE|0|1` are accepted as
+  safe compatibility no-ops.
+- `synchronous = FULL|NORMAL|OFF` succeeds only when it matches the open-time
+  WAL sync mode; it is not a runtime durability downgrade.
+- `user_version` and `application_id` persist signed 32-bit transactional
+  application metadata.
+- `busy_timeout` sets a connection-local default for queued writes.
+- PRAGMAs that would imply dirty reads, disabled constraints, alternate journal
+  modes, or in-memory temp storage are rejected.
+
+`main.` and `temp.` PRAGMA qualifiers are accepted for compatibility:
+
+```sql
+PRAGMA main.table_info(users);
+PRAGMA temp.table_info(temp_users);
+```
+
+### Compatibility Catalog Views
+
+Read-only compatibility views expose catalog metadata for schema browsers and
+generic SQL tools:
+
+- `sqlite_schema`, `sqlite_master`, `main.sqlite_schema`, `main.sqlite_master`
+  with columns `type`, `name`, `tbl_name`, `rootpage`, `sql`.
+- `sqlite_temp_schema`, `sqlite_temp_master`, `temp.sqlite_schema`,
+  `temp.sqlite_master` with the same shape for temporary objects.
+- `information_schema.schemata` with `main`, `temp`, and registered schemas.
+- `information_schema.tables` with visible persistent and temporary tables and
+  views.
+- `information_schema.columns` with visible persistent and temporary table
+  columns.
+
+```sql
+SELECT type, name, tbl_name FROM sqlite_schema ORDER BY name;
+SELECT table_schema, table_name, table_type FROM information_schema.tables;
+SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'users';
+```
+
+These are virtual read-only views, not mutable catalog tables.
+
 ### Table-Valued Functions
 
 Table-valued functions appear in the `FROM` clause and return a set of rows. See `design/adr/0111-table-valued-functions.md`.
@@ -674,6 +787,50 @@ Returns columns: `key` (TEXT), `value` (TEXT), `type` (TEXT), `path` (TEXT).
 ```sql
 SELECT key, value, type, path FROM json_tree('{"a":{"b":1},"c":[2,3]}');
 ```
+
+**`generate_series(start, stop [, step])`** — returns an inclusive series in a
+single `value` column.
+
+Supported forms:
+
+- `INT64` start/stop with optional `INT64` step. The default step is `1`.
+- `TIMESTAMP` start/stop with an explicit `INTERVAL` step.
+- `DATE` start/stop with an explicit whole-day `INTERVAL` step.
+
+```sql
+SELECT value FROM generate_series(1, 5);
+SELECT value FROM generate_series(5, 1, -1);
+SELECT value FROM generate_series(
+  TIMESTAMP '2026-01-01 00:00:00',
+  TIMESTAMP '2026-01-01 02:00:00',
+  INTERVAL '1 hour'
+);
+SELECT value FROM generate_series(
+  DATE '2026-01-01',
+  DATE '2026-01-03',
+  INTERVAL '1 day'
+);
+```
+
+`generate_series` rejects zero steps and result sets larger than 1,000,000
+rows. Temporal series require an explicit interval.
+
+**SQLite-compatible PRAGMA table functions** — expose PRAGMA result shapes in
+the `FROM` clause so callers can filter and join introspection results:
+
+```sql
+SELECT name FROM pragma_table_info('users') WHERE pk = 1;
+SELECT * FROM pragma_table_xinfo('users');
+SELECT name FROM pragma_table_list() WHERE schema = 'main';
+SELECT name FROM pragma_index_list('users');
+SELECT name FROM pragma_index_info('users_name_idx');
+SELECT * FROM pragma_index_xinfo('users_name_idx');
+SELECT * FROM pragma_foreign_key_list('orders');
+SELECT * FROM pragma_database_list();
+```
+
+`main.` and `temp.` prefixes are accepted for these functions, for example
+`main.pragma_table_info('users')`.
 
 ### Generated Columns
 

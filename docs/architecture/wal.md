@@ -277,7 +277,12 @@ For very large databases, archived WAL segments could be:
 
 ## Configuration
 
-DecentDB supports a limited SQLite-compatible PRAGMA subset (`page_size`, `cache_size`, `integrity_check`, `database_list`, `table_info(table)`). Checkpointing and reader timeouts are configured via API/CLI flags (not PRAGMA).
+DecentDB supports safe SQLite-compatible PRAGMA probes for common WAL and
+configuration questions. `PRAGMA journal_mode` reports `wal`,
+`PRAGMA synchronous` reports the open-time sync mode, and
+`PRAGMA wal_checkpoint(...)` maps to DecentDB's safe checkpoint operation.
+Checkpoint and reader-retention policy are still configured through API/CLI
+settings; PRAGMA assignment does not weaken durability.
 
 ### Checkpointing
 

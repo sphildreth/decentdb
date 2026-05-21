@@ -47,9 +47,9 @@ storage fundamentals.
 
 ## Moved Out Of This Track
 
-- SQL and PRAGMA compatibility quick wins are tracked in
+- SQL and PRAGMA compatibility quick wins are delivered in
   [`WIN_SQL_PRAGMA_COMPATIBILITY_QUICK_WINS_SPEC.md`](WIN_SQL_PRAGMA_COMPATIBILITY_QUICK_WINS_SPEC.md)
-  as the complete vNext+2 compatibility-polish milestone.
+  as the complete compatibility-polish milestone.
 - Full-text search with BM25 ranking is tracked in [`FUTURE_WINS.md`](FUTURE_WINS.md) as its own roadmap item.
 - Native geospatial types and spatial indexes are shipped foundations covered by
   ADR 0124 through ADR 0128 and the user-guide data type/index docs.
@@ -60,10 +60,11 @@ storage fundamentals.
 
 ### Current State
 
-`CREATE SCHEMA` registers namespace names and persists them. Relation names
-cannot yet be qualified in DDL or DML, and there is no schema resolver,
-search-path policy, or namespace-aware object lookup beyond simple schema-name
-registration.
+`CREATE SCHEMA` registers namespace names and persists them. The delivered
+quick-win layer supports narrow `main.` and `temp.` qualified local object
+names for compatibility. General application schemas such as `app.users` are
+still not object owners, and there is no search-path policy or namespace-aware
+catalog ownership model beyond simple schema-name registration.
 
 ### Target Scope
 

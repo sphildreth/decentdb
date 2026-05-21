@@ -75,38 +75,39 @@ fn infer_expr_name_syntactic(expr: &Expr, ordinal: usize) -> String {
 
 impl EngineRuntime {
     pub(super) fn execute_create_view(&mut self, statement: &CreateViewStatement) -> Result<()> {
+        let (qualifier, object_name) = super::compat_schema_qualified_name(&statement.view_name);
+        if statement.temporary && qualifier == Some(super::CompatSchemaQualifier::Main) {
+            return Err(DbError::sql(
+                "temporary views cannot be created in the main schema",
+            ));
+        }
+        let temporary =
+            statement.temporary || qualifier == Some(super::CompatSchemaQualifier::Temp);
+        let view_name = object_name.to_string();
+
         // Handle existence conflicts for temporary and persistent views.
-        if statement.temporary {
-            if let Some(_existing) = self.temp_view(&statement.view_name) {
+        if temporary {
+            if let Some(_existing) = self.temp_view(&view_name) {
                 if statement.replace {
-                    self.temp_views_mut().remove(&statement.view_name);
+                    self.temp_views_mut().remove(&view_name);
                 } else if statement.if_not_exists {
                     return Ok(());
                 } else {
-                    return Err(DbError::sql(format!(
-                        "object {} already exists",
-                        statement.view_name
-                    )));
+                    return Err(DbError::sql(format!("object {} already exists", view_name)));
                 }
             }
-        } else if self.catalog.contains_object(&statement.view_name) {
-            if self.catalog.view(&statement.view_name).is_some() {
+        } else if self.catalog.contains_object(&view_name) {
+            if self.catalog.view(&view_name).is_some() {
                 if statement.replace {
-                    self.catalog_mut().views.remove(&statement.view_name);
+                    self.catalog_mut().views.remove(&view_name);
                 } else if statement.if_not_exists {
                     return Ok(());
                 } else {
-                    return Err(DbError::sql(format!(
-                        "object {} already exists",
-                        statement.view_name
-                    )));
+                    return Err(DbError::sql(format!("object {} already exists", view_name)));
                 }
             } else {
                 // Object exists but is not a view (e.g., a table)
-                return Err(DbError::sql(format!(
-                    "object {} already exists",
-                    statement.view_name
-                )));
+                return Err(DbError::sql(format!("object {} already exists", view_name)));
             }
         }
 
@@ -130,7 +131,7 @@ impl EngineRuntime {
             statement.column_names.clone()
         };
         let dependencies = collect_view_dependencies(&statement.query);
-        if !statement.temporary
+        if !temporary
             && dependencies
                 .iter()
                 .any(|dependency| self.temp_relation_exists(dependency))
@@ -155,29 +156,27 @@ impl EngineRuntime {
             if cte_names.contains(dependency.as_str()) {
                 continue;
             }
-            let exists = self.catalog.table(dependency).is_some()
-                || self.catalog.view(dependency).is_some()
-                || self.temp_relation_exists(dependency);
+            let exists = self.table_schema(dependency).is_some()
+                || self
+                    .visible_view(dependency, super::NameResolutionScope::Session)
+                    .is_some();
             if !exists {
                 return Err(DbError::sql(format!("unknown table or view {dependency}")));
             }
         }
 
         let view = ViewSchema {
-            name: statement.view_name.clone(),
-            temporary: statement.temporary,
+            name: view_name.clone(),
+            temporary,
             sql_text: statement.query.to_sql(),
             column_names,
             dependencies,
         };
-        if statement.temporary {
-            self.temp_views_mut()
-                .insert(statement.view_name.clone(), view);
+        if temporary {
+            self.temp_views_mut().insert(view_name, view);
             self.bump_temp_schema_cookie();
         } else {
-            self.catalog_mut()
-                .views
-                .insert(statement.view_name.clone(), view);
+            self.catalog_mut().views.insert(view_name, view);
             self.bump_schema_cookie();
         }
         Ok(())
@@ -203,7 +202,11 @@ impl EngineRuntime {
             self.bump_temp_schema_cookie();
             return Ok(());
         }
-        let Some(view_name) = self.catalog.view(name).map(|view| view.name.clone()) else {
+        let Some(view_name) = self
+            .visible_view(name, super::NameResolutionScope::Session)
+            .filter(|view| !view.temporary)
+            .map(|view| view.name.clone())
+        else {
             if if_exists {
                 return Ok(());
             }

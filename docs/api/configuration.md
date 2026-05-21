@@ -49,7 +49,12 @@ DecentDB uses a write-ahead log (WAL) and performs an `fsync()` on commit by def
 
 ### Durability
 
-DecentDB exposes a narrow SQL-level PRAGMA subset (`page_size`, `cache_size`, `integrity_check`, `database_list`). There is no SQL-level PRAGMA to change durability for normal DML (`INSERT`/`UPDATE`/`DELETE`). For high-throughput ingestion, use bulk-load durability modes instead:
+DecentDB exposes SQLite-style compatibility PRAGMAs for common tooling probes,
+but SQL-level PRAGMAs do not weaken durability for normal DML
+(`INSERT`/`UPDATE`/`DELETE`). `PRAGMA journal_mode` reports the engine's
+WAL-only mode, and `PRAGMA synchronous` accepts only no-op assignments that
+match the database's open-time WAL sync configuration. For high-throughput
+ingestion, use bulk-load durability modes instead:
 
 - CLI: `decentdb bulk-load --durability=full|deferred|none` (default: `deferred`)
 - Rust: `BulkLoadOptions.durability = dmFull|dmDeferred|dmNone`
@@ -118,18 +123,49 @@ decentdb info --db=my.ddb --schema-summary
 # - (optional) Schema summary (tables, columns, indexes)
 ```
 
-### Checkpoint/Reader Settings (CLI)
+### SQL PRAGMA Compatibility
 
-DecentDB supports a limited SQLite-compatible PRAGMA subset:
-- `PRAGMA page_size`
-- `PRAGMA cache_size`
-- `PRAGMA integrity_check`
-- `PRAGMA database_list`
-- `PRAGMA table_info(<table>)`
+DecentDB supports a safe SQLite-compatible PRAGMA subset for configuration
+inspection, schema discovery, and common ORM/tooling setup probes:
 
-Assignment form is accepted only with constrained behavior:
-- `PRAGMA page_size = <current_value>` is a no-op; changing page size requires reopening with `DbConfig.page_size`.
-- `PRAGMA cache_size = <current_value>` is a no-op; changing cache size requires reopening with `DbConfig.cache_size_mb`.
+- Storage and integrity: `page_size`, `cache_size`, `integrity_check`,
+  `quick_check`, `database_list`
+- Safety mode probes: `foreign_keys`, `journal_mode`, `synchronous`,
+  `encoding`, `locking_mode`, `temp_store`
+- WAL maintenance: `wal_checkpoint`
+- Application metadata: `schema_version`, `user_version`, `application_id`
+- Timeout tuning for queued writes: `busy_timeout`
+- Introspection: `table_info(table)`, `table_xinfo(table)`, `table_list`,
+  `index_list(table)`, `index_info(index)`, `index_xinfo(index)`,
+  `foreign_key_list(table)`
+
+Assignment form is accepted only when it is safe:
+
+- `PRAGMA page_size = <current_value>` is a no-op; changing page size requires
+  reopening with `DbConfig.page_size`.
+- `PRAGMA cache_size = <current_value>` is a no-op; changing cache size
+  requires reopening with `DbConfig.cache_size_mb`.
+- `PRAGMA foreign_keys = ON` is a no-op because DecentDB always enforces
+  foreign keys. `OFF` is rejected.
+- `PRAGMA journal_mode = WAL` is a no-op and returns `wal`; other journal
+  modes are rejected.
+- `PRAGMA synchronous = FULL|NORMAL|OFF` succeeds only when the requested value
+  matches the database's open-time WAL sync mode. It is not a runtime durability
+  downgrade.
+- `PRAGMA encoding = UTF-8`, `PRAGMA locking_mode = NORMAL`, and
+  `PRAGMA temp_store = DEFAULT|FILE|0|1` are accepted as safe compatibility
+  no-ops.
+- `PRAGMA user_version = <signed 32-bit integer>` and
+  `PRAGMA application_id = <signed 32-bit integer>` are durable,
+  transactional application metadata values.
+- `PRAGMA busy_timeout = <milliseconds>` sets the connection-local timeout used
+  by queued writes when an individual queued call does not provide its own
+  timeout.
+
+Known unsafe or unsupported PRAGMAs are rejected with explicit SQL errors
+instead of being silently ignored. Examples include `read_uncommitted`,
+`ignore_check_constraints`, `defer_foreign_keys`, `journal_mode = OFF`, and
+`temp_store = MEMORY`.
 
 To override checkpoint/reader settings for a single `exec` invocation, use:
 - `--checkpointBytes`

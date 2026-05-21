@@ -35,6 +35,7 @@ It targets a single process with **one writer** and **many concurrent readers** 
 - 🖥️ **Built-In HTTP Server And Web Console** - `decentdb serve` exposes a local HTTP API and embedded browser console for inspection, SQL execution, schema browsing, EXPLAIN, CSV export, and scripting
 - 🌐 **WASM Browser OPFS Support** - `@decentdb/web` runs DecentDB in a Dedicated Worker with an OPFS-backed VFS, async TypeScript API, binary result transport, checkpoint, import/export, persistence helpers, and browser smoke/benchmark coverage
 - 🐘 **PostgreSQL-like SQL** - Familiar DDL/DML syntax with JOINs (INNER, LEFT, RIGHT, FULL OUTER, CROSS, NATURAL), CTEs (including WITH RECURSIVE), subqueries, window functions, and rich types (UUID, DECIMAL, native TIMESTAMP)
+- 🔎 **SQLite/PostgreSQL Compatibility Helpers** - Safe SQLite-style PRAGMAs, `sqlite_schema`, minimal `information_schema`, `generate_series`, `main.`/`temp.` qualifiers, and query-time built-in collations for easier tool and migration onboarding
 - 🕒 **Native TIMESTAMP Type** - DATE/TIMESTAMP columns stored as int64 microseconds since Unix epoch (UTC); correct `ORDER BY` and `EXTRACT(YEAR|MONTH|DAY|HOUR|MINUTE|SECOND FROM ...)`, with native bind/read in all bindings
 - 👥 **Concurrent Reads** - Snapshot isolation allows multiple readers with one writer
 - 🚦 **Queued Write Concurrency** - Engine-owned bounded write queue with timeouts, metrics, and strict durable group commit for predictable in-process concurrent writes
