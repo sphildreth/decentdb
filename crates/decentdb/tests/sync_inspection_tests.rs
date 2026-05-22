@@ -361,3 +361,207 @@ fn sys_views_expose_operational_metrics() {
         Value::Bool(storage.shared_wal)
     );
 }
+
+const PREPARED_SYS_VIEW_ASSERTIONS: [(&str, &[&str]); 14] = [
+    (
+        "SELECT * FROM sys.wal_metrics",
+        &[
+            "latest_lsn",
+            "file_size_bytes",
+            "active_readers",
+            "max_page_count",
+            "checkpoint_epoch",
+            "warning_count",
+            "version_count",
+            "resident_versions",
+            "on_disk_versions",
+            "shared_wal",
+        ],
+    ),
+    (
+        "SELECT * FROM sys.storage_metrics",
+        &[
+            "path",
+            "wal_path",
+            "format_version",
+            "page_size",
+            "cache_size_mb",
+            "page_count",
+            "schema_cookie",
+            "wal_end_lsn",
+            "wal_file_size",
+            "last_checkpoint_lsn",
+            "active_readers",
+            "wal_versions",
+            "warning_count",
+            "shared_wal",
+        ],
+    ),
+    (
+        "SELECT * FROM sys.write_queue_metrics",
+        &[
+            "capacity",
+            "current_depth",
+            "admitted",
+            "rejected",
+            "timed_out",
+            "canceled",
+            "executed",
+            "committed",
+            "failed",
+            "group_commit_batches",
+            "group_commit_syncs",
+            "group_commit_max_batch",
+            "group_commit_commits_covered",
+            "physical_syncs_saved",
+            "total_queue_wait_ns",
+        ],
+    ),
+    (
+        "SELECT * FROM sys.sync_status",
+        &[
+            "enabled",
+            "replica_id",
+            "next_sequence",
+            "journal_path",
+            "journal_size_bytes",
+        ],
+    ),
+    (
+        "SELECT * FROM sys.sync_retention",
+        &[
+            "journal_records",
+            "first_sequence",
+            "last_sequence",
+            "safe_prune_through",
+            "prunable_records",
+            "blocked_by_json",
+            "journal_size_bytes",
+        ],
+    ),
+    (
+        "SELECT * FROM sys.sync_peer_lag",
+        &[
+            "peer_name",
+            "remote_replica_id",
+            "in_watermark",
+            "out_watermark",
+            "local_high_watermark",
+            "in_lag",
+            "out_lag",
+        ],
+    ),
+    (
+        "SELECT * FROM sys.sync_relay_status",
+        &[
+            "relay_id",
+            "protocol_version",
+            "database_replica_id",
+            "production_mode",
+            "secure_transport_required",
+            "insecure_override_enabled",
+            "active_sessions",
+            "active_streams",
+            "started_at_micros",
+        ],
+    ),
+    (
+        "SELECT * FROM sys.reactive_metrics",
+        &[
+            "active_watch_count",
+            "table_watch_count",
+            "range_watch_count",
+            "query_watch_count",
+            "change_stream_count",
+            "events_published",
+            "events_delivered",
+            "events_dropped",
+            "lagged_watch_count",
+            "row_change_events_truncated",
+        ],
+    ),
+    (
+        "SELECT * FROM sys.reactive_subscriptions",
+        &[
+            "watch_id",
+            "kind",
+            "created_at_micros",
+            "queue_capacity",
+            "queue_depth",
+            "last_delivered_event_id",
+            "dropped_events",
+            "lagged",
+            "dependencies_json",
+        ],
+    ),
+    (
+        "SELECT * FROM sys.extensions",
+        &[
+            "name",
+            "version",
+            "content_hash",
+            "enabled",
+            "installed_at_micros",
+        ],
+    ),
+    (
+        "SELECT * FROM sys.extension_functions",
+        &[
+            "extension_name",
+            "content_hash",
+            "function_name",
+            "export",
+            "kind",
+            "args",
+            "returns",
+            "deterministic",
+            "null_handling",
+        ],
+    ),
+    (
+        "SELECT * FROM sys.extension_collations",
+        &[
+            "extension_name",
+            "content_hash",
+            "collation_name",
+            "export",
+            "deterministic",
+        ],
+    ),
+    (
+        "SELECT * FROM sys.extension_dependencies",
+        &[
+            "object_kind",
+            "object_name",
+            "extension_name",
+            "dependency_name",
+            "dependency_kind",
+            "content_hash",
+            "recorded_at_micros",
+        ],
+    ),
+    (
+        "SELECT * FROM sys.extension_validation",
+        &["name", "valid", "error"],
+    ),
+];
+
+fn assert_prepared_sys_view_columns(result: &decentdb::QueryResult, expected: &[&str]) {
+    assert_eq!(result.columns().len(), expected.len());
+    for (actual, expected) in result.columns().iter().zip(expected.iter()) {
+        assert_eq!(actual, expected);
+    }
+}
+
+#[test]
+fn prepared_sys_views_execute_without_schema_support_errors() {
+    let dir = tempfile::TempDir::with_prefix("decentdb-sys-prepared-views").unwrap();
+    let path = dir.path().join("test.ddb");
+    let db = Db::create(&path, DbConfig::default()).unwrap();
+
+    for (sql, expected_columns) in PREPARED_SYS_VIEW_ASSERTIONS {
+        let statement = db.prepare(sql).unwrap();
+        let result = statement.execute(&[]).unwrap();
+        assert_prepared_sys_view_columns(&result, expected_columns);
+    }
+}

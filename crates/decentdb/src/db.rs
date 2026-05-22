@@ -171,6 +171,7 @@ pub struct PreparedStatement {
     schema_cookie: u32,
     temp_schema_cookie: u32,
     statement: Arc<SqlStatement>,
+    prepared_sql: String,
     prepared_insert: Option<Arc<PreparedSimpleInsert>>,
     prepared_update: Option<Arc<PreparedSimpleUpdate>>,
     prepared_delete: Option<Arc<PreparedSimpleDelete>>,
@@ -3657,6 +3658,17 @@ impl Db {
         prepared: &PreparedStatement,
         params: &[Value],
     ) -> Result<QueryResult> {
+        {
+            let runtime = self
+                .inner
+                .engine
+                .read()
+                .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+            self.validate_prepared_against_runtime(Some(prepared), &runtime)?;
+        }
+        if let Some(result) = self.try_execute_prepared_inspection_query(prepared, params)? {
+            return Ok(result);
+        }
         if self.inner.sql_txn_active.load(Ordering::Acquire) {
             let mut txn = self
                 .inner
@@ -4919,6 +4931,7 @@ impl Db {
             schema_cookie: runtime.catalog.schema_cookie,
             temp_schema_cookie: runtime.temp_schema_cookie,
             statement: Arc::clone(&statement),
+            prepared_sql: prepared_sql.clone(),
             prepared_insert,
             prepared_update,
             prepared_delete,
@@ -6613,6 +6626,9 @@ impl Db {
             state.runtime.temp_schema_cookie,
         )?;
         if prepared.read_only {
+            if let Some(result) = self.try_execute_prepared_inspection_query(prepared, params)? {
+                return Ok(result);
+            }
             let snapshot_lsn = state.snapshot_lsn();
             return self.execute_read_in_runtime_state(
                 prepared.statement.as_ref(),
@@ -6661,6 +6677,9 @@ impl Db {
             state.runtime.temp_schema_cookie,
         )?;
         if prepared.read_only {
+            if let Some(result) = self.try_execute_prepared_inspection_query(prepared, params)? {
+                return Ok(result);
+            }
             let snapshot_lsn = state.snapshot_lsn();
             return self.execute_read_in_runtime_state(
                 prepared.statement.as_ref(),
@@ -6709,6 +6728,9 @@ impl Db {
             state.runtime.temp_schema_cookie,
         )?;
         if prepared.read_only {
+            if let Some(result) = self.try_execute_prepared_inspection_query(prepared, params)? {
+                return Ok(result);
+            }
             let snapshot_lsn = state.snapshot_lsn();
             return self.execute_read_in_runtime_state(
                 prepared.statement.as_ref(),
@@ -6926,6 +6948,26 @@ impl Db {
                 }
             }
         }
+    }
+
+    fn try_execute_prepared_inspection_query(
+        &self,
+        prepared: &PreparedStatement,
+        params: &[Value],
+    ) -> Result<Option<QueryResult>> {
+        if let Some(result) =
+            self.try_execute_sync_inspection_query(&prepared.prepared_sql, params)?
+        {
+            return Ok(Some(result));
+        }
+        if let Some(result) = crate::extensions::try_execute_extension_inspection_query(
+            self,
+            &prepared.prepared_sql,
+            params,
+        )? {
+            return Ok(Some(result));
+        }
+        Ok(None)
     }
 
     pub fn sync_scopes(&self) -> Result<Vec<SyncScope>> {

@@ -2276,6 +2276,7 @@ fn normalize_range_var(range: &protobuf::RangeVar) -> Result<String> {
         return match schema.as_str() {
             "main" => Ok(format!("main.{}", range.relname)),
             "temp" | "information_schema" => Ok(format!("{schema}.{}", range.relname)),
+            "sys" => Ok(format!("sys.{}", range.relname)),
             other => Err(unsupported(format!(
                 "schema-qualified objects outside main/temp are not supported yet; schema '{other}' is registered but object ownership by schema is advanced compatibility work"
             ))),
