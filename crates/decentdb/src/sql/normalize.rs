@@ -1541,9 +1541,29 @@ fn normalize_const(value: &protobuf::AConst) -> Result<Expr> {
         ),
         Some(protobuf::a_const::Val::Boolval(value)) => Value::Bool(value.boolval),
         Some(protobuf::a_const::Val::Sval(value)) => Value::Text(value.sval.clone()),
-        Some(protobuf::a_const::Val::Bsval(value)) => Value::Text(value.bsval.clone()),
+        Some(protobuf::a_const::Val::Bsval(value)) => {
+            normalize_binary_string_literal(&value.bsval)?
+        }
         None => Value::Null,
     }))
+}
+
+fn normalize_binary_string_literal(raw: &str) -> Result<Value> {
+    let Some(hex) = raw.strip_prefix('x').or_else(|| raw.strip_prefix('X')) else {
+        return Ok(Value::Text(raw.to_string()));
+    };
+    if !hex.len().is_multiple_of(2) {
+        return Err(unsupported("invalid hex BLOB literal length"));
+    }
+    let mut bytes = Vec::with_capacity(hex.len() / 2);
+    for chunk in hex.as_bytes().chunks_exact(2) {
+        let pair =
+            std::str::from_utf8(chunk).map_err(|_| unsupported("invalid hex BLOB literal"))?;
+        bytes.push(
+            u8::from_str_radix(pair, 16).map_err(|_| unsupported("invalid hex BLOB literal"))?,
+        );
+    }
+    Ok(Value::Blob(bytes))
 }
 
 fn normalize_type_cast(cast: &protobuf::TypeCast) -> Result<Expr> {
@@ -2256,6 +2276,7 @@ fn normalize_range_var(range: &protobuf::RangeVar) -> Result<String> {
         return match schema.as_str() {
             "main" => Ok(format!("main.{}", range.relname)),
             "temp" | "information_schema" => Ok(format!("{schema}.{}", range.relname)),
+            "sys" => Ok(format!("sys.{}", range.relname)),
             other => Err(unsupported(format!(
                 "schema-qualified objects outside main/temp are not supported yet; schema '{other}' is registered but object ownership by schema is advanced compatibility work"
             ))),
@@ -3732,6 +3753,21 @@ mod tests {
     fn insert_from_query() {
         if let Statement::Insert(ins) = norm("INSERT INTO t SELECT * FROM u") {
             assert!(matches!(ins.source, InsertSource::Query(_)));
+        }
+    }
+
+    #[test]
+    fn insert_hex_blob_literal() {
+        if let Statement::Insert(ins) = norm("INSERT INTO t VALUES (X'0102ff')") {
+            let InsertSource::Values(rows) = ins.source else {
+                panic!("expected VALUES source");
+            };
+            assert_eq!(
+                rows[0][0],
+                Expr::Literal(Value::Blob(vec![0x01, 0x02, 0xff]))
+            );
+        } else {
+            panic!("expected Insert statement");
         }
     }
 

@@ -15,7 +15,9 @@ use crate::{
 };
 
 const DDB_OK: u32 = 0;
-const DDB_ABI_VERSION: u32 = 4;
+const DDB_ABI_VERSION: u32 = 5;
+#[cfg(test)]
+const DDB_ERR_SQL: u32 = 5;
 const DDB_WRITE_QUEUE_TIMEOUT_DEFAULT: u64 = u64::MAX;
 
 #[repr(u32)]
@@ -2272,6 +2274,43 @@ pub extern "C" fn ddb_db_execute(
 }
 
 #[no_mangle]
+/// Executes SQL against a branch, including `main`, with positional parameters.
+///
+/// On success, ownership of the returned result handle transfers to the caller.
+/// The handle must be released with `ddb_result_free`.
+pub extern "C" fn ddb_db_execute_on_branch(
+    db: *mut DbHandle,
+    branch_name: *const c_char,
+    sql: *const c_char,
+    params: *const DdbValue,
+    params_len: usize,
+    out_result: *mut *mut ResultHandle,
+) -> u32 {
+    ffi_boundary(|| {
+        let db = handle_ref(db, "db")?;
+        let branch_name = utf8_arg(branch_name, "branch_name")?;
+        let sql = utf8_arg(sql, "sql")?;
+        let rust_params = params_slice(params, params_len)?
+            .iter()
+            .map(value_from_ffi)
+            .collect::<Result<Vec<_>>>()?;
+        let mut result =
+            db.db
+                .execute_batch_on_branch_with_params(&sql, &branch_name, &rust_params)?;
+        if result.len() != 1 {
+            return Err(DbError::sql(format!(
+                "expected exactly one SQL statement, got {}",
+                result.len()
+            )));
+        }
+        *out_ptr(out_result, "out_result")? = Box::into_raw(Box::new(ResultHandle {
+            result: result.remove(0),
+        }));
+        Ok(())
+    })
+}
+
+#[no_mangle]
 /// Executes SQL through the engine-owned write queue.
 ///
 /// Pass `UINT64_MAX` for `timeout_ms` to use the database's configured
@@ -3703,6 +3742,14 @@ mod tests {
     #[test]
     fn abi_shape_matches_expected_layout() {
         let _execute: ExecuteFn = ddb_db_execute;
+        let _execute_on_branch: extern "C" fn(
+            *mut DbHandle,
+            *const c_char,
+            *const c_char,
+            *const DdbValue,
+            usize,
+            *mut *mut ResultHandle,
+        ) -> u32 = ddb_db_execute_on_branch;
         let _execute_queued: extern "C" fn(
             *mut DbHandle,
             *const c_char,
@@ -3816,6 +3863,209 @@ mod tests {
         assert_eq!(metrics.executed, 1);
         assert_eq!(metrics.committed, 1);
         assert_eq!(metrics.failed, 0);
+        assert_eq!(ddb_db_free(&mut db), DDB_OK);
+    }
+
+    #[test]
+    fn ddb_db_execute_on_branch_supports_main_and_branch_params() {
+        let mut db = ptr::null_mut();
+        let path = CString::new(":memory:").expect("path");
+        assert_eq!(ddb_db_open_or_create(path.as_ptr(), &mut db), DDB_OK);
+
+        let create =
+            CString::new("CREATE TABLE items (id INT64 PRIMARY KEY, value TEXT)").expect("sql");
+        let mut result = ptr::null_mut();
+        assert_eq!(
+            ddb_db_execute(db, create.as_ptr(), ptr::null(), 0, &mut result),
+            DDB_OK
+        );
+        assert_eq!(ddb_result_free(&mut result), DDB_OK);
+
+        let snapshot_json =
+            CString::new("{\"op\":\"snapshot_create\",\"name\":\"execute-on-branch-snapshot\"}")
+                .expect("snapshot request");
+        let mut snapshot_out = ptr::null_mut();
+        assert_eq!(
+            ddb_db_branch_execute_json(db, snapshot_json.as_ptr(), &mut snapshot_out),
+            DDB_OK,
+            "create snapshot failed: {}",
+            unsafe { CStr::from_ptr(ddb_last_error_message()) }
+                .to_str()
+                .expect("utf8")
+        );
+        assert_eq!(ddb_string_free(&mut snapshot_out), DDB_OK);
+
+        let create_branch_json = CString::new(
+            "{\"op\":\"branch_create\",\"name\":\"work\",\"from\":\"execute-on-branch-snapshot\"}",
+        )
+        .expect("branch create request");
+        let mut branch_out = ptr::null_mut();
+        assert_eq!(
+            ddb_db_branch_execute_json(db, create_branch_json.as_ptr(), &mut branch_out),
+            DDB_OK,
+            "create branch failed: {}",
+            unsafe { CStr::from_ptr(ddb_last_error_message()) }
+                .to_str()
+                .expect("utf8")
+        );
+        assert_eq!(ddb_string_free(&mut branch_out), DDB_OK);
+
+        let params = [DdbValue {
+            tag: DdbValueTag::Int64 as u32,
+            int64_value: 1,
+            ..DdbValue::default()
+        }];
+        let main_branch = CString::new("main").expect("main branch");
+        let insert_sql =
+            CString::new("INSERT INTO items VALUES ($1, 'from main exec')").expect("insert sql");
+        let select_sql =
+            CString::new("SELECT id, value FROM items WHERE id = $1").expect("select sql");
+        let branch_insert_sql =
+            CString::new("INSERT INTO items VALUES ($1, $2)").expect("branch insert sql");
+        let branch_name = CString::new("work").expect("branch name");
+        assert_eq!(
+            ddb_db_execute_on_branch(
+                db,
+                main_branch.as_ptr(),
+                insert_sql.as_ptr(),
+                params.as_ptr(),
+                params.len(),
+                &mut result,
+            ),
+            DDB_OK,
+            "execute_on_branch on main failed: {}",
+            unsafe { CStr::from_ptr(ddb_last_error_message()) }
+                .to_str()
+                .expect("utf8")
+        );
+        assert_eq!(ddb_result_free(&mut result), DDB_OK);
+
+        assert_eq!(
+            ddb_db_execute_on_branch(
+                db,
+                main_branch.as_ptr(),
+                select_sql.as_ptr(),
+                params.as_ptr(),
+                params.len(),
+                &mut result,
+            ),
+            DDB_OK,
+        );
+
+        let mut selected_rows = 0;
+        assert_eq!(ddb_result_row_count(result, &mut selected_rows), DDB_OK);
+        assert_eq!(selected_rows, 1);
+        let mut value = DdbValue::default();
+        assert_eq!(ddb_result_value_copy(result, 0, 0, &mut value), DDB_OK);
+        assert_eq!(value.tag, DdbValueTag::Int64 as u32);
+        assert_eq!(value.int64_value, 1);
+        assert_eq!(ddb_value_dispose(&mut value), DDB_OK);
+        assert_eq!(ddb_result_free(&mut result), DDB_OK);
+
+        let branch_text = b"from branch exec";
+        let branch_params = [
+            DdbValue {
+                tag: DdbValueTag::Int64 as u32,
+                int64_value: 2,
+                ..DdbValue::default()
+            },
+            DdbValue {
+                tag: DdbValueTag::Text as u32,
+                data: branch_text.as_ptr().cast_mut(),
+                len: branch_text.len(),
+                ..DdbValue::default()
+            },
+        ];
+        assert_eq!(
+            ddb_db_execute_on_branch(
+                db,
+                branch_name.as_ptr(),
+                branch_insert_sql.as_ptr(),
+                branch_params.as_ptr(),
+                branch_params.len(),
+                &mut result,
+            ),
+            DDB_OK,
+            "execute_on_branch on named branch failed: {}",
+            unsafe { CStr::from_ptr(ddb_last_error_message()) }
+                .to_str()
+                .expect("utf8")
+        );
+        assert_eq!(ddb_result_free(&mut result), DDB_OK);
+
+        let branch_id_param = [DdbValue {
+            tag: DdbValueTag::Int64 as u32,
+            int64_value: 2,
+            ..DdbValue::default()
+        }];
+        assert_eq!(
+            ddb_db_execute_on_branch(
+                db,
+                branch_name.as_ptr(),
+                select_sql.as_ptr(),
+                branch_id_param.as_ptr(),
+                branch_id_param.len(),
+                &mut result,
+            ),
+            DDB_OK,
+        );
+        selected_rows = 0;
+        assert_eq!(ddb_result_row_count(result, &mut selected_rows), DDB_OK);
+        assert_eq!(selected_rows, 1);
+        assert_eq!(ddb_result_value_copy(result, 0, 1, &mut value), DDB_OK);
+        assert_eq!(value.tag, DdbValueTag::Text as u32);
+        let branch_text = std::str::from_utf8(unsafe {
+            std::slice::from_raw_parts(value.data.cast_const(), value.len)
+        })
+        .expect("branch text");
+        assert_eq!(branch_text, "from branch exec");
+        assert_eq!(ddb_value_dispose(&mut value), DDB_OK);
+        assert_eq!(ddb_result_free(&mut result), DDB_OK);
+
+        assert_eq!(
+            ddb_db_execute_on_branch(
+                db,
+                main_branch.as_ptr(),
+                select_sql.as_ptr(),
+                branch_id_param.as_ptr(),
+                branch_id_param.len(),
+                &mut result,
+            ),
+            DDB_OK,
+        );
+        selected_rows = 0;
+        assert_eq!(ddb_result_row_count(result, &mut selected_rows), DDB_OK);
+        assert_eq!(selected_rows, 0);
+        assert_eq!(ddb_result_free(&mut result), DDB_OK);
+
+        assert_eq!(
+            ddb_db_execute_on_branch(
+                db,
+                branch_name.as_ptr(),
+                select_sql.as_ptr(),
+                branch_id_param.as_ptr(),
+                branch_id_param.len(),
+                &mut result,
+            ),
+            DDB_OK,
+            "logged branch SQL with params should replay successfully"
+        );
+        assert_eq!(ddb_result_free(&mut result), DDB_OK);
+
+        let missing_param_status = ddb_db_execute_on_branch(
+            db,
+            branch_name.as_ptr(),
+            branch_insert_sql.as_ptr(),
+            ptr::null(),
+            0,
+            &mut result,
+        );
+        assert_eq!(missing_param_status, DDB_ERR_SQL);
+        assert!(unsafe { CStr::from_ptr(ddb_last_error_message()) }
+            .to_str()
+            .expect("utf8")
+            .contains("parameter $1 was not provided"));
+
         assert_eq!(ddb_db_free(&mut db), DDB_OK);
     }
 

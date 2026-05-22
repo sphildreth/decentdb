@@ -5,6 +5,24 @@ All notable changes to DecentDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.7.0] - [2026-05-22]
+
+### Added
+
+- Added ABI v5 with the stable C ABI `ddb_db_execute_on_branch` entry point plus
+  Dart `Database.branchWorkflow` APIs for named snapshots, branch create/list/
+  delete/rename/commit/log/diff/restore/merge, and branch-local SQL execution
+  with typed positional parameters.
+
+## Fixed
+
+- Fixed canonical `sys.*` inspection query execution through prepared statements,
+  including `sys.wal_metrics`, `sys.storage_metrics`, `sys.write_queue_metrics`,
+  `sys.sync_status`, `sys.sync_retention`, `sys.sync_peer_lag`,
+  `sys.sync_relay_status`, `sys.reactive_metrics`, `sys.reactive_subscriptions`,
+  `sys.extensions`, `sys.extension_functions`, `sys.extension_collations`,
+  `sys.extension_dependencies`, and `sys.extension_validation`.
+
 ## [2.6.0] - 2026-05-21
 
 ### Added
