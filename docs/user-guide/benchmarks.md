@@ -5,7 +5,7 @@ This page collects the current Python embedded comparison charts and a plain-lan
 ## Benchmark snapshot metadata
 
 <!-- BENCHMARK_AUTOGEN_METADATA_START -->
-- Document updated: 2026-05-21 16:16:57 UTC
+- Document updated: 2026-05-22 23:01:18 UTC
 - Ranking snapshot: final sweep point at `500` operations from the exported benchmark bundles in `docs/assets/benchmarks/python-embedded-compare/`
 <!-- BENCHMARK_AUTOGEN_METADATA_END -->
 
@@ -13,7 +13,7 @@ This page collects the current Python embedded comparison charts and a plain-lan
 
 | Engine | Version stamp | Source |
 | --- | --- | --- |
-| DecentDB | 2.6.0 | Workspace package version |
+| DecentDB | 2.7.0 | Workspace package version |
 | SQLite (`SQLite_wal_full`) | 3.52.0 | Benchmark-reported engine version |
 | DuckDB | 1.5.1 | Benchmark-reported engine version |
 | H2 (`JDBC`) | 2.2.224 | Benchmark-reported engine version |
@@ -60,14 +60,14 @@ The summary table below uses the latest sweep point shown in the charts: `500` o
 <!-- BENCHMARK_AUTOGEN_SUMMARY_START -->
 | Workload | Benchmark | Leader at 500 ops | Leader mean latency (us/op) | DecentDB mean latency (us/op) | DecentDB rank | Reading |
 | --- | --- | --- | ---: | ---: | --- | --- |
-| Workload C | Full scan | DuckDB | 703.92 | 1424.34 | 3rd of 6 | Trailing |
-| Workload C | Point select | SQLite_wal_full | 6.49 | 21.35 | 2nd of 6 | Near the front |
-| Workload A | Point select | SQLite_wal_full | 6.34 | 20.97 | 2nd of 6 | Near the front |
-| Workload A | Aggregate | SQLite_wal_full | 59.68 | 222.96 | 2nd of 6 | Near the front |
-| Workload A | Join | SQLite_wal_full | 30.38 | 287.65 | 2nd of 6 | Near the front |
-| Workload A | Range scan | SQLite_wal_full | 6.20 | 266.56 | 4th of 6 | Trailing |
-| Workload A | Delete | H2(JDBC) | 70.79 | 2356.47 | 6th of 6 | Trailing heavily |
-| Workload A | Update | H2(JDBC) | 86.01 | 2928.55 | 6th of 6 | Trailing heavily |
+| Workload C | Full scan | SQLite_wal_full | 687.84 | 1277.67 | 3rd of 6 | Trailing |
+| Workload C | Point select | SQLite_wal_full | 6.64 | 19.30 | 2nd of 6 | Near the front |
+| Workload A | Point select | SQLite_wal_full | 9.92 | 18.01 | 2nd of 6 | Near the front |
+| Workload A | Aggregate | SQLite_wal_full | 56.41 | 192.58 | 3rd of 6 | Trailing |
+| Workload A | Join | SQLite_wal_full | 29.35 | 278.70 | 3rd of 6 | Trailing |
+| Workload A | Range scan | SQLite_wal_full | 7.45 | 255.38 | 5th of 6 | Trailing |
+| Workload A | Delete | H2(JDBC) | 32.86 | 2146.71 | 6th of 6 | Trailing heavily |
+| Workload A | Update | H2(JDBC) | 39.16 | 2793.34 | 6th of 6 | Trailing heavily |
 <!-- BENCHMARK_AUTOGEN_SUMMARY_END -->
 
 Notes:
