@@ -2,7 +2,8 @@
 
 **Date:** 2026-05-21
 **Status:** Implemented for DecentDB 2.6.0
-**Roadmap:** [`FUTURE_WINS.md`](FUTURE_WINS.md)
+**Roadmap:** Delivered foundation; see [`FUTURE_WINS.md`](FUTURE_WINS.md)
+Delivered Context
 **Audience:** Core engine developers, SQL planner/executor maintainers, C ABI maintainers, binding maintainers, CLI maintainers, documentation authors, coding agents
 **Related inputs:** Lua 5.4 Reference Manual, `design/FUTURE_WINS.md`, `design/WIN_ADVANCED_SQL_COMPATIBILITY_SURFACE.md`, `design/adr/0111-table-valued-functions.md`, `design/adr/0118-rust-ffi-panic-safety.md`, ADR 0169-0173
 
@@ -52,12 +53,12 @@ Use DecentDB for type authority, SQL registration, sandboxing, and durability.
 Use the manifest as the contract.
 ```
 
-Future Win #2 is complete in 2.6.0 when the package model and supported SQL
-extension surface are implemented end to end: scalar functions, table-valued
-functions, aggregates, query-time collations, package validation, package
-hashing, signature verification, install/enable/trust lifecycle, dependency
-inspection, CLI/Rust/C ABI coverage, docs, and examples. A scalar-only runtime
-is not complete.
+The former Lua extension future win is complete in 2.6.0 when the package
+model and supported SQL extension surface are implemented end to end: scalar
+functions, table-valued functions, aggregates, query-time collations, package
+validation, package hashing, signature verification, install/enable/trust
+lifecycle, dependency inspection, CLI/Rust/C ABI coverage, docs, and examples.
+A scalar-only runtime is not complete.
 
 ---
 
@@ -997,8 +998,9 @@ sync metadata tables.
 
 ## 21. Implementation Slices
 
-All slices below were part of the Future Win #2 implementation plan. They are
-kept here as the completion record for the 2.6.0 Lua extension surface.
+All slices below were part of the former Lua extension future win
+implementation plan. They are kept here as the completion record for the 2.6.0
+Lua extension surface.
 
 ### Slice 0: ADRs And Dependency Gate
 

@@ -6,7 +6,7 @@
 **Audience:** Core engine developers, sync implementers, CLI maintainers, web
 binding maintainers, SDK maintainers, documentation authors, release engineers,
 coding agents
-**Related Roadmap Item:** `design/FUTURE_WINS.md` priority #1
+**Related Roadmap Item:** Delivered foundation; see `design/FUTURE_WINS.md` Delivered Context.
 **Governing ADRs:**
 [`adr/0166-production-sync-relay-boundary-and-identity.md`](adr/0166-production-sync-relay-boundary-and-identity.md),
 [`adr/0167-public-changeset-api.md`](adr/0167-public-changeset-api.md),
