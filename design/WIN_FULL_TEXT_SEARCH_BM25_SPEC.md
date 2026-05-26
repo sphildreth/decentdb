@@ -159,6 +159,12 @@ Initial DDL rules:
   boundaries are hard phrase boundaries in v1, so a quoted phrase cannot match
   across `title` and `body` unless a later ADR explicitly adds cross-field phrase
   behavior.
+- V1 implements hard field boundaries with a persisted analyzer position gap:
+  `FTS_FIELD_POSITION_GAP = 256`. If `title` produces positions `0, 1`, then the
+  first `body` token starts at `1 + 256 = 257`. Phrase matching still checks
+  consecutive positions, so phrases cannot cross fields without any special
+  multi-field phrase logic. Document length counts real tokens only, not gap
+  positions.
 - Document length is the sum of analyzed tokens from non-NULL fields.
 - Ranking corpus statistics (`N` and `avgdl`) count only rows whose indexed
   document length is greater than zero. The implementation may still store
@@ -372,11 +378,15 @@ Required catalog changes:
   parsing at every call site.
 - `FullTextIndexConfig` must include analyzer id/version, tokenizer, language,
   stopwords, stemming, case-folding policy, diacritic policy, prefix lengths,
-  and any ranking defaults that become persistent.
+  field position gap, and any ranking defaults that become persistent.
 - Existing BTree, trigram, and spatial indexes must round-trip with empty/default
   options.
 - Catalog serialization must have deterministic field ordering and explicit
-  versioning. If this changes the database format version, ADR 0131 applies.
+  versioning.
+- Adding `IndexKind::FullText` and persisted full-text options is a database
+  format change. Phase 2 must bump the format version and update the
+  `decentdb-migrate` read-only parser per ADR 0131 before integration tests rely
+  on persistent FTS databases.
 
 Required introspection contract:
 
@@ -405,6 +415,30 @@ Implementation should reuse existing B+Tree and overflow-page mechanisms where
 that keeps the storage model simple and portable. Large postings lists must be
 chunked; one unbounded blob per term is not acceptable.
 
+Logical key namespace:
+
+- FTS should use typed, byte-stable keys in ordinary engine-owned B+Trees rather
+  than inventing custom page formats.
+- Keys must include a stable `index_id` or equivalent internal index storage id.
+  If the catalog does not already expose a stable index id, Phase 2 must add one
+  or explicitly justify a canonical-name encoding.
+- Recommended key families:
+  - `(index_id, TYPE_META)` -> index metadata and verification marker
+  - `(index_id, TYPE_TERM, term_bytes)` -> `(term_id, doc_freq, total_term_freq)`
+  - `(index_id, TYPE_PREFIX, prefix_bytes)` -> compressed term-id list or term-id
+    range metadata for prefix lookup
+  - `(index_id, TYPE_POSTING, term_id, chunk_start_row_id)` -> compressed
+    postings chunk
+  - `(index_id, TYPE_DOC_STAT, row_id)` -> `(doc_generation, doc_len,
+    field_lens_array)`
+- Postings chunk payloads should use varint/delta encoding for row ids,
+  document generations, term frequency, and positions. Encoding must support
+  streaming one chunk at a time.
+- `chunk_start_row_id` is the first row id represented in the postings chunk and
+  keeps high-frequency terms from requiring one huge postings value.
+- Postings entries must include enough document-generation information to
+  distinguish current row content from obsolete entries left behind by updates.
+
 Verification marker requirements:
 
 - Phase 2 must define the concrete verification marker before storage code
@@ -417,9 +451,8 @@ Verification marker requirements:
 - Query execution is not required to recompute full-index checksums on every
   query.
 
-The implementation must decide whether the catalog/index metadata change bumps
-the on-disk format version. If it does, ADR 0131 applies and the
-`decentdb-migrate` read-only migration parser must be updated.
+The catalog and storage changes require a format-version bump. ADR 0131 applies,
+and the `decentdb-migrate` read-only migration parser must be updated in Phase 2.
 
 Implementation impact checklist:
 
@@ -462,25 +495,44 @@ Required transaction behavior:
 
 - Inserted rows become searchable at the same transaction visibility boundary as
   the base table rows.
-- Updated indexed columns remove old tokens and add new tokens.
-- Deleted rows are removed from search results.
+- Updated indexed columns logically remove old tokens and add new tokens at the
+  same visibility boundary.
+- Deleted rows are removed from search results at the same visibility boundary.
 - Rollback reverts all FTS maintenance.
 - Same-transaction reads follow DecentDB's normal read-your-writes rules.
 - Row policies filter FTS candidates before rows are returned.
 
 FTS must not copy trigram's checkpoint-only pending-op visibility if that would
 make committed or same-transaction FTS reads lag behind base table visibility.
-The implementation may choose one of these concrete strategies:
+V1 should use transaction-local FTS delta overlays rather than eager temporary
+index copies:
 
-- transaction-local FTS delta overlays merged with committed postings during FTS
-  reads, then persisted or discarded on commit/rollback; or
-- eager materialization to a transaction-private runtime/index copy before any
-  same-transaction FTS read.
+- The active write transaction keeps in-memory FTS additions and logical
+  removals keyed by index, term id or analyzed term, row id, and document
+  generation.
+- FTS query execution streams candidates from persistent postings and merges
+  them with the transaction-local overlay.
+- Rollback drops the overlay.
+- Commit applies the overlay metadata needed for future readers without
+  requiring every obsolete posting entry to be physically removed immediately.
 
-Either strategy must make `fulltext_match(...)` see the transaction's own
-insert/update/delete effects under the same rules as ordinary table scans.
-Checkpoint-only materialization that makes FTS results stale while base rows are
-visible is not acceptable for v1.
+This overlay direction minimizes write amplification during a transaction while
+preserving read-your-writes. If implementation proves an alternative is simpler,
+it must preserve the same visibility contract and be documented with a follow-up
+ADR note before landing.
+
+Deletion and update cleanup:
+
+- V1 does not need to eagerly purge every obsolete row id from existing postings
+  chunks during `DELETE` or indexed-column `UPDATE`.
+- Query execution must filter posting candidates through base-table visibility
+  and current document statistics.
+- Same-row updates require generation filtering: a posting entry for `(row_id,
+  old_generation)` must not match the current `(row_id, new_generation)`.
+  Base-table visibility alone is not enough for updates that preserve row ids.
+- Missing or deleted document statistics cause the candidate to be ignored.
+- `ALTER INDEX ... REBUILD` compacts away obsolete postings. Background vacuum
+  for FTS postings is a later feature.
 
 Required recovery behavior:
 
@@ -804,6 +856,7 @@ Scope:
 - analyzer metadata in catalog/introspection/tooling metadata
 - term dictionary, postings, document stats, and index metadata storage
 - rebuild from base table
+- database format-version bump and `decentdb-migrate` read-only parser update
 
 Acceptance:
 
@@ -811,13 +864,14 @@ Acceptance:
 - rebuild produces deterministic postings and stats
 - DDL rejects unsupported access-method aliases and invalid `WITH` options
 - dump/introspection round-trips `USING fulltext` and normalized analyzer options
-- format-version decision documented and implemented if needed
+- format-version bump is implemented and migration parser coverage exists
 
 ### Phase 3: Transactional Maintenance And Recovery
 
 Scope:
 
 - insert/update/delete maintenance
+- transaction-local FTS delta overlay
 - rollback and transaction visibility
 - crash/reopen checks
 - verify and stale-index detection
@@ -826,6 +880,8 @@ Acceptance:
 
 - no committed row is silently missing from FTS results after recovery
 - same-transaction FTS reads see the transaction's own writes
+- updates that preserve row id do not match obsolete terms from older document
+  generations
 - verify reports corrupt/stale index data
 - rebuild repairs derived index state
 - rebuild concurrency follows the synchronous atomic-swap rules in section 8

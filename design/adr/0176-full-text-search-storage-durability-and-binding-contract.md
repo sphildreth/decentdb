@@ -27,6 +27,19 @@ The FTS storage model will include these logical structures:
 - index metadata containing analyzer config, document count, average document
   length, build generation, dirty/rebuild state, and verification metadata
 
+The logical storage key families are:
+
+- `(index_id, TYPE_META)`
+- `(index_id, TYPE_TERM, term_bytes)`
+- `(index_id, TYPE_PREFIX, prefix_bytes)`
+- `(index_id, TYPE_POSTING, term_id, chunk_start_row_id)`
+- `(index_id, TYPE_DOC_STAT, row_id)`
+
+Postings chunks are keyed by term id and starting row id, with compressed payloads
+that include row-id deltas, document generation, term frequency, and positions.
+This keeps high-frequency terms chunked and allows query execution to stream
+postings without loading a full list into memory.
+
 `NULL` indexed text values contribute no tokens and are not indexed as a literal
 string. Ranking document count and average document length count only rows with
 at least one indexed token.
@@ -41,10 +54,17 @@ rebuild if the implementation proves that this preserves base-table durability
 and query correctness. Queries against a stale FTS index must either trigger an
 explicitly accepted rebuild path or fail with a clear error.
 
-FTS maintenance must satisfy DecentDB read-your-writes semantics. The
-implementation may use transaction-local FTS delta overlays or eager
-transaction-private materialization, but checkpoint-only materialization that
-makes FTS results lag behind visible base table rows is not acceptable.
+FTS maintenance must satisfy DecentDB read-your-writes semantics. V1 should use
+transaction-local FTS delta overlays merged with persistent postings at query
+time. Checkpoint-only materialization that makes FTS results lag behind visible
+base table rows is not acceptable.
+
+Deletes and indexed-column updates do not need to physically purge obsolete row
+ids from postings chunks synchronously. Query execution must filter candidates
+through base-table visibility and current document statistics. Updates that
+preserve row id require document-generation filtering so an old posting for the
+same row id cannot match the new document content. `ALTER INDEX ... REBUILD`
+compacts obsolete postings.
 
 `ALTER INDEX ... REBUILD` is synchronous in v1. It uses the normal single-writer
 path, blocks other writes, builds replacement FTS state from a consistent
@@ -82,6 +102,8 @@ The storage decision follows these product constraints:
 - committed base table rows remain the durable source of truth
 - FTS query results must match committed table contents
 - same-transaction FTS reads must match same-transaction table visibility
+- obsolete postings left behind by deletes or same-row updates must be filtered
+  by visibility and document generation
 - derived index corruption must be detectable and repairable
 - index maintenance must honor transaction commit and rollback
 - WAL and checkpoint behavior must remain understandable
@@ -103,6 +125,9 @@ same statements and read rank values as ordinary `FLOAT64` columns.
   much implementation detail and makes planner integration harder.
 - **One opaque serialized FTS blob per index.** Rejected. It has poor update,
   verification, and large-index behavior.
+- **Eager purge of every obsolete posting during DELETE/UPDATE.** Rejected as a
+  required v1 behavior because it creates random-write amplification. Rebuild can
+  compact obsolete entries.
 - **Checkpoint-only FTS materialization.** Rejected for v1 if it causes
   same-transaction or committed FTS reads to lag behind visible base table rows.
 - **Mandatory external search library.** Rejected for portability, auditability,
@@ -117,14 +142,16 @@ same statements and read rank values as ordinary `FLOAT64` columns.
 - Persisting analyzer identifiers and versions is required to avoid silent
   semantic drift across releases.
 - Transactional maintenance adds write cost to indexed text updates.
-- Transaction-local delta overlays or eager private materialization add executor
-  complexity, but they preserve DecentDB's visibility contract.
+- Transaction-local delta overlays and generation filtering add executor
+  complexity, but they preserve DecentDB's visibility contract while avoiding
+  unnecessary random posting rewrites.
 - Phrase and prefix support require position and dictionary data, increasing
   index size.
 - Branch-aware derived state may force stale-index marking or branch-local
   generations until a later storage ADR proves safe sharing.
-- If the new index kind requires an on-disk format version bump, ADR 0131
-  requires a read-only migration parser update in `decentdb-migrate`.
+- The new index kind and persisted FTS options require an on-disk format version
+  bump. ADR 0131 requires a read-only migration parser update in
+  `decentdb-migrate`.
 
 ### References
 
