@@ -95,7 +95,7 @@ shipped foundation affects follow-on roadmap decisions.
 
 | Priority | Future Version | Status | Feature | Current Source Of Truth | Why This Rank |
 |---:|---|---|---|---|---|
-| 1 | vNext | TODO | Full-text search with BM25 ranking | Needs ADR/spec | Expected by app databases and a real SQLite FTS migration blocker |
+| 1 | vNext | TODO | Full-text search with BM25 ranking | [`WIN_FULL_TEXT_SEARCH_BM25_SPEC.md`](WIN_FULL_TEXT_SEARCH_BM25_SPEC.md); ADR 0175-0176 | Expected by app databases and a real SQLite FTS migration blocker |
 | 2 | vNext | TODO | Cross-process WAL coordination | Needs ADR/spec | Important for Electron/Tauri, helper processes, CLI coexistence, background sync workers, and matching SQLite's practical process-safe advantage |
 | 3 | vNext | TODO | Browser SQL/API parity and production web hardening | ADR 0161/0165 and browser docs; needs follow-up spec | DecentDB has a browser runtime; the next adoption hurdle is making it feel complete next to SQLite WASM and PGlite |
 | 4 | vNext | TODO | Mobile production runtime and SDK hardening | Needs ADR/spec | Local-first without first-class iOS/Android lifecycle, packaging, key storage, and background sync guidance leaves a major adoption gap |
@@ -162,7 +162,9 @@ database.
 
 **Future Version:** vNext
 
-**Source of truth:** Needs ADR/spec before implementation.
+**Source of truth:** [`WIN_FULL_TEXT_SEARCH_BM25_SPEC.md`](WIN_FULL_TEXT_SEARCH_BM25_SPEC.md);
+[`ADR 0175`](adr/0175-native-full-text-search-query-surface-and-ranking.md);
+[`ADR 0176`](adr/0176-full-text-search-storage-durability-and-binding-contract.md).
 
 ### Why This Matters
 
@@ -791,9 +793,10 @@ mobile, performance, and operational foundations.
 
 ## Near-Term Sequence
 
-1. Draft the full-text search ADR/spec and benchmark targets so BM25, phrase
-   search, tokenization, recovery, and planner integration are designed before
-   storage/index code lands.
+1. Implement full-text search from
+   [`WIN_FULL_TEXT_SEARCH_BM25_SPEC.md`](WIN_FULL_TEXT_SEARCH_BM25_SPEC.md), ADR
+   0175, and ADR 0176, keeping BM25, phrase search, tokenization, recovery,
+   planner integration, binding tests, docs, and benchmarks in scope.
 2. Design cross-process WAL coordination with Electron/Tauri, CLI coexistence,
    background workers, browser ownership, and crash/stale-owner diagnostics in
    one portability-aware plan.
