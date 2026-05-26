@@ -61,6 +61,34 @@ Notes:
   (for example `app.users`) are rejected.
 - `CREATE SCHEMA ... AUTHORIZATION ...` and inline schema elements are not supported.
 
+### Security DDL
+
+Row policies and column masks are durable security metadata. Audit context is
+connection-local metadata supplied by the host application.
+
+```sql
+SET AUDIT CONTEXT tenant_id = 'tenant-a';
+SET AUDIT CONTEXT actor = 'alice@example.com';
+
+CREATE POLICY tenant_filter
+  ON invoices
+  USING tenant_id = current_tenant();
+
+CREATE MASK ssn_mask
+  ON employees(ssn)
+  USING '***-**-' || right(ssn, 4);
+
+ALTER POLICY tenant_filter DISABLE;
+ALTER MASK ssn_mask ENABLE;
+DROP POLICY IF EXISTS tenant_filter;
+DROP MASK IF EXISTS ssn_mask;
+```
+
+Policy expressions must evaluate to `BOOL`; `FALSE` and `NULL` hide the row.
+Masks rewrite query output for matching columns without changing stored values.
+See [Local Data Security](security.md) for TDE, policy, masking, and audit
+context details.
+
 ### CREATE INDEX
 
 ```sql

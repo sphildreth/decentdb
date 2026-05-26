@@ -47,6 +47,43 @@ decentdb exec --db=large.ddb --sql="SELECT 1" --cacheMb=256
 
 DecentDB uses a write-ahead log (WAL) and performs an `fsync()` on commit by default for durable ACID writes.
 
+## Local Transparent Data Encryption (TDE)
+
+TDE is configured at create/open time with `DbConfig::encryption` or C ABI open
+options. The database file, WAL, and sync journal are encrypted through the VFS
+layer when a key is supplied.
+
+```rust
+use decentdb::{Db, DbConfig, DbEncryptionConfig};
+
+let config = DbConfig {
+    encryption: Some(DbEncryptionConfig::from_key_bytes(
+        b"application-managed high entropy key bytes",
+    )?),
+    ..DbConfig::default()
+};
+
+let db = Db::create("secure.ddb", config.clone())?;
+let reopened = Db::open("secure.ddb", config)?;
+# Ok::<(), decentdb::DbError>(())
+```
+
+C ABI and binding callers can use open options:
+
+```text
+encryption_key_hex=00112233445566778899aabbccddeeff
+encryption_key=development-only-text-key
+```
+
+`encryption_key_hex` / `tde_key_hex` decode hex bytes. `encryption_key` /
+`tde_key` use the UTF-8 bytes of the option value. Avoid logging option strings
+that contain key material.
+
+TDE v1 provides local encryption-at-rest confidentiality. Key storage, key
+rotation, and authenticated page/chunk encryption are separate follow-up
+concerns; keep production keys in a platform key store, secure enclave, KMS, or
+equivalent secret manager.
+
 ### Durability
 
 DecentDB exposes SQLite-style compatibility PRAGMAs for common tooling probes,

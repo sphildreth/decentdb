@@ -27,6 +27,7 @@ mod planner;
 mod reactive;
 mod record;
 mod search;
+mod security;
 pub(crate) mod spatial;
 mod sql;
 mod storage;
@@ -43,7 +44,7 @@ pub use crate::branch::{
     BranchMergeOperation, BranchMergeReport, BranchRestoreReport, BranchRowDiff, BranchTableDiff,
     BranchTableDiffStatus, NamedSnapshot,
 };
-pub use crate::config::{DbConfig, WalSyncMode};
+pub use crate::config::{DbConfig, DbEncryptionConfig, EncryptionKey, WalSyncMode};
 pub use crate::db::{evict_shared_wal, Db, PreparedStatement, SqlTransaction};
 pub use crate::doctor::{
     render_markdown, run_doctor, sort_findings, DoctorCategory, DoctorCheckSelection,

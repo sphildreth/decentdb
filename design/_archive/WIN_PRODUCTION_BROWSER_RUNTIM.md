@@ -2,10 +2,10 @@
 
 **Date:** 2026-05-20  
 **Status:** Implemented for DecentDB 2.6.0
-**Roadmap:** Delivered foundation; see [`FUTURE_WINS.md`](FUTURE_WINS.md) Delivered Context
+**Roadmap:** Delivered foundation; see [`FUTURE_WINS.md`](../FUTURE_WINS.md) Delivered Context
 **Document Type:** Implementation SPEC
 **Audience:** Web binding maintainers, WASM/VFS maintainers, sync implementers, storage/WAL maintainers, documentation authors, release engineers, coding agents  
-**Related inputs:** [`FUTURE_WINS.md`](FUTURE_WINS.md), [`adr/0161-browser-wasm-opfs-runtime.md`](adr/0161-browser-wasm-opfs-runtime.md), [`docs/api/wasm.md`](../docs/api/wasm.md), [`WIN_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md`](WIN_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md), [`WIN_CONCURRENT_WRITE_ERGONOMICS_PHASED_APPROACH.md`](WIN_CONCURRENT_WRITE_ERGONOMICS_PHASED_APPROACH.md)
+**Related inputs:** [`FUTURE_WINS.md`](../FUTURE_WINS.md), [`adr/0161-browser-wasm-opfs-runtime.md`](../adr/0161-browser-wasm-opfs-runtime.md), [`docs/api/wasm.md`](../../docs/api/wasm.md), [`WIN_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md`](../WIN_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md), [`WIN_CONCURRENT_WRITE_ERGONOMICS_PHASED_APPROACH.md`](WIN_CONCURRENT_WRITE_ERGONOMICS_PHASED_APPROACH.md)
 
 ---
 

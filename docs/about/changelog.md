@@ -5,6 +5,23 @@ All notable changes to DecentDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Added local data security v1: transparent data encryption for database, WAL,
+  and sync-journal files via `DbConfig::encryption` and C ABI open options;
+  durable `CREATE/ALTER/DROP POLICY`; durable `CREATE/ALTER/DROP MASK`;
+  connection-local audit context through Rust, SQL, and C ABI APIs; audit
+  context SQL functions; `sys_audit_context`; and security DDL audit events.
+- Added ADR 0174 documenting the TDE, policy, masking, audit-context, C ABI, and
+  follow-up security boundaries.
+
+### Changed
+
+- Bumped the C ABI version to 6 for the new audit-context entry points and TDE
+  open options, and updated the Dart ABI expectation/header copies.
+
 ## [2.7.0] - [2026-05-22]
 
 ### Added

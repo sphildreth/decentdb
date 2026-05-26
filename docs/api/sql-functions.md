@@ -79,9 +79,29 @@ series may not produce more than 1,000,000 rows.
 
 - `current_database()` and `current_schema()` return `main`.
 - `database()` and `schema()` are compatibility aliases returning `main`.
+- `current_audit_context(key)` returns the current connection-local audit
+  context value for `key`, or `NULL`.
+- `current_tenant()` returns audit context `tenant_id` or `tenant`, or `NULL`.
+- `current_actor()` returns audit context `actor` or `user`, or `NULL`.
 - `version()` returns a DecentDB version string.
 - `sqlite_version()` and `pg_backend_pid()` are rejected rather than returning
   misleading SQLite or PostgreSQL server values.
+
+### Audit context inspection
+
+`sys_audit_context` exposes the current handle's audit context as `key` /
+`value` rows.
+
+```sql
+SET AUDIT CONTEXT tenant_id = 'tenant-a';
+SET AUDIT CONTEXT actor = 'alice@example.com';
+
+SELECT current_tenant(), current_actor();
+SELECT key, value FROM sys_audit_context ORDER BY key;
+```
+
+Audit context is connection-local. It is used by row policies, column masks,
+and security audit event rows.
 
 ## Operational inspection views
 

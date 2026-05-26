@@ -22,6 +22,7 @@ nav:
     - Migrations: user-guide/migration.md
     - Transactions: user-guide/transactions.md
     - Write Concurrency: user-guide/write-concurrency.md
+    - Local Data Security: user-guide/security.md
     - Lua Extensions: user-guide/lua-extensions.md
     - Local-first sync:
       - Overview: user-guide/sync/index.md

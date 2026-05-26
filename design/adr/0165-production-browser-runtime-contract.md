@@ -83,7 +83,7 @@ DecentDB browser production runtime adopts the following contract.
 
 ### References
 
-- `design/WIN_PRODUCTION_BROWSER_RUNTIM.md`
+- `design/_archive/WIN_PRODUCTION_BROWSER_RUNTIM.md`
 - `design/FUTURE_WINS.md`
 - `design/adr/0161-browser-wasm-opfs-runtime.md`
 - `docs/api/wasm.md`

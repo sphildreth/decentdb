@@ -74,6 +74,7 @@ use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 
 const APPLICATION_PRAGMA_TABLE: &str = "__decentdb_application_pragmas";
+static AUDIT_EVENT_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// Stable engine owner used across later storage, SQL, and FFI slices.
 #[derive(Clone, Debug)]
@@ -349,6 +350,7 @@ struct DbInner {
     held_snapshots: Mutex<HashMap<u64, ReaderGuard>>,
     sync_ctx: SyncContext,
     reactive_hub: Arc<ReactiveHub>,
+    audit_context: Arc<Mutex<crate::security::AuditContext>>,
     read_only_paged_row_source_residency: Mutex<ReadOnlyPagedRowSourceResidency>,
     write_queue: OnceLock<WriteQueue>,
 }
@@ -646,6 +648,32 @@ impl Db {
         })
     }
 
+    /// Reads the raw database header using the supplied configuration.
+    ///
+    /// This variant can inspect encrypted databases when `config.encryption`
+    /// contains the correct key.
+    pub fn read_header_info_with_config(
+        path: impl AsRef<Path>,
+        config: &DbConfig,
+    ) -> Result<HeaderInfo> {
+        let path = path.as_ref();
+        let vfs = VfsHandle::for_path(path).with_config(config);
+        let file = vfs.open(path, OpenMode::OpenExisting, FileKind::Database)?;
+        let header = storage::read_database_header_vfs_loose(file.as_ref())?;
+        Ok(HeaderInfo {
+            magic_hex: hex_encode(&header.magic),
+            format_version: header.format_version,
+            page_size: header.page_size,
+            header_checksum: header.header_checksum,
+            schema_cookie: header.schema_cookie,
+            catalog_root_page_id: header.catalog_root_page_id,
+            freelist_root_page_id: header.freelist.root_page_id,
+            freelist_head_page_id: header.freelist.head_page_id,
+            freelist_page_count: header.freelist.page_count,
+            last_checkpoint_lsn: header.last_checkpoint_lsn,
+        })
+    }
+
     /// Begins an exclusive SQL transaction handle that reserves mutable runtime
     /// state until commit or rollback.
     pub fn transaction(&self) -> Result<SqlTransaction<'_>> {
@@ -683,6 +711,7 @@ impl Db {
     ) -> Result<Self> {
         let path = path.as_ref();
         config.validate_for_create()?;
+        let vfs = vfs.with_config(&config);
         let open_mode = if vfs.is_memory() {
             OpenMode::OpenOrCreate
         } else {
@@ -709,6 +738,7 @@ impl Db {
         vfs: VfsHandle,
     ) -> Result<Self> {
         let path = path.as_ref();
+        let vfs = vfs.with_config(&config);
         let mode = if vfs.is_memory() {
             OpenMode::OpenOrCreate
         } else {
@@ -962,7 +992,7 @@ impl Db {
 
         self.checkpoint_wal()?;
 
-        let vfs = VfsHandle::for_path(dest);
+        let vfs = VfsHandle::for_path(dest).with_config(&self.inner.config);
         if vfs.file_exists(dest)? {
             return Err(DbError::io(
                 format!("destination {} already exists", dest.display()),
@@ -1924,6 +1954,16 @@ impl Db {
                 results.push(result);
                 continue;
             }
+            if let Some(command) = crate::security::parse_set_audit_context(trimmed)? {
+                let result = self.execute_set_audit_context(command)?;
+                results.push(result);
+                continue;
+            }
+            if let Some(command) = crate::security::parse_security_command(trimmed)? {
+                let result = self.execute_security_command(trimmed, command)?;
+                results.push(result);
+                continue;
+            }
             if let Some(command) = crate::extensions::parse_extension_sql(trimmed)? {
                 let result = crate::extensions::execute_extension_sql(self, command)?;
                 results.push(result);
@@ -2641,8 +2681,10 @@ impl Db {
             }
         }
 
-        let (runtime, runtime_lsn) =
+        let (mut runtime, runtime_lsn) =
             EngineRuntime::load_from_storage(&pager, &wal, schema_cookie, &effective_config)?;
+        let audit_context = Arc::new(Mutex::new(crate::security::AuditContext::default()));
+        runtime.set_audit_context_handle(Arc::clone(&audit_context));
         let catalog = CatalogHandle::new(runtime.catalog.as_ref().clone());
         let last_seen_checkpoint_epoch = wal.checkpoint_epoch();
         let reactive_hub = crate::reactive::acquire_hub(open_lock_key.clone(), &effective_config);
@@ -2672,6 +2714,7 @@ impl Db {
                 held_snapshots: Mutex::new(HashMap::new()),
                 sync_ctx: SyncContext::new(&path),
                 reactive_hub,
+                audit_context,
                 read_only_paged_row_source_residency: Mutex::new(
                     ReadOnlyPagedRowSourceResidency::default(),
                 ),
@@ -2697,6 +2740,40 @@ impl Db {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.inner.path
+    }
+
+    /// Sets a per-handle audit context value used by policies, masks, and
+    /// audit metadata.
+    pub fn set_audit_context_value(&self, key: &str, value: Value) -> Result<()> {
+        if key.trim().is_empty() {
+            return Err(DbError::sql("audit context key must not be empty"));
+        }
+        self.inner
+            .audit_context
+            .lock()
+            .map_err(|_| DbError::internal("audit context lock poisoned"))?
+            .set(key.trim().to_string(), value);
+        Ok(())
+    }
+
+    /// Removes a per-handle audit context value.
+    pub fn clear_audit_context_value(&self, key: &str) -> Result<()> {
+        self.inner
+            .audit_context
+            .lock()
+            .map_err(|_| DbError::internal("audit context lock poisoned"))?
+            .remove(key);
+        Ok(())
+    }
+
+    /// Returns a snapshot of the current per-handle audit context.
+    pub fn audit_context_snapshot(&self) -> Result<BTreeMap<String, Value>> {
+        Ok(self
+            .inner
+            .audit_context
+            .lock()
+            .map_err(|_| DbError::internal("audit context lock poisoned"))?
+            .snapshot())
     }
 
     pub fn schema_cookie(&self) -> Result<u32> {
@@ -2787,75 +2864,80 @@ impl Db {
                 Some(snapshot_lsn),
             )?;
         }
-        if let SqlStatement::Query(query) = statement {
-            let runtime = self
-                .inner
-                .engine
-                .read()
-                .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
-            self.validate_prepared_against_runtime(prepared, &runtime)?;
-            if let Some(result) = runtime.try_execute_simple_deferred_count_query(
-                query,
-                &self.inner.pager,
-                &self.inner.wal,
-                snapshot_lsn,
-            )? {
-                drop(runtime);
-                return self.finalize_row_source_autocommit_statement(statement, Ok(result));
-            }
-            if let Some(result) = runtime.try_execute_simple_deferred_min_max_query(
-                query,
-                &self.inner.pager,
-                &self.inner.wal,
-                snapshot_lsn,
-            )? {
-                drop(runtime);
-                return self.finalize_row_source_autocommit_statement(statement, Ok(result));
-            }
-            if let Some(result) = runtime.try_execute_simple_deferred_indexed_projection_query(
-                query,
-                params,
-                &self.inner.pager,
-                &self.inner.wal,
-                snapshot_lsn,
-                self.inner.config.persistent_pk_index,
-            )? {
-                drop(runtime);
-                return self.finalize_row_source_autocommit_statement(statement, Ok(result));
-            }
-            if let Some(result) = runtime.try_execute_simple_deferred_paged_query(
-                query,
-                params,
-                &self.inner.pager,
-                &self.inner.wal,
-                snapshot_lsn,
-                self.inner.config.persistent_pk_index,
-            )? {
-                drop(runtime);
-                return self.finalize_row_source_autocommit_statement(statement, Ok(result));
-            }
-            if prepared.is_none() {
-                if let Some(result) = self
-                    .try_execute_simple_indexed_join_projection_query_at_snapshot(
-                        &runtime,
-                        statement,
-                        query,
-                        params,
-                        snapshot_lsn,
-                    )?
-                {
-                    drop(runtime);
-                    return self.finalize_row_source_autocommit_statement(statement, Ok(result));
-                }
-                if let Some(result) = self.try_execute_query_with_row_sources_at_snapshot(
-                    &runtime,
-                    statement,
-                    params,
+        let security_active = self.ensure_security_tables_loaded_at_snapshot(snapshot_lsn)?;
+        if !security_active {
+            if let SqlStatement::Query(query) = statement {
+                let runtime = self
+                    .inner
+                    .engine
+                    .read()
+                    .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+                self.validate_prepared_against_runtime(prepared, &runtime)?;
+                if let Some(result) = runtime.try_execute_simple_deferred_count_query(
+                    query,
+                    &self.inner.pager,
+                    &self.inner.wal,
                     snapshot_lsn,
-                    false,
                 )? {
                     drop(runtime);
                     return self.finalize_row_source_autocommit_statement(statement, Ok(result));
+                }
+                if let Some(result) = runtime.try_execute_simple_deferred_min_max_query(
+                    query,
+                    &self.inner.pager,
+                    &self.inner.wal,
+                    snapshot_lsn,
+                )? {
+                    drop(runtime);
+                    return self.finalize_row_source_autocommit_statement(statement, Ok(result));
+                }
+                if let Some(result) = runtime.try_execute_simple_deferred_indexed_projection_query(
+                    query,
+                    params,
+                    &self.inner.pager,
+                    &self.inner.wal,
+                    snapshot_lsn,
+                    self.inner.config.persistent_pk_index,
+                )? {
+                    drop(runtime);
+                    return self.finalize_row_source_autocommit_statement(statement, Ok(result));
+                }
+                if let Some(result) = runtime.try_execute_simple_deferred_paged_query(
+                    query,
+                    params,
+                    &self.inner.pager,
+                    &self.inner.wal,
+                    snapshot_lsn,
+                    self.inner.config.persistent_pk_index,
+                )? {
+                    drop(runtime);
+                    return self.finalize_row_source_autocommit_statement(statement, Ok(result));
+                }
+                if prepared.is_none() {
+                    if let Some(result) = self
+                        .try_execute_simple_indexed_join_projection_query_at_snapshot(
+                            &runtime,
+                            statement,
+                            query,
+                            params,
+                            snapshot_lsn,
+                        )?
+                    {
+                        drop(runtime);
+                        return self
+                            .finalize_row_source_autocommit_statement(statement, Ok(result));
+                    }
+                    if let Some(result) = self.try_execute_query_with_row_sources_at_snapshot(
+                        &runtime,
+                        statement,
+                        params,
+                        snapshot_lsn,
+                        false,
+                    )? {
+                        drop(runtime);
+                        return self
+                            .finalize_row_source_autocommit_statement(statement, Ok(result));
+                    }
                 }
             }
         }
@@ -2938,6 +3020,150 @@ impl Db {
             PragmaCommand::Call { target, argument } => self.execute_pragma_call(target, argument),
             PragmaCommand::Set(target, value) => self.execute_pragma_set(target, value),
         }
+    }
+
+    fn ensure_security_catalog(&self) -> Result<()> {
+        for ddl in [
+            crate::security::POLICIES_DDL,
+            crate::security::MASKS_DDL,
+            crate::security::AUDIT_EVENTS_DDL,
+        ] {
+            self.execute_batch_direct_with_params(ddl, &[])?;
+        }
+        Ok(())
+    }
+
+    fn execute_set_audit_context(
+        &self,
+        command: crate::security::SetAuditContextCommand,
+    ) -> Result<QueryResult> {
+        match command.value {
+            Some(value) => self.set_audit_context_value(&command.key, value)?,
+            None => self.clear_audit_context_value(&command.key)?,
+        }
+        Ok(QueryResult::with_affected_rows(0))
+    }
+
+    fn execute_security_command(
+        &self,
+        sql: &str,
+        command: crate::security::SecurityCommand,
+    ) -> Result<QueryResult> {
+        self.ensure_security_catalog()?;
+        let created_at = current_time_micros();
+        match command {
+            crate::security::SecurityCommand::CreatePolicy {
+                name,
+                table_name,
+                using_sql,
+            } => {
+                self.execute_with_params(
+                    "INSERT INTO __decentdb_policies (policy_name, table_name, using_sql, enabled, created_at_micros) VALUES ($1, $2, $3, TRUE, $4)",
+                    &[
+                        Value::Text(name.clone()),
+                        Value::Text(table_name.clone()),
+                        Value::Text(using_sql),
+                        Value::Int64(created_at),
+                    ],
+                )?;
+                self.insert_audit_event("CREATE_POLICY", Some(&name), Some(sql))?;
+            }
+            crate::security::SecurityCommand::DropPolicy { name, if_exists } => {
+                let result = self.execute_with_params(
+                    "DELETE FROM __decentdb_policies WHERE policy_name = $1",
+                    &[Value::Text(name.clone())],
+                )?;
+                if result.affected_rows() == 0 && !if_exists {
+                    return Err(DbError::sql(format!("policy {name} does not exist")));
+                }
+                self.insert_audit_event("DROP_POLICY", Some(&name), Some(sql))?;
+            }
+            crate::security::SecurityCommand::AlterPolicy { name, enabled } => {
+                let result = self.execute_with_params(
+                    "UPDATE __decentdb_policies SET enabled = $1 WHERE policy_name = $2",
+                    &[Value::Bool(enabled), Value::Text(name.clone())],
+                )?;
+                if result.affected_rows() == 0 {
+                    return Err(DbError::sql(format!("policy {name} does not exist")));
+                }
+                self.insert_audit_event("ALTER_POLICY", Some(&name), Some(sql))?;
+            }
+            crate::security::SecurityCommand::CreateMask {
+                name,
+                table_name,
+                column_name,
+                expression_sql,
+            } => {
+                self.execute_with_params(
+                    "INSERT INTO __decentdb_masks (mask_name, table_name, column_name, expression_sql, enabled, created_at_micros) VALUES ($1, $2, $3, $4, TRUE, $5)",
+                    &[
+                        Value::Text(name.clone()),
+                        Value::Text(table_name),
+                        Value::Text(column_name),
+                        Value::Text(expression_sql),
+                        Value::Int64(created_at),
+                    ],
+                )?;
+                self.insert_audit_event("CREATE_MASK", Some(&name), Some(sql))?;
+            }
+            crate::security::SecurityCommand::DropMask { name, if_exists } => {
+                let result = self.execute_with_params(
+                    "DELETE FROM __decentdb_masks WHERE mask_name = $1",
+                    &[Value::Text(name.clone())],
+                )?;
+                if result.affected_rows() == 0 && !if_exists {
+                    return Err(DbError::sql(format!("mask {name} does not exist")));
+                }
+                self.insert_audit_event("DROP_MASK", Some(&name), Some(sql))?;
+            }
+            crate::security::SecurityCommand::AlterMask { name, enabled } => {
+                let result = self.execute_with_params(
+                    "UPDATE __decentdb_masks SET enabled = $1 WHERE mask_name = $2",
+                    &[Value::Bool(enabled), Value::Text(name.clone())],
+                )?;
+                if result.affected_rows() == 0 {
+                    return Err(DbError::sql(format!("mask {name} does not exist")));
+                }
+                self.insert_audit_event("ALTER_MASK", Some(&name), Some(sql))?;
+            }
+        }
+        Ok(QueryResult::with_affected_rows(0))
+    }
+
+    fn insert_audit_event(
+        &self,
+        operation: &str,
+        target: Option<&str>,
+        statement: Option<&str>,
+    ) -> Result<()> {
+        self.ensure_security_catalog()?;
+        let context = self.audit_context_snapshot()?;
+        let context_json = audit_context_json(&context)?;
+        let actor = context
+            .get("actor")
+            .or_else(|| context.get("user"))
+            .map(audit_value_to_text);
+        let tenant = context
+            .get("tenant_id")
+            .or_else(|| context.get("tenant"))
+            .map(audit_value_to_text);
+        let created_at = current_time_micros();
+        let counter = AUDIT_EVENT_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let event_id = format!("audit:{created_at}:{counter}");
+        self.execute_with_params(
+            "INSERT INTO __decentdb_audit_events (event_id, created_at_micros, actor, tenant, operation, target, statement, context_json) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            &[
+                Value::Text(event_id),
+                Value::Int64(created_at),
+                actor.map(Value::Text).unwrap_or(Value::Null),
+                tenant.map(Value::Text).unwrap_or(Value::Null),
+                Value::Text(operation.to_string()),
+                target.map(|value| Value::Text(value.to_string())).unwrap_or(Value::Null),
+                statement.map(|value| Value::Text(value.to_string())).unwrap_or(Value::Null),
+                Value::Text(context_json),
+            ],
+        )?;
+        Ok(())
     }
 
     fn execute_pragma_query(&self, target: PragmaTarget) -> Result<QueryResult> {
@@ -5366,6 +5592,7 @@ impl Db {
             schema_cookie,
             &self.inner.config,
         )?;
+        restored.set_audit_context_handle(Arc::clone(&self.inner.audit_context));
         self.apply_temp_state_to_runtime(&mut restored)?;
         self.inner
             .catalog
@@ -5487,6 +5714,7 @@ impl Db {
             schema_cookie,
             &self.inner.config,
         )?;
+        runtime.set_audit_context_handle(Arc::clone(&self.inner.audit_context));
         self.apply_temp_state_to_runtime(&mut runtime)?;
         self.inner
             .catalog
@@ -5607,6 +5835,39 @@ impl Db {
                 &filter,
             )
         }
+    }
+
+    fn security_catalog_table_names() -> [&'static str; 2] {
+        [
+            crate::security::POLICIES_TABLE,
+            crate::security::MASKS_TABLE,
+        ]
+    }
+
+    fn ensure_security_tables_loaded_at_snapshot(&self, snapshot_lsn: u64) -> Result<bool> {
+        self.ensure_tables_loaded_at_snapshot(
+            &Self::security_catalog_table_names(),
+            Some(snapshot_lsn),
+        )?;
+        let runtime = self
+            .inner
+            .engine
+            .read()
+            .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+        runtime.security_rules_active()
+    }
+
+    fn load_security_tables_for_runtime_at_snapshot(
+        &self,
+        runtime: &mut EngineRuntime,
+        snapshot_lsn: u64,
+    ) -> Result<bool> {
+        self.load_runtime_table_row_sources_at_snapshot(
+            runtime,
+            &Self::security_catalog_table_names(),
+            snapshot_lsn,
+        )?;
+        runtime.security_rules_active()
     }
 
     fn ensure_table_row_sources_loaded_at_snapshot(
@@ -6270,10 +6531,12 @@ impl Db {
         snapshot_lsn: u64,
         indexes_maybe_stale: &mut bool,
     ) -> Result<QueryResult> {
+        let security_active =
+            self.load_security_tables_for_runtime_at_snapshot(runtime, snapshot_lsn)?;
         if self.statement_is_temp_only(runtime, statement) {
             return runtime.execute_read_statement(statement, params, self.inner.config.page_size);
         }
-        if !*indexes_maybe_stale {
+        if !security_active && !*indexes_maybe_stale {
             if let SqlStatement::Query(query) = statement {
                 if let Some(result) = self
                     .try_execute_simple_indexed_join_projection_query_at_snapshot(
@@ -6288,14 +6551,16 @@ impl Db {
                 }
             }
         }
-        if let Some(result) = self.try_execute_query_with_row_sources_at_snapshot(
-            runtime,
-            statement,
-            params,
-            snapshot_lsn,
-            *indexes_maybe_stale,
-        )? {
-            return Ok(result);
+        if !security_active {
+            if let Some(result) = self.try_execute_query_with_row_sources_at_snapshot(
+                runtime,
+                statement,
+                params,
+                snapshot_lsn,
+                *indexes_maybe_stale,
+            )? {
+                return Ok(result);
+            }
         }
         let targeted_ok = self.ensure_runtime_tables_loaded_for_statement_at_snapshot(
             runtime,
@@ -14756,6 +15021,88 @@ fn sql_identifier(name: &str) -> String {
 
 fn sql_string_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
+}
+
+fn audit_context_json(context: &BTreeMap<String, Value>) -> Result<String> {
+    let mut object = serde_json::Map::new();
+    for (key, value) in context {
+        object.insert(key.clone(), audit_value_to_json(value));
+    }
+    serde_json::to_string(&JsonValue::Object(object))
+        .map_err(|error| DbError::internal(format!("serialize audit context JSON: {error}")))
+}
+
+fn audit_value_to_json(value: &Value) -> JsonValue {
+    match value {
+        Value::Null => JsonValue::Null,
+        Value::Int64(value) => JsonValue::Number(serde_json::Number::from(*value)),
+        Value::Float64(value) => serde_json::Number::from_f64(*value)
+            .map(JsonValue::Number)
+            .unwrap_or(JsonValue::Null),
+        Value::Bool(value) => JsonValue::Bool(*value),
+        Value::Text(value) => JsonValue::String(value.clone()),
+        Value::Blob(value) | Value::Geometry(value) | Value::Geography(value) => {
+            JsonValue::String(hex_encode(value))
+        }
+        Value::Decimal { scaled, scale } => JsonValue::String(decimal_to_text(*scaled, *scale)),
+        Value::Uuid(value) => JsonValue::String(hex_encode(value)),
+        Value::TimestampMicros(value) => JsonValue::Number(serde_json::Number::from(*value)),
+        Value::Enum {
+            enum_type_id,
+            label_id,
+        } => JsonValue::String(format!("{enum_type_id}:{label_id}")),
+        Value::IpAddr { family, addr } => format_ip_addr(*family, addr)
+            .map(JsonValue::String)
+            .unwrap_or(JsonValue::Null),
+        Value::Cidr {
+            family,
+            prefix_len,
+            network,
+        } => format_cidr(*family, *prefix_len, network)
+            .map(JsonValue::String)
+            .unwrap_or(JsonValue::Null),
+        Value::MacAddr { len, bytes } => format_mac_addr(*len, bytes)
+            .map(JsonValue::String)
+            .unwrap_or(JsonValue::Null),
+        Value::DateDays(value) => JsonValue::String(format_date_days(*value)),
+        Value::TimeMicros(value) => format_time_micros(*value)
+            .map(JsonValue::String)
+            .unwrap_or(JsonValue::Null),
+        Value::TimestampTzMicros(value) => JsonValue::String(format_timestamp_tz_micros(*value)),
+        Value::Interval {
+            months,
+            days,
+            micros,
+        } => JsonValue::String(format_interval(*months, *days, *micros)),
+    }
+}
+
+fn audit_value_to_text(value: &Value) -> String {
+    match value {
+        Value::Text(value) => value.clone(),
+        Value::Null => "null".to_string(),
+        other => audit_value_to_json(other).to_string(),
+    }
+}
+
+fn decimal_to_text(scaled: i64, scale: u8) -> String {
+    if scale == 0 {
+        return scaled.to_string();
+    }
+    let negative = scaled < 0;
+    let digits = scaled.unsigned_abs().to_string();
+    let scale = usize::from(scale);
+    let padded = if digits.len() <= scale {
+        format!("{}{}", "0".repeat(scale + 1 - digits.len()), digits)
+    } else {
+        digits
+    };
+    let split = padded.len() - scale;
+    let mut decimal = format!("{}.{}", &padded[..split], &padded[split..]);
+    if negative {
+        decimal.insert(0, '-');
+    }
+    decimal
 }
 
 fn hex_encode(bytes: &[u8]) -> String {

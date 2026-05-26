@@ -99,6 +99,7 @@ impl QueryResult {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ColumnBinding {
     pub(crate) table: Option<String>,
+    pub(crate) source_table: Option<String>,
     pub(crate) name: String,
     pub(crate) hidden: bool,
 }
@@ -156,7 +157,22 @@ impl ColumnBinding {
     #[must_use]
     pub(crate) fn visible(table: Option<String>, name: String) -> Self {
         Self {
+            source_table: table.clone(),
             table,
+            name,
+            hidden: false,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn visible_source(
+        table: Option<String>,
+        source_table: Option<String>,
+        name: String,
+    ) -> Self {
+        Self {
+            table,
+            source_table,
             name,
             hidden: false,
         }
@@ -166,6 +182,7 @@ impl ColumnBinding {
     pub(crate) fn as_output(&self) -> Self {
         Self {
             table: self.table.clone(),
+            source_table: self.source_table.clone(),
             name: self.name.clone(),
             hidden: false,
         }

@@ -1392,6 +1392,7 @@ pub(crate) struct EngineRuntime {
     pub(crate) reactive_mutations: Vec<crate::reactive::RowChange>,
     pub(crate) extension_trust_anchors: Arc<Vec<crate::extensions::ExtensionTrustAnchor>>,
     pub(crate) extension_unsigned_development_mode: bool,
+    pub(crate) audit_context: Arc<Mutex<crate::security::AuditContext>>,
 }
 
 #[derive(Debug)]
@@ -1573,6 +1574,7 @@ impl Clone for EngineRuntime {
             reactive_mutations: self.reactive_mutations.clone(),
             extension_trust_anchors: Arc::clone(&self.extension_trust_anchors),
             extension_unsigned_development_mode: self.extension_unsigned_development_mode,
+            audit_context: Arc::clone(&self.audit_context),
         }
     }
 }
@@ -1618,7 +1620,15 @@ impl EngineRuntime {
             reactive_mutations: Vec::new(),
             extension_trust_anchors: Arc::new(config.extension_trust_anchors.clone()),
             extension_unsigned_development_mode: config.extension_unsigned_development_mode,
+            audit_context: Arc::new(Mutex::new(crate::security::AuditContext::default())),
         }
+    }
+
+    pub(crate) fn set_audit_context_handle(
+        &mut self,
+        audit_context: Arc<Mutex<crate::security::AuditContext>>,
+    ) {
+        self.audit_context = audit_context;
     }
 
     pub(crate) fn set_sync_capture_active(&mut self, active: bool) {
@@ -3953,6 +3963,11 @@ impl EngineRuntime {
     ) -> Result<QueryResult> {
         match statement {
             Statement::Query(query) => {
+                if self.security_rules_active()? {
+                    return self
+                        .evaluate_query(query, params, &BTreeMap::new())
+                        .map(dataset_to_result);
+                }
                 if let Some(result) = self.try_execute_simple_count_query(query)? {
                     return Ok(result);
                 }
@@ -6965,12 +6980,24 @@ impl EngineRuntime {
         let left_columns: Vec<ColumnBinding> = left_table
             .columns
             .iter()
-            .map(|c| ColumnBinding::visible(Some(left_binding_name.to_string()), c.name.clone()))
+            .map(|c| {
+                ColumnBinding::visible_source(
+                    Some(left_binding_name.to_string()),
+                    Some(plan.left_name.to_string()),
+                    c.name.clone(),
+                )
+            })
             .collect();
         let right_columns: Vec<ColumnBinding> = right_table
             .columns
             .iter()
-            .map(|c| ColumnBinding::visible(Some(right_binding_name.to_string()), c.name.clone()))
+            .map(|c| {
+                ColumnBinding::visible_source(
+                    Some(right_binding_name.to_string()),
+                    Some(plan.right_name.to_string()),
+                    c.name.clone(),
+                )
+            })
             .collect();
 
         let using_columns = resolve_join_using_columns_for_schemas(
@@ -13561,8 +13588,9 @@ impl EngineRuntime {
             .columns
             .iter()
             .map(|column| {
-                ColumnBinding::visible(
+                ColumnBinding::visible_source(
                     Some(plan.probe_table.binding_name().to_string()),
+                    Some(plan.probe_table.name.to_string()),
                     column.name.clone(),
                 )
             })
@@ -13851,7 +13879,11 @@ impl EngineRuntime {
         let right_binding_name = right_alias.clone().unwrap_or_else(|| right_name.clone());
         let mut columns = left.columns.clone();
         columns.extend(right_table.columns.iter().map(|column| {
-            ColumnBinding::visible(Some(right_binding_name.clone()), column.name.clone())
+            ColumnBinding::visible_source(
+                Some(right_binding_name.clone()),
+                Some(right_name.clone()),
+                column.name.clone(),
+            )
         }));
         let right_column_count = right_table.columns.len();
         let is_left_outer = matches!(kind, JoinKind::Left | JoinKind::Full);
@@ -14245,10 +14277,29 @@ impl EngineRuntime {
             "information_schema.columns" => {
                 return Ok(Some(self.information_schema_columns_dataset()));
             }
+            "sys_audit_context" => {
+                return self.sys_audit_context_dataset().map(Some);
+            }
             _ => name,
         };
         let _ = table_name;
         Ok(None)
+    }
+
+    fn sys_audit_context_dataset(&self) -> Result<Dataset> {
+        let context = self
+            .audit_context
+            .lock()
+            .map_err(|_| DbError::internal("audit context lock poisoned"))?
+            .snapshot();
+        let rows = context
+            .into_iter()
+            .map(|(key, value)| vec![Value::Text(key), value])
+            .collect::<Vec<_>>();
+        Ok(Dataset::with_rows(
+            visible_columns("sys_audit_context", &["key", "value"]),
+            rows,
+        ))
     }
 
     fn evaluate_generate_series(&self, table_name: String, values: Vec<Value>) -> Result<Dataset> {
@@ -14711,7 +14762,13 @@ impl EngineRuntime {
             table
                 .columns
                 .iter()
-                .map(|column| ColumnBinding::visible(Some(table_name.clone()), column.name.clone()))
+                .map(|column| {
+                    ColumnBinding::visible_source(
+                        Some(table_name.clone()),
+                        Some(table.name.clone()),
+                        column.name.clone(),
+                    )
+                })
                 .collect(),
             rows,
         ))
@@ -14732,14 +14789,237 @@ impl EngineRuntime {
             }
             rows.push(values);
         }
-        Ok(Dataset::with_rows(
+        let mut dataset = Dataset::with_rows(
             table
                 .columns
                 .iter()
-                .map(|column| ColumnBinding::visible(Some(table_name.clone()), column.name.clone()))
+                .map(|column| {
+                    ColumnBinding::visible_source(
+                        Some(table_name.clone()),
+                        Some(table.name.clone()),
+                        column.name.clone(),
+                    )
+                })
                 .collect(),
             rows,
-        ))
+        );
+        self.apply_row_policies(table, &mut dataset)?;
+        Ok(dataset)
+    }
+
+    fn apply_row_policies(&self, table: &TableSchema, dataset: &mut Dataset) -> Result<()> {
+        if table.temporary || crate::security::is_security_internal_table(&table.name) {
+            return Ok(());
+        }
+        let policies = self.active_row_policies_for_table(&table.name)?;
+        if policies.is_empty() {
+            return Ok(());
+        }
+        let filter_dataset = Dataset::with_rows(dataset.columns.clone(), Vec::new());
+        let mut kept = Vec::with_capacity(dataset.rows.len());
+        for row in dataset.rows.iter() {
+            let mut visible = true;
+            for policy in &policies {
+                match self.eval_expr(
+                    &policy.expr,
+                    &filter_dataset,
+                    row,
+                    &[],
+                    &BTreeMap::new(),
+                    None,
+                )? {
+                    Value::Bool(true) => {}
+                    Value::Bool(false) | Value::Null => {
+                        visible = false;
+                        break;
+                    }
+                    other => {
+                        return Err(DbError::sql(format!(
+                            "policy {} did not evaluate to BOOL: {other:?}",
+                            policy.name
+                        )))
+                    }
+                }
+            }
+            if visible {
+                kept.push(row.clone());
+            }
+        }
+        dataset.set_rows(kept);
+        Ok(())
+    }
+
+    fn active_row_policies_for_table(&self, table_name: &str) -> Result<Vec<ActiveRowPolicy>> {
+        let Some(row_source) = self.visible_table_row_source(crate::security::POLICIES_TABLE)
+        else {
+            return Ok(Vec::new());
+        };
+        let mut policies = Vec::new();
+        for row in row_source.rows() {
+            let row = row?;
+            let values = row.values();
+            let enabled = matches!(values.get(3), Some(Value::Bool(true)));
+            if !enabled {
+                continue;
+            }
+            let Some(Value::Text(policy_name)) = values.first() else {
+                continue;
+            };
+            let Some(Value::Text(policy_table)) = values.get(1) else {
+                continue;
+            };
+            if !identifiers_equal(policy_table, table_name) {
+                continue;
+            }
+            let Some(Value::Text(using_sql)) = values.get(2) else {
+                continue;
+            };
+            policies.push(ActiveRowPolicy {
+                name: policy_name.clone(),
+                expr: parse_sql_statement(&format!("SELECT {using_sql}")).and_then(
+                    |statement| {
+                        let Statement::Query(query) = statement else {
+                            return Err(DbError::sql("policy expression did not parse as SELECT"));
+                        };
+                        let QueryBody::Select(select) = query.body else {
+                            return Err(DbError::sql("policy expression did not parse as SELECT"));
+                        };
+                        let Some(SelectItem::Expr { expr, .. }) = select.projection.first() else {
+                            return Err(DbError::sql("policy expression is not scalar"));
+                        };
+                        Ok(expr.clone())
+                    },
+                )?,
+            });
+        }
+        Ok(policies)
+    }
+
+    fn active_column_masks(&self) -> Result<Vec<ActiveColumnMask>> {
+        let Some(row_source) = self.visible_table_row_source(crate::security::MASKS_TABLE) else {
+            return Ok(Vec::new());
+        };
+        let mut masks = Vec::new();
+        for row in row_source.rows() {
+            let row = row?;
+            let values = row.values();
+            if !matches!(values.get(4), Some(Value::Bool(true))) {
+                continue;
+            }
+            let (
+                Some(Value::Text(_mask_name)),
+                Some(Value::Text(table_name)),
+                Some(Value::Text(column_name)),
+                Some(Value::Text(expression_sql)),
+            ) = (values.first(), values.get(1), values.get(2), values.get(3))
+            else {
+                continue;
+            };
+            masks.push(ActiveColumnMask {
+                table_name: table_name.clone(),
+                column_name: column_name.clone(),
+                expr: parse_sql_statement(&format!("SELECT {expression_sql}")).and_then(
+                    |statement| {
+                        let Statement::Query(query) = statement else {
+                            return Err(DbError::sql("mask expression did not parse as SELECT"));
+                        };
+                        let QueryBody::Select(select) = query.body else {
+                            return Err(DbError::sql("mask expression did not parse as SELECT"));
+                        };
+                        let Some(SelectItem::Expr { expr, .. }) = select.projection.first() else {
+                            return Err(DbError::sql("mask expression is not scalar"));
+                        };
+                        Ok(expr.clone())
+                    },
+                )?,
+            });
+        }
+        Ok(masks)
+    }
+
+    pub(crate) fn security_rules_active(&self) -> Result<bool> {
+        if let Some(row_source) = self.visible_table_row_source(crate::security::POLICIES_TABLE) {
+            for row in row_source.rows() {
+                if matches!(row?.values().get(3), Some(Value::Bool(true))) {
+                    return Ok(true);
+                }
+            }
+        }
+        self.security_masks_active()
+    }
+
+    fn security_masks_active(&self) -> Result<bool> {
+        let Some(row_source) = self.visible_table_row_source(crate::security::MASKS_TABLE) else {
+            return Ok(false);
+        };
+        for row in row_source.rows() {
+            if matches!(row?.values().get(4), Some(Value::Bool(true))) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn masked_output_value(
+        &self,
+        binding: &ColumnBinding,
+        value: &Value,
+        dataset: &Dataset,
+        row: &[Value],
+        params: &[Value],
+        ctes: &BTreeMap<String, Dataset>,
+    ) -> Result<Value> {
+        let masks = self.active_column_masks()?;
+        let exact = masks.iter().find(|mask| {
+            identifiers_equal(&mask.column_name, &binding.name)
+                && binding
+                    .source_table
+                    .as_deref()
+                    .or(binding.table.as_deref())
+                    .is_some_and(|table| identifiers_equal(table, &mask.table_name))
+        });
+        let display_table = if exact.is_none() {
+            binding.table.as_deref().filter(|table| {
+                binding
+                    .source_table
+                    .as_deref()
+                    .is_none_or(|source| !identifiers_equal(source, table))
+            })
+        } else {
+            None
+        };
+        let alias_match = display_table.and_then(|table| {
+            let matches = masks
+                .iter()
+                .filter(|mask| {
+                    identifiers_equal(&mask.column_name, &binding.name)
+                        && identifiers_equal(&mask.table_name, table)
+                })
+                .collect::<Vec<_>>();
+            if matches.len() == 1 {
+                matches.first().copied()
+            } else {
+                None
+            }
+        });
+        let fallback = if exact.is_none() && alias_match.is_none() {
+            let matches = masks
+                .iter()
+                .filter(|mask| identifiers_equal(&mask.column_name, &binding.name))
+                .collect::<Vec<_>>();
+            if matches.len() == 1 {
+                matches.first().copied()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(mask) = exact.or(alias_match).or(fallback) {
+            self.eval_expr(&mask.expr, dataset, row, params, ctes, None)
+        } else {
+            Ok(value.clone())
+        }
     }
 }
 
@@ -14758,6 +15038,19 @@ struct SimpleIndexedProjectionPlan<'a> {
     projection_indexes: Vec<usize>,
     column_names: Vec<String>,
     limit: Option<usize>,
+}
+
+#[derive(Clone, Debug)]
+struct ActiveRowPolicy {
+    name: String,
+    expr: Expr,
+}
+
+#[derive(Clone, Debug)]
+struct ActiveColumnMask {
+    table_name: String,
+    column_name: String,
+    expr: Expr,
 }
 
 struct SimpleCountQueryPlan<'a> {
@@ -19232,13 +19525,19 @@ fn simple_join_projection_eval_bindings(
     let left_binding = left_alias.as_deref().unwrap_or(left_table_name);
     let right_binding = right_alias.as_deref().unwrap_or(right_table_name);
     let mut bindings = Vec::with_capacity(left_schema.columns.len() + right_schema.columns.len());
-    bindings.extend(
-        left_schema.columns.iter().map(|column| {
-            ColumnBinding::visible(Some(left_binding.to_string()), column.name.clone())
-        }),
-    );
+    bindings.extend(left_schema.columns.iter().map(|column| {
+        ColumnBinding::visible_source(
+            Some(left_binding.to_string()),
+            Some(left_table_name.to_string()),
+            column.name.clone(),
+        )
+    }));
     bindings.extend(right_schema.columns.iter().map(|column| {
-        ColumnBinding::visible(Some(right_binding.to_string()), column.name.clone())
+        ColumnBinding::visible_source(
+            Some(right_binding.to_string()),
+            Some(right_table_name.to_string()),
+            column.name.clone(),
+        )
     }));
     bindings
 }
@@ -23527,8 +23826,10 @@ impl EngineRuntime {
         ctes: &BTreeMap<String, Dataset>,
         excluded: Option<&Dataset>,
     ) -> Result<Dataset> {
-        if let Some(projected) = try_project_simple_select_items(dataset, items)? {
-            return Ok(projected);
+        if !self.security_masks_active()? {
+            if let Some(projected) = try_project_simple_select_items(dataset, items)? {
+                return Ok(projected);
+            }
         }
         let window_values = items
             .iter()
@@ -23620,6 +23921,30 @@ impl EngineRuntime {
                                     DbError::internal("window-function values were not precomputed")
                                 })?,
                         ),
+                        Expr::Column { table, column } if excluded.is_none() => {
+                            let binding = dataset
+                                .columns
+                                .iter()
+                                .find(|binding| {
+                                    identifiers_equal(&binding.name, column)
+                                        && match table {
+                                            Some(table) => binding
+                                                .table
+                                                .as_deref()
+                                                .is_some_and(|name| identifiers_equal(name, table)),
+                                            None => true,
+                                        }
+                                })
+                                .cloned()
+                                .unwrap_or_else(|| {
+                                    ColumnBinding::visible(table.clone(), column.clone())
+                                });
+                            let value =
+                                self.eval_expr(expr, dataset, row, params, ctes, excluded)?;
+                            output.push(self.masked_output_value(
+                                &binding, &value, dataset, row, params, ctes,
+                            )?);
+                        }
                         _ => {
                             output.push(self.eval_expr(expr, dataset, row, params, ctes, excluded)?)
                         }
@@ -23627,14 +23952,18 @@ impl EngineRuntime {
                     SelectItem::Wildcard => {
                         for (binding, value) in dataset.columns.iter().zip(row) {
                             if !binding.hidden {
-                                output.push(value.clone());
+                                output.push(self.masked_output_value(
+                                    binding, value, dataset, row, params, ctes,
+                                )?);
                             }
                         }
                     }
                     SelectItem::QualifiedWildcard(table) => {
                         for (binding, value) in dataset.columns.iter().zip(row) {
                             if binding.table.as_deref() == Some(table.as_str()) {
-                                output.push(value.clone());
+                                output.push(self.masked_output_value(
+                                    binding, value, dataset, row, params, ctes,
+                                )?);
                             }
                         }
                     }
@@ -25962,6 +26291,42 @@ fn eval_function(
                 )));
             }
             Ok(Value::Text("main".to_string()))
+        }
+        "current_audit_context" => {
+            if values.len() != 1 {
+                return Err(DbError::sql("CURRENT_AUDIT_CONTEXT expects 1 argument"));
+            }
+            let Some(key) = expect_text_arg("CURRENT_AUDIT_CONTEXT", "first", &values[0])? else {
+                return Ok(Value::Null);
+            };
+            Ok(runtime
+                .audit_context
+                .lock()
+                .map_err(|_| DbError::internal("audit context lock poisoned"))?
+                .get(key)
+                .unwrap_or(Value::Null))
+        }
+        "current_tenant" => {
+            if !values.is_empty() {
+                return Err(DbError::sql("CURRENT_TENANT expects 0 arguments"));
+            }
+            Ok(runtime
+                .audit_context
+                .lock()
+                .map_err(|_| DbError::internal("audit context lock poisoned"))?
+                .tenant()
+                .unwrap_or(Value::Null))
+        }
+        "current_actor" => {
+            if !values.is_empty() {
+                return Err(DbError::sql("CURRENT_ACTOR expects 0 arguments"));
+            }
+            Ok(runtime
+                .audit_context
+                .lock()
+                .map_err(|_| DbError::internal("audit context lock poisoned"))?
+                .actor()
+                .unwrap_or(Value::Null))
         }
         "version" => {
             if !values.is_empty() {

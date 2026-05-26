@@ -2,10 +2,10 @@
 
 **Date:** 2026-05-20  
 **Status:** Implemented for the self-contained queued SQL contract
-**Roadmap:** Delivered foundation; see [`FUTURE_WINS.md`](FUTURE_WINS.md) Delivered Context
+**Roadmap:** Delivered foundation; see [`FUTURE_WINS.md`](../FUTURE_WINS.md) Delivered Context
 **Document Type:** Phased delivery plan; not a final ADR  
 **Audience:** Core engine developers, WAL/storage maintainers, C ABI maintainers, binding maintainers, CLI maintainers, benchmark maintainers, documentation authors, coding agents  
-**Related inputs:** [`FUTURE_WINS.md`](FUTURE_WINS.md), [`adr/0135-async-commit-wal-group-commit.md`](adr/0135-async-commit-wal-group-commit.md), [`adr/0037-group-commit-wal-batching.md`](adr/0037-group-commit-wal-batching.md), [`SPEC.md`](SPEC.md), [`bindings/SQLC_SUPPORT.md`](bindings/SQLC_SUPPORT.md), [`bindings/SQLALCHEMY_SUPPORT.md`](bindings/SQLALCHEMY_SUPPORT.md), [`bindings/DAPPER_SUPPORT.md`](bindings/DAPPER_SUPPORT.md), [`bindings/NODEJS_SUPPORT.md`](bindings/NODEJS_SUPPORT.md)
+**Related inputs:** [`FUTURE_WINS.md`](../FUTURE_WINS.md), [`adr/0135-async-commit-wal-group-commit.md`](../adr/0135-async-commit-wal-group-commit.md), [`adr/0037-group-commit-wal-batching.md`](../adr/0037-group-commit-wal-batching.md), [`SPEC.md`](../SPEC.md), [`bindings/SQLC_SUPPORT.md`](../bindings/SQLC_SUPPORT.md), [`bindings/SQLALCHEMY_SUPPORT.md`](../bindings/SQLALCHEMY_SUPPORT.md), [`bindings/DAPPER_SUPPORT.md`](../bindings/DAPPER_SUPPORT.md), [`bindings/NODEJS_SUPPORT.md`](../bindings/NODEJS_SUPPORT.md)
 
 ---
 

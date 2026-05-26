@@ -1,10 +1,12 @@
 //! Engine configuration surface for DecentDB.
 
+use std::fmt;
 use std::path::PathBuf;
 
 use crate::error::{DbError, Result};
 use crate::extensions::ExtensionTrustAnchor;
 use crate::storage::page;
+use zeroize::Zeroize;
 
 /// WAL sync policy used by the engine.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -32,6 +34,66 @@ pub enum WalSyncMode {
     TestingOnlyUnsafeNoSync,
 }
 
+/// Application-supplied encryption key material for local TDE.
+///
+/// DecentDB owns a copy of these bytes so it can derive per-file encryption
+/// keys while the database handle is open. Debug output is intentionally
+/// redacted.
+#[derive(Clone, Eq, PartialEq)]
+pub struct EncryptionKey {
+    bytes: Vec<u8>,
+}
+
+impl EncryptionKey {
+    /// Copies raw application key bytes into an engine-owned key buffer.
+    ///
+    /// The key must not be empty. Callers should use high-entropy key bytes
+    /// from their KMS or platform secret store.
+    pub fn from_bytes(bytes: impl AsRef<[u8]>) -> Result<Self> {
+        let bytes = bytes.as_ref();
+        if bytes.is_empty() {
+            return Err(DbError::internal("encryption key must not be empty"));
+        }
+        Ok(Self {
+            bytes: bytes.to_vec(),
+        })
+    }
+
+    pub(crate) fn expose_secret(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl fmt::Debug for EncryptionKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EncryptionKey")
+            .field("len", &self.bytes.len())
+            .field("redacted", &true)
+            .finish()
+    }
+}
+
+impl Drop for EncryptionKey {
+    fn drop(&mut self) {
+        self.bytes.zeroize();
+    }
+}
+
+/// Local transparent data encryption configuration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DbEncryptionConfig {
+    pub key: EncryptionKey,
+}
+
+impl DbEncryptionConfig {
+    /// Creates a TDE configuration from application-owned key bytes.
+    pub fn from_key_bytes(bytes: impl AsRef<[u8]>) -> Result<Self> {
+        Ok(Self {
+            key: EncryptionKey::from_bytes(bytes)?,
+        })
+    }
+}
+
 /// Engine configuration applied at database create/open time.
 ///
 /// ```
@@ -57,6 +119,17 @@ pub struct DbConfig {
     pub checkpoint_timeout_sec: u64,
     pub trigram_postings_threshold: usize,
     pub temp_dir: PathBuf,
+
+    /// Optional local transparent data encryption for database, WAL, and sync
+    /// journal files.
+    ///
+    /// When set, DecentDB wraps the configured VFS and encrypts all logical
+    /// bytes after a small plaintext per-file TDE prefix. Existing plaintext
+    /// databases cannot be opened with encryption enabled without an explicit
+    /// migration/export step.
+    ///
+    /// Default: `None`.
+    pub encryption: Option<DbEncryptionConfig>,
 
     /// Trigger an automatic checkpoint when the in-memory WAL has accumulated
     /// at least this many distinct dirty page versions since the last
@@ -293,6 +366,7 @@ impl Default for DbConfig {
             checkpoint_timeout_sec: 30,
             trigram_postings_threshold: 100_000,
             temp_dir: default_temp_dir(),
+            encryption: None,
             wal_checkpoint_threshold_pages: 4096,
             wal_checkpoint_threshold_bytes: 64 * 1024 * 1024,
             release_freed_memory_after_checkpoint: cfg!(all(
@@ -349,6 +423,7 @@ mod tests {
         assert_eq!(config.checkpoint_timeout_sec, 30);
         assert_eq!(config.trigram_postings_threshold, 100_000);
         assert!(!config.temp_dir.as_os_str().is_empty());
+        assert!(config.encryption.is_none());
         assert_eq!(config.wal_checkpoint_threshold_pages, 4096);
         assert_eq!(config.wal_checkpoint_threshold_bytes, 64 * 1024 * 1024);
         assert_eq!(config.wal_resident_versions_per_page, 16);

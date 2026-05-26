@@ -21,6 +21,7 @@ queries, syncable offline data, and language bindings that feel native.
 | Built-in HTTP and web console | `decentdb serve` exposes a local HTTP API and embedded browser console for inspection, SQL execution, EXPLAIN, schema browsing, CSV export, and scripting. |
 | Browser WASM and OPFS | `@decentdb/web` runs DecentDB in a Dedicated Worker with OPFS persistence, an async TypeScript API, binary result transport, and browser smoke/benchmark coverage. |
 | Branch, diff, restore, and time travel | Durable named snapshots, branch-local writes, diff reports, guarded restore, and constrained merge workflows for migration rehearsal and support/debugging. |
+| Local data security | TDE for local files, durable row policies, column masks, audit context functions, and queryable security audit events. |
 | Practical PostgreSQL-like SQL | Familiar DDL/DML, joins, CTEs, window functions, set operations, upsert, `RETURNING`, savepoints, triggers, generated columns, JSON functions, and rich scalar functions. |
 | SQL compatibility helpers | Safe SQLite-style PRAGMAs, `sqlite_schema`, minimal `information_schema`, `generate_series`, `main.`/`temp.` qualifiers, and query-time built-in collations ease tool and migration onboarding. |
 | Sandboxed Lua extensions | Manifest-declared Lua packages add scalar functions, table-valued functions, aggregates, and query-time collations through explicit install, enable, and per-connection trust. |
@@ -44,6 +45,8 @@ queries, syncable offline data, and language bindings that feel native.
   `sqlite_schema`, minimal `information_schema`, `generate_series`,
   `main.`/`temp.` qualifiers, and query-time `BINARY`, `NOCASE`, and `RTRIM`
   collations.
+- **Local data security** with TDE, durable row policies, projection masks,
+  audit context functions, and queryable security audit events.
 - **Sandboxed Lua extensions** with manifest validation, package hashing,
   Ed25519 signature checks, explicit install/enable/trust lifecycle, scalar
   functions, table-valued functions, aggregates, query-time collations, Rust
@@ -122,6 +125,7 @@ decentdb sync pending --db ./app.ddb --since 0 --limit 10 --format table
   [SQL Feature Matrix](user-guide/sql-feature-matrix.md), and
   [Data Types](user-guide/data-types.md)
 - Local-first applications: [Local-first sync](user-guide/sync/index.md)
+- Security-sensitive apps: [Local Data Security](user-guide/security.md)
 - Browser applications: [WASM / Browser](api/wasm.md)
 - Extensibility: [Lua Extensions](user-guide/lua-extensions.md)
 - Operational workflows: [Doctor](user-guide/doctor.md),
@@ -220,7 +224,7 @@ authoritative implementation.
 - DecentDB exposes a sandboxed Lua extension model. It does not support
   arbitrary native extension loading, SQLite-style `.load`, direct database
   handles inside extension code, or Lua execution in browser/WASM artifacts.
-- Some roadmap items, including policy-aware SQL, vector search, and full-text
+- Some roadmap items, including vector search and full-text
   ranking, are planned work rather than shipped features.
 
 ## Releases And Packages

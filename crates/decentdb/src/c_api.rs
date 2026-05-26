@@ -10,12 +10,12 @@ use std::time::Duration;
 use crate::db::PreparedStatement;
 use crate::error::{DbError, DbErrorCode, Result};
 use crate::{
-    evict_shared_wal, ChangeStreamOptions, Db, DbConfig, QueryResult, QueryWatchOptions,
-    QueuedWriteOptions, RangeWatchOptions, TableWatchOptions, Value,
+    evict_shared_wal, ChangeStreamOptions, Db, DbConfig, DbEncryptionConfig, QueryResult,
+    QueryWatchOptions, QueuedWriteOptions, RangeWatchOptions, TableWatchOptions, Value,
 };
 
 const DDB_OK: u32 = 0;
-const DDB_ABI_VERSION: u32 = 5;
+const DDB_ABI_VERSION: u32 = 6;
 #[cfg(test)]
 const DDB_ERR_SQL: u32 = 5;
 const DDB_WRITE_QUEUE_TIMEOUT_DEFAULT: u64 = u64::MAX;
@@ -1291,6 +1291,25 @@ fn parse_usize_option(value: &str, key: &str) -> Result<usize> {
     })
 }
 
+fn parse_hex_option(value: &str, key: &str) -> Result<Vec<u8>> {
+    let value = value.trim();
+    if value.is_empty() || !value.len().is_multiple_of(2) {
+        return Err(DbError::sql(format!(
+            "invalid hex value for option {key}: expected an even number of hex digits"
+        )));
+    }
+    let mut bytes = Vec::with_capacity(value.len() / 2);
+    for chunk in value.as_bytes().chunks_exact(2) {
+        let pair = std::str::from_utf8(chunk)
+            .map_err(|_| DbError::sql(format!("invalid hex value for option {key}")))?;
+        bytes.push(
+            u8::from_str_radix(pair, 16)
+                .map_err(|_| DbError::sql(format!("invalid hex value for option {key}")))?,
+        );
+    }
+    Ok(bytes)
+}
+
 fn parse_cache_size_mb_option(value: &str, page_size: u32) -> Result<usize> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -1413,6 +1432,15 @@ fn db_config_from_options(options: Option<&str>) -> Result<DbConfig> {
             "write_queue_max_group_delay_us" => {
                 config.write_queue_max_group_delay_us = parse_u64_option(value, key.as_str())?;
             }
+            "encryption_key" | "tde_key" => {
+                config.encryption = Some(DbEncryptionConfig::from_key_bytes(value.as_bytes())?);
+            }
+            "encryption_key_hex" | "tde_key_hex" => {
+                config.encryption = Some(DbEncryptionConfig::from_key_bytes(parse_hex_option(
+                    value,
+                    key.as_str(),
+                )?)?);
+            }
             "allow_extension" => {
                 config
                     .extension_trust_anchors
@@ -1445,7 +1473,8 @@ fn options_arg(options: *const c_char) -> Result<Option<String>> {
 /// comma, or semicolon. Supported keys include `cache_size`,
 /// `retain_paged_row_sources_after_commit`, `paged_row_storage`,
 /// `persistent_pk_index`, `wal_autocheckpoint`,
-/// `wal_checkpoint_threshold_pages`, and `wal_checkpoint_threshold_bytes`.
+/// `wal_checkpoint_threshold_pages`, `wal_checkpoint_threshold_bytes`,
+/// `encryption_key`, and `encryption_key_hex`.
 pub extern "C" fn ddb_db_create_with_options(
     path: *const c_char,
     options: *const c_char,
@@ -2242,6 +2271,35 @@ pub extern "C" fn ddb_db_free(db: *mut *mut DbHandle) -> u32 {
         }
         *db = ptr::null_mut();
         Ok(())
+    })
+}
+
+#[no_mangle]
+/// Sets a text audit-context value on this database handle.
+pub extern "C" fn ddb_db_set_audit_context_text(
+    db: *mut DbHandle,
+    key: *const c_char,
+    value: *const c_char,
+    value_len: usize,
+) -> u32 {
+    ffi_boundary(|| {
+        let db = handle_ref(db, "db")?;
+        let key = utf8_arg(key, "key")?;
+        let value = borrowed_bytes(value.cast(), value_len)?;
+        let value = std::str::from_utf8(value)
+            .map_err(|error| DbError::sql(format!("value is not valid UTF-8: {error}")))?;
+        db.db
+            .set_audit_context_value(&key, Value::Text(value.to_string()))
+    })
+}
+
+#[no_mangle]
+/// Clears one audit-context value from this database handle.
+pub extern "C" fn ddb_db_clear_audit_context(db: *mut DbHandle, key: *const c_char) -> u32 {
+    ffi_boundary(|| {
+        let db = handle_ref(db, "db")?;
+        let key = utf8_arg(key, "key")?;
+        db.db.clear_audit_context_value(&key)
     })
 }
 
@@ -3758,6 +3816,14 @@ mod tests {
             u64,
             *mut *mut ResultHandle,
         ) -> u32 = ddb_db_execute_queued;
+        let _set_audit_context_text: extern "C" fn(
+            *mut DbHandle,
+            *const c_char,
+            *const c_char,
+            usize,
+        ) -> u32 = ddb_db_set_audit_context_text;
+        let _clear_audit_context: extern "C" fn(*mut DbHandle, *const c_char) -> u32 =
+            ddb_db_clear_audit_context;
         assert_eq!(std::mem::size_of::<DdbValue>(), 168);
         assert_eq!(std::mem::align_of::<DdbValue>(), 8);
         assert_eq!(std::mem::size_of::<DdbWriteQueueMetrics>(), 120);
@@ -3772,7 +3838,7 @@ mod tests {
     #[test]
     fn db_config_options_parse_tuned_profile() {
         let config = db_config_from_options(Some(
-            "cache_size=64MB;retain_paged_row_sources_after_commit=true;paged_row_storage=false;wal_autocheckpoint=0;write_queue_enabled=true;write_queue_capacity=17;write_queue_default_timeout_ms=25;write_queue_strict_group_commit=true;write_queue_max_batch=9;write_queue_max_group_delay_us=1000",
+            "cache_size=64MB;retain_paged_row_sources_after_commit=true;paged_row_storage=false;wal_autocheckpoint=0;write_queue_enabled=true;write_queue_capacity=17;write_queue_default_timeout_ms=25;write_queue_strict_group_commit=true;write_queue_max_batch=9;write_queue_max_group_delay_us=1000;encryption_key_hex=7464652d6b6579",
         ))
         .expect("options should parse");
         assert_eq!(config.cache_size_mb, 64);
@@ -3786,6 +3852,45 @@ mod tests {
         assert!(config.write_queue_strict_group_commit);
         assert_eq!(config.write_queue_max_batch, 9);
         assert_eq!(config.write_queue_max_group_delay_us, 1000);
+        assert!(config.encryption.is_some());
+    }
+
+    #[test]
+    fn c_api_sets_and_clears_audit_context() {
+        let mut db = ptr::null_mut();
+        let path = CString::new(":memory:").expect("path");
+        assert_eq!(ddb_db_open_or_create(path.as_ptr(), &mut db), DDB_OK);
+
+        let actor_key = CString::new("actor").expect("key");
+        let actor = CString::new("c-api-user").expect("value");
+        assert_eq!(
+            ddb_db_set_audit_context_text(db, actor_key.as_ptr(), actor.as_ptr(), 10),
+            DDB_OK
+        );
+
+        let sql = CString::new("SELECT current_actor()").expect("sql");
+        let mut result = ptr::null_mut();
+        assert_eq!(
+            ddb_db_execute(db, sql.as_ptr(), ptr::null(), 0, &mut result),
+            DDB_OK
+        );
+        let mut copied = DdbValue::default();
+        assert_eq!(ddb_result_value_copy(result, 0, 0, &mut copied), DDB_OK);
+        assert_eq!(copied.tag, DdbValueTag::Text as u32);
+        let text = unsafe { std::slice::from_raw_parts(copied.data, copied.len) };
+        assert_eq!(text, b"c-api-user");
+        assert_eq!(ddb_value_dispose(&mut copied), DDB_OK);
+        assert_eq!(ddb_result_free(&mut result), DDB_OK);
+
+        assert_eq!(ddb_db_clear_audit_context(db, actor_key.as_ptr()), DDB_OK);
+        assert_eq!(
+            ddb_db_execute(db, sql.as_ptr(), ptr::null(), 0, &mut result),
+            DDB_OK
+        );
+        assert_eq!(ddb_result_value_copy(result, 0, 0, &mut copied), DDB_OK);
+        assert_eq!(copied.tag, DdbValueTag::Null as u32);
+        assert_eq!(ddb_result_free(&mut result), DDB_OK);
+        assert_eq!(ddb_db_free(&mut db), DDB_OK);
     }
 
     #[test]

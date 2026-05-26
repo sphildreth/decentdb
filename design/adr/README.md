@@ -11,6 +11,7 @@ This directory contains the historical and active ADRs for DecentDB.
 - **0118-rust-ffi-panic-safety.md**: Mandates `catch_unwind` on all C-ABI boundaries.
 - **0119-rust-vfs-pread-pwrite.md**: Mandates standard file positional I/O over `unsafe mmap` for the Virtual File System.
 - **0120-core-storage-engine-btree.md**: Formalizes the choice of an optimized B+Tree over an LSM-Tree for the core storage engine.
+- **0174-local-data-security-tde-policies-masking-audit-context.md**: Defines TDE v1, durable row policies, column masks, audit context, C ABI key options, catalog boundaries, and follow-up security work.
 - **0173-lua-extension-function-kind-phasing.md**: Defines the complete Lua extension function scope: scalar functions, table-valued functions, aggregates, query-time collations, persistence boundaries, dependency inspection, and docs/API coverage.
 - **0172-lua-extension-cli-c-abi-and-binding-contract.md**: Defines CLI lifecycle commands, C ABI JSON bridge shape, binding responsibilities, trust configuration, dependency/rebuild commands, and extension inspection surfaces.
 - **0171-lua-extension-sql-type-and-planner-contract.md**: Defines SQL registration, strict manifest-declared signatures for all Lua extension objects, DecentDB-owned type conversion, NULL handling, planner limits, and persisted-object boundaries.

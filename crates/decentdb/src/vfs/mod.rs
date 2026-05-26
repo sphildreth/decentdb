@@ -4,6 +4,7 @@
 //! - design/adr/0119-rust-vfs-pread-pwrite.md
 //! - design/adr/0105-in-memory-vfs.md
 
+pub(crate) mod encrypted;
 pub(crate) mod faulty;
 pub(crate) mod mem;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -16,8 +17,10 @@ pub(crate) mod stats;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::config::DbConfig;
 use crate::error::{DbError, Result};
 
+use self::encrypted::EncryptedVfs;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use self::faulty::FaultyVfs;
 use self::mem::MemVfs;
@@ -112,6 +115,16 @@ impl VfsHandle {
                     inner: Arc::new(FaultyVfs::wrap(os_vfs)),
                 }
             }
+        }
+    }
+
+    pub(crate) fn with_config(self, config: &DbConfig) -> Self {
+        if let Some(encryption) = &config.encryption {
+            Self {
+                inner: Arc::new(EncryptedVfs::wrap(self.inner, encryption.clone())),
+            }
+        } else {
+            self
         }
     }
 

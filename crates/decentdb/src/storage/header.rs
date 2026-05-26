@@ -1,6 +1,7 @@
 //! Fixed main-database header encoding and validation.
 
 use crate::error::{DbError, Result};
+use crate::vfs::encrypted::TDE_MAGIC;
 use crate::vfs::{read_exact_at, write_all_at, VfsFile};
 
 use super::checksum;
@@ -90,6 +91,11 @@ impl DatabaseHeader {
     pub(crate) fn decode_loose(bytes: &[u8; DB_HEADER_SIZE]) -> Result<Self> {
         let magic = read_array::<16>(bytes, 0);
         if magic != DB_MAGIC {
+            if &magic[..TDE_MAGIC.len()] == TDE_MAGIC {
+                return Err(DbError::corruption(
+                    "database is encrypted; supply DbConfig::encryption with the correct key",
+                ));
+            }
             return Err(DbError::corruption(format!(
                 "invalid database header magic on page {}",
                 HEADER_PAGE_ID

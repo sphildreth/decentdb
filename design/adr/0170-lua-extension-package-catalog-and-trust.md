@@ -206,6 +206,6 @@ Implementation is not complete until tests cover:
 ## References
 
 - `design/FUTURE_WINS.md`
-- `design/WIN_LUA_EXTENSION_RUNTIME_SPEC.md`
+- `design/_archive/WIN_LUA_EXTENSION_RUNTIME_SPEC.md`
 - `design/adr/0153-branch-metadata-identity-and-user-surface.md`
 - `design/adr/0157-branch-diff-restore-and-merge-semantics.md`

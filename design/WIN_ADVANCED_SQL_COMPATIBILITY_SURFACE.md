@@ -48,12 +48,12 @@ storage fundamentals.
 ## Moved Out Of This Track
 
 - SQL and PRAGMA compatibility quick wins are delivered in
-  [`WIN_SQL_PRAGMA_COMPATIBILITY_QUICK_WINS_SPEC.md`](WIN_SQL_PRAGMA_COMPATIBILITY_QUICK_WINS_SPEC.md)
+  [`WIN_SQL_PRAGMA_COMPATIBILITY_QUICK_WINS_SPEC.md`](_archive/WIN_SQL_PRAGMA_COMPATIBILITY_QUICK_WINS_SPEC.md)
   as the complete compatibility-polish milestone.
 - Full-text search with BM25 ranking is tracked in [`FUTURE_WINS.md`](FUTURE_WINS.md) as its own roadmap item.
 - Native geospatial types and spatial indexes are shipped foundations covered by
   ADR 0124 through ADR 0128 and the user-guide data type/index docs.
-- Lua extensions are tracked in [`WIN_LUA_EXTENSION_RUNTIME_SPEC.md`](WIN_LUA_EXTENSION_RUNTIME_SPEC.md) as the extension runtime and package model.
+- Lua extensions are tracked in [`WIN_LUA_EXTENSION_RUNTIME_SPEC.md`](_archive/WIN_LUA_EXTENSION_RUNTIME_SPEC.md) as the extension runtime and package model.
 - Access control, `GRANT`, and `REVOKE` belong with policy-aware embedded SQL only if DecentDB later adds a product-level role or policy model.
 
 ## 1. Schema-Qualified Namespaces
@@ -188,7 +188,7 @@ and do not require Lua.
 
 - Unrestricted native code execution inside the engine.
 - Sandboxed procedural languages in this track. Lua extension work belongs in
-  `WIN_LUA_EXTENSION_RUNTIME_SPEC.md`.
+  `design/_archive/WIN_LUA_EXTENSION_RUNTIME_SPEC.md`.
 
 ### Validation
 

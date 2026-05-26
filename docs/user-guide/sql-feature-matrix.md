@@ -52,6 +52,29 @@ SELECT * FROM sys_sync_doctor;
 
 See [Local-first sync](sync/index.md) for the full guide.
 
+## Local data security
+
+This section compares local database security surfaces. DecentDB is embedded and
+does not implement server users or roles; host applications control who can open
+a database handle and execute SQL.
+
+| Feature | DecentDB | SQLite | PostgreSQL | DuckDB |
+|---------|----------|--------|------------|--------|
+| Transparent local database encryption | ✅ (TDE open config) | ⚠️ (SQLCipher or other extension/build) | ⚠️ (cluster/file-system encryption; server-oriented) | ❌ |
+| WAL and sidecar encryption through the same local key | ✅ | ⚠️ (extension-dependent) | ⚠️ (deployment-dependent) | ❌ |
+| Durable row policies in an embedded engine | ✅ (`CREATE POLICY`) | ❌ | ✅ (row-level security) | ❌ |
+| Durable projection masks | ✅ (`CREATE MASK`) | ❌ | ⚠️ (views/policies/extensions) | ❌ |
+| Connection-local audit context functions | ✅ (`current_tenant`, `current_actor`) | ❌ | ⚠️ (session settings/current user) | ❌ |
+| Queryable local security audit events | ✅ (`__decentdb_audit_events`) | ❌ | ⚠️ (audit extensions/logging) | ❌ |
+
+```sql
+SET AUDIT CONTEXT tenant_id = 'tenant-a';
+CREATE POLICY tenant_filter ON invoices USING tenant_id = current_tenant();
+CREATE MASK ssn_mask ON employees(ssn) USING '***-**-' || right(ssn, 4);
+```
+
+See [Local Data Security](security.md) for the full DecentDB contract.
+
 ## Branch, diff, restore, and time travel
 
 This section compares built-in database workflow surfaces. Other engines can

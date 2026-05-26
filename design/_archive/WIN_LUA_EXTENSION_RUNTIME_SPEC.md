@@ -2,7 +2,7 @@
 
 **Date:** 2026-05-21
 **Status:** Implemented for DecentDB 2.6.0
-**Roadmap:** Delivered foundation; see [`FUTURE_WINS.md`](FUTURE_WINS.md)
+**Roadmap:** Delivered foundation; see [`FUTURE_WINS.md`](../FUTURE_WINS.md)
 Delivered Context
 **Audience:** Core engine developers, SQL planner/executor maintainers, C ABI maintainers, binding maintainers, CLI maintainers, documentation authors, coding agents
 **Related inputs:** Lua 5.4 Reference Manual, `design/FUTURE_WINS.md`, `design/WIN_ADVANCED_SQL_COMPATIBILITY_SURFACE.md`, `design/adr/0111-table-valued-functions.md`, `design/adr/0118-rust-ffi-panic-safety.md`, ADR 0169-0173
@@ -153,19 +153,19 @@ by the accepted ADRs below.
 
 Accepted ADR coverage:
 
-1. [ADR 0169](adr/0169-lua-extension-runtime-dependency-and-sandbox.md):
+1. [ADR 0169](../adr/0169-lua-extension-runtime-dependency-and-sandbox.md):
    runtime dependency, build strategy, sandbox, resource limits, and
    native/browser execution policy.
-2. [ADR 0170](adr/0170-lua-extension-package-catalog-and-trust.md):
+2. [ADR 0170](../adr/0170-lua-extension-package-catalog-and-trust.md):
    package layout, manifest authority, versioning inputs, content hashing,
    catalog storage, enablement, purge, and connection-level trust.
-3. [ADR 0171](adr/0171-lua-extension-sql-type-and-planner-contract.md):
+3. [ADR 0171](../adr/0171-lua-extension-sql-type-and-planner-contract.md):
    SQL function registration, strict manifest signatures, DecentDB-owned type
    boundary, NULL handling, planner contract, and persisted-object boundaries.
-4. [ADR 0172](adr/0172-lua-extension-cli-c-abi-and-binding-contract.md):
+4. [ADR 0172](../adr/0172-lua-extension-cli-c-abi-and-binding-contract.md):
    CLI lifecycle, C ABI JSON bridge, binding responsibilities, inspection
    surfaces, and documentation expectations.
-5. [ADR 0173](adr/0173-lua-extension-function-kind-phasing.md):
+5. [ADR 0173](../adr/0173-lua-extension-function-kind-phasing.md):
    complete function-kind scope, including table-valued functions, aggregates,
    query-time collations, dependency inspection, and completion criteria.
 

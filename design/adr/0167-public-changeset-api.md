@@ -201,7 +201,7 @@ Implementation is not complete until tests cover:
 ## References
 
 - `design/FUTURE_WINS.md` priority #1
-- `design/WIN_PRODUCTION_RELAY_SPEC.md`
+- `design/_archive/WIN_PRODUCTION_RELAY_SPEC.md`
 - `design/WIN_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md`
 - `design/adr/0147-local-sync-journal-foundation.md`
 - `design/adr/0150-sync-conflict-resolution-workflows.md`

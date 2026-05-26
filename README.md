@@ -29,6 +29,9 @@ It targets a single process with **one writer** and **many concurrent readers** 
 ## Features
 
 - 🔒 **ACID Transactions** - Write-ahead logging with crash-safe recovery
+- 🔐 **Local Data Security** - Transparent data encryption, durable row
+  policies, projection masks, audit context functions, and queryable security
+  audit events
 - 🌳 **B+Tree Storage** - Efficient tables and secondary indexes with page caching
 - 🔁 **Local-First Sync** - Durable change journals, public changeset APIs, production HTTP/WebSocket relay, shape subscriptions, scoped peer replication, conflict workflows, operational doctor tooling, CLI commands, and .NET/web helpers
 - 📡 **Reactive Subscriptions** - In-process table, range, query, and change-stream watches deliver committed invalidation events with LSN boundaries, bounded lag handling, C ABI JSON polling, and Python/Go direct helpers

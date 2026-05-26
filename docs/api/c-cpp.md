@@ -111,6 +111,47 @@ Rules:
 - Do not call free functions concurrently from multiple threads on the same
   pointer or handle.
 
+## Open Options And Local Security
+
+The option-aware open functions accept a UTF-8 `key=value` string separated by
+whitespace, commas, or semicolons:
+
+- `ddb_db_create_with_options`
+- `ddb_db_open_with_options`
+- `ddb_db_open_or_create_with_options`
+
+TDE can be enabled with `encryption_key_hex` or `encryption_key`:
+
+```c
+ddb_db_t *db = NULL;
+check(ddb_db_create_with_options(
+          "secure.ddb",
+          "encryption_key_hex=00112233445566778899aabbccddeeff",
+          &db),
+      "create encrypted db");
+```
+
+`encryption_key_hex` / `tde_key_hex` decode hex bytes. `encryption_key` /
+`tde_key` use the UTF-8 bytes of the option value. Avoid logging option strings
+that contain key material.
+
+Audit context can be set through SQL or through the C ABI:
+
+```c
+const char *actor = "alice@example.com";
+check(ddb_db_set_audit_context_text(
+          db,
+          "actor",
+          actor,
+          strlen(actor)),
+      "set actor");
+
+check(ddb_db_clear_audit_context(db, "actor"), "clear actor");
+```
+
+The SQL layer also supports `SET AUDIT CONTEXT`, `CREATE POLICY`, and
+`CREATE MASK`. See [Local Data Security](../user-guide/security.md).
+
 ## Queued Writes
 
 `ddb_db_execute_queued` submits one SQL statement to the engine-owned write

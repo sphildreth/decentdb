@@ -6,10 +6,10 @@
 
 **Roadmap:** Delivered; removed from active Future Wins
 
-**Related:** [`WIN_ADVANCED_SQL_COMPATIBILITY_SURFACE.md`](WIN_ADVANCED_SQL_COMPATIBILITY_SURFACE.md),
-[`docs/user-guide/comparison.md`](../docs/user-guide/comparison.md),
-[`docs/api/configuration.md`](../docs/api/configuration.md),
-[`docs/user-guide/sql-feature-matrix.md`](../docs/user-guide/sql-feature-matrix.md)
+**Related:** [`WIN_ADVANCED_SQL_COMPATIBILITY_SURFACE.md`](../WIN_ADVANCED_SQL_COMPATIBILITY_SURFACE.md),
+[`docs/user-guide/comparison.md`](../../docs/user-guide/comparison.md),
+[`docs/api/configuration.md`](../../docs/api/configuration.md),
+[`docs/user-guide/sql-feature-matrix.md`](../../docs/user-guide/sql-feature-matrix.md)
 
 ## Purpose
 
