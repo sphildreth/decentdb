@@ -9,16 +9,27 @@ index state. The index must be maintained through the normal single-writer
 transaction path, must be planner-visible, and must be rebuildable from the base
 table.
 
+The catalog must add `IndexKind::FullText` plus typed full-text options metadata
+reachable from `IndexSchema`. Analyzer configuration must not live only in
+rendered SQL text or in ad hoc per-call parsing. Structured introspection and
+tooling metadata must expose the full-text index kind and normalized analyzer
+options.
+
 The FTS storage model will include these logical structures:
 
 - term dictionary with term bytes, term ids, document frequency, and total term
   frequency
 - postings keyed by term id and row id, including term frequency and token
   positions
-- document statistics keyed by row id, including indexed document length and
-  optional per-field lengths
+- document statistics keyed by row id, including indexed document length,
+  optional per-field lengths, and enough state to handle `NULL -> text` and
+  `text -> NULL` transitions
 - index metadata containing analyzer config, document count, average document
   length, build generation, dirty/rebuild state, and verification metadata
+
+`NULL` indexed text values contribute no tokens and are not indexed as a literal
+string. Ranking document count and average document length count only rows with
+at least one indexed token.
 
 The implementation should reuse existing B+Tree and overflow-page mechanisms
 where practical. Large postings lists must be chunked and must not be stored as
@@ -29,6 +40,29 @@ that they may be stale or corrupt. Recovery may mark an FTS index as needing
 rebuild if the implementation proves that this preserves base-table durability
 and query correctness. Queries against a stale FTS index must either trigger an
 explicitly accepted rebuild path or fail with a clear error.
+
+FTS maintenance must satisfy DecentDB read-your-writes semantics. The
+implementation may use transaction-local FTS delta overlays or eager
+transaction-private materialization, but checkpoint-only materialization that
+makes FTS results lag behind visible base table rows is not acceptable.
+
+`ALTER INDEX ... REBUILD` is synchronous in v1. It uses the normal single-writer
+path, blocks other writes, builds replacement FTS state from a consistent
+snapshot, and atomically swaps the rebuilt index at commit. Partially rebuilt
+state must never be visible. `ALTER INDEX ... VERIFY` is synchronous and
+read-only from the user's perspective.
+
+FTS data must be stored through the same database, WAL, and sync-journal byte
+paths as other engine data. TDE therefore encrypts FTS term dictionaries,
+postings, document statistics, and metadata at rest. FTS must not create
+plaintext sidecar files. Verification, Doctor, and default error messages must
+not print raw indexed terms.
+
+FTS follows branch-visible base table state. Branch-local writes must either
+maintain branch-local FTS generations or mark that branch's FTS index stale;
+they must not mutate another branch's visible FTS state. Branch diff, restore,
+and sync changesets treat FTS as derived state and capture base table changes
+rather than postings or term dictionary mutations.
 
 Bindings will consume FTS through ordinary SQL and scalar result values. A
 dedicated FTS C ABI is not required for v1. C ABI changes are limited to ABI
@@ -47,6 +81,7 @@ The storage decision follows these product constraints:
 
 - committed base table rows remain the durable source of truth
 - FTS query results must match committed table contents
+- same-transaction FTS reads must match same-transaction table visibility
 - derived index corruption must be detectable and repairable
 - index maintenance must honor transaction commit and rollback
 - WAL and checkpoint behavior must remain understandable
@@ -68,6 +103,8 @@ same statements and read rank values as ordinary `FLOAT64` columns.
   much implementation detail and makes planner integration harder.
 - **One opaque serialized FTS blob per index.** Rejected. It has poor update,
   verification, and large-index behavior.
+- **Checkpoint-only FTS materialization.** Rejected for v1 if it causes
+  same-transaction or committed FTS reads to lag behind visible base table rows.
 - **Mandatory external search library.** Rejected for portability, auditability,
   and long-term storage ownership reasons.
 - **Dedicated per-binding FTS APIs.** Rejected. They would increase drift and
@@ -80,8 +117,12 @@ same statements and read rank values as ordinary `FLOAT64` columns.
 - Persisting analyzer identifiers and versions is required to avoid silent
   semantic drift across releases.
 - Transactional maintenance adds write cost to indexed text updates.
+- Transaction-local delta overlays or eager private materialization add executor
+  complexity, but they preserve DecentDB's visibility contract.
 - Phrase and prefix support require position and dictionary data, increasing
   index size.
+- Branch-aware derived state may force stale-index marking or branch-local
+  generations until a later storage ADR proves safe sharing.
 - If the new index kind requires an on-disk format version bump, ADR 0131
   requires a read-only migration parser update in `decentdb-migrate`.
 
@@ -94,4 +135,3 @@ same statements and read rank values as ordinary `FLOAT64` columns.
 - `design/adr/0063-trigram-postings-paging-format.md`
 - `design/adr/0131-legacy-format-migrations.md`
 - `include/decentdb.h`
-

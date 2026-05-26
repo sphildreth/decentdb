@@ -9,7 +9,7 @@ This directory contains the historical and active ADRs for DecentDB.
 
 ### Recent Rust-Specific ADRs:
 - **0176-full-text-search-storage-durability-and-binding-contract.md**: Defines FTS as engine-owned derived secondary index state, with term/postings/document-stat storage, rebuild/verify behavior, stale-index handling, and binding responsibilities through ordinary SQL.
-- **0175-native-full-text-search-query-surface-and-ranking.md**: Defines native `USING fulltext` indexes, `index MATCH query`, `bm25(index)` ranking, portable analyzer/query behavior, and the non-virtual-table FTS user surface.
+- **0175-native-full-text-search-query-surface-and-ranking.md**: Defines native `USING fulltext` indexes, `fulltext_match('index', query)`, `bm25('index')` ranking, portable analyzer/query behavior, and the non-virtual-table FTS user surface.
 - **0118-rust-ffi-panic-safety.md**: Mandates `catch_unwind` on all C-ABI boundaries.
 - **0119-rust-vfs-pread-pwrite.md**: Mandates standard file positional I/O over `unsafe mmap` for the Virtual File System.
 - **0120-core-storage-engine-btree.md**: Formalizes the choice of an optimized B+Tree over an LSM-Tree for the core storage engine.
