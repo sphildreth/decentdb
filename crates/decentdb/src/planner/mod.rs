@@ -3,7 +3,7 @@
 pub(crate) mod logical;
 pub(crate) mod physical;
 
-use crate::catalog::{identifiers_equal, CatalogState, IndexKind};
+use crate::catalog::{identifiers_equal, CatalogState, IndexKind, TableSchema};
 use crate::error::Result;
 use crate::sql::ast::{
     BinaryOp, Expr, FromItem, JoinConstraint, JoinKind, Query, QueryBody, Select, Statement,
@@ -233,6 +233,17 @@ fn maybe_index_plan(
         });
     }
     let (column_name, uses_like) = simple_indexable_filter(filter)?;
+    if !uses_like {
+        if let Some(row_id_alias) = planner_row_id_alias_column_name(table)
+            .filter(|row_id_alias| identifiers_equal(row_id_alias, column_name))
+        {
+            return Some(PhysicalPlan::RowIdLookup {
+                table: table.name.clone(),
+                column: row_id_alias.to_string(),
+                predicate: filter.clone(),
+            });
+        }
+    }
     let index = catalog.indexes.values().find(|index| {
         identifiers_equal(&index.table_name, &table.name)
             && index.columns.len() == 1
@@ -240,12 +251,19 @@ fn maybe_index_plan(
             && index.columns[0]
                 .column_name
                 .as_ref()
-                .is_some_and(|indexed| indexed == column_name)
+                .is_some_and(|indexed| identifiers_equal(indexed, column_name))
             && (uses_like && index.kind == IndexKind::Trigram
                 || !uses_like && index.kind == IndexKind::Btree)
             && index.fresh
     })?;
-    if !uses_like && !should_use_btree_index(table.name.as_str(), index.name.as_str(), catalog) {
+    if !uses_like
+        && !index.unique
+        && !table
+            .primary_key_columns
+            .iter()
+            .any(|pk| identifiers_equal(pk, column_name))
+        && !should_use_btree_index(table.name.as_str(), index.name.as_str(), catalog)
+    {
         return None;
     }
     Some(if uses_like {
@@ -261,6 +279,18 @@ fn maybe_index_plan(
             predicate: filter.clone(),
         }
     })
+}
+
+fn planner_row_id_alias_column_name(table: &TableSchema) -> Option<&str> {
+    if table.primary_key_columns.len() != 1 {
+        return None;
+    }
+    let primary_key_column = &table.primary_key_columns[0];
+    table
+        .columns
+        .iter()
+        .find(|column| identifiers_equal(&column.name, primary_key_column) && column.auto_increment)
+        .map(|column| column.name.as_str())
 }
 
 fn should_use_btree_index(table_name: &str, index_name: &str, catalog: &CatalogState) -> bool {
@@ -526,7 +556,13 @@ fn simple_indexable_filter(filter: &Expr) -> Option<(&str, bool)> {
             (Expr::Column { column, .. }, BinaryOp::Eq, Expr::Literal(_)) => {
                 Some((column.as_str(), false))
             }
+            (Expr::Column { column, .. }, BinaryOp::Eq, Expr::Parameter(_)) => {
+                Some((column.as_str(), false))
+            }
             (Expr::Literal(_), BinaryOp::Eq, Expr::Column { column, .. }) => {
+                Some((column.as_str(), false))
+            }
+            (Expr::Parameter(_), BinaryOp::Eq, Expr::Column { column, .. }) => {
                 Some((column.as_str(), false))
             }
             _ => None,
@@ -534,9 +570,13 @@ fn simple_indexable_filter(filter: &Expr) -> Option<(&str, bool)> {
         Expr::Like {
             expr: left,
             pattern: right,
+            escape,
+            negated,
             ..
         } => match (&**left, &**right) {
-            (Expr::Column { column, .. }, Expr::Literal(crate::record::value::Value::Text(_))) => {
+            (Expr::Column { column, .. }, Expr::Literal(crate::record::value::Value::Text(_)))
+                if !*negated && escape.is_none() =>
+            {
                 Some((column.as_str(), true))
             }
             _ => None,
@@ -604,6 +644,7 @@ fn expr_has_aggregate(expr: &Expr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::{ColumnSchema, ColumnType, IndexColumn, IndexSchema};
     use crate::record::value::Value;
     use crate::sql::ast::{SelectItem, UnaryOp};
 
@@ -620,6 +661,77 @@ mod tests {
 
     fn lit_text(s: &str) -> Expr {
         Expr::Literal(Value::Text(s.to_string()))
+    }
+
+    fn test_column(name: &str, auto_increment: bool) -> ColumnSchema {
+        ColumnSchema {
+            name: name.to_string(),
+            column_type: ColumnType::Int64,
+            spatial_type: None,
+            enum_type: None,
+            nullable: false,
+            default_sql: None,
+            generated_sql: None,
+            generated_stored: false,
+            primary_key: auto_increment,
+            unique: auto_increment,
+            auto_increment,
+            checks: Vec::new(),
+            foreign_key: None,
+        }
+    }
+
+    fn catalog_with_artist_table() -> CatalogState {
+        let mut catalog = CatalogState::empty(0);
+        catalog.tables.insert(
+            "Artist".to_string(),
+            TableSchema {
+                name: "Artist".to_string(),
+                temporary: false,
+                columns: vec![
+                    test_column("Id", true),
+                    test_column("NameNormalized", false),
+                ],
+                checks: Vec::new(),
+                foreign_keys: Vec::new(),
+                primary_key_columns: vec!["Id".to_string()],
+                next_row_id: 1,
+                pk_index_root: None,
+            },
+        );
+        catalog.indexes.insert(
+            "IX_Artist_NameNormalized".to_string(),
+            IndexSchema {
+                name: "IX_Artist_NameNormalized".to_string(),
+                table_name: "Artist".to_string(),
+                kind: IndexKind::Btree,
+                unique: false,
+                columns: vec![IndexColumn {
+                    column_name: Some("NameNormalized".to_string()),
+                    expression_sql: None,
+                }],
+                include_columns: Vec::new(),
+                predicate_sql: None,
+                full_text: None,
+                fresh: true,
+            },
+        );
+        catalog
+    }
+
+    fn single_table_select(filter: Expr) -> Select {
+        Select {
+            distinct: false,
+            distinct_on: vec![],
+            projection: vec![SelectItem::Wildcard],
+            from: vec![FromItem::Table {
+                name: "Artist".to_string(),
+                alias: None,
+            }],
+            filter: Some(filter),
+            group_by: vec![],
+            having: None,
+        }
     }
 
     fn agg_count() -> Expr {
@@ -931,6 +1043,17 @@ mod tests {
     }
 
     #[test]
+    fn indexable_eq_column_parameter() {
+        let filter = Expr::Binary {
+            left: Box::new(col("id")),
+            op: BinaryOp::Eq,
+            right: Box::new(Expr::Parameter(1)),
+        };
+        let result = simple_indexable_filter(&filter);
+        assert_eq!(result, Some(("id", false)));
+    }
+
+    #[test]
     fn indexable_eq_literal_column() {
         let filter = Expr::Binary {
             left: Box::new(lit_int(42)),
@@ -952,6 +1075,30 @@ mod tests {
         };
         let result = simple_indexable_filter(&filter);
         assert_eq!(result, Some(("name", true)));
+    }
+
+    #[test]
+    fn not_indexable_negated_like() {
+        let filter = Expr::Like {
+            expr: Box::new(col("name")),
+            pattern: Box::new(lit_text("%hello%")),
+            escape: None,
+            case_insensitive: false,
+            negated: true,
+        };
+        assert!(simple_indexable_filter(&filter).is_none());
+    }
+
+    #[test]
+    fn not_indexable_like_with_escape() {
+        let filter = Expr::Like {
+            expr: Box::new(col("name")),
+            pattern: Box::new(lit_text("%hello/%")),
+            escape: Some(Box::new(lit_text("/"))),
+            case_insensitive: false,
+            negated: false,
+        };
+        assert!(simple_indexable_filter(&filter).is_none());
     }
 
     #[test]
@@ -1068,6 +1215,46 @@ mod tests {
             having: None,
         };
         assert!(!projection_has_aggregate(&select));
+    }
+
+    // ── maybe_index_plan ─────────────────────────────────────────────
+
+    #[test]
+    fn row_id_lookup_plan_uses_identifier_equality() {
+        let catalog = catalog_with_artist_table();
+        let select = single_table_select(Expr::Binary {
+            left: Box::new(col("id")),
+            op: BinaryOp::Eq,
+            right: Box::new(lit_int(42)),
+        });
+        let plan = maybe_index_plan(&select, select.filter.as_ref().unwrap(), &catalog)
+            .expect("row-id lookup plan");
+        let lines = plan.render();
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("RowIdLookup(table=Artist, column=Id")),
+            "expected RowIdLookup, got: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn btree_index_plan_matches_column_case_insensitively() {
+        let catalog = catalog_with_artist_table();
+        let select = single_table_select(Expr::Binary {
+            left: Box::new(col("namenormalized")),
+            op: BinaryOp::Eq,
+            right: Box::new(lit_text("MOTLEYCRUE")),
+        });
+        let plan = maybe_index_plan(&select, select.filter.as_ref().unwrap(), &catalog)
+            .expect("btree index plan");
+        let lines = plan.render();
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("IndexSeek(table=Artist, index=IX_Artist_NameNormalized")),
+            "expected IndexSeek, got: {lines:?}"
+        );
     }
 
     // ── should_use_btree_index ──────────────────────────────────────

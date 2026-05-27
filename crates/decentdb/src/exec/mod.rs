@@ -62,7 +62,7 @@ use crate::record::value::{
     parse_timestamp_tz_micros, Value,
 };
 use crate::search::fulltext::{AnalyzerConfig, FullTextIndex, FTS_SEMANTIC_ERROR_PREFIX};
-use crate::search::{TrigramIndex, TrigramQueryResult};
+use crate::search::{TrigramIndex, TrigramIndexBuilder, TrigramQueryResult};
 use crate::spatial::index::{SpatialEnvelope, SpatialIndexBackend, SpatialRuntimeIndex};
 use crate::spatial::types::{
     CoordinateDimensions, Position, SpatialError, SpatialGeometry, SpatialKind, SpatialValue,
@@ -9731,13 +9731,6 @@ impl EngineRuntime {
         {
             return Ok(None);
         }
-        if select
-            .projection
-            .iter()
-            .any(|item| !matches!(item, SelectItem::Expr { .. }))
-        {
-            return Ok(None);
-        }
         let has_expression_projection = select.projection.iter().any(|item| match item {
             SelectItem::Expr { expr, .. } => !matches!(expr, Expr::Column { .. }),
             SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => true,
@@ -9751,45 +9744,65 @@ impl EngineRuntime {
             return Ok(None);
         }
 
-        let column_names = select
-            .projection
-            .iter()
-            .enumerate()
-            .map(|(index, item)| match item {
-                SelectItem::Expr { expr, alias } => alias
-                    .clone()
-                    .unwrap_or_else(|| infer_expr_name(expr, index + 1)),
-                SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => {
-                    format!("col{}", index + 1)
-                }
-            })
-            .collect::<Vec<_>>();
+        let binding_name = alias.as_deref().unwrap_or(name);
+        let Some(projection_plan) =
+            simple_expression_projection_plan(table_schema, name, binding_name, &select.projection)
+        else {
+            return Ok(None);
+        };
+        let ctes = BTreeMap::new();
         let limit = query
             .limit
             .as_ref()
-            .map(|expr| self.eval_constant_i64(expr, params, &BTreeMap::new()))
+            .map(|expr| self.eval_constant_i64(expr, params, &ctes))
             .transpose()?
             .map(|value| usize::try_from(value.max(0)).unwrap_or(usize::MAX));
         let offset = query
             .offset
             .as_ref()
-            .map(|expr| self.eval_constant_i64(expr, params, &BTreeMap::new()))
+            .map(|expr| self.eval_constant_i64(expr, params, &ctes))
             .transpose()?
             .map(|value| usize::try_from(value.max(0)).unwrap_or(usize::MAX))
             .unwrap_or(0);
         let Some(row_source) = self.visible_table_row_source(name) else {
             return Ok(None);
         };
+        if let Some(row_ids) = select
+            .filter
+            .as_ref()
+            .map(|filter| {
+                self.trigram_candidate_row_ids_for_filter(name, alias, filter, params, &ctes)
+            })
+            .transpose()?
+            .flatten()
+        {
+            return Ok(Some(
+                self.simple_expression_projection_result_from_row_ids(
+                    row_source,
+                    table_schema,
+                    binding_name,
+                    &select.projection,
+                    &projection_plan,
+                    select.filter.as_ref(),
+                    select.distinct,
+                    &query.order_by,
+                    params,
+                    limit,
+                    offset,
+                    &row_ids,
+                )?,
+            ));
+        }
         Ok(Some(self.simple_expression_projection_result_from_source(
             row_source,
             table_schema,
-            alias.as_deref().unwrap_or(name),
+            binding_name,
             &select.projection,
+            &projection_plan,
             select.filter.as_ref(),
             select.distinct,
             &query.order_by,
             params,
-            column_names,
             limit,
             offset,
         )?))
@@ -9915,11 +9928,11 @@ impl EngineRuntime {
         table_schema: &TableSchema,
         binding_name: &str,
         projection: &[SelectItem],
+        projection_plan: &SimpleExpressionProjectionPlan<'_>,
         filter: Option<&Expr>,
         distinct: bool,
         order_by: &[crate::sql::ast::OrderBy],
         params: &[Value],
-        column_names: Vec<String>,
         limit: Option<usize>,
         offset: usize,
     ) -> Result<QueryResult> {
@@ -9949,22 +9962,12 @@ impl EngineRuntime {
                     return Ok(());
                 }
             }
-            let mut output = Vec::with_capacity(projection.len());
-            for item in projection {
-                let SelectItem::Expr { expr, .. } = item else {
-                    return Err(DbError::internal(
-                        "expression projection fast path received non-expression item",
-                    ));
-                };
-                output.push(self.eval_expr(
-                    expr,
-                    &dataset,
-                    &eval_values,
-                    params,
-                    &BTreeMap::new(),
-                    None,
-                )?);
-            }
+            let output = self.project_simple_expression_row(
+                projection_plan,
+                &dataset,
+                &eval_values,
+                params,
+            )?;
             if distinct && !seen.insert(row_identity(&output)?) {
                 return Ok(());
             }
@@ -10017,7 +10020,131 @@ impl EngineRuntime {
             .take(limit.unwrap_or(usize::MAX))
             .map(|(row, _)| row)
             .collect();
-        Ok(QueryResult::with_rows(column_names, rows))
+        Ok(QueryResult::with_rows(
+            projection_plan.column_names.clone(),
+            rows,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn simple_expression_projection_result_from_deferred_row_ids<S: PageStore>(
+        &self,
+        store: &S,
+        state: PersistedTableState,
+        table_schema: &TableSchema,
+        binding_name: &str,
+        projection: &[SelectItem],
+        projection_plan: &SimpleExpressionProjectionPlan<'_>,
+        filter: Option<&Expr>,
+        distinct: bool,
+        order_by: &[crate::sql::ast::OrderBy],
+        params: &[Value],
+        limit: Option<usize>,
+        offset: usize,
+        row_ids: &[i64],
+        use_persistent_pk_index: bool,
+        paged_locator_cache: Option<&DeferredPagedRowLocatorCache>,
+    ) -> Result<QueryResult> {
+        let dataset = Dataset::with_rows(
+            table_bindings_with_hidden_row_id(table_schema, binding_name),
+            Vec::new(),
+        );
+        let projection_order_by = projection_order_by_plan(order_by, projection);
+        let bounded_row_count = limit.map(|limit| limit.saturating_add(offset));
+        let mut rows = Vec::with_capacity(bounded_row_count.unwrap_or(row_ids.len()));
+        let mut seen = BTreeSet::new();
+        for row_id in row_ids {
+            let Some(stored_row) = read_deferred_stored_row_by_id(
+                store,
+                state,
+                table_schema,
+                *row_id,
+                use_persistent_pk_index,
+                paged_locator_cache,
+            )?
+            else {
+                continue;
+            };
+            let mut eval_values = stored_row.values;
+            eval_values.push(Value::Int64(stored_row.row_id));
+            if let Some(filter) = filter {
+                if !matches!(
+                    self.eval_expr(
+                        filter,
+                        &dataset,
+                        &eval_values,
+                        params,
+                        &BTreeMap::new(),
+                        None,
+                    )?,
+                    Value::Bool(true)
+                ) {
+                    continue;
+                }
+            }
+            let output = self.project_simple_expression_row(
+                projection_plan,
+                &dataset,
+                &eval_values,
+                params,
+            )?;
+            if distinct && !seen.insert(row_identity(&output)?) {
+                continue;
+            }
+
+            let mut order_values = Vec::with_capacity(order_by.len());
+            if let Some(order_by_plan) = projection_order_by.as_deref() {
+                for order in order_by_plan {
+                    order_values.push(output[order.projection_index].clone());
+                }
+            } else {
+                for order in order_by {
+                    order_values.push(self.eval_expr(
+                        &order.expr,
+                        &dataset,
+                        &eval_values,
+                        params,
+                        &BTreeMap::new(),
+                        None,
+                    )?);
+                }
+            }
+            let row = (QueryRow::new(output), order_values);
+            if let Some(bounded_row_count) = bounded_row_count {
+                if order_by.is_empty() {
+                    if rows.len() < bounded_row_count {
+                        rows.push(row);
+                    } else {
+                        break;
+                    }
+                } else {
+                    push_bounded_ordered_query_row(
+                        Some(self),
+                        &mut rows,
+                        row,
+                        order_by,
+                        bounded_row_count,
+                    )?;
+                }
+            } else {
+                rows.push(row);
+            }
+        }
+
+        if !order_by.is_empty() {
+            sort_query_rows_by_order_values(Some(self), &mut rows, order_by)?;
+        }
+
+        let rows = rows
+            .into_iter()
+            .skip(offset)
+            .take(limit.unwrap_or(usize::MAX))
+            .map(|(row, _)| row)
+            .collect();
+        Ok(QueryResult::with_rows(
+            projection_plan.column_names.clone(),
+            rows,
+        ))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -10027,11 +10154,11 @@ impl EngineRuntime {
         table_schema: &TableSchema,
         binding_name: &str,
         projection: &[SelectItem],
+        projection_plan: &SimpleExpressionProjectionPlan<'_>,
         filter: Option<&Expr>,
         distinct: bool,
         order_by: &[crate::sql::ast::OrderBy],
         params: &[Value],
-        column_names: Vec<String>,
         limit: Option<usize>,
         offset: usize,
     ) -> Result<QueryResult> {
@@ -10056,22 +10183,8 @@ impl EngineRuntime {
                 }
             }
 
-            let mut output = Vec::with_capacity(projection.len());
-            for item in projection {
-                let SelectItem::Expr { expr, .. } = item else {
-                    return Err(DbError::internal(
-                        "expression projection fast path received non-expression item",
-                    ));
-                };
-                output.push(self.eval_expr(
-                    expr,
-                    &dataset,
-                    &values,
-                    params,
-                    &BTreeMap::new(),
-                    None,
-                )?);
-            }
+            let output =
+                self.project_simple_expression_row(projection_plan, &dataset, &values, params)?;
             if distinct && !seen.insert(row_identity(&output)?) {
                 continue;
             }
@@ -10125,7 +10238,141 @@ impl EngineRuntime {
             .take(limit.unwrap_or(usize::MAX))
             .map(|(row, _)| row)
             .collect();
-        Ok(QueryResult::with_rows(column_names, rows))
+        Ok(QueryResult::with_rows(
+            projection_plan.column_names.clone(),
+            rows,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn simple_expression_projection_result_from_row_ids(
+        &self,
+        row_source: VisibleTableRowSource<'_>,
+        table_schema: &TableSchema,
+        binding_name: &str,
+        projection: &[SelectItem],
+        projection_plan: &SimpleExpressionProjectionPlan<'_>,
+        filter: Option<&Expr>,
+        distinct: bool,
+        order_by: &[crate::sql::ast::OrderBy],
+        params: &[Value],
+        limit: Option<usize>,
+        offset: usize,
+        row_ids: &[i64],
+    ) -> Result<QueryResult> {
+        let dataset = Dataset::with_rows(
+            table_bindings_with_hidden_row_id(table_schema, binding_name),
+            Vec::new(),
+        );
+        let projection_order_by = projection_order_by_plan(order_by, projection);
+        let bounded_row_count = limit.map(|limit| limit.saturating_add(offset));
+        let mut rows = Vec::with_capacity(bounded_row_count.unwrap_or(row_ids.len()));
+        let mut seen = BTreeSet::new();
+        for row_id in row_ids {
+            let Some(stored_row) = row_source.row_by_id(*row_id)? else {
+                continue;
+            };
+            let mut values = stored_row.values().to_vec();
+            values.push(Value::Int64(stored_row.row_id()));
+            if let Some(filter) = filter {
+                if !matches!(
+                    self.eval_expr(filter, &dataset, &values, params, &BTreeMap::new(), None)?,
+                    Value::Bool(true)
+                ) {
+                    continue;
+                }
+            }
+
+            let output =
+                self.project_simple_expression_row(projection_plan, &dataset, &values, params)?;
+            if distinct && !seen.insert(row_identity(&output)?) {
+                continue;
+            }
+
+            let mut order_values = Vec::with_capacity(order_by.len());
+            if let Some(order_by_plan) = projection_order_by.as_deref() {
+                for order in order_by_plan {
+                    order_values.push(output[order.projection_index].clone());
+                }
+            } else {
+                for order in order_by {
+                    order_values.push(self.eval_expr(
+                        &order.expr,
+                        &dataset,
+                        &values,
+                        params,
+                        &BTreeMap::new(),
+                        None,
+                    )?);
+                }
+            }
+            let row = (QueryRow::new(output), order_values);
+            if let Some(bounded_row_count) = bounded_row_count {
+                if order_by.is_empty() {
+                    if rows.len() < bounded_row_count {
+                        rows.push(row);
+                    } else {
+                        break;
+                    }
+                } else {
+                    push_bounded_ordered_query_row(
+                        Some(self),
+                        &mut rows,
+                        row,
+                        order_by,
+                        bounded_row_count,
+                    )?;
+                }
+            } else {
+                rows.push(row);
+            }
+        }
+
+        if !order_by.is_empty() {
+            sort_query_rows_by_order_values(Some(self), &mut rows, order_by)?;
+        }
+
+        let rows = rows
+            .into_iter()
+            .skip(offset)
+            .take(limit.unwrap_or(usize::MAX))
+            .map(|(row, _)| row)
+            .collect();
+        Ok(QueryResult::with_rows(
+            projection_plan.column_names.clone(),
+            rows,
+        ))
+    }
+
+    fn project_simple_expression_row(
+        &self,
+        projection_plan: &SimpleExpressionProjectionPlan<'_>,
+        dataset: &Dataset,
+        values: &[Value],
+        params: &[Value],
+    ) -> Result<Vec<Value>> {
+        let mut output = Vec::with_capacity(projection_plan.sources.len());
+        for source in &projection_plan.sources {
+            match source {
+                SimpleExpressionProjectionSource::Column(index) => {
+                    let value = values.get(*index).ok_or_else(|| {
+                        DbError::internal("expression projection column index exceeds row width")
+                    })?;
+                    output.push(value.clone());
+                }
+                SimpleExpressionProjectionSource::Expr(expr) => {
+                    output.push(self.eval_expr(
+                        expr,
+                        dataset,
+                        values,
+                        params,
+                        &BTreeMap::new(),
+                        None,
+                    )?);
+                }
+            }
+        }
+        Ok(output)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -10920,6 +11167,7 @@ impl EngineRuntime {
             pager,
             wal,
             snapshot_lsn,
+            use_persistent_pk_index,
         )? {
             return Ok(Some(result));
         }
@@ -10939,6 +11187,7 @@ impl EngineRuntime {
         pager: &PagerHandle,
         wal: &WalHandle,
         snapshot_lsn: u64,
+        use_persistent_pk_index: bool,
     ) -> Result<Option<QueryResult>> {
         if !query.ctes.is_empty() {
             return Ok(None);
@@ -11009,13 +11258,6 @@ impl EngineRuntime {
         {
             return Ok(None);
         }
-        if select
-            .projection
-            .iter()
-            .any(|item| !matches!(item, SelectItem::Expr { .. }))
-        {
-            return Ok(None);
-        }
         let has_expression_projection = select.projection.iter().any(|item| match item {
             SelectItem::Expr { expr, .. } => !matches!(expr, Expr::Column { .. }),
             SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => true,
@@ -11029,29 +11271,23 @@ impl EngineRuntime {
             return Ok(None);
         }
 
-        let column_names = select
-            .projection
-            .iter()
-            .enumerate()
-            .map(|(index, item)| match item {
-                SelectItem::Expr { expr, alias } => alias
-                    .clone()
-                    .unwrap_or_else(|| infer_expr_name(expr, index + 1)),
-                SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => {
-                    format!("col{}", index + 1)
-                }
-            })
-            .collect::<Vec<_>>();
+        let binding_name = alias.as_deref().unwrap_or(name);
+        let Some(projection_plan) =
+            simple_expression_projection_plan(table_schema, name, binding_name, &select.projection)
+        else {
+            return Ok(None);
+        };
+        let ctes = BTreeMap::new();
         let limit = query
             .limit
             .as_ref()
-            .map(|expr| self.eval_constant_i64(expr, params, &BTreeMap::new()))
+            .map(|expr| self.eval_constant_i64(expr, params, &ctes))
             .transpose()?
             .map(|value| usize::try_from(value.max(0)).unwrap_or(usize::MAX));
         let offset = query
             .offset
             .as_ref()
-            .map(|expr| self.eval_constant_i64(expr, params, &BTreeMap::new()))
+            .map(|expr| self.eval_constant_i64(expr, params, &ctes))
             .transpose()?
             .map(|value| usize::try_from(value.max(0)).unwrap_or(usize::MAX))
             .unwrap_or(0);
@@ -11063,18 +11299,59 @@ impl EngineRuntime {
             wal,
             snapshot_lsn,
         };
+        let paged_locator_cache = self
+            .catalog
+            .table(name)
+            .and_then(|table| self.deferred_paged_row_locator_caches.get(&table.name))
+            .map(|cache| cache.as_ref());
+        if deferred_rowid_lookup_available(
+            state,
+            table_schema,
+            use_persistent_pk_index,
+            paged_locator_cache,
+        ) {
+            if let Some(row_ids) = select
+                .filter
+                .as_ref()
+                .map(|filter| {
+                    self.trigram_candidate_row_ids_for_filter(name, alias, filter, params, &ctes)
+                })
+                .transpose()?
+                .flatten()
+            {
+                return Ok(Some(
+                    self.simple_expression_projection_result_from_deferred_row_ids(
+                        &store,
+                        state,
+                        table_schema,
+                        binding_name,
+                        &select.projection,
+                        &projection_plan,
+                        select.filter.as_ref(),
+                        select.distinct,
+                        &query.order_by,
+                        params,
+                        limit,
+                        offset,
+                        &row_ids,
+                        use_persistent_pk_index,
+                        paged_locator_cache,
+                    )?,
+                ));
+            }
+        }
         Ok(Some(
             self.simple_expression_projection_result_from_persisted_state(
                 &store,
                 state,
                 table_schema,
-                alias.as_deref().unwrap_or(name),
+                binding_name,
                 &select.projection,
+                &projection_plan,
                 select.filter.as_ref(),
                 select.distinct,
                 &query.order_by,
                 params,
-                column_names,
                 limit,
                 offset,
             )?,
@@ -13050,53 +13327,77 @@ impl EngineRuntime {
             }
         }
 
-        if let Some((column_name, pattern_expr, has_additional_filter)) =
-            simple_trigram_lookup(filter)
+        if let Some(row_ids) =
+            self.trigram_candidate_row_ids_for_filter(name, alias, filter, params, ctes)?
         {
-            if let Some(index) = self.catalog.indexes.values().find(|index| {
-                identifiers_equal(&index.table_name, name)
-                    && index.fresh
-                    && index.kind == IndexKind::Trigram
-                    && index.predicate_sql.is_none()
-                    && index.columns.len() == 1
-                    && index.columns[0]
-                        .column_name
-                        .as_deref()
-                        .is_some_and(|index_column| identifiers_equal(index_column, column_name))
-            }) {
-                let pattern =
-                    self.eval_expr(pattern_expr, &Dataset::empty(), &[], params, ctes, None)?;
-                if let Value::Text(pattern) = pattern {
-                    if let Some(RuntimeIndex::Trigram { index }) = self.index(&index.name) {
-                        if !index.planner_may_use_index() {
-                            return Ok(None);
-                        }
-                        let row_ids =
-                            match index.query_candidates(&pattern, has_additional_filter)? {
-                                TrigramQueryResult::Candidates(ids)
-                                | TrigramQueryResult::Capped(ids) => ids
-                                    .into_iter()
-                                    .filter_map(|row_id| i64::try_from(row_id).ok())
-                                    .collect::<Vec<_>>(),
-                                TrigramQueryResult::FallbackTooShort
-                                | TrigramQueryResult::FallbackRequiresAdditionalFilter
-                                | TrigramQueryResult::RebuildRequired => return Ok(None),
-                            };
-                        return self
-                            .dataset_from_row_id_set(
-                                table,
-                                row_source,
-                                alias,
-                                RuntimeRowIdSet::Many(&row_ids),
-                                false,
-                            )
-                            .map(Some);
-                    }
-                }
-            }
+            return self
+                .dataset_from_row_id_set(
+                    table,
+                    row_source,
+                    alias,
+                    RuntimeRowIdSet::Many(&row_ids),
+                    false,
+                )
+                .map(Some);
         }
 
         Ok(None)
+    }
+
+    fn trigram_candidate_row_ids_for_filter(
+        &self,
+        table_name: &str,
+        alias: &Option<String>,
+        filter: &Expr,
+        params: &[Value],
+        ctes: &BTreeMap<String, Dataset>,
+    ) -> Result<Option<Vec<i64>>> {
+        let Some(lookup) = simple_trigram_lookup(filter) else {
+            return Ok(None);
+        };
+        if !matches_filter_binding(table_name, alias, lookup.table_qualifier) {
+            return Ok(None);
+        }
+        let Some(index_schema) = self.catalog.indexes.values().find(|index| {
+            identifiers_equal(&index.table_name, table_name)
+                && index.fresh
+                && index.kind == IndexKind::Trigram
+                && index.predicate_sql.is_none()
+                && index.columns.len() == 1
+                && index.columns[0]
+                    .column_name
+                    .as_deref()
+                    .is_some_and(|index_column| identifiers_equal(index_column, lookup.column_name))
+        }) else {
+            return Ok(None);
+        };
+        let pattern = self.eval_expr(
+            lookup.pattern_expr,
+            &Dataset::empty(),
+            &[],
+            params,
+            ctes,
+            None,
+        )?;
+        let Value::Text(pattern) = pattern else {
+            return Ok(None);
+        };
+        let Some(RuntimeIndex::Trigram { index }) = self.index(&index_schema.name) else {
+            return Ok(None);
+        };
+        if !index.planner_may_use_index() {
+            return Ok(None);
+        }
+        let row_ids = match index.query_candidates(&pattern, lookup.has_additional_filter)? {
+            TrigramQueryResult::Candidates(ids) | TrigramQueryResult::Capped(ids) => ids
+                .into_iter()
+                .filter_map(|row_id| i64::try_from(row_id).ok())
+                .collect::<Vec<_>>(),
+            TrigramQueryResult::FallbackTooShort
+            | TrigramQueryResult::FallbackRequiresAdditionalFilter
+            | TrigramQueryResult::RebuildRequired => return Ok(None),
+        };
+        Ok(Some(row_ids))
     }
 
     fn evaluate_values_body(
@@ -15773,6 +16074,7 @@ fn build_runtime_index(
         }
         IndexKind::Trigram => {
             let mut trigram = TrigramIndex::new(page_size, 100_000);
+            let mut builder = TrigramIndexBuilder::new();
             for row in source.rows() {
                 let row = row?;
                 if !row_satisfies_index_predicate(runtime, index, table, row.values())? {
@@ -15786,10 +16088,10 @@ fn build_runtime_index(
                             DbError::constraint("trigram index requires a single text expression")
                         })?
                 {
-                    trigram.queue_insert(row.row_id() as u64, &text);
+                    builder.insert(row.row_id() as u64, &text);
                 }
             }
-            trigram.checkpoint()?;
+            builder.finish_into(&mut trigram)?;
             Ok(RuntimeIndex::Trigram { index: trigram })
         }
         IndexKind::Spatial => {
@@ -20264,6 +20566,18 @@ struct SimpleOrderByPlan {
     collation: Option<Collation>,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum SimpleExpressionProjectionSource<'a> {
+    Column(usize),
+    Expr(&'a Expr),
+}
+
+#[derive(Clone, Debug)]
+struct SimpleExpressionProjectionPlan<'a> {
+    sources: Vec<SimpleExpressionProjectionSource<'a>>,
+    column_names: Vec<String>,
+}
+
 #[derive(Clone, Debug)]
 enum SimpleJoinProjectionSource {
     Left(usize),
@@ -20927,6 +21241,80 @@ fn project_simple_projection_values(values: &[Value], projection_indexes: &[usiz
     QueryRow::new(projected)
 }
 
+fn simple_expression_projection_plan<'a>(
+    table_schema: &'a TableSchema,
+    table_name: &str,
+    binding_name: &str,
+    projection: &'a [SelectItem],
+) -> Option<SimpleExpressionProjectionPlan<'a>> {
+    let mut sources = Vec::new();
+    let mut column_names = Vec::new();
+    for (item_index, item) in projection.iter().enumerate() {
+        match item {
+            SelectItem::Expr { expr, alias } => {
+                if let Expr::Column { table, column } = expr {
+                    let column_index = simple_expression_projection_column_index(
+                        table_schema,
+                        table_name,
+                        binding_name,
+                        table.as_deref(),
+                        column,
+                    )?;
+                    sources.push(SimpleExpressionProjectionSource::Column(column_index));
+                    column_names.push(alias.clone().unwrap_or_else(|| column.clone()));
+                } else {
+                    sources.push(SimpleExpressionProjectionSource::Expr(expr));
+                    column_names.push(
+                        alias
+                            .clone()
+                            .unwrap_or_else(|| infer_expr_name(expr, item_index + 1)),
+                    );
+                }
+            }
+            SelectItem::Wildcard => {
+                for (column_index, column) in table_schema.columns.iter().enumerate() {
+                    sources.push(SimpleExpressionProjectionSource::Column(column_index));
+                    column_names.push(column.name.clone());
+                }
+            }
+            SelectItem::QualifiedWildcard(qualified_name) => {
+                if !identifiers_equal(qualified_name, table_name)
+                    && !identifiers_equal(qualified_name, binding_name)
+                {
+                    return None;
+                }
+                for (column_index, column) in table_schema.columns.iter().enumerate() {
+                    sources.push(SimpleExpressionProjectionSource::Column(column_index));
+                    column_names.push(column.name.clone());
+                }
+            }
+        }
+    }
+    Some(SimpleExpressionProjectionPlan {
+        sources,
+        column_names,
+    })
+}
+
+fn simple_expression_projection_column_index(
+    table_schema: &TableSchema,
+    table_name: &str,
+    binding_name: &str,
+    qualifier: Option<&str>,
+    column_name: &str,
+) -> Option<usize> {
+    if let Some(qualifier) = qualifier {
+        if !identifiers_equal(qualifier, table_name) && !identifiers_equal(qualifier, binding_name)
+        {
+            return None;
+        }
+    }
+    table_schema
+        .columns
+        .iter()
+        .position(|candidate| identifiers_equal(&candidate.name, column_name))
+}
+
 fn apply_simple_projection_postprocessing_with_order(
     runtime: Option<&EngineRuntime>,
     mut rows: Vec<QueryRow>,
@@ -21550,6 +21938,131 @@ fn read_deferred_row_by_cached_paged_locator<S: PageStore>(
     }))
 }
 
+fn read_deferred_row_by_id_from_paged_chunk<S: PageStore>(
+    store: &S,
+    chunk: &PersistedTableChunkState,
+    row_id: i64,
+) -> Result<Option<StoredRow>> {
+    if let Some(overlay_pointer) = chunk.overlay_pointer {
+        let overlay_payload = read_overflow(store, overlay_pointer)?;
+        if Some(crc32c_parts(&[overlay_payload.as_slice()])) != chunk.overlay_checksum {
+            return Err(DbError::corruption(
+                "paged table overlay chunk checksum mismatch",
+            ));
+        }
+        if let Some(row) = read_row_from_table_payload_by_id(overlay_payload.as_slice(), row_id)? {
+            return Ok(Some(row));
+        }
+    }
+
+    if chunk.tombstoned_row_ids.contains(&row_id) {
+        return Ok(None);
+    }
+
+    let payload = read_overflow(store, chunk.pointer)?;
+    if crc32c_parts(&[payload.as_slice()]) != chunk.checksum {
+        return Err(DbError::corruption("paged table chunk checksum mismatch"));
+    }
+    read_row_from_table_payload_by_id(payload.as_slice(), row_id)
+}
+
+fn read_row_from_table_payload_by_id(payload: &[u8], row_id: i64) -> Result<Option<StoredRow>> {
+    if payload.is_empty() {
+        return Ok(None);
+    }
+    let mut cursor = Cursor::new(payload);
+    let magic = cursor.read_slice(TABLE_PAYLOAD_MAGIC.len())?;
+    if magic != TABLE_PAYLOAD_MAGIC {
+        return Err(DbError::corruption("table payload magic is invalid"));
+    }
+    let row_count = cursor.read_u32()? as usize;
+    for _ in 0..row_count {
+        let candidate_row_id = cursor.read_i64()?;
+        let row_bytes_len = cursor.read_u32()? as usize;
+        let row_bytes = cursor.read_slice(row_bytes_len)?;
+        if candidate_row_id == row_id {
+            let row = Row::decode(row_bytes)?;
+            return Ok(Some(StoredRow {
+                row_id: candidate_row_id,
+                values: row.into_values(),
+            }));
+        }
+    }
+    Ok(None)
+}
+
+fn manifest_chunk_index_for_row_position(
+    chunks: &[PersistedTableChunkState],
+    row_position: usize,
+) -> Option<usize> {
+    let mut start = 0usize;
+    for (index, chunk) in chunks.iter().enumerate() {
+        let end = start.saturating_add(chunk.row_count);
+        if row_position < end {
+            return Some(index);
+        }
+        start = end;
+    }
+    None
+}
+
+fn read_deferred_row_by_id_from_paged_table_manifest<S: PageStore>(
+    store: &S,
+    state: PersistedTableState,
+    row_id: i64,
+) -> Result<Option<StoredRow>> {
+    let manifest_payload = read_overflow(store, state.pointer)?;
+    if crc32c_parts(&[manifest_payload.as_slice()]) != state.checksum {
+        return Err(DbError::corruption(
+            "paged table manifest checksum mismatch",
+        ));
+    }
+    let manifest = decode_paged_table_manifest_payload(&manifest_payload)?;
+    let total_row_count = manifest
+        .chunks
+        .iter()
+        .fold(0usize, |total, chunk| total.saturating_add(chunk.row_count));
+    if state.row_count != 0 && total_row_count != state.row_count {
+        return Err(DbError::corruption(
+            "paged table manifest row count mismatch",
+        ));
+    }
+
+    let mut checked_chunks = BTreeSet::new();
+    for position in [
+        row_id
+            .checked_sub(1)
+            .and_then(|position| usize::try_from(position).ok()),
+        usize::try_from(row_id).ok(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let Some(chunk_index) = manifest_chunk_index_for_row_position(&manifest.chunks, position)
+        else {
+            continue;
+        };
+        if !checked_chunks.insert(chunk_index) {
+            continue;
+        }
+        if let Some(row) =
+            read_deferred_row_by_id_from_paged_chunk(store, &manifest.chunks[chunk_index], row_id)?
+        {
+            return Ok(Some(row));
+        }
+    }
+
+    for (chunk_index, chunk) in manifest.chunks.iter().enumerate() {
+        if checked_chunks.contains(&chunk_index) {
+            continue;
+        }
+        if let Some(row) = read_deferred_row_by_id_from_paged_chunk(store, chunk, row_id)? {
+            return Ok(Some(row));
+        }
+    }
+    Ok(None)
+}
+
 fn read_deferred_stored_row_by_id<S: PageStore>(
     store: &S,
     state: PersistedTableState,
@@ -21587,15 +22100,7 @@ fn read_deferred_stored_row_by_id<S: PageStore>(
             Some(DecodedRowLocator::V2(locator)) => {
                 read_deferred_row_by_locator_from_paged_table_payload(store, state, row_id, locator)
             }
-            _ => read_table_page_manifest_from_state(store, state)?
-                .row_by_id(row_id)?
-                .map(|row| {
-                    Ok(StoredRow {
-                        row_id: row.row_id(),
-                        values: row.values().to_vec(),
-                    })
-                })
-                .transpose(),
+            _ => read_deferred_row_by_id_from_paged_table_manifest(store, state, row_id),
         };
     }
 
@@ -23358,23 +23863,48 @@ fn try_project_simple_select_items(
     Ok(Some(Dataset::with_rows(output_columns, output_rows)))
 }
 
-fn simple_trigram_lookup(filter: &Expr) -> Option<(&str, &Expr, bool)> {
+#[derive(Clone, Copy, Debug)]
+struct SimpleTrigramLookup<'a> {
+    table_qualifier: Option<&'a str>,
+    column_name: &'a str,
+    pattern_expr: &'a Expr,
+    has_additional_filter: bool,
+}
+
+fn simple_trigram_lookup(filter: &Expr) -> Option<SimpleTrigramLookup<'_>> {
     match filter {
-        Expr::Like { expr, pattern, .. } => match (&**expr, &**pattern) {
-            (Expr::Column { column, .. }, pattern @ (Expr::Literal(_) | Expr::Parameter(_))) => {
-                Some((column.as_str(), pattern, false))
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            negated,
+            ..
+        } if !negated && escape.is_none() => match (&**expr, &**pattern) {
+            (Expr::Column { table, column }, pattern @ (Expr::Literal(_) | Expr::Parameter(_))) => {
+                Some(SimpleTrigramLookup {
+                    table_qualifier: table.as_deref(),
+                    column_name: column.as_str(),
+                    pattern_expr: pattern,
+                    has_additional_filter: false,
+                })
             }
             _ => None,
         },
         Expr::Binary {
             left,
-            op: BinaryOp::And | BinaryOp::Or,
+            op: BinaryOp::And,
             right,
-        } => simple_trigram_lookup(left)
-            .map(|(column, pattern, _)| (column, pattern, true))
-            .or_else(|| {
-                simple_trigram_lookup(right).map(|(column, pattern, _)| (column, pattern, true))
-            }),
+        } => {
+            if let Some(mut lookup) = simple_trigram_lookup(left) {
+                lookup.has_additional_filter = true;
+                Some(lookup)
+            } else {
+                simple_trigram_lookup(right).map(|mut lookup| {
+                    lookup.has_additional_filter = true;
+                    lookup
+                })
+            }
+        }
         _ => None,
     }
 }
@@ -31098,14 +31628,139 @@ mod tests {
         decode_runtime_payload, drop_index_include_columns_section,
         encode_legacy_table_payload_from_manifest, encode_manifest_payload,
         encode_paged_table_chunks, encode_paged_table_chunks_from_rows, encode_runtime_payload,
-        encode_table_payload, persist_paged_table, read_deferred_row_by_id_from_table_payload,
-        read_table_page_manifest_from_state, rewrite_paged_table_from_resident, ColumnBinding,
-        Dataset, DbTxnPageStore, EngineRuntime, OverflowPointer, PersistedTableState,
-        RuntimeBtreeKeys, RuntimeIndex, StoredRow, TableData, TablePageManifest,
-        TablePageManifestChunk, TableRowSource,
+        encode_table_payload, like_match, persist_paged_table,
+        read_deferred_row_by_id_from_table_payload, read_table_page_manifest_from_state,
+        rewrite_paged_table_from_resident, simple_trigram_lookup, ColumnBinding, Dataset,
+        DbTxnPageStore, EngineRuntime, OverflowPointer, PersistedTableState, RuntimeBtreeKeys,
+        RuntimeIndex, StoredRow, TableData, TablePageManifest, TablePageManifestChunk,
+        TableRowSource,
     };
 
     const PAGE_SIZE: u32 = 4096;
+
+    #[test]
+    fn like_match_fast_patterns_match_recursive_semantics() {
+        assert!(like_match("Motley Crue", "%Motley%", false, None));
+        assert!(like_match("Motley Crue", "Motley%", false, None));
+        assert!(like_match("The Motley", "%Motley", false, None));
+        assert!(like_match("Motley", "Motley", false, None));
+        assert!(!like_match("motley", "%Motley%", false, None));
+        assert!(like_match("motley", "%Motley%", true, None));
+        assert!(like_match("M_tley", "M$_tley", false, Some('$')));
+        assert!(like_match("", "", false, None));
+        assert!(!like_match("x", "", false, None));
+    }
+
+    #[test]
+    fn simple_expression_projection_fast_path_handles_wildcard_like_order_limit() {
+        let mut runtime = EngineRuntime::empty(1);
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE artists (id INT64 PRIMARY KEY, name TEXT)",
+        );
+        execute_sql(&mut runtime, "INSERT INTO artists VALUES (1, 'Motley B')");
+        execute_sql(&mut runtime, "INSERT INTO artists VALUES (2, 'Other')");
+        execute_sql(&mut runtime, "INSERT INTO artists VALUES (3, 'Motley A')");
+
+        let statement = parse_sql_statement(
+            "SELECT * FROM artists WHERE name LIKE '%Motley%' ORDER BY name LIMIT 1",
+        )
+        .expect("parse");
+        let crate::sql::ast::Statement::Query(query) = &statement else {
+            panic!("expected query");
+        };
+        let result = runtime
+            .try_execute_simple_expression_projection_query(query, &[])
+            .expect("execute")
+            .expect("wildcard LIKE query should use streaming expression projection path");
+
+        assert_eq!(result.columns(), &["id".to_string(), "name".to_string()]);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[Value::Int64(3), Value::Text("Motley A".to_string())]
+        );
+    }
+
+    #[test]
+    fn trigram_candidate_lookup_handles_like_wildcards() {
+        let mut runtime = EngineRuntime::empty(1);
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE docs (id INT64 PRIMARY KEY, body TEXT)",
+        );
+        execute_sql(&mut runtime, "INSERT INTO docs VALUES (1, 'Motley Crue')");
+        execute_sql(&mut runtime, "INSERT INTO docs VALUES (2, 'Other Motley')");
+        execute_sql(&mut runtime, "INSERT INTO docs VALUES (3, 'Unrelated')");
+        execute_sql(
+            &mut runtime,
+            "CREATE INDEX docs_body_trgm ON docs USING gin (body)",
+        );
+
+        let statement = parse_sql_statement(
+            "SELECT * FROM docs WHERE body LIKE '%Motley%' ORDER BY body LIMIT 10",
+        )
+        .expect("parse");
+        let crate::sql::ast::Statement::Query(query) = &statement else {
+            panic!("expected query");
+        };
+        let crate::sql::ast::QueryBody::Select(select) = &query.body else {
+            panic!("expected select");
+        };
+        let row_ids = runtime
+            .trigram_candidate_row_ids_for_filter(
+                "docs",
+                &None,
+                select.filter.as_ref().expect("filter"),
+                &[],
+                &BTreeMap::new(),
+            )
+            .expect("lookup")
+            .expect("trigram index should produce candidates");
+        assert_eq!(row_ids, vec![1, 2]);
+
+        let result = runtime
+            .try_execute_simple_expression_projection_query(query, &[])
+            .expect("execute")
+            .expect("wildcard LIKE query should use fast projection path");
+        assert_eq!(
+            result
+                .rows()
+                .iter()
+                .map(|row| row.values()[0].clone())
+                .collect::<Vec<_>>(),
+            vec![Value::Int64(1), Value::Int64(2)]
+        );
+    }
+
+    #[test]
+    fn simple_trigram_lookup_rejects_non_candidate_safe_filters() {
+        fn lookup_has_additional_filter(sql: &str) -> Option<bool> {
+            let statement = parse_sql_statement(sql).expect("parse");
+            let crate::sql::ast::Statement::Query(query) = &statement else {
+                panic!("expected query");
+            };
+            let crate::sql::ast::QueryBody::Select(select) = &query.body else {
+                panic!("expected select");
+            };
+            simple_trigram_lookup(select.filter.as_ref().expect("filter"))
+                .map(|lookup| lookup.has_additional_filter)
+        }
+
+        assert!(
+            lookup_has_additional_filter("SELECT * FROM docs WHERE body NOT LIKE '%Motley%'")
+                .is_none()
+        );
+        assert!(lookup_has_additional_filter(
+            "SELECT * FROM docs WHERE body LIKE '%Motley%' OR id = 1"
+        )
+        .is_none());
+        assert_eq!(
+            lookup_has_additional_filter(
+                "SELECT * FROM docs WHERE body LIKE '%Motley%' AND id > 0"
+            ),
+            Some(true)
+        );
+    }
 
     #[test]
     fn runtime_clone_preserves_btree_and_trigram_indexes() {
@@ -36005,6 +36660,9 @@ fn compare_numeric_text_values(left: &Value, right: &Value) -> Option<std::cmp::
 }
 
 fn like_match(input: &str, pattern: &str, case_insensitive: bool, escape: Option<char>) -> bool {
+    if let Some(result) = like_match_simple_pattern(input, pattern, case_insensitive, escape) {
+        return result;
+    }
     let input = if case_insensitive {
         input.to_ascii_uppercase()
     } else {
@@ -36018,6 +36676,77 @@ fn like_match(input: &str, pattern: &str, case_insensitive: bool, escape: Option
     let input = input.chars().collect::<Vec<_>>();
     let pattern = pattern.chars().collect::<Vec<_>>();
     like_match_chars(&input, &pattern, escape)
+}
+
+fn like_match_simple_pattern(
+    input: &str,
+    pattern: &str,
+    case_insensitive: bool,
+    escape: Option<char>,
+) -> Option<bool> {
+    if escape.is_some() || pattern.as_bytes().contains(&b'_') {
+        return None;
+    }
+    if !pattern.is_empty() && pattern.as_bytes().iter().all(|byte| *byte == b'%') {
+        return Some(true);
+    }
+
+    let literal = pattern.trim_matches('%');
+    if literal.as_bytes().contains(&b'%') {
+        return None;
+    }
+
+    let starts_with_wildcard = pattern.starts_with('%');
+    let ends_with_wildcard = pattern.ends_with('%');
+    Some(match (starts_with_wildcard, ends_with_wildcard) {
+        (true, true) => like_contains_literal(input, literal, case_insensitive),
+        (true, false) => like_ends_with_literal(input, literal, case_insensitive),
+        (false, true) => like_starts_with_literal(input, literal, case_insensitive),
+        (false, false) => like_equals_literal(input, literal, case_insensitive),
+    })
+}
+
+fn like_equals_literal(input: &str, literal: &str, case_insensitive: bool) -> bool {
+    if case_insensitive {
+        input.eq_ignore_ascii_case(literal)
+    } else {
+        input == literal
+    }
+}
+
+fn like_starts_with_literal(input: &str, literal: &str, case_insensitive: bool) -> bool {
+    if case_insensitive {
+        input
+            .as_bytes()
+            .get(..literal.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(literal.as_bytes()))
+    } else {
+        input.starts_with(literal)
+    }
+}
+
+fn like_ends_with_literal(input: &str, literal: &str, case_insensitive: bool) -> bool {
+    if case_insensitive {
+        input
+            .as_bytes()
+            .get(input.len().saturating_sub(literal.len())..)
+            .is_some_and(|suffix| suffix.eq_ignore_ascii_case(literal.as_bytes()))
+    } else {
+        input.ends_with(literal)
+    }
+}
+
+fn like_contains_literal(input: &str, literal: &str, case_insensitive: bool) -> bool {
+    if !case_insensitive {
+        return input.contains(literal);
+    }
+    if literal.is_empty() {
+        return true;
+    }
+    input
+        .as_bytes()
+        .windows(literal.len())
+        .any(|candidate| candidate.eq_ignore_ascii_case(literal.as_bytes()))
 }
 
 fn like_match_chars(input: &[char], pattern: &[char], escape: Option<char>) -> bool {

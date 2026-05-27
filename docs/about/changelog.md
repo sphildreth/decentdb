@@ -47,6 +47,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   while local snapshots, named snapshot retention, unreadable reader slots, or
   cross-process reader slots are active; reader-free checkpoints still copy back
   and truncate normally.
+- Improved large-table read performance for common `LIKE` predicates and
+  deferred paged row-id point lookups, including allocation-light `LIKE`
+  matching, trigram candidate pushdown for safe substring searches, bulk
+  trigram index construction, and chunk-targeted `INTEGER PRIMARY KEY` lookups
+  that avoid reconstructing a full paged table manifest.
 
 ### Fixed
 
@@ -56,6 +61,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed opening current-format databases produced by earlier v13 migration
   builds by repairing an empty coordination identity before initializing the
   coordination sidecar.
+- Fixed non-ANALYZE `EXPLAIN` so it renders from catalog metadata without
+  materializing deferred paged row sources, reports `RowIdLookup` for row-id
+  primary-key predicates, and matches index columns with normal SQL identifier
+  equality instead of case-sensitive string equality.
+- Fixed trigram `LIKE` planning to avoid unsafe index use for `NOT LIKE` and
+  escaped patterns while ignoring wildcard characters when deriving required
+  trigram tokens.
+- Fixed same-handle reader snapshots so refreshing to an older retained WAL LSN
+  reloads the runtime catalog/table metadata instead of reusing newer deferred
+  paged-table overflow pointers.
 
 ## [2.7.0] - [2026-05-22]
 

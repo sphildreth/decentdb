@@ -2890,6 +2890,21 @@ impl Db {
             )?;
         }
         let security_active = self.ensure_security_tables_loaded_at_snapshot(snapshot_lsn)?;
+        if let SqlStatement::Explain(explain) = statement {
+            if !explain.analyze {
+                let runtime = self
+                    .inner
+                    .engine
+                    .read()
+                    .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+                self.validate_prepared_against_runtime(prepared, &runtime)?;
+                let result =
+                    runtime.execute_read_statement(statement, params, self.inner.config.page_size);
+                drop(runtime);
+                drop(reader);
+                return self.finalize_row_source_autocommit_statement(statement, result);
+            }
+        }
         if !security_active {
             if let SqlStatement::Query(query) = statement {
                 let runtime = self
@@ -5648,20 +5663,6 @@ impl Db {
         }
         if snapshot_lsn == last_runtime_lsn && latest_checkpoint_epoch == last_seen_checkpoint_epoch
         {
-            return Ok(());
-        }
-
-        let writer_last_commit_lsn = self.inner.writer_last_commit_lsn.load(Ordering::Acquire);
-        if last_runtime_lsn > 0
-            && writer_last_commit_lsn > 0
-            && snapshot_lsn <= writer_last_commit_lsn
-        {
-            self.inner
-                .last_runtime_lsn
-                .store(snapshot_lsn, Ordering::Release);
-            self.inner
-                .last_seen_checkpoint_epoch
-                .store(latest_checkpoint_epoch, Ordering::Release);
             return Ok(());
         }
 
@@ -17617,6 +17618,93 @@ mod tests {
     }
 
     #[test]
+    fn refresh_engine_from_snapshot_reloads_when_reader_uses_older_lsn() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir
+            .path()
+            .join("refresh-engine-from-older-reader-snapshot.ddb");
+        let config = DbConfig {
+            defer_table_materialization: true,
+            paged_row_storage: true,
+            ..DbConfig::default()
+        };
+        let db = Db::open_or_create(&path, config).expect("open db");
+
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+            .expect("create table");
+        let older_pointer = {
+            let runtime = db.inner.engine.read().expect("engine runtime lock");
+            runtime
+                .persisted_tables
+                .get("t")
+                .expect("empty persisted table state")
+                .pointer
+        };
+        assert_eq!(
+            older_pointer.head_page_id, 0,
+            "test setup should start with an empty persisted table"
+        );
+
+        let reader = db
+            .inner
+            .wal
+            .begin_reader_with_pager(&db.inner.pager)
+            .expect("begin reader");
+        let older_snapshot_lsn = reader.snapshot_lsn();
+
+        db.execute("INSERT INTO t VALUES (1, 'newer')")
+            .expect("insert newer row");
+        let newer_snapshot_lsn = db.inner.wal.latest_snapshot();
+        assert!(
+            newer_snapshot_lsn > older_snapshot_lsn,
+            "test setup should advance the WAL while the reader holds the older snapshot"
+        );
+        assert_eq!(
+            db.inner.last_runtime_lsn.load(AtomicOrdering::Acquire),
+            newer_snapshot_lsn
+        );
+        let newer_pointer = {
+            let runtime = db.inner.engine.read().expect("engine runtime lock");
+            runtime
+                .persisted_tables
+                .get("t")
+                .expect("newer persisted table state")
+                .pointer
+        };
+        assert_ne!(
+            newer_pointer, older_pointer,
+            "test setup should persist a newer table pointer"
+        );
+        assert!(
+            newer_pointer.is_table_paged_manifest(),
+            "test should exercise deferred paged table metadata"
+        );
+
+        db.refresh_engine_from_snapshot(older_snapshot_lsn)
+            .expect("refresh from older reader snapshot");
+
+        assert_eq!(
+            db.inner.last_runtime_lsn.load(AtomicOrdering::Acquire),
+            older_snapshot_lsn
+        );
+        let runtime = db.inner.engine.read().expect("engine runtime lock");
+        let state = runtime
+            .persisted_tables
+            .get("t")
+            .expect("persisted table state");
+        assert_eq!(
+            state.pointer, older_pointer,
+            "runtime table pointer must match the snapshot LSN, not the newer writer commit"
+        );
+        assert_ne!(
+            state.pointer, newer_pointer,
+            "runtime table pointer should not reuse newer writer metadata for an older snapshot"
+        );
+        drop(runtime);
+        drop(reader);
+    }
+
+    #[test]
     fn deferred_paged_secondary_index_point_lookup_stays_indexed_and_unloaded() {
         let tempdir = TempDir::new().expect("tempdir");
         let path = tempdir
@@ -28146,6 +28234,74 @@ mod tests {
         assert!(
             json_after.contains("\"rows_in_memory_count\":0"),
             "expected zero resident rows after deferred point lookup, got: {json_after}"
+        );
+    }
+
+    #[test]
+    fn explain_row_id_lookup_reports_runtime_path_and_keeps_deferred_table_unloaded() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir.path().join("deferred-explain-row-id.ddb");
+
+        {
+            let db = Db::open_or_create(&path, DbConfig::default()).expect("create db");
+            db.execute("CREATE TABLE seeded (id INTEGER PRIMARY KEY, n INTEGER, body TEXT)")
+                .expect("create seeded");
+            let body = "x".repeat(2048);
+            let mut txn = db.transaction().expect("begin txn");
+            let insert = txn
+                .prepare("INSERT INTO seeded (id, n, body) VALUES ($1, $2, $3)")
+                .expect("prepare insert");
+            for i in 0_i64..128_i64 {
+                insert
+                    .execute_in(
+                        &mut txn,
+                        &[Value::Int64(i), Value::Int64(i), Value::Text(body.clone())],
+                    )
+                    .expect("insert");
+            }
+            txn.commit().expect("commit rows");
+            db.checkpoint().expect("checkpoint before close");
+        }
+
+        let db = Db::open_or_create(&path, DbConfig::default()).expect("reopen with defer");
+        let json_open = db.inspect_storage_state_json().expect("json open");
+        assert!(
+            json_open.contains("\"loaded_table_count\":0"),
+            "expected zero loaded tables at open, got: {json_open}"
+        );
+
+        let explain = db
+            .execute("EXPLAIN SELECT n FROM seeded WHERE Id = 17")
+            .expect("explain point lookup");
+        assert!(
+            explain
+                .explain_lines()
+                .iter()
+                .any(|line| line.contains("RowIdLookup(table=seeded, column=id")),
+            "expected RowIdLookup in explain, got: {:?}",
+            explain.explain_lines()
+        );
+        assert!(
+            explain
+                .explain_lines()
+                .iter()
+                .all(|line| !line.contains("TableScan(table=seeded)")),
+            "did not expect TableScan in explain, got: {:?}",
+            explain.explain_lines()
+        );
+
+        let json_after = db.inspect_storage_state_json().expect("json after explain");
+        assert!(
+            json_after.contains("\"loaded_table_count\":0"),
+            "expected EXPLAIN to avoid materialization, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"deferred_table_count\":1"),
+            "expected deferred table to remain deferred after EXPLAIN, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"rows_in_memory_count\":0"),
+            "expected zero resident rows after EXPLAIN, got: {json_after}"
         );
     }
 

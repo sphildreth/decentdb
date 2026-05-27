@@ -14,7 +14,10 @@ use crate::btree::write::Btree;
 use crate::error::Result;
 use crate::search::postings::{decode_postings, encode_postings};
 use crate::search::rebuild::{Freshness, RebuildState};
-use crate::search::trigram::{decide_guardrails, unique_tokens, GuardrailDecision};
+use crate::search::trigram::{
+    decide_guardrails_for_len, like_required_char_len, like_required_tokens, unique_tokens,
+    GuardrailDecision,
+};
 use crate::storage::page::InMemoryPageStore;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -38,6 +41,37 @@ pub(crate) struct TrigramIndex {
     pending: BTreeMap<u32, Vec<PendingOp>>,
     rebuild_state: RebuildState,
     postings_threshold: usize,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct TrigramIndexBuilder {
+    postings: BTreeMap<u32, Vec<u64>>,
+}
+
+impl TrigramIndexBuilder {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn insert(&mut self, row_id: u64, text: &str) {
+        for token in unique_tokens(text) {
+            self.postings.entry(token).or_default().push(row_id);
+        }
+    }
+
+    pub(crate) fn finish_into(self, index: &mut TrigramIndex) -> Result<()> {
+        index.postings_tree.clear()?;
+        index.pending.clear();
+        for (token, mut row_ids) in self.postings {
+            row_ids.sort_unstable();
+            row_ids.dedup();
+            index
+                .postings_tree
+                .insert(u64::from(token), encode_postings(&row_ids)?)?;
+        }
+        index.rebuild_state.mark_rebuilt();
+        Ok(())
+    }
 }
 
 impl TrigramIndex {
@@ -106,23 +140,11 @@ impl TrigramIndex {
         I: IntoIterator<Item = (u64, T)>,
         T: AsRef<str>,
     {
-        self.postings_tree.clear()?;
-        self.pending.clear();
-
-        let mut postings = BTreeMap::<u32, BTreeSet<u64>>::new();
+        let mut builder = TrigramIndexBuilder::new();
         for (row_id, text) in documents {
-            for token in unique_tokens(text.as_ref()) {
-                postings.entry(token).or_default().insert(row_id);
-            }
+            builder.insert(row_id, text.as_ref());
         }
-        for (token, row_ids) in postings {
-            self.postings_tree.insert(
-                u64::from(token),
-                encode_postings(&row_ids.into_iter().collect::<Vec<_>>())?,
-            )?;
-        }
-        self.rebuild_state.mark_rebuilt();
-        Ok(())
+        builder.finish_into(self)
     }
 
     pub(crate) fn checkpoint(&mut self) -> Result<()> {
@@ -166,7 +188,7 @@ impl TrigramIndex {
             return Ok(TrigramQueryResult::RebuildRequired);
         }
 
-        let tokens = unique_tokens(pattern);
+        let tokens = like_required_tokens(pattern);
         if tokens.is_empty() {
             return Ok(TrigramQueryResult::FallbackTooShort);
         }
@@ -181,8 +203,8 @@ impl TrigramIndex {
         postings.sort_by_key(|set| set.len());
         let rarest_count = postings.first().map_or(0, Vec::len);
 
-        match decide_guardrails(
-            pattern,
+        match decide_guardrails_for_len(
+            like_required_char_len(pattern),
             rarest_count,
             has_additional_filter,
             self.postings_threshold,
@@ -245,7 +267,7 @@ fn intersect_postings(postings: &[Vec<u64>]) -> Vec<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Freshness, TrigramIndex, TrigramQueryResult};
+    use super::{Freshness, TrigramIndex, TrigramIndexBuilder, TrigramQueryResult};
 
     #[test]
     fn query_support_uses_checkpointed_and_pending_deltas() {
@@ -257,6 +279,32 @@ mod tests {
 
         let result = index.query_candidates("alpha", false).expect("query");
         assert_eq!(result, TrigramQueryResult::Candidates(vec![1, 2, 3]));
+    }
+
+    #[test]
+    fn query_supports_like_wildcard_patterns() {
+        let mut index = TrigramIndex::new(1024, 100_000);
+        index.queue_insert(1, "Motley Crue");
+        index.queue_insert(2, "Other Motley");
+        index.queue_insert(3, "Unrelated");
+        index.checkpoint().expect("checkpoint");
+
+        let result = index.query_candidates("%Motley%", false).expect("query");
+        assert_eq!(result, TrigramQueryResult::Candidates(vec![1, 2]));
+    }
+
+    #[test]
+    fn bulk_builder_creates_queryable_postings() {
+        let mut builder = TrigramIndexBuilder::new();
+        builder.insert(3, "Motley Crue");
+        builder.insert(1, "Other Motley");
+        builder.insert(2, "Unrelated");
+
+        let mut index = TrigramIndex::new(1024, 100_000);
+        builder.finish_into(&mut index).expect("finish");
+
+        let result = index.query_candidates("%Motley%", false).expect("query");
+        assert_eq!(result, TrigramQueryResult::Candidates(vec![1, 3]));
     }
 
     #[test]

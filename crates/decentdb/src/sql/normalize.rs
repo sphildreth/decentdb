@@ -1755,11 +1755,13 @@ fn normalize_aexpr(expr: &protobuf::AExpr) -> Result<Expr> {
             }
         }
         protobuf::AExprKind::AexprLike | protobuf::AExprKind::AexprIlike => {
+            let operator = normalize_operator_name(&expr.name)?;
             let (pattern, escape) = normalize_like_pattern(
                 expr.rexpr
                     .as_deref()
                     .ok_or_else(|| unsupported("LIKE is missing its pattern"))?,
             )?;
+            let negated = matches!(operator.as_str(), "!~~" | "!~~*");
             Ok(Expr::Like {
                 expr: Box::new(normalize_expr_node(
                     expr.lexpr
@@ -1768,8 +1770,9 @@ fn normalize_aexpr(expr: &protobuf::AExpr) -> Result<Expr> {
                 )?),
                 pattern: Box::new(pattern),
                 escape: escape.map(Box::new),
-                case_insensitive: kind == protobuf::AExprKind::AexprIlike,
-                negated: false,
+                case_insensitive: kind == protobuf::AExprKind::AexprIlike
+                    || matches!(operator.as_str(), "~~*" | "!~~*"),
+                negated,
             })
         }
         protobuf::AExprKind::AexprBetween | protobuf::AExprKind::AexprNotBetween => {
@@ -2872,6 +2875,19 @@ mod tests {
                 }) = &s.filter
                 {
                     assert!(case_insensitive);
+                } else {
+                    panic!("expected LIKE expr");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn aexpr_not_like_marks_like_negated() {
+        if let Statement::Query(q) = norm("SELECT * FROM t WHERE name NOT LIKE 'alice'") {
+            if let QueryBody::Select(s) = q.body {
+                if let Some(Expr::Like { negated, .. }) = &s.filter {
+                    assert!(*negated);
                 } else {
                     panic!("expected LIKE expr");
                 }

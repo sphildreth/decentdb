@@ -12,6 +12,11 @@ pub(crate) enum PhysicalPlan {
         index: String,
         predicate: Expr,
     },
+    RowIdLookup {
+        table: String,
+        column: String,
+        predicate: Expr,
+    },
     TrigramSearch {
         table: String,
         index: String,
@@ -89,6 +94,14 @@ impl PhysicalPlan {
                 predicate,
             } => output.push(format!(
                 "{indent}IndexSeek(table={table}, index={index}, predicate={})",
+                predicate.to_sql()
+            )),
+            Self::RowIdLookup {
+                table,
+                column,
+                predicate,
+            } => output.push(format!(
+                "{indent}RowIdLookup(table={table}, column={column}, predicate={})",
                 predicate.to_sql()
             )),
             Self::TrigramSearch {
