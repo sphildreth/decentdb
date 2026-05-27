@@ -40,11 +40,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   export/import diagnostics, browser sync apply-before-ack helpers, framework
   recipes, a checked-in SQL parity corpus, and expanded browser benchmark
   guardrails.
+- Added Flutter mobile production-runtime hardening with a new
+  `decentdb_flutter` package shell, Android/iOS native artifact build scripts,
+  unsigned mobile GitHub Actions artifact workflow, app-private path and
+  database-set helpers, mobile key-provider wiring, redacted open-option
+  diagnostics, a reference Flutter app, and mobile package tests.
+- Added Dart sync JSON/public changeset wrappers, including status/init,
+  changeset create/inspect/apply/invert, and `applyBeforeAck` ordering for
+  relay clients.
 
 ### Changed
 
 - Bumped the C ABI version to 6 for the new audit-context entry points and TDE
   open options, and updated the Dart ABI expectation/header copies.
+- Extended the Rust library crate outputs with `staticlib` for iOS XCFramework
+  packaging and added Dart default native loading for Android and iOS package
+  layouts.
 - Bumped the database format version to 12 for full-text index metadata and
   added `decentdb-migrate` support for format-11 databases.
 - Bumped the database format version to 13 to add a non-secret database identity
@@ -62,6 +73,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Promoted the browser Future Win from roadmap item to delivered context in
   `design/FUTURE_WINS.md`; follow-on browser work is now scoped to measured
   parser breadth, security key handling, branch workflows, or performance.
+- Promoted the mobile Future Win from roadmap item to delivered context in
+  `design/FUTURE_WINS.md`; follow-on mobile work is now scoped to measured
+  device matrices, direct native SDKs, watch lifecycle guarantees, and key
+  rotation rather than first-class Flutter package hardening.
 
 ### Fixed
 

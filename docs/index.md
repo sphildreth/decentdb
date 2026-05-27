@@ -20,6 +20,7 @@ queries, syncable offline data, and language bindings that feel native.
 | Reactive subscriptions | In-process table, range, query, and change-stream watches deliver committed invalidation events with LSN boundaries, bounded lag handling, and Rust/C/Python/Go entry points. |
 | Built-in HTTP and web console | `decentdb serve` exposes a local HTTP API and embedded browser console for inspection, SQL execution, EXPLAIN, schema browsing, CSV export, and scripting. |
 | Browser WASM and OPFS | `@decentdb/web` runs DecentDB in a Dedicated Worker with OPFS persistence, an async TypeScript API, binary result transport, and browser smoke/benchmark coverage. |
+| Flutter mobile runtime | `decentdb_flutter` packages Android/iOS native artifacts, app-private path helpers, key-provider wiring, redacted diagnostics, and mobile lifecycle/sync recipes around the Dart FFI API. |
 | Branch, diff, restore, and time travel | Durable named snapshots, branch-local writes, diff reports, guarded restore, and constrained merge workflows for migration rehearsal and support/debugging. |
 | Local data security | TDE for local files, durable row policies, column masks, audit context functions, and queryable security audit events. |
 | Practical PostgreSQL-like SQL | Familiar DDL/DML, joins, CTEs, window functions, set operations, upsert, `RETURNING`, savepoints, triggers, generated columns, JSON functions, and rich scalar functions. |
@@ -127,6 +128,7 @@ decentdb sync pending --db ./app.ddb --since 0 --limit 10 --format table
 - Local-first applications: [Local-first sync](user-guide/sync/index.md)
 - Security-sensitive apps: [Local Data Security](user-guide/security.md)
 - Browser applications: [WASM / Browser](api/wasm.md)
+- Flutter mobile applications: [Dart/Flutter](api/dart.md#flutter-mobile-package)
 - Extensibility: [Lua Extensions](user-guide/lua-extensions.md)
 - Operational workflows: [Doctor](user-guide/doctor.md),
   [Performance Tuning](user-guide/performance.md), and

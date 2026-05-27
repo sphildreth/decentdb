@@ -1,7 +1,7 @@
 # Mobile Production Runtime And SDK Hardening
 
 **Date:** 2026-05-27
-**Status:** Draft
+**Status:** Implemented
 **Future Version:** vNext
 **Roadmap:** [`FUTURE_WINS.md`](FUTURE_WINS.md)
 **Document Type:** Implementation SPEC
@@ -43,13 +43,16 @@ maintainers, documentation authors, benchmark maintainers, coding agents
   meaning, or making DecentDB own platform key storage, prompts, rotation,
   unwrapping, escrow, or recovery.
 
-**Implementation status, 2026-05-27:** Not started. The existing Dart package is
-desktop/CLI oriented, wraps the stable C ABI, and already exposes the core
-database primitives mobile needs: create/open/open-existing, native prepared
-statements, paging, transactions, checkpoint/save-as, branch workflows, write
-queue options, and process-coordination options. Mobile production work should
-package and validate those primitives under explicit iOS/Android lifecycle,
-storage, key, and sync rules.
+**Implementation status, 2026-05-27:** Implemented as the first Flutter mobile
+production-runtime baseline. The delivered work adds the separate
+`decentdb_flutter` package shell, Android/iOS artifact build and install
+scripts, a dedicated mobile artifact workflow, Android/iOS default Dart native
+loading, typed native load/ABI mismatch errors, redacted open-option helpers,
+mobile key-provider/path/database-set helpers, `AsyncDatabase` option and
+owning-isolate hardening, Dart public changeset wrappers with
+`applyBeforeAck`, a reference Flutter app, package tests, documentation, and
+changelog updates. The support matrix remains Tier 2/Candidate until real-device
+release-blocking lanes are added; no Tier 1 mobile claim is made by this spec.
 
 ---
 
@@ -139,27 +142,17 @@ Delivered foundations to reuse:
   lifecycle/restart conditions.
 - Cross-process WAL coordination on native OS platforms.
 
-Current gaps:
+Remaining promotion gaps:
 
-- The Dart docs and release artifacts are desktop-focused.
-- `NativeBindings.defaultLibraryName()` does not define Android or iOS loading
-  behavior.
-- There is no Flutter mobile plugin/package that bundles Android/iOS native
-  DecentDB artifacts.
-- There is no mobile policy for sharing one native handle across Dart isolates
-  or for selecting the async facade as the mobile default.
-- There is no mobile app template showing app-private paths, TDE key retrieval,
-  lifecycle handling, checkpointing, and relay sync.
-- Dart sync/relay wrappers over public changesets, shape subscription, durable
-  ack, and conflict inspection are not yet ergonomic enough for the target
-  mobile examples.
-- Dart/mobile reactive watch wrappers and lifecycle semantics are not yet
-  specified for backgrounding, worker-isolate shutdown, or process restart.
-- There is no iOS/Android support matrix or simulator/device CI lane.
-- There are no mobile-specific tests for app background/foreground, process
-  death, encrypted reopen, WAL recovery, upgrade, or sync apply-before-ack.
-- Mobile package size, cold open, first query, and memory behavior are not
-  tracked in release guardrails.
+- Real-device Android and iOS lanes are still required before promoting either
+  platform from Tier 2/Candidate to Tier 1.
+- Dart/mobile reactive watch wrappers remain deferred until backgrounding,
+  worker-isolate shutdown, close, and process-restart semantics are tested and
+  documented.
+- Direct Swift, Kotlin, React Native, app-extension, widget, and multiprocess
+  shared-database profiles remain follow-on candidates.
+- Runtime mobile benchmark latency baselines are advisory until a device or
+  simulator benchmark lane writes accepted thresholds.
 
 ## 5. Definition Of Done
 
@@ -323,18 +316,17 @@ Recommended defaults:
 The SDK should make the safe default easy:
 
 ```dart
-final db = await DecentDbMobile.openDatabase('app.ddb');
+final db = await DecentDbMobile.openAppDatabase('app.ddb');
 ```
 
-The exact helper names are placeholders. The important contract is that users
-should not guess live database paths or native library paths in the normal
-Flutter-plugin path.
+The important contract is that users should not guess live database paths or
+native library paths in the normal Flutter-plugin path.
 
 The explicit `libraryPath` fallback is only for custom/non-plugin loading:
 
 ```dart
-final path = await DecentDbMobilePaths.appDatabasePath('app.ddb');
-final libraryPath = await DecentDbMobile.resolveLibraryPathForCustomLoader();
+final path = await DecentDbMobile.appDatabasePath('app.ddb');
+final libraryPath = '/custom/path/to/libdecentdb.so';
 final db = Database.open(path, libraryPath: libraryPath);
 ```
 
@@ -504,7 +496,7 @@ Accepted target helper shape:
 
 ```dart
 abstract interface class DecentDbKeyProvider {
-  Future<Uint8List> loadOrCreateKey(String databaseId);
+  Future<Uint8List> loadDatabaseKey();
 }
 ```
 

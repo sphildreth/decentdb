@@ -26,9 +26,20 @@ sealed class _Req {
 }
 
 class _OpenReq extends _Req {
-  const _OpenReq(super.id, this.path, this.libraryPath, this.cap);
+  const _OpenReq(
+    super.id,
+    this.path,
+    this.libraryPath,
+    this.options,
+    this.processCoordination,
+    this.processCoordinationTimeoutMs,
+    this.cap,
+  );
   final String path;
   final String? libraryPath;
+  final String? options;
+  final ProcessCoordinationMode? processCoordination;
+  final int? processCoordinationTimeoutMs;
   final int cap;
 }
 
@@ -102,15 +113,25 @@ void _workerEntry(List<dynamic> args) {
     try {
       switch (msg) {
         case _OpenReq(
-          id: final id,
-          path: final p,
-          libraryPath: final lp,
-          cap: final _,
-        ):
+            id: final id,
+            path: final p,
+            libraryPath: final lp,
+            options: final options,
+            processCoordination: final processCoordination,
+            processCoordinationTimeoutMs: final processCoordinationTimeoutMs,
+            cap: final cap,
+          ):
           // Disable the Database-level stmt cache in the worker.  Each
           // AsyncStatement gets its own native handle via nextStmtId; caching
           // at the Database layer would alias handles for the same SQL.
-          db = Database.open(p, libraryPath: lp, stmtCacheCapacity: 0);
+          db = Database.open(
+            p,
+            options: options,
+            processCoordination: processCoordination,
+            processCoordinationTimeoutMs: processCoordinationTimeoutMs,
+            libraryPath: lp,
+            stmtCacheCapacity: cap,
+          );
           responseSend.send([id, true, null]);
 
         case _ExecuteReq(id: final id, sql: final sql, params: final params):
@@ -127,10 +148,10 @@ void _workerEntry(List<dynamic> args) {
           responseSend.send([id, true, sid]);
 
         case _StmtBindAllReq(
-          id: final id,
-          stmtId: final sid,
-          params: final params
-        ):
+            id: final id,
+            stmtId: final sid,
+            params: final params
+          ):
           stmts[sid]!.bindAll(params);
           responseSend.send([id, true, null]);
 
@@ -176,6 +197,11 @@ void _workerEntry(List<dynamic> args) {
 /// An [AsyncDatabase] wraps a synchronous [Database] in a dedicated worker
 /// [Isolate], keeping all FFI calls off the caller's event loop.
 ///
+/// The worker isolate is the owning isolate for the native database handle.
+/// Mobile foreground/background and close policies apply to that worker:
+/// pending requests settle with [AsyncDatabaseClosed] if the worker is
+/// terminated before responding.
+///
 /// Obtain via [AsyncDatabase.open].  Must be closed with [close] when done.
 ///
 /// Example:
@@ -214,6 +240,9 @@ final class AsyncDatabase {
   /// in that isolate and do not block the caller's event loop.
   static Future<AsyncDatabase> open(
     String path, {
+    String? options,
+    ProcessCoordinationMode? processCoordination,
+    int? processCoordinationTimeoutMs,
     String? libraryPath,
   }) async {
     final responsePort = ReceivePort();
@@ -263,7 +292,15 @@ final class AsyncDatabase {
     });
 
     // Send the open request.
-    await db._send(_OpenReq(db._nextId++, path, libraryPath, 0));
+    await db._send(_OpenReq(
+      db._nextId++,
+      path,
+      libraryPath,
+      options,
+      processCoordination,
+      processCoordinationTimeoutMs,
+      0,
+    ));
 
     return db;
   }
@@ -354,15 +391,13 @@ final class AsyncStatement {
 
   /// Execute a DML statement; returns the number of affected rows.
   Future<int> execute() async {
-    final result =
-        await _db._send(_StmtExecuteReq(_db._nextId++, _stmtId));
+    final result = await _db._send(_StmtExecuteReq(_db._nextId++, _stmtId));
     return result as int;
   }
 
   /// Execute a SELECT statement and return all result rows.
   Future<List<Row>> query() async {
-    final result =
-        await _db._send(_StmtQueryReq(_db._nextId++, _stmtId));
+    final result = await _db._send(_StmtQueryReq(_db._nextId++, _stmtId));
     return (result as List).cast<Row>();
   }
 

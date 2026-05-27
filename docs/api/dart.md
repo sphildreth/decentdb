@@ -3,6 +3,8 @@
 DecentDB ships two Dart-facing layers:
 
 - `bindings/dart/dart/` — the packaged `decentdb` Dart API
+- `bindings/dart/flutter/` — the `decentdb_flutter` mobile package for
+  Flutter apps on Android and iOS
 - `tests/bindings/dart/` — the smoke-validation package used in CI and repository validation
 
 ## Native library requirement
@@ -30,6 +32,110 @@ platform-native archives that contain just the FFI library:
 Each archive extracts to the platform-native library file
 (`libdecentdb.so`, `libdecentdb.dylib`, or `decentdb.dll`) so desktop apps can
 bundle it directly.
+
+## Flutter Mobile Package
+
+`decentdb_flutter` is the first-class mobile package. It keeps the SQL/database
+API in the pure Dart `decentdb` package and adds mobile packaging, path,
+key-provider, sidecar, lifecycle, and diagnostics helpers.
+
+Initial mobile support tiers:
+
+| Platform | Target | Tier |
+|---|---|---|
+| Android Flutter app-private storage | API 26+, `arm64-v8a` device, `x86_64` emulator | Tier 2 until a documented real-device lane exists |
+| iOS Flutter app-private Application Support storage | iOS 15+, arm64 device, x86_64 simulator | Tier 2 until a documented real-device lane exists |
+| Android widgets/services/providers sharing one DB | Multiprocess mobile access | Candidate/unsupported until separately tested |
+| iOS app extensions sharing one DB | App group storage | Candidate/unsupported until separately tested |
+
+The mobile package uses default native loading in the happy path:
+
+- Android: `DynamicLibrary.open('libdecentdb.so')` from the standard
+  Flutter/Gradle native library layout.
+- iOS: `DynamicLibrary.process()` for the static/XCFramework link model.
+
+Android/iOS candidate artifacts are built by:
+
+```bash
+bindings/dart/scripts/build_mobile_android.sh --strict
+bindings/dart/scripts/build_mobile_ios.sh --strict
+bindings/dart/scripts/check_mobile_artifacts.sh --platform android --artifact-root target/mobile-artifacts/android --strict
+bindings/dart/scripts/check_mobile_artifacts.sh --platform ios --artifact-root target/mobile-artifacts/ios --strict
+```
+
+Install built artifacts into the mobile package layout with:
+
+```bash
+bindings/dart/scripts/install_mobile_artifacts.sh
+```
+
+The dedicated `Mobile Native Artifacts` GitHub Actions workflow builds unsigned
+candidate Android and iOS artifacts on tag pushes and manual dispatch.
+Use `bindings/dart/scripts/mobile_benchmark_guardrails.sh` to record artifact
+size guardrails and the placeholder runtime metrics that device/simulator
+benchmark lanes fill in once accepted baselines exist.
+
+### Mobile Quick Start
+
+```dart
+import 'package:decentdb_flutter/decentdb_flutter.dart';
+
+final db = await DecentDbMobile.openAppDatabase('app.ddb');
+try {
+  db.execute('CREATE TABLE IF NOT EXISTS items (id INT64 PRIMARY KEY, name TEXT)');
+} finally {
+  db.close();
+}
+```
+
+The v1 mobile database-set helper returns the files that app backup, restore,
+export, and delete workflows must treat together:
+
+```dart
+final path = await DecentDbMobile.appDatabasePath('app.ddb');
+final files = DecentDbMobile.databaseSetPaths(path);
+```
+
+That set is `app.ddb`, `app.ddb.wal`, `app.ddb.sync-journal`, and
+`app.ddb.coord` when process coordination is enabled. Future authoritative
+sidecars require a spec or ADR update before mobile backup/restore obligations
+change.
+
+`DecentDbMobile.noBackupDatabasePath(name)` returns an app-private device-local
+subdirectory path for replicas or caches that should not be restored. The host
+app is still responsible for any platform-specific backup-exclusion flag.
+
+### Mobile Lifecycle
+
+Mobile apps should use one owning isolate per native database handle. The
+recommended async pattern is `AsyncDatabase`; its worker isolate owns the
+native handle and all pending futures fail with `AsyncDatabaseClosed` if the
+worker closes or terminates before replying.
+
+On background/inactive transitions, stop admitting new app writes, finish or
+cancel in-flight work, optionally checkpoint, and close when no OS-approved
+background task is active. After process kill or isolate restart, old
+`Database`, `AsyncDatabase`, `Statement`, and `AsyncStatement` objects are
+invalid; reopen the database and recreate statements.
+
+Reactive watch/change-stream wrappers are not exposed by the Flutter mobile
+package yet. The native C ABI has watch foundations, but mobile background,
+close, and restart semantics need dedicated lifecycle tests before the package
+claims a stable reactive mobile API.
+
+### Mobile Diagnostics
+
+Use redacted summaries for logging and support bundles:
+
+```dart
+final summary = DecentDbMobile.openOptionsSummary(
+  'encryption_key_hex=001122;process_coordination=required',
+);
+```
+
+`DecentDbAbiMismatchException` reports the expected ABI, loaded ABI, artifact
+source when known, and recovery guidance. Align the `decentdb`,
+`decentdb_flutter`, and native artifact versions when this error appears.
 
 ## Quick start
 

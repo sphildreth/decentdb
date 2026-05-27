@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:decentdb/decentdb.dart';
 import 'package:test/test.dart';
@@ -63,8 +64,7 @@ void main() {
     final timer =
         Timer.periodic(const Duration(milliseconds: 1), (_) => timerFires++);
 
-    final sel =
-        await db.prepare('SELECT id FROM t WHERE v LIKE \'x%\'');
+    final sel = await db.prepare('SELECT id FROM t WHERE v LIKE \'x%\'');
     final rows = await sel.query();
     await sel.dispose();
     timer.cancel();
@@ -82,6 +82,34 @@ void main() {
     await expectLater(db.close(), completes);
     // Second close is a no-op.
     await expectLater(db.close(), completes);
+  });
+
+  test('forwards native open options into the worker isolate', () async {
+    await expectLater(
+      AsyncDatabase.open(':memory:',
+          libraryPath: libPath, options: 'cache_mb=8'),
+      throwsA(isA<DecentDbException>()),
+    );
+  });
+
+  test('forwards process coordination options into the worker isolate',
+      () async {
+    final tempDir =
+        Directory.systemTemp.createTempSync('decentdb_async_coord_');
+    final dbPath = '${tempDir.path}/coord.ddb';
+    try {
+      final db = await AsyncDatabase.open(
+        dbPath,
+        libraryPath: libPath,
+        processCoordination: ProcessCoordinationMode.required,
+        processCoordinationTimeoutMs: 250,
+      );
+      await db.execute('CREATE TABLE t (id INT64 PRIMARY KEY)');
+      await db.close();
+      expect(File('$dbPath.coord').existsSync(), isTrue);
+    } finally {
+      tempDir.deleteSync(recursive: true);
+    }
   });
 
   test('operations after close throw AsyncDatabaseClosed', () async {

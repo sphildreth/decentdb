@@ -52,7 +52,7 @@ tempfile = "3.10"
 rand = "0.8"
 
 [lib]
-crate-type = ["rlib", "cdylib"]
+crate-type = ["rlib", "cdylib", "staticlib"]
 
 [[bench]]
 name = "release_metrics"

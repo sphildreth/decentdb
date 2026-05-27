@@ -45,6 +45,39 @@ platform key storage, online key rotation, or a new authenticated page/chunk
 format. Applications should keep keys in an operating-system key store, browser
 key store, secure enclave, KMS, or equivalent secret-management system.
 
+### Mobile Key Storage
+
+Flutter mobile apps should keep database keys in app-owned secure storage and
+pass key bytes only during open/create. `decentdb_flutter` exposes a
+`DecentDbKeyProvider` interface so applications can wrap iOS Keychain,
+Android Keystore-backed storage, or another approved secret store without
+making the DecentDB engine own prompts, biometrics, recovery, or rotation.
+
+```dart
+final db = await DecentDbMobile.openAppDatabase(
+  'app.ddb',
+  keyProvider: MyKeychainOrKeystoreProvider(),
+);
+```
+
+Never log raw open options. Redact `encryption_key`, `encryption_key_hex`,
+`tde_key`, and `tde_key_hex` before diagnostics or support bundles:
+
+```dart
+final safe = DecentDbMobile.openOptionsSummary(rawOptions);
+```
+
+Dart key clearing is best-effort. A returned `Uint8List` can be overwritten
+after open, and the Dart binding zeroes the FFI UTF-8 options allocation before
+freeing it, but Dart heap copies, garbage collection, and native conversion
+buffers may still leave transient copies outside deterministic control. Treat
+raw option strings and key byte buffers as short-lived sensitive values.
+
+If a mobile key is lost, deleted, biometric-locked, or not restored with the app
+data, the encrypted database cannot be opened. Keep sync credentials, relay
+tokens, and database encryption keys separate so key-loss and credential-rotation
+procedures do not depend on one another.
+
 ## Audit Context
 
 Audit context is connection-local metadata supplied by the host application.

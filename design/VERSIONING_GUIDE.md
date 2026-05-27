@@ -62,6 +62,11 @@ exists in the Rust repository today.
 
 - `bindings/dart/dart/pubspec.yaml`  
   Update `version`.
+- `bindings/dart/flutter/pubspec.yaml`  
+  Update `version` when the Flutter mobile package is released from this
+  repository. If it uses a local path dependency on `decentdb` during
+  development, release packaging must swap or validate that dependency before
+  publishing.
 
 ### Node bindings
 
@@ -155,6 +160,7 @@ rg 'OLD_VERSION|vOLD_VERSION' \
   bindings/java/dbeaver-extension/build.gradle \
   bindings/java/dbeaver-extension/META-INF/MANIFEST.MF \
   bindings/dart/dart/pubspec.yaml \
+  bindings/dart/flutter/pubspec.yaml \
   bindings/node/decentdb/package.json \
   bindings/node/decentdb/package-lock.json \
   bindings/node/knex-decentdb/package.json \

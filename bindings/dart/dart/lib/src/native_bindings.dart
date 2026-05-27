@@ -3,6 +3,8 @@ import 'dart:io' show Platform;
 
 import 'package:ffi/ffi.dart';
 
+import 'errors.dart';
+
 const int expectedAbiVersion = 6;
 const int ddbOk = 0;
 const int ddbWriteQueueTimeoutDefault = 0xFFFFFFFFFFFFFFFF;
@@ -920,6 +922,21 @@ class NativeBindings {
         dbBranchExecuteJson =
             _lib.lookupFunction<_DbJsonRequestC, _DbJsonRequestDart>(
                 'ddb_db_branch_execute_json'),
+        dbSyncExecuteJson =
+            _lib.lookupFunction<_DbJsonRequestC, _DbJsonRequestDart>(
+                'ddb_db_sync_execute_json'),
+        syncChangesetCreateJson =
+            _lib.lookupFunction<_DbJsonRequestC, _DbJsonRequestDart>(
+                'ddb_sync_changeset_create_json'),
+        syncChangesetApplyJson =
+            _lib.lookupFunction<_DbJsonRequestC, _DbJsonRequestDart>(
+                'ddb_sync_changeset_apply_json'),
+        syncChangesetInspectJson =
+            _lib.lookupFunction<_DbJsonRequestC, _DbJsonRequestDart>(
+                'ddb_sync_changeset_inspect_json'),
+        syncChangesetInvertJson =
+            _lib.lookupFunction<_DbJsonRequestC, _DbJsonRequestDart>(
+                'ddb_sync_changeset_invert_json'),
         dbGetToolingMetadataJson =
             _lib.lookupFunction<_DbStringOutC, _DbStringOutDart>(
                 'ddb_db_get_tooling_metadata_json'),
@@ -1068,6 +1085,13 @@ class NativeBindings {
   final _DbInspectStorageStateDart dbInspectStorageStateJson;
   final _EvictSharedWalDart evictSharedWal;
 
+  // Sync
+  final _DbJsonRequestDart dbSyncExecuteJson;
+  final _DbJsonRequestDart syncChangesetCreateJson;
+  final _DbJsonRequestDart syncChangesetApplyJson;
+  final _DbJsonRequestDart syncChangesetInspectJson;
+  final _DbJsonRequestDart syncChangesetInvertJson;
+
   // ddb_db_execute result accessors
   final _ResultFreeDart resultFree;
   final _ResultRowCountDart resultRowCount;
@@ -1111,18 +1135,56 @@ class NativeBindings {
 
   static NativeBindings load(String path) {
     return _cache.putIfAbsent(path, () {
-      final bindings = NativeBindings._(DynamicLibrary.open(path));
-      final abi = bindings.abiVersion();
-      if (abi != expectedAbiVersion) {
-        throw StateError(
-          'DecentDB ABI version mismatch: expected $expectedAbiVersion, got $abi.',
+      final DynamicLibrary lib;
+      try {
+        lib = DynamicLibrary.open(path);
+      } catch (error) {
+        throw DecentDbNativeLoadException(
+          'Failed to load DecentDB native library: $error',
+          artifact: path,
         );
       }
-      return bindings;
+      return _fromLibrary(lib, artifact: path);
     });
   }
 
+  static NativeBindings loadDefault() {
+    if (Platform.isIOS) {
+      return loadProcess();
+    }
+    return load(defaultLibraryName());
+  }
+
+  static NativeBindings loadProcess() {
+    return _cache.putIfAbsent('@process', () {
+      final DynamicLibrary lib;
+      try {
+        lib = DynamicLibrary.process();
+      } catch (error) {
+        throw DecentDbNativeLoadException(
+          'Failed to resolve DecentDB symbols from the current process: $error',
+          artifact: '@process',
+        );
+      }
+      return _fromLibrary(lib, artifact: '@process');
+    });
+  }
+
+  static NativeBindings _fromLibrary(DynamicLibrary lib, {String? artifact}) {
+    final bindings = NativeBindings._(lib);
+    final abi = bindings.abiVersion();
+    if (abi != expectedAbiVersion) {
+      throw DecentDbAbiMismatchException(
+        expectedAbiVersion: expectedAbiVersion,
+        loadedAbiVersion: abi,
+        artifact: artifact,
+      );
+    }
+    return bindings;
+  }
+
   static String defaultLibraryName() {
+    if (Platform.isAndroid) return 'libdecentdb.so';
     if (Platform.isLinux) return 'libdecentdb.so';
     if (Platform.isMacOS) return 'libdecentdb.dylib';
     if (Platform.isWindows) return 'decentdb.dll';
