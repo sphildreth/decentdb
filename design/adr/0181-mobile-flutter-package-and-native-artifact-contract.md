@@ -27,6 +27,9 @@ Initial Android support targets:
 - `x86_64` for emulator CI;
 - no `armeabi-v7a` support unless measured demand justifies the additional
   binary and validation matrix.
+- Dart loading through the packaged native library name, normally
+  `DynamicLibrary.open('libdecentdb.so')`, when the library is under the
+  standard Flutter/Gradle native library layout.
 
 Initial iOS support targets:
 
@@ -35,6 +38,11 @@ Initial iOS support targets:
 - static-library-compatible Rust artifacts as the preferred link input;
 - Flutter-compatible loading/registration that does not require applications to
   manually pass a `libraryPath` for the packaged happy path.
+- `DynamicLibrary.process()` or generated plugin registration for the accepted
+  static/XCFramework link model. If a dynamic framework path is chosen,
+  `DynamicLibrary.open()` must be explicitly validated.
+- simulator and device builds must both validate the chosen Dart FFI loading
+  mechanism, and any difference must be documented in the package README.
 
 Mobile release artifacts begin in a separate mobile workflow, triggered manually
 and on tags. That workflow may later merge into the main release workflow after
@@ -54,9 +62,10 @@ typed Dart exception or stable mobile error wrapper that includes expected ABI,
 loaded ABI, artifact path or package source when known, and recovery guidance to
 align the `decentdb`, `decentdb_flutter`, and packaged native artifact versions.
 
-Adding `armeabi-v7a` requires a concrete promotion reason, such as a partner
-requirement or measured install-base need, plus release-blocking artifact-size,
-emulator/device, ABI-version, and smoke coverage for that ABI.
+Adding `armeabi-v7a` requires a spec update or ADR, a concrete promotion reason
+such as a partner requirement or measured install-base need, plus
+release-blocking artifact-size, emulator/device, ABI-version, and smoke
+coverage for that ABI.
 
 ### Rationale
 

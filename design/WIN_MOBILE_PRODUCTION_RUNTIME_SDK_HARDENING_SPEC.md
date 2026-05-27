@@ -127,10 +127,16 @@ Delivered foundations to reuse:
   workflow APIs, schema/tooling metadata, and typed value mappings.
 - Dart async facade in `async_database.dart` for isolate-backed execution.
 - Dart open options for process coordination and write queue parameters.
+- C ABI open options for TDE key material, including `encryption_key`,
+  `encryption_key_hex`, `tde_key`, and `tde_key_hex`. This option-string key
+  transport is an accepted ADR 0174 trade-off, not a mobile-specific invention.
 - TDE v1 through Rust config and C ABI open options, including encryption of the
   database, WAL, and sync journal.
 - Production relay and public changeset APIs.
 - Browser apply-before-ack helper, which is a useful pattern for mobile sync.
+- C ABI reactive watch and change-stream entry points, which are useful
+  foundations for mobile reactive UI but are not yet validated under mobile
+  lifecycle/restart conditions.
 - Cross-process WAL coordination on native OS platforms.
 
 Current gaps:
@@ -144,6 +150,11 @@ Current gaps:
   or for selecting the async facade as the mobile default.
 - There is no mobile app template showing app-private paths, TDE key retrieval,
   lifecycle handling, checkpointing, and relay sync.
+- Dart sync/relay wrappers over public changesets, shape subscription, durable
+  ack, and conflict inspection are not yet ergonomic enough for the target
+  mobile examples.
+- Dart/mobile reactive watch wrappers and lifecycle semantics are not yet
+  specified for backgrounding, worker-isolate shutdown, or process restart.
 - There is no iOS/Android support matrix or simulator/device CI lane.
 - There are no mobile-specific tests for app background/foreground, process
   death, encrypted reopen, WAL recovery, upgrade, or sync apply-before-ack.
@@ -180,6 +191,9 @@ This win is complete only when all of these are true:
 - The reference Flutter app is either the integration-test host or is exercised
   by the same integration scenarios, so documented examples cannot drift from
   release validation.
+- Uninstalling or resetting DecentDB data from a mobile app is documented,
+  including cleanup of the full v1 database set and any app-owned key/identity
+  consequences.
 - Docs and `docs/about/changelog.md` are updated when implementation lands.
 
 ## 6. Support Tiers
@@ -205,9 +219,10 @@ Candidate initial matrix:
 | React Native, Swift, Kotlin direct SDKs | TBD | Candidate | Should follow Flutter proof unless product demand justifies parallel work. |
 | Cloud-synced directories, external SD/shared storage, user-visible Documents by default | N/A | Unsupported | App may export copies intentionally, but production DB files should remain app-private. |
 
-Adding `armeabi-v7a` requires a concrete promotion reason, such as a partner
-requirement or measured install-base need, plus release-blocking artifact-size,
-emulator/device, ABI-version, and smoke coverage for that ABI.
+Adding `armeabi-v7a` requires a spec update or ADR, a concrete promotion reason
+such as a partner requirement or measured install-base need, plus
+release-blocking artifact-size, emulator/device, ABI-version, and smoke
+coverage for that ABI.
 
 ## 7. Package And SDK Architecture
 
@@ -240,6 +255,9 @@ Android package requirements:
   met.
 - Package libraries under the Flutter/Gradle-native layout so apps do not set
   `libraryPath` manually.
+- Android Dart loading should use the packaged native library name, normally
+  `DynamicLibrary.open('libdecentdb.so')`, when the `.so` is under the standard
+  Flutter/Gradle native library layout.
 - Verify symbol exports, ABI version, and C ABI layout on each architecture.
 - Document minimum Android API/NDK level and how release artifacts are produced.
 
@@ -250,8 +268,12 @@ iOS package requirements:
 - Use static-library-compatible Rust artifacts as the preferred XCFramework
   input. Add `staticlib` to the Rust crate build outputs if implementation
   proves it is needed for the accepted iOS link model.
-- Ensure Dart FFI loading works for the chosen link model, including
-  `DynamicLibrary.process()` or generated plugin registration when appropriate.
+- For the static/XCFramework link model, iOS Dart loading should prefer
+  `DynamicLibrary.process()` or generated plugin registration. If a dynamic
+  framework path is chosen, validate `DynamicLibrary.open()` explicitly.
+- Validate whether the Dart FFI loading mechanism is consistent between iOS
+  simulator and device builds for the chosen link model; document any
+  simulator/device difference in the package README.
 - Verify bitcode/symbol/signing expectations for current Xcode/Flutter stable.
 - Document minimum iOS version and whether simulator/device support differs.
 
@@ -335,6 +357,13 @@ to this spec. Move, delete, export, or restore workflows must not silently copy
 only the main file unless the API explicitly creates a consistent backup/export
 artifact.
 
+The database-set contract is governed by the DecentDB database format version
+and the mobile package version. Mobile backup/restore must preserve every file
+in the v1 set that is present at the time of backup. The v1 mobile package does
+not bundle `decentdb-migrate`; mobile apps should only claim in-app file-format
+upgrade support when the Rust engine supports that upgrade on open or a
+mobile-safe migration workflow is explicitly added and tested.
+
 ### 8.3 OS Backup And Cloud Sync
 
 Default live database placement should not imply cloud-sync safety.
@@ -377,6 +406,12 @@ isolates. The recommended mobile pattern is one owning isolate per database
 handle, with app/UI code calling through an async facade or command queue. The
 existing `async_database.dart` facade should be evaluated as the default mobile
 pattern and extended only where mobile lifecycle or sync ergonomics require it.
+
+For `AsyncDatabase`, the worker isolate is the owning isolate. Foreground,
+background, close, checkpoint, and cancellation policies apply to that worker,
+not merely to the UI isolate that holds futures. When the worker is closed or
+terminated, pending futures must settle with a typed closed/canceled error, and
+callers must reopen the database before issuing more work.
 
 If an app opens separate handles from multiple isolates or processes, it must
 use the documented process-coordination profile and accept the single-writer
@@ -440,7 +475,9 @@ Docs and examples must cover:
 - generating high-entropy database keys;
 - storing/wrapping keys in iOS Keychain and Android Keystore;
 - passing key bytes to DecentDB only for open/create;
-- redacting options and logs that contain key material;
+- redacting options and logs that contain key material, including
+  `encryption_key`, `encryption_key_hex`, `tde_key`, and `tde_key_hex` in raw C
+  ABI open-option strings;
 - handling wrong-key, missing-key, biometric-lockout, device-restore, and
   reinstall scenarios;
 - clearing temporary Dart/native key buffers as far as the platform permits;
@@ -453,6 +490,13 @@ should minimize copies, prefer short-lived buffers, document the limitation, and
 use FFI allocation/free or platform secure-storage APIs where that materially
 reduces exposure. The spec must not imply C-style guaranteed zeroization for all
 Dart-managed key bytes.
+
+The FFI native allocation used to pass an options string can also contain key
+material. `package:ffi` allocation/free does not guarantee zeroization of the
+native copy after use. Mobile code should treat raw option strings containing
+keys as sensitive, minimize their lifetime, avoid diagnostics/logging of raw
+options, and prefer redacted structured summaries everywhere outside the
+immediate open/create call.
 
 ### 10.2 API Shape
 
@@ -524,9 +568,17 @@ Required Flutter/mobile helpers:
 - TDE key-provider example interface;
 - relay apply-before-ack example helper or recipe;
 - diagnostics surface that reports platform, artifact ABI, DecentDB ABI,
-  database path class, open options summary, and support tier.
+  database path class, redacted open options summary, and support tier.
 - typed startup errors for native library load failure and ABI mismatch, with
   recovery guidance for package/artifact version alignment.
+- `redactSensitiveOpenOptions()` or an equivalent `SanitizedOptions` helper that
+  strips key material from `encryption_key`, `encryption_key_hex`, `tde_key`,
+  and `tde_key_hex` before diagnostics, logs, support JSON, or troubleshooting
+  output.
+- documented reactive watch support status. If watch/change-stream APIs are
+  exposed in the mobile package, their background, close, and restart semantics
+  must be documented and tested; otherwise the mobile docs must mark reactive
+  watch wrappers as deferred.
 
 The existing Dart `Database` API should remain the main database API. Additions
 to the pure Dart package should be limited to mobile-neutral improvements such
@@ -559,6 +611,9 @@ Minimum integration coverage:
 - reference Flutter app scenarios for the same create/open, encrypted reopen,
   lifecycle, and sync apply-before-ack paths. The reference app may be the test
   host, or tests may drive it through a shared scenario harness.
+- if mobile watch/change-stream APIs are exposed, validate watch delivery across
+  foreground changes and verify watches are closed/invalidated predictably after
+  background close or process restart.
 
 Tier 1 additionally requires at least one real-device lane or documented
 release-blocking device-lab process for each claimed platform.
@@ -599,6 +654,9 @@ Docs must include:
 - ABI mismatch troubleshooting must name the Dart exception/error shape, show
   expected vs loaded ABI values, and tell users to align the `decentdb`,
   `decentdb_flutter`, and packaged native artifact versions.
+- diagnostics and troubleshooting output must only show redacted open-option
+  summaries; raw options containing `encryption_key`, `encryption_key_hex`,
+  `tde_key`, or `tde_key_hex` must never appear in logs or support JSON.
 - release artifact verification instructions;
 - unsupported environments and why they are unsupported.
 
@@ -613,6 +671,18 @@ Update targets when implementation lands:
 - `docs/about/changelog.md`.
 
 ## 15. Phased Implementation Plan
+
+Phase dependencies:
+
+| Phase | Prerequisites |
+|---|---|
+| 0. ADR/spec validation and inventory | None. |
+| 1. Native artifact build and loader | Phase 0 locked target matrix and package shape. |
+| 2. Flutter mobile package and example app | Phase 1 packaged Android/iOS artifacts and loading smoke. |
+| 3. TDE and key-store recipes | Phase 1 native artifacts, Phase 2 package path, and redacted options helper. |
+| 4. Lifecycle and recovery | Phase 2 app/test host and async/owning-isolate policy. |
+| 5. Relay sync mobile examples | Phase 2 app/test host plus Dart wrappers for public changeset apply/export, relay ack, and conflict inspection. |
+| 6. Benchmarks, support matrix, and release guardrails | Prior phases plus mobile CI infrastructure. |
 
 ### Phase 0: ADR/Spec Validation And Inventory
 
@@ -647,6 +717,8 @@ Update targets when implementation lands:
 - Add Keychain/Keystore example adapters or documented integration.
 - Add wrong-key and missing-key tests.
 - Verify logs and diagnostics redact key material.
+- Add mobile-neutral redaction tests for raw C ABI open options containing
+  `encryption_key`, `encryption_key_hex`, `tde_key`, and `tde_key_hex`.
 
 ### Phase 4: Lifecycle And Recovery
 
@@ -671,6 +743,10 @@ Update targets when implementation lands:
 
 ## 16. Acceptance Criteria
 
+These criteria refine the Definition of Done in section 5 into implementation
+and validation checks. If section 5 changes, this section must be reviewed in
+the same branch.
+
 - Mobile spec/ADR decisions are settled before implementation that affects
   lifecycle, key storage, packaging contracts, or C ABI.
 - Flutter mobile package path works on Android and iOS without manual native
@@ -686,6 +762,9 @@ Update targets when implementation lands:
   after process/isolate restart and must be recreated after reopen.
 - Mobile docs state the Dart key zeroing limitation and the best-effort buffer
   handling policy.
+- Mobile diagnostics and support output redact TDE key open options.
+- Mobile async/isolate docs identify the worker isolate as the database owner
+  and specify pending-future behavior on close/termination.
 - Sync examples preserve apply-before-ack ordering.
 - TDE examples never log key material or store it beside the database.
 - Benchmarks and package-size guardrails run in release validation.
@@ -749,8 +828,8 @@ packaging, or support evidence.
    only after the artifact contract is stable.
 10. Normal mobile apps default to single app-process database use. Cross-process
     coordination is documented as off unless the app deliberately shares a
-    database across processes/extensions. Require `required` coordination only
-    for a separately tested shared-access profile.
+    database across processes/extensions. Set `process_coordination=required`
+    only for a separately tested shared-access profile.
 
 ## 19. Resolved Guidance
 

@@ -30,10 +30,18 @@ or user-visible Documents by default.
 
 The database set includes the main database file, WAL sidecar, sync journal,
 and coordination sidecar when enabled. This is the v1 mobile database-set
-contract. Any new authoritative sidecar or manifest that mobile backup/restore
-must preserve requires an ADR or an update to the mobile spec. Move, delete,
-restore, and support workflows must not silently operate on only the main file
-unless they are using a DecentDB API that creates a consistent artifact.
+contract, governed by the DecentDB database format version and the mobile
+package version. Any new authoritative sidecar or manifest that mobile
+backup/restore must preserve requires an ADR or an update to the mobile spec.
+Move, delete, restore, and support workflows must not silently operate on only
+the main file unless they are using a DecentDB API that creates a consistent
+artifact.
+
+Mobile backup/restore must preserve every file in the v1 set that is present at
+the time of backup. The v1 mobile package does not bundle `decentdb-migrate`;
+mobile apps should only claim in-app file-format upgrade support when the Rust
+engine supports that upgrade on open or a mobile-safe migration workflow is
+explicitly added and tested.
 
 Mobile lifecycle guidance is:
 
@@ -60,6 +68,12 @@ handle, with app/UI code calling through an async facade or command queue. The
 existing Dart async facade should be evaluated as the default mobile pattern
 and extended only where mobile lifecycle or sync ergonomics require it.
 
+For `AsyncDatabase`, the worker isolate is the owning isolate. Foreground,
+background, close, checkpoint, and cancellation policies apply to that worker,
+not merely to the UI isolate that holds futures. When the worker is closed or
+terminated, pending futures must settle with a typed closed/canceled error, and
+callers must reopen the database before issuing more work.
+
 If an app opens separate handles from multiple isolates or processes, it must
 use the documented process-coordination profile and accept the one-writer
 contract. Tier 1 mobile support does not include multi-isolate shared-handle
@@ -70,6 +84,11 @@ must be described as best-effort. Sync examples must use apply-before-ack:
 apply the relay changeset in a durable local transaction, then ack the relay. If
 the task is killed before ack, the relay should redeliver from the previous
 durable checkpoint.
+
+Reactive watch and change-stream APIs are useful for mobile UIs, but they are
+not part of the Tier 1 mobile claim unless their background, close, and restart
+semantics are documented and tested. If exposed, watches must be closed or
+invalidated predictably after background close or process restart.
 
 Support tiers are based on tests, not build possibility:
 

@@ -33,7 +33,8 @@ Docs and examples must cover:
 - storing or wrapping keys in iOS Keychain and Android Keystore;
 - passing key bytes to DecentDB only for create/open;
 - avoiding logs or diagnostics that include key material or option strings with
-  key material;
+  key material, including `encryption_key`, `encryption_key_hex`, `tde_key`,
+  and `tde_key_hex`;
 - clearing temporary Dart/native key buffers as far as the platform permits;
 - handling missing keys, wrong keys, biometric lockout, reinstall, backup
   restore, and device migration;
@@ -52,6 +53,15 @@ should minimize copies, prefer short-lived buffers, document the limitation, and
 use FFI allocation/free or platform secure-storage APIs where that materially
 reduces exposure. The ADR does not require or imply C-style guaranteed
 zeroization for all Dart-managed key bytes.
+
+The C ABI option-string key transport from ADR 0174 is an accepted trade-off,
+not a mobile-specific invention. The FFI native allocation used to pass an
+options string can contain key material and `package:ffi` allocation/free does
+not guarantee zeroization of the native copy after use. Mobile code must treat
+raw option strings containing keys as sensitive, minimize their lifetime, avoid
+diagnostics/logging of raw options, and provide a Dart-side
+`redactSensitiveOpenOptions()` or equivalent sanitized-options helper for
+support output.
 
 Online key rotation, authenticated page/chunk encryption, remote KMS
 integrations, and engine-owned key escrow are out of scope for this mobile win.
