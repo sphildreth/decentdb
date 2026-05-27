@@ -120,7 +120,7 @@ shipped foundation affects follow-on roadmap decisions.
 
 | Priority | Future Version | Status | Feature | Current Source Of Truth | Why This Rank |
 |---:|---|---|---|---|---|
-| 1 | vNext | TODO | Default-fast performance and storage efficiency | Benchmarking guide and release metrics; needs ADR/spec for format-affecting work | DecentDB should feel fast without special tuning and should keep file size/cold-open behavior competitive |
+| 1 | vNext | TODO | Default-fast performance and storage efficiency | [`WIN_DEFAULT_FAST_PERFORMANCE_STORAGE_EFFICIENCY_SPEC.md`](WIN_DEFAULT_FAST_PERFORMANCE_STORAGE_EFFICIENCY_SPEC.md); ADR 0184 | DecentDB should feel fast without special tuning and should keep file size/cold-open behavior competitive |
 | 2 | vNext | TODO | Rich structured errors and developer diagnostics | Existing [`docs/api/error-codes.md`](../docs/api/error-codes.md); needs ADR/spec for stable machine-readable expansion | Low-cost adoption win: better errors, hints, and doc links reduce integration friction across every binding |
 | 3 | vNext+1 | TODO | Incremental backup and point-in-time recovery | Basic `save_as` backup is delivered; needs ADR/spec for WAL archive/PITR semantics | Durable recovery artifacts are a production requirement and distinct from live replication |
 | 4 | vNext+1 | TODO | Runtime tracing, advisors, and Doctor integration | Needs ADR/spec; follows shipped operational metrics | Explains slow queries, lock waits, index usage, schema lint, and maintenance issues once the metrics contract is stable |
@@ -191,8 +191,9 @@ database.
 
 **Future Version:** vNext
 
-**Source of truth:** Benchmarking guide and release metrics exist; needs
-ADR/spec for persistent-format or planner-contract changes.
+**Source of truth:** [`WIN_DEFAULT_FAST_PERFORMANCE_STORAGE_EFFICIENCY_SPEC.md`](WIN_DEFAULT_FAST_PERFORMANCE_STORAGE_EFFICIENCY_SPEC.md)
+and ADR 0184. Persistent-format, WAL semantic, or broad binding-contract
+changes still require follow-up ADRs.
 
 ### Why This Matters
 
