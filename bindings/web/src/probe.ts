@@ -1,4 +1,7 @@
 import {
+  BROWSER_PROTOCOL_VERSION,
+  BROWSER_SQL_PROFILE,
+  type BrowserCapabilities,
   ERR_BROWSER_COORDINATION_UNAVAILABLE,
   ERR_BROWSER_OPFS_UNAVAILABLE,
   ERR_BROWSER_SERVICE_WORKER_UNSUPPORTED,
@@ -59,6 +62,8 @@ export interface BrowserRuntimeProbe {
     wasmModule: boolean;
     parserProfile: string;
     resultTransport: ResultTransport;
+    protocolVersion: number;
+    capabilities: BrowserCapabilities;
   };
   errors: QueryErrorPayload[];
 }
@@ -170,6 +175,8 @@ export async function probeRuntime(options?: {
 
   const storageProbe = await probeOpfs(errors);
   const persistApi = typeof storage().persist === "function";
+  const resultTransport = options?.resultTransport ?? "binary";
+  const capabilities = browserCapabilities(resultTransport);
   const report: BrowserRuntimeProbe = {
     supported: false,
     tier: "unsupported",
@@ -182,8 +189,10 @@ export async function probeRuntime(options?: {
     },
     decentdb: {
       wasmModule: true,
-      parserProfile: "browser-app-v1",
-      resultTransport: options?.resultTransport ?? "binary",
+      parserProfile: BROWSER_SQL_PROFILE,
+      resultTransport,
+      protocolVersion: BROWSER_PROTOCOL_VERSION,
+      capabilities,
     },
     errors,
   };
@@ -235,4 +244,27 @@ export async function probeRuntime(options?: {
     !runtime.serviceWorker;
   report.tier = report.supported ? "supported" : "unsupported";
   return report;
+}
+
+function browserCapabilities(_resultTransport: ResultTransport): BrowserCapabilities {
+  return {
+    protocolVersion: BROWSER_PROTOCOL_VERSION,
+    parserProfile: BROWSER_SQL_PROFILE,
+    resultTransports: ["binary", "json"],
+    transactions: true,
+    savepoints: true,
+    preparedStatements: true,
+    statementReset: true,
+    statementClearBindings: true,
+    statementPaging: true,
+    asyncStatementIteration: true,
+    importExport: true,
+    metrics: true,
+    relayHttp: true,
+    relayWebSocket: true,
+    changesetApply: true,
+    branchSnapshots: false,
+    browserTdeOpenOptions: false,
+    cooperativeCancellation: false,
+  };
 }

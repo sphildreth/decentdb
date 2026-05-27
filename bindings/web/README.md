@@ -21,6 +21,9 @@ const db = await open({
 await db.exec("CREATE TABLE IF NOT EXISTS notes(id INT64 PRIMARY KEY, body TEXT)");
 await db.exec("INSERT INTO notes(id, body) VALUES ($1, $2)", [1, "hello"]);
 const result = await db.query("SELECT id, body FROM notes");
+await db.transaction(async (tx) => {
+  await tx.exec("INSERT INTO notes(id, body) VALUES ($1, $2)", [2, "tx"]);
+});
 const metrics = await db.metrics();
 await db.close();
 ```
@@ -39,9 +42,10 @@ await db.close();
   `relayHello`, HTTP shape snapshot/pull/ack, and WebSocket shape
   subscriptions from supported page/worker contexts.
 
-`metrics()` reports owner id/runtime, attached clients, parser profile,
-quota/usage, persistence state, and WASM memory samples. Browser system views
-are also available through `query("SELECT * FROM sys.browser_runtime")`,
+`metrics()` reports owner id/runtime, attached clients, protocol version,
+capability flags, parser profile, quota/usage, persistence state, checkpoint/
+export/import timestamps, and WASM memory samples. Browser system views are
+also available through `query("SELECT * FROM sys.browser_runtime")`,
 `sys.browser_owner`, `sys.browser_storage`, and `sys.browser_sync`.
 
 ## Build
@@ -91,8 +95,8 @@ npm run browser:smoke:edge
 npm run browser:smoke:candidate
 ```
 
-Run the large-result transport benchmark when changing the worker protocol or
-result decoding path:
+Run the browser benchmark guardrail when changing the worker protocol, startup,
+statement paging, import/export, or result decoding path:
 
 ```bash
 npm run browser:bench
@@ -111,16 +115,50 @@ create/open/query/reopen, binary and JSON result transports, export/import,
 checkpoint, and persist coverage.
 
 `browser:bench` runs `tests/bindings/web/transport-bench.spec.js` and reports
-binary-vs-JSON result transport timings plus WASM memory samples.
+cold open, warm reopen, first query, prepared lookup, insert transaction,
+export/import, binary-vs-JSON result transport timings, package asset sizes, and
+WASM memory samples.
 
-## Current Limits
+## Supported Browser SQL Profile
 
-The browser `browser-app-v1` wasm parser is intentionally scoped because the
-native `pg_query` C parser is not available on `wasm32-unknown-unknown`.
-Browser workflows cover `CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`,
-`DROP INDEX`, `INSERT ... VALUES`, `UPDATE`, `DELETE`, and basic `SELECT` with
-simple boolean/comparison `WHERE`, `ORDER BY`, `LIMIT`, and `OFFSET`; native
-DecentDB continues to provide the broader SQL surface.
+`@decentdb/web` exposes `browser-app-v2` through probe/runtime metadata.
+
+Supported browser SQL includes:
+
+- `CREATE TABLE` with ordinary columns, `NOT NULL`, `PRIMARY KEY`, `UNIQUE`,
+  simple `CHECK`, `DEFAULT` values, and simple `REFERENCES` clauses.
+- `DROP TABLE`, `CREATE INDEX`, `DROP INDEX`.
+- `INSERT ... VALUES` and `INSERT ... SELECT` (for migration/import workflows).
+- `UPDATE`, `DELETE`, and basic `SELECT` with boolean/comparison `WHERE`,
+  `ORDER BY`, `LIMIT`, and `OFFSET`.
+
+Unsupported grammar and parser profile cases return stable browser SQL errors:
+`ERR_BROWSER_SQL_UNSUPPORTED`, `ERR_BROWSER_SQL_PARSE`,
+`ERR_BROWSER_SQL_PROFILE_MISMATCH`.
+
+The TypeScript API includes transactions, savepoints, prepared statement
+`reset()`/`clearBindings()`/`page()`/async iteration, import/export, metrics,
+and production relay helpers. Browser branch/snapshot workflows and browser TDE
+open options are explicitly deferred and reported as disabled capability flags.
+
+Relay subscriptions should apply locally before acking:
+
+```ts
+db.sync.subscribeShape({
+  peer: "relay",
+  shapeId: "tenant_42_tasks_v1",
+  clientReplicaId: "web_123",
+  onMessage(message) {
+    void db.sync.applyAndAckShape({
+      peer: "relay",
+      message,
+      tenantId: "tenant_42",
+      subjectId: "user_123",
+      clientReplicaId: "web_123",
+    });
+  },
+});
+```
 
 Unsupported runtime modes fail explicitly with stable browser error codes such
 as `ERR_BROWSER_COORDINATION_UNAVAILABLE`, `ERR_BROWSER_OPFS_UNAVAILABLE`,

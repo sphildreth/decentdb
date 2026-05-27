@@ -1,4 +1,7 @@
 import {
+  BROWSER_PROTOCOL_VERSION,
+  BROWSER_SQL_PROFILE,
+  type BrowserCapabilities,
   type CheckpointResult,
   type ExportResult,
   type MetricsResult,
@@ -15,14 +18,19 @@ import {
   type ExecResult,
   type QueryResult,
   type PrepareResult,
+  type StatementPageResult,
+  type SyncApplyChangesetResult,
   type SyncRunResult,
   type OwnerRuntime,
   createErrorPayload,
+  ERR_BROWSER_BRANCH_UNSUPPORTED,
   ERR_BROWSER_COORDINATION_UNAVAILABLE,
+  ERR_BROWSER_DB_CLOSED,
   ERR_BROWSER_OWNER_STALE,
   ERR_BROWSER_OWNER_TIMEOUT,
   ERR_BROWSER_PROBE_FAILED,
   ERR_BROWSER_SERVICE_WORKER_UNSUPPORTED,
+  ERR_BROWSER_STATEMENT_CLOSED,
   ERR_BROWSER_UNSUPPORTED,
   ERR_OPERATION_FAILED,
 } from "./protocol.js";
@@ -40,7 +48,9 @@ export type {
   PersistResult,
   MetricsResult,
   BrowserRuntimeProbe,
+  BrowserCapabilities,
   OwnerRuntime,
+  SyncApplyChangesetResult,
 };
 
 export interface OpenOptions {
@@ -68,6 +78,15 @@ export interface SyncRunOptions {
   timeoutMs?: number;
 }
 
+export interface TransactionOptions {
+  mode?: "deferred" | "immediate" | "exclusive";
+}
+
+export interface SyncApplyChangesetOptions {
+  changeset: unknown;
+  applyOptions?: Record<string, unknown>;
+}
+
 export interface RelayRequestOptions {
   peer: string;
   headers?: Record<string, string>;
@@ -92,6 +111,16 @@ export interface ShapeAckOptions extends RelayRequestOptions {
   sourceHighWatermark: number;
   changesetId?: string;
   sessionId?: string;
+}
+
+export interface ShapeApplyAndAckOptions extends RelayRequestOptions {
+  message: unknown;
+  tenantId: string;
+  subjectId: string;
+  clientReplicaId: string;
+  sessionId?: string;
+  applyOptions?: Record<string, unknown>;
+  apply?: (changeset: unknown) => Promise<unknown>;
 }
 
 export interface RelayPrincipalOptions {
@@ -739,6 +768,50 @@ export class Statement {
     return step.row;
   }
 
+  async reset(): Promise<this> {
+    this.assertOpen();
+    await this.db.execRequest("statement_reset", { statementId: this.statementId });
+    return this;
+  }
+
+  async clearBindings(): Promise<this> {
+    this.assertOpen();
+    await this.db.execRequest("statement_clear_bindings", { statementId: this.statementId });
+    return this;
+  }
+
+  async page<T = QueryRow>(pageSize = 100): Promise<QueryResultShape<T> & { done: boolean }> {
+    this.assertOpen();
+    const response = await this.db.execRequest("statement_page", {
+      statementId: this.statementId,
+      pageSize,
+    });
+    const page = response.result as StatementPageResult | undefined;
+    const rows = (page?.rows ?? []) as T[];
+    return {
+      rowCount: rows.length,
+      columns: page?.columns ?? [],
+      rows,
+      done: page?.done ?? true,
+    };
+  }
+
+  async *iterate<T = QueryRow>(pageSize = 100): AsyncIterableIterator<T> {
+    while (true) {
+      const page = await this.page<T>(pageSize);
+      for (const row of page.rows) {
+        yield row;
+      }
+      if (page.done) {
+        return;
+      }
+    }
+  }
+
+  [Symbol.asyncIterator](): AsyncIterableIterator<QueryRow> {
+    return this.iterate<QueryRow>()[Symbol.asyncIterator]();
+  }
+
   async close(): Promise<void> {
     if (this.closed) {
       return;
@@ -749,13 +822,21 @@ export class Statement {
 
   private assertOpen(): void {
     if (this.closed) {
-      throw new Error("statement closed");
+      throw new DecentDBWebError(
+        createErrorPayload(
+          ERR_BROWSER_STATEMENT_CLOSED,
+          "Prepared statement is closed.",
+          this.sql
+        )
+      );
     }
+    this.db.assertOpen();
   }
 }
 
 class SyncController {
   private readonly peers = new Map<string, SyncConfigurePeerOptions>();
+  private readonly subscriptions = new Set<ShapeSubscription>();
 
   constructor(private readonly db: Database) {}
 
@@ -780,6 +861,18 @@ class SyncController {
     return (response.result as SyncRunResult) ?? {
       status: "deferred",
       message: "Browser sync transport is deferred for this build profile.",
+    };
+  }
+
+  async applyChangeset(options: SyncApplyChangesetOptions): Promise<SyncApplyChangesetResult> {
+    this.db.assertOpen();
+    const response = await this.db.execRequest("sync_apply_changeset", {
+      dbId: this.db.id,
+      changeset: options.changeset,
+      options: options.applyOptions,
+    });
+    return (response.result as SyncApplyChangesetResult | undefined) ?? {
+      outcome: "unknown",
     };
   }
 
@@ -829,6 +922,51 @@ class SyncController {
         changeset_id: options.changesetId ?? null,
       }),
     });
+  }
+
+  async applyAndAckShape(options: ShapeApplyAndAckOptions): Promise<{
+    apply: unknown;
+    ack: unknown;
+  }> {
+    this.db.assertOpen();
+    const value = options.message as Record<string, unknown>;
+    const checkpoint = (value.checkpoint ?? {}) as Record<string, unknown>;
+    const changeset = (value.changeset ?? value) as Record<string, unknown>;
+    if (!changeset || typeof changeset !== "object") {
+      throw new DecentDBWebError({
+        code: "ERR_BROWSER_SYNC_CHANGESET_REQUIRED",
+        message: "Relay message does not contain a changeset payload.",
+        details: "Pass the relay message with a changeset field or a changeset object.",
+      });
+    }
+
+    const apply = options.apply
+      ? await options.apply(changeset)
+      : await this.applyChangeset({
+          changeset,
+          applyOptions: options.applyOptions,
+        });
+
+    const ack = await this.ackShape({
+      peer: options.peer,
+      headers: options.headers,
+      shapeId: String(value.shape_id ?? value.shapeId ?? options.headers?.["x-decentdb-shapes"] ?? ""),
+      tenantId: options.tenantId,
+      clientReplicaId: options.clientReplicaId,
+      subjectId: options.subjectId,
+      sessionId: options.sessionId,
+      shapeSequence: Number(value.shape_sequence ?? checkpoint.shape_sequence ?? 0),
+      sourceHighWatermark: Number(
+        value.source_high_watermark ?? checkpoint.source_high_watermark ?? 0
+      ),
+      changesetId:
+        typeof changeset.changeset_id === "string"
+          ? changeset.changeset_id
+          : typeof value.changeset_id === "string"
+            ? value.changeset_id
+            : undefined,
+    });
+    return { apply, ack };
   }
 
   subscribeShape(options: ShapeSubscribeOptions): ShapeSubscription {
@@ -888,7 +1026,7 @@ class SyncController {
         })
       );
     });
-    return {
+    const subscription = {
       close: () => socket.close(),
       ack: (message: unknown): void => {
         const value = message as Record<string, unknown>;
@@ -911,6 +1049,16 @@ class SyncController {
         });
       },
     };
+    socket.addEventListener("close", () => this.subscriptions.delete(subscription));
+    this.subscriptions.add(subscription);
+    return subscription;
+  }
+
+  closeSubscriptions(): void {
+    for (const subscription of this.subscriptions) {
+      subscription.close();
+    }
+    this.subscriptions.clear();
   }
 
   private async fetchRelay(
@@ -1025,6 +1173,40 @@ function splitHeaderList(value: string | undefined): string[] {
     : [];
 }
 
+function defaultCapabilities(): BrowserCapabilities {
+  return {
+    protocolVersion: BROWSER_PROTOCOL_VERSION,
+    parserProfile: BROWSER_SQL_PROFILE,
+    resultTransports: ["binary", "json"],
+    transactions: true,
+    savepoints: true,
+    preparedStatements: true,
+    statementReset: true,
+    statementClearBindings: true,
+    statementPaging: true,
+    asyncStatementIteration: true,
+    importExport: true,
+    metrics: true,
+    relayHttp: true,
+    relayWebSocket: true,
+    changesetApply: true,
+    branchSnapshots: false,
+    browserTdeOpenOptions: false,
+    cooperativeCancellation: false,
+  };
+}
+
+function safeSqlIdentifier(name: string): string {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
+    throw new DecentDBWebError({
+      code: "ERR_BROWSER_INVALID_IDENTIFIER",
+      message: "Identifier contains unsupported characters.",
+      details: name,
+    });
+  }
+  return name;
+}
+
 export class Database {
   public readonly sync: SyncController;
   private closed = false;
@@ -1059,8 +1241,10 @@ export class Database {
           },
           decentdb: {
             wasmModule: true,
-            parserProfile: "browser-app-v1",
+            parserProfile: BROWSER_SQL_PROFILE,
             resultTransport: options.resultTransport ?? "binary",
+            protocolVersion: BROWSER_PROTOCOL_VERSION,
+            capabilities: defaultCapabilities(),
           },
           errors: [],
         }
@@ -1132,6 +1316,18 @@ export class Database {
     return this.result.engineReady;
   }
 
+  get parserProfile(): string {
+    return this.result.parserProfile;
+  }
+
+  get protocolVersion(): number {
+    return this.result.protocolVersion;
+  }
+
+  get capabilities(): BrowserCapabilities {
+    return this.result.capabilities;
+  }
+
   async exec(sql: string, params?: Params): Promise<ExecResultShape> {
     this.assertOpen();
     const response = await this.execRequest("exec", {
@@ -1177,6 +1373,58 @@ export class Database {
     return new Statement(this, prepared.statementId, prepared.sql);
   }
 
+  async beginTransaction(options: TransactionOptions = {}): Promise<void> {
+    const mode = options.mode?.toUpperCase();
+    await this.exec(mode ? `BEGIN ${mode}` : "BEGIN");
+  }
+
+  async commitTransaction(): Promise<void> {
+    await this.exec("COMMIT");
+  }
+
+  async rollbackTransaction(): Promise<void> {
+    await this.exec("ROLLBACK");
+  }
+
+  async transaction<T>(
+    callback: (db: Database) => T | Promise<T>,
+    options: TransactionOptions = {}
+  ): Promise<T> {
+    await this.beginTransaction(options);
+    try {
+      const value = await callback(this);
+      await this.commitTransaction();
+      return value;
+    } catch (error) {
+      await this.rollbackTransaction().catch(() => undefined);
+      throw error;
+    }
+  }
+
+  async savepoint(name = `sp_${Date.now().toString(36)}`): Promise<string> {
+    this.assertOpen();
+    await this.exec(`SAVEPOINT ${safeSqlIdentifier(name)}`);
+    return name;
+  }
+
+  async releaseSavepoint(name: string): Promise<void> {
+    await this.exec(`RELEASE SAVEPOINT ${safeSqlIdentifier(name)}`);
+  }
+
+  async rollbackToSavepoint(name: string): Promise<void> {
+    await this.exec(`ROLLBACK TO SAVEPOINT ${safeSqlIdentifier(name)}`);
+  }
+
+  createSnapshot(_name: string): never {
+    throw new DecentDBWebError(
+      createErrorPayload(
+        ERR_BROWSER_BRANCH_UNSUPPORTED,
+        "Browser branch and snapshot APIs are not enabled in browser-app-v2.",
+        "Use native bindings for branch workflows; browser capability metadata reports branchSnapshots=false."
+      )
+    );
+  }
+
   async checkpoint(): Promise<CheckpointResult> {
     this.assertOpen();
     const response = await this.execRequest("checkpoint", { dbId: this.id });
@@ -1218,6 +1466,7 @@ export class Database {
     if (this.closed) {
       return;
     }
+    this.sync.closeSubscriptions();
     await this.execRequest("close", { dbId: this.id });
     this.closed = true;
     if (this.closeTransportOnClose) {
@@ -1242,7 +1491,13 @@ export class Database {
 
   assertOpen(): void {
     if (this.closed) {
-      throw new Error("database closed");
+      throw new DecentDBWebError(
+        createErrorPayload(
+          ERR_BROWSER_DB_CLOSED,
+          "Database handle is closed.",
+          this.path
+        )
+      );
     }
   }
 

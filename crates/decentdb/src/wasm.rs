@@ -73,6 +73,53 @@ impl WebDb {
         ))
     }
 
+    #[wasm_bindgen(js_name = syncExecuteJson)]
+    pub fn sync_execute_json(&self, request_json: &str) -> std::result::Result<String, JsValue> {
+        let request: JsonValue = serde_json::from_str(request_json)
+            .map_err(|error| js_db_error(DbError::sql(format!("invalid sync JSON: {error}"))))?;
+        let object = request
+            .as_object()
+            .ok_or_else(|| js_db_error(DbError::sql("sync JSON request must be an object")))?;
+        let op = object
+            .get("op")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| js_db_error(DbError::sql("sync JSON request requires op")))?;
+        match op {
+            "changeset_apply" => {
+                let changeset = object.get("changeset").cloned().ok_or_else(|| {
+                    js_db_error(DbError::sql("changeset_apply requires changeset"))
+                })?;
+                let changeset: crate::sync::SyncChangeset = serde_json::from_value(changeset)
+                    .map_err(|error| {
+                        js_db_error(DbError::sql(format!("invalid changeset payload: {error}")))
+                    })?;
+                let options = object
+                    .get("options")
+                    .cloned()
+                    .map(serde_json::from_value::<crate::sync::ApplyChangesetOptions>)
+                    .transpose()
+                    .map_err(|error| {
+                        js_db_error(DbError::sql(format!(
+                            "invalid changeset apply options: {error}"
+                        )))
+                    })?
+                    .unwrap_or_default();
+                let result = self
+                    .db()?
+                    .sync_apply_changeset(&changeset, options)
+                    .map_err(js_db_error)?;
+                serde_json::to_string(&result).map_err(|error| {
+                    js_db_error(DbError::internal(format!(
+                        "serialize changeset apply result: {error}"
+                    )))
+                })
+            }
+            other => Err(js_db_error(DbError::sql(format!(
+                "unsupported browser sync op: {other}"
+            )))),
+        }
+    }
+
     #[wasm_bindgen(js_name = close)]
     pub fn close(&mut self) {
         let _ = self.db.take();

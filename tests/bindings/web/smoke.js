@@ -83,6 +83,36 @@ async function runSmokeScenario(options = {}) {
     const browserOwnerView = await db.query("SELECT * FROM sys.browser_owner");
     const browserStorageView = await db.query("SELECT * FROM sys.browser_storage");
     const browserSyncView = await db.query("SELECT * FROM sys.browser_sync");
+    const dbMetadata = {
+      parserProfile: db.parserProfile,
+      protocolVersion: db.protocolVersion,
+      capabilities: db.capabilities,
+    };
+
+    await db.exec("CREATE TABLE IF NOT EXISTS smoke_tx(id INT64 PRIMARY KEY, name TEXT)");
+    await db.exec("DELETE FROM smoke_tx");
+    await db.transaction(async (tx) => {
+      await tx.exec("INSERT INTO smoke_tx(id, name) VALUES ($1, $2)", [seedId, "committed"]);
+      const savepoint = await tx.savepoint("smoke_sp");
+      await tx.exec("INSERT INTO smoke_tx(id, name) VALUES ($1, $2)", [seedId + 1, "rolled-back"]);
+      await tx.rollbackToSavepoint(savepoint);
+      await tx.releaseSavepoint(savepoint);
+    });
+    const txRows = await db.query("SELECT id, name FROM smoke_tx ORDER BY id ASC");
+
+    const stmt = await db.prepare(`SELECT id, name FROM ${DB_TABLE} ORDER BY id ASC`);
+    const firstPreparedRow = await stmt.step();
+    await stmt.reset();
+    const preparedPage = await stmt.page(10);
+    await stmt.clearBindings();
+    await stmt.close();
+    let closedStatementCode = null;
+    try {
+      await stmt.step();
+    } catch (error) {
+      closedStatementCode = error && typeof error === "object" && "code" in error ? error.code : null;
+    }
+
     await db.sync.configurePeer({
       name: "cloud",
       endpoint: "https://sync.example.invalid",
@@ -92,6 +122,36 @@ async function runSmokeScenario(options = {}) {
       direction: "both",
       timeoutMs: 1000,
     });
+    const originalFetch = globalThis.fetch;
+    const syncOrder = [];
+    globalThis.fetch = async () => {
+      syncOrder.push("ack");
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    };
+    let applyAck;
+    try {
+      applyAck = await db.sync.applyAndAckShape({
+        peer: "cloud",
+        tenantId: "tenant_42",
+        subjectId: "user_123",
+        clientReplicaId: "web_123",
+        message: {
+          shape_id: "tenant_42_tasks_v1",
+          shape_sequence: 7,
+          source_high_watermark: 11,
+          changeset: { changeset_id: "changeset:test" },
+        },
+        apply: async () => {
+          syncOrder.push("apply");
+          return { outcome: "applied" };
+        },
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
     const metrics = await db.metrics();
     const checkpointResult = await db.checkpoint();
     const exported = await db.export();
@@ -142,7 +202,14 @@ async function runSmokeScenario(options = {}) {
       browserOwnerView,
       browserStorageView,
       browserSyncView,
+      dbMetadata,
+      txRows: txRows.rows,
+      firstPreparedRow,
+      preparedPage,
+      closedStatementCode,
       syncRun,
+      applyAck,
+      syncOrder,
     };
   } finally {
     await closeIfOpen(db);

@@ -1,7 +1,7 @@
 # Browser SQL/API Parity And Production Web Hardening
 
 **Date:** 2026-05-27
-**Status:** Design draft; implementation not started
+**Status:** Implemented
 **Future Version:** vNext
 **Roadmap:** [`FUTURE_WINS.md`](FUTURE_WINS.md)
 **Document Type:** Implementation SPEC
@@ -23,12 +23,12 @@ maintainers, coding agents
 - Browser TDE/key material handling if browser open options expose encryption
   keys or passphrases.
 
-**Implementation status, 2026-05-27:** Not implemented. DecentDB already ships a
-real `@decentdb/web` runtime using a Dedicated Worker, OPFS sync access handles,
-Web Locks, BroadcastChannel owner routing, binary result transport, browser
-diagnostics, import/export, persistence helpers, relay helpers, smoke tests, and
-transport benchmarks. This spec defines the next product bar: browser SQL/API
-parity and production hardening sufficient for serious web application adoption.
+**Implementation status, 2026-05-27:** Implemented. `@decentdb/web` now exposes
+`browser-app-v2` parser/profile metadata, stable browser SQL errors, protocol
+version and capability flags, transaction/savepoint helpers, prepared statement
+reset/clear/page/async iteration, lifecycle guards for closed handles/imports,
+browser sync apply-before-ack helpers, expanded OPFS diagnostics, framework
+recipes, a checked-in SQL parity corpus, and browser benchmark guardrails.
 
 **Related inputs:**
 
@@ -689,18 +689,20 @@ Docs must include:
 | Service worker demand pressures unsafe ownership | Keep unsupported unless a new ADR proves a safe storage/ownership model. |
 | Security docs imply browser key storage DecentDB does not provide | Separate explicit browser TDE options from later key-store helper roadmap. |
 
-## 18. Open Decisions For Review
+## 18. Implementation Decisions
 
-1. Should `browser-app-v2` use an expanded in-repo parser or a pure-Rust parser
-   dependency?
-2. Which native SQL features are mandatory for vNext browser parity versus
-   acceptable follow-up?
-3. Should browser TDE open options be included in this win or deferred to the
-   later key-store/security roadmap?
-4. Should branch/snapshot APIs be part of browser parity v1 or a separate
-   browser workflow slice?
-5. What package-size and startup thresholds are acceptable after baseline data
-   is captured?
-6. Should cancellation be exposed now if wasm execution can only honor it before
-   dispatch or between operations?
-
+1. `browser-app-v2` expands the existing in-repo wasm parser. No parser
+   dependency or native `pg_query` wasm port was added, so no parser ADR was
+   required.
+2. Browser TDE open options are deferred. Capability metadata reports
+   `browserTdeOpenOptions: false`; browser-local OPFS data remains protected by
+   browser/profile/OS storage boundaries plus application sync/export strategy.
+3. Browser branch/snapshot workflows are deferred. Capability metadata reports
+   `branchSnapshots: false` and the TypeScript API fails explicitly with
+   `ERR_BROWSER_BRANCH_UNSUPPORTED`.
+4. Query cancellation is not exposed because wasm execution cannot preempt a
+   synchronous engine call safely. Capability metadata reports
+   `cooperativeCancellation: false`.
+5. Benchmark guardrails start with broad browser-safe thresholds in the
+   Playwright benchmark and should be tightened from accepted CI baselines per
+   release.

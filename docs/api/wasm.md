@@ -112,6 +112,9 @@ Options:
 - `exec(sql, params?)`
 - `query(sql, params?)`
 - `prepare(sql)`
+- `beginTransaction()`, `commitTransaction()`, `rollbackTransaction()`
+- `transaction(callback, options?)`
+- `savepoint(name?)`, `releaseSavepoint(name)`, `rollbackToSavepoint(name)`
 - `checkpoint()`
 - `export()`
 - `import(bytes)`
@@ -121,13 +124,18 @@ Options:
 
 The module also exports `probeRuntime(options?)`, which returns a structured
 support report covering worker/coordination primitives, OPFS capability,
-persistence/quota information, parser profile, result transport, and stable
-browser error payloads.
+persistence/quota information, protocol version, parser profile, capability
+flags, result transport, and stable browser error payloads. `open()` returns the
+same protocol/capability metadata on the `Database` handle.
 
 `Statement` methods:
 
 - `bind(params)`
 - `step()`
+- `reset()`
+- `clearBindings()`
+- `page(pageSize?)`
+- `iterate(pageSize?)` and async iteration
 - `close()`
 
 Prepared statement example:
@@ -136,8 +144,17 @@ Prepared statement example:
 const stmt = await db.prepare("SELECT id, title FROM todos WHERE id = $1");
 await stmt.bind([1]);
 const row = await stmt.step();
+await stmt.reset();
+for await (const row of stmt.iterate(100)) {
+  console.log(row);
+}
 await stmt.close();
 ```
+
+Closed database and statement handles fail with stable browser errors
+(`ERR_BROWSER_DB_CLOSED` and `ERR_BROWSER_STATEMENT_CLOSED`). `import()` and
+`close()` reject active prepared statements or active transactions instead of
+silently tearing them down.
 
 ## SQL Parameters
 
@@ -203,8 +220,13 @@ const subscription = db.sync.subscribeShape({
   shapeId: "tenant_42_tasks_v1",
   clientReplicaId: "web_123",
   onMessage(message) {
-    // Apply or inspect the delivered changeset in application code.
-    subscription.ack(message);
+    void db.sync.applyAndAckShape({
+      peer: "relay",
+      message,
+      tenantId: "tenant_42",
+      subjectId: "user_123",
+      clientReplicaId: "web_123",
+    });
   },
 });
 ```
@@ -212,6 +234,11 @@ const subscription = db.sync.subscribeShape({
 HTTP helpers use normal fetch headers. WebSocket subscriptions pass short-lived
 principal context in the stream URL because browser WebSocket APIs cannot set
 custom headers; deploy relay streams over TLS.
+
+`applyAndAckShape()` applies the delivered public changeset through the local
+engine first, waits for that transaction to succeed, and only then sends the
+relay ack. Applications that intentionally ack before local apply must do that
+manually and own the documented data-loss risk.
 
 ## Persistence And Durability
 
@@ -226,7 +253,10 @@ Important boundaries:
   is not an unconditional retention guarantee.
 - `export()` checkpoints first and returns a checkpointed database byte image.
 - `import(bytes)` replaces the database image and clears the WAL for that
-  browser handle.
+  browser handle; imports require one attached client, no active statements, and
+  no active transaction.
+- `metrics()` and `sys.browser_storage` report last checkpoint/export/import
+  timestamps and storage pressure when browser quota estimates are available.
 - Applications with important data should sync or export explicitly.
 
 Backup and restore example:
@@ -239,16 +269,26 @@ const restoredBytes = await selectedFile.arrayBuffer();
 await db.import(restoredBytes);
 ```
 
-## Current Limitations
+## SQL Profile (Parser)
 
-- Browser SQL parsing currently uses the `browser-app-v1` wasm-target parser
-  profile because the
-  native `pg_query` C parser does not build for `wasm32-unknown-unknown`.
-  Native DecentDB keeps the full parser path.
-- The browser parser profile is suitable for local-first application bootstrap
-  and smoke workflows: `CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`,
-  `DROP INDEX`, `INSERT ... VALUES`, `UPDATE`, `DELETE`, and basic `SELECT`
-  with simple boolean/comparison `WHERE`, `ORDER BY`, `LIMIT`, and `OFFSET`.
+- Browser runtime exposes `parserProfile: "browser-app-v2"` from
+  `probeRuntime()`, `open()`, `metrics()`, and `sys.browser_runtime`.
+- `browser-app-v2` expands the in-repo wasm parser. No parser dependency or
+  native `pg_query` wasm port was added.
+- Supported for browser workflows: `CREATE TABLE` (including primary key,
+  `NOT NULL`, `UNIQUE`, simple `CHECK`, `REFERENCES`, and `DEFAULT` values),
+  `DROP TABLE`, `CREATE INDEX`, `DROP INDEX`, `INSERT ... VALUES`,
+  `INSERT ... SELECT`, `UPDATE`, `DELETE`, and `SELECT` with `WHERE`, `ORDER BY`,
+  `LIMIT`, and `OFFSET`.
+- Generated columns, CTEs, joins beyond the current browser profile, Lua
+  extension SQL, and native-only platform features are explicit browser-profile
+  deferrals.
+- Unsupported-by-browser SQL surfaces still return stable browser SQL errors:
+  `ERR_BROWSER_SQL_UNSUPPORTED`, `ERR_BROWSER_SQL_PARSE`, and
+  `ERR_BROWSER_SQL_PROFILE_MISMATCH`.
+- Browser branch/snapshot workflow APIs and browser TDE open options are
+  deferred in this release and exposed as `branchSnapshots: false` and
+  `browserTdeOpenOptions: false` in capability metadata.
 - Browser sync relay helpers require an application-hosted production relay.
   The legacy `sync.run()` peer-to-peer workflow remains a compatibility shell
   for builds that have not configured a relay.
@@ -280,18 +320,27 @@ npm run browser:smoke:edge
 npm run browser:smoke:candidate
 ```
 
-Run the transport benchmark when changing result encoding or decoding:
+Run the browser benchmark guardrail when changing startup, result encoding,
+statement paging, import/export, or worker protocol paths:
 
 ```bash
 npm run browser:bench
 ```
 
-The benchmark compares binary and JSON result transports on the same large
-result shape and reports query time plus WASM memory samples.
+The benchmark records cold open, warm reopen, first query, prepared point
+lookups, transaction insert batches, large-result binary and JSON decoding,
+export/import, package asset sizes, and WASM/JS memory samples. The release
+guardrail fails when the binary large-result path is materially slower than JSON
+or when startup/query times exceed the broad browser threshold in
+`transport-bench.spec.js`; tighter release thresholds should be set from the
+recorded CI baseline for the target browser channel.
 
-## Frontend Integration Notes
+## Framework Recipes
 
-Vanilla TypeScript keeps one module-level handle:
+### Static ESM
+
+Keep one module-level handle and serve `worker.js`, `decentdb_wasm.js`, and the
+generated `.wasm` asset from the same static origin:
 
 ```ts
 import { open, type Database } from "@decentdb/web";
@@ -305,6 +354,75 @@ export async function getDb() {
 
 addEventListener("pagehide", () => void db?.close());
 ```
+
+### Vite
+
+Copy the built `bindings/web/dist` assets into `public/decentdb/` or serve them
+from your package asset pipeline, then pass explicit URLs:
+
+```ts
+await open({
+  path: "app.ddb",
+  workerUrl: new URL("/decentdb/worker.js", location.origin).toString(),
+  wasmUrl: new URL("/decentdb/decentdb_wasm.js", location.origin).toString(),
+});
+```
+
+### Next.js
+
+Use `@decentdb/web` only from client components or dynamic imports with SSR
+disabled. Keep the handle in a client-side provider and close it on `pagehide`.
+
+```tsx
+"use client";
+
+import { useEffect, useState } from "react";
+import type { Database } from "@decentdb/web";
+
+export function DecentDbProvider() {
+  const [db, setDb] = useState<Database>();
+
+  useEffect(() => {
+    let handle: Database | undefined;
+    void import("@decentdb/web").then(async ({ open }) => {
+      handle = await open({ path: "app.ddb" });
+      setDb(handle);
+    });
+    return () => void handle?.close();
+  }, []);
+
+  return null;
+}
+```
+
+For the pages router, use the same dynamic import from `useEffect`; do not open
+the browser runtime during `getServerSideProps`, route handlers, or middleware.
+
+### SvelteKit
+
+Open from `onMount` only, with SSR imports guarded by the browser lifecycle:
+
+```ts
+import { onMount } from "svelte";
+
+onMount(() => {
+  let db;
+  import("@decentdb/web").then(async ({ open }) => {
+    db = await open({ path: "app.ddb" });
+  });
+  return () => void db?.close();
+});
+```
+
+### Electron And Tauri Webviews
+
+Use the renderer/webview process, not the main process, and verify the webview
+actually exposes Dedicated Worker, BroadcastChannel, Web Locks, and OPFS sync
+access handles with `probeRuntime()`. If a webview lacks those capabilities,
+use a native binding in the host process instead of falling back to weaker
+browser storage.
+
+### React
 
 React should open once for the app shell and close during cleanup:
 
@@ -342,6 +460,15 @@ tabs can open the same path; the runtime routes through one active owner.
 - `ERR_BROWSER_OWNER_TIMEOUT` or `ERR_BROWSER_OWNER_STALE`: retry the operation;
   if the previous owner disappeared, the next request can recover ownership and
   replay WAL through normal open.
+- `ERR_BROWSER_SQL_PARSE`, `ERR_BROWSER_SQL_UNSUPPORTED`, or
+  `ERR_BROWSER_SQL_PROFILE_MISMATCH`: the SQL is invalid, outside
+  `browser-app-v2`, or requires a newer/different browser SQL profile.
+- `ERR_BROWSER_DB_CLOSED` or `ERR_BROWSER_STATEMENT_CLOSED`: create a fresh
+  handle or statement instead of reusing a closed one.
+- `ERR_BROWSER_ACTIVE_STATEMENTS` or `ERR_BROWSER_TRANSACTION_ACTIVE`: close
+  statements and commit/rollback before closing or importing.
+- `ERR_BROWSER_BRANCH_UNSUPPORTED`: branch/snapshot workflows are native-only in
+  this browser profile.
 - `ERR_BROWSER_SERVICE_WORKER_UNSUPPORTED`: open the database from an
   application page/runtime owner instead of a service worker.
 - `ERR_BROWSER_SYNC_PEER_NOT_CONFIGURED`: configure the relay with

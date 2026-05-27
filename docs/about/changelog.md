@@ -33,6 +33,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `process_coordination=auto|required|single_process_unsafe` and
   `process_coordination_timeout_ms`, plus binding smoke coverage for the new
   diagnostics.
+- Added `@decentdb/web` browser parity hardening: `browser-app-v2` SQL profile
+  metadata, stable browser SQL error codes, protocol/capability metadata,
+  transaction/savepoint helpers, prepared statement reset/clear/page/async
+  iteration, explicit closed-handle/import lifecycle errors, OPFS checkpoint/
+  export/import diagnostics, browser sync apply-before-ack helpers, framework
+  recipes, a checked-in SQL parity corpus, and expanded browser benchmark
+  guardrails.
 
 ### Changed
 
@@ -52,6 +59,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   matching, trigram candidate pushdown for safe substring searches, bulk
   trigram index construction, and chunk-targeted `INTEGER PRIMARY KEY` lookups
   that avoid reconstructing a full paged table manifest.
+- Promoted the browser Future Win from roadmap item to delivered context in
+  `design/FUTURE_WINS.md`; follow-on browser work is now scoped to measured
+  parser breadth, security key handling, branch workflows, or performance.
 
 ### Fixed
 

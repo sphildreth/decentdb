@@ -24,7 +24,7 @@ pub(crate) fn parse_sql_batch(sql: &str) -> Result<Vec<Statement>> {
     let (generated_modes, sql_with_generated_rewrite) = rewrite_generated_virtual_columns(sql);
     if !generated_modes.is_empty() {
         return Err(DbError::sql(
-            "generated columns are not supported by the initial wasm parser",
+            "ERR_BROWSER_SQL_UNSUPPORTED|browser-app-v2|generated-column|generated columns are not supported by browser-app-v2",
         ));
     }
     let compat_sql = rewrite_legacy_trigger_body(sql_with_generated_rewrite.as_ref());
