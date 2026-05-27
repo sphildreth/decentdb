@@ -125,6 +125,7 @@ Delivered foundations to reuse:
 - Dart open/create/open-existing/memory modes, `close()`, `Finalizer` fallback,
   transactions, prepared statements, paging, checkpoint, save-as, branch
   workflow APIs, schema/tooling metadata, and typed value mappings.
+- Dart async facade in `async_database.dart` for isolate-backed execution.
 - Dart open options for process coordination and write queue parameters.
 - TDE v1 through Rust config and C ABI open options, including encryption of the
   database, WAL, and sync journal.
@@ -139,6 +140,8 @@ Current gaps:
   behavior.
 - There is no Flutter mobile plugin/package that bundles Android/iOS native
   DecentDB artifacts.
+- There is no mobile policy for sharing one native handle across Dart isolates
+  or for selecting the async facade as the mobile default.
 - There is no mobile app template showing app-private paths, TDE key retrieval,
   lifecycle handling, checkpointing, and relay sync.
 - There is no iOS/Android support matrix or simulator/device CI lane.
@@ -170,7 +173,13 @@ This win is complete only when all of these are true:
 - Relay sync mobile examples apply locally durably before acking relay delivery.
 - Simulator and device smoke tests exist for all Tier 1 claims.
 - Mobile benchmark guardrails record package size, cold open, first query,
-  prepared lookup loop, checkpoint/export, sync apply, and memory growth.
+  prepared lookup loop, checkpoint/export, sync apply, and memory growth. The
+  first release may use broad advisory thresholds captured from CI/device
+  baselines, but supported mobile claims must fail CI on severe regressions once
+  those baselines are accepted.
+- The reference Flutter app is either the integration-test host or is exercised
+  by the same integration scenarios, so documented examples cannot drift from
+  release validation.
 - Docs and `docs/about/changelog.md` are updated when implementation lands.
 
 ## 6. Support Tiers
@@ -188,19 +197,26 @@ Candidate initial matrix:
 
 | Platform | Initial target | Proposed tier after this win | Notes |
 |---|---|---|---|
-| Android Flutter, app-private internal storage | API 26+; `arm64-v8a` device; `x86_64` emulator | Tier 1 | Final API floor should match Rust/NDK and Flutter stable constraints measured during implementation. |
-| iOS Flutter, app-private Application Support storage | iOS 15+; arm64 device; simulator lane | Tier 1 or Tier 2 | Tier 1 requires real-device validation and an accepted XCFramework/static-link story. |
+| Android Flutter, app-private internal storage | API 26+; `arm64-v8a` device; `x86_64` emulator | Tier 2 until a documented real-device lane exists; Tier 1 after that gate passes | Final API floor should match Rust/NDK and Flutter stable constraints measured during implementation. |
+| iOS Flutter, app-private Application Support storage | iOS 15+; arm64 device; simulator lane | Tier 2 until a documented real-device lane exists; Tier 1 after that gate passes | Requires accepted XCFramework/static-link story plus real-device validation for Tier 1. |
 | Flutter desktop | Existing Linux/macOS/Windows package path | Existing supported surface | Not part of the mobile claim except for shared Dart API regression tests. |
 | Android app widgets, services, multiprocess providers sharing one DB | TBD | Candidate/Unsupported | Requires explicit cross-process mobile validation. |
 | iOS app extensions sharing one DB through app groups | TBD | Candidate/Unsupported | Requires explicit file-lock, WAL-retention, and entitlement validation. |
 | React Native, Swift, Kotlin direct SDKs | TBD | Candidate | Should follow Flutter proof unless product demand justifies parallel work. |
 | Cloud-synced directories, external SD/shared storage, user-visible Documents by default | N/A | Unsupported | App may export copies intentionally, but production DB files should remain app-private. |
 
+Adding `armeabi-v7a` requires a concrete promotion reason, such as a partner
+requirement or measured install-base need, plus release-blocking artifact-size,
+emulator/device, ABI-version, and smoke coverage for that ABI.
+
 ## 7. Package And SDK Architecture
+
+This section restates the implementation-facing requirements from ADR 0181.
+If ADR 0181 changes, this section must be updated in the same branch.
 
 ### 7.1 Package Shape
 
-Preferred direction:
+Accepted package shape:
 
 - Keep `bindings/dart/dart` as the pure Dart C ABI wrapper.
 - Add a thin Flutter mobile package, tentatively `decentdb_flutter`, that:
@@ -211,22 +227,17 @@ Preferred direction:
   - delegates all SQL/database work to the existing `decentdb` Dart package.
 
 This avoids forcing Flutter dependencies into pure Dart/CLI users while keeping
-the database API in one place.
-
-Acceptable alternative after review:
-
-- Add Flutter plugin platform directories directly to the existing `decentdb`
-  Dart package if package fragmentation creates more user friction than it
-  removes. If this route is chosen, docs must preserve pure Dart/desktop usage
-  and CI must still validate non-Flutter Dart tests.
+the database API in one place. Adding Flutter plugin platform directories
+directly to the existing `decentdb` package is no longer the v1 direction and
+requires new evidence that a separate package creates material user friction.
 
 ### 7.2 Native Artifacts
 
 Android package requirements:
 
 - Build `libdecentdb.so` for at least `arm64-v8a` and `x86_64`.
-- Decide whether `armeabi-v7a` is supported, candidate, or intentionally
-  omitted.
+- Omit `armeabi-v7a` in v1 unless the promotion gate in the support matrix is
+  met.
 - Package libraries under the Flutter/Gradle-native layout so apps do not set
   `libraryPath` manually.
 - Verify symbol exports, ABI version, and C ABI layout on each architecture.
@@ -236,7 +247,9 @@ iOS package requirements:
 
 - Produce an XCFramework or equivalent Flutter-compatible package for iOS
   device and simulator.
-- Decide whether the Rust crate needs `staticlib` in addition to `cdylib`.
+- Use static-library-compatible Rust artifacts as the preferred XCFramework
+  input. Add `staticlib` to the Rust crate build outputs if implementation
+  proves it is needed for the accepted iOS link model.
 - Ensure Dart FFI loading works for the chosen link model, including
   `DynamicLibrary.process()` or generated plugin registration when appropriate.
 - Verify bitcode/symbol/signing expectations for current Xcode/Flutter stable.
@@ -246,7 +259,11 @@ Shared requirements:
 
 - Native artifacts must be built from the same DecentDB version as the Dart
   package metadata.
-- ABI mismatch must fail clearly at startup.
+- ABI mismatch must fail clearly at startup through a typed Dart exception or a
+  stable DecentDB mobile error wrapper around the existing ABI check. The error
+  must include expected ABI, loaded ABI, artifact path or package source when
+  known, and recovery guidance to align the Flutter package and native
+  artifact versions.
 - Release packages must include license notices and artifact checksums.
 - No mobile package should download executable native code at runtime.
 
@@ -266,6 +283,9 @@ update rules.
 
 ## 8. Mobile Storage Contract
 
+This section restates the storage-facing requirements from ADR 0182. If ADR
+0182 changes, this section must be updated in the same branch.
+
 ### 8.1 Database Locations
 
 Recommended defaults:
@@ -281,12 +301,24 @@ Recommended defaults:
 The SDK should make the safe default easy:
 
 ```dart
-final path = await DecentDbMobilePaths.appDatabasePath('app.ddb');
-final db = Database.open(path, libraryPath: await DecentDbMobile.libraryPath());
+final db = await DecentDbMobile.openDatabase('app.ddb');
 ```
 
 The exact helper names are placeholders. The important contract is that users
-should not guess live database paths in examples.
+should not guess live database paths or native library paths in the normal
+Flutter-plugin path.
+
+The explicit `libraryPath` fallback is only for custom/non-plugin loading:
+
+```dart
+final path = await DecentDbMobilePaths.appDatabasePath('app.ddb');
+final libraryPath = await DecentDbMobile.resolveLibraryPathForCustomLoader();
+final db = Database.open(path, libraryPath: libraryPath);
+```
+
+The `.ddb` extension is the recommended DecentDB database-file extension in
+docs and examples. The engine does not require that extension; applications may
+use another name when their storage policy requires it.
 
 ### 8.2 Sidecar Files
 
@@ -295,11 +327,13 @@ Docs and helpers must treat these as a single database set:
 - main `.ddb` file;
 - WAL sidecar;
 - sync journal sidecar;
-- coordination sidecar when process coordination is enabled;
-- future backup/PITR manifests when applicable.
+- coordination sidecar when process coordination is enabled.
 
-Move, delete, export, or restore workflows must not silently copy only the main
-file unless the API explicitly creates a consistent backup/export artifact.
+This is the v1 mobile database-set contract. Any new authoritative sidecar or
+manifest that mobile backup/restore must preserve requires an ADR or an update
+to this spec. Move, delete, export, or restore workflows must not silently copy
+only the main file unless the API explicitly creates a consistent backup/export
+artifact.
 
 ### 8.3 OS Backup And Cloud Sync
 
@@ -315,6 +349,9 @@ Default live database placement should not imply cloud-sync safety.
 
 ## 9. Lifecycle Contract
 
+This section restates the implementation-facing requirements from ADR 0182.
+If ADR 0182 changes, this section must be updated in the same branch.
+
 Mobile apps have discontinuous execution. The SDK should make the safe path
 boring and explicit.
 
@@ -327,8 +364,26 @@ boring and explicit.
   cleanup order clearly through the Dart API.
 - Long-lived singleton handles are acceptable for foreground apps when lifecycle
   callbacks checkpoint/close according to policy.
+- After process kill, app restart, isolate restart, or native-handle loss, all
+  previous `Database` and `Statement` Dart objects are invalid. The app must
+  reopen the database and recreate prepared statements. WAL recovery reclaims
+  committed database state; native statement handles are process memory and are
+  not durable resources.
 
-### 9.2 Foreground And Background
+### 9.2 Dart Isolates And Async Access
+
+Mobile apps should not share one native `Database` handle across arbitrary Dart
+isolates. The recommended mobile pattern is one owning isolate per database
+handle, with app/UI code calling through an async facade or command queue. The
+existing `async_database.dart` facade should be evaluated as the default mobile
+pattern and extended only where mobile lifecycle or sync ergonomics require it.
+
+If an app opens separate handles from multiple isolates or processes, it must
+use the documented process-coordination profile and accept the single-writer
+contract. Tier 1 mobile support does not include multi-isolate shared-handle
+access.
+
+### 9.3 Foreground And Background
 
 Recommended default policy:
 
@@ -343,7 +398,7 @@ Recommended default policy:
 Docs must be clear that `checkpoint()` improves startup/storage behavior but is
 not required for committed durability when WAL sync mode is durable.
 
-### 9.3 Background Sync
+### 9.4 Background Sync
 
 Background sync must be framed as opportunistic:
 
@@ -357,7 +412,7 @@ Background sync must be framed as opportunistic:
 The SDK may provide helper patterns, but it must not claim that iOS or Android
 will run sync continuously.
 
-### 9.4 Multiprocess And Extensions
+### 9.5 Multiprocess And Extensions
 
 Initial Tier 1 should be single app process. App extensions, widgets,
 foreground services, or content providers sharing one database file must remain
@@ -370,6 +425,9 @@ candidate/unsupported until tests prove:
 - all participants use compatible DecentDB versions and open options.
 
 ## 10. TDE And Platform Key Stores
+
+This section restates the implementation-facing requirements from ADR 0183.
+If ADR 0183 changes, this section must be updated in the same branch.
 
 TDE v1 accepts application-owned key bytes and encrypts the database, WAL, and
 sync journal through the VFS layer. Mobile hardening should make this easy to
@@ -388,9 +446,17 @@ Docs and examples must cover:
 - clearing temporary Dart/native key buffers as far as the platform permits;
 - separating sync authentication credentials from database encryption keys.
 
+Dart key clearing is best-effort. A `Uint8List` returned from a provider can be
+overwritten by application code, but Dart GC, copies, and FFI conversions may
+leave additional memory copies outside deterministic control. Mobile helpers
+should minimize copies, prefer short-lived buffers, document the limitation, and
+use FFI allocation/free or platform secure-storage APIs where that materially
+reduces exposure. The spec must not imply C-style guaranteed zeroization for all
+Dart-managed key bytes.
+
 ### 10.2 API Shape
 
-Preferred helper shape:
+Accepted target helper shape:
 
 ```dart
 abstract interface class DecentDbKeyProvider {
@@ -415,6 +481,10 @@ implementation feedback proves a narrower prerequisite is required.
 
 ## 11. Sync Relay Mobile Contract
 
+This section follows ADR 0166, ADR 0167, ADR 0168, and ADR 0182. If those ADRs
+change the relay, public changeset, shape subscription, or mobile lifecycle
+contract, this section must be updated in the same branch.
+
 Mobile sync should reuse public changesets and the production relay protocol.
 
 Required examples:
@@ -429,6 +499,8 @@ Required examples:
 Apply-before-ack rule:
 
 ```dart
+// Target API shape. Current Dart sync support may need wrappers over the
+// existing C ABI JSON/public changeset entry points before this is available.
 await db.transaction(() async {
   await db.sync.applyChangeset(message.changeset);
 });
@@ -453,6 +525,8 @@ Required Flutter/mobile helpers:
 - relay apply-before-ack example helper or recipe;
 - diagnostics surface that reports platform, artifact ABI, DecentDB ABI,
   database path class, open options summary, and support tier.
+- typed startup errors for native library load failure and ABI mismatch, with
+  recovery guidance for package/artifact version alignment.
 
 The existing Dart `Database` API should remain the main database API. Additions
 to the pure Dart package should be limited to mobile-neutral improvements such
@@ -482,6 +556,9 @@ Minimum integration coverage:
 - process kill or forced restart with WAL recovery.
 - relay apply-before-ack with a mock relay or local relay.
 - package asset loading without manual `libraryPath`.
+- reference Flutter app scenarios for the same create/open, encrypted reopen,
+  lifecycle, and sync apply-before-ack paths. The reference app may be the test
+  host, or tests may drive it through a shared scenario harness.
 
 Tier 1 additionally requires at least one real-device lane or documented
 release-blocking device-lab process for each claimed platform.
@@ -503,6 +580,8 @@ Record at least:
 - memory before/after large result paging.
 
 Guardrails should start broad and tighten from measured CI/device baselines.
+Initial benchmark output is advisory until baselines are accepted; after that,
+severe regressions in supported mobile lanes should fail release validation.
 Durable defaults must not be weakened for mobile benchmark wins.
 
 ## 14. Documentation
@@ -517,6 +596,9 @@ Docs must include:
 - relay sync apply-before-ack cookbook;
 - troubleshooting table for library load, ABI mismatch, missing key, wrong key,
   busy/locked database, background task suspension, and restore issues;
+- ABI mismatch troubleshooting must name the Dart exception/error shape, show
+  expected vs loaded ABI values, and tell users to align the `decentdb`,
+  `decentdb_flutter`, and packaged native artifact versions.
 - release artifact verification instructions;
 - unsupported environments and why they are unsupported.
 
@@ -532,15 +614,17 @@ Update targets when implementation lands:
 
 ## 15. Phased Implementation Plan
 
-### Phase 0: ADR/Spec Finalization And Inventory
+### Phase 0: ADR/Spec Validation And Inventory
 
-- Review this spec and decide whether a dedicated mobile runtime ADR is needed
-  before code.
+- Validate and lock the accepted ADR/spec decisions for the first implementation
+  slice; do not reopen package shape, mobile runtime contract, or key-store
+  boundary without new evidence.
 - Inventory Flutter stable, Rust target, Android NDK, iOS/Xcode, and CI
   constraints.
-- Decide the initial Tier 1 matrix.
-- Decide package shape: separate `decentdb_flutter` plugin vs adding Flutter
-  platform folders to the existing Dart package.
+- Validate the initial Tier 2 simulator/emulator matrix and define explicit
+  real-device promotion gates for Tier 1.
+- Confirm the separate `decentdb_flutter` plugin layout and mobile workflow
+  trigger policy.
 
 ### Phase 1: Native Artifact Build And Loader
 
@@ -551,7 +635,7 @@ Update targets when implementation lands:
 
 ### Phase 2: Flutter Mobile Package And Example App
 
-- Add the mobile plugin/package or Flutter platform folders.
+- Add the separate `decentdb_flutter` mobile plugin/package.
 - Add a reference Flutter app.
 - Demonstrate app-private paths, create/open, prepared statements, transaction,
   checkpoint, close, and reopen.
@@ -592,8 +676,16 @@ Update targets when implementation lands:
 - Flutter mobile package path works on Android and iOS without manual native
   library copying.
 - Tier 1 support claims have release-blocking tests.
+- Tier 2 support claims have release-blocking simulator/emulator tests and
+  clearly documented real-device promotion gates.
 - Mobile docs clearly describe app-private storage, sidecars, backups, TDE key
   handling, lifecycle, background sync, and unsupported environments.
+- Mobile docs state the v1 database-set contract and require ADR/spec updates
+  before adding authoritative sidecars to mobile backup/restore obligations.
+- Mobile docs state that database handles and prepared statements are invalid
+  after process/isolate restart and must be recreated after reopen.
+- Mobile docs state the Dart key zeroing limitation and the best-effort buffer
+  handling policy.
 - Sync examples preserve apply-before-ack ordering.
 - TDE examples never log key material or store it beside the database.
 - Benchmarks and package-size guardrails run in release validation.

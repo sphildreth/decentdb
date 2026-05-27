@@ -49,7 +49,14 @@ separate real-device lane or a documented device-lab process.
 Mobile packages must not download executable native code at runtime. Release
 artifacts must be built from the same DecentDB version as Dart package metadata,
 must include license notices, and must fail clearly when the native ABI version
-does not match the Dart binding expectation.
+does not match the Dart binding expectation. ABI mismatch must surface through a
+typed Dart exception or stable mobile error wrapper that includes expected ABI,
+loaded ABI, artifact path or package source when known, and recovery guidance to
+align the `decentdb`, `decentdb_flutter`, and packaged native artifact versions.
+
+Adding `armeabi-v7a` requires a concrete promotion reason, such as a partner
+requirement or measured install-base need, plus release-blocking artifact-size,
+emulator/device, ABI-version, and smoke coverage for that ABI.
 
 ### Rationale
 
@@ -120,4 +127,3 @@ artifact workflow.
 - `docs/api/dart.md`
 - `design/adr/0160-binding-native-semantic-data-types.md`
 - `design/adr/0179-cross-process-public-contract-bindings-and-diagnostics.md`
-

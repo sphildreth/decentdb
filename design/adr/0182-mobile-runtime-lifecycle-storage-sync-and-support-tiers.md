@@ -29,10 +29,11 @@ placed in cloud-synced folders, external/shared storage, temporary directories,
 or user-visible Documents by default.
 
 The database set includes the main database file, WAL sidecar, sync journal,
-coordination sidecar when enabled, and future backup/PITR manifests. Move,
-delete, restore, and support workflows must not silently operate on only the
-main file unless they are using a DecentDB API that creates a consistent
-artifact.
+and coordination sidecar when enabled. This is the v1 mobile database-set
+contract. Any new authoritative sidecar or manifest that mobile backup/restore
+must preserve requires an ADR or an update to the mobile spec. Move, delete,
+restore, and support workflows must not silently operate on only the main file
+unless they are using a DecentDB API that creates a consistent artifact.
 
 Mobile lifecycle guidance is:
 
@@ -46,6 +47,23 @@ Mobile lifecycle guidance is:
 - rely on normal WAL recovery for process kill and crash recovery;
 - explain that checkpointing improves startup/storage behavior but is not
   required for committed durability when WAL sync mode is durable.
+
+After process kill, app restart, isolate restart, or native-handle loss, all
+previous `Database` and `Statement` Dart objects are invalid. Applications must
+reopen the database and recreate prepared statements. WAL recovery reclaims
+committed database state; native statement handles are process memory and are
+not durable resources.
+
+Mobile apps should not share one native `Database` handle across arbitrary Dart
+isolates. The recommended mobile pattern is one owning isolate per database
+handle, with app/UI code calling through an async facade or command queue. The
+existing Dart async facade should be evaluated as the default mobile pattern
+and extended only where mobile lifecycle or sync ergonomics require it.
+
+If an app opens separate handles from multiple isolates or processes, it must
+use the documented process-coordination profile and accept the one-writer
+contract. Tier 1 mobile support does not include multi-isolate shared-handle
+access.
 
 Mobile background sync is opportunistic. iOS and Android background schedulers
 must be described as best-effort. Sync examples must use apply-before-ack:
@@ -136,4 +154,3 @@ behavior still needs device validation before production claims are made.
 - `design/adr/0179-cross-process-public-contract-bindings-and-diagnostics.md`
 - `docs/user-guide/sync/relay.md`
 - `docs/user-guide/write-concurrency.md`
-

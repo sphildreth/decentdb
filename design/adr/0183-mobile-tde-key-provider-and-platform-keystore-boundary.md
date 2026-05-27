@@ -45,6 +45,14 @@ unrecoverable unless the application has its own key escrow or backup policy.
 DecentDB must surface a clear missing-key or wrong-key error and must not
 silently recreate an encrypted database over restored data.
 
+Dart key clearing is best-effort. A `Uint8List` returned from a provider can be
+overwritten by application code, but Dart GC, copies, and FFI conversions may
+leave additional memory copies outside deterministic control. Mobile helpers
+should minimize copies, prefer short-lived buffers, document the limitation, and
+use FFI allocation/free or platform secure-storage APIs where that materially
+reduces exposure. The ADR does not require or imply C-style guaranteed
+zeroization for all Dart-managed key bytes.
+
 Online key rotation, authenticated page/chunk encryption, remote KMS
 integrations, and engine-owned key escrow are out of scope for this mobile win.
 Those belong under future authenticated encryption/key-rotation work unless a
@@ -106,4 +114,3 @@ into data loss.
 - `design/adr/0174-local-data-security-tde-policies-masking-audit-context.md`
 - `docs/user-guide/security.md`
 - `docs/api/configuration.md`
-
