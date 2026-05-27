@@ -92,7 +92,7 @@ benchmarks that prove the durability/recovery complexity is worth it.
 - Preserve explicit profile names in release assets so default and tuned results
   cannot be confused.
 - Add performance Doctor findings only where DecentDB can attach concrete
-  evidence and safe remediation guidance.
+  evidence through stable runtime surfaces and safe remediation guidance.
 
 ## 3. Non-Goals
 
@@ -206,9 +206,15 @@ Provisional phase-1 targets:
 | Aggregates | Reduce default/tuned p95 ratio by at least 3x from the current baseline, with `decentdb_balanced_durable` aggregate p95 no worse than 0.05 ms. |
 | Joins | Reduce default/tuned p95 ratio by at least 2x from the current baseline, with `decentdb_balanced_durable` join p95 no worse than 0.016 ms. |
 | Durable commit p95 | Improve default p95 by at least 20%, with `decentdb_balanced_durable` commit p95 no worse than 0.75 ms and without weakening `WalSyncMode::Full`. |
-| Insert throughput | Improve default throughput by at least 10%, with `decentdb_balanced_durable` insert throughput at or above 1,775,000 rows/sec on the accepted baseline lane, or explicitly defer the remaining gap with benchmark evidence that it requires format/write-path work. |
+| Insert throughput | Improve default throughput by at least 10%, with `decentdb_balanced_durable` insert throughput at or above 1,779,000 rows/sec on the accepted baseline lane, or explicitly defer the remaining gap with benchmark evidence that it requires format/write-path work. |
 | Storage size | Do not regress `decentdb_balanced_durable` combined main database plus WAL size after checkpoint; improve that combined size by at least 5% from the accepted baseline where existing checkpoint/freelist/rewrite mechanisms can do so. The current denominator is 3.6914 MiB. |
 | Cold open and first query | Establish accepted p95 baselines for small, medium, and large databases, then improve targeted `decentdb_balanced_durable` profiles by at least 20%. |
+
+`decentdb_low_memory_durable` is a release-profile guardrail, not a phase-1
+improvement target. It should preserve the accepted constrained-host behavior
+unless benchmark evidence justifies changing it. Any low-memory profile change
+must get its own accepted baseline and must not exceed the section 6.4
+regression thresholds.
 
 If a target is infeasible after benchmark evidence, the spec must be updated
 with the measured reason and the follow-up design path, such as a format ADR.
@@ -239,6 +245,12 @@ threading limitation, such as single-threaded execution or non-`Send`
 connections. Until the benchmark records exact DuckDB PRAGMAs/settings and
 durability guarantees, the DuckDB row must be labeled as `duckdb_engine_default`
 and not presented as a full-sync WAL peer.
+
+DuckDB rename sequencing is strict: first record the exact DuckDB PRAGMAs,
+connection settings, and durability note in benchmark metadata; then update the
+harness profile key to `duckdb_engine_default`; then regenerate JSON summaries
+and charts. New release assets must not publish a bare `duckdb` key once this
+metadata exists.
 
 Partial comparison rows are allowed only when clearly labeled as partial. The
 current H2 and HSQLDB rows contain only `read_p95_ms`; they must either be
@@ -290,6 +302,11 @@ OS-page-cache eviction such as `posix_fadvise(DONTNEED)` where available,
 isolated temporary storage, or an intentionally warm cache. Release charts must
 not mix cold and warm results under one label.
 
+Cold/open chart labels must use stable metadata fields instead of ad hoc names:
+`process_state` is `fresh_process` or `warm_process`; `os_cache_state` is
+`evicted_os_cache`, `warm_os_cache`, or `unknown_os_cache`; and
+`storage_state` is `isolated_temp_storage` or `reused_storage`.
+
 Cold-open fixtures must use a stable OLTP-ish schema shape, not only row counts:
 
 - one primary table with an `INT64` primary key, at least six scalar columns,
@@ -308,6 +325,7 @@ Cold-open fixtures must use a stable OLTP-ish schema shape, not only row counts:
 Every performance change must say which baseline it targets:
 
 - `decentdb_balanced_durable` native;
+- `decentdb_low_memory_durable` native;
 - tuned durable native;
 - binding path;
 - browser/WASM;
@@ -334,6 +352,11 @@ maintainers own triage for regressions in their subsystem. If noise makes a
 threshold unreliable, the benchmark must be fixed or relabeled before it can be
 used as a release-blocking gate.
 
+Release-blocking benchmark lanes must record sample count and relative standard
+deviation for the gated metric. A lane should not block release unless it has at
+least five independent runs and relative standard deviation no greater than 5%,
+or benchmark maintainers explicitly accept a different threshold for that lane.
+
 ## 7. Implementation Tracks
 
 ### 7.1 Default Configuration And Checkpoint Policy
@@ -356,10 +379,12 @@ The default page cache size is the leading first-phase hypothesis. The current
 benchmark gap compares a 4 MiB default profile with a 64 MiB tuned profile, so
 the first benchmark slice must sweep at least 4, 8, 16, 24, 32, and 64 MiB
 under the same durable settings before changing deeper executor or storage code
-for read latency. The first serious default candidate is 16 MiB. Move the balanced
-default to 32 MiB only if benchmarks show a clear cross-workload win over
-16 MiB across point, concurrent, range, join, aggregate, browser/mobile, and
-memory profiles.
+for read latency. The sweep must include point reads, range scans, concurrent
+reads, joins, aggregates, durable commit p95, insert throughput, storage size
+after checkpoint, and memory. The first serious default candidate is 16 MiB.
+Move the balanced default to 32 MiB only if benchmarks show a clear
+cross-workload win over 16 MiB across point, concurrent, range, join, aggregate,
+browser/mobile, and memory profiles.
 
 If the accepted default cache grows, DecentDB must also keep an explicit
 low-memory profile or documented open option for constrained hosts. The
@@ -426,6 +451,14 @@ row-source loading, narrower covered index reads, and lower prepared-statement
 overhead. If benchmark evidence points instead to lock contention or reader
 retention semantics, that requires a follow-up ADR before changing the
 one-writer/many-readers contract.
+
+For this spec, stale or unverifiable index state means the executor cannot prove
+that the chosen index reflects the committed schema and visible rows for the
+statement snapshot. Examples include schema-cookie or index-generation mismatch,
+an index marked invalid after failed build/rebuild, missing required include
+payload, verification failure, or unsupported transaction-local overlay. This
+spec does not add new persistent staleness metadata; if implementation needs
+that, the format impact must be handled through the appropriate ADR path.
 
 ### 7.4 Statistics And Plan Reuse
 
@@ -599,22 +632,25 @@ work, profile naming, cache sweeps, binding benchmarks, and documentation can
 still proceed because they do not depend on the ADR's covering-index contract.
 
 1. Land this spec and ADR 0184.
-2. Add benchmark slices for cold open, first query, storage size, and binding
-   prepared-statement paths.
+2. Add benchmark harness slices and metadata fields for cold open, first query,
+   storage size, and binding prepared-statement paths.
 3. Run baseline measurements and record accepted targets. This is a gate before
    default tuning or planner/executor changes are judged complete.
-4. Update benchmark aggregation and chart scripts for canonical profile keys:
-   `decentdb_balanced_durable`, `decentdb_low_memory_durable`,
-   `decentdb_tuned_durable`, and `duckdb_engine_default` when DuckDB settings
-   are recorded. Keep compatibility handling for old `decentdb_default_durable`
-   inputs during the transition.
+4. Update benchmark aggregation and chart scripts for canonical profile keys.
+   Benchmark maintainers own the `data/bench_summary.json` transition from
+   `decentdb_default_durable` to `decentdb_balanced_durable`, the DuckDB
+   metadata then `duckdb_engine_default` rename sequence, and H2/HSQLDB partial
+   row cleanup. Keep compatibility handling for old inputs during the
+   transition.
 5. Run the 4/8/16/24/32/64 MiB cache sweep, using 16 MiB as the first balanced
    default candidate and preserving an explicit low-memory profile. The sweep
-   must include at least point reads, range scans, concurrent reads, durable
-   commit p95, insert throughput, storage size after checkpoint, and memory.
+   must include at least point reads, range scans, concurrent reads, joins,
+   aggregates, durable commit p95, insert throughput, storage size after
+   checkpoint, and memory.
 6. Add Python as the first maintained binding benchmark profile.
-7. Add cold-open fixtures for small, medium, and large databases using the
-   accepted row-count/size targets in section 12.
+7. Generate cold-open fixtures for small, medium, and large databases using the
+   accepted row-count/size targets in section 12; this is fixture data work on
+   top of the harness slices from step 2.
 8. Implement no-format default tuning and checkpoint policy changes.
 9. Implement ADR 0184 planner/executor improvements, starting with covering
    index cases that can be proven safe.
