@@ -101,6 +101,61 @@ SELECT * FROM users WHERE name ILIKE '%SMITH%';
 - Very common patterns (like 'the') may not use the index
 - Only works with `%pattern%` style LIKE queries
 
+## Full-Text Indexes
+
+Full-text indexes provide tokenized keyword search, phrase search, prefix
+search, and BM25 ranking over one or more `TEXT` columns.
+
+### Creating Full-Text Indexes
+
+```sql
+CREATE INDEX idx_docs_search
+ON docs USING fulltext (title, body)
+WITH (
+    tokenizer = 'unicode',
+    language = 'simple',
+    stopwords = 'none',
+    stemming = 'none',
+    case_folded = true,
+    diacritics = 'preserve',
+    prefix = '2,3'
+);
+```
+
+Only `fulltext` is accepted as the access-method keyword. `fts` and
+`full_text` are not aliases.
+
+### Querying Full-Text Indexes
+
+Use `fulltext_match(index_name, query)` in `WHERE` and `bm25(index_name)` in
+the same query block for ranking:
+
+```sql
+SELECT id, title, bm25('idx_docs_search') AS rank
+FROM docs
+WHERE fulltext_match('idx_docs_search', 'database OR search')
+ORDER BY rank DESC
+LIMIT 20;
+
+SELECT id
+FROM docs
+WHERE fulltext_match('idx_docs_search', '"embedded database"');
+```
+
+The query language supports terms, quoted phrases, `OR`, excluded terms with
+`-term`, and prefix terms such as `dec*` when the index was created with a
+matching `prefix` policy. Multiple non-`OR` terms are an implicit AND.
+
+### Full-Text Index Limitations
+
+- Indexed columns must be plain `TEXT` columns. Expressions, partial predicates,
+  `UNIQUE`, and `INCLUDE` columns are not supported for full-text indexes.
+- Prefix queries are disabled unless the index has explicit prefix lengths.
+- `bm25(index_name)` requires a compatible `fulltext_match(index_name, ...)`
+  predicate in the same query block.
+- `ALTER INDEX index_name VERIFY` validates the derived runtime index, and
+  `ALTER INDEX index_name REBUILD` rebuilds it from base table rows.
+
 ## Spatial Indexes
 
 Spatial indexes accelerate native `GEOMETRY` and `GEOGRAPHY` columns. They store spatial envelopes in a native grid index and refine matches with exact `ST_*` predicate evaluation.

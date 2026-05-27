@@ -46,6 +46,8 @@ It targets a single process with **one writer** and **many concurrent readers** 
 - 📈 **Queryable Operational Metrics** - Stable `sys.*` inspection views expose WAL, write-queue, storage, reactive subscription, and sync status snapshots without telemetry writes
 - 🌿 **Branch, Diff, Restore, And Time Travel** - Named snapshots, isolated branch writes, branch diffs, guarded restore, and constrained merge for migration rehearsal and agent sandboxes
 - 🔎 **Trigram Index** - Fast text search for `LIKE '%pattern%'` queries
+- 🔍 **Full-Text Search** - Native `USING fulltext` indexes with phrase/prefix
+  queries and BM25 ranking through `fulltext_match` and `bm25`
 - 🗺️ **Native Geospatial** - `GEOMETRY` / `GEOGRAPHY` values, `ST_*` functions, and `USING spatial` indexes
 - 🧪 **Comprehensive Testing** - Unit tests, property tests, crash injection, and differential testing
 - 🔄 **Foreign Key Constraints** - Automatic indexing and referential integrity enforcement
@@ -193,6 +195,10 @@ decentdb exec --db ./my.ddb --sql "SELECT u.name, SUM(o.amount) AS total
 decentdb exec --db ./my.ddb --sql "CREATE INDEX idx_users_name ON users USING trigram(name)"
 decentdb exec --db ./my.ddb --sql "SELECT * FROM users WHERE name LIKE '%ali%'"
 
+# Ranked full-text search
+decentdb exec --db ./my.ddb --sql "CREATE INDEX idx_docs_search ON docs USING fulltext(title, body) WITH (prefix = '2,3')"
+decentdb exec --db ./my.ddb --sql "SELECT id, bm25('idx_docs_search') AS rank FROM docs WHERE fulltext_match('idx_docs_search', 'database OR search') ORDER BY rank DESC LIMIT 20"
+
 # Geospatial radius query with a spatial index
 decentdb exec --db ./my.ddb --sql "CREATE TABLE places (id INT PRIMARY KEY, geog GEOGRAPHY(POINT,4326))"
 decentdb exec --db ./my.ddb --sql "CREATE INDEX idx_places_geog ON places USING spatial(geog)"
@@ -269,7 +275,7 @@ DecentDB is organized into focused modules:
 - **Record** - Typed value encoding with overflow pages
 - **Catalog** - Schema metadata management
 - **SQL/Planner/Exec** - Query parsing, planning, and execution
-- **Search** - Trigram inverted index for text search
+- **Search** - Trigram substring search and native full-text search
 
 ## Development
 

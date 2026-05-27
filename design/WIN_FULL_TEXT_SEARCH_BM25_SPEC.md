@@ -1,7 +1,7 @@
 # Full-Text Search With BM25 Ranking
 
 **Date:** 2026-05-26
-**Status:** Active implementation spec seed
+**Status:** Implemented; retained as design and acceptance reference
 **Future Version:** vNext
 **Roadmap:** [`FUTURE_WINS.md`](FUTURE_WINS.md)
 **Document Type:** Implementation SPEC
@@ -13,6 +13,13 @@ coding agents
 
 - [`adr/0175-native-full-text-search-query-surface-and-ranking.md`](adr/0175-native-full-text-search-query-surface-and-ranking.md)
 - [`adr/0176-full-text-search-storage-durability-and-binding-contract.md`](adr/0176-full-text-search-storage-durability-and-binding-contract.md)
+
+**Implementation status, 2026-05-26:** The engine implements `USING fulltext`
+indexes, persisted analyzer config, `fulltext_match`, `bm25`, phrase/prefix
+querying, write-path maintenance, planner prefiltering, rebuild/verify SQL,
+tooling metadata, documentation, and regression coverage. Follow-up work should
+be filed as performance, hybrid-search, fuzzy-search, or binding-helper items
+rather than reopening this roadmap win.
 
 **Related inputs:**
 

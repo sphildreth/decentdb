@@ -2542,6 +2542,7 @@ mod tests {
                 columns: vec![format!("col_{i}")],
                 include_columns: vec![],
                 predicate_sql: None,
+                full_text_options_json: None,
                 fresh: true,
             })
             .collect();
@@ -2577,6 +2578,7 @@ mod tests {
                 columns: vec![format!("col_{i}")],
                 include_columns: vec![],
                 predicate_sql: None,
+                full_text_options_json: None,
                 fresh: true,
             })
             .collect();
@@ -2606,6 +2608,7 @@ mod tests {
             columns: vec!["a".into()],
             include_columns: vec![],
             predicate_sql: None,
+            full_text_options_json: None,
             fresh: false,
         });
         let findings = evaluate_rules(&data);
@@ -3224,6 +3227,7 @@ mod tests {
             columns: vec!["v".into()],
             include_columns: vec![],
             predicate_sql: None,
+            full_text_options_json: None,
             fresh: false,
         });
         let findings = evaluate_rules(&data);

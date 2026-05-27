@@ -103,6 +103,36 @@ SELECT key, value FROM sys_audit_context ORDER BY key;
 Audit context is connection-local. It is used by row policies, column masks,
 and security audit event rows.
 
+## Full-Text Search Functions
+
+Full-text search is exposed through ordinary SQL functions over
+`USING fulltext` indexes.
+
+| Function | Returns | Notes |
+|---|---|---|
+| `fulltext_match(index_name, query)` | `BOOL` | Predicate for a full-text index in a `WHERE` query block. |
+| `bm25(index_name)` | `FLOAT64` | Ranking score for rows matched by the same-block `fulltext_match` predicate. |
+
+Example:
+
+```sql
+CREATE INDEX idx_docs_search
+ON docs USING fulltext (title, body)
+WITH (prefix = '2,3');
+
+SELECT id, title, bm25('idx_docs_search') AS rank
+FROM docs
+WHERE fulltext_match('idx_docs_search', '"embedded database" OR search')
+ORDER BY rank DESC
+LIMIT 20;
+```
+
+The query string supports terms, quoted phrases, uppercase `OR`, exclusions
+with `-term`, and prefix terms such as `dec*` when the index has matching
+prefix lengths. Invalid full-text query syntax returns an `FTS query error:`
+SQL error. Calling `bm25(...)` without a compatible same-block
+`fulltext_match(...)` returns an `FTS semantic error:`.
+
 ## Operational inspection views
 
 DecentDB exposes operational inspection surfaces through stable, read-only `sys.*`

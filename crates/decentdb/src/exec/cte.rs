@@ -3,7 +3,9 @@ use std::collections::BTreeSet;
 use crate::catalog::identifiers_equal;
 use crate::error::{DbError, Result};
 use crate::record::value::Value;
-use crate::sql::ast::{CommonTableExpr, Expr, FromItem, Query, QueryBody, Select, SelectItem};
+use crate::sql::ast::{
+    CommonTableExpr, Expr, FromItem, JoinConstraint, Query, QueryBody, Select, SelectItem,
+};
 
 use super::projection_has_aggregate_items;
 use super::row::Dataset;
@@ -17,7 +19,12 @@ pub(crate) fn augment_dataset_with_outer_scope(
         return dataset;
     }
 
-    dataset.columns.extend(outer_dataset.columns.clone());
+    dataset
+        .columns
+        .extend(outer_dataset.columns.iter().cloned().map(|mut binding| {
+            binding.hidden = true;
+            binding
+        }));
     for row in dataset.rows_mut() {
         row.extend_from_slice(outer_row);
     }
@@ -83,13 +90,20 @@ pub(crate) fn select_references_outer(
     outer_tables: &BTreeSet<String>,
     local_tables: &BTreeSet<String>,
 ) -> bool {
-    select.projection.iter().any(|item| match item {
-        SelectItem::Expr { expr, .. } => expr_references_outer(expr, outer_tables, local_tables),
-        SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => false,
-    }) || select
-        .filter
-        .as_ref()
-        .is_some_and(|expr| expr_references_outer(expr, outer_tables, local_tables))
+    select
+        .from
+        .iter()
+        .any(|item| from_item_references_outer(item, outer_tables, local_tables))
+        || select.projection.iter().any(|item| match item {
+            SelectItem::Expr { expr, .. } => {
+                expr_references_outer(expr, outer_tables, local_tables)
+            }
+            SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => false,
+        })
+        || select
+            .filter
+            .as_ref()
+            .is_some_and(|expr| expr_references_outer(expr, outer_tables, local_tables))
         || select
             .group_by
             .iter()
@@ -102,6 +116,35 @@ pub(crate) fn select_references_outer(
             .distinct_on
             .iter()
             .any(|expr| expr_references_outer(expr, outer_tables, local_tables))
+}
+
+fn from_item_references_outer(
+    item: &FromItem,
+    outer_tables: &BTreeSet<String>,
+    local_tables: &BTreeSet<String>,
+) -> bool {
+    match item {
+        FromItem::Table { .. } => false,
+        FromItem::Subquery { query, .. } => query_references_outer_tables(query, outer_tables),
+        FromItem::Function { args, .. } => args
+            .iter()
+            .any(|arg| expr_references_outer(arg, outer_tables, local_tables)),
+        FromItem::Join {
+            left,
+            right,
+            constraint,
+            ..
+        } => {
+            from_item_references_outer(left, outer_tables, local_tables)
+                || from_item_references_outer(right, outer_tables, local_tables)
+                || match constraint {
+                    JoinConstraint::On(expr) => {
+                        expr_references_outer(expr, outer_tables, local_tables)
+                    }
+                    JoinConstraint::Using(_) | JoinConstraint::Natural => false,
+                }
+        }
+    }
 }
 
 pub(crate) fn expr_references_outer(

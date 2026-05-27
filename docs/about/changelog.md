@@ -16,11 +16,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   context SQL functions; `sys_audit_context`; and security DDL audit events.
 - Added ADR 0174 documenting the TDE, policy, masking, audit-context, C ABI, and
   follow-up security boundaries.
+- Added native full-text search with `USING fulltext` indexes, persisted
+  analyzer options, `fulltext_match`, `bm25` ranking, phrase and prefix queries,
+  write-path maintenance, `ALTER INDEX ... VERIFY`, `ALTER INDEX ... REBUILD`,
+  tooling metadata, and SQL/user documentation.
 
 ### Changed
 
 - Bumped the C ABI version to 6 for the new audit-context entry points and TDE
   open options, and updated the Dart ABI expectation/header copies.
+- Bumped the database format version to 12 for full-text index metadata and
+  added `decentdb-migrate` support for format-11 databases.
 
 ## [2.7.0] - [2026-05-22]
 

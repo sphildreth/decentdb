@@ -98,6 +98,7 @@ or external tools; DecentDB exposes these as named database operations.
 | CREATE TABLE | ✅ | ✅ | ✅ | ✅ |
 | DROP TABLE | ✅ | ✅ | ✅ | ✅ |
 | CREATE INDEX | ✅ | ✅ | ✅ | ✅ |
+| Full-text indexes and BM25 ranking | ✅ (`USING fulltext`, `bm25`) | ✅ (FTS5) | ✅ (`tsvector`/GIN) | ⚠️ (extension-dependent) |
 | Spatial indexes | ✅ (`USING spatial`) | ⚠️ (RTree extension) | ✅ (GiST/SP-GiST via PostGIS) | ✅ (spatial extension) |
 | Covering indexes (`INCLUDE (...)`) | ✅ (BTREE key-column indexes) | ❌ | ✅ | ❌ |
 | DROP INDEX | ✅ | ✅ | ✅ | ✅ |

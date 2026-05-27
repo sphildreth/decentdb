@@ -200,6 +200,7 @@ fn parse_create_index(sql: &str) -> Result<CreateIndexStatement> {
         columns,
         include_columns: Vec::new(),
         predicate: None,
+        options: Vec::new(),
     })
 }
 

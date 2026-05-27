@@ -45,6 +45,10 @@ use crate::record::value::{
     parse_decimal_text, parse_interval, parse_ip_addr, parse_mac_addr, parse_time_micros,
     parse_timestamp_tz_micros, Value,
 };
+use crate::search::fulltext::analyzer::{
+    AnalyzerConfig, AnalyzerDiacritics, AnalyzerLanguage, AnalyzerStemmer, AnalyzerStopwords,
+    AnalyzerTokenization,
+};
 use crate::sql::ast::Statement as SqlStatement;
 use crate::sql::parser::{parse_expression_sql, parse_sql_statement, rewrite_legacy_trigger_body};
 use crate::storage::freelist::{decode_freelist_next, encode_freelist_page};
@@ -13704,12 +13708,14 @@ fn index_info(index: &IndexSchema) -> IndexInfo {
             IndexKind::Btree => "btree",
             IndexKind::Trigram => "trigram",
             IndexKind::Spatial => "spatial",
+            IndexKind::FullText => "fulltext",
         }
         .to_string(),
         unique: index.unique,
         columns: index.columns.iter().map(index_column_name).collect(),
         include_columns: index.include_columns.clone(),
         predicate_sql: index.predicate_sql.clone(),
+        full_text_options_json: full_text_options_json(index),
         fresh: index.fresh,
     }
 }
@@ -13844,16 +13850,25 @@ fn schema_index_info(index: &IndexSchema) -> SchemaIndexInfo {
             IndexKind::Btree => "btree",
             IndexKind::Trigram => "trigram",
             IndexKind::Spatial => "spatial",
+            IndexKind::FullText => "fulltext",
         }
         .to_string(),
         unique: index.unique,
         columns: index.columns.iter().map(index_column_name).collect(),
         include_columns: index.include_columns.clone(),
         predicate_sql: index.predicate_sql.clone(),
+        full_text_options_json: full_text_options_json(index),
         fresh: index.fresh,
         temporary: false,
         ddl: render_create_index(index),
     }
+}
+
+fn full_text_options_json(index: &IndexSchema) -> Option<String> {
+    index
+        .full_text
+        .as_ref()
+        .and_then(|config| String::from_utf8(config.to_json().ok()?).ok())
 }
 
 fn schema_trigger_info(trigger: &TriggerSchema) -> SchemaTriggerInfo {
@@ -13926,6 +13941,7 @@ fn runtime_index_entry_count(index: &RuntimeIndex) -> usize {
         RuntimeIndex::Btree { keys } => keys.total_row_id_count(),
         RuntimeIndex::Trigram { index } => index.entry_count(),
         RuntimeIndex::Spatial { index } => index.len(),
+        RuntimeIndex::FullText { index } => index.entry_count(),
     }
 }
 
@@ -14768,7 +14784,9 @@ fn render_create_index(index: &IndexSchema) -> String {
         IndexKind::Btree => String::new(),
         IndexKind::Trigram => " USING trigram".to_string(),
         IndexKind::Spatial => " USING spatial".to_string(),
+        IndexKind::FullText => " USING fulltext".to_string(),
     };
+    let full_text_options = render_full_text_options(index.full_text.as_ref());
     let columns = index
         .columns
         .iter()
@@ -14794,9 +14812,56 @@ fn render_create_index(index: &IndexSchema) -> String {
         .map(|predicate| format!(" WHERE {predicate}"))
         .unwrap_or_default();
     format!(
-        "CREATE {unique}INDEX {} ON {}{using} ({columns}){include}{predicate};",
+        "CREATE {unique}INDEX {} ON {}{using} ({columns}){full_text_options}{include}{predicate};",
         sql_identifier(&index.name),
         sql_identifier(&index.table_name)
+    )
+}
+
+fn render_full_text_options(config: Option<&AnalyzerConfig>) -> String {
+    let Some(config) = config else {
+        return String::new();
+    };
+    let tokenizer = match config.tokenizer {
+        AnalyzerTokenization::Unicode => "unicode",
+    };
+    let language = match config.language {
+        AnalyzerLanguage::Simple => "simple",
+        AnalyzerLanguage::English => "english",
+    };
+    let stopwords = match &config.stopwords {
+        AnalyzerStopwords::None => "none".to_string(),
+        AnalyzerStopwords::Builtin => "builtin".to_string(),
+        AnalyzerStopwords::Custom(words) => words.join(","),
+    };
+    let stemming = match config.stemming {
+        AnalyzerStemmer::None => "none",
+        AnalyzerStemmer::English => "english",
+    };
+    let diacritics = match config.diacritics {
+        AnalyzerDiacritics::Preserve => "preserve",
+        AnalyzerDiacritics::Remove => "remove",
+    };
+    let prefix = if config.prefix.enabled {
+        config
+            .prefix
+            .lengths
+            .iter()
+            .map(u8::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    } else {
+        "none".to_string()
+    };
+    format!(
+        " WITH (tokenizer = {}, language = {}, stopwords = {}, stemming = {}, case_folded = {}, diacritics = {}, prefix = {})",
+        sql_string_literal(tokenizer),
+        sql_string_literal(language),
+        sql_string_literal(&stopwords),
+        sql_string_literal(stemming),
+        if config.case_folded { "TRUE" } else { "FALSE" },
+        sql_string_literal(diacritics),
+        sql_string_literal(&prefix),
     )
 }
 
@@ -15455,6 +15520,7 @@ mod tests {
             columns: Vec::new(),
             include_columns: Vec::new(),
             predicate_sql: None,
+            full_text: None,
             fresh: false,
         };
         let state = TempSchemaState {

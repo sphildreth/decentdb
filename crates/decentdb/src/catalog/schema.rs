@@ -171,6 +171,7 @@ pub(crate) enum IndexKind {
     Btree,
     Trigram,
     Spatial,
+    FullText,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -188,6 +189,7 @@ pub(crate) struct IndexSchema {
     pub(crate) columns: Vec<IndexColumn>,
     pub(crate) include_columns: Vec<String>,
     pub(crate) predicate_sql: Option<String>,
+    pub(crate) full_text: Option<crate::search::fulltext::AnalyzerConfig>,
     pub(crate) fresh: bool,
 }
 
@@ -366,6 +368,9 @@ mod tests {
         let kind = IndexKind::Spatial;
         let copied = kind;
         assert_eq!(copied, IndexKind::Spatial);
+        let kind = IndexKind::FullText;
+        let copied = kind;
+        assert_eq!(copied, IndexKind::FullText);
     }
 
     #[test]
@@ -528,6 +533,7 @@ mod tests {
             }],
             include_columns: vec![],
             predicate_sql: None,
+            full_text: None,
             fresh: true,
         };
         let copied = index.clone();

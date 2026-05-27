@@ -963,7 +963,7 @@ fn infer_function_type(
             .and_then(|expr| infer_expr_type(expr, scope, diagnostics))
             .or_else(|| Some(DescribedType::scalar(ColumnType::Float64, true))),
         "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "atan2" | "sqrt" | "pow" | "power"
-        | "radians" | "degrees" | "st_distance" | "st_length" | "st_area" => {
+        | "radians" | "degrees" | "st_distance" | "st_length" | "st_area" | "bm25" => {
             Some(DescribedType::scalar(ColumnType::Float64, true))
         }
         "coalesce" => args
@@ -971,7 +971,7 @@ fn infer_function_type(
             .filter_map(|expr| infer_expr_type(expr, scope, diagnostics))
             .next(),
         "st_dwithin" | "st_intersects" | "st_contains" | "st_within" | "st_equals"
-        | "st_isvalid" => Some(DescribedType::scalar(ColumnType::Bool, true)),
+        | "st_isvalid" | "fulltext_match" => Some(DescribedType::scalar(ColumnType::Bool, true)),
         "st_asbinary" => Some(DescribedType::scalar(ColumnType::Blob, true)),
         "st_geogpoint" | "st_geogpointz" | "st_geogpointm" | "st_geogpointzm"
         | "st_geogfromwkb" | "st_geogfromtext" | "st_geogfromgeojson" => {
@@ -1182,6 +1182,8 @@ fn statement_kind(statement: &Statement) -> &'static str {
         Statement::CreateTableAs(_) => "create_table_as",
         Statement::CreateSchema { .. } => "create_schema",
         Statement::CreateIndex(_) => "create_index",
+        Statement::AlterIndexRebuild { .. } => "alter_index_rebuild",
+        Statement::AlterIndexVerify { .. } => "alter_index_verify",
         Statement::CreateView(_) => "create_view",
         Statement::CreateTrigger(_) => "create_trigger",
         Statement::DropTable { .. } => "drop_table",

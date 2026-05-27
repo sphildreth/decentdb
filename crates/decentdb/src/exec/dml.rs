@@ -4059,6 +4059,21 @@ fn apply_runtime_index_update_for_row_change(
             }
             Ok(true)
         }
+        IndexKind::FullText => {
+            let old_fields = full_text_fields_for_row(runtime, index, table, old_row_values)?;
+            let new_fields = full_text_fields_for_row(runtime, index, table, new_row_values)?;
+            let Some(RuntimeIndex::FullText { index: fulltext }) = runtime.index_mut(&index.name)
+            else {
+                return Ok(false);
+            };
+            let row_id = u64::try_from(row_id)
+                .map_err(|_| DbError::internal(format!("row_id {row_id} is invalid")))?;
+            if old_fields != new_fields {
+                let refs = new_fields.iter().map(Option::as_deref).collect::<Vec<_>>();
+                fulltext.replace_document(row_id, &refs);
+            }
+            Ok(true)
+        }
     }
 }
 
@@ -4101,7 +4116,38 @@ fn apply_runtime_index_delete_for_row(
             spatial.remove(row_id);
             Ok(true)
         }
+        IndexKind::FullText => {
+            let Some(RuntimeIndex::FullText { index: fulltext }) = runtime.index_mut(&index.name)
+            else {
+                return Ok(false);
+            };
+            let row_id = u64::try_from(row_id)
+                .map_err(|_| DbError::internal(format!("row_id {row_id} is invalid")))?;
+            fulltext.delete_document(row_id);
+            Ok(true)
+        }
     }
+}
+
+fn full_text_fields_for_row(
+    runtime: &EngineRuntime,
+    index: &crate::catalog::IndexSchema,
+    table: &crate::catalog::TableSchema,
+    row_values: &[Value],
+) -> Result<Vec<Option<String>>> {
+    if !row_satisfies_index_predicate(runtime, index, table, row_values)? {
+        return Ok(Vec::new());
+    }
+    compute_index_values(runtime, index, table, row_values)?
+        .into_iter()
+        .map(|value| match value {
+            Value::Text(text) => Ok(Some(text)),
+            Value::Null => Ok(None),
+            other => Err(DbError::constraint(format!(
+                "fulltext index requires TEXT columns, got {other:?}"
+            ))),
+        })
+        .collect()
 }
 
 fn trigram_index_text_for_row(
@@ -5190,6 +5236,7 @@ mod tests {
                 ],
                 include_columns: vec![],
                 predicate_sql: None,
+                full_text: None,
                 fresh: true,
             },
         );
@@ -5363,6 +5410,7 @@ mod tests {
                 ],
                 include_columns: vec![],
                 predicate_sql: None,
+                full_text: None,
                 fresh: true,
             },
         );

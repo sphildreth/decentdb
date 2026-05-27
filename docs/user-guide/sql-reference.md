@@ -98,6 +98,11 @@ CREATE INDEX index_name ON table_name(column_name);
 -- Trigram index for text search
 CREATE INDEX index_name ON table_name USING trigram(column_name);
 
+-- Full-text index for tokenized search and BM25 ranking
+CREATE INDEX index_name
+ON table_name USING fulltext(title, body)
+WITH (prefix = '2,3', diacritics = 'remove');
+
 -- Spatial index for GEOMETRY / GEOGRAPHY
 CREATE INDEX index_name ON table_name USING spatial(column_name);
 
@@ -116,6 +121,10 @@ CREATE INDEX index_name ON table_name(column_name) INCLUDE (other_col, more_col)
 
 Notes:
 - Partial/filtered indexes are supported for BTREE indexes with arbitrary predicates (including multi-column and `UNIQUE`). Partial trigram indexes are not supported.
+- Full-text indexes are supported for one or more plain `TEXT` columns and are
+  queried with `fulltext_match('index_name', query)` plus optional
+  `bm25('index_name')` ranking. Full-text indexes do not support `UNIQUE`,
+  predicates, expressions, or `INCLUDE` columns.
 - Spatial indexes are supported for a single `GEOMETRY` or `GEOGRAPHY` column and accelerate `ST_DWithin`, `ST_Intersects`, `ST_Contains`, `ST_Within`, `ST_Equals`, and nearest-neighbor `<->` planning.
 - Covering indexes (`INCLUDE (...)`) are supported for BTREE key-column indexes and store additional non-key columns in index metadata for compatibility.
 - Expression indexes are currently limited to **a single** deterministic expression:
@@ -128,12 +137,18 @@ Notes:
   the default binary behavior. Persistent `NOCASE` and `RTRIM` column/index
   collations are rejected; query-time collations are supported separately.
 
-### DROP TABLE / DROP INDEX
+### DROP TABLE / DROP INDEX / ALTER INDEX
 
 ```sql
 DROP TABLE table_name;
 DROP INDEX index_name;
+ALTER INDEX index_name VERIFY;
+ALTER INDEX index_name REBUILD;
 ```
+
+`ALTER INDEX ... VERIFY` and `ALTER INDEX ... REBUILD` are supported for
+full-text indexes. `VERIFY` validates the derived runtime index against base
+table rows, and `REBUILD` reconstructs it synchronously.
 
 ### ALTER TABLE
 
@@ -477,6 +492,10 @@ Supported scalar functions:
 
 **Other:**
 - `PRINTF(format, args...)` — formatted string output (SQLite-compatible)
+- `fulltext_match(index_name, query)` — boolean predicate over a full-text
+  index; supported in `WHERE` query blocks.
+- `bm25(index_name)` — FLOAT64 ranking score for rows matched by
+  `fulltext_match` in the same query block.
 - `current_database()` / `current_schema()` — return `main`
 - `database()` / `schema()` — compatibility aliases returning `main`
 - `version()` — returns the DecentDB engine version string
@@ -516,6 +535,10 @@ SELECT TRIM(name) || '_suffix' FROM users;
 SELECT CAST(id AS TEXT) FROM users;
 SELECT CAST('12.34' AS DECIMAL(10,2));
 SELECT CASE WHEN active THEN 'on' ELSE 'off' END FROM users;
+SELECT id, bm25('idx_docs_search') AS rank
+FROM docs
+WHERE fulltext_match('idx_docs_search', 'database OR search')
+ORDER BY rank DESC;
 SELECT JSON_ARRAY_LENGTH('["a","b","c"]');  -- Returns 3
 SELECT JSON_EXTRACT('{"name":"Alice"}', '$.name');  -- Returns 'Alice'
 SELECT JSON_TYPE('{"a":1}');  -- Returns 'object'

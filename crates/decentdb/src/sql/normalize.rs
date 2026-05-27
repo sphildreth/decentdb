@@ -14,10 +14,10 @@ use super::ast::{
     ConflictAction, ConflictTarget, CreateIndexStatement, CreateTableAsStatement,
     CreateTableStatement, CreateTriggerStatement, CreateViewStatement, DeleteStatement,
     ExplainStatement, Expr, ForeignKeyActionSpec, ForeignKeyDefinition, FromItem, IndexExpression,
-    InsertSource, InsertStatement, JoinConstraint, JoinKind, OrderBy, Query, QueryBody, Select,
-    SelectItem, SetOperation, Statement, SubqueryQuantifier, TableConstraint, TriggerEventSpec,
-    TriggerKindSpec, TruncateIdentityMode, UnaryOp, UpdateStatement, WindowFrame, WindowFrameBound,
-    WindowFrameUnit,
+    IndexOption, InsertSource, InsertStatement, JoinConstraint, JoinKind, OrderBy, Query,
+    QueryBody, Select, SelectItem, SetOperation, Statement, SubqueryQuantifier, TableConstraint,
+    TriggerEventSpec, TriggerKindSpec, TruncateIdentityMode, UnaryOp, UpdateStatement, WindowFrame,
+    WindowFrameBound, WindowFrameUnit,
 };
 
 // Thread-local flag set by `detect_and_rewrite_create_view_if_not_exists` and
@@ -798,7 +798,51 @@ fn normalize_create_index(statement: &protobuf::IndexStmt) -> Result<CreateIndex
             .as_deref()
             .map(normalize_expr_node)
             .transpose()?,
+        options: normalize_index_options(&statement.options)?,
     })
+}
+
+fn normalize_index_options(nodes: &[protobuf::Node]) -> Result<Vec<IndexOption>> {
+    nodes
+        .iter()
+        .map(|node| match node_kind(node)? {
+            NodeEnum::DefElem(def) => {
+                let value = def
+                    .arg
+                    .as_deref()
+                    .map(normalize_index_option_value)
+                    .transpose()?
+                    .unwrap_or(Value::Bool(true));
+                Ok(IndexOption {
+                    name: def.defname.clone(),
+                    value,
+                })
+            }
+            other => Err(unsupported(format!(
+                "unsupported CREATE INDEX option node {}",
+                describe_node(other)
+            ))),
+        })
+        .collect()
+}
+
+fn normalize_index_option_value(node: &protobuf::Node) -> Result<Value> {
+    match node_kind(node)? {
+        NodeEnum::AConst(value) => {
+            let Expr::Literal(value) = normalize_const(value)? else {
+                return Err(unsupported("CREATE INDEX option must be a literal"));
+            };
+            Ok(value)
+        }
+        NodeEnum::String(value) => Ok(Value::Text(value.sval.clone())),
+        NodeEnum::Integer(value) => Ok(Value::Int64(i64::from(value.ival))),
+        NodeEnum::Float(value) => Ok(Value::Text(value.fval.clone())),
+        NodeEnum::Boolean(value) => Ok(Value::Bool(value.boolval)),
+        other => Err(unsupported(format!(
+            "unsupported CREATE INDEX option value {}",
+            describe_node(other)
+        ))),
+    }
 }
 
 fn normalize_index_collation(index: &protobuf::IndexElem) -> Result<()> {

@@ -179,6 +179,20 @@ impl ColumnBinding {
     }
 
     #[must_use]
+    pub(crate) fn hidden_source(
+        table: Option<String>,
+        source_table: Option<String>,
+        name: String,
+    ) -> Self {
+        Self {
+            table,
+            source_table,
+            name,
+            hidden: true,
+        }
+    }
+
+    #[must_use]
     pub(crate) fn as_output(&self) -> Self {
         Self {
             table: self.table.clone(),

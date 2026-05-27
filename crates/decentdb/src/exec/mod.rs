@@ -61,6 +61,7 @@ use crate::record::value::{
     parse_decimal_text, parse_interval, parse_ip_addr, parse_mac_addr, parse_time_micros,
     parse_timestamp_tz_micros, Value,
 };
+use crate::search::fulltext::{AnalyzerConfig, FullTextIndex, FTS_SEMANTIC_ERROR_PREFIX};
 use crate::search::{TrigramIndex, TrigramQueryResult};
 use crate::spatial::index::{SpatialEnvelope, SpatialIndexBackend, SpatialRuntimeIndex};
 use crate::spatial::types::{
@@ -100,12 +101,14 @@ const SCHEMAS_SECTION_MAGIC: &[u8; 8] = b"DDBSCH01";
 const PK_INDEX_ROOTS_SECTION_MAGIC: &[u8; 8] = b"DDBPKR01";
 const SPATIAL_COLUMNS_SECTION_MAGIC: &[u8; 8] = b"DDBSPT01";
 const ENUM_COLUMNS_SECTION_MAGIC: &[u8; 8] = b"DDBENU01";
+const FULL_TEXT_OPTIONS_SECTION_MAGIC: &[u8; 8] = b"DDBFTS01";
 const SIGNED_ROW_ID_BIAS: u64 = 0x8000_0000_0000_0000;
 const DEFERRED_COMPRESSED_LOOKUP_CACHE_LIMIT: usize = 32;
 static RANDOM_STATE: AtomicU64 = AtomicU64::new(0);
 static DEFERRED_COMPRESSED_LOOKUP_CACHE: OnceLock<Mutex<DeferredCompressedLookupCache>> =
     OnceLock::new();
 const EXEC_MICROS_PER_DAY: i64 = 86_400_000_000;
+const FTS_HIDDEN_ROW_ID_COLUMN: &str = "__decentdb_fts_rowid";
 
 fn generated_columns_are_stored(table: &TableSchema) -> bool {
     table
@@ -1339,6 +1342,16 @@ pub(crate) enum RuntimeIndex {
     Btree { keys: RuntimeBtreeKeys },
     Trigram { index: TrigramIndex },
     Spatial { index: SpatialRuntimeIndex },
+    FullText { index: FullTextIndex },
+}
+
+fn runtime_index_entry_count(index: &RuntimeIndex) -> usize {
+    match index {
+        RuntimeIndex::Btree { keys } => keys.total_row_id_count(),
+        RuntimeIndex::Trigram { index } => index.entry_count(),
+        RuntimeIndex::Spatial { index } => index.len(),
+        RuntimeIndex::FullText { index } => index.entry_count(),
+    }
 }
 
 #[derive(Debug)]
@@ -1357,6 +1370,11 @@ pub(super) enum PendingIndexInsert {
         name: String,
         row_id: i64,
         value: SpatialValue,
+    },
+    FullText {
+        name: String,
+        row_id: u64,
+        fields: Vec<Option<String>>,
     },
 }
 
@@ -1393,6 +1411,12 @@ pub(crate) struct EngineRuntime {
     pub(crate) extension_trust_anchors: Arc<Vec<crate::extensions::ExtensionTrustAnchor>>,
     pub(crate) extension_unsigned_development_mode: bool,
     pub(crate) audit_context: Arc<Mutex<crate::security::AuditContext>>,
+    fts_eval_context: Arc<Mutex<FtsEvalContext>>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct FtsEvalContext {
+    scores: BTreeMap<(String, i64), f64>,
 }
 
 #[derive(Debug)]
@@ -1575,6 +1599,7 @@ impl Clone for EngineRuntime {
             extension_trust_anchors: Arc::clone(&self.extension_trust_anchors),
             extension_unsigned_development_mode: self.extension_unsigned_development_mode,
             audit_context: Arc::clone(&self.audit_context),
+            fts_eval_context: Arc::clone(&self.fts_eval_context),
         }
     }
 }
@@ -1621,6 +1646,7 @@ impl EngineRuntime {
             extension_trust_anchors: Arc::new(config.extension_trust_anchors.clone()),
             extension_unsigned_development_mode: config.extension_unsigned_development_mode,
             audit_context: Arc::new(Mutex::new(crate::security::AuditContext::default())),
+            fts_eval_context: Arc::new(Mutex::new(FtsEvalContext::default())),
         }
     }
 
@@ -3380,6 +3406,22 @@ impl EngineRuntime {
         Ok(())
     }
 
+    pub(crate) fn verify_index(&self, name: &str, page_size: u32) -> Result<()> {
+        self.catalog
+            .index(name)
+            .ok_or_else(|| DbError::sql(format!("unknown index {name}")))?;
+        let existing = self.index(name).map_or(0, runtime_index_entry_count);
+        let mut rebuilt = self.clone();
+        rebuilt.rebuild_index(name, page_size)?;
+        let actual = rebuilt.index(name).map_or(0, runtime_index_entry_count);
+        if existing != actual {
+            return Err(DbError::corruption(format!(
+                "index {name} verification failed: expected {existing} entries, rebuilt {actual}"
+            )));
+        }
+        Ok(())
+    }
+
     pub(crate) fn rebuild_stale_indexes(&mut self, page_size: u32) -> Result<()> {
         if self
             .catalog
@@ -3618,6 +3660,17 @@ impl EngineRuntime {
                         });
                     }
                 }
+                IndexKind::FullText => {
+                    if !row_satisfies_index_predicate(self, &index, &table, &row.values)? {
+                        continue;
+                    }
+                    let fields = full_text_fields_for_row(self, &index, &table, &row.values)?;
+                    updates.push(PendingIndexInsert::FullText {
+                        name: index.name.clone(),
+                        row_id: row.row_id as u64,
+                        fields,
+                    });
+                }
             }
         }
 
@@ -3671,6 +3724,26 @@ impl EngineRuntime {
                     Some(_) => {
                         return Err(DbError::internal(format!(
                             "runtime index {name} is not a SPATIAL index"
+                        )))
+                    }
+                    None => {
+                        return Err(DbError::internal(format!(
+                            "runtime index {name} is missing"
+                        )))
+                    }
+                },
+                PendingIndexInsert::FullText {
+                    name,
+                    row_id,
+                    fields,
+                } => match self.index_mut(&name) {
+                    Some(RuntimeIndex::FullText { index }) => {
+                        let refs = fields.iter().map(Option::as_deref).collect::<Vec<_>>();
+                        index.insert_document(row_id, &refs);
+                    }
+                    Some(_) => {
+                        return Err(DbError::internal(format!(
+                            "runtime index {name} is not a fulltext index"
                         )))
                     }
                     None => {
@@ -3734,6 +3807,14 @@ impl EngineRuntime {
             Statement::CreateIndex(statement) => {
                 self.execute_create_index(statement, page_size)?;
                 self.rebuild_indexes(page_size)?;
+                Ok(QueryResult::with_affected_rows(0))
+            }
+            Statement::AlterIndexRebuild { name } => {
+                self.rebuild_index(name, page_size)?;
+                Ok(QueryResult::with_affected_rows(0))
+            }
+            Statement::AlterIndexVerify { name } => {
+                self.verify_index(name, page_size)?;
                 Ok(QueryResult::with_affected_rows(0))
             }
             Statement::CreateView(statement) => {
@@ -3961,6 +4042,7 @@ impl EngineRuntime {
         params: &[Value],
         _page_size: u32,
     ) -> Result<QueryResult> {
+        self.clear_fts_eval_context()?;
         match statement {
             Statement::Query(query) => {
                 if self.security_rules_active()? {
@@ -4080,6 +4162,15 @@ impl EngineRuntime {
                 "read-only execution received mutating statement {other:?}"
             ))),
         }
+    }
+
+    fn clear_fts_eval_context(&self) -> Result<()> {
+        self.fts_eval_context
+            .lock()
+            .map_err(|_| DbError::internal("FTS eval context lock poisoned"))?
+            .scores
+            .clear();
+        Ok(())
     }
 
     fn analyze_simple_count_query<'a>(
@@ -8896,6 +8987,22 @@ impl EngineRuntime {
                     (entry_count, entry_count)
                 }
                 Some(RuntimeIndex::Trigram { .. }) | None => continue,
+                Some(RuntimeIndex::FullText { index: fulltext }) => {
+                    let entry_count = i64::try_from(fulltext.entry_count()).map_err(|_| {
+                        DbError::sql(format!(
+                            "index {} exceeds ANALYZE entry-count limits",
+                            index.name
+                        ))
+                    })?;
+                    let distinct_key_count =
+                        i64::try_from(fulltext.term_count()).map_err(|_| {
+                            DbError::sql(format!(
+                                "index {} exceeds ANALYZE distinct-count limits",
+                                index.name
+                            ))
+                        })?;
+                    (entry_count, distinct_key_count)
+                }
             };
             self.catalog_mut().index_stats.insert(
                 index.name.clone(),
@@ -9612,6 +9719,21 @@ impl EngineRuntime {
         if select
             .projection
             .iter()
+            .any(select_item_contains_fulltext_function)
+            || select
+                .filter
+                .as_ref()
+                .is_some_and(expr_contains_fulltext_function)
+            || query
+                .order_by
+                .iter()
+                .any(|order| expr_contains_fulltext_function(&order.expr))
+        {
+            return Ok(None);
+        }
+        if select
+            .projection
+            .iter()
             .any(|item| !matches!(item, SelectItem::Expr { .. }))
         {
             return Ok(None);
@@ -9802,23 +9924,26 @@ impl EngineRuntime {
         offset: usize,
     ) -> Result<QueryResult> {
         let dataset = Dataset::with_rows(
-            table_schema
-                .columns
-                .iter()
-                .map(|column| {
-                    ColumnBinding::visible(Some(binding_name.to_string()), column.name.clone())
-                })
-                .collect(),
+            table_bindings_with_hidden_row_id(table_schema, binding_name),
             Vec::new(),
         );
         let projection_order_by = projection_order_by_plan(order_by, projection);
         let bounded_row_count = limit.map(|limit| limit.saturating_add(offset));
         let mut rows = Vec::with_capacity(bounded_row_count.unwrap_or(state.row_count));
         let mut seen = BTreeSet::new();
-        visit_persisted_table_rows(store, state, |_, values| {
+        visit_persisted_table_rows(store, state, |row_id, values| {
+            let mut eval_values = values.to_vec();
+            eval_values.push(Value::Int64(row_id));
             if let Some(filter) = filter {
                 if !matches!(
-                    self.eval_expr(filter, &dataset, values, params, &BTreeMap::new(), None)?,
+                    self.eval_expr(
+                        filter,
+                        &dataset,
+                        &eval_values,
+                        params,
+                        &BTreeMap::new(),
+                        None,
+                    )?,
                     Value::Bool(true)
                 ) {
                     return Ok(());
@@ -9834,7 +9959,7 @@ impl EngineRuntime {
                 output.push(self.eval_expr(
                     expr,
                     &dataset,
-                    values,
+                    &eval_values,
                     params,
                     &BTreeMap::new(),
                     None,
@@ -9854,7 +9979,7 @@ impl EngineRuntime {
                     order_values.push(self.eval_expr(
                         &order.expr,
                         &dataset,
-                        values,
+                        &eval_values,
                         params,
                         &BTreeMap::new(),
                         None,
@@ -9911,13 +10036,7 @@ impl EngineRuntime {
         offset: usize,
     ) -> Result<QueryResult> {
         let dataset = Dataset::with_rows(
-            table_schema
-                .columns
-                .iter()
-                .map(|column| {
-                    ColumnBinding::visible(Some(binding_name.to_string()), column.name.clone())
-                })
-                .collect(),
+            table_bindings_with_hidden_row_id(table_schema, binding_name),
             Vec::new(),
         );
         let projection_order_by = projection_order_by_plan(order_by, projection);
@@ -9926,10 +10045,11 @@ impl EngineRuntime {
         let mut seen = BTreeSet::new();
         for stored_row in row_source.rows() {
             let stored_row = stored_row?;
-            let values = stored_row.values();
+            let mut values = stored_row.values().to_vec();
+            values.push(Value::Int64(stored_row.row_id()));
             if let Some(filter) = filter {
                 if !matches!(
-                    self.eval_expr(filter, &dataset, values, params, &BTreeMap::new(), None)?,
+                    self.eval_expr(filter, &dataset, &values, params, &BTreeMap::new(), None)?,
                     Value::Bool(true)
                 ) {
                     continue;
@@ -9946,7 +10066,7 @@ impl EngineRuntime {
                 output.push(self.eval_expr(
                     expr,
                     &dataset,
-                    values,
+                    &values,
                     params,
                     &BTreeMap::new(),
                     None,
@@ -9966,7 +10086,7 @@ impl EngineRuntime {
                     order_values.push(self.eval_expr(
                         &order.expr,
                         &dataset,
-                        values,
+                        &values,
                         params,
                         &BTreeMap::new(),
                         None,
@@ -10871,6 +10991,21 @@ impl EngineRuntime {
                 .order_by
                 .iter()
                 .any(|order| expr_contains_recursive_unsupported_feature(&order.expr))
+        {
+            return Ok(None);
+        }
+        if select
+            .projection
+            .iter()
+            .any(select_item_contains_fulltext_function)
+            || select
+                .filter
+                .as_ref()
+                .is_some_and(expr_contains_fulltext_function)
+            || query
+                .order_by
+                .iter()
+                .any(|order| expr_contains_fulltext_function(&order.expr))
         {
             return Ok(None);
         }
@@ -12552,12 +12687,16 @@ impl EngineRuntime {
 
         if let Some(filter) = &select.filter {
             let filter_dataset = Dataset::with_rows(dataset.columns.clone(), Vec::new());
-            dataset.rows_mut().retain(|row| {
-                matches!(
-                    self.eval_expr(filter, &filter_dataset, row, params, ctes, None),
-                    Ok(Value::Bool(true))
-                )
-            });
+            let mut filtered = Vec::with_capacity(dataset.rows.len());
+            for row in dataset.take_rows() {
+                if matches!(
+                    self.eval_expr(filter, &filter_dataset, &row, params, ctes, None)?,
+                    Value::Bool(true)
+                ) {
+                    filtered.push(row);
+                }
+            }
+            dataset.set_rows(filtered);
         }
 
         Ok(dataset)
@@ -12669,12 +12808,16 @@ impl EngineRuntime {
         dataset = augment_dataset_with_outer_scope(dataset, outer_dataset, outer_row);
         if let Some(filter) = &select.filter {
             let filter_dataset = Dataset::with_rows(dataset.columns.clone(), Vec::new());
-            dataset.rows_mut().retain(|row| {
-                matches!(
-                    self.eval_expr(filter, &filter_dataset, row, params, ctes, None),
-                    Ok(Value::Bool(true))
-                )
-            });
+            let mut filtered = Vec::with_capacity(dataset.rows.len());
+            for row in dataset.take_rows() {
+                if matches!(
+                    self.eval_expr(filter, &filter_dataset, &row, params, ctes, None)?,
+                    Value::Bool(true)
+                ) {
+                    filtered.push(row);
+                }
+            }
+            dataset.set_rows(filtered);
         }
         Ok(dataset)
     }
@@ -12759,6 +12902,62 @@ impl EngineRuntime {
         }
         let row_source = self.table_row_source(name);
 
+        if let Some(fulltext_lookup) = simple_fulltext_lookup(filter) {
+            let index_value = self.eval_expr(
+                fulltext_lookup.index_name_expr,
+                &Dataset::empty(),
+                &[],
+                params,
+                ctes,
+                None,
+            )?;
+            let query_value = self.eval_expr(
+                fulltext_lookup.query_expr,
+                &Dataset::empty(),
+                &[],
+                params,
+                ctes,
+                None,
+            )?;
+            let Some(index_name) = expect_text_arg("FULLTEXT_MATCH", "first", &index_value)? else {
+                return Ok(Some(Dataset::with_rows(
+                    table_bindings_with_hidden_row_id(table, alias.as_deref().unwrap_or(name)),
+                    Vec::new(),
+                )));
+            };
+            let Some(query_text) = expect_text_arg("FULLTEXT_MATCH", "second", &query_value)?
+            else {
+                return Ok(Some(Dataset::with_rows(
+                    table_bindings_with_hidden_row_id(table, alias.as_deref().unwrap_or(name)),
+                    Vec::new(),
+                )));
+            };
+            if let Some(index_schema) = self.catalog.index(index_name) {
+                if identifiers_equal(&index_schema.table_name, name)
+                    && index_schema.fresh
+                    && index_schema.kind == IndexKind::FullText
+                {
+                    if let Some(RuntimeIndex::FullText { index }) = self.index(&index_schema.name) {
+                        let row_ids = index
+                            .search(query_text)
+                            .map_err(|error| DbError::sql(error.message))?
+                            .into_iter()
+                            .filter_map(|hit| i64::try_from(hit.row_id).ok())
+                            .collect::<Vec<_>>();
+                        return self
+                            .dataset_from_row_id_set(
+                                table,
+                                row_source,
+                                alias,
+                                RuntimeRowIdSet::Many(&row_ids),
+                                true,
+                            )
+                            .map(Some);
+                    }
+                }
+            }
+        }
+
         if let Some(spatial_lookup) = simple_spatial_lookup(filter) {
             if !matches_filter_binding(name, alias, spatial_lookup.table_qualifier) {
                 return Ok(None);
@@ -12818,6 +13017,7 @@ impl EngineRuntime {
                         row_source,
                         alias,
                         RuntimeRowIdSet::Many(&row_ids),
+                        false,
                     )
                     .map(Some);
             }
@@ -12844,7 +13044,7 @@ impl EngineRuntime {
                 if let Some(RuntimeIndex::Btree { keys }) = self.index(&index.name) {
                     let row_ids = keys.row_ids_for_value_set(&value)?;
                     return self
-                        .dataset_from_row_id_set(table, row_source, alias, row_ids)
+                        .dataset_from_row_id_set(table, row_source, alias, row_ids, false)
                         .map(Some);
                 }
             }
@@ -12888,6 +13088,7 @@ impl EngineRuntime {
                                 row_source,
                                 alias,
                                 RuntimeRowIdSet::Many(&row_ids),
+                                false,
                             )
                             .map(Some);
                     }
@@ -13463,7 +13664,7 @@ impl EngineRuntime {
             return Ok(None);
         };
         let row_ids = keys.row_ids_for_value_set(&value)?;
-        self.dataset_from_row_id_set(table, row_source, alias, row_ids)
+        self.dataset_from_row_id_set(table, row_source, alias, row_ids, false)
             .map(Some)
     }
 
@@ -14077,7 +14278,8 @@ impl EngineRuntime {
                 column_names,
                 lateral,
             } => {
-                let mut dataset = if *lateral {
+                let mut dataset = if *lateral || query_references_outer_scope(query, scope_dataset)
+                {
                     self.evaluate_query_with_outer(query, params, ctes, scope_dataset, scope_row)?
                 } else {
                     self.evaluate_query(query, params, ctes)?
@@ -14738,6 +14940,7 @@ impl EngineRuntime {
         row_source: Option<&TableRowSource>,
         alias: &Option<String>,
         row_ids: RuntimeRowIdSet<'_>,
+        include_hidden_row_id: bool,
     ) -> Result<Dataset> {
         let table_name = alias.clone().unwrap_or_else(|| table.name.clone());
         let mut rows = Vec::with_capacity(row_ids.len());
@@ -14750,7 +14953,13 @@ impl EngineRuntime {
                 .map(|source| source.row_by_id(row_id))
                 .transpose()
             {
-                Ok(Some(Some(row))) => rows.push(row.values().to_vec()),
+                Ok(Some(Some(row))) => {
+                    let mut values = row.values().to_vec();
+                    if include_hidden_row_id {
+                        values.push(Value::Int64(row.row_id()));
+                    }
+                    rows.push(values);
+                }
                 Ok(Some(None)) | Ok(None) => {}
                 Err(error) => row_lookup_error = Some(error),
             }
@@ -14758,20 +14967,25 @@ impl EngineRuntime {
         if let Some(error) = row_lookup_error {
             return Err(error);
         }
-        Ok(Dataset::with_rows(
-            table
-                .columns
-                .iter()
-                .map(|column| {
-                    ColumnBinding::visible_source(
-                        Some(table_name.clone()),
-                        Some(table.name.clone()),
-                        column.name.clone(),
-                    )
-                })
-                .collect(),
-            rows,
-        ))
+        let mut columns = table
+            .columns
+            .iter()
+            .map(|column| {
+                ColumnBinding::visible_source(
+                    Some(table_name.clone()),
+                    Some(table.name.clone()),
+                    column.name.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        if include_hidden_row_id {
+            columns.push(ColumnBinding::hidden_source(
+                Some(table_name),
+                Some(table.name.clone()),
+                FTS_HIDDEN_ROW_ID_COLUMN.to_string(),
+            ));
+        }
+        Ok(Dataset::with_rows(columns, rows))
     }
 
     fn dataset_from_visible_row_source(
@@ -14783,26 +14997,25 @@ impl EngineRuntime {
         let table_name = alias.clone().unwrap_or_else(|| table.name.clone());
         let mut rows = Vec::with_capacity(row_source.row_count());
         for row in row_source.rows() {
-            let mut values = row?.values().to_vec();
+            let row = row?;
+            let mut values = row.values().to_vec();
             if !generated_columns_are_stored(table) {
                 self.apply_virtual_generated_columns(table, &mut values)?;
             }
             rows.push(values);
         }
-        let mut dataset = Dataset::with_rows(
-            table
-                .columns
-                .iter()
-                .map(|column| {
-                    ColumnBinding::visible_source(
-                        Some(table_name.clone()),
-                        Some(table.name.clone()),
-                        column.name.clone(),
-                    )
-                })
-                .collect(),
-            rows,
-        );
+        let columns = table
+            .columns
+            .iter()
+            .map(|column| {
+                ColumnBinding::visible_source(
+                    Some(table_name.clone()),
+                    Some(table.name.clone()),
+                    column.name.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut dataset = Dataset::with_rows(columns, rows);
         self.apply_row_policies(table, &mut dataset)?;
         Ok(dataset)
     }
@@ -15592,6 +15805,23 @@ fn build_runtime_index(
             }
             Ok(RuntimeIndex::Spatial { index: spatial })
         }
+        IndexKind::FullText => {
+            let config = index
+                .full_text
+                .clone()
+                .ok_or_else(|| DbError::corruption("fulltext index is missing analyzer config"))?;
+            let mut fulltext = FullTextIndex::new(config);
+            for row in source.rows() {
+                let row = row?;
+                if !row_satisfies_index_predicate(runtime, index, table, row.values())? {
+                    continue;
+                }
+                let fields = full_text_fields_for_row(runtime, index, table, row.values())?;
+                let field_refs = fields.iter().map(Option::as_deref).collect::<Vec<_>>();
+                fulltext.insert_document(row.row_id() as u64, &field_refs);
+            }
+            Ok(RuntimeIndex::FullText { index: fulltext })
+        }
     }
 }
 
@@ -15761,6 +15991,27 @@ pub(super) fn compute_index_values(
         .collect()
 }
 
+pub(super) fn full_text_fields_for_row(
+    runtime: &EngineRuntime,
+    index: &IndexSchema,
+    table: &TableSchema,
+    row_values: &[Value],
+) -> Result<Vec<Option<String>>> {
+    if !row_satisfies_index_predicate(runtime, index, table, row_values)? {
+        return Ok(Vec::new());
+    }
+    compute_index_values(runtime, index, table, row_values)?
+        .into_iter()
+        .map(|value| match value {
+            Value::Text(text) => Ok(Some(text)),
+            Value::Null => Ok(None),
+            other => Err(DbError::constraint(format!(
+                "fulltext index requires TEXT columns, got {other:?}"
+            ))),
+        })
+        .collect()
+}
+
 pub(super) fn row_satisfies_index_predicate(
     runtime: &EngineRuntime,
     index: &IndexSchema,
@@ -15822,6 +16073,26 @@ pub(super) fn table_row_dataset(table: &TableSchema, row: &[Value], table_name: 
             .collect(),
         vec![row.to_vec()],
     )
+}
+
+fn table_bindings_with_hidden_row_id(table: &TableSchema, table_name: &str) -> Vec<ColumnBinding> {
+    let mut columns = table
+        .columns
+        .iter()
+        .map(|column| {
+            ColumnBinding::visible_source(
+                Some(table_name.to_string()),
+                Some(table.name.clone()),
+                column.name.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    columns.push(ColumnBinding::hidden_source(
+        Some(table_name.to_string()),
+        Some(table.name.clone()),
+        FTS_HIDDEN_ROW_ID_COLUMN.to_string(),
+    ));
+    columns
 }
 
 fn decode_root_header(page_bytes: &[u8]) -> Result<Option<RootHeader>> {
@@ -15947,6 +16218,7 @@ fn encode_runtime_payload(runtime: &EngineRuntime) -> Result<Vec<u8>> {
     }
     encode_schemas_section(&mut output, &runtime.catalog.schemas)?;
     encode_index_include_columns_section(&mut output, &runtime.catalog.indexes)?;
+    encode_full_text_options_section(&mut output, &runtime.catalog.indexes)?;
     encode_generated_columns_section(&mut output, &runtime.catalog.tables)?;
     encode_spatial_columns_section(&mut output, &runtime.catalog.tables)?;
     encode_enum_columns_section(&mut output, &runtime.catalog.tables)?;
@@ -16070,6 +16342,7 @@ fn decode_runtime_payload(bytes: &[u8]) -> Result<EngineRuntime> {
                 columns,
                 include_columns: Vec::new(),
                 predicate_sql,
+                full_text: None,
                 fresh,
             },
         );
@@ -16106,6 +16379,9 @@ fn decode_runtime_payload(bytes: &[u8]) -> Result<EngineRuntime> {
     }
     if cursor.offset < cursor.bytes.len() {
         decode_index_include_columns_section(&mut cursor, &mut runtime.catalog_mut().indexes)?;
+    }
+    if cursor.offset < cursor.bytes.len() {
+        decode_full_text_options_section(&mut cursor, &mut runtime.catalog_mut().indexes)?;
     }
     if cursor.offset < cursor.bytes.len() {
         decode_generated_columns_section(&mut cursor, &mut runtime.catalog_mut().tables)?;
@@ -16240,6 +16516,7 @@ fn encode_manifest_payload_with_offsets(
     }
     encode_schemas_section(&mut output, &runtime.catalog.schemas)?;
     encode_index_include_columns_section(&mut output, &runtime.catalog.indexes)?;
+    encode_full_text_options_section(&mut output, &runtime.catalog.indexes)?;
     encode_generated_columns_section(&mut output, &runtime.catalog.tables)?;
     encode_spatial_columns_section(&mut output, &runtime.catalog.tables)?;
     encode_enum_columns_section(&mut output, &runtime.catalog.tables)?;
@@ -16439,6 +16716,7 @@ fn decode_manifest_payload<S: PageStore>(_store: &S, bytes: &[u8]) -> Result<Eng
                 columns,
                 include_columns: Vec::new(),
                 predicate_sql,
+                full_text: None,
                 fresh,
             },
         );
@@ -16499,6 +16777,9 @@ fn decode_manifest_payload<S: PageStore>(_store: &S, bytes: &[u8]) -> Result<Eng
     }
     if cursor.offset < cursor.bytes.len() {
         decode_index_include_columns_section(&mut cursor, &mut runtime.catalog_mut().indexes)?;
+    }
+    if cursor.offset < cursor.bytes.len() {
+        decode_full_text_options_section(&mut cursor, &mut runtime.catalog_mut().indexes)?;
     }
     if cursor.offset < cursor.bytes.len() {
         decode_generated_columns_section(&mut cursor, &mut runtime.catalog_mut().tables)?;
@@ -18109,6 +18390,31 @@ fn encode_index_include_columns_section(
     Ok(())
 }
 
+fn encode_full_text_options_section(
+    output: &mut Vec<u8>,
+    indexes: &BTreeMap<String, IndexSchema>,
+) -> Result<()> {
+    let entries = indexes
+        .iter()
+        .filter_map(|(name, index)| index.full_text.as_ref().map(|config| (name, config)))
+        .collect::<Vec<_>>();
+    output.extend_from_slice(FULL_TEXT_OPTIONS_SECTION_MAGIC);
+    output.push(1);
+    encode_u32(
+        output,
+        u32::try_from(entries.len())
+            .map_err(|_| DbError::constraint("fulltext option entry count exceeds u32"))?,
+    );
+    for (index_name, config) in entries {
+        encode_string(output, index_name)?;
+        let bytes = config
+            .to_json()
+            .map_err(|error| DbError::internal(error.message))?;
+        encode_bytes(output, &bytes)?;
+    }
+    Ok(())
+}
+
 fn encode_schemas_section(
     output: &mut Vec<u8>,
     schemas: &BTreeMap<String, SchemaInfo>,
@@ -18202,6 +18508,46 @@ fn decode_index_include_columns_section(
             ))
         })?;
         index.include_columns = include_columns;
+    }
+    Ok(())
+}
+
+fn decode_full_text_options_section(
+    cursor: &mut Cursor<'_>,
+    indexes: &mut BTreeMap<String, IndexSchema>,
+) -> Result<()> {
+    let section_is_present = cursor
+        .bytes
+        .get(cursor.offset..cursor.offset + FULL_TEXT_OPTIONS_SECTION_MAGIC.len())
+        .is_some_and(|magic| magic == FULL_TEXT_OPTIONS_SECTION_MAGIC);
+    if !section_is_present {
+        return Ok(());
+    }
+    cursor.offset += FULL_TEXT_OPTIONS_SECTION_MAGIC.len();
+    let version = cursor.read_u8()?;
+    if version != 1 {
+        return Err(DbError::corruption(format!(
+            "unknown fulltext options section version {version}"
+        )));
+    }
+    let entry_count = cursor.read_u32()?;
+    for _ in 0..entry_count {
+        let index_name = cursor.read_string()?;
+        let config_bytes_len = cursor.read_u32()? as usize;
+        let config_bytes = cursor.read_slice(config_bytes_len)?;
+        let config = AnalyzerConfig::from_json(config_bytes)
+            .map_err(|error| DbError::corruption(error.message))?;
+        let index = indexes.get_mut(&index_name).ok_or_else(|| {
+            DbError::corruption(format!(
+                "fulltext options metadata referenced unknown index {index_name}"
+            ))
+        })?;
+        if index.kind != IndexKind::FullText {
+            return Err(DbError::corruption(format!(
+                "fulltext options metadata referenced non-fulltext index {index_name}"
+            )));
+        }
+        index.full_text = Some(config);
     }
     Ok(())
 }
@@ -18523,6 +18869,7 @@ fn decode_index_kind(tag: u8) -> Result<crate::catalog::IndexKind> {
         0 => Ok(crate::catalog::IndexKind::Btree),
         1 => Ok(crate::catalog::IndexKind::Trigram),
         2 => Ok(crate::catalog::IndexKind::Spatial),
+        3 => Ok(crate::catalog::IndexKind::FullText),
         _ => Err(DbError::corruption("unknown index kind tag")),
     }
 }
@@ -22983,7 +23330,7 @@ fn try_project_simple_select_items(
             SelectItem::QualifiedWildcard(table) => {
                 let mut matched = false;
                 for (source_index, binding) in dataset.columns.iter().enumerate() {
-                    if binding.table.as_deref() != Some(table.as_str()) {
+                    if binding.hidden || binding.table.as_deref() != Some(table.as_str()) {
                         continue;
                     }
                     projection_plan.push(source_index);
@@ -23028,6 +23375,31 @@ fn simple_trigram_lookup(filter: &Expr) -> Option<(&str, &Expr, bool)> {
             .or_else(|| {
                 simple_trigram_lookup(right).map(|(column, pattern, _)| (column, pattern, true))
             }),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SimpleFullTextLookup<'a> {
+    index_name_expr: &'a Expr,
+    query_expr: &'a Expr,
+}
+
+fn simple_fulltext_lookup(filter: &Expr) -> Option<SimpleFullTextLookup<'_>> {
+    match filter {
+        Expr::Function { name, args }
+            if name.eq_ignore_ascii_case("fulltext_match") && args.len() == 2 =>
+        {
+            Some(SimpleFullTextLookup {
+                index_name_expr: &args[0],
+                query_expr: &args[1],
+            })
+        }
+        Expr::Binary {
+            left,
+            op: BinaryOp::And,
+            right,
+        } => simple_fulltext_lookup(left).or_else(|| simple_fulltext_lookup(right)),
         _ => None,
     }
 }
@@ -23901,7 +24273,9 @@ impl EngineRuntime {
                     dataset
                         .columns
                         .iter()
-                        .filter(|column| column.table.as_deref() == Some(table.as_str()))
+                        .filter(|column| {
+                            !column.hidden && column.table.as_deref() == Some(table.as_str())
+                        })
                         .map(ColumnBinding::as_output),
                 ),
             }
@@ -23960,7 +24334,7 @@ impl EngineRuntime {
                     }
                     SelectItem::QualifiedWildcard(table) => {
                         for (binding, value) in dataset.columns.iter().zip(row) {
-                            if binding.table.as_deref() == Some(table.as_str()) {
+                            if !binding.hidden && binding.table.as_deref() == Some(table.as_str()) {
                                 output.push(self.masked_output_value(
                                     binding, value, dataset, row, params, ctes,
                                 )?);
@@ -26268,6 +26642,175 @@ fn aggregate_extreme(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn eval_fulltext_match(
+    runtime: &EngineRuntime,
+    args: &[Expr],
+    dataset: &Dataset,
+    row: &[Value],
+    params: &[Value],
+    ctes: &BTreeMap<String, Dataset>,
+    excluded: Option<&Dataset>,
+) -> Result<Value> {
+    if args.len() != 2 {
+        return Err(DbError::sql("FULLTEXT_MATCH expects 2 arguments"));
+    }
+    let index_value = runtime.eval_expr(&args[0], dataset, row, params, ctes, excluded)?;
+    let query_value = runtime.eval_expr(&args[1], dataset, row, params, ctes, excluded)?;
+    let Some(index_name) = expect_text_arg("FULLTEXT_MATCH", "first", &index_value)? else {
+        return Ok(Value::Null);
+    };
+    let Some(query_text) = expect_text_arg("FULLTEXT_MATCH", "second", &query_value)? else {
+        return Ok(Value::Null);
+    };
+    let (index_schema, fulltext) = fulltext_runtime_index(runtime, index_name)?;
+    let row_id = resolve_fulltext_row_id(dataset, row, index_schema)?;
+    let row_id_u64 = u64::try_from(row_id).map_err(|_| {
+        DbError::internal(format!(
+            "fulltext index {} received negative row id {row_id}",
+            index_schema.name
+        ))
+    })?;
+    let matched = fulltext
+        .matches_query(row_id_u64, query_text)
+        .map_err(|error| DbError::sql(error.message))?;
+    let mut context = runtime
+        .fts_eval_context
+        .lock()
+        .map_err(|_| DbError::internal("fulltext evaluation context lock poisoned"))?;
+    let key = (index_schema.name.clone(), row_id);
+    if matched {
+        let score = fulltext
+            .score_query(row_id_u64, query_text)
+            .map_err(|error| DbError::sql(error.message))?;
+        context.scores.insert(key, score);
+    } else {
+        context.scores.remove(&key);
+    }
+    Ok(Value::Bool(matched))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn eval_bm25(
+    runtime: &EngineRuntime,
+    args: &[Expr],
+    dataset: &Dataset,
+    row: &[Value],
+    params: &[Value],
+    ctes: &BTreeMap<String, Dataset>,
+    excluded: Option<&Dataset>,
+) -> Result<Value> {
+    if args.len() != 1 {
+        return Err(DbError::sql("BM25 expects 1 argument"));
+    }
+    let index_value = runtime.eval_expr(&args[0], dataset, row, params, ctes, excluded)?;
+    let Some(index_name) = expect_text_arg("BM25", "first", &index_value)? else {
+        return Ok(Value::Null);
+    };
+    let (index_schema, _) = fulltext_runtime_index(runtime, index_name)?;
+    let Some(row_id_column_index) = fulltext_row_id_column_index(dataset, index_schema)? else {
+        return Err(DbError::sql(format!(
+            "{FTS_SEMANTIC_ERROR_PREFIX} bm25 requires fulltext_match in the same query block"
+        )));
+    };
+    let row_id = match row.get(row_id_column_index) {
+        Some(Value::Int64(row_id)) => *row_id,
+        Some(other) => {
+            return Err(DbError::internal(format!(
+                "fulltext hidden row id has unexpected value {other:?}"
+            )));
+        }
+        None => return Err(DbError::internal("row is shorter than fulltext bindings")),
+    };
+    let context = runtime
+        .fts_eval_context
+        .lock()
+        .map_err(|_| DbError::internal("fulltext evaluation context lock poisoned"))?;
+    context
+        .scores
+        .get(&(index_schema.name.clone(), row_id))
+        .copied()
+        .map(Value::Float64)
+        .ok_or_else(|| {
+            DbError::sql(format!(
+                "{FTS_SEMANTIC_ERROR_PREFIX} bm25 requires fulltext_match in the same query block"
+            ))
+        })
+}
+
+fn fulltext_runtime_index<'a>(
+    runtime: &'a EngineRuntime,
+    index_name: &str,
+) -> Result<(&'a IndexSchema, &'a FullTextIndex)> {
+    let index_schema = runtime.catalog.index(index_name).ok_or_else(|| {
+        DbError::sql(format!(
+            "{FTS_SEMANTIC_ERROR_PREFIX} unknown fulltext index {index_name}"
+        ))
+    })?;
+    if index_schema.kind != IndexKind::FullText {
+        return Err(DbError::sql(format!(
+            "{FTS_SEMANTIC_ERROR_PREFIX} index {index_name} is not a fulltext index"
+        )));
+    }
+    if !index_schema.fresh {
+        return Err(DbError::sql(format!(
+            "{FTS_SEMANTIC_ERROR_PREFIX} fulltext index {index_name} is stale"
+        )));
+    }
+    let Some(RuntimeIndex::FullText { index }) = runtime.index(&index_schema.name) else {
+        return Err(DbError::sql(format!(
+            "{FTS_SEMANTIC_ERROR_PREFIX} runtime fulltext index {index_name} is missing"
+        )));
+    };
+    Ok((index_schema, index))
+}
+
+fn resolve_fulltext_row_id(
+    dataset: &Dataset,
+    row: &[Value],
+    index_schema: &IndexSchema,
+) -> Result<i64> {
+    let column_index = fulltext_row_id_column_index(dataset, index_schema)?.ok_or_else(|| {
+        DbError::sql(format!(
+            "{FTS_SEMANTIC_ERROR_PREFIX} fulltext index {} table is not in query scope",
+            index_schema.name
+        ))
+    })?;
+    match row.get(column_index) {
+        Some(Value::Int64(row_id)) => Ok(*row_id),
+        Some(other) => Err(DbError::internal(format!(
+            "fulltext hidden row id has unexpected value {other:?}"
+        ))),
+        None => Err(DbError::internal("row is shorter than its bindings")),
+    }
+}
+
+fn fulltext_row_id_column_index(
+    dataset: &Dataset,
+    index_schema: &IndexSchema,
+) -> Result<Option<usize>> {
+    let mut matched_index = None;
+    for (column_index, binding) in dataset.columns.iter().enumerate() {
+        if !binding.hidden || !identifiers_equal(&binding.name, FTS_HIDDEN_ROW_ID_COLUMN) {
+            continue;
+        }
+        if !binding
+            .source_table
+            .as_deref()
+            .is_some_and(|source| identifiers_equal(source, &index_schema.table_name))
+        {
+            continue;
+        }
+        if matched_index.replace(column_index).is_some() {
+            return Err(DbError::sql(format!(
+                "{FTS_SEMANTIC_ERROR_PREFIX} fulltext index {} matches more than one table instance in this query",
+                index_schema.name
+            )));
+        }
+    }
+    Ok(matched_index)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn eval_function(
     runtime: &EngineRuntime,
     name: &str,
@@ -26278,6 +26821,13 @@ fn eval_function(
     ctes: &BTreeMap<String, Dataset>,
     excluded: Option<&Dataset>,
 ) -> Result<Value> {
+    if name.eq_ignore_ascii_case("fulltext_match") {
+        return eval_fulltext_match(runtime, args, dataset, row, params, ctes, excluded);
+    }
+    if name.eq_ignore_ascii_case("bm25") {
+        return eval_bm25(runtime, args, dataset, row, params, ctes, excluded);
+    }
+
     let values = args
         .iter()
         .map(|expr| runtime.eval_expr(expr, dataset, row, params, ctes, excluded))
@@ -35010,6 +35560,105 @@ fn select_item_contains_collation(item: &SelectItem) -> bool {
     match item {
         SelectItem::Expr { expr, .. } => expr_contains_collation(expr),
         SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => false,
+    }
+}
+
+fn select_item_contains_fulltext_function(item: &SelectItem) -> bool {
+    match item {
+        SelectItem::Expr { expr, .. } => expr_contains_fulltext_function(expr),
+        SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => false,
+    }
+}
+
+fn expr_contains_fulltext_function(expr: &Expr) -> bool {
+    match expr {
+        Expr::Function { name, args } => {
+            name.eq_ignore_ascii_case("fulltext_match")
+                || name.eq_ignore_ascii_case("bm25")
+                || args.iter().any(expr_contains_fulltext_function)
+        }
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+            expr_contains_fulltext_function(expr)
+        }
+        Expr::Collate { expr, .. } => expr_contains_fulltext_function(expr),
+        Expr::Binary { left, right, .. } => {
+            expr_contains_fulltext_function(left) || expr_contains_fulltext_function(right)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            expr_contains_fulltext_function(expr)
+                || expr_contains_fulltext_function(low)
+                || expr_contains_fulltext_function(high)
+        }
+        Expr::InList { expr, items, .. } => {
+            expr_contains_fulltext_function(expr)
+                || items.iter().any(expr_contains_fulltext_function)
+        }
+        Expr::InSubquery { expr, .. } | Expr::CompareSubquery { expr, .. } => {
+            expr_contains_fulltext_function(expr)
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            expr_contains_fulltext_function(expr)
+                || expr_contains_fulltext_function(pattern)
+                || escape
+                    .as_deref()
+                    .is_some_and(expr_contains_fulltext_function)
+        }
+        Expr::Aggregate { args, order_by, .. } => {
+            args.iter().any(expr_contains_fulltext_function)
+                || order_by
+                    .iter()
+                    .any(|order| expr_contains_fulltext_function(&order.expr))
+        }
+        Expr::RowNumber {
+            partition_by,
+            order_by,
+            ..
+        } => {
+            partition_by.iter().any(expr_contains_fulltext_function)
+                || order_by
+                    .iter()
+                    .any(|order| expr_contains_fulltext_function(&order.expr))
+        }
+        Expr::WindowFunction {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            args.iter().any(expr_contains_fulltext_function)
+                || partition_by.iter().any(expr_contains_fulltext_function)
+                || order_by
+                    .iter()
+                    .any(|order| expr_contains_fulltext_function(&order.expr))
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            operand
+                .as_deref()
+                .is_some_and(expr_contains_fulltext_function)
+                || branches.iter().any(|(when, then)| {
+                    expr_contains_fulltext_function(when) || expr_contains_fulltext_function(then)
+                })
+                || else_expr
+                    .as_deref()
+                    .is_some_and(expr_contains_fulltext_function)
+        }
+        Expr::Row(exprs) => exprs.iter().any(expr_contains_fulltext_function),
+        Expr::Literal(_)
+        | Expr::Column { .. }
+        | Expr::Parameter(_)
+        | Expr::ScalarSubquery(_)
+        | Expr::Exists(_) => false,
     }
 }
 

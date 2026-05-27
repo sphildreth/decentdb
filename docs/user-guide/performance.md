@@ -55,7 +55,7 @@ CREATE TABLE orders (
 
 ### Trigram Indexes
 
-Use trigram indexes for text search:
+Use trigram indexes for substring and `%pattern%` search:
 
 ```sql
 CREATE INDEX idx_name_trgm ON users USING trigram(name);
@@ -63,6 +63,26 @@ CREATE INDEX idx_name_trgm ON users USING trigram(name);
 -- Fast substring search
 SELECT * FROM users WHERE name LIKE '%john%';
 ```
+
+### Full-Text Indexes
+
+Use full-text indexes for tokenized document search, phrase search, prefix
+search, and BM25 ranking:
+
+```sql
+CREATE INDEX idx_docs_search
+ON docs USING fulltext(title, body)
+WITH (prefix = '2,3');
+
+SELECT id, bm25('idx_docs_search') AS rank
+FROM docs
+WHERE fulltext_match('idx_docs_search', 'database OR search')
+ORDER BY rank DESC
+LIMIT 20;
+```
+
+Choose trigram search for arbitrary substrings and full-text search for
+keyword/document relevance.
 
 ### Expression Indexes
 

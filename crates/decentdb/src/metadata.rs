@@ -79,6 +79,7 @@ pub struct IndexInfo {
     pub columns: Vec<String>,
     pub include_columns: Vec<String>,
     pub predicate_sql: Option<String>,
+    pub full_text_options_json: Option<String>,
     pub fresh: bool,
 }
 
@@ -161,6 +162,7 @@ pub struct SchemaIndexInfo {
     pub columns: Vec<String>,
     pub include_columns: Vec<String>,
     pub predicate_sql: Option<String>,
+    pub full_text_options_json: Option<String>,
     pub fresh: bool,
     pub temporary: bool,
     pub ddl: String,

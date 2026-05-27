@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 //! Trigram indexing and search primitives.
 
+pub(crate) mod fulltext;
 pub(crate) mod postings;
 pub(crate) mod rebuild;
 #[cfg(test)]

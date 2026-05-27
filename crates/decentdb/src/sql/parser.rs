@@ -35,6 +35,9 @@ pub(crate) fn parse_sql_batch(sql: &str) -> Result<Vec<Statement>> {
 pub(crate) fn parse_sql_batch(sql: &str) -> Result<Vec<Statement>> {
     let (generated_modes, sql_with_generated_rewrite) = rewrite_generated_virtual_columns(sql);
     let compat_sql = rewrite_legacy_trigger_body(sql_with_generated_rewrite.as_ref());
+    if let Some(statement) = parse_alter_index_maintenance(&compat_sql)? {
+        return Ok(vec![statement]);
+    }
     // Pre-rewrite: make CREATE VIEW IF NOT EXISTS parsable by pg_query.
     let sql_for_split = super::normalize::detect_and_rewrite_create_view_if_not_exists(&compat_sql);
     let statements = libpg_query_sys::split_statements(sql_for_split.as_str())
@@ -64,6 +67,80 @@ pub(crate) fn parse_sql_batch(sql: &str) -> Result<Vec<Statement>> {
             }
         })
         .collect()
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+fn parse_alter_index_maintenance(sql: &str) -> Result<Option<Statement>> {
+    let trimmed = sql.trim();
+    let trimmed = trimmed.strip_suffix(';').unwrap_or(trimmed).trim();
+    let Some(rest) = consume_keyword_ci(trimmed, "ALTER") else {
+        return Ok(None);
+    };
+    let Some(rest) = consume_keyword_ci(rest, "INDEX") else {
+        return Ok(None);
+    };
+    let (name, rest) = parse_identifier_token(rest)?;
+    let rest = rest.trim();
+    if rest.eq_ignore_ascii_case("REBUILD") {
+        return Ok(Some(Statement::AlterIndexRebuild { name }));
+    }
+    if rest.eq_ignore_ascii_case("VERIFY") {
+        return Ok(Some(Statement::AlterIndexVerify { name }));
+    }
+    Ok(None)
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+fn consume_keyword_ci<'a>(input: &'a str, keyword: &str) -> Option<&'a str> {
+    let input = input.trim_start();
+    if !input
+        .get(..keyword.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(keyword))
+    {
+        return None;
+    }
+    let rest = &input[keyword.len()..];
+    if rest
+        .chars()
+        .next()
+        .is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    {
+        return None;
+    }
+    Some(rest.trim_start())
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+fn parse_identifier_token(input: &str) -> Result<(String, &str)> {
+    let input = input.trim_start();
+    if input.is_empty() {
+        return Err(DbError::sql("ALTER INDEX requires an index name"));
+    }
+    if let Some(rest) = input.strip_prefix('"') {
+        let mut output = String::new();
+        let mut chars = rest.char_indices().peekable();
+        while let Some((offset, ch)) = chars.next() {
+            if ch == '"' {
+                if matches!(chars.peek(), Some((_, '"'))) {
+                    output.push('"');
+                    chars.next();
+                    continue;
+                }
+                let consumed = offset + ch.len_utf8() + 1;
+                return Ok((output, &input[consumed..]));
+            }
+            output.push(ch);
+        }
+        return Err(DbError::sql("unterminated quoted index name"));
+    }
+    let end = input
+        .char_indices()
+        .find_map(|(index, ch)| ch.is_whitespace().then_some(index))
+        .unwrap_or(input.len());
+    if end == 0 {
+        return Err(DbError::sql("ALTER INDEX requires an index name"));
+    }
+    Ok((input[..end].to_string(), &input[end..]))
 }
 
 fn rewrite_generated_virtual_columns(sql: &str) -> (Vec<bool>, Cow<'_, str>) {

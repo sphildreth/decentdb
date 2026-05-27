@@ -802,6 +802,7 @@ mod tests {
                 }],
                 include_columns: vec![],
                 predicate_sql: None,
+                full_text: None,
                 fresh: false,
             },
         );
@@ -945,6 +946,7 @@ mod tests {
                 ],
                 include_columns: vec![],
                 predicate_sql: None,
+                full_text: None,
                 fresh: true,
             },
         );
