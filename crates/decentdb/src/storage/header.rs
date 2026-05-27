@@ -139,6 +139,20 @@ impl DatabaseHeader {
     }
 
     #[must_use]
+    pub(crate) fn has_empty_database_id(&self) -> bool {
+        self.database_id == [0_u8; DATABASE_ID_LEN]
+    }
+
+    pub(crate) fn ensure_database_id(&mut self) -> bool {
+        if !self.has_empty_database_id() {
+            return false;
+        }
+        self.database_id = random_database_id();
+        self.header_checksum = self.compute_checksum();
+        true
+    }
+
+    #[must_use]
     fn compute_checksum(&self) -> u32 {
         let bytes = self.encode_with_checksum(0);
         checksum::crc32c_parts(&[&bytes[0..CHECKSUM_OFFSET], &bytes[CHECKSUM_OFFSET + 4..]])
@@ -213,6 +227,18 @@ pub(crate) fn read_database_header_vfs(file: &dyn VfsFile) -> Result<DatabaseHea
     DatabaseHeader::decode(&bytes)
 }
 
+pub(crate) fn repair_empty_database_id_vfs(
+    file: &dyn VfsFile,
+    header: &mut DatabaseHeader,
+) -> Result<bool> {
+    if !header.ensure_database_id() {
+        return Ok(false);
+    }
+    write_all_at(file, 0, &header.encode())?;
+    file.sync_data()?;
+    Ok(true)
+}
+
 pub(crate) fn read_database_header_vfs_loose(file: &dyn VfsFile) -> Result<DatabaseHeader> {
     let mut bytes = [0_u8; DB_HEADER_SIZE];
     read_exact_at(file, 0, &mut bytes)?;
@@ -281,6 +307,21 @@ mod tests {
         let header = DatabaseHeader::new(page::DEFAULT_PAGE_SIZE);
 
         assert_ne!(header.database_id, [0_u8; DATABASE_ID_LEN]);
+    }
+
+    #[test]
+    fn ensure_database_id_repairs_empty_identity() {
+        let mut header = DatabaseHeader::new(page::DEFAULT_PAGE_SIZE);
+        header.database_id = [0_u8; DATABASE_ID_LEN];
+        header.header_checksum = header.compute_checksum();
+
+        assert!(header.has_empty_database_id());
+        assert!(header.ensure_database_id());
+        assert!(!header.has_empty_database_id());
+
+        let encoded = header.encode();
+        let decoded = DatabaseHeader::decode(&encoded).expect("repaired header should decode");
+        assert_eq!(decoded.database_id, header.database_id);
     }
 
     #[test]

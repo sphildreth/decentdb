@@ -180,8 +180,7 @@ fn migrate_v11_file(source: &Path, dest: &Path) -> Result<()> {
 }
 
 fn migrate_v12_file(source: &Path, dest: &Path) -> Result<()> {
-    copy_file_and_patch_format_version(source, dest, 12)?;
-    patch_database_id_if_empty(dest)
+    copy_file_and_patch_format_version(source, dest, 12)
 }
 
 fn copy_file_and_patch_format_version(
@@ -355,6 +354,13 @@ fn patch_wal_header_pages(wal_path: &Path, db_path: &Path) -> Result<usize> {
             error
         )
     })?;
+    let migrated_database_id =
+        read_database_id_from_header_page(&header_page).ok_or_else(|| {
+            anyhow!(
+                "Migrated database header page {} is too short to read coordination identity",
+                db_path.display()
+            )
+        })?;
 
     let mut patched = 0_usize;
     let mut offset = WAL_HEADER_SIZE as u64;
@@ -405,7 +411,11 @@ fn patch_wal_header_pages(wal_path: &Path, db_path: &Path) -> Result<usize> {
                             error
                         )
                     })?;
-                patch_page_header_format_version(&mut page, decentdb::DB_FORMAT_VERSION)?;
+                patch_page_header_format_version(
+                    &mut page,
+                    decentdb::DB_FORMAT_VERSION,
+                    Some(&migrated_database_id),
+                )?;
                 wal.seek(SeekFrom::Start(payload_offset))
                     .and_then(|_| wal.write_all(&page))
                     .map_err(|error| {
@@ -433,7 +443,11 @@ fn patch_wal_header_pages(wal_path: &Path, db_path: &Path) -> Result<usize> {
                     })?;
                 let mut updated_page = header_page.clone();
                 apply_page_delta_in_place(&mut updated_page, &payload)?;
-                patch_page_header_format_version(&mut updated_page, decentdb::DB_FORMAT_VERSION)?;
+                patch_page_header_format_version(
+                    &mut updated_page,
+                    decentdb::DB_FORMAT_VERSION,
+                    Some(&migrated_database_id),
+                )?;
                 let patched_delta = encode_page_delta(&header_page, &updated_page)?;
                 wal.seek(SeekFrom::Start(payload_offset))
                     .and_then(|_| wal.write_all(&patched_delta))
@@ -474,7 +488,20 @@ fn wal_frame_payload_len(frame_type: u8, page_size: usize) -> Result<usize> {
     }
 }
 
-fn patch_page_header_format_version(page: &mut [u8], format_version: u32) -> Result<()> {
+fn read_database_id_from_header_page(page: &[u8]) -> Option<[u8; DATABASE_ID_LEN]> {
+    if page.len() < DATABASE_ID_OFFSET + DATABASE_ID_LEN {
+        return None;
+    }
+    let mut database_id = [0_u8; DATABASE_ID_LEN];
+    database_id.copy_from_slice(&page[DATABASE_ID_OFFSET..DATABASE_ID_OFFSET + DATABASE_ID_LEN]);
+    Some(database_id)
+}
+
+fn patch_page_header_format_version(
+    page: &mut [u8],
+    format_version: u32,
+    database_id: Option<&[u8; DATABASE_ID_LEN]>,
+) -> Result<()> {
     if page.len() < DB_HEADER_SIZE {
         return Err(anyhow!(
             "Header page is shorter than fixed database header: {} bytes",
@@ -483,7 +510,7 @@ fn patch_page_header_format_version(page: &mut [u8], format_version: u32) -> Res
     }
     let mut header = [0_u8; DB_HEADER_SIZE];
     header.copy_from_slice(&page[..DB_HEADER_SIZE]);
-    patch_header_format_version(&mut header, format_version);
+    patch_header_format_version_with_database_id(&mut header, format_version, database_id);
     page[..DB_HEADER_SIZE].copy_from_slice(&header);
     Ok(())
 }
@@ -589,63 +616,40 @@ fn encode_page_delta(base: &[u8], updated: &[u8]) -> Result<[u8; WAL_DELTA_FRAME
 }
 
 fn patch_header_format_version(header: &mut [u8; DB_HEADER_SIZE], format_version: u32) {
+    patch_header_format_version_with_database_id(header, format_version, None);
+}
+
+fn patch_header_format_version_with_database_id(
+    header: &mut [u8; DB_HEADER_SIZE],
+    format_version: u32,
+    database_id: Option<&[u8; DATABASE_ID_LEN]>,
+) {
     header[FORMAT_VERSION_OFFSET..FORMAT_VERSION_OFFSET + 4]
         .copy_from_slice(&format_version.to_le_bytes());
+    if format_version >= 13 {
+        match database_id {
+            Some(database_id) => {
+                header[DATABASE_ID_OFFSET..DATABASE_ID_OFFSET + DATABASE_ID_LEN]
+                    .copy_from_slice(database_id);
+            }
+            None => seed_header_database_id_if_empty(header),
+        }
+    }
     recompute_header_checksum(header);
 }
 
-fn patch_header_database_id_if_empty(header: &mut [u8; DB_HEADER_SIZE]) {
+fn seed_header_database_id_if_empty(header: &mut [u8; DB_HEADER_SIZE]) {
     let range = DATABASE_ID_OFFSET..DATABASE_ID_OFFSET + DATABASE_ID_LEN;
     if header[range.clone()].iter().any(|byte| *byte != 0) {
         return;
     }
     header[range].copy_from_slice(&random_database_id());
-    recompute_header_checksum(header);
 }
 
 fn recompute_header_checksum(header: &mut [u8; DB_HEADER_SIZE]) {
     header[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4].fill(0);
     let checksum = crc32c_parts(&[&header[..CHECKSUM_OFFSET], &header[CHECKSUM_OFFSET + 4..]]);
     header[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4].copy_from_slice(&checksum.to_le_bytes());
-}
-
-fn patch_database_id_if_empty(path: &Path) -> Result<()> {
-    let mut file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .map_err(|error| {
-            anyhow!(
-                "Failed to open destination database {} for identity patch: {}",
-                path.display(),
-                error
-            )
-        })?;
-    let mut header = [0_u8; DB_HEADER_SIZE];
-    file.read_exact(&mut header).map_err(|error| {
-        anyhow!(
-            "Failed to read destination database header {} for identity patch: {}",
-            path.display(),
-            error
-        )
-    })?;
-    patch_header_database_id_if_empty(&mut header);
-    file.seek(SeekFrom::Start(0))
-        .and_then(|_| file.write_all(&header))
-        .map_err(|error| {
-            anyhow!(
-                "Failed to write destination database identity {}: {}",
-                path.display(),
-                error
-            )
-        })?;
-    file.flush().map_err(|error| {
-        anyhow!(
-            "Failed to flush destination database identity {}: {}",
-            path.display(),
-            error
-        )
-    })
 }
 
 fn random_database_id() -> [u8; DATABASE_ID_LEN] {
@@ -736,6 +740,30 @@ mod tests {
         );
     }
 
+    fn rewrite_source_as_legacy_format(path: &Path, format_version: u32) {
+        let mut bytes = std::fs::read(path).expect("read source");
+        let mut header = [0_u8; super::DB_HEADER_SIZE];
+        header.copy_from_slice(&bytes[..super::DB_HEADER_SIZE]);
+        header[super::DATABASE_ID_OFFSET..super::DATABASE_ID_OFFSET + super::DATABASE_ID_LEN]
+            .fill(0);
+        patch_header_format_version(&mut header, format_version);
+        bytes[..super::DB_HEADER_SIZE].copy_from_slice(&header);
+        std::fs::write(path, bytes).expect("write legacy header");
+    }
+
+    fn assert_database_id_nonzero(path: &Path) -> [u8; super::DATABASE_ID_LEN] {
+        let bytes = std::fs::read(path).expect("read database bytes");
+        let mut database_id = [0_u8; super::DATABASE_ID_LEN];
+        database_id.copy_from_slice(
+            &bytes[super::DATABASE_ID_OFFSET..super::DATABASE_ID_OFFSET + super::DATABASE_ID_LEN],
+        );
+        assert!(
+            database_id.iter().any(|byte| *byte != 0),
+            "expected migrated database to have a nonzero coordination identity"
+        );
+        database_id
+    }
+
     #[test]
     fn migrate_v8_copy_upgrades_header_version() {
         let tempdir = TempDir::new().expect("tempdir");
@@ -750,16 +778,12 @@ mod tests {
         db.checkpoint().expect("checkpoint");
         drop(db);
 
-        let mut bytes = std::fs::read(&source).expect("read source");
-        let mut header = [0_u8; super::DB_HEADER_SIZE];
-        header.copy_from_slice(&bytes[..super::DB_HEADER_SIZE]);
-        patch_header_format_version(&mut header, 8);
-        bytes[..super::DB_HEADER_SIZE].copy_from_slice(&header);
-        std::fs::write(&source, bytes).expect("write v8 header");
+        rewrite_source_as_legacy_format(&source, 8);
 
         migrate_v8_file(&source, &dest).expect("migrate v8 file");
         let header = Db::read_header_info(&dest).expect("read migrated header");
         assert_eq!(header.format_version, DB_FORMAT_VERSION);
+        assert_database_id_nonzero(&dest);
 
         let reopened = Db::open_or_create(&dest, DbConfig::default()).expect("open migrated db");
         let result = reopened
@@ -791,14 +815,10 @@ mod tests {
         db.checkpoint().expect("checkpoint");
         drop(db);
 
-        let mut bytes = std::fs::read(&source).expect("read source");
-        let mut header = [0_u8; super::DB_HEADER_SIZE];
-        header.copy_from_slice(&bytes[..super::DB_HEADER_SIZE]);
-        patch_header_format_version(&mut header, 8);
-        bytes[..super::DB_HEADER_SIZE].copy_from_slice(&header);
-        std::fs::write(&source, bytes).expect("write v8 header");
+        rewrite_source_as_legacy_format(&source, 8);
 
         migrate_v8_file(&source, &dest).expect("migrate v8 file");
+        assert_database_id_nonzero(&dest);
 
         let config = DbConfig {
             persistent_pk_index: true,
@@ -845,16 +865,12 @@ mod tests {
         db.checkpoint().expect("checkpoint");
         drop(db);
 
-        let mut bytes = std::fs::read(&source).expect("read source");
-        let mut header = [0_u8; super::DB_HEADER_SIZE];
-        header.copy_from_slice(&bytes[..super::DB_HEADER_SIZE]);
-        patch_header_format_version(&mut header, 9);
-        bytes[..super::DB_HEADER_SIZE].copy_from_slice(&header);
-        std::fs::write(&source, bytes).expect("write v9 header");
+        rewrite_source_as_legacy_format(&source, 9);
 
         migrate_v9_file(&source, &dest).expect("migrate v9 file");
         let header = Db::read_header_info(&dest).expect("read migrated header");
         assert_eq!(header.format_version, DB_FORMAT_VERSION);
+        assert_database_id_nonzero(&dest);
 
         let reopened = Db::open_or_create(&dest, DbConfig::default()).expect("open migrated db");
         let result = reopened
@@ -880,16 +896,12 @@ mod tests {
         db.checkpoint().expect("checkpoint");
         drop(db);
 
-        let mut bytes = std::fs::read(&source).expect("read source");
-        let mut header = [0_u8; super::DB_HEADER_SIZE];
-        header.copy_from_slice(&bytes[..super::DB_HEADER_SIZE]);
-        patch_header_format_version(&mut header, 10);
-        bytes[..super::DB_HEADER_SIZE].copy_from_slice(&header);
-        std::fs::write(&source, bytes).expect("write v10 header");
+        rewrite_source_as_legacy_format(&source, 10);
 
         migrate_v10_file(&source, &dest).expect("migrate v10 file");
         let header = Db::read_header_info(&dest).expect("read migrated header");
         assert_eq!(header.format_version, DB_FORMAT_VERSION);
+        assert_database_id_nonzero(&dest);
 
         let reopened = Db::open_or_create(&dest, DbConfig::default()).expect("open migrated db");
         let result = reopened
@@ -915,16 +927,12 @@ mod tests {
         db.checkpoint().expect("checkpoint");
         drop(db);
 
-        let mut bytes = std::fs::read(&source).expect("read source");
-        let mut header = [0_u8; super::DB_HEADER_SIZE];
-        header.copy_from_slice(&bytes[..super::DB_HEADER_SIZE]);
-        patch_header_format_version(&mut header, 11);
-        bytes[..super::DB_HEADER_SIZE].copy_from_slice(&header);
-        std::fs::write(&source, bytes).expect("write v11 header");
+        rewrite_source_as_legacy_format(&source, 11);
 
         migrate_v11_file(&source, &dest).expect("migrate v11 file");
         let header = Db::read_header_info(&dest).expect("read migrated header");
         assert_eq!(header.format_version, DB_FORMAT_VERSION);
+        assert_database_id_nonzero(&dest);
 
         let reopened = Db::open_or_create(&dest, DbConfig::default()).expect("open migrated db");
         let result = reopened
@@ -950,21 +958,12 @@ mod tests {
         db.checkpoint().expect("checkpoint");
         drop(db);
 
-        let mut bytes = std::fs::read(&source).expect("read source");
-        let mut header = [0_u8; super::DB_HEADER_SIZE];
-        header.copy_from_slice(&bytes[..super::DB_HEADER_SIZE]);
-        patch_header_format_version(&mut header, 12);
-        bytes[..super::DB_HEADER_SIZE].copy_from_slice(&header);
-        std::fs::write(&source, bytes).expect("write v12 header");
+        rewrite_source_as_legacy_format(&source, 12);
 
         migrate_v12_file(&source, &dest).expect("migrate v12 file");
         let header = Db::read_header_info(&dest).expect("read migrated header");
         assert_eq!(header.format_version, DB_FORMAT_VERSION);
-        let bytes = std::fs::read(&dest).expect("read migrated bytes");
-        assert_ne!(
-            &bytes[super::DATABASE_ID_OFFSET..super::DATABASE_ID_OFFSET + super::DATABASE_ID_LEN],
-            &[0_u8; super::DATABASE_ID_LEN]
-        );
+        assert_database_id_nonzero(&dest);
 
         let reopened = Db::open_or_create(&dest, DbConfig::default()).expect("open migrated db");
         let result = reopened
@@ -1006,12 +1005,7 @@ mod tests {
             "expected source WAL to contain uncheckpointed frames"
         );
 
-        let mut bytes = std::fs::read(&source).expect("read source");
-        let mut header = [0_u8; super::DB_HEADER_SIZE];
-        header.copy_from_slice(&bytes[..super::DB_HEADER_SIZE]);
-        patch_header_format_version(&mut header, 10);
-        bytes[..super::DB_HEADER_SIZE].copy_from_slice(&header);
-        std::fs::write(&source, bytes).expect("write v10 header");
+        rewrite_source_as_legacy_format(&source, 10);
 
         migrate_v10_file(&source, &dest).expect("migrate v10 file with wal");
 
@@ -1023,6 +1017,7 @@ mod tests {
 
         let header = Db::read_header_info(&dest).expect("read migrated header");
         assert_eq!(header.format_version, DB_FORMAT_VERSION);
+        let migrated_database_id = assert_database_id_nonzero(&dest);
 
         let reopened = Db::open_or_create(&dest, DbConfig::default())
             .expect("open migrated db and recover wal");
@@ -1041,6 +1036,7 @@ mod tests {
 
         let header = Db::read_header_info(&dest).expect("read checkpointed migrated header");
         assert_eq!(header.format_version, DB_FORMAT_VERSION);
+        assert_eq!(assert_database_id_nonzero(&dest), migrated_database_id);
         let checkpointed_wal_len = std::fs::metadata(&dest_wal)
             .expect("checkpointed wal metadata")
             .len();

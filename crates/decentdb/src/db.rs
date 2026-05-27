@@ -2657,7 +2657,8 @@ impl Db {
             },
             FileKind::Database,
         )?;
-        let header = storage::read_database_header_vfs(file.as_ref())?;
+        let mut header = storage::read_database_header_vfs(file.as_ref())?;
+        storage::repair_empty_database_id_vfs(file.as_ref(), &mut header)?;
         let mut effective_config = config;
         effective_config.page_size = header.page_size;
         let schema_cookie = header.schema_cookie;
@@ -15375,6 +15376,7 @@ fn json_escape(input: String) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::path::Path;
     use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
     use std::sync::{Arc, Barrier};
     use std::thread;
@@ -15391,7 +15393,9 @@ mod tests {
         decode_paged_table_manifest_payload, EngineRuntime, RuntimeIndex, TableData, TableRowSource,
     };
     use crate::record::overflow::read_overflow;
+    use crate::storage::header::DB_HEADER_SIZE;
     use crate::storage::page::{PageId, PageStore};
+    use crate::storage::DatabaseHeader;
 
     use crate::exec::dml::{PreparedInsertColumn, PreparedInsertValueSource, PreparedSimpleInsert};
     use crate::sql::parser::parse_sql_statement;
@@ -15434,6 +15438,13 @@ mod tests {
                 "PagerReadStore does not support writing pages",
             ))
         }
+    }
+
+    fn read_header_from_path(path: &Path) -> DatabaseHeader {
+        let bytes = std::fs::read(path).expect("read database bytes");
+        let mut header = [0_u8; DB_HEADER_SIZE];
+        header.copy_from_slice(&bytes[..DB_HEADER_SIZE]);
+        DatabaseHeader::decode(&header).expect("decode database header")
     }
 
     #[test]
@@ -31258,6 +31269,39 @@ mod tests {
 
         let coordination = db2.execute("SELECT * FROM sys.process_coordination")?;
         assert_eq!(coordination.rows()[0].values()[1], Value::Bool(true));
+        Ok(())
+    }
+
+    #[test]
+    fn open_repairs_current_header_with_empty_coordination_identity() -> Result<()> {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("repair-empty-identity.ddb");
+
+        let db = Db::open_or_create(&path, DbConfig::default())?;
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT)")?;
+        db.execute("INSERT INTO t VALUES (1, 'alpha')")?;
+        db.checkpoint()?;
+        drop(db);
+
+        let original_header = read_header_from_path(&path);
+        assert!(!original_header.has_empty_database_id());
+
+        let mut damaged_header = original_header.clone();
+        damaged_header.database_id = [0_u8; 16];
+        let mut bytes = std::fs::read(&path).expect("read database bytes");
+        bytes[..DB_HEADER_SIZE].copy_from_slice(&damaged_header.encode());
+        std::fs::write(&path, bytes).expect("write damaged header");
+        assert!(read_header_from_path(&path).has_empty_database_id());
+
+        let reopened = Db::open_or_create(&path, DbConfig::default())?;
+        let result = reopened.execute("SELECT value FROM t WHERE id = 1")?;
+        assert_eq!(
+            result.rows()[0].values(),
+            &[Value::Text("alpha".to_string())]
+        );
+        drop(reopened);
+
+        assert!(!read_header_from_path(&path).has_empty_database_id());
         Ok(())
     }
 

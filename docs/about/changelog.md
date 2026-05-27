@@ -48,6 +48,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cross-process reader slots are active; reader-free checkpoints still copy back
   and truncate normally.
 
+### Fixed
+
+- Fixed legacy database migrations to seed the v13 coordination identity for
+  all upgraded source formats and to keep copied WAL header-page frames aligned
+  with the migrated main header identity.
+- Fixed opening current-format databases produced by earlier v13 migration
+  builds by repairing an empty coordination identity before initializing the
+  coordination sidecar.
+
 ## [2.7.0] - [2026-05-22]
 
 ### Added

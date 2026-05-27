@@ -98,7 +98,7 @@ shipped foundation affects follow-on roadmap decisions.
 
 | Priority | Future Version | Status | Feature | Current Source Of Truth | Why This Rank |
 |---:|---|---|---|---|---|
-| 1 | vNext | TODO | Browser SQL/API parity and production web hardening | ADR 0161/0165 and browser docs; needs follow-up spec | DecentDB has a browser runtime; the next adoption hurdle is making it feel complete next to SQLite WASM and PGlite |
+| 1 | vNext | TODO | Browser SQL/API parity and production web hardening | [`WIN_BROWSER_SQL_API_PARITY_PRODUCTION_WEB_SPEC.md`](WIN_BROWSER_SQL_API_PARITY_PRODUCTION_WEB_SPEC.md) | DecentDB has a browser runtime; the next adoption hurdle is making it feel complete next to SQLite WASM and PGlite |
 | 2 | vNext | TODO | Mobile production runtime and SDK hardening | Needs ADR/spec | Local-first without first-class iOS/Android lifecycle, packaging, key storage, and background sync guidance leaves a major adoption gap |
 | 3 | vNext | TODO | Default-fast performance and storage efficiency | Benchmarking guide and release metrics; needs ADR/spec for format-affecting work | DecentDB should feel fast without special tuning and should keep file size/cold-open behavior competitive |
 | 4 | vNext+1 | TODO | Runtime tracing, advisors, and Doctor integration | Needs ADR/spec; follows shipped operational metrics | Explains slow queries, lock waits, index usage, and maintenance issues once the metrics contract is stable |
@@ -157,47 +157,14 @@ This should be stated plainly in user docs so developers understand that
 DecentDB optimizes the single-writer model rather than pretending it is a server
 database.
 
-## 1. Cross-Process WAL Coordination
+## 1. Browser SQL/API Parity And Production Web Hardening
 
 **Status:** `TODO`
 
 **Future Version:** vNext
 
-**Source of truth:** [`WIN_CROSS_PROCESS_WAL_COORDINATION_SPEC.md`](WIN_CROSS_PROCESS_WAL_COORDINATION_SPEC.md)
-and ADR 0177-0180.
-
-### Why This Matters
-
-DecentDB already has same-process shared WAL visibility. Cross-process
-coordination would support Electron/Tauri apps, helper processes, CLI/app
-coexistence, background sync workers, and desktop apps that currently choose
-SQLite because process-safe file access is a known quantity.
-
-### Required Work
-
-- file-lock or shared-memory writer coordination
-- cross-process reader registry or equivalent retention model
-- consistent snapshots across processes
-- stale-owner and crash-recovery behavior
-- diagnostics for process-level blockers
-- binding and CLI guidance for multi-process applications
-
-### Guardrails
-
-- no weakening of one-writer semantics
-- no platform-specific behavior without explicit portability notes
-- ADR required because this changes locking and `Send` / `Sync` boundaries
-- browser multi-tab coordination stays aligned with, but distinct from, native
-  OS process coordination
-
-## 2. Browser SQL/API Parity And Production Web Hardening
-
-**Status:** `TODO`
-
-**Future Version:** vNext
-
-**Source of truth:** ADR 0161/0165 and browser docs exist; needs follow-up
-ADR/spec before implementation.
+**Source of truth:** [`WIN_BROWSER_SQL_API_PARITY_PRODUCTION_WEB_SPEC.md`](WIN_BROWSER_SQL_API_PARITY_PRODUCTION_WEB_SPEC.md)
+and ADR 0161/0165.
 
 ### Why This Matters
 
@@ -225,7 +192,7 @@ notice deeper engine advantages.
 - keep service-worker ownership unsupported unless a new ADR proves it safe
 - do not make browser parity depend on arbitrary native extension loading
 
-## 3. Mobile Production Runtime And SDK Hardening
+## 2. Mobile Production Runtime And SDK Hardening
 
 **Status:** `TODO`
 
@@ -259,7 +226,7 @@ and consumer mobile apps will default to SQLite plus a sync layer.
 - require real device or simulator smoke coverage before calling a platform
   supported
 
-## 4. Default-Fast Performance And Storage Efficiency
+## 3. Default-Fast Performance And Storage Efficiency
 
 **Status:** `TODO`
 
@@ -295,7 +262,7 @@ after manual tuning.
   application-facing latency
 - keep profile names explicit so tuned and default results are not conflated
 
-## 5. Runtime Tracing, Advisors, And Doctor Integration
+## 4. Runtime Tracing, Advisors, And Doctor Integration
 
 **Status:** `TODO`
 
@@ -348,7 +315,7 @@ SELECT * FROM sys.doctor_findings;
 - advisor output must be reviewable and must not auto-apply destructive fixes
 - keep hot-path overhead measurable and benchmarked
 
-## 6. Branch-Aware Migration Rehearsal And Promotion
+## 5. Branch-Aware Migration Rehearsal And Promotion
 
 **Status:** `TODO`
 
@@ -382,7 +349,7 @@ validate, diff, detect drift, and promote.
 - do not hide destructive schema changes behind automatic promotion
 - shipped policy/security semantics must participate in validation
 
-## 7. Backend Sync Bridge For Existing App Databases, Postgres First
+## 6. Backend Sync Bridge For Existing App Databases, Postgres First
 
 **Status:** `TODO`
 
@@ -415,7 +382,7 @@ changeset and relay model without rewriting their server architecture first.
 - make unsupported schema/type differences explicit before data moves
 - keep hosted-service concerns outside the engine
 
-## 8. Incrementally Maintained Projections
+## 7. Incrementally Maintained Projections
 
 **Status:** `BACKLOG`
 
@@ -444,7 +411,7 @@ database-native capability that also accelerates reactive queries.
 - keep maintenance work visible in write latency and `sys.*`
 - define crash recovery and rebuild semantics before implementation
 
-## 9. JSONB Binary Storage And JSON Path Indexing
+## 8. JSONB Binary Storage And JSON Path Indexing
 
 **Status:** `BACKLOG`
 
@@ -469,7 +436,7 @@ baseline expectation rather than a niche feature.
 - partial updates rebuild the binary blob through the single writer unless an
   ADR proves a narrower mutation format is safe
 
-## 10. Hybrid Local Search: FTS, Trigram, Vector, And Rank Fusion
+## 9. Hybrid Local Search: FTS, Trigram, Vector, And Rank Fusion
 
 **Status:** `BACKLOG`
 
@@ -504,7 +471,7 @@ default performance affect more existing embedded database users. Hybrid search
 should follow the runtime fundamentals and avoid becoming a large storage/index
 project before the core engine is easier to adopt and operate.
 
-## 11. Authenticated Encryption, Key Rotation, And Platform Key-Store Helpers
+## 10. Authenticated Encryption, Key Rotation, And Platform Key-Store Helpers
 
 **Status:** `BACKLOG`
 
@@ -537,7 +504,7 @@ desktop, server, browser, and mobile hosts.
 - keep key material outside database pages, WAL, sync journals, audit rows, and
   diagnostics
 
-## 12. Agent And Tooling Integration Mode
+## 11. Agent And Tooling Integration Mode
 
 **Status:** `BACKLOG`
 
@@ -572,7 +539,7 @@ guessing.
 - Decent Bench remains the product home for rich visual workflows and generated
   SDK output
 
-## 13. Application And Support Bundle Format
+## 12. Application And Support Bundle Format
 
 **Status:** `BACKLOG`
 
@@ -607,7 +574,7 @@ A DecentDB bundle may contain:
 - support bundles must have a sanitization/redaction story before use with
   regulated data
 
-## 14. Temporal Row History And Auditable State
+## 13. Temporal Row History And Auditable State
 
 **Status:** `BACKLOG`
 
@@ -636,7 +603,7 @@ auditable local data. Some regulated and support-heavy apps need to answer:
 - redaction must be compatible with retention and audit requirements
 - do not conflate branch snapshots with row-level audit history
 
-## 15. Advanced Geospatial Semantics And Analytics
+## 14. Advanced Geospatial Semantics And Analytics
 
 **Status:** `BACKLOG`
 
@@ -668,7 +635,7 @@ the completed native geospatial feature does not appear unfinished.
 - avoid native GEOS/PROJ/GDAL dependencies unless an ADR justifies the tradeoff
 - keep WASM/mobile compatibility as a design constraint
 
-## 16. Advanced SQL Compatibility Surface
+## 15. Advanced SQL Compatibility Surface
 
 **Status:** `BACKLOG`
 
@@ -705,7 +672,7 @@ layer is delivered; this item is for heavier compatibility work.
   ergonomics
 - avoid expanding core import/export features in this track
 
-## 17. WAL Streaming Replication
+## 16. WAL Streaming Replication
 
 **Status:** `BACKLOG`
 
@@ -730,7 +697,7 @@ traditional HA problem.
 - quorum acknowledgement
 - explicit consistency/durability tradeoffs
 
-## 18. Cloud-Native Object Storage VFS
+## 17. Cloud-Native Object Storage VFS
 
 **Status:** `BACKLOG`
 
@@ -759,18 +726,19 @@ mobile, performance, and operational foundations.
 
 ## Near-Term Sequence
 
-1. Design cross-process WAL coordination with Electron/Tauri, CLI coexistence,
-   background workers, browser ownership, and crash/stale-owner diagnostics in
-   one portability-aware plan.
-2. Scope browser parity and mobile hardening into explicit support tiers and
-   tests. These are adoption work, not just binding niceties.
+1. Implement browser SQL/API parity and production web hardening from
+   [`WIN_BROWSER_SQL_API_PARITY_PRODUCTION_WEB_SPEC.md`](WIN_BROWSER_SQL_API_PARITY_PRODUCTION_WEB_SPEC.md),
+   including explicit support tiers, SQL profile tests, OPFS lifecycle coverage,
+   and browser benchmark guardrails.
+2. Scope mobile hardening into explicit support tiers and tests. This is
+   adoption work, not just binding niceties.
 3. Use release benchmark profiles to drive default-fast performance and storage
    efficiency work before adding lower-impact feature breadth.
 4. Extend shipped `sys.*` metrics into opt-in tracing, advisors, and Doctor
    integration once the hot-path overhead budget is explicit.
-6. Promote authenticated encryption/key-rotation work only after the v1 TDE and
+5. Promote authenticated encryption/key-rotation work only after the v1 TDE and
    policy surfaces have production feedback and a follow-up ADR.
-7. Promote backlog items into TODO only after the top adoption blockers have
+6. Promote backlog items into TODO only after the top adoption blockers have
    ADR/spec coverage or active implementation ownership.
 
 ## Market Notes
