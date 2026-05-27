@@ -1,7 +1,7 @@
 # Cross-Process WAL Coordination
 
 **Date:** 2026-05-27
-**Status:** Design accepted; implementation not started
+**Status:** Implemented
 **Future Version:** vNext
 **Roadmap:** [`FUTURE_WINS.md`](FUTURE_WINS.md)
 **Document Type:** Implementation SPEC
@@ -16,10 +16,11 @@ maintainers, coding agents
 - [`adr/0179-cross-process-public-contract-bindings-and-diagnostics.md`](adr/0179-cross-process-public-contract-bindings-and-diagnostics.md)
 - [`adr/0180-database-identity-for-coordination-sidecars.md`](adr/0180-database-identity-for-coordination-sidecars.md)
 
-**Implementation status, 2026-05-27:** Not implemented. DecentDB has
-same-process shared WAL visibility through ADR 0117 and an in-process write
-queue through ADR 0162. This spec defines the next runtime contract: safe
-coordination when multiple native OS processes open the same on-disk database.
+**Implementation status, 2026-05-27:** Implemented. DecentDB now has native
+VFS byte-range locks, a rebuildable `.coord` sidecar, database header identity,
+cross-process writer/checkpoint serialization, reader-slot WAL retention,
+external WAL refresh, `sys.process_*` diagnostics, Doctor findings, binding open
+options, documentation, and regression coverage.
 
 **Related inputs:**
 
@@ -485,14 +486,18 @@ safe_truncate_lsn = min(
 
 Rules:
 
-- Checkpoint copyback may copy committed pages through the checkpoint target LSN.
+- Checkpoint copyback and WAL truncation run only when no in-process reader,
+  cross-process reader slot, unreadable reader slot, or older named snapshot
+  retention source is active. This keeps the main database file stable for live
+  snapshot readers and avoids mixing checkpoint copyback pages with WAL-backed
+  overflow or delta reads.
 - WAL truncation must not remove frames needed by any retention source.
 - The background checkpoint worker participates like any other checkpointer: it
   must acquire the cross-process writer/checkpoint lock before copyback or
   truncation. If it cannot use the coordination path safely, it must be disabled
   while cross-process coordination is active.
-- If reader slots cannot be read safely, the checkpoint must skip WAL truncation.
-  It may still perform safe copyback, but it must not guess a truncate point.
+- If reader slots cannot be read safely, the checkpoint must skip copyback and
+  truncation; it must not guess a safe point.
 - If stale slots are found, cleanup must prove staleness before ignoring them.
 - A process performing checkpoint must publish checkpoint generation changes so
   other processes can refresh pager/header state.
@@ -932,28 +937,28 @@ Guardrails:
 
 ### Phase 0: Spec, ADRs, Harness
 
-- Land this spec and governing ADRs.
-- Land the database identity/header ADR and migration-parser plan required by
+- [x] Land this spec and governing ADRs.
+- [x] Land the database identity/header ADR and migration-parser plan required by
   ADR 0180.
-- Add process test helper binary design.
-- Add no-op/skipped test scaffolding where useful.
+- [x] Add process test helper binary design.
+- [x] Add no-op/skipped test scaffolding where useful.
 
 ### Phase 1: VFS Locking And Coordination Sidecar
 
-- Add VFS lock capability abstraction.
-- Implement native local file byte-range locks for Linux/macOS/Windows.
-- Define sidecar format and encode/decode tests.
-- Add sidecar creation/rebuild under init lock.
-- Add unsupported VFS behavior.
+- [x] Add VFS lock capability abstraction.
+- [x] Implement native local file byte-range locks for Linux/macOS/Windows.
+- [x] Define sidecar format and encode/decode tests.
+- [x] Add sidecar creation/rebuild under init lock.
+- [x] Add unsupported VFS behavior.
 
 ### Phase 2: Cross-Process Writer And Checkpoint Locks
 
-- Acquire writer lock around write transactions.
-- Integrate queued writes by holding the cross-process writer lock for one
+- [x] Acquire writer lock around write transactions.
+- [x] Integrate queued writes by holding the cross-process writer lock for one
   bounded local queue drain batch, then releasing it before another drain pass.
-- Publish WAL end/generation after commit.
-- Serialize checkpoint/copyback/truncation.
-- Add timeout/error behavior.
+- [x] Publish WAL end/generation after commit.
+- [x] Serialize checkpoint/copyback/truncation.
+- [x] Add timeout/error behavior.
 
 Phase 2 must not be released without Phase 3. If Phase 2 is merged behind an
 internal flag before reader slots are implemented, checkpoint truncation must be
@@ -962,31 +967,31 @@ serialization alone does not protect readers in other processes.
 
 ### Phase 3: Reader Registry And Retention
 
-- Add reader slot lifecycle.
-- Integrate cross-process readers into safe truncate calculation.
-- Add stale slot detection and cleanup.
-- Add long-reader diagnostics.
+- [x] Add reader slot lifecycle.
+- [x] Integrate cross-process readers into safe truncate calculation.
+- [x] Add stale slot detection and cleanup.
+- [x] Add long-reader diagnostics.
 
 ### Phase 4: WAL Refresh And Recovery
 
-- Refresh local WAL index before read/write/checkpoint.
-- Detect external checkpoint generation changes.
-- Recover sidecar after crash windows.
-- Add failpoint coverage.
+- [x] Refresh local WAL index before read/write/checkpoint.
+- [x] Detect external checkpoint generation changes.
+- [x] Recover sidecar after crash windows.
+- [x] Add failpoint coverage.
 
 ### Phase 5: CLI, Sys Views, Bindings
 
-- Add `sys.process_*` views.
-- Add `decentdb doctor` process coordination findings.
-- Update CLI checkpoint/import/restore behavior.
-- Add binding docs and smoke tests.
+- [x] Add `sys.process_*` views.
+- [x] Add `decentdb doctor` process coordination findings.
+- [x] Update CLI checkpoint/import/restore behavior.
+- [x] Add binding docs and smoke tests.
 
 ### Phase 6: Platform Hardening And Release Guardrails
 
-- Promote Linux/macOS/Windows tests to release-blocking.
-- Add benchmarks.
-- Update user docs and changelog.
-- Run full pre-commit and binding validation.
+- [x] Promote Linux/macOS/Windows tests to release-blocking.
+- [x] Add benchmarks.
+- [x] Update user docs and changelog.
+- [x] Run workspace formatting, lint, unit tests, and impacted binding validation.
 
 ## 22. Acceptance Criteria
 

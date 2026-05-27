@@ -47,6 +47,41 @@ decentdb exec --db=large.ddb --sql="SELECT 1" --cacheMb=256
 
 DecentDB uses a write-ahead log (WAL) and performs an `fsync()` on commit by default for durable ACID writes.
 
+## Cross-Process WAL Coordination
+
+Local on-disk databases coordinate multiple native OS processes by default when
+the VFS supports byte-range file locks. Coordination uses a rebuildable
+`<database>.coord` sidecar to serialize writers/checkpoints, retain WAL frames
+for readers in other processes, and publish WAL/checkpoint generation changes.
+
+Rust configuration:
+
+```rust
+use decentdb::{Db, DbConfig, ProcessCoordinationMode};
+
+let config = DbConfig {
+    process_coordination: ProcessCoordinationMode::Required,
+    process_coordination_timeout_ms: 30_000,
+    ..DbConfig::default()
+};
+
+let db = Db::open("app.ddb", config)?;
+# Ok::<(), decentdb::DbError>(())
+```
+
+C ABI and binding open options:
+
+```text
+process_coordination=auto
+process_coordination=required
+process_coordination=single_process_unsafe
+process_coordination_timeout_ms=30000
+```
+
+Use `required` for applications that must fail when cross-process protection is
+unavailable. Use `single_process_unsafe` only for known single-process or
+immutable inspection workflows.
+
 ## Local Transparent Data Encryption (TDE)
 
 TDE is configured at create/open time with `DbConfig::encryption` or C ABI open

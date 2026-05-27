@@ -44,7 +44,9 @@ pub use crate::branch::{
     BranchMergeOperation, BranchMergeReport, BranchRestoreReport, BranchRowDiff, BranchTableDiff,
     BranchTableDiffStatus, NamedSnapshot,
 };
-pub use crate::config::{DbConfig, DbEncryptionConfig, EncryptionKey, WalSyncMode};
+pub use crate::config::{
+    DbConfig, DbEncryptionConfig, EncryptionKey, ProcessCoordinationMode, WalSyncMode,
+};
 pub use crate::db::{evict_shared_wal, Db, PreparedStatement, SqlTransaction};
 pub use crate::doctor::{
     render_markdown, run_doctor, sort_findings, DoctorCategory, DoctorCheckSelection,

@@ -69,6 +69,17 @@ The Dart wrapper now exposes distinct open modes backed by the stable C ABI:
 
 The package also installs a Dart `Finalizer` so a leaked `Database` handle is still released if the object is garbage-collected, but callers should still close explicitly.
 
+Local on-disk databases can require cross-process WAL coordination through
+typed open parameters:
+
+```dart
+final db = Database.open(
+  'app.ddb',
+  processCoordination: ProcessCoordinationMode.required,
+  processCoordinationTimeoutMs: 30000,
+);
+```
+
 ## Statement API
 
 `Statement` is now backed by native prepared statements (`ddb_stmt_t`), not by re-sending the SQL text for every execution.
@@ -392,8 +403,7 @@ DECENTDB_NATIVE_LIB=../../../target/debug/libdecentdb.so dart run benchmarks/ben
 
 ## Notes
 - `Database.open(options: ...)` passes native open options through the stable C
-  ABI, including write-queue options such as `write_queue_enabled`,
-  `write_queue_capacity`, and `write_queue_default_timeout_ms`
+  ABI, including cross-process coordination and write-queue options
 - `Database.executeQueued(sql)` and `Database.writeQueueMetrics()` expose the
   engine-owned write queue for self-contained queued writes
 - the example under `bindings/dart/examples/flutter_desktop/` is still a desktop-oriented reference rather than a real Flutter SDK app

@@ -79,6 +79,50 @@ public sealed class WalLifecycleTests : IDisposable
     }
 
     [Fact]
+    public void ProcessCoordinationOptions_ExposeSysViews()
+    {
+        var builder = new DecentDBConnectionStringBuilder
+        {
+            DataSource = _dbPath,
+            ProcessCoordination = "required",
+            ProcessCoordinationTimeoutMs = 250
+        };
+
+        using var connection = new DecentDBConnection(builder.ConnectionString);
+        connection.Open();
+
+        using (var command = connection.CreateCommand())
+        {
+            command.CommandText = "CREATE TABLE coordination_probe (id INT64 PRIMARY KEY, value TEXT)";
+            command.ExecuteNonQuery();
+            command.CommandText = "INSERT INTO coordination_probe VALUES (1, 'one')";
+            command.ExecuteNonQuery();
+        }
+
+        using (var command = connection.CreateCommand())
+        {
+            command.CommandText = "SELECT * FROM sys.process_coordination";
+            using var reader = command.ExecuteReader();
+            Assert.True(reader.Read());
+            Assert.Equal("required", reader.GetString(reader.GetOrdinal("mode")));
+            Assert.True(reader.GetBoolean(reader.GetOrdinal("enabled")));
+            Assert.True(reader.GetBoolean(reader.GetOrdinal("supported")));
+            Assert.EndsWith(".coord", reader.GetString(reader.GetOrdinal("coord_path")));
+        }
+
+        using (var command = connection.CreateCommand())
+        {
+            command.CommandText = "SELECT * FROM sys.process_lock_metrics";
+            using var reader = command.ExecuteReader();
+            Assert.True(reader.Read());
+            Assert.True(reader.GetInt64(reader.GetOrdinal("writer_lock_waits")) >= 0);
+            Assert.True(reader.GetInt64(reader.GetOrdinal("reader_slots_allocated")) >= 0);
+        }
+
+        Assert.True(File.Exists(_dbPath + ".coord"));
+    }
+
+    [Fact]
     public void ReopenThenCheckpoint_LeavesWalBounded()
     {
         using (var connection = new DecentDBConnection($"Data Source={_dbPath}"))

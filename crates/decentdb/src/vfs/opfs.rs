@@ -84,6 +84,10 @@ impl Vfs for OpfsVfs {
     fn canonicalize_path(&self, path: &Path) -> Result<PathBuf> {
         Ok(path.to_path_buf())
     }
+
+    fn supports_file_locks(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug)]
@@ -230,6 +234,7 @@ fn kind_label(kind: FileKind) -> &'static str {
         FileKind::Database => "database",
         FileKind::Wal => "wal",
         FileKind::SyncJournal => "sync-journal",
+        FileKind::Coordination => "coordination",
     }
 }
 

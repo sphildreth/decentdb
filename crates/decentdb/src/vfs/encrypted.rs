@@ -14,7 +14,7 @@ use zeroize::Zeroize;
 use crate::config::DbEncryptionConfig;
 use crate::error::{DbError, Result};
 
-use super::{write_all_at, FileKind, OpenMode, Vfs, VfsFile};
+use super::{write_all_at, FileKind, OpenMode, Vfs, VfsFile, VfsFileLock};
 
 pub(crate) const TDE_MAGIC: &[u8; 8] = b"DDBTDE1\0";
 const TDE_VERSION: u32 = 1;
@@ -85,6 +85,10 @@ impl Vfs for EncryptedVfs {
 
     fn is_memory(&self) -> bool {
         self.inner.is_memory()
+    }
+
+    fn supports_file_locks(&self) -> bool {
+        self.inner.supports_file_locks()
     }
 }
 
@@ -166,6 +170,16 @@ impl VfsFile for EncryptedVfsFile {
 
     fn set_len(&self, len: u64) -> Result<()> {
         self.inner.set_len(physical_offset(len)?)
+    }
+
+    fn try_lock_range(
+        &self,
+        offset: u64,
+        len: u64,
+        exclusive: bool,
+    ) -> Result<Option<Box<dyn VfsFileLock>>> {
+        self.inner
+            .try_lock_range(physical_offset(offset)?, len, exclusive)
     }
 }
 
@@ -338,6 +352,7 @@ fn file_kind_id(kind: FileKind) -> u8 {
         FileKind::Database => 1,
         FileKind::Wal => 2,
         FileKind::SyncJournal => 3,
+        FileKind::Coordination => 4,
     }
 }
 

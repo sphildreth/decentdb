@@ -237,7 +237,7 @@ namespace DecentDB.AdoNet
         public static string EngineVersion() => Native.DecentDB.EngineVersion();
 
         /// <summary>
-        /// Deletes the database file and all associated sidecar files (WAL, SHM).
+        /// Deletes the database file and all associated sidecar files (WAL, SHM, coordination).
         /// This operation ignores missing files — each path is deleted if present,
         /// and no exception is thrown for absent files. The data file itself is
         /// deleted last so that an interruption mid-call leaves the database openable
@@ -263,10 +263,11 @@ namespace DecentDB.AdoNet
                 catch (DirectoryNotFoundException) { }
             }
 
-            // Delete sidecars first (order: .wal, -wal, -shm)
+            // Delete sidecars first (order: .wal, -wal, -shm, .coord)
             TryDelete(fullPath + ".wal");
             TryDelete(fullPath + "-wal");
             TryDelete(fullPath + "-shm");
+            TryDelete(fullPath + ".coord");
 
             // Delete the data file last
             TryDelete(fullPath);
@@ -538,6 +539,18 @@ namespace DecentDB.AdoNet
                 !string.IsNullOrWhiteSpace(walAutoCheckpoint))
             {
                 AppendNativeOption(options, "wal_autocheckpoint", walAutoCheckpoint);
+            }
+
+            if (kvps.TryGetValue("Process Coordination", out var processCoordination) &&
+                !string.IsNullOrWhiteSpace(processCoordination))
+            {
+                AppendNativeOption(options, "process_coordination", processCoordination);
+            }
+
+            if (kvps.TryGetValue("Process Coordination Timeout Ms", out var processCoordinationTimeout) &&
+                !string.IsNullOrWhiteSpace(processCoordinationTimeout))
+            {
+                AppendNativeOption(options, "process_coordination_timeout_ms", processCoordinationTimeout);
             }
 
             if (kvps.TryGetValue("Write Queue Enabled", out var writeQueueEnabled) &&

@@ -3,6 +3,7 @@
 pub(crate) mod async_commit;
 pub(crate) mod background;
 pub(crate) mod checkpoint;
+pub(crate) mod coordination;
 pub(crate) mod delta;
 #[cfg(test)]
 mod delta_tests;
@@ -37,6 +38,10 @@ use crate::benchmark::{
 
 use self::async_commit::AsyncCommitState;
 use self::background::BgCheckpointer;
+use self::coordination::{
+    ProcessCoordinationSnapshot, ProcessCoordinator, ProcessLockMetricsSnapshot,
+    ProcessReaderGuard, ProcessReaderSlotSnapshot, ReaderRetentionSnapshot,
+};
 use self::delta::apply_page_delta_in_place;
 use self::format::{FrameEncoding, WalFrame};
 use self::index::{WalIndex, WalVersion};
@@ -98,6 +103,9 @@ pub(crate) struct SharedWalInner {
     /// `SharedWalInner::drop` can `take()` it and signal the worker to
     /// shut down before joining the thread.
     pub(crate) bg_checkpointer: OnceLock<BgCheckpointer>,
+    pub(crate) process_coordinator: Option<ProcessCoordinator>,
+    pub(crate) observed_coord_wal_generation: AtomicU64,
+    pub(crate) observed_coord_checkpoint_generation: AtomicU64,
 }
 
 /// Snapshot of the checkpoint-related `DbConfig` fields. Held inside
@@ -154,8 +162,9 @@ impl WalHandle {
         db_path: &Path,
         config: &DbConfig,
         pager: &PagerHandle,
+        process_coordinator: Option<ProcessCoordinator>,
     ) -> Result<Self> {
-        shared::acquire(vfs, db_path, config, pager)
+        shared::acquire(vfs, db_path, config, pager, process_coordinator)
     }
 
     pub(crate) fn evict(vfs: &VfsHandle, db_path: &Path) -> Result<()> {
@@ -236,6 +245,52 @@ impl WalHandle {
     }
 
     pub(crate) fn begin_reader(&self) -> Result<ReaderGuard> {
+        self.begin_reader_with_process_guard(None)
+    }
+
+    pub(crate) fn begin_reader_with_pager(&self, pager: &PagerHandle) -> Result<ReaderGuard> {
+        if self.inner.process_coordinator.is_none() {
+            return self.begin_reader();
+        }
+        let mut delay = std::time::Duration::from_micros(100);
+        for _ in 0..8 {
+            self.refresh_from_coordination(pager)?;
+            let before = self.coordination_header_snapshot()?;
+            let guard = self.begin_reader_with_process_slot()?;
+            let after = self.coordination_header_snapshot()?;
+            if before
+                .as_ref()
+                .zip(after.as_ref())
+                .is_none_or(|(before, after)| {
+                    before.wal_generation == after.wal_generation
+                        && before.checkpoint_generation == after.checkpoint_generation
+                })
+            {
+                return Ok(guard);
+            }
+            drop(guard);
+            std::thread::sleep(delay);
+            delay = (delay * 2).min(std::time::Duration::from_millis(5));
+        }
+        self.refresh_from_coordination(pager)?;
+        self.begin_reader_with_process_slot()
+    }
+
+    fn begin_reader_with_process_slot(&self) -> Result<ReaderGuard> {
+        let process_guard = if let Some(coordinator) = &self.inner.process_coordinator {
+            let reader_id = self.inner.reader_registry.next_reader_id();
+            Some(coordinator.begin_reader(reader_id, self.latest_snapshot())?)
+        } else {
+            None
+        };
+        self.begin_reader_with_process_guard(process_guard)
+    }
+
+    fn begin_reader_with_process_guard(
+        &self,
+        process_guard: Option<ProcessReaderGuard>,
+    ) -> Result<ReaderGuard> {
+        let mut process_guard = process_guard;
         loop {
             if self.inner.checkpoint_pending.load(Ordering::Acquire) {
                 thread::yield_now();
@@ -256,8 +311,184 @@ impl WalHandle {
                 thread::yield_now();
                 continue;
             }
-            return self.inner.reader_registry.register(self.latest_snapshot());
+            return self
+                .inner
+                .reader_registry
+                .register_with_process_guard(self.latest_snapshot(), process_guard.take());
         }
+    }
+
+    pub(crate) fn lock_process_writer(&self) -> Result<Option<coordination::ProcessWriterGuard>> {
+        self.inner
+            .process_coordinator
+            .as_ref()
+            .map(ProcessCoordinator::lock_writer)
+            .transpose()
+    }
+
+    pub(crate) fn lock_process_checkpoint(
+        &self,
+    ) -> Result<Option<coordination::ProcessWriterGuard>> {
+        self.inner
+            .process_coordinator
+            .as_ref()
+            .map(ProcessCoordinator::lock_checkpoint)
+            .transpose()
+    }
+
+    pub(crate) fn publish_process_commit(&self, wal_end_lsn: u64) -> Result<()> {
+        if let Some(coordinator) = &self.inner.process_coordinator {
+            coordinator.publish_commit(wal_end_lsn)?;
+            self.record_observed_coordination()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn publish_process_checkpoint(
+        &self,
+        checkpoint_lsn: u64,
+        wal_end_lsn: u64,
+    ) -> Result<()> {
+        if let Some(coordinator) = &self.inner.process_coordinator {
+            coordinator.publish_checkpoint(checkpoint_lsn, wal_end_lsn)?;
+            self.record_observed_coordination()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn refresh_from_coordination(&self, pager: &PagerHandle) -> Result<()> {
+        let Some(coordinator) = &self.inner.process_coordinator else {
+            return Ok(());
+        };
+        let snapshot = coordinator.snapshot()?;
+        let observed_wal = self
+            .inner
+            .observed_coord_wal_generation
+            .load(Ordering::Acquire);
+        let observed_checkpoint = self
+            .inner
+            .observed_coord_checkpoint_generation
+            .load(Ordering::Acquire);
+        if snapshot.wal_generation == observed_wal
+            && snapshot.checkpoint_generation == observed_checkpoint
+            && snapshot.wal_end_lsn == self.latest_snapshot()
+        {
+            return Ok(());
+        }
+        if self.inner.reader_registry.active_reader_count()? > 0
+            || self.retained_snapshot_lsn().is_some()
+        {
+            return Ok(());
+        }
+
+        let result = (|| {
+            let _writer_state = self
+                .inner
+                .write_lock
+                .lock()
+                .expect("wal write lock should not be poisoned");
+            if snapshot.checkpoint_generation != observed_checkpoint {
+                let header = pager.header_from_disk()?;
+                pager.refresh_from_disk(header)?;
+            }
+            let mut sidecar = self.inner.index_sidecar.as_ref().map(|sidecar| {
+                sidecar
+                    .lock()
+                    .expect("wal index sidecar lock should not be poisoned")
+            });
+            if let Some(sidecar) = sidecar.as_mut() {
+                sidecar.clear()?;
+            }
+            let (index, end_lsn, recovered_max_page_id) =
+                crate::wal::recovery::initialize_or_recover(
+                    &self.inner.file,
+                    pager,
+                    self.inner.page_size,
+                    self.inner.wal_index_hot_set_pages,
+                    sidecar.as_deref_mut(),
+                )?;
+            {
+                let mut current = self
+                    .inner
+                    .index
+                    .lock()
+                    .expect("wal index lock should not be poisoned");
+                *current = index;
+            }
+            self.inner.wal_end_lsn.store(end_lsn, Ordering::Release);
+            self.inner
+                .max_page_count
+                .fetch_max(recovered_max_page_id, Ordering::AcqRel);
+            self.inner
+                .observed_coord_wal_generation
+                .store(snapshot.wal_generation, Ordering::Release);
+            self.inner
+                .observed_coord_checkpoint_generation
+                .store(snapshot.checkpoint_generation, Ordering::Release);
+            Ok(())
+        })();
+        coordinator.mark_refresh_result(&result);
+        result
+    }
+
+    pub(crate) fn process_reader_retention(&self) -> Result<Option<ReaderRetentionSnapshot>> {
+        self.inner
+            .process_coordinator
+            .as_ref()
+            .map(ProcessCoordinator::scan_reader_retention)
+            .transpose()
+    }
+
+    pub(crate) fn process_coordination_snapshot(
+        &self,
+    ) -> Result<Option<ProcessCoordinationSnapshot>> {
+        self.inner
+            .process_coordinator
+            .as_ref()
+            .map(ProcessCoordinator::coordination_snapshot)
+            .transpose()
+    }
+
+    pub(crate) fn process_lock_metrics_snapshot(
+        &self,
+    ) -> Result<Option<ProcessLockMetricsSnapshot>> {
+        self.inner
+            .process_coordinator
+            .as_ref()
+            .map(ProcessCoordinator::lock_metrics_snapshot)
+            .transpose()
+    }
+
+    pub(crate) fn process_reader_slot_snapshots(
+        &self,
+    ) -> Result<Option<Vec<ProcessReaderSlotSnapshot>>> {
+        self.inner
+            .process_coordinator
+            .as_ref()
+            .map(ProcessCoordinator::reader_slot_snapshots)
+            .transpose()
+    }
+
+    fn coordination_header_snapshot(
+        &self,
+    ) -> Result<Option<coordination::CoordinationHeaderSnapshot>> {
+        self.inner
+            .process_coordinator
+            .as_ref()
+            .map(ProcessCoordinator::snapshot)
+            .transpose()
+    }
+
+    fn record_observed_coordination(&self) -> Result<()> {
+        if let Some(snapshot) = self.coordination_header_snapshot()? {
+            self.inner
+                .observed_coord_wal_generation
+                .store(snapshot.wal_generation, Ordering::Release);
+            self.inner
+                .observed_coord_checkpoint_generation
+                .store(snapshot.checkpoint_generation, Ordering::Release);
+        }
+        Ok(())
     }
 
     pub(crate) fn set_max_page_count(&self, page_count: u32) {
@@ -590,7 +821,7 @@ mod tests {
         let db_path = Path::new(":memory:");
         let pager = test_pager(&vfs, db_path);
         let cfg = test_config();
-        let wal = WalHandle::acquire(&vfs, db_path, &cfg, &pager).expect("acquire wal");
+        let wal = WalHandle::acquire(&vfs, db_path, &cfg, &pager, None).expect("acquire wal");
         let page_id = page::CATALOG_ROOT_PAGE_ID + 1;
         let payload = vec![0x5A; page::DEFAULT_PAGE_SIZE as usize];
         let snapshot_lsn = wal
@@ -619,7 +850,7 @@ mod tests {
         let pager = test_pager(&vfs, db_path);
         let mut cfg = test_config();
         cfg.wal_resident_versions_per_page = 0;
-        let wal = WalHandle::acquire(&vfs, db_path, &cfg, &pager).expect("acquire wal");
+        let wal = WalHandle::acquire(&vfs, db_path, &cfg, &pager, None).expect("acquire wal");
         let page_id = page::CATALOG_ROOT_PAGE_ID + 1;
 
         let first_payload = vec![0x11; page::DEFAULT_PAGE_SIZE as usize];
@@ -640,7 +871,8 @@ mod tests {
         assert_eq!(reader.snapshot_lsn(), first_snapshot);
         assert_eq!(
             wal.version_counts_by_payload().expect("payload counts"),
-            (0, 2)
+            (1, 1),
+            "reader-visible delta bases stay resident until snapshots drain"
         );
         drop(reader);
 
@@ -674,7 +906,7 @@ mod tests {
         let pager = test_pager(&vfs, db_path);
         let mut cfg = test_config();
         cfg.wal_resident_versions_per_page = 0;
-        let wal = WalHandle::acquire(&vfs, db_path, &cfg, &pager).expect("acquire wal");
+        let wal = WalHandle::acquire(&vfs, db_path, &cfg, &pager, None).expect("acquire wal");
         let page_id = page::CATALOG_ROOT_PAGE_ID + 1;
 
         let base = vec![0x10; page::DEFAULT_PAGE_SIZE as usize];
@@ -708,7 +940,7 @@ mod tests {
         let pager = test_pager(&vfs, db_path);
         let mut cfg = test_config();
         cfg.wal_resident_versions_per_page = 0;
-        let wal = WalHandle::acquire(&vfs, db_path, &cfg, &pager).expect("acquire wal");
+        let wal = WalHandle::acquire(&vfs, db_path, &cfg, &pager, None).expect("acquire wal");
         let page_id = page::CATALOG_ROOT_PAGE_ID + 1;
 
         let base = vec![0xA1; page::DEFAULT_PAGE_SIZE as usize];
@@ -757,7 +989,7 @@ mod tests {
         let pager = test_pager(&vfs, db_path);
         let mut cfg = test_config();
         cfg.wal_index_hot_set_pages = 1;
-        let wal = WalHandle::acquire(&vfs, db_path, &cfg, &pager).expect("acquire wal");
+        let wal = WalHandle::acquire(&vfs, db_path, &cfg, &pager, None).expect("acquire wal");
 
         let page_one = page::CATALOG_ROOT_PAGE_ID + 1;
         let page_two = page_one + 1;
@@ -797,7 +1029,7 @@ mod tests {
         let pager = test_pager(&vfs, db_path);
         let mut cfg = test_config();
         cfg.wal_index_hot_set_pages = 1;
-        let wal = WalHandle::acquire(&vfs, db_path, &cfg, &pager).expect("acquire wal");
+        let wal = WalHandle::acquire(&vfs, db_path, &cfg, &pager, None).expect("acquire wal");
 
         let page_one = page::CATALOG_ROOT_PAGE_ID + 1;
         let page_two = page_one + 1;
@@ -843,7 +1075,7 @@ mod tests {
         let pager = test_pager(&vfs, db_path);
         let mut cfg = test_config();
         cfg.wal_index_hot_set_pages = 1;
-        let wal = WalHandle::acquire(&vfs, db_path, &cfg, &pager).expect("acquire wal");
+        let wal = WalHandle::acquire(&vfs, db_path, &cfg, &pager, None).expect("acquire wal");
 
         let page_one = page::CATALOG_ROOT_PAGE_ID + 1;
         let page_two = page_one + 1;
@@ -875,7 +1107,7 @@ mod tests {
         let pager = test_pager(&vfs, db_path);
         let mut cfg = test_config();
         cfg.wal_index_hot_set_pages = 1;
-        let wal = WalHandle::acquire(&vfs, db_path, &cfg, &pager).expect("acquire wal");
+        let wal = WalHandle::acquire(&vfs, db_path, &cfg, &pager, None).expect("acquire wal");
 
         let page_one = page::CATALOG_ROOT_PAGE_ID + 1;
         let page_two = page_one + 1;

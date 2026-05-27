@@ -9,7 +9,7 @@ use super::freelist::FreelistState;
 use super::page;
 
 pub(crate) const DB_HEADER_SIZE: usize = 128;
-pub const DB_FORMAT_VERSION: u32 = 12;
+pub const DB_FORMAT_VERSION: u32 = 13;
 #[allow(dead_code)]
 pub(crate) const WAL_HEADER_VERSION: u32 = 1;
 pub(crate) const HEADER_PAGE_ID: u32 = 1;
@@ -27,6 +27,10 @@ const FREELIST_COUNT_OFFSET: usize = 44;
 const LAST_CHECKPOINT_LSN_OFFSET: usize = 48;
 const RESERVED_OFFSET: usize = 56;
 const RESERVED_LEN: usize = 72;
+const DATABASE_ID_LEN: usize = 16;
+const DATABASE_ID_OFFSET: usize = RESERVED_OFFSET;
+const DATABASE_ID_TRAILER_OFFSET: usize = DATABASE_ID_OFFSET + DATABASE_ID_LEN;
+const RESERVED_TRAILER_LEN: usize = RESERVED_LEN - DATABASE_ID_LEN;
 
 /// Parsed representation of the fixed page-1 database header.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -39,7 +43,8 @@ pub(crate) struct DatabaseHeader {
     pub(crate) catalog_root_page_id: u32,
     pub(crate) freelist: FreelistState,
     pub(crate) last_checkpoint_lsn: u64,
-    pub(crate) reserved: [u8; RESERVED_LEN],
+    pub(crate) database_id: [u8; DATABASE_ID_LEN],
+    pub(crate) reserved: [u8; RESERVED_TRAILER_LEN],
 }
 
 impl DatabaseHeader {
@@ -54,7 +59,8 @@ impl DatabaseHeader {
             catalog_root_page_id: CATALOG_ROOT_PAGE_ID,
             freelist: FreelistState::default(),
             last_checkpoint_lsn: 0,
-            reserved: [0; RESERVED_LEN],
+            database_id: random_database_id(),
+            reserved: [0; RESERVED_TRAILER_LEN],
         };
         header.header_checksum = header.compute_checksum();
         header
@@ -127,7 +133,8 @@ impl DatabaseHeader {
                 page_count: read_u32(bytes, FREELIST_COUNT_OFFSET),
             },
             last_checkpoint_lsn: read_u64(bytes, LAST_CHECKPOINT_LSN_OFFSET),
-            reserved: read_array::<RESERVED_LEN>(bytes, RESERVED_OFFSET),
+            database_id: read_array::<DATABASE_ID_LEN>(bytes, DATABASE_ID_OFFSET),
+            reserved: read_array::<RESERVED_TRAILER_LEN>(bytes, DATABASE_ID_TRAILER_OFFSET),
         })
     }
 
@@ -154,9 +161,35 @@ impl DatabaseHeader {
             LAST_CHECKPOINT_LSN_OFFSET,
             self.last_checkpoint_lsn,
         );
-        bytes[RESERVED_OFFSET..RESERVED_OFFSET + RESERVED_LEN].copy_from_slice(&self.reserved);
+        bytes[DATABASE_ID_OFFSET..DATABASE_ID_OFFSET + DATABASE_ID_LEN]
+            .copy_from_slice(&self.database_id);
+        bytes[DATABASE_ID_TRAILER_OFFSET..RESERVED_OFFSET + RESERVED_LEN]
+            .copy_from_slice(&self.reserved);
         bytes
     }
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+fn random_database_id() -> [u8; DATABASE_ID_LEN] {
+    let mut database_id = [0_u8; DATABASE_ID_LEN];
+    loop {
+        match getrandom::fill(&mut database_id) {
+            Ok(()) => {
+                if database_id != [0_u8; DATABASE_ID_LEN] {
+                    return database_id;
+                }
+            }
+            Err(_) => {
+                database_id[0] = 1;
+                return database_id;
+            }
+        }
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+fn random_database_id() -> [u8; DATABASE_ID_LEN] {
+    [1_u8; DATABASE_ID_LEN]
 }
 
 pub(crate) fn write_database_bootstrap_vfs(
@@ -214,7 +247,9 @@ fn write_u64(bytes: &mut [u8; DB_HEADER_SIZE], offset: usize, value: u64) {
 
 #[cfg(test)]
 mod tests {
-    use super::{DatabaseHeader, DB_FORMAT_VERSION, DB_HEADER_SIZE};
+    use super::{
+        DatabaseHeader, DATABASE_ID_LEN, DB_FORMAT_VERSION, DB_HEADER_SIZE, RESERVED_OFFSET,
+    };
     use crate::error::DbError;
     use crate::storage::page;
 
@@ -227,6 +262,25 @@ mod tests {
         assert_eq!(decoded, header);
         assert_eq!(decoded.catalog_root_page_id, super::CATALOG_ROOT_PAGE_ID);
         assert_eq!(decoded.freelist.page_count, 0);
+        assert_ne!(decoded.database_id, [0_u8; DATABASE_ID_LEN]);
+    }
+
+    #[test]
+    fn header_roundtrip_stores_database_id_and_trailing_reserved() {
+        let header = DatabaseHeader::new(page::DEFAULT_PAGE_SIZE);
+        let encoded = header.encode();
+        let decoded = DatabaseHeader::decode(&encoded).expect("header should decode");
+
+        assert_eq!(decoded.database_id, header.database_id);
+        assert_eq!(decoded.reserved, header.reserved);
+        assert_eq!(decoded.database_id.len(), DATABASE_ID_LEN);
+    }
+
+    #[test]
+    fn new_header_generates_nonzero_database_id() {
+        let header = DatabaseHeader::new(page::DEFAULT_PAGE_SIZE);
+
+        assert_ne!(header.database_id, [0_u8; DATABASE_ID_LEN]);
     }
 
     #[test]
@@ -270,6 +324,18 @@ mod tests {
         let header = DatabaseHeader::new(page::DEFAULT_PAGE_SIZE);
         let mut encoded = header.encode();
         encoded[24] ^= 0xFF;
+
+        assert!(matches!(
+            DatabaseHeader::decode(&encoded),
+            Err(DbError::Corruption { .. })
+        ));
+    }
+
+    #[test]
+    fn checksum_covers_database_id() {
+        let header = DatabaseHeader::new(page::DEFAULT_PAGE_SIZE);
+        let mut encoded = header.encode();
+        encoded[RESERVED_OFFSET] ^= 0xFF;
 
         assert!(matches!(
             DatabaseHeader::decode(&encoded),

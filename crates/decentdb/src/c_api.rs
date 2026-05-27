@@ -10,8 +10,9 @@ use std::time::Duration;
 use crate::db::PreparedStatement;
 use crate::error::{DbError, DbErrorCode, Result};
 use crate::{
-    evict_shared_wal, ChangeStreamOptions, Db, DbConfig, DbEncryptionConfig, QueryResult,
-    QueryWatchOptions, QueuedWriteOptions, RangeWatchOptions, TableWatchOptions, Value,
+    evict_shared_wal, ChangeStreamOptions, Db, DbConfig, DbEncryptionConfig,
+    ProcessCoordinationMode, QueryResult, QueryWatchOptions, QueuedWriteOptions, RangeWatchOptions,
+    TableWatchOptions, Value,
 };
 
 const DDB_OK: u32 = 0;
@@ -1267,6 +1268,17 @@ fn parse_bool_option(value: &str, key: &str) -> Result<bool> {
     }
 }
 
+fn parse_process_coordination_option(value: &str) -> Result<ProcessCoordinationMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "auto" => Ok(ProcessCoordinationMode::Auto),
+        "required" => Ok(ProcessCoordinationMode::Required),
+        "single_process_unsafe" | "off" => Ok(ProcessCoordinationMode::SingleProcessUnsafe),
+        _ => Err(DbError::sql(format!(
+            "invalid process_coordination value: {value}"
+        ))),
+    }
+}
+
 fn parse_u32_option(value: &str, key: &str) -> Result<u32> {
     value.trim().parse::<u32>().map_err(|_| {
         DbError::sql(format!(
@@ -1413,6 +1425,12 @@ fn db_config_from_options(options: Option<&str>) -> Result<DbConfig> {
             }
             "wal_checkpoint_threshold_bytes" => {
                 config.wal_checkpoint_threshold_bytes = parse_u64_option(value, key.as_str())?;
+            }
+            "process_coordination" => {
+                config.process_coordination = parse_process_coordination_option(value)?;
+            }
+            "process_coordination_timeout_ms" => {
+                config.process_coordination_timeout_ms = parse_u64_option(value, key.as_str())?;
             }
             "write_queue_enabled" => {
                 config.write_queue_enabled = parse_bool_option(value, key.as_str())?;
@@ -3838,7 +3856,7 @@ mod tests {
     #[test]
     fn db_config_options_parse_tuned_profile() {
         let config = db_config_from_options(Some(
-            "cache_size=64MB;retain_paged_row_sources_after_commit=true;paged_row_storage=false;wal_autocheckpoint=0;write_queue_enabled=true;write_queue_capacity=17;write_queue_default_timeout_ms=25;write_queue_strict_group_commit=true;write_queue_max_batch=9;write_queue_max_group_delay_us=1000;encryption_key_hex=7464652d6b6579",
+            "cache_size=64MB;retain_paged_row_sources_after_commit=true;paged_row_storage=false;wal_autocheckpoint=0;process_coordination=single_process_unsafe;process_coordination_timeout_ms=125;write_queue_enabled=true;write_queue_capacity=17;write_queue_default_timeout_ms=25;write_queue_strict_group_commit=true;write_queue_max_batch=9;write_queue_max_group_delay_us=1000;encryption_key_hex=7464652d6b6579",
         ))
         .expect("options should parse");
         assert_eq!(config.cache_size_mb, 64);
@@ -3846,6 +3864,11 @@ mod tests {
         assert!(!config.paged_row_storage);
         assert_eq!(config.wal_checkpoint_threshold_pages, 0);
         assert_eq!(config.wal_checkpoint_threshold_bytes, 0);
+        assert_eq!(
+            config.process_coordination,
+            ProcessCoordinationMode::SingleProcessUnsafe
+        );
+        assert_eq!(config.process_coordination_timeout_ms, 125);
         assert!(config.write_queue_enabled);
         assert_eq!(config.write_queue_capacity, 17);
         assert_eq!(config.write_queue_default_timeout_ms, 25);

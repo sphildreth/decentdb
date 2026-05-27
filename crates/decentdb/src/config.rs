@@ -8,6 +8,31 @@ use crate::extensions::ExtensionTrustAnchor;
 use crate::storage::page;
 use zeroize::Zeroize;
 
+/// Cross-process WAL coordination mode for native on-disk databases.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProcessCoordinationMode {
+    /// Enable process coordination when the VFS can provide the required
+    /// local-file locks. In-memory databases remain process-local.
+    Auto,
+    /// Require process coordination. Open fails if the selected VFS cannot
+    /// provide the coordination contract.
+    Required,
+    /// Bypass process coordination. Safe only when one OS process can access
+    /// the database file.
+    SingleProcessUnsafe,
+}
+
+impl ProcessCoordinationMode {
+    #[must_use]
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Required => "required",
+            Self::SingleProcessUnsafe => "single_process_unsafe",
+        }
+    }
+}
+
 /// WAL sync policy used by the engine.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WalSyncMode {
@@ -116,6 +141,16 @@ pub struct DbConfig {
     /// Default: `256`.
     pub page_pool_max: usize,
     pub wal_sync_mode: WalSyncMode,
+    /// Cross-process WAL coordination mode for native on-disk databases.
+    ///
+    /// Default: `ProcessCoordinationMode::Auto`.
+    pub process_coordination: ProcessCoordinationMode,
+    /// Maximum time a process-coordination writer/checkpoint lock acquisition
+    /// waits before returning `DbError::Timeout`. `0` means fail immediately
+    /// with `DbError::Busy`.
+    ///
+    /// Default: `30_000`.
+    pub process_coordination_timeout_ms: u64,
     pub checkpoint_timeout_sec: u64,
     pub trigram_postings_threshold: usize,
     pub temp_dir: PathBuf,
@@ -363,6 +398,8 @@ impl Default for DbConfig {
             cached_payloads_max_entries: 1024,
             page_pool_max: 256,
             wal_sync_mode: WalSyncMode::Full,
+            process_coordination: ProcessCoordinationMode::Auto,
+            process_coordination_timeout_ms: 30_000,
             checkpoint_timeout_sec: 30,
             trigram_postings_threshold: 100_000,
             temp_dir: default_temp_dir(),
@@ -408,7 +445,7 @@ fn default_temp_dir() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{DbConfig, WalSyncMode};
+    use super::{DbConfig, ProcessCoordinationMode, WalSyncMode};
     use crate::storage::page;
 
     #[test]
@@ -420,6 +457,8 @@ mod tests {
         assert_eq!(config.cached_payloads_max_entries, 1024);
         assert_eq!(config.page_pool_max, 256);
         assert_eq!(config.wal_sync_mode, WalSyncMode::Full);
+        assert_eq!(config.process_coordination, ProcessCoordinationMode::Auto);
+        assert_eq!(config.process_coordination_timeout_ms, 30_000);
         assert_eq!(config.checkpoint_timeout_sec, 30);
         assert_eq!(config.trigram_postings_threshold, 100_000);
         assert!(!config.temp_dir.as_os_str().is_empty());

@@ -1,9 +1,10 @@
 # Write Concurrency
 
-DecentDB keeps a single-process, one-writer/many-readers concurrency model. The
-engine does not hide a multi-writer server behind the API. Instead, it provides
-an engine-owned write queue for applications and bindings that want predictable
-in-process concurrent writes without building their own writer dispatcher.
+DecentDB keeps a one-writer/many-readers concurrency model. The engine does not
+hide a multi-writer server behind the API. Instead, it provides cross-process
+WAL coordination for local on-disk databases and an engine-owned write queue for
+applications and bindings that want predictable concurrent writes without
+building their own writer dispatcher.
 
 ## Direct Writes
 
@@ -58,12 +59,40 @@ completes under synchronous WAL modes.
 `WalSyncMode::AsyncCommit` remains a separate opt-in mode that acknowledges
 commits before the covering fsync.
 
+## Cross-Process WAL Coordination
+
+Native local files now coordinate through a rebuildable `<database>.coord`
+sidecar. The sidecar serializes writer and checkpoint ownership with OS file
+locks, tracks reader slots from every process, and publishes WAL/checkpoint
+generations so each process refreshes its local WAL index before reads, writes,
+and checkpoints.
+
+The default mode is `auto`: local on-disk databases use process coordination
+when the VFS supports byte-range file locks, while in-memory and unsupported
+VFSes stay in single-process mode. Use `required` when an application must fail
+instead of silently running without cross-process protection. Use
+`single_process_unsafe` only for immutable inspection or tests that knowingly
+avoid concurrent native process access.
+
+Queryable diagnostics:
+
+```sql
+SELECT * FROM sys.process_coordination;
+SELECT * FROM sys.process_readers;
+SELECT * FROM sys.process_lock_metrics;
+```
+
+`decentdb doctor` includes WAL findings for cross-process reader retention and
+currently held writer/checkpoint locks.
+
 ## Configuration
 
 Rust `DbConfig` and C ABI open options expose:
 
 | Option | Default | Meaning |
 |---|---:|---|
+| `process_coordination` | `auto` | `auto`, `required`, or `single_process_unsafe`. |
+| `process_coordination_timeout_ms` | `30000` | Bounded wait for cross-process writer/checkpoint/reader-slot locks. |
 | `write_queue_enabled` | `false` | Lets high-level bindings opt into queued execution for their normal paths. Explicit queued APIs can still be called directly. |
 | `write_queue_capacity` | `1024` | Maximum admitted requests waiting for execution. |
 | `write_queue_default_timeout_ms` | `0` | Default queue timeout; `0` means no configured default. |
@@ -95,8 +124,10 @@ and estimated physical syncs saved. These counters are now also available via
 
 ## Limitations
 
-- The queue is in-process. Cross-process write coordination is a separate
-  roadmap item.
+- The write queue is in-process. Cross-process coordination serializes file
+  ownership but does not create a durable inter-process job queue.
+- Network filesystems, cloud-synced folders, and unproven FUSE-like filesystems
+  are unsupported for coordinated writes in v1.
 - Queued explicit transaction leases are not part of this release.
 - Some high-level provider prepared-statement paths remain direct until the C
   ABI grows a queued prepared-statement contract. Use the binding's explicit

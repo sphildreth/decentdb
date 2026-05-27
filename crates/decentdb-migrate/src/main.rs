@@ -4,12 +4,15 @@ use decentdb::Db;
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 mod v3;
 
 const DB_HEADER_SIZE: usize = 128;
 const FORMAT_VERSION_OFFSET: usize = 16;
 const CHECKSUM_OFFSET: usize = 24;
+const DATABASE_ID_OFFSET: usize = 56;
+const DATABASE_ID_LEN: usize = 16;
 const HEADER_PAGE_ID: u32 = 1;
 const WAL_HEADER_SIZE: usize = 32;
 const WAL_MAGIC: [u8; 8] = *b"DDBWAL01";
@@ -110,6 +113,10 @@ fn main() -> Result<()> {
             println!("Detected DecentDB Version 11 format.");
             migrate_v11_file(&source_path, &dest_path)?;
         }
+        12 => {
+            println!("Detected DecentDB Version 12 format.");
+            migrate_v12_file(&source_path, &dest_path)?;
+        }
         _ => {
             return Err(anyhow!("Migration for format version {} is not supported by this version of decentdb-migrate.", header.format_version));
         }
@@ -170,6 +177,11 @@ fn migrate_v10_file(source: &Path, dest: &Path) -> Result<()> {
 fn migrate_v11_file(source: &Path, dest: &Path) -> Result<()> {
     copy_file_and_patch_format_version(source, dest, 11)?;
     copy_wal_sidecar_if_present(source, dest)
+}
+
+fn migrate_v12_file(source: &Path, dest: &Path) -> Result<()> {
+    copy_file_and_patch_format_version(source, dest, 12)?;
+    patch_database_id_if_empty(dest)
 }
 
 fn copy_file_and_patch_format_version(
@@ -579,9 +591,74 @@ fn encode_page_delta(base: &[u8], updated: &[u8]) -> Result<[u8; WAL_DELTA_FRAME
 fn patch_header_format_version(header: &mut [u8; DB_HEADER_SIZE], format_version: u32) {
     header[FORMAT_VERSION_OFFSET..FORMAT_VERSION_OFFSET + 4]
         .copy_from_slice(&format_version.to_le_bytes());
+    recompute_header_checksum(header);
+}
+
+fn patch_header_database_id_if_empty(header: &mut [u8; DB_HEADER_SIZE]) {
+    let range = DATABASE_ID_OFFSET..DATABASE_ID_OFFSET + DATABASE_ID_LEN;
+    if header[range.clone()].iter().any(|byte| *byte != 0) {
+        return;
+    }
+    header[range].copy_from_slice(&random_database_id());
+    recompute_header_checksum(header);
+}
+
+fn recompute_header_checksum(header: &mut [u8; DB_HEADER_SIZE]) {
     header[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4].fill(0);
     let checksum = crc32c_parts(&[&header[..CHECKSUM_OFFSET], &header[CHECKSUM_OFFSET + 4..]]);
     header[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4].copy_from_slice(&checksum.to_le_bytes());
+}
+
+fn patch_database_id_if_empty(path: &Path) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|error| {
+            anyhow!(
+                "Failed to open destination database {} for identity patch: {}",
+                path.display(),
+                error
+            )
+        })?;
+    let mut header = [0_u8; DB_HEADER_SIZE];
+    file.read_exact(&mut header).map_err(|error| {
+        anyhow!(
+            "Failed to read destination database header {} for identity patch: {}",
+            path.display(),
+            error
+        )
+    })?;
+    patch_header_database_id_if_empty(&mut header);
+    file.seek(SeekFrom::Start(0))
+        .and_then(|_| file.write_all(&header))
+        .map_err(|error| {
+            anyhow!(
+                "Failed to write destination database identity {}: {}",
+                path.display(),
+                error
+            )
+        })?;
+    file.flush().map_err(|error| {
+        anyhow!(
+            "Failed to flush destination database identity {}: {}",
+            path.display(),
+            error
+        )
+    })
+}
+
+fn random_database_id() -> [u8; DATABASE_ID_LEN] {
+    let mut database_id = [0_u8; DATABASE_ID_LEN];
+    if getrandom::fill(&mut database_id).is_ok() && database_id != [0_u8; DATABASE_ID_LEN] {
+        return database_id;
+    }
+    let fallback = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(1)
+        ^ u128::from(std::process::id());
+    fallback.to_le_bytes()
 }
 
 fn read_u32(bytes: &[u8], offset: usize) -> u32 {
@@ -636,7 +713,7 @@ const fn build_crc32c_table() -> [u32; 256] {
 #[cfg(test)]
 mod tests {
     use super::{
-        migrate_v10_file, migrate_v11_file, migrate_v8_file, migrate_v9_file,
+        migrate_v10_file, migrate_v11_file, migrate_v12_file, migrate_v8_file, migrate_v9_file,
         patch_header_format_version, wal_path_for_db,
     };
     use decentdb::{Db, DbConfig, DB_FORMAT_VERSION};
@@ -848,6 +925,46 @@ mod tests {
         migrate_v11_file(&source, &dest).expect("migrate v11 file");
         let header = Db::read_header_info(&dest).expect("read migrated header");
         assert_eq!(header.format_version, DB_FORMAT_VERSION);
+
+        let reopened = Db::open_or_create(&dest, DbConfig::default()).expect("open migrated db");
+        let result = reopened
+            .execute("SELECT val FROM t WHERE id = 1")
+            .expect("query migrated row");
+        assert_eq!(
+            result.rows()[0].values()[0],
+            decentdb::Value::Text("alpha".to_string())
+        );
+    }
+
+    #[test]
+    fn migrate_v12_copy_upgrades_header_version() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let source = tempdir.path().join("source-v12.ddb");
+        let dest = tempdir.path().join("dest-v12.ddb");
+
+        let db = Db::open_or_create(&source, DbConfig::default()).expect("create source");
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+            .expect("create table");
+        db.execute("INSERT INTO t VALUES (1, 'alpha')")
+            .expect("insert row");
+        db.checkpoint().expect("checkpoint");
+        drop(db);
+
+        let mut bytes = std::fs::read(&source).expect("read source");
+        let mut header = [0_u8; super::DB_HEADER_SIZE];
+        header.copy_from_slice(&bytes[..super::DB_HEADER_SIZE]);
+        patch_header_format_version(&mut header, 12);
+        bytes[..super::DB_HEADER_SIZE].copy_from_slice(&header);
+        std::fs::write(&source, bytes).expect("write v12 header");
+
+        migrate_v12_file(&source, &dest).expect("migrate v12 file");
+        let header = Db::read_header_info(&dest).expect("read migrated header");
+        assert_eq!(header.format_version, DB_FORMAT_VERSION);
+        let bytes = std::fs::read(&dest).expect("read migrated bytes");
+        assert_ne!(
+            &bytes[super::DATABASE_ID_OFFSET..super::DATABASE_ID_OFFSET + super::DATABASE_ID_LEN],
+            &[0_u8; super::DATABASE_ID_LEN]
+        );
 
         let reopened = Db::open_or_create(&dest, DbConfig::default()).expect("open migrated db");
         let result = reopened

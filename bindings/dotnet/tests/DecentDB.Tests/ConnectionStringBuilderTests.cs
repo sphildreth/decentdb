@@ -22,6 +22,8 @@ public sealed class ConnectionStringBuilderTests : IDisposable
         Assert.Empty(builder.ConnectionString);
         Assert.Empty(builder.DataSource);
         Assert.Null(builder.CacheSize);
+        Assert.Null(builder.ProcessCoordination);
+        Assert.Null(builder.ProcessCoordinationTimeoutMs);
         Assert.False(builder.Logging);
         Assert.Null(builder.LogLevel);
         Assert.Equal(30, builder.CommandTimeout);
@@ -30,10 +32,12 @@ public sealed class ConnectionStringBuilderTests : IDisposable
     [Fact]
     public void Constructor_WithConnectionString_ParsesValues()
     {
-        var builder = new DecentDBConnectionStringBuilder($"Data Source={_dbPath};Cache Size=64MB;Logging=True;LogLevel=Info;Command Timeout=60");
+        var builder = new DecentDBConnectionStringBuilder($"Data Source={_dbPath};Cache Size=64MB;Process Coordination=required;Process Coordination Timeout Ms=250;Logging=True;LogLevel=Info;Command Timeout=60");
 
         Assert.Equal(_dbPath, builder.DataSource);
         Assert.Equal("64MB", builder.CacheSize);
+        Assert.Equal("required", builder.ProcessCoordination);
+        Assert.Equal(250, builder.ProcessCoordinationTimeoutMs);
         Assert.True(builder.Logging);
         Assert.Equal("Info", builder.LogLevel);
         Assert.Equal(60, builder.CommandTimeout);
@@ -72,6 +76,24 @@ public sealed class ConnectionStringBuilderTests : IDisposable
     }
 
     [Fact]
+    public void ProcessCoordination_SetAndGet_RoundTrips()
+    {
+        var builder = new DecentDBConnectionStringBuilder
+        {
+            ProcessCoordination = "required",
+            ProcessCoordinationTimeoutMs = 250
+        };
+
+        Assert.Equal("required", builder.ProcessCoordination);
+        Assert.Equal(250, builder.ProcessCoordinationTimeoutMs);
+
+        builder.ProcessCoordination = null;
+        builder.ProcessCoordinationTimeoutMs = null;
+        Assert.Null(builder.ProcessCoordination);
+        Assert.Null(builder.ProcessCoordinationTimeoutMs);
+    }
+
+    [Fact]
     public void LogLevel_SetAndGet_RoundTrips()
     {
         var builder = new DecentDBConnectionStringBuilder();
@@ -104,6 +126,8 @@ public sealed class ConnectionStringBuilderTests : IDisposable
         {
             DataSource = _dbPath,
             CacheSize = "128MB",
+            ProcessCoordination = "single_process_unsafe",
+            ProcessCoordinationTimeoutMs = 125,
             Logging = true,
             LogLevel = "Error",
             CommandTimeout = 15
@@ -112,6 +136,8 @@ public sealed class ConnectionStringBuilderTests : IDisposable
         var rebuilt = new DecentDBConnectionStringBuilder(builder.ConnectionString);
         Assert.Equal(_dbPath, rebuilt.DataSource);
         Assert.Equal("128MB", rebuilt.CacheSize);
+        Assert.Equal("single_process_unsafe", rebuilt.ProcessCoordination);
+        Assert.Equal(125, rebuilt.ProcessCoordinationTimeoutMs);
         Assert.True(rebuilt.Logging);
         Assert.Equal("Error", rebuilt.LogLevel);
         Assert.Equal(15, rebuilt.CommandTimeout);

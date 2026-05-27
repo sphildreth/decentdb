@@ -24,7 +24,7 @@
 
 DecentDB is an embedded relational database engine built with Rust, focused on **durable ACID writes**, **fast reads**, and **predictable correctness**.
 
-It targets a single process with **one writer** and **many concurrent readers** under snapshot isolation, implementing a PostgreSQL-like SQL dialect (via libpg_query) on top of a fixed-page B+Tree storage engine and a write-ahead log (WAL) for durability.
+It preserves a **one writer** and **many concurrent readers** concurrency model under snapshot isolation, with local on-disk databases able to coordinate multiple native OS processes through WAL locks, reader slots, and a rebuildable coordination sidecar.
 
 ## Features
 
@@ -42,6 +42,9 @@ It targets a single process with **one writer** and **many concurrent readers** 
 - 🧩 **Lua Extensions** - Manifest-declared Lua packages add scalar functions, table-valued functions, aggregates, and query-time collations with explicit install, enable, content-hash trust, CLI, Rust, and C ABI lifecycle APIs
 - 🕒 **Native TIMESTAMP Type** - DATE/TIMESTAMP columns stored as int64 microseconds since Unix epoch (UTC); correct `ORDER BY` and `EXTRACT(YEAR|MONTH|DAY|HOUR|MINUTE|SECOND FROM ...)`, with native bind/read in all bindings
 - 👥 **Concurrent Reads** - Snapshot isolation allows multiple readers with one writer
+- 🔐 **Cross-Process WAL Coordination** - Native byte-range locks and a
+  rebuildable `.coord` sidecar coordinate local on-disk databases across
+  processes, preserving one-writer/many-reader snapshot safety with diagnostics
 - 🚦 **Queued Write Concurrency** - Engine-owned bounded write queue with timeouts, metrics, and strict durable group commit for predictable in-process concurrent writes
 - 📈 **Queryable Operational Metrics** - Stable `sys.*` inspection views expose WAL, write-queue, storage, reactive subscription, and sync status snapshots without telemetry writes
 - 🌿 **Branch, Diff, Restore, And Time Travel** - Named snapshots, isolated branch writes, branch diffs, guarded restore, and constrained merge for migration rehearsal and agent sandboxes

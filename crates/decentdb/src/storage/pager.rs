@@ -627,6 +627,7 @@ mod tests {
             .open(&path, OpenMode::CreateNew, FileKind::Database)
             .expect("create database");
         let header = DatabaseHeader::new(page::DEFAULT_PAGE_SIZE);
+        let original_database_id = header.database_id;
         write_database_bootstrap_vfs(file.as_ref(), &header).expect("bootstrap database");
         let pager = PagerHandle::open(file, header.clone(), 1).expect("open pager");
 
@@ -634,6 +635,7 @@ mod tests {
         pager.set_schema_cookie(0xBEEF).expect("set schema cookie");
 
         let on_disk = pager.header_from_disk().expect("read header from disk");
+        assert_eq!(on_disk.database_id, original_database_id);
         assert_eq!(on_disk.last_checkpoint_lsn, 0xDEADBEEF);
         assert_eq!(on_disk.schema_cookie, 0xBEEF);
     }

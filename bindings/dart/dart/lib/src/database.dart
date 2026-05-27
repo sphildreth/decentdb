@@ -14,6 +14,35 @@ import 'types.dart';
 /// Open mode used by [Database._openWith].
 enum _OpenMode { create, open, openOrCreate }
 
+/// Cross-process WAL coordination mode for local on-disk databases.
+enum ProcessCoordinationMode {
+  auto('auto'),
+  required('required'),
+  singleProcessUnsafe('single_process_unsafe');
+
+  const ProcessCoordinationMode(this.nativeValue);
+
+  final String nativeValue;
+}
+
+String? _buildOpenOptions(
+  String? options, {
+  ProcessCoordinationMode? processCoordination,
+  int? processCoordinationTimeoutMs,
+}) {
+  final parts = <String>[];
+  if (options != null && options.trim().isNotEmpty) {
+    parts.add(options.trim());
+  }
+  if (processCoordination != null) {
+    parts.add('process_coordination=${processCoordination.nativeValue}');
+  }
+  if (processCoordinationTimeoutMs != null) {
+    parts.add('process_coordination_timeout_ms=$processCoordinationTimeoutMs');
+  }
+  return parts.isEmpty ? null : parts.join(';');
+}
+
 /// An open DecentDB database.
 ///
 /// Obtain via [Database.open], [Database.create], [Database.openExisting], or
@@ -81,15 +110,22 @@ class Database {
     _OpenMode mode,
     String path, {
     String? options,
+    ProcessCoordinationMode? processCoordination,
+    int? processCoordinationTimeoutMs,
     String? libraryPath,
     NativeBindings? bindings,
     int stmtCacheCapacity = 128,
   }) {
     final nb = _resolveBindings(libraryPath, bindings);
+    final openOptions = _buildOpenOptions(
+      options,
+      processCoordination: processCoordination,
+      processCoordinationTimeoutMs: processCoordinationTimeoutMs,
+    );
     final nativePath = path.toNativeUtf8();
-    final nativeOptions = options == null || options.trim().isEmpty
+    final nativeOptions = openOptions == null || openOptions.trim().isEmpty
         ? null
-        : options.toNativeUtf8();
+        : openOptions.toNativeUtf8();
     final outDb = calloc<Pointer<DdbDb>>();
     try {
       final int status;
@@ -136,6 +172,8 @@ class Database {
   static Database open(
     String path, {
     String? options,
+    ProcessCoordinationMode? processCoordination,
+    int? processCoordinationTimeoutMs,
     String? libraryPath,
     NativeBindings? bindings,
     int stmtCacheCapacity = 128,
@@ -144,6 +182,8 @@ class Database {
       _OpenMode.openOrCreate,
       path,
       options: options,
+      processCoordination: processCoordination,
+      processCoordinationTimeoutMs: processCoordinationTimeoutMs,
       libraryPath: libraryPath,
       bindings: bindings,
       stmtCacheCapacity: stmtCacheCapacity,
@@ -154,12 +194,16 @@ class Database {
   static Database create(
     String path, {
     String? options,
+    ProcessCoordinationMode? processCoordination,
+    int? processCoordinationTimeoutMs,
     String? libraryPath,
     NativeBindings? bindings,
     int stmtCacheCapacity = 128,
   }) =>
       _openWith(_OpenMode.create, path,
           options: options,
+          processCoordination: processCoordination,
+          processCoordinationTimeoutMs: processCoordinationTimeoutMs,
           libraryPath: libraryPath,
           bindings: bindings,
           stmtCacheCapacity: stmtCacheCapacity);
@@ -168,12 +212,16 @@ class Database {
   static Database openExisting(
     String path, {
     String? options,
+    ProcessCoordinationMode? processCoordination,
+    int? processCoordinationTimeoutMs,
     String? libraryPath,
     NativeBindings? bindings,
     int stmtCacheCapacity = 128,
   }) =>
       _openWith(_OpenMode.open, path,
           options: options,
+          processCoordination: processCoordination,
+          processCoordinationTimeoutMs: processCoordinationTimeoutMs,
           libraryPath: libraryPath,
           bindings: bindings,
           stmtCacheCapacity: stmtCacheCapacity);

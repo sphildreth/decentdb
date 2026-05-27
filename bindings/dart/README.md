@@ -230,7 +230,9 @@ into `Database.open(..., libraryPath: ...)`. See
 
 - `Database.open(options: ...)`, `Database.create(options: ...)`, and
   `Database.openExisting(options: ...)` pass native open options through the
-  stable C ABI. Queue options include `write_queue_enabled`,
+  stable C ABI. Typed coordination parameters include
+  `processCoordination: ProcessCoordinationMode.required` and
+  `processCoordinationTimeoutMs: 30000`. Queue options include `write_queue_enabled`,
   `write_queue_capacity`, `write_queue_default_timeout_ms`,
   `write_queue_strict_group_commit`, `write_queue_max_batch`, and
   `write_queue_max_group_delay_us`.

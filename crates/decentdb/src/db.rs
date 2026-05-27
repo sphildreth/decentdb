@@ -19,7 +19,7 @@ use crate::catalog::{
     ForeignKeyConstraint, IndexColumn, IndexKind, IndexSchema, TableSchema, TriggerEvent,
     TriggerKind, TriggerSchema, ViewSchema,
 };
-use crate::config::{DbConfig, WalSyncMode};
+use crate::config::{DbConfig, ProcessCoordinationMode, WalSyncMode};
 use crate::error::{DbError, Result};
 use crate::exec::dml::{PreparedSimpleDelete, PreparedSimpleInsert, PreparedSimpleUpdate};
 use crate::exec::{
@@ -715,6 +715,7 @@ impl Db {
     ) -> Result<Self> {
         let path = path.as_ref();
         config.validate_for_create()?;
+        let coordination_vfs = vfs.clone();
         let vfs = vfs.with_config(&config);
         let open_mode = if vfs.is_memory() {
             OpenMode::OpenOrCreate
@@ -726,7 +727,7 @@ impl Db {
         storage::write_database_bootstrap_vfs(file.as_ref(), &header)?;
         file.sync_metadata()?;
 
-        Self::open_with_vfs(path.to_path_buf(), config, vfs)
+        Self::open_with_vfs(path.to_path_buf(), config, vfs, coordination_vfs)
     }
 
     /// Opens an existing database file and validates its fixed header.
@@ -742,6 +743,7 @@ impl Db {
         vfs: VfsHandle,
     ) -> Result<Self> {
         let path = path.as_ref();
+        let coordination_vfs = vfs.clone();
         let vfs = vfs.with_config(&config);
         let mode = if vfs.is_memory() {
             OpenMode::OpenOrCreate
@@ -754,7 +756,7 @@ impl Db {
             storage::write_database_bootstrap_vfs(file.as_ref(), &header)?;
             file.sync_metadata()?;
         }
-        Self::open_with_vfs(path.to_path_buf(), config, vfs)
+        Self::open_with_vfs(path.to_path_buf(), config, vfs, coordination_vfs)
     }
 
     /// Opens an existing database or creates a new one when the path does not
@@ -1018,7 +1020,7 @@ impl Db {
 
     /// Begins a single-connection write transaction.
     pub fn begin_write(&self) -> Result<()> {
-        let snapshot_reader = self.inner.wal.begin_reader()?;
+        let snapshot_reader = self.inner.wal.begin_reader_with_pager(&self.inner.pager)?;
         self.refresh_pager_after_checkpoint()?;
         let mut txn = self
             .inner
@@ -1326,7 +1328,7 @@ impl Db {
     pub fn read_page(&self, page_id: u32) -> Result<Arc<[u8]>> {
         #[cfg(feature = "bench-internals")]
         READ_PATH_WAL_READER_BEGIN_COUNT.fetch_add(1, Ordering::Relaxed);
-        let reader = self.inner.wal.begin_reader()?;
+        let reader = self.inner.wal.begin_reader_with_pager(&self.inner.pager)?;
         self.read_page_at_snapshot_lsn(page_id, reader.snapshot_lsn())
     }
 
@@ -2002,6 +2004,12 @@ impl Db {
         self.inner.wal.begin_deferred_group_commit()
     }
 
+    pub(crate) fn begin_process_writer_batch(
+        &self,
+    ) -> Result<Option<crate::wal::coordination::ProcessWriterGuard>> {
+        self.inner.wal.lock_process_writer()
+    }
+
     pub(crate) fn flush_deferred_group_commit(&self) -> Result<bool> {
         self.inner.wal.flush_deferred_group_commit()
     }
@@ -2050,7 +2058,7 @@ impl Db {
             .lock()
             .map_err(|_| DbError::internal("SQL writer lock poisoned"))?;
         if self.inner.config.defer_table_materialization {
-            let reader = self.inner.wal.begin_reader()?;
+            let reader = self.inner.wal.begin_reader_with_pager(&self.inner.pager)?;
             let snapshot_lsn = reader.snapshot_lsn();
             self.refresh_engine_from_snapshot(snapshot_lsn)?;
             let mut working = self.engine_snapshot()?;
@@ -2099,7 +2107,7 @@ impl Db {
             .lock()
             .map_err(|_| DbError::internal("SQL writer lock poisoned"))?;
         if self.inner.config.defer_table_materialization {
-            let reader = self.inner.wal.begin_reader()?;
+            let reader = self.inner.wal.begin_reader_with_pager(&self.inner.pager)?;
             let snapshot_lsn = reader.snapshot_lsn();
             self.refresh_engine_from_snapshot(snapshot_lsn)?;
             let mut working = self.engine_snapshot()?;
@@ -2134,7 +2142,7 @@ impl Db {
             .lock()
             .map_err(|_| DbError::internal("SQL writer lock poisoned"))?;
         if self.inner.config.defer_table_materialization {
-            let reader = self.inner.wal.begin_reader()?;
+            let reader = self.inner.wal.begin_reader_with_pager(&self.inner.pager)?;
             let snapshot_lsn = reader.snapshot_lsn();
             self.refresh_engine_from_snapshot(snapshot_lsn)?;
             let mut working = self.engine_snapshot()?;
@@ -2159,7 +2167,7 @@ impl Db {
 
     /// Holds a snapshot open until `release_snapshot` is called.
     pub fn hold_snapshot(&self) -> Result<u64> {
-        let guard = self.inner.wal.begin_reader()?;
+        let guard = self.inner.wal.begin_reader_with_pager(&self.inner.pager)?;
         let token = guard.id();
         self.inner
             .held_snapshots
@@ -2616,7 +2624,12 @@ impl Db {
         Ok(format!("[{entries}]"))
     }
 
-    fn open_with_vfs(path: PathBuf, config: DbConfig, vfs: VfsHandle) -> Result<Self> {
+    fn open_with_vfs(
+        path: PathBuf,
+        config: DbConfig,
+        vfs: VfsHandle,
+        coordination_vfs: VfsHandle,
+    ) -> Result<Self> {
         let open_lock_key = if vfs.is_memory() {
             None
         } else {
@@ -2648,6 +2661,13 @@ impl Db {
         let mut effective_config = config;
         effective_config.page_size = header.page_size;
         let schema_cookie = header.schema_cookie;
+        let process_coordinator = crate::wal::coordination::ProcessCoordinator::open(
+            &coordination_vfs,
+            &path,
+            &header,
+            effective_config.process_coordination,
+            effective_config.process_coordination_timeout_ms,
+        )?;
 
         let pager = PagerHandle::open_with_page_pool(
             Arc::clone(&file),
@@ -2655,7 +2675,7 @@ impl Db {
             effective_config.cache_size_mb,
             effective_config.page_pool_max,
         )?;
-        let wal = WalHandle::acquire(&vfs, &path, &effective_config, &pager)?;
+        let wal = WalHandle::acquire(&vfs, &path, &effective_config, &pager, process_coordinator)?;
         wal.set_max_page_count(pager.on_disk_page_count()?);
 
         // ADR 0143 engine-memory plan: drop the in-memory WAL page-version
@@ -2857,7 +2877,7 @@ impl Db {
 
         #[cfg(feature = "bench-internals")]
         READ_PATH_WAL_READER_BEGIN_COUNT.fetch_add(1, Ordering::Relaxed);
-        let reader = self.inner.wal.begin_reader()?;
+        let reader = self.inner.wal.begin_reader_with_pager(&self.inner.pager)?;
         let snapshot_lsn = reader.snapshot_lsn();
         self.refresh_engine_from_snapshot(snapshot_lsn)?;
         if self.inner.config.extension_unsigned_development_mode
@@ -5329,7 +5349,7 @@ impl Db {
             self.refresh_engine_from_storage()?;
             return Ok((self.engine_snapshot()?, None));
         }
-        let reader = self.inner.wal.begin_reader()?;
+        let reader = self.inner.wal.begin_reader_with_pager(&self.inner.pager)?;
         let snapshot_lsn = reader.snapshot_lsn();
         self.refresh_engine_from_snapshot(snapshot_lsn)?;
         drop(reader);
@@ -5672,6 +5692,9 @@ impl Db {
     }
 
     fn refresh_engine_from_storage(&self) -> Result<()> {
+        self.inner
+            .wal
+            .refresh_from_coordination(&self.inner.pager)?;
         let latest_lsn = self.inner.wal.latest_snapshot();
         let latest_checkpoint_epoch = self.inner.wal.checkpoint_epoch();
         let last_runtime_lsn = self.inner.last_runtime_lsn.load(Ordering::Acquire);
@@ -5742,7 +5765,7 @@ impl Db {
             return Ok(());
         }
 
-        let reader = self.inner.wal.begin_reader()?;
+        let reader = self.inner.wal.begin_reader_with_pager(&self.inner.pager)?;
         let snapshot_lsn = reader.snapshot_lsn();
         self.refresh_engine_from_snapshot(snapshot_lsn)?;
         self.ensure_all_tables_loaded_at_snapshot(Some(snapshot_lsn))?;
@@ -5760,7 +5783,7 @@ impl Db {
             return Ok(());
         }
 
-        let reader = self.inner.wal.begin_reader()?;
+        let reader = self.inner.wal.begin_reader_with_pager(&self.inner.pager)?;
         let snapshot_lsn = reader.snapshot_lsn();
         self.refresh_engine_from_snapshot(snapshot_lsn)?;
         let targeted_ok =
@@ -5921,7 +5944,7 @@ impl Db {
             return Ok(());
         }
 
-        let reader = self.inner.wal.begin_reader()?;
+        let reader = self.inner.wal.begin_reader_with_pager(&self.inner.pager)?;
         let snapshot_lsn = reader.snapshot_lsn();
         self.refresh_engine_from_snapshot(snapshot_lsn)?;
         self.ensure_table_row_sources_loaded_at_snapshot(names, snapshot_lsn)?;
@@ -5963,7 +5986,7 @@ impl Db {
             return self.ensure_tables_loaded_for_statement_at_snapshot(statement, None);
         }
 
-        let reader = self.inner.wal.begin_reader()?;
+        let reader = self.inner.wal.begin_reader_with_pager(&self.inner.pager)?;
         let snapshot_lsn = reader.snapshot_lsn();
         self.refresh_engine_from_snapshot(snapshot_lsn)?;
         let mut runtime = self
@@ -5999,7 +6022,7 @@ impl Db {
             return Ok(runtime.can_execute_statement_in_state_without_clone(statement));
         }
 
-        let reader = self.inner.wal.begin_reader()?;
+        let reader = self.inner.wal.begin_reader_with_pager(&self.inner.pager)?;
         let snapshot_lsn = reader.snapshot_lsn();
         self.refresh_engine_from_snapshot(snapshot_lsn)?;
         let runtime = self
@@ -6234,7 +6257,7 @@ impl Db {
     fn begin_sql_snapshot(&self) -> Result<(ReaderGuard, u64, u64)> {
         #[cfg(feature = "bench-internals")]
         READ_PATH_WAL_READER_BEGIN_COUNT.fetch_add(1, Ordering::Relaxed);
-        let reader = self.inner.wal.begin_reader()?;
+        let reader = self.inner.wal.begin_reader_with_pager(&self.inner.pager)?;
         let snapshot_lsn = reader.snapshot_lsn();
         self.refresh_engine_from_snapshot(snapshot_lsn)?;
         let checkpoint_epoch = self.inner.wal.checkpoint_epoch();
@@ -10691,6 +10714,13 @@ impl Db {
                 self.sync_journal_query_result(since_sequence).map(Some)
             }
             SyncInspectionQuery::WalMetrics => self.wal_metrics_query_result().map(Some),
+            SyncInspectionQuery::ProcessCoordination => {
+                self.process_coordination_query_result().map(Some)
+            }
+            SyncInspectionQuery::ProcessReaders => self.process_readers_query_result().map(Some),
+            SyncInspectionQuery::ProcessLockMetrics => {
+                self.process_lock_metrics_query_result().map(Some)
+            }
             SyncInspectionQuery::WriteQueueMetrics => {
                 self.write_queue_metrics_query_result().map(Some)
             }
@@ -10776,6 +10806,155 @@ impl Db {
                 Value::Bool(self.inner.wal.is_shared()),
             ])],
         ))
+    }
+
+    fn process_coordination_query_result(&self) -> Result<QueryResult> {
+        let columns = vec![
+            "mode".to_string(),
+            "enabled".to_string(),
+            "supported".to_string(),
+            "coord_path".to_string(),
+            "coord_version".to_string(),
+            "coordinator_generation".to_string(),
+            "wal_end_lsn".to_string(),
+            "checkpoint_generation".to_string(),
+            "last_refresh_lsn".to_string(),
+            "last_refresh_age_ms".to_string(),
+        ];
+        let row = if let Some(snapshot) = self.inner.wal.process_coordination_snapshot()? {
+            QueryRow::new(vec![
+                Value::Text(snapshot.mode.as_str().to_string()),
+                Value::Bool(snapshot.enabled),
+                Value::Bool(snapshot.supported),
+                snapshot
+                    .coord_path
+                    .map(|path| Value::Text(path.to_string_lossy().to_string()))
+                    .unwrap_or(Value::Null),
+                sync_u64_to_i64(u64::from(snapshot.coord_version), "coord_version")?,
+                sync_u64_to_i64(snapshot.coordinator_generation, "coordinator_generation")?,
+                sync_u64_to_i64(snapshot.wal_end_lsn, "wal_end_lsn")?,
+                sync_u64_to_i64(snapshot.checkpoint_generation, "checkpoint_generation")?,
+                sync_u64_to_i64(self.inner.wal.latest_snapshot(), "last_refresh_lsn")?,
+                snapshot
+                    .last_refresh_age_ms
+                    .map(|value| sync_u64_to_i64(value, "last_refresh_age_ms"))
+                    .transpose()?
+                    .unwrap_or(Value::Null),
+            ])
+        } else {
+            QueryRow::new(vec![
+                Value::Text(self.inner.config.process_coordination.as_str().to_string()),
+                Value::Bool(false),
+                Value::Bool(
+                    self.inner.vfs.supports_file_locks()
+                        || self.inner.config.process_coordination
+                            == ProcessCoordinationMode::SingleProcessUnsafe,
+                ),
+                Value::Null,
+                Value::Int64(0),
+                Value::Int64(0),
+                sync_u64_to_i64(self.inner.wal.latest_snapshot(), "wal_end_lsn")?,
+                sync_u64_to_i64(self.inner.wal.checkpoint_epoch(), "checkpoint_generation")?,
+                sync_u64_to_i64(self.inner.wal.latest_snapshot(), "last_refresh_lsn")?,
+                Value::Null,
+            ])
+        };
+        Ok(QueryResult::with_rows(columns, vec![row]))
+    }
+
+    fn process_readers_query_result(&self) -> Result<QueryResult> {
+        let columns = vec![
+            "slot_id".to_string(),
+            "pid".to_string(),
+            "connection_id".to_string(),
+            "snapshot_lsn".to_string(),
+            "age_ms".to_string(),
+            "heartbeat_age_ms".to_string(),
+            "state".to_string(),
+            "retention_blocking".to_string(),
+        ];
+        let Some(readers) = self.inner.wal.process_reader_slot_snapshots()? else {
+            return Ok(QueryResult::with_rows(columns, Vec::new()));
+        };
+        let mut rows = Vec::with_capacity(readers.len());
+        for reader in readers {
+            rows.push(QueryRow::new(vec![
+                sync_u64_to_i64(u64::from(reader.slot_id), "slot_id")?,
+                sync_u64_to_i64(reader.pid, "pid")?,
+                Value::Text(reader.connection_id),
+                sync_u64_to_i64(reader.snapshot_lsn, "snapshot_lsn")?,
+                sync_u64_to_i64(reader.age_ms, "age_ms")?,
+                sync_u64_to_i64(reader.heartbeat_age_ms, "heartbeat_age_ms")?,
+                Value::Text(reader.state),
+                Value::Bool(reader.retention_blocking),
+            ]));
+        }
+        Ok(QueryResult::with_rows(columns, rows))
+    }
+
+    fn process_lock_metrics_query_result(&self) -> Result<QueryResult> {
+        let columns = vec![
+            "writer_lock_waits".to_string(),
+            "writer_lock_timeouts".to_string(),
+            "current_writer_pid".to_string(),
+            "current_writer_lock_age_ms".to_string(),
+            "current_checkpoint_pid".to_string(),
+            "current_checkpoint_lock_age_ms".to_string(),
+            "checkpoint_lock_waits".to_string(),
+            "checkpoint_lock_timeouts".to_string(),
+            "reader_slots_allocated".to_string(),
+            "stale_slots_cleaned".to_string(),
+            "wal_refreshes".to_string(),
+            "wal_refresh_failures".to_string(),
+        ];
+        let row = if let Some(metrics) = self.inner.wal.process_lock_metrics_snapshot()? {
+            QueryRow::new(vec![
+                sync_u64_to_i64(metrics.writer_lock_waits, "writer_lock_waits")?,
+                sync_u64_to_i64(metrics.writer_lock_timeouts, "writer_lock_timeouts")?,
+                metrics
+                    .current_writer_pid
+                    .map(|value| sync_u64_to_i64(value, "current_writer_pid"))
+                    .transpose()?
+                    .unwrap_or(Value::Null),
+                metrics
+                    .current_writer_lock_age_ms
+                    .map(|value| sync_u64_to_i64(value, "current_writer_lock_age_ms"))
+                    .transpose()?
+                    .unwrap_or(Value::Null),
+                metrics
+                    .current_checkpoint_pid
+                    .map(|value| sync_u64_to_i64(value, "current_checkpoint_pid"))
+                    .transpose()?
+                    .unwrap_or(Value::Null),
+                metrics
+                    .current_checkpoint_lock_age_ms
+                    .map(|value| sync_u64_to_i64(value, "current_checkpoint_lock_age_ms"))
+                    .transpose()?
+                    .unwrap_or(Value::Null),
+                sync_u64_to_i64(metrics.checkpoint_lock_waits, "checkpoint_lock_waits")?,
+                sync_u64_to_i64(metrics.checkpoint_lock_timeouts, "checkpoint_lock_timeouts")?,
+                sync_u64_to_i64(metrics.reader_slot_allocations, "reader_slots_allocated")?,
+                sync_u64_to_i64(metrics.reader_slot_reclaims, "stale_slots_cleaned")?,
+                sync_u64_to_i64(metrics.wal_refreshes, "wal_refreshes")?,
+                sync_u64_to_i64(metrics.wal_refresh_failures, "wal_refresh_failures")?,
+            ])
+        } else {
+            QueryRow::new(vec![
+                Value::Int64(0),
+                Value::Int64(0),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Int64(0),
+                Value::Int64(0),
+                Value::Int64(0),
+                Value::Int64(0),
+                Value::Int64(0),
+                Value::Int64(0),
+            ])
+        };
+        Ok(QueryResult::with_rows(columns, vec![row]))
     }
 
     fn write_queue_metrics_query_result(&self) -> Result<QueryResult> {
@@ -11608,6 +11787,9 @@ enum SyncInspectionQuery {
     Status,
     Journal { since_sequence: u64 },
     WalMetrics,
+    ProcessCoordination,
+    ProcessReaders,
+    ProcessLockMetrics,
     WriteQueueMetrics,
     StorageMetrics,
     ReactiveMetrics,
@@ -11642,6 +11824,9 @@ impl SyncInspectionQuery {
                 Some(Self::Journal { since_sequence: 0 })
             }
             "select * from sys.wal_metrics" => Some(Self::WalMetrics),
+            "select * from sys.process_coordination" => Some(Self::ProcessCoordination),
+            "select * from sys.process_readers" => Some(Self::ProcessReaders),
+            "select * from sys.process_lock_metrics" => Some(Self::ProcessLockMetrics),
             "select * from sys.write_queue_metrics" => Some(Self::WriteQueueMetrics),
             "select * from sys.storage_metrics" => Some(Self::StorageMetrics),
             "select * from sys.reactive_metrics" => Some(Self::ReactiveMetrics),
@@ -31049,6 +31234,72 @@ mod tests {
             counters.write_txn_lock_count, 0,
             "held-snapshot read should still skip write_txn lock when no writer is active"
         );
+    }
+
+    #[test]
+    fn process_coordination_refreshes_independent_wal_handle() -> Result<()> {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("process_refresh.ddb");
+        let config = DbConfig {
+            background_checkpoint_worker: false,
+            wal_checkpoint_threshold_pages: 0,
+            wal_checkpoint_threshold_bytes: 0,
+            ..DbConfig::default()
+        };
+
+        let db1 = Db::open_or_create(&path, config.clone())?;
+        db1.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT)")?;
+        super::evict_shared_wal(&path)?;
+        let db2 = Db::open_or_create(&path, config)?;
+
+        db1.execute("INSERT INTO t VALUES (1, 'alpha')")?;
+        let count = scalar_i64(&db2.execute("SELECT COUNT(*) FROM t")?);
+        assert_eq!(count, 1);
+
+        let coordination = db2.execute("SELECT * FROM sys.process_coordination")?;
+        assert_eq!(coordination.rows()[0].values()[1], Value::Bool(true));
+        Ok(())
+    }
+
+    #[test]
+    fn process_reader_slot_blocks_external_checkpoint_truncation() -> Result<()> {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("process_reader_retention.ddb");
+        let config = DbConfig {
+            background_checkpoint_worker: false,
+            wal_checkpoint_threshold_pages: 0,
+            wal_checkpoint_threshold_bytes: 0,
+            ..DbConfig::default()
+        };
+
+        let db1 = Db::open_or_create(&path, config.clone())?;
+        db1.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT)")?;
+        super::evict_shared_wal(&path)?;
+        let db2 = Db::open_or_create(&path, config)?;
+        let token = db2.hold_snapshot()?;
+
+        db1.execute("INSERT INTO t VALUES (1, 'held')")?;
+        db1.checkpoint_wal()?;
+        let wal_path = {
+            let mut path = path.as_os_str().to_os_string();
+            path.push(".wal");
+            std::path::PathBuf::from(path)
+        };
+        let held_len = std::fs::metadata(&wal_path)
+            .expect("stat wal with process reader")
+            .len();
+        assert!(
+            held_len > crate::wal::format::WAL_HEADER_SIZE,
+            "process reader should prevent WAL truncation, got {held_len}"
+        );
+
+        db2.release_snapshot(token)?;
+        db1.checkpoint_wal()?;
+        let released_len = std::fs::metadata(&wal_path)
+            .expect("stat wal after release")
+            .len();
+        assert_eq!(released_len, crate::wal::format::WAL_HEADER_SIZE);
+        Ok(())
     }
 
     #[test]

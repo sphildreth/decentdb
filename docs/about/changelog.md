@@ -5,7 +5,7 @@ All notable changes to DecentDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.8.0] - [Unreleased]
 
 ### Added
 
@@ -23,6 +23,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added Python, Dart, and .NET binding showcase tests for native full-text
   search, parameterized `fulltext_match` queries, prefix search, and `bm25`
   ranking through each binding's public API.
+- Added cross-process WAL coordination for local on-disk databases: VFS
+  byte-range locks on native platforms, a rebuildable `.coord` sidecar with
+  database identity checks, cross-process writer/checkpoint serialization,
+  reader-slot WAL retention, external WAL refresh, stale-slot cleanup, and
+  `sys.process_coordination`, `sys.process_readers`, and
+  `sys.process_lock_metrics` diagnostics.
+- Added Rust, C ABI open-option, Python, Dart, and .NET surfaces for
+  `process_coordination=auto|required|single_process_unsafe` and
+  `process_coordination_timeout_ms`, plus binding smoke coverage for the new
+  diagnostics.
 
 ### Changed
 
@@ -30,6 +40,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   open options, and updated the Dart ABI expectation/header copies.
 - Bumped the database format version to 12 for full-text index metadata and
   added `decentdb-migrate` support for format-11 databases.
+- Bumped the database format version to 13 to add a non-secret database identity
+  used by coordination sidecars, and added `decentdb-migrate` support for
+  format-12 databases.
+- Tightened checkpoint safety so explicit checkpoints skip main-file copyback
+  while local snapshots, named snapshot retention, unreadable reader slots, or
+  cross-process reader slots are active; reader-free checkpoints still copy back
+  and truncate normally.
 
 ## [2.7.0] - [2026-05-22]
 

@@ -319,7 +319,7 @@ impl WalDeltaMaterializeFixture {
             wal_resident_versions_per_page: 0,
             ..DbConfig::default()
         };
-        let wal = WalHandle::acquire(&vfs, db_path, &cfg, &pager)?;
+        let wal = WalHandle::acquire(&vfs, db_path, &cfg, &pager, None)?;
         let page_id = CATALOG_ROOT_PAGE_ID + 1;
 
         let base = vec![0xA1; DEFAULT_PAGE_SIZE as usize];

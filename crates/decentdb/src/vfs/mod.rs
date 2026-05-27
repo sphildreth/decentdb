@@ -16,6 +16,7 @@ pub(crate) mod stats;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::config::DbConfig;
 use crate::error::{DbError, Result};
@@ -34,6 +35,7 @@ pub(crate) enum FileKind {
     Database,
     Wal,
     SyncJournal,
+    Coordination,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -53,7 +55,13 @@ pub(crate) trait Vfs: Send + Sync + std::fmt::Debug {
     fn is_memory(&self) -> bool {
         false
     }
+
+    fn supports_file_locks(&self) -> bool {
+        false
+    }
 }
+
+pub(crate) trait VfsFileLock: Send + Sync + std::fmt::Debug {}
 
 pub(crate) trait VfsFile: Send + Sync + std::fmt::Debug {
     fn kind(&self) -> FileKind;
@@ -86,6 +94,17 @@ pub(crate) trait VfsFile: Send + Sync + std::fmt::Debug {
     fn sync_metadata(&self) -> Result<()>;
     fn file_size(&self) -> Result<u64>;
     fn set_len(&self, len: u64) -> Result<()>;
+    fn try_lock_range(
+        &self,
+        _offset: u64,
+        _len: u64,
+        _exclusive: bool,
+    ) -> Result<Option<Box<dyn VfsFileLock>>> {
+        Err(DbError::transaction(format!(
+            "{} VFS file does not support process coordination locks",
+            self.path().display()
+        )))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -152,6 +171,43 @@ impl VfsHandle {
 
     pub(crate) fn is_memory(&self) -> bool {
         self.inner.is_memory()
+    }
+
+    pub(crate) fn supports_file_locks(&self) -> bool {
+        self.inner.supports_file_locks()
+    }
+}
+
+pub(crate) fn lock_range_with_timeout(
+    file: &dyn VfsFile,
+    offset: u64,
+    len: u64,
+    exclusive: bool,
+    timeout: Option<Duration>,
+) -> Result<Box<dyn VfsFileLock>> {
+    let start = Instant::now();
+    let mut delay = Duration::from_micros(100);
+    loop {
+        if let Some(guard) = file.try_lock_range(offset, len, exclusive)? {
+            return Ok(guard);
+        }
+        match timeout {
+            Some(timeout) if timeout.is_zero() => {
+                return Err(DbError::busy(format!(
+                    "process coordination lock at {} offset {offset} length {len} is busy",
+                    file.path().display()
+                )));
+            }
+            Some(timeout) if start.elapsed() >= timeout => {
+                return Err(DbError::timeout(format!(
+                    "timed out waiting for process coordination lock at {} offset {offset} length {len}",
+                    file.path().display()
+                )));
+            }
+            _ => {}
+        }
+        std::thread::sleep(delay);
+        delay = (delay * 2).min(Duration::from_millis(5));
     }
 }
 

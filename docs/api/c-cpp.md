@@ -135,6 +135,23 @@ check(ddb_db_create_with_options(
 `tde_key` use the UTF-8 bytes of the option value. Avoid logging option strings
 that contain key material.
 
+Cross-process WAL coordination can be required explicitly:
+
+```c
+ddb_db_t *db = NULL;
+check(ddb_db_open_or_create_with_options(
+          "app.ddb",
+          "process_coordination=required;process_coordination_timeout_ms=30000",
+          &db),
+      "open coordinated db");
+```
+
+Supported `process_coordination` values are `auto` (default), `required`, and
+`single_process_unsafe`. Coordinated opens create or reuse a rebuildable
+`app.ddb.coord` sidecar on local filesystems with byte-range lock support. Use
+`SELECT * FROM sys.process_coordination`, `sys.process_readers`, and
+`sys.process_lock_metrics` for diagnostics.
+
 Audit context can be set through SQL or through the C ABI:
 
 ```c

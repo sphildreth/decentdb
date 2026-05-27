@@ -6,7 +6,7 @@ use std::sync::{Arc, OnceLock};
 
 use crate::error::Result;
 
-use super::{FileKind, OpenMode, Vfs, VfsFile};
+use super::{FileKind, OpenMode, Vfs, VfsFile, VfsFileLock};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct BenchVfsFileStats {
@@ -87,6 +87,7 @@ impl StatsState {
             FileKind::Database => &self.db,
             FileKind::Wal => &self.wal,
             FileKind::SyncJournal => &self.sync_journal,
+            FileKind::Coordination => &self.wal,
         }
     }
 
@@ -189,6 +190,10 @@ impl Vfs for StatsVfs {
     fn is_memory(&self) -> bool {
         self.inner.is_memory()
     }
+
+    fn supports_file_locks(&self) -> bool {
+        self.inner.supports_file_locks()
+    }
 }
 
 #[derive(Debug)]
@@ -271,6 +276,15 @@ impl VfsFile for StatsVfsFile {
                 .fetch_add(1, Ordering::Relaxed);
         }
         self.inner.set_len(len)
+    }
+
+    fn try_lock_range(
+        &self,
+        offset: u64,
+        len: u64,
+        exclusive: bool,
+    ) -> Result<Option<Box<dyn VfsFileLock>>> {
+        self.inner.try_lock_range(offset, len, exclusive)
     }
 }
 

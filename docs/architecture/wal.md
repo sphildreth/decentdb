@@ -101,6 +101,29 @@ fsync(WAL file)    // Periodically
 
 Faster for bulk operations, risk of losing last batch.
 
+## Cross-Process Coordination
+
+For local on-disk databases, DecentDB can coordinate WAL ownership across native
+OS processes through a rebuildable `<database>.coord` sidecar. The sidecar is
+not authoritative data; it records database identity, WAL/checkpoint
+generations, lock-owner metadata, and a fixed reader-slot table that can be
+rebuilt from the database header and WAL.
+
+Coordination preserves the existing one-writer/many-readers model:
+
+- writer and checkpoint operations acquire OS byte-range locks through the VFS;
+- reader transactions register a sidecar slot with their snapshot LSN;
+- checkpoints skip copyback and truncation while local or process reader slots
+  are active, then copy back and truncate once readers drain;
+- each process refreshes its local WAL index when another process publishes a
+  newer WAL or checkpoint generation;
+- stale reader slots are reclaimed only when lock liveness can be proven.
+
+The default `process_coordination=auto` enables this path when the VFS supports
+local file locks. `process_coordination=required` fails open on unsupported
+VFSes, and `single_process_unsafe` skips sidecar registration for callers that
+know no other native process is concurrently using the file.
+
 ## Snapshot Isolation
 
 ### Reader Snapshots

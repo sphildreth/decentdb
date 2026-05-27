@@ -429,6 +429,8 @@ def _prepare_queued_params(params):
 def _build_open_options(
     options="",
     *,
+    process_coordination=None,
+    process_coordination_timeout_ms=None,
     write_queue_enabled=None,
     write_queue_capacity=None,
     write_queue_default_timeout_ms=None,
@@ -444,6 +446,12 @@ def _build_open_options(
                 option_items.append(stripped)
         else:
             option_items.append(str(options))
+    if process_coordination is not None:
+        option_items.append(f"process_coordination={str(process_coordination)}")
+    if process_coordination_timeout_ms is not None:
+        option_items.append(
+            f"process_coordination_timeout_ms={int(process_coordination_timeout_ms)}"
+        )
     if write_queue_enabled is not None:
         option_items.append(f"write_queue_enabled={str(bool(write_queue_enabled)).lower()}")
     if write_queue_capacity is not None:
@@ -3518,6 +3526,8 @@ class Connection:
         stmt_cache_size=128,
         mode="open_or_create",
         options="",
+        process_coordination=None,
+        process_coordination_timeout_ms=None,
         write_queue_enabled=None,
         write_queue_capacity=None,
         write_queue_default_timeout_ms=None,
@@ -3539,6 +3549,8 @@ class Connection:
         raw_path = fs_path.encode("utf-8") if isinstance(fs_path, str) else fs_path
         db_options = _build_open_options(
             options,
+            process_coordination=process_coordination,
+            process_coordination_timeout_ms=process_coordination_timeout_ms,
             write_queue_enabled=write_queue_enabled,
             write_queue_capacity=write_queue_capacity,
             write_queue_default_timeout_ms=write_queue_default_timeout_ms,
@@ -3966,6 +3978,8 @@ def connect(dsn, **kwargs):
     stmt_cache_size = kwargs.pop("stmt_cache_size", 128)
     mode = kwargs.pop("mode", "open_or_create")
     options = kwargs.pop("options", "")
+    process_coordination = kwargs.pop("process_coordination", None)
+    process_coordination_timeout_ms = kwargs.pop("process_coordination_timeout_ms", None)
     write_queue_enabled = kwargs.pop("write_queue_enabled", None)
     write_queue_capacity = kwargs.pop("write_queue_capacity", None)
     write_queue_default_timeout_ms = kwargs.pop("write_queue_default_timeout_ms", None)
@@ -3977,6 +3991,8 @@ def connect(dsn, **kwargs):
         stmt_cache_size=stmt_cache_size,
         mode=mode,
         options=options,
+        process_coordination=process_coordination,
+        process_coordination_timeout_ms=process_coordination_timeout_ms,
         write_queue_enabled=write_queue_enabled,
         write_queue_capacity=write_queue_capacity,
         write_queue_default_timeout_ms=write_queue_default_timeout_ms,

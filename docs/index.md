@@ -28,7 +28,7 @@ queries, syncable offline data, and language bindings that feel native.
 | Application-friendly types | Native `INT64`, `FLOAT64`, `BOOL`, `TEXT`, `BLOB`, `DECIMAL`, `UUID`, `DATE`, and `TIMESTAMP`. |
 | Indexed substring search | Native trigram indexes accelerate interactive `LIKE '%pattern%'` queries. |
 | Multi-language embedding | C ABI plus .NET, Go, Python, Node.js, Dart/Flutter, and JDBC bindings. |
-| Operational tooling | Queryable `sys.*` metrics for WAL, write queue, storage, reactive subscriptions, and sync status; CLI inspection, checkpoints, index rebuilds, import/export, bulk load, doctor reports, and DBeaver/JDBC integration. |
+| Operational tooling | Queryable `sys.*` metrics for WAL, process coordination, write queue, storage, reactive subscriptions, and sync status; CLI inspection, checkpoints, index rebuilds, import/export, bulk load, doctor reports, and DBeaver/JDBC integration. |
 
 ## Core Features
 

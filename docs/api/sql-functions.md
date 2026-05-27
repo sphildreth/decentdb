@@ -145,6 +145,9 @@ The canonical operational surfaces are:
 ```sql
 SELECT * FROM sys.sync_status;
 SELECT * FROM sys.wal_metrics;
+SELECT * FROM sys.process_coordination;
+SELECT * FROM sys.process_readers;
+SELECT * FROM sys.process_lock_metrics;
 SELECT * FROM sys.write_queue_metrics;
 SELECT * FROM sys.storage_metrics;
 SELECT * FROM sys.reactive_metrics;
@@ -244,6 +247,59 @@ Example:
 SELECT * FROM sys.wal_metrics;
 ```
 
+### `sys.process_coordination`
+
+One row describing this handle's cross-process coordination mode and observed
+sidecar state.
+
+| Column | Type | Unit / meaning |
+|---|---|---|
+| `mode` | `TEXT` | `auto`, `required`, or `single_process_unsafe`. |
+| `enabled` | `BOOL` | Whether this handle is using the coordination sidecar. |
+| `supported` | `BOOL` | Whether the selected VFS can support process coordination. |
+| `coord_path` | `TEXT` | Coordination sidecar path, or `NULL` when disabled. |
+| `coord_version` | `INT64` | Sidecar format version. |
+| `coordinator_generation` | `INT64` | Sidecar generation observed by this handle. |
+| `wal_end_lsn` | `INT64` | WAL end LSN published in the sidecar. |
+| `checkpoint_generation` | `INT64` | Checkpoint generation published in the sidecar. |
+| `last_refresh_lsn` | `INT64` | Last WAL snapshot LSN visible to this handle. |
+| `last_refresh_age_ms` | `INT64` | Age of the last coordination refresh, or `NULL`. |
+
+### `sys.process_readers`
+
+One row per active cross-process reader slot. Empty when coordination is
+disabled or no external reader slots are active.
+
+| Column | Type | Unit / meaning |
+|---|---|---|
+| `slot_id` | `INT64` | Fixed sidecar reader slot number. |
+| `pid` | `INT64` | Owning process ID. |
+| `connection_id` | `TEXT` | Best-effort per-connection owner token. |
+| `snapshot_lsn` | `INT64` | Reader snapshot LSN retained by this slot. |
+| `age_ms` | `INT64` | Reader slot age. |
+| `heartbeat_age_ms` | `INT64` | Time since the slot was last refreshed. |
+| `state` | `TEXT` | Current slot state. |
+| `retention_blocking` | `BOOL` | Whether the slot can block WAL truncation. |
+
+### `sys.process_lock_metrics`
+
+One row describing cross-process lock wait counters and current lock owners.
+
+| Column | Type | Unit / meaning |
+|---|---|---|
+| `writer_lock_waits` | `INT64` | Writer lock acquisitions that waited or succeeded. |
+| `writer_lock_timeouts` | `INT64` | Writer lock acquisition timeouts. |
+| `current_writer_pid` | `INT64` | Current writer lock owner PID, or `NULL`. |
+| `current_writer_lock_age_ms` | `INT64` | Current writer lock age, or `NULL`. |
+| `current_checkpoint_pid` | `INT64` | Current checkpoint lock owner PID, or `NULL`. |
+| `current_checkpoint_lock_age_ms` | `INT64` | Current checkpoint lock age, or `NULL`. |
+| `checkpoint_lock_waits` | `INT64` | Checkpoint lock acquisitions that waited or succeeded. |
+| `checkpoint_lock_timeouts` | `INT64` | Checkpoint lock acquisition timeouts. |
+| `reader_slots_allocated` | `INT64` | Reader slot allocations by this handle. |
+| `stale_slots_cleaned` | `INT64` | Stale reader slots reclaimed by this handle. |
+| `wal_refreshes` | `INT64` | WAL refreshes after external generation changes. |
+| `wal_refresh_failures` | `INT64` | Failed WAL refresh attempts. |
+
 ### `sys.storage_metrics`
 
 One row describing the current database file and storage snapshot. All columns
@@ -330,6 +386,10 @@ SELECT * FROM sys.reactive_subscriptions ORDER BY watch_id;
   for stable fields, and includes both database and WAL paths.
 - `sys.wal_metrics` is a one-row snapshot of internal WAL runtime counters such
   as active readers, warning state, payload versions, and checkpoint state.
+- `sys.process_coordination`, `sys.process_readers`, and
+  `sys.process_lock_metrics` describe native cross-process coordination for the
+  current local database handle. They return disabled/empty snapshots on
+  unsupported VFSes or `single_process_unsafe` opens.
 - `sys.sync_status` is the canonical name for the sync status row. The
   `sys_sync_status` compatibility name remains supported.
 - These surfaces do not write telemetry rows, create catalog objects, or enable

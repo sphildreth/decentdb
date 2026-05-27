@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 
 use crate::error::{DbError, Result};
 
-use super::{FileKind, OpenMode, Vfs, VfsFile};
+use super::{FileKind, OpenMode, Vfs, VfsFile, VfsFileLock};
 
 #[derive(Debug, Default)]
 pub(crate) struct OsVfs;
@@ -64,6 +64,10 @@ impl Vfs for OsVfs {
                 .map(|cwd| cwd.join(path))
                 .map_err(|source| DbError::io("resolve current working directory", source))
         }
+    }
+
+    fn supports_file_locks(&self) -> bool {
+        true
     }
 }
 
@@ -204,6 +208,15 @@ impl VfsFile for OsVfsFile {
             .set_len(len)
             .map_err(|source| DbError::io(format!("resize file {}", self.path.display()), source))
     }
+
+    fn try_lock_range(
+        &self,
+        offset: u64,
+        len: u64,
+        exclusive: bool,
+    ) -> Result<Option<Box<dyn VfsFileLock>>> {
+        try_lock_range(&self.file, &self.path, offset, len, exclusive)
+    }
 }
 
 impl Drop for OsVfsFile {
@@ -312,7 +325,170 @@ impl FileKind {
             Self::Database => "database",
             Self::Wal => "wal",
             Self::SyncJournal => "sync-journal",
+            Self::Coordination => "coordination",
         }
+    }
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct OsFileLock {
+    fd: std::os::fd::RawFd,
+    offset: u64,
+    len: u64,
+}
+
+#[cfg(unix)]
+impl VfsFileLock for OsFileLock {}
+
+#[cfg(unix)]
+impl Drop for OsFileLock {
+    fn drop(&mut self) {
+        let mut lock = libc::flock {
+            l_type: libc::F_UNLCK as libc::c_short,
+            l_whence: libc::SEEK_SET as libc::c_short,
+            l_start: self.offset as libc::off_t,
+            l_len: self.len as libc::off_t,
+            l_pid: 0,
+        };
+        // SAFETY: `fd` is borrowed from an open `OsVfsFile` that outlives all
+        // guards created by DecentDB's coordination layer. Unlock failure on
+        // drop cannot be reported, so it is intentionally ignored.
+        let _ = unsafe { libc::fcntl(self.fd, libc::F_SETLK, &mut lock) };
+    }
+}
+
+#[cfg(unix)]
+fn try_lock_range(
+    file: &File,
+    path: &Path,
+    offset: u64,
+    len: u64,
+    exclusive: bool,
+) -> Result<Option<Box<dyn VfsFileLock>>> {
+    use std::os::fd::AsRawFd;
+
+    let fd = file.as_raw_fd();
+    let lock_type = if exclusive {
+        libc::F_WRLCK
+    } else {
+        libc::F_RDLCK
+    };
+    let mut lock = libc::flock {
+        l_type: lock_type as libc::c_short,
+        l_whence: libc::SEEK_SET as libc::c_short,
+        l_start: offset as libc::off_t,
+        l_len: len as libc::off_t,
+        l_pid: 0,
+    };
+    // SAFETY: `fd` is valid for the duration of the call and `lock` points to
+    // an initialized platform `flock` structure supplied by libc.
+    let rc = unsafe { libc::fcntl(fd, libc::F_SETLK, &mut lock) };
+    if rc == 0 {
+        return Ok(Some(Box::new(OsFileLock { fd, offset, len })));
+    }
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(code) if code == libc::EACCES || code == libc::EAGAIN => Ok(None),
+        _ => Err(DbError::io(
+            format!(
+                "lock byte range {offset}..{} for {}",
+                offset.saturating_add(len),
+                path.display()
+            ),
+            error,
+        )),
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+struct OsFileLock {
+    handle: std::os::windows::io::RawHandle,
+    offset: u64,
+    len: u64,
+}
+
+#[cfg(windows)]
+impl VfsFileLock for OsFileLock {}
+
+#[cfg(windows)]
+impl Drop for OsFileLock {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Storage::FileSystem::UnlockFileEx;
+        use windows_sys::Win32::System::IO::OVERLAPPED;
+
+        let mut overlapped = OVERLAPPED::default();
+        overlapped.Anonymous.Anonymous.Offset = self.offset as u32;
+        overlapped.Anonymous.Anonymous.OffsetHigh = (self.offset >> 32) as u32;
+        // SAFETY: The handle is borrowed from the open file that created this
+        // guard. Unlock failure on drop cannot be reported, so it is ignored.
+        let _ = unsafe {
+            UnlockFileEx(
+                self.handle,
+                0,
+                self.len as u32,
+                (self.len >> 32) as u32,
+                &mut overlapped,
+            )
+        };
+    }
+}
+
+#[cfg(windows)]
+fn try_lock_range(
+    file: &File,
+    path: &Path,
+    offset: u64,
+    len: u64,
+    exclusive: bool,
+) -> Result<Option<Box<dyn VfsFileLock>>> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION;
+    use windows_sys::Win32::Storage::FileSystem::{
+        LockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
+    };
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+
+    let handle = file.as_raw_handle();
+    let mut overlapped = OVERLAPPED::default();
+    overlapped.Anonymous.Anonymous.Offset = offset as u32;
+    overlapped.Anonymous.Anonymous.OffsetHigh = (offset >> 32) as u32;
+    let mut flags = LOCKFILE_FAIL_IMMEDIATELY;
+    if exclusive {
+        flags |= LOCKFILE_EXCLUSIVE_LOCK;
+    }
+    // SAFETY: `handle` is valid for the duration of this call and
+    // `overlapped` describes the byte range to lock.
+    let ok = unsafe {
+        LockFileEx(
+            handle,
+            flags,
+            0,
+            len as u32,
+            (len >> 32) as u32,
+            &mut overlapped,
+        )
+    };
+    if ok != 0 {
+        return Ok(Some(Box::new(OsFileLock {
+            handle,
+            offset,
+            len,
+        })));
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(ERROR_LOCK_VIOLATION as i32) {
+        Ok(None)
+    } else {
+        Err(DbError::io(
+            format!(
+                "lock byte range {offset}..{} for {}",
+                offset.saturating_add(len),
+                path.display()
+            ),
+            error,
+        ))
     }
 }
 
@@ -380,6 +556,28 @@ mod tests {
         assert!(vfs.file_exists(&path).expect("file_exists"));
         vfs.remove_file(&path).expect("remove file");
         assert!(!vfs.file_exists(&path).expect("file_exists after remove"));
+    }
+
+    #[test]
+    fn byte_range_lock_can_be_acquired_and_reacquired_after_drop() {
+        let vfs = OsVfs;
+        let path = unique_path("byte-range-lock");
+        let file = vfs
+            .open(&path, OpenMode::CreateNew, FileKind::Coordination)
+            .expect("create coordination file");
+
+        let guard = file
+            .try_lock_range(8, 1, true)
+            .expect("try lock")
+            .expect("lock acquired");
+        drop(guard);
+        let guard = file
+            .try_lock_range(8, 1, true)
+            .expect("try lock again")
+            .expect("lock reacquired");
+        drop(guard);
+
+        vfs.remove_file(&path).expect("cleanup file");
     }
 
     #[test]

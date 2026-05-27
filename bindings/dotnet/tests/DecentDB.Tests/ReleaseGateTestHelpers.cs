@@ -12,7 +12,7 @@ internal static class ReleaseGateTestHelpers
 
     public static void DeleteDbArtifacts(string dbPath)
     {
-        foreach (var suffix in new[] { string.Empty, "-wal", ".bak", ".copy", ".copy-wal" })
+        foreach (var suffix in new[] { string.Empty, "-wal", ".wal", ".coord", ".bak", ".copy", ".copy-wal", ".copy.coord" })
         {
             var path = dbPath + suffix;
             if (File.Exists(path))

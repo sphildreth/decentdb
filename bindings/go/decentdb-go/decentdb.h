@@ -172,7 +172,11 @@ ddb_status_t ddb_db_open_or_create(const char *path, ddb_db_t **out_db);
  * by whitespace, commas, or semicolons. Supported keys include cache_size,
  * retain_paged_row_sources_after_commit, paged_row_storage,
  * persistent_pk_index, wal_autocheckpoint, wal_checkpoint_threshold_pages,
- * wal_checkpoint_threshold_bytes, encryption_key, and encryption_key_hex.
+ * wal_checkpoint_threshold_bytes, process_coordination,
+ * process_coordination_timeout_ms, write_queue_enabled, write_queue_capacity,
+ * write_queue_default_timeout_ms, write_queue_strict_group_commit,
+ * write_queue_max_batch, write_queue_max_group_delay_us, encryption_key, and
+ * encryption_key_hex.
  */
 ddb_status_t ddb_db_create_with_options(const char *path, const char *options, ddb_db_t **out_db);
 ddb_status_t ddb_db_open_with_options(const char *path, const char *options, ddb_db_t **out_db);
