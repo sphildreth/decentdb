@@ -8,6 +8,9 @@ This directory contains the historical and active ADRs for DecentDB.
 > the current Rust engine.
 
 ### Recent Rust-Specific ADRs:
+- **0179-cross-process-public-contract-bindings-and-diagnostics.md**: Defines the public process-coordination option, binding responsibilities, SQL/CLI diagnostics, and safe-by-default error behavior.
+- **0178-cross-process-reader-retention-and-wal-refresh.md**: Defines cross-process reader slots, checkpoint retention across processes, WAL index refresh, and stale reader cleanup.
+- **0177-cross-process-coordination-sidecar-and-locking.md**: Defines the coordination sidecar, byte-range file locking model, VFS process-lock capability, and no-mmap v1 direction.
 - **0176-full-text-search-storage-durability-and-binding-contract.md**: Defines FTS as engine-owned derived secondary index state, with term/postings/document-stat storage, rebuild/verify behavior, stale-index handling, and binding responsibilities through ordinary SQL.
 - **0175-native-full-text-search-query-surface-and-ranking.md**: Defines native `USING fulltext` indexes, `fulltext_match('index', query)`, `bm25('index')` ranking, portable analyzer/query behavior, and the non-virtual-table FTS user surface.
 - **0118-rust-ffi-panic-safety.md**: Mandates `catch_unwind` on all C-ABI boundaries.

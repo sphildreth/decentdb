@@ -97,7 +97,7 @@ shipped foundation affects follow-on roadmap decisions.
 
 | Priority | Future Version | Status | Feature | Current Source Of Truth | Why This Rank |
 |---:|---|---|---|---|---|
-| 1 | vNext | TODO | Cross-process WAL coordination | Needs ADR/spec | Important for Electron/Tauri, helper processes, CLI coexistence, background sync workers, and matching SQLite's practical process-safe advantage |
+| 1 | vNext | TODO | Cross-process WAL coordination | [`WIN_CROSS_PROCESS_WAL_COORDINATION_SPEC.md`](WIN_CROSS_PROCESS_WAL_COORDINATION_SPEC.md); ADR 0177-0179 | Important for Electron/Tauri, helper processes, CLI coexistence, background sync workers, and matching SQLite's practical process-safe advantage |
 | 2 | vNext | TODO | Browser SQL/API parity and production web hardening | ADR 0161/0165 and browser docs; needs follow-up spec | DecentDB has a browser runtime; the next adoption hurdle is making it feel complete next to SQLite WASM and PGlite |
 | 3 | vNext | TODO | Mobile production runtime and SDK hardening | Needs ADR/spec | Local-first without first-class iOS/Android lifecycle, packaging, key storage, and background sync guidance leaves a major adoption gap |
 | 4 | vNext | TODO | Default-fast performance and storage efficiency | Benchmarking guide and release metrics; needs ADR/spec for format-affecting work | DecentDB should feel fast without special tuning and should keep file size/cold-open behavior competitive |
@@ -163,7 +163,8 @@ database.
 
 **Future Version:** vNext
 
-**Source of truth:** Needs ADR/spec before implementation.
+**Source of truth:** [`WIN_CROSS_PROCESS_WAL_COORDINATION_SPEC.md`](WIN_CROSS_PROCESS_WAL_COORDINATION_SPEC.md)
+and ADR 0177-0179.
 
 ### Why This Matters
 
