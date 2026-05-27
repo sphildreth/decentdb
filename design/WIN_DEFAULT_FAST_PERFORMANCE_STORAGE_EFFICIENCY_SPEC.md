@@ -187,6 +187,9 @@ Before implementation changes begin, benchmark maintainers must run the expanded
 benchmark slices from section 6 and record accepted target thresholds. Those
 targets may refine the provisional bands below, but they must be committed to
 the spec or an accepted benchmark note before performance patches are judged.
+The accepted baseline lane is the rollout step 3 benchmark run for the expanded
+suite on the release benchmark environment. Implementation patches are judged
+against that lane until a later baseline update is explicitly accepted.
 
 Ratio targets are valid only when the default profile improves. A target is not
 met by making the tuned profile slower. Tuned durable, SQLite, and DuckDB
@@ -222,7 +225,7 @@ Release performance assets must keep at least these profiles distinct:
 | `decentdb_low_memory_durable` | Explicit constrained-host profile, initially preserving the current 4 MiB cache behavior unless benchmarks justify a different low-memory value. |
 | `decentdb_tuned_durable` | Explicit high-memory durable tuning profile. |
 | `sqlite_wal_full` | Durable SQLite comparison, with SQLite-specific tuning named. |
-| `duckdb` | Embedded analytical engine comparison, with explicit engine-default durability and threading caveats named. |
+| `duckdb_engine_default` | Embedded analytical engine comparison, with explicit engine-default durability and threading caveats named. |
 | Python binding profile | First release-blocking application-facing latency profile. |
 | browser/mobile profile | Required when a change claims browser/mobile startup, query, or memory benefits. |
 
@@ -236,6 +239,12 @@ threading limitation, such as single-threaded execution or non-`Send`
 connections. Until the benchmark records exact DuckDB PRAGMAs/settings and
 durability guarantees, the DuckDB row must be labeled as `duckdb_engine_default`
 and not presented as a full-sync WAL peer.
+
+Partial comparison rows are allowed only when clearly labeled as partial. The
+current H2 and HSQLDB rows contain only `read_p95_ms`; they must either be
+expanded to the accepted workload matrix, excluded from cross-engine comparison
+charts, or labeled as `read_only_partial` so readers and regression guardrails
+do not treat them as full profile peers.
 
 The first maintained binding profile is Python. Python should exercise the
 stable C ABI prepared-statement and result APIs directly and report both
@@ -358,6 +367,22 @@ low-memory profile should initially preserve the current 4 MiB behavior.
 Browser and mobile benchmark lanes are binding constraints for default
 increases, not after-the-fact documentation work.
 
+If browser or mobile lanes regress after a default cache increase is accepted,
+the balanced default reverts to the highest cache value that passes all required
+lanes. If that value is the current 4 MiB baseline, the default remains 4 MiB
+and the spec must be updated with the measured reason before another increase
+is attempted.
+
+Named profile helpers are accepted, but open-time knobs remain the authoritative
+configuration contract. Each helper maps to one canonical release benchmark
+profile:
+
+| Helper | Canonical Release Profile | Direction |
+|---|---|---|
+| `balanced` | `decentdb_balanced_durable` | Default durable profile, using the accepted cache-size result from the sweep. Start from a 16 MiB candidate. |
+| `low_memory` | `decentdb_low_memory_durable` | Constrained-host durable profile, initially 4 MiB unless benchmark evidence changes it. |
+| `tuned_durable` | `decentdb_tuned_durable` | Explicit high-memory durable profile for benchmark and power-user tuning. |
+
 ### 7.2 Cold Open And First Query
 
 Optimize open and first-use behavior around:
@@ -416,15 +441,11 @@ should make that data more useful without making it mandatory ritual:
 New persisted statistics fields require format/migration analysis before
 implementation.
 
-Named profile helpers are accepted, but open-time knobs remain the authoritative
-configuration contract. Each helper maps to one canonical release benchmark
-profile:
-
-| Helper | Canonical Release Profile | Direction |
-|---|---|---|
-| `balanced` | `decentdb_balanced_durable` | Default durable profile, using the accepted cache-size result from the sweep. Start from a 16 MiB candidate. |
-| `low_memory` | `decentdb_low_memory_durable` | Constrained-host durable profile, initially 4 MiB unless benchmark evidence changes it. |
-| `tuned_durable` | `decentdb_tuned_durable` | Explicit high-memory durable profile for benchmark and power-user tuning. |
+Planner use of `ANALYZE` assumes the recorded row counts and distinct key counts
+are accurate enough for coarse index-vs-scan decisions, not exact cardinality
+estimation. If relying on existing stats causes plan regressions, the planner
+must fall back to conservative heuristics or the spec must add a statistics
+accuracy/rebuild requirement before expanding stats-driven choices.
 
 ### 7.5 Binding And Result Materialization Hot Paths
 
@@ -519,6 +540,7 @@ Minimum validation for each implementation slice:
 | `ANALYZE`/stats | stats persistence tests, no-stats fallback tests, plan tests |
 | Binding hot path | C ABI tests plus impacted binding smoke/benchmark |
 | WASM/mobile | browser/mobile benchmark guardrails and lifecycle smoke |
+| TDE with WAL/checkpoint changes | TDE-enabled recovery/checkpoint smoke, no key material in benchmark metadata or diagnostics |
 | Future storage format phase | ADR, migration parser, crash/recovery, compatibility tests |
 
 Memory-bound checks must include any platform surface affected by the default
@@ -526,6 +548,11 @@ change. Native checks report RSS where available; browser checks report WASM
 heap and JS-visible memory where available; mobile checks report process memory
 from the accepted device/simulator lane. If a platform cannot provide a stable
 absolute memory reading, it must still report relative growth versus baseline.
+Native Linux RSS should use `/proc/self/status` `VmRSS` or an equivalent harness
+sample. Native macOS should use `task_info` or an equivalent harness sample.
+Browser memory should use WASM heap plus JS-visible memory where the browser
+exposes it. Memory gates are baseline-relative deltas unless a platform-specific
+budget is explicitly accepted.
 
 Standard Rust validation remains:
 
@@ -546,7 +573,11 @@ Update user-facing docs when public behavior changes:
 - binding docs for prepared-statement and streaming/page APIs;
 - `docs/api/wasm.md` and Dart/mobile docs when browser/mobile profiles are
   affected;
-- benchmark docs and release assets when profile names or workloads change.
+- benchmark docs and release assets when profile names or workloads change;
+- benchmark aggregation and chart scripts when profile keys change, including
+  the `decentdb_default_durable` to `decentdb_balanced_durable` transition and
+  the `duckdb` to `duckdb_engine_default` label once exact DuckDB settings are
+  recorded.
 
 ## 10. Risks And Mitigations
 
@@ -572,16 +603,23 @@ still proceed because they do not depend on the ADR's covering-index contract.
    prepared-statement paths.
 3. Run baseline measurements and record accepted targets. This is a gate before
    default tuning or planner/executor changes are judged complete.
-4. Run the 4/8/16/24/32/64 MiB cache sweep, using 16 MiB as the first balanced
-   default candidate and preserving an explicit low-memory profile.
-5. Add Python as the first maintained binding benchmark profile.
-6. Add cold-open fixtures for small, medium, and large databases using the
+4. Update benchmark aggregation and chart scripts for canonical profile keys:
+   `decentdb_balanced_durable`, `decentdb_low_memory_durable`,
+   `decentdb_tuned_durable`, and `duckdb_engine_default` when DuckDB settings
+   are recorded. Keep compatibility handling for old `decentdb_default_durable`
+   inputs during the transition.
+5. Run the 4/8/16/24/32/64 MiB cache sweep, using 16 MiB as the first balanced
+   default candidate and preserving an explicit low-memory profile. The sweep
+   must include at least point reads, range scans, concurrent reads, durable
+   commit p95, insert throughput, storage size after checkpoint, and memory.
+6. Add Python as the first maintained binding benchmark profile.
+7. Add cold-open fixtures for small, medium, and large databases using the
    accepted row-count/size targets in section 12.
-7. Implement no-format default tuning and checkpoint policy changes.
-8. Implement ADR 0184 planner/executor improvements, starting with covering
+8. Implement no-format default tuning and checkpoint policy changes.
+9. Implement ADR 0184 planner/executor improvements, starting with covering
    index cases that can be proven safe.
-9. Update docs and release benchmark assets.
-10. Evaluate whether remaining storage-size gaps justify a concrete compression
+10. Update docs and release benchmark assets.
+11. Evaluate whether remaining storage-size gaps justify a concrete compression
    or layout ADR.
 
 ## 12. Accepted Recommendations
