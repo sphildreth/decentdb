@@ -246,6 +246,12 @@ connections. Until the benchmark records exact DuckDB PRAGMAs/settings and
 durability guarantees, the DuckDB row must be labeled as `duckdb_engine_default`
 and not presented as a full-sync WAL peer.
 
+Competitor storage comparisons must also record structural settings that affect
+file size, including database page size, auto-vacuum/vacuum behavior, and
+deletion-zeroing settings such as SQLite `secure_delete`. When the engines can
+support it, storage comparison runs should use 4096-byte pages; otherwise the
+release metadata must state the engine-specific page size.
+
 DuckDB rename sequencing is strict: first record the exact DuckDB PRAGMAs,
 connection settings, and durability note in benchmark metadata; then update the
 harness profile key to `duckdb_engine_default`; then regenerate JSON summaries
@@ -306,6 +312,14 @@ Cold/open chart labels must use stable metadata fields instead of ad hoc names:
 `process_state` is `fresh_process` or `warm_process`; `os_cache_state` is
 `evicted_os_cache`, `warm_os_cache`, or `unknown_os_cache`; and
 `storage_state` is `isolated_temp_storage` or `reused_storage`.
+
+For browser/OPFS and mobile lanes that cannot evict the OS page cache directly,
+the benchmark must define the closest target-appropriate cold-state protocol.
+Browser lanes should rebuild the OPFS connection in a fresh browser context or
+clear origin storage/cache as supported by the harness. Mobile lanes should use
+a hard simulator/device restart or a documented harness cache-purge routine.
+These lanes must not be labeled equivalent to POSIX page-cache eviction unless
+the harness proves that behavior.
 
 Cold-open fixtures must use a stable OLTP-ish schema shape, not only row counts:
 
@@ -381,10 +395,11 @@ the first benchmark slice must sweep at least 4, 8, 16, 24, 32, and 64 MiB
 under the same durable settings before changing deeper executor or storage code
 for read latency. The sweep must include point reads, range scans, concurrent
 reads, joins, aggregates, durable commit p95, insert throughput, storage size
-after checkpoint, and memory. The first serious default candidate is 16 MiB.
-Move the balanced default to 32 MiB only if benchmarks show a clear
-cross-workload win over 16 MiB across point, concurrent, range, join, aggregate,
-browser/mobile, and memory profiles.
+after checkpoint, checkpoint latency p95/max, write amplification where the
+harness can observe written bytes, and memory. The first serious default
+candidate is 16 MiB. Move the balanced default to 32 MiB only if benchmarks show
+a clear cross-workload win over 16 MiB across point, concurrent, range, join,
+aggregate, browser/mobile, checkpoint/write pressure, and memory profiles.
 
 If the accepted default cache grows, DecentDB must also keep an explicit
 low-memory profile or documented open option for constrained hosts. The
@@ -460,6 +475,10 @@ payload, verification failure, or unsupported transaction-local overlay. This
 spec does not add new persistent staleness metadata; if implementation needs
 that, the format impact must be handled through the appropriate ADR path.
 
+Covering-index execution must also fall back to the base-row path when the
+current transaction has pending writes to the target table that are not fully
+represented in a proven transaction-local index overlay.
+
 ### 7.4 Statistics And Plan Reuse
 
 `ANALYZE` already records table row counts and index key cardinality. This win
@@ -526,6 +545,12 @@ metadata, and should not change re-key behavior. Checkpoint or WAL changes must
 run at least one TDE-enabled recovery/checkpoint smoke before release because
 TDE wraps database and WAL bytes on the same logical paths.
 
+When TDE is enabled, page-cache discard paths must zero decrypted page buffers
+before returning them to reusable pools or the allocator. If an implementation
+cannot prove that for all discarded decrypted pages, the larger default cache
+must not be enabled for TDE lanes until the residual risk is documented and
+accepted.
+
 Potential later work:
 
 - page-level compression;
@@ -565,7 +590,7 @@ Minimum validation for each implementation slice:
 
 | Change Area | Required Validation |
 |---|---|
-| Default config | Native benchmark before/after, docs update, memory-bound check including peak RSS/heap, steady-state RSS/heap after checkpoint, and configured cache/default profile reporting |
+| Default config | Native benchmark before/after, docs update, memory-bound check including peak RSS/heap, steady-state RSS/heap after checkpoint, checkpoint latency p95/max, write-amplification measurement where available, and configured cache/default profile reporting |
 | WAL/checkpoint tuning | WAL recovery tests, checkpoint tests, Doctor WAL checks, benchmark |
 | Cold open | open/reopen tests, crash recovery tests, cold-open benchmark |
 | Planner/executor | targeted SQL tests, `EXPLAIN` coverage, benchmark hot path |
@@ -573,7 +598,7 @@ Minimum validation for each implementation slice:
 | `ANALYZE`/stats | stats persistence tests, no-stats fallback tests, plan tests |
 | Binding hot path | C ABI tests plus impacted binding smoke/benchmark |
 | WASM/mobile | browser/mobile benchmark guardrails and lifecycle smoke |
-| TDE with WAL/checkpoint changes | TDE-enabled recovery/checkpoint smoke, no key material in benchmark metadata or diagnostics |
+| TDE with WAL/checkpoint changes | TDE-enabled recovery/checkpoint smoke, decrypted page-buffer zeroing on discard, no key material in benchmark metadata or diagnostics |
 | Future storage format phase | ADR, migration parser, crash/recovery, compatibility tests |
 
 Memory-bound checks must include any platform surface affected by the default
@@ -646,7 +671,8 @@ still proceed because they do not depend on the ADR's covering-index contract.
    default candidate and preserving an explicit low-memory profile. The sweep
    must include at least point reads, range scans, concurrent reads, joins,
    aggregates, durable commit p95, insert throughput, storage size after
-   checkpoint, and memory.
+   checkpoint, checkpoint latency p95/max, write amplification where available,
+   and memory.
 6. Add Python as the first maintained binding benchmark profile.
 7. Generate cold-open fixtures for small, medium, and large databases using the
    accepted row-count/size targets in section 12; this is fixture data work on
