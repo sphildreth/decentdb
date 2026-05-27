@@ -8,6 +8,7 @@ This directory contains the historical and active ADRs for DecentDB.
 > the current Rust engine.
 
 ### Recent Rust-Specific ADRs:
+- **0180-database-identity-for-coordination-sidecars.md**: Defines the stable non-secret database header identity and sidecar fingerprint required for stale-sidecar detection, plus the format-bump and migration-parser obligations.
 - **0179-cross-process-public-contract-bindings-and-diagnostics.md**: Defines the public process-coordination option, binding responsibilities, SQL/CLI diagnostics, and safe-by-default error behavior.
 - **0178-cross-process-reader-retention-and-wal-refresh.md**: Defines cross-process reader slots, checkpoint retention across processes, WAL index refresh, and stale reader cleanup.
 - **0177-cross-process-coordination-sidecar-and-locking.md**: Defines the coordination sidecar, byte-range file locking model, VFS process-lock capability, and no-mmap v1 direction.

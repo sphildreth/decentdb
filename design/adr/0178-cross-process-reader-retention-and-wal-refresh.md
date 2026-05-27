@@ -8,16 +8,25 @@ Cross-process readers must participate in WAL retention through reader slots in
 the coordination sidecar. Checkpoint truncation must consider every active
 reader slot owned by every process before discarding WAL frames.
 
-Reader slots record snapshot LSN, owner process metadata, connection/reader
-generation, checkpoint generation observed at read start, heartbeat information,
-and state flags. A reader slot is owned by a byte-range lock. Slot records are
-diagnostic and retention metadata; they must not contain user data, SQL text,
-TDE key material, indexed terms, or audit context values.
+V1 uses 64 fixed reader slots per database. Reader slots record snapshot LSN,
+owner process metadata, connection/reader generation, checkpoint generation
+observed at read start, heartbeat information, and state flags. A reader slot is
+owned by a byte-range lock. Slot records are diagnostic and retention metadata;
+they must not contain user data, SQL text, TDE key material, indexed terms, or
+audit context values. If no reader slot is available, begin-read fails with a
+specific reader-slot-exhaustion error.
 
 The begin-read protocol must register a conservative slot before depending on a
 snapshot LSN. Checkpointers must treat initializing slots as retention blockers.
 This prevents a reader from capturing an old LSN while a checkpoint concurrently
 sees no active readers and truncates required WAL frames.
+
+Begin-read retries after a concurrent checkpoint/WAL generation change are
+bounded. V1 allows at most 8 retries with exponential backoff starting at 100
+microseconds and capped at 5 milliseconds, then waits for a stable generation by
+polling the sidecar generation with the same capped backoff subject to the
+configured busy timeout. Timeout returns a busy/timeout error; it must not fall
+back to an unregistered stale snapshot.
 
 Checkpoint safe truncation must use the minimum of:
 
@@ -31,7 +40,9 @@ Every process keeps a local WAL index. Before beginning a read transaction,
 beginning a write transaction, checkpointing, or reporting WAL diagnostics, the
 process must compare its local generation with the coordination sidecar and
 refresh if another process appended WAL frames, checkpointed, truncated, or
-recovered the WAL.
+recovered the WAL. Refresh must detect checkpoint/truncation generation changes
+before attempting an incremental scan from a local offset that may no longer
+exist.
 
 Refresh must validate WAL frames and commit markers. Coordination sidecar
 metadata is a publication and discovery mechanism, not a substitute for WAL
@@ -39,7 +50,13 @@ integrity checks.
 
 Stale reader slots may be cleaned only after the engine proves the slot lock is
 not held by the owner process. A long-running reader in a live process is a
-valid retention blocker, not a stale slot.
+valid retention blocker, not a stale slot. If lock liveness cannot be proven
+with certainty, the slot remains active and retention-blocking.
+
+Owner liveness proof must account for PID reuse. Phase 1 must define
+platform-specific owner tokens, such as PID plus `/proc/<pid>/stat` start time
+and boot id on Linux, PID plus process start time on macOS, and process id plus
+creation time or an owned process handle on Windows.
 
 ### Rationale
 
@@ -84,6 +101,9 @@ dead reader from a merely old reader.
   identify the blocker.
 - Crash cleanup must be platform-tested carefully because lock release behavior
   is part of the correctness story.
+- The fixed 64-slot v1 limit is simple and testable, but applications with many
+  processes and long concurrent readers may need a later sidecar format
+  extension.
 
 ### Consequences
 
@@ -96,6 +116,9 @@ dead reader from a merely old reader.
   publish-before-return, checkpoint-before-truncate, and stale-reader cleanup
   windows.
 - Doctor and `sys.*` surfaces should expose active and stale reader slots.
+- Phase 2 writer/checkpoint locking must not be released without Phase 3 reader
+  retention. If staged behind an internal flag, WAL truncation must be disabled
+  until cross-process reader slots are active.
 
 ### References
 
@@ -106,4 +129,3 @@ dead reader from a merely old reader.
 - `design/adr/0141-paged-on-disk-wal-index.md`
 - `design/adr/0156-branch-checkpoint-retention-and-garbage-collection.md`
 - `design/adr/0168-sync-shape-streaming-subscriptions.md`
-

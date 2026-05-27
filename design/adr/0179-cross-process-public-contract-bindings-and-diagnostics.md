@@ -22,6 +22,11 @@ Native local on-disk databases use `auto` by default. Unsupported VFS or
 filesystem configurations must fail safe unless the caller explicitly uses
 `single_process_unsafe`.
 
+Coordinated read-only opens require write access to the coordination sidecar in
+v1. If the sidecar cannot be created or updated, open fails with a clear error.
+`single_process_unsafe` is not a coordinated read-only mode; it is an explicit
+safety opt-out for controlled single-process deployments.
+
 Diagnostics are exposed primarily through SQL and CLI:
 
 - `sys.process_coordination`
@@ -37,6 +42,13 @@ binding must update its ABI expectation and smoke tests.
 Cross-process writer/checkpoint waits use existing busy/timeout semantics where
 possible. Error messages should identify process coordination blockers when the
 owner metadata is known.
+
+Doctor must include findings for long-held writer locks, active reader retention
+blockers, stale reader slots, sidecar/database identity mismatches, unsupported
+coordination filesystems, and WAL growth caused by cross-process retention.
+SQL diagnostics must include current writer/checkpoint holder metadata when
+known, including process id and lock age, in addition to cumulative wait and
+timeout counters.
 
 Bindings must add smoke tests or examples that prove independent host processes
 can safely use the same database file through the public binding API.
@@ -81,6 +93,9 @@ the risk visible.
 - Binding documentation needs to explain sidecar permissions and unsupported
   filesystems clearly.
 - If new C ABI status codes are needed, all bindings need coordinated updates.
+- The default `auto` path should be exercised by process-coordination
+  integration tests. Narrow unit tests may use `single_process_unsafe` when the
+  coordination sidecar is unrelated to the behavior under test.
 
 ### Consequences
 
@@ -100,4 +115,3 @@ the risk visible.
 - `design/adr/0163-operational-sys-metrics.md`
 - `docs/user-guide/write-concurrency.md`
 - `include/decentdb.h`
-

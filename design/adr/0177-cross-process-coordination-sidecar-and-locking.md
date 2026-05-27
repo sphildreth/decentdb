@@ -16,17 +16,31 @@ The sidecar path is:
 
 The sidecar is separate from the database file and WAL file. It contains
 coordination metadata only, not user data. It has its own magic, version,
-database identity fingerprint, generation counters, WAL/checkpoint publication
-metadata, owner records, reader slot records, and checksums for torn-write
-detection.
+the ADR 0180 database identity/fingerprint, generation counters,
+WAL/checkpoint publication metadata, owner records, reader slot records, and
+checksums for torn-write detection.
+
+The sidecar uses checksums per durable record family, not only one whole-file
+checksum. The fixed header has its own checksum. Reader slots and owner records
+have independent checksums and generations so a torn write can invalidate one
+record without making unrelated records unusable. Header corruption requires
+sidecar repair/rebuild under the coordinator initialization lock. Record
+corruption that cannot be proven safe is treated conservatively as a retention
+blocker until repaired.
 
 V1 uses byte-range locks on the coordination sidecar for:
 
 - coordinator initialization/repair;
 - writer ownership;
-- checkpoint ownership;
+- checkpoint ownership, aliased to the writer lock in v1;
 - reader slot ownership/liveness;
 - metadata publication if not already protected by the writer/checkpoint lock.
+
+Aliasing the checkpoint lock to the writer lock is deliberate for v1. It avoids
+cross-process writer/checkpoint deadlock classes and keeps the first release
+conservative: checkpoint copyback/truncation and write transactions are mutually
+exclusive across processes. A later ADR may split these locks only with a
+complete lock ordering and deadlock-avoidance protocol.
 
 The VFS layer must grow a process-locking capability abstraction. Native local
 filesystem VFS implementations for Linux, macOS, and Windows must implement that
@@ -41,6 +55,16 @@ ADR 0119.
 The coordination sidecar is rebuildable from the database header and WAL under
 the coordinator initialization lock. It is not authoritative for committed user
 data. The WAL and database remain the durable source of truth.
+
+Database replacement, move, copy, and delete tooling should treat `.ddb`,
+`.ddb.wal`, optional `.ddb.walidx`, and `.ddb.coord` as one artifact set. A stale
+sidecar beside a replaced database must be rejected or rebuilt based on a
+database identity fingerprint mismatch.
+
+Sidecar rebuild uses a `rebuilding` generation marker so large-WAL scans do not
+require holding the coordinator initialization lock for the entire scan. If a
+process crashes during rebuild, the partial sidecar is treated as corrupt and
+the next opener rebuilds again.
 
 ### Rationale
 
@@ -96,9 +120,15 @@ repair it by holding the initialization lock and scanning the database/WAL.
   reader registration.
 - The sidecar adds another file that backup/support tooling must understand.
 - Rebuilding a corrupt sidecar requires exclusive initialization coordination and
-  may block opens briefly.
+  may block opens briefly. If the WAL is very large, sidecar rebuild latency is
+  proportional to WAL scan cost.
 - The sidecar format needs compatibility tests even though it is not database
   user data.
+- Coordinated read-only opens require write access to the sidecar in v1, even if
+  the database file itself is read-only.
+- The sidecar is independently versioned and rebuildable. Migration tooling does
+  not need to parse historical sidecar formats unless a future ADR makes sidecar
+  state authoritative.
 
 ### Consequences
 
@@ -117,4 +147,4 @@ repair it by holding the initialization lock and scanning the database/WAL.
 - `design/adr/0117-shared-wal-registry.md`
 - `design/adr/0119-rust-vfs-pread-pwrite.md`
 - `design/adr/0162-engine-owned-write-queue-strict-group-commit.md`
-
+- `design/adr/0180-database-identity-for-coordination-sidecars.md`
