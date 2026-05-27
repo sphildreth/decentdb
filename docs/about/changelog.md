@@ -20,6 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   analyzer options, `fulltext_match`, `bm25` ranking, phrase and prefix queries,
   write-path maintenance, `ALTER INDEX ... VERIFY`, `ALTER INDEX ... REBUILD`,
   tooling metadata, and SQL/user documentation.
+- Added Python, Dart, and .NET binding showcase tests for native full-text
+  search, parameterized `fulltext_match` queries, prefix search, and `bm25`
+  ranking through each binding's public API.
 
 ### Changed
 
