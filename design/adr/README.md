@@ -8,6 +8,9 @@ This directory contains the historical and active ADRs for DecentDB.
 > the current Rust engine.
 
 ### Recent Rust-Specific ADRs:
+- **0183-mobile-tde-key-provider-and-platform-keystore-boundary.md**: Defines the mobile TDE key-provider boundary, Keychain/Keystore reference-adapter scope, key-loss behavior, and the rule that Rust and pure Dart remain platform key-store agnostic.
+- **0182-mobile-runtime-lifecycle-storage-sync-and-support-tiers.md**: Defines mobile app-process ownership, app-private storage, sidecar handling, best-effort background sync with apply-before-ack, support tiers, and device/simulator validation requirements.
+- **0181-mobile-flutter-package-and-native-artifact-contract.md**: Defines Flutter-first mobile packaging, Android/iOS targets, XCFramework direction, separate mobile release workflow, and continued use of the stable C ABI boundary.
 - **0180-database-identity-for-coordination-sidecars.md**: Defines the stable non-secret database header identity and sidecar fingerprint required for stale-sidecar detection, plus the format-bump and migration-parser obligations.
 - **0179-cross-process-public-contract-bindings-and-diagnostics.md**: Defines the public process-coordination option, binding responsibilities, SQL/CLI diagnostics, and safe-by-default error behavior.
 - **0178-cross-process-reader-retention-and-wal-refresh.md**: Defines cross-process reader slots, checkpoint retention across processes, WAL index refresh, and stale reader cleanup.

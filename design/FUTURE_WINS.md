@@ -119,7 +119,7 @@ shipped foundation affects follow-on roadmap decisions.
 
 | Priority | Future Version | Status | Feature | Current Source Of Truth | Why This Rank |
 |---:|---|---|---|---|---|
-| 1 | vNext | TODO | Mobile production runtime and SDK hardening | Needs ADR/spec | Local-first without first-class iOS/Android lifecycle, packaging, key storage, and background sync guidance leaves a major adoption gap |
+| 1 | vNext | TODO | Mobile production runtime and SDK hardening | [`WIN_MOBILE_PRODUCTION_RUNTIME_SDK_HARDENING_SPEC.md`](WIN_MOBILE_PRODUCTION_RUNTIME_SDK_HARDENING_SPEC.md) | Local-first without first-class iOS/Android lifecycle, packaging, key storage, and background sync guidance leaves a major adoption gap |
 | 2 | vNext | TODO | Default-fast performance and storage efficiency | Benchmarking guide and release metrics; needs ADR/spec for format-affecting work | DecentDB should feel fast without special tuning and should keep file size/cold-open behavior competitive |
 | 3 | vNext | TODO | Rich structured errors and developer diagnostics | Existing [`docs/api/error-codes.md`](../docs/api/error-codes.md); needs ADR/spec for stable machine-readable expansion | Low-cost adoption win: better errors, hints, and doc links reduce integration friction across every binding |
 | 4 | vNext+1 | TODO | Incremental backup and point-in-time recovery | Basic `save_as` backup is delivered; needs ADR/spec for WAL archive/PITR semantics | Durable recovery artifacts are a production requirement and distinct from live replication |
@@ -191,7 +191,8 @@ database.
 
 **Future Version:** vNext
 
-**Source of truth:** Needs ADR/spec before implementation.
+**Source of truth:**
+[`WIN_MOBILE_PRODUCTION_RUNTIME_SDK_HARDENING_SPEC.md`](WIN_MOBILE_PRODUCTION_RUNTIME_SDK_HARDENING_SPEC.md).
 
 ### Why This Matters
 
@@ -1120,7 +1121,7 @@ Not promoted because the premise is already delivered or the idea is off-lane:
    optional tuning-only feature.
 8. Promote authenticated encryption/key-rotation work only after the v1 TDE and
    policy surfaces have production feedback and a follow-up ADR.
-10. Promote backlog items into TODO only after the top adoption blockers have
+9. Promote backlog items into TODO only after the top adoption blockers have
    ADR/spec coverage or active implementation ownership.
 
 ## Market Notes
