@@ -79,7 +79,7 @@ benchmarks that prove the durability/recovery complexity is worth it.
 
 ## 2. Product Goals
 
-- Reduce the visible gap between `decentdb_default_durable` and
+- Reduce the visible gap between `decentdb_balanced_durable` and
   `decentdb_tuned_durable` benchmark profiles.
 - Keep durable defaults durable: no default switch from full durable WAL sync to
   weaker acknowledgement semantics.
@@ -109,10 +109,16 @@ benchmarks that prove the durability/recovery complexity is worth it.
 
 The current release benchmark summary was aggregated on 2026-05-22 and uses the
 `single_thread_prepared_statement_oltp_with_concurrent_read_extension` profile.
-The default DecentDB profile is:
+This is the frozen planning baseline until rollout step 3 recaptures an
+accepted baseline on the expanded benchmark suite. If step 3 recaptures the
+baseline, update this section before judging implementation patches.
+
+The existing JSON names the current default row `decentdb_default_durable`.
+Within this spec, that row is the baseline for the canonical release profile
+`decentdb_balanced_durable`:
 
 ```text
-decentdb_default_durable:wal_sync_full cache_size_mb=4
+decentdb_balanced_durable baseline: wal_sync_full cache_size_mb=4
 ```
 
 The tuned DecentDB profile is:
@@ -123,7 +129,7 @@ decentdb_tuned_durable:wal_sync_full cache_size_mb=64 retain_paged_row_sources_a
 
 Representative current p95 values:
 
-| Metric | Default Durable | Tuned Durable | SQLite WAL FULL |
+| Metric | Balanced Baseline | Tuned Durable | SQLite WAL FULL |
 |---|---:|---:|---:|
 | Point read p95 | 0.0169598 ms | 0.001907 ms | 0.0034974 ms |
 | Range scan p95 | 0.6764458 ms | 0.012146 ms | 0.011377 ms |
@@ -153,10 +159,11 @@ This baseline shows five separate problems:
 
 This win is complete only when all of these are true:
 
-- `decentdb_default_durable` release benchmarks improve against the accepted
+- `decentdb_balanced_durable` release benchmarks improve against the accepted
   baseline without weakening `WalSyncMode::Full`.
-- Release assets include native default durable, native tuned durable, and at
-  least one maintained binding profile for the targeted hot paths.
+- Release assets include native `decentdb_balanced_durable`, native
+  `decentdb_tuned_durable`, and at least one maintained binding profile for the
+  targeted hot paths.
 - Browser and mobile guardrails exist for any work that claims startup,
   first-query, result materialization, or package/runtime improvements on those
   surfaces.
@@ -181,18 +188,24 @@ benchmark slices from section 6 and record accepted target thresholds. Those
 targets may refine the provisional bands below, but they must be committed to
 the spec or an accepted benchmark note before performance patches are judged.
 
+Ratio targets are valid only when the default profile improves. A target is not
+met by making the tuned profile slower. Tuned durable, SQLite, and DuckDB
+comparison profiles must remain within accepted benchmark noise or be explicitly
+rebaselined with a reason before ratio-based success is claimed.
+
 Provisional phase-1 targets:
 
 | Metric Category | Target Band |
 |---|---|
-| Point reads | Reduce default/tuned p95 ratio from about 9x to 4x or better. |
-| Concurrent reads | Reduce default/tuned p95 ratio from about 7x to 4x or better and remain no worse than SQLite WAL FULL. |
-| Range scans and aggregates | Reduce the default/tuned p95 ratio by at least 3x from the current baseline. |
-| Joins | Reduce the default/tuned p95 ratio by at least 2x from the current baseline. |
-| Durable commit p95 | Improve default p95 by at least 20% without weakening `WalSyncMode::Full`. |
-| Insert throughput | Improve default throughput by at least 10%, or explicitly defer the remaining gap with benchmark evidence that it requires format/write-path work. |
-| Storage size | Do not regress combined main database plus WAL size; improve phase-1 size by at least 5% where existing checkpoint/freelist/rewrite mechanisms can do so. |
-| Cold open and first query | Establish accepted p95 baselines for small, medium, and large databases, then improve targeted profiles by at least 20%. |
+| Point reads | Reduce default/tuned p95 ratio from about 9x to 4x or better, with `decentdb_balanced_durable` point-read p95 no worse than 0.008 ms on the accepted baseline lane. |
+| Concurrent reads | Reduce default/tuned p95 ratio from about 7x to 4x or better, with `decentdb_balanced_durable` concurrent-read p95 no worse than 0.023 ms on the accepted baseline lane. |
+| Range scans | Reduce default/tuned p95 ratio by at least 3x from the current baseline, with `decentdb_balanced_durable` range-scan p95 no worse than 0.25 ms. |
+| Aggregates | Reduce default/tuned p95 ratio by at least 3x from the current baseline, with `decentdb_balanced_durable` aggregate p95 no worse than 0.05 ms. |
+| Joins | Reduce default/tuned p95 ratio by at least 2x from the current baseline, with `decentdb_balanced_durable` join p95 no worse than 0.016 ms. |
+| Durable commit p95 | Improve default p95 by at least 20%, with `decentdb_balanced_durable` commit p95 no worse than 0.75 ms and without weakening `WalSyncMode::Full`. |
+| Insert throughput | Improve default throughput by at least 10%, with `decentdb_balanced_durable` insert throughput at or above 1,775,000 rows/sec on the accepted baseline lane, or explicitly defer the remaining gap with benchmark evidence that it requires format/write-path work. |
+| Storage size | Do not regress `decentdb_balanced_durable` combined main database plus WAL size after checkpoint; improve that combined size by at least 5% from the accepted baseline where existing checkpoint/freelist/rewrite mechanisms can do so. The current denominator is 3.6914 MiB. |
+| Cold open and first query | Establish accepted p95 baselines for small, medium, and large databases, then improve targeted `decentdb_balanced_durable` profiles by at least 20%. |
 
 If a target is infeasible after benchmark evidence, the spec must be updated
 with the measured reason and the follow-up design path, such as a format ADR.
@@ -220,7 +233,9 @@ Release assets must describe competitor durability settings precisely enough
 that readers can compare latency and safety together. For DuckDB, the metadata
 must state the engine-default durability mode used by the benchmark and any
 threading limitation, such as single-threaded execution or non-`Send`
-connections.
+connections. Until the benchmark records exact DuckDB PRAGMAs/settings and
+durability guarantees, the DuckDB row must be labeled as `duckdb_engine_default`
+and not presented as a full-sync WAL peer.
 
 The first maintained binding profile is Python. Python should exercise the
 stable C ABI prepared-statement and result APIs directly and report both
@@ -241,6 +256,14 @@ The native benchmark suite must continue to cover:
 - concurrent prepared point lookups;
 - final size after checkpoint.
 
+The canonical concurrent-read workload is four reader threads, each executing
+25,000 prepared point lookups over a deterministic permutation. It is read-only:
+no writer is active during the baseline concurrent-read measurement, and reader
+threads keep their prepared statements alive for the duration of the run. Any
+active-writer concurrency claim requires a separately named mixed workload with
+the writer cadence, commit mode, reader lifetime, and checkpoint behavior
+recorded in metadata.
+
 New default-fast work should add:
 
 - cold open;
@@ -258,11 +281,24 @@ OS-page-cache eviction such as `posix_fadvise(DONTNEED)` where available,
 isolated temporary storage, or an intentionally warm cache. Release charts must
 not mix cold and warm results under one label.
 
+Cold-open fixtures must use a stable OLTP-ish schema shape, not only row counts:
+
+- one primary table with an `INT64` primary key, at least six scalar columns,
+  and one variable-width `TEXT` or `BLOB` payload column;
+- one child table with a foreign key to the primary table;
+- primary-key indexes plus at least three secondary B+Tree indexes, including
+  one composite index and one `INCLUDE (...)` covering-index candidate;
+- medium and large fixtures must include overflow pages by making at least 10%
+  of payload values larger than one page payload;
+- small fixtures use the same schema at 10,000 rows, medium fixtures use
+  1,000,000 rows, and large fixtures use 10,000,000 rows or a fixed 1-2 GiB
+  database, whichever is more practical for release validation.
+
 ### 6.3 Baseline Policy
 
 Every performance change must say which baseline it targets:
 
-- default durable native;
+- `decentdb_balanced_durable` native;
 - tuned durable native;
 - binding path;
 - browser/WASM;
@@ -273,6 +309,21 @@ Every performance change must say which baseline it targets:
 Any regression accepted for one metric must be paired with an explicit product
 reason and a compensating win. Durable commit p95, correctness, and recovery
 behavior are not acceptable regression sinks for read benchmark wins.
+
+### 6.4 Regression Guardrails
+
+Default-fast benchmarks are enforced in three lanes:
+
+| Lane | Scope | Enforcement |
+|---|---|---|
+| PR targeted | Required for patches that claim performance, storage, cache, planner, executor, binding, WAL, or checkpoint improvements. | Blocks the patch when a targeted p95 latency regresses by more than 10%, throughput regresses by more than 10%, storage size regresses by more than 5%, or memory regresses by more than 10% without an accepted explanation. |
+| Nightly full | Runs the expanded native default/tuned, storage, cold-open, and selected binding suite. | Opens or updates a benchmark regression issue owned by benchmark maintainers and the touched area owner. |
+| Release blocking | Runs the full accepted profile matrix before publishing release assets. | Blocks release if any accepted target regresses beyond threshold without an approved baseline update. |
+
+Benchmark maintainers own harness reliability and baseline updates. Area
+maintainers own triage for regressions in their subsystem. If noise makes a
+threshold unreliable, the benchmark must be fixed or relabeled before it can be
+used as a release-blocking gate.
 
 ## 7. Implementation Tracks
 
@@ -294,9 +345,9 @@ reason it is appropriate for embedded app defaults.
 
 The default page cache size is the leading first-phase hypothesis. The current
 benchmark gap compares a 4 MiB default profile with a 64 MiB tuned profile, so
-the first benchmark slice must sweep at least 4, 8, 16, 32, and 64 MiB under the
-same durable settings before changing deeper executor or storage code for read
-latency. The first serious default candidate is 16 MiB. Move the balanced
+the first benchmark slice must sweep at least 4, 8, 16, 24, 32, and 64 MiB
+under the same durable settings before changing deeper executor or storage code
+for read latency. The first serious default candidate is 16 MiB. Move the balanced
 default to 32 MiB only if benchmarks show a clear cross-workload win over
 16 MiB across point, concurrent, range, join, aggregate, browser/mobile, and
 memory profiles.
@@ -321,6 +372,10 @@ Optimize open and first-use behavior around:
 
 Cold-open changes must preserve crash recovery semantics and cross-process
 coordination rules.
+
+Deferred table materialization refers to the ADR 0143 open-time behavior where
+table row data stays unloaded until a statement needs it. Cold-open benchmarks
+must report whether first-query latency includes deferred table load work.
 
 Open-time checkpoint tuning must be measured separately from query execution so
 first-query wins are not hiding longer open latency or surprise checkpoint work.
@@ -361,14 +416,15 @@ should make that data more useful without making it mandatory ritual:
 New persisted statistics fields require format/migration analysis before
 implementation.
 
-Named profiles are accepted as user-facing helpers, but open-time knobs remain
-the authoritative configuration contract. The initial profile set is:
+Named profile helpers are accepted, but open-time knobs remain the authoritative
+configuration contract. Each helper maps to one canonical release benchmark
+profile:
 
-| Profile | Direction |
-|---|---|
-| `balanced` | Default durable profile, using the accepted cache-size result from the sweep. Start from a 16 MiB candidate. |
-| `low_memory` | Constrained-host durable profile, initially 4 MiB unless benchmark evidence changes it. |
-| `tuned_durable` | Explicit high-memory durable profile for benchmark and power-user tuning. |
+| Helper | Canonical Release Profile | Direction |
+|---|---|---|
+| `balanced` | `decentdb_balanced_durable` | Default durable profile, using the accepted cache-size result from the sweep. Start from a 16 MiB candidate. |
+| `low_memory` | `decentdb_low_memory_durable` | Constrained-host durable profile, initially 4 MiB unless benchmark evidence changes it. |
+| `tuned_durable` | `decentdb_tuned_durable` | Explicit high-memory durable profile for benchmark and power-user tuning. |
 
 ### 7.5 Binding And Result Materialization Hot Paths
 
@@ -409,6 +465,13 @@ avoidable rewrites, freelist/trailing-page waste, and checkpoint behavior. Page
 density, key-prefix encoding, and compression belong in later ADR-backed work if
 the measured residual gap is still product-significant.
 
+TDE interaction must be explicit even when no behavior changes are intended.
+Default cache-size changes should not extend encryption key lifetime beyond the
+open database handle, should not add key material to metrics or benchmark
+metadata, and should not change re-key behavior. Checkpoint or WAL changes must
+run at least one TDE-enabled recovery/checkpoint smoke before release because
+TDE wraps database and WAL bytes on the same logical paths.
+
 Potential later work:
 
 - page-level compression;
@@ -436,7 +499,9 @@ explain them. Acceptable examples:
 - checkpoint is blocked by process reader slots;
 - database has high freelist fragmentation and a safe vacuum workflow exists;
 - index is stale or verification fails;
-- cache is undersized based on observed cache metrics, not only file size.
+- cache is undersized based on observed cache metrics, not only file size;
+- page-cache hit/miss ratio or eviction rate shows working-set pressure, once
+  those metrics are exposed through stable runtime surfaces.
 
 Doctor must not recommend unsafe durability downgrades.
 
@@ -454,7 +519,7 @@ Minimum validation for each implementation slice:
 | `ANALYZE`/stats | stats persistence tests, no-stats fallback tests, plan tests |
 | Binding hot path | C ABI tests plus impacted binding smoke/benchmark |
 | WASM/mobile | browser/mobile benchmark guardrails and lifecycle smoke |
-| Storage format | ADR, migration parser, crash/recovery, compatibility tests |
+| Future storage format phase | ADR, migration parser, crash/recovery, compatibility tests |
 
 Memory-bound checks must include any platform surface affected by the default
 change. Native checks report RSS where available; browser checks report WASM
@@ -497,12 +562,17 @@ Update user-facing docs when public behavior changes:
 
 ## 11. Rollout Plan
 
+ADR dependency: if ADR 0184 is delayed, rejected, or reopened in a branch,
+planner/executor work from sections 7.3 and 7.4 is blocked. Benchmark harness
+work, profile naming, cache sweeps, binding benchmarks, and documentation can
+still proceed because they do not depend on the ADR's covering-index contract.
+
 1. Land this spec and ADR 0184.
 2. Add benchmark slices for cold open, first query, storage size, and binding
    prepared-statement paths.
 3. Run baseline measurements and record accepted targets. This is a gate before
    default tuning or planner/executor changes are judged complete.
-4. Run the 4/8/16/32/64 MiB cache sweep, using 16 MiB as the first balanced
+4. Run the 4/8/16/24/32/64 MiB cache sweep, using 16 MiB as the first balanced
    default candidate and preserving an explicit low-memory profile.
 5. Add Python as the first maintained binding benchmark profile.
 6. Add cold-open fixtures for small, medium, and large databases using the
@@ -517,8 +587,8 @@ Update user-facing docs when public behavior changes:
 ## 12. Accepted Recommendations
 
 - Use 16 MiB as the first balanced default cache-size candidate. Still run the
-  full 4/8/16/32/64 MiB sweep, keep 4 MiB available as `low_memory`, and move to
-  32 MiB only if it is clearly better across the full benchmark and memory
+  full 4/8/16/24/32/64 MiB sweep, keep 4 MiB available as `low_memory`, and move
+  to 32 MiB only if it is clearly better across the full benchmark and memory
   matrix.
 - Add named profile helpers while keeping open-time knobs authoritative. The
   accepted profile names are `balanced`, `low_memory`, and `tuned_durable`.
