@@ -831,7 +831,7 @@ dependencies = [
 
 [[package]]
 name = "decentdb"
-version = "2.7.0"
+version = "2.8.0"
 dependencies = [
  "base64 0.22.1",
  "chacha20",
@@ -867,7 +867,7 @@ dependencies = [
 
 [[package]]
 name = "decentdb-benchmark"
-version = "2.7.0"
+version = "2.8.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -881,7 +881,7 @@ dependencies = [
 
 [[package]]
 name = "decentdb-cli"
-version = "2.7.0"
+version = "2.8.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -895,7 +895,7 @@ dependencies = [
 
 [[package]]
 name = "decentdb-migrate"
-version = "2.7.0"
+version = "2.8.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1859,7 +1859,7 @@ dependencies = [
 
 [[package]]
 name = "libpg_query_sys"
-version = "2.7.0"
+version = "2.8.0"
 dependencies = [
  "pg_query",
 ]

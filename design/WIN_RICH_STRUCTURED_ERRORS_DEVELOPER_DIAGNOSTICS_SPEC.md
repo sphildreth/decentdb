@@ -2,7 +2,7 @@
 
 **Date:** 2026-05-28
 **Status:** DELIVERED
-**Delivered Version:** vNext
+**Delivered Version:** 2.8.0
 **Delivery note:** Implemented with stable structured diagnostics across Rust/C ABI, CLI/HTTP/WASM, and maintained bindings. Docs, fixtures, and validation now cover the first-slice contract.
 **Roadmap:** [`FUTURE_WINS.md`](FUTURE_WINS.md)
 **Document Type:** Implementation SPEC
@@ -10,8 +10,8 @@
 binding maintainers, WASM/browser maintainers, sync maintainers, Doctor and
 tooling authors, documentation authors, coding agents
 
-`vNext` means the first release bucket after 2.7.0. This delivered slice does
-not promise that every possible future subcode is already covered.
+Delivered in 2.8.0. This delivered slice does not promise that every possible
+future subcode is already covered.
 
 **Governing ADRs:**
 

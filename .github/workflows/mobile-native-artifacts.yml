@@ -35,11 +35,12 @@ jobs:
   android:
     name: Android mobile artifacts
     runs-on: ubuntu-latest
-    env:
-      MOBILE_ARTIFACT_ROOT: "${{ runner.temp }}/decentdb-mobile-artifacts/android"
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+
+      - name: Set artifact root
+        run: echo "MOBILE_ARTIFACT_ROOT=$RUNNER_TEMP/decentdb-mobile-artifacts/android" >> "$GITHUB_ENV"
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
@@ -71,7 +72,7 @@ jobs:
       - name: Record Android guardrails
         run: bash bindings/dart/scripts/mobile_benchmark_guardrails.sh \
           --android-root "$MOBILE_ARTIFACT_ROOT" \
-          --ios-root "${{ runner.temp }}/missing-ios" \
+          --ios-root "$RUNNER_TEMP/missing-ios" \
           --output "$MOBILE_ARTIFACT_ROOT/mobile-guardrails.json"
 
       - name: Package Android artifacts
@@ -97,11 +98,12 @@ jobs:
   ios:
     name: iOS mobile artifacts
     runs-on: macos-latest
-    env:
-      MOBILE_ARTIFACT_ROOT: "${{ runner.temp }}/decentdb-mobile-artifacts/ios"
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+
+      - name: Set artifact root
+        run: echo "MOBILE_ARTIFACT_ROOT=$RUNNER_TEMP/decentdb-mobile-artifacts/ios" >> "$GITHUB_ENV"
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
@@ -132,7 +134,7 @@ jobs:
 
       - name: Record iOS guardrails
         run: bash bindings/dart/scripts/mobile_benchmark_guardrails.sh \
-          --android-root "${{ runner.temp }}/missing-android" \
+          --android-root "$RUNNER_TEMP/missing-android" \
           --ios-root "$MOBILE_ARTIFACT_ROOT" \
           --output "$MOBILE_ARTIFACT_ROOT/mobile-guardrails.json"
 

@@ -84,6 +84,92 @@ def expect_json_version(
             )
 
 
+def expect_dart_path_lock_versions(
+    root: Path,
+    relative_path: str,
+    expected: str,
+    issues: list[str],
+    package_names: tuple[str, ...],
+) -> None:
+    text = read_text(root / relative_path, issues)
+    if not text:
+        return
+
+    wanted = set(package_names)
+    actuals: dict[str, str] = {}
+    current_package: str | None = None
+    source_is_path = False
+
+    for line in text.splitlines():
+        package_match = re.match(r"^  ([A-Za-z0-9_]+):\s*$", line)
+        if package_match:
+            current_package = package_match.group(1)
+            source_is_path = False
+            continue
+        if current_package in wanted and line.strip() == "source: path":
+            source_is_path = True
+            continue
+        if current_package in wanted and source_is_path:
+            version_match = re.match(r'^    version: "([^"]+)"\s*$', line)
+            if version_match:
+                actuals[current_package] = version_match.group(1)
+
+    for package_name in package_names:
+        actual = actuals.get(package_name)
+        if actual is None:
+            issues.append(
+                f"{relative_path} missing path package version for {package_name}"
+            )
+        elif actual != expected:
+            issues.append(
+                f"{relative_path} path package {package_name} version is "
+                f"{actual!r}, expected {expected!r}"
+            )
+
+
+def expect_cargo_lock_path_versions(
+    root: Path,
+    relative_path: str,
+    expected: str,
+    issues: list[str],
+    package_names: tuple[str, ...],
+) -> None:
+    text = read_text(root / relative_path, issues)
+    if not text:
+        return
+
+    wanted = set(package_names)
+    actuals: dict[str, str] = {}
+    chunks = re.split(r"(?m)(?=^\[\[package\]\]$)", text)
+
+    for chunk in chunks:
+        name_match = re.search(r'^name = "([^"]+)"$', chunk, flags=re.MULTILINE)
+        if not name_match:
+            continue
+        package_name = name_match.group(1)
+        if package_name not in wanted:
+            continue
+        if re.search(r"^source = ", chunk, flags=re.MULTILINE):
+            continue
+        version_match = re.search(
+            r'^version = "([^"]+)"$', chunk, flags=re.MULTILINE
+        )
+        if version_match:
+            actuals[package_name] = version_match.group(1)
+
+    for package_name in package_names:
+        actual = actuals.get(package_name)
+        if actual is None:
+            issues.append(
+                f"{relative_path} missing path package version for {package_name}"
+            )
+        elif actual != expected:
+            issues.append(
+                f"{relative_path} path package {package_name} version is "
+                f"{actual!r}, expected {expected!r}"
+            )
+
+
 def git_path_changed(root: Path, relative_path: str) -> bool:
     try:
         unstaged = subprocess.run(
@@ -188,6 +274,72 @@ def validate(root: Path) -> int:
             "pubspec version",
             issues,
         )
+        expect_regex(
+            root,
+            "bindings/dart/flutter/android/build.gradle",
+            r"^version\s*=\s*'([^']+)'",
+            version,
+            "Gradle version",
+            issues,
+        )
+        expect_regex(
+            root,
+            "bindings/dart/flutter/ios/decentdb_flutter.podspec",
+            r"^\s*s\.version\s*=\s*'([^']+)'",
+            version,
+            "podspec version",
+            issues,
+        )
+        expect_regex(
+            root,
+            "bindings/dart/flutter/example/pubspec.yaml",
+            r"^version:\s*([^\r\n]+)",
+            version,
+            "reference app version",
+            issues,
+        )
+        expect_dart_path_lock_versions(
+            root,
+            "bindings/dart/flutter/pubspec.lock",
+            version,
+            issues,
+            ("decentdb",),
+        )
+        expect_dart_path_lock_versions(
+            root,
+            "bindings/dart/flutter/example/pubspec.lock",
+            version,
+            issues,
+            ("decentdb", "decentdb_flutter"),
+        )
+        expect_dart_path_lock_versions(
+            root,
+            "bindings/dart/examples/console/pubspec.lock",
+            version,
+            issues,
+            ("decentdb",),
+        )
+        expect_dart_path_lock_versions(
+            root,
+            "bindings/dart/examples/console_complex/pubspec.lock",
+            version,
+            issues,
+            ("decentdb",),
+        )
+        expect_dart_path_lock_versions(
+            root,
+            "bindings/dart/examples/flutter_desktop/pubspec.lock",
+            version,
+            issues,
+            ("decentdb",),
+        )
+        expect_dart_path_lock_versions(
+            root,
+            "tests/bindings/dart/pubspec.lock",
+            version,
+            issues,
+            ("decentdb",),
+        )
         expect_json_version(
             root,
             "bindings/node/decentdb/package.json",
@@ -215,11 +367,47 @@ def validate(root: Path) -> int:
             issues,
             package_paths=("", "../decentdb"),
         )
+        expect_cargo_lock_path_versions(
+            root,
+            "benchmarks/rust-baseline/Cargo.lock",
+            version,
+            issues,
+            ("decentdb", "libpg_query_sys"),
+        )
+        expect_regex(
+            root,
+            "docs/user-guide/benchmarks.md",
+            r"^\| DecentDB \|\s*([^|]+?)\s*\| Workspace package version \|",
+            version,
+            "benchmark version stamp",
+            issues,
+        )
+        expect_regex(
+            root,
+            "design/FUTURE_WINS.md",
+            r"public release in this repository is `([^`]+)`",
+            version,
+            "current public release marker",
+            issues,
+        )
+        expect_regex(
+            root,
+            "design/FUTURE_WINS.md",
+            r"bucket after `([^`]+)` only when scope is explicitly accepted",
+            version,
+            "vNext base release marker",
+            issues,
+        )
 
     changelog = root / "docs/about/changelog.md"
     changelog_text = read_text(changelog, issues)
     if changelog_text and "Unreleased" not in changelog_text:
-        issues.append("docs/about/changelog.md has no Unreleased release bucket")
+        current_heading = f"## [{version}]"
+        if current_heading not in changelog_text:
+            issues.append(
+                "docs/about/changelog.md has neither an Unreleased bucket nor "
+                f"a {current_heading} release heading"
+            )
 
     if git_path_changed(root, "CHANGELOG.md"):
         issues.append(

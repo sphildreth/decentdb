@@ -2,16 +2,15 @@
 
 **Date:** 2026-05-27
 **Status:** Delivered
-**Future Version:** vNext
+**Delivered Version:** 2.8.0
 **Roadmap:** [`FUTURE_WINS.md`](FUTURE_WINS.md)
 **Document Type:** Implementation SPEC
 **Audience:** Core engine maintainers, planner and executor maintainers, WAL and
 storage maintainers, binding maintainers, benchmark maintainers, documentation
 authors, coding agents
 
-`vNext` means the first release bucket after 2.7.0 only after this scope is
-explicitly accepted. It is not a promise that every follow-up listed here lands
-in that release.
+Delivered in 2.8.0. This document is not a promise that every follow-up listed
+here lands in the same release.
 
 **Governing ADRs:**
 
