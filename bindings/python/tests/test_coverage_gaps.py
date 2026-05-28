@@ -120,7 +120,16 @@ def test_raise_error_types(db_path):
     cur.execute("INSERT INTO uniq_tab VALUES (1)")
     with pytest.raises(decentdb.IntegrityError) as excinfo:
         cur.execute("INSERT INTO uniq_tab VALUES (1)")
-    assert "Context:" in str(excinfo.value)
+    error = excinfo.value
+    assert "unique constraint" in str(error)
+    assert "Context:" not in str(error)
+    assert error.native_code == decentdb.native.ERR_CONSTRAINT
+    assert error.code_name == "ERR_CONSTRAINT"
+    assert error.subcode == "constraint.unique"
+    assert error.sqlstate == "23505"
+    assert error.retryable is False
+    assert error.permanent is True
+    assert error.diagnostic["docs"] == "errors/constraint-unique"
     
 def test_can_defer_select_rebinding(db_path, monkeypatch):
     monkeypatch.setenv("DECENTDB_PY_USE_ROW_VIEW", "0")
@@ -394,4 +403,3 @@ def test_missing_line_942_947(db_path, monkeypatch):
     # 942: calling info on closed connection
     with pytest.raises(ProgrammingError):
         conn.list_tables()
-

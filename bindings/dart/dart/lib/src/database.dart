@@ -94,7 +94,12 @@ class Database {
   Never _throwStatus(int status, String fallback) {
     final msgPtr = _bindings.lastErrorMessage();
     final msg = msgPtr == nullptr ? fallback : msgPtr.toDartString();
-    throw DecentDbException(ErrorCode.fromCode(status), msg);
+    final diagnostic = _bindings.takeLastErrorDiagnostic();
+    throw DecentDbException(
+      ErrorCode.fromCode(status),
+      msg,
+      diagnostic: diagnostic,
+    );
   }
 
   // ---------------------------------------------------------------------------
@@ -153,7 +158,12 @@ class Database {
         final msg = msgPtr == nullptr
             ? 'Failed to open database at $path'
             : msgPtr.toDartString();
-        throw DecentDbException(ErrorCode.fromCode(status), msg);
+        final diagnostic = nb.takeLastErrorDiagnostic();
+        throw DecentDbException(
+          ErrorCode.fromCode(status),
+          msg,
+          diagnostic: diagnostic,
+        );
       }
       return Database._(nb, outDb.value, stmtCacheCapacity: stmtCacheCapacity);
     } finally {
@@ -268,7 +278,12 @@ class Database {
         final msg = msgPtr == nullptr
             ? 'Failed to evict shared WAL for $path'
             : msgPtr.toDartString();
-        throw DecentDbException(ErrorCode.fromCode(status), msg);
+        final diagnostic = nb.takeLastErrorDiagnostic();
+        throw DecentDbException(
+          ErrorCode.fromCode(status),
+          msg,
+          diagnostic: diagnostic,
+        );
       }
     } finally {
       calloc.free(nativePath);

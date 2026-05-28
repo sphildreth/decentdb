@@ -172,12 +172,41 @@ export type RequestPayload<K extends RpcKind> = Extract<RpcRequest, { kind: K }>
 export class DecentDBWebError extends Error {
   public readonly code: string;
   public readonly details?: string;
+  public readonly nativeCode?: number;
+  public readonly subcode?: string;
+  public readonly sqlstate?: string;
+  public readonly retryable?: boolean;
+  public readonly permanent?: boolean;
+  public readonly diagnostic?: Record<string, unknown>;
+  public readonly diagnosticJson?: string;
 
   constructor(payload: QueryErrorPayload) {
     super(payload.message);
     this.name = "DecentDBWebError";
     this.code = payload.code;
     this.details = payload.details;
+    this.nativeCode = payload.nativeCode;
+    this.subcode = payload.subcode;
+    this.sqlstate = payload.sqlstate;
+    this.retryable = payload.retryable;
+    this.permanent = payload.permanent;
+    this.diagnostic = payload.diagnostic;
+    this.diagnosticJson = payload.diagnosticJson;
+  }
+
+  toPayload(): QueryErrorPayload {
+    return {
+      code: this.code,
+      message: this.message,
+      details: this.details,
+      nativeCode: this.nativeCode,
+      subcode: this.subcode,
+      sqlstate: this.sqlstate,
+      retryable: this.retryable,
+      permanent: this.permanent,
+      diagnostic: this.diagnostic,
+      diagnosticJson: this.diagnosticJson,
+    };
   }
 }
 
@@ -566,7 +595,7 @@ function bindOwnerCoordinator(owner: OwnerCoordinator): void {
       .catch((error: unknown) => {
         const payload =
           error instanceof DecentDBWebError
-            ? createErrorPayload(error.code, error.message, error.details)
+            ? error.toPayload()
             : createErrorPayload(
                 ERR_OPERATION_FAILED,
                 "Owner request failed.",

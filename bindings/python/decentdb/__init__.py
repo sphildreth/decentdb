@@ -76,7 +76,18 @@ _BINARY_BYTES_TAGS = (DDB_VALUE_BLOB, DDB_VALUE_GEOMETRY, DDB_VALUE_GEOGRAPHY)
 
 
 class Error(Exception):
-    pass
+    def __init__(self, message="", *, diagnostic=None, native_code=None):
+        super().__init__(message)
+        self.diagnostic = diagnostic
+        self.native_code = native_code if native_code is not None else (
+            diagnostic.get("code") if isinstance(diagnostic, Mapping) else None
+        )
+        self.code = self.native_code
+        self.code_name = diagnostic.get("code_name") if isinstance(diagnostic, Mapping) else None
+        self.subcode = diagnostic.get("subcode") if isinstance(diagnostic, Mapping) else None
+        self.sqlstate = diagnostic.get("sqlstate") if isinstance(diagnostic, Mapping) else None
+        self.retryable = diagnostic.get("retryable") if isinstance(diagnostic, Mapping) else None
+        self.permanent = diagnostic.get("permanent") if isinstance(diagnostic, Mapping) else None
 
 
 class Warning(Exception):
@@ -277,6 +288,22 @@ def _last_error_message():
     return message.decode("utf-8", errors="replace") if message else None
 
 
+def _last_error_diagnostic():
+    lib = load_library()
+    last_error_json = getattr(lib, "decentdb_last_error_json", None)
+    if last_error_json is None:
+        return None
+    out = ctypes.c_char_p()
+    status = last_error_json(ctypes.byref(out))
+    if status != ERR_OK or not out.value:
+        return None
+    try:
+        raw = ctypes.string_at(out).decode("utf-8", errors="replace")
+        return json.loads(raw)
+    finally:
+        lib.ddb_string_free(ctypes.byref(out))
+
+
 def _raise_error(code, *, sql=None, params=None):
     lib = load_library()
     if isinstance(code, int):
@@ -287,18 +314,13 @@ def _raise_error(code, *, sql=None, params=None):
             getattr(lib, "decentdb_last_error_code", lambda *_args: ERR_INTERNAL)(code)
         )
     message = _last_error_message() or f"Unknown error {native_code}"
+    diagnostic = _last_error_diagnostic()
     if native_code == ERR_TRANSACTION and "no active SQL transaction" in message:
         message = "No active transaction: " + message
-    if sql is not None:
-        context = {
-            "native_code": native_code,
-            "sql": sql,
-            "params": _format_params_for_error(params),
-        }
-        message += "\nContext: " + json.dumps(context, ensure_ascii=False)
+    _ = (sql, params)
 
     if native_code == ERR_CONSTRAINT:
-        raise IntegrityError(message)
+        raise IntegrityError(message, diagnostic=diagnostic, native_code=native_code)
     if native_code in (
         ERR_TRANSACTION,
         ERR_IO,
@@ -310,16 +332,16 @@ def _raise_error(code, *, sql=None, params=None):
         ERR_QUEUE_FULL,
         ERR_QUEUE_CLOSED,
     ):
-        raise OperationalError(message)
+        raise OperationalError(message, diagnostic=diagnostic, native_code=native_code)
     if native_code == ERR_SQL:
-        raise ProgrammingError(message)
+        raise ProgrammingError(message, diagnostic=diagnostic, native_code=native_code)
     if native_code == ERR_CORRUPTION:
-        raise DatabaseError(message)
+        raise DatabaseError(message, diagnostic=diagnostic, native_code=native_code)
     if native_code == ERR_INTERNAL:
-        raise InternalError(message)
+        raise InternalError(message, diagnostic=diagnostic, native_code=native_code)
     if native_code in (ERR_INVALID, ERR_PERMISSION, ERR_FULL, ERR_NOMEM, ERR_ERROR):
-        raise DatabaseError(message)
-    raise DatabaseError(message)
+        raise DatabaseError(message, diagnostic=diagnostic, native_code=native_code)
+    raise DatabaseError(message, diagnostic=diagnostic, native_code=native_code)
 
 
 def _encode_queued_param(value):

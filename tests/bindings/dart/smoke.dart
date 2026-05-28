@@ -183,6 +183,14 @@ void main() {
       e.message.contains('no_such_table_xyz'),
       'error message should reference the missing table: ${e.message}',
     );
+    _check(
+      e.subcode == 'sql.relation_not_found',
+      'expected sql.relation_not_found diagnostic, got ${e.subcode}',
+    );
+    _check(
+      e.diagnostic?.raw['relation'] == 'no_such_table_xyz',
+      'diagnostic should expose the missing relation: ${e.diagnostic?.raw}',
+    );
   }
 
   // -------------------------------------------------------------------------
@@ -208,9 +216,8 @@ void main() {
     typedInsert.dispose();
   }
 
-  final typedRow = db
-      .query('SELECT blob, dec, ts FROM typed WHERE id = 1')
-      .single;
+  final typedRow =
+      db.query('SELECT blob, dec, ts FROM typed WHERE id = 1').single;
   _check(
     (typedRow['blob'] as Uint8List).toString() == blobIn.toString(),
     'blob round-trip failed',

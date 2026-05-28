@@ -515,6 +515,21 @@ Java_com_decentdb_jdbc_DecentDBNative_dbLastErrorMessage(JNIEnv *env, jclass cls
     return cstr_to_jstring(env, msg);
 }
 
+JNIEXPORT jstring JNICALL
+Java_com_decentdb_jdbc_DecentDBNative_dbLastErrorJson(JNIEnv *env, jclass cls, jlong handle)
+{
+    (void)cls;
+    (void)handle;
+    char *json = NULL;
+    ddb_status_t status = ddb_last_error_json(&json);
+    if (status != DDB_OK || json == NULL) {
+        return NULL;
+    }
+    jstring result = cstr_to_jstring(env, json);
+    ddb_string_free(&json);
+    return result;
+}
+
 JNIEXPORT jint JNICALL
 Java_com_decentdb_jdbc_DecentDBNative_abiVersion(JNIEnv *env, jclass cls)
 {

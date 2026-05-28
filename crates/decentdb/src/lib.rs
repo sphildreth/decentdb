@@ -57,7 +57,12 @@ pub use crate::doctor::{
     DoctorMode, DoctorOptions, DoctorPathMode, DoctorRecommendation, DoctorReport, DoctorSeverity,
     DoctorStatus, DoctorSummary,
 };
-pub use crate::error::{DbError, DbErrorCode, Result};
+pub use crate::error::{
+    DbDiagnostic, DbDiagnosticAuditContext, DbDiagnosticContext, DbDiagnosticOpenOptions,
+    DbDiagnosticParameter, DbDiagnosticPath, DbDiagnosticPathKind, DbDiagnosticRedaction,
+    DbDiagnosticSyncToken, DbDoctorHandoff, DbDoctorHandoffKind, DbError, DbErrorCode, Result,
+    DIAGNOSTIC_VERSION,
+};
 pub use crate::exec::{BulkLoadOptions, QueryResult, QueryRow};
 pub use crate::extensions::{
     validate_extension_package, Ed25519SignatureVerifier, ExtensionDependencyRecord,

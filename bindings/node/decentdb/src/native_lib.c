@@ -41,6 +41,7 @@
 typedef ddb_status_t (*fn_abi_version_t)(void);
 typedef const char* (*fn_version_t)(void);
 typedef const char* (*fn_last_error_message_t)(void);
+typedef ddb_status_t (*fn_last_error_json_t)(char** out_json);
 typedef ddb_status_t (*fn_string_free_t)(char** value);
 typedef ddb_status_t (*fn_db_create_t)(const char* path, ddb_db_t** out_db);
 typedef ddb_status_t (*fn_db_create_with_options_t)(const char* path, const char* options, ddb_db_t** out_db);
@@ -117,6 +118,7 @@ static struct {
   fn_abi_version_t abi_version;
   fn_version_t version;
   fn_last_error_message_t last_error_message;
+  fn_last_error_json_t last_error_json;
   fn_string_free_t string_free;
   fn_db_create_t db_create;
   fn_db_create_with_options_t db_create_with_options;
@@ -411,6 +413,14 @@ static int wrap_last_error_code(decentdb_db* db) {
 static const char* wrap_last_error_message(decentdb_db* db) {
   (void)db;
   return current_last_error_message();
+}
+
+static const char* wrap_last_error_json(decentdb_db* db) {
+  (void)db;
+  if (!g_sym.last_error_json) return NULL;
+  char* out = NULL;
+  ddb_status_t status = g_sym.last_error_json(&out);
+  return status == DDB_OK ? out : NULL;
 }
 
 static int wrap_prepare(decentdb_db* db, const char* sql_utf8, decentdb_stmt** out_stmt) {
@@ -823,6 +833,7 @@ static int resolve_all(DL_HANDLE h) {
   g_sym.abi_version = (fn_abi_version_t)load_sym(h, "ddb_abi_version");
   g_sym.version = (fn_version_t)load_sym(h, "ddb_version");
   g_sym.last_error_message = (fn_last_error_message_t)load_sym(h, "ddb_last_error_message");
+  g_sym.last_error_json = (fn_last_error_json_t)load_sym(h, "ddb_last_error_json");
   g_sym.string_free = (fn_string_free_t)load_sym(h, "ddb_string_free");
   g_sym.db_create = (fn_db_create_t)load_sym(h, "ddb_db_create");
   g_sym.db_create_with_options =
@@ -940,6 +951,7 @@ static int resolve_all(DL_HANDLE h) {
   g_api.write_queue_metrics = wrap_write_queue_metrics;
   g_api.last_error_code = wrap_last_error_code;
   g_api.last_error_message = wrap_last_error_message;
+  g_api.last_error_json = wrap_last_error_json;
   g_api.prepare = wrap_prepare;
   g_api.bind_null = wrap_bind_null;
   g_api.bind_int64 = wrap_bind_int64;

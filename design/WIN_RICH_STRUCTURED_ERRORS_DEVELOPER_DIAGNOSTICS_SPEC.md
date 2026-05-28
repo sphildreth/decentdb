@@ -1,17 +1,17 @@
 # Rich Structured Errors And Developer Diagnostics
 
 **Date:** 2026-05-28
-**Status:** TODO
-**Future Version:** vNext
+**Status:** DELIVERED
+**Delivered Version:** vNext
+**Delivery note:** Implemented with stable structured diagnostics across Rust/C ABI, CLI/HTTP/WASM, and maintained bindings. Docs, fixtures, and validation now cover the first-slice contract.
 **Roadmap:** [`FUTURE_WINS.md`](FUTURE_WINS.md)
 **Document Type:** Implementation SPEC
 **Audience:** Core engine maintainers, C ABI maintainers, CLI maintainers,
 binding maintainers, WASM/browser maintainers, sync maintainers, Doctor and
 tooling authors, documentation authors, coding agents
 
-`vNext` means the first release bucket after 2.7.0 only after this scope is
-explicitly accepted. It is not a promise that every possible subcode lands in
-the first implementation slice.
+`vNext` means the first release bucket after 2.7.0. This delivered slice does
+not promise that every possible future subcode is already covered.
 
 **Governing ADRs:**
 
@@ -19,7 +19,7 @@ the first implementation slice.
 - [`adr/0118-rust-ffi-panic-safety.md`](adr/0118-rust-ffi-panic-safety.md)
 - [`adr/0185-rich-structured-error-diagnostics-contract.md`](adr/0185-rich-structured-error-diagnostics-contract.md)
 
-**Required follow-up ADRs before implementation:**
+**ADR-required follow-up decisions:**
 
 - New top-level numeric C ABI status codes beyond the existing broad categories.
 - Any error or diagnostic change that exposes raw parameters, full SQL text,

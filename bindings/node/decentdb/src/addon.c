@@ -241,9 +241,11 @@ typedef struct {
   int rc;
   int native_err_code;
   char native_err_msg[512];
+  char native_err_json[2048];
 } async_step_data;
 
 static napi_value build_row_array(napi_env env, const decentdb_native_api* api, decentdb_stmt* stmt);
+static void free_native_owned_string(const decentdb_native_api* api, const char* ptr);
 
 static void free_batch_buffers(
     int64_t* ids,
@@ -281,6 +283,26 @@ static napi_value throw_error(napi_env env, const char* code, const char* msg) {
   return NULL;
 }
 
+static void copy_named_property(napi_env env, napi_value target, napi_value source, const char* name) {
+  bool has = false;
+  if (napi_has_named_property(env, source, name, &has) != napi_ok || !has) return;
+
+  napi_value value;
+  if (napi_get_named_property(env, source, name, &value) != napi_ok) return;
+  (void)napi_set_named_property(env, target, name, value);
+}
+
+static napi_status parse_json_value(napi_env env, napi_value raw, napi_value* out) {
+  napi_value global, json, parse;
+  napi_status st = napi_get_global(env, &global);
+  if (st != napi_ok) return st;
+  st = napi_get_named_property(env, global, "JSON", &json);
+  if (st != napi_ok) return st;
+  st = napi_get_named_property(env, json, "parse", &parse);
+  if (st != napi_ok) return st;
+  return napi_call_function(env, json, parse, 1, &raw, out);
+}
+
 static napi_value throw_last_native_error(napi_env env, const decentdb_native_api* api) {
   int code = 0;
   const char* msg = "native error";
@@ -291,7 +313,44 @@ static napi_value throw_last_native_error(napi_env env, const decentdb_native_ap
 
   char buf[768];
   snprintf(buf, sizeof(buf), "DecentDB native error (%d): %s", code, msg ? msg : "");
-  return throw_error(env, "DECENTDB_NATIVE", buf);
+
+  napi_value err, msgv, codev, native_codev;
+  napi_status st;
+  st = napi_create_string_utf8(env, buf, NAPI_AUTO_LENGTH, &msgv);
+  NAPI_CALL(env, st);
+  st = napi_create_error(env, NULL, msgv, &err);
+  NAPI_CALL(env, st);
+  st = napi_create_string_utf8(env, "DECENTDB_NATIVE", NAPI_AUTO_LENGTH, &codev);
+  NAPI_CALL(env, st);
+  st = napi_set_named_property(env, err, "code", codev);
+  NAPI_CALL(env, st);
+  st = napi_create_int32(env, code, &native_codev);
+  NAPI_CALL(env, st);
+  st = napi_set_named_property(env, err, "nativeCode", native_codev);
+  NAPI_CALL(env, st);
+
+  const char* diagnostic_json = NULL;
+  if (api && api->last_error_json) {
+    diagnostic_json = api->last_error_json(NULL);
+  }
+  if (diagnostic_json && diagnostic_json[0] != '\0') {
+    napi_value raw, diagnostic;
+    st = napi_create_string_utf8(env, diagnostic_json, NAPI_AUTO_LENGTH, &raw);
+    if (st == napi_ok) {
+      (void)napi_set_named_property(env, err, "diagnosticJson", raw);
+      if (parse_json_value(env, raw, &diagnostic) == napi_ok) {
+        (void)napi_set_named_property(env, err, "diagnostic", diagnostic);
+        copy_named_property(env, err, diagnostic, "subcode");
+        copy_named_property(env, err, diagnostic, "sqlstate");
+        copy_named_property(env, err, diagnostic, "retryable");
+        copy_named_property(env, err, diagnostic, "permanent");
+      }
+    }
+    free_native_owned_string(api, diagnostic_json);
+  }
+
+  napi_throw(env, err);
+  return NULL;
 }
 
 static void free_native_owned_string(const decentdb_native_api* api, const char* ptr) {
@@ -1624,6 +1683,15 @@ static void async_step_execute(napi_env env, void* data) {
     } else {
       d->native_err_msg[0] = '\0';
     }
+    d->native_err_json[0] = '\0';
+    if (d->api->last_error_json) {
+      const char* diagnostic_json = d->api->last_error_json(NULL);
+      if (diagnostic_json) {
+        strncpy(d->native_err_json, diagnostic_json, sizeof(d->native_err_json) - 1);
+        d->native_err_json[sizeof(d->native_err_json) - 1] = '\0';
+        free_native_owned_string(d->api, diagnostic_json);
+      }
+    }
   }
 }
 
@@ -1644,6 +1712,19 @@ static void async_step_complete(napi_env env, napi_status status, void* data) {
     snprintf(codeBuf, sizeof(codeBuf), "%d", d->native_err_code);
     napi_create_string_utf8(env, codeBuf, NAPI_AUTO_LENGTH, &codev);
     napi_set_named_property(env, err, "code", codev);
+    if (d->native_err_json[0] != '\0') {
+      napi_value raw, diagnostic;
+      if (napi_create_string_utf8(env, d->native_err_json, NAPI_AUTO_LENGTH, &raw) == napi_ok) {
+        (void)napi_set_named_property(env, err, "diagnosticJson", raw);
+        if (parse_json_value(env, raw, &diagnostic) == napi_ok) {
+          (void)napi_set_named_property(env, err, "diagnostic", diagnostic);
+          copy_named_property(env, err, diagnostic, "subcode");
+          copy_named_property(env, err, diagnostic, "sqlstate");
+          copy_named_property(env, err, diagnostic, "retryable");
+          copy_named_property(env, err, diagnostic, "permanent");
+        }
+      }
+    }
     napi_reject_deferred(env, d->deferred, err);
   } else if (d->rc == 0) {
     // Done

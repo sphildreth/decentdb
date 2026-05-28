@@ -4,7 +4,7 @@ use std::error::Error;
 use std::path::Path;
 use std::sync::Arc;
 
-use js_sys::Uint8Array;
+use js_sys::{Object, Reflect, Uint8Array, JSON};
 use serde_json::{json, Value as JsonValue};
 use wasm_bindgen::prelude::*;
 
@@ -517,5 +517,43 @@ fn js_db_error(error: DbError) -> JsValue {
         message.push_str(": ");
         message.push_str(&source.to_string());
     }
-    JsValue::from_str(&message)
+    let mut diagnostic = error.diagnostic();
+    diagnostic.message = message.clone();
+    let diagnostic_json = diagnostic.to_json().unwrap_or_else(|_| "{}".to_string());
+
+    let object = Object::new();
+    set_js_property(&object, "code", JsValue::from_str(diagnostic.code_name));
+    set_js_property(&object, "message", JsValue::from_str(&message));
+    set_js_property(
+        &object,
+        "nativeCode",
+        JsValue::from_f64(f64::from(diagnostic.code.as_u32())),
+    );
+    set_js_property(&object, "subcode", JsValue::from_str(diagnostic.subcode));
+    if let Some(sqlstate) = diagnostic.sqlstate {
+        set_js_property(&object, "sqlstate", JsValue::from_str(sqlstate));
+    }
+    set_js_property(
+        &object,
+        "retryable",
+        JsValue::from_bool(diagnostic.retryable),
+    );
+    set_js_property(
+        &object,
+        "permanent",
+        JsValue::from_bool(diagnostic.permanent),
+    );
+    set_js_property(
+        &object,
+        "diagnosticJson",
+        JsValue::from_str(&diagnostic_json),
+    );
+    if let Ok(parsed) = JSON::parse(&diagnostic_json) {
+        set_js_property(&object, "diagnostic", parsed);
+    }
+    object.into()
+}
+
+fn set_js_property(object: &Object, key: &str, value: JsValue) {
+    let _ = Reflect::set(object, &JsValue::from_str(key), &value);
 }

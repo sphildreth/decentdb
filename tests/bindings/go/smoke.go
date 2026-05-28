@@ -24,6 +24,19 @@ func check(status C.ddb_status_t, context string) {
 	}
 }
 
+func lastErrorJSON() string {
+	var out *C.char
+	status := C.ddb_last_error_json(&out)
+	if status != C.DDB_OK {
+		panic(fmt.Sprintf("last_error_json failed with status %d", uint32(status)))
+	}
+	if out == nil {
+		return ""
+	}
+	defer C.ddb_string_free(&out)
+	return C.GoString(out)
+}
+
 func main() {
 	var db *C.ddb_db_t
 	var result *C.ddb_result_t
@@ -97,6 +110,12 @@ func main() {
 	}
 	if message := C.GoString(C.ddb_last_error_message()); message == "" || !contains(message, "nope") {
 		panic(fmt.Sprintf("unexpected error message %q", message))
+	}
+	diagnostic := lastErrorJSON()
+	if !contains(diagnostic, `"code_name":"ERR_SQL"`) ||
+		!contains(diagnostic, `"subcode":"sql.relation_not_found"`) ||
+		!contains(diagnostic, `"relation":"nope"`) {
+		panic(fmt.Sprintf("unexpected diagnostic JSON %q", diagnostic))
 	}
 
 	check(C.ddb_db_free(&db), "free db")

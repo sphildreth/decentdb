@@ -86,6 +86,22 @@ Common status codes:
 `ddb_last_error_message()` returns a borrowed thread-local error string. Treat
 the pointer as valid only until the next DecentDB call on the same thread.
 
+`DDB_ABI_VERSION` for this contract is currently `7`.
+Callers should prefer `ddb_last_error_json(char **out_json)` for machine-readable
+details when available:
+
+```c
+char *json = NULL;
+ddb_status_t status = ddb_db_execute(db, "SELEC bad", NULL, 0, &result);
+if (status != DDB_OK && ddb_last_error_json(&json) == DDB_OK) {
+  // parse json diagnostics
+  puts(json);
+  ddb_string_free(&json);
+}
+```
+
+The JSON accessor does not replace `ddb_last_error_message()`.
+
 ## Ownership Rules
 
 The C ABI uses opaque handles for databases, prepared statements, and query

@@ -27,6 +27,7 @@ typedef struct decentdb_native_api {
 
   int (*last_error_code)(decentdb_db* db);
   const char* (*last_error_message)(decentdb_db* db);
+  const char* (*last_error_json)(decentdb_db* db);
 
   int (*prepare)(decentdb_db* db, const char* sql_utf8, decentdb_stmt** out_stmt);
 

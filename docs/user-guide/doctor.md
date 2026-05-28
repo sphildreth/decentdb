@@ -259,6 +259,26 @@ decentdb doctor \
 | `basename` | Render only file names, such as `app.ddb` and `app.ddb.wal`. |
 | `redacted` | Render `<redacted>` for database and WAL paths. |
 
+## Integrating with diagnostic handoff
+
+Some engine diagnostics include a `doctor` handoff command and SQL snippets. The
+payload is redacted with `<redacted>` placeholders and is not a path-specific
+template replacement.
+
+A sample handoff command is:
+
+```bash
+decentdb doctor --db /path/to/app.ddb --format json
+```
+
+Use the placeholder form from the diagnostic payload only after your application
+supplies the real database context.
+
+## See Also
+
+- [Error diagnostics and troubleshooting](error-diagnostics.md)
+- [Error contracts](../api/error-codes.md)
+
 Use `basename` for local logs where the file name is helpful but the full
 directory is not. Use `redacted` for multi-tenant logs, support bundles, or any
 environment where paths may contain customer identifiers.

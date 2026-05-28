@@ -306,7 +306,10 @@ public class NativeLayerTests : IDisposable
     public void ErrorHandling()
     {
         using var db = new NativeDb(_dbPath);
-        Assert.Throws<DecentDBException>(() => db.Prepare("INVALID SQL SYNTAX"));
+        var ex = Assert.Throws<DecentDBException>(() => db.Prepare("INVALID SQL SYNTAX"));
+        Assert.Equal("ERR_SQL", ex.Diagnostic?.CodeName);
+        Assert.Equal("sql.syntax", ex.Subcode);
+        Assert.False(ex.Retryable);
     }
 
     [Fact]

@@ -18,7 +18,12 @@ class Schema {
     final messagePtr = _bindings.lastErrorMessage();
     final message =
         messagePtr == nullptr ? fallback : messagePtr.toDartString();
-    throw DecentDbException(ErrorCode.fromCode(status), message);
+    final diagnostic = _bindings.takeLastErrorDiagnostic();
+    throw DecentDbException(
+      ErrorCode.fromCode(status),
+      message,
+      diagnostic: diagnostic,
+    );
   }
 
   String _callDbString(

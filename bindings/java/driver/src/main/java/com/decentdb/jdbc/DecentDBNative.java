@@ -53,6 +53,9 @@ final class DecentDBNative {
     /** Returns last error message for the handle. */
     static native String dbLastErrorMessage(long dbHandle);
 
+    /** Returns structured JSON for the last native error, or null when absent. */
+    static native String dbLastErrorJson(long dbHandle);
+
     /** Returns the stable DecentDB C ABI version. */
     static native int abiVersion();
 

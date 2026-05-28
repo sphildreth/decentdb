@@ -68,6 +68,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   callers that repeatedly execute one prepared statement inside an exclusive
   transaction; simple positional INSERT batches validate and resolve the fast
   path once, then refill a mutable parameter buffer per row.
+- Added rich structured error diagnostics across Rust, the C ABI, CLI/HTTP JSON,
+  WASM/browser errors, and maintained bindings, including `ddb_last_error_json`,
+  stable `subcode`/`retryable`/`permanent` fields, SQLSTATE/doc anchors where
+  applicable, redacted context, binding smoke coverage, compatibility guidance,
+  and a dedicated
+  [`error-diagnostics`](../user-guide/error-diagnostics.md) troubleshooting page.
 
 ### Changed
 
@@ -126,6 +132,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `design/FUTURE_WINS.md`; follow-on mobile work is now scoped to measured
   device matrices, direct native SDKs, watch lifecycle guarantees, and key
   rotation rather than first-class Flutter package hardening.
+- Bumped the C ABI version to 7 for structured diagnostic JSON and added release
+  guardrail documentation for first-slice subcode projection across bindings.
 
 ### Fixed
 

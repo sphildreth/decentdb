@@ -10,6 +10,8 @@ extern "C" {
 
 typedef uint32_t ddb_status_t;
 
+#define DDB_ABI_VERSION 7u
+
 enum {
   DDB_OK = 0,
   DDB_ERR_IO = 1,
@@ -141,6 +143,13 @@ typedef struct ddb_row_i64_text_f64_view_t {
 uint32_t ddb_abi_version(void);
 const char *ddb_version(void);
 const char *ddb_last_error_message(void);
+/*
+ * Returns owned JSON for the most recent DecentDB error on this thread.
+ * On success, `*out_json` is either NULL when there is no last error or a
+ * UTF-8 JSON string that must be freed with ddb_string_free.
+ * Calling this accessor does not clear or replace ddb_last_error_message().
+ */
+ddb_status_t ddb_last_error_json(char **out_json);
 
 /*
  * Initializes an owned value slot for use with ddb_*_value_copy APIs.

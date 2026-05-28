@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:ffi';
 import 'dart:io' show Platform;
 
@@ -5,7 +6,7 @@ import 'package:ffi/ffi.dart';
 
 import 'errors.dart';
 
-const int expectedAbiVersion = 6;
+const int expectedAbiVersion = 7;
 const int ddbOk = 0;
 const int ddbWriteQueueTimeoutDefault = 0xFFFFFFFFFFFFFFFF;
 const int ddbTagNull = 0;
@@ -253,6 +254,9 @@ typedef _VersionDart = Pointer<Utf8> Function();
 
 typedef _LastErrorMessageC = Pointer<Utf8> Function();
 typedef _LastErrorMessageDart = Pointer<Utf8> Function();
+
+typedef _LastErrorJsonC = Uint32 Function(Pointer<Pointer<Utf8>> outJson);
+typedef _LastErrorJsonDart = int Function(Pointer<Pointer<Utf8>> outJson);
 
 typedef _ValueDisposeC = Uint32 Function(Pointer<DdbValue> value);
 typedef _ValueDisposeDart = int Function(Pointer<DdbValue> value);
@@ -852,6 +856,9 @@ class NativeBindings {
         lastErrorMessage =
             _lib.lookupFunction<_LastErrorMessageC, _LastErrorMessageDart>(
                 'ddb_last_error_message'),
+        lastErrorJson =
+            _lib.lookupFunction<_LastErrorJsonC, _LastErrorJsonDart>(
+                'ddb_last_error_json'),
         valueDispose = _lib.lookupFunction<_ValueDisposeC, _ValueDisposeDart>(
             'ddb_value_dispose'),
         stringFree = _lib
@@ -1045,8 +1052,32 @@ class NativeBindings {
   final _AbiVersionDart abiVersion;
   final _VersionDart version;
   final _LastErrorMessageDart lastErrorMessage;
+  final _LastErrorJsonDart lastErrorJson;
   final _ValueDisposeDart valueDispose;
   final _StringFreeDart stringFree;
+
+  DecentDbDiagnostic? takeLastErrorDiagnostic() {
+    final out = calloc<Pointer<Utf8>>();
+    try {
+      final status = lastErrorJson(out);
+      if (status != ddbOk || out.value == nullptr) return null;
+      final raw = out.value.toDartString();
+      try {
+        final decoded = jsonDecode(raw);
+        if (decoded is Map) {
+          return DecentDbDiagnostic(
+            Map<String, Object?>.from(decoded),
+            rawJson: raw,
+          );
+        }
+        return DecentDbDiagnostic(<String, Object?>{}, rawJson: raw);
+      } finally {
+        stringFree(out);
+      }
+    } finally {
+      calloc.free(out);
+    }
+  }
 
   // DB open/close
   final _DbPathOutDart dbCreate;

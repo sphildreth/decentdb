@@ -1,5 +1,19 @@
 import 'types.dart';
 
+/// Structured diagnostic payload returned by the native error contract.
+class DecentDbDiagnostic {
+  const DecentDbDiagnostic(this.raw, {this.rawJson});
+
+  final Map<String, Object?> raw;
+  final String? rawJson;
+
+  String? get codeName => raw['code_name'] as String?;
+  String? get subcode => raw['subcode'] as String?;
+  String? get sqlstate => raw['sqlstate'] as String?;
+  bool? get retryable => raw['retryable'] as bool?;
+  bool? get permanent => raw['permanent'] as bool?;
+}
+
 /// Exception thrown by DecentDB operations.
 class DecentDbException implements Exception {
   /// The error code from the native library.
@@ -8,7 +22,15 @@ class DecentDbException implements Exception {
   /// Human-readable error message.
   final String message;
 
-  const DecentDbException(this.code, this.message);
+  /// Optional structured diagnostic payload.
+  final DecentDbDiagnostic? diagnostic;
+
+  const DecentDbException(this.code, this.message, {this.diagnostic});
+
+  String? get subcode => diagnostic?.subcode;
+  String? get sqlstate => diagnostic?.sqlstate;
+  bool? get retryable => diagnostic?.retryable;
+  bool? get permanent => diagnostic?.permanent;
 
   @override
   String toString() => 'DecentDbException(${code.name}): $message';

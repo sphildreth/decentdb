@@ -167,6 +167,37 @@ public sealed class DecentDB : IDisposable
         return Marshal.PtrToStringUTF8(ptr) ?? string.Empty;
     }
 
+    internal static DecentDBDiagnostic? TryGetLastErrorDiagnostic()
+    {
+        IntPtr ptr = IntPtr.Zero;
+        try
+        {
+            var status = DecentDBNative.ddb_last_error_json(out ptr);
+            if (status != 0 || ptr == IntPtr.Zero)
+            {
+                return null;
+            }
+
+            var rawJson = Marshal.PtrToStringUTF8(ptr);
+            return string.IsNullOrWhiteSpace(rawJson) ? null : new DecentDBDiagnostic(rawJson);
+        }
+        catch (DllNotFoundException)
+        {
+            return null;
+        }
+        catch (EntryPointNotFoundException)
+        {
+            return null;
+        }
+        finally
+        {
+            if (ptr != IntPtr.Zero)
+            {
+                DecentDBNative.ddb_string_free(ref ptr);
+            }
+        }
+    }
+
     public void Dispose()
     {
         if (_disposed) return;
@@ -2199,10 +2230,64 @@ public class DecentDBException : Exception
 {
     public int ErrorCode { get; }
     public string Sql { get; }
+    public DecentDBDiagnostic? Diagnostic { get; }
+    public string? Subcode => Diagnostic?.Subcode;
+    public string? SqlState => Diagnostic?.SqlState;
+    public bool? Retryable => Diagnostic?.Retryable;
+    public bool? Permanent => Diagnostic?.Permanent;
 
-    public DecentDBException(int errorCode, string message, string sql) : base($"DecentDB error {errorCode}: {message}\nSQL: {sql}")
+    public DecentDBException(int errorCode, string message, string sql, DecentDBDiagnostic? diagnostic = null) : base($"DecentDB error {errorCode}: {message}\nSQL: {sql}")
     {
         ErrorCode = errorCode;
         Sql = sql;
+        Diagnostic = diagnostic ?? DecentDB.TryGetLastErrorDiagnostic();
+    }
+}
+
+public sealed class DecentDBDiagnostic
+{
+    internal DecentDBDiagnostic(string rawJson)
+    {
+        RawJson = rawJson;
+        try
+        {
+            using var document = JsonDocument.Parse(rawJson);
+            var root = document.RootElement;
+            if (root.TryGetProperty("code", out var code) && code.TryGetInt32(out var nativeCode))
+            {
+                NativeCode = nativeCode;
+            }
+            CodeName = GetString(root, "code_name");
+            Subcode = GetString(root, "subcode");
+            SqlState = GetString(root, "sqlstate");
+            Retryable = GetBool(root, "retryable");
+            Permanent = GetBool(root, "permanent");
+        }
+        catch (JsonException)
+        {
+            // Keep RawJson available even if a future payload is not understood.
+        }
+    }
+
+    public string RawJson { get; }
+    public int? NativeCode { get; }
+    public string? CodeName { get; }
+    public string? Subcode { get; }
+    public string? SqlState { get; }
+    public bool? Retryable { get; }
+    public bool? Permanent { get; }
+
+    private static string? GetString(JsonElement root, string property)
+    {
+        return root.TryGetProperty(property, out var value) && value.ValueKind == JsonValueKind.String
+            ? value.GetString()
+            : null;
+    }
+
+    private static bool? GetBool(JsonElement root, string property)
+    {
+        return root.TryGetProperty(property, out var value) && (value.ValueKind == JsonValueKind.True || value.ValueKind == JsonValueKind.False)
+            ? value.GetBoolean()
+            : null;
     }
 }

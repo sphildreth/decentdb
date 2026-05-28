@@ -8,7 +8,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use crate::db::PreparedStatement;
-use crate::error::{DbError, DbErrorCode, Result};
+use crate::error::{DbDiagnostic, DbError, DbErrorCode, Result};
 use crate::{
     evict_shared_wal, ChangeStreamOptions, Db, DbConfig, DbEncryptionConfig,
     ProcessCoordinationMode, QueryResult, QueryWatchOptions, QueuedWriteOptions, RangeWatchOptions,
@@ -16,7 +16,7 @@ use crate::{
 };
 
 const DDB_OK: u32 = 0;
-const DDB_ABI_VERSION: u32 = 6;
+const DDB_ABI_VERSION: u32 = 7;
 #[cfg(test)]
 const DDB_ERR_SQL: u32 = 5;
 const DDB_WRITE_QUEUE_TIMEOUT_DEFAULT: u64 = u64::MAX;
@@ -239,6 +239,7 @@ pub struct StmtHandle {
 
 thread_local! {
     static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
+    static LAST_DIAGNOSTIC: RefCell<Option<DbDiagnostic>> = const { RefCell::new(None) };
 }
 
 fn ffi_boundary<F>(op: F) -> u32
@@ -249,11 +250,12 @@ where
     match panic::catch_unwind(AssertUnwindSafe(op)) {
         Ok(Ok(())) => DDB_OK,
         Ok(Err(error)) => {
-            set_last_error(error.to_string());
+            set_last_error(error.to_string(), error.diagnostic());
             error.numeric_code()
         }
         Err(payload) => {
-            set_last_error(panic_payload_message(payload));
+            let error = DbError::panic(panic_payload_message(payload));
+            set_last_error(error.to_string(), error.diagnostic());
             DbErrorCode::Panic.as_u32()
         }
     }
@@ -266,7 +268,8 @@ where
     match panic::catch_unwind(AssertUnwindSafe(op)) {
         Ok(value) => value,
         Err(payload) => {
-            set_last_error(panic_payload_message(payload));
+            let error = DbError::panic(panic_payload_message(payload));
+            set_last_error(error.to_string(), error.diagnostic());
             ptr::null()
         }
     }
@@ -276,15 +279,28 @@ fn clear_last_error() {
     LAST_ERROR.with(|slot| {
         *slot.borrow_mut() = None;
     });
+    LAST_DIAGNOSTIC.with(|slot| {
+        *slot.borrow_mut() = None;
+    });
 }
 
-fn set_last_error(message: String) {
+fn set_last_error(message: String, mut diagnostic: DbDiagnostic) {
     let sanitized = message.replace('\0', " ");
+    diagnostic.message = diagnostic.message.replace('\0', " ");
     let cstring =
         CString::new(sanitized).unwrap_or_else(|_| CString::new("invalid error").expect("literal"));
     LAST_ERROR.with(|slot| {
         *slot.borrow_mut() = Some(cstring);
     });
+    LAST_DIAGNOSTIC.with(|slot| {
+        *slot.borrow_mut() = Some(diagnostic);
+    });
+}
+
+fn set_internal_last_error(message: impl Into<String>) -> u32 {
+    let error = DbError::internal_invariant(message.into());
+    set_last_error(error.to_string(), error.diagnostic());
+    DbErrorCode::Internal.as_u32()
 }
 
 fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
@@ -1195,6 +1211,59 @@ pub extern "C" fn ddb_last_error_message() -> *const c_char {
                 .map_or(ptr::null(), |value| value.as_ptr())
         })
     })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_last_error_json(out_json: *mut *mut c_char) -> u32 {
+    match panic::catch_unwind(AssertUnwindSafe(|| {
+        if out_json.is_null() {
+            return set_internal_last_error("out_json pointer is null");
+        }
+
+        // SAFETY: `out_json` was checked for null and is caller-owned output
+        // storage for this C ABI function. We only write either null or an
+        // owned CString pointer created by `CString::into_raw`.
+        unsafe {
+            *out_json = ptr::null_mut();
+        }
+
+        let diagnostic = LAST_DIAGNOSTIC.with(|slot| slot.borrow().clone());
+        let Some(diagnostic) = diagnostic else {
+            return DDB_OK;
+        };
+
+        let json = match diagnostic.to_json() {
+            Ok(json) => json,
+            Err(error) => {
+                return set_internal_last_error(format!(
+                    "failed to serialize last error diagnostic: {error}"
+                ));
+            }
+        };
+        let cstring = match CString::new(json) {
+            Ok(value) => value,
+            Err(_) => {
+                return set_internal_last_error(
+                    "serialized last error diagnostic contained an interior nul byte",
+                );
+            }
+        };
+
+        // SAFETY: `out_json` is still the same validated output pointer; the
+        // raw CString becomes caller-owned and must be released with
+        // `ddb_string_free`.
+        unsafe {
+            *out_json = cstring.into_raw();
+        }
+        DDB_OK
+    })) {
+        Ok(status) => status,
+        Err(payload) => {
+            let error = DbError::panic(panic_payload_message(payload));
+            set_last_error(error.to_string(), error.diagnostic());
+            DbErrorCode::Panic.as_u32()
+        }
+    }
 }
 
 #[no_mangle]
@@ -3929,6 +3998,135 @@ mod tests {
                 .to_string()
         });
         assert!(message.contains("boom"));
+
+        let mut json = ptr::null_mut();
+        assert_eq!(ddb_last_error_json(&mut json), DDB_OK);
+        let diagnostic = parse_json(&mut json);
+        assert_eq!(
+            diagnostic["code"],
+            JsonValue::from(DbErrorCode::Panic.as_u32())
+        );
+        assert_eq!(diagnostic["subcode"], "internal.panic_captured");
+        assert!(diagnostic["message"]
+            .as_str()
+            .expect("panic message")
+            .contains("boom"));
+    }
+
+    #[test]
+    fn last_error_json_reports_no_error_without_mutating_state() {
+        clear_last_error();
+
+        let mut json = ptr::null_mut();
+        assert_eq!(ddb_last_error_json(&mut json), DDB_OK);
+        assert!(json.is_null());
+        assert!(ddb_last_error_message().is_null());
+    }
+
+    #[test]
+    fn last_error_json_null_output_sets_error_state() {
+        clear_last_error();
+
+        assert_eq!(
+            ddb_last_error_json(ptr::null_mut()),
+            DbErrorCode::Internal.as_u32()
+        );
+        let message = unsafe { CStr::from_ptr(ddb_last_error_message()) }
+            .to_str()
+            .expect("message utf8");
+        assert!(message.contains("out_json"));
+
+        let mut json = ptr::null_mut();
+        assert_eq!(ddb_last_error_json(&mut json), DDB_OK);
+        assert!(!json.is_null());
+        let diagnostic_text = unsafe { CStr::from_ptr(json) }
+            .to_str()
+            .expect("diagnostic utf8");
+        let diagnostic =
+            serde_json::from_str::<JsonValue>(diagnostic_text).expect("diagnostic json");
+        assert_eq!(
+            diagnostic["code"],
+            JsonValue::from(DbErrorCode::Internal.as_u32())
+        );
+        assert_eq!(diagnostic["subcode"], "internal.invariant");
+        assert_eq!(ddb_string_free(&mut json), DDB_OK);
+    }
+
+    #[test]
+    fn last_error_json_returns_owned_diagnostic_and_preserves_message() {
+        let mut db = ptr::null_mut();
+        let path = CString::new(":memory:").expect("path");
+        assert_eq!(ddb_db_open_or_create(path.as_ptr(), &mut db), DDB_OK);
+
+        let sql = CString::new("SELECT * FROM nope").expect("sql");
+        let mut result = ptr::null_mut();
+        assert_eq!(
+            ddb_db_execute(db, sql.as_ptr(), ptr::null(), 0, &mut result),
+            DDB_ERR_SQL
+        );
+
+        let message_before = unsafe { CStr::from_ptr(ddb_last_error_message()) }
+            .to_str()
+            .expect("message utf8")
+            .to_string();
+        assert!(message_before.contains("nope"));
+
+        let mut json = ptr::null_mut();
+        assert_eq!(ddb_last_error_json(&mut json), DDB_OK);
+        assert!(!json.is_null());
+        let message_after = unsafe { CStr::from_ptr(ddb_last_error_message()) }
+            .to_str()
+            .expect("message utf8")
+            .to_string();
+        assert_eq!(message_after, message_before);
+
+        let diagnostic_text = unsafe { CStr::from_ptr(json) }
+            .to_str()
+            .expect("diagnostic utf8")
+            .to_string();
+        let diagnostic =
+            serde_json::from_str::<JsonValue>(&diagnostic_text).expect("diagnostic json");
+        assert_eq!(diagnostic["code"], JsonValue::from(DDB_ERR_SQL));
+        assert_eq!(diagnostic["code_name"], "ERR_SQL");
+        assert_eq!(diagnostic["subcode"], "sql.relation_not_found");
+        assert_eq!(diagnostic["relation"], "nope");
+        assert_eq!(diagnostic["retryable"], false);
+        assert_eq!(diagnostic["permanent"], true);
+        assert!(diagnostic.get("sql").is_none());
+
+        assert_eq!(ddb_string_free(&mut json), DDB_OK);
+        assert_eq!(ddb_db_free(&mut db), DDB_OK);
+    }
+
+    #[test]
+    fn successful_ffi_call_clears_message_and_diagnostic_together() {
+        let mut db = ptr::null_mut();
+        let path = CString::new(":memory:").expect("path");
+        assert_eq!(ddb_db_open_or_create(path.as_ptr(), &mut db), DDB_OK);
+
+        let bad_sql = CString::new("SELECT * FROM nope").expect("sql");
+        let mut result = ptr::null_mut();
+        assert_eq!(
+            ddb_db_execute(db, bad_sql.as_ptr(), ptr::null(), 0, &mut result),
+            DDB_ERR_SQL
+        );
+        let mut json = ptr::null_mut();
+        assert_eq!(ddb_last_error_json(&mut json), DDB_OK);
+        assert!(!json.is_null());
+
+        let good_sql = CString::new("SELECT 1").expect("sql");
+        assert_eq!(
+            ddb_db_execute(db, good_sql.as_ptr(), ptr::null(), 0, &mut result),
+            DDB_OK
+        );
+        assert_eq!(ddb_result_free(&mut result), DDB_OK);
+        assert!(ddb_last_error_message().is_null());
+
+        let mut cleared_json = ptr::null_mut();
+        assert_eq!(ddb_last_error_json(&mut cleared_json), DDB_OK);
+        assert!(cleared_json.is_null());
+        assert_eq!(ddb_string_free(&mut json), DDB_OK);
+        assert_eq!(ddb_db_free(&mut db), DDB_OK);
     }
 
     #[test]

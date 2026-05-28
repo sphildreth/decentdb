@@ -66,6 +66,13 @@ export interface QueryErrorPayload {
   code: string;
   message: string;
   details?: string;
+  nativeCode?: number;
+  subcode?: string;
+  sqlstate?: string;
+  retryable?: boolean;
+  permanent?: boolean;
+  diagnostic?: Record<string, unknown>;
+  diagnosticJson?: string;
 }
 
 export interface OpenRequest {
@@ -420,10 +427,16 @@ export const ERR_BROWSER_SERVICE_WORKER_UNSUPPORTED =
 export const ERR_BROWSER_SYNC_DEFERRED = "ERR_BROWSER_SYNC_DEFERRED";
 export const ERR_BROWSER_PROBE_FAILED = "ERR_BROWSER_PROBE_FAILED";
 
-export function createErrorPayload(code: string, message: string, details?: string): QueryErrorPayload {
+export function createErrorPayload(
+  code: string,
+  message: string,
+  details?: string,
+  extra?: Partial<Omit<QueryErrorPayload, "code" | "message" | "details">>
+): QueryErrorPayload {
   return {
     code,
     message,
     details,
+    ...extra,
   };
 }

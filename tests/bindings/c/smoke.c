@@ -56,6 +56,22 @@ static void expect_bytes(const uint8_t *actual, const uint8_t *expected,
   }
 }
 
+static void expect_last_error_json(void) {
+  char *json = NULL;
+  check(ddb_last_error_json(&json), "last_error_json");
+  if (json == NULL) {
+    fprintf(stderr, "last_error_json returned NULL after error\n");
+    exit(1);
+  }
+  if (strstr(json, "\"code_name\":\"ERR_SQL\"") == NULL ||
+      strstr(json, "\"subcode\":\"sql.relation_not_found\"") == NULL ||
+      strstr(json, "\"relation\":\"nope\"") == NULL) {
+    fprintf(stderr, "unexpected diagnostic JSON: %s\n", json);
+    exit(1);
+  }
+  check(ddb_string_free(&json), "free last_error_json");
+}
+
 int main(void) {
   ddb_db_t *db = NULL;
   ddb_result_t *result = NULL;
@@ -289,6 +305,7 @@ int main(void) {
     fprintf(stderr, "missing table error message did not mention table name\n");
     return 1;
   }
+  expect_last_error_json();
 
   check(ddb_db_free(&db), "free db");
   return 0;

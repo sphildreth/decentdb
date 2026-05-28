@@ -39,7 +39,19 @@ describe('Error handling', () => {
   it('throws on table that does not exist', () => {
     const { db, dir } = tmpDb();
     try {
-      assert.throws(() => db.exec('SELECT * FROM nonexistent'), /error|Error/i);
+      let error;
+      try {
+        db.exec('SELECT * FROM nonexistent');
+      } catch (err) {
+        error = err;
+      }
+      assert.ok(error, 'expected an error');
+      assert.match(error.message, /error|Error/i);
+      assert.equal(error.nativeCode, 5);
+      assert.equal(error.subcode, 'sql.relation_not_found');
+      assert.equal(error.diagnostic?.code_name, 'ERR_SQL');
+      assert.equal(error.diagnostic?.relation, 'nonexistent');
+      assert.match(error.diagnosticJson, /"subcode":"sql\.relation_not_found"/);
     } finally {
       db.close();
       fs.rmSync(dir, { recursive: true, force: true });

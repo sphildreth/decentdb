@@ -153,6 +153,23 @@ async function runSmokeScenario(options = {}) {
       globalThis.fetch = originalFetch;
     }
     const metrics = await db.metrics();
+    let missingTableDiagnostic = null;
+    try {
+      await db.query("SELECT * FROM no_such_web_table");
+      throw new Error("expected missing-table query to fail");
+    } catch (error) {
+      if (!(error instanceof DecentDBWebError)) {
+        throw error;
+      }
+      if (
+        error.nativeCode !== 5 ||
+        error.subcode !== "sql.relation_not_found" ||
+        error.diagnostic?.relation !== "no_such_web_table"
+      ) {
+        throw new Error(`unexpected diagnostic: ${JSON.stringify(error.toPayload())}`);
+      }
+      missingTableDiagnostic = error.toPayload();
+    }
     const checkpointResult = await db.checkpoint();
     const exported = await db.export();
     const persisted = await db.persist();
@@ -207,6 +224,7 @@ async function runSmokeScenario(options = {}) {
       firstPreparedRow,
       preparedPage,
       closedStatementCode,
+      missingTableDiagnostic,
       syncRun,
       applyAck,
       syncOrder,

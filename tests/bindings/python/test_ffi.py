@@ -78,6 +78,8 @@ def load_library():
 
     lib = ctypes.CDLL(str(LIB_PATH))
     lib.ddb_last_error_message.restype = ctypes.c_char_p
+    lib.ddb_last_error_json.argtypes = [ctypes.POINTER(ctypes.c_char_p)]
+    lib.ddb_last_error_json.restype = ctypes.c_uint32
     lib.ddb_string_free.argtypes = [ctypes.POINTER(ctypes.c_char_p)]
     lib.ddb_string_free.restype = ctypes.c_uint32
 
@@ -152,6 +154,19 @@ def load_library():
 def last_error(lib) -> str:
     message = lib.ddb_last_error_message()
     return "" if not message else message.decode("utf-8")
+
+
+def last_error_diagnostic(lib):
+    out = ctypes.c_char_p()
+    status = lib.ddb_last_error_json(ctypes.byref(out))
+    if status != DDB_OK:
+        raise AssertionError(f"last_error_json failed with status {status}")
+    if not out.value:
+        return None
+    try:
+        return json.loads(ctypes.string_at(out).decode("utf-8"))
+    finally:
+        check(lib, lib.ddb_string_free(ctypes.byref(out)), "free diagnostic json")
 
 
 def check(lib, status: int, context: str) -> None:
@@ -369,6 +384,11 @@ def run() -> None:
     )
     assert status == DDB_ERR_SQL
     assert "missing_table" in last_error(lib)
+    diagnostic = last_error_diagnostic(lib)
+    assert diagnostic is not None
+    assert diagnostic["code_name"] == "ERR_SQL"
+    assert diagnostic["subcode"] == "sql.relation_not_found"
+    assert diagnostic["relation"] == "missing_table"
 
     check(lib, lib.ddb_db_free(ctypes.byref(db)), "free db")
     check(lib, lib.ddb_db_free(ctypes.byref(db)), "double free db")

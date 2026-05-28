@@ -1,303 +1,218 @@
 # Error Codes
 
-DecentDB uses specific error codes to indicate different types of failures.
+DecentDB now uses stable broad categories plus structured diagnostics for machine-readable behavior.
 
-## Error Code Reference
+For vNext, bindings should treat the broad status as the compatibility floor and
+`subcode` plus `retryable/permanent` as the primary handling key.
 
-### ERR_IO (I/O Error)
+- `DDB_ABI_VERSION` is **7**.
+- `ddb_last_error_json(char **out_json)` is the stable C ABI accessor for
+  structured diagnostics.
+- The first public slice uses a stable `subcode` family with optional SQLSTATE
+  and bounded redacted context.
 
-File system operations failed.
+## Broad Status Families
 
-**Common Causes:**
-- Disk full
-- Permission denied
-- File not found
-- Hardware failure
+Broad categories stay stable for compatibility and broad branching.
 
-**Example:**
-```bash
-decentdb exec --db=/readonly/my.ddb --sql="SELECT 1"
-# Error: ERR_IO: Permission denied
+| Category | Meaning |
+|---|---|
+| `ERR_OK` | Success |
+| `ERR_IO` | I/O failure |
+| `ERR_CORRUPTION` | Corruption or invalid DB state |
+| `ERR_CONSTRAINT` | Constraint violation |
+| `ERR_TRANSACTION` | Transaction error |
+| `ERR_SQL` | SQL parse, bind, or execution error |
+| `ERR_INTERNAL` | Internal engine error |
+| `ERR_PANIC` | Panic captured at ABI boundary |
+| `ERR_UNSUPPORTED_FORMAT_VERSION` | Database format is newer than engine support |
+| `ERR_BUSY` | Resource is busy |
+| `ERR_TIMEOUT` | Timed out before run/complete |
+| `ERR_CANCELED` | Request canceled before execution |
+| `ERR_QUEUE_FULL` | Writer queue capacity exhausted |
+| `ERR_QUEUE_CLOSED` | Writer queue is shutting down or closed |
+
+## Structured Diagnostic JSON
+
+The structured diagnostic is versioned and returned by `ddb_last_error_json`:
+
+```json
+{
+  "version": 1,
+  "code": 5,
+  "code_name": "ERR_SQL",
+  "subcode": "sql.relation_not_found",
+  "sqlstate": "42P01",
+  "message": "relation not found",
+  "retryable": false,
+  "permanent": true,
+  "redaction": "default",
+  "relation": "users",
+  "docs": "errors/sql-relation-not-found"
+}
 ```
 
-**Resolution:**
-- Check disk space: `df -h`
-- Check permissions: `ls -la`
-- Verify path exists
+Required fields are:
 
-### ERR_CORRUPTION (Database Corruption)
+- `version`: diagnostic schema version, starts at `1`.
+- `code`: numeric category.
+- `code_name`: broad category name, without ABI prefix.
+- `subcode`: stable machine-readable condition.
+- `message`: human-readable text (non-contractual).
+- `retryable`: may a retry succeed without changing input.
+- `permanent`: will the same inputs keep failing until external state or policy changes.
+- `redaction`: active policy (`default` initially).
+- `docs`: stable diagnostics anchor.
 
-Database file structure is invalid.
+Optional fields are omitted if unknown:
 
-**Common Causes:**
-- Unexpected shutdown during write
-- Storage hardware failure
-- Manual file modification
-- Bug in database engine
+- `sqlstate`: SQLSTATE-compatible code where unambiguous.
+- `relation`, `column`, `index`, `constraint`, `policy`, `branch`, `sync_scope`,
+  `sync_peer`, `changeset_id`.
+- `process_owner`, `wal`, `format`, `parameter`, `path`, `hint`, `doctor`,
+  `details`.
 
-**Example:**
-```bash
-decentdb exec --db=corrupted.ddb --sql="SELECT 1"
-# Error: ERR_CORRUPTION: Invalid page checksum
-```
+## First Slice Subcodes (vNext)
 
-**Resolution:**
-- Restore from backup
-- Verify on-disk structure with `decentdb verify-header` and `decentdb verify-index`
-- Contact support if reproducible
+These are the first diagnostics expected for stable projection.
 
-### ERR_CONSTRAINT (Constraint Violation)
+| Category | Subcode | SQLSTATE | Retryable | Permanent | Docs |
+|---|---|---|---:|---:|---|
+| `ERR_SQL` | `sql.syntax` | `42601` | No | Yes | `errors/sql-syntax` |
+| `ERR_SQL` | `sql.relation_not_found` | `42P01` | No | Yes | `errors/sql-relation-not-found` |
+| `ERR_SQL` | `sql.column_not_found` | `42703` | No | Yes | `errors/sql-column-not-found` |
+| `ERR_SQL` | `sql.ambiguous_column` | `42702` | No | Yes | `errors/sql-ambiguous-column` |
+| `ERR_SQL` | `sql.parameter_missing` | `07002` | No | Yes | `errors/sql-parameter-missing` |
+| `ERR_SQL` | `sql.parameter_type_mismatch` | `42804` | No | Yes | `errors/sql-parameter-type-mismatch` |
+| `ERR_SQL` | `sql.unsupported_feature` | `0A000` | No | Yes | `errors/sql-unsupported-feature` |
+| `ERR_CONSTRAINT` | `constraint.unique` | `23505` | No | Yes | `errors/constraint-unique` |
+| `ERR_CONSTRAINT` | `constraint.not_null` | `23502` | No | Yes | `errors/constraint-not-null` |
+| `ERR_CONSTRAINT` | `constraint.check` | `23514` | No | Yes | `errors/constraint-check` |
+| `ERR_CONSTRAINT` | `constraint.foreign_key` | `23503` | No | Yes | `errors/constraint-foreign-key` |
+| `ERR_TRANSACTION` | `transaction.no_active_transaction` | `25000` | No | Yes | `errors/transaction-no-active-transaction` |
+| `ERR_TRANSACTION` | `transaction.invalid_state` | `25000` | No | Yes | `errors/transaction-invalid-state` |
+| `ERR_TIMEOUT` | `queue.write_timeout` | `HYT00` | Yes | Yes | `errors/queue-write-timeout` |
+| `ERR_CANCELED` | `queue.canceled` | `57014` | No | No | `errors/queue-canceled` |
+| `ERR_QUEUE_FULL` | `queue.full` | `HYT00` | Yes | Yes | `errors/queue-full` |
+| `ERR_QUEUE_CLOSED` | `queue.closed` | `08003` | No | Yes | `errors/queue-closed` |
+| `ERR_BUSY` | `busy.writer_lock` | `55P03` | Yes | Yes | `errors/busy-writer-lock` |
+| `ERR_BUSY` | `busy.reader_conflict` | `55P03` | Yes | Yes | `errors/busy-reader-conflict` |
+| `ERR_TIMEOUT` | `coordination.lock_timeout` | `55P03` | Yes | Yes | `errors/coordination-lock-timeout` |
+| `ERR_IO` | `coordination.sidecar_unavailable` | None | No | Yes | `errors/coordination-sidecar-unavailable` |
+| `ERR_IO` | `io.permission_denied` | None | No | Yes | `errors/io-permission-denied` |
+| `ERR_IO` | `io.disk_full` | None | Yes | Yes | `errors/io-disk-full` |
+| `ERR_IO` | `io.not_found` | None | No | Yes | `errors/io-not-found` |
+| `ERR_UNSUPPORTED_FORMAT_VERSION` | `format.unsupported_version` | None | No | Yes | `errors/format-unsupported-version` |
+| `ERR_CORRUPTION` | `corruption.database_header` | None | No | Yes | `errors/corruption-database-header` |
+| `ERR_CORRUPTION` | `corruption.page_checksum` | None | No | Yes | `errors/corruption-page-checksum` |
+| `ERR_CORRUPTION` | `corruption.wal_frame` | None | No | Yes | `errors/corruption-wal-frame` |
+| `ERR_CORRUPTION` | `corruption.wal_replay` | None | No | Yes | `errors/corruption-wal-replay` |
+| `ERR_IO` | `tde.key_required` | None | No | Yes | `errors/tde-key-required` |
+| `ERR_CORRUPTION` | `tde.key_mismatch` | None | No | Yes | `errors/tde-key-mismatch` |
+| `ERR_SQL` | `security.policy_denied` | `42501` | No | Yes | `errors/security-policy-denied` |
+| `ERR_SQL` | `security.mask_expression_invalid` | `42601` | No | Yes | `errors/security-mask-expression-invalid` |
+| `ERR_SQL` | `sync.scope_not_found` | None | No | Yes | `errors/sync-scope-not-found` |
+| `ERR_TRANSACTION` | `sync.retention_blocked` | None | Yes | Yes | `errors/sync-retention-blocked` |
+| `ERR_SQL` | `branch.not_found` | None | No | Yes | `errors/branch-not-found` |
+| `ERR_CONSTRAINT` | `branch.merge_conflict` | None | No | Yes | `errors/branch-merge-conflict` |
+| `ERR_SQL` | `extension.untrusted_package` | None | No | Yes | `errors/extension-untrusted-package` |
+| `ERR_PANIC` | `internal.panic_captured` | `XX000` | No | No | `errors/internal-panic-captured` |
+| `ERR_INTERNAL` | `internal.invariant` | `XX000` | No | Yes | `errors/internal-invariant` |
 
-Data violates schema constraints.
+Keep this list as the implementation expands.
 
-**Common Causes:**
-- Duplicate PRIMARY KEY
-- Violates UNIQUE constraint
-- Violates NOT NULL
-- Violates FOREIGN KEY
+## CLI / HTTP / WASM Output
 
-**Example:**
-```sql
--- Table with UNIQUE constraint
-CREATE TABLE users (id INT PRIMARY KEY, email TEXT UNIQUE);
-
-INSERT INTO users VALUES (1, 'alice@example.com');
-INSERT INTO users VALUES (2, 'alice@example.com');
--- Error: ERR_CONSTRAINT: UNIQUE constraint violation
-```
-
-**Resolution:**
-- Check for existing values
-- Handle duplicates in application
-- Use INSERT OR REPLACE (if supported)
-
-### ERR_TRANSACTION (Transaction Error)
-
-Transaction-related failures.
-
-**Common Causes:**
-- Deadlock (rare in DecentDB)
-- Lock timeout
-- Write conflict
-
-**Example:**
-```bash
-# Two processes trying to write simultaneously
-# Process 1: BEGIN; UPDATE ...
-# Process 2: BEGIN; UPDATE ... (waits)
-```
-
-**Resolution:**
-- Retry the transaction
-- Keep transactions short
-- Use appropriate isolation level
-
-### ERR_TIMEOUT / ERR_CANCELED / ERR_QUEUE_FULL / ERR_QUEUE_CLOSED
-
-Write-queue control failures.
-
-**Common Causes:**
-- The bounded write queue is at capacity
-- A queued request timed out before execution started
-- A queued request was canceled before execution started
-- The database handle is closing while work is waiting
-
-**Resolution:**
-- Increase `write_queue_capacity` for bursty in-process workloads
-- Increase the per-call or configured queue timeout
-- Keep explicit transactions on the direct transaction APIs
-- Inspect queue metrics to identify sustained pressure
-
-See [Write Concurrency](../user-guide/write-concurrency.md) for the queued
-write contract and strict group-commit behavior.
-
-### ERR_SQL (SQL Error)
-
-Invalid SQL syntax or semantic error.
-
-**Common Causes:**
-- Syntax error in SQL
-- Table doesn't exist
-- Column doesn't exist
-- Type mismatch
-
-**Example:**
-```bash
-decentdb exec --db=my.ddb --sql="SELECT * FROM nonexistent"
-# Error: ERR_SQL: Table not found
-
-decentdb exec --db=my.ddb --sql="SELEC * FROM users"
-# Error: ERR_SQL: Syntax error
-```
-
-**Resolution:**
-- Verify table/column names
-- Check SQL syntax
-- Use DESCRIBE to see schema
-
-### ERR_INTERNAL (Internal Error)
-
-Unexpected internal engine error.
-
-**Common Causes:**
-- Bug in DecentDB
-- Memory allocation failure
-- Internal assertion failure
-
-**Example:**
-```
-Error: ERR_INTERNAL: Unexpected null pointer
-```
-
-**Resolution:**
-- Report bug with reproduction steps
-- Check system resources
-- Restart application
-
-## Error Response Format
-
-CLI errors are returned as JSON:
+CLI and HTTP JSON responses should include both the legacy short code and diagnostic
+object:
 
 ```json
 {
   "ok": false,
   "error": {
     "code": "ERR_SQL",
-    "message": "Table not found",
-    "context": "users"
-  },
-  "rows": []
+    "native_code": 5,
+    "subcode": "sql.relation_not_found",
+    "message": "relation not found",
+    "diagnostic": {
+      "version": 1,
+      "code": 5,
+      "code_name": "ERR_SQL",
+      "subcode": "sql.relation_not_found",
+      "sqlstate": "42P01",
+      "retryable": false,
+      "permanent": true,
+      "redaction": "default",
+      "relation": "users",
+      "docs": "errors/sql-relation-not-found"
+    }
+  }
 }
 ```
 
-Fields:
-- `code`: Error category (see above)
-- `message`: Human-readable description
-- `context`: Additional context (table name, column name, etc.)
+Do not replace the message from the diagnostic object and do not rely on parsing
+free-text for behavior.
 
-## Rust API Error Handling
+## Redaction by Default
 
-```rust
-import decentdb/engine
+The default diagnostics contract excludes:
 
-let res = execSql(db, "SELECT * FROM users")
-if not res.ok:
-  echo "Error code: ", res.err.code
-  echo "Message: ", res.err.message
-  echo "Context: ", res.err.context
-  
-  case res.err.code
-  of ERR_SQL:
-    echo "Fix your SQL query"
-  of ERR_CONSTRAINT:
-    echo "Check your data"
-  of ERR_IO:
-    echo "Check file system"
-  else:
-    echo "Unexpected error"
-```
+- SQL parameter values
+- Raw SQL text
+- Encryption keys or derived key material
+- Full paths
+- Sync tokens
+- Raw audit context values
 
-## Common Error Patterns
+Allowed default context includes relation/object metadata, redacted path
+descriptors, process or WAL identifiers, and bounded technical counters.
 
-### "Table not found"
+## Binding Projection
 
-```
-ERR_SQL: Table not found: users
-```
+All maintained bindings should keep existing exception families and add structured
+diagnostic access:
 
-**Check:**
-1. Did you create the table?
-2. Is the database path correct?
-3. Are you using the right database file?
+- `code` and `native_code` where relevant.
+- `subcode` and optional `sqlstate`.
+- `retryable` and `permanent`.
+- Raw diagnostic JSON or equivalent map for forward compatibility.
 
-### "UNIQUE constraint violation"
+Bindings should parse `diagnostic.subcode` and `diagnostic.code_name` for automation
+rather than matching `message` strings.
 
-```
-ERR_CONSTRAINT: UNIQUE constraint violation: email
-```
+## Troubleshooting Anchors
 
-**Check:**
-1. Does the value already exist?
-2. Are you inserting duplicates?
+The `docs` field uses stable anchor IDs. See:
 
-### "FOREIGN KEY constraint violation"
+- [`errors/sql-relation-not-found`](../user-guide/error-diagnostics.md#errors/sql-relation-not-found)
+- [`errors/constraint-unique`](../user-guide/error-diagnostics.md#errors/constraint-unique)
+- [`errors/queue-write-timeout`](../user-guide/error-diagnostics.md#errors/queue-write-timeout)
+- [`errors/busy-writer-lock`](../user-guide/error-diagnostics.md#errors/busy-writer-lock)
+- [`errors/io-disk-full`](../user-guide/error-diagnostics.md#errors/io-disk-full)
+- [`errors/corruption-page-checksum`](../user-guide/error-diagnostics.md#errors/corruption-page-checksum)
+- [`errors/sync-retention-blocked`](../user-guide/error-diagnostics.md#errors/sync-retention-blocked)
+- [`errors/branch-merge-conflict`](../user-guide/error-diagnostics.md#errors/branch-merge-conflict)
 
-```
-ERR_CONSTRAINT: FOREIGN KEY constraint violation: user_id
-```
+## Compatibility Checklist
 
-**Check:**
-1. Does the referenced row exist?
-2. Is the foreign key value correct?
+- Existing broad status values must not change.
+- Required diagnostic fields may not be removed.
+- New optional fields are backward-compatible.
+- Subcodes must keep stable spelling and meaning during a compatibility cycle.
+- Changing `retryable` or `permanent` semantics requires release note coverage.
+- Message text changes are allowed and should not be used as contracts.
 
-### "Missing parameter"
+## Release Guardrails
 
-```
-ERR_SQL: Missing parameter: 1
-```
-
-**Check:**
-1. Did you provide all parameters?
-2. Are parameter indices correct ($1, $2, etc.)?
-
-### "Type mismatch"
-
-```
-ERR_SQL: Type mismatch for column: age
-```
-
-**Check:**
-1. Are you passing the right type (int vs text)?
-2. Is the column type what you expect?
-
-## Troubleshooting Guide
-
-### Database Won't Open
-
-1. Check file permissions
-2. Verify file isn't corrupted
-3. Ensure sufficient disk space
-4. Check if another process has locked it
-
-### Queries Are Slow
-
-1. Check if indexes exist: `list-indexes`
-2. Analyze query plan
-3. Consider adding indexes
-4. Check cache size
-
-### Write Failures
-
-1. Check disk space
-2. Verify write permissions
-3. Check if database is read-only
-4. Ensure single writer
-
-### Recovery Mode
-
-If database is corrupted:
+Run the phase-5 consistency check when preparing a release:
 
 ```bash
-# Verify on-disk structure
-decentdb verify-header --db=my.ddb
-
-# If you suspect a specific index is corrupted:
-decentdb list-indexes --db=my.ddb
-decentdb verify-index --db=my.ddb --index=idx_users_name
-
-# Export and reimport if needed
-decentdb export --db=my.ddb --table=users --output=users.csv
-# Create new database and import
+python scripts/validate_error_diagnostics.py
 ```
 
-## Getting Help
+That check validates:
 
-If you encounter an error:
-
-1. Check this error code reference
-2. Review the [SQL Reference](../user-guide/sql-reference.md)
-3. Check [common issues on GitHub](https://github.com/sphildreth/decentdb/issues)
-4. Report new issues with:
-   - Error code and message
-   - Steps to reproduce
-   - Expected vs actual behavior
+- First-slice subcodes are documented.
+- Troubleshooting anchor coverage for all first-slice anchors.
+- Required docs touchpoints (`error-codes`, `c-cpp`, and `doctor`).
+- Binding smoke fixture coverage status.

@@ -208,10 +208,17 @@ func (c *connector) Driver() driver.Driver {
 }
 
 type DecentDBError struct {
-	Code    int
-	Message string
-	SQL     string
-	Err     error
+	Code           int
+	Message        string
+	SQL            string
+	Err            error
+	Diagnostic     map[string]any
+	DiagnosticJSON string
+	CodeName       string
+	Subcode        string
+	SQLState       string
+	Retryable      bool
+	Permanent      bool
 }
 
 type Decimal struct {
@@ -303,7 +310,19 @@ func statusCode(status C.ddb_status_t) int {
 func statusError(status C.ddb_status_t, sql string) error {
 	msg := C.GoString(C.ddb_last_error_message())
 	code := statusCode(status)
-	v := &DecentDBError{Code: code, Message: msg, SQL: sql}
+	rawDiagnostic, diagnostic := lastErrorDiagnostic()
+	v := &DecentDBError{
+		Code:           code,
+		Message:        msg,
+		SQL:            sql,
+		Diagnostic:     diagnostic,
+		DiagnosticJSON: rawDiagnostic,
+		CodeName:       diagnosticString(diagnostic, "code_name"),
+		Subcode:        diagnosticString(diagnostic, "subcode"),
+		SQLState:       diagnosticString(diagnostic, "sqlstate"),
+		Retryable:      diagnosticBool(diagnostic, "retryable"),
+		Permanent:      diagnosticBool(diagnostic, "permanent"),
+	}
 	switch status {
 	case C.DDB_ERR_BUSY:
 		v.Err = ErrBusy
@@ -320,6 +339,37 @@ func statusError(status C.ddb_status_t, sql string) error {
 		return fmt.Errorf("%w: %w", v.Err, v)
 	}
 	return v
+}
+
+func lastErrorDiagnostic() (string, map[string]any) {
+	var out *C.char
+	if C.ddb_last_error_json(&out) != C.DDB_OK || out == nil {
+		return "", nil
+	}
+	defer freeAPIString(out)
+
+	raw := C.GoString(out)
+	var diagnostic map[string]any
+	if err := json.Unmarshal([]byte(raw), &diagnostic); err != nil {
+		return raw, nil
+	}
+	return raw, diagnostic
+}
+
+func diagnosticString(diagnostic map[string]any, key string) string {
+	if diagnostic == nil {
+		return ""
+	}
+	value, _ := diagnostic[key].(string)
+	return value
+}
+
+func diagnosticBool(diagnostic map[string]any, key string) bool {
+	if diagnostic == nil {
+		return false
+	}
+	value, _ := diagnostic[key].(bool)
+	return value
 }
 
 func freeAPIString(ptr *C.char) {
