@@ -54,6 +54,8 @@ Supported keys:
 | `Paged Row Storage` | bool | engine default | Enable the paged row storage format; set `False` for the tuned resident-read profile used by benchmarks. |
 | `Persistent PK Index` | bool | engine default | Enable the persistent primary-key locator index. |
 | `WAL Auto Checkpoint` | int | engine default | WAL auto-checkpoint page threshold; use `0` to disable for controlled benchmark runs. |
+| `Process Coordination` | string | `auto` | Cross-process WAL coordination mode: `auto`, `required`, or `single_process_unsafe`. |
+| `Process Coordination Timeout Ms` | int | `30000` | Bounded wait for cross-process coordination locks. |
 | `Write Queue Enabled` | bool | engine default | Enable engine-owned queued writes for connection-level write execution. |
 | `Write Queue Capacity` | int | engine default | Maximum admitted queued writes waiting for execution. |
 | `Write Queue Default Timeout Ms` | int | engine default | Default queued-write timeout in milliseconds; `0` means no default timeout. |
@@ -65,7 +67,7 @@ Supported keys:
 | `Command Timeout` | int | `30` | Command timeout in seconds. |
 | `Pooling` | bool | `true` | Consumed by MicroOrm only; ADO.NET ignores this key. |
 
-The `DecentDBConnection.DeleteDatabaseFiles(path)` helper deletes the database file and all sidecar files (`.wal`, `-wal`, `-shm`) safely.
+The `DecentDBConnection.DeleteDatabaseFiles(path)` helper deletes the database file and all sidecar files (`.wal`, `-wal`, `-shm`, `.coord`) safely.
 
 `DecentDB.Native.DecentDB.ExecuteQueued(sql)` exposes the native queued path for
 self-contained SQL, and `WriteQueueMetrics()` returns queue counters. ADO.NET

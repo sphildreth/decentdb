@@ -43,6 +43,41 @@ assert_eq!(result.rows().len(), 1);
 
 `Db::execute_batch` and `Db::execute_batch_with_params` accept semicolon-delimited batches.
 
+## Local data security
+
+TDE is configured through `DbConfig::encryption`:
+
+```rust
+use decentdb::{Db, DbConfig, DbEncryptionConfig};
+
+let config = DbConfig {
+    encryption: Some(DbEncryptionConfig::from_key_bytes(
+        b"application-managed high entropy key bytes",
+    )?),
+    ..DbConfig::default()
+};
+
+let db = Db::create("secure.ddb", config.clone())?;
+let reopened = Db::open("secure.ddb", config)?;
+# Ok::<(), decentdb::DbError>(())
+```
+
+Audit context is handle-local and can be set through Rust or SQL:
+
+```rust
+use decentdb::Value;
+
+db.set_audit_context_value("tenant_id", Value::Text("tenant-a".to_string()))?;
+db.set_audit_context_value("actor", Value::Text("alice@example.com".to_string()))?;
+let snapshot = db.audit_context_snapshot()?;
+db.clear_audit_context_value("actor")?;
+# Ok::<(), decentdb::DbError>(())
+```
+
+The SQL security surface includes `SET AUDIT CONTEXT`, `CREATE POLICY`,
+`ALTER/DROP POLICY`, `CREATE MASK`, and `ALTER/DROP MASK`. See
+[Local Data Security](../user-guide/security.md) for the full contract.
+
 ## Explicit transactions
 
 The Rust engine now supports explicit handle-local SQL transactions:

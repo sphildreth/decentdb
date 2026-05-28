@@ -18,6 +18,7 @@ use crate::config::DbConfig;
 use crate::db::Db;
 use crate::error::Result;
 use crate::metadata::{HeaderInfo, IndexInfo, SchemaSnapshot, StorageInfo};
+use crate::record::value::Value;
 use crate::storage::DB_FORMAT_VERSION;
 
 // ---------------------------------------------------------------------------
@@ -519,7 +520,17 @@ struct CollectedData {
     schema: Option<SchemaSnapshot>,
     indexes: Vec<IndexInfo>,
     named_snapshot_count: usize,
+    process_coordination: Option<ProcessCoordinationFacts>,
     physical_bytes: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ProcessCoordinationFacts {
+    active_process_readers: u64,
+    current_writer_pid: Option<u64>,
+    current_writer_lock_age_ms: Option<u64>,
+    current_checkpoint_pid: Option<u64>,
+    current_checkpoint_lock_age_ms: Option<u64>,
 }
 
 /// Collect all facts from an already-opened [`Db`] handle.
@@ -532,6 +543,7 @@ fn collect_facts(db: &Db, path: &Path) -> Result<CollectedData> {
     let schema = db.get_schema_snapshot().ok();
     let indexes = db.list_indexes().unwrap_or_default();
     let named_snapshot_count = crate::branch::named_snapshot_count(db).unwrap_or(0);
+    let process_coordination = collect_process_coordination_facts(db).ok().flatten();
 
     let database = DoctorDatabaseSummary {
         path: path.display().to_string(),
@@ -549,8 +561,49 @@ fn collect_facts(db: &Db, path: &Path) -> Result<CollectedData> {
         schema,
         indexes,
         named_snapshot_count,
+        process_coordination,
         physical_bytes,
     })
+}
+
+fn collect_process_coordination_facts(db: &Db) -> Result<Option<ProcessCoordinationFacts>> {
+    let coordination = db.execute("SELECT * FROM sys.process_coordination")?;
+    let Some(row) = coordination.rows().first() else {
+        return Ok(None);
+    };
+    let enabled = value_bool(row.values().get(1)).unwrap_or(false);
+    if !enabled {
+        return Ok(None);
+    }
+
+    let active_process_readers = db
+        .execute("SELECT * FROM sys.process_readers")
+        .map(|result| result.rows().len() as u64)
+        .unwrap_or(0);
+
+    let metrics = db.execute("SELECT * FROM sys.process_lock_metrics")?;
+    let metrics_row = metrics.rows().first();
+    Ok(Some(ProcessCoordinationFacts {
+        active_process_readers,
+        current_writer_pid: metrics_row.and_then(|r| value_u64(r.values().get(2))),
+        current_writer_lock_age_ms: metrics_row.and_then(|r| value_u64(r.values().get(3))),
+        current_checkpoint_pid: metrics_row.and_then(|r| value_u64(r.values().get(4))),
+        current_checkpoint_lock_age_ms: metrics_row.and_then(|r| value_u64(r.values().get(5))),
+    }))
+}
+
+fn value_bool(value: Option<&Value>) -> Option<bool> {
+    match value {
+        Some(Value::Bool(value)) => Some(*value),
+        _ => None,
+    }
+}
+
+fn value_u64(value: Option<&Value>) -> Option<u64> {
+    match value {
+        Some(Value::Int64(value)) if *value >= 0 => Some(*value as u64),
+        _ => None,
+    }
 }
 
 /// Collect a best-effort database summary from a loose header for partial
@@ -638,6 +691,28 @@ fn evaluate_rules(data: &CollectedData) -> Vec<DoctorFinding> {
 
         if data.named_snapshot_count > 0 {
             findings.push(wal_named_snapshots_retained(data.named_snapshot_count));
+        }
+    }
+
+    if let Some(coordination) = &data.process_coordination {
+        if coordination.active_process_readers > 0 {
+            findings.push(wal_process_readers_active(
+                coordination.active_process_readers,
+            ));
+        }
+
+        if let Some(pid) = coordination.current_writer_pid {
+            findings.push(wal_process_writer_lock_held(
+                pid,
+                coordination.current_writer_lock_age_ms.unwrap_or(0),
+            ));
+        }
+
+        if let Some(pid) = coordination.current_checkpoint_pid {
+            findings.push(wal_process_checkpoint_lock_held(
+                pid,
+                coordination.current_checkpoint_lock_age_ms.unwrap_or(0),
+            ));
         }
     }
 
@@ -1573,6 +1648,80 @@ fn wal_named_snapshots_retained(snapshot_count: usize) -> DoctorFinding {
         recommendation: Some(DoctorRecommendation {
             summary: "Delete named snapshots that are no longer needed.".into(),
             commands: vec!["decentdb snapshot delete --db <path> --name <snapshot>".into()],
+            safe_to_automate: false,
+        }),
+    }
+}
+
+fn wal_process_readers_active(active_readers: u64) -> DoctorFinding {
+    DoctorFinding {
+        id: "wal.process_readers_active".into(),
+        severity: DoctorSeverity::Warning,
+        category: DoctorCategory::Wal,
+        title: "Cross-process readers are retaining WAL history".into(),
+        message: "Reader slots in the coordination sidecar can prevent WAL truncation until those read transactions finish.".into(),
+        evidence: vec![DoctorEvidence {
+            field: "active_process_readers".into(),
+            value: DoctorEvidenceValue::Uint(active_readers),
+            unit: None,
+        }],
+        recommendation: Some(DoctorRecommendation {
+            summary: "Close stale or long-running external readers before checkpoint-sensitive maintenance.".into(),
+            commands: vec!["SELECT * FROM sys.process_readers".into()],
+            safe_to_automate: false,
+        }),
+    }
+}
+
+fn wal_process_writer_lock_held(pid: u64, age_ms: u64) -> DoctorFinding {
+    DoctorFinding {
+        id: "wal.process_writer_lock_held".into(),
+        severity: DoctorSeverity::Warning,
+        category: DoctorCategory::Wal,
+        title: "Cross-process writer lock is currently held".into(),
+        message: "Another process currently owns the cross-process writer lock and may block writes from this process.".into(),
+        evidence: vec![
+            DoctorEvidence {
+                field: "pid".into(),
+                value: DoctorEvidenceValue::Uint(pid),
+                unit: None,
+            },
+            DoctorEvidence {
+                field: "age_ms".into(),
+                value: DoctorEvidenceValue::Uint(age_ms),
+                unit: Some("ms".into()),
+            },
+        ],
+        recommendation: Some(DoctorRecommendation {
+            summary: "Inspect the owning process and retry after the write transaction completes.".into(),
+            commands: vec!["SELECT * FROM sys.process_lock_metrics".into()],
+            safe_to_automate: false,
+        }),
+    }
+}
+
+fn wal_process_checkpoint_lock_held(pid: u64, age_ms: u64) -> DoctorFinding {
+    DoctorFinding {
+        id: "wal.process_checkpoint_lock_held".into(),
+        severity: DoctorSeverity::Warning,
+        category: DoctorCategory::Wal,
+        title: "Cross-process checkpoint lock is currently held".into(),
+        message: "Another process currently owns the cross-process checkpoint lock and may delay checkpoint or WAL truncation work.".into(),
+        evidence: vec![
+            DoctorEvidence {
+                field: "pid".into(),
+                value: DoctorEvidenceValue::Uint(pid),
+                unit: None,
+            },
+            DoctorEvidence {
+                field: "age_ms".into(),
+                value: DoctorEvidenceValue::Uint(age_ms),
+                unit: Some("ms".into()),
+            },
+        ],
+        recommendation: Some(DoctorRecommendation {
+            summary: "Inspect the owning process and retry maintenance after the checkpoint completes.".into(),
+            commands: vec!["SELECT * FROM sys.process_lock_metrics".into()],
             safe_to_automate: false,
         }),
     }
@@ -2542,6 +2691,7 @@ mod tests {
                 columns: vec![format!("col_{i}")],
                 include_columns: vec![],
                 predicate_sql: None,
+                full_text_options_json: None,
                 fresh: true,
             })
             .collect();
@@ -2577,6 +2727,7 @@ mod tests {
                 columns: vec![format!("col_{i}")],
                 include_columns: vec![],
                 predicate_sql: None,
+                full_text_options_json: None,
                 fresh: true,
             })
             .collect();
@@ -2606,6 +2757,7 @@ mod tests {
             columns: vec!["a".into()],
             include_columns: vec![],
             predicate_sql: None,
+            full_text_options_json: None,
             fresh: false,
         });
         let findings = evaluate_rules(&data);
@@ -3088,6 +3240,7 @@ mod tests {
             }),
             indexes: vec![],
             named_snapshot_count: 0,
+            process_coordination: None,
             physical_bytes: 8192,
         }
     }
@@ -3224,6 +3377,7 @@ mod tests {
             columns: vec!["v".into()],
             include_columns: vec![],
             predicate_sql: None,
+            full_text_options_json: None,
             fresh: false,
         });
         let findings = evaluate_rules(&data);

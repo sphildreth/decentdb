@@ -27,6 +27,7 @@ mod planner;
 mod reactive;
 mod record;
 mod search;
+mod security;
 pub(crate) mod spatial;
 mod sql;
 mod storage;
@@ -43,8 +44,12 @@ pub use crate::branch::{
     BranchMergeOperation, BranchMergeReport, BranchRestoreReport, BranchRowDiff, BranchTableDiff,
     BranchTableDiffStatus, NamedSnapshot,
 };
-pub use crate::config::{DbConfig, WalSyncMode};
-pub use crate::db::{evict_shared_wal, Db, PreparedStatement, SqlTransaction};
+pub use crate::config::{
+    DbConfig, DbEncryptionConfig, EncryptionKey, ProcessCoordinationMode, WalSyncMode,
+};
+pub use crate::db::{
+    evict_shared_wal, Db, PreparedStatement, PreparedStatementBatch, SqlTransaction,
+};
 pub use crate::doctor::{
     render_markdown, run_doctor, sort_findings, DoctorCategory, DoctorCheckSelection,
     DoctorCollectedFacts, DoctorDatabaseSummary, DoctorEvidence, DoctorEvidenceValue,
@@ -52,7 +57,12 @@ pub use crate::doctor::{
     DoctorMode, DoctorOptions, DoctorPathMode, DoctorRecommendation, DoctorReport, DoctorSeverity,
     DoctorStatus, DoctorSummary,
 };
-pub use crate::error::{DbError, DbErrorCode, Result};
+pub use crate::error::{
+    DbDiagnostic, DbDiagnosticAuditContext, DbDiagnosticContext, DbDiagnosticOpenOptions,
+    DbDiagnosticParameter, DbDiagnosticPath, DbDiagnosticPathKind, DbDiagnosticRedaction,
+    DbDiagnosticSyncToken, DbDoctorHandoff, DbDoctorHandoffKind, DbError, DbErrorCode, Result,
+    DIAGNOSTIC_VERSION,
+};
 pub use crate::exec::{BulkLoadOptions, QueryResult, QueryRow};
 pub use crate::extensions::{
     validate_extension_package, Ed25519SignatureVerifier, ExtensionDependencyRecord,

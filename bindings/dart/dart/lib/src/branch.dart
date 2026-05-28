@@ -283,7 +283,12 @@ class BranchWorkflow {
   Never _throwStatus(int status, String fallback) {
     final msgPtr = _bindings.lastErrorMessage();
     final msg = msgPtr == nullptr ? fallback : msgPtr.toDartString();
-    throw DecentDbException(ErrorCode.fromCode(status), msg);
+    final diagnostic = _bindings.takeLastErrorDiagnostic();
+    throw DecentDbException(
+      ErrorCode.fromCode(status),
+      msg,
+      diagnostic: diagnostic,
+    );
   }
 }
 

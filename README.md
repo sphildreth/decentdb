@@ -24,25 +24,33 @@
 
 DecentDB is an embedded relational database engine built with Rust, focused on **durable ACID writes**, **fast reads**, and **predictable correctness**.
 
-It targets a single process with **one writer** and **many concurrent readers** under snapshot isolation, implementing a PostgreSQL-like SQL dialect (via libpg_query) on top of a fixed-page B+Tree storage engine and a write-ahead log (WAL) for durability.
+It preserves a **one writer** and **many concurrent readers** concurrency model under snapshot isolation, with local on-disk databases able to coordinate multiple native OS processes through WAL locks, reader slots, and a rebuildable coordination sidecar.
 
 ## Features
 
 - 🔒 **ACID Transactions** - Write-ahead logging with crash-safe recovery
+- 🔐 **Local Data Security** - Transparent data encryption, durable row
+  policies, projection masks, audit context functions, and queryable security
+  audit events
 - 🌳 **B+Tree Storage** - Efficient tables and secondary indexes with page caching
 - 🔁 **Local-First Sync** - Durable change journals, public changeset APIs, production HTTP/WebSocket relay, shape subscriptions, scoped peer replication, conflict workflows, operational doctor tooling, CLI commands, and .NET/web helpers
 - 📡 **Reactive Subscriptions** - In-process table, range, query, and change-stream watches deliver committed invalidation events with LSN boundaries, bounded lag handling, C ABI JSON polling, and Python/Go direct helpers
 - 🖥️ **Built-In HTTP Server And Web Console** - `decentdb serve` exposes a local HTTP API and embedded browser console for inspection, SQL execution, schema browsing, EXPLAIN, CSV export, and scripting
-- 🌐 **WASM Browser OPFS Support** - `@decentdb/web` runs DecentDB in a Dedicated Worker with an OPFS-backed VFS, async TypeScript API, binary result transport, checkpoint, import/export, persistence helpers, and browser smoke/benchmark coverage
+- 🌐 **WASM Browser OPFS Support** - `@decentdb/web` runs DecentDB in a Dedicated Worker with an OPFS-backed VFS, browser-app SQL profile metadata, transactions, prepared statement paging, binary result transport, checkpoint, import/export, persistence helpers, relay apply-before-ack helpers, and browser smoke/benchmark coverage
 - 🐘 **PostgreSQL-like SQL** - Familiar DDL/DML syntax with JOINs (INNER, LEFT, RIGHT, FULL OUTER, CROSS, NATURAL), CTEs (including WITH RECURSIVE), subqueries, window functions, and rich types (UUID, DECIMAL, native TIMESTAMP)
 - 🔎 **SQLite/PostgreSQL Compatibility Helpers** - Safe SQLite-style PRAGMAs, `sqlite_schema`, minimal `information_schema`, `generate_series`, `main.`/`temp.` qualifiers, and query-time built-in collations for easier tool and migration onboarding
 - 🧩 **Lua Extensions** - Manifest-declared Lua packages add scalar functions, table-valued functions, aggregates, and query-time collations with explicit install, enable, content-hash trust, CLI, Rust, and C ABI lifecycle APIs
 - 🕒 **Native TIMESTAMP Type** - DATE/TIMESTAMP columns stored as int64 microseconds since Unix epoch (UTC); correct `ORDER BY` and `EXTRACT(YEAR|MONTH|DAY|HOUR|MINUTE|SECOND FROM ...)`, with native bind/read in all bindings
 - 👥 **Concurrent Reads** - Snapshot isolation allows multiple readers with one writer
+- 🔐 **Cross-Process WAL Coordination** - Native byte-range locks and a
+  rebuildable `.coord` sidecar coordinate local on-disk databases across
+  processes, preserving one-writer/many-reader snapshot safety with diagnostics
 - 🚦 **Queued Write Concurrency** - Engine-owned bounded write queue with timeouts, metrics, and strict durable group commit for predictable in-process concurrent writes
 - 📈 **Queryable Operational Metrics** - Stable `sys.*` inspection views expose WAL, write-queue, storage, reactive subscription, and sync status snapshots without telemetry writes
 - 🌿 **Branch, Diff, Restore, And Time Travel** - Named snapshots, isolated branch writes, branch diffs, guarded restore, and constrained merge for migration rehearsal and agent sandboxes
 - 🔎 **Trigram Index** - Fast text search for `LIKE '%pattern%'` queries
+- 🔍 **Full-Text Search** - Native `USING fulltext` indexes with phrase/prefix
+  queries and BM25 ranking through `fulltext_match` and `bm25`
 - 🗺️ **Native Geospatial** - `GEOMETRY` / `GEOGRAPHY` values, `ST_*` functions, and `USING spatial` indexes
 - 🧪 **Comprehensive Testing** - Unit tests, property tests, crash injection, and differential testing
 - 🔄 **Foreign Key Constraints** - Automatic indexing and referential integrity enforcement
@@ -89,9 +97,12 @@ It targets a single process with **one writer** and **many concurrent readers** 
 - The native benchmark summary is generated with `cargo bench -p decentdb --bench embedded_compare`.
 - Optional Python-harness engines (for example `H2` and `HSQLDB`) are merged into the README summary with `python scripts/aggregate_benchmarks.py`.
 - The README chart assets are rendered from `data/bench_summary.json` by `python scripts/make_readme_chart.py` and `python scripts/visualize_alternative.py`.
+- Checked-in chart assets use the accepted release benchmark snapshot. Local diagnostic benchmark runs should not replace `data/bench_summary.json` unless they were collected in the release benchmark lane.
 - Native runs now keep DecentDB rows separate by profile:
-  - `decentdb_default_durable` — durability-focused default config (`wal_sync_full`, 4 MB cache)
+  - `decentdb_balanced_durable` — current balanced durable default config (`wal_sync_full`, 16 MB cache)
+  - `decentdb_low_memory_durable` — constrained-host durable config (`wal_sync_full`, 4 MB cache)
   - `decentdb_tuned_durable` — durability-preserving tuned config (`wal_sync_full`, 64 MB cache, `retain_paged_row_sources_after_commit`)
+  - `decentdb_default_durable` — legacy release-snapshot key for historical 4 MB default rows
 - SQLite results are reported as `sqlite_wal_full` (WAL+FULL sync); relaxed durability variants can be added as separate profiles when collected.
 - Chart values are **normalized vs SQLite** (baseline = 1.0), and the charted metric set is the full native set collected in the benchmark JSON:
   - `read_p95_ms`, `join_p95_ms`, `range_scan_p95_ms`, `aggregate_p95_ms`, `concurrent_read_p95_ms`, `commit_p95_ms`, `insert_rows_per_sec`.
@@ -190,6 +201,10 @@ decentdb exec --db ./my.ddb --sql "SELECT u.name, SUM(o.amount) AS total
 decentdb exec --db ./my.ddb --sql "CREATE INDEX idx_users_name ON users USING trigram(name)"
 decentdb exec --db ./my.ddb --sql "SELECT * FROM users WHERE name LIKE '%ali%'"
 
+# Ranked full-text search
+decentdb exec --db ./my.ddb --sql "CREATE INDEX idx_docs_search ON docs USING fulltext(title, body) WITH (prefix = '2,3')"
+decentdb exec --db ./my.ddb --sql "SELECT id, bm25('idx_docs_search') AS rank FROM docs WHERE fulltext_match('idx_docs_search', 'database OR search') ORDER BY rank DESC LIMIT 20"
+
 # Geospatial radius query with a spatial index
 decentdb exec --db ./my.ddb --sql "CREATE TABLE places (id INT PRIMARY KEY, geog GEOGRAPHY(POINT,4326))"
 decentdb exec --db ./my.ddb --sql "CREATE INDEX idx_places_geog ON places USING spatial(geog)"
@@ -266,7 +281,7 @@ DecentDB is organized into focused modules:
 - **Record** - Typed value encoding with overflow pages
 - **Catalog** - Schema metadata management
 - **SQL/Planner/Exec** - Query parsing, planning, and execution
-- **Search** - Trigram inverted index for text search
+- **Search** - Trigram substring search and native full-text search
 
 ## Development
 

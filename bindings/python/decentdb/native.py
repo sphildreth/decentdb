@@ -235,6 +235,8 @@ def load_library():
 
     _lib.ddb_last_error_message.argtypes = []
     _lib.ddb_last_error_message.restype = c_char_p
+    _lib.ddb_last_error_json.argtypes = [POINTER(c_char_p)]
+    _lib.ddb_last_error_json.restype = c_uint32
 
     _lib.ddb_value_init.argtypes = [POINTER(DdbValue)]
     _lib.ddb_value_init.restype = c_uint32
@@ -536,6 +538,7 @@ def load_library():
     _lib.ddb_result_value_copy.restype = c_uint32
 
     _lib.decentdb_last_error_message = _lib.ddb_last_error_message
+    _lib.decentdb_last_error_json = _lib.ddb_last_error_json
     _lib.decentdb_last_error_code = lambda *_args: getattr(
         _lib, "_last_error_code", ERR_INTERNAL
     )

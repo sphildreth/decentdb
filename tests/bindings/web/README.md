@@ -32,10 +32,14 @@ npm run browser:smoke
 `npm run browser:smoke` exercises:
 
 - capability probes and stable unsupported-runtime errors
+- `browser-app-v2` parser/profile metadata and SQL parity corpus assumptions
 - Dedicated Worker owner routing through BroadcastChannel and Web Locks
 - multi-tab owner sharing and recovery after the original owner tab closes
 - create/open flow
 - query
+- transactions and savepoints
+- prepared statement reset, paging, async-compatible cursor behavior, and
+  closed-statement errors
 - reopen with `open`
 - binary and JSON result transports
 - export
@@ -43,6 +47,7 @@ npm run browser:smoke
 - persist helper
 - import into a second database handle
 - browser runtime/storage/sync diagnostics
+- relay apply-before-ack helper ordering with a mocked relay ack
 
 ## Transport benchmark (S7 coverage)
 
@@ -52,8 +57,18 @@ From `bindings/web`, after building the package and wasm artifact:
 npm run browser:bench
 ```
 
-The benchmark exercises binary and JSON result transports against the same
-large-result shape and reports query time, row count, and WASM memory samples.
+The benchmark exercises cold open, warm reopen, first query, prepared point
+lookups, insert transaction batches, export/import, package asset sizes, and
+binary and JSON result transports against the same large-result shape. It
+reports timing, row count, and WASM memory samples and includes broad guardrails
+for startup/query regressions and binary-vs-JSON result transport.
+
+## SQL parity corpus
+
+`sql-parity-corpus.json` classifies representative browser-app-v2 SQL as
+`supported`, `unsupported_by_browser_profile`, `unsupported_by_native_engine`,
+or `deferred_requires_ADR`. Keep it aligned with the parser tests and docs when
+changing the browser SQL profile.
 
 If your environment lacks browser binaries, install Chromium once:
 

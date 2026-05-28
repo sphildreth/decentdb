@@ -11,7 +11,7 @@ use crate::storage::page::SUPPORTED_PAGE_SIZES;
 use crate::wal::delta::DELTA_FRAME_PAYLOAD_SIZE;
 use crate::wal::format::{FrameType, FRAME_HEADER_SIZE, FRAME_TRAILER_SIZE, WAL_HEADER_SIZE};
 
-use super::{FileKind, OpenMode, Vfs, VfsFile};
+use super::{FileKind, OpenMode, Vfs, VfsFile, VfsFileLock};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum FailAction {
@@ -73,6 +73,10 @@ impl Vfs for FaultyVfs {
 
     fn is_memory(&self) -> bool {
         self.inner.is_memory()
+    }
+
+    fn supports_file_locks(&self) -> bool {
+        self.inner.supports_file_locks()
     }
 }
 
@@ -218,6 +222,15 @@ impl VfsFile for FaultyVfsFile {
 
     fn set_len(&self, len: u64) -> Result<()> {
         self.inner.set_len(len)
+    }
+
+    fn try_lock_range(
+        &self,
+        offset: u64,
+        len: u64,
+        exclusive: bool,
+    ) -> Result<Option<Box<dyn VfsFileLock>>> {
+        self.inner.try_lock_range(offset, len, exclusive)
     }
 }
 
@@ -368,6 +381,7 @@ fn classify_read(kind: FileKind) -> &'static str {
         FileKind::Database => "db.read",
         FileKind::Wal => "wal.read",
         FileKind::SyncJournal => "sync.read",
+        FileKind::Coordination => "coord.read",
     }
 }
 
@@ -376,6 +390,7 @@ fn classify_sync(kind: FileKind) -> &'static str {
         FileKind::Database => "db.fsync",
         FileKind::Wal => "wal.fsync",
         FileKind::SyncJournal => "sync.fsync",
+        FileKind::Coordination => "coord.fsync",
     }
 }
 
@@ -384,6 +399,7 @@ fn classify_metadata_sync(kind: FileKind) -> &'static str {
         FileKind::Database => "db.sync_metadata",
         FileKind::Wal => "wal.sync_metadata",
         FileKind::SyncJournal => "sync.sync_metadata",
+        FileKind::Coordination => "coord.sync_metadata",
     }
 }
 
@@ -398,6 +414,7 @@ fn classify_write(kind: FileKind, offset: u64, buf: &[u8]) -> &'static str {
         }
         FileKind::Wal => classify_wal_write(offset, buf),
         FileKind::SyncJournal => "sync.write",
+        FileKind::Coordination => "coord.write",
     }
 }
 

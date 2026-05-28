@@ -68,6 +68,39 @@ void main() {
       );
     });
 
+    test('process coordination options expose sys views', () {
+      final tempDir =
+          Directory.systemTemp.createTempSync('decentdb_dart_coord_');
+      final dbPath = '${tempDir.path}/coord.ddb';
+      try {
+        final fileDb = Database.open(
+          dbPath,
+          libraryPath: libPath,
+          processCoordination: ProcessCoordinationMode.required,
+          processCoordinationTimeoutMs: 250,
+        );
+        fileDb.execute('CREATE TABLE t (id INT64 PRIMARY KEY, value TEXT)');
+        fileDb.execute("INSERT INTO t VALUES (1, 'one')");
+
+        final coordination =
+            fileDb.query('SELECT * FROM sys.process_coordination').single;
+        expect(coordination['mode'], 'required');
+        expect(coordination['enabled'], true);
+        expect(coordination['supported'], true);
+        expect(coordination['coord_path'], endsWith('.coord'));
+
+        final metrics =
+            fileDb.query('SELECT * FROM sys.process_lock_metrics').single;
+        expect(metrics['writer_lock_waits'], greaterThanOrEqualTo(0));
+        expect(metrics['reader_slots_allocated'], greaterThanOrEqualTo(0));
+
+        fileDb.close();
+        expect(File('$dbPath.coord').existsSync(), true);
+      } finally {
+        tempDir.deleteSync(recursive: true);
+      }
+    });
+
     test('operations on closed database throw', () {
       final closed = Database.open(':memory:', libraryPath: libPath);
       closed.close();

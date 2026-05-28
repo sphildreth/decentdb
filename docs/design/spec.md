@@ -197,17 +197,18 @@ Checkpointed pages are copied to the main database file.
 
 **Checkpoint Protocol:**
 1. Set `checkpoint_pending` flag to block new write transactions.
-2. Copy committed pages to main DB file (up to last commit).
-3. Determine `safe_truncate_lsn = min(active_readers_snapshot_lsn)`.
-   - If no readers, `safe_truncate_lsn = last_commit_lsn`.
-4. Write CHECKPOINT frame to WAL.
-5. **Conditionally Truncate:**
-   - If `safe_truncate_lsn` allows, truncate the WAL file.
-   - If readers are blocking truncation, the WAL remains large until the next checkpoint opportunistically truncates it.
-6. Clear `checkpoint_pending` flag.
+2. Determine whether any local reader, cross-process reader, unreadable reader
+   slot, or older named snapshot retention source is active.
+3. If any reader or retention blocker is active, skip copyback and truncation.
+   The WAL remains large until a reader-free checkpoint.
+4. Copy committed pages to the main DB file (up to the last commit).
+5. Determine `safe_truncate_lsn = last_commit_lsn`.
+6. Write CHECKPOINT frame to WAL.
+7. Truncate the WAL file.
+8. Clear `checkpoint_pending` flag.
 
 **Forced Checkpoint (Timeout):**
-- If we must checkpoint while readers are active, we proceed with the copy based on the `writer`'s LSN, but we **skip the WAL truncation** step for any portion needed by readers.
+- If readers are active, checkpoint returns without copyback or truncation.
 
 **WAL Growth Prevention (see ADR-0024):**
 - Implement reader tracking to monitor active readers and their snapshot LSNs

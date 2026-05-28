@@ -958,6 +958,7 @@ mod tests {
             }],
             include_columns: vec![],
             predicate_sql: None,
+            full_text: None,
             fresh: true,
         };
         let idx_b = IndexSchema {
@@ -971,6 +972,7 @@ mod tests {
             }],
             include_columns: vec![],
             predicate_sql: None,
+            full_text: None,
             fresh: true,
         };
         runtime

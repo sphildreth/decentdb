@@ -4,7 +4,7 @@ use std::error::Error;
 use std::path::Path;
 use std::sync::Arc;
 
-use js_sys::Uint8Array;
+use js_sys::{Object, Reflect, Uint8Array, JSON};
 use serde_json::{json, Value as JsonValue};
 use wasm_bindgen::prelude::*;
 
@@ -71,6 +71,53 @@ impl WebDb {
         Err(JsValue::from_str(
             "importBytes is managed by the @decentdb/web worker so OPFS handles can be closed and reopened safely",
         ))
+    }
+
+    #[wasm_bindgen(js_name = syncExecuteJson)]
+    pub fn sync_execute_json(&self, request_json: &str) -> std::result::Result<String, JsValue> {
+        let request: JsonValue = serde_json::from_str(request_json)
+            .map_err(|error| js_db_error(DbError::sql(format!("invalid sync JSON: {error}"))))?;
+        let object = request
+            .as_object()
+            .ok_or_else(|| js_db_error(DbError::sql("sync JSON request must be an object")))?;
+        let op = object
+            .get("op")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| js_db_error(DbError::sql("sync JSON request requires op")))?;
+        match op {
+            "changeset_apply" => {
+                let changeset = object.get("changeset").cloned().ok_or_else(|| {
+                    js_db_error(DbError::sql("changeset_apply requires changeset"))
+                })?;
+                let changeset: crate::sync::SyncChangeset = serde_json::from_value(changeset)
+                    .map_err(|error| {
+                        js_db_error(DbError::sql(format!("invalid changeset payload: {error}")))
+                    })?;
+                let options = object
+                    .get("options")
+                    .cloned()
+                    .map(serde_json::from_value::<crate::sync::ApplyChangesetOptions>)
+                    .transpose()
+                    .map_err(|error| {
+                        js_db_error(DbError::sql(format!(
+                            "invalid changeset apply options: {error}"
+                        )))
+                    })?
+                    .unwrap_or_default();
+                let result = self
+                    .db()?
+                    .sync_apply_changeset(&changeset, options)
+                    .map_err(js_db_error)?;
+                serde_json::to_string(&result).map_err(|error| {
+                    js_db_error(DbError::internal(format!(
+                        "serialize changeset apply result: {error}"
+                    )))
+                })
+            }
+            other => Err(js_db_error(DbError::sql(format!(
+                "unsupported browser sync op: {other}"
+            )))),
+        }
     }
 
     #[wasm_bindgen(js_name = close)]
@@ -470,5 +517,43 @@ fn js_db_error(error: DbError) -> JsValue {
         message.push_str(": ");
         message.push_str(&source.to_string());
     }
-    JsValue::from_str(&message)
+    let mut diagnostic = error.diagnostic();
+    diagnostic.message = message.clone();
+    let diagnostic_json = diagnostic.to_json().unwrap_or_else(|_| "{}".to_string());
+
+    let object = Object::new();
+    set_js_property(&object, "code", JsValue::from_str(diagnostic.code_name));
+    set_js_property(&object, "message", JsValue::from_str(&message));
+    set_js_property(
+        &object,
+        "nativeCode",
+        JsValue::from_f64(f64::from(diagnostic.code.as_u32())),
+    );
+    set_js_property(&object, "subcode", JsValue::from_str(diagnostic.subcode));
+    if let Some(sqlstate) = diagnostic.sqlstate {
+        set_js_property(&object, "sqlstate", JsValue::from_str(sqlstate));
+    }
+    set_js_property(
+        &object,
+        "retryable",
+        JsValue::from_bool(diagnostic.retryable),
+    );
+    set_js_property(
+        &object,
+        "permanent",
+        JsValue::from_bool(diagnostic.permanent),
+    );
+    set_js_property(
+        &object,
+        "diagnosticJson",
+        JsValue::from_str(&diagnostic_json),
+    );
+    if let Ok(parsed) = JSON::parse(&diagnostic_json) {
+        set_js_property(&object, "diagnostic", parsed);
+    }
+    object.into()
+}
+
+fn set_js_property(object: &Object, key: &str, value: JsValue) {
+    let _ = Reflect::set(object, &JsValue::from_str(key), &value);
 }

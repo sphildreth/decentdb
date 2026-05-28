@@ -128,7 +128,12 @@ class Statement {
         final msg = msgPtr == nullptr
             ? 'Failed to prepare statement'
             : msgPtr.toDartString();
-        throw DecentDbException(ErrorCode.fromCode(status), msg);
+        final diagnostic = bindings.takeLastErrorDiagnostic();
+        throw DecentDbException(
+          ErrorCode.fromCode(status),
+          msg,
+          diagnostic: diagnostic,
+        );
       }
       return Statement._(bindings, outStmt.value);
     } finally {
@@ -164,7 +169,12 @@ class Statement {
   Never _throwStatus(int status, String fallback) {
     final msgPtr = _bindings.lastErrorMessage();
     final msg = msgPtr == nullptr ? fallback : msgPtr.toDartString();
-    throw DecentDbException(ErrorCode.fromCode(status), msg);
+    final diagnostic = _bindings.takeLastErrorDiagnostic();
+    throw DecentDbException(
+      ErrorCode.fromCode(status),
+      msg,
+      diagnostic: diagnostic,
+    );
   }
 
   void _invalidateExecution() {

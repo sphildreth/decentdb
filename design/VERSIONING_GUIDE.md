@@ -62,6 +62,20 @@ exists in the Rust repository today.
 
 - `bindings/dart/dart/pubspec.yaml`  
   Update `version`.
+- `bindings/dart/flutter/pubspec.yaml`  
+  Update `version` when the Flutter mobile package is released from this
+  repository. If it uses a local path dependency on `decentdb` during
+  development, release packaging must swap or validate that dependency before
+  publishing.
+- `bindings/dart/flutter/android/build.gradle`
+- `bindings/dart/flutter/ios/decentdb_flutter.podspec`
+- `bindings/dart/flutter/example/pubspec.yaml`
+  The checked-in Flutter reference app follows the mobile package release line
+  because it is used by release artifact validation.
+- Dart `pubspec.lock` files that pin local `path` dependencies on `decentdb` or
+  `decentdb_flutter`
+  Refresh only the local path package versions; do not rewrite hosted
+  dependency versions such as `args`.
 
 ### Node bindings
 
@@ -76,6 +90,18 @@ For the Node packages, update both the manifest and the lockfile's top-level pac
 
 - `docs/about/changelog.md`  
   Add or update release notes under `Unreleased` or under the new version heading, depending on the release process being used.
+- `docs/user-guide/benchmarks.md`
+  Update the DecentDB engine version stamp when the workspace release version
+  changes.
+- `design/FUTURE_WINS.md`
+  Update the current public release marker that defines the `vNext` planning
+  bucket. Historical delivered-context references stay unchanged.
+
+### Secondary lockfiles
+
+- `benchmarks/rust-baseline/Cargo.lock`
+  Update only the local workspace path package versions for `decentdb` and
+  `libpg_query_sys`; leave third-party crate versions untouched.
 
 ### Release automation
 
@@ -87,7 +113,8 @@ For the Node packages, update both the manifest and the lockfile's top-level pac
 ## 3. Files that usually do **not** need a version bump
 
 Do **not** bump unrelated example/demo app versions just to match the DecentDB
-release unless they explicitly surface the shipped DecentDB version to users.
+release unless they explicitly surface the shipped DecentDB version to users or
+participate in release artifact validation.
 
 Examples:
 
@@ -155,11 +182,24 @@ rg 'OLD_VERSION|vOLD_VERSION' \
   bindings/java/dbeaver-extension/build.gradle \
   bindings/java/dbeaver-extension/META-INF/MANIFEST.MF \
   bindings/dart/dart/pubspec.yaml \
+  bindings/dart/flutter/pubspec.yaml \
+  bindings/dart/flutter/android/build.gradle \
+  bindings/dart/flutter/ios/decentdb_flutter.podspec \
+  bindings/dart/flutter/example/pubspec.yaml \
+  bindings/dart/flutter/pubspec.lock \
+  bindings/dart/flutter/example/pubspec.lock \
+  bindings/dart/examples/console/pubspec.lock \
+  bindings/dart/examples/console_complex/pubspec.lock \
+  bindings/dart/examples/flutter_desktop/pubspec.lock \
+  tests/bindings/dart/pubspec.lock \
   bindings/node/decentdb/package.json \
   bindings/node/decentdb/package-lock.json \
   bindings/node/knex-decentdb/package.json \
   bindings/node/knex-decentdb/package-lock.json \
+  benchmarks/rust-baseline/Cargo.lock \
   docs/about/changelog.md \
+  docs/user-guide/benchmarks.md \
+  design/FUTURE_WINS.md \
   .github/workflows/nuget.yml
 ```
 

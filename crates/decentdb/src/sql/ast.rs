@@ -53,6 +53,12 @@ pub(crate) enum Statement {
         table_name: String,
         actions: Vec<AlterTableAction>,
     },
+    AlterIndexRebuild {
+        name: String,
+    },
+    AlterIndexVerify {
+        name: String,
+    },
     TruncateTable {
         table_name: String,
         identity: TruncateIdentityMode,
@@ -474,12 +480,19 @@ pub(crate) struct CreateIndexStatement {
     pub(crate) columns: Vec<IndexExpression>,
     pub(crate) include_columns: Vec<String>,
     pub(crate) predicate: Option<Expr>,
+    pub(crate) options: Vec<IndexOption>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum IndexExpression {
     Column(String),
     Expr(Expr),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct IndexOption {
+    pub(crate) name: String,
+    pub(crate) value: Value,
 }
 
 #[derive(Clone, Debug, PartialEq)]

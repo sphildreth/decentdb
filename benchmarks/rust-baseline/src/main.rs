@@ -7,7 +7,7 @@
 // Hot-path pattern (identical to the internal `decentdb-benchmark` scenarios):
 //   1. db.transaction()          -> SqlTransaction (exclusive runtime state)
 //   2. txn.prepare("INSERT ...") -> PreparedStatement (parsed once)
-//   3. prepared.execute_in(&mut txn, &[Value::..., ...])   -- per row
+//   3. txn.prepared_batch(...).execute_mut(&mut [Value::..., ...]) -- per row
 //   4. txn.commit()              -- single WAL commit per batch
 //
 // Scales mirror DecentDB.Compare.Common.Scale exactly.
@@ -16,11 +16,11 @@
 // same shape as RunReport so it can be diffed against the .NET reports.
 
 use std::fs;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{bail, Context};
-use chrono::{TimeZone, Utc};
 use clap::{Parser, ValueEnum};
 use decentdb::{DbConfig, PreparedStatement, Value};
 use serde::{Deserialize, Serialize};
@@ -133,18 +133,23 @@ fn parse_scale(name: &str) -> Scale {
 // --- deterministic RNG -----------------------------------------------------
 // SplitMix64 - small, fast, deterministic. We don't need to byte-match the
 // .NET System.Random output; we just need stable, reproducible seed plans.
+const SPLITMIX64_INCREMENT: u64 = 0x9E3779B97F4A7C15;
+
 #[derive(Clone)]
 struct Rng(u64);
 impl Rng {
     fn new(seed: u64) -> Self {
-        Self(seed.wrapping_add(0x9E3779B97F4A7C15))
+        Self(seed.wrapping_add(SPLITMIX64_INCREMENT))
     }
     fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
+        self.0 = self.0.wrapping_add(SPLITMIX64_INCREMENT);
         let mut z = self.0;
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
         z ^ (z >> 31)
+    }
+    fn skip(&mut self, count: u64) {
+        self.0 = self.0.wrapping_add(SPLITMIX64_INCREMENT.wrapping_mul(count));
     }
     /// Uniform in [0, n).
     fn gen_range(&mut self, n: u32) -> u32 {
@@ -186,13 +191,44 @@ struct SeedSummary {
     total_songs: u64,
 }
 
-fn summarize_seed_plan(scale: Scale, seed: u64) -> SeedSummary {
-    walk_seed_plan(scale, seed, |_| {}, |_| {}, |_| {})
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SeedWalkEmit {
+    artists: bool,
+    albums: bool,
+    songs: bool,
 }
 
-fn walk_seed_plan(
+impl SeedWalkEmit {
+    const NONE: Self = Self {
+        artists: false,
+        albums: false,
+        songs: false,
+    };
+    const ARTISTS: Self = Self {
+        artists: true,
+        albums: false,
+        songs: false,
+    };
+    const ALBUMS: Self = Self {
+        artists: false,
+        albums: true,
+        songs: false,
+    };
+    const SONGS: Self = Self {
+        artists: false,
+        albums: false,
+        songs: true,
+    };
+}
+
+fn summarize_seed_plan(scale: Scale, seed: u64) -> SeedSummary {
+    walk_seed_plan_select(scale, seed, SeedWalkEmit::NONE, |_| {}, |_| {}, |_| {})
+}
+
+fn walk_seed_plan_select(
     scale: Scale,
     seed: u64,
+    emit: SeedWalkEmit,
     mut on_artist: impl FnMut(ArtistSeed),
     mut on_album: impl FnMut(AlbumSeed),
     mut on_song: impl FnMut(SongSeed),
@@ -224,27 +260,40 @@ fn walk_seed_plan(
             }
             album_counter += 1;
             let album_id = album_counter;
-            for _ in 0..songs_this_album {
-                song_counter += 1;
-                on_song(SongSeed {
-                    id: song_counter,
-                    album_id,
+            if emit.songs {
+                for _ in 0..songs_this_album {
+                    song_counter += 1;
+                    let duration_ms = 60_000 + rng.gen_range(360_000) as i32;
+                    on_song(SongSeed {
+                        id: song_counter,
+                        album_id,
+                        artist_id,
+                        duration_ms,
+                    });
+                }
+            } else {
+                song_counter += songs_this_album;
+                rng.skip(songs_this_album as u64);
+            }
+            let release_year = 1960 + rng.gen_range(65) as i32;
+            if emit.albums {
+                on_album(AlbumSeed {
+                    id: album_id,
                     artist_id,
-                    duration_ms: 60_000 + rng.gen_range(360_000) as i32,
+                    release_year,
                 });
             }
-            on_album(AlbumSeed {
-                id: album_id,
-                artist_id,
-                release_year: 1960 + rng.gen_range(65) as i32,
-            });
         }
 
-        on_artist(ArtistSeed {
-            id: artist_id,
-            country: COUNTRIES[rng.gen_range(COUNTRIES.len() as u32) as usize],
-            formed_year: 1950 + rng.gen_range(75) as i32,
-        });
+        let country = COUNTRIES[rng.gen_range(COUNTRIES.len() as u32) as usize];
+        let formed_year = 1950 + rng.gen_range(75) as i32;
+        if emit.artists {
+            on_artist(ArtistSeed {
+                id: artist_id,
+                country,
+                formed_year,
+            });
+        }
     }
 
     SeedSummary {
@@ -550,51 +599,72 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         decentdb::Db::create(&db_path, cli.profile.db_config()).expect("Db::create")
     });
 
+    let ddl_batch = build_schema_ddl_batch();
     rec.measure("schema_create", None, || {
-        for stmt in DDL {
-            db.execute(stmt).expect("ddl");
-        }
+        db.execute_batch(&ddl_batch).expect("ddl batch");
     });
 
+    let insert_artist: PreparedStatement = db
+        .prepare(
+            "INSERT INTO artists (id, name, country, formed_year) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .expect("prepare artists");
     // ── Seed artists ──────────────────────────────────────────────
     rec.measure("seed_artists", Some(u64::from(scale.artists)), || {
         let mut txn = db.transaction().expect("begin");
-        let prepared: PreparedStatement = txn
-            .prepare(
-                "INSERT INTO artists (id, name, country, formed_year) \
-                 VALUES ($1, $2, $3, $4)",
-            )
-            .expect("prepare artists");
         let params: &mut [Value] = &mut [
             Value::Int64(0),
             Value::Text(String::new()),
             Value::Text(String::new()),
             Value::Int64(0),
         ];
-        walk_seed_plan(
-            scale,
-            cli.seed,
-            |a| {
-                params[0] = Value::Int64(a.id);
-                params[1] = Value::Text(format!("Artist {}", a.id));
-                params[2] = Value::Text(a.country.to_string());
-                params[3] = Value::Int64(a.formed_year as i64);
-                prepared.execute_in(&mut txn, params).expect("ins artist");
-            },
-            |_| {},
-            |_| {},
-        );
+        let mut artist_name = String::with_capacity(32);
+        {
+            let mut batch = txn
+                .prepared_batch(&insert_artist, params.len())
+                .expect("prepare artist batch");
+            walk_seed_plan_select(
+                scale,
+                cli.seed,
+                SeedWalkEmit::ARTISTS,
+                |a| {
+                    params[0] = Value::Int64(a.id);
+                    artist_name.clear();
+                    artist_name.push_str("Artist ");
+                    write!(&mut artist_name, "{}", a.id).expect("write artist name");
+                    params[1] = Value::Text(artist_name.clone());
+                    params[2] = Value::Text(a.country.to_string());
+                    params[3] = Value::Int64(a.formed_year as i64);
+                    batch.execute_mut(params).expect("ins artist");
+                },
+                |_| {},
+                |_| {},
+            );
+        }
         txn.commit().expect("commit artists");
     });
 
+    let insert_album: PreparedStatement = db
+        .prepare(
+            "INSERT INTO albums (id, artist_id, title, release_year) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .expect("prepare albums");
     // ── Seed albums ───────────────────────────────────────────────
     rec.measure("seed_albums", Some(summary.total_albums), || {
-        seed_albums(&db, scale, cli.seed);
+        seed_albums(&db, &insert_album, scale, cli.seed);
     });
 
+    let insert_song: PreparedStatement = db
+        .prepare(
+            "INSERT INTO songs (id, album_id, artist_id, title, duration_ms) \
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .expect("prepare songs");
     // ── Seed songs ────────────────────────────────────────────────
     rec.measure("seed_songs", Some(summary.total_songs), || {
-        seed_songs(&db, scale, cli.seed);
+        seed_songs(&db, &insert_song, scale, cli.seed);
     });
 
     // ── Queries ───────────────────────────────────────────────────
@@ -693,7 +763,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     report.finished_unix = now_unix();
 
     fs::create_dir_all(&cli.out_dir)?;
-    let datetime_stamp = Utc::now().format("%Y-%m-%d-%H%M").to_string();
+    let datetime_stamp = format_unix_filename_stamp(report.finished_unix);
     let out_path = cli.out_dir.join(format!(
         "{datetime_stamp}-rust-baseline-{}-{}.json",
         cli.profile.as_str(),
@@ -708,44 +778,42 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn seed_albums(db: &decentdb::Db, scale: Scale, seed: u64) {
+fn seed_albums(db: &decentdb::Db, prepared: &PreparedStatement, scale: Scale, seed: u64) {
     let mut txn = db.transaction().expect("begin albums");
-    let prepared = txn
-        .prepare(
-            "INSERT INTO albums (id, artist_id, title, release_year) \
-             VALUES ($1, $2, $3, $4)",
-        )
-        .expect("prepare albums");
     let params: &mut [Value] = &mut [
         Value::Int64(0),
         Value::Int64(0),
         Value::Text(String::new()),
         Value::Int64(0),
     ];
-    walk_seed_plan(
-        scale,
-        seed,
-        |_| {},
-        |al| {
-            params[0] = Value::Int64(al.id);
-            params[1] = Value::Int64(al.artist_id);
-            params[2] = Value::Text(format!("Album {}", al.id));
-            params[3] = Value::Int64(al.release_year as i64);
-            prepared.execute_in(&mut txn, params).expect("ins album");
-        },
-        |_| {},
-    );
+    let mut album_title = String::with_capacity(32);
+    {
+        let mut batch = txn
+            .prepared_batch(prepared, params.len())
+            .expect("prepare album batch");
+        walk_seed_plan_select(
+            scale,
+            seed,
+            SeedWalkEmit::ALBUMS,
+            |_| {},
+            |al| {
+                params[0] = Value::Int64(al.id);
+                params[1] = Value::Int64(al.artist_id);
+                album_title.clear();
+                album_title.push_str("Album ");
+                write!(&mut album_title, "{}", al.id).expect("write album title");
+                params[2] = Value::Text(album_title.clone());
+                params[3] = Value::Int64(al.release_year as i64);
+                batch.execute_mut(params).expect("ins album");
+            },
+            |_| {},
+        );
+    }
     txn.commit().expect("commit albums");
 }
 
-fn seed_songs(db: &decentdb::Db, scale: Scale, seed: u64) {
+fn seed_songs(db: &decentdb::Db, prepared: &PreparedStatement, scale: Scale, seed: u64) {
     let mut txn = db.transaction().expect("begin songs");
-    let prepared = txn
-        .prepare(
-            "INSERT INTO songs (id, album_id, artist_id, title, duration_ms) \
-             VALUES ($1, $2, $3, $4, $5)",
-        )
-        .expect("prepare songs");
     let params: &mut [Value] = &mut [
         Value::Int64(0),
         Value::Int64(0),
@@ -753,24 +821,44 @@ fn seed_songs(db: &decentdb::Db, scale: Scale, seed: u64) {
         Value::Text(String::new()),
         Value::Int64(0),
     ];
-    walk_seed_plan(
-        scale,
-        seed,
-        |_| {},
-        |_| {},
-        |s| {
-            params[0] = Value::Int64(s.id);
-            params[1] = Value::Int64(s.album_id);
-            params[2] = Value::Int64(s.artist_id);
-            params[3] = Value::Text(format!("Song {}", s.id));
-            params[4] = Value::Int64(s.duration_ms as i64);
-            prepared.execute_in(&mut txn, params).expect("ins song");
-        },
-    );
+    let mut song_title = String::with_capacity(32);
+    {
+        let mut batch = txn
+            .prepared_batch(prepared, params.len())
+            .expect("prepare song batch");
+        walk_seed_plan_select(
+            scale,
+            seed,
+            SeedWalkEmit::SONGS,
+            |_| {},
+            |_| {},
+            |s| {
+                params[0] = Value::Int64(s.id);
+                params[1] = Value::Int64(s.album_id);
+                params[2] = Value::Int64(s.artist_id);
+                song_title.clear();
+                song_title.push_str("Song ");
+                write!(&mut song_title, "{}", s.id).expect("write song title");
+                params[3] = Value::Text(song_title.clone());
+                params[4] = Value::Int64(s.duration_ms as i64);
+                batch.execute_mut(params).expect("ins song");
+            },
+        );
+    }
     txn.commit().expect("commit songs");
 }
 
 // --- helpers ---------------------------------------------------------------
+fn build_schema_ddl_batch() -> String {
+    let mut sql = String::from("BEGIN;\n");
+    for stmt in DDL {
+        sql.push_str(stmt);
+        sql.push_str(";\n");
+    }
+    sql.push_str("COMMIT;");
+    sql
+}
+
 fn first_value(r: &decentdb::QueryResult) -> Option<Value> {
     r.rows()
         .first()
@@ -932,10 +1020,40 @@ fn scale_rank(name: &str) -> usize {
 }
 
 fn format_unix_label(unix: u64) -> String {
-    Utc.timestamp_opt(unix as i64, 0)
-        .single()
-        .map(|ts| ts.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-        .unwrap_or_else(|| format!("{unix}"))
+    let (year, month, day, hour, minute, second) = unix_utc_parts(unix);
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} UTC")
+}
+
+fn format_unix_filename_stamp(unix: u64) -> String {
+    let (year, month, day, hour, minute, _) = unix_utc_parts(unix);
+    format!("{year:04}-{month:02}-{day:02}-{hour:02}{minute:02}")
+}
+
+fn unix_utc_parts(unix: u64) -> (i32, u32, u32, u32, u32, u32) {
+    let days = (unix / 86_400) as i64;
+    let seconds_of_day = unix % 86_400;
+    let (year, month, day) = civil_from_unix_days(days);
+    let hour = (seconds_of_day / 3_600) as u32;
+    let minute = ((seconds_of_day % 3_600) / 60) as u32;
+    let second = (seconds_of_day % 60) as u32;
+    (year, month, day, hour, minute, second)
+}
+
+fn civil_from_unix_days(days: i64) -> (i32, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = z - era * 146_097;
+    let year_of_era = (day_of_era - day_of_era / 1_460 + day_of_era / 36_524
+        - day_of_era / 146_096)
+        / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year =
+        day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    let year = year + i64::from(month <= 2);
+    (year as i32, month as u32, day as u32)
 }
 
 fn build_report_html(data: &HtmlReportData) -> anyhow::Result<String> {
@@ -1407,8 +1525,9 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        ordered_step_names, parse_scale, summarize_seed_plan, HistoricalRun, RunReport, StepMetric,
-        HUGE, SMOKE,
+        format_unix_filename_stamp, format_unix_label, ordered_step_names, parse_scale,
+        summarize_seed_plan, walk_seed_plan_select, HistoricalRun, RunReport, SeedWalkEmit,
+        StepMetric, HUGE, SMOKE,
     };
 
     #[test]
@@ -1427,6 +1546,67 @@ mod tests {
 
         assert_eq!(summary.total_albums, 5_000);
         assert_eq!(summary.total_songs, 27_783);
+    }
+
+    #[test]
+    fn selective_seed_walk_preserves_emitted_rows() {
+        let mut full_artists = Vec::new();
+        let mut full_albums = Vec::new();
+        let mut full_songs = Vec::new();
+        walk_seed_plan_select(
+            SMOKE,
+            42,
+            SeedWalkEmit {
+                artists: true,
+                albums: true,
+                songs: true,
+            },
+            |row| full_artists.push(row),
+            |row| full_albums.push(row),
+            |row| full_songs.push(row),
+        );
+
+        let mut artists = Vec::new();
+        walk_seed_plan_select(
+            SMOKE,
+            42,
+            SeedWalkEmit::ARTISTS,
+            |row| artists.push(row),
+            |_| {},
+            |_| {},
+        );
+        assert_eq!(artists, full_artists);
+
+        let mut albums = Vec::new();
+        walk_seed_plan_select(
+            SMOKE,
+            42,
+            SeedWalkEmit::ALBUMS,
+            |_| {},
+            |row| albums.push(row),
+            |_| {},
+        );
+        assert_eq!(albums, full_albums);
+
+        let mut songs = Vec::new();
+        walk_seed_plan_select(
+            SMOKE,
+            42,
+            SeedWalkEmit::SONGS,
+            |_| {},
+            |_| {},
+            |row| songs.push(row),
+        );
+        assert_eq!(songs, full_songs);
+    }
+
+    #[test]
+    fn unix_timestamp_formatting_is_utc() {
+        assert_eq!(format_unix_filename_stamp(1_779_193_075), "2026-05-19-1217");
+        assert_eq!(
+            format_unix_label(1_779_193_075),
+            "2026-05-19 12:17:55 UTC"
+        );
     }
 
     #[test]

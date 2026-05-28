@@ -21,6 +21,7 @@ DECENTDB_ENGINE_NAME = "DecentDB"
 def _flatten_bundle(bundle: ResultsBundle) -> List[Dict[str, object]]:
     rows: List[Dict[str, object]] = []
     for result in bundle.results:
+        metadata = result.metadata or {}
         rows.append(
             {
                 "engine": result.engine,
@@ -34,6 +35,12 @@ def _flatten_bundle(bundle: ResultsBundle) -> List[Dict[str, object]]:
                 "workload": bundle.manifest.workload_name,
                 "transaction_mode": bundle.manifest.transaction_mode,
                 "durability_mode": bundle.manifest.durability_mode,
+                "process_state": metadata.get("process_state", ""),
+                "os_cache_state": metadata.get("os_cache_state", ""),
+                "storage_state": metadata.get("storage_state", ""),
+                "storage_bytes": metadata.get("storage_bytes", 0),
+                "storage_bytes_main": metadata.get("storage_bytes_main", 0),
+                "storage_bytes_wal": metadata.get("storage_bytes_wal", 0),
             }
         )
     return rows

@@ -9,7 +9,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
-use decentdb::{Db, DbConfig, StorageInfo, Value};
+use decentdb::{Db, DbConfig, DbError, StorageInfo, Value};
 
 use crate::output::stringify_value;
 
@@ -639,7 +639,7 @@ fn handle_sql(
                 return write_json_response(
                     stream,
                     400,
-                    api_error("SQL_SYNTAX_ERROR", &error.to_string()),
+                    api_engine_error("SQL_SYNTAX_ERROR", &error),
                     state,
                 );
             }
@@ -662,7 +662,7 @@ fn handle_sql(
             return write_json_response(
                 stream,
                 400,
-                api_error("INVALID_REQUEST", &error.to_string()),
+                api_engine_error("INVALID_REQUEST", &error),
                 state,
             );
         }
@@ -935,6 +935,19 @@ fn status_reason(status: u16) -> &'static str {
 
 fn api_error(code: &str, message: &str) -> serde_json::Value {
     serde_json::json!({"error": {"code": code, "message": message}})
+}
+
+fn api_engine_error(code: &str, error: &DbError) -> serde_json::Value {
+    let diagnostic = error.diagnostic();
+    serde_json::json!({
+        "error": {
+            "code": code,
+            "native_code": error.numeric_code(),
+            "subcode": diagnostic.subcode,
+            "message": error.to_string(),
+            "diagnostic": diagnostic,
+        }
+    })
 }
 
 fn validate_limits(command: &ServeCommandOptions) -> Result<()> {

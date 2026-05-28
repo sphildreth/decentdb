@@ -10,10 +10,11 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::thread;
 
 use crate::config::DbConfig;
-use crate::error::Result;
+use crate::error::{DbError, Result};
 use crate::storage::PagerHandle;
 use crate::vfs::{FileKind, OpenMode, VfsHandle};
 
+use super::coordination::ProcessCoordinator;
 use super::index_sidecar::{WalIndexBackendKind, WalIndexSidecar};
 use super::reader_registry::ReaderRegistry;
 use super::recovery;
@@ -24,9 +25,10 @@ pub(crate) fn acquire(
     db_path: &Path,
     config: &DbConfig,
     pager: &PagerHandle,
+    process_coordinator: Option<ProcessCoordinator>,
 ) -> Result<WalHandle> {
     if vfs.is_memory() {
-        return build_handle(vfs, None, db_path, config, pager);
+        return build_handle(vfs, None, db_path, config, pager, process_coordinator);
     }
 
     let canonical_path = vfs.canonicalize_path(db_path)?;
@@ -39,6 +41,11 @@ pub(crate) fn acquire(
             while existing.checkpoint_pending.load(Ordering::SeqCst) {
                 thread::yield_now();
             }
+            if process_coordinator.is_some() && existing.process_coordinator.is_none() {
+                return Err(DbError::transaction(
+                    "existing same-process WAL handle was opened without process coordination",
+                ));
+            }
             return Ok(WalHandle { inner: existing });
         }
     }
@@ -49,6 +56,7 @@ pub(crate) fn acquire(
         &canonical_path,
         config,
         pager,
+        process_coordinator,
     )?;
     registry
         .lock()
@@ -63,6 +71,7 @@ fn build_handle(
     db_path: &Path,
     config: &DbConfig,
     pager: &PagerHandle,
+    process_coordinator: Option<ProcessCoordinator>,
 ) -> Result<WalHandle> {
     let wal_path = wal_path_for_db(db_path);
     let mode = if vfs.file_exists(&wal_path)? {
@@ -91,6 +100,22 @@ fn build_handle(
         ),
         _ => None,
     };
+    let published_coordination = process_coordinator
+        .as_ref()
+        .map(|coordinator| {
+            coordinator.publish_recovered_wal(end_lsn, pager.header_snapshot()?.last_checkpoint_lsn)
+        })
+        .transpose()?;
+    let (observed_coord_wal_generation, observed_coord_checkpoint_generation) =
+        if let Some(snapshot) = published_coordination {
+            (snapshot.wal_generation, snapshot.checkpoint_generation)
+        } else if let Some(coordinator) = &process_coordinator {
+            let snapshot = coordinator.snapshot()?;
+            (snapshot.wal_generation, snapshot.checkpoint_generation)
+        } else {
+            (0, 0)
+        };
+
     let inner = Arc::new(SharedWalInner {
         canonical_path,
         file,
@@ -113,7 +138,11 @@ fn build_handle(
         pages_since_checkpoint: AtomicU32::new(0),
         checkpoint_scratch: Mutex::new(Vec::new()),
         materialize_scratch: Mutex::new(Vec::with_capacity(config.page_size as usize)),
+        background_checkpoint_worker: config.background_checkpoint_worker,
         bg_checkpointer: std::sync::OnceLock::new(),
+        process_coordinator,
+        observed_coord_wal_generation: AtomicU64::new(observed_coord_wal_generation),
+        observed_coord_checkpoint_generation: AtomicU64::new(observed_coord_checkpoint_generation),
     });
 
     if let Some(sidecar) = &inner.index_sidecar {
@@ -128,19 +157,6 @@ fn build_handle(
             inner: Arc::clone(&inner),
         };
         wal.spill_excess_hot_pages_locked(&mut index, &mut sidecar)?;
-    }
-
-    // Background checkpoint worker (ADR 0058). Only spawn when at least one
-    // size-based threshold is enabled; otherwise the worker would be idle
-    // forever and just consume an OS thread.
-    let cfg = AutoCheckpointConfig::from_db_config(config);
-    let any_threshold_enabled = cfg.threshold_pages != 0 || cfg.threshold_bytes != 0;
-    if config.background_checkpoint_worker && any_threshold_enabled {
-        let bg = super::background::BgCheckpointer::start(Arc::downgrade(&inner), pager.clone());
-        // `set` only fails if the cell was already initialized; build_handle
-        // is the sole writer so this is unreachable in practice. Drop the
-        // result rather than `expect`-ing to keep the cdylib boundary clean.
-        let _ = inner.bg_checkpointer.set(bg);
     }
 
     Ok(WalHandle { inner })

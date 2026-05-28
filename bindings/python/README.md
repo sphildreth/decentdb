@@ -44,9 +44,18 @@ native `DATE`, `TIME`, and `TIMESTAMPTZ` column types.
 DecentDB operates as an embedded database with the following concurrency model:
 - **Single Writer**: Only one connection can write to the database at a time.
 - **Multiple Readers**: Multiple connections can read simultaneously (Snapshot Isolation).
-- **Process Model**: Currently optimized for single-process usage. Multi-process sharing is not guaranteed safe yet.
+- **Process Model**: Local on-disk databases coordinate native OS processes through the WAL coordination sidecar when the VFS supports file locks.
 
-**Recommendation**: Ensure your application architecture enforces a single-writer pattern (e.g. via a dedicated writer thread or queue).
+Use `process_coordination="required"` when multi-process safety is required:
+
+```python
+with connect(
+    "app.ddb",
+    process_coordination="required",
+    process_coordination_timeout_ms=30_000,
+) as con:
+    print(con.execute("SELECT * FROM sys.process_coordination").fetchone())
+```
 
 ## Bounded Write Queue (DDB v3)
 

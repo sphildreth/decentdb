@@ -5,6 +5,155 @@ All notable changes to DecentDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.8.0] - [2026-05-28]
+
+### Added
+
+- Added local data security v1: transparent data encryption for database, WAL,
+  and sync-journal files via `DbConfig::encryption` and C ABI open options;
+  durable `CREATE/ALTER/DROP POLICY`; durable `CREATE/ALTER/DROP MASK`;
+  connection-local audit context through Rust, SQL, and C ABI APIs; audit
+  context SQL functions; `sys_audit_context`; and security DDL audit events.
+- Added ADR 0174 documenting the TDE, policy, masking, audit-context, C ABI, and
+  follow-up security boundaries.
+- Added native full-text search with `USING fulltext` indexes, persisted
+  analyzer options, `fulltext_match`, `bm25` ranking, phrase and prefix queries,
+  write-path maintenance, `ALTER INDEX ... VERIFY`, `ALTER INDEX ... REBUILD`,
+  tooling metadata, and SQL/user documentation.
+- Added Python, Dart, and .NET binding showcase tests for native full-text
+  search, parameterized `fulltext_match` queries, prefix search, and `bm25`
+  ranking through each binding's public API.
+- Added cross-process WAL coordination for local on-disk databases: VFS
+  byte-range locks on native platforms, a rebuildable `.coord` sidecar with
+  database identity checks, cross-process writer/checkpoint serialization,
+  reader-slot WAL retention, external WAL refresh, stale-slot cleanup, and
+  `sys.process_coordination`, `sys.process_readers`, and
+  `sys.process_lock_metrics` diagnostics.
+- Added Rust, C ABI open-option, Python, Dart, and .NET surfaces for
+  `process_coordination=auto|required|single_process_unsafe` and
+  `process_coordination_timeout_ms`, plus binding smoke coverage for the new
+  diagnostics.
+- Added `@decentdb/web` browser parity hardening: `browser-app-v2` SQL profile
+  metadata, stable browser SQL error codes, protocol/capability metadata,
+  transaction/savepoint helpers, prepared statement reset/clear/page/async
+  iteration, explicit closed-handle/import lifecycle errors, OPFS checkpoint/
+  export/import diagnostics, browser sync apply-before-ack helpers, framework
+  recipes, a checked-in SQL parity corpus, and expanded browser benchmark
+  guardrails.
+- Added Flutter mobile production-runtime hardening with a new
+  `decentdb_flutter` package shell, Android/iOS native artifact build scripts,
+  unsigned mobile GitHub Actions artifact workflow, app-private path and
+  database-set helpers, mobile key-provider wiring, redacted open-option
+  diagnostics, a reference Flutter app, and mobile package tests.
+- Added Dart sync JSON/public changeset wrappers, including status/init,
+  changeset create/inspect/apply/invert, and `applyBeforeAck` ordering for
+  relay clients.
+- Added default-fast benchmark/profile assets: canonical
+  `decentdb_balanced_durable`, `decentdb_low_memory_durable`,
+  `decentdb_tuned_durable`, and `duckdb_engine_default` labels; storage split
+  fields; cold-state metadata; H2/HSQLDB partial labeling; and Python binding
+  prepared-statement/result-materialization benchmark slices.
+- Added prepared INSERT fast-path coverage for supported direct/default write
+  shapes, including routing that avoids unnecessary covering-index payload work,
+  deferred table materialization that preserves valid index state, and scalar
+  integer aggregate support that scans persisted payload columns without forcing
+  full row materialization.
+- Added parser-bypass fast paths for plain persistent-table `COUNT(*)` reads and
+  integer primary-key projection reads so default rust-baseline count and
+  single-row lookup slices stay on metadata/row-id lookup paths.
+- Added runtime-only covering-index execution for safe B+Tree `INCLUDE (...)`
+  projections, including `EXPLAIN` reporting and conservative fallback when
+  projections are not covered or security rules are active.
+- Added `SqlTransaction::prepared_batch` and `PreparedStatementBatch` for Rust
+  callers that repeatedly execute one prepared statement inside an exclusive
+  transaction; simple positional INSERT batches validate and resolve the fast
+  path once, then refill a mutable parameter buffer per row.
+- Added rich structured error diagnostics across Rust, the C ABI, CLI/HTTP JSON,
+  WASM/browser errors, and maintained bindings, including `ddb_last_error_json`,
+  stable `subcode`/`retryable`/`permanent` fields, SQLSTATE/doc anchors where
+  applicable, redacted context, binding smoke coverage, compatibility guidance,
+  and a dedicated
+  [`error-diagnostics`](../user-guide/error-diagnostics.md) troubleshooting page.
+
+### Changed
+
+- Kept release-facing benchmark charts on the controlled 2026-05-22 snapshot
+  while the new profile-aware benchmark harness is staged; local diagnostic runs
+  no longer replace the checked-in comparison asset, and H2/HSQLDB read-only
+  partial comparison rows remain visible in the chart.
+- Bumped the C ABI version to 6 for the new audit-context entry points and TDE
+  open options, and updated the Dart ABI expectation/header copies.
+- Extended the Rust library crate outputs with `staticlib` for iOS XCFramework
+  packaging and added Dart default native loading for Android and iOS package
+  layouts.
+- Bumped the database format version to 12 for full-text index metadata and
+  added `decentdb-migrate` support for format-11 databases.
+- Bumped the database format version to 13 to add a non-secret database identity
+  used by coordination sidecars, and added `decentdb-migrate` support for
+  format-12 databases.
+- Tightened checkpoint safety so explicit checkpoints skip main-file copyback
+  while local snapshots, named snapshot retention, unreadable reader slots, or
+  cross-process reader slots are active; reader-free checkpoints still copy back
+  and truncate normally.
+- Improved large-table read performance for common `LIKE` predicates and
+  deferred paged row-id point lookups, including allocation-light `LIKE`
+  matching, trigram candidate pushdown for safe substring searches, bulk
+  trigram index construction, and chunk-targeted `INTEGER PRIMARY KEY` lookups
+  that avoid reconstructing a full paged table manifest.
+- Kept the default durable cache at the historical 4 MiB after executor
+  fast-path fixes recovered read headroom without raising the default cache,
+  added explicit
+  `DbConfig::balanced()` (16 MiB),
+  `DbConfig::low_memory()` (4 MiB), and `DbConfig::tuned_durable()` helpers, and
+  stopped the CLI `exec` command from overriding caller-selected cache options.
+- Reduced default open and commit overhead by lazily starting the background
+  checkpoint worker, lazily creating reactive subscription hubs, treating the
+  coordination sidecar as rebuildable metadata during create/open, keeping
+  writer-owner diagnostics in memory for default `auto` coordination, and
+  avoiding redundant coordination-header reads/locks after publish operations,
+  plus skipping no-op backfill/snapshot-retention maintenance when a newly
+  created database still has schema cookie `0`, while preserving the byte-range
+  process lock.
+- Tightened the Rust rust-baseline benchmark runner so schema setup uses one
+  explicit durable transaction for the same DDL, seed slices use mutable
+  prepared insert buffers through transaction-scoped prepared batches without
+  prepare time in the measured section, unused seed-walk payloads are not
+  constructed, and release builds use full LTO, stripped symbols, and
+  abort-on-panic. The final smoke/medium/full/huge
+  comparison against `benchmarks/rust-baseline/results` is green across every
+  recorded step, total runtime, peak RSS, database size, and WAL size metric.
+- Promoted the default-fast performance/storage-efficiency Future Win from the
+  roadmap to delivered context; follow-on performance work is now scoped to
+  measured evidence outside this completed baseline.
+- Promoted the browser Future Win from roadmap item to delivered context in
+  `design/FUTURE_WINS.md`; follow-on browser work is now scoped to measured
+  parser breadth, security key handling, branch workflows, or performance.
+- Promoted the mobile Future Win from roadmap item to delivered context in
+  `design/FUTURE_WINS.md`; follow-on mobile work is now scoped to measured
+  device matrices, direct native SDKs, watch lifecycle guarantees, and key
+  rotation rather than first-class Flutter package hardening.
+- Bumped the C ABI version to 7 for structured diagnostic JSON and added release
+  guardrail documentation for first-slice subcode projection across bindings.
+
+### Fixed
+
+- Fixed legacy database migrations to seed the v13 coordination identity for
+  all upgraded source formats and to keep copied WAL header-page frames aligned
+  with the migrated main header identity.
+- Fixed opening current-format databases produced by earlier v13 migration
+  builds by repairing an empty coordination identity before initializing the
+  coordination sidecar.
+- Fixed non-ANALYZE `EXPLAIN` so it renders from catalog metadata without
+  materializing deferred paged row sources, reports `RowIdLookup` for row-id
+  primary-key predicates, and matches index columns with normal SQL identifier
+  equality instead of case-sensitive string equality.
+- Fixed trigram `LIKE` planning to avoid unsafe index use for `NOT LIKE` and
+  escaped patterns while ignoring wildcard characters when deriving required
+  trigram tokens.
+- Fixed same-handle reader snapshots so refreshing to an older retained WAL LSN
+  reloads the runtime catalog/table metadata instead of reusing newer deferred
+  paged-table overflow pointers.
+
 ## [2.7.0] - [2026-05-22]
 
 ### Added

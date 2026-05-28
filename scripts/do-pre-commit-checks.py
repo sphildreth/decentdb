@@ -77,7 +77,7 @@ class Check:
     modes: tuple[str, ...] = ("paranoid",)
     benchmark_comparison: bool = False
     cargo_bound: bool = False
-    requires: str | None = None
+    requires: str | tuple[str, ...] | None = None
 
 
 @dataclass
@@ -319,6 +319,32 @@ def build_checks() -> list[Check]:
             modes=("fast", "paranoid"),
             cargo_bound=True,
         ),
+        Check(
+            key="cargo-metadata",
+            title="Cargo metadata parse",
+            cwd=REPO_ROOT,
+            command="cargo metadata --no-deps --format-version 1 >/dev/null",
+            env={},
+            stage=0,
+            cargo_bound=True,
+        ),
+        Check(
+            key="release-metadata",
+            title="Release metadata/version guardrails",
+            cwd=REPO_ROOT,
+            command=f"{python_exec} scripts/validate_release_metadata.py",
+            env={},
+            stage=0,
+        ),
+        Check(
+            key="error-diagnostics-guardrail",
+            title="Structured error diagnostics guardrail",
+            cwd=REPO_ROOT,
+            command=f"{python_exec} scripts/validate_error_diagnostics.py --strict",
+            env={},
+            stage=0,
+            modes=("fast", "paranoid"),
+        ),
         # ── Stage 1: Clean + rebuild (guarantees no stale artifacts) ──
         Check(
             key="rust-clean",
@@ -417,6 +443,20 @@ def build_checks() -> list[Check]:
             cargo_bound=True,
         ),
         Check(
+            key="rust-workspace-extra",
+            title="Rust remaining workspace crate tests",
+            cwd=REPO_ROOT,
+            command=(
+                "cargo test --workspace "
+                "--exclude decentdb "
+                "--exclude decentdb-cli "
+                "--exclude decentdb-migrate"
+            ),
+            env={},
+            stage=4,
+            cargo_bound=True,
+        ),
+        Check(
             key="python-smoke",
             title="Python full test suite",
             cwd=REPO_ROOT / "bindings" / "python",
@@ -476,6 +516,24 @@ def build_checks() -> list[Check]:
             requires="node",
         ),
         Check(
+            key="node-knex-tests",
+            title="Node.js Knex dialect tests",
+            cwd=REPO_ROOT / "bindings" / "node" / "knex-decentdb",
+            command="npm test",
+            env={"DECENTDB_NATIVE_LIB_PATH": str(native_lib)},
+            stage=5,
+            requires="node",
+        ),
+        Check(
+            key="web-typecheck-build",
+            title="Web package typecheck/build",
+            cwd=REPO_ROOT / "bindings" / "web",
+            command="npm ci && npm run typecheck && npm run build",
+            env={},
+            stage=4,
+            requires="node",
+        ),
+        Check(
             key="c-smoke",
             title="C binding smoke test",
             cwd=REPO_ROOT,
@@ -498,7 +556,25 @@ def build_checks() -> list[Check]:
             stage=4,
             requires="dart",
         ),
-        # ── Stage 5: Benchmarks (parallel) ──
+        # ── Stage 5: Storage harnesses and benchmark smoke checks (parallel) ──
+        Check(
+            key="storage-short-crash",
+            title="Storage short crash harness",
+            cwd=REPO_ROOT,
+            command=f"{python_exec} tests/harness/runner.py tests/harness/scenarios/short_crash.json",
+            env={},
+            stage=5,
+            cargo_bound=True,
+        ),
+        Check(
+            key="storage-soak",
+            title="Storage soak harness",
+            cwd=REPO_ROOT,
+            command=f"{python_exec} tests/harness/runner.py tests/harness/scenarios/soak_storage.json",
+            env={},
+            stage=5,
+            cargo_bound=True,
+        ),
         Check(
             key="rust-benchmark-phase1-native",
             title="Rust benchmark phase 1 direct scenarios",
@@ -571,6 +647,59 @@ def build_checks() -> list[Check]:
             env={},
             stage=5,
             benchmark_comparison=True,
+        ),
+        # ── Stage 6: Release-facing artifacts, docs, and browser/WASM smoke ──
+        Check(
+            key="rust-release-metrics-bench",
+            title="Rust release metrics benchmark",
+            cwd=REPO_ROOT,
+            command="cargo bench -p decentdb --bench release_metrics",
+            env={},
+            stage=6,
+            cargo_bound=True,
+        ),
+        Check(
+            key="rust-docs",
+            title="Rust doctests and API docs",
+            cwd=REPO_ROOT,
+            command="cargo test --workspace --doc && cargo doc --workspace --no-deps",
+            env={},
+            stage=6,
+            cargo_bound=True,
+        ),
+        Check(
+            key="mkdocs-build",
+            title="MkDocs site build",
+            cwd=REPO_ROOT,
+            command=(
+                f"{python_exec} -m venv .tmp/precommit-mkdocs-venv && "
+                ". .tmp/precommit-mkdocs-venv/bin/activate && "
+                "python -m pip install -q -r docs/requirements.txt && "
+                "mkdocs build --config-file mkdocs.yml --site-dir .tmp/mkdocs-site"
+            ),
+            env={},
+            stage=6,
+        ),
+        Check(
+            key="web-wasm-browser-smoke",
+            title="Web WASM browser OPFS smoke",
+            cwd=REPO_ROOT,
+            command=(
+                "cargo build -p decentdb --target wasm32-unknown-unknown --release && "
+                "wasm-bindgen target/wasm32-unknown-unknown/release/decentdb.wasm "
+                "--target web "
+                "--out-dir bindings/web/dist "
+                "--out-name decentdb_wasm && "
+                "cd bindings/web && "
+                "npm ci && "
+                "npm run build && "
+                "npm run browser:install && "
+                "npm run browser:smoke:ci"
+            ),
+            env={},
+            stage=6,
+            cargo_bound=True,
+            requires=("node", "wasm-bindgen"),
         ),
     ]
 
@@ -695,14 +824,21 @@ def _run_stage(
     return failures
 
 
+def _required_tools(check: Check) -> tuple[str, ...]:
+    if check.requires is None:
+        return ()
+    if isinstance(check.requires, str):
+        return (check.requires,)
+    return check.requires
+
+
 def _check_skip_reason(check: Check) -> str | None:
     """Return a human-readable skip reason, or None if the check can run."""
     env = os.environ.copy()
     env.update(check.env)
-    if not check.requires:
-        return None
-    if not shutil.which(check.requires, path=env.get("PATH")):
-        return f"{check.requires} not found"
+    for tool in _required_tools(check):
+        if not shutil.which(tool, path=env.get("PATH")):
+            return f"{tool} not found"
     # Gradle 8.x doesn't support JDK 25+; detect and skip gracefully.
     if check.key == "java-tests":
         if _java_home_with_jni_headers(env) is None:
@@ -963,12 +1099,13 @@ def _list_checks_rich(all_checks: list[Check]) -> int:
         flags = []
         if check.cargo_bound:
             flags.append("cargo")
-        if check.requires:
+        required_tools = _required_tools(check)
+        if required_tools:
             skip = _check_skip_reason(check)
             if skip:
                 flags.append(f"[yellow]skip: {skip}[/]")
             else:
-                flags.append(f"requires:{check.requires}")
+                flags.append(f"requires:{','.join(required_tools)}")
         if check.benchmark_comparison:
             flags.append("benchmark")
         table.add_row(check.key, str(check.stage), modes, check.title, ", ".join(flags))
@@ -1077,8 +1214,9 @@ def _list_checks_plain(all_checks: list[Check]) -> int:
         flags = []
         if check.cargo_bound:
             flags.append("cargo")
-        if check.requires:
-            flags.append(f"requires:{check.requires}")
+        required_tools = _required_tools(check)
+        if required_tools:
+            flags.append(f"requires:{','.join(required_tools)}")
         if check.benchmark_comparison:
             flags.append("benchmark")
         suffix = f"  [{', '.join(flags)}]" if flags else ""

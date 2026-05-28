@@ -173,6 +173,13 @@ static unsafe void Run()
         {
             throw new InvalidOperationException($"unexpected error message: {message}");
         }
+        var diagnostic = GetLastErrorJson();
+        if (!diagnostic.Contains("\"code_name\":\"ERR_SQL\"", StringComparison.Ordinal) ||
+            !diagnostic.Contains("\"subcode\":\"sql.relation_not_found\"", StringComparison.Ordinal) ||
+            !diagnostic.Contains("\"relation\":\"missing_table\"", StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException($"unexpected diagnostic JSON: {diagnostic}");
+        }
     }
 
     Check(Native.ddb_db_free(ref db), "free db");
@@ -191,6 +198,32 @@ static string GetLastError()
 {
     var ptr = Native.ddb_last_error_message();
     return ptr == IntPtr.Zero ? string.Empty : Marshal.PtrToStringUTF8(ptr) ?? string.Empty;
+}
+
+static string GetLastErrorJson()
+{
+    var ptr = IntPtr.Zero;
+    var status = Native.ddb_last_error_json(ref ptr);
+    if (status != DdbOk)
+    {
+        throw new InvalidOperationException($"last_error_json failed with status {status}");
+    }
+    if (ptr == IntPtr.Zero)
+    {
+        return string.Empty;
+    }
+    try
+    {
+        return Marshal.PtrToStringUTF8(ptr) ?? string.Empty;
+    }
+    finally
+    {
+        var freeStatus = Native.ddb_string_free(ref ptr);
+        if (freeStatus != DdbOk)
+        {
+            throw new InvalidOperationException($"free diagnostic JSON failed with status {freeStatus}");
+        }
+    }
 }
 
 static unsafe string Utf8FromValue(in DdbValue value)
@@ -289,6 +322,12 @@ internal static partial class Native
 {
     [LibraryImport("decentdb")]
     internal static partial IntPtr ddb_last_error_message();
+
+    [LibraryImport("decentdb")]
+    internal static partial uint ddb_last_error_json(ref IntPtr json);
+
+    [LibraryImport("decentdb")]
+    internal static partial uint ddb_string_free(ref IntPtr value);
 
     [LibraryImport("decentdb")]
     internal static partial uint ddb_db_open_or_create(IntPtr path, ref IntPtr db);

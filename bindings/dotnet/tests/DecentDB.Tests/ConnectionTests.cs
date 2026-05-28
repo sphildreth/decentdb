@@ -130,6 +130,7 @@ public class ConnectionTests
         File.WriteAllText(basePath + ".wal", "wal");
         File.WriteAllText(basePath + "-wal", "d-wal");
         File.WriteAllText(basePath + "-shm", "shm");
+        File.WriteAllText(basePath + ".coord", "coord");
 
         DecentDBConnection.DeleteDatabaseFiles(basePath);
 
@@ -137,6 +138,7 @@ public class ConnectionTests
         Assert.False(File.Exists(basePath + ".wal"), ".wal file should be deleted");
         Assert.False(File.Exists(basePath + "-wal"), "-wal file should be deleted");
         Assert.False(File.Exists(basePath + "-shm"), "-shm file should be deleted");
+        Assert.False(File.Exists(basePath + ".coord"), ".coord file should be deleted");
     }
 
     [Fact]
@@ -149,6 +151,7 @@ public class ConnectionTests
         Assert.False(File.Exists(basePath + ".wal"));
         Assert.False(File.Exists(basePath + "-wal"));
         Assert.False(File.Exists(basePath + "-shm"));
+        Assert.False(File.Exists(basePath + ".coord"));
 
         // Should not throw
         DecentDBConnection.DeleteDatabaseFiles(basePath);
@@ -164,12 +167,14 @@ public class ConnectionTests
         File.WriteAllText(basePath + ".wal", "wal");
         File.WriteAllText(basePath + "-wal", "d-wal");
         File.WriteAllText(basePath + "-shm", "shm");
+        File.WriteAllText(basePath + ".coord", "coord");
 
         // Verify all files exist before deletion
         Assert.True(File.Exists(basePath));
         Assert.True(File.Exists(basePath + ".wal"));
         Assert.True(File.Exists(basePath + "-wal"));
         Assert.True(File.Exists(basePath + "-shm"));
+        Assert.True(File.Exists(basePath + ".coord"));
 
         DecentDBConnection.DeleteDatabaseFiles(basePath);
 
@@ -178,5 +183,6 @@ public class ConnectionTests
         Assert.False(File.Exists(basePath + ".wal"), ".wal file should be deleted");
         Assert.False(File.Exists(basePath + "-wal"), "-wal file should be deleted");
         Assert.False(File.Exists(basePath + "-shm"), "-shm file should be deleted");
+        Assert.False(File.Exists(basePath + ".coord"), ".coord file should be deleted");
     }
 }

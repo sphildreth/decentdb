@@ -49,7 +49,55 @@ pub(crate) fn decide_guardrails(
     has_additional_filter: bool,
     threshold: usize,
 ) -> GuardrailDecision {
-    let len = pattern_char_len(pattern);
+    decide_guardrails_for_len(
+        pattern_char_len(pattern),
+        rarest_postings_count,
+        has_additional_filter,
+        threshold,
+    )
+}
+
+#[must_use]
+pub(crate) fn like_required_tokens(pattern: &str) -> Vec<u32> {
+    let mut tokens = BTreeSet::new();
+    let mut literal = String::new();
+    for ch in pattern.chars() {
+        if matches!(ch, '%' | '_') {
+            collect_literal_tokens(&literal, &mut tokens);
+            literal.clear();
+        } else {
+            literal.push(ch);
+        }
+    }
+    collect_literal_tokens(&literal, &mut tokens);
+    tokens.into_iter().collect()
+}
+
+#[must_use]
+pub(crate) fn like_required_char_len(pattern: &str) -> usize {
+    let mut current = 0usize;
+    let mut longest = 0usize;
+    for ch in pattern.chars() {
+        if matches!(ch, '%' | '_') {
+            longest = longest.max(current);
+            current = 0;
+        } else {
+            current += 1;
+        }
+    }
+    longest.max(current)
+}
+
+fn collect_literal_tokens(literal: &str, tokens: &mut BTreeSet<u32>) {
+    tokens.extend(unique_tokens(literal));
+}
+
+pub(crate) fn decide_guardrails_for_len(
+    len: usize,
+    rarest_postings_count: usize,
+    has_additional_filter: bool,
+    threshold: usize,
+) -> GuardrailDecision {
     if len < 3 {
         return GuardrailDecision::TooShort;
     }
@@ -73,8 +121,8 @@ pub(crate) fn pack_trigram(bytes: [u8; 3]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        decide_guardrails, normalize, pack_trigram, pattern_char_len, unique_tokens,
-        GuardrailDecision,
+        decide_guardrails, like_required_char_len, like_required_tokens, normalize, pack_trigram,
+        pattern_char_len, unique_tokens, GuardrailDecision,
     };
 
     #[test]
@@ -133,6 +181,18 @@ mod tests {
 
         let tokens = unique_tokens("abcde");
         assert_eq!(tokens.len(), 3);
+    }
+
+    #[test]
+    fn like_required_tokens_ignore_wildcards() {
+        assert_eq!(like_required_tokens("%Motley%"), unique_tokens("Motley"));
+        assert_eq!(like_required_char_len("%Motley%"), 6);
+
+        let tokens = like_required_tokens("%Mot%ley%");
+        assert!(tokens.contains(&pack_trigram(*b"MOT")));
+        assert!(tokens.contains(&pack_trigram(*b"LEY")));
+        assert!(!tokens.contains(&pack_trigram(*b"OTL")));
+        assert_eq!(like_required_char_len("%Mot%ley%"), 3);
     }
 
     #[test]

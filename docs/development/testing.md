@@ -29,6 +29,21 @@ cargo t
 cargo lint
 ```
 
+## Release-oriented pre-commit validation
+
+The staged pre-commit runner has two modes:
+
+```bash
+python scripts/do-pre-commit-checks.py --mode fast
+python scripts/do-pre-commit-checks.py --mode paranoid
+```
+
+Use `paranoid` before release candidates. It runs the normal Rust and binding
+matrix, then adds release metadata/version checks, structured diagnostic
+guardrails, remaining workspace crate tests, package-local Knex and web
+typecheck/build coverage, storage crash/soak harnesses, release metrics,
+rustdoc/API docs, MkDocs, and browser WASM OPFS smoke coverage.
+
 ## Focused Rust test commands
 
 Engine library/unit tests:

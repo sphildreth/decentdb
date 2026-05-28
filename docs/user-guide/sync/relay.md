@@ -119,6 +119,51 @@ The relay advances the durable shape checkpoint only after the client sends
 The CLI relay keeps at most one unacked changeset in flight per subscription.
 Slow clients receive `lagged` messages instead of unbounded buffering.
 
+## Browser Apply Before Ack
+
+`@decentdb/web` routes relay helpers through the browser database owner. For
+shape streams, use `applyAndAckShape()` so the public changeset is applied in a
+local transaction before the relay ack is sent:
+
+```ts
+const subscription = db.sync.subscribeShape({
+  peer: "relay",
+  shapeId: "tenant_42_tasks_v1",
+  clientReplicaId: "web_123",
+  onMessage(message) {
+    void db.sync.applyAndAckShape({
+      peer: "relay",
+      message,
+      tenantId: "tenant_42",
+      subjectId: "user_123",
+      clientReplicaId: "web_123",
+    });
+  },
+});
+```
+
+Browser WebSocket clients still pass short-lived principal context through the
+TLS-protected stream URL because the WebSocket API cannot set custom headers.
+Do not call `subscription.ack(message)` before the local apply succeeds unless
+the application intentionally accepts replay/data-loss risk.
+
+## Mobile Apply Before Ack
+
+Flutter mobile apps use the same ordering rule. Apply the public changeset to
+the local database first, then acknowledge the relay message. If the OS suspends
+or kills the app before the ack, the relay can redeliver from the durable
+checkpoint.
+
+```dart
+await db.sync.applyBeforeAck(message.changeset, () async {
+  await subscription.ack(message);
+});
+```
+
+For background tasks, keep the work idempotent and short: open the database,
+apply the changeset, commit, ack, then close. Do not depend on iOS or Android to
+run background sync continuously or at a fixed interval.
+
 ## Diagnostics
 
 Use:

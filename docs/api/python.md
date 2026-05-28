@@ -67,6 +67,25 @@ conn = decentdb.connect("/path/to/data.ddb", mode="open")
 conn = decentdb.Connection("/path/to/data.ddb", mode="open_or_create", stmt_cache_size=256)
 ```
 
+### Cross-Process WAL Coordination
+
+Local on-disk databases use cross-process WAL coordination by default when the
+native VFS supports file locks. Pass explicit options when a Python application,
+CLI helper, or background worker must fail instead of running without the
+coordination sidecar:
+
+```python
+conn = decentdb.connect(
+    "/path/to/data.ddb",
+    process_coordination="required",
+    process_coordination_timeout_ms=30_000,
+)
+
+coordination = conn.execute("SELECT * FROM sys.process_coordination").fetchone()
+```
+
+Supported modes are `"auto"`, `"required"`, and `"single_process_unsafe"`.
+
 ### Write Queue
 
 ```python

@@ -1,28 +1,63 @@
 //! Minimal wasm parser used to keep the initial browser target independent of
 //! the native C-backed PostgreSQL parser.
 //!
-//! This parser is intentionally narrow. It exists to support the first browser
-//! smoke path while the full wasm-compatible parser strategy is finalized.
+//! This parser is intentionally profile-scoped. It supports the browser-app-v2
+//! application SQL profile without depending on the native C-backed parser.
 
 use crate::catalog::{ColumnType, EnumTypeInfo, SpatialTypeInfo};
 use crate::error::{DbError, Result};
 use crate::record::value::Value;
 
 use super::ast::{
-    Assignment, BinaryOp, ColumnDefinition, CreateIndexStatement, CreateTableStatement,
-    DeleteStatement, Expr, FromItem, IndexExpression, InsertSource, InsertStatement, OrderBy,
-    Query, QueryBody, Select, SelectItem, Statement, UpdateStatement,
+    AlterTableAction, Assignment, BinaryOp, ColumnDefinition, CreateIndexStatement,
+    CreateTableStatement, DeleteStatement, Expr, ForeignKeyActionSpec, ForeignKeyDefinition,
+    FromItem, IndexExpression, InsertSource, InsertStatement, OrderBy, Query, QueryBody, Select,
+    SelectItem, Statement, UpdateStatement,
 };
 
 pub(crate) fn parse_sql_batch(sql: &str) -> Result<Vec<Statement>> {
     let statements = split_sql_batch(sql);
     if statements.is_empty() {
-        return Err(DbError::sql("no SQL statements found"));
+        return Err(browser_sql_parse_error("no SQL statements found"));
     }
     statements
         .iter()
         .map(|statement| parse_statement(statement.trim()))
         .collect()
+}
+
+const BROWSER_SQL_PROFILE: &str = "browser-app-v2";
+const ERR_BROWSER_SQL_PARSE: &str = "ERR_BROWSER_SQL_PARSE";
+const ERR_BROWSER_SQL_UNSUPPORTED: &str = "ERR_BROWSER_SQL_UNSUPPORTED";
+const ERR_BROWSER_SQL_PROFILE_MISMATCH: &str = "ERR_BROWSER_SQL_PROFILE_MISMATCH";
+
+fn browser_sql_parse_error(message: impl Into<String>) -> DbError {
+    DbError::sql(format!(
+        "{ERR_BROWSER_SQL_PARSE}|{BROWSER_SQL_PROFILE}|syntax|{}",
+        message.into()
+    ))
+}
+
+fn browser_sql_unsupported_error(
+    feature: impl Into<String>,
+    message: impl Into<String>,
+) -> DbError {
+    DbError::sql(format!(
+        "{ERR_BROWSER_SQL_UNSUPPORTED}|{BROWSER_SQL_PROFILE}|{}|{}",
+        feature.into(),
+        message.into()
+    ))
+}
+
+fn browser_sql_profile_mismatch_error(
+    feature: impl Into<String>,
+    message: impl Into<String>,
+) -> DbError {
+    DbError::sql(format!(
+        "{ERR_BROWSER_SQL_PROFILE_MISMATCH}|{BROWSER_SQL_PROFILE}|{}|{}",
+        feature.into(),
+        message.into()
+    ))
 }
 
 fn parse_statement(sql: &str) -> Result<Statement> {
@@ -45,10 +80,111 @@ fn parse_statement(sql: &str) -> Result<Statement> {
         parse_drop_table(trimmed)
     } else if starts_with_keyword(trimmed, "DROP INDEX") {
         parse_drop_index(trimmed)
+    } else if starts_with_keyword(trimmed, "ALTER TABLE") {
+        parse_alter_table(trimmed)
     } else {
-        Err(DbError::sql(format!(
-            "unsupported SQL in initial wasm parser: {trimmed}"
-        )))
+        Err(browser_sql_profile_mismatch_error(
+            "statement",
+            format!("profile {BROWSER_SQL_PROFILE} does not support statement: {trimmed}"),
+        ))
+    }
+}
+
+fn parse_alter_table(sql: &str) -> Result<Statement> {
+    let rest = consume_keywords(sql, &["ALTER", "TABLE"])?;
+    let mut parts = rest
+        .split_whitespace()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if parts.len() < 2 {
+        return Err(browser_sql_parse_error(
+            "ALTER TABLE requires a table name and action",
+        ));
+    }
+    let table_name = clean_identifier(&parts.remove(0))?;
+    let action = parts.remove(0).to_ascii_uppercase();
+
+    match action.as_str() {
+        "ADD" => {
+            if parts.is_empty() || !eq_ci(&parts[0], "COLUMN") {
+                return Err(browser_sql_unsupported_error(
+                    "alter-table",
+                    "ALTER TABLE ADD requires COLUMN",
+                ));
+            }
+            parts.remove(0);
+            let definition = parse_column_definition(&parts.join(" "))?;
+            Ok(Statement::AlterTable {
+                table_name,
+                actions: vec![AlterTableAction::AddColumn(definition)],
+            })
+        }
+        "DROP" => {
+            if parts.is_empty() {
+                return Err(browser_sql_parse_error(
+                    "ALTER TABLE DROP requires a target",
+                ));
+            }
+            if eq_ci(&parts[0], "COLUMN") {
+                parts.remove(0);
+                if parts.is_empty() {
+                    return Err(browser_sql_parse_error(
+                        "ALTER TABLE DROP COLUMN requires a column name",
+                    ));
+                }
+                Ok(Statement::AlterTable {
+                    table_name,
+                    actions: vec![AlterTableAction::DropColumn {
+                        column_name: clean_identifier(&parts[0])?,
+                    }],
+                })
+            } else {
+                Err(browser_sql_parse_error(
+                    "ALTER TABLE DROP currently supports DROP COLUMN",
+                ))
+            }
+        }
+        "RENAME" => {
+            if parts.is_empty() {
+                return Err(browser_sql_parse_error(
+                    "ALTER TABLE RENAME requires a target",
+                ));
+            }
+            if eq_ci(&parts[0], "TO") {
+                parts.remove(0);
+                let new_name = parts.first().ok_or_else(|| {
+                    browser_sql_parse_error("ALTER TABLE RENAME TO requires a new table name")
+                })?;
+                Ok(Statement::AlterTable {
+                    table_name,
+                    actions: vec![AlterTableAction::RenameTable {
+                        new_name: clean_identifier(new_name)?,
+                    }],
+                })
+            } else if eq_ci(&parts[0], "COLUMN") {
+                parts.remove(0);
+                if parts.len() < 3 || !eq_ci(&parts[1], "TO") {
+                    return Err(browser_sql_parse_error(
+                        "ALTER TABLE RENAME COLUMN requires `old TO new`",
+                    ));
+                }
+                Ok(Statement::AlterTable {
+                    table_name,
+                    actions: vec![AlterTableAction::RenameColumn {
+                        old_name: clean_identifier(&parts[0])?,
+                        new_name: clean_identifier(&parts[2])?,
+                    }],
+                })
+            } else {
+                Err(browser_sql_parse_error(
+                    "ALTER TABLE RENAME requires TO or COLUMN",
+                ))
+            }
+        }
+        _ => Err(browser_sql_unsupported_error(
+            "alter-table",
+            format!("unsupported ALTER TABLE action in browser parser: {action}"),
+        )),
     }
 }
 
@@ -72,7 +208,7 @@ fn parse_create_table(sql: &str) -> Result<CreateTableStatement> {
     };
     let open = rest
         .find('(')
-        .ok_or_else(|| DbError::sql("CREATE TABLE requires a column list"))?;
+        .ok_or_else(|| browser_sql_parse_error("CREATE TABLE requires a column list"))?;
     let table_name = clean_identifier(rest[..open].trim())?;
     let close = matching_final_paren(rest)?;
     let column_sql = &rest[open + 1..close];
@@ -81,7 +217,9 @@ fn parse_create_table(sql: &str) -> Result<CreateTableStatement> {
         .map(|column| parse_column_definition(column.trim()))
         .collect::<Result<Vec<_>>>()?;
     if columns.is_empty() {
-        return Err(DbError::sql("CREATE TABLE requires at least one column"));
+        return Err(browser_sql_parse_error(
+            "CREATE TABLE requires at least one column",
+        ));
     }
     Ok(CreateTableStatement {
         table_name,
@@ -95,13 +233,20 @@ fn parse_create_table(sql: &str) -> Result<CreateTableStatement> {
 fn parse_column_definition(sql: &str) -> Result<ColumnDefinition> {
     let tokens = tokenize_words(sql);
     if tokens.len() < 2 {
-        return Err(DbError::sql(format!("invalid column definition: {sql}")));
+        return Err(browser_sql_parse_error(format!(
+            "invalid column definition: {sql}"
+        )));
     }
     let name = clean_identifier(&tokens[0])?;
     let column_type = parse_column_type(&tokens[1])?;
     let mut nullable = true;
     let mut primary_key = false;
     let mut unique = false;
+    let generated = None;
+    let generated_stored = false;
+    let mut checks = Vec::new();
+    let mut default = None;
+    let mut references = None;
     let mut index = 2;
     while index < tokens.len() {
         if token_eq(&tokens[index], "PRIMARY")
@@ -125,11 +270,34 @@ fn parse_column_definition(sql: &str) -> Result<ColumnDefinition> {
         } else if token_eq(&tokens[index], "NULL") {
             nullable = true;
             index += 1;
+        } else if token_eq(&tokens[index], "DEFAULT") {
+            let default_expr = tokens
+                .get(index + 1)
+                .ok_or_else(|| browser_sql_parse_error("DEFAULT requires a value"))?;
+            default = Some(parse_expr(default_expr)?);
+            index += 2;
+        } else if token_eq(&tokens[index], "CHECK") {
+            if index + 1 >= tokens.len() {
+                return Err(browser_sql_parse_error(
+                    "CHECK requires a constraint expression",
+                ));
+            }
+            checks.push(parse_expr(&tokens[index + 1..].join(" "))?);
+            index = tokens.len();
+        } else if token_eq(&tokens[index], "REFERENCES") {
+            let (reference, consumed) = parse_column_reference(&tokens[index + 1..].join(" "))?;
+            references = Some(reference);
+            index += 1 + consumed;
+        } else if token_eq(&tokens[index], "GENERATED") {
+            return Err(browser_sql_unsupported_error(
+                "generated-column",
+                "generated columns are not supported by browser-app-v2",
+            ));
         } else {
-            return Err(DbError::sql(format!(
-                "unsupported column clause in initial wasm parser: {}",
-                tokens[index]
-            )));
+            return Err(browser_sql_unsupported_error(
+                "column-clause",
+                format!("unsupported column clause: {}", tokens[index]),
+            ));
         }
     }
     Ok(ColumnDefinition {
@@ -138,14 +306,65 @@ fn parse_column_definition(sql: &str) -> Result<ColumnDefinition> {
         spatial_type: None::<SpatialTypeInfo>,
         enum_type: None::<EnumTypeInfo>,
         nullable,
-        default: None,
-        generated: None,
-        generated_stored: false,
+        default,
+        generated,
+        generated_stored,
         primary_key,
         unique,
-        checks: Vec::new(),
-        references: None,
+        checks,
+        references,
     })
+}
+
+fn parse_column_reference(reference: &str) -> Result<(ForeignKeyDefinition, usize)> {
+    let tokens = tokenize_words_with_punctuation(reference);
+    if tokens.is_empty() {
+        return Err(browser_sql_parse_error(
+            "REFERENCES requires a referenced table",
+        ));
+    }
+    let table_name = clean_identifier(&tokens[0])?;
+    let mut index = 1_usize;
+    if index >= tokens.len() || !eq_ci(&tokens[index], "(") {
+        return Ok((
+            ForeignKeyDefinition {
+                name: None,
+                columns: Vec::new(),
+                referenced_table: table_name,
+                referenced_columns: Vec::new(),
+                on_delete: ForeignKeyActionSpec::NoAction,
+                on_update: ForeignKeyActionSpec::NoAction,
+            },
+            index,
+        ));
+    }
+    index += 1;
+
+    let mut referenced_columns = Vec::new();
+    while index < tokens.len() {
+        if eq_ci(&tokens[index], ")") {
+            return Ok((
+                ForeignKeyDefinition {
+                    name: None,
+                    columns: Vec::new(),
+                    referenced_table: table_name,
+                    referenced_columns,
+                    on_delete: ForeignKeyActionSpec::NoAction,
+                    on_update: ForeignKeyActionSpec::NoAction,
+                },
+                index + 1,
+            ));
+        }
+        if eq_ci(&tokens[index], ",") {
+            index += 1;
+            continue;
+        }
+        referenced_columns.push(clean_identifier(&tokens[index])?);
+        index += 1;
+    }
+    Err(browser_sql_parse_error(
+        "unterminated foreign key column list",
+    ))
 }
 
 fn parse_drop_table(sql: &str) -> Result<Statement> {
@@ -178,13 +397,13 @@ fn parse_create_index(sql: &str) -> Result<CreateIndexStatement> {
     } else {
         (false, after_index)
     };
-    let on_index =
-        find_keyword(rest, "ON").ok_or_else(|| DbError::sql("CREATE INDEX requires ON table"))?;
+    let on_index = find_keyword(rest, "ON")
+        .ok_or_else(|| browser_sql_parse_error("CREATE INDEX requires ON table"))?;
     let index_name = clean_identifier(rest[..on_index].trim())?;
     let after_on = rest[on_index + "ON".len()..].trim();
     let open = after_on
         .find('(')
-        .ok_or_else(|| DbError::sql("CREATE INDEX requires a column list"))?;
+        .ok_or_else(|| browser_sql_parse_error("CREATE INDEX requires a column list"))?;
     let table_name = clean_identifier(after_on[..open].trim())?;
     let close = matching_final_paren(after_on)?;
     let columns = split_top_level(&after_on[open + 1..close], ',')
@@ -200,6 +419,7 @@ fn parse_create_index(sql: &str) -> Result<CreateIndexStatement> {
         columns,
         include_columns: Vec::new(),
         predicate: None,
+        options: Vec::new(),
     })
 }
 
@@ -219,29 +439,66 @@ fn parse_drop_index(sql: &str) -> Result<Statement> {
 
 fn parse_insert(sql: &str) -> Result<InsertStatement> {
     let rest = consume_keywords(sql, &["INSERT", "INTO"])?;
-    let values_index = find_keyword(rest, "VALUES")
-        .ok_or_else(|| DbError::sql("INSERT requires VALUES in initial wasm parser"))?;
-    let target = rest[..values_index].trim();
-    let values_sql = rest[values_index + "VALUES".len()..].trim();
-    let (table_name, columns) = if let Some(open) = target.find('(') {
-        let close = matching_final_paren(target)?;
-        let name = clean_identifier(target[..open].trim())?;
-        let columns = split_top_level(&target[open + 1..close], ',')
+    let values_index = find_keyword(rest, "VALUES");
+    let select_index = find_keyword(rest, "SELECT");
+    let (is_insert_select, source_index) = match (values_index, select_index) {
+        (Some(values_pos), Some(select_pos)) if select_pos < values_pos => (true, Some(select_pos)),
+        (Some(values_pos), Some(_)) => (false, Some(values_pos)),
+        (Some(values_pos), None) => (false, Some(values_pos)),
+        (None, Some(select_pos)) => (true, Some(select_pos)),
+        (None, None) => {
+            return Err(browser_sql_unsupported_error(
+                "insert-source",
+                "INSERT requires VALUES or SELECT",
+            ));
+        }
+    };
+
+    let source_index = source_index.expect("insert source index");
+    let target_sql = rest[..source_index].trim();
+    let source_keyword_len = if is_insert_select {
+        "SELECT".len()
+    } else {
+        "VALUES".len()
+    };
+    let source_sql = rest[source_index + source_keyword_len..].trim();
+    if target_sql.is_empty() || source_sql.is_empty() {
+        return Err(browser_sql_parse_error(
+            "INSERT requires both target and source",
+        ));
+    }
+
+    let (table_name, columns) = if let Some(open) = target_sql.find('(') {
+        let close = matching_final_paren(target_sql)?;
+        let name = clean_identifier(target_sql[..open].trim())?;
+        let columns = split_top_level(&target_sql[open + 1..close], ',')
             .into_iter()
             .map(|column| clean_identifier(column.trim()))
             .collect::<Result<Vec<_>>>()?;
         (name, columns)
     } else {
-        (clean_identifier(target)?, Vec::new())
+        (clean_identifier(target_sql)?, Vec::new())
     };
-    let rows = parse_values_rows(values_sql)?;
-    Ok(InsertStatement {
-        table_name,
-        columns,
-        source: InsertSource::Values(rows),
-        on_conflict: None,
-        returning: Vec::new(),
-    })
+    if is_insert_select {
+        let source_query = format!("SELECT {source_sql}");
+        let query = parse_select(&source_query)?;
+        Ok(InsertStatement {
+            table_name,
+            columns,
+            source: InsertSource::Query(Box::new(query)),
+            on_conflict: None,
+            returning: Vec::new(),
+        })
+    } else {
+        let rows = parse_values_rows(source_sql)?;
+        Ok(InsertStatement {
+            table_name,
+            columns,
+            source: InsertSource::Values(rows),
+            on_conflict: None,
+            returning: Vec::new(),
+        })
+    }
 }
 
 fn parse_delete(sql: &str) -> Result<DeleteStatement> {
@@ -263,7 +520,8 @@ fn parse_delete(sql: &str) -> Result<DeleteStatement> {
 
 fn parse_update(sql: &str) -> Result<UpdateStatement> {
     let rest = consume_keyword(sql, "UPDATE")?;
-    let set_index = find_keyword(rest, "SET").ok_or_else(|| DbError::sql("UPDATE requires SET"))?;
+    let set_index =
+        find_keyword(rest, "SET").ok_or_else(|| browser_sql_parse_error("UPDATE requires SET"))?;
     let table_name = clean_identifier(rest[..set_index].trim())?;
     let after_set = rest[set_index + "SET".len()..].trim();
     let where_index = find_keyword(after_set, "WHERE");
@@ -279,7 +537,9 @@ fn parse_update(sql: &str) -> Result<UpdateStatement> {
         .map(|assignment| parse_assignment(&assignment))
         .collect::<Result<Vec<_>>>()?;
     if assignments.is_empty() {
-        return Err(DbError::sql("UPDATE requires at least one assignment"));
+        return Err(browser_sql_parse_error(
+            "UPDATE requires at least one assignment",
+        ));
     }
     Ok(UpdateStatement {
         table_name,
@@ -290,7 +550,8 @@ fn parse_update(sql: &str) -> Result<UpdateStatement> {
 }
 
 fn parse_assignment(sql: &str) -> Result<Assignment> {
-    let index = find_operator(sql, "=").ok_or_else(|| DbError::sql("assignment requires ="))?;
+    let index =
+        find_operator(sql, "=").ok_or_else(|| browser_sql_parse_error("assignment requires ="))?;
     Ok(Assignment {
         column_name: clean_identifier(sql[..index].trim())?,
         expr: parse_expr(&sql[index + 1..])?,
@@ -302,7 +563,7 @@ fn parse_values_rows(sql: &str) -> Result<Vec<Vec<Expr>>> {
     for row_sql in split_top_level(sql.trim(), ',') {
         let row_sql = row_sql.trim();
         if !(row_sql.starts_with('(') && row_sql.ends_with(')')) {
-            return Err(DbError::sql("VALUES rows must be parenthesized"));
+            return Err(browser_sql_parse_error("VALUES rows must be parenthesized"));
         }
         rows.push(
             split_top_level(&row_sql[1..row_sql.len() - 1], ',')
@@ -438,6 +699,9 @@ fn parse_select_item(sql: &str) -> Result<SelectItem> {
 
 fn parse_expr(sql: &str) -> Result<Expr> {
     let trimmed = sql.trim();
+    if let Some(inner) = strip_outer_parens(trimmed) {
+        return parse_expr(inner);
+    }
     if let Some(index) = find_keyword(trimmed, "OR") {
         return Ok(Expr::Binary {
             left: Box::new(parse_expr(&trimmed[..index])?),
@@ -502,11 +766,11 @@ fn parse_expr(sql: &str) -> Result<Expr> {
         });
     }
     if let Some(rest) = trimmed.strip_prefix('$') {
-        let index = rest
-            .parse::<usize>()
-            .map_err(|_| DbError::sql(format!("invalid parameter reference: {trimmed}")))?;
+        let index = rest.parse::<usize>().map_err(|_| {
+            browser_sql_parse_error(format!("invalid parameter reference: {trimmed}"))
+        })?;
         if index == 0 {
-            return Err(DbError::sql("parameter indexes are 1-based"));
+            return Err(browser_sql_parse_error("parameter indexes are 1-based"));
         }
         return Ok(Expr::Parameter(index));
     }
@@ -534,12 +798,45 @@ fn parse_expr(sql: &str) -> Result<Expr> {
     })
 }
 
+fn strip_outer_parens(sql: &str) -> Option<&str> {
+    if !(sql.starts_with('(') && sql.ends_with(')')) {
+        return None;
+    }
+    let mut depth = 0_i32;
+    let mut in_single = false;
+    let mut chars = sql.char_indices().peekable();
+    while let Some((index, ch)) = chars.next() {
+        if in_single {
+            if ch == '\'' {
+                if matches!(chars.peek(), Some((_, '\''))) {
+                    let _ = chars.next();
+                } else {
+                    in_single = false;
+                }
+            }
+            continue;
+        }
+        match ch {
+            '\'' => in_single = true,
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 && index != sql.len() - 1 {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+    (depth == 0).then_some(sql[1..sql.len() - 1].trim())
+}
+
 fn parse_string_literal(sql: &str) -> Result<Option<String>> {
     if !sql.starts_with('\'') {
         return Ok(None);
     }
     if !sql.ends_with('\'') || sql.len() < 2 {
-        return Err(DbError::sql("unterminated string literal"));
+        return Err(browser_sql_parse_error("unterminated string literal"));
     }
     Ok(Some(sql[1..sql.len() - 1].replace("''", "'")))
 }
@@ -555,9 +852,10 @@ fn parse_column_type(sql: &str) -> Result<ColumnType> {
         "DECIMAL" | "NUMERIC" => Ok(ColumnType::Decimal),
         "UUID" => Ok(ColumnType::Uuid),
         "TIMESTAMP" => Ok(ColumnType::Timestamp),
-        other => Err(DbError::sql(format!(
-            "unsupported column type in initial wasm parser: {other}"
-        ))),
+        other => Err(browser_sql_unsupported_error(
+            "column-type",
+            format!("unsupported column type: {other}"),
+        )),
     }
 }
 
@@ -616,7 +914,7 @@ fn split_top_level(sql: &str, delimiter: char) -> Vec<String> {
 fn matching_final_paren(sql: &str) -> Result<usize> {
     let open = sql
         .find('(')
-        .ok_or_else(|| DbError::sql("expected opening parenthesis"))?;
+        .ok_or_else(|| browser_sql_parse_error("expected opening parenthesis"))?;
     let mut depth = 0_i32;
     let mut in_single = false;
     let mut last_close = None;
@@ -644,12 +942,13 @@ fn matching_final_paren(sql: &str) -> Result<usize> {
             _ => {}
         }
     }
-    let close = last_close.ok_or_else(|| DbError::sql("expected closing parenthesis"))?;
+    let close =
+        last_close.ok_or_else(|| browser_sql_parse_error("expected closing parenthesis"))?;
     if close <= open {
-        return Err(DbError::sql("invalid parenthesis range"));
+        return Err(browser_sql_parse_error("invalid parenthesis range"));
     }
     if !sql[close + 1..].trim().is_empty() {
-        return Err(DbError::sql(format!(
+        return Err(browser_sql_parse_error(format!(
             "unsupported trailing SQL in initial wasm parser: {}",
             sql[close + 1..].trim()
         )));
@@ -660,7 +959,7 @@ fn matching_final_paren(sql: &str) -> Result<usize> {
 fn clean_identifier(identifier: &str) -> Result<String> {
     let trimmed = identifier.trim();
     if trimmed.is_empty() {
-        return Err(DbError::sql("expected identifier"));
+        return Err(browser_sql_parse_error("expected identifier"));
     }
     if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2 {
         return Ok(trimmed[1..trimmed.len() - 1].replace("\"\"", "\""));
@@ -669,7 +968,9 @@ fn clean_identifier(identifier: &str) -> Result<String> {
         .chars()
         .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '.')
     {
-        return Err(DbError::sql(format!("invalid identifier: {trimmed}")));
+        return Err(browser_sql_parse_error(format!(
+            "invalid identifier: {trimmed}"
+        )));
     }
     Ok(trimmed.to_string())
 }
@@ -757,7 +1058,7 @@ fn starts_with_keyword(sql: &str, keyword: &str) -> bool {
 
 fn consume_keyword<'a>(sql: &'a str, keyword: &str) -> Result<&'a str> {
     consume_keyword_optional(sql, keyword)
-        .ok_or_else(|| DbError::sql(format!("expected keyword {keyword}")))
+        .ok_or_else(|| browser_sql_parse_error(format!("expected keyword {keyword}")))
 }
 
 fn consume_keywords<'a>(mut sql: &'a str, keywords: &[&str]) -> Result<&'a str> {
@@ -790,7 +1091,38 @@ fn tokenize_words(sql: &str) -> Vec<String> {
         .collect()
 }
 
+fn tokenize_words_with_punctuation(sql: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    for ch in sql.chars() {
+        if ch.is_whitespace() {
+            if !current.is_empty() {
+                tokens.push(current.clone());
+                current.clear();
+            }
+            continue;
+        }
+        if ch == ',' || ch == '(' || ch == ')' {
+            if !current.is_empty() {
+                tokens.push(current);
+                current = String::new();
+            }
+            tokens.push(ch.to_string());
+            continue;
+        }
+        current.push(ch);
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
 fn token_eq(left: &str, right: &str) -> bool {
+    left.eq_ignore_ascii_case(right)
+}
+
+fn eq_ci(left: &str, right: &str) -> bool {
     left.eq_ignore_ascii_case(right)
 }
 
@@ -854,11 +1186,81 @@ mod tests {
 
     #[test]
     fn rejects_sql_outside_initial_browser_subset() {
-        let error = parse_sql_batch("ALTER TABLE notes ADD COLUMN done BOOL")
+        let error = parse_sql_batch("CREATE SCHEMA notes")
             .expect_err("unsupported SQL must be rejected explicitly");
 
         assert!(error
             .to_string()
-            .contains("unsupported SQL in initial wasm parser"));
+            .contains("ERR_BROWSER_SQL_PROFILE_MISMATCH|browser-app-v2|statement|"));
+    }
+
+    #[test]
+    fn supports_alter_table_add_column() {
+        let statements = parse_sql_batch("ALTER TABLE users ADD COLUMN done BOOL")
+            .expect("ALTER TABLE ADD COLUMN should parse");
+
+        assert_eq!(statements.len(), 1);
+        let Statement::AlterTable {
+            table_name,
+            actions,
+        } = &statements[0]
+        else {
+            panic!("expected alter table statement");
+        };
+        assert_eq!(table_name, "users");
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(
+            &actions[0],
+            AlterTableAction::AddColumn(column)
+                if column.name == "done" && column.column_type == ColumnType::Bool
+        ));
+    }
+
+    #[test]
+    fn supports_default_and_simple_check_columns() {
+        let statements = parse_sql_batch(
+            "CREATE TABLE notes(id INT64 PRIMARY KEY, done BOOL DEFAULT FALSE, score INT64 CHECK (score >= 0))",
+        )
+        .expect("DEFAULT and CHECK should parse");
+
+        let Statement::CreateTable(table) = &statements[0] else {
+            panic!("expected create table statement");
+        };
+        assert!(table.columns[1].default.is_some());
+        assert_eq!(table.columns[2].checks.len(), 1);
+    }
+
+    #[test]
+    fn supports_insert_select() {
+        let statements =
+            parse_sql_batch("INSERT INTO notes(id, body) SELECT 1 AS id, 'from-select' AS body")
+                .expect("INSERT SELECT should parse");
+
+        assert_eq!(statements.len(), 1);
+        let Statement::Insert(insert) = &statements[0] else {
+            panic!("expected insert statement");
+        };
+        assert_eq!(insert.table_name, "notes");
+        assert_eq!(insert.columns, vec!["id", "body"]);
+        assert!(matches!(&insert.source, InsertSource::Query(_)));
+    }
+
+    #[test]
+    fn unsupported_browser_sql_error_shape() {
+        let error = parse_sql_batch("CREATE TABLE notes(id UNKNOWN_TYPE)")
+            .expect_err("unknown types should emit browser error code");
+
+        assert!(error
+            .to_string()
+            .contains("ERR_BROWSER_SQL_UNSUPPORTED|browser-app-v2|column-type|"));
+    }
+
+    #[test]
+    fn parse_error_shape() {
+        let error = parse_sql_batch("CREATE TABLE").expect_err("invalid create should parse fail");
+
+        assert!(error
+            .to_string()
+            .contains("ERR_BROWSER_SQL_PARSE|browser-app-v2|syntax|"));
     }
 }

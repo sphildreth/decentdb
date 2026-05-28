@@ -21,6 +21,28 @@ static int check(ddb_status_t status, char *buffer, size_t buffer_len,
   return 0;
 }
 
+static int check_last_error_json(char *buffer, size_t buffer_len) {
+  char *json = NULL;
+  ddb_status_t status = ddb_last_error_json(&json);
+  if (status != DDB_OK) {
+    snprintf(buffer, buffer_len, "last_error_json failed with status %u",
+             status);
+    return 0;
+  }
+  if (json == NULL) {
+    snprintf(buffer, buffer_len, "last_error_json returned NULL");
+    return 0;
+  }
+  int ok = strstr(json, "\"code_name\":\"ERR_SQL\"") != NULL &&
+           strstr(json, "\"subcode\":\"sql.relation_not_found\"") != NULL &&
+           strstr(json, "\"relation\":\"nope\"") != NULL;
+  if (!ok) {
+    snprintf(buffer, buffer_len, "unexpected diagnostic JSON: %.400s", json);
+  }
+  ddb_string_free(&json);
+  return ok;
+}
+
 static napi_value run_smoke(napi_env env, napi_callback_info info) {
   (void)info;
   char error[512];
@@ -117,6 +139,9 @@ static napi_value run_smoke(napi_env env, napi_callback_info info) {
   }
   if (strstr(ddb_last_error_message(), "nope") == NULL) {
     return fail(env, "unexpected error message");
+  }
+  if (!check_last_error_json(error, sizeof(error))) {
+    return fail(env, error);
   }
   ddb_db_free(&db);
 

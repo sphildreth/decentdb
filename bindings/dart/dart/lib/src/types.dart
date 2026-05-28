@@ -10,7 +10,12 @@ enum ErrorCode {
   sql(5),
   internal(6),
   panic(7),
-  unsupportedFormatVersion(8);
+  unsupportedFormatVersion(8),
+  busy(9),
+  timeout(10),
+  canceled(11),
+  queueFull(12),
+  queueClosed(13);
 
   const ErrorCode(this.code);
 

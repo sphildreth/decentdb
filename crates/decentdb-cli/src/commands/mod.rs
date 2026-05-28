@@ -13,7 +13,7 @@ use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use decentdb::{
     evict_shared_wal, render_markdown, run_doctor, BranchDiffReport, BranchInfo, BranchLogEntry,
     BranchMergeOperation, BranchMergeReport, BranchRestoreReport, BranchTableDiffStatus,
-    BulkLoadOptions, ColumnInfo, Db, DbConfig, DoctorCategory, DoctorCheckSelection,
+    BulkLoadOptions, ColumnInfo, Db, DbConfig, DbError, DoctorCategory, DoctorCheckSelection,
     DoctorIndexVerification, DoctorOptions, DoctorPathMode, DoctorReport, DoctorSeverity,
     ExtensionTrustAnchor, ExtensionValidationOptions, ForeignKeyInfo, HeaderInfo,
     IndexVerification, NamedSnapshot, QueryResult, ShapeAckOptions, StorageInfo, SyncChangeBatch,
@@ -23,7 +23,7 @@ use decentdb::{
 };
 
 use crate::output::{
-    render_error_json, render_exec_success_json, render_key_value_rows, render_rows,
+    render_error_json_for_error, render_exec_success_json, render_key_value_rows, render_rows,
     rows_from_query_result, stringify_value, OutputFormat,
 };
 use crate::repl::run_repl;
@@ -175,7 +175,7 @@ pub struct ExecCommand {
     pub format: OutputFormat,
     #[arg(long = "noRows")]
     pub no_rows: bool,
-    #[arg(long = "cachePages", default_value_t = 1024)]
+    #[arg(long = "cachePages", default_value_t = 0)]
     pub cache_pages: usize,
     #[arg(long = "cacheMb", default_value_t = 0)]
     pub cache_mb: usize,
@@ -1339,7 +1339,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         Commands::Exec(command) => {
             if let Err(error) = run_exec(&command) {
                 if command.format == OutputFormat::Json {
-                    println!("{}", render_error_json(&error.to_string()));
+                    println!("{}", render_error_json_for_error(&error));
                     return Ok(());
                 }
                 return Err(error);
@@ -3248,7 +3248,7 @@ fn handle_relay_http_connection(
         Err(error) => write_sync_json_response(
             &mut stream,
             400,
-            relay_error("RELAY_ERROR", &error.to_string()),
+            relay_error_from_anyhow("RELAY_ERROR", &error),
         ),
     }
 }
@@ -4108,6 +4108,35 @@ fn relay_error(code: &str, message: &str) -> serde_json::Value {
         "error_code": code,
         "error": message,
     })
+}
+
+fn relay_error_from_anyhow(code: &str, error: &anyhow::Error) -> serde_json::Value {
+    if let Some(db_error) = error.downcast_ref::<DbError>() {
+        let diagnostic = db_error.diagnostic();
+        serde_json::json!({
+            "error_code": code,
+            "error": db_error.to_string(),
+            "native_code": db_error.numeric_code(),
+            "subcode": diagnostic.subcode,
+            "diagnostic": diagnostic,
+        })
+    } else {
+        relay_error(code, &error.to_string())
+    }
+}
+
+fn json_error_from_anyhow(error: &anyhow::Error) -> serde_json::Value {
+    if let Some(db_error) = error.downcast_ref::<DbError>() {
+        let diagnostic = db_error.diagnostic();
+        serde_json::json!({
+            "error": db_error.to_string(),
+            "native_code": db_error.numeric_code(),
+            "subcode": diagnostic.subcode,
+            "diagnostic": diagnostic,
+        })
+    } else {
+        serde_json::json!({ "error": error.to_string() })
+    }
 }
 
 fn current_time_micros_cli() -> i64 {
@@ -5116,7 +5145,7 @@ fn handle_sync_connection(
                 db.sync_export_batch(since, limit)
             };
             batch
-                .map_err(|error| anyhow!(error.to_string()))
+                .map_err(Into::into)
                 .and_then(|batch| serde_json::to_value(batch).map_err(Into::into))
         }
         ("POST", "/decentdb/sync/v1/import") => {
@@ -5136,7 +5165,7 @@ fn handle_sync_connection(
                 }
             };
             summary
-                .map_err(|error| anyhow!(error.to_string()))
+                .map_err(Into::into)
                 .and_then(|summary| serde_json::to_value(summary).map_err(Into::into))
         }
         ("GET", "/decentdb/sync/v1/conflicts") => Ok(serde_json::to_value(db.sync_conflicts()?)?),
@@ -5151,11 +5180,7 @@ fn handle_sync_connection(
 
     match response {
         Ok(body) => write_sync_json_response(&mut stream, 200, body),
-        Err(error) => write_sync_json_response(
-            &mut stream,
-            400,
-            serde_json::json!({ "error": error.to_string() }),
-        ),
+        Err(error) => write_sync_json_response(&mut stream, 400, json_error_from_anyhow(&error)),
     }
 }
 

@@ -1,0 +1,22 @@
+name: decentdb_flutter_example
+description: Reference Flutter mobile app for DecentDB.
+publish_to: none
+version: 2.8.0
+
+environment:
+  sdk: ^3.0.0
+  flutter: ">=3.16.0"
+
+dependencies:
+  decentdb_flutter:
+    path: ..
+  flutter:
+    sdk: flutter
+  path_provider: ^2.1.5
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+flutter:
+  uses-material-design: true

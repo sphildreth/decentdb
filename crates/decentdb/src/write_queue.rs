@@ -295,6 +295,26 @@ impl WriteQueue {
             return;
         }
 
+        let process_writer = match db.begin_process_writer_batch() {
+            Ok(guard) => guard,
+            Err(error) => {
+                self.metrics
+                    .failed
+                    .fetch_add(batch.len() as u64, Ordering::Relaxed);
+                let message = error.to_string();
+                for request in batch {
+                    let _ = Self::set_result(
+                        &request,
+                        Err(DbError::io(
+                            "queued process writer lock",
+                            std::io::Error::other(message.clone()),
+                        )),
+                    );
+                }
+                self.finish_executor_batch();
+                return;
+            }
+        };
         let _group_commit = if self.strict_group_commit {
             Some(db.begin_deferred_group_commit())
         } else {
@@ -384,6 +404,7 @@ impl WriteQueue {
             }
         }
 
+        drop(process_writer);
         self.finish_executor_batch();
     }
 

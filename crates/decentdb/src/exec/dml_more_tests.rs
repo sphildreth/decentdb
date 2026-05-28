@@ -374,6 +374,7 @@ mod tests {
             .insert(table.name.clone(), TableData::from_rows(vec![]).into());
         let prepared = crate::exec::dml::PreparedSimpleInsert {
             table_name: "t".to_string(),
+            catalog_table_name: Some("t".to_string()),
             row_source_dependency_tables: vec![],
             columns: vec![
                 crate::exec::dml::PreparedInsertColumn {
@@ -444,6 +445,7 @@ mod tests {
             .insert(table.name.clone(), TableData::from_rows(vec![]).into());
         let prepared = crate::exec::dml::PreparedSimpleInsert {
             table_name: "t2".to_string(),
+            catalog_table_name: Some("t2".to_string()),
             row_source_dependency_tables: vec![],
             columns: vec![crate::exec::dml::PreparedInsertColumn {
                 name: "id".to_string(),

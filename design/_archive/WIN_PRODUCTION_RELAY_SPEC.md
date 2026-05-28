@@ -6,13 +6,13 @@
 **Audience:** Core engine developers, sync implementers, CLI maintainers, web
 binding maintainers, SDK maintainers, documentation authors, release engineers,
 coding agents
-**Related Roadmap Item:** `design/FUTURE_WINS.md` priority #1
+**Related Roadmap Item:** Delivered foundation; see `design/FUTURE_WINS.md` Delivered Context.
 **Governing ADRs:**
-[`adr/0166-production-sync-relay-boundary-and-identity.md`](adr/0166-production-sync-relay-boundary-and-identity.md),
-[`adr/0167-public-changeset-api.md`](adr/0167-public-changeset-api.md),
-[`adr/0168-sync-shape-streaming-subscriptions.md`](adr/0168-sync-shape-streaming-subscriptions.md)
+[`adr/0166-production-sync-relay-boundary-and-identity.md`](../adr/0166-production-sync-relay-boundary-and-identity.md),
+[`adr/0167-public-changeset-api.md`](../adr/0167-public-changeset-api.md),
+[`adr/0168-sync-shape-streaming-subscriptions.md`](../adr/0168-sync-shape-streaming-subscriptions.md)
 **Related Inputs:**
-[`WIN_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md`](WIN_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md),
+[`WIN_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md`](../WIN_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md),
 [`WIN_REACTIVE_QUERY_SUBSCRIPTIONS_CHANGE_STREAMS_SPEC.md`](WIN_REACTIVE_QUERY_SUBSCRIPTIONS_CHANGE_STREAMS_SPEC.md),
 [`WIN_PRODUCTION_BROWSER_RUNTIM.md`](WIN_PRODUCTION_BROWSER_RUNTIM.md),
 ADR 0147-0152, ADR 0157-0158, ADR 0163-0165

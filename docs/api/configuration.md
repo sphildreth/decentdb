@@ -23,7 +23,8 @@ The page cache keeps frequently accessed pages in memory.
 **Configuration:**
 - CLI: `--cachePages=<n>` or `--cacheMb=<n>`
 - Rust API: `openDb(path, cachePages = n)`
-- Default: 1024 pages (4MB with 4KB pages)
+- Default durable/low-memory profile: 1024 pages (4MB with 4KB pages)
+- Explicit balanced profile: 4096 pages (16MB with 4KB pages)
 
 **Recommendations:**
 
@@ -37,15 +38,113 @@ The page cache keeps frequently accessed pages in memory.
 **Example:**
 ```bash
 # Small database
+decentdb exec --db=small.ddb --sql="SELECT 1"
+
+# Constrained host / low-memory profile behavior
 decentdb exec --db=small.ddb --sql="SELECT 1" --cachePages=1024
 
 # Large database
 decentdb exec --db=large.ddb --sql="SELECT 1" --cacheMb=256
 ```
 
+Rust callers can also start from named durable profiles:
+
+```rust
+use decentdb::DbConfig;
+
+let balanced = DbConfig::balanced();
+let low_memory = DbConfig::low_memory();
+let tuned = DbConfig::tuned_durable();
+# let _ = (balanced, low_memory, tuned);
+```
+
+All three keep full WAL sync. `tuned_durable` is explicit because it raises
+memory use and changes row-source/checkpoint behavior for hot read workloads.
+
 ## Durability and Checkpointing
 
 DecentDB uses a write-ahead log (WAL) and performs an `fsync()` on commit by default for durable ACID writes.
+
+## Cross-Process WAL Coordination
+
+Local on-disk databases coordinate multiple native OS processes by default when
+the VFS supports byte-range file locks. Coordination uses a rebuildable
+`<database>.coord` sidecar to serialize writers/checkpoints, retain WAL frames
+for readers in other processes, and publish WAL/checkpoint generation changes.
+
+Rust configuration:
+
+```rust
+use decentdb::{Db, DbConfig, ProcessCoordinationMode};
+
+let config = DbConfig {
+    process_coordination: ProcessCoordinationMode::Required,
+    process_coordination_timeout_ms: 30_000,
+    ..DbConfig::default()
+};
+
+let db = Db::open("app.ddb", config)?;
+# Ok::<(), decentdb::DbError>(())
+```
+
+C ABI and binding open options:
+
+```text
+process_coordination=auto
+process_coordination=required
+process_coordination=single_process_unsafe
+process_coordination_timeout_ms=30000
+```
+
+Use `required` for applications that must fail when cross-process protection is
+unavailable. Use `single_process_unsafe` only for known single-process or
+immutable inspection workflows.
+
+The `.coord` sidecar is rebuildable from the durable database header and WAL.
+Default opens therefore avoid fsyncing sidecar metadata; byte-range locks remain
+the correctness mechanism for writer/checkpoint serialization.
+
+In `auto` mode, current-writer diagnostics are maintained in process memory so
+each durable commit does not need an extra sidecar metadata write. `required`
+mode persists those diagnostics for applications that prefer cross-process
+operational visibility over the default-fast commit path.
+
+## Local Transparent Data Encryption (TDE)
+
+TDE is configured at create/open time with `DbConfig::encryption` or C ABI open
+options. The database file, WAL, and sync journal are encrypted through the VFS
+layer when a key is supplied.
+
+```rust
+use decentdb::{Db, DbConfig, DbEncryptionConfig};
+
+let config = DbConfig {
+    encryption: Some(DbEncryptionConfig::from_key_bytes(
+        b"application-managed high entropy key bytes",
+    )?),
+    ..DbConfig::default()
+};
+
+let db = Db::create("secure.ddb", config.clone())?;
+let reopened = Db::open("secure.ddb", config)?;
+# Ok::<(), decentdb::DbError>(())
+```
+
+C ABI and binding callers can use open options:
+
+```text
+encryption_key_hex=00112233445566778899aabbccddeeff
+encryption_key=development-only-text-key
+```
+
+`encryption_key_hex` / `tde_key_hex` decode hex bytes. `encryption_key` /
+`tde_key` use the UTF-8 bytes of the option value. Avoid logging option strings
+that contain key material.
+
+TDE v1 provides local encryption-at-rest confidentiality. Key storage, key
+rotation, and authenticated page/chunk encryption are separate follow-up
+concerns; keep production keys in a platform key store, secure enclave, KMS, or
+equivalent secret manager.
 
 ### Durability
 
@@ -212,8 +311,8 @@ Create `~/.decentdb/config` for default settings:
 db = ~/myapp.ddb
 
 # Default cache size (either key is supported)
-cacheMb = 64
-# cachePages = 16384
+cacheMb = 16
+# cachePages = 4096
 ```
 
 Settings are overridden by command-line options.
@@ -242,7 +341,7 @@ opts.checkpointOnComplete = true
 
 ```bash
 # Balanced settings
-decentdb exec --db=my.ddb --sql="..." --cacheMb=64
+decentdb exec --db=my.ddb --sql="..."
 ```
 
 ## Best Practices
@@ -271,8 +370,8 @@ decentdb exec --db=my.ddb --sql="..." --cacheMb=64
 ### Small Embedded Device
 
 ```bash
-# Minimal memory usage
-decentdb exec --db=embedded.ddb --sql="..." --cachePages=256  # 1MB
+# Constrained memory usage
+decentdb exec --db=embedded.ddb --sql="..." --cachePages=1024  # 4MB
 ```
 
 ### Development/Testing

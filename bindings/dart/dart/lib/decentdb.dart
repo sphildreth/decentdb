@@ -8,6 +8,7 @@ export 'src/branch.dart';
 export 'src/database.dart';
 export 'src/statement.dart';
 export 'src/errors.dart';
+export 'src/open_options.dart';
 export 'src/types.dart';
 export 'src/schema.dart';
 export 'src/schema_snapshot.dart';

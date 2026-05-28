@@ -86,6 +86,22 @@ Common status codes:
 `ddb_last_error_message()` returns a borrowed thread-local error string. Treat
 the pointer as valid only until the next DecentDB call on the same thread.
 
+`DDB_ABI_VERSION` for this contract is currently `7`.
+Callers should prefer `ddb_last_error_json(char **out_json)` for machine-readable
+details when available:
+
+```c
+char *json = NULL;
+ddb_status_t status = ddb_db_execute(db, "SELEC bad", NULL, 0, &result);
+if (status != DDB_OK && ddb_last_error_json(&json) == DDB_OK) {
+  // parse json diagnostics
+  puts(json);
+  ddb_string_free(&json);
+}
+```
+
+The JSON accessor does not replace `ddb_last_error_message()`.
+
 ## Ownership Rules
 
 The C ABI uses opaque handles for databases, prepared statements, and query
@@ -110,6 +126,64 @@ Rules:
   must be released with `ddb_value_dispose`.
 - Do not call free functions concurrently from multiple threads on the same
   pointer or handle.
+
+## Open Options And Local Security
+
+The option-aware open functions accept a UTF-8 `key=value` string separated by
+whitespace, commas, or semicolons:
+
+- `ddb_db_create_with_options`
+- `ddb_db_open_with_options`
+- `ddb_db_open_or_create_with_options`
+
+TDE can be enabled with `encryption_key_hex` or `encryption_key`:
+
+```c
+ddb_db_t *db = NULL;
+check(ddb_db_create_with_options(
+          "secure.ddb",
+          "encryption_key_hex=00112233445566778899aabbccddeeff",
+          &db),
+      "create encrypted db");
+```
+
+`encryption_key_hex` / `tde_key_hex` decode hex bytes. `encryption_key` /
+`tde_key` use the UTF-8 bytes of the option value. Avoid logging option strings
+that contain key material.
+
+Cross-process WAL coordination can be required explicitly:
+
+```c
+ddb_db_t *db = NULL;
+check(ddb_db_open_or_create_with_options(
+          "app.ddb",
+          "process_coordination=required;process_coordination_timeout_ms=30000",
+          &db),
+      "open coordinated db");
+```
+
+Supported `process_coordination` values are `auto` (default), `required`, and
+`single_process_unsafe`. Coordinated opens create or reuse a rebuildable
+`app.ddb.coord` sidecar on local filesystems with byte-range lock support. Use
+`SELECT * FROM sys.process_coordination`, `sys.process_readers`, and
+`sys.process_lock_metrics` for diagnostics.
+
+Audit context can be set through SQL or through the C ABI:
+
+```c
+const char *actor = "alice@example.com";
+check(ddb_db_set_audit_context_text(
+          db,
+          "actor",
+          actor,
+          strlen(actor)),
+      "set actor");
+
+check(ddb_db_clear_audit_context(db, "actor"), "clear actor");
+```
+
+The SQL layer also supports `SET AUDIT CONTEXT`, `CREATE POLICY`, and
+`CREATE MASK`. See [Local Data Security](../user-guide/security.md).
 
 ## Queued Writes
 

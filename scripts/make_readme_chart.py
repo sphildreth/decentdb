@@ -99,10 +99,15 @@ def plot(rows: list[dict[str, object]], meta: dict[str, object]) -> None:
     if not available_metrics:
         raise SystemExit("No plottable data. Did you provide metrics?")
 
-    rows_by_display = {
-        display_engine_name(str(row["engine"])): row
-        for row in rows
-    }
+    rows_by_display = {}
+    for row in rows:
+        display = display_engine_name(str(row["engine"]))
+        if display in rows_by_display:
+            raise SystemExit(
+                "Duplicate benchmark display label after normalization: "
+                f"{display}. Use distinct engine labels or remove the alias row."
+            )
+        rows_by_display[display] = row
     engines = ordered_display_engines(list(rows_by_display.keys()))
 
     positions = np.arange(len(available_metrics), dtype=float)

@@ -111,6 +111,8 @@ pub(crate) fn commit_pages(
     pages: Vec<(PageId, Vec<u8>)>,
     max_page_count: u32,
 ) -> Result<u64> {
+    let _process_guard = wal.lock_process_writer()?;
+    wal.refresh_from_coordination(pager)?;
     let mut writer_state = wal
         .inner
         .write_lock
@@ -244,6 +246,7 @@ pub(crate) fn commit_pages(
             .pages_since_checkpoint
             .fetch_add(prepared_count_u32, Ordering::AcqRel);
     }
+    wal.publish_process_commit(offset)?;
     drop(writer_state);
     demote_cold_versions(wal)?;
     maybe_auto_checkpoint(wal, pager)?;
@@ -258,6 +261,8 @@ pub(crate) fn commit_pages_if_latest(
     expected_latest_lsn: u64,
     expected_checkpoint_epoch: u64,
 ) -> Result<u64> {
+    let _process_guard = wal.lock_process_writer()?;
+    wal.refresh_from_coordination(pager)?;
     let mut writer_state = wal
         .inner
         .write_lock
@@ -400,6 +405,7 @@ pub(crate) fn commit_pages_if_latest(
             .pages_since_checkpoint
             .fetch_add(prepared_count_u32, Ordering::AcqRel);
     }
+    wal.publish_process_commit(offset)?;
     drop(writer_state);
     demote_cold_versions(wal)?;
     maybe_auto_checkpoint(wal, pager)?;
@@ -599,6 +605,13 @@ fn demote_cold_versions(wal: &WalHandle) -> Result<()> {
         (None, Some(retained_lsn)) => Some(retained_lsn),
         (None, None) => None,
     };
+    if min_reader_snapshot.is_some() {
+        // Delta materialization may need a stable base page chain. While any
+        // snapshot is active, keep newly-written versions resident so readers
+        // never have to reconstruct an on-disk delta against a main-db page
+        // that checkpoint copyback can be updating concurrently.
+        return Ok(());
+    }
     let mut index = wal
         .inner
         .index
@@ -651,10 +664,17 @@ fn maybe_auto_checkpoint(wal: &WalHandle, pager: &PagerHandle) -> Result<()> {
         return Ok(());
     }
 
-    // ADR 0058: prefer the background worker when present so the writer's
-    // commit hot path is not blocked by checkpoint copyback. The worker
-    // applies the same reader-active gating below.
-    if let Some(bg) = wal.inner.bg_checkpointer.get() {
+    // ADR 0058: prefer the background worker when configured so the writer's
+    // commit hot path is not blocked by checkpoint copyback. Start it lazily
+    // on the first real threshold hit so ordinary opens do not pay thread
+    // creation cost.
+    if wal.inner.background_checkpoint_worker {
+        let bg = wal.inner.bg_checkpointer.get_or_init(|| {
+            super::background::BgCheckpointer::start(
+                std::sync::Arc::downgrade(&wal.inner),
+                pager.clone(),
+            )
+        });
         bg.wake();
         return Ok(());
     }
@@ -751,7 +771,7 @@ mod tests {
             background_checkpoint_worker: false,
             ..DbConfig::default()
         };
-        let wal = WalHandle::acquire(&vfs, path, &cfg, &pager).expect("acquire");
+        let wal = WalHandle::acquire(&vfs, path, &cfg, &pager, None).expect("acquire");
         (vfs, pager, wal)
     }
 

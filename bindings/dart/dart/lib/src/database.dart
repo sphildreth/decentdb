@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:collection';
 import 'dart:convert';
 import 'dart:ffi';
@@ -13,6 +14,35 @@ import 'types.dart';
 
 /// Open mode used by [Database._openWith].
 enum _OpenMode { create, open, openOrCreate }
+
+/// Cross-process WAL coordination mode for local on-disk databases.
+enum ProcessCoordinationMode {
+  auto('auto'),
+  required('required'),
+  singleProcessUnsafe('single_process_unsafe');
+
+  const ProcessCoordinationMode(this.nativeValue);
+
+  final String nativeValue;
+}
+
+String? _buildOpenOptions(
+  String? options, {
+  ProcessCoordinationMode? processCoordination,
+  int? processCoordinationTimeoutMs,
+}) {
+  final parts = <String>[];
+  if (options != null && options.trim().isNotEmpty) {
+    parts.add(options.trim());
+  }
+  if (processCoordination != null) {
+    parts.add('process_coordination=${processCoordination.nativeValue}');
+  }
+  if (processCoordinationTimeoutMs != null) {
+    parts.add('process_coordination_timeout_ms=$processCoordinationTimeoutMs');
+  }
+  return parts.isEmpty ? null : parts.join(';');
+}
 
 /// An open DecentDB database.
 ///
@@ -64,7 +94,12 @@ class Database {
   Never _throwStatus(int status, String fallback) {
     final msgPtr = _bindings.lastErrorMessage();
     final msg = msgPtr == nullptr ? fallback : msgPtr.toDartString();
-    throw DecentDbException(ErrorCode.fromCode(status), msg);
+    final diagnostic = _bindings.takeLastErrorDiagnostic();
+    throw DecentDbException(
+      ErrorCode.fromCode(status),
+      msg,
+      diagnostic: diagnostic,
+    );
   }
 
   // ---------------------------------------------------------------------------
@@ -73,23 +108,34 @@ class Database {
 
   static NativeBindings _resolveBindings(
       String? libraryPath, NativeBindings? bindings) {
-    return bindings ??
-        NativeBindings.load(libraryPath ?? NativeBindings.defaultLibraryName());
+    if (bindings != null) {
+      return bindings;
+    }
+    return libraryPath == null
+        ? NativeBindings.loadDefault()
+        : NativeBindings.load(libraryPath);
   }
 
   static Database _openWith(
     _OpenMode mode,
     String path, {
     String? options,
+    ProcessCoordinationMode? processCoordination,
+    int? processCoordinationTimeoutMs,
     String? libraryPath,
     NativeBindings? bindings,
     int stmtCacheCapacity = 128,
   }) {
     final nb = _resolveBindings(libraryPath, bindings);
+    final openOptions = _buildOpenOptions(
+      options,
+      processCoordination: processCoordination,
+      processCoordinationTimeoutMs: processCoordinationTimeoutMs,
+    );
     final nativePath = path.toNativeUtf8();
-    final nativeOptions = options == null || options.trim().isEmpty
+    final nativeOptions = openOptions == null || openOptions.trim().isEmpty
         ? null
-        : options.toNativeUtf8();
+        : openOptions.toNativeUtf8();
     final outDb = calloc<Pointer<DdbDb>>();
     try {
       final int status;
@@ -112,15 +158,29 @@ class Database {
         final msg = msgPtr == nullptr
             ? 'Failed to open database at $path'
             : msgPtr.toDartString();
-        throw DecentDbException(ErrorCode.fromCode(status), msg);
+        final diagnostic = nb.takeLastErrorDiagnostic();
+        throw DecentDbException(
+          ErrorCode.fromCode(status),
+          msg,
+          diagnostic: diagnostic,
+        );
       }
       return Database._(nb, outDb.value, stmtCacheCapacity: stmtCacheCapacity);
     } finally {
       calloc.free(outDb);
       if (nativeOptions != null) {
+        _zeroNativeUtf8(nativeOptions, openOptions!);
         calloc.free(nativeOptions);
       }
       calloc.free(nativePath);
+    }
+  }
+
+  static void _zeroNativeUtf8(Pointer<Utf8> pointer, String value) {
+    final bytes = utf8.encode(value).length + 1;
+    final data = pointer.cast<Uint8>();
+    for (var i = 0; i < bytes; i++) {
+      data[i] = 0;
     }
   }
 
@@ -136,6 +196,8 @@ class Database {
   static Database open(
     String path, {
     String? options,
+    ProcessCoordinationMode? processCoordination,
+    int? processCoordinationTimeoutMs,
     String? libraryPath,
     NativeBindings? bindings,
     int stmtCacheCapacity = 128,
@@ -144,6 +206,8 @@ class Database {
       _OpenMode.openOrCreate,
       path,
       options: options,
+      processCoordination: processCoordination,
+      processCoordinationTimeoutMs: processCoordinationTimeoutMs,
       libraryPath: libraryPath,
       bindings: bindings,
       stmtCacheCapacity: stmtCacheCapacity,
@@ -154,12 +218,16 @@ class Database {
   static Database create(
     String path, {
     String? options,
+    ProcessCoordinationMode? processCoordination,
+    int? processCoordinationTimeoutMs,
     String? libraryPath,
     NativeBindings? bindings,
     int stmtCacheCapacity = 128,
   }) =>
       _openWith(_OpenMode.create, path,
           options: options,
+          processCoordination: processCoordination,
+          processCoordinationTimeoutMs: processCoordinationTimeoutMs,
           libraryPath: libraryPath,
           bindings: bindings,
           stmtCacheCapacity: stmtCacheCapacity);
@@ -168,12 +236,16 @@ class Database {
   static Database openExisting(
     String path, {
     String? options,
+    ProcessCoordinationMode? processCoordination,
+    int? processCoordinationTimeoutMs,
     String? libraryPath,
     NativeBindings? bindings,
     int stmtCacheCapacity = 128,
   }) =>
       _openWith(_OpenMode.open, path,
           options: options,
+          processCoordination: processCoordination,
+          processCoordinationTimeoutMs: processCoordinationTimeoutMs,
           libraryPath: libraryPath,
           bindings: bindings,
           stmtCacheCapacity: stmtCacheCapacity);
@@ -206,7 +278,12 @@ class Database {
         final msg = msgPtr == nullptr
             ? 'Failed to evict shared WAL for $path'
             : msgPtr.toDartString();
-        throw DecentDbException(ErrorCode.fromCode(status), msg);
+        final diagnostic = nb.takeLastErrorDiagnostic();
+        throw DecentDbException(
+          ErrorCode.fromCode(status),
+          msg,
+          diagnostic: diagnostic,
+        );
       }
     } finally {
       calloc.free(nativePath);
@@ -594,6 +671,43 @@ class Database {
     return BranchWorkflow.fromNative(_bindings, _dbPtr!);
   }
 
+  /// Access sync and changeset operations backed by the stable C ABI.
+  SyncController get sync {
+    _checkOpen();
+    return SyncController._(this);
+  }
+
+  Map<String, Object?> _callJsonBridge(
+    int Function(Pointer<DdbDb>, Pointer<Utf8>, Pointer<Pointer<Utf8>>) call,
+    Map<String, Object?> request,
+    String fallback,
+  ) {
+    _checkOpen();
+    final requestJson = jsonEncode(request);
+    final nativeRequest = requestJson.toNativeUtf8();
+    final outJson = calloc<Pointer<Utf8>>();
+    try {
+      final status = call(_dbPtr!, nativeRequest, outJson);
+      if (status != ddbOk) {
+        _throwStatus(status, fallback);
+      }
+      final rawJson =
+          outJson.value == nullptr ? '{}' : outJson.value.toDartString();
+      final freeStatus = _bindings.stringFree(outJson);
+      if (freeStatus != ddbOk) {
+        _throwStatus(freeStatus, 'Failed to free JSON response');
+      }
+      final decoded = jsonDecode(rawJson);
+      if (decoded is! Map) {
+        throw FormatException('JSON response is not an object: $rawJson');
+      }
+      return decoded.cast<String, Object?>();
+    } finally {
+      calloc.free(outJson);
+      calloc.free(nativeRequest);
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // Maintenance
   // ---------------------------------------------------------------------------
@@ -668,5 +782,96 @@ class Database {
     } finally {
       calloc.free(slot);
     }
+  }
+}
+
+/// Sync and public changeset API.
+///
+/// The relay-safe helper [applyBeforeAck] applies a changeset locally before
+/// awaiting the caller's acknowledgement callback.
+final class SyncController {
+  SyncController._(this._db);
+
+  final Database _db;
+
+  /// Execute a raw sync JSON request such as `{"op":"status"}`.
+  Map<String, Object?> executeJson(Map<String, Object?> request) {
+    return _db._callJsonBridge(
+      _db._bindings.dbSyncExecuteJson,
+      request,
+      'Failed to execute sync JSON request',
+    );
+  }
+
+  /// Return current sync status.
+  Map<String, Object?> status() => executeJson({'op': 'status'});
+
+  /// Initialize this database as [replicaId].
+  Map<String, Object?> initReplica(String replicaId) {
+    return executeJson({'op': 'init_replica', 'replica_id': replicaId});
+  }
+
+  /// Create a public changeset from native changeset create [options].
+  Map<String, Object?> createChangeset(Map<String, Object?> options) {
+    return _db._callJsonBridge(
+      _db._bindings.syncChangesetCreateJson,
+      options,
+      'Failed to create sync changeset',
+    );
+  }
+
+  /// Inspect a public [changeset].
+  Map<String, Object?> inspectChangeset(
+    Map<String, Object?> changeset, {
+    Map<String, Object?> options = const {},
+  }) {
+    return _db._callJsonBridge(
+      _db._bindings.syncChangesetInspectJson,
+      _changesetRequest(changeset, options),
+      'Failed to inspect sync changeset',
+    );
+  }
+
+  /// Apply a public [changeset].
+  Map<String, Object?> applyChangeset(
+    Map<String, Object?> changeset, {
+    Map<String, Object?> options = const {},
+  }) {
+    return _db._callJsonBridge(
+      _db._bindings.syncChangesetApplyJson,
+      _changesetRequest(changeset, options),
+      'Failed to apply sync changeset',
+    );
+  }
+
+  /// Apply [changeset] locally before acknowledging it to a relay.
+  Future<Map<String, Object?>> applyBeforeAck(
+    Map<String, Object?> changeset,
+    FutureOr<void> Function() acknowledge, {
+    Map<String, Object?> options = const {},
+  }) async {
+    final result = applyChangeset(changeset, options: options);
+    await acknowledge();
+    return result;
+  }
+
+  /// Invert a public [changeset].
+  Map<String, Object?> invertChangeset(Map<String, Object?> changeset) {
+    return _db._callJsonBridge(
+      _db._bindings.syncChangesetInvertJson,
+      {'changeset': changeset},
+      'Failed to invert sync changeset',
+    );
+  }
+
+  static Map<String, Object?> _changesetRequest(
+    Map<String, Object?> changeset,
+    Map<String, Object?> options,
+  ) {
+    final request = <String, Object?>{'changeset': changeset};
+    if (options.isNotEmpty) {
+      request['options'] = options;
+    }
+    return request;
   }
 }

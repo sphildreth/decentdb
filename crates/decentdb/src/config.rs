@@ -1,10 +1,37 @@
 //! Engine configuration surface for DecentDB.
 
+use std::fmt;
 use std::path::PathBuf;
 
 use crate::error::{DbError, Result};
 use crate::extensions::ExtensionTrustAnchor;
 use crate::storage::page;
+use zeroize::Zeroize;
+
+/// Cross-process WAL coordination mode for native on-disk databases.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProcessCoordinationMode {
+    /// Enable process coordination when the VFS can provide the required
+    /// local-file locks. In-memory databases remain process-local.
+    Auto,
+    /// Require process coordination. Open fails if the selected VFS cannot
+    /// provide the coordination contract.
+    Required,
+    /// Bypass process coordination. Safe only when one OS process can access
+    /// the database file.
+    SingleProcessUnsafe,
+}
+
+impl ProcessCoordinationMode {
+    #[must_use]
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Required => "required",
+            Self::SingleProcessUnsafe => "single_process_unsafe",
+        }
+    }
+}
 
 /// WAL sync policy used by the engine.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -32,6 +59,66 @@ pub enum WalSyncMode {
     TestingOnlyUnsafeNoSync,
 }
 
+/// Application-supplied encryption key material for local TDE.
+///
+/// DecentDB owns a copy of these bytes so it can derive per-file encryption
+/// keys while the database handle is open. Debug output is intentionally
+/// redacted.
+#[derive(Clone, Eq, PartialEq)]
+pub struct EncryptionKey {
+    bytes: Vec<u8>,
+}
+
+impl EncryptionKey {
+    /// Copies raw application key bytes into an engine-owned key buffer.
+    ///
+    /// The key must not be empty. Callers should use high-entropy key bytes
+    /// from their KMS or platform secret store.
+    pub fn from_bytes(bytes: impl AsRef<[u8]>) -> Result<Self> {
+        let bytes = bytes.as_ref();
+        if bytes.is_empty() {
+            return Err(DbError::internal("encryption key must not be empty"));
+        }
+        Ok(Self {
+            bytes: bytes.to_vec(),
+        })
+    }
+
+    pub(crate) fn expose_secret(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl fmt::Debug for EncryptionKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EncryptionKey")
+            .field("len", &self.bytes.len())
+            .field("redacted", &true)
+            .finish()
+    }
+}
+
+impl Drop for EncryptionKey {
+    fn drop(&mut self) {
+        self.bytes.zeroize();
+    }
+}
+
+/// Local transparent data encryption configuration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DbEncryptionConfig {
+    pub key: EncryptionKey,
+}
+
+impl DbEncryptionConfig {
+    /// Creates a TDE configuration from application-owned key bytes.
+    pub fn from_key_bytes(bytes: impl AsRef<[u8]>) -> Result<Self> {
+        Ok(Self {
+            key: EncryptionKey::from_bytes(bytes)?,
+        })
+    }
+}
+
 /// Engine configuration applied at database create/open time.
 ///
 /// ```
@@ -54,9 +141,30 @@ pub struct DbConfig {
     /// Default: `256`.
     pub page_pool_max: usize,
     pub wal_sync_mode: WalSyncMode,
+    /// Cross-process WAL coordination mode for native on-disk databases.
+    ///
+    /// Default: `ProcessCoordinationMode::Auto`.
+    pub process_coordination: ProcessCoordinationMode,
+    /// Maximum time a process-coordination writer/checkpoint lock acquisition
+    /// waits before returning `DbError::Timeout`. `0` means fail immediately
+    /// with `DbError::Busy`.
+    ///
+    /// Default: `30_000`.
+    pub process_coordination_timeout_ms: u64,
     pub checkpoint_timeout_sec: u64,
     pub trigram_postings_threshold: usize,
     pub temp_dir: PathBuf,
+
+    /// Optional local transparent data encryption for database, WAL, and sync
+    /// journal files.
+    ///
+    /// When set, DecentDB wraps the configured VFS and encrypts all logical
+    /// bytes after a small plaintext per-file TDE prefix. Existing plaintext
+    /// databases cannot be opened with encryption enabled without an explicit
+    /// migration/export step.
+    ///
+    /// Default: `None`.
+    pub encryption: Option<DbEncryptionConfig>,
 
     /// Trigger an automatic checkpoint when the in-memory WAL has accumulated
     /// at least this many distinct dirty page versions since the last
@@ -265,6 +373,46 @@ pub struct DbConfig {
 }
 
 impl DbConfig {
+    /// Returns the named balanced durable profile used by applications that can
+    /// spend more memory on the page cache than the default profile.
+    ///
+    /// The profile preserves full durable WAL sync and uses a 16 MiB cache.
+    #[must_use]
+    pub fn balanced() -> Self {
+        Self {
+            cache_size_mb: 16,
+            ..Self::default()
+        }
+    }
+
+    /// Returns the constrained-host durable profile with the historical 4 MiB
+    /// cache behavior.
+    #[must_use]
+    pub fn low_memory() -> Self {
+        Self {
+            cache_size_mb: 4,
+            ..Self::default()
+        }
+    }
+
+    /// Returns the high-memory durable tuning profile used for explicit
+    /// benchmark and power-user comparisons.
+    ///
+    /// This profile is intentionally not the default: it preserves full WAL
+    /// sync, but raises memory use and changes row-source/checkpoint behavior
+    /// for hot read workloads.
+    #[must_use]
+    pub fn tuned_durable() -> Self {
+        Self {
+            cache_size_mb: 64,
+            retain_paged_row_sources_after_commit: true,
+            paged_row_storage: false,
+            wal_checkpoint_threshold_pages: 0,
+            wal_checkpoint_threshold_bytes: 0,
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn validate_for_create(&self) -> Result<()> {
         if page::is_supported_page_size(self.page_size) {
             Ok(())
@@ -290,9 +438,12 @@ impl Default for DbConfig {
             cached_payloads_max_entries: 1024,
             page_pool_max: 256,
             wal_sync_mode: WalSyncMode::Full,
+            process_coordination: ProcessCoordinationMode::Auto,
+            process_coordination_timeout_ms: 30_000,
             checkpoint_timeout_sec: 30,
             trigram_postings_threshold: 100_000,
             temp_dir: default_temp_dir(),
+            encryption: None,
             wal_checkpoint_threshold_pages: 4096,
             wal_checkpoint_threshold_bytes: 64 * 1024 * 1024,
             release_freed_memory_after_checkpoint: cfg!(all(
@@ -334,7 +485,7 @@ fn default_temp_dir() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{DbConfig, WalSyncMode};
+    use super::{DbConfig, ProcessCoordinationMode, WalSyncMode};
     use crate::storage::page;
 
     #[test]
@@ -346,9 +497,12 @@ mod tests {
         assert_eq!(config.cached_payloads_max_entries, 1024);
         assert_eq!(config.page_pool_max, 256);
         assert_eq!(config.wal_sync_mode, WalSyncMode::Full);
+        assert_eq!(config.process_coordination, ProcessCoordinationMode::Auto);
+        assert_eq!(config.process_coordination_timeout_ms, 30_000);
         assert_eq!(config.checkpoint_timeout_sec, 30);
         assert_eq!(config.trigram_postings_threshold, 100_000);
         assert!(!config.temp_dir.as_os_str().is_empty());
+        assert!(config.encryption.is_none());
         assert_eq!(config.wal_checkpoint_threshold_pages, 4096);
         assert_eq!(config.wal_checkpoint_threshold_bytes, 64 * 1024 * 1024);
         assert_eq!(config.wal_resident_versions_per_page, 16);
@@ -369,5 +523,27 @@ mod tests {
         assert!(!config.extension_unsigned_development_mode);
         // Default depends on platform; just assert the field is reachable.
         let _ = config.release_freed_memory_after_checkpoint;
+    }
+
+    #[test]
+    fn named_profiles_preserve_durable_sync_and_cache_contracts() {
+        let balanced = DbConfig::balanced();
+        assert_eq!(balanced.cache_size_mb, 16);
+        assert_eq!(balanced.wal_sync_mode, WalSyncMode::Full);
+        assert!(balanced.paged_row_storage);
+        assert!(!balanced.retain_paged_row_sources_after_commit);
+
+        let low_memory = DbConfig::low_memory();
+        assert_eq!(low_memory.cache_size_mb, 4);
+        assert_eq!(low_memory.wal_sync_mode, WalSyncMode::Full);
+        assert!(low_memory.paged_row_storage);
+
+        let tuned = DbConfig::tuned_durable();
+        assert_eq!(tuned.cache_size_mb, 64);
+        assert_eq!(tuned.wal_sync_mode, WalSyncMode::Full);
+        assert!(tuned.retain_paged_row_sources_after_commit);
+        assert!(!tuned.paged_row_storage);
+        assert_eq!(tuned.wal_checkpoint_threshold_pages, 0);
+        assert_eq!(tuned.wal_checkpoint_threshold_bytes, 0);
     }
 }

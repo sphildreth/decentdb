@@ -57,7 +57,8 @@ While the Native Tier is perfect for C/C++/Rust engines, it cannot fairly benchm
 
 To include these systems, we implement a robust Python-based testing framework. Python acts as the orchestrator, utilizing appropriate bridges (`jaydebeapi` for JDBC, subprocess execution for .NET) to interface with these databases.
 
-*(Note: This framework is thoroughly detailed in `design/COMPARISON_BENCHMARK_PLAN.md`)*
+*(Note: The historical Python comparison plan is preserved in
+`design/_archive/COMPARISON_BENCHMARK_PLAN.md`.)*
 
 ### Framework Architecture
 

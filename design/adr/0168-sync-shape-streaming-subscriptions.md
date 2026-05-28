@@ -165,10 +165,10 @@ Implementation is not complete until tests cover:
 ## References
 
 - `design/FUTURE_WINS.md` priority #1
-- `design/WIN_PRODUCTION_RELAY_SPEC.md`
+- `design/_archive/WIN_PRODUCTION_RELAY_SPEC.md`
 - `design/WIN_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md`
-- `design/WIN_REACTIVE_QUERY_SUBSCRIPTIONS_CHANGE_STREAMS_SPEC.md`
-- `design/WIN_PRODUCTION_BROWSER_RUNTIM.md`
+- `design/_archive/WIN_REACTIVE_QUERY_SUBSCRIPTIONS_CHANGE_STREAMS_SPEC.md`
+- `design/_archive/WIN_PRODUCTION_BROWSER_RUNTIM.md`
 - `design/adr/0149-scoped-sync-v1.md`
 - `design/adr/0164-reactive-query-subscriptions-and-change-streams.md`
 - `design/adr/0165-production-browser-runtime-contract.md`

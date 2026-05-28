@@ -1,4 +1,4 @@
-//! Reader-aware checkpoint copyback and WAL pruning.
+//! Reader-safe checkpoint copyback and WAL pruning.
 //!
 //! Implements:
 //! - design/adr/0004-wal-checkpoint-strategy.md
@@ -24,6 +24,8 @@ pub(crate) fn checkpoint(wal: &WalHandle, pager: &PagerHandle, timeout_sec: u64)
         }
     }
 
+    let _process_guard = wal.lock_process_checkpoint()?;
+    wal.refresh_from_coordination(pager)?;
     let _writer_guard = wal
         .inner
         .write_lock
@@ -31,15 +33,41 @@ pub(crate) fn checkpoint(wal: &WalHandle, pager: &PagerHandle, timeout_sec: u64)
         .expect("wal write lock should not be poisoned");
     wal.inner.checkpoint_pending.store(true, Ordering::SeqCst);
     let _pending_reset = PendingReset(wal);
+    {
+        // Fence with begin_reader(), which holds the index lock while it
+        // re-checks checkpoint_pending and registers its snapshot. Without
+        // this handoff a checkpoint can compute safe_lsn before a reader that
+        // already passed the pending check becomes visible in the registry,
+        // then copy back newer pages underneath that reader's snapshot.
+        let _index = wal
+            .inner
+            .index
+            .lock()
+            .expect("wal index lock should not be poisoned");
+    }
 
     let current_lsn = wal.latest_snapshot();
-    let active_reader_lsn = wal
-        .inner
-        .reader_registry
-        .min_snapshot_lsn()?
-        .unwrap_or(current_lsn);
-    let retained_snapshot_lsn = wal.retained_snapshot_lsn().unwrap_or(current_lsn);
-    let safe_lsn = active_reader_lsn.min(retained_snapshot_lsn);
+    let active_reader_lsn = wal.inner.reader_registry.min_snapshot_lsn()?;
+    let retained_snapshot_lsn = wal.retained_snapshot_lsn();
+    let process_retention = wal.process_reader_retention()?;
+    let process_readers_block_checkpoint = process_retention
+        .as_ref()
+        .is_some_and(|retention| retention.active_count > 0 || retention.truncation_blocked);
+    let named_snapshot_retained =
+        retained_snapshot_lsn.is_some_and(|snapshot_lsn| snapshot_lsn < current_lsn);
+    if active_reader_lsn.is_some() || named_snapshot_retained || process_readers_block_checkpoint {
+        // Copyback mutates main-db pages one at a time. Readers normally use
+        // WAL versions for changed pages, but overflow and delta paths can
+        // still fall back to main-db pages for stable bases. Keep the data
+        // file unchanged while snapshots are live; a later reader-free
+        // checkpoint will copy back and truncate the WAL.
+        let _warnings = wal
+            .inner
+            .reader_registry
+            .capture_long_reader_warnings(timeout_sec)?;
+        return Ok(());
+    }
+    let safe_lsn = current_lsn;
 
     let mut latest_versions = wal
         .inner
@@ -84,7 +112,6 @@ pub(crate) fn checkpoint(wal: &WalHandle, pager: &PagerHandle, timeout_sec: u64)
     let _checkpoint_end = writer::append_checkpoint_frame(wal, safe_lsn)?;
 
     {
-        let active_readers = wal.inner.reader_registry.active_reader_count()?;
         let mut index = wal
             .inner
             .index
@@ -96,10 +123,7 @@ pub(crate) fn checkpoint(wal: &WalHandle, pager: &PagerHandle, timeout_sec: u64)
         // every version).  If safe_lsn < current_lsn, a reader that
         // dropped after we computed safe_lsn would cause us to lose
         // post-safe_lsn commits if we truncated.
-        let named_snapshot_retained = wal
-            .retained_snapshot_lsn()
-            .is_some_and(|snapshot_lsn| snapshot_lsn < current_lsn);
-        if active_readers == 0 && !named_snapshot_retained && safe_lsn >= current_lsn {
+        if safe_lsn >= current_lsn {
             index.clear();
             if let Some(sidecar) = &wal.inner.index_sidecar {
                 sidecar
@@ -110,19 +134,12 @@ pub(crate) fn checkpoint(wal: &WalHandle, pager: &PagerHandle, timeout_sec: u64)
             drop(index);
             writer::truncate_to_header(wal)?;
         } else {
-            drop(index);
-            // Retain snapshot-visible versions while readers are active.
-            // Pruning them here forces deferred readers back onto fallback
-            // page reads after checkpoint, which can race with subsequent
-            // commits that rewrite or recycle those pages.
-            let _warnings = wal
-                .inner
-                .reader_registry
-                .capture_long_reader_warnings(timeout_sec)?;
+            unreachable!("reader-blocked checkpoints return before copyback");
         }
     }
 
     wal.inner.checkpoint_epoch.fetch_add(1, Ordering::AcqRel);
+    wal.publish_process_checkpoint(safe_lsn, wal.latest_snapshot())?;
     // Reset the size-based trigger counter (ADR 0137). The byte threshold
     // resets implicitly because `truncate_to_header` zeroes `wal_end_lsn`;
     // when readers prevented truncation the next commit will re-evaluate

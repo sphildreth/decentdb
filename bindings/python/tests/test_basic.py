@@ -162,17 +162,19 @@ def test_row_view_toggle(db_path, monkeypatch):
     assert cur.fetchone() == (1, "alice", b"\x00\x01", True)
     conn.close()
 
-def test_error_includes_sql_and_code(db_path):
+def test_error_exposes_structured_diagnostic(db_path):
     conn = decentdb.connect(db_path)
     cur = conn.cursor()
 
     with pytest.raises(decentdb.ProgrammingError) as excinfo:
         cur.execute("SELEC 1")
 
-    msg = str(excinfo.value)
-    assert "Context:" in msg
-    assert "native_code" in msg
-    assert "\"sql\":" in msg
+    error = excinfo.value
+    assert error.native_code == decentdb.native.ERR_SQL
+    assert error.code_name == "ERR_SQL"
+    assert error.subcode == "sql.syntax"
+    assert error.diagnostic["code_name"] == "ERR_SQL"
+    assert error.diagnostic["subcode"] == "sql.syntax"
 
     conn.close()
 

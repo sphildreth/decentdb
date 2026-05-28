@@ -78,6 +78,57 @@ impl Row {
         Self::decode_with_overflow::<crate::storage::page::InMemoryPageStore>(bytes, None)
     }
 
+    pub(crate) fn decode_int64_at(bytes: &[u8], column_index: usize) -> Result<Option<i64>> {
+        let (field_count, mut offset) = decode_varint_u64(bytes)?;
+        let field_count = usize::try_from(field_count)
+            .map_err(|_| DbError::corruption("row field count exceeds usize"))?;
+        if column_index >= field_count {
+            return Err(DbError::corruption("row field index exceeds field count"));
+        }
+
+        for field_index in 0..field_count {
+            let tag = *bytes
+                .get(offset)
+                .ok_or_else(|| DbError::corruption("truncated row field tag"))?;
+            offset += 1;
+
+            let (payload_len, len_bytes) = decode_varint_u64(&bytes[offset..])?;
+            offset += len_bytes;
+            let payload_len = usize::try_from(payload_len)
+                .map_err(|_| DbError::corruption("field payload length exceeds usize"))?;
+            let payload_end = offset + payload_len;
+            let payload = bytes
+                .get(offset..payload_end)
+                .ok_or_else(|| DbError::corruption("truncated row field payload"))?;
+            offset = payload_end;
+
+            if field_index != column_index {
+                continue;
+            }
+
+            return match tag {
+                TAG_NULL => {
+                    if !payload.is_empty() {
+                        return Err(DbError::corruption("NULL field must have empty payload"));
+                    }
+                    Ok(None)
+                }
+                TAG_INT64 => {
+                    let (encoded, consumed) = decode_varint_u64(payload)?;
+                    if consumed != payload.len() {
+                        return Err(DbError::corruption("INT64 payload has trailing bytes"));
+                    }
+                    Ok(Some(zigzag_decode_u64(encoded)))
+                }
+                _ => Err(DbError::corruption(
+                    "row field is not encoded as an INT64 value",
+                )),
+            };
+        }
+
+        Err(DbError::corruption("row field index exceeds field count"))
+    }
+
     pub(crate) fn encode_with_overflow<S: PageStore>(
         &self,
         store: Option<&mut S>,
@@ -587,6 +638,20 @@ mod tests {
             let decoded = Row::decode(&encoded).expect("decode");
             prop_assert!(rows_equal(decoded.values(), values.as_slice()));
         }
+    }
+
+    #[test]
+    fn decode_int64_at_reads_one_encoded_field() {
+        let row = Row::new(vec![
+            Value::Text("skip".to_string()),
+            Value::Int64(42),
+            Value::Null,
+        ]);
+        let encoded = row.encode().expect("encode");
+
+        assert_eq!(Row::decode_int64_at(&encoded, 1).expect("decode"), Some(42));
+        assert_eq!(Row::decode_int64_at(&encoded, 2).expect("decode"), None);
+        assert!(Row::decode_int64_at(&encoded, 0).is_err());
     }
 
     #[test]

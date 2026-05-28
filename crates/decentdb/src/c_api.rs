@@ -8,14 +8,15 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use crate::db::PreparedStatement;
-use crate::error::{DbError, DbErrorCode, Result};
+use crate::error::{DbDiagnostic, DbError, DbErrorCode, Result};
 use crate::{
-    evict_shared_wal, ChangeStreamOptions, Db, DbConfig, QueryResult, QueryWatchOptions,
-    QueuedWriteOptions, RangeWatchOptions, TableWatchOptions, Value,
+    evict_shared_wal, ChangeStreamOptions, Db, DbConfig, DbEncryptionConfig,
+    ProcessCoordinationMode, QueryResult, QueryWatchOptions, QueuedWriteOptions, RangeWatchOptions,
+    TableWatchOptions, Value,
 };
 
 const DDB_OK: u32 = 0;
-const DDB_ABI_VERSION: u32 = 5;
+const DDB_ABI_VERSION: u32 = 7;
 #[cfg(test)]
 const DDB_ERR_SQL: u32 = 5;
 const DDB_WRITE_QUEUE_TIMEOUT_DEFAULT: u64 = u64::MAX;
@@ -238,6 +239,7 @@ pub struct StmtHandle {
 
 thread_local! {
     static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
+    static LAST_DIAGNOSTIC: RefCell<Option<DbDiagnostic>> = const { RefCell::new(None) };
 }
 
 fn ffi_boundary<F>(op: F) -> u32
@@ -248,11 +250,12 @@ where
     match panic::catch_unwind(AssertUnwindSafe(op)) {
         Ok(Ok(())) => DDB_OK,
         Ok(Err(error)) => {
-            set_last_error(error.to_string());
+            set_last_error(error.to_string(), error.diagnostic());
             error.numeric_code()
         }
         Err(payload) => {
-            set_last_error(panic_payload_message(payload));
+            let error = DbError::panic(panic_payload_message(payload));
+            set_last_error(error.to_string(), error.diagnostic());
             DbErrorCode::Panic.as_u32()
         }
     }
@@ -265,7 +268,8 @@ where
     match panic::catch_unwind(AssertUnwindSafe(op)) {
         Ok(value) => value,
         Err(payload) => {
-            set_last_error(panic_payload_message(payload));
+            let error = DbError::panic(panic_payload_message(payload));
+            set_last_error(error.to_string(), error.diagnostic());
             ptr::null()
         }
     }
@@ -275,15 +279,28 @@ fn clear_last_error() {
     LAST_ERROR.with(|slot| {
         *slot.borrow_mut() = None;
     });
+    LAST_DIAGNOSTIC.with(|slot| {
+        *slot.borrow_mut() = None;
+    });
 }
 
-fn set_last_error(message: String) {
+fn set_last_error(message: String, mut diagnostic: DbDiagnostic) {
     let sanitized = message.replace('\0', " ");
+    diagnostic.message = diagnostic.message.replace('\0', " ");
     let cstring =
         CString::new(sanitized).unwrap_or_else(|_| CString::new("invalid error").expect("literal"));
     LAST_ERROR.with(|slot| {
         *slot.borrow_mut() = Some(cstring);
     });
+    LAST_DIAGNOSTIC.with(|slot| {
+        *slot.borrow_mut() = Some(diagnostic);
+    });
+}
+
+fn set_internal_last_error(message: impl Into<String>) -> u32 {
+    let error = DbError::internal_invariant(message.into());
+    set_last_error(error.to_string(), error.diagnostic());
+    DbErrorCode::Internal.as_u32()
 }
 
 fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
@@ -1197,6 +1214,59 @@ pub extern "C" fn ddb_last_error_message() -> *const c_char {
 }
 
 #[no_mangle]
+pub extern "C" fn ddb_last_error_json(out_json: *mut *mut c_char) -> u32 {
+    match panic::catch_unwind(AssertUnwindSafe(|| {
+        if out_json.is_null() {
+            return set_internal_last_error("out_json pointer is null");
+        }
+
+        // SAFETY: `out_json` was checked for null and is caller-owned output
+        // storage for this C ABI function. We only write either null or an
+        // owned CString pointer created by `CString::into_raw`.
+        unsafe {
+            *out_json = ptr::null_mut();
+        }
+
+        let diagnostic = LAST_DIAGNOSTIC.with(|slot| slot.borrow().clone());
+        let Some(diagnostic) = diagnostic else {
+            return DDB_OK;
+        };
+
+        let json = match diagnostic.to_json() {
+            Ok(json) => json,
+            Err(error) => {
+                return set_internal_last_error(format!(
+                    "failed to serialize last error diagnostic: {error}"
+                ));
+            }
+        };
+        let cstring = match CString::new(json) {
+            Ok(value) => value,
+            Err(_) => {
+                return set_internal_last_error(
+                    "serialized last error diagnostic contained an interior nul byte",
+                );
+            }
+        };
+
+        // SAFETY: `out_json` is still the same validated output pointer; the
+        // raw CString becomes caller-owned and must be released with
+        // `ddb_string_free`.
+        unsafe {
+            *out_json = cstring.into_raw();
+        }
+        DDB_OK
+    })) {
+        Ok(status) => status,
+        Err(payload) => {
+            let error = DbError::panic(panic_payload_message(payload));
+            set_last_error(error.to_string(), error.diagnostic());
+            DbErrorCode::Panic.as_u32()
+        }
+    }
+}
+
+#[no_mangle]
 pub extern "C" fn ddb_value_init(value: *mut DdbValue) -> u32 {
     ffi_boundary(|| {
         *out_ptr(value, "value")? = DdbValue::default();
@@ -1267,6 +1337,17 @@ fn parse_bool_option(value: &str, key: &str) -> Result<bool> {
     }
 }
 
+fn parse_process_coordination_option(value: &str) -> Result<ProcessCoordinationMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "auto" => Ok(ProcessCoordinationMode::Auto),
+        "required" => Ok(ProcessCoordinationMode::Required),
+        "single_process_unsafe" | "off" => Ok(ProcessCoordinationMode::SingleProcessUnsafe),
+        _ => Err(DbError::sql(format!(
+            "invalid process_coordination value: {value}"
+        ))),
+    }
+}
+
 fn parse_u32_option(value: &str, key: &str) -> Result<u32> {
     value.trim().parse::<u32>().map_err(|_| {
         DbError::sql(format!(
@@ -1289,6 +1370,25 @@ fn parse_usize_option(value: &str, key: &str) -> Result<usize> {
             "invalid unsigned integer value for option {key}: {value}"
         ))
     })
+}
+
+fn parse_hex_option(value: &str, key: &str) -> Result<Vec<u8>> {
+    let value = value.trim();
+    if value.is_empty() || !value.len().is_multiple_of(2) {
+        return Err(DbError::sql(format!(
+            "invalid hex value for option {key}: expected an even number of hex digits"
+        )));
+    }
+    let mut bytes = Vec::with_capacity(value.len() / 2);
+    for chunk in value.as_bytes().chunks_exact(2) {
+        let pair = std::str::from_utf8(chunk)
+            .map_err(|_| DbError::sql(format!("invalid hex value for option {key}")))?;
+        bytes.push(
+            u8::from_str_radix(pair, 16)
+                .map_err(|_| DbError::sql(format!("invalid hex value for option {key}")))?,
+        );
+    }
+    Ok(bytes)
 }
 
 fn parse_cache_size_mb_option(value: &str, page_size: u32) -> Result<usize> {
@@ -1395,6 +1495,12 @@ fn db_config_from_options(options: Option<&str>) -> Result<DbConfig> {
             "wal_checkpoint_threshold_bytes" => {
                 config.wal_checkpoint_threshold_bytes = parse_u64_option(value, key.as_str())?;
             }
+            "process_coordination" => {
+                config.process_coordination = parse_process_coordination_option(value)?;
+            }
+            "process_coordination_timeout_ms" => {
+                config.process_coordination_timeout_ms = parse_u64_option(value, key.as_str())?;
+            }
             "write_queue_enabled" => {
                 config.write_queue_enabled = parse_bool_option(value, key.as_str())?;
             }
@@ -1412,6 +1518,15 @@ fn db_config_from_options(options: Option<&str>) -> Result<DbConfig> {
             }
             "write_queue_max_group_delay_us" => {
                 config.write_queue_max_group_delay_us = parse_u64_option(value, key.as_str())?;
+            }
+            "encryption_key" | "tde_key" => {
+                config.encryption = Some(DbEncryptionConfig::from_key_bytes(value.as_bytes())?);
+            }
+            "encryption_key_hex" | "tde_key_hex" => {
+                config.encryption = Some(DbEncryptionConfig::from_key_bytes(parse_hex_option(
+                    value,
+                    key.as_str(),
+                )?)?);
             }
             "allow_extension" => {
                 config
@@ -1445,7 +1560,8 @@ fn options_arg(options: *const c_char) -> Result<Option<String>> {
 /// comma, or semicolon. Supported keys include `cache_size`,
 /// `retain_paged_row_sources_after_commit`, `paged_row_storage`,
 /// `persistent_pk_index`, `wal_autocheckpoint`,
-/// `wal_checkpoint_threshold_pages`, and `wal_checkpoint_threshold_bytes`.
+/// `wal_checkpoint_threshold_pages`, `wal_checkpoint_threshold_bytes`,
+/// `encryption_key`, and `encryption_key_hex`.
 pub extern "C" fn ddb_db_create_with_options(
     path: *const c_char,
     options: *const c_char,
@@ -2242,6 +2358,35 @@ pub extern "C" fn ddb_db_free(db: *mut *mut DbHandle) -> u32 {
         }
         *db = ptr::null_mut();
         Ok(())
+    })
+}
+
+#[no_mangle]
+/// Sets a text audit-context value on this database handle.
+pub extern "C" fn ddb_db_set_audit_context_text(
+    db: *mut DbHandle,
+    key: *const c_char,
+    value: *const c_char,
+    value_len: usize,
+) -> u32 {
+    ffi_boundary(|| {
+        let db = handle_ref(db, "db")?;
+        let key = utf8_arg(key, "key")?;
+        let value = borrowed_bytes(value.cast(), value_len)?;
+        let value = std::str::from_utf8(value)
+            .map_err(|error| DbError::sql(format!("value is not valid UTF-8: {error}")))?;
+        db.db
+            .set_audit_context_value(&key, Value::Text(value.to_string()))
+    })
+}
+
+#[no_mangle]
+/// Clears one audit-context value from this database handle.
+pub extern "C" fn ddb_db_clear_audit_context(db: *mut DbHandle, key: *const c_char) -> u32 {
+    ffi_boundary(|| {
+        let db = handle_ref(db, "db")?;
+        let key = utf8_arg(key, "key")?;
+        db.db.clear_audit_context_value(&key)
     })
 }
 
@@ -3758,6 +3903,14 @@ mod tests {
             u64,
             *mut *mut ResultHandle,
         ) -> u32 = ddb_db_execute_queued;
+        let _set_audit_context_text: extern "C" fn(
+            *mut DbHandle,
+            *const c_char,
+            *const c_char,
+            usize,
+        ) -> u32 = ddb_db_set_audit_context_text;
+        let _clear_audit_context: extern "C" fn(*mut DbHandle, *const c_char) -> u32 =
+            ddb_db_clear_audit_context;
         assert_eq!(std::mem::size_of::<DdbValue>(), 168);
         assert_eq!(std::mem::align_of::<DdbValue>(), 8);
         assert_eq!(std::mem::size_of::<DdbWriteQueueMetrics>(), 120);
@@ -3772,7 +3925,7 @@ mod tests {
     #[test]
     fn db_config_options_parse_tuned_profile() {
         let config = db_config_from_options(Some(
-            "cache_size=64MB;retain_paged_row_sources_after_commit=true;paged_row_storage=false;wal_autocheckpoint=0;write_queue_enabled=true;write_queue_capacity=17;write_queue_default_timeout_ms=25;write_queue_strict_group_commit=true;write_queue_max_batch=9;write_queue_max_group_delay_us=1000",
+            "cache_size=64MB;retain_paged_row_sources_after_commit=true;paged_row_storage=false;wal_autocheckpoint=0;process_coordination=single_process_unsafe;process_coordination_timeout_ms=125;write_queue_enabled=true;write_queue_capacity=17;write_queue_default_timeout_ms=25;write_queue_strict_group_commit=true;write_queue_max_batch=9;write_queue_max_group_delay_us=1000;encryption_key_hex=7464652d6b6579",
         ))
         .expect("options should parse");
         assert_eq!(config.cache_size_mb, 64);
@@ -3780,12 +3933,56 @@ mod tests {
         assert!(!config.paged_row_storage);
         assert_eq!(config.wal_checkpoint_threshold_pages, 0);
         assert_eq!(config.wal_checkpoint_threshold_bytes, 0);
+        assert_eq!(
+            config.process_coordination,
+            ProcessCoordinationMode::SingleProcessUnsafe
+        );
+        assert_eq!(config.process_coordination_timeout_ms, 125);
         assert!(config.write_queue_enabled);
         assert_eq!(config.write_queue_capacity, 17);
         assert_eq!(config.write_queue_default_timeout_ms, 25);
         assert!(config.write_queue_strict_group_commit);
         assert_eq!(config.write_queue_max_batch, 9);
         assert_eq!(config.write_queue_max_group_delay_us, 1000);
+        assert!(config.encryption.is_some());
+    }
+
+    #[test]
+    fn c_api_sets_and_clears_audit_context() {
+        let mut db = ptr::null_mut();
+        let path = CString::new(":memory:").expect("path");
+        assert_eq!(ddb_db_open_or_create(path.as_ptr(), &mut db), DDB_OK);
+
+        let actor_key = CString::new("actor").expect("key");
+        let actor = CString::new("c-api-user").expect("value");
+        assert_eq!(
+            ddb_db_set_audit_context_text(db, actor_key.as_ptr(), actor.as_ptr(), 10),
+            DDB_OK
+        );
+
+        let sql = CString::new("SELECT current_actor()").expect("sql");
+        let mut result = ptr::null_mut();
+        assert_eq!(
+            ddb_db_execute(db, sql.as_ptr(), ptr::null(), 0, &mut result),
+            DDB_OK
+        );
+        let mut copied = DdbValue::default();
+        assert_eq!(ddb_result_value_copy(result, 0, 0, &mut copied), DDB_OK);
+        assert_eq!(copied.tag, DdbValueTag::Text as u32);
+        let text = unsafe { std::slice::from_raw_parts(copied.data, copied.len) };
+        assert_eq!(text, b"c-api-user");
+        assert_eq!(ddb_value_dispose(&mut copied), DDB_OK);
+        assert_eq!(ddb_result_free(&mut result), DDB_OK);
+
+        assert_eq!(ddb_db_clear_audit_context(db, actor_key.as_ptr()), DDB_OK);
+        assert_eq!(
+            ddb_db_execute(db, sql.as_ptr(), ptr::null(), 0, &mut result),
+            DDB_OK
+        );
+        assert_eq!(ddb_result_value_copy(result, 0, 0, &mut copied), DDB_OK);
+        assert_eq!(copied.tag, DdbValueTag::Null as u32);
+        assert_eq!(ddb_result_free(&mut result), DDB_OK);
+        assert_eq!(ddb_db_free(&mut db), DDB_OK);
     }
 
     #[test]
@@ -3801,6 +3998,135 @@ mod tests {
                 .to_string()
         });
         assert!(message.contains("boom"));
+
+        let mut json = ptr::null_mut();
+        assert_eq!(ddb_last_error_json(&mut json), DDB_OK);
+        let diagnostic = parse_json(&mut json);
+        assert_eq!(
+            diagnostic["code"],
+            JsonValue::from(DbErrorCode::Panic.as_u32())
+        );
+        assert_eq!(diagnostic["subcode"], "internal.panic_captured");
+        assert!(diagnostic["message"]
+            .as_str()
+            .expect("panic message")
+            .contains("boom"));
+    }
+
+    #[test]
+    fn last_error_json_reports_no_error_without_mutating_state() {
+        clear_last_error();
+
+        let mut json = ptr::null_mut();
+        assert_eq!(ddb_last_error_json(&mut json), DDB_OK);
+        assert!(json.is_null());
+        assert!(ddb_last_error_message().is_null());
+    }
+
+    #[test]
+    fn last_error_json_null_output_sets_error_state() {
+        clear_last_error();
+
+        assert_eq!(
+            ddb_last_error_json(ptr::null_mut()),
+            DbErrorCode::Internal.as_u32()
+        );
+        let message = unsafe { CStr::from_ptr(ddb_last_error_message()) }
+            .to_str()
+            .expect("message utf8");
+        assert!(message.contains("out_json"));
+
+        let mut json = ptr::null_mut();
+        assert_eq!(ddb_last_error_json(&mut json), DDB_OK);
+        assert!(!json.is_null());
+        let diagnostic_text = unsafe { CStr::from_ptr(json) }
+            .to_str()
+            .expect("diagnostic utf8");
+        let diagnostic =
+            serde_json::from_str::<JsonValue>(diagnostic_text).expect("diagnostic json");
+        assert_eq!(
+            diagnostic["code"],
+            JsonValue::from(DbErrorCode::Internal.as_u32())
+        );
+        assert_eq!(diagnostic["subcode"], "internal.invariant");
+        assert_eq!(ddb_string_free(&mut json), DDB_OK);
+    }
+
+    #[test]
+    fn last_error_json_returns_owned_diagnostic_and_preserves_message() {
+        let mut db = ptr::null_mut();
+        let path = CString::new(":memory:").expect("path");
+        assert_eq!(ddb_db_open_or_create(path.as_ptr(), &mut db), DDB_OK);
+
+        let sql = CString::new("SELECT * FROM nope").expect("sql");
+        let mut result = ptr::null_mut();
+        assert_eq!(
+            ddb_db_execute(db, sql.as_ptr(), ptr::null(), 0, &mut result),
+            DDB_ERR_SQL
+        );
+
+        let message_before = unsafe { CStr::from_ptr(ddb_last_error_message()) }
+            .to_str()
+            .expect("message utf8")
+            .to_string();
+        assert!(message_before.contains("nope"));
+
+        let mut json = ptr::null_mut();
+        assert_eq!(ddb_last_error_json(&mut json), DDB_OK);
+        assert!(!json.is_null());
+        let message_after = unsafe { CStr::from_ptr(ddb_last_error_message()) }
+            .to_str()
+            .expect("message utf8")
+            .to_string();
+        assert_eq!(message_after, message_before);
+
+        let diagnostic_text = unsafe { CStr::from_ptr(json) }
+            .to_str()
+            .expect("diagnostic utf8")
+            .to_string();
+        let diagnostic =
+            serde_json::from_str::<JsonValue>(&diagnostic_text).expect("diagnostic json");
+        assert_eq!(diagnostic["code"], JsonValue::from(DDB_ERR_SQL));
+        assert_eq!(diagnostic["code_name"], "ERR_SQL");
+        assert_eq!(diagnostic["subcode"], "sql.relation_not_found");
+        assert_eq!(diagnostic["relation"], "nope");
+        assert_eq!(diagnostic["retryable"], false);
+        assert_eq!(diagnostic["permanent"], true);
+        assert!(diagnostic.get("sql").is_none());
+
+        assert_eq!(ddb_string_free(&mut json), DDB_OK);
+        assert_eq!(ddb_db_free(&mut db), DDB_OK);
+    }
+
+    #[test]
+    fn successful_ffi_call_clears_message_and_diagnostic_together() {
+        let mut db = ptr::null_mut();
+        let path = CString::new(":memory:").expect("path");
+        assert_eq!(ddb_db_open_or_create(path.as_ptr(), &mut db), DDB_OK);
+
+        let bad_sql = CString::new("SELECT * FROM nope").expect("sql");
+        let mut result = ptr::null_mut();
+        assert_eq!(
+            ddb_db_execute(db, bad_sql.as_ptr(), ptr::null(), 0, &mut result),
+            DDB_ERR_SQL
+        );
+        let mut json = ptr::null_mut();
+        assert_eq!(ddb_last_error_json(&mut json), DDB_OK);
+        assert!(!json.is_null());
+
+        let good_sql = CString::new("SELECT 1").expect("sql");
+        assert_eq!(
+            ddb_db_execute(db, good_sql.as_ptr(), ptr::null(), 0, &mut result),
+            DDB_OK
+        );
+        assert_eq!(ddb_result_free(&mut result), DDB_OK);
+        assert!(ddb_last_error_message().is_null());
+
+        let mut cleared_json = ptr::null_mut();
+        assert_eq!(ddb_last_error_json(&mut cleared_json), DDB_OK);
+        assert!(cleared_json.is_null());
+        assert_eq!(ddb_string_free(&mut json), DDB_OK);
+        assert_eq!(ddb_db_free(&mut db), DDB_OK);
     }
 
     #[test]
@@ -4795,7 +5121,10 @@ mod tests {
         let mut geog = DdbValue::default();
         assert_eq!(ddb_stmt_value_copy(select_stmt, 0, &mut geog), DDB_OK);
         assert_eq!(geog.tag, DdbValueTag::Geography as u32);
-        assert!(geog.len > point_wkb.len());
+        assert_eq!(geog.len, point_wkb.len());
+        // SAFETY: ddb_stmt_value_copy returned an owned buffer with geog.len bytes.
+        let copied = unsafe { std::slice::from_raw_parts(geog.data, geog.len) };
+        assert_eq!(copied, point_wkb.as_slice());
         assert_eq!(ddb_value_dispose(&mut geog), DDB_OK);
 
         assert_eq!(ddb_stmt_free(&mut select_stmt), DDB_OK);

@@ -10,6 +10,8 @@ extern "C" {
 
 typedef uint32_t ddb_status_t;
 
+#define DDB_ABI_VERSION 7u
+
 enum {
   DDB_OK = 0,
   DDB_ERR_IO = 1,
@@ -141,6 +143,13 @@ typedef struct ddb_row_i64_text_f64_view_t {
 uint32_t ddb_abi_version(void);
 const char *ddb_version(void);
 const char *ddb_last_error_message(void);
+/*
+ * Returns owned JSON for the most recent DecentDB error on this thread.
+ * On success, `*out_json` is either NULL when there is no last error or a
+ * UTF-8 JSON string that must be freed with ddb_string_free.
+ * Calling this accessor does not clear or replace ddb_last_error_message().
+ */
+ddb_status_t ddb_last_error_json(char **out_json);
 
 /*
  * Initializes an owned value slot for use with ddb_*_value_copy APIs.
@@ -172,7 +181,11 @@ ddb_status_t ddb_db_open_or_create(const char *path, ddb_db_t **out_db);
  * by whitespace, commas, or semicolons. Supported keys include cache_size,
  * retain_paged_row_sources_after_commit, paged_row_storage,
  * persistent_pk_index, wal_autocheckpoint, wal_checkpoint_threshold_pages,
- * and wal_checkpoint_threshold_bytes.
+ * wal_checkpoint_threshold_bytes, process_coordination,
+ * process_coordination_timeout_ms, write_queue_enabled, write_queue_capacity,
+ * write_queue_default_timeout_ms, write_queue_strict_group_commit,
+ * write_queue_max_batch, write_queue_max_group_delay_us, encryption_key, and
+ * encryption_key_hex.
  */
 ddb_status_t ddb_db_create_with_options(const char *path, const char *options, ddb_db_t **out_db);
 ddb_status_t ddb_db_open_with_options(const char *path, const char *options, ddb_db_t **out_db);
@@ -204,6 +217,13 @@ ddb_status_t ddb_sync_changeset_invert_json(ddb_db_t *db, const char *request_js
  * Do not call ddb_db_free concurrently from multiple threads on the same handle.
  */
 ddb_status_t ddb_db_free(ddb_db_t **db);
+ddb_status_t ddb_db_set_audit_context_text(
+    ddb_db_t *db,
+    const char *key,
+    const char *value,
+    size_t value_len
+);
+ddb_status_t ddb_db_clear_audit_context(ddb_db_t *db, const char *key);
 
 /*
  * On success, ownership of the returned statement handle transfers to the caller.

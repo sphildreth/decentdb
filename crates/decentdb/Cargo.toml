@@ -22,11 +22,18 @@ sha2 = "0.10"
 smallvec = "1.15"
 toml = "0.8"
 base64 = "0.22"
+chacha20 = "0.9"
 ed25519-dalek = { version = "2.1", default-features = false, features = ["std"] }
+zeroize = "1.8"
 
 [target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies]
+getrandom = "0.3"
+libc = "0.2"
 libpg_query_sys = { path = "../libpg_query_sys" }
 mlua = { version = "0.11", optional = true, features = ["lua54", "vendored", "send"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO"] }
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 js-sys = "0.3"
@@ -45,7 +52,7 @@ tempfile = "3.10"
 rand = "0.8"
 
 [lib]
-crate-type = ["rlib", "cdylib"]
+crate-type = ["rlib", "cdylib", "staticlib"]
 
 [[bench]]
 name = "release_metrics"

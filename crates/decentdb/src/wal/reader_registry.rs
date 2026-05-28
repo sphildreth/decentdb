@@ -13,6 +13,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use crate::error::{DbError, Result};
+use crate::wal::coordination::ProcessReaderGuard;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ReaderRegistry {
@@ -44,10 +45,24 @@ pub(crate) struct ReaderGuard {
     inner: Arc<ReaderRegistryInner>,
     reader_id: u64,
     snapshot_lsn: u64,
+    _process_guard: Option<ProcessReaderGuard>,
 }
 
 impl ReaderRegistry {
+    #[cfg(test)]
     pub(crate) fn register(&self, snapshot_lsn: u64) -> Result<ReaderGuard> {
+        self.register_with_process_guard(snapshot_lsn, None)
+    }
+
+    pub(crate) fn next_reader_id(&self) -> u64 {
+        self.inner.next_id.load(Ordering::Relaxed) + 1
+    }
+
+    pub(crate) fn register_with_process_guard(
+        &self,
+        snapshot_lsn: u64,
+        process_guard: Option<ProcessReaderGuard>,
+    ) -> Result<ReaderGuard> {
         let reader_id = self.inner.next_id.fetch_add(1, Ordering::Relaxed) + 1;
         self.inner
             .readers
@@ -65,6 +80,7 @@ impl ReaderRegistry {
             inner: Arc::clone(&self.inner),
             reader_id,
             snapshot_lsn,
+            _process_guard: process_guard,
         })
     }
 

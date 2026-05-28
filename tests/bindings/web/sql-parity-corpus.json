@@ -1,0 +1,90 @@
+{
+  "profile": "browser-app-v2",
+  "updated": "2026-05-27",
+  "decision": "browser-app-v2 expands the in-repo wasm parser instead of adding a parser dependency; native pg_query remains the native parser path.",
+  "queries": [
+    {
+      "name": "create_table_app_columns",
+      "sql": "CREATE TABLE IF NOT EXISTS notes(id INT64 PRIMARY KEY, body TEXT NOT NULL, done BOOL DEFAULT FALSE)",
+      "classification": "supported"
+    },
+    {
+      "name": "create_index",
+      "sql": "CREATE INDEX IF NOT EXISTS notes_body_idx ON notes(body)",
+      "classification": "supported"
+    },
+    {
+      "name": "insert_values_multi_row",
+      "sql": "INSERT INTO notes(id, body, done) VALUES ($1, $2, FALSE), ($3, 'second', TRUE)",
+      "classification": "supported"
+    },
+    {
+      "name": "insert_select_simple_projection",
+      "sql": "INSERT INTO notes(id, body) SELECT 10 AS id, 'from-select' AS body",
+      "classification": "supported"
+    },
+    {
+      "name": "update_with_predicate",
+      "sql": "UPDATE notes SET body = 'updated' WHERE id = $1",
+      "classification": "supported"
+    },
+    {
+      "name": "delete_with_predicate",
+      "sql": "DELETE FROM notes WHERE id = $1",
+      "classification": "supported"
+    },
+    {
+      "name": "select_projection_filter_order_limit",
+      "sql": "SELECT id, body FROM notes WHERE id >= $1 AND body <> 'x' ORDER BY id ASC LIMIT 10 OFFSET 0",
+      "classification": "supported"
+    },
+    {
+      "name": "alter_table_add_column",
+      "sql": "ALTER TABLE notes ADD COLUMN archived BOOL",
+      "classification": "supported"
+    },
+    {
+      "name": "alter_table_rename_column",
+      "sql": "ALTER TABLE notes RENAME COLUMN body TO title",
+      "classification": "supported"
+    },
+    {
+      "name": "drop_index",
+      "sql": "DROP INDEX IF EXISTS notes_body_idx",
+      "classification": "supported"
+    },
+    {
+      "name": "drop_table",
+      "sql": "DROP TABLE IF EXISTS notes",
+      "classification": "supported"
+    },
+    {
+      "name": "generated_column",
+      "sql": "CREATE TABLE generated_notes(id INT64, doubled INT64 GENERATED ALWAYS AS (id * 2) STORED)",
+      "classification": "unsupported_by_browser_profile",
+      "expected_error": "ERR_BROWSER_SQL_UNSUPPORTED",
+      "reason": "generated column expression lowering remains native-only in browser-app-v2"
+    },
+    {
+      "name": "recursive_cte",
+      "sql": "WITH RECURSIVE nums(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM nums WHERE n < 3) SELECT n FROM nums",
+      "classification": "unsupported_by_browser_profile",
+      "expected_error": "ERR_BROWSER_SQL_PROFILE_MISMATCH",
+      "reason": "CTE lowering is deferred until the wasm parser can normalize nested query bodies"
+    },
+    {
+      "name": "lua_extension",
+      "sql": "CREATE EXTENSION text_tools",
+      "classification": "deferred_requires_ADR",
+      "expected_error": "ERR_BROWSER_SQL_PROFILE_MISMATCH",
+      "reason": "browser Lua package trust and runtime policy require a separate ADR"
+    },
+    {
+      "name": "postgres_create_schema",
+      "sql": "CREATE SCHEMA app",
+      "classification": "unsupported_by_native_engine",
+      "expected_error": "ERR_BROWSER_SQL_PROFILE_MISMATCH",
+      "reason": "native DecentDB does not expose PostgreSQL schema ownership semantics"
+    }
+  ]
+}

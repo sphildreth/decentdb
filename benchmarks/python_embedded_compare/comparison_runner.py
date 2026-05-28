@@ -62,6 +62,10 @@ DEFAULT_BENCHMARKS_DOC_PATH = (
     Path(__file__).resolve().parents[2] / "docs" / "user-guide" / "benchmarks.md"
 )
 
+DEFAULT_PROCESS_STATE = "warm_process"
+DEFAULT_OS_CACHE_STATE = "unknown_os_cache"
+DEFAULT_STORAGE_STATE = "reused_storage"
+
 
 def load_config(config_path: Path) -> Dict[str, Any]:
     """Load database configuration from YAML file."""
@@ -165,6 +169,9 @@ def run_benchmark_for_engine(
     dataset_config: Dict[str, Any],
     operations: int,
     warmup: int,
+    process_state: str,
+    os_cache_state: str,
+    storage_state: str,
     output_dir: Path,
 ) -> Dict[str, Any]:
     """Run benchmarks for a single engine.
@@ -282,8 +289,20 @@ def run_benchmark_for_engine(
             result = workload.run_delete(driver, operations, warmup)
             results["delete"] = result
 
+            # Prepared statement round trip
+            print("    Running prepared statement round-trip benchmark...")
+            result = workload.run_prepared_statement_roundtrip(driver, operations, warmup)
+            results["prepared_statement_roundtrip"] = result
+
+            # Result materialization
+            print("    Running result materialization benchmark...")
+            result = workload.run_result_materialization(driver, operations, warmup)
+            results["result_materialization"] = result
+
             # Get storage size
-            storage_bytes = driver.get_storage_size()
+            storage_bytes, storage_bytes_main, storage_bytes_wal = (
+                _measure_storage_bytes_with_split(driver.name, db_path)
+            )
 
             # Create result records
             result_records = []
@@ -298,7 +317,12 @@ def run_benchmark_for_engine(
                         latency_ms=bench_result.latency_ms,
                         throughput_ops_sec=bench_result.throughput_ops_sec,
                         metadata={
+                            "process_state": process_state,
+                            "os_cache_state": os_cache_state,
+                            "storage_state": storage_state,
                             "storage_bytes": storage_bytes,
+                            "storage_bytes_main": storage_bytes_main,
+                            "storage_bytes_wal": storage_bytes_wal,
                             "config_notes": driver.get_config_notes(),
                         },
                     )
@@ -323,6 +347,40 @@ def run_benchmark_for_engine(
             driver.disconnect()
 
 
+def _measure_storage_bytes_with_split(
+    engine: str, db_path: str
+) -> tuple[int, int, int]:
+    """Return total, main-db, and WAL-like file sizes in bytes."""
+    base_path = Path(db_path)
+    storage_main = _path_size_bytes(base_path)
+
+    engine_normalized = engine.lower()
+    wal_paths: List[str] = []
+    if engine_normalized.startswith("sqlite"):
+        wal_paths = [f"{db_path}-wal", f"{db_path}-shm"]
+    elif engine_normalized in {"decentdb", "duckdb"}:
+        wal_paths = [f"{db_path}.wal"]
+    elif engine_normalized in {"h2", "derby", "hsqldb", "firebird"}:
+        wal_paths = [f"{db_path}.log"]
+    elif engine_normalized == "litedb":
+        wal_paths = []
+
+    storage_wal = 0
+    for path in wal_paths:
+        storage_wal += _path_size_bytes(Path(path))
+
+    return storage_main + storage_wal, storage_main, storage_wal
+
+
+def _path_size_bytes(path: Path) -> int:
+    try:
+        if path.exists() and path.is_file():
+            return path.stat().st_size
+    except OSError:
+        return 0
+    return 0
+
+
 def run_comparison(
     engines: List[str],
     config: Dict[str, Any],
@@ -334,6 +392,9 @@ def run_comparison(
     dataset_config: Dict[str, Any],
     operations: int,
     warmup: int,
+    process_state: str,
+    os_cache_state: str,
+    storage_state: str,
     output_dir: Path,
 ) -> ResultsBundle:
     """Run comparison across multiple engines.
@@ -370,6 +431,9 @@ def run_comparison(
         "dataset_config": json.dumps(dataset_config, sort_keys=True),
         "operation_count": str(operations),
         "warmup_operations": str(warmup),
+        "process_state": process_state,
+        "os_cache_state": os_cache_state,
+        "storage_state": storage_state,
     }
 
     bundle = ResultsBundle(manifest)
@@ -401,6 +465,9 @@ def run_comparison(
             dataset_config=dataset_config,
             operations=operations,
             warmup=warmup,
+            process_state=process_state,
+            os_cache_state=os_cache_state,
+            storage_state=storage_state,
             output_dir=output_dir,
         )
 
@@ -519,6 +586,24 @@ def main():
         help="Output directory",
     )
     parser.add_argument(
+        "--process-state",
+        default=DEFAULT_PROCESS_STATE,
+        choices=["fresh_process", "warm_process"],
+        help="Process state metadata to tag each benchmark result",
+    )
+    parser.add_argument(
+        "--os-cache-state",
+        default=DEFAULT_OS_CACHE_STATE,
+        choices=["evicted_os_cache", "warm_os_cache", "unknown_os_cache"],
+        help="OS cache state metadata to tag each benchmark result",
+    )
+    parser.add_argument(
+        "--storage-state",
+        default=DEFAULT_STORAGE_STATE,
+        choices=["isolated_temp_storage", "reused_storage"],
+        help="Storage state metadata to tag each benchmark result",
+    )
+    parser.add_argument(
         "--docs-assets-dir",
         type=Path,
         default=DEFAULT_DOCS_ASSETS_DIR,
@@ -613,6 +698,9 @@ def main():
                 dataset_config=dataset_config,
                 operations=op_count,
                 warmup=args.warmup,
+                process_state=args.process_state,
+                os_cache_state=args.os_cache_state,
+                storage_state=args.storage_state,
                 output_dir=run_output_dir,
             )
         )

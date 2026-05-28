@@ -1,6 +1,6 @@
 use clap::ValueEnum;
 
-use decentdb::{QueryResult, Value};
+use decentdb::{DbError, QueryResult, Value};
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -135,10 +135,26 @@ pub fn render_exec_success_json(
 }
 
 pub fn render_error_json(message: &str) -> String {
-    format!(
-        "{{\"ok\":false,\"error\":{{\"message\":\"{}\"}}}}",
-        json_escape(message)
-    )
+    serde_json::json!({"ok": false, "error": {"message": message}}).to_string()
+}
+
+pub fn render_error_json_for_error(error: &anyhow::Error) -> String {
+    if let Some(db_error) = error.downcast_ref::<DbError>() {
+        let diagnostic = db_error.diagnostic();
+        serde_json::json!({
+            "ok": false,
+            "error": {
+                "code": diagnostic.code_name,
+                "native_code": db_error.numeric_code(),
+                "subcode": diagnostic.subcode,
+                "message": db_error.to_string(),
+                "diagnostic": diagnostic,
+            }
+        })
+        .to_string()
+    } else {
+        render_error_json(&error.to_string())
+    }
 }
 
 pub fn render_key_value_rows(format: OutputFormat, rows: &[(String, String)]) -> String {

@@ -79,9 +79,59 @@ series may not produce more than 1,000,000 rows.
 
 - `current_database()` and `current_schema()` return `main`.
 - `database()` and `schema()` are compatibility aliases returning `main`.
+- `current_audit_context(key)` returns the current connection-local audit
+  context value for `key`, or `NULL`.
+- `current_tenant()` returns audit context `tenant_id` or `tenant`, or `NULL`.
+- `current_actor()` returns audit context `actor` or `user`, or `NULL`.
 - `version()` returns a DecentDB version string.
 - `sqlite_version()` and `pg_backend_pid()` are rejected rather than returning
   misleading SQLite or PostgreSQL server values.
+
+### Audit context inspection
+
+`sys_audit_context` exposes the current handle's audit context as `key` /
+`value` rows.
+
+```sql
+SET AUDIT CONTEXT tenant_id = 'tenant-a';
+SET AUDIT CONTEXT actor = 'alice@example.com';
+
+SELECT current_tenant(), current_actor();
+SELECT key, value FROM sys_audit_context ORDER BY key;
+```
+
+Audit context is connection-local. It is used by row policies, column masks,
+and security audit event rows.
+
+## Full-Text Search Functions
+
+Full-text search is exposed through ordinary SQL functions over
+`USING fulltext` indexes.
+
+| Function | Returns | Notes |
+|---|---|---|
+| `fulltext_match(index_name, query)` | `BOOL` | Predicate for a full-text index in a `WHERE` query block. |
+| `bm25(index_name)` | `FLOAT64` | Ranking score for rows matched by the same-block `fulltext_match` predicate. |
+
+Example:
+
+```sql
+CREATE INDEX idx_docs_search
+ON docs USING fulltext (title, body)
+WITH (prefix = '2,3');
+
+SELECT id, title, bm25('idx_docs_search') AS rank
+FROM docs
+WHERE fulltext_match('idx_docs_search', '"embedded database" OR search')
+ORDER BY rank DESC
+LIMIT 20;
+```
+
+The query string supports terms, quoted phrases, uppercase `OR`, exclusions
+with `-term`, and prefix terms such as `dec*` when the index has matching
+prefix lengths. Invalid full-text query syntax returns an `FTS query error:`
+SQL error. Calling `bm25(...)` without a compatible same-block
+`fulltext_match(...)` returns an `FTS semantic error:`.
 
 ## Operational inspection views
 
@@ -95,6 +145,9 @@ The canonical operational surfaces are:
 ```sql
 SELECT * FROM sys.sync_status;
 SELECT * FROM sys.wal_metrics;
+SELECT * FROM sys.process_coordination;
+SELECT * FROM sys.process_readers;
+SELECT * FROM sys.process_lock_metrics;
 SELECT * FROM sys.write_queue_metrics;
 SELECT * FROM sys.storage_metrics;
 SELECT * FROM sys.reactive_metrics;
@@ -194,6 +247,59 @@ Example:
 SELECT * FROM sys.wal_metrics;
 ```
 
+### `sys.process_coordination`
+
+One row describing this handle's cross-process coordination mode and observed
+sidecar state.
+
+| Column | Type | Unit / meaning |
+|---|---|---|
+| `mode` | `TEXT` | `auto`, `required`, or `single_process_unsafe`. |
+| `enabled` | `BOOL` | Whether this handle is using the coordination sidecar. |
+| `supported` | `BOOL` | Whether the selected VFS can support process coordination. |
+| `coord_path` | `TEXT` | Coordination sidecar path, or `NULL` when disabled. |
+| `coord_version` | `INT64` | Sidecar format version. |
+| `coordinator_generation` | `INT64` | Sidecar generation observed by this handle. |
+| `wal_end_lsn` | `INT64` | WAL end LSN published in the sidecar. |
+| `checkpoint_generation` | `INT64` | Checkpoint generation published in the sidecar. |
+| `last_refresh_lsn` | `INT64` | Last WAL snapshot LSN visible to this handle. |
+| `last_refresh_age_ms` | `INT64` | Age of the last coordination refresh, or `NULL`. |
+
+### `sys.process_readers`
+
+One row per active cross-process reader slot. Empty when coordination is
+disabled or no external reader slots are active.
+
+| Column | Type | Unit / meaning |
+|---|---|---|
+| `slot_id` | `INT64` | Fixed sidecar reader slot number. |
+| `pid` | `INT64` | Owning process ID. |
+| `connection_id` | `TEXT` | Best-effort per-connection owner token. |
+| `snapshot_lsn` | `INT64` | Reader snapshot LSN retained by this slot. |
+| `age_ms` | `INT64` | Reader slot age. |
+| `heartbeat_age_ms` | `INT64` | Time since the slot was last refreshed. |
+| `state` | `TEXT` | Current slot state. |
+| `retention_blocking` | `BOOL` | Whether the slot can block WAL truncation. |
+
+### `sys.process_lock_metrics`
+
+One row describing cross-process lock wait counters and current lock owners.
+
+| Column | Type | Unit / meaning |
+|---|---|---|
+| `writer_lock_waits` | `INT64` | Writer lock acquisitions that waited or succeeded. |
+| `writer_lock_timeouts` | `INT64` | Writer lock acquisition timeouts. |
+| `current_writer_pid` | `INT64` | Current writer lock owner PID, or `NULL`. |
+| `current_writer_lock_age_ms` | `INT64` | Current writer lock age, or `NULL`. |
+| `current_checkpoint_pid` | `INT64` | Current checkpoint lock owner PID, or `NULL`. |
+| `current_checkpoint_lock_age_ms` | `INT64` | Current checkpoint lock age, or `NULL`. |
+| `checkpoint_lock_waits` | `INT64` | Checkpoint lock acquisitions that waited or succeeded. |
+| `checkpoint_lock_timeouts` | `INT64` | Checkpoint lock acquisition timeouts. |
+| `reader_slots_allocated` | `INT64` | Reader slot allocations by this handle. |
+| `stale_slots_cleaned` | `INT64` | Stale reader slots reclaimed by this handle. |
+| `wal_refreshes` | `INT64` | WAL refreshes after external generation changes. |
+| `wal_refresh_failures` | `INT64` | Failed WAL refresh attempts. |
+
 ### `sys.storage_metrics`
 
 One row describing the current database file and storage snapshot. All columns
@@ -280,6 +386,10 @@ SELECT * FROM sys.reactive_subscriptions ORDER BY watch_id;
   for stable fields, and includes both database and WAL paths.
 - `sys.wal_metrics` is a one-row snapshot of internal WAL runtime counters such
   as active readers, warning state, payload versions, and checkpoint state.
+- `sys.process_coordination`, `sys.process_readers`, and
+  `sys.process_lock_metrics` describe native cross-process coordination for the
+  current local database handle. They return disabled/empty snapshots on
+  unsupported VFSes or `single_process_unsafe` opens.
 - `sys.sync_status` is the canonical name for the sync status row. The
   `sys_sync_status` compatibility name remains supported.
 - These surfaces do not write telemetry rows, create catalog objects, or enable

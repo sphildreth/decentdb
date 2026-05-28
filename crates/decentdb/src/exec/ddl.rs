@@ -6,14 +6,19 @@ use crate::catalog::{
 };
 use crate::error::{DbError, Result};
 use crate::record::value::Value;
+use crate::search::fulltext::{
+    AnalyzerConfig, AnalyzerDiacritics, AnalyzerStopwords, AnalyzerTokenization,
+    FTS_DDL_ERROR_PREFIX,
+};
 use crate::sql::ast::{
     AlterTableAction, ColumnDefinition, CreateIndexStatement, CreateTableStatement, Expr,
-    ForeignKeyActionSpec, ForeignKeyDefinition, IndexExpression, TableConstraint,
+    ForeignKeyActionSpec, ForeignKeyDefinition, IndexExpression, IndexOption, TableConstraint,
 };
 use crate::sql::parser::parse_expression_sql;
 
 use super::constraints::auto_index_name;
 use super::{table_row_dataset, EngineRuntime, StoredRow, TableData, TableRowSource};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 impl EngineRuntime {
@@ -171,6 +176,7 @@ impl EngineRuntime {
                         .collect(),
                     include_columns: Vec::new(),
                     predicate_sql: None,
+                    full_text: None,
                     fresh: false,
                 });
             }
@@ -189,6 +195,7 @@ impl EngineRuntime {
                         .collect(),
                     include_columns: Vec::new(),
                     predicate_sql: None,
+                    full_text: None,
                     fresh: false,
                 });
             }
@@ -225,6 +232,7 @@ impl EngineRuntime {
                     .collect(),
                 include_columns: Vec::new(),
                 predicate_sql: None,
+                full_text: None,
                 fresh: true,
             })?;
         }
@@ -244,6 +252,7 @@ impl EngineRuntime {
                     .collect(),
                 include_columns: Vec::new(),
                 predicate_sql: None,
+                full_text: None,
                 fresh: true,
             })?;
         }
@@ -269,6 +278,7 @@ impl EngineRuntime {
                         .collect(),
                     include_columns: Vec::new(),
                     predicate_sql: None,
+                    full_text: None,
                     fresh: true,
                 })?;
             }
@@ -329,11 +339,22 @@ impl EngineRuntime {
             "btree" => IndexKind::Btree,
             "gin" | "trigram" => IndexKind::Trigram,
             "spatial" => IndexKind::Spatial,
+            "fulltext" => IndexKind::FullText,
             other => {
                 return Err(DbError::sql(format!(
                     "unsupported index access method {other}"
                 )))
             }
+        };
+        let full_text_config = if kind == IndexKind::FullText {
+            Some(full_text_config_from_options(&statement.options)?)
+        } else {
+            if !statement.options.is_empty() {
+                return Err(DbError::sql(format!(
+                    "{FTS_DDL_ERROR_PREFIX} WITH options are only supported for fulltext indexes"
+                )));
+            }
+            None
         };
 
         let has_expression = statement
@@ -392,6 +413,48 @@ impl EngineRuntime {
                 return Err(DbError::sql(
                     "spatial indexes require GEOMETRY or GEOGRAPHY columns",
                 ));
+            }
+        }
+        if kind == IndexKind::FullText {
+            if statement.unique {
+                return Err(DbError::sql(format!(
+                    "{FTS_DDL_ERROR_PREFIX} fulltext indexes cannot be UNIQUE"
+                )));
+            }
+            if statement.columns.is_empty() || has_expression {
+                return Err(DbError::sql(format!(
+                    "{FTS_DDL_ERROR_PREFIX} fulltext indexes require one or more plain TEXT columns"
+                )));
+            }
+            if statement.predicate.is_some() {
+                return Err(DbError::sql(format!(
+                    "{FTS_DDL_ERROR_PREFIX} partial fulltext indexes are not supported"
+                )));
+            }
+            if !statement.include_columns.is_empty() {
+                return Err(DbError::sql(format!(
+                    "{FTS_DDL_ERROR_PREFIX} fulltext indexes do not support INCLUDE columns"
+                )));
+            }
+            for column in &statement.columns {
+                let IndexExpression::Column(column_name) = column else {
+                    unreachable!("fulltext expression already rejected");
+                };
+                let column = table
+                    .columns
+                    .iter()
+                    .find(|column| identifiers_equal(&column.name, column_name))
+                    .ok_or_else(|| {
+                        DbError::sql(format!(
+                            "index column {} does not exist on {}",
+                            column_name, table.name
+                        ))
+                    })?;
+                if column.column_type != ColumnType::Text {
+                    return Err(DbError::sql(format!(
+                        "{FTS_DDL_ERROR_PREFIX} fulltext indexes require TEXT columns"
+                    )));
+                }
             }
         }
         if has_expression {
@@ -505,6 +568,7 @@ impl EngineRuntime {
                 .predicate
                 .as_ref()
                 .map(|predicate| predicate.to_sql()),
+            full_text: full_text_config,
             fresh: true,
         })?;
 
@@ -1151,6 +1215,7 @@ impl EngineRuntime {
                             .collect(),
                         include_columns: Vec::new(),
                         predicate_sql: None,
+                        full_text: None,
                         fresh: false,
                     })?;
                     self.rebuild_index(&index_name, page_size)?;
@@ -1201,6 +1266,7 @@ impl EngineRuntime {
                         .collect(),
                     include_columns: Vec::new(),
                     predicate_sql: None,
+                    full_text: None,
                     fresh: false,
                 };
                 self.insert_index_schema(index)?;
@@ -1869,6 +1935,100 @@ fn rename_column_references(
             }
         }
     }
+}
+
+fn full_text_config_from_options(options: &[IndexOption]) -> Result<AnalyzerConfig> {
+    let mut config = AnalyzerConfig::default();
+    let mut seen = BTreeSet::new();
+    for option in options {
+        let name = option.name.to_ascii_lowercase();
+        if !seen.insert(name.clone()) {
+            return Err(DbError::sql(format!(
+                "{FTS_DDL_ERROR_PREFIX} duplicate fulltext option {}",
+                option.name
+            )));
+        }
+        match name.as_str() {
+            "tokenizer" => {
+                let value = option_text("tokenizer", &option.value)?;
+                if value.eq_ignore_ascii_case("unicode") {
+                    config.tokenizer = AnalyzerTokenization::Unicode;
+                } else {
+                    return Err(invalid_fulltext_option("tokenizer", value));
+                }
+            }
+            "language" => {
+                let value = option_text("language", &option.value)?;
+                if !value.eq_ignore_ascii_case("simple") {
+                    return Err(invalid_fulltext_option("language", value));
+                }
+            }
+            "stopwords" => {
+                let value = option_text("stopwords", &option.value)?;
+                if value.eq_ignore_ascii_case("none") {
+                    config.stopwords = AnalyzerStopwords::None;
+                } else if value.eq_ignore_ascii_case("builtin") {
+                    config.stopwords = AnalyzerStopwords::Builtin;
+                } else {
+                    return Err(invalid_fulltext_option("stopwords", value));
+                }
+            }
+            "stemming" => {
+                let value = option_text("stemming", &option.value)?;
+                if !value.eq_ignore_ascii_case("none") {
+                    return Err(invalid_fulltext_option("stemming", value));
+                }
+            }
+            "case_fold" | "case_folded" => {
+                config.case_folded = option_bool(&option.value, "case_fold")?;
+            }
+            "diacritics" => {
+                let value = option_text("diacritics", &option.value)?;
+                if value.eq_ignore_ascii_case("preserve") {
+                    config.diacritics = AnalyzerDiacritics::Preserve;
+                } else if value.eq_ignore_ascii_case("remove") {
+                    config.diacritics = AnalyzerDiacritics::Remove;
+                } else {
+                    return Err(invalid_fulltext_option("diacritics", value));
+                }
+            }
+            "prefix" => {
+                let value = option_text("prefix", &option.value)?;
+                config.prefix = AnalyzerConfig::parse_prefix_option(value)
+                    .map_err(|error| DbError::sql(error.message))?;
+            }
+            other => {
+                return Err(DbError::sql(format!(
+                    "{FTS_DDL_ERROR_PREFIX} unknown fulltext option {other}"
+                )));
+            }
+        }
+    }
+    Ok(config.canonicalize())
+}
+
+fn option_text<'a>(name: &str, value: &'a Value) -> Result<&'a str> {
+    match value {
+        Value::Text(value) => Ok(value),
+        other => Err(DbError::sql(format!(
+            "{FTS_DDL_ERROR_PREFIX} option {name} expects text, got {other:?}"
+        ))),
+    }
+}
+
+fn option_bool(value: &Value, name: &str) -> Result<bool> {
+    match value {
+        Value::Bool(value) => Ok(*value),
+        other => Err(DbError::sql(format!(
+            "{FTS_DDL_ERROR_PREFIX} option {name} expects bool, got {other:?}"
+        ))),
+    }
+}
+
+fn invalid_fulltext_option(name: &str, value: &str) -> DbError {
+    DbError::sql(format!(
+        "{FTS_DDL_ERROR_PREFIX} unsupported value '{value}' for option {name}"
+    ))
 }
 
 fn rename_table_references(runtime: &mut EngineRuntime, old_name: &str, new_name: &str) {

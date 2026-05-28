@@ -1,9 +1,11 @@
 {
   "engines": {
     "H2": {
+      "profile_scope": "read_only_partial",
       "read_p95_ms": 0.08575900005780568
     },
     "HSQLDB": {
+      "profile_scope": "read_only_partial",
       "read_p95_ms": 0.14089199999034463
     },
     "decentdb_default_durable": {
@@ -14,7 +16,9 @@
       "concurrent_read_p95_ms": 0.040266399999999994,
       "concurrent_read_p95_stddev_ms": 0.001355030567920885,
       "concurrent_read_threads": 4,
+      "db_plus_wal_size_mb": 3.691436767578125,
       "db_size_mb": 3.691436767578125,
+      "db_size_mb_main": 3.691436767578125,
       "insert_rows_per_sec": 1617064.0869584186,
       "insert_rps_stddev": 36144.89038672069,
       "join_p95_ms": 0.031102799999999996,
@@ -22,7 +26,8 @@
       "range_scan_p95_ms": 0.6764458,
       "range_scan_p95_stddev_ms": 0.020475357397613345,
       "read_p95_ms": 0.0169598,
-      "read_p95_stddev_ms": 0.00043199324068786085
+      "read_p95_stddev_ms": 0.00043199324068786085,
+      "wal_size_mb": 0.0
     },
     "decentdb_tuned_durable": {
       "aggregate_p95_ms": 0.0258068,
@@ -32,7 +37,9 @@
       "concurrent_read_p95_ms": 0.005530200000000001,
       "concurrent_read_p95_stddev_ms": 0.0013768438400922596,
       "concurrent_read_threads": 4,
+      "db_plus_wal_size_mb": 3.210968017578125,
       "db_size_mb": 3.210968017578125,
+      "db_size_mb_main": 3.210968017578125,
       "insert_rows_per_sec": 1787296.9993487769,
       "insert_rps_stddev": 46222.55057989225,
       "join_p95_ms": 0.0030208,
@@ -40,7 +47,8 @@
       "range_scan_p95_ms": 0.012146,
       "range_scan_p95_stddev_ms": 0.0002611214276921755,
       "read_p95_ms": 0.001907,
-      "read_p95_stddev_ms": 1.6248076809271963e-05
+      "read_p95_stddev_ms": 1.6248076809271963e-05,
+      "wal_size_mb": 0.0
     },
     "duckdb": {
       "aggregate_p95_ms": 0.3118468,
@@ -50,7 +58,9 @@
       "concurrent_read_p95_ms": 0.24066799999999997,
       "concurrent_read_p95_stddev_ms": 0.006711868711469251,
       "concurrent_read_threads": 4,
+      "db_plus_wal_size_mb": 3.26171875,
       "db_size_mb": 3.26171875,
+      "db_size_mb_main": 3.26171875,
       "insert_rows_per_sec": 4993.288967225109,
       "insert_rps_stddev": 24.644997683495554,
       "join_p95_ms": 0.5063644,
@@ -58,7 +68,8 @@
       "range_scan_p95_ms": 1.1566231999999999,
       "range_scan_p95_stddev_ms": 0.12921957623580102,
       "read_p95_ms": 0.22555300000000003,
-      "read_p95_stddev_ms": 0.0014171629405258944
+      "read_p95_stddev_ms": 0.0014171629405258944,
+      "wal_size_mb": 0.0
     },
     "sqlite": {
       "aggregate_p95_ms": 0.0374144,
@@ -68,7 +79,9 @@
       "concurrent_read_p95_ms": 0.023314999999999995,
       "concurrent_read_p95_stddev_ms": 0.01212392109839057,
       "concurrent_read_threads": 4,
+      "db_plus_wal_size_mb": 2.1953125,
       "db_size_mb": 2.1953125,
+      "db_size_mb_main": 2.1953125,
       "insert_rows_per_sec": 2266283.7599928672,
       "insert_rps_stddev": 134668.25043960812,
       "join_p95_ms": 0.0037916000000000004,
@@ -76,7 +89,8 @@
       "range_scan_p95_ms": 0.011377,
       "range_scan_p95_stddev_ms": 0.000269229270325498,
       "read_p95_ms": 0.0034974,
-      "read_p95_stddev_ms": 9.520504188329515e-06
+      "read_p95_stddev_ms": 9.520504188329515e-06,
+      "wal_size_mb": 0.0
     }
   },
   "metadata": {
@@ -84,15 +98,31 @@
     "aggregated_at": "2026-05-22T23:01:18.566231+00:00",
     "benchmark_profile": "single_thread_prepared_statement_oltp_with_concurrent_read_extension",
     "binding_parity_note": "sqlite via rusqlite FFI; duckdb via duckdb-rs FFI; decentdb via native Rust API (zero FFI overhead in benchmark loop)",
+    "cold_open_metadata": {
+      "notes": "native snapshot predates cold-process release lanes; do not treat as cold-open evidence",
+      "os_cache_state": "unknown_os_cache",
+      "process_state": "warm_process",
+      "storage_state": "reused_storage"
+    },
     "commit_workload": "prepared_single_row_auto_commit_insert_p95",
     "concurrent_read_workload": "4_threads_each_doing_25000_prepared_point_lookups",
     "decentdb_clone_overhead_note": "removed string.clone() on every read in this revision to eliminate heap-allocator skew",
     "decentdb_durability": "wal_sync_full",
-    "decentdb_profile_default": "decentdb_default_durable:wal_sync_full cache_size_mb=4",
+    "decentdb_profile_balanced": "decentdb_balanced_durable:wal_sync_full cache_size_mb=16",
+    "decentdb_profile_default": "historical_release_snapshot_row:decentdb_default_durable:wal_sync_full cache_size_mb=4",
+    "decentdb_profile_low_memory": "decentdb_low_memory_durable:wal_sync_full cache_size_mb=4",
     "decentdb_profile_tuned": "decentdb_tuned_durable:wal_sync_full cache_size_mb=64 retain_paged_row_sources_after_commit=true paged_row_storage=false wal_autocheckpoint=0",
     "duckdb_durability": "engine_default",
+    "duckdb_engine_note": "engine-default durability and thread behavior are explicitly retained for this row",
+    "duckdb_profile": "duckdb_engine_default",
     "duckdb_threads_note": "duckdb forced to single thread; concurrent read test falls back to single-threaded for duckdb because Connection is not Send",
     "durability_profile": "engine_specific_with_profile_pairs",
+    "first_query_metadata": {
+      "notes": "native snapshot predates first-query release lanes; rerun expanded benchmarks before release claims",
+      "os_cache_state": "unknown_os_cache",
+      "process_state": "warm_process",
+      "storage_state": "reused_storage"
+    },
     "hardware_class_note": "server_cloud_cpu; results may not generalize to embedded targets such as raspberry pi",
     "insert_timing_scope": "prepared_transaction_body_excludes_begin_prepare_and_final_commit; durable commit cost is reported separately as commit_workload",
     "insert_workload": "prepared_single_row_insert_loop_inside_one_explicit_transaction",
@@ -101,8 +131,10 @@
     "latency_capture_unit": "nanoseconds",
     "latency_report_unit": "milliseconds",
     "machine": "AMD EPYC 9V74 80-Core Processor",
-    "notes": "merged extra engines from .tmp/benchmark-assets/root-readme-results.json",
+    "notes": "controlled 2026-05-22 release snapshot retained for chart lineage; local 2026-05-27 Ryzen diagnostic run is intentionally not checked into release assets; native harness now emits canonical balanced/low-memory/tuned profile keys for newly accepted runs; H2/HSQLDB rows are read-only partial comparison rows",
     "os": "linux",
+    "os_cache_state": "unknown_os_cache",
+    "process_state": "warm_process",
     "python_merge_target_operations": 500,
     "range_scan_workload": "prepared_range_scan_50_rows_ordered",
     "read_pattern": "deterministic_permutation",
@@ -113,6 +145,7 @@
     "sqlite_profile": "sqlite_wal_full",
     "statistical_runs": "5",
     "storage_root": "../../target/embedded_compare",
+    "storage_state": "reused_storage",
     "wal_autocheckpoint_note": "sqlite wal_autocheckpoint=0 is a benchmark-specific tuning; production defaults differ"
   }
 }

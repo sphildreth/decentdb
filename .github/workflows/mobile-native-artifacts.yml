@@ -1,0 +1,159 @@
+name: Mobile Native Artifacts
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  flutter-package:
+    name: Flutter package validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Flutter SDK
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Analyze Dart package
+        run: |
+          cd bindings/dart/dart
+          dart pub get
+          dart analyze
+
+      - name: Test Flutter package
+        run: |
+          cd bindings/dart/flutter
+          flutter pub get
+          flutter analyze
+          flutter test
+
+  android:
+    name: Android mobile artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set artifact root
+        run: echo "MOBILE_ARTIFACT_ROOT=$RUNNER_TEMP/decentdb-mobile-artifacts/android" >> "$GITHUB_ENV"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Flutter SDK
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Prepare Android targets
+        run: |
+          rustup target add aarch64-linux-android x86_64-linux-android
+
+      - name: Build Android artifacts
+        run: |
+          chmod +x bindings/dart/scripts/build_mobile_android.sh \
+            bindings/dart/scripts/check_mobile_artifacts.sh \
+            bindings/dart/scripts/mobile_benchmark_guardrails.sh
+          bash bindings/dart/scripts/build_mobile_android.sh \
+            --artifact-root "$MOBILE_ARTIFACT_ROOT" \
+            --strict
+
+      - name: Validate Android artifacts
+        run: bash bindings/dart/scripts/check_mobile_artifacts.sh \
+          --platform android \
+          --artifact-root "$MOBILE_ARTIFACT_ROOT" \
+          --strict
+
+      - name: Record Android guardrails
+        run: bash bindings/dart/scripts/mobile_benchmark_guardrails.sh \
+          --android-root "$MOBILE_ARTIFACT_ROOT" \
+          --ios-root "$RUNNER_TEMP/missing-ios" \
+          --output "$MOBILE_ARTIFACT_ROOT/mobile-guardrails.json"
+
+      - name: Package Android artifacts
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME:-manual}"
+          if [[ "$GITHUB_REF_TYPE" != "tag" ]]; then
+            TAG="manual-${GITHUB_RUN_NUMBER}"
+          fi
+          ARTIFACT_NAME="decentdb-mobile-android-${TAG}.zip"
+          echo "ARTIFACT_NAME=$ARTIFACT_NAME" >> "$GITHUB_ENV"
+          cd "$MOBILE_ARTIFACT_ROOT"
+          zip -r "../$ARTIFACT_NAME" .
+          echo "ARTIFACT_PATH=$MOBILE_ARTIFACT_ROOT/../$ARTIFACT_NAME" >> "$GITHUB_ENV"
+
+      - name: Upload Android artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ env.ARTIFACT_PATH }}
+          if-no-files-found: error
+
+  ios:
+    name: iOS mobile artifacts
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set artifact root
+        run: echo "MOBILE_ARTIFACT_ROOT=$RUNNER_TEMP/decentdb-mobile-artifacts/ios" >> "$GITHUB_ENV"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Flutter SDK
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Prepare iOS targets
+        run: |
+          rustup target add aarch64-apple-ios x86_64-apple-ios
+
+      - name: Build iOS artifacts
+        run: |
+          chmod +x bindings/dart/scripts/build_mobile_ios.sh \
+            bindings/dart/scripts/check_mobile_artifacts.sh \
+            bindings/dart/scripts/mobile_benchmark_guardrails.sh
+          bash bindings/dart/scripts/build_mobile_ios.sh \
+            --artifact-root "$MOBILE_ARTIFACT_ROOT" \
+            --strict
+
+      - name: Validate iOS artifacts
+        run: bash bindings/dart/scripts/check_mobile_artifacts.sh \
+          --platform ios \
+          --artifact-root "$MOBILE_ARTIFACT_ROOT" \
+          --strict
+
+      - name: Record iOS guardrails
+        run: bash bindings/dart/scripts/mobile_benchmark_guardrails.sh \
+          --android-root "$RUNNER_TEMP/missing-android" \
+          --ios-root "$MOBILE_ARTIFACT_ROOT" \
+          --output "$MOBILE_ARTIFACT_ROOT/mobile-guardrails.json"
+
+      - name: Package iOS artifacts
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME:-manual}"
+          if [[ "$GITHUB_REF_TYPE" != "tag" ]]; then
+            TAG="manual-${GITHUB_RUN_NUMBER}"
+          fi
+          ARTIFACT_NAME="decentdb-mobile-ios-${TAG}.zip"
+          echo "ARTIFACT_NAME=$ARTIFACT_NAME" >> "$GITHUB_ENV"
+          cd "$MOBILE_ARTIFACT_ROOT"
+          zip -r "../$ARTIFACT_NAME" .
+          echo "ARTIFACT_PATH=$MOBILE_ARTIFACT_ROOT/../$ARTIFACT_NAME" >> "$GITHUB_ENV"
+
+      - name: Upload iOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ env.ARTIFACT_PATH }}
+          if-no-files-found: error

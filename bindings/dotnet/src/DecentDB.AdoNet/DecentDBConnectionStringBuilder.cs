@@ -18,6 +18,8 @@ public sealed class DecentDBConnectionStringBuilder : DbConnectionStringBuilder
     private const string PagedRowStorageKey = "Paged Row Storage";
     private const string PersistentPkIndexKey = "Persistent PK Index";
     private const string WalAutoCheckpointKey = "WAL Auto Checkpoint";
+    private const string ProcessCoordinationKey = "Process Coordination";
+    private const string ProcessCoordinationTimeoutMsKey = "Process Coordination Timeout Ms";
     private const string WriteQueueEnabledKey = "Write Queue Enabled";
     private const string WriteQueueCapacityKey = "Write Queue Capacity";
     private const string WriteQueueDefaultTimeoutMsKey = "Write Queue Default Timeout Ms";
@@ -95,6 +97,28 @@ public sealed class DecentDBConnectionStringBuilder : DbConnectionStringBuilder
             if (value == null) Remove(WalAutoCheckpointKey);
             else this[WalAutoCheckpointKey] = value;
         }
+    }
+
+    /// <summary>
+    /// Cross-process WAL coordination mode: <c>auto</c>, <c>required</c>, or <c>single_process_unsafe</c>. Optional.
+    /// </summary>
+    public string? ProcessCoordination
+    {
+        get => TryGetValue(ProcessCoordinationKey, out var v) ? (string)v : null;
+        set
+        {
+            if (value == null) Remove(ProcessCoordinationKey);
+            else this[ProcessCoordinationKey] = value;
+        }
+    }
+
+    /// <summary>
+    /// Cross-process lock wait timeout in milliseconds. Optional.
+    /// </summary>
+    public int? ProcessCoordinationTimeoutMs
+    {
+        get => GetNullableInt(ProcessCoordinationTimeoutMsKey);
+        set => SetNullableInt(ProcessCoordinationTimeoutMsKey, value);
     }
 
     /// <summary>

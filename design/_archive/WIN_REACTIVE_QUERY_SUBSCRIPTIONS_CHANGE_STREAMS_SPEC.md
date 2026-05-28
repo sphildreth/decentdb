@@ -1,11 +1,11 @@
 # Reactive Query Subscriptions And Change Streams
 
-**Status:** Active spec - ADR accepted, implementation pending
+**Status:** Implemented for DecentDB 2.6.0
 **Project:** DecentDB
 **Document Type:** Implementation SPEC
 **Audience:** Core engine developers, binding maintainers, CLI maintainers,
 documentation authors, coding agents
-**Related Roadmap Item:** `design/FUTURE_WINS.md` item 3
+**Related Roadmap Item:** Delivered foundation; see `design/FUTURE_WINS.md` Delivered Context.
 **Governing ADR:** `design/adr/0164-reactive-query-subscriptions-and-change-streams.md`
 
 ---

@@ -2,8 +2,6 @@ package com.decentdb.jdbc;
 
 import java.sql.SQLException;
 import java.sql.SQLFeatureNotSupportedException;
-import java.sql.SQLTimeoutException;
-import java.sql.SQLTransientException;
 
 /**
  * Builds {@link SQLException} instances with appropriate SQLState codes.
@@ -54,25 +52,31 @@ final class Errors {
      * Converts a DecentDB C API error code + message into the most
      * appropriate {@link SQLException} subtype.
      */
-    static SQLException fromNative(int code, String msg) {
+    static SQLException fromNative(int code, String msg, DecentDBDiagnostic diagnostic) {
+        String diagnosticSqlState = diagnostic != null ? diagnostic.getSqlState() : null;
+        String sqlState = diagnosticSqlState != null ? diagnosticSqlState : sqlStateForCode(code);
+        return new DecentDBSQLException(msg, sqlState, code, diagnostic);
+    }
+
+    private static String sqlStateForCode(int code) {
         switch (code) {
             case DecentDBNative.ERR_CONSTRAINT:
-                return constraint(msg, code);
+                return "23000";
             case DecentDBNative.ERR_SQL:
-                return syntax(msg, code);
+                return "42000";
             case DecentDBNative.ERR_IO:
             case DecentDBNative.ERR_CORRUPTION:
-                return new SQLException(msg, "08006", code);
+                return "08006";
             case DecentDBNative.ERR_TIMEOUT:
-                return new SQLTimeoutException(msg, "HYT00", code);
+                return "HYT00";
             case DecentDBNative.ERR_BUSY:
             case DecentDBNative.ERR_QUEUE_FULL:
             case DecentDBNative.ERR_QUEUE_CLOSED:
-                return new SQLTransientException(msg, "HYT00", code);
+                return "HYT00";
             case DecentDBNative.ERR_CANCELED:
-                return new SQLTransientException(msg, "57014", code);
+                return "57014";
             default:
-                return general(msg, code);
+                return "HY000";
         }
     }
 
@@ -82,7 +86,8 @@ final class Errors {
             String msg = DecentDBNative.dbLastErrorMessage(dbHandle);
             int code = DecentDBNative.dbLastErrorCode(dbHandle);
             int effectiveCode = code != 0 ? code : result;
-            throw fromNative(effectiveCode, msg != null ? msg : "Unknown native error (code " + result + ")");
+            DecentDBDiagnostic diagnostic = DecentDBDiagnostic.fromJson(DecentDBNative.dbLastErrorJson(dbHandle));
+            throw fromNative(effectiveCode, msg != null ? msg : "Unknown native error (code " + result + ")", diagnostic);
         }
     }
 
@@ -91,7 +96,8 @@ final class Errors {
             String msg = DecentDBNative.dbLastErrorMessage(dbHandle);
             int code = DecentDBNative.dbLastErrorCode(dbHandle);
             int effectiveCode = code != 0 ? code : status;
-            throw fromNative(effectiveCode, msg != null ? msg : "Native status error (code " + status + ")");
+            DecentDBDiagnostic diagnostic = DecentDBDiagnostic.fromJson(DecentDBNative.dbLastErrorJson(dbHandle));
+            throw fromNative(effectiveCode, msg != null ? msg : "Native status error (code " + status + ")", diagnostic);
         }
     }
 }

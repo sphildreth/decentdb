@@ -36,7 +36,7 @@ Suppose you have an old version 3 database named `musicbrainz.ddb`.
    If you try to run the standard CLI on it, you will see a message like this:
    ```bash
    decentdb info --db musicbrainz.ddb
-   # Error: Database is in legacy format version 3. To upgrade it to the current format version 8, please use the standalone migration tool...
+   # Error: Database is in legacy format version 3. To upgrade it to the current format version 12, please use the standalone migration tool...
    ```
 
 2. **Run the migration:**
@@ -46,7 +46,7 @@ Suppose you have an old version 3 database named `musicbrainz.ddb`.
    
    *Output:*
    ```text
-   Migrating database from format version 3 to 8...
+   Migrating database from format version 3 to 12...
    Detected Nim-era Version 3 format.
    Extracting schema...
    Migrating table 'artists'... [10,000 rows]
@@ -66,6 +66,9 @@ Suppose you have an old version 3 database named `musicbrainz.ddb`.
 
 ## Supported Legacy Formats
 
-Currently, `decentdb-migrate` is focused on providing an upgrade path from the widely-used **Version 3** (the final Nim-era format) to the current Rust-era format. 
+Currently, `decentdb-migrate` supports upgrades from the widely-used
+**Version 3** final Nim-era format and selected Rust-era storage formats,
+including the format-11 to format-12 metadata migration for native full-text
+indexes.
 
 If you encounter an even older format version that is unsupported, please open an issue on the DecentDB GitHub repository.

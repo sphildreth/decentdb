@@ -3,6 +3,11 @@
 The in-tree Dart package wraps the stable Rust `ddb_*` C ABI with a small,
 idiomatic Dart API for desktop and CLI applications.
 
+Flutter mobile apps should use the sibling `bindings/dart/flutter`
+`decentdb_flutter` package. It delegates SQL/database work to this Dart package
+and adds Android/iOS packaging, app-private path helpers, key-provider wiring,
+redacted diagnostics, mobile lifecycle guidance, and reference examples.
+
 ## What is covered today
 
 - `Database.open()` / `Database.create()` / `Database.openExisting()` /
@@ -40,6 +45,13 @@ idiomatic Dart API for desktop and CLI applications.
   including snapshot list/create/delete, branch list/create/delete/rename,
   branch commit/log/diff/restore/merge, and branch-local SQL execution/query
   with typed positional parameters
+- Sync JSON and public changeset helpers via `Database.sync`, including
+  status/init, changeset create/inspect/apply/invert, and apply-before-ack
+  ordering for relay clients
+- Mobile-neutral default native loading for Android/iOS package layouts plus
+  typed native-load and ABI-mismatch exceptions
+- Redacted open-option diagnostics for `encryption_key`, `encryption_key_hex`,
+  `tde_key`, and `tde_key_hex`
 - `ErrorCode.fromCode` throws `StateError` on unrecognised codes
 - `sqlite3` moved to `dev_dependencies` (only used by the benchmark)
 
@@ -74,6 +86,21 @@ You can also use the helper script:
 ```bash
 bindings/dart/scripts/build_native.sh
 ```
+
+For mobile CI artifact candidates, there are optional helper scripts:
+
+```bash
+bindings/dart/scripts/build_mobile_android.sh
+bindings/dart/scripts/build_mobile_ios.sh
+bindings/dart/scripts/check_mobile_artifacts.sh
+bindings/dart/scripts/install_mobile_artifacts.sh
+bindings/dart/scripts/mobile_benchmark_guardrails.sh
+```
+
+These scripts build candidate Android/iOS mobile artifacts, write a `version.txt`
+file with build metadata, emit a `checksums.sha256` index for uploaded
+packaged outputs, install artifacts into the Flutter package layout, and record
+initial mobile artifact-size guardrails.
 
 ## Run the Dart package tests
 
@@ -196,6 +223,29 @@ final mergePreview = workflow.merge(branch.name, 'main', dryRun: true);
 print('Merge clean: ${mergePreview.clean}');
 ```
 
+## Sync changesets
+
+The Dart package exposes the stable C ABI sync JSON and public changeset entry
+points through `Database.sync`:
+
+```dart
+db.sync.initReplica('mobile-a');
+final changeset = db.sync.createChangeset({
+  'source': {
+    'kind': 'checkpoint',
+    'peer': 'relay',
+    'since_sequence': 0,
+  },
+});
+
+await db.sync.applyBeforeAck(changeset, () async {
+  await relay.ack(changeset);
+});
+```
+
+`applyBeforeAck` preserves the relay invariant: local durable apply happens
+before acknowledgement. If the process dies before ack, the relay can redeliver.
+
 ## Schema metadata
 
 ```dart
@@ -230,7 +280,9 @@ into `Database.open(..., libraryPath: ...)`. See
 
 - `Database.open(options: ...)`, `Database.create(options: ...)`, and
   `Database.openExisting(options: ...)` pass native open options through the
-  stable C ABI. Queue options include `write_queue_enabled`,
+  stable C ABI. Typed coordination parameters include
+  `processCoordination: ProcessCoordinationMode.required` and
+  `processCoordinationTimeoutMs: 30000`. Queue options include `write_queue_enabled`,
   `write_queue_capacity`, `write_queue_default_timeout_ms`,
   `write_queue_strict_group_commit`, `write_queue_max_batch`, and
   `write_queue_max_group_delay_us`.

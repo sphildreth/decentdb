@@ -32,11 +32,14 @@ const BENCH_RUNS: usize = 5;
 const CONCURRENT_READ_THREADS: usize = 4;
 const CONCURRENT_READS_PER_THREAD: usize = READ_COUNT / CONCURRENT_READ_THREADS;
 
-const DECENTDB_DEFAULT_DURABLE_PROFILE: &str = "decentdb_default_durable";
+const DECENTDB_BALANCED_DURABLE_PROFILE: &str = "decentdb_balanced_durable";
+const DECENTDB_LOW_MEMORY_DURABLE_PROFILE: &str = "decentdb_low_memory_durable";
 const DECENTDB_TUNED_DURABLE_PROFILE: &str = "decentdb_tuned_durable";
+const DUCKDB_ENGINE_DEFAULT_PROFILE: &str = "duckdb_engine_default";
 const SQLITE_WAL_FULL_PROFILE: &str = "sqlite_wal_full";
 
-const DECENTDB_DEFAULT_CACHE_MB: usize = 4;
+const DECENTDB_BALANCED_CACHE_MB: usize = 16;
+const DECENTDB_LOW_MEMORY_CACHE_MB: usize = 4;
 const DECENTDB_TUNED_CACHE_MB: usize = 64;
 
 fn elapsed_nanos(started: Instant) -> u64 {
@@ -114,6 +117,9 @@ struct EngineMetrics {
     insert_rows_per_sec: f64,
     insert_rps_stddev: f64,
     db_size_mb: f64,
+    db_size_mb_main: f64,
+    wal_size_mb: f64,
+    db_plus_wal_size_mb: f64,
     // New metrics
     range_scan_p95_ms: f64,
     range_scan_p95_stddev_ms: f64,
@@ -124,62 +130,43 @@ struct EngineMetrics {
     concurrent_read_threads: usize,
 }
 
+#[derive(Clone, Copy, Default)]
+struct StorageSizes {
+    main_bytes: u64,
+    wal_bytes: u64,
+}
+
+impl StorageSizes {
+    fn total_bytes(self) -> u64 {
+        self.main_bytes.saturating_add(self.wal_bytes)
+    }
+}
+
 #[derive(Clone, Copy)]
 enum DecentDbProfile {
-    DefaultDurable,
-    TunedDurable,
+    Balanced,
+    LowMemory,
+    Tuned,
 }
 
 impl DecentDbProfile {
     fn engine_name(&self) -> &'static str {
         match self {
-            Self::DefaultDurable => DECENTDB_DEFAULT_DURABLE_PROFILE,
-            Self::TunedDurable => DECENTDB_TUNED_DURABLE_PROFILE,
-        }
-    }
-
-    fn cache_size_mb(&self) -> usize {
-        match self {
-            Self::DefaultDurable => DECENTDB_DEFAULT_CACHE_MB,
-            Self::TunedDurable => DECENTDB_TUNED_CACHE_MB,
-        }
-    }
-
-    fn retain_paged_row_sources_after_commit(&self) -> bool {
-        match self {
-            Self::DefaultDurable => false,
-            Self::TunedDurable => true,
-        }
-    }
-
-    fn paged_row_storage(&self) -> bool {
-        match self {
-            Self::DefaultDurable => true,
-            Self::TunedDurable => false,
+            Self::Balanced => DECENTDB_BALANCED_DURABLE_PROFILE,
+            Self::LowMemory => DECENTDB_LOW_MEMORY_DURABLE_PROFILE,
+            Self::Tuned => DECENTDB_TUNED_DURABLE_PROFILE,
         }
     }
 }
 
 fn decentdb_config_for_profile(profile: DecentDbProfile, temp_dir: PathBuf) -> decentdb::DbConfig {
-    decentdb::DbConfig {
-        cache_size_mb: profile.cache_size_mb(),
-        temp_dir,
-        retain_paged_row_sources_after_commit: profile.retain_paged_row_sources_after_commit(),
-        paged_row_storage: profile.paged_row_storage(),
-        wal_checkpoint_threshold_pages: match profile {
-            DecentDbProfile::DefaultDurable => {
-                decentdb::DbConfig::default().wal_checkpoint_threshold_pages
-            }
-            DecentDbProfile::TunedDurable => 0,
-        },
-        wal_checkpoint_threshold_bytes: match profile {
-            DecentDbProfile::DefaultDurable => {
-                decentdb::DbConfig::default().wal_checkpoint_threshold_bytes
-            }
-            DecentDbProfile::TunedDurable => 0,
-        },
-        ..decentdb::DbConfig::default()
-    }
+    let mut config = match profile {
+        DecentDbProfile::Balanced => decentdb::DbConfig::balanced(),
+        DecentDbProfile::LowMemory => decentdb::DbConfig::low_memory(),
+        DecentDbProfile::Tuned => decentdb::DbConfig::tuned_durable(),
+    };
+    config.temp_dir = temp_dir;
+    config
 }
 
 trait DatabaseBenchmarker {
@@ -192,7 +179,7 @@ trait DatabaseBenchmarker {
     fn range_scans(&mut self) -> Vec<u64>;
     fn aggregates(&mut self) -> Vec<u64>;
     fn concurrent_reads(&mut self, thread_count: usize) -> Vec<u64>;
-    fn teardown(&mut self) -> u64; // returns db size in bytes
+    fn teardown(&mut self) -> StorageSizes;
 }
 
 // ---------------------------------------------------------------------------
@@ -443,7 +430,7 @@ impl DatabaseBenchmarker for SqliteBenchmarker {
         all
     }
 
-    fn teardown(&mut self) -> u64 {
+    fn teardown(&mut self) -> StorageSizes {
         if let Some(conn) = self.conn.as_mut() {
             conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
                 .unwrap();
@@ -452,7 +439,10 @@ impl DatabaseBenchmarker for SqliteBenchmarker {
         let db_size = fs::metadata(&self.db_path).map(|m| m.len()).unwrap_or(0);
         let wal_path = append_path_suffix(&self.db_path, "-wal");
         let wal_size = fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
-        db_size + wal_size
+        StorageSizes {
+            main_bytes: db_size,
+            wal_bytes: wal_size,
+        }
     }
 }
 
@@ -503,7 +493,7 @@ impl DuckDbBenchmarker {
 
 impl DatabaseBenchmarker for DuckDbBenchmarker {
     fn name(&self) -> &'static str {
-        "duckdb"
+        DUCKDB_ENGINE_DEFAULT_PROFILE
     }
 
     fn setup(&mut self, path: &Path) {
@@ -661,7 +651,7 @@ impl DatabaseBenchmarker for DuckDbBenchmarker {
         self.random_reads()
     }
 
-    fn teardown(&mut self) -> u64 {
+    fn teardown(&mut self) -> StorageSizes {
         if let Some(conn) = self.conn.as_mut() {
             conn.execute_batch("CHECKPOINT;").unwrap();
         }
@@ -669,7 +659,10 @@ impl DatabaseBenchmarker for DuckDbBenchmarker {
         let db_size = fs::metadata(&self.db_path).map(|m| m.len()).unwrap_or(0);
         let wal_path = append_path_suffix(&self.db_path, ".wal");
         let wal_size = fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
-        db_size + wal_size
+        StorageSizes {
+            main_bytes: db_size,
+            wal_bytes: wal_size,
+        }
     }
 }
 
@@ -955,7 +948,7 @@ impl DatabaseBenchmarker for DecentDbBenchmarker {
         all
     }
 
-    fn teardown(&mut self) -> u64 {
+    fn teardown(&mut self) -> StorageSizes {
         if let Some(db) = self.db.as_ref() {
             db.checkpoint().unwrap();
         }
@@ -963,7 +956,10 @@ impl DatabaseBenchmarker for DecentDbBenchmarker {
         let db_size = fs::metadata(&self.db_path).map(|m| m.len()).unwrap_or(0);
         let wal_path = append_path_suffix(&self.db_path, ".wal");
         let wal_size = fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
-        db_size + wal_size
+        StorageSizes {
+            main_bytes: db_size,
+            wal_bytes: wal_size,
+        }
     }
 }
 
@@ -1043,9 +1039,15 @@ fn run_single(benchmarker: &mut dyn DatabaseBenchmarker) -> EngineMetrics {
     );
 
     // 9. Teardown & Size
-    let db_size_bytes = benchmarker.teardown();
-    metrics.db_size_mb = db_size_bytes as f64 / (1024.0 * 1024.0);
-    println!("  -> DB Size: {:.2} MB", metrics.db_size_mb);
+    let storage = benchmarker.teardown();
+    metrics.db_size_mb_main = storage.main_bytes as f64 / (1024.0 * 1024.0);
+    metrics.wal_size_mb = storage.wal_bytes as f64 / (1024.0 * 1024.0);
+    metrics.db_plus_wal_size_mb = storage.total_bytes() as f64 / (1024.0 * 1024.0);
+    metrics.db_size_mb = metrics.db_plus_wal_size_mb;
+    println!(
+        "  -> DB Size: {:.2} MB main + {:.2} MB WAL = {:.2} MB",
+        metrics.db_size_mb_main, metrics.wal_size_mb, metrics.db_plus_wal_size_mb
+    );
 
     metrics
 }
@@ -1059,6 +1061,9 @@ fn run_engine(benchmarker: &mut dyn DatabaseBenchmarker) -> EngineMetrics {
     let mut agg_p95_samples: Vec<f64> = Vec::with_capacity(BENCH_RUNS);
     let mut concurrent_p95_samples: Vec<f64> = Vec::with_capacity(BENCH_RUNS);
     let mut db_size_samples: Vec<f64> = Vec::with_capacity(BENCH_RUNS);
+    let mut db_size_main_samples: Vec<f64> = Vec::with_capacity(BENCH_RUNS);
+    let mut wal_size_samples: Vec<f64> = Vec::with_capacity(BENCH_RUNS);
+    let mut db_plus_wal_size_samples: Vec<f64> = Vec::with_capacity(BENCH_RUNS);
 
     for run in 0..BENCH_RUNS {
         println!(
@@ -1076,6 +1081,9 @@ fn run_engine(benchmarker: &mut dyn DatabaseBenchmarker) -> EngineMetrics {
         agg_p95_samples.push(single.aggregate_p95_ms);
         concurrent_p95_samples.push(single.concurrent_read_p95_ms);
         db_size_samples.push(single.db_size_mb);
+        db_size_main_samples.push(single.db_size_mb_main);
+        wal_size_samples.push(single.wal_size_mb);
+        db_plus_wal_size_samples.push(single.db_plus_wal_size_mb);
     }
 
     let aggregated = EngineMetrics {
@@ -1095,6 +1103,9 @@ fn run_engine(benchmarker: &mut dyn DatabaseBenchmarker) -> EngineMetrics {
         concurrent_read_p95_stddev_ms: stddev_f64(&concurrent_p95_samples),
         concurrent_read_threads: CONCURRENT_READ_THREADS,
         db_size_mb: mean_f64(&db_size_samples),
+        db_size_mb_main: mean_f64(&db_size_main_samples),
+        wal_size_mb: mean_f64(&wal_size_samples),
+        db_plus_wal_size_mb: mean_f64(&db_plus_wal_size_samples),
     };
 
     println!("\n  === {} aggregated results ===", benchmarker.name());
@@ -1185,10 +1196,24 @@ fn main() {
         "wal+synchronous_full+wal_autocheckpoint_0".to_string(),
     );
     summary.metadata.insert(
+        "decentdb_profile_balanced".to_string(),
+        format!(
+            "{}:wal_sync_full cache_size_mb={}",
+            DECENTDB_BALANCED_DURABLE_PROFILE, DECENTDB_BALANCED_CACHE_MB
+        ),
+    );
+    summary.metadata.insert(
         "decentdb_profile_default".to_string(),
         format!(
             "{}:wal_sync_full cache_size_mb={}",
-            DECENTDB_DEFAULT_DURABLE_PROFILE, DECENTDB_DEFAULT_CACHE_MB
+            DECENTDB_BALANCED_DURABLE_PROFILE, DECENTDB_BALANCED_CACHE_MB
+        ),
+    );
+    summary.metadata.insert(
+        "decentdb_profile_low_memory".to_string(),
+        format!(
+            "{}:wal_sync_full cache_size_mb={}",
+            DECENTDB_LOW_MEMORY_DURABLE_PROFILE, DECENTDB_LOW_MEMORY_CACHE_MB
         ),
     );
     summary.metadata.insert(
@@ -1203,9 +1228,27 @@ fn main() {
         "engine_default".to_string(),
     );
     summary.metadata.insert(
+        "duckdb_profile".to_string(),
+        DUCKDB_ENGINE_DEFAULT_PROFILE.to_string(),
+    );
+    summary.metadata.insert(
+        "duckdb_engine_note".to_string(),
+        "engine-default durability and thread behavior are explicitly retained for this row"
+            .to_string(),
+    );
+    summary.metadata.insert(
         "decentdb_durability".to_string(),
         "wal_sync_full".to_string(),
     );
+    summary
+        .metadata
+        .insert("process_state".to_string(), "warm_process".to_string());
+    summary
+        .metadata
+        .insert("os_cache_state".to_string(), "unknown_os_cache".to_string());
+    summary
+        .metadata
+        .insert("storage_state".to_string(), "reused_storage".to_string());
 
     // Benchmark scope disclaimers
     summary.metadata.insert(
@@ -1278,7 +1321,7 @@ fn main() {
     );
     summary.metadata.insert(
         "hardware_class_note".to_string(),
-        "server_cloud_cpu; results may not generalize to embedded targets such as raspberry pi"
+        "native_linux_cpu; results may not generalize to embedded targets such as raspberry pi"
             .to_string(),
     );
     summary.metadata.insert(
@@ -1309,12 +1352,18 @@ fn main() {
         .insert(duckdb.name().to_string(), run_engine(&mut duckdb));
 
     // DecentDB
-    let mut decentdb = DecentDbBenchmarker::new(DecentDbProfile::DefaultDurable);
+    let mut decentdb = DecentDbBenchmarker::new(DecentDbProfile::Balanced);
     summary
         .engines
         .insert(decentdb.name().to_string(), run_engine(&mut decentdb));
 
-    let mut tuned_decentdb = DecentDbBenchmarker::new(DecentDbProfile::TunedDurable);
+    let mut low_memory_decentdb = DecentDbBenchmarker::new(DecentDbProfile::LowMemory);
+    summary.engines.insert(
+        low_memory_decentdb.name().to_string(),
+        run_engine(&mut low_memory_decentdb),
+    );
+
+    let mut tuned_decentdb = DecentDbBenchmarker::new(DecentDbProfile::Tuned);
     summary.engines.insert(
         tuned_decentdb.name().to_string(),
         run_engine(&mut tuned_decentdb),

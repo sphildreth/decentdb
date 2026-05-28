@@ -21,6 +21,8 @@ The connection string accepts the following keys:
 |-----|------|---------|-------------|
 | `Data Source` | string | *required* | Path to the database file (e.g., `/tmp/mydb.ddb`). |
 | `Cache Size` | string | engine default | SQLite-style cache size: integer (pages) or with unit (`64MB`, `1GB`). |
+| `Process Coordination` | string | `auto` | Cross-process WAL coordination mode: `auto`, `required`, or `single_process_unsafe`. |
+| `Process Coordination Timeout Ms` | int | `30000` | Bounded wait for cross-process coordination locks. |
 | `Logging` | bool | `false` | When `true`, fires `SqlExecuting` and `SqlExecuted` events on the connection. |
 | `LogLevel` | enum (`Debug`/`Info`/`Warn`/`Error`) | `Debug` | Minimum severity for log events when `Logging=true`. |
 | `Command Timeout` | int | `30` | Command execution timeout in seconds. |
@@ -30,7 +32,7 @@ Bare paths (e.g., `"/tmp/mydb.ddb"`) are also accepted by `DecentDBConnection`'s
 
 ## Cleanup helper
 
-Use `DecentDBConnection.DeleteDatabaseFiles(path)` to safely delete the database file and all sidecar files (`.wal`, `-wal`, `-shm`) in the correct order. This prevents stale WAL issues when recreating databases.
+Use `DecentDBConnection.DeleteDatabaseFiles(path)` to safely delete the database file and all sidecar files (`.wal`, `-wal`, `-shm`, `.coord`) in the correct order. This prevents stale WAL or coordination artifacts when recreating databases.
 
 ## Notes
 

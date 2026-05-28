@@ -29,6 +29,9 @@ public final class Smoke {
             MethodHandle lastError = linker.downcallHandle(
                 lookup.find("ddb_last_error_message").orElseThrow(),
                 FunctionDescriptor.of(ADDRESS));
+            MethodHandle lastErrorJson = linker.downcallHandle(
+                lookup.find("ddb_last_error_json").orElseThrow(),
+                FunctionDescriptor.of(JAVA_INT, ADDRESS));
             MethodHandle open = linker.downcallHandle(
                 lookup.find("ddb_db_open_or_create").orElseThrow(),
                 FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS));
@@ -165,6 +168,12 @@ public final class Smoke {
             if (!error.contains("nope")) {
                 throw new IllegalStateException("unexpected error: " + error);
             }
+            String diagnostic = errorJson(lastErrorJson, stringFree, arena);
+            if (!diagnostic.contains("\"code_name\":\"ERR_SQL\"")
+                || !diagnostic.contains("\"subcode\":\"sql.relation_not_found\"")
+                || !diagnostic.contains("\"relation\":\"nope\"")) {
+                throw new IllegalStateException("unexpected diagnostic: " + diagnostic);
+            }
 
             check((int) dbFree.invokeExact(dbSlot), "free db", lastError);
         }
@@ -179,6 +188,26 @@ public final class Smoke {
     private static String errorString(MethodHandle lastError) throws Throwable {
         MemorySegment segment = (MemorySegment) lastError.invokeExact();
         return segment.equals(MemorySegment.NULL) ? "" : segment.reinterpret(Long.MAX_VALUE).getUtf8String(0);
+    }
+
+    private static String errorJson(MethodHandle lastErrorJson, MethodHandle stringFree, Arena arena) throws Throwable {
+        MemorySegment slot = arena.allocate(ADDRESS);
+        int status = (int) lastErrorJson.invokeExact(slot);
+        if (status != DDB_OK) {
+            throw new IllegalStateException("last_error_json failed with status " + status);
+        }
+        MemorySegment segment = slot.get(ADDRESS, 0);
+        if (segment.equals(MemorySegment.NULL)) {
+            return "";
+        }
+        try {
+            return segment.reinterpret(Long.MAX_VALUE).getUtf8String(0);
+        } finally {
+            int freeStatus = (int) stringFree.invokeExact(slot);
+            if (freeStatus != DDB_OK) {
+                throw new IllegalStateException("free diagnostic failed with status " + freeStatus);
+            }
+        }
     }
 
     private static Path locateLibrary(Path root) throws IOException {

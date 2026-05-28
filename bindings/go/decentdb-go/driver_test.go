@@ -202,6 +202,32 @@ func TestDriver(t *testing.T) {
 	}
 }
 
+func TestDriverErrorDiagnostic(t *testing.T) {
+	db, err := sql.Open("decentdb", ":memory:")
+	if err != nil {
+		t.Fatalf("failed to open: %v", err)
+	}
+	defer db.Close()
+
+	_, err = db.ExecContext(context.Background(), "SELECT * FROM nonexistent")
+	if err == nil {
+		t.Fatal("expected missing table error")
+	}
+	var dbErr *DecentDBError
+	if !errors.As(err, &dbErr) {
+		t.Fatalf("expected DecentDBError, got %T: %v", err, err)
+	}
+	if dbErr.CodeName != "ERR_SQL" {
+		t.Fatalf("expected ERR_SQL code name, got %q", dbErr.CodeName)
+	}
+	if dbErr.Subcode != "sql.relation_not_found" {
+		t.Fatalf("expected relation-not-found subcode, got %q", dbErr.Subcode)
+	}
+	if dbErr.Diagnostic["relation"] != "nonexistent" {
+		t.Fatalf("unexpected diagnostic relation: %#v", dbErr.Diagnostic)
+	}
+}
+
 func TestDriver_WriteQueue_DSNOptionsAndDirectHelpers(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "decentdb-test-write-queue-*")
 	if err != nil {

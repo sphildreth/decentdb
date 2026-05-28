@@ -8,9 +8,21 @@ This directory contains the historical and active ADRs for DecentDB.
 > the current Rust engine.
 
 ### Recent Rust-Specific ADRs:
+- **0185-rich-structured-error-diagnostics-contract.md**: Defines the versioned structured diagnostic object, stable subcode contract, C ABI JSON accessor direction, binding projection requirements, redaction rules, retry/permanence classification, and Doctor handoff policy.
+- **0184-default-fast-planner-and-runtime-contract.md**: Defines the default-fast performance boundary, durable-default guardrails, covering-index execution rules, statistics/plan-cache constraints, and ADR triggers for format, WAL, and broad binding changes.
+- **0183-mobile-tde-key-provider-and-platform-keystore-boundary.md**: Defines the mobile TDE key-provider boundary, Keychain/Keystore reference-adapter scope, key-loss behavior, and the rule that Rust and pure Dart remain platform key-store agnostic.
+- **0182-mobile-runtime-lifecycle-storage-sync-and-support-tiers.md**: Defines mobile app-process ownership, app-private storage, sidecar handling, best-effort background sync with apply-before-ack, support tiers, and device/simulator validation requirements.
+- **0181-mobile-flutter-package-and-native-artifact-contract.md**: Defines Flutter-first mobile packaging, Android/iOS targets, XCFramework direction, separate mobile release workflow, and continued use of the stable C ABI boundary.
+- **0180-database-identity-for-coordination-sidecars.md**: Defines the stable non-secret database header identity and sidecar fingerprint required for stale-sidecar detection, plus the format-bump and migration-parser obligations.
+- **0179-cross-process-public-contract-bindings-and-diagnostics.md**: Defines the public process-coordination option, binding responsibilities, SQL/CLI diagnostics, and safe-by-default error behavior.
+- **0178-cross-process-reader-retention-and-wal-refresh.md**: Defines cross-process reader slots, checkpoint retention across processes, WAL index refresh, and stale reader cleanup.
+- **0177-cross-process-coordination-sidecar-and-locking.md**: Defines the coordination sidecar, byte-range file locking model, VFS process-lock capability, and no-mmap v1 direction.
+- **0176-full-text-search-storage-durability-and-binding-contract.md**: Defines FTS as engine-owned derived secondary index state, with term/postings/document-stat storage, rebuild/verify behavior, stale-index handling, and binding responsibilities through ordinary SQL.
+- **0175-native-full-text-search-query-surface-and-ranking.md**: Defines native `USING fulltext` indexes, `fulltext_match('index', query)`, `bm25('index')` ranking, portable analyzer/query behavior, and the non-virtual-table FTS user surface.
 - **0118-rust-ffi-panic-safety.md**: Mandates `catch_unwind` on all C-ABI boundaries.
 - **0119-rust-vfs-pread-pwrite.md**: Mandates standard file positional I/O over `unsafe mmap` for the Virtual File System.
 - **0120-core-storage-engine-btree.md**: Formalizes the choice of an optimized B+Tree over an LSM-Tree for the core storage engine.
+- **0174-local-data-security-tde-policies-masking-audit-context.md**: Defines TDE v1, durable row policies, column masks, audit context, C ABI key options, catalog boundaries, and follow-up security work.
 - **0173-lua-extension-function-kind-phasing.md**: Defines the complete Lua extension function scope: scalar functions, table-valued functions, aggregates, query-time collations, persistence boundaries, dependency inspection, and docs/API coverage.
 - **0172-lua-extension-cli-c-abi-and-binding-contract.md**: Defines CLI lifecycle commands, C ABI JSON bridge shape, binding responsibilities, trust configuration, dependency/rebuild commands, and extension inspection surfaces.
 - **0171-lua-extension-sql-type-and-planner-contract.md**: Defines SQL registration, strict manifest-declared signatures for all Lua extension objects, DecentDB-owned type conversion, NULL handling, planner limits, and persisted-object boundaries.

@@ -518,6 +518,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
+name = "chacha20"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3613f74bd2eac03dad61bd53dbe620703d4371614fe0bc3b9f04dd36fe4e818"
+dependencies = [
+ "cfg-if",
+ "cipher",
+ "cpufeatures",
+]
+
+[[package]]
 name = "chrono"
 version = "0.4.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -555,6 +566,16 @@ checksum = "57663b653d948a338bfb3eeba9bb2fd5fcfaecb9e199e87e1eda4d9e8b240fd9"
 dependencies = [
  "ciborium-io",
  "half",
+]
+
+[[package]]
+name = "cipher"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "773f3b9af64447d2ce9850330c473515014aa235e6a783b02db81ff39e4a3dad"
+dependencies = [
+ "crypto-common",
+ "inout",
 ]
 
 [[package]]
@@ -810,17 +831,20 @@ dependencies = [
 
 [[package]]
 name = "decentdb"
-version = "2.7.0"
+version = "2.8.0"
 dependencies = [
  "base64 0.22.1",
+ "chacha20",
  "chrono",
  "criterion",
  "duckdb",
  "ed25519-dalek",
+ "getrandom 0.3.4",
  "hdrhistogram",
  "iai-callgrind",
  "insta",
  "js-sys",
+ "libc",
  "libpg_query_sys",
  "md5",
  "miniz_oxide",
@@ -837,11 +861,13 @@ dependencies = [
  "thiserror 2.0.18",
  "toml",
  "wasm-bindgen",
+ "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]
 name = "decentdb-benchmark"
-version = "2.7.0"
+version = "2.8.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -855,7 +881,7 @@ dependencies = [
 
 [[package]]
 name = "decentdb-cli"
-version = "2.7.0"
+version = "2.8.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -869,12 +895,13 @@ dependencies = [
 
 [[package]]
 name = "decentdb-migrate"
-version = "2.7.0"
+version = "2.8.0"
 dependencies = [
  "anyhow",
  "clap",
  "decentdb",
  "flate2",
+ "getrandom 0.3.4",
  "serde_json",
  "tempfile",
 ]
@@ -1609,6 +1636,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "inout"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "879f10e63c20629ecabbb64a8010319738c66a5cd0c29b02d63d272b03751d01"
+dependencies = [
+ "generic-array",
+]
+
+[[package]]
 name = "insta"
 version = "1.46.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1823,7 +1859,7 @@ dependencies = [
 
 [[package]]
 name = "libpg_query_sys"
-version = "2.7.0"
+version = "2.8.0"
 dependencies = [
  "pg_query",
 ]

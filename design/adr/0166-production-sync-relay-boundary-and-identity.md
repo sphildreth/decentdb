@@ -197,7 +197,7 @@ Implementation is not complete until tests cover:
 ## References
 
 - `design/FUTURE_WINS.md` priority #1
-- `design/WIN_PRODUCTION_RELAY_SPEC.md`
+- `design/_archive/WIN_PRODUCTION_RELAY_SPEC.md`
 - `design/WIN_LOCAL_FIRST_SYNC_FIRST_CLASS_SPEC.md`
 - `design/adr/0148-sync-http-transport-and-peer-management.md`
 - `design/adr/0149-scoped-sync-v1.md`

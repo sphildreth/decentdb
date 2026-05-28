@@ -164,6 +164,9 @@ public static class DecentDBNative
     [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_last_error_message")]
     internal static extern IntPtr ddb_last_error_message();
 
+    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_last_error_json")]
+    internal static extern uint ddb_last_error_json(out IntPtr outJson);
+
     [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_string_free")]
     internal static extern uint ddb_string_free(ref IntPtr value);
 

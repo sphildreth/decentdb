@@ -259,6 +259,26 @@ decentdb doctor \
 | `basename` | Render only file names, such as `app.ddb` and `app.ddb.wal`. |
 | `redacted` | Render `<redacted>` for database and WAL paths. |
 
+## Integrating with diagnostic handoff
+
+Some engine diagnostics include a `doctor` handoff command and SQL snippets. The
+payload is redacted with `<redacted>` placeholders and is not a path-specific
+template replacement.
+
+A sample handoff command is:
+
+```bash
+decentdb doctor --db /path/to/app.ddb --format json
+```
+
+Use the placeholder form from the diagnostic payload only after your application
+supplies the real database context.
+
+## See Also
+
+- [Error diagnostics and troubleshooting](error-diagnostics.md)
+- [Error contracts](../api/error-codes.md)
+
 Use `basename` for local logs where the file name is helpful but the full
 directory is not. Use `redacted` for multi-tenant logs, support bundles, or any
 environment where paths may contain customer identifiers.
@@ -412,6 +432,9 @@ decentdb doctor --db app.ddb --format json --fail-on warning > after.json
 | `wal.large_file` | `warning` | WAL size exceeds the configured v1 threshold. | Checkpoint when readers are not holding snapshots; `--fix` may do this safely. |
 | `wal.many_versions` | `warning` | Many page versions are retained in the WAL. | Look for long readers or checkpoint starvation. |
 | `wal.long_readers_present` | `warning` | Active readers are holding WAL space. | Close long readers before checkpoint-sensitive operations. |
+| `wal.process_readers_active` | `warning` | Cross-process reader slots are retaining WAL history. | Inspect `sys.process_readers` and close stale or long-running external readers. |
+| `wal.process_writer_lock_held` | `warning` | Another process currently owns the writer lock. | Inspect `sys.process_lock_metrics` and retry when the writer completes. |
+| `wal.process_checkpoint_lock_held` | `warning` | Another process currently owns the checkpoint lock. | Inspect `sys.process_lock_metrics` and retry maintenance later. |
 | `wal.reader_warnings_recorded` | `warning` | Reader warnings have been recorded. | Inspect read transaction lifetime. |
 | `wal.shared_enabled` | `info` | Shared WAL mode is enabled. | Usually informational. |
 | `fragmentation.high` | `warning` | Free-list pages are high relative to total pages. | Consider `decentdb vacuum --db <path> --output <new-path>`. |
@@ -469,4 +492,3 @@ Check whether the command used:
 
 When disabled, findings and evidence remain present but recommendation text and
 commands are omitted.
-

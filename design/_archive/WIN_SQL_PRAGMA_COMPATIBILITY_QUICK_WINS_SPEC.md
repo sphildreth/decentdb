@@ -6,15 +6,15 @@
 
 **Roadmap:** Delivered; removed from active Future Wins
 
-**Related:** [`WIN_ADVANCED_SQL_COMPATIBILITY_SURFACE.md`](WIN_ADVANCED_SQL_COMPATIBILITY_SURFACE.md),
-[`docs/user-guide/comparison.md`](../docs/user-guide/comparison.md),
-[`docs/api/configuration.md`](../docs/api/configuration.md),
-[`docs/user-guide/sql-feature-matrix.md`](../docs/user-guide/sql-feature-matrix.md)
+**Related:** [`WIN_ADVANCED_SQL_COMPATIBILITY_SURFACE.md`](../WIN_ADVANCED_SQL_COMPATIBILITY_SURFACE.md),
+[`docs/user-guide/comparison.md`](../../docs/user-guide/comparison.md),
+[`docs/api/configuration.md`](../../docs/api/configuration.md),
+[`docs/user-guide/sql-feature-matrix.md`](../../docs/user-guide/sql-feature-matrix.md)
 
 ## Purpose
 
-This spec defines the completed implementation target for roadmap item 3,
-"SQL and PRAGMA compatibility quick wins."
+This spec defines the completed implementation target for the former roadmap
+item, "SQL and PRAGMA compatibility quick wins."
 
 The goal is to remove high-friction migration and tooling failures caused by
 small SQLite, PostgreSQL, and DuckDB-adjacent probes, helper functions, and
@@ -22,10 +22,10 @@ introspection queries. The goal is not to make DecentDB a SQLite clone or a
 PostgreSQL server. Compatibility work in this spec must be narrow, explicit,
 tested, and safe under DecentDB's durability-first embedded model.
 
-This spec has been implemented. Roadmap item 3 has been removed from active
-`FUTURE_WINS.md` entries and retained only as delivered context. Remaining
-heavyweight SQL compatibility work stays in the later advanced compatibility
-track.
+This spec has been implemented. The former roadmap item has been removed from
+active `FUTURE_WINS.md` entries and retained only as delivered context.
+Remaining heavyweight SQL compatibility work stays in the later advanced
+compatibility track.
 
 ## Summary
 
@@ -170,7 +170,7 @@ implemented.
 
 ## Completion Definition
 
-Roadmap item 3 is complete only when all of the following are true:
+The former roadmap item is complete only when all of the following are true:
 
 1. Every Required PRAGMA in this spec is implemented with documented result
    shape, assignment behavior, and tests.
@@ -968,5 +968,5 @@ or durability guarantees:
 - [x] Docs updated.
 - [x] Changelog updated in `docs/about/changelog.md`.
 - [x] Engine, CLI, binding smoke, workspace tests, and lint pass.
-- [x] Roadmap item 3 removed from active Future Wins or moved to Delivered
+- [x] Former roadmap item removed from active Future Wins or moved to Delivered
       Context after implementation is complete.

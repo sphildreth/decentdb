@@ -29,7 +29,7 @@ Implement in-process reactive query subscriptions and change streams around a
 shared post-commit event hub.
 
 The companion implementation spec is
-`design/WIN_REACTIVE_QUERY_SUBSCRIPTIONS_CHANGE_STREAMS_SPEC.md`.
+`design/_archive/WIN_REACTIVE_QUERY_SUBSCRIPTIONS_CHANGE_STREAMS_SPEC.md`.
 
 ### Event hub ownership
 
@@ -233,7 +233,7 @@ All unit tests must pass before the roadmap item is marked complete.
 ## References
 
 - `design/FUTURE_WINS.md` item 3
-- `design/WIN_REACTIVE_QUERY_SUBSCRIPTIONS_CHANGE_STREAMS_SPEC.md`
+- `design/_archive/WIN_REACTIVE_QUERY_SUBSCRIPTIONS_CHANGE_STREAMS_SPEC.md`
 - `design/adr/0003-snapshot-lsn-atomicity.md`
 - `design/adr/0117-shared-wal-registry.md`
 - `design/adr/0118-rust-ffi-panic-safety.md`

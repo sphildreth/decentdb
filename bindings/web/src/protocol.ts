@@ -2,6 +2,32 @@ export type OpenMode = "openOrCreate" | "open" | "create";
 export type ResultTransport = "binary" | "json";
 export type OwnerRuntime = "dedicated-worker" | "remote-owner";
 export type CoordinationModel = "broadcastchannel-weblocks-dedicated-owner";
+export type BrowserSqlProfile = "browser-app-v1" | "browser-app-v2";
+
+export const BROWSER_PROTOCOL_VERSION = 2;
+export const BROWSER_SQL_PROFILE: BrowserSqlProfile = "browser-app-v2";
+
+export interface BrowserCapabilities {
+  protocolVersion: number;
+  engineVersion?: string;
+  parserProfile: BrowserSqlProfile;
+  resultTransports: ResultTransport[];
+  transactions: boolean;
+  savepoints: boolean;
+  preparedStatements: boolean;
+  statementReset: boolean;
+  statementClearBindings: boolean;
+  statementPaging: boolean;
+  asyncStatementIteration: boolean;
+  importExport: boolean;
+  metrics: boolean;
+  relayHttp: boolean;
+  relayWebSocket: boolean;
+  changesetApply: boolean;
+  branchSnapshots: boolean;
+  browserTdeOpenOptions: boolean;
+  cooperativeCancellation: boolean;
+}
 
 export type RpcKind =
   | "open"
@@ -11,6 +37,9 @@ export type RpcKind =
   | "prepare"
   | "statement_bind"
   | "statement_step"
+  | "statement_reset"
+  | "statement_clear_bindings"
+  | "statement_page"
   | "statement_close"
   | "checkpoint"
   | "export"
@@ -18,6 +47,7 @@ export type RpcKind =
   | "persist"
   | "metrics"
   | "sync_configure_peer"
+  | "sync_apply_changeset"
   | "sync_run";
 
 export type QueryValue =
@@ -36,6 +66,13 @@ export interface QueryErrorPayload {
   code: string;
   message: string;
   details?: string;
+  nativeCode?: number;
+  subcode?: string;
+  sqlstate?: string;
+  retryable?: boolean;
+  permanent?: boolean;
+  diagnostic?: Record<string, unknown>;
+  diagnosticJson?: string;
 }
 
 export interface OpenRequest {
@@ -107,6 +144,31 @@ export interface StatementStepRequest {
   };
 }
 
+export interface StatementResetRequest {
+  kind: "statement_reset";
+  requestId: number;
+  payload: {
+    statementId: number;
+  };
+}
+
+export interface StatementClearBindingsRequest {
+  kind: "statement_clear_bindings";
+  requestId: number;
+  payload: {
+    statementId: number;
+  };
+}
+
+export interface StatementPageRequest {
+  kind: "statement_page";
+  requestId: number;
+  payload: {
+    statementId: number;
+    pageSize: number;
+  };
+}
+
 export interface StatementCloseRequest {
   kind: "statement_close";
   requestId: number;
@@ -166,6 +228,16 @@ export interface SyncConfigurePeerRequest {
   };
 }
 
+export interface SyncApplyChangesetRequest {
+  kind: "sync_apply_changeset";
+  requestId: number;
+  payload: {
+    dbId: number;
+    changeset: unknown;
+    options?: Record<string, unknown>;
+  };
+}
+
 export interface SyncRunRequest {
   kind: "sync_run";
   requestId: number;
@@ -185,6 +257,9 @@ export type RpcRequest =
   | PrepareRequest
   | StatementBindRequest
   | StatementStepRequest
+  | StatementResetRequest
+  | StatementClearBindingsRequest
+  | StatementPageRequest
   | StatementCloseRequest
   | CheckpointRequest
   | ExportRequest
@@ -192,6 +267,7 @@ export type RpcRequest =
   | PersistRequest
   | MetricsRequest
   | SyncConfigurePeerRequest
+  | SyncApplyChangesetRequest
   | SyncRunRequest;
 
 export interface OpenResult {
@@ -202,7 +278,10 @@ export interface OpenResult {
   ownerId: string;
   coordinationModel: CoordinationModel;
   attachedClientCount: number;
-  parserProfile: string;
+  protocolVersion: number;
+  engineVersion?: string;
+  parserProfile: BrowserSqlProfile;
+  capabilities: BrowserCapabilities;
   engineReady: boolean;
   notes?: string[];
 }
@@ -227,13 +306,21 @@ export interface StatementStepResult {
   row?: QueryRow;
 }
 
+export interface StatementPageResult {
+  columns: string[];
+  rows: QueryRow[];
+  done: boolean;
+}
+
 export interface CheckpointResult {
   truncatedWalBytes?: number;
+  checkpointedAtMs?: number;
 }
 
 export interface ExportResult {
   bytes: ArrayBuffer;
   size: number;
+  exportedAtMs?: number;
 }
 
 export interface PersistResult {
@@ -255,10 +342,29 @@ export interface MetricsResult {
   staleOwnerRecoveries?: number;
   coordinationModel?: string;
   parserProfile?: string;
+  protocolVersion?: number;
+  engineVersion?: string;
+  capabilities?: BrowserCapabilities;
   syncConfiguredPeers?: number;
   syncDeferred?: boolean;
   syncRelayHttpPull?: boolean;
   syncRelayWebSocketShapes?: boolean;
+  lastCheckpointMs?: number;
+  lastExportMs?: number;
+  lastImportMs?: number;
+  storagePressure?: "unknown" | "ok" | "warning" | "critical";
+}
+
+export interface SyncApplyChangesetResult {
+  outcome: string;
+  changeset_id?: string;
+  changesetId?: string;
+  rows_seen?: number;
+  rows_applied?: number;
+  rows_skipped?: number;
+  rows_conflicted?: number;
+  checkpoint_after?: number;
+  [key: string]: unknown;
 }
 
 export interface SyncRunResult {
@@ -276,10 +382,12 @@ export interface RpcResponse {
     | QueryResult
     | PrepareResult
     | StatementStepResult
+    | StatementPageResult
     | CheckpointResult
     | ExportResult
     | PersistResult
     | MetricsResult
+    | SyncApplyChangesetResult
     | SyncRunResult;
   error?: QueryErrorPayload;
 }
@@ -303,15 +411,32 @@ export const ERR_BROWSER_PRIVATE_MODE_UNSUPPORTED =
   "ERR_BROWSER_PRIVATE_MODE_UNSUPPORTED";
 export const ERR_BROWSER_SQL_PROFILE_UNSUPPORTED =
   "ERR_BROWSER_SQL_PROFILE_UNSUPPORTED";
+export const ERR_BROWSER_SQL_UNSUPPORTED = "ERR_BROWSER_SQL_UNSUPPORTED";
+export const ERR_BROWSER_SQL_PARSE = "ERR_BROWSER_SQL_PARSE";
+export const ERR_BROWSER_SQL_PROFILE_MISMATCH =
+  "ERR_BROWSER_SQL_PROFILE_MISMATCH";
+export const ERR_BROWSER_DB_CLOSED = "ERR_BROWSER_DB_CLOSED";
+export const ERR_BROWSER_STATEMENT_CLOSED = "ERR_BROWSER_STATEMENT_CLOSED";
+export const ERR_BROWSER_ACTIVE_STATEMENTS = "ERR_BROWSER_ACTIVE_STATEMENTS";
+export const ERR_BROWSER_TRANSACTION_ACTIVE = "ERR_BROWSER_TRANSACTION_ACTIVE";
+export const ERR_BROWSER_BRANCH_UNSUPPORTED = "ERR_BROWSER_BRANCH_UNSUPPORTED";
+export const ERR_BROWSER_TDE_UNSUPPORTED = "ERR_BROWSER_TDE_UNSUPPORTED";
+export const ERR_BROWSER_PROTOCOL_MISMATCH = "ERR_BROWSER_PROTOCOL_MISMATCH";
 export const ERR_BROWSER_SERVICE_WORKER_UNSUPPORTED =
   "ERR_BROWSER_SERVICE_WORKER_UNSUPPORTED";
 export const ERR_BROWSER_SYNC_DEFERRED = "ERR_BROWSER_SYNC_DEFERRED";
 export const ERR_BROWSER_PROBE_FAILED = "ERR_BROWSER_PROBE_FAILED";
 
-export function createErrorPayload(code: string, message: string, details?: string): QueryErrorPayload {
+export function createErrorPayload(
+  code: string,
+  message: string,
+  details?: string,
+  extra?: Partial<Omit<QueryErrorPayload, "code" | "message" | "details">>
+): QueryErrorPayload {
   return {
     code,
     message,
     details,
+    ...extra,
   };
 }
