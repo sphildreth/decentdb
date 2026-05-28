@@ -279,6 +279,19 @@ class TestJdbcDriverConfig:
 
         assert driver.jar_paths == [str(jar_path.resolve())]
 
+    def test_derby_adapts_parameterized_limit(self):
+        """Derby should accept Workload C materialization limit syntax."""
+        driver = JDBCDriver({"engine": "derby"})
+
+        adapted = driver._adapt_sql(
+            "SELECT id, val, f FROM bench WHERE id >= ? LIMIT ?"
+        )
+
+        assert (
+            adapted
+            == "SELECT id, val, f FROM bench WHERE id >= ? FETCH FIRST ? ROWS ONLY"
+        )
+
     def test_jdbc_prepared_statement_uses_dbapi_cursor_execute(self):
         """JDBC prepared benchmark path should not require JayDeBeApi cursor.prepare."""
 

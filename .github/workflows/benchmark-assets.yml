@@ -340,9 +340,10 @@ jobs:
           from pathlib import Path
 
           expected = {
-              "decentdb_default_durable",
+              "decentdb_balanced_durable",
+              "decentdb_low_memory_durable",
               "decentdb_tuned_durable",
-              "duckdb",
+              "duckdb_engine_default",
               "sqlite",
               "H2",
               "HSQLDB",
