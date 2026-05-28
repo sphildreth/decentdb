@@ -64,12 +64,16 @@ void main() {
     final timer =
         Timer.periodic(const Duration(milliseconds: 1), (_) => timerFires++);
 
-    final sel = await db.prepare('SELECT id FROM t WHERE v LIKE \'x%\'');
+    final sel = await db.prepare(
+      'SELECT COUNT(*) AS c FROM t a, t b '
+      'WHERE (a.id + b.id) >= 0 AND a.v LIKE \'x%\'',
+    );
     final rows = await sel.query();
     await sel.dispose();
     timer.cancel();
 
-    expect(rows.length, rowCount);
+    expect(rows.length, 1);
+    expect(rows.single['c'], rowCount * rowCount);
     // The timer should have fired at least a few times while the query was
     // running, proving the main isolate remained responsive.
     expect(timerFires, greaterThanOrEqualTo(1));
