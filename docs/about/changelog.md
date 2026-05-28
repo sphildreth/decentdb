@@ -140,9 +140,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed Windows native release builds by making the process-coordination
   byte-range lock guard explicitly `Send`/`Sync` under the documented Windows
   handle lifetime invariant.
-- Fixed mobile native artifact release builds by passing Android NDK compiler
-  and archiver paths through to C build scripts and avoiding Bash associative
-  arrays in the iOS artifact script on macOS runners.
+- Fixed mobile native artifact release builds by passing Android NDK compiler,
+  archiver, and C flag settings through to C build scripts and avoiding Bash
+  associative arrays in the iOS artifact script on macOS runners.
 - Fixed the native release benchmark lane so DecentDB README chart profiles
   explicitly run as single-process embedded comparisons with
   `process_coordination=single_process_unsafe`, while keeping durable

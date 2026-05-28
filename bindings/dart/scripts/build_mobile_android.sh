@@ -166,8 +166,10 @@ build_target() {
   local target_suffix
   local cc_suffix
   local env_var
+  local cflags_var
   local linker
   local ar
+  local existing_cflags
   local out_lib
   local dst_dir
   local env_args=()
@@ -179,12 +181,15 @@ build_target() {
   target_suffix="${target_suffix//-/_}"
   cc_suffix="${target//-/_}"
   env_var="CARGO_TARGET_${target_suffix}_LINKER"
+  cflags_var="CFLAGS_${cc_suffix}"
 
   linker="${!env_var:-$(find_android_linker "$target" || true)}"
   if [[ -n "$linker" ]]; then
+    existing_cflags="${!cflags_var:-}"
     env_args=(
       "${env_var}=${linker}"
       "CC_${cc_suffix}=${linker}"
+      "${cflags_var}=${existing_cflags:+$existing_cflags }-D_GNU_SOURCE -Wno-error=implicit-function-declaration"
     )
     ar="$(find_android_tool llvm-ar || true)"
     if [[ -n "$ar" ]]; then
