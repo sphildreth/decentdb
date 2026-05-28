@@ -409,6 +409,20 @@ struct OsFileLock {
     len: u64,
 }
 
+// SAFETY: `OsFileLock` stores a borrowed Windows kernel file handle and byte
+// range metadata. The guard never dereferences the raw handle; it only passes
+// it back to `UnlockFileEx` when dropped. Windows file handles are valid to use
+// from any thread while the owning `File` remains open, and DecentDB's
+// coordination layer keeps the owning `OsVfsFile` alive for the guard lifetime.
+#[cfg(windows)]
+unsafe impl Send for OsFileLock {}
+
+// SAFETY: Shared references to `OsFileLock` do not mutate Rust-managed state.
+// Unlocking happens only through `Drop`, which requires unique ownership of the
+// guard, and delegates synchronization to the operating system.
+#[cfg(windows)]
+unsafe impl Sync for OsFileLock {}
+
 #[cfg(windows)]
 impl VfsFileLock for OsFileLock {}
 
