@@ -195,6 +195,15 @@ Required fields:
 | `permanent` | Whether the same inputs/state should keep failing until the caller or environment changes. |
 | `redaction` | Redaction policy applied to this diagnostic. Initial value is `default`. |
 
+`retryable` and `permanent` are independent flags, not automatic inverses:
+
+| Flags | Meaning |
+|---|---|
+| `retryable=false`, `permanent=true` | Caller must change input, schema, configuration, permissions, or durable state. Example: `constraint.unique`. |
+| `retryable=true`, `permanent=false` | Ordinary transient condition. Retrying with backoff may succeed. |
+| `retryable=true`, `permanent=true` | State-change-required retry. The same caller input may succeed later only after external or engine state changes, such as a writer lock clearing, queue pressure draining, disk space being freed, or sync retention blockers being resolved. |
+| `retryable=false`, `permanent=false` | Reserved for caller-driven cancellation or ambiguous internal failures where DecentDB cannot make a safe retry recommendation. |
+
 Optional common fields:
 
 | Field | Meaning |
@@ -219,8 +228,14 @@ Optional common fields:
 | `doctor` | Structured handoff to Doctor or `sys.*` inspection. |
 | `details` | Small structured details map for low-risk non-sensitive fields. |
 
+Named fields are reserved for the explicit optional fields in this table. Small,
+non-sensitive facts that do not have a named field belong under `details`.
+
 Unknown optional fields must be ignored by consumers. Removing a required field,
 renaming a subcode, or changing a subcode's meaning is a compatibility break.
+JSON serialization must omit absent optional fields rather than emitting
+`null`, and deterministic key order should be used for snapshots, docs examples,
+and C ABI tests.
 
 ### 5.3 Rust Shape
 
@@ -245,9 +260,17 @@ pub struct DbDiagnostic {
 The exact Rust type can differ, but the implementation must make it hard to
 create a stable diagnostic with unredacted dynamic fields accidentally.
 
+`DbDiagnosticContext` should be a typed context struct with optional fields that
+mirror the JSON optional fields in Section 5.2. Dynamic values that can contain
+paths, parameters, SQL text, audit context, credentials, or open options should
+use redacted wrapper types instead of plain `String`.
+
 `DbError::code()` and `DbError::numeric_code()` continue working. Existing
-message constructors may remain as compatibility helpers, but new code paths
-should prefer constructors that set a subcode and structured context.
+message constructors remain as compatibility shims. They should assign
+category-specific fallback subcodes such as `sql.unknown`,
+`constraint.unknown`, `io.unknown`, or `internal.unknown` until the call site is
+converted. New code paths must use structured constructors that set a stable
+subcode and context explicitly.
 
 ### 5.4 C ABI Shape
 
@@ -267,6 +290,12 @@ Rules:
 - The C ABI version must be bumped.
 - Every maintained binding must update ABI expectations and smoke tests.
 
+The ABI bump is expressed through the existing runtime `ddb_abi_version()`
+query. Bindings must compare that runtime value against their compiled
+expectation. The public header may also define a compile-time `DDB_ABI_VERSION`
+macro when the implementation lands, but the runtime function remains the
+authoritative compatibility check.
+
 A borrowed-pointer accessor can be added later if profiling proves the owned
 JSON path too costly, but the first stable API should prefer clear ownership.
 
@@ -275,6 +304,19 @@ JSON path too costly, but the first stable API should prefer clear ownership.
 The first implementation does not need to cover every error path. It should
 cover high-friction cases where structured handling immediately helps
 applications and bindings.
+
+Initial categories use the existing broad numeric error family and the public
+compatibility effect, not a perfect domain taxonomy. SQL-surfaced security,
+sync, branch, and extension validation errors may remain under `ERR_SQL` in the
+first slice because adding `ERR_SECURITY`, `ERR_SYNC`, or `ERR_BRANCH` requires
+a follow-up ADR and C ABI decision. TDE open failures stay under `ERR_IO` or
+`ERR_CORRUPTION` when they are observed as file/open/header validation failures.
+
+The table lists `retryable` to keep the catalog compact. Unless an implemented
+subcode documents a more specific value, first-slice retryable rows should use
+`permanent=true` as state-change-required retries, and non-retryable rows should
+also use `permanent=true` except caller-driven cancellation such as
+`queue.canceled`, which should use `permanent=false`.
 
 | Area | Category | Subcode | SQLSTATE | Retryable | Key fields |
 |---|---|---|---|---:|---|
@@ -305,6 +347,7 @@ applications and bindings.
 | Corruption | `ERR_CORRUPTION` | `corruption.database_header` | none | No | `format`, `doctor` |
 | Corruption | `ERR_CORRUPTION` | `corruption.page_checksum` | none | No | `details.page_id`, `doctor` |
 | Corruption | `ERR_CORRUPTION` | `corruption.wal_frame` | none | No | `wal`, `doctor` |
+| Corruption | `ERR_CORRUPTION` | `corruption.wal_replay` | none | No | `wal`, `doctor` |
 | Security | `ERR_SQL` | `security.policy_denied` | `42501` | No | `relation`, `policy` |
 | Security | `ERR_SQL` | `security.mask_expression_invalid` | `42601` | No | `relation`, `column`, `policy` |
 | Encryption | `ERR_IO` | `tde.key_required` | none | No | `path` |
@@ -317,6 +360,15 @@ applications and bindings.
 | Extension | `ERR_SQL` | `extension.untrusted_package` | none | No | `details.package` |
 | Panic | `ERR_PANIC` | `internal.panic_captured` | `XX000` | No | none |
 | Internal | `ERR_INTERNAL` | `internal.invariant` | `XX000` | No | `doctor` |
+
+`queue.write_timeout` uses `ERR_TIMEOUT` because a request was admitted and then
+timed out while waiting. `queue.full` uses `ERR_QUEUE_FULL` because admission was
+rejected immediately by bounded backpressure.
+
+Network/remoting errors are out of scope for the core engine v1 catalog unless
+the failing operation is owned by the engine. Relay or transport layers may wrap
+engine diagnostics in command-level errors until a future ADR accepts an
+engine-owned network diagnostic family.
 
 Subcodes can be added over time. The first slice should prioritize correctness
 and stable coverage for common errors over exhaustive taxonomy.
@@ -335,7 +387,9 @@ ordinary support tickets.
 - Raw audit context values.
 - Bearer tokens, sync auth tokens, or relay credentials.
 - Full absolute filesystem paths.
-- Raw SQL text unless it is already a static command name emitted by DecentDB.
+- Raw SQL text unless it is a DecentDB-internal command verb such as
+  `CHECKPOINT` or `VACUUM`. A hardcoded SQL statement is still SQL text and must
+  not be included by default.
 
 ### 7.2 Allowed Default Context
 
@@ -369,8 +423,8 @@ native idiom.
 | Go | `DecentDBError` gains diagnostic fields and keeps sentinel wrapping for busy/timeout/queue cases. |
 | Node | `Error` objects include `code`, `nativeCode`, `subcode`, `sqlstate`, `retryable`, `permanent`, and `diagnostic`. |
 | .NET | `DecentDBException` gains diagnostic properties and ADO.NET maps SQLState-like concepts where applicable. |
-| Java | `SQLException` vendor code and SQLState remain; diagnostic JSON or typed detail is available from DecentDB exception helpers. |
-| Dart | `DecentDbException` gains `diagnostic`; `ErrorCode` must cover every current C ABI status. |
+| Java | `SQLException` vendor code and SQLState remain; typed diagnostic detail is available from DecentDB exception helpers, with raw JSON available for forward compatibility. |
+| Dart | `DecentDbException` gains `diagnostic`. |
 | WASM/browser | Worker and TypeScript APIs expose the same diagnostic object in rejected promises/errors. |
 | CLI/HTTP | JSON error responses include the diagnostic object; table/text output keeps concise messages plus docs/hint where useful. |
 
@@ -443,7 +497,10 @@ Examples:
 ```
 
 Doctor handoff must be informational. Error construction must stay cheap unless
-the caller explicitly runs a Doctor or diagnostics command.
+the caller explicitly runs a Doctor or diagnostics command. The `<redacted>`
+token in `doctor.command` is a literal placeholder, not a template expansion.
+Callers must supply their own database path or connection context when running
+the suggested command.
 
 ## 11. Implementation Phases
 
@@ -451,6 +508,9 @@ the caller explicitly runs a Doctor or diagnostics command.
 
 - Add the Rust diagnostic types and serialization.
 - Add constructors for the highest-priority subcodes.
+- Define deterministic diagnostic JSON serialization before exposing it through
+  the C ABI: required fields are always present, absent optional fields are
+  omitted, and key order is stable for tests and docs.
 - Preserve existing `DbError` category behavior and display text.
 - Add redaction helpers for parameters, paths, open options, audit context, and
   sync/auth tokens.
@@ -489,14 +549,21 @@ the caller explicitly runs a Doctor or diagnostics command.
 - Rewrite `docs/api/error-codes.md` around category plus subcode diagnostics.
 - Add troubleshooting pages for common docs anchors.
 - Add release validation that verifies diagnostic consistency across maintained
-  bindings.
+  bindings. This should be a CI-invoked script or staged pre-commit check that
+  runs the relevant Rust validation plus binding smoke tests and asserts that
+  the accepted first-slice subcodes are projected without message parsing. Each
+  maintained binding should either cover every first-slice subcode through a
+  shared diagnostic fixture or explicitly record why a subcode is unreachable
+  from that binding's public surface.
 - Add a compatibility checklist for new subcodes and diagnostic fields.
 
 ## 12. Testing Requirements
 
 - Rust unit tests for every stable subcode introduced in the first slice.
 - Snapshot or schema tests for diagnostic JSON required fields.
-- C ABI tests for `ddb_last_error_json` ownership and lifetime.
+- C ABI tests for `ddb_last_error_json` ownership, lifetime, thread-local
+  behavior, no-last-error behavior (`DDB_OK` plus `NULL`), and the invariant
+  that reading JSON does not mutate the last diagnostic or message.
 - Panic-boundary tests that return `ERR_PANIC` plus `internal.panic_captured`.
 - Redaction tests for SQL parameters, open options, TDE keys, sync tokens, audit
   context, and paths.
@@ -544,14 +611,80 @@ This win is complete when:
 - Message text may change at any time and must not be asserted as stable except
   in narrowly scoped human-output tests.
 
-## 15. Open Questions
+A compatibility cycle means at least one public release after the replacement
+subcode ships with the old subcode still accepted or emitted as an alias. If the
+change also affects C ABI shape or binding compatibility, the alias must remain
+until at least the next C ABI version bump after that public release unless a
+follow-up ADR accepts a shorter migration.
 
-- Should the initial `path` redaction use basename plus hash, path class only,
-  or caller-supplied display label?
-- Should bindings expose diagnostics as immutable typed objects or raw JSON plus
-  convenience properties?
-- Which SQL parser errors can reliably include source spans in the first slice?
-- Should docs anchors be plain strings such as `errors/constraint-unique` or
-  full relative URLs under `docs/api/error-codes.md`?
-- Should debug builds include additional opt-in local-only diagnostic fields
-  that are never exposed in release builds?
+## 15. Initial Defaults For Previously Open Questions
+
+These defaults close the initial design questions for the first implementation
+slice. Future changes to these defaults should be treated as compatibility work
+and reviewed against ADR 0185.
+
+### 15.1 Path Redaction
+
+Path redaction should default to a structured descriptor instead of a raw path
+string:
+
+```json
+{
+  "kind": "database",
+  "display": "app.ddb",
+  "fingerprint": "sha256:1a2b3c4d5e6f"
+}
+```
+
+Rules:
+
+- Use a caller-supplied display label when available.
+- Otherwise use the basename plus a short SHA-256 fingerprint of the canonical
+  path.
+- Do not include parent directories by default.
+- Use `kind` values such as `database`, `wal`, `coordination_sidecar`,
+  `sync_journal`, `backup_destination`, or `unknown`.
+- The initial fingerprint should use 12 lowercase hexadecimal characters unless
+  implementation or collision tests justify a different length.
+
+### 15.2 Binding Diagnostic Shape
+
+Bindings should expose immutable typed diagnostic objects plus the original raw
+JSON or map for forward compatibility.
+
+Required fields and common optional fields should get convenience properties.
+Unknown future fields must remain accessible through the raw JSON/map so callers
+do not need a binding release before inspecting a newly added optional field.
+
+### 15.3 SQL Source Spans
+
+SQL source spans should be included only when the parser or resolver provides
+reliable byte offsets.
+
+The first slice should include syntax positions where the parser already
+reports reliable locations. It should not invent spans for semantic errors.
+Semantic errors should use structured fields such as `relation`, `column`,
+`parameter`, and `details` instead.
+
+### 15.4 Documentation Anchors
+
+Documentation anchors should be stable relative IDs, not full URLs.
+
+Examples:
+
+- `errors/constraint-unique`
+- `errors/sql-relation-not-found`
+- `errors/queue-write-timeout`
+
+Docs tooling, CLI output, website output, and hosted API references can resolve
+those anchors to versioned URLs later. The diagnostic contract should only
+promise the stable anchor ID.
+
+### 15.5 Debug-Only Detail
+
+Debug builds should not change the public diagnostic schema.
+
+Extra local-only debugging detail may exist behind an explicit unsafe or
+developer diagnostic flag, but it must not flow through default C ABI, binding,
+CLI, WASM, HTTP, or support JSON output. Default diagnostics should remain
+redacted and schema-compatible across debug and release builds.
