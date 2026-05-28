@@ -134,6 +134,26 @@ jobs:
           set -euo pipefail
           cargo build -p decentdb --release --quiet
 
+      - name: Generate rust-baseline release cross-check
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .tmp/benchmark-assets/rust-baseline-current
+          cargo run \
+            --manifest-path benchmarks/rust-baseline/Cargo.toml \
+            --bin rust-baseline \
+            --release \
+            --quiet \
+            -- \
+            --scale full \
+            --out-dir "$GITHUB_WORKSPACE/.tmp/benchmark-assets/rust-baseline-current" \
+            --db-path "$GITHUB_WORKSPACE/.tmp/benchmark-assets/rust-baseline-current/run-rust-full.ddb"
+          python scripts/compare_rust_baseline.py \
+            --current-dir .tmp/benchmark-assets/rust-baseline-current \
+            --scale full \
+            > .tmp/benchmark-assets/rust-baseline-compare.txt
+          cat .tmp/benchmark-assets/rust-baseline-compare.txt
+
       - name: Generate native benchmark summary
         shell: bash
         run: |
@@ -360,6 +380,15 @@ jobs:
               sys.exit(1)
           PY
 
+      - name: Validate release benchmark narrative
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/validate_release_benchmark_narrative.py \
+            --summary data/bench_summary.json \
+            --rust-baseline-current-dir .tmp/benchmark-assets/rust-baseline-current \
+            --report .tmp/benchmark-assets/benchmark-narrative.txt
+
       - name: Generate README benchmark assets
         shell: bash
         run: |
@@ -391,6 +420,9 @@ jobs:
             data/bench_summary.json
             docs/assets/benchmarks/python-embedded-compare
             docs/user-guide/benchmarks.md
+            .tmp/benchmark-assets/benchmark-narrative.txt
+            .tmp/benchmark-assets/rust-baseline-compare.txt
+            .tmp/benchmark-assets/rust-baseline-current
             .tmp/benchmark-assets/workload_a
             .tmp/benchmark-assets/workload_c
             .tmp/benchmark-assets/root-readme-results.json

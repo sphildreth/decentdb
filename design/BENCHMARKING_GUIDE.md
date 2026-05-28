@@ -121,6 +121,17 @@ The native run writes `data/bench_summary.json`. The helper script
 `benchmarks/python_embedded_compare/out/results_merged.json` before the README
 chart renderers consume the combined summary.
 
+The README native comparison is intentionally a single-process embedded-engine
+benchmark. DecentDB rows set `process_coordination=single_process_unsafe` while
+preserving `WalSyncMode::Full`; cross-process coordination correctness and
+diagnostic overhead are validated outside these release chart bars.
+
+Release asset refreshes also run the raw `benchmarks/rust-baseline` full-scale
+cross-check and `scripts/validate_release_benchmark_narrative.py`. The guard
+prevents publishing a README chart whose tuned durable row communicates a severe
+SQLite-relative drop while the raw-engine baseline tells a materially different
+story.
+
 ```bash
 python scripts/aggregate_benchmarks.py \
   --native-summary data/bench_summary.json \

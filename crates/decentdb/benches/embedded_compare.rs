@@ -166,6 +166,7 @@ fn decentdb_config_for_profile(profile: DecentDbProfile, temp_dir: PathBuf) -> d
         DecentDbProfile::Tuned => decentdb::DbConfig::tuned_durable(),
     };
     config.temp_dir = temp_dir;
+    config.process_coordination = decentdb::ProcessCoordinationMode::SingleProcessUnsafe;
     config
 }
 
@@ -1198,28 +1199,28 @@ fn main() {
     summary.metadata.insert(
         "decentdb_profile_balanced".to_string(),
         format!(
-            "{}:wal_sync_full cache_size_mb={}",
+            "{}:wal_sync_full cache_size_mb={} process_coordination=single_process_unsafe",
             DECENTDB_BALANCED_DURABLE_PROFILE, DECENTDB_BALANCED_CACHE_MB
         ),
     );
     summary.metadata.insert(
         "decentdb_profile_default".to_string(),
         format!(
-            "{}:wal_sync_full cache_size_mb={}",
+            "{}:wal_sync_full cache_size_mb={} process_coordination=single_process_unsafe",
             DECENTDB_BALANCED_DURABLE_PROFILE, DECENTDB_BALANCED_CACHE_MB
         ),
     );
     summary.metadata.insert(
         "decentdb_profile_low_memory".to_string(),
         format!(
-            "{}:wal_sync_full cache_size_mb={}",
+            "{}:wal_sync_full cache_size_mb={} process_coordination=single_process_unsafe",
             DECENTDB_LOW_MEMORY_DURABLE_PROFILE, DECENTDB_LOW_MEMORY_CACHE_MB
         ),
     );
     summary.metadata.insert(
         "decentdb_profile_tuned".to_string(),
         format!(
-            "{}:wal_sync_full cache_size_mb={} retain_paged_row_sources_after_commit=true paged_row_storage=false wal_autocheckpoint=0",
+            "{}:wal_sync_full cache_size_mb={} retain_paged_row_sources_after_commit=true paged_row_storage=false wal_autocheckpoint=0 process_coordination=single_process_unsafe",
             DECENTDB_TUNED_DURABLE_PROFILE, DECENTDB_TUNED_CACHE_MB
         ),
     );
@@ -1239,6 +1240,15 @@ fn main() {
     summary.metadata.insert(
         "decentdb_durability".to_string(),
         "wal_sync_full".to_string(),
+    );
+    summary.metadata.insert(
+        "decentdb_process_coordination".to_string(),
+        "single_process_unsafe".to_string(),
+    );
+    summary.metadata.insert(
+        "process_coordination_note".to_string(),
+        "native cross-engine benchmarks are single-process comparisons; cross-process coordination overhead is measured separately"
+            .to_string(),
     );
     summary
         .metadata

@@ -99,10 +99,19 @@ It preserves a **one writer** and **many concurrent readers** concurrency model 
 - The README chart assets are rendered from `data/bench_summary.json` by `python scripts/make_readme_chart.py` and `python scripts/visualize_alternative.py`.
 - Checked-in chart assets use the accepted release benchmark snapshot. Local diagnostic benchmark runs should not replace `data/bench_summary.json` unless they were collected in the release benchmark lane.
 - Native runs now keep DecentDB rows separate by profile:
-  - `decentdb_balanced_durable` — current balanced durable default config (`wal_sync_full`, 16 MB cache)
+  - `decentdb_balanced_durable` — current balanced durable config (`wal_sync_full`, 16 MB cache)
   - `decentdb_low_memory_durable` — constrained-host durable config (`wal_sync_full`, 4 MB cache)
   - `decentdb_tuned_durable` — durability-preserving tuned config (`wal_sync_full`, 64 MB cache, `retain_paged_row_sources_after_commit`)
   - `decentdb_default_durable` — legacy release-snapshot key for historical 4 MB default rows
+- Native DecentDB chart rows run with `process_coordination=single_process_unsafe`
+  because this chart is a single-process embedded-engine comparison. Cross-process
+  coordination is validated separately and should not be inferred from these
+  hot-path bars.
+- The benchmark asset workflow also runs the raw `rust-baseline` full-scale
+  cross-check and validates the merged chart summary before publishing. If the
+  README chart would show a severe tuned-profile drop while the raw engine
+  baseline remains healthy, the workflow fails instead of committing confusing
+  assets.
 - SQLite results are reported as `sqlite_wal_full` (WAL+FULL sync); relaxed durability variants can be added as separate profiles when collected.
 - Chart values are **normalized vs SQLite** (baseline = 1.0), and the charted metric set is the full native set collected in the benchmark JSON:
   - `read_p95_ms`, `join_p95_ms`, `range_scan_p95_ms`, `aggregate_p95_ms`, `concurrent_read_p95_ms`, `commit_p95_ms`, `insert_rows_per_sec`.
