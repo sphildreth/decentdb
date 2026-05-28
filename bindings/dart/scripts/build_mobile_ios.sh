@@ -145,17 +145,17 @@ build_xcframework() {
   return 0
 }
 
-declare -a ABIS=(ios-arm64 ios-simulator-x86_64)
-declare -A ABI_TO_TARGET=(
-  [ios-arm64]=aarch64-apple-ios
-  [ios-simulator-x86_64]=x86_64-apple-ios
+declare -a TARGET_SPECS=(
+  "ios-arm64:aarch64-apple-ios"
+  "ios-simulator-x86_64:x86_64-apple-ios"
 )
 
-total_count=${#ABIS[@]}
+total_count=${#TARGET_SPECS[@]}
 built_count=0
 
-for abi in "${ABIS[@]}"; do
-  target="${ABI_TO_TARGET[$abi]}"
+for spec in "${TARGET_SPECS[@]}"; do
+  abi="${spec%%:*}"
+  target="${spec#*:}"
   if build_static_target "$abi" "$target"; then
     built_count=$((built_count + 1))
   fi
