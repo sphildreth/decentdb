@@ -113,6 +113,7 @@ class JDBCDriver(DatabaseDriver):
         if self.engine == "derby":
             adapted = adapted.replace(" ORDER BY created_at LIMIT ?", " ORDER BY created_at FETCH FIRST ? ROWS ONLY")
             adapted = adapted.replace(" ORDER BY o.created_at LIMIT ?", " ORDER BY o.created_at FETCH FIRST ? ROWS ONLY")
+            adapted = adapted.replace(" LIMIT ?", " FETCH FIRST ? ROWS ONLY")
 
         return adapted
 
