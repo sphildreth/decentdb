@@ -195,6 +195,15 @@ Required fields:
 | `permanent` | Whether the same inputs/state should keep failing until the caller or environment changes. |
 | `redaction` | Redaction policy applied to this diagnostic. Initial value is `default`. |
 
+`code_name` uses the stable `ERR_*` spelling without the public C constant's
+`DDB_` prefix. For example, C status `DDB_ERR_CONSTRAINT`, Rust
+`DbErrorCode::Constraint`, and JSON `code_name: "ERR_CONSTRAINT"` all refer to
+the same broad category.
+
+The `version` field increments when the required field set changes or when the
+meaning of an existing required field changes. Adding optional fields, adding
+new subcodes, or adding new `details` keys does not require a version bump.
+
 `retryable` and `permanent` are independent flags, not automatic inverses:
 
 | Flags | Meaning |
@@ -230,6 +239,16 @@ Optional common fields:
 
 Named fields are reserved for the explicit optional fields in this table. Small,
 non-sensitive facts that do not have a named field belong under `details`.
+`details` must stay small: fewer than 10 keys, scalar or short-string values by
+default, no large nested objects or arrays, and a target serialized size under
+1 KiB. Larger inspection output belongs in Doctor or `sys.*` diagnostics.
+
+SQLSTATE is omitted when no PostgreSQL/ODBC code has a close semantic match,
+when the condition is engine-internal or platform-specific, or when assigning a
+value would require inventing a non-standard extension. SQLSTATE values should
+be added only when a standard code exists and the mapping is unambiguous.
+SQLSTATE is never precise enough to replace `subcode`; for example, multiple
+internal failures may share `XX000`.
 
 Unknown optional fields must be ignored by consumers. Removing a required field,
 renaming a subcode, or changing a subcode's meaning is a compatibility break.
@@ -290,6 +309,16 @@ Rules:
 - The C ABI version must be bumped.
 - Every maintained binding must update ABI expectations and smoke tests.
 
+The C ABI last-error state should remain thread-local and represent one coherent
+snapshot from the most recent FFI boundary on that thread. The implementation
+should store the typed `DbDiagnostic` alongside the existing message state, then
+serialize JSON lazily when `ddb_last_error_json()` is called. The accessor is
+read-only: it must not clear, consume, or replace either the diagnostic or the
+message. The existing `clear_last_error()` behavior must reset both the message
+and diagnostic together at the start of each FFI boundary so
+`ddb_last_error_message()` and `ddb_last_error_json()` cannot report different
+calls.
+
 The ABI bump is expressed through the existing runtime `ddb_abi_version()`
 query. Bindings must compare that runtime value against their compiled
 expectation. The public header may also define a compile-time `DDB_ABI_VERSION`
@@ -318,6 +347,11 @@ subcode documents a more specific value, first-slice retryable rows should use
 also use `permanent=true` except caller-driven cancellation such as
 `queue.canceled`, which should use `permanent=false`.
 
+Subcode prefixes are semantic families and may not match the numeric category.
+The numeric category is the broad C ABI compatibility layer; the subcode is the
+precise domain condition. Consumers should dispatch on numeric codes for broad
+backwards-compatible exception families and on subcodes for precise behavior.
+
 | Area | Category | Subcode | SQLSTATE | Retryable | Key fields |
 |---|---|---|---|---:|---|
 | SQL parse | `ERR_SQL` | `sql.syntax` | `42601` | No | `details.position` when known |
@@ -338,6 +372,7 @@ also use `permanent=true` except caller-driven cancellation such as
 | Queue | `ERR_QUEUE_FULL` | `queue.full` | `HYT00` | Yes | `details.capacity` |
 | Queue | `ERR_QUEUE_CLOSED` | `queue.closed` | `08003` | No | none |
 | Locking | `ERR_BUSY` | `busy.writer_lock` | `55P03` | Yes | `process_owner`, `doctor` |
+| Locking | `ERR_BUSY` | `busy.reader_conflict` | `55P03` | Yes | `process_owner`, `doctor` |
 | Process coordination | `ERR_TIMEOUT` | `coordination.lock_timeout` | `55P03` | Yes | `process_owner`, `doctor` |
 | Process coordination | `ERR_IO` | `coordination.sidecar_unavailable` | none | No | `path`, `doctor` |
 | I/O | `ERR_IO` | `io.permission_denied` | none | No | `path` |
@@ -364,6 +399,11 @@ also use `permanent=true` except caller-driven cancellation such as
 `queue.write_timeout` uses `ERR_TIMEOUT` because a request was admitted and then
 timed out while waiting. `queue.full` uses `ERR_QUEUE_FULL` because admission was
 rejected immediately by bounded backpressure.
+
+`busy.reader_conflict` is included as a reserved first-slice subcode for any
+current or future reader-side busy condition that is distinct from a writer-lock
+blocker. If implementation confirms no public reader-side busy path exists, the
+subcode may remain documented but unreachable in v1 binding smoke tests.
 
 Network/remoting errors are out of scope for the core engine v1 catalog unless
 the failing operation is owned by the engine. Relay or transport layers may wrap
@@ -432,6 +472,12 @@ Bindings should preserve source-compatible broad exception families where
 possible. Structured diagnostics should make existing exceptions more useful,
 not force every caller to catch a new root error type.
 
+Typed diagnostic detail is the primary binding surface. Bindings must also keep
+the original raw diagnostic JSON or raw map available on the same exception or
+error object for forward compatibility. For example, Node should expose both
+`error.diagnostic` and `error.diagnosticJson`; bindings should not require a
+separate global last-error accessor after an exception has been thrown.
+
 ## 9. CLI, HTTP, WASM, And JSON Bridges
 
 JSON-facing surfaces should standardize on:
@@ -466,6 +512,12 @@ the engine diagnostic as `diagnostic`.
 
 Sync JSON bridge errors, branch JSON bridge errors, browser worker errors, and
 HTTP console errors must all use the same shape.
+
+WASM/browser runtimes may reach the diagnostic through the same C ABI accessor
+when that is practical, or through a wasm-specific bridge that serializes the
+same diagnostic object. Browser worker errors should carry the diagnostic object
+through the worker protocol, including `postMessage` rejections and promise
+errors. They should not depend on host support for `WebAssembly.Exception`.
 
 ## 10. Doctor Handoff
 
@@ -523,7 +575,8 @@ the suggested command.
 - Bump the C ABI version.
 - Update `include/decentdb.h`.
 - Update C ABI tests for ownership, thread-local last error behavior, panic
-  diagnostics, and no-last-error behavior.
+  diagnostics, no-last-error behavior, and message/diagnostic clearing
+  consistency.
 - Update CLI, HTTP console, sync JSON bridges, branch JSON bridges, and WASM
   worker errors to include diagnostics.
 
@@ -531,6 +584,7 @@ the suggested command.
 
 - Update Python, Go, Node, .NET, Java, Dart, and browser TypeScript bindings.
 - Ensure every binding knows all current broad status codes.
+- Expose diagnostics for the Phase 1-2 subcode set before expanding coverage.
 - Add smoke tests for SQL, constraint, queue/busy, and redaction-sensitive
   errors where practical.
 - Update binding docs and examples.
@@ -543,6 +597,8 @@ the suggested command.
   extension errors where structured context is already available.
 - Add Doctor handoff for process, WAL/corruption, sync, and branch conflict
   families.
+- Extend binding diagnostic fixtures and smoke coverage incrementally as new
+  Phase 4 subcodes become reachable.
 
 ### Phase 5: Documentation And Release Guardrails
 
@@ -563,7 +619,8 @@ the suggested command.
 - Snapshot or schema tests for diagnostic JSON required fields.
 - C ABI tests for `ddb_last_error_json` ownership, lifetime, thread-local
   behavior, no-last-error behavior (`DDB_OK` plus `NULL`), and the invariant
-  that reading JSON does not mutate the last diagnostic or message.
+  that reading JSON does not clear, consume, replace, or otherwise mutate the
+  last diagnostic or message.
 - Panic-boundary tests that return `ERR_PANIC` plus `internal.panic_captured`.
 - Redaction tests for SQL parameters, open options, TDE keys, sync tokens, audit
   context, and paths.
@@ -573,6 +630,8 @@ the suggested command.
   message text.
 - Compatibility tests proving existing numeric status values do not change.
 - Fuzz or table-driven tests for path/open-option redaction helpers.
+- Tests proving `clear_last_error()` resets message and diagnostic state
+  together at FFI boundary entry.
 
 ## 13. Definition Of Done
 
@@ -646,6 +705,11 @@ Rules:
   `sync_journal`, `backup_destination`, or `unknown`.
 - The initial fingerprint should use 12 lowercase hexadecimal characters unless
   implementation or collision tests justify a different length.
+
+The fingerprint is a diagnostic correlation token, not a secret. It can confirm
+a path guess for someone who already knows the candidate path and algorithm, but
+that trade-off is acceptable for default troubleshooting. Future high-security
+profiles may omit path fingerprints entirely.
 
 ### 15.2 Binding Diagnostic Shape
 
