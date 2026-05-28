@@ -1,8 +1,8 @@
 # Overview
 
-This is a list of feedback from the prmpt 
+This is a list of feedback from the prmpt
 
-> Review the @design/FUTURE_WINS.md. Think about what other additional "Future Wins" this project would benefit from. 
+> Review the @design/FUTURE_WINS.md. Think about what other additional "Future Wins" this project would benefit from.
 
 These should be reviewed and aggregated into a single list. Then ranked in priority with higher priority being the largest impact to the user.
 
@@ -318,8 +318,8 @@ The top two — snapshot isolation and WASM UDFs — would each require an ADR a
 Based on reviewing the FUTURE_WINS.md roadmap, here are a few additional "Future Wins" that would complement DecentDB's mission and align with its priorities:
 Additional Future Win Candidates
 1. Automated Database Maintenance System
-Status: TODO  
-Future Version: vNext+1 or Later  
+Status: TODO
+Future Version: vNext+1 or Later
 Why This Matters: While DecentDB has performance tuning guides, many embedded/database users expect "zero-maintenance" operation. An automated maintenance system could handle vacuum, analyze, and integrity checks in the background based on usage patterns and workload characteristics, reducing operational overhead for applications that embed DecentDB.
 Desired Capability:
 - Background maintenance tasks that adapt to database write/read patterns
@@ -334,8 +334,8 @@ Guardrails:
 - No silent data loss or format changes without explicit user consent
 - Maintenance overhead should be measurable and benchmarkable
 2. Time-Series Storage Optimizations
-Status: TODO  
-Future Version: Later  
+Status: TODO
+Future Version: Later
 Why This Matters: Many local-first applications (IoT, monitoring, finance, telemetry) work heavily with time-series data. While DecentDB is a general-purpose SQL engine, adding storage engine hints or specialized table options for time-series workloads could significantly improve compression and query performance for this important use case without complicating the general engine.
 Desired Capability:
 - WITH TIME_SERIES_OPTIMIZATIONS table option or similar
@@ -350,8 +350,8 @@ Guardrails:
 - Format changes would require ADR and migration planning
 - Should complement rather than replace the performance tracking work already planned
 3. Enhanced Diagnostics and Error Reporting
-Status: TODO  
-Future Version: vNext+1  
+Status: TODO
+Future Version: vNext+1
 Why This Matters: While DecentDB has operational metrics and Doctor integration, improving the day-to-day developer experience through better error messages, structured error codes, and built-in health checks would make the database easier to embed and troubleshoot in applications.
 Desired Capability:
 - Structured error codes with SQLSTATE compatibility
@@ -397,17 +397,16 @@ These additions complement the existing roadmap by addressing operational fricti
 
 ```
 Additional Future Wins to consider adding (ranked by fit to consolidation filter):
-18. Workload-driven automatic index advisor and lightweight auto-maintenance (vNext+1, TODO)  
+18. Workload-driven automatic index advisor and lightweight auto-maintenance (vNext+1, TODO)
    Builds on shipped sys.* + Doctor; reduces "tune or fail" friction for default-fast perf without planner contract changes.
-19. Native UUID type + functions with index-friendly storage (Later, BACKLOG)  
+19. Native UUID type + functions with index-friendly storage (Later, BACKLOG)
    Fills a common migration/ORM gap; cheap win once JSONB/path work exists, keeps C ABI stable.
-20. Declarative retention + compaction policies for WAL/branch/sync journals (Later, BACKLOG)  
+20. Declarative retention + compaction policies for WAL/branch/sync journals (Later, BACKLOG)
    Hardens mobile/browser production runtimes and storage efficiency; follows TDE/security and cross-process foundations.
-21. In-process read replica / snapshot isolation helpers for analytics dashboards (Later, BACKLOG)  
+21. In-process read replica / snapshot isolation helpers for analytics dashboards (Later, BACKLOG)
    Leverages one-writer model + projections track; attractive for reactive apps without multi-writer or FDW scope creep.
 These stay inside durability-first identity, avoid excluded areas, and extend delivered surfaces (metrics, branches, sync, browser/mobile, performance).
 ```
-
 
 ## Coding agent #7 suggestions
 
