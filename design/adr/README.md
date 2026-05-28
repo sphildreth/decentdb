@@ -8,6 +8,7 @@ This directory contains the historical and active ADRs for DecentDB.
 > the current Rust engine.
 
 ### Recent Rust-Specific ADRs:
+- **0185-rich-structured-error-diagnostics-contract.md**: Defines the versioned structured diagnostic object, stable subcode contract, C ABI JSON accessor direction, binding projection requirements, redaction rules, retry/permanence classification, and Doctor handoff policy.
 - **0184-default-fast-planner-and-runtime-contract.md**: Defines the default-fast performance boundary, durable-default guardrails, covering-index execution rules, statistics/plan-cache constraints, and ADR triggers for format, WAL, and broad binding changes.
 - **0183-mobile-tde-key-provider-and-platform-keystore-boundary.md**: Defines the mobile TDE key-provider boundary, Keychain/Keystore reference-adapter scope, key-loss behavior, and the rule that Rust and pure Dart remain platform key-store agnostic.
 - **0182-mobile-runtime-lifecycle-storage-sync-and-support-tiers.md**: Defines mobile app-process ownership, app-private storage, sidecar handling, best-effort background sync with apply-before-ack, support tiers, and device/simulator validation requirements.

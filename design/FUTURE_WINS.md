@@ -2,7 +2,7 @@
 
 **Status:** Consolidated roadmap
 
-**Updated:** 2026-05-27
+**Updated:** 2026-05-28
 
 **Supersedes:** earlier DecentDB future-wins roadmap drafts for roadmap
 prioritization.
@@ -121,7 +121,7 @@ shipped foundation affects follow-on roadmap decisions.
 
 | Priority | Future Version | Status | Feature | Current Source Of Truth | Why This Rank |
 |---:|---|---|---|---|---|
-| 1 | vNext | TODO | Rich structured errors and developer diagnostics | Existing [`docs/api/error-codes.md`](../docs/api/error-codes.md); needs ADR/spec for stable machine-readable expansion | Low-cost adoption win: better errors, hints, and doc links reduce integration friction across every binding |
+| 1 | vNext | TODO | Rich structured errors and developer diagnostics | [`WIN_RICH_STRUCTURED_ERRORS_DEVELOPER_DIAGNOSTICS_SPEC.md`](WIN_RICH_STRUCTURED_ERRORS_DEVELOPER_DIAGNOSTICS_SPEC.md); ADR 0185; existing [`docs/api/error-codes.md`](../docs/api/error-codes.md) | Low-cost adoption win: better errors, hints, and doc links reduce integration friction across every binding |
 | 2 | vNext+1 | TODO | Incremental backup and point-in-time recovery | Basic `save_as` backup is delivered; needs ADR/spec for WAL archive/PITR semantics | Durable recovery artifacts are a production requirement and distinct from live replication |
 | 3 | vNext+1 | TODO | Runtime tracing, advisors, and Doctor integration | Needs ADR/spec; follows shipped operational metrics | Explains slow queries, lock waits, index usage, schema lint, and maintenance issues once the metrics contract is stable |
 | 4 | vNext+1 | TODO | Branch-aware migration rehearsal and promotion | ADR 0153-0159 and branch CLI/API docs; needs ADR/spec | Uses shipped branch/diff foundations for a distinctive safe migration workflow |
@@ -191,9 +191,12 @@ database.
 
 **Future Version:** vNext
 
-**Source of truth:** Existing [`docs/api/error-codes.md`](../docs/api/error-codes.md)
-defines broad error categories; needs ADR/spec before expanding the stable
-machine-readable contract.
+**Source of truth:**
+[`WIN_RICH_STRUCTURED_ERRORS_DEVELOPER_DIAGNOSTICS_SPEC.md`](WIN_RICH_STRUCTURED_ERRORS_DEVELOPER_DIAGNOSTICS_SPEC.md)
+and ADR 0185 define the stable diagnostic contract. Existing
+[`docs/api/error-codes.md`](../docs/api/error-codes.md) documents the broad
+error categories and should be rewritten around the structured contract when
+implementation lands.
 
 ### Why This Matters
 
