@@ -152,6 +152,32 @@ find_android_tool() {
   return 1
 }
 
+find_android_sysroot() {
+  local ndk_home="${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-${NDK_HOME:-${ANDROID_NDK_LATEST_HOME:-}}}}"
+  if [[ -z "$ndk_home" || ! -d "$ndk_home" ]]; then
+    local sdk_root="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+    if [[ -n "$sdk_root" && -d "$sdk_root/ndk" ]]; then
+      ndk_home="$(find "$sdk_root/ndk" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)"
+    fi
+  fi
+  if [[ -z "$ndk_home" || ! -d "$ndk_home" ]]; then
+    return 1
+  fi
+
+  local host_tag="linux-x86_64"
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    host_tag="darwin-$(uname -m)"
+  fi
+
+  local sysroot="$ndk_home/toolchains/llvm/prebuilt/$host_tag/sysroot"
+  if [[ -d "$sysroot" ]]; then
+    echo "$sysroot"
+    return 0
+  fi
+
+  return 1
+}
+
 build_target() {
   local abi="$1"
   local target="$2"
@@ -169,7 +195,9 @@ build_target() {
   local cflags_var
   local linker
   local ar
+  local sysroot
   local existing_cflags
+  local existing_bindgen_args
   local out_lib
   local dst_dir
   local env_args=()
@@ -186,11 +214,18 @@ build_target() {
   linker="${!env_var:-$(find_android_linker "$target" || true)}"
   if [[ -n "$linker" ]]; then
     existing_cflags="${!cflags_var:-}"
+    existing_bindgen_args="${BINDGEN_EXTRA_CLANG_ARGS:-}"
+    sysroot="$(find_android_sysroot || true)"
     env_args=(
       "${env_var}=${linker}"
       "CC_${cc_suffix}=${linker}"
       "${cflags_var}=${existing_cflags:+$existing_cflags }-D_GNU_SOURCE -Wno-error=implicit-function-declaration"
     )
+    if [[ -n "$sysroot" ]]; then
+      env_args+=(
+        "BINDGEN_EXTRA_CLANG_ARGS=${existing_bindgen_args:+$existing_bindgen_args }--target=${target} --sysroot=${sysroot} -I${sysroot}/usr/include -I${sysroot}/usr/include/${target}"
+      )
+    fi
     ar="$(find_android_tool llvm-ar || true)"
     if [[ -n "$ar" ]]; then
       env_args+=("AR_${cc_suffix}=${ar}")

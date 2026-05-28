@@ -64,16 +64,18 @@ jobs:
             --strict
 
       - name: Validate Android artifacts
-        run: bash bindings/dart/scripts/check_mobile_artifacts.sh \
-          --platform android \
-          --artifact-root "$MOBILE_ARTIFACT_ROOT" \
-          --strict
+        run: |
+          bash bindings/dart/scripts/check_mobile_artifacts.sh \
+            --platform android \
+            --artifact-root "$MOBILE_ARTIFACT_ROOT" \
+            --strict
 
       - name: Record Android guardrails
-        run: bash bindings/dart/scripts/mobile_benchmark_guardrails.sh \
-          --android-root "$MOBILE_ARTIFACT_ROOT" \
-          --ios-root "$RUNNER_TEMP/missing-ios" \
-          --output "$MOBILE_ARTIFACT_ROOT/mobile-guardrails.json"
+        run: |
+          bash bindings/dart/scripts/mobile_benchmark_guardrails.sh \
+            --android-root "$MOBILE_ARTIFACT_ROOT" \
+            --ios-root "$RUNNER_TEMP/missing-ios" \
+            --output "$MOBILE_ARTIFACT_ROOT/mobile-guardrails.json"
 
       - name: Package Android artifacts
         run: |
@@ -127,16 +129,18 @@ jobs:
             --strict
 
       - name: Validate iOS artifacts
-        run: bash bindings/dart/scripts/check_mobile_artifacts.sh \
-          --platform ios \
-          --artifact-root "$MOBILE_ARTIFACT_ROOT" \
-          --strict
+        run: |
+          bash bindings/dart/scripts/check_mobile_artifacts.sh \
+            --platform ios \
+            --artifact-root "$MOBILE_ARTIFACT_ROOT" \
+            --strict
 
       - name: Record iOS guardrails
-        run: bash bindings/dart/scripts/mobile_benchmark_guardrails.sh \
-          --android-root "$RUNNER_TEMP/missing-android" \
-          --ios-root "$MOBILE_ARTIFACT_ROOT" \
-          --output "$MOBILE_ARTIFACT_ROOT/mobile-guardrails.json"
+        run: |
+          bash bindings/dart/scripts/mobile_benchmark_guardrails.sh \
+            --android-root "$RUNNER_TEMP/missing-android" \
+            --ios-root "$MOBILE_ARTIFACT_ROOT" \
+            --output "$MOBILE_ARTIFACT_ROOT/mobile-guardrails.json"
 
       - name: Package iOS artifacts
         run: |
