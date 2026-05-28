@@ -21,7 +21,7 @@ class DuckDBDriver(DatabaseDriver):
         super().__init__(config)
         self.db_path = config.get("database_path", "duckdb.db")
         self._cursor = None
-        self._prepared_stmts: Dict[str, duckdb.Statement] = {}
+        self._prepared_stmts: Dict[str, Any] = {}
 
     @property
     def name(self) -> str:
@@ -46,6 +46,11 @@ class DuckDBDriver(DatabaseDriver):
                 self.connection.execute("CHECKPOINT")
             except:
                 pass
+            for cursor in self._prepared_stmts.values():
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
             self.connection.close()
             self.connection = None
             self._cursor = None
@@ -98,19 +103,22 @@ class DuckDBDriver(DatabaseDriver):
     def rollback(self):
         self.connection.execute("ROLLBACK")
 
-    def prepare_statement(self, sql: str) -> duckdb.Statement:
-        stmt = self.connection.prepare(sql)
-        self._prepared_stmts[sql] = stmt
-        return stmt
+    def prepare_statement(self, sql: str):
+        cursor = self._prepared_stmts.get(sql)
+        if cursor is None:
+            cursor = self.connection.cursor()
+            self._prepared_stmts[sql] = cursor
+        return sql, cursor
 
     def execute_prepared(
-        self, handle: duckdb.Statement, params: Optional[Tuple] = None
+        self, handle: Any, params: Optional[Tuple] = None
     ) -> Any:
+        sql, cursor = handle
         if params:
-            result = handle.execute(params)
+            cursor.execute(sql, params)
         else:
-            result = handle.execute()
-        return result.fetchall()
+            cursor.execute(sql)
+        return cursor.fetchall() if cursor.description else cursor.rowcount
 
     def get_engine_metadata(self) -> EngineMetadata:
         version = duckdb.__version__
