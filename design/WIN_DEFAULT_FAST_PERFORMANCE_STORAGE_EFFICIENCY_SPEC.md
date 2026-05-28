@@ -281,6 +281,19 @@ Release performance assets must keep at least these profiles distinct:
 Profile names must appear in JSON metadata and generated release charts. Tuned
 results must never replace default results in release-facing assets.
 
+Native cross-engine chart runs are single-process embedded comparisons. They
+may set `process_coordination=single_process_unsafe` only when the metadata and
+README methodology state that scope explicitly; cross-process coordination must
+remain covered by separate correctness and overhead validation.
+
+The release asset workflow must include a raw rust-baseline cross-check and
+fail before publishing if `data/bench_summary.json` would create a materially
+conflicting benchmark narrative. The current guard is
+`scripts/validate_release_benchmark_narrative.py`, which verifies profile
+metadata and requires the tuned durable row to stay competitive against SQLite
+on the release chart metric set unless a regression is explicitly accepted and
+documented.
+
 Release assets must describe competitor durability settings precisely enough
 that readers can compare latency and safety together. For DuckDB, the metadata
 must state the engine-default durability mode used by the benchmark and any

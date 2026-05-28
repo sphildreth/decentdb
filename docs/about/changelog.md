@@ -137,6 +137,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Fixed the native release benchmark lane so DecentDB README chart profiles
+  explicitly run as single-process embedded comparisons with
+  `process_coordination=single_process_unsafe`, while keeping durable
+  `WalSyncMode::Full` and documenting that cross-process coordination is
+  validated separately.
+- Added a release benchmark narrative guard to the benchmark-assets workflow:
+  it now runs the raw rust-baseline full-scale cross-check, uploads the compare
+  report, and fails before publishing README chart assets if the tuned durable
+  chart row and raw-engine baseline tell conflicting performance stories.
 - Fixed legacy database migrations to seed the v13 coordination identity for
   all upgraded source formats and to keep copied WAL header-page frames aligned
   with the migrated main header identity.
