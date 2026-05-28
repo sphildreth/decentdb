@@ -137,6 +137,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Fixed Windows native release builds by making the process-coordination
+  byte-range lock guard explicitly `Send`/`Sync` under the documented Windows
+  handle lifetime invariant.
 - Fixed the native release benchmark lane so DecentDB README chart profiles
   explicitly run as single-process embedded comparisons with
   `process_coordination=single_process_unsafe`, while keeping durable
