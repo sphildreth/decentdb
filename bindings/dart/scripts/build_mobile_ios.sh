@@ -96,7 +96,7 @@ build_static_target() {
     return 2
   fi
 
-  if ! cargo rustc -p decentdb --crate-type staticlib --target "$target" "${CARGO_PROFILE[@]}"; then
+  if ! cargo rustc -p decentdb --lib --crate-type staticlib --target "$target" "${CARGO_PROFILE[@]}"; then
     echo "::warning::cargo rustc failed for $target, skipping $abi."
     return 1
   fi
