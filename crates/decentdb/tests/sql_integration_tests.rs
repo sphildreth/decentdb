@@ -145,6 +145,116 @@ fn read_executor_supports_joins_aggregates_row_number_and_explain() {
 }
 
 #[test]
+fn covering_index_projection_uses_include_payloads_and_safe_fallbacks() {
+    let path = unique_db_path("covering-index-projection");
+    let db = Db::create(&path, DbConfig::default()).expect("create database");
+
+    db.execute(
+        "CREATE TABLE users (\
+         id INT64 PRIMARY KEY, \
+         email TEXT NOT NULL, \
+         name TEXT NOT NULL, \
+         city TEXT NOT NULL\
+         )",
+    )
+    .expect("create users");
+    db.execute("CREATE INDEX users_email_cover ON users (email) INCLUDE (name)")
+        .expect("create covering index");
+    db.execute(
+        "INSERT INTO users (id, email, name, city) VALUES \
+         (1, 'ada@example.com', 'Ada', 'London'), \
+         (2, 'grace@example.com', 'Grace', 'Arlington')",
+    )
+    .expect("insert users");
+
+    let explain = db
+        .execute("EXPLAIN SELECT name FROM users WHERE email = 'ada@example.com'")
+        .expect("explain covered lookup");
+    assert!(
+        explain
+            .explain_lines()
+            .iter()
+            .any(|line| line.contains("CoveringIndexSeek(table=users, index=users_email_cover")),
+        "expected CoveringIndexSeek in {:?}",
+        explain.explain_lines()
+    );
+
+    let covered = db
+        .execute("SELECT name FROM users WHERE email = 'ada@example.com'")
+        .expect("covered lookup");
+    assert_eq!(
+        covered.rows()[0].values(),
+        &[Value::Text("Ada".to_string())]
+    );
+
+    db.execute("UPDATE users SET name = 'Ada Lovelace' WHERE id = 1")
+        .expect("update included payload");
+    let updated = db
+        .execute("SELECT name FROM users WHERE email = 'ada@example.com'")
+        .expect("covered lookup after include update");
+    assert_eq!(
+        updated.rows()[0].values(),
+        &[Value::Text("Ada Lovelace".to_string())]
+    );
+
+    db.execute(
+        "INSERT INTO users (id, email, name, city) VALUES \
+         (3, 'katherine@example.com', 'Katherine', 'White Sulphur Springs')",
+    )
+    .expect("insert after covering index");
+    let inserted = db
+        .execute("SELECT name FROM users WHERE email = 'katherine@example.com'")
+        .expect("covered lookup after insert");
+    assert_eq!(
+        inserted.rows()[0].values(),
+        &[Value::Text("Katherine".to_string())]
+    );
+
+    let fallback = db
+        .execute("EXPLAIN SELECT city FROM users WHERE email = 'ada@example.com'")
+        .expect("explain uncovered lookup");
+    assert!(
+        fallback
+            .explain_lines()
+            .iter()
+            .any(|line| line.contains("IndexSeek(table=users, index=users_email_cover")),
+        "expected non-covering IndexSeek in {:?}",
+        fallback.explain_lines()
+    );
+    assert!(
+        fallback
+            .explain_lines()
+            .iter()
+            .all(|line| !line.contains("CoveringIndexSeek")),
+        "uncovered projection must not use covering path: {:?}",
+        fallback.explain_lines()
+    );
+
+    db.execute("CREATE MASK user_name_mask ON users(name) USING 'masked'")
+        .expect("create mask");
+    let masked_explain = db
+        .execute("EXPLAIN SELECT name FROM users WHERE email = 'ada@example.com'")
+        .expect("explain masked lookup");
+    assert!(
+        masked_explain
+            .explain_lines()
+            .iter()
+            .all(|line| !line.contains("CoveringIndexSeek")),
+        "masked query must not explain covering path: {:?}",
+        masked_explain.explain_lines()
+    );
+    let masked = db
+        .execute("SELECT name FROM users WHERE email = 'ada@example.com'")
+        .expect("masked lookup");
+    assert_eq!(
+        masked.rows()[0].values(),
+        &[Value::Text("masked".to_string())]
+    );
+
+    cleanup_db(&path);
+}
+
+#[test]
 fn simple_filtered_projection_query_supports_range_order_and_limit() {
     let path = unique_db_path("phase3-simple-filtered-projection");
     let db = Db::create(&path, DbConfig::default()).expect("create database");

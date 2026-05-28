@@ -12,6 +12,11 @@ pub(crate) enum PhysicalPlan {
         index: String,
         predicate: Expr,
     },
+    CoveringIndexSeek {
+        table: String,
+        index: String,
+        predicate: Expr,
+    },
     RowIdLookup {
         table: String,
         column: String,
@@ -94,6 +99,14 @@ impl PhysicalPlan {
                 predicate,
             } => output.push(format!(
                 "{indent}IndexSeek(table={table}, index={index}, predicate={})",
+                predicate.to_sql()
+            )),
+            Self::CoveringIndexSeek {
+                table,
+                index,
+                predicate,
+            } => output.push(format!(
+                "{indent}CoveringIndexSeek(table={table}, index={index}, predicate={})",
                 predicate.to_sql()
             )),
             Self::RowIdLookup {

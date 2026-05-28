@@ -47,7 +47,9 @@ pub use crate::branch::{
 pub use crate::config::{
     DbConfig, DbEncryptionConfig, EncryptionKey, ProcessCoordinationMode, WalSyncMode,
 };
-pub use crate::db::{evict_shared_wal, Db, PreparedStatement, SqlTransaction};
+pub use crate::db::{
+    evict_shared_wal, Db, PreparedStatement, PreparedStatementBatch, SqlTransaction,
+};
 pub use crate::doctor::{
     render_markdown, run_doctor, sort_findings, DoctorCategory, DoctorCheckSelection,
     DoctorCollectedFacts, DoctorDatabaseSummary, DoctorEvidence, DoctorEvidenceValue,

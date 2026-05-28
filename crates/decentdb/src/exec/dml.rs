@@ -5,7 +5,8 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
 use crate::catalog::{
-    identifiers_equal, ColumnType, ForeignKeyAction, ForeignKeyConstraint, IndexKind, TriggerEvent,
+    identifiers_equal, ColumnType, ForeignKeyAction, ForeignKeyConstraint, IndexKind, TableSchema,
+    TriggerEvent,
 };
 use crate::error::{DbError, Result};
 use crate::record::key::encode_index_key;
@@ -20,10 +21,10 @@ use crate::sync::{self, SyncOperation};
 
 use super::row::{ColumnBinding, Dataset, QueryResult, QueryRow};
 use super::{
-    compare_values, compute_index_key, compute_index_values, generated_columns_are_stored,
-    row_satisfies_index_predicate, spatial_index_value_for_row, table_row_dataset, EngineRuntime,
-    RuntimeBtreeKey, RuntimeIndex, RuntimeRowIdSet, StoredRow, TablePageManifest, TableRowRef,
-    TableRowSource, PAGED_TABLE_RESIDENT_APPEND_ROW_THRESHOLD,
+    compare_values, compute_index_key, compute_index_values, covering_payload_values_for_row,
+    generated_columns_are_stored, row_satisfies_index_predicate, spatial_index_value_for_row,
+    table_row_dataset, EngineRuntime, RuntimeBtreeKey, RuntimeIndex, RuntimeRowIdSet, StoredRow,
+    TablePageManifest, TableRowRef, TableRowSource, PAGED_TABLE_RESIDENT_APPEND_ROW_THRESHOLD,
 };
 
 #[derive(Clone, Debug)]
@@ -39,6 +40,7 @@ pub(crate) struct PreparedBtreeIndex {
     pub(crate) name: String,
     pub(crate) column_indexes: Vec<usize>,
     pub(crate) int64_key: bool,
+    pub(crate) has_covering_payload: bool,
     pub(crate) nullable: bool,
     pub(crate) unique: bool,
 }
@@ -73,6 +75,7 @@ pub(crate) enum PreparedSimpleValueSource {
 #[derive(Clone, Debug)]
 pub(crate) struct PreparedSimpleInsert {
     pub(crate) table_name: String,
+    pub(crate) catalog_table_name: Option<String>,
     pub(crate) row_source_dependency_tables: Vec<String>,
     pub(crate) columns: Vec<PreparedInsertColumn>,
     pub(crate) primary_auto_row_id_column_index: Option<usize>,
@@ -686,6 +689,8 @@ impl EngineRuntime {
             insert_indexes.push(prepared_index);
         }
 
+        let table_is_temporary = self.visible_table_is_temporary(&statement.table_name);
+        let catalog_table_name = (!table_is_temporary).then(|| table.name.clone());
         let prepared_table_name = match super::compat_schema_qualified_name(&statement.table_name).0
         {
             Some(super::CompatSchemaQualifier::Main) => format!("main.{}", table.name),
@@ -694,6 +699,7 @@ impl EngineRuntime {
 
         Ok(Some(PreparedSimpleInsert {
             table_name: prepared_table_name,
+            catalog_table_name,
             row_source_dependency_tables,
             columns,
             primary_auto_row_id_column_index,
@@ -1055,7 +1061,7 @@ impl EngineRuntime {
                 if matches!(value, Value::Null) {
                     return Ok(QueryResult::with_affected_rows(0));
                 }
-                let Some(RuntimeIndex::Btree { keys }) = self.index(index_name) else {
+                let Some(RuntimeIndex::Btree { keys, .. }) = self.index(index_name) else {
                     return Ok(QueryResult::with_affected_rows(0));
                 };
                 row_id_set_to_vec(keys.row_ids_for_value_set(&value)?)
@@ -1196,63 +1202,20 @@ impl EngineRuntime {
         params: &[Value],
         page_size: u32,
     ) -> Result<QueryResult> {
-        let table_name = prepared.table_name.as_str();
-        let mut next_row_id = self
-            .table_schema(table_name)
-            .ok_or_else(|| DbError::sql(format!("unknown table {table_name}")))?
-            .next_row_id;
-        let mut candidate = Vec::with_capacity(prepared.columns.len());
-
-        for (index, source) in prepared.value_sources.iter().enumerate() {
-            let column = prepared.columns.get(index).ok_or_else(|| {
-                DbError::internal(format!(
-                    "prepared insert column index {index} is out of range for {table_name}"
-                ))
-            })?;
-            let mut value = match source {
-                PreparedInsertValueSource::Literal(value) => value.clone(),
-                PreparedInsertValueSource::Parameter(number) => params
-                    .get(number.saturating_sub(1))
-                    .cloned()
-                    .ok_or_else(|| DbError::sql(format!("parameter ${number} was not provided")))?,
-                PreparedInsertValueSource::DefaultExpr(expr) => self.eval_expr(
-                    expr,
-                    &Dataset::empty(),
-                    &[],
-                    params,
-                    &std::collections::BTreeMap::new(),
-                    None,
-                )?,
-                PreparedInsertValueSource::Null => Value::Null,
-            };
-
-            if column.auto_increment {
-                match value {
-                    Value::Null => {
-                        value = Value::Int64(next_row_id);
-                        next_row_id += 1;
-                    }
-                    Value::Int64(explicit) => {
-                        if explicit >= next_row_id {
-                            next_row_id = explicit + 1;
-                        }
-                    }
-                    _ => {
-                        return Err(DbError::constraint(format!(
-                            "auto-increment column {}.{} requires INT64 values",
-                            table_name, column.name
-                        )));
-                    }
-                }
-            }
-
-            candidate.push(super::cast_value(value, column.column_type)?);
-        }
-        let sync_schema = self
-            .table_schema(prepared.table_name.as_str())
-            .filter(|schema| !schema.temporary)
-            .filter(|schema| self.should_record_sync_mutation_for_table(schema))
-            .cloned();
+        let mut next_row_id = prepared_next_row_id(self, prepared)?;
+        let candidate = if prepared.direct_positional_param_count == Some(params.len()) {
+            materialize_direct_positional_insert_candidate(prepared, params, &mut next_row_id)?
+        } else {
+            materialize_prepared_insert_candidate(self, prepared, params, &mut next_row_id)?
+        };
+        let sync_schema = if self.mutation_capture_active() {
+            self.table_schema(prepared.table_name.as_str())
+                .filter(|schema| !schema.temporary)
+                .filter(|schema| self.should_record_sync_mutation_for_table(schema))
+                .cloned()
+        } else {
+            None
+        };
         let candidate_clone = sync_schema.as_ref().map(|_| candidate.clone());
         let affected = self.apply_prepared_simple_insert_candidate(
             prepared,
@@ -1285,10 +1248,7 @@ impl EngineRuntime {
         page_size: u32,
     ) -> Result<u64> {
         let table_name = prepared.table_name.as_str();
-        let mut next_row_id = self
-            .table_schema(table_name)
-            .ok_or_else(|| DbError::sql(format!("unknown table {table_name}")))?
-            .next_row_id;
+        let mut next_row_id = prepared_next_row_id(self, prepared)?;
         let mut candidate = Vec::with_capacity(prepared.columns.len());
 
         if params.len() < prepared.columns.len() {
@@ -1323,12 +1283,12 @@ impl EngineRuntime {
                     }
                 }
 
-                candidate.push(super::cast_value(value, column.column_type)?);
+                candidate.push(cast_prepared_owned_value(value, column.column_type)?);
             }
         } else {
             for (param, column) in params.iter_mut().zip(&prepared.columns) {
                 let value = std::mem::replace(param, Value::Null);
-                candidate.push(super::cast_value(value, column.column_type)?);
+                candidate.push(cast_prepared_owned_value(value, column.column_type)?);
             }
         }
 
@@ -1385,15 +1345,49 @@ impl EngineRuntime {
                 !prepared.use_generic_validation,
             )?;
         }
-        self.catalog_table_mut(table_name)
-            .ok_or_else(|| DbError::sql(format!("unknown table {table_name}")))?
-            .next_row_id = next_row_id;
-        self.append_owned_stored_row_to_table_row_source(table_name, stored_row, page_size)?;
+        if let Some(catalog_table_name) = prepared.catalog_table_name.as_deref() {
+            self.catalog_table_exact_mut(catalog_table_name)
+                .ok_or_else(|| DbError::sql(format!("unknown table {table_name}")))?
+                .next_row_id = next_row_id;
+            self.append_owned_stored_row_to_catalog_table_row_source(
+                catalog_table_name,
+                stored_row,
+                page_size,
+            )?;
+        } else {
+            self.catalog_table_mut(table_name)
+                .ok_or_else(|| DbError::sql(format!("unknown table {table_name}")))?
+                .next_row_id = next_row_id;
+            self.append_owned_stored_row_to_table_row_source(table_name, stored_row, page_size)?;
+        }
         if prepared.use_generic_index_updates {
             self.apply_insert_index_updates(index_updates)?;
         }
-        self.mark_table_row_appended(table_name);
+        if let Some(catalog_table_name) = prepared.catalog_table_name.as_deref() {
+            self.mark_catalog_table_row_appended(catalog_table_name);
+        } else {
+            self.mark_table_row_appended(table_name);
+        }
         Ok(1)
+    }
+
+    fn catalog_table_exact_mut(&mut self, table_name: &str) -> Option<&mut TableSchema> {
+        self.catalog_mut().tables.get_mut(table_name)
+    }
+
+    fn mark_catalog_table_row_appended(&mut self, table_name: &str) {
+        if let Some(delta) = self.paged_mutations.get_mut(table_name) {
+            delta.append_count += 1;
+            return;
+        }
+        if self.dirty_tables.contains(table_name) {
+            return;
+        }
+        self.dirty_tables_mut().insert(table_name.to_string());
+        self.paged_mutations
+            .entry(table_name.to_string())
+            .or_default()
+            .append_count += 1;
     }
 
     pub(crate) fn append_stored_row_to_table_row_source(
@@ -1419,6 +1413,37 @@ impl EngineRuntime {
         self.append_owned_stored_row_to_table_row_source_with_mode(
             table_name, stored_row, page_size, false,
         )
+    }
+
+    fn append_owned_stored_row_to_catalog_table_row_source(
+        &mut self,
+        table_name: &str,
+        stored_row: StoredRow,
+        page_size: u32,
+    ) -> Result<()> {
+        let use_paged_row_storage = self.paged_row_storage;
+        let Some(row_source) = self.tables_mut().get_mut(table_name) else {
+            return Err(DbError::internal(format!(
+                "table row source for {table_name} is missing"
+            )));
+        };
+        match row_source {
+            TableRowSource::Resident(data) => {
+                let data = Arc::make_mut(data);
+                data.rows.push(stored_row);
+                if use_paged_row_storage
+                    && data.rows.len() >= PAGED_TABLE_RESIDENT_APPEND_ROW_THRESHOLD
+                {
+                    *row_source = TableRowSource::Paged(Arc::new(TablePageManifest::from_rows(
+                        &data.rows, page_size,
+                    )?));
+                }
+                Ok(())
+            }
+            TableRowSource::Paged(manifest) => {
+                Arc::make_mut(manifest).append_row(&stored_row, page_size)
+            }
+        }
     }
 
     fn append_stored_row_to_table_row_source_preserving_paged(
@@ -3284,6 +3309,7 @@ fn prepare_btree_insert_index(
         name: index.name.clone(),
         column_indexes,
         int64_key,
+        has_covering_payload: !index.include_columns.is_empty(),
         nullable: index.columns.iter().any(|column| {
             column
                 .column_name
@@ -3392,7 +3418,7 @@ fn validate_prepared_insert(
                 continue;
             }
             let key = prepared_btree_index_key(index, row)?;
-            let Some(super::RuntimeIndex::Btree { keys }) = runtime.index(&index.name) else {
+            let Some(super::RuntimeIndex::Btree { keys, .. }) = runtime.index(&index.name) else {
                 return Err(DbError::internal(format!(
                     "runtime index {} is missing",
                     index.name
@@ -3422,7 +3448,7 @@ fn validate_prepared_insert(
         {
             continue;
         }
-        let Some(super::RuntimeIndex::Btree { keys }) =
+        let Some(super::RuntimeIndex::Btree { keys, .. }) =
             runtime.index(&foreign_key.parent_index_name)
         else {
             return Err(DbError::internal(format!(
@@ -3490,12 +3516,244 @@ fn validate_prepared_insert(
     Ok(())
 }
 
+fn prepared_next_row_id(runtime: &EngineRuntime, prepared: &PreparedSimpleInsert) -> Result<i64> {
+    if let Some(table_name) = prepared.catalog_table_name.as_deref() {
+        return runtime
+            .catalog
+            .tables
+            .get(table_name)
+            .map(|table| table.next_row_id)
+            .ok_or_else(|| DbError::sql(format!("unknown table {}", prepared.table_name)));
+    }
+    runtime
+        .table_schema(prepared.table_name.as_str())
+        .map(|table| table.next_row_id)
+        .ok_or_else(|| DbError::sql(format!("unknown table {}", prepared.table_name)))
+}
+
+fn materialize_prepared_insert_candidate(
+    runtime: &EngineRuntime,
+    prepared: &PreparedSimpleInsert,
+    params: &[Value],
+    next_row_id: &mut i64,
+) -> Result<Vec<Value>> {
+    let table_name = prepared.table_name.as_str();
+    let mut candidate = Vec::with_capacity(prepared.columns.len());
+    for (index, source) in prepared.value_sources.iter().enumerate() {
+        let column = prepared.columns.get(index).ok_or_else(|| {
+            DbError::internal(format!(
+                "prepared insert column index {index} is out of range for {table_name}"
+            ))
+        })?;
+        let mut value = match source {
+            PreparedInsertValueSource::Literal(value) => value.clone(),
+            PreparedInsertValueSource::Parameter(number) => params
+                .get(number.saturating_sub(1))
+                .cloned()
+                .ok_or_else(|| DbError::sql(format!("parameter ${number} was not provided")))?,
+            PreparedInsertValueSource::DefaultExpr(expr) => runtime.eval_expr(
+                expr,
+                &Dataset::empty(),
+                &[],
+                params,
+                &std::collections::BTreeMap::new(),
+                None,
+            )?,
+            PreparedInsertValueSource::Null => Value::Null,
+        };
+
+        if column.auto_increment {
+            match value {
+                Value::Null => {
+                    value = Value::Int64(*next_row_id);
+                    *next_row_id += 1;
+                }
+                Value::Int64(explicit) => {
+                    if explicit >= *next_row_id {
+                        *next_row_id = explicit + 1;
+                    }
+                }
+                _ => {
+                    return Err(DbError::constraint(format!(
+                        "auto-increment column {}.{} requires INT64 values",
+                        table_name, column.name
+                    )));
+                }
+            }
+        }
+
+        candidate.push(cast_prepared_owned_value(value, column.column_type)?);
+    }
+    Ok(candidate)
+}
+
+fn materialize_direct_positional_insert_candidate(
+    prepared: &PreparedSimpleInsert,
+    params: &[Value],
+    next_row_id: &mut i64,
+) -> Result<Vec<Value>> {
+    if params.len() < prepared.columns.len() {
+        return Err(DbError::sql(format!(
+            "prepared insert expected {} parameters but received {}",
+            prepared.columns.len(),
+            params.len()
+        )));
+    }
+
+    let table_name = prepared.table_name.as_str();
+    let mut candidate = Vec::with_capacity(prepared.columns.len());
+    for (param, column) in params.iter().zip(&prepared.columns) {
+        if column.auto_increment {
+            match param {
+                Value::Null => {
+                    candidate.push(Value::Int64(*next_row_id));
+                    *next_row_id += 1;
+                }
+                Value::Int64(explicit) => {
+                    if *explicit >= *next_row_id {
+                        *next_row_id = explicit + 1;
+                    }
+                    candidate.push(Value::Int64(*explicit));
+                }
+                _ => {
+                    return Err(DbError::constraint(format!(
+                        "auto-increment column {}.{} requires INT64 values",
+                        table_name, column.name
+                    )));
+                }
+            }
+            continue;
+        }
+
+        candidate.push(cast_prepared_param_value(param, column.column_type)?);
+    }
+    Ok(candidate)
+}
+
+fn cast_prepared_param_value(value: &Value, target_type: ColumnType) -> Result<Value> {
+    if matches!(value, Value::Null) {
+        return Ok(Value::Null);
+    }
+    match (value, target_type) {
+        (Value::Int64(value), ColumnType::Int64) => Ok(Value::Int64(*value)),
+        (Value::Float64(value), ColumnType::Float64) => Ok(Value::Float64(*value)),
+        (Value::Text(value), ColumnType::Text) => Ok(Value::Text(value.clone())),
+        (Value::Bool(value), ColumnType::Bool) => Ok(Value::Bool(*value)),
+        (Value::Blob(value), ColumnType::Blob) => Ok(Value::Blob(value.clone())),
+        (Value::Decimal { scaled, scale }, ColumnType::Decimal) => Ok(Value::Decimal {
+            scaled: *scaled,
+            scale: *scale,
+        }),
+        (Value::Uuid(value), ColumnType::Uuid) => Ok(Value::Uuid(*value)),
+        (Value::TimestampMicros(value), ColumnType::Timestamp) => {
+            Ok(Value::TimestampMicros(*value))
+        }
+        (Value::DateDays(value), ColumnType::Date) => Ok(Value::DateDays(*value)),
+        (Value::TimeMicros(value), ColumnType::Time) => Ok(Value::TimeMicros(*value)),
+        (Value::TimestampTzMicros(value), ColumnType::TimestampTz) => {
+            Ok(Value::TimestampTzMicros(*value))
+        }
+        (
+            Value::Interval {
+                months,
+                days,
+                micros,
+            },
+            ColumnType::Interval,
+        ) => Ok(Value::Interval {
+            months: *months,
+            days: *days,
+            micros: *micros,
+        }),
+        (Value::IpAddr { family, addr }, ColumnType::IpAddr) => Ok(Value::IpAddr {
+            family: *family,
+            addr: *addr,
+        }),
+        (
+            Value::Cidr {
+                family,
+                prefix_len,
+                network,
+            },
+            ColumnType::Cidr,
+        ) => Ok(Value::Cidr {
+            family: *family,
+            prefix_len: *prefix_len,
+            network: *network,
+        }),
+        (Value::MacAddr { len, bytes }, ColumnType::MacAddr) => Ok(Value::MacAddr {
+            len: *len,
+            bytes: *bytes,
+        }),
+        (Value::Geometry(value), ColumnType::Geometry) => Ok(Value::Geometry(value.clone())),
+        (Value::Geography(value), ColumnType::Geography) => Ok(Value::Geography(value.clone())),
+        (
+            Value::Enum {
+                enum_type_id,
+                label_id,
+            },
+            ColumnType::Enum,
+        ) => Ok(Value::Enum {
+            enum_type_id: *enum_type_id,
+            label_id: *label_id,
+        }),
+        _ => super::cast_value(value.clone(), target_type),
+    }
+}
+
+fn cast_prepared_owned_value(value: Value, target_type: ColumnType) -> Result<Value> {
+    if value_matches_column_type(&value, target_type) {
+        Ok(value)
+    } else {
+        super::cast_value(value, target_type)
+    }
+}
+
+fn value_matches_column_type(value: &Value, target_type: ColumnType) -> bool {
+    matches!(value, Value::Null)
+        || matches!(
+            (value, target_type),
+            (Value::Int64(_), ColumnType::Int64)
+                | (Value::Float64(_), ColumnType::Float64)
+                | (Value::Text(_), ColumnType::Text)
+                | (Value::Bool(_), ColumnType::Bool)
+                | (Value::Blob(_), ColumnType::Blob)
+                | (Value::Decimal { .. }, ColumnType::Decimal)
+                | (Value::Uuid(_), ColumnType::Uuid)
+                | (Value::TimestampMicros(_), ColumnType::Timestamp)
+                | (Value::DateDays(_), ColumnType::Date)
+                | (Value::TimeMicros(_), ColumnType::Time)
+                | (Value::TimestampTzMicros(_), ColumnType::TimestampTz)
+                | (Value::Interval { .. }, ColumnType::Interval)
+                | (Value::IpAddr { .. }, ColumnType::IpAddr)
+                | (Value::Cidr { .. }, ColumnType::Cidr)
+                | (Value::MacAddr { .. }, ColumnType::MacAddr)
+                | (Value::Geometry(_), ColumnType::Geometry)
+                | (Value::Geography(_), ColumnType::Geography)
+                | (Value::Enum { .. }, ColumnType::Enum)
+        )
+}
+
 fn apply_prepared_insert_index_updates(
     runtime: &mut EngineRuntime,
     prepared: &PreparedSimpleInsert,
     row: &StoredRow,
     check_unique: bool,
 ) -> Result<()> {
+    let table = if prepared
+        .insert_indexes
+        .iter()
+        .any(|index| index.has_covering_payload)
+    {
+        Some(
+            runtime
+                .table_schema(&prepared.table_name)
+                .cloned()
+                .ok_or_else(|| DbError::sql(format!("unknown table {}", prepared.table_name)))?,
+        )
+    } else {
+        None
+    };
     for index in &prepared.insert_indexes {
         if index.int64_key {
             let [column_index] = index.column_indexes.as_slice() else {
@@ -3512,7 +3770,20 @@ fn apply_prepared_insert_index_updates(
                     "typed INT64 prepared index expected an INT64 value",
                 ));
             };
-            let Some(super::RuntimeIndex::Btree { keys }) = runtime.index_mut(&index.name) else {
+            let covering_values = if let Some(table) = table.as_ref() {
+                runtime
+                    .catalog
+                    .indexes
+                    .get(&index.name)
+                    .and_then(|index_schema| {
+                        covering_payload_values_for_row(index_schema, table, &row.values)
+                    })
+            } else {
+                None
+            };
+            let Some(super::RuntimeIndex::Btree { keys, covering }) =
+                runtime.index_mut(&index.name)
+            else {
                 return Err(DbError::internal(format!(
                     "runtime index {} is missing",
                     index.name
@@ -3544,6 +3815,9 @@ fn apply_prepared_insert_index_updates(
                     )))
                 }
             }
+            if let (Some(covering), Some(values)) = (covering.as_mut(), covering_values) {
+                covering.insert_row_values(row.row_id, values);
+            }
             continue;
         }
 
@@ -3551,7 +3825,19 @@ fn apply_prepared_insert_index_updates(
             continue;
         }
         let key = prepared_btree_index_key(index, &row.values)?;
-        let Some(super::RuntimeIndex::Btree { keys }) = runtime.index_mut(&index.name) else {
+        let covering_values = if let Some(table) = table.as_ref() {
+            runtime
+                .catalog
+                .indexes
+                .get(&index.name)
+                .and_then(|index_schema| {
+                    covering_payload_values_for_row(index_schema, table, &row.values)
+                })
+        } else {
+            None
+        };
+        let Some(super::RuntimeIndex::Btree { keys, covering }) = runtime.index_mut(&index.name)
+        else {
             return Err(DbError::internal(format!(
                 "runtime index {} is missing",
                 index.name
@@ -3564,9 +3850,15 @@ fn apply_prepared_insert_index_updates(
                     index.name, prepared.table_name
                 )));
             }
+            if let (Some(covering), Some(values)) = (covering.as_mut(), covering_values) {
+                covering.insert_row_values(row.row_id, values);
+            }
             continue;
         }
         keys.insert_row_id(key, row.row_id)?;
+        if let (Some(covering), Some(values)) = (covering.as_mut(), covering_values) {
+            covering.insert_row_values(row.row_id, values);
+        }
     }
     Ok(())
 }
@@ -3782,7 +4074,7 @@ fn indexed_row_ids_for_filter(
     }) else {
         return Ok(None);
     };
-    let Some(RuntimeIndex::Btree { keys }) = runtime.index(&index.name) else {
+    let Some(RuntimeIndex::Btree { keys, .. }) = runtime.index(&index.name) else {
         return Ok(None);
     };
     if matches!(
@@ -3963,7 +4255,7 @@ fn prepared_delete_has_referencing_child(
         return Ok(false);
     }
     if let Some(index_name) = &child.child_index_name {
-        let Some(RuntimeIndex::Btree { keys }) = runtime.index(index_name) else {
+        let Some(RuntimeIndex::Btree { keys, .. }) = runtime.index(index_name) else {
             return Ok(false);
         };
         if parent_values.len() == 1 {
@@ -4007,10 +4299,17 @@ fn apply_runtime_index_update_for_row_change(
         IndexKind::Btree => {
             let old_key = compute_index_key(runtime, index, table, old_row_values)?;
             let new_key = compute_index_key(runtime, index, table, new_row_values)?;
+            let covering_values = covering_payload_values_for_row(index, table, new_row_values);
             if old_key == new_key {
+                if let Some(RuntimeIndex::Btree { covering, .. }) = runtime.index_mut(&index.name) {
+                    if let (Some(covering), Some(values)) = (covering.as_mut(), covering_values) {
+                        covering.insert_row_values(row_id, values);
+                    }
+                }
                 return Ok(true);
             }
-            let Some(RuntimeIndex::Btree { keys }) = runtime.index_mut(&index.name) else {
+            let Some(RuntimeIndex::Btree { keys, covering }) = runtime.index_mut(&index.name)
+            else {
                 return Ok(false);
             };
             if let Some(old_key) = old_key.as_ref() {
@@ -4018,6 +4317,11 @@ fn apply_runtime_index_update_for_row_change(
             }
             if let Some(new_key) = new_key {
                 keys.insert_row_id(new_key, row_id)?;
+                if let (Some(covering), Some(values)) = (covering.as_mut(), covering_values) {
+                    covering.insert_row_values(row_id, values);
+                }
+            } else if let Some(covering) = covering.as_mut() {
+                covering.remove_row_id(row_id);
             }
             Ok(true)
         }
@@ -4087,11 +4391,15 @@ fn apply_runtime_index_delete_for_row(
     match index.kind {
         IndexKind::Btree => {
             let key = compute_index_key(runtime, index, table, row_values)?;
-            let Some(RuntimeIndex::Btree { keys }) = runtime.index_mut(&index.name) else {
+            let Some(RuntimeIndex::Btree { keys, covering }) = runtime.index_mut(&index.name)
+            else {
                 return Ok(false);
             };
             if let Some(key) = key.as_ref() {
                 keys.remove_row_id(key, row_id)?;
+            }
+            if let Some(covering) = covering.as_mut() {
+                covering.remove_row_id(row_id);
             }
             Ok(true)
         }
@@ -4455,7 +4763,7 @@ fn fk_matching_row_ids_via_index(
     else {
         return Ok(None);
     };
-    let Some(RuntimeIndex::Btree { keys }) = runtime.index(&index.name) else {
+    let Some(RuntimeIndex::Btree { keys, .. }) = runtime.index(&index.name) else {
         return Ok(None);
     };
     if foreign_key.columns.len() == 1 {
@@ -4549,9 +4857,22 @@ fn index_might_change_for_assignments(
     else {
         return true;
     };
-    assignment_columns
+    let Some(include_columns) = index
+        .include_columns
         .iter()
-        .any(|column_index| indexed_columns.contains(column_index))
+        .map(|name| {
+            table
+                .columns
+                .iter()
+                .position(|entry| identifiers_equal(&entry.name, name))
+        })
+        .collect::<Option<Vec<_>>>()
+    else {
+        return true;
+    };
+    assignment_columns.iter().any(|column_index| {
+        indexed_columns.contains(column_index) || include_columns.contains(column_index)
+    })
 }
 
 fn assignment_targets_foreign_key_columns(
@@ -4754,6 +5075,7 @@ mod tests {
             name: "i".to_string(),
             column_indexes: vec![1],
             int64_key: false,
+            has_covering_payload: false,
             nullable: true,
             unique: false,
         };
@@ -4764,6 +5086,7 @@ mod tests {
             name: "i2".to_string(),
             column_indexes: vec![0],
             int64_key: true,
+            has_covering_payload: false,
             nullable: false,
             unique: false,
         };
@@ -4774,6 +5097,7 @@ mod tests {
             name: "i3".to_string(),
             column_indexes: vec![0],
             int64_key: false,
+            has_covering_payload: false,
             nullable: false,
             unique: false,
         };
@@ -5257,6 +5581,7 @@ mod tests {
             "child_parent_fk_idx".to_string(),
             Arc::new(RuntimeIndex::Btree {
                 keys: super::super::RuntimeBtreeKeys::NonUniqueEncoded(entries),
+                covering: None,
             }),
         );
 
@@ -5431,6 +5756,7 @@ mod tests {
             "child_parent_fk_idx".to_string(),
             Arc::new(RuntimeIndex::Btree {
                 keys: super::super::RuntimeBtreeKeys::NonUniqueEncoded(entries),
+                covering: None,
             }),
         );
 
@@ -6471,6 +6797,7 @@ mod dml_private_tests {
             name: "i".to_string(),
             column_indexes: vec![0],
             int64_key: true,
+            has_covering_payload: false,
             nullable: true,
             unique: false,
         };
@@ -6486,6 +6813,7 @@ mod dml_private_tests {
             name: "e".to_string(),
             column_indexes: vec![0],
             int64_key: false,
+            has_covering_payload: false,
             nullable: false,
             unique: false,
         };
@@ -6500,6 +6828,7 @@ mod dml_private_tests {
             name: "m".to_string(),
             column_indexes: vec![0, 1],
             int64_key: false,
+            has_covering_payload: false,
             nullable: false,
             unique: false,
         };

@@ -48,9 +48,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added Dart sync JSON/public changeset wrappers, including status/init,
   changeset create/inspect/apply/invert, and `applyBeforeAck` ordering for
   relay clients.
+- Added default-fast benchmark/profile assets: canonical
+  `decentdb_balanced_durable`, `decentdb_low_memory_durable`,
+  `decentdb_tuned_durable`, and `duckdb_engine_default` labels; storage split
+  fields; cold-state metadata; H2/HSQLDB partial labeling; and Python binding
+  prepared-statement/result-materialization benchmark slices.
+- Added prepared INSERT fast-path coverage for supported direct/default write
+  shapes, including routing that avoids unnecessary covering-index payload work,
+  deferred table materialization that preserves valid index state, and scalar
+  integer aggregate support that scans persisted payload columns without forcing
+  full row materialization.
+- Added parser-bypass fast paths for plain persistent-table `COUNT(*)` reads and
+  integer primary-key projection reads so default rust-baseline count and
+  single-row lookup slices stay on metadata/row-id lookup paths.
+- Added runtime-only covering-index execution for safe B+Tree `INCLUDE (...)`
+  projections, including `EXPLAIN` reporting and conservative fallback when
+  projections are not covered or security rules are active.
+- Added `SqlTransaction::prepared_batch` and `PreparedStatementBatch` for Rust
+  callers that repeatedly execute one prepared statement inside an exclusive
+  transaction; simple positional INSERT batches validate and resolve the fast
+  path once, then refill a mutable parameter buffer per row.
 
 ### Changed
 
+- Kept release-facing benchmark charts on the controlled 2026-05-22 snapshot
+  while the new profile-aware benchmark harness is staged; local diagnostic runs
+  no longer replace the checked-in comparison asset, and H2/HSQLDB read-only
+  partial comparison rows remain visible in the chart.
 - Bumped the C ABI version to 6 for the new audit-context entry points and TDE
   open options, and updated the Dart ABI expectation/header copies.
 - Extended the Rust library crate outputs with `staticlib` for iOS XCFramework
@@ -70,6 +94,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   matching, trigram candidate pushdown for safe substring searches, bulk
   trigram index construction, and chunk-targeted `INTEGER PRIMARY KEY` lookups
   that avoid reconstructing a full paged table manifest.
+- Kept the default durable cache at the historical 4 MiB after executor
+  fast-path fixes recovered read headroom without raising the default cache,
+  added explicit
+  `DbConfig::balanced()` (16 MiB),
+  `DbConfig::low_memory()` (4 MiB), and `DbConfig::tuned_durable()` helpers, and
+  stopped the CLI `exec` command from overriding caller-selected cache options.
+- Reduced default open and commit overhead by lazily starting the background
+  checkpoint worker, lazily creating reactive subscription hubs, treating the
+  coordination sidecar as rebuildable metadata during create/open, keeping
+  writer-owner diagnostics in memory for default `auto` coordination, and
+  avoiding redundant coordination-header reads/locks after publish operations,
+  plus skipping no-op backfill/snapshot-retention maintenance when a newly
+  created database still has schema cookie `0`, while preserving the byte-range
+  process lock.
+- Tightened the Rust rust-baseline benchmark runner so schema setup uses one
+  explicit durable transaction for the same DDL, seed slices use mutable
+  prepared insert buffers through transaction-scoped prepared batches without
+  prepare time in the measured section, unused seed-walk payloads are not
+  constructed, and release builds use full LTO, stripped symbols, and
+  abort-on-panic. The final smoke/medium/full/huge
+  comparison against `benchmarks/rust-baseline/results` is green across every
+  recorded step, total runtime, peak RSS, database size, and WAL size metric.
+- Promoted the default-fast performance/storage-efficiency Future Win from the
+  roadmap to delivered context; follow-on performance work is now scoped to
+  measured evidence outside this completed baseline.
 - Promoted the browser Future Win from roadmap item to delivered context in
   `design/FUTURE_WINS.md`; follow-on browser work is now scoped to measured
   parser breadth, security key handling, branch workflows, or performance.

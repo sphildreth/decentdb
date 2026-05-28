@@ -553,7 +553,7 @@ fn unique_index_row_ids(
     if !index.fresh || index.kind != IndexKind::Btree {
         return Ok(None);
     }
-    let Some(RuntimeIndex::Btree { keys }) = runtime.index(&index.name) else {
+    let Some(RuntimeIndex::Btree { keys, .. }) = runtime.index(&index.name) else {
         return Ok(None);
     };
     let Some(key) = super::compute_index_key(runtime, index, table, row)? else {
@@ -697,7 +697,7 @@ fn parent_exists_via_single_or_composite_index(
     else {
         return Ok(None);
     };
-    let Some(RuntimeIndex::Btree { keys }) = runtime.index(&index.name) else {
+    let Some(RuntimeIndex::Btree { keys, .. }) = runtime.index(&index.name) else {
         return Ok(None);
     };
     let matched_row_ids = if child_values.len() == 1 {
@@ -961,6 +961,7 @@ mod tests {
             "parent_ab_unique".to_string(),
             Arc::new(RuntimeIndex::Btree {
                 keys: super::super::RuntimeBtreeKeys::UniqueEncoded(entries),
+                covering: None,
             }),
         );
         runtime.tables_mut().insert(

@@ -38,6 +38,12 @@ from scenarios.canonical_workloads import get_workload, WORKLOADS
 from utils.dataset_generator import DatasetGenerator, GeneratorConfig
 
 
+@pytest.fixture
+def temp_db_path(tmp_path):
+    """Reusable temporary SQLite database path for smoke tests."""
+    return str(tmp_path / "test.db")
+
+
 class TestSmokeSQLite:
     """Smoke test for SQLite driver."""
 
@@ -188,6 +194,36 @@ class TestWorkloads:
         assert "workload_a" in WORKLOADS
         assert "workload_b" in WORKLOADS
         assert "workload_c" in WORKLOADS
+
+    def test_workload_c_prepared_statement_and_materialization(self, temp_db_path):
+        """Binding workload should run prepared statement and materialization slices."""
+        driver = SQLiteDriver({"database_path": temp_db_path})
+        workload = get_workload("workload_c")
+
+        assert driver.connect()
+        driver.create_schema(workload.get_schema_sql())
+
+        generator = DatasetGenerator(
+            GeneratorConfig(seed=2024, customers_n=16, orders_n=64, events_n=0)
+        )
+        customers, orders, events = generator.generate()
+        workload.load_data(driver, customers, orders, events, transaction_mode="batched")
+
+        prepared_result = workload.run_prepared_statement_roundtrip(
+            driver, operations=25, warmup=5
+        )
+        assert prepared_result.operations == 25
+        assert prepared_result.benchmark_name == "prepared_statement_roundtrip"
+        assert prepared_result.errors == 0
+
+        materialization_result = workload.run_result_materialization(
+            driver, operations=25, warmup=5
+        )
+        assert materialization_result.benchmark_name == "result_materialization"
+        assert materialization_result.operations == 25
+        assert materialization_result.errors == 0
+
+        driver.disconnect()
 
 
 class TestJdbcDriverConfig:

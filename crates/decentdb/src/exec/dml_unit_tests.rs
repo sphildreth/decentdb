@@ -214,6 +214,101 @@ mod tests {
     }
 
     #[test]
+    fn prepared_simple_insert_direct_params_update_explicit_auto_row_id() {
+        let mut runtime = EngineRuntime::empty(1);
+        runtime.catalog_mut().tables.insert(
+            "t".to_string(),
+            crate::catalog::TableSchema {
+                name: "t".to_string(),
+                temporary: false,
+                columns: vec![
+                    crate::catalog::ColumnSchema {
+                        name: "id".to_string(),
+                        column_type: crate::catalog::ColumnType::Int64,
+                        spatial_type: None,
+                        enum_type: None,
+                        nullable: false,
+                        default_sql: None,
+                        generated_sql: None,
+                        generated_stored: false,
+                        primary_key: true,
+                        unique: false,
+                        auto_increment: true,
+                        checks: vec![],
+                        foreign_key: None,
+                    },
+                    crate::catalog::ColumnSchema {
+                        name: "name".to_string(),
+                        column_type: crate::catalog::ColumnType::Text,
+                        spatial_type: None,
+                        enum_type: None,
+                        nullable: false,
+                        default_sql: None,
+                        generated_sql: None,
+                        generated_stored: false,
+                        primary_key: false,
+                        unique: false,
+                        auto_increment: false,
+                        checks: vec![],
+                        foreign_key: None,
+                    },
+                ],
+                checks: vec![],
+                foreign_keys: vec![],
+                primary_key_columns: vec!["id".to_string()],
+                next_row_id: 1,
+                pk_index_root: None,
+            },
+        );
+        runtime.tables_mut().insert(
+            "t".to_string(),
+            TableRowSource::Resident(Arc::new(TableData::from_rows(Vec::new()))),
+        );
+
+        let stmt =
+            parse_sql_statement("INSERT INTO t (id, name) VALUES ($1, $2)").expect("parse insert");
+        let Statement::Insert(insert) = stmt else {
+            panic!("expected insert");
+        };
+        let prepared = runtime
+            .prepare_simple_insert(&insert)
+            .expect("prepare insert")
+            .expect("simple insert");
+        assert_eq!(prepared.direct_positional_param_count, Some(2));
+        assert!(prepared.has_auto_increment);
+
+        runtime
+            .execute_prepared_simple_insert(
+                &prepared,
+                &[Value::Int64(42), Value::Text("explicit".to_string())],
+                4096,
+            )
+            .expect("execute explicit insert");
+        runtime
+            .execute_prepared_simple_insert(
+                &prepared,
+                &[Value::Null, Value::Text("default".to_string())],
+                4096,
+            )
+            .expect("execute default insert");
+
+        assert_eq!(
+            runtime
+                .catalog
+                .tables
+                .get("t")
+                .expect("table schema")
+                .next_row_id,
+            44
+        );
+        let rows = &runtime.table_data("t").expect("table data").rows;
+        assert_eq!(rows[0].row_id, 42);
+        assert_eq!(rows[0].values[0], Value::Int64(42));
+        assert_eq!(rows[1].row_id, 43);
+        assert_eq!(rows[1].values[0], Value::Int64(43));
+    }
+
+    #[test]
     fn resident_prepared_simple_insert_keeps_table_data_arc_stable() {
         let mut runtime = EngineRuntime::empty(1);
         runtime.catalog_mut().tables.insert(
@@ -329,6 +424,7 @@ mod tests {
 
         let prepared = PreparedSimpleInsert {
             table_name: "t".to_string(),
+            catalog_table_name: Some("t".to_string()),
             row_source_dependency_tables: vec![],
             columns: vec![],
             primary_auto_row_id_column_index: None,
@@ -944,6 +1040,7 @@ mod tests {
             "parent_ab_unique".to_string(),
             Arc::new(RuntimeIndex::Btree {
                 keys: RuntimeBtreeKeys::UniqueEncoded(BTreeMap::new()),
+                covering: None,
             }),
         );
 
@@ -1116,6 +1213,7 @@ mod tests {
             "parent_ab_unique".to_string(),
             Arc::new(RuntimeIndex::Btree {
                 keys: RuntimeBtreeKeys::UniqueEncoded(parent_index_entries),
+                covering: None,
             }),
         );
         runtime.tables_mut().insert(

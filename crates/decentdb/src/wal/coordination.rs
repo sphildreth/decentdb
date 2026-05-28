@@ -509,7 +509,7 @@ impl ProcessCoordinator {
         &self,
         wal_end_lsn: u64,
         checkpoint_lsn: u64,
-    ) -> Result<()> {
+    ) -> Result<CoordinationHeaderSnapshot> {
         let _meta = lock_range_with_timeout(
             self.inner.file.as_ref(),
             META_LOCK_OFFSET,
@@ -526,40 +526,39 @@ impl ProcessCoordinator {
             header.coordinator_generation = header.coordinator_generation.saturating_add(1);
             header.wal_generation = header.wal_generation.saturating_add(1);
         }
-        self.write_header(&header)
+        self.write_header(&header)?;
+        Ok(header)
     }
 
-    pub(crate) fn publish_commit(&self, wal_end_lsn: u64) -> Result<()> {
-        let _meta = lock_range_with_timeout(
-            self.inner.file.as_ref(),
-            META_LOCK_OFFSET,
-            1,
-            true,
-            self.inner.timeout,
-        )?;
+    pub(crate) fn publish_commit(&self, wal_end_lsn: u64) -> Result<CoordinationHeaderSnapshot> {
+        // The caller holds the process writer lock. That lock is already the
+        // cross-process serialization point for committed WAL publication, so
+        // taking the metadata byte lock again only adds a syscall to every
+        // durable commit.
         let mut header = self.read_header()?;
         self.validate_header_identity(&header)?;
         header.coordinator_generation = header.coordinator_generation.saturating_add(1);
         header.wal_generation = header.wal_generation.saturating_add(1);
         header.wal_end_lsn = wal_end_lsn;
-        self.write_header(&header)
+        self.write_header(&header)?;
+        Ok(header)
     }
 
-    pub(crate) fn publish_checkpoint(&self, checkpoint_lsn: u64, wal_end_lsn: u64) -> Result<()> {
-        let _meta = lock_range_with_timeout(
-            self.inner.file.as_ref(),
-            META_LOCK_OFFSET,
-            1,
-            true,
-            self.inner.timeout,
-        )?;
+    pub(crate) fn publish_checkpoint(
+        &self,
+        checkpoint_lsn: u64,
+        wal_end_lsn: u64,
+    ) -> Result<CoordinationHeaderSnapshot> {
+        // The caller holds the process checkpoint lock (same underlying
+        // writer byte-range lock), which serializes checkpoint publication.
         let mut header = self.read_header()?;
         self.validate_header_identity(&header)?;
         header.coordinator_generation = header.coordinator_generation.saturating_add(1);
         header.checkpoint_generation = header.checkpoint_generation.saturating_add(1);
         header.checkpoint_lsn = checkpoint_lsn;
         header.wal_end_lsn = wal_end_lsn;
-        self.write_header(&header)
+        self.write_header(&header)?;
+        Ok(header)
     }
 
     fn lock_writer_inner(&self, checkpoint: bool) -> Result<ProcessWriterGuard> {
@@ -601,9 +600,14 @@ impl ProcessCoordinator {
         };
         self.record_lock_wait(checkpoint);
         HELD_WRITER_LOCKS.with(|held| {
-            held.borrow_mut().insert(key, 1);
+            held.borrow_mut().insert(key.clone(), 1);
         });
-        self.publish_writer_owner(true)?;
+        if let Err(error) = self.publish_writer_owner_if_required(true) {
+            HELD_WRITER_LOCKS.with(|held| {
+                held.borrow_mut().remove(&key);
+            });
+            return Err(error);
+        }
         Ok(ProcessWriterGuard {
             coordinator: self.clone(),
             owned_lock: true,
@@ -619,22 +623,34 @@ impl ProcessCoordinator {
             true,
             self.inner.timeout,
         )?;
+        let min_len = HEADER_LEN + u64::from(READER_SLOT_COUNT) * READER_SLOT_LEN;
+        let file_len = self.inner.file.file_size()?;
+        let header = self.initial_header();
+        if file_len == 0 {
+            self.inner.file.set_len(min_len)?;
+            self.write_header(&header)?;
+            self.clear_all_reader_slots_bulk()?;
+            return Ok(());
+        }
+
         let rebuild = match self.read_header() {
             Ok(header) => self.validate_header_identity(&header).is_err(),
             Err(_) => true,
         };
         if rebuild {
-            self.inner.file.set_len(HEADER_LEN)?;
-            let header = self.initial_header();
+            self.inner.file.set_len(min_len)?;
             self.write_header(&header)?;
-            self.clear_all_reader_slots()?;
+            self.clear_all_reader_slots_bulk()?;
         } else {
-            let min_len = HEADER_LEN + u64::from(READER_SLOT_COUNT) * READER_SLOT_LEN;
-            if self.inner.file.file_size()? < min_len {
+            if file_len < min_len {
                 self.inner.file.set_len(min_len)?;
             }
         }
-        self.inner.file.sync_metadata()
+        // The coordination sidecar contains live-process coordination state,
+        // not authoritative database content. If a crash loses a create or
+        // rebuild here, the next opener reconstructs it from the durable
+        // database header and WAL.
+        Ok(())
     }
 
     fn initial_header(&self) -> CoordinationHeaderSnapshot {
@@ -705,25 +721,48 @@ impl ProcessCoordinator {
     }
 
     fn clear_reader_slot(&self, slot: u16) -> Result<()> {
-        self.write_reader_slot(
-            slot,
-            ReaderSlotRecord {
-                state: READER_STATE_EMPTY,
-                generation: 0,
-                process_id: 0,
-                process_token: 0,
-                reader_id: 0,
-                snapshot_lsn: 0,
-                started_unix_ms: 0,
-            },
-        )
+        self.write_reader_slot(slot, empty_reader_slot_record())
     }
 
-    fn clear_all_reader_slots(&self) -> Result<()> {
-        for slot in 0..READER_SLOT_COUNT {
-            self.clear_reader_slot(slot)?;
+    fn clear_all_reader_slots_bulk(&self) -> Result<()> {
+        const SLOT_BYTES: usize = READER_SLOT_COUNT as usize * READER_SLOT_LEN as usize;
+        let encoded = encode_reader_slot(empty_reader_slot_record());
+        let mut bytes = [0_u8; SLOT_BYTES];
+        for chunk in bytes.chunks_exact_mut(READER_SLOT_LEN as usize) {
+            chunk.copy_from_slice(&encoded);
         }
-        Ok(())
+        write_all_at(self.inner.file.as_ref(), HEADER_LEN, &bytes)
+    }
+
+    fn publish_writer_owner_if_required(&self, active: bool) -> Result<()> {
+        self.record_local_writer_owner(active);
+        if matches!(self.inner.mode, ProcessCoordinationMode::Required) {
+            self.publish_writer_owner(active)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn record_local_writer_owner(&self, active: bool) {
+        if active {
+            self.inner
+                .metrics
+                .current_writer_pid
+                .store(self.inner.process_id, Ordering::Release);
+            self.inner
+                .metrics
+                .current_writer_lock_started_ms
+                .store(now_unix_ms(), Ordering::Release);
+        } else {
+            self.inner
+                .metrics
+                .current_writer_pid
+                .store(0, Ordering::Release);
+            self.inner
+                .metrics
+                .current_writer_lock_started_ms
+                .store(0, Ordering::Release);
+        }
     }
 
     fn publish_writer_owner(&self, active: bool) -> Result<()> {
@@ -825,7 +864,7 @@ impl Drop for ProcessWriterGuard {
             }
         });
         if should_clear {
-            let _ = self.coordinator.publish_writer_owner(false);
+            let _ = self.coordinator.publish_writer_owner_if_required(false);
         }
     }
 }
@@ -846,6 +885,18 @@ fn coord_path_for_db(db_path: &Path) -> PathBuf {
     let mut path = db_path.as_os_str().to_os_string();
     path.push(".coord");
     PathBuf::from(path)
+}
+
+fn empty_reader_slot_record() -> ReaderSlotRecord {
+    ReaderSlotRecord {
+        state: READER_STATE_EMPTY,
+        generation: 0,
+        process_id: 0,
+        process_token: 0,
+        reader_id: 0,
+        snapshot_lsn: 0,
+        started_unix_ms: 0,
+    }
 }
 
 fn active_reader_slots() -> &'static Mutex<HashSet<ReaderSlotKey>> {

@@ -6,7 +6,8 @@ pub(crate) mod physical;
 use crate::catalog::{identifiers_equal, CatalogState, IndexKind, TableSchema};
 use crate::error::Result;
 use crate::sql::ast::{
-    BinaryOp, Expr, FromItem, JoinConstraint, JoinKind, Query, QueryBody, Select, Statement,
+    BinaryOp, Expr, FromItem, JoinConstraint, JoinKind, Query, QueryBody, Select, SelectItem,
+    Statement,
 };
 
 use self::physical::PhysicalPlan;
@@ -272,6 +273,12 @@ fn maybe_index_plan(
             index: index.name.clone(),
             predicate: filter.clone(),
         }
+    } else if select_projection_is_covered_by_index(select, table, index) {
+        PhysicalPlan::CoveringIndexSeek {
+            table: table.name.clone(),
+            index: index.name.clone(),
+            predicate: filter.clone(),
+        }
     } else {
         PhysicalPlan::IndexSeek {
             table: table.name.clone(),
@@ -279,6 +286,90 @@ fn maybe_index_plan(
             predicate: filter.clone(),
         }
     })
+}
+
+fn select_projection_is_covered_by_index(
+    select: &Select,
+    table: &TableSchema,
+    index: &crate::catalog::IndexSchema,
+) -> bool {
+    if index.kind != IndexKind::Btree
+        || !index.fresh
+        || index.predicate_sql.is_some()
+        || index.include_columns.is_empty()
+        || !generated_columns_are_stored_for_planner(table)
+    {
+        return false;
+    }
+    let Some(covered_columns) = planner_covering_index_columns(index, table) else {
+        return false;
+    };
+    let Some(FromItem::Table { name, alias }) = select.from.first() else {
+        return false;
+    };
+    let binding_name = alias.as_deref().unwrap_or(name);
+    select.projection.iter().all(|item| match item {
+        SelectItem::Expr { expr, .. } => {
+            let Expr::Column {
+                table: qualifier,
+                column,
+            } = expr
+            else {
+                return false;
+            };
+            if qualifier.as_deref().is_some_and(|qualifier| {
+                !identifiers_equal(qualifier, &table.name)
+                    && !identifiers_equal(qualifier, binding_name)
+            }) {
+                return false;
+            }
+            covered_columns
+                .iter()
+                .any(|covered| identifiers_equal(covered, column))
+        }
+        SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => false,
+    })
+}
+
+fn planner_covering_index_columns(
+    index: &crate::catalog::IndexSchema,
+    table: &TableSchema,
+) -> Option<Vec<String>> {
+    let mut columns: Vec<String> = Vec::new();
+    for column in index
+        .columns
+        .iter()
+        .map(|column| column.column_name.as_deref())
+        .chain(
+            index
+                .include_columns
+                .iter()
+                .map(|column| Some(column.as_str())),
+        )
+    {
+        let column = column?;
+        if !table
+            .columns
+            .iter()
+            .any(|candidate| identifiers_equal(&candidate.name, column))
+        {
+            return None;
+        }
+        if !columns
+            .iter()
+            .any(|existing| identifiers_equal(existing, column))
+        {
+            columns.push(column.to_string());
+        }
+    }
+    Some(columns)
+}
+
+fn generated_columns_are_stored_for_planner(table: &TableSchema) -> bool {
+    table
+        .columns
+        .iter()
+        .all(|column| column.generated_sql.is_none() || column.generated_stored)
 }
 
 fn planner_row_id_alias_column_name(table: &TableSchema) -> Option<&str> {

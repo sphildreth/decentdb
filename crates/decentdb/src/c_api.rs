@@ -4923,7 +4923,10 @@ mod tests {
         let mut geog = DdbValue::default();
         assert_eq!(ddb_stmt_value_copy(select_stmt, 0, &mut geog), DDB_OK);
         assert_eq!(geog.tag, DdbValueTag::Geography as u32);
-        assert!(geog.len > point_wkb.len());
+        assert_eq!(geog.len, point_wkb.len());
+        // SAFETY: ddb_stmt_value_copy returned an owned buffer with geog.len bytes.
+        let copied = unsafe { std::slice::from_raw_parts(geog.data, geog.len) };
+        assert_eq!(copied, point_wkb.as_slice());
         assert_eq!(ddb_value_dispose(&mut geog), DDB_OK);
 
         assert_eq!(ddb_stmt_free(&mut select_stmt), DDB_OK);

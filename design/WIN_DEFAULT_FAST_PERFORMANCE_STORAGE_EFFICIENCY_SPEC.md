@@ -1,7 +1,7 @@
 # Default-Fast Performance And Storage Efficiency
 
 **Date:** 2026-05-27
-**Status:** Proposed
+**Status:** Delivered
 **Future Version:** vNext
 **Roadmap:** [`FUTURE_WINS.md`](FUTURE_WINS.md)
 **Document Type:** Implementation SPEC
@@ -27,6 +27,41 @@ in that release.
 - Major parser, planner, statistics, or storage dependency additions.
 - New unsafe storage, VFS, or memory-mapping behavior beyond already accepted
   FFI/VFS boundaries.
+
+**Delivered implementation note (2026-05-27):**
+
+- Default `DbConfig` uses the durable historical 4 MiB cache while preserving
+  `WalSyncMode::Full`; executor fast-path fixes recovered read headroom without
+  adopting the higher-cache RSS footprint after the 16 MiB candidate exceeded
+  the guardrail.
+- `DbConfig::balanced()`, `DbConfig::low_memory()`, and
+  `DbConfig::tuned_durable()` expose the accepted named profile helpers without
+  replacing open-time knobs.
+- Benchmark aggregation and charts use canonical profile keys, DuckDB engine
+  default labeling, partial read-only labeling for H2/HSQLDB, storage split
+  fields, and Python binding prepared-statement/materialization slices.
+- The planner and executor use runtime-only covering B+Tree payloads for safe
+  `INCLUDE (...)` indexed projections and fall back when projections are not
+  covered or security rules are active.
+- Prepared insert execution favors the direct/default write hot path when available
+  and avoids unnecessary covering-index payload work for common parameterized
+  insert/update shapes.
+- Rust callers can use `SqlTransaction::prepared_batch` to keep one validated
+  prepared statement and its simple positional INSERT plan live across repeated
+  mutable parameter rows inside an exclusive transaction.
+- Deferred table materialization preserves valid index metadata in the covered fast
+  path: index-based execution remains correct when a table can be proven
+  statement-complete and is only materialized when needed.
+- Plain persistent-table `COUNT(*)` and integer primary-key projection reads use
+  parser-bypass metadata or row-id lookup paths when security, temp/view, and
+  expression semantics do not require full planning.
+- Scalar integer aggregate fast paths can scan encoded/persisted payload columns
+  directly for supported `COUNT/SUM/AVG/MIN/MAX` forms without forcing full
+  row materialization first.
+- Persistent compression, prefix encoding, page-layout work, WAL semantic
+  changes, and broad C ABI streaming contracts remain deferred to separate ADRs
+  because the delivered slice intentionally avoids format and durability
+  changes.
 
 **Related inputs:**
 
@@ -107,18 +142,28 @@ benchmarks that prove the durability/recovery complexity is worth it.
 
 ## 4. Current Baseline
 
-The current release benchmark summary was aggregated on 2026-05-22 and uses the
-`single_thread_prepared_statement_oltp_with_concurrent_read_extension` profile.
-This is the frozen planning baseline until rollout step 3 recaptures an
-accepted baseline on the expanded benchmark suite. If step 3 recaptures the
-baseline, update this section before judging implementation patches.
+The checked-in benchmark summary remains the controlled 2026-05-22 release
+snapshot recorded in `data/bench_summary.json`. A 2026-05-27 local Ryzen run was
+used only as a diagnostic while adding profile-aware benchmark support and must
+not replace release-facing assets. Future benchmark refreshes should come from
+the controlled release lane, not from an arbitrary developer workstation.
 
-The existing JSON names the current default row `decentdb_default_durable`.
-Within this spec, that row is the baseline for the canonical release profile
-`decentdb_balanced_durable`:
+The current code default profile is:
 
 ```text
-decentdb_balanced_durable baseline: wal_sync_full cache_size_mb=4
+decentdb_default_durable:wal_sync_full cache_size_mb=4
+```
+
+The canonical balanced durable benchmark profile is:
+
+```text
+decentdb_balanced_durable:wal_sync_full cache_size_mb=16
+```
+
+The low-memory guardrail profile is:
+
+```text
+decentdb_low_memory_durable:wal_sync_full cache_size_mb=4
 ```
 
 The tuned DecentDB profile is:
@@ -127,9 +172,9 @@ The tuned DecentDB profile is:
 decentdb_tuned_durable:wal_sync_full cache_size_mb=64 retain_paged_row_sources_after_commit=true paged_row_storage=false wal_autocheckpoint=0
 ```
 
-Representative current p95 values:
+Representative accepted p95 values from the controlled release snapshot:
 
-| Metric | Balanced Baseline | Tuned Durable | SQLite WAL FULL |
+| Metric | Historical Default Baseline | Tuned Durable | SQLite WAL FULL |
 |---|---:|---:|---:|
 | Point read p95 | 0.0169598 ms | 0.001907 ms | 0.0034974 ms |
 | Range scan p95 | 0.6764458 ms | 0.012146 ms | 0.011377 ms |
@@ -140,16 +185,15 @@ Representative current p95 values:
 | Database size after checkpoint | 3.6914 MiB | 3.2110 MiB | 2.1953 MiB |
 | Insert rows/sec | 1,617,064 | 1,787,297 | 2,266,284 |
 
-This baseline shows five separate problems:
+This baseline shows four separate follow-up measurement areas:
 
-- some default gaps are caused by conservative memory/default choices;
-- some default gaps are caused by planner/executor paths that do not exploit
-  existing metadata broadly enough;
-- concurrent reads are materially behind the tuned profile and should improve
-  through the same cache, row-source retention, and planner/executor work;
-- insert throughput is behind tuned DecentDB and SQLite; first-phase work should
-  measure whether checkpoint/cache tuning closes this before proposing write
-  format changes;
+- some remaining default gaps are caused by planner/executor paths that do not
+  exploit existing metadata broadly enough;
+- concurrent reads are faster than SQLite in the historical snapshot, but still
+  behind the tuned profile and should improve through narrower row access and
+  lower prepared-statement overhead before concurrency changes are considered;
+- insert throughput is behind SQLite; future work should measure whether
+  checkpoint/cache tuning closes this before proposing write format changes;
 - some storage gaps may require deeper layout work, but should not be guessed
   before the cheap, non-format work is measured. The tuned profile is still
   larger than SQLite in this snapshot, so phase-1 storage work may improve WAL
@@ -389,17 +433,29 @@ Accepted changes must preserve documented memory bounds. If a default increases
 resident memory, the benchmark and docs must state the new behavior and the
 reason it is appropriate for embedded app defaults.
 
-The default page cache size is the leading first-phase hypothesis. The current
-benchmark gap compares a 4 MiB default profile with a 64 MiB tuned profile, so
-the first benchmark slice must sweep at least 4, 8, 16, 24, 32, and 64 MiB
-under the same durable settings before changing deeper executor or storage code
-for read latency. The sweep must include point reads, range scans, concurrent
-reads, joins, aggregates, durable commit p95, insert throughput, storage size
-after checkpoint, checkpoint latency p95/max, write amplification where the
-harness can observe written bytes, and memory. The first serious default
-candidate is 16 MiB. Move the balanced default to 32 MiB only if benchmarks show
-a clear cross-workload win over 16 MiB across point, concurrent, range, join,
-aggregate, browser/mobile, checkpoint/write pressure, and memory profiles.
+The default page cache size was the leading first-phase hypothesis, but
+regression checks against `benchmarks/rust-baseline/results` kept the code
+default at the historical 4 MiB after executor and row-source fixes recovered
+read-path headroom without moving the default to a higher-cache memory profile.
+The final accepted rust-baseline comparison for this slice ran
+smoke/medium/full/huge against the checked-in default-profile results and beat
+every recorded step, total runtime, peak RSS, database size, and WAL size
+metric. The measured implementation also keeps default `auto` coordination
+writer-owner diagnostics in memory, removes redundant coordination metadata
+locks from commit/checkpoint publication, and skips no-op empty-schema
+maintenance during brand-new durable opens; byte-range locks remain the
+correctness contract.
+The balanced profile uses 16 MiB, and
+the tuned durable profile remains at 64 MiB. Any future move beyond the 4 MiB
+default must rerun at least the 4, 6, 8, 16, 24, 32, and 64 MiB
+sweep under the same durable settings before changing deeper executor or
+storage code for read latency. The sweep must include point reads, range scans,
+concurrent reads, joins, aggregates, durable commit p95, insert throughput,
+storage size after checkpoint, checkpoint latency p95/max, write amplification
+where the harness can observe written bytes, and memory. Move the explicit
+balanced profile to 32 MiB only if benchmarks show a clear cross-workload win
+over 16 MiB across point, concurrent, range, join, aggregate, browser/mobile,
+checkpoint/write pressure, and memory profiles.
 
 If the accepted default cache grows, DecentDB must also keep an explicit
 low-memory profile or documented open option for constrained hosts. The
@@ -408,10 +464,9 @@ Browser and mobile benchmark lanes are binding constraints for default
 increases, not after-the-fact documentation work.
 
 If browser or mobile lanes regress after a default cache increase is accepted,
-the balanced default reverts to the highest cache value that passes all required
-lanes. If that value is the current 4 MiB baseline, the default remains 4 MiB
-and the spec must be updated with the measured reason before another increase
-is attempted.
+the code default reverts to the highest cache value that passes all required
+lanes, with 4 MiB retained as the low-memory profile floor. The spec must be
+updated with the measured reason before another default increase is attempted.
 
 Named profile helpers are accepted, but open-time knobs remain the authoritative
 configuration contract. Each helper maps to one canonical release benchmark
@@ -419,7 +474,7 @@ profile:
 
 | Helper | Canonical Release Profile | Direction |
 |---|---|---|
-| `balanced` | `decentdb_balanced_durable` | Default durable profile, using the accepted cache-size result from the sweep. Start from a 16 MiB candidate. |
+| `balanced` | `decentdb_balanced_durable` | Explicit balanced durable profile, using the accepted 16 MiB cache-size result from the sweep. |
 | `low_memory` | `decentdb_low_memory_durable` | Constrained-host durable profile, initially 4 MiB unless benchmark evidence changes it. |
 | `tuned_durable` | `decentdb_tuned_durable` | Explicit high-memory durable profile for benchmark and power-user tuning. |
 
@@ -667,8 +722,8 @@ still proceed because they do not depend on the ADR's covering-index contract.
    metadata then `duckdb_engine_default` rename sequence, and H2/HSQLDB partial
    row cleanup. Keep compatibility handling for old inputs during the
    transition.
-5. Run the 4/8/16/24/32/64 MiB cache sweep, using 16 MiB as the first balanced
-   default candidate and preserving an explicit low-memory profile. The sweep
+5. Run the 4/6/8/16/24/32/64 MiB cache sweep, using 16 MiB as the first explicit
+   balanced profile candidate and preserving a low-memory 4 MiB footprint. The sweep
    must include at least point reads, range scans, concurrent reads, joins,
    aggregates, durable commit p95, insert throughput, storage size after
    checkpoint, checkpoint latency p95/max, write amplification where available,
@@ -686,10 +741,10 @@ still proceed because they do not depend on the ADR's covering-index contract.
 
 ## 12. Accepted Recommendations
 
-- Use 16 MiB as the first balanced default cache-size candidate. Still run the
-  full 4/8/16/24/32/64 MiB sweep, keep 4 MiB available as `low_memory`, and move
-  to 32 MiB only if it is clearly better across the full benchmark and memory
-  matrix.
+- Keep 4 MiB as the code default while executor fast paths beat the historical
+  rust-baseline performance and memory matrix. Use 16 MiB as the explicit
+  balanced profile, and move the default higher only if it is clearly better
+  across the full benchmark and memory matrix.
 - Add named profile helpers while keeping open-time knobs authoritative. The
   accepted profile names are `balanced`, `low_memory`, and `tuned_durable`.
 - Use Python as the first release-blocking maintained binding latency profile.

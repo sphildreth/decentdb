@@ -842,6 +842,13 @@ pub(crate) fn acquire_hub(registry_key: Option<PathBuf>, config: &DbConfig) -> A
     hub
 }
 
+pub(crate) fn existing_hub(registry_key: Option<&PathBuf>) -> Option<Arc<ReactiveHub>> {
+    let key = registry_key?;
+    let registry = HUB_REGISTRY.get()?;
+    let guard = registry.lock().ok()?;
+    guard.get(key).and_then(Weak::upgrade)
+}
+
 impl WatchInner {
     fn try_recv(&self) -> Result<Option<WatchEvent>> {
         let mut queue = self

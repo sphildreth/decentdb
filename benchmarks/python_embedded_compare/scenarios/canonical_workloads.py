@@ -139,6 +139,32 @@ class Workload(ABC):
         """Run delete benchmark."""
         pass
 
+    def run_prepared_statement_roundtrip(
+        self,
+        driver: DatabaseDriver,
+        operations: int,
+        warmup: int = 100,
+    ) -> BenchmarkResult:
+        """Run prepared statement execution round-trip benchmark.
+
+        Implementations that do not provide a meaningful benchmark should return
+        an empty result.
+        """
+        return empty_benchmark_result("prepared_statement_roundtrip")
+
+    def run_result_materialization(
+        self,
+        driver: DatabaseDriver,
+        operations: int,
+        warmup: int = 100,
+    ) -> BenchmarkResult:
+        """Run result materialization benchmark.
+
+        Implementations that do not provide a meaningful benchmark should return
+        an empty result.
+        """
+        return empty_benchmark_result("result_materialization")
+
 
 class OrdersWorkload(Workload):
     """OLTP-ish Orders workload (Workload A)."""
@@ -896,6 +922,23 @@ CREATE INDEX bench_id_idx ON bench(id);
         rng = random.Random(60)
         return [(rng.randrange(self._row_count),) for _ in range(n)]
 
+    def _generate_prepared_roundtrip_params(self, n: int) -> List[Tuple]:
+        import random
+
+        rng = random.Random(61)
+        return [(rng.randrange(self._row_count),) for _ in range(n)]
+
+    def _generate_materialization_params(self, n: int) -> List[Tuple]:
+        import random
+
+        rng = random.Random(62)
+        params = []
+        for _ in range(n):
+            start = rng.randrange(max(self._row_count - 1, 1))
+            limit = rng.randint(1, min(25, self._row_count - start))
+            params.append((start, limit))
+        return params
+
     def _run_query_benchmark(
         self,
         driver: DatabaseDriver,
@@ -916,6 +959,44 @@ CREATE INDEX bench_id_idx ON bench(id);
             op_timer.start()
             try:
                 driver.execute_query(sql, params)
+                tracker.record(op_timer.stop() * 1000)
+            except Exception:
+                tracker.record_error()
+
+        duration = timer.stop()
+        stats = tracker.get_statistics()
+        operations = len(params_list) - warmup
+
+        return BenchmarkResult(
+            benchmark_name=benchmark_name,
+            operations=operations,
+            duration_sec=duration,
+            latency_ms=stats,
+            throughput_ops_sec=operations / duration if duration > 0 else 0,
+            errors=stats["error_count"],
+        )
+
+    def _run_prepared_benchmark(
+        self,
+        driver: DatabaseDriver,
+        sql: str,
+        params_list: List[Optional[Tuple]],
+        benchmark_name: str,
+        warmup: int,
+    ) -> BenchmarkResult:
+        prepared = driver.prepare_statement(sql)
+        for params in params_list[:warmup]:
+            driver.execute_prepared(prepared, params)
+
+        tracker = LatencyTracker()
+        timer = Timer()
+        timer.start()
+
+        for params in params_list[warmup:]:
+            op_timer = Timer()
+            op_timer.start()
+            try:
+                driver.execute_prepared(prepared, params)
                 tracker.record(op_timer.stop() * 1000)
             except Exception:
                 tracker.record_error()
@@ -962,6 +1043,38 @@ CREATE INDEX bench_id_idx ON bench(id);
             "SELECT id, val, f FROM bench",
             params_list,
             "full_scan",
+            warmup,
+        )
+
+    def run_prepared_statement_roundtrip(
+        self,
+        driver: DatabaseDriver,
+        operations: int,
+        warmup: int = 100,
+    ) -> BenchmarkResult:
+        self._require_loaded_data()
+        params_list = self._generate_prepared_roundtrip_params(operations + warmup)
+        return self._run_prepared_benchmark(
+            driver,
+            "SELECT id, val, f FROM bench WHERE id = ?",
+            params_list,
+            "prepared_statement_roundtrip",
+            warmup,
+        )
+
+    def run_result_materialization(
+        self,
+        driver: DatabaseDriver,
+        operations: int,
+        warmup: int = 100,
+    ) -> BenchmarkResult:
+        self._require_loaded_data()
+        params_list = self._generate_materialization_params(operations + warmup)
+        return self._run_prepared_benchmark(
+            driver,
+            "SELECT id, val, f FROM bench WHERE id >= ? LIMIT ?",
+            params_list,
+            "result_materialization",
             warmup,
         )
 

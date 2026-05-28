@@ -373,6 +373,46 @@ pub struct DbConfig {
 }
 
 impl DbConfig {
+    /// Returns the named balanced durable profile used by applications that can
+    /// spend more memory on the page cache than the default profile.
+    ///
+    /// The profile preserves full durable WAL sync and uses a 16 MiB cache.
+    #[must_use]
+    pub fn balanced() -> Self {
+        Self {
+            cache_size_mb: 16,
+            ..Self::default()
+        }
+    }
+
+    /// Returns the constrained-host durable profile with the historical 4 MiB
+    /// cache behavior.
+    #[must_use]
+    pub fn low_memory() -> Self {
+        Self {
+            cache_size_mb: 4,
+            ..Self::default()
+        }
+    }
+
+    /// Returns the high-memory durable tuning profile used for explicit
+    /// benchmark and power-user comparisons.
+    ///
+    /// This profile is intentionally not the default: it preserves full WAL
+    /// sync, but raises memory use and changes row-source/checkpoint behavior
+    /// for hot read workloads.
+    #[must_use]
+    pub fn tuned_durable() -> Self {
+        Self {
+            cache_size_mb: 64,
+            retain_paged_row_sources_after_commit: true,
+            paged_row_storage: false,
+            wal_checkpoint_threshold_pages: 0,
+            wal_checkpoint_threshold_bytes: 0,
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn validate_for_create(&self) -> Result<()> {
         if page::is_supported_page_size(self.page_size) {
             Ok(())
@@ -483,5 +523,27 @@ mod tests {
         assert!(!config.extension_unsigned_development_mode);
         // Default depends on platform; just assert the field is reachable.
         let _ = config.release_freed_memory_after_checkpoint;
+    }
+
+    #[test]
+    fn named_profiles_preserve_durable_sync_and_cache_contracts() {
+        let balanced = DbConfig::balanced();
+        assert_eq!(balanced.cache_size_mb, 16);
+        assert_eq!(balanced.wal_sync_mode, WalSyncMode::Full);
+        assert!(balanced.paged_row_storage);
+        assert!(!balanced.retain_paged_row_sources_after_commit);
+
+        let low_memory = DbConfig::low_memory();
+        assert_eq!(low_memory.cache_size_mb, 4);
+        assert_eq!(low_memory.wal_sync_mode, WalSyncMode::Full);
+        assert!(low_memory.paged_row_storage);
+
+        let tuned = DbConfig::tuned_durable();
+        assert_eq!(tuned.cache_size_mb, 64);
+        assert_eq!(tuned.wal_sync_mode, WalSyncMode::Full);
+        assert!(tuned.retain_paged_row_sources_after_commit);
+        assert!(!tuned.paged_row_storage);
+        assert_eq!(tuned.wal_checkpoint_threshold_pages, 0);
+        assert_eq!(tuned.wal_checkpoint_threshold_bytes, 0);
     }
 }

@@ -97,6 +97,7 @@ instead of brand-new roadmap items.
 | Cross-process WAL coordination | [`WIN_CROSS_PROCESS_WAL_COORDINATION_SPEC.md`](WIN_CROSS_PROCESS_WAL_COORDINATION_SPEC.md); ADR 0177-0180; [`docs/user-guide/write-concurrency.md`](../docs/user-guide/write-concurrency.md#cross-process-wal-coordination) | Native OS processes can safely share local on-disk databases through byte-range locks, `.coord` sidecars, cross-process reader retention, WAL refresh, binding open options, `sys.process_*` diagnostics, and Doctor findings. Future runtime work can build on this foundation for browser/mobile hardening and richer operational tracing. |
 | Browser SQL/API parity and production web hardening | [`WIN_BROWSER_SQL_API_PARITY_PRODUCTION_WEB_SPEC.md`](WIN_BROWSER_SQL_API_PARITY_PRODUCTION_WEB_SPEC.md); [`docs/api/wasm.md`](../docs/api/wasm.md); [`bindings/web/README.md`](../bindings/web/README.md) | Browser now has the `browser-app-v2` SQL profile, checked-in parity corpus, stable browser SQL errors, protocol/capability metadata, transaction/savepoint APIs, prepared statement paging, OPFS lifecycle guards/diagnostics, relay apply-before-ack helpers, framework recipes, and benchmark guardrails. Future browser work should target measured parser breadth, TDE/key handling, branch workflows, or browser-specific performance rather than this parity baseline. |
 | Mobile production runtime and SDK hardening | [`WIN_MOBILE_PRODUCTION_RUNTIME_SDK_HARDENING_SPEC.md`](WIN_MOBILE_PRODUCTION_RUNTIME_SDK_HARDENING_SPEC.md); ADR 0181-0183; [`docs/api/dart.md`](../docs/api/dart.md); [`bindings/dart/flutter/README.md`](../bindings/dart/flutter/README.md) | Flutter mobile now has a package shell, Android/iOS artifact scripts and GitHub Actions workflow, mobile native loading defaults, redacted open-option diagnostics, key-provider helpers, async worker lifecycle docs/tests, public changeset apply-before-ack wrappers, and mobile storage/sidecar guidance. Follow-on mobile work should target measured device matrices, native Swift/Kotlin SDKs, watch lifecycle guarantees, or key rotation rather than first-class package hardening. |
+| Default-fast performance and storage efficiency | [`WIN_DEFAULT_FAST_PERFORMANCE_STORAGE_EFFICIENCY_SPEC.md`](WIN_DEFAULT_FAST_PERFORMANCE_STORAGE_EFFICIENCY_SPEC.md); ADR 0184; [`docs/user-guide/performance.md`](../docs/user-guide/performance.md); [`docs/api/configuration.md`](../docs/api/configuration.md) | **Priority #1 complete:** durable defaults keep the historical 4 MiB cache after executor fast-path fixes recovered read headroom, while explicit low-memory/balanced/tuned durable profile helpers provide 4 MiB, 16 MiB, and 64 MiB options. The delivered slice includes canonical benchmark profile metadata, Python binding hot-path benchmark slices, storage/cold-state metadata, prepared-insert fast-path fixes, transaction-scoped prepared batches for repeated Rust inserts, runtime-only covering-index execution for safe `INCLUDE (...)` projections, parser-bypass metadata/row-id reads for plain `COUNT(*)` and integer primary-key projections, deferred table materialization behavior that preserves valid indexes, scalar aggregate fast paths that scan persisted payload columns without forcing full row materialization, lazy default-open work for checkpoint/reactive/coordination/empty-schema maintenance, and a green rust-baseline smoke/medium/full/huge comparison against the checked-in historical default-profile results. Follow-on performance work should be measured and scoped to new evidence, not this completed baseline. |
 | Benchmark profiles and release assets | [`BENCHMARKING_GUIDE.md`](BENCHMARKING_GUIDE.md), `crates/decentdb-benchmark`, `data/bench_summary.json` | Performance work should target measured default and tuned profiles, storage efficiency, cold-open behavior, and release-chart regressions. |
 
 ## Status Map
@@ -120,29 +121,28 @@ shipped foundation affects follow-on roadmap decisions.
 
 | Priority | Future Version | Status | Feature | Current Source Of Truth | Why This Rank |
 |---:|---|---|---|---|---|
-| 1 | vNext | TODO | Default-fast performance and storage efficiency | [`WIN_DEFAULT_FAST_PERFORMANCE_STORAGE_EFFICIENCY_SPEC.md`](WIN_DEFAULT_FAST_PERFORMANCE_STORAGE_EFFICIENCY_SPEC.md); ADR 0184 | DecentDB should feel fast without special tuning and should keep file size/cold-open behavior competitive |
-| 2 | vNext | TODO | Rich structured errors and developer diagnostics | Existing [`docs/api/error-codes.md`](../docs/api/error-codes.md); needs ADR/spec for stable machine-readable expansion | Low-cost adoption win: better errors, hints, and doc links reduce integration friction across every binding |
-| 3 | vNext+1 | TODO | Incremental backup and point-in-time recovery | Basic `save_as` backup is delivered; needs ADR/spec for WAL archive/PITR semantics | Durable recovery artifacts are a production requirement and distinct from live replication |
-| 4 | vNext+1 | TODO | Runtime tracing, advisors, and Doctor integration | Needs ADR/spec; follows shipped operational metrics | Explains slow queries, lock waits, index usage, schema lint, and maintenance issues once the metrics contract is stable |
-| 5 | vNext+1 | TODO | Branch-aware migration rehearsal and promotion | ADR 0153-0159 and branch CLI/API docs; needs ADR/spec | Uses shipped branch/diff foundations for a distinctive safe migration workflow |
-| 6 | vNext+1 | TODO | Online schema change execution | Needs ADR/spec; follows branch migration design | Completes the migration story by reducing reader/write disruption during large table rebuilds and index work |
-| 7 | vNext+1 | TODO | Backend sync bridge for existing app databases, Postgres first | Needs ADR/spec | Makes DecentDB easier to adopt in apps that already have a central Postgres/Supabase-style backend |
-| 8 | vNext+1 | TODO | Resource governance, quotas, and automated maintenance | Needs ADR/spec; follows browser/mobile/runtime diagnostics | Embedded hosts need explicit storage, WAL, memory, quota, and maintenance behavior to avoid runaway local resource use |
-| 9 | Later | BACKLOG | Incrementally maintained projections | Needs ADR/spec | Accelerates dashboards, local read models, and reactive query workloads |
-| 10 | Later | BACKLOG | JSONB binary storage and JSON path indexing | Needs ADR/spec | Important for JSON-heavy workloads and now a SQLite baseline expectation |
-| 11 | Later | BACKLOG | Hybrid local search: FTS, trigram, vector, and rank fusion | FTS foundation is delivered; vector and rank fusion need ADR/spec | More compelling than standalone HNSW: apps want keyword, substring, semantic, and relational filters together |
-| 12 | Later | BACKLOG | Authenticated encryption, key rotation, and platform key-store helpers | ADR 0174 follow-up | TDE v1 provides local confidentiality; regulated deployments eventually need tamper-evident page/chunk authentication, key rotation, and turnkey OS/browser/mobile key-store guidance |
-| 13 | Later | BACKLOG | Agent and tooling integration mode | [`STABLE_TOOLING_METADATA_CONTRACT.md`](STABLE_TOOLING_METADATA_CONTRACT.md); needs ADR/spec | Makes the agent-friendly promise concrete without putting LLM behavior in the engine |
-| 14 | Later | BACKLOG | Reliability validation, fault injection, and deterministic replay | [`TESTING_STRATEGY.md`](TESTING_STRATEGY.md); needs ADR/spec for replay capture | Raises confidence in ACID/concurrency changes and makes production bugs reproducible without weakening hot paths |
-| 15 | Later | BACKLOG | Application and support bundle format | Needs ADR/spec | Useful portable artifact and diagnostics story, but should follow security/redaction foundations |
-| 16 | Later | BACKLOG | Temporal row history and auditable state | Needs ADR/spec | Strong regulated/support workflow, but should follow security, audit context, and sync hardening |
-| 17 | Later | BACKLOG | Structured CDC and logical change feeds | Change streams, public changesets, and sync journal are delivered; needs ADR/spec | Lets DecentDB feed event-driven systems without becoming a message broker or bypassing local transactions |
-| 18 | Later | BACKLOG | Curated Lua extension ecosystem | Lua runtime/package model is delivered; needs ADR/spec outside core engine if registry semantics affect trust | Turns safe extensibility into an adoption moat while preserving the no-native-extension stance |
-| 19 | Later | BACKLOG | Unicode collation and internationalization profile | Query-time built-in and Lua collations are delivered; needs ADR/spec for ICU/data-size strategy | International apps need correct Unicode sort/search semantics, but portability and binary size make it a later tradeoff |
-| 20 | Later | BACKLOG | Advanced SQL compatibility surface | [`WIN_ADVANCED_SQL_COMPATIBILITY_SURFACE.md`](WIN_ADVANCED_SQL_COMPATIBILITY_SURFACE.md) | Useful adoption polish after higher-impact runtime, recovery, migration, and workflow blockers |
-| 21 | Later | BACKLOG | Advanced geospatial semantics and analytics | ADR 0128 deferred work; needs follow-up ADR/spec | Builds on shipped spatial support without implying the foundation is unfinished |
-| 22 | Later | BACKLOG | WAL streaming replication | Needs ADR/spec | Useful HA/read-scale story, but weaker than local-first sync and PITR for DecentDB identity |
-| 23 | Later | BACKLOG | Cloud-native object storage VFS and WASI edge profiles | Needs ADR/spec | Interesting edge/serverless story with high durability, consistency, packaging, and cache-invalidation complexity |
+| 1 | vNext | TODO | Rich structured errors and developer diagnostics | Existing [`docs/api/error-codes.md`](../docs/api/error-codes.md); needs ADR/spec for stable machine-readable expansion | Low-cost adoption win: better errors, hints, and doc links reduce integration friction across every binding |
+| 2 | vNext+1 | TODO | Incremental backup and point-in-time recovery | Basic `save_as` backup is delivered; needs ADR/spec for WAL archive/PITR semantics | Durable recovery artifacts are a production requirement and distinct from live replication |
+| 3 | vNext+1 | TODO | Runtime tracing, advisors, and Doctor integration | Needs ADR/spec; follows shipped operational metrics | Explains slow queries, lock waits, index usage, schema lint, and maintenance issues once the metrics contract is stable |
+| 4 | vNext+1 | TODO | Branch-aware migration rehearsal and promotion | ADR 0153-0159 and branch CLI/API docs; needs ADR/spec | Uses shipped branch/diff foundations for a distinctive safe migration workflow |
+| 5 | vNext+1 | TODO | Online schema change execution | Needs ADR/spec; follows branch migration design | Completes the migration story by reducing reader/write disruption during large table rebuilds and index work |
+| 6 | vNext+1 | TODO | Backend sync bridge for existing app databases, Postgres first | Needs ADR/spec | Makes DecentDB easier to adopt in apps that already have a central Postgres/Supabase-style backend |
+| 7 | vNext+1 | TODO | Resource governance, quotas, and automated maintenance | Needs ADR/spec; follows browser/mobile/runtime diagnostics | Embedded hosts need explicit storage, WAL, memory, quota, and maintenance behavior to avoid runaway local resource use |
+| 8 | Later | BACKLOG | Incrementally maintained projections | Needs ADR/spec | Accelerates dashboards, local read models, and reactive query workloads |
+| 9 | Later | BACKLOG | JSONB binary storage and JSON path indexing | Needs ADR/spec | Important for JSON-heavy workloads and now a SQLite baseline expectation |
+| 10 | Later | BACKLOG | Hybrid local search: FTS, trigram, vector, and rank fusion | FTS foundation is delivered; vector and rank fusion need ADR/spec | More compelling than standalone HNSW: apps want keyword, substring, semantic, and relational filters together |
+| 11 | Later | BACKLOG | Authenticated encryption, key rotation, and platform key-store helpers | ADR 0174 follow-up | TDE v1 provides local confidentiality; regulated deployments eventually need tamper-evident page/chunk authentication, key rotation, and turnkey OS/browser/mobile key-store guidance |
+| 12 | Later | BACKLOG | Agent and tooling integration mode | [`STABLE_TOOLING_METADATA_CONTRACT.md`](STABLE_TOOLING_METADATA_CONTRACT.md); needs ADR/spec | Makes the agent-friendly promise concrete without putting LLM behavior in the engine |
+| 13 | Later | BACKLOG | Reliability validation, fault injection, and deterministic replay | [`TESTING_STRATEGY.md`](TESTING_STRATEGY.md); needs ADR/spec for replay capture | Raises confidence in ACID/concurrency changes and makes production bugs reproducible without weakening hot paths |
+| 14 | Later | BACKLOG | Application and support bundle format | Needs ADR/spec | Useful portable artifact and diagnostics story, but should follow security/redaction foundations |
+| 15 | Later | BACKLOG | Temporal row history and auditable state | Needs ADR/spec | Strong regulated/support workflow, but should follow security, audit context, and sync hardening |
+| 16 | Later | BACKLOG | Structured CDC and logical change feeds | Change streams, public changesets, and sync journal are delivered; needs ADR/spec | Lets DecentDB feed event-driven systems without becoming a message broker or bypassing local transactions |
+| 17 | Later | BACKLOG | Curated Lua extension ecosystem | Lua runtime/package model is delivered; needs ADR/spec outside core engine if registry semantics affect trust | Turns safe extensibility into an adoption moat while preserving the no-native-extension stance |
+| 18 | Later | BACKLOG | Unicode collation and internationalization profile | Query-time built-in and Lua collations are delivered; needs ADR/spec for ICU/data-size strategy | International apps need correct Unicode sort/search semantics, but portability and binary size make it a later tradeoff |
+| 19 | Later | BACKLOG | Advanced SQL compatibility surface | [`WIN_ADVANCED_SQL_COMPATIBILITY_SURFACE.md`](WIN_ADVANCED_SQL_COMPATIBILITY_SURFACE.md) | Useful adoption polish after higher-impact runtime, recovery, migration, and workflow blockers |
+| 20 | Later | BACKLOG | Advanced geospatial semantics and analytics | ADR 0128 deferred work; needs follow-up ADR/spec | Builds on shipped spatial support without implying the foundation is unfinished |
+| 21 | Later | BACKLOG | WAL streaming replication | Needs ADR/spec | Useful HA/read-scale story, but weaker than local-first sync and PITR for DecentDB identity |
+| 22 | Later | BACKLOG | Cloud-native object storage VFS and WASI edge profiles | Needs ADR/spec | Interesting edge/serverless story with high durability, consistency, packaging, and cache-invalidation complexity |
 
 ## Positioning
 
@@ -185,50 +185,7 @@ This should be stated plainly in user docs so developers understand that
 DecentDB optimizes the single-writer model rather than pretending it is a server
 database.
 
-## 1. Default-Fast Performance And Storage Efficiency
-
-**Status:** `TODO`
-
-**Future Version:** vNext
-
-**Source of truth:** [`WIN_DEFAULT_FAST_PERFORMANCE_STORAGE_EFFICIENCY_SPEC.md`](WIN_DEFAULT_FAST_PERFORMANCE_STORAGE_EFFICIENCY_SPEC.md)
-and ADR 0184. Persistent-format, WAL semantic, or broad binding-contract
-changes still require follow-up ADRs.
-
-### Why This Matters
-
-DecentDB's tuned durable profile is competitive in the release benchmark assets,
-but developers judge the engine by defaults, cold-open behavior, file size,
-prepared-statement paths, and predictable performance under normal app use.
-Making safe defaults fast is more valuable than adding features that only shine
-after manual tuning.
-
-### Target Areas
-
-- reduce the gap between default durable and tuned durable profiles
-- improve cold-open and first-query behavior for large databases
-- improve file size and WAL/checkpoint storage efficiency
-- evaluate page-level compression, key-prefix compression, and layout changes
-  only when benchmark profiles justify the format/recovery complexity
-- teach the planner/executor to exploit covering indexes where metadata already
-  exists
-- keep `ANALYZE` and stats useful without turning tuning into required ritual
-- improve plan caching and adaptive statistics where they preserve predictable
-  behavior under prepared-statement workloads
-- improve binding prepared-statement hot paths where measurements show overhead
-- add memory-bounded streaming result APIs where large binding/WASM result
-  materialization shows real host pressure
-- add performance Doctor findings only after the runtime can explain them
-
-### Guardrails
-
-- do not weaken durable defaults to win charts
-- do not change persistent formats without ADR and migration coverage
-- benchmark both native and maintained binding paths when a change targets
-  application-facing latency
-- keep profile names explicit so tuned and default results are not conflated
-
-## 2. Rich Structured Errors And Developer Diagnostics
+## 1. Rich Structured Errors And Developer Diagnostics
 
 **Status:** `TODO`
 
@@ -265,7 +222,7 @@ friction even when the engine is behaving correctly.
 - keep added context cheap unless diagnostics are explicitly enabled
 - preserve existing broad error categories for compatibility
 
-## 3. Incremental Backup And Point-In-Time Recovery
+## 2. Incremental Backup And Point-In-Time Recovery
 
 **Status:** `TODO`
 
@@ -302,7 +259,7 @@ retention, encryption, and restore semantics.
 - make retention and storage growth explicit
 - keep live replication and external object storage as separate designs
 
-## 4. Runtime Tracing, Advisors, And Doctor Integration
+## 3. Runtime Tracing, Advisors, And Doctor Integration
 
 **Status:** `TODO`
 
@@ -362,7 +319,7 @@ SELECT * FROM sys.doctor_findings;
 - advisor output must be reviewable and must not auto-apply destructive fixes
 - keep hot-path overhead measurable and benchmarked
 
-## 5. Branch-Aware Migration Rehearsal And Promotion
+## 4. Branch-Aware Migration Rehearsal And Promotion
 
 **Status:** `TODO`
 
@@ -399,7 +356,7 @@ validate, diff, detect drift, and promote.
 - do not hide destructive schema changes behind automatic promotion
 - shipped policy/security semantics must participate in validation
 
-## 6. Online Schema Change Execution
+## 5. Online Schema Change Execution
 
 **Status:** `TODO`
 
@@ -434,7 +391,7 @@ the entire operation.
 - every format or catalog change must follow ADR 0131 migration requirements
 - measure write-path impact and expose it in diagnostics
 
-## 7. Backend Sync Bridge For Existing App Databases, Postgres First
+## 6. Backend Sync Bridge For Existing App Databases, Postgres First
 
 **Status:** `TODO`
 
@@ -469,7 +426,7 @@ changeset and relay model without rewriting their server architecture first.
 - make unsupported schema/type differences explicit before data moves
 - keep hosted-service concerns outside the engine
 
-## 8. Resource Governance, Quotas, And Automated Maintenance
+## 7. Resource Governance, Quotas, And Automated Maintenance
 
 **Status:** `TODO`
 
@@ -509,7 +466,7 @@ harm the host even when DecentDB remains logically correct.
 - do not auto-delete named snapshots, branches, sync data, or audit records
   without explicit retained-policy configuration
 
-## 9. Incrementally Maintained Projections
+## 8. Incrementally Maintained Projections
 
 **Status:** `BACKLOG`
 
@@ -538,7 +495,7 @@ database-native capability that also accelerates reactive queries.
 - keep maintenance work visible in write latency and `sys.*`
 - define crash recovery and rebuild semantics before implementation
 
-## 10. JSONB Binary Storage And JSON Path Indexing
+## 9. JSONB Binary Storage And JSON Path Indexing
 
 **Status:** `BACKLOG`
 
@@ -563,7 +520,7 @@ baseline expectation rather than a niche feature.
 - partial updates rebuild the binary blob through the single writer unless an
   ADR proves a narrower mutation format is safe
 
-## 11. Hybrid Local Search: FTS, Trigram, Vector, And Rank Fusion
+## 10. Hybrid Local Search: FTS, Trigram, Vector, And Rank Fusion
 
 **Status:** `BACKLOG`
 
@@ -598,7 +555,7 @@ default performance affect more existing embedded database users. Hybrid search
 should follow the runtime fundamentals and avoid becoming a large storage/index
 project before the core engine is easier to adopt and operate.
 
-## 12. Authenticated Encryption, Key Rotation, And Platform Key-Store Helpers
+## 11. Authenticated Encryption, Key Rotation, And Platform Key-Store Helpers
 
 **Status:** `BACKLOG`
 
@@ -631,7 +588,7 @@ desktop, server, browser, and mobile hosts.
 - keep key material outside database pages, WAL, sync journals, audit rows, and
   diagnostics
 
-## 13. Agent And Tooling Integration Mode
+## 12. Agent And Tooling Integration Mode
 
 **Status:** `BACKLOG`
 
@@ -670,7 +627,7 @@ guessing.
 - Decent Bench remains the product home for rich visual workflows and generated
   SDK output
 
-## 14. Reliability Validation, Fault Injection, And Deterministic Replay
+## 13. Reliability Validation, Fault Injection, And Deterministic Replay
 
 **Status:** `BACKLOG`
 
@@ -711,7 +668,7 @@ production failures without sharing raw database files.
 - byte-identical database images are not a blanket requirement unless a narrow
   ADR proves the value and cost
 
-## 15. Application And Support Bundle Format
+## 14. Application And Support Bundle Format
 
 **Status:** `BACKLOG`
 
@@ -748,7 +705,7 @@ A DecentDB bundle may contain:
 - support bundles must have a sanitization/redaction story before use with
   regulated data
 
-## 16. Temporal Row History And Auditable State
+## 15. Temporal Row History And Auditable State
 
 **Status:** `BACKLOG`
 
@@ -777,7 +734,7 @@ auditable local data. Some regulated and support-heavy apps need to answer:
 - redaction must be compatible with retention and audit requirements
 - do not conflate branch snapshots with row-level audit history
 
-## 17. Structured CDC And Logical Change Feeds
+## 16. Structured CDC And Logical Change Feeds
 
 **Status:** `BACKLOG`
 
@@ -816,7 +773,7 @@ broker.
 - reuse changeset compatibility metadata rather than inventing a parallel
   serialization contract
 
-## 18. Curated Lua Extension Ecosystem
+## 17. Curated Lua Extension Ecosystem
 
 **Status:** `BACKLOG`
 
@@ -854,7 +811,7 @@ verify, and test across native, browser, and mobile targets.
   the engine
 - keep browser/mobile package-size and sandbox constraints explicit
 
-## 19. Unicode Collation And Internationalization Profile
+## 18. Unicode Collation And Internationalization Profile
 
 **Status:** `BACKLOG`
 
@@ -888,7 +845,7 @@ government, education, commerce, and consumer applications.
 - avoid locale-sensitive behavior in durability-critical metadata keys
 - keep Lua collations available for narrower application-specific behavior
 
-## 20. Advanced SQL Compatibility Surface
+## 19. Advanced SQL Compatibility Surface
 
 **Status:** `BACKLOG`
 
@@ -927,7 +884,7 @@ layer is delivered; this item is for heavier compatibility work.
   ergonomics
 - avoid expanding core import/export features in this track
 
-## 21. Advanced Geospatial Semantics And Analytics
+## 20. Advanced Geospatial Semantics And Analytics
 
 **Status:** `BACKLOG`
 
@@ -959,7 +916,7 @@ the completed native geospatial feature does not appear unfinished.
 - avoid native GEOS/PROJ/GDAL dependencies unless an ADR justifies the tradeoff
 - keep WASM/mobile compatibility as a design constraint
 
-## 22. WAL Streaming Replication
+## 21. WAL Streaming Replication
 
 **Status:** `BACKLOG`
 
@@ -984,7 +941,7 @@ traditional HA problem.
 - quorum acknowledgement
 - explicit consistency/durability tradeoffs
 
-## 23. Cloud-Native Object Storage VFS And WASI Edge Profiles
+## 22. Cloud-Native Object Storage VFS And WASI Edge Profiles
 
 **Status:** `BACKLOG`
 
@@ -1034,7 +991,8 @@ Promoted as distinct roadmap items:
 Folded into existing tracks instead of duplicated:
 
 - page/key/layout compression, streaming result sets, plan caching, and adaptive
-  statistics belong under default-fast performance and storage efficiency
+  statistics belong under future measured performance follow-ups when benchmark
+  evidence justifies the added contract or format risk
 - schema linting, plan diff/regression reporting, session visibility, and
   connection lifecycle diagnostics belong under tracing/advisors/Doctor
 - schema version registries, migration history, and compatibility validation
@@ -1069,23 +1027,18 @@ Not promoted because the premise is already delivered or the idea is off-lane:
 
 ## Near-Term Sequence
 
-1. Scope mobile hardening into explicit support tiers and tests. This is
-   adoption work, not just binding niceties.
-2. Use release benchmark profiles to drive default-fast performance and storage
-   efficiency work, including storage-layout ideas such as page/key compression
-   only when measurements justify the format risk.
-3. Tighten structured errors and developer diagnostics early because they
+1. Tighten structured errors and developer diagnostics early because they
    improve every binding and make later runtime work easier to consume.
-4. Scope incremental backup/PITR separately from WAL streaming replication; the
+2. Scope incremental backup/PITR separately from WAL streaming replication; the
    basic online backup API exists, but production recovery semantics need their
    own ADR.
-5. Extend shipped `sys.*` metrics into opt-in tracing, advisors, and Doctor
+3. Extend shipped `sys.*` metrics into opt-in tracing, advisors, and Doctor
    integration once the hot-path overhead budget is explicit.
-6. Design branch-aware migration rehearsal and online schema execution together
+4. Design branch-aware migration rehearsal and online schema execution together
    so validation and production promotion do not diverge.
-7. Treat resource governance as part of browser/mobile readiness, not as an
+5. Treat resource governance as part of browser/mobile readiness, not as an
    optional tuning-only feature.
-8. Promote authenticated encryption/key-rotation work only after the v1 TDE and
+6. Promote authenticated encryption/key-rotation work only after the v1 TDE and
    policy surfaces have production feedback and a follow-up ADR.
 9. Promote backlog items into TODO only after the top adoption blockers have
    ADR/spec coverage or active implementation ownership.

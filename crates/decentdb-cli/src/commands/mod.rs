@@ -175,7 +175,7 @@ pub struct ExecCommand {
     pub format: OutputFormat,
     #[arg(long = "noRows")]
     pub no_rows: bool,
-    #[arg(long = "cachePages", default_value_t = 1024)]
+    #[arg(long = "cachePages", default_value_t = 0)]
     pub cache_pages: usize,
     #[arg(long = "cacheMb", default_value_t = 0)]
     pub cache_mb: usize,

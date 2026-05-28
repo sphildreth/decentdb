@@ -97,11 +97,14 @@ pub(crate) struct SharedWalInner {
     pub(crate) checkpoint_scratch: Mutex<Vec<(PageId, index::WalVersion)>>,
     /// Reusable mutable page image for delta-frame materialization.
     pub(crate) materialize_scratch: Mutex<Vec<u8>>,
-    /// Optional background checkpoint worker (ADR 0058). Set once during
-    /// `shared::build_handle` when the embedder opts in via
-    /// `DbConfig::background_checkpoint_worker`. `OnceLock` is used so
-    /// `SharedWalInner::drop` can `take()` it and signal the worker to
-    /// shut down before joining the thread.
+    /// Whether auto-checkpoint threshold hits should use the background
+    /// worker instead of checkpointing on the writer thread.
+    pub(crate) background_checkpoint_worker: bool,
+    /// Optional background checkpoint worker (ADR 0058). Started lazily on
+    /// the first auto-checkpoint threshold hit so opens that never need a
+    /// worker do not pay thread-spawn cost. `OnceLock` is used so
+    /// `SharedWalInner::drop` can `take()` it and signal the worker to shut
+    /// down before joining the thread.
     pub(crate) bg_checkpointer: OnceLock<BgCheckpointer>,
     pub(crate) process_coordinator: Option<ProcessCoordinator>,
     pub(crate) observed_coord_wal_generation: AtomicU64,
@@ -338,8 +341,8 @@ impl WalHandle {
 
     pub(crate) fn publish_process_commit(&self, wal_end_lsn: u64) -> Result<()> {
         if let Some(coordinator) = &self.inner.process_coordinator {
-            coordinator.publish_commit(wal_end_lsn)?;
-            self.record_observed_coordination()?;
+            let snapshot = coordinator.publish_commit(wal_end_lsn)?;
+            self.record_observed_coordination_snapshot(&snapshot);
         }
         Ok(())
     }
@@ -350,8 +353,8 @@ impl WalHandle {
         wal_end_lsn: u64,
     ) -> Result<()> {
         if let Some(coordinator) = &self.inner.process_coordinator {
-            coordinator.publish_checkpoint(checkpoint_lsn, wal_end_lsn)?;
-            self.record_observed_coordination()?;
+            let snapshot = coordinator.publish_checkpoint(checkpoint_lsn, wal_end_lsn)?;
+            self.record_observed_coordination_snapshot(&snapshot);
         }
         Ok(())
     }
@@ -479,16 +482,16 @@ impl WalHandle {
             .transpose()
     }
 
-    fn record_observed_coordination(&self) -> Result<()> {
-        if let Some(snapshot) = self.coordination_header_snapshot()? {
-            self.inner
-                .observed_coord_wal_generation
-                .store(snapshot.wal_generation, Ordering::Release);
-            self.inner
-                .observed_coord_checkpoint_generation
-                .store(snapshot.checkpoint_generation, Ordering::Release);
-        }
-        Ok(())
+    fn record_observed_coordination_snapshot(
+        &self,
+        snapshot: &coordination::CoordinationHeaderSnapshot,
+    ) {
+        self.inner
+            .observed_coord_wal_generation
+            .store(snapshot.wal_generation, Ordering::Release);
+        self.inner
+            .observed_coord_checkpoint_generation
+            .store(snapshot.checkpoint_generation, Ordering::Release);
     }
 
     pub(crate) fn set_max_page_count(&self, page_count: u32) {

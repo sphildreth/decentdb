@@ -100,11 +100,16 @@ fn build_handle(
         ),
         _ => None,
     };
-    if let Some(coordinator) = &process_coordinator {
-        coordinator.publish_recovered_wal(end_lsn, pager.header_snapshot()?.last_checkpoint_lsn)?;
-    }
+    let published_coordination = process_coordinator
+        .as_ref()
+        .map(|coordinator| {
+            coordinator.publish_recovered_wal(end_lsn, pager.header_snapshot()?.last_checkpoint_lsn)
+        })
+        .transpose()?;
     let (observed_coord_wal_generation, observed_coord_checkpoint_generation) =
-        if let Some(coordinator) = &process_coordinator {
+        if let Some(snapshot) = published_coordination {
+            (snapshot.wal_generation, snapshot.checkpoint_generation)
+        } else if let Some(coordinator) = &process_coordinator {
             let snapshot = coordinator.snapshot()?;
             (snapshot.wal_generation, snapshot.checkpoint_generation)
         } else {
@@ -133,6 +138,7 @@ fn build_handle(
         pages_since_checkpoint: AtomicU32::new(0),
         checkpoint_scratch: Mutex::new(Vec::new()),
         materialize_scratch: Mutex::new(Vec::with_capacity(config.page_size as usize)),
+        background_checkpoint_worker: config.background_checkpoint_worker,
         bg_checkpointer: std::sync::OnceLock::new(),
         process_coordinator,
         observed_coord_wal_generation: AtomicU64::new(observed_coord_wal_generation),
@@ -151,19 +157,6 @@ fn build_handle(
             inner: Arc::clone(&inner),
         };
         wal.spill_excess_hot_pages_locked(&mut index, &mut sidecar)?;
-    }
-
-    // Background checkpoint worker (ADR 0058). Only spawn when at least one
-    // size-based threshold is enabled; otherwise the worker would be idle
-    // forever and just consume an OS thread.
-    let cfg = AutoCheckpointConfig::from_db_config(config);
-    let any_threshold_enabled = cfg.threshold_pages != 0 || cfg.threshold_bytes != 0;
-    if config.background_checkpoint_worker && any_threshold_enabled {
-        let bg = super::background::BgCheckpointer::start(Arc::downgrade(&inner), pager.clone());
-        // `set` only fails if the cell was already initialized; build_handle
-        // is the sole writer so this is unreachable in practice. Drop the
-        // result rather than `expect`-ing to keep the cdylib boundary clean.
-        let _ = inner.bg_checkpointer.set(bg);
     }
 
     Ok(WalHandle { inner })

@@ -25,7 +25,7 @@ use crate::exec::dml::{PreparedSimpleDelete, PreparedSimpleInsert, PreparedSimpl
 use crate::exec::{
     decode_paged_table_manifest_payload, read_table_payload_row_count_from_bytes,
     row_satisfies_expression, statement_is_read_only, BulkLoadOptions, EngineRuntime, QueryResult,
-    QueryRow, RuntimeIndex, TableData,
+    QueryRow, RuntimeIndex, SimpleRowIdProjectionRequest, TableData,
 };
 use crate::metadata::{
     CheckConstraintInfo, ColumnInfo, ForeignKeyInfo, HeaderInfo, IndexInfo, IndexVerification,
@@ -183,6 +183,20 @@ pub struct PreparedStatement {
     read_only: bool,
 }
 
+/// Transaction-scoped prepared statement executor for repeated rows.
+///
+/// This handle validates the prepared statement and resolves the insert fast
+/// path once, then reuses that work for each row executed against the same SQL
+/// transaction.
+#[derive(Debug)]
+pub struct PreparedStatementBatch<'txn, 'db> {
+    db: &'db Db,
+    state: &'txn mut ExclusiveSqlTxnState<'db>,
+    prepared: &'txn PreparedStatement,
+    prepared_insert: Option<Arc<PreparedSimpleInsert>>,
+    direct_positional: bool,
+}
+
 /// Exclusive SQL transaction handle that keeps mutable runtime state reserved.
 ///
 /// While this handle is active, callers should use it for all SQL work on the
@@ -237,7 +251,7 @@ impl PreparedStatement {
     }
 }
 
-impl SqlTransaction<'_> {
+impl<'db> SqlTransaction<'db> {
     /// Prepares a single SQL statement against this transaction's current schema.
     pub fn prepare(&self, sql: &str) -> Result<PreparedStatement> {
         let state = self
@@ -280,6 +294,26 @@ impl SqlTransaction<'_> {
             .execute_prepared_in_exclusive_state_mut(prepared, params, state)
     }
 
+    /// Creates a reusable executor for applying many parameter rows to one
+    /// prepared statement inside this transaction.
+    ///
+    /// For simple positional INSERT statements, the returned batch handle
+    /// reuses the prepared insert plan for every row and avoids per-row schema
+    /// validation. The handle borrows this transaction mutably until it is
+    /// dropped.
+    pub fn prepared_batch<'txn>(
+        &'txn mut self,
+        prepared: &'txn PreparedStatement,
+        param_count: usize,
+    ) -> Result<PreparedStatementBatch<'txn, 'db>> {
+        let state = self
+            .state
+            .as_mut()
+            .ok_or_else(|| DbError::transaction("SQL transaction handle is no longer active"))?;
+        self.db
+            .prepare_batch_in_exclusive_state(prepared, param_count, state)
+    }
+
     /// Commits this transaction's reserved runtime into the WAL-backed database.
     pub fn commit(mut self) -> Result<u64> {
         let state = self
@@ -318,6 +352,37 @@ impl SqlTransaction<'_> {
     }
 }
 
+impl PreparedStatementBatch<'_, '_> {
+    /// Executes one row using mutable positional parameters.
+    ///
+    /// The batch may consume parameter values while executing. Callers should
+    /// refill the parameter buffer before the next call.
+    pub fn execute_mut(&mut self, params: &mut [Value]) -> Result<u64> {
+        if self.direct_positional {
+            let prepared_insert = self
+                .prepared_insert
+                .as_ref()
+                .ok_or_else(|| DbError::internal("missing prepared insert batch plan"))?;
+            let affected = self
+                .state
+                .runtime
+                .execute_prepared_simple_insert_positional_params_in_place(
+                    prepared_insert.as_ref(),
+                    params,
+                    self.db.inner.config.page_size,
+                )?;
+            self.state.persistent_changed |=
+                Db::prepared_insert_changes_persistent_table(&self.state.runtime, prepared_insert);
+            return Ok(affected);
+        }
+
+        let result =
+            self.db
+                .execute_prepared_in_exclusive_state_mut(self.prepared, params, self.state)?;
+        Ok(result.affected_rows())
+    }
+}
+
 impl Drop for SqlTransaction<'_> {
     fn drop(&mut self) {
         if let Some(state) = self.state.take() {
@@ -353,7 +418,8 @@ struct DbInner {
     prepared_insert_cache: Mutex<PreparedInsertCache>,
     held_snapshots: Mutex<HashMap<u64, ReaderGuard>>,
     sync_ctx: SyncContext,
-    reactive_hub: Arc<ReactiveHub>,
+    reactive_registry_key: Option<PathBuf>,
+    reactive_hub: OnceLock<Arc<ReactiveHub>>,
     audit_context: Arc<Mutex<crate::security::AuditContext>>,
     read_only_paged_row_source_residency: Mutex<ReadOnlyPagedRowSourceResidency>,
     write_queue: OnceLock<WriteQueue>,
@@ -1486,7 +1552,7 @@ impl Db {
     /// Subscribes to committed changes for one or more persistent user tables.
     pub fn watch_table(&self, options: TableWatchOptions) -> Result<WatchHandle> {
         let tables = self.validate_watch_tables(&options.tables)?;
-        self.inner.reactive_hub.watch_table(
+        self.reactive_hub().watch_table(
             tables,
             options.queue_capacity,
             self.inner.wal.latest_snapshot(),
@@ -1498,7 +1564,7 @@ impl Db {
     pub fn watch_range(&self, mut options: RangeWatchOptions) -> Result<WatchHandle> {
         let canonical = self.validate_watch_range_table(&options.table)?;
         options.table = canonical;
-        self.inner.reactive_hub.watch_range(
+        self.reactive_hub().watch_range(
             options,
             self.inner.wal.latest_snapshot(),
             self.schema_cookie()?,
@@ -1520,7 +1586,7 @@ impl Db {
         }
         let dependencies = self.query_watch_dependencies(&statement)?;
         let result = self.execute_with_params(sql, params)?;
-        self.inner.reactive_hub.watch_query(
+        self.reactive_hub().watch_query(
             dependencies,
             options.queue_capacity,
             self.inner.wal.latest_snapshot(),
@@ -1536,7 +1602,7 @@ impl Db {
         } else {
             Some(self.validate_watch_tables(&options.tables)?)
         };
-        self.inner.reactive_hub.change_stream(
+        self.reactive_hub().change_stream(
             tables,
             options.queue_capacity,
             self.inner.wal.latest_snapshot(),
@@ -1547,13 +1613,17 @@ impl Db {
     /// Returns current reactive subscription counters.
     #[must_use]
     pub fn reactive_metrics(&self) -> ReactiveMetricsSnapshot {
-        self.inner.reactive_hub.metrics_snapshot()
+        self.reactive_hub_if_initialized()
+            .map_or_else(ReactiveMetricsSnapshot::default, |hub| {
+                hub.metrics_snapshot()
+            })
     }
 
     /// Returns current reactive subscription details.
     #[must_use]
     pub fn reactive_subscriptions(&self) -> Vec<ReactiveSubscriptionSnapshot> {
-        self.inner.reactive_hub.subscription_snapshots()
+        self.reactive_hub_if_initialized()
+            .map_or_else(Vec::new, |hub| hub.subscription_snapshots())
     }
 
     /// Executes one or more read-only SQL statements against a retained WAL LSN.
@@ -1985,6 +2055,16 @@ impl Db {
                 results.push(result);
                 continue;
             }
+            if let Some(result) = self.try_execute_simple_count_sql_fast_path(trimmed, params)? {
+                results.push(result);
+                continue;
+            }
+            if let Some(result) =
+                self.try_execute_simple_row_id_projection_sql_fast_path(trimmed, params)?
+            {
+                results.push(result);
+                continue;
+            }
 
             reject_unsupported_collated_key_sql(trimmed)?;
             let statement = self.parsed_statement(trimmed)?;
@@ -1996,6 +2076,98 @@ impl Db {
             results.push(result);
         }
         Ok(results)
+    }
+
+    fn try_execute_simple_count_sql_fast_path(
+        &self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Option<QueryResult>> {
+        if !params.is_empty() || self.inner.sql_txn_active.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let Some(plan) = parse_simple_count_star_sql(sql) else {
+            return Ok(None);
+        };
+
+        let reader = self.inner.wal.begin_reader_with_pager(&self.inner.pager)?;
+        let snapshot_lsn = reader.snapshot_lsn();
+        self.refresh_engine_from_snapshot(snapshot_lsn)?;
+        if self.ensure_security_tables_loaded_at_snapshot(snapshot_lsn)? {
+            return Ok(None);
+        }
+        let runtime = self
+            .inner
+            .engine
+            .read()
+            .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+        let Some(table) = runtime.catalog.table(plan.table_name) else {
+            return Ok(None);
+        };
+        if runtime.temp_table_schema(plan.table_name).is_some()
+            || runtime
+                .catalog
+                .views
+                .keys()
+                .any(|view_name| identifiers_equal(view_name, plan.table_name))
+        {
+            return Ok(None);
+        }
+        let row_count = self.runtime_table_row_count(&runtime, &table.name)?;
+        let row_count = i64::try_from(row_count).map_err(|_| {
+            DbError::sql(format!(
+                "table {} exceeds COUNT(*) row-count limits",
+                plan.table_name
+            ))
+        })?;
+        drop(runtime);
+        drop(reader);
+        Ok(Some(QueryResult::with_rows(
+            vec!["COUNT(*)".to_string()],
+            vec![QueryRow::new(vec![Value::Int64(row_count)])],
+        )))
+    }
+
+    fn try_execute_simple_row_id_projection_sql_fast_path(
+        &self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Option<QueryResult>> {
+        if self.inner.sql_txn_active.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let Some(plan) = parse_simple_row_id_projection_sql(sql) else {
+            return Ok(None);
+        };
+        let Some(Value::Int64(lookup_row_id)) = params.get(plan.param_index) else {
+            return Ok(None);
+        };
+
+        let reader = self.inner.wal.begin_reader_with_pager(&self.inner.pager)?;
+        let snapshot_lsn = reader.snapshot_lsn();
+        self.refresh_engine_from_snapshot(snapshot_lsn)?;
+        if self.ensure_security_tables_loaded_at_snapshot(snapshot_lsn)? {
+            return Ok(None);
+        }
+        let runtime = self
+            .inner
+            .engine
+            .read()
+            .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+        let result =
+            runtime.execute_simple_row_id_projection_at_snapshot(SimpleRowIdProjectionRequest {
+                table_name: plan.table_name,
+                projection_columns: &plan.projection_columns,
+                filter_column: plan.filter_column,
+                lookup_row_id: *lookup_row_id,
+                pager: &self.inner.pager,
+                wal: &self.inner.wal,
+                snapshot_lsn,
+                use_persistent_pk_index: self.inner.config.persistent_pk_index,
+            })?;
+        drop(runtime);
+        drop(reader);
+        Ok(result)
     }
 
     pub(crate) fn begin_deferred_group_commit(
@@ -2018,6 +2190,30 @@ impl Db {
         self.inner
             .write_queue
             .get_or_init(|| WriteQueue::new(&self.inner.config))
+    }
+
+    fn reactive_hub(&self) -> Arc<ReactiveHub> {
+        Arc::clone(self.inner.reactive_hub.get_or_init(|| {
+            crate::reactive::acquire_hub(
+                self.inner.reactive_registry_key.clone(),
+                &self.inner.config,
+            )
+        }))
+    }
+
+    fn reactive_hub_if_initialized(&self) -> Option<&Arc<ReactiveHub>> {
+        self.inner.reactive_hub.get()
+    }
+
+    fn reactive_hub_if_available(&self) -> Option<Arc<ReactiveHub>> {
+        self.reactive_hub_if_initialized()
+            .map(Arc::clone)
+            .or_else(|| crate::reactive::existing_hub(self.inner.reactive_registry_key.as_ref()))
+    }
+
+    fn reactive_has_watchers(&self) -> bool {
+        self.reactive_hub_if_available()
+            .is_some_and(|hub| hub.has_watchers())
     }
 
     fn reject_transaction_control_for_queued_sql(&self, sql: &str) -> Result<()> {
@@ -2350,6 +2546,10 @@ impl Db {
     }
 
     pub(crate) fn refresh_named_snapshot_retention(&self) -> Result<()> {
+        if self.inner.catalog.schema_cookie()? == 0 {
+            self.inner.wal.set_retained_snapshot_lsn(None);
+            return Ok(());
+        }
         let retained_lsn = crate::branch::retained_snapshot_lsn(self)?;
         self.inner.wal.set_retained_snapshot_lsn(retained_lsn);
         Ok(())
@@ -2712,7 +2912,7 @@ impl Db {
         runtime.set_audit_context_handle(Arc::clone(&audit_context));
         let catalog = CatalogHandle::new(runtime.catalog.as_ref().clone());
         let last_seen_checkpoint_epoch = wal.checkpoint_epoch();
-        let reactive_hub = crate::reactive::acquire_hub(open_lock_key.clone(), &effective_config);
+        let reactive_registry_key = open_lock_key.clone();
         let busy_timeout_ms = effective_config.write_queue_default_timeout_ms;
 
         let db = Self {
@@ -2738,7 +2938,8 @@ impl Db {
                 prepared_insert_cache: Mutex::new(PreparedInsertCache::default()),
                 held_snapshots: Mutex::new(HashMap::new()),
                 sync_ctx: SyncContext::new(&path),
-                reactive_hub,
+                reactive_registry_key,
+                reactive_hub: OnceLock::new(),
                 audit_context,
                 read_only_paged_row_source_residency: Mutex::new(
                     ReadOnlyPagedRowSourceResidency::default(),
@@ -3869,9 +4070,7 @@ impl Db {
 
         let cache_key = Self::prepared_statement_cache_key(prepared);
         if let Some(plan) = prepared_insert_runtime_cache.get(&cache_key) {
-            if runtime.can_reuse_prepared_simple_insert(plan)
-                && runtime.prepared_insert_target_loaded(&plan.table_name)
-            {
+            if Self::prepared_insert_target_loaded(runtime, plan) {
                 return Ok(Some(Arc::clone(plan)));
             }
             prepared_insert_runtime_cache.remove(&cache_key);
@@ -3881,7 +4080,7 @@ impl Db {
             prepared_insert.use_generic_validation || prepared_insert.use_generic_index_updates;
         if !needs_refresh
             && runtime.can_reuse_prepared_simple_insert(prepared_insert)
-            && runtime.prepared_insert_target_loaded(&prepared_insert.table_name)
+            && Self::prepared_insert_target_loaded(runtime, prepared_insert)
         {
             prepared_insert_runtime_cache.insert(cache_key, Arc::clone(prepared_insert));
             return Ok(Some(Arc::clone(prepared_insert)));
@@ -3911,12 +4110,21 @@ impl Db {
     }
 
     fn prepared_insert_changes_persistent_table(
+        _runtime: &EngineRuntime,
+        prepared_insert: &PreparedSimpleInsert,
+    ) -> bool {
+        prepared_insert.catalog_table_name.is_some()
+    }
+
+    fn prepared_insert_target_loaded(
         runtime: &EngineRuntime,
         prepared_insert: &PreparedSimpleInsert,
     ) -> bool {
-        runtime
-            .temp_table_schema(&prepared_insert.table_name)
-            .is_none()
+        if let Some(table_name) = prepared_insert.catalog_table_name.as_deref() {
+            runtime.tables.contains_key(table_name)
+        } else {
+            runtime.prepared_insert_target_loaded(&prepared_insert.table_name)
+        }
     }
 
     fn execute_prepared_read_statement(
@@ -4855,6 +5063,9 @@ impl Db {
         if !self.inner.config.persistent_pk_index {
             return Ok(());
         }
+        if self.inner.catalog.schema_cookie()? == 0 {
+            return Ok(());
+        }
 
         let mut runtime = self
             .inner
@@ -4913,6 +5124,9 @@ impl Db {
 
     fn backfill_paged_row_storage(&self) -> Result<()> {
         if !self.inner.config.paged_row_storage {
+            return Ok(());
+        }
+        if self.inner.catalog.schema_cookie()? == 0 {
             return Ok(());
         }
 
@@ -7054,6 +7268,48 @@ impl Db {
             &mut state.persistent_changed,
             &mut state.indexes_maybe_stale,
         )
+    }
+
+    fn prepare_batch_in_exclusive_state<'txn, 'db>(
+        &'db self,
+        prepared: &'txn PreparedStatement,
+        param_count: usize,
+        state: &'txn mut ExclusiveSqlTxnState<'db>,
+    ) -> Result<PreparedStatementBatch<'txn, 'db>> {
+        if !Arc::ptr_eq(&self.inner, &prepared.db.inner) {
+            return Err(DbError::transaction(
+                "prepared statement belongs to a different database handle",
+            ));
+        }
+        self.validate_prepared_schema_cookie(
+            prepared,
+            state.runtime.catalog.schema_cookie,
+            state.runtime.temp_schema_cookie,
+        )?;
+
+        let mut prepared_insert = None;
+        let mut direct_positional = false;
+        if !prepared.read_only && matches!(prepared.statement.as_ref(), SqlStatement::Insert(_)) {
+            let snapshot_lsn = state.snapshot_lsn();
+            prepared_insert = self.prepared_insert_plan_for_runtime_state(
+                prepared,
+                &mut state.runtime,
+                snapshot_lsn,
+                &mut state.indexes_maybe_stale,
+                &mut state.prepared_insert_runtime_cache,
+            )?;
+            direct_positional = prepared_insert.as_deref().is_some_and(|insert| {
+                Self::prepared_insert_uses_direct_positional_params(insert, param_count)
+            });
+        }
+
+        Ok(PreparedStatementBatch {
+            db: self,
+            state,
+            prepared,
+            prepared_insert,
+            direct_positional,
+        })
     }
 
     fn execute_statement_in_state(
@@ -11681,10 +11937,13 @@ impl Db {
         &self,
         runtime: &mut EngineRuntime,
     ) -> Option<PendingReactiveCommit> {
-        if !self.inner.reactive_hub.has_watchers() {
+        let Some(hub) = self
+            .reactive_hub_if_available()
+            .filter(|hub| hub.has_watchers())
+        else {
             let _ = runtime.take_reactive_mutations();
             return None;
-        }
+        };
         let mut changed = runtime
             .dirty_tables
             .iter()
@@ -11702,7 +11961,7 @@ impl Db {
         if changed.is_empty() && row_changes.is_empty() && !schema_changed {
             return None;
         }
-        let max_rows = self.inner.reactive_hub.max_row_changes_per_event();
+        let max_rows = hub.max_row_changes_per_event();
         let row_changes_truncated = max_rows > 0 && row_changes.len() > max_rows;
         if row_changes_truncated {
             row_changes.clear();
@@ -11718,15 +11977,15 @@ impl Db {
     }
 
     fn publish_reactive_commit(&self, pending: Option<PendingReactiveCommit>, committed_lsn: u64) {
-        if let Some(pending) = pending {
-            self.inner.reactive_hub.publish(pending, committed_lsn);
+        if let (Some(pending), Some(hub)) = (pending, self.reactive_hub_if_available()) {
+            hub.publish(pending, committed_lsn);
         }
     }
 
     fn configure_runtime_sync_capture(&self, runtime: &mut EngineRuntime) -> Result<()> {
         let active = self.runtime_sync_capture_should_be_active(runtime)?;
         runtime.set_sync_capture_active(active);
-        runtime.set_reactive_capture_active(self.inner.reactive_hub.has_watchers());
+        runtime.set_reactive_capture_active(self.reactive_has_watchers());
         Ok(())
     }
 
@@ -13171,6 +13430,108 @@ enum PragmaName {
     ForeignKeyList,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SimpleCountSqlPlan<'a> {
+    table_name: &'a str,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SimpleRowIdProjectionSqlPlan<'a> {
+    table_name: &'a str,
+    projection_columns: Vec<&'a str>,
+    filter_column: &'a str,
+    param_index: usize,
+}
+
+fn parse_simple_count_star_sql(sql: &str) -> Option<SimpleCountSqlPlan<'_>> {
+    const PREFIX: &str = "select count(*) from ";
+    let trimmed = sql.trim();
+    if !trimmed.is_ascii()
+        || trimmed.len() <= PREFIX.len()
+        || !trimmed[..PREFIX.len()].eq_ignore_ascii_case(PREFIX)
+    {
+        return None;
+    }
+    let table_name = trimmed[PREFIX.len()..].trim();
+    if !is_simple_sql_identifier(table_name) {
+        return None;
+    }
+    Some(SimpleCountSqlPlan { table_name })
+}
+
+fn parse_simple_row_id_projection_sql(sql: &str) -> Option<SimpleRowIdProjectionSqlPlan<'_>> {
+    let trimmed = sql.trim();
+    if !trimmed.is_ascii() {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if !lower.starts_with("select ") {
+        return None;
+    }
+    let from_index = lower.find(" from ")?;
+    let where_marker = " where ";
+    let where_index = lower[from_index + 6..]
+        .find(where_marker)
+        .map(|index| from_index + 6 + index)?;
+    if lower[where_index + where_marker.len()..].contains(" order ")
+        || lower[where_index + where_marker.len()..].contains(" limit ")
+        || lower[where_index + where_marker.len()..].contains(" group ")
+    {
+        return None;
+    }
+
+    let projection_sql = trimmed[6..from_index].trim();
+    let table_name = trimmed[from_index + 6..where_index].trim();
+    let filter_sql = trimmed[where_index + where_marker.len()..].trim();
+    if projection_sql.is_empty() || !is_simple_sql_identifier(table_name) {
+        return None;
+    }
+    let mut projection_columns = Vec::new();
+    for column in projection_sql.split(',') {
+        let column = column.trim();
+        if !is_simple_sql_identifier(column) {
+            return None;
+        }
+        projection_columns.push(column);
+    }
+    let (left, right) = filter_sql.split_once('=')?;
+    let left = left.trim();
+    let right = right.trim();
+    let (filter_column, param_index) = if let Some(param_index) = parse_positional_param(right) {
+        (left, param_index)
+    } else if let Some(param_index) = parse_positional_param(left) {
+        (right, param_index)
+    } else {
+        return None;
+    };
+    if !is_simple_sql_identifier(filter_column) {
+        return None;
+    }
+    Some(SimpleRowIdProjectionSqlPlan {
+        table_name,
+        projection_columns,
+        filter_column,
+        param_index,
+    })
+}
+
+fn parse_positional_param(sql: &str) -> Option<usize> {
+    let number = sql.strip_prefix('$')?;
+    if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    number.parse::<usize>().ok()?.checked_sub(1)
+}
+
+fn is_simple_sql_identifier(identifier: &str) -> bool {
+    let mut chars = identifier.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
 fn parse_transaction_control(sql: &str) -> Option<TransactionControl> {
     let normalized = normalized_control_sql(sql);
     let upper = normalized.to_ascii_uppercase();
@@ -14125,7 +14486,7 @@ fn trigger_event_name(event: TriggerEvent) -> &'static str {
 
 fn runtime_index_entry_count(index: &RuntimeIndex) -> usize {
     match index {
-        RuntimeIndex::Btree { keys } => keys.total_row_id_count(),
+        RuntimeIndex::Btree { keys, .. } => keys.total_row_id_count(),
         RuntimeIndex::Trigram { index } => index.entry_count(),
         RuntimeIndex::Spatial { index } => index.len(),
         RuntimeIndex::FullText { index } => index.entry_count(),
@@ -15402,7 +15763,10 @@ mod tests {
     use crate::sql::parser::parse_sql_statement;
     use crate::{BulkLoadOptions, Db, QueuedWriteOptions, Value, WalSyncMode};
 
-    use super::{split_sql_batch, PreparedInsertCache, StatementCache, TempSchemaState};
+    use super::{
+        parse_simple_count_star_sql, parse_simple_row_id_projection_sql, split_sql_batch,
+        PreparedInsertCache, StatementCache, TempSchemaState,
+    };
 
     #[derive(Debug)]
     struct PagerReadStore<'a> {
@@ -15620,6 +15984,30 @@ mod tests {
 
         assert!(Arc::ptr_eq(&first, &first_again));
         assert!(!Arc::ptr_eq(&second, &second_again));
+    }
+
+    #[test]
+    fn simple_count_sql_fast_path_parser_accepts_only_plain_count_star() {
+        let plan = parse_simple_count_star_sql("SELECT COUNT(*) FROM songs").expect("simple count");
+        assert_eq!(plan.table_name, "songs");
+        assert!(parse_simple_count_star_sql("SELECT COUNT(id) FROM songs").is_none());
+        assert!(parse_simple_count_star_sql("SELECT COUNT(*) FROM songs WHERE id = 1").is_none());
+    }
+
+    #[test]
+    fn simple_row_id_projection_sql_fast_path_parser_extracts_projection() {
+        let plan = parse_simple_row_id_projection_sql(
+            "SELECT id, name, country FROM artists WHERE id = $1",
+        )
+        .expect("simple rowid projection");
+        assert_eq!(plan.table_name, "artists");
+        assert_eq!(plan.projection_columns, vec!["id", "name", "country"]);
+        assert_eq!(plan.filter_column, "id");
+        assert_eq!(plan.param_index, 0);
+        assert!(parse_simple_row_id_projection_sql(
+            "SELECT id, upper(name) FROM artists WHERE id = $1"
+        )
+        .is_none());
     }
 
     #[test]
@@ -17119,6 +17507,42 @@ mod tests {
                     .expect("lookup committed rows")
             ),
             2
+        );
+    }
+
+    #[test]
+    fn exclusive_transaction_prepared_batch_reuses_insert_plan() {
+        let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+            .expect("create table");
+
+        let mut txn = db.transaction().expect("begin exclusive txn");
+        let insert = txn
+            .prepare("INSERT INTO t VALUES ($1, $2)")
+            .expect("prepare insert");
+        let mut params = vec![Value::Int64(0), Value::Text(String::new())];
+        {
+            let mut batch = txn
+                .prepared_batch(&insert, params.len())
+                .expect("prepare batch");
+            for row_id in 1..=4 {
+                params[0] = Value::Int64(row_id);
+                params[1] = Value::Text(format!("value-{row_id}"));
+                assert_eq!(batch.execute_mut(&mut params).expect("insert row"), 1);
+            }
+        }
+        txn.commit().expect("commit txn");
+
+        assert_eq!(
+            scalar_i64(&db.execute("SELECT COUNT(*) FROM t").expect("count rows")),
+            4
+        );
+        assert_eq!(
+            scalar_i64(
+                &db.execute("SELECT id FROM t WHERE val = 'value-3'")
+                    .expect("lookup committed row")
+            ),
+            3
         );
     }
 
@@ -27765,6 +28189,7 @@ mod tests {
     fn dummy_prepared_insert(table_name: &str) -> PreparedSimpleInsert {
         PreparedSimpleInsert {
             table_name: table_name.to_string(),
+            catalog_table_name: Some(table_name.to_string()),
             row_source_dependency_tables: Vec::new(),
             columns: vec![PreparedInsertColumn {
                 name: "id".to_string(),

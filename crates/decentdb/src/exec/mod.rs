@@ -293,6 +293,17 @@ impl TableData {
             .and_then(|index| self.rows.get(index))
     }
 
+    fn visit_int64_column_values<F>(&self, column_index: usize, mut visitor: F) -> Result<()>
+    where
+        F: FnMut(i64, Option<i64>) -> Result<()>,
+    {
+        for row in &self.rows {
+            let value = int64_column_value(row.values.get(column_index))?;
+            visitor(row.row_id, value)?;
+        }
+        Ok(())
+    }
+
     /// Approximate heap residency of this table's row vector. Includes
     /// `Vec<StoredRow>` capacity plus each row's `Vec<Value>` capacity plus
     /// each `Value`'s heap allocations. Excludes the `TableData` struct
@@ -414,6 +425,17 @@ impl TableRowRef<'_> {
             Self::Resident(row) => &row.values,
             Self::Decoded(row) => &row.values,
         }
+    }
+}
+
+fn int64_column_value(value: Option<&Value>) -> Result<Option<i64>> {
+    match value {
+        Some(Value::Int64(value)) => Ok(Some(*value)),
+        Some(Value::Null) => Ok(None),
+        Some(other) => Err(DbError::sql(format!(
+            "numeric aggregate does not support {other:?}"
+        ))),
+        None => Err(DbError::internal("row is shorter than table schema")),
     }
 }
 
@@ -797,6 +819,33 @@ impl TablePageManifest {
         })))
     }
 
+    fn visit_int64_column_values<F>(&self, column_index: usize, mut visitor: F) -> Result<()>
+    where
+        F: FnMut(i64, Option<i64>) -> Result<()>,
+    {
+        for entry in self.rows.iter() {
+            let chunk = self.chunks.get(entry.chunk_index as usize).ok_or_else(|| {
+                DbError::corruption("paged table chunk index exceeded chunk list length")
+            })?;
+            let payload = if entry.is_overlay {
+                chunk
+                    .overlay_payload
+                    .as_ref()
+                    .ok_or_else(|| DbError::corruption("paged table overlay chunk is missing"))?
+            } else {
+                &chunk.payload
+            };
+            let start = entry.locator.byte_offset as usize;
+            let end = start + entry.locator.byte_len as usize;
+            let row_bytes = payload
+                .as_slice()
+                .get(start..end)
+                .ok_or_else(|| DbError::corruption("paged row locator exceeded payload length"))?;
+            visitor(entry.row_id, Row::decode_int64_at(row_bytes, column_index)?)?;
+        }
+        Ok(())
+    }
+
     fn rows(&self) -> TablePageRowIter<'_> {
         TablePageRowIter {
             manifest: self,
@@ -953,6 +1002,16 @@ impl<'a> VisibleTableRowSource<'a> {
             Self::Base(source) => source.row_at_position(position),
         }
     }
+
+    fn visit_int64_column_values<F>(&self, column_index: usize, visitor: F) -> Result<()>
+    where
+        F: FnMut(i64, Option<i64>) -> Result<()>,
+    {
+        match self {
+            Self::Temp(data) => data.visit_int64_column_values(column_index, visitor),
+            Self::Base(source) => source.visit_int64_column_values(column_index, visitor),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1001,6 +1060,16 @@ impl TableRowSource {
         match self {
             Self::Resident(data) => Ok(data.rows.get(position).map(TableRowRef::Resident)),
             Self::Paged(manifest) => manifest.row_at_position(position),
+        }
+    }
+
+    fn visit_int64_column_values<F>(&self, column_index: usize, visitor: F) -> Result<()>
+    where
+        F: FnMut(i64, Option<i64>) -> Result<()>,
+    {
+        match self {
+            Self::Resident(data) => data.visit_int64_column_values(column_index, visitor),
+            Self::Paged(manifest) => manifest.visit_int64_column_values(column_index, visitor),
         }
     }
 
@@ -1338,16 +1407,63 @@ impl RuntimeBtreeKeys {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct RuntimeCoveringPayloads {
+    columns: Vec<String>,
+    rows: BTreeMap<i64, Vec<Value>>,
+}
+
+impl RuntimeCoveringPayloads {
+    fn new(columns: Vec<String>) -> Self {
+        Self {
+            columns,
+            rows: BTreeMap::new(),
+        }
+    }
+
+    fn column_position(&self, column_name: &str) -> Option<usize> {
+        self.columns
+            .iter()
+            .position(|candidate| identifiers_equal(candidate, column_name))
+    }
+
+    fn insert_row_values(&mut self, row_id: i64, values: Vec<Value>) {
+        self.rows.insert(row_id, values);
+    }
+
+    fn remove_row_id(&mut self, row_id: i64) {
+        self.rows.remove(&row_id);
+    }
+
+    fn project_row(&self, row_id: i64, offsets: &[usize]) -> Option<QueryRow> {
+        let values = self.rows.get(&row_id)?;
+        let mut projected = Vec::with_capacity(offsets.len());
+        for offset in offsets {
+            projected.push(values.get(*offset)?.clone());
+        }
+        Some(QueryRow::new(projected))
+    }
+}
+
+#[derive(Clone, Debug)]
 pub(crate) enum RuntimeIndex {
-    Btree { keys: RuntimeBtreeKeys },
-    Trigram { index: TrigramIndex },
-    Spatial { index: SpatialRuntimeIndex },
-    FullText { index: FullTextIndex },
+    Btree {
+        keys: RuntimeBtreeKeys,
+        covering: Option<RuntimeCoveringPayloads>,
+    },
+    Trigram {
+        index: TrigramIndex,
+    },
+    Spatial {
+        index: SpatialRuntimeIndex,
+    },
+    FullText {
+        index: FullTextIndex,
+    },
 }
 
 fn runtime_index_entry_count(index: &RuntimeIndex) -> usize {
     match index {
-        RuntimeIndex::Btree { keys } => keys.total_row_id_count(),
+        RuntimeIndex::Btree { keys, .. } => keys.total_row_id_count(),
         RuntimeIndex::Trigram { index } => index.entry_count(),
         RuntimeIndex::Spatial { index } => index.len(),
         RuntimeIndex::FullText { index } => index.entry_count(),
@@ -1360,6 +1476,7 @@ pub(super) enum PendingIndexInsert {
         name: String,
         key: RuntimeBtreeKey,
         row_id: i64,
+        covering_values: Option<Vec<Value>>,
     },
     Trigram {
         name: String,
@@ -1604,6 +1721,17 @@ impl Clone for EngineRuntime {
     }
 }
 
+pub(crate) struct SimpleRowIdProjectionRequest<'a> {
+    pub(crate) table_name: &'a str,
+    pub(crate) projection_columns: &'a [&'a str],
+    pub(crate) filter_column: &'a str,
+    pub(crate) lookup_row_id: i64,
+    pub(crate) pager: &'a PagerHandle,
+    pub(crate) wal: &'a WalHandle,
+    pub(crate) snapshot_lsn: u64,
+    pub(crate) use_persistent_pk_index: bool,
+}
+
 impl EngineRuntime {
     #[must_use]
     pub(crate) fn empty(schema_cookie: u32) -> Self {
@@ -1673,6 +1801,10 @@ impl EngineRuntime {
 
     pub(crate) fn sync_capture_active(&self) -> bool {
         self.sync_capture_active
+    }
+
+    pub(crate) fn mutation_capture_active(&self) -> bool {
+        self.sync_capture_active || self.reactive_capture_active
     }
 
     pub(crate) fn should_record_sync_mutation_for_table(&self, table: &TableSchema) -> bool {
@@ -2253,7 +2385,6 @@ impl EngineRuntime {
         if table_names.is_empty() {
             return Ok(());
         }
-        let mut tables_loaded = Vec::new();
         for table_name in &table_names {
             let state = *self.persisted_tables.get(table_name).ok_or_else(|| {
                 DbError::internal(format!(
@@ -2267,11 +2398,7 @@ impl EngineRuntime {
                 ps.tail = read_uncompressed_overflow_tail(store, ps.pointer)?.unwrap_or_default();
             }
             self.tables_mut().insert(table_name.clone(), data.into());
-            tables_loaded.push(table_name.clone());
             self.deferred_tables_mut().remove(table_name);
-        }
-        for table_name in &tables_loaded {
-            self.mark_indexes_stale_for_table(table_name);
         }
         self.rebuild_stale_indexes(page_size)?;
         Ok(())
@@ -2298,7 +2425,6 @@ impl EngineRuntime {
         if table_names.is_empty() {
             return Ok(());
         }
-        let mut tables_loaded = Vec::new();
         for table_name in &table_names {
             let state = *self.persisted_tables.get(table_name).ok_or_else(|| {
                 DbError::internal(format!(
@@ -2316,11 +2442,7 @@ impl EngineRuntime {
                 ps.tail = read_uncompressed_overflow_tail(store, ps.pointer)?.unwrap_or_default();
             }
             self.tables_mut().insert(table_name.clone(), row_source);
-            tables_loaded.push(table_name.clone());
             self.deferred_tables_mut().remove(table_name);
-        }
-        for table_name in &tables_loaded {
-            self.mark_indexes_stale_for_table(table_name);
         }
         self.rebuild_stale_indexes(page_size)?;
         Ok(())
@@ -3434,10 +3556,10 @@ impl EngineRuntime {
 
         // ADR 0143 Phase B: under per-table deferred materialization, an
         // index whose target table has not yet been loaded must not be
-        // rebuilt — its rows are not in memory. The index is rebuilt
-        // when the table itself is materialized via
-        // `materialize_deferred_tables_with_store`, which calls
-        // `mark_indexes_stale_for_table` followed by `rebuild_stale_indexes`.
+        // rebuilt — its rows are not in memory. If the index was still
+        // resident from before the table was deferred, it remains valid;
+        // otherwise the index is rebuilt when the table itself is
+        // materialized and no longer appears in `deferred_tables`.
         let names = self
             .catalog
             .indexes
@@ -3626,6 +3748,11 @@ impl EngineRuntime {
                         name: index.name.clone(),
                         key,
                         row_id: row.row_id,
+                        covering_values: covering_payload_values_for_row(
+                            &index,
+                            &table,
+                            &row.values,
+                        ),
                     });
                 }
                 IndexKind::Trigram => {
@@ -3683,9 +3810,18 @@ impl EngineRuntime {
     ) -> Result<()> {
         for update in updates {
             match update {
-                PendingIndexInsert::Btree { name, key, row_id } => match self.index_mut(&name) {
-                    Some(RuntimeIndex::Btree { keys }) => {
+                PendingIndexInsert::Btree {
+                    name,
+                    key,
+                    row_id,
+                    covering_values,
+                } => match self.index_mut(&name) {
+                    Some(RuntimeIndex::Btree { keys, covering }) => {
                         keys.insert_row_id(key, row_id)?;
+                        if let (Some(covering), Some(values)) = (covering.as_mut(), covering_values)
+                        {
+                            covering.insert_row_values(row_id, values);
+                        }
                     }
                     Some(_) => {
                         return Err(DbError::internal(format!(
@@ -4130,7 +4266,14 @@ impl EngineRuntime {
                     .map(dataset_to_result)
             }
             Statement::Explain(explain) => {
-                let planner_catalog = self.planner_catalog();
+                let mut planner_catalog = self.planner_catalog();
+                if self.security_rules_active()? {
+                    for index in planner_catalog.indexes.values_mut() {
+                        if index.kind == IndexKind::Btree {
+                            index.fresh = false;
+                        }
+                    }
+                }
                 let mut lines = planner::plan_statement(
                     &Statement::Explain(explain.clone()),
                     &planner_catalog,
@@ -5184,6 +5327,11 @@ impl EngineRuntime {
         params: &[Value],
     ) -> Result<QueryResult> {
         if let Some(result) =
+            self.try_simple_scalar_int64_numeric_aggregate_from_source(row_source, plan)?
+        {
+            return Ok(result);
+        }
+        if let Some(result) =
             self.try_simple_scalar_filtered_numeric_aggregate_from_source(row_source, plan, params)?
         {
             return Ok(result);
@@ -5416,6 +5564,66 @@ impl EngineRuntime {
         render_simple_grouped_numeric_aggregate_groups(self, groups, plan, params)
     }
 
+    fn try_simple_scalar_int64_numeric_aggregate_from_source(
+        &self,
+        row_source: VisibleTableRowSource<'_>,
+        plan: &SimpleGroupedNumericAggregatePlan<'_>,
+    ) -> Result<Option<QueryResult>> {
+        let Some(column_index) = self.simple_scalar_int64_aggregate_column(plan) else {
+            return Ok(None);
+        };
+        let mut stats = SimpleScalarInt64AggregateStats::default();
+        row_source.visit_int64_column_values(column_index, |_, value| {
+            stats.add(value);
+            Ok(())
+        })?;
+        Ok(Some(QueryResult::with_rows(
+            plan.column_names.clone(),
+            vec![QueryRow::new(stats.into_values(&plan.aggregate_bindings))],
+        )))
+    }
+
+    fn simple_scalar_int64_aggregate_column(
+        &self,
+        plan: &SimpleGroupedNumericAggregatePlan<'_>,
+    ) -> Option<usize> {
+        if !plan.group_exprs.is_empty()
+            || plan.filter_expr.is_some()
+            || plan.projection_exprs.is_some()
+            || plan.having.is_some()
+            || plan.order_by.is_some()
+            || plan.limit.is_some()
+            || plan.offset != 0
+        {
+            return None;
+        }
+        let table_schema = self.table_schema(plan.table_name)?;
+        let mut scalar_column_index = None;
+        for aggregate in &plan.aggregate_bindings {
+            let column_index = match aggregate.kind {
+                SimpleGroupedNumericAggregateKind::CountRows => continue,
+                SimpleGroupedNumericAggregateKind::CountNonNull
+                | SimpleGroupedNumericAggregateKind::Sum
+                | SimpleGroupedNumericAggregateKind::Avg
+                | SimpleGroupedNumericAggregateKind::Min
+                | SimpleGroupedNumericAggregateKind::Max => {
+                    simple_aggregate_source_column_index(aggregate, table_schema)?
+                }
+                _ => return None,
+            };
+            if table_schema.columns.get(column_index)?.column_type != ColumnType::Int64 {
+                return None;
+            }
+            if scalar_column_index
+                .replace(column_index)
+                .is_some_and(|existing| existing != column_index)
+            {
+                return None;
+            }
+        }
+        scalar_column_index
+    }
+
     fn try_simple_scalar_filtered_numeric_aggregate_from_source(
         &self,
         row_source: VisibleTableRowSource<'_>,
@@ -5617,6 +5825,11 @@ impl EngineRuntime {
         plan: &SimpleGroupedNumericAggregatePlan<'_>,
         params: &[Value],
     ) -> Result<QueryResult> {
+        if let Some(result) =
+            self.try_simple_scalar_int64_numeric_aggregate_from_persisted_state(store, state, plan)?
+        {
+            return Ok(result);
+        }
         if let Some(result) = self
             .try_simple_scalar_filtered_numeric_aggregate_from_persisted_state(
                 store, state, plan, params,
@@ -5840,6 +6053,26 @@ impl EngineRuntime {
         })?;
 
         render_simple_grouped_numeric_aggregate_groups(self, groups, plan, params)
+    }
+
+    fn try_simple_scalar_int64_numeric_aggregate_from_persisted_state<S: PageStore>(
+        &self,
+        store: &S,
+        state: PersistedTableState,
+        plan: &SimpleGroupedNumericAggregatePlan<'_>,
+    ) -> Result<Option<QueryResult>> {
+        let Some(column_index) = self.simple_scalar_int64_aggregate_column(plan) else {
+            return Ok(None);
+        };
+        let mut stats = SimpleScalarInt64AggregateStats::default();
+        visit_persisted_table_int64_column(store, state, column_index, |_, value| {
+            stats.add(value);
+            Ok(())
+        })?;
+        Ok(Some(QueryResult::with_rows(
+            plan.column_names.clone(),
+            vec![QueryRow::new(stats.into_values(&plan.aggregate_bindings))],
+        )))
     }
 
     fn try_execute_simple_deferred_paged_grouped_count_query(
@@ -6225,7 +6458,7 @@ impl EngineRuntime {
         let Some(parent_source) = self.visible_table_row_source(plan.parent_table_name) else {
             return Ok(None);
         };
-        let Some(RuntimeIndex::Btree { keys }) = self.index(&plan.child_index_name) else {
+        let Some(RuntimeIndex::Btree { keys, .. }) = self.index(&plan.child_index_name) else {
             return Ok(None);
         };
         let parent_table = self.table_schema(plan.parent_table_name).ok_or_else(|| {
@@ -6245,6 +6478,11 @@ impl EngineRuntime {
                 ))
             })?;
 
+        let bounded_order = plan
+            .order_by
+            .as_deref()
+            .zip(plan.limit)
+            .filter(|(_, _)| plan.offset == 0);
         let mut rows = Vec::new();
         for parent_row in parent_source.rows() {
             let parent_row = parent_row?;
@@ -6271,7 +6509,23 @@ impl EngineRuntime {
                 output.push(parent_values[*index].clone());
             }
             output.push(Value::Int64(child_count));
-            rows.push(QueryRow::new(output));
+            let row = QueryRow::new(output);
+            if let Some((order_by, limit)) = bounded_order {
+                push_bounded_projection_ordered_query_row(
+                    Some(self),
+                    &mut rows,
+                    row,
+                    order_by,
+                    limit,
+                )?;
+            } else {
+                rows.push(row);
+            }
+        }
+
+        if let Some((order_by, _)) = bounded_order {
+            sort_query_rows_by_projection_order(Some(self), &mut rows, order_by)?;
+            return Ok(Some(QueryResult::with_rows(plan.column_names, rows)));
         }
 
         Ok(Some(apply_simple_projection_postprocessing_with_order(
@@ -6867,7 +7121,8 @@ impl EngineRuntime {
             .steps
             .iter()
             .map(|step| {
-                let Some(RuntimeIndex::Btree { keys }) = self.index(&step.right_index_name) else {
+                let Some(RuntimeIndex::Btree { keys, .. }) = self.index(&step.right_index_name)
+                else {
                     return Err(DbError::internal(format!(
                         "index {} is missing for indexed join limit plan",
                         step.right_index_name
@@ -7539,7 +7794,7 @@ impl EngineRuntime {
                 }) else {
                     return Ok(None);
                 };
-                let Some(RuntimeIndex::Btree { keys }) = self.index(&filter_index.name) else {
+                let Some(RuntimeIndex::Btree { keys, .. }) = self.index(&filter_index.name) else {
                     return Ok(None);
                 };
                 Some(keys.row_ids_for_value_set(&filter_value)?)
@@ -7583,7 +7838,7 @@ impl EngineRuntime {
             }
         };
         let keys = if let Some(index) = probe_index {
-            let Some(RuntimeIndex::Btree { keys }) = self.index(&index.name) else {
+            let Some(RuntimeIndex::Btree { keys, .. }) = self.index(&index.name) else {
                 return Ok(None);
             };
             Some(keys)
@@ -8897,7 +9152,7 @@ impl EngineRuntime {
                     .is_some_and(|index_column| identifiers_equal(index_column, column_name))
                 && index.columns[0].expression_sql.is_none()
         })?;
-        let RuntimeIndex::Btree { keys } = self.index(&index.name)? else {
+        let RuntimeIndex::Btree { keys, .. } = self.index(&index.name)? else {
             return None;
         };
         Some(keys)
@@ -8961,7 +9216,7 @@ impl EngineRuntime {
                 continue;
             };
             let (entry_count, distinct_key_count) = match self.index(&index.name) {
-                Some(RuntimeIndex::Btree { keys }) => {
+                Some(RuntimeIndex::Btree { keys, .. }) => {
                     let entry_count = i64::try_from(keys.total_row_id_count()).map_err(|_| {
                         DbError::sql(format!(
                             "index {} exceeds ANALYZE entry-count limits",
@@ -10563,9 +10818,12 @@ impl EngineRuntime {
         }) else {
             return Ok(None);
         };
-        let Some(RuntimeIndex::Btree { keys }) = self.index(&index.name) else {
+        let Some(RuntimeIndex::Btree { keys, covering }) = self.index(&index.name) else {
             return Ok(None);
         };
+        let covering_offsets = covering.as_ref().and_then(|covering| {
+            covering_projection_offsets(covering, plan.table_schema, &plan.projection_indexes)
+        });
         let row_ids = keys.row_ids_for_value_set(&plan.lookup_value)?;
 
         let limit = plan.limit.unwrap_or(usize::MAX);
@@ -10574,6 +10832,13 @@ impl EngineRuntime {
         row_ids.for_each(|row_id| {
             if row_lookup_error.is_some() || rows.len() >= limit {
                 return;
+            }
+            if let (Some(covering), Some(offsets)) = (covering.as_ref(), covering_offsets.as_ref())
+            {
+                if let Some(row) = covering.project_row(row_id, offsets) {
+                    rows.push(row);
+                    return;
+                }
             }
             let stored_row = match row_source
                 .map(|source| source.row_by_id(row_id))
@@ -10644,9 +10909,12 @@ impl EngineRuntime {
             }) else {
                 return Ok(None);
             };
-            let Some(RuntimeIndex::Btree { keys }) = self.index(&index.name) else {
+            let Some(RuntimeIndex::Btree { keys, covering }) = self.index(&index.name) else {
                 return Ok(None);
             };
+            let covering_offsets = covering.as_ref().and_then(|covering| {
+                covering_projection_offsets(covering, plan.table_schema, &plan.projection_indexes)
+            });
             let row_ids = keys.row_ids_for_value_set(&plan.lookup_value)?;
             let limit = plan.limit.unwrap_or(usize::MAX);
             let mut rows = Vec::with_capacity(row_ids.len().min(limit));
@@ -10654,6 +10922,14 @@ impl EngineRuntime {
             row_ids.for_each(|row_id| {
                 if row_lookup_error.is_some() || rows.len() >= limit {
                     return;
+                }
+                if let (Some(covering), Some(offsets)) =
+                    (covering.as_ref(), covering_offsets.as_ref())
+                {
+                    if let Some(row) = covering.project_row(row_id, offsets) {
+                        rows.push(row);
+                        return;
+                    }
                 }
                 match row_source.row_by_id(row_id) {
                     Ok(Some(stored_row)) => rows.push(project_simple_projection_values(
@@ -10732,9 +11008,12 @@ impl EngineRuntime {
         }) else {
             return Ok(None);
         };
-        let Some(RuntimeIndex::Btree { keys }) = self.index(&index.name) else {
+        let Some(RuntimeIndex::Btree { keys, covering }) = self.index(&index.name) else {
             return Ok(None);
         };
+        let covering_offsets = covering.as_ref().and_then(|covering| {
+            covering_projection_offsets(covering, plan.table_schema, &plan.projection_indexes)
+        });
         let row_ids = keys.row_ids_for_value_set(&plan.lookup_value)?;
         let limit = plan.limit.unwrap_or(usize::MAX);
         rows.reserve(row_ids.len().min(limit));
@@ -10742,6 +11021,13 @@ impl EngineRuntime {
         row_ids.for_each(|row_id| {
             if row_lookup_error.is_some() || rows.len() >= limit {
                 return;
+            }
+            if let (Some(covering), Some(offsets)) = (covering.as_ref(), covering_offsets.as_ref())
+            {
+                if let Some(row) = covering.project_row(row_id, offsets) {
+                    rows.push(row);
+                    return;
+                }
             }
             match read_deferred_stored_row_by_id(
                 &store,
@@ -10763,6 +11049,95 @@ impl EngineRuntime {
             return Err(error);
         }
         Ok(Some(QueryResult::with_rows(plan.column_names, rows)))
+    }
+
+    pub(crate) fn execute_simple_row_id_projection_at_snapshot(
+        &self,
+        request: SimpleRowIdProjectionRequest<'_>,
+    ) -> Result<Option<QueryResult>> {
+        if self
+            .visible_view(request.table_name, NameResolutionScope::Session)
+            .is_some()
+            || self.visible_table_is_temporary(request.table_name)
+        {
+            return Ok(None);
+        }
+        let Some(table_schema) = self.table_schema(request.table_name) else {
+            return Ok(None);
+        };
+        if !generated_columns_are_stored(table_schema) {
+            return Ok(None);
+        }
+        if !row_id_alias_column_name(table_schema)
+            .is_some_and(|column_name| identifiers_equal(column_name, request.filter_column))
+        {
+            return Ok(None);
+        }
+        let canonical_table_name = table_schema.name.as_str();
+
+        let mut projection_indexes = Vec::with_capacity(request.projection_columns.len());
+        let mut column_names = Vec::with_capacity(request.projection_columns.len());
+        for projection_column in request.projection_columns {
+            let Some(index) = table_schema
+                .columns
+                .iter()
+                .position(|column| identifiers_equal(&column.name, projection_column))
+            else {
+                return Ok(None);
+            };
+            projection_indexes.push(index);
+            column_names.push((*projection_column).to_string());
+        }
+
+        if let Some(row_source) = self.visible_table_row_source(canonical_table_name) {
+            let rows = row_source
+                .row_by_id(request.lookup_row_id)?
+                .map(|stored_row| {
+                    vec![project_simple_projection_values(
+                        stored_row.values(),
+                        &projection_indexes,
+                    )]
+                })
+                .unwrap_or_default();
+            return Ok(Some(QueryResult::with_rows(column_names, rows)));
+        }
+
+        if !self.has_deferred_tables()
+            || !self
+                .deferred_table_names()
+                .any(|candidate| identifiers_equal(candidate, canonical_table_name))
+        {
+            return Ok(None);
+        }
+        let Some(state) = self.persisted_table_state(canonical_table_name) else {
+            return Ok(None);
+        };
+        let paged_locator_cache = self
+            .catalog
+            .table(canonical_table_name)
+            .and_then(|table| self.deferred_paged_row_locator_caches.get(&table.name))
+            .map(|cache| cache.as_ref());
+        let store = SnapshotPageStore {
+            pager: request.pager,
+            wal: request.wal,
+            snapshot_lsn: request.snapshot_lsn,
+        };
+        let rows = read_deferred_stored_row_by_id(
+            &store,
+            state,
+            table_schema,
+            request.lookup_row_id,
+            request.use_persistent_pk_index,
+            paged_locator_cache,
+        )?
+        .map(|stored_row| {
+            vec![project_simple_projection_row(
+                &stored_row,
+                &projection_indexes,
+            )]
+        })
+        .unwrap_or_default();
+        Ok(Some(QueryResult::with_rows(column_names, rows)))
     }
 
     fn try_execute_simple_deferred_rowid_join_projection_query(
@@ -13318,7 +13693,7 @@ impl EngineRuntime {
             }) {
                 let value =
                     self.eval_expr(value_expr, &Dataset::empty(), &[], params, ctes, None)?;
-                if let Some(RuntimeIndex::Btree { keys }) = self.index(&index.name) {
+                if let Some(RuntimeIndex::Btree { keys, .. }) = self.index(&index.name) {
                     let row_ids = keys.row_ids_for_value_set(&value)?;
                     return self
                         .dataset_from_row_id_set(table, row_source, alias, row_ids, false)
@@ -13961,7 +14336,7 @@ impl EngineRuntime {
         };
 
         let value = self.eval_expr(value_expr, &Dataset::empty(), &[], params, ctes, None)?;
-        let Some(RuntimeIndex::Btree { keys }) = self.index(&index.name) else {
+        let Some(RuntimeIndex::Btree { keys, .. }) = self.index(&index.name) else {
             return Ok(None);
         };
         let row_ids = keys.row_ids_for_value_set(&value)?;
@@ -14039,7 +14414,7 @@ impl EngineRuntime {
             (None, filtered_join_indexes)
         };
         let keys = if let Some(index) = probe_index {
-            let Some(RuntimeIndex::Btree { keys }) = self.index(&index.name) else {
+            let Some(RuntimeIndex::Btree { keys, .. }) = self.index(&index.name) else {
                 return Ok(None);
             };
             Some(keys)
@@ -14330,7 +14705,7 @@ impl EngineRuntime {
             (None, left_join_indexes)
         };
         let keys = if let Some(index) = probe_index {
-            let Some(RuntimeIndex::Btree { keys }) = self.index(&index.name) else {
+            let Some(RuntimeIndex::Btree { keys, .. }) = self.index(&index.name) else {
                 return Ok(None);
             };
             Some(keys)
@@ -15758,6 +16133,66 @@ struct SimpleGroupedNumericAggregateBinding {
     source_expr: Option<Expr>,
 }
 
+#[derive(Default)]
+struct SimpleScalarInt64AggregateStats {
+    row_count: i64,
+    non_null_count: i64,
+    total_int: i64,
+    total_float: f64,
+    min_value: Option<i64>,
+    max_value: Option<i64>,
+}
+
+impl SimpleScalarInt64AggregateStats {
+    fn add(&mut self, value: Option<i64>) {
+        self.row_count += 1;
+        let Some(value) = value else {
+            return;
+        };
+        self.non_null_count += 1;
+        self.total_int += value;
+        self.total_float += value as f64;
+        self.min_value = Some(self.min_value.map_or(value, |min| min.min(value)));
+        self.max_value = Some(self.max_value.map_or(value, |max| max.max(value)));
+    }
+
+    fn into_values(
+        self,
+        aggregate_bindings: &[SimpleGroupedNumericAggregateBinding],
+    ) -> Vec<Value> {
+        aggregate_bindings
+            .iter()
+            .map(|aggregate| match aggregate.kind {
+                SimpleGroupedNumericAggregateKind::CountRows => Value::Int64(self.row_count),
+                SimpleGroupedNumericAggregateKind::CountNonNull => {
+                    Value::Int64(self.non_null_count)
+                }
+                SimpleGroupedNumericAggregateKind::Sum => {
+                    if self.non_null_count == 0 {
+                        Value::Null
+                    } else {
+                        Value::Int64(self.total_int)
+                    }
+                }
+                SimpleGroupedNumericAggregateKind::Avg => {
+                    if self.non_null_count == 0 {
+                        Value::Null
+                    } else {
+                        Value::Float64(self.total_float / self.non_null_count as f64)
+                    }
+                }
+                SimpleGroupedNumericAggregateKind::Min => {
+                    self.min_value.map(Value::Int64).unwrap_or(Value::Null)
+                }
+                SimpleGroupedNumericAggregateKind::Max => {
+                    self.max_value.map(Value::Int64).unwrap_or(Value::Null)
+                }
+                _ => Value::Null,
+            })
+            .collect()
+    }
+}
+
 #[derive(Clone, Debug)]
 struct ManifestTemplate {
     schema_cookie: u32,
@@ -15968,6 +16403,67 @@ impl PageStore for DbTxnPageStore<'_> {
     }
 }
 
+fn covering_payloads_for_index(
+    index: &IndexSchema,
+    table: &TableSchema,
+) -> Option<RuntimeCoveringPayloads> {
+    let columns = covering_payload_column_names(index, table)?;
+    Some(RuntimeCoveringPayloads::new(columns))
+}
+
+fn covering_payload_column_names(index: &IndexSchema, table: &TableSchema) -> Option<Vec<String>> {
+    if index.kind != IndexKind::Btree
+        || index.predicate_sql.is_some()
+        || index.include_columns.is_empty()
+        || !generated_columns_are_stored(table)
+    {
+        return None;
+    }
+
+    let mut columns: Vec<String> = Vec::new();
+    for column in index
+        .columns
+        .iter()
+        .map(|column| column.column_name.as_deref())
+        .chain(
+            index
+                .include_columns
+                .iter()
+                .map(|column| Some(column.as_str())),
+        )
+    {
+        let column = column?;
+        schema_column_index(table, column)?;
+        if !columns
+            .iter()
+            .any(|existing| identifiers_equal(existing, column))
+        {
+            columns.push(column.to_string());
+        }
+    }
+    if columns.is_empty() {
+        None
+    } else {
+        Some(columns)
+    }
+}
+
+fn covering_payload_values_for_row(
+    index: &IndexSchema,
+    table: &TableSchema,
+    row_values: &[Value],
+) -> Option<Vec<Value>> {
+    let columns = covering_payload_column_names(index, table)?;
+    columns
+        .iter()
+        .map(|column| {
+            schema_column_index(table, column)
+                .and_then(|offset| row_values.get(offset))
+                .cloned()
+        })
+        .collect()
+}
+
 fn build_runtime_index(
     index: &IndexSchema,
     runtime: &EngineRuntime,
@@ -15986,6 +16482,7 @@ fn build_runtime_index(
     match index.kind {
         IndexKind::Btree => {
             let int64_keys = btree_uses_typed_int64_keys(index, table);
+            let mut covering = covering_payloads_for_index(index, table);
             if index.unique && int64_keys {
                 let mut keys = HashMap::with_capacity_and_hasher(
                     source.row_count(),
@@ -16007,9 +16504,17 @@ fn build_runtime_index(
                             index.name
                         )));
                     }
+                    if let Some(covering) = covering.as_mut() {
+                        if let Some(values) =
+                            covering_payload_values_for_row(index, table, row.values())
+                        {
+                            covering.insert_row_values(row.row_id(), values);
+                        }
+                    }
                 }
                 Ok(RuntimeIndex::Btree {
                     keys: RuntimeBtreeKeys::UniqueInt64(keys),
+                    covering,
                 })
             } else if index.unique {
                 let mut keys = BTreeMap::<Vec<u8>, i64>::new();
@@ -16029,9 +16534,17 @@ fn build_runtime_index(
                             index.name
                         )));
                     }
+                    if let Some(covering) = covering.as_mut() {
+                        if let Some(values) =
+                            covering_payload_values_for_row(index, table, row.values())
+                        {
+                            covering.insert_row_values(row.row_id(), values);
+                        }
+                    }
                 }
                 Ok(RuntimeIndex::Btree {
                     keys: RuntimeBtreeKeys::UniqueEncoded(keys),
+                    covering,
                 })
             } else if int64_keys {
                 let mut keys: Int64Map<Vec<i64>> = HashMap::with_capacity_and_hasher(
@@ -16049,9 +16562,17 @@ fn build_runtime_index(
                         ));
                     };
                     keys.entry(key).or_default().push(row.row_id());
+                    if let Some(covering) = covering.as_mut() {
+                        if let Some(values) =
+                            covering_payload_values_for_row(index, table, row.values())
+                        {
+                            covering.insert_row_values(row.row_id(), values);
+                        }
+                    }
                 }
                 Ok(RuntimeIndex::Btree {
                     keys: RuntimeBtreeKeys::NonUniqueInt64(keys),
+                    covering,
                 })
             } else {
                 let mut keys = BTreeMap::<Vec<u8>, Vec<i64>>::new();
@@ -16066,9 +16587,17 @@ fn build_runtime_index(
                         ));
                     };
                     keys.entry(key).or_default().push(row.row_id());
+                    if let Some(covering) = covering.as_mut() {
+                        if let Some(values) =
+                            covering_payload_values_for_row(index, table, row.values())
+                        {
+                            covering.insert_row_values(row.row_id(), values);
+                        }
+                    }
                 }
                 Ok(RuntimeIndex::Btree {
                     keys: RuntimeBtreeKeys::NonUniqueEncoded(keys),
+                    covering,
                 })
             }
         }
@@ -17414,6 +17943,143 @@ where
         visitor(row_id, row.values())?;
     }
     Ok(row_count)
+}
+
+fn visit_table_payload_int64_column_from_bytes<F>(
+    bytes: &[u8],
+    column_index: usize,
+    tombstoned_row_ids: Option<&[i64]>,
+    visitor: &mut F,
+) -> Result<usize>
+where
+    F: FnMut(i64, Option<i64>) -> Result<()>,
+{
+    if bytes.is_empty() {
+        return Ok(0);
+    }
+    let mut cursor = Cursor::new(bytes);
+    let magic = cursor.read_slice(TABLE_PAYLOAD_MAGIC.len())?;
+    if magic != TABLE_PAYLOAD_MAGIC {
+        return Err(DbError::corruption("table payload magic is invalid"));
+    }
+    let row_count = cursor.read_u32()? as usize;
+    let mut visible_count = 0usize;
+    for _ in 0..row_count {
+        let row_id = cursor.read_i64()?;
+        let row_bytes_len = cursor.read_u32()? as usize;
+        let row_bytes = cursor.read_slice(row_bytes_len)?;
+        if tombstoned_row_ids.is_some_and(|row_ids| row_ids.binary_search(&row_id).is_ok()) {
+            continue;
+        }
+        visitor(row_id, Row::decode_int64_at(row_bytes, column_index)?)?;
+        visible_count += 1;
+    }
+    Ok(visible_count)
+}
+
+fn visit_table_payload_int64_column_from_pointer<S: PageStore, F>(
+    store: &S,
+    pointer: OverflowPointer,
+    column_index: usize,
+    visitor: &mut F,
+) -> Result<usize>
+where
+    F: FnMut(i64, Option<i64>) -> Result<()>,
+{
+    if pointer.head_page_id == 0 || pointer.logical_len == 0 {
+        return Ok(0);
+    }
+    if pointer.is_compressed() {
+        let payload = read_overflow(store, pointer)?;
+        return visit_table_payload_int64_column_from_bytes(&payload, column_index, None, visitor);
+    }
+
+    let mut cursor = OverflowPayloadCursor::new(store, pointer);
+    let mut magic = [0_u8; TABLE_PAYLOAD_MAGIC.len()];
+    cursor.read_exact(&mut magic)?;
+    if magic != *TABLE_PAYLOAD_MAGIC {
+        return Err(DbError::corruption("table payload magic is invalid"));
+    }
+    let row_count = cursor.read_u32()? as usize;
+    for _ in 0..row_count {
+        let row_id = cursor.read_i64()?;
+        let row_bytes_len = cursor.read_u32()? as usize;
+        let row_bytes = cursor.read_vec(row_bytes_len)?;
+        visitor(row_id, Row::decode_int64_at(&row_bytes, column_index)?)?;
+    }
+    Ok(row_count)
+}
+
+fn visit_persisted_table_int64_column<S: PageStore, F>(
+    store: &S,
+    state: PersistedTableState,
+    column_index: usize,
+    mut visitor: F,
+) -> Result<usize>
+where
+    F: FnMut(i64, Option<i64>) -> Result<()>,
+{
+    if state.pointer.head_page_id == 0 || state.pointer.logical_len == 0 {
+        return Ok(0);
+    }
+    if !state.pointer.is_table_paged_manifest() {
+        let row_count = visit_table_payload_int64_column_from_pointer(
+            store,
+            state.pointer,
+            column_index,
+            &mut visitor,
+        )?;
+        if state.row_count != 0 && row_count != state.row_count {
+            return Err(DbError::corruption("table payload row count mismatch"));
+        }
+        return Ok(row_count);
+    }
+
+    let manifest_payload = read_overflow(store, state.pointer)?;
+    if crc32c_parts(&[manifest_payload.as_slice()]) != state.checksum {
+        return Err(DbError::corruption(
+            "paged table manifest checksum mismatch",
+        ));
+    }
+    let manifest = decode_paged_table_manifest_payload(&manifest_payload)?;
+    let mut total_row_count = 0usize;
+    for chunk in manifest.chunks {
+        let mut count = 0usize;
+        let tombstones = if chunk.tombstoned_row_ids.is_empty() {
+            None
+        } else {
+            Some(chunk.tombstoned_row_ids.as_slice())
+        };
+
+        let base_payload = read_overflow(store, chunk.pointer)?;
+        count += visit_table_payload_int64_column_from_bytes(
+            &base_payload,
+            column_index,
+            tombstones,
+            &mut visitor,
+        )?;
+
+        if let Some(overlay_pointer) = chunk.overlay_pointer {
+            let overlay_payload = read_overflow(store, overlay_pointer)?;
+            count += visit_table_payload_int64_column_from_bytes(
+                &overlay_payload,
+                column_index,
+                None,
+                &mut visitor,
+            )?;
+        }
+
+        if count != chunk.row_count {
+            return Err(DbError::corruption("paged table chunk row count mismatch"));
+        }
+        total_row_count = total_row_count.saturating_add(count);
+    }
+    if state.row_count != 0 && total_row_count != state.row_count {
+        return Err(DbError::corruption(
+            "paged table manifest row count mismatch",
+        ));
+    }
+    Ok(total_row_count)
 }
 
 fn visit_persisted_table_rows<S: PageStore, F>(
@@ -21241,6 +21907,22 @@ fn project_simple_projection_values(values: &[Value], projection_indexes: &[usiz
     QueryRow::new(projected)
 }
 
+fn covering_projection_offsets(
+    covering: &RuntimeCoveringPayloads,
+    table_schema: &TableSchema,
+    projection_indexes: &[usize],
+) -> Option<Vec<usize>> {
+    projection_indexes
+        .iter()
+        .map(|projection_index| {
+            table_schema
+                .columns
+                .get(*projection_index)
+                .and_then(|column| covering.column_position(&column.name))
+        })
+        .collect()
+}
+
 fn simple_expression_projection_plan<'a>(
     table_schema: &'a TableSchema,
     table_name: &str,
@@ -21458,6 +22140,65 @@ fn sort_query_rows_by_projection_order(
     });
     if let Some(error) = sort_error {
         return Err(error);
+    }
+    Ok(())
+}
+
+fn compare_query_rows_by_projection_order(
+    runtime: Option<&EngineRuntime>,
+    left: &QueryRow,
+    right: &QueryRow,
+    order_by: &[SimpleOrderByPlan],
+) -> Result<std::cmp::Ordering> {
+    for order in order_by {
+        let ordering = compare_values_with_runtime_collation(
+            runtime,
+            &left.values()[order.projection_index],
+            &right.values()[order.projection_index],
+            order.collation.clone(),
+        )?;
+        if ordering == std::cmp::Ordering::Equal {
+            continue;
+        }
+        return Ok(if order.descending {
+            ordering.reverse()
+        } else {
+            ordering
+        });
+    }
+    Ok(std::cmp::Ordering::Equal)
+}
+
+fn push_bounded_projection_ordered_query_row(
+    runtime: Option<&EngineRuntime>,
+    rows: &mut Vec<QueryRow>,
+    row: QueryRow,
+    order_by: &[SimpleOrderByPlan],
+    bounded_row_count: usize,
+) -> Result<()> {
+    if bounded_row_count == 0 {
+        return Ok(());
+    }
+    if rows.len() < bounded_row_count {
+        rows.push(row);
+        return Ok(());
+    }
+    let mut worst_index = 0;
+    for index in 1..rows.len() {
+        if compare_query_rows_by_projection_order(
+            runtime,
+            &rows[index],
+            &rows[worst_index],
+            order_by,
+        )? == std::cmp::Ordering::Greater
+        {
+            worst_index = index;
+        }
+    }
+    if compare_query_rows_by_projection_order(runtime, &row, &rows[worst_index], order_by)?
+        == std::cmp::Ordering::Less
+    {
+        rows[worst_index] = row;
     }
     Ok(())
 }
@@ -22744,6 +23485,19 @@ fn analyze_simple_grouped_numeric_aggregate_binding(
             source_expr: Some(args[0].clone()),
         })
     }
+}
+
+fn simple_aggregate_source_column_index(
+    aggregate: &SimpleGroupedNumericAggregateBinding,
+    table_schema: &TableSchema,
+) -> Option<usize> {
+    if let Some(column_index) = aggregate.source_column_index {
+        return Some(column_index);
+    }
+    let Some(Expr::Column { column, .. }) = aggregate.source_expr.as_ref() else {
+        return None;
+    };
+    schema_column_index(table_schema, column)
 }
 
 fn matching_simple_grouped_aggregate_binding<'a>(
@@ -31781,7 +32535,7 @@ mod tests {
 
         let cloned = runtime.clone();
 
-        let RuntimeIndex::Btree { keys } = cloned
+        let RuntimeIndex::Btree { keys, .. } = cloned
             .index("docs_email_idx")
             .expect("email index should be cloned")
         else {
@@ -31823,7 +32577,7 @@ mod tests {
             .cloned()
             .expect("primary-key index should exist");
 
-        let RuntimeIndex::Btree { keys } = runtime
+        let RuntimeIndex::Btree { keys, .. } = runtime
             .index(&index_name)
             .expect("INT64 index should exist")
         else {
@@ -35351,6 +36105,15 @@ mod tests {
             &mut runtime,
             "INSERT INTO metrics (id, val) VALUES (4, NULL)",
         );
+        let rows = runtime
+            .table_row_source("metrics")
+            .expect("metrics rows")
+            .resident_data()
+            .rows
+            .clone();
+        runtime
+            .replace_table_row_source("metrics", paged_row_source(rows))
+            .expect("replace metrics row source");
 
         let statement = parse_sql_statement(
             "SELECT COUNT(*), SUM(val), AVG(val), MIN(val), MAX(val) FROM metrics",
