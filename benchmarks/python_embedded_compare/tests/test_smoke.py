@@ -152,6 +152,22 @@ class TestSmokeDuckDB:
 
         driver.disconnect()
 
+    @pytest.mark.skipif(not DUCKDB_AVAILABLE, reason="DuckDB not installed")
+    def test_duckdb_prepared_statement_fallback(self, temp_db_path):
+        """DuckDB prepared benchmark path should not require connection.prepare."""
+        driver = DuckDBDriver({"database_path": temp_db_path})
+        assert driver.connect()
+
+        driver.execute_update("CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)")
+        driver.execute_update("INSERT INTO test VALUES (?, ?)", (1, "duckdb"))
+
+        handle = driver.prepare_statement("SELECT value FROM test WHERE id = ?")
+        result = driver.execute_prepared(handle, (1,))
+
+        assert result == [("duckdb",)]
+
+        driver.disconnect()
+
 
 class TestWorkloads:
     """Test workload implementations."""
@@ -262,6 +278,50 @@ class TestJdbcDriverConfig:
         )
 
         assert driver.jar_paths == [str(jar_path.resolve())]
+
+    def test_jdbc_prepared_statement_uses_dbapi_cursor_execute(self):
+        """JDBC prepared benchmark path should not require JayDeBeApi cursor.prepare."""
+
+        class FakeCursor:
+            description = [("id",)]
+            rowcount = 1
+
+            def __init__(self):
+                self.calls = []
+                self.closed = False
+
+            def execute(self, sql, params=None):
+                self.calls.append((sql, params))
+
+            def fetchall(self):
+                return [(1,)]
+
+            def close(self):
+                self.closed = True
+
+        class FakeConnection:
+            def __init__(self):
+                self.cursors = []
+
+            def cursor(self):
+                cursor = FakeCursor()
+                self.cursors.append(cursor)
+                return cursor
+
+        driver = JDBCDriver({"engine": "h2"})
+        fake_connection = FakeConnection()
+        driver.connection = fake_connection
+
+        handle = driver.prepare_statement("SELECT id FROM bench WHERE id = ?")
+        result = driver.execute_prepared(handle, (7,))
+        second_handle = driver.prepare_statement("SELECT id FROM bench WHERE id = ?")
+
+        assert result == [(1,)]
+        assert handle[1] is second_handle[1]
+        assert len(fake_connection.cursors) == 1
+        assert fake_connection.cursors[0].calls == [
+            ("SELECT id FROM bench WHERE id = ?", (7,))
+        ]
 
     @_skip_no_firebird
     def test_firebird_driver_adds_native_support_jars(self):

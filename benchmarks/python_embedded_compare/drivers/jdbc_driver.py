@@ -167,6 +167,12 @@ class JDBCDriver(DatabaseDriver):
 
     def disconnect(self):
         if self.connection:
+            for cursor in self._prepared_stmts.values():
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+            self._prepared_stmts.clear()
             try:
                 self.connection.close()
             except:
@@ -235,20 +241,22 @@ class JDBCDriver(DatabaseDriver):
 
     def prepare_statement(self, sql: str):
         sql = self._adapt_sql(sql)
-        cursor = self.connection.cursor()
-        cursor.prepare(sql)
-        self._prepared_stmts[sql] = cursor
-        return cursor
+        cursor = self._prepared_stmts.get(sql)
+        if cursor is None:
+            cursor = self.connection.cursor()
+            self._prepared_stmts[sql] = cursor
+        return sql, cursor
 
     def execute_prepared(self, handle, params: Optional[Tuple] = None) -> Any:
+        sql, cursor = handle
         if params:
-            handle.execute(params)
+            cursor.execute(sql, params)
         else:
-            handle.execute()
+            cursor.execute(sql)
 
-        if handle.description:
-            return handle.fetchall()
-        return handle.rowcount
+        if cursor.description:
+            return cursor.fetchall()
+        return cursor.rowcount
 
     def get_engine_metadata(self) -> EngineMetadata:
         # Try to get version from the engine
