@@ -144,6 +144,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   archiver, C flag, and bindgen sysroot settings through to C build scripts,
   using shell-safe multi-line workflow commands, and avoiding Bash associative
   arrays in the iOS artifact script on macOS runners.
+- Fixed mobile native artifact uploads so workflow-dispatch packaging writes
+  zip files to explicit runner-temp paths accepted by `actions/upload-artifact`
+  instead of parent-relative paths.
 - Fixed the native release benchmark lane so DecentDB README chart profiles
   explicitly run as single-process embedded comparisons with
   `process_coordination=single_process_unsafe`, while keeping durable
