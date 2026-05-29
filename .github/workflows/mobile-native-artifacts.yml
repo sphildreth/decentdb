@@ -85,10 +85,11 @@ jobs:
             TAG="manual-${GITHUB_RUN_NUMBER}"
           fi
           ARTIFACT_NAME="decentdb-mobile-android-${TAG}.zip"
+          ARTIFACT_PATH="$RUNNER_TEMP/$ARTIFACT_NAME"
           echo "ARTIFACT_NAME=$ARTIFACT_NAME" >> "$GITHUB_ENV"
+          echo "ARTIFACT_PATH=$ARTIFACT_PATH" >> "$GITHUB_ENV"
           cd "$MOBILE_ARTIFACT_ROOT"
-          zip -r "../$ARTIFACT_NAME" .
-          echo "ARTIFACT_PATH=$MOBILE_ARTIFACT_ROOT/../$ARTIFACT_NAME" >> "$GITHUB_ENV"
+          zip -r "$ARTIFACT_PATH" .
 
       - name: Upload Android artifact
         uses: actions/upload-artifact@v4
@@ -150,10 +151,11 @@ jobs:
             TAG="manual-${GITHUB_RUN_NUMBER}"
           fi
           ARTIFACT_NAME="decentdb-mobile-ios-${TAG}.zip"
+          ARTIFACT_PATH="$RUNNER_TEMP/$ARTIFACT_NAME"
           echo "ARTIFACT_NAME=$ARTIFACT_NAME" >> "$GITHUB_ENV"
+          echo "ARTIFACT_PATH=$ARTIFACT_PATH" >> "$GITHUB_ENV"
           cd "$MOBILE_ARTIFACT_ROOT"
-          zip -r "../$ARTIFACT_NAME" .
-          echo "ARTIFACT_PATH=$MOBILE_ARTIFACT_ROOT/../$ARTIFACT_NAME" >> "$GITHUB_ENV"
+          zip -r "$ARTIFACT_PATH" .
 
       - name: Upload iOS artifact
         uses: actions/upload-artifact@v4
