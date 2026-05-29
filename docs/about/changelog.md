@@ -140,6 +140,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed Windows native release builds by making the process-coordination
   byte-range lock guard explicitly `Send`/`Sync` under the documented Windows
   handle lifetime invariant.
+- Fixed Windows GitHub release artifact builds by linking the Java JNI bridge
+  against the DecentDB cdylib/import library before falling back to the Rust
+  static library, avoiding MinGW/MSVC runtime symbol mismatches.
 - Fixed mobile native artifact release builds by passing Android NDK compiler,
   archiver, C flag, and bindgen sysroot settings through to C build scripts,
   using shell-safe multi-line workflow commands, and avoiding Bash associative

@@ -60,13 +60,17 @@ else
 endif
 
 ifeq ($(IS_WINDOWS),1)
-    # Rust cdylib typically produces target/debug/decentdb.dll on Windows.
+    # Prefer the Rust cdylib/import library on Windows. Linking the JNI bridge
+    # against the Rust staticlib (`decentdb.lib`) from MinGW pulls in the MSVC
+    # Rust runtime and fails on unresolved MSVC/Windows symbols.
     ifneq (,$(wildcard $(DECENTDB_LIB_DIR)/libdecentdb.dll.a))
         DECENTDB_LINK_FLAGS = $(DECENTDB_LIB_DIR)/libdecentdb.dll.a
-    else ifneq (,$(wildcard $(DECENTDB_LIB_DIR)/decentdb.lib))
-        DECENTDB_LINK_FLAGS = $(DECENTDB_LIB_DIR)/decentdb.lib
+    else ifneq (,$(wildcard $(DECENTDB_LIB_DIR)/decentdb.dll.lib))
+        DECENTDB_LINK_FLAGS = $(DECENTDB_LIB_DIR)/decentdb.dll.lib
     else ifneq (,$(wildcard $(DECENTDB_LIB_DIR)/decentdb.dll))
         DECENTDB_LINK_FLAGS = $(DECENTDB_LIB_DIR)/decentdb.dll
+    else ifneq (,$(wildcard $(DECENTDB_LIB_DIR)/decentdb.lib))
+        DECENTDB_LINK_FLAGS = $(DECENTDB_LIB_DIR)/decentdb.lib
     else
         DECENTDB_LINK_FLAGS = -L$(DECENTDB_LIB_DIR) -ldecentdb
     endif
