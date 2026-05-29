@@ -5,14 +5,105 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      build_platform:
+        description: "Artifact platform to build for diagnostics"
+        required: false
+        default: all
+        type: choice
+        options:
+          - all
+          - linux-x64
+          - linux-arm64
+          - windows-x64
+          - macos-arm64
+      run_validation:
+        description: "Run the full validation suite before artifact builds"
+        required: false
+        default: true
+        type: boolean
+      create_release:
+        description: "Create/update the GitHub release after a manual all-platform tag run"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
 
 jobs:
+  plan_build:
+    name: Plan artifact builds
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Select build matrix
+        id: matrix
+        env:
+          BUILD_PLATFORM: ${{ github.event_name == 'workflow_dispatch' && inputs.build_platform || 'all' }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+
+          platforms = [
+              {
+                  "label": "Linux x64",
+                  "runner": "ubuntu-latest",
+                  "release_suffix": "Linux-x64",
+                  "java_suffix": "Linux",
+                  "artifact_name": "linux-x64",
+                  "dart_lib_name": "libdecentdb.so",
+              },
+              {
+                  "label": "Linux arm64",
+                  "runner": "ubuntu-24.04-arm",
+                  "release_suffix": "Linux-arm64",
+                  "java_suffix": "Linux-arm64",
+                  "artifact_name": "linux-arm64",
+                  "dart_lib_name": "libdecentdb.so",
+              },
+              {
+                  "label": "Windows x64",
+                  "runner": "windows-latest",
+                  "release_suffix": "Windows-x64",
+                  "java_suffix": "Windows",
+                  "artifact_name": "windows-x64",
+                  "dart_lib_name": "decentdb.dll",
+              },
+              {
+                  "label": "macOS arm64",
+                  "runner": "macos-latest",
+                  "release_suffix": "macOS-arm64",
+                  "java_suffix": "macOS",
+                  "artifact_name": "macos-arm64",
+                  "dart_lib_name": "libdecentdb.dylib",
+              },
+          ]
+
+          build_platform = os.environ.get("BUILD_PLATFORM", "all")
+          selected = (
+              platforms
+              if build_platform == "all"
+              else [
+                  platform
+                  for platform in platforms
+                  if platform["artifact_name"] == build_platform
+              ]
+          )
+          if not selected:
+              raise SystemExit(f"unknown release build platform: {build_platform}")
+
+          matrix = json.dumps({"include": selected}, separators=(",", ":"))
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              print(f"matrix={matrix}", file=output)
+          PY
+
   validate:
     name: Full Validation Suite
     runs-on: ubuntu-latest
+    if: github.event_name != 'workflow_dispatch' || inputs.run_validation
     env:
       CI: "true"
     steps:
@@ -128,36 +219,17 @@ jobs:
   build:
     name: Build artifacts (${{ matrix.label }})
     runs-on: ${{ matrix.runner }}
-    needs: [validate]
-    if: startsWith(github.ref, 'refs/tags/')
+    needs: [plan_build, validate]
+    if: >-
+      always() &&
+      needs.plan_build.result == 'success' &&
+      (startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch') &&
+      (needs.validate.result == 'success' || (github.event_name == 'workflow_dispatch' && !inputs.run_validation))
+    env:
+      PACKAGE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || format('manual-{0}', github.run_number) }}
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - label: Linux x64
-            runner: ubuntu-latest
-            release_suffix: Linux-x64
-            java_suffix: Linux
-            artifact_name: linux-x64
-            dart_lib_name: libdecentdb.so
-          - label: Linux arm64
-            runner: ubuntu-24.04-arm
-            release_suffix: Linux-arm64
-            java_suffix: Linux-arm64
-            artifact_name: linux-arm64
-            dart_lib_name: libdecentdb.so
-          - label: Windows x64
-            runner: windows-latest
-            release_suffix: Windows-x64
-            java_suffix: Windows
-            artifact_name: windows-x64
-            dart_lib_name: decentdb.dll
-          - label: macOS arm64
-            runner: macos-latest
-            release_suffix: macOS-arm64
-            java_suffix: macOS
-            artifact_name: macos-arm64
-            dart_lib_name: libdecentdb.dylib
+      matrix: ${{ fromJSON(needs.plan_build.outputs.matrix) }}
 
     steps:
       - name: Checkout
@@ -167,7 +239,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Set up Java 21
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '21'
@@ -224,8 +296,8 @@ jobs:
           ./gradlew --no-daemon :driver:jar :dbeaver-extension:jar -PnativeLibDir="$GITHUB_WORKSPACE/target/release" -PdbeaverPluginDir="$DBEAVER_PLUGIN_DIR"
 
           mkdir -p "$GITHUB_WORKSPACE/dbeaver-dist/dbeaver/plugins"
-          cp -v dbeaver-extension/build/libs/dbeaver-extension-*.jar "$GITHUB_WORKSPACE/dbeaver-dist/dbeaver/plugins/org.jkiss.dbeaver.ext.decentdb_${GITHUB_REF_NAME#v}.jar"
-          cp -v driver/build/libs/driver-*.jar "$GITHUB_WORKSPACE/decentdb-jdbc-${GITHUB_REF_NAME}-${{ matrix.java_suffix }}.jar"
+          cp -v dbeaver-extension/build/libs/dbeaver-extension-*.jar "$GITHUB_WORKSPACE/dbeaver-dist/dbeaver/plugins/org.jkiss.dbeaver.ext.decentdb_${PACKAGE_TAG#v}.jar"
+          cp -v driver/build/libs/driver-*.jar "$GITHUB_WORKSPACE/decentdb-jdbc-${PACKAGE_TAG}-${{ matrix.java_suffix }}.jar"
 
       - name: Stage artifacts (Linux/macOS)
         if: runner.os != 'Windows'
@@ -256,7 +328,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          TAG="${GITHUB_REF_NAME}"
+          TAG="${PACKAGE_TAG}"
           OUT="decentdb-${TAG}-${{ matrix.release_suffix }}.tar.gz"
           tar -C dist -czf "$OUT" .
 
@@ -265,7 +337,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          TAG="${GITHUB_REF_NAME}"
+          TAG="${PACKAGE_TAG}"
           mkdir -p dart-dist
           cp -v "dist/${{ matrix.dart_lib_name }}" "dart-dist/${{ matrix.dart_lib_name }}"
           OUT="decentdb-dart-native-${TAG}-${{ matrix.release_suffix }}.tar.gz"
@@ -276,7 +348,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          OUT="decentdb-dbeaver-${GITHUB_REF_NAME}-${{ matrix.java_suffix }}.zip"
+          OUT="decentdb-dbeaver-${PACKAGE_TAG}-${{ matrix.java_suffix }}.zip"
           cd dbeaver-dist
           zip -r "../$OUT" dbeaver
 
@@ -284,7 +356,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $tag = "$env:GITHUB_REF_NAME"
+          $tag = "$env:PACKAGE_TAG"
           $out = "decentdb-$tag-${{ matrix.release_suffix }}.zip"
           Compress-Archive -Path dist\* -DestinationPath $out -Force
 
@@ -292,7 +364,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $tag = "$env:GITHUB_REF_NAME"
+          $tag = "$env:PACKAGE_TAG"
           $dartDist = "dart-dist"
           New-Item -ItemType Directory -Force $dartDist | Out-Null
           Copy-Item -Force "dist\\${{ matrix.dart_lib_name }}" "$dartDist\\${{ matrix.dart_lib_name }}"
@@ -304,7 +376,8 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $out = "decentdb-dbeaver-$env:GITHUB_REF_NAME-${{ matrix.java_suffix }}.zip"
+          $tag = "$env:PACKAGE_TAG"
+          $out = "decentdb-dbeaver-$tag-${{ matrix.java_suffix }}.zip"
           if (Test-Path $out) { Remove-Item -Force $out }
           Compress-Archive -Path dbeaver-dist\dbeaver -DestinationPath $out -Force
 
@@ -317,18 +390,22 @@ jobs:
           with: |
             name: release-${{ matrix.artifact_name }}
             path: |
-              decentdb-${{ github.ref_name }}-${{ matrix.release_suffix }}.tar.gz
-              decentdb-${{ github.ref_name }}-${{ matrix.release_suffix }}.zip
-              decentdb-dart-native-${{ github.ref_name }}-${{ matrix.release_suffix }}.tar.gz
-              decentdb-dart-native-${{ github.ref_name }}-${{ matrix.release_suffix }}.zip
-              decentdb-jdbc-${{ github.ref_name }}-${{ matrix.java_suffix }}.jar
-              decentdb-dbeaver-${{ github.ref_name }}-${{ matrix.java_suffix }}.zip
+              decentdb-${{ env.PACKAGE_TAG }}-${{ matrix.release_suffix }}.tar.gz
+              decentdb-${{ env.PACKAGE_TAG }}-${{ matrix.release_suffix }}.zip
+              decentdb-dart-native-${{ env.PACKAGE_TAG }}-${{ matrix.release_suffix }}.tar.gz
+              decentdb-dart-native-${{ env.PACKAGE_TAG }}-${{ matrix.release_suffix }}.zip
+              decentdb-jdbc-${{ env.PACKAGE_TAG }}-${{ matrix.java_suffix }}.jar
+              decentdb-dbeaver-${{ env.PACKAGE_TAG }}-${{ matrix.java_suffix }}.zip
 
   release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
     needs: [build]
-    if: startsWith(github.ref, 'refs/tags/')
+    if: >-
+      always() &&
+      startsWith(github.ref, 'refs/tags/') &&
+      needs.build.result == 'success' &&
+      (github.event_name != 'workflow_dispatch' || (inputs.create_release && inputs.build_platform == 'all'))
 
     steps:
       - name: Download artifacts
