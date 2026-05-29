@@ -4,6 +4,12 @@ on:
   push:
     branches: ["main"]
   workflow_dispatch:
+    inputs:
+      accept_benchmark_regression:
+        description: "Publish benchmark assets even when the narrative guard reports a tuned-profile regression"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -22,6 +28,7 @@ jobs:
       JAVA_TOOL_OPTIONS: "--enable-native-access=ALL-UNNAMED"
       BENCHMARK_ENGINES: "sqlite,duckdb,decentdb,h2,derby,hsqldb"
       ROOT_README_EXTRA_ENGINES: "H2(JDBC),HSQLDB(JDBC)"
+      ACCEPT_BENCHMARK_REGRESSION: ${{ inputs.accept_benchmark_regression || 'false' }}
       BENCHMARK_OPS_LIST: "10,50,100,250,500"
       BENCHMARK_TARGET_OPS: "500"
       BENCHMARK_WARMUP: "50"
@@ -381,15 +388,40 @@ jobs:
           PY
 
       - name: Validate release benchmark narrative
+        id: benchmark-narrative
         shell: bash
         run: |
           set -euo pipefail
+          set +e
           python scripts/validate_release_benchmark_narrative.py \
             --summary data/bench_summary.json \
             --rust-baseline-current-dir .tmp/benchmark-assets/rust-baseline-current \
             --report .tmp/benchmark-assets/benchmark-narrative.txt
+          status=$?
+          set -e
+
+          {
+            echo "## Benchmark Narrative"
+            echo
+            cat .tmp/benchmark-assets/benchmark-narrative.txt
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ "$status" -eq 0 ]]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ "${ACCEPT_BENCHMARK_REGRESSION}" == "true" ]]; then
+            echo "::warning::Benchmark narrative guard failed, but accept_benchmark_regression=true; benchmark assets will be published."
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "::warning::Benchmark narrative guard failed; benchmark assets will be uploaded for review but will not be published to main."
+          echo "publish=false" >> "$GITHUB_OUTPUT"
 
       - name: Generate README benchmark assets
+        if: steps.benchmark-narrative.outputs.publish == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -397,6 +429,7 @@ jobs:
           python scripts/visualize_alternative.py
 
       - name: Show benchmark asset diff
+        if: steps.benchmark-narrative.outputs.publish == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -430,6 +463,7 @@ jobs:
 
       - name: Create GitHub App token
         id: app-token
+        if: steps.benchmark-narrative.outputs.publish == 'true'
         uses: actions/create-github-app-token@v3
         with:
           app-id: ${{ secrets.BENCHMARK_APP_ID }}
@@ -437,7 +471,7 @@ jobs:
 
       - name: Commit benchmark assets to main
         id: commit
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main' && steps.benchmark-narrative.outputs.publish == 'true'
         shell: bash
         env:
           APP_TOKEN: ${{ steps.app-token.outputs.token }}
