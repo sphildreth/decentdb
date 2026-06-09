@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [2.9.0] - [2026-06-09]
 
+### Fixed
+
+- Fixed Memory Safety Nightly Valgrind failures by releasing retained capacity
+  from the process-local WAL reader-slot registry after the final local reader
+  slot is removed.
+
 ### Added
 
 - Added .NET ADO.NET maintenance helpers for WAL status snapshots,
