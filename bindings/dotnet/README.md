@@ -30,8 +30,10 @@ This directory contains the official .NET bindings for DecentDB:
 | Connection pooling | ❌ (MicroOrm interprets `Pooling`) | ✅ | ❌ |
 | View querying (keyless DTO) | ✅ | ✅ (`QueryRawAsync<T>`) | ✅ (`DbQuery` / keyless entity) |
 | Diagnostic events (`SqlExecuting`/`SqlExecuted`) | ✅ | ❌ | ✅ (EF Core logging) |
+| Query plan helper (`ExplainQuery`) | ✅ | ❌ | ✅ (`ToQueryString` + ADO.NET helper) |
 | `GetSchema("Indexes")` with `IS_PRIMARY_KEY` | ✅ | N/A | N/A |
 | `DeleteDatabaseFiles` helper | ✅ | N/A | N/A |
+| File maintenance (`GetWalStatus`, `CheckpointAsync`, `CompactAsync`, `VacuumAsync`) | ✅ | N/A | N/A |
 | Model pre-building cache | N/A | N/A | ✅ (`DecentDBModelBuilder`) |
 | Compiled query support | N/A | N/A | ✅ (`EF.CompileQuery`) |
 | Correlated aggregate rewrite | N/A | N/A | ✅ (infrastructure; rewrite deferred) |
@@ -68,6 +70,17 @@ Supported keys:
 | `Pooling` | bool | `true` | Consumed by MicroOrm only; ADO.NET ignores this key. |
 
 The `DecentDBConnection.DeleteDatabaseFiles(path)` helper deletes the database file and all sidecar files (`.wal`, `-wal`, `-shm`, `.coord`) safely.
+
+The `DecentDBMaintenance` helper exposes binding-native maintenance operations:
+`GetWalStatus(path)`, `CheckpointAsync(path)`, `CompactAsync(source, target)`,
+and `VacuumAsync(path, createBackup: true)`. These helpers use the .NET binding
+directly. The older `VacuumAtomicAsync(path, cliPath, ...)` remains available
+for legacy executable-backed vacuum workflows.
+
+For query-plan diagnostics, call `connection.ExplainQuery(sql)` or
+`connection.ExplainQuery(sql, analyze: true)` on an open ADO.NET connection.
+The returned plan includes the generated `EXPLAIN` SQL, plan lines, joined text,
+and elapsed diagnostic duration.
 
 `DecentDB.Native.DecentDB.ExecuteQueued(sql)` exposes the native queued path for
 self-contained SQL, and `WriteQueueMetrics()` returns queue counters. ADO.NET

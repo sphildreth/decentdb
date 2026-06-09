@@ -163,7 +163,7 @@ connection.GetSchema("Indexes")     // Index information
 ### Database Maintenance
 - **Checkpoint** - Flush WAL to main database file
 - **SaveAs** - Export database to new file
-- **VacuumAtomicAsync** - Compact a file-backed database with the maintenance helper
+- **VacuumAsync** - Compact a file-backed database with the maintenance helper
 
 ### Provider Ergonomics
 - `DecentDBConnectionStringBuilder` can be passed directly to `UseDecentDB(...)`

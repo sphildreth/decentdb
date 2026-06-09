@@ -11,6 +11,206 @@ namespace DecentDB.AdoNet
     /// </summary>
     public static class DecentDBMaintenance
     {
+        /// <summary>
+        /// Returns file-size diagnostics for a DecentDB database and known WAL sidecars.
+        /// </summary>
+        /// <param name="databasePath">The path to the DecentDB database file.</param>
+        public static DecentDBWalStatus GetWalStatus(string databasePath)
+        {
+            var fullPath = NormalizeDatabasePath(databasePath);
+            return new DecentDBWalStatus(
+                fullPath,
+                FileLengthOrZero(fullPath),
+                fullPath + "-wal",
+                FileLengthOrZero(fullPath + "-wal"),
+                fullPath + ".wal",
+                FileLengthOrZero(fullPath + ".wal"),
+                fullPath + ".coord",
+                FileLengthOrZero(fullPath + ".coord"));
+        }
+
+        /// <summary>
+        /// Opens the database and performs a DecentDB checkpoint without invoking the CLI.
+        /// </summary>
+        /// <param name="databasePath">The path to the DecentDB database file.</param>
+        /// <param name="cancellationToken">A token to cancel before the operation starts.</param>
+        public static Task<DecentDBCheckpointResult> CheckpointAsync(
+            string databasePath,
+            CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var fullPath = NormalizeDatabasePath(databasePath);
+            var before = GetWalStatus(fullPath);
+            if (!File.Exists(fullPath))
+            {
+                return Task.FromResult(new DecentDBCheckpointResult(
+                    fullPath,
+                    databaseExisted: false,
+                    before,
+                    before,
+                    TimeSpan.Zero));
+            }
+
+            var stopwatch = Stopwatch.StartNew();
+            using (var connection = OpenConnection(fullPath))
+            {
+                connection.Checkpoint();
+            }
+
+            stopwatch.Stop();
+            var after = GetWalStatus(fullPath);
+            return Task.FromResult(new DecentDBCheckpointResult(
+                fullPath,
+                databaseExisted: true,
+                before,
+                after,
+                stopwatch.Elapsed));
+        }
+
+        /// <summary>
+        /// Saves a compact copy of a database to a new destination file without invoking the CLI.
+        /// </summary>
+        /// <param name="sourceDatabasePath">The source DecentDB database file.</param>
+        /// <param name="destinationDatabasePath">The destination DecentDB database file.</param>
+        /// <param name="overwrite">Whether to delete an existing destination and its sidecars first.</param>
+        /// <param name="cancellationToken">A token to cancel before the operation starts.</param>
+        public static Task<DecentDBCompactResult> CompactAsync(
+            string sourceDatabasePath,
+            string destinationDatabasePath,
+            bool overwrite = false,
+            CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var sourcePath = NormalizeDatabasePath(sourceDatabasePath);
+            var destinationPath = NormalizeDatabasePath(destinationDatabasePath);
+            if (PathsEqual(sourcePath, destinationPath))
+            {
+                throw new ArgumentException("Destination database path must be different from the source path.", nameof(destinationDatabasePath));
+            }
+
+            var sourceBytes = FileLengthOrZero(sourcePath);
+            if (!File.Exists(sourcePath))
+            {
+                return Task.FromResult(new DecentDBCompactResult(
+                    sourcePath,
+                    destinationPath,
+                    sourceExisted: false,
+                    sourceBytes,
+                    destinationBytes: 0,
+                    TimeSpan.Zero));
+            }
+
+            var destinationDirectory = Path.GetDirectoryName(destinationPath);
+            if (!string.IsNullOrEmpty(destinationDirectory) && !Directory.Exists(destinationDirectory))
+            {
+                Directory.CreateDirectory(destinationDirectory);
+            }
+
+            var destinationArtifactsExist = HasDatabaseArtifacts(destinationPath);
+            if (destinationArtifactsExist)
+            {
+                if (!overwrite)
+                {
+                    throw new IOException($"Destination database or sidecar artifacts already exist: {destinationPath}");
+                }
+
+                DecentDBConnection.DeleteDatabaseFiles(destinationPath);
+            }
+
+            var stopwatch = Stopwatch.StartNew();
+            using (var connection = OpenConnection(sourcePath))
+            {
+                connection.SaveAs(destinationPath);
+            }
+
+            stopwatch.Stop();
+            return Task.FromResult(new DecentDBCompactResult(
+                sourcePath,
+                destinationPath,
+                sourceExisted: true,
+                sourceBytes,
+                FileLengthOrZero(destinationPath),
+                stopwatch.Elapsed));
+        }
+
+        /// <summary>
+        /// Compacts a database to a temporary file and replaces the original without invoking the CLI.
+        /// Ensure no other connections are open to the database file before running.
+        /// </summary>
+        /// <param name="databasePath">The path to the DecentDB database file.</param>
+        /// <param name="createBackup">If true, renames the original database file with a .bak extension instead of deleting it.</param>
+        /// <param name="cancellationToken">A token to cancel before each operation phase starts.</param>
+        public static async Task<DecentDBVacuumResult> VacuumAsync(
+            string databasePath,
+            bool createBackup = false,
+            CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var fullPath = NormalizeDatabasePath(databasePath);
+            var before = GetWalStatus(fullPath);
+            if (!File.Exists(fullPath))
+            {
+                return new DecentDBVacuumResult(
+                    fullPath,
+                    databaseExisted: false,
+                    backupCreated: false,
+                    backupPath: null,
+                    before,
+                    before,
+                    TimeSpan.Zero);
+            }
+
+            var stopwatch = Stopwatch.StartNew();
+            var tempPath = fullPath + ".vacuum_tmp";
+            var backupPath = fullPath + ".bak";
+
+            try
+            {
+                await CheckpointAsync(fullPath, cancellationToken).ConfigureAwait(false);
+                cancellationToken.ThrowIfCancellationRequested();
+
+                DecentDBConnection.DeleteDatabaseFiles(tempPath);
+                await CompactAsync(fullPath, tempPath, overwrite: true, cancellationToken).ConfigureAwait(false);
+                cancellationToken.ThrowIfCancellationRequested();
+
+                if (createBackup)
+                {
+                    if (File.Exists(backupPath))
+                    {
+                        File.Delete(backupPath);
+                    }
+
+                    File.Move(fullPath, backupPath);
+                }
+                else
+                {
+                    File.Delete(fullPath);
+                }
+
+                DeleteSidecars(fullPath);
+                File.Move(tempPath, fullPath);
+                DeleteSidecars(tempPath);
+                stopwatch.Stop();
+
+                return new DecentDBVacuumResult(
+                    fullPath,
+                    databaseExisted: true,
+                    backupCreated: createBackup,
+                    backupPath: createBackup ? backupPath : null,
+                    before,
+                    GetWalStatus(fullPath),
+                    stopwatch.Elapsed);
+            }
+            catch
+            {
+                DecentDBConnection.DeleteDatabaseFiles(tempPath);
+                throw;
+            }
+        }
+
         private static string ResolveCliExecutablePath(string cliExecutablePath)
         {
             if (Path.IsPathRooted(cliExecutablePath) && File.Exists(cliExecutablePath))
@@ -44,6 +244,83 @@ namespace DecentDB.AdoNet
             }
 
             return cliExecutablePath;
+        }
+
+        private static string NormalizeDatabasePath(string databasePath)
+        {
+            if (string.IsNullOrWhiteSpace(databasePath))
+                throw new ArgumentException("Database path cannot be null or empty.", nameof(databasePath));
+
+            return Path.GetFullPath(databasePath);
+        }
+
+        private static bool PathsEqual(string left, string right)
+        {
+            var comparison = OperatingSystem.IsWindows()
+                ? StringComparison.OrdinalIgnoreCase
+                : StringComparison.Ordinal;
+            return string.Equals(left, right, comparison);
+        }
+
+        private static DecentDBConnection OpenConnection(string databasePath)
+        {
+            var builder = new DecentDBConnectionStringBuilder
+            {
+                DataSource = databasePath
+            };
+            var connection = new DecentDBConnection(builder.ConnectionString);
+            connection.Open();
+            return connection;
+        }
+
+        private static long FileLengthOrZero(string path)
+        {
+            try
+            {
+                return File.Exists(path) ? new FileInfo(path).Length : 0;
+            }
+            catch (IOException)
+            {
+                return 0;
+            }
+            catch (UnauthorizedAccessException)
+            {
+                return 0;
+            }
+        }
+
+        private static bool HasDatabaseArtifacts(string databasePath)
+        {
+            return File.Exists(databasePath) ||
+                   File.Exists(databasePath + "-wal") ||
+                   File.Exists(databasePath + ".wal") ||
+                   File.Exists(databasePath + "-shm") ||
+                   File.Exists(databasePath + ".coord");
+        }
+
+        private static void DeleteSidecars(string databasePath)
+        {
+            TryDelete(databasePath + "-wal");
+            TryDelete(databasePath + ".wal");
+            TryDelete(databasePath + "-shm");
+            TryDelete(databasePath + ".coord");
+        }
+
+        private static void TryDelete(string path)
+        {
+            try
+            {
+                if (File.Exists(path))
+                {
+                    File.Delete(path);
+                }
+            }
+            catch (FileNotFoundException)
+            {
+            }
+            catch (DirectoryNotFoundException)
+            {
+            }
         }
 
         private static IEnumerable<string> CandidateCliPaths(string root)

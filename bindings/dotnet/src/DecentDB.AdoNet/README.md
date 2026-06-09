@@ -6,6 +6,7 @@ This package provides:
 
 - `DecentDBConnection` / `DecentDBCommand` / `DecentDBDataReader`
 - `DecentDBConnectionStringBuilder`
+- `DecentDBMaintenance` for checkpoint, WAL status, compact, and vacuum helpers
 
 ## Install
 
@@ -33,6 +34,35 @@ Bare paths (e.g., `"/tmp/mydb.ddb"`) are also accepted by `DecentDBConnection`'s
 ## Cleanup helper
 
 Use `DecentDBConnection.DeleteDatabaseFiles(path)` to safely delete the database file and all sidecar files (`.wal`, `-wal`, `-shm`, `.coord`) in the correct order. This prevents stale WAL or coordination artifacts when recreating databases.
+
+## Maintenance helpers
+
+Use `DecentDBMaintenance` for file-path based maintenance through the .NET
+binding:
+
+```csharp
+var before = DecentDBMaintenance.GetWalStatus(path);
+var checkpoint = await DecentDBMaintenance.CheckpointAsync(path);
+var compact = await DecentDBMaintenance.CompactAsync(path, compactedPath);
+var vacuum = await DecentDBMaintenance.VacuumAsync(path, createBackup: true);
+```
+
+`VacuumAsync(...)` uses the .NET binding directly by checkpointing, saving a
+compact temporary copy, and replacing the original file. `VacuumAtomicAsync(...)`
+remains available for legacy executable-backed offline vacuum flows.
+
+## Query diagnostics
+
+Use `ExplainQuery` on an open `DecentDBConnection` to capture `EXPLAIN` or
+`EXPLAIN ANALYZE` output without writing command boilerplate:
+
+```csharp
+var plan = connection.ExplainQuery(
+    "SELECT * FROM artists WHERE musicbrainz_id_raw = $1",
+    analyze: true);
+
+Console.WriteLine(plan.Text);
+```
 
 ## Notes
 

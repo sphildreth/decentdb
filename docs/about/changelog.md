@@ -5,6 +5,26 @@ All notable changes to DecentDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [2.9.0] - [2026-06-09]
+
+### Added
+
+- Added .NET ADO.NET maintenance helpers for WAL status snapshots,
+  binding-native checkpoints, compact save-as copies, and in-process vacuum without
+  requiring an external executable.
+- Added a .NET ADO.NET `ExplainQuery` helper for `EXPLAIN` and
+  `EXPLAIN ANALYZE` diagnostics.
+- Added .NET EF Core regression coverage for exact equality on large indexed
+  string columns modeled after Melodee's MusicBrainz lookup workload.
+
+### Changed
+
+- Improved .NET ADO.NET open failures for unsupported database format versions
+  with guidance to use a compatible engine, run `decentdb-migrate` when
+  available, or rebuild/export with the current engine.
+
 ## [2.8.0] - [2026-05-28]
 
 ### Added

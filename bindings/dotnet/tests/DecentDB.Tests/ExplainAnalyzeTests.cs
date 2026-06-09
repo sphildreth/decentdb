@@ -128,4 +128,32 @@ public sealed class ExplainAnalyzeTests : IDisposable
         Assert.DoesNotContain("Actual Rows:", planText);
         Assert.DoesNotContain("Actual Time:", planText);
     }
+
+    [Fact]
+    public void ExplainQueryExtension_ReturnsPlanTextAndDuration()
+    {
+        using var conn = OpenConnection();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE t (id INT, name TEXT)";
+        cmd.ExecuteNonQuery();
+        cmd.CommandText = "INSERT INTO t VALUES (1, 'Alice'), (2, 'Bob')";
+        cmd.ExecuteNonQuery();
+
+        var plan = conn.ExplainQuery("SELECT * FROM t WHERE id = 1", analyze: true);
+
+        Assert.True(plan.Analyze);
+        Assert.Equal("SELECT * FROM t WHERE id = 1", plan.Sql);
+        Assert.Equal("EXPLAIN ANALYZE SELECT * FROM t WHERE id = 1", plan.ExplainSql);
+        Assert.NotEmpty(plan.Lines);
+        Assert.Contains("Actual Rows:", plan.Text);
+        Assert.True(plan.Duration >= TimeSpan.Zero);
+    }
+
+    [Fact]
+    public void ExplainQueryExtension_ClosedConnection_Throws()
+    {
+        using var conn = new DecentDBConnection($"Data Source={_dbPath}");
+
+        Assert.Throws<InvalidOperationException>(() => conn.ExplainQuery("SELECT 1"));
+    }
 }
