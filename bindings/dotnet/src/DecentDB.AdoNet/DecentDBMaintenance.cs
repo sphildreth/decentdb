@@ -1,6 +1,8 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -63,6 +65,98 @@ namespace DecentDB.AdoNet
             return Task.FromResult(new DecentDBCheckpointResult(
                 fullPath,
                 databaseExisted: true,
+                before,
+                after,
+                stopwatch.Elapsed));
+        }
+
+        /// <summary>
+        /// Opens the database and rebuilds one index without invoking the CLI.
+        /// </summary>
+        /// <param name="databasePath">The path to the DecentDB database file.</param>
+        /// <param name="indexName">The index name to rebuild.</param>
+        /// <param name="cancellationToken">A token to cancel before the operation starts.</param>
+        public static Task<DecentDBIndexRebuildResult> RebuildIndexAsync(
+            string databasePath,
+            string indexName,
+            CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (string.IsNullOrWhiteSpace(indexName))
+                throw new ArgumentException("Index name cannot be null or empty.", nameof(indexName));
+
+            var fullPath = NormalizeDatabasePath(databasePath);
+            var before = GetWalStatus(fullPath);
+            if (!File.Exists(fullPath))
+            {
+                return Task.FromResult(new DecentDBIndexRebuildResult(
+                    fullPath,
+                    databaseExisted: false,
+                    Array.Empty<string>(),
+                    before,
+                    before,
+                    TimeSpan.Zero));
+            }
+
+            var stopwatch = Stopwatch.StartNew();
+            using (var connection = OpenConnection(fullPath))
+            {
+                ExecuteNonQuery(connection, $"ALTER INDEX {QuoteIdentifier(indexName)} REBUILD");
+            }
+
+            stopwatch.Stop();
+            var after = GetWalStatus(fullPath);
+            return Task.FromResult(new DecentDBIndexRebuildResult(
+                fullPath,
+                databaseExisted: true,
+                new[] { indexName },
+                before,
+                after,
+                stopwatch.Elapsed));
+        }
+
+        /// <summary>
+        /// Opens the database and rebuilds all catalog indexes without invoking the CLI.
+        /// </summary>
+        /// <param name="databasePath">The path to the DecentDB database file.</param>
+        /// <param name="cancellationToken">A token to cancel before the operation starts.</param>
+        public static Task<DecentDBIndexRebuildResult> RebuildIndexesAsync(
+            string databasePath,
+            CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var fullPath = NormalizeDatabasePath(databasePath);
+            var before = GetWalStatus(fullPath);
+            if (!File.Exists(fullPath))
+            {
+                return Task.FromResult(new DecentDBIndexRebuildResult(
+                    fullPath,
+                    databaseExisted: false,
+                    Array.Empty<string>(),
+                    before,
+                    before,
+                    TimeSpan.Zero));
+            }
+
+            var rebuilt = new List<string>();
+            var stopwatch = Stopwatch.StartNew();
+            using (var connection = OpenConnection(fullPath))
+            {
+                foreach (var indexName in ListIndexNames(connection))
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    ExecuteNonQuery(connection, $"ALTER INDEX {QuoteIdentifier(indexName)} REBUILD");
+                    rebuilt.Add(indexName);
+                }
+            }
+
+            stopwatch.Stop();
+            var after = GetWalStatus(fullPath);
+            return Task.FromResult(new DecentDBIndexRebuildResult(
+                fullPath,
+                databaseExisted: true,
+                rebuilt,
                 before,
                 after,
                 stopwatch.Elapsed));
@@ -271,6 +365,43 @@ namespace DecentDB.AdoNet
             var connection = new DecentDBConnection(builder.ConnectionString);
             connection.Open();
             return connection;
+        }
+
+        private static void ExecuteNonQuery(DecentDBConnection connection, string sql)
+        {
+            using var command = connection.CreateCommand();
+            command.CommandText = sql;
+            command.ExecuteNonQuery();
+        }
+
+        private static IReadOnlyList<string> ListIndexNames(DecentDBConnection connection)
+        {
+            using var document = JsonDocument.Parse(connection.ListIndexesJson());
+            if (document.RootElement.ValueKind != JsonValueKind.Array)
+            {
+                return Array.Empty<string>();
+            }
+
+            var names = new List<string>();
+            foreach (var element in document.RootElement.EnumerateArray())
+            {
+                if (element.TryGetProperty("name", out var nameProperty) &&
+                    nameProperty.ValueKind == JsonValueKind.String)
+                {
+                    var name = nameProperty.GetString();
+                    if (!string.IsNullOrWhiteSpace(name))
+                    {
+                        names.Add(name);
+                    }
+                }
+            }
+
+            return names;
+        }
+
+        private static string QuoteIdentifier(string identifier)
+        {
+            return "\"" + identifier.Replace("\"", "\"\"", StringComparison.Ordinal) + "\"";
         }
 
         private static long FileLengthOrZero(string path)

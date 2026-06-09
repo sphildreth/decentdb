@@ -10801,7 +10801,14 @@ impl EngineRuntime {
                     ));
                 }
             }
-            return Ok(Some(QueryResult::with_rows(plan.column_names, rows)));
+            return Ok(Some(apply_simple_projection_postprocessing_with_order(
+                Some(self),
+                rows,
+                plan.column_names,
+                plan.order_by.as_deref(),
+                plan.limit,
+                plan.offset,
+            )?));
         }
 
         let Some(index) = self.catalog.indexes.values().find(|index| {
@@ -10826,11 +10833,15 @@ impl EngineRuntime {
         });
         let row_ids = keys.row_ids_for_value_set(&plan.lookup_value)?;
 
-        let limit = plan.limit.unwrap_or(usize::MAX);
-        let mut rows = Vec::with_capacity(row_ids.len().min(limit));
+        let scan_limit = if plan.order_by.is_none() && plan.offset == 0 {
+            plan.limit.unwrap_or(usize::MAX)
+        } else {
+            usize::MAX
+        };
+        let mut rows = Vec::with_capacity(row_ids.len().min(scan_limit));
         let mut row_lookup_error = None;
         row_ids.for_each(|row_id| {
-            if row_lookup_error.is_some() || rows.len() >= limit {
+            if row_lookup_error.is_some() || rows.len() >= scan_limit {
                 return;
             }
             if let (Some(covering), Some(offsets)) = (covering.as_ref(), covering_offsets.as_ref())
@@ -10859,7 +10870,14 @@ impl EngineRuntime {
         if let Some(error) = row_lookup_error {
             return Err(error);
         }
-        Ok(Some(QueryResult::with_rows(plan.column_names, rows)))
+        Ok(Some(apply_simple_projection_postprocessing_with_order(
+            Some(self),
+            rows,
+            plan.column_names,
+            plan.order_by.as_deref(),
+            plan.limit,
+            plan.offset,
+        )?))
     }
 
     pub(crate) fn try_execute_simple_deferred_indexed_projection_query(
@@ -10890,7 +10908,14 @@ impl EngineRuntime {
                         ));
                     }
                 }
-                return Ok(Some(QueryResult::with_rows(plan.column_names, rows)));
+                return Ok(Some(apply_simple_projection_postprocessing_with_order(
+                    Some(self),
+                    rows,
+                    plan.column_names,
+                    plan.order_by.as_deref(),
+                    plan.limit,
+                    plan.offset,
+                )?));
             }
 
             let Some(index) = self.catalog.indexes.values().find(|index| {
@@ -10916,11 +10941,15 @@ impl EngineRuntime {
                 covering_projection_offsets(covering, plan.table_schema, &plan.projection_indexes)
             });
             let row_ids = keys.row_ids_for_value_set(&plan.lookup_value)?;
-            let limit = plan.limit.unwrap_or(usize::MAX);
-            let mut rows = Vec::with_capacity(row_ids.len().min(limit));
+            let scan_limit = if plan.order_by.is_none() && plan.offset == 0 {
+                plan.limit.unwrap_or(usize::MAX)
+            } else {
+                usize::MAX
+            };
+            let mut rows = Vec::with_capacity(row_ids.len().min(scan_limit));
             let mut row_lookup_error = None;
             row_ids.for_each(|row_id| {
-                if row_lookup_error.is_some() || rows.len() >= limit {
+                if row_lookup_error.is_some() || rows.len() >= scan_limit {
                     return;
                 }
                 if let (Some(covering), Some(offsets)) =
@@ -10943,7 +10972,14 @@ impl EngineRuntime {
             if let Some(error) = row_lookup_error {
                 return Err(error);
             }
-            return Ok(Some(QueryResult::with_rows(plan.column_names, rows)));
+            return Ok(Some(apply_simple_projection_postprocessing_with_order(
+                Some(self),
+                rows,
+                plan.column_names,
+                plan.order_by.as_deref(),
+                plan.limit,
+                plan.offset,
+            )?));
         }
         if !self.has_deferred_tables() {
             return Ok(None);
@@ -10991,7 +11027,14 @@ impl EngineRuntime {
                     ));
                 }
             }
-            return Ok(Some(QueryResult::with_rows(plan.column_names, rows)));
+            return Ok(Some(apply_simple_projection_postprocessing_with_order(
+                Some(self),
+                rows,
+                plan.column_names,
+                plan.order_by.as_deref(),
+                plan.limit,
+                plan.offset,
+            )?));
         }
 
         let Some(index) = self.catalog.indexes.values().find(|index| {
@@ -11015,11 +11058,15 @@ impl EngineRuntime {
             covering_projection_offsets(covering, plan.table_schema, &plan.projection_indexes)
         });
         let row_ids = keys.row_ids_for_value_set(&plan.lookup_value)?;
-        let limit = plan.limit.unwrap_or(usize::MAX);
-        rows.reserve(row_ids.len().min(limit));
+        let scan_limit = if plan.order_by.is_none() && plan.offset == 0 {
+            plan.limit.unwrap_or(usize::MAX)
+        } else {
+            usize::MAX
+        };
+        rows.reserve(row_ids.len().min(scan_limit));
         let mut row_lookup_error = None;
         row_ids.for_each(|row_id| {
-            if row_lookup_error.is_some() || rows.len() >= limit {
+            if row_lookup_error.is_some() || rows.len() >= scan_limit {
                 return;
             }
             if let (Some(covering), Some(offsets)) = (covering.as_ref(), covering_offsets.as_ref())
@@ -11048,7 +11095,14 @@ impl EngineRuntime {
         if let Some(error) = row_lookup_error {
             return Err(error);
         }
-        Ok(Some(QueryResult::with_rows(plan.column_names, rows)))
+        Ok(Some(apply_simple_projection_postprocessing_with_order(
+            Some(self),
+            rows,
+            plan.column_names,
+            plan.order_by.as_deref(),
+            plan.limit,
+            plan.offset,
+        )?))
     }
 
     pub(crate) fn execute_simple_row_id_projection_at_snapshot(
@@ -12241,7 +12295,7 @@ impl EngineRuntime {
         query: &'a Query,
         params: &[Value],
     ) -> Result<Option<SimpleIndexedProjectionPlan<'a>>> {
-        if !query.ctes.is_empty() || !query.order_by.is_empty() || query.offset.is_some() {
+        if !query.ctes.is_empty() {
             return Ok(None);
         }
         let QueryBody::Select(select) = &query.body else {
@@ -12299,12 +12353,29 @@ impl EngineRuntime {
         else {
             return Ok(None);
         };
+        let order_by = self.simple_projection_order_by_plan(
+            query,
+            table_schema,
+            name,
+            binding_name,
+            &projection_indexes,
+        )?;
+        if !query.order_by.is_empty() && order_by.is_none() {
+            return Ok(None);
+        }
         let limit = query
             .limit
             .as_ref()
             .map(|expr| self.eval_constant_i64(expr, params, &BTreeMap::new()))
             .transpose()?
             .map(|value| usize::try_from(value.max(0)).unwrap_or(usize::MAX));
+        let offset = query
+            .offset
+            .as_ref()
+            .map(|expr| self.eval_constant_i64(expr, params, &BTreeMap::new()))
+            .transpose()?
+            .map(|value| usize::try_from(value.max(0)).unwrap_or(usize::MAX))
+            .unwrap_or(0);
 
         Ok(Some(SimpleIndexedProjectionPlan {
             table_name: name,
@@ -12313,7 +12384,9 @@ impl EngineRuntime {
             lookup_value,
             projection_indexes,
             column_names,
+            order_by,
             limit,
+            offset,
         }))
     }
 
@@ -15926,7 +15999,9 @@ struct SimpleIndexedProjectionPlan<'a> {
     lookup_value: Value,
     projection_indexes: Vec<usize>,
     column_names: Vec<String>,
+    order_by: Option<Vec<SimpleOrderByPlan>>,
     limit: Option<usize>,
+    offset: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -33377,6 +33452,76 @@ mod tests {
         assert_eq!(result.rows().len(), 2);
         assert_eq!(result.rows()[0].values(), &[Value::Int64(0)]);
         assert_eq!(result.rows()[1].values(), &[Value::Int64(1)]);
+    }
+
+    #[test]
+    fn simple_indexed_projection_order_by_limit_offset_uses_fast_path() {
+        let mut runtime = EngineRuntime::empty(1);
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE artists (id INT64 PRIMARY KEY, name_normalized TEXT, raw_id TEXT)",
+        );
+        execute_sql(
+            &mut runtime,
+            "CREATE INDEX artists_name_normalized_idx ON artists (name_normalized)",
+        );
+        execute_sql(
+            &mut runtime,
+            "CREATE UNIQUE INDEX artists_raw_id_idx ON artists (raw_id)",
+        );
+        for (id, normalized, raw_id) in [
+            (10, "shared", "mbid-010"),
+            (20, "shared", "mbid-020"),
+            (30, "shared", "mbid-030"),
+            (40, "other", "mbid-040"),
+        ] {
+            execute_sql(
+                &mut runtime,
+                &format!(
+                    "INSERT INTO artists (id, name_normalized, raw_id) VALUES ({id}, '{normalized}', '{raw_id}')"
+                ),
+            );
+        }
+
+        let statement = parse_sql_statement(
+            "SELECT id, raw_id FROM artists \
+             WHERE name_normalized = 'shared' ORDER BY id DESC LIMIT 1 OFFSET 1",
+        )
+        .expect("parse ordered indexed projection");
+        let crate::sql::ast::Statement::Query(query) = &statement else {
+            panic!("expected query statement");
+        };
+
+        let result = runtime
+            .try_execute_simple_indexed_projection_query(query, &[])
+            .expect("execute ordered indexed projection")
+            .expect("ordered indexed projection should stay on fast path");
+
+        assert_eq!(result.columns(), &["id".to_string(), "raw_id".to_string()]);
+        assert_eq!(result.rows().len(), 1);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[Value::Int64(20), Value::Text("mbid-020".to_string())]
+        );
+
+        let statement =
+            parse_sql_statement("SELECT id FROM artists WHERE raw_id = $1 ORDER BY id ASC LIMIT 1")
+                .expect("parse parameterized indexed projection");
+        let crate::sql::ast::Statement::Query(query) = &statement else {
+            panic!("expected query statement");
+        };
+
+        let result = runtime
+            .try_execute_simple_indexed_projection_query(
+                query,
+                &[Value::Text("mbid-030".to_string())],
+            )
+            .expect("execute parameterized indexed projection")
+            .expect("parameterized indexed projection should stay on fast path");
+
+        assert_eq!(result.columns(), &["id".to_string()]);
+        assert_eq!(result.rows().len(), 1);
+        assert_eq!(result.rows()[0].values(), &[Value::Int64(30)]);
     }
 
     #[test]

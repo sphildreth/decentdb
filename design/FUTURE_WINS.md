@@ -50,6 +50,15 @@ Accepted high-leverage themes:
   adding arbitrary native extension loading
 - keep DecentDB-owned tooling contracts authoritative while Decent Bench owns
   rich IDE/codegen workflows
+- eliminate redundant parse and plan work through query plan caching and
+  prepared-statement reuse so that high-throughput embedded workloads get
+  competitive performance without application-level tuning
+- bound result materialization through streaming and cursor-based result sets so
+  that embedded hosts with limited memory can query large datasets safely
+- make offline-first conflict resolution ergonomic through declarative merge
+  policies so that local-first adoption is not blocked by custom conflict code
+- close the developer-experience gap around schema migration file management so
+  that branch-aware rehearsal has a first-class CLI workflow
 
 Intentionally excluded or deferred from the core roadmap:
 
@@ -111,8 +120,8 @@ Status values:
 - `BACKLOG`: valuable, but not part of the near-term implementation path.
 
 Future version values are planning buckets, not release commitments. The latest
-public release in this repository is `2.9.0`. `vNext` means the first release
-bucket after `2.9.0` only when scope is explicitly accepted. `vNext+1` and
+public release in this repository is `2.10.0`. `vNext` means the first release
+bucket after `2.10.0` only when scope is explicitly accepted. `vNext+1` and
 `vNext+2` are follow-on planning buckets, not exact semantic versions.
 
 Roadmap lifecycle: once a Future Win is 100% implemented, tested, and
@@ -128,21 +137,29 @@ shipped foundation affects follow-on roadmap decisions.
 | 4 | vNext+1 | TODO | Online schema change execution | Needs ADR/spec; follows branch migration design | Completes the migration story by reducing reader/write disruption during large table rebuilds and index work |
 | 5 | vNext+1 | TODO | Backend sync bridge for existing app databases, Postgres first | Needs ADR/spec | Makes DecentDB easier to adopt in apps that already have a central Postgres/Supabase-style backend |
 | 6 | vNext+1 | TODO | Resource governance, quotas, and automated maintenance | Needs ADR/spec; follows browser/mobile/runtime diagnostics | Embedded hosts need explicit storage, WAL, memory, quota, and maintenance behavior to avoid runaway local resource use |
-| 7 | Later | BACKLOG | Incrementally maintained projections | Needs ADR/spec | Accelerates dashboards, local read models, and reactive query workloads |
-| 8 | Later | BACKLOG | JSONB binary storage and JSON path indexing | Needs ADR/spec | Important for JSON-heavy workloads and now a SQLite baseline expectation |
-| 9 | Later | BACKLOG | Hybrid local search: FTS, trigram, vector, and rank fusion | FTS foundation is delivered; vector and rank fusion need ADR/spec | More compelling than standalone HNSW: apps want keyword, substring, semantic, and relational filters together |
-| 10 | Later | BACKLOG | Authenticated encryption, key rotation, and platform key-store helpers | ADR 0174 follow-up | TDE v1 provides local confidentiality; regulated deployments eventually need tamper-evident page/chunk authentication, key rotation, and turnkey OS/browser/mobile key-store guidance |
-| 11 | Later | BACKLOG | Agent and tooling integration mode | [`STABLE_TOOLING_METADATA_CONTRACT.md`](STABLE_TOOLING_METADATA_CONTRACT.md); needs ADR/spec | Makes the agent-friendly promise concrete without putting LLM behavior in the engine |
-| 12 | Later | BACKLOG | Reliability validation, fault injection, and deterministic replay | [`TESTING_STRATEGY.md`](TESTING_STRATEGY.md); needs ADR/spec for replay capture | Raises confidence in ACID/concurrency changes and makes production bugs reproducible without weakening hot paths |
-| 13 | Later | BACKLOG | Application and support bundle format | Needs ADR/spec | Useful portable artifact and diagnostics story, but should follow security/redaction foundations |
-| 14 | Later | BACKLOG | Temporal row history and auditable state | Needs ADR/spec | Strong regulated/support workflow, but should follow security, audit context, and sync hardening |
-| 15 | Later | BACKLOG | Structured CDC and logical change feeds | Change streams, public changesets, and sync journal are delivered; needs ADR/spec | Lets DecentDB feed event-driven systems without becoming a message broker or bypassing local transactions |
-| 16 | Later | BACKLOG | Curated Lua extension ecosystem | Lua runtime/package model is delivered; needs ADR/spec outside core engine if registry semantics affect trust | Turns safe extensibility into an adoption moat while preserving the no-native-extension stance |
-| 17 | Later | BACKLOG | Unicode collation and internationalization profile | Query-time built-in and Lua collations are delivered; needs ADR/spec for ICU/data-size strategy | International apps need correct Unicode sort/search semantics, but portability and binary size make it a later tradeoff |
-| 18 | Later | BACKLOG | Advanced SQL compatibility surface | [`WIN_ADVANCED_SQL_COMPATIBILITY_SURFACE.md`](WIN_ADVANCED_SQL_COMPATIBILITY_SURFACE.md) | Useful adoption polish after higher-impact runtime, recovery, migration, and workflow blockers |
-| 19 | Later | BACKLOG | Advanced geospatial semantics and analytics | ADR 0128 deferred work; needs follow-up ADR/spec | Builds on shipped spatial support without implying the foundation is unfinished |
-| 20 | Later | BACKLOG | WAL streaming replication | Needs ADR/spec | Useful HA/read-scale story, but weaker than local-first sync and PITR for DecentDB identity |
-| 21 | Later | BACKLOG | Cloud-native object storage VFS and WASI edge profiles | Needs ADR/spec | Interesting edge/serverless story with high durability, consistency, packaging, and cache-invalidation complexity |
+| 7 | vNext+1 | TODO | Query plan caching and prepared-statement reuse | [`WIN_QUERY_PLAN_CACHING_AND_STATEMENT_REUSE.md`](WIN_QUERY_PLAN_CACHING_AND_STATEMENT_REUSE.md); needs ADR/spec | ORMs and binding layers expect plan reuse; reduces CPU overhead for repeated queries; affects Priority #2 (fast reads) and Priority #3 (ergonomic bindings) |
+| 8 | vNext+1 | TODO | Streaming and cursor-based result sets | Needs ADR/spec | Memory-bounded hosts need bounded result materialization; enables resource governance and affects large-query adoption |
+| 9 | vNext+2 | TODO | Offline-first conflict resolution UX and declarative merge policies | Needs ADR/spec; builds on shipped sync and changeset surfaces | Local-first differentiator; competitors handle conflict UX poorly; declarative merge policies make sync adoption easier |
+| 10 | vNext+2 | TODO | Schema migration file management and CLI | Needs ADR/spec; complements branch-aware migration rehearsal | Developer-experience gap for version-tracked migration scripts and framework integration |
+| 11 | vNext+2 | TODO | Observability bridge: OpenTelemetry and structured export | Needs ADR/spec; follows tracing/advisors | Production teams need external observability to justify DecentDB over SQLite; builds on item 2 |
+| 12 | vNext+2 | TODO | Binding ergonomics and performance contract | Needs ADR/spec | No current roadmap item addresses connection pooling, batch APIs, and cross-target performance guarantees for maintained bindings |
+| 13 | Later | BACKLOG | Incrementally maintained projections | Needs ADR/spec | Accelerates dashboards, local read models, and reactive query workloads |
+| 14 | Later | BACKLOG | JSONB binary storage and JSON path indexing | Needs ADR/spec | Important for JSON-heavy workloads and now a SQLite baseline expectation |
+| 15 | Later | BACKLOG | Hybrid local search: FTS, trigram, vector, and rank fusion | FTS foundation is delivered; vector and rank fusion need ADR/spec | More compelling than standalone HNSW: apps want keyword, substring, semantic, and relational filters together |
+| 16 | Later | BACKLOG | Authenticated encryption, key rotation, and platform key-store helpers | ADR 0174 follow-up | TDE v1 provides local confidentiality; regulated deployments eventually need tamper-evident page/chunk authentication, key rotation, and turnkey OS/browser/mobile key-store guidance |
+| 17 | Later | BACKLOG | Agent and tooling integration mode | [`STABLE_TOOLING_METADATA_CONTRACT.md`](STABLE_TOOLING_METADATA_CONTRACT.md); needs ADR/spec | Makes the agent-friendly promise concrete without putting LLM behavior in the engine |
+| 18 | Later | BACKLOG | Reliability validation, fault injection, and deterministic replay | [`TESTING_STRATEGY.md`](TESTING_STRATEGY.md); needs ADR/spec for replay capture | Raises confidence in ACID/concurrency changes and makes production bugs reproducible without weakening hot paths |
+| 19 | Later | BACKLOG | Application and support bundle format | Needs ADR/spec | Useful portable artifact and diagnostics story, but should follow security/redaction foundations |
+| 20 | Later | BACKLOG | Temporal row history and auditable state | Needs ADR/spec | Strong regulated/support workflow, but should follow security, audit context, and sync hardening |
+| 21 | Later | BACKLOG | Structured CDC and logical change feeds | Change streams, public changesets, and sync journal are delivered; needs ADR/spec | Lets DecentDB feed event-driven systems without becoming a message broker or bypassing local transactions |
+| 22 | Later | BACKLOG | Curated Lua extension ecosystem | Lua runtime/package model is delivered; needs ADR/spec outside core engine if registry semantics affect trust | Turns safe extensibility into an adoption moat while preserving the no-native-extension stance |
+| 23 | Later | BACKLOG | Multi-tenant scoped isolation | Needs ADR/spec | Narrow scoped-visibility mechanism distinct from shipped masking and excluded server-style auth; enables SaaS-embedded patterns |
+| 24 | Later | BACKLOG | Unicode collation and internationalization profile | Query-time built-in and Lua collations are delivered; needs ADR/spec for ICU/data-size strategy | International apps need correct Unicode sort/search semantics, but portability and binary size make it a later tradeoff |
+| 25 | Later | BACKLOG | Advanced SQL compatibility surface | [`WIN_ADVANCED_SQL_COMPATIBILITY_SURFACE.md`](WIN_ADVANCED_SQL_COMPATIBILITY_SURFACE.md) | Useful adoption polish after higher-impact runtime, recovery, migration, and workflow blockers |
+| 26 | Later | BACKLOG | Advanced geospatial semantics and analytics | ADR 0128 deferred work; needs follow-up ADR/spec | Builds on shipped spatial support without implying the foundation is unfinished |
+| 27 | Later | BACKLOG | Deterministic testing and binding snapshot assertions | Needs ADR/spec; follows reliability validation | Binding-level test infrastructure and deterministic assertion patterns improve Priority #3 confidence |
+| 28 | Later | BACKLOG | WAL streaming replication | Needs ADR/spec | Useful HA/read-scale story, but weaker than local-first sync and PITR for DecentDB identity |
+| 29 | Later | BACKLOG | Cloud-native object storage VFS and WASI edge profiles | Needs ADR/spec | Interesting edge/serverless story with high durability, consistency, packaging, and cache-invalidation complexity |
 
 ## Positioning
 
@@ -429,7 +446,303 @@ harm the host even when DecentDB remains logically correct.
 - do not auto-delete named snapshots, branches, sync data, or audit records
   without explicit retained-policy configuration
 
-## 7. Incrementally Maintained Projections
+## 7. Query Plan Caching And Prepared-Statement Reuse
+
+**Status:** `TODO`
+
+**Future Version:** vNext+1
+
+**Source of truth:** [`WIN_QUERY_PLAN_CACHING_AND_STATEMENT_REUSE.md`](WIN_QUERY_PLAN_CACHING_AND_STATEMENT_REUSE.md); needs ADR/spec before implementation.
+
+### Why This Matters
+
+DecentDB currently parses, resolves, and plans every SQL statement from scratch
+unless the caller uses a prepared statement that the executor replays. Even
+prepared statements re-validate schema cookies and re-bind parameters on every
+execution. ORMs, binding layers, and application frameworks commonly execute the
+same parameterized queries thousands of times in a session. Each redundant parse
+and plan cycle costs CPU, increases p99 latency, and makes DecentDB harder to
+recommend for high-throughput embedded workloads where SQLite and PostgreSQL
+already cache compiled plans.
+
+This is both a performance concern and an adoption concern. Teams evaluating
+embedded databases expect prepared statements to avoid re-parsing. The default
+fast performance win shipped in ADR 0184 covers executor fast paths but does not
+address plan caching or statement reuse. Without a caching layer, DecentDB's
+prepared-statement throughput has a measurable overhead floor that binding layers
+cannot work around.
+
+### Desired Capability
+
+- compiled plan cache keyed by SQL text with parameterized and schema-dependent
+  separation
+- schema-cookie or catalog-generation invalidation that evicts stale plans without
+  re-parsing every statement
+- plan reuse across prepared statements within the same database connection
+- optional cross-connection plan sharing through a process-global plan cache with
+  safe invalidation semantics
+- cache size limits with LRU or generation-based eviction tuned for embedded
+  memory constraints
+- `sys.*` diagnostics for cache hit rates, eviction counts, and cache memory use
+- C ABI and maintained binding surfaces for plan cache configuration and inspection
+- benchmark guardrails that measure prepared-statement throughput before and after
+  plan caching
+
+### Guardrails
+
+- do not cache plans across schema changes without correct invalidation
+- do not share mutable plan state across connections without safe concurrency
+- do not increase default resident memory beyond the accepted low-memory profile
+- do not make plan caching mandatory; embedded hosts must be able to disable it
+- keep the one-writer/many-readers model intact; plan caching must not introduce
+  hidden write-path contention
+- measure and publish the overhead of cache lookup versus the savings; if the
+  cache hit path adds measurable overhead to one-shot queries, provide a bypass
+
+## 8. Streaming And Cursor-Based Result Sets
+
+**Status:** `TODO`
+
+**Future Version:** vNext+1
+
+**Source of truth:** Needs ADR/spec before implementation. A streaming result
+contract that changes C ABI lifetime or ownership semantics requires a separate
+ADR and C ABI version bump.
+
+### Why This Matters
+
+Embedded hosts have bounded memory. Large SELECT results, analytical queries,
+sync changeset exports, and support bundle queries can materialize full result
+sets that exceed practical memory on mobile devices, browsers, and constrained
+servers. DecentDB currently materializes full results before returning them
+through most binding surfaces. This creates a hard ceiling on query result size
+and forces application authors to paginate manually or risk out-of-memory
+conditions.
+
+Resource governance (item 6) needs bounded result materialization as a
+governance tool. Reactive subscriptions (shipped) already stream incremental
+changes, but bulk reads still require full materialization. A streaming or
+cursor-based result path makes resource quotas enforceable and makes large-query
+workloads practical on memory-constrained hosts.
+
+### Desired Capability
+
+- cursor-based result iteration through the C ABI that fetches rows in bounded
+  batches without materializing the full result set
+- connection-scoped result cursors with explicit open, fetch, and close lifecycle
+- configurable fetch batch size with a default that respects low-memory profiles
+- early query termination through cursor close without completing the full scan
+- resource governance integration: queries that would exceed the configured result
+  memory budget fail with a clear error rather than silently materializing
+- binding-friendly iteration patterns that compose with existing prepared-statement
+  APIs
+- WASM and mobile cursor patterns that respect single-threaded and async
+  constraints
+
+### Guardrails
+
+- do not change existing C ABI result ownership semantics without a version bump
+  and ADR
+- do not hold write locks or WAL retention barriers indefinitely for open cursors;
+  use snapshot isolation correctly and document the retention behavior
+- keep the default full-materialization path stable; streaming must be opt-in for
+  the first release
+- measure cursor overhead versus full materialization for small result sets; do
+  not regress the common case
+- any new C ABI lifetime contract requires binding updates and migration guidance
+
+## 9. Offline-First Conflict Resolution UX And Declarative Merge Policies
+
+**Status:** `TODO`
+
+**Future Version:** vNext+2
+
+**Source of truth:** Needs ADR/spec. Builds on shipped sync slices, changesets,
+and conflict surfaces.
+
+### Why This Matters
+
+DecentDB has delivered local-first sync slices 1-8, public changesets, and a
+conflict resolution surface. But conflict handling currently requires application
+code for every conflict type. Developers building offline-first apps need
+declarative merge policies that cover common patterns (last-write-wins,
+application-specific merge, field-level merge, and per-column conflict
+strategies) without writing custom resolution logic for every table.
+
+Competing local-first databases such as PowerSync and Electric SQL provide
+opinionated merge strategies out of the box. DecentDB's sync foundation is
+stronger, but the developer experience of handling conflicts falls short of the
+"just works" promise that makes local-first adoption easy. This win does not add
+CRDTs or server-side merge engines. It makes the already-shipped conflict
+surface easier to consume through declarative policies and ergonomic tooling.
+
+### Desired Capability
+
+- declarative per-table and per-column merge policies (last-write-wins,
+  application-merge, fail-and-notify, and custom Lua resolvers)
+- conflict preview and inspection through `sys.*` views and CLI
+- merge policy definitions stored in catalog metadata with sync shape awareness
+- field-level merge for common patterns (increment counters, concat text, choose
+  non-null)
+- conflict dashboards and debugging surfaces in Doctor and CLI
+- binding-friendly conflict enumeration and resolution APIs
+- documentation patterns and examples for common offline-first conflict scenarios
+
+### Guardrails
+
+- do not build a general CRDT column type or automatic merge system
+- do not bypass local transaction semantics or changeset durability
+- keep custom resolution safe: Lua resolvers follow the same sandbox and trust
+  model as other Lua extensions
+- fail-and-notify is a valid policy; not every conflict should auto-resolve
+- merge policies must compose with TDE, masking, and audit context without
+  bypassing them
+
+## 10. Schema Migration File Management And CLI
+
+**Status:** `TODO`
+
+**Future Version:** vNext+2
+
+**Source of truth:** Needs ADR/spec. Complements branch-aware migration rehearsal
+(item 3).
+
+### Why This Matters
+
+Branch-aware migration rehearsal (item 3) provides the database-side workflow for
+safe schema changes: branch, migrate, validate, diff, and promote. But application
+developers also need a version-tracked migration file management workflow: SQL
+migration files, up/down scripts, version ordering, manifest tracking, and
+integration with migration frameworks (golang-migrate, Flyway, Alembic, Entity
+Framework migrations).
+
+SQLite's simplicity is partly due to its lightweight CLI migration story. DecentDB
+has strong branch and diff foundations, but the developer CLI workflow for managing
+migration files, tracking applied versions, and running migration sequences is
+incomplete. This win makes the branch rehearsal workflow accessible to developers
+who think in terms of numbered migration files, not database branches.
+
+### Desired Capability
+
+- `decentdb migrate` CLI subcommand for create, apply, revert, status, and verify
+  operations
+- migration file format with ordered up/down SQL scripts and metadata headers
+- migration manifest tracking applied versions in durable catalog metadata
+- dry-run and plan-only modes that show the SQL and effects without executing
+- integration with branch rehearsal: create migration branch, apply migration
+  files, validate, diff, and promote
+- C ABI and binding surfaces for migration status and version queries
+- `sys.migrations` view for applied migration history
+- conflict detection when migration history diverges from expected state
+
+### Guardrails
+
+- do not build a general migration framework server or UI
+- do not duplicate Decent Bench's SDK generation and visual migration workflows
+- migration files are SQL text; do not invent a new DSL
+- migration tracking metadata must survive crash recovery and branch promotion
+- keep the CLI surface composable so build systems and CI pipelines can drive it
+
+## 11. Observability Bridge: OpenTelemetry And Structured Export
+
+**Status:** `TODO`
+
+**Future Version:** vNext+2
+
+**Source of truth:** Needs ADR/spec. Follows runtime tracing and advisors
+(item 2).
+
+### Why This Matters
+
+Runtime tracing and Doctor (item 2) provide internal diagnostic surfaces
+through `sys.*` views and CLI output. But production teams running DecentDB
+inside larger applications already use OpenTelemetry, Prometheus, structured
+logging, and distributed tracing to observe their stack. If DecentDB cannot
+export structured traces and metrics to these systems, operators lack visibility
+into embedded database behavior and fall back to guessing.
+
+SQLite has limited observability. Making DecentDB observable in standard
+observability stacks is a practical differentiator for teams evaluating embedded
+databases for production workloads. This win does not add a tracing collector to
+the engine core. It adds opt-in export bridges that translate internal metrics
+and trace events into standard formats.
+
+### Desired Capability
+
+- opt-in OpenTelemetry trace span export for query execution, transaction
+  lifecycle, checkpoint, WAL, sync, and branch operations
+- opt-in OpenTelemetry metrics export for cache hit rates, WAL growth, commit
+  latency, checkpoint duration, and connection counts
+- structured logging bridge that emits JSON-formatted events compatible with
+  common log aggregators
+- C ABI configuration for enabling, filtering, and endpoint configuration
+- maintained binding surfaces for trace context propagation and metric export
+- no hot-path overhead when observability is disabled
+- documentation for common integration patterns (Jaeger, Zipkin, Grafana,
+  Datadog, CloudWatch)
+
+### Guardrails
+
+- do not add always-on tracing or telemetry collection
+- do not add a network listener, HTTP server, or gRPC dependency to the core
+  engine; export bridges are host-side adapters or binding-side integrations
+- do not emit sensitive data (parameter values, TDE keys, SQL text) by default
+- keep tracing/metric collection opt-in at open time, not per-query
+- follow the redaction policy from the structured errors spec (ADR 0185) for any
+  exported data
+
+## 12. Binding Ergonomics And Performance Contract
+
+**Status:** `TODO`
+
+**Future Version:** vNext+2
+
+**Source of truth:** Needs ADR/spec. ADRs 0039-0046 cover .NET-specific
+ergonomics; this item covers cross-binding consistency.
+
+### Why This Matters
+
+DecentDB has six maintained bindings (Python, Go, Node, .NET, Java, Dart) plus
+WASM/browser. Each binding wraps the C ABI with language-appropriate patterns.
+But there is no cross-binding performance contract or ergonomics specification.
+Binding authors currently make independent choices about connection pooling,
+statement reuse, batch patterns, error projection, type mapping, and async
+models. This creates inconsistent developer experience and performance gaps that
+are not visible in native-only benchmarks.
+
+SQLite's ecosystem works partly because every binding behaves predictably.
+DecentDB bindings should offer a consistent contract: connection pooling
+patterns, prepared-statement lifecycle, batch insert APIs, async model
+conventions, and minimum performance expectations relative to the native path.
+This win formalizes that contract and makes binding performance a first-class
+concern.
+
+### Desired Capability
+
+- cross-binding ergonomics contract specifying minimum API surface: open,
+  prepare, execute, fetch, close, transaction, error, and metadata patterns
+- connection pooling patterns and recommendations for each binding language
+- batch insert API contract that uses the shipped write queue for group commit
+- prepared-statement lifecycle patterns with explicit reset, reuse, and cleanup
+  guidance
+- binding performance benchmarks measured against the native C ABI path with
+  documented target ratios
+- async model conventions for each binding (Node Promises, .NET Task, Go
+  goroutines, Java CompletableFuture, Dart async, Python async)
+- error projection contract consistent with ADR 0185 across all bindings
+- `sys.*` and Doctor integration patterns documented for each binding
+
+### Guardrails
+
+- do not mandate identical internal implementation across bindings; idiomatic
+  patterns differ by language
+- do not rewrite bindings; formalize existing contracts and fill measured gaps
+- do not add binding-specific query features that bypass the C ABI
+- keep the C ABI as the single authoritative contract surface
+- binding performance targets are measured ratios against native, not absolute
+  numbers
+
+## 13. Incrementally Maintained Projections
 
 **Status:** `BACKLOG`
 
@@ -458,7 +771,7 @@ database-native capability that also accelerates reactive queries.
 - keep maintenance work visible in write latency and `sys.*`
 - define crash recovery and rebuild semantics before implementation
 
-## 8. JSONB Binary Storage And JSON Path Indexing
+## 14. JSONB Binary Storage And JSON Path Indexing
 
 **Status:** `BACKLOG`
 
@@ -483,7 +796,7 @@ baseline expectation rather than a niche feature.
 - partial updates rebuild the binary blob through the single writer unless an
   ADR proves a narrower mutation format is safe
 
-## 9. Hybrid Local Search: FTS, Trigram, Vector, And Rank Fusion
+## 15. Hybrid Local Search: FTS, Trigram, Vector, And Rank Fusion
 
 **Status:** `BACKLOG`
 
@@ -518,7 +831,7 @@ default performance affect more existing embedded database users. Hybrid search
 should follow the runtime fundamentals and avoid becoming a large storage/index
 project before the core engine is easier to adopt and operate.
 
-## 10. Authenticated Encryption, Key Rotation, And Platform Key-Store Helpers
+## 16. Authenticated Encryption, Key Rotation, And Platform Key-Store Helpers
 
 **Status:** `BACKLOG`
 
@@ -551,7 +864,7 @@ desktop, server, browser, and mobile hosts.
 - keep key material outside database pages, WAL, sync journals, audit rows, and
   diagnostics
 
-## 11. Agent And Tooling Integration Mode
+## 17. Agent And Tooling Integration Mode
 
 **Status:** `BACKLOG`
 
@@ -590,7 +903,7 @@ guessing.
 - Decent Bench remains the product home for rich visual workflows and generated
   SDK output
 
-## 12. Reliability Validation, Fault Injection, And Deterministic Replay
+## 18. Reliability Validation, Fault Injection, And Deterministic Replay
 
 **Status:** `BACKLOG`
 
@@ -631,7 +944,7 @@ production failures without sharing raw database files.
 - byte-identical database images are not a blanket requirement unless a narrow
   ADR proves the value and cost
 
-## 13. Application And Support Bundle Format
+## 19. Application And Support Bundle Format
 
 **Status:** `BACKLOG`
 
@@ -668,7 +981,7 @@ A DecentDB bundle may contain:
 - support bundles must have a sanitization/redaction story before use with
   regulated data
 
-## 14. Temporal Row History And Auditable State
+## 20. Temporal Row History And Auditable State
 
 **Status:** `BACKLOG`
 
@@ -697,7 +1010,7 @@ auditable local data. Some regulated and support-heavy apps need to answer:
 - redaction must be compatible with retention and audit requirements
 - do not conflate branch snapshots with row-level audit history
 
-## 15. Structured CDC And Logical Change Feeds
+## 21. Structured CDC And Logical Change Feeds
 
 **Status:** `BACKLOG`
 
@@ -736,7 +1049,7 @@ broker.
 - reuse changeset compatibility metadata rather than inventing a parallel
   serialization contract
 
-## 16. Curated Lua Extension Ecosystem
+## 22. Curated Lua Extension Ecosystem
 
 **Status:** `BACKLOG`
 
@@ -774,7 +1087,50 @@ verify, and test across native, browser, and mobile targets.
   the engine
 - keep browser/mobile package-size and sandbox constraints explicit
 
-## 17. Unicode Collation And Internationalization Profile
+## 23. Multi-Tenant Scoped Isolation
+
+**Status:** `BACKLOG`
+
+**Future Version:** Later
+
+**Source of truth:** Needs ADR/spec. Follows resource governance, security, and
+audit context foundations.
+
+### Why This Matters
+
+DecentDB already ships row-level policies, projection masks, and audit context
+(ADR 0174). These provide local data security for single-tenant deployments.
+Applications embedding DecentDB in SaaS, multi-app, or multi-workspace
+environments need a narrower, more explicit isolation mechanism that goes beyond
+masking but falls short of server-style users, roles, and authentication (which
+are explicitly excluded from the roadmap).
+
+Multi-tenant scoped isolation is distinct from row-level masking (which hides
+data) and from server auth (which assumes a connection manager). It is about
+enforcing scoped visibility: a tenant or workspace can only see and modify its
+own partition of the database, enforced by the engine rather than by application
+convention alone.
+
+### Possible Direction
+
+- tenant or workspace context set at open time or per-transaction
+- scoped visibility filters automatically applied to all queries in the scope
+- scoped storage quotas composing with resource governance (item 6)
+- scoped `sys.*` diagnostics filtered by tenant context
+- scoped sync and changeset boundaries
+- scoped branch isolation where tenants cannot access other tenants' branches
+
+### Guardrails
+
+- this is not server-style users, roles, or authentication
+- the host application remains responsible for who can open a handle
+- scoped isolation must not bypass TDE, masking, or audit context
+- scoped filters must be verifiable by Doctor and `sys.*` surfaces
+- performance overhead of scoped filtering must be measured and documented
+- scoped isolation composes with, but does not replace, application-level access
+  control
+
+## 24. Unicode Collation And Internationalization Profile
 
 **Status:** `BACKLOG`
 
@@ -808,7 +1164,7 @@ government, education, commerce, and consumer applications.
 - avoid locale-sensitive behavior in durability-critical metadata keys
 - keep Lua collations available for narrower application-specific behavior
 
-## 18. Advanced SQL Compatibility Surface
+## 25. Advanced SQL Compatibility Surface
 
 **Status:** `BACKLOG`
 
@@ -847,7 +1203,7 @@ layer is delivered; this item is for heavier compatibility work.
   ergonomics
 - avoid expanding core import/export features in this track
 
-## 19. Advanced Geospatial Semantics And Analytics
+## 26. Advanced Geospatial Semantics And Analytics
 
 **Status:** `BACKLOG`
 
@@ -879,7 +1235,52 @@ the completed native geospatial feature does not appear unfinished.
 - avoid native GEOS/PROJ/GDAL dependencies unless an ADR justifies the tradeoff
 - keep WASM/mobile compatibility as a design constraint
 
-## 20. WAL Streaming Replication
+## 27. Deterministic Testing And Binding Snapshot Assertions
+
+**Status:** `BACKLOG`
+
+**Future Version:** Later
+
+**Source of truth:** Needs ADR/spec. Follows reliability validation (item 18)
+and builds on the Python test harness and binding smoke test infrastructure.
+
+### Why This Matters
+
+DecentDB has a Python test harness, Rust unit tests, and per-binding smoke tests.
+But binding authors and application developers have no deterministic test
+infrastructure for asserting query results, schema states, and migration
+outcomes across engine versions. Test flakiness from non-deterministic date/time
+values, auto-increment sequences, floating-point differences, and
+platform-dependent sort orders makes it harder to write reliable binding tests.
+
+SQLite's test suite works partly because it offers deterministic mode settings
+and fixture-based regression testing. DecentDB should provide similar
+determinism controls for testing: seedable sequences, frozen timestamps,
+deterministic collation, and snapshot-based assertion helpers that make binding
+and application tests reliable across platforms and versions.
+
+### Possible Direction
+
+- deterministic test mode: seedable auto-increment, frozen `NOW()`/`TODAY()`,
+  deterministic random, and deterministic collation order
+- result snapshot assertion helpers for binding smoke tests
+- schema snapshot comparison for migration tests
+- migration history assertion for branch rehearsal tests
+- test fixture generation from benchmark schemas with deterministic data
+- C ABI test configuration for enabling deterministic mode
+- documentation patterns for common deterministic testing scenarios
+
+### Guardrails
+
+- deterministic mode is for testing only; it must not be a production
+  configuration
+- do not change WAL, recovery, or crash-recovery semantics in deterministic
+  mode; only suppress non-deterministic observable values
+- keep binding smoke tests runnable without deterministic mode; deterministic
+  mode should tighten assertions, not gate CI
+- deterministic mode must work across all maintained binding targets
+
+## 28. WAL Streaming Replication
 
 **Status:** `BACKLOG`
 
@@ -904,7 +1305,7 @@ traditional HA problem.
 - quorum acknowledgement
 - explicit consistency/durability tradeoffs
 
-## 21. Cloud-Native Object Storage VFS And WASI Edge Profiles
+## 29. Cloud-Native Object Storage VFS And WASI Edge Profiles
 
 **Status:** `BACKLOG`
 
@@ -949,12 +1350,30 @@ Promoted as distinct roadmap items:
 - structured CDC and logical change feeds
 - curated Lua extension ecosystem
 - Unicode collation and internationalization profile
+- query plan caching and prepared-statement reuse (adoption and performance
+  concern; ORMs and binding layers expect plan reuse)
+- streaming and cursor-based result sets (resource governance and adoption
+  concern; embedded hosts need bounded materialization)
+- offline-first conflict resolution UX and declarative merge policies
+  (local-first differentiator; builds on shipped sync and changeset surfaces)
+- schema migration file management and CLI (developer-experience gap for
+  version-tracked migration scripts)
+- observability bridge: OpenTelemetry and structured export (production
+  observability for embedded database adoption)
+- binding ergonomics and performance contract (cross-binding consistency and
+  performance guarantees)
+- multi-tenant scoped isolation (narrow scoped-visibility mechanism distinct
+  from shipped masking and excluded server-style auth)
+- deterministic testing and binding snapshot assertions (binding-level test
+  infrastructure for reliable cross-platform testing)
 
 Folded into existing tracks instead of duplicated:
 
-- page/key/layout compression, streaming result sets, plan caching, and adaptive
-  statistics belong under future measured performance follow-ups when benchmark
-  evidence justifies the added contract or format risk
+- page/key/layout compression and adaptive statistics remain under future
+  measured performance follow-ups when benchmark evidence justifies the added
+  contract or format risk. Plan caching and streaming result sets were promoted
+  as distinct items because their adoption and governance impact exceeds pure
+  performance optimization.
 - schema linting, plan diff/regression reporting, session visibility, and
   connection lifecycle diagnostics belong under tracing/advisors/Doctor
 - schema version registries, migration history, and compatibility validation
@@ -1002,8 +1421,21 @@ Not promoted because the premise is already delivered or the idea is off-lane:
    optional tuning-only feature.
 6. Promote authenticated encryption/key-rotation work only after the v1 TDE and
    policy surfaces have production feedback and a follow-up ADR.
-9. Promote backlog items into TODO only after the top adoption blockers have
-   ADR/spec coverage or active implementation ownership.
+7. Design query plan caching and prepared-statement reuse as a performance and
+   adoption win that complements the shipped executor fast paths without changing
+   file format or durability semantics.
+8. Design streaming and cursor-based result sets as a resource-governance
+   building block that enables bounded result materialization for embedded hosts.
+9. Design offline-first conflict resolution UX and declarative merge policies
+   after the backend sync bridge validates the public changeset contract.
+10. Design schema migration file management and CLI as a developer-experience
+    complement to branch-aware migration rehearsal.
+11. Design the observability bridge after runtime tracing and advisors have a
+    stable internal contract; export bridges depend on internal surfaces.
+12. Formalize the binding ergonomics and performance contract after structured
+    errors and diagnostics are delivered.
+13. Promote backlog items into TODO only after the top adoption blockers have
+    ADR/spec coverage or active implementation ownership.
 
 ## Market Notes
 
@@ -1040,6 +1472,28 @@ clone checklist:
 - The largest DecentDB opportunity is integrated durable local-first workflow:
   fast embedded reads/writes, sync, branches, browser/mobile runtime,
   observability, security, and agent-readable tooling.
+- SQLite caches compiled statements by default and PostgreSQL caches query plans
+  across connections. DecentDB currently re-parses and re-validates on every
+  execution; plan caching is a baseline expectation for high-throughput embedded
+  workloads.
+- SQLite, DuckDB, and PostgreSQL all support stepped/cursor result iteration.
+  DecentDB's full-result materialization creates a hard ceiling for large queries
+  on memory-constrained hosts; streaming results are both a governance and
+  adoption concern.
+- PowerSync, Electric SQL, and PGlite provide opinionated conflict resolution
+  patterns out of the box. DecentDB has the foundation but needs declarative merge
+  policies to make offline-first adoption easy.
+- SQLite's `sqlite3` CLI and migration tooling (golang-migrate, Alembic, Flyway)
+  make schema management feel simple. DecentDB needs a migration file workflow to
+  complement its branch rehearsal foundations.
+- Production teams running DecentDB inside larger stacks need OpenTelemetry and
+  structured export to observe embedded database behavior alongside the rest of
+  their infrastructure. SQLite has limited observability; DecentDB can
+  differentiate here.
+- Multi-tenant SaaS embeddings need scoped isolation that goes beyond row masking
+  but does not require server-style authentication. This is a narrower scope than
+  excluded auth features but addresses a real adoption blocker for platform
+  embedders.
 
 Useful references:
 

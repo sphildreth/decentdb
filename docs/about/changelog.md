@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.10.0] - [2026-06-09]
+
+### Fixed
+
+- Kept simple indexed equality projections on the native fast path when they
+  include provider-generated `ORDER BY`, `LIMIT`, or `OFFSET` clauses. This
+  covers EF Core shapes such as `Where(...).OrderBy(...).Take(...)` for
+  indexed string lookups.
+
+### Added
+
+- Added .NET ADO.NET `DecentDBMaintenance.RebuildIndexAsync(...)` and
+  `RebuildIndexesAsync(...)` helpers so applications can rebuild runtime index
+  structures through the binding without invoking the CLI.
+- Added native and .NET regression coverage for Melodee-style ordered indexed
+  string equality lookups.
+
 ## [2.9.0] - [2026-06-09]
 
 ### Fixed

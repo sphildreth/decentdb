@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 
 namespace DecentDB.AdoNet;
 
@@ -60,6 +61,36 @@ public sealed class DecentDBCheckpointResult
 
     public string DatabasePath { get; }
     public bool DatabaseExisted { get; }
+    public DecentDBWalStatus Before { get; }
+    public DecentDBWalStatus After { get; }
+    public TimeSpan Duration { get; }
+}
+
+/// <summary>
+/// Result from an in-process index rebuild operation.
+/// </summary>
+public sealed class DecentDBIndexRebuildResult
+{
+    public DecentDBIndexRebuildResult(
+        string databasePath,
+        bool databaseExisted,
+        IReadOnlyList<string> indexes,
+        DecentDBWalStatus before,
+        DecentDBWalStatus after,
+        TimeSpan duration)
+    {
+        DatabasePath = databasePath;
+        DatabaseExisted = databaseExisted;
+        Indexes = indexes;
+        Before = before;
+        After = after;
+        Duration = duration;
+    }
+
+    public string DatabasePath { get; }
+    public bool DatabaseExisted { get; }
+    public IReadOnlyList<string> Indexes { get; }
+    public int IndexCount => Indexes.Count;
     public DecentDBWalStatus Before { get; }
     public DecentDBWalStatus After { get; }
     public TimeSpan Duration { get; }

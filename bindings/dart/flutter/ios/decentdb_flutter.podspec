@@ -1,6 +1,6 @@
 Pod::Spec.new do |s|
   s.name             = 'decentdb_flutter'
-  s.version          = '2.9.0'
+  s.version          = '2.10.0'
   s.summary          = 'Flutter mobile integration helpers for DecentDB.'
   s.description      = 'Provides Flutter registration and native artifact wiring for the DecentDB Dart FFI package.'
   s.homepage         = 'https://github.com/sphildreth/decentdb'
