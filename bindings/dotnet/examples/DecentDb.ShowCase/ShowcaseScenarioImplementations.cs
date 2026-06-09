@@ -712,14 +712,14 @@ internal static partial class ShowcaseScenarioCatalog
             inMemory.SaveAs(maintenanceDbPath);
         }
 
-        var vacuumed = await DecentDBMaintenance.VacuumAtomicAsync(maintenanceDbPath);
+        var vacuumResult = await DecentDBMaintenance.VacuumAsync(maintenanceDbPath);
         using var verify = scenario.CreateOpenConnection(maintenanceDbPath);
         using var verifyCommand = verify.CreateCommand();
         verifyCommand.CommandText = "SELECT COUNT(*) FROM maintenance_demo";
         var copiedRows = Convert.ToInt64(verifyCommand.ExecuteScalar());
 
         scenario.WriteLine($"  SaveAs copied rows: {copiedRows}");
-        scenario.WriteLine($"  VacuumAtomicAsync: {vacuumed}");
+        scenario.WriteLine($"  VacuumAsync replaced database: {vacuumResult.DatabaseExisted}");
         scenario.WriteLine();
     }
     private static async Task DemonstrateConcurrencyControl(ShowcaseScenarioContext scenario)

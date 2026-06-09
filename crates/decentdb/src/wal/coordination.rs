@@ -876,6 +876,9 @@ impl Drop for ProcessReaderGuard {
                 coord_path: self.coordinator.inner.coord_path.clone(),
                 slot: self.slot,
             });
+            if slots.is_empty() {
+                slots.shrink_to_fit();
+            }
         }
         let _ = self.coordinator.clear_reader_slot(self.slot);
     }

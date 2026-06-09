@@ -168,8 +168,22 @@ namespace DecentDB.AdoNet
             catch (Exception ex)
             {
                 _state = ConnectionState.Closed;
-                throw new InvalidOperationException($"Failed to open database: {ex.Message}", ex);
+                throw new InvalidOperationException(CreateOpenFailureMessage(path, ex), ex);
             }
+        }
+
+        private static string CreateOpenFailureMessage(string path, Exception exception)
+        {
+            var message = exception.Message;
+            if (message.Contains("unsupported database format version", StringComparison.OrdinalIgnoreCase))
+            {
+                return "Failed to open database: unsupported DecentDB file format. " +
+                       "Use a compatible DecentDB engine, run decentdb-migrate when a migration path is available, " +
+                       "or rebuild/export the database with the current engine. " +
+                       $"Path: {path}. Native error: {message}";
+            }
+
+            return $"Failed to open database: {message}";
         }
 
         public override Task OpenAsync(CancellationToken cancellationToken)
