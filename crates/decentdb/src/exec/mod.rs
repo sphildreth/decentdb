@@ -94,7 +94,6 @@ const TABLE_PAYLOAD_MAGIC: &[u8; 8] = b"DDBTBL01";
 const TABLE_PAGED_MANIFEST_MAGIC: &[u8; 8] = b"DDBTPG02";
 const PAGED_TABLE_TARGET_CHUNK_PAGES: usize = 16;
 pub(super) const PAGED_TABLE_RESIDENT_APPEND_ROW_THRESHOLD: usize = 1024;
-const DEFERRED_PAGED_ROW_LOCATOR_CACHE_MAX_ROWS: usize = 250_000;
 const GENERATED_COLUMNS_SECTION_MAGIC: &[u8; 8] = b"DDBGCM02";
 const INDEX_INCLUDE_COLUMNS_SECTION_MAGIC: &[u8; 8] = b"DDBICL1\0";
 const SCHEMAS_SECTION_MAGIC: &[u8; 8] = b"DDBSCH01";
@@ -2039,8 +2038,8 @@ impl EngineRuntime {
         table_name: &str,
         state: PersistedTableState,
     ) -> Result<Option<PageId>> {
-        let needs_locator_cache = state.row_count <= DEFERRED_PAGED_ROW_LOCATOR_CACHE_MAX_ROWS
-            && self.should_cache_deferred_paged_row_locators(table_name);
+        let needs_locator_cache =
+            self.should_cache_deferred_paged_row_locators(table_name);
         if !db.config().persistent_pk_index && !needs_locator_cache {
             self.deferred_paged_row_locator_caches_mut()
                 .remove(table_name);

@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Removed the 250,000-row limit on the paged row locator cache that caused
+  indexed equality lookups on large checkpointed tables to degrade to
+  O(manifest_size) per-row linear scans. The cache is now built for all
+  tables with btree indexes or row_id alias columns, regardless of row count.
+  This fixes multi-second indexed lookups observed on tables with millions of
+  rows (Melodee DDB-002/DDB-003).
+
+### Added
+
+- Added regression tests for indexed seek performance on checkpointed/paged
+  tables with 300K+ rows, verifying bounded lookup time after checkpoint and
+  reopen.
+
 
 ## [2.10.0] - [2026-06-10]
 
