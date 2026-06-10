@@ -427,6 +427,49 @@ When `--fix` is present, doctor:
 4. Re-collects facts and re-runs checks.
 5. Reports `mode="fix"`, `pre_fix_findings`, `findings`, and `fixes`.
 
+### tracing (new in v2.11)
+
+Query runtime tracing views for slow queries, lock waits, sessions, index usage,
+Doctor findings, and safe fix plans. Tracing is **disabled by default** and must
+be enabled through `DbConfig::tracing` at open time.
+
+```bash
+decentdb tracing --db=<path> --view=<view> [--format=<json|table|markdown>] [--reset]
+```
+
+Supported views:
+
+- `sessions` — active session state
+- `slow_queries` — captured slow query events
+- `lock_waits` — captured lock-wait events
+- `index_usage` — per-index read/write counters
+- `doctor_findings` — merged static and runtime advisor findings
+- `fix_plan` — safe-to-apply fix plans
+
+Supported options:
+
+- `--format=<json|table|markdown>` output format, default `json`
+- `--reset` clear the selected trace buffer after displaying it
+
+**Examples:**
+
+```bash
+# Query slow queries as JSON
+decentdb tracing --db=my.ddb --view=slow_queries
+
+# Query lock waits as a table
+decentdb tracing --db=my.ddb --view=lock_waits --format=table
+
+# Query index usage and reset the buffer
+decentdb tracing --db=my.ddb --view=index_usage --reset
+
+# Query doctor findings (merged static + runtime)
+decentdb tracing --db=my.ddb --view=doctor_findings
+
+# Query safe fix plans
+decentdb tracing --db=my.ddb --view=fix_plan --format=table
+```
+
 **v1 auto-fixable findings:**
 
 | Fix action | Trigger finding | Precondition |

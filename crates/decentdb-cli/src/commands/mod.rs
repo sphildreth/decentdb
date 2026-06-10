@@ -6048,11 +6048,11 @@ fn run_tracing(command: TracingCommand) -> Result<()> {
         TracingView::FixPlan => "SELECT * FROM sys.fix_plan",
     };
     let result = db.execute(sql)?;
-    let columns = result.columns().clone();
+    let columns = result.columns();
     let rows = rows_from_query_result(&result);
     match command.format {
         OutputFormat::Json => println!("{}", render_exec_success_json(&[result], 0.0, false)),
-        _ => println!("{}", render_rows(command.format, &columns, &rows, true)),
+        _ => println!("{}", render_rows(command.format, columns, &rows, true)),
     }
     if command.reset {
         let kind = match command.view {
