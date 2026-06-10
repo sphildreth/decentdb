@@ -149,6 +149,31 @@ impl<T> BoundedRingBuffer<T> {
         }
         removed
     }
+
+    /// Get a reference to the oldest element without removing it.
+    pub fn oldest(&self) -> Option<&T> {
+        if self.len == 0 {
+            return None;
+        }
+        let cap = self.entries.capacity();
+        let idx = self.tail % cap;
+        self.entries.get(idx)
+    }
+
+    /// Evict the oldest element and return it.
+    pub fn evict_oldest(&mut self) -> Option<T> {
+        if self.len == 0 {
+            return None;
+        }
+        let cap = self.entries.capacity();
+        let idx = self.tail % cap;
+        let item = self.entries.remove(idx);
+        self.tail %= self.entries.len();
+        self.len -= 1;
+        self.head = self.tail;
+        self.eviction_count = self.eviction_count.wrapping_add(1);
+        Some(item)
+    }
 }
 
 #[cfg(test)]

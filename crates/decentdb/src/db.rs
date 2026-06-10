@@ -3044,6 +3044,16 @@ impl Db {
         let tracing_arc = Arc::new(tracing_state);
         runtime.set_tracing(Arc::clone(&tracing_arc));
 
+        if tracing_arc.config.lock_wait.enabled && tracing_arc.config.enabled {
+            let tracing_for_callback = Arc::clone(&tracing_arc);
+            wal.set_process_lock_wait_callback(Some(Arc::new(
+                move |checkpoint, elapsed, status| {
+                    let source = if checkpoint { "checkpoint" } else { "writer" };
+                    tracing_for_callback.record_lock_wait(elapsed, source, status, true);
+                },
+            )));
+        }
+
         let catalog = CatalogHandle::new(runtime.catalog.as_ref().clone());
         let last_seen_checkpoint_epoch = wal.checkpoint_epoch();
         let reactive_registry_key = open_lock_key.clone();

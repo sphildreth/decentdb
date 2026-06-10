@@ -1,8 +1,10 @@
 #![allow(dead_code)]
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 
 use crate::record::value::Value;
+use crate::tracing::buffer::BoundedRingBuffer;
 use crate::tracing::config::RuntimeTracingConfig;
 
 /// How an index was used in a traced operation.
@@ -60,10 +62,15 @@ impl IndexUsageRow {
     }
 }
 
+fn index_key(table_name: &str, index_name: &str) -> String {
+    format!("{table_name}:{index_name}")
+}
+
 #[derive(Debug)]
 pub(crate) struct IndexUsageStore {
     config: RuntimeTracingConfig,
-    rows: Vec<IndexUsageRow>,
+    rows: HashMap<String, IndexUsageRow>,
+    order: BoundedRingBuffer<String>,
 }
 
 impl IndexUsageStore {
@@ -71,7 +78,8 @@ impl IndexUsageStore {
         let capacity = config.index_usage.max_rows.clamp(1, 65_536);
         Self {
             config: config.clone(),
-            rows: Vec::with_capacity(capacity),
+            rows: HashMap::with_capacity(capacity),
+            order: BoundedRingBuffer::with_capacity(capacity),
         }
     }
 
@@ -86,37 +94,46 @@ impl IndexUsageStore {
         if !self.config.enabled || !self.config.index_usage.enabled {
             return;
         }
-        if let Some(existing) = self
-            .rows
-            .iter_mut()
-            .find(|r| r.table_name == table_name && r.index_name == index_name)
-        {
+        let key = index_key(table_name, index_name);
+        if let Some(existing) = self.rows.get_mut(&key) {
             match kind {
                 IndexUsageKind::Read => existing.read_count += 1,
                 IndexUsageKind::Write => existing.write_count += 1,
             }
-        } else if self.rows.len() < self.config.index_usage.max_rows {
-            self.rows.push(IndexUsageRow {
-                table_name: table_name.to_string(),
-                index_name: index_name.to_string(),
-                index_kind: index_kind.to_string(),
-                read_count: match kind {
-                    IndexUsageKind::Read => 1,
-                    IndexUsageKind::Write => 0,
+        } else {
+            if self.rows.len() >= self.config.index_usage.max_rows {
+                // Evict oldest entry
+                if let Some(oldest_key) = self.order.oldest() {
+                    self.rows.remove(oldest_key);
+                    self.order.evict_oldest();
+                }
+            }
+            self.rows.insert(
+                key.clone(),
+                IndexUsageRow {
+                    table_name: table_name.to_string(),
+                    index_name: index_name.to_string(),
+                    index_kind: index_kind.to_string(),
+                    read_count: match kind {
+                        IndexUsageKind::Read => 1,
+                        IndexUsageKind::Write => 0,
+                    },
+                    write_count: match kind {
+                        IndexUsageKind::Read => 0,
+                        IndexUsageKind::Write => 1,
+                    },
                 },
-                write_count: match kind {
-                    IndexUsageKind::Read => 0,
-                    IndexUsageKind::Write => 1,
-                },
-            });
+            );
+            self.order.push_back(key);
         }
     }
 
     pub(crate) fn snapshot(&self) -> Vec<IndexUsageRow> {
-        self.rows.clone()
+        self.rows.values().cloned().collect()
     }
 
     pub(crate) fn reset(&mut self) {
         self.rows.clear();
+        self.order.reset();
     }
 }

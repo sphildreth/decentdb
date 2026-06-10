@@ -145,6 +145,16 @@ impl RuntimeTraceState {
                     store.reset();
                 }
             }
+            crate::tracing::events::RuntimeTraceFamily::LockWait => {
+                if let Ok(mut store) = self.lock_wait_store.lock() {
+                    store.reset();
+                }
+            }
+            crate::tracing::events::RuntimeTraceFamily::IndexUsage => {
+                if let Ok(mut store) = self.index_usage_store.lock() {
+                    store.reset();
+                }
+            }
             crate::tracing::events::RuntimeTraceFamily::Session => {
                 if let Ok(mut buf) = self.recent_sessions.lock() {
                     buf.reset();
