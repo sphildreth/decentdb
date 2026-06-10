@@ -118,14 +118,14 @@ impl SessionTracker {
 #[derive(Debug)]
 pub(crate) struct RecentSessionBuffer {
     capacity: usize,
-    sessions: Vec<SessionSnapshot>,
+    sessions: std::collections::VecDeque<SessionSnapshot>,
 }
 
 impl RecentSessionBuffer {
     pub(crate) fn with_capacity(capacity: usize) -> Self {
         Self {
             capacity,
-            sessions: Vec::with_capacity(capacity.min(16)),
+            sessions: std::collections::VecDeque::with_capacity(capacity.min(16)),
         }
     }
 
@@ -134,13 +134,13 @@ impl RecentSessionBuffer {
             return;
         }
         if self.sessions.len() >= self.capacity {
-            self.sessions.remove(0);
+            self.sessions.pop_front();
         }
-        self.sessions.push(session);
+        self.sessions.push_back(session);
     }
 
     pub(crate) fn snapshot(&self) -> Vec<SessionSnapshot> {
-        self.sessions.clone()
+        self.sessions.iter().cloned().collect()
     }
 
     pub(crate) fn reset(&mut self) {

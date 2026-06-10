@@ -151,8 +151,9 @@ impl SlowQueryStore {
             return;
         }
         let mode = self.config.slow_query.sql_text_mode;
-        let sql_template = redact_sql(sql, mode);
-        let sql_template_clone = sql_template.clone();
+        let max_chars = self.config.slow_query.max_sql_bytes_per_event;
+        let sql_template = redact_sql(sql, mode, max_chars);
+        let truncated = sql.chars().count() > max_chars;
         let fingerprint = sql_fingerprint(sql);
         let event = SlowQueryEventInternal {
             event_id: next_event_id(),
@@ -164,13 +165,13 @@ impl SlowQueryStore {
             statement_kind: statement_kind.to_string(),
             read_only,
             sql_fingerprint: fingerprint,
-            sql_template: sql_template_clone,
+            sql_template,
             sql_text_mode: mode,
             database_id_hash: database_id_hash.to_string(),
             status: status.to_string(),
             error_code: error_code.map(|s| s.to_string()),
             internal,
-            truncated: sql_template.len() >= self.config.slow_query.max_sql_bytes_per_event,
+            truncated,
         };
         self.buffer.push_back(event);
     }

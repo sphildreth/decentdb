@@ -3,19 +3,18 @@
 /// Phase 1 supports `None` and `Full`. `Template` and `Redacted` require a
 /// parser-backed redactor and will be added once the redaction path is
 /// benchmarked and tested.
-pub(crate) fn redact_sql(sql: &str, mode: crate::tracing::config::SqlTextMode) -> String {
+pub(crate) fn redact_sql(
+    sql: &str,
+    mode: crate::tracing::config::SqlTextMode,
+    max_chars: usize,
+) -> String {
     use crate::tracing::config::SqlTextMode;
     match mode {
         SqlTextMode::None => String::new(),
         SqlTextMode::Full => {
-            // Still truncate at a hard limit to prevent unbounded payloads.
-            const MAX_BYTES: usize = 8192;
-            if sql.len() > MAX_BYTES {
-                let trunc = &sql[..sql
-                    .char_indices()
-                    .nth(MAX_BYTES)
-                    .map(|(i, _)| i)
-                    .unwrap_or(sql.len())];
+            let limit = max_chars.max(1);
+            if sql.chars().count() > limit {
+                let trunc: String = sql.chars().take(limit).collect();
                 format!("{}…", trunc)
             } else {
                 sql.to_string()

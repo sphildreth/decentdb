@@ -211,7 +211,7 @@ impl RuntimeTraceState {
         index_kind: &str,
         kind: crate::tracing::index_usage::IndexUsageKind,
     ) {
-        if let Ok(store) = self.index_usage_store.lock() {
+        if let Ok(mut store) = self.index_usage_store.lock() {
             store.record(table_name, index_name, index_kind, kind);
         }
     }
@@ -273,6 +273,11 @@ impl RuntimeTraceSink for RuntimeTraceState {
         }
         match family {
             crate::tracing::events::RuntimeTraceFamily::Statement => self.config.slow_query.enabled,
+            crate::tracing::events::RuntimeTraceFamily::LockWait => self.config.lock_wait.enabled,
+            crate::tracing::events::RuntimeTraceFamily::IndexUsage => {
+                self.config.index_usage.enabled
+            }
+            crate::tracing::events::RuntimeTraceFamily::Session => self.config.sessions.enabled,
             _ => false,
         }
     }

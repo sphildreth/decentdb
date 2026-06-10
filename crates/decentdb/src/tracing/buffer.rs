@@ -128,12 +128,6 @@ impl<T> BoundedRingBuffer<T> {
         }
     }
 
-    /// Overwrite the oldest element.
-    fn evict_oldest(&mut self) {
-        self.eviction_count = self.eviction_count.wrapping_add(1);
-        self.tail = (self.tail + 1) % self.entries.len();
-    }
-
     /// Drains elements while `predicate` returns `true` and returns their count.
     pub(crate) fn drain_if(&mut self, mut predicate: impl FnMut(&T) -> bool) -> usize {
         let mut removed = 0;

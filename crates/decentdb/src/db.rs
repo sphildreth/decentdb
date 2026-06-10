@@ -11209,7 +11209,7 @@ impl Db {
             for issue in report.issues {
                 findings.push(vec![
                     Value::Text(format!("sync-{}", issue.line_number)),
-                    Value::Text(format!("{:?}", issue.severity)),
+                    Value::Text(issue.code.clone()),
                     Value::Text(format!("{:?}", issue.severity)),
                     Value::Text(issue.message.clone()),
                     Value::Text(issue.message),
@@ -11253,6 +11253,8 @@ impl Db {
     }
 
     fn fix_plan_query_result(&self) -> Result<QueryResult> {
+        // Note: This duplicates the advisor analysis from doctor_findings_query_result.
+        // Future optimization: cache advisor findings with a TTL to avoid redundant analysis.
         let columns = vec![
             "advisor_id".to_string(),
             "action".to_string(),

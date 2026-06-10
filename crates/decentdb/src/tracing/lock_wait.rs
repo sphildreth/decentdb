@@ -43,7 +43,7 @@ pub(crate) struct LockWaitStore {
 
 impl LockWaitStore {
     pub(crate) fn new(config: &RuntimeTracingConfig) -> Self {
-        let capacity = config.lock_wait.max_events.clamp(1, 65_536);
+        let capacity = config.lock_wait.max_events.clamp(1, 16_384);
         Self {
             config: config.clone(),
             buffer: BoundedRingBuffer::with_capacity(capacity),
@@ -67,6 +67,8 @@ impl LockWaitStore {
         }
         let threshold = self.config.lock_wait.threshold_us;
         let duration_us = duration.as_micros() as u64;
+        // threshold_us == 0 means "record every lock acquisition" (no filtering).
+        // This intentionally differs from slow_query where 0 means "disabled".
         if threshold > 0 && duration_us < threshold {
             return;
         }

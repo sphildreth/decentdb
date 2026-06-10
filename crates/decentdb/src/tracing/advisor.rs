@@ -300,6 +300,8 @@ pub fn advisor_findings_to_doctor_findings(
             AdvisorSeverity::Warning => DoctorSeverity::Warning,
             AdvisorSeverity::Error => DoctorSeverity::Error,
         };
+        // DoctorCategory lacks Query and Contention variants, so advisor
+        // categories are mapped to the closest existing doctor category.
         let category = match f.category {
             AdvisorCategory::Query => DoctorCategory::Wal,
             AdvisorCategory::Index => DoctorCategory::Indexes,
