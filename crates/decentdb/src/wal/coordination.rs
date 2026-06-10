@@ -872,7 +872,12 @@ impl ProcessCoordinator {
         }
     }
 
-    fn maybe_notify_lock_wait_callback(&self, checkpoint: bool, elapsed: std::time::Duration, status: &str) {
+    fn maybe_notify_lock_wait_callback(
+        &self,
+        checkpoint: bool,
+        elapsed: std::time::Duration,
+        status: &str,
+    ) {
         if let Ok(callback) = self.inner.lock_wait_callback.lock() {
             if let Some(ref cb) = *callback {
                 cb(checkpoint, elapsed, status);

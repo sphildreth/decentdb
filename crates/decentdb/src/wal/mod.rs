@@ -343,11 +343,7 @@ impl WalHandle {
     #[allow(clippy::type_complexity)]
     pub(crate) fn set_process_lock_wait_callback(
         &self,
-        callback: Option<
-            std::sync::Arc<
-                dyn Fn(bool, std::time::Duration, &str) + Send + Sync,
-            >,
-        >,
+        callback: Option<std::sync::Arc<dyn Fn(bool, std::time::Duration, &str) + Send + Sync>>,
     ) {
         if let Some(ref coordinator) = self.inner.process_coordinator {
             coordinator.set_lock_wait_callback(callback);

@@ -83,8 +83,7 @@ impl LockWaitStore {
         });
     }
 
-    pub(crate) fn snapshot(&self,
-    ) -> BoundedSnapshot<LockWaitEvent> {
+    pub(crate) fn snapshot(&self) -> BoundedSnapshot<LockWaitEvent> {
         self.buffer.snapshot(|e| e.clone())
     }
 

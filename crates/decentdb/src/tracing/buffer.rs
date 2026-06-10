@@ -81,8 +81,10 @@ impl<T> BoundedRingBuffer<T> {
             self.entries.push(item);
             self.head = self.entries.len();
         } else {
-            self.entries[self.head] = item;
-            self.head = (self.head + 1) % self.entries.capacity();
+            let cap = self.entries.capacity();
+            let idx = self.head % cap;
+            self.entries[idx] = item;
+            self.head = (self.head + 1) % cap;
             self.tail = self.head;
             self.eviction_count = self.eviction_count.wrapping_add(1);
         }

@@ -4,10 +4,10 @@
 //! waits, index usage, and session lifecycle. Disabled by default; disabled
 //! paths must not allocate, normalize SQL, or acquire extra locks.
 
+pub(crate) mod advisor;
 mod buffer;
 pub(crate) mod config;
 pub(crate) mod events;
-pub(crate) mod advisor;
 pub(crate) mod index_usage;
 pub(crate) mod lock_wait;
 pub(crate) mod redact;

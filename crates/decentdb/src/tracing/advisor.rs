@@ -40,10 +40,20 @@ impl AdvisorFinding {
             Value::Text(self.description.clone()),
             Value::Text(self.evidence.join("; ")),
             Value::Text(self.recommendation.clone()),
-            Value::Text(self.fix_plan.as_ref().map_or("".to_string(), |p| p.action.clone())),
-            Value::Text(self.fix_plan.as_ref().map_or("".to_string(), |p| p.target.clone())),
             Value::Text(
-                self.fix_plan.as_ref().map_or("none".to_string(), |p| p.auto_safe.clone()),
+                self.fix_plan
+                    .as_ref()
+                    .map_or("".to_string(), |p| p.action.clone()),
+            ),
+            Value::Text(
+                self.fix_plan
+                    .as_ref()
+                    .map_or("".to_string(), |p| p.target.clone()),
+            ),
+            Value::Text(
+                self.fix_plan
+                    .as_ref()
+                    .map_or("none".to_string(), |p| p.auto_safe.clone()),
             ),
             Value::Bool(self.fix_plan.is_some()),
         ]
@@ -121,10 +131,7 @@ impl AdvisorEngine {
         self.storage_advisor(wal_size_mb, uncheckpointed_frames);
     }
 
-    fn slow_query_advisor(
-        &mut self,
-        slow_queries: &BoundedSnapshot<SlowQueryEvent>,
-    ) {
+    fn slow_query_advisor(&mut self, slow_queries: &BoundedSnapshot<SlowQueryEvent>) {
         if slow_queries.items.is_empty() {
             return;
         }
@@ -152,24 +159,20 @@ impl AdvisorEngine {
                         event.sql_fingerprint, count
                     ),
                     evidence: vec![format!("duration_us={}", event.duration_us)],
-                    recommendation:
-                        "Review query plan; consider adding or rebuilding indexes.".to_string(),
+                    recommendation: "Review query plan; consider adding or rebuilding indexes."
+                        .to_string(),
                     fix_plan: None,
                 });
             }
         }
     }
 
-    fn lock_wait_advisor(
-        &mut self,
-        lock_waits: &BoundedSnapshot<LockWaitEvent>,
-    ) {
+    fn lock_wait_advisor(&mut self, lock_waits: &BoundedSnapshot<LockWaitEvent>) {
         if lock_waits.items.is_empty() {
             return;
         }
         // Find the dominant lock-wait source.
-        let mut counts: std::collections::HashMap<String, u64> =
-            std::collections::HashMap::new();
+        let mut counts: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
         let mut max_wait: Option<(&LockWaitEvent, u64)> = None;
         for e in &lock_waits.items {
             let key = e.wait_source.clone();
@@ -192,18 +195,15 @@ impl AdvisorEngine {
                         event.wait_source, count
                     ),
                     evidence: vec![format!("max_duration_us={}", event.duration_us)],
-                    recommendation:
-                        "Consider reducing transaction scope or batching writes.".to_string(),
+                    recommendation: "Consider reducing transaction scope or batching writes."
+                        .to_string(),
                     fix_plan: None,
                 });
             }
         }
     }
 
-    fn index_usage_advisor(
-        &mut self,
-        index_usage: &[IndexUsageRow],
-    ) {
+    fn index_usage_advisor(&mut self, index_usage: &[IndexUsageRow]) {
         if index_usage.is_empty() {
             return;
         }
@@ -219,7 +219,10 @@ impl AdvisorEngine {
                         "Index {} on {} has {} reads and {} writes.",
                         row.index_name, row.table_name, row.read_count, row.write_count
                     ),
-                    evidence: vec![format!("reads={} writes={}", row.read_count, row.write_count)],
+                    evidence: vec![format!(
+                        "reads={} writes={}",
+                        row.read_count, row.write_count
+                    )],
                     recommendation:
                         "Review write amplification; consider partial indexes if applicable."
                             .to_string(),
@@ -245,11 +248,7 @@ impl AdvisorEngine {
         }
     }
 
-    fn storage_advisor(
-        &mut self,
-        wal_size_mb: u64,
-        uncheckpointed_frames: u64,
-    ) {
+    fn storage_advisor(&mut self, wal_size_mb: u64, uncheckpointed_frames: u64) {
         if wal_size_mb > 100 {
             self.findings.push(AdvisorFinding {
                 advisor_id: "storage-large-wal".to_string(),
@@ -278,10 +277,7 @@ impl AdvisorEngine {
                     "{} frames have not been checkpointed.",
                     uncheckpointed_frames
                 ),
-                evidence: vec![format!(
-                    "uncheckpointed_frames={}",
-                    uncheckpointed_frames
-                )],
+                evidence: vec![format!("uncheckpointed_frames={}", uncheckpointed_frames)],
                 recommendation: "Run CHECKPOINT to reclaim space.".to_string(),
                 fix_plan: Some(AdvisorFixPlan {
                     action: "checkpoint".to_string(),

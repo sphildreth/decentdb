@@ -2000,9 +2000,7 @@ impl Db {
     /// Reset a specific runtime trace store by name.
     ///
     /// `kind` may be "slow_queries", "lock_waits", or "index_usage".
-    pub fn tracing_reset(&self,
-        kind: &str,
-    ) -> Result<()> {
+    pub fn tracing_reset(&self, kind: &str) -> Result<()> {
         match kind {
             "slow_queries" => self
                 .inner
@@ -2025,7 +2023,11 @@ impl Db {
                 .lock()
                 .map_err(|_| DbError::internal("index usage store poisoned"))?
                 .reset(),
-            _ => return Err(DbError::sql(format!("unknown tracing kind for reset: {kind}"))),
+            _ => {
+                return Err(DbError::sql(format!(
+                    "unknown tracing kind for reset: {kind}"
+                )))
+            }
         }
         Ok(())
     }
@@ -2174,15 +2176,12 @@ impl Db {
         );
     }
 
-    fn record_lock_wait(
-        &self,
-        start: Option<std::time::Instant>,
-        source: &str,
-        status: &str,
-    ) {
+    fn record_lock_wait(&self, start: Option<std::time::Instant>, source: &str, status: &str) {
         if let Some(t0) = start {
             let dur = t0.elapsed();
-            self.inner.tracing.record_lock_wait(dur, source, status, false);
+            self.inner
+                .tracing
+                .record_lock_wait(dur, source, status, false);
         }
     }
 
@@ -11223,14 +11222,21 @@ impl Db {
         let slow_queries = self.inner.tracing.slow_queries_snapshot();
         let lock_waits = self.inner.tracing.lock_waits_snapshot();
         let index_usage = self.inner.tracing.index_usage_snapshot();
-        let wal_size_mb = self.inner.wal.latest_snapshot().saturating_sub(
-            crate::wal::format::WAL_HEADER_SIZE,
-        ) / (1024 * 1024);
-        let uncheckpointed_frames = self.inner.wal.latest_snapshot().saturating_sub(
-            self.inner.wal.checkpoint_epoch(),
-        ) / self.inner.config.page_size as u64;
+        let wal_size_mb = self
+            .inner
+            .wal
+            .latest_snapshot()
+            .saturating_sub(crate::wal::format::WAL_HEADER_SIZE)
+            / (1024 * 1024);
+        let uncheckpointed_frames = self
+            .inner
+            .wal
+            .latest_snapshot()
+            .saturating_sub(self.inner.wal.checkpoint_epoch())
+            / self.inner.config.page_size as u64;
         let mut engine = crate::tracing::advisor::AdvisorEngine::new();
-        engine.analyze(&slow_queries,
+        engine.analyze(
+            &slow_queries,
             &lock_waits,
             &index_usage,
             wal_size_mb,
@@ -11256,14 +11262,21 @@ impl Db {
         let slow_queries = self.inner.tracing.slow_queries_snapshot();
         let lock_waits = self.inner.tracing.lock_waits_snapshot();
         let index_usage = self.inner.tracing.index_usage_snapshot();
-        let wal_size_mb = self.inner.wal.latest_snapshot().saturating_sub(
-            crate::wal::format::WAL_HEADER_SIZE,
-        ) / (1024 * 1024);
-        let uncheckpointed_frames = self.inner.wal.latest_snapshot().saturating_sub(
-            self.inner.wal.checkpoint_epoch(),
-        ) / self.inner.config.page_size as u64;
+        let wal_size_mb = self
+            .inner
+            .wal
+            .latest_snapshot()
+            .saturating_sub(crate::wal::format::WAL_HEADER_SIZE)
+            / (1024 * 1024);
+        let uncheckpointed_frames = self
+            .inner
+            .wal
+            .latest_snapshot()
+            .saturating_sub(self.inner.wal.checkpoint_epoch())
+            / self.inner.config.page_size as u64;
         let mut engine = crate::tracing::advisor::AdvisorEngine::new();
-        engine.analyze(&slow_queries,
+        engine.analyze(
+            &slow_queries,
             &lock_waits,
             &index_usage,
             wal_size_mb,

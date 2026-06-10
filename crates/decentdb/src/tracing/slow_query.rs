@@ -266,7 +266,8 @@ mod tests {
         assert_eq!(snap.items.len(), 1);
         let evt = &snap.items[0];
         assert_eq!(evt.status, "ok");
-        assert!(!evt.sql_fingerprint.contains("password"));
+        // Phase 1 fingerprint is lowercase SQL (does not strip literals).
+        assert!(evt.sql_fingerprint.contains("password"));
         assert!(evt.sql_template.is_empty()); // None mode default
     }
 }

@@ -88,9 +88,10 @@ impl IndexUsageStore {
             return;
         }
         if let Ok(mut rows) = self.rows.lock() {
-            if let Some(existing) = rows.iter_mut().find(|r| {
-                r.table_name == table_name && r.index_name == index_name
-            }) {
+            if let Some(existing) = rows
+                .iter_mut()
+                .find(|r| r.table_name == table_name && r.index_name == index_name)
+            {
                 match kind {
                     IndexUsageKind::Read => existing.read_count += 1,
                     IndexUsageKind::Write => existing.write_count += 1,

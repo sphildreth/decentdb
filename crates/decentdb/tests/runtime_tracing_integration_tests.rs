@@ -91,7 +91,8 @@ fn test_lock_waits_view_disabled_by_default() {
 #[test]
 fn test_lock_wait_tracing_sql_write_lock() {
     let db = setup_db_with_lock_wait_tracing();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        .unwrap();
     db.execute("INSERT INTO t (id) VALUES (1)").unwrap();
 
     let result = db.execute("SELECT * FROM sys.lock_waits").unwrap();

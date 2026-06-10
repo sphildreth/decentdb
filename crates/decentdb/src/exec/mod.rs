@@ -1806,10 +1806,7 @@ impl EngineRuntime {
         self.sync_capture_active
     }
 
-    pub(crate) fn set_tracing(
-        &mut self,
-        tracing: Arc<crate::tracing::RuntimeTraceState>,
-    ) {
+    pub(crate) fn set_tracing(&mut self, tracing: Arc<crate::tracing::RuntimeTraceState>) {
         self.tracing = Some(tracing);
     }
 
@@ -1821,12 +1818,7 @@ impl EngineRuntime {
         }
         if let Some(tracing) = self.tracing.as_ref() {
             for (table_name, index_name, index_kind, kind) in events {
-                tracing.record_index_usage(
-                    &table_name,
-                    &index_name,
-                    &index_kind,
-                    kind,
-                );
+                tracing.record_index_usage(&table_name, &index_name, &index_kind, kind);
             }
         }
     }

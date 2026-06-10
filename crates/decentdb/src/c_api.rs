@@ -3875,10 +3875,8 @@ pub extern "C" fn ddb_runtime_tracing_snapshot(
                     .map(|v| match v {
                         Value::Null => serde_json::Value::Null,
                         Value::Int64(i) => serde_json::Value::Number((*i).into()),
-                        Value::Float64(f) => {
-                            serde_json::Number::from_f64(*f)
-                                .map_or(serde_json::Value::Null, serde_json::Value::Number)
-                        }
+                        Value::Float64(f) => serde_json::Number::from_f64(*f)
+                            .map_or(serde_json::Value::Null, serde_json::Value::Number),
                         Value::Bool(b) => serde_json::Value::Bool(*b),
                         Value::Text(s) => serde_json::Value::String(s.clone()),
                         Value::Blob(b) => {
@@ -3897,8 +3895,9 @@ pub extern "C" fn ddb_runtime_tracing_snapshot(
             "rows": rows,
         }))
         .map_err(|e| DbError::internal(format!("JSON serialization failed: {e}")))?;
-        *out_ptr(out_json, "out_json")? =
-            CString::new(json).map_err(|e| DbError::internal(format!("CString failed: {e}")))?.into_raw();
+        *out_ptr(out_json, "out_json")? = CString::new(json)
+            .map_err(|e| DbError::internal(format!("CString failed: {e}")))?
+            .into_raw();
         Ok(())
     })
 }
@@ -3907,10 +3906,7 @@ pub extern "C" fn ddb_runtime_tracing_snapshot(
 ///
 /// `kind` may be "slow_queries", "lock_waits", or "index_usage".
 #[no_mangle]
-pub extern "C" fn ddb_runtime_tracing_reset(
-    db: *mut DbHandle,
-    kind: *const c_char,
-) -> u32 {
+pub extern "C" fn ddb_runtime_tracing_reset(db: *mut DbHandle, kind: *const c_char) -> u32 {
     ffi_boundary(|| {
         let db = handle_ref(db, "db")?;
         let kind = utf8_arg(kind, "kind")?;

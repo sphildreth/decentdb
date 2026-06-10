@@ -170,13 +170,7 @@ impl RuntimeTraceState {
 
     /// Record a lock-wait event if thresholds permit.
     #[inline]
-    pub fn record_lock_wait(
-        &self,
-        duration: Duration,
-        source: &str,
-        status: &str,
-        internal: bool,
-    ) {
+    pub fn record_lock_wait(&self, duration: Duration, source: &str, status: &str, internal: bool) {
         if let Ok(mut store) = self.lock_wait_store.lock() {
             store.maybe_record(
                 duration,
@@ -223,8 +217,7 @@ impl RuntimeTraceState {
     }
 
     /// Snapshot index usage rows.
-    pub fn index_usage_snapshot(&self,
-    ) -> Vec<crate::tracing::index_usage::IndexUsageRow> {
+    pub fn index_usage_snapshot(&self) -> Vec<crate::tracing::index_usage::IndexUsageRow> {
         self.index_usage_store
             .lock()
             .map(|store| store.snapshot())

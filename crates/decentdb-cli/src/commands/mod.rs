@@ -6034,11 +6034,7 @@ fn _table_summary(table: &TableInfo) -> Vec<String> {
 // ----------------------------------------------------------------------
 
 fn run_tracing(command: TracingCommand) -> Result<()> {
-    let db = open_db(&command.db,
-        false,
-        0,
-        0,
-    )?;
+    let db = open_db(&command.db, false, 0, 0)?;
     let sql = match command.view {
         TracingView::Sessions => "SELECT * FROM sys.sessions",
         TracingView::SlowQueries => "SELECT * FROM sys.slow_queries",
