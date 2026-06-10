@@ -49,6 +49,31 @@ public sealed class IndexedStringEqualityRegressionTests : IDisposable
         Assert.Equal(targetNormalizedName, byRawId.NameNormalized);
     }
 
+    [Fact]
+    public void OrderedTake_OnLargeIndexedRawId_ReturnsExpectedRow()
+    {
+        SeedData();
+
+        using var context = CreateContext();
+        var targetRawId = BuildRawId(TargetId);
+        var query = context.Artists
+            .AsNoTracking()
+            .Where(x => x.RawId == targetRawId)
+            .OrderBy(x => x.Id)
+            .Take(1);
+
+        var sql = query.ToQueryString();
+        AssertExactEqualityPredicate(sql, "raw_id", "targetRawId");
+        Assert.Contains("ORDER BY", sql, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("LIMIT", sql, StringComparison.OrdinalIgnoreCase);
+
+        var rows = query.ToArray();
+
+        Assert.Single(rows);
+        Assert.Equal(TargetId, rows[0].Id);
+        Assert.Equal(targetRawId, rows[0].RawId);
+    }
+
     private IndexedStringDbContext CreateContext()
     {
         var optionsBuilder = new DbContextOptionsBuilder<IndexedStringDbContext>();

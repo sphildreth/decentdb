@@ -370,6 +370,9 @@ pub struct DbConfig {
     /// This is intentionally off by default. Production callers should prefer
     /// exact `extension_trust_anchors`.
     pub extension_unsigned_development_mode: bool,
+
+    /// Optional runtime tracing configuration. Disabled by default.
+    pub tracing: crate::tracing::RuntimeTracingConfig,
 }
 
 impl DbConfig {
@@ -469,6 +472,7 @@ impl Default for DbConfig {
             reactive_max_row_changes_per_event: 4096,
             extension_trust_anchors: Vec::new(),
             extension_unsigned_development_mode: false,
+            tracing: crate::tracing::RuntimeTracingConfig::default(),
         }
     }
 }

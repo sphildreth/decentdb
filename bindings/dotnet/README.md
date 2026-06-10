@@ -73,7 +73,8 @@ The `DecentDBConnection.DeleteDatabaseFiles(path)` helper deletes the database f
 
 The `DecentDBMaintenance` helper exposes binding-native maintenance operations:
 `GetWalStatus(path)`, `CheckpointAsync(path)`, `CompactAsync(source, target)`,
-and `VacuumAsync(path, createBackup: true)`. These helpers use the .NET binding
+`RebuildIndexAsync(path, indexName)`, `RebuildIndexesAsync(path)`, and
+`VacuumAsync(path, createBackup: true)`. These helpers use the .NET binding
 directly. The older `VacuumAtomicAsync(path, cliPath, ...)` remains available
 for legacy executable-backed vacuum workflows.
 

@@ -47,7 +47,6 @@ pub(crate) struct ProcessCoordinator {
     inner: Arc<ProcessCoordinatorInner>,
 }
 
-#[derive(Debug)]
 struct ProcessCoordinatorInner {
     file: Arc<dyn VfsFile>,
     coord_path: PathBuf,
@@ -60,6 +59,26 @@ struct ProcessCoordinatorInner {
     page_size: u32,
     fingerprint: [u8; 32],
     metrics: ProcessCoordinationMetrics,
+    #[allow(clippy::type_complexity)]
+    lock_wait_callback: Mutex<Option<Arc<dyn Fn(bool, Duration, &str) + Send + Sync>>>,
+}
+
+impl std::fmt::Debug for ProcessCoordinatorInner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProcessCoordinatorInner")
+            .field("coord_path", &self.coord_path)
+            .field("mode", &self.mode)
+            .field("timeout", &self.timeout)
+            .field("process_id", &self.process_id)
+            .field("process_token", &self.process_token)
+            .field("database_id", &self.database_id)
+            .field("db_format_version", &self.db_format_version)
+            .field("page_size", &self.page_size)
+            .field("fingerprint", &self.fingerprint)
+            .field("metrics", &self.metrics)
+            .field("lock_wait_callback", &"...")
+            .finish()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -234,6 +253,7 @@ impl ProcessCoordinator {
                     header.page_size,
                 ),
                 metrics: ProcessCoordinationMetrics::default(),
+                lock_wait_callback: Mutex::new(None),
             }),
         };
         coordinator.initialize_or_rebuild()?;
@@ -359,6 +379,17 @@ impl ProcessCoordinator {
 
     pub(crate) fn lock_checkpoint(&self) -> Result<ProcessWriterGuard> {
         self.lock_writer_inner(true)
+    }
+
+    #[allow(dead_code)]
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn set_lock_wait_callback(
+        &self,
+        callback: Option<Arc<dyn Fn(bool, Duration, &str) + Send + Sync>>,
+    ) {
+        if let Ok(mut guard) = self.inner.lock_wait_callback.lock() {
+            *guard = callback;
+        }
     }
 
     pub(crate) fn begin_reader(
@@ -580,6 +611,7 @@ impl ProcessCoordinator {
             });
         }
 
+        let start = std::time::Instant::now();
         let guard = match lock_range_with_timeout(
             self.inner.file.as_ref(),
             WRITER_LOCK_OFFSET,
@@ -589,16 +621,22 @@ impl ProcessCoordinator {
         ) {
             Ok(guard) => guard,
             Err(DbError::Busy { .. }) => {
+                let elapsed = start.elapsed();
                 self.record_lock_timeout(checkpoint);
+                self.maybe_notify_lock_wait_callback(checkpoint, elapsed, "busy");
                 return Err(DbError::busy("process writer lock is busy"));
             }
             Err(DbError::Timeout { .. }) => {
+                let elapsed = start.elapsed();
                 self.record_lock_timeout(checkpoint);
+                self.maybe_notify_lock_wait_callback(checkpoint, elapsed, "timeout");
                 return Err(DbError::timeout("process writer lock wait timed out"));
             }
             Err(error) => return Err(error),
         };
+        let elapsed = start.elapsed();
         self.record_lock_wait(checkpoint);
+        self.maybe_notify_lock_wait_callback(checkpoint, elapsed, "ok");
         HELD_WRITER_LOCKS.with(|held| {
             held.borrow_mut().insert(key.clone(), 1);
         });
@@ -831,6 +869,19 @@ impl ProcessCoordinator {
                 .metrics
                 .writer_lock_timeouts
                 .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn maybe_notify_lock_wait_callback(
+        &self,
+        checkpoint: bool,
+        elapsed: std::time::Duration,
+        status: &str,
+    ) {
+        if let Ok(callback) = self.inner.lock_wait_callback.lock() {
+            if let Some(ref cb) = *callback {
+                cb(checkpoint, elapsed, status);
+            }
         }
     }
 

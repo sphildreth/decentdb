@@ -96,6 +96,8 @@ pub enum Commands {
     VerifyHeader(VerifyHeaderCommand),
     /// Verify index integrity
     VerifyIndex(VerifyIndexCommand),
+    /// Runtime tracing views and diagnostics
+    Tracing(TracingCommand),
     /// Run `decentdb doctor` to diagnose database health
     Doctor(DoctorCommand),
     /// Migrate a legacy database format to the current version
@@ -1254,6 +1256,30 @@ fn parse_path_mode(raw: &str) -> Result<DoctorPathMode, String> {
 }
 
 #[derive(Clone, Debug, Parser)]
+pub struct TracingCommand {
+    #[arg(long)]
+    pub db: String,
+    /// Trace view to query.
+    #[arg(long, value_enum)]
+    pub view: TracingView,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
+    pub format: OutputFormat,
+    /// Reset the selected trace store after querying.
+    #[arg(long, default_value_t = false)]
+    pub reset: bool,
+}
+
+#[derive(Clone, Debug, ValueEnum)]
+pub enum TracingView {
+    Sessions,
+    SlowQueries,
+    LockWaits,
+    IndexUsage,
+    DoctorFindings,
+    FixPlan,
+}
+
+#[derive(Clone, Debug, Parser)]
 pub struct DoctorCommand {
     #[arg(long)]
     pub db: String,
@@ -1395,6 +1421,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         Commands::Extension(command) => run_extension(command)?,
         Commands::Serve(command) => run_serve(command)?,
         Commands::Doctor(_) => unreachable!("Doctor is handled in run()"),
+        Commands::Tracing(command) => run_tracing(command)?,
     }
     Ok(())
 }
@@ -6000,6 +6027,39 @@ fn _table_summary(table: &TableInfo) -> Vec<String> {
             .collect::<Vec<_>>()
             .join(", "),
     ]
+}
+
+// ----------------------------------------------------------------------
+// Tracing command
+// ----------------------------------------------------------------------
+
+fn run_tracing(command: TracingCommand) -> Result<()> {
+    let db = open_db(&command.db, false, 0, 0)?;
+    let sql = match command.view {
+        TracingView::Sessions => "SELECT * FROM sys.sessions",
+        TracingView::SlowQueries => "SELECT * FROM sys.slow_queries",
+        TracingView::LockWaits => "SELECT * FROM sys.lock_waits",
+        TracingView::IndexUsage => "SELECT * FROM sys.index_usage",
+        TracingView::DoctorFindings => "SELECT * FROM sys.doctor_findings",
+        TracingView::FixPlan => "SELECT * FROM sys.fix_plan",
+    };
+    let result = db.execute(sql)?;
+    let columns = result.columns();
+    let rows = rows_from_query_result(&result);
+    match command.format {
+        OutputFormat::Json => println!("{}", render_exec_success_json(&[result], 0.0, false)),
+        _ => println!("{}", render_rows(command.format, columns, &rows, true)),
+    }
+    if command.reset {
+        let kind = match command.view {
+            TracingView::SlowQueries => "slow_queries",
+            TracingView::LockWaits => "lock_waits",
+            TracingView::IndexUsage => "index_usage",
+            _ => return Ok(()),
+        };
+        db.tracing_reset(kind)?;
+    }
+    Ok(())
 }
 
 // ----------------------------------------------------------------------

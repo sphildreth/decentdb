@@ -4295,7 +4295,10 @@ fn apply_runtime_index_update_for_row_change(
     old_row_values: &[Value],
     new_row_values: &[Value],
 ) -> Result<bool> {
-    match index.kind {
+    let kind = index.kind;
+    let _table_name = table.name.clone();
+    let _index_name = index.name.clone();
+    match kind {
         IndexKind::Btree => {
             let old_key = compute_index_key(runtime, index, table, old_row_values)?;
             let new_key = compute_index_key(runtime, index, table, new_row_values)?;

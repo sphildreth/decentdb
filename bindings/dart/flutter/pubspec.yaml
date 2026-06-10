@@ -1,6 +1,6 @@
 name: decentdb_flutter
 description: Flutter mobile integration helpers for the DecentDB Dart FFI package.
-version: 2.9.0
+version: 2.10.0
 publish_to: none
 repository: https://github.com/sphildreth/decentdb
 homepage: https://github.com/sphildreth/decentdb/tree/main/bindings/dart/flutter

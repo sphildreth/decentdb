@@ -523,6 +523,30 @@ ddb_status_t ddb_result_value_copy(
     size_t column_index,
     ddb_value_t *out_value);
 
+/**
+ * Runtime tracing snapshot.
+ *
+ * `kind` selects the trace view:
+ *   "slow_queries", "lock_waits", "sessions",
+ *   "index_usage", "doctor_findings", "fix_plan"
+ *
+ * On success, `out_json` receives an owned JSON string.
+ * The caller must free it with `ddb_string_free`.
+ */
+ddb_status_t ddb_runtime_tracing_snapshot(
+    ddb_db_t *db,
+    const char *kind,
+    char **out_json);
+
+/**
+ * Reset a specific runtime trace ring buffer.
+ *
+ * `kind` may be "slow_queries", "lock_waits", or "index_usage".
+ */
+ddb_status_t ddb_runtime_tracing_reset(
+    ddb_db_t *db,
+    const char *kind);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+
+## [2.10.0] - [2026-06-10]
+
+### Fixed
+
+- Kept simple indexed equality projections on the native fast path when they
+  include provider-generated `ORDER BY`, `LIMIT`, or `OFFSET` clauses. This
+  covers EF Core shapes such as `Where(...).OrderBy(...).Take(...)` for
+  indexed string lookups.
+
+### Added
+
+- Added .NET ADO.NET `DecentDBMaintenance.RebuildIndexAsync(...)` and
+  `RebuildIndexesAsync(...)` helpers so applications can rebuild runtime index
+  structures through the binding without invoking the CLI.
+- Added native and .NET regression coverage for Melodee-style ordered indexed
+  string equality lookups.
+- Runtime tracing subsystem (`RuntimeTraceState`, `RuntimeTracingConfig`) with
+  open-time configuration via `DbConfig::tracing`. Disabled by default; the
+  disabled path adds no allocation, no SQL normalization, and no extra locks.
+- Slow query tracing: per-statement fingerprinting, redaction, bounded ring
+  buffer (`sys.slow_queries`), and `SqlTextMode::None` (default) vs `Full`.
+- Lock-wait tracing: records `sql_write_lock` waits and process-coordination
+  lock waits (`sys.lock_waits`).
+- Index-usage aggregates: read/write counters per index (`sys.index_usage`).
+- Advisor engine (`AdvisorEngine`) with four advisor categories:
+  `Query`, `Index`, `Contention`, `Storage`. Produces findings with severity,
+  confidence, evidence, and optional safe fix plans.
+- Doctor integration: `sys.doctor_findings` merges static `sync_operational_doctor_report`
+  findings with runtime advisor findings; `sys.fix_plan` exposes safe-to-apply plans.
+- C ABI: `ddb_runtime_tracing_snapshot` and `ddb_runtime_tracing_reset` for all
+  trace views.
+- CLI: new `decentdb tracing --view <view>` command supporting JSON/Table/Markdown
+  output and `--reset` option.
+- Integration tests covering disabled-by-default, slow query capture, redaction,
+  full-mode SQL text, sessions view, lock-wait capture, and empty-buffer reset.
+
+
 ## [2.9.0] - [2026-06-09]
 
 ### Fixed

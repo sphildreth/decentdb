@@ -8,6 +8,10 @@ This directory contains the historical and active ADRs for DecentDB.
 > the current Rust engine.
 
 ### Recent Rust-Specific ADRs:
+- **0189-runtime-tracing-api-and-binding-contract.md**: Defines SQL-first runtime diagnostics access, Rust-owned typed tracing configuration, conservative C ABI expansion rules, binding responsibilities, and follow-up ADR triggers for broad telemetry APIs.
+- **0188-runtime-advisors-and-fix-plan-policy.md**: Defines runtime advisor finding identity, severity/confidence/evidence requirements, conservative missing/unused index guidance, Doctor `--fix-plan`, and the no-automatic-schema-mutation boundary.
+- **0187-runtime-sys-views-and-doctor-projection.md**: Defines `sys.sessions`, `sys.slow_queries`, `sys.lock_waits`, `sys.index_usage`, and `sys.doctor_findings` as read-only virtual inspection views with explicit Doctor refresh semantics.
+- **0186-runtime-tracing-contract-and-redaction.md**: Defines opt-in bounded in-memory runtime tracing, disabled-overhead targets, redaction defaults, event-family scope, trace buffer behavior, and persistent/export telemetry ADR triggers.
 - **0185-rich-structured-error-diagnostics-contract.md**: Defines the versioned structured diagnostic object, stable subcode contract, C ABI JSON accessor direction, binding projection requirements, redaction rules, retry/permanence classification, and Doctor handoff policy.
 - **0184-default-fast-planner-and-runtime-contract.md**: Defines the default-fast performance boundary, durable-default guardrails, covering-index execution rules, statistics/plan-cache constraints, and ADR triggers for format, WAL, and broad binding changes.
 - **0183-mobile-tde-key-provider-and-platform-keystore-boundary.md**: Defines the mobile TDE key-provider boundary, Keychain/Keystore reference-adapter scope, key-loss behavior, and the rule that Rust and pure Dart remain platform key-store agnostic.

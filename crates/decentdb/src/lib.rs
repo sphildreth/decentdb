@@ -33,6 +33,7 @@ mod sql;
 mod storage;
 mod sync;
 mod tooling;
+mod tracing;
 mod vfs;
 mod wal;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -101,6 +102,7 @@ pub use crate::sync::{
     SyncShapeClient, SyncShapeDelivery, SyncStatus, SyncSubjectKind, SYNC_CHANGESET_VERSION,
     SYNC_CONTRACT_VERSION, SYNC_RELAY_PROTOCOL_VERSION, SYNC_SHAPE_STREAM_VERSION,
 };
+pub use crate::tracing::config::SqlTextMode;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 pub use crate::wasm::WebDb;
 pub use crate::write_queue::{QueuedWriteOptions, WriteQueueMetricsSnapshot};

@@ -78,6 +78,63 @@ public class MaintenanceTests
     }
 
     [Fact]
+    public async Task RebuildIndexesAsync_MissingDatabase_ReturnsEmptyResult()
+    {
+        var dbPath = Path.Combine(Path.GetTempPath(), $"test_rebuild_indexes_none_{Guid.NewGuid():N}.ddb");
+
+        var result = await DecentDBMaintenance.RebuildIndexesAsync(dbPath);
+
+        Assert.False(result.DatabaseExisted);
+        Assert.Equal(Path.GetFullPath(dbPath), result.DatabasePath);
+        Assert.Equal(0, result.IndexCount);
+    }
+
+    [Fact]
+    public async Task RebuildIndexAsync_ValidFile_RebuildsSingleIndexWithoutCli()
+    {
+        var dbPath = Path.Combine(Path.GetTempPath(), $"test_rebuild_index_binding_{Guid.NewGuid():N}.ddb");
+
+        try
+        {
+            SeedIndexedDatabase(dbPath);
+
+            var result = await DecentDBMaintenance.RebuildIndexAsync(dbPath, "ix_rebuild_name");
+
+            Assert.True(result.DatabaseExisted);
+            Assert.Equal(Path.GetFullPath(dbPath), result.DatabasePath);
+            Assert.Equal(new[] { "ix_rebuild_name" }, result.Indexes);
+            Assert.Equal(1L, CountIndexedRows(dbPath, "value_042"));
+        }
+        finally
+        {
+            DecentDBConnection.DeleteDatabaseFiles(dbPath);
+        }
+    }
+
+    [Fact]
+    public async Task RebuildIndexesAsync_ValidFile_RebuildsCatalogIndexesWithoutCli()
+    {
+        var dbPath = Path.Combine(Path.GetTempPath(), $"test_rebuild_indexes_binding_{Guid.NewGuid():N}.ddb");
+
+        try
+        {
+            SeedIndexedDatabase(dbPath);
+
+            var result = await DecentDBMaintenance.RebuildIndexesAsync(dbPath);
+
+            Assert.True(result.DatabaseExisted);
+            Assert.Equal(Path.GetFullPath(dbPath), result.DatabasePath);
+            Assert.Contains("ix_rebuild_name", result.Indexes);
+            Assert.Contains("ux_rebuild_raw", result.Indexes);
+            Assert.Equal(1L, CountIndexedRows(dbPath, "value_042"));
+        }
+        finally
+        {
+            DecentDBConnection.DeleteDatabaseFiles(dbPath);
+        }
+    }
+
+    [Fact]
     public async Task CompactAsync_ValidFile_CreatesReadableCopyWithoutCli()
     {
         var dbPath = Path.Combine(Path.GetTempPath(), $"test_compact_binding_{Guid.NewGuid():N}.ddb");
@@ -236,12 +293,41 @@ public class MaintenanceTests
         cmd.ExecuteNonQuery();
     }
 
+    private static void SeedIndexedDatabase(string dbPath)
+    {
+        using var conn = new DecentDBConnection($"Data Source={dbPath};WAL Auto Checkpoint=0");
+        conn.Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE RebuildTest (Id INTEGER PRIMARY KEY, Name TEXT, RawId TEXT);";
+        cmd.ExecuteNonQuery();
+        cmd.CommandText = "CREATE INDEX ix_rebuild_name ON RebuildTest (Name);";
+        cmd.ExecuteNonQuery();
+        cmd.CommandText = "CREATE UNIQUE INDEX ux_rebuild_raw ON RebuildTest (RawId);";
+        cmd.ExecuteNonQuery();
+
+        for (var i = 0; i < 128; i++)
+        {
+            cmd.CommandText = $"INSERT INTO RebuildTest (Id, Name, RawId) VALUES ({i}, 'value_{i:D3}', 'raw_{i:D3}');";
+            cmd.ExecuteNonQuery();
+        }
+    }
+
     private static long CountRows(string dbPath)
     {
         using var conn = new DecentDBConnection($"Data Source={dbPath}");
         conn.Open();
         using var cmd = conn.CreateCommand();
         cmd.CommandText = "SELECT COUNT(*) FROM MaintenanceTest;";
+        return Convert.ToInt64(cmd.ExecuteScalar());
+    }
+
+    private static long CountIndexedRows(string dbPath, string name)
+    {
+        using var conn = new DecentDBConnection($"Data Source={dbPath}");
+        conn.Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT COUNT(*) FROM RebuildTest WHERE Name = $1;";
+        cmd.Parameters.Add(new DecentDBParameter("$1", name));
         return Convert.ToInt64(cmd.ExecuteScalar());
     }
 }

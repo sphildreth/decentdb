@@ -339,6 +339,17 @@ impl WalHandle {
             .transpose()
     }
 
+    #[allow(dead_code)]
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn set_process_lock_wait_callback(
+        &self,
+        callback: Option<std::sync::Arc<dyn Fn(bool, std::time::Duration, &str) + Send + Sync>>,
+    ) {
+        if let Some(ref coordinator) = self.inner.process_coordinator {
+            coordinator.set_lock_wait_callback(callback);
+        }
+    }
+
     pub(crate) fn publish_process_commit(&self, wal_end_lsn: u64) -> Result<()> {
         if let Some(coordinator) = &self.inner.process_coordinator {
             let snapshot = coordinator.publish_commit(wal_end_lsn)?;

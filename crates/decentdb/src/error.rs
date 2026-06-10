@@ -119,7 +119,7 @@ pub const SUBCODE_INTERNAL_UNKNOWN: &str = "internal.unknown";
 pub const SUBCODE_INTERNAL_PANIC_CAPTURED: &str = "internal.panic_captured";
 pub const SUBCODE_INTERNAL_INVARIANT: &str = "internal.invariant";
 
-fn short_hex_sha256(input: &str) -> String {
+pub(crate) fn short_hex_sha256(input: &str) -> String {
     let mut digest = Sha256::new();
     digest.update(input.as_bytes());
     let bytes = digest.finalize();

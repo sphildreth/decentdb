@@ -157,6 +157,12 @@ SELECT * FROM sys.extension_functions;
 SELECT * FROM sys.extension_collations;
 SELECT * FROM sys.extension_dependencies;
 SELECT * FROM sys.extension_validation;
+SELECT * FROM sys.sessions;
+SELECT * FROM sys.slow_queries;
+SELECT * FROM sys.lock_waits;
+SELECT * FROM sys.index_usage;
+SELECT * FROM sys.doctor_findings;
+SELECT * FROM sys.fix_plan;
 ```
 
 Legacy `sys_sync_*` names remain for sync inspection compatibility:
@@ -373,6 +379,131 @@ Example:
 SELECT * FROM sys.reactive_subscriptions ORDER BY watch_id;
 ```
 
+### `sys.sessions`
+
+One row per active session for the current database handle.
+
+| Column | Type | Nullable | Unit / meaning |
+|---|---|---|---:|
+| `session_id` | `INT64` | no | Session identifier. |
+| `connection_id` | `TEXT` | no | Connection identifier. |
+| `opened_at_unix_ms` | `INT64` | no | Session open timestamp in Unix milliseconds. |
+| `state` | `TEXT` | no | `active`, `in_transaction`, or `closed`. |
+| `tracing_enabled` | `BOOL` | no | Whether tracing is enabled for this session. |
+| `slow_query_threshold_us` | `INT64` | yes | Configured slow-query threshold, or `NULL`. |
+| `database_id_hash` | `TEXT` | no | Short SHA-256 hash of the database path. |
+
+Example:
+
+```sql
+SELECT * FROM sys.sessions;
+```
+
+### `sys.slow_queries`
+
+One row per captured slow query statement. Empty when tracing is disabled or no queries have exceeded the threshold.
+
+| Column | Type | Nullable | Unit / meaning |
+|---|---|---|---:|
+| `event_id` | `INT64` | no | Unique event identifier. |
+| `session_id` | `INT64` | no | Owning session identifier. |
+| `connection_id` | `TEXT` | no | Owning connection identifier. |
+| `started_at_unix_ms` | `INT64` | no | Statement start timestamp in Unix milliseconds. |
+| `duration_us` | `INT64` | no | Elapsed execution time in microseconds. |
+| `threshold_us` | `INT64` | no | Threshold that qualified this event. |
+| `statement_kind` | `TEXT` | no | Statement type, e.g. `SELECT`, `INSERT`, `UPDATE`. |
+| `read_only` | `BOOL` | no | Whether the statement was read-only. |
+| `sql_fingerprint` | `TEXT` | no | Normalized query fingerprint. |
+| `sql_text` | `TEXT` | no | Full SQL text when `sql_text_mode = full`; otherwise empty. |
+| `sql_text_mode` | `TEXT` | no | `none` or `full`. |
+| `status` | `TEXT` | no | Execution status, e.g. `ok` or `error`. |
+| `error_code` | `TEXT` | yes | Error code if status is `error`. |
+| `database_id_hash` | `TEXT` | no | Short SHA-256 hash of the database path. |
+| `internal` | `BOOL` | no | Whether the statement originated from internal logic. |
+
+Example:
+
+```sql
+SELECT * FROM sys.slow_queries;
+```
+
+### `sys.lock_waits`
+
+One row per captured lock-wait event. Empty when lock-wait tracing is disabled or no waits have exceeded the threshold.
+
+| Column | Type | Nullable | Unit / meaning |
+|---|---|---|---:|
+| `event_id` | `INT64` | no | Unique event identifier. |
+| `session_id` | `INT64` | no | Owning session identifier. |
+| `connection_id` | `TEXT` | no | Owning connection identifier. |
+| `duration_us` | `INT64` | no | Time spent waiting for the lock in microseconds. |
+| `threshold_us` | `INT64` | no | Threshold that qualified this event. |
+| `wait_source` | `TEXT` | no | Source of the wait, e.g. `sql_write` or `process_writer`. |
+| `status` | `TEXT` | no | Acquisition result: `ok`, `busy`, or `timeout`. |
+| `database_id_hash` | `TEXT` | no | Short SHA-256 hash of the database path. |
+| `internal` | `BOOL` | no | Whether the wait originated from internal logic. |
+
+Example:
+
+```sql
+SELECT * FROM sys.lock_waits;
+```
+
+### `sys.index_usage`
+
+One row per index with observed read or write traffic. Empty when index-usage tracing is disabled or no indexes have been accessed.
+
+| Column | Type | Nullable | Unit / meaning |
+|---|---|---|---:|
+| `table_name` | `TEXT` | no | Table the index belongs to. |
+| `index_name` | `TEXT` | no | Index name. |
+| `index_kind` | `TEXT` | no | Index kind, e.g. `btree`. |
+| `read_count` | `INT64` | no | Number of observed index reads. |
+| `write_count` | `INT64` | no | Number of observed index writes. |
+
+Example:
+
+```sql
+SELECT * FROM sys.index_usage;
+```
+
+### `sys.doctor_findings`
+
+Merged findings from the static operational Doctor report and the runtime Advisor engine. Empty when no findings are present.
+
+| Column | Type | Nullable | Unit / meaning |
+|---|---|---|---:|
+| `id` | `TEXT` | no | Finding identifier. |
+| `category` | `TEXT` | no | Category, e.g. `Wal`, `Indexes`, `Storage`, `Query`, `Index`, `Contention`. |
+| `severity` | `TEXT` | no | `info`, `warning`, or `error`. |
+| `title` | `TEXT` | no | Short finding title. |
+| `message` | `TEXT` | no | Detailed description. |
+| `evidence` | `TEXT` | no | Evidence as key-value pairs. |
+| `recommendation` | `TEXT` | no | Human-readable recommendation. |
+
+Example:
+
+```sql
+SELECT * FROM sys.doctor_findings;
+```
+
+### `sys.fix_plan`
+
+One row per safe-to-apply fix plan emitted by the Advisor engine. Empty when no plans are available.
+
+| Column | Type | Nullable | Unit / meaning |
+|---|---|---|---:|
+| `advisor_id` | `TEXT` | no | Advisor that produced this plan. |
+| `action` | `TEXT` | no | Planned action, e.g. `checkpoint`. |
+| `target` | `TEXT` | no | Target of the action, e.g. `wal`. |
+| `auto_safe` | `TEXT` | no | Safety classification: `auto`, `manual`, or `review`. |
+
+Example:
+
+```sql
+SELECT * FROM sys.fix_plan;
+```
+
 ### Lifecycle and compatibility notes
 
 - `sys.write_queue_metrics` is a one-row snapshot of `Db::write_queue_metrics`
@@ -392,8 +523,10 @@ SELECT * FROM sys.reactive_subscriptions ORDER BY watch_id;
   unsupported VFSes or `single_process_unsafe` opens.
 - `sys.sync_status` is the canonical name for the sync status row. The
   `sys_sync_status` compatibility name remains supported.
-- These surfaces do not write telemetry rows, create catalog objects, or enable
-  slow-query, lock-wait, index-usage, advisor, or Doctor findings tracing.
+- Runtime tracing views (`sys.slow_queries`, `sys.lock_waits`, `sys.index_usage`,
+  `sys.doctor_findings`, `sys.fix_plan`) are in-memory snapshots. They do not
+  write telemetry rows or create catalog objects, and they reset when the
+  database handle is closed.
 
 ### `sys_sync_status`
 

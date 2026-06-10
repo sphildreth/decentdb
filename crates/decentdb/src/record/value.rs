@@ -58,6 +58,14 @@ pub enum Value {
 }
 
 impl Value {
+    #[must_use]
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            Self::Text(s) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+
     pub(crate) fn text_from_bytes(bytes: Vec<u8>) -> Result<Self> {
         String::from_utf8(bytes).map(Self::Text).map_err(|error| {
             DbError::corruption(format!("TEXT payload is not valid UTF-8: {error}"))
