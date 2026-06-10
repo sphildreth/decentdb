@@ -1528,6 +1528,7 @@ pub(crate) struct EngineRuntime {
     pub(crate) extension_trust_anchors: Arc<Vec<crate::extensions::ExtensionTrustAnchor>>,
     pub(crate) extension_unsigned_development_mode: bool,
     pub(crate) audit_context: Arc<Mutex<crate::security::AuditContext>>,
+    pub(crate) tracing: Option<Arc<crate::tracing::RuntimeTraceState>>,
     fts_eval_context: Arc<Mutex<FtsEvalContext>>,
 }
 
@@ -1716,6 +1717,7 @@ impl Clone for EngineRuntime {
             extension_trust_anchors: Arc::clone(&self.extension_trust_anchors),
             extension_unsigned_development_mode: self.extension_unsigned_development_mode,
             audit_context: Arc::clone(&self.audit_context),
+            tracing: self.tracing.as_ref().map(Arc::clone),
             fts_eval_context: Arc::clone(&self.fts_eval_context),
         }
     }
@@ -1774,15 +1776,16 @@ impl EngineRuntime {
             extension_trust_anchors: Arc::new(config.extension_trust_anchors.clone()),
             extension_unsigned_development_mode: config.extension_unsigned_development_mode,
             audit_context: Arc::new(Mutex::new(crate::security::AuditContext::default())),
+            tracing: None,
             fts_eval_context: Arc::new(Mutex::new(FtsEvalContext::default())),
         }
     }
 
     pub(crate) fn set_audit_context_handle(
         &mut self,
-        audit_context: Arc<Mutex<crate::security::AuditContext>>,
+        handle: Arc<Mutex<crate::security::AuditContext>>,
     ) {
-        self.audit_context = audit_context;
+        self.audit_context = handle;
     }
 
     pub(crate) fn set_sync_capture_active(&mut self, active: bool) {
@@ -1801,6 +1804,31 @@ impl EngineRuntime {
 
     pub(crate) fn sync_capture_active(&self) -> bool {
         self.sync_capture_active
+    }
+
+    pub(crate) fn set_tracing(
+        &mut self,
+        tracing: Arc<crate::tracing::RuntimeTraceState>,
+    ) {
+        self.tracing = Some(tracing);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn drain_index_usage(&self) {
+        let events = crate::tracing::index_usage::drain_local_index_usage();
+        if events.is_empty() {
+            return;
+        }
+        if let Some(tracing) = self.tracing.as_ref() {
+            for (table_name, index_name, index_kind, kind) in events {
+                tracing.record_index_usage(
+                    &table_name,
+                    &index_name,
+                    &index_kind,
+                    kind,
+                );
+            }
+        }
     }
 
     pub(crate) fn mutation_capture_active(&self) -> bool {
@@ -13768,6 +13796,14 @@ impl EngineRuntime {
                     self.eval_expr(value_expr, &Dataset::empty(), &[], params, ctes, None)?;
                 if let Some(RuntimeIndex::Btree { keys, .. }) = self.index(&index.name) {
                     let row_ids = keys.row_ids_for_value_set(&value)?;
+                    if let Some(ref tracing) = self.tracing {
+                        tracing.record_index_usage(
+                            name,
+                            &index.name,
+                            "btree",
+                            crate::tracing::index_usage::IndexUsageKind::Read,
+                        );
+                    }
                     return self
                         .dataset_from_row_id_set(table, row_source, alias, row_ids, false)
                         .map(Some);

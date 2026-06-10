@@ -3834,6 +3834,91 @@ pub extern "C" fn ddb_result_value_copy(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Runtime tracing C ABI
+// ---------------------------------------------------------------------------
+
+/// Snapshot runtime tracing data as JSON.
+///
+/// `kind` selects the trace view:
+///   "slow_queries", "lock_waits", "sessions",
+///   "index_usage", "doctor_findings", "fix_plan"
+///
+/// On success, `out_json` receives an owned JSON string.
+/// The caller must free it with `ddb_string_free`.
+#[no_mangle]
+pub extern "C" fn ddb_runtime_tracing_snapshot(
+    db: *mut DbHandle,
+    kind: *const c_char,
+    out_json: *mut *mut c_char,
+) -> u32 {
+    ffi_boundary(|| {
+        let db = handle_ref(db, "db")?;
+        let kind = utf8_arg(kind, "kind")?;
+        let sql = match kind.as_str() {
+            "slow_queries" => "SELECT * FROM sys.slow_queries",
+            "lock_waits" => "SELECT * FROM sys.lock_waits",
+            "sessions" => "SELECT * FROM sys.sessions",
+            "index_usage" => "SELECT * FROM sys.index_usage",
+            "doctor_findings" => "SELECT * FROM sys.doctor_findings",
+            "fix_plan" => "SELECT * FROM sys.fix_plan",
+            _ => return Err(DbError::sql(format!("unknown tracing kind: {kind}"))),
+        };
+        let result = db.db.execute(sql)?;
+        let columns: Vec<&str> = result.columns().iter().map(|s| s.as_str()).collect();
+        let rows: Vec<Vec<serde_json::Value>> = result
+            .rows()
+            .iter()
+            .map(|row| {
+                row.values()
+                    .iter()
+                    .map(|v| match v {
+                        Value::Null => serde_json::Value::Null,
+                        Value::Int64(i) => serde_json::Value::Number((*i).into()),
+                        Value::Float64(f) => {
+                            serde_json::Number::from_f64(*f)
+                                .map_or(serde_json::Value::Null, serde_json::Value::Number)
+                        }
+                        Value::Bool(b) => serde_json::Value::Bool(*b),
+                        Value::Text(s) => serde_json::Value::String(s.clone()),
+                        Value::Blob(b) => {
+                            serde_json::Value::String(format!("<blob len={}>", b.len()))
+                        }
+                        Value::Decimal { scaled, scale } => {
+                            serde_json::Value::String(format!("Decimal({scaled},{scale})"))
+                        }
+                        _ => serde_json::Value::String(format!("{:?}", v)),
+                    })
+                    .collect()
+            })
+            .collect();
+        let json = serde_json::to_string(&serde_json::json!({
+            "columns": columns,
+            "rows": rows,
+        }))
+        .map_err(|e| DbError::internal(format!("JSON serialization failed: {e}")))?;
+        *out_ptr(out_json, "out_json")? =
+            CString::new(json).map_err(|e| DbError::internal(format!("CString failed: {e}")))?.into_raw();
+        Ok(())
+    })
+}
+
+/// Reset a specific runtime trace ring buffer.
+///
+/// `kind` may be "slow_queries", "lock_waits", or "index_usage".
+#[no_mangle]
+pub extern "C" fn ddb_runtime_tracing_reset(
+    db: *mut DbHandle,
+    kind: *const c_char,
+) -> u32 {
+    ffi_boundary(|| {
+        let db = handle_ref(db, "db")?;
+        let kind = utf8_arg(kind, "kind")?;
+        db.db.tracing_reset(&kind)?;
+        Ok(())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -423,6 +423,7 @@ struct DbInner {
     audit_context: Arc<Mutex<crate::security::AuditContext>>,
     read_only_paged_row_source_residency: Mutex<ReadOnlyPagedRowSourceResidency>,
     write_queue: OnceLock<WriteQueue>,
+    tracing: Arc<crate::tracing::RuntimeTraceState>,
 }
 
 impl Drop for DbInner {
@@ -1992,7 +1993,41 @@ impl Db {
         sql: &str,
         params: &[Value],
     ) -> Result<Vec<QueryResult>> {
+        let _savepoint = StatementSavepoint::new(self.inner.wal.latest_snapshot());
         self.execute_batch_direct_with_params(sql, params)
+    }
+
+    /// Reset a specific runtime trace store by name.
+    ///
+    /// `kind` may be "slow_queries", "lock_waits", or "index_usage".
+    pub fn tracing_reset(&self,
+        kind: &str,
+    ) -> Result<()> {
+        match kind {
+            "slow_queries" => self
+                .inner
+                .tracing
+                .slow_query_store
+                .lock()
+                .map_err(|_| DbError::internal("slow query store poisoned"))?
+                .reset(),
+            "lock_waits" => self
+                .inner
+                .tracing
+                .lock_wait_store
+                .lock()
+                .map_err(|_| DbError::internal("lock wait store poisoned"))?
+                .reset(),
+            "index_usage" => self
+                .inner
+                .tracing
+                .index_usage_store
+                .lock()
+                .map_err(|_| DbError::internal("index usage store poisoned"))?
+                .reset(),
+            _ => return Err(DbError::sql(format!("unknown tracing kind for reset: {kind}"))),
+        }
+        Ok(())
     }
 
     pub(crate) fn execute_batch_direct_with_params(
@@ -2009,11 +2044,18 @@ impl Db {
 
             if let Some(control) = parse_transaction_control(trimmed) {
                 match control {
-                    TransactionControl::Begin => self.begin_transaction()?,
+                    TransactionControl::Begin => {
+                        self.begin_transaction()?;
+                        self.inner.tracing.mark_in_transaction();
+                    }
                     TransactionControl::Commit => {
                         self.commit_transaction()?;
+                        self.inner.tracing.mark_active();
                     }
-                    TransactionControl::Rollback => self.rollback_transaction()?,
+                    TransactionControl::Rollback => {
+                        self.rollback_transaction()?;
+                        self.inner.tracing.mark_active();
+                    }
                     TransactionControl::Savepoint(name) => self.create_savepoint(&name)?,
                     TransactionControl::ReleaseSavepoint(name) => {
                         self.release_savepoint(&name)?;
@@ -2056,26 +2098,92 @@ impl Db {
                 continue;
             }
             if let Some(result) = self.try_execute_simple_count_sql_fast_path(trimmed, params)? {
+                self.record_statement_trace(
+                    trimmed,
+                    true,
+                    std::time::Duration::ZERO,
+                    0,
+                    Ok(&result),
+                );
                 results.push(result);
                 continue;
             }
             if let Some(result) =
                 self.try_execute_simple_row_id_projection_sql_fast_path(trimmed, params)?
             {
+                self.record_statement_trace(
+                    trimmed,
+                    true,
+                    std::time::Duration::ZERO,
+                    0,
+                    Ok(&result),
+                );
                 results.push(result);
                 continue;
             }
 
             reject_unsupported_collated_key_sql(trimmed)?;
             let statement = self.parsed_statement(trimmed)?;
-            let result = if statement_is_read_only(&statement) {
-                self.execute_read_statement(&statement, params)?
+            let start = if self.inner.tracing.any_enabled() {
+                Some((
+                    std::time::Instant::now(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as i64,
+                ))
             } else {
-                self.execute_write_statement(trimmed, &statement, params)?
+                None
             };
-            results.push(result);
+            let read_only = statement_is_read_only(&statement);
+            let result = if read_only {
+                self.execute_read_statement(&statement, params)
+            } else {
+                self.execute_write_statement(trimmed, &statement, params)
+            };
+            if let Some((t0, unix_ms)) = start {
+                let dur = t0.elapsed();
+                self.record_statement_trace(trimmed, read_only, dur, unix_ms, result.as_ref());
+            }
+            results.push(result?);
         }
         Ok(results)
+    }
+
+    fn record_statement_trace(
+        &self,
+        sql: &str,
+        read_only: bool,
+        duration: std::time::Duration,
+        started_at_unix_ms: i64,
+        result: std::result::Result<&QueryResult, &DbError>,
+    ) {
+        let status = match result {
+            Ok(_) => "ok",
+            Err(_) => "error",
+        };
+        self.inner.tracing.record_slow_query(
+            duration,
+            started_at_unix_ms,
+            "statement",
+            read_only,
+            sql,
+            status,
+            None,
+            false,
+        );
+    }
+
+    fn record_lock_wait(
+        &self,
+        start: Option<std::time::Instant>,
+        source: &str,
+        status: &str,
+    ) {
+        if let Some(t0) = start {
+            let dur = t0.elapsed();
+            self.inner.tracing.record_lock_wait(dur, source, status, false);
+        }
     }
 
     fn try_execute_simple_count_sql_fast_path(
@@ -2248,11 +2356,17 @@ impl Db {
         rows: &[Vec<Value>],
         options: BulkLoadOptions,
     ) -> Result<u64> {
+        let lw_start = if self.inner.tracing.config.lock_wait.enabled {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         let _writer = self
             .inner
             .sql_write_lock
             .lock()
             .map_err(|_| DbError::internal("SQL writer lock poisoned"))?;
+        self.record_lock_wait(lw_start, "sql_write", "ok");
         if self.inner.config.defer_table_materialization {
             let reader = self.inner.wal.begin_reader_with_pager(&self.inner.pager)?;
             let snapshot_lsn = reader.snapshot_lsn();
@@ -2297,11 +2411,17 @@ impl Db {
 
     /// Rebuilds a single named index from the persisted table state.
     pub fn rebuild_index(&self, name: &str) -> Result<()> {
+        let lw_start = if self.inner.tracing.config.lock_wait.enabled {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         let _writer = self
             .inner
             .sql_write_lock
             .lock()
             .map_err(|_| DbError::internal("SQL writer lock poisoned"))?;
+        self.record_lock_wait(lw_start, "sql_write", "ok");
         if self.inner.config.defer_table_materialization {
             let reader = self.inner.wal.begin_reader_with_pager(&self.inner.pager)?;
             let snapshot_lsn = reader.snapshot_lsn();
@@ -2332,11 +2452,17 @@ impl Db {
 
     /// Rebuilds all indexes from the persisted table state.
     pub fn rebuild_indexes(&self) -> Result<()> {
+        let lw_start = if self.inner.tracing.config.lock_wait.enabled {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         let _writer = self
             .inner
             .sql_write_lock
             .lock()
             .map_err(|_| DbError::internal("SQL writer lock poisoned"))?;
+        self.record_lock_wait(lw_start, "sql_write", "ok");
         if self.inner.config.defer_table_materialization {
             let reader = self.inner.wal.begin_reader_with_pager(&self.inner.pager)?;
             let snapshot_lsn = reader.snapshot_lsn();
@@ -2910,6 +3036,15 @@ impl Db {
             EngineRuntime::load_from_storage(&pager, &wal, schema_cookie, &effective_config)?;
         let audit_context = Arc::new(Mutex::new(crate::security::AuditContext::default()));
         runtime.set_audit_context_handle(Arc::clone(&audit_context));
+
+        let tracing_state = crate::tracing::RuntimeTraceState::new(
+            &effective_config.tracing,
+            crate::tracing::next_connection_id(),
+            crate::error::short_hex_sha256(&path.to_string_lossy()),
+        );
+        let tracing_arc = Arc::new(tracing_state);
+        runtime.set_tracing(Arc::clone(&tracing_arc));
+
         let catalog = CatalogHandle::new(runtime.catalog.as_ref().clone());
         let last_seen_checkpoint_epoch = wal.checkpoint_epoch();
         let reactive_registry_key = open_lock_key.clone();
@@ -2945,6 +3080,7 @@ impl Db {
                     ReadOnlyPagedRowSourceResidency::default(),
                 ),
                 write_queue: OnceLock::new(),
+                tracing: Arc::clone(&tracing_arc),
             }),
         };
         db.backfill_missing_persistent_pk_indexes()?;
@@ -4196,11 +4332,17 @@ impl Db {
                 SqlTxnSlot::None => {}
             }
         }
+        let lw_start = if self.inner.tracing.config.lock_wait.enabled {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         let _writer = self
             .inner
             .sql_write_lock
             .lock()
             .map_err(|_| DbError::internal("SQL writer lock poisoned"))?;
+        self.record_lock_wait(lw_start, "sql_write", "ok");
         if let Some(prepared_update) = prepared.prepared_update.as_deref() {
             if let Some(result) = self.try_execute_autocommit_prepared_update_in_place(
                 prepared,
@@ -4314,11 +4456,17 @@ impl Db {
         }
 
         {
+            let lw_start = if self.inner.tracing.config.lock_wait.enabled {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             let _writer = self
                 .inner
                 .sql_write_lock
                 .lock()
                 .map_err(|_| DbError::internal("SQL writer lock poisoned"))?;
+            self.record_lock_wait(lw_start, "sql_write", "ok");
             if let Some(prepared_insert) = prepared.prepared_insert.as_deref() {
                 if let Some(result) = self.try_execute_autocommit_prepared_insert_in_place_mut(
                     prepared,
@@ -4362,11 +4510,17 @@ impl Db {
             }
         }
 
+        let lw_start = if self.inner.tracing.config.lock_wait.enabled {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         let _writer = self
             .inner
             .sql_write_lock
             .lock()
             .map_err(|_| DbError::internal("SQL writer lock poisoned"))?;
+        self.record_lock_wait(lw_start, "sql_write", "ok");
         if let crate::sql::ast::Statement::Update(update) = statement {
             let prepared = {
                 let runtime = self
@@ -10952,6 +11106,186 @@ impl Db {
         Ok(stored_next_sequence.max(journal_next_sequence))
     }
 
+    fn sessions_query_result(&self) -> Result<QueryResult> {
+        let columns = vec![
+            "session_id".to_string(),
+            "connection_id".to_string(),
+            "database_id_hash".to_string(),
+            "opened_at_unix_ms".to_string(),
+            "closed_at_unix_ms".to_string(),
+            "state".to_string(),
+            "binding".to_string(),
+            "tracing_enabled".to_string(),
+            "slow_query_threshold_us".to_string(),
+            "internal".to_string(),
+        ];
+        let sessions = self.inner.tracing.sessions_snapshot();
+        let rows = sessions
+            .into_iter()
+            .map(|s| QueryRow::new(s.to_query_row()))
+            .collect();
+        Ok(QueryResult::with_rows(columns, rows))
+    }
+
+    fn slow_queries_query_result(&self) -> Result<QueryResult> {
+        let columns = vec![
+            "event_id".to_string(),
+            "session_id".to_string(),
+            "connection_id".to_string(),
+            "started_at_unix_ms".to_string(),
+            "duration_us".to_string(),
+            "threshold_us".to_string(),
+            "statement_kind".to_string(),
+            "read_only".to_string(),
+            "sql_fingerprint".to_string(),
+            "sql_template".to_string(),
+            "sql_text_mode".to_string(),
+            "database_id_hash".to_string(),
+            "status".to_string(),
+            "error_code".to_string(),
+            "internal".to_string(),
+            "truncated".to_string(),
+        ];
+        let snapshot = self.inner.tracing.slow_queries_snapshot();
+        let rows = snapshot
+            .items
+            .into_iter()
+            .map(|e| QueryRow::new(e.to_query_row()))
+            .collect();
+        Ok(QueryResult::with_rows(columns, rows))
+    }
+
+    fn lock_waits_query_result(&self) -> Result<QueryResult> {
+        let columns = vec![
+            "event_id".to_string(),
+            "session_id".to_string(),
+            "connection_id".to_string(),
+            "duration_us".to_string(),
+            "threshold_us".to_string(),
+            "wait_source".to_string(),
+            "status".to_string(),
+            "database_id_hash".to_string(),
+            "internal".to_string(),
+        ];
+        let snapshot = self.inner.tracing.lock_waits_snapshot();
+        let rows = snapshot
+            .items
+            .into_iter()
+            .map(|e| QueryRow::new(e.to_query_row()))
+            .collect();
+        Ok(QueryResult::with_rows(columns, rows))
+    }
+
+    fn index_usage_query_result(&self) -> Result<QueryResult> {
+        let columns = vec![
+            "table_name".to_string(),
+            "index_name".to_string(),
+            "index_kind".to_string(),
+            "read_count".to_string(),
+            "write_count".to_string(),
+        ];
+        let rows = self
+            .inner
+            .tracing
+            .index_usage_snapshot()
+            .into_iter()
+            .map(|r| QueryRow::new(r.to_query_row()))
+            .collect();
+        Ok(QueryResult::with_rows(columns, rows))
+    }
+
+    fn doctor_findings_query_result(&self) -> Result<QueryResult> {
+        let columns = vec![
+            "id".to_string(),
+            "category".to_string(),
+            "severity".to_string(),
+            "title".to_string(),
+            "message".to_string(),
+            "evidence".to_string(),
+            "recommendation".to_string(),
+        ];
+        let mut findings = Vec::new();
+        // Static Doctor findings via sync_operational_doctor_report
+        if let Ok(report) = self.sync_operational_doctor_report() {
+            for issue in report.issues {
+                findings.push(vec![
+                    Value::Text(format!("sync-{}", issue.line_number)),
+                    Value::Text(format!("{:?}", issue.severity)),
+                    Value::Text(format!("{:?}", issue.severity)),
+                    Value::Text(issue.message.clone()),
+                    Value::Text(issue.message),
+                    Value::Text(String::new()),
+                    Value::Text(report.guidance.first().cloned().unwrap_or_default()),
+                ]);
+            }
+        }
+        // Runtime advisor findings
+        let slow_queries = self.inner.tracing.slow_queries_snapshot();
+        let lock_waits = self.inner.tracing.lock_waits_snapshot();
+        let index_usage = self.inner.tracing.index_usage_snapshot();
+        let wal_size_mb = self.inner.wal.latest_snapshot().saturating_sub(
+            crate::wal::format::WAL_HEADER_SIZE,
+        ) / (1024 * 1024);
+        let uncheckpointed_frames = self.inner.wal.latest_snapshot().saturating_sub(
+            self.inner.wal.checkpoint_epoch(),
+        ) / self.inner.config.page_size as u64;
+        let mut engine = crate::tracing::advisor::AdvisorEngine::new();
+        engine.analyze(&slow_queries,
+            &lock_waits,
+            &index_usage,
+            wal_size_mb,
+            uncheckpointed_frames,
+        );
+        for f in engine.into_findings() {
+            let mut row = f.to_query_row();
+            // trim to first 7 columns
+            row.truncate(7);
+            findings.push(row);
+        }
+        let rows = findings.into_iter().map(QueryRow::new).collect();
+        Ok(QueryResult::with_rows(columns, rows))
+    }
+
+    fn fix_plan_query_result(&self) -> Result<QueryResult> {
+        let columns = vec![
+            "advisor_id".to_string(),
+            "action".to_string(),
+            "target".to_string(),
+            "auto_safe".to_string(),
+        ];
+        let slow_queries = self.inner.tracing.slow_queries_snapshot();
+        let lock_waits = self.inner.tracing.lock_waits_snapshot();
+        let index_usage = self.inner.tracing.index_usage_snapshot();
+        let wal_size_mb = self.inner.wal.latest_snapshot().saturating_sub(
+            crate::wal::format::WAL_HEADER_SIZE,
+        ) / (1024 * 1024);
+        let uncheckpointed_frames = self.inner.wal.latest_snapshot().saturating_sub(
+            self.inner.wal.checkpoint_epoch(),
+        ) / self.inner.config.page_size as u64;
+        let mut engine = crate::tracing::advisor::AdvisorEngine::new();
+        engine.analyze(&slow_queries,
+            &lock_waits,
+            &index_usage,
+            wal_size_mb,
+            uncheckpointed_frames,
+        );
+        let rows: Vec<QueryRow> = engine
+            .into_findings()
+            .into_iter()
+            .filter_map(|f| {
+                f.fix_plan.map(|p| {
+                    QueryRow::new(vec![
+                        Value::Text(f.advisor_id),
+                        Value::Text(p.action),
+                        Value::Text(p.target),
+                        Value::Text(p.auto_safe),
+                    ])
+                })
+            })
+            .collect();
+        Ok(QueryResult::with_rows(columns, rows))
+    }
+
     fn try_execute_sync_inspection_query(
         &self,
         sql: &str,
@@ -10995,6 +11329,12 @@ impl Db {
             SyncInspectionQuery::ScopeTables => self.sync_scope_tables_query_result().map(Some),
             SyncInspectionQuery::PeerScopes => self.sync_peer_scopes_query_result().map(Some),
             SyncInspectionQuery::Sessions => self.sync_sessions_query_result().map(Some),
+            SyncInspectionQuery::RuntimeSessions => self.sessions_query_result().map(Some),
+            SyncInspectionQuery::SlowQueries => self.slow_queries_query_result().map(Some),
+            SyncInspectionQuery::LockWaits => self.lock_waits_query_result().map(Some),
+            SyncInspectionQuery::IndexUsage => self.index_usage_query_result().map(Some),
+            SyncInspectionQuery::DoctorFindings => self.doctor_findings_query_result().map(Some),
+            SyncInspectionQuery::FixPlan => self.fix_plan_query_result().map(Some),
             SyncInspectionQuery::ConflictPolicy => {
                 self.sync_conflict_policy_query_result().map(Some)
             }
@@ -12070,6 +12410,12 @@ enum SyncInspectionQuery {
     Shapes,
     ShapeClients,
     ChangesetHistory,
+    RuntimeSessions,
+    SlowQueries,
+    LockWaits,
+    IndexUsage,
+    DoctorFindings,
+    FixPlan,
 }
 
 impl SyncInspectionQuery {
@@ -12146,6 +12492,12 @@ impl SyncInspectionQuery {
             "select * from sys.sync_changeset_history order by created_at_micros, changeset_id" => {
                 Some(Self::ChangesetHistory)
             }
+            "select * from sys.sessions" => Some(Self::RuntimeSessions),
+            "select * from sys.slow_queries" => Some(Self::SlowQueries),
+            "select * from sys.lock_waits" => Some(Self::LockWaits),
+            "select * from sys.index_usage" => Some(Self::IndexUsage),
+            "select * from sys.doctor_findings" => Some(Self::DoctorFindings),
+            "select * from sys.fix_plan" => Some(Self::FixPlan),
             _ => parse_sync_journal_where_sequence(normalized)
                 .map(|since_sequence| Self::Journal { since_sequence }),
         }
