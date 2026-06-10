@@ -20,6 +20,23 @@ pub use sink::RuntimeTraceState;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+use std::time::{SystemTime, UNIX_EPOCH};
+
+pub(crate) fn unix_millis_now() -> i64 {
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    {
+        js_sys::Date::now() as i64
+    }
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64
+    }
+}
+
 static GLOBAL_EVENT_COUNTER: AtomicU64 = AtomicU64::new(1);
 static GLOBAL_CONNECTION_COUNTER: AtomicU64 = AtomicU64::new(1);
 

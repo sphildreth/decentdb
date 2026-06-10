@@ -1,8 +1,7 @@
 #![allow(dead_code)]
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use crate::record::value::Value;
+use crate::tracing::unix_millis_now;
 /// Lifecycle state of a session/connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionState {
@@ -78,10 +77,7 @@ impl SessionTracker {
         tracing_enabled: bool,
         slow_query_threshold_us: Option<u64>,
     ) -> Self {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64;
+        let now = unix_millis_now();
         Self {
             session_id,
             connection_id,
