@@ -132,7 +132,7 @@ shipped foundation affects follow-on roadmap decisions.
 | Priority | Future Version | Status | Feature | Current Source Of Truth | Why This Rank |
 |---:|---|---|---|---|---|
 | 1 | vNext+1 | TODO | Incremental backup and point-in-time recovery | Basic `save_as` backup is delivered; needs ADR/spec for WAL archive/PITR semantics | Durable recovery artifacts are a production requirement and distinct from live replication |
-| 2 | vNext+1 | TODO | Runtime tracing, advisors, and Doctor integration | Needs ADR/spec; follows shipped operational metrics | Explains slow queries, lock waits, index usage, schema lint, and maintenance issues once the metrics contract is stable |
+| 2 | vNext+1 | TODO | Runtime tracing, advisors, and Doctor integration | [`WIN_RUNTIME_TRACING_ADVISORS_AND_DOCTOR_INTEGRATION.md`](WIN_RUNTIME_TRACING_ADVISORS_AND_DOCTOR_INTEGRATION.md); ADR 0186-0189 | Explains slow queries, lock waits, index usage, schema lint, and maintenance issues once the metrics contract is stable |
 | 3 | vNext+1 | TODO | Branch-aware migration rehearsal and promotion | ADR 0153-0159 and branch CLI/API docs; needs ADR/spec | Uses shipped branch/diff foundations for a distinctive safe migration workflow |
 | 4 | vNext+1 | TODO | Online schema change execution | Needs ADR/spec; follows branch migration design | Completes the migration story by reducing reader/write disruption during large table rebuilds and index work |
 | 5 | vNext+1 | TODO | Backend sync bridge for existing app databases, Postgres first | Needs ADR/spec | Makes DecentDB easier to adopt in apps that already have a central Postgres/Supabase-style backend |
@@ -245,8 +245,8 @@ retention, encryption, and restore semantics.
 
 **Future Version:** vNext+1
 
-**Source of truth:** Needs ADR/spec. Follows the shipped operational metrics
-contract.
+**Source of truth:** [`WIN_RUNTIME_TRACING_ADVISORS_AND_DOCTOR_INTEGRATION.md`](WIN_RUNTIME_TRACING_ADVISORS_AND_DOCTOR_INTEGRATION.md);
+ADR 0186-0189.
 
 ### Why This Matters
 
