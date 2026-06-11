@@ -2038,8 +2038,7 @@ impl EngineRuntime {
         table_name: &str,
         state: PersistedTableState,
     ) -> Result<Option<PageId>> {
-        let needs_locator_cache =
-            self.should_cache_deferred_paged_row_locators(table_name);
+        let needs_locator_cache = self.should_cache_deferred_paged_row_locators(table_name);
         if !db.config().persistent_pk_index && !needs_locator_cache {
             self.deferred_paged_row_locator_caches_mut()
                 .remove(table_name);

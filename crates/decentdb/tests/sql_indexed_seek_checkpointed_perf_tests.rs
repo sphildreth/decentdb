@@ -69,9 +69,9 @@ fn indexed_equality_on_large_checkpointed_table_is_bounded() {
         // Insert 300,000 rows using transactions (exceeds old 250,000 limit)
         let row_count: i64 = 300_000;
         let mut txn = db.transaction().unwrap();
-        let stmt = txn.prepare(
-            "INSERT INTO Artist VALUES ($1, $2, $3, $4, $5, $6)"
-        ).unwrap();
+        let stmt = txn
+            .prepare("INSERT INTO Artist VALUES ($1, $2, $3, $4, $5, $6)")
+            .unwrap();
         for i in 1..=row_count {
             stmt.execute_in(
                 &mut txn,
@@ -236,7 +236,9 @@ fn explain_reports_index_seek_for_checkpointed_table() {
             .unwrap();
 
         let mut txn = db.transaction().unwrap();
-        let stmt = txn.prepare("INSERT INTO Probe VALUES ($1, $2, $3)").unwrap();
+        let stmt = txn
+            .prepare("INSERT INTO Probe VALUES ($1, $2, $3)")
+            .unwrap();
         for i in 1..=5_000 {
             stmt.execute_in(
                 &mut txn,
