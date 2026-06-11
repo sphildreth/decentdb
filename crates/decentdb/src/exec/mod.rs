@@ -9545,25 +9545,29 @@ impl EngineRuntime {
         limit: Option<usize>,
         offset: usize,
     ) -> Result<Option<QueryResult>> {
-        if lower_bound.is_none() || upper_bound.is_none() {
+        let lower_only_limited = lower_bound.is_some() && upper_bound.is_none() && limit.is_some();
+        let bounded_range = lower_bound.is_some() && upper_bound.is_some();
+        if !bounded_range && !lower_only_limited {
             return Ok(None);
         }
-        if order_by.len() != 1 || order_by[0].descending {
-            return Ok(None);
-        }
-        let Expr::Column {
-            table: order_table,
-            column: order_column,
-        } = &order_by[0].expr
-        else {
-            return Ok(None);
-        };
-        if !identifiers_equal(order_column, filter_column)
-            || order_table
-                .as_deref()
-                .is_some_and(|qualifier| !matches_table_binding(table_binding, Some(qualifier)))
-        {
-            return Ok(None);
+        if !order_by.is_empty() {
+            if order_by.len() != 1 || order_by[0].descending {
+                return Ok(None);
+            }
+            let Expr::Column {
+                table: order_table,
+                column: order_column,
+            } = &order_by[0].expr
+            else {
+                return Ok(None);
+            };
+            if !identifiers_equal(order_column, filter_column)
+                || order_table
+                    .as_deref()
+                    .is_some_and(|qualifier| !matches_table_binding(table_binding, Some(qualifier)))
+            {
+                return Ok(None);
+            }
         }
         if !table_schema
             .primary_key_columns
@@ -9591,10 +9595,25 @@ impl EngineRuntime {
         }
 
         let take = limit.unwrap_or(usize::MAX);
+        let max_probe_steps = if upper_bound.is_none() {
+            Some(
+                row_source
+                    .row_count()
+                    .saturating_add(offset)
+                    .saturating_add(take),
+            )
+        } else {
+            None
+        };
         let mut skipped = 0usize;
         let mut rows = Vec::with_capacity(take.min(64));
         let mut row_id = start;
+        let mut probe_steps = 0usize;
         while row_id < end_exclusive && rows.len() < take {
+            if max_probe_steps.is_some_and(|max_probe_steps| probe_steps >= max_probe_steps) {
+                return Ok(None);
+            }
+            probe_steps = probe_steps.saturating_add(1);
             if let Some(row) = row_source.row_by_id(row_id)? {
                 if skipped < offset {
                     skipped += 1;
@@ -9631,25 +9650,29 @@ impl EngineRuntime {
         use_persistent_pk_index: bool,
         paged_locator_cache: Option<&DeferredPagedRowLocatorCache>,
     ) -> Result<Option<QueryResult>> {
-        if lower_bound.is_none() || upper_bound.is_none() {
+        let lower_only_limited = lower_bound.is_some() && upper_bound.is_none() && limit.is_some();
+        let bounded_range = lower_bound.is_some() && upper_bound.is_some();
+        if !bounded_range && !lower_only_limited {
             return Ok(None);
         }
-        if order_by.len() != 1 || order_by[0].descending {
-            return Ok(None);
-        }
-        let Expr::Column {
-            table: order_table,
-            column: order_column,
-        } = &order_by[0].expr
-        else {
-            return Ok(None);
-        };
-        if !identifiers_equal(order_column, filter_column)
-            || order_table
-                .as_deref()
-                .is_some_and(|qualifier| !matches_table_binding(table_binding, Some(qualifier)))
-        {
-            return Ok(None);
+        if !order_by.is_empty() {
+            if order_by.len() != 1 || order_by[0].descending {
+                return Ok(None);
+            }
+            let Expr::Column {
+                table: order_table,
+                column: order_column,
+            } = &order_by[0].expr
+            else {
+                return Ok(None);
+            };
+            if !identifiers_equal(order_column, filter_column)
+                || order_table
+                    .as_deref()
+                    .is_some_and(|qualifier| !matches_table_binding(table_binding, Some(qualifier)))
+            {
+                return Ok(None);
+            }
         }
         if !table_schema
             .primary_key_columns
@@ -9687,10 +9710,20 @@ impl EngineRuntime {
         }
 
         let take = limit.unwrap_or(usize::MAX);
+        let max_probe_steps = if upper_bound.is_none() {
+            Some(state.row_count.saturating_add(offset).saturating_add(take))
+        } else {
+            None
+        };
         let mut skipped = 0usize;
         let mut rows = Vec::with_capacity(take.min(64));
         let mut row_id = start;
+        let mut probe_steps = 0usize;
         while row_id < end_exclusive && rows.len() < take {
+            if max_probe_steps.is_some_and(|max_probe_steps| probe_steps >= max_probe_steps) {
+                return Ok(None);
+            }
+            probe_steps = probe_steps.saturating_add(1);
             if let Some(row) = read_deferred_stored_row_by_id(
                 store,
                 state,

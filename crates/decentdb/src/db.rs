@@ -177,10 +177,19 @@ pub struct PreparedStatement {
     temp_schema_cookie: u32,
     statement: Arc<SqlStatement>,
     prepared_sql: String,
+    simple_row_id_projection: Option<PreparedSimpleRowIdProjection>,
     prepared_insert: Option<Arc<PreparedSimpleInsert>>,
     prepared_update: Option<Arc<PreparedSimpleUpdate>>,
     prepared_delete: Option<Arc<PreparedSimpleDelete>>,
     read_only: bool,
+}
+
+#[derive(Clone, Debug)]
+struct PreparedSimpleRowIdProjection {
+    table_name: String,
+    projection_columns: Vec<String>,
+    filter_column: String,
+    param_index: usize,
 }
 
 /// Transaction-scoped prepared statement executor for repeated rows.
@@ -4272,11 +4281,68 @@ impl Db {
         }
     }
 
+    fn try_execute_prepared_simple_row_id_projection(
+        &self,
+        prepared: &PreparedStatement,
+        params: &[Value],
+    ) -> Result<Option<QueryResult>> {
+        if self.inner.sql_txn_active.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let Some(plan) = prepared.simple_row_id_projection.as_ref() else {
+            return Ok(None);
+        };
+        let Some(Value::Int64(lookup_row_id)) = params.get(plan.param_index) else {
+            return Ok(None);
+        };
+
+        let reader = self.inner.wal.begin_reader_with_pager(&self.inner.pager)?;
+        let snapshot_lsn = reader.snapshot_lsn();
+        self.refresh_engine_from_snapshot(snapshot_lsn)?;
+        if self.ensure_security_tables_loaded_at_snapshot(snapshot_lsn)? {
+            return Ok(None);
+        }
+        let runtime = self
+            .inner
+            .engine
+            .read()
+            .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+        self.validate_prepared_schema_cookie(
+            prepared,
+            runtime.catalog.schema_cookie,
+            runtime.temp_schema_cookie,
+        )?;
+        let projection_columns = plan
+            .projection_columns
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let result =
+            runtime.execute_simple_row_id_projection_at_snapshot(SimpleRowIdProjectionRequest {
+                table_name: plan.table_name.as_str(),
+                projection_columns: &projection_columns,
+                filter_column: plan.filter_column.as_str(),
+                lookup_row_id: *lookup_row_id,
+                pager: &self.inner.pager,
+                wal: &self.inner.wal,
+                snapshot_lsn,
+                use_persistent_pk_index: self.inner.config.persistent_pk_index,
+            })?;
+        drop(runtime);
+        drop(reader);
+        Ok(result)
+    }
+
     fn execute_prepared_read_statement(
         &self,
         prepared: &PreparedStatement,
         params: &[Value],
     ) -> Result<QueryResult> {
+        if let Some(result) =
+            self.try_execute_prepared_simple_row_id_projection(prepared, params)?
+        {
+            return Ok(result);
+        }
         {
             let runtime = self
                 .inner
@@ -5569,12 +5635,26 @@ impl Db {
             ),
             _ => (None, None, None),
         };
+        let simple_row_id_projection =
+            parse_simple_row_id_projection_sql(&prepared_sql).map(|plan| {
+                PreparedSimpleRowIdProjection {
+                    table_name: plan.table_name.to_string(),
+                    projection_columns: plan
+                        .projection_columns
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    filter_column: plan.filter_column.to_string(),
+                    param_index: plan.param_index,
+                }
+            });
         Ok(PreparedStatement {
             db: self.clone(),
             schema_cookie: runtime.catalog.schema_cookie,
             temp_schema_cookie: runtime.temp_schema_cookie,
             statement: Arc::clone(&statement),
             prepared_sql: prepared_sql.clone(),
+            simple_row_id_projection,
             prepared_insert,
             prepared_update,
             prepared_delete,
@@ -29282,6 +29362,22 @@ mod tests {
         assert_eq!(result.rows().len(), 3);
         assert_eq!(result.rows()[0].values(), &[Value::Text("u10".to_string())]);
         assert_eq!(result.rows()[2].values(), &[Value::Text("u12".to_string())]);
+
+        let lower_limit = db
+            .prepare("SELECT name FROM users WHERE id >= $1 LIMIT $2")
+            .expect("prepare lower-bound range lookup");
+        let result = lower_limit
+            .execute(&[Value::Int64(200), Value::Int64(2)])
+            .expect("execute lower-bound range lookup");
+        assert_eq!(result.rows().len(), 2);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[Value::Text("u200".to_string())]
+        );
+        assert_eq!(
+            result.rows()[1].values(),
+            &[Value::Text("u201".to_string())]
+        );
 
         let json_after = db
             .inspect_storage_state_json()
