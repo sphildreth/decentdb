@@ -1,8 +1,7 @@
-// DecentDB raw-engine baseline benchmark.
+// DecentDB rust-baseline benchmark.
 //
-// Mirrors the schema/queries used by the .NET AdoNet/MicroOrm/EfCore benchmark
-// suite at /tmp/tmp-opus47-decentdb-net-tests, but skips every layer above the
-// `decentdb` crate so the numbers represent the engine's theoretical ceiling.
+// Mirrors the schema and query shapes used by the music-library comparison
+// workload, with direct DecentDB and SQLite reference runners.
 //
 // Hot-path pattern (identical to the internal `decentdb-benchmark` scenarios):
 //   1. db.transaction()          -> SqlTransaction (exclusive runtime state)
@@ -12,8 +11,8 @@
 //
 // Scales mirror DecentDB.Compare.Common.Scale exactly.
 //
-// Output: pretty-printed JSON to results/<datetime>-rust-baseline-<scale>.json with the
-// same shape as RunReport so it can be diffed against the .NET reports.
+// Output: pretty-printed JSON to
+// results/<datetime>-rust-baseline-<profile>-<scale>.json.
 
 use std::fs;
 use std::fmt::Write as _;
@@ -23,10 +22,11 @@ use std::time::Instant;
 use anyhow::{bail, Context};
 use clap::{Parser, ValueEnum};
 use decentdb::{DbConfig, PreparedStatement, Value};
+use rusqlite::{params, Connection as SqliteConnection};
 use serde::{Deserialize, Serialize};
 
 #[derive(Parser, Debug)]
-#[command(version, about = "DecentDB raw-engine baseline benchmark")]
+#[command(version, about = "DecentDB rust-baseline benchmark")]
 struct Cli {
     /// Scale: smoke | medium | full | huge
     #[arg(long, default_value = "smoke")]
@@ -34,7 +34,7 @@ struct Cli {
     /// Output directory for JSON report.
     #[arg(long, default_value = "results")]
     out_dir: PathBuf,
-    /// Database path (defaults to ./run-rust-<scale>.ddb).
+    /// Database path (defaults by engine and scale).
     #[arg(long)]
     db_path: Option<PathBuf>,
     /// Seed for the deterministic plan.
@@ -43,12 +43,38 @@ struct Cli {
     /// Engine profile: default | resident-hot-read.
     #[arg(long, value_enum, default_value_t = BenchmarkProfile::Default)]
     profile: BenchmarkProfile,
+    /// Engine implementation: decentdb | sqlite.
+    #[arg(long, value_enum, default_value_t = BenchmarkEngine::DecentDb)]
+    engine: BenchmarkEngine,
     /// Generate an HTML report from historical JSON files in the output directory.
     #[arg(long)]
     report: bool,
     /// HTML output path for --report (defaults to <out-dir>/report.html).
     #[arg(long)]
     report_file: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum BenchmarkEngine {
+    #[value(name = "decentdb", alias = "decent-db")]
+    DecentDb,
+    Sqlite,
+}
+
+impl BenchmarkEngine {
+    fn binding_name(self) -> &'static str {
+        match self {
+            Self::DecentDb => "RustRaw",
+            Self::Sqlite => "SQLiteRusqlite",
+        }
+    }
+
+    fn default_db_path(self, scale: Scale) -> PathBuf {
+        match self {
+            Self::DecentDb => PathBuf::from(format!("run-rust-{}.ddb", scale.name)),
+            Self::Sqlite => PathBuf::from(format!("run-rust-sqlite-{}.db", scale.name)),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -565,13 +591,16 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     }
 
     let scale = parse_scale(&cli.scale);
+    if cli.engine == BenchmarkEngine::Sqlite && cli.profile != BenchmarkProfile::Default {
+        bail!("--profile is only supported for --engine decentdb");
+    }
     let db_path = cli
         .db_path
-        .unwrap_or_else(|| PathBuf::from(format!("run-rust-{}.ddb", scale.name)));
+        .unwrap_or_else(|| cli.engine.default_db_path(scale));
 
     println!(
-        "Summarizing seed plan: scale={} artists={} albums(target)={} songs_cap={}",
-        scale.name, scale.artists, scale.albums, scale.songs_cap
+        "Summarizing seed plan: engine={:?} scale={} artists={} albums(target)={} songs_cap={}",
+        cli.engine, scale.name, scale.artists, scale.albums, scale.songs_cap
     );
     let summary = summarize_seed_plan(scale, cli.seed);
     println!(
@@ -579,10 +608,14 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         scale.artists, summary.total_albums, summary.total_songs
     );
 
+    if cli.engine == BenchmarkEngine::Sqlite {
+        return run_sqlite_benchmark(scale, cli.seed, summary, db_path, cli.out_dir);
+    }
+
     delete_db_files(&db_path);
 
     let mut report = RunReport {
-        binding: "RustRaw".to_string(),
+        binding: cli.engine.binding_name().to_string(),
         scale_name: scale.name.to_string(),
         benchmark_profile: cli.profile.as_str().to_string(),
         target_artists: scale.artists,
@@ -766,7 +799,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     let datetime_stamp = format_unix_filename_stamp(report.finished_unix);
     let out_path = cli.out_dir.join(format!(
         "{datetime_stamp}-rust-baseline-{}-{}.json",
-        cli.profile.as_str(),
+        report.benchmark_profile.as_str(),
         scale.name
     ));
     fs::write(&out_path, serde_json::to_string_pretty(&report)?)?;
@@ -776,6 +809,327 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     println!("Cleaned up temp DB files: {}", db_path.display());
 
     Ok(())
+}
+
+fn run_sqlite_benchmark(
+    scale: Scale,
+    seed: u64,
+    summary: SeedSummary,
+    db_path: PathBuf,
+    out_dir: PathBuf,
+) -> anyhow::Result<()> {
+    delete_db_files(&db_path);
+
+    let mut report = RunReport {
+        binding: BenchmarkEngine::Sqlite.binding_name().to_string(),
+        scale_name: scale.name.to_string(),
+        benchmark_profile: "sqlite-wal-full".to_string(),
+        target_artists: scale.artists,
+        target_albums: scale.albums,
+        target_songs_cap: scale.songs_cap,
+        started_unix: now_unix(),
+        database_path: db_path.display().to_string(),
+        ..Default::default()
+    };
+    let mut rec = Recorder::new(&mut report);
+
+    let conn = rec.measure("connect_open", None, || {
+        open_sqlite_wal_full(&db_path).expect("open sqlite")
+    });
+    rec.report.engine_version = sqlite_engine_version(&conn).unwrap_or_else(|_| "unknown".into());
+
+    let ddl_batch = build_schema_ddl_batch();
+    rec.measure("schema_create", None, || {
+        conn.execute_batch(&ddl_batch).expect("sqlite ddl batch");
+    });
+
+    let mut insert_artist = conn
+        .prepare(
+            "INSERT INTO artists (id, name, country, formed_year) \
+             VALUES (?1, ?2, ?3, ?4)",
+        )
+        .expect("prepare sqlite artists");
+    rec.measure("seed_artists", Some(u64::from(scale.artists)), || {
+        seed_sqlite_artists(&conn, &mut insert_artist, scale, seed);
+    });
+    drop(insert_artist);
+
+    let mut insert_album = conn
+        .prepare(
+            "INSERT INTO albums (id, artist_id, title, release_year) \
+             VALUES (?1, ?2, ?3, ?4)",
+        )
+        .expect("prepare sqlite albums");
+    rec.measure("seed_albums", Some(summary.total_albums), || {
+        seed_sqlite_albums(&conn, &mut insert_album, scale, seed);
+    });
+    drop(insert_album);
+
+    let mut insert_song = conn
+        .prepare(
+            "INSERT INTO songs (id, album_id, artist_id, title, duration_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )
+        .expect("prepare sqlite songs");
+    rec.measure("seed_songs", Some(summary.total_songs), || {
+        seed_sqlite_songs(&conn, &mut insert_song, scale, seed);
+    });
+    drop(insert_song);
+
+    rec.measure("query_count_songs", None, || {
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM songs", [], |row| row.get(0))
+            .expect("sqlite count");
+        println!("    count=Some(Int64({count}))");
+    });
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM songs", [], |row| row.get(0))
+        .expect("sqlite count extra");
+    rec.add_extra("count", serde_json::json!(count));
+
+    rec.measure("query_aggregate_durations", None, || {
+        let row: (i64, i64, f64, i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), SUM(duration_ms), AVG(duration_ms), \
+                        MIN(duration_ms), MAX(duration_ms) FROM songs",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("sqlite aggregate durations");
+        println!("    agg_row={row:?}");
+    });
+
+    rec.measure("query_artist_by_id", None, || {
+        let target = i64::from(scale.artists) / 2 + 1;
+        let row: (i64, String, String, i64) = conn
+            .query_row(
+                "SELECT id, name, country, formed_year FROM artists WHERE id = ?1",
+                params![target],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("sqlite artist by id");
+        println!("    artist={row:?}");
+    });
+
+    rec.measure("query_top10_artists_by_songs", None, || {
+        let rows = sqlite_query_row_count(
+            &conn,
+            "SELECT a.id, a.name, COUNT(s.id) AS song_count
+             FROM artists a
+             JOIN songs s ON s.artist_id = a.id
+             GROUP BY a.id, a.name
+             ORDER BY song_count DESC
+             LIMIT 10",
+            [],
+        )
+        .expect("sqlite top10 artists");
+        println!("    rows={rows}");
+    });
+
+    rec.measure("query_top10_albums_by_songs", None, || {
+        let rows = sqlite_query_row_count(
+            &conn,
+            "SELECT al.id, al.title, COUNT(s.id) AS song_count
+             FROM albums al
+             JOIN songs s ON s.album_id = al.id
+             GROUP BY al.id, al.title
+             ORDER BY song_count DESC
+             LIMIT 10",
+            [],
+        )
+        .expect("sqlite top10 albums");
+        println!("    rows={rows}");
+    });
+
+    rec.measure("query_view_first_1000", None, || {
+        let rows = sqlite_query_row_count(
+            &conn,
+            "SELECT artist_id, artist_name, album_title, song_title \
+             FROM v_artist_songs LIMIT 1000",
+            [],
+        )
+        .expect("sqlite view 1000");
+        println!("    rows={rows}");
+    });
+
+    rec.measure("query_songs_for_artist_via_view", None, || {
+        let rows = sqlite_query_row_count(
+            &conn,
+            "SELECT album_title, song_title, duration_ms \
+             FROM v_artist_songs WHERE artist_id = ?1",
+            params![1_i64],
+        )
+        .expect("sqlite artist 1 view");
+        println!("    rows={rows}");
+    });
+
+    if let Ok(meta) = fs::metadata(&db_path) {
+        rec.report.database_size_bytes = meta.len();
+    }
+    if let Ok(meta) = fs::metadata(sqlite_wal_path(&db_path)) {
+        rec.report.wal_size_bytes = meta.len();
+    }
+    rec.report.finished_unix = now_unix();
+
+    fs::create_dir_all(&out_dir)?;
+    let datetime_stamp = format_unix_filename_stamp(rec.report.finished_unix);
+    let out_path = out_dir.join(format!(
+        "{datetime_stamp}-rust-baseline-{}-{}.json",
+        rec.report.benchmark_profile.as_str(),
+        scale.name
+    ));
+    fs::write(&out_path, serde_json::to_string_pretty(&rec.report)?)?;
+    println!("\nWrote {}", out_path.display());
+
+    drop(conn);
+    delete_db_files(&db_path);
+    println!("Cleaned up temp DB files: {}", db_path.display());
+
+    Ok(())
+}
+
+fn open_sqlite_wal_full(path: &Path) -> rusqlite::Result<SqliteConnection> {
+    let conn = SqliteConnection::open(path)?;
+    let journal_mode: String = conn.query_row("PRAGMA journal_mode=WAL;", [], |row| row.get(0))?;
+    assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+    conn.execute_batch(
+        "PRAGMA synchronous=FULL;
+         PRAGMA wal_autocheckpoint=0;",
+    )?;
+    let synchronous: i64 = conn.query_row("PRAGMA synchronous;", [], |row| row.get(0))?;
+    assert_eq!(synchronous, 2, "expected SQLite synchronous=FULL");
+    let wal_autocheckpoint: i64 =
+        conn.query_row("PRAGMA wal_autocheckpoint;", [], |row| row.get(0))?;
+    assert_eq!(
+        wal_autocheckpoint, 0,
+        "expected SQLite wal_autocheckpoint=0"
+    );
+    Ok(conn)
+}
+
+fn sqlite_engine_version(conn: &SqliteConnection) -> rusqlite::Result<String> {
+    conn.query_row("SELECT sqlite_version()", [], |row| row.get(0))
+}
+
+fn sqlite_wal_path(path: &Path) -> PathBuf {
+    let mut wal = path.as_os_str().to_owned();
+    wal.push("-wal");
+    PathBuf::from(wal)
+}
+
+fn seed_sqlite_artists(
+    conn: &SqliteConnection,
+    stmt: &mut rusqlite::Statement<'_>,
+    scale: Scale,
+    seed: u64,
+) {
+    conn.execute_batch("BEGIN IMMEDIATE;")
+        .expect("begin sqlite artists");
+    let mut artist_name = String::with_capacity(32);
+    walk_seed_plan_select(
+        scale,
+        seed,
+        SeedWalkEmit::ARTISTS,
+        |a| {
+            artist_name.clear();
+            artist_name.push_str("Artist ");
+            write!(&mut artist_name, "{}", a.id).expect("write artist name");
+            stmt.execute(params![a.id, artist_name.as_str(), a.country, a.formed_year])
+                .expect("sqlite insert artist");
+        },
+        |_| {},
+        |_| {},
+    );
+    conn.execute_batch("COMMIT;").expect("commit sqlite artists");
+}
+
+fn seed_sqlite_albums(
+    conn: &SqliteConnection,
+    stmt: &mut rusqlite::Statement<'_>,
+    scale: Scale,
+    seed: u64,
+) {
+    conn.execute_batch("BEGIN IMMEDIATE;")
+        .expect("begin sqlite albums");
+    let mut album_title = String::with_capacity(32);
+    walk_seed_plan_select(
+        scale,
+        seed,
+        SeedWalkEmit::ALBUMS,
+        |_| {},
+        |al| {
+            album_title.clear();
+            album_title.push_str("Album ");
+            write!(&mut album_title, "{}", al.id).expect("write album title");
+            stmt.execute(params![
+                al.id,
+                al.artist_id,
+                album_title.as_str(),
+                al.release_year
+            ])
+            .expect("sqlite insert album");
+        },
+        |_| {},
+    );
+    conn.execute_batch("COMMIT;").expect("commit sqlite albums");
+}
+
+fn seed_sqlite_songs(
+    conn: &SqliteConnection,
+    stmt: &mut rusqlite::Statement<'_>,
+    scale: Scale,
+    seed: u64,
+) {
+    conn.execute_batch("BEGIN IMMEDIATE;")
+        .expect("begin sqlite songs");
+    let mut song_title = String::with_capacity(32);
+    walk_seed_plan_select(
+        scale,
+        seed,
+        SeedWalkEmit::SONGS,
+        |_| {},
+        |_| {},
+        |s| {
+            song_title.clear();
+            song_title.push_str("Song ");
+            write!(&mut song_title, "{}", s.id).expect("write song title");
+            stmt.execute(params![
+                s.id,
+                s.album_id,
+                s.artist_id,
+                song_title.as_str(),
+                s.duration_ms
+            ])
+            .expect("sqlite insert song");
+        },
+    );
+    conn.execute_batch("COMMIT;").expect("commit sqlite songs");
+}
+
+fn sqlite_query_row_count<P: rusqlite::Params>(
+    conn: &SqliteConnection,
+    sql: &str,
+    params: P,
+) -> rusqlite::Result<usize> {
+    let mut stmt = conn.prepare(sql)?;
+    let column_count = stmt.column_count();
+    let mut rows = stmt.query(params)?;
+    let mut count = 0usize;
+    while let Some(row) = rows.next()? {
+        for index in 0..column_count {
+            let _: rusqlite::types::Value = row.get(index)?;
+        }
+        count += 1;
+    }
+    Ok(count)
 }
 
 fn seed_albums(db: &decentdb::Db, prepared: &PreparedStatement, scale: Scale, seed: u64) {

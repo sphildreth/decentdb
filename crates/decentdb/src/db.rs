@@ -3310,6 +3310,18 @@ impl Db {
                 }
                 if prepared.is_none() {
                     if let Some(result) = self
+                        .try_execute_indexed_join_grouped_count_query_at_snapshot(
+                            &runtime,
+                            query,
+                            params,
+                            snapshot_lsn,
+                        )?
+                    {
+                        drop(runtime);
+                        return self
+                            .finalize_row_source_autocommit_statement(statement, Ok(result));
+                    }
+                    if let Some(result) = self
                         .try_execute_simple_indexed_join_projection_query_at_snapshot(
                             &runtime,
                             statement,
@@ -6908,6 +6920,35 @@ impl Db {
         Some(())
     }
 
+    fn try_execute_indexed_join_grouped_count_query_at_snapshot(
+        &self,
+        runtime: &EngineRuntime,
+        query: &crate::sql::ast::Query,
+        params: &[Value],
+        snapshot_lsn: u64,
+    ) -> Result<Option<QueryResult>> {
+        if !runtime.has_deferred_tables() {
+            return Ok(None);
+        }
+        let Some(parent_table_name) =
+            runtime.indexed_join_grouped_count_parent_table_name(query, params)?
+        else {
+            return Ok(None);
+        };
+
+        let parent_table_name = parent_table_name.to_string();
+        let mut join_runtime = runtime.clone();
+        self.load_runtime_table_row_sources_at_snapshot(
+            &mut join_runtime,
+            &[parent_table_name.as_str()],
+            snapshot_lsn,
+        )?;
+        let result = join_runtime.try_execute_indexed_join_grouped_count_query(query, params);
+        drop(join_runtime);
+        self.release_freed_heap_after_paged_row_source_drop();
+        result
+    }
+
     fn try_execute_simple_indexed_join_projection_query_at_snapshot(
         &self,
         runtime: &EngineRuntime,
@@ -7024,6 +7065,16 @@ impl Db {
         }
         if !security_active && !*indexes_maybe_stale {
             if let SqlStatement::Query(query) = statement {
+                if let Some(result) = self
+                    .try_execute_indexed_join_grouped_count_query_at_snapshot(
+                        runtime,
+                        query,
+                        params,
+                        snapshot_lsn,
+                    )?
+                {
+                    return Ok(result);
+                }
                 if let Some(result) = self
                     .try_execute_simple_indexed_join_projection_query_at_snapshot(
                         runtime,
@@ -23266,6 +23317,215 @@ mod tests {
     }
 
     #[test]
+    fn paged_row_storage_view_filter_indexed_join_chain_keeps_deferred_tables_unloaded() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir
+            .path()
+            .join("paged-row-storage-view-filtered-join-chain.ddb");
+        let config = DbConfig {
+            paged_row_storage: true,
+            ..DbConfig::default()
+        };
+
+        {
+            let db = Db::open_or_create(&path, config.clone()).expect("open db");
+            db.execute("CREATE TABLE artists (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+                .expect("create artists");
+            db.execute(
+                "CREATE TABLE albums (id INTEGER PRIMARY KEY, artist_id INTEGER NOT NULL, title TEXT)",
+            )
+            .expect("create albums");
+            db.execute(
+                "CREATE TABLE songs (id INTEGER PRIMARY KEY, album_id INTEGER NOT NULL, title TEXT, duration_ms INTEGER NOT NULL)",
+            )
+            .expect("create songs");
+            db.execute("CREATE INDEX idx_albums_artist ON albums (artist_id)")
+                .expect("create albums artist index");
+            db.execute("CREATE INDEX idx_songs_album ON songs (album_id)")
+                .expect("create songs album index");
+            db.execute(
+                "CREATE VIEW v_artist_songs AS \
+                 SELECT a.id AS artist_id, a.name AS artist_name, al.title AS album_title, \
+                        s.title AS song_title, s.duration_ms AS duration_ms \
+                 FROM artists a JOIN albums al ON al.artist_id = a.id \
+                 JOIN songs s ON s.album_id = al.id",
+            )
+            .expect("create view");
+
+            db.execute("INSERT INTO artists (id, name) VALUES (1, 'a')")
+                .expect("insert artist 1");
+            db.execute("INSERT INTO artists (id, name) VALUES (2, 'b')")
+                .expect("insert artist 2");
+            db.execute("INSERT INTO albums (id, artist_id, title) VALUES (10, 1, 'a1')")
+                .expect("insert album 1");
+            db.execute("INSERT INTO albums (id, artist_id, title) VALUES (20, 2, 'b1')")
+                .expect("insert album 2");
+            db.execute(
+                "INSERT INTO songs (id, album_id, title, duration_ms) VALUES (100, 10, 's1', 1000)",
+            )
+            .expect("insert song 1");
+            db.execute(
+                "INSERT INTO songs (id, album_id, title, duration_ms) VALUES (101, 10, 's2', 2000)",
+            )
+            .expect("insert song 2");
+            db.execute(
+                "INSERT INTO songs (id, album_id, title, duration_ms) VALUES (200, 20, 's3', 3000)",
+            )
+            .expect("insert song 3");
+            db.checkpoint().expect("checkpoint");
+        }
+
+        let db = Db::open_or_create(&path, config).expect("reopen db");
+        let json_before = db
+            .inspect_storage_state_json()
+            .expect("json before view query");
+        assert!(
+            json_before.contains("\"loaded_table_count\":0"),
+            "expected view base tables to start deferred, got: {json_before}"
+        );
+        assert!(
+            json_before.contains("\"deferred_table_count\":3"),
+            "expected all view base tables deferred at reopen, got: {json_before}"
+        );
+
+        let result = db
+            .execute_with_params(
+                "SELECT album_title, song_title, duration_ms \
+                 FROM v_artist_songs WHERE artist_id = $1",
+                &[Value::Int64(1)],
+            )
+            .expect("view filtered join query");
+        assert_eq!(result.rows().len(), 2);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[
+                Value::Text("a1".to_string()),
+                Value::Text("s1".to_string()),
+                Value::Int64(1000)
+            ]
+        );
+        assert_eq!(
+            result.rows()[1].values(),
+            &[
+                Value::Text("a1".to_string()),
+                Value::Text("s2".to_string()),
+                Value::Int64(2000)
+            ]
+        );
+
+        let json_after = db
+            .inspect_storage_state_json()
+            .expect("json after view query");
+        assert!(
+            json_after.contains("\"loaded_table_count\":0"),
+            "expected deferred view filtered join to avoid resident table materialization, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"deferred_table_count\":3"),
+            "expected deferred view filtered join to leave base tables deferred, got: {json_after}"
+        );
+    }
+
+    #[test]
+    fn paged_row_storage_view_limit_indexed_join_chain_keeps_deferred_tables_unloaded() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir
+            .path()
+            .join("paged-row-storage-view-limit-join-chain.ddb");
+        let config = DbConfig {
+            paged_row_storage: true,
+            ..DbConfig::default()
+        };
+
+        {
+            let db = Db::open_or_create(&path, config.clone()).expect("open db");
+            db.execute("CREATE TABLE artists (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+                .expect("create artists");
+            db.execute(
+                "CREATE TABLE albums (id INTEGER PRIMARY KEY, artist_id INTEGER NOT NULL, title TEXT)",
+            )
+            .expect("create albums");
+            db.execute(
+                "CREATE TABLE songs (id INTEGER PRIMARY KEY, album_id INTEGER NOT NULL, title TEXT, duration_ms INTEGER NOT NULL)",
+            )
+            .expect("create songs");
+            db.execute("CREATE INDEX idx_albums_artist ON albums (artist_id)")
+                .expect("create albums artist index");
+            db.execute("CREATE INDEX idx_songs_album ON songs (album_id)")
+                .expect("create songs album index");
+            db.execute(
+                "CREATE VIEW v_artist_songs AS \
+                 SELECT a.id AS artist_id, a.name AS artist_name, al.title AS album_title, \
+                        s.title AS song_title, s.duration_ms AS duration_ms \
+                 FROM artists a JOIN albums al ON al.artist_id = a.id \
+                 JOIN songs s ON s.album_id = al.id",
+            )
+            .expect("create view");
+
+            db.execute("INSERT INTO artists (id, name) VALUES (1, 'a')")
+                .expect("insert artist 1");
+            db.execute("INSERT INTO artists (id, name) VALUES (2, 'b')")
+                .expect("insert artist 2");
+            db.execute("INSERT INTO albums (id, artist_id, title) VALUES (10, 1, 'a1')")
+                .expect("insert album 1");
+            db.execute("INSERT INTO albums (id, artist_id, title) VALUES (20, 2, 'b1')")
+                .expect("insert album 2");
+            db.execute(
+                "INSERT INTO songs (id, album_id, title, duration_ms) VALUES (100, 10, 's1', 1000)",
+            )
+            .expect("insert song 1");
+            db.execute(
+                "INSERT INTO songs (id, album_id, title, duration_ms) VALUES (101, 10, 's2', 2000)",
+            )
+            .expect("insert song 2");
+            db.execute(
+                "INSERT INTO songs (id, album_id, title, duration_ms) VALUES (200, 20, 's3', 3000)",
+            )
+            .expect("insert song 3");
+            db.checkpoint().expect("checkpoint");
+        }
+
+        let db = Db::open_or_create(&path, config).expect("reopen db");
+        let result = db
+            .execute(
+                "SELECT artist_id, artist_name, album_title, song_title \
+                 FROM v_artist_songs LIMIT 2",
+            )
+            .expect("view limit query");
+        assert_eq!(result.rows().len(), 2);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[
+                Value::Int64(1),
+                Value::Text("a".to_string()),
+                Value::Text("a1".to_string()),
+                Value::Text("s1".to_string())
+            ]
+        );
+        assert_eq!(
+            result.rows()[1].values(),
+            &[
+                Value::Int64(1),
+                Value::Text("a".to_string()),
+                Value::Text("a1".to_string()),
+                Value::Text("s2".to_string())
+            ]
+        );
+
+        let json_after = db
+            .inspect_storage_state_json()
+            .expect("json after view limit query");
+        assert!(
+            json_after.contains("\"loaded_table_count\":0"),
+            "expected deferred view limit to avoid resident table materialization, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"deferred_table_count\":3"),
+            "expected deferred view limit to leave base tables deferred, got: {json_after}"
+        );
+    }
+
+    #[test]
     fn paged_row_storage_indexed_join_order_limit_offset_keeps_deferred_tables_unloaded() {
         let tempdir = TempDir::new().expect("tempdir");
         let path = tempdir
@@ -26693,6 +26953,86 @@ mod tests {
         assert!(
             json_after.contains("\"rows_in_memory_count\":0"),
             "expected zero resident rows after paged grouped count, got: {json_after}"
+        );
+    }
+
+    #[test]
+    fn paged_row_storage_indexed_join_grouped_count_keeps_deferred_tables_unloaded() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir
+            .path()
+            .join("paged-row-storage-indexed-join-grouped-count.ddb");
+        let config = DbConfig {
+            paged_row_storage: true,
+            ..DbConfig::default()
+        };
+
+        {
+            let db = Db::open_or_create(&path, config.clone()).expect("create db");
+            db.execute("CREATE TABLE artists (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+                .expect("create artists");
+            db.execute(
+                "CREATE TABLE songs (id INTEGER PRIMARY KEY, artist_id INTEGER NOT NULL, title TEXT, body TEXT)",
+            )
+            .expect("create songs");
+            db.execute("CREATE INDEX idx_songs_artist ON songs (artist_id)")
+                .expect("create song artist index");
+            db.execute("INSERT INTO artists (id, name) VALUES (1, 'a')")
+                .expect("insert artist 1");
+            db.execute("INSERT INTO artists (id, name) VALUES (2, 'b')")
+                .expect("insert artist 2");
+            let large_body = "x".repeat(2048);
+            for (id, artist_id) in [(1, 1), (2, 1), (3, 2)] {
+                db.execute_with_params(
+                    "INSERT INTO songs (id, artist_id, title, body) VALUES ($1, $2, $3, $4)",
+                    &[
+                        Value::Int64(id),
+                        Value::Int64(artist_id),
+                        Value::Text(format!("s{id}")),
+                        Value::Text(large_body.clone()),
+                    ],
+                )
+                .expect("insert song");
+            }
+            db.checkpoint().expect("checkpoint");
+        }
+
+        let db = Db::open_or_create(&path, config).expect("reopen with paged storage");
+        let result = db
+            .execute(
+                "SELECT a.id, a.name, COUNT(s.id) AS song_count \
+                 FROM artists a JOIN songs s ON s.artist_id = a.id \
+                 GROUP BY a.id, a.name ORDER BY song_count DESC LIMIT 10",
+            )
+            .expect("indexed grouped count");
+        assert_eq!(result.rows().len(), 2);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[
+                Value::Int64(1),
+                Value::Text("a".to_string()),
+                Value::Int64(2)
+            ]
+        );
+        assert_eq!(
+            result.rows()[1].values(),
+            &[
+                Value::Int64(2),
+                Value::Text("b".to_string()),
+                Value::Int64(1)
+            ]
+        );
+
+        let json_after = db
+            .inspect_storage_state_json()
+            .expect("json after indexed grouped count");
+        assert!(
+            json_after.contains("\"loaded_table_count\":0"),
+            "expected indexed grouped count to use cloned row sources only, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"deferred_table_count\":2"),
+            "expected base tables to remain deferred after indexed grouped count, got: {json_after}"
         );
     }
 

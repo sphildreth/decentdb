@@ -1,7 +1,14 @@
-# DecentDB raw-engine baseline benchmark
+# DecentDB rust-baseline benchmark
 
-This is a **raw Rust baseline** for the same benchmark suite the .NET tests
-in `..` exercise. It links the `decentdb` crate directly (path-dep against
+This benchmark is the apples-to-apples Rust runner for the music-library
+workload used to compare DecentDB against SQLite. By default it runs DecentDB
+directly through the Rust crate. With `--engine sqlite`, it runs the same schema,
+seed plan, and query shapes through `rusqlite`.
+
+The SQLite path exists only in this benchmark crate. It does not add SQLite
+tests, dependencies, or comparison behavior to the DecentDB engine core.
+
+The default DecentDB path links the `decentdb` crate directly (path-dep against
 `../../crates/decentdb`) and uses the engine's hot-path API:
 
 - `Db::create()` to make a fresh database
@@ -13,6 +20,11 @@ in `..` exercise. It links the `decentdb` crate directly (path-dep against
 There is **no FFI, no marshalling, no LINQ, no parameter rewriter**, and no
 ADO.NET command/connection layer — so the timings here represent the
 theoretical engine ceiling that any binding could approach but never beat.
+
+The SQLite path uses `rusqlite` against the same generated workload, with
+`journal_mode=WAL`, `synchronous=FULL`, and `wal_autocheckpoint=0`. Each seed
+phase runs in one explicit `BEGIN IMMEDIATE` transaction, and query timing
+materializes every returned column before counting a row.
 
 ## Schema and queries
 
@@ -44,20 +56,45 @@ counts are reported as `Plan: artists=… total_albums=… total_songs=…`.
 ## Build & run
 
 ```bash
-cd /home/steven/source/decentdb/benchmarks/rust-baseline
+cd /home/steven/src/github/decentdb/benchmarks/rust-baseline
 cargo build --release
-./target/release/rust-baseline --scale smoke
-./target/release/rust-baseline --scale medium
-./target/release/rust-baseline --scale full
-./target/release/rust-baseline --scale huge
-./target/release/rust-baseline --scale full --profile resident-hot-read
+./target/release/rust-baseline --engine decentdb --scale smoke
+./target/release/rust-baseline --engine decentdb --scale medium
+./target/release/rust-baseline --engine decentdb --scale full
+./target/release/rust-baseline --engine decentdb --scale huge
+./target/release/rust-baseline --engine sqlite --scale smoke
+./target/release/rust-baseline --engine decentdb --scale full --profile resident-hot-read
 ./target/release/rust-baseline --report
 ./target/release/rust-baseline --report --report-file /tmp/rust-baseline-report.html
 ```
 
+To run the full DecentDB-vs-SQLite comparison into a temporary output
+directory, use:
+
+```bash
+cd /home/steven/src/github/decentdb/benchmarks/rust-baseline
+cargo build --release
+OUT="$PWD/../../.tmp/rust-baseline-compare/results"
+DBS="$PWD/../../.tmp/rust-baseline-compare/dbs"
+mkdir -p "$OUT" "$DBS"
+for scale in smoke medium full huge; do
+  ./target/release/rust-baseline \
+    --engine decentdb \
+    --scale "$scale" \
+    --out-dir "$OUT" \
+    --db-path "$DBS/run-decentdb-$scale.ddb"
+  ./target/release/rust-baseline \
+    --engine sqlite \
+    --scale "$scale" \
+    --out-dir "$OUT" \
+    --db-path "$DBS/run-sqlite-$scale.db"
+done
+```
+
 ## Profiles
 
-The default profile uses `DbConfig::default()`: durable WAL, deferred table
+`--profile` applies only to `--engine decentdb`. The default profile uses
+`DbConfig::default()`: durable WAL, deferred table
 materialization, and paged row storage with post-commit re-deferral. It is the
 low-memory profile and should remain the default historical comparison.
 
@@ -68,21 +105,31 @@ sources resident after commit instead of dropping them back to the deferred set.
 This is a fair profile only when reported separately from default because it
 trades higher process memory for lower repeated read cost.
 
+SQLite runs always use benchmark profile `sqlite-wal-full` and reject
+DecentDB-only profiles.
+
 ## Results
 
 JSON reports are written to
 `results/<datetime>-rust-baseline-<profile>-<scale>.json` where `<datetime>` is
-`YYYY-MM-DD-HHMM` (e.g., `2026-04-26-1430`). Older checked-in reports omit the
-profile segment and are treated as the default profile. This timestamped naming
-enables historical comparisons across multiple runs:
+`YYYY-MM-DD-HHMM` (e.g., `2026-04-26-1430`). DecentDB default runs use
+`default`; tuned DecentDB runs use their selected profile name; SQLite runs use
+`sqlite-wal-full`. Older checked-in reports omit the profile segment and are
+treated as the default profile. This timestamped naming enables historical
+comparisons across multiple runs:
 
 ```
 results/
 ├── 2026-03-24-1200-rust-baseline-full.json
-├── 2026-04-01-0900-rust-baseline-full.json
-├── 2026-04-26-1430-rust-baseline-full.json
+├── 2026-04-26-1430-rust-baseline-default-full.json
+├── 2026-06-11-1215-rust-baseline-sqlite-wal-full-full.json
 └── ...
 ```
+
+Each JSON report records `binding`, `benchmark_profile`, `engine_version`,
+database/WAL size, peak RSS, total runtime, and every instrumented step. Use
+`binding` to separate DecentDB (`RustRaw`) from SQLite (`SQLiteRusqlite`) when
+comparing runs programmatically.
 
 ### Historical HTML report
 
@@ -101,18 +148,6 @@ The generated report includes:
   improvements are easy to spot over time
 
 Use `--report-file <path>` with `--report` to override the output path.
-
-## Headline numbers (engine 2.3.1, scale=`full`, ≈2.75M songs)
-
-| metric                       | RustRaw   |
-|------------------------------|----------:|
-| `seed_artists` r/s           |   792,664 |
-| `seed_albums` r/s            |   786,594 |
-| `seed_songs`  r/s            |   672,241 |
-| `seed_songs` slowdown vs raw |    1.00×  |
-| `query_top10_albums` (s)     |     3.235 |
-| peak RSS                     |    2.2 GB |
-| DB size                      |  144.9 MB |
 
 ## Engine memory observation (worth filing)
 
