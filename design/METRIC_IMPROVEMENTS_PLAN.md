@@ -107,11 +107,80 @@ Important rust-baseline wins to protect:
 | full | 1.88x | 232.10x | 4.96x | 15.54x | 2.77x |
 | huge | 1.15x | 1504.83x | 3.80x | 12.77x | 2.93x |
 
+## 2026-06-11 Worktree Update: Point Lookup
+
+Implemented worktree optimizations for the point-lookup priority:
+
+- Cache prepared row-id projection metadata so prepared point reads do not
+  resolve projection columns on every execution.
+- Add an `execute_with_params` single-statement fast path before batch splitting
+  for simple `SELECT ... WHERE rowid_alias = $n` and `COUNT(*)` queries.
+- Use the existing identity-hashed `Int64Map` for deferred paged row locators.
+- Retain a bounded 8 MiB per-table cache of already verified paged chunk
+  payloads in `DeferredPagedRowLocatorCache`, avoiding repeated overflow reads
+  and CRC checks for small dimension tables.
+- Avoid a lowercased SQL allocation in the simple row-id parser.
+- Avoid common-path security-table allocation and duplicate runtime read locks.
+- Move decoded owned rows directly into `QueryRow` for identity projections.
+- Split validated and resolved simple row-id execution so the unprepared fast
+  path does not repeat table/view/temp/generated-column validation.
+
+Validation run:
+
+- `cargo fmt --check`
+- `cargo check -p decentdb`
+- `cargo clippy -p decentdb --all-targets --all-features -- -D warnings`
+- `cargo test -p decentdb prepared_row_id_point_lookup_keeps_deferred_table_unloaded -- --nocapture`
+- `cargo test -p decentdb prepared_row_id_range_uses_deferred_locator_cache -- --nocapture`
+- `cargo test -p decentdb fast_path -- --nocapture`
+
+Rust-baseline all-scale comparison from
+`.tmp/rust-baseline-point-lookup-20260611-final/results`:
+
+| Scale | Original DecentDB `query_artist_by_id` | Current DecentDB | Current SQLite | SQLite / DecentDB | DecentDB change vs original | Status |
+|---|---:|---:|---:|---:|---:|---|
+| smoke | 48.66 us | 23.98 us | 22.87 us | 0.95x | -50.7% | Large improvement; not a clean SQLite win |
+| medium | 73.21 us | 35.33 us | 42.77 us | 1.21x | -51.7% | DecentDB wins this run |
+| full | 89.72 us | 39.34 us | 61.94 us | 1.57x | -56.1% | DecentDB wins this run |
+| huge | 87.37 us | 41.16 us | 90.31 us | 2.19x | -52.9% | DecentDB wins this run |
+
+Smoke repeat check from
+`.tmp/rust-baseline-point-lookup-20260611-smoke-repeats-v6`:
+
+| Engine | Runs | Median | Q1 | Q3 | Interpretation |
+|---|---:|---:|---:|---:|---|
+| DecentDB | 24 | 23.83 us | 22.87 us | 26.08 us | Much improved but still behind SQLite median |
+| SQLite | 24 | 20.58 us | 19.46 us | 22.53 us | Still faster on tiny fixed-overhead smoke lookup |
+
+Current point-lookup status:
+
+- The original rust-baseline DecentDB point lookup was improved by roughly
+  51-56% on medium/full and 53% on huge, now beating SQLite by 1.21x, 1.57x,
+  and 2.19x respectively in the latest all-scale run.
+- Smoke improved by roughly 51%, but median smoke still trails SQLite by about
+  14% in repeated runs. The remaining gap is fixed per-query overhead rather
+  than row retrieval from storage.
+- The public `embedded_compare` chart benchmark has not been rerun for this
+  worktree update yet. Because the prepared path was optimized, `read_p95_ms`
+  should be rerun before marking priority 1 complete.
+
+Next point-lookup follow-ups:
+
+- Profile the remaining fixed overhead in `begin_reader_with_pager`,
+  `refresh_engine_from_snapshot`, security rule checks, and result construction
+  before attempting a more invasive change.
+- Add selective row decoding for partial projections such as public
+  `SELECT name FROM users WHERE id = $1`; this should help public
+  `read_p95_ms` more than rust-baseline `query_artist_by_id`, which projects
+  every `artists` column.
+- Rerun `cargo bench -p decentdb --bench embedded_compare` and update the
+  public README metric table before declaring point lookup complete.
+
 ## Recommended Priority Order
 
 | Rank | Priority metric / area | Public chart coverage | Rust-baseline coverage | Baseline status | Target |
 |---:|---|---|---|---|---|
-| 1 | Point lookup latency | `read_p95_ms` | `query_artist_by_id` | Tuned public row wins, balanced loses, rust-baseline still slightly loses at all scales | Improve core point lookup latency; keep tuned ahead and close rust-baseline gap |
+| 1 | Point lookup latency | `read_p95_ms` | `query_artist_by_id` | Worktree now wins rust-baseline medium/full/huge and cuts smoke roughly in half, but smoke median still trails SQLite; public chart rerun pending | Finish fixed-overhead work, rerun public benchmark, keep tuned ahead and close smoke gap |
 | 2 | Range scan latency | `range_scan_p95_ms` | Partial overlap through indexed scans and view paths | Tuned public row is 0.89x vs SQLite | Bring tuned above 1.00x vs SQLite and reduce balanced gap |
 | 3 | Join and view lookup latency | `join_p95_ms` | `query_view_first_1000`, `query_songs_for_artist_via_view` | Tuned public row is 0.96x; rust-baseline view paths lose strongly | Bring public join above 1.00x and reduce view-path latency materially |
 | 4 | Durable commit latency | `commit_p95_ms` | Not directly represented in rust-baseline totals | Tuned public row wins narrowly at 1.06x | Protect or improve without weakening ACID guarantees |

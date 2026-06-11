@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockWriteGuard, Weak};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak};
 use std::time::{Duration, SystemTime};
 
 #[cfg(feature = "bench-internals")]
@@ -21,11 +21,14 @@ use crate::catalog::{
 };
 use crate::config::{DbConfig, ProcessCoordinationMode, WalSyncMode};
 use crate::error::{DbError, Result};
-use crate::exec::dml::{PreparedSimpleDelete, PreparedSimpleInsert, PreparedSimpleUpdate};
+use crate::exec::dml::{
+    row_id_alias_column_name, PreparedSimpleDelete, PreparedSimpleInsert, PreparedSimpleUpdate,
+};
 use crate::exec::{
     decode_paged_table_manifest_payload, read_table_payload_row_count_from_bytes,
     row_satisfies_expression, statement_is_read_only, BulkLoadOptions, EngineRuntime, QueryResult,
-    QueryRow, RuntimeIndex, SimpleRowIdProjectionRequest, TableData,
+    QueryRow, ResolvedSimpleRowIdProjectionRequest, RuntimeIndex, SimpleRowIdProjectionRequest,
+    TableData,
 };
 use crate::metadata::{
     CheckConstraintInfo, ColumnInfo, ForeignKeyInfo, HeaderInfo, IndexInfo, IndexVerification,
@@ -187,8 +190,8 @@ pub struct PreparedStatement {
 #[derive(Clone, Debug)]
 struct PreparedSimpleRowIdProjection {
     table_name: String,
-    projection_columns: Vec<String>,
-    filter_column: String,
+    projection_indexes: Vec<usize>,
+    column_names: Vec<String>,
     param_index: usize,
 }
 
@@ -1475,6 +1478,31 @@ impl Db {
 
     /// Executes a single SQL statement with positional `$n` parameters.
     pub fn execute_with_params(&self, sql: &str, params: &[Value]) -> Result<QueryResult> {
+        if let Some(trimmed) = simple_single_statement_fast_path_sql(sql) {
+            if let Some(result) = self.try_execute_simple_count_sql_fast_path(trimmed, params)? {
+                self.record_statement_trace(
+                    trimmed,
+                    true,
+                    std::time::Duration::ZERO,
+                    0,
+                    Ok(&result),
+                );
+                return Ok(result);
+            }
+            if let Some(result) =
+                self.try_execute_simple_row_id_projection_sql_fast_path(trimmed, params)?
+            {
+                self.record_statement_trace(
+                    trimmed,
+                    true,
+                    std::time::Duration::ZERO,
+                    0,
+                    Ok(&result),
+                );
+                return Ok(result);
+            }
+        }
+
         let mut results = self.execute_batch_with_params(sql, params)?;
         if results.len() != 1 {
             return Err(DbError::sql(format!(
@@ -2209,14 +2237,9 @@ impl Db {
         let reader = self.inner.wal.begin_reader_with_pager(&self.inner.pager)?;
         let snapshot_lsn = reader.snapshot_lsn();
         self.refresh_engine_from_snapshot(snapshot_lsn)?;
-        if self.ensure_security_tables_loaded_at_snapshot(snapshot_lsn)? {
+        let Some(runtime) = self.runtime_read_for_fast_read_at_snapshot(snapshot_lsn)? else {
             return Ok(None);
-        }
-        let runtime = self
-            .inner
-            .engine
-            .read()
-            .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+        };
         let Some(table) = runtime.catalog.table(plan.table_name) else {
             return Ok(None);
         };
@@ -2262,14 +2285,9 @@ impl Db {
         let reader = self.inner.wal.begin_reader_with_pager(&self.inner.pager)?;
         let snapshot_lsn = reader.snapshot_lsn();
         self.refresh_engine_from_snapshot(snapshot_lsn)?;
-        if self.ensure_security_tables_loaded_at_snapshot(snapshot_lsn)? {
+        let Some(runtime) = self.runtime_read_for_fast_read_at_snapshot(snapshot_lsn)? else {
             return Ok(None);
-        }
-        let runtime = self
-            .inner
-            .engine
-            .read()
-            .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+        };
         let result =
             runtime.execute_simple_row_id_projection_at_snapshot(SimpleRowIdProjectionRequest {
                 table_name: plan.table_name,
@@ -4311,35 +4329,26 @@ impl Db {
         let reader = self.inner.wal.begin_reader_with_pager(&self.inner.pager)?;
         let snapshot_lsn = reader.snapshot_lsn();
         self.refresh_engine_from_snapshot(snapshot_lsn)?;
-        if self.ensure_security_tables_loaded_at_snapshot(snapshot_lsn)? {
+        let Some(runtime) = self.runtime_read_for_fast_read_at_snapshot(snapshot_lsn)? else {
             return Ok(None);
-        }
-        let runtime = self
-            .inner
-            .engine
-            .read()
-            .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+        };
         self.validate_prepared_schema_cookie(
             prepared,
             runtime.catalog.schema_cookie,
             runtime.temp_schema_cookie,
         )?;
-        let projection_columns = plan
-            .projection_columns
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>();
-        let result =
-            runtime.execute_simple_row_id_projection_at_snapshot(SimpleRowIdProjectionRequest {
+        let result = runtime.execute_resolved_simple_row_id_projection_at_snapshot(
+            ResolvedSimpleRowIdProjectionRequest {
                 table_name: plan.table_name.as_str(),
-                projection_columns: &projection_columns,
-                filter_column: plan.filter_column.as_str(),
+                projection_indexes: &plan.projection_indexes,
+                column_names: &plan.column_names,
                 lookup_row_id: *lookup_row_id,
                 pager: &self.inner.pager,
                 wal: &self.inner.wal,
                 snapshot_lsn,
                 use_persistent_pk_index: self.inner.config.persistent_pk_index,
-            })?;
+            },
+        )?;
         drop(runtime);
         drop(reader);
         Ok(result)
@@ -5648,18 +5657,7 @@ impl Db {
             _ => (None, None, None),
         };
         let simple_row_id_projection =
-            parse_simple_row_id_projection_sql(&prepared_sql).map(|plan| {
-                PreparedSimpleRowIdProjection {
-                    table_name: plan.table_name.to_string(),
-                    projection_columns: plan
-                        .projection_columns
-                        .into_iter()
-                        .map(str::to_string)
-                        .collect(),
-                    filter_column: plan.filter_column.to_string(),
-                    param_index: plan.param_index,
-                }
-            });
+            Self::prepared_simple_row_id_projection(&prepared_sql, runtime);
         Ok(PreparedStatement {
             db: self.clone(),
             schema_cookie: runtime.catalog.schema_cookie,
@@ -5671,6 +5669,46 @@ impl Db {
             prepared_update,
             prepared_delete,
             read_only,
+        })
+    }
+
+    fn prepared_simple_row_id_projection(
+        sql: &str,
+        runtime: &EngineRuntime,
+    ) -> Option<PreparedSimpleRowIdProjection> {
+        let plan = parse_simple_row_id_projection_sql(sql)?;
+        if runtime.temp_table_schema(plan.table_name).is_some()
+            || runtime
+                .catalog
+                .views
+                .keys()
+                .any(|view_name| identifiers_equal(view_name, plan.table_name))
+        {
+            return None;
+        }
+        let table = runtime.catalog.table(plan.table_name)?;
+        if !row_id_alias_column_name(table)
+            .is_some_and(|column_name| identifiers_equal(column_name, plan.filter_column))
+        {
+            return None;
+        }
+
+        let mut projection_indexes = Vec::with_capacity(plan.projection_columns.len());
+        let mut column_names = Vec::with_capacity(plan.projection_columns.len());
+        for projection_column in plan.projection_columns {
+            let index = table
+                .columns
+                .iter()
+                .position(|column| identifiers_equal(&column.name, projection_column))?;
+            projection_indexes.push(index);
+            column_names.push(projection_column.to_string());
+        }
+
+        Some(PreparedSimpleRowIdProjection {
+            table_name: table.name.clone(),
+            projection_indexes,
+            column_names,
+            param_index: plan.param_index,
         })
     }
 
@@ -6278,7 +6316,6 @@ impl Db {
         names: &[&str],
         snapshot_lsn: Option<u64>,
     ) -> Result<()> {
-        let filter: BTreeSet<String> = names.iter().map(|s| s.to_string()).collect();
         {
             let runtime = self
                 .inner
@@ -6295,6 +6332,7 @@ impl Db {
                 return Ok(());
             }
         }
+        let filter: BTreeSet<String> = names.iter().map(|s| s.to_string()).collect();
         let mut runtime = self
             .inner
             .engine
@@ -6340,6 +6378,46 @@ impl Db {
             crate::security::POLICIES_TABLE,
             crate::security::MASKS_TABLE,
         ]
+    }
+
+    fn runtime_has_deferred_security_tables(runtime: &EngineRuntime) -> bool {
+        runtime.has_deferred_tables()
+            && Self::security_catalog_table_names().iter().any(|name| {
+                runtime
+                    .deferred_table_names()
+                    .any(|candidate| candidate.eq_ignore_ascii_case(name))
+            })
+    }
+
+    fn runtime_read_for_fast_read_at_snapshot(
+        &self,
+        snapshot_lsn: u64,
+    ) -> Result<Option<RwLockReadGuard<'_, EngineRuntime>>> {
+        let runtime = self
+            .inner
+            .engine
+            .read()
+            .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+        if Self::runtime_has_deferred_security_tables(&runtime) {
+            drop(runtime);
+            self.ensure_tables_loaded_at_snapshot(
+                &Self::security_catalog_table_names(),
+                Some(snapshot_lsn),
+            )?;
+            let runtime = self
+                .inner
+                .engine
+                .read()
+                .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+            if runtime.security_rules_active()? {
+                return Ok(None);
+            }
+            return Ok(Some(runtime));
+        }
+        if runtime.security_rules_active()? {
+            return Ok(None);
+        }
+        Ok(Some(runtime))
     }
 
     fn ensure_security_tables_loaded_at_snapshot(&self, snapshot_lsn: u64) -> Result<bool> {
@@ -13951,6 +14029,18 @@ struct SimpleRowIdProjectionSqlPlan<'a> {
     param_index: usize,
 }
 
+fn simple_single_statement_fast_path_sql(sql: &str) -> Option<&str> {
+    let trimmed = sql.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let trimmed = trimmed.strip_suffix(';').unwrap_or(trimmed).trim_end();
+    if trimmed.is_empty() || trimmed.contains(';') {
+        return None;
+    }
+    Some(trimmed)
+}
+
 fn parse_simple_count_star_sql(sql: &str) -> Option<SimpleCountSqlPlan<'_>> {
     const PREFIX: &str = "select count(*) from ";
     let trimmed = sql.trim();
@@ -13972,18 +14062,17 @@ fn parse_simple_row_id_projection_sql(sql: &str) -> Option<SimpleRowIdProjection
     if !trimmed.is_ascii() {
         return None;
     }
-    let lower = trimmed.to_ascii_lowercase();
-    if !lower.starts_with("select ") {
+    if trimmed.len() <= 7 || !trimmed[..7].eq_ignore_ascii_case("select ") {
         return None;
     }
-    let from_index = lower.find(" from ")?;
+    let from_index = find_ascii_case_insensitive(trimmed, " from ")?;
     let where_marker = " where ";
-    let where_index = lower[from_index + 6..]
-        .find(where_marker)
+    let where_index = find_ascii_case_insensitive(&trimmed[from_index + 6..], where_marker)
         .map(|index| from_index + 6 + index)?;
-    if lower[where_index + where_marker.len()..].contains(" order ")
-        || lower[where_index + where_marker.len()..].contains(" limit ")
-        || lower[where_index + where_marker.len()..].contains(" group ")
+    let filter_tail = &trimmed[where_index + where_marker.len()..];
+    if contains_ascii_case_insensitive(filter_tail, " order ")
+        || contains_ascii_case_insensitive(filter_tail, " limit ")
+        || contains_ascii_case_insensitive(filter_tail, " group ")
     {
         return None;
     }
@@ -14021,6 +14110,28 @@ fn parse_simple_row_id_projection_sql(sql: &str) -> Option<SimpleRowIdProjection
         filter_column,
         param_index,
     })
+}
+
+fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .position(|window| ascii_bytes_eq_ignore_ascii_case(window, needle.as_bytes()))
+}
+
+fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
+    find_ascii_case_insensitive(haystack, needle).is_some()
+}
+
+fn ascii_bytes_eq_ignore_ascii_case(left: &[u8], right: &[u8]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right.iter())
+            .all(|(left, right)| left.eq_ignore_ascii_case(right))
 }
 
 fn parse_positional_param(sql: &str) -> Option<usize> {
@@ -16272,8 +16383,9 @@ mod tests {
     use crate::{BulkLoadOptions, Db, QueuedWriteOptions, Value, WalSyncMode};
 
     use super::{
-        parse_simple_count_star_sql, parse_simple_row_id_projection_sql, split_sql_batch,
-        PreparedInsertCache, StatementCache, TempSchemaState,
+        parse_simple_count_star_sql, parse_simple_row_id_projection_sql,
+        simple_single_statement_fast_path_sql, split_sql_batch, PreparedInsertCache,
+        StatementCache, TempSchemaState,
     };
 
     #[derive(Debug)]
@@ -16516,6 +16628,17 @@ mod tests {
             "SELECT id, upper(name) FROM artists WHERE id = $1"
         )
         .is_none());
+    }
+
+    #[test]
+    fn single_statement_fast_path_accepts_optional_trailing_semicolon_only() {
+        assert_eq!(
+            simple_single_statement_fast_path_sql(" SELECT id FROM artists WHERE id = $1; "),
+            Some("SELECT id FROM artists WHERE id = $1")
+        );
+        assert!(simple_single_statement_fast_path_sql("").is_none());
+        assert!(simple_single_statement_fast_path_sql("SELECT 1; SELECT 2").is_none());
+        assert!(simple_single_statement_fast_path_sql("SELECT 1;;").is_none());
     }
 
     #[test]

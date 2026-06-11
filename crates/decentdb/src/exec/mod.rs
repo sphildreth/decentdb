@@ -103,6 +103,7 @@ const ENUM_COLUMNS_SECTION_MAGIC: &[u8; 8] = b"DDBENU01";
 const FULL_TEXT_OPTIONS_SECTION_MAGIC: &[u8; 8] = b"DDBFTS01";
 const SIGNED_ROW_ID_BIAS: u64 = 0x8000_0000_0000_0000;
 const DEFERRED_COMPRESSED_LOOKUP_CACHE_LIMIT: usize = 32;
+const DEFERRED_PAGED_ROW_PAYLOAD_CACHE_LIMIT_BYTES: usize = 8 * 1024 * 1024;
 const DEFERRED_VIEW_LIMIT_MIN_PERSISTED_ROWS: usize = 100_000;
 static RANDOM_STATE: AtomicU64 = AtomicU64::new(0);
 static DEFERRED_COMPRESSED_LOOKUP_CACHE: OnceLock<Mutex<DeferredCompressedLookupCache>> =
@@ -228,16 +229,42 @@ struct CachedPagedRowLocator {
     locator: RowLocatorV1,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct CachedPagedChunkPayloadKey {
+    head_page_id: PageId,
+    logical_len: u32,
+    flags: u8,
+    checksum: u32,
+}
+
+impl CachedPagedChunkPayloadKey {
+    fn new(pointer: OverflowPointer, checksum: u32) -> Self {
+        Self {
+            head_page_id: pointer.head_page_id,
+            logical_len: pointer.logical_len,
+            flags: pointer.flags,
+            checksum,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct DeferredPagedRowLocatorCache {
     manifest_pointer: OverflowPointer,
     manifest_checksum: u32,
-    locators: BTreeMap<i64, CachedPagedRowLocator>,
+    locators: Int64Map<CachedPagedRowLocator>,
+    verified_payloads: HashMap<CachedPagedChunkPayloadKey, Arc<Vec<u8>>>,
 }
 
 impl DeferredPagedRowLocatorCache {
     fn matches_state(&self, state: PersistedTableState) -> bool {
         self.manifest_pointer == state.pointer && self.manifest_checksum == state.checksum
+    }
+
+    fn verified_payload(&self, pointer: OverflowPointer, checksum: u32) -> Option<&[u8]> {
+        self.verified_payloads
+            .get(&CachedPagedChunkPayloadKey::new(pointer, checksum))
+            .map(|payload| payload.as_slice())
     }
 }
 
@@ -1732,6 +1759,28 @@ pub(crate) struct SimpleRowIdProjectionRequest<'a> {
     pub(crate) wal: &'a WalHandle,
     pub(crate) snapshot_lsn: u64,
     pub(crate) use_persistent_pk_index: bool,
+}
+
+pub(crate) struct ResolvedSimpleRowIdProjectionRequest<'a> {
+    pub(crate) table_name: &'a str,
+    pub(crate) projection_indexes: &'a [usize],
+    pub(crate) column_names: &'a [String],
+    pub(crate) lookup_row_id: i64,
+    pub(crate) pager: &'a PagerHandle,
+    pub(crate) wal: &'a WalHandle,
+    pub(crate) snapshot_lsn: u64,
+    pub(crate) use_persistent_pk_index: bool,
+}
+
+struct ValidatedSimpleRowIdProjectionRequest<'a> {
+    table_schema: &'a TableSchema,
+    projection_indexes: &'a [usize],
+    column_names: Vec<String>,
+    lookup_row_id: i64,
+    pager: &'a PagerHandle,
+    wal: &'a WalHandle,
+    snapshot_lsn: u64,
+    use_persistent_pk_index: bool,
 }
 
 impl EngineRuntime {
@@ -11189,8 +11238,6 @@ impl EngineRuntime {
         {
             return Ok(None);
         }
-        let canonical_table_name = table_schema.name.as_str();
-
         let mut projection_indexes = Vec::with_capacity(request.projection_columns.len());
         let mut column_names = Vec::with_capacity(request.projection_columns.len());
         for projection_column in request.projection_columns {
@@ -11205,17 +11252,75 @@ impl EngineRuntime {
             column_names.push((*projection_column).to_string());
         }
 
+        self.execute_validated_simple_row_id_projection_at_snapshot(
+            ValidatedSimpleRowIdProjectionRequest {
+                table_schema,
+                projection_indexes: &projection_indexes,
+                column_names,
+                lookup_row_id: request.lookup_row_id,
+                pager: request.pager,
+                wal: request.wal,
+                snapshot_lsn: request.snapshot_lsn,
+                use_persistent_pk_index: request.use_persistent_pk_index,
+            },
+        )
+    }
+
+    pub(crate) fn execute_resolved_simple_row_id_projection_at_snapshot(
+        &self,
+        request: ResolvedSimpleRowIdProjectionRequest<'_>,
+    ) -> Result<Option<QueryResult>> {
+        if self
+            .visible_view(request.table_name, NameResolutionScope::Session)
+            .is_some()
+            || self.visible_table_is_temporary(request.table_name)
+        {
+            return Ok(None);
+        }
+        let Some(table_schema) = self.table_schema(request.table_name) else {
+            return Ok(None);
+        };
+        if !generated_columns_are_stored(table_schema) {
+            return Ok(None);
+        }
+        if request
+            .projection_indexes
+            .iter()
+            .any(|index| *index >= table_schema.columns.len())
+        {
+            return Ok(None);
+        }
+        self.execute_validated_simple_row_id_projection_at_snapshot(
+            ValidatedSimpleRowIdProjectionRequest {
+                table_schema,
+                projection_indexes: request.projection_indexes,
+                column_names: request.column_names.to_vec(),
+                lookup_row_id: request.lookup_row_id,
+                pager: request.pager,
+                wal: request.wal,
+                snapshot_lsn: request.snapshot_lsn,
+                use_persistent_pk_index: request.use_persistent_pk_index,
+            },
+        )
+    }
+
+    fn execute_validated_simple_row_id_projection_at_snapshot(
+        &self,
+        request: ValidatedSimpleRowIdProjectionRequest<'_>,
+    ) -> Result<Option<QueryResult>> {
+        let table_schema = request.table_schema;
+        let canonical_table_name = table_schema.name.as_str();
         if let Some(row_source) = self.visible_table_row_source(canonical_table_name) {
             let rows = row_source
                 .row_by_id(request.lookup_row_id)?
                 .map(|stored_row| {
                     vec![project_simple_projection_values(
                         stored_row.values(),
-                        &projection_indexes,
+                        request.projection_indexes,
                     )]
                 })
                 .unwrap_or_default();
-            return Ok(Some(QueryResult::with_rows(column_names, rows)));
+            return Ok(Some(QueryResult::with_rows(request.column_names, rows)));
         }
 
         if !self.has_deferred_tables()
@@ -11247,13 +11352,13 @@ impl EngineRuntime {
             paged_locator_cache,
         )?
         .map(|stored_row| {
-            vec![project_simple_projection_row(
-                &stored_row,
-                &projection_indexes,
+            vec![project_simple_projection_owned_row(
+                stored_row,
+                request.projection_indexes,
             )]
         })
         .unwrap_or_default();
-        Ok(Some(QueryResult::with_rows(column_names, rows)))
+        Ok(Some(QueryResult::with_rows(request.column_names, rows)))
     }
 
     fn try_execute_simple_deferred_rowid_join_projection_query(
@@ -22966,6 +23071,22 @@ fn project_simple_projection_row(stored_row: &StoredRow, projection_indexes: &[u
     project_simple_projection_values(&stored_row.values, projection_indexes)
 }
 
+fn project_simple_projection_owned_row(
+    stored_row: StoredRow,
+    projection_indexes: &[usize],
+) -> QueryRow {
+    if projection_indexes.len() == stored_row.values.len()
+        && projection_indexes
+            .iter()
+            .copied()
+            .enumerate()
+            .all(|(expected, actual)| expected == actual)
+    {
+        return QueryRow::new(stored_row.values);
+    }
+    project_simple_projection_values(&stored_row.values, projection_indexes)
+}
+
 fn project_simple_projection_values(values: &[Value], projection_indexes: &[usize]) -> QueryRow {
     let mut projected = Vec::with_capacity(projection_indexes.len());
     for index in projection_indexes {
@@ -23424,7 +23545,7 @@ fn append_paged_row_locator_entries(
 }
 
 fn append_cached_paged_row_locators(
-    locators: &mut BTreeMap<i64, CachedPagedRowLocator>,
+    locators: &mut Int64Map<CachedPagedRowLocator>,
     payload: &[u8],
     pointer: OverflowPointer,
     checksum: u32,
@@ -23464,12 +23585,54 @@ fn append_cached_paged_row_locators(
     Ok(())
 }
 
+fn maybe_cache_verified_paged_chunk_payload(
+    payloads: &mut HashMap<CachedPagedChunkPayloadKey, Arc<Vec<u8>>>,
+    cached_payload_bytes: &mut usize,
+    pointer: OverflowPointer,
+    checksum: u32,
+    payload: &Arc<Vec<u8>>,
+) {
+    let payload_len = payload.len();
+    if payload_len == 0 || payload_len > DEFERRED_PAGED_ROW_PAYLOAD_CACHE_LIMIT_BYTES {
+        return;
+    }
+    if cached_payload_bytes.saturating_add(payload_len)
+        > DEFERRED_PAGED_ROW_PAYLOAD_CACHE_LIMIT_BYTES
+    {
+        return;
+    }
+    let key = CachedPagedChunkPayloadKey::new(pointer, checksum);
+    if payloads.contains_key(&key) {
+        return;
+    }
+    *cached_payload_bytes = cached_payload_bytes.saturating_add(payload_len);
+    payloads.insert(key, Arc::clone(payload));
+}
+
 fn build_deferred_paged_row_locator_cache(
     state: PersistedTableState,
     chunks: &[TablePageManifestChunk],
 ) -> Result<DeferredPagedRowLocatorCache> {
-    let mut locators = BTreeMap::new();
+    let expected_locators = chunks
+        .iter()
+        .map(|chunk| {
+            chunk
+                .row_count
+                .saturating_add(chunk.overlay_payload.is_some() as usize)
+        })
+        .sum();
+    let mut locators =
+        Int64Map::with_capacity_and_hasher(expected_locators, Int64HashBuilder::default());
+    let mut verified_payloads = HashMap::new();
+    let mut cached_payload_bytes = 0usize;
     for chunk in chunks {
+        maybe_cache_verified_paged_chunk_payload(
+            &mut verified_payloads,
+            &mut cached_payload_bytes,
+            chunk.pointer,
+            chunk.checksum,
+            &chunk.payload,
+        );
         append_cached_paged_row_locators(
             &mut locators,
             chunk.payload.as_slice(),
@@ -23482,6 +23645,13 @@ fn build_deferred_paged_row_locator_cache(
             chunk.overlay_checksum,
             chunk.overlay_payload.as_ref(),
         ) {
+            maybe_cache_verified_paged_chunk_payload(
+                &mut verified_payloads,
+                &mut cached_payload_bytes,
+                overlay_pointer,
+                overlay_checksum,
+                overlay_payload,
+            );
             append_cached_paged_row_locators(
                 &mut locators,
                 overlay_payload.as_slice(),
@@ -23495,6 +23665,7 @@ fn build_deferred_paged_row_locator_cache(
         manifest_pointer: state.pointer,
         manifest_checksum: state.checksum,
         locators,
+        verified_payloads,
     })
 }
 
@@ -23729,21 +23900,19 @@ fn read_deferred_row_by_cached_paged_locator<S: PageStore>(
     store: &S,
     row_id: i64,
     cached: CachedPagedRowLocator,
+    verified_payload: Option<&[u8]>,
 ) -> Result<Option<StoredRow>> {
-    let payload = read_overflow(store, cached.pointer)?;
-    if crc32c_parts(&[payload.as_slice()]) != cached.checksum {
-        return Err(DbError::corruption("paged table chunk checksum mismatch"));
-    }
-    let start = cached.locator.byte_offset as usize;
-    let end = start.saturating_add(cached.locator.byte_len as usize);
-    let row_bytes = payload
-        .get(start..end)
-        .ok_or_else(|| DbError::corruption("paged row locator exceeded payload length"))?;
-    let row = Row::decode(row_bytes)?;
-    Ok(Some(StoredRow {
-        row_id,
-        values: row.into_values(),
-    }))
+    let owned_payload;
+    let payload = if let Some(payload) = verified_payload {
+        payload
+    } else {
+        owned_payload = read_overflow(store, cached.pointer)?;
+        if crc32c_parts(&[owned_payload.as_slice()]) != cached.checksum {
+            return Err(DbError::corruption("paged table chunk checksum mismatch"));
+        }
+        owned_payload.as_slice()
+    };
+    decode_row_by_locator_from_payload(payload, row_id, cached.locator).map(Some)
 }
 
 fn read_deferred_row_by_id_from_paged_chunk<S: PageStore>(
@@ -23901,7 +24070,14 @@ fn read_deferred_stored_row_by_id<S: PageStore>(
                 .locators
                 .get(&row_id)
                 .copied()
-                .map(|cached| read_deferred_row_by_cached_paged_locator(store, row_id, cached))
+                .map(|cached| {
+                    read_deferred_row_by_cached_paged_locator(
+                        store,
+                        row_id,
+                        cached,
+                        cache.verified_payload(cached.pointer, cached.checksum),
+                    )
+                })
                 .unwrap_or(Ok(None));
         }
         return match locator {
