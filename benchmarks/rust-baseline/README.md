@@ -30,17 +30,20 @@ theoretical engine ceiling that any binding could approach but never beat.
 
 The SQLite path uses `rusqlite` against the same generated workload, with
 `journal_mode=WAL`, `synchronous=FULL`, and `wal_autocheckpoint=0`. Each seed
-phase runs in one explicit `BEGIN IMMEDIATE` transaction, and query timing
-materializes every returned column before counting a row.
+phase runs in one explicit `BEGIN IMMEDIATE` transaction. After seeding, both
+engines run a measured WAL checkpoint before query timing starts: DecentDB uses
+`Db::checkpoint_wal()` and SQLite uses `PRAGMA wal_checkpoint(TRUNCATE)`. Query
+timing materializes every returned column before counting a row.
 
 ## Schema and queries
 
 - `artists`, `albums`, `songs` tables with the same columns/PKs.
 - 5 secondary indexes (`idx_albums_artist`, `idx_songs_album`, etc.).
 - `v_artist_songs` view joining all three.
-- 12 instrumented steps: `connect_open`, `schema_create`, three seed loops,
-  and seven query shapes including `COUNT(*)`, aggregates, by-id lookup,
-  Top-10 artists/albums by song count, and view scans.
+- 13 instrumented steps: `connect_open`, `schema_create`, three seed loops,
+  `checkpoint_after_seed`, and seven query shapes including `COUNT(*)`,
+  aggregates, by-id lookup, Top-10 artists/albums by song count, and view
+  scans.
 
 ## Scales
 
@@ -65,6 +68,8 @@ counts are reported as `Plan: artists=… total_albums=… total_songs=…`.
 ```bash
 cd /home/steven/src/github/decentdb/benchmarks/rust-baseline
 cargo build --release
+./target/release/rust-baseline --engine decentdb --benchmark
+./target/release/rust-baseline --engine sqlite --benchmark
 ./target/release/rust-baseline --engine decentdb --scale smoke
 ./target/release/rust-baseline --engine decentdb --scale medium
 ./target/release/rust-baseline --engine decentdb --scale full
@@ -75,6 +80,12 @@ cargo build --release
 ./target/release/rust-baseline --report --report-file /tmp/rust-baseline-report.html
 ```
 
+Use `--benchmark` to run all scales in order (`smoke`, `medium`, `full`,
+`huge`) for the selected engine/profile and then generate the same HTML report
+as `--report`. Suite mode uses the default per-engine/per-scale database paths
+and rejects `--db-path`; use single-scale mode when you need to pin an exact
+database file.
+
 To run the full DecentDB-vs-SQLite comparison into a temporary output
 directory, use:
 
@@ -82,20 +93,13 @@ directory, use:
 cd /home/steven/src/github/decentdb/benchmarks/rust-baseline
 cargo build --release
 OUT="$PWD/../../.tmp/rust-baseline-compare/results"
-DBS="$PWD/../../.tmp/rust-baseline-compare/dbs"
-mkdir -p "$OUT" "$DBS"
-for scale in smoke medium full huge; do
-  ./target/release/rust-baseline \
-    --engine decentdb \
-    --scale "$scale" \
-    --out-dir "$OUT" \
-    --db-path "$DBS/run-decentdb-$scale.ddb"
-  ./target/release/rust-baseline \
-    --engine sqlite \
-    --scale "$scale" \
-    --out-dir "$OUT" \
-    --db-path "$DBS/run-sqlite-$scale.db"
-done
+mkdir -p "$OUT"
+./target/release/rust-baseline --engine decentdb --benchmark --out-dir "$OUT"
+./target/release/rust-baseline \
+  --engine sqlite \
+  --benchmark \
+  --out-dir "$OUT" \
+  --report-file "$OUT/report.html"
 ```
 
 ## Profiles
@@ -134,16 +138,19 @@ results/
 ```
 
 Each JSON report records `binding`, `benchmark_profile`, `engine_version`,
-database/WAL size, peak RSS, total runtime, and every instrumented step. Use
-`binding` to separate DecentDB (`RustRaw`) from SQLite (`SQLiteRusqlite`) when
-comparing runs programmatically.
+database/WAL size after the run, peak RSS, total runtime, and every
+instrumented step. The `checkpoint_after_seed` step records checkpoint duration
+plus WAL/database bytes before and after the checkpoint in its `extra` object.
+Use `binding` to separate DecentDB (`RustRaw`) from SQLite (`SQLiteRusqlite`)
+when comparing runs programmatically.
 
 ### Historical HTML report
 
-`--report` is a **report-only** mode: it does not run a benchmark. Instead it
-loads every `*.json` result in `results/`, groups runs by scale (`smoke`,
-`medium`, `full`, `huge`), and writes a static HTML report to
-`results/report.html` by default.
+`--report` is a **report-only** mode when used by itself: it does not run a
+benchmark. Instead it loads every `*.json` result in `results/`, groups runs by
+scale (`smoke`, `medium`, `full`, `huge`), and writes a static HTML report to
+`results/report.html` by default. `--benchmark` runs the suite first and then
+performs this report generation step automatically.
 
 The generated report includes:
 
@@ -154,7 +161,8 @@ The generated report includes:
 - raw run-history tables and per-step summary tables so regressions and
   improvements are easy to spot over time
 
-Use `--report-file <path>` with `--report` to override the output path.
+Use `--report-file <path>` with `--report` or `--benchmark` to override the
+output path.
 
 ## Engine memory observation (worth filing)
 
