@@ -129,6 +129,65 @@ impl Row {
         Err(DbError::corruption("row field index exceeds field count"))
     }
 
+    pub(crate) fn decode_projection_with_overflow<S: PageStore>(
+        bytes: &[u8],
+        store: Option<&S>,
+        projection_indexes: &[usize],
+    ) -> Result<Vec<Value>> {
+        let (field_count, mut offset) = decode_varint_u64(bytes)?;
+        let field_count = usize::try_from(field_count)
+            .map_err(|_| DbError::corruption("row field count exceeds usize"))?;
+        if projection_indexes
+            .iter()
+            .any(|column_index| *column_index >= field_count)
+        {
+            return Err(DbError::corruption("row field index exceeds field count"));
+        }
+
+        let mut projected: Vec<Option<Value>> = vec![None; projection_indexes.len()];
+        for field_index in 0..field_count {
+            let tag = *bytes
+                .get(offset)
+                .ok_or_else(|| DbError::corruption("truncated row field tag"))?;
+            offset += 1;
+
+            let (payload_len, len_bytes) = decode_varint_u64(&bytes[offset..])?;
+            offset += len_bytes;
+            let payload_len = usize::try_from(payload_len)
+                .map_err(|_| DbError::corruption("field payload length exceeds usize"))?;
+            let payload_end = offset + payload_len;
+            let payload = bytes
+                .get(offset..payload_end)
+                .ok_or_else(|| DbError::corruption("truncated row field payload"))?;
+            offset = payload_end;
+
+            let mut first_projection_offset: Option<usize> = None;
+            for (projection_offset, projection_index) in projection_indexes.iter().enumerate() {
+                if *projection_index != field_index {
+                    continue;
+                }
+                if let Some(first_projection_offset) = first_projection_offset {
+                    let value = projected[first_projection_offset]
+                        .as_ref()
+                        .ok_or_else(|| DbError::internal("projected row value missing"))?
+                        .clone();
+                    projected[projection_offset] = Some(value);
+                } else {
+                    projected[projection_offset] =
+                        Some(Self::decode_value_with_overflow(tag, payload, store)?);
+                    first_projection_offset = Some(projection_offset);
+                }
+            }
+        }
+
+        projected
+            .into_iter()
+            .map(|value| {
+                value.ok_or_else(|| DbError::corruption("projected row field was not decoded"))
+            })
+            .collect()
+    }
+
     pub(crate) fn encode_with_overflow<S: PageStore>(
         &self,
         store: Option<&mut S>,
@@ -519,6 +578,155 @@ impl Row {
 
         Ok(Self { values })
     }
+
+    fn decode_value_with_overflow<S: PageStore>(
+        tag: u8,
+        payload: &[u8],
+        store: Option<&S>,
+    ) -> Result<Value> {
+        match tag {
+            TAG_NULL => {
+                if !payload.is_empty() {
+                    return Err(DbError::corruption("NULL field must have empty payload"));
+                }
+                Ok(Value::Null)
+            }
+            TAG_INT64 => {
+                let (encoded, consumed) = decode_varint_u64(payload)?;
+                if consumed != payload.len() {
+                    return Err(DbError::corruption("INT64 payload has trailing bytes"));
+                }
+                Ok(Value::Int64(zigzag_decode_u64(encoded)))
+            }
+            TAG_FLOAT64 => {
+                let bytes: [u8; 8] = payload
+                    .try_into()
+                    .map_err(|_| DbError::corruption("FLOAT64 payload must be 8 bytes"))?;
+                Ok(Value::Float64(f64::from_le_bytes(bytes)))
+            }
+            TAG_BOOL => match payload {
+                [0] => Ok(Value::Bool(false)),
+                [1] => Ok(Value::Bool(true)),
+                _ => Err(DbError::corruption("BOOL payload must be 0 or 1")),
+            },
+            TAG_TEXT => Value::text_from_bytes(payload.to_vec()),
+            TAG_BLOB => Ok(Value::Blob(payload.to_vec())),
+            TAG_ENUM => {
+                let (enum_type_id, consumed_a) = decode_varint_u64(payload)?;
+                let (label_id, consumed_b) = decode_varint_u64(&payload[consumed_a..])?;
+                if consumed_a + consumed_b != payload.len() {
+                    return Err(DbError::corruption("ENUM payload has trailing bytes"));
+                }
+                Ok(Value::Enum {
+                    enum_type_id,
+                    label_id,
+                })
+            }
+            TAG_IPADDR => {
+                let (family, addr) = decode_ip_addr_payload(payload)?;
+                Ok(Value::IpAddr { family, addr })
+            }
+            TAG_CIDR => {
+                let (family, prefix_len, network) = decode_cidr_payload(payload)?;
+                Ok(Value::Cidr {
+                    family,
+                    prefix_len,
+                    network,
+                })
+            }
+            TAG_MACADDR => {
+                let (len, bytes) = decode_mac_addr_payload(payload)?;
+                Ok(Value::MacAddr { len, bytes })
+            }
+            TAG_DATE => {
+                let (encoded, consumed) = decode_varint_u64(payload)?;
+                if consumed != payload.len() {
+                    return Err(DbError::corruption("DATE payload has trailing bytes"));
+                }
+                let value = zigzag_decode_u64(encoded);
+                let date = i32::try_from(value)
+                    .map_err(|_| DbError::corruption("DATE payload exceeds i32 range"))?;
+                Ok(Value::DateDays(date))
+            }
+            TAG_TIME => {
+                let (encoded, consumed) = decode_varint_u64(payload)?;
+                if consumed != payload.len() {
+                    return Err(DbError::corruption("TIME payload has trailing bytes"));
+                }
+                Ok(Value::TimeMicros(zigzag_decode_u64(encoded)))
+            }
+            TAG_TIMESTAMP_TZ => {
+                let (encoded, consumed) = decode_varint_u64(payload)?;
+                if consumed != payload.len() {
+                    return Err(DbError::corruption(
+                        "TIMESTAMPTZ payload has trailing bytes",
+                    ));
+                }
+                Ok(Value::TimestampTzMicros(zigzag_decode_u64(encoded)))
+            }
+            TAG_INTERVAL => {
+                let (months_encoded, consumed_a) = decode_varint_u64(payload)?;
+                let (days_encoded, consumed_b) = decode_varint_u64(&payload[consumed_a..])?;
+                let (micros_encoded, consumed_c) =
+                    decode_varint_u64(&payload[consumed_a + consumed_b..])?;
+                if consumed_a + consumed_b + consumed_c != payload.len() {
+                    return Err(DbError::corruption("INTERVAL payload has trailing bytes"));
+                }
+                let months = i32::try_from(zigzag_decode_u64(months_encoded))
+                    .map_err(|_| DbError::corruption("INTERVAL months exceed i32 range"))?;
+                let days = i32::try_from(zigzag_decode_u64(days_encoded))
+                    .map_err(|_| DbError::corruption("INTERVAL days exceed i32 range"))?;
+                Ok(Value::Interval {
+                    months,
+                    days,
+                    micros: zigzag_decode_u64(micros_encoded),
+                })
+            }
+            TAG_GEOMETRY => Ok(Value::Geometry(payload.to_vec())),
+            TAG_GEOGRAPHY => Ok(Value::Geography(payload.to_vec())),
+            TAG_DECIMAL => {
+                let scale = *payload
+                    .first()
+                    .ok_or_else(|| DbError::corruption("DECIMAL payload missing scale"))?;
+                let (encoded, consumed) = decode_varint_u64(&payload[1..])?;
+                if consumed + 1 != payload.len() {
+                    return Err(DbError::corruption("DECIMAL payload has trailing bytes"));
+                }
+                Ok(Value::Decimal {
+                    scaled: zigzag_decode_u64(encoded),
+                    scale,
+                })
+            }
+            TAG_UUID => {
+                let bytes: [u8; 16] = payload
+                    .try_into()
+                    .map_err(|_| DbError::corruption("UUID payload must be 16 bytes"))?;
+                Ok(Value::Uuid(bytes))
+            }
+            TAG_TIMESTAMP => {
+                let (encoded, consumed) = decode_varint_u64(payload)?;
+                if consumed != payload.len() {
+                    return Err(DbError::corruption("TIMESTAMP payload has trailing bytes"));
+                }
+                Ok(Value::TimestampMicros(zigzag_decode_u64(encoded)))
+            }
+            TAG_TEXT_OVERFLOW => {
+                let store = store.ok_or_else(|| {
+                    DbError::constraint("TEXT overflow decoding requires a page store")
+                })?;
+                let pointer = decode_overflow_pointer(payload)?;
+                Value::text_from_bytes(read_overflow(store, pointer)?)
+            }
+            TAG_BLOB_OVERFLOW => {
+                let store = store.ok_or_else(|| {
+                    DbError::constraint("BLOB overflow decoding requires a page store")
+                })?;
+                let pointer = decode_overflow_pointer(payload)?;
+                Ok(Value::Blob(read_overflow(store, pointer)?))
+            }
+            _ => Err(DbError::corruption(format!("unknown row value tag {tag}"))),
+        }
+    }
 }
 
 fn encode_overflow_pointer(pointer: OverflowPointer) -> [u8; 9] {
@@ -652,6 +860,33 @@ mod tests {
         assert_eq!(Row::decode_int64_at(&encoded, 1).expect("decode"), Some(42));
         assert_eq!(Row::decode_int64_at(&encoded, 2).expect("decode"), None);
         assert!(Row::decode_int64_at(&encoded, 0).is_err());
+    }
+
+    #[test]
+    fn decode_projection_materializes_requested_columns_in_order() {
+        let row = Row::new(vec![
+            Value::Int64(7),
+            Value::Text("selected".to_string()),
+            Value::Bool(true),
+        ]);
+        let encoded = row.encode().expect("encode");
+
+        let projected =
+            Row::decode_projection_with_overflow::<InMemoryPageStore>(&encoded, None, &[1, 0, 1])
+                .expect("decode projection");
+
+        assert_eq!(
+            projected,
+            vec![
+                Value::Text("selected".to_string()),
+                Value::Int64(7),
+                Value::Text("selected".to_string()),
+            ]
+        );
+        assert!(
+            Row::decode_projection_with_overflow::<InMemoryPageStore>(&encoded, None, &[3])
+                .is_err()
+        );
     }
 
     #[test]

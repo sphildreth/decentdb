@@ -73,6 +73,47 @@ Notes:
   `data/bench_summary.json`, but they are not currently rendered in the README
   images.
 
+## Current Worktree Public Metrics
+
+Latest local public benchmark:
+
+```bash
+cargo bench -p decentdb --bench embedded_compare
+```
+
+Output summary: `data/bench_summary.json`, generated on 2026-06-12 from the
+`pk-lookup-profiled` worktree.
+
+| Metric | SQLite | Balanced | Balanced vs SQLite | Low-memory | Low-memory vs SQLite | Tuned | Tuned vs SQLite | Current status |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| `insert_rows_per_sec` | 2,083,405 rows/s | 2,370,472 rows/s | 1.14x | 2,327,752 rows/s | 1.12x | 2,641,010 rows/s | 1.27x | DecentDB wins |
+| `read_p95_ms` | 0.002579 ms | 0.001156 ms | 2.23x | 0.001050 ms | 2.46x | 0.000870 ms | 2.97x | DecentDB wins |
+| `commit_p95_ms` | 3.063863 ms | 3.068071 ms | 0.999x | 3.070023 ms | 0.998x | 3.067321 ms | 0.999x | At parity, not a beyond-noise win |
+| `join_p95_ms` | 0.003122 ms | 0.001583 ms | 1.97x | 0.001412 ms | 2.21x | 0.001106 ms | 2.82x | DecentDB wins |
+| `range_scan_p95_ms` | 0.014485 ms | 0.009546 ms | 1.52x | 0.008852 ms | 1.64x | 0.006103 ms | 2.37x | DecentDB wins |
+| `aggregate_p95_ms` | 0.030896 ms | 0.000629 ms | 49.09x | 0.000577 ms | 53.53x | 0.000569 ms | 54.26x | DecentDB wins |
+| `concurrent_read_p95_ms` | 0.015523 ms | 0.009334 ms | 1.66x | 0.008715 ms | 1.78x | 0.009109 ms | 1.70x | DecentDB wins |
+
+Interpretation:
+
+- The public README read-side metrics now exceed SQLite for every DecentDB
+  profile in this worktree: point lookup, indexed range scan, join lookup,
+  aggregate, concurrent read, and bulk insert throughput are all ahead.
+- Durable commit p95 is at the same single-`fsync` floor as SQLite. Multiple
+  local runs have moved both engines by several microseconds, and the latest
+  run has DecentDB 0.1-0.2% behind SQLite with overlapping standard deviations.
+  This must stay tracked as the remaining public metric blocker because it is
+  not a beyond-noise DecentDB win.
+- The current no-ADR commit-path work reduced engine overhead without changing
+  durability: batched WAL writes now pass through VFS wrappers, no-failpoint
+  VFS operations avoid failpoint-registry mutexes, no-op reactive publish
+  returns before hub lookup, and prepared auto-commit inserts skip redundant
+  post-commit re-deferral when no touched table is paged.
+- Further durable-commit improvement likely needs either a clearly measured
+  syscall-level optimization or an ADR-backed WAL/recovery change. Do not relax
+  `WalSyncMode::Full`, skip the WAL header end-offset update, or otherwise
+  weaken ACID semantics to win this metric.
+
 ## Rust-Baseline SQLite Comparison
 
 The rust-baseline workload is not the public README chart input. It is a larger
@@ -180,14 +221,15 @@ Next point-lookup follow-ups:
 
 | Rank | Priority metric / area | Public chart coverage | Rust-baseline coverage | Baseline status | Target |
 |---:|---|---|---|---|---|
-| 1 | Point lookup latency | `read_p95_ms` | `query_artist_by_id` | Worktree now wins rust-baseline medium/full/huge and cuts smoke roughly in half, but smoke median still trails SQLite; public chart rerun pending | Finish fixed-overhead work, rerun public benchmark, keep tuned ahead and close smoke gap |
-| 2 | Range scan latency | `range_scan_p95_ms` | Partial overlap through indexed scans and view paths | Tuned public row is 0.89x vs SQLite | Bring tuned above 1.00x vs SQLite and reduce balanced gap |
-| 3 | Join and view lookup latency | `join_p95_ms` | `query_view_first_1000`, `query_songs_for_artist_via_view` | Tuned public row is 0.96x; rust-baseline view paths lose strongly | Bring public join above 1.00x and reduce view-path latency materially |
-| 4 | Durable commit latency | `commit_p95_ms` | Not directly represented in rust-baseline totals | Tuned public row wins narrowly at 1.06x | Protect or improve without weakening ACID guarantees |
-| 5 | Concurrent read latency | `concurrent_read_p95_ms` | Not directly represented in rust-baseline | Tuned public row wins strongly | Protect; watch for reader-cache or locking regressions |
-| 6 | Aggregate latency | `aggregate_p95_ms` | `query_aggregate_durations`, grouped Top-N queries | Tuned public row wins; rust-baseline wins strongly | Protect wins; optimize only if shared hot-path work helps higher priorities |
-| 7 | Insert throughput | `insert_rows_per_sec` | `seed_songs` and seed loops | DecentDB wins public and rust-baseline insert paths | Protect wins; avoid trading write durability for chart gains |
-| 8 | Size and memory | Stored in summary, not charted | RSS, DB size, WAL size in rust-baseline JSON | Not public-charted today | Track opportunistically; consider adding public visibility later |
+| 1 | Durable commit latency | `commit_p95_ms` | Not directly represented in rust-baseline totals | Current worktree is at parity but still 0.1-0.2% behind SQLite in the latest public run | Find a no-durability-regression win beyond sync noise, or document that an ADR-level WAL change is required |
+| 2 | Rust-baseline view lookup latency | Not directly charted | `query_view_first_1000`, `query_songs_for_artist_via_view` | Public join now wins, but rust-baseline view paths still lose strongly | Reduce view expansion/materialization overhead without regressing public join/range wins |
+| 3 | Point lookup latency | `read_p95_ms` | `query_artist_by_id` | Public metric now wins across profiles; rust-baseline medium/full/huge win, smoke median remains close | Protect public wins and close remaining smoke fixed-overhead gap opportunistically |
+| 4 | Range scan latency | `range_scan_p95_ms` | Partial overlap through indexed scans and view paths | Public metric now wins across profiles | Protect; optimize only if shared view/range work helps rust-baseline |
+| 5 | Join latency | `join_p95_ms` | View and join query shapes | Public metric now wins across profiles | Protect public win while improving rust-baseline views |
+| 6 | Concurrent read latency | `concurrent_read_p95_ms` | Not directly represented in rust-baseline | Public metric now wins across profiles | Protect; watch for reader-cache or locking regressions |
+| 7 | Aggregate latency | `aggregate_p95_ms` | `query_aggregate_durations`, grouped Top-N queries | Public and rust-baseline aggregate paths win strongly | Protect wins; optimize only if shared hot-path work helps higher priorities |
+| 8 | Insert throughput | `insert_rows_per_sec` | `seed_songs` and seed loops | DecentDB wins public and rust-baseline insert paths | Protect wins; avoid trading write durability for chart gains |
+| 9 | Size and memory | Stored in summary, not charted | RSS, DB size, WAL size in rust-baseline JSON | Not public-charted today | Track opportunistically; consider adding public visibility later |
 
 ## Execution Plan
 

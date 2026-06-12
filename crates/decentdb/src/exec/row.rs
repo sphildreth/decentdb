@@ -23,7 +23,7 @@ impl QueryRow {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct QueryResult {
-    columns: Vec<String>,
+    columns: Arc<[String]>,
     rows: Vec<QueryRow>,
     affected_rows: u64,
     explain_lines: Vec<String>,
@@ -33,7 +33,7 @@ impl QueryResult {
     #[must_use]
     pub fn empty() -> Self {
         Self {
-            columns: Vec::new(),
+            columns: Arc::from([]),
             rows: Vec::new(),
             affected_rows: 0,
             explain_lines: Vec::new(),
@@ -42,6 +42,17 @@ impl QueryResult {
 
     #[must_use]
     pub fn with_rows(columns: Vec<String>, rows: Vec<QueryRow>) -> Self {
+        let affected_rows = rows.len() as u64;
+        Self {
+            columns: Arc::from(columns),
+            rows,
+            affected_rows,
+            explain_lines: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn with_shared_columns(columns: Arc<[String]>, rows: Vec<QueryRow>) -> Self {
         let affected_rows = rows.len() as u64;
         Self {
             columns,
@@ -54,7 +65,7 @@ impl QueryResult {
     #[must_use]
     pub fn with_affected_rows(affected_rows: u64) -> Self {
         Self {
-            columns: Vec::new(),
+            columns: Arc::from([]),
             rows: Vec::new(),
             affected_rows,
             explain_lines: Vec::new(),
@@ -64,7 +75,7 @@ impl QueryResult {
     #[must_use]
     pub fn with_explain(lines: Vec<String>) -> Self {
         Self {
-            columns: vec!["plan".to_string()],
+            columns: Arc::from(["plan".to_string()]),
             rows: lines
                 .iter()
                 .cloned()
@@ -77,7 +88,7 @@ impl QueryResult {
 
     #[must_use]
     pub fn columns(&self) -> &[String] {
-        &self.columns
+        self.columns.as_ref()
     }
 
     #[must_use]

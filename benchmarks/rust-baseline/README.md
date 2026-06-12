@@ -8,6 +8,13 @@ seed plan, and query shapes through `rusqlite`.
 The SQLite path exists only in this benchmark crate. It does not add SQLite
 tests, dependencies, or comparison behavior to the DecentDB engine core.
 
+For the current cross-benchmark performance plan, see
+`../../design/METRIC_IMPROVEMENTS_PLAN.md`. The public README charts are driven
+by `cargo bench -p decentdb --bench embedded_compare` and
+`data/bench_summary.json`; this rust-baseline runner is the larger diagnostic
+surface for music-library totals, point lookups, joins, views, and grouped
+aggregates.
+
 The default DecentDB path links the `decentdb` crate directly (path-dep against
 `../../crates/decentdb`) and uses the engine's hot-path API:
 

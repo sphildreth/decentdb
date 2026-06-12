@@ -237,6 +237,24 @@ impl VfsFile for StatsVfsFile {
         Ok(written)
     }
 
+    fn write_all_at_many(&self, writes: &[(u64, &[u8])]) -> Result<()> {
+        self.inner.write_all_at_many(writes)?;
+        let state = global_stats_state();
+        if state.enabled() {
+            let stats = state.file_stats(self.inner.kind());
+            stats.write_calls.fetch_add(
+                u64::try_from(writes.len()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+            let bytes = writes
+                .iter()
+                .map(|(_, buf)| u64::try_from(buf.len()).unwrap_or(u64::MAX))
+                .fold(0_u64, u64::saturating_add);
+            stats.bytes_written.fetch_add(bytes, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
     fn advise_sequential(&self) -> Result<()> {
         self.inner.advise_sequential()
     }

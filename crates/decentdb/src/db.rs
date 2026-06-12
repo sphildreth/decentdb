@@ -27,8 +27,9 @@ use crate::exec::dml::{
 use crate::exec::{
     decode_paged_table_manifest_payload, read_table_payload_row_count_from_bytes,
     row_satisfies_expression, statement_is_read_only, BulkLoadOptions, EngineRuntime, QueryResult,
-    QueryRow, ResolvedSimpleRowIdProjectionRequest, RuntimeIndex, SimpleRowIdProjectionRequest,
-    TableData,
+    QueryRow, ResolvedSimpleJoinProjection, ResolvedSimpleRowIdJoinProjectionRequest,
+    ResolvedSimpleRowIdProjectionRequest, ResolvedSimpleRowIdRangeProjectionRequest, RuntimeIndex,
+    SimpleJoinProjectionSide, SimpleRangeBoundValue, SimpleRowIdProjectionRequest, TableData,
 };
 use crate::metadata::{
     CheckConstraintInfo, ColumnInfo, ForeignKeyInfo, HeaderInfo, IndexInfo, IndexVerification,
@@ -181,6 +182,9 @@ pub struct PreparedStatement {
     statement: Arc<SqlStatement>,
     prepared_sql: String,
     simple_row_id_projection: Option<PreparedSimpleRowIdProjection>,
+    simple_row_id_range_projection: Option<PreparedSimpleRowIdRangeProjection>,
+    simple_row_id_join_projection: Option<PreparedSimpleRowIdJoinProjection>,
+    simple_scalar_filtered_aggregate: Option<PreparedSimpleScalarFilteredAggregate>,
     prepared_insert: Option<Arc<PreparedSimpleInsert>>,
     prepared_update: Option<Arc<PreparedSimpleUpdate>>,
     prepared_delete: Option<Arc<PreparedSimpleDelete>>,
@@ -191,8 +195,82 @@ pub struct PreparedStatement {
 struct PreparedSimpleRowIdProjection {
     table_name: String,
     projection_indexes: Vec<usize>,
-    column_names: Vec<String>,
+    column_names: Arc<[String]>,
     param_index: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PreparedSimpleRangeBoundParam {
+    inclusive: bool,
+    param_index: usize,
+}
+
+#[derive(Clone, Debug)]
+struct PreparedSimpleRowIdRangeProjection {
+    table_name: String,
+    projection_indexes: Vec<usize>,
+    column_names: Arc<[String]>,
+    filter_column: String,
+    lower_bound: Option<PreparedSimpleRangeBoundParam>,
+    upper_bound: Option<PreparedSimpleRangeBoundParam>,
+    limit_param_index: usize,
+}
+
+#[derive(Clone, Debug)]
+struct PreparedSimpleRowIdJoinProjection {
+    left_table_name: String,
+    right_table_name: String,
+    left_projection_indexes: Vec<usize>,
+    right_projection_indexes: Vec<usize>,
+    projections: Vec<ResolvedSimpleJoinProjection>,
+    column_names: Arc<[String]>,
+    param_index: usize,
+}
+
+#[derive(Clone, Debug)]
+struct PreparedSimpleScalarFilteredAggregate {
+    table_name: String,
+    param_index: usize,
+    cache: Arc<Mutex<PreparedScalarAggregateCache>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct PreparedScalarAggregateCacheKey {
+    snapshot_lsn: u64,
+    pointer_head_page_id: u32,
+    pointer_logical_len: u32,
+    pointer_flags: u8,
+    checksum: u32,
+    row_count: usize,
+    param_value: i64,
+}
+
+#[derive(Debug, Default)]
+struct PreparedScalarAggregateCache {
+    entries: HashMap<PreparedScalarAggregateCacheKey, QueryResult>,
+    insertion_order: VecDeque<PreparedScalarAggregateCacheKey>,
+}
+
+const PREPARED_SCALAR_AGGREGATE_CACHE_LIMIT: usize = 256;
+
+impl PreparedScalarAggregateCache {
+    fn get(&self, key: &PreparedScalarAggregateCacheKey) -> Option<QueryResult> {
+        self.entries.get(key).cloned()
+    }
+
+    fn insert(&mut self, key: PreparedScalarAggregateCacheKey, result: QueryResult) {
+        if let Some(existing) = self.entries.get_mut(&key) {
+            *existing = result;
+            return;
+        }
+        if self.entries.len() >= PREPARED_SCALAR_AGGREGATE_CACHE_LIMIT {
+            if let Some(evicted) = self.insertion_order.pop_front() {
+                self.entries.remove(&evicted);
+            }
+        }
+        self.insertion_order.push_back(key);
+        self.entries.insert(key, result);
+    }
 }
 
 /// Transaction-scoped prepared statement executor for repeated rows.
@@ -2197,6 +2275,9 @@ impl Db {
         started_at_unix_ms: i64,
         result: std::result::Result<&QueryResult, &DbError>,
     ) {
+        if !self.inner.tracing.any_enabled() {
+            return;
+        }
         let status = match result {
             Ok(_) => "ok",
             Err(_) => "error",
@@ -4341,7 +4422,7 @@ impl Db {
             ResolvedSimpleRowIdProjectionRequest {
                 table_name: plan.table_name.as_str(),
                 projection_indexes: &plan.projection_indexes,
-                column_names: &plan.column_names,
+                column_names: Arc::clone(&plan.column_names),
                 lookup_row_id: *lookup_row_id,
                 pager: &self.inner.pager,
                 wal: &self.inner.wal,
@@ -4354,6 +4435,201 @@ impl Db {
         Ok(result)
     }
 
+    fn try_execute_prepared_simple_row_id_range_projection(
+        &self,
+        prepared: &PreparedStatement,
+        params: &[Value],
+    ) -> Result<Option<QueryResult>> {
+        if self.inner.sql_txn_active.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let Some(plan) = prepared.simple_row_id_range_projection.as_ref() else {
+            return Ok(None);
+        };
+        let lower_bound = if let Some(bound) = plan.lower_bound {
+            let Some(Value::Int64(value)) = params.get(bound.param_index) else {
+                return Ok(None);
+            };
+            Some(SimpleRangeBoundValue {
+                inclusive: bound.inclusive,
+                value: Value::Int64(*value),
+            })
+        } else {
+            None
+        };
+        let upper_bound = if let Some(bound) = plan.upper_bound {
+            let Some(Value::Int64(value)) = params.get(bound.param_index) else {
+                return Ok(None);
+            };
+            Some(SimpleRangeBoundValue {
+                inclusive: bound.inclusive,
+                value: Value::Int64(*value),
+            })
+        } else {
+            None
+        };
+        let Some(Value::Int64(limit_value)) = params.get(plan.limit_param_index) else {
+            return Ok(None);
+        };
+        let limit = Some(usize::try_from((*limit_value).max(0)).unwrap_or(usize::MAX));
+
+        let reader = self.inner.wal.begin_reader_with_pager(&self.inner.pager)?;
+        let snapshot_lsn = reader.snapshot_lsn();
+        self.refresh_engine_from_snapshot(snapshot_lsn)?;
+        let Some(runtime) = self.runtime_read_for_fast_read_at_snapshot(snapshot_lsn)? else {
+            return Ok(None);
+        };
+        self.validate_prepared_schema_cookie(
+            prepared,
+            runtime.catalog.schema_cookie,
+            runtime.temp_schema_cookie,
+        )?;
+        let result = runtime.execute_resolved_simple_row_id_range_projection_at_snapshot(
+            ResolvedSimpleRowIdRangeProjectionRequest {
+                table_name: plan.table_name.as_str(),
+                projection_indexes: &plan.projection_indexes,
+                column_names: Arc::clone(&plan.column_names),
+                filter_column: plan.filter_column.as_str(),
+                lower_bound,
+                upper_bound,
+                limit,
+                pager: &self.inner.pager,
+                wal: &self.inner.wal,
+                snapshot_lsn,
+                use_persistent_pk_index: self.inner.config.persistent_pk_index,
+            },
+        )?;
+        drop(runtime);
+        drop(reader);
+        Ok(result)
+    }
+
+    fn try_execute_prepared_simple_row_id_join_projection(
+        &self,
+        prepared: &PreparedStatement,
+        params: &[Value],
+    ) -> Result<Option<QueryResult>> {
+        if self.inner.sql_txn_active.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let Some(plan) = prepared.simple_row_id_join_projection.as_ref() else {
+            return Ok(None);
+        };
+        let Some(Value::Int64(lookup_row_id)) = params.get(plan.param_index) else {
+            return Ok(None);
+        };
+
+        let reader = self.inner.wal.begin_reader_with_pager(&self.inner.pager)?;
+        let snapshot_lsn = reader.snapshot_lsn();
+        self.refresh_engine_from_snapshot(snapshot_lsn)?;
+        let Some(runtime) = self.runtime_read_for_fast_read_at_snapshot(snapshot_lsn)? else {
+            return Ok(None);
+        };
+        self.validate_prepared_schema_cookie(
+            prepared,
+            runtime.catalog.schema_cookie,
+            runtime.temp_schema_cookie,
+        )?;
+        let result = runtime.execute_resolved_simple_row_id_join_projection_at_snapshot(
+            ResolvedSimpleRowIdJoinProjectionRequest {
+                left_table_name: plan.left_table_name.as_str(),
+                right_table_name: plan.right_table_name.as_str(),
+                left_projection_indexes: &plan.left_projection_indexes,
+                right_projection_indexes: &plan.right_projection_indexes,
+                projections: &plan.projections,
+                column_names: Arc::clone(&plan.column_names),
+                lookup_row_id: *lookup_row_id,
+                pager: &self.inner.pager,
+                wal: &self.inner.wal,
+                snapshot_lsn,
+                use_persistent_pk_index: self.inner.config.persistent_pk_index,
+            },
+        )?;
+        drop(runtime);
+        drop(reader);
+        Ok(result)
+    }
+
+    fn try_execute_prepared_simple_scalar_filtered_aggregate(
+        &self,
+        prepared: &PreparedStatement,
+        params: &[Value],
+    ) -> Result<Option<QueryResult>> {
+        if self.inner.sql_txn_active.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let Some(plan) = prepared.simple_scalar_filtered_aggregate.as_ref() else {
+            return Ok(None);
+        };
+        let Some(Value::Int64(param_value)) = params.get(plan.param_index) else {
+            return Ok(None);
+        };
+        let SqlStatement::Query(query) = prepared.statement.as_ref() else {
+            return Ok(None);
+        };
+
+        let reader = self.inner.wal.begin_reader_with_pager(&self.inner.pager)?;
+        let snapshot_lsn = reader.snapshot_lsn();
+        self.refresh_engine_from_snapshot(snapshot_lsn)?;
+        let Some(runtime) = self.runtime_read_for_fast_read_at_snapshot(snapshot_lsn)? else {
+            return Ok(None);
+        };
+        self.validate_prepared_schema_cookie(
+            prepared,
+            runtime.catalog.schema_cookie,
+            runtime.temp_schema_cookie,
+        )?;
+        let has_resident_source = runtime.table_row_source(plan.table_name.as_str()).is_some();
+        if !has_resident_source && !runtime.has_deferred_tables() {
+            return Ok(None);
+        }
+        let state = runtime.persisted_table_state(plan.table_name.as_str());
+        if !has_resident_source && state.is_none() {
+            return Ok(None);
+        };
+        let state = state.unwrap_or_default();
+        let key = PreparedScalarAggregateCacheKey {
+            snapshot_lsn,
+            pointer_head_page_id: state.pointer.head_page_id,
+            pointer_logical_len: state.pointer.logical_len,
+            pointer_flags: state.pointer.flags,
+            checksum: state.checksum,
+            row_count: state.row_count,
+            param_value: *param_value,
+        };
+        if let Some(result) = plan
+            .cache
+            .lock()
+            .map_err(|_| DbError::internal("prepared aggregate cache lock poisoned"))?
+            .get(&key)
+        {
+            drop(runtime);
+            drop(reader);
+            return Ok(Some(result));
+        }
+
+        let result = if has_resident_source {
+            runtime.try_execute_simple_grouped_numeric_aggregate_query(query, params)?
+        } else {
+            runtime.try_execute_simple_deferred_paged_grouped_numeric_aggregate_query(
+                query,
+                params,
+                &self.inner.pager,
+                &self.inner.wal,
+                snapshot_lsn,
+            )?
+        };
+        if let Some(result) = result.as_ref() {
+            plan.cache
+                .lock()
+                .map_err(|_| DbError::internal("prepared aggregate cache lock poisoned"))?
+                .insert(key, result.clone());
+        }
+        drop(runtime);
+        drop(reader);
+        Ok(result)
+    }
+
     fn execute_prepared_read_statement(
         &self,
         prepared: &PreparedStatement,
@@ -4361,6 +4637,21 @@ impl Db {
     ) -> Result<QueryResult> {
         if let Some(result) =
             self.try_execute_prepared_simple_row_id_projection(prepared, params)?
+        {
+            return Ok(result);
+        }
+        if let Some(result) =
+            self.try_execute_prepared_simple_row_id_range_projection(prepared, params)?
+        {
+            return Ok(result);
+        }
+        if let Some(result) =
+            self.try_execute_prepared_simple_row_id_join_projection(prepared, params)?
+        {
+            return Ok(result);
+        }
+        if let Some(result) =
+            self.try_execute_prepared_simple_scalar_filtered_aggregate(prepared, params)?
         {
             return Ok(result);
         }
@@ -4935,7 +5226,9 @@ impl Db {
                 return Err(error);
             }
         };
-        self.sync_post_commit(&mut runtime, committed_lsn)?;
+        if !runtime.sync_mutations.is_empty() {
+            self.sync_post_commit(&mut runtime, committed_lsn)?;
+        }
         self.sync_temp_state_from_runtime(&runtime)?;
         self.inner
             .last_runtime_lsn
@@ -5017,7 +5310,9 @@ impl Db {
                 return Err(error);
             }
         };
-        self.sync_post_commit(&mut runtime, committed_lsn)?;
+        if !runtime.sync_mutations.is_empty() {
+            self.sync_post_commit(&mut runtime, committed_lsn)?;
+        }
         self.sync_temp_state_from_runtime(&runtime)?;
         self.inner
             .last_runtime_lsn
@@ -5101,7 +5396,9 @@ impl Db {
                 return Err(error);
             }
         };
-        self.sync_post_commit(&mut runtime, committed_lsn)?;
+        if !runtime.sync_mutations.is_empty() {
+            self.sync_post_commit(&mut runtime, committed_lsn)?;
+        }
         self.sync_temp_state_from_runtime(&runtime)?;
         self.inner
             .last_runtime_lsn
@@ -5109,9 +5406,13 @@ impl Db {
         self.inner
             .writer_last_commit_lsn
             .store(committed_lsn, Ordering::Release);
+        let redefer_after_write =
+            self.runtime_should_redefer_persisted_tables_after_write(&runtime, table_refs);
         drop(runtime);
         self.publish_reactive_commit(reactive_pending, committed_lsn);
-        self.redefer_persisted_tables_after_write(table_refs)?;
+        if redefer_after_write {
+            self.redefer_persisted_tables_after_write(table_refs)?;
+        }
         Ok(Some(QueryResult::with_affected_rows(affected)))
     }
 
@@ -5165,7 +5466,9 @@ impl Db {
                 return Err(error);
             }
         };
-        self.sync_post_commit(&mut runtime, committed_lsn)?;
+        if !runtime.sync_mutations.is_empty() {
+            self.sync_post_commit(&mut runtime, committed_lsn)?;
+        }
         let runtime_schema_cookie = runtime.catalog.schema_cookie;
         if self.inner.catalog.schema_cookie()? != runtime_schema_cookie {
             self.inner
@@ -5237,7 +5540,9 @@ impl Db {
                 return Err(error);
             }
         };
-        self.sync_post_commit(&mut runtime, committed_lsn)?;
+        if !runtime.sync_mutations.is_empty() {
+            self.sync_post_commit(&mut runtime, committed_lsn)?;
+        }
         let runtime_schema_cookie = runtime.catalog.schema_cookie;
         if self.inner.catalog.schema_cookie()? != runtime_schema_cookie {
             self.inner
@@ -5658,6 +5963,12 @@ impl Db {
         };
         let simple_row_id_projection =
             Self::prepared_simple_row_id_projection(&prepared_sql, runtime);
+        let simple_row_id_range_projection =
+            Self::prepared_simple_row_id_range_projection(&prepared_sql, runtime);
+        let simple_row_id_join_projection =
+            Self::prepared_simple_row_id_join_projection(statement.as_ref(), runtime);
+        let simple_scalar_filtered_aggregate =
+            Self::prepared_simple_scalar_filtered_aggregate(statement.as_ref(), runtime);
         Ok(PreparedStatement {
             db: self.clone(),
             schema_cookie: runtime.catalog.schema_cookie,
@@ -5665,6 +5976,9 @@ impl Db {
             statement: Arc::clone(&statement),
             prepared_sql: prepared_sql.clone(),
             simple_row_id_projection,
+            simple_row_id_range_projection,
+            simple_row_id_join_projection,
+            simple_scalar_filtered_aggregate,
             prepared_insert,
             prepared_update,
             prepared_delete,
@@ -5707,8 +6021,288 @@ impl Db {
         Some(PreparedSimpleRowIdProjection {
             table_name: table.name.clone(),
             projection_indexes,
-            column_names,
+            column_names: Arc::from(column_names),
             param_index: plan.param_index,
+        })
+    }
+
+    fn prepared_simple_row_id_range_projection(
+        sql: &str,
+        runtime: &EngineRuntime,
+    ) -> Option<PreparedSimpleRowIdRangeProjection> {
+        let plan = parse_simple_row_id_range_projection_sql(sql)?;
+        if runtime.temp_table_schema(plan.table_name).is_some()
+            || runtime
+                .catalog
+                .views
+                .keys()
+                .any(|view_name| identifiers_equal(view_name, plan.table_name))
+        {
+            return None;
+        }
+        let table = runtime.catalog.table(plan.table_name)?;
+        let filter_column_index = table
+            .columns
+            .iter()
+            .position(|column| identifiers_equal(&column.name, plan.filter_column))?;
+        if !table
+            .primary_key_columns
+            .iter()
+            .any(|column| identifiers_equal(column, plan.filter_column))
+            || table.columns[filter_column_index].column_type != ColumnType::Int64
+        {
+            return None;
+        }
+
+        let mut projection_indexes = Vec::with_capacity(plan.projection_columns.len());
+        let mut column_names = Vec::with_capacity(plan.projection_columns.len());
+        for projection_column in plan.projection_columns {
+            let index = table
+                .columns
+                .iter()
+                .position(|column| identifiers_equal(&column.name, projection_column))?;
+            projection_indexes.push(index);
+            column_names.push(projection_column.to_string());
+        }
+
+        Some(PreparedSimpleRowIdRangeProjection {
+            table_name: table.name.clone(),
+            projection_indexes,
+            column_names: Arc::from(column_names),
+            filter_column: table.columns[filter_column_index].name.clone(),
+            lower_bound: plan.lower_bound,
+            upper_bound: plan.upper_bound,
+            limit_param_index: plan.limit_param_index,
+        })
+    }
+
+    fn prepared_simple_row_id_join_projection(
+        statement: &SqlStatement,
+        runtime: &EngineRuntime,
+    ) -> Option<PreparedSimpleRowIdJoinProjection> {
+        let SqlStatement::Query(query) = statement else {
+            return None;
+        };
+        if !query.ctes.is_empty()
+            || !query.order_by.is_empty()
+            || query.limit.is_some()
+            || query.offset.is_some()
+        {
+            return None;
+        }
+        let crate::sql::ast::QueryBody::Select(select) = &query.body else {
+            return None;
+        };
+        if !select.group_by.is_empty()
+            || select.having.is_some()
+            || select.distinct
+            || !select.distinct_on.is_empty()
+            || select.from.len() != 1
+        {
+            return None;
+        }
+        let filter = select.filter.as_ref()?;
+        let crate::sql::ast::FromItem::Join {
+            left,
+            right,
+            kind: crate::sql::ast::JoinKind::Inner,
+            constraint,
+        } = &select.from[0]
+        else {
+            return None;
+        };
+        let crate::sql::ast::FromItem::Table {
+            name: left_name,
+            alias: left_alias,
+        } = &**left
+        else {
+            return None;
+        };
+        let crate::sql::ast::FromItem::Table {
+            name: right_name,
+            alias: right_alias,
+        } = &**right
+        else {
+            return None;
+        };
+        if runtime.temp_table_schema(left_name).is_some()
+            || runtime.temp_table_schema(right_name).is_some()
+            || runtime.catalog.views.keys().any(|view_name| {
+                identifiers_equal(view_name, left_name) || identifiers_equal(view_name, right_name)
+            })
+        {
+            return None;
+        }
+        let left_schema = runtime.catalog.table(left_name)?;
+        let right_schema = runtime.catalog.table(right_name)?;
+        let left_rowid_column = row_id_alias_column_name(left_schema)?;
+        let right_rowid_column = row_id_alias_column_name(right_schema)?;
+
+        let (join_a, join_b) = prepared_join_column_equality(constraint)?;
+        let join_a_side =
+            prepared_join_column_side(join_a.0, left_name, left_alias, right_name, right_alias)?;
+        let join_b_side =
+            prepared_join_column_side(join_b.0, left_name, left_alias, right_name, right_alias)?;
+        let (left_join_column, right_join_column) = match (join_a_side, join_b_side) {
+            (SimpleJoinProjectionSide::Left, SimpleJoinProjectionSide::Right) => {
+                (join_a.1, join_b.1)
+            }
+            (SimpleJoinProjectionSide::Right, SimpleJoinProjectionSide::Left) => {
+                (join_b.1, join_a.1)
+            }
+            _ => return None,
+        };
+        if !identifiers_equal(left_join_column, left_rowid_column)
+            || !identifiers_equal(right_join_column, right_rowid_column)
+        {
+            return None;
+        }
+
+        let (filter_table, filter_column, param_index) = prepared_join_filter_param(filter)?;
+        let filter_side = prepared_join_column_side(
+            filter_table,
+            left_name,
+            left_alias,
+            right_name,
+            right_alias,
+        )?;
+        match filter_side {
+            SimpleJoinProjectionSide::Left
+                if !identifiers_equal(filter_column, left_rowid_column) =>
+            {
+                return None;
+            }
+            SimpleJoinProjectionSide::Right
+                if !identifiers_equal(filter_column, right_rowid_column) =>
+            {
+                return None;
+            }
+            _ => {}
+        }
+        let mut projections = Vec::with_capacity(select.projection.len());
+        let mut left_projection_indexes = Vec::new();
+        let mut right_projection_indexes = Vec::new();
+        let mut column_names = Vec::with_capacity(select.projection.len());
+        for item in &select.projection {
+            let crate::sql::ast::SelectItem::Expr { expr, alias } = item else {
+                return None;
+            };
+            let crate::sql::ast::Expr::Column { table, column } = expr else {
+                return None;
+            };
+            let side = prepared_join_column_side(
+                table.as_deref(),
+                left_name,
+                left_alias,
+                right_name,
+                right_alias,
+            )?;
+            let schema = match side {
+                SimpleJoinProjectionSide::Left => left_schema,
+                SimpleJoinProjectionSide::Right => right_schema,
+            };
+            let index = schema
+                .columns
+                .iter()
+                .position(|candidate| identifiers_equal(&candidate.name, column))?;
+            let projected_index = match side {
+                SimpleJoinProjectionSide::Left => {
+                    push_prepared_join_projection_index(&mut left_projection_indexes, index)
+                }
+                SimpleJoinProjectionSide::Right => {
+                    push_prepared_join_projection_index(&mut right_projection_indexes, index)
+                }
+            };
+            projections.push(ResolvedSimpleJoinProjection {
+                side,
+                index: projected_index,
+            });
+            column_names.push(alias.clone().unwrap_or_else(|| column.clone()));
+        }
+
+        Some(PreparedSimpleRowIdJoinProjection {
+            left_table_name: left_schema.name.clone(),
+            right_table_name: right_schema.name.clone(),
+            left_projection_indexes,
+            right_projection_indexes,
+            projections,
+            column_names: Arc::from(column_names),
+            param_index,
+        })
+    }
+
+    fn prepared_simple_scalar_filtered_aggregate(
+        statement: &SqlStatement,
+        runtime: &EngineRuntime,
+    ) -> Option<PreparedSimpleScalarFilteredAggregate> {
+        let SqlStatement::Query(query) = statement else {
+            return None;
+        };
+        if !query.ctes.is_empty()
+            || !query.order_by.is_empty()
+            || query.limit.is_some()
+            || query.offset.is_some()
+        {
+            return None;
+        }
+        let crate::sql::ast::QueryBody::Select(select) = &query.body else {
+            return None;
+        };
+        if select.distinct
+            || !select.distinct_on.is_empty()
+            || !select.group_by.is_empty()
+            || select.having.is_some()
+            || select.from.len() != 1
+            || select.projection.len() != 2
+        {
+            return None;
+        }
+        let crate::sql::ast::FromItem::Table { name, alias } = &select.from[0] else {
+            return None;
+        };
+        if runtime.temp_table_schema(name).is_some()
+            || runtime
+                .catalog
+                .views
+                .keys()
+                .any(|view_name| identifiers_equal(view_name, name))
+        {
+            return None;
+        }
+        let table = runtime.catalog.table(name)?;
+        if !prepared_table_generated_columns_are_stored(table) {
+            return None;
+        }
+        let param_index = prepared_scalar_filter_param(select.filter.as_ref()?, name, alias)?;
+        let mut saw_count = false;
+        let mut saw_sum = false;
+        for item in &select.projection {
+            let crate::sql::ast::SelectItem::Expr { expr, .. } = item else {
+                return None;
+            };
+            if prepared_scalar_count_star(expr) {
+                saw_count = true;
+                continue;
+            }
+            if let Some(sum_column) = prepared_scalar_sum_column(expr, name, alias) {
+                if table
+                    .columns
+                    .iter()
+                    .any(|column| identifiers_equal(&column.name, sum_column))
+                {
+                    saw_sum = true;
+                    continue;
+                }
+            }
+            return None;
+        }
+        if !saw_count || !saw_sum {
+            return None;
+        }
+        Some(PreparedSimpleScalarFilteredAggregate {
+            table_name: table.name.clone(),
+            param_index,
+            cache: Arc::new(Mutex::new(PreparedScalarAggregateCache::default())),
         })
     }
 
@@ -6211,14 +6805,17 @@ impl Db {
             .inner
             .last_seen_checkpoint_epoch
             .load(Ordering::Acquire);
+        let writer_last_commit_lsn = self.inner.writer_last_commit_lsn.load(Ordering::Acquire);
 
         if latest_lsn <= last_runtime_lsn && latest_checkpoint_epoch == last_seen_checkpoint_epoch {
             return Ok(());
         }
 
+        let mut checkpoint_lsn_after_refresh = None;
         if latest_checkpoint_epoch != last_seen_checkpoint_epoch {
             let cached_header = self.inner.pager.header_snapshot()?;
             let on_disk_header = self.inner.pager.header_from_disk()?;
+            checkpoint_lsn_after_refresh = Some(on_disk_header.last_checkpoint_lsn);
             if on_disk_header.last_checkpoint_lsn != cached_header.last_checkpoint_lsn {
                 self.inner.pager.refresh_from_disk(on_disk_header)?;
             }
@@ -6227,10 +6824,12 @@ impl Db {
                 .store(latest_checkpoint_epoch, Ordering::Release);
         }
 
-        let writer_last_commit_lsn = self.inner.writer_last_commit_lsn.load(Ordering::Acquire);
         if last_runtime_lsn > 0
             && writer_last_commit_lsn > 0
+            && last_runtime_lsn >= writer_last_commit_lsn
             && latest_lsn <= writer_last_commit_lsn
+            && checkpoint_lsn_after_refresh
+                .is_none_or(|checkpoint_lsn| checkpoint_lsn <= last_runtime_lsn)
         {
             // A checkpoint can legally fold this handle's last committed WAL
             // history back into the database file and reset the live WAL end
@@ -6593,6 +7192,14 @@ impl Db {
     }
 
     fn redefer_persisted_tables(&self, names: &[&str]) -> Result<()> {
+        self.redefer_persisted_tables_inner(names, true)
+    }
+
+    fn redefer_persisted_tables_inner(
+        &self,
+        names: &[&str],
+        release_heap_after_drop: bool,
+    ) -> Result<()> {
         if !self.inner.config.defer_table_materialization || names.is_empty() {
             return Ok(());
         }
@@ -6603,7 +7210,9 @@ impl Db {
             .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
         runtime.redefer_persisted_tables(names);
         drop(runtime);
-        self.release_freed_heap_after_paged_row_source_drop();
+        if release_heap_after_drop {
+            self.release_freed_heap_after_paged_row_source_drop();
+        }
         Ok(())
     }
 
@@ -6613,9 +7222,18 @@ impl Db {
             && !self.inner.config.retain_paged_row_sources_after_commit
     }
 
+    fn runtime_should_redefer_persisted_tables_after_write(
+        &self,
+        runtime: &EngineRuntime,
+        names: &[&str],
+    ) -> bool {
+        self.should_redefer_paged_row_sources_after_write()
+            && runtime.has_redeferable_persisted_tables(names)
+    }
+
     fn redefer_persisted_tables_after_write(&self, names: &[&str]) -> Result<()> {
         if self.should_redefer_paged_row_sources_after_write() {
-            self.redefer_persisted_tables(names)
+            self.redefer_persisted_tables_inner(names, false)
         } else {
             Ok(())
         }
@@ -12551,7 +13169,10 @@ impl Db {
     }
 
     fn publish_reactive_commit(&self, pending: Option<PendingReactiveCommit>, committed_lsn: u64) {
-        if let (Some(pending), Some(hub)) = (pending, self.reactive_hub_if_available()) {
+        let Some(pending) = pending else {
+            return;
+        };
+        if let Some(hub) = self.reactive_hub_if_available() {
             hub.publish(pending, committed_lsn);
         }
     }
@@ -14029,6 +14650,16 @@ struct SimpleRowIdProjectionSqlPlan<'a> {
     param_index: usize,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SimpleRowIdRangeProjectionSqlPlan<'a> {
+    table_name: &'a str,
+    projection_columns: Vec<&'a str>,
+    filter_column: &'a str,
+    lower_bound: Option<PreparedSimpleRangeBoundParam>,
+    upper_bound: Option<PreparedSimpleRangeBoundParam>,
+    limit_param_index: usize,
+}
+
 fn simple_single_statement_fast_path_sql(sql: &str) -> Option<&str> {
     let trimmed = sql.trim();
     if trimmed.is_empty() {
@@ -14110,6 +14741,417 @@ fn parse_simple_row_id_projection_sql(sql: &str) -> Option<SimpleRowIdProjection
         filter_column,
         param_index,
     })
+}
+
+fn parse_simple_row_id_range_projection_sql(
+    sql: &str,
+) -> Option<SimpleRowIdRangeProjectionSqlPlan<'_>> {
+    let trimmed = sql.trim();
+    if !trimmed.is_ascii() {
+        return None;
+    }
+    if trimmed.len() <= 7 || !trimmed[..7].eq_ignore_ascii_case("select ") {
+        return None;
+    }
+    let from_index = find_ascii_case_insensitive(trimmed, " from ")?;
+    let where_marker = " where ";
+    let where_index = find_ascii_case_insensitive(&trimmed[from_index + 6..], where_marker)
+        .map(|index| from_index + 6 + index)?;
+    let projection_sql = trimmed[6..from_index].trim();
+    let table_name = trimmed[from_index + 6..where_index].trim();
+    if projection_sql.is_empty() || !is_simple_sql_identifier(table_name) {
+        return None;
+    }
+
+    let filter_tail = trimmed[where_index + where_marker.len()..].trim();
+    let limit_marker = " limit ";
+    let limit_index = find_ascii_case_insensitive(filter_tail, limit_marker)?;
+    let before_limit = filter_tail[..limit_index].trim();
+    let limit_sql = filter_tail[limit_index + limit_marker.len()..].trim();
+    if limit_sql.is_empty()
+        || contains_ascii_case_insensitive(limit_sql, " offset ")
+        || limit_sql.split_ascii_whitespace().count() != 1
+    {
+        return None;
+    }
+    let limit_param_index = parse_positional_param(limit_sql)?;
+
+    let order_marker = " order by ";
+    let (filter_sql, order_column) =
+        if let Some(order_index) = find_ascii_case_insensitive(before_limit, order_marker) {
+            let filter_sql = before_limit[..order_index].trim();
+            let order_sql = before_limit[order_index + order_marker.len()..].trim();
+            let mut order_parts = order_sql.split_ascii_whitespace();
+            let order_column = order_parts.next()?;
+            if !is_simple_sql_identifier(order_column) {
+                return None;
+            }
+            match order_parts.next() {
+                None => {}
+                Some(direction) if direction.eq_ignore_ascii_case("asc") => {}
+                _ => return None,
+            }
+            if order_parts.next().is_some() {
+                return None;
+            }
+            (filter_sql, Some(order_column))
+        } else {
+            (before_limit, None)
+        };
+    if filter_sql.is_empty()
+        || contains_ascii_case_insensitive(filter_sql, " group ")
+        || contains_ascii_case_insensitive(filter_sql, " having ")
+    {
+        return None;
+    }
+
+    let mut projection_columns = Vec::new();
+    for column in projection_sql.split(',') {
+        let column = column.trim();
+        if !is_simple_sql_identifier(column) {
+            return None;
+        }
+        projection_columns.push(column);
+    }
+
+    let mut filter_column = None;
+    let mut lower_bound = None;
+    let mut upper_bound = None;
+    let mut remaining = filter_sql.trim();
+    loop {
+        let (term, rest) = if let Some(and_index) = find_ascii_case_insensitive(remaining, " and ")
+        {
+            (
+                remaining[..and_index].trim(),
+                Some(remaining[and_index + 5..].trim()),
+            )
+        } else {
+            (remaining.trim(), None)
+        };
+        let (term_column, bound_kind, param_index) = parse_simple_range_param_term(term)?;
+        if let Some(existing_column) = filter_column {
+            if !identifiers_equal(existing_column, term_column) {
+                return None;
+            }
+        } else {
+            filter_column = Some(term_column);
+        }
+        let bound = PreparedSimpleRangeBoundParam {
+            inclusive: bound_kind.inclusive(),
+            param_index,
+        };
+        match bound_kind {
+            SimpleRangeParamBoundKind::Lower(_) => {
+                if lower_bound.replace(bound).is_some() {
+                    return None;
+                }
+            }
+            SimpleRangeParamBoundKind::Upper(_) => {
+                if upper_bound.replace(bound).is_some() {
+                    return None;
+                }
+            }
+        }
+        let Some(rest) = rest else {
+            break;
+        };
+        if rest.is_empty() {
+            return None;
+        }
+        remaining = rest;
+    }
+    let filter_column = filter_column?;
+    if lower_bound.is_none() && upper_bound.is_none() {
+        return None;
+    }
+    if order_column.is_some_and(|column| !identifiers_equal(column, filter_column)) {
+        return None;
+    }
+
+    Some(SimpleRowIdRangeProjectionSqlPlan {
+        table_name,
+        projection_columns,
+        filter_column,
+        lower_bound,
+        upper_bound,
+        limit_param_index,
+    })
+}
+
+type PreparedJoinColumnRef<'a> = (Option<&'a str>, &'a str);
+type PreparedJoinColumnEquality<'a> = (PreparedJoinColumnRef<'a>, PreparedJoinColumnRef<'a>);
+
+fn prepared_join_column_equality(
+    constraint: &crate::sql::ast::JoinConstraint,
+) -> Option<PreparedJoinColumnEquality<'_>> {
+    let crate::sql::ast::JoinConstraint::On(expr) = constraint else {
+        return None;
+    };
+    let crate::sql::ast::Expr::Binary {
+        left,
+        op: crate::sql::ast::BinaryOp::Eq,
+        right,
+    } = expr
+    else {
+        return None;
+    };
+    let crate::sql::ast::Expr::Column {
+        table: left_table,
+        column: left_column,
+    } = left.as_ref()
+    else {
+        return None;
+    };
+    let crate::sql::ast::Expr::Column {
+        table: right_table,
+        column: right_column,
+    } = right.as_ref()
+    else {
+        return None;
+    };
+    Some((
+        (left_table.as_deref(), left_column.as_str()),
+        (right_table.as_deref(), right_column.as_str()),
+    ))
+}
+
+fn prepared_join_filter_param(
+    filter: &crate::sql::ast::Expr,
+) -> Option<(Option<&str>, &str, usize)> {
+    let crate::sql::ast::Expr::Binary {
+        left,
+        op: crate::sql::ast::BinaryOp::Eq,
+        right,
+    } = filter
+    else {
+        return None;
+    };
+    if let crate::sql::ast::Expr::Column { table, column } = left.as_ref() {
+        let crate::sql::ast::Expr::Parameter(param_index) = right.as_ref() else {
+            return None;
+        };
+        return Some((
+            table.as_deref(),
+            column.as_str(),
+            param_index.checked_sub(1)?,
+        ));
+    }
+    if let crate::sql::ast::Expr::Column { table, column } = right.as_ref() {
+        let crate::sql::ast::Expr::Parameter(param_index) = left.as_ref() else {
+            return None;
+        };
+        return Some((
+            table.as_deref(),
+            column.as_str(),
+            param_index.checked_sub(1)?,
+        ));
+    }
+    None
+}
+
+fn prepared_join_column_side(
+    table: Option<&str>,
+    left_name: &str,
+    left_alias: &Option<String>,
+    right_name: &str,
+    right_alias: &Option<String>,
+) -> Option<SimpleJoinProjectionSide> {
+    let table = table?;
+    let matches_left = identifiers_equal(table, left_name)
+        || left_alias
+            .as_deref()
+            .is_some_and(|alias| identifiers_equal(table, alias));
+    let matches_right = identifiers_equal(table, right_name)
+        || right_alias
+            .as_deref()
+            .is_some_and(|alias| identifiers_equal(table, alias));
+    match (matches_left, matches_right) {
+        (true, false) => Some(SimpleJoinProjectionSide::Left),
+        (false, true) => Some(SimpleJoinProjectionSide::Right),
+        _ => None,
+    }
+}
+
+fn push_prepared_join_projection_index(indexes: &mut Vec<usize>, index: usize) -> usize {
+    if let Some(position) = indexes.iter().position(|candidate| *candidate == index) {
+        position
+    } else {
+        indexes.push(index);
+        indexes.len() - 1
+    }
+}
+
+fn prepared_table_generated_columns_are_stored(table: &TableSchema) -> bool {
+    table
+        .columns
+        .iter()
+        .all(|column| column.generated_sql.is_none() || column.generated_stored)
+}
+
+fn prepared_scalar_count_star(expr: &crate::sql::ast::Expr) -> bool {
+    let crate::sql::ast::Expr::Aggregate {
+        name,
+        args,
+        distinct,
+        star,
+        order_by,
+        within_group,
+    } = expr
+    else {
+        return false;
+    };
+    name.eq_ignore_ascii_case("count")
+        && args.is_empty()
+        && !*distinct
+        && *star
+        && order_by.is_empty()
+        && !*within_group
+}
+
+fn prepared_scalar_sum_column<'a>(
+    expr: &'a crate::sql::ast::Expr,
+    table_name: &str,
+    alias: &Option<String>,
+) -> Option<&'a str> {
+    let crate::sql::ast::Expr::Aggregate {
+        name,
+        args,
+        distinct,
+        star,
+        order_by,
+        within_group,
+    } = expr
+    else {
+        return None;
+    };
+    if !name.eq_ignore_ascii_case("sum")
+        || *distinct
+        || *star
+        || !order_by.is_empty()
+        || *within_group
+        || args.len() != 1
+    {
+        return None;
+    }
+    let crate::sql::ast::Expr::Column { table, column } = &args[0] else {
+        return None;
+    };
+    if prepared_scalar_column_matches_table(table.as_deref(), table_name, alias) {
+        Some(column.as_str())
+    } else {
+        None
+    }
+}
+
+fn prepared_scalar_filter_param(
+    filter: &crate::sql::ast::Expr,
+    table_name: &str,
+    alias: &Option<String>,
+) -> Option<usize> {
+    let crate::sql::ast::Expr::Binary {
+        left,
+        op: crate::sql::ast::BinaryOp::Eq,
+        right,
+    } = filter
+    else {
+        return None;
+    };
+    if let crate::sql::ast::Expr::Column { table, .. } = left.as_ref() {
+        if prepared_scalar_column_matches_table(table.as_deref(), table_name, alias) {
+            let crate::sql::ast::Expr::Parameter(param_index) = right.as_ref() else {
+                return None;
+            };
+            return param_index.checked_sub(1);
+        }
+    }
+    if let crate::sql::ast::Expr::Column { table, .. } = right.as_ref() {
+        if prepared_scalar_column_matches_table(table.as_deref(), table_name, alias) {
+            let crate::sql::ast::Expr::Parameter(param_index) = left.as_ref() else {
+                return None;
+            };
+            return param_index.checked_sub(1);
+        }
+    }
+    None
+}
+
+fn prepared_scalar_column_matches_table(
+    table: Option<&str>,
+    table_name: &str,
+    alias: &Option<String>,
+) -> bool {
+    table.is_none_or(|qualifier| {
+        identifiers_equal(qualifier, table_name)
+            || alias
+                .as_deref()
+                .is_some_and(|alias| identifiers_equal(qualifier, alias))
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SimpleRangeParamBoundKind {
+    Lower(bool),
+    Upper(bool),
+}
+
+impl SimpleRangeParamBoundKind {
+    fn inclusive(self) -> bool {
+        match self {
+            Self::Lower(inclusive) | Self::Upper(inclusive) => inclusive,
+        }
+    }
+}
+
+fn parse_simple_range_param_term(term: &str) -> Option<(&str, SimpleRangeParamBoundKind, usize)> {
+    let (left, op, right) = split_simple_range_operator(term)?;
+    if is_simple_sql_identifier(left) {
+        let param_index = parse_positional_param(right)?;
+        let bound = match op {
+            SimpleRangeOperator::Gt => SimpleRangeParamBoundKind::Lower(false),
+            SimpleRangeOperator::GtEq => SimpleRangeParamBoundKind::Lower(true),
+            SimpleRangeOperator::Lt => SimpleRangeParamBoundKind::Upper(false),
+            SimpleRangeOperator::LtEq => SimpleRangeParamBoundKind::Upper(true),
+        };
+        return Some((left, bound, param_index));
+    }
+    if is_simple_sql_identifier(right) {
+        let param_index = parse_positional_param(left)?;
+        let bound = match op {
+            SimpleRangeOperator::Gt => SimpleRangeParamBoundKind::Upper(false),
+            SimpleRangeOperator::GtEq => SimpleRangeParamBoundKind::Upper(true),
+            SimpleRangeOperator::Lt => SimpleRangeParamBoundKind::Lower(false),
+            SimpleRangeOperator::LtEq => SimpleRangeParamBoundKind::Lower(true),
+        };
+        return Some((right, bound, param_index));
+    }
+    None
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SimpleRangeOperator {
+    Gt,
+    GtEq,
+    Lt,
+    LtEq,
+}
+
+fn split_simple_range_operator(term: &str) -> Option<(&str, SimpleRangeOperator, &str)> {
+    for (token, op) in [
+        (">=", SimpleRangeOperator::GtEq),
+        ("<=", SimpleRangeOperator::LtEq),
+        (">", SimpleRangeOperator::Gt),
+        ("<", SimpleRangeOperator::Lt),
+    ] {
+        if let Some(index) = term.find(token) {
+            let left = term[..index].trim();
+            let right = term[index + token.len()..].trim();
+            if left.is_empty() || right.is_empty() {
+                return None;
+            }
+            return Some((left, op, right));
+        }
+    }
+    None
 }
 
 fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
@@ -16384,8 +17426,8 @@ mod tests {
 
     use super::{
         parse_simple_count_star_sql, parse_simple_row_id_projection_sql,
-        simple_single_statement_fast_path_sql, split_sql_batch, PreparedInsertCache,
-        StatementCache, TempSchemaState,
+        parse_simple_row_id_range_projection_sql, simple_single_statement_fast_path_sql,
+        split_sql_batch, PreparedInsertCache, StatementCache, TempSchemaState,
     };
 
     #[derive(Debug)]
@@ -16626,6 +17668,51 @@ mod tests {
         assert_eq!(plan.param_index, 0);
         assert!(parse_simple_row_id_projection_sql(
             "SELECT id, upper(name) FROM artists WHERE id = $1"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn simple_row_id_range_projection_sql_parser_extracts_bounds_and_limit() {
+        let plan = parse_simple_row_id_range_projection_sql(
+            "SELECT name FROM users WHERE id >= $1 AND id < $2 ORDER BY id LIMIT $3",
+        )
+        .expect("simple rowid range projection");
+        assert_eq!(plan.table_name, "users");
+        assert_eq!(plan.projection_columns, vec!["name"]);
+        assert_eq!(plan.filter_column, "id");
+        assert_eq!(
+            plan.lower_bound,
+            Some(super::PreparedSimpleRangeBoundParam {
+                inclusive: true,
+                param_index: 0
+            })
+        );
+        assert_eq!(
+            plan.upper_bound,
+            Some(super::PreparedSimpleRangeBoundParam {
+                inclusive: false,
+                param_index: 1
+            })
+        );
+        assert_eq!(plan.limit_param_index, 2);
+
+        let reversed = parse_simple_row_id_range_projection_sql(
+            "SELECT name FROM users WHERE $1 <= id AND $2 > id ORDER BY id ASC LIMIT $3",
+        )
+        .expect("reversed range predicates");
+        assert_eq!(reversed.lower_bound, plan.lower_bound);
+        assert_eq!(reversed.upper_bound, plan.upper_bound);
+        assert!(parse_simple_row_id_range_projection_sql(
+            "SELECT name FROM users WHERE id >= $1 AND id < $2 ORDER BY id DESC LIMIT $3"
+        )
+        .is_none());
+        assert!(parse_simple_row_id_range_projection_sql(
+            "SELECT name FROM users WHERE id >= $1 AND id < $2 ORDER BY name LIMIT $3"
+        )
+        .is_none());
+        assert!(parse_simple_row_id_range_projection_sql(
+            "SELECT upper(name) FROM users WHERE id >= $1 AND id < $2 ORDER BY id LIMIT $3"
         )
         .is_none());
     }
@@ -18250,8 +19337,23 @@ mod tests {
             .expect("create table");
         db.execute("CREATE INDEX docs_name_idx ON docs(name)")
             .expect("create index");
-        db.execute("INSERT INTO docs VALUES (1, 'old'), (2, 'stable')")
-            .expect("insert rows");
+        let mut txn = db.transaction().expect("begin seed txn");
+        let insert = txn
+            .prepare("INSERT INTO docs VALUES ($1, $2)")
+            .expect("prepare seed insert");
+        let large_name = "x".repeat(2048);
+        for i in 0_i64..40_i64 {
+            insert
+                .execute_in(
+                    &mut txn,
+                    &[
+                        Value::Int64(i + 1),
+                        Value::Text(format!("name-{i}-{large_name}")),
+                    ],
+                )
+                .expect("insert row");
+        }
+        txn.commit().expect("commit seed rows");
         let mut stale_runtime = db
             .runtime_for_metadata_inspection()
             .expect("runtime for stale setup");
@@ -18707,7 +19809,11 @@ mod tests {
             .expect("begin reader");
         let older_snapshot_lsn = reader.snapshot_lsn();
 
-        db.execute("INSERT INTO t VALUES (1, 'newer')")
+        let insert = db
+            .prepare("INSERT INTO t VALUES ($1, $2)")
+            .expect("prepare newer row insert");
+        insert
+            .execute(&[Value::Int64(1), Value::Text("x".repeat(70_000))])
             .expect("insert newer row");
         let newer_snapshot_lsn = db.inner.wal.latest_snapshot();
         assert!(
@@ -18778,13 +19884,14 @@ mod tests {
         let insert = txn
             .prepare("INSERT INTO bench VALUES ($1, $2, $3)")
             .expect("prepare insert");
+        let large_body = "x".repeat(2048);
         for i in 0_i64..128_i64 {
             insert
                 .execute_in(
                     &mut txn,
                     &[
                         Value::Int64(i),
-                        Value::Text(format!("value_{i}")),
+                        Value::Text(format!("value_{i}_{large_body}")),
                         Value::Float64(i as f64),
                     ],
                 )
@@ -18825,7 +19932,7 @@ mod tests {
             result.rows()[0].values(),
             &[
                 Value::Int64(42),
-                Value::Text("value_42".to_string()),
+                Value::Text(format!("value_42_{large_body}")),
                 Value::Float64(42.0),
             ]
         );
@@ -20029,6 +21136,157 @@ mod tests {
             assert!(
                 docs_after.pk_index_root.is_some(),
                 "inserted paged table should retain persistent pk locator root"
+            );
+            let page_store = PagerReadStore { db: &db };
+            let manifest_after = read_overflow(&page_store, docs_after.pointer)
+                .expect("read paged manifest after insert");
+            let manifest_after = decode_paged_table_manifest_payload(&manifest_after)
+                .expect("decode paged manifest after insert");
+            assert_eq!(
+                manifest_after
+                    .chunks
+                    .iter()
+                    .map(|chunk| chunk.row_count)
+                    .sum::<usize>(),
+                97,
+                "paged manifest row counts should reflect the insert"
+            );
+            manifest_after
+                .chunks
+                .iter()
+                .filter_map(|chunk| {
+                    untouched_chunk_pointers
+                        .contains(&chunk.pointer)
+                        .then_some(chunk.pointer)
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            preserved_untouched, untouched_chunk_pointers,
+            "untouched paged chunks should retain their original pointers after reopen-time insert"
+        );
+
+        let inserted = db
+            .execute("SELECT n FROM docs WHERE id = 97")
+            .expect("point lookup after reopen insert");
+        assert_eq!(scalar_i64(&inserted), 9600);
+        assert_eq!(
+            scalar_i64(
+                &db.execute("SELECT COUNT(*) FROM docs")
+                    .expect("count docs rows")
+            ),
+            97
+        );
+        let json_after = db
+            .inspect_storage_state_json()
+            .expect("json after insert reopen");
+        assert!(
+            json_after.contains("\"loaded_table_count\":0"),
+            "expected inserted paged table to remain off the resident path, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"deferred_table_count\":1"),
+            "expected inserted paged table to remain deferred after reopen, got: {json_after}"
+        );
+    }
+
+    #[test]
+    fn paged_row_storage_prepared_insert_after_reopen_preserves_untouched_chunks_without_persistent_pk_index(
+    ) {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir
+            .path()
+            .join("paged-row-storage-insert-after-reopen-without-pk-index.ddb");
+        let config = DbConfig {
+            persistent_pk_index: false,
+            paged_row_storage: true,
+            ..DbConfig::default()
+        };
+
+        {
+            let db = Db::open_or_create(&path, config.clone()).expect("open db");
+            db.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, n INTEGER, body TEXT)")
+                .expect("create docs table");
+            let large_body = "x".repeat(2048);
+            let mut txn = db.transaction().expect("begin txn");
+            let insert = txn
+                .prepare("INSERT INTO docs VALUES ($1, $2, $3)")
+                .expect("prepare insert");
+            for i in 0_i64..96_i64 {
+                insert
+                    .execute_in(
+                        &mut txn,
+                        &[
+                            Value::Int64(i + 1),
+                            Value::Int64(i),
+                            Value::Text(large_body.clone()),
+                        ],
+                    )
+                    .expect("insert row");
+            }
+            txn.commit().expect("commit rows");
+            db.checkpoint().expect("checkpoint");
+        }
+
+        let untouched_chunk_pointers = {
+            let db = Db::open_or_create(&path, config.clone()).expect("reopen db");
+            let json_open = db.inspect_storage_state_json().expect("json at reopen");
+            assert!(
+                json_open.contains("\"deferred_table_count\":1"),
+                "expected paged-backed table to stay deferred at reopen, got: {json_open}"
+            );
+
+            let untouched_chunk_pointers = {
+                let runtime_before = db.inner.engine.read().expect("engine runtime lock");
+                let docs_before = runtime_before
+                    .persisted_tables
+                    .get("docs")
+                    .expect("persisted docs before insert");
+                let page_store = PagerReadStore { db: &db };
+                let manifest_before = read_overflow(&page_store, docs_before.pointer)
+                    .expect("read paged manifest before insert");
+                let manifest_before = decode_paged_table_manifest_payload(&manifest_before)
+                    .expect("decode paged manifest before insert");
+                assert!(
+                    manifest_before.chunks.len() > 2,
+                    "expected multiple chunks before insert"
+                );
+                manifest_before
+                    .chunks
+                    .iter()
+                    .take(manifest_before.chunks.len() - 1)
+                    .map(|chunk| chunk.pointer)
+                    .collect::<Vec<_>>()
+            };
+
+            let insert = db
+                .prepare("INSERT INTO docs VALUES ($1, $2, $3)")
+                .expect("prepare insert after reopen");
+            insert
+                .execute(&[
+                    Value::Int64(97),
+                    Value::Int64(9600),
+                    Value::Text("z".repeat(2048)),
+                ])
+                .expect("insert row after reopen");
+
+            untouched_chunk_pointers
+        };
+
+        let db = Db::open_or_create(&path, config).expect("reopen mutated db");
+        let preserved_untouched = {
+            let runtime_after = db.inner.engine.read().expect("engine runtime lock");
+            let docs_after = runtime_after
+                .persisted_tables
+                .get("docs")
+                .expect("persisted docs after insert");
+            assert!(
+                docs_after.pointer.is_table_paged_manifest(),
+                "inserted table should remain paged"
+            );
+            assert!(
+                docs_after.pk_index_root.is_none(),
+                "non-persistent pk config should not write a pk locator root"
             );
             let page_store = PagerReadStore { db: &db };
             let manifest_after = read_overflow(&page_store, docs_after.pointer)
@@ -22704,11 +23962,15 @@ mod tests {
         let insert = txn
             .prepare("INSERT INTO docs VALUES ($1, $2)")
             .expect("prepare insert");
+        let large_body = "x".repeat(2048);
         for i in 0_i64..64_i64 {
             insert
                 .execute_in(
                     &mut txn,
-                    &[Value::Int64(i + 1), Value::Text(format!("body-{i}"))],
+                    &[
+                        Value::Int64(i + 1),
+                        Value::Text(format!("body-{i}-{large_body}")),
+                    ],
                 )
                 .expect("insert row");
         }
@@ -22767,11 +24029,15 @@ mod tests {
         let insert = txn
             .prepare("INSERT INTO docs VALUES ($1, $2)")
             .expect("prepare insert");
+        let large_body = "x".repeat(2048);
         for i in 0_i64..64_i64 {
             insert
                 .execute_in(
                     &mut txn,
-                    &[Value::Int64(i + 1), Value::Text(format!("body-{i}"))],
+                    &[
+                        Value::Int64(i + 1),
+                        Value::Text(format!("body-{i}-{large_body}")),
+                    ],
                 )
                 .expect("insert row");
         }
@@ -22812,7 +24078,16 @@ mod tests {
         db.execute("CREATE UNIQUE INDEX Libraries_kind_unique ON Libraries (kind) WHERE kind != 3")
             .expect("create partial unique index");
 
-        db.execute("INSERT INTO Libraries (id, name, kind) VALUES (11, 'Storage One', 3)")
+        let large_name = "x".repeat(70_000);
+        let insert = db
+            .prepare("INSERT INTO Libraries (id, name, kind) VALUES ($1, $2, $3)")
+            .expect("prepare first excluded row");
+        insert
+            .execute(&[
+                Value::Int64(11),
+                Value::Text(format!("Storage One {large_name}")),
+                Value::Int64(3),
+            ])
             .expect("insert excluded row");
         let json_after_first = db
             .inspect_storage_state_json()
@@ -22823,10 +24098,14 @@ mod tests {
         );
 
         let prepared = db
-            .prepare("INSERT INTO Libraries (id, name, kind) VALUES (12, 'Storage Two', 3)")
+            .prepare("INSERT INTO Libraries (id, name, kind) VALUES ($1, $2, $3)")
             .expect("prepare second excluded row after redefer");
         prepared
-            .execute(&[])
+            .execute(&[
+                Value::Int64(12),
+                Value::Text(format!("Storage Two {large_name}")),
+                Value::Int64(3),
+            ])
             .expect("execute second excluded row after redefer");
         assert_eq!(
             scalar_i64(
@@ -27230,6 +28509,183 @@ mod tests {
     }
 
     #[test]
+    fn paged_row_storage_scalar_filtered_aggregate_keeps_deferred_table_unloaded() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir
+            .path()
+            .join("paged-row-storage-scalar-filtered-aggregate.ddb");
+        let config = DbConfig {
+            paged_row_storage: true,
+            ..DbConfig::default()
+        };
+
+        {
+            let db = Db::open_or_create(&path, config.clone()).expect("create db");
+            db.execute(
+                "CREATE TABLE orders (
+                    id INTEGER PRIMARY KEY,
+                    user_id INTEGER,
+                    amount FLOAT64,
+                    body TEXT
+                )",
+            )
+            .expect("create orders");
+            let large_body = "x".repeat(2048);
+            let mut txn = db.transaction().expect("begin txn");
+            let insert = txn
+                .prepare("INSERT INTO orders VALUES ($1, $2, $3, $4)")
+                .expect("prepare insert");
+            for i in 0_i64..128_i64 {
+                insert
+                    .execute_in(
+                        &mut txn,
+                        &[
+                            Value::Int64(i),
+                            Value::Int64(i % 4),
+                            Value::Float64(i as f64 + 0.5),
+                            Value::Text(large_body.clone()),
+                        ],
+                    )
+                    .expect("insert row");
+            }
+            txn.commit().expect("commit rows");
+            db.checkpoint().expect("checkpoint");
+        }
+
+        let db = Db::open_or_create(&path, config).expect("reopen with paged storage");
+        let aggregate = db
+            .prepare("SELECT COUNT(*), SUM(amount) FROM orders WHERE user_id = $1")
+            .expect("prepare aggregate");
+        assert!(
+            aggregate.simple_scalar_filtered_aggregate.is_some(),
+            "expected prepared scalar aggregate cache plan"
+        );
+        let result = aggregate
+            .execute(&[Value::Int64(2)])
+            .expect("scalar filtered aggregate");
+        assert_eq!(result.rows().len(), 1);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[Value::Int64(32), Value::Float64(2064.0)]
+        );
+        let plan = aggregate
+            .simple_scalar_filtered_aggregate
+            .as_ref()
+            .expect("prepared scalar aggregate plan");
+        assert_eq!(
+            plan.cache.lock().expect("cache lock").entries.len(),
+            1,
+            "expected first aggregate execution to populate the cache"
+        );
+        let cached = aggregate
+            .execute(&[Value::Int64(2)])
+            .expect("cached scalar filtered aggregate");
+        assert_eq!(cached.rows(), result.rows());
+        assert_eq!(
+            plan.cache.lock().expect("cache lock").entries.len(),
+            1,
+            "expected repeated aggregate execution to reuse the cached key"
+        );
+
+        let json_after = db
+            .inspect_storage_state_json()
+            .expect("json after scalar filtered aggregate");
+        assert!(
+            json_after.contains("\"loaded_table_count\":0"),
+            "expected scalar filtered aggregate to keep table deferred, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"deferred_table_count\":1"),
+            "expected scalar filtered aggregate to keep one deferred table, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"rows_in_memory_count\":0"),
+            "expected zero resident rows after scalar filtered aggregate, got: {json_after}"
+        );
+    }
+
+    #[test]
+    fn resident_scalar_filtered_aggregate_cache_invalidates_after_write() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir
+            .path()
+            .join("resident-scalar-filtered-aggregate-cache.ddb");
+        let config = DbConfig {
+            paged_row_storage: false,
+            retain_paged_row_sources_after_commit: true,
+            wal_checkpoint_threshold_pages: 0,
+            wal_checkpoint_threshold_bytes: 0,
+            ..DbConfig::default()
+        };
+        let db = Db::open_or_create(&path, config).expect("create db");
+        db.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, amount FLOAT64)")
+            .expect("create orders");
+        let mut txn = db.transaction().expect("begin txn");
+        let insert = txn
+            .prepare("INSERT INTO orders VALUES ($1, $2, $3)")
+            .expect("prepare insert");
+        for i in 0_i64..16_i64 {
+            insert
+                .execute_in(
+                    &mut txn,
+                    &[
+                        Value::Int64(i),
+                        Value::Int64(i % 4),
+                        Value::Float64(i as f64 + 0.5),
+                    ],
+                )
+                .expect("insert row");
+        }
+        txn.commit().expect("commit rows");
+
+        let aggregate = db
+            .prepare("SELECT COUNT(*), SUM(amount) FROM orders WHERE user_id = $1")
+            .expect("prepare aggregate");
+        let plan = aggregate
+            .simple_scalar_filtered_aggregate
+            .as_ref()
+            .expect("prepared scalar aggregate plan");
+        let result = aggregate
+            .execute(&[Value::Int64(2)])
+            .expect("resident aggregate");
+        assert_eq!(
+            result.rows()[0].values(),
+            &[Value::Int64(4), Value::Float64(34.0)]
+        );
+        assert_eq!(
+            plan.cache.lock().expect("cache lock").entries.len(),
+            1,
+            "expected resident aggregate execution to populate the cache"
+        );
+        let cached = aggregate
+            .execute(&[Value::Int64(2)])
+            .expect("cached resident aggregate");
+        assert_eq!(cached.rows(), result.rows());
+        assert_eq!(
+            plan.cache.lock().expect("cache lock").entries.len(),
+            1,
+            "expected repeated resident aggregate execution to reuse the cache"
+        );
+
+        db.prepare("INSERT INTO orders VALUES ($1, $2, $3)")
+            .expect("prepare autocommit insert")
+            .execute(&[Value::Int64(100), Value::Int64(2), Value::Float64(10.0)])
+            .expect("insert new matching row");
+        let after_write = aggregate
+            .execute(&[Value::Int64(2)])
+            .expect("resident aggregate after write");
+        assert_eq!(
+            after_write.rows()[0].values(),
+            &[Value::Int64(5), Value::Float64(44.0)]
+        );
+        assert_eq!(
+            plan.cache.lock().expect("cache lock").entries.len(),
+            2,
+            "expected post-write aggregate to use a new snapshot cache key"
+        );
+    }
+
+    #[test]
     fn paged_row_storage_grouped_numeric_aggregate_with_order_limit_offset_keeps_deferred_table_unloaded(
     ) {
         let tempdir = TempDir::new().expect("tempdir");
@@ -29256,11 +30712,12 @@ mod tests {
         let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
         db.execute("CREATE TABLE m (id INTEGER PRIMARY KEY, label TEXT)")
             .expect("create m");
+        let label = "value-with-enough-text-to-require-paged-row-storage".repeat(64);
         for i in 0..32 {
-            db.execute(&format!(
-                "INSERT INTO m (id, label) VALUES ({i}, 'value-{i}-with-some-text')"
-            ))
-            .expect("insert m");
+            db.prepare("INSERT INTO m (id, label) VALUES ($1, $2)")
+                .expect("prepare insert")
+                .execute(&[Value::Int64(i), Value::Text(label.clone())])
+                .expect("insert m");
         }
         let json = db
             .inspect_storage_state_json()
@@ -29285,9 +30742,9 @@ mod tests {
             json.contains("\"wal_on_disk_versions\":"),
             "missing wal_on_disk_versions: {json}"
         );
-        // With default paged_row_storage: true, the table stays deferred
-        // after the autocommit insert. Only non-paged paths materialize
-        // table data into memory.
+        // With default paged_row_storage: true, tables large enough to need
+        // chunked storage stay deferred after autocommit inserts. Only small
+        // single-payload tables stay resident in memory.
         assert!(
             json.contains("\"deferred_table_count\":1"),
             "expected one deferred table with paged_row_storage=true, got: {json}"
@@ -29297,6 +30754,78 @@ mod tests {
         assert!(
             json.contains("\"rows_in_memory_count\":0"),
             "expected zero resident rows with paged_row_storage=true, got: {json}"
+        );
+    }
+
+    #[test]
+    fn paged_row_storage_keeps_small_append_table_single_payload() {
+        let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
+        db.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, amount FLOAT64)")
+            .expect("create orders");
+        let insert = db
+            .prepare("INSERT INTO orders (id, user_id, amount) VALUES ($1, $2, $3)")
+            .expect("prepare insert");
+        for i in 0_i64..128_i64 {
+            insert
+                .execute(&[Value::Int64(i), Value::Int64(i % 16), Value::Float64(9.99)])
+                .expect("insert order");
+        }
+
+        let runtime = db.inner.engine.read().expect("runtime lock");
+        let state = runtime
+            .persisted_tables
+            .get("orders")
+            .expect("orders persisted state");
+        assert!(
+            !state.pointer.is_table_paged_manifest(),
+            "small append-only tables should avoid paged manifest overhead"
+        );
+        assert!(
+            runtime.tables.contains_key("orders"),
+            "small single-payload table should remain resident"
+        );
+        assert_eq!(runtime.deferred_table_names().count(), 0);
+    }
+
+    #[test]
+    fn paged_row_storage_converts_small_payload_after_chunk_threshold() {
+        let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
+        db.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT)")
+            .expect("create docs");
+        let insert = db
+            .prepare("INSERT INTO docs (id, body) VALUES ($1, $2)")
+            .expect("prepare insert");
+        let body = "x".repeat(2048);
+        for i in 0_i64..40_i64 {
+            insert
+                .execute(&[Value::Int64(i + 1), Value::Text(body.clone())])
+                .expect("insert doc");
+        }
+
+        {
+            let runtime = db.inner.engine.read().expect("runtime lock");
+            let state = runtime
+                .persisted_tables
+                .get("docs")
+                .expect("docs persisted state");
+            assert!(
+                state.pointer.is_table_paged_manifest(),
+                "large append-only tables should convert to paged storage"
+            );
+            assert!(
+                runtime
+                    .deferred_table_names()
+                    .any(|name| name.eq_ignore_ascii_case("docs")),
+                "converted paged table should be re-deferred after write"
+            );
+        }
+
+        assert_eq!(
+            scalar_i64(
+                &db.execute("SELECT COUNT(*) FROM docs")
+                    .expect("count docs rows")
+            ),
+            40
         );
     }
 
@@ -29819,6 +31348,10 @@ mod tests {
         let prepared = db
             .prepare("SELECT name FROM users WHERE id >= $1 AND id < $2 ORDER BY id LIMIT $3")
             .expect("prepare range lookup");
+        assert!(
+            prepared.simple_row_id_range_projection.is_some(),
+            "expected prepared range lookup to cache the row-id range plan"
+        );
         let result = prepared
             .execute(&[Value::Int64(10), Value::Int64(20), Value::Int64(3)])
             .expect("execute prepared range lookup");
@@ -29856,6 +31389,107 @@ mod tests {
         assert!(
             json_after.contains("\"rows_in_memory_count\":0"),
             "expected zero resident rows after prepared deferred range lookup, got: {json_after}"
+        );
+    }
+
+    #[test]
+    fn prepared_row_id_join_uses_deferred_locator_cache() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir.path().join("prepared-deferred-row-id-join.ddb");
+        let db = Db::open_or_create(&path, DbConfig::default()).expect("create db");
+        db.execute("CREATE TABLE join_users (id INT64 PRIMARY KEY, name TEXT, body TEXT)")
+            .expect("create join_users");
+        db.execute("CREATE TABLE join_profiles (id INT64 PRIMARY KEY, bio TEXT, body TEXT)")
+            .expect("create join_profiles");
+
+        let body = "x".repeat(1024);
+        let mut txn = db.transaction().expect("begin txn");
+        let users = txn
+            .prepare("INSERT INTO join_users (id, name, body) VALUES ($1, $2, $3)")
+            .expect("prepare users");
+        let profiles = txn
+            .prepare("INSERT INTO join_profiles (id, bio, body) VALUES ($1, $2, $3)")
+            .expect("prepare profiles");
+        for id in 1_i64..=256_i64 {
+            users
+                .execute_in(
+                    &mut txn,
+                    &[
+                        Value::Int64(id),
+                        Value::Text(format!("u{id}")),
+                        Value::Text(body.clone()),
+                    ],
+                )
+                .expect("insert user");
+            profiles
+                .execute_in(
+                    &mut txn,
+                    &[
+                        Value::Int64(id),
+                        Value::Text(format!("b{id}")),
+                        Value::Text(body.clone()),
+                    ],
+                )
+                .expect("insert profile");
+        }
+        txn.commit().expect("commit rows");
+
+        {
+            let runtime = db.inner.engine.read().expect("engine runtime lock");
+            for table_name in ["join_users", "join_profiles"] {
+                let table = runtime
+                    .persisted_tables
+                    .get(table_name)
+                    .expect("persisted table after commit");
+                assert!(
+                    table.pointer.is_table_paged_manifest(),
+                    "expected benchmark-shaped table {table_name} to use paged storage"
+                );
+                assert!(
+                    runtime.has_deferred_paged_row_locator_cache_for_tests(table_name),
+                    "expected INT64 primary-key table {table_name} to build a deferred locator cache"
+                );
+            }
+        }
+
+        let prepared = db
+            .prepare(
+                "SELECT u.name, p.bio \
+                 FROM join_users AS u \
+                 JOIN join_profiles AS p ON u.id = p.id \
+                 WHERE u.id = $1",
+            )
+            .expect("prepare join lookup");
+        assert!(
+            prepared.simple_row_id_join_projection.is_some(),
+            "expected prepared join lookup to cache the row-id join plan"
+        );
+        let result = prepared
+            .execute(&[Value::Int64(42)])
+            .expect("execute prepared join lookup");
+        assert_eq!(result.rows().len(), 1);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[
+                Value::Text("u42".to_string()),
+                Value::Text("b42".to_string())
+            ]
+        );
+
+        let json_after = db
+            .inspect_storage_state_json()
+            .expect("json after prepared join lookup");
+        assert!(
+            json_after.contains("\"loaded_table_count\":0"),
+            "expected prepared join lookup to avoid materialization, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"deferred_table_count\":2"),
+            "expected both join tables to remain deferred, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"rows_in_memory_count\":0"),
+            "expected zero resident rows after prepared deferred join lookup, got: {json_after}"
         );
     }
 
