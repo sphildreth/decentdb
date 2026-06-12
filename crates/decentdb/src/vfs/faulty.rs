@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::ThreadId;
 
@@ -160,6 +161,32 @@ impl VfsFile for FaultyVfsFile {
         }
     }
 
+    fn write_all_at_many(&self, writes: &[(u64, &[u8])]) -> Result<()> {
+        if self.state.can_passthrough_batch() {
+            return self.inner.write_all_at_many(writes);
+        }
+
+        for (offset, buf) in writes {
+            let mut cursor = 0;
+            while cursor < buf.len() {
+                let written = self.write_at(*offset + cursor as u64, &buf[cursor..])?;
+                if written == 0 {
+                    return Err(DbError::io(
+                        format!(
+                            "short write on {} at offset {}: expected {} bytes, got {cursor}",
+                            self.path().display(),
+                            *offset + cursor as u64,
+                            buf.len()
+                        ),
+                        std::io::Error::new(std::io::ErrorKind::WriteZero, "short write"),
+                    ));
+                }
+                cursor += written;
+            }
+        }
+        Ok(())
+    }
+
     fn advise_sequential(&self) -> Result<()> {
         self.inner.advise_sequential()
     }
@@ -236,6 +263,7 @@ impl VfsFile for FaultyVfsFile {
 
 #[derive(Debug, Default)]
 struct FaultState {
+    active_failpoints: AtomicUsize,
     failpoints: Mutex<HashMap<String, Vec<Failpoint>>>,
     hits: Mutex<HashMap<String, u64>>,
     logs: Mutex<Vec<FailpointLogEntry>>,
@@ -243,7 +271,20 @@ struct FaultState {
 }
 
 impl FaultState {
+    fn can_passthrough_batch(&self) -> bool {
+        if !self.has_active_failpoints() {
+            return true;
+        }
+        if !self.is_owner_thread() {
+            return true;
+        }
+        self.failpoints.lock().expect("fault state lock").is_empty()
+    }
+
     fn decision(&self, label: &str) -> FaultDecision {
+        if !self.has_active_failpoints() {
+            return FaultDecision::Untracked;
+        }
         if !self.is_owner_thread() {
             return FaultDecision::Untracked;
         }
@@ -277,6 +318,10 @@ impl FaultState {
         }
 
         FaultDecision::Pass { hit }
+    }
+
+    fn has_active_failpoints(&self) -> bool {
+        self.active_failpoints.load(Ordering::Acquire) != 0
     }
 
     fn log(&self, label: &str, hit: u64, outcome: &str) {
@@ -326,6 +371,7 @@ pub(crate) fn install_failpoint(failpoint: Failpoint) -> Result<()> {
         .entry(failpoint.label.clone())
         .or_default()
         .push(failpoint);
+    state.active_failpoints.fetch_add(1, Ordering::Release);
     Ok(())
 }
 
@@ -336,6 +382,7 @@ pub(crate) fn clear_failpoints() -> Result<()> {
         .lock()
         .map_err(|_| DbError::internal("fault state lock poisoned"))?
         .clear();
+    state.active_failpoints.store(0, Ordering::Release);
     state
         .hits
         .lock()
@@ -602,6 +649,38 @@ mod tests {
 
         let logs = failpoint_logs().expect("read logs");
         assert!(logs.is_empty(), "normal I/O should not be logged");
+
+        clear_failpoints().expect("clear failpoints");
+    }
+
+    #[test]
+    fn batched_writes_honor_failpoints() {
+        let _guard = super::test_failpoint_lock().lock().expect("test lock");
+        clear_failpoints().expect("clear failpoints");
+        install_failpoint(Failpoint {
+            label: "db.write_page".to_string(),
+            trigger_on: 2,
+            action: FailAction::PartialWrite { bytes: 2 },
+        })
+        .expect("install partial write");
+
+        let vfs = FaultyVfs::wrap(Arc::new(crate::vfs::mem::MemVfs::default()));
+        let file = vfs
+            .open(
+                Path::new(":memory:"),
+                OpenMode::CreateNew,
+                FileKind::Database,
+            )
+            .expect("create file");
+
+        file.write_all_at_many(&[(4096, &[1, 2, 3]), (8192, &[4, 5, 6])])
+            .expect("batched write retries partial writes");
+        let logs = failpoint_logs().expect("read logs");
+        assert!(
+            logs.iter()
+                .any(|entry| entry.label == "db.write_page" && entry.outcome == "partial_write:2"),
+            "partial batched write should be logged"
+        );
 
         clear_failpoints().expect("clear failpoints");
     }

@@ -5347,6 +5347,100 @@ mod tests {
     }
 
     #[test]
+    fn ffi_reader_prepared_statement_refreshes_after_external_checkpoint() {
+        let unique = format!(
+            "ffi-checkpoint-reader-refresh-{}-{}.ddb",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        );
+        let path_buf = std::env::temp_dir().join(unique);
+        let path = CString::new(path_buf.to_string_lossy().as_bytes()).expect("path");
+        let mut setup = ptr::null_mut();
+        let mut reader = ptr::null_mut();
+        let mut writer = ptr::null_mut();
+        let mut result = ptr::null_mut();
+
+        assert_eq!(ddb_db_open_or_create(path.as_ptr(), &mut setup), DDB_OK);
+        let create = CString::new("CREATE TABLE t (id INTEGER)").expect("create");
+        assert_eq!(
+            ddb_db_execute(setup, create.as_ptr(), ptr::null(), 0, &mut result),
+            DDB_OK
+        );
+        assert_eq!(ddb_result_free(&mut result), DDB_OK);
+        assert_eq!(ddb_db_begin_transaction(setup), DDB_OK);
+        for id in 0_i64..100_i64 {
+            let insert = CString::new(format!("INSERT INTO t VALUES ({id})")).expect("insert");
+            assert_eq!(
+                ddb_db_execute(setup, insert.as_ptr(), ptr::null(), 0, &mut result),
+                DDB_OK
+            );
+            assert_eq!(ddb_result_free(&mut result), DDB_OK);
+        }
+        let mut lsn = 0;
+        assert_eq!(ddb_db_commit_transaction(setup, &mut lsn), DDB_OK);
+        assert_eq!(ddb_db_free(&mut setup), DDB_OK);
+
+        assert_eq!(ddb_db_open_or_create(path.as_ptr(), &mut reader), DDB_OK);
+        let select_all = CString::new("SELECT * FROM t").expect("select all");
+        let mut select_stmt = ptr::null_mut();
+        assert_eq!(
+            ddb_db_prepare(reader, select_all.as_ptr(), &mut select_stmt),
+            DDB_OK
+        );
+        let mut seen_rows = 0;
+        loop {
+            let mut has_row = 0;
+            assert_eq!(ddb_stmt_step(select_stmt, &mut has_row), DDB_OK);
+            if has_row == 0 {
+                break;
+            }
+            seen_rows += 1;
+        }
+        assert_eq!(seen_rows, 100);
+        assert_eq!(ddb_stmt_free(&mut select_stmt), DDB_OK);
+
+        assert_eq!(ddb_db_open_or_create(path.as_ptr(), &mut writer), DDB_OK);
+        assert_eq!(ddb_db_begin_transaction(writer), DDB_OK);
+        for id in 100_i64..200_i64 {
+            let insert = CString::new(format!("INSERT INTO t VALUES ({id})")).expect("insert");
+            assert_eq!(
+                ddb_db_execute(writer, insert.as_ptr(), ptr::null(), 0, &mut result),
+                DDB_OK
+            );
+            assert_eq!(ddb_result_free(&mut result), DDB_OK);
+        }
+        assert_eq!(ddb_db_commit_transaction(writer, &mut lsn), DDB_OK);
+        assert_eq!(ddb_db_checkpoint(writer), DDB_OK);
+
+        let count = CString::new("SELECT COUNT(*) FROM t").expect("count");
+        let mut count_stmt = ptr::null_mut();
+        assert_eq!(
+            ddb_db_prepare(reader, count.as_ptr(), &mut count_stmt),
+            DDB_OK
+        );
+        let mut has_row = 0;
+        assert_eq!(ddb_stmt_step(count_stmt, &mut has_row), DDB_OK);
+        assert_eq!(has_row, 1);
+        let mut value = DdbValue::default();
+        assert_eq!(ddb_stmt_value_copy(count_stmt, 0, &mut value), DDB_OK);
+        assert_eq!(value.int64_value, 200);
+        assert_eq!(ddb_value_dispose(&mut value), DDB_OK);
+
+        assert_eq!(ddb_stmt_free(&mut count_stmt), DDB_OK);
+        assert_eq!(ddb_db_free(&mut writer), DDB_OK);
+        assert_eq!(ddb_db_free(&mut reader), DDB_OK);
+
+        let _ = std::fs::remove_file(&path_buf);
+        let mut wal_path = path_buf.clone();
+        wal_path.as_mut_os_string().push(".wal");
+        let _ = std::fs::remove_file(wal_path);
+        let _ = std::fs::remove_file(path_buf.with_extension("ddb.shm"));
+    }
+
+    #[test]
     fn ffi_reused_prepared_stmt_across_checkpoint_keeps_explicit_txn_commit_working() {
         let unique = format!(
             "ffi-checkpoint-reuse-{}-{}.ddb",

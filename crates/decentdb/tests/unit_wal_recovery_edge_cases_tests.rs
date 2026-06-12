@@ -126,12 +126,15 @@ fn uncommitted_wal_frames_are_not_visible_after_reopen() {
 
     // Simulate a crash before the commit frame is written.
     Db::clear_failpoints().unwrap();
-    Db::install_failpoint("wal.write_commit", "error", 1, 0).unwrap();
     {
         let db = Db::open(&path, config.clone()).unwrap();
-        let _ = db.execute("INSERT INTO t VALUES (2)"); // expected to fail
+        Db::install_failpoint("wal.write_commit", "error", 1, 0).unwrap();
+        let error = db
+            .execute("INSERT INTO t VALUES (2)")
+            .expect_err("commit frame write should fail");
+        assert!(matches!(error, DbError::Io { .. }));
+        Db::clear_failpoints().unwrap();
     }
-    Db::clear_failpoints().unwrap();
 
     // Re-open: only committed row (id=1) should be visible.
     let db = Db::open(&path, config).unwrap();

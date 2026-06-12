@@ -288,6 +288,10 @@ impl WalIndex {
         }
     }
 
+    pub(crate) fn has_dirty_since_demote(&self) -> bool {
+        !self.dirty_since_demote.is_empty()
+    }
+
     pub(crate) fn unmark_dirty_since_demote(&mut self, page_id: PageId) {
         if !self.dirty_since_demote_set.remove(&page_id) {
             return;

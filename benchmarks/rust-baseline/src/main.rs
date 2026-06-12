@@ -1,8 +1,7 @@
-// DecentDB raw-engine baseline benchmark.
+// DecentDB rust-baseline benchmark.
 //
-// Mirrors the schema/queries used by the .NET AdoNet/MicroOrm/EfCore benchmark
-// suite at /tmp/tmp-opus47-decentdb-net-tests, but skips every layer above the
-// `decentdb` crate so the numbers represent the engine's theoretical ceiling.
+// Mirrors the schema and query shapes used by the music-library comparison
+// workload, with direct DecentDB and SQLite reference runners.
 //
 // Hot-path pattern (identical to the internal `decentdb-benchmark` scenarios):
 //   1. db.transaction()          -> SqlTransaction (exclusive runtime state)
@@ -12,21 +11,22 @@
 //
 // Scales mirror DecentDB.Compare.Common.Scale exactly.
 //
-// Output: pretty-printed JSON to results/<datetime>-rust-baseline-<scale>.json with the
-// same shape as RunReport so it can be diffed against the .NET reports.
+// Output: pretty-printed JSON to
+// results/<datetime>-rust-baseline-<profile>-<scale>.json.
 
-use std::fs;
 use std::fmt::Write as _;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{bail, Context};
 use clap::{Parser, ValueEnum};
 use decentdb::{DbConfig, PreparedStatement, Value};
+use rusqlite::{params, Connection as SqliteConnection};
 use serde::{Deserialize, Serialize};
 
 #[derive(Parser, Debug)]
-#[command(version, about = "DecentDB raw-engine baseline benchmark")]
+#[command(version, about = "DecentDB rust-baseline benchmark")]
 struct Cli {
     /// Scale: smoke | medium | full | huge
     #[arg(long, default_value = "smoke")]
@@ -34,7 +34,7 @@ struct Cli {
     /// Output directory for JSON report.
     #[arg(long, default_value = "results")]
     out_dir: PathBuf,
-    /// Database path (defaults to ./run-rust-<scale>.ddb).
+    /// Database path (defaults by engine and scale).
     #[arg(long)]
     db_path: Option<PathBuf>,
     /// Seed for the deterministic plan.
@@ -43,12 +43,41 @@ struct Cli {
     /// Engine profile: default | resident-hot-read.
     #[arg(long, value_enum, default_value_t = BenchmarkProfile::Default)]
     profile: BenchmarkProfile,
+    /// Engine implementation: decentdb | sqlite.
+    #[arg(long, value_enum, default_value_t = BenchmarkEngine::DecentDb)]
+    engine: BenchmarkEngine,
     /// Generate an HTML report from historical JSON files in the output directory.
     #[arg(long)]
     report: bool,
-    /// HTML output path for --report (defaults to <out-dir>/report.html).
+    /// Run all scales in order (smoke, medium, full, huge), then generate the HTML report.
+    #[arg(long)]
+    benchmark: bool,
+    /// HTML output path for --report or --benchmark (defaults to <out-dir>/report.html).
     #[arg(long)]
     report_file: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum BenchmarkEngine {
+    #[value(name = "decentdb", alias = "decent-db")]
+    DecentDb,
+    Sqlite,
+}
+
+impl BenchmarkEngine {
+    fn binding_name(self) -> &'static str {
+        match self {
+            Self::DecentDb => "RustRaw",
+            Self::Sqlite => "SQLiteRusqlite",
+        }
+    }
+
+    fn default_db_path(self, scale: Scale) -> PathBuf {
+        match self {
+            Self::DecentDb => PathBuf::from(format!("run-rust-{}.ddb", scale.name)),
+            Self::Sqlite => PathBuf::from(format!("run-rust-sqlite-{}.db", scale.name)),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -119,6 +148,7 @@ const HUGE: Scale = Scale {
     max_songs_per_album: 10,
     songs_cap: 25_000_000,
 };
+const BENCHMARK_SCALES: [Scale; 4] = [SMOKE, MEDIUM, FULL, HUGE];
 
 fn parse_scale(name: &str) -> Scale {
     match name.to_ascii_lowercase().as_str() {
@@ -149,7 +179,9 @@ impl Rng {
         z ^ (z >> 31)
     }
     fn skip(&mut self, count: u64) {
-        self.0 = self.0.wrapping_add(SPLITMIX64_INCREMENT.wrapping_mul(count));
+        self.0 = self
+            .0
+            .wrapping_add(SPLITMIX64_INCREMENT.wrapping_mul(count));
     }
     /// Uniform in [0, n).
     fn gen_range(&mut self, n: u32) -> u32 {
@@ -537,9 +569,7 @@ fn delete_db_files(path: &Path) {
     let _ = fs::remove_file(path);
     // DecentDB writes <db>.wal as the WAL companion (per the engine's WAL
     // suffix convention used elsewhere in the workspace).
-    let mut wal = path.as_os_str().to_owned();
-    wal.push(".wal");
-    let _ = fs::remove_file(PathBuf::from(&wal));
+    let _ = fs::remove_file(decentdb_wal_path(path));
     // Belt-and-suspenders: the .NET tests use both -wal and .wal historically.
     if let Some(stem) = path.file_name().and_then(|s| s.to_str()) {
         if let Some(parent) = path.parent() {
@@ -549,42 +579,107 @@ fn delete_db_files(path: &Path) {
     }
 }
 
+fn file_size(path: &Path) -> u64 {
+    fs::metadata(path).map(|meta| meta.len()).unwrap_or(0)
+}
+
+fn decentdb_wal_path(path: &Path) -> PathBuf {
+    let mut wal = path.as_os_str().to_owned();
+    wal.push(".wal");
+    PathBuf::from(wal)
+}
+
 fn run(cli: Cli) -> anyhow::Result<()> {
-    if cli.report_file.is_some() && !cli.report {
-        bail!("--report-file requires --report");
+    if cli.report_file.is_some() && !cli.report && !cli.benchmark {
+        bail!("--report-file requires --report or --benchmark");
+    }
+
+    if cli.benchmark {
+        return run_benchmark_suite(&cli);
     }
 
     if cli.report {
-        let report_file = cli
-            .report_file
-            .clone()
-            .unwrap_or_else(|| cli.out_dir.join("report.html"));
-        generate_html_report(&cli.out_dir, &report_file)?;
-        println!("Wrote {}", report_file.display());
+        generate_report_from_cli(&cli)?;
         return Ok(());
     }
 
     let scale = parse_scale(&cli.scale);
-    let db_path = cli
-        .db_path
-        .unwrap_or_else(|| PathBuf::from(format!("run-rust-{}.ddb", scale.name)));
+    run_single_benchmark(&cli, scale)
+}
+
+fn run_benchmark_suite(cli: &Cli) -> anyhow::Result<()> {
+    if cli.db_path.is_some() {
+        bail!("--db-path is not supported with --benchmark; each scale uses its own database path");
+    }
+    if cli.engine == BenchmarkEngine::Sqlite && cli.profile != BenchmarkProfile::Default {
+        bail!("--profile is only supported for --engine decentdb");
+    }
 
     println!(
-        "Summarizing seed plan: scale={} artists={} albums(target)={} songs_cap={}",
-        scale.name, scale.artists, scale.albums, scale.songs_cap
+        "Running rust-baseline benchmark suite: engine={:?} profile={} scales=smoke,medium,full,huge",
+        cli.engine,
+        if cli.engine == BenchmarkEngine::Sqlite {
+            "sqlite-wal-full"
+        } else {
+            cli.profile.as_str()
+        }
     );
-    let summary = summarize_seed_plan(scale, cli.seed);
+    for scale in BENCHMARK_SCALES {
+        println!("\n=== scale: {} ===", scale.name);
+        run_single_benchmark(cli, scale)?;
+    }
+    generate_report_from_cli(cli)?;
+    Ok(())
+}
+
+fn generate_report_from_cli(cli: &Cli) -> anyhow::Result<()> {
+    let report_file = cli
+        .report_file
+        .clone()
+        .unwrap_or_else(|| cli.out_dir.join("report.html"));
+    generate_html_report(&cli.out_dir, &report_file)?;
+    println!("Wrote {}", report_file.display());
+    Ok(())
+}
+
+fn run_single_benchmark(cli: &Cli, scale: Scale) -> anyhow::Result<()> {
+    if cli.engine == BenchmarkEngine::Sqlite && cli.profile != BenchmarkProfile::Default {
+        bail!("--profile is only supported for --engine decentdb");
+    }
+    let db_path = cli
+        .db_path
+        .clone()
+        .unwrap_or_else(|| cli.engine.default_db_path(scale));
+
+    run_single_benchmark_with_path(cli, scale, db_path)
+}
+
+fn run_single_benchmark_with_path(cli: &Cli, scale: Scale, db_path: PathBuf) -> anyhow::Result<()> {
+    let out_dir = cli.out_dir.clone();
+    let engine = cli.engine;
+    let profile = cli.profile;
+    let seed = cli.seed;
+
+    println!(
+        "Summarizing seed plan: engine={:?} scale={} artists={} albums(target)={} songs_cap={}",
+        engine, scale.name, scale.artists, scale.albums, scale.songs_cap
+    );
+    let summary = summarize_seed_plan(scale, seed);
     println!(
         "Plan: artists={} total_albums={} total_songs={}",
         scale.artists, summary.total_albums, summary.total_songs
     );
 
+    if engine == BenchmarkEngine::Sqlite {
+        return run_sqlite_benchmark(scale, seed, summary, db_path, out_dir);
+    }
+
     delete_db_files(&db_path);
 
     let mut report = RunReport {
-        binding: "RustRaw".to_string(),
+        binding: engine.binding_name().to_string(),
         scale_name: scale.name.to_string(),
-        benchmark_profile: cli.profile.as_str().to_string(),
+        benchmark_profile: profile.as_str().to_string(),
         target_artists: scale.artists,
         target_albums: scale.albums,
         target_songs_cap: scale.songs_cap,
@@ -596,7 +691,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     let mut rec = Recorder::new(&mut report);
 
     let db = rec.measure("connect_open", None, || {
-        decentdb::Db::create(&db_path, cli.profile.db_config()).expect("Db::create")
+        decentdb::Db::create(&db_path, profile.db_config()).expect("Db::create")
     });
 
     let ddl_batch = build_schema_ddl_batch();
@@ -626,7 +721,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 .expect("prepare artist batch");
             walk_seed_plan_select(
                 scale,
-                cli.seed,
+                seed,
                 SeedWalkEmit::ARTISTS,
                 |a| {
                     params[0] = Value::Int64(a.id);
@@ -653,7 +748,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         .expect("prepare albums");
     // ── Seed albums ───────────────────────────────────────────────
     rec.measure("seed_albums", Some(summary.total_albums), || {
-        seed_albums(&db, &insert_album, scale, cli.seed);
+        seed_albums(&db, &insert_album, scale, seed);
     });
 
     let insert_song: PreparedStatement = db
@@ -664,8 +759,27 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         .expect("prepare songs");
     // ── Seed songs ────────────────────────────────────────────────
     rec.measure("seed_songs", Some(summary.total_songs), || {
-        seed_songs(&db, &insert_song, scale, cli.seed);
+        seed_songs(&db, &insert_song, scale, seed);
     });
+
+    let wal_bytes_before = file_size(&decentdb_wal_path(&db_path));
+    let database_bytes_before = file_size(&db_path);
+    rec.measure("checkpoint_after_seed", None, || {
+        db.checkpoint_wal().expect("checkpoint wal after seed");
+    });
+    let wal_bytes_after = file_size(&decentdb_wal_path(&db_path));
+    let database_bytes_after = file_size(&db_path);
+    rec.add_extra("checkpoint_mode", serde_json::json!("wal"));
+    rec.add_extra("wal_bytes_before", serde_json::json!(wal_bytes_before));
+    rec.add_extra("wal_bytes_after", serde_json::json!(wal_bytes_after));
+    rec.add_extra(
+        "database_bytes_before",
+        serde_json::json!(database_bytes_before),
+    );
+    rec.add_extra(
+        "database_bytes_after",
+        serde_json::json!(database_bytes_after),
+    );
 
     // ── Queries ───────────────────────────────────────────────────
     rec.measure("query_count_songs", None, || {
@@ -755,18 +869,14 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     if let Ok(meta) = fs::metadata(&db_path) {
         report.database_size_bytes = meta.len();
     }
-    let mut wal = db_path.as_os_str().to_owned();
-    wal.push(".wal");
-    if let Ok(meta) = fs::metadata(PathBuf::from(&wal)) {
-        report.wal_size_bytes = meta.len();
-    }
+    report.wal_size_bytes = file_size(&decentdb_wal_path(&db_path));
     report.finished_unix = now_unix();
 
-    fs::create_dir_all(&cli.out_dir)?;
+    fs::create_dir_all(&out_dir)?;
     let datetime_stamp = format_unix_filename_stamp(report.finished_unix);
-    let out_path = cli.out_dir.join(format!(
+    let out_path = out_dir.join(format!(
         "{datetime_stamp}-rust-baseline-{}-{}.json",
-        cli.profile.as_str(),
+        report.benchmark_profile.as_str(),
         scale.name
     ));
     fs::write(&out_path, serde_json::to_string_pretty(&report)?)?;
@@ -776,6 +886,363 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     println!("Cleaned up temp DB files: {}", db_path.display());
 
     Ok(())
+}
+
+fn run_sqlite_benchmark(
+    scale: Scale,
+    seed: u64,
+    summary: SeedSummary,
+    db_path: PathBuf,
+    out_dir: PathBuf,
+) -> anyhow::Result<()> {
+    delete_db_files(&db_path);
+
+    let mut report = RunReport {
+        binding: BenchmarkEngine::Sqlite.binding_name().to_string(),
+        scale_name: scale.name.to_string(),
+        benchmark_profile: "sqlite-wal-full".to_string(),
+        target_artists: scale.artists,
+        target_albums: scale.albums,
+        target_songs_cap: scale.songs_cap,
+        started_unix: now_unix(),
+        database_path: db_path.display().to_string(),
+        ..Default::default()
+    };
+    let mut rec = Recorder::new(&mut report);
+
+    let conn = rec.measure("connect_open", None, || {
+        open_sqlite_wal_full(&db_path).expect("open sqlite")
+    });
+    rec.report.engine_version = sqlite_engine_version(&conn).unwrap_or_else(|_| "unknown".into());
+
+    let ddl_batch = build_schema_ddl_batch();
+    rec.measure("schema_create", None, || {
+        conn.execute_batch(&ddl_batch).expect("sqlite ddl batch");
+    });
+
+    let mut insert_artist = conn
+        .prepare(
+            "INSERT INTO artists (id, name, country, formed_year) \
+             VALUES (?1, ?2, ?3, ?4)",
+        )
+        .expect("prepare sqlite artists");
+    rec.measure("seed_artists", Some(u64::from(scale.artists)), || {
+        seed_sqlite_artists(&conn, &mut insert_artist, scale, seed);
+    });
+    drop(insert_artist);
+
+    let mut insert_album = conn
+        .prepare(
+            "INSERT INTO albums (id, artist_id, title, release_year) \
+             VALUES (?1, ?2, ?3, ?4)",
+        )
+        .expect("prepare sqlite albums");
+    rec.measure("seed_albums", Some(summary.total_albums), || {
+        seed_sqlite_albums(&conn, &mut insert_album, scale, seed);
+    });
+    drop(insert_album);
+
+    let mut insert_song = conn
+        .prepare(
+            "INSERT INTO songs (id, album_id, artist_id, title, duration_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )
+        .expect("prepare sqlite songs");
+    rec.measure("seed_songs", Some(summary.total_songs), || {
+        seed_sqlite_songs(&conn, &mut insert_song, scale, seed);
+    });
+    drop(insert_song);
+
+    let wal_bytes_before = file_size(&sqlite_wal_path(&db_path));
+    let database_bytes_before = file_size(&db_path);
+    let (busy, log_frames, checkpointed_frames) =
+        rec.measure("checkpoint_after_seed", None, || {
+            sqlite_checkpoint_truncate(&conn).expect("sqlite checkpoint after seed")
+        });
+    let wal_bytes_after = file_size(&sqlite_wal_path(&db_path));
+    let database_bytes_after = file_size(&db_path);
+    rec.add_extra("checkpoint_mode", serde_json::json!("truncate"));
+    rec.add_extra("wal_bytes_before", serde_json::json!(wal_bytes_before));
+    rec.add_extra("wal_bytes_after", serde_json::json!(wal_bytes_after));
+    rec.add_extra(
+        "database_bytes_before",
+        serde_json::json!(database_bytes_before),
+    );
+    rec.add_extra(
+        "database_bytes_after",
+        serde_json::json!(database_bytes_after),
+    );
+    rec.add_extra("sqlite_busy", serde_json::json!(busy));
+    rec.add_extra("sqlite_log_frames", serde_json::json!(log_frames));
+    rec.add_extra(
+        "sqlite_checkpointed_frames",
+        serde_json::json!(checkpointed_frames),
+    );
+
+    rec.measure("query_count_songs", None, || {
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM songs", [], |row| row.get(0))
+            .expect("sqlite count");
+        println!("    count=Some(Int64({count}))");
+    });
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM songs", [], |row| row.get(0))
+        .expect("sqlite count extra");
+    rec.add_extra("count", serde_json::json!(count));
+
+    rec.measure("query_aggregate_durations", None, || {
+        let row: (i64, i64, f64, i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), SUM(duration_ms), AVG(duration_ms), \
+                        MIN(duration_ms), MAX(duration_ms) FROM songs",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("sqlite aggregate durations");
+        println!("    agg_row={row:?}");
+    });
+
+    rec.measure("query_artist_by_id", None, || {
+        let target = i64::from(scale.artists) / 2 + 1;
+        let row: (i64, String, String, i64) = conn
+            .query_row(
+                "SELECT id, name, country, formed_year FROM artists WHERE id = ?1",
+                params![target],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("sqlite artist by id");
+        println!("    artist={row:?}");
+    });
+
+    rec.measure("query_top10_artists_by_songs", None, || {
+        let rows = sqlite_query_row_count(
+            &conn,
+            "SELECT a.id, a.name, COUNT(s.id) AS song_count
+             FROM artists a
+             JOIN songs s ON s.artist_id = a.id
+             GROUP BY a.id, a.name
+             ORDER BY song_count DESC
+             LIMIT 10",
+            [],
+        )
+        .expect("sqlite top10 artists");
+        println!("    rows={rows}");
+    });
+
+    rec.measure("query_top10_albums_by_songs", None, || {
+        let rows = sqlite_query_row_count(
+            &conn,
+            "SELECT al.id, al.title, COUNT(s.id) AS song_count
+             FROM albums al
+             JOIN songs s ON s.album_id = al.id
+             GROUP BY al.id, al.title
+             ORDER BY song_count DESC
+             LIMIT 10",
+            [],
+        )
+        .expect("sqlite top10 albums");
+        println!("    rows={rows}");
+    });
+
+    rec.measure("query_view_first_1000", None, || {
+        let rows = sqlite_query_row_count(
+            &conn,
+            "SELECT artist_id, artist_name, album_title, song_title \
+             FROM v_artist_songs LIMIT 1000",
+            [],
+        )
+        .expect("sqlite view 1000");
+        println!("    rows={rows}");
+    });
+
+    rec.measure("query_songs_for_artist_via_view", None, || {
+        let rows = sqlite_query_row_count(
+            &conn,
+            "SELECT album_title, song_title, duration_ms \
+             FROM v_artist_songs WHERE artist_id = ?1",
+            params![1_i64],
+        )
+        .expect("sqlite artist 1 view");
+        println!("    rows={rows}");
+    });
+
+    if let Ok(meta) = fs::metadata(&db_path) {
+        rec.report.database_size_bytes = meta.len();
+    }
+    rec.report.wal_size_bytes = file_size(&sqlite_wal_path(&db_path));
+    rec.report.finished_unix = now_unix();
+
+    fs::create_dir_all(&out_dir)?;
+    let datetime_stamp = format_unix_filename_stamp(rec.report.finished_unix);
+    let out_path = out_dir.join(format!(
+        "{datetime_stamp}-rust-baseline-{}-{}.json",
+        rec.report.benchmark_profile.as_str(),
+        scale.name
+    ));
+    fs::write(&out_path, serde_json::to_string_pretty(&rec.report)?)?;
+    println!("\nWrote {}", out_path.display());
+
+    drop(conn);
+    delete_db_files(&db_path);
+    println!("Cleaned up temp DB files: {}", db_path.display());
+
+    Ok(())
+}
+
+fn open_sqlite_wal_full(path: &Path) -> rusqlite::Result<SqliteConnection> {
+    let conn = SqliteConnection::open(path)?;
+    let journal_mode: String = conn.query_row("PRAGMA journal_mode=WAL;", [], |row| row.get(0))?;
+    assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+    conn.execute_batch(
+        "PRAGMA synchronous=FULL;
+         PRAGMA wal_autocheckpoint=0;",
+    )?;
+    let synchronous: i64 = conn.query_row("PRAGMA synchronous;", [], |row| row.get(0))?;
+    assert_eq!(synchronous, 2, "expected SQLite synchronous=FULL");
+    let wal_autocheckpoint: i64 =
+        conn.query_row("PRAGMA wal_autocheckpoint;", [], |row| row.get(0))?;
+    assert_eq!(
+        wal_autocheckpoint, 0,
+        "expected SQLite wal_autocheckpoint=0"
+    );
+    Ok(conn)
+}
+
+fn sqlite_engine_version(conn: &SqliteConnection) -> rusqlite::Result<String> {
+    conn.query_row("SELECT sqlite_version()", [], |row| row.get(0))
+}
+
+fn sqlite_checkpoint_truncate(conn: &SqliteConnection) -> rusqlite::Result<(i64, i64, i64)> {
+    conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+    })
+}
+
+fn sqlite_wal_path(path: &Path) -> PathBuf {
+    let mut wal = path.as_os_str().to_owned();
+    wal.push("-wal");
+    PathBuf::from(wal)
+}
+
+fn seed_sqlite_artists(
+    conn: &SqliteConnection,
+    stmt: &mut rusqlite::Statement<'_>,
+    scale: Scale,
+    seed: u64,
+) {
+    conn.execute_batch("BEGIN IMMEDIATE;")
+        .expect("begin sqlite artists");
+    let mut artist_name = String::with_capacity(32);
+    walk_seed_plan_select(
+        scale,
+        seed,
+        SeedWalkEmit::ARTISTS,
+        |a| {
+            artist_name.clear();
+            artist_name.push_str("Artist ");
+            write!(&mut artist_name, "{}", a.id).expect("write artist name");
+            stmt.execute(params![
+                a.id,
+                artist_name.as_str(),
+                a.country,
+                a.formed_year
+            ])
+            .expect("sqlite insert artist");
+        },
+        |_| {},
+        |_| {},
+    );
+    conn.execute_batch("COMMIT;")
+        .expect("commit sqlite artists");
+}
+
+fn seed_sqlite_albums(
+    conn: &SqliteConnection,
+    stmt: &mut rusqlite::Statement<'_>,
+    scale: Scale,
+    seed: u64,
+) {
+    conn.execute_batch("BEGIN IMMEDIATE;")
+        .expect("begin sqlite albums");
+    let mut album_title = String::with_capacity(32);
+    walk_seed_plan_select(
+        scale,
+        seed,
+        SeedWalkEmit::ALBUMS,
+        |_| {},
+        |al| {
+            album_title.clear();
+            album_title.push_str("Album ");
+            write!(&mut album_title, "{}", al.id).expect("write album title");
+            stmt.execute(params![
+                al.id,
+                al.artist_id,
+                album_title.as_str(),
+                al.release_year
+            ])
+            .expect("sqlite insert album");
+        },
+        |_| {},
+    );
+    conn.execute_batch("COMMIT;").expect("commit sqlite albums");
+}
+
+fn seed_sqlite_songs(
+    conn: &SqliteConnection,
+    stmt: &mut rusqlite::Statement<'_>,
+    scale: Scale,
+    seed: u64,
+) {
+    conn.execute_batch("BEGIN IMMEDIATE;")
+        .expect("begin sqlite songs");
+    let mut song_title = String::with_capacity(32);
+    walk_seed_plan_select(
+        scale,
+        seed,
+        SeedWalkEmit::SONGS,
+        |_| {},
+        |_| {},
+        |s| {
+            song_title.clear();
+            song_title.push_str("Song ");
+            write!(&mut song_title, "{}", s.id).expect("write song title");
+            stmt.execute(params![
+                s.id,
+                s.album_id,
+                s.artist_id,
+                song_title.as_str(),
+                s.duration_ms
+            ])
+            .expect("sqlite insert song");
+        },
+    );
+    conn.execute_batch("COMMIT;").expect("commit sqlite songs");
+}
+
+fn sqlite_query_row_count<P: rusqlite::Params>(
+    conn: &SqliteConnection,
+    sql: &str,
+    params: P,
+) -> rusqlite::Result<usize> {
+    let mut stmt = conn.prepare(sql)?;
+    let column_count = stmt.column_count();
+    let mut rows = stmt.query(params)?;
+    let mut count = 0usize;
+    while let Some(row) = rows.next()? {
+        for index in 0..column_count {
+            let _: rusqlite::types::Value = row.get(index)?;
+        }
+        count += 1;
+    }
+    Ok(count)
 }
 
 fn seed_albums(db: &decentdb::Db, prepared: &PreparedStatement, scale: Scale, seed: u64) {
@@ -980,6 +1447,7 @@ fn ordered_step_names(runs: &[HistoricalRun]) -> Vec<String> {
         "seed_artists",
         "seed_albums",
         "seed_songs",
+        "checkpoint_after_seed",
         "query_count_songs",
         "query_aggregate_durations",
         "query_artist_by_id",
@@ -1043,12 +1511,10 @@ fn civil_from_unix_days(days: i64) -> (i32, u32, u32) {
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let day_of_era = z - era * 146_097;
-    let year_of_era = (day_of_era - day_of_era / 1_460 + day_of_era / 36_524
-        - day_of_era / 146_096)
-        / 365;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
     let year = year_of_era + era * 400;
-    let day_of_year =
-        day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
     let month_prime = (5 * day_of_year + 2) / 153;
     let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
     let month = month_prime + if month_prime < 10 { 3 } else { -9 };
@@ -1527,7 +1993,7 @@ mod tests {
     use super::{
         format_unix_filename_stamp, format_unix_label, ordered_step_names, parse_scale,
         summarize_seed_plan, walk_seed_plan_select, HistoricalRun, RunReport, SeedWalkEmit,
-        StepMetric, HUGE, SMOKE,
+        StepMetric, BENCHMARK_SCALES, HUGE, SMOKE,
     };
 
     #[test]
@@ -1538,6 +2004,13 @@ mod tests {
         assert_eq!(scale.artists, HUGE.artists);
         assert_eq!(scale.albums, HUGE.albums);
         assert_eq!(scale.songs_cap, HUGE.songs_cap);
+    }
+
+    #[test]
+    fn benchmark_scales_run_in_expected_order() {
+        let names: Vec<_> = BENCHMARK_SCALES.iter().map(|scale| scale.name).collect();
+
+        assert_eq!(names, vec!["smoke", "medium", "full", "huge"]);
     }
 
     #[test]
@@ -1603,10 +2076,7 @@ mod tests {
     #[test]
     fn unix_timestamp_formatting_is_utc() {
         assert_eq!(format_unix_filename_stamp(1_779_193_075), "2026-05-19-1217");
-        assert_eq!(
-            format_unix_label(1_779_193_075),
-            "2026-05-19 12:17:55 UTC"
-        );
+        assert_eq!(format_unix_label(1_779_193_075), "2026-05-19 12:17:55 UTC");
     }
 
     #[test]
@@ -1625,6 +2095,10 @@ mod tests {
                         ..Default::default()
                     },
                     StepMetric {
+                        name: "checkpoint_after_seed".to_string(),
+                        ..Default::default()
+                    },
+                    StepMetric {
                         name: "schema_create".to_string(),
                         ..Default::default()
                     },
@@ -1638,6 +2112,7 @@ mod tests {
             vec![
                 "schema_create".to_string(),
                 "seed_songs".to_string(),
+                "checkpoint_after_seed".to_string(),
                 "query_view_first_1000".to_string()
             ]
         );

@@ -1,0 +1,155 @@
+{
+  "binding": "RustRaw",
+  "scale_name": "huge",
+  "benchmark_profile": "default",
+  "target_artists": 250000,
+  "target_albums": 2500000,
+  "target_songs_cap": 25000000,
+  "started_unix": 1781271652,
+  "finished_unix": 1781271732,
+  "engine_version": "2.10.0",
+  "database_path": "run-rust-huge.ddb",
+  "database_size_bytes": 833892352,
+  "wal_size_bytes": 32,
+  "peak_rss_bytes": 3446149120,
+  "steps": [
+    {
+      "name": "connect_open",
+      "duration_seconds": 0.005878543,
+      "records": null,
+      "records_per_second": null,
+      "rss_bytes": 250970112,
+      "rss_anon_kb": 235172,
+      "rss_file_kb": 9916,
+      "extra": {}
+    },
+    {
+      "name": "schema_create",
+      "duration_seconds": 0.031754994,
+      "records": null,
+      "records_per_second": null,
+      "rss_bytes": 12103680,
+      "rss_anon_kb": 1904,
+      "rss_file_kb": 9916,
+      "extra": {}
+    },
+    {
+      "name": "seed_artists",
+      "duration_seconds": 0.256828467,
+      "records": 250000,
+      "records_per_second": 973412.3437336874,
+      "rss_bytes": 101318656,
+      "rss_anon_kb": 89028,
+      "rss_file_kb": 9916,
+      "extra": {}
+    },
+    {
+      "name": "seed_albums",
+      "duration_seconds": 2.517898258,
+      "records": 2500000,
+      "records_per_second": 992891.5880762328,
+      "rss_bytes": 924823552,
+      "rss_anon_kb": 893232,
+      "rss_file_kb": 9916,
+      "extra": {}
+    },
+    {
+      "name": "seed_songs",
+      "duration_seconds": 18.041484802,
+      "records": 13746520,
+      "records_per_second": 761939.5050276639,
+      "rss_bytes": 3446149120,
+      "rss_anon_kb": 3355464,
+      "rss_file_kb": 9916,
+      "extra": {}
+    },
+    {
+      "name": "checkpoint_after_seed",
+      "duration_seconds": 1.9839196810000002,
+      "records": null,
+      "records_per_second": null,
+      "rss_bytes": 2589343744,
+      "rss_anon_kb": 2518740,
+      "rss_file_kb": 9916,
+      "extra": {
+        "checkpoint_mode": "wal",
+        "database_bytes_after": 833892352,
+        "database_bytes_before": 8192,
+        "wal_bytes_after": 32,
+        "wal_bytes_before": 805306368
+      }
+    },
+    {
+      "name": "query_count_songs",
+      "duration_seconds": 0.416849104,
+      "records": null,
+      "records_per_second": null,
+      "rss_bytes": 1683533824,
+      "rss_anon_kb": 1634160,
+      "rss_file_kb": 9916,
+      "extra": {
+        "count": 13746520
+      }
+    },
+    {
+      "name": "query_aggregate_durations",
+      "duration_seconds": 0.666562944,
+      "records": null,
+      "records_per_second": null,
+      "rss_bytes": 1683550208,
+      "rss_anon_kb": 1634176,
+      "rss_file_kb": 9916,
+      "extra": {}
+    },
+    {
+      "name": "query_artist_by_id",
+      "duration_seconds": 0.000087795,
+      "records": null,
+      "records_per_second": null,
+      "rss_bytes": 1683550208,
+      "rss_anon_kb": 1634176,
+      "rss_file_kb": 9916,
+      "extra": {}
+    },
+    {
+      "name": "query_top10_artists_by_songs",
+      "duration_seconds": 16.653227525,
+      "records": null,
+      "records_per_second": null,
+      "rss_bytes": 723496960,
+      "rss_anon_kb": 696624,
+      "rss_file_kb": 9916,
+      "extra": {}
+    },
+    {
+      "name": "query_top10_albums_by_songs",
+      "duration_seconds": 24.443281897,
+      "records": null,
+      "records_per_second": null,
+      "rss_bytes": 723472384,
+      "rss_anon_kb": 696600,
+      "rss_file_kb": 9916,
+      "extra": {}
+    },
+    {
+      "name": "query_view_first_1000",
+      "duration_seconds": 10.722553411,
+      "records": null,
+      "records_per_second": null,
+      "rss_bytes": 2124804096,
+      "rss_anon_kb": 2065088,
+      "rss_file_kb": 9916,
+      "extra": {}
+    },
+    {
+      "name": "query_songs_for_artist_via_view",
+      "duration_seconds": 4.521317772,
+      "records": null,
+      "records_per_second": null,
+      "rss_bytes": 2124570624,
+      "rss_anon_kb": 2064860,
+      "rss_file_kb": 9916,
+      "extra": {}
+    }
+  ]
+}

@@ -187,6 +187,7 @@ pub(crate) fn commit_pages(
     offset = new_offset;
     sync_for_mode(wal, metadata_changed, new_offset)?;
 
+    let should_demote_cold_versions;
     {
         let mut index = wal
             .inner
@@ -245,10 +246,14 @@ pub(crate) fn commit_pages(
         wal.inner
             .pages_since_checkpoint
             .fetch_add(prepared_count_u32, Ordering::AcqRel);
+        should_demote_cold_versions =
+            wal.inner.wal_index_hot_set_pages != 0 || index.has_dirty_since_demote();
     }
     wal.publish_process_commit(offset)?;
     drop(writer_state);
-    demote_cold_versions(wal)?;
+    if should_demote_cold_versions {
+        demote_cold_versions(wal)?;
+    }
     maybe_auto_checkpoint(wal, pager)?;
     Ok(offset)
 }
@@ -351,6 +356,7 @@ pub(crate) fn commit_pages_if_latest(
     offset = new_offset;
     sync_for_mode(wal, metadata_changed, new_offset)?;
 
+    let should_demote_cold_versions;
     {
         let mut index = wal
             .inner
@@ -404,10 +410,14 @@ pub(crate) fn commit_pages_if_latest(
         wal.inner
             .pages_since_checkpoint
             .fetch_add(prepared_count_u32, Ordering::AcqRel);
+        should_demote_cold_versions =
+            wal.inner.wal_index_hot_set_pages != 0 || index.has_dirty_since_demote();
     }
     wal.publish_process_commit(offset)?;
     drop(writer_state);
-    demote_cold_versions(wal)?;
+    if should_demote_cold_versions {
+        demote_cold_versions(wal)?;
+    }
     maybe_auto_checkpoint(wal, pager)?;
     Ok(offset)
 }

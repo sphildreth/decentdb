@@ -58,7 +58,7 @@ It preserves a **one writer** and **many concurrent readers** concurrency model 
 - ⚡ **Triggers** - AFTER and INSTEAD OF triggers for complex logic
 - 💾 **Savepoints** - Nested transaction control with SAVEPOINT, RELEASE, and ROLLBACK TO
 - 🧠 **In-Memory Database** - Ephemeral `:memory:` databases for caching and testing, with `save-as` (CLI) / `saveAs` (embedded API) to snapshot to disk
-- 📦 **Single-file DB + WAL sidecar** - Primary `.ddb` file with a `-wal` sidecar log for durability
+- 📦 **Single-file DB + WAL sidecar** - Primary `.ddb` file with an append-`.wal` sidecar log for durability
 - 🌐 **Cross-Platform** - Native release builds for Linux x86_64/arm64 (including 64-bit Raspberry Pi OS), macOS, and Windows
 - 🚀 **Bulk Load Operations** - Optimized high-performance data loading
 - 🛠️ **Rich CLI Tool** - Unified command-line interface for all database operations
@@ -112,6 +112,12 @@ It preserves a **one writer** and **many concurrent readers** concurrency model 
   README chart would show a severe tuned-profile drop while the raw engine
   baseline remains healthy, the workflow fails instead of committing confusing
   assets.
+- For manual engine diagnostics, `benchmarks/rust-baseline` supports
+  `--benchmark` to run `smoke`, `medium`, `full`, and `huge` scales in order
+  for one engine/profile and then generate its HTML report. That runner now
+  measures read queries from a checkpointed post-load state for both DecentDB
+  and SQLite, with `checkpoint_after_seed` recording WAL/database bytes before
+  and after checkpointing.
 - SQLite results are reported as `sqlite_wal_full` (WAL+FULL sync); relaxed durability variants can be added as separate profiles when collected.
 - Chart values are **normalized vs SQLite** (baseline = 1.0), and the charted metric set is the full native set collected in the benchmark JSON:
   - `read_p95_ms`, `join_p95_ms`, `range_scan_p95_ms`, `aggregate_p95_ms`, `concurrent_read_p95_ms`, `commit_p95_ms`, `insert_rows_per_sec`.
@@ -134,6 +140,11 @@ python scripts/aggregate_benchmarks.py \
 # Render the README chart assets from the merged summary
 python scripts/make_readme_chart.py
 python scripts/visualize_alternative.py
+
+# Optional raw engine diagnostic suite and HTML report
+cd benchmarks/rust-baseline
+cargo run --release -- --engine decentdb --benchmark --out-dir ../../.tmp/rust-baseline/results
+cargo run --release -- --engine sqlite --benchmark --out-dir ../../.tmp/rust-baseline/results
 ```
 
 ## Quick Start
