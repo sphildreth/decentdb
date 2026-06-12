@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.11.0] - [2026-06-12]
+
 ### Fixed
 
 - Removed the 250,000-row limit on the paged row locator cache that caused
@@ -15,13 +17,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tables with btree indexes or row_id alias columns, regardless of row count.
   This fixes multi-second indexed lookups observed on tables with millions of
   rows (Melodee DDB-002/DDB-003).
+- Refreshed reader and prepared-statement checkpoint handling so same-handle
+  and FFI callers continue to read and commit correctly after WAL checkpoint
+  truncation.
+- Hardened faulty-VFS write handling used by WAL recovery tests so injected
+  partial-write failures preserve the expected file state.
 
 ### Added
 
+- Added executor support for bounded indexed range seeks with optional limits,
+  expanding the fast path beyond exact equality probes.
 - Added regression tests for indexed seek performance on checkpointed/paged
   tables with 300K+ rows, verifying bounded lookup time after checkpoint and
   reopen.
+- Added `design/METRIC_IMPROVEMENTS_PLAN.md` to track DecentDB's current
+  benchmark standing against SQLite and the priority order for closing or
+  exceeding each public-facing metric.
+- Added `benchmarks/rust-baseline --benchmark`, which runs `smoke`, `medium`,
+  `full`, and `huge` scales in order for the selected engine/profile and then
+  generates the HTML report.
 
+### Changed
+
+- Optimized Rust query result and row projection paths by sharing column
+  metadata with `Arc` and improving fast projection decoding for point-lookups.
+- Updated the rust-baseline benchmark to measure reads from a checkpointed
+  post-seed state for both engines: DecentDB uses `Db::checkpoint_wal()` and
+  SQLite uses `PRAGMA wal_checkpoint(TRUNCATE)`. The new
+  `checkpoint_after_seed` step records duration plus WAL/database bytes before
+  and after checkpointing.
 
 ## [2.10.0] - [2026-06-10]
 
