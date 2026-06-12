@@ -20,15 +20,19 @@ pub use sink::RuntimeTraceState;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+#[cfg(all(not(miri), not(all(target_arch = "wasm32", target_os = "unknown"))))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(crate) fn unix_millis_now() -> i64 {
-    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    #[cfg(miri)]
+    {
+        0
+    }
+    #[cfg(all(not(miri), target_arch = "wasm32", target_os = "unknown"))]
     {
         js_sys::Date::now() as i64
     }
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[cfg(all(not(miri), not(all(target_arch = "wasm32", target_os = "unknown"))))]
     {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)

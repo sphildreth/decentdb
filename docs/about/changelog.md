@@ -22,6 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   truncation.
 - Hardened faulty-VFS write handling used by WAL recovery tests so injected
   partial-write failures preserve the expected file state.
+- Kept the Miri smoke binary compatible with default Miri isolation by using a
+  deterministic runtime-tracing timestamp under `cfg(miri)`.
 
 ### Added
 
