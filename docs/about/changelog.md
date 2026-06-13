@@ -40,6 +40,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Kept memory-safety nightly useful under AddressSanitizer by preserving the
   indexed checkpointed-table correctness and plan-shape checks while reserving
   strict wall-clock performance assertions for non-sanitized runs.
+- Bounded the release workflow validation job and workspace-check step so a
+  hung test reports a targeted timeout instead of consuming the full six-hour
+  GitHub Actions job window.
 
 ## [2.11.0] - [2026-06-12]
 
