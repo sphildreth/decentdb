@@ -26,8 +26,9 @@ pub(crate) fn plan_statement(
 pub(crate) fn plan_query(query: &Query, catalog: &CatalogState) -> Result<PhysicalPlan> {
     let mut plan = plan_query_body(&query.body, catalog)?;
     if !query.order_by.is_empty() {
-        plan =
-            maybe_spatial_knn_plan(&plan, query, catalog).unwrap_or_else(|| PhysicalPlan::Sort {
+        plan = maybe_spatial_knn_plan(&plan, query, catalog)
+            .or_else(|| maybe_ordered_row_id_scan_plan(query, catalog))
+            .unwrap_or_else(|| PhysicalPlan::Sort {
                 input: Box::new(plan),
                 order_by: query.order_by.clone(),
             });
@@ -439,6 +440,67 @@ fn maybe_spatial_knn_plan(
         index: index.name.clone(),
         order: order.expr.clone(),
         input: Box::new(input.clone()),
+    })
+}
+
+fn maybe_ordered_row_id_scan_plan(query: &Query, catalog: &CatalogState) -> Option<PhysicalPlan> {
+    if !query.ctes.is_empty()
+        || query.limit.is_none()
+        || query.order_by.len() != 1
+        || query.order_by[0].descending
+    {
+        return None;
+    }
+    let QueryBody::Select(select) = &query.body else {
+        return None;
+    };
+    if select.filter.is_some()
+        || !select.group_by.is_empty()
+        || select.having.is_some()
+        || select.distinct
+        || projection_has_aggregate(select)
+        || select.from.len() != 1
+    {
+        return None;
+    }
+    let FromItem::Table { name, alias } = &select.from[0] else {
+        return None;
+    };
+    let table = catalog.table(name)?;
+    let Expr::Column {
+        table: order_table,
+        column: order_column,
+    } = &query.order_by[0].expr
+    else {
+        return None;
+    };
+    if let Some(qualifier) = order_table.as_deref() {
+        if !identifiers_equal(qualifier, name)
+            && !alias
+                .as_deref()
+                .is_some_and(|binding| identifiers_equal(qualifier, binding))
+        {
+            return None;
+        }
+    }
+    let column = table
+        .columns
+        .iter()
+        .find(|column| identifiers_equal(&column.name, order_column))?;
+    if column.column_type != crate::catalog::ColumnType::Int64
+        || !table
+            .primary_key_columns
+            .iter()
+            .any(|primary_key| identifiers_equal(primary_key, order_column))
+    {
+        return None;
+    }
+    Some(PhysicalPlan::Project {
+        input: Box::new(PhysicalPlan::OrderedRowIdScan {
+            table: table.name.clone(),
+            column: column.name.clone(),
+        }),
+        items: select.projection.clone(),
     })
 }
 

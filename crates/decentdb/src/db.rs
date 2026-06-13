@@ -3200,7 +3200,6 @@ impl Db {
                 tracing: Arc::clone(&tracing_arc),
             }),
         };
-        db.backfill_missing_persistent_pk_indexes()?;
         db.backfill_paged_row_storage()?;
         db.refresh_named_snapshot_retention()?;
         drop(open_guard);
@@ -3332,8 +3331,8 @@ impl Db {
 
         #[cfg(feature = "bench-internals")]
         READ_PATH_WAL_READER_BEGIN_COUNT.fetch_add(1, Ordering::Relaxed);
-        let reader = self.inner.wal.begin_reader_with_pager(&self.inner.pager)?;
-        let snapshot_lsn = reader.snapshot_lsn();
+        let mut reader = self.inner.wal.begin_reader_with_pager(&self.inner.pager)?;
+        let mut snapshot_lsn = reader.snapshot_lsn();
         self.refresh_engine_from_snapshot(snapshot_lsn)?;
         if self.inner.config.extension_unsigned_development_mode
             || !self.inner.config.extension_trust_anchors.is_empty()
@@ -3361,41 +3360,128 @@ impl Db {
         }
         if !security_active {
             if let SqlStatement::Query(query) = statement {
-                let runtime = self
-                    .inner
-                    .engine
-                    .read()
-                    .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
-                self.validate_prepared_against_runtime(prepared, &runtime)?;
-                if let Some(result) = runtime.try_execute_simple_deferred_count_query(
-                    query,
-                    &self.inner.pager,
-                    &self.inner.wal,
-                    snapshot_lsn,
-                )? {
-                    drop(runtime);
-                    return self.finalize_row_source_autocommit_statement(statement, Ok(result));
+                let mut runtime_guard = Some(
+                    self.inner
+                        .engine
+                        .read()
+                        .map_err(|_| DbError::internal("engine runtime lock poisoned"))?,
+                );
+
+                let missing_runtime_btree = {
+                    let runtime = runtime_guard
+                        .as_ref()
+                        .ok_or_else(|| DbError::internal("runtime guard missing"))?;
+                    self.validate_prepared_against_runtime(prepared, runtime)?;
+                    if let Some(result) = runtime.try_execute_simple_deferred_count_query(
+                        query,
+                        &self.inner.pager,
+                        &self.inner.wal,
+                        snapshot_lsn,
+                    )? {
+                        drop(runtime_guard);
+                        return self
+                            .finalize_row_source_autocommit_statement(statement, Ok(result));
+                    }
+                    if let Some(result) = runtime.try_execute_simple_deferred_min_max_query(
+                        query,
+                        &self.inner.pager,
+                        &self.inner.wal,
+                        snapshot_lsn,
+                    )? {
+                        drop(runtime_guard);
+                        return self
+                            .finalize_row_source_autocommit_statement(statement, Ok(result));
+                    }
+                    let missing_pk_root = if self.inner.config.persistent_pk_index {
+                        let missing_pk_root = runtime
+                            .simple_indexed_projection_missing_persistent_pk_root(query, params)?;
+                        if missing_pk_root.is_some() {
+                            missing_pk_root
+                        } else {
+                            runtime.simple_ordered_projection_missing_persistent_pk_root(
+                                query, params,
+                            )?
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some(table_name) = missing_pk_root {
+                        let table_name = table_name.to_string();
+                        drop(runtime_guard.take());
+                        drop(reader);
+                        self.backfill_missing_persistent_pk_index_for_table(table_name.as_str())?;
+                        reader = self.inner.wal.begin_reader_with_pager(&self.inner.pager)?;
+                        snapshot_lsn = reader.snapshot_lsn();
+                        self.refresh_engine_from_snapshot(snapshot_lsn)?;
+                        runtime_guard = Some(
+                            self.inner
+                                .engine
+                                .read()
+                                .map_err(|_| DbError::internal("engine runtime lock poisoned"))?,
+                        );
+                    }
+
+                    let runtime = runtime_guard
+                        .as_ref()
+                        .ok_or_else(|| DbError::internal("runtime guard missing"))?;
+                    self.validate_prepared_against_runtime(prepared, runtime)?;
+                    if let Some(result) = runtime
+                        .try_execute_simple_deferred_indexed_projection_query(
+                            query,
+                            params,
+                            &self.inner.pager,
+                            &self.inner.wal,
+                            snapshot_lsn,
+                            self.inner.config.persistent_pk_index,
+                        )?
+                    {
+                        drop(runtime_guard);
+                        return self
+                            .finalize_row_source_autocommit_statement(statement, Ok(result));
+                    }
+                    runtime.simple_indexed_projection_missing_runtime_btree(query, params)?
+                };
+
+                if let Some((table_name, index_name)) = missing_runtime_btree {
+                    let table_name = table_name.to_string();
+                    let index_name = index_name.to_string();
+                    drop(runtime_guard.take());
+                    self.hydrate_deferred_runtime_index_at_snapshot(
+                        table_name.as_str(),
+                        index_name.as_str(),
+                        snapshot_lsn,
+                    )?;
+                    runtime_guard = Some(
+                        self.inner
+                            .engine
+                            .read()
+                            .map_err(|_| DbError::internal("engine runtime lock poisoned"))?,
+                    );
+
+                    let runtime = runtime_guard
+                        .as_ref()
+                        .ok_or_else(|| DbError::internal("runtime guard missing"))?;
+                    self.validate_prepared_against_runtime(prepared, runtime)?;
+                    if let Some(result) = runtime
+                        .try_execute_simple_deferred_indexed_projection_query(
+                            query,
+                            params,
+                            &self.inner.pager,
+                            &self.inner.wal,
+                            snapshot_lsn,
+                            self.inner.config.persistent_pk_index,
+                        )?
+                    {
+                        drop(runtime_guard);
+                        return self
+                            .finalize_row_source_autocommit_statement(statement, Ok(result));
+                    }
                 }
-                if let Some(result) = runtime.try_execute_simple_deferred_min_max_query(
-                    query,
-                    &self.inner.pager,
-                    &self.inner.wal,
-                    snapshot_lsn,
-                )? {
-                    drop(runtime);
-                    return self.finalize_row_source_autocommit_statement(statement, Ok(result));
-                }
-                if let Some(result) = runtime.try_execute_simple_deferred_indexed_projection_query(
-                    query,
-                    params,
-                    &self.inner.pager,
-                    &self.inner.wal,
-                    snapshot_lsn,
-                    self.inner.config.persistent_pk_index,
-                )? {
-                    drop(runtime);
-                    return self.finalize_row_source_autocommit_statement(statement, Ok(result));
-                }
+
+                let runtime = runtime_guard
+                    .as_ref()
+                    .ok_or_else(|| DbError::internal("runtime guard missing"))?;
+                self.validate_prepared_against_runtime(prepared, runtime)?;
                 if let Some(result) = runtime.try_execute_simple_deferred_paged_query(
                     query,
                     params,
@@ -3404,43 +3490,43 @@ impl Db {
                     snapshot_lsn,
                     self.inner.config.persistent_pk_index,
                 )? {
-                    drop(runtime);
+                    drop(runtime_guard);
                     return self.finalize_row_source_autocommit_statement(statement, Ok(result));
                 }
                 if prepared.is_none() {
                     if let Some(result) = self
                         .try_execute_indexed_join_grouped_count_query_at_snapshot(
-                            &runtime,
+                            runtime,
                             query,
                             params,
                             snapshot_lsn,
                         )?
                     {
-                        drop(runtime);
+                        drop(runtime_guard);
                         return self
                             .finalize_row_source_autocommit_statement(statement, Ok(result));
                     }
                     if let Some(result) = self
                         .try_execute_simple_indexed_join_projection_query_at_snapshot(
-                            &runtime,
+                            runtime,
                             statement,
                             query,
                             params,
                             snapshot_lsn,
                         )?
                     {
-                        drop(runtime);
+                        drop(runtime_guard);
                         return self
                             .finalize_row_source_autocommit_statement(statement, Ok(result));
                     }
                     if let Some(result) = self.try_execute_query_with_row_sources_at_snapshot(
-                        &runtime,
+                        runtime,
                         statement,
                         params,
                         snapshot_lsn,
                         false,
                     )? {
-                        drop(runtime);
+                        drop(runtime_guard);
                         return self
                             .finalize_row_source_autocommit_statement(statement, Ok(result));
                     }
@@ -5614,7 +5700,7 @@ impl Db {
         Ok(result)
     }
 
-    fn backfill_missing_persistent_pk_indexes(&self) -> Result<()> {
+    fn backfill_missing_persistent_pk_index_for_table(&self, table_name: &str) -> Result<()> {
         if !self.inner.config.persistent_pk_index {
             return Ok(());
         }
@@ -5627,19 +5713,25 @@ impl Db {
             .engine
             .write()
             .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
-        let needs_backfill = runtime.catalog.tables.iter().any(|(table_name, table)| {
-            table.pk_index_root.is_none()
-                && runtime
-                    .persisted_tables
-                    .get(table_name)
-                    .is_some_and(|state| state.pointer.head_page_id != 0)
-        });
+        let needs_backfill = runtime
+            .catalog
+            .tables
+            .iter()
+            .find(|(candidate, _)| identifiers_equal(candidate, table_name))
+            .is_some_and(|(canonical_name, table)| {
+                table.pk_index_root.is_none()
+                    && runtime
+                        .persisted_tables
+                        .get(canonical_name)
+                        .is_some_and(|state| state.pointer.head_page_id != 0)
+            });
         if !needs_backfill {
             return Ok(());
         }
 
         self.begin_write()?;
-        let changed = match runtime.backfill_missing_persistent_pk_indexes(self) {
+        let changed = match runtime.backfill_missing_persistent_pk_index_for_table(self, table_name)
+        {
             Ok(changed) => changed,
             Err(error) => {
                 let _ = self.rollback();
@@ -5664,9 +5756,12 @@ impl Db {
                 return Err(error);
             }
         };
-        self.inner
-            .catalog
-            .replace(runtime.catalog.as_ref().clone())?;
+        let runtime_schema_cookie = runtime.catalog.schema_cookie;
+        if self.inner.catalog.schema_cookie()? != runtime_schema_cookie {
+            self.inner
+                .catalog
+                .replace(runtime.catalog.as_ref().clone())?;
+        }
         self.sync_temp_state_from_runtime(&runtime)?;
         self.inner
             .last_runtime_lsn
@@ -7077,6 +7172,41 @@ impl Db {
             &self.inner.wal,
             self.inner.config.page_size,
             &filter,
+            snapshot_lsn,
+        )
+    }
+
+    fn hydrate_deferred_runtime_index_at_snapshot(
+        &self,
+        table_name: &str,
+        index_name: &str,
+        snapshot_lsn: u64,
+    ) -> Result<()> {
+        {
+            let runtime = self
+                .inner
+                .engine
+                .read()
+                .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+            let has_deferred = runtime.has_deferred_tables();
+            let has_match = runtime
+                .deferred_table_names()
+                .any(|deferred| identifiers_equal(deferred, table_name));
+            if !has_deferred || !has_match {
+                return Ok(());
+            }
+        }
+        let mut runtime = self
+            .inner
+            .engine
+            .write()
+            .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+        runtime.hydrate_deferred_runtime_index_at_snapshot(
+            &self.inner.pager,
+            &self.inner.wal,
+            self.inner.config.page_size,
+            table_name,
+            index_name,
             snapshot_lsn,
         )
     }
@@ -19399,6 +19529,7 @@ mod tests {
         let db = Db::open_or_create(
             &path,
             DbConfig {
+                persistent_pk_index: false,
                 paged_row_storage: false,
                 ..DbConfig::default()
             },
@@ -19950,6 +20081,98 @@ mod tests {
     }
 
     #[test]
+    fn reopen_deferred_paged_secondary_index_lookup_hydrates_runtime_btree_index() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir
+            .path()
+            .join("reopened-deferred-paged-secondary-index-lookup.ddb");
+        let config = DbConfig {
+            paged_row_storage: true,
+            defer_table_materialization: true,
+            ..DbConfig::default()
+        };
+        let large_body = "x".repeat(2048);
+
+        {
+            let db = Db::open_or_create(&path, config.clone()).expect("open db");
+            db.execute("CREATE TABLE bench (id INT64 PRIMARY KEY, lookup TEXT, body TEXT)")
+                .expect("create bench");
+            db.execute("CREATE INDEX bench_lookup_idx ON bench(lookup)")
+                .expect("create lookup index");
+            let mut txn = db.transaction().expect("begin txn");
+            let insert = txn
+                .prepare("INSERT INTO bench VALUES ($1, $2, $3)")
+                .expect("prepare insert");
+            for i in 1_i64..=128_i64 {
+                insert
+                    .execute_in(
+                        &mut txn,
+                        &[
+                            Value::Int64(i),
+                            Value::Text(format!("lookup-{i}")),
+                            Value::Text(format!("body-{i}-{large_body}")),
+                        ],
+                    )
+                    .expect("insert row");
+            }
+            txn.commit().expect("commit rows");
+            db.checkpoint().expect("checkpoint before reopen");
+        }
+
+        let db = Db::open_or_create(&path, config).expect("reopen db");
+        {
+            let runtime = db.inner.engine.read().expect("engine runtime lock");
+            assert!(
+                runtime
+                    .deferred_table_names()
+                    .any(|name| name.eq_ignore_ascii_case("bench")),
+                "bench should be deferred immediately after reopen"
+            );
+            assert!(
+                runtime.index("bench_lookup_idx").is_none(),
+                "freshly reopened deferred runtime should start without an in-memory btree map"
+            );
+        }
+
+        let result = db
+            .execute("SELECT id, lookup FROM bench WHERE lookup = 'lookup-127' ORDER BY id LIMIT 1")
+            .expect("indexed point lookup after reopen");
+        assert_eq!(result.rows().len(), 1);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[Value::Int64(127), Value::Text("lookup-127".to_string()),]
+        );
+
+        {
+            let runtime = db.inner.engine.read().expect("engine runtime lock");
+            assert!(
+                matches!(
+                    runtime.index("bench_lookup_idx"),
+                    Some(RuntimeIndex::Btree { .. })
+                ),
+                "lookup should hydrate the runtime btree map for subsequent reads"
+            );
+            assert!(
+                runtime
+                    .deferred_table_names()
+                    .any(|name| name.eq_ignore_ascii_case("bench")),
+                "hydration should leave the paged table deferred"
+            );
+        }
+        let json_after = db
+            .inspect_storage_state_json()
+            .expect("json after indexed lookup");
+        assert!(
+            json_after.contains("\"loaded_table_count\":0"),
+            "hydration should not keep the paged row source loaded, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"rows_in_memory_count\":0"),
+            "hydration should not materialize rows into memory, got: {json_after}"
+        );
+    }
+
+    #[test]
     fn checkpoint_compacts_paged_table_chunks_and_preserves_persistent_pk_index() {
         let tempdir = TempDir::new().expect("tempdir");
         let path = tempdir.path().join("checkpoint-compacts-paged-table.ddb");
@@ -20059,6 +20282,7 @@ mod tests {
                 &path,
                 DbConfig {
                     paged_row_storage: false,
+                    persistent_pk_index: false,
                     ..DbConfig::default()
                 },
             )
@@ -20104,6 +20328,7 @@ mod tests {
 
         let config = DbConfig {
             persistent_pk_index: true,
+            paged_row_storage: false,
             ..DbConfig::default()
         };
         let db = Db::open_or_create(&path, config).expect("reopen with persistent pk index");
@@ -20112,14 +20337,37 @@ mod tests {
             let seeded = runtime
                 .persisted_tables
                 .get("seeded")
+                .expect("persisted seeded before backfill");
+            assert!(
+                seeded.pointer.is_compressed(),
+                "open should not backfill every table eagerly"
+            );
+            assert!(
+                seeded.pk_index_root.is_none(),
+                "open should leave the missing persistent pk locator for on-demand backfill"
+            );
+        }
+
+        assert_eq!(
+            scalar_text(
+                &db.execute("SELECT body FROM seeded WHERE id = 17")
+                    .expect("select row after targeted backfill")
+            ),
+            "x".repeat(2048)
+        );
+        {
+            let runtime = db.inner.engine.read().expect("engine runtime lock");
+            let seeded = runtime
+                .persisted_tables
+                .get("seeded")
                 .expect("persisted seeded after backfill");
             assert!(
                 !seeded.pointer.is_compressed(),
-                "backfill should rewrite the large payload uncompressed"
+                "targeted backfill should rewrite the large payload uncompressed"
             );
             assert!(
                 seeded.pk_index_root.is_some(),
-                "backfill should attach a persistent pk locator tree"
+                "targeted backfill should attach a persistent pk locator tree"
             );
             assert!(
                 runtime
@@ -31390,6 +31638,188 @@ mod tests {
             json_after.contains("\"rows_in_memory_count\":0"),
             "expected zero resident rows after prepared deferred range lookup, got: {json_after}"
         );
+    }
+
+    #[test]
+    fn deferred_ordered_projection_paged_limit_offset_keeps_deferred_state() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir.path().join("deferred-ordered-projection-paged.ddb");
+        let create_config = DbConfig {
+            paged_row_storage: true,
+            defer_table_materialization: true,
+            persistent_pk_index: false,
+            ..DbConfig::default()
+        };
+        let query_config = DbConfig {
+            paged_row_storage: true,
+            defer_table_materialization: true,
+            persistent_pk_index: true,
+            ..DbConfig::default()
+        };
+        let body = "x".repeat(2048);
+
+        {
+            let db = Db::open_or_create(&path, create_config).expect("create db");
+            db.execute("CREATE TABLE users (id INT64 PRIMARY KEY, name TEXT, body TEXT)")
+                .expect("create users");
+            let mut txn = db.transaction().expect("begin txn");
+            let insert = txn
+                .prepare("INSERT INTO users VALUES ($1, $2, $3)")
+                .expect("prepare insert");
+            for id in 1_i64..=200_i64 {
+                insert
+                    .execute_in(
+                        &mut txn,
+                        &[
+                            Value::Int64(id),
+                            Value::Text(format!("user-{id}")),
+                            Value::Text(body.clone()),
+                        ],
+                    )
+                    .expect("insert row");
+            }
+            txn.commit().expect("commit rows");
+            db.checkpoint().expect("checkpoint before reopen");
+        }
+
+        let db = Db::open_or_create(&path, query_config.clone()).expect("reopen with defer");
+        {
+            let runtime = db.inner.engine.read().expect("engine runtime lock");
+            let table = runtime
+                .catalog
+                .table("users")
+                .expect("users table after reopen");
+            assert!(
+                table.pk_index_root.is_none(),
+                "legacy database should reopen before targeted primary-key locator backfill"
+            );
+            let pk_index = runtime
+                .catalog
+                .indexes
+                .values()
+                .find(|index| {
+                    index.table_name.eq_ignore_ascii_case("users")
+                        && index.unique
+                        && index.kind == IndexKind::Btree
+                        && index.columns.len() == 1
+                        && index.columns[0]
+                            .column_name
+                            .as_deref()
+                            .is_some_and(|column| column.eq_ignore_ascii_case("id"))
+                })
+                .expect("primary-key btree index");
+            assert!(
+                runtime.index(&pk_index.name).is_none(),
+                "freshly reopened deferred runtime should start without an in-memory primary-key btree"
+            );
+        };
+        let explain = db
+            .execute("EXPLAIN SELECT name FROM users ORDER BY id LIMIT 4 OFFSET 2")
+            .expect("explain ordered projection");
+        assert!(
+            explain
+                .explain_lines()
+                .iter()
+                .all(|line| !line.contains("TableScan(table=users)")),
+            "expected no TableScan in explain, got: {:?}",
+            explain.explain_lines()
+        );
+        assert!(
+            explain
+                .explain_lines()
+                .iter()
+                .all(|line| !line.contains("Sort")),
+            "expected no Sort in explain, got: {:?}",
+            explain.explain_lines()
+        );
+
+        let projected_key = db
+            .execute("SELECT id FROM users ORDER BY id LIMIT 1")
+            .expect("projected primary-key ordered projection");
+        assert_eq!(projected_key.rows().len(), 1);
+        assert_eq!(projected_key.rows()[0].values(), &[Value::Int64(1)]);
+
+        {
+            let runtime = db.inner.engine.read().expect("engine runtime lock");
+            let table = runtime
+                .catalog
+                .table("users")
+                .expect("users table after ordered projection");
+            assert!(
+                table.pk_index_root.is_some(),
+                "projected primary-key ordering should backfill the persistent locator"
+            );
+            let pk_index = runtime
+                .catalog
+                .indexes
+                .values()
+                .find(|index| {
+                    index.table_name.eq_ignore_ascii_case("users")
+                        && index.unique
+                        && index.kind == IndexKind::Btree
+                        && index.columns.len() == 1
+                        && index.columns[0]
+                            .column_name
+                            .as_deref()
+                            .is_some_and(|column| column.eq_ignore_ascii_case("id"))
+                })
+                .expect("primary-key btree index");
+            assert!(
+                runtime.index(&pk_index.name).is_none(),
+                "projected primary-key ordering should use the persistent locator without hydrating the runtime btree"
+            );
+        }
+
+        let result = db
+            .execute("SELECT name FROM users ORDER BY id LIMIT 4 OFFSET 2")
+            .expect("simple ordered projection");
+        assert_eq!(result.rows().len(), 4);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[Value::Text("user-3".to_string())]
+        );
+        assert_eq!(
+            result.rows()[1].values(),
+            &[Value::Text("user-4".to_string())]
+        );
+        assert_eq!(
+            result.rows()[2].values(),
+            &[Value::Text("user-5".to_string())]
+        );
+        assert_eq!(
+            result.rows()[3].values(),
+            &[Value::Text("user-6".to_string())]
+        );
+
+        let json_after = db
+            .inspect_storage_state_json()
+            .expect("json after ordered projection");
+        assert!(
+            json_after.contains("\"loaded_table_count\":0"),
+            "expected ordered projection to avoid materialization, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"deferred_table_count\":1"),
+            "expected deferred table to remain deferred, got: {json_after}"
+        );
+        assert!(
+            json_after.contains("\"rows_in_memory_count\":0"),
+            "expected zero resident rows after ordered projection, got: {json_after}"
+        );
+
+        drop(db);
+        let reopened = Db::open_or_create(&path, query_config).expect("reopen after backfill");
+        {
+            let runtime = reopened.inner.engine.read().expect("engine runtime lock");
+            let table = runtime
+                .catalog
+                .table("users")
+                .expect("users table after backfill reopen");
+            assert!(
+                table.pk_index_root.is_some(),
+                "targeted primary-key locator backfill should persist across reopen"
+            );
+        }
     }
 
     #[test]

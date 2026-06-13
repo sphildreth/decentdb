@@ -1111,6 +1111,12 @@ fn sync_relay_v2_websocket_snapshot_ack_persists_checkpoint() {
 
     let (server, addr) = spawn_sync_relay_serve(&db, 1);
     let mut stream = std::net::TcpStream::connect(&addr).expect("connect websocket relay");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set websocket read timeout");
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .expect("set websocket write timeout");
     let request = format!(
         "GET /decentdb/sync/v2/stream?tenant=1&subject=user-1&shapes=tenant-shape HTTP/1.1\r\n\
          Host: {addr}\r\n\
@@ -1125,7 +1131,7 @@ fn sync_relay_v2_websocket_snapshot_ack_persists_checkpoint() {
         .expect("write websocket handshake");
     stream.flush().expect("flush websocket handshake");
 
-    let mut reader = BufReader::new(stream.try_clone().expect("clone websocket"));
+    let mut reader = BufReader::new(stream);
     let mut status_line = String::new();
     reader
         .read_line(&mut status_line)

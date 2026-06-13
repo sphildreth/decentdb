@@ -118,7 +118,7 @@ fn descend_to_leaf<S: PageStore>(
     key: u64,
 ) -> Result<(PageId, LeafPage)> {
     loop {
-        let page = decode_page(&store.read_page(page_id)?)?;
+        let page = decode_page_at(store, page_id)?;
         match page {
             BtreePage::Leaf(leaf) => return Ok((page_id, leaf)),
             BtreePage::Internal(internal) => {
@@ -135,7 +135,7 @@ fn descend_to_leaf<S: PageStore>(
 
 fn first_leaf<S: PageStore>(store: &S, mut page_id: PageId) -> Result<(PageId, LeafPage)> {
     loop {
-        let page = decode_page(&store.read_page(page_id)?)?;
+        let page = decode_page_at(store, page_id)?;
         match page {
             BtreePage::Leaf(leaf) => return Ok((page_id, leaf)),
             BtreePage::Internal(internal) => {
@@ -151,7 +151,7 @@ fn first_leaf<S: PageStore>(store: &S, mut page_id: PageId) -> Result<(PageId, L
 
 fn last_leaf<S: PageStore>(store: &S, mut page_id: PageId) -> Result<(PageId, LeafPage)> {
     loop {
-        let page = decode_page(&store.read_page(page_id)?)?;
+        let page = decode_page_at(store, page_id)?;
         match page {
             BtreePage::Leaf(leaf) => return Ok((page_id, leaf)),
             BtreePage::Internal(internal) => {
@@ -162,12 +162,21 @@ fn last_leaf<S: PageStore>(store: &S, mut page_id: PageId) -> Result<(PageId, Le
 }
 
 fn load_leaf_page<S: PageStore>(store: &S, page_id: PageId) -> Result<LeafPage> {
-    match decode_page(&store.read_page(page_id)?)? {
+    match decode_page_at(store, page_id)? {
         BtreePage::Leaf(leaf) => Ok(leaf),
         BtreePage::Internal(_) => Err(DbError::corruption(format!(
             "expected leaf page at {page_id}, found internal page"
         ))),
     }
+}
+
+fn decode_page_at<S: PageStore>(store: &S, page_id: PageId) -> Result<BtreePage> {
+    let page = store.read_page(page_id)?;
+    decode_page(&page).map_err(|error| {
+        DbError::corruption(format!(
+            "B+Tree page {page_id} could not be decoded: {error}"
+        ))
+    })
 }
 
 fn materialize_leaf_value<S: PageStore>(

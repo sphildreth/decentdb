@@ -71,14 +71,14 @@ packages:
       path: "../../dart"
       relative: true
     source: path
-    version: "2.11.0"
+    version: "2.12.0"
   decentdb_flutter:
     dependency: "direct main"
     description:
       path: ".."
       relative: true
     source: path
-    version: "2.11.0"
+    version: "2.12.0"
   fake_async:
     dependency: transitive
     description:

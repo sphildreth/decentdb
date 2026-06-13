@@ -255,10 +255,10 @@ pub struct DbConfig {
 
     /// When `true`, the engine persists a row-id -> table-payload-byte-range
     /// locator B+Tree for base tables and consults it for deferred
-    /// `WHERE id = ?` reads before falling back to full table materialization.
+    /// primary-key point/range reads before falling back to full table scans.
     ///
-    /// Default: `false` for one release of soak time. Existing databases and
-    /// callers keep the Phase B behavior until they opt in.
+    /// Default: `false`. Existing databases and callers keep the historical
+    /// low-write-amplification path until they explicitly opt in.
     ///
     /// See ADR 0144 — Persistent Primary-Key Locator Index.
     pub persistent_pk_index: bool,

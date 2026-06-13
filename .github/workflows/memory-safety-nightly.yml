@@ -44,6 +44,7 @@ jobs:
         env:
           RUSTFLAGS: "-Zsanitizer=${{ matrix.sanitizer }}"
           RUSTDOCFLAGS: "-Zsanitizer=${{ matrix.sanitizer }}"
+          DECENTDB_SANITIZER: "${{ matrix.sanitizer }}"
           # ASAN/LSAN need single-threaded execution for reliable results
           RUST_TEST_THREADS: "1"
         run: |

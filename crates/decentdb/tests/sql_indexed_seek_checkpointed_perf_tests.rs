@@ -29,6 +29,10 @@ fn large_table_config() -> DbConfig {
     }
 }
 
+fn strict_wall_clock_regression_assertions_enabled() -> bool {
+    std::env::var_os("DECENTDB_SANITIZER").is_none()
+}
+
 /// Regression test for DDB-002/DDB-003: indexed equality on a large
 /// checkpointed table must use the paged row locator cache for O(1)
 /// row-by-id lookups, not fall through to O(manifest_size) linear scan.
@@ -136,16 +140,18 @@ fn indexed_equality_on_large_checkpointed_table_is_bounded() {
     let row2 = &result2.rows()[0];
     assert_eq!(row2.values()[2], Value::Text(target_mbid.clone()));
 
-    assert!(
-        elapsed.as_secs_f64() < 5.0,
-        "indexed NameNormalized equality on 300K-row checkpointed table took {elapsed:?}; \
-         expected bounded paged-row-locator lookup, not O(manifest_size) scan"
-    );
-    assert!(
-        elapsed2.as_secs_f64() < 5.0,
-        "indexed MusicBrainzIdRaw equality on 300K-row checkpointed table took {elapsed2:?}; \
-         expected bounded paged-row-locator lookup, not O(manifest_size) scan"
-    );
+    if strict_wall_clock_regression_assertions_enabled() {
+        assert!(
+            elapsed.as_secs_f64() < 5.0,
+            "indexed NameNormalized equality on 300K-row checkpointed table took {elapsed:?}; \
+             expected bounded paged-row-locator lookup, not O(manifest_size) scan"
+        );
+        assert!(
+            elapsed2.as_secs_f64() < 5.0,
+            "indexed MusicBrainzIdRaw equality on 300K-row checkpointed table took {elapsed2:?}; \
+             expected bounded paged-row-locator lookup, not O(manifest_size) scan"
+        );
+    }
     // TempDir is automatically cleaned up
 }
 
