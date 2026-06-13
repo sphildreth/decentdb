@@ -35,7 +35,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Improved B+Tree corruption diagnostics by including the page id when page
   decoding fails during read traversal.
 - Hardened the sync relay websocket checkpoint test with socket timeouts so
-  failed handshakes cannot hang the test process.
+  failed handshakes cannot hang the test process, and preserved frame bytes
+  already buffered while reading the HTTP upgrade headers.
 - Kept memory-safety nightly useful under AddressSanitizer by preserving the
   indexed checkpointed-table correctness and plan-shape checks while reserving
   strict wall-clock performance assertions for non-sanitized runs.
