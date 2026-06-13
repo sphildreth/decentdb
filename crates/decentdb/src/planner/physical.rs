@@ -22,6 +22,10 @@ pub(crate) enum PhysicalPlan {
         column: String,
         predicate: Expr,
     },
+    OrderedRowIdScan {
+        table: String,
+        column: String,
+    },
     TrigramSearch {
         table: String,
         index: String,
@@ -117,6 +121,11 @@ impl PhysicalPlan {
                 "{indent}RowIdLookup(table={table}, column={column}, predicate={})",
                 predicate.to_sql()
             )),
+            Self::OrderedRowIdScan { table, column } => {
+                output.push(format!(
+                    "{indent}OrderedRowIdScan(table={table}, column={column})"
+                ));
+            }
             Self::TrigramSearch {
                 table,
                 index,

@@ -1111,6 +1111,12 @@ fn sync_relay_v2_websocket_snapshot_ack_persists_checkpoint() {
 
     let (server, addr) = spawn_sync_relay_serve(&db, 1);
     let mut stream = std::net::TcpStream::connect(&addr).expect("connect websocket relay");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set websocket read timeout");
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .expect("set websocket write timeout");
     let request = format!(
         "GET /decentdb/sync/v2/stream?tenant=1&subject=user-1&shapes=tenant-shape HTTP/1.1\r\n\
          Host: {addr}\r\n\
@@ -1125,7 +1131,7 @@ fn sync_relay_v2_websocket_snapshot_ack_persists_checkpoint() {
         .expect("write websocket handshake");
     stream.flush().expect("flush websocket handshake");
 
-    let mut reader = BufReader::new(stream.try_clone().expect("clone websocket"));
+    let mut reader = BufReader::new(stream);
     let mut status_line = String::new();
     reader
         .read_line(&mut status_line)
@@ -1138,12 +1144,11 @@ fn sync_relay_v2_websocket_snapshot_ack_persists_checkpoint() {
             break;
         }
     }
-    let mut stream = reader.into_inner();
-    let hello = read_websocket_json_frame(&mut stream);
+    let hello = read_websocket_json_frame(&mut reader);
     assert_eq!(hello["type"], "hello");
 
     write_websocket_json_frame(
-        &mut stream,
+        reader.get_mut(),
         &serde_json::json!({
             "type": "subscribe_shape",
             "request_id": "req-1",
@@ -1152,11 +1157,11 @@ fn sync_relay_v2_websocket_snapshot_ack_persists_checkpoint() {
             "mode": "snapshot"
         }),
     );
-    let snapshot = read_websocket_json_frame(&mut stream);
+    let snapshot = read_websocket_json_frame(&mut reader);
     assert_eq!(snapshot["type"], "snapshot");
     let checkpoint = snapshot["checkpoint"].clone();
     write_websocket_json_frame(
-        &mut stream,
+        reader.get_mut(),
         &serde_json::json!({
             "type": "ack",
             "request_id": "req-ack",
@@ -1166,9 +1171,9 @@ fn sync_relay_v2_websocket_snapshot_ack_persists_checkpoint() {
             "changeset_id": snapshot["changeset"]["changeset_id"]
         }),
     );
-    let ack = read_websocket_json_frame(&mut stream);
+    let ack = read_websocket_json_frame(&mut reader);
     assert_eq!(ack["type"], "ack");
-    drop(stream);
+    drop(reader);
     drop(server);
 
     let db = open_db(&db);
@@ -1420,7 +1425,7 @@ fn write_websocket_json_frame(stream: &mut std::net::TcpStream, value: &serde_js
     stream.flush().expect("flush websocket frame");
 }
 
-fn read_websocket_json_frame(stream: &mut std::net::TcpStream) -> serde_json::Value {
+fn read_websocket_json_frame<R: Read>(stream: &mut R) -> serde_json::Value {
     let mut header = [0u8; 2];
     stream
         .read_exact(&mut header)

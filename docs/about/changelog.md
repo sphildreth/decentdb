@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.12.0] - [2026-06-13]
+
+### Added
+
+- Added a deferred-table fast path for simple `ORDER BY <INT64 primary key>
+  LIMIT/OFFSET` projections. DecentDB now plans these as ordered row-id scans,
+  lazily backfills only the target table's persistent primary-key locator when
+  needed, refreshes the read snapshot after that metadata backfill, and uses the
+  persisted locator instead of falling through to full paged-table scans.
+
+### Changed
+
+- Kept persistent primary-key locator indexes opt-in behind
+  `DbConfig::persistent_pk_index` so the default rust-baseline write path
+  preserves its low-write-amplification profile while large deferred lookup
+  workloads can still enable durable locators explicitly.
+
+### Fixed
+
+- Corrected deferred paged-table projections that order by an `INT64` primary
+  key column that is not part of the projection, including mixed update-and-append
+  transactions where the updated row is stored in an overlay chunk.
+- Kept cold secondary btree equality lookups on deferred paged tables from
+  materializing the table by lazily hydrating only the required runtime index
+  and then preserving deferred row storage.
+- Improved B+Tree corruption diagnostics by including the page id when page
+  decoding fails during read traversal.
+- Hardened the sync relay websocket checkpoint test with socket timeouts so
+  failed handshakes cannot hang the test process, and preserved frame bytes
+  already buffered while reading the HTTP upgrade headers.
+- Kept memory-safety nightly useful under AddressSanitizer by preserving the
+  indexed checkpointed-table correctness and plan-shape checks while reserving
+  strict wall-clock performance assertions for non-sanitized runs.
+- Bounded the release workflow validation job and workspace-check step so a
+  hung test reports a targeted timeout instead of consuming the full six-hour
+  GitHub Actions job window.
+
 ## [2.11.0] - [2026-06-12]
 
 ### Fixed

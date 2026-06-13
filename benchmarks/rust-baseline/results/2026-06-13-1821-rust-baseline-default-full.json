@@ -1,0 +1,155 @@
+{
+  "binding": "RustRaw",
+  "scale_name": "full",
+  "benchmark_profile": "default",
+  "target_artists": 50000,
+  "target_albums": 500000,
+  "target_songs_cap": 5000000,
+  "started_unix": 1781374886,
+  "finished_unix": 1781374919,
+  "engine_version": "2.12.0",
+  "database_path": "run-rust-full.ddb",
+  "database_size_bytes": 240967680,
+  "wal_size_bytes": 32,
+  "peak_rss_bytes": 883195904,
+  "steps": [
+    {
+      "name": "connect_open",
+      "duration_seconds": 0.006098629,
+      "records": null,
+      "records_per_second": null,
+      "rss_bytes": 58753024,
+      "rss_anon_kb": 47628,
+      "rss_file_kb": 9748,
+      "extra": {}
+    },
+    {
+      "name": "schema_create",
+      "duration_seconds": 0.009442332,
+      "records": null,
+      "records_per_second": null,
+      "rss_bytes": 11968512,
+      "rss_anon_kb": 1940,
+      "rss_file_kb": 9748,
+      "extra": {}
+    },
+    {
+      "name": "seed_artists",
+      "duration_seconds": 0.353621309,
+      "records": 50000,
+      "records_per_second": 141394.19409252852,
+      "rss_bytes": 34840576,
+      "rss_anon_kb": 24276,
+      "rss_file_kb": 9748,
+      "extra": {}
+    },
+    {
+      "name": "seed_albums",
+      "duration_seconds": 3.412669374,
+      "records": 500000,
+      "records_per_second": 146512.87458707098,
+      "rss_bytes": 233295872,
+      "rss_anon_kb": 218080,
+      "rss_file_kb": 9748,
+      "extra": {}
+    },
+    {
+      "name": "seed_songs",
+      "duration_seconds": 18.379374314,
+      "records": 2749816,
+      "records_per_second": 149614.23348918906,
+      "rss_bytes": 883195904,
+      "rss_anon_kb": 852748,
+      "rss_file_kb": 9748,
+      "extra": {}
+    },
+    {
+      "name": "checkpoint_after_seed",
+      "duration_seconds": 0.562571263,
+      "records": null,
+      "records_per_second": null,
+      "rss_bytes": 619143168,
+      "rss_anon_kb": 594884,
+      "rss_file_kb": 9748,
+      "extra": {
+        "checkpoint_mode": "wal",
+        "database_bytes_after": 240967680,
+        "database_bytes_before": 8192,
+        "wal_bytes_after": 32,
+        "wal_bytes_before": 234881024
+      }
+    },
+    {
+      "name": "query_count_songs",
+      "duration_seconds": 0.083467364,
+      "records": null,
+      "records_per_second": null,
+      "rss_bytes": 435695616,
+      "rss_anon_kb": 415736,
+      "rss_file_kb": 9748,
+      "extra": {
+        "count": 2749816
+      }
+    },
+    {
+      "name": "query_aggregate_durations",
+      "duration_seconds": 0.129172383,
+      "records": null,
+      "records_per_second": null,
+      "rss_bytes": 435732480,
+      "rss_anon_kb": 415772,
+      "rss_file_kb": 9748,
+      "extra": {}
+    },
+    {
+      "name": "query_artist_by_id",
+      "duration_seconds": 0.000096642,
+      "records": null,
+      "records_per_second": null,
+      "rss_bytes": 435736576,
+      "rss_anon_kb": 415776,
+      "rss_file_kb": 9748,
+      "extra": {}
+    },
+    {
+      "name": "query_top10_artists_by_songs",
+      "duration_seconds": 3.477425369,
+      "records": null,
+      "records_per_second": null,
+      "rss_bytes": 228450304,
+      "rss_anon_kb": 213348,
+      "rss_file_kb": 9748,
+      "extra": {}
+    },
+    {
+      "name": "query_top10_albums_by_songs",
+      "duration_seconds": 5.006331761,
+      "records": null,
+      "records_per_second": null,
+      "rss_bytes": 228454400,
+      "rss_anon_kb": 213352,
+      "rss_file_kb": 9748,
+      "extra": {}
+    },
+    {
+      "name": "query_view_first_1000",
+      "duration_seconds": 2.247103293,
+      "records": null,
+      "records_per_second": null,
+      "rss_bytes": 485974016,
+      "rss_anon_kb": 464836,
+      "rss_file_kb": 9748,
+      "extra": {}
+    },
+    {
+      "name": "query_songs_for_artist_via_view",
+      "duration_seconds": 0.007024389,
+      "records": null,
+      "records_per_second": null,
+      "rss_bytes": 486129664,
+      "rss_anon_kb": 464988,
+      "rss_file_kb": 9748,
+      "extra": {}
+    }
+  ]
+}

@@ -35,7 +35,11 @@ use chrono::{
     Timelike, Utc,
 };
 
-use crate::btree::read::find_exact as btree_find_exact;
+use crate::btree::cursor::BtreeCursor;
+use crate::btree::read::{
+    find_exact as btree_find_exact, first_position as btree_first_position,
+    materialize_current as btree_materialize_current,
+};
 use crate::btree::table::free_table_btree;
 use crate::btree::write::Btree;
 use crate::catalog::{
@@ -265,6 +269,10 @@ impl DeferredPagedRowLocatorCache {
         self.verified_payloads
             .get(&CachedPagedChunkPayloadKey::new(pointer, checksum))
             .map(|payload| payload.as_slice())
+    }
+
+    fn min_row_id(&self) -> Option<i64> {
+        self.locators.keys().min().copied()
     }
 }
 
@@ -2446,6 +2454,69 @@ impl EngineRuntime {
         self.materialize_deferred_table_row_sources_with_store(&store, page_size, Some(filter))
     }
 
+    pub(crate) fn hydrate_deferred_runtime_index_at_snapshot(
+        &mut self,
+        pager: &PagerHandle,
+        wal: &WalHandle,
+        page_size: u32,
+        table_name: &str,
+        index_name: &str,
+        snapshot_lsn: u64,
+    ) -> Result<()> {
+        let Some(canonical_table_name) = self
+            .deferred_tables
+            .iter()
+            .find(|deferred| identifiers_equal(deferred, table_name))
+            .cloned()
+        else {
+            return Ok(());
+        };
+
+        let store = SnapshotPageStore {
+            pager,
+            wal,
+            snapshot_lsn,
+        };
+        let state = *self
+            .persisted_tables
+            .get(&canonical_table_name)
+            .ok_or_else(|| {
+                DbError::internal(format!(
+                    "deferred table '{canonical_table_name}' has no persisted state"
+                ))
+            })?;
+        let row_source = if state.pointer.is_table_paged_manifest() {
+            TableRowSource::Paged(Arc::new(read_table_page_manifest_from_state(
+                &store, state,
+            )?))
+        } else {
+            TableRowSource::Resident(Arc::new(decode_persisted_table_data(&store, state)?))
+        };
+        let row_count = row_source.row_count();
+        if let Some(ps) = self.persisted_tables_mut().get_mut(&canonical_table_name) {
+            ps.row_count = row_count;
+            ps.tail = read_uncompressed_overflow_tail(&store, ps.pointer)?.unwrap_or_default();
+        }
+        self.tables_mut()
+            .insert(canonical_table_name.clone(), row_source);
+        self.deferred_tables_mut().remove(&canonical_table_name);
+        if !self.indexes.contains_key(index_name) {
+            self.rebuild_index(index_name, page_size)?;
+        }
+        if state.pointer.is_table_paged_manifest() {
+            let Some(TableRowSource::Paged(manifest)) = self.tables.get(&canonical_table_name)
+            else {
+                return Err(DbError::internal(format!(
+                    "paged row source for {canonical_table_name} is missing after index hydration"
+                )));
+            };
+            let chunks = Arc::clone(&manifest.chunks);
+            self.cache_deferred_paged_row_locators(&canonical_table_name, state, chunks.as_ref())?;
+        }
+        self.redefer_persisted_tables(&[canonical_table_name.as_str()]);
+        Ok(())
+    }
+
     fn load_deferred_tables_with_snapshot(
         &mut self,
         pager: &PagerHandle,
@@ -3058,88 +3129,96 @@ impl EngineRuntime {
         })
     }
 
-    pub(crate) fn backfill_missing_persistent_pk_indexes(
+    pub(crate) fn backfill_missing_persistent_pk_index_for_table(
         &mut self,
         db: &crate::db::Db,
+        table_name: &str,
     ) -> Result<bool> {
-        let table_names = self
+        let Some(canonical_table_name) = self
             .catalog
             .tables
-            .iter()
-            .filter(|(_, table)| table.pk_index_root.is_none())
-            .filter_map(|(table_name, _)| {
-                self.persisted_tables
-                    .get(table_name)
-                    .filter(|state| state.pointer.head_page_id != 0)
-                    .map(|_| table_name.clone())
-            })
-            .collect::<Vec<_>>();
-        if table_names.is_empty() {
+            .keys()
+            .find(|candidate| identifiers_equal(candidate, table_name))
+            .cloned()
+        else {
+            return Ok(false);
+        };
+        let Some(table) = self.catalog.tables.get(&canonical_table_name) else {
+            return Ok(false);
+        };
+        if table.pk_index_root.is_some()
+            || self
+                .persisted_tables
+                .get(&canonical_table_name)
+                .is_none_or(|state| state.pointer.head_page_id == 0)
+        {
+            return Ok(false);
+        }
+        self.backfill_missing_persistent_pk_index_for_canonical_table(
+            db,
+            canonical_table_name.as_str(),
+        )
+    }
+
+    fn backfill_missing_persistent_pk_index_for_canonical_table(
+        &mut self,
+        db: &crate::db::Db,
+        table_name: &str,
+    ) -> Result<bool> {
+        let Some(previous_state) = self.persisted_tables.get(table_name).copied() else {
+            return Ok(false);
+        };
+        if self
+            .catalog
+            .tables
+            .get(table_name)
+            .is_some_and(|table| table.pk_index_root.is_some())
+            || previous_state.pointer.head_page_id == 0
+        {
             return Ok(false);
         }
 
-        let mut changed = false;
-        for table_name in table_names {
-            let Some(previous_state) = self.persisted_tables.get(&table_name).copied() else {
-                continue;
-            };
-
-            let mut store = DbTxnPageStore { db };
-            let payload = if previous_state.pointer.is_table_paged_manifest() {
-                let chunk_payloads = read_paged_table_chunk_payloads(&store, previous_state)?;
-                let manifest = TablePageManifest::from_chunks(chunk_payloads)?;
-                Arc::new(encode_legacy_table_payload_from_manifest(&manifest)?)
-            } else {
-                Arc::new(read_overflow(&store, previous_state.pointer)?)
-            };
-            let pointer = if previous_state.pointer.is_compressed()
-                && !previous_state.pointer.is_table_paged_manifest()
-            {
-                rewrite_overflow(
-                    &mut store,
-                    previous_state.pointer,
-                    payload.as_slice(),
-                    CompressionMode::Never,
-                )?
-            } else {
-                previous_state.pointer
-            };
-            let tail = if previous_state.pointer.is_table_paged_manifest() {
-                previous_state.tail
-            } else {
-                read_uncompressed_overflow_tail(&store, pointer)?.unwrap_or_default()
-            };
-            let checksum = if previous_state.pointer.is_table_paged_manifest() {
-                previous_state.checksum
-            } else {
-                crc32c_parts(&[payload.as_slice()])
-            };
-            self.persisted_tables_mut().insert(
-                table_name.clone(),
-                PersistedTableState {
-                    pointer,
-                    checksum,
-                    row_count: previous_state.row_count,
-                    tail,
-                    pk_index_root: previous_state.pk_index_root,
-                },
-            );
-            self.cache_payload_insert(table_name.clone(), Arc::clone(&payload));
-            self.overflow_chain_caches.remove(&table_name);
-            let chain_cache = build_overflow_chain_cache(&store, pointer.head_page_id)?;
-            self.overflow_chain_caches
-                .insert(table_name.clone(), chain_cache);
-
-            let pk_index_root = if previous_state.pointer.is_table_paged_manifest() {
-                let chunk_payloads = read_paged_table_chunk_payloads(&store, previous_state)?;
-                build_persistent_pk_index_root_from_chunk_payloads(db, &chunk_payloads)?
-            } else {
-                build_persistent_pk_index_root(db, payload.as_slice())?
-            };
-            replace_table_pk_index_root(self, db, &table_name, pk_index_root)?;
-            changed = true;
+        let mut store = DbTxnPageStore { db };
+        if previous_state.pointer.is_table_paged_manifest() {
+            let chunk_payloads = read_paged_table_chunk_payloads(&store, previous_state)?;
+            let pk_index_root =
+                build_persistent_pk_index_root_from_chunk_payloads(db, &chunk_payloads)?;
+            replace_table_pk_index_root(self, db, table_name, pk_index_root)?;
+            return Ok(true);
         }
-        Ok(changed)
+
+        let payload = Arc::new(read_overflow(&store, previous_state.pointer)?);
+        let pointer = if previous_state.pointer.is_compressed() {
+            rewrite_overflow(
+                &mut store,
+                previous_state.pointer,
+                payload.as_slice(),
+                CompressionMode::Never,
+            )?
+        } else {
+            previous_state.pointer
+        };
+        let tail = read_uncompressed_overflow_tail(&store, pointer)?.unwrap_or_default();
+        let checksum = crc32c_parts(&[payload.as_slice()]);
+        self.persisted_tables_mut().insert(
+            table_name.to_string(),
+            PersistedTableState {
+                pointer,
+                checksum,
+                row_count: previous_state.row_count,
+                tail,
+                pk_index_root: previous_state.pk_index_root,
+            },
+        );
+        self.cache_payload_insert(table_name.to_string(), Arc::clone(&payload));
+        self.overflow_chain_caches.remove(table_name);
+        let chain_cache = build_overflow_chain_cache(&store, pointer.head_page_id)?;
+        self.overflow_chain_caches
+            .insert(table_name.to_string(), chain_cache);
+
+        let pk_index_root = build_persistent_pk_index_root(db, payload.as_slice())?;
+        replace_table_pk_index_root(self, db, table_name, pk_index_root)?;
+        Ok(true)
     }
 
     pub(crate) fn backfill_paged_row_storage(&mut self, db: &crate::db::Db) -> Result<bool> {
@@ -12937,6 +13016,16 @@ impl EngineRuntime {
         )? {
             return Ok(Some(result));
         }
+        if let Some(result) = self.try_execute_simple_deferred_table_projection_query(
+            query,
+            params,
+            pager,
+            wal,
+            snapshot_lsn,
+            use_persistent_pk_index,
+        )? {
+            return Ok(Some(result));
+        }
         if let Some(result) = self.try_execute_simple_deferred_expression_projection_query(
             query,
             params,
@@ -12947,13 +13036,7 @@ impl EngineRuntime {
         )? {
             return Ok(Some(result));
         }
-        self.try_execute_simple_deferred_table_projection_query(
-            query,
-            params,
-            pager,
-            wal,
-            snapshot_lsn,
-        )
+        Ok(None)
     }
 
     fn try_execute_simple_deferred_expression_projection_query(
@@ -13231,6 +13314,7 @@ impl EngineRuntime {
         pager: &PagerHandle,
         wal: &WalHandle,
         snapshot_lsn: u64,
+        use_persistent_pk_index: bool,
     ) -> Result<Option<QueryResult>> {
         if !query.ctes.is_empty() {
             return Ok(None);
@@ -13276,7 +13360,41 @@ impl EngineRuntime {
             alias.as_deref().unwrap_or(name),
             &projection_indexes,
         )?;
-        if !query.order_by.is_empty() && order_by.is_none() {
+        let row_id_order_column = if query.order_by.len() == 1 && !query.order_by[0].descending {
+            if let Expr::Column {
+                table: order_table,
+                column: order_column,
+            } = &query.order_by[0].expr
+            {
+                if order_table.as_deref().is_some_and(|qualifier| {
+                    !matches_table_binding(TableBindingRef { name, alias }, Some(qualifier))
+                }) {
+                    None
+                } else if let Some(filter_column_index) =
+                    schema_column_index(table_schema, order_column)
+                {
+                    if table_schema
+                        .primary_key_columns
+                        .iter()
+                        .any(|column| identifiers_equal(column, order_column))
+                        && table_schema.columns[filter_column_index].column_type
+                            == crate::catalog::ColumnType::Int64
+                    {
+                        Some(order_column.as_str())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if !query.order_by.is_empty() && order_by.is_none() && row_id_order_column.is_none() {
             return Ok(None);
         }
         let limit = query
@@ -13300,6 +13418,89 @@ impl EngineRuntime {
             wal,
             snapshot_lsn,
         };
+        let paged_locator_cache = self
+            .catalog
+            .table(name)
+            .and_then(|table| self.deferred_paged_row_locator_caches.get(&table.name))
+            .map(|cache| cache.as_ref());
+        if let Some(filter_column) = row_id_order_column {
+            if limit != Some(0) && use_persistent_pk_index {
+                if let Some(result) = try_persistent_pk_ordered_projection_result(
+                    &store,
+                    state,
+                    table_schema,
+                    &projection_indexes,
+                    column_names.clone(),
+                    limit,
+                    offset,
+                )? {
+                    return Ok(Some(result));
+                }
+            }
+            if limit.is_some() && limit != Some(0) {
+                if let Some(row_ids) =
+                    self.ordered_runtime_btree_row_ids(name, filter_column, limit, offset)?
+                {
+                    let mut rows = Vec::with_capacity(row_ids.len().min(64));
+                    for row_id in row_ids {
+                        if let Some(values) = read_deferred_projected_values_by_id(
+                            &store,
+                            state,
+                            table_schema,
+                            row_id,
+                            use_persistent_pk_index,
+                            paged_locator_cache,
+                            &projection_indexes,
+                        )? {
+                            rows.push(QueryRow::new(values));
+                        }
+                    }
+                    return Ok(Some(QueryResult::with_rows(column_names, rows)));
+                }
+            }
+        }
+        let mut unbounded_lower_bound = None;
+        if let Some(cache) = paged_locator_cache {
+            if let Some(min_row_id) = cache.min_row_id() {
+                unbounded_lower_bound = Some(SimpleRangeBoundValue {
+                    inclusive: true,
+                    value: Value::Int64(min_row_id),
+                });
+            }
+        }
+        if unbounded_lower_bound.is_none() && use_persistent_pk_index {
+            if let Some(min_row_id) = first_persistent_pk_row_id(&store, table_schema)? {
+                unbounded_lower_bound = Some(SimpleRangeBoundValue {
+                    inclusive: true,
+                    value: Value::Int64(min_row_id),
+                });
+            }
+        }
+        if limit.is_some() && limit != Some(0) {
+            if let Some(filter_column) = row_id_order_column {
+                if let Some(result) = self.try_simple_deferred_rowid_range_projection_result(
+                    &store,
+                    state,
+                    table_schema,
+                    TableBindingRef { name, alias },
+                    filter_column,
+                    unbounded_lower_bound.as_ref(),
+                    None,
+                    &projection_indexes,
+                    column_names.clone(),
+                    &query.order_by,
+                    limit,
+                    offset,
+                    use_persistent_pk_index,
+                    paged_locator_cache,
+                )? {
+                    return Ok(Some(result));
+                }
+            }
+        }
+        if !query.order_by.is_empty() && order_by.is_none() {
+            return Ok(None);
+        }
         Ok(Some(self.simple_projection_result_from_persisted_state(
             &store,
             state,
@@ -13735,6 +13936,228 @@ impl EngineRuntime {
             limit,
             offset,
         }))
+    }
+
+    pub(crate) fn simple_indexed_projection_missing_runtime_btree<'a>(
+        &'a self,
+        query: &'a Query,
+        params: &[Value],
+    ) -> Result<Option<(&'a str, &'a str)>> {
+        let Some(plan) = self.analyze_simple_indexed_projection_query(query, params)? else {
+            return Ok(None);
+        };
+        if row_id_alias_column_name(plan.table_schema)
+            .is_some_and(|column_name| identifiers_equal(column_name, plan.filter_column))
+        {
+            return Ok(None);
+        }
+        let Some(index) = self.single_column_btree_index(plan.table_name, plan.filter_column)
+        else {
+            return Ok(None);
+        };
+        if matches!(self.index(&index.name), Some(RuntimeIndex::Btree { .. })) {
+            Ok(None)
+        } else {
+            Ok(Some((plan.table_name, index.name.as_str())))
+        }
+    }
+
+    pub(crate) fn simple_indexed_projection_missing_persistent_pk_root<'a>(
+        &'a self,
+        query: &'a Query,
+        params: &[Value],
+    ) -> Result<Option<&'a str>> {
+        let Some(plan) = self.analyze_simple_indexed_projection_query(query, params)? else {
+            return Ok(None);
+        };
+        if plan.table_schema.pk_index_root.is_some() {
+            return Ok(None);
+        }
+        let Some(filter_column_index) = schema_column_index(plan.table_schema, plan.filter_column)
+        else {
+            return Ok(None);
+        };
+        if plan.table_schema.columns[filter_column_index].column_type != ColumnType::Int64
+            || !plan
+                .table_schema
+                .primary_key_columns
+                .iter()
+                .any(|column| identifiers_equal(column, plan.filter_column))
+        {
+            return Ok(None);
+        }
+        if self
+            .persisted_table_state(plan.table_name)
+            .is_some_and(|state| state.pointer.head_page_id != 0)
+        {
+            Ok(Some(plan.table_name))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub(crate) fn simple_ordered_projection_missing_persistent_pk_root<'a>(
+        &'a self,
+        query: &'a Query,
+        params: &[Value],
+    ) -> Result<Option<&'a str>> {
+        if !query.ctes.is_empty() || query.order_by.len() != 1 || query.order_by[0].descending {
+            return Ok(None);
+        }
+        let QueryBody::Select(select) = &query.body else {
+            return Ok(None);
+        };
+        if select.filter.is_some()
+            || !select.group_by.is_empty()
+            || select.having.is_some()
+            || select.distinct
+            || projection_has_aggregate_items(&select.projection)
+            || select.from.len() != 1
+        {
+            return Ok(None);
+        }
+        let FromItem::Table { name, alias } = &select.from[0] else {
+            return Ok(None);
+        };
+        if self
+            .visible_view(name, NameResolutionScope::Session)
+            .is_some()
+            || self.visible_table_is_temporary(name)
+            || self.visible_table_row_source(name).is_some()
+        {
+            return Ok(None);
+        }
+        let Some(table_schema) = self.table_schema(name) else {
+            return Ok(None);
+        };
+        if table_schema.pk_index_root.is_some() || !generated_columns_are_stored(table_schema) {
+            return Ok(None);
+        }
+        let Some((_projection_indexes, _)) =
+            self.simple_projection_plan(select, name, alias, table_schema)
+        else {
+            return Ok(None);
+        };
+        let Expr::Column {
+            table: order_table,
+            column: order_column,
+        } = &query.order_by[0].expr
+        else {
+            return Ok(None);
+        };
+        if order_table.as_deref().is_some_and(|qualifier| {
+            !matches_table_binding(TableBindingRef { name, alias }, Some(qualifier))
+        }) {
+            return Ok(None);
+        }
+        let Some(order_column_index) = schema_column_index(table_schema, order_column) else {
+            return Ok(None);
+        };
+        if table_schema.columns[order_column_index].column_type != ColumnType::Int64
+            || !table_schema
+                .primary_key_columns
+                .iter()
+                .any(|column| identifiers_equal(column, order_column))
+        {
+            return Ok(None);
+        }
+        let limit = query
+            .limit
+            .as_ref()
+            .map(|expr| self.eval_constant_i64(expr, params, &BTreeMap::new()))
+            .transpose()?
+            .map(|value| usize::try_from(value.max(0)).unwrap_or(usize::MAX));
+        if limit == Some(0) {
+            return Ok(None);
+        }
+        if self
+            .persisted_table_state(name)
+            .is_some_and(|state| state.pointer.head_page_id != 0)
+        {
+            Ok(Some(name))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn single_column_btree_index(
+        &self,
+        table_name: &str,
+        column_name: &str,
+    ) -> Option<&IndexSchema> {
+        self.catalog.indexes.values().find(|index| {
+            identifiers_equal(&index.table_name, table_name)
+                && index.fresh
+                && index.kind == IndexKind::Btree
+                && index.predicate_sql.is_none()
+                && index.columns.len() == 1
+                && index.columns[0]
+                    .column_name
+                    .as_deref()
+                    .is_some_and(|index_column| identifiers_equal(index_column, column_name))
+                && index.columns[0].expression_sql.is_none()
+        })
+    }
+
+    fn ordered_runtime_btree_row_ids(
+        &self,
+        table_name: &str,
+        column_name: &str,
+        limit: Option<usize>,
+        offset: usize,
+    ) -> Result<Option<Vec<i64>>> {
+        let Some(index) = self.single_column_btree_index(table_name, column_name) else {
+            return Ok(None);
+        };
+        let Some(RuntimeIndex::Btree { keys, .. }) = self.index(&index.name) else {
+            return Ok(None);
+        };
+        let take = limit.unwrap_or(usize::MAX);
+        if take == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        match keys {
+            RuntimeBtreeKeys::UniqueInt64(entries) => {
+                let mut ordered = entries
+                    .iter()
+                    .map(|(key, row_id)| (*key, *row_id))
+                    .collect::<Vec<_>>();
+                ordered.sort_unstable_by_key(|(key, _)| *key);
+                Ok(Some(
+                    ordered
+                        .into_iter()
+                        .skip(offset)
+                        .take(take)
+                        .map(|(_, row_id)| row_id)
+                        .collect(),
+                ))
+            }
+            RuntimeBtreeKeys::NonUniqueInt64(entries) => {
+                let mut ordered = entries
+                    .iter()
+                    .map(|(key, row_ids)| (*key, row_ids.as_slice()))
+                    .collect::<Vec<_>>();
+                ordered.sort_unstable_by_key(|(key, _)| *key);
+                let mut skipped = 0usize;
+                let mut row_ids = Vec::with_capacity(take.min(64));
+                for (_, ids) in ordered {
+                    let mut ids = ids.to_vec();
+                    ids.sort_unstable();
+                    for row_id in ids {
+                        if skipped < offset {
+                            skipped += 1;
+                            continue;
+                        }
+                        row_ids.push(row_id);
+                        if row_ids.len() == take {
+                            return Ok(Some(row_ids));
+                        }
+                    }
+                }
+                Ok(Some(row_ids))
+            }
+            RuntimeBtreeKeys::UniqueEncoded(_) | RuntimeBtreeKeys::NonUniqueEncoded(_) => Ok(None),
+        }
     }
 
     fn simple_projection_plan(
@@ -20836,9 +21259,12 @@ fn replace_table_pk_index_root(
                 .get(table_name)
                 .and_then(|table| table.pk_index_root)
         });
-    if let Some(previous_pk_index_root) = previous_pk_index_root {
-        let mut store = DbTxnPageStore { db };
-        free_table_btree(&mut store, Some(previous_pk_index_root))?;
+    match previous_pk_index_root {
+        Some(previous_pk_index_root) if Some(previous_pk_index_root) != new_pk_index_root => {
+            let mut store = DbTxnPageStore { db };
+            free_table_btree(&mut store, Some(previous_pk_index_root))?;
+        }
+        _ => {}
     }
     let table = runtime
         .catalog_mut()
@@ -24299,6 +24725,63 @@ fn encode_row_id_locator_key(row_id: i64) -> u64 {
     (row_id as u64) ^ SIGNED_ROW_ID_BIAS
 }
 
+fn decode_row_id_locator_key(key: u64) -> i64 {
+    (key ^ SIGNED_ROW_ID_BIAS) as i64
+}
+
+fn first_persistent_pk_row_id<S: PageStore>(
+    store: &S,
+    table_schema: &TableSchema,
+) -> Result<Option<i64>> {
+    let Some(pk_index_root) = table_schema.pk_index_root else {
+        return Ok(None);
+    };
+    let Some(position) = btree_first_position(store, Some(pk_index_root))? else {
+        return Ok(None);
+    };
+    let (key, _) = btree_materialize_current(store, &position)?;
+    Ok(Some(decode_row_id_locator_key(key)))
+}
+
+fn try_persistent_pk_ordered_projection_result<S: PageStore>(
+    store: &S,
+    state: PersistedTableState,
+    table_schema: &TableSchema,
+    projection_indexes: &[usize],
+    column_names: Vec<String>,
+    limit: Option<usize>,
+    offset: usize,
+) -> Result<Option<QueryResult>> {
+    let Some(pk_index_root) = table_schema.pk_index_root else {
+        return Ok(None);
+    };
+    let take = limit.unwrap_or(usize::MAX);
+    if take == 0 {
+        return Ok(Some(QueryResult::with_rows(column_names, Vec::new())));
+    }
+
+    let mut cursor = BtreeCursor::from_start(store, Some(pk_index_root))?;
+    let mut skipped = 0usize;
+    let mut rows = Vec::with_capacity(take.min(64));
+    while let Some((_, payload)) = cursor.next()? {
+        if skipped < offset {
+            skipped += 1;
+            continue;
+        }
+        let locator = decode_row_locator(&payload)?;
+        if let Some(values) =
+            read_deferred_projected_values_by_locator(store, state, locator, projection_indexes)?
+        {
+            rows.push(QueryRow::new(values));
+            if rows.len() == take {
+                break;
+            }
+        }
+    }
+
+    Ok(Some(QueryResult::with_rows(column_names, rows)))
+}
+
 fn encode_row_locator(locator: RowLocatorV1) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(8);
     bytes.extend_from_slice(&locator.byte_offset.to_le_bytes());
@@ -24789,6 +25272,116 @@ fn read_deferred_projected_values_by_cached_paged_locator<S: PageStore>(
         cached.locator,
         projection_indexes,
     )
+}
+
+fn read_deferred_projected_values_by_locator_from_table_payload<S: PageStore>(
+    store: &S,
+    state: PersistedTableState,
+    locator: RowLocatorV1,
+    projection_indexes: &[usize],
+) -> Result<Option<Vec<Value>>> {
+    let pointer = state.pointer;
+    if pointer.head_page_id == 0 {
+        return Ok(None);
+    }
+    if pointer.is_compressed() {
+        let entry = read_deferred_compressed_table_lookup_entry(store, state)?;
+        return decode_projected_values_by_locator_from_payload(
+            Some(store),
+            entry.payload.as_slice(),
+            locator,
+            projection_indexes,
+        )
+        .map(Some);
+    }
+
+    let mut cursor = OverflowPayloadCursor::new(store, pointer);
+    cursor.skip(locator.byte_offset as usize)?;
+    let row_bytes = cursor.read_vec(locator.byte_len as usize)?;
+    Row::decode_projection_with_overflow(row_bytes.as_slice(), Some(store), projection_indexes)
+        .map(Some)
+}
+
+fn read_deferred_projected_values_by_locator_from_paged_table_payload<S: PageStore>(
+    store: &S,
+    state: PersistedTableState,
+    locator: RowLocatorV2,
+    projection_indexes: &[usize],
+) -> Result<Option<Vec<Value>>> {
+    let manifest_payload = read_overflow(store, state.pointer)?;
+    if crc32c_parts(&[manifest_payload.as_slice()]) != state.checksum {
+        return Err(DbError::corruption(
+            "paged table manifest checksum mismatch",
+        ));
+    }
+    let manifest = decode_paged_table_manifest_payload(&manifest_payload)?;
+    let chunk = manifest
+        .chunks
+        .get(locator.chunk_index as usize)
+        .ok_or_else(|| DbError::corruption("paged table locator chunk index is invalid"))?;
+    let pointer = if locator.is_overlay {
+        chunk.overlay_pointer.ok_or_else(|| {
+            DbError::corruption("paged table overlay pointer missing for overlay locator")
+        })?
+    } else {
+        chunk.pointer
+    };
+    let payload = read_overflow(store, pointer)?;
+    decode_projected_values_by_locator_from_payload(
+        Some(store),
+        payload.as_slice(),
+        RowLocatorV1 {
+            byte_offset: locator.byte_offset,
+            byte_len: locator.byte_len,
+        },
+        projection_indexes,
+    )
+    .map(Some)
+}
+
+fn read_deferred_projected_values_by_locator<S: PageStore>(
+    store: &S,
+    state: PersistedTableState,
+    locator: DecodedRowLocator,
+    projection_indexes: &[usize],
+) -> Result<Option<Vec<Value>>> {
+    if state.pointer.is_table_paged_manifest() {
+        return match locator {
+            DecodedRowLocator::V2(locator) => {
+                read_deferred_projected_values_by_locator_from_paged_table_payload(
+                    store,
+                    state,
+                    locator,
+                    projection_indexes,
+                )
+            }
+            DecodedRowLocator::V1(_) => Err(DbError::corruption(
+                "paged table persistent pk locator payload is invalid",
+            )),
+        };
+    }
+
+    match locator {
+        DecodedRowLocator::V1(locator) => {
+            read_deferred_projected_values_by_locator_from_table_payload(
+                store,
+                state,
+                locator,
+                projection_indexes,
+            )
+        }
+        DecodedRowLocator::V2(locator) => {
+            read_deferred_projected_values_by_locator_from_table_payload(
+                store,
+                state,
+                RowLocatorV1 {
+                    byte_offset: locator.byte_offset,
+                    byte_len: locator.byte_len,
+                },
+                projection_indexes,
+            )
+        }
+    }
 }
 
 fn read_deferred_row_by_id_from_paged_chunk<S: PageStore>(
