@@ -1,0 +1,6 @@
+{
+  "instructions": [
+    ".kilo/rules/*.md",
+    ".kilocode/rules/*.md"
+  ]
+}
