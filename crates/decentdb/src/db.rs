@@ -37,6 +37,7 @@ use crate::metadata::{
     SchemaTriggerInfo, SchemaViewInfo, StorageInfo, TableInfo, ToolingMetadata, TriggerInfo,
     ViewInfo,
 };
+use crate::plan_cache::PlanCache;
 use crate::reactive::{
     ChangeSource, ChangeStreamOptions, PendingReactiveCommit, QueryWatchOptions, RangeWatchOptions,
     ReactiveHub, ReactiveMetricsSnapshot, ReactiveSubscriptionSnapshot, TableWatchOptions,
@@ -189,6 +190,215 @@ pub struct PreparedStatement {
     prepared_update: Option<Arc<PreparedSimpleUpdate>>,
     prepared_delete: Option<Arc<PreparedSimpleDelete>>,
     read_only: bool,
+}
+
+#[derive(Clone, Debug)]
+struct PreparedPlanBundle {
+    statement: Arc<SqlStatement>,
+    simple_row_id_projection: Option<PreparedSimpleRowIdProjection>,
+    simple_row_id_range_projection: Option<PreparedSimpleRowIdRangeProjection>,
+    simple_row_id_join_projection: Option<PreparedSimpleRowIdJoinProjection>,
+    simple_scalar_filtered_aggregate: Option<PreparedSimpleScalarFilteredAggregate>,
+    prepared_insert: Option<Arc<PreparedSimpleInsert>>,
+    prepared_update: Option<Arc<PreparedSimpleUpdate>>,
+    prepared_delete: Option<Arc<PreparedSimpleDelete>>,
+    read_only: bool,
+}
+
+#[derive(Clone, Debug)]
+struct PreparedPlanCacheEntry {
+    key_hash: u64,
+    bundle: PreparedPlanBundle,
+    plan_size_bytes: u64,
+    persistent_schema_cookie: u32,
+    temp_schema_cookie: u32,
+    policy_mask_generation: u32,
+    hit_count: u64,
+    last_used_at_micros: i64,
+}
+
+#[derive(Debug)]
+struct PreparedPlanCache {
+    enabled: bool,
+    max_size_bytes: u64,
+    current_size_bytes: u64,
+    entries: HashMap<crate::plan_cache::PlanCacheKey, PreparedPlanCacheEntry>,
+    order: VecDeque<crate::plan_cache::PlanCacheKey>,
+    total_hits: u64,
+    total_misses: u64,
+    total_evictions: u64,
+    total_oversized_refusals: u64,
+}
+
+impl PreparedPlanCache {
+    fn new(config: &crate::plan_cache::PlanCacheConfig) -> Self {
+        Self {
+            enabled: config.enabled,
+            max_size_bytes: config.max_size_bytes,
+            current_size_bytes: 0,
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            total_hits: 0,
+            total_misses: 0,
+            total_evictions: 0,
+            total_oversized_refusals: 0,
+        }
+    }
+
+    fn get(
+        &mut self,
+        key: &crate::plan_cache::PlanCacheKey,
+        current_persistent_cookie: u32,
+        current_temp_cookie: u32,
+        current_policy_mask_generation: u32,
+    ) -> Option<PreparedPlanBundle> {
+        if !self.enabled {
+            return None;
+        }
+        let entry = match self.entries.get(key) {
+            Some(entry) => entry,
+            None => {
+                self.total_misses = self.total_misses.saturating_add(1);
+                return None;
+            }
+        };
+        if entry.persistent_schema_cookie != current_persistent_cookie
+            || entry.temp_schema_cookie != current_temp_cookie
+            || entry.policy_mask_generation != current_policy_mask_generation
+        {
+            let _ = entry;
+            self.evict_key(key);
+            self.total_misses = self.total_misses.saturating_add(1);
+            return None;
+        }
+        let bundle = entry.bundle.clone();
+        let _ = entry;
+        self.promote(key);
+        self.total_hits = self.total_hits.saturating_add(1);
+        if let Some(entry) = self.entries.get_mut(key) {
+            entry.hit_count = entry.hit_count.saturating_add(1);
+            entry.last_used_at_micros = current_time_micros();
+        }
+        Some(bundle)
+    }
+
+    fn insert(
+        &mut self,
+        key: crate::plan_cache::PlanCacheKey,
+        bundle: PreparedPlanBundle,
+        plan_size_bytes: u64,
+    ) {
+        const FIXED_OVERHEAD_BYTES: u64 =
+            crate::plan_cache::PLAN_CACHE_ENTRY_FIXED_OVERHEAD_BYTES as u64;
+        if !self.enabled {
+            return;
+        }
+        if plan_size_bytes.saturating_add(FIXED_OVERHEAD_BYTES) > self.max_size_bytes {
+            self.total_oversized_refusals = self.total_oversized_refusals.saturating_add(1);
+            return;
+        }
+        if let Some(previous) = self.entries.remove(&key) {
+            self.current_size_bytes = self
+                .current_size_bytes
+                .saturating_sub(previous.plan_size_bytes)
+                .saturating_sub(FIXED_OVERHEAD_BYTES);
+            self.order.retain(|candidate| candidate != &key);
+        }
+        let entry = PreparedPlanCacheEntry {
+            key_hash: key.stable_hash(),
+            bundle,
+            plan_size_bytes,
+            persistent_schema_cookie: key.persistent_schema_cookie,
+            temp_schema_cookie: key.temp_schema_cookie,
+            policy_mask_generation: key.policy_mask_generation,
+            hit_count: 0,
+            last_used_at_micros: current_time_micros(),
+        };
+        self.entries.insert(key.clone(), entry);
+        self.order.push_back(key);
+        self.current_size_bytes = self
+            .current_size_bytes
+            .saturating_add(plan_size_bytes)
+            .saturating_add(FIXED_OVERHEAD_BYTES);
+        self.evict_to_fit(self.max_size_bytes);
+    }
+
+    fn invalidate_all(&mut self) {
+        let evicted = self.entries.len() as u64;
+        self.total_evictions = self.total_evictions.saturating_add(evicted);
+        self.entries.clear();
+        self.order.clear();
+        self.current_size_bytes = 0;
+    }
+
+    fn flush(&mut self) {
+        self.invalidate_all();
+        self.total_hits = 0;
+        self.total_misses = 0;
+        self.total_evictions = 0;
+        self.total_oversized_refusals = 0;
+    }
+
+    fn snapshot_entries(&self) -> Vec<PreparedPlanCacheEntry> {
+        let mut entries = self.entries.values().cloned().collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.key_hash);
+        entries
+    }
+
+    fn summary(&self) -> crate::plan_cache::PlanCacheSummary {
+        let total = self.total_hits.saturating_add(self.total_misses);
+        let hit_rate = if total == 0 {
+            0.0
+        } else {
+            (self.total_hits as f64) * 100.0 / (total as f64)
+        };
+        crate::plan_cache::PlanCacheSummary {
+            scope: "connection",
+            total_entries: self.entries.len() as u64,
+            total_hits: self.total_hits,
+            total_misses: self.total_misses,
+            total_evictions: self.total_evictions,
+            total_size_bytes: self.current_size_bytes,
+            max_size_bytes: self.max_size_bytes,
+            total_oversized_refusals: self.total_oversized_refusals,
+            hit_rate,
+        }
+    }
+
+    fn promote(&mut self, key: &crate::plan_cache::PlanCacheKey) {
+        self.order.retain(|candidate| candidate != key);
+        self.order.push_back(key.clone());
+    }
+
+    fn evict_key(&mut self, key: &crate::plan_cache::PlanCacheKey) {
+        const FIXED_OVERHEAD_BYTES: u64 =
+            crate::plan_cache::PLAN_CACHE_ENTRY_FIXED_OVERHEAD_BYTES as u64;
+        if let Some(entry) = self.entries.remove(key) {
+            self.current_size_bytes = self
+                .current_size_bytes
+                .saturating_sub(entry.plan_size_bytes)
+                .saturating_sub(FIXED_OVERHEAD_BYTES);
+            self.total_evictions = self.total_evictions.saturating_add(1);
+        }
+        self.order.retain(|candidate| candidate != key);
+    }
+
+    fn evict_to_fit(&mut self, target_size: u64) {
+        const FIXED_OVERHEAD_BYTES: u64 =
+            crate::plan_cache::PLAN_CACHE_ENTRY_FIXED_OVERHEAD_BYTES as u64;
+        while self.current_size_bytes > target_size {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(entry) = self.entries.remove(&oldest) {
+                self.current_size_bytes = self
+                    .current_size_bytes
+                    .saturating_sub(entry.plan_size_bytes)
+                    .saturating_sub(FIXED_OVERHEAD_BYTES);
+                self.total_evictions = self.total_evictions.saturating_add(1);
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -506,6 +716,9 @@ struct DbInner {
     temp_state: Mutex<TempSchemaState>,
     statement_cache: Mutex<StatementCache>,
     prepared_insert_cache: Mutex<PreparedInsertCache>,
+    plan_cache: Mutex<PlanCache>,
+    prepared_plan_cache: Mutex<PreparedPlanCache>,
+    policy_mask_generation: crate::plan_cache::PolicyMaskGeneration,
     held_snapshots: Mutex<HashMap<u64, ReaderGuard>>,
     sync_ctx: SyncContext,
     reactive_registry_key: Option<PathBuf>,
@@ -650,6 +863,58 @@ struct SqlSavepoint {
 impl SqlTxnState {
     fn snapshot_lsn(&self) -> u64 {
         self.snapshot_reader.snapshot_lsn()
+    }
+}
+
+impl crate::plan_cache::PlanCacheInvalidator for DbInner {
+    fn on_persistent_ddl(&self) {
+        if let Ok(mut cache) = self.plan_cache.lock() {
+            cache.invalidate_all();
+        }
+        if let Ok(mut cache) = self.prepared_plan_cache.lock() {
+            cache.invalidate_all();
+        }
+    }
+    fn on_temp_schema_change(&self) {
+        if let Ok(mut cache) = self.plan_cache.lock() {
+            cache.invalidate_all();
+        }
+        if let Ok(mut cache) = self.prepared_plan_cache.lock() {
+            cache.invalidate_all();
+        }
+    }
+    fn on_policy_mask_change(&self) {
+        self.policy_mask_generation.bump();
+        if let Ok(mut cache) = self.plan_cache.lock() {
+            cache.invalidate_all();
+        }
+        if let Ok(mut cache) = self.prepared_plan_cache.lock() {
+            cache.invalidate_all();
+        }
+    }
+    fn on_branch_switch(&self) {
+        if let Ok(mut cache) = self.plan_cache.lock() {
+            cache.invalidate_all();
+        }
+        if let Ok(mut cache) = self.prepared_plan_cache.lock() {
+            cache.invalidate_all();
+        }
+    }
+    fn on_extension_change(&self) {
+        if let Ok(mut cache) = self.plan_cache.lock() {
+            cache.invalidate_all();
+        }
+        if let Ok(mut cache) = self.prepared_plan_cache.lock() {
+            cache.invalidate_all();
+        }
+    }
+    fn on_explicit_flush(&self) {
+        if let Ok(mut cache) = self.plan_cache.lock() {
+            cache.flush();
+        }
+        if let Ok(mut cache) = self.prepared_plan_cache.lock() {
+            cache.flush();
+        }
     }
 }
 
@@ -2191,16 +2456,20 @@ impl Db {
             }
             if let Some(command) = crate::security::parse_set_audit_context(trimmed)? {
                 let result = self.execute_set_audit_context(command)?;
+                // Per ADR 0192, audit context writes do not invalidate
+                // the plan cache.
                 results.push(result);
                 continue;
             }
             if let Some(command) = crate::security::parse_security_command(trimmed)? {
                 let result = self.execute_security_command(trimmed, command)?;
+                crate::plan_cache::PlanCacheInvalidator::on_policy_mask_change(&*self.inner);
                 results.push(result);
                 continue;
             }
             if let Some(command) = crate::extensions::parse_extension_sql(trimmed)? {
                 let result = crate::extensions::execute_extension_sql(self, command)?;
+                crate::plan_cache::PlanCacheInvalidator::on_extension_change(&*self.inner);
                 results.push(result);
                 continue;
             }
@@ -2262,9 +2531,53 @@ impl Db {
                 let dur = t0.elapsed();
                 self.record_statement_trace(trimmed, read_only, dur, unix_ms, result.as_ref());
             }
-            results.push(result?);
+            let result = result?;
+            self.dispatch_plan_cache_invalidation(&statement);
+            results.push(result);
         }
         Ok(results)
+    }
+
+    fn dispatch_plan_cache_invalidation(&self, statement: &SqlStatement) {
+        use crate::plan_cache::SqlStatementExt;
+        use SqlStatement::*;
+        let inner: &DbInner = &self.inner;
+        match statement {
+            CreateTable(_)
+            | CreateTableAs(_)
+            | CreateSchema { .. }
+            | CreateIndex(_)
+            | CreateView(_)
+            | CreateTrigger(_)
+            | DropTable { .. }
+            | DropIndex { .. }
+            | DropView { .. }
+            | DropTrigger { .. }
+            | AlterTable { .. }
+            | AlterIndexRebuild { .. }
+            | AlterIndexVerify { .. }
+            | AlterViewRename { .. }
+            | TruncateTable { .. } => {
+                crate::plan_cache::PlanCacheInvalidator::on_persistent_ddl(inner);
+            }
+            Analyze { .. } => {
+                crate::plan_cache::PlanCacheInvalidator::on_analyze(
+                    inner,
+                    statement.table_name_for_analyze().unwrap_or(""),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    fn statement_can_enter_plan_cache(statement: &SqlStatement) -> bool {
+        matches!(
+            statement,
+            SqlStatement::Query(_)
+                | SqlStatement::Insert(_)
+                | SqlStatement::Update(_)
+                | SqlStatement::Delete(_)
+        )
     }
 
     fn record_statement_trace(
@@ -2451,6 +2764,12 @@ impl Db {
     /// Prepared statements are bound to the current schema cookie. If the schema
     /// changes, the handle must be recreated before it can be executed again.
     pub fn prepare(&self, sql: &str) -> Result<PreparedStatement> {
+        if !self.inner.sql_txn_active.load(Ordering::Acquire) {
+            let prepared_sql = prepared_statement_sql(sql)?;
+            if let Some(prepared) = self.try_prepare_from_plan_cache(&prepared_sql)? {
+                return Ok(prepared);
+            }
+        }
         let runtime = self.runtime_for_prepare()?;
         self.prepare_with_runtime(sql, &runtime)
     }
@@ -3166,11 +3485,19 @@ impl Db {
         let last_seen_checkpoint_epoch = wal.checkpoint_epoch();
         let reactive_registry_key = open_lock_key.clone();
         let busy_timeout_ms = effective_config.write_queue_default_timeout_ms;
+        let mut parsed_plan_cache_config = effective_config.plan_cache.clone();
+        let mut prepared_plan_cache_config = effective_config.plan_cache.clone();
+        let prepared_budget = effective_config.plan_cache.max_size_bytes / 2;
+        parsed_plan_cache_config.max_size_bytes = effective_config
+            .plan_cache
+            .max_size_bytes
+            .saturating_sub(prepared_budget);
+        prepared_plan_cache_config.max_size_bytes = prepared_budget;
 
         let db = Self {
             inner: Arc::new(DbInner {
                 path: path.clone(),
-                config: effective_config,
+                config: effective_config.clone(),
                 vfs,
                 pager,
                 wal,
@@ -3188,6 +3515,11 @@ impl Db {
                 temp_state: Mutex::new(TempSchemaState::default()),
                 statement_cache: Mutex::new(StatementCache::default()),
                 prepared_insert_cache: Mutex::new(PreparedInsertCache::default()),
+                plan_cache: Mutex::new(PlanCache::new(&parsed_plan_cache_config)),
+                prepared_plan_cache: Mutex::new(PreparedPlanCache::new(
+                    &prepared_plan_cache_config,
+                )),
+                policy_mask_generation: crate::plan_cache::PolicyMaskGeneration::new(0),
                 held_snapshots: Mutex::new(HashMap::new()),
                 sync_ctx: SyncContext::new(&path),
                 reactive_registry_key,
@@ -3256,6 +3588,88 @@ impl Db {
 
     pub fn schema_cookie(&self) -> Result<u32> {
         self.inner.catalog.schema_cookie()
+    }
+
+    /// Returns a snapshot of the connection-local plan cache summary.
+    pub fn plan_cache_summary(&self) -> Result<crate::plan_cache::PlanCacheSummary> {
+        let parsed = self
+            .inner
+            .plan_cache
+            .lock()
+            .map(|cache| cache.summary())
+            .map_err(|_| DbError::internal("plan cache lock poisoned"))?;
+        let prepared = self
+            .inner
+            .prepared_plan_cache
+            .lock()
+            .map(|cache| cache.summary())
+            .map_err(|_| DbError::internal("prepared plan cache lock poisoned"))?;
+        let total_hits = parsed.total_hits.saturating_add(prepared.total_hits);
+        let total_misses = parsed.total_misses.saturating_add(prepared.total_misses);
+        let total_lookups = total_hits.saturating_add(total_misses);
+        let hit_rate = if total_lookups == 0 {
+            0.0
+        } else {
+            (total_hits as f64) * 100.0 / (total_lookups as f64)
+        };
+        Ok(crate::plan_cache::PlanCacheSummary {
+            scope: "connection",
+            total_entries: parsed.total_entries.saturating_add(prepared.total_entries),
+            total_hits,
+            total_misses,
+            total_evictions: parsed
+                .total_evictions
+                .saturating_add(prepared.total_evictions),
+            total_size_bytes: parsed
+                .total_size_bytes
+                .saturating_add(prepared.total_size_bytes),
+            max_size_bytes: parsed
+                .max_size_bytes
+                .saturating_add(prepared.max_size_bytes),
+            total_oversized_refusals: parsed
+                .total_oversized_refusals
+                .saturating_add(prepared.total_oversized_refusals),
+            hit_rate,
+        })
+    }
+
+    /// Returns a snapshot of every entry currently held in the
+    /// connection-local plan cache.
+    pub fn plan_cache_entries(&self) -> Result<Vec<crate::plan_cache::PlanCacheEntry>> {
+        self.inner
+            .plan_cache
+            .lock()
+            .map(|cache| cache.snapshot_entries())
+            .map_err(|_| DbError::internal("plan cache lock poisoned"))
+    }
+
+    fn prepared_plan_cache_entries(&self) -> Result<Vec<PreparedPlanCacheEntry>> {
+        self.inner
+            .prepared_plan_cache
+            .lock()
+            .map(|cache| cache.snapshot_entries())
+            .map_err(|_| DbError::internal("prepared plan cache lock poisoned"))
+    }
+
+    /// Flushes the connection-local plan cache and resets its counters.
+    pub fn flush_plan_cache(&self) -> Result<()> {
+        self.inner
+            .plan_cache
+            .lock()
+            .map(|mut cache| cache.flush())
+            .map_err(|_| DbError::internal("plan cache lock poisoned"))?;
+        self.inner
+            .prepared_plan_cache
+            .lock()
+            .map(|mut cache| cache.flush())
+            .map_err(|_| DbError::internal("prepared plan cache lock poisoned"))
+    }
+
+    /// Returns the current policy/mask generation counter. The counter
+    /// is bumped on every CREATE/DROP/ALTER POLICY and on projection
+    /// mask changes; see ADR 0192.
+    pub fn policy_mask_generation(&self) -> u32 {
+        self.inner.policy_mask_generation.current()
     }
 
     #[must_use]
@@ -3857,6 +4271,10 @@ impl Db {
                         .unwrap_or(i64::MAX),
                 )])],
             )),
+            PragmaName::FlushPlanCache => {
+                self.flush_plan_cache()?;
+                Ok(QueryResult::with_affected_rows(0))
+            }
         }
     }
 
@@ -3909,6 +4327,10 @@ impl Db {
                     pragma_schema_function_prefix(target.schema),
                     sql_string_literal(&table_name)
                 ))
+            }
+            PragmaName::FlushPlanCache => {
+                self.flush_plan_cache()?;
+                Ok(QueryResult::with_affected_rows(0))
             }
             PragmaName::WalCheckpoint => self.execute_pragma_wal_checkpoint(argument.as_deref()),
             other => Err(DbError::sql(format!(
@@ -4159,6 +4581,17 @@ impl Db {
                 "PRAGMA {} does not support assignment",
                 pragma_name_sql(&target.name)
             ))),
+            PragmaName::FlushPlanCache => {
+                let value = parse_pragma_text_or_mode(&value, "PRAGMA flush_plan_cache")?;
+                if value == "LOCAL" {
+                    self.flush_plan_cache()?;
+                    Ok(QueryResult::with_affected_rows(0))
+                } else {
+                    Err(DbError::sql(
+                        "PRAGMA flush_plan_cache accepts only local in this release",
+                    ))
+                }
+            }
             PragmaName::ForeignKeys => {
                 let value = parse_pragma_bool_value(&value, "PRAGMA foreign_keys")?;
                 if value {
@@ -5915,11 +6348,19 @@ impl Db {
         {
             return Ok(());
         }
-        self.inner
-            .temp_state
-            .lock()
-            .map_err(|_| DbError::internal("temp schema lock poisoned"))?
-            .update_from_runtime(runtime);
+        let changed = {
+            let mut state = self
+                .inner
+                .temp_state
+                .lock()
+                .map_err(|_| DbError::internal("temp schema lock poisoned"))?;
+            let before = state.schema_cookie;
+            state.update_from_runtime(runtime);
+            before != state.schema_cookie
+        };
+        if changed {
+            crate::plan_cache::PlanCacheInvalidator::on_temp_schema_change(&*self.inner);
+        }
         Ok(())
     }
 
@@ -6023,11 +6464,106 @@ impl Db {
     }
 
     fn parsed_statement(&self, sql: &str) -> Result<Arc<SqlStatement>> {
-        self.inner
+        // Try the connection-local plan cache first. The cache is keyed
+        // by the prepared SQL text plus the current schema cookies and
+        // policy/mask generation; on a hit we still get a fresh
+        // `PreparedStatement` (which is cheap to construct) but we
+        // skip the parse step.
+        let prepared_sql = prepared_statement_sql(sql)?;
+        let parameter_shape = parameter_shape_for_prepared_sql(&prepared_sql);
+        if parameter_shape.arity() == 0 {
+            return self
+                .inner
+                .statement_cache
+                .lock()
+                .map_err(|_| DbError::internal("statement cache lock poisoned"))?
+                .get_or_parse(&prepared_sql);
+        }
+
+        let temp_cookie = self
+            .inner
+            .temp_state
+            .lock()
+            .map(|s| s.schema_cookie)
+            .unwrap_or(0);
+        let persistent_cookie = self.inner.catalog.schema_cookie()?;
+        let policy_gen = self.inner.policy_mask_generation.current();
+        let mut plan_cache = self
+            .inner
+            .plan_cache
+            .lock()
+            .map_err(|_| DbError::internal("plan cache lock poisoned"))?;
+        let key = crate::plan_cache::PlanCacheKey::new(
+            prepared_sql,
+            parameter_shape,
+            persistent_cookie,
+            temp_cookie,
+            policy_gen,
+        );
+        let current_key = key.clone();
+        if let Some(statement) = plan_cache.get(&key, persistent_cookie, temp_cookie, policy_gen) {
+            return Ok(statement);
+        }
+        drop(plan_cache);
+        // Fall back to the existing narrow statement cache for parse
+        // work, then store the parsed statement in the plan cache.
+        let statement = self
+            .inner
             .statement_cache
             .lock()
             .map_err(|_| DbError::internal("statement cache lock poisoned"))?
-            .get_or_parse(sql)
+            .get_or_parse(&current_key.sql_text)?;
+        if Self::statement_can_enter_plan_cache(statement.as_ref()) {
+            if let Ok(mut plan_cache) = self.inner.plan_cache.lock() {
+                if plan_cache.should_admit_missed_key(&current_key) {
+                    let size = crate::plan_cache::statement_accounted_size(&statement);
+                    plan_cache.insert(current_key, Arc::clone(&statement), size);
+                }
+            }
+        }
+        Ok(statement)
+    }
+
+    fn try_prepare_from_plan_cache(&self, prepared_sql: &str) -> Result<Option<PreparedStatement>> {
+        let persistent_cookie = self.inner.catalog.schema_cookie()?;
+        let temp_cookie = self
+            .inner
+            .temp_state
+            .lock()
+            .map_err(|_| DbError::internal("temp schema lock poisoned"))?
+            .schema_cookie;
+        let policy_gen = self.inner.policy_mask_generation.current();
+        let key = crate::plan_cache::PlanCacheKey::new(
+            prepared_sql.to_string(),
+            parameter_shape_for_prepared_sql(prepared_sql),
+            persistent_cookie,
+            temp_cookie,
+            policy_gen,
+        );
+        let Some(bundle) = self
+            .inner
+            .prepared_plan_cache
+            .lock()
+            .map_err(|_| DbError::internal("prepared plan cache lock poisoned"))?
+            .get(&key, persistent_cookie, temp_cookie, policy_gen)
+        else {
+            return Ok(None);
+        };
+        Ok(Some(PreparedStatement {
+            db: self.clone(),
+            schema_cookie: persistent_cookie,
+            temp_schema_cookie: temp_cookie,
+            statement: Arc::clone(&bundle.statement),
+            prepared_sql: prepared_sql.to_string(),
+            simple_row_id_projection: bundle.simple_row_id_projection,
+            simple_row_id_range_projection: bundle.simple_row_id_range_projection,
+            simple_row_id_join_projection: bundle.simple_row_id_join_projection,
+            simple_scalar_filtered_aggregate: bundle.simple_scalar_filtered_aggregate,
+            prepared_insert: bundle.prepared_insert,
+            prepared_update: bundle.prepared_update,
+            prepared_delete: bundle.prepared_delete,
+            read_only: bundle.read_only,
+        }))
     }
 
     fn prepare_with_runtime(
@@ -6036,6 +6572,42 @@ impl Db {
         runtime: &EngineRuntime,
     ) -> Result<PreparedStatement> {
         let prepared_sql = prepared_statement_sql(sql)?;
+        let policy_gen = self.inner.policy_mask_generation.current();
+        let key = crate::plan_cache::PlanCacheKey::new(
+            prepared_sql.clone(),
+            parameter_shape_for_prepared_sql(&prepared_sql),
+            runtime.catalog.schema_cookie,
+            runtime.temp_schema_cookie,
+            policy_gen,
+        );
+        if let Some(bundle) = self
+            .inner
+            .prepared_plan_cache
+            .lock()
+            .map_err(|_| DbError::internal("prepared plan cache lock poisoned"))?
+            .get(
+                &key,
+                runtime.catalog.schema_cookie,
+                runtime.temp_schema_cookie,
+                policy_gen,
+            )
+        {
+            return Ok(PreparedStatement {
+                db: self.clone(),
+                schema_cookie: runtime.catalog.schema_cookie,
+                temp_schema_cookie: runtime.temp_schema_cookie,
+                statement: Arc::clone(&bundle.statement),
+                prepared_sql,
+                simple_row_id_projection: bundle.simple_row_id_projection,
+                simple_row_id_range_projection: bundle.simple_row_id_range_projection,
+                simple_row_id_join_projection: bundle.simple_row_id_join_projection,
+                simple_scalar_filtered_aggregate: bundle.simple_scalar_filtered_aggregate,
+                prepared_insert: bundle.prepared_insert,
+                prepared_update: bundle.prepared_update,
+                prepared_delete: bundle.prepared_delete,
+                read_only: bundle.read_only,
+            });
+        }
         let statement = self.parsed_statement(&prepared_sql)?;
         let read_only = statement_is_read_only(statement.as_ref());
         let (prepared_insert, prepared_update, prepared_delete) = match statement.as_ref() {
@@ -6064,12 +6636,8 @@ impl Db {
             Self::prepared_simple_row_id_join_projection(statement.as_ref(), runtime);
         let simple_scalar_filtered_aggregate =
             Self::prepared_simple_scalar_filtered_aggregate(statement.as_ref(), runtime);
-        Ok(PreparedStatement {
-            db: self.clone(),
-            schema_cookie: runtime.catalog.schema_cookie,
-            temp_schema_cookie: runtime.temp_schema_cookie,
+        let bundle = PreparedPlanBundle {
             statement: Arc::clone(&statement),
-            prepared_sql: prepared_sql.clone(),
             simple_row_id_projection,
             simple_row_id_range_projection,
             simple_row_id_join_projection,
@@ -6077,6 +6645,30 @@ impl Db {
             prepared_insert,
             prepared_update,
             prepared_delete,
+            read_only,
+        };
+        if Self::statement_can_enter_plan_cache(bundle.statement.as_ref()) {
+            if let Ok(mut cache) = self.inner.prepared_plan_cache.lock() {
+                cache.insert(
+                    key,
+                    bundle.clone(),
+                    Self::prepared_plan_accounted_size(&bundle),
+                );
+            }
+        }
+        Ok(PreparedStatement {
+            db: self.clone(),
+            schema_cookie: runtime.catalog.schema_cookie,
+            temp_schema_cookie: runtime.temp_schema_cookie,
+            statement: Arc::clone(&statement),
+            prepared_sql: prepared_sql.clone(),
+            simple_row_id_projection: bundle.simple_row_id_projection,
+            simple_row_id_range_projection: bundle.simple_row_id_range_projection,
+            simple_row_id_join_projection: bundle.simple_row_id_join_projection,
+            simple_scalar_filtered_aggregate: bundle.simple_scalar_filtered_aggregate,
+            prepared_insert: bundle.prepared_insert,
+            prepared_update: bundle.prepared_update,
+            prepared_delete: bundle.prepared_delete,
             read_only,
         })
     }
@@ -6417,6 +7009,65 @@ impl Db {
                 runtime.temp_schema_cookie,
                 || runtime.prepare_simple_insert(statement),
             )
+    }
+
+    fn prepared_plan_accounted_size(bundle: &PreparedPlanBundle) -> u64 {
+        fn string_bytes(value: &str) -> u64 {
+            value.len() as u64
+        }
+        fn string_slice_bytes(values: &[String]) -> u64 {
+            values.iter().map(|value| string_bytes(value)).sum()
+        }
+
+        let mut total = crate::plan_cache::statement_accounted_size(bundle.statement.as_ref())
+            .saturating_add(std::mem::size_of::<PreparedPlanBundle>() as u64);
+        if let Some(plan) = &bundle.simple_row_id_projection {
+            total = total
+                .saturating_add(128)
+                .saturating_add(string_bytes(&plan.table_name))
+                .saturating_add(
+                    (plan.projection_indexes.len() * std::mem::size_of::<usize>()) as u64,
+                )
+                .saturating_add(string_slice_bytes(&plan.column_names));
+        }
+        if let Some(plan) = &bundle.simple_row_id_range_projection {
+            total = total
+                .saturating_add(160)
+                .saturating_add(string_bytes(&plan.table_name))
+                .saturating_add(string_bytes(&plan.filter_column))
+                .saturating_add(
+                    (plan.projection_indexes.len() * std::mem::size_of::<usize>()) as u64,
+                )
+                .saturating_add(string_slice_bytes(&plan.column_names));
+        }
+        if let Some(plan) = &bundle.simple_row_id_join_projection {
+            total = total
+                .saturating_add(256)
+                .saturating_add(string_bytes(&plan.left_table_name))
+                .saturating_add(string_bytes(&plan.right_table_name))
+                .saturating_add(
+                    ((plan.left_projection_indexes.len()
+                        + plan.right_projection_indexes.len()
+                        + plan.projections.len())
+                        * std::mem::size_of::<usize>()) as u64,
+                )
+                .saturating_add(string_slice_bytes(&plan.column_names));
+        }
+        if let Some(plan) = &bundle.simple_scalar_filtered_aggregate {
+            total = total
+                .saturating_add(128)
+                .saturating_add(string_bytes(&plan.table_name));
+        }
+        if bundle.prepared_insert.is_some() {
+            total = total.saturating_add(512);
+        }
+        if bundle.prepared_update.is_some() {
+            total = total.saturating_add(384);
+        }
+        if bundle.prepared_delete.is_some() {
+            total = total.saturating_add(384);
+        }
+        total
     }
 
     fn persist_runtime(&self, runtime: EngineRuntime) -> Result<u64> {
@@ -12210,13 +12861,88 @@ impl Db {
             uncheckpointed_frames,
         );
         for f in engine.into_findings() {
-            let mut row = f.to_query_row();
-            // trim to first 7 columns
-            row.truncate(7);
-            findings.push(row);
+            findings.push(vec![
+                Value::Text(f.advisor_id),
+                Value::Text(format!("{:?}", f.category)),
+                Value::Text(format!("{:?}", f.severity)),
+                Value::Text(f.title),
+                Value::Text(f.description),
+                Value::Text(f.evidence.join("; ")),
+                Value::Text(f.recommendation),
+            ]);
         }
+        self.append_plan_cache_doctor_findings(&mut findings)?;
         let rows = findings.into_iter().map(QueryRow::new).collect();
         Ok(QueryResult::with_rows(columns, rows))
+    }
+
+    fn append_plan_cache_doctor_findings(&self, findings: &mut Vec<Vec<Value>>) -> Result<()> {
+        let summary = self.plan_cache_summary()?;
+        let config = &self.inner.config.plan_cache;
+        if !config.enabled {
+            findings.push(plan_cache_doctor_row(
+                "plan-cache.disabled",
+                "Statistics",
+                "Info",
+                "Plan cache is disabled",
+                "This connection will parse and plan each statement without using the connection-local plan cache.",
+                "enabled=false",
+                "Enable plan_cache_enabled=true for repeated prepared-statement workloads.",
+            ));
+            return Ok(());
+        }
+
+        if summary.total_oversized_refusals > 0 {
+            findings.push(plan_cache_doctor_row(
+                "plan-cache.oversized-refusals",
+                "Storage",
+                "Warning",
+                "Plan cache refused oversized entries",
+                "One or more statements were larger than the configured plan-cache budget and could not be cached.",
+                &format!(
+                    "oversized_refusals={}; max_size_bytes={}",
+                    summary.total_oversized_refusals, summary.max_size_bytes
+                ),
+                "Increase plan_cache_max_bytes or leave unusually large one-off statements uncached.",
+            ));
+        }
+
+        if summary.total_evictions > 0 {
+            findings.push(plan_cache_doctor_row(
+                "plan-cache.evictions",
+                "Storage",
+                "Warning",
+                "Plan cache is evicting entries",
+                "The connection-local plan cache has evicted entries, which can reduce reuse for repeated workloads.",
+                &format!(
+                    "entries={}; evictions={}; size_bytes={}; max_size_bytes={}; hit_rate={:.2}%",
+                    summary.total_entries,
+                    summary.total_evictions,
+                    summary.total_size_bytes,
+                    summary.max_size_bytes,
+                    summary.hit_rate
+                ),
+                "Increase plan_cache_max_bytes for large prepared-statement working sets, or inspect sys.plan_cache for churn.",
+            ));
+        }
+
+        let lookups = summary.total_hits.saturating_add(summary.total_misses);
+        if lookups >= 100 && summary.hit_rate < 10.0 {
+            findings.push(plan_cache_doctor_row(
+                "plan-cache.low-hit-rate",
+                "Statistics",
+                "Info",
+                "Plan cache hit rate is low",
+                "This connection has performed many plan-cache lookups with few hits, which usually means the workload is mostly one-shot SQL.",
+                &format!(
+                    "hits={}; misses={}; hit_rate={:.2}%",
+                    summary.total_hits, summary.total_misses, summary.hit_rate
+                ),
+                "For one-shot workloads, either leave the cache at the small default or disable it with plan_cache_enabled=false.",
+            ));
+        }
+
+        Ok(())
     }
 
     fn fix_plan_query_result(&self) -> Result<QueryResult> {
@@ -12327,6 +13053,10 @@ impl Db {
             SyncInspectionQuery::ShapeClients => self.sync_shape_clients_query_result().map(Some),
             SyncInspectionQuery::ChangesetHistory => {
                 self.sync_changeset_history_query_result().map(Some)
+            }
+            SyncInspectionQuery::PlanCache => self.plan_cache_query_result().map(Some),
+            SyncInspectionQuery::PlanCacheSummary => {
+                self.plan_cache_summary_query_result().map(Some)
             }
         }
     }
@@ -12614,6 +13344,82 @@ impl Db {
                 sync_u64_to_i64(storage.wal_versions as u64, "wal_versions")?,
                 sync_u64_to_i64(storage.warning_count as u64, "warning_count")?,
                 Value::Bool(storage.shared_wal),
+            ])],
+        ))
+    }
+
+    fn plan_cache_query_result(&self) -> Result<QueryResult> {
+        let entries = self.plan_cache_entries()?;
+        let prepared_entries = self.prepared_plan_cache_entries()?;
+        let columns = vec![
+            "scope".to_string(),
+            "cache_key_hash".to_string(),
+            "persistent_schema_cookie".to_string(),
+            "temp_schema_cookie".to_string(),
+            "policy_mask_generation".to_string(),
+            "hit_count".to_string(),
+            "last_used_at".to_string(),
+            "plan_size_bytes".to_string(),
+            "statement_category".to_string(),
+        ];
+        let mut rows = Vec::with_capacity(entries.len());
+        for entry in entries {
+            rows.push(QueryRow::new(vec![
+                Value::Text("connection".to_string()),
+                Value::Text(format!("{:016x}", entry.key_hash)),
+                Value::Int64(i64::from(entry.persistent_schema_cookie)),
+                Value::Int64(i64::from(entry.temp_schema_cookie)),
+                Value::Int64(i64::from(entry.policy_mask_generation)),
+                Value::Int64(entry.hit_count as i64),
+                Value::Text(format!("{} micros", entry.last_used_at_micros)),
+                Value::Int64(entry.plan_size_bytes as i64),
+                Value::Text(entry.statement_category.as_str().to_string()),
+            ]));
+        }
+        for entry in prepared_entries {
+            rows.push(QueryRow::new(vec![
+                Value::Text("connection".to_string()),
+                Value::Text(format!("{:016x}", entry.key_hash)),
+                Value::Int64(i64::from(entry.persistent_schema_cookie)),
+                Value::Int64(i64::from(entry.temp_schema_cookie)),
+                Value::Int64(i64::from(entry.policy_mask_generation)),
+                Value::Int64(entry.hit_count as i64),
+                Value::Text(format!("{} micros", entry.last_used_at_micros)),
+                Value::Int64(entry.plan_size_bytes as i64),
+                Value::Text(
+                    crate::plan_cache::StatementCategory::classify(entry.bundle.statement.as_ref())
+                        .as_str()
+                        .to_string(),
+                ),
+            ]));
+        }
+        Ok(QueryResult::with_rows(columns, rows))
+    }
+
+    fn plan_cache_summary_query_result(&self) -> Result<QueryResult> {
+        let summary = self.plan_cache_summary()?;
+        Ok(QueryResult::with_rows(
+            vec![
+                "scope".to_string(),
+                "total_entries".to_string(),
+                "total_hits".to_string(),
+                "total_misses".to_string(),
+                "total_evictions".to_string(),
+                "total_size_bytes".to_string(),
+                "max_size_bytes".to_string(),
+                "total_oversized_refusals".to_string(),
+                "hit_rate".to_string(),
+            ],
+            vec![QueryRow::new(vec![
+                Value::Text(summary.scope.to_string()),
+                Value::Int64(summary.total_entries as i64),
+                Value::Int64(summary.total_hits as i64),
+                Value::Int64(summary.total_misses as i64),
+                Value::Int64(summary.total_evictions as i64),
+                Value::Int64(summary.total_size_bytes as i64),
+                Value::Int64(summary.max_size_bytes as i64),
+                Value::Int64(summary.total_oversized_refusals as i64),
+                Value::Float64(summary.hit_rate),
             ])],
         ))
     }
@@ -13401,6 +14207,8 @@ enum SyncInspectionQuery {
     IndexUsage,
     DoctorFindings,
     FixPlan,
+    PlanCache,
+    PlanCacheSummary,
 }
 
 impl SyncInspectionQuery {
@@ -13483,6 +14291,8 @@ impl SyncInspectionQuery {
             "select * from sys.index_usage" => Some(Self::IndexUsage),
             "select * from sys.doctor_findings" => Some(Self::DoctorFindings),
             "select * from sys.fix_plan" => Some(Self::FixPlan),
+            "select * from sys.plan_cache" => Some(Self::PlanCache),
+            "select * from sys.plan_cache_summary" => Some(Self::PlanCacheSummary),
             _ => parse_sync_journal_where_sequence(normalized)
                 .map(|since_sequence| Self::Journal { since_sequence }),
         }
@@ -13496,6 +14306,26 @@ fn normalize_sync_inspection_sql(sql: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ")
         .to_ascii_lowercase()
+}
+
+fn plan_cache_doctor_row(
+    id: &str,
+    category: &str,
+    severity: &str,
+    title: &str,
+    message: &str,
+    evidence: &str,
+    recommendation: &str,
+) -> Vec<Value> {
+    vec![
+        Value::Text(id.to_string()),
+        Value::Text(category.to_string()),
+        Value::Text(severity.to_string()),
+        Value::Text(title.to_string()),
+        Value::Text(message.to_string()),
+        Value::Text(evidence.to_string()),
+        Value::Text(recommendation.to_string()),
+    ]
 }
 
 fn parse_sync_journal_where_sequence(normalized: &str) -> Option<u64> {
@@ -14765,6 +15595,7 @@ enum PragmaName {
     IndexInfo,
     IndexXInfo,
     ForeignKeyList,
+    FlushPlanCache,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -15468,6 +16299,7 @@ fn parse_pragma_name(name: &str) -> Result<PragmaTarget> {
         "index_info" => Ok(PragmaName::IndexInfo),
         "index_xinfo" => Ok(PragmaName::IndexXInfo),
         "foreign_key_list" => Ok(PragmaName::ForeignKeyList),
+        "flush_plan_cache" => Ok(PragmaName::FlushPlanCache),
         "auto_vacuum" => Err(DbError::sql(
             "PRAGMA auto_vacuum is not supported; not applicable to DecentDB storage/checkpointing",
         )),
@@ -15645,6 +16477,7 @@ fn pragma_name_sql(name: &PragmaName) -> &'static str {
         PragmaName::IndexInfo => "index_info",
         PragmaName::IndexXInfo => "index_xinfo",
         PragmaName::ForeignKeyList => "foreign_key_list",
+        PragmaName::FlushPlanCache => "flush_plan_cache",
     }
 }
 
@@ -15958,6 +16791,87 @@ fn prepared_statement_sql(sql: &str) -> Result<String> {
     }
     reject_unsupported_collated_key_sql(&statement)?;
     Ok(statement)
+}
+
+fn parameter_shape_for_prepared_sql(sql: &str) -> crate::plan_cache::ParameterShape {
+    let bytes = sql.as_bytes();
+    let mut index = 0_usize;
+    let mut highest_dollar_param = 0_usize;
+    let mut positional_params = 0_usize;
+
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\'' => {
+                index += 1;
+                while index < bytes.len() {
+                    if bytes[index] == b'\'' {
+                        if index + 1 < bytes.len() && bytes[index + 1] == b'\'' {
+                            index += 2;
+                        } else {
+                            index += 1;
+                            break;
+                        }
+                    } else {
+                        index += 1;
+                    }
+                }
+            }
+            b'"' => {
+                index += 1;
+                while index < bytes.len() {
+                    if bytes[index] == b'"' {
+                        if index + 1 < bytes.len() && bytes[index + 1] == b'"' {
+                            index += 2;
+                        } else {
+                            index += 1;
+                            break;
+                        }
+                    } else {
+                        index += 1;
+                    }
+                }
+            }
+            b'-' if index + 1 < bytes.len() && bytes[index + 1] == b'-' => {
+                index += 2;
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+            }
+            b'/' if index + 1 < bytes.len() && bytes[index + 1] == b'*' => {
+                index += 2;
+                while index + 1 < bytes.len() {
+                    if bytes[index] == b'*' && bytes[index + 1] == b'/' {
+                        index += 2;
+                        break;
+                    }
+                    index += 1;
+                }
+            }
+            b'?' => {
+                positional_params = positional_params.saturating_add(1);
+                index += 1;
+            }
+            b'$' if index + 1 < bytes.len() && bytes[index + 1].is_ascii_digit() => {
+                index += 1;
+                let mut value = 0_usize;
+                while index < bytes.len() && bytes[index].is_ascii_digit() {
+                    value = value
+                        .saturating_mul(10)
+                        .saturating_add((bytes[index] - b'0') as usize);
+                    index += 1;
+                }
+                highest_dollar_param = highest_dollar_param.max(value);
+            }
+            _ => index += 1,
+        }
+    }
+
+    let arity = if highest_dollar_param > 0 && positional_params > 0 {
+        highest_dollar_param.saturating_add(positional_params)
+    } else {
+        highest_dollar_param.max(positional_params)
+    };
+    crate::plan_cache::ParameterShape::unknown_with_arity(arity)
 }
 
 fn reject_unsupported_collated_key_sql(sql: &str) -> Result<()> {
@@ -34999,5 +35913,141 @@ mod tests {
                 .expect("count rows");
             assert_eq!(result.rows()[0].values(), &[Value::Int64(3)]);
         }
+    }
+
+    // -------- Plan cache tests (Phase 1A) ----------
+
+    #[test]
+    fn plan_cache_caches_repeated_prepares() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("plan_cache_basic.ddb");
+        let db = Db::create(&path, DbConfig::default()).expect("create db");
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+            .expect("create table");
+
+        let prep1 = db.prepare("SELECT * FROM t WHERE id = 1").expect("prepare");
+        let prep2 = db.prepare("SELECT * FROM t WHERE id = 1").expect("prepare");
+        let summary = db.plan_cache_summary().expect("summary");
+        assert!(summary.total_hits >= 1);
+        assert!(summary.total_misses >= 1);
+        let _ = prep1;
+        let _ = prep2;
+    }
+
+    #[test]
+    fn plan_cache_ddl_invalidates_eagerly() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("plan_cache_ddl.ddb");
+        let db = Db::create(&path, DbConfig::default()).expect("create db");
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            .expect("create table");
+
+        let _ = db.prepare("SELECT * FROM t").expect("prepare");
+        let before = db.plan_cache_summary().expect("summary");
+        assert!(before.total_entries >= 1);
+
+        db.execute("ALTER TABLE t ADD COLUMN val TEXT")
+            .expect("alter table");
+        let after = db.plan_cache_summary().expect("summary");
+        assert_eq!(after.total_entries, 0);
+    }
+
+    #[test]
+    fn plan_cache_audit_context_does_not_evict() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("plan_cache_audit.ddb");
+        let db = Db::create(&path, DbConfig::default()).expect("create db");
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            .expect("create table");
+
+        let _ = db.prepare("SELECT * FROM t").expect("prepare");
+        let before = db.plan_cache_summary().expect("summary");
+        let hits_before = before.total_hits;
+        let entries_before = before.total_entries;
+        assert!(entries_before >= 1);
+
+        db.execute("SET AUDIT CONTEXT actor = 'tester'")
+            .expect("audit context");
+        let after = db.plan_cache_summary().expect("summary");
+        assert_eq!(
+            after.total_entries, entries_before,
+            "audit context must not evict the plan cache"
+        );
+
+        let _ = db.prepare("SELECT * FROM t").expect("prepare");
+        let after2 = db.plan_cache_summary().expect("summary");
+        assert!(
+            after2.total_hits > hits_before,
+            "expected at least one new hit on re-prepare after audit context write"
+        );
+    }
+
+    #[test]
+    fn plan_cache_pragma_flush_resets() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("plan_cache_flush.ddb");
+        let db = Db::create(&path, DbConfig::default()).expect("create db");
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            .expect("create table");
+        let _ = db.prepare("SELECT * FROM t").expect("prepare");
+        assert!(db.plan_cache_summary().expect("summary").total_entries >= 1);
+        db.execute("PRAGMA flush_plan_cache").expect("pragma");
+        assert_eq!(db.plan_cache_summary().expect("summary").total_entries, 0);
+    }
+
+    #[test]
+    fn plan_cache_pragma_flush_local_resets() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("plan_cache_flush_local.ddb");
+        let db = Db::create(&path, DbConfig::default()).expect("create db");
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            .expect("create table");
+        let _ = db
+            .prepare("SELECT * FROM t WHERE id = $1")
+            .expect("prepare");
+        assert!(db.plan_cache_summary().expect("summary").total_entries >= 1);
+        db.execute("PRAGMA flush_plan_cache = local")
+            .expect("pragma");
+        let summary = db.plan_cache_summary().expect("summary");
+        assert_eq!(summary.total_entries, 0);
+        assert_eq!(summary.total_hits, 0);
+        assert_eq!(summary.total_misses, 0);
+    }
+
+    #[test]
+    fn plan_cache_summary_api_works() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("plan_cache_view.ddb");
+        let db = Db::create(&path, DbConfig::default()).expect("create db");
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            .expect("create table");
+        let _ = db.prepare("SELECT * FROM t").expect("prepare");
+        let result = db
+            .execute("SELECT * FROM sys.plan_cache_summary")
+            .expect("summary view");
+        assert_eq!(result.rows().len(), 1);
+        let result = db
+            .execute("SELECT * FROM sys.plan_cache")
+            .expect("entries view");
+        let _ = result;
+    }
+
+    #[test]
+    fn plan_cache_doctor_reports_disabled_cache() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("plan_cache_doctor.ddb");
+        let mut config = DbConfig::default();
+        config.with_plan_cache(|cfg| cfg.enabled = false);
+        let db = Db::create(&path, config).expect("create db");
+        let result = db
+            .execute("SELECT * FROM sys.doctor_findings")
+            .expect("doctor findings");
+        assert!(
+            result.rows().iter().any(|row| matches!(
+                row.values().first(),
+                Some(Value::Text(id)) if id == "plan-cache.disabled"
+            )),
+            "disabled plan cache should be visible through sys.doctor_findings"
+        );
     }
 }

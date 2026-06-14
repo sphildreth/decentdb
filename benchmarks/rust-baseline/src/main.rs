@@ -16,6 +16,7 @@
 
 use std::fmt::Write as _;
 use std::fs;
+use std::hint::black_box;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -52,6 +53,9 @@ struct Cli {
     /// Run all scales in order (smoke, medium, full, huge), then generate the HTML report.
     #[arg(long)]
     benchmark: bool,
+    /// Run the DecentDB plan-cache guardrail benchmark and write a JSON report.
+    #[arg(long)]
+    plan_cache_benchmark: bool,
     /// HTML output path for --report or --benchmark (defaults to <out-dir>/report.html).
     #[arg(long)]
     report_file: Option<PathBuf>,
@@ -408,6 +412,32 @@ struct RunReport {
     steps: Vec<StepMetric>,
 }
 
+#[derive(Clone, Default, Serialize)]
+struct PlanCacheBenchmarkReport {
+    binding: String,
+    benchmark_profile: String,
+    started_unix: u64,
+    finished_unix: u64,
+    engine_version: String,
+    database_path: String,
+    cases: Vec<PlanCacheCaseMetric>,
+}
+
+#[derive(Clone, Default, Serialize)]
+struct PlanCacheCaseMetric {
+    scenario: String,
+    plan_cache_enabled: bool,
+    iterations: u64,
+    duration_seconds: f64,
+    operations_per_second: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enabled_delta_vs_disabled_percent: Option<f64>,
+    p95_ns: u64,
+    p99_ns: u64,
+    total_hits: u64,
+    total_misses: u64,
+}
+
 #[derive(Clone, Serialize)]
 struct HistoricalRun {
     file_name: String,
@@ -590,8 +620,15 @@ fn decentdb_wal_path(path: &Path) -> PathBuf {
 }
 
 fn run(cli: Cli) -> anyhow::Result<()> {
+    if cli.plan_cache_benchmark && (cli.benchmark || cli.report) {
+        bail!("--plan-cache-benchmark cannot be combined with --benchmark or --report");
+    }
     if cli.report_file.is_some() && !cli.report && !cli.benchmark {
         bail!("--report-file requires --report or --benchmark");
+    }
+
+    if cli.plan_cache_benchmark {
+        return run_plan_cache_benchmark(&cli);
     }
 
     if cli.benchmark {
@@ -640,6 +677,295 @@ fn generate_report_from_cli(cli: &Cli) -> anyhow::Result<()> {
     generate_html_report(&cli.out_dir, &report_file)?;
     println!("Wrote {}", report_file.display());
     Ok(())
+}
+
+const PLAN_CACHE_BENCH_ROWS: i64 = 10_000;
+const PLAN_CACHE_REPEATED_ITERS: u64 = 20_000;
+const PLAN_CACHE_ONE_SHOT_ITERS: u64 = 1_000;
+const PLAN_CACHE_CHURN_ITERS: u64 = 20_000;
+const PLAN_CACHE_CHURN_VARIANTS: usize = 1_000;
+const PLAN_CACHE_CHURN_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+fn run_plan_cache_benchmark(cli: &Cli) -> anyhow::Result<()> {
+    if cli.engine != BenchmarkEngine::DecentDb {
+        bail!("--plan-cache-benchmark is DecentDB-only");
+    }
+    if cli.profile != BenchmarkProfile::Default {
+        bail!("--plan-cache-benchmark uses the default DecentDB profile");
+    }
+
+    let base_path = cli
+        .db_path
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("run-rust-plan-cache.ddb"));
+    let mut report = PlanCacheBenchmarkReport {
+        binding: BenchmarkEngine::DecentDb.binding_name().to_string(),
+        benchmark_profile: "plan-cache".to_string(),
+        started_unix: now_unix(),
+        engine_version: decentdb::version().to_string(),
+        database_path: base_path.display().to_string(),
+        ..Default::default()
+    };
+
+    let mut repeated_enabled = measure_plan_cache_repeated_prepare(&base_path, true)?;
+    let repeated_disabled = measure_plan_cache_repeated_prepare(&base_path, false)?;
+    record_enabled_delta(&mut repeated_enabled, &repeated_disabled);
+    report.cases.push(repeated_enabled);
+    report.cases.push(repeated_disabled);
+
+    let mut one_shot_enabled = measure_plan_cache_one_shot(&base_path, true)?;
+    let one_shot_disabled = measure_plan_cache_one_shot(&base_path, false)?;
+    record_enabled_delta(&mut one_shot_enabled, &one_shot_disabled);
+    report.cases.push(one_shot_enabled);
+    report.cases.push(one_shot_disabled);
+
+    let mut churn_enabled = measure_plan_cache_churn(&base_path, true)?;
+    let churn_disabled = measure_plan_cache_churn(&base_path, false)?;
+    record_enabled_delta(&mut churn_enabled, &churn_disabled);
+    report.cases.push(churn_enabled);
+    report.cases.push(churn_disabled);
+
+    report.finished_unix = now_unix();
+    fs::create_dir_all(&cli.out_dir)?;
+    let datetime_stamp = format_unix_filename_stamp(report.finished_unix);
+    let out_path = cli
+        .out_dir
+        .join(format!("{datetime_stamp}-rust-baseline-plan-cache.json"));
+    fs::write(&out_path, serde_json::to_string_pretty(&report)?)?;
+    println!("\nWrote {}", out_path.display());
+    delete_db_files(&base_path);
+    Ok(())
+}
+
+fn record_enabled_delta(enabled: &mut PlanCacheCaseMetric, disabled: &PlanCacheCaseMetric) {
+    if enabled.plan_cache_enabled && disabled.duration_seconds > 0.0 {
+        enabled.enabled_delta_vs_disabled_percent = Some(
+            (enabled.duration_seconds - disabled.duration_seconds) * 100.0
+                / disabled.duration_seconds,
+        );
+    }
+}
+
+fn create_plan_cache_fixture(
+    path: &Path,
+    plan_cache_enabled: bool,
+    max_cache_bytes: Option<u64>,
+) -> anyhow::Result<decentdb::Db> {
+    delete_db_files(path);
+    let mut config = DbConfig::default();
+    config.with_plan_cache(|cfg| {
+        cfg.enabled = plan_cache_enabled;
+        if let Some(max_cache_bytes) = max_cache_bytes {
+            cfg.max_size_bytes = max_cache_bytes;
+        }
+    });
+    let db = decentdb::Db::create(path, config)?;
+    db.execute("CREATE TABLE bench (id INTEGER PRIMARY KEY, val TEXT, grp INTEGER)")?;
+    {
+        let mut txn = db.transaction()?;
+        let insert = txn.prepare("INSERT INTO bench VALUES ($1, $2, $3)")?;
+        for i in 0..PLAN_CACHE_BENCH_ROWS {
+            insert.execute_in(
+                &mut txn,
+                &[
+                    Value::Int64(i),
+                    Value::Text(format!("v{i}")),
+                    Value::Int64(i % 10),
+                ],
+            )?;
+        }
+        txn.commit()?;
+    }
+    Ok(db)
+}
+
+fn measure_plan_cache_repeated_prepare(
+    base_path: &Path,
+    plan_cache_enabled: bool,
+) -> anyhow::Result<PlanCacheCaseMetric> {
+    let db = create_plan_cache_fixture(base_path, plan_cache_enabled, None)?;
+    db.flush_plan_cache()?;
+    let before = db.plan_cache_summary()?;
+    let mut latencies = Vec::with_capacity(PLAN_CACHE_REPEATED_ITERS as usize);
+    let start = Instant::now();
+    for _ in 0..PLAN_CACHE_REPEATED_ITERS {
+        let op_start = Instant::now();
+        let prepared = db.prepare("SELECT val FROM bench WHERE id = $1")?;
+        black_box(prepared);
+        latencies.push(elapsed_ns(op_start));
+    }
+    let elapsed = start.elapsed().as_secs_f64();
+    let after = db.plan_cache_summary()?;
+    let hit_delta = after.total_hits.saturating_sub(before.total_hits);
+    let miss_delta = after.total_misses.saturating_sub(before.total_misses);
+    if plan_cache_enabled {
+        let expected_hits = PLAN_CACHE_REPEATED_ITERS.saturating_sub(1);
+        if hit_delta < expected_hits {
+            bail!("repeated prepare expected at least {expected_hits} hits, got {hit_delta}");
+        }
+    } else if hit_delta != 0 || miss_delta != 0 {
+        bail!("disabled cache reported hits={hit_delta} misses={miss_delta}");
+    }
+    delete_db_files(base_path);
+    Ok(plan_cache_case_metric(
+        "repeated_prepare_point_lookup",
+        plan_cache_enabled,
+        PLAN_CACHE_REPEATED_ITERS,
+        elapsed,
+        &mut latencies,
+        hit_delta,
+        miss_delta,
+    ))
+}
+
+fn measure_plan_cache_one_shot(
+    base_path: &Path,
+    plan_cache_enabled: bool,
+) -> anyhow::Result<PlanCacheCaseMetric> {
+    let db = create_plan_cache_fixture(base_path, plan_cache_enabled, None)?;
+    db.flush_plan_cache()?;
+    let before = db.plan_cache_summary()?;
+    let mut latencies = Vec::with_capacity(PLAN_CACHE_ONE_SHOT_ITERS as usize);
+    let start = Instant::now();
+    for i in 0..PLAN_CACHE_ONE_SHOT_ITERS {
+        let id = (i as i64) % PLAN_CACHE_BENCH_ROWS;
+        let sql = format!("SELECT COUNT(*) FROM bench WHERE id = {id} AND {i} = {i}");
+        let op_start = Instant::now();
+        let result = db.execute(&sql)?;
+        black_box(result.rows().len());
+        latencies.push(elapsed_ns(op_start));
+    }
+    let elapsed = start.elapsed().as_secs_f64();
+    let after = db.plan_cache_summary()?;
+    let hit_delta = after.total_hits.saturating_sub(before.total_hits);
+    let miss_delta = after.total_misses.saturating_sub(before.total_misses);
+    if hit_delta != 0 {
+        bail!("one-shot benchmark should not hit the cache, got {hit_delta}");
+    }
+    if !plan_cache_enabled && miss_delta != 0 {
+        bail!("disabled cache reported one-shot misses={miss_delta}");
+    }
+    delete_db_files(base_path);
+    Ok(plan_cache_case_metric(
+        "one_shot_query",
+        plan_cache_enabled,
+        PLAN_CACHE_ONE_SHOT_ITERS,
+        elapsed,
+        &mut latencies,
+        hit_delta,
+        miss_delta,
+    ))
+}
+
+fn measure_plan_cache_churn(
+    base_path: &Path,
+    plan_cache_enabled: bool,
+) -> anyhow::Result<PlanCacheCaseMetric> {
+    let db = create_plan_cache_fixture(
+        base_path,
+        plan_cache_enabled,
+        plan_cache_enabled.then_some(PLAN_CACHE_CHURN_MAX_BYTES),
+    )?;
+    let statements = build_plan_cache_point_lookup_statements();
+    db.flush_plan_cache()?;
+    if plan_cache_enabled {
+        for sql in &statements {
+            black_box(db.prepare(sql)?);
+        }
+    }
+    let before = db.plan_cache_summary()?;
+    let mut latencies = Vec::with_capacity(PLAN_CACHE_CHURN_ITERS as usize);
+    let start = Instant::now();
+    for i in 0..PLAN_CACHE_CHURN_ITERS {
+        let sql = &statements[i as usize % statements.len()];
+        let op_start = Instant::now();
+        let prepared = db.prepare(sql)?;
+        black_box(prepared);
+        latencies.push(elapsed_ns(op_start));
+    }
+    let elapsed = start.elapsed().as_secs_f64();
+    let after = db.plan_cache_summary()?;
+    let hit_delta = after.total_hits.saturating_sub(before.total_hits);
+    let miss_delta = after.total_misses.saturating_sub(before.total_misses);
+    if plan_cache_enabled {
+        if hit_delta < PLAN_CACHE_CHURN_ITERS {
+            bail!("warm churn expected at least {} hits, got {hit_delta}", PLAN_CACHE_CHURN_ITERS);
+        }
+    } else if hit_delta != 0 || miss_delta != 0 {
+        bail!("disabled cache reported hits={hit_delta} misses={miss_delta}");
+    }
+    delete_db_files(base_path);
+    Ok(plan_cache_case_metric(
+        "churn_prepare_p95_p99",
+        plan_cache_enabled,
+        PLAN_CACHE_CHURN_ITERS,
+        elapsed,
+        &mut latencies,
+        hit_delta,
+        miss_delta,
+    ))
+}
+
+fn build_plan_cache_point_lookup_statements() -> Vec<String> {
+    (0..PLAN_CACHE_CHURN_VARIANTS)
+        .map(|idx| {
+            let id = idx as i64 % PLAN_CACHE_BENCH_ROWS;
+            format!("SELECT val FROM bench WHERE id = {id}")
+        })
+        .collect()
+}
+
+fn plan_cache_case_metric(
+    scenario: &str,
+    plan_cache_enabled: bool,
+    iterations: u64,
+    duration_seconds: f64,
+    latencies: &mut [u64],
+    total_hits: u64,
+    total_misses: u64,
+) -> PlanCacheCaseMetric {
+    let operations_per_second = if duration_seconds > 0.0 {
+        iterations as f64 / duration_seconds
+    } else {
+        0.0
+    };
+    let p95_ns = percentile_ns(latencies, 95);
+    let p99_ns = percentile_ns(latencies, 99);
+    println!(
+        "  [PlanCache] {:<32} {:<8} {:>10.0} ops/s p95={} p99={} hits={} misses={}",
+        scenario,
+        if plan_cache_enabled { "enabled" } else { "disabled" },
+        operations_per_second,
+        Recorder::format_duration_ns(p95_ns),
+        Recorder::format_duration_ns(p99_ns),
+        total_hits,
+        total_misses
+    );
+    PlanCacheCaseMetric {
+        scenario: scenario.to_string(),
+        plan_cache_enabled,
+        iterations,
+        duration_seconds,
+        operations_per_second,
+        enabled_delta_vs_disabled_percent: None,
+        p95_ns,
+        p99_ns,
+        total_hits,
+        total_misses,
+    }
+}
+
+fn elapsed_ns(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
+fn percentile_ns(samples: &mut [u64], percentile: u32) -> u64 {
+    if samples.is_empty() {
+        return 0;
+    }
+    samples.sort_unstable();
+    let idx = (samples.len().saturating_sub(1) * percentile as usize).div_ceil(100);
+    samples[idx]
 }
 
 fn run_single_benchmark(cli: &Cli, scale: Scale) -> anyhow::Result<()> {

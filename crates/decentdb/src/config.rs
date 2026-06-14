@@ -373,6 +373,12 @@ pub struct DbConfig {
 
     /// Optional runtime tracing configuration. Disabled by default.
     pub tracing: crate::tracing::RuntimeTracingConfig,
+
+    /// Connection-local plan cache configuration. See
+    /// `design/WIN_QUERY_PLAN_CACHING_AND_STATEMENT_REUSE.md` and
+    /// ADR 0190-0193. Defaults to enabled with a conservative
+    /// 256 KiB budget.
+    pub plan_cache: crate::plan_cache::PlanCacheConfig,
 }
 
 impl DbConfig {
@@ -431,6 +437,20 @@ impl DbConfig {
     pub fn set_cached_payloads_max_entries_for_tests(&mut self, entries: usize) {
         self.cached_payloads_max_entries = entries;
     }
+
+    /// Configures the connection-local plan cache.
+    pub fn with_plan_cache<F: FnOnce(&mut crate::plan_cache::PlanCacheConfig)>(
+        &mut self,
+        f: F,
+    ) -> &mut Self {
+        f(&mut self.plan_cache);
+        self
+    }
+
+    /// Returns the current plan cache configuration.
+    pub fn plan_cache(&self) -> &crate::plan_cache::PlanCacheConfig {
+        &self.plan_cache
+    }
 }
 
 impl Default for DbConfig {
@@ -473,6 +493,7 @@ impl Default for DbConfig {
             extension_trust_anchors: Vec::new(),
             extension_unsigned_development_mode: false,
             tracing: crate::tracing::RuntimeTracingConfig::default(),
+            plan_cache: crate::plan_cache::PlanCacheConfig::default(),
         }
     }
 }

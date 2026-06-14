@@ -23,6 +23,7 @@ mod json;
 #[cfg(test)]
 mod json_tests;
 mod metadata;
+pub(crate) mod plan_cache;
 mod planner;
 mod reactive;
 mod record;
@@ -80,6 +81,7 @@ pub use crate::metadata::{
     ToolingCapabilities, ToolingColumnTypeMetadata, ToolingMetadata, ToolingSpatialTypeInfo,
     ToolingTypeInfo, TriggerInfo, ViewInfo,
 };
+pub use crate::plan_cache::{PlanCacheConfig, PlanCacheSummary};
 pub use crate::reactive::{
     ChangeSource, ChangeStreamEvent, ChangeStreamOptions, InitialWatchEvent, InvalidationEvent,
     LaggedWatchEvent, QueryWatchOptions, RangeWatchOptions, ReactiveMetricsSnapshot,

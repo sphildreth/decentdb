@@ -1,15 +1,15 @@
 # Query Plan Caching And Prepared-Statement Reuse
 
 **Date:** 2026-06-13
-**Status:** TODO
-**Future Version:** vNext+1
+**Status:** DONE
+**Delivered Version:** 2.13.0
 **Roadmap:** [`FUTURE_WINS.md`](FUTURE_WINS.md)
 **Document Type:** Future Win SPEC
 **Audience:** Core engine maintainers, planner and executor maintainers, WAL and
 storage maintainers, C ABI maintainers, binding maintainers, WASM/browser
 maintainers, benchmark maintainers, documentation authors, coding agents
 
-**Governing ADRs:** see the four ADRs linked above. The decisions those
+**Governing ADRs:** see the ADRs linked below. The decisions those
 ADRs record (cache key, eviction policy, security generation, C ABI
 surface) are the answers to the previously-open "ADR-required
 decisions" list and are referenced by name throughout this spec.
@@ -26,6 +26,9 @@ decisions" list and are referenced by name throughout this spec.
 - [ADR 0193](./adr/0193-query-plan-cache-c-abi-surface-and-binding-contract.md):
   C ABI open options, default-on vs default-off, the additive-vs-version-bump
   call, and binding responsibilities.
+- [ADR 0194](./adr/0194-query-plan-cache-prepared-plan-reuse.md):
+  Phase 1B prepared-plan bundle reuse for `PreparedSimple*` and simple DML
+  plans.
 
 **Related inputs:**
 
@@ -724,6 +727,43 @@ This win is complete (Phases 1A + 1B) only when all of these are true:
 - Benchmarks are checked into the release suite with guardrails.
 - Doctor reports plan cache findings when the configuration or hit rate
   suggests tuning.
+
+### 10.1 Implementation Results
+
+Delivered in 2.13.0:
+
+- Connection-local parsed AST cache keyed by exact prepared SQL text,
+  parameter shape, persistent schema cookie, temp schema cookie, and
+  policy/mask generation.
+- Connection-local prepared-plan bundle cache for the existing simple DML and
+  `PreparedSimple*` read-plan inventory, governed by ADR 0194.
+- Default-on 256 KiB total plan-cache budget, split between parsed AST and
+  prepared-plan entries, with combined public diagnostics.
+- Eager full invalidation for persistent DDL, temp schema changes, `ANALYZE`,
+  policy/mask changes, branch changes, extension changes, and explicit flush.
+- `SET AUDIT CONTEXT` intentionally does not invalidate cached plans.
+- `sys.plan_cache`, `sys.plan_cache_summary`, `sys.doctor_findings` plan-cache
+  guidance, `PRAGMA flush_plan_cache`, C ABI diagnostics, C ABI open options,
+  and `decentdb plan-cache stats|list|reset`.
+- Parsed AST second-use admission for parameterized statements and a
+  zero-parameter literal-execution bypass so one-shot SQL does not churn the
+  generalized cache.
+
+Final local benchmark evidence:
+
+```text
+cargo bench -p decentdb --bench plan_cache
+  repeated_prepare_point_lookup: enabled 8.07 us, disabled 12.59 us
+  one_shot_query: enabled 2.77 ms, disabled 2.78 ms
+  churn_p95_p99: enabled 9.68 us, disabled 25.55 us
+
+cargo run --manifest-path benchmarks/rust-baseline/Cargo.toml \
+  --release --bin rust-baseline -- \
+  --plan-cache-benchmark --out-dir .tmp/rust-baseline-plan-cache
+  repeated_prepare_point_lookup: enabled 564,509 ops/s, disabled 165,490 ops/s
+  one_shot_query: enabled 418 ops/s, disabled 425 ops/s
+  churn_prepare_p95_p99: enabled 100,368 ops/s, disabled 45,477 ops/s
+```
 
 ## 11. Compatibility Rules
 

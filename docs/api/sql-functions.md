@@ -163,7 +163,25 @@ SELECT * FROM sys.lock_waits;
 SELECT * FROM sys.index_usage;
 SELECT * FROM sys.doctor_findings;
 SELECT * FROM sys.fix_plan;
+SELECT * FROM sys.plan_cache;
+SELECT * FROM sys.plan_cache_summary;
 ```
+
+`sys.plan_cache` returns one row per cached entry with the cache key
+hash (SipHash-style, not portable across engine versions), the
+persistent and temp schema cookies, the policy/mask generation,
+hit count, last-used timestamp, and a closed-enum statement category.
+`sys.plan_cache_summary` returns one row with aggregate counters
+(`total_entries`, `total_hits`, `total_misses`, `total_evictions`,
+`total_size_bytes`, `max_size_bytes`, `total_oversized_refusals`,
+`hit_rate`). Neither view exposes the full SQL text of cached
+statements. Use `PRAGMA flush_plan_cache` to evict all entries and
+reset the counters. See `design/WIN_QUERY_PLAN_CACHING_AND_STATEMENT_REUSE.md`
+and ADR 0190-0194 for the full contract.
+
+`sys.doctor_findings` includes current-connection plan-cache guidance when the
+cache is disabled, oversized entries are refused, eviction churn is observed,
+or sustained lookup history shows a low hit rate.
 
 Legacy `sys_sync_*` names remain for sync inspection compatibility:
 

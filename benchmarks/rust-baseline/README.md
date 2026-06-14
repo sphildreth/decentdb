@@ -76,6 +76,7 @@ cargo build --release
 ./target/release/rust-baseline --engine decentdb --scale huge
 ./target/release/rust-baseline --engine sqlite --scale smoke
 ./target/release/rust-baseline --engine decentdb --scale full --profile resident-hot-read
+./target/release/rust-baseline --plan-cache-benchmark --out-dir ../../.tmp/rust-baseline-plan-cache
 ./target/release/rust-baseline --report
 ./target/release/rust-baseline --report --report-file /tmp/rust-baseline-report.html
 ```
@@ -85,6 +86,13 @@ Use `--benchmark` to run all scales in order (`smoke`, `medium`, `full`,
 as `--report`. Suite mode uses the default per-engine/per-scale database paths
 and rejects `--db-path`; use single-scale mode when you need to pin an exact
 database file.
+
+Use `--plan-cache-benchmark` for the DecentDB-only plan-cache guardrail suite.
+It writes a JSON report with enabled/disabled results for repeated
+parameterized point-lookup preparation, one-shot literal SQL overhead, and warm
+1,000-statement churn p95/p99. This mode is separate from the music-library
+comparison and is intended to prove the connection-local plan-cache win without
+mixing it into SQLite comparison totals.
 
 To run the full DecentDB-vs-SQLite comparison into a temporary output
 directory, use:

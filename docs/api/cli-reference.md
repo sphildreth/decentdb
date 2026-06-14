@@ -453,6 +453,30 @@ Supported options:
 
 **Examples:**
 
+### plan-cache (new in 2.13.0)
+
+Inspect or reset the connection-local plan cache. The plan cache is
+**enabled by default** and reduces redundant parse, resolve, and
+planner work for repeated prepared statements within a `Db` handle.
+See `design/WIN_QUERY_PLAN_CACHING_AND_STATEMENT_REUSE.md` and
+ADR 0190-0194.
+
+```bash
+decentdb plan-cache stats --db=<path> [--format=<json|table|markdown>]
+decentdb plan-cache list  --db=<path> [--format=<json|table|markdown>]
+decentdb plan-cache reset --db=<path>
+```
+
+Subcommands:
+
+- `stats` — display `sys.plan_cache_summary` (one row, aggregate
+  counters and the configured memory budget)
+- `list`  — display `sys.plan_cache` (one row per cached entry)
+- `reset` — execute `PRAGMA flush_plan_cache` on a writer connection
+  and exit
+
+**Examples:**
+
 ```bash
 # Query slow queries as JSON
 decentdb tracing --db=my.ddb --view=slow_queries

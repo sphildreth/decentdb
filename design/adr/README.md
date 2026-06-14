@@ -8,6 +8,7 @@ This directory contains the historical and active ADRs for DecentDB.
 > the current Rust engine.
 
 ### Recent Rust-Specific ADRs:
+- **0194-query-plan-cache-prepared-plan-reuse.md**: Defines the Phase 1B prepared-plan bundle cache for `PreparedSimple*` read plans and simple DML plans, its first-miss admission behavior, shared invalidation contract, memory-budget split, and validation requirements.
 - **0193-query-plan-cache-c-abi-surface-and-binding-contract.md**: Defines the additive `plan_cache_enabled` and `plan_cache_max_bytes` C ABI open options, the default-on behavior, the no-C-ABI-version-bump decision, the `ddb_plan_cache_summary` and `ddb_plan_cache_flush` accessors, and the maintained-binding contract for the connection-local plan cache.
 - **0192-query-plan-cache-security-generation-and-tde.md**: Defines the `policy_mask_generation` cache-key counter, the audit-context-as-observable-but-not-cache-key decision, TDE's plan-cache non-interaction, and the round-trip test that enforces the audit-context exclusion.
 - **0191-query-plan-cache-memory-accounting-and-eviction.md**: Defines the 256 KiB default, the fixed-overhead-plus-recursive-helper accounting method, the oversized-entry refusal path, the page-cache budget independence, and the lock-model contract for the connection-local plan cache.

@@ -1537,6 +1537,12 @@ fn db_config_from_options(options: Option<&str>) -> Result<DbConfig> {
                 config.extension_unsigned_development_mode =
                     parse_bool_option(value, key.as_str())?;
             }
+            "plan_cache_enabled" => {
+                config.plan_cache.enabled = parse_bool_option(value, key.as_str())?;
+            }
+            "plan_cache_max_bytes" => {
+                config.plan_cache.max_size_bytes = parse_u64_option(value, key.as_str())?;
+            }
             _ => {
                 return Err(DbError::sql(format!("unsupported database option: {key}")));
             }
@@ -2387,6 +2393,57 @@ pub extern "C" fn ddb_db_clear_audit_context(db: *mut DbHandle, key: *const c_ch
         let db = handle_ref(db, "db")?;
         let key = utf8_arg(key, "key")?;
         db.db.clear_audit_context_value(&key)
+    })
+}
+
+/// Plan cache summary accessor (F023 / ADR 0193).
+#[repr(C)]
+pub struct DdbPlanCacheSummary {
+    pub scope: *const c_char,
+    pub total_entries: u64,
+    pub total_hits: u64,
+    pub total_misses: u64,
+    pub total_evictions: u64,
+    pub total_size_bytes: u64,
+    pub max_size_bytes: u64,
+    pub total_oversized_refusals: u64,
+    pub hit_rate: f64,
+}
+
+const PLAN_CACHE_SCOPE_CONNECTION: &[u8; 11] = b"connection\0";
+
+#[no_mangle]
+/// Returns a snapshot of the connection-local plan cache summary.
+pub extern "C" fn ddb_plan_cache_summary(
+    db: *mut DbHandle,
+    out_summary: *mut DdbPlanCacheSummary,
+) -> u32 {
+    ffi_boundary(|| {
+        let db = handle_ref(db, "db")?;
+        let summary = db.db.plan_cache_summary()?;
+        let out = out_ptr(out_summary, "out_summary")?;
+        out.scope = match summary.scope {
+            "connection" => PLAN_CACHE_SCOPE_CONNECTION.as_ptr().cast(),
+            _ => std::ptr::null(),
+        };
+        out.total_entries = summary.total_entries;
+        out.total_hits = summary.total_hits;
+        out.total_misses = summary.total_misses;
+        out.total_evictions = summary.total_evictions;
+        out.total_size_bytes = summary.total_size_bytes;
+        out.max_size_bytes = summary.max_size_bytes;
+        out.total_oversized_refusals = summary.total_oversized_refusals;
+        out.hit_rate = summary.hit_rate;
+        Ok(())
+    })
+}
+
+#[no_mangle]
+/// Flushes the connection-local plan cache and resets its counters.
+pub extern "C" fn ddb_plan_cache_flush(db: *mut DbHandle) -> u32 {
+    ffi_boundary(|| {
+        let db = handle_ref(db, "db")?;
+        db.db.flush_plan_cache()
     })
 }
 

@@ -89,7 +89,7 @@ For the Node packages, update both the manifest and the lockfile's top-level pac
 ### Documentation
 
 - `docs/about/changelog.md`  
-  Add or update release notes under `Unreleased` or under the new version heading, depending on the release process being used.
+  Add or update release notes under `UNRELEASED` or under the new version heading, depending on the release process being used.
 - `docs/user-guide/benchmarks.md`
   Update the DecentDB engine version stamp when the workspace release version
   changes.

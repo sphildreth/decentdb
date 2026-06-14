@@ -7,8 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.13.0] - [UNRELEASED]
+
+### Added
+
+- Added the default-on connection-local plan cache (ADR 0190-0194). It reuses
+  parsed parameterized statements and prepared-plan bundles across calls within
+  a `Db` handle, keyed by `(sql_text, parameter_shape,
+  persistent_schema_cookie, temp_schema_cookie, policy_mask_generation)`.
+  Diagnostics are exposed through `sys.plan_cache`,
+  `sys.plan_cache_summary`, `sys.doctor_findings`, `PRAGMA flush_plan_cache`,
+  C ABI `ddb_plan_cache_summary` / `ddb_plan_cache_flush`, and
+  `decentdb plan-cache stats|list|reset`. C ABI open options
+  `plan_cache_enabled` and `plan_cache_max_bytes` are additive and do not bump
+  the C ABI version.
+- Added `cargo bench -p decentdb --bench plan_cache` and
+  `benchmarks/rust-baseline --plan-cache-benchmark` guardrail benchmarks.
+  Local validation showed repeated point-lookup preparation at 565K ops/s with
+  the cache enabled vs 165K ops/s disabled, one-shot query throughput within
+  the guardrail at 418 ops/s enabled vs 425 ops/s disabled, and warm churn
+  preparation at 100K ops/s enabled vs 45K ops/s disabled.
+
 ### Fixed
 
+- Protected one-shot literal SQL from plan-cache churn by bypassing the
+  generalized parsed cache for zero-parameter execution and using second-use
+  admission for parameterized parsed statements.
 - Eagerly hydrate all B-tree indexes for deferred tables
   on database open when `defer_table_materialization` is enabled. Previously,
   each secondary index was lazily hydrated on first query, causing multi-second

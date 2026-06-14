@@ -251,6 +251,68 @@ decentdb info --db=my.ddb
 # - Active readers
 ```
 
+## Plan Cache
+
+DecentDB ships a connection-local plan cache that reuses parsed
+parameterized statements and reusable prepared plans across calls
+within a single `Db` handle. The cache is **enabled by default** with
+a conservative 256 KiB total budget. See
+`design/WIN_QUERY_PLAN_CACHING_AND_STATEMENT_REUSE.md` and
+ADR 0190-0194 for the full contract.
+
+Cache configuration:
+
+```rust
+use decentdb::{Db, DbConfig};
+
+let mut config = DbConfig::default();
+config.with_plan_cache(|c| {
+    c.enabled = true;
+    c.max_size_bytes = 512 * 1024;  // 512 KiB
+});
+let db = Db::open("app.ddb", config)?;
+```
+
+C ABI / binding open options:
+
+```text
+plan_cache_enabled=true|false
+plan_cache_max_bytes=<bytes>
+```
+
+The default-on behavior is additive: existing binaries that do not
+set the options get the cache. To opt out, set
+`plan_cache_enabled=false`.
+
+Literal one-shot SQL follows the existing narrow parser cache path instead of
+entering the generalized plan cache. Parameterized parsed statements use
+second-use admission, and prepared-plan entries admit on the first miss. This
+keeps one-shot overhead bounded while preserving the repeated-preparation win.
+
+Diagnostics:
+
+```sql
+SELECT * FROM sys.plan_cache;
+SELECT * FROM sys.plan_cache_summary;
+PRAGMA flush_plan_cache;  -- evict and reset counters
+```
+
+The cache is invalidated on DDL, temp-schema, policy/mask changes,
+branch operations, extension changes, and `PRAGMA flush_plan_cache`.
+`SET AUDIT CONTEXT` does not affect the cache (ADR 0192).
+
+WASM/browser note: the budget is *per connection*. Multi-worker
+browser apps should set `plan_cache_max_bytes` to
+`low_memory_budget / N_workers`.
+
+Native validation commands:
+
+```bash
+cargo bench -p decentdb --bench plan_cache
+cd benchmarks/rust-baseline
+cargo run --release --bin rust-baseline -- --plan-cache-benchmark --out-dir ../../.tmp/rust-baseline-plan-cache
+```
+
 ## Prepared-write hot paths and aggregates
 
 Prepared insert execution prefers direct/default hot paths for supported prepared

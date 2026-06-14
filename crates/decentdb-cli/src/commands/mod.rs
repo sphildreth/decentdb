@@ -98,6 +98,9 @@ pub enum Commands {
     VerifyIndex(VerifyIndexCommand),
     /// Runtime tracing views and diagnostics
     Tracing(TracingCommand),
+    /// Plan cache diagnostics and management
+    #[command(subcommand)]
+    PlanCache(PlanCacheCommand),
     /// Run `decentdb doctor` to diagnose database health
     Doctor(DoctorCommand),
     /// Migrate a legacy database format to the current version
@@ -343,6 +346,38 @@ pub struct SaveAsCommand {
     pub db: String,
     #[arg(long)]
     pub output: PathBuf,
+}
+
+#[derive(Clone, Debug, Subcommand)]
+pub enum PlanCacheCommand {
+    /// Show plan cache summary (one row)
+    Stats(PlanCacheStatsCommand),
+    /// List cached entries
+    List(PlanCacheListCommand),
+    /// Reset the connection-local plan cache
+    Reset(PlanCacheResetCommand),
+}
+
+#[derive(Clone, Debug, Parser)]
+pub struct PlanCacheStatsCommand {
+    #[arg(long)]
+    pub db: String,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+    pub format: OutputFormat,
+}
+
+#[derive(Clone, Debug, Parser)]
+pub struct PlanCacheListCommand {
+    #[arg(long)]
+    pub db: String,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+    pub format: OutputFormat,
+}
+
+#[derive(Clone, Debug, Parser)]
+pub struct PlanCacheResetCommand {
+    #[arg(long)]
+    pub db: String,
 }
 
 #[derive(Clone, Debug, Subcommand)]
@@ -1422,6 +1457,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         Commands::Serve(command) => run_serve(command)?,
         Commands::Doctor(_) => unreachable!("Doctor is handled in run()"),
         Commands::Tracing(command) => run_tracing(command)?,
+        Commands::PlanCache(command) => run_plan_cache(command)?,
     }
     Ok(())
 }
@@ -6058,6 +6094,45 @@ fn run_tracing(command: TracingCommand) -> Result<()> {
             _ => return Ok(()),
         };
         db.tracing_reset(kind)?;
+    }
+    Ok(())
+}
+
+// ----------------------------------------------------------------------
+// Plan cache command
+// ----------------------------------------------------------------------
+
+fn run_plan_cache(command: PlanCacheCommand) -> Result<()> {
+    match command {
+        PlanCacheCommand::Stats(cmd) => {
+            let db = open_db(&cmd.db, false, 0, 0)?;
+            let result = db.execute("SELECT * FROM sys.plan_cache_summary")?;
+            let columns = result.columns();
+            let rows = rows_from_query_result(&result);
+            match cmd.format {
+                OutputFormat::Json => {
+                    println!("{}", render_exec_success_json(&[result], 0.0, false))
+                }
+                _ => println!("{}", render_rows(cmd.format, columns, &rows, true)),
+            }
+        }
+        PlanCacheCommand::List(cmd) => {
+            let db = open_db(&cmd.db, false, 0, 0)?;
+            let result = db.execute("SELECT * FROM sys.plan_cache")?;
+            let columns = result.columns();
+            let rows = rows_from_query_result(&result);
+            match cmd.format {
+                OutputFormat::Json => {
+                    println!("{}", render_exec_success_json(&[result], 0.0, false))
+                }
+                _ => println!("{}", render_rows(cmd.format, columns, &rows, true)),
+            }
+        }
+        PlanCacheCommand::Reset(cmd) => {
+            let db = open_db(&cmd.db, false, 0, 0)?;
+            db.execute("PRAGMA flush_plan_cache")?;
+            eprintln!("plan cache flushed");
+        }
     }
     Ok(())
 }
