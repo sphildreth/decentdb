@@ -2257,6 +2257,20 @@ impl EngineRuntime {
         if !config.defer_table_materialization || runtime.deferred_tables.is_empty() {
             runtime.rebuild_indexes(pager.page_size())?;
         }
+        // DDB-002/DDB-003: When defer_table_materialization is true, eagerly
+        // hydrate all indexes for deferred tables. This ensures that the first
+        // query for each index is fast (sub-millisecond) instead of triggering
+        // lazy index hydration which can take multiple seconds for large tables.
+        // The table data is loaded temporarily, indexes are built, row locators
+        // are cached, and then the table is re-deferred to free memory.
+        if config.defer_table_materialization && !runtime.deferred_tables.is_empty() {
+            runtime.hydrate_all_deferred_table_indexes(
+                pager,
+                wal,
+                pager.page_size(),
+                snapshot_lsn,
+            )?;
+        }
         Ok(runtime)
     }
 
@@ -2514,6 +2528,87 @@ impl EngineRuntime {
             self.cache_deferred_paged_row_locators(&canonical_table_name, state, chunks.as_ref())?;
         }
         self.redefer_persisted_tables(&[canonical_table_name.as_str()]);
+        Ok(())
+    }
+
+    /// Eagerly hydrates all indexes for all deferred tables. This is called
+    /// during database open when `defer_table_materialization` is true to
+    /// ensure that subsequent queries are fast. For each deferred table with
+    /// indexes, this function:
+    /// 1. Reads the table manifest from disk (once per table)
+    /// 2. Builds all indexes for the table
+    /// 3. Caches row locators for paged tables
+    /// 4. Re-defers the table (removes data from memory)
+    ///
+    /// This makes database open slower but ensures that the first query for
+    /// each index is fast (sub-millisecond instead of multi-second).
+    ///
+    /// Note: Only tables with paged manifests can be re-deferred after hydration.
+    /// Non-paged tables are skipped to avoid leaving them loaded in memory.
+    pub(crate) fn hydrate_all_deferred_table_indexes(
+        &mut self,
+        pager: &PagerHandle,
+        wal: &WalHandle,
+        page_size: u32,
+        snapshot_lsn: u64,
+    ) -> Result<()> {
+        let deferred_tables: Vec<String> = self.deferred_tables.iter().cloned().collect();
+        for table_name in deferred_tables {
+            let Some(state) = self.persisted_tables.get(&table_name).copied() else {
+                continue;
+            };
+
+            if !state.pointer.is_table_paged_manifest() {
+                continue;
+            }
+
+            let has_indexes = self.catalog.indexes.values().any(|index| {
+                identifiers_equal(&index.table_name, &table_name) && index.kind == IndexKind::Btree
+            });
+            if !has_indexes {
+                continue;
+            }
+
+            let store = SnapshotPageStore {
+                pager,
+                wal,
+                snapshot_lsn,
+            };
+            let row_source = TableRowSource::Paged(Arc::new(read_table_page_manifest_from_state(
+                &store, state,
+            )?));
+            let row_count = row_source.row_count();
+            if let Some(ps) = self.persisted_tables_mut().get_mut(&table_name) {
+                ps.row_count = row_count;
+                ps.tail = read_uncompressed_overflow_tail(&store, ps.pointer)?.unwrap_or_default();
+            }
+            self.tables_mut().insert(table_name.clone(), row_source);
+            self.deferred_tables_mut().remove(&table_name);
+
+            let indexes_for_table: Vec<String> = self
+                .catalog
+                .indexes
+                .values()
+                .filter(|index| {
+                    identifiers_equal(&index.table_name, &table_name)
+                        && index.kind == IndexKind::Btree
+                        && !self.indexes.contains_key(&index.name)
+                })
+                .map(|index| index.name.clone())
+                .collect();
+            for index_name in indexes_for_table {
+                self.rebuild_index(&index_name, page_size)?;
+            }
+
+            let Some(TableRowSource::Paged(manifest)) = self.tables.get(&table_name) else {
+                return Err(DbError::internal(format!(
+                    "paged row source for {table_name} is missing after index hydration"
+                )));
+            };
+            let chunks = Arc::clone(&manifest.chunks);
+            self.cache_deferred_paged_row_locators(&table_name, state, chunks.as_ref())?;
+            self.redefer_persisted_tables(&[table_name.as_str()]);
+        }
         Ok(())
     }
 

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Eagerly hydrate all B-tree indexes for deferred tables
+  on database open when `defer_table_materialization` is enabled. Previously,
+  each secondary index was lazily hydrated on first query, causing multi-second
+  delays (12+ seconds for 1M row tables) on the first query for each index.
+  Now all indexes are loaded during open, ensuring sub-millisecond query
+  performance from the first execution. This trades slightly slower database
+  open time for consistently fast query performance, which is critical for
+  request-path workloads like Melodee's MusicBrainz lookups.
+
 ## [2.12.0] - [2026-06-13]
 
 ### Added

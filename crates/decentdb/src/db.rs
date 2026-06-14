@@ -20129,8 +20129,11 @@ mod tests {
                 "bench should be deferred immediately after reopen"
             );
             assert!(
-                runtime.index("bench_lookup_idx").is_none(),
-                "freshly reopened deferred runtime should start without an in-memory btree map"
+                matches!(
+                    runtime.index("bench_lookup_idx"),
+                    Some(RuntimeIndex::Btree { .. })
+                ),
+                "eager index hydration should load the btree map on reopen for fast first queries"
             );
         }
 
@@ -31709,8 +31712,8 @@ mod tests {
                 })
                 .expect("primary-key btree index");
             assert!(
-                runtime.index(&pk_index.name).is_none(),
-                "freshly reopened deferred runtime should start without an in-memory primary-key btree"
+                matches!(runtime.index(&pk_index.name), Some(RuntimeIndex::Btree { .. })),
+                "eager index hydration should load the primary-key btree on reopen for fast first queries"
             );
         };
         let explain = db
@@ -31765,8 +31768,11 @@ mod tests {
                 })
                 .expect("primary-key btree index");
             assert!(
-                runtime.index(&pk_index.name).is_none(),
-                "projected primary-key ordering should use the persistent locator without hydrating the runtime btree"
+                matches!(
+                    runtime.index(&pk_index.name),
+                    Some(RuntimeIndex::Btree { .. })
+                ),
+                "eager index hydration ensures the primary-key btree is available for fast queries"
             );
         }
 
