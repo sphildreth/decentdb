@@ -105,6 +105,7 @@ struct ReadOnlyPagedRowSourceResidency {
 struct PagerReadStore<'a> {
     db: &'a Db,
     snapshot_token: u64,
+    explicit_snapshot_lsn: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -131,13 +132,24 @@ impl<'a> PagerReadStore<'a> {
         Ok(Self {
             db,
             snapshot_token: db.hold_snapshot()?,
+            explicit_snapshot_lsn: None,
         })
+    }
+
+    fn with_snapshot_lsn(db: &'a Db, snapshot_lsn: u64) -> Self {
+        Self {
+            db,
+            snapshot_token: 0,
+            explicit_snapshot_lsn: Some(snapshot_lsn),
+        }
     }
 }
 
 impl Drop for PagerReadStore<'_> {
     fn drop(&mut self) {
-        let _ = self.db.release_snapshot(self.snapshot_token);
+        if self.snapshot_token != 0 {
+            let _ = self.db.release_snapshot(self.snapshot_token);
+        }
     }
 }
 
@@ -159,6 +171,9 @@ impl PageStore for PagerReadStore<'_> {
     }
 
     fn read_page(&self, page_id: PageId) -> Result<Arc<[u8]>> {
+        if let Some(lsn) = self.explicit_snapshot_lsn {
+            return self.db.read_page_at_snapshot_lsn(page_id, lsn);
+        }
         self.db.read_page_for_snapshot(self.snapshot_token, page_id)
     }
 
@@ -2651,7 +2666,7 @@ impl Db {
         {
             return Ok(None);
         }
-        let row_count = self.runtime_table_row_count(&runtime, &table.name)?;
+        let row_count = self.runtime_table_row_count(&runtime, &table.name, Some(snapshot_lsn))?;
         let row_count = i64::try_from(row_count).map_err(|_| {
             DbError::sql(format!(
                 "table {} exceeds COUNT(*) row-count limits",
@@ -3163,13 +3178,13 @@ impl Db {
             }
             tables.push(table_info(
                 table,
-                self.runtime_table_row_count(&runtime, &table.name)?,
+                self.runtime_table_row_count(&runtime, &table.name, None)?,
             ));
         }
         for table in runtime.temp_tables.values() {
             tables.push(table_info(
                 table,
-                self.runtime_table_row_count(&runtime, &table.name)?,
+                self.runtime_table_row_count(&runtime, &table.name, None)?,
             ));
         }
         Ok(tables)
@@ -3191,14 +3206,20 @@ impl Db {
             return Err(DbError::sql(format!("unknown table {name}")));
         }
         let (table, row_count) = if let Some(table) = runtime.temp_tables.get(name) {
-            (table, self.runtime_table_row_count(&runtime, &table.name)?)
+            (
+                table,
+                self.runtime_table_row_count(&runtime, &table.name, None)?,
+            )
         } else {
             let table = runtime
                 .catalog
                 .tables
                 .get(name)
                 .ok_or_else(|| DbError::sql(format!("unknown table {name}")))?;
-            (table, self.runtime_table_row_count(&runtime, &table.name)?)
+            (
+                table,
+                self.runtime_table_row_count(&runtime, &table.name, None)?,
+            )
         };
         Ok(table_info(table, row_count))
     }
@@ -7474,7 +7495,12 @@ impl Db {
         self.engine_snapshot()
     }
 
-    fn runtime_table_row_count(&self, runtime: &EngineRuntime, table_name: &str) -> Result<usize> {
+    fn runtime_table_row_count(
+        &self,
+        runtime: &EngineRuntime,
+        table_name: &str,
+        snapshot_lsn: Option<u64>,
+    ) -> Result<usize> {
         if let Some(table) = runtime.temp_table_schema(table_name) {
             return Ok(runtime
                 .temp_table_data(&table.name)
@@ -7501,7 +7527,11 @@ impl Db {
             return Ok(state.row_count);
         }
 
-        let store = PagerReadStore::new(self)?;
+        let store = if let Some(lsn) = snapshot_lsn {
+            PagerReadStore::with_snapshot_lsn(self, lsn)
+        } else {
+            PagerReadStore::new(self)?
+        };
         let payload = read_overflow(&store, state.pointer)?;
         if state.pointer.is_table_paged_manifest() {
             let manifest = decode_paged_table_manifest_payload(&payload)?;
@@ -17309,13 +17339,13 @@ fn schema_snapshot(db: &Db, runtime: &EngineRuntime) -> Result<SchemaSnapshot> {
         }
         tables.push(schema_table_info(
             table,
-            db.runtime_table_row_count(runtime, &table.name)?,
+            db.runtime_table_row_count(runtime, &table.name, None)?,
         ));
     }
     for table in runtime.temp_tables.values() {
         tables.push(schema_table_info(
             table,
-            db.runtime_table_row_count(runtime, &table.name)?,
+            db.runtime_table_row_count(runtime, &table.name, None)?,
         ));
     }
     tables.sort_by(|left, right| left.name.cmp(&right.name));
