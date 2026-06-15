@@ -4,6 +4,8 @@ on:
   push:
     tags:
       - "v*"
+  release:
+    types: [published]
   workflow_dispatch:
     inputs:
       build_platform:
@@ -30,6 +32,14 @@ on:
 
 permissions:
   contents: write
+
+env:
+  RELEASE_TAG: >-
+    ${{
+      github.event_name == 'release'
+      && github.event.release.tag_name
+      || (github.ref_type == 'tag' && github.ref_name || format('manual-{0}', github.run_number))
+    }}
 
 jobs:
   plan_build:
@@ -225,10 +235,10 @@ jobs:
     if: >-
       always() &&
       needs.plan_build.result == 'success' &&
-      (startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch') &&
+      (startsWith(github.ref, 'refs/tags/') || github.event_name == 'release' || github.event_name == 'workflow_dispatch') &&
       (needs.validate.result == 'success' || (github.event_name == 'workflow_dispatch' && !inputs.run_validation))
     env:
-      PACKAGE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || format('manual-{0}', github.run_number) }}
+      PACKAGE_TAG: ${{ env.RELEASE_TAG }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan_build.outputs.matrix) }}
@@ -405,7 +415,7 @@ jobs:
     needs: [build]
     if: >-
       always() &&
-      startsWith(github.ref, 'refs/tags/') &&
+      (startsWith(github.ref, 'refs/tags/') || github.event_name == 'release') &&
       needs.build.result == 'success' &&
       (github.event_name != 'workflow_dispatch' || (inputs.create_release && inputs.build_platform == 'all'))
 
@@ -418,22 +428,22 @@ jobs:
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}
-          prerelease: ${{ startsWith(github.ref_name, 'v0.') || contains(github.ref_name, '-rc.') }}
+          tag_name: ${{ env.RELEASE_TAG }}
+          prerelease: ${{ startsWith(env.RELEASE_TAG, 'v0.') || contains(env.RELEASE_TAG, '-rc.') }}
           files: |
-            artifacts/**/decentdb-${{ github.ref_name }}-Linux-x64.tar.gz
-            artifacts/**/decentdb-${{ github.ref_name }}-Linux-arm64.tar.gz
-            artifacts/**/decentdb-${{ github.ref_name }}-macOS-arm64.tar.gz
-            artifacts/**/decentdb-${{ github.ref_name }}-Windows-x64.zip
-            artifacts/**/decentdb-dart-native-${{ github.ref_name }}-Linux-x64.tar.gz
-            artifacts/**/decentdb-dart-native-${{ github.ref_name }}-Linux-arm64.tar.gz
-            artifacts/**/decentdb-dart-native-${{ github.ref_name }}-macOS-arm64.tar.gz
-            artifacts/**/decentdb-dart-native-${{ github.ref_name }}-Windows-x64.zip
-            artifacts/**/decentdb-jdbc-${{ github.ref_name }}-Linux.jar
-            artifacts/**/decentdb-jdbc-${{ github.ref_name }}-Linux-arm64.jar
-            artifacts/**/decentdb-jdbc-${{ github.ref_name }}-macOS.jar
-            artifacts/**/decentdb-jdbc-${{ github.ref_name }}-Windows.jar
-            artifacts/**/decentdb-dbeaver-${{ github.ref_name }}-Linux.zip
-            artifacts/**/decentdb-dbeaver-${{ github.ref_name }}-Linux-arm64.zip
-            artifacts/**/decentdb-dbeaver-${{ github.ref_name }}-macOS.zip
-            artifacts/**/decentdb-dbeaver-${{ github.ref_name }}-Windows.zip
+            artifacts/**/decentdb-${{ env.RELEASE_TAG }}-Linux-x64.tar.gz
+            artifacts/**/decentdb-${{ env.RELEASE_TAG }}-Linux-arm64.tar.gz
+            artifacts/**/decentdb-${{ env.RELEASE_TAG }}-macOS-arm64.tar.gz
+            artifacts/**/decentdb-${{ env.RELEASE_TAG }}-Windows-x64.zip
+            artifacts/**/decentdb-dart-native-${{ env.RELEASE_TAG }}-Linux-x64.tar.gz
+            artifacts/**/decentdb-dart-native-${{ env.RELEASE_TAG }}-Linux-arm64.tar.gz
+            artifacts/**/decentdb-dart-native-${{ env.RELEASE_TAG }}-macOS-arm64.tar.gz
+            artifacts/**/decentdb-dart-native-${{ env.RELEASE_TAG }}-Windows-x64.zip
+            artifacts/**/decentdb-jdbc-${{ env.RELEASE_TAG }}-Linux.jar
+            artifacts/**/decentdb-jdbc-${{ env.RELEASE_TAG }}-Linux-arm64.jar
+            artifacts/**/decentdb-jdbc-${{ env.RELEASE_TAG }}-macOS.jar
+            artifacts/**/decentdb-jdbc-${{ env.RELEASE_TAG }}-Windows.jar
+            artifacts/**/decentdb-dbeaver-${{ env.RELEASE_TAG }}-Linux.zip
+            artifacts/**/decentdb-dbeaver-${{ env.RELEASE_TAG }}-Linux-arm64.zip
+            artifacts/**/decentdb-dbeaver-${{ env.RELEASE_TAG }}-macOS.zip
+            artifacts/**/decentdb-dbeaver-${{ env.RELEASE_TAG }}-Windows.zip

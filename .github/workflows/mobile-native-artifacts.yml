@@ -5,6 +5,16 @@ on:
   push:
     tags:
       - "v*"
+  release:
+    types: [published]
+
+env:
+  RELEASE_TAG: >-
+    ${{
+      github.event_name == 'release'
+      && github.event.release.tag_name
+      || (github.ref_type == 'tag' && github.ref_name || format('manual-{0}', github.run_number))
+    }}
 
 jobs:
   flutter-package:
@@ -80,10 +90,7 @@ jobs:
       - name: Package Android artifacts
         run: |
           set -euo pipefail
-          TAG="${GITHUB_REF_NAME:-manual}"
-          if [[ "$GITHUB_REF_TYPE" != "tag" ]]; then
-            TAG="manual-${GITHUB_RUN_NUMBER}"
-          fi
+          TAG="${RELEASE_TAG}"
           ARTIFACT_NAME="decentdb-mobile-android-${TAG}.zip"
           ARTIFACT_PATH="$RUNNER_TEMP/$ARTIFACT_NAME"
           echo "ARTIFACT_NAME=$ARTIFACT_NAME" >> "$GITHUB_ENV"
@@ -146,10 +153,7 @@ jobs:
       - name: Package iOS artifacts
         run: |
           set -euo pipefail
-          TAG="${GITHUB_REF_NAME:-manual}"
-          if [[ "$GITHUB_REF_TYPE" != "tag" ]]; then
-            TAG="manual-${GITHUB_RUN_NUMBER}"
-          fi
+          TAG="${RELEASE_TAG}"
           ARTIFACT_NAME="decentdb-mobile-ios-${TAG}.zip"
           ARTIFACT_PATH="$RUNNER_TEMP/$ARTIFACT_NAME"
           echo "ARTIFACT_NAME=$ARTIFACT_NAME" >> "$GITHUB_ENV"
