@@ -694,7 +694,7 @@ dependencies = [
 
 [[package]]
 name = "decentdb"
-version = "2.13.0"
+version = "2.13.1"
 dependencies = [
  "base64",
  "chacha20",
@@ -1531,7 +1531,7 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "libpg_query_sys"
-version = "2.13.0"
+version = "2.13.1"
 dependencies = [
  "pg_query",
 ]

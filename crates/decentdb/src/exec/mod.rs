@@ -107,10 +107,13 @@ const ENUM_COLUMNS_SECTION_MAGIC: &[u8; 8] = b"DDBENU01";
 const FULL_TEXT_OPTIONS_SECTION_MAGIC: &[u8; 8] = b"DDBFTS01";
 const SIGNED_ROW_ID_BIAS: u64 = 0x8000_0000_0000_0000;
 const DEFERRED_COMPRESSED_LOOKUP_CACHE_LIMIT: usize = 32;
+const DEFERRED_RUNTIME_BTREE_INDEX_CACHE_LIMIT: usize = 16;
 const DEFERRED_PAGED_ROW_PAYLOAD_CACHE_LIMIT_BYTES: usize = 8 * 1024 * 1024;
 const DEFERRED_VIEW_LIMIT_MIN_PERSISTED_ROWS: usize = 100_000;
 static RANDOM_STATE: AtomicU64 = AtomicU64::new(0);
 static DEFERRED_COMPRESSED_LOOKUP_CACHE: OnceLock<Mutex<DeferredCompressedLookupCache>> =
+    OnceLock::new();
+static DEFERRED_RUNTIME_BTREE_INDEX_CACHE: OnceLock<Mutex<DeferredRuntimeBtreeIndexCache>> =
     OnceLock::new();
 const EXEC_MICROS_PER_DAY: i64 = 86_400_000_000;
 const FTS_HIDDEN_ROW_ID_COLUMN: &str = "__decentdb_fts_rowid";
@@ -210,6 +213,53 @@ struct DeferredCompressedLookupCacheEntry {
 struct DeferredCompressedLookupCache {
     entries: HashMap<DeferredCompressedLookupCacheKey, Arc<DeferredCompressedLookupCacheEntry>>,
     insertion_order: VecDeque<DeferredCompressedLookupCacheKey>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct DeferredRuntimeBtreeIndexCacheKey {
+    table_name: String,
+    index_name: String,
+    table_head_page_id: PageId,
+    table_logical_len: u32,
+    table_flags: u8,
+    table_checksum: u32,
+    unique: bool,
+    columns: Vec<(Option<String>, Option<String>)>,
+    include_columns: Vec<String>,
+    predicate_sql: Option<String>,
+}
+
+impl DeferredRuntimeBtreeIndexCacheKey {
+    fn new(table: &TableSchema, index: &IndexSchema, state: PersistedTableState) -> Self {
+        Self {
+            table_name: table.name.clone(),
+            index_name: index.name.clone(),
+            table_head_page_id: state.pointer.head_page_id,
+            table_logical_len: state.pointer.logical_len,
+            table_flags: state.pointer.flags,
+            table_checksum: state.checksum,
+            unique: index.unique,
+            columns: index
+                .columns
+                .iter()
+                .map(|column| (column.column_name.clone(), column.expression_sql.clone()))
+                .collect(),
+            include_columns: index.include_columns.clone(),
+            predicate_sql: index.predicate_sql.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct DeferredRuntimeBtreeIndexCacheEntry {
+    runtime_index: Arc<RuntimeIndex>,
+    paged_locator_cache: Option<Arc<DeferredPagedRowLocatorCache>>,
+}
+
+#[derive(Default)]
+struct DeferredRuntimeBtreeIndexCache {
+    entries: HashMap<DeferredRuntimeBtreeIndexCacheKey, Arc<DeferredRuntimeBtreeIndexCacheEntry>>,
+    insertion_order: VecDeque<DeferredRuntimeBtreeIndexCacheKey>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2346,20 +2396,6 @@ impl EngineRuntime {
         if !config.defer_table_materialization || runtime.deferred_tables.is_empty() {
             runtime.rebuild_indexes(pager.page_size())?;
         }
-        // DDB-002/DDB-003: When defer_table_materialization is true, eagerly
-        // hydrate all indexes for deferred tables. This ensures that the first
-        // query for each index is fast (sub-millisecond) instead of triggering
-        // lazy index hydration which can take multiple seconds for large tables.
-        // The table data is loaded temporarily, indexes are built, row locators
-        // are cached, and then the table is re-deferred to free memory.
-        if config.defer_table_materialization && !runtime.deferred_tables.is_empty() {
-            runtime.hydrate_all_deferred_table_indexes(
-                pager,
-                wal,
-                pager.page_size(),
-                snapshot_lsn,
-            )?;
-        }
         Ok(runtime)
     }
 
@@ -2588,6 +2624,31 @@ impl EngineRuntime {
                     "deferred table '{canonical_table_name}' has no persisted state"
                 ))
             })?;
+        let table_schema = self
+            .catalog
+            .table(&canonical_table_name)
+            .ok_or_else(|| {
+                DbError::internal(format!(
+                    "deferred table '{canonical_table_name}' has no schema"
+                ))
+            })?
+            .clone();
+        let index_schema = self
+            .catalog
+            .index(index_name)
+            .ok_or_else(|| DbError::sql(format!("unknown index {index_name}")))?
+            .clone();
+        let cache_key = DeferredRuntimeBtreeIndexCacheKey::new(&table_schema, &index_schema, state);
+        if let Some(entry) = cached_deferred_runtime_btree_index(&cache_key)? {
+            self.indexes_mut()
+                .insert(index_schema.name.clone(), Arc::clone(&entry.runtime_index));
+            if let Some(locator_cache) = entry.paged_locator_cache.as_ref() {
+                self.deferred_paged_row_locator_caches_mut()
+                    .insert(canonical_table_name, Arc::clone(locator_cache));
+            }
+            return Ok(());
+        }
+
         let row_source = if state.pointer.is_table_paged_manifest() {
             TableRowSource::Paged(Arc::new(read_table_page_manifest_from_state(
                 &store, state,
@@ -2603,8 +2664,8 @@ impl EngineRuntime {
         self.tables_mut()
             .insert(canonical_table_name.clone(), row_source);
         self.deferred_tables_mut().remove(&canonical_table_name);
-        if !self.indexes.contains_key(index_name) {
-            self.rebuild_index(index_name, page_size)?;
+        if !self.indexes.contains_key(&index_schema.name) {
+            self.rebuild_index(&index_schema.name, page_size)?;
         }
         if state.pointer.is_table_paged_manifest() {
             let Some(TableRowSource::Paged(manifest)) = self.tables.get(&canonical_table_name)
@@ -2616,88 +2677,20 @@ impl EngineRuntime {
             let chunks = Arc::clone(&manifest.chunks);
             self.cache_deferred_paged_row_locators(&canonical_table_name, state, chunks.as_ref())?;
         }
-        self.redefer_persisted_tables(&[canonical_table_name.as_str()]);
-        Ok(())
-    }
-
-    /// Eagerly hydrates all indexes for all deferred tables. This is called
-    /// during database open when `defer_table_materialization` is true to
-    /// ensure that subsequent queries are fast. For each deferred table with
-    /// indexes, this function:
-    /// 1. Reads the table manifest from disk (once per table)
-    /// 2. Builds all indexes for the table
-    /// 3. Caches row locators for paged tables
-    /// 4. Re-defers the table (removes data from memory)
-    ///
-    /// This makes database open slower but ensures that the first query for
-    /// each index is fast (sub-millisecond instead of multi-second).
-    ///
-    /// Note: Only tables with paged manifests can be re-deferred after hydration.
-    /// Non-paged tables are skipped to avoid leaving them loaded in memory.
-    pub(crate) fn hydrate_all_deferred_table_indexes(
-        &mut self,
-        pager: &PagerHandle,
-        wal: &WalHandle,
-        page_size: u32,
-        snapshot_lsn: u64,
-    ) -> Result<()> {
-        let deferred_tables: Vec<String> = self.deferred_tables.iter().cloned().collect();
-        for table_name in deferred_tables {
-            let Some(state) = self.persisted_tables.get(&table_name).copied() else {
-                continue;
-            };
-
-            if !state.pointer.is_table_paged_manifest() {
-                continue;
-            }
-
-            let has_indexes = self.catalog.indexes.values().any(|index| {
-                identifiers_equal(&index.table_name, &table_name) && index.kind == IndexKind::Btree
-            });
-            if !has_indexes {
-                continue;
-            }
-
-            let store = SnapshotPageStore {
-                pager,
-                wal,
-                snapshot_lsn,
-            };
-            let row_source = TableRowSource::Paged(Arc::new(read_table_page_manifest_from_state(
-                &store, state,
-            )?));
-            let row_count = row_source.row_count();
-            if let Some(ps) = self.persisted_tables_mut().get_mut(&table_name) {
-                ps.row_count = row_count;
-                ps.tail = read_uncompressed_overflow_tail(&store, ps.pointer)?.unwrap_or_default();
-            }
-            self.tables_mut().insert(table_name.clone(), row_source);
-            self.deferred_tables_mut().remove(&table_name);
-
-            let indexes_for_table: Vec<String> = self
-                .catalog
-                .indexes
-                .values()
-                .filter(|index| {
-                    identifiers_equal(&index.table_name, &table_name)
-                        && index.kind == IndexKind::Btree
-                        && !self.indexes.contains_key(&index.name)
-                })
-                .map(|index| index.name.clone())
-                .collect();
-            for index_name in indexes_for_table {
-                self.rebuild_index(&index_name, page_size)?;
-            }
-
-            let Some(TableRowSource::Paged(manifest)) = self.tables.get(&table_name) else {
-                return Err(DbError::internal(format!(
-                    "paged row source for {table_name} is missing after index hydration"
-                )));
-            };
-            let chunks = Arc::clone(&manifest.chunks);
-            self.cache_deferred_paged_row_locators(&table_name, state, chunks.as_ref())?;
-            self.redefer_persisted_tables(&[table_name.as_str()]);
+        if let Some(runtime_index) = self.indexes.get(&index_schema.name).cloned() {
+            let paged_locator_cache = self
+                .deferred_paged_row_locator_caches
+                .get(&canonical_table_name)
+                .cloned();
+            cache_deferred_runtime_btree_index(
+                cache_key,
+                DeferredRuntimeBtreeIndexCacheEntry {
+                    runtime_index,
+                    paged_locator_cache,
+                },
+            )?;
         }
+        self.redefer_persisted_tables(&[canonical_table_name.as_str()]);
         Ok(())
     }
 
@@ -25324,6 +25317,39 @@ fn build_paged_row_locator_entries_from_chunk_payloads(
 fn deferred_compressed_lookup_cache() -> &'static Mutex<DeferredCompressedLookupCache> {
     DEFERRED_COMPRESSED_LOOKUP_CACHE
         .get_or_init(|| Mutex::new(DeferredCompressedLookupCache::default()))
+}
+
+fn deferred_runtime_btree_index_cache() -> &'static Mutex<DeferredRuntimeBtreeIndexCache> {
+    DEFERRED_RUNTIME_BTREE_INDEX_CACHE
+        .get_or_init(|| Mutex::new(DeferredRuntimeBtreeIndexCache::default()))
+}
+
+fn cached_deferred_runtime_btree_index(
+    key: &DeferredRuntimeBtreeIndexCacheKey,
+) -> Result<Option<Arc<DeferredRuntimeBtreeIndexCacheEntry>>> {
+    let cache = deferred_runtime_btree_index_cache()
+        .lock()
+        .map_err(|_| DbError::internal("deferred runtime index cache lock poisoned"))?;
+    Ok(cache.entries.get(key).cloned())
+}
+
+fn cache_deferred_runtime_btree_index(
+    key: DeferredRuntimeBtreeIndexCacheKey,
+    entry: DeferredRuntimeBtreeIndexCacheEntry,
+) -> Result<()> {
+    let mut cache = deferred_runtime_btree_index_cache()
+        .lock()
+        .map_err(|_| DbError::internal("deferred runtime index cache lock poisoned"))?;
+    if !cache.entries.contains_key(&key) {
+        if cache.entries.len() >= DEFERRED_RUNTIME_BTREE_INDEX_CACHE_LIMIT {
+            if let Some(evicted) = cache.insertion_order.pop_front() {
+                cache.entries.remove(&evicted);
+            }
+        }
+        cache.insertion_order.push_back(key.clone());
+    }
+    cache.entries.insert(key, Arc::new(entry));
+    Ok(())
 }
 
 fn deferred_compressed_lookup_cache_key(
