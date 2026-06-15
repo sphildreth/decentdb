@@ -7,9 +7,6 @@ run-name: >-
   }}
 
 on:
-  push:
-    tags:
-      - "v*"
   release:
     types: [published]
   workflow_dispatch:
@@ -260,7 +257,7 @@ jobs:
           unzip -l "$pkg" | grep -q "lib/net10.0/DecentDB.EntityFrameworkCore.NodaTime.dll"
 
       - name: Publish to NuGet.org
-        if: ${{ github.event_name == 'push' || github.event_name == 'release' || inputs.publish_to_nuget == true }}
+        if: ${{ github.event_name == 'release' || inputs.publish_to_nuget == true }}
         env:
           NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
         shell: bash
