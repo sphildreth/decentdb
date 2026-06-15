@@ -239,6 +239,20 @@ impl WalHandle {
         self.materialize_latest_visible_locked(&index, pager, page_id, snapshot_lsn)
     }
 
+    pub(crate) fn materialize_checkpoint_version(
+        &self,
+        pager: &PagerHandle,
+        page_id: PageId,
+        version: &WalVersion,
+    ) -> Result<Arc<[u8]>> {
+        let index = self
+            .inner
+            .index
+            .lock()
+            .expect("wal index lock should not be poisoned");
+        self.materialize_version_locked(&index, pager, page_id, version)
+    }
+
     pub(crate) fn latest_snapshot(&self) -> u64 {
         self.inner.wal_end_lsn.load(Ordering::Acquire)
     }

@@ -9,6 +9,16 @@
 storage maintainers, C ABI maintainers, binding maintainers, WASM/browser
 maintainers, benchmark maintainers, documentation authors, coding agents
 
+## Phase Map
+
+| Phase | Status | Scope | Completion Criteria |
+|---|---|---|---|
+| Phase 1A: AST Cache Generalization And Invalidation Surface | DONE | Connection-local parsed AST cache, cache key, invalidation sink, diagnostics, configuration, C ABI open options, CLI reset/list/stats surface, and AST-cache benchmarks. | Delivered in 2.13.0 with default-on bounded cache, eager full invalidation, `sys.plan_cache`, `sys.plan_cache_summary`, `PRAGMA flush_plan_cache`, and plan-cache guardrail benchmarks. |
+| Phase 1B: Simple-Plan Reuse (`PreparedSimple*` projections) | DONE | Connection-local prepared-plan bundle cache for existing simple DML and `PreparedSimple*` read-plan inventory. | Delivered in 2.13.0 under ADR 0194 with prepared point lookup, one-shot query, and churn guardrail evidence. |
+| Phase 2: Process-Global Plan Cache | TODO | Optional process-global cache shared across compatible connections. | Requires a future ADR, database identity partitioning, safe temp-schema exclusions, process-scope diagnostics, and multi-connection benchmark proof. |
+| Phase 3: Finer-Grained Invalidation | TODO | Object-level invalidation using table/index/column reference tracking instead of eager full eviction. | Requires measured DDL/ANALYZE invalidation pressure, object-reference tracking, correctness tests for stale-plan prevention, and benchmark proof that the added complexity pays for itself. |
+| Phase 4: Binding Integration, CLI, And Doctor | DONE | User-facing configuration/docs, binding guidance, CLI subcommands, Doctor findings, and release documentation. | Delivered in 2.13.0 with C ABI diagnostics/options, `decentdb plan-cache stats/list/reset`, Doctor plan-cache findings, and documentation/changelog updates. |
+
 **Governing ADRs:** see the ADRs linked below. The decisions those
 ADRs record (cache key, eviction policy, security generation, C ABI
 surface) are the answers to the previously-open "ADR-required

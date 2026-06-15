@@ -23,10 +23,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the C ABI version.
 - Added `cargo bench -p decentdb --bench plan_cache` and
   `benchmarks/rust-baseline --plan-cache-benchmark` guardrail benchmarks.
-  Local validation showed repeated point-lookup preparation at 565K ops/s with
-  the cache enabled vs 165K ops/s disabled, one-shot query throughput within
-  the guardrail at 418 ops/s enabled vs 425 ops/s disabled, and warm churn
-  preparation at 100K ops/s enabled vs 45K ops/s disabled.
+  Local validation showed repeated point-lookup preparation at 643K ops/s with
+  the cache enabled vs 188K ops/s disabled, one-shot query throughput within
+  the guardrail at 435 ops/s enabled vs 442 ops/s disabled, and warm churn
+  preparation at 100K ops/s enabled vs 43K ops/s disabled.
+- Added cost and cardinality estimates to rendered physical plans, including
+  explicit `HashJoin`, `IndexedJoin`, `StreamingAggregate`, `ViewScan`, and
+  `ExpandedView` plan nodes for planner diagnostics. `EXPLAIN` now surfaces
+  estimated rows and relative cost for planned read operators, and the EXPLAIN
+  planner can use persisted `ANALYZE` statistics to compare table scans, row-id
+  lookups, index seeks, and simple inner-join alternatives.
+
+### Changed
+
+- Improved prepared read hot paths for row-id, row-id range, and simple row-id
+  join projections by reusing bounded resident paged row sources when the
+  runtime snapshot is current. This avoids repeated deferred-table row-source
+  reloads for medium-sized prepared lookup workloads while preserving the
+  existing deferred-table memory cap and re-defer behavior.
+- Reduced unnecessary row materialization in simple projection paths by reading
+  projected values directly for row-id lookups and by applying unordered
+  `LIMIT/OFFSET` while scanning simple table and filtered projection fast paths.
+- Switched the in-process reader registry from a hash map to reusable reader
+  slots so repeated reader registration avoids avoidable hot-path overhead.
+- Regenerated the native benchmark summary and README benchmark chart assets
+  from the latest `embedded_compare` run.
 
 ### Fixed
 

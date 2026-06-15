@@ -92,6 +92,8 @@ pub struct Db {
 }
 
 const AUTOCOMMIT_PAGED_ROW_SOURCE_MAX_RESIDENT: usize = 4;
+const PREPARED_READ_ROW_SOURCE_MIN_ROWS: usize = 4_096;
+const PREPARED_READ_ROW_SOURCE_ROWS_PER_CACHE_MB: usize = 8_192;
 
 #[derive(Debug, Default)]
 struct ReadOnlyPagedRowSourceResidency {
@@ -836,7 +838,7 @@ struct SqlTxnState {
 #[derive(Debug)]
 struct ExclusiveSqlTxnState<'a> {
     runtime: RwLockWriteGuard<'a, EngineRuntime>,
-    snapshot_reader: ReaderGuard,
+    snapshot_reader: Option<ReaderGuard>,
     base_lsn: u64,
     base_checkpoint_epoch: u64,
     persistent_changed: bool,
@@ -920,7 +922,10 @@ impl crate::plan_cache::PlanCacheInvalidator for DbInner {
 
 impl ExclusiveSqlTxnState<'_> {
     fn snapshot_lsn(&self) -> u64 {
-        self.snapshot_reader.snapshot_lsn()
+        self.snapshot_reader
+            .as_ref()
+            .expect("exclusive SQL transaction snapshot reader should be active")
+            .snapshot_lsn()
     }
 }
 
@@ -4926,9 +4931,38 @@ impl Db {
             return Ok(None);
         };
 
+        if let Some(runtime) =
+            self.runtime_read_for_current_prepared_row_sources(&[plan.table_name.as_str()])?
+        {
+            self.validate_prepared_schema_cookie(
+                prepared,
+                runtime.catalog.schema_cookie,
+                runtime.temp_schema_cookie,
+            )?;
+            let result = runtime.execute_resolved_simple_row_id_projection_at_snapshot(
+                ResolvedSimpleRowIdProjectionRequest {
+                    table_name: plan.table_name.as_str(),
+                    projection_indexes: &plan.projection_indexes,
+                    column_names: Arc::clone(&plan.column_names),
+                    lookup_row_id: *lookup_row_id,
+                    pager: &self.inner.pager,
+                    wal: &self.inner.wal,
+                    snapshot_lsn: self.inner.last_runtime_lsn.load(Ordering::Acquire),
+                    use_persistent_pk_index: self.inner.config.persistent_pk_index,
+                },
+            )?;
+            if result.is_some() {
+                return Ok(result);
+            }
+        }
+
         let reader = self.inner.wal.begin_reader_with_pager(&self.inner.pager)?;
         let snapshot_lsn = reader.snapshot_lsn();
         self.refresh_engine_from_snapshot(snapshot_lsn)?;
+        self.try_load_prepared_read_row_sources_at_snapshot(
+            &[plan.table_name.as_str()],
+            snapshot_lsn,
+        )?;
         let Some(runtime) = self.runtime_read_for_fast_read_at_snapshot(snapshot_lsn)? else {
             return Ok(None);
         };
@@ -4992,9 +5026,41 @@ impl Db {
         };
         let limit = Some(usize::try_from((*limit_value).max(0)).unwrap_or(usize::MAX));
 
+        if let Some(runtime) =
+            self.runtime_read_for_current_prepared_row_sources(&[plan.table_name.as_str()])?
+        {
+            self.validate_prepared_schema_cookie(
+                prepared,
+                runtime.catalog.schema_cookie,
+                runtime.temp_schema_cookie,
+            )?;
+            let result = runtime.execute_resolved_simple_row_id_range_projection_at_snapshot(
+                ResolvedSimpleRowIdRangeProjectionRequest {
+                    table_name: plan.table_name.as_str(),
+                    projection_indexes: &plan.projection_indexes,
+                    column_names: Arc::clone(&plan.column_names),
+                    filter_column: plan.filter_column.as_str(),
+                    lower_bound: lower_bound.clone(),
+                    upper_bound: upper_bound.clone(),
+                    limit,
+                    pager: &self.inner.pager,
+                    wal: &self.inner.wal,
+                    snapshot_lsn: self.inner.last_runtime_lsn.load(Ordering::Acquire),
+                    use_persistent_pk_index: self.inner.config.persistent_pk_index,
+                },
+            )?;
+            if result.is_some() {
+                return Ok(result);
+            }
+        }
+
         let reader = self.inner.wal.begin_reader_with_pager(&self.inner.pager)?;
         let snapshot_lsn = reader.snapshot_lsn();
         self.refresh_engine_from_snapshot(snapshot_lsn)?;
+        self.try_load_prepared_read_row_sources_at_snapshot(
+            &[plan.table_name.as_str()],
+            snapshot_lsn,
+        )?;
         let Some(runtime) = self.runtime_read_for_fast_read_at_snapshot(snapshot_lsn)? else {
             return Ok(None);
         };
@@ -5038,9 +5104,40 @@ impl Db {
             return Ok(None);
         };
 
+        let join_tables = [
+            plan.left_table_name.as_str(),
+            plan.right_table_name.as_str(),
+        ];
+        if let Some(runtime) = self.runtime_read_for_current_prepared_row_sources(&join_tables)? {
+            self.validate_prepared_schema_cookie(
+                prepared,
+                runtime.catalog.schema_cookie,
+                runtime.temp_schema_cookie,
+            )?;
+            let result = runtime.execute_resolved_simple_row_id_join_projection_at_snapshot(
+                ResolvedSimpleRowIdJoinProjectionRequest {
+                    left_table_name: plan.left_table_name.as_str(),
+                    right_table_name: plan.right_table_name.as_str(),
+                    left_projection_indexes: &plan.left_projection_indexes,
+                    right_projection_indexes: &plan.right_projection_indexes,
+                    projections: &plan.projections,
+                    column_names: Arc::clone(&plan.column_names),
+                    lookup_row_id: *lookup_row_id,
+                    pager: &self.inner.pager,
+                    wal: &self.inner.wal,
+                    snapshot_lsn: self.inner.last_runtime_lsn.load(Ordering::Acquire),
+                    use_persistent_pk_index: self.inner.config.persistent_pk_index,
+                },
+            )?;
+            if result.is_some() {
+                return Ok(result);
+            }
+        }
+
         let reader = self.inner.wal.begin_reader_with_pager(&self.inner.pager)?;
         let snapshot_lsn = reader.snapshot_lsn();
         self.refresh_engine_from_snapshot(snapshot_lsn)?;
+        self.try_load_prepared_read_row_sources_at_snapshot(&join_tables, snapshot_lsn)?;
         let Some(runtime) = self.runtime_read_for_fast_read_at_snapshot(snapshot_lsn)? else {
             return Ok(None);
         };
@@ -7084,7 +7181,7 @@ impl Db {
         self.configure_runtime_sync_capture(&mut runtime)?;
         Ok(ExclusiveSqlTxnState {
             runtime,
-            snapshot_reader,
+            snapshot_reader: Some(snapshot_reader),
             base_lsn: current_lsn,
             base_checkpoint_epoch: current_epoch,
             persistent_changed: false,
@@ -7112,6 +7209,7 @@ impl Db {
             self.restore_runtime_from_storage(&mut state.runtime)?;
             return Err(error);
         }
+        drop(state.snapshot_reader.take());
         let committed_lsn = match self.commit_if_latest(state.base_lsn, state.base_checkpoint_epoch)
         {
             Ok(lsn) => lsn,
@@ -7393,7 +7491,7 @@ impl Db {
         }
 
         if let Some(source) = runtime.table_row_source(table_name) {
-            return Ok(source.rows().count());
+            return Ok(source.row_count());
         }
 
         let Some(state) = runtime.persisted_table_state(table_name) else {
@@ -7493,23 +7591,40 @@ impl Db {
 
     fn refresh_engine_from_snapshot(&self, snapshot_lsn: u64) -> Result<()> {
         let latest_checkpoint_epoch = self.inner.wal.checkpoint_epoch();
-        let last_seen_checkpoint_epoch = self
+        let mut last_seen_checkpoint_epoch = self
             .inner
             .last_seen_checkpoint_epoch
             .load(Ordering::Acquire);
         let last_runtime_lsn = self.inner.last_runtime_lsn.load(Ordering::Acquire);
+        let writer_last_commit_lsn = self.inner.writer_last_commit_lsn.load(Ordering::Acquire);
+        let mut checkpoint_lsn_after_refresh = None;
         if latest_checkpoint_epoch != last_seen_checkpoint_epoch {
             let cached_header = self.inner.pager.header_snapshot()?;
             let on_disk_header = self.inner.pager.header_from_disk()?;
+            checkpoint_lsn_after_refresh = Some(on_disk_header.last_checkpoint_lsn);
             if on_disk_header.last_checkpoint_lsn != cached_header.last_checkpoint_lsn {
                 self.inner.pager.refresh_from_disk(on_disk_header)?;
             }
             self.inner
                 .last_seen_checkpoint_epoch
                 .store(latest_checkpoint_epoch, Ordering::Release);
+            last_seen_checkpoint_epoch = latest_checkpoint_epoch;
         }
         if snapshot_lsn == last_runtime_lsn && latest_checkpoint_epoch == last_seen_checkpoint_epoch
         {
+            return Ok(());
+        }
+        if last_runtime_lsn > 0
+            && writer_last_commit_lsn > 0
+            && last_runtime_lsn >= writer_last_commit_lsn
+            && snapshot_lsn <= writer_last_commit_lsn
+            && checkpoint_lsn_after_refresh.is_some_and(|checkpoint_lsn| {
+                checkpoint_lsn >= writer_last_commit_lsn && checkpoint_lsn <= last_runtime_lsn
+            })
+        {
+            self.inner
+                .last_runtime_lsn
+                .store(snapshot_lsn, Ordering::Release);
             return Ok(());
         }
 
@@ -7860,6 +7975,198 @@ impl Db {
             index_name,
             snapshot_lsn,
         )
+    }
+
+    fn prepared_read_row_source_row_limit(&self) -> usize {
+        self.inner
+            .config
+            .cache_size_mb
+            .saturating_mul(PREPARED_READ_ROW_SOURCE_ROWS_PER_CACHE_MB)
+    }
+
+    fn try_load_prepared_read_row_sources_at_snapshot(
+        &self,
+        names: &[&str],
+        snapshot_lsn: u64,
+    ) -> Result<()> {
+        if names.is_empty()
+            || !self.inner.config.defer_table_materialization
+            || !self.inner.config.paged_row_storage
+        {
+            return Ok(());
+        }
+
+        let row_limit = self.prepared_read_row_source_row_limit();
+        if row_limit == 0 {
+            return Ok(());
+        }
+
+        let mut to_load = BTreeSet::new();
+        {
+            let runtime = self
+                .inner
+                .engine
+                .read()
+                .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+            for name in names {
+                let Some(table_name) = runtime.canonical_catalog_table_name(name) else {
+                    continue;
+                };
+                if runtime.table_row_source(&table_name).is_some() {
+                    continue;
+                }
+                let Some(state) = runtime.persisted_tables.get(&table_name).copied() else {
+                    continue;
+                };
+                if !runtime.deferred_tables.contains(&table_name) {
+                    continue;
+                }
+                if !state.pointer.is_table_paged_manifest()
+                    || state.row_count < PREPARED_READ_ROW_SOURCE_MIN_ROWS
+                    || state.row_count > row_limit
+                {
+                    return Ok(());
+                }
+                to_load.insert(table_name);
+            }
+        }
+
+        if to_load.is_empty() {
+            return Ok(());
+        }
+
+        {
+            let mut runtime = self
+                .inner
+                .engine
+                .write()
+                .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+            runtime.load_deferred_table_row_sources_filtered_at_snapshot(
+                &self.inner.pager,
+                &self.inner.wal,
+                self.inner.config.page_size,
+                &to_load,
+                snapshot_lsn,
+            )?;
+        }
+
+        let loaded_refs = to_load.iter().map(String::as_str).collect::<Vec<_>>();
+        self.touch_read_only_paged_row_sources_by_name(&loaded_refs)
+    }
+
+    fn touch_read_only_paged_row_sources_by_name(&self, names: &[&str]) -> Result<()> {
+        if names.is_empty()
+            || !self.inner.config.defer_table_materialization
+            || !self.inner.config.paged_row_storage
+        {
+            return Ok(());
+        }
+
+        let (touched_tables, all_paged_tables) = {
+            let runtime = self
+                .inner
+                .engine
+                .read()
+                .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+            let mut touched_tables = BTreeSet::new();
+            let mut all_paged_tables = BTreeSet::new();
+            for (name, state) in runtime.persisted_tables.iter() {
+                if state.pointer.is_table_paged_manifest() {
+                    all_paged_tables.insert(name.clone());
+                }
+            }
+            for name in names {
+                let Some(table_name) = runtime.canonical_catalog_table_name(name) else {
+                    continue;
+                };
+                if all_paged_tables.contains(&table_name)
+                    && runtime.table_row_source(&table_name).is_some()
+                {
+                    touched_tables.insert(table_name);
+                }
+            }
+            (touched_tables, all_paged_tables)
+        };
+
+        if touched_tables.is_empty() {
+            return Ok(());
+        }
+
+        let mut to_redefer: Vec<String> = Vec::new();
+        {
+            let mut residency = self
+                .inner
+                .read_only_paged_row_source_residency
+                .lock()
+                .map_err(|_| {
+                    DbError::internal("read-only paged row source residency lock poisoned")
+                })?;
+            residency
+                .table_touch_generation
+                .retain(|name, _| all_paged_tables.contains(name));
+            let touch_gen = residency.next_touch_gen;
+            residency.next_touch_gen = residency.next_touch_gen.saturating_add(1);
+            for table_name in touched_tables {
+                residency
+                    .table_touch_generation
+                    .insert(table_name, touch_gen);
+            }
+            if residency.table_touch_generation.len() > AUTOCOMMIT_PAGED_ROW_SOURCE_MAX_RESIDENT {
+                let mut ordered_touch = residency
+                    .table_touch_generation
+                    .iter()
+                    .map(|(name, generation)| (name, *generation))
+                    .collect::<Vec<_>>();
+                ordered_touch.sort_by_key(|(_, generation)| *generation);
+                let overflow = ordered_touch.len() - AUTOCOMMIT_PAGED_ROW_SOURCE_MAX_RESIDENT;
+                to_redefer.reserve(overflow);
+                for (name, _) in ordered_touch.iter().take(overflow) {
+                    to_redefer.push((*name).clone());
+                }
+                for name in &to_redefer {
+                    residency.table_touch_generation.remove(name);
+                }
+            }
+        }
+
+        if to_redefer.is_empty() {
+            Ok(())
+        } else {
+            let redefer_refs = to_redefer.iter().map(String::as_str).collect::<Vec<_>>();
+            self.redefer_persisted_tables(&redefer_refs)
+        }
+    }
+
+    fn runtime_read_for_current_prepared_row_sources(
+        &self,
+        names: &[&str],
+    ) -> Result<Option<RwLockReadGuard<'_, EngineRuntime>>> {
+        if names.is_empty() {
+            return Ok(None);
+        }
+        let latest_lsn = self.inner.wal.latest_snapshot();
+        let latest_checkpoint_epoch = self.inner.wal.checkpoint_epoch();
+        let runtime = self
+            .inner
+            .engine
+            .read()
+            .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+        let last_runtime_lsn = self.inner.last_runtime_lsn.load(Ordering::Acquire);
+        let last_seen_checkpoint_epoch = self
+            .inner
+            .last_seen_checkpoint_epoch
+            .load(Ordering::Acquire);
+        if last_runtime_lsn != latest_lsn
+            || last_seen_checkpoint_epoch != latest_checkpoint_epoch
+            || names.iter().any(|name| {
+                runtime
+                    .canonical_catalog_table_name(name)
+                    .is_none_or(|table_name| runtime.table_row_source(&table_name).is_none())
+            })
+        {
+            return Ok(None);
+        }
+        Ok(Some(runtime))
     }
 
     fn load_simple_write_row_sources_at_latest_snapshot(&self, names: &[&str]) -> Result<()> {

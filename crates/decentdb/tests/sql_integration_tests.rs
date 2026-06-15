@@ -399,7 +399,7 @@ fn analyze_stats_change_btree_explain_plan_based_on_selectivity() {
         explain_after
             .explain_lines()
             .iter()
-            .any(|line| line.contains("TableScan(table=events)")),
+            .any(|line| line.contains("TableScan(table=events")),
         "expected post-ANALYZE TableScan in {:?}",
         explain_after.explain_lines()
     );

@@ -91,9 +91,7 @@ pub(crate) fn checkpoint(wal: &WalHandle, pager: &PagerHandle, timeout_sec: u64)
     }
 
     for (page_id, version) in latest_versions.iter() {
-        let payload = wal
-            .read_page_at_snapshot(pager, *page_id, version.lsn)?
-            .ok_or_else(|| crate::error::DbError::corruption("checkpoint page version vanished"))?;
+        let payload = wal.materialize_checkpoint_version(pager, *page_id, version)?;
         pager.write_page_direct(*page_id, &payload)?;
     }
     // Drop large `Arc<[u8]>` references early so the checkpoint copyback's
