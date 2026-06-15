@@ -328,6 +328,16 @@ impl TableData {
             .and_then(|index| self.rows.get(index))
     }
 
+    fn projected_values_by_id(
+        &self,
+        row_id: i64,
+        projection_indexes: &[usize],
+    ) -> Result<Option<Vec<Value>>> {
+        Ok(self
+            .row_by_id(row_id)
+            .map(|row| project_simple_projection_value_vec(&row.values, projection_indexes)))
+    }
+
     fn visit_int64_column_values<F>(&self, column_index: usize, mut visitor: F) -> Result<()>
     where
         F: FnMut(i64, Option<i64>) -> Result<()>,
@@ -826,6 +836,30 @@ impl TablePageManifest {
         self.row_at_position(index)
     }
 
+    fn projected_values_by_id(
+        &self,
+        row_id: i64,
+        projection_indexes: &[usize],
+    ) -> Result<Option<Vec<Value>>> {
+        if let Some(index) = row_id
+            .checked_sub(1)
+            .and_then(|value| usize::try_from(value).ok())
+        {
+            if self.rows.get(index).is_some_and(|row| row.row_id == row_id) {
+                return self.projected_values_at_position(index, projection_indexes);
+            }
+        }
+
+        if let Ok(index) = self.rows.binary_search_by_key(&row_id, |row| row.row_id) {
+            return self.projected_values_at_position(index, projection_indexes);
+        }
+
+        let Some(index) = self.rows.iter().position(|row| row.row_id == row_id) else {
+            return Ok(None);
+        };
+        self.projected_values_at_position(index, projection_indexes)
+    }
+
     fn row_at_position(&self, position: usize) -> Result<Option<TableRowRef<'_>>> {
         let Some(entry) = self.rows.get(position) else {
             return Ok(None);
@@ -852,6 +886,39 @@ impl TablePageManifest {
             row_id: entry.row_id,
             values: row.into_values(),
         })))
+    }
+
+    fn projected_values_at_position(
+        &self,
+        position: usize,
+        projection_indexes: &[usize],
+    ) -> Result<Option<Vec<Value>>> {
+        let Some(entry) = self.rows.get(position) else {
+            return Ok(None);
+        };
+        let chunk = self.chunks.get(entry.chunk_index as usize).ok_or_else(|| {
+            DbError::corruption("paged table chunk index exceeded chunk list length")
+        })?;
+        let payload = if entry.is_overlay {
+            chunk
+                .overlay_payload
+                .as_ref()
+                .ok_or_else(|| DbError::corruption("paged table overlay chunk is missing"))?
+        } else {
+            &chunk.payload
+        };
+        let start = entry.locator.byte_offset as usize;
+        let end = start + entry.locator.byte_len as usize;
+        let row_bytes = payload
+            .as_slice()
+            .get(start..end)
+            .ok_or_else(|| DbError::corruption("paged row locator exceeded payload length"))?;
+        Row::decode_projection_with_overflow::<page::InMemoryPageStore>(
+            row_bytes,
+            None,
+            projection_indexes,
+        )
+        .map(Some)
     }
 
     fn visit_int64_column_values<F>(&self, column_index: usize, mut visitor: F) -> Result<()>
@@ -1031,6 +1098,17 @@ impl<'a> VisibleTableRowSource<'a> {
         }
     }
 
+    fn projected_values_by_id(
+        &self,
+        row_id: i64,
+        projection_indexes: &[usize],
+    ) -> Result<Option<Vec<Value>>> {
+        match self {
+            Self::Temp(data) => data.projected_values_by_id(row_id, projection_indexes),
+            Self::Base(source) => source.projected_values_by_id(row_id, projection_indexes),
+        }
+    }
+
     fn row_at_position(&self, position: usize) -> Result<Option<TableRowRef<'a>>> {
         match self {
             Self::Temp(data) => Ok(data.rows.get(position).map(TableRowRef::Resident)),
@@ -1077,7 +1155,7 @@ impl TableRowSource {
         }
     }
 
-    fn row_count(&self) -> usize {
+    pub(crate) fn row_count(&self) -> usize {
         match self {
             Self::Resident(data) => data.rows.len(),
             Self::Paged(manifest) => manifest.row_count(),
@@ -1088,6 +1166,17 @@ impl TableRowSource {
         match self {
             Self::Resident(data) => Ok(data.row_by_id(row_id).map(TableRowRef::Resident)),
             Self::Paged(manifest) => manifest.row_by_id(row_id),
+        }
+    }
+
+    fn projected_values_by_id(
+        &self,
+        row_id: i64,
+        projection_indexes: &[usize],
+    ) -> Result<Option<Vec<Value>>> {
+        match self {
+            Self::Resident(data) => data.projected_values_by_id(row_id, projection_indexes),
+            Self::Paged(manifest) => manifest.projected_values_by_id(row_id, projection_indexes),
         }
     }
 
@@ -2257,6 +2346,20 @@ impl EngineRuntime {
         if !config.defer_table_materialization || runtime.deferred_tables.is_empty() {
             runtime.rebuild_indexes(pager.page_size())?;
         }
+        // DDB-002/DDB-003: When defer_table_materialization is true, eagerly
+        // hydrate all indexes for deferred tables. This ensures that the first
+        // query for each index is fast (sub-millisecond) instead of triggering
+        // lazy index hydration which can take multiple seconds for large tables.
+        // The table data is loaded temporarily, indexes are built, row locators
+        // are cached, and then the table is re-deferred to free memory.
+        if config.defer_table_materialization && !runtime.deferred_tables.is_empty() {
+            runtime.hydrate_all_deferred_table_indexes(
+                pager,
+                wal,
+                pager.page_size(),
+                snapshot_lsn,
+            )?;
+        }
         Ok(runtime)
     }
 
@@ -2514,6 +2617,87 @@ impl EngineRuntime {
             self.cache_deferred_paged_row_locators(&canonical_table_name, state, chunks.as_ref())?;
         }
         self.redefer_persisted_tables(&[canonical_table_name.as_str()]);
+        Ok(())
+    }
+
+    /// Eagerly hydrates all indexes for all deferred tables. This is called
+    /// during database open when `defer_table_materialization` is true to
+    /// ensure that subsequent queries are fast. For each deferred table with
+    /// indexes, this function:
+    /// 1. Reads the table manifest from disk (once per table)
+    /// 2. Builds all indexes for the table
+    /// 3. Caches row locators for paged tables
+    /// 4. Re-defers the table (removes data from memory)
+    ///
+    /// This makes database open slower but ensures that the first query for
+    /// each index is fast (sub-millisecond instead of multi-second).
+    ///
+    /// Note: Only tables with paged manifests can be re-deferred after hydration.
+    /// Non-paged tables are skipped to avoid leaving them loaded in memory.
+    pub(crate) fn hydrate_all_deferred_table_indexes(
+        &mut self,
+        pager: &PagerHandle,
+        wal: &WalHandle,
+        page_size: u32,
+        snapshot_lsn: u64,
+    ) -> Result<()> {
+        let deferred_tables: Vec<String> = self.deferred_tables.iter().cloned().collect();
+        for table_name in deferred_tables {
+            let Some(state) = self.persisted_tables.get(&table_name).copied() else {
+                continue;
+            };
+
+            if !state.pointer.is_table_paged_manifest() {
+                continue;
+            }
+
+            let has_indexes = self.catalog.indexes.values().any(|index| {
+                identifiers_equal(&index.table_name, &table_name) && index.kind == IndexKind::Btree
+            });
+            if !has_indexes {
+                continue;
+            }
+
+            let store = SnapshotPageStore {
+                pager,
+                wal,
+                snapshot_lsn,
+            };
+            let row_source = TableRowSource::Paged(Arc::new(read_table_page_manifest_from_state(
+                &store, state,
+            )?));
+            let row_count = row_source.row_count();
+            if let Some(ps) = self.persisted_tables_mut().get_mut(&table_name) {
+                ps.row_count = row_count;
+                ps.tail = read_uncompressed_overflow_tail(&store, ps.pointer)?.unwrap_or_default();
+            }
+            self.tables_mut().insert(table_name.clone(), row_source);
+            self.deferred_tables_mut().remove(&table_name);
+
+            let indexes_for_table: Vec<String> = self
+                .catalog
+                .indexes
+                .values()
+                .filter(|index| {
+                    identifiers_equal(&index.table_name, &table_name)
+                        && index.kind == IndexKind::Btree
+                        && !self.indexes.contains_key(&index.name)
+                })
+                .map(|index| index.name.clone())
+                .collect();
+            for index_name in indexes_for_table {
+                self.rebuild_index(&index_name, page_size)?;
+            }
+
+            let Some(TableRowSource::Paged(manifest)) = self.tables.get(&table_name) else {
+                return Err(DbError::internal(format!(
+                    "paged row source for {table_name} is missing after index hydration"
+                )));
+            };
+            let chunks = Arc::clone(&manifest.chunks);
+            self.cache_deferred_paged_row_locators(&table_name, state, chunks.as_ref())?;
+            self.redefer_persisted_tables(&[table_name.as_str()]);
+        }
         Ok(())
     }
 
@@ -9888,14 +10072,11 @@ impl EngineRuntime {
                 return Ok(None);
             }
             probe_steps = probe_steps.saturating_add(1);
-            if let Some(row) = row_source.row_by_id(row_id)? {
+            if let Some(values) = row_source.projected_values_by_id(row_id, projection_indexes)? {
                 if skipped < offset {
                     skipped += 1;
                 } else {
-                    rows.push(project_simple_projection_values(
-                        row.values(),
-                        projection_indexes,
-                    ));
+                    rows.push(QueryRow::new(values));
                 }
             }
             let Some(next_row_id) = row_id.checked_add(1) else {
@@ -10398,7 +10579,31 @@ impl EngineRuntime {
         limit: Option<usize>,
         offset: usize,
     ) -> Result<QueryResult> {
-        let mut rows = Vec::with_capacity(row_source.row_count());
+        let bounded_row_count = limit.map(|limit| limit.saturating_add(offset));
+        let mut rows = Vec::with_capacity(
+            bounded_row_count
+                .unwrap_or(row_source.row_count())
+                .min(row_source.row_count()),
+        );
+        if order_by.is_none() {
+            let mut skipped = 0usize;
+            for stored_row in row_source.rows() {
+                let stored_row = stored_row?;
+                if skipped < offset {
+                    skipped = skipped.saturating_add(1);
+                    continue;
+                }
+                if limit.is_some_and(|limit| rows.len() >= limit) {
+                    break;
+                }
+                rows.push(project_simple_projection_values(
+                    stored_row.values(),
+                    projection_indexes,
+                ));
+            }
+            return Ok(QueryResult::with_rows(column_names, rows));
+        }
+
         for stored_row in row_source.rows() {
             let stored_row = stored_row?;
             rows.push(project_simple_projection_values(
@@ -10456,7 +10661,27 @@ impl EngineRuntime {
         limit: Option<usize>,
         offset: usize,
     ) -> Result<QueryResult> {
-        let mut rows = Vec::with_capacity(state.row_count);
+        let bounded_row_count = limit.map(|limit| limit.saturating_add(offset));
+        let mut rows = Vec::with_capacity(
+            bounded_row_count
+                .unwrap_or(state.row_count)
+                .min(state.row_count),
+        );
+        if order_by.is_none() {
+            let mut skipped = 0usize;
+            visit_persisted_table_rows_until(store, state, |_, values| {
+                if skipped < offset {
+                    skipped = skipped.saturating_add(1);
+                    return Ok(false);
+                }
+                if limit.is_some_and(|limit| rows.len() >= limit) {
+                    return Ok(true);
+                }
+                rows.push(project_simple_projection_values(values, projection_indexes));
+                Ok(limit.is_some_and(|limit| rows.len() >= limit))
+            })?;
+            return Ok(QueryResult::with_rows(column_names, rows));
+        }
         visit_persisted_table_rows(store, state, |_, values| {
             rows.push(project_simple_projection_values(values, projection_indexes));
             Ok(())
@@ -10969,7 +11194,35 @@ impl EngineRuntime {
         limit: Option<usize>,
         offset: usize,
     ) -> Result<QueryResult> {
-        let mut rows = Vec::with_capacity(row_source.row_count());
+        let bounded_row_count = limit.map(|limit| limit.saturating_add(offset));
+        let mut rows = Vec::with_capacity(
+            bounded_row_count
+                .unwrap_or(row_source.row_count())
+                .min(row_source.row_count()),
+        );
+        if order_by.is_none() {
+            let mut skipped = 0usize;
+            for stored_row in row_source.rows() {
+                let stored_row = stored_row?;
+                let candidate = &stored_row.values()[filter_column_index];
+                if !simple_range_bound_matches(candidate, lower_bound, upper_bound)? {
+                    continue;
+                }
+                if skipped < offset {
+                    skipped = skipped.saturating_add(1);
+                    continue;
+                }
+                if limit.is_some_and(|limit| rows.len() >= limit) {
+                    break;
+                }
+                rows.push(project_simple_projection_values(
+                    stored_row.values(),
+                    projection_indexes,
+                ));
+            }
+            return Ok(QueryResult::with_rows(column_names, rows));
+        }
+
         for stored_row in row_source.rows() {
             let stored_row = stored_row?;
             let candidate = &stored_row.values()[filter_column_index];
@@ -11042,7 +11295,31 @@ impl EngineRuntime {
         limit: Option<usize>,
         offset: usize,
     ) -> Result<QueryResult> {
-        let mut rows = Vec::with_capacity(state.row_count);
+        let bounded_row_count = limit.map(|limit| limit.saturating_add(offset));
+        let mut rows = Vec::with_capacity(
+            bounded_row_count
+                .unwrap_or(state.row_count)
+                .min(state.row_count),
+        );
+        if order_by.is_none() {
+            let mut skipped = 0usize;
+            visit_persisted_table_rows_until(store, state, |_, values| {
+                let candidate = &values[filter_column_index];
+                if !simple_range_bound_matches(candidate, lower_bound, upper_bound)? {
+                    return Ok(false);
+                }
+                if skipped < offset {
+                    skipped = skipped.saturating_add(1);
+                    return Ok(false);
+                }
+                if limit.is_some_and(|limit| rows.len() >= limit) {
+                    return Ok(true);
+                }
+                rows.push(project_simple_projection_values(values, projection_indexes));
+                Ok(limit.is_some_and(|limit| rows.len() >= limit))
+            })?;
+            return Ok(QueryResult::with_rows(column_names, rows));
+        }
         visit_persisted_table_rows(store, state, |_, values| {
             let candidate = &values[filter_column_index];
             if !simple_range_bound_matches(candidate, lower_bound, upper_bound)? {
@@ -11778,13 +12055,8 @@ impl EngineRuntime {
         let canonical_table_name = table_schema.name.as_str();
         if let Some(row_source) = self.visible_table_row_source(canonical_table_name) {
             let rows = row_source
-                .row_by_id(request.lookup_row_id)?
-                .map(|stored_row| {
-                    vec![project_simple_projection_values(
-                        stored_row.values(),
-                        request.projection_indexes,
-                    )]
-                })
+                .projected_values_by_id(request.lookup_row_id, request.projection_indexes)?
+                .map(|values| vec![QueryRow::new(values)])
                 .unwrap_or_default();
             return Ok(Some(QueryResult::with_shared_columns(
                 Arc::clone(&request.column_names),
@@ -36197,6 +36469,71 @@ mod tests {
         assert_eq!(result.columns(), &["id".to_string()]);
         assert_eq!(result.rows().len(), 1);
         assert_eq!(result.rows()[0].values(), &[Value::Int64(30)]);
+    }
+
+    #[test]
+    fn simple_projection_no_order_by_offset_limit_uses_fast_path() {
+        let mut runtime = EngineRuntime::empty(1);
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE songs (id INT64 PRIMARY KEY, title TEXT)",
+        );
+        for id in 1..=5 {
+            execute_sql(
+                &mut runtime,
+                &format!("INSERT INTO songs (id, title) VALUES ({id}, 't{id}')"),
+            );
+        }
+
+        let statement =
+            parse_sql_statement("SELECT id FROM songs LIMIT 3 OFFSET 2").expect("parse query");
+        let crate::sql::ast::Statement::Query(query) = &statement else {
+            panic!("expected query");
+        };
+
+        let result = runtime
+            .try_execute_simple_table_projection_query(query, &[])
+            .expect("execute")
+            .expect("simple table projection should stay on fast path");
+
+        assert_eq!(result.columns(), &["id".to_string()]);
+        assert_eq!(result.rows().len(), 3);
+        assert_eq!(result.rows()[0].values(), &[Value::Int64(3)]);
+        assert_eq!(result.rows()[1].values(), &[Value::Int64(4)]);
+        assert_eq!(result.rows()[2].values(), &[Value::Int64(5)]);
+    }
+
+    #[test]
+    fn simple_filtered_projection_no_order_by_offset_limit_uses_fast_path() {
+        let mut runtime = EngineRuntime::empty(1);
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE users (id INT64 PRIMARY KEY, age INT64)",
+        );
+        for (id, age) in [(1, 21), (2, 22), (3, 23), (4, 24), (5, 25)] {
+            execute_sql(
+                &mut runtime,
+                &format!("INSERT INTO users (id, age) VALUES ({id}, {age})"),
+            );
+        }
+
+        let statement = parse_sql_statement(
+            "SELECT id FROM users WHERE age >= 22 AND age <= 25 LIMIT 2 OFFSET 1",
+        )
+        .expect("parse filtered query");
+        let crate::sql::ast::Statement::Query(query) = &statement else {
+            panic!("expected query");
+        };
+
+        let result = runtime
+            .try_execute_simple_filtered_projection_query(query, &[])
+            .expect("execute")
+            .expect("filtered projection should stay on fast path");
+
+        assert_eq!(result.columns(), &["id".to_string()]);
+        assert_eq!(result.rows().len(), 2);
+        assert_eq!(result.rows()[0].values(), &[Value::Int64(3)]);
+        assert_eq!(result.rows()[1].values(), &[Value::Int64(4)]);
     }
 
     #[test]

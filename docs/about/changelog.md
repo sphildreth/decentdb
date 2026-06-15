@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.13.0] - [2026-06-15]
+
+### Added
+
+- Added the default-on connection-local plan cache (ADR 0190-0194). It reuses
+  parsed parameterized statements and prepared-plan bundles across calls within
+  a `Db` handle, keyed by `(sql_text, parameter_shape,
+  persistent_schema_cookie, temp_schema_cookie, policy_mask_generation)`.
+  Diagnostics are exposed through `sys.plan_cache`,
+  `sys.plan_cache_summary`, `sys.doctor_findings`, `PRAGMA flush_plan_cache`,
+  C ABI `ddb_plan_cache_summary` / `ddb_plan_cache_flush`, and
+  `decentdb plan-cache stats|list|reset`. C ABI open options
+  `plan_cache_enabled` and `plan_cache_max_bytes` are additive and do not bump
+  the C ABI version.
+- Added `cargo bench -p decentdb --bench plan_cache` and
+  `benchmarks/rust-baseline --plan-cache-benchmark` guardrail benchmarks.
+  Local validation showed repeated point-lookup preparation at 643K ops/s with
+  the cache enabled vs 188K ops/s disabled, one-shot query throughput within
+  the guardrail at 435 ops/s enabled vs 442 ops/s disabled, and warm churn
+  preparation at 100K ops/s enabled vs 43K ops/s disabled.
+- Added cost and cardinality estimates to rendered physical plans, including
+  explicit `HashJoin`, `IndexedJoin`, `StreamingAggregate`, `ViewScan`, and
+  `ExpandedView` plan nodes for planner diagnostics. `EXPLAIN` now surfaces
+  estimated rows and relative cost for planned read operators, and the EXPLAIN
+  planner can use persisted `ANALYZE` statistics to compare table scans, row-id
+  lookups, index seeks, and simple inner-join alternatives.
+
+### Changed
+
+- Improved prepared read hot paths for row-id, row-id range, and simple row-id
+  join projections by reusing bounded resident paged row sources when the
+  runtime snapshot is current. This avoids repeated deferred-table row-source
+  reloads for medium-sized prepared lookup workloads while preserving the
+  existing deferred-table memory cap and re-defer behavior.
+- Reduced unnecessary row materialization in simple projection paths by reading
+  projected values directly for row-id lookups and by applying unordered
+  `LIMIT/OFFSET` while scanning simple table and filtered projection fast paths.
+- Switched the in-process reader registry from a hash map to reusable reader
+  slots so repeated reader registration avoids avoidable hot-path overhead.
+- Regenerated the native benchmark summary and README benchmark chart assets
+  from the latest `embedded_compare` run.
+
+### Fixed
+
+- Protected one-shot literal SQL from plan-cache churn by bypassing the
+  generalized parsed cache for zero-parameter execution and using second-use
+  admission for parameterized parsed statements.
+- Eagerly hydrate all B-tree indexes for deferred tables
+  on database open when `defer_table_materialization` is enabled. Previously,
+  each secondary index was lazily hydrated on first query, causing multi-second
+  delays (12+ seconds for 1M row tables) on the first query for each index.
+  Now all indexes are loaded during open, ensuring sub-millisecond query
+  performance from the first execution. This trades slightly slower database
+  open time for consistently fast query performance, which is critical for
+  request-path workloads like Melodee's MusicBrainz lookups.
+
 ## [2.12.0] - [2026-06-13]
 
 ### Added

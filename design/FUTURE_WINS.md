@@ -50,9 +50,8 @@ Accepted high-leverage themes:
   adding arbitrary native extension loading
 - keep DecentDB-owned tooling contracts authoritative while Decent Bench owns
   rich IDE/codegen workflows
-- eliminate redundant parse and plan work through query plan caching and
-  prepared-statement reuse so that high-throughput embedded workloads get
-  competitive performance without application-level tuning
+- build on delivered query plan caching and prepared-statement reuse so that
+  future planner work starts from measured cache-hit behavior
 - bound result materialization through streaming and cursor-based result sets so
   that embedded hosts with limited memory can query large datasets safely
 - make offline-first conflict resolution ergonomic through declarative merge
@@ -108,6 +107,7 @@ instead of brand-new roadmap items.
 | Browser SQL/API parity and production web hardening | [`WIN_BROWSER_SQL_API_PARITY_PRODUCTION_WEB_SPEC.md`](WIN_BROWSER_SQL_API_PARITY_PRODUCTION_WEB_SPEC.md); [`docs/api/wasm.md`](../docs/api/wasm.md); [`bindings/web/README.md`](../bindings/web/README.md) | Browser now has the `browser-app-v2` SQL profile, checked-in parity corpus, stable browser SQL errors, protocol/capability metadata, transaction/savepoint APIs, prepared statement paging, OPFS lifecycle guards/diagnostics, relay apply-before-ack helpers, framework recipes, and benchmark guardrails. Future browser work should target measured parser breadth, TDE/key handling, branch workflows, or browser-specific performance rather than this parity baseline. |
 | Mobile production runtime and SDK hardening | [`WIN_MOBILE_PRODUCTION_RUNTIME_SDK_HARDENING_SPEC.md`](WIN_MOBILE_PRODUCTION_RUNTIME_SDK_HARDENING_SPEC.md); ADR 0181-0183; [`docs/api/dart.md`](../docs/api/dart.md); [`bindings/dart/flutter/README.md`](../bindings/dart/flutter/README.md) | Flutter mobile now has a package shell, Android/iOS artifact scripts and GitHub Actions workflow, mobile native loading defaults, redacted open-option diagnostics, key-provider helpers, async worker lifecycle docs/tests, public changeset apply-before-ack wrappers, and mobile storage/sidecar guidance. Follow-on mobile work should target measured device matrices, native Swift/Kotlin SDKs, watch lifecycle guarantees, or key rotation rather than first-class package hardening. |
 | Default-fast performance and storage efficiency | [`WIN_DEFAULT_FAST_PERFORMANCE_STORAGE_EFFICIENCY_SPEC.md`](WIN_DEFAULT_FAST_PERFORMANCE_STORAGE_EFFICIENCY_SPEC.md); ADR 0184; [`docs/user-guide/performance.md`](../docs/user-guide/performance.md); [`docs/api/configuration.md`](../docs/api/configuration.md) | **Priority #1 complete:** durable defaults keep the historical 4 MiB cache after executor fast-path fixes recovered read headroom, while explicit low-memory/balanced/tuned durable profile helpers provide 4 MiB, 16 MiB, and 64 MiB options. The delivered slice includes canonical benchmark profile metadata, Python binding hot-path benchmark slices, storage/cold-state metadata, prepared-insert fast-path fixes, transaction-scoped prepared batches for repeated Rust inserts, runtime-only covering-index execution for safe `INCLUDE (...)` projections, parser-bypass metadata/row-id reads for plain `COUNT(*)` and integer primary-key projections, deferred table materialization behavior that preserves valid indexes, scalar aggregate fast paths that scan persisted payload columns without forcing full row materialization, lazy default-open work for checkpoint/reactive/coordination/empty-schema maintenance, and a green rust-baseline smoke/medium/full/huge comparison against the checked-in historical default-profile results. Follow-on performance work should be measured and scoped to new evidence, not this completed baseline. |
+| Query plan caching and prepared-statement reuse | [`WIN_QUERY_PLAN_CACHING_AND_STATEMENT_REUSE.md`](WIN_QUERY_PLAN_CACHING_AND_STATEMENT_REUSE.md); ADR 0190-0194; [`docs/user-guide/performance.md`](../docs/user-guide/performance.md#plan-cache) | Connection-local parsed AST and prepared-plan bundle caches are delivered with default-on bounded memory, invalidation, diagnostics, CLI/C ABI access, Doctor guidance, and native/rust-baseline guardrail benchmarks. Future plan-cache work should be scoped as process-global sharing, object-level invalidation, or binding-specific throughput work. |
 | Benchmark profiles and release assets | [`BENCHMARKING_GUIDE.md`](BENCHMARKING_GUIDE.md), `crates/decentdb-benchmark`, `data/bench_summary.json` | Performance work should target measured default and tuned profiles, storage efficiency, cold-open behavior, and release-chart regressions. |
 
 ## Status Map
@@ -120,8 +120,8 @@ Status values:
 - `BACKLOG`: valuable, but not part of the near-term implementation path.
 
 Future version values are planning buckets, not release commitments. The latest
-public release in this repository is `2.12.0`. `vNext` means the first release
-bucket after `2.12.0` only when scope is explicitly accepted. `vNext+1` and
+public release in this repository is `2.13.0`. `vNext` means the first release
+bucket after `2.13.0` only when scope is explicitly accepted. `vNext+1` and
 `vNext+2` are follow-on planning buckets, not exact semantic versions.
 
 Roadmap lifecycle: once a Future Win is 100% implemented, tested, and
@@ -137,29 +137,28 @@ shipped foundation affects follow-on roadmap decisions.
 | 4 | vNext+1 | TODO | Online schema change execution | Needs ADR/spec; follows branch migration design | Completes the migration story by reducing reader/write disruption during large table rebuilds and index work |
 | 5 | vNext+1 | TODO | Backend sync bridge for existing app databases, Postgres first | Needs ADR/spec | Makes DecentDB easier to adopt in apps that already have a central Postgres/Supabase-style backend |
 | 6 | vNext+1 | TODO | Resource governance, quotas, and automated maintenance | Needs ADR/spec; follows browser/mobile/runtime diagnostics | Embedded hosts need explicit storage, WAL, memory, quota, and maintenance behavior to avoid runaway local resource use |
-| 7 | vNext+1 | TODO | Query plan caching and prepared-statement reuse | [`WIN_QUERY_PLAN_CACHING_AND_STATEMENT_REUSE.md`](WIN_QUERY_PLAN_CACHING_AND_STATEMENT_REUSE.md); needs ADR/spec | ORMs and binding layers expect plan reuse; reduces CPU overhead for repeated queries; affects Priority #2 (fast reads) and Priority #3 (ergonomic bindings) |
-| 8 | vNext+1 | TODO | Streaming and cursor-based result sets | Needs ADR/spec | Memory-bounded hosts need bounded result materialization; enables resource governance and affects large-query adoption |
-| 9 | vNext+2 | TODO | Offline-first conflict resolution UX and declarative merge policies | Needs ADR/spec; builds on shipped sync and changeset surfaces | Local-first differentiator; competitors handle conflict UX poorly; declarative merge policies make sync adoption easier |
-| 10 | vNext+2 | TODO | Schema migration file management and CLI | Needs ADR/spec; complements branch-aware migration rehearsal | Developer-experience gap for version-tracked migration scripts and framework integration |
-| 11 | vNext+2 | TODO | Observability bridge: OpenTelemetry and structured export | Needs ADR/spec; follows tracing/advisors | Production teams need external observability to justify DecentDB over SQLite; builds on item 2 |
-| 12 | vNext+2 | TODO | Binding ergonomics and performance contract | Needs ADR/spec | No current roadmap item addresses connection pooling, batch APIs, and cross-target performance guarantees for maintained bindings |
-| 13 | Later | BACKLOG | Incrementally maintained projections | Needs ADR/spec | Accelerates dashboards, local read models, and reactive query workloads |
-| 14 | Later | BACKLOG | JSONB binary storage and JSON path indexing | Needs ADR/spec | Important for JSON-heavy workloads and now a SQLite baseline expectation |
-| 15 | Later | BACKLOG | Hybrid local search: FTS, trigram, vector, and rank fusion | FTS foundation is delivered; vector and rank fusion need ADR/spec | More compelling than standalone HNSW: apps want keyword, substring, semantic, and relational filters together |
-| 16 | Later | BACKLOG | Authenticated encryption, key rotation, and platform key-store helpers | ADR 0174 follow-up | TDE v1 provides local confidentiality; regulated deployments eventually need tamper-evident page/chunk authentication, key rotation, and turnkey OS/browser/mobile key-store guidance |
-| 17 | Later | BACKLOG | Agent and tooling integration mode | [`STABLE_TOOLING_METADATA_CONTRACT.md`](STABLE_TOOLING_METADATA_CONTRACT.md); needs ADR/spec | Makes the agent-friendly promise concrete without putting LLM behavior in the engine |
-| 18 | Later | BACKLOG | Reliability validation, fault injection, and deterministic replay | [`TESTING_STRATEGY.md`](TESTING_STRATEGY.md); needs ADR/spec for replay capture | Raises confidence in ACID/concurrency changes and makes production bugs reproducible without weakening hot paths |
-| 19 | Later | BACKLOG | Application and support bundle format | Needs ADR/spec | Useful portable artifact and diagnostics story, but should follow security/redaction foundations |
-| 20 | Later | BACKLOG | Temporal row history and auditable state | Needs ADR/spec | Strong regulated/support workflow, but should follow security, audit context, and sync hardening |
-| 21 | Later | BACKLOG | Structured CDC and logical change feeds | Change streams, public changesets, and sync journal are delivered; needs ADR/spec | Lets DecentDB feed event-driven systems without becoming a message broker or bypassing local transactions |
-| 22 | Later | BACKLOG | Curated Lua extension ecosystem | Lua runtime/package model is delivered; needs ADR/spec outside core engine if registry semantics affect trust | Turns safe extensibility into an adoption moat while preserving the no-native-extension stance |
-| 23 | Later | BACKLOG | Multi-tenant scoped isolation | Needs ADR/spec | Narrow scoped-visibility mechanism distinct from shipped masking and excluded server-style auth; enables SaaS-embedded patterns |
-| 24 | Later | BACKLOG | Unicode collation and internationalization profile | Query-time built-in and Lua collations are delivered; needs ADR/spec for ICU/data-size strategy | International apps need correct Unicode sort/search semantics, but portability and binary size make it a later tradeoff |
-| 25 | Later | BACKLOG | Advanced SQL compatibility surface | [`WIN_ADVANCED_SQL_COMPATIBILITY_SURFACE.md`](WIN_ADVANCED_SQL_COMPATIBILITY_SURFACE.md) | Useful adoption polish after higher-impact runtime, recovery, migration, and workflow blockers |
-| 26 | Later | BACKLOG | Advanced geospatial semantics and analytics | ADR 0128 deferred work; needs follow-up ADR/spec | Builds on shipped spatial support without implying the foundation is unfinished |
-| 27 | Later | BACKLOG | Deterministic testing and binding snapshot assertions | Needs ADR/spec; follows reliability validation | Binding-level test infrastructure and deterministic assertion patterns improve Priority #3 confidence |
-| 28 | Later | BACKLOG | WAL streaming replication | Needs ADR/spec | Useful HA/read-scale story, but weaker than local-first sync and PITR for DecentDB identity |
-| 29 | Later | BACKLOG | Cloud-native object storage VFS and WASI edge profiles | Needs ADR/spec | Interesting edge/serverless story with high durability, consistency, packaging, and cache-invalidation complexity |
+| 7 | vNext+1 | TODO | Streaming and cursor-based result sets | Needs ADR/spec | Memory-bounded hosts need bounded result materialization; enables resource governance and affects large-query adoption |
+| 8 | vNext+2 | TODO | Offline-first conflict resolution UX and declarative merge policies | Needs ADR/spec; builds on shipped sync and changeset surfaces | Local-first differentiator; competitors handle conflict UX poorly; declarative merge policies make sync adoption easier |
+| 9 | vNext+2 | TODO | Schema migration file management and CLI | Needs ADR/spec; complements branch-aware migration rehearsal | Developer-experience gap for version-tracked migration scripts and framework integration |
+| 10 | vNext+2 | TODO | Observability bridge: OpenTelemetry and structured export | Needs ADR/spec; follows tracing/advisors | Production teams need external observability to justify DecentDB over SQLite; builds on item 2 |
+| 11 | vNext+2 | TODO | Binding ergonomics and performance contract | Needs ADR/spec | No current roadmap item addresses connection pooling, batch APIs, and cross-target performance guarantees for maintained bindings |
+| 12 | Later | BACKLOG | Incrementally maintained projections | Needs ADR/spec | Accelerates dashboards, local read models, and reactive query workloads |
+| 13 | Later | BACKLOG | JSONB binary storage and JSON path indexing | Needs ADR/spec | Important for JSON-heavy workloads and now a SQLite baseline expectation |
+| 14 | Later | BACKLOG | Hybrid local search: FTS, trigram, vector, and rank fusion | FTS foundation is delivered; vector and rank fusion need ADR/spec | More compelling than standalone HNSW: apps want keyword, substring, semantic, and relational filters together |
+| 15 | Later | BACKLOG | Authenticated encryption, key rotation, and platform key-store helpers | ADR 0174 follow-up | TDE v1 provides local confidentiality; regulated deployments eventually need tamper-evident page/chunk authentication, key rotation, and turnkey OS/browser/mobile key-store guidance |
+| 16 | Later | BACKLOG | Agent and tooling integration mode | [`STABLE_TOOLING_METADATA_CONTRACT.md`](STABLE_TOOLING_METADATA_CONTRACT.md); needs ADR/spec | Makes the agent-friendly promise concrete without putting LLM behavior in the engine |
+| 17 | Later | BACKLOG | Reliability validation, fault injection, and deterministic replay | [`TESTING_STRATEGY.md`](TESTING_STRATEGY.md); needs ADR/spec for replay capture | Raises confidence in ACID/concurrency changes and makes production bugs reproducible without weakening hot paths |
+| 18 | Later | BACKLOG | Application and support bundle format | Needs ADR/spec | Useful portable artifact and diagnostics story, but should follow security/redaction foundations |
+| 19 | Later | BACKLOG | Temporal row history and auditable state | Needs ADR/spec | Strong regulated/support workflow, but should follow security, audit context, and sync hardening |
+| 20 | Later | BACKLOG | Structured CDC and logical change feeds | Change streams, public changesets, and sync journal are delivered; needs ADR/spec | Lets DecentDB feed event-driven systems without becoming a message broker or bypassing local transactions |
+| 21 | Later | BACKLOG | Curated Lua extension ecosystem | Lua runtime/package model is delivered; needs ADR/spec outside core engine if registry semantics affect trust | Turns safe extensibility into an adoption moat while preserving the no-native-extension stance |
+| 22 | Later | BACKLOG | Multi-tenant scoped isolation | Needs ADR/spec | Narrow scoped-visibility mechanism distinct from shipped masking and excluded server-style auth; enables SaaS-embedded patterns |
+| 23 | Later | BACKLOG | Unicode collation and internationalization profile | Query-time built-in and Lua collations are delivered; needs ADR/spec for ICU/data-size strategy | International apps need correct Unicode sort/search semantics, but portability and binary size make it a later tradeoff |
+| 24 | Later | BACKLOG | Advanced SQL compatibility surface | [`WIN_ADVANCED_SQL_COMPATIBILITY_SURFACE.md`](WIN_ADVANCED_SQL_COMPATIBILITY_SURFACE.md) | Useful adoption polish after higher-impact runtime, recovery, migration, and workflow blockers |
+| 25 | Later | BACKLOG | Advanced geospatial semantics and analytics | ADR 0128 deferred work; needs follow-up ADR/spec | Builds on shipped spatial support without implying the foundation is unfinished |
+| 26 | Later | BACKLOG | Deterministic testing and binding snapshot assertions | Needs ADR/spec; follows reliability validation | Binding-level test infrastructure and deterministic assertion patterns improve Priority #3 confidence |
+| 27 | Later | BACKLOG | WAL streaming replication | Needs ADR/spec | Useful HA/read-scale story, but weaker than local-first sync and PITR for DecentDB identity |
+| 28 | Later | BACKLOG | Cloud-native object storage VFS and WASI edge profiles | Needs ADR/spec | Interesting edge/serverless story with high durability, consistency, packaging, and cache-invalidation complexity |
 
 ## Positioning
 
@@ -445,59 +444,6 @@ harm the host even when DecentDB remains logically correct.
 - keep accounting cheap; avoid full-page or full-table walks on every write
 - do not auto-delete named snapshots, branches, sync data, or audit records
   without explicit retained-policy configuration
-
-## 7. Query Plan Caching And Prepared-Statement Reuse
-
-**Status:** `TODO`
-
-**Future Version:** vNext+1
-
-**Source of truth:** [`WIN_QUERY_PLAN_CACHING_AND_STATEMENT_REUSE.md`](WIN_QUERY_PLAN_CACHING_AND_STATEMENT_REUSE.md); needs ADR/spec before implementation.
-
-### Why This Matters
-
-DecentDB currently parses, resolves, and plans every SQL statement from scratch
-unless the caller uses a prepared statement that the executor replays. Even
-prepared statements re-validate schema cookies and re-bind parameters on every
-execution. ORMs, binding layers, and application frameworks commonly execute the
-same parameterized queries thousands of times in a session. Each redundant parse
-and plan cycle costs CPU, increases p99 latency, and makes DecentDB harder to
-recommend for high-throughput embedded workloads where SQLite and PostgreSQL
-already cache compiled plans.
-
-This is both a performance concern and an adoption concern. Teams evaluating
-embedded databases expect prepared statements to avoid re-parsing. The default
-fast performance win shipped in ADR 0184 covers executor fast paths but does not
-address plan caching or statement reuse. Without a caching layer, DecentDB's
-prepared-statement throughput has a measurable overhead floor that binding layers
-cannot work around.
-
-### Desired Capability
-
-- compiled plan cache keyed by SQL text with parameterized and schema-dependent
-  separation
-- schema-cookie or catalog-generation invalidation that evicts stale plans without
-  re-parsing every statement
-- plan reuse across prepared statements within the same database connection
-- optional cross-connection plan sharing through a process-global plan cache with
-  safe invalidation semantics
-- cache size limits with LRU or generation-based eviction tuned for embedded
-  memory constraints
-- `sys.*` diagnostics for cache hit rates, eviction counts, and cache memory use
-- C ABI and maintained binding surfaces for plan cache configuration and inspection
-- benchmark guardrails that measure prepared-statement throughput before and after
-  plan caching
-
-### Guardrails
-
-- do not cache plans across schema changes without correct invalidation
-- do not share mutable plan state across connections without safe concurrency
-- do not increase default resident memory beyond the accepted low-memory profile
-- do not make plan caching mandatory; embedded hosts must be able to disable it
-- keep the one-writer/many-readers model intact; plan caching must not introduce
-  hidden write-path contention
-- measure and publish the overhead of cache lookup versus the savings; if the
-  cache hit path adds measurable overhead to one-shot queries, provide a bypass
 
 ## 8. Streaming And Cursor-Based Result Sets
 
@@ -1350,8 +1296,6 @@ Promoted as distinct roadmap items:
 - structured CDC and logical change feeds
 - curated Lua extension ecosystem
 - Unicode collation and internationalization profile
-- query plan caching and prepared-statement reuse (adoption and performance
-  concern; ORMs and binding layers expect plan reuse)
 - streaming and cursor-based result sets (resource governance and adoption
   concern; embedded hosts need bounded materialization)
 - offline-first conflict resolution UX and declarative merge policies
@@ -1421,9 +1365,9 @@ Not promoted because the premise is already delivered or the idea is off-lane:
    optional tuning-only feature.
 6. Promote authenticated encryption/key-rotation work only after the v1 TDE and
    policy surfaces have production feedback and a follow-up ADR.
-7. Design query plan caching and prepared-statement reuse as a performance and
-   adoption win that complements the shipped executor fast paths without changing
-   file format or durability semantics.
+7. Build on delivered query plan caching and prepared-statement reuse when
+   scoping process-global sharing, finer-grained invalidation, or binding
+   throughput work.
 8. Design streaming and cursor-based result sets as a resource-governance
    building block that enables bounded result materialization for embedded hosts.
 9. Design offline-first conflict resolution UX and declarative merge policies

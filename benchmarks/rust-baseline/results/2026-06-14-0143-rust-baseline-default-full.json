@@ -1,0 +1,155 @@
+{
+  "binding": "RustRaw",
+  "scale_name": "full",
+  "benchmark_profile": "default",
+  "target_artists": 50000,
+  "target_albums": 500000,
+  "target_songs_cap": 5000000,
+  "started_unix": 1781401391,
+  "finished_unix": 1781401397,
+  "engine_version": "2.12.0",
+  "database_path": "run-rust-full.ddb",
+  "database_size_bytes": 161189888,
+  "wal_size_bytes": 32,
+  "peak_rss_bytes": 920961024,
+  "steps": [
+    {
+      "name": "connect_open",
+      "duration_seconds": 0.003418851,
+      "records": null,
+      "records_per_second": null,
+      "rss_bytes": 36773888,
+      "rss_anon_kb": 26212,
+      "rss_file_kb": 9700,
+      "extra": {}
+    },
+    {
+      "name": "schema_create",
+      "duration_seconds": 0.006530295,
+      "records": null,
+      "records_per_second": null,
+      "rss_bytes": 12042240,
+      "rss_anon_kb": 2060,
+      "rss_file_kb": 9700,
+      "extra": {}
+    },
+    {
+      "name": "seed_artists",
+      "duration_seconds": 0.059443315,
+      "records": 50000,
+      "records_per_second": 841137.4769391647,
+      "rss_bytes": 30965760,
+      "rss_anon_kb": 20540,
+      "rss_file_kb": 9700,
+      "extra": {}
+    },
+    {
+      "name": "seed_albums",
+      "duration_seconds": 0.483928914,
+      "records": 500000,
+      "records_per_second": 1033209.6006976761,
+      "rss_bytes": 203214848,
+      "rss_anon_kb": 188752,
+      "rss_file_kb": 9700,
+      "extra": {}
+    },
+    {
+      "name": "seed_songs",
+      "duration_seconds": 2.152952953,
+      "records": 2749816,
+      "records_per_second": 1277229.953477762,
+      "rss_bytes": 708395008,
+      "rss_anon_kb": 682092,
+      "rss_file_kb": 9700,
+      "extra": {}
+    },
+    {
+      "name": "checkpoint_after_seed",
+      "duration_seconds": 0.37668491,
+      "records": null,
+      "records_per_second": null,
+      "rss_bytes": 538857472,
+      "rss_anon_kb": 516528,
+      "rss_file_kb": 9700,
+      "extra": {
+        "checkpoint_mode": "wal",
+        "database_bytes_after": 161189888,
+        "database_bytes_before": 8192,
+        "wal_bytes_after": 32,
+        "wal_bytes_before": 167772160
+      }
+    },
+    {
+      "name": "query_count_songs",
+      "duration_seconds": 2.255628445,
+      "records": null,
+      "records_per_second": null,
+      "rss_bytes": 920961024,
+      "rss_anon_kb": 889676,
+      "rss_file_kb": 9700,
+      "extra": {
+        "count": 2749816
+      }
+    },
+    {
+      "name": "query_aggregate_durations",
+      "duration_seconds": 0.128085938,
+      "records": null,
+      "records_per_second": null,
+      "rss_bytes": 920961024,
+      "rss_anon_kb": 889676,
+      "rss_file_kb": 9700,
+      "extra": {}
+    },
+    {
+      "name": "query_artist_by_id",
+      "duration_seconds": 0.000036439,
+      "records": null,
+      "records_per_second": null,
+      "rss_bytes": 920961024,
+      "rss_anon_kb": 889676,
+      "rss_file_kb": 9700,
+      "extra": {}
+    },
+    {
+      "name": "query_top10_artists_by_songs",
+      "duration_seconds": 0.060630014,
+      "records": null,
+      "records_per_second": null,
+      "rss_bytes": 590491648,
+      "rss_anon_kb": 566952,
+      "rss_file_kb": 9700,
+      "extra": {}
+    },
+    {
+      "name": "query_top10_albums_by_songs",
+      "duration_seconds": 0.205375591,
+      "records": null,
+      "records_per_second": null,
+      "rss_bytes": 590487552,
+      "rss_anon_kb": 566948,
+      "rss_file_kb": 9700,
+      "extra": {}
+    },
+    {
+      "name": "query_view_first_1000",
+      "duration_seconds": 0.00197519,
+      "records": null,
+      "records_per_second": null,
+      "rss_bytes": 590671872,
+      "rss_anon_kb": 567128,
+      "rss_file_kb": 9700,
+      "extra": {}
+    },
+    {
+      "name": "query_songs_for_artist_via_view",
+      "duration_seconds": 0.000297319,
+      "records": null,
+      "records_per_second": null,
+      "rss_bytes": 590671872,
+      "rss_anon_kb": 567128,
+      "rss_file_kb": 9700,
+      "extra": {}
+    }
+  ]
+}

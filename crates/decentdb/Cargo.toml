@@ -72,6 +72,10 @@ name = "micro_hot_paths_callgrind"
 harness = false
 required-features = ["bench-internals"]
 
+[[bench]]
+name = "plan_cache"
+harness = false
+
 [[bin]]
 name = "wal_fuzz"
 test = false

@@ -184,8 +184,8 @@ ddb_status_t ddb_db_open_or_create(const char *path, ddb_db_t **out_db);
  * wal_checkpoint_threshold_bytes, process_coordination,
  * process_coordination_timeout_ms, write_queue_enabled, write_queue_capacity,
  * write_queue_default_timeout_ms, write_queue_strict_group_commit,
- * write_queue_max_batch, write_queue_max_group_delay_us, encryption_key, and
- * encryption_key_hex.
+ * write_queue_max_batch, write_queue_max_group_delay_us, plan_cache_enabled,
+ * plan_cache_max_bytes, encryption_key, and encryption_key_hex.
  */
 ddb_status_t ddb_db_create_with_options(const char *path, const char *options, ddb_db_t **out_db);
 ddb_status_t ddb_db_open_with_options(const char *path, const char *options, ddb_db_t **out_db);
@@ -224,6 +224,27 @@ ddb_status_t ddb_db_set_audit_context_text(
     size_t value_len
 );
 ddb_status_t ddb_db_clear_audit_context(ddb_db_t *db, const char *key);
+
+/* Plan cache diagnostics (F023 / ADR 0193). */
+
+typedef struct ddb_plan_cache_summary {
+    /* Static engine-owned string. Do not pass this pointer to ddb_string_free. */
+    const char *scope;
+    uint64_t total_entries;
+    uint64_t total_hits;
+    uint64_t total_misses;
+    uint64_t total_evictions;
+    uint64_t total_size_bytes;
+    uint64_t max_size_bytes;
+    uint64_t total_oversized_refusals;
+    double hit_rate;
+} ddb_plan_cache_summary_t;
+
+ddb_status_t ddb_plan_cache_summary(
+    ddb_db_t *db,
+    ddb_plan_cache_summary_t *out_summary
+);
+ddb_status_t ddb_plan_cache_flush(ddb_db_t *db);
 
 /*
  * On success, ownership of the returned statement handle transfers to the caller.

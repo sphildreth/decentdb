@@ -5,12 +5,21 @@ pub(crate) mod physical;
 
 use crate::catalog::{identifiers_equal, CatalogState, IndexKind, TableSchema};
 use crate::error::Result;
+use crate::record::value::Value;
 use crate::sql::ast::{
     BinaryOp, Expr, FromItem, JoinConstraint, JoinKind, Query, QueryBody, Select, SelectItem,
     Statement,
 };
+use crate::sql::parser::parse_sql_statement;
 
-use self::physical::PhysicalPlan;
+use self::physical::{PhysicalPlan, PlanEstimate};
+
+const PLANNER_TABLE_ROWS_HEURISTIC: u64 = 1_000;
+const PLANNER_ROWS_PER_PAGE: f64 = 100.0;
+const PLANNER_EQ_SELECTIVITY_WITH_STATS: f64 = 0.10;
+const PLANNER_EQ_SELECTIVITY_WITHOUT_STATS: f64 = 0.10;
+const PLANNER_RANGE_SELECTIVITY: f64 = 0.30;
+const PLANNER_LIKE_SELECTIVITY: f64 = 0.05;
 
 pub(crate) fn plan_statement(
     statement: &Statement,
@@ -19,7 +28,9 @@ pub(crate) fn plan_statement(
     match statement {
         Statement::Query(query) => plan_query(query, catalog),
         Statement::Explain(explain) => plan_statement(&explain.statement, catalog),
-        _ => Ok(PhysicalPlan::Empty),
+        _ => Ok(PhysicalPlan::Empty {
+            estimate: PlanEstimate::ZERO,
+        }),
     }
 }
 
@@ -31,6 +42,7 @@ pub(crate) fn plan_query(query: &Query, catalog: &CatalogState) -> Result<Physic
             .unwrap_or_else(|| PhysicalPlan::Sort {
                 input: Box::new(plan),
                 order_by: query.order_by.clone(),
+                estimate: PlanEstimate::ZERO,
             });
     }
     if query.limit.is_some() || query.offset.is_some() {
@@ -38,15 +50,18 @@ pub(crate) fn plan_query(query: &Query, catalog: &CatalogState) -> Result<Physic
             input: Box::new(plan),
             limit: query.limit.clone(),
             offset: query.offset.clone(),
+            estimate: PlanEstimate::ZERO,
         };
     }
-    Ok(plan)
+    Ok(annotate_plan(plan, catalog))
 }
 
 fn plan_query_body(query: &QueryBody, catalog: &CatalogState) -> Result<PhysicalPlan> {
     match query {
         QueryBody::Select(select) => plan_select(select, catalog),
-        QueryBody::Values(_) => Ok(PhysicalPlan::Empty),
+        QueryBody::Values(_) => Ok(PhysicalPlan::Empty {
+            estimate: PlanEstimate::ZERO,
+        }),
         QueryBody::SetOperation {
             op,
             all,
@@ -57,13 +72,16 @@ fn plan_query_body(query: &QueryBody, catalog: &CatalogState) -> Result<Physical
             all: *all,
             left: Box::new(plan_query_body(left, catalog)?),
             right: Box::new(plan_query_body(right, catalog)?),
+            estimate: PlanEstimate::ZERO,
         }),
     }
 }
 
 fn plan_select(select: &Select, catalog: &CatalogState) -> Result<PhysicalPlan> {
     let mut plan = if select.from.is_empty() {
-        PhysicalPlan::Empty
+        PhysicalPlan::Empty {
+            estimate: PlanEstimate::ZERO,
+        }
     } else {
         plan_from_item(&select.from[0], catalog)?
     };
@@ -73,6 +91,7 @@ fn plan_select(select: &Select, catalog: &CatalogState) -> Result<PhysicalPlan> 
             right: Box::new(plan_from_item(item, catalog)?),
             kind: JoinKind::Inner,
             constraint: JoinConstraint::On(Expr::Literal(crate::record::value::Value::Bool(true))),
+            estimate: PlanEstimate::ZERO,
         };
     }
 
@@ -83,34 +102,48 @@ fn plan_select(select: &Select, catalog: &CatalogState) -> Result<PhysicalPlan> 
             plan = PhysicalPlan::Filter {
                 input: Box::new(plan),
                 predicate: filter.clone(),
+                estimate: PlanEstimate::ZERO,
             };
         }
     }
     if !select.group_by.is_empty() || projection_has_aggregate(select) {
-        plan = PhysicalPlan::Aggregate {
+        plan = PhysicalPlan::StreamingAggregate {
             input: Box::new(plan),
             group_by: select.group_by.clone(),
             having: select.having.clone(),
+            estimate: PlanEstimate::ZERO,
         };
     }
     plan = PhysicalPlan::Project {
         input: Box::new(plan),
         items: select.projection.clone(),
+        estimate: PlanEstimate::ZERO,
     };
+    let plan = rewrite_join_order(plan, select, catalog)?;
     Ok(plan)
 }
 
 fn plan_from_item(item: &FromItem, catalog: &CatalogState) -> Result<PhysicalPlan> {
     Ok(match item {
-        FromItem::Table { name, .. } => PhysicalPlan::TableScan {
-            table: if catalog.view(name).is_some() {
-                format!("view:{name}")
+        FromItem::Table { name, .. } => {
+            if catalog.view(name).is_some() {
+                if let Some(plan) = maybe_expand_view(name, catalog)? {
+                    return Ok(plan);
+                }
+                PhysicalPlan::ViewScan {
+                    name: name.clone(),
+                    estimate: PlanEstimate::ZERO,
+                }
             } else {
-                name.clone()
-            },
-        },
+                PhysicalPlan::TableScan {
+                    table: name.clone(),
+                    estimate: PlanEstimate::ZERO,
+                }
+            }
+        }
         FromItem::Function { name, alias, .. } => PhysicalPlan::TableScan {
             table: alias.clone().unwrap_or_else(|| format!("tvf:{name}")),
+            estimate: PlanEstimate::ZERO,
         },
         FromItem::Subquery { query, .. } => plan_query(query, catalog)?,
         FromItem::Join {
@@ -121,16 +154,689 @@ fn plan_from_item(item: &FromItem, catalog: &CatalogState) -> Result<PhysicalPla
         } => {
             if let Some(plan) = maybe_spatial_join_plan(left, right, *kind, constraint, catalog)? {
                 plan
+            } else if let Some(plan) = maybe_join_plan(left, right, *kind, constraint, catalog) {
+                plan
             } else {
                 PhysicalPlan::NestedLoopJoin {
                     left: Box::new(plan_from_item(left, catalog)?),
                     right: Box::new(plan_from_item(right, catalog)?),
                     kind: *kind,
                     constraint: constraint.clone(),
+                    estimate: PlanEstimate::ZERO,
                 }
             }
         }
     })
+}
+
+fn rewrite_join_order(
+    original_plan: PhysicalPlan,
+    select: &Select,
+    catalog: &CatalogState,
+) -> Result<PhysicalPlan> {
+    if select.from.len() < 2
+        || !select
+            .from
+            .iter()
+            .all(|item| matches!(item, FromItem::Table { .. }))
+    {
+        return Ok(original_plan);
+    }
+    rewrite_join_order_by_stats(select.from.as_slice(), select.filter.as_ref(), catalog)
+}
+
+fn rewrite_join_order_by_stats(
+    from_items: &[FromItem],
+    filter: Option<&Expr>,
+    catalog: &CatalogState,
+) -> Result<PhysicalPlan> {
+    let mut table_plans = Vec::with_capacity(from_items.len());
+    for item in from_items {
+        table_plans.push(plan_from_item(item, catalog)?);
+    }
+    let mut tables = Vec::with_capacity(table_plans.len());
+    for (index, item) in from_items.iter().enumerate() {
+        let (table, alias) = match item {
+            FromItem::Table { name, alias } => (name.as_str(), alias.as_ref()),
+            _ => {
+                return Ok(PhysicalPlan::Empty {
+                    estimate: PlanEstimate::ZERO,
+                })
+            }
+        };
+        let columns = catalog.table(table).map_or_else(Vec::new, |table| {
+            table
+                .columns
+                .iter()
+                .map(|column| column.name.clone())
+                .collect()
+        });
+        let annotated = annotate_plan(table_plans[index].clone(), catalog);
+        tables.push(JoinTableRelation {
+            name: table.to_string(),
+            alias: alias.cloned(),
+            columns,
+            plan: annotated,
+        });
+    }
+
+    if tables.len() < 2 {
+        return Ok(tables.into_iter().next().map_or_else(
+            || PhysicalPlan::Empty {
+                estimate: PlanEstimate::ZERO,
+            },
+            |table| table.plan,
+        ));
+    }
+
+    let join_predicates = filter
+        .filter(|filter| !filter_is_always_true(filter))
+        .map(|filter| collect_join_predicates(tables.as_slice(), filter))
+        .unwrap_or_default();
+
+    if tables.len() <= 6 {
+        build_left_deep_join_plan_dp(&tables, &join_predicates, catalog)
+    } else {
+        build_greedy_left_deep_join_plan(&tables, &join_predicates, catalog)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct JoinTableRelation {
+    name: String,
+    alias: Option<String>,
+    columns: Vec<String>,
+    plan: PhysicalPlan,
+}
+
+impl JoinTableRelation {
+    fn estimate_rows(&self) -> u64 {
+        self.plan.estimate().rows.max(1)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct JoinPredicate {
+    left_table: usize,
+    right_table: usize,
+    left_column: String,
+    right_column: String,
+    expr: Expr,
+}
+
+fn collect_join_predicates(relations: &[JoinTableRelation], filter: &Expr) -> Vec<JoinPredicate> {
+    let mut predicates = Vec::new();
+    collect_join_predicates_recursive(relations, filter, &mut predicates);
+    predicates
+}
+
+fn collect_join_predicates_recursive(
+    relations: &[JoinTableRelation],
+    expr: &Expr,
+    out: &mut Vec<JoinPredicate>,
+) {
+    match expr {
+        Expr::Binary {
+            left,
+            op: BinaryOp::And,
+            right,
+        } => {
+            collect_join_predicates_recursive(relations, left, out);
+            collect_join_predicates_recursive(relations, right, out);
+        }
+        Expr::Binary {
+            left,
+            op: BinaryOp::Eq,
+            right,
+        } => {
+            let Some((left_table, left_column)) = relation_column_from_expr(left, relations) else {
+                return;
+            };
+            let Some((right_table, right_column)) = relation_column_from_expr(right, relations)
+            else {
+                return;
+            };
+            if left_table == right_table {
+                return;
+            }
+            out.push(JoinPredicate {
+                left_table,
+                right_table,
+                left_column,
+                right_column,
+                expr: Expr::Binary {
+                    left: left.clone(),
+                    op: BinaryOp::Eq,
+                    right: right.clone(),
+                },
+            });
+        }
+        Expr::Binary {
+            left,
+            op: BinaryOp::Or,
+            right,
+        } => {
+            collect_join_predicates_recursive(relations, left, out);
+            collect_join_predicates_recursive(relations, right, out);
+        }
+        _ => {}
+    }
+}
+
+fn relation_column_from_expr(
+    expr: &Expr,
+    relations: &[JoinTableRelation],
+) -> Option<(usize, String)> {
+    let Expr::Column { table, column } = expr else {
+        return None;
+    };
+    let with_qualifier = table.as_ref().and_then(|qualifier| {
+        relations
+            .iter()
+            .position(|relation| {
+                identifiers_equal(&relation.name, qualifier)
+                    || relation
+                        .alias
+                        .as_deref()
+                        .is_some_and(|alias| identifiers_equal(alias, qualifier))
+            })
+            .filter(|&index| relation_has_column(&relations[index], column))
+    });
+    if let Some(index) = with_qualifier {
+        return Some((index, column.clone()));
+    }
+    let matches = relations
+        .iter()
+        .enumerate()
+        .filter(|(_, relation)| relation_has_column(relation, column))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if matches.len() == 1 {
+        Some((matches[0], column.clone()))
+    } else {
+        None
+    }
+}
+
+fn relation_has_column(relation: &JoinTableRelation, column: &str) -> bool {
+    relation
+        .columns
+        .iter()
+        .any(|candidate| identifiers_equal(candidate, column))
+}
+
+fn filter_is_always_true(expr: &Expr) -> bool {
+    matches!(expr, Expr::Literal(Value::Bool(true)))
+}
+
+fn build_left_deep_join_plan_dp(
+    relations: &[JoinTableRelation],
+    join_predicates: &[JoinPredicate],
+    catalog: &CatalogState,
+) -> Result<PhysicalPlan> {
+    let relation_count = relations.len();
+    let total_states = 1_usize << relation_count;
+    let mut best: Vec<Option<(PlanEstimate, PhysicalPlan, u64)>> = vec![None; total_states];
+    for (index, relation) in relations.iter().enumerate() {
+        let mask = 1_usize << index;
+        let estimate = relation.plan.estimate();
+        best[mask] = Some((estimate, relation.plan.clone(), estimate.rows));
+    }
+
+    for mask in 1..total_states {
+        let Some((_, base_plan, base_rows)) = best[mask].as_ref().cloned() else {
+            continue;
+        };
+        for next in 0..relation_count {
+            let next_bit = 1_usize << next;
+            if mask & next_bit != 0 {
+                continue;
+            }
+            let Some(next_relation) = relations.get(next) else {
+                continue;
+            };
+            let on = predicates_to_join_expr(mask, next, join_predicates);
+            let right_index_name = on.as_ref().and_then(|_| {
+                index_name_for_relation_join_predicates(
+                    next,
+                    &next_relation.name,
+                    mask,
+                    join_predicates,
+                    catalog,
+                )
+            });
+            let candidate = choose_join_plan(
+                base_plan.clone(),
+                next_relation.plan.clone(),
+                on,
+                catalog,
+                None,
+                right_index_name,
+            );
+            let candidate = annotate_plan(candidate, catalog);
+            let next_mask = mask | next_bit;
+            let candidate_cost = candidate.estimate().cost;
+            let candidate_rows = candidate.estimate().rows.max(1).max(base_rows);
+            let candidate = (
+                PlanEstimate {
+                    rows: candidate_rows,
+                    cost: candidate_cost,
+                },
+                candidate,
+                candidate_rows,
+            );
+            if best[next_mask]
+                .as_ref()
+                .is_none_or(|(existing, _, _)| existing.cost > candidate_cost)
+            {
+                best[next_mask] = Some(candidate);
+            }
+        }
+    }
+    if let Some((_, plan, _)) = best[total_states - 1].clone() {
+        Ok(plan)
+    } else {
+        Ok(PhysicalPlan::Empty {
+            estimate: PlanEstimate::ZERO,
+        })
+    }
+}
+
+fn predicates_to_join_expr(
+    left_mask: usize,
+    right: usize,
+    predicates: &[JoinPredicate],
+) -> Option<Expr> {
+    let exprs: Vec<Expr> = predicates
+        .iter()
+        .filter(|predicate| {
+            (predicate.left_table == right && mask_has_relation(left_mask, predicate.right_table))
+                || (predicate.right_table == right
+                    && mask_has_relation(left_mask, predicate.left_table))
+        })
+        .map(|predicate| predicate.expr.clone())
+        .collect();
+    merge_predicates_by_and(exprs)
+}
+
+fn build_greedy_left_deep_join_plan(
+    relations: &[JoinTableRelation],
+    join_predicates: &[JoinPredicate],
+    catalog: &CatalogState,
+) -> Result<PhysicalPlan> {
+    if relations.is_empty() {
+        return Ok(PhysicalPlan::Empty {
+            estimate: PlanEstimate::ZERO,
+        });
+    }
+    let mut sorted_indexes: Vec<usize> = (0..relations.len()).collect();
+    sorted_indexes.sort_by_key(|index| relations[*index].estimate_rows());
+    let mut used_mask = 0_usize;
+    let first_index = sorted_indexes
+        .first()
+        .copied()
+        .expect("at least one join relation");
+    used_mask |= 1usize << first_index;
+    let first_relation = &relations[first_index];
+    let mut plan = first_relation.plan.clone();
+    for index in sorted_indexes {
+        let next_relation = &relations[index];
+        let next_bit = 1_usize << index;
+        if used_mask & next_bit != 0 {
+            continue;
+        }
+        let on = predicates_to_join_expr(used_mask, index, join_predicates);
+        let next_index_name = index_name_for_relation_join_predicates(
+            index,
+            &next_relation.name,
+            used_mask,
+            join_predicates,
+            catalog,
+        );
+        let candidate = annotate_plan(
+            choose_join_plan(
+                plan,
+                next_relation.plan.clone(),
+                on,
+                catalog,
+                None,
+                next_index_name,
+            ),
+            catalog,
+        );
+        plan = candidate;
+        used_mask |= next_bit;
+    }
+    Ok(plan)
+}
+
+fn mask_has_relation(mask: usize, relation_index: usize) -> bool {
+    (mask & (1_usize << relation_index)) != 0
+}
+
+fn choose_join_plan(
+    left: PhysicalPlan,
+    right: PhysicalPlan,
+    on: Option<Expr>,
+    catalog: &CatalogState,
+    left_index_name: Option<String>,
+    right_index_name: Option<String>,
+) -> PhysicalPlan {
+    let (Some(on), kind) = (on, JoinKind::Inner) else {
+        return PhysicalPlan::NestedLoopJoin {
+            left: Box::new(left),
+            right: Box::new(right),
+            kind: JoinKind::Inner,
+            constraint: JoinConstraint::On(Expr::Literal(Value::Bool(true))),
+            estimate: PlanEstimate::ZERO,
+        };
+    };
+    if is_simple_equi_join(&on) {
+        let indexed_candidates = [
+            right_index_name
+                .as_ref()
+                .map(|index| (index.clone(), false)),
+            left_index_name.as_ref().map(|index| (index.clone(), true)),
+        ];
+        let mut best: Option<PhysicalPlan> = None;
+        let mut best_cost = f64::INFINITY;
+        for (index_name, swap_sides) in indexed_candidates.into_iter().flatten() {
+            let candidate = if swap_sides {
+                PhysicalPlan::IndexedJoin {
+                    left: Box::new(right.clone()),
+                    right: Box::new(left.clone()),
+                    kind,
+                    on: swap_join_on_expr(&on),
+                    index: index_name,
+                    estimate: PlanEstimate::ZERO,
+                }
+            } else {
+                PhysicalPlan::IndexedJoin {
+                    left: Box::new(left.clone()),
+                    right: Box::new(right.clone()),
+                    kind,
+                    on: on.clone(),
+                    index: index_name,
+                    estimate: PlanEstimate::ZERO,
+                }
+            };
+            let cost = estimate_join_plan_cost(&candidate, catalog);
+            if cost < best_cost {
+                best_cost = cost;
+                best = Some(candidate);
+            }
+        }
+        if let Some(best) = best {
+            return best;
+        }
+        return PhysicalPlan::HashJoin {
+            left: Box::new(left),
+            right: Box::new(right),
+            kind,
+            on,
+            estimate: PlanEstimate::ZERO,
+        };
+    }
+    PhysicalPlan::NestedLoopJoin {
+        left: Box::new(left),
+        right: Box::new(right),
+        kind,
+        constraint: JoinConstraint::On(on),
+        estimate: PlanEstimate::ZERO,
+    }
+}
+
+fn estimate_join_plan_cost(plan: &PhysicalPlan, catalog: &CatalogState) -> f64 {
+    match plan {
+        PhysicalPlan::IndexedJoin {
+            left,
+            right,
+            on: _,
+            index,
+            ..
+        } => {
+            let left_plan = annotate_plan((**left).clone(), catalog);
+            let right_plan = annotate_plan((**right).clone(), catalog);
+            let right_rows = right_plan.estimate().rows.max(1);
+            let probe_cost = estimate_join_probe_cost(
+                right_rows,
+                index,
+                catalog,
+                &Expr::Literal(Value::Bool(true)),
+            );
+            left_plan.estimate().cost + (left_plan.estimate().rows as f64) * probe_cost
+        }
+        PhysicalPlan::HashJoin { left, right, .. } => {
+            let left_plan = annotate_plan((**left).clone(), catalog);
+            let right_plan = annotate_plan((**right).clone(), catalog);
+            left_plan.estimate().cost
+                + right_plan.estimate().cost
+                + left_plan.estimate().rows as f64
+        }
+        _ => {
+            let annotated = annotate_plan(plan.clone(), catalog);
+            annotated.estimate().cost
+        }
+    }
+}
+
+fn maybe_join_plan(
+    left: &FromItem,
+    right: &FromItem,
+    kind: JoinKind,
+    constraint: &JoinConstraint,
+    catalog: &CatalogState,
+) -> Option<PhysicalPlan> {
+    if kind != JoinKind::Inner {
+        return None;
+    }
+    let JoinConstraint::On(on) = constraint else {
+        return None;
+    };
+    let FromItem::Table {
+        name: left_name,
+        alias: left_alias,
+    } = left
+    else {
+        return None;
+    };
+    let FromItem::Table {
+        name: right_name,
+        alias: right_alias,
+    } = right
+    else {
+        return None;
+    };
+    let left_binding = TableBindingRef {
+        name: left_name,
+        alias: left_alias,
+    };
+    let right_binding = TableBindingRef {
+        name: right_name,
+        alias: right_alias,
+    };
+    let left_plan = plan_from_item(left, catalog).ok()?;
+    let right_plan = plan_from_item(right, catalog).ok()?;
+    let left_index = join_side_index_name(catalog, left_binding, on);
+    let right_index = join_side_index_name(catalog, right_binding, on);
+    Some(choose_join_plan(
+        left_plan,
+        right_plan,
+        Some(on.clone()),
+        catalog,
+        left_index,
+        right_index,
+    ))
+}
+
+fn join_side_index_name(
+    catalog: &CatalogState,
+    binding: TableBindingRef<'_>,
+    constraint: &Expr,
+) -> Option<String> {
+    for expr in flattened_join_predicate_columns(constraint) {
+        let Some(column_ref) = qualified_column_ref_expr(expr) else {
+            continue;
+        };
+        if matches_table_binding(binding, column_ref.table) {
+            if let Some(index_name) = catalog.indexes.values().find_map(|index| {
+                if !identifiers_equal(&index.table_name, binding.name)
+                    || index.columns.len() != 1
+                    || index.predicate_sql.is_some()
+                    || !index.fresh
+                {
+                    return None;
+                }
+                match &index.columns[0].column_name {
+                    Some(indexed_column)
+                        if identifiers_equal(indexed_column, column_ref.column) =>
+                    {
+                        Some(index.name.clone())
+                    }
+                    _ => None,
+                }
+            }) {
+                return Some(index_name);
+            }
+        }
+    }
+    None
+}
+
+fn index_name_for_table_column(
+    catalog: &CatalogState,
+    table_name: &str,
+    column_name: &str,
+) -> Option<String> {
+    if column_name.is_empty() {
+        return None;
+    }
+    catalog.indexes.values().find_map(|index| {
+        if !identifiers_equal(&index.table_name, table_name)
+            || index.columns.len() != 1
+            || index.predicate_sql.is_some()
+            || index.columns[0].column_name.as_deref().is_none()
+            || !index.fresh
+            || index.kind != IndexKind::Btree
+        {
+            return None;
+        }
+        let indexed_column = index.columns[0].column_name.as_ref()?;
+        if identifiers_equal(indexed_column, column_name) {
+            Some(index.name.clone())
+        } else {
+            None
+        }
+    })
+}
+
+fn index_name_for_relation_join_predicates(
+    relation_index: usize,
+    relation_name: &str,
+    used_mask: usize,
+    predicates: &[JoinPredicate],
+    catalog: &CatalogState,
+) -> Option<String> {
+    for predicate in predicates {
+        if predicate.left_table == relation_index
+            && used_mask_has_any_relation(used_mask, predicate.right_table)
+        {
+            if let Some(index_name) =
+                index_name_for_table_column(catalog, relation_name, &predicate.left_column)
+            {
+                return Some(index_name);
+            }
+        }
+        if predicate.right_table == relation_index
+            && used_mask_has_any_relation(used_mask, predicate.left_table)
+        {
+            if let Some(index_name) =
+                index_name_for_table_column(catalog, relation_name, &predicate.right_column)
+            {
+                return Some(index_name);
+            }
+        }
+    }
+    None
+}
+
+fn used_mask_has_any_relation(mask: usize, relation: usize) -> bool {
+    (mask & (1_usize << relation)) != 0
+}
+
+fn merge_predicates_by_and(predicates: Vec<Expr>) -> Option<Expr> {
+    let mut merged = None;
+    for predicate in predicates {
+        match merged {
+            None => merged = Some(predicate),
+            Some(existing) => {
+                merged = Some(Expr::Binary {
+                    left: Box::new(existing),
+                    op: BinaryOp::And,
+                    right: Box::new(predicate),
+                });
+            }
+        }
+    }
+    merged
+}
+
+fn swap_join_on_expr(expr: &Expr) -> Expr {
+    match expr {
+        Expr::Binary {
+            left,
+            op: BinaryOp::And,
+            right,
+        } => Expr::Binary {
+            left: Box::new(swap_join_on_expr(left)),
+            op: BinaryOp::And,
+            right: Box::new(swap_join_on_expr(right)),
+        },
+        Expr::Binary {
+            left,
+            op: BinaryOp::Eq,
+            right,
+        } => Expr::Binary {
+            left: right.clone(),
+            op: BinaryOp::Eq,
+            right: left.clone(),
+        },
+        _ => expr.clone(),
+    }
+}
+
+fn is_simple_equi_join(expr: &Expr) -> bool {
+    match expr {
+        Expr::Binary {
+            left,
+            op: BinaryOp::Eq,
+            right,
+        } => {
+            matches!(left.as_ref(), Expr::Column { .. })
+                && matches!(right.as_ref(), Expr::Column { .. })
+        }
+        Expr::Binary {
+            left,
+            op: BinaryOp::And,
+            right,
+        } => is_simple_equi_join(left) && is_simple_equi_join(right),
+        _ => false,
+    }
+}
+
+fn flattened_join_predicate_columns(expr: &Expr) -> Vec<&Expr> {
+    match expr {
+        Expr::Binary {
+            left,
+            op: BinaryOp::And,
+            right,
+        } => {
+            let mut parts = flattened_join_predicate_columns(left);
+            parts.extend(flattened_join_predicate_columns(right));
+            parts
+        }
+        _ => vec![expr],
+    }
 }
 
 fn maybe_spatial_join_plan(
@@ -196,11 +902,13 @@ fn maybe_spatial_join_plan(
             table: table.name.to_string(),
             index: index.name.clone(),
             predicate: on.clone(),
+            estimate: PlanEstimate::ZERO,
             input: Box::new(PhysicalPlan::NestedLoopJoin {
                 left: Box::new(plan_from_item(left, catalog)?),
                 right: Box::new(plan_from_item(right, catalog)?),
                 kind,
                 constraint: constraint.clone(),
+                estimate: PlanEstimate::ZERO,
             }),
         }));
     }
@@ -232,6 +940,7 @@ fn maybe_index_plan(
             table: table.name.clone(),
             index: index.name.clone(),
             predicate: filter.clone(),
+            estimate: PlanEstimate::ZERO,
         });
     }
     let (column_name, uses_like) = simple_indexable_filter(filter)?;
@@ -243,6 +952,7 @@ fn maybe_index_plan(
                 table: table.name.clone(),
                 column: row_id_alias.to_string(),
                 predicate: filter.clone(),
+                estimate: PlanEstimate::ZERO,
             });
         }
     }
@@ -273,18 +983,21 @@ fn maybe_index_plan(
             table: table.name.clone(),
             index: index.name.clone(),
             predicate: filter.clone(),
+            estimate: PlanEstimate::ZERO,
         }
     } else if select_projection_is_covered_by_index(select, table, index) {
         PhysicalPlan::CoveringIndexSeek {
             table: table.name.clone(),
             index: index.name.clone(),
             predicate: filter.clone(),
+            estimate: PlanEstimate::ZERO,
         }
     } else {
         PhysicalPlan::IndexSeek {
             table: table.name.clone(),
             index: index.name.clone(),
             predicate: filter.clone(),
+            estimate: PlanEstimate::ZERO,
         }
     })
 }
@@ -439,6 +1152,7 @@ fn maybe_spatial_knn_plan(
         table: table.name.clone(),
         index: index.name.clone(),
         order: order.expr.clone(),
+        estimate: PlanEstimate::ZERO,
         input: Box::new(input.clone()),
     })
 }
@@ -499,8 +1213,10 @@ fn maybe_ordered_row_id_scan_plan(query: &Query, catalog: &CatalogState) -> Opti
         input: Box::new(PhysicalPlan::OrderedRowIdScan {
             table: table.name.clone(),
             column: column.name.clone(),
+            estimate: PlanEstimate::ZERO,
         }),
         items: select.projection.clone(),
+        estimate: PlanEstimate::ZERO,
     })
 }
 
@@ -792,6 +1508,563 @@ fn expr_has_aggregate(expr: &Expr) -> bool {
         Expr::Cast { expr, .. } => expr_has_aggregate(expr),
         Expr::Literal(_) | Expr::Column { .. } | Expr::Parameter(_) => false,
     }
+}
+
+fn annotate_plan(plan: PhysicalPlan, catalog: &CatalogState) -> PhysicalPlan {
+    match plan {
+        PhysicalPlan::TableScan { table, .. } => {
+            let rows = estimate_table_rows(catalog, &table);
+            PhysicalPlan::TableScan {
+                table,
+                estimate: PlanEstimate {
+                    rows,
+                    cost: scan_cost_u64(rows),
+                },
+            }
+        }
+        PhysicalPlan::IndexSeek {
+            table,
+            index,
+            predicate,
+            ..
+        } => {
+            let table_rows = estimate_table_rows(catalog, &table);
+            let rows = estimate_filter_rows(table_rows, &predicate, catalog);
+            PhysicalPlan::IndexSeek {
+                table,
+                index,
+                predicate,
+                estimate: PlanEstimate {
+                    rows,
+                    cost: 1.0 + scan_cost_u64(rows),
+                },
+            }
+        }
+        PhysicalPlan::CoveringIndexSeek {
+            table,
+            index,
+            predicate,
+            ..
+        } => {
+            let table_rows = estimate_table_rows(catalog, &table);
+            let rows = estimate_filter_rows(table_rows, &predicate, catalog);
+            PhysicalPlan::CoveringIndexSeek {
+                table,
+                index,
+                predicate,
+                estimate: PlanEstimate {
+                    rows,
+                    cost: scan_cost_u64(rows),
+                },
+            }
+        }
+        PhysicalPlan::RowIdLookup {
+            table,
+            column,
+            predicate,
+            ..
+        } => {
+            let table_rows = estimate_table_rows(catalog, &table);
+            PhysicalPlan::RowIdLookup {
+                table,
+                column,
+                predicate,
+                estimate: PlanEstimate {
+                    rows: 1,
+                    cost: 1.0 + (table_rows.max(1) as f64).log2(),
+                },
+            }
+        }
+        PhysicalPlan::OrderedRowIdScan { table, column, .. } => {
+            let rows = estimate_table_rows(catalog, &table);
+            PhysicalPlan::OrderedRowIdScan {
+                table,
+                column,
+                estimate: PlanEstimate {
+                    rows,
+                    cost: scan_cost_u64(rows),
+                },
+            }
+        }
+        PhysicalPlan::TrigramSearch {
+            table,
+            index,
+            predicate,
+            ..
+        } => {
+            let rows =
+                estimate_filter_rows(estimate_table_rows(catalog, &table), &predicate, catalog);
+            PhysicalPlan::TrigramSearch {
+                table,
+                index,
+                predicate,
+                estimate: PlanEstimate { rows, cost: 10.0 },
+            }
+        }
+        PhysicalPlan::SpatialFilter {
+            table,
+            index,
+            predicate,
+            ..
+        } => {
+            let rows =
+                estimate_filter_rows(estimate_table_rows(catalog, &table), &predicate, catalog);
+            PhysicalPlan::SpatialFilter {
+                table,
+                index,
+                predicate,
+                estimate: PlanEstimate {
+                    rows,
+                    cost: 1.0 + scan_cost_u64(rows),
+                },
+            }
+        }
+        PhysicalPlan::SpatialKnn {
+            table,
+            index,
+            order,
+            input,
+            ..
+        } => {
+            let input = Box::new(annotate_plan(*input, catalog));
+            let estimate = input.estimate();
+            PhysicalPlan::SpatialKnn {
+                table,
+                index,
+                order,
+                input,
+                estimate,
+            }
+        }
+        PhysicalPlan::SpatialJoin {
+            table,
+            index,
+            predicate,
+            input,
+            ..
+        } => {
+            let input = Box::new(annotate_plan(*input, catalog));
+            let estimate = input.estimate();
+            PhysicalPlan::SpatialJoin {
+                table,
+                index,
+                predicate,
+                input,
+                estimate,
+            }
+        }
+        PhysicalPlan::Filter {
+            input, predicate, ..
+        } => {
+            let input = Box::new(annotate_plan(*input, catalog));
+            let input_estimate = input.estimate();
+            let rows = ((input_estimate.rows as f64) * estimate_selectivity(&predicate, catalog))
+                .max(1.0) as u64;
+            PhysicalPlan::Filter {
+                input,
+                predicate,
+                estimate: PlanEstimate {
+                    rows,
+                    cost: input_estimate.cost,
+                },
+            }
+        }
+        PhysicalPlan::Project { input, items, .. } => {
+            let input = Box::new(annotate_plan(*input, catalog));
+            let estimate = input.estimate();
+            PhysicalPlan::Project {
+                input,
+                items,
+                estimate,
+            }
+        }
+        PhysicalPlan::NestedLoopJoin {
+            left,
+            right,
+            kind,
+            constraint,
+            ..
+        } => {
+            let left = Box::new(annotate_plan(*left, catalog));
+            let right = Box::new(annotate_plan(*right, catalog));
+            let left_estimate = left.estimate();
+            let right_estimate = right.estimate();
+            let selectivity = if kind == JoinKind::Inner {
+                estimate_join_selectivity(&constraint, catalog)
+            } else {
+                1.0
+            };
+            let rows = (left_estimate.rows as f64 * right_estimate.rows as f64 * selectivity)
+                .max(1.0) as u64;
+            let cost = left_estimate.cost + left_estimate.rows as f64 * right_estimate.cost;
+            PhysicalPlan::NestedLoopJoin {
+                left,
+                right,
+                kind,
+                constraint,
+                estimate: PlanEstimate { rows, cost },
+            }
+        }
+        PhysicalPlan::HashJoin {
+            left,
+            right,
+            kind,
+            on,
+            ..
+        } => {
+            let left = Box::new(annotate_plan(*left, catalog));
+            let right = Box::new(annotate_plan(*right, catalog));
+            let left_estimate = left.estimate();
+            let right_estimate = right.estimate();
+            let rows = (left_estimate.rows as f64
+                * right_estimate.rows as f64
+                * estimate_join_selectivity_constraint(&on, catalog))
+            .max(1.0) as u64;
+            let cost = left_estimate.cost + right_estimate.cost + left_estimate.rows as f64;
+            PhysicalPlan::HashJoin {
+                left,
+                right,
+                kind,
+                on,
+                estimate: PlanEstimate { rows, cost },
+            }
+        }
+        PhysicalPlan::IndexedJoin {
+            left,
+            right,
+            kind,
+            on,
+            index,
+            ..
+        } => {
+            let left = Box::new(annotate_plan(*left, catalog));
+            let right = Box::new(annotate_plan(*right, catalog));
+            let left_estimate = left.estimate();
+            let right_estimate = right.estimate();
+            let rows = (left_estimate.rows as f64
+                * right_estimate.rows as f64
+                * estimate_join_selectivity_constraint(&on, catalog))
+            .max(1.0) as u64;
+            let probe_cost =
+                estimate_join_probe_cost(right_estimate.rows.max(1), &index, catalog, &on);
+            let cost = left_estimate.cost + (left_estimate.rows as f64) * probe_cost;
+            PhysicalPlan::IndexedJoin {
+                left,
+                right,
+                kind,
+                on,
+                index,
+                estimate: PlanEstimate { rows, cost },
+            }
+        }
+        PhysicalPlan::StreamingAggregate {
+            input,
+            group_by,
+            having,
+            ..
+        } => {
+            let input = Box::new(annotate_plan(*input, catalog));
+            let input_estimate = input.estimate();
+            let rows = if group_by.is_empty() {
+                1
+            } else {
+                input_estimate.rows.max(1)
+            };
+            let rows = rows.min(input_estimate.rows.max(1));
+            PhysicalPlan::StreamingAggregate {
+                input,
+                group_by,
+                having,
+                estimate: PlanEstimate {
+                    rows,
+                    cost: input_estimate.cost,
+                },
+            }
+        }
+        PhysicalPlan::Sort {
+            input, order_by, ..
+        } => {
+            let input = Box::new(annotate_plan(*input, catalog));
+            let estimate = input.estimate();
+            PhysicalPlan::Sort {
+                input,
+                order_by,
+                estimate: PlanEstimate {
+                    rows: estimate.rows,
+                    cost: estimate.cost
+                        + (estimate.rows as f64) * (estimate.rows.max(2) as f64).log2()
+                            / PLANNER_ROWS_PER_PAGE,
+                },
+            }
+        }
+        PhysicalPlan::Limit {
+            input,
+            limit,
+            offset,
+            ..
+        } => {
+            let input = Box::new(annotate_plan(*input, catalog));
+            let input_estimate = input.estimate();
+            let limit_rows = literal_usize_to_rows(limit.as_ref());
+            let rows = if let Some(limit_rows) = limit_rows {
+                input_estimate.rows.min(limit_rows)
+            } else {
+                input_estimate.rows
+            };
+            let offset_rows = literal_usize_to_rows(offset.as_ref());
+            let rows = offset_rows.map_or(rows, |offset| rows.saturating_sub(offset));
+            PhysicalPlan::Limit {
+                input,
+                limit,
+                offset,
+                estimate: PlanEstimate {
+                    rows,
+                    cost: if input_estimate.rows == 0 {
+                        0.0
+                    } else {
+                        (rows as f64) / (input_estimate.rows as f64) * input_estimate.cost
+                    },
+                },
+            }
+        }
+        PhysicalPlan::SetOp {
+            op,
+            all,
+            left,
+            right,
+            ..
+        } => {
+            let left = Box::new(annotate_plan(*left, catalog));
+            let right = Box::new(annotate_plan(*right, catalog));
+            let left_estimate = left.estimate();
+            let right_estimate = right.estimate();
+            let rows = left_estimate.rows.saturating_add(right_estimate.rows);
+            PhysicalPlan::SetOp {
+                op,
+                all,
+                left,
+                right,
+                estimate: PlanEstimate {
+                    rows,
+                    cost: left_estimate.cost + right_estimate.cost,
+                },
+            }
+        }
+        PhysicalPlan::ViewScan { name, .. } => {
+            let rows = PLANNER_TABLE_ROWS_HEURISTIC;
+            PhysicalPlan::ViewScan {
+                name,
+                estimate: PlanEstimate {
+                    rows,
+                    cost: scan_cost_u64(rows),
+                },
+            }
+        }
+        PhysicalPlan::ExpandedView {
+            name,
+            input,
+            pushed_filter,
+            pushed_projection,
+            pushed_limit,
+            ..
+        } => {
+            let input = Box::new(annotate_plan(*input, catalog));
+            let estimate = input.estimate();
+            PhysicalPlan::ExpandedView {
+                name,
+                input,
+                pushed_filter,
+                pushed_projection,
+                pushed_limit,
+                estimate,
+            }
+        }
+        PhysicalPlan::Empty { .. } => PhysicalPlan::Empty {
+            estimate: PlanEstimate::ZERO,
+        },
+    }
+}
+
+fn estimate_table_rows(catalog: &CatalogState, table: &str) -> u64 {
+    catalog
+        .table_stats
+        .get(table)
+        .map_or(PLANNER_TABLE_ROWS_HEURISTIC, |stats| {
+            stats.row_count.max(0) as u64
+        })
+}
+
+fn scan_cost_u64(rows: u64) -> f64 {
+    (rows as f64 / PLANNER_ROWS_PER_PAGE).max(1.0)
+}
+
+fn estimate_filter_rows(row_count: u64, filter: &Expr, catalog: &CatalogState) -> u64 {
+    ((row_count as f64) * estimate_selectivity(filter, catalog)).max(1.0) as u64
+}
+
+fn estimate_selectivity(expr: &Expr, catalog: &CatalogState) -> f64 {
+    let _ = catalog;
+    match expr {
+        Expr::Binary { left, op, right } => match op {
+            BinaryOp::And => {
+                estimate_selectivity(left, catalog) * estimate_selectivity(right, catalog)
+            }
+            BinaryOp::Or => {
+                let left = estimate_selectivity(left, catalog);
+                let right = estimate_selectivity(right, catalog);
+                (left + right - (left * right)).min(1.0)
+            }
+            BinaryOp::Eq => {
+                let index_selectivity = estimate_eq_selectivity_with_expr(left, right);
+                index_selectivity.clamp(PLANNER_EQ_SELECTIVITY_WITHOUT_STATS, 1.0)
+            }
+            BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq => {
+                PLANNER_RANGE_SELECTIVITY
+            }
+            BinaryOp::NotEq => 1.0 - PLANNER_EQ_SELECTIVITY_WITHOUT_STATS,
+            _ => 1.0,
+        },
+        Expr::Like {
+            expr: _left,
+            pattern: right,
+            negated,
+            ..
+        } => {
+            if !negated && matches!(right.as_ref(), Expr::Literal(Value::Text(_))) {
+                PLANNER_LIKE_SELECTIVITY
+            } else {
+                1.0
+            }
+        }
+        Expr::Between { .. } => PLANNER_RANGE_SELECTIVITY,
+        Expr::InSubquery { .. } => PLANNER_RANGE_SELECTIVITY,
+        Expr::CompareSubquery { .. } => PLANNER_RANGE_SELECTIVITY,
+        Expr::Function { .. } => PLANNER_LIKE_SELECTIVITY,
+        Expr::ScalarSubquery(_) | Expr::Exists(_) => 1.0,
+        Expr::Collate { expr, .. } => estimate_selectivity(expr, catalog),
+        Expr::Cast { expr, .. } => estimate_selectivity(expr, catalog),
+        Expr::Unary { expr, .. } => estimate_selectivity(expr, catalog),
+        Expr::IsNull { expr, .. } => estimate_selectivity(expr, catalog),
+        Expr::InList { .. } => PLANNER_EQ_SELECTIVITY_WITHOUT_STATS,
+        Expr::Case { .. } => PLANNER_RANGE_SELECTIVITY,
+        Expr::Row(_) => PLANNER_RANGE_SELECTIVITY,
+        Expr::WindowFunction { .. } => 1.0,
+        Expr::Aggregate { .. } => 1.0,
+        Expr::RowNumber { .. } => 1.0,
+        Expr::Literal(_) | Expr::Parameter(_) | Expr::Column { .. } => 1.0,
+    }
+}
+
+fn estimate_eq_selectivity_with_expr(left: &Expr, right: &Expr) -> f64 {
+    let has_column = matches!(
+        (left, right),
+        (Expr::Column { .. }, Expr::Literal(_))
+            | (Expr::Column { .. }, Expr::Parameter(_))
+            | (Expr::Literal(_), Expr::Column { .. })
+            | (Expr::Parameter(_), Expr::Column { .. })
+    );
+    if has_column {
+        PLANNER_EQ_SELECTIVITY_WITHOUT_STATS
+    } else {
+        1.0
+    }
+}
+
+fn estimate_join_selectivity(on_constraint: &JoinConstraint, catalog: &CatalogState) -> f64 {
+    match on_constraint {
+        JoinConstraint::On(expr) => estimate_join_selectivity_constraint(expr, catalog),
+        JoinConstraint::Using(_) | JoinConstraint::Natural => 1.0,
+    }
+}
+
+fn estimate_join_selectivity_constraint(expr: &Expr, _catalog: &CatalogState) -> f64 {
+    match expr {
+        Expr::Binary {
+            left,
+            op: BinaryOp::Eq,
+            right: _right,
+        } => {
+            let left_is_col = matches!(left.as_ref(), Expr::Column { .. });
+            if left_is_col {
+                PLANNER_EQ_SELECTIVITY_WITH_STATS
+            } else {
+                1.0
+            }
+        }
+        Expr::Binary { left, op, right } => match op {
+            BinaryOp::And => {
+                estimate_join_selectivity_constraint(left, _catalog)
+                    * estimate_join_selectivity_constraint(right, _catalog)
+            }
+            BinaryOp::Or => {
+                let left = estimate_join_selectivity_constraint(left, _catalog);
+                let right = estimate_join_selectivity_constraint(right, _catalog);
+                (left + right - left * right).min(1.0)
+            }
+            _ => 1.0,
+        },
+        _ => 1.0,
+    }
+}
+
+fn estimate_join_probe_cost(
+    right_rows: u64,
+    _index: &str,
+    _catalog: &CatalogState,
+    _predicate: &Expr,
+) -> f64 {
+    (right_rows as f64).log2().max(1.0)
+}
+
+fn literal_usize_to_rows(expr: Option<&Expr>) -> Option<u64> {
+    let expr = expr?;
+    match expr {
+        Expr::Literal(Value::Int64(value)) => u64::try_from(*value).ok(),
+        Expr::Literal(Value::Decimal { scaled, scale: _ }) => u64::try_from(*scaled).ok(),
+        _ => None,
+    }
+}
+fn maybe_expand_view(name: &str, catalog: &CatalogState) -> Result<Option<PhysicalPlan>> {
+    let Some(view) = catalog.view(name) else {
+        return Ok(None);
+    };
+    let view_statement = parse_sql_statement(&view.sql_text)?;
+    let Statement::Query(view_query) = view_statement else {
+        return Ok(None);
+    };
+    if view_query.recursive
+        || !view_query.ctes.is_empty()
+        || !view_query.order_by.is_empty()
+        || view_query.limit.is_some()
+        || view_query.offset.is_some()
+    {
+        return Ok(None);
+    }
+    let QueryBody::Select(view_select) = &view_query.body else {
+        return Ok(None);
+    };
+    if view_select.distinct
+        || !view_select.distinct_on.is_empty()
+        || view_select.filter.is_some()
+        || !view_select.group_by.is_empty()
+        || view_select.having.is_some()
+        || projection_has_aggregate_items(&view_select.projection)
+    {
+        return Ok(None);
+    }
+    let inner_plan = plan_select(view_select, catalog)?;
+    Ok(Some(PhysicalPlan::ExpandedView {
+        name: view.name.clone(),
+        input: Box::new(inner_plan),
+        pushed_filter: false,
+        pushed_projection: false,
+        pushed_limit: false,
+        estimate: PlanEstimate::ZERO,
+    }))
+}
+
+fn projection_has_aggregate_items(items: &[SelectItem]) -> bool {
+    items.iter().any(select_item_has_aggregate)
 }
 
 #[cfg(test)]
