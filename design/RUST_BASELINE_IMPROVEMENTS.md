@@ -200,17 +200,17 @@ Only use `DONE` and `TODO` in the phase status column.
 | Phase | Status | Purpose | Primary files |
 |---:|---|---|---|
 | 0 | DONE | Review current README, implementation, existing benchmark docs, and external-agent findings. | This document |
-| 1 | TODO | Tighten benchmark contract, README framing, result metadata, and historical compatibility. | `benchmarks/rust-baseline/README.md`, `benchmarks/rust-baseline/src/main.rs` |
-| 2 | TODO | Add high-iteration latency-suite mode for music-library reads. | `benchmarks/rust-baseline/src/main.rs`, report HTML code |
-| 3 | TODO | Add concurrent-read and read-under-write suites. | `benchmarks/rust-baseline/src/main.rs` |
-| 4 | TODO | Add durable commit, update, delete, cold-open, and recovery-reopen suites. | `benchmarks/rust-baseline/src/main.rs`, optional helper child mode |
-| 5 | TODO | Add DuckDB engine support for the music-library workload. | `benchmarks/rust-baseline/Cargo.toml`, `benchmarks/rust-baseline/src/main.rs`, README |
-| 6 | TODO | Improve HTML report with cross-engine ratios, latency tables, and memory views. | `benchmarks/rust-baseline/src/main.rs` |
-| 7 | TODO | Add optional exploratory profiles and deferred workload extensions. | README, future design docs as needed |
+| 1 | DONE | Tighten benchmark contract, README framing, result metadata, and historical compatibility. | `benchmarks/rust-baseline/README.md`, `benchmarks/rust-baseline/src/main.rs` |
+| 2 | DONE | Add high-iteration latency-suite mode for music-library reads. | `benchmarks/rust-baseline/src/main.rs`, report HTML code |
+| 3 | DONE | Add concurrent-read and read-under-write suites. | `benchmarks/rust-baseline/src/main.rs` |
+| 4 | DONE | Add durable commit, update, delete, cold-open, and recovery-reopen suites. | `benchmarks/rust-baseline/src/main.rs`, optional helper child mode |
+| 5 | DONE | Add DuckDB engine support for the music-library workload. | `benchmarks/rust-baseline/Cargo.toml`, `benchmarks/rust-baseline/src/main.rs`, README |
+| 6 | DONE | Improve HTML report with cross-engine ratios, latency tables, and memory views. | `benchmarks/rust-baseline/src/main.rs` |
+| 7 | DONE | Add optional exploratory profiles and deferred workload extensions. | README, future design docs as needed |
 
 ## Phase 1: Benchmark Contract And Metadata
 
-Status: TODO
+Status: DONE
 
 ### Goal
 
@@ -345,7 +345,7 @@ Acceptance criteria:
 
 ## Phase 2: Music-Library Latency Suite
 
-Status: TODO
+Status: DONE
 
 ### Goal
 
@@ -471,7 +471,7 @@ Acceptance criteria:
 
 ## Phase 3: Concurrent Reads And Read Under Write
 
-Status: TODO
+Status: DONE
 
 ### Goal
 
@@ -617,7 +617,7 @@ Acceptance criteria:
 
 ## Phase 4: Writes, CRUD, Cold Open, And Recovery
 
-Status: TODO
+Status: DONE
 
 ### Goal
 
@@ -755,7 +755,7 @@ Acceptance criteria:
 
 ## Phase 5: DuckDB Music-Library Engine
 
-Status: TODO
+Status: DONE
 
 ### Goal
 
@@ -855,7 +855,7 @@ Acceptance criteria:
 
 ## Phase 6: HTML Report Improvements
 
-Status: TODO
+Status: DONE
 
 ### Goal
 
@@ -914,7 +914,7 @@ Acceptance criteria:
 
 ## Phase 7: Optional Exploratory Profiles And Deferred Workloads
 
-Status: TODO
+Status: DONE
 
 ### SQLite WAL NORMAL
 
@@ -1037,4 +1037,3 @@ This plan is complete when:
   runs and remains backward compatible with checked-in historical result files.
 - `cargo test --manifest-path benchmarks/rust-baseline/Cargo.toml` passes.
 - Smoke runs pass for every implemented engine and suite.
-
