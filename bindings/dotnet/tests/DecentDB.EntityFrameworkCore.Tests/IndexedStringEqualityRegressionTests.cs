@@ -1,4 +1,5 @@
 using System.Globalization;
+using DecentDB.AdoNet;
 using DecentDB.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore;
 using Xunit;
@@ -74,6 +75,45 @@ public sealed class IndexedStringEqualityRegressionTests : IDisposable
         Assert.Equal(targetRawId, rows[0].RawId);
     }
 
+    [Fact]
+    public void OrderedTake_AfterCheckpointAcrossReopenedContexts_ReturnsExpectedRow()
+    {
+        SeedData();
+        CheckpointDatabase();
+
+        var targetRawId = BuildRawId(TargetId);
+        using (var firstContext = CreateContext())
+        {
+            var firstRows = firstContext.Artists
+                .AsNoTracking()
+                .Where(x => x.RawId == targetRawId)
+                .OrderBy(x => x.Id)
+                .Take(1)
+                .ToArray();
+
+            Assert.Single(firstRows);
+            Assert.Equal(TargetId, firstRows[0].Id);
+        }
+
+        using var secondContext = CreateContext();
+        var secondQuery = secondContext.Artists
+            .AsNoTracking()
+            .Where(x => x.RawId == targetRawId)
+            .OrderBy(x => x.Id)
+            .Take(1);
+
+        var sql = secondQuery.ToQueryString();
+        AssertExactEqualityPredicate(sql, "raw_id", "targetRawId");
+        Assert.Contains("ORDER BY", sql, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("LIMIT", sql, StringComparison.OrdinalIgnoreCase);
+
+        var secondRows = secondQuery.ToArray();
+
+        Assert.Single(secondRows);
+        Assert.Equal(TargetId, secondRows[0].Id);
+        Assert.Equal(targetRawId, secondRows[0].RawId);
+    }
+
     private IndexedStringDbContext CreateContext()
     {
         var optionsBuilder = new DbContextOptionsBuilder<IndexedStringDbContext>();
@@ -98,6 +138,13 @@ public sealed class IndexedStringEqualityRegressionTests : IDisposable
 
         context.Artists.AddRange(artists);
         context.SaveChanges();
+    }
+
+    private void CheckpointDatabase()
+    {
+        using var connection = new DecentDBConnection($"Data Source={_dbPath}");
+        connection.Open();
+        connection.Checkpoint();
     }
 
     private static string BuildNormalizedName(int id)

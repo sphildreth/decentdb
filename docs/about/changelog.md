@@ -5,7 +5,18 @@ All notable changes to DecentDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.13.1] - [Unreleased]
+
+### Fixed
+
+- Kept deferred-table database open lazy while avoiding repeated secondary
+  index rebuilds across short-lived connections in the same process. The first
+  query for a specific deferred B-tree index may hydrate that one runtime
+  index, then a bounded process cache reuses the runtime index and paged row
+  locator cache for subsequent handles with the same persisted table snapshot.
+  This fixes Melodee's checkpointed MusicBrainz DDB-002/DDB-003 timeout
+  pattern without moving all multi-million-row index rebuild work into every
+  `Db::open`.
 
 ## [2.13.0] - [2026-06-15]
 
