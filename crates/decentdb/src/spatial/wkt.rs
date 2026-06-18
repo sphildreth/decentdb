@@ -416,4 +416,35 @@ mod tests {
             .expect("valid value");
         assert_eq!(reparsed, expected);
     }
+
+    #[test]
+    fn parse_empty_geometry_is_rejected() {
+        let parsed = from_wkt("SRID=3857;POINT EMPTY", 0);
+        assert!(parsed.is_err());
+
+        let msg = parsed.unwrap_err().to_string().to_lowercase();
+        assert!(msg.contains("missing geometry body") || msg.contains("parse"));
+    }
+
+    #[test]
+    fn parses_point_xy_with_srid() {
+        let parsed = from_wkt("SRID=4326;POINT(-122.4 47.6)", 0).expect("point parse");
+        assert_eq!(parsed.srid, 4326);
+        assert_eq!(parsed.dimensions, CoordinateDimensions::Xy);
+
+        let rendered = to_wkt(&parsed);
+        assert!(rendered.contains("POINT"));
+        assert!(rendered.contains("4326"));
+    }
+
+    #[test]
+    fn parses_polygon_xy() {
+        let parsed = from_wkt("SRID=3857;POLYGON((0 0,1 0,1 1,0 0),(2 2,3 2,3 3,2 2))", 0)
+            .expect("polygon parse");
+        assert_eq!(parsed.dimensions, CoordinateDimensions::Xy);
+        let SpatialGeometry::Polygon(polygons) = parsed.geometry else {
+            panic!("expected polygon")
+        };
+        assert_eq!(polygons.len(), 2);
+    }
 }

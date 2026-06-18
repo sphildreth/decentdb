@@ -153,6 +153,14 @@ The repository currently ships the `release_metrics` benchmark target:
 cargo bench -p decentdb
 ```
 
+For benchmark runs that produce files, write outputs under `.tmp/` or another
+explicitly ignored directory:
+
+- `--out-dir` (JSON/HTML reports): `.tmp/benchmarks/...`
+- Flamegraph / profiling artifacts: `.tmp/profiling/...`
+- Temporary benchmark scripts, throwaway analysis files, and exploratory command
+  wrappers: `.tmp/` workspaces
+
 The Rust-native benchmark runner also owns the Phase 1 concurrent-write
 regression hooks:
 
@@ -162,6 +170,9 @@ cargo run -p decentdb-benchmark -- run --profile smoke \
 cargo run -p decentdb-benchmark -- run --profile smoke \
   --scenario queued_writer_single --scenario queued_writer_read_under_write
 ```
+
+The benchmark output for those hooks should also be written to `.tmp/` (for
+example `.tmp/review-implementation/benchmarks/phase-1/`).
 
 The queued-writer scenarios execute the engine-owned write queue directly:
 `queued_writer_single` measures the single-writer queued overhead with zero

@@ -12,6 +12,36 @@ Semantic result values decode as Go-native shapes:
 - `TIME` -> `time.Duration`
 - `INTERVAL` -> `IntervalValue{Months, Days, Micros}`
 
+## Branch API (C ABI backed)
+
+The direct Go API exposes branch lifecycle and branch-scoped execution helpers:
+
+- `CreateBranch(name, from ...string)`
+- `ListBranches()`
+- `DeleteBranch(name)`
+- `ExecuteOnBranch(branch, sql, args...)`
+- `QueryOnBranchInt64(branch, sql, args...)`
+
+```go
+db, err := OpenDirect("demo.ddb")
+if err != nil { /* ... */ }
+defer db.Close()
+
+_, err = db.CreateBranch("feature")
+if err != nil { /* ... */ }
+
+count, err := db.QueryOnBranchInt64("feature", "SELECT COUNT(*) FROM items")
+if err != nil { /* ... */ }
+_ = count
+
+if _, err := db.ExecuteOnBranch("feature", "INSERT INTO items(id, value) VALUES ($1, $2)", 1, "branch-row"); err != nil {
+    // ...
+}
+```
+
+Branch-scoped execution is explicit; the package does not expose a persistent
+current-branch session state.
+
 ## Write queue support
 
 The driver supports the bounded write queue via DSN options:

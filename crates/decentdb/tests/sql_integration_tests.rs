@@ -1546,6 +1546,185 @@ fn updating_int64_column_accepts_boolean_values() {
 }
 
 #[test]
+fn sql_robustness_handles_empty_and_malformed_statements_with_typed_errors() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).expect("create in-memory db");
+
+    for sql in ["", "   ", "-- all comments\n-- should fail", " ; ", ";"] {
+        let err = db
+            .execute(sql)
+            .expect_err("empty or comment-only SQL should be rejected");
+        assert!(matches!(err, decentdb::DbError::Sql { .. }));
+    }
+
+    let err = db
+        .execute("SELECT FROM bad_table")
+        .expect_err("malformed SQL should return typed SQL error");
+    assert!(matches!(err, decentdb::DbError::Sql { .. }));
+}
+
+#[test]
+fn sql_robustness_evaluates_deep_nested_expression_without_panic() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).expect("create in-memory db");
+
+    let mut expr = String::from("1");
+    let depth = 24;
+    for _ in 0..depth {
+        expr = format!("({expr} + 1)");
+    }
+    let result = db
+        .execute(&format!("SELECT {expr} AS depth_sum"))
+        .expect("nested expression query");
+    assert_eq!(
+        result.rows()[0].values(),
+        &[Value::Int64((depth as i64) + 1)]
+    );
+}
+
+#[test]
+fn sql_robustness_large_in_lists_are_evaluated_deterministically() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).expect("create in-memory db");
+    let size = 256usize;
+
+    db.execute("CREATE TABLE phase5_large_in (id INT64 PRIMARY KEY)")
+        .expect("create table for large in-list");
+    for id in 0..size {
+        db.execute(&format!("INSERT INTO phase5_large_in VALUES ({id})"))
+            .expect("seed large in-list fixture");
+    }
+
+    let in_list = (0..size)
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let result = db
+        .execute(&format!(
+            "SELECT COUNT(*) FROM phase5_large_in WHERE id IN ({in_list})"
+        ))
+        .expect("large in-list count");
+    assert_eq!(
+        result.rows()[0].values(),
+        &[Value::Int64(i64::try_from(size).expect("size in i64"))]
+    );
+}
+
+#[test]
+fn sql_robustness_queries_empty_tables_and_aggregates() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).expect("create in-memory db");
+    db.execute("CREATE TABLE phase5_empty_agg (id INT64, score INT64)")
+        .expect("create empty table");
+
+    let empty = db
+        .execute("SELECT id, score FROM phase5_empty_agg")
+        .expect("select from empty table");
+    assert!(empty.rows().is_empty());
+
+    let empty_agg = db
+        .execute(
+            "SELECT COUNT(*) AS c, SUM(score) AS s, MAX(score) AS m, MIN(score) AS n \
+             FROM phase5_empty_agg",
+        )
+        .expect("aggregate empty table");
+    assert_eq!(
+        empty_agg.rows()[0].values(),
+        &[Value::Int64(0), Value::Null, Value::Null, Value::Null]
+    );
+
+    db.execute("INSERT INTO phase5_empty_agg VALUES (1, 10), (2, NULL), (3, 5)")
+        .expect("seed non-empty data");
+    let non_empty_agg = db
+        .execute(
+            "SELECT COUNT(*) AS c, SUM(score) AS s, MAX(score) AS m, MIN(score) AS n \
+             FROM phase5_empty_agg",
+        )
+        .expect("aggregate non-empty table");
+    assert_eq!(
+        non_empty_agg.rows()[0].values(),
+        &[
+            Value::Int64(3),
+            Value::Int64(15),
+            Value::Int64(10),
+            Value::Int64(5)
+        ]
+    );
+}
+
+#[test]
+fn sql_robustness_join_cardinality_cases_are_consistent() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).expect("create in-memory db");
+
+    db.execute("CREATE TABLE phase5_join_left (id INT64 PRIMARY KEY)")
+        .expect("create left table");
+    db.execute("CREATE TABLE phase5_join_right (id INT64 PRIMARY KEY, left_id INT64, label TEXT)")
+        .expect("create right table");
+    db.execute("INSERT INTO phase5_join_left VALUES (1), (2), (3), (4)")
+        .expect("seed left table");
+    db.execute(
+        "INSERT INTO phase5_join_right VALUES (1, 2, 'single'), (2, 3, 'first'), (3, 3, 'second')",
+    )
+    .expect("seed right table");
+
+    let none = db
+        .execute("SELECT l.id, r.label FROM phase5_join_left AS l JOIN phase5_join_right AS r ON l.id = r.left_id WHERE l.id = 1 ORDER BY r.id")
+        .expect("join with no matches");
+    assert!(none.rows().is_empty());
+
+    let one = db
+        .execute(
+            "SELECT l.id, r.label FROM phase5_join_left AS l JOIN phase5_join_right AS r \
+             ON l.id = r.left_id WHERE l.id = 2 ORDER BY r.id",
+        )
+        .expect("join with one match");
+    assert_eq!(
+        one.rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>(),
+        vec![vec![Value::Int64(2), Value::Text("single".to_string())]]
+    );
+
+    let many = db
+        .execute(
+            "SELECT l.id, r.label FROM phase5_join_left AS l JOIN phase5_join_right AS r \
+             ON l.id = r.left_id WHERE l.id = 3 ORDER BY r.id",
+        )
+        .expect("join with many matches");
+    assert_eq!(
+        many.rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>(),
+        vec![
+            vec![Value::Int64(3), Value::Text("first".to_string())],
+            vec![Value::Int64(3), Value::Text("second".to_string())],
+        ]
+    );
+}
+
+#[test]
+fn sql_robustness_constraint_violation_rolls_back_transaction_state() {
+    let path = unique_db_path("phase5-tx-robustness");
+    let db = Db::create(&path, DbConfig::default()).expect("create database");
+
+    db.execute("CREATE TABLE phase5_users (id INT64 PRIMARY KEY, email TEXT UNIQUE NOT NULL)")
+        .expect("create users table");
+    db.execute("BEGIN").expect("begin explicit transaction");
+    db.execute("INSERT INTO phase5_users VALUES (1, 'existing@example.com')")
+        .expect("insert first user");
+    let err = db
+        .execute("INSERT INTO phase5_users VALUES (2, 'existing@example.com')")
+        .expect_err("duplicate unique should fail");
+    assert!(matches!(err, decentdb::DbError::Constraint { .. }));
+    db.execute("ROLLBACK").expect("rollback transaction");
+
+    let rows = db
+        .execute("SELECT COUNT(*) FROM phase5_users")
+        .expect("count rows after rollback");
+    assert_eq!(rows.rows()[0].values(), &[Value::Int64(0)]);
+
+    cleanup_db(&path);
+}
+
+#[test]
 fn transaction_handle_blocks_db_execution_until_finished() {
     let path = unique_db_path("phase1-transaction-handle-exclusive");
     let db = Db::create(&path, DbConfig::default()).expect("create database");

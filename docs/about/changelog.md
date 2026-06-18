@@ -5,6 +5,36 @@ All notable changes to DecentDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Added Go direct binding branch helpers backed by existing C ABI functions:
+  `CreateBranch`, `ListBranches`, `DeleteBranch`, `ExecuteOnBranch`, and
+  `QueryOnBranchInt64`, with package tests and README examples.
+- Added a binding compatibility matrix covering Rust, C ABI, Python, Go, Java,
+  Node.js, Dart, .NET, and Web/WASM support status across core embedding
+  capabilities.
+- Added targeted WAL/VFS, extension trust, local security, TDE, error taxonomy,
+  record/value, B+Tree, SQL robustness, and spatial/EWKB tests from the
+  implementation review.
+- Documented browser/WASM row ownership and added browser smoke coverage proving
+  prepared-statement rows remain usable after advancing and closing the
+  statement.
+
+### Changed
+
+- Split large executor and database helper code into smaller internal Rust
+  modules without changing public API, SQL behavior, C ABI behavior, or on-disk
+  formats.
+- Moved large `db.rs` and `exec/mod.rs` in-file test modules into sibling test
+  modules for easier navigation.
+
+### Fixed
+
+- Replaced selected production panic-like executor paths with typed SQL/internal
+  errors or explicit invariants, with regression tests for those error paths.
+
 ## [2.13.1] - [2026-06-15]
 
 ### Fixed

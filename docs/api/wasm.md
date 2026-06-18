@@ -175,6 +175,23 @@ serialization for large reads.
 
 Set `resultTransport: "json"` only for debugging or compatibility comparisons.
 
+## Row Ownership
+
+Browser rows are copied into JavaScript-owned objects before they cross the
+worker boundary. `query()`, `Statement.step()`, `Statement.page()`, and
+`Statement.iterate()` do not expose borrowed pointers into WASM linear memory or
+native engine buffers.
+
+Callers may retain returned row objects after stepping to another row, resetting
+or closing the statement, and closing the database. Blob-like values are decoded
+as JavaScript-owned byte arrays; mutating a returned array mutates only that
+caller-owned copy.
+
+Borrowed row-view APIs are intentionally not exposed in `browser-app-v2`.
+If a future browser row-view API is added, it must document when borrowed memory
+is invalidated and must include retaining-values tests for step, page, reset,
+statement close, and database close.
+
 Use `metrics()` when validating browser performance-sensitive changes. It
 returns available worker-side samples such as current WASM linear-memory bytes,
 pages, owner id/runtime, attached client count, coordination model, parser

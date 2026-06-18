@@ -1000,6 +1000,27 @@ mod tests {
     }
 
     #[test]
+    fn parse_batch_empty_and_comment_only_sql_is_rejected() {
+        assert!(parse_sql_batch("").is_err());
+        assert!(parse_sql_batch("\n -- only a comment\n").is_err());
+        assert!(parse_sql_batch(" ; \n ; ").is_err());
+    }
+
+    #[test]
+    fn parse_batch_reports_malformed_sql() {
+        let err = parse_sql_batch("SELECT FROM table");
+        let msg = err.unwrap_err().to_string().to_lowercase();
+        assert!(msg.contains("syntax") || msg.contains("unexpected") || msg.contains("near"));
+    }
+
+    #[test]
+    fn parse_batch_rejects_multiple_statements_for_single_statement_api() {
+        let err = parse_sql_statement("INSERT INTO t VALUES (1); INSERT INTO t VALUES (2)");
+        let msg = err.unwrap_err().to_string().to_lowercase();
+        assert!(msg.contains("exactly one"));
+    }
+
+    #[test]
     fn parse_virtual_generated_column() {
         let statement = parse_sql_statement(
             "CREATE TABLE t (id INT PRIMARY KEY, x INT, y INT GENERATED ALWAYS AS (x * 2) VIRTUAL)",

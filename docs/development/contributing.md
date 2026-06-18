@@ -40,6 +40,11 @@ package-local suite and matching `tests/bindings/` smoke path described in the
 If you touched the storage harness or crash behavior, run at least one relevant
 scenario from `tests/harness/scenarios/`.
 
+## Documentation conventions
+
+User-facing change notes go in `docs/about/changelog.md`. The root
+`CHANGELOG.md` is a placeholder and must not be updated.
+
 ## Coding expectations
 
 - Follow idiomatic Rust patterns and let `rustfmt` handle layout.

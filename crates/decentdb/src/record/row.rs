@@ -979,6 +979,55 @@ mod tests {
     }
 
     #[test]
+    fn row_roundtrip_handles_null_and_mixed_values() {
+        let row = Row::new(vec![
+            Value::Null,
+            Value::Int64(0),
+            Value::Int64(-1),
+            Value::Int64(i64::MIN),
+            Value::Int64(i64::MAX),
+            Value::Text("".to_string()),
+            Value::Text("空".to_string()),
+            Value::Blob(Vec::new()),
+            Value::Blob(vec![0_u8; 8_192]),
+        ]);
+        let decoded = Row::decode(&row.encode().expect("encode")).expect("decode");
+        assert_eq!(decoded, row);
+    }
+
+    #[test]
+    fn row_roundtrip_preserves_special_floats() {
+        let row = Row::new(vec![
+            Value::Float64(0.0),
+            Value::Float64(-0.0),
+            Value::Float64(f64::INFINITY),
+            Value::Float64(f64::NEG_INFINITY),
+            Value::Float64(f64::from_bits(0x7ff8000000000000)),
+        ]);
+        let decoded = Row::decode(&row.encode().expect("encode")).expect("decode");
+        assert!(rows_equal(decoded.values(), row.values()));
+    }
+
+    #[test]
+    fn decode_rejects_truncated_row_bytes() {
+        let row = Row::new(vec![Value::Int64(42), Value::Text("x".to_string())]);
+        let mut encoded = row.encode().expect("encode");
+        encoded.pop();
+        assert!(Row::decode(&encoded).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_unknown_row_tag() {
+        let encoded = vec![1_u8, 255_u8, 0_u8];
+        let err = Row::decode(&encoded).expect_err("invalid tag should fail");
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("unknown row value tag") || msg.contains("truncated"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
     fn semantic_values_roundtrip_compact_payloads() {
         let row = Row::new(vec![
             Value::Enum {

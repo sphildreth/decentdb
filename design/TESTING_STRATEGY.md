@@ -49,11 +49,31 @@ Runs on every PR.
   - “FK constraints never violated”
 - Seeds:
   - record seed on failure
+  - use explicit, documented constants for randomized Rust unit tests (for replay), for example:
+    - `0xA11F_A11E_BEEF_CAFE` for randomized B+Tree insert order tests
+    - generated SQL query depth constants (for deep nested expression coverage) in assertions or test names
   - rerun with same seed in CI
 - Long-running transactions:
   - Test snapshot isolation under concurrent writes
   - Verify readers see consistent snapshots
   - Test transaction rollback on errors
+- Current Phase 5 coverage additions include:
+  - SQL robustness tests for empty and malformed statements
+  - deeply nested expression execution with deterministic depth
+  - large constant IN-list coverage with fixed list size (`256` in deterministic order)
+  - empty-table query and aggregate behavior
+  - join cardinality cases (no match, one match, many matches)
+  - constraint-violation rollback inside explicit transactions
+
+Commanded coverage run for these surfaces:
+
+```bash
+cargo t -p decentdb -- record
+cargo t -p decentdb -- btree
+cargo t -p decentdb -- sql
+cargo t -p decentdb -- spatial
+```
+
 - Race condition testing:
   - Concurrent reader/writer scenarios (see ADR-0026)
   - Randomized scheduling to expose timing-dependent bugs
@@ -224,8 +244,19 @@ Language bindings (Python, .NET, Go, Java, Node, Dart) provide FFI access to the
   - Java: `tests/bindings/java/Smoke.java`
   - Node: `tests/bindings/node/smoke.js`
   - Dart: `tests/bindings/dart/smoke.dart`
+  - Web/WASM: `npm run browser:smoke` from `bindings/web` when browser
+    artifacts and Playwright browsers are available.
   - Combined runtime: ~2-3 minutes
   - Rationale: These bindings are thinner FFI wrappers; comprehensive suites would require significant community ownership. Smoke tests catch regressions in FFI ABI layer quickly.
+
+Phase 6 binding review additions:
+
+- Go direct binding branch coverage: `cd bindings/go/decentdb-go && go test ./...`.
+- Browser/WASM row ownership coverage: browser smoke now retains a prepared row
+  after stepping and closing the statement; rows are copied JavaScript-owned
+  values, not borrowed WASM row views.
+- Cross-binding smoke gate: `python scripts/do-pre-commit-checks.py --mode fast`.
+- Capability status source of truth: `docs/api/bindings-matrix.md`.
 
 ### 5.5.2 Platform Strategy
 
@@ -291,6 +322,21 @@ Run microbenchmarks on every PR:
 - Store benchmark results in CI artifacts
 - Track trends over time (graphs in CI dashboard)
 - Allow manual baseline updates with justification
+
+### 6.4 Review Implementation Benchmark Gates
+
+The 2026-06-18 implementation review used `benchmarks/rust-baseline` as the
+guardrail source:
+
+- Tier B: `cargo build --release`, DecentDB `smoke`, DecentDB `medium`, and
+  `--plan-cache-benchmark`.
+- Tier C: full DecentDB/SQLite comparison, DecentDB resident-hot-read full
+  profile, report generation, and the latency/concurrency/write/cold smoke
+  suites when final release-quality validation is required.
+- Artifacts are stored under `.tmp/review-implementation/benchmarks/`.
+- If plan-cache p95/p99 samples exceed the strict threshold during a
+  no-behavior mechanical move, rerun isolated samples and record the decision
+  in `.tmp/review-implementation/benchmarks/regression-notes.md`.
 
 ## 7. "Definition of Done" for any PR
 
