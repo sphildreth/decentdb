@@ -71,7 +71,7 @@ packages:
       path: "../dart"
       relative: true
     source: path
-    version: "2.13.1"
+    version: "2.14.0"
   fake_async:
     dependency: transitive
     description:

@@ -3,7 +3,7 @@ plugins {
 }
 
 group = 'dev.decentdb.decentdb_flutter'
-version = '2.13.1'
+version = '2.14.0'
 
 android {
     namespace 'dev.decentdb.decentdb_flutter'
