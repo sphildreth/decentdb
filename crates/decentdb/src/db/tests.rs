@@ -246,6 +246,45 @@ fn execute_batch_schema_only_ddl_is_single_commit_and_queryable() {
 }
 
 #[test]
+fn zero_row_prepared_dml_does_not_commit_autocommit_wal_frame() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let path = tempdir.path().join("zero-row-prepared-dml.ddb");
+    let db = Db::create(&path, DbConfig::default()).expect("create db");
+
+    db.execute(
+        "CREATE TABLE items (
+            id INTEGER PRIMARY KEY,
+            value TEXT
+         )",
+    )
+    .expect("create table");
+    db.execute("INSERT INTO items (id, value) VALUES (1, 'one')")
+        .expect("seed row");
+
+    let before_noop = db.inner.wal.latest_snapshot();
+    let deleted = db
+        .execute_with_params("DELETE FROM items WHERE id = $1", &[Value::Int64(99)])
+        .expect("delete missing row");
+    assert_eq!(deleted.affected_rows(), 0);
+    assert_eq!(db.inner.wal.latest_snapshot(), before_noop);
+
+    let updated = db
+        .execute_with_params(
+            "UPDATE items SET value = $1 WHERE id = $2",
+            &[Value::Text("missing".to_string()), Value::Int64(99)],
+        )
+        .expect("update missing row");
+    assert_eq!(updated.affected_rows(), 0);
+    assert_eq!(db.inner.wal.latest_snapshot(), before_noop);
+
+    let deleted = db
+        .execute_with_params("DELETE FROM items WHERE id = $1", &[Value::Int64(1)])
+        .expect("delete existing row");
+    assert_eq!(deleted.affected_rows(), 1);
+    assert!(db.inner.wal.latest_snapshot() > before_noop);
+}
+
+#[test]
 fn execute_batch_mixed_statements_fallback_to_per_statement_flow() {
     let tempdir = TempDir::new().expect("tempdir");
     let path = tempdir.path().join("ddl-then-dml-fallback.ddb");

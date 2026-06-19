@@ -41,6 +41,7 @@ pub(crate) struct PreparedBtreeIndex {
     pub(crate) column_indexes: Vec<usize>,
     pub(crate) int64_key: bool,
     pub(crate) has_covering_payload: bool,
+    pub(crate) covering_payload_column_indexes: Vec<usize>,
     pub(crate) nullable: bool,
     pub(crate) unique: bool,
 }
@@ -94,10 +95,18 @@ pub(crate) struct PreparedSimpleInsert {
 #[derive(Clone, Debug)]
 pub(crate) struct PreparedSimpleUpdate {
     pub(crate) table_name: String,
+    pub(crate) row_id_source: PreparedSimpleValueSource,
+    pub(crate) assignments: Vec<PreparedSimpleUpdateAssignment>,
+    pub(crate) indexes: Vec<PreparedBtreeIndex>,
+    pub(crate) compiled_index_state_epoch: u64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedSimpleUpdateAssignment {
+    pub(crate) column_name: String,
     pub(crate) column_index: usize,
     pub(crate) column_type: ColumnType,
     pub(crate) nullable: bool,
-    pub(crate) row_id_source: PreparedSimpleValueSource,
     pub(crate) value_source: PreparedSimpleValueSource,
 }
 
@@ -722,7 +731,6 @@ impl EngineRuntime {
     ) -> Result<Option<PreparedSimpleUpdate>> {
         if !self.can_execute_update_in_state_without_clone(statement)
             || !statement.returning.is_empty()
-            || statement.assignments.len() != 1
         {
             return Ok(None);
         }
@@ -745,43 +753,63 @@ impl EngineRuntime {
             return Ok(None);
         }
 
-        let assignment = &statement.assignments[0];
-        let Some(value_source) = compile_prepared_simple_value_source(&assignment.expr) else {
-            return Ok(None);
-        };
         let Some(row_id_source) = compile_prepared_simple_value_source(value_expr) else {
             return Ok(None);
         };
-        let Some(column_index) = table
-            .columns
-            .iter()
-            .position(|column| identifiers_equal(&column.name, &assignment.column_name))
-        else {
-            return Err(DbError::sql(format!(
-                "unknown column {}",
-                assignment.column_name
-            )));
-        };
-        let column = &table.columns[column_index];
-        if column.generated_sql.is_some() {
-            return Ok(None);
-        }
-        if column.column_type == ColumnType::Enum {
-            return Ok(None);
+
+        let mut assignments = Vec::with_capacity(statement.assignments.len());
+        let mut assignment_columns = Vec::with_capacity(statement.assignments.len());
+        for assignment in &statement.assignments {
+            let Some(column_index) = table
+                .columns
+                .iter()
+                .position(|column| identifiers_equal(&column.name, &assignment.column_name))
+            else {
+                return Err(DbError::sql(format!(
+                    "unknown column {}",
+                    assignment.column_name
+                )));
+            };
+            if assignment_columns.contains(&column_index) {
+                return Ok(None);
+            }
+            let column = &table.columns[column_index];
+            if column.generated_sql.is_some() || column.column_type == ColumnType::Enum {
+                return Ok(None);
+            }
+            let Some(value_source) = compile_prepared_simple_value_source(&assignment.expr) else {
+                return Ok(None);
+            };
+            assignments.push(PreparedSimpleUpdateAssignment {
+                column_name: assignment.column_name.clone(),
+                column_index,
+                column_type: column.column_type,
+                nullable: column.nullable,
+                value_source,
+            });
+            assignment_columns.push(column_index);
         }
 
-        let assignment_columns = [column_index];
         if assignment_targets_referenced_parent_key_columns(self, table, &assignment_columns) {
             return Ok(None);
         }
-        let index_changes = self
+        if assignment_targets_foreign_key_columns(table, &assignment_columns) {
+            return Ok(None);
+        }
+        let mut indexes = Vec::new();
+        for index in self
             .catalog
             .indexes
             .values()
             .filter(|index| identifiers_equal(&index.table_name, &table.name))
-            .any(|index| index_might_change_for_assignments(table, index, &assignment_columns));
-        if index_changes {
-            return Ok(None);
+        {
+            if !index_might_change_for_assignments(table, index, &assignment_columns) {
+                continue;
+            }
+            let Some(prepared_index) = prepare_btree_insert_index(self, table, index)? else {
+                return Ok(None);
+            };
+            indexes.push(prepared_index);
         }
 
         let prepared_table_name = match super::compat_schema_qualified_name(&statement.table_name).0
@@ -792,11 +820,10 @@ impl EngineRuntime {
 
         Ok(Some(PreparedSimpleUpdate {
             table_name: prepared_table_name,
-            column_index,
-            column_type: column.column_type,
-            nullable: column.nullable,
             row_id_source,
-            value_source,
+            assignments,
+            indexes,
+            compiled_index_state_epoch: self.index_state_epoch,
         }))
     }
 
@@ -804,6 +831,11 @@ impl EngineRuntime {
         // Schema cookie is validated before this is called, so the table exists.
         // Only check if it was shadowed by a temp table.
         !self.visible_table_is_temporary(&prepared.table_name)
+            && prepared.compiled_index_state_epoch == self.index_state_epoch
+            && prepared
+                .indexes
+                .iter()
+                .all(|index| self.prepared_btree_index_is_fresh(index))
     }
 
     pub(crate) fn execute_prepared_simple_update(
@@ -816,133 +848,233 @@ impl EngineRuntime {
             Value::Int64(value) => value,
             _ => return Ok(QueryResult::with_affected_rows(0)),
         };
-        let next_value = cast_prepared_simple_value(
-            resolve_prepared_simple_value(&prepared.value_source, params)?,
-            prepared.column_type,
-        )?;
-        if !prepared.nullable && matches!(next_value, Value::Null) {
-            return Err(DbError::constraint(format!(
-                "column {}.{} may not be NULL",
-                prepared.table_name, prepared.column_index
+        let mut resolved_assignments = Vec::with_capacity(prepared.assignments.len());
+        for assignment in &prepared.assignments {
+            let next_value = cast_prepared_simple_value(
+                resolve_prepared_simple_value(&assignment.value_source, params)?,
+                assignment.column_type,
+            )?;
+            if !assignment.nullable && matches!(next_value, Value::Null) {
+                return Err(DbError::constraint(format!(
+                    "column {}.{} may not be NULL",
+                    prepared.table_name, assignment.column_name
+                )));
+            }
+            resolved_assignments.push((assignment.column_index, next_value));
+        }
+        if self.table_schema(&prepared.table_name).is_none() {
+            return Err(DbError::internal(format!(
+                "table schema for {} is missing",
+                prepared.table_name
             )));
         }
+        let all_indexes_present = prepared
+            .indexes
+            .iter()
+            .all(|index| self.prepared_btree_index_is_fresh(index));
 
-        match self.table_row_source(&prepared.table_name) {
-            Some(TableRowSource::Resident(_)) => {
+        let row_source_is_paged = match self.table_row_source(&prepared.table_name) {
+            Some(TableRowSource::Resident(_)) => false,
+            Some(TableRowSource::Paged(_)) => true,
+            None => {
+                return Err(DbError::internal(format!(
+                    "table data for {} is missing",
+                    prepared.table_name
+                )))
+            }
+        };
+
+        if !row_source_is_paged {
+            {
+                let (row_index, current_values) = {
+                    let Some(table_data) = self.table_data(&prepared.table_name) else {
+                        return Err(DbError::internal(format!(
+                            "table data for {} is missing",
+                            prepared.table_name
+                        )));
+                    };
+                    let Some(row_index) = table_data.row_index_by_id(row_id) else {
+                        return Ok(QueryResult::with_affected_rows(0));
+                    };
+                    let Some(current_values) =
+                        table_data.rows.get(row_index).map(|row| row.values.clone())
+                    else {
+                        return Err(DbError::internal(format!(
+                            "row index {} is invalid for {}",
+                            row_index, prepared.table_name
+                        )));
+                    };
+                    (row_index, current_values)
+                };
+                let mut next_values = current_values.clone();
+                for (column_index, next_value) in &resolved_assignments {
+                    let Some(slot) = next_values.get_mut(*column_index) else {
+                        return Err(DbError::internal(format!(
+                            "column index {} is invalid for {}",
+                            column_index, prepared.table_name
+                        )));
+                    };
+                    *slot = next_value.clone();
+                }
+                if next_values == current_values {
+                    return Ok(QueryResult::with_affected_rows(1));
+                }
+
+                let mut indexes_remain_fresh = true;
+                if !all_indexes_present {
+                    indexes_remain_fresh = false;
+                }
+                for index in &prepared.indexes {
+                    if !self.prepared_btree_index_is_fresh(index) {
+                        continue;
+                    }
+                    if !apply_prepared_btree_index_update_for_row_change(
+                        self,
+                        &prepared.table_name,
+                        index,
+                        row_id,
+                        &current_values,
+                        &next_values,
+                    )? {
+                        indexes_remain_fresh = false;
+                        break;
+                    }
+                }
                 let Some(table_data) = self.table_data_mut(&prepared.table_name) else {
                     return Err(DbError::internal(format!(
                         "table data for {} is missing",
                         prepared.table_name
                     )));
                 };
-                let Some(row_index) = table_data.row_index_by_id(row_id) else {
-                    return Ok(QueryResult::with_affected_rows(0));
-                };
-                let Some(current_value) =
-                    table_data.rows[row_index].values.get(prepared.column_index)
-                else {
-                    return Err(DbError::internal(format!(
-                        "column index {} is invalid for {}",
-                        prepared.column_index, prepared.table_name
-                    )));
-                };
-                if *current_value != next_value {
-                    table_data
-                        .replace_value(row_index, prepared.column_index, next_value)
-                        .ok_or_else(|| {
-                            DbError::internal(format!(
-                                "column index {} is invalid for {}",
-                                prepared.column_index, prepared.table_name
-                            ))
-                        })?;
-                    let updated_values = table_data.rows[row_index].values.clone();
-                    self.mark_table_row_dirty(
-                        &prepared.table_name,
-                        row_index,
-                        row_id,
-                        &updated_values,
-                    );
-                    if self.sync_capture_active() {
-                        let sync_info = self
-                            .table_schema(prepared.table_name.as_str())
-                            .filter(|schema| !schema.temporary)
-                            .filter(|schema| self.should_record_sync_mutation_for_table(schema))
-                            .map(|schema| {
-                                (
-                                    schema.name.clone(),
-                                    sync::build_primary_key_json(schema, &updated_values),
-                                    sync::build_after_json(schema, &updated_values),
-                                )
-                            });
-                        if let Some((table_name, pk, after)) = sync_info {
-                            let schema_cookie = self.catalog.schema_cookie;
-                            self.record_sync_mutation(
-                                &table_name,
-                                SyncOperation::Update,
-                                pk,
-                                Some(after),
-                                schema_cookie,
-                            );
-                        }
+                table_data
+                    .replace_row_values(row_index, next_values.clone())
+                    .ok_or_else(|| {
+                        DbError::internal(format!(
+                            "table row {} is invalid for {}",
+                            row_id, prepared.table_name
+                        ))
+                    })?;
+                self.mark_table_row_dirty(&prepared.table_name, row_index, row_id, &next_values);
+                if !indexes_remain_fresh {
+                    self.mark_indexes_stale_for_table(&prepared.table_name);
+                }
+                if self.sync_capture_active() {
+                    let sync_info = self
+                        .table_schema(prepared.table_name.as_str())
+                        .filter(|schema| !schema.temporary)
+                        .filter(|schema| self.should_record_sync_mutation_for_table(schema))
+                        .map(|schema| {
+                            (
+                                schema.name.clone(),
+                                sync::build_primary_key_json(schema, &next_values),
+                                sync::build_after_json(schema, &next_values),
+                            )
+                        });
+                    if let Some((table_name, pk, after)) = sync_info {
+                        let schema_cookie = self.catalog.schema_cookie;
+                        self.record_sync_mutation(
+                            &table_name,
+                            SyncOperation::Update,
+                            pk,
+                            Some(after),
+                            schema_cookie,
+                        );
                     }
                 }
                 Ok(QueryResult::with_affected_rows(1))
             }
-            Some(TableRowSource::Paged(manifest)) => {
+        } else {
+            let manifest = match self.table_row_source(&prepared.table_name) {
+                Some(TableRowSource::Paged(manifest)) => Arc::clone(manifest),
+                Some(TableRowSource::Resident(_)) => {
+                    return Err(DbError::internal(format!(
+                        "table row source for {} changed during UPDATE",
+                        prepared.table_name
+                    )))
+                }
+                None => {
+                    return Err(DbError::internal(format!(
+                        "table data for {} is missing",
+                        prepared.table_name
+                    )))
+                }
+            };
+            {
                 let Some(current_row) = manifest.row_by_id(row_id)? else {
                     return Ok(QueryResult::with_affected_rows(0));
                 };
-                let Some(current_value) = current_row.values().get(prepared.column_index) else {
-                    return Err(DbError::internal(format!(
-                        "column index {} is invalid for {}",
-                        prepared.column_index, prepared.table_name
-                    )));
-                };
-                if *current_value != next_value {
-                    let mut next_values = current_row.values().to_vec();
-                    next_values[prepared.column_index] = next_value;
-                    let updated_values = next_values.clone();
-                    let mut row_changes = BTreeMap::new();
-                    row_changes.insert(row_id, Some(next_values));
-                    let updated_manifest = super::apply_paged_row_changes_to_manifest(
-                        manifest.as_ref(),
-                        &row_changes,
-                    )?;
-                    self.replace_table_row_source(
+                let mut next_values = current_row.values().to_vec();
+                let current_values = next_values.clone();
+                for (column_index, next_value) in &resolved_assignments {
+                    let Some(slot) = next_values.get_mut(*column_index) else {
+                        return Err(DbError::internal(format!(
+                            "column index {} is invalid for {}",
+                            column_index, prepared.table_name
+                        )));
+                    };
+                    *slot = next_value.clone();
+                }
+                if next_values == current_values {
+                    return Ok(QueryResult::with_affected_rows(1));
+                }
+                let mut indexes_remain_fresh = true;
+                if !all_indexes_present {
+                    indexes_remain_fresh = false;
+                }
+                for index in &prepared.indexes {
+                    if !self.prepared_btree_index_is_fresh(index) {
+                        continue;
+                    }
+                    if !apply_prepared_btree_index_update_for_row_change(
+                        self,
                         &prepared.table_name,
-                        TableRowSource::Paged(Arc::new(updated_manifest)),
-                    )?;
-                    self.mark_table_dirty(&prepared.table_name);
-                    if self.sync_capture_active() {
-                        let sync_data = self
-                            .table_schema(prepared.table_name.as_str())
-                            .filter(|schema| !schema.temporary)
-                            .filter(|schema| self.should_record_sync_mutation_for_table(schema))
-                            .map(|schema| {
-                                (
-                                    schema.name.clone(),
-                                    sync::build_primary_key_json(schema, &updated_values),
-                                    sync::build_after_json(schema, &updated_values),
-                                )
-                            });
-                        if let Some((table_name, pk, after)) = sync_data {
-                            let schema_cookie = self.catalog.schema_cookie;
-                            self.record_sync_mutation(
-                                &table_name,
-                                SyncOperation::Update,
-                                pk,
-                                Some(after),
-                                schema_cookie,
-                            );
-                        }
+                        index,
+                        row_id,
+                        &current_values,
+                        &next_values,
+                    )? {
+                        indexes_remain_fresh = false;
+                        break;
+                    }
+                }
+                let mut row_changes = BTreeMap::new();
+                row_changes.insert(row_id, Some(next_values.clone()));
+                let updated_manifest =
+                    super::apply_paged_row_changes_to_manifest(manifest.as_ref(), &row_changes)?;
+                self.replace_table_row_source(
+                    &prepared.table_name,
+                    TableRowSource::Paged(Arc::new(updated_manifest)),
+                )?;
+                self.mark_table_dirty(&prepared.table_name);
+                if !indexes_remain_fresh {
+                    self.mark_indexes_stale_for_table(&prepared.table_name);
+                }
+                self.mark_table_row_dirty(&prepared.table_name, 0, row_id, &next_values);
+                if self.sync_capture_active() {
+                    let sync_data = self
+                        .table_schema(prepared.table_name.as_str())
+                        .filter(|schema| !schema.temporary)
+                        .filter(|schema| self.should_record_sync_mutation_for_table(schema))
+                        .map(|schema| {
+                            (
+                                schema.name.clone(),
+                                sync::build_primary_key_json(schema, &next_values),
+                                sync::build_after_json(schema, &next_values),
+                            )
+                        });
+                    if let Some((table_name, pk, after)) = sync_data {
+                        let schema_cookie = self.catalog.schema_cookie;
+                        self.record_sync_mutation(
+                            &table_name,
+                            SyncOperation::Update,
+                            pk,
+                            Some(after),
+                            schema_cookie,
+                        );
                     }
                 }
                 Ok(QueryResult::with_affected_rows(1))
             }
-            None => Err(DbError::internal(format!(
-                "table data for {} is missing",
-                prepared.table_name
-            ))),
         }
     }
 
@@ -1071,22 +1203,25 @@ impl EngineRuntime {
             return Ok(QueryResult::with_affected_rows(0));
         }
 
-        let row_source = self
-            .table_row_source(&prepared.table_name)
-            .ok_or_else(|| {
+        let (removed_rows, row_source_was_resident) = {
+            let row_source = self.table_row_source(&prepared.table_name).ok_or_else(|| {
                 DbError::internal(format!("table data for {} is missing", prepared.table_name))
-            })?
-            .clone();
-        let mut removed_rows = Vec::with_capacity(matching_row_ids.len());
-        for &row_id in &matching_row_ids {
-            let row = row_source
-                .row_by_id(row_id)?
-                .ok_or_else(|| DbError::internal(format!("row {row_id} vanished during DELETE")))?;
-            removed_rows.push(StoredRow {
-                row_id,
-                values: row.values().to_vec(),
-            });
-        }
+            })?;
+            let mut removed_rows = Vec::with_capacity(matching_row_ids.len());
+            for &row_id in &matching_row_ids {
+                let row = row_source.row_by_id(row_id)?.ok_or_else(|| {
+                    DbError::internal(format!("row {row_id} vanished during DELETE"))
+                })?;
+                removed_rows.push(StoredRow {
+                    row_id,
+                    values: row.values().to_vec(),
+                });
+            }
+            (
+                removed_rows,
+                matches!(row_source, TableRowSource::Resident(_)),
+            )
+        };
 
         if !prepared.restrict_children.is_empty() {
             for row in &removed_rows {
@@ -1101,8 +1236,8 @@ impl EngineRuntime {
             }
         }
 
-        match row_source {
-            TableRowSource::Resident(_) => {
+        if row_source_was_resident {
+            {
                 let mut row_indices = {
                     let table_data = self.table_data(&prepared.table_name).ok_or_else(|| {
                         DbError::internal(format!(
@@ -1133,7 +1268,23 @@ impl EngineRuntime {
                     }
                 }
             }
-            TableRowSource::Paged(manifest) => {
+        } else {
+            let manifest = match self.table_row_source(&prepared.table_name) {
+                Some(TableRowSource::Paged(manifest)) => Arc::clone(manifest),
+                Some(TableRowSource::Resident(_)) => {
+                    return Err(DbError::internal(format!(
+                        "table row source for {} changed during DELETE",
+                        prepared.table_name
+                    )))
+                }
+                None => {
+                    return Err(DbError::internal(format!(
+                        "table data for {} is missing",
+                        prepared.table_name
+                    )))
+                }
+            };
+            {
                 let row_changes = matching_row_ids
                     .iter()
                     .copied()
@@ -1160,7 +1311,13 @@ impl EngineRuntime {
             }
         }
 
-        self.mark_table_dirty(&prepared.table_name);
+        if row_source_was_resident {
+            for row in &removed_rows {
+                self.mark_table_row_deleted(&prepared.table_name, row.row_id);
+            }
+        } else {
+            self.mark_table_dirty(&prepared.table_name);
+        }
         if self.should_record_sync_mutation_for_table(&prepared.table) {
             for row in &removed_rows {
                 let pk = sync::build_primary_key_json(&prepared.table, &row.values);
@@ -1176,7 +1333,7 @@ impl EngineRuntime {
         Ok(QueryResult::with_affected_rows(removed_rows.len() as u64))
     }
 
-    fn prepared_btree_index_is_fresh(&self, prepared: &PreparedBtreeIndex) -> bool {
+    pub(crate) fn prepared_btree_index_is_fresh(&self, prepared: &PreparedBtreeIndex) -> bool {
         matches!(
             self.catalog.indexes.get(&prepared.name),
             Some(index) if index.kind == IndexKind::Btree && index.fresh
@@ -3310,6 +3467,9 @@ fn prepare_btree_insert_index(
         column_indexes,
         int64_key,
         has_covering_payload: !index.include_columns.is_empty(),
+        covering_payload_column_indexes: prepare_btree_index_covering_payload_column_indexes(
+            table, index,
+        ),
         nullable: index.columns.iter().any(|column| {
             column
                 .column_name
@@ -3324,6 +3484,17 @@ fn prepare_btree_insert_index(
         }),
         unique: index.unique,
     }))
+}
+
+fn prepare_btree_index_covering_payload_column_indexes(
+    table: &crate::catalog::TableSchema,
+    index: &crate::catalog::IndexSchema,
+) -> Vec<usize> {
+    super::covering_payload_column_names(index, table)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|column_name| super::schema_column_index(table, column_name.as_str()))
+        .collect()
 }
 
 fn prepare_foreign_key(
@@ -3911,6 +4082,87 @@ fn prepared_index_contains_null(index: &PreparedBtreeIndex, row: &[Value]) -> bo
         .column_indexes
         .iter()
         .any(|&column_index| matches!(row.get(column_index), Some(Value::Null)))
+}
+
+fn prepared_index_covering_payload_values(
+    index: &PreparedBtreeIndex,
+    row_values: &[Value],
+) -> Result<Option<Vec<Value>>> {
+    if index.covering_payload_column_indexes.is_empty() {
+        return Ok(None);
+    }
+    index
+        .covering_payload_column_indexes
+        .iter()
+        .map(|&index| {
+            row_values
+                .get(index)
+                .cloned()
+                .ok_or_else(|| DbError::internal("row is shorter than prepared index plan"))
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(Some)
+}
+
+fn apply_prepared_btree_index_update_for_row_change(
+    runtime: &mut EngineRuntime,
+    table_name: &str,
+    index: &PreparedBtreeIndex,
+    row_id: i64,
+    old_row_values: &[Value],
+    new_row_values: &[Value],
+) -> Result<bool> {
+    let old_key = if index.unique && prepared_index_contains_null(index, old_row_values) {
+        None
+    } else {
+        Some(prepared_btree_index_key(index, old_row_values)?)
+    };
+    let new_key = if index.unique && prepared_index_contains_null(index, new_row_values) {
+        None
+    } else {
+        Some(prepared_btree_index_key(index, new_row_values)?)
+    };
+
+    let Some(super::RuntimeIndex::Btree { keys, covering }) = runtime.index_mut(&index.name) else {
+        return Ok(false);
+    };
+
+    if old_key == new_key {
+        let covering_values = prepared_index_covering_payload_values(index, new_row_values)?;
+        if let (Some(covering), Some(values)) = (covering.as_mut(), covering_values) {
+            covering.insert_row_values(row_id, values);
+        }
+        return Ok(true);
+    }
+
+    if let Some(old_key) = old_key {
+        keys.remove_row_id(&old_key, row_id)?;
+    }
+
+    let Some(new_key) = new_key else {
+        if let Some(covering) = covering.as_mut() {
+            covering.remove_row_id(row_id);
+        }
+        return Ok(true);
+    };
+
+    if index.unique {
+        if keys.insert_row_id(new_key, row_id).is_err() {
+            return Err(DbError::constraint(format!(
+                "unique constraint {} on {} was violated",
+                index.name, table_name
+            )));
+        }
+    } else {
+        keys.insert_row_id(new_key, row_id)?;
+    }
+
+    let covering_values = prepared_index_covering_payload_values(index, new_row_values)?;
+    if let (Some(covering), Some(values)) = (covering.as_mut(), covering_values) {
+        covering.insert_row_values(row_id, values);
+    }
+
+    Ok(true)
 }
 
 fn materialize_insert_source(
@@ -5079,6 +5331,7 @@ mod tests {
             column_indexes: vec![1],
             int64_key: false,
             has_covering_payload: false,
+            covering_payload_column_indexes: vec![],
             nullable: true,
             unique: false,
         };
@@ -5090,6 +5343,7 @@ mod tests {
             column_indexes: vec![0],
             int64_key: true,
             has_covering_payload: false,
+            covering_payload_column_indexes: vec![],
             nullable: false,
             unique: false,
         };
@@ -5101,6 +5355,7 @@ mod tests {
             column_indexes: vec![0],
             int64_key: false,
             has_covering_payload: false,
+            covering_payload_column_indexes: vec![],
             nullable: false,
             unique: false,
         };
@@ -6801,6 +7056,7 @@ mod dml_private_tests {
             column_indexes: vec![0],
             int64_key: true,
             has_covering_payload: false,
+            covering_payload_column_indexes: vec![],
             nullable: true,
             unique: false,
         };
@@ -6817,6 +7073,7 @@ mod dml_private_tests {
             column_indexes: vec![0],
             int64_key: false,
             has_covering_payload: false,
+            covering_payload_column_indexes: vec![],
             nullable: false,
             unique: false,
         };
@@ -6832,6 +7089,7 @@ mod dml_private_tests {
             column_indexes: vec![0, 1],
             int64_key: false,
             has_covering_payload: false,
+            covering_payload_column_indexes: vec![],
             nullable: false,
             unique: false,
         };

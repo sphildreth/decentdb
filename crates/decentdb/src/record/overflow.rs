@@ -4,6 +4,7 @@
 //! - design/adr/0020-overflow-pages-for-blobs.md
 //! - design/adr/0031-overflow-page-format.md
 
+use std::ops::Range;
 use std::sync::Arc;
 
 use crate::error::{DbError, Result};
@@ -166,6 +167,59 @@ pub(crate) fn rewrite_overflow_cached<S: PageStore>(
     cached_page_ids: &[PageId],
     skip_first_n_pages: usize,
 ) -> Result<(OverflowPointer, OverflowChainCache, OverflowTailInfo)> {
+    rewrite_overflow_cached_with_dirty_byte_range(
+        store,
+        previous,
+        bytes,
+        cached_page_ids,
+        skip_first_n_pages,
+        None,
+    )
+}
+
+/// Like [`rewrite_overflow_cached`] but allows callers to limit the dirty
+/// overflow page window when the page count is unchanged.
+pub(crate) fn rewrite_overflow_cached_with_dirty_byte_range<S: PageStore>(
+    store: &mut S,
+    previous: OverflowPointer,
+    bytes: &[u8],
+    cached_page_ids: &[PageId],
+    skip_first_n_pages: usize,
+    dirty_byte_range: Option<Range<usize>>,
+) -> Result<(OverflowPointer, OverflowChainCache, OverflowTailInfo)> {
+    if let Some(range) = dirty_byte_range {
+        let ranges = [range];
+        return rewrite_overflow_cached_with_dirty_byte_ranges(
+            store,
+            previous,
+            bytes,
+            cached_page_ids,
+            skip_first_n_pages,
+            Some(&ranges),
+        );
+    }
+    rewrite_overflow_cached_with_dirty_byte_ranges(
+        store,
+        previous,
+        bytes,
+        cached_page_ids,
+        skip_first_n_pages,
+        None,
+    )
+}
+
+/// Like [`rewrite_overflow_cached`] but allows callers to limit the dirty
+/// overflow page windows. This is useful for resident-table DELETE, where the
+/// row-count header and shifted tail are dirty but the middle of the payload is
+/// unchanged.
+pub(crate) fn rewrite_overflow_cached_with_dirty_byte_ranges<S: PageStore>(
+    store: &mut S,
+    previous: OverflowPointer,
+    bytes: &[u8],
+    cached_page_ids: &[PageId],
+    skip_first_n_pages: usize,
+    dirty_byte_ranges: Option<&[Range<usize>]>,
+) -> Result<(OverflowPointer, OverflowChainCache, OverflowTailInfo)> {
     let logical_len = u32::try_from(bytes.len())
         .map_err(|_| DbError::constraint("overflow payload exceeds u32 logical length"))?;
 
@@ -201,54 +255,85 @@ pub(crate) fn rewrite_overflow_cached<S: PageStore>(
         }
     }
 
-    // Determine how many leading pages can be safely skipped.
-    // Pages are skippable when: same page count as before (no chain
-    // restructure), the page was in the previous cache, and its byte
-    // range falls entirely within the unchanged prefix.
-    let effective_skip = if needed_pages == cached_page_ids.len() {
-        skip_first_n_pages.min(needed_pages)
-    } else {
-        // Chain length changed — next pointers may differ; rewrite all.
-        0
-    };
+    let rewrite_page_ranges = dirty_byte_ranges
+        .filter(|ranges| !ranges.is_empty())
+        .map(|ranges| {
+            let mut page_ranges = Vec::with_capacity(ranges.len() + 1);
+            for dirty_range in ranges {
+                let range_start = dirty_range.start.min(bytes.len());
+                let range_end = dirty_range.end.min(bytes.len());
+                if range_start >= range_end {
+                    continue;
+                }
+                let rewrite_from_page = range_start
+                    .checked_div(chunk_capacity)
+                    .unwrap_or(0)
+                    .max(skip_first_n_pages)
+                    .min(needed_pages);
+                let rewrite_to_page = ((range_end.saturating_sub(1)) / chunk_capacity)
+                    .saturating_add(1)
+                    .min(needed_pages);
+                if rewrite_from_page < rewrite_to_page {
+                    page_ranges.push(rewrite_from_page..rewrite_to_page);
+                }
+            }
+            if needed_pages != cached_page_ids.len() && needed_pages > 0 {
+                let last_page = needed_pages - 1;
+                if last_page >= skip_first_n_pages {
+                    page_ranges.push(last_page..needed_pages);
+                }
+            }
+            if page_ranges.is_empty() {
+                return page_ranges;
+            }
+            page_ranges.sort_by_key(|range| range.start);
+            let mut merged: Vec<Range<usize>> = Vec::with_capacity(page_ranges.len());
+            for range in page_ranges {
+                if let Some(last) = merged.last_mut() {
+                    if range.start <= last.end {
+                        last.end = last.end.max(range.end);
+                        continue;
+                    }
+                }
+                merged.push(range);
+            }
+            merged
+        });
 
     // Single reusable buffer avoids per-page allocation.
     let mut page_buf = vec![0u8; page_size];
-    let mut offset = effective_skip * chunk_capacity;
 
-    for (index, &page_id) in page_ids.iter().enumerate() {
-        if index < effective_skip {
-            continue;
-        }
-
-        let next = page_ids.get(index + 1).copied().unwrap_or(0);
-        let remaining = bytes.len().saturating_sub(offset);
-        let chunk_len = remaining.min(chunk_capacity);
-
-        page_buf.fill(0);
-        page_buf[0..4].copy_from_slice(&next.to_le_bytes());
-        page_buf[4..8].copy_from_slice(
-            &u32::try_from(chunk_len)
-                .map_err(|_| DbError::constraint("overflow chunk length exceeds u32"))?
-                .to_le_bytes(),
-        );
-        if chunk_len > 0 {
-            page_buf[OVERFLOW_HEADER_SIZE..OVERFLOW_HEADER_SIZE + chunk_len]
-                .copy_from_slice(&bytes[offset..offset + chunk_len]);
-            offset += chunk_len;
-        }
-
-        // Lazy comparison: read the existing page from the page cache
-        // (vectorized memcmp is ~4× faster than byte-by-byte CRC-32C).
-        if index < cached_page_ids.len() {
-            if let Ok(existing) = store.read_page(page_id) {
-                if *existing == *page_buf {
-                    continue;
-                }
+    if let Some(page_ranges) = rewrite_page_ranges {
+        for page_range in page_ranges {
+            for index in page_range {
+                write_cached_overflow_page(
+                    store,
+                    bytes,
+                    &page_ids,
+                    cached_page_ids,
+                    chunk_capacity,
+                    &mut page_buf,
+                    index,
+                )?;
             }
         }
-
-        store.write_page(page_id, &page_buf)?;
+    } else {
+        let rewrite_from_page = if needed_pages == cached_page_ids.len() {
+            skip_first_n_pages.min(needed_pages)
+        } else {
+            0
+        };
+        for index in rewrite_from_page..needed_pages {
+            write_cached_overflow_page(
+                store,
+                bytes,
+                &page_ids,
+                cached_page_ids,
+                chunk_capacity,
+                &mut page_buf,
+                index,
+            )?;
+        }
     }
 
     // Free excess pages if the payload shrank.
@@ -276,6 +361,46 @@ pub(crate) fn rewrite_overflow_cached<S: PageStore>(
         OverflowChainCache { page_ids },
         tail,
     ))
+}
+
+fn write_cached_overflow_page<S: PageStore>(
+    store: &mut S,
+    bytes: &[u8],
+    page_ids: &[PageId],
+    cached_page_ids: &[PageId],
+    chunk_capacity: usize,
+    page_buf: &mut [u8],
+    index: usize,
+) -> Result<()> {
+    let page_id = page_ids[index];
+    let next = page_ids.get(index + 1).copied().unwrap_or(0);
+    let offset = index * chunk_capacity;
+    let remaining = bytes.len().saturating_sub(offset);
+    let chunk_len = remaining.min(chunk_capacity);
+
+    page_buf.fill(0);
+    page_buf[0..4].copy_from_slice(&next.to_le_bytes());
+    page_buf[4..8].copy_from_slice(
+        &u32::try_from(chunk_len)
+            .map_err(|_| DbError::constraint("overflow chunk length exceeds u32"))?
+            .to_le_bytes(),
+    );
+    if chunk_len > 0 {
+        page_buf[OVERFLOW_HEADER_SIZE..OVERFLOW_HEADER_SIZE + chunk_len]
+            .copy_from_slice(&bytes[offset..offset + chunk_len]);
+    }
+
+    // Lazy comparison: read the existing page from the page cache
+    // (vectorized memcmp is ~4x faster than byte-by-byte CRC-32C).
+    if index < cached_page_ids.len() {
+        if let Ok(existing) = store.read_page(page_id) {
+            if *existing == *page_buf {
+                return Ok(());
+            }
+        }
+    }
+
+    store.write_page(page_id, page_buf)
 }
 
 /// Build an [`OverflowChainCache`] by collecting page IDs and hashing each

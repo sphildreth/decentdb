@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+#[cfg(all(not(miri), not(all(target_arch = "wasm32", target_os = "unknown"))))]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -1566,10 +1567,21 @@ pub(crate) struct SyncContext {
 }
 
 pub(crate) fn current_time_micros() -> i64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|duration| duration.as_micros() as i64)
-        .unwrap_or(0)
+    #[cfg(miri)]
+    {
+        0
+    }
+    #[cfg(all(not(miri), target_arch = "wasm32", target_os = "unknown"))]
+    {
+        (js_sys::Date::now() * 1000.0) as i64
+    }
+    #[cfg(all(not(miri), not(all(target_arch = "wasm32", target_os = "unknown"))))]
+    {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_micros() as i64)
+            .unwrap_or(0)
+    }
 }
 
 pub(crate) struct SyncJournalCaptureScope<'a> {
@@ -1722,10 +1734,7 @@ impl SyncContext {
         }
 
         self.ensure_journal_open(vfs)?;
-        let now_micros = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_micros() as i64)
-            .unwrap_or(0);
+        let now_micros = current_time_micros();
 
         let mut buffer = Vec::new();
         let mut seq = self.next_sequence();

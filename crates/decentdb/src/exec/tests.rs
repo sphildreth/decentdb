@@ -449,6 +449,222 @@ fn simple_grouped_wrapped_count_multi_order_by_uses_fast_path() {
 }
 
 #[test]
+fn simple_grouped_count_uses_runtime_btree_index_cardinality() {
+    let mut runtime = EngineRuntime::empty(1);
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE issues (id INT64 PRIMARY KEY, status TEXT)",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE INDEX idx_issues_status ON issues (status)",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO issues (id, status) VALUES (1, 'open')",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO issues (id, status) VALUES (2, 'closed')",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO issues (id, status) VALUES (3, 'open')",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO issues (id, status) VALUES (4, 'resolved')",
+    );
+
+    let statement =
+        parse_sql_statement("SELECT status, COUNT(*) FROM issues GROUP BY status ORDER BY status")
+            .expect("parse grouped count");
+    let crate::sql::ast::Statement::Query(query) = &statement else {
+        panic!("expected query statement");
+    };
+
+    let result = runtime
+        .try_execute_simple_grouped_count_query(query, &[])
+        .expect("execute grouped count")
+        .expect("grouped count should stay on fast path");
+
+    assert_eq!(
+        result.columns(),
+        &["status".to_string(), "col2".to_string()]
+    );
+    assert_eq!(
+        result
+            .rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>(),
+        vec![
+            vec![Value::Text("closed".to_string()), Value::Int64(1)],
+            vec![Value::Text("open".to_string()), Value::Int64(2)],
+            vec![Value::Text("resolved".to_string()), Value::Int64(1)],
+        ]
+    );
+}
+
+#[test]
+fn simple_grouped_count_uses_runtime_btree_unique_index_cardinality() {
+    let mut runtime = EngineRuntime::empty(1);
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE issues (id INT64 PRIMARY KEY, status TEXT)",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE UNIQUE INDEX idx_issues_status ON issues (status)",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO issues (id, status) VALUES (1, 'open')",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO issues (id, status) VALUES (2, 'closed')",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO issues (id, status) VALUES (3, 'resolved')",
+    );
+
+    let statement =
+        parse_sql_statement("SELECT status, COUNT(*) FROM issues GROUP BY status ORDER BY status")
+            .expect("parse grouped count");
+    let crate::sql::ast::Statement::Query(query) = &statement else {
+        panic!("expected query statement");
+    };
+
+    let result = runtime
+        .try_execute_simple_grouped_count_query(query, &[])
+        .expect("execute grouped count")
+        .expect("grouped count should stay on fast path");
+
+    assert_eq!(
+        result.columns(),
+        &["status".to_string(), "col2".to_string()]
+    );
+    assert_eq!(
+        result
+            .rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>(),
+        vec![
+            vec![Value::Text("closed".to_string()), Value::Int64(1)],
+            vec![Value::Text("open".to_string()), Value::Int64(1)],
+            vec![Value::Text("resolved".to_string()), Value::Int64(1)],
+        ]
+    );
+}
+
+#[test]
+fn left_join_status_aggregate_uses_index_fast_path() {
+    let mut runtime = EngineRuntime::empty(1);
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE projects (id INT64 PRIMARY KEY, name TEXT)",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE issues (id INT64 PRIMARY KEY, project_id INT64, status TEXT)",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE INDEX idx_issues_project ON issues (project_id)",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO projects (id, name) VALUES (1, 'Alpha')",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO projects (id, name) VALUES (2, 'Beta')",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO projects (id, name) VALUES (3, 'Empty')",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO issues (id, project_id, status) VALUES (10, 1, 'open')",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO issues (id, project_id, status) VALUES (11, 1, 'in_progress')",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO issues (id, project_id, status) VALUES (20, 2, 'resolved')",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO issues (id, project_id, status) VALUES (21, 2, 'closed')",
+    );
+
+    let statement = parse_sql_statement(
+        "SELECT p.id, p.name,
+                SUM(CASE WHEN i.status = 'open' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN i.status = 'in_progress' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN i.status = 'resolved' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN i.status = 'closed' THEN 1 ELSE 0 END),
+                COUNT(i.id)
+         FROM projects p
+         LEFT JOIN issues i ON i.project_id = p.id
+         GROUP BY p.id, p.name
+         ORDER BY COUNT(i.id) DESC, p.id",
+    )
+    .expect("parse project status report");
+    let crate::sql::ast::Statement::Query(query) = &statement else {
+        panic!("expected query statement");
+    };
+
+    let result = runtime
+        .try_execute_left_join_status_aggregate_query(query, &[])
+        .expect("execute project status report")
+        .expect("project status report should stay on fast path");
+
+    assert_eq!(
+        result
+            .rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>(),
+        vec![
+            vec![
+                Value::Int64(1),
+                Value::Text("Alpha".to_string()),
+                Value::Int64(1),
+                Value::Int64(1),
+                Value::Int64(0),
+                Value::Int64(0),
+                Value::Int64(2),
+            ],
+            vec![
+                Value::Int64(2),
+                Value::Text("Beta".to_string()),
+                Value::Int64(0),
+                Value::Int64(0),
+                Value::Int64(1),
+                Value::Int64(1),
+                Value::Int64(2),
+            ],
+            vec![
+                Value::Int64(3),
+                Value::Text("Empty".to_string()),
+                Value::Int64(0),
+                Value::Int64(0),
+                Value::Int64(0),
+                Value::Int64(0),
+                Value::Int64(0),
+            ],
+        ]
+    );
+}
+
+#[test]
 fn simple_grouped_wrapped_group_projection_uses_count_fast_path() {
     let mut runtime = EngineRuntime::empty(1);
     execute_sql(
@@ -1071,6 +1287,53 @@ fn simple_indexed_projection_order_by_limit_offset_uses_fast_path() {
     assert_eq!(result.columns(), &["id".to_string()]);
     assert_eq!(result.rows().len(), 1);
     assert_eq!(result.rows()[0].values(), &[Value::Int64(30)]);
+}
+
+#[test]
+fn simple_indexed_projection_order_by_id_uses_row_id_order_with_limit_offset() {
+    let mut runtime = EngineRuntime::empty(1);
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE issues (id INT64 PRIMARY KEY, project_id INT64)",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE INDEX idx_issues_project ON issues (project_id)",
+    );
+    for (id, project_id) in [(30, 3), (10, 3), (20, 3), (40, 2)] {
+        execute_sql(
+            &mut runtime,
+            &format!("INSERT INTO issues (id, project_id) VALUES ({id}, {project_id})"),
+        );
+    }
+
+    let statement = parse_sql_statement(
+        "SELECT id, project_id FROM issues \
+         WHERE project_id = 3 ORDER BY id ASC LIMIT 2 OFFSET 1",
+    )
+    .expect("parse pagination indexed projection");
+    let crate::sql::ast::Statement::Query(query) = &statement else {
+        panic!("expected query statement");
+    };
+
+    let result = runtime
+        .try_execute_simple_indexed_projection_query(query, &[])
+        .expect("execute pagination indexed projection")
+        .expect("pagination indexed projection should stay on fast path");
+
+    assert_eq!(
+        result.columns(),
+        &["id".to_string(), "project_id".to_string()]
+    );
+    assert_eq!(result.rows().len(), 2);
+    assert_eq!(
+        result.rows()[0].values(),
+        &[Value::Int64(20), Value::Int64(3)]
+    );
+    assert_eq!(
+        result.rows()[1].values(),
+        &[Value::Int64(30), Value::Int64(3)]
+    );
 }
 
 #[test]
@@ -3278,6 +3541,95 @@ fn persist_to_db_resident_paged_row_updates_preserves_untouched_chunk_pointers()
         updated_row.values(),
         &[Value::Int64(6), Value::Text(updated_body)]
     );
+}
+
+#[test]
+fn prepared_simple_update_multiple_assignments_updates_indexed_queries() {
+    let mut runtime = EngineRuntime::empty(1);
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE issues (
+            id INT64 PRIMARY KEY,
+            project_id INT64,
+            status TEXT,
+            title TEXT,
+            updated_at INT64
+        )",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE INDEX idx_issues_status ON issues (status)",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE INDEX idx_issues_project_status ON issues (project_id, status)",
+    );
+
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO issues (id, project_id, status, title, updated_at) VALUES (1, 10, 'open', 'issue-1', 100)",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO issues (id, project_id, status, title, updated_at) VALUES (2, 10, 'closed', 'issue-2', 200)",
+    );
+
+    let statement =
+        parse_sql_statement("UPDATE issues SET status = $1, updated_at = $2 WHERE id = $3")
+            .expect("parse update");
+    let crate::sql::ast::Statement::Update(update) = &statement else {
+        panic!("expected update");
+    };
+    let prepared = runtime
+        .prepare_simple_update(update)
+        .expect("prepare update")
+        .expect("expected prepared update");
+    runtime
+        .execute_prepared_simple_update(
+            &prepared,
+            &[
+                Value::Text("resolved".to_string()),
+                Value::Int64(300),
+                Value::Int64(1),
+            ],
+            PAGE_SIZE,
+        )
+        .expect("execute prepared update");
+
+    let statement = parse_sql_statement(
+        "SELECT id, status FROM issues WHERE project_id = $1 AND status = $2 ORDER BY id",
+    )
+    .expect("parse indexed query");
+    let crate::sql::ast::Statement::Query(query) = &statement else {
+        panic!("expected query");
+    };
+    let result = runtime
+        .try_execute_simple_indexed_projection_query(
+            query,
+            &[Value::Int64(10), Value::Text("resolved".to_string())],
+        )
+        .expect("execute indexed projection")
+        .expect("query should remain on indexed projection path");
+    assert_eq!(
+        result
+            .rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>(),
+        vec![vec![Value::Int64(1), Value::Text("resolved".to_string())]]
+    );
+
+    let statement =
+        parse_sql_statement("SELECT id, status FROM issues WHERE status = $1 ORDER BY id")
+            .expect("parse status-only query");
+    let crate::sql::ast::Statement::Query(query) = &statement else {
+        panic!("expected query");
+    };
+    let old_status = runtime
+        .try_execute_simple_indexed_projection_query(query, &[Value::Text("open".to_string())])
+        .expect("execute old-status query")
+        .expect("old status query should remain on indexed projection path");
+    assert!(old_status.rows().is_empty());
 }
 
 #[test]

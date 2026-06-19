@@ -4,11 +4,13 @@
 mod tests {
     use crate::exec::{
         append_table_payload, decode_table_payload, encode_table_payload,
-        generated_columns_are_stored, map_get_ci, map_get_ci_mut, splice_updated_rows_payload,
-        EngineRuntime, Int64IdentityHasher, Int64Map, PendingIndexInsert, PersistedTableState,
-        RuntimeBtreeKey, RuntimeBtreeKeys, RuntimeRowIdSet, StoredRow, TableData,
+        generated_columns_are_stored, map_get_ci, map_get_ci_mut, splice_deleted_rows_payload,
+        splice_deleted_rows_payload_in_place, splice_updated_rows_payload,
+        splice_updated_rows_payload_in_place, EngineRuntime, Int64IdentityHasher, Int64Map,
+        PendingIndexInsert, PersistedTableState, RuntimeBtreeKey, RuntimeBtreeKeys,
+        RuntimeRowIdSet, StoredRow, TableData,
     };
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::hash::Hasher;
 
     use crate::catalog::{
@@ -547,6 +549,113 @@ mod tests {
     }
 
     #[test]
+    fn splice_updated_rows_payload_preserves_padded_row_slot() {
+        let mut before = TableData::default();
+        before.rows.push(StoredRow {
+            row_id: 1,
+            values: vec![Value::Text("a".to_string()), Value::Int64(10)],
+        });
+        before.rows.push(StoredRow {
+            row_id: 2,
+            values: vec![Value::Text("keep".to_string()), Value::Int64(20)],
+        });
+        let before_payload = encode_table_payload(&before).expect("encode before");
+        let first_row_body_len = u32::from_le_bytes(
+            before_payload[20..24]
+                .try_into()
+                .expect("bad row body length"),
+        ) as usize;
+
+        let updated = TableData::from_rows(vec![
+            StoredRow {
+                row_id: 1,
+                values: vec![Value::Text("ab".to_string()), Value::Int64(10)],
+            },
+            before.rows[1].clone(),
+        ]);
+        let expected_full_payload = encode_table_payload(&updated).expect("encode expected");
+        let expected_first_row_len = u32::from_le_bytes(
+            expected_full_payload[20..24]
+                .try_into()
+                .expect("bad expected row body length"),
+        ) as usize;
+        let first_row_start: usize = 12;
+        let first_row_body_start = first_row_start + 12; // row_id + row_body_len prefix.
+        assert!(
+            expected_first_row_len > first_row_body_len,
+            "updated row should grow but remain within padded row slot"
+        );
+        let expected_last_row_body_byte = first_row_body_start + first_row_body_len;
+
+        let result =
+            splice_updated_rows_payload(&before_payload, &updated, &[0]).expect("splice row");
+        assert_eq!(result.payload.len(), before_payload.len());
+        assert_eq!(result.first_dirty_byte, first_row_body_start);
+        assert_eq!(result.last_dirty_byte, expected_last_row_body_byte);
+        let decoded = decode_table_payload(&result.payload).expect("decode spliced");
+        assert_eq!(decoded.rows.len(), 2);
+        assert_eq!(decoded.rows[0].row_id, 1);
+        assert_eq!(decoded.rows[0].values[0], Value::Text("ab".to_string()));
+        assert_eq!(decoded.rows[1], before.rows[1]);
+    }
+
+    #[test]
+    fn splice_updated_rows_payload_in_place_preserves_padded_row_slot() {
+        let mut before = TableData::default();
+        before.rows.push(StoredRow {
+            row_id: 1,
+            values: vec![Value::Text("a".to_string()), Value::Int64(10)],
+        });
+        before.rows.push(StoredRow {
+            row_id: 2,
+            values: vec![Value::Text("keep".to_string()), Value::Int64(20)],
+        });
+        let mut payload = encode_table_payload(&before).expect("encode before");
+        let original_len = payload.len();
+
+        let updated = TableData::from_rows(vec![
+            StoredRow {
+                row_id: 1,
+                values: vec![Value::Text("ab".to_string()), Value::Int64(10)],
+            },
+            before.rows[1].clone(),
+        ]);
+
+        let range = splice_updated_rows_payload_in_place(&mut payload, &updated, &[0])
+            .expect("splice row")
+            .expect("in-place splice");
+        assert_eq!(payload.len(), original_len);
+        assert_eq!(range.first_dirty_byte, 24);
+        let decoded = decode_table_payload(&payload).expect("decode spliced");
+        assert_eq!(decoded.rows.len(), 2);
+        assert_eq!(decoded.rows[0].values[0], Value::Text("ab".to_string()));
+        assert_eq!(decoded.rows[1], before.rows[1]);
+    }
+
+    #[test]
+    fn splice_updated_rows_payload_in_place_returns_none_when_row_grows_past_slot() {
+        let mut before = TableData::default();
+        before.rows.push(StoredRow {
+            row_id: 1,
+            values: vec![Value::Text("a".to_string()), Value::Int64(10)],
+        });
+        let mut payload = encode_table_payload(&before).expect("encode before");
+        let original = payload.clone();
+        let updated = TableData::from_rows(vec![StoredRow {
+            row_id: 1,
+            values: vec![
+                Value::Text("this value is larger than the row slack".to_string()),
+                Value::Int64(10),
+            ],
+        }]);
+
+        let result = splice_updated_rows_payload_in_place(&mut payload, &updated, &[0])
+            .expect("splice decision");
+        assert!(result.is_none());
+        assert_eq!(payload, original);
+    }
+
+    #[test]
     fn splice_updated_rows_payload_falls_back_on_bad_header() {
         let mut data = TableData::default();
         data.rows.push(StoredRow {
@@ -558,6 +667,180 @@ mod tests {
         let decoded = decode_table_payload(&res.payload).expect("decode");
         assert_eq!(decoded.rows.len(), 1);
         assert_eq!(res.first_dirty_byte, 0);
+    }
+
+    #[test]
+    fn splice_deleted_rows_payload_removes_multiple_rows() {
+        let mut before = TableData::default();
+        for row_id in 1_i64..=5_i64 {
+            before.rows.push(StoredRow {
+                row_id,
+                values: vec![Value::Int64(row_id)],
+            });
+        }
+        let before_payload = encode_table_payload(&before).expect("encode before payload");
+
+        let after = TableData::from_rows(vec![
+            StoredRow {
+                row_id: 1,
+                values: vec![Value::Int64(1)],
+            },
+            StoredRow {
+                row_id: 3,
+                values: vec![Value::Int64(3)],
+            },
+            StoredRow {
+                row_id: 5,
+                values: vec![Value::Int64(5)],
+            },
+        ]);
+        let mut deleted_row_ids = BTreeSet::new();
+        deleted_row_ids.insert(2);
+        deleted_row_ids.insert(4);
+        let first_row_len = u32::from_le_bytes(
+            before_payload[20..24]
+                .try_into()
+                .expect("bad test payload header"),
+        ) as usize;
+        let first_row_start = 12usize + 12 + first_row_len;
+
+        let result = splice_deleted_rows_payload(&before_payload, &after, &deleted_row_ids)
+            .expect("splice delete");
+        let decoded = decode_table_payload(&result.payload).expect("decode payload");
+        assert_eq!(result.first_dirty_byte, first_row_start);
+        assert_eq!(decoded.rows.len(), 3);
+        assert_eq!(
+            decoded
+                .rows
+                .iter()
+                .map(|row| row.row_id)
+                .collect::<Vec<_>>(),
+            vec![1, 3, 5]
+        );
+    }
+
+    #[test]
+    fn splice_deleted_rows_payload_in_place_removes_multiple_rows() {
+        let mut before = TableData::default();
+        for row_id in 1_i64..=5_i64 {
+            before.rows.push(StoredRow {
+                row_id,
+                values: vec![Value::Int64(row_id)],
+            });
+        }
+        let mut payload = encode_table_payload(&before).expect("encode before payload");
+        let original_len = payload.len();
+
+        let after = TableData::from_rows(vec![
+            StoredRow {
+                row_id: 1,
+                values: vec![Value::Int64(1)],
+            },
+            StoredRow {
+                row_id: 3,
+                values: vec![Value::Int64(3)],
+            },
+            StoredRow {
+                row_id: 5,
+                values: vec![Value::Int64(5)],
+            },
+        ]);
+        let mut deleted_row_ids = BTreeSet::new();
+        deleted_row_ids.insert(2);
+        deleted_row_ids.insert(4);
+
+        let dirty_ranges =
+            splice_deleted_rows_payload_in_place(&mut payload, &after, &deleted_row_ids)
+                .expect("splice delete")
+                .expect("in-place delete");
+        assert_eq!(dirty_ranges[0], 8..12);
+        assert!(dirty_ranges.iter().any(|range| range.end < original_len));
+        assert!(payload.len() < original_len);
+
+        let decoded = decode_table_payload(&payload).expect("decode payload");
+        assert_eq!(decoded.rows.len(), 3);
+        assert_eq!(
+            decoded
+                .rows
+                .iter()
+                .map(|row| row.row_id)
+                .collect::<Vec<_>>(),
+            vec![1, 3, 5]
+        );
+    }
+
+    #[test]
+    fn splice_deleted_rows_payload_in_place_returns_none_for_invalid_payload() {
+        let after = TableData::from_rows(vec![StoredRow {
+            row_id: 1,
+            values: vec![Value::Int64(1)],
+        }]);
+        let mut deleted_row_ids = BTreeSet::new();
+        deleted_row_ids.insert(2);
+        let mut payload = vec![0u8, 1, 2];
+        let original = payload.clone();
+
+        let result = splice_deleted_rows_payload_in_place(&mut payload, &after, &deleted_row_ids)
+            .expect("splice decision");
+        assert!(result.is_none());
+        assert_eq!(payload, original);
+    }
+
+    #[test]
+    fn splice_deleted_rows_payload_in_place_returns_none_on_row_count_mismatch() {
+        let before = TableData::from_rows(vec![
+            StoredRow {
+                row_id: 1,
+                values: vec![Value::Int64(1)],
+            },
+            StoredRow {
+                row_id: 2,
+                values: vec![Value::Int64(2)],
+            },
+        ]);
+        let after = TableData::from_rows(vec![StoredRow {
+            row_id: 1,
+            values: vec![Value::Int64(1)],
+        }]);
+        let mut deleted_row_ids = BTreeSet::new();
+        deleted_row_ids.insert(2);
+        deleted_row_ids.insert(99);
+        let mut payload = encode_table_payload(&before).expect("encode before payload");
+        let original = payload.clone();
+
+        let result = splice_deleted_rows_payload_in_place(&mut payload, &after, &deleted_row_ids)
+            .expect("splice decision");
+        assert!(result.is_none());
+        assert_eq!(payload, original);
+    }
+
+    #[test]
+    fn splice_deleted_rows_payload_falls_back_on_missing_deleted_row() {
+        let mut before = TableData::default();
+        before.rows.push(StoredRow {
+            row_id: 1,
+            values: vec![Value::Int64(1)],
+        });
+        before.rows.push(StoredRow {
+            row_id: 2,
+            values: vec![Value::Int64(2)],
+        });
+        let before_payload = encode_table_payload(&before).expect("encode before payload");
+
+        let after = TableData::from_rows(vec![StoredRow {
+            row_id: 1,
+            values: vec![Value::Int64(1)],
+        }]);
+        let mut deleted_row_ids = BTreeSet::new();
+        deleted_row_ids.insert(2);
+        deleted_row_ids.insert(99);
+
+        let result = splice_deleted_rows_payload(&before_payload, &after, &deleted_row_ids)
+            .expect("splice fallback");
+        let decoded = decode_table_payload(&result.payload).expect("decode payload");
+        assert_eq!(result.first_dirty_byte, 0);
+        assert_eq!(decoded.rows.len(), 1);
+        assert_eq!(decoded.rows[0].row_id, 1);
     }
 
     #[test]

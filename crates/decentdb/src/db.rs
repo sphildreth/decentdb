@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 #[cfg(feature = "bench-internals")]
 use crate::benchmark::{
@@ -22,7 +22,8 @@ use crate::catalog::{
 use crate::config::{DbConfig, ProcessCoordinationMode, WalSyncMode};
 use crate::error::{DbError, Result};
 use crate::exec::dml::{
-    row_id_alias_column_name, PreparedSimpleDelete, PreparedSimpleInsert, PreparedSimpleUpdate,
+    row_id_alias_column_name, PreparedDeleteLookup, PreparedSimpleDelete, PreparedSimpleInsert,
+    PreparedSimpleUpdate, PreparedSimpleValueSource,
 };
 use crate::exec::{
     decode_paged_table_manifest_payload, read_table_payload_row_count_from_bytes,
@@ -1457,11 +1458,20 @@ impl Db {
         // to fold into the main database file. After a successful checkpoint
         // this handle's logical WAL end is reset to 0 even though the database
         // header may retain the last folded checkpoint LSN.
-        self.inner
-            .wal
-            .refresh_from_coordination(&self.inner.pager)?;
-        if self.inner.wal.latest_snapshot() != 0 {
+        let mut latest_snapshot = self.inner.wal.latest_snapshot();
+        if latest_snapshot == 0 {
+            if let Some(coordination_snapshot) = self.inner.wal.process_coordination_snapshot()? {
+                if coordination_snapshot.wal_end_lsn != latest_snapshot {
+                    self.inner
+                        .wal
+                        .refresh_from_coordination(&self.inner.pager)?;
+                    latest_snapshot = self.inner.wal.latest_snapshot();
+                }
+            }
+        }
+        if latest_snapshot != 0 {
             self.checkpoint_wal()?;
+            latest_snapshot = self.inner.wal.latest_snapshot();
         }
 
         let vfs = VfsHandle::for_path(dest).with_config(&self.inner.config);
@@ -1471,9 +1481,7 @@ impl Db {
                 std::io::Error::new(std::io::ErrorKind::AlreadyExists, "destination exists"),
             ));
         }
-        if self.inner.wal.latest_snapshot() == 0
-            && self.try_save_as_checkpointed_file_copy(dest, &vfs)?
-        {
+        if latest_snapshot == 0 && self.try_save_as_checkpointed_file_copy(dest, &vfs)? {
             return Ok(());
         }
 
@@ -5757,6 +5765,16 @@ impl Db {
             .lock()
             .map_err(|_| DbError::internal("SQL writer lock poisoned"))?;
         self.record_lock_wait(lw_start, "sql_write", "ok");
+        if matches!(
+            statement,
+            crate::sql::ast::Statement::Update(_) | crate::sql::ast::Statement::Delete(_)
+        ) {
+            if let Some(result) =
+                self.try_execute_cached_autocommit_prepared_dml(sql, statement, params)?
+            {
+                return Ok(result);
+            }
+        }
         if let crate::sql::ast::Statement::Update(update) = statement {
             let prepared = {
                 let runtime = self
@@ -5826,6 +5844,45 @@ impl Db {
         self.execute_autocommit_in_place(|runtime| {
             runtime.execute_statement(statement, params, self.inner.config.page_size)
         })
+    }
+
+    fn try_execute_cached_autocommit_prepared_dml(
+        &self,
+        sql: &str,
+        statement: &crate::sql::ast::Statement,
+        params: &[Value],
+    ) -> Result<Option<QueryResult>> {
+        let prepared = {
+            let runtime = self
+                .inner
+                .engine
+                .read()
+                .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+            self.prepare_with_runtime(sql, &runtime)?
+        };
+        match statement {
+            crate::sql::ast::Statement::Update(_) => {
+                let Some(prepared_update) = prepared.prepared_update.as_deref() else {
+                    return Ok(None);
+                };
+                self.try_execute_autocommit_prepared_update_in_place(
+                    &prepared,
+                    prepared_update,
+                    params,
+                )
+            }
+            crate::sql::ast::Statement::Delete(_) => {
+                let Some(prepared_delete) = prepared.prepared_delete.as_deref() else {
+                    return Ok(None);
+                };
+                self.try_execute_autocommit_prepared_delete_in_place(
+                    &prepared,
+                    prepared_delete,
+                    params,
+                )
+            }
+            _ => Ok(None),
+        }
     }
 
     fn execute_autocommit_temp_only_statement(
@@ -5988,7 +6045,19 @@ impl Db {
                 return Err(error);
             }
         };
-        runtime.rebuild_stale_indexes(self.inner.config.page_size)?;
+        if result.affected_rows() == 0 && !self.runtime_has_persistent_commit_work(&runtime)? {
+            self.sync_temp_state_from_runtime(&runtime)?;
+            drop(runtime);
+            self.redefer_persisted_tables_after_write(&[prepared_update.table_name.as_str()])?;
+            return Ok(result);
+        }
+        if !prepared_update
+            .indexes
+            .iter()
+            .all(|index| runtime.prepared_btree_index_is_fresh(index))
+        {
+            runtime.rebuild_stale_indexes(self.inner.config.page_size)?;
+        }
         let reactive_pending = self.take_reactive_pending_commit(&mut runtime);
         self.begin_write()?;
         if let Err(error) = runtime.persist_to_db(self) {
@@ -6059,6 +6128,12 @@ impl Db {
                 return Err(error);
             }
         };
+        if result.affected_rows() == 0 && !self.runtime_has_persistent_commit_work(&runtime)? {
+            self.sync_temp_state_from_runtime(&runtime)?;
+            drop(runtime);
+            self.redefer_persisted_tables_after_write(&table_names)?;
+            return Ok(result);
+        }
         runtime.rebuild_stale_indexes(self.inner.config.page_size)?;
         let reactive_pending = self.take_reactive_pending_commit(&mut runtime);
         self.begin_write()?;
@@ -6299,7 +6374,19 @@ impl Db {
                 return Err(error);
             }
         };
-        runtime.rebuild_stale_indexes(self.inner.config.page_size)?;
+        if result.affected_rows() == 0 && !self.runtime_has_persistent_commit_work(&runtime)? {
+            self.sync_temp_state_from_runtime(&runtime)?;
+            drop(runtime);
+            self.redefer_persisted_tables_after_write(&[prepared_update.table_name.as_str()])?;
+            return Ok(Some(result));
+        }
+        if !prepared_update
+            .indexes
+            .iter()
+            .all(|index| runtime.prepared_btree_index_is_fresh(index))
+        {
+            runtime.rebuild_stale_indexes(self.inner.config.page_size)?;
+        }
         let reactive_pending = self.take_reactive_pending_commit(&mut runtime);
         self.begin_write()?;
         if let Err(error) = runtime.persist_to_db(self) {
@@ -6343,6 +6430,13 @@ impl Db {
         prepared_delete: &PreparedSimpleDelete,
         params: &[Value],
     ) -> Result<Option<QueryResult>> {
+        if let Some(result) = self.try_execute_zero_row_index_delete_against_current_runtime(
+            prepared_statement,
+            prepared_delete,
+            params,
+        )? {
+            return Ok(Some(result));
+        }
         let mut table_names = vec![prepared_delete.table.name.as_str()];
         for child in &prepared_delete.restrict_children {
             table_names.push(child.child_table_name.as_str());
@@ -6373,6 +6467,12 @@ impl Db {
                 return Err(error);
             }
         };
+        if result.affected_rows() == 0 && !self.runtime_has_persistent_commit_work(&runtime)? {
+            self.sync_temp_state_from_runtime(&runtime)?;
+            drop(runtime);
+            self.redefer_persisted_tables_after_write(&table_names)?;
+            return Ok(Some(result));
+        }
         runtime.rebuild_stale_indexes(self.inner.config.page_size)?;
         let reactive_pending = self.take_reactive_pending_commit(&mut runtime);
         self.begin_write()?;
@@ -6409,6 +6509,63 @@ impl Db {
         self.publish_reactive_commit(reactive_pending, committed_lsn);
         self.redefer_persisted_tables_after_write(&table_names)?;
         Ok(Some(result))
+    }
+
+    fn try_execute_zero_row_index_delete_against_current_runtime(
+        &self,
+        prepared_statement: &PreparedStatement,
+        prepared_delete: &PreparedSimpleDelete,
+        params: &[Value],
+    ) -> Result<Option<QueryResult>> {
+        let PreparedDeleteLookup::Index {
+            index_name,
+            value_source,
+        } = &prepared_delete.lookup
+        else {
+            return Ok(None);
+        };
+        let value = resolve_prepared_simple_value_for_fast_path(value_source, params)?;
+        if matches!(value, Value::Null) {
+            return Ok(Some(QueryResult::with_affected_rows(0)));
+        }
+
+        let latest_lsn = self.inner.wal.latest_snapshot();
+        let latest_checkpoint_epoch = self.inner.wal.checkpoint_epoch();
+        let last_runtime_lsn = self.inner.last_runtime_lsn.load(Ordering::Acquire);
+        let last_seen_checkpoint_epoch = self
+            .inner
+            .last_seen_checkpoint_epoch
+            .load(Ordering::Acquire);
+        if last_runtime_lsn != latest_lsn || last_seen_checkpoint_epoch != latest_checkpoint_epoch {
+            return Ok(None);
+        }
+
+        let runtime = self
+            .inner
+            .engine
+            .read()
+            .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+        self.validate_prepared_schema_cookie(
+            prepared_statement,
+            runtime.catalog.schema_cookie,
+            runtime.temp_schema_cookie,
+        )?;
+        if !runtime.can_reuse_prepared_simple_delete(prepared_delete) {
+            return Ok(None);
+        }
+        let Some(index_schema) = runtime.catalog.indexes.get(index_name) else {
+            return Ok(None);
+        };
+        if !index_schema.fresh || index_schema.kind != IndexKind::Btree {
+            return Ok(None);
+        }
+        let Some(RuntimeIndex::Btree { keys, .. }) = runtime.index(index_name) else {
+            return Ok(None);
+        };
+        if keys.row_ids_for_value_set(&value)?.is_empty() {
+            return Ok(Some(QueryResult::with_affected_rows(0)));
+        }
+        Ok(None)
     }
 
     fn execute_autocommit_in_place<F>(&self, apply: F) -> Result<QueryResult>
@@ -6461,6 +6618,13 @@ impl Db {
         drop(runtime);
         self.publish_reactive_commit(reactive_pending, committed_lsn);
         Ok(result)
+    }
+
+    fn runtime_has_persistent_commit_work(&self, runtime: &EngineRuntime) -> Result<bool> {
+        if !runtime.dirty_tables.is_empty() {
+            return Ok(true);
+        }
+        Ok(self.inner.catalog.schema_cookie()? != runtime.catalog.schema_cookie)
     }
 
     fn backfill_missing_persistent_pk_index_for_table(&self, table_name: &str) -> Result<()> {
@@ -12564,10 +12728,7 @@ impl Db {
         let primary_key_json = serde_json::to_value(&record.primary_key).map_err(|error| {
             DbError::internal(format!("failed to serialize sync primary key: {error}"))
         })?;
-        let created_at_micros = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|duration| duration.as_micros() as i64)
-            .unwrap_or(0);
+        let created_at_micros = current_time_micros();
         let local_row_json_text = conflict
             .local_row_json
             .as_ref()
@@ -12634,7 +12795,14 @@ impl Db {
         table: &TableSchema,
         primary_key: &serde_json::Map<String, JsonValue>,
     ) -> Result<Option<serde_json::Value>> {
-        let runtime = self.runtime_for_metadata_inspection()?;
+        let (mut runtime, snapshot_lsn) = self.runtime_for_targeted_row_source_inspection()?;
+        if let Some(snapshot_lsn) = snapshot_lsn {
+            self.load_runtime_table_row_sources_at_snapshot(
+                &mut runtime,
+                &[table.name.as_str()],
+                snapshot_lsn,
+            )?;
+        }
         let Some(source) = runtime.table_row_source(&table.name) else {
             return Ok(None);
         };
@@ -14747,6 +14915,19 @@ impl Db {
         }
         self.inner.sync_ctx.set_next_sequence(status.next_sequence);
         Ok(true)
+    }
+}
+
+fn resolve_prepared_simple_value_for_fast_path(
+    source: &PreparedSimpleValueSource,
+    params: &[Value],
+) -> Result<Value> {
+    match source {
+        PreparedSimpleValueSource::Literal(value) => Ok(value.clone()),
+        PreparedSimpleValueSource::Parameter(number) => params
+            .get(number.saturating_sub(1))
+            .cloned()
+            .ok_or_else(|| DbError::sql(format!("parameter ${number} was not provided"))),
     }
 }
 
