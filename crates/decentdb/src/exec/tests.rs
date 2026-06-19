@@ -507,6 +507,66 @@ fn simple_grouped_count_uses_runtime_btree_index_cardinality() {
 }
 
 #[test]
+fn simple_grouped_count_uses_runtime_btree_index_cardinality_without_row_source() {
+    let mut runtime = EngineRuntime::empty(1);
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE issues (id INT64 PRIMARY KEY, status TEXT)",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE INDEX idx_issues_status ON issues (status)",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO issues (id, status) VALUES (1, 'open')",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO issues (id, status) VALUES (2, 'closed')",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO issues (id, status) VALUES (3, 'open')",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO issues (id, status) VALUES (4, 'resolved')",
+    );
+
+    let statement =
+        parse_sql_statement("SELECT status, COUNT(*) FROM issues GROUP BY status ORDER BY status")
+            .expect("parse grouped count");
+    let crate::sql::ast::Statement::Query(query) = &statement else {
+        panic!("expected query statement");
+    };
+    let Some(plan) = runtime
+        .analyze_simple_grouped_count_query(query, &[])
+        .expect("analyze grouped count")
+    else {
+        panic!("expected grouped count plan");
+    };
+
+    let result = runtime
+        .try_simple_grouped_count_result_from_runtime_index(None, &plan, &[])
+        .expect("execute grouped count via runtime index")
+        .expect("grouped count should stay on runtime-index path without row source");
+
+    assert_eq!(
+        result
+            .rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>(),
+        vec![
+            vec![Value::Text("closed".to_string()), Value::Int64(1)],
+            vec![Value::Text("open".to_string()), Value::Int64(2)],
+            vec![Value::Text("resolved".to_string()), Value::Int64(1)],
+        ]
+    );
+}
+
+#[test]
 fn simple_grouped_count_uses_runtime_btree_unique_index_cardinality() {
     let mut runtime = EngineRuntime::empty(1);
     execute_sql(

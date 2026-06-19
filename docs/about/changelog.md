@@ -31,9 +31,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   formats.
 - Moved large `db.rs` and `exec/mod.rs` in-file test modules into sibling test
   modules for easier navigation.
+- Optimized aggregate read paths used by issue-tracker style reporting
+  workloads. Simple `GROUP BY <column>, COUNT(*)` queries can now answer from
+  fresh single-column B-tree index cardinalities, including deferred paged-table
+  snapshots without a resident row source, and status-report `LEFT JOIN`
+  aggregates can use the child join index instead of scanning the full child
+  table.
 
 ### Fixed
 
+- Kept deferred read execution paths pinned to one WAL snapshot through final
+  statement execution. This prevents concurrent writer/checkpoint activity from
+  mixing runtime metadata with pages from a different snapshot, which could
+  surface as intermittent overflow payload length mismatch errors under
+  writer/reader stress.
 - Replaced selected production panic-like executor paths with typed SQL/internal
   errors or explicit invariants, with regression tests for those error paths.
 

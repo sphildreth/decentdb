@@ -1957,6 +1957,18 @@ impl Db {
                 return Ok(result);
             }
             if let Some(result) =
+                self.try_execute_simple_grouped_count_sql_fast_path(trimmed, params)?
+            {
+                self.record_statement_trace(
+                    trimmed,
+                    true,
+                    std::time::Duration::ZERO,
+                    0,
+                    Ok(&result),
+                );
+                return Ok(result);
+            }
+            if let Some(result) =
                 self.try_execute_simple_row_id_projection_sql_fast_path(trimmed, params)?
             {
                 self.record_statement_trace(
@@ -2625,6 +2637,19 @@ impl Db {
                 continue;
             }
             if let Some(result) =
+                self.try_execute_simple_grouped_count_sql_fast_path(trimmed, params)?
+            {
+                self.record_statement_trace(
+                    trimmed,
+                    true,
+                    std::time::Duration::ZERO,
+                    0,
+                    Ok(&result),
+                );
+                results.push(result);
+                continue;
+            }
+            if let Some(result) =
                 self.try_execute_simple_row_id_projection_sql_fast_path(trimmed, params)?
             {
                 self.record_statement_trace(
@@ -2636,6 +2661,39 @@ impl Db {
                 );
                 results.push(result);
                 continue;
+            }
+            if !self.inner.sql_txn_active.load(Ordering::Acquire) && params.is_empty() {
+                if let Ok(prepared_sql) = prepared_statement_sql(trimmed) {
+                    if let Some(prepared) = self.try_prepare_from_plan_cache(&prepared_sql)? {
+                        if prepared.read_only {
+                            let start = if self.inner.tracing.any_enabled() {
+                                Some((
+                                    std::time::Instant::now(),
+                                    std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_millis() as i64,
+                                ))
+                            } else {
+                                None
+                            };
+                            let result = self.execute_prepared_statement(&prepared, params);
+                            if let Some((t0, unix_ms)) = start {
+                                let dur = t0.elapsed();
+                                self.record_statement_trace(
+                                    trimmed,
+                                    true,
+                                    dur,
+                                    unix_ms,
+                                    result.as_ref(),
+                                );
+                            }
+                            let result = result?;
+                            results.push(result);
+                            continue;
+                        }
+                    }
+                }
             }
 
             reject_unsupported_collated_key_sql(trimmed)?;
@@ -2875,6 +2933,33 @@ impl Db {
             vec!["COUNT(*)".to_string()],
             vec![QueryRow::new(vec![Value::Int64(row_count)])],
         )))
+    }
+
+    fn try_execute_simple_grouped_count_sql_fast_path(
+        &self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Option<QueryResult>> {
+        if !params.is_empty() || self.inner.sql_txn_active.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let Some(plan) = parse_simple_grouped_count_sql(sql) else {
+            return Ok(None);
+        };
+
+        let reader = self.inner.wal.begin_reader_with_pager(&self.inner.pager)?;
+        let snapshot_lsn = reader.snapshot_lsn();
+        self.refresh_engine_from_snapshot(snapshot_lsn)?;
+        let Some(runtime) = self.runtime_read_for_fast_read_at_snapshot(snapshot_lsn)? else {
+            return Ok(None);
+        };
+        let result = runtime.try_execute_simple_grouped_count_sql_from_runtime_index(
+            plan.table_name,
+            plan.group_column,
+        )?;
+        drop(runtime);
+        drop(reader);
+        Ok(result)
     }
 
     fn try_execute_simple_row_id_projection_sql_fast_path(
@@ -3966,11 +4051,11 @@ impl Db {
         }
 
         // Fast path: when the statement's base tables are already resident at
-        // the latest snapshot (e.g. after a same-handle bulk load or write
-        // with `retain_paged_row_sources_after_commit`), execute directly
-        // against the resident runtime without beginning a WAL reader or
-        // reloading row sources. This skips the per-statement O(table size)
-        // reload that dominates filtered/aggregate read workloads otherwise.
+        // the pinned reader snapshot (e.g. after a same-handle bulk load or
+        // write with `retain_paged_row_sources_after_commit`), execute against
+        // the resident runtime without reloading row sources. This skips the
+        // per-statement O(table size) reload that dominates filtered/aggregate
+        // read workloads otherwise.
         //
         // Gated off when Lua extensions are active: the deferred path's
         // `ensure_tables_loaded_at_snapshot` loads extension catalog tables
@@ -3980,19 +4065,22 @@ impl Db {
         // and masks could be treated as absent by the generic executor.
         let extension_execution_enabled = self.inner.config.extension_unsigned_development_mode
             || !self.inner.config.extension_trust_anchors.is_empty();
-        if !extension_execution_enabled {
-            if let Some(runtime) = self.try_resident_read_for_statement(statement, prepared)? {
-                let result =
-                    runtime.execute_read_statement(statement, params, self.inner.config.page_size);
-                drop(runtime);
-                return self.finalize_row_source_autocommit_statement(statement, result);
-            }
-        }
-
         #[cfg(feature = "bench-internals")]
         READ_PATH_WAL_READER_BEGIN_COUNT.fetch_add(1, Ordering::Relaxed);
         let mut reader = self.inner.wal.begin_reader_with_pager(&self.inner.pager)?;
         let mut snapshot_lsn = reader.snapshot_lsn();
+        if !extension_execution_enabled {
+            if let Some(runtime) =
+                self.try_resident_read_for_statement_at_snapshot(statement, prepared, snapshot_lsn)?
+            {
+                let result =
+                    runtime.execute_read_statement(statement, params, self.inner.config.page_size);
+                drop(runtime);
+                drop(reader);
+                return self.finalize_row_source_autocommit_statement(statement, result);
+            }
+        }
+
         self.refresh_engine_from_snapshot(snapshot_lsn)?;
         if self.inner.config.extension_unsigned_development_mode
             || !self.inner.config.extension_trust_anchors.is_empty()
@@ -4211,7 +4299,6 @@ impl Db {
                     }
                     drop(runtime);
                     self.ensure_table_row_sources_loaded_at_snapshot(&names, snapshot_lsn)?;
-                    drop(reader);
                     let runtime = self
                         .inner
                         .engine
@@ -4234,7 +4321,6 @@ impl Db {
         if !targeted_ok {
             self.ensure_all_tables_loaded_at_snapshot(Some(snapshot_lsn))?;
         }
-        drop(reader);
 
         let runtime = self
             .inner
@@ -5172,9 +5258,12 @@ impl Db {
             return Ok(None);
         };
 
-        if let Some(runtime) =
-            self.runtime_read_for_current_prepared_row_sources(&[plan.table_name.as_str()])?
-        {
+        let reader = self.inner.wal.begin_reader_with_pager(&self.inner.pager)?;
+        let snapshot_lsn = reader.snapshot_lsn();
+        if let Some(runtime) = self.runtime_read_for_prepared_row_sources_at_snapshot(
+            &[plan.table_name.as_str()],
+            snapshot_lsn,
+        )? {
             self.validate_prepared_schema_cookie(
                 prepared,
                 runtime.catalog.schema_cookie,
@@ -5188,23 +5277,24 @@ impl Db {
                     lookup_row_id: *lookup_row_id,
                     pager: &self.inner.pager,
                     wal: &self.inner.wal,
-                    snapshot_lsn: self.inner.last_runtime_lsn.load(Ordering::Acquire),
+                    snapshot_lsn,
                     use_persistent_pk_index: self.inner.config.persistent_pk_index,
                 },
             )?;
             if result.is_some() {
+                drop(runtime);
+                drop(reader);
                 return Ok(result);
             }
+            drop(runtime);
         }
-
-        let reader = self.inner.wal.begin_reader_with_pager(&self.inner.pager)?;
-        let snapshot_lsn = reader.snapshot_lsn();
         self.refresh_engine_from_snapshot(snapshot_lsn)?;
         self.try_load_prepared_read_row_sources_at_snapshot(
             &[plan.table_name.as_str()],
             snapshot_lsn,
         )?;
         let Some(runtime) = self.runtime_read_for_fast_read_at_snapshot(snapshot_lsn)? else {
+            drop(reader);
             return Ok(None);
         };
         self.validate_prepared_schema_cookie(
@@ -5267,9 +5357,12 @@ impl Db {
         };
         let limit = Some(usize::try_from((*limit_value).max(0)).unwrap_or(usize::MAX));
 
-        if let Some(runtime) =
-            self.runtime_read_for_current_prepared_row_sources(&[plan.table_name.as_str()])?
-        {
+        let reader = self.inner.wal.begin_reader_with_pager(&self.inner.pager)?;
+        let snapshot_lsn = reader.snapshot_lsn();
+        if let Some(runtime) = self.runtime_read_for_prepared_row_sources_at_snapshot(
+            &[plan.table_name.as_str()],
+            snapshot_lsn,
+        )? {
             self.validate_prepared_schema_cookie(
                 prepared,
                 runtime.catalog.schema_cookie,
@@ -5286,23 +5379,24 @@ impl Db {
                     limit,
                     pager: &self.inner.pager,
                     wal: &self.inner.wal,
-                    snapshot_lsn: self.inner.last_runtime_lsn.load(Ordering::Acquire),
+                    snapshot_lsn,
                     use_persistent_pk_index: self.inner.config.persistent_pk_index,
                 },
             )?;
             if result.is_some() {
+                drop(runtime);
+                drop(reader);
                 return Ok(result);
             }
+            drop(runtime);
         }
-
-        let reader = self.inner.wal.begin_reader_with_pager(&self.inner.pager)?;
-        let snapshot_lsn = reader.snapshot_lsn();
         self.refresh_engine_from_snapshot(snapshot_lsn)?;
         self.try_load_prepared_read_row_sources_at_snapshot(
             &[plan.table_name.as_str()],
             snapshot_lsn,
         )?;
         let Some(runtime) = self.runtime_read_for_fast_read_at_snapshot(snapshot_lsn)? else {
+            drop(reader);
             return Ok(None);
         };
         self.validate_prepared_schema_cookie(
@@ -5349,7 +5443,11 @@ impl Db {
             plan.left_table_name.as_str(),
             plan.right_table_name.as_str(),
         ];
-        if let Some(runtime) = self.runtime_read_for_current_prepared_row_sources(&join_tables)? {
+        let reader = self.inner.wal.begin_reader_with_pager(&self.inner.pager)?;
+        let snapshot_lsn = reader.snapshot_lsn();
+        if let Some(runtime) =
+            self.runtime_read_for_prepared_row_sources_at_snapshot(&join_tables, snapshot_lsn)?
+        {
             self.validate_prepared_schema_cookie(
                 prepared,
                 runtime.catalog.schema_cookie,
@@ -5366,20 +5464,21 @@ impl Db {
                     lookup_row_id: *lookup_row_id,
                     pager: &self.inner.pager,
                     wal: &self.inner.wal,
-                    snapshot_lsn: self.inner.last_runtime_lsn.load(Ordering::Acquire),
+                    snapshot_lsn,
                     use_persistent_pk_index: self.inner.config.persistent_pk_index,
                 },
             )?;
             if result.is_some() {
+                drop(runtime);
+                drop(reader);
                 return Ok(result);
             }
+            drop(runtime);
         }
-
-        let reader = self.inner.wal.begin_reader_with_pager(&self.inner.pager)?;
-        let snapshot_lsn = reader.snapshot_lsn();
         self.refresh_engine_from_snapshot(snapshot_lsn)?;
         self.try_load_prepared_read_row_sources_at_snapshot(&join_tables, snapshot_lsn)?;
         let Some(runtime) = self.runtime_read_for_fast_read_at_snapshot(snapshot_lsn)? else {
+            drop(reader);
             return Ok(None);
         };
         self.validate_prepared_schema_cookie(
@@ -8002,12 +8101,9 @@ impl Db {
             .last_seen_checkpoint_epoch
             .load(Ordering::Acquire);
         let last_runtime_lsn = self.inner.last_runtime_lsn.load(Ordering::Acquire);
-        let writer_last_commit_lsn = self.inner.writer_last_commit_lsn.load(Ordering::Acquire);
-        let mut checkpoint_lsn_after_refresh = None;
         if latest_checkpoint_epoch != last_seen_checkpoint_epoch {
             let cached_header = self.inner.pager.header_snapshot()?;
             let on_disk_header = self.inner.pager.header_from_disk()?;
-            checkpoint_lsn_after_refresh = Some(on_disk_header.last_checkpoint_lsn);
             if on_disk_header.last_checkpoint_lsn != cached_header.last_checkpoint_lsn {
                 self.inner.pager.refresh_from_disk(on_disk_header)?;
             }
@@ -8018,19 +8114,6 @@ impl Db {
         }
         if snapshot_lsn == last_runtime_lsn && latest_checkpoint_epoch == last_seen_checkpoint_epoch
         {
-            return Ok(());
-        }
-        if last_runtime_lsn > 0
-            && writer_last_commit_lsn > 0
-            && last_runtime_lsn >= writer_last_commit_lsn
-            && snapshot_lsn <= writer_last_commit_lsn
-            && checkpoint_lsn_after_refresh.is_some_and(|checkpoint_lsn| {
-                checkpoint_lsn >= writer_last_commit_lsn && checkpoint_lsn <= last_runtime_lsn
-            })
-        {
-            self.inner
-                .last_runtime_lsn
-                .store(snapshot_lsn, Ordering::Release);
             return Ok(());
         }
 
@@ -8545,30 +8628,30 @@ impl Db {
 
     /// Fast path for non-transactional reads when deferred materialization is
     /// enabled but the statement's base tables are already resident at the
-    /// latest snapshot LSN.
+    /// pinned reader snapshot.
     ///
     /// Returns a read guard over the resident runtime when the statement can
-    /// be executed without beginning a WAL reader or reloading row sources.
+    /// be executed without reloading row sources.
     /// Returns `Ok(None)` when any referenced base table is not resident, the
     /// runtime LSN is stale, a checkpoint has advanced, or the statement's
     /// base-table set cannot be resolved (callers fall back to the deferred
     /// load path in that case).
-    fn try_resident_read_for_statement(
+    fn try_resident_read_for_statement_at_snapshot(
         &self,
         statement: &SqlStatement,
         prepared: Option<&PreparedStatement>,
+        snapshot_lsn: u64,
     ) -> Result<Option<RwLockReadGuard<'_, EngineRuntime>>> {
         if !self.inner.config.defer_table_materialization {
             return Ok(None);
         }
-        let latest_lsn = self.inner.wal.latest_snapshot();
-        let latest_checkpoint_epoch = self.inner.wal.checkpoint_epoch();
+        let checkpoint_epoch = self.inner.wal.checkpoint_epoch();
         let last_runtime_lsn = self.inner.last_runtime_lsn.load(Ordering::Acquire);
         let last_seen_checkpoint_epoch = self
             .inner
             .last_seen_checkpoint_epoch
             .load(Ordering::Acquire);
-        if last_runtime_lsn != latest_lsn || last_seen_checkpoint_epoch != latest_checkpoint_epoch {
+        if last_runtime_lsn != snapshot_lsn || last_seen_checkpoint_epoch != checkpoint_epoch {
             return Ok(None);
         }
         let runtime = self
@@ -8576,6 +8659,15 @@ impl Db {
             .engine
             .read()
             .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+        let current_runtime_lsn = self.inner.last_runtime_lsn.load(Ordering::Acquire);
+        let current_seen_checkpoint_epoch = self
+            .inner
+            .last_seen_checkpoint_epoch
+            .load(Ordering::Acquire);
+        if current_runtime_lsn != snapshot_lsn || current_seen_checkpoint_epoch != checkpoint_epoch
+        {
+            return Ok(None);
+        }
         self.validate_prepared_against_runtime(prepared, &runtime)?;
         if Self::runtime_has_deferred_security_tables(&runtime)
             || runtime.security_rules_active()?
@@ -8601,14 +8693,14 @@ impl Db {
         }
     }
 
-    fn runtime_read_for_current_prepared_row_sources(
+    fn runtime_read_for_prepared_row_sources_at_snapshot(
         &self,
         names: &[&str],
+        snapshot_lsn: u64,
     ) -> Result<Option<RwLockReadGuard<'_, EngineRuntime>>> {
         if names.is_empty() {
             return Ok(None);
         }
-        let latest_lsn = self.inner.wal.latest_snapshot();
         let latest_checkpoint_epoch = self.inner.wal.checkpoint_epoch();
         let runtime = self
             .inner
@@ -8620,7 +8712,7 @@ impl Db {
             .inner
             .last_seen_checkpoint_epoch
             .load(Ordering::Acquire);
-        if last_runtime_lsn != latest_lsn
+        if last_runtime_lsn != snapshot_lsn
             || last_seen_checkpoint_epoch != latest_checkpoint_epoch
             || names.iter().any(|name| {
                 runtime

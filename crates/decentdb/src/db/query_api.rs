@@ -71,6 +71,12 @@ pub(super) struct SimpleCountSqlPlan<'a> {
     pub(super) table_name: &'a str,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SimpleGroupedCountSqlPlan<'a> {
+    pub(super) table_name: &'a str,
+    pub(super) group_column: &'a str,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SimpleRowIdProjectionSqlPlan<'a> {
     pub(super) table_name: &'a str,
@@ -115,6 +121,58 @@ pub(super) fn parse_simple_count_star_sql(sql: &str) -> Option<SimpleCountSqlPla
         return None;
     }
     Some(SimpleCountSqlPlan { table_name })
+}
+
+pub(super) fn parse_simple_grouped_count_sql(sql: &str) -> Option<SimpleGroupedCountSqlPlan<'_>> {
+    let trimmed = sql.trim();
+    if !trimmed.is_ascii() {
+        return None;
+    }
+    if trimmed.len() <= 7 || !trimmed[..7].eq_ignore_ascii_case("select ") {
+        return None;
+    }
+
+    let from_index = find_ascii_case_insensitive(trimmed, " from ")?;
+    let group_marker = " group by ";
+    let group_index = find_ascii_case_insensitive(&trimmed[from_index + 6..], group_marker)
+        .map(|index| from_index + 6 + index)?;
+    let order_marker = " order by ";
+    let order_index =
+        find_ascii_case_insensitive(&trimmed[group_index + group_marker.len()..], order_marker)
+            .map(|index| group_index + group_marker.len() + index)?;
+
+    let projection_sql = trimmed[6..from_index].trim();
+    let table_name = trimmed[from_index + 6..group_index].trim();
+    let group_column = trimmed[group_index + group_marker.len()..order_index].trim();
+    let order_sql = trimmed[order_index + order_marker.len()..].trim();
+    let mut order_parts = order_sql.split_ascii_whitespace();
+    let order_column = order_parts.next()?;
+    let order_direction = order_parts.next();
+    if order_parts.next().is_some()
+        || order_direction.is_some_and(|direction| !direction.eq_ignore_ascii_case("asc"))
+    {
+        return None;
+    }
+
+    let mut projection_parts = projection_sql.split(',');
+    let projection_column = projection_parts.next()?.trim();
+    let count_expr = projection_parts.next()?.trim();
+    if projection_parts.next().is_some()
+        || !is_simple_sql_identifier(table_name)
+        || !is_simple_sql_identifier(projection_column)
+        || !is_simple_sql_identifier(group_column)
+        || !is_simple_sql_identifier(order_column)
+        || !identifiers_equal(projection_column, group_column)
+        || !identifiers_equal(order_column, group_column)
+        || !count_expr.eq_ignore_ascii_case("count(*)")
+    {
+        return None;
+    }
+
+    Some(SimpleGroupedCountSqlPlan {
+        table_name,
+        group_column,
+    })
 }
 
 pub(super) fn parse_simple_row_id_projection_sql(

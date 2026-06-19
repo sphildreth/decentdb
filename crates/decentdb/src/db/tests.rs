@@ -23,9 +23,10 @@ use crate::sql::parser::parse_sql_statement;
 use crate::{BulkLoadOptions, Db, QueuedWriteOptions, Value, WalSyncMode};
 
 use super::{
-    parse_simple_count_star_sql, parse_simple_row_id_projection_sql,
-    parse_simple_row_id_range_projection_sql, simple_single_statement_fast_path_sql,
-    split_sql_batch, PreparedInsertCache, StatementCache, TempSchemaState,
+    parse_simple_count_star_sql, parse_simple_grouped_count_sql,
+    parse_simple_row_id_projection_sql, parse_simple_row_id_range_projection_sql,
+    simple_single_statement_fast_path_sql, split_sql_batch, PreparedInsertCache, StatementCache,
+    TempSchemaState,
 };
 
 #[derive(Debug)]
@@ -343,6 +344,65 @@ fn simple_count_sql_fast_path_parser_accepts_only_plain_count_star() {
     assert_eq!(plan.table_name, "songs");
     assert!(parse_simple_count_star_sql("SELECT COUNT(id) FROM songs").is_none());
     assert!(parse_simple_count_star_sql("SELECT COUNT(*) FROM songs WHERE id = 1").is_none());
+}
+
+#[test]
+fn simple_grouped_count_sql_fast_path_parser_accepts_plain_grouped_count() {
+    let plan = parse_simple_grouped_count_sql(
+        "SELECT status, COUNT(*) FROM issues GROUP BY status ORDER BY status",
+    )
+    .expect("simple grouped count");
+    assert_eq!(plan.table_name, "issues");
+    assert_eq!(plan.group_column, "status");
+
+    assert!(parse_simple_grouped_count_sql(
+        "SELECT status, COUNT(id) FROM issues GROUP BY status ORDER BY status"
+    )
+    .is_none());
+    assert!(parse_simple_grouped_count_sql(
+        "SELECT status, COUNT(*) FROM issues GROUP BY priority ORDER BY status"
+    )
+    .is_none());
+    assert!(parse_simple_grouped_count_sql(
+        "SELECT status, COUNT(*) FROM issues GROUP BY status ORDER BY status DESC"
+    )
+    .is_none());
+    assert!(parse_simple_grouped_count_sql(
+        "SELECT status, COUNT(*) FROM issues WHERE priority = 1 GROUP BY status ORDER BY status"
+    )
+    .is_none());
+}
+
+#[test]
+fn simple_grouped_count_sql_fast_path_executes_from_db() -> Result<()> {
+    let dir = TempDir::new().expect("create temp dir");
+    let path = dir.path().join("grouped-count-fast-path.ddb");
+    let db = Db::open_or_create(path, DbConfig::default())?;
+    db.execute("CREATE TABLE issues (id INT64 PRIMARY KEY, status TEXT)")?;
+    db.execute("CREATE INDEX idx_issues_status ON issues (status)")?;
+    db.execute("INSERT INTO issues (id, status) VALUES (1, 'open')")?;
+    db.execute("INSERT INTO issues (id, status) VALUES (2, 'closed')")?;
+    db.execute("INSERT INTO issues (id, status) VALUES (3, 'open')")?;
+
+    let result =
+        db.execute("SELECT status, COUNT(*) FROM issues GROUP BY status ORDER BY status;")?;
+
+    assert_eq!(
+        result.columns(),
+        &["status".to_string(), "col2".to_string()]
+    );
+    assert_eq!(
+        result
+            .rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>(),
+        vec![
+            vec![Value::Text("closed".to_string()), Value::Int64(1)],
+            vec![Value::Text("open".to_string()), Value::Int64(2)],
+        ]
+    );
+    Ok(())
 }
 
 #[test]

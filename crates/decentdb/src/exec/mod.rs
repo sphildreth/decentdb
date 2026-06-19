@@ -4797,16 +4797,16 @@ impl EngineRuntime {
                 if let Some(result) = self.try_execute_simple_min_max_query(query)? {
                     return Ok(result);
                 }
+                if let Some(result) =
+                    self.try_execute_left_join_status_aggregate_query(query, params)?
+                {
+                    return Ok(result);
+                }
                 if let Some(result) = self.try_execute_simple_grouped_count_query(query, params)? {
                     return Ok(result);
                 }
                 if let Some(result) =
                     self.try_execute_simple_grouped_numeric_aggregate_query(query, params)?
-                {
-                    return Ok(result);
-                }
-                if let Some(result) =
-                    self.try_execute_left_join_status_aggregate_query(query, params)?
                 {
                     return Ok(result);
                 }
@@ -5535,7 +5535,7 @@ impl EngineRuntime {
         params: &[Value],
     ) -> Result<QueryResult> {
         if let Some(result) =
-            self.try_simple_grouped_count_result_from_runtime_index(row_source, plan, params)?
+            self.try_simple_grouped_count_result_from_runtime_index(Some(row_source), plan, params)?
         {
             return Ok(result);
         }
@@ -5585,7 +5585,7 @@ impl EngineRuntime {
 
     fn try_simple_grouped_count_result_from_runtime_index(
         &self,
-        row_source: VisibleTableRowSource<'_>,
+        row_source: Option<VisibleTableRowSource<'_>>,
         plan: &SimpleGroupedCountPlan<'_>,
         params: &[Value],
     ) -> Result<Option<QueryResult>> {
@@ -5655,7 +5655,7 @@ impl EngineRuntime {
                     let Some(values) = Self::runtime_index_key_values_to_group_values(
                         key,
                         Some(*row_id),
-                        &row_source,
+                        row_source,
                         &[group_column_index],
                     )?
                     else {
@@ -5676,7 +5676,7 @@ impl EngineRuntime {
                     let Some(values) = Self::runtime_index_key_values_to_group_values(
                         key,
                         Some(row_id),
-                        &row_source,
+                        row_source,
                         &[group_column_index],
                     )?
                     else {
@@ -5699,18 +5699,130 @@ impl EngineRuntime {
         )?))
     }
 
+    pub(crate) fn try_execute_simple_grouped_count_sql_from_runtime_index(
+        &self,
+        table_name: &str,
+        group_column: &str,
+    ) -> Result<Option<QueryResult>> {
+        if self.security_rules_active()?
+            || self
+                .visible_view(table_name, NameResolutionScope::Session)
+                .is_some()
+            || self.visible_table_is_temporary(table_name)
+        {
+            return Ok(None);
+        }
+        let Some(table_schema) = self.table_schema(table_name) else {
+            return Ok(None);
+        };
+        if !generated_columns_are_stored(table_schema) {
+            return Ok(None);
+        }
+        let Some(group_column_index) = schema_column_index(table_schema, group_column) else {
+            return Ok(None);
+        };
+        let Some(index) = self.single_column_btree_index(table_name, group_column) else {
+            return Ok(None);
+        };
+        let Some(RuntimeIndex::Btree { keys, .. }) = self.index(&index.name) else {
+            return Ok(None);
+        };
+
+        let mut groups = Vec::new();
+        match keys {
+            RuntimeBtreeKeys::UniqueInt64(entries) => {
+                groups.reserve(entries.len());
+                for key in entries.keys() {
+                    groups.push(SimpleGroupedCountAggregate {
+                        group_values: vec![Value::Int64(*key)],
+                        count: 1,
+                    });
+                }
+            }
+            RuntimeBtreeKeys::NonUniqueInt64(entries) => {
+                groups.reserve(entries.len());
+                for (key, row_ids) in entries {
+                    if row_ids.is_empty() {
+                        continue;
+                    }
+                    groups.push(SimpleGroupedCountAggregate {
+                        group_values: vec![Value::Int64(*key)],
+                        count: i64::try_from(row_ids.len()).map_err(|_| {
+                            DbError::constraint(
+                                "grouped COUNT index bucket exceeds INT64 row-count limits",
+                            )
+                        })?,
+                    });
+                }
+            }
+            RuntimeBtreeKeys::UniqueEncoded(entries) => {
+                groups.reserve(entries.len());
+                for key in entries.keys() {
+                    let Some(value) = Self::decode_runtime_index_group_key(key) else {
+                        return Ok(None);
+                    };
+                    groups.push(SimpleGroupedCountAggregate {
+                        group_values: vec![value],
+                        count: 1,
+                    });
+                }
+            }
+            RuntimeBtreeKeys::NonUniqueEncoded(entries) => {
+                groups.reserve(entries.len());
+                for (key, row_ids) in entries {
+                    if row_ids.is_empty() {
+                        continue;
+                    }
+                    let Some(value) = Self::decode_runtime_index_group_key(key) else {
+                        return Ok(None);
+                    };
+                    groups.push(SimpleGroupedCountAggregate {
+                        group_values: vec![value],
+                        count: i64::try_from(row_ids.len()).map_err(|_| {
+                            DbError::constraint(
+                                "grouped COUNT index bucket exceeds INT64 row-count limits",
+                            )
+                        })?,
+                    });
+                }
+            }
+        }
+
+        let mut rows = groups
+            .into_iter()
+            .map(SimpleGroupedCountAggregate::into_row)
+            .collect::<Vec<_>>();
+        sort_query_rows_by_projection_order(
+            Some(self),
+            &mut rows,
+            &[SimpleOrderByPlan {
+                projection_index: 0,
+                descending: false,
+                collation: None,
+            }],
+        )?;
+        Ok(Some(QueryResult::with_rows(
+            vec![
+                table_schema.columns[group_column_index].name.clone(),
+                "col2".to_string(),
+            ],
+            rows,
+        )))
+    }
+
     fn runtime_index_key_values_to_group_values<'a>(
         key: &'a [u8],
         row_id: Option<i64>,
-        row_source: &VisibleTableRowSource<'a>,
+        row_source: Option<VisibleTableRowSource<'a>>,
         projection_indexes: &[usize],
     ) -> Result<Option<Vec<Value>>> {
         if let Some(value) = Self::decode_runtime_index_group_key(key) {
             return Ok(Some(vec![value]));
         }
 
-        let Some(row_id) = row_id else {
-            return Ok(None);
+        let (row_source, row_id) = match (row_source, row_id) {
+            (Some(row_source), Some(row_id)) => (row_source, row_id),
+            _ => return Ok(None),
         };
         row_source.projected_values_by_id(row_id, projection_indexes)
     }
@@ -6997,6 +7109,11 @@ impl EngineRuntime {
         {
             return Ok(None);
         }
+        if let Some(result) =
+            self.try_simple_grouped_count_result_from_runtime_index(None, &plan, params)?
+        {
+            return Ok(Some(result));
+        }
         let Some(state) = self.persisted_table_state(plan.table_name) else {
             return Ok(None);
         };
@@ -7373,6 +7490,92 @@ impl EngineRuntime {
             .as_deref()
             .zip(plan.limit)
             .filter(|(_, _)| plan.offset == 0);
+        let child_index_keys =
+            plan.child_index_name
+                .as_deref()
+                .and_then(|index_name| match self.index(index_name) {
+                    Some(RuntimeIndex::Btree { keys, .. }) => Some(keys),
+                    _ => None,
+                });
+
+        if let Some(keys) = child_index_keys {
+            let mut rows = Vec::new();
+            for parent_row in parent_source.rows() {
+                let parent_row = parent_row?;
+                let parent_values = parent_row.values();
+                let Some(join_value) = parent_values.get(plan.parent_join_index) else {
+                    return Err(DbError::internal("parent join row is shorter than schema"));
+                };
+
+                let mut counts = LeftJoinStatusCounts::default();
+                if !matches!(join_value, Value::Null) {
+                    let child_row_ids = keys.row_ids_for_value_set(join_value)?;
+                    match child_row_ids {
+                        RuntimeRowIdSet::Empty => {}
+                        RuntimeRowIdSet::Single(child_row_id) => {
+                            let Some(child_row) = child_source.row_by_id(child_row_id)? else {
+                                return Err(DbError::internal(
+                                    "child index referenced missing row id",
+                                ));
+                            };
+                            add_status_aggregate_child_row(&mut counts, child_row.values(), &plan)?;
+                        }
+                        RuntimeRowIdSet::Many(row_ids) => {
+                            for child_row_id in row_ids {
+                                let Some(child_row) = child_source.row_by_id(*child_row_id)? else {
+                                    return Err(DbError::internal(
+                                        "child index referenced missing row id",
+                                    ));
+                                };
+                                add_status_aggregate_child_row(
+                                    &mut counts,
+                                    child_row.values(),
+                                    &plan,
+                                )?;
+                            }
+                        }
+                    }
+                }
+
+                let mut output = Vec::with_capacity(plan.group_column_indexes.len() + 5);
+                for index in &plan.group_column_indexes {
+                    output.push(parent_values[*index].clone());
+                }
+                output.push(Value::Int64(counts.open_count));
+                output.push(Value::Int64(counts.in_progress_count));
+                output.push(Value::Int64(counts.resolved_count));
+                output.push(Value::Int64(counts.closed_count));
+                output.push(Value::Int64(counts.total_count));
+                let row = QueryRow::new(output);
+
+                if let Some((order_by, limit)) = bounded_order {
+                    push_bounded_projection_ordered_query_row(
+                        Some(self),
+                        &mut rows,
+                        row,
+                        order_by,
+                        limit,
+                    )?;
+                } else {
+                    rows.push(row);
+                }
+            }
+
+            if let Some((order_by, _)) = bounded_order {
+                sort_query_rows_by_projection_order(Some(self), &mut rows, order_by)?;
+                return Ok(Some(QueryResult::with_rows(plan.column_names, rows)));
+            }
+
+            return Ok(Some(apply_simple_projection_postprocessing_with_order(
+                Some(self),
+                rows,
+                plan.column_names,
+                plan.order_by.as_deref(),
+                plan.limit,
+                plan.offset,
+            )?));
+        }
+
         let mut counts_by_join_key = HashMap::<Vec<u8>, LeftJoinStatusCounts>::new();
         for child_row in child_source.rows() {
             let child_row = child_row?;
@@ -7707,6 +7910,9 @@ impl EngineRuntime {
         let child_id_index = schema_column_index(child_schema, "id").ok_or_else(|| {
             DbError::internal(format!("column id not found in child table {}", child_name))
         })?;
+        let child_index_name = self
+            .single_column_btree_index(child_name, child_join_column)
+            .map(|index| index.name.clone());
 
         let order_by = projection_order_by_plan(&query.order_by, &select.projection);
         if !query.order_by.is_empty() {
@@ -7749,6 +7955,7 @@ impl EngineRuntime {
             child_join_index,
             child_status_index,
             child_id_index,
+            child_index_name,
             group_column_indexes,
             column_names,
             order_by,
@@ -19100,11 +19307,26 @@ struct LeftJoinStatusAggregatePlan<'a> {
     child_join_index: usize,
     child_status_index: usize,
     child_id_index: usize,
+    child_index_name: Option<String>,
     group_column_indexes: Vec<usize>,
     column_names: Vec<String>,
     order_by: Option<Vec<SimpleOrderByPlan>>,
     limit: Option<usize>,
     offset: usize,
+}
+
+fn add_status_aggregate_child_row(
+    counts: &mut LeftJoinStatusCounts,
+    child_values: &[Value],
+    plan: &LeftJoinStatusAggregatePlan<'_>,
+) -> Result<()> {
+    let Some(child_status) = child_values.get(plan.child_status_index) else {
+        return Err(DbError::internal("child join row is shorter than schema"));
+    };
+    let Some(child_id) = child_values.get(plan.child_id_index) else {
+        return Err(DbError::internal("child join row is shorter than schema"));
+    };
+    counts.add_child(child_status, child_id)
 }
 
 #[derive(Clone, Copy, Debug, Default)]
