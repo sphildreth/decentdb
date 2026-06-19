@@ -1748,10 +1748,6 @@ impl PayloadCache {
         Some(payload)
     }
 
-    fn take(&mut self, table_name: &str) -> Option<Arc<Vec<u8>>> {
-        self.entries.remove(table_name).map(|entry| entry.payload)
-    }
-
     fn insert(&mut self, table_name: String, payload: Arc<Vec<u8>>) {
         if self.max_entries == 0 {
             return;
@@ -2216,13 +2212,6 @@ impl EngineRuntime {
             .lock()
             .expect("payload cache lock should not be poisoned")
             .get(table_name)
-    }
-
-    fn take_cached_payload(&mut self, table_name: &str) -> Option<Arc<Vec<u8>>> {
-        self.payload_cache
-            .lock()
-            .expect("payload cache lock should not be poisoned")
-            .take(table_name)
     }
 
     fn cache_payload_insert(&mut self, table_name: String, payload: Arc<Vec<u8>>) {
@@ -2886,7 +2875,7 @@ impl EngineRuntime {
                 }
                 let cached_payload =
                     if !use_paged_row_storage || !previous_pointer.is_table_paged_manifest() {
-                        self.take_cached_payload(&canonical_table_name)
+                        self.cached_payload(&canonical_table_name)
                     } else {
                         None
                     };
@@ -3131,12 +3120,21 @@ impl EngineRuntime {
 
                 // Choose the encoding path:
                 //  1. Row-update splice: only re-encode modified rows using cached payload
-                //  2. Append-only: read old payload, append new rows
-                //  3. Full re-encode: encode every row from scratch
+                //  2. Row-delete splice: copy unchanged encoded rows from previous payload
+                //  3. Append-only: read old payload, append new rows
+                //  4. Full re-encode: encode every row from scratch
                 let (payload, skip_overflow_pages) = if !delta.updated_rows.is_empty()
                     && delta.deleted_rows.is_empty()
                     && delta.append_count == 0
                 {
+                    let cached_payload = if let Some(cached) = cached_payload {
+                        Some(cached)
+                    } else if previous_pointer.head_page_id != 0 {
+                        read_overflow(&store, previous_pointer).ok().map(Arc::new)
+                    } else {
+                        None
+                    };
+
                     if let Some(cached) = cached_payload {
                         let mut dirty_indices = Vec::with_capacity(delta.updated_rows.len());
                         for row_id in delta.updated_rows.keys() {
@@ -3150,6 +3148,31 @@ impl EngineRuntime {
                         // Compute how many leading overflow pages are
                         // guaranteed identical (their byte ranges fall
                         // entirely within the unchanged prefix).
+                        let page_size = db.config().page_size as usize;
+                        let chunk_cap = page_size.saturating_sub(OVERFLOW_HEADER_SIZE);
+                        let skip = splice.first_dirty_byte.checked_div(chunk_cap).unwrap_or(0);
+                        (splice.payload, skip)
+                    } else {
+                        (encode_table_payload(data)?, 0)
+                    }
+                } else if !delta.deleted_rows.is_empty()
+                    && delta.updated_rows.is_empty()
+                    && delta.append_count == 0
+                {
+                    let cached_payload = if let Some(cached) = cached_payload {
+                        Some(cached)
+                    } else if previous_pointer.head_page_id != 0 {
+                        read_overflow(&store, previous_pointer).ok().map(Arc::new)
+                    } else {
+                        None
+                    };
+
+                    if let Some(cached) = cached_payload {
+                        let splice = splice_deleted_rows_payload(
+                            cached.as_slice(),
+                            data,
+                            &delta.deleted_rows,
+                        )?;
                         let page_size = db.config().page_size as usize;
                         let chunk_cap = page_size.saturating_sub(OVERFLOW_HEADER_SIZE);
                         let skip = splice.first_dirty_byte.checked_div(chunk_cap).unwrap_or(0);
@@ -11389,8 +11412,9 @@ impl EngineRuntime {
             return Ok(Some(QueryResult::with_rows(plan.column_names, Vec::new())));
         }
 
-        if row_id_alias_column_name(plan.table_schema)
-            .is_some_and(|column_name| identifiers_equal(column_name, plan.filter_column))
+        if plan.extra_lookup_terms.is_empty()
+            && row_id_alias_column_name(plan.table_schema)
+                .is_some_and(|column_name| identifiers_equal(column_name, plan.filter_column))
         {
             let mut rows = Vec::new();
             if let Some(row_id) = value_as_int64(&plan.lookup_value) {
@@ -11415,18 +11439,7 @@ impl EngineRuntime {
             )?));
         }
 
-        let Some(index) = self.catalog.indexes.values().find(|index| {
-            identifiers_equal(&index.table_name, plan.table_name)
-                && index.fresh
-                && index.kind == IndexKind::Btree
-                && index.predicate_sql.is_none()
-                && index.columns.len() == 1
-                && index.columns[0]
-                    .column_name
-                    .as_deref()
-                    .is_some_and(|index_column| identifiers_equal(index_column, plan.filter_column))
-                && index.columns[0].expression_sql.is_none()
-        }) else {
+        let Some(index) = self.btree_index_for_simple_indexed_projection_plan(&plan) else {
             return Ok(None);
         };
         let Some(RuntimeIndex::Btree { keys, covering }) = self.index(&index.name) else {
@@ -11435,7 +11448,7 @@ impl EngineRuntime {
         let covering_offsets = covering.as_ref().and_then(|covering| {
             covering_projection_offsets(covering, plan.table_schema, &plan.projection_indexes)
         });
-        let row_ids = keys.row_ids_for_value_set(&plan.lookup_value)?;
+        let row_ids = row_ids_for_simple_indexed_projection_lookup(keys, &plan)?;
 
         let scan_limit = if plan.order_by.is_none() && plan.offset == 0 {
             plan.limit.unwrap_or(usize::MAX)
@@ -11500,8 +11513,9 @@ impl EngineRuntime {
             if plan.limit == Some(0) {
                 return Ok(Some(QueryResult::with_rows(plan.column_names, Vec::new())));
             }
-            if row_id_alias_column_name(plan.table_schema)
-                .is_some_and(|column_name| identifiers_equal(column_name, plan.filter_column))
+            if plan.extra_lookup_terms.is_empty()
+                && row_id_alias_column_name(plan.table_schema)
+                    .is_some_and(|column_name| identifiers_equal(column_name, plan.filter_column))
             {
                 let mut rows = Vec::new();
                 if let Some(row_id) = value_as_int64(&plan.lookup_value) {
@@ -11522,20 +11536,7 @@ impl EngineRuntime {
                 )?));
             }
 
-            let Some(index) = self.catalog.indexes.values().find(|index| {
-                identifiers_equal(&index.table_name, plan.table_name)
-                    && index.fresh
-                    && index.kind == IndexKind::Btree
-                    && index.predicate_sql.is_none()
-                    && index.columns.len() == 1
-                    && index.columns[0]
-                        .column_name
-                        .as_deref()
-                        .is_some_and(|index_column| {
-                            identifiers_equal(index_column, plan.filter_column)
-                        })
-                    && index.columns[0].expression_sql.is_none()
-            }) else {
+            let Some(index) = self.btree_index_for_simple_indexed_projection_plan(&plan) else {
                 return Ok(None);
             };
             let Some(RuntimeIndex::Btree { keys, covering }) = self.index(&index.name) else {
@@ -11544,7 +11545,7 @@ impl EngineRuntime {
             let covering_offsets = covering.as_ref().and_then(|covering| {
                 covering_projection_offsets(covering, plan.table_schema, &plan.projection_indexes)
             });
-            let row_ids = keys.row_ids_for_value_set(&plan.lookup_value)?;
+            let row_ids = row_ids_for_simple_indexed_projection_lookup(keys, &plan)?;
             let scan_limit = if plan.order_by.is_none() && plan.offset == 0 {
                 plan.limit.unwrap_or(usize::MAX)
             } else {
@@ -11613,8 +11614,9 @@ impl EngineRuntime {
         };
 
         let mut rows = Vec::new();
-        if row_id_alias_column_name(plan.table_schema)
-            .is_some_and(|column_name| identifiers_equal(column_name, plan.filter_column))
+        if plan.extra_lookup_terms.is_empty()
+            && row_id_alias_column_name(plan.table_schema)
+                .is_some_and(|column_name| identifiers_equal(column_name, plan.filter_column))
         {
             if let Some(row_id) = value_as_int64(&plan.lookup_value) {
                 if let Some(stored_row) = read_deferred_stored_row_by_id(
@@ -11641,18 +11643,7 @@ impl EngineRuntime {
             )?));
         }
 
-        let Some(index) = self.catalog.indexes.values().find(|index| {
-            identifiers_equal(&index.table_name, plan.table_name)
-                && index.fresh
-                && index.kind == IndexKind::Btree
-                && index.predicate_sql.is_none()
-                && index.columns.len() == 1
-                && index.columns[0]
-                    .column_name
-                    .as_deref()
-                    .is_some_and(|index_column| identifiers_equal(index_column, plan.filter_column))
-                && index.columns[0].expression_sql.is_none()
-        }) else {
+        let Some(index) = self.btree_index_for_simple_indexed_projection_plan(&plan) else {
             return Ok(None);
         };
         let Some(RuntimeIndex::Btree { keys, covering }) = self.index(&index.name) else {
@@ -11661,7 +11652,7 @@ impl EngineRuntime {
         let covering_offsets = covering.as_ref().and_then(|covering| {
             covering_projection_offsets(covering, plan.table_schema, &plan.projection_indexes)
         });
-        let row_ids = keys.row_ids_for_value_set(&plan.lookup_value)?;
+        let row_ids = row_ids_for_simple_indexed_projection_lookup(keys, &plan)?;
         let scan_limit = if plan.order_by.is_none() && plan.offset == 0 {
             plan.limit.unwrap_or(usize::MAX)
         } else {
@@ -14151,24 +14142,49 @@ impl EngineRuntime {
             return Ok(None);
         }
         let binding_name = alias.as_deref().unwrap_or(name);
-        let Some((filter_table, filter_column, value_expr)) = simple_btree_lookup(filter) else {
+        let Some(lookup_terms) = simple_btree_lookup_terms(filter) else {
             return Ok(None);
         };
-        if let Some(table_name) = filter_table {
-            if !identifiers_equal(table_name, name) && !identifiers_equal(table_name, binding_name)
-            {
+        for (filter_table, _, _) in &lookup_terms {
+            if filter_table.as_ref().is_some_and(|table_name| {
+                !identifiers_equal(table_name, name) && !identifiers_equal(table_name, binding_name)
+            }) {
                 return Ok(None);
             }
         }
+        let ordered_lookup_terms = if lookup_terms.len() == 1 {
+            lookup_terms
+        } else {
+            let Some(index) =
+                self.compound_btree_index_for_lookup_terms(name, lookup_terms.as_slice())
+            else {
+                return Ok(None);
+            };
+            ordered_lookup_terms_for_index(index, lookup_terms.as_slice())?
+        };
 
-        let lookup_value = self.eval_expr(
-            value_expr,
-            &Dataset::empty(),
-            &[],
-            params,
-            &BTreeMap::new(),
-            None,
-        )?;
+        let mut lookup_values = Vec::with_capacity(ordered_lookup_terms.len());
+        for (_, _, value_expr) in &ordered_lookup_terms {
+            lookup_values.push(self.eval_expr(
+                value_expr,
+                &Dataset::empty(),
+                &[],
+                params,
+                &BTreeMap::new(),
+                None,
+            )?);
+        }
+        let filter_column = ordered_lookup_terms[0].1;
+        let lookup_value = lookup_values
+            .first()
+            .cloned()
+            .ok_or_else(|| DbError::internal("indexed projection lookup terms are empty"))?;
+        let extra_lookup_terms = ordered_lookup_terms
+            .iter()
+            .skip(1)
+            .zip(lookup_values.into_iter().skip(1))
+            .map(|((_, column, _), value)| (*column, value))
+            .collect::<Vec<_>>();
         let Some((projection_indexes, column_names)) =
             self.simple_projection_plan(select, name, alias, table_schema)
         else {
@@ -14203,6 +14219,7 @@ impl EngineRuntime {
             table_schema,
             filter_column,
             lookup_value,
+            extra_lookup_terms,
             projection_indexes,
             column_names,
             order_by,
@@ -14219,13 +14236,13 @@ impl EngineRuntime {
         let Some(plan) = self.analyze_simple_indexed_projection_query(query, params)? else {
             return Ok(None);
         };
-        if row_id_alias_column_name(plan.table_schema)
-            .is_some_and(|column_name| identifiers_equal(column_name, plan.filter_column))
+        if plan.extra_lookup_terms.is_empty()
+            && row_id_alias_column_name(plan.table_schema)
+                .is_some_and(|column_name| identifiers_equal(column_name, plan.filter_column))
         {
             return Ok(None);
         }
-        let Some(index) = self.single_column_btree_index(plan.table_name, plan.filter_column)
-        else {
+        let Some(index) = self.btree_index_for_simple_indexed_projection_plan(&plan) else {
             return Ok(None);
         };
         if matches!(self.index(&index.name), Some(RuntimeIndex::Btree { .. })) {
@@ -14243,7 +14260,7 @@ impl EngineRuntime {
         let Some(plan) = self.analyze_simple_indexed_projection_query(query, params)? else {
             return Ok(None);
         };
-        if plan.table_schema.pk_index_root.is_some() {
+        if !plan.extra_lookup_terms.is_empty() || plan.table_schema.pk_index_root.is_some() {
             return Ok(None);
         }
         let Some(filter_column_index) = schema_column_index(plan.table_schema, plan.filter_column)
@@ -14369,6 +14386,68 @@ impl EngineRuntime {
                     .as_deref()
                     .is_some_and(|index_column| identifiers_equal(index_column, column_name))
                 && index.columns[0].expression_sql.is_none()
+        })
+    }
+
+    fn compound_btree_index_for_lookup_terms(
+        &self,
+        table_name: &str,
+        lookup_terms: &[(Option<&str>, &str, &Expr)],
+    ) -> Option<&IndexSchema> {
+        if lookup_terms.len() < 2 {
+            return None;
+        }
+        self.catalog.indexes.values().find(|index| {
+            identifiers_equal(&index.table_name, table_name)
+                && index.fresh
+                && index.kind == IndexKind::Btree
+                && index.predicate_sql.is_none()
+                && index.columns.len() >= lookup_terms.len()
+                && index
+                    .columns
+                    .iter()
+                    .take(lookup_terms.len())
+                    .all(|index_column| {
+                        index_column.expression_sql.is_none()
+                            && index_column.column_name.as_deref().is_some_and(|column| {
+                                lookup_terms.iter().any(|(_, lookup_column, _)| {
+                                    identifiers_equal(column, lookup_column)
+                                })
+                            })
+                    })
+        })
+    }
+
+    fn btree_index_for_simple_indexed_projection_plan(
+        &self,
+        plan: &SimpleIndexedProjectionPlan<'_>,
+    ) -> Option<&IndexSchema> {
+        if plan.extra_lookup_terms.is_empty() {
+            return self.single_column_btree_index(plan.table_name, plan.filter_column);
+        }
+        let lookup_columns = std::iter::once(plan.filter_column)
+            .chain(plan.extra_lookup_terms.iter().map(|(column, _)| *column))
+            .collect::<Vec<_>>();
+        self.catalog.indexes.values().find(|index| {
+            identifiers_equal(&index.table_name, plan.table_name)
+                && index.fresh
+                && index.kind == IndexKind::Btree
+                && index.predicate_sql.is_none()
+                && index.columns.len() >= lookup_columns.len()
+                && index
+                    .columns
+                    .iter()
+                    .take(lookup_columns.len())
+                    .zip(lookup_columns.iter())
+                    .all(|(index_column, lookup_column)| {
+                        index_column.expression_sql.is_none()
+                            && index_column
+                                .column_name
+                                .as_deref()
+                                .is_some_and(|index_column| {
+                                    identifiers_equal(index_column, lookup_column)
+                                })
+                    })
         })
     }
 
@@ -18064,11 +18143,37 @@ struct SimpleIndexedProjectionPlan<'a> {
     table_schema: &'a TableSchema,
     filter_column: &'a str,
     lookup_value: Value,
+    extra_lookup_terms: Vec<(&'a str, Value)>,
     projection_indexes: Vec<usize>,
     column_names: Vec<String>,
     order_by: Option<Vec<SimpleOrderByPlan>>,
     limit: Option<usize>,
     offset: usize,
+}
+
+enum SimpleIndexedProjectionRowIds<'a> {
+    Borrowed(RuntimeRowIdSet<'a>),
+    Owned(Vec<i64>),
+}
+
+impl SimpleIndexedProjectionRowIds<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Borrowed(row_ids) => row_ids.len(),
+            Self::Owned(row_ids) => row_ids.len(),
+        }
+    }
+
+    fn for_each(self, mut f: impl FnMut(i64)) {
+        match self {
+            Self::Borrowed(row_ids) => row_ids.for_each(f),
+            Self::Owned(row_ids) => {
+                for row_id in row_ids {
+                    f(row_id);
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -21676,6 +21781,95 @@ fn splice_updated_rows_payload(
     })
 }
 
+fn splice_deleted_rows_payload(
+    old: &[u8],
+    data: &TableData,
+    deleted_row_ids: &BTreeSet<i64>,
+) -> Result<SpliceResult> {
+    const HEADER_LEN: usize = 8 /* magic */ + 4 /* row_count */;
+
+    if deleted_row_ids.is_empty() {
+        return Ok(SpliceResult {
+            payload: old.to_vec(),
+            first_dirty_byte: old.len(),
+        });
+    }
+    if old.len() < HEADER_LEN || old[..8] != *TABLE_PAYLOAD_MAGIC {
+        let payload = encode_table_payload(data)?;
+        return Ok(SpliceResult {
+            payload,
+            first_dirty_byte: 0,
+        });
+    }
+    let old_row_count =
+        u32::from_le_bytes(old[8..12].try_into().expect("row-count header length")) as usize;
+    if old_row_count != data.rows.len().saturating_add(deleted_row_ids.len()) {
+        let payload = encode_table_payload(data)?;
+        return Ok(SpliceResult {
+            payload,
+            first_dirty_byte: 0,
+        });
+    }
+
+    let mut deleted_spans: Vec<(usize, usize)> = Vec::with_capacity(deleted_row_ids.len());
+    let mut scan_offset = HEADER_LEN;
+    let mut row_idx = 0usize;
+    while row_idx < old_row_count && scan_offset + 12 <= old.len() {
+        let row_id = i64::from_le_bytes(
+            old[scan_offset..scan_offset + 8]
+                .try_into()
+                .expect("row id length"),
+        );
+        let row_data_len = u32::from_le_bytes(
+            old[scan_offset + 8..scan_offset + 12]
+                .try_into()
+                .expect("row data len"),
+        ) as usize;
+        let row_end = scan_offset.saturating_add(12).saturating_add(row_data_len);
+        if row_end > old.len() {
+            let payload = encode_table_payload(data)?;
+            return Ok(SpliceResult {
+                payload,
+                first_dirty_byte: 0,
+            });
+        }
+        if deleted_row_ids.contains(&row_id) {
+            deleted_spans.push((scan_offset, row_end));
+        }
+        scan_offset = row_end;
+        row_idx += 1;
+    }
+
+    if row_idx != old_row_count || deleted_spans.len() != deleted_row_ids.len() {
+        let payload = encode_table_payload(data)?;
+        return Ok(SpliceResult {
+            payload,
+            first_dirty_byte: 0,
+        });
+    }
+
+    let first_dirty_byte = deleted_spans.first().map_or(0, |span| span.0);
+    let mut output = Vec::with_capacity(old.len());
+    output.extend_from_slice(&old[..TABLE_PAYLOAD_MAGIC.len()]);
+    encode_u32(&mut output, data.rows.len() as u32);
+
+    let mut copy_from = HEADER_LEN;
+    for (span_start, span_end) in deleted_spans {
+        if copy_from < span_start {
+            output.extend_from_slice(&old[copy_from..span_start]);
+        }
+        copy_from = span_end;
+    }
+    if copy_from < old.len() {
+        output.extend_from_slice(&old[copy_from..]);
+    }
+
+    Ok(SpliceResult {
+        payload: output,
+        first_dirty_byte,
+    })
+}
+
 fn encode_appended_table_rows(data: &TableData, existing_count: usize) -> Result<Vec<u8>> {
     if existing_count > data.rows.len() {
         return Err(DbError::internal(
@@ -22647,6 +22841,86 @@ fn simple_btree_lookup(filter: &Expr) -> Option<(Option<&str>, &str, &Expr)> {
         },
         _ => None,
     }
+}
+
+fn simple_btree_lookup_terms(filter: &Expr) -> Option<Vec<(Option<&str>, &str, &Expr)>> {
+    fn collect<'a>(
+        expr: &'a Expr,
+        terms: &mut Vec<(Option<&'a str>, &'a str, &'a Expr)>,
+    ) -> Option<()> {
+        match expr {
+            Expr::Binary {
+                left,
+                op: BinaryOp::And,
+                right,
+            } => {
+                collect(left, terms)?;
+                collect(right, terms)?;
+                Some(())
+            }
+            _ => {
+                let term = simple_btree_lookup(expr)?;
+                if terms
+                    .iter()
+                    .any(|(_, column, _)| identifiers_equal(column, term.1))
+                {
+                    return None;
+                }
+                terms.push(term);
+                Some(())
+            }
+        }
+    }
+
+    let mut terms = Vec::new();
+    collect(filter, &mut terms)?;
+    (!terms.is_empty()).then_some(terms)
+}
+
+fn ordered_lookup_terms_for_index<'a>(
+    index: &IndexSchema,
+    lookup_terms: &[(Option<&'a str>, &'a str, &'a Expr)],
+) -> Result<Vec<(Option<&'a str>, &'a str, &'a Expr)>> {
+    let mut ordered = Vec::with_capacity(lookup_terms.len());
+    for index_column in index.columns.iter().take(lookup_terms.len()) {
+        let Some(column_name) = index_column.column_name.as_deref() else {
+            return Err(DbError::internal(
+                "compound indexed projection matched expression index column",
+            ));
+        };
+        let Some(term) = lookup_terms
+            .iter()
+            .copied()
+            .find(|(_, lookup_column, _)| identifiers_equal(column_name, lookup_column))
+        else {
+            return Err(DbError::internal(
+                "compound indexed projection matched non-prefix lookup terms",
+            ));
+        };
+        ordered.push(term);
+    }
+    Ok(ordered)
+}
+
+fn row_ids_for_simple_indexed_projection_lookup<'a>(
+    keys: &'a RuntimeBtreeKeys,
+    plan: &SimpleIndexedProjectionPlan<'_>,
+) -> Result<SimpleIndexedProjectionRowIds<'a>> {
+    if plan.extra_lookup_terms.is_empty() {
+        return keys
+            .row_ids_for_value_set(&plan.lookup_value)
+            .map(SimpleIndexedProjectionRowIds::Borrowed);
+    }
+    let values = std::iter::once(plan.lookup_value.clone())
+        .chain(
+            plan.extra_lookup_terms
+                .iter()
+                .map(|(_, value)| value.clone()),
+        )
+        .collect::<Vec<_>>();
+    Ok(SimpleIndexedProjectionRowIds::Owned(keys.row_ids_for_key(
+        &RuntimeBtreeKey::Encoded(Row::new(values).encode()?),
+    )))
 }
 
 fn view_projection_expr_for_output_column(items: &[SelectItem], column: &str) -> Option<Expr> {

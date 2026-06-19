@@ -74,7 +74,9 @@ use crate::sync::{
     SyncShapeCheckpoint, SyncShapeClient, SyncShapeDelivery, SyncStatus,
 };
 use crate::vfs::faulty::{self, FailAction, Failpoint};
-use crate::vfs::{is_memory_path, write_all_at, FileKind, OpenMode, VfsHandle};
+use crate::vfs::{
+    is_memory_path, read_exact_at, write_all_at, FileKind, OpenMode, VfsFile, VfsHandle,
+};
 use crate::wal::reader_registry::ReaderGuard;
 use crate::wal::savepoint::StatementSavepoint;
 use crate::wal::WalHandle;
@@ -1451,7 +1453,16 @@ impl Db {
             ));
         }
 
-        self.checkpoint_wal()?;
+        // `save_as` only needs a WAL checkpoint when the live WAL has frames
+        // to fold into the main database file. After a successful checkpoint
+        // this handle's logical WAL end is reset to 0 even though the database
+        // header may retain the last folded checkpoint LSN.
+        self.inner
+            .wal
+            .refresh_from_coordination(&self.inner.pager)?;
+        if self.inner.wal.latest_snapshot() != 0 {
+            self.checkpoint_wal()?;
+        }
 
         let vfs = VfsHandle::for_path(dest).with_config(&self.inner.config);
         if vfs.file_exists(dest)? {
@@ -1459,6 +1470,11 @@ impl Db {
                 format!("destination {} already exists", dest.display()),
                 std::io::Error::new(std::io::ErrorKind::AlreadyExists, "destination exists"),
             ));
+        }
+        if self.inner.wal.latest_snapshot() == 0
+            && self.try_save_as_checkpointed_file_copy(dest, &vfs)?
+        {
+            return Ok(());
         }
 
         let file = vfs.open(dest, OpenMode::CreateNew, FileKind::Database)?;
@@ -1470,6 +1486,73 @@ impl Db {
         }
         file.set_len(page::page_offset(page_count.saturating_add(1), page_size))?;
         file.sync_metadata()?;
+        Ok(())
+    }
+
+    fn try_save_as_checkpointed_file_copy(
+        &self,
+        dest: &Path,
+        dest_vfs: &VfsHandle,
+    ) -> Result<bool> {
+        if is_memory_path(self.path()) || dest_vfs.is_memory() {
+            return Ok(false);
+        }
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        if self.inner.config.encryption.is_none() && self.try_save_as_os_file_copy(dest)? {
+            return Ok(true);
+        }
+
+        let source_vfs = VfsHandle::for_path(self.path()).with_config(&self.inner.config);
+        if source_vfs.is_memory() {
+            return Ok(false);
+        }
+
+        let source = source_vfs.open(self.path(), OpenMode::OpenExisting, FileKind::Database)?;
+        let dest_file = dest_vfs.open(dest, OpenMode::CreateNew, FileKind::Database)?;
+        source.advise_sequential()?;
+        dest_file.advise_sequential()?;
+        let len = source.file_size()?;
+        Self::copy_vfs_file(source.as_ref(), dest_file.as_ref(), len)?;
+        dest_file.set_len(len)?;
+        dest_file.sync_metadata()?;
+        Ok(true)
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    fn try_save_as_os_file_copy(&self, dest: &Path) -> Result<bool> {
+        let mut source = std::fs::File::open(self.path()).map_err(|source| {
+            DbError::io(
+                format!("open source database {}", self.path().display()),
+                source,
+            )
+        })?;
+        let mut dest_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(dest)
+            .map_err(|source| DbError::io(format!("create snapshot {}", dest.display()), source))?;
+
+        let result = std::io::copy(&mut source, &mut dest_file)
+            .and_then(|_| dest_file.sync_all())
+            .map_err(|source| DbError::io(format!("copy snapshot {}", dest.display()), source));
+        if let Err(error) = result {
+            let _ = std::fs::remove_file(dest);
+            return Err(error);
+        }
+        Ok(true)
+    }
+
+    fn copy_vfs_file(source: &dyn VfsFile, dest: &dyn VfsFile, len: u64) -> Result<()> {
+        const COPY_CHUNK_BYTES: usize = 1024 * 1024;
+
+        let mut buffer = vec![0_u8; COPY_CHUNK_BYTES];
+        let mut offset = 0_u64;
+        while offset < len {
+            let chunk_len = (len - offset).min(COPY_CHUNK_BYTES as u64) as usize;
+            read_exact_at(source, offset, &mut buffer[..chunk_len])?;
+            write_all_at(dest, offset, &buffer[..chunk_len])?;
+            offset += chunk_len as u64;
+        }
         Ok(())
     }
 
@@ -2450,6 +2533,12 @@ impl Db {
         sql: &str,
         params: &[Value],
     ) -> Result<Vec<QueryResult>> {
+        if params.is_empty() && !self.inner.sql_txn_active.load(Ordering::Acquire) {
+            if let Some(results) = self.try_execute_schema_batch_with_single_commit(sql)? {
+                return Ok(results);
+            }
+        }
+
         let mut results = Vec::new();
         for statement_sql in split_sql_batch(sql) {
             let trimmed = statement_sql.trim();
@@ -2569,6 +2658,92 @@ impl Db {
             results.push(result);
         }
         Ok(results)
+    }
+
+    fn try_execute_schema_batch_with_single_commit(
+        &self,
+        sql: &str,
+    ) -> Result<Option<Vec<QueryResult>>> {
+        let mut statements = Vec::new();
+        for statement_sql in split_sql_batch(sql) {
+            let trimmed = statement_sql.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            if parse_transaction_control(trimmed).is_some()
+                || parse_pragma_command(trimmed)?.is_some()
+                || crate::security::parse_set_audit_context(trimmed)?.is_some()
+                || crate::security::parse_security_command(trimmed)?.is_some()
+                || crate::extensions::parse_extension_sql(trimmed)?.is_some()
+                || self
+                    .try_execute_sync_inspection_query(trimmed, &[])?
+                    .is_some()
+                || crate::extensions::try_execute_extension_inspection_query(self, trimmed, &[])?
+                    .is_some()
+            {
+                return Ok(None);
+            }
+
+            let statement = self.parsed_statement(trimmed)?;
+            if !matches!(
+                statement.as_ref(),
+                SqlStatement::CreateTable(_)
+                    | SqlStatement::CreateTableAs(_)
+                    | SqlStatement::CreateSchema { .. }
+                    | SqlStatement::CreateIndex(_)
+                    | SqlStatement::CreateView(_)
+                    | SqlStatement::CreateTrigger(_),
+            ) {
+                return Ok(None);
+            }
+
+            let runtime = self
+                .inner
+                .engine
+                .read()
+                .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+            if self.statement_is_temp_only(&runtime, statement.as_ref()) {
+                return Ok(None);
+            }
+
+            statements.push(statement);
+        }
+
+        if statements.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+
+        let lw_start = if self.inner.tracing.config.lock_wait.enabled {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        let _writer = self
+            .inner
+            .sql_write_lock
+            .lock()
+            .map_err(|_| DbError::internal("SQL writer lock poisoned"))?;
+        self.record_lock_wait(lw_start, "sql_write", "ok");
+
+        let mut state = self.build_exclusive_sql_txn_state()?;
+        let snapshot_lsn = state.snapshot_lsn();
+        let mut results = Vec::with_capacity(statements.len());
+        for statement in &statements {
+            let result = self.execute_write_in_runtime_state(
+                statement.as_ref(),
+                &[],
+                &mut state.runtime,
+                snapshot_lsn,
+                &mut state.persistent_changed,
+                &mut state.indexes_maybe_stale,
+            )?;
+            self.dispatch_plan_cache_invalidation(statement);
+            results.push(result);
+        }
+
+        self.commit_exclusive_sql_txn(state)?;
+        Ok(Some(results))
     }
 
     fn dispatch_plan_cache_invalidation(&self, statement: &SqlStatement) {
@@ -3780,6 +3955,30 @@ impl Db {
                 .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
             self.validate_prepared_against_runtime(prepared, &runtime)?;
             return runtime.execute_read_statement(statement, params, self.inner.config.page_size);
+        }
+
+        // Fast path: when the statement's base tables are already resident at
+        // the latest snapshot (e.g. after a same-handle bulk load or write
+        // with `retain_paged_row_sources_after_commit`), execute directly
+        // against the resident runtime without beginning a WAL reader or
+        // reloading row sources. This skips the per-statement O(table size)
+        // reload that dominates filtered/aggregate read workloads otherwise.
+        //
+        // Gated off when Lua extensions are active: the deferred path's
+        // `ensure_tables_loaded_at_snapshot` loads extension catalog tables
+        // before execution, and bypassing it would leave extension functions
+        // unresolved. Row-level security also requires the deferred path when
+        // security catalog tables are deferred or active; otherwise policies
+        // and masks could be treated as absent by the generic executor.
+        let extension_execution_enabled = self.inner.config.extension_unsigned_development_mode
+            || !self.inner.config.extension_trust_anchors.is_empty();
+        if !extension_execution_enabled {
+            if let Some(runtime) = self.try_resident_read_for_statement(statement, prepared)? {
+                let result =
+                    runtime.execute_read_statement(statement, params, self.inner.config.page_size);
+                drop(runtime);
+                return self.finalize_row_source_autocommit_statement(statement, result);
+            }
         }
 
         #[cfg(feature = "bench-internals")]
@@ -8177,6 +8376,64 @@ impl Db {
         } else {
             let redefer_refs = to_redefer.iter().map(String::as_str).collect::<Vec<_>>();
             self.redefer_persisted_tables(&redefer_refs)
+        }
+    }
+
+    /// Fast path for non-transactional reads when deferred materialization is
+    /// enabled but the statement's base tables are already resident at the
+    /// latest snapshot LSN.
+    ///
+    /// Returns a read guard over the resident runtime when the statement can
+    /// be executed without beginning a WAL reader or reloading row sources.
+    /// Returns `Ok(None)` when any referenced base table is not resident, the
+    /// runtime LSN is stale, a checkpoint has advanced, or the statement's
+    /// base-table set cannot be resolved (callers fall back to the deferred
+    /// load path in that case).
+    fn try_resident_read_for_statement(
+        &self,
+        statement: &SqlStatement,
+        prepared: Option<&PreparedStatement>,
+    ) -> Result<Option<RwLockReadGuard<'_, EngineRuntime>>> {
+        if !self.inner.config.defer_table_materialization {
+            return Ok(None);
+        }
+        let latest_lsn = self.inner.wal.latest_snapshot();
+        let latest_checkpoint_epoch = self.inner.wal.checkpoint_epoch();
+        let last_runtime_lsn = self.inner.last_runtime_lsn.load(Ordering::Acquire);
+        let last_seen_checkpoint_epoch = self
+            .inner
+            .last_seen_checkpoint_epoch
+            .load(Ordering::Acquire);
+        if last_runtime_lsn != latest_lsn || last_seen_checkpoint_epoch != latest_checkpoint_epoch {
+            return Ok(None);
+        }
+        let runtime = self
+            .inner
+            .engine
+            .read()
+            .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+        self.validate_prepared_against_runtime(prepared, &runtime)?;
+        if Self::runtime_has_deferred_security_tables(&runtime)
+            || runtime.security_rules_active()?
+        {
+            return Ok(None);
+        }
+        let Some(base_tables) = self.safe_referenced_base_tables_in_runtime(&runtime, statement)
+        else {
+            return Ok(None);
+        };
+        if base_tables.is_empty() {
+            return Ok(Some(runtime));
+        }
+        let all_resident = base_tables.iter().all(|name| {
+            runtime
+                .canonical_catalog_table_name(name)
+                .is_some_and(|table_name| runtime.table_row_source(&table_name).is_some())
+        });
+        if all_resident {
+            Ok(Some(runtime))
+        } else {
+            Ok(None)
         }
     }
 

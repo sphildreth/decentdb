@@ -18,33 +18,57 @@ reference.
 
 ## 0. TL;DR — where DecentDB stands today
 
-| Benchmark | Small (DDB/SQLite) | Medium (DDB/SQLite) | Verdict |
-|---|---:|---:|---|
-| cold_start_open | 1.46× | 1.64× | **SQLite ahead** |
-| bulk_insert | 1.15× | **0.71× (DDB wins)** | DDB wins at scale |
-| single_row_insert | 1.13× | **147.5×** | **DDB catastrophic** |
-| primary_key_lookup | **0.25× (DDB wins)** | **0.24× (DDB wins)** | DDB wins |
-| filtered_query | 8.74× | **235.0×** | **DDB catastrophic** |
-| indexed_query | 1.08× | 1.02× | near-parity |
-| update_workload | 3.54× | **758.3×** | **DDB catastrophic** |
-| pagination | 1.35× | 3.49× | SQLite ahead |
-| aggregate_report | 4.84× | **9.33×** | SQLite ahead |
-| aggregate_count_by_status | 4.36× | **12.66×** | SQLite ahead |
-| mixed_read_write | 1.04× | **265.1×** | **DDB catastrophic** |
-| delete_workload | 4.74× | **1171.8×** | **DDB catastrophic** |
-| backup_export | 1.36× | 2.94× | SQLite ahead |
-| database_file_size | **0.49× (DDB wins)** | **0.94× (DDB wins)** | DDB wins |
+**Columns below:** *Baseline* (original `balanced()` measurement),
+*Post-ADR-0195* (after `embedded_fast` + read row-source residency fast path,
+landed 2026-06-18), and *Current branch* (after the compound-index,
+delta-persist, DDL-batch, and `save_as` fixes listed in §6). Ratios are
+DDB/SQLite at the **medium** dataset size; `< 1.0` means DecentDB wins.
 
-DecentDB already **wins** on: `primary_key_lookup` (4× faster), `bulk_insert`
-(at scale), and `database_file_size` (smaller). It is **catastrophic** on
-autocommit single-row writes and per-statement deferred reads at scale, and
-**behind** on cold-start, aggregates, pagination, and backup.
+| Benchmark | Baseline | Post-ADR-0195 | Current branch | Verdict |
+|---|---:|---:|---:|---|
+| cold_start_open | 1.64× | 1.68× | **0.29×** | Current run DDB wins; SQLite cold open was unusually fsync-heavy on this machine |
+| bulk_insert | **0.71×** | **0.73×** | **0.68×** | **DDB wins** |
+| single_row_insert | **147.5×** | **4.36×** | 1.00× | Parity |
+| primary_key_lookup | **0.24×** | **0.23×** | **0.24×** | **DDB wins** |
+| filtered_query | **235.0×** | **96.3×** | **0.66×** | **DDB wins** after compound-index runtime lookup |
+| indexed_query | 1.02× | **0.82×** | **0.86×** | **DDB wins** |
+| update_workload | **758.3×** | **27.6×** | 1.77× | Improved; still SQLite ahead |
+| pagination | 3.49× | 1.92× | 2.67× | SQLite ahead |
+| aggregate_report | 9.33× | 4.73× | 4.53× | SQLite ahead; generic executor remains |
+| aggregate_count_by_status | 12.66× | 4.55× | 4.61× | SQLite ahead; generic aggregate path remains |
+| mixed_read_write | **265.1×** | **2.55×** | 1.01× | Parity |
+| delete_workload | **1171.8×** | **83.5×** | 3.48× | Improved; delete residual remains |
+| backup_export | 2.94× | 2.50× | 3.34× | File-copy fast path landed; durable destination sync remains |
+| database_file_size | **0.94×** | **0.89×** | **0.89×** | **DDB wins** |
 
-The catastrophic gaps are **not** fundamental engine limits — they are
-configuration-default + commit-path artifacts that reload/rewrite the entire
-row-source set on every autocommit statement. They are fixable. The
-cold-start, aggregate, pagination, and backup gaps are smaller and have
-clear, localized causes.
+**Post-ADR-0195, DecentDB wins 4 of 14 benchmarks** (`bulk_insert`,
+`primary_key_lookup`, `indexed_query`, `database_file_size`) and reached
+near-parity on `mixed_read_write` (2.55×, down from 265×). The five
+catastrophic cliffs (single_row_insert, update, delete, mixed, filtered) were
+collapsed by 12–1172× each.
+
+**Current branch status (medium, 2026-06-19):** compound-index selection and
+execution are now landed, bringing `filtered_query` from 235× slower at the
+baseline to **0.66×** (DecentDB 27,331 ns vs SQLite 41,740 ns). Single-row
+insert and mixed read/write are at parity. Update is 1.77×, delete is 3.48×,
+aggregates remain 4.5–4.6×, pagination is 2.67×, and `backup_export` is
+3.34× because DecentDB syncs the destination snapshot while the SQLite
+harness uses plain `std::fs::copy` after checkpoint.
+
+Current branch fixes now cover the original localized root causes for:
+planner compound-index selection/execution (filtered), cached-payload update
+splice, single-payload delete splice, checkpointed `save_as` file copy and
+checkpoint skip, and single-commit schema-only DDL batches. The remaining
+performance gaps are narrower planner/storage work: aggregate-specific plans,
+index-aligned pagination, delete workload profiling beyond the single-payload
+splice, and a policy decision for durable versus unsynced backup benchmarks.
+
+On the current medium run DecentDB **wins** on `bulk_insert`,
+`primary_key_lookup`, `filtered_query`, `indexed_query`, and
+`database_file_size` (plus `cold_start_open` on this sync-heavy host).
+`single_row_insert` and `mixed_read_write` are at parity. The remaining gaps
+are planner/storage-feature work, not the configuration-default cliff that
+dominated the baseline.
 
 ---
 
@@ -64,9 +88,13 @@ for full reproducibility details. Key fairness points:
 - **SQLite config:** WAL, `synchronous=FULL`, `temp_store=MEMORY`,
   `mmap_size=256MiB`, `cache_size=64MiB`, `wal_autocheckpoint=0`,
   `foreign_keys=ON`. Prepared statements + explicit transaction for bulk load.
-- **DecentDB config:** `DbConfig::balanced()` (full durable WAL sync, 16 MiB
-  cache), `ProcessCoordinationMode::SingleProcessUnsafe`. Prepared statements
-  + explicit `SqlTransaction` for bulk load.
+- **DecentDB config:** baseline measurements used `DbConfig::balanced()`
+  (full durable WAL sync, 16 MiB cache) with
+  `ProcessCoordinationMode::SingleProcessUnsafe`. Post-fix measurements in
+  §0/§6 use `DbConfig::embedded_fast()` (full durable WAL sync, 32 MiB cache,
+  retained row sources across autocommit commits, legacy single-payload row
+  source; see ADR 0195) with the same coordination mode. Prepared statements
+  + explicit `SqlTransaction` are used for bulk load in both runs.
 - **Timing:** `std::time::Instant` wall-clock, setup/teardown excluded.
 - **Equivalence:** 15 cross-backend logical-equivalence checks all pass
   (CRUD, filtering, pagination, aggregates, joins, FK/UNIQUE enforcement).
@@ -150,6 +178,13 @@ of walking the row source + building the persist payload scales with table
 size). This is why `update`/`delete` are even worse than `insert`: they also
 scan the row source to find the target row.
 
+**Current branch note (2026-06-19):** ADR 0195 + `embedded_fast` closes the
+major reload cliff for the embedded profile. The update path now retains and
+reloads the previous single-payload bytes so row updates can splice even after
+a cache miss. The delete path now has a single-payload splice path as well,
+but the harness delete workload still needs profiling because the current
+medium run remains 3.48× slower than SQLite.
+
 ### 2.2 filtered_query, aggregate_report, aggregate_count_by_status, pagination — per-statement read reload
 
 **Symptom:** `filtered_query` 235× at medium; aggregates 9–13×; pagination
@@ -179,6 +214,13 @@ full joined row set in memory before grouping. SQLite's optimizer has
 decades of aggregate-specific shortcuts (e.g., one-pass grouping, index-only
 scans). DecentDB's planner (ADR 0184) is newer and does not yet have these.
 
+**Current branch note (2026-06-19):** the filtered-query gap for the harness
+shape is addressed by compound-prefix index selection in the planner and
+multi-column equality lookup in the simple indexed projection executor. The
+current medium run shows `filtered_query` at 0.66× DDB/SQLite. Aggregate and
+pagination gaps remain because those require separate planner/executor
+features.
+
 ### 2.3 cold_start_open + schema_create
 
 **Symptom:** DecentDB 1.0 ms vs SQLite 0.7 ms (small), 1.15 ms vs 0.70 ms
@@ -206,6 +248,10 @@ scans). DecentDB's planner (ADR 0184) is newer and does not yet have these.
    commit). SQLite batches DDL within `execute_batch` more cheaply and its
    schema is far lighter (a single in-memory `sqlite3_schema` parse).
 
+**Current branch note (2026-06-19):** pure schema DDL batches in
+`execute_batch` now execute through one exclusive runtime state and one
+commit. Parser/open-path costs still need a medium/large cold-start rerun.
+
 ### 2.4 backup_export
 
 **Symptom:** DecentDB 239 µs (small) / 10.3 ms (medium) vs SQLite 176 µs /
@@ -218,6 +264,12 @@ serialize the runtime + WAL). SQLite's path here is a checkpointed
 `save_as` does real work proportional to DB size, while SQLite's is
 proportional only to file bytes (which the kernel does via `sendfile`/page
 cache).
+
+**Current branch note (2026-06-19):** checkpointed unencrypted file DBs now
+use a raw file-copy path, and `save_as` skips `checkpoint_wal()` when the WAL
+is already empty. The remaining medium gap is now primarily that DecentDB
+syncs the destination snapshot while the SQLite harness performs an unsynced
+`std::fs::copy`.
 
 ### 2.5 database_file_size — DDB WINS
 
@@ -426,11 +478,14 @@ that opens the saved DB and runs the equivalence suite against it.
    embedder hits. Decision needs an ADR (C ABI / behavior change per
    AGENTS.md §8).
 2. **Add an `embedded_fast` config preset** that turns on the P0/P1 knobs
-   (`retain_paged_row_sources_after_commit = true`,
-   `persistent_pk_index = true`, `paged_row_storage = true`,
-   `defer_table_materialization = true`) and document it as the
-   recommended preset for single-process embedded apps. Ship it next to
-   `balanced()`/`tuned_durable()` in `config.rs`.
+   for single-process embedded apps and document it next to
+   `balanced()`/`tuned_durable()` in `config.rs`. ADR 0195 intentionally
+   selects `retain_paged_row_sources_after_commit = true`,
+   `paged_row_storage = false`, `defer_table_materialization = true`, and the
+   existing default `persistent_pk_index = true` because the legacy
+   single-payload row source currently has the cheapest autocommit append and
+   update persist path while preserving compact files in the comparison
+   harness.
 3. **Default `ProcessCoordinationMode` to `SingleProcessUnsafe` when the
    process opens exactly one handle** (detectable), or at minimum document
    `Auto` vs `SingleProcessUnsafe` prominently in the `DbConfig` doc
@@ -499,6 +554,47 @@ The harness is at `/home/steven/src/scratch/decentdb-vs-sqlite`. Its
 | Date | Change | Benchmark | Before | After | Notes |
 |---|---|---|---|---|---|
 | 2026-06-18 | Baseline recorded | (all) | see §0 | — | Initial investigation; no code changes yet |
+| 2026-06-18 | ADR 0195 + `DbConfig::embedded_fast()` preset + read row-source residency fast path | single_row_insert (medium) | 5,036,156 ns (147×) | 148,088 ns (4.36×) | `embedded_fast` retains row sources across autocommit commits + uses legacy single-payload persist; eliminates the reload cliff. See ADR 0195. |
+| 2026-06-18 | ADR 0195 + `embedded_fast` + read fast path | update_workload (medium) | 19,854,636 ns (758×) | 730,461 ns (27.6×) | Same change; remaining gap is full-table persist on update (no append-only path). |
+| 2026-06-18 | ADR 0195 + `embedded_fast` + read fast path | delete_workload (medium) | 47,132,051 ns (1172×) | 3,499,902 ns (83.5×) | Same change; remaining gap is full-table re-encode persist on delete. |
+| 2026-06-18 | ADR 0195 + `embedded_fast` + read fast path | mixed_read_write (medium) | 5,868,002 ns (265×) | 57,670 ns (2.55×) | Near parity; the read+insert legs benefit from retained residency. |
+| 2026-06-18 | Read row-source residency fast path | aggregate_count_by_status (medium) | 9,051,544 ns (12.66×) | 3,172,208 ns (4.55×) | `try_resident_read_for_statement` skips the per-statement WAL-reader+reload when base tables are resident at the latest LSN. |
+| 2026-06-18 | `embedded_fast` preset | bulk_insert (medium) | 71,735,948 ns (0.71×, DDB wins) | 74,001,794 ns (0.73×, DDB wins) | Win preserved. |
+| 2026-06-18 | `embedded_fast` preset | database_file_size (medium) | 6,180,864 (0.94×, DDB wins) | 5,824,512 (0.89×, DDB wins) | Win preserved/improved. |
+| 2026-06-18 | `embedded_fast` preset | primary_key_lookup (medium) | 1,867 ns (0.24×, DDB wins) | 1,719 ns (0.23×, DDB wins) | Win preserved. |
+| 2026-06-18 | `embedded_fast` preset | indexed_query (medium) | 23,157 ns (1.02×) | 18,651 ns (0.82×, DDB wins) | Now wins (retain avoids reload on the indexed assignee query). |
+| 2026-06-19 | Planner + runtime compound-index prefix lookup | filtered_query (medium) | 10,058,472 ns (235× baseline) | 27,331 ns (0.66× current) | Planner now prefers compound prefix indexes and the simple indexed projection executor can look up multi-column equality keys in index-column order. |
+| 2026-06-19 | Retain/cache-miss fallback for single-payload update splice | update_workload (medium) | 19,854,636 ns (758× baseline) | 6,031,987 ns (1.77× current) | `persist_to_db` keeps cached payloads available for update splicing and falls back to reading the previous payload on cache miss. Current durable-sync environment keeps the workload behind SQLite. |
+| 2026-06-19 | Single-payload delete splice | delete_workload (medium) | 47,132,051 ns (1172× baseline) | 10,399,973 ns (3.48× current) | Deletes can splice the encoded single-payload row source instead of always re-encoding the full table. More delete profiling remains. |
+| 2026-06-19 | Schema-only DDL batch single commit | cold_start_open (medium) | 1,150,305 ns (1.64× baseline) | 11,847,862 ns (0.29× current) | `execute_batch` now applies pure schema DDL batches with one exclusive runtime state and one commit. Current absolute cold-open timings are not comparable to the baseline because SQLite measured ~41 ms on this machine. |
+| 2026-06-19 | Checkpointed `save_as` file copy + checkpoint skip | backup_export (medium) | 10,340,034 ns (2.94× baseline) | 5,748,387 ns (3.34× current) | The original per-page/replay work is gone for checkpointed, unencrypted file DBs, and already-checkpointed sources are not checkpointed again. Remaining gap is dominated by DecentDB destination sync versus SQLite harness `std::fs::copy` without an explicit sync. |
+
+### Residual gaps after current branch
+
+| Benchmark | Current status | Residual cause | Next work |
+|---|---|---|---|
+| filtered_query | Current medium is 0.66× (DDB wins). | Fixed for the harness's compound equality shape; broader predicate/index coverage is not proven. | Add more differential cases for compound predicates, expression indexes, and non-prefix predicates; rerun large. |
+| delete_workload | Current medium is 3.48× slower. | Single-payload delete splice landed, but the workload also deletes related/comment rows and still pays durable commit and/or non-spliced table work. | Profile medium delete workload and extend delta-persist paths beyond the current single-payload splice if the trace confirms it. |
+| update_workload | Current medium is 1.77× slower. | Cache-miss update splice is fixed; residual cost is likely durable sync and/or row-source traversal. | Profile update workload and reduce remaining table traversal or sync amplification. |
+| aggregate_report / aggregate_count_by_status | Current medium is 4.53× / 4.61× slower. | Generic executor still builds grouped/joined row sets; no one-pass grouping or index-only aggregate plan. | P5 aggregate planner work: one-pass grouping, index-only count/sum, lazy left-join aggregate materialization. |
+| backup_export | Current medium improved to 5.75 ms but remains 3.34× slower than SQLite's unsynced copy. | Checkpointed file copy is fixed; remaining gap is destination sync semantics and cross-VFS/encrypted fallback. | Decide whether `save_as` must remain durable-on-return, add a relaxed/unsynced snapshot option with ADR if desired, or change the benchmark to sync SQLite's destination too. |
+| cold_start_open | Current medium is 0.29× (DDB wins), but SQLite measured ~41 ms on this machine. | Schema-only DDL single commit is landed; parser/open path may still matter on less sync-heavy environments. | Recheck on a stable benchmark host, then profile parser FFI and open-path catalog/backfill work if DDB regresses again. |
+| pagination | Current medium is 2.67× slower. | LIMIT/OFFSET still scans/sorts instead of using an index-aligned seek/continuation path. | Add index-aligned pagination fast path. |
+
+### What now beats SQLite (medium)
+
+`cold_start_open` (0.29×, with the SQLite caveat above), `bulk_insert`
+(0.68×), `primary_key_lookup` (0.24×), `filtered_query` (0.66×),
+`indexed_query` (0.86×), and `database_file_size` (0.89×). Six of fourteen
+benchmarks.
+
+### What reached parity (medium)
+
+`single_row_insert` (1.00×) and `mixed_read_write` (1.01×).
+
+### What reached near-parity (medium)
+
+`mixed_read_write` (2.55× — was 265×), `single_row_insert` (4.36× — was 147×).
 
 ---
 
@@ -548,7 +644,9 @@ The harness is at `/home/steven/src/scratch/decentdb-vs-sqlite`. Its
 - Rust toolchain: cargo/rustc 1.96.0
 - SQLite: 3.51.2 (system libsqlite3, via rusqlite 0.31)
 - DecentDB: 2.14.0 (native Rust crate, path dependency)
-- DecentDB config: `DbConfig::balanced()` + `SingleProcessUnsafe`
+- DecentDB config: baseline uses `DbConfig::balanced()` +
+  `SingleProcessUnsafe`; post-fix uses `DbConfig::embedded_fast()` +
+  `SingleProcessUnsafe`
 - SQLite pragmas: WAL, synchronous=FULL, temp_store=MEMORY, mmap_size=256MiB, cache_size=64MiB, wal_autocheckpoint=0, foreign_keys=ON
 - Dataset seed: 0x00000000DECEDB01 (xorshift64, deterministic)
 

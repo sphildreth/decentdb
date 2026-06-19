@@ -1074,6 +1074,107 @@ fn simple_indexed_projection_order_by_limit_offset_uses_fast_path() {
 }
 
 #[test]
+fn simple_indexed_projection_uses_compound_prefix_equality_lookup() {
+    let mut runtime = EngineRuntime::empty(1);
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE issues (
+            id INT64 PRIMARY KEY,
+            project_id INT64,
+            status TEXT,
+            title TEXT,
+            created_at INT64
+        )",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE INDEX idx_issues_project_status ON issues (project_id, status)",
+    );
+    for (id, project_id, status, created_at) in [
+        (1, 10, "open", 100),
+        (2, 10, "closed", 200),
+        (3, 10, "open", 300),
+        (4, 20, "open", 400),
+    ] {
+        execute_sql(
+            &mut runtime,
+            &format!(
+                "INSERT INTO issues (id, project_id, status, title, created_at) \
+                 VALUES ({id}, {project_id}, '{status}', 'issue-{id}', {created_at})"
+            ),
+        );
+    }
+
+    let statement = parse_sql_statement(
+        "SELECT id, title, created_at FROM issues \
+         WHERE project_id = $1 AND status = $2 \
+         ORDER BY created_at DESC",
+    )
+    .expect("parse compound indexed projection");
+    let crate::sql::ast::Statement::Query(query) = &statement else {
+        panic!("expected query statement");
+    };
+    let result = runtime
+        .try_execute_simple_indexed_projection_query(
+            query,
+            &[Value::Int64(10), Value::Text("open".to_string())],
+        )
+        .expect("execute compound indexed projection")
+        .expect("compound indexed projection should stay on fast path");
+
+    assert_eq!(
+        result.columns(),
+        &[
+            "id".to_string(),
+            "title".to_string(),
+            "created_at".to_string()
+        ]
+    );
+    assert_eq!(result.rows().len(), 2);
+    assert_eq!(
+        result.rows()[0].values(),
+        &[
+            Value::Int64(3),
+            Value::Text("issue-3".to_string()),
+            Value::Int64(300)
+        ]
+    );
+    assert_eq!(
+        result.rows()[1].values(),
+        &[
+            Value::Int64(1),
+            Value::Text("issue-1".to_string()),
+            Value::Int64(100)
+        ]
+    );
+
+    let statement = parse_sql_statement(
+        "SELECT id, created_at FROM issues \
+         WHERE status = $2 AND project_id = $1 \
+         ORDER BY created_at DESC",
+    )
+    .expect("parse reordered compound indexed projection");
+    let crate::sql::ast::Statement::Query(query) = &statement else {
+        panic!("expected query statement");
+    };
+    let reordered = runtime
+        .try_execute_simple_indexed_projection_query(
+            query,
+            &[Value::Int64(10), Value::Text("open".to_string())],
+        )
+        .expect("execute reordered compound indexed projection")
+        .expect("reordered compound indexed projection should stay on fast path");
+    assert_eq!(
+        reordered
+            .rows()
+            .iter()
+            .map(|row| row.values()[0].clone())
+            .collect::<Vec<_>>(),
+        vec![Value::Int64(3), Value::Int64(1)]
+    );
+}
+
+#[test]
 fn simple_projection_no_order_by_offset_limit_uses_fast_path() {
     let mut runtime = EngineRuntime::empty(1);
     execute_sql(
@@ -3176,6 +3277,154 @@ fn persist_to_db_resident_paged_row_updates_preserves_untouched_chunk_pointers()
     assert_eq!(
         updated_row.values(),
         &[Value::Int64(6), Value::Text(updated_body)]
+    );
+}
+
+#[test]
+fn persist_to_db_single_payload_update_succeeds_after_cached_payload_miss() {
+    let config = DbConfig {
+        paged_row_storage: false,
+        defer_table_materialization: false,
+        ..DbConfig::default()
+    };
+    let db = Db::open_or_create(":memory:", config).expect("open db");
+    db.execute("CREATE TABLE docs (id INT64 PRIMARY KEY, body TEXT)")
+        .expect("create table");
+    for row_id in 1_i64..=8_i64 {
+        db.execute(&format!(
+            "INSERT INTO docs (id, body) VALUES ({row_id}, 'x')"
+        ))
+        .expect("insert row");
+    }
+
+    let mut runtime = db.debug_engine_snapshot().expect("snapshot runtime");
+    runtime.cache_payload_remove("docs");
+    assert!(runtime.cached_payload("docs").is_none());
+
+    let statement =
+        parse_sql_statement("UPDATE docs SET body = 'updated' WHERE id = 4").expect("parse update");
+    let crate::sql::ast::Statement::Update(update) = statement else {
+        panic!("expected update");
+    };
+    let prepared = runtime
+        .prepare_simple_update(&update)
+        .expect("prepare update")
+        .expect("expected prepared update");
+    runtime
+        .execute_prepared_simple_update(&prepared, &[], PAGE_SIZE)
+        .expect("execute prepared update");
+
+    db.begin_write().expect("begin write txn");
+    runtime.persist_to_db(&db).expect("persist runtime");
+    db.commit().expect("commit write txn");
+
+    assert!(runtime.cached_payload("docs").is_some());
+
+    let updated = db
+        .execute("SELECT body FROM docs WHERE id = 4")
+        .expect("select updated row")
+        .rows()
+        .first()
+        .and_then(|row| row.values().first())
+        .cloned();
+    assert_eq!(updated, Some(Value::Text("updated".to_string())));
+
+    let untouched = db
+        .execute("SELECT body FROM docs WHERE id = 3")
+        .expect("select untouched row")
+        .rows()
+        .first()
+        .and_then(|row| row.values().first())
+        .cloned();
+    assert_eq!(untouched, Some(Value::Text("x".to_string())));
+
+    let mut reloaded_runtime = db.debug_engine_snapshot().expect("reload snapshot runtime");
+    assert!(reloaded_runtime.cached_payload("docs").is_none());
+
+    let reload_statement = parse_sql_statement("UPDATE docs SET body = 'again' WHERE id = 5")
+        .expect("parse second update");
+    let crate::sql::ast::Statement::Update(reload_update) = reload_statement else {
+        panic!("expected update");
+    };
+    let reload_prepared = reloaded_runtime
+        .prepare_simple_update(&reload_update)
+        .expect("prepare second update")
+        .expect("expected prepared second update");
+    reloaded_runtime
+        .execute_prepared_simple_update(&reload_prepared, &[], PAGE_SIZE)
+        .expect("execute second update");
+
+    db.begin_write().expect("begin write for second update");
+    reloaded_runtime
+        .persist_to_db(&db)
+        .expect("persist second update");
+    db.commit().expect("commit second write txn");
+
+    let second = db
+        .execute("SELECT body FROM docs WHERE id = 5")
+        .expect("select second updated row")
+        .rows()
+        .first()
+        .and_then(|row| row.values().first())
+        .cloned();
+    assert_eq!(second, Some(Value::Text("again".to_string())));
+}
+
+#[test]
+fn persist_to_db_single_payload_delete_succeeds_after_cached_payload_miss() {
+    let config = DbConfig {
+        paged_row_storage: false,
+        defer_table_materialization: false,
+        ..DbConfig::default()
+    };
+    let db = Db::open_or_create(":memory:", config).expect("open db");
+    db.execute("CREATE TABLE docs (id INT64 PRIMARY KEY, body TEXT)")
+        .expect("create table");
+    for row_id in 1_i64..=8_i64 {
+        db.execute(&format!(
+            "INSERT INTO docs (id, body) VALUES ({row_id}, 'x')"
+        ))
+        .expect("insert row");
+    }
+
+    let mut runtime = db.debug_engine_snapshot().expect("snapshot runtime");
+    runtime.cache_payload_remove("docs");
+    assert!(runtime.cached_payload("docs").is_none());
+
+    let statement = parse_sql_statement("DELETE FROM docs WHERE id = 4").expect("parse delete");
+    let crate::sql::ast::Statement::Delete(delete) = statement else {
+        panic!("expected delete");
+    };
+    let prepared = runtime
+        .prepare_simple_delete(&delete)
+        .expect("prepare delete")
+        .expect("expected prepared delete");
+    runtime
+        .execute_prepared_simple_delete(&prepared, &[], PAGE_SIZE)
+        .expect("execute prepared delete");
+
+    db.begin_write().expect("begin write txn");
+    runtime.persist_to_db(&db).expect("persist runtime");
+    db.commit().expect("commit write txn");
+
+    assert!(runtime.cached_payload("docs").is_some());
+    assert_eq!(
+        db.execute("SELECT COUNT(*) FROM docs")
+            .expect("count rows")
+            .rows()
+            .first()
+            .and_then(|row| row.values().first())
+            .cloned(),
+        Some(Value::Int64(7))
+    );
+    assert_eq!(
+        db.execute("SELECT COUNT(*) FROM docs WHERE id = 4")
+            .expect("count deleted row")
+            .rows()
+            .first()
+            .and_then(|row| row.values().first())
+            .cloned(),
+        Some(Value::Int64(0))
     );
 }
 

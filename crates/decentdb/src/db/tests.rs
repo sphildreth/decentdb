@@ -214,6 +214,58 @@ fn queued_execution_honors_cancel_before_admission() {
 }
 
 #[test]
+fn execute_batch_schema_only_ddl_is_single_commit_and_queryable() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let path = tempdir.path().join("ddl-schema-batch.ddb");
+    let db = Db::create(&path, DbConfig::default()).expect("create db");
+
+    let before_lsn = db.inner.wal.latest_snapshot();
+    let results = db
+        .execute_batch(
+            "CREATE TABLE artists (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL
+             );
+             CREATE INDEX idx_artists_name ON artists(name);
+             CREATE VIEW artist_names AS
+                SELECT id, name FROM artists;",
+        )
+        .expect("execute schema-only batch");
+    assert_eq!(results.len(), 3);
+    assert!(db.inner.wal.latest_snapshot() > before_lsn);
+
+    db.execute("INSERT INTO artists (id, name) VALUES (1, 'Ada')")
+        .expect("seed artist");
+    db.execute("INSERT INTO artists (id, name) VALUES (2, 'Bob')")
+        .expect("second artist");
+
+    let count = db
+        .execute("SELECT COUNT(*) FROM artist_names")
+        .expect("query artist view");
+    assert_eq!(scalar_i64(&count), 2);
+}
+
+#[test]
+fn execute_batch_mixed_statements_fallback_to_per_statement_flow() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let path = tempdir.path().join("ddl-then-dml-fallback.ddb");
+    let db = Db::create(&path, DbConfig::default()).expect("create db");
+
+    let results = db
+        .execute_batch(
+            "CREATE TABLE entities (id INTEGER PRIMARY KEY, name TEXT);
+             INSERT INTO entities (id, name) VALUES (1, 'value')",
+        )
+        .expect("mixed batch still executes");
+    assert_eq!(results.len(), 2);
+
+    let count = db
+        .execute("SELECT COUNT(*) FROM entities")
+        .expect("count inserted row");
+    assert_eq!(scalar_i64(&count), 1);
+}
+
+#[test]
 fn statement_cache_reuses_parsed_statement() {
     let mut cache = StatementCache::with_capacity(4);
     let first = cache.get_or_parse("SELECT 1").expect("parse");
@@ -2184,6 +2236,57 @@ fn save_as_flushes_wal_without_compacting_source_payloads() {
                 .expect("count snapshot docs")
         ),
         96
+    );
+}
+
+#[test]
+fn save_as_file_copy_preserves_checkpointed_snapshot_bytes() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let path = tempdir.path().join("save-as-file-copy-source.ddb");
+    let snapshot_path = tempdir.path().join("save-as-file-copy-snapshot.ddb");
+    let db = Db::open_or_create(&path, DbConfig::default()).expect("open db");
+    db.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT)")
+        .expect("create docs table");
+    for id in 1..=32 {
+        db.execute(&format!(
+            "INSERT INTO docs (id, body) VALUES ({id}, 'body-{id}')"
+        ))
+        .expect("insert row");
+    }
+
+    db.checkpoint_wal().expect("checkpoint wal");
+    let before = db.storage_info().expect("storage before save_as");
+    let source_bytes_before = std::fs::read(&path).expect("read source bytes before save_as");
+
+    db.save_as(&snapshot_path).expect("save as");
+
+    let after = db.storage_info().expect("storage after save_as");
+    assert_eq!(
+        before.wal_end_lsn, after.wal_end_lsn,
+        "save_as should not checkpoint when already checkpointed"
+    );
+    assert_eq!(
+        before.wal_file_size, after.wal_file_size,
+        "save_as should not modify WAL when already checkpointed"
+    );
+
+    assert_eq!(
+        std::fs::read(&path).expect("read source bytes after save_as"),
+        source_bytes_before,
+        "save_as should not mutate a checkpointed source database file"
+    );
+    assert_eq!(
+        std::fs::read(&snapshot_path).expect("read snapshot bytes"),
+        source_bytes_before
+    );
+    let snapshot = Db::open(&snapshot_path, DbConfig::default()).expect("open snapshot");
+    assert_eq!(
+        scalar_i64(
+            &snapshot
+                .execute("SELECT COUNT(*) FROM docs")
+                .expect("count snapshot docs")
+        ),
+        32
     );
 }
 

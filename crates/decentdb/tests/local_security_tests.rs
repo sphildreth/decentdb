@@ -98,6 +98,47 @@ fn policies_masks_and_audit_context_filter_and_mask_query_output() {
 }
 
 #[test]
+fn resident_fast_read_respects_security_rules_after_reopen() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("resident_security.ddb");
+
+    {
+        let db = Db::open_or_create(&path, DbConfig::default()).expect("create db");
+        db.execute("CREATE TABLE employees (id INT PRIMARY KEY, tenant_id TEXT, ssn TEXT)")
+            .expect("create table");
+        db.execute(
+            "INSERT INTO employees (id, tenant_id, ssn) VALUES
+             (1, 'tenant-a', '111-22-3333'),
+             (2, 'tenant-b', '222-33-4444')",
+        )
+        .expect("insert rows");
+        db.execute("CREATE POLICY tenant_filter ON employees USING tenant_id = current_tenant()")
+            .expect("create policy");
+        db.execute("CREATE MASK ssn_mask ON employees(ssn) USING 'masked'")
+            .expect("create mask");
+    }
+
+    let db = Db::open(&path, DbConfig::embedded_fast()).expect("reopen db");
+    db.execute("SET AUDIT CONTEXT tenant_id = 'tenant-a'")
+        .expect("set tenant");
+    db.execute("INSERT INTO employees (id, tenant_id, ssn) VALUES (3, 'tenant-a', '333-44-5555')")
+        .expect("insert third tenant row");
+
+    let result = db
+        .execute("SELECT id, ssn FROM employees ORDER BY id")
+        .expect("select tenant-filtered masked rows");
+    assert_eq!(result.rows().len(), 2);
+    assert_eq!(
+        result.rows()[0].values(),
+        &[Value::Int64(1), Value::Text("masked".to_string())]
+    );
+    assert_eq!(
+        result.rows()[1].values(),
+        &[Value::Int64(3), Value::Text("masked".to_string())]
+    );
+}
+
+#[test]
 fn policy_and_mask_can_be_disabled_and_dropped() {
     let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
     db.execute("CREATE TABLE docs (id INT PRIMARY KEY, tenant_id TEXT, body TEXT)")

@@ -422,6 +422,39 @@ impl DbConfig {
         }
     }
 
+    /// Returns the recommended profile for single-process embedded
+    /// applications that perform a mix of reads and autocommit writes on a
+    /// hot working set of tables.
+    ///
+    /// This profile preserves full durable WAL sync and retains loaded row
+    /// sources across autocommit commits so that repeated single-row
+    /// inserts/updates/deletes on the same table do not reload the table
+    /// from disk on every statement (the dominant cost of the default
+    /// `balanced`/`low_memory` profiles for autocommit write workloads). It
+    /// uses the legacy single-payload row source (`paged_row_storage =
+    /// false`), which has the cheapest incremental persist path for
+    /// autocommit writes while still producing compact on-disk files, and
+    /// disables the size-based auto-checkpoint triggers so bulk loads are
+    /// not interrupted mid-flight.
+    ///
+    /// Resident memory is bounded by the 32 MiB page cache plus the retained
+    /// row sources for the hot working set. The [`DbConfig::low_memory`] /
+    /// [`DbConfig::balanced`] profiles remain available for long-lived
+    /// handles that touch many tables and must keep resident memory minimal
+    /// between statements. For bulk loads, prefer an explicit transaction
+    /// regardless of profile.
+    #[must_use]
+    pub fn embedded_fast() -> Self {
+        Self {
+            cache_size_mb: 32,
+            retain_paged_row_sources_after_commit: true,
+            paged_row_storage: false,
+            wal_checkpoint_threshold_pages: 0,
+            wal_checkpoint_threshold_bytes: 0,
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn validate_for_create(&self) -> Result<()> {
         if page::is_supported_page_size(self.page_size) {
             Ok(())
