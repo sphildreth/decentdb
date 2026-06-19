@@ -2663,6 +2663,140 @@ fn refresh_engine_from_snapshot_reloads_when_reader_uses_older_lsn() {
 }
 
 #[test]
+fn checkpoint_fold_refresh_reloads_after_post_checkpoint_external_commit() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let path = tempdir
+        .path()
+        .join("checkpoint-fold-post-commit-refresh.ddb");
+    let config = DbConfig {
+        paged_row_storage: true,
+        ..DbConfig::default()
+    };
+    let db = Db::open_or_create(&path, config.clone()).expect("open db");
+
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+        .expect("create table");
+    let mut txn = db.transaction().expect("begin seed txn");
+    let insert = txn
+        .prepare("INSERT INTO t VALUES ($1, $2)")
+        .expect("prepare");
+    let large_body = "x".repeat(4096);
+    for id in 0_i64..256_i64 {
+        insert
+            .execute_in(
+                &mut txn,
+                &[Value::Int64(id), Value::Text(large_body.clone())],
+            )
+            .expect("seed row");
+    }
+    txn.commit().expect("commit seed rows");
+    let pre_checkpoint_lsn = db
+        .inner
+        .writer_last_commit_lsn
+        .load(AtomicOrdering::Acquire);
+
+    db.checkpoint_wal().expect("checkpoint wal");
+    assert_eq!(
+        db.inner.wal.latest_snapshot(),
+        0,
+        "test setup expects checkpoint to truncate the WAL"
+    );
+
+    let other = Db::open_or_create(&path, config).expect("open second db");
+    let other_insert = other
+        .prepare("INSERT INTO t VALUES ($1, $2)")
+        .expect("prepare");
+    other_insert
+        .execute(&[Value::Int64(10_000), Value::Text("newer".to_string())])
+        .expect("post-checkpoint insert");
+    let post_checkpoint_lsn = db.inner.wal.latest_snapshot();
+    assert!(post_checkpoint_lsn > 0);
+    assert!(
+        post_checkpoint_lsn < pre_checkpoint_lsn,
+        "test setup should reuse a lower numeric WAL LSN after checkpoint"
+    );
+
+    let result = db.execute("SELECT MAX(id) FROM t").expect("max id");
+    assert_eq!(scalar_i64(&result), 10_000);
+    assert_eq!(
+        db.inner.last_runtime_lsn.load(AtomicOrdering::Acquire),
+        post_checkpoint_lsn,
+        "post-checkpoint WAL commits must reload runtime metadata instead of reusing checkpoint-folded state"
+    );
+}
+
+#[test]
+fn storage_refresh_reloads_when_seen_checkpoint_reuses_lower_wal_lsn() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let path = tempdir
+        .path()
+        .join("storage-refresh-lower-post-checkpoint-lsn.ddb");
+    let config = DbConfig {
+        paged_row_storage: true,
+        ..DbConfig::default()
+    };
+    let db = Db::open_or_create(&path, config.clone()).expect("open db");
+
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+        .expect("create table");
+    let mut txn = db.transaction().expect("begin seed txn");
+    let insert = txn
+        .prepare("INSERT INTO t VALUES ($1, $2)")
+        .expect("prepare");
+    let large_body = "x".repeat(4096);
+    for id in 0_i64..256_i64 {
+        insert
+            .execute_in(
+                &mut txn,
+                &[Value::Int64(id), Value::Text(large_body.clone())],
+            )
+            .expect("seed row");
+    }
+    txn.commit().expect("commit seed rows");
+    let pre_checkpoint_lsn = db.inner.last_runtime_lsn.load(AtomicOrdering::Acquire);
+
+    db.checkpoint_wal().expect("checkpoint wal");
+    db.begin_write().expect("begin write to observe checkpoint");
+    db.rollback().expect("rollback write observation");
+    assert_eq!(
+        db.inner
+            .last_seen_checkpoint_epoch
+            .load(AtomicOrdering::Acquire),
+        db.inner.wal.checkpoint_epoch(),
+        "test setup should mark checkpoint epoch as seen"
+    );
+    assert_eq!(
+        db.inner.last_runtime_lsn.load(AtomicOrdering::Acquire),
+        pre_checkpoint_lsn,
+        "observing the checkpoint through write setup should not reload runtime by itself"
+    );
+
+    let other = Db::open_or_create(&path, config).expect("open second db");
+    let other_insert = other
+        .prepare("INSERT INTO t VALUES ($1, $2)")
+        .expect("prepare");
+    other_insert
+        .execute(&[Value::Int64(10_001), Value::Text("newer".to_string())])
+        .expect("post-checkpoint insert");
+    let post_checkpoint_lsn = db.inner.wal.latest_snapshot();
+    assert!(post_checkpoint_lsn > 0);
+    assert!(
+        post_checkpoint_lsn < pre_checkpoint_lsn,
+        "test setup should reuse a lower numeric WAL LSN after checkpoint"
+    );
+
+    db.refresh_engine_from_storage()
+        .expect("refresh from lower post-checkpoint LSN");
+    assert_eq!(
+        db.inner.last_runtime_lsn.load(AtomicOrdering::Acquire),
+        post_checkpoint_lsn,
+        "storage refresh must not treat a lower post-checkpoint WAL LSN as already loaded"
+    );
+    let result = db.execute("SELECT MAX(id) FROM t").expect("max id");
+    assert_eq!(scalar_i64(&result), 10_001);
+}
+
+#[test]
 fn deferred_paged_secondary_index_point_lookup_stays_indexed_and_unloaded() {
     let tempdir = TempDir::new().expect("tempdir");
     let path = tempdir
@@ -14763,6 +14897,71 @@ fn repeated_autocommit_read_reuses_resident_paged_row_source() {
             .table_touch_generation
             .keys()
             .any(|name| name.eq_ignore_ascii_case("seeded")));
+    }
+}
+
+#[test]
+fn checkpoint_wal_read_refresh_preserves_paged_table_row_count_metadata() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let path = tempdir
+        .path()
+        .join("checkpoint-wal-preserves-paged-row-count.ddb");
+    let config = DbConfig {
+        paged_row_storage: true,
+        ..DbConfig::default()
+    };
+
+    let db = Db::open_or_create(&path, config).expect("create db");
+    db.execute("CREATE TABLE seeded (id INTEGER PRIMARY KEY, n INTEGER, body TEXT)")
+        .expect("create seeded");
+    let mut txn = db.transaction().expect("begin txn");
+    let insert = txn
+        .prepare("INSERT INTO seeded (id, n, body) VALUES ($1, $2, $3)")
+        .expect("prepare insert");
+    for i in 0_i64..64_i64 {
+        insert
+            .execute_in(
+                &mut txn,
+                &[
+                    Value::Int64(i),
+                    Value::Int64(i * 10),
+                    Value::Text("x".repeat(2048)),
+                ],
+            )
+            .expect("insert row");
+    }
+    txn.commit().expect("commit rows");
+
+    {
+        let runtime = db.inner.engine.read().expect("runtime read lock");
+        let state = runtime
+            .persisted_tables
+            .get("seeded")
+            .expect("persisted seeded");
+        assert!(state.pointer.is_table_paged_manifest());
+        assert_eq!(state.row_count, 64);
+        assert!(
+            runtime
+                .deferred_table_names()
+                .any(|name| name.eq_ignore_ascii_case("seeded")),
+            "default paged row storage should re-defer committed row sources"
+        );
+    }
+
+    db.checkpoint_wal().expect("checkpoint wal");
+    let count = db.execute("SELECT COUNT(*) FROM seeded").expect("count");
+    assert_eq!(scalar_i64(&count), 64);
+
+    {
+        let runtime = db.inner.engine.read().expect("runtime read lock");
+        let state = runtime
+            .persisted_tables
+            .get("seeded")
+            .expect("persisted seeded");
+        assert_eq!(
+            state.row_count, 64,
+            "post-checkpoint snapshot refresh should not rebuild away hot row-count metadata"
+        );
     }
 }
 

@@ -740,6 +740,7 @@ struct DbInner {
     last_runtime_lsn: AtomicU64,
     writer_last_commit_lsn: AtomicU64,
     last_seen_checkpoint_epoch: AtomicU64,
+    last_explicit_checkpoint_epoch: AtomicU64,
     sql_write_lock: Mutex<()>,
     sql_txn: Mutex<SqlTxnSlot>,
     sql_txn_active: AtomicBool,
@@ -1920,9 +1921,17 @@ impl Db {
     /// Flushes committed WAL frames into the database file without running the
     /// optional pre-checkpoint payload compaction pass.
     pub fn checkpoint_wal(&self) -> Result<()> {
+        let checkpoint_epoch_before = self.inner.wal.checkpoint_epoch();
         self.inner
             .wal
-            .checkpoint(&self.inner.pager, self.inner.config.checkpoint_timeout_sec)
+            .checkpoint(&self.inner.pager, self.inner.config.checkpoint_timeout_sec)?;
+        let checkpoint_epoch_after = self.inner.wal.checkpoint_epoch();
+        if checkpoint_epoch_after != checkpoint_epoch_before {
+            self.inner
+                .last_explicit_checkpoint_epoch
+                .store(checkpoint_epoch_after, Ordering::Release);
+        }
+        Ok(())
     }
 
     /// Blocks until every commit acknowledged before this call is durable on
@@ -3813,6 +3822,7 @@ impl Db {
                 last_runtime_lsn: AtomicU64::new(runtime_lsn),
                 writer_last_commit_lsn: AtomicU64::new(0),
                 last_seen_checkpoint_epoch: AtomicU64::new(last_seen_checkpoint_epoch),
+                last_explicit_checkpoint_epoch: AtomicU64::new(0),
                 sql_write_lock: Mutex::new(()),
                 sql_txn: Mutex::new(SqlTxnSlot::None),
                 sql_txn_active: AtomicBool::new(false),
@@ -8101,9 +8111,16 @@ impl Db {
             .last_seen_checkpoint_epoch
             .load(Ordering::Acquire);
         let last_runtime_lsn = self.inner.last_runtime_lsn.load(Ordering::Acquire);
+        let writer_last_commit_lsn = self.inner.writer_last_commit_lsn.load(Ordering::Acquire);
+        let last_explicit_checkpoint_epoch = self
+            .inner
+            .last_explicit_checkpoint_epoch
+            .load(Ordering::Acquire);
+        let mut checkpoint_lsn_after_refresh = None;
         if latest_checkpoint_epoch != last_seen_checkpoint_epoch {
             let cached_header = self.inner.pager.header_snapshot()?;
             let on_disk_header = self.inner.pager.header_from_disk()?;
+            checkpoint_lsn_after_refresh = Some(on_disk_header.last_checkpoint_lsn);
             if on_disk_header.last_checkpoint_lsn != cached_header.last_checkpoint_lsn {
                 self.inner.pager.refresh_from_disk(on_disk_header)?;
             }
@@ -8114,6 +8131,26 @@ impl Db {
         }
         if snapshot_lsn == last_runtime_lsn && latest_checkpoint_epoch == last_seen_checkpoint_epoch
         {
+            return Ok(());
+        }
+
+        if last_runtime_lsn > 0
+            && writer_last_commit_lsn > 0
+            && last_runtime_lsn >= writer_last_commit_lsn
+            && snapshot_lsn == 0
+            && last_explicit_checkpoint_epoch == latest_checkpoint_epoch
+            && checkpoint_lsn_after_refresh.is_some_and(|checkpoint_lsn| {
+                checkpoint_lsn == last_runtime_lsn && checkpoint_lsn >= writer_last_commit_lsn
+            })
+        {
+            // An explicit checkpoint from this handle can fold exactly the
+            // current runtime into the database file and reset the live WAL
+            // end to 0. Only preserve the hot runtime before any post-
+            // checkpoint WAL frames exist; otherwise the runtime would no
+            // longer match the pinned snapshot.
+            self.inner
+                .last_runtime_lsn
+                .store(snapshot_lsn, Ordering::Release);
             return Ok(());
         }
 
@@ -8157,7 +8194,7 @@ impl Db {
             .load(Ordering::Acquire);
         let writer_last_commit_lsn = self.inner.writer_last_commit_lsn.load(Ordering::Acquire);
 
-        if latest_lsn <= last_runtime_lsn && latest_checkpoint_epoch == last_seen_checkpoint_epoch {
+        if latest_lsn == last_runtime_lsn && latest_checkpoint_epoch == last_seen_checkpoint_epoch {
             return Ok(());
         }
 
@@ -8174,18 +8211,23 @@ impl Db {
                 .store(latest_checkpoint_epoch, Ordering::Release);
         }
 
+        let last_explicit_checkpoint_epoch = self
+            .inner
+            .last_explicit_checkpoint_epoch
+            .load(Ordering::Acquire);
         if last_runtime_lsn > 0
             && writer_last_commit_lsn > 0
             && last_runtime_lsn >= writer_last_commit_lsn
-            && latest_lsn <= writer_last_commit_lsn
-            && checkpoint_lsn_after_refresh
-                .is_none_or(|checkpoint_lsn| checkpoint_lsn <= last_runtime_lsn)
+            && latest_lsn == 0
+            && last_explicit_checkpoint_epoch == latest_checkpoint_epoch
+            && checkpoint_lsn_after_refresh.is_some_and(|checkpoint_lsn| {
+                checkpoint_lsn == last_runtime_lsn && checkpoint_lsn >= writer_last_commit_lsn
+            })
         {
-            // A checkpoint can legally fold this handle's last committed WAL
-            // history back into the database file and reset the live WAL end
-            // (often to 0 after truncation). The in-memory runtime is still
-            // current, but future OCC writes must compare against the new live
-            // WAL end rather than the pre-checkpoint commit LSN.
+            // An explicit checkpoint from this handle can fold exactly the
+            // current runtime into the database file and reset the live WAL
+            // end to 0. Only preserve the runtime before any post-checkpoint
+            // WAL frames exist; lower nonzero LSNs after WAL reuse must reload.
             self.inner
                 .last_runtime_lsn
                 .store(latest_lsn, Ordering::Release);

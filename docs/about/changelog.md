@@ -45,6 +45,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mixing runtime metadata with pages from a different snapshot, which could
   surface as intermittent overflow payload length mismatch errors under
   writer/reader stress.
+- Preserved hot same-handle paged-table runtime metadata across explicit WAL
+  checkpoint folds while still reloading after background or cross-connection
+  post-checkpoint WAL commits. Bulk-load-then-read workloads now keep deferred
+  row-count metadata and locator/index caches available after
+  `checkpoint_wal()`, restoring rust-baseline count, grouped-join, and
+  view-query performance.
 - Replaced selected production panic-like executor paths with typed SQL/internal
   errors or explicit invariants, with regression tests for those error paths.
 
