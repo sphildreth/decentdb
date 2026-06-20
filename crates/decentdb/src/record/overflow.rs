@@ -999,7 +999,7 @@ mod tests {
     use super::{
         append_uncompressed_with_first_page_patch, build_overflow_chain_cache, free_overflow,
         read_overflow, read_overflow_prefix, rewrite_overflow,
-        rewrite_overflow_cached_with_dirty_byte_ranges, write_overflow,
+        rewrite_overflow_cached_with_dirty_byte_range, write_overflow,
     };
 
     #[test]
@@ -1099,13 +1099,13 @@ mod tests {
 
         let mut grown = payload.clone();
         grown.push(9);
-        let (rewritten, new_cache, _tail) = rewrite_overflow_cached_with_dirty_byte_ranges(
+        let (rewritten, new_cache, _tail) = rewrite_overflow_cached_with_dirty_byte_range(
             &mut store,
             pointer,
             &grown,
             &cache.page_ids,
             0,
-            Some(&[24..25]),
+            Some(24..25),
         )
         .expect("rewrite with dirty range");
 
