@@ -278,9 +278,15 @@ pub(crate) fn rewrite_overflow_cached_with_dirty_byte_ranges<S: PageStore>(
                 }
             }
             if needed_pages != cached_page_ids.len() && needed_pages > 0 {
-                let last_page = needed_pages - 1;
-                if last_page >= skip_first_n_pages {
-                    page_ranges.push(last_page..needed_pages);
+                let rewrite_from_page = if needed_pages > cached_page_ids.len() {
+                    cached_page_ids.len().saturating_sub(1)
+                } else {
+                    needed_pages - 1
+                }
+                .max(skip_first_n_pages)
+                .min(needed_pages);
+                if rewrite_from_page < needed_pages {
+                    page_ranges.push(rewrite_from_page..needed_pages);
                 }
             }
             if page_ranges.is_empty() {
@@ -991,8 +997,9 @@ mod tests {
     use crate::storage::page::InMemoryPageStore;
 
     use super::{
-        append_uncompressed_with_first_page_patch, free_overflow, read_overflow,
-        read_overflow_prefix, rewrite_overflow, write_overflow,
+        append_uncompressed_with_first_page_patch, build_overflow_chain_cache, free_overflow,
+        read_overflow, read_overflow_prefix, rewrite_overflow,
+        rewrite_overflow_cached_with_dirty_byte_ranges, write_overflow,
     };
 
     #[test]
@@ -1080,6 +1087,40 @@ mod tests {
         assert_eq!(cache.page_ids.first().copied(), Some(updated.head_page_id));
         assert!(tail.page_id > 0);
         assert!(tail.chunk_len > 0);
+    }
+
+    #[test]
+    fn cached_dirty_range_growth_rewrites_previous_tail_pointer() {
+        let mut store = InMemoryPageStore::new(32);
+        let payload = vec![7_u8; 24];
+        let pointer = write_overflow(&mut store, &payload, CompressionMode::Never).expect("write");
+        let cache =
+            build_overflow_chain_cache(&store, pointer.head_page_id).expect("build chain cache");
+
+        let mut grown = payload.clone();
+        grown.push(9);
+        let (rewritten, new_cache, _tail) = rewrite_overflow_cached_with_dirty_byte_ranges(
+            &mut store,
+            pointer,
+            &grown,
+            &cache.page_ids,
+            0,
+            Some(&[24..25]),
+        )
+        .expect("rewrite with dirty range");
+
+        assert_eq!(new_cache.page_ids.len(), 2);
+        let head_page = store
+            .read_page(rewritten.head_page_id)
+            .expect("read head page");
+        assert_eq!(
+            u32::from_le_bytes(head_page[0..4].try_into().expect("head next pointer")),
+            new_cache.page_ids[1]
+        );
+        assert_eq!(
+            read_overflow(&store, rewritten).expect("read rewritten"),
+            grown
+        );
     }
 
     // ── Compression mode tests ──────────────────────────────────────

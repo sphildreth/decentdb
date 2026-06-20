@@ -7,7 +7,7 @@ The status values are intentionally limited to:
 ## Feature-by-Binding Support
 
 | Capability | Rust Native | C ABI | Python | Go | Java / JDBC | Node.js | Dart | .NET | Web / WASM |
-|---|---|---|---|---|---|---|---|---|
+|---|---|---|---|---|---|---|---|---|---|
 | Open/close database | supported | supported | supported | supported | supported | supported | supported | supported | supported |
 | Execute SQL | supported | supported | supported | supported | supported | supported | supported | supported | supported |
 | Prepared statements | supported | supported | partial | supported | supported | partial | partial | supported | partial |
