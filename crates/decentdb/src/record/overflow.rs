@@ -994,7 +994,7 @@ fn write_chain_pages<S: PageStore>(
 #[cfg(test)]
 mod tests {
     use crate::record::compression::CompressionMode;
-    use crate::storage::page::InMemoryPageStore;
+    use crate::storage::page::{InMemoryPageStore, PageStore};
 
     use super::{
         append_uncompressed_with_first_page_patch, build_overflow_chain_cache, free_overflow,
