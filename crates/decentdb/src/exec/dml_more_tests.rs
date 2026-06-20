@@ -168,6 +168,10 @@ mod tests {
             .resident_data()
             .rows
             .is_empty());
+        assert!(runtime
+            .paged_mutations
+            .get("t")
+            .is_some_and(|delta| delta.deleted_rows.contains(&1)));
     }
 
     #[test]

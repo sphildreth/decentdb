@@ -3,7 +3,7 @@ plugins {
 }
 
 group = 'com.decentdb'
-version = '2.13.1'
+version = '2.14.0'
 
 def repoRoot = file("${rootProject.projectDir}/../..")
 def nativeLibDirPath = project.findProperty('nativeLibDir') ?:

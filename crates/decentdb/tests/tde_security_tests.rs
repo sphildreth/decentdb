@@ -115,3 +115,40 @@ fn encrypted_save_as_preserves_tde() {
         &[Value::Text("backup-secret".to_string())]
     );
 }
+
+#[test]
+fn encrypted_database_wrong_key_open_does_not_corrupt_file_for_future_recovery() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("secure.ddb");
+    let config = tde_config();
+
+    {
+        let db = Db::create(&path, config.clone()).expect("create encrypted db");
+        db.execute("CREATE TABLE secrets (id INT64 PRIMARY KEY, secret TEXT)")
+            .expect("create table");
+        db.execute("INSERT INTO secrets (id, secret) VALUES (1, 'top-secret')")
+            .expect("insert encrypted secret");
+    }
+
+    let wrong_key_config = DbConfig {
+        encryption: Some(
+            DbEncryptionConfig::from_key_bytes(b"wrong-key-material-32-bytes-long")
+                .expect("valid wrong key"),
+        ),
+        ..DbConfig::default()
+    };
+    let wrong_open = Db::open(&path, wrong_key_config).expect_err("wrong key should fail");
+    assert!(
+        wrong_open.to_string().contains("supplied encryption key"),
+        "expected wrong-key rejection details, got {wrong_open}"
+    );
+
+    let db = Db::open(&path, config).expect("reopen with correct key");
+    let recovered = db
+        .execute("SELECT id, secret FROM secrets WHERE id = 1")
+        .expect("recover after wrong-key attempt");
+    assert_eq!(
+        recovered.rows()[0].values(),
+        &[Value::Int64(1), Value::Text("top-secret".to_string())]
+    );
+}

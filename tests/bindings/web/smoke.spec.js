@@ -72,6 +72,7 @@ test("web package OPFS smoke: probe + owner diagnostics + create/open/query/reop
   expect(result.dbMetadata.capabilities.branchSnapshots).toBe(false);
   expect(result.txRows).toEqual([{ id: 4242, name: "committed" }]);
   expect(result.firstPreparedRow).toEqual(result.createdRows[0]);
+  expect(result.retainedPreparedRow).toEqual(result.createdRows[0]);
   expect(result.preparedPage.rows).toEqual(result.createdRows);
   expect(result.preparedPage.done).toBe(true);
   expect(result.closedStatementCode).toBe("ERR_BROWSER_STATEMENT_CLOSED");

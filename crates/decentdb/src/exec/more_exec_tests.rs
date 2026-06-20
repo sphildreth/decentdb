@@ -5,6 +5,7 @@ mod tests {
     use super::super::*;
 
     use crate::catalog::ColumnType;
+    use crate::error::{DbError, DbErrorCode};
     use crate::sql::ast::BinaryOp;
 
     #[test]
@@ -64,6 +65,29 @@ mod tests {
             Value::Int64(1),
         );
         assert!(err.is_err());
+        assert!(matches!(err, Err(DbError::Sql { .. })));
+    }
+
+    #[test]
+    fn arithmetic_eq_int64_is_internal_error() {
+        let err = arithmetic(&BinaryOp::Eq, Value::Int64(1), Value::Int64(2))
+            .expect_err("eq is unsupported for arithmetic path");
+        assert!(matches!(err, DbError::Internal { .. }));
+        assert_eq!(err.code(), DbErrorCode::Internal);
+        assert!(
+            matches!(format!("{err}").as_str(), msg if msg.contains("invalid arithmetic operator"))
+        );
+    }
+
+    #[test]
+    fn arithmetic_eq_float_is_internal_error() {
+        let err = arithmetic(&BinaryOp::Eq, Value::Float64(1.0), Value::Float64(2.0))
+            .expect_err("eq is unsupported for arithmetic path");
+        assert!(matches!(err, DbError::Internal { .. }));
+        assert_eq!(err.code(), DbErrorCode::Internal);
+        assert!(
+            matches!(format!("{err}").as_str(), msg if msg.contains("invalid arithmetic operator"))
+        );
     }
 
     #[test]

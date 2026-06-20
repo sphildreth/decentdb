@@ -924,6 +924,30 @@ fn maybe_index_plan(
         return None;
     };
     let table = catalog.table(name)?;
+    if let Some(index) = best_matching_compound_prefix_index(filter, table, catalog) {
+        if !index.unique
+            && !should_use_btree_index(table.name.as_str(), index.name.as_str(), catalog)
+        {
+            return None;
+        }
+        return Some(
+            if select_projection_is_covered_by_index(select, table, index) {
+                PhysicalPlan::CoveringIndexSeek {
+                    table: table.name.clone(),
+                    index: index.name.clone(),
+                    predicate: filter.clone(),
+                    estimate: PlanEstimate::ZERO,
+                }
+            } else {
+                PhysicalPlan::IndexSeek {
+                    table: table.name.clone(),
+                    index: index.name.clone(),
+                    predicate: filter.clone(),
+                    estimate: PlanEstimate::ZERO,
+                }
+            },
+        );
+    }
     if let Some(column_name) = simple_spatial_indexable_filter(filter) {
         let index = catalog.indexes.values().find(|index| {
             identifiers_equal(&index.table_name, &table.name)
@@ -1000,6 +1024,82 @@ fn maybe_index_plan(
             estimate: PlanEstimate::ZERO,
         }
     })
+}
+
+fn best_matching_compound_prefix_index<'a>(
+    filter: &Expr,
+    table: &TableSchema,
+    catalog: &'a CatalogState,
+) -> Option<&'a crate::catalog::IndexSchema> {
+    const MIN_PREFIX_COLUMNS: usize = 2;
+    let mut best: Option<(&crate::catalog::IndexSchema, usize)> = None;
+    for index in catalog.indexes.values() {
+        if !identifiers_equal(&index.table_name, &table.name)
+            || index.kind != IndexKind::Btree
+            || index.predicate_sql.is_some()
+            || !index.fresh
+            || index.columns.len() < MIN_PREFIX_COLUMNS
+        {
+            continue;
+        }
+        let Some(matched_prefix_len) = compound_index_prefix_len(filter, index, MIN_PREFIX_COLUMNS)
+        else {
+            continue;
+        };
+        if best.is_none_or(|(_, current)| matched_prefix_len > current) {
+            best = Some((index, matched_prefix_len));
+        }
+    }
+    best.map(|(index, _)| index)
+}
+
+fn compound_index_prefix_len(
+    filter: &Expr,
+    index: &crate::catalog::IndexSchema,
+    min_prefix_len: usize,
+) -> Option<usize> {
+    let mut indexable_columns: Vec<&str> = Vec::new();
+    for filter_expr in flattened_and_predicates(filter) {
+        let Some(column) = simple_indexable_equality_filter(filter_expr) else {
+            continue;
+        };
+        if indexable_columns
+            .iter()
+            .any(|candidate| identifiers_equal(candidate, column))
+        {
+            continue;
+        }
+        indexable_columns.push(column);
+    }
+    let mut matched_prefix_len = 0;
+    for indexed_column in index.columns.iter() {
+        let Some(indexed) = indexed_column.column_name.as_deref() else {
+            break;
+        };
+        if !indexable_columns
+            .iter()
+            .any(|filter_column| identifiers_equal(filter_column, indexed))
+        {
+            break;
+        }
+        matched_prefix_len += 1;
+    }
+    (matched_prefix_len >= min_prefix_len).then_some(matched_prefix_len)
+}
+
+fn flattened_and_predicates(expr: &Expr) -> Vec<&Expr> {
+    match expr {
+        Expr::Binary {
+            left,
+            op: BinaryOp::And,
+            right,
+        } => {
+            let mut predicates = flattened_and_predicates(left);
+            predicates.extend(flattened_and_predicates(right));
+            predicates
+        }
+        _ => vec![expr],
+    }
 }
 
 fn select_projection_is_covered_by_index(
@@ -1420,33 +1520,34 @@ fn expr_has_column_ref(expr: &Expr) -> bool {
 }
 
 fn simple_indexable_filter(filter: &Expr) -> Option<(&str, bool)> {
+    simple_indexable_equality_filter(filter)
+        .map(|column| (column, false))
+        .or_else(|| match filter {
+            Expr::Like {
+                expr: left,
+                pattern: right,
+                escape,
+                negated,
+                ..
+            } => match (&**left, &**right) {
+                (
+                    Expr::Column { column, .. },
+                    Expr::Literal(crate::record::value::Value::Text(_)),
+                ) if !*negated && escape.is_none() => Some((column.as_str(), true)),
+                _ => None,
+            },
+            _ => None,
+        })
+}
+
+fn simple_indexable_equality_filter(filter: &Expr) -> Option<&str> {
     match filter {
         Expr::Binary { left, op, right } => match (&**left, op, &**right) {
-            (Expr::Column { column, .. }, BinaryOp::Eq, Expr::Literal(_)) => {
-                Some((column.as_str(), false))
-            }
-            (Expr::Column { column, .. }, BinaryOp::Eq, Expr::Parameter(_)) => {
-                Some((column.as_str(), false))
-            }
-            (Expr::Literal(_), BinaryOp::Eq, Expr::Column { column, .. }) => {
-                Some((column.as_str(), false))
-            }
-            (Expr::Parameter(_), BinaryOp::Eq, Expr::Column { column, .. }) => {
-                Some((column.as_str(), false))
-            }
-            _ => None,
-        },
-        Expr::Like {
-            expr: left,
-            pattern: right,
-            escape,
-            negated,
-            ..
-        } => match (&**left, &**right) {
-            (Expr::Column { column, .. }, Expr::Literal(crate::record::value::Value::Text(_)))
-                if !*negated && escape.is_none() =>
-            {
-                Some((column.as_str(), true))
+            (Expr::Column { column, .. }, BinaryOp::Eq, Expr::Literal(_))
+            | (Expr::Column { column, .. }, BinaryOp::Eq, Expr::Parameter(_))
+            | (Expr::Literal(_), BinaryOp::Eq, Expr::Column { column, .. })
+            | (Expr::Parameter(_), BinaryOp::Eq, Expr::Column { column, .. }) => {
+                Some(column.as_str())
             }
             _ => None,
         },
@@ -2145,6 +2246,51 @@ mod tests {
         catalog
     }
 
+    fn catalog_with_issue_table() -> CatalogState {
+        let mut catalog = CatalogState::empty(0);
+        catalog.tables.insert(
+            "issues".to_string(),
+            TableSchema {
+                name: "issues".to_string(),
+                temporary: false,
+                columns: vec![
+                    test_column("project_id", false),
+                    test_column("status", false),
+                    test_column("id", true),
+                ],
+                checks: Vec::new(),
+                foreign_keys: Vec::new(),
+                primary_key_columns: vec!["id".to_string()],
+                next_row_id: 1,
+                pk_index_root: None,
+            },
+        );
+        catalog.indexes.insert(
+            "idx_issues_project_status".to_string(),
+            IndexSchema {
+                name: "idx_issues_project_status".to_string(),
+                table_name: "issues".to_string(),
+                kind: IndexKind::Btree,
+                unique: false,
+                columns: vec![
+                    IndexColumn {
+                        column_name: Some("project_id".to_string()),
+                        expression_sql: None,
+                    },
+                    IndexColumn {
+                        column_name: Some("status".to_string()),
+                        expression_sql: None,
+                    },
+                ],
+                include_columns: Vec::new(),
+                predicate_sql: None,
+                full_text: None,
+                fresh: true,
+            },
+        );
+        catalog
+    }
+
     fn single_table_select(filter: Expr) -> Select {
         Select {
             distinct: false,
@@ -2152,6 +2298,21 @@ mod tests {
             projection: vec![SelectItem::Wildcard],
             from: vec![FromItem::Table {
                 name: "Artist".to_string(),
+                alias: None,
+            }],
+            filter: Some(filter),
+            group_by: vec![],
+            having: None,
+        }
+    }
+
+    fn single_issues_select(filter: Expr) -> Select {
+        Select {
+            distinct: false,
+            distinct_on: vec![],
+            projection: vec![SelectItem::Wildcard],
+            from: vec![FromItem::Table {
+                name: "issues".to_string(),
                 alias: None,
             }],
             filter: Some(filter),
@@ -2679,6 +2840,60 @@ mod tests {
             lines
                 .iter()
                 .any(|line| line.contains("IndexSeek(table=Artist, index=IX_Artist_NameNormalized")),
+            "expected IndexSeek, got: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn btree_index_plan_uses_compound_prefix_index_for_two_eq_predicates() {
+        let catalog = catalog_with_issue_table();
+        let select = single_issues_select(Expr::Binary {
+            left: Box::new(Expr::Binary {
+                left: Box::new(col("project_id")),
+                op: BinaryOp::Eq,
+                right: Box::new(Expr::Parameter(1)),
+            }),
+            op: BinaryOp::And,
+            right: Box::new(Expr::Binary {
+                left: Box::new(col("status")),
+                op: BinaryOp::Eq,
+                right: Box::new(Expr::Parameter(2)),
+            }),
+        });
+        let plan = maybe_index_plan(&select, select.filter.as_ref().unwrap(), &catalog)
+            .expect("compound index plan");
+        let lines = plan.render();
+        assert!(
+            lines.iter().any(
+                |line| line.contains("IndexSeek(table=issues, index=idx_issues_project_status")
+            ),
+            "expected IndexSeek, got: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn btree_index_plan_uses_compound_prefix_index_for_reversed_and_predicates() {
+        let catalog = catalog_with_issue_table();
+        let select = single_issues_select(Expr::Binary {
+            left: Box::new(Expr::Binary {
+                left: Box::new(col("status")),
+                op: BinaryOp::Eq,
+                right: Box::new(Expr::Parameter(2)),
+            }),
+            op: BinaryOp::And,
+            right: Box::new(Expr::Binary {
+                left: Box::new(col("project_id")),
+                op: BinaryOp::Eq,
+                right: Box::new(Expr::Parameter(1)),
+            }),
+        });
+        let plan = maybe_index_plan(&select, select.filter.as_ref().unwrap(), &catalog)
+            .expect("compound index plan");
+        let lines = plan.render();
+        assert!(
+            lines.iter().any(
+                |line| line.contains("IndexSeek(table=issues, index=idx_issues_project_status")
+            ),
             "expected IndexSeek, got: {lines:?}"
         );
     }

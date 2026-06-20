@@ -175,3 +175,48 @@ fn insert_wrong_column_count_is_error() {
         DbErrorCode::Sql | DbErrorCode::Constraint
     ));
 }
+
+#[test]
+fn transaction_errors_return_transaction_code() {
+    let db = mem_db();
+    let err = db.execute("COMMIT").unwrap_err();
+    assert_eq!(err.code(), DbErrorCode::Transaction);
+}
+
+#[test]
+fn diagnostics_redact_absolute_and_preserve_relative_filenames() {
+    let absolute_path = std::env::temp_dir().join(format!(
+        "phase4-missing-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    let absolute_error = Db::open(&absolute_path, DbConfig::default()).unwrap_err();
+    assert_eq!(absolute_error.code(), DbErrorCode::Io);
+    let absolute_diagnostic = absolute_error.diagnostic();
+    let absolute_context_path = absolute_diagnostic.context.path.expect("path context");
+    assert_eq!(
+        absolute_context_path.display,
+        absolute_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .expect("missing filename")
+    );
+
+    let relative_name = format!(
+        "phase4-missing-rel-{}-{}.ddb",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    );
+    let relative_error = Db::open(&relative_name, DbConfig::default()).unwrap_err();
+    assert_eq!(relative_error.code(), DbErrorCode::Io);
+    let relative_diagnostic = relative_error.diagnostic();
+    let relative_context_path = relative_diagnostic.context.path.expect("path context");
+    assert!(relative_context_path.display.ends_with(&relative_name));
+    assert!(!relative_context_path.display.contains('/'));
+}

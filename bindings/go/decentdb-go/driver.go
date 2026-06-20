@@ -423,6 +423,16 @@ type WriteQueueMetrics struct {
 	TotalQueueWaitNS    uint64
 }
 
+type BranchInfo struct {
+	BranchID        string  `json:"branch_id"`
+	Name            string  `json:"name"`
+	CurrentHeadID   *string `json:"current_head_id"`
+	BaseHeadID      *string `json:"base_head_id"`
+	CreatedAtMicros int64   `json:"created_at_micros"`
+	UpdatedAtMicros int64   `json:"updated_at_micros"`
+	DeletedAtMicros *int64  `json:"deleted_at_micros"`
+}
+
 // Watch is an in-process reactive subscription handle.
 type Watch struct {
 	ptr    *C.ddb_watch_t
@@ -575,6 +585,125 @@ func (d *DB) Exec(sql string, args ...driver.Value) (int64, error) {
 	return result.RowsAffected()
 }
 
+// CreateBranch creates a new branch from `main` or a named source branch.
+// If no source is provided, `main` is used.
+func (d *DB) CreateBranch(name string, from ...string) (BranchInfo, error) {
+	if d.closed != 0 {
+		return BranchInfo{}, driver.ErrBadConn
+	}
+
+	request := map[string]any{
+		"op":   "branch_create",
+		"name": name,
+	}
+	if len(from) > 0 && strings.TrimSpace(from[0]) != "" {
+		request["from"] = strings.TrimSpace(from[0])
+	}
+
+	var branch BranchInfo
+	if err := d.c.branchExecute(context.Background(), request, &branch); err != nil {
+		return BranchInfo{}, err
+	}
+	return branch, nil
+}
+
+// ListBranches returns metadata for all branches visible to this database.
+func (d *DB) ListBranches() ([]BranchInfo, error) {
+	if d.closed != 0 {
+		return nil, driver.ErrBadConn
+	}
+
+	var branches []BranchInfo
+	if err := d.c.branchExecute(context.Background(), map[string]any{"op": "branch_list"}, &branches); err != nil {
+		return nil, err
+	}
+	return branches, nil
+}
+
+// DeleteBranch deletes a non-main branch.
+func (d *DB) DeleteBranch(name string) (bool, error) {
+	if d.closed != 0 {
+		return false, driver.ErrBadConn
+	}
+
+	var out struct {
+		Deleted bool `json:"deleted"`
+		Name    string
+	}
+	if err := d.c.branchExecute(context.Background(), map[string]any{
+		"op":   "branch_delete",
+		"name": name,
+	}, &out); err != nil {
+		return false, err
+	}
+	return out.Deleted, nil
+}
+
+// ExecuteOnBranch runs a statement against the specified branch, including "main".
+func (d *DB) ExecuteOnBranch(branch string, query string, args ...driver.Value) (int64, error) {
+	if d.closed != 0 {
+		return 0, driver.ErrBadConn
+	}
+	namedArgs := make([]driver.NamedValue, len(args))
+	for i, value := range args {
+		namedArgs[i] = driver.NamedValue{Ordinal: i + 1, Value: value}
+	}
+	result, err := d.c.executeOnBranch(context.Background(), branch, query, namedArgs)
+	if err != nil {
+		return 0, err
+	}
+	defer C.ddb_result_free(&result)
+
+	var affected C.uint64_t
+	status := C.ddb_result_affected_rows(result, &affected)
+	if status != C.DDB_OK {
+		return 0, statusError(status, query)
+	}
+	return int64(affected), nil
+}
+
+// QueryOnBranchInt64 executes a scalar query against the specified branch and
+// returns the first column of the first row as int64.
+func (d *DB) QueryOnBranchInt64(branch string, query string, args ...driver.Value) (int64, error) {
+	if d.closed != 0 {
+		return 0, driver.ErrBadConn
+	}
+	namedArgs := make([]driver.NamedValue, len(args))
+	for i, value := range args {
+		namedArgs[i] = driver.NamedValue{Ordinal: i + 1, Value: value}
+	}
+	result, err := d.c.executeOnBranch(context.Background(), branch, query, namedArgs)
+	if err != nil {
+		return 0, err
+	}
+	defer C.ddb_result_free(&result)
+
+	var rowCount C.size_t
+	status := C.ddb_result_row_count(result, &rowCount)
+	if status != C.DDB_OK {
+		return 0, statusError(status, query)
+	}
+	if rowCount == 0 {
+		return 0, sql.ErrNoRows
+	}
+
+	raw, err := d.c.resultValueCopy(result, 0, 0, query)
+	if err != nil {
+		return 0, err
+	}
+	switch value := raw.(type) {
+	case int64:
+		return value, nil
+	case uint64:
+		if value > uint64(1<<63-1) {
+			return 0, fmt.Errorf("branch query returned uint64 value outside int64 range")
+		}
+		return int64(value), nil
+	default:
+		return 0, fmt.Errorf("branch query returned non-integer value %T", raw)
+	}
+}
+
 func (c *conn) CheckNamedValue(nv *driver.NamedValue) error {
 	switch nv.Value.(type) {
 	case Decimal:
@@ -616,6 +745,14 @@ func hasUnsupportedParamStyle(sqlText string) bool {
 		}
 	}
 	return false
+}
+
+func normalizeBranchName(branch string) string {
+	name := strings.TrimSpace(branch)
+	if name == "" {
+		return "main"
+	}
+	return name
 }
 
 type queuedArgSet struct {
@@ -709,6 +846,102 @@ func convertQueueArgs(args []driver.NamedValue) (*queuedArgSet, error) {
 	}
 
 	return out, nil
+}
+
+func (c *conn) branchExecute(ctx context.Context, request map[string]any, out any) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if c.db == nil {
+		return driver.ErrBadConn
+	}
+
+	payload, err := json.Marshal(request)
+	if err != nil {
+		return err
+	}
+	cPayload := C.CString(string(payload))
+	defer C.free(unsafe.Pointer(cPayload))
+
+	var cOut *C.char
+	status := C.ddb_db_branch_execute_json(c.db, cPayload, &cOut)
+	if status != C.DDB_OK {
+		return statusError(status, "branch_execute_json")
+	}
+	defer freeAPIString(cOut)
+
+	if out != nil {
+		if cOut == nil {
+			return fmt.Errorf("branch_execute_json returned nil output")
+		}
+		if err := json.Unmarshal([]byte(C.GoString(cOut)), out); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *conn) executeOnBranch(
+	ctx context.Context,
+	branch string,
+	query string,
+	args []driver.NamedValue,
+) (*C.ddb_result_t, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if c.db == nil {
+		return nil, driver.ErrBadConn
+	}
+
+	for _, arg := range args {
+		if arg.Ordinal <= 0 {
+			return nil, fmt.Errorf("invalid parameter index %d", arg.Ordinal)
+		}
+	}
+
+	converted, err := convertQueueArgs(args)
+	if err != nil {
+		return nil, err
+	}
+	defer converted.Free()
+
+	cBranch := C.CString(normalizeBranchName(branch))
+	defer C.free(unsafe.Pointer(cBranch))
+
+	cQuery := C.CString(query)
+	defer C.free(unsafe.Pointer(cQuery))
+
+	var result *C.ddb_result_t
+	var values *C.ddb_value_t
+	if len(converted.Values) > 0 {
+		values = &converted.Values[0]
+	}
+	status := C.ddb_db_execute_on_branch(
+		c.db,
+		cBranch,
+		cQuery,
+		values,
+		C.size_t(len(converted.Values)),
+		&result,
+	)
+	if status != C.DDB_OK {
+		return nil, statusError(status, query)
+	}
+	return result, nil
+}
+
+func (c *conn) resultValueCopy(result *C.ddb_result_t, row, col int, context string) (interface{}, error) {
+	if result == nil {
+		return nil, driver.ErrBadConn
+	}
+	var value C.ddb_value_t
+	status := C.ddb_result_value_copy(result, C.size_t(row), C.size_t(col), &value)
+	if status != C.DDB_OK {
+		return nil, statusError(status, context)
+	}
+	defer C.ddb_value_dispose(&value)
+	return valueToGo(value), nil
 }
 
 func (c *conn) Prepare(query string) (driver.Stmt, error) {

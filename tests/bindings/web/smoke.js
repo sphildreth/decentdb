@@ -106,6 +106,11 @@ async function runSmokeScenario(options = {}) {
     const preparedPage = await stmt.page(10);
     await stmt.clearBindings();
     await stmt.close();
+
+    const retainedStmt = await db.prepare(`SELECT id, name FROM ${DB_TABLE} ORDER BY id ASC`);
+    const retainedPreparedRow = await retainedStmt.step();
+    await retainedStmt.step();
+    await retainedStmt.close();
     let closedStatementCode = null;
     try {
       await stmt.step();
@@ -222,6 +227,7 @@ async function runSmokeScenario(options = {}) {
       dbMetadata,
       txRows: txRows.rows,
       firstPreparedRow,
+      retainedPreparedRow,
       preparedPage,
       closedStatementCode,
       missingTableDiagnostic,

@@ -1,4 +1,4 @@
-use decentdb::{Db, DbConfig, Value};
+use decentdb::{Db, DbConfig, DbErrorCode, Value};
 
 #[test]
 fn policies_masks_and_audit_context_filter_and_mask_query_output() {
@@ -95,6 +95,47 @@ fn policies_masks_and_audit_context_filter_and_mask_query_output() {
         Value::Text("alice".to_string()),
         Value::Text("tenant-a".to_string()),
     ]));
+}
+
+#[test]
+fn resident_fast_read_respects_security_rules_after_reopen() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("resident_security.ddb");
+
+    {
+        let db = Db::open_or_create(&path, DbConfig::default()).expect("create db");
+        db.execute("CREATE TABLE employees (id INT PRIMARY KEY, tenant_id TEXT, ssn TEXT)")
+            .expect("create table");
+        db.execute(
+            "INSERT INTO employees (id, tenant_id, ssn) VALUES
+             (1, 'tenant-a', '111-22-3333'),
+             (2, 'tenant-b', '222-33-4444')",
+        )
+        .expect("insert rows");
+        db.execute("CREATE POLICY tenant_filter ON employees USING tenant_id = current_tenant()")
+            .expect("create policy");
+        db.execute("CREATE MASK ssn_mask ON employees(ssn) USING 'masked'")
+            .expect("create mask");
+    }
+
+    let db = Db::open(&path, DbConfig::embedded_fast()).expect("reopen db");
+    db.execute("SET AUDIT CONTEXT tenant_id = 'tenant-a'")
+        .expect("set tenant");
+    db.execute("INSERT INTO employees (id, tenant_id, ssn) VALUES (3, 'tenant-a', '333-44-5555')")
+        .expect("insert third tenant row");
+
+    let result = db
+        .execute("SELECT id, ssn FROM employees ORDER BY id")
+        .expect("select tenant-filtered masked rows");
+    assert_eq!(result.rows().len(), 2);
+    assert_eq!(
+        result.rows()[0].values(),
+        &[Value::Int64(1), Value::Text("masked".to_string())]
+    );
+    assert_eq!(
+        result.rows()[1].values(),
+        &[Value::Int64(3), Value::Text("masked".to_string())]
+    );
 }
 
 #[test]
@@ -205,4 +246,65 @@ fn policies_and_masks_persist_and_apply_through_aliases() {
             Value::Text("payroll-mask".to_string()),
         ]
     );
+}
+
+#[test]
+fn unsupported_security_statement_syntax_returns_typed_sql_error() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
+    db.execute("CREATE TABLE docs (id INT64 PRIMARY KEY)")
+        .unwrap();
+
+    let err = db.execute("SET AUDIT CONTEXT tenant_id =").unwrap_err();
+    assert_eq!(err.code(), DbErrorCode::Sql);
+
+    let err = db.execute("ALTER POLICY").unwrap_err();
+    assert_eq!(err.code(), DbErrorCode::Sql);
+
+    let select_ok = db.execute("SELECT id FROM docs").unwrap();
+    assert_eq!(select_ok.rows().len(), 0);
+}
+
+#[test]
+fn security_blocked_and_malformed_statements_return_typed_sql_errors() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
+    db.execute("CREATE TABLE docs (id INT64 PRIMARY KEY)")
+        .unwrap();
+
+    let statements = [
+        ("SET AUDIT CONTEXT tenant_id =", DbErrorCode::Sql),
+        ("CREATE POLICY", DbErrorCode::Sql),
+        ("ALTER POLICY", DbErrorCode::Sql),
+        ("SET MASK 'docs.ssns'", DbErrorCode::Sql),
+    ];
+
+    for (sql, expected_code) in statements {
+        let error = db.execute(sql).unwrap_err();
+        assert_eq!(error.code(), expected_code, "unexpected code for '{sql}'");
+    }
+}
+
+#[test]
+fn parser_errors_preserve_handle_and_do_not_echo_private_values() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
+    db.execute("CREATE TABLE docs (id INT64 PRIMARY KEY)")
+        .unwrap();
+
+    let parse_error = db
+        .execute("SET AUDIT CONTEXT actor = <redacted_secret>")
+        .unwrap_err();
+    assert_eq!(parse_error.code(), DbErrorCode::Sql);
+    assert!(
+        !parse_error.to_string().contains("<redacted_secret>"),
+        "parser errors should avoid echoing malformed values"
+    );
+
+    db.execute("BEGIN").unwrap();
+    db.execute("INSERT INTO docs (id) VALUES (1)").unwrap();
+    let _ = db
+        .execute("CREATE POLICY docs_policy USING id")
+        .unwrap_err();
+    db.execute("ROLLBACK").unwrap();
+
+    let rows = db.execute("SELECT COUNT(*) FROM docs").unwrap();
+    assert_eq!(rows.rows()[0].values()[0], Value::Int64(0));
 }

@@ -256,6 +256,23 @@ mod tests {
 
     use super::{free_table_btree, TableBtree, TableBtreeView, TableRow};
 
+    fn shuffle_in_place(values: &mut [i64], seed: &mut u64) {
+        if values.is_empty() {
+            return;
+        }
+
+        let mut current = *seed;
+        for i in (1..values.len()).rev() {
+            current ^= current << 7;
+            current ^= current >> 9;
+            current ^= current << 8;
+            let swap = (current as usize) % (i + 1);
+            values.swap(i, swap);
+        }
+
+        *seed = current;
+    }
+
     fn collect_forward(
         tree: &TableBtree<crate::storage::page::InMemoryPageStore>,
     ) -> Vec<TableRow> {
@@ -412,5 +429,189 @@ mod tests {
 
         let mut seek_before_start = tree.cursor_seek_backward(0).expect("cursor");
         assert!(seek_before_start.prev().expect("prev").is_none());
+    }
+
+    #[test]
+    fn sequential_and_reverse_inserts_are_sorted_in_cursor_order() {
+        let mut forward = TableBtree::with_page_size(256);
+        for row_id in 0_i64..64 {
+            forward
+                .insert_row(row_id, vec![Value::Int64(row_id)])
+                .expect("insert row");
+        }
+
+        assert_eq!(
+            collect_forward(&forward)
+                .iter()
+                .map(|row| row.row_id)
+                .collect::<Vec<_>>(),
+            (0_i64..64).collect::<Vec<_>>()
+        );
+
+        let mut reverse = TableBtree::with_page_size(256);
+        for row_id in (0_i64..64).rev() {
+            reverse
+                .insert_row(row_id, vec![Value::Int64(row_id)])
+                .expect("insert row");
+        }
+
+        assert_eq!(
+            collect_forward(&reverse)
+                .iter()
+                .map(|row| row.row_id)
+                .collect::<Vec<_>>(),
+            (0_i64..64).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn deterministic_random_order_inserts_use_seed_a11fa11e_beef_cafe() {
+        let mut row_ids: Vec<i64> = (0_i64..400).map(|value| value * 2 - 400).collect();
+        let expected = {
+            let mut expected = row_ids.clone();
+            expected.sort_unstable();
+            expected
+        };
+
+        let mut seed = 0xA11F_A11E_BEEF_CAFE_u64;
+        shuffle_in_place(&mut row_ids, &mut seed);
+
+        let mut tree = TableBtree::with_page_size(256);
+        for row_id in row_ids {
+            tree.insert_row(row_id, vec![Value::Int64(row_id)])
+                .expect("insert row");
+        }
+
+        let collected = collect_forward(&tree)
+            .into_iter()
+            .map(|row| row.row_id)
+            .collect::<Vec<_>>();
+        assert_eq!(collected, expected);
+    }
+
+    #[test]
+    fn duplicate_row_id_returns_previous_row_payload() {
+        let mut tree = TableBtree::with_page_size(128);
+        let prior = tree
+            .insert_row(42, vec![Value::Text("first".to_string())])
+            .expect("insert first row");
+        assert!(prior.is_none());
+
+        let prior = tree
+            .insert_row(42, vec![Value::Text("second".to_string())])
+            .expect("replace row");
+        assert_eq!(
+            prior.expect("replacement should return previous row"),
+            TableRow {
+                row_id: 42,
+                values: vec![Value::Text("first".to_string())],
+            }
+        );
+
+        let current = tree.get_row(42).expect("row exists").expect("read row");
+        assert_eq!(
+            current,
+            TableRow {
+                row_id: 42,
+                values: vec![Value::Text("second".to_string())],
+            }
+        );
+    }
+
+    #[test]
+    fn seek_boundary_positions_are_inclusive_and_follow_expected_next_slot() {
+        let mut tree = TableBtree::with_page_size(128);
+        for row_id in [-10_i64, -2, 0, 4, 5, 8, 11] {
+            tree.insert_row(row_id, vec![Value::Int64(row_id)])
+                .expect("insert row");
+        }
+
+        let mut at_or_after_five = tree.cursor_seek_forward(5).expect("cursor forward");
+        assert_eq!(at_or_after_five.next().expect("next").unwrap().row_id, 5);
+
+        let mut after_five = tree
+            .cursor_seek_forward(6)
+            .expect("cursor forward exclusive equivalent");
+        assert_eq!(after_five.next().expect("next").unwrap().row_id, 8);
+
+        let mut at_or_before_five = tree.cursor_seek_backward(5).expect("cursor backward");
+        assert_eq!(at_or_before_five.prev().expect("prev").unwrap().row_id, 5);
+
+        let mut before_or_at_zero = tree.cursor_seek_backward(1).expect("cursor backward");
+        assert_eq!(before_or_at_zero.prev().expect("prev").unwrap().row_id, 0);
+    }
+
+    #[test]
+    fn delete_then_reinsert_preserves_lookup_and_ordering() {
+        let mut tree = TableBtree::with_page_size(256);
+        for row_id in 1_i64..40 {
+            tree.insert_row(row_id, vec![Value::Int64(row_id)])
+                .expect("insert row");
+        }
+
+        tree.delete_row(10)
+            .expect("delete row")
+            .expect("deleted row");
+        tree.delete_row(11)
+            .expect("delete row")
+            .expect("deleted row");
+
+        tree.insert_row(10, vec![Value::Int64(500)])
+            .expect("reinsert row");
+        tree.insert_row(11, vec![Value::Int64(501)])
+            .expect("reinsert row");
+
+        let values = collect_forward(&tree)
+            .into_iter()
+            .map(|row| (row.row_id, row.values[0].clone()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(values[8], (9_i64, Value::Int64(9)));
+        assert_eq!(values[9], (10_i64, Value::Int64(500)));
+        assert_eq!(values[10], (11_i64, Value::Int64(501)));
+        assert_eq!(values[11], (12_i64, Value::Int64(12)));
+
+        let lookup = tree.get_row(10).expect("get row").expect("row exists");
+        assert_eq!(lookup.values[0], Value::Int64(500));
+    }
+
+    #[test]
+    fn split_and_reopen_preserve_sorted_rows_across_page_boundaries() {
+        let mut tree = TableBtree::with_page_size(128);
+        for row_id in 0_i64..1024 {
+            tree.insert_row(row_id, vec![Value::Int64(row_id)])
+                .expect("insert row");
+        }
+
+        for row_id in (200_i64..900_i64).step_by(3) {
+            tree.delete_row(row_id).expect("delete row");
+        }
+
+        for row_id in (200_i64..900_i64).step_by(3) {
+            tree.insert_row(row_id, vec![Value::Int64(row_id)])
+                .expect("reinsert row");
+        }
+
+        let expected = (0_i64..1024).collect::<Vec<_>>();
+        let collected = collect_forward(&tree)
+            .into_iter()
+            .map(|row| row.row_id)
+            .collect::<Vec<_>>();
+
+        let (store, root_page_id) = tree.into_parts();
+        assert!(store.allocated_page_count() > 1);
+        let view = TableBtreeView::new(&store, root_page_id);
+
+        let reopened = {
+            let mut cursor = view.cursor_from_start().expect("cursor");
+            let mut rows = Vec::new();
+            while let Some(row) = cursor.next().expect("next") {
+                rows.push(row.row_id);
+            }
+            rows
+        };
+
+        assert_eq!(collected, expected);
+        assert_eq!(reopened, expected);
     }
 }

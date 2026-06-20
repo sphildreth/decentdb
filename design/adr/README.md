@@ -8,6 +8,7 @@ This directory contains the historical and active ADRs for DecentDB.
 > the current Rust engine.
 
 ### Recent Rust-Specific ADRs:
+- **0195-embedded-fast-profile-and-resident-read-fast-path.md**: Adds the `DbConfig::embedded_fast()` preset (retain row sources across autocommit commits + legacy single-payload persist) and a resident read fast path (`try_resident_read_for_statement`) that skips the per-statement WAL-reader + row-source reload when base tables are already resident, closing the autocommit write/read reload cliff while preserving durable sync and the existing presets' memory bounds.
 - **0194-query-plan-cache-prepared-plan-reuse.md**: Defines the Phase 1B prepared-plan bundle cache for `PreparedSimple*` read plans and simple DML plans, its first-miss admission behavior, shared invalidation contract, memory-budget split, and validation requirements.
 - **0193-query-plan-cache-c-abi-surface-and-binding-contract.md**: Defines the additive `plan_cache_enabled` and `plan_cache_max_bytes` C ABI open options, the default-on behavior, the no-C-ABI-version-bump decision, the `ddb_plan_cache_summary` and `ddb_plan_cache_flush` accessors, and the maintained-binding contract for the connection-local plan cache.
 - **0192-query-plan-cache-security-generation-and-tde.md**: Defines the `policy_mask_generation` cache-key counter, the audit-context-as-observable-but-not-cache-key decision, TDE's plan-cache non-interaction, and the round-trip test that enforces the audit-context exclusion.

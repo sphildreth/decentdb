@@ -397,3 +397,89 @@ fn wal_index_keeps_only_latest_versions_without_readers() {
 
     cleanup_db(&path);
 }
+
+#[test]
+fn active_snapshot_keeps_stable_pages_visible_during_writer_commit_and_recovery() {
+    let path = unique_db_path("snapshot-writer-commit-recovery");
+    let db = Db::create(&path, DbConfig::default()).expect("create database");
+
+    db.begin_write().expect("begin write for initial page");
+    db.write_page(3, &filled_page(db.config().page_size, 0x11))
+        .expect("write initial page");
+    db.commit().expect("commit initial page");
+
+    let snapshot = db
+        .hold_snapshot()
+        .expect("hold snapshot while writer commits");
+
+    db.begin_write().expect("begin write for update");
+    db.write_page(3, &filled_page(db.config().page_size, 0x22))
+        .expect("write updated page");
+    db.commit().expect("commit updated page");
+
+    let snapshot_page = db
+        .read_page_for_snapshot(snapshot, 3)
+        .expect("read held snapshot view");
+    assert_eq!(
+        snapshot_page.to_vec(),
+        filled_page(db.config().page_size, 0x11),
+        "held snapshot must remain at pre-commit page image"
+    );
+
+    db.checkpoint().expect("checkpoint with active snapshot");
+    let wal_size = fs::metadata(wal_path(&path)).expect("stat wal").len();
+    assert!(
+        wal_size > 32,
+        "active snapshot must keep WAL growth until versions are no longer needed"
+    );
+
+    db.release_snapshot(snapshot).expect("release snapshot");
+    db.checkpoint()
+        .expect("checkpoint should truncate after snapshot release");
+    let wal_size = fs::metadata(wal_path(&path)).expect("stat wal").len();
+    assert_eq!(wal_size, 32);
+
+    let reopened = Db::open(&path, DbConfig::default()).expect("reopen database");
+    assert_eq!(
+        reopened
+            .read_page(3)
+            .expect("read committed page after recovery")
+            .to_vec(),
+        filled_page(reopened.config().page_size, 0x22)
+    );
+
+    cleanup_db(&path);
+}
+
+#[test]
+fn repeated_small_page_commits_reopen_with_last_image_intact() {
+    let _guard = test_lock().lock().expect("test lock");
+    let path = unique_db_path("repeated-small-commits-page");
+    let db = Db::create(&path, DbConfig::default()).expect("create database");
+
+    for iteration in 0_u8..8 {
+        let marker = 0x10 + iteration;
+        db.begin_write().expect("begin write");
+        db.write_page(3, &filled_page(db.config().page_size, marker))
+            .expect("write marker page");
+        db.commit().expect("commit marker page");
+        if iteration % 3 == 0 {
+            db.checkpoint().expect("checkpoint during repeated commits");
+        }
+    }
+
+    let wal_size = fs::metadata(wal_path(&path)).expect("stat wal").len();
+    assert!(
+        wal_size >= 32,
+        "repeated commits should maintain a readable wal file"
+    );
+
+    drop(db);
+    let reopened = Db::open(&path, DbConfig::default()).expect("reopen database");
+    assert_eq!(
+        reopened.read_page(3).expect("read reopened page").to_vec(),
+        filled_page(reopened.config().page_size, 0x10 + 7)
+    );
+
+    cleanup_db(&path);
+}

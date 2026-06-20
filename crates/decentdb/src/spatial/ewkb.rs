@@ -395,7 +395,9 @@ impl<'a> ByteReader<'a> {
 #[cfg(test)]
 mod tests {
     use crate::spatial::ewkb::{from_ewkb, normalize_ewkb, to_ewkb};
-    use crate::spatial::types::{CoordinateDimensions, Position, SpatialGeometry, SpatialValue};
+    use crate::spatial::types::{
+        CoordinateDimensions, Position, SpatialError, SpatialGeometry, SpatialValue,
+    };
 
     #[test]
     fn roundtrip_point_xyzm() {
@@ -459,5 +461,38 @@ mod tests {
         let normalized = normalize_ewkb(&bytes).expect("must normalize");
         let parsed = from_ewkb(&normalized).expect("normalized should parse");
         assert_eq!(parsed.srid, 4326);
+    }
+
+    #[test]
+    fn reject_unknown_type_code() {
+        let mut bytes = vec![1u8];
+        bytes.extend_from_slice(&0x2000_00FFu32.to_le_bytes());
+        bytes.extend_from_slice(&4326u32.to_le_bytes());
+
+        let err = from_ewkb(&bytes).unwrap_err();
+        let msg = err.to_string().to_lowercase();
+        assert!(msg.contains("unsupported"));
+    }
+
+    #[test]
+    fn reject_truncated_payloads() {
+        let err = from_ewkb(&[1u8, 1, 0]).unwrap_err();
+        assert_eq!(err, SpatialError::Truncated);
+    }
+
+    #[test]
+    fn reject_trailing_bytes() {
+        let value = SpatialValue::new(
+            4326,
+            CoordinateDimensions::Xy,
+            SpatialGeometry::Point(Position::xy(1.0, 2.0)),
+        )
+        .expect("valid spatial value");
+
+        let mut bytes = to_ewkb(&value);
+        bytes.push(0xAA);
+
+        let err = from_ewkb(&bytes).unwrap_err().to_string().to_lowercase();
+        assert!(err.contains("trailing bytes"));
     }
 }

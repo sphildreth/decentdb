@@ -22,10 +22,13 @@ mod dml_unit_tests;
 mod runtime_unit_tests;
 
 pub(crate) mod cte;
+mod expressions;
+use expressions::*;
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::hash::{BuildHasherDefault, Hasher};
+use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -55,7 +58,8 @@ use crate::record::key::encode_index_key;
 use crate::record::overflow::{
     append_uncompressed_with_first_page_patch, build_overflow_chain_cache, free_overflow,
     read_overflow, read_uncompressed_overflow_tail, rewrite_overflow, rewrite_overflow_cached,
-    write_overflow, OverflowChainCache, OverflowPointer, OverflowTailInfo, OVERFLOW_HEADER_SIZE,
+    rewrite_overflow_cached_with_dirty_byte_ranges, write_overflow, OverflowChainCache,
+    OverflowPointer, OverflowTailInfo, OVERFLOW_HEADER_SIZE,
 };
 use crate::record::row::Row;
 use crate::record::value::{
@@ -96,6 +100,7 @@ const LEGACY_RUNTIME_PAYLOAD_MAGIC: &[u8; 9] = b"DDBSTATE1";
 const MANIFEST_PAYLOAD_MAGIC: &[u8; 8] = b"DDBMANF1";
 const TABLE_PAYLOAD_MAGIC: &[u8; 8] = b"DDBTBL01";
 const TABLE_PAGED_MANIFEST_MAGIC: &[u8; 8] = b"DDBTPG02";
+const TABLE_PAYLOAD_ROW_BODY_PADDING_BYTES: usize = 8;
 const PAGED_TABLE_TARGET_CHUNK_PAGES: usize = 16;
 pub(super) const PAGED_TABLE_RESIDENT_APPEND_ROW_THRESHOLD: usize = 1024;
 const GENERATED_COLUMNS_SECTION_MAGIC: &[u8; 8] = b"DDBGCM02";
@@ -1194,6 +1199,7 @@ impl TableRowSource {
     pub(crate) fn resident_data(&self) -> &TableData {
         match self {
             Self::Resident(data) => data.as_ref(),
+            // Invariant: this method is only called for resident row sources.
             Self::Paged(_) => unreachable!("paged row sources are not resident table data"),
         }
     }
@@ -1201,6 +1207,7 @@ impl TableRowSource {
     fn resident_data_mut(&mut self) -> &mut TableData {
         match self {
             Self::Resident(data) => Arc::make_mut(data),
+            // Invariant: this method is only called for mutable resident row sources.
             Self::Paged(_) => unreachable!("paged row sources are not mutable resident table data"),
         }
     }
@@ -2214,7 +2221,7 @@ impl EngineRuntime {
             .get(table_name)
     }
 
-    fn take_cached_payload(&mut self, table_name: &str) -> Option<Arc<Vec<u8>>> {
+    fn cached_payload_take(&mut self, table_name: &str) -> Option<Arc<Vec<u8>>> {
         self.payload_cache
             .lock()
             .expect("payload cache lock should not be poisoned")
@@ -2880,12 +2887,21 @@ impl EngineRuntime {
                         }
                     };
                 }
-                let cached_payload =
-                    if !use_paged_row_storage || !previous_pointer.is_table_paged_manifest() {
-                        self.take_cached_payload(&canonical_table_name)
-                    } else {
-                        None
-                    };
+                let resident_update_only = !delta.updated_rows.is_empty()
+                    && delta.deleted_rows.is_empty()
+                    && delta.append_count == 0;
+                let resident_delete_only = delta.updated_rows.is_empty()
+                    && !delta.deleted_rows.is_empty()
+                    && delta.append_count == 0;
+                let cached_payload = if (!use_paged_row_storage
+                    || !previous_pointer.is_table_paged_manifest())
+                    && !resident_update_only
+                    && !resident_delete_only
+                {
+                    self.cached_payload(&canonical_table_name)
+                } else {
+                    None
+                };
                 if let Some(manifest) = row_source.paged_manifest() {
                     self.overflow_chain_caches.remove(&canonical_table_name);
                     if delta.append_count > 0
@@ -3127,13 +3143,14 @@ impl EngineRuntime {
 
                 // Choose the encoding path:
                 //  1. Row-update splice: only re-encode modified rows using cached payload
-                //  2. Append-only: read old payload, append new rows
-                //  3. Full re-encode: encode every row from scratch
-                let (payload, skip_overflow_pages) = if !delta.updated_rows.is_empty()
-                    && delta.deleted_rows.is_empty()
-                    && delta.append_count == 0
-                {
-                    if let Some(cached) = cached_payload {
+                //  2. Row-delete splice: copy unchanged encoded rows from previous payload
+                //  3. Append-only: read old payload, append new rows
+                //  4. Full re-encode: encode every row from scratch
+                let (payload, dirty_byte_ranges, pk_locator_preserved) =
+                    if !delta.updated_rows.is_empty()
+                        && delta.deleted_rows.is_empty()
+                        && delta.append_count == 0
+                    {
                         let mut dirty_indices = Vec::with_capacity(delta.updated_rows.len());
                         for row_id in delta.updated_rows.keys() {
                             if let Some(idx) = data.row_index_by_id(*row_id) {
@@ -3141,39 +3158,181 @@ impl EngineRuntime {
                             }
                         }
                         dirty_indices.sort_unstable();
-                        let splice =
-                            splice_updated_rows_payload(cached.as_slice(), data, &dirty_indices)?;
-                        // Compute how many leading overflow pages are
-                        // guaranteed identical (their byte ranges fall
-                        // entirely within the unchanged prefix).
-                        let page_size = db.config().page_size as usize;
-                        let chunk_cap = page_size.saturating_sub(OVERFLOW_HEADER_SIZE);
-                        let skip = splice.first_dirty_byte.checked_div(chunk_cap).unwrap_or(0);
-                        (splice.payload, skip)
+
+                        if let Some(cached) = self.cached_payload_take(&canonical_table_name) {
+                            match Arc::try_unwrap(cached) {
+                                Ok(mut payload) => {
+                                    if let Some(dirty_range) = splice_updated_rows_payload_in_place(
+                                        &mut payload,
+                                        data,
+                                        &dirty_indices,
+                                    )? {
+                                        (
+                                            payload,
+                                            single_dirty_range(
+                                                dirty_range.first_dirty_byte
+                                                    ..dirty_range.last_dirty_byte,
+                                            ),
+                                            true,
+                                        )
+                                    } else {
+                                        let splice = splice_updated_rows_payload(
+                                            payload.as_slice(),
+                                            data,
+                                            &dirty_indices,
+                                        )?;
+                                        let first = splice.first_dirty_byte;
+                                        let last = splice.last_dirty_byte;
+                                        (
+                                            splice.payload,
+                                            single_dirty_range(first..last),
+                                            splice.pk_locator_preserved,
+                                        )
+                                    }
+                                }
+                                Err(cached) => {
+                                    let splice = splice_updated_rows_payload(
+                                        cached.as_slice(),
+                                        data,
+                                        &dirty_indices,
+                                    )?;
+                                    let first = splice.first_dirty_byte;
+                                    let last = splice.last_dirty_byte;
+                                    (
+                                        splice.payload,
+                                        single_dirty_range(first..last),
+                                        splice.pk_locator_preserved,
+                                    )
+                                }
+                            }
+                        } else if previous_pointer.head_page_id != 0 {
+                            let mut payload = read_overflow(&store, previous_pointer)?;
+                            if let Some(dirty_range) = splice_updated_rows_payload_in_place(
+                                &mut payload,
+                                data,
+                                &dirty_indices,
+                            )? {
+                                (
+                                    payload,
+                                    single_dirty_range(
+                                        dirty_range.first_dirty_byte..dirty_range.last_dirty_byte,
+                                    ),
+                                    true,
+                                )
+                            } else {
+                                let splice = splice_updated_rows_payload(
+                                    payload.as_slice(),
+                                    data,
+                                    &dirty_indices,
+                                )?;
+                                let first = splice.first_dirty_byte;
+                                let last = splice.last_dirty_byte;
+                                (
+                                    splice.payload,
+                                    single_dirty_range(first..last),
+                                    splice.pk_locator_preserved,
+                                )
+                            }
+                        } else {
+                            let payload = encode_table_payload(data)?;
+                            let last = payload.len();
+                            (payload, single_dirty_range(0..last), false)
+                        }
+                    } else if !delta.deleted_rows.is_empty()
+                        && delta.updated_rows.is_empty()
+                        && delta.append_count == 0
+                    {
+                        if let Some(cached) = self.cached_payload_take(&canonical_table_name) {
+                            match Arc::try_unwrap(cached) {
+                                Ok(mut payload) => {
+                                    if let Some(dirty_range) = splice_deleted_rows_payload_in_place(
+                                        &mut payload,
+                                        data,
+                                        &delta.deleted_rows,
+                                    )? {
+                                        (payload, dirty_range, false)
+                                    } else {
+                                        let splice = splice_deleted_rows_payload(
+                                            payload.as_slice(),
+                                            data,
+                                            &delta.deleted_rows,
+                                        )?;
+                                        let first = splice.first_dirty_byte;
+                                        let last = splice.last_dirty_byte;
+                                        (splice.payload, single_dirty_range(first..last), false)
+                                    }
+                                }
+                                Err(cached) => {
+                                    let splice = splice_deleted_rows_payload(
+                                        cached.as_slice(),
+                                        data,
+                                        &delta.deleted_rows,
+                                    )?;
+                                    let first = splice.first_dirty_byte;
+                                    let last = splice.last_dirty_byte;
+                                    (splice.payload, single_dirty_range(first..last), false)
+                                }
+                            }
+                        } else if previous_pointer.head_page_id != 0 {
+                            let mut payload = read_overflow(&store, previous_pointer)?;
+                            if let Some(dirty_range) = splice_deleted_rows_payload_in_place(
+                                &mut payload,
+                                data,
+                                &delta.deleted_rows,
+                            )? {
+                                (payload, dirty_range, false)
+                            } else {
+                                let splice = splice_deleted_rows_payload(
+                                    payload.as_slice(),
+                                    data,
+                                    &delta.deleted_rows,
+                                )?;
+                                let first = splice.first_dirty_byte;
+                                let last = splice.last_dirty_byte;
+                                (splice.payload, single_dirty_range(first..last), false)
+                            }
+                        } else {
+                            let payload = encode_table_payload(data)?;
+                            let last = payload.len();
+                            (payload, single_dirty_range(0..last), false)
+                        }
+                    } else if delta.append_count > 0
+                        && delta.updated_rows.is_empty()
+                        && delta.deleted_rows.is_empty()
+                        && previous_pointer.head_page_id != 0
+                    {
+                        let previous_payload = read_overflow(&store, previous_pointer)?;
+                        let payload = append_table_payload(previous_payload, data)?;
+                        let last = payload.len();
+                        (payload, single_dirty_range(0..last), false)
                     } else {
-                        (encode_table_payload(data)?, 0)
-                    }
-                } else if delta.append_count > 0
-                    && delta.updated_rows.is_empty()
-                    && delta.deleted_rows.is_empty()
-                    && previous_pointer.head_page_id != 0
-                {
-                    let previous_payload = read_overflow(&store, previous_pointer)?;
-                    (append_table_payload(previous_payload, data)?, 0)
-                } else {
-                    (encode_table_payload(data)?, 0)
-                };
+                        let payload = encode_table_payload(data)?;
+                        let last = payload.len();
+                        (payload, single_dirty_range(0..last), false)
+                    };
 
                 let checksum = crc32c_parts(&[payload.as_slice()]);
                 let (pointer, new_chain_cache, tail) = if let Some(chain_cache) =
                     self.overflow_chain_caches.get(&canonical_table_name)
                 {
-                    rewrite_overflow_cached(
+                    let page_size = db.config().page_size as usize;
+                    let chunk_cap = page_size.saturating_sub(OVERFLOW_HEADER_SIZE);
+                    let skip = if chunk_cap == 0 {
+                        0
+                    } else {
+                        dirty_byte_ranges
+                            .iter()
+                            .map(|range| range.start.checked_div(chunk_cap).unwrap_or(0))
+                            .min()
+                            .unwrap_or(0)
+                    };
+                    rewrite_overflow_cached_with_dirty_byte_ranges(
                         &mut store,
                         previous_pointer,
                         &payload,
                         &chain_cache.page_ids,
-                        skip_overflow_pages,
+                        skip,
+                        Some(dirty_byte_ranges.as_slice()),
                     )?
                 } else {
                     let ptr = rewrite_overflow(
@@ -3199,7 +3358,9 @@ impl EngineRuntime {
                         pk_index_root: previous_state.pk_index_root,
                     },
                 );
-                let pk_index_root = if db.config().persistent_pk_index {
+                let pk_index_root = if db.config().persistent_pk_index && pk_locator_preserved {
+                    previous_state.pk_index_root
+                } else if db.config().persistent_pk_index {
                     build_persistent_pk_index_root(db, payload.as_slice())?
                 } else {
                     None
@@ -4636,6 +4797,11 @@ impl EngineRuntime {
                 if let Some(result) = self.try_execute_simple_min_max_query(query)? {
                     return Ok(result);
                 }
+                if let Some(result) =
+                    self.try_execute_left_join_status_aggregate_query(query, params)?
+                {
+                    return Ok(result);
+                }
                 if let Some(result) = self.try_execute_simple_grouped_count_query(query, params)? {
                     return Ok(result);
                 }
@@ -5368,6 +5534,12 @@ impl EngineRuntime {
         plan: &SimpleGroupedCountPlan<'_>,
         params: &[Value],
     ) -> Result<QueryResult> {
+        if let Some(result) =
+            self.try_simple_grouped_count_result_from_runtime_index(Some(row_source), plan, params)?
+        {
+            return Ok(result);
+        }
+
         let mut groups = Vec::<SimpleGroupedCountAggregate>::new();
         let mut group_positions = BTreeMap::<Vec<u8>, usize>::new();
         let group_dataset = Dataset::with_rows(plan.group_eval_bindings.clone(), Vec::new());
@@ -5409,6 +5581,393 @@ impl EngineRuntime {
         }
 
         render_simple_grouped_count_groups(self, groups, plan, params)
+    }
+
+    fn try_simple_grouped_count_result_from_runtime_index(
+        &self,
+        row_source: Option<VisibleTableRowSource<'_>>,
+        plan: &SimpleGroupedCountPlan<'_>,
+        params: &[Value],
+    ) -> Result<Option<QueryResult>> {
+        if plan.group_exprs.len() != 1
+            || plan.filter_expr.is_some()
+            || plan.projection_exprs.is_some()
+            || plan.having.is_some()
+        {
+            return Ok(None);
+        }
+        let Expr::Column {
+            table: group_table,
+            column: group_column,
+        } = &plan.group_exprs[0]
+        else {
+            return Ok(None);
+        };
+        if group_table
+            .as_deref()
+            .is_some_and(|table| !identifiers_equal(table, plan.table_name))
+        {
+            return Ok(None);
+        }
+        let Some(table_schema) = self.table_schema(plan.table_name) else {
+            return Ok(None);
+        };
+        let Some(group_column_index) = schema_column_index(table_schema, group_column) else {
+            return Ok(None);
+        };
+        let Some(index) = self.single_column_btree_index(plan.table_name, group_column) else {
+            return Ok(None);
+        };
+        let Some(RuntimeIndex::Btree { keys, .. }) = self.index(&index.name) else {
+            return Ok(None);
+        };
+
+        let mut groups = Vec::new();
+        match keys {
+            RuntimeBtreeKeys::UniqueInt64(entries) => {
+                groups.reserve(entries.len());
+                for key in entries.keys() {
+                    groups.push(SimpleGroupedCountAggregate {
+                        group_values: vec![Value::Int64(*key)],
+                        count: 1,
+                    });
+                }
+            }
+            RuntimeBtreeKeys::NonUniqueInt64(entries) => {
+                groups.reserve(entries.len());
+                for (key, row_ids) in entries {
+                    if row_ids.is_empty() {
+                        continue;
+                    }
+                    groups.push(SimpleGroupedCountAggregate {
+                        group_values: vec![Value::Int64(*key)],
+                        count: i64::try_from(row_ids.len()).map_err(|_| {
+                            DbError::constraint(
+                                "grouped COUNT index bucket exceeds INT64 row-count limits",
+                            )
+                        })?,
+                    });
+                }
+            }
+            RuntimeBtreeKeys::UniqueEncoded(entries) => {
+                groups.reserve(entries.len());
+                for (key, row_id) in entries {
+                    let Some(values) = Self::runtime_index_key_values_to_group_values(
+                        key,
+                        Some(*row_id),
+                        row_source,
+                        &[group_column_index],
+                    )?
+                    else {
+                        continue;
+                    };
+                    groups.push(SimpleGroupedCountAggregate {
+                        group_values: values,
+                        count: 1,
+                    });
+                }
+            }
+            RuntimeBtreeKeys::NonUniqueEncoded(entries) => {
+                groups.reserve(entries.len());
+                for (key, row_ids) in entries {
+                    let Some(row_id) = row_ids.first().copied() else {
+                        continue;
+                    };
+                    let Some(values) = Self::runtime_index_key_values_to_group_values(
+                        key,
+                        Some(row_id),
+                        row_source,
+                        &[group_column_index],
+                    )?
+                    else {
+                        continue;
+                    };
+                    groups.push(SimpleGroupedCountAggregate {
+                        group_values: values,
+                        count: i64::try_from(row_ids.len()).map_err(|_| {
+                            DbError::constraint(
+                                "grouped COUNT index bucket exceeds INT64 row-count limits",
+                            )
+                        })?,
+                    });
+                }
+            }
+        }
+
+        Ok(Some(render_simple_grouped_count_groups(
+            self, groups, plan, params,
+        )?))
+    }
+
+    pub(crate) fn try_execute_simple_grouped_count_sql_from_runtime_index(
+        &self,
+        table_name: &str,
+        group_column: &str,
+    ) -> Result<Option<QueryResult>> {
+        if self.security_rules_active()?
+            || self
+                .visible_view(table_name, NameResolutionScope::Session)
+                .is_some()
+            || self.visible_table_is_temporary(table_name)
+        {
+            return Ok(None);
+        }
+        let Some(table_schema) = self.table_schema(table_name) else {
+            return Ok(None);
+        };
+        if !generated_columns_are_stored(table_schema) {
+            return Ok(None);
+        }
+        let Some(group_column_index) = schema_column_index(table_schema, group_column) else {
+            return Ok(None);
+        };
+        let Some(index) = self.single_column_btree_index(table_name, group_column) else {
+            return Ok(None);
+        };
+        let Some(RuntimeIndex::Btree { keys, .. }) = self.index(&index.name) else {
+            return Ok(None);
+        };
+
+        let mut groups = Vec::new();
+        match keys {
+            RuntimeBtreeKeys::UniqueInt64(entries) => {
+                groups.reserve(entries.len());
+                for key in entries.keys() {
+                    groups.push(SimpleGroupedCountAggregate {
+                        group_values: vec![Value::Int64(*key)],
+                        count: 1,
+                    });
+                }
+            }
+            RuntimeBtreeKeys::NonUniqueInt64(entries) => {
+                groups.reserve(entries.len());
+                for (key, row_ids) in entries {
+                    if row_ids.is_empty() {
+                        continue;
+                    }
+                    groups.push(SimpleGroupedCountAggregate {
+                        group_values: vec![Value::Int64(*key)],
+                        count: i64::try_from(row_ids.len()).map_err(|_| {
+                            DbError::constraint(
+                                "grouped COUNT index bucket exceeds INT64 row-count limits",
+                            )
+                        })?,
+                    });
+                }
+            }
+            RuntimeBtreeKeys::UniqueEncoded(entries) => {
+                groups.reserve(entries.len());
+                for key in entries.keys() {
+                    let Some(value) = Self::decode_runtime_index_group_key(key) else {
+                        return Ok(None);
+                    };
+                    groups.push(SimpleGroupedCountAggregate {
+                        group_values: vec![value],
+                        count: 1,
+                    });
+                }
+            }
+            RuntimeBtreeKeys::NonUniqueEncoded(entries) => {
+                groups.reserve(entries.len());
+                for (key, row_ids) in entries {
+                    if row_ids.is_empty() {
+                        continue;
+                    }
+                    let Some(value) = Self::decode_runtime_index_group_key(key) else {
+                        return Ok(None);
+                    };
+                    groups.push(SimpleGroupedCountAggregate {
+                        group_values: vec![value],
+                        count: i64::try_from(row_ids.len()).map_err(|_| {
+                            DbError::constraint(
+                                "grouped COUNT index bucket exceeds INT64 row-count limits",
+                            )
+                        })?,
+                    });
+                }
+            }
+        }
+
+        let mut rows = groups
+            .into_iter()
+            .map(SimpleGroupedCountAggregate::into_row)
+            .collect::<Vec<_>>();
+        sort_query_rows_by_projection_order(
+            Some(self),
+            &mut rows,
+            &[SimpleOrderByPlan {
+                projection_index: 0,
+                descending: false,
+                collation: None,
+            }],
+        )?;
+        Ok(Some(QueryResult::with_rows(
+            vec![
+                table_schema.columns[group_column_index].name.clone(),
+                "col2".to_string(),
+            ],
+            rows,
+        )))
+    }
+
+    fn runtime_index_key_values_to_group_values<'a>(
+        key: &'a [u8],
+        row_id: Option<i64>,
+        row_source: Option<VisibleTableRowSource<'a>>,
+        projection_indexes: &[usize],
+    ) -> Result<Option<Vec<Value>>> {
+        if let Some(value) = Self::decode_runtime_index_group_key(key) {
+            return Ok(Some(vec![value]));
+        }
+
+        let (row_source, row_id) = match (row_source, row_id) {
+            (Some(row_source), Some(row_id)) => (row_source, row_id),
+            _ => return Ok(None),
+        };
+        row_source.projected_values_by_id(row_id, projection_indexes)
+    }
+
+    fn decode_runtime_index_group_key(key: &[u8]) -> Option<Value> {
+        let (tag, payload) = key.split_first()?;
+        match *tag {
+            0 if payload.is_empty() => Some(Value::Null),
+            1 if payload.len() == 1 => match payload[0] {
+                0 => Some(Value::Bool(false)),
+                1 => Some(Value::Bool(true)),
+                _ => None,
+            },
+            2 if payload.len() == 8 => {
+                let mut bytes = [0_u8; 8];
+                bytes.copy_from_slice(payload);
+                let bits = u64::from_be_bytes(bytes) ^ 0x8000_0000_0000_0000;
+                Some(Value::Int64(i64::from_be_bytes(bits.to_be_bytes())))
+            }
+            3 if payload.len() == 8 => {
+                let mut bytes = [0_u8; 8];
+                bytes.copy_from_slice(payload);
+                let sortable = u64::from_be_bytes(bytes);
+                let bits = if sortable & (1_u64 << 63) != 0 {
+                    sortable ^ (1_u64 << 63)
+                } else {
+                    !sortable
+                };
+                Some(Value::Float64(f64::from_bits(bits)))
+            }
+            6 if payload.len() == 16 => {
+                let mut bytes = [0_u8; 16];
+                bytes.copy_from_slice(payload);
+                Some(Value::Uuid(bytes))
+            }
+            7 => {
+                let text = String::from_utf8(payload.to_vec()).ok()?;
+                Some(Value::Text(text))
+            }
+            8 => Some(Value::Blob(payload.to_vec())),
+            9 if payload.len() == 16 => {
+                let mut enum_type_id = [0_u8; 8];
+                enum_type_id.copy_from_slice(&payload[..8]);
+                let mut label_id = [0_u8; 8];
+                label_id.copy_from_slice(&payload[8..16]);
+                Some(Value::Enum {
+                    enum_type_id: u64::from_be_bytes(enum_type_id),
+                    label_id: u64::from_be_bytes(label_id),
+                })
+            }
+            10 if payload.len() == 17 => {
+                let family = *payload.last()?;
+                match family {
+                    4 => {
+                        let mut addr = [0_u8; 16];
+                        addr[..4].copy_from_slice(&payload[12..16]);
+                        Some(Value::IpAddr { family, addr })
+                    }
+                    6 => {
+                        let mut addr = [0_u8; 16];
+                        addr.copy_from_slice(&payload[..16]);
+                        Some(Value::IpAddr { family, addr })
+                    }
+                    _ => None,
+                }
+            }
+            11 if matches!(payload.len(), 6 | 18) => {
+                let family = payload[0];
+                let prefix_len = payload[1];
+                if family != 4 && family != 6 {
+                    return None;
+                }
+                let mut network = [0_u8; 16];
+                if family == 4 {
+                    if payload.len() != 6 {
+                        return None;
+                    }
+                    network[..4].copy_from_slice(&payload[2..6]);
+                } else {
+                    network.copy_from_slice(&payload[2..18]);
+                }
+                Some(Value::Cidr {
+                    family,
+                    prefix_len,
+                    network,
+                })
+            }
+            12 if payload.len() == 4 => {
+                let mut bytes = [0_u8; 4];
+                bytes.copy_from_slice(payload);
+                let raw = u32::from_be_bytes(bytes) ^ 0x8000_0000;
+                Some(Value::DateDays(i32::from_be_bytes(raw.to_be_bytes())))
+            }
+            13 if payload.len() == 8 => {
+                let mut bytes = [0_u8; 8];
+                bytes.copy_from_slice(payload);
+                let bits = u64::from_be_bytes(bytes) ^ 0x8000_0000_0000_0000;
+                Some(Value::TimeMicros(i64::from_be_bytes(bits.to_be_bytes())))
+            }
+            14 if payload.len() == 8 => {
+                let mut bytes = [0_u8; 8];
+                bytes.copy_from_slice(payload);
+                let bits = u64::from_be_bytes(bytes) ^ 0x8000_0000_0000_0000;
+                Some(Value::TimestampTzMicros(i64::from_be_bytes(
+                    bits.to_be_bytes(),
+                )))
+            }
+            15 if payload.len() == 16 => {
+                let mut months = [0_u8; 4];
+                months.copy_from_slice(&payload[..4]);
+                let mut days = [0_u8; 4];
+                days.copy_from_slice(&payload[4..8]);
+                let mut micros = [0_u8; 8];
+                micros.copy_from_slice(&payload[8..16]);
+                Some(Value::Interval {
+                    months: {
+                        let raw = u32::from_be_bytes(months) ^ 0x8000_0000;
+                        i32::from_be_bytes(raw.to_be_bytes())
+                    },
+                    days: {
+                        let raw = u32::from_be_bytes(days) ^ 0x8000_0000;
+                        i32::from_be_bytes(raw.to_be_bytes())
+                    },
+                    micros: {
+                        let bits = u64::from_be_bytes(micros) ^ 0x8000_0000_0000_0000;
+                        i64::from_be_bytes(bits.to_be_bytes())
+                    },
+                })
+            }
+            16 if !payload.is_empty() => {
+                let len = *payload.last()?;
+                if len > 8 {
+                    return None;
+                }
+                let len_usize = usize::from(len);
+                if payload.len() != len_usize + 1 {
+                    return None;
+                }
+                let mut bytes = [0_u8; 8];
+                bytes[..len_usize].copy_from_slice(&payload[..len_usize]);
+                Some(Value::MacAddr { len, bytes })
+            }
+            5 => None,
+            _ => None,
+        }
     }
 
     fn simple_grouped_count_result_from_persisted_state<S: PageStore>(
@@ -6550,6 +7109,11 @@ impl EngineRuntime {
         {
             return Ok(None);
         }
+        if let Some(result) =
+            self.try_simple_grouped_count_result_from_runtime_index(None, &plan, params)?
+        {
+            return Ok(Some(result));
+        }
         let Some(state) = self.persisted_table_state(plan.table_name) else {
             return Ok(None);
         };
@@ -6904,6 +7468,500 @@ impl EngineRuntime {
 
         let column_names: Vec<String> = result_columns.into_iter().map(|c| c.name).collect();
         Ok(QueryResult::with_rows(column_names, rows))
+    }
+
+    pub(crate) fn try_execute_left_join_status_aggregate_query(
+        &self,
+        query: &Query,
+        params: &[Value],
+    ) -> Result<Option<QueryResult>> {
+        let Some(plan) = self.analyze_left_join_status_aggregate_query(query, params)? else {
+            return Ok(None);
+        };
+        let Some(parent_source) = self.visible_table_row_source(plan.parent_table_name) else {
+            return Ok(None);
+        };
+        let Some(child_source) = self.visible_table_row_source(plan.child_table_name) else {
+            return Ok(None);
+        };
+
+        let bounded_order = plan
+            .order_by
+            .as_deref()
+            .zip(plan.limit)
+            .filter(|(_, _)| plan.offset == 0);
+        let child_index_keys =
+            plan.child_index_name
+                .as_deref()
+                .and_then(|index_name| match self.index(index_name) {
+                    Some(RuntimeIndex::Btree { keys, .. }) => Some(keys),
+                    _ => None,
+                });
+
+        if let Some(keys) = child_index_keys {
+            let mut rows = Vec::new();
+            for parent_row in parent_source.rows() {
+                let parent_row = parent_row?;
+                let parent_values = parent_row.values();
+                let Some(join_value) = parent_values.get(plan.parent_join_index) else {
+                    return Err(DbError::internal("parent join row is shorter than schema"));
+                };
+
+                let mut counts = LeftJoinStatusCounts::default();
+                if !matches!(join_value, Value::Null) {
+                    let child_row_ids = keys.row_ids_for_value_set(join_value)?;
+                    match child_row_ids {
+                        RuntimeRowIdSet::Empty => {}
+                        RuntimeRowIdSet::Single(child_row_id) => {
+                            let Some(child_row) = child_source.row_by_id(child_row_id)? else {
+                                return Err(DbError::internal(
+                                    "child index referenced missing row id",
+                                ));
+                            };
+                            add_status_aggregate_child_row(&mut counts, child_row.values(), &plan)?;
+                        }
+                        RuntimeRowIdSet::Many(row_ids) => {
+                            for child_row_id in row_ids {
+                                let Some(child_row) = child_source.row_by_id(*child_row_id)? else {
+                                    return Err(DbError::internal(
+                                        "child index referenced missing row id",
+                                    ));
+                                };
+                                add_status_aggregate_child_row(
+                                    &mut counts,
+                                    child_row.values(),
+                                    &plan,
+                                )?;
+                            }
+                        }
+                    }
+                }
+
+                let mut output = Vec::with_capacity(plan.group_column_indexes.len() + 5);
+                for index in &plan.group_column_indexes {
+                    output.push(parent_values[*index].clone());
+                }
+                output.push(Value::Int64(counts.open_count));
+                output.push(Value::Int64(counts.in_progress_count));
+                output.push(Value::Int64(counts.resolved_count));
+                output.push(Value::Int64(counts.closed_count));
+                output.push(Value::Int64(counts.total_count));
+                let row = QueryRow::new(output);
+
+                if let Some((order_by, limit)) = bounded_order {
+                    push_bounded_projection_ordered_query_row(
+                        Some(self),
+                        &mut rows,
+                        row,
+                        order_by,
+                        limit,
+                    )?;
+                } else {
+                    rows.push(row);
+                }
+            }
+
+            if let Some((order_by, _)) = bounded_order {
+                sort_query_rows_by_projection_order(Some(self), &mut rows, order_by)?;
+                return Ok(Some(QueryResult::with_rows(plan.column_names, rows)));
+            }
+
+            return Ok(Some(apply_simple_projection_postprocessing_with_order(
+                Some(self),
+                rows,
+                plan.column_names,
+                plan.order_by.as_deref(),
+                plan.limit,
+                plan.offset,
+            )?));
+        }
+
+        let mut counts_by_join_key = HashMap::<Vec<u8>, LeftJoinStatusCounts>::new();
+        for child_row in child_source.rows() {
+            let child_row = child_row?;
+            let child_values = child_row.values();
+            let Some(child_join_value) = child_values.get(plan.child_join_index) else {
+                return Err(DbError::internal("child join row is shorter than schema"));
+            };
+            if matches!(child_join_value, Value::Null) {
+                continue;
+            }
+            let Some(child_status) = child_values.get(plan.child_status_index) else {
+                return Err(DbError::internal("child join row is shorter than schema"));
+            };
+            let Some(child_id) = child_values.get(plan.child_id_index) else {
+                return Err(DbError::internal("child join row is shorter than schema"));
+            };
+            counts_by_join_key
+                .entry(row_identity(std::slice::from_ref(child_join_value))?)
+                .or_default()
+                .add_child(child_status, child_id)?;
+        }
+
+        let mut rows = Vec::new();
+        for parent_row in parent_source.rows() {
+            let parent_row = parent_row?;
+            let parent_values = parent_row.values();
+            let Some(join_value) = parent_values.get(plan.parent_join_index) else {
+                return Err(DbError::internal("parent join row is shorter than schema"));
+            };
+
+            let counts = if matches!(join_value, Value::Null) {
+                LeftJoinStatusCounts::default()
+            } else {
+                counts_by_join_key
+                    .get(&row_identity(std::slice::from_ref(join_value))?)
+                    .copied()
+                    .unwrap_or_default()
+            };
+
+            let mut output = Vec::with_capacity(plan.group_column_indexes.len() + 5);
+            for index in &plan.group_column_indexes {
+                output.push(parent_values[*index].clone());
+            }
+            output.push(Value::Int64(counts.open_count));
+            output.push(Value::Int64(counts.in_progress_count));
+            output.push(Value::Int64(counts.resolved_count));
+            output.push(Value::Int64(counts.closed_count));
+            output.push(Value::Int64(counts.total_count));
+            let row = QueryRow::new(output);
+
+            if let Some((order_by, limit)) = bounded_order {
+                push_bounded_projection_ordered_query_row(
+                    Some(self),
+                    &mut rows,
+                    row,
+                    order_by,
+                    limit,
+                )?;
+            } else {
+                rows.push(row);
+            }
+        }
+
+        if let Some((order_by, _)) = bounded_order {
+            sort_query_rows_by_projection_order(Some(self), &mut rows, order_by)?;
+            return Ok(Some(QueryResult::with_rows(plan.column_names, rows)));
+        }
+
+        Ok(Some(apply_simple_projection_postprocessing_with_order(
+            Some(self),
+            rows,
+            plan.column_names,
+            plan.order_by.as_deref(),
+            plan.limit,
+            plan.offset,
+        )?))
+    }
+
+    fn analyze_left_join_status_aggregate_query<'a>(
+        &'a self,
+        query: &'a Query,
+        params: &[Value],
+    ) -> Result<Option<LeftJoinStatusAggregatePlan<'a>>> {
+        if !query.ctes.is_empty() || query.recursive {
+            return Ok(None);
+        }
+        let QueryBody::Select(select) = &query.body else {
+            return Ok(None);
+        };
+        if select.distinct
+            || !select.distinct_on.is_empty()
+            || query.order_by.len() > 2
+            || select.filter.is_some()
+            || select.having.is_some()
+            || select.group_by.len() != 2
+            || select.projection.len() != 7
+            || select.from.len() != 1
+        {
+            return Ok(None);
+        }
+
+        let FromItem::Join {
+            left,
+            right,
+            kind,
+            constraint,
+        } = &select.from[0]
+        else {
+            return Ok(None);
+        };
+        if !matches!(kind, JoinKind::Left) {
+            return Ok(None);
+        }
+
+        let (left_name, left_alias) = match &**left {
+            FromItem::Table { name, alias } => (name.as_str(), alias),
+            _ => return Ok(None),
+        };
+        let (right_name, right_alias) = match &**right {
+            FromItem::Table { name, alias } => (name.as_str(), alias),
+            _ => return Ok(None),
+        };
+        if self
+            .visible_view(left_name, NameResolutionScope::Session)
+            .is_some()
+            || self
+                .visible_view(right_name, NameResolutionScope::Session)
+                .is_some()
+            || self.visible_table_is_temporary(left_name)
+            || self.visible_table_is_temporary(right_name)
+        {
+            return Ok(None);
+        }
+        let Some(left_schema) = self.table_schema(left_name) else {
+            return Ok(None);
+        };
+        let Some(right_schema) = self.table_schema(right_name) else {
+            return Ok(None);
+        };
+        if !generated_columns_are_stored(left_schema) || !generated_columns_are_stored(right_schema)
+        {
+            return Ok(None);
+        }
+
+        let left_binding = TableBindingRef {
+            name: left_name,
+            alias: left_alias,
+        };
+        let right_binding = TableBindingRef {
+            name: right_name,
+            alias: right_alias,
+        };
+        let left_group_indexes =
+            indexed_join_group_column_indexes(&select.group_by, left_binding, left_schema);
+        let right_group_indexes =
+            indexed_join_group_column_indexes(&select.group_by, right_binding, right_schema);
+        let (
+            parent_name,
+            parent_alias,
+            parent_schema,
+            child_name,
+            child_alias,
+            child_schema,
+            group_column_indexes,
+        ) = match (left_group_indexes, right_group_indexes) {
+            (Some(group_column_indexes), None) => (
+                left_name,
+                left_alias,
+                left_schema,
+                right_name,
+                right_alias,
+                right_schema,
+                group_column_indexes,
+            ),
+            _ => return Ok(None),
+        };
+
+        let parent_binding = TableBindingRef {
+            name: parent_name,
+            alias: parent_alias,
+        };
+        let child_binding = TableBindingRef {
+            name: child_name,
+            alias: child_alias,
+        };
+
+        for (projection_item, group_expr) in select
+            .projection
+            .iter()
+            .take(select.group_by.len())
+            .zip(&select.group_by)
+        {
+            let SelectItem::Expr {
+                expr: projection_expr,
+                ..
+            } = projection_item
+            else {
+                return Ok(None);
+            };
+            if !grouped_projection_expr_matches_group_expr(
+                projection_expr,
+                group_expr,
+                parent_binding,
+            ) {
+                return Ok(None);
+            }
+        }
+
+        let SelectItem::Expr {
+            expr: open_expr, ..
+        } = &select.projection[2]
+        else {
+            return Ok(None);
+        };
+        let SelectItem::Expr {
+            expr: in_progress_expr,
+            ..
+        } = &select.projection[3]
+        else {
+            return Ok(None);
+        };
+        let SelectItem::Expr {
+            expr: resolved_expr,
+            ..
+        } = &select.projection[4]
+        else {
+            return Ok(None);
+        };
+        let SelectItem::Expr {
+            expr: closed_expr, ..
+        } = &select.projection[5]
+        else {
+            return Ok(None);
+        };
+        let SelectItem::Expr {
+            expr: count_expr, ..
+        } = &select.projection[6]
+        else {
+            return Ok(None);
+        };
+
+        if !aggregate_matches_status_case_sum(open_expr, "sum", child_binding, "status", "open")
+            || !aggregate_matches_status_case_sum(
+                in_progress_expr,
+                "sum",
+                child_binding,
+                "status",
+                "in_progress",
+            )
+            || !aggregate_matches_status_case_sum(
+                resolved_expr,
+                "sum",
+                child_binding,
+                "status",
+                "resolved",
+            )
+            || !aggregate_matches_status_case_sum(
+                closed_expr,
+                "sum",
+                child_binding,
+                "status",
+                "closed",
+            )
+            || !aggregate_matches_single_binding_column(count_expr, "count", child_binding, "id")
+        {
+            return Ok(None);
+        }
+
+        let mut column_names = Vec::with_capacity(select.projection.len());
+        for (index, projection_item) in select.projection.iter().enumerate() {
+            let SelectItem::Expr { expr, alias } = projection_item else {
+                return Ok(None);
+            };
+            column_names.push(
+                alias
+                    .clone()
+                    .unwrap_or_else(|| infer_expr_name(expr, index + 1)),
+            );
+        }
+
+        let Some(join_equalities) = simple_indexed_join_constraint_equalities(
+            constraint,
+            left_binding,
+            right_binding,
+            left_schema,
+            right_schema,
+        ) else {
+            return Ok(None);
+        };
+        let Some((left_join_columns, right_join_columns)) =
+            orient_join_equalities(&join_equalities, left_binding, right_binding)
+        else {
+            return Ok(None);
+        };
+        if left_join_columns.len() != 1 || right_join_columns.len() != 1 {
+            return Ok(None);
+        }
+
+        let (parent_join_column, child_join_column) = if identifiers_equal(parent_name, left_name) {
+            (left_join_columns[0], right_join_columns[0])
+        } else {
+            (right_join_columns[0], left_join_columns[0])
+        };
+
+        let parent_join_index = parent_schema
+            .columns
+            .iter()
+            .position(|column| identifiers_equal(&column.name, parent_join_column))
+            .ok_or_else(|| {
+                DbError::internal(format!(
+                    "join column {}.{} not found",
+                    parent_name, parent_join_column
+                ))
+            })?;
+        let child_join_index = child_schema
+            .columns
+            .iter()
+            .position(|column| identifiers_equal(&column.name, child_join_column))
+            .ok_or_else(|| {
+                DbError::internal(format!(
+                    "join column {}.{} not found",
+                    child_name, child_join_column
+                ))
+            })?;
+
+        let child_status_index = schema_column_index(child_schema, "status").ok_or_else(|| {
+            DbError::internal(format!(
+                "column status not found in child table {}",
+                child_name
+            ))
+        })?;
+        let child_id_index = schema_column_index(child_schema, "id").ok_or_else(|| {
+            DbError::internal(format!("column id not found in child table {}", child_name))
+        })?;
+        let child_index_name = self
+            .single_column_btree_index(child_name, child_join_column)
+            .map(|index| index.name.clone());
+
+        let order_by = projection_order_by_plan(&query.order_by, &select.projection);
+        if !query.order_by.is_empty() {
+            let Some(order_by) = order_by.as_ref() else {
+                return Ok(None);
+            };
+            if order_by.len() != 2
+                || order_by[0].projection_index != 6
+                || !order_by[0].descending
+                || order_by[1].projection_index != 0
+                || order_by[1].descending
+            {
+                return Ok(None);
+            }
+        }
+
+        if child_schema.columns[child_status_index].column_type != crate::catalog::ColumnType::Text
+        {
+            return Ok(None);
+        }
+
+        let limit = query
+            .limit
+            .as_ref()
+            .map(|expr| self.eval_constant_i64(expr, params, &BTreeMap::new()))
+            .transpose()?
+            .map(|value| usize::try_from(value.max(0)).unwrap_or(usize::MAX));
+        let offset = query
+            .offset
+            .as_ref()
+            .map(|expr| self.eval_constant_i64(expr, params, &BTreeMap::new()))
+            .transpose()?
+            .map(|value| usize::try_from(value.max(0)).unwrap_or(usize::MAX))
+            .unwrap_or(0);
+
+        Ok(Some(LeftJoinStatusAggregatePlan {
+            parent_table_name: parent_name,
+            parent_join_index,
+            child_table_name: child_name,
+            child_join_index,
+            child_status_index,
+            child_id_index,
+            child_index_name,
+            group_column_indexes,
+            column_names,
+            order_by,
+            limit,
+            offset,
+        }))
     }
 
     pub(crate) fn try_execute_indexed_join_grouped_count_query(
@@ -9155,19 +10213,23 @@ impl EngineRuntime {
         }
         matching_orders.sort_by(|(_, left_id, _), (_, right_id, _)| right_id.cmp(left_id));
 
-        let column_names = select
-            .projection
-            .iter()
-            .enumerate()
-            .map(|(index, item)| match item {
-                SelectItem::Expr { expr, alias } => alias
-                    .clone()
-                    .unwrap_or_else(|| infer_expr_name(expr, index + 1)),
-                SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => {
-                    unreachable!("history fast path only matches explicit projection")
+        let mut column_names = Vec::with_capacity(select.projection.len());
+        for (index, item) in select.projection.iter().enumerate() {
+            match item {
+                SelectItem::Expr { expr, alias } => {
+                    column_names.push(
+                        alias
+                            .clone()
+                            .unwrap_or_else(|| infer_expr_name(expr, index + 1)),
+                    );
                 }
-            })
-            .collect::<Vec<_>>();
+                SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => {
+                    return Err(DbError::internal(
+                        "internal: history fast path expects explicit projection expressions",
+                    ));
+                }
+            }
+        }
 
         let mut rows = Vec::new();
         for (_order_row_id, order_id, order_total_amount) in matching_orders {
@@ -11381,8 +12443,9 @@ impl EngineRuntime {
             return Ok(Some(QueryResult::with_rows(plan.column_names, Vec::new())));
         }
 
-        if row_id_alias_column_name(plan.table_schema)
-            .is_some_and(|column_name| identifiers_equal(column_name, plan.filter_column))
+        if plan.extra_lookup_terms.is_empty()
+            && row_id_alias_column_name(plan.table_schema)
+                .is_some_and(|column_name| identifiers_equal(column_name, plan.filter_column))
         {
             let mut rows = Vec::new();
             if let Some(row_id) = value_as_int64(&plan.lookup_value) {
@@ -11407,18 +12470,7 @@ impl EngineRuntime {
             )?));
         }
 
-        let Some(index) = self.catalog.indexes.values().find(|index| {
-            identifiers_equal(&index.table_name, plan.table_name)
-                && index.fresh
-                && index.kind == IndexKind::Btree
-                && index.predicate_sql.is_none()
-                && index.columns.len() == 1
-                && index.columns[0]
-                    .column_name
-                    .as_deref()
-                    .is_some_and(|index_column| identifiers_equal(index_column, plan.filter_column))
-                && index.columns[0].expression_sql.is_none()
-        }) else {
+        let Some(index) = self.btree_index_for_simple_indexed_projection_plan(&plan) else {
             return Ok(None);
         };
         let Some(RuntimeIndex::Btree { keys, covering }) = self.index(&index.name) else {
@@ -11427,42 +12479,83 @@ impl EngineRuntime {
         let covering_offsets = covering.as_ref().and_then(|covering| {
             covering_projection_offsets(covering, plan.table_schema, &plan.projection_indexes)
         });
-        let row_ids = keys.row_ids_for_value_set(&plan.lookup_value)?;
+        let row_id_order = indexed_projection_row_id_order(&plan);
+        let row_ids = row_ids_for_simple_indexed_projection_lookup(keys, &plan)?;
 
-        let scan_limit = if plan.order_by.is_none() && plan.offset == 0 {
+        let scan_limit = if let Some((_, limit_with_offset)) = row_id_order {
+            limit_with_offset
+        } else if plan.order_by.is_none() && plan.offset == 0 {
             plan.limit.unwrap_or(usize::MAX)
         } else {
             usize::MAX
         };
         let mut rows = Vec::with_capacity(row_ids.len().min(scan_limit));
         let mut row_lookup_error = None;
-        row_ids.for_each(|row_id| {
-            if row_lookup_error.is_some() || rows.len() >= scan_limit {
-                return;
+        if let Some((descending, _)) = row_id_order {
+            let ordered_row_ids = row_ids.into_sorted_vec(descending);
+            let limit = plan.limit.unwrap_or(usize::MAX);
+            for row_id in ordered_row_ids.into_iter().skip(plan.offset).take(limit) {
+                if row_lookup_error.is_some() || rows.len() >= scan_limit {
+                    break;
+                }
+                if let (Some(covering), Some(offsets)) =
+                    (covering.as_ref(), covering_offsets.as_ref())
+                {
+                    if let Some(row) = covering.project_row(row_id, offsets) {
+                        rows.push(row);
+                        continue;
+                    }
+                }
+                let stored_row = match row_source
+                    .map(|source| source.row_by_id(row_id))
+                    .transpose()
+                {
+                    Ok(Some(Some(stored_row))) => stored_row,
+                    Ok(Some(None)) | Ok(None) => continue,
+                    Err(error) => {
+                        row_lookup_error = Some(error);
+                        break;
+                    }
+                };
+                rows.push(project_simple_projection_values(
+                    stored_row.values(),
+                    &plan.projection_indexes,
+                ));
             }
-            if let (Some(covering), Some(offsets)) = (covering.as_ref(), covering_offsets.as_ref())
-            {
-                if let Some(row) = covering.project_row(row_id, offsets) {
-                    rows.push(row);
+            if let Some(error) = row_lookup_error {
+                return Err(error);
+            }
+            return Ok(Some(QueryResult::with_rows(plan.column_names, rows)));
+        } else {
+            row_ids.for_each(|row_id| {
+                if row_lookup_error.is_some() || rows.len() >= scan_limit {
                     return;
                 }
-            }
-            let stored_row = match row_source
-                .map(|source| source.row_by_id(row_id))
-                .transpose()
-            {
-                Ok(Some(Some(stored_row))) => stored_row,
-                Ok(Some(None)) | Ok(None) => return,
-                Err(error) => {
-                    row_lookup_error = Some(error);
-                    return;
+                if let (Some(covering), Some(offsets)) =
+                    (covering.as_ref(), covering_offsets.as_ref())
+                {
+                    if let Some(row) = covering.project_row(row_id, offsets) {
+                        rows.push(row);
+                        return;
+                    }
                 }
-            };
-            rows.push(project_simple_projection_values(
-                stored_row.values(),
-                &plan.projection_indexes,
-            ));
-        });
+                let stored_row = match row_source
+                    .map(|source| source.row_by_id(row_id))
+                    .transpose()
+                {
+                    Ok(Some(Some(stored_row))) => stored_row,
+                    Ok(Some(None)) | Ok(None) => return,
+                    Err(error) => {
+                        row_lookup_error = Some(error);
+                        return;
+                    }
+                };
+                rows.push(project_simple_projection_values(
+                    stored_row.values(),
+                    &plan.projection_indexes,
+                ));
+            });
+        }
         if let Some(error) = row_lookup_error {
             return Err(error);
         }
@@ -11492,8 +12585,9 @@ impl EngineRuntime {
             if plan.limit == Some(0) {
                 return Ok(Some(QueryResult::with_rows(plan.column_names, Vec::new())));
             }
-            if row_id_alias_column_name(plan.table_schema)
-                .is_some_and(|column_name| identifiers_equal(column_name, plan.filter_column))
+            if plan.extra_lookup_terms.is_empty()
+                && row_id_alias_column_name(plan.table_schema)
+                    .is_some_and(|column_name| identifiers_equal(column_name, plan.filter_column))
             {
                 let mut rows = Vec::new();
                 if let Some(row_id) = value_as_int64(&plan.lookup_value) {
@@ -11514,36 +12608,56 @@ impl EngineRuntime {
                 )?));
             }
 
-            let Some(index) = self.catalog.indexes.values().find(|index| {
-                identifiers_equal(&index.table_name, plan.table_name)
-                    && index.fresh
-                    && index.kind == IndexKind::Btree
-                    && index.predicate_sql.is_none()
-                    && index.columns.len() == 1
-                    && index.columns[0]
-                        .column_name
-                        .as_deref()
-                        .is_some_and(|index_column| {
-                            identifiers_equal(index_column, plan.filter_column)
-                        })
-                    && index.columns[0].expression_sql.is_none()
-            }) else {
+            let Some(index) = self.btree_index_for_simple_indexed_projection_plan(&plan) else {
                 return Ok(None);
             };
             let Some(RuntimeIndex::Btree { keys, covering }) = self.index(&index.name) else {
                 return Ok(None);
             };
+            let row_id_order = indexed_projection_row_id_order(&plan);
             let covering_offsets = covering.as_ref().and_then(|covering| {
                 covering_projection_offsets(covering, plan.table_schema, &plan.projection_indexes)
             });
-            let row_ids = keys.row_ids_for_value_set(&plan.lookup_value)?;
-            let scan_limit = if plan.order_by.is_none() && plan.offset == 0 {
-                plan.limit.unwrap_or(usize::MAX)
-            } else {
-                usize::MAX
-            };
+            let row_ids = row_ids_for_simple_indexed_projection_lookup(keys, &plan)?;
+            let scan_limit =
+                if row_id_order.is_none() && plan.order_by.is_none() && plan.offset == 0 {
+                    plan.limit.unwrap_or(usize::MAX)
+                } else if let Some((_, limit_with_offset)) = row_id_order {
+                    limit_with_offset
+                } else {
+                    usize::MAX
+                };
             let mut rows = Vec::with_capacity(row_ids.len().min(scan_limit));
             let mut row_lookup_error = None;
+            if let Some((descending, _)) = row_id_order {
+                let ordered_row_ids = row_ids.into_sorted_vec(descending);
+                let limit = plan.limit.unwrap_or(usize::MAX);
+                for row_id in ordered_row_ids.into_iter().skip(plan.offset).take(limit) {
+                    if row_lookup_error.is_some() || rows.len() >= scan_limit {
+                        break;
+                    }
+                    if let (Some(covering), Some(offsets)) =
+                        (covering.as_ref(), covering_offsets.as_ref())
+                    {
+                        if let Some(row) = covering.project_row(row_id, offsets) {
+                            rows.push(row);
+                            continue;
+                        }
+                    }
+                    match row_source.row_by_id(row_id) {
+                        Ok(Some(stored_row)) => rows.push(project_simple_projection_values(
+                            stored_row.values(),
+                            &plan.projection_indexes,
+                        )),
+                        Ok(None) => {}
+                        Err(error) => row_lookup_error = Some(error),
+                    }
+                }
+                if let Some(error) = row_lookup_error {
+                    return Err(error);
+                }
+                return Ok(Some(QueryResult::with_rows(plan.column_names, rows)));
+            }
             row_ids.for_each(|row_id| {
                 if row_lookup_error.is_some() || rows.len() >= scan_limit {
                     return;
@@ -11605,8 +12719,9 @@ impl EngineRuntime {
         };
 
         let mut rows = Vec::new();
-        if row_id_alias_column_name(plan.table_schema)
-            .is_some_and(|column_name| identifiers_equal(column_name, plan.filter_column))
+        if plan.extra_lookup_terms.is_empty()
+            && row_id_alias_column_name(plan.table_schema)
+                .is_some_and(|column_name| identifiers_equal(column_name, plan.filter_column))
         {
             if let Some(row_id) = value_as_int64(&plan.lookup_value) {
                 if let Some(stored_row) = read_deferred_stored_row_by_id(
@@ -11633,18 +12748,7 @@ impl EngineRuntime {
             )?));
         }
 
-        let Some(index) = self.catalog.indexes.values().find(|index| {
-            identifiers_equal(&index.table_name, plan.table_name)
-                && index.fresh
-                && index.kind == IndexKind::Btree
-                && index.predicate_sql.is_none()
-                && index.columns.len() == 1
-                && index.columns[0]
-                    .column_name
-                    .as_deref()
-                    .is_some_and(|index_column| identifiers_equal(index_column, plan.filter_column))
-                && index.columns[0].expression_sql.is_none()
-        }) else {
+        let Some(index) = self.btree_index_for_simple_indexed_projection_plan(&plan) else {
             return Ok(None);
         };
         let Some(RuntimeIndex::Btree { keys, covering }) = self.index(&index.name) else {
@@ -11653,41 +12757,85 @@ impl EngineRuntime {
         let covering_offsets = covering.as_ref().and_then(|covering| {
             covering_projection_offsets(covering, plan.table_schema, &plan.projection_indexes)
         });
-        let row_ids = keys.row_ids_for_value_set(&plan.lookup_value)?;
-        let scan_limit = if plan.order_by.is_none() && plan.offset == 0 {
+        let row_id_order = indexed_projection_row_id_order(&plan);
+        let row_ids = row_ids_for_simple_indexed_projection_lookup(keys, &plan)?;
+        let scan_limit = if let Some((_, limit_with_offset)) = row_id_order {
+            limit_with_offset
+        } else if plan.order_by.is_none() && plan.offset == 0 {
             plan.limit.unwrap_or(usize::MAX)
         } else {
             usize::MAX
         };
         rows.reserve(row_ids.len().min(scan_limit));
         let mut row_lookup_error = None;
-        row_ids.for_each(|row_id| {
-            if row_lookup_error.is_some() || rows.len() >= scan_limit {
-                return;
-            }
-            if let (Some(covering), Some(offsets)) = (covering.as_ref(), covering_offsets.as_ref())
-            {
-                if let Some(row) = covering.project_row(row_id, offsets) {
-                    rows.push(row);
-                    return;
+        if let Some((descending, _)) = row_id_order {
+            let ordered_row_ids = row_ids.into_sorted_vec(descending);
+            let limit = plan.limit.unwrap_or(usize::MAX);
+            for row_id in ordered_row_ids.into_iter().skip(plan.offset).take(limit) {
+                if row_lookup_error.is_some() || rows.len() >= scan_limit {
+                    break;
+                }
+                if let (Some(covering), Some(offsets)) =
+                    (covering.as_ref(), covering_offsets.as_ref())
+                {
+                    if let Some(row) = covering.project_row(row_id, offsets) {
+                        rows.push(row);
+                        continue;
+                    }
+                }
+                match read_deferred_stored_row_by_id(
+                    &store,
+                    state,
+                    plan.table_schema,
+                    row_id,
+                    use_persistent_pk_index,
+                    paged_locator_cache,
+                ) {
+                    Ok(Some(stored_row)) => rows.push(project_simple_projection_row(
+                        &stored_row,
+                        &plan.projection_indexes,
+                    )),
+                    Ok(None) => {}
+                    Err(error) => {
+                        row_lookup_error = Some(error);
+                        break;
+                    }
                 }
             }
-            match read_deferred_stored_row_by_id(
-                &store,
-                state,
-                plan.table_schema,
-                row_id,
-                use_persistent_pk_index,
-                paged_locator_cache,
-            ) {
-                Ok(Some(stored_row)) => rows.push(project_simple_projection_row(
-                    &stored_row,
-                    &plan.projection_indexes,
-                )),
-                Ok(None) => {}
-                Err(error) => row_lookup_error = Some(error),
+            if let Some(error) = row_lookup_error {
+                return Err(error);
             }
-        });
+            return Ok(Some(QueryResult::with_rows(plan.column_names, rows)));
+        } else {
+            row_ids.for_each(|row_id| {
+                if row_lookup_error.is_some() || rows.len() >= scan_limit {
+                    return;
+                }
+                if let (Some(covering), Some(offsets)) =
+                    (covering.as_ref(), covering_offsets.as_ref())
+                {
+                    if let Some(row) = covering.project_row(row_id, offsets) {
+                        rows.push(row);
+                        return;
+                    }
+                }
+                match read_deferred_stored_row_by_id(
+                    &store,
+                    state,
+                    plan.table_schema,
+                    row_id,
+                    use_persistent_pk_index,
+                    paged_locator_cache,
+                ) {
+                    Ok(Some(stored_row)) => rows.push(project_simple_projection_row(
+                        &stored_row,
+                        &plan.projection_indexes,
+                    )),
+                    Ok(None) => {}
+                    Err(error) => row_lookup_error = Some(error),
+                }
+            });
+        }
         if let Some(error) = row_lookup_error {
             return Err(error);
         }
@@ -14143,24 +15291,49 @@ impl EngineRuntime {
             return Ok(None);
         }
         let binding_name = alias.as_deref().unwrap_or(name);
-        let Some((filter_table, filter_column, value_expr)) = simple_btree_lookup(filter) else {
+        let Some(lookup_terms) = simple_btree_lookup_terms(filter) else {
             return Ok(None);
         };
-        if let Some(table_name) = filter_table {
-            if !identifiers_equal(table_name, name) && !identifiers_equal(table_name, binding_name)
-            {
+        for (filter_table, _, _) in &lookup_terms {
+            if filter_table.as_ref().is_some_and(|table_name| {
+                !identifiers_equal(table_name, name) && !identifiers_equal(table_name, binding_name)
+            }) {
                 return Ok(None);
             }
         }
+        let ordered_lookup_terms = if lookup_terms.len() == 1 {
+            lookup_terms
+        } else {
+            let Some(index) =
+                self.compound_btree_index_for_lookup_terms(name, lookup_terms.as_slice())
+            else {
+                return Ok(None);
+            };
+            ordered_lookup_terms_for_index(index, lookup_terms.as_slice())?
+        };
 
-        let lookup_value = self.eval_expr(
-            value_expr,
-            &Dataset::empty(),
-            &[],
-            params,
-            &BTreeMap::new(),
-            None,
-        )?;
+        let mut lookup_values = Vec::with_capacity(ordered_lookup_terms.len());
+        for (_, _, value_expr) in &ordered_lookup_terms {
+            lookup_values.push(self.eval_expr(
+                value_expr,
+                &Dataset::empty(),
+                &[],
+                params,
+                &BTreeMap::new(),
+                None,
+            )?);
+        }
+        let filter_column = ordered_lookup_terms[0].1;
+        let lookup_value = lookup_values
+            .first()
+            .cloned()
+            .ok_or_else(|| DbError::internal("indexed projection lookup terms are empty"))?;
+        let extra_lookup_terms = ordered_lookup_terms
+            .iter()
+            .skip(1)
+            .zip(lookup_values.into_iter().skip(1))
+            .map(|((_, column, _), value)| (*column, value))
+            .collect::<Vec<_>>();
         let Some((projection_indexes, column_names)) =
             self.simple_projection_plan(select, name, alias, table_schema)
         else {
@@ -14195,6 +15368,7 @@ impl EngineRuntime {
             table_schema,
             filter_column,
             lookup_value,
+            extra_lookup_terms,
             projection_indexes,
             column_names,
             order_by,
@@ -14211,13 +15385,13 @@ impl EngineRuntime {
         let Some(plan) = self.analyze_simple_indexed_projection_query(query, params)? else {
             return Ok(None);
         };
-        if row_id_alias_column_name(plan.table_schema)
-            .is_some_and(|column_name| identifiers_equal(column_name, plan.filter_column))
+        if plan.extra_lookup_terms.is_empty()
+            && row_id_alias_column_name(plan.table_schema)
+                .is_some_and(|column_name| identifiers_equal(column_name, plan.filter_column))
         {
             return Ok(None);
         }
-        let Some(index) = self.single_column_btree_index(plan.table_name, plan.filter_column)
-        else {
+        let Some(index) = self.btree_index_for_simple_indexed_projection_plan(&plan) else {
             return Ok(None);
         };
         if matches!(self.index(&index.name), Some(RuntimeIndex::Btree { .. })) {
@@ -14235,7 +15409,7 @@ impl EngineRuntime {
         let Some(plan) = self.analyze_simple_indexed_projection_query(query, params)? else {
             return Ok(None);
         };
-        if plan.table_schema.pk_index_root.is_some() {
+        if !plan.extra_lookup_terms.is_empty() || plan.table_schema.pk_index_root.is_some() {
             return Ok(None);
         }
         let Some(filter_column_index) = schema_column_index(plan.table_schema, plan.filter_column)
@@ -14361,6 +15535,68 @@ impl EngineRuntime {
                     .as_deref()
                     .is_some_and(|index_column| identifiers_equal(index_column, column_name))
                 && index.columns[0].expression_sql.is_none()
+        })
+    }
+
+    fn compound_btree_index_for_lookup_terms(
+        &self,
+        table_name: &str,
+        lookup_terms: &[(Option<&str>, &str, &Expr)],
+    ) -> Option<&IndexSchema> {
+        if lookup_terms.len() < 2 {
+            return None;
+        }
+        self.catalog.indexes.values().find(|index| {
+            identifiers_equal(&index.table_name, table_name)
+                && index.fresh
+                && index.kind == IndexKind::Btree
+                && index.predicate_sql.is_none()
+                && index.columns.len() >= lookup_terms.len()
+                && index
+                    .columns
+                    .iter()
+                    .take(lookup_terms.len())
+                    .all(|index_column| {
+                        index_column.expression_sql.is_none()
+                            && index_column.column_name.as_deref().is_some_and(|column| {
+                                lookup_terms.iter().any(|(_, lookup_column, _)| {
+                                    identifiers_equal(column, lookup_column)
+                                })
+                            })
+                    })
+        })
+    }
+
+    fn btree_index_for_simple_indexed_projection_plan(
+        &self,
+        plan: &SimpleIndexedProjectionPlan<'_>,
+    ) -> Option<&IndexSchema> {
+        if plan.extra_lookup_terms.is_empty() {
+            return self.single_column_btree_index(plan.table_name, plan.filter_column);
+        }
+        let lookup_columns = std::iter::once(plan.filter_column)
+            .chain(plan.extra_lookup_terms.iter().map(|(column, _)| *column))
+            .collect::<Vec<_>>();
+        self.catalog.indexes.values().find(|index| {
+            identifiers_equal(&index.table_name, plan.table_name)
+                && index.fresh
+                && index.kind == IndexKind::Btree
+                && index.predicate_sql.is_none()
+                && index.columns.len() >= lookup_columns.len()
+                && index
+                    .columns
+                    .iter()
+                    .take(lookup_columns.len())
+                    .zip(lookup_columns.iter())
+                    .all(|(index_column, lookup_column)| {
+                        index_column.expression_sql.is_none()
+                            && index_column
+                                .column_name
+                                .as_deref()
+                                .is_some_and(|index_column| {
+                                    identifiers_equal(index_column, lookup_column)
+                                })
+                    })
         })
     }
 
@@ -15595,6 +16831,7 @@ impl EngineRuntime {
         }
         let mut iter = from.iter();
         let cross_constraint = JoinConstraint::On(Expr::Literal(Value::Bool(true)));
+        // Invariant: iterator is non-empty due to the guard above.
         let mut current = self.evaluate_from_item_in_scope(
             iter.next().expect("first FROM item"),
             params,
@@ -18055,11 +19292,115 @@ struct SimpleIndexedProjectionPlan<'a> {
     table_schema: &'a TableSchema,
     filter_column: &'a str,
     lookup_value: Value,
+    extra_lookup_terms: Vec<(&'a str, Value)>,
     projection_indexes: Vec<usize>,
     column_names: Vec<String>,
     order_by: Option<Vec<SimpleOrderByPlan>>,
     limit: Option<usize>,
     offset: usize,
+}
+
+struct LeftJoinStatusAggregatePlan<'a> {
+    parent_table_name: &'a str,
+    parent_join_index: usize,
+    child_table_name: &'a str,
+    child_join_index: usize,
+    child_status_index: usize,
+    child_id_index: usize,
+    child_index_name: Option<String>,
+    group_column_indexes: Vec<usize>,
+    column_names: Vec<String>,
+    order_by: Option<Vec<SimpleOrderByPlan>>,
+    limit: Option<usize>,
+    offset: usize,
+}
+
+fn add_status_aggregate_child_row(
+    counts: &mut LeftJoinStatusCounts,
+    child_values: &[Value],
+    plan: &LeftJoinStatusAggregatePlan<'_>,
+) -> Result<()> {
+    let Some(child_status) = child_values.get(plan.child_status_index) else {
+        return Err(DbError::internal("child join row is shorter than schema"));
+    };
+    let Some(child_id) = child_values.get(plan.child_id_index) else {
+        return Err(DbError::internal("child join row is shorter than schema"));
+    };
+    counts.add_child(child_status, child_id)
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct LeftJoinStatusCounts {
+    open_count: i64,
+    in_progress_count: i64,
+    resolved_count: i64,
+    closed_count: i64,
+    total_count: i64,
+}
+
+impl LeftJoinStatusCounts {
+    fn bump(value: &mut i64) -> Result<()> {
+        *value = value
+            .checked_add(1)
+            .ok_or_else(|| DbError::sql("aggregate count exceeds INT64 limits"))?;
+        Ok(())
+    }
+
+    fn add_child(&mut self, status: &Value, id: &Value) -> Result<()> {
+        if let Value::Text(status) = status {
+            match status.as_str() {
+                "open" => Self::bump(&mut self.open_count)?,
+                "in_progress" => Self::bump(&mut self.in_progress_count)?,
+                "resolved" => Self::bump(&mut self.resolved_count)?,
+                "closed" => Self::bump(&mut self.closed_count)?,
+                _ => {}
+            }
+        }
+        if !matches!(id, Value::Null) {
+            Self::bump(&mut self.total_count)?;
+        }
+        Ok(())
+    }
+}
+
+enum SimpleIndexedProjectionRowIds<'a> {
+    Borrowed(RuntimeRowIdSet<'a>),
+    Owned(Vec<i64>),
+}
+
+impl SimpleIndexedProjectionRowIds<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Borrowed(row_ids) => row_ids.len(),
+            Self::Owned(row_ids) => row_ids.len(),
+        }
+    }
+
+    fn into_vec(self) -> Vec<i64> {
+        let mut row_ids = Vec::with_capacity(self.len());
+        self.for_each(|row_id| row_ids.push(row_id));
+        row_ids
+    }
+
+    fn into_sorted_vec(self, descending: bool) -> Vec<i64> {
+        let mut row_ids = self.into_vec();
+        row_ids.sort_unstable();
+        if descending {
+            row_ids.reverse();
+        }
+        row_ids
+    }
+
+    fn for_each(self, mut f: impl FnMut(i64)) {
+        match self {
+            Self::Borrowed(row_ids) => row_ids.for_each(f),
+            Self::Owned(row_ids) => {
+                for row_id in row_ids {
+                    f(row_id);
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -19782,7 +21123,19 @@ fn encode_table_payload(data: &TableData) -> Result<Vec<u8>> {
     for row in &data.rows {
         encode_i64(&mut output, row.row_id);
         Row::encode_values_into(&row.values, &mut encoded_row)?;
-        encode_bytes(&mut output, &encoded_row)?;
+        let row_body_len = encoded_row
+            .len()
+            .saturating_add(TABLE_PAYLOAD_ROW_BODY_PADDING_BYTES);
+        encode_u32(
+            &mut output,
+            u32::try_from(row_body_len)
+                .map_err(|_| DbError::constraint("table row body length exceeds u32"))?,
+        );
+        output.extend_from_slice(&encoded_row);
+        output.extend(std::iter::repeat_n(
+            0u8,
+            row_body_len.saturating_sub(encoded_row.len()),
+        ));
     }
     Ok(output)
 }
@@ -19790,7 +21143,10 @@ fn encode_table_payload(data: &TableData) -> Result<Vec<u8>> {
 fn encoded_table_row_len(row: &StoredRow, scratch: &mut Vec<u8>) -> Result<usize> {
     scratch.clear();
     Row::encode_values_into(&row.values, scratch)?;
-    Ok(8usize.saturating_add(4).saturating_add(scratch.len()))
+    Ok(8usize
+        .saturating_add(4)
+        .saturating_add(scratch.len())
+        .saturating_add(TABLE_PAYLOAD_ROW_BODY_PADDING_BYTES))
 }
 
 fn resident_table_should_use_paged_storage(
@@ -21546,14 +22902,220 @@ fn replace_table_pk_index_root(
 /// Build a new payload by splicing only the modified rows into the cached
 /// previous payload.  Unchanged row bytes are copied verbatim from `old`,
 /// saving the per-row serialisation cost for the common single-row UPDATE.
-/// Result of a splice operation, containing the new payload and metadata
-/// about which byte offset was first modified.
+/// Result of a splice operation, containing the new payload and dirty byte
+/// range metadata.
 struct SpliceResult {
     payload: Vec<u8>,
-    /// Byte offset of the first modified row in the OLD payload. Pages before
-    /// this offset are guaranteed unchanged and can be skipped during overflow
-    /// rewrite.
+    /// Byte offset of the first modified byte in the OLD payload.
     first_dirty_byte: usize,
+    /// Exclusive byte offset of the first byte after the changed range in the
+    /// OLD payload, when conservative behavior is used this may be payload
+    /// length.
+    last_dirty_byte: usize,
+    /// Whether the updated payload preserves row offsets and can reuse
+    /// the previous persistent PK locator root.
+    pk_locator_preserved: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SpliceDirtyRange {
+    first_dirty_byte: usize,
+    last_dirty_byte: usize,
+}
+
+fn single_dirty_range(range: Range<usize>) -> Vec<Range<usize>> {
+    std::iter::once(range).collect()
+}
+
+fn splice_updated_rows_payload_in_place(
+    payload: &mut [u8],
+    data: &TableData,
+    dirty_indices: &[usize],
+) -> Result<Option<SpliceDirtyRange>> {
+    const HEADER_LEN: usize = 8 /* magic */ + 4 /* row_count */;
+
+    if payload.len() < HEADER_LEN || payload[..8] != *TABLE_PAYLOAD_MAGIC {
+        return Ok(None);
+    }
+    let old_row_count =
+        u32::from_le_bytes(payload[8..12].try_into().expect("row-count header length")) as usize;
+    if old_row_count != data.rows.len() {
+        return Ok(None);
+    }
+
+    let mut sorted_dirty: Vec<usize> = dirty_indices.to_vec();
+    sorted_dirty.sort_unstable();
+    sorted_dirty.dedup();
+    if sorted_dirty.is_empty() {
+        return Ok(Some(SpliceDirtyRange {
+            first_dirty_byte: payload.len(),
+            last_dirty_byte: payload.len(),
+        }));
+    }
+
+    let mut row_spans: Vec<(usize, usize)> = Vec::with_capacity(sorted_dirty.len());
+    let mut scan_offset = HEADER_LEN;
+    let mut dirty_cursor = 0;
+    let mut row_idx = 0;
+    while dirty_cursor < sorted_dirty.len() && scan_offset + 12 <= payload.len() {
+        if row_idx >= old_row_count {
+            break;
+        }
+        let row_id = i64::from_le_bytes(
+            payload[scan_offset..scan_offset + 8]
+                .try_into()
+                .expect("row id length"),
+        );
+        let row_data_len = u32::from_le_bytes(
+            payload[scan_offset + 8..scan_offset + 12]
+                .try_into()
+                .expect("row data len"),
+        ) as usize;
+        let row_end = scan_offset.saturating_add(12).saturating_add(row_data_len);
+        if row_end > payload.len() {
+            return Ok(None);
+        }
+        if row_idx == sorted_dirty[dirty_cursor] {
+            let Some(row) = data.rows.get(row_idx) else {
+                return Ok(None);
+            };
+            if row.row_id != row_id {
+                return Ok(None);
+            }
+            row_spans.push((scan_offset, row_end));
+            dirty_cursor += 1;
+            if dirty_cursor == sorted_dirty.len() {
+                break;
+            }
+        }
+        scan_offset = row_end;
+        row_idx += 1;
+    }
+    if row_spans.len() != sorted_dirty.len() {
+        return Ok(None);
+    }
+
+    let mut encoded_rows: Vec<Vec<u8>> = Vec::with_capacity(sorted_dirty.len());
+    let mut encoded_row = Vec::with_capacity(128);
+    for (span_idx, &dirty_row) in sorted_dirty.iter().enumerate() {
+        let Some(row) = data.rows.get(dirty_row) else {
+            return Ok(None);
+        };
+        let (span_start, span_end) = row_spans[span_idx];
+        let old_row_body_len = span_end.saturating_sub(span_start).saturating_sub(12);
+        encoded_row.clear();
+        Row::encode_values_into(&row.values, &mut encoded_row)?;
+        if encoded_row.len() > old_row_body_len {
+            return Ok(None);
+        }
+        encoded_rows.push(encoded_row.clone());
+    }
+
+    for (span_idx, encoded_row) in encoded_rows.iter().enumerate() {
+        let (span_start, span_end) = row_spans[span_idx];
+        let body_start = span_start.saturating_add(12);
+        let body_written_end = body_start.saturating_add(encoded_row.len());
+        payload[body_start..body_written_end].copy_from_slice(encoded_row);
+        payload[body_written_end..span_end].fill(0);
+    }
+
+    Ok(Some(SpliceDirtyRange {
+        first_dirty_byte: row_spans
+            .first()
+            .map_or(0, |span| span.0.saturating_add(12)),
+        last_dirty_byte: row_spans.last().map_or(payload.len(), |span| span.1),
+    }))
+}
+
+fn splice_deleted_rows_payload_in_place(
+    payload: &mut Vec<u8>,
+    data: &TableData,
+    deleted_row_ids: &BTreeSet<i64>,
+) -> Result<Option<Vec<Range<usize>>>> {
+    const HEADER_LEN: usize = 8 /* magic */ + 4 /* row_count */;
+
+    if deleted_row_ids.is_empty() {
+        return Ok(Some(single_dirty_range(payload.len()..payload.len())));
+    }
+    if payload.len() < HEADER_LEN || payload[..8] != *TABLE_PAYLOAD_MAGIC {
+        return Ok(None);
+    }
+    let old_row_count =
+        u32::from_le_bytes(payload[8..12].try_into().expect("row-count header length")) as usize;
+    if old_row_count != data.rows.len().saturating_add(deleted_row_ids.len()) {
+        return Ok(None);
+    }
+
+    let mut deleted_spans: Vec<(usize, usize)> = Vec::with_capacity(deleted_row_ids.len());
+    let mut remaining = deleted_row_ids.len();
+    let mut scan_offset = HEADER_LEN;
+    let mut scanned_rows = 0usize;
+    while remaining > 0 && scan_offset + 12 <= payload.len() {
+        if scanned_rows >= old_row_count {
+            break;
+        }
+        let row_id = i64::from_le_bytes(
+            payload[scan_offset..scan_offset + 8]
+                .try_into()
+                .expect("row id length"),
+        );
+        let row_data_len = u32::from_le_bytes(
+            payload[scan_offset + 8..scan_offset + 12]
+                .try_into()
+                .expect("row data len"),
+        ) as usize;
+        let row_end = scan_offset.saturating_add(12).saturating_add(row_data_len);
+        if row_end > payload.len() {
+            return Ok(None);
+        }
+        if deleted_row_ids.contains(&row_id) {
+            deleted_spans.push((scan_offset, row_end));
+            remaining -= 1;
+        }
+        scan_offset = row_end;
+        scanned_rows += 1;
+    }
+
+    if remaining > 0 || deleted_spans.len() != deleted_row_ids.len() {
+        return Ok(None);
+    }
+
+    let original_len = payload.len();
+    let first_deleted_byte = deleted_spans.first().map_or(HEADER_LEN, |span| span.0);
+    payload[8..12].copy_from_slice(
+        &u32::try_from(data.rows.len())
+            .map_err(|_| DbError::constraint("table row count exceeds u32"))?
+            .to_le_bytes(),
+    );
+
+    let mut copy_from = HEADER_LEN;
+    let mut write_at = HEADER_LEN;
+    for (span_start, span_end) in deleted_spans {
+        if copy_from < span_start {
+            if copy_from != write_at {
+                payload.copy_within(copy_from..span_start, write_at);
+            }
+            write_at += span_start - copy_from;
+        }
+        copy_from = span_end;
+    }
+    if copy_from < original_len {
+        let tail_len = original_len - copy_from;
+        if copy_from != write_at {
+            payload.copy_within(copy_from..original_len, write_at);
+        }
+        write_at += tail_len;
+    }
+    payload.truncate(write_at);
+
+    let mut ranges = single_dirty_range(8..HEADER_LEN);
+    if !payload.is_empty() {
+        let tail_dirty_start = first_deleted_byte.saturating_sub(1).min(payload.len());
+        if tail_dirty_start < payload.len() {
+            ranges.push(tail_dirty_start..payload.len());
+        }
+    }
+    Ok(Some(ranges))
 }
 
 fn splice_updated_rows_payload(
@@ -21565,9 +23127,12 @@ fn splice_updated_rows_payload(
 
     if old.len() < HEADER_LEN || old[..8] != *TABLE_PAYLOAD_MAGIC {
         let payload = encode_table_payload(data)?;
+        let payload_len = payload.len();
         return Ok(SpliceResult {
             payload,
             first_dirty_byte: 0,
+            last_dirty_byte: payload_len,
+            pk_locator_preserved: false,
         });
     }
     let old_row_count =
@@ -21576,9 +23141,12 @@ fn splice_updated_rows_payload(
         // Row count changed (e.g. concurrent insert/delete after the cache
         // was stored) — fall back to full encode for safety.
         let payload = encode_table_payload(data)?;
+        let payload_len = payload.len();
         return Ok(SpliceResult {
             payload,
             first_dirty_byte: 0,
+            last_dirty_byte: payload_len,
+            pk_locator_preserved: false,
         });
     }
 
@@ -21605,43 +23173,107 @@ fn splice_updated_rows_payload(
     let mut dirty_cursor = 0;
     let mut row_idx = 0;
     while dirty_cursor < sorted_dirty.len() && scan_offset + 12 <= old.len() {
+        if row_idx >= old_row_count {
+            break;
+        }
         let rd_len = u32::from_le_bytes(
             old[scan_offset + 8..scan_offset + 12]
                 .try_into()
                 .expect("row data len"),
         ) as usize;
         let row_end = scan_offset + 12 + rd_len;
+        if row_end > old.len() {
+            let payload = encode_table_payload(data)?;
+            let payload_len = payload.len();
+            return Ok(SpliceResult {
+                payload,
+                first_dirty_byte: 0,
+                last_dirty_byte: payload_len,
+                pk_locator_preserved: false,
+            });
+        }
         if row_idx == sorted_dirty[dirty_cursor] {
             row_spans.push((scan_offset, row_end));
             dirty_cursor += 1;
+            if dirty_cursor == sorted_dirty.len() {
+                break;
+            }
         }
         scan_offset = row_end;
         row_idx += 1;
-        if row_idx > old_row_count {
-            break;
-        }
     }
 
     if row_spans.len() != sorted_dirty.len() {
         // Could not find all dirty rows in the old payload; fall back.
         let payload = encode_table_payload(data)?;
+        let payload_len = payload.len();
         return Ok(SpliceResult {
             payload,
             first_dirty_byte: 0,
+            last_dirty_byte: payload_len,
+            pk_locator_preserved: false,
         });
     }
 
-    let first_dirty_byte = row_spans.first().map_or(0, |s| s.0);
+    if row_spans.is_empty() {
+        return Ok(SpliceResult {
+            payload: old.to_vec(),
+            first_dirty_byte: 0,
+            last_dirty_byte: old.len(),
+            pk_locator_preserved: false,
+        });
+    }
 
-    // Build the spliced payload.
-    let mut output = Vec::with_capacity(old.len() + sorted_dirty.len() * 32);
+    let mut can_preserve_body = true;
+    let mut encoded_rows: Vec<Vec<u8>> = Vec::with_capacity(sorted_dirty.len());
+    let mut encoded_row = Vec::with_capacity(128);
+    for (span_idx, &dirty_row) in sorted_dirty.iter().enumerate() {
+        if dirty_row >= data.rows.len() {
+            let payload = encode_table_payload(data)?;
+            let payload_len = payload.len();
+            return Ok(SpliceResult {
+                payload,
+                first_dirty_byte: 0,
+                last_dirty_byte: payload_len,
+                pk_locator_preserved: false,
+            });
+        }
+        let (span_start, span_end) = row_spans[span_idx];
+        let old_row_body_len = span_end.saturating_sub(span_start).saturating_sub(12);
+
+        let row = &data.rows[dirty_row];
+        encoded_row.clear();
+        Row::encode_values_into(&row.values, &mut encoded_row)?;
+        if encoded_row.len() > old_row_body_len {
+            can_preserve_body = false;
+        }
+        encoded_rows.push(encoded_row.clone());
+    }
+
+    let mut output = Vec::with_capacity(if can_preserve_body {
+        old.len()
+    } else {
+        old.len().saturating_add(sorted_dirty.len() * 32)
+    });
     output.extend_from_slice(&old[..8]); // magic
     encode_u32(&mut output, data.rows.len() as u32);
 
+    let first_dirty_byte = if can_preserve_body {
+        row_spans.first().map_or(0, |s| s.0.saturating_add(12))
+    } else {
+        row_spans.first().map_or(0, |s| s.0)
+    };
+    let last_dirty_byte = if can_preserve_body {
+        row_spans.last().map_or(first_dirty_byte, |s| s.1)
+    } else {
+        old.len()
+    };
+
     let mut copy_from = HEADER_LEN;
-    let mut encoded_row = Vec::with_capacity(128);
     for (span_idx, &dirty_row) in sorted_dirty.iter().enumerate() {
         let (span_start, span_end) = row_spans[span_idx];
+        let old_row_body_len = span_end.saturating_sub(span_start).saturating_sub(12);
+        let encoded_row = &encoded_rows[span_idx];
 
         // Copy unchanged bytes before this dirty row.
         if copy_from < span_start {
@@ -21651,8 +23283,23 @@ fn splice_updated_rows_payload(
         // Encode the updated row.
         let row = &data.rows[dirty_row];
         encode_i64(&mut output, row.row_id);
-        Row::encode_values_into(&row.values, &mut encoded_row)?;
-        encode_bytes(&mut output, &encoded_row)?;
+        if can_preserve_body {
+            let row_body_len = u32::try_from(old_row_body_len)
+                .map_err(|_| DbError::constraint("table row body length exceeds u32"))?;
+            output.extend_from_slice(&row_body_len.to_le_bytes());
+            output.extend_from_slice(encoded_row);
+            output.extend(std::iter::repeat_n(
+                0u8,
+                old_row_body_len.saturating_sub(encoded_row.len()),
+            ));
+        } else {
+            encode_u32(
+                &mut output,
+                u32::try_from(encoded_row.len())
+                    .map_err(|_| DbError::constraint("table row body length exceeds u32"))?,
+            );
+            output.extend_from_slice(encoded_row);
+        }
 
         copy_from = span_end;
     }
@@ -21664,6 +23311,114 @@ fn splice_updated_rows_payload(
     Ok(SpliceResult {
         payload: output,
         first_dirty_byte,
+        last_dirty_byte,
+        pk_locator_preserved: can_preserve_body,
+    })
+}
+
+fn splice_deleted_rows_payload(
+    old: &[u8],
+    data: &TableData,
+    deleted_row_ids: &BTreeSet<i64>,
+) -> Result<SpliceResult> {
+    const HEADER_LEN: usize = 8 /* magic */ + 4 /* row_count */;
+
+    if deleted_row_ids.is_empty() {
+        return Ok(SpliceResult {
+            payload: old.to_vec(),
+            first_dirty_byte: old.len(),
+            last_dirty_byte: old.len(),
+            pk_locator_preserved: false,
+        });
+    }
+    if old.len() < HEADER_LEN || old[..8] != *TABLE_PAYLOAD_MAGIC {
+        let payload = encode_table_payload(data)?;
+        let payload_len = payload.len();
+        return Ok(SpliceResult {
+            payload,
+            first_dirty_byte: 0,
+            last_dirty_byte: payload_len,
+            pk_locator_preserved: false,
+        });
+    }
+    let old_row_count =
+        u32::from_le_bytes(old[8..12].try_into().expect("row-count header length")) as usize;
+    if old_row_count != data.rows.len().saturating_add(deleted_row_ids.len()) {
+        let payload = encode_table_payload(data)?;
+        let payload_len = payload.len();
+        return Ok(SpliceResult {
+            payload,
+            first_dirty_byte: 0,
+            last_dirty_byte: payload_len,
+            pk_locator_preserved: false,
+        });
+    }
+
+    let mut deleted_spans: Vec<(usize, usize)> = Vec::with_capacity(deleted_row_ids.len());
+    let mut remaining = deleted_row_ids.len();
+    let mut scan_offset = HEADER_LEN;
+    while remaining > 0 && scan_offset + 12 <= old.len() {
+        let row_id = i64::from_le_bytes(
+            old[scan_offset..scan_offset + 8]
+                .try_into()
+                .expect("row id length"),
+        );
+        let row_data_len = u32::from_le_bytes(
+            old[scan_offset + 8..scan_offset + 12]
+                .try_into()
+                .expect("row data len"),
+        ) as usize;
+        let row_end = scan_offset.saturating_add(12).saturating_add(row_data_len);
+        if row_end > old.len() {
+            let payload = encode_table_payload(data)?;
+            let payload_len = payload.len();
+            return Ok(SpliceResult {
+                payload,
+                first_dirty_byte: 0,
+                last_dirty_byte: payload_len,
+                pk_locator_preserved: false,
+            });
+        }
+        if deleted_row_ids.contains(&row_id) {
+            deleted_spans.push((scan_offset, row_end));
+            remaining -= 1;
+        }
+        scan_offset = row_end;
+    }
+
+    if remaining > 0 || deleted_spans.len() != deleted_row_ids.len() {
+        let payload = encode_table_payload(data)?;
+        let payload_len = payload.len();
+        return Ok(SpliceResult {
+            payload,
+            first_dirty_byte: 0,
+            last_dirty_byte: payload_len,
+            pk_locator_preserved: false,
+        });
+    }
+
+    let first_dirty_byte = deleted_spans.first().map_or(0, |span| span.0);
+    let mut output = Vec::with_capacity(old.len());
+    output.extend_from_slice(&old[..TABLE_PAYLOAD_MAGIC.len()]);
+    encode_u32(&mut output, data.rows.len() as u32);
+
+    let mut copy_from = HEADER_LEN;
+    for (span_start, span_end) in deleted_spans {
+        if copy_from < span_start {
+            output.extend_from_slice(&old[copy_from..span_start]);
+        }
+        copy_from = span_end;
+    }
+    if copy_from < old.len() {
+        output.extend_from_slice(&old[copy_from..]);
+    }
+
+    let last_dirty_byte = output.len();
+    Ok(SpliceResult {
+        payload: output,
+        first_dirty_byte,
+        last_dirty_byte,
+        pk_locator_preserved: false,
     })
 }
 
@@ -21682,7 +23437,20 @@ fn encode_appended_table_rows(data: &TableData, existing_count: usize) -> Result
     for row in data.rows.iter().skip(existing_count) {
         encode_i64(&mut appended, row.row_id);
         Row::encode_values_into(&row.values, &mut encoded_row)?;
-        encode_bytes(&mut appended, &encoded_row)?;
+        let row_body_len = encoded_row
+            .len()
+            .saturating_add(TABLE_PAYLOAD_ROW_BODY_PADDING_BYTES);
+        encode_u32(
+            &mut appended,
+            u32::try_from(row_body_len)
+                .map_err(|_| DbError::constraint("table row body length exceeds u32"))?,
+        );
+        appended.extend_from_slice(&encoded_row);
+        appended.extend(std::iter::repeat_n(
+            0u8,
+            row_body_len.saturating_sub(encoded_row.len()),
+        ));
+        encoded_row.clear();
     }
     Ok(appended)
 }
@@ -22638,6 +24406,113 @@ fn simple_btree_lookup(filter: &Expr) -> Option<(Option<&str>, &str, &Expr)> {
         },
         _ => None,
     }
+}
+
+fn simple_btree_lookup_terms(filter: &Expr) -> Option<Vec<(Option<&str>, &str, &Expr)>> {
+    fn collect<'a>(
+        expr: &'a Expr,
+        terms: &mut Vec<(Option<&'a str>, &'a str, &'a Expr)>,
+    ) -> Option<()> {
+        match expr {
+            Expr::Binary {
+                left,
+                op: BinaryOp::And,
+                right,
+            } => {
+                collect(left, terms)?;
+                collect(right, terms)?;
+                Some(())
+            }
+            _ => {
+                let term = simple_btree_lookup(expr)?;
+                if terms
+                    .iter()
+                    .any(|(_, column, _)| identifiers_equal(column, term.1))
+                {
+                    return None;
+                }
+                terms.push(term);
+                Some(())
+            }
+        }
+    }
+
+    let mut terms = Vec::new();
+    collect(filter, &mut terms)?;
+    (!terms.is_empty()).then_some(terms)
+}
+
+fn ordered_lookup_terms_for_index<'a>(
+    index: &IndexSchema,
+    lookup_terms: &[(Option<&'a str>, &'a str, &'a Expr)],
+) -> Result<Vec<(Option<&'a str>, &'a str, &'a Expr)>> {
+    let mut ordered = Vec::with_capacity(lookup_terms.len());
+    for index_column in index.columns.iter().take(lookup_terms.len()) {
+        let Some(column_name) = index_column.column_name.as_deref() else {
+            return Err(DbError::internal(
+                "compound indexed projection matched expression index column",
+            ));
+        };
+        let Some(term) = lookup_terms
+            .iter()
+            .copied()
+            .find(|(_, lookup_column, _)| identifiers_equal(column_name, lookup_column))
+        else {
+            return Err(DbError::internal(
+                "compound indexed projection matched non-prefix lookup terms",
+            ));
+        };
+        ordered.push(term);
+    }
+    Ok(ordered)
+}
+
+fn row_ids_for_simple_indexed_projection_lookup<'a>(
+    keys: &'a RuntimeBtreeKeys,
+    plan: &SimpleIndexedProjectionPlan<'_>,
+) -> Result<SimpleIndexedProjectionRowIds<'a>> {
+    if plan.extra_lookup_terms.is_empty() {
+        return keys
+            .row_ids_for_value_set(&plan.lookup_value)
+            .map(SimpleIndexedProjectionRowIds::Borrowed);
+    }
+    let values = std::iter::once(plan.lookup_value.clone())
+        .chain(
+            plan.extra_lookup_terms
+                .iter()
+                .map(|(_, value)| value.clone()),
+        )
+        .collect::<Vec<_>>();
+    Ok(SimpleIndexedProjectionRowIds::Owned(keys.row_ids_for_key(
+        &RuntimeBtreeKey::Encoded(Row::new(values).encode()?),
+    )))
+}
+
+fn indexed_projection_row_id_order(
+    plan: &SimpleIndexedProjectionPlan<'_>,
+) -> Option<(bool, usize)> {
+    let order_by = plan.order_by.as_ref()?;
+    if order_by.len() != 1 {
+        return None;
+    }
+    let row_id_alias = row_id_alias_column_name(plan.table_schema)?;
+    let row_id_order = &order_by[0];
+    if row_id_order.collation.is_some() {
+        return None;
+    }
+    let projection_index = plan
+        .projection_indexes
+        .get(row_id_order.projection_index)
+        .copied()?;
+    let order_column = plan.table_schema.columns.get(projection_index)?;
+    if !identifiers_equal(&order_column.name, row_id_alias) {
+        return None;
+    }
+    let limit_with_offset = plan
+        .limit
+        .map(|limit| limit.saturating_add(plan.offset))
+        .unwrap_or(usize::MAX);
+    Some((row_id_order.descending, limit_with_offset))
 }
 
 fn view_projection_expr_for_output_column(items: &[SelectItem], column: &str) -> Option<Expr> {
@@ -26201,6 +28076,68 @@ fn aggregate_matches_single_binding_column(
     expr_matches_binding_column(&args[0], binding, column)
 }
 
+fn aggregate_matches_status_case_sum(
+    expr: &Expr,
+    aggregate_name: &str,
+    binding: TableBindingRef<'_>,
+    status_column: &str,
+    status_value: &str,
+) -> bool {
+    let Expr::Aggregate {
+        name,
+        args,
+        distinct,
+        star,
+        order_by,
+        within_group,
+    } = expr
+    else {
+        return false;
+    };
+    if !name.eq_ignore_ascii_case(aggregate_name)
+        || *distinct
+        || *star
+        || !order_by.is_empty()
+        || *within_group
+        || args.len() != 1
+    {
+        return false;
+    }
+    let Expr::Case {
+        operand: None,
+        branches,
+        else_expr: Some(else_expr),
+    } = &args[0]
+    else {
+        return false;
+    };
+    if branches.len() != 1
+        || !matches!(&branches[0].1, Expr::Literal(Value::Int64(1)))
+        || !matches!(&**else_expr, Expr::Literal(Value::Int64(0)))
+    {
+        return false;
+    }
+    status_case_condition_matches(&branches[0].0, binding, status_column, status_value)
+}
+
+fn status_case_condition_matches(
+    expr: &Expr,
+    binding: TableBindingRef<'_>,
+    status_column: &str,
+    status_value: &str,
+) -> bool {
+    let Expr::Binary { left, op, right } = expr else {
+        return false;
+    };
+    if *op != BinaryOp::Eq {
+        return false;
+    }
+    (expr_matches_binding_column(left, binding, status_column)
+        && matches!(&**right, Expr::Literal(Value::Text(value)) if value == status_value))
+        || (expr_matches_binding_column(right, binding, status_column)
+            && matches!(&**left, Expr::Literal(Value::Text(value)) if value == status_value))
+}
+
 fn aggregate_matches_binding_product(
     expr: &Expr,
     aggregate_name: &str,
@@ -28261,7 +30198,11 @@ fn resolve_join_using_columns_for_schemas(
                     let left_idx = left_columns
                         .iter()
                         .position(|c| identifiers_equal(&c.name, &lc.name))
-                        .unwrap();
+                        .ok_or_else(|| {
+                            DbError::internal(
+                                "internal: NATURAL join column is missing on left table",
+                            )
+                        })?;
                     result.push(JoinUsingColumn {
                         name: left_columns[left_idx].name.clone(),
                         left_index: left_idx,
@@ -30657,10348 +32598,8 @@ pub(crate) fn statement_is_read_only(statement: &Statement) -> bool {
     matches!(statement, Statement::Query(_) | Statement::Explain(_))
 }
 
-fn infer_expr_name(expr: &Expr, ordinal: usize) -> String {
-    match expr {
-        Expr::Column { column, .. } => column.clone(),
-        Expr::Collate { expr, .. } => infer_expr_name(expr, ordinal),
-        Expr::RowNumber { .. } => "row_number".to_string(),
-        Expr::WindowFunction { name, .. } => name.clone(),
-        _ => format!("col{ordinal}"),
-    }
-}
-
-enum NumericAgg {
-    Sum,
-    Avg,
-    Total,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum VarianceAgg {
-    StddevSamp,
-    StddevPop,
-    VarSamp,
-    VarPop,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BoolAgg {
-    And,
-    Or,
-}
-
-struct AggregateEvalContext<'a> {
-    runtime: &'a EngineRuntime,
-    dataset: &'a Dataset,
-    params: &'a [Value],
-    ctes: &'a BTreeMap<String, Dataset>,
-}
-
-impl AggregateEvalContext<'_> {
-    fn eval_row(&self, row: &[Value], expr: &Expr) -> Result<Value> {
-        self.runtime
-            .eval_expr(expr, self.dataset, row, self.params, self.ctes, None)
-    }
-}
-
-fn aggregate_numeric(
-    ctx: &AggregateEvalContext<'_>,
-    row_indexes: &[usize],
-    expr: &Expr,
-    kind: NumericAgg,
-    distinct: bool,
-) -> Result<Value> {
-    let mut total_int = 0_i64;
-    let mut total_float = 0_f64;
-    let mut saw_float = false;
-    let mut count = 0_i64;
-
-    if distinct {
-        let mut vals = Vec::new();
-        for row_index in row_indexes {
-            let row = ctx
-                .dataset
-                .rows
-                .get(*row_index)
-                .map(Vec::as_slice)
-                .ok_or_else(|| DbError::internal("group row index is invalid"))?;
-            let val = ctx.eval_row(row, expr)?;
-            if !matches!(val, Value::Null) {
-                vals.push(val);
-            }
-        }
-        vals.sort_by(|a, b| compare_values(a, b).unwrap_or(std::cmp::Ordering::Equal));
-        vals.dedup_by(|a, b| {
-            compare_values(a, b).unwrap_or(std::cmp::Ordering::Equal) == std::cmp::Ordering::Equal
-        });
-        for val in vals {
-            match val {
-                Value::Int64(value) => {
-                    total_int += value;
-                    total_float += value as f64;
-                    count += 1;
-                }
-                Value::Float64(value) => {
-                    total_float += value;
-                    saw_float = true;
-                    count += 1;
-                }
-                Value::Decimal { scaled, scale } => {
-                    total_float += (scaled as f64) / 10_f64.powi(i32::from(scale));
-                    saw_float = true;
-                    count += 1;
-                }
-                other => {
-                    return Err(DbError::sql(format!(
-                        "numeric aggregate does not support {other:?}"
-                    )))
-                }
-            }
-        }
-    } else {
-        for row_index in row_indexes {
-            let row = ctx
-                .dataset
-                .rows
-                .get(*row_index)
-                .map(Vec::as_slice)
-                .ok_or_else(|| DbError::internal("group row index is invalid"))?;
-            match ctx.eval_row(row, expr)? {
-                Value::Null => {}
-                Value::Int64(value) => {
-                    total_int += value;
-                    total_float += value as f64;
-                    count += 1;
-                }
-                Value::Float64(value) => {
-                    total_float += value;
-                    saw_float = true;
-                    count += 1;
-                }
-                Value::Decimal { scaled, scale } => {
-                    total_float += (scaled as f64) / 10_f64.powi(i32::from(scale));
-                    saw_float = true;
-                    count += 1;
-                }
-                other => {
-                    return Err(DbError::sql(format!(
-                        "numeric aggregate does not support {other:?}"
-                    )))
-                }
-            }
-        }
-    }
-    if count == 0 {
-        return Ok(match kind {
-            NumericAgg::Total => Value::Float64(0.0),
-            NumericAgg::Sum | NumericAgg::Avg => Value::Null,
-        });
-    }
-    Ok(match kind {
-        NumericAgg::Sum if saw_float => Value::Float64(total_float),
-        NumericAgg::Sum => Value::Int64(total_int),
-        NumericAgg::Avg => Value::Float64(total_float / count as f64),
-        NumericAgg::Total => Value::Float64(total_float),
-    })
-}
-
-fn aggregate_variance(
-    ctx: &AggregateEvalContext<'_>,
-    row_indexes: &[usize],
-    expr: &Expr,
-    kind: VarianceAgg,
-    distinct: bool,
-) -> Result<Value> {
-    let mut values = Vec::new();
-    for row_index in row_indexes {
-        let row = ctx
-            .dataset
-            .rows
-            .get(*row_index)
-            .map(Vec::as_slice)
-            .ok_or_else(|| DbError::internal("group row index is invalid"))?;
-        let value = ctx.eval_row(row, expr)?;
-        if !matches!(value, Value::Null) {
-            values.push(value);
-        }
-    }
-
-    if distinct {
-        values.sort_by(|a, b| compare_values(a, b).unwrap_or(std::cmp::Ordering::Equal));
-        values.dedup_by(|a, b| {
-            compare_values(a, b).unwrap_or(std::cmp::Ordering::Equal) == std::cmp::Ordering::Equal
-        });
-    }
-
-    let mut count = 0_u64;
-    let mut mean = 0.0_f64;
-    let mut m2 = 0.0_f64;
-    for value in values {
-        let number = match value {
-            Value::Int64(value) => value as f64,
-            Value::Float64(value) => value,
-            Value::Decimal { scaled, scale } => (scaled as f64) / 10_f64.powi(i32::from(scale)),
-            other => {
-                return Err(DbError::sql(format!(
-                    "variance aggregate does not support {other:?}"
-                )));
-            }
-        };
-        count += 1;
-        let delta = number - mean;
-        mean += delta / (count as f64);
-        let delta2 = number - mean;
-        m2 += delta * delta2;
-    }
-
-    if count == 0 {
-        return Ok(Value::Null);
-    }
-
-    let denominator = match kind {
-        VarianceAgg::StddevPop | VarianceAgg::VarPop => count as f64,
-        VarianceAgg::StddevSamp | VarianceAgg::VarSamp => {
-            if count < 2 {
-                return Ok(Value::Null);
-            }
-            (count - 1) as f64
-        }
-    };
-    let variance = m2 / denominator;
-    Ok(match kind {
-        VarianceAgg::StddevSamp | VarianceAgg::StddevPop => Value::Float64(variance.sqrt()),
-        VarianceAgg::VarSamp | VarianceAgg::VarPop => Value::Float64(variance),
-    })
-}
-
-fn aggregate_bool(
-    ctx: &AggregateEvalContext<'_>,
-    row_indexes: &[usize],
-    expr: &Expr,
-    kind: BoolAgg,
-    distinct: bool,
-) -> Result<Value> {
-    let mut values = Vec::new();
-    for row_index in row_indexes {
-        let row = ctx
-            .dataset
-            .rows
-            .get(*row_index)
-            .map(Vec::as_slice)
-            .ok_or_else(|| DbError::internal("group row index is invalid"))?;
-        let value = ctx.eval_row(row, expr)?;
-        if !matches!(value, Value::Null) {
-            values.push(value);
-        }
-    }
-
-    if distinct {
-        values.sort_by(|a, b| compare_values(a, b).unwrap_or(std::cmp::Ordering::Equal));
-        values.dedup_by(|a, b| {
-            compare_values(a, b).unwrap_or(std::cmp::Ordering::Equal) == std::cmp::Ordering::Equal
-        });
-    }
-
-    let mut saw_non_null = false;
-    let mut result = match kind {
-        BoolAgg::And => true,
-        BoolAgg::Or => false,
-    };
-
-    for value in values {
-        let boolean = match value {
-            Value::Bool(value) => value,
-            other => {
-                return Err(DbError::sql(format!(
-                    "boolean aggregate does not support {other:?}"
-                )))
-            }
-        };
-        saw_non_null = true;
-        match kind {
-            BoolAgg::And => {
-                result &= boolean;
-                if !result {
-                    break;
-                }
-            }
-            BoolAgg::Or => {
-                result |= boolean;
-                if result {
-                    break;
-                }
-            }
-        }
-    }
-
-    if saw_non_null {
-        Ok(Value::Bool(result))
-    } else {
-        Ok(Value::Null)
-    }
-}
-
-fn aggregate_extreme(
-    runtime: &EngineRuntime,
-    dataset: &Dataset,
-    row_indexes: &[usize],
-    expr: &Expr,
-    params: &[Value],
-    ctes: &BTreeMap<String, Dataset>,
-    want_min: bool,
-) -> Result<Value> {
-    let mut current: Option<Value> = None;
-    for row_index in row_indexes {
-        let row = dataset
-            .rows
-            .get(*row_index)
-            .map(Vec::as_slice)
-            .ok_or_else(|| DbError::internal("group row index is invalid"))?;
-        let value = runtime.eval_expr(expr, dataset, row, params, ctes, None)?;
-        if matches!(value, Value::Null) {
-            continue;
-        }
-        match &current {
-            Some(existing) => {
-                let ordering = compare_values(&value, existing)?;
-                if (want_min && ordering == std::cmp::Ordering::Less)
-                    || (!want_min && ordering == std::cmp::Ordering::Greater)
-                {
-                    current = Some(value);
-                }
-            }
-            None => current = Some(value),
-        }
-    }
-    Ok(current.unwrap_or(Value::Null))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn eval_fulltext_match(
-    runtime: &EngineRuntime,
-    args: &[Expr],
-    dataset: &Dataset,
-    row: &[Value],
-    params: &[Value],
-    ctes: &BTreeMap<String, Dataset>,
-    excluded: Option<&Dataset>,
-) -> Result<Value> {
-    if args.len() != 2 {
-        return Err(DbError::sql("FULLTEXT_MATCH expects 2 arguments"));
-    }
-    let index_value = runtime.eval_expr(&args[0], dataset, row, params, ctes, excluded)?;
-    let query_value = runtime.eval_expr(&args[1], dataset, row, params, ctes, excluded)?;
-    let Some(index_name) = expect_text_arg("FULLTEXT_MATCH", "first", &index_value)? else {
-        return Ok(Value::Null);
-    };
-    let Some(query_text) = expect_text_arg("FULLTEXT_MATCH", "second", &query_value)? else {
-        return Ok(Value::Null);
-    };
-    let (index_schema, fulltext) = fulltext_runtime_index(runtime, index_name)?;
-    let row_id = resolve_fulltext_row_id(dataset, row, index_schema)?;
-    let row_id_u64 = u64::try_from(row_id).map_err(|_| {
-        DbError::internal(format!(
-            "fulltext index {} received negative row id {row_id}",
-            index_schema.name
-        ))
-    })?;
-    let matched = fulltext
-        .matches_query(row_id_u64, query_text)
-        .map_err(|error| DbError::sql(error.message))?;
-    let mut context = runtime
-        .fts_eval_context
-        .lock()
-        .map_err(|_| DbError::internal("fulltext evaluation context lock poisoned"))?;
-    let key = (index_schema.name.clone(), row_id);
-    if matched {
-        let score = fulltext
-            .score_query(row_id_u64, query_text)
-            .map_err(|error| DbError::sql(error.message))?;
-        context.scores.insert(key, score);
-    } else {
-        context.scores.remove(&key);
-    }
-    Ok(Value::Bool(matched))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn eval_bm25(
-    runtime: &EngineRuntime,
-    args: &[Expr],
-    dataset: &Dataset,
-    row: &[Value],
-    params: &[Value],
-    ctes: &BTreeMap<String, Dataset>,
-    excluded: Option<&Dataset>,
-) -> Result<Value> {
-    if args.len() != 1 {
-        return Err(DbError::sql("BM25 expects 1 argument"));
-    }
-    let index_value = runtime.eval_expr(&args[0], dataset, row, params, ctes, excluded)?;
-    let Some(index_name) = expect_text_arg("BM25", "first", &index_value)? else {
-        return Ok(Value::Null);
-    };
-    let (index_schema, _) = fulltext_runtime_index(runtime, index_name)?;
-    let Some(row_id_column_index) = fulltext_row_id_column_index(dataset, index_schema)? else {
-        return Err(DbError::sql(format!(
-            "{FTS_SEMANTIC_ERROR_PREFIX} bm25 requires fulltext_match in the same query block"
-        )));
-    };
-    let row_id = match row.get(row_id_column_index) {
-        Some(Value::Int64(row_id)) => *row_id,
-        Some(other) => {
-            return Err(DbError::internal(format!(
-                "fulltext hidden row id has unexpected value {other:?}"
-            )));
-        }
-        None => return Err(DbError::internal("row is shorter than fulltext bindings")),
-    };
-    let context = runtime
-        .fts_eval_context
-        .lock()
-        .map_err(|_| DbError::internal("fulltext evaluation context lock poisoned"))?;
-    context
-        .scores
-        .get(&(index_schema.name.clone(), row_id))
-        .copied()
-        .map(Value::Float64)
-        .ok_or_else(|| {
-            DbError::sql(format!(
-                "{FTS_SEMANTIC_ERROR_PREFIX} bm25 requires fulltext_match in the same query block"
-            ))
-        })
-}
-
-fn fulltext_runtime_index<'a>(
-    runtime: &'a EngineRuntime,
-    index_name: &str,
-) -> Result<(&'a IndexSchema, &'a FullTextIndex)> {
-    let index_schema = runtime.catalog.index(index_name).ok_or_else(|| {
-        DbError::sql(format!(
-            "{FTS_SEMANTIC_ERROR_PREFIX} unknown fulltext index {index_name}"
-        ))
-    })?;
-    if index_schema.kind != IndexKind::FullText {
-        return Err(DbError::sql(format!(
-            "{FTS_SEMANTIC_ERROR_PREFIX} index {index_name} is not a fulltext index"
-        )));
-    }
-    if !index_schema.fresh {
-        return Err(DbError::sql(format!(
-            "{FTS_SEMANTIC_ERROR_PREFIX} fulltext index {index_name} is stale"
-        )));
-    }
-    let Some(RuntimeIndex::FullText { index }) = runtime.index(&index_schema.name) else {
-        return Err(DbError::sql(format!(
-            "{FTS_SEMANTIC_ERROR_PREFIX} runtime fulltext index {index_name} is missing"
-        )));
-    };
-    Ok((index_schema, index))
-}
-
-fn resolve_fulltext_row_id(
-    dataset: &Dataset,
-    row: &[Value],
-    index_schema: &IndexSchema,
-) -> Result<i64> {
-    let column_index = fulltext_row_id_column_index(dataset, index_schema)?.ok_or_else(|| {
-        DbError::sql(format!(
-            "{FTS_SEMANTIC_ERROR_PREFIX} fulltext index {} table is not in query scope",
-            index_schema.name
-        ))
-    })?;
-    match row.get(column_index) {
-        Some(Value::Int64(row_id)) => Ok(*row_id),
-        Some(other) => Err(DbError::internal(format!(
-            "fulltext hidden row id has unexpected value {other:?}"
-        ))),
-        None => Err(DbError::internal("row is shorter than its bindings")),
-    }
-}
-
-fn fulltext_row_id_column_index(
-    dataset: &Dataset,
-    index_schema: &IndexSchema,
-) -> Result<Option<usize>> {
-    let mut matched_index = None;
-    for (column_index, binding) in dataset.columns.iter().enumerate() {
-        if !binding.hidden || !identifiers_equal(&binding.name, FTS_HIDDEN_ROW_ID_COLUMN) {
-            continue;
-        }
-        if !binding
-            .source_table
-            .as_deref()
-            .is_some_and(|source| identifiers_equal(source, &index_schema.table_name))
-        {
-            continue;
-        }
-        if matched_index.replace(column_index).is_some() {
-            return Err(DbError::sql(format!(
-                "{FTS_SEMANTIC_ERROR_PREFIX} fulltext index {} matches more than one table instance in this query",
-                index_schema.name
-            )));
-        }
-    }
-    Ok(matched_index)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn eval_function(
-    runtime: &EngineRuntime,
-    name: &str,
-    args: &[Expr],
-    dataset: &Dataset,
-    row: &[Value],
-    params: &[Value],
-    ctes: &BTreeMap<String, Dataset>,
-    excluded: Option<&Dataset>,
-) -> Result<Value> {
-    if name.eq_ignore_ascii_case("fulltext_match") {
-        return eval_fulltext_match(runtime, args, dataset, row, params, ctes, excluded);
-    }
-    if name.eq_ignore_ascii_case("bm25") {
-        return eval_bm25(runtime, args, dataset, row, params, ctes, excluded);
-    }
-
-    let values = args
-        .iter()
-        .map(|expr| runtime.eval_expr(expr, dataset, row, params, ctes, excluded))
-        .collect::<Result<Vec<_>>>()?;
-    match name {
-        "current_database" | "current_schema" | "database" | "schema" => {
-            if !values.is_empty() {
-                return Err(DbError::sql(format!(
-                    "{} expects 0 arguments",
-                    name.to_ascii_uppercase()
-                )));
-            }
-            Ok(Value::Text("main".to_string()))
-        }
-        "current_audit_context" => {
-            if values.len() != 1 {
-                return Err(DbError::sql("CURRENT_AUDIT_CONTEXT expects 1 argument"));
-            }
-            let Some(key) = expect_text_arg("CURRENT_AUDIT_CONTEXT", "first", &values[0])? else {
-                return Ok(Value::Null);
-            };
-            Ok(runtime
-                .audit_context
-                .lock()
-                .map_err(|_| DbError::internal("audit context lock poisoned"))?
-                .get(key)
-                .unwrap_or(Value::Null))
-        }
-        "current_tenant" => {
-            if !values.is_empty() {
-                return Err(DbError::sql("CURRENT_TENANT expects 0 arguments"));
-            }
-            Ok(runtime
-                .audit_context
-                .lock()
-                .map_err(|_| DbError::internal("audit context lock poisoned"))?
-                .tenant()
-                .unwrap_or(Value::Null))
-        }
-        "current_actor" => {
-            if !values.is_empty() {
-                return Err(DbError::sql("CURRENT_ACTOR expects 0 arguments"));
-            }
-            Ok(runtime
-                .audit_context
-                .lock()
-                .map_err(|_| DbError::internal("audit context lock poisoned"))?
-                .actor()
-                .unwrap_or(Value::Null))
-        }
-        "version" => {
-            if !values.is_empty() {
-                return Err(DbError::sql("VERSION expects 0 arguments"));
-            }
-            Ok(Value::Text(format!(
-                "DecentDB {}",
-                env!("CARGO_PKG_VERSION")
-            )))
-        }
-        "sqlite_version" => Err(DbError::sql(
-            "sqlite_version() is not supported; DecentDB is not SQLite",
-        )),
-        "pg_backend_pid" => Err(DbError::sql(
-            "pg_backend_pid() is not supported; DecentDB is embedded and has no server backend PID",
-        )),
-        "coalesce" => Ok(values
-            .into_iter()
-            .find(|value| !matches!(value, Value::Null))
-            .unwrap_or(Value::Null)),
-        "nullif" => {
-            if values.len() != 2 {
-                return Err(DbError::sql("NULLIF expects two arguments"));
-            }
-            if compare_values(&values[0], &values[1])? == std::cmp::Ordering::Equal {
-                Ok(Value::Null)
-            } else {
-                Ok(values[0].clone())
-            }
-        }
-        "greatest" => eval_greatest_least(&values, true),
-        "least" => eval_greatest_least(&values, false),
-        "iif" => eval_iif(&values),
-        "concat" => {
-            let mut output = String::new();
-            for value in &values {
-                if matches!(value, Value::Null) {
-                    continue;
-                }
-                output.push_str(&value_to_text(value)?);
-            }
-            Ok(Value::Text(output))
-        }
-        "concat_ws" => {
-            if values.is_empty() {
-                return Err(DbError::sql("CONCAT_WS expects at least 1 argument"));
-            }
-            let Some(separator) = expect_text_arg("CONCAT_WS", "first", &values[0])? else {
-                return Ok(Value::Null);
-            };
-            let mut parts = Vec::new();
-            for value in &values[1..] {
-                if matches!(value, Value::Null) {
-                    continue;
-                }
-                parts.push(value_to_text(value)?);
-            }
-            Ok(Value::Text(parts.join(separator)))
-        }
-        "lower" => unary_text_fn(values, |value| value.to_ascii_lowercase()),
-        "upper" => unary_text_fn(values, |value| value.to_ascii_uppercase()),
-        "trim" | "pg_catalog.btrim" => unary_text_fn(values, |value| value.trim().to_string()),
-        "ltrim" | "pg_catalog.ltrim" => {
-            unary_text_fn(values, |value| value.trim_start().to_string())
-        }
-        "rtrim" | "pg_catalog.rtrim" => unary_text_fn(values, |value| value.trim_end().to_string()),
-        "position" | "pg_catalog.position" => {
-            if values.len() != 2 {
-                return Err(DbError::sql("POSITION expects 2 arguments"));
-            }
-            let Some(haystack) = expect_text_arg("POSITION", "first", &values[0])? else {
-                return Ok(Value::Null);
-            };
-            let Some(needle) = expect_text_arg("POSITION", "second", &values[1])? else {
-                return Ok(Value::Null);
-            };
-            if needle.is_empty() {
-                return Ok(Value::Int64(1));
-            }
-            if let Some(idx) = haystack.find(needle) {
-                let char_idx = haystack[..idx].chars().count();
-                Ok(Value::Int64((char_idx + 1) as i64))
-            } else {
-                Ok(Value::Int64(0))
-            }
-        }
-        "initcap" => {
-            if values.len() != 1 {
-                return Err(DbError::sql("INITCAP expects 1 argument"));
-            }
-            let Some(value) = expect_text_arg("INITCAP", "first", &values[0])? else {
-                return Ok(Value::Null);
-            };
-            let mut output = String::with_capacity(value.len());
-            let mut start_of_word = true;
-            for ch in value.chars() {
-                if ch.is_alphanumeric() {
-                    if start_of_word {
-                        for upper in ch.to_uppercase() {
-                            output.push(upper);
-                        }
-                        start_of_word = false;
-                    } else {
-                        for lower in ch.to_lowercase() {
-                            output.push(lower);
-                        }
-                    }
-                } else {
-                    start_of_word = true;
-                    output.push(ch);
-                }
-            }
-            Ok(Value::Text(output))
-        }
-        "ascii" => {
-            if values.len() != 1 {
-                return Err(DbError::sql("ASCII expects 1 argument"));
-            }
-            let Some(value) = expect_text_arg("ASCII", "first", &values[0])? else {
-                return Ok(Value::Null);
-            };
-            Ok(Value::Int64(
-                value
-                    .chars()
-                    .next()
-                    .map_or(0_i64, |ch| i64::from(ch as u32)),
-            ))
-        }
-        "length" => {
-            if values.len() != 1 {
-                return Err(DbError::sql("LENGTH expects one argument"));
-            }
-            match &values[0] {
-                Value::Text(value) => Ok(Value::Int64(value.chars().count() as i64)),
-                Value::Blob(value) => Ok(Value::Int64(value.len() as i64)),
-                Value::Null => Ok(Value::Null),
-                other => Err(DbError::sql(format!(
-                    "LENGTH expects text or blob, got {other:?}"
-                ))),
-            }
-        }
-        "substr" | "substring" => {
-            if values.len() < 2 || values.len() > 3 {
-                return Err(DbError::sql("SUBSTR expects 2 or 3 arguments"));
-            }
-            if matches!(values[0], Value::Null) || matches!(values[1], Value::Null) {
-                return Ok(Value::Null);
-            }
-            if values.len() == 3 && matches!(values[2], Value::Null) {
-                return Ok(Value::Null);
-            }
-            let s = match &values[0] {
-                Value::Text(s) => s,
-                _ => return Err(DbError::sql("SUBSTR expects text for first argument")),
-            };
-            let start = match &values[1] {
-                Value::Int64(i) => *i,
-                _ => return Err(DbError::sql("SUBSTR expects int for second argument")),
-            };
-            let length = if values.len() == 3 {
-                match &values[2] {
-                    Value::Int64(i) => Some(*i),
-                    _ => return Err(DbError::sql("SUBSTR expects int for third argument")),
-                }
-            } else {
-                None
-            };
-
-            let char_idx = if start > 0 { start - 1 } else { 0 } as usize;
-            let chars = s.chars().skip(char_idx);
-            if let Some(l) = length {
-                let len = if l > 0 { l as usize } else { 0 };
-                Ok(Value::Text(chars.take(len).collect()))
-            } else {
-                Ok(Value::Text(chars.collect()))
-            }
-        }
-        "replace" => {
-            if values.len() != 3 {
-                return Err(DbError::sql("REPLACE expects 3 arguments"));
-            }
-            if matches!(values[0], Value::Null)
-                || matches!(values[1], Value::Null)
-                || matches!(values[2], Value::Null)
-            {
-                return Ok(Value::Null);
-            }
-            let s = match &values[0] {
-                Value::Text(s) => s,
-                _ => return Err(DbError::sql("REPLACE expects text for first argument")),
-            };
-            let target = match &values[1] {
-                Value::Text(s) => s,
-                _ => return Err(DbError::sql("REPLACE expects text for second argument")),
-            };
-            let replacement = match &values[2] {
-                Value::Text(s) => s,
-                _ => return Err(DbError::sql("REPLACE expects text for third argument")),
-            };
-            Ok(Value::Text(s.replace(target, replacement)))
-        }
-        "regexp_replace" => {
-            if values.len() < 3 || values.len() > 4 {
-                return Err(DbError::sql("REGEXP_REPLACE expects 3 or 4 arguments"));
-            }
-            let Some(input) = expect_text_arg("REGEXP_REPLACE", "first", &values[0])? else {
-                return Ok(Value::Null);
-            };
-            let Some(pattern) = expect_text_arg("REGEXP_REPLACE", "second", &values[1])? else {
-                return Ok(Value::Null);
-            };
-            let Some(replacement) = expect_text_arg("REGEXP_REPLACE", "third", &values[2])? else {
-                return Ok(Value::Null);
-            };
-            let flags = if let Some(flag_value) = values.get(3) {
-                let Some(flags) = expect_text_arg("REGEXP_REPLACE", "fourth", flag_value)? else {
-                    return Ok(Value::Null);
-                };
-                Some(flags)
-            } else {
-                None
-            };
-            Ok(Value::Text(eval_regexp_replace(
-                input,
-                pattern,
-                replacement,
-                flags,
-            )?))
-        }
-        "split_part" => {
-            if values.len() != 3 {
-                return Err(DbError::sql("SPLIT_PART expects 3 arguments"));
-            }
-            let Some(value) = expect_text_arg("SPLIT_PART", "first", &values[0])? else {
-                return Ok(Value::Null);
-            };
-            let Some(delimiter) = expect_text_arg("SPLIT_PART", "second", &values[1])? else {
-                return Ok(Value::Null);
-            };
-            let Some(index) = expect_int_arg("SPLIT_PART", "third", &values[2])? else {
-                return Ok(Value::Null);
-            };
-            if index <= 0 {
-                return Err(DbError::sql("SPLIT_PART index must be greater than 0"));
-            }
-            if delimiter.is_empty() {
-                if index == 1 {
-                    return Ok(Value::Text(value.to_string()));
-                }
-                return Ok(Value::Text(String::new()));
-            }
-            let index = usize::try_from(index - 1)
-                .map_err(|_| DbError::sql("SPLIT_PART index is out of range"))?;
-            Ok(Value::Text(
-                value
-                    .split(delimiter)
-                    .nth(index)
-                    .unwrap_or_default()
-                    .to_string(),
-            ))
-        }
-        "string_to_array" => {
-            if values.len() != 2 {
-                return Err(DbError::sql("STRING_TO_ARRAY expects 2 arguments"));
-            }
-            let Some(value) = expect_text_arg("STRING_TO_ARRAY", "first", &values[0])? else {
-                return Ok(Value::Null);
-            };
-            let Some(delimiter) = expect_text_arg("STRING_TO_ARRAY", "second", &values[1])? else {
-                return Ok(Value::Null);
-            };
-            let array = if delimiter.is_empty() {
-                JsonValue::Array(vec![JsonValue::String(value.to_string())])
-            } else {
-                JsonValue::Array(
-                    value
-                        .split(delimiter)
-                        .map(|part| JsonValue::String(part.to_string()))
-                        .collect::<Vec<_>>(),
-                )
-            };
-            Ok(Value::Text(array.render_json()))
-        }
-        "quote_ident" => {
-            if values.len() != 1 {
-                return Err(DbError::sql("QUOTE_IDENT expects 1 argument"));
-            }
-            let Some(identifier) = expect_text_arg("QUOTE_IDENT", "first", &values[0])? else {
-                return Ok(Value::Null);
-            };
-            Ok(Value::Text(format!(
-                "\"{}\"",
-                identifier.replace('"', "\"\"")
-            )))
-        }
-        "quote_literal" => {
-            if values.len() != 1 {
-                return Err(DbError::sql("QUOTE_LITERAL expects 1 argument"));
-            }
-            let Some(literal) = expect_text_arg("QUOTE_LITERAL", "first", &values[0])? else {
-                return Ok(Value::Null);
-            };
-            Ok(Value::Text(format!("'{}'", literal.replace('\'', "''"))))
-        }
-        "md5" => {
-            if values.len() != 1 {
-                return Err(DbError::sql("MD5 expects 1 argument"));
-            }
-            let Some(value) = expect_text_arg("MD5", "first", &values[0])? else {
-                return Ok(Value::Null);
-            };
-            Ok(Value::Text(format!("{:x}", md5::compute(value.as_bytes()))))
-        }
-        "sha256" => {
-            if values.len() != 1 {
-                return Err(DbError::sql("SHA256 expects 1 argument"));
-            }
-            let Some(value) = expect_text_arg("SHA256", "first", &values[0])? else {
-                return Ok(Value::Null);
-            };
-            let digest = <sha2::Sha256 as sha2::Digest>::digest(value.as_bytes());
-            Ok(Value::Text(hex_encode_lower(&digest)))
-        }
-        "instr" => {
-            if values.len() != 2 {
-                return Err(DbError::sql("INSTR expects 2 arguments"));
-            }
-            if matches!(values[0], Value::Null) || matches!(values[1], Value::Null) {
-                return Ok(Value::Null);
-            }
-            let s = match &values[0] {
-                Value::Text(s) => s,
-                _ => return Err(DbError::sql("INSTR expects text for first argument")),
-            };
-            let target = match &values[1] {
-                Value::Text(s) => s,
-                _ => return Err(DbError::sql("INSTR expects text for second argument")),
-            };
-            match s.find(target) {
-                Some(idx) => {
-                    let char_idx = s[..idx].chars().count();
-                    Ok(Value::Int64((char_idx + 1) as i64))
-                }
-                None => Ok(Value::Int64(0)),
-            }
-        }
-        "left" => {
-            if values.len() != 2 {
-                return Err(DbError::sql("LEFT expects 2 arguments"));
-            }
-            let Some(value) = expect_text_arg("LEFT", "first", &values[0])? else {
-                return Ok(Value::Null);
-            };
-            let Some(length) = expect_int_arg("LEFT", "second", &values[1])? else {
-                return Ok(Value::Null);
-            };
-            Ok(Value::Text(take_left_chars(
-                value,
-                non_negative_usize(length, "LEFT", "second")?,
-            )))
-        }
-        "right" => {
-            if values.len() != 2 {
-                return Err(DbError::sql("RIGHT expects 2 arguments"));
-            }
-            let Some(value) = expect_text_arg("RIGHT", "first", &values[0])? else {
-                return Ok(Value::Null);
-            };
-            let Some(length) = expect_int_arg("RIGHT", "second", &values[1])? else {
-                return Ok(Value::Null);
-            };
-            Ok(Value::Text(take_right_chars(
-                value,
-                non_negative_usize(length, "RIGHT", "second")?,
-            )))
-        }
-        "lpad" => {
-            if values.len() != 3 {
-                return Err(DbError::sql("LPAD expects 3 arguments"));
-            }
-            let Some(value) = expect_text_arg("LPAD", "first", &values[0])? else {
-                return Ok(Value::Null);
-            };
-            let Some(target_len) = expect_int_arg("LPAD", "second", &values[1])? else {
-                return Ok(Value::Null);
-            };
-            let Some(pad) = expect_text_arg("LPAD", "third", &values[2])? else {
-                return Ok(Value::Null);
-            };
-            Ok(Value::Text(pad_left(value, target_len, pad)))
-        }
-        "rpad" => {
-            if values.len() != 3 {
-                return Err(DbError::sql("RPAD expects 3 arguments"));
-            }
-            let Some(value) = expect_text_arg("RPAD", "first", &values[0])? else {
-                return Ok(Value::Null);
-            };
-            let Some(target_len) = expect_int_arg("RPAD", "second", &values[1])? else {
-                return Ok(Value::Null);
-            };
-            let Some(pad) = expect_text_arg("RPAD", "third", &values[2])? else {
-                return Ok(Value::Null);
-            };
-            Ok(Value::Text(pad_right(value, target_len, pad)))
-        }
-        "repeat" => {
-            if values.len() != 2 {
-                return Err(DbError::sql("REPEAT expects 2 arguments"));
-            }
-            let Some(value) = expect_text_arg("REPEAT", "first", &values[0])? else {
-                return Ok(Value::Null);
-            };
-            let Some(count) = expect_int_arg("REPEAT", "second", &values[1])? else {
-                return Ok(Value::Null);
-            };
-            let count = non_negative_usize(count, "REPEAT", "second")?;
-            Ok(Value::Text(value.repeat(count)))
-        }
-        "reverse" => {
-            if values.len() != 1 {
-                return Err(DbError::sql("REVERSE expects 1 argument"));
-            }
-            let Some(value) = expect_text_arg("REVERSE", "first", &values[0])? else {
-                return Ok(Value::Null);
-            };
-            Ok(Value::Text(value.chars().rev().collect()))
-        }
-        "chr" | "char" => {
-            if values.len() != 1 {
-                return Err(DbError::sql("CHR expects 1 argument"));
-            }
-            let Some(codepoint) = expect_int_arg("CHR", "first", &values[0])? else {
-                return Ok(Value::Null);
-            };
-            let codepoint = u32::try_from(codepoint)
-                .map_err(|_| DbError::sql("CHR code point must be between 0 and 1114111"))?;
-            let ch = char::from_u32(codepoint)
-                .ok_or_else(|| DbError::sql("CHR code point must be between 0 and 1114111"))?;
-            Ok(Value::Text(ch.to_string()))
-        }
-        "hex" => {
-            if values.len() != 1 {
-                return Err(DbError::sql("HEX expects 1 argument"));
-            }
-            match &values[0] {
-                Value::Null => Ok(Value::Null),
-                Value::Text(value) => Ok(Value::Text(hex_encode_upper(value.as_bytes()))),
-                Value::Blob(value) => Ok(Value::Text(hex_encode_upper(value))),
-                Value::Uuid(value) => Ok(Value::Text(hex_encode_upper(value))),
-                other => Err(DbError::sql(format!(
-                    "HEX expects text, BLOB, or UUID, got {other:?}"
-                ))),
-            }
-        }
-        "abs" => {
-            if values.len() != 1 {
-                return Err(DbError::sql("ABS expects 1 argument"));
-            }
-            match expect_numeric_arg("ABS", "first", &values[0])? {
-                None => Ok(Value::Null),
-                Some(NumericValue::Int64(value)) => value
-                    .checked_abs()
-                    .map(Value::Int64)
-                    .ok_or_else(|| DbError::sql("ABS overflow for INT64 input")),
-                Some(NumericValue::Float64(value)) => Ok(Value::Float64(value.abs())),
-                Some(NumericValue::Decimal { scaled, scale }) => scaled
-                    .checked_abs()
-                    .map(|scaled| Value::Decimal { scaled, scale })
-                    .ok_or_else(|| DbError::sql("ABS overflow for DECIMAL input")),
-            }
-        }
-        "ceil" | "ceiling" => {
-            if values.len() != 1 {
-                return Err(DbError::sql("CEIL expects 1 argument"));
-            }
-            match expect_numeric_arg("CEIL", "first", &values[0])? {
-                None => Ok(Value::Null),
-                Some(NumericValue::Int64(value)) => Ok(Value::Int64(value)),
-                Some(value) => Ok(Value::Float64(value.as_f64().ceil())),
-            }
-        }
-        "floor" => {
-            if values.len() != 1 {
-                return Err(DbError::sql("FLOOR expects 1 argument"));
-            }
-            match expect_numeric_arg("FLOOR", "first", &values[0])? {
-                None => Ok(Value::Null),
-                Some(NumericValue::Int64(value)) => Ok(Value::Int64(value)),
-                Some(value) => Ok(Value::Float64(value.as_f64().floor())),
-            }
-        }
-        "round" => {
-            if values.is_empty() || values.len() > 2 {
-                return Err(DbError::sql("ROUND expects 1 or 2 arguments"));
-            }
-            let Some(number) = expect_numeric_arg("ROUND", "first", &values[0])? else {
-                return Ok(Value::Null);
-            };
-            let scale = if let Some(value) = values.get(1) {
-                let Some(scale) = expect_int_arg("ROUND", "second", value)? else {
-                    return Ok(Value::Null);
-                };
-                i32::try_from(scale).map_err(|_| DbError::sql("ROUND precision is out of range"))?
-            } else {
-                0
-            };
-            let factor = 10_f64.powi(scale);
-            Ok(Value::Float64((number.as_f64() * factor).round() / factor))
-        }
-        "sqrt" => {
-            if values.len() != 1 {
-                return Err(DbError::sql("SQRT expects 1 argument"));
-            }
-            let Some(number) = expect_numeric_arg("SQRT", "first", &values[0])? else {
-                return Ok(Value::Null);
-            };
-            let number = number.as_f64();
-            if number < 0.0 {
-                return Ok(Value::Null);
-            }
-            Ok(Value::Float64(number.sqrt()))
-        }
-        "power" | "pow" => {
-            if values.len() != 2 {
-                return Err(DbError::sql("POWER expects 2 arguments"));
-            }
-            let Some(base) = expect_numeric_arg("POWER", "first", &values[0])? else {
-                return Ok(Value::Null);
-            };
-            let Some(exponent) = expect_numeric_arg("POWER", "second", &values[1])? else {
-                return Ok(Value::Null);
-            };
-            Ok(Value::Float64(base.as_f64().powf(exponent.as_f64())))
-        }
-        "mod" => {
-            if values.len() != 2 {
-                return Err(DbError::sql("MOD expects 2 arguments"));
-            }
-            let Some(left) = expect_numeric_arg("MOD", "first", &values[0])? else {
-                return Ok(Value::Null);
-            };
-            let Some(right) = expect_numeric_arg("MOD", "second", &values[1])? else {
-                return Ok(Value::Null);
-            };
-            match (left, right) {
-                (_, NumericValue::Int64(0)) => Ok(Value::Null),
-                (_, NumericValue::Float64(0.0)) => Ok(Value::Null),
-                (_, NumericValue::Decimal { scaled: 0, .. }) => Ok(Value::Null),
-                (NumericValue::Int64(left), NumericValue::Int64(right)) => {
-                    Ok(Value::Int64(left % right))
-                }
-                (left, right) => Ok(Value::Float64(left.as_f64() % right.as_f64())),
-            }
-        }
-        "sign" => {
-            if values.len() != 1 {
-                return Err(DbError::sql("SIGN expects 1 argument"));
-            }
-            match expect_numeric_arg("SIGN", "first", &values[0])? {
-                None => Ok(Value::Null),
-                Some(NumericValue::Int64(value)) => Ok(Value::Int64(value.signum())),
-                Some(NumericValue::Float64(value)) => Ok(Value::Int64(if value > 0.0 {
-                    1
-                } else if value < 0.0 {
-                    -1
-                } else {
-                    0
-                })),
-                Some(NumericValue::Decimal { scaled, .. }) => Ok(Value::Int64(scaled.signum())),
-            }
-        }
-        "ln" => {
-            if values.len() != 1 {
-                return Err(DbError::sql("LN expects 1 argument"));
-            }
-            let Some(number) = expect_numeric_arg("LN", "first", &values[0])? else {
-                return Ok(Value::Null);
-            };
-            let number = number.as_f64();
-            if number <= 0.0 {
-                return Ok(Value::Null);
-            }
-            Ok(Value::Float64(number.ln()))
-        }
-        "log" => {
-            if values.is_empty() || values.len() > 2 {
-                return Err(DbError::sql("LOG expects 1 or 2 arguments"));
-            }
-            if values.len() == 1 {
-                let Some(number) = expect_numeric_arg("LOG", "first", &values[0])? else {
-                    return Ok(Value::Null);
-                };
-                let number = number.as_f64();
-                if number <= 0.0 {
-                    return Ok(Value::Null);
-                }
-                return Ok(Value::Float64(number.log10()));
-            }
-            let Some(base) = expect_numeric_arg("LOG", "first", &values[0])? else {
-                return Ok(Value::Null);
-            };
-            let Some(number) = expect_numeric_arg("LOG", "second", &values[1])? else {
-                return Ok(Value::Null);
-            };
-            let base = base.as_f64();
-            let number = number.as_f64();
-            if base <= 0.0 || base == 1.0 || number <= 0.0 {
-                return Ok(Value::Null);
-            }
-            Ok(Value::Float64(number.log(base)))
-        }
-        "exp" => {
-            if values.len() != 1 {
-                return Err(DbError::sql("EXP expects 1 argument"));
-            }
-            let Some(number) = expect_numeric_arg("EXP", "first", &values[0])? else {
-                return Ok(Value::Null);
-            };
-            Ok(Value::Float64(number.as_f64().exp()))
-        }
-        "sin" => {
-            if values.len() != 1 {
-                return Err(DbError::sql("SIN expects 1 argument"));
-            }
-            let Some(number) = expect_numeric_arg("SIN", "first", &values[0])? else {
-                return Ok(Value::Null);
-            };
-            Ok(Value::Float64(number.as_f64().sin()))
-        }
-        "cos" => {
-            if values.len() != 1 {
-                return Err(DbError::sql("COS expects 1 argument"));
-            }
-            let Some(number) = expect_numeric_arg("COS", "first", &values[0])? else {
-                return Ok(Value::Null);
-            };
-            Ok(Value::Float64(number.as_f64().cos()))
-        }
-        "tan" => {
-            if values.len() != 1 {
-                return Err(DbError::sql("TAN expects 1 argument"));
-            }
-            let Some(number) = expect_numeric_arg("TAN", "first", &values[0])? else {
-                return Ok(Value::Null);
-            };
-            let radians = number.as_f64();
-            if radians.cos().abs() < 1e-12 {
-                return Ok(Value::Null);
-            }
-            Ok(Value::Float64(radians.tan()))
-        }
-        "asin" => {
-            if values.len() != 1 {
-                return Err(DbError::sql("ASIN expects 1 argument"));
-            }
-            let Some(number) = expect_numeric_arg("ASIN", "first", &values[0])? else {
-                return Ok(Value::Null);
-            };
-            let value = number.as_f64();
-            if !(-1.0..=1.0).contains(&value) {
-                return Ok(Value::Null);
-            }
-            Ok(Value::Float64(value.asin()))
-        }
-        "acos" => {
-            if values.len() != 1 {
-                return Err(DbError::sql("ACOS expects 1 argument"));
-            }
-            let Some(number) = expect_numeric_arg("ACOS", "first", &values[0])? else {
-                return Ok(Value::Null);
-            };
-            let value = number.as_f64();
-            if !(-1.0..=1.0).contains(&value) {
-                return Ok(Value::Null);
-            }
-            Ok(Value::Float64(value.acos()))
-        }
-        "atan" => {
-            if values.len() != 1 {
-                return Err(DbError::sql("ATAN expects 1 argument"));
-            }
-            let Some(number) = expect_numeric_arg("ATAN", "first", &values[0])? else {
-                return Ok(Value::Null);
-            };
-            Ok(Value::Float64(number.as_f64().atan()))
-        }
-        "atan2" => {
-            if values.len() != 2 {
-                return Err(DbError::sql("ATAN2 expects 2 arguments"));
-            }
-            let Some(y) = expect_numeric_arg("ATAN2", "first", &values[0])? else {
-                return Ok(Value::Null);
-            };
-            let Some(x) = expect_numeric_arg("ATAN2", "second", &values[1])? else {
-                return Ok(Value::Null);
-            };
-            Ok(Value::Float64(y.as_f64().atan2(x.as_f64())))
-        }
-        "pi" => {
-            if !values.is_empty() {
-                return Err(DbError::sql("PI expects 0 arguments"));
-            }
-            Ok(Value::Float64(std::f64::consts::PI))
-        }
-        "degrees" => {
-            if values.len() != 1 {
-                return Err(DbError::sql("DEGREES expects 1 argument"));
-            }
-            let Some(number) = expect_numeric_arg("DEGREES", "first", &values[0])? else {
-                return Ok(Value::Null);
-            };
-            Ok(Value::Float64(number.as_f64().to_degrees()))
-        }
-        "radians" => {
-            if values.len() != 1 {
-                return Err(DbError::sql("RADIANS expects 1 argument"));
-            }
-            let Some(number) = expect_numeric_arg("RADIANS", "first", &values[0])? else {
-                return Ok(Value::Null);
-            };
-            Ok(Value::Float64(number.as_f64().to_radians()))
-        }
-        "cot" => {
-            if values.len() != 1 {
-                return Err(DbError::sql("COT expects 1 argument"));
-            }
-            let Some(number) = expect_numeric_arg("COT", "first", &values[0])? else {
-                return Ok(Value::Null);
-            };
-            let tan = number.as_f64().tan();
-            if tan.abs() < 1e-12 {
-                return Ok(Value::Null);
-            }
-            Ok(Value::Float64(1.0 / tan))
-        }
-        "random" => {
-            if !values.is_empty() {
-                return Err(DbError::sql("RANDOM expects 0 arguments"));
-            }
-            Ok(Value::Float64(next_random_f64()))
-        }
-        "now" | "current_timestamp" | "localtimestamp" => eval_current_timestamp(values),
-        "current_date" => eval_current_date(values),
-        "current_time" | "localtime" => eval_current_time(values),
-        "date_trunc" => eval_date_trunc(values),
-        "date_part" | "pg_catalog.date_part" => eval_date_part(values),
-        "date_diff" => eval_date_diff(values),
-        "last_day" => eval_last_day(values),
-        "next_day" => eval_next_day(values),
-        "make_date" => eval_make_date(values),
-        "make_timestamp" => eval_make_timestamp(values),
-        "to_timestamp" => eval_to_timestamp(values),
-        "interval" => eval_interval(values),
-        "age" => eval_age(values),
-        "date" => eval_date(values),
-        "datetime" => eval_datetime(values),
-        "strftime" => eval_strftime(values),
-        "extract" | "pg_catalog.extract" => eval_extract(values),
-        "gen_random_uuid" => eval_gen_random_uuid(values),
-        "uuid_parse" => eval_uuid_parse(values),
-        "uuid_to_string" => eval_uuid_to_string(values),
-        "json_array" | "pg_catalog.json_array" => eval_json_array(values),
-        "json_array_length" => eval_json_array_length(values),
-        "json_extract" => eval_json_extract(values),
-        "json_object" | "pg_catalog.json_object" => eval_json_object(values),
-        "json_type" | "pg_catalog.json_type" => eval_json_type(values),
-        "json_valid" | "pg_catalog.json_valid" => eval_json_valid(values),
-        "st_point" | "st_makepoint" => eval_spatial_point_constructor(&values, false, false),
-        "st_pointz" => eval_spatial_point_constructor(&values, false, true),
-        "st_pointm" => eval_spatial_point_m_constructor(&values, false),
-        "st_pointzm" => eval_spatial_point_zm_constructor(&values, false),
-        "st_geogpoint" => eval_spatial_point_constructor(&values, true, false),
-        "st_geogpointz" => eval_spatial_point_constructor(&values, true, true),
-        "st_geogpointm" => eval_spatial_point_m_constructor(&values, true),
-        "st_geogpointzm" => eval_spatial_point_zm_constructor(&values, true),
-        "st_asbinary" => eval_spatial_as_binary(&values),
-        "st_astext" => eval_spatial_as_text(&values),
-        "st_asgeojson" => eval_spatial_as_geojson(&values),
-        "st_srid" => eval_spatial_srid(&values),
-        "st_geometrytype" => eval_spatial_geometry_type(&values),
-        "st_x" => eval_spatial_point_accessor(&values, SpatialAccessor::X),
-        "st_y" => eval_spatial_point_accessor(&values, SpatialAccessor::Y),
-        "st_z" => eval_spatial_point_accessor(&values, SpatialAccessor::Z),
-        "st_m" => eval_spatial_point_accessor(&values, SpatialAccessor::M),
-        "st_setsrid" => eval_spatial_set_srid(&values),
-        "st_isvalid" => eval_spatial_is_valid(&values),
-        "st_distance" => eval_spatial_distance(&values),
-        "st_dwithin" => eval_spatial_dwithin(&values),
-        "st_intersects" => eval_spatial_predicate(&values, SpatialPredicate::Intersects),
-        "st_contains" => eval_spatial_predicate(&values, SpatialPredicate::Contains),
-        "st_within" => eval_spatial_predicate(&values, SpatialPredicate::Within),
-        "st_equals" => eval_spatial_predicate(&values, SpatialPredicate::Equals),
-        "st_length" => eval_spatial_length(&values),
-        "st_area" => eval_spatial_area(&values),
-        "st_geomfromwkb" => eval_spatial_from_wkb(&values, false),
-        "st_geogfromwkb" => eval_spatial_from_wkb(&values, true),
-        "st_geomfromtext" => eval_spatial_from_text(&values, false),
-        "st_geogfromtext" => eval_spatial_from_text(&values, true),
-        "st_geomfromgeojson" => eval_spatial_from_geojson(&values, false),
-        "st_geogfromgeojson" => eval_spatial_from_geojson(&values, true),
-        other => {
-            if let Some(value) =
-                crate::extensions::invoke_scalar_from_runtime(runtime, other, &values)?
-            {
-                return Ok(value);
-            }
-            Err(DbError::sql(format!("unsupported scalar function {other}")))
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-enum SpatialAccessor {
-    X,
-    Y,
-    Z,
-    M,
-}
-
-#[derive(Clone, Copy)]
-enum SpatialPredicate {
-    Intersects,
-    Contains,
-    Within,
-    Equals,
-}
-
-fn spatial_error(error: SpatialError) -> DbError {
-    DbError::sql(error.to_string())
-}
-
-fn eval_spatial_point_constructor(
-    values: &[Value],
-    geography: bool,
-    with_z: bool,
-) -> Result<Value> {
-    let expected = if with_z { 3 } else { 2 };
-    if values.len() != expected {
-        return Err(DbError::sql(format!(
-            "{} expects {expected} arguments",
-            if geography {
-                "ST_GeogPoint"
-            } else {
-                "ST_Point"
-            }
-        )));
-    }
-    if values.iter().any(|value| matches!(value, Value::Null)) {
-        return Ok(Value::Null);
-    }
-    let x = numeric_value_as_f64("spatial point", "first", &values[0])?;
-    let y = numeric_value_as_f64("spatial point", "second", &values[1])?;
-    let z = if with_z {
-        Some(numeric_value_as_f64("spatial point", "third", &values[2])?)
-    } else {
-        None
-    };
-    let dimensions = if with_z {
-        CoordinateDimensions::Xyz
-    } else {
-        CoordinateDimensions::Xy
-    };
-    spatial_point_value(geography, x, y, z, None, dimensions)
-}
-
-fn eval_spatial_point_m_constructor(values: &[Value], geography: bool) -> Result<Value> {
-    if values.len() != 3 {
-        return Err(DbError::sql(if geography {
-            "ST_GeogPointM expects 3 arguments"
-        } else {
-            "ST_PointM expects 3 arguments"
-        }));
-    }
-    if values.iter().any(|value| matches!(value, Value::Null)) {
-        return Ok(Value::Null);
-    }
-    let x = numeric_value_as_f64("spatial point", "first", &values[0])?;
-    let y = numeric_value_as_f64("spatial point", "second", &values[1])?;
-    let m = numeric_value_as_f64("spatial point", "third", &values[2])?;
-    spatial_point_value(geography, x, y, None, Some(m), CoordinateDimensions::Xym)
-}
-
-fn eval_spatial_point_zm_constructor(values: &[Value], geography: bool) -> Result<Value> {
-    if values.len() != 4 {
-        return Err(DbError::sql(if geography {
-            "ST_GeogPointZM expects 4 arguments"
-        } else {
-            "ST_PointZM expects 4 arguments"
-        }));
-    }
-    if values.iter().any(|value| matches!(value, Value::Null)) {
-        return Ok(Value::Null);
-    }
-    let x = numeric_value_as_f64("spatial point", "first", &values[0])?;
-    let y = numeric_value_as_f64("spatial point", "second", &values[1])?;
-    let z = numeric_value_as_f64("spatial point", "third", &values[2])?;
-    let m = numeric_value_as_f64("spatial point", "fourth", &values[3])?;
-    spatial_point_value(
-        geography,
-        x,
-        y,
-        Some(z),
-        Some(m),
-        CoordinateDimensions::Xyzm,
-    )
-}
-
-fn spatial_point_value(
-    geography: bool,
-    x: f64,
-    y: f64,
-    z: Option<f64>,
-    m: Option<f64>,
-    dimensions: CoordinateDimensions,
-) -> Result<Value> {
-    let position = Position::for_dimensions(x, y, z, m, dimensions).map_err(spatial_error)?;
-    let value = SpatialValue::new(
-        if geography { 4326 } else { 0 },
-        dimensions,
-        SpatialGeometry::Point(position),
-    )
-    .map_err(spatial_error)?;
-    validate_spatial_value(&value, geography)?;
-    let bytes = crate::spatial::ewkb::to_ewkb(&value);
-    Ok(if geography {
-        Value::Geography(bytes)
-    } else {
-        Value::Geometry(bytes)
-    })
-}
-
-fn eval_spatial_from_wkb(values: &[Value], geography: bool) -> Result<Value> {
-    let valid_arity = if geography {
-        values.len() == 1
-    } else {
-        values.len() == 1 || values.len() == 2
-    };
-    if !valid_arity {
-        return Err(DbError::sql(if geography {
-            "ST_GeogFromWKB expects 1 argument"
-        } else {
-            "ST_GeomFromWKB expects 1 or 2 arguments"
-        }));
-    }
-    if values.iter().any(|value| matches!(value, Value::Null)) {
-        return Ok(Value::Null);
-    }
-    let bytes = expect_blob_arg(
-        if geography {
-            "ST_GeogFromWKB"
-        } else {
-            "ST_GeomFromWKB"
-        },
-        "first",
-        &values[0],
-    )?;
-    let default_srid = if geography {
-        4326
-    } else if values.len() == 2 {
-        u32::try_from(expect_int_arg("ST_GeomFromWKB", "second", &values[1])?.unwrap_or(0))
-            .map_err(|_| DbError::sql("ST_GeomFromWKB SRID must be non-negative"))?
-    } else {
-        0
-    };
-    let mut spatial = crate::spatial::ewkb::from_wkb_with_default_srid(bytes, default_srid)
-        .map_err(spatial_error)?;
-    if !geography && values.len() == 2 && spatial.srid != default_srid {
-        return Err(DbError::sql(
-            "ST_GeomFromWKB explicit SRID does not match EWKB SRID",
-        ));
-    }
-    if geography {
-        spatial.srid = 4326;
-    }
-    validate_spatial_value(&spatial, geography)?;
-    let bytes = crate::spatial::ewkb::to_ewkb(&spatial);
-    Ok(if geography {
-        Value::Geography(bytes)
-    } else {
-        Value::Geometry(bytes)
-    })
-}
-
-fn eval_spatial_from_text(values: &[Value], geography: bool) -> Result<Value> {
-    let valid_arity = if geography {
-        values.len() == 1
-    } else {
-        values.len() == 1 || values.len() == 2
-    };
-    if !valid_arity {
-        return Err(DbError::sql(if geography {
-            "ST_GeogFromText expects 1 argument"
-        } else {
-            "ST_GeomFromText expects 1 or 2 arguments"
-        }));
-    }
-    if values.iter().any(|value| matches!(value, Value::Null)) {
-        return Ok(Value::Null);
-    }
-    let Some(text) = expect_text_arg(
-        if geography {
-            "ST_GeogFromText"
-        } else {
-            "ST_GeomFromText"
-        },
-        "first",
-        &values[0],
-    )?
-    else {
-        return Ok(Value::Null);
-    };
-    let default_srid = if geography {
-        4326
-    } else if values.len() == 2 {
-        u32::try_from(expect_int_arg("ST_GeomFromText", "second", &values[1])?.unwrap_or(0))
-            .map_err(|_| DbError::sql("ST_GeomFromText SRID must be non-negative"))?
-    } else {
-        0
-    };
-    let mut spatial = crate::spatial::wkt::from_wkt(text, default_srid).map_err(spatial_error)?;
-    if !geography && values.len() == 2 && spatial.srid != default_srid {
-        return Err(DbError::sql(
-            "ST_GeomFromText explicit SRID does not match EWKT SRID",
-        ));
-    }
-    if geography {
-        spatial.srid = 4326;
-    }
-    validate_spatial_value(&spatial, geography)?;
-    let bytes = crate::spatial::ewkb::to_ewkb(&spatial);
-    Ok(if geography {
-        Value::Geography(bytes)
-    } else {
-        Value::Geometry(bytes)
-    })
-}
-
-fn eval_spatial_from_geojson(values: &[Value], geography: bool) -> Result<Value> {
-    let valid_arity = if geography {
-        values.len() == 1
-    } else {
-        values.len() == 1 || values.len() == 2
-    };
-    if !valid_arity {
-        return Err(DbError::sql(if geography {
-            "ST_GeogFromGeoJSON expects 1 argument"
-        } else {
-            "ST_GeomFromGeoJSON expects 1 or 2 arguments"
-        }));
-    }
-    if values.iter().any(|value| matches!(value, Value::Null)) {
-        return Ok(Value::Null);
-    }
-    let Some(text) = expect_text_arg(
-        if geography {
-            "ST_GeogFromGeoJSON"
-        } else {
-            "ST_GeomFromGeoJSON"
-        },
-        "first",
-        &values[0],
-    )?
-    else {
-        return Ok(Value::Null);
-    };
-    let srid = if geography {
-        4326
-    } else if values.len() == 2 {
-        u32::try_from(expect_int_arg("ST_GeomFromGeoJSON", "second", &values[1])?.unwrap_or(0))
-            .map_err(|_| DbError::sql("ST_GeomFromGeoJSON SRID must be non-negative"))?
-    } else {
-        0
-    };
-    let spatial = crate::spatial::geojson::from_geojson(text, srid).map_err(spatial_error)?;
-    validate_spatial_value(&spatial, geography)?;
-    let bytes = crate::spatial::ewkb::to_ewkb(&spatial);
-    Ok(if geography {
-        Value::Geography(bytes)
-    } else {
-        Value::Geometry(bytes)
-    })
-}
-
-fn eval_spatial_as_binary(values: &[Value]) -> Result<Value> {
-    expect_arity("ST_AsBinary", values, 1)?;
-    match &values[0] {
-        Value::Null => Ok(Value::Null),
-        Value::Geometry(bytes) | Value::Geography(bytes) => Ok(Value::Blob(bytes.clone())),
-        other => Err(DbError::sql(format!(
-            "ST_AsBinary expects spatial input, got {other:?}"
-        ))),
-    }
-}
-
-fn eval_spatial_as_text(values: &[Value]) -> Result<Value> {
-    expect_arity("ST_AsText", values, 1)?;
-    let Some((_, spatial)) = spatial_value_from_db(&values[0])? else {
-        return Ok(Value::Null);
-    };
-    Ok(Value::Text(crate::spatial::wkt::to_wkt(&spatial)))
-}
-
-fn eval_spatial_as_geojson(values: &[Value]) -> Result<Value> {
-    expect_arity("ST_AsGeoJSON", values, 1)?;
-    let Some((_, spatial)) = spatial_value_from_db(&values[0])? else {
-        return Ok(Value::Null);
-    };
-    Ok(Value::Text(
-        crate::spatial::geojson::to_geojson(&spatial).map_err(spatial_error)?,
-    ))
-}
-
-fn eval_spatial_srid(values: &[Value]) -> Result<Value> {
-    expect_arity("ST_SRID", values, 1)?;
-    let Some((_, spatial)) = spatial_value_from_db(&values[0])? else {
-        return Ok(Value::Null);
-    };
-    Ok(Value::Int64(i64::from(spatial.srid)))
-}
-
-fn eval_spatial_geometry_type(values: &[Value]) -> Result<Value> {
-    expect_arity("ST_GeometryType", values, 1)?;
-    let Some((_, spatial)) = spatial_value_from_db(&values[0])? else {
-        return Ok(Value::Null);
-    };
-    Ok(Value::Text(spatial_kind_name(spatial.kind()).to_string()))
-}
-
-fn eval_spatial_point_accessor(values: &[Value], accessor: SpatialAccessor) -> Result<Value> {
-    expect_arity("spatial coordinate accessor", values, 1)?;
-    let Some((_, spatial)) = spatial_value_from_db(&values[0])? else {
-        return Ok(Value::Null);
-    };
-    let SpatialGeometry::Point(point) = spatial.geometry else {
-        return Err(DbError::sql(
-            "spatial coordinate accessors require POINT input",
-        ));
-    };
-    match accessor {
-        SpatialAccessor::X => Ok(Value::Float64(point.x)),
-        SpatialAccessor::Y => Ok(Value::Float64(point.y)),
-        SpatialAccessor::Z => Ok(point.z.map(Value::Float64).unwrap_or(Value::Null)),
-        SpatialAccessor::M => Ok(point.m.map(Value::Float64).unwrap_or(Value::Null)),
-    }
-}
-
-fn eval_spatial_set_srid(values: &[Value]) -> Result<Value> {
-    expect_arity("ST_SetSRID", values, 2)?;
-    if values.iter().any(|value| matches!(value, Value::Null)) {
-        return Ok(Value::Null);
-    }
-    let srid = u32::try_from(expect_int_arg("ST_SetSRID", "second", &values[1])?.unwrap_or(0))
-        .map_err(|_| DbError::sql("ST_SetSRID SRID must be non-negative"))?;
-    let Some((geography, mut spatial)) = spatial_value_from_db(&values[0])? else {
-        return Ok(Value::Null);
-    };
-    if geography && srid != 4326 {
-        return Err(DbError::sql(
-            "GEOGRAPHY supports only SRID 4326 in DecentDB 1.0",
-        ));
-    }
-    spatial.srid = srid;
-    validate_spatial_value(&spatial, geography)?;
-    let bytes = crate::spatial::ewkb::to_ewkb(&spatial);
-    Ok(if geography {
-        Value::Geography(bytes)
-    } else {
-        Value::Geometry(bytes)
-    })
-}
-
-fn eval_spatial_is_valid(values: &[Value]) -> Result<Value> {
-    expect_arity("ST_IsValid", values, 1)?;
-    match &values[0] {
-        Value::Null => Ok(Value::Null),
-        Value::Geometry(bytes) => Ok(Value::Bool(
-            crate::spatial::ewkb::from_ewkb(bytes)
-                .and_then(|value| validate_spatial_value_spatial_error(&value, false))
-                .is_ok(),
-        )),
-        Value::Geography(bytes) => Ok(Value::Bool(
-            crate::spatial::ewkb::from_ewkb(bytes)
-                .and_then(|value| validate_spatial_value_spatial_error(&value, true))
-                .is_ok(),
-        )),
-        other => Err(DbError::sql(format!(
-            "ST_IsValid expects spatial input, got {other:?}"
-        ))),
-    }
-}
-
-fn eval_spatial_distance(values: &[Value]) -> Result<Value> {
-    expect_arity("ST_Distance", values, 2)?;
-    if values.iter().any(|value| matches!(value, Value::Null)) {
-        return Ok(Value::Null);
-    }
-    Ok(Value::Float64(spatial_distance_values(
-        &values[0], &values[1],
-    )?))
-}
-
-fn eval_spatial_dwithin(values: &[Value]) -> Result<Value> {
-    expect_arity("ST_DWithin", values, 3)?;
-    if values.iter().any(|value| matches!(value, Value::Null)) {
-        return Ok(Value::Null);
-    }
-    let distance = numeric_value_as_f64("ST_DWithin", "third", &values[2])?;
-    if distance < 0.0 {
-        return Ok(Value::Bool(false));
-    }
-    Ok(Value::Bool(
-        spatial_distance_values(&values[0], &values[1])? <= distance,
-    ))
-}
-
-fn eval_spatial_predicate(values: &[Value], predicate: SpatialPredicate) -> Result<Value> {
-    expect_arity("spatial predicate", values, 2)?;
-    if values.iter().any(|value| matches!(value, Value::Null)) {
-        return Ok(Value::Null);
-    }
-    let (left_geography, left) = spatial_value_from_db_required(&values[0])?;
-    let (right_geography, right) = spatial_value_from_db_required(&values[1])?;
-    ensure_spatial_compatible(left_geography, &left, right_geography, &right)?;
-    let result = match predicate {
-        SpatialPredicate::Intersects => {
-            crate::spatial::predicate::intersects(&left.geometry, &right.geometry)
-        }
-        SpatialPredicate::Contains => {
-            crate::spatial::predicate::contains(&left.geometry, &right.geometry)
-        }
-        SpatialPredicate::Within => {
-            crate::spatial::predicate::within(&left.geometry, &right.geometry)
-        }
-        SpatialPredicate::Equals => {
-            crate::spatial::predicate::equals(&left.geometry, &right.geometry)
-        }
-    }
-    .map_err(spatial_error)?;
-    Ok(Value::Bool(result))
-}
-
-fn eval_spatial_length(values: &[Value]) -> Result<Value> {
-    expect_arity("ST_Length", values, 1)?;
-    let Some((geography, spatial)) = spatial_value_from_db(&values[0])? else {
-        return Ok(Value::Null);
-    };
-    if geography {
-        return Err(DbError::sql("ST_Length for GEOGRAPHY is not supported"));
-    }
-    Ok(Value::Float64(geometry_length(&spatial.geometry)?))
-}
-
-fn eval_spatial_area(values: &[Value]) -> Result<Value> {
-    expect_arity("ST_Area", values, 1)?;
-    let Some((geography, spatial)) = spatial_value_from_db(&values[0])? else {
-        return Ok(Value::Null);
-    };
-    let area = if geography {
-        geography_area_approx_meters(&spatial.geometry)?
-    } else {
-        geometry_area(&spatial.geometry)?
-    };
-    Ok(Value::Float64(area))
-}
-
-fn spatial_distance_values(left: &Value, right: &Value) -> Result<f64> {
-    let (left_geography, left) = spatial_value_from_db_required(left)?;
-    let (right_geography, right) = spatial_value_from_db_required(right)?;
-    ensure_spatial_compatible(left_geography, &left, right_geography, &right)?;
-    if left_geography {
-        let (SpatialGeometry::Point(left_point), SpatialGeometry::Point(right_point)) =
-            (&left.geometry, &right.geometry)
-        else {
-            return Err(DbError::sql(
-                "ST_Distance for GEOGRAPHY supports POINT inputs in this release",
-            ));
-        };
-        Ok(crate::spatial::distance::geography_point_distance_meters(
-            *left_point,
-            *right_point,
-        ))
-    } else {
-        crate::spatial::distance::planar_geometry_distance(&left.geometry, &right.geometry)
-            .map_err(spatial_error)
-    }
-}
-
-fn spatial_value_from_db_required(value: &Value) -> Result<(bool, SpatialValue)> {
-    spatial_value_from_db(value)?.ok_or_else(|| DbError::sql("spatial input must not be NULL"))
-}
-
-fn spatial_value_from_db(value: &Value) -> Result<Option<(bool, SpatialValue)>> {
-    match value {
-        Value::Null => Ok(None),
-        Value::Geometry(bytes) => Ok(Some((
-            false,
-            crate::spatial::ewkb::from_ewkb(bytes).map_err(spatial_error)?,
-        ))),
-        Value::Geography(bytes) => Ok(Some((
-            true,
-            crate::spatial::ewkb::from_ewkb(bytes).map_err(spatial_error)?,
-        ))),
-        other => Err(DbError::sql(format!(
-            "expected spatial value, got {other:?}"
-        ))),
-    }
-}
-
-fn ensure_spatial_compatible(
-    left_geography: bool,
-    left: &SpatialValue,
-    right_geography: bool,
-    right: &SpatialValue,
-) -> Result<()> {
-    if left_geography != right_geography {
-        return Err(DbError::sql(
-            "spatial predicates require matching GEOMETRY/GEOGRAPHY families",
-        ));
-    }
-    if left.srid != right.srid {
-        return Err(DbError::sql("spatial predicates require matching SRIDs"));
-    }
-    Ok(())
-}
-
-fn normalize_geometry_bytes(bytes: &[u8]) -> Result<Vec<u8>> {
-    let value =
-        crate::spatial::ewkb::from_wkb_with_default_srid(bytes, 0).map_err(spatial_error)?;
-    validate_spatial_value(&value, false)?;
-    Ok(crate::spatial::ewkb::to_ewkb(&value))
-}
-
-fn normalize_geography_bytes(bytes: &[u8]) -> Result<Vec<u8>> {
-    let mut value =
-        crate::spatial::ewkb::from_wkb_with_default_srid(bytes, 4326).map_err(spatial_error)?;
-    value.srid = 4326;
-    validate_spatial_value(&value, true)?;
-    Ok(crate::spatial::ewkb::to_ewkb(&value))
-}
-
-fn validate_spatial_value(value: &SpatialValue, geography: bool) -> Result<()> {
-    validate_spatial_value_spatial_error(value, geography).map_err(spatial_error)
-}
-
-fn validate_spatial_value_spatial_error(
-    value: &SpatialValue,
-    geography: bool,
-) -> std::result::Result<(), SpatialError> {
-    if geography && value.srid != 4326 {
-        return Err(SpatialError::InvalidInput(
-            "GEOGRAPHY supports only SRID 4326 in DecentDB 1.0".to_string(),
-        ));
-    }
-    if !geography && value.srid > i32::MAX as u32 {
-        return Err(SpatialError::InvalidInput(
-            "GEOMETRY SRID exceeds supported range".to_string(),
-        ));
-    }
-    for position in value.geometry.all_positions() {
-        if !position.x.is_finite()
-            || !position.y.is_finite()
-            || position.z.is_some_and(|z| !z.is_finite())
-            || position.m.is_some_and(|m| !m.is_finite())
-        {
-            return Err(SpatialError::InvalidInput(
-                "spatial coordinates must be finite".to_string(),
-            ));
-        }
-        if geography
-            && !((-180.0..=180.0).contains(&position.x) && (-90.0..=90.0).contains(&position.y))
-        {
-            return Err(SpatialError::InvalidInput(
-                "GEOGRAPHY coordinates must be lon/lat in valid WGS84 ranges".to_string(),
-            ));
-        }
-    }
-    validate_shape_minimums(&value.geometry)
-}
-
-fn validate_shape_minimums(geometry: &SpatialGeometry) -> std::result::Result<(), SpatialError> {
-    match geometry {
-        SpatialGeometry::Point(_) => Ok(()),
-        SpatialGeometry::LineString(line) => {
-            if line.len() < 2 {
-                Err(SpatialError::InvalidInput(
-                    "LINESTRING requires at least two points".to_string(),
-                ))
-            } else {
-                Ok(())
-            }
-        }
-        SpatialGeometry::Polygon(polygon) => validate_polygon_minimums(polygon),
-        SpatialGeometry::MultiPoint(points) => {
-            if points.is_empty() {
-                Err(SpatialError::InvalidInput(
-                    "MULTIPOINT requires at least one point".to_string(),
-                ))
-            } else {
-                Ok(())
-            }
-        }
-        SpatialGeometry::MultiLineString(lines) => {
-            for line in lines {
-                if line.len() < 2 {
-                    return Err(SpatialError::InvalidInput(
-                        "MULTILINESTRING members require at least two points".to_string(),
-                    ));
-                }
-            }
-            Ok(())
-        }
-        SpatialGeometry::MultiPolygon(polygons) => {
-            for polygon in polygons {
-                validate_polygon_minimums(polygon)?;
-            }
-            Ok(())
-        }
-    }
-}
-
-fn validate_polygon_minimums(polygon: &[Vec<Position>]) -> std::result::Result<(), SpatialError> {
-    if polygon.is_empty() {
-        return Err(SpatialError::InvalidInput(
-            "POLYGON requires at least one ring".to_string(),
-        ));
-    }
-    for ring in polygon {
-        if ring.len() < 4 {
-            return Err(SpatialError::InvalidInput(
-                "POLYGON rings require at least four points".to_string(),
-            ));
-        }
-        if !ring
-            .first()
-            .zip(ring.last())
-            .is_some_and(|(first, last)| first.xy_equals(*last))
-        {
-            return Err(SpatialError::InvalidInput(
-                "POLYGON rings must be closed".to_string(),
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn expect_arity(function_name: &str, values: &[Value], expected: usize) -> Result<()> {
-    if values.len() != expected {
-        return Err(DbError::sql(format!(
-            "{function_name} expects {expected} argument{}",
-            if expected == 1 { "" } else { "s" }
-        )));
-    }
-    Ok(())
-}
-
-fn expect_blob_arg<'a>(function_name: &str, ordinal: &str, value: &'a Value) -> Result<&'a [u8]> {
-    match value {
-        Value::Blob(value) => Ok(value),
-        other => Err(DbError::sql(format!(
-            "{function_name} expects BLOB for {ordinal} argument, got {other:?}"
-        ))),
-    }
-}
-
-fn numeric_value_as_f64(function_name: &str, ordinal: &str, value: &Value) -> Result<f64> {
-    let Some(number) = expect_numeric_arg(function_name, ordinal, value)? else {
-        return Err(DbError::sql(format!(
-            "{function_name} {ordinal} argument must not be NULL"
-        )));
-    };
-    let value = number.as_f64();
-    if !value.is_finite() {
-        return Err(DbError::sql(format!(
-            "{function_name} {ordinal} argument must be finite"
-        )));
-    }
-    Ok(value)
-}
-
-fn spatial_kind_name(kind: SpatialKind) -> &'static str {
-    match kind {
-        SpatialKind::Point => "POINT",
-        SpatialKind::LineString => "LINESTRING",
-        SpatialKind::Polygon => "POLYGON",
-        SpatialKind::MultiPoint => "MULTIPOINT",
-        SpatialKind::MultiLineString => "MULTILINESTRING",
-        SpatialKind::MultiPolygon => "MULTIPOLYGON",
-    }
-}
-
-fn geometry_length(geometry: &SpatialGeometry) -> Result<f64> {
-    match geometry {
-        SpatialGeometry::LineString(line) => Ok(line_length(line)),
-        SpatialGeometry::MultiLineString(lines) => {
-            Ok(lines.iter().map(|line| line_length(line)).sum())
-        }
-        _ => Err(DbError::sql(
-            "ST_Length supports LINESTRING geometry inputs",
-        )),
-    }
-}
-
-fn line_length(line: &[Position]) -> f64 {
-    line.windows(2)
-        .map(|segment| crate::spatial::distance::point_distance_xy(segment[0], segment[1]))
-        .sum()
-}
-
-fn geometry_area(geometry: &SpatialGeometry) -> Result<f64> {
-    match geometry {
-        SpatialGeometry::Polygon(polygon) => Ok(polygon_area(polygon).abs()),
-        SpatialGeometry::MultiPolygon(polygons) => Ok(polygons
-            .iter()
-            .map(|polygon| polygon_area(polygon).abs())
-            .sum()),
-        _ => Err(DbError::sql("ST_Area supports POLYGON geometry inputs")),
-    }
-}
-
-fn polygon_area(polygon: &[Vec<Position>]) -> f64 {
-    let Some(shell) = polygon.first() else {
-        return 0.0;
-    };
-    let shell_area = ring_area(shell).abs();
-    let holes = polygon
-        .iter()
-        .skip(1)
-        .map(|ring| ring_area(ring).abs())
-        .sum::<f64>();
-    shell_area - holes
-}
-
-fn ring_area(ring: &[Position]) -> f64 {
-    if ring.len() < 3 {
-        return 0.0;
-    }
-    ring.windows(2)
-        .map(|segment| segment[0].x * segment[1].y - segment[1].x * segment[0].y)
-        .sum::<f64>()
-        * 0.5
-}
-
-fn geography_area_approx_meters(geometry: &SpatialGeometry) -> Result<f64> {
-    const DEG_TO_RAD: f64 = std::f64::consts::PI / 180.0;
-    let scale_polygon = |polygon: &[Vec<Position>]| -> f64 {
-        let mean_lat = polygon
-            .first()
-            .map(|ring| ring.iter().map(|p| p.y).sum::<f64>() / ring.len().max(1) as f64)
-            .unwrap_or(0.0)
-            .to_radians();
-        let meters_per_degree_lat = crate::spatial::distance::EARTH_RADIUS_METERS * DEG_TO_RAD;
-        let meters_per_degree_lon = meters_per_degree_lat * mean_lat.cos().abs().max(1e-12);
-        let scaled = polygon
-            .iter()
-            .map(|ring| {
-                ring.iter()
-                    .map(|p| Position::xy(p.x * meters_per_degree_lon, p.y * meters_per_degree_lat))
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        polygon_area(&scaled).abs()
-    };
-    match geometry {
-        SpatialGeometry::Polygon(polygon) => Ok(scale_polygon(polygon)),
-        SpatialGeometry::MultiPolygon(polygons) => {
-            Ok(polygons.iter().map(|polygon| scale_polygon(polygon)).sum())
-        }
-        _ => Err(DbError::sql("ST_Area supports POLYGON geography inputs")),
-    }
-}
-
-fn eval_greatest_least(values: &[Value], want_greatest: bool) -> Result<Value> {
-    if values.is_empty() {
-        return Err(DbError::sql(if want_greatest {
-            "GREATEST expects at least 1 argument"
-        } else {
-            "LEAST expects at least 1 argument"
-        }));
-    }
-    if values.iter().any(|value| matches!(value, Value::Null)) {
-        return Ok(Value::Null);
-    }
-    let mut best = values[0].clone();
-    for value in &values[1..] {
-        let ordering = compare_values(value, &best)?;
-        if (want_greatest && ordering == std::cmp::Ordering::Greater)
-            || (!want_greatest && ordering == std::cmp::Ordering::Less)
-        {
-            best = value.clone();
-        }
-    }
-    Ok(best)
-}
-
-fn eval_iif(values: &[Value]) -> Result<Value> {
-    if values.len() != 3 {
-        return Err(DbError::sql("IIF expects 3 arguments"));
-    }
-    Ok(if matches!(truthy(&values[0]), Some(true)) {
-        values[1].clone()
-    } else {
-        values[2].clone()
-    })
-}
-
-#[derive(Clone, Copy, Debug)]
-enum NumericValue {
-    Int64(i64),
-    Float64(f64),
-    Decimal { scaled: i64, scale: u8 },
-}
-
-impl NumericValue {
-    fn as_f64(self) -> f64 {
-        match self {
-            Self::Int64(value) => value as f64,
-            Self::Float64(value) => value,
-            Self::Decimal { scaled, scale } => (scaled as f64) / 10_f64.powi(i32::from(scale)),
-        }
-    }
-}
-
-fn unary_text_fn(values: Vec<Value>, f: impl FnOnce(String) -> String) -> Result<Value> {
-    if values.len() != 1 {
-        return Err(DbError::sql("function expects one argument"));
-    }
-    match values.into_iter().next() {
-        Some(Value::Text(value)) => Ok(Value::Text(f(value))),
-        Some(Value::Null) => Ok(Value::Null),
-        Some(other) => Err(DbError::sql(format!(
-            "function expects text, got {other:?}"
-        ))),
-        None => Err(DbError::sql("function expects one argument")),
-    }
-}
-
-fn expect_text_arg<'a>(
-    function_name: &str,
-    ordinal: &str,
-    value: &'a Value,
-) -> Result<Option<&'a str>> {
-    match value {
-        Value::Text(value) => Ok(Some(value)),
-        Value::Null => Ok(None),
-        other => Err(DbError::sql(format!(
-            "{function_name} expects text for {ordinal} argument, got {other:?}"
-        ))),
-    }
-}
-
-fn expect_int_arg(function_name: &str, ordinal: &str, value: &Value) -> Result<Option<i64>> {
-    match value {
-        Value::Int64(value) => Ok(Some(*value)),
-        Value::Null => Ok(None),
-        other => Err(DbError::sql(format!(
-            "{function_name} expects int for {ordinal} argument, got {other:?}"
-        ))),
-    }
-}
-
-fn expect_numeric_arg(
-    function_name: &str,
-    ordinal: &str,
-    value: &Value,
-) -> Result<Option<NumericValue>> {
-    match value {
-        Value::Int64(value) => Ok(Some(NumericValue::Int64(*value))),
-        Value::Float64(value) => Ok(Some(NumericValue::Float64(*value))),
-        Value::Decimal { scaled, scale } => Ok(Some(NumericValue::Decimal {
-            scaled: *scaled,
-            scale: *scale,
-        })),
-        Value::Null => Ok(None),
-        other => Err(DbError::sql(format!(
-            "{function_name} expects numeric input for {ordinal} argument, got {other:?}"
-        ))),
-    }
-}
-
-fn non_negative_usize(value: i64, function_name: &str, ordinal: &str) -> Result<usize> {
-    if value < 0 {
-        return Ok(0);
-    }
-    usize::try_from(value).map_err(|_| {
-        DbError::sql(format!(
-            "{function_name} {ordinal} argument is out of range"
-        ))
-    })
-}
-
-fn take_left_chars(value: &str, len: usize) -> String {
-    value.chars().take(len).collect()
-}
-
-fn take_right_chars(value: &str, len: usize) -> String {
-    let chars = value.chars().collect::<Vec<_>>();
-    let start = chars.len().saturating_sub(len);
-    chars[start..].iter().copied().collect()
-}
-
-fn pad_left(value: &str, target_len: i64, pad: &str) -> String {
-    let target_len = target_len.max(0) as usize;
-    let current_len = value.chars().count();
-    if target_len <= current_len {
-        return take_left_chars(value, target_len);
-    }
-    if pad.is_empty() {
-        return value.to_string();
-    }
-    let padding = repeat_to_char_len(pad, target_len - current_len);
-    format!("{padding}{value}")
-}
-
-fn pad_right(value: &str, target_len: i64, pad: &str) -> String {
-    let target_len = target_len.max(0) as usize;
-    let current_len = value.chars().count();
-    if target_len <= current_len {
-        return take_left_chars(value, target_len);
-    }
-    if pad.is_empty() {
-        return value.to_string();
-    }
-    let padding = repeat_to_char_len(pad, target_len - current_len);
-    format!("{value}{padding}")
-}
-
-fn repeat_to_char_len(pattern: &str, len: usize) -> String {
-    if len == 0 || pattern.is_empty() {
-        return String::new();
-    }
-    let mut output = String::new();
-    while output.chars().count() < len {
-        output.push_str(pattern);
-    }
-    output.chars().take(len).collect()
-}
-
-fn hex_encode_upper(bytes: &[u8]) -> String {
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        use std::fmt::Write as _;
-
-        let _ = write!(output, "{byte:02X}");
-    }
-    output
-}
-
-fn hex_encode_lower(bytes: &[u8]) -> String {
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        use std::fmt::Write as _;
-
-        let _ = write!(output, "{byte:02x}");
-    }
-    output
-}
-
-fn eval_regexp_replace(
-    input: &str,
-    pattern: &str,
-    replacement: &str,
-    flags: Option<&str>,
-) -> Result<String> {
-    let mut case_insensitive = false;
-    let mut global = false;
-    if let Some(flags) = flags {
-        for flag in flags.chars() {
-            match flag {
-                'i' | 'I' => case_insensitive = true,
-                'g' | 'G' => global = true,
-                _ => {
-                    return Err(DbError::sql(format!(
-                        "REGEXP_REPLACE flag {flag} is not supported"
-                    )))
-                }
-            }
-        }
-    }
-    let mut builder = regex::RegexBuilder::new(pattern);
-    builder.case_insensitive(case_insensitive);
-    let regex = builder
-        .build()
-        .map_err(|error| DbError::sql(format!("invalid regular expression: {error}")))?;
-    if global {
-        Ok(regex.replace_all(input, replacement).to_string())
-    } else {
-        Ok(regex.replace(input, replacement).to_string())
-    }
-}
-
-fn next_random_u64() -> u64 {
-    let mut observed = RANDOM_STATE.load(Ordering::Relaxed);
-    loop {
-        let current = if observed == 0 {
-            random_seed()
-        } else {
-            observed
-        };
-        let next = splitmix64(current);
-        match RANDOM_STATE.compare_exchange_weak(
-            observed,
-            next,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => return next,
-            Err(actual) => observed = actual,
-        }
-    }
-}
-
-fn next_random_f64() -> f64 {
-    let value = next_random_u64();
-    ((value >> 11) as f64) / ((1_u64 << 53) as f64)
-}
-
-fn random_seed() -> u64 {
-    let nanos = match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(duration) => duration.as_nanos() as u64,
-        Err(_) => 0xDDB5_EED5_A17C_E55D,
-    };
-    nanos ^ 0x9E37_79B9_7F4A_7C15
-}
-
-fn splitmix64(state: u64) -> u64 {
-    let mut value = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    value ^ (value >> 31)
-}
-
-fn eval_current_timestamp(values: Vec<Value>) -> Result<Value> {
-    if !values.is_empty() {
-        return Err(DbError::sql("CURRENT_TIMESTAMP expects 0 arguments"));
-    }
-    Ok(Value::TimestampTzMicros(current_utc_timestamp_micros()?))
-}
-
-fn eval_current_date(values: Vec<Value>) -> Result<Value> {
-    if !values.is_empty() {
-        return Err(DbError::sql("CURRENT_DATE expects 0 arguments"));
-    }
-    Ok(Value::DateDays(parse_date_days(&format_date(
-        current_utc_datetime(),
-    ))?))
-}
-
-fn eval_current_time(values: Vec<Value>) -> Result<Value> {
-    if !values.is_empty() {
-        return Err(DbError::sql("CURRENT_TIME expects 0 arguments"));
-    }
-    Ok(Value::TimeMicros(parse_time_micros(&format_time(
-        current_utc_datetime(),
-    ))?))
-}
-
-fn eval_date(values: Vec<Value>) -> Result<Value> {
-    let Some(datetime) = resolve_datetime_arguments("DATE", &values, true)? else {
-        return Ok(Value::Null);
-    };
-    Ok(Value::DateDays(parse_date_days(&format_date(datetime))?))
-}
-
-fn eval_datetime(values: Vec<Value>) -> Result<Value> {
-    let Some(datetime) = resolve_datetime_arguments("DATETIME", &values, true)? else {
-        return Ok(Value::Null);
-    };
-    Ok(Value::Text(format_datetime(datetime)))
-}
-
-fn eval_strftime(values: Vec<Value>) -> Result<Value> {
-    if values.is_empty() {
-        return Err(DbError::sql("STRFTIME expects at least 1 argument"));
-    }
-    let Some(format) = expect_text_arg("STRFTIME", "first", &values[0])? else {
-        return Ok(Value::Null);
-    };
-    let Some(datetime) = resolve_datetime_arguments("STRFTIME", &values[1..], true)? else {
-        return Ok(Value::Null);
-    };
-    Ok(Value::Text(datetime.format(format).to_string()))
-}
-
-fn eval_extract(values: Vec<Value>) -> Result<Value> {
-    if values.len() != 2 {
-        return Err(DbError::sql("EXTRACT expects 2 arguments"));
-    }
-    let Some(field) = expect_text_arg("EXTRACT", "first", &values[0])? else {
-        return Ok(Value::Null);
-    };
-    let Some(datetime) = datetime_from_value("EXTRACT", &values[1])? else {
-        return Ok(Value::Null);
-    };
-    match field.to_ascii_uppercase().as_str() {
-        "YEAR" => Ok(Value::Int64(i64::from(datetime.year()))),
-        "MONTH" => Ok(Value::Int64(i64::from(datetime.month()))),
-        "DAY" => Ok(Value::Int64(i64::from(datetime.day()))),
-        "HOUR" => Ok(Value::Int64(i64::from(datetime.hour()))),
-        "MINUTE" => Ok(Value::Int64(i64::from(datetime.minute()))),
-        "SECOND" => Ok(Value::Int64(i64::from(datetime.second()))),
-        "DOW" => Ok(Value::Int64(i64::from(
-            datetime.weekday().num_days_from_sunday(),
-        ))),
-        "DOY" => Ok(Value::Int64(i64::from(datetime.ordinal()))),
-        "EPOCH" => Ok(Value::Float64(
-            (datetime.timestamp_micros() as f64) / 1_000_000.0,
-        )),
-        other => Err(DbError::sql(format!(
-            "EXTRACT field {other} is not supported"
-        ))),
-    }
-}
-
-fn eval_date_trunc(values: Vec<Value>) -> Result<Value> {
-    if values.len() != 2 {
-        return Err(DbError::sql("DATE_TRUNC expects 2 arguments"));
-    }
-    let Some(precision) = expect_text_arg("DATE_TRUNC", "first", &values[0])? else {
-        return Ok(Value::Null);
-    };
-    let Some(datetime) = datetime_from_value("DATE_TRUNC", &values[1])? else {
-        return Ok(Value::Null);
-    };
-    let truncated = truncate_datetime(datetime, precision)?;
-    Ok(Value::TimestampMicros(truncated.timestamp_micros()))
-}
-
-fn eval_date_part(values: Vec<Value>) -> Result<Value> {
-    if values.len() != 2 {
-        return Err(DbError::sql("DATE_PART expects 2 arguments"));
-    }
-    eval_extract(values)
-}
-
-fn eval_date_diff(values: Vec<Value>) -> Result<Value> {
-    if values.len() != 3 {
-        return Err(DbError::sql("DATE_DIFF expects 3 arguments"));
-    }
-    let Some(part) = expect_text_arg("DATE_DIFF", "first", &values[0])? else {
-        return Ok(Value::Null);
-    };
-    let Some(start) = datetime_from_value("DATE_DIFF", &values[1])? else {
-        return Ok(Value::Null);
-    };
-    let Some(end) = datetime_from_value("DATE_DIFF", &values[2])? else {
-        return Ok(Value::Null);
-    };
-    let diff = date_diff_part(part, start, end)?;
-    Ok(Value::Int64(diff))
-}
-
-fn eval_last_day(values: Vec<Value>) -> Result<Value> {
-    if values.len() != 1 {
-        return Err(DbError::sql("LAST_DAY expects 1 argument"));
-    }
-    let Some(datetime) = datetime_from_value("LAST_DAY", &values[0])? else {
-        return Ok(Value::Null);
-    };
-    let first_of_month = datetime
-        .date_naive()
-        .with_day(1)
-        .ok_or_else(|| DbError::sql("LAST_DAY date is out of range"))?;
-    let next_month = first_of_month
-        .checked_add_months(Months::new(1))
-        .ok_or_else(|| DbError::sql("LAST_DAY date is out of range"))?;
-    let last_day = next_month
-        .pred_opt()
-        .ok_or_else(|| DbError::sql("LAST_DAY date is out of range"))?;
-    Ok(Value::Text(last_day.format("%Y-%m-%d").to_string()))
-}
-
-fn eval_next_day(values: Vec<Value>) -> Result<Value> {
-    if values.len() != 2 {
-        return Err(DbError::sql("NEXT_DAY expects 2 arguments"));
-    }
-    let Some(datetime) = datetime_from_value("NEXT_DAY", &values[0])? else {
-        return Ok(Value::Null);
-    };
-    let Some(weekday_text) = expect_text_arg("NEXT_DAY", "second", &values[1])? else {
-        return Ok(Value::Null);
-    };
-    let target = parse_weekday_name(weekday_text)?;
-    let mut days_ahead = i64::from(target.num_days_from_monday())
-        - i64::from(datetime.weekday().num_days_from_monday());
-    if days_ahead <= 0 {
-        days_ahead += 7;
-    }
-    let next = datetime
-        .checked_add_signed(ChronoDuration::days(days_ahead))
-        .ok_or_else(|| DbError::sql("NEXT_DAY result overflowed supported range"))?;
-    Ok(Value::Text(
-        next.date_naive().format("%Y-%m-%d").to_string(),
-    ))
-}
-
-fn eval_make_date(values: Vec<Value>) -> Result<Value> {
-    if values.len() != 3 {
-        return Err(DbError::sql("MAKE_DATE expects 3 arguments"));
-    }
-    let year = expect_int_arg("MAKE_DATE", "first", &values[0])?;
-    let month = expect_int_arg("MAKE_DATE", "second", &values[1])?;
-    let day = expect_int_arg("MAKE_DATE", "third", &values[2])?;
-    let (Some(year), Some(month), Some(day)) = (year, month, day) else {
-        return Ok(Value::Null);
-    };
-    let year = i32::try_from(year).map_err(|_| DbError::sql("MAKE_DATE year is out of range"))?;
-    let month =
-        u32::try_from(month).map_err(|_| DbError::sql("MAKE_DATE month is out of range"))?;
-    let day = u32::try_from(day).map_err(|_| DbError::sql("MAKE_DATE day is out of range"))?;
-    let date = NaiveDate::from_ymd_opt(year, month, day)
-        .ok_or_else(|| DbError::sql("MAKE_DATE arguments are not a valid date"))?;
-    Ok(Value::Text(date.format("%Y-%m-%d").to_string()))
-}
-
-fn eval_make_timestamp(values: Vec<Value>) -> Result<Value> {
-    if values.len() != 6 {
-        return Err(DbError::sql("MAKE_TIMESTAMP expects 6 arguments"));
-    }
-    let year = expect_int_arg("MAKE_TIMESTAMP", "first", &values[0])?;
-    let month = expect_int_arg("MAKE_TIMESTAMP", "second", &values[1])?;
-    let day = expect_int_arg("MAKE_TIMESTAMP", "third", &values[2])?;
-    let hour = expect_int_arg("MAKE_TIMESTAMP", "fourth", &values[3])?;
-    let minute = expect_int_arg("MAKE_TIMESTAMP", "fifth", &values[4])?;
-    let second = expect_numeric_arg("MAKE_TIMESTAMP", "sixth", &values[5])?;
-    let (Some(year), Some(month), Some(day), Some(hour), Some(minute), Some(second)) =
-        (year, month, day, hour, minute, second)
-    else {
-        return Ok(Value::Null);
-    };
-    let year =
-        i32::try_from(year).map_err(|_| DbError::sql("MAKE_TIMESTAMP year is out of range"))?;
-    let month =
-        u32::try_from(month).map_err(|_| DbError::sql("MAKE_TIMESTAMP month is out of range"))?;
-    let day = u32::try_from(day).map_err(|_| DbError::sql("MAKE_TIMESTAMP day is out of range"))?;
-    let hour =
-        u32::try_from(hour).map_err(|_| DbError::sql("MAKE_TIMESTAMP hour is out of range"))?;
-    let minute =
-        u32::try_from(minute).map_err(|_| DbError::sql("MAKE_TIMESTAMP minute is out of range"))?;
-    let second_f64 = second.as_f64();
-    if !(0.0..60.0).contains(&second_f64) {
-        return Err(DbError::sql(
-            "MAKE_TIMESTAMP seconds must be between 0 (inclusive) and 60 (exclusive)",
-        ));
-    }
-    let second_whole = second_f64.floor() as u32;
-    let micros = ((second_f64 - f64::from(second_whole)) * 1_000_000.0).round() as u32;
-    let date = NaiveDate::from_ymd_opt(year, month, day)
-        .ok_or_else(|| DbError::sql("MAKE_TIMESTAMP arguments are not a valid date"))?;
-    let datetime = date
-        .and_hms_micro_opt(hour, minute, second_whole, micros.min(999_999))
-        .ok_or_else(|| DbError::sql("MAKE_TIMESTAMP arguments are not a valid timestamp"))?;
-    Ok(Value::TimestampMicros(
-        DateTime::<Utc>::from_naive_utc_and_offset(datetime, Utc).timestamp_micros(),
-    ))
-}
-
-fn eval_to_timestamp(values: Vec<Value>) -> Result<Value> {
-    if values.is_empty() || values.len() > 2 {
-        return Err(DbError::sql("TO_TIMESTAMP expects 1 or 2 arguments"));
-    }
-    match (&values[0], values.get(1)) {
-        (Value::Null, _) => Ok(Value::Null),
-        (Value::Int64(epoch), None) => Ok(Value::TimestampMicros(
-            epoch
-                .checked_mul(1_000_000)
-                .ok_or_else(|| DbError::sql("TO_TIMESTAMP epoch is out of range"))?,
-        )),
-        (Value::Float64(epoch), None) => Ok(Value::TimestampMicros((epoch * 1_000_000.0) as i64)),
-        (Value::Text(text), None) => Ok(Value::TimestampMicros(
-            parse_datetime_text("TO_TIMESTAMP", text)?.timestamp_micros(),
-        )),
-        (Value::Text(text), Some(Value::Text(format))) => Ok(Value::TimestampMicros(
-            parse_to_timestamp_with_format(text, format)?.timestamp_micros(),
-        )),
-        (_, Some(Value::Null)) => Ok(Value::Null),
-        (other, None) => Err(DbError::sql(format!(
-            "TO_TIMESTAMP expects numeric epoch or text input, got {other:?}"
-        ))),
-        (_, Some(other)) => Err(DbError::sql(format!(
-            "TO_TIMESTAMP format argument must be text, got {other:?}"
-        ))),
-    }
-}
-
-fn eval_interval(values: Vec<Value>) -> Result<Value> {
-    if values.len() != 1 {
-        return Err(DbError::sql("INTERVAL expects 1 argument"));
-    }
-    let raw = match &values[0] {
-        Value::Null => return Ok(Value::Null),
-        Value::Text(raw) => raw.as_str(),
-        other => {
-            return Err(DbError::sql(format!(
-                "INTERVAL expects text literal input, got {other:?}"
-            )))
-        }
-    };
-    let (months, days, micros) = parse_interval(raw)?;
-    Ok(Value::Interval {
-        months,
-        days,
-        micros,
-    })
-}
-
-fn eval_age(values: Vec<Value>) -> Result<Value> {
-    if values.is_empty() || values.len() > 2 {
-        return Err(DbError::sql("AGE expects 1 or 2 arguments"));
-    }
-    let first = match datetime_from_value("AGE", &values[0])? {
-        Some(value) => value,
-        None => return Ok(Value::Null),
-    };
-    let second = if let Some(second) = values.get(1) {
-        match datetime_from_value("AGE", second)? {
-            Some(value) => value,
-            None => return Ok(Value::Null),
-        }
-    } else {
-        current_utc_datetime()
-    };
-    let delta = first.timestamp_micros() - second.timestamp_micros();
-    Ok(Value::Text(format_age_interval(delta)))
-}
-
-fn truncate_datetime(datetime: DateTime<Utc>, precision: &str) -> Result<DateTime<Utc>> {
-    let lower = precision.to_ascii_lowercase();
-    let date = datetime.date_naive();
-    let time = datetime.time();
-    let truncated = match lower.as_str() {
-        "microsecond" | "microseconds" => datetime.naive_utc(),
-        "millisecond" | "milliseconds" => datetime
-            .naive_utc()
-            .with_nanosecond((time.nanosecond() / 1_000_000) * 1_000_000)
-            .ok_or_else(|| DbError::sql("DATE_TRUNC produced an invalid timestamp"))?,
-        "second" | "seconds" => date
-            .and_hms_opt(time.hour(), time.minute(), time.second())
-            .ok_or_else(|| DbError::sql("DATE_TRUNC produced an invalid timestamp"))?,
-        "minute" | "minutes" => date
-            .and_hms_opt(time.hour(), time.minute(), 0)
-            .ok_or_else(|| DbError::sql("DATE_TRUNC produced an invalid timestamp"))?,
-        "hour" | "hours" => date
-            .and_hms_opt(time.hour(), 0, 0)
-            .ok_or_else(|| DbError::sql("DATE_TRUNC produced an invalid timestamp"))?,
-        "day" | "days" => date
-            .and_hms_opt(0, 0, 0)
-            .ok_or_else(|| DbError::sql("DATE_TRUNC produced an invalid timestamp"))?,
-        "week" | "weeks" => {
-            let start = date
-                .checked_sub_signed(ChronoDuration::days(i64::from(
-                    date.weekday().num_days_from_monday(),
-                )))
-                .ok_or_else(|| DbError::sql("DATE_TRUNC produced an invalid date"))?;
-            start
-                .and_hms_opt(0, 0, 0)
-                .ok_or_else(|| DbError::sql("DATE_TRUNC produced an invalid timestamp"))?
-        }
-        "month" | "months" => date
-            .with_day(1)
-            .ok_or_else(|| DbError::sql("DATE_TRUNC produced an invalid date"))?
-            .and_hms_opt(0, 0, 0)
-            .ok_or_else(|| DbError::sql("DATE_TRUNC produced an invalid timestamp"))?,
-        "quarter" | "quarters" => {
-            let month = ((date.month() - 1) / 3) * 3 + 1;
-            NaiveDate::from_ymd_opt(date.year(), month, 1)
-                .ok_or_else(|| DbError::sql("DATE_TRUNC produced an invalid date"))?
-                .and_hms_opt(0, 0, 0)
-                .ok_or_else(|| DbError::sql("DATE_TRUNC produced an invalid timestamp"))?
-        }
-        "year" | "years" => NaiveDate::from_ymd_opt(date.year(), 1, 1)
-            .ok_or_else(|| DbError::sql("DATE_TRUNC produced an invalid date"))?
-            .and_hms_opt(0, 0, 0)
-            .ok_or_else(|| DbError::sql("DATE_TRUNC produced an invalid timestamp"))?,
-        "decade" | "decades" => {
-            let year = date.year().div_euclid(10) * 10;
-            NaiveDate::from_ymd_opt(year, 1, 1)
-                .ok_or_else(|| DbError::sql("DATE_TRUNC produced an invalid date"))?
-                .and_hms_opt(0, 0, 0)
-                .ok_or_else(|| DbError::sql("DATE_TRUNC produced an invalid timestamp"))?
-        }
-        "century" | "centuries" => {
-            let year = ((date.year() - 1).div_euclid(100) * 100) + 1;
-            NaiveDate::from_ymd_opt(year, 1, 1)
-                .ok_or_else(|| DbError::sql("DATE_TRUNC produced an invalid date"))?
-                .and_hms_opt(0, 0, 0)
-                .ok_or_else(|| DbError::sql("DATE_TRUNC produced an invalid timestamp"))?
-        }
-        "millennium" | "millennia" => {
-            let year = ((date.year() - 1).div_euclid(1000) * 1000) + 1;
-            NaiveDate::from_ymd_opt(year, 1, 1)
-                .ok_or_else(|| DbError::sql("DATE_TRUNC produced an invalid date"))?
-                .and_hms_opt(0, 0, 0)
-                .ok_or_else(|| DbError::sql("DATE_TRUNC produced an invalid timestamp"))?
-        }
-        other => {
-            return Err(DbError::sql(format!(
-                "DATE_TRUNC precision {other} is not supported"
-            )))
-        }
-    };
-    Ok(DateTime::from_naive_utc_and_offset(truncated, Utc))
-}
-
-fn date_diff_part(part: &str, start: DateTime<Utc>, end: DateTime<Utc>) -> Result<i64> {
-    let part = part.to_ascii_lowercase();
-    let micros = end.timestamp_micros() - start.timestamp_micros();
-    let result = match part.as_str() {
-        "microsecond" | "microseconds" => micros,
-        "millisecond" | "milliseconds" => micros.div_euclid(1_000),
-        "second" | "seconds" => micros.div_euclid(1_000_000),
-        "minute" | "minutes" => micros.div_euclid(60 * 1_000_000),
-        "hour" | "hours" => micros.div_euclid(60 * 60 * 1_000_000),
-        "day" | "days" => micros.div_euclid(24 * 60 * 60 * 1_000_000),
-        "week" | "weeks" => micros.div_euclid(7 * 24 * 60 * 60 * 1_000_000),
-        "month" | "months" => {
-            let start_date = start.date_naive();
-            let end_date = end.date_naive();
-            let mut months = i64::from(end_date.year() - start_date.year()) * 12
-                + i64::from(end_date.month())
-                - i64::from(start_date.month());
-            if end_date.day() < start_date.day() {
-                months -= 1;
-            }
-            months
-        }
-        "year" | "years" => {
-            let start_date = start.date_naive();
-            let end_date = end.date_naive();
-            let mut years = i64::from(end_date.year() - start_date.year());
-            if (end_date.month(), end_date.day()) < (start_date.month(), start_date.day()) {
-                years -= 1;
-            }
-            years
-        }
-        other => {
-            return Err(DbError::sql(format!(
-                "DATE_DIFF part {other} is not supported"
-            )))
-        }
-    };
-    Ok(result)
-}
-
-fn parse_weekday_name(value: &str) -> Result<chrono::Weekday> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "monday" | "mon" => Ok(chrono::Weekday::Mon),
-        "tuesday" | "tue" | "tues" => Ok(chrono::Weekday::Tue),
-        "wednesday" | "wed" => Ok(chrono::Weekday::Wed),
-        "thursday" | "thu" | "thurs" => Ok(chrono::Weekday::Thu),
-        "friday" | "fri" => Ok(chrono::Weekday::Fri),
-        "saturday" | "sat" => Ok(chrono::Weekday::Sat),
-        "sunday" | "sun" => Ok(chrono::Weekday::Sun),
-        other => Err(DbError::sql(format!(
-            "NEXT_DAY weekday {other} is not supported"
-        ))),
-    }
-}
-
-fn parse_to_timestamp_with_format(text: &str, format: &str) -> Result<DateTime<Utc>> {
-    let mapped = match format {
-        "YYYY-MM-DD HH24:MI:SS" => "%Y-%m-%d %H:%M:%S",
-        "YYYY-MM-DD" => "%Y-%m-%d",
-        "DD/MM/YYYY" => "%d/%m/%Y",
-        _ => {
-            return Err(DbError::sql(
-                "TO_TIMESTAMP format is not supported by DecentDB yet",
-            ))
-        }
-    };
-    if mapped.contains("%H") {
-        let naive = NaiveDateTime::parse_from_str(text, mapped)
-            .map_err(|_| DbError::sql("TO_TIMESTAMP input does not match format"))?;
-        Ok(DateTime::from_naive_utc_and_offset(naive, Utc))
-    } else {
-        let date = NaiveDate::parse_from_str(text, mapped)
-            .map_err(|_| DbError::sql("TO_TIMESTAMP input does not match format"))?;
-        let naive = date
-            .and_hms_opt(0, 0, 0)
-            .ok_or_else(|| DbError::sql("TO_TIMESTAMP input is out of range"))?;
-        Ok(DateTime::from_naive_utc_and_offset(naive, Utc))
-    }
-}
-
-fn format_age_interval(delta_micros: i64) -> String {
-    let negative = delta_micros < 0;
-    let mut remainder = delta_micros.unsigned_abs();
-    let day_micros = 24_u64 * 60 * 60 * 1_000_000;
-    let hour_micros = 60_u64 * 60 * 1_000_000;
-    let minute_micros = 60_u64 * 1_000_000;
-    let second_micros = 1_000_000_u64;
-    let days = remainder / day_micros;
-    remainder %= day_micros;
-    let hours = remainder / hour_micros;
-    remainder %= hour_micros;
-    let minutes = remainder / minute_micros;
-    remainder %= minute_micros;
-    let seconds = remainder / second_micros;
-    let micros = remainder % second_micros;
-    let sign = if negative { "-" } else { "" };
-    if micros == 0 {
-        format!("{sign}{days} days {hours:02}:{minutes:02}:{seconds:02}")
-    } else {
-        format!("{sign}{days} days {hours:02}:{minutes:02}:{seconds:02}.{micros:06}")
-    }
-}
-
-fn eval_gen_random_uuid(values: Vec<Value>) -> Result<Value> {
-    if !values.is_empty() {
-        return Err(DbError::sql("GEN_RANDOM_UUID expects 0 arguments"));
-    }
-    let mut value = [0u8; 16];
-    value[..8].copy_from_slice(&next_random_u64().to_be_bytes());
-    value[8..].copy_from_slice(&next_random_u64().to_be_bytes());
-    value[6] = (value[6] & 0x0f) | 0x40;
-    value[8] = (value[8] & 0x3f) | 0x80;
-    Ok(Value::Uuid(value))
-}
-
-fn eval_uuid_parse(values: Vec<Value>) -> Result<Value> {
-    if values.len() != 1 {
-        return Err(DbError::sql("UUID_PARSE expects 1 argument"));
-    }
-    match &values[0] {
-        Value::Null => Ok(Value::Null),
-        Value::Text(value) => Ok(Value::Uuid(parse_uuid_text(value)?)),
-        other => Err(DbError::sql(format!(
-            "UUID_PARSE expects text input, got {other:?}"
-        ))),
-    }
-}
-
-fn eval_uuid_to_string(values: Vec<Value>) -> Result<Value> {
-    if values.len() != 1 {
-        return Err(DbError::sql("UUID_TO_STRING expects 1 argument"));
-    }
-    match &values[0] {
-        Value::Null => Ok(Value::Null),
-        Value::Uuid(value) => Ok(Value::Text(value_to_text(&Value::Uuid(*value))?)),
-        other => Err(DbError::sql(format!(
-            "UUID_TO_STRING expects UUID input, got {other:?}"
-        ))),
-    }
-}
-
-fn current_utc_datetime() -> DateTime<Utc> {
-    Utc::now()
-}
-
-fn current_utc_timestamp_micros() -> Result<i64> {
-    let now = current_utc_datetime();
-    let seconds = now.timestamp();
-    let micros = i64::from(now.timestamp_subsec_micros());
-    seconds
-        .checked_mul(1_000_000)
-        .and_then(|value| value.checked_add(micros))
-        .ok_or_else(|| DbError::sql("CURRENT_TIMESTAMP overflowed the supported range"))
-}
-
-fn resolve_datetime_arguments(
-    function_name: &str,
-    values: &[Value],
-    default_now: bool,
-) -> Result<Option<DateTime<Utc>>> {
-    if values.is_empty() {
-        return if default_now {
-            Ok(Some(current_utc_datetime()))
-        } else {
-            Err(DbError::sql(format!(
-                "{function_name} expects a date/time argument"
-            )))
-        };
-    }
-    let Some(mut datetime) = datetime_from_value(function_name, &values[0])? else {
-        return Ok(None);
-    };
-    for modifier in &values[1..] {
-        let Some(modifier) = expect_text_arg(function_name, "modifier", modifier)? else {
-            return Ok(None);
-        };
-        datetime = apply_datetime_modifier(function_name, datetime, modifier)?;
-    }
-    Ok(Some(datetime))
-}
-
-fn datetime_from_value(function_name: &str, value: &Value) -> Result<Option<DateTime<Utc>>> {
-    match value {
-        Value::Null => Ok(None),
-        Value::Text(value) => parse_datetime_text(function_name, value).map(Some),
-        Value::TimestampMicros(value) | Value::TimestampTzMicros(value) => {
-            datetime_from_epoch_micros(function_name, *value).map(Some)
-        }
-        Value::DateDays(days) => {
-            let micros = i64::from(*days)
-                .checked_mul(EXEC_MICROS_PER_DAY)
-                .ok_or_else(|| DbError::sql(format!("{function_name} date is out of range")))?;
-            datetime_from_epoch_micros(function_name, micros).map(Some)
-        }
-        Value::TimeMicros(micros) => datetime_from_epoch_micros(function_name, *micros).map(Some),
-        other => Err(DbError::sql(format!(
-            "{function_name} expects text or date/time input, got {other:?}"
-        ))),
-    }
-}
-
-fn datetime_from_epoch_micros(function_name: &str, micros: i64) -> Result<DateTime<Utc>> {
-    Utc.timestamp_micros(micros)
-        .single()
-        .ok_or_else(|| DbError::sql(format!("{function_name} timestamp is out of range")))
-}
-
-fn parse_datetime_text(function_name: &str, value: &str) -> Result<DateTime<Utc>> {
-    let trimmed = value.trim();
-    if trimmed.eq_ignore_ascii_case("now") {
-        return Ok(current_utc_datetime());
-    }
-    if let Ok(value) = DateTime::parse_from_rfc3339(trimmed) {
-        return Ok(value.with_timezone(&Utc));
-    }
-    for format in [
-        "%Y-%m-%d %H:%M:%S%.f",
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%dT%H:%M:%S%.f",
-        "%Y-%m-%dT%H:%M:%S",
-    ] {
-        if let Ok(value) = NaiveDateTime::parse_from_str(trimmed, format) {
-            return Ok(DateTime::from_naive_utc_and_offset(value, Utc));
-        }
-    }
-    if let Ok(value) = NaiveDate::parse_from_str(trimmed, "%Y-%m-%d") {
-        let value = value
-            .and_hms_opt(0, 0, 0)
-            .ok_or_else(|| DbError::sql("date value is out of range"))?;
-        return Ok(DateTime::from_naive_utc_and_offset(value, Utc));
-    }
-    Err(DbError::sql(format!(
-        "{function_name} expects ISO-like date/time text or 'now'"
-    )))
-}
-
-fn apply_datetime_modifier(
-    function_name: &str,
-    datetime: DateTime<Utc>,
-    modifier: &str,
-) -> Result<DateTime<Utc>> {
-    let modifier = modifier.trim();
-    if modifier.is_empty() {
-        return Err(DbError::sql(format!(
-            "{function_name} date/time modifier must not be empty"
-        )));
-    }
-    let (sign, body) = if let Some(rest) = modifier.strip_prefix('+') {
-        (1_i64, rest)
-    } else if let Some(rest) = modifier.strip_prefix('-') {
-        (-1_i64, rest)
-    } else {
-        (1_i64, modifier)
-    };
-    let mut parts = body.split_whitespace();
-    let amount = parts
-        .next()
-        .ok_or_else(|| DbError::sql(format!("{function_name} date/time modifier is invalid")))?
-        .parse::<i64>()
-        .map_err(|_| DbError::sql(format!("{function_name} date/time modifier is invalid")))?;
-    let amount = amount
-        .checked_mul(sign)
-        .ok_or_else(|| DbError::sql(format!("{function_name} date/time modifier overflowed")))?;
-    let unit = parts
-        .next()
-        .ok_or_else(|| DbError::sql(format!("{function_name} date/time modifier is invalid")))?;
-    if parts.next().is_some() {
-        return Err(DbError::sql(format!(
-            "{function_name} date/time modifier is invalid"
-        )));
-    }
-    match unit.to_ascii_lowercase().trim_end_matches('s') {
-        "year" => shift_datetime_by_months(
-            datetime,
-            amount.checked_mul(12).ok_or_else(|| {
-                DbError::sql(format!("{function_name} date/time modifier overflowed"))
-            })?,
-        ),
-        "month" => shift_datetime_by_months(datetime, amount),
-        "day" => shift_datetime_by_duration(function_name, datetime, ChronoDuration::days(amount)),
-        "hour" => {
-            shift_datetime_by_duration(function_name, datetime, ChronoDuration::hours(amount))
-        }
-        "minute" => {
-            shift_datetime_by_duration(function_name, datetime, ChronoDuration::minutes(amount))
-        }
-        "second" => {
-            shift_datetime_by_duration(function_name, datetime, ChronoDuration::seconds(amount))
-        }
-        other => Err(DbError::sql(format!(
-            "{function_name} does not support date/time modifier unit {other}"
-        ))),
-    }
-}
-
-fn shift_datetime_by_duration(
-    function_name: &str,
-    datetime: DateTime<Utc>,
-    duration: ChronoDuration,
-) -> Result<DateTime<Utc>> {
-    datetime.checked_add_signed(duration).ok_or_else(|| {
-        DbError::sql(format!(
-            "{function_name} date/time modifier overflowed the supported range"
-        ))
-    })
-}
-
-fn shift_datetime_by_months(datetime: DateTime<Utc>, months: i64) -> Result<DateTime<Utc>> {
-    if months == 0 {
-        return Ok(datetime);
-    }
-    let magnitude = months
-        .checked_abs()
-        .and_then(|value| u32::try_from(value).ok())
-        .ok_or_else(|| DbError::sql("date/time month modifier is out of range"))?;
-    let naive = if months > 0 {
-        datetime
-            .naive_utc()
-            .checked_add_months(Months::new(magnitude))
-    } else {
-        datetime
-            .naive_utc()
-            .checked_sub_months(Months::new(magnitude))
-    };
-    naive
-        .map(|value| DateTime::from_naive_utc_and_offset(value, Utc))
-        .ok_or_else(|| DbError::sql("date/time month modifier overflowed the supported range"))
-}
-
-fn format_date(datetime: DateTime<Utc>) -> String {
-    datetime.format("%Y-%m-%d").to_string()
-}
-
-fn format_time(datetime: DateTime<Utc>) -> String {
-    datetime.format("%H:%M:%S").to_string()
-}
-
-fn format_datetime(datetime: DateTime<Utc>) -> String {
-    datetime.format("%Y-%m-%d %H:%M:%S").to_string()
-}
-
-fn parse_uuid_text(value: &str) -> Result<[u8; 16]> {
-    let compact = if value.len() == 36 {
-        if value.as_bytes().get(8) != Some(&b'-')
-            || value.as_bytes().get(13) != Some(&b'-')
-            || value.as_bytes().get(18) != Some(&b'-')
-            || value.as_bytes().get(23) != Some(&b'-')
-        {
-            return Err(DbError::sql("UUID_PARSE expects canonical UUID text"));
-        }
-        value.replace('-', "")
-    } else if value.len() == 32 {
-        value.to_string()
-    } else {
-        return Err(DbError::sql("UUID_PARSE expects canonical UUID text"));
-    };
-    if compact.len() != 32 {
-        return Err(DbError::sql("UUID_PARSE expects canonical UUID text"));
-    }
-    let mut uuid = [0u8; 16];
-    for (index, chunk) in compact.as_bytes().chunks_exact(2).enumerate() {
-        let text = std::str::from_utf8(chunk)
-            .map_err(|_| DbError::sql("UUID_PARSE expects canonical UUID text"))?;
-        uuid[index] = u8::from_str_radix(text, 16)
-            .map_err(|_| DbError::sql("UUID_PARSE expects canonical UUID text"))?;
-    }
-    Ok(uuid)
-}
-
-fn eval_json_binary_operator(left: &Value, right: &Value, text_mode: bool) -> Result<Value> {
-    let Some(target) = json_operator_target(left, right)? else {
-        return Ok(Value::Null);
-    };
-    if text_mode {
-        match target {
-            JsonValue::Null => Ok(Value::Null),
-            JsonValue::String(value) => Ok(Value::Text(value)),
-            JsonValue::Number(value) => Ok(Value::Text(value)),
-            JsonValue::Bool(value) => Ok(Value::Text(if value {
-                "true".to_string()
-            } else {
-                "false".to_string()
-            })),
-            other => Ok(Value::Text(other.render_json())),
-        }
-    } else {
-        Ok(Value::Text(target.render_json()))
-    }
-}
-
-fn json_operator_target(left: &Value, right: &Value) -> Result<Option<JsonValue>> {
-    let json = match left {
-        Value::Null => return Ok(None),
-        Value::Text(value) => parse_json(value)?,
-        other => {
-            return Err(DbError::sql(format!(
-                "JSON operators expect text JSON input, got {other:?}"
-            )))
-        }
-    };
-    match right {
-        Value::Null => Ok(None),
-        Value::Text(path) if path.starts_with('$') => {
-            let path = parse_json_path(path)?;
-            Ok(json.lookup(&path).cloned())
-        }
-        Value::Text(key) => match &json {
-            JsonValue::Object(object) => Ok(object.get(key).cloned()),
-            JsonValue::Array(array) => {
-                let Ok(index) = key.parse::<usize>() else {
-                    return Ok(None);
-                };
-                Ok(array.get(index).cloned())
-            }
-            _ => Ok(None),
-        },
-        Value::Int64(index) => {
-            let Ok(index) = usize::try_from(*index) else {
-                return Ok(None);
-            };
-            match &json {
-                JsonValue::Array(array) => Ok(array.get(index).cloned()),
-                _ => Ok(None),
-            }
-        }
-        other => Err(DbError::sql(format!(
-            "JSON operators expect text keys or integer indexes, got {other:?}"
-        ))),
-    }
-}
-
-fn expand_json_each_rows(value: &Value) -> Result<Vec<Vec<Value>>> {
-    let Some(json) = json_table_input("json_each", value)? else {
-        return Ok(Vec::new());
-    };
-    match json {
-        JsonValue::Object(object) => object
-            .into_iter()
-            .map(|(key, value)| json_table_row(Value::Text(key), value, None))
-            .collect(),
-        JsonValue::Array(array) => array
-            .into_iter()
-            .enumerate()
-            .map(|(index, value)| {
-                json_table_row(
-                    Value::Int64(i64::try_from(index).unwrap_or(i64::MAX)),
-                    value,
-                    None,
-                )
-            })
-            .collect(),
-        other => Ok(vec![json_table_row(Value::Null, other, None)?]),
-    }
-}
-
-fn expand_json_tree_rows(value: &Value) -> Result<Vec<Vec<Value>>> {
-    let Some(json) = json_table_input("json_tree", value)? else {
-        return Ok(Vec::new());
-    };
-    let mut rows = Vec::new();
-    append_json_tree_rows(Value::Null, json, "$".to_string(), &mut rows)?;
-    Ok(rows)
-}
-
-fn json_table_input(function_name: &str, value: &Value) -> Result<Option<JsonValue>> {
-    match value {
-        Value::Null => Ok(None),
-        Value::Text(value) => parse_json(value).map(Some),
-        other => Err(DbError::sql(format!(
-            "{function_name} expects text JSON input, got {other:?}"
-        ))),
-    }
-}
-
-fn generate_series_rows(values: &[Value]) -> Result<Vec<Value>> {
-    if values.iter().any(|value| matches!(value, Value::Null)) {
-        return Ok(Vec::new());
-    }
-    match values {
-        [Value::Int64(start), Value::Int64(stop)] => {
-            generate_int_series_rows(*start, *stop, 1)
-        }
-        [Value::Int64(start), Value::Int64(stop), Value::Int64(step)] => {
-            generate_int_series_rows(*start, *stop, *step)
-        }
-        [
-            Value::TimestampMicros(start),
-            Value::TimestampMicros(stop),
-            Value::Interval {
-                months,
-                days,
-                micros,
-            },
-        ] => generate_timestamp_series_rows(*start, *stop, *months, *days, *micros),
-        [
-            Value::DateDays(start),
-            Value::DateDays(stop),
-            Value::Interval {
-                months,
-                days,
-                micros,
-            },
-        ] => generate_date_series_rows(*start, *stop, *months, *days, *micros),
-        [Value::TimestampMicros(_), Value::TimestampMicros(_)]
-        | [Value::DateDays(_), Value::DateDays(_)] => Err(DbError::sql(
-            "temporal generate_series requires an INTERVAL step argument",
-        )),
-        _ => Err(DbError::sql(
-            "generate_series supports INT64 start/stop[/step], TIMESTAMP start/stop/INTERVAL step, and DATE start/stop/INTERVAL step",
-        )),
-    }
-}
-
-fn generate_int_series_rows(start: i64, stop: i64, step: i64) -> Result<Vec<Value>> {
-    if step == 0 {
-        return Err(DbError::sql("generate_series step cannot be zero"));
-    }
-    let ascending = step > 0;
-    if (ascending && start > stop) || (!ascending && start < stop) {
-        return Ok(Vec::new());
-    }
-    let mut rows = Vec::new();
-    let mut current = start;
-    loop {
-        push_generate_series_value(&mut rows, Value::Int64(current))?;
-        match current.checked_add(step) {
-            Some(next) if (ascending && next <= stop) || (!ascending && next >= stop) => {
-                current = next;
-            }
-            Some(_) => break,
-            None => break,
-        }
-    }
-    Ok(rows)
-}
-
-fn generate_timestamp_series_rows(
-    start: i64,
-    stop: i64,
-    months: i32,
-    days: i32,
-    micros: i64,
-) -> Result<Vec<Value>> {
-    let first_next = apply_interval_to_timestamp_micros(start, months, days, micros, true)?;
-    let direction = first_next.cmp(&start);
-    if direction == std::cmp::Ordering::Equal {
-        return Err(DbError::sql("generate_series step cannot be zero"));
-    }
-    if (direction == std::cmp::Ordering::Greater && start > stop)
-        || (direction == std::cmp::Ordering::Less && start < stop)
-    {
-        return Ok(Vec::new());
-    }
-
-    let mut rows = Vec::new();
-    let mut current = start;
-    loop {
-        push_generate_series_value(&mut rows, Value::TimestampMicros(current))?;
-        let next = apply_interval_to_timestamp_micros(current, months, days, micros, true)?;
-        if next == current {
-            return Err(DbError::sql("generate_series step cannot be zero"));
-        }
-        let in_range = if direction == std::cmp::Ordering::Greater {
-            next <= stop
-        } else {
-            next >= stop
-        };
-        if !in_range {
-            break;
-        }
-        current = next;
-    }
-    Ok(rows)
-}
-
-fn generate_date_series_rows(
-    start: i32,
-    stop: i32,
-    months: i32,
-    days: i32,
-    micros: i64,
-) -> Result<Vec<Value>> {
-    if months != 0 || micros != 0 {
-        return Err(DbError::sql(
-            "DATE generate_series currently requires an INTERVAL with whole days only",
-        ));
-    }
-    if days == 0 {
-        return Err(DbError::sql("generate_series step cannot be zero"));
-    }
-    let ascending = days > 0;
-    if (ascending && start > stop) || (!ascending && start < stop) {
-        return Ok(Vec::new());
-    }
-    let mut rows = Vec::new();
-    let mut current = start;
-    loop {
-        push_generate_series_value(&mut rows, Value::DateDays(current))?;
-        match current.checked_add(days) {
-            Some(next) if (ascending && next <= stop) || (!ascending && next >= stop) => {
-                current = next;
-            }
-            Some(_) => break,
-            None => break,
-        }
-    }
-    Ok(rows)
-}
-
-fn push_generate_series_value(rows: &mut Vec<Value>, value: Value) -> Result<()> {
-    if rows.len() >= GENERATE_SERIES_MAX_ROWS {
-        return Err(DbError::sql(format!(
-            "generate_series produced more than {GENERATE_SERIES_MAX_ROWS} rows"
-        )));
-    }
-    rows.push(value);
-    Ok(())
-}
-
-fn one_text_arg(function_name: &str, values: Vec<Value>) -> Result<String> {
-    if values.len() != 1 {
-        return Err(DbError::sql(format!("{function_name} expects 1 argument")));
-    }
-    match values.into_iter().next().unwrap_or(Value::Null) {
-        Value::Text(value) => Ok(value),
-        Value::Null => Ok(String::new()),
-        other => Err(DbError::sql(format!(
-            "{function_name} expects a text argument, got {other:?}"
-        ))),
-    }
-}
-
-fn visible_columns(table_name: &str, names: &[&str]) -> Vec<ColumnBinding> {
-    names
-        .iter()
-        .map(|name| ColumnBinding::visible(Some(table_name.to_string()), (*name).to_string()))
-        .collect()
-}
-
-fn compat_catalog_object_is_visible(name: &str) -> bool {
-    !name.starts_with("__decentdb_")
-}
-
-fn pragma_table_info_dataset(
-    table_name: String,
-    columns: &[ColumnSchema],
-    extended: bool,
-) -> Dataset {
-    let mut rows = Vec::new();
-    for (cid, column) in columns.iter().enumerate() {
-        let mut row = vec![
-            Value::Int64(i64::try_from(cid).unwrap_or(i64::MAX)),
-            Value::Text(column.name.clone()),
-            Value::Text(column.column_type.as_str().to_string()),
-            Value::Int64(if column.nullable { 0 } else { 1 }),
-            column.default_sql.clone().map_or(Value::Null, Value::Text),
-            Value::Int64(if column.primary_key { 1 } else { 0 }),
-        ];
-        if extended {
-            let hidden = if column.generated_sql.is_none() {
-                0
-            } else if column.generated_stored {
-                3
-            } else {
-                2
-            };
-            row.push(Value::Int64(hidden));
-        }
-        rows.push(row);
-    }
-    let names = if extended {
-        vec![
-            "cid",
-            "name",
-            "type",
-            "notnull",
-            "dflt_value",
-            "pk",
-            "hidden",
-        ]
-    } else {
-        vec!["cid", "name", "type", "notnull", "dflt_value", "pk"]
-    };
-    Dataset::with_rows(visible_columns(&table_name, &names), rows)
-}
-
-fn table_list_row(schema: &str, name: &str, kind: &str, column_count: usize) -> Vec<Value> {
-    vec![
-        Value::Text(schema.to_string()),
-        Value::Text(name.to_string()),
-        Value::Text(kind.to_string()),
-        Value::Int64(i64::try_from(column_count).unwrap_or(i64::MAX)),
-        Value::Int64(0),
-        Value::Int64(0),
-    ]
-}
-
-fn index_info_rows(index: &IndexSchema, extended: bool) -> Vec<Vec<Value>> {
-    let mut rows = Vec::new();
-    for (seqno, column) in index.columns.iter().enumerate() {
-        let cid = if column.column_name.is_some() {
-            seqno as i64
-        } else {
-            -2
-        };
-        let name = column
-            .column_name
-            .clone()
-            .or_else(|| column.expression_sql.clone())
-            .map_or(Value::Null, Value::Text);
-        let mut row = vec![
-            Value::Int64(i64::try_from(seqno).unwrap_or(i64::MAX)),
-            Value::Int64(cid),
-            name,
-        ];
-        if extended {
-            row.extend([
-                Value::Int64(0),
-                Value::Text("BINARY".to_string()),
-                Value::Int64(1),
-            ]);
-        }
-        rows.push(row);
-    }
-    if extended {
-        let base = rows.len();
-        for (offset, include) in index.include_columns.iter().enumerate() {
-            rows.push(vec![
-                Value::Int64(i64::try_from(base + offset).unwrap_or(i64::MAX)),
-                Value::Int64(-1),
-                Value::Text(include.clone()),
-                Value::Int64(0),
-                Value::Text("BINARY".to_string()),
-                Value::Int64(0),
-            ]);
-        }
-    }
-    rows
-}
-
-fn foreign_key_rows(table: &TableSchema) -> Vec<Vec<Value>> {
-    let mut rows = Vec::new();
-    for (id, foreign_key) in table.foreign_keys.iter().enumerate() {
-        for (seq, (from, to)) in foreign_key
-            .columns
-            .iter()
-            .zip(foreign_key.referenced_columns.iter())
-            .enumerate()
-        {
-            rows.push(vec![
-                Value::Int64(i64::try_from(id).unwrap_or(i64::MAX)),
-                Value::Int64(i64::try_from(seq).unwrap_or(i64::MAX)),
-                Value::Text(foreign_key.referenced_table.clone()),
-                Value::Text(from.clone()),
-                Value::Text(to.clone()),
-                Value::Text(foreign_key_action_sqlite_name(foreign_key.on_update)),
-                Value::Text(foreign_key_action_sqlite_name(foreign_key.on_delete)),
-                Value::Text("NONE".to_string()),
-            ]);
-        }
-    }
-    rows
-}
-
-fn foreign_key_action_sqlite_name(action: ForeignKeyAction) -> String {
-    match action {
-        ForeignKeyAction::NoAction => "NO ACTION",
-        ForeignKeyAction::Restrict => "RESTRICT",
-        ForeignKeyAction::Cascade => "CASCADE",
-        ForeignKeyAction::SetNull => "SET NULL",
-    }
-    .to_string()
-}
-
-fn sqlite_schema_row(kind: &str, name: &str, tbl_name: &str, sql: Option<String>) -> Vec<Value> {
-    vec![
-        Value::Text(kind.to_string()),
-        Value::Text(name.to_string()),
-        Value::Text(tbl_name.to_string()),
-        Value::Int64(0),
-        sql.map_or(Value::Null, Value::Text),
-    ]
-}
-
-fn information_schema_schemata_row(schema: &str) -> Vec<Value> {
-    vec![
-        Value::Text("main".to_string()),
-        Value::Text(schema.to_string()),
-        Value::Text("decentdb".to_string()),
-        Value::Text("main".to_string()),
-        Value::Text(schema.to_string()),
-        Value::Text("UTF-8".to_string()),
-    ]
-}
-
-fn information_schema_table_row(schema: &str, name: &str, table_type: &str) -> Vec<Value> {
-    vec![
-        Value::Text("main".to_string()),
-        Value::Text(schema.to_string()),
-        Value::Text(name.to_string()),
-        Value::Text(table_type.to_string()),
-    ]
-}
-
-fn information_schema_column_rows(
-    schema: &str,
-    table_name: &str,
-    columns: &[ColumnSchema],
-) -> Vec<Vec<Value>> {
-    columns
-        .iter()
-        .enumerate()
-        .map(|(index, column)| {
-            vec![
-                Value::Text("main".to_string()),
-                Value::Text(schema.to_string()),
-                Value::Text(table_name.to_string()),
-                Value::Text(column.name.clone()),
-                Value::Int64(i64::try_from(index + 1).unwrap_or(i64::MAX)),
-                column.default_sql.clone().map_or(Value::Null, Value::Text),
-                Value::Text(if column.nullable { "YES" } else { "NO" }.to_string()),
-                Value::Text(column.column_type.as_str().to_string()),
-            ]
-        })
-        .collect()
-}
-
-fn render_compat_create_table(table: &TableSchema) -> String {
-    let columns = table
-        .columns
-        .iter()
-        .map(|column| {
-            format!(
-                "{} {}",
-                sql_identifier_exec(&column.name),
-                column.column_type.as_str()
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!(
-        "CREATE {}TABLE {} ({});",
-        if table.temporary { "TEMP " } else { "" },
-        sql_identifier_exec(&table.name),
-        columns
-    )
-}
-
-fn render_compat_create_view(view: &ViewSchema) -> String {
-    format!(
-        "CREATE {}VIEW {} AS {};",
-        if view.temporary { "TEMP " } else { "" },
-        sql_identifier_exec(&view.name),
-        view.sql_text
-    )
-}
-
-fn render_compat_create_index(index: &IndexSchema) -> String {
-    let columns = index
-        .columns
-        .iter()
-        .map(|column| {
-            column
-                .column_name
-                .as_deref()
-                .map(sql_identifier_exec)
-                .or_else(|| column.expression_sql.clone())
-                .unwrap_or_else(|| "\"expr\"".to_string())
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!(
-        "CREATE {}INDEX {} ON {} ({});",
-        if index.unique { "UNIQUE " } else { "" },
-        sql_identifier_exec(&index.name),
-        sql_identifier_exec(&index.table_name),
-        columns
-    )
-}
-
-fn render_compat_create_trigger(trigger: &crate::catalog::TriggerSchema) -> String {
-    format!(
-        "CREATE TRIGGER {} {} {} ON {} FOR EACH ROW EXECUTE FUNCTION decentdb_exec_sql({});",
-        sql_identifier_exec(&trigger.name),
-        trigger_kind_name_exec(trigger.kind),
-        trigger_event_name_exec(trigger.event),
-        sql_identifier_exec(&trigger.target_name),
-        sql_string_literal_exec(&trigger.action_sql)
-    )
-}
-
-fn trigger_kind_name_exec(kind: TriggerKind) -> &'static str {
-    match kind {
-        TriggerKind::After => "AFTER",
-        TriggerKind::InsteadOf => "INSTEAD OF",
-    }
-}
-
-fn trigger_event_name_exec(event: TriggerEvent) -> &'static str {
-    match event {
-        TriggerEvent::Insert => "INSERT",
-        TriggerEvent::Update => "UPDATE",
-        TriggerEvent::Delete => "DELETE",
-    }
-}
-
-fn sql_identifier_exec(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
-}
-
-fn sql_string_literal_exec(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
-}
-
-fn append_json_tree_rows(
-    key: Value,
-    value: JsonValue,
-    path: String,
-    rows: &mut Vec<Vec<Value>>,
-) -> Result<()> {
-    rows.push(json_table_row(key, value.clone(), Some(path.clone()))?);
-    match value {
-        JsonValue::Object(object) => {
-            for (child_key, child_value) in object {
-                append_json_tree_rows(
-                    Value::Text(child_key.clone()),
-                    child_value,
-                    format!("{path}.{child_key}"),
-                    rows,
-                )?;
-            }
-        }
-        JsonValue::Array(array) => {
-            for (index, child_value) in array.into_iter().enumerate() {
-                append_json_tree_rows(
-                    Value::Int64(i64::try_from(index).unwrap_or(i64::MAX)),
-                    child_value,
-                    format!("{path}[{index}]"),
-                    rows,
-                )?;
-            }
-        }
-        JsonValue::Null | JsonValue::Bool(_) | JsonValue::String(_) | JsonValue::Number(_) => {}
-    }
-    Ok(())
-}
-
-fn json_table_row(key: Value, value: JsonValue, path: Option<String>) -> Result<Vec<Value>> {
-    let mut row = vec![
-        key,
-        json_value_to_value(value.clone())?,
-        Value::Text(json_type_name(&value).to_string()),
-    ];
-    if let Some(path) = path {
-        row.push(Value::Text(path));
-    }
-    Ok(row)
-}
-
-fn eval_json_array(values: Vec<Value>) -> Result<Value> {
-    let items = values
-        .iter()
-        .map(json_value_from_value)
-        .collect::<Result<Vec<_>>>()?;
-    Ok(Value::Text(JsonValue::Array(items).render_json()))
-}
-
-fn eval_json_object(values: Vec<Value>) -> Result<Value> {
-    if !values.len().is_multiple_of(2) {
-        return Err(DbError::sql(
-            "json_object expects an even number of arguments",
-        ));
-    }
-    let mut object = BTreeMap::new();
-    for pair in values.chunks_exact(2) {
-        let key = match &pair[0] {
-            Value::Text(value) => value.clone(),
-            Value::Null => return Err(DbError::sql("json_object keys cannot be NULL")),
-            other => {
-                return Err(DbError::sql(format!(
-                    "json_object keys must be text, got {other:?}"
-                )))
-            }
-        };
-        object.insert(key, json_value_from_value(&pair[1])?);
-    }
-    Ok(Value::Text(JsonValue::Object(object).render_json()))
-}
-
-fn eval_json_type(values: Vec<Value>) -> Result<Value> {
-    if values.is_empty() || values.len() > 2 {
-        return Err(DbError::sql("json_type expects 1 or 2 arguments"));
-    }
-    let Some(target) = json_target_value(&values)? else {
-        return Ok(Value::Null);
-    };
-    Ok(Value::Text(json_type_name(&target).to_string()))
-}
-
-fn eval_json_valid(values: Vec<Value>) -> Result<Value> {
-    if values.len() != 1 {
-        return Err(DbError::sql("json_valid expects 1 argument"));
-    }
-    match &values[0] {
-        Value::Null => Ok(Value::Null),
-        Value::Text(value) => Ok(Value::Bool(parse_json(value).is_ok())),
-        other => Err(DbError::sql(format!(
-            "json_valid expects text input, got {other:?}"
-        ))),
-    }
-}
-
-fn json_type_name(value: &JsonValue) -> &'static str {
-    match value {
-        JsonValue::Null => "null",
-        JsonValue::Bool(true) => "true",
-        JsonValue::Bool(false) => "false",
-        JsonValue::String(_) => "text",
-        JsonValue::Number(number) => {
-            if number.contains('.') {
-                "real"
-            } else {
-                "integer"
-            }
-        }
-        JsonValue::Array(_) => "array",
-        JsonValue::Object(_) => "object",
-    }
-}
-
-fn json_value_from_value(value: &Value) -> Result<JsonValue> {
-    match value {
-        Value::Null => Ok(JsonValue::Null),
-        Value::Int64(value) => Ok(JsonValue::Number(value.to_string())),
-        Value::Float64(value) => Ok(JsonValue::Number(value.to_string())),
-        Value::Bool(value) => Ok(JsonValue::Bool(*value)),
-        Value::Text(value) => Ok(JsonValue::String(value.clone())),
-        Value::Blob(_) | Value::Geometry(_) | Value::Geography(_) => {
-            Err(DbError::sql("cannot encode binary value as JSON"))
-        }
-        Value::Decimal { scaled, scale } => {
-            Ok(JsonValue::Number(decimal_to_string(*scaled, *scale)))
-        }
-        Value::Uuid(value) => Ok(JsonValue::String(value_to_text(&Value::Uuid(*value))?)),
-        Value::TimestampMicros(value) => Ok(JsonValue::Number(value.to_string())),
-        Value::Enum {
-            enum_type_id,
-            label_id,
-        } => Ok(JsonValue::String(format!("{enum_type_id}:{label_id}"))),
-        Value::IpAddr { family, addr } => Ok(JsonValue::String(format_ip_addr(*family, addr)?)),
-        Value::Cidr {
-            family,
-            prefix_len,
-            network,
-        } => Ok(JsonValue::String(format_cidr(
-            *family,
-            *prefix_len,
-            network,
-        )?)),
-        Value::MacAddr { len, bytes } => Ok(JsonValue::String(format_mac_addr(*len, bytes)?)),
-        Value::DateDays(days) => Ok(JsonValue::String(format_date_days(*days))),
-        Value::TimeMicros(micros) => Ok(JsonValue::String(format_time_micros(*micros)?)),
-        Value::TimestampTzMicros(micros) => {
-            Ok(JsonValue::String(format_timestamp_tz_micros(*micros)))
-        }
-        Value::Interval {
-            months,
-            days,
-            micros,
-        } => Ok(JsonValue::String(format_interval(*months, *days, *micros))),
-    }
-}
-
-fn sort_aggregate_row_indexes(
-    runtime: &EngineRuntime,
-    dataset: &Dataset,
-    row_indexes: &[usize],
-    order_by: &[crate::sql::ast::OrderBy],
-    params: &[Value],
-    ctes: &BTreeMap<String, Dataset>,
-) -> Result<Vec<usize>> {
-    if order_by.is_empty() {
-        return Ok(row_indexes.to_vec());
-    }
-    let mut keyed = row_indexes
-        .iter()
-        .map(|row_index| {
-            let row = dataset
-                .rows
-                .get(*row_index)
-                .map(Vec::as_slice)
-                .ok_or_else(|| DbError::internal("group row index is invalid"))?;
-            let keys = order_by
-                .iter()
-                .map(|order| runtime.eval_expr(&order.expr, dataset, row, params, ctes, None))
-                .collect::<Result<Vec<_>>>()?;
-            Ok((*row_index, keys))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let mut sort_error = None;
-    keyed.sort_by(|(left_index, left_keys), (right_index, right_keys)| {
-        for (order, (left, right)) in order_by.iter().zip(left_keys.iter().zip(right_keys.iter())) {
-            let ordering = match compare_values_with_runtime_collation(
-                Some(runtime),
-                left,
-                right,
-                order.collation.clone(),
-            ) {
-                Ok(ordering) => ordering,
-                Err(error) => {
-                    if sort_error.is_none() {
-                        sort_error = Some(error);
-                    }
-                    std::cmp::Ordering::Equal
-                }
-            };
-            if ordering != std::cmp::Ordering::Equal {
-                return if order.descending {
-                    ordering.reverse()
-                } else {
-                    ordering
-                };
-            }
-        }
-        left_index.cmp(right_index)
-    });
-    if let Some(error) = sort_error {
-        return Err(error);
-    }
-    Ok(keyed.into_iter().map(|(row_index, _)| row_index).collect())
-}
-
-fn values_equal(left: &Value, right: &Value) -> Result<bool> {
-    Ok(compare_values(left, right)? == std::cmp::Ordering::Equal)
-}
-
-fn value_to_numeric_f64(value: Value, fn_name: &str) -> Result<Option<f64>> {
-    match value {
-        Value::Null => Ok(None),
-        Value::Int64(value) => Ok(Some(value as f64)),
-        Value::Float64(value) => Ok(Some(value)),
-        Value::Decimal { scaled, scale } => {
-            Ok(Some((scaled as f64) / 10_f64.powi(i32::from(scale))))
-        }
-        other => Err(DbError::sql(format!(
-            "{fn_name} expects numeric values, got {other:?}"
-        ))),
-    }
-}
-
-fn parse_percentile_fraction(value: Value, fn_name: &str) -> Result<f64> {
-    let Some(fraction) = value_to_numeric_f64(value, fn_name)? else {
-        return Err(DbError::sql(format!("{fn_name} fraction cannot be NULL")));
-    };
-    if !(0.0..=1.0).contains(&fraction) {
-        return Err(DbError::sql(format!(
-            "{fn_name} fraction must be between 0 and 1"
-        )));
-    }
-    Ok(fraction)
-}
-
-fn aggregate_array_agg(
-    ctx: &AggregateEvalContext<'_>,
-    row_indexes: &[usize],
-    expr: &Expr,
-    distinct: bool,
-    order_by: &[crate::sql::ast::OrderBy],
-) -> Result<Value> {
-    let ordered_indexes = sort_aggregate_row_indexes(
-        ctx.runtime,
-        ctx.dataset,
-        row_indexes,
-        order_by,
-        ctx.params,
-        ctx.ctes,
-    )?;
-    let mut values = Vec::new();
-    let mut seen_values = Vec::<Value>::new();
-    for row_index in ordered_indexes {
-        let row = ctx
-            .dataset
-            .rows
-            .get(row_index)
-            .map(Vec::as_slice)
-            .ok_or_else(|| DbError::internal("group row index is invalid"))?;
-        let value = ctx.eval_row(row, expr)?;
-        if distinct {
-            if seen_values
-                .iter()
-                .map(|seen| values_equal(seen, &value))
-                .collect::<Result<Vec<_>>>()?
-                .into_iter()
-                .any(std::convert::identity)
-            {
-                continue;
-            }
-            seen_values.push(value.clone());
-        }
-        values.push(json_value_from_value(&value)?);
-    }
-    Ok(Value::Text(JsonValue::Array(values).render_json()))
-}
-
-fn aggregate_median(
-    ctx: &AggregateEvalContext<'_>,
-    row_indexes: &[usize],
-    expr: &Expr,
-    distinct: bool,
-) -> Result<Value> {
-    let mut values = Vec::new();
-    for row_index in row_indexes {
-        let row = ctx
-            .dataset
-            .rows
-            .get(*row_index)
-            .map(Vec::as_slice)
-            .ok_or_else(|| DbError::internal("group row index is invalid"))?;
-        if let Some(number) = value_to_numeric_f64(ctx.eval_row(row, expr)?, "MEDIAN")? {
-            values.push(number);
-        }
-    }
-    if distinct {
-        values.sort_by(|a, b| a.total_cmp(b));
-        values.dedup_by(|a, b| a.total_cmp(b) == std::cmp::Ordering::Equal);
-    } else {
-        values.sort_by(|a, b| a.total_cmp(b));
-    }
-    if values.is_empty() {
-        return Ok(Value::Null);
-    }
-    let mid = values.len() / 2;
-    if values.len() % 2 == 1 {
-        Ok(Value::Float64(values[mid]))
-    } else {
-        Ok(Value::Float64((values[mid - 1] + values[mid]) / 2.0))
-    }
-}
-
-fn aggregate_percentile_cont(
-    runtime: &EngineRuntime,
-    dataset: &Dataset,
-    row_indexes: &[usize],
-    fraction_expr: &Expr,
-    order_by: &[crate::sql::ast::OrderBy],
-    params: &[Value],
-    ctes: &BTreeMap<String, Dataset>,
-) -> Result<Value> {
-    if order_by.len() != 1 {
-        return Err(DbError::sql(
-            "PERCENTILE_CONT requires exactly one ORDER BY expression",
-        ));
-    }
-    let fraction = parse_percentile_fraction(
-        runtime.eval_expr(fraction_expr, dataset, &[], params, ctes, None)?,
-        "PERCENTILE_CONT",
-    )?;
-    let ordered_indexes =
-        sort_aggregate_row_indexes(runtime, dataset, row_indexes, order_by, params, ctes)?;
-    let mut values = Vec::new();
-    for row_index in ordered_indexes {
-        let row = dataset
-            .rows
-            .get(row_index)
-            .map(Vec::as_slice)
-            .ok_or_else(|| DbError::internal("group row index is invalid"))?;
-        let order_value = runtime.eval_expr(&order_by[0].expr, dataset, row, params, ctes, None)?;
-        if let Some(number) = value_to_numeric_f64(order_value, "PERCENTILE_CONT")? {
-            values.push(number);
-        }
-    }
-    if values.is_empty() {
-        return Ok(Value::Null);
-    }
-    let max_index = (values.len() - 1) as f64;
-    let position = fraction * max_index;
-    let lower_index = position.floor() as usize;
-    let upper_index = position.ceil() as usize;
-    if lower_index == upper_index {
-        Ok(Value::Float64(values[lower_index]))
-    } else {
-        let lower = values[lower_index];
-        let upper = values[upper_index];
-        let weight = position - (lower_index as f64);
-        Ok(Value::Float64(lower + (upper - lower) * weight))
-    }
-}
-
-fn aggregate_percentile_disc(
-    runtime: &EngineRuntime,
-    dataset: &Dataset,
-    row_indexes: &[usize],
-    fraction_expr: &Expr,
-    order_by: &[crate::sql::ast::OrderBy],
-    params: &[Value],
-    ctes: &BTreeMap<String, Dataset>,
-) -> Result<Value> {
-    if order_by.len() != 1 {
-        return Err(DbError::sql(
-            "PERCENTILE_DISC requires exactly one ORDER BY expression",
-        ));
-    }
-    let fraction = parse_percentile_fraction(
-        runtime.eval_expr(fraction_expr, dataset, &[], params, ctes, None)?,
-        "PERCENTILE_DISC",
-    )?;
-    let ordered_indexes =
-        sort_aggregate_row_indexes(runtime, dataset, row_indexes, order_by, params, ctes)?;
-    let mut values = Vec::new();
-    for row_index in ordered_indexes {
-        let row = dataset
-            .rows
-            .get(row_index)
-            .map(Vec::as_slice)
-            .ok_or_else(|| DbError::internal("group row index is invalid"))?;
-        let order_value = runtime.eval_expr(&order_by[0].expr, dataset, row, params, ctes, None)?;
-        if !matches!(order_value, Value::Null) {
-            values.push(order_value);
-        }
-    }
-    if values.is_empty() {
-        return Ok(Value::Null);
-    }
-    let threshold = ((values.len() as f64) * fraction).ceil() as usize;
-    let index = threshold.saturating_sub(1).min(values.len() - 1);
-    Ok(values[index].clone())
-}
-
-fn decimal_to_string(scaled: i64, scale: u8) -> String {
-    if scale == 0 {
-        return scaled.to_string();
-    }
-    let negative = scaled < 0;
-    let digits = scaled.unsigned_abs().to_string();
-    let scale = usize::from(scale);
-    let padded = if digits.len() <= scale {
-        format!("{}{}", "0".repeat(scale + 1 - digits.len()), digits)
-    } else {
-        digits
-    };
-    let split = padded.len() - scale;
-    let mut output = format!("{}.{}", &padded[..split], &padded[split..]);
-    if negative {
-        output.insert(0, '-');
-    }
-    output
-}
-
-fn eval_like(
-    left: Value,
-    right: Value,
-    escape: Option<Value>,
-    case_insensitive: bool,
-    negated: bool,
-) -> Result<Value> {
-    let escape = normalize_like_escape(escape)?;
-    match (left, right) {
-        (Value::Text(left), Value::Text(right)) => {
-            let matches = like_match(&left, &right, case_insensitive, escape);
-            Ok(Value::Bool(if negated { !matches } else { matches }))
-        }
-        (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
-        other => Err(DbError::sql(format!(
-            "LIKE expects text values, got {other:?}"
-        ))),
-    }
-}
-
-fn normalize_like_escape(escape: Option<Value>) -> Result<Option<char>> {
-    match escape {
-        None => Ok(None),
-        Some(Value::Null) => Ok(None),
-        Some(Value::Text(text)) => {
-            let mut chars = text.chars();
-            let Some(ch) = chars.next() else {
-                return Ok(None);
-            };
-            if chars.next().is_some() {
-                return Err(DbError::sql(
-                    "LIKE ESCAPE expression must evaluate to a single character",
-                ));
-            }
-            Ok(Some(ch))
-        }
-        Some(other) => Err(DbError::sql(format!(
-            "LIKE ESCAPE expects text, got {other:?}"
-        ))),
-    }
-}
-
-fn aggregate_group_concat(
-    ctx: &AggregateEvalContext<'_>,
-    row_indexes: &[usize],
-    args: &[Expr],
-    distinct: bool,
-    order_by: &[crate::sql::ast::OrderBy],
-    function_name: &str,
-) -> Result<Value> {
-    let function_name = function_name.to_ascii_uppercase();
-    if args.is_empty() || args.len() > 2 {
-        return Err(DbError::sql(format!(
-            "{function_name} expects 1 or 2 arguments"
-        )));
-    }
-    let ordered_indexes = sort_aggregate_row_indexes(
-        ctx.runtime,
-        ctx.dataset,
-        row_indexes,
-        order_by,
-        ctx.params,
-        ctx.ctes,
-    )?;
-    let mut parts = Vec::new();
-    let mut seen_values = Vec::<Value>::new();
-    let mut separator = ",".to_string();
-    for row_index in ordered_indexes {
-        let row = ctx
-            .dataset
-            .rows
-            .get(row_index)
-            .map(Vec::as_slice)
-            .ok_or_else(|| DbError::internal("group row index is invalid"))?;
-        let value = ctx.eval_row(row, &args[0])?;
-        if matches!(value, Value::Null) {
-            continue;
-        }
-        if distinct {
-            if seen_values
-                .iter()
-                .map(|seen| values_equal(seen, &value))
-                .collect::<Result<Vec<_>>>()?
-                .into_iter()
-                .any(std::convert::identity)
-            {
-                continue;
-            }
-            seen_values.push(value.clone());
-        }
-        if let Some(separator_expr) = args.get(1) {
-            separator = match ctx.eval_row(row, separator_expr)? {
-                Value::Text(value) => value,
-                Value::Null => String::new(),
-                other => {
-                    return Err(DbError::sql(format!(
-                        "{function_name} separator must be text, got {other:?}"
-                    )))
-                }
-            };
-        }
-        parts.push(value_to_text(&value)?);
-    }
-    if parts.is_empty() {
-        Ok(Value::Null)
-    } else {
-        Ok(Value::Text(parts.join(&separator)))
-    }
-}
-
-fn eval_json_array_length(values: Vec<Value>) -> Result<Value> {
-    if values.is_empty() || values.len() > 2 {
-        return Err(DbError::sql("json_array_length expects 1 or 2 arguments"));
-    }
-    let target = json_target_value(&values)?;
-    match target {
-        Some(JsonValue::Array(array)) => Ok(Value::Int64(array.len() as i64)),
-        Some(_) => Ok(Value::Int64(0)),
-        None => Ok(Value::Null),
-    }
-}
-
-fn eval_json_extract(values: Vec<Value>) -> Result<Value> {
-    if values.len() != 2 {
-        return Err(DbError::sql("json_extract expects 2 arguments"));
-    }
-    let Some(target) = json_target_value(&values)? else {
-        return Ok(Value::Null);
-    };
-    json_value_to_value(target)
-}
-
-fn json_target_value(values: &[Value]) -> Result<Option<JsonValue>> {
-    let json = match values.first() {
-        Some(Value::Null) | None => return Ok(None),
-        Some(Value::Text(value)) => parse_json(value)?,
-        Some(other) => {
-            return Err(DbError::sql(format!(
-                "JSON functions expect text input, got {other:?}"
-            )))
-        }
-    };
-    if let Some(path_value) = values.get(1) {
-        let path = match path_value {
-            Value::Null => return Ok(None),
-            Value::Text(path) => parse_json_path(path)?,
-            other => {
-                return Err(DbError::sql(format!(
-                    "JSON path must be text, got {other:?}"
-                )))
-            }
-        };
-        Ok(json.lookup(&path).cloned())
-    } else {
-        Ok(Some(json))
-    }
-}
-
-fn json_value_to_value(value: JsonValue) -> Result<Value> {
-    match value {
-        JsonValue::Null => Ok(Value::Null),
-        JsonValue::Bool(value) => Ok(Value::Bool(value)),
-        JsonValue::String(value) => Ok(Value::Text(value)),
-        JsonValue::Number(value) => {
-            let (scaled, scale) = parse_decimal_text(&value)?;
-            if scale == 0 {
-                Ok(Value::Int64(scaled))
-            } else {
-                Ok(Value::Float64(
-                    (scaled as f64) / 10_f64.powi(i32::from(scale)),
-                ))
-            }
-        }
-        JsonValue::Object(_) | JsonValue::Array(_) => Ok(Value::Text(value.render_json())),
-    }
-}
-
-fn value_to_text(value: &Value) -> Result<String> {
-    match value {
-        Value::Null => Ok(String::new()),
-        Value::Int64(value) => Ok(value.to_string()),
-        Value::Float64(value) => Ok(value.to_string()),
-        Value::Bool(value) => Ok(if *value { "true" } else { "false" }.to_string()),
-        Value::Text(value) => Ok(value.clone()),
-        Value::Blob(_) => Err(DbError::sql("cannot stringify BLOB value")),
-        Value::Decimal { scaled, scale } => {
-            if *scale == 0 {
-                Ok(scaled.to_string())
-            } else {
-                let negative = *scaled < 0;
-                let digits = scaled.unsigned_abs().to_string();
-                let scale = usize::from(*scale);
-                if digits.len() <= scale {
-                    let padded = format!("{digits:0>width$}", width = scale + 1);
-                    let split = padded.len() - scale;
-                    Ok(format!(
-                        "{}{}.{}",
-                        if negative { "-" } else { "" },
-                        &padded[..split],
-                        &padded[split..]
-                    ))
-                } else {
-                    let split = digits.len() - scale;
-                    Ok(format!(
-                        "{}{}.{}",
-                        if negative { "-" } else { "" },
-                        &digits[..split],
-                        &digits[split..]
-                    ))
-                }
-            }
-        }
-        Value::Uuid(value) => Ok(format!(
-            "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-            value[0], value[1], value[2], value[3], value[4], value[5], value[6], value[7],
-            value[8], value[9], value[10], value[11], value[12], value[13], value[14], value[15]
-        )),
-        Value::TimestampMicros(value) => Ok(value.to_string()),
-        Value::Enum {
-            enum_type_id,
-            label_id,
-        } => Ok(format!("{enum_type_id}:{label_id}")),
-        Value::IpAddr { family, addr } => format_ip_addr(*family, addr),
-        Value::Cidr {
-            family,
-            prefix_len,
-            network,
-        } => format_cidr(*family, *prefix_len, network),
-        Value::MacAddr { len, bytes } => format_mac_addr(*len, bytes),
-        Value::DateDays(days) => Ok(format_date_days(*days)),
-        Value::TimeMicros(micros) => format_time_micros(*micros),
-        Value::TimestampTzMicros(micros) => Ok(format_timestamp_tz_micros(*micros)),
-        Value::Interval {
-            months,
-            days,
-            micros,
-        } => Ok(format_interval(*months, *days, *micros)),
-        Value::Geometry(_) | Value::Geography(_) => {
-            Err(DbError::sql("use ST_AsText to render spatial values"))
-        }
-    }
-}
-
-fn cast_value(value: Value, target_type: crate::catalog::ColumnType) -> Result<Value> {
-    if matches!(value, Value::Null) {
-        return Ok(Value::Null);
-    }
-    match target_type {
-        crate::catalog::ColumnType::Int64 => match value {
-            Value::Int64(value) => Ok(Value::Int64(value)),
-            Value::Float64(value) => Ok(Value::Int64(value as i64)),
-            Value::Decimal { scaled, scale } => Ok(Value::Int64(decimal_to_i64(scaled, scale))),
-            Value::Bool(value) => Ok(Value::Int64(if value { 1 } else { 0 })),
-            Value::Text(value) => value
-                .parse::<i64>()
-                .map(Value::Int64)
-                .map_err(|_| DbError::sql("invalid INT64 cast")),
-            other => Err(DbError::sql(format!("cannot cast {other:?} to INT64"))),
-        },
-        crate::catalog::ColumnType::Float64 => match value {
-            Value::Int64(value) => Ok(Value::Float64(value as f64)),
-            Value::Float64(value) => Ok(Value::Float64(value)),
-            Value::Decimal { scaled, scale } => Ok(Value::Float64(decimal_to_f64(scaled, scale))),
-            Value::Text(value) => value
-                .parse::<f64>()
-                .map(Value::Float64)
-                .map_err(|_| DbError::sql("invalid FLOAT64 cast")),
-            other => Err(DbError::sql(format!("cannot cast {other:?} to FLOAT64"))),
-        },
-        crate::catalog::ColumnType::Text => Ok(Value::Text(match value {
-            Value::Text(value) => value,
-            Value::Int64(value) => value.to_string(),
-            Value::Float64(value) => value.to_string(),
-            Value::Bool(value) => value.to_string(),
-            Value::Enum {
-                enum_type_id,
-                label_id,
-            } => format!("{enum_type_id}:{label_id}"),
-            Value::IpAddr { family, addr } => format_ip_addr(family, &addr)?,
-            Value::Cidr {
-                family,
-                prefix_len,
-                network,
-            } => format_cidr(family, prefix_len, &network)?,
-            Value::MacAddr { len, bytes } => format_mac_addr(len, &bytes)?,
-            Value::DateDays(days) => format_date_days(days),
-            Value::TimeMicros(micros) => format_time_micros(micros)?,
-            Value::TimestampTzMicros(micros) => format_timestamp_tz_micros(micros),
-            Value::Interval {
-                months,
-                days,
-                micros,
-            } => format_interval(months, days, micros),
-            other => return Err(DbError::sql(format!("cannot cast {other:?} to TEXT"))),
-        })),
-        crate::catalog::ColumnType::Bool => match value {
-            Value::Bool(value) => Ok(Value::Bool(value)),
-            Value::Text(value) => match value.to_ascii_lowercase().as_str() {
-                "true" | "t" | "1" => Ok(Value::Bool(true)),
-                "false" | "f" | "0" => Ok(Value::Bool(false)),
-                _ => Err(DbError::sql("invalid BOOL cast")),
-            },
-            other => Err(DbError::sql(format!("cannot cast {other:?} to BOOL"))),
-        },
-        crate::catalog::ColumnType::Blob => match value {
-            Value::Blob(value) => Ok(Value::Blob(value)),
-            Value::Uuid(value) => Ok(Value::Blob(value.to_vec())),
-            other => Err(DbError::sql(format!("cannot cast {other:?} to BLOB"))),
-        },
-        crate::catalog::ColumnType::Geometry => match value {
-            Value::Geometry(value) => Ok(Value::Geometry(normalize_geometry_bytes(&value)?)),
-            other => Err(DbError::sql(format!(
-                "cannot cast {other:?} to GEOMETRY; use ST_GeomFromWKB or ST_GeomFromText"
-            ))),
-        },
-        crate::catalog::ColumnType::Geography => match value {
-            Value::Geography(value) => Ok(Value::Geography(normalize_geography_bytes(&value)?)),
-            other => Err(DbError::sql(format!(
-                "cannot cast {other:?} to GEOGRAPHY; use ST_GeogFromWKB or ST_GeogFromText"
-            ))),
-        },
-        crate::catalog::ColumnType::Decimal => match value {
-            Value::Decimal { scaled, scale } => Ok(Value::Decimal { scaled, scale }),
-            Value::Int64(value) => Ok(Value::Decimal {
-                scaled: value,
-                scale: 0,
-            }),
-            Value::Float64(value) => {
-                let (scaled, scale) = parse_decimal_text(&value.to_string())?;
-                Ok(Value::Decimal { scaled, scale })
-            }
-            Value::Text(value) => {
-                let (scaled, scale) = parse_decimal_text(&value)?;
-                Ok(Value::Decimal { scaled, scale })
-            }
-            other => Err(DbError::sql(format!("cannot cast {other:?} to DECIMAL"))),
-        },
-        crate::catalog::ColumnType::Uuid => match value {
-            Value::Uuid(value) => Ok(Value::Uuid(value)),
-            Value::Blob(value) if value.len() == 16 => {
-                let mut uuid = [0u8; 16];
-                uuid.copy_from_slice(&value);
-                Ok(Value::Uuid(uuid))
-            }
-            other => Err(DbError::sql(format!("cannot cast {other:?} to UUID"))),
-        },
-        crate::catalog::ColumnType::Timestamp => match value {
-            Value::TimestampMicros(value) => Ok(Value::TimestampMicros(value)),
-            Value::TimestampTzMicros(value) => Ok(Value::TimestampMicros(value)),
-            Value::Int64(value) => Ok(Value::TimestampMicros(value)),
-            Value::Text(value) => Ok(Value::TimestampMicros(
-                parse_datetime_text("TIMESTAMP cast", &value)?.timestamp_micros(),
-            )),
-            other => Err(DbError::sql(format!("cannot cast {other:?} to TIMESTAMP"))),
-        },
-        crate::catalog::ColumnType::Enum => match value {
-            Value::Enum {
-                enum_type_id,
-                label_id,
-            } => Ok(Value::Enum {
-                enum_type_id,
-                label_id,
-            }),
-            other => Err(DbError::sql(format!(
-                "cannot cast {other:?} to ENUM without column enum metadata"
-            ))),
-        },
-        crate::catalog::ColumnType::IpAddr => match value {
-            Value::IpAddr { family, addr } => Ok(Value::IpAddr { family, addr }),
-            Value::Text(value) => {
-                let (family, addr) = parse_ip_addr(&value)?;
-                Ok(Value::IpAddr { family, addr })
-            }
-            other => Err(DbError::sql(format!("cannot cast {other:?} to IPADDR"))),
-        },
-        crate::catalog::ColumnType::Cidr => match value {
-            Value::Cidr {
-                family,
-                prefix_len,
-                network,
-            } => Ok(Value::Cidr {
-                family,
-                prefix_len,
-                network,
-            }),
-            Value::Text(value) => {
-                let (family, prefix_len, network) = parse_cidr(&value)?;
-                Ok(Value::Cidr {
-                    family,
-                    prefix_len,
-                    network,
-                })
-            }
-            other => Err(DbError::sql(format!("cannot cast {other:?} to CIDR"))),
-        },
-        crate::catalog::ColumnType::MacAddr => match value {
-            Value::MacAddr { len, bytes } => Ok(Value::MacAddr { len, bytes }),
-            Value::Text(value) => {
-                let (len, bytes) = parse_mac_addr(&value)?;
-                Ok(Value::MacAddr { len, bytes })
-            }
-            other => Err(DbError::sql(format!("cannot cast {other:?} to MACADDR"))),
-        },
-        crate::catalog::ColumnType::Date => match value {
-            Value::DateDays(days) => Ok(Value::DateDays(days)),
-            Value::Int64(value) => {
-                let days = i32::try_from(value).map_err(|_| DbError::sql("invalid DATE cast"))?;
-                Ok(Value::DateDays(days))
-            }
-            Value::Text(value) => Ok(Value::DateDays(parse_date_days(&value)?)),
-            other => Err(DbError::sql(format!("cannot cast {other:?} to DATE"))),
-        },
-        crate::catalog::ColumnType::Time => match value {
-            Value::TimeMicros(micros) => Ok(Value::TimeMicros(micros)),
-            Value::Int64(value) => Ok(Value::TimeMicros(value)),
-            Value::Text(value) => Ok(Value::TimeMicros(parse_time_micros(&value)?)),
-            other => Err(DbError::sql(format!("cannot cast {other:?} to TIME"))),
-        },
-        crate::catalog::ColumnType::TimestampTz => match value {
-            Value::TimestampTzMicros(value) => Ok(Value::TimestampTzMicros(value)),
-            Value::TimestampMicros(value) | Value::Int64(value) => {
-                Ok(Value::TimestampTzMicros(value))
-            }
-            Value::Text(value) => Ok(Value::TimestampTzMicros(parse_timestamp_tz_micros(&value)?)),
-            other => Err(DbError::sql(format!(
-                "cannot cast {other:?} to TIMESTAMPTZ"
-            ))),
-        },
-        crate::catalog::ColumnType::Interval => match value {
-            Value::Interval {
-                months,
-                days,
-                micros,
-            } => Ok(Value::Interval {
-                months,
-                days,
-                micros,
-            }),
-            Value::Int64(value) => Ok(Value::Interval {
-                months: 0,
-                days: 0,
-                micros: value,
-            }),
-            Value::Text(value) => {
-                let (months, days, micros) = parse_interval(&value)?;
-                Ok(Value::Interval {
-                    months,
-                    days,
-                    micros,
-                })
-            }
-            other => Err(DbError::sql(format!("cannot cast {other:?} to INTERVAL"))),
-        },
-    }
-}
-
-fn decimal_to_f64(scaled: i64, scale: u8) -> f64 {
-    (scaled as f64) / 10_f64.powi(i32::from(scale))
-}
-
-fn decimal_to_i64(scaled: i64, scale: u8) -> i64 {
-    if scale == 0 {
-        return scaled;
-    }
-    let Some(divisor) = 10_i64.checked_pow(u32::from(scale)) else {
-        return 0;
-    };
-    scaled / divisor
-}
-
-fn infer_column_type_for_ctas(
-    rows: &[Vec<Value>],
-    column_index: usize,
-) -> crate::catalog::ColumnType {
-    for row in rows {
-        let Some(value) = row.get(column_index) else {
-            continue;
-        };
-        match value {
-            Value::Null => continue,
-            Value::Int64(_) => return crate::catalog::ColumnType::Int64,
-            Value::Float64(_) => return crate::catalog::ColumnType::Float64,
-            Value::Text(_) => return crate::catalog::ColumnType::Text,
-            Value::Bool(_) => return crate::catalog::ColumnType::Bool,
-            Value::Blob(_) => return crate::catalog::ColumnType::Blob,
-            Value::Decimal { .. } => return crate::catalog::ColumnType::Decimal,
-            Value::Uuid(_) => return crate::catalog::ColumnType::Uuid,
-            Value::TimestampMicros(_) => return crate::catalog::ColumnType::Timestamp,
-            Value::Enum { .. } => return crate::catalog::ColumnType::Enum,
-            Value::IpAddr { .. } => return crate::catalog::ColumnType::IpAddr,
-            Value::Cidr { .. } => return crate::catalog::ColumnType::Cidr,
-            Value::MacAddr { .. } => return crate::catalog::ColumnType::MacAddr,
-            Value::DateDays(_) => return crate::catalog::ColumnType::Date,
-            Value::TimeMicros(_) => return crate::catalog::ColumnType::Time,
-            Value::TimestampTzMicros(_) => return crate::catalog::ColumnType::TimestampTz,
-            Value::Interval { .. } => return crate::catalog::ColumnType::Interval,
-            Value::Geometry(_) => return crate::catalog::ColumnType::Geometry,
-            Value::Geography(_) => return crate::catalog::ColumnType::Geography,
-        }
-    }
-    crate::catalog::ColumnType::Text
-}
-
-fn truthy(value: &Value) -> Option<bool> {
-    match value {
-        Value::Bool(value) => Some(*value),
-        Value::Null => None,
-        _ => None,
-    }
-}
-
-fn eval_binary(op: &BinaryOp, left: Value, right: Value) -> Result<Value> {
-    match op {
-        BinaryOp::And => Ok(match (truthy(&left), truthy(&right)) {
-            (Some(false), _) | (_, Some(false)) => Value::Bool(false),
-            (Some(true), Some(true)) => Value::Bool(true),
-            _ => Value::Null,
-        }),
-        BinaryOp::Or => Ok(match (truthy(&left), truthy(&right)) {
-            (Some(true), _) | (_, Some(true)) => Value::Bool(true),
-            (Some(false), Some(false)) => Value::Bool(false),
-            _ => Value::Null,
-        }),
-        BinaryOp::Concat => match (left, right) {
-            (Value::Text(left), Value::Text(right)) => Ok(Value::Text(left + &right)),
-            (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
-            other => Err(DbError::sql(format!("cannot concatenate {other:?}"))),
-        },
-        BinaryOp::JsonExtract => eval_json_binary_operator(&left, &right, false),
-        BinaryOp::JsonExtractText => eval_json_binary_operator(&left, &right, true),
-        BinaryOp::Distance => {
-            if matches!(left, Value::Null) || matches!(right, Value::Null) {
-                Ok(Value::Null)
-            } else {
-                Ok(Value::Float64(spatial_distance_values(&left, &right)?))
-            }
-        }
-        BinaryOp::RegexMatch => eval_regex(left, right, false, false),
-        BinaryOp::RegexMatchCaseInsensitive => eval_regex(left, right, true, false),
-        BinaryOp::RegexNotMatch => eval_regex(left, right, false, true),
-        BinaryOp::RegexNotMatchCaseInsensitive => eval_regex(left, right, true, true),
-        BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => {
-            arithmetic(op, left, right)
-        }
-        BinaryOp::IsDistinctFrom => Ok(Value::Bool(
-            compare_values(&left, &right)? != std::cmp::Ordering::Equal,
-        )),
-        BinaryOp::IsNotDistinctFrom => Ok(Value::Bool(
-            compare_values(&left, &right)? == std::cmp::Ordering::Equal,
-        )),
-        _ => {
-            if matches!(left, Value::Null) || matches!(right, Value::Null) {
-                return Ok(Value::Null);
-            }
-            let ordering = compare_values(&left, &right)?;
-            Ok(Value::Bool(match op {
-                BinaryOp::Eq => ordering == std::cmp::Ordering::Equal,
-                BinaryOp::NotEq => ordering != std::cmp::Ordering::Equal,
-                BinaryOp::Lt => ordering == std::cmp::Ordering::Less,
-                BinaryOp::LtEq => ordering != std::cmp::Ordering::Greater,
-                BinaryOp::Gt => ordering == std::cmp::Ordering::Greater,
-                BinaryOp::GtEq => ordering != std::cmp::Ordering::Less,
-                _ => unreachable!(),
-            }))
-        }
-    }
-}
-
-fn compare_values_with_runtime_collation(
-    runtime: Option<&EngineRuntime>,
-    left: &Value,
-    right: &Value,
-    collation: Option<Collation>,
-) -> Result<std::cmp::Ordering> {
-    match (&collation, left, right) {
-        (Some(Collation::Extension(name)), Value::Text(left), Value::Text(right)) => {
-            let Some(runtime) = runtime else {
-                return Err(DbError::sql(format!(
-                    "extension collation {name} requires runtime-aware comparison"
-                )));
-            };
-            crate::extensions::compare_with_collation_from_runtime(runtime, name, left, right)?
-                .ok_or_else(|| DbError::sql(format!("unsupported collation {name}")))
-        }
-        _ => compare_values_with_collation(left, right, collation),
-    }
-}
-
-fn eval_binary_with_collation(
-    runtime: Option<&EngineRuntime>,
-    op: &BinaryOp,
-    left: Value,
-    right: Value,
-    collation: Option<Collation>,
-) -> Result<Value> {
-    if collation.is_none() {
-        return eval_binary(op, left, right);
-    }
-    match op {
-        BinaryOp::IsDistinctFrom => Ok(Value::Bool(
-            compare_values_with_runtime_collation(runtime, &left, &right, collation.clone())?
-                != std::cmp::Ordering::Equal,
-        )),
-        BinaryOp::IsNotDistinctFrom => Ok(Value::Bool(
-            compare_values_with_runtime_collation(runtime, &left, &right, collation.clone())?
-                == std::cmp::Ordering::Equal,
-        )),
-        BinaryOp::Eq
-        | BinaryOp::NotEq
-        | BinaryOp::Lt
-        | BinaryOp::LtEq
-        | BinaryOp::Gt
-        | BinaryOp::GtEq => {
-            if matches!(left, Value::Null) || matches!(right, Value::Null) {
-                return Ok(Value::Null);
-            }
-            let ordering =
-                compare_values_with_runtime_collation(runtime, &left, &right, collation)?;
-            Ok(Value::Bool(match op {
-                BinaryOp::Eq => ordering == std::cmp::Ordering::Equal,
-                BinaryOp::NotEq => ordering != std::cmp::Ordering::Equal,
-                BinaryOp::Lt => ordering == std::cmp::Ordering::Less,
-                BinaryOp::LtEq => ordering != std::cmp::Ordering::Greater,
-                BinaryOp::Gt => ordering == std::cmp::Ordering::Greater,
-                BinaryOp::GtEq => ordering != std::cmp::Ordering::Less,
-                _ => unreachable!(),
-            }))
-        }
-        _ => eval_binary(op, left, right),
-    }
-}
-
-fn eval_regex(left: Value, right: Value, case_insensitive: bool, negated: bool) -> Result<Value> {
-    match (left, right) {
-        (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
-        (Value::Text(left), Value::Text(pattern)) => {
-            let mut builder = regex::RegexBuilder::new(&pattern);
-            builder.case_insensitive(case_insensitive);
-            let regex = builder
-                .build()
-                .map_err(|error| DbError::sql(format!("invalid regular expression: {error}")))?;
-            let matched = regex.is_match(&left);
-            Ok(Value::Bool(if negated { !matched } else { matched }))
-        }
-        other => Err(DbError::sql(format!(
-            "regex operators expect text values, got {other:?}"
-        ))),
-    }
-}
-
 #[cfg(test)]
-#[allow(clippy::items_after_test_module)]
-mod tests {
-    use std::collections::{BTreeMap, BTreeSet};
-    use std::sync::Arc;
-
-    use crate::record::compression::CompressionMode;
-    use crate::search::TrigramQueryResult;
-    use crate::sql::ast::{Expr, FromItem};
-    use crate::sql::parser::parse_sql_statement;
-    use crate::storage::checksum::crc32c_parts;
-    use crate::storage::page::InMemoryPageStore;
-    use crate::{Db, DbConfig, Value};
-
-    use super::{
-        append_paged_table_chunks, decode_manifest_payload, decode_paged_table_manifest_payload,
-        decode_runtime_payload, drop_index_include_columns_section,
-        encode_legacy_table_payload_from_manifest, encode_manifest_payload,
-        encode_paged_table_chunks, encode_paged_table_chunks_from_rows, encode_runtime_payload,
-        encode_table_payload, like_match, persist_paged_table,
-        read_deferred_row_by_id_from_table_payload, read_table_page_manifest_from_state,
-        rewrite_paged_table_from_resident, simple_trigram_lookup,
-        try_append_only_paged_table_from_manifest, ColumnBinding, Dataset, DbTxnPageStore,
-        EngineRuntime, OverflowPointer, PersistedTableState, RuntimeBtreeKeys, RuntimeIndex,
-        StoredRow, TableData, TablePageManifest, TablePageManifestChunk, TableRowSource,
-    };
-
-    const PAGE_SIZE: u32 = 4096;
-
-    #[test]
-    fn like_match_fast_patterns_match_recursive_semantics() {
-        assert!(like_match("Motley Crue", "%Motley%", false, None));
-        assert!(like_match("Motley Crue", "Motley%", false, None));
-        assert!(like_match("The Motley", "%Motley", false, None));
-        assert!(like_match("Motley", "Motley", false, None));
-        assert!(!like_match("motley", "%Motley%", false, None));
-        assert!(like_match("motley", "%Motley%", true, None));
-        assert!(like_match("M_tley", "M$_tley", false, Some('$')));
-        assert!(like_match("", "", false, None));
-        assert!(!like_match("x", "", false, None));
-    }
-
-    #[test]
-    fn simple_expression_projection_fast_path_handles_wildcard_like_order_limit() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE artists (id INT64 PRIMARY KEY, name TEXT)",
-        );
-        execute_sql(&mut runtime, "INSERT INTO artists VALUES (1, 'Motley B')");
-        execute_sql(&mut runtime, "INSERT INTO artists VALUES (2, 'Other')");
-        execute_sql(&mut runtime, "INSERT INTO artists VALUES (3, 'Motley A')");
-
-        let statement = parse_sql_statement(
-            "SELECT * FROM artists WHERE name LIKE '%Motley%' ORDER BY name LIMIT 1",
-        )
-        .expect("parse");
-        let crate::sql::ast::Statement::Query(query) = &statement else {
-            panic!("expected query");
-        };
-        let result = runtime
-            .try_execute_simple_expression_projection_query(query, &[])
-            .expect("execute")
-            .expect("wildcard LIKE query should use streaming expression projection path");
-
-        assert_eq!(result.columns(), &["id".to_string(), "name".to_string()]);
-        assert_eq!(
-            result.rows()[0].values(),
-            &[Value::Int64(3), Value::Text("Motley A".to_string())]
-        );
-    }
-
-    #[test]
-    fn trigram_candidate_lookup_handles_like_wildcards() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE docs (id INT64 PRIMARY KEY, body TEXT)",
-        );
-        execute_sql(&mut runtime, "INSERT INTO docs VALUES (1, 'Motley Crue')");
-        execute_sql(&mut runtime, "INSERT INTO docs VALUES (2, 'Other Motley')");
-        execute_sql(&mut runtime, "INSERT INTO docs VALUES (3, 'Unrelated')");
-        execute_sql(
-            &mut runtime,
-            "CREATE INDEX docs_body_trgm ON docs USING gin (body)",
-        );
-
-        let statement = parse_sql_statement(
-            "SELECT * FROM docs WHERE body LIKE '%Motley%' ORDER BY body LIMIT 10",
-        )
-        .expect("parse");
-        let crate::sql::ast::Statement::Query(query) = &statement else {
-            panic!("expected query");
-        };
-        let crate::sql::ast::QueryBody::Select(select) = &query.body else {
-            panic!("expected select");
-        };
-        let row_ids = runtime
-            .trigram_candidate_row_ids_for_filter(
-                "docs",
-                &None,
-                select.filter.as_ref().expect("filter"),
-                &[],
-                &BTreeMap::new(),
-            )
-            .expect("lookup")
-            .expect("trigram index should produce candidates");
-        assert_eq!(row_ids, vec![1, 2]);
-
-        let result = runtime
-            .try_execute_simple_expression_projection_query(query, &[])
-            .expect("execute")
-            .expect("wildcard LIKE query should use fast projection path");
-        assert_eq!(
-            result
-                .rows()
-                .iter()
-                .map(|row| row.values()[0].clone())
-                .collect::<Vec<_>>(),
-            vec![Value::Int64(1), Value::Int64(2)]
-        );
-    }
-
-    #[test]
-    fn simple_trigram_lookup_rejects_non_candidate_safe_filters() {
-        fn lookup_has_additional_filter(sql: &str) -> Option<bool> {
-            let statement = parse_sql_statement(sql).expect("parse");
-            let crate::sql::ast::Statement::Query(query) = &statement else {
-                panic!("expected query");
-            };
-            let crate::sql::ast::QueryBody::Select(select) = &query.body else {
-                panic!("expected select");
-            };
-            simple_trigram_lookup(select.filter.as_ref().expect("filter"))
-                .map(|lookup| lookup.has_additional_filter)
-        }
-
-        assert!(
-            lookup_has_additional_filter("SELECT * FROM docs WHERE body NOT LIKE '%Motley%'")
-                .is_none()
-        );
-        assert!(lookup_has_additional_filter(
-            "SELECT * FROM docs WHERE body LIKE '%Motley%' OR id = 1"
-        )
-        .is_none());
-        assert_eq!(
-            lookup_has_additional_filter(
-                "SELECT * FROM docs WHERE body LIKE '%Motley%' AND id > 0"
-            ),
-            Some(true)
-        );
-    }
-
-    #[test]
-    fn runtime_clone_preserves_btree_and_trigram_indexes() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE docs (id INT64 PRIMARY KEY, email TEXT, body TEXT)",
-        );
-        execute_sql(&mut runtime, "CREATE INDEX docs_email_idx ON docs (email)");
-        execute_sql(
-            &mut runtime,
-            "CREATE INDEX docs_body_trgm_idx ON docs USING gin (body)",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO docs (id, email, body) VALUES (1, 'a@example.com', 'alphabet soup')",
-        );
-
-        let cloned = runtime.clone();
-
-        let RuntimeIndex::Btree { keys, .. } = cloned
-            .index("docs_email_idx")
-            .expect("email index should be cloned")
-        else {
-            panic!("expected BTREE runtime index");
-        };
-        assert!(!keys.is_empty(), "btree entries should be preserved");
-
-        let RuntimeIndex::Trigram { index } = cloned
-            .index("docs_body_trgm_idx")
-            .expect("trigram index should be cloned")
-        else {
-            panic!("expected trigram runtime index");
-        };
-        assert_eq!(
-            index
-                .query_candidates("alpha", false)
-                .expect("query cloned index"),
-            TrigramQueryResult::Candidates(vec![1])
-        );
-    }
-
-    #[test]
-    fn non_nullable_int64_btree_indexes_use_typed_runtime_keys() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE docs (id INT64 PRIMARY KEY, email TEXT)",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO docs (id, email) VALUES (7, 'a@example.com')",
-        );
-
-        let index_name = runtime
-            .catalog
-            .indexes
-            .keys()
-            .next()
-            .cloned()
-            .expect("primary-key index should exist");
-
-        let RuntimeIndex::Btree { keys, .. } = runtime
-            .index(&index_name)
-            .expect("INT64 index should exist")
-        else {
-            panic!("expected BTREE runtime index");
-        };
-
-        let RuntimeBtreeKeys::UniqueInt64(entries) = keys else {
-            panic!("expected typed INT64 runtime keys");
-        };
-        assert_eq!(entries.get(&7), Some(&7));
-        assert_eq!(
-            keys.row_ids_for_value(&Value::Int64(7))
-                .expect("INT64 lookup should succeed"),
-            vec![7]
-        );
-        assert!(keys
-            .row_ids_for_value(&Value::Text("7".into()))
-            .expect("mismatched lookup should not fail")
-            .is_empty());
-    }
-
-    #[test]
-    fn simple_grouped_wrapped_having_uses_numeric_fast_path() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE seeded (id INT64 PRIMARY KEY, grp INT64, word TEXT)",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO seeded (id, grp, word) VALUES (0, 0, 'beta')",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO seeded (id, grp, word) VALUES (1, 0, 'alpha')",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO seeded (id, grp, word) VALUES (2, 1, 'gamma')",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO seeded (id, grp, word) VALUES (3, 1, 'delta')",
-        );
-
-        let statement = parse_sql_statement(
-            "SELECT grp, UPPER(MIN(word)) AS upper_min FROM seeded \
-             GROUP BY grp HAVING UPPER(MIN(word)) >= 'DELTA' \
-             ORDER BY upper_min DESC",
-        )
-        .expect("parse grouped wrapped having");
-        let crate::sql::ast::Statement::Query(query) = &statement else {
-            panic!("expected query statement");
-        };
-
-        let result = runtime
-            .try_execute_simple_grouped_numeric_aggregate_query(query, &[])
-            .expect("execute grouped wrapped having")
-            .expect("wrapped grouped query should stay on fast path");
-
-        assert_eq!(
-            result.columns(),
-            &["grp".to_string(), "upper_min".to_string()]
-        );
-        assert_eq!(result.rows().len(), 1);
-        assert_eq!(
-            result.rows()[0].values(),
-            &[Value::Int64(1), Value::Text("DELTA".to_string())]
-        );
-    }
-
-    #[test]
-    fn simple_grouped_wrapped_count_having_uses_count_fast_path() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE seeded (id INT64 PRIMARY KEY, grp INT64)",
-        );
-        execute_sql(&mut runtime, "INSERT INTO seeded (id, grp) VALUES (0, 0)");
-        execute_sql(&mut runtime, "INSERT INTO seeded (id, grp) VALUES (1, 0)");
-        execute_sql(&mut runtime, "INSERT INTO seeded (id, grp) VALUES (2, 1)");
-
-        let statement = parse_sql_statement(
-            "SELECT grp, COUNT(*) + 1 AS cnt FROM seeded \
-             GROUP BY grp HAVING COUNT(*) + 1 >= 3 \
-             ORDER BY cnt DESC",
-        )
-        .expect("parse grouped wrapped count");
-        let crate::sql::ast::Statement::Query(query) = &statement else {
-            panic!("expected query statement");
-        };
-
-        let result = runtime
-            .try_execute_simple_grouped_count_query(query, &[])
-            .expect("execute grouped wrapped count")
-            .expect("wrapped grouped count should stay on fast path");
-
-        assert_eq!(result.columns(), &["grp".to_string(), "cnt".to_string()]);
-        assert_eq!(result.rows().len(), 1);
-        assert_eq!(
-            result.rows()[0].values(),
-            &[Value::Int64(0), Value::Int64(3)]
-        );
-    }
-
-    #[test]
-    fn simple_grouped_numeric_multi_order_by_uses_fast_path() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE seeded (id INT64 PRIMARY KEY, grp INT64, n INT64)",
-        );
-        for (id, grp, n) in [(0, 0, 1), (1, 0, 4), (2, 1, 2), (3, 1, 3)] {
-            execute_sql(
-                &mut runtime,
-                &format!("INSERT INTO seeded (id, grp, n) VALUES ({id}, {grp}, {n})"),
-            );
-        }
-
-        let statement = parse_sql_statement(
-            "SELECT grp, SUM(n) AS total, AVG(n) AS avg FROM seeded \
-             GROUP BY grp HAVING SUM(n) >= 3 \
-             ORDER BY total DESC, grp ASC",
-        )
-        .expect("parse grouped numeric");
-        let crate::sql::ast::Statement::Query(query) = &statement else {
-            panic!("expected query statement");
-        };
-
-        let result = runtime
-            .try_execute_simple_grouped_numeric_aggregate_query(query, &[])
-            .expect("execute grouped numeric")
-            .expect("grouped numeric query should stay on fast path");
-
-        assert_eq!(
-            result.columns(),
-            &["grp".to_string(), "total".to_string(), "avg".to_string()]
-        );
-        assert_eq!(result.rows().len(), 2);
-        assert_eq!(
-            result.rows()[0].values(),
-            &[Value::Int64(0), Value::Int64(5), Value::Float64(2.5)]
-        );
-        assert_eq!(
-            result.rows()[1].values(),
-            &[Value::Int64(1), Value::Int64(5), Value::Float64(2.5)]
-        );
-    }
-
-    #[test]
-    fn simple_grouped_numeric_distinct_uses_fast_path() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE seeded (id INT64 PRIMARY KEY, grp INT64, n INT64)",
-        );
-        for (id, grp, n) in [
-            (0, 0, 1),
-            (1, 0, 1),
-            (2, 0, 2),
-            (3, 1, 2),
-            (4, 1, 3),
-            (5, 1, 3),
-        ] {
-            execute_sql(
-                &mut runtime,
-                &format!("INSERT INTO seeded (id, grp, n) VALUES ({id}, {grp}, {n})"),
-            );
-        }
-
-        let statement = parse_sql_statement(
-            "SELECT grp, SUM(DISTINCT n) AS total, AVG(DISTINCT n + 1) AS shifted_avg \
-             FROM seeded GROUP BY grp HAVING SUM(DISTINCT n) >= 3 \
-             ORDER BY total DESC, grp ASC",
-        )
-        .expect("parse grouped numeric distinct");
-        let crate::sql::ast::Statement::Query(query) = &statement else {
-            panic!("expected query statement");
-        };
-
-        let result = runtime
-            .try_execute_simple_grouped_numeric_aggregate_query(query, &[])
-            .expect("execute grouped numeric distinct")
-            .expect("grouped numeric distinct should stay on fast path");
-
-        assert_eq!(
-            result.columns(),
-            &[
-                "grp".to_string(),
-                "total".to_string(),
-                "shifted_avg".to_string()
-            ]
-        );
-        assert_eq!(result.rows().len(), 2);
-        assert_eq!(
-            result.rows()[0].values(),
-            &[Value::Int64(1), Value::Int64(5), Value::Float64(3.5)]
-        );
-        assert_eq!(
-            result.rows()[1].values(),
-            &[Value::Int64(0), Value::Int64(3), Value::Float64(2.5)]
-        );
-    }
-
-    #[test]
-    fn simple_grouped_wrapped_count_multi_order_by_uses_fast_path() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE seeded (id INT64 PRIMARY KEY, grp INT64)",
-        );
-        execute_sql(&mut runtime, "INSERT INTO seeded (id, grp) VALUES (0, 1)");
-        execute_sql(&mut runtime, "INSERT INTO seeded (id, grp) VALUES (1, 1)");
-        execute_sql(&mut runtime, "INSERT INTO seeded (id, grp) VALUES (2, 0)");
-        execute_sql(&mut runtime, "INSERT INTO seeded (id, grp) VALUES (3, 0)");
-
-        let statement = parse_sql_statement(
-            "SELECT grp, COUNT(*) + 1 AS cnt FROM seeded \
-             GROUP BY grp HAVING COUNT(*) + 1 >= 3 \
-             ORDER BY cnt DESC, grp ASC",
-        )
-        .expect("parse grouped wrapped count");
-        let crate::sql::ast::Statement::Query(query) = &statement else {
-            panic!("expected query statement");
-        };
-
-        let result = runtime
-            .try_execute_simple_grouped_count_query(query, &[])
-            .expect("execute grouped wrapped count")
-            .expect("wrapped grouped count should stay on fast path");
-
-        assert_eq!(result.columns(), &["grp".to_string(), "cnt".to_string()]);
-        assert_eq!(result.rows().len(), 2);
-        assert_eq!(
-            result.rows()[0].values(),
-            &[Value::Int64(0), Value::Int64(3)]
-        );
-        assert_eq!(
-            result.rows()[1].values(),
-            &[Value::Int64(1), Value::Int64(3)]
-        );
-    }
-
-    #[test]
-    fn simple_grouped_wrapped_group_projection_uses_count_fast_path() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE seeded (id INT64 PRIMARY KEY, n INT64)",
-        );
-        for id in 0..6 {
-            execute_sql(
-                &mut runtime,
-                &format!("INSERT INTO seeded (id, n) VALUES ({id}, {id})"),
-            );
-        }
-
-        let statement = parse_sql_statement(
-            "SELECT n / 2 + 1 AS bucket, COUNT(*) AS c FROM seeded \
-             GROUP BY n / 2 ORDER BY bucket DESC",
-        )
-        .expect("parse grouped wrapped group count");
-        let crate::sql::ast::Statement::Query(query) = &statement else {
-            panic!("expected query statement");
-        };
-
-        let result = runtime
-            .try_execute_simple_grouped_count_query(query, &[])
-            .expect("execute grouped wrapped group count")
-            .expect("wrapped grouped count should stay on fast path");
-
-        assert_eq!(result.columns(), &["bucket".to_string(), "c".to_string()]);
-        assert_eq!(result.rows().len(), 3);
-        assert_eq!(
-            result.rows()[0].values(),
-            &[Value::Int64(3), Value::Int64(2)]
-        );
-        assert_eq!(
-            result.rows()[2].values(),
-            &[Value::Int64(1), Value::Int64(2)]
-        );
-    }
-
-    #[test]
-    fn simple_grouped_multiple_count_rows_use_numeric_fast_path() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE seeded (id INT64 PRIMARY KEY, grp INT64)",
-        );
-        for (id, grp) in [(0, 0), (1, 0), (2, 1)] {
-            execute_sql(
-                &mut runtime,
-                &format!("INSERT INTO seeded (id, grp) VALUES ({id}, {grp})"),
-            );
-        }
-
-        let statement = parse_sql_statement(
-            "SELECT grp, COUNT(*) AS c, COUNT(*) + 1 AS c_plus_one \
-             FROM seeded GROUP BY grp ORDER BY grp ASC",
-        )
-        .expect("parse grouped repeated count");
-        let crate::sql::ast::Statement::Query(query) = &statement else {
-            panic!("expected query statement");
-        };
-
-        let result = runtime
-            .try_execute_simple_grouped_numeric_aggregate_query(query, &[])
-            .expect("execute grouped repeated count")
-            .expect("grouped repeated count should stay on numeric fast path");
-
-        assert_eq!(
-            result.columns(),
-            &["grp".to_string(), "c".to_string(), "c_plus_one".to_string()]
-        );
-        assert_eq!(result.rows().len(), 2);
-        assert_eq!(
-            result.rows()[0].values(),
-            &[Value::Int64(0), Value::Int64(2), Value::Int64(3)]
-        );
-        assert_eq!(
-            result.rows()[1].values(),
-            &[Value::Int64(1), Value::Int64(1), Value::Int64(2)]
-        );
-    }
-
-    #[test]
-    fn simple_grouped_numeric_multi_column_aggregates_use_fast_path() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE seeded (id INT64 PRIMARY KEY, grp INT64, n INT64, m INT64)",
-        );
-        for (id, grp, n, m) in [(0, 0, 2, 10), (1, 0, 4, 20), (2, 1, 6, 30), (3, 1, 8, 50)] {
-            execute_sql(
-                &mut runtime,
-                &format!("INSERT INTO seeded (id, grp, n, m) VALUES ({id}, {grp}, {n}, {m})"),
-            );
-        }
-
-        let statement = parse_sql_statement(
-            "SELECT grp, SUM(n) AS total_n, AVG(m) AS avg_m \
-             FROM seeded GROUP BY grp ORDER BY grp ASC",
-        )
-        .expect("parse grouped multi-column numeric aggregate");
-        let crate::sql::ast::Statement::Query(query) = &statement else {
-            panic!("expected query statement");
-        };
-
-        let result = runtime
-            .try_execute_simple_grouped_numeric_aggregate_query(query, &[])
-            .expect("execute grouped multi-column numeric aggregate")
-            .expect("grouped multi-column numeric aggregate should stay on fast path");
-
-        assert_eq!(
-            result.columns(),
-            &[
-                "grp".to_string(),
-                "total_n".to_string(),
-                "avg_m".to_string()
-            ]
-        );
-        assert_eq!(result.rows().len(), 2);
-        assert_eq!(
-            result.rows()[0].values(),
-            &[Value::Int64(0), Value::Int64(6), Value::Float64(15.0)]
-        );
-        assert_eq!(
-            result.rows()[1].values(),
-            &[Value::Int64(1), Value::Int64(14), Value::Float64(40.0)]
-        );
-    }
-
-    #[test]
-    fn simple_grouped_wrapped_group_projection_uses_numeric_fast_path() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE seeded (id INT64 PRIMARY KEY, grp INT64, n INT64)",
-        );
-        for (id, grp, n) in [(0, 0, 1), (1, 0, 4), (2, 1, 2), (3, 1, 3)] {
-            execute_sql(
-                &mut runtime,
-                &format!("INSERT INTO seeded (id, grp, n) VALUES ({id}, {grp}, {n})"),
-            );
-        }
-
-        let statement = parse_sql_statement(
-            "SELECT grp + 1 AS next_grp, SUM(n) AS total FROM seeded \
-             GROUP BY grp ORDER BY next_grp DESC",
-        )
-        .expect("parse grouped wrapped group numeric");
-        let crate::sql::ast::Statement::Query(query) = &statement else {
-            panic!("expected query statement");
-        };
-
-        let result = runtime
-            .try_execute_simple_grouped_numeric_aggregate_query(query, &[])
-            .expect("execute grouped wrapped group numeric")
-            .expect("wrapped grouped numeric query should stay on fast path");
-
-        assert_eq!(
-            result.columns(),
-            &["next_grp".to_string(), "total".to_string()]
-        );
-        assert_eq!(result.rows().len(), 2);
-        assert_eq!(
-            result.rows()[0].values(),
-            &[Value::Int64(2), Value::Int64(5)]
-        );
-        assert_eq!(
-            result.rows()[1].values(),
-            &[Value::Int64(1), Value::Int64(5)]
-        );
-    }
-
-    #[test]
-    fn simple_grouped_numeric_expression_aggregates_use_fast_path() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE seeded (id INT64 PRIMARY KEY, grp INT64, n INT64, m INT64)",
-        );
-        for (id, grp, n, m) in [(0, 0, 2, 10), (1, 0, 4, 20), (2, 1, 6, 30), (3, 1, 8, 50)] {
-            execute_sql(
-                &mut runtime,
-                &format!("INSERT INTO seeded (id, grp, n, m) VALUES ({id}, {grp}, {n}, {m})"),
-            );
-        }
-
-        let statement = parse_sql_statement(
-            "SELECT grp, SUM(n + m) AS total, AVG(m - n) AS avg_delta \
-             FROM seeded GROUP BY grp HAVING SUM(n + m) >= 30 \
-             ORDER BY total DESC, grp ASC",
-        )
-        .expect("parse grouped numeric expression aggregate");
-        let crate::sql::ast::Statement::Query(query) = &statement else {
-            panic!("expected query statement");
-        };
-
-        let result = runtime
-            .try_execute_simple_grouped_numeric_aggregate_query(query, &[])
-            .expect("execute grouped numeric expression aggregate")
-            .expect("grouped numeric expression aggregate should stay on fast path");
-
-        assert_eq!(
-            result.columns(),
-            &[
-                "grp".to_string(),
-                "total".to_string(),
-                "avg_delta".to_string()
-            ]
-        );
-        assert_eq!(result.rows().len(), 2);
-        assert_eq!(
-            result.rows()[0].values(),
-            &[Value::Int64(1), Value::Int64(94), Value::Float64(33.0)]
-        );
-        assert_eq!(
-            result.rows()[1].values(),
-            &[Value::Int64(0), Value::Int64(36), Value::Float64(12.0)]
-        );
-    }
-
-    #[test]
-    fn simple_grouped_count_expr_uses_numeric_fast_path() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE seeded (id INT64 PRIMARY KEY, grp INT64, n INT64)",
-        );
-        for (id, grp, n) in [(0, 0, "1"), (1, 0, "NULL"), (2, 1, "5"), (3, 1, "7")] {
-            execute_sql(
-                &mut runtime,
-                &format!("INSERT INTO seeded (id, grp, n) VALUES ({id}, {grp}, {n})"),
-            );
-        }
-
-        let statement = parse_sql_statement(
-            "SELECT grp, COUNT(n) AS present, COUNT(n + 1) AS shifted \
-             FROM seeded GROUP BY grp HAVING COUNT(n) >= 1 \
-             ORDER BY present DESC, grp ASC",
-        )
-        .expect("parse grouped count expr");
-        let crate::sql::ast::Statement::Query(query) = &statement else {
-            panic!("expected query statement");
-        };
-
-        let result = runtime
-            .try_execute_simple_grouped_numeric_aggregate_query(query, &[])
-            .expect("execute grouped count expr")
-            .expect("grouped count expr should stay on fast path");
-
-        assert_eq!(
-            result.columns(),
-            &[
-                "grp".to_string(),
-                "present".to_string(),
-                "shifted".to_string()
-            ]
-        );
-        assert_eq!(result.rows().len(), 2);
-        assert_eq!(
-            result.rows()[0].values(),
-            &[Value::Int64(1), Value::Int64(2), Value::Int64(2)]
-        );
-        assert_eq!(
-            result.rows()[1].values(),
-            &[Value::Int64(0), Value::Int64(1), Value::Int64(1)]
-        );
-    }
-
-    #[test]
-    fn simple_grouped_count_distinct_uses_numeric_fast_path() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE seeded (id INT64 PRIMARY KEY, grp INT64, n INT64)",
-        );
-        for (id, grp, n) in [
-            (0, 0, "1"),
-            (1, 0, "1"),
-            (2, 0, "NULL"),
-            (3, 1, "2"),
-            (4, 1, "3"),
-            (5, 1, "3"),
-        ] {
-            execute_sql(
-                &mut runtime,
-                &format!("INSERT INTO seeded (id, grp, n) VALUES ({id}, {grp}, {n})"),
-            );
-        }
-
-        let statement = parse_sql_statement(
-            "SELECT grp, COUNT(DISTINCT n) AS uniq, COUNT(DISTINCT n + 1) AS shifted \
-             FROM seeded GROUP BY grp HAVING COUNT(DISTINCT n) >= 1 \
-             ORDER BY uniq DESC, grp ASC",
-        )
-        .expect("parse grouped count distinct");
-        let crate::sql::ast::Statement::Query(query) = &statement else {
-            panic!("expected query statement");
-        };
-
-        let result = runtime
-            .try_execute_simple_grouped_numeric_aggregate_query(query, &[])
-            .expect("execute grouped count distinct")
-            .expect("grouped count distinct should stay on fast path");
-
-        assert_eq!(
-            result.columns(),
-            &["grp".to_string(), "uniq".to_string(), "shifted".to_string()]
-        );
-        assert_eq!(result.rows().len(), 2);
-        assert_eq!(
-            result.rows()[0].values(),
-            &[Value::Int64(1), Value::Int64(2), Value::Int64(2)]
-        );
-        assert_eq!(
-            result.rows()[1].values(),
-            &[Value::Int64(0), Value::Int64(1), Value::Int64(1)]
-        );
-    }
-
-    #[test]
-    fn simple_grouped_total_variance_bool_use_numeric_fast_path() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE seeded (id INT64 PRIMARY KEY, grp INT64, n INT64, flag BOOLEAN)",
-        );
-        for (id, grp, n, flag) in [
-            (0, 0, 1, true),
-            (1, 0, 1, true),
-            (2, 0, 3, false),
-            (3, 1, 2, true),
-            (4, 1, 4, true),
-        ] {
-            execute_sql(
-                &mut runtime,
-                &format!("INSERT INTO seeded (id, grp, n, flag) VALUES ({id}, {grp}, {n}, {flag})"),
-            );
-        }
-
-        let statement = parse_sql_statement(
-            "SELECT grp, TOTAL(DISTINCT n) AS total_n, VAR_SAMP(DISTINCT n) AS spread, \
-             BOOL_AND(DISTINCT flag) AS all_true \
-             FROM seeded GROUP BY grp HAVING TOTAL(DISTINCT n) >= 4 ORDER BY grp ASC",
-        )
-        .expect("parse grouped total variance bool");
-        let crate::sql::ast::Statement::Query(query) = &statement else {
-            panic!("expected query statement");
-        };
-
-        let result = runtime
-            .try_execute_simple_grouped_numeric_aggregate_query(query, &[])
-            .expect("execute grouped total variance bool")
-            .expect("grouped total variance bool should stay on fast path");
-
-        assert_eq!(
-            result.columns(),
-            &[
-                "grp".to_string(),
-                "total_n".to_string(),
-                "spread".to_string(),
-                "all_true".to_string(),
-            ]
-        );
-        assert_eq!(result.rows().len(), 2);
-        assert_eq!(
-            result.rows()[0].values(),
-            &[
-                Value::Int64(0),
-                Value::Float64(4.0),
-                Value::Float64(2.0),
-                Value::Bool(false),
-            ]
-        );
-        assert_eq!(
-            result.rows()[1].values(),
-            &[
-                Value::Int64(1),
-                Value::Float64(6.0),
-                Value::Float64(2.0),
-                Value::Bool(true),
-            ]
-        );
-    }
-
-    #[test]
-    fn simple_grouped_having_only_aggregate_uses_numeric_fast_path() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE seeded (id INT64 PRIMARY KEY, grp INT64, n INT64)",
-        );
-        for (id, grp, n) in [(0, 0, 1), (1, 0, 4), (2, 1, 1)] {
-            execute_sql(
-                &mut runtime,
-                &format!("INSERT INTO seeded (id, grp, n) VALUES ({id}, {grp}, {n})"),
-            );
-        }
-
-        let statement = parse_sql_statement(
-            "SELECT grp, COUNT(*) AS c FROM seeded \
-             GROUP BY grp HAVING SUM(n) >= 3 ORDER BY grp ASC",
-        )
-        .expect("parse grouped having-only aggregate");
-        let crate::sql::ast::Statement::Query(query) = &statement else {
-            panic!("expected query statement");
-        };
-
-        let result = runtime
-            .try_execute_simple_grouped_numeric_aggregate_query(query, &[])
-            .expect("execute grouped having-only aggregate")
-            .expect("grouped having-only aggregate should stay on fast path");
-
-        assert_eq!(result.columns(), &["grp".to_string(), "c".to_string()]);
-        assert_eq!(result.rows().len(), 1);
-        assert_eq!(
-            result.rows()[0].values(),
-            &[Value::Int64(0), Value::Int64(2)]
-        );
-    }
-
-    #[test]
-    fn simple_grouped_count_with_expression_filter_uses_fast_path() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE seeded (id INT64 PRIMARY KEY, grp INT64, n INT64, m INT64)",
-        );
-        for (id, grp, n, m) in [(0, 0, 1, 1), (1, 0, 2, 4), (2, 1, 3, 1), (3, 1, 1, 0)] {
-            execute_sql(
-                &mut runtime,
-                &format!("INSERT INTO seeded (id, grp, n, m) VALUES ({id}, {grp}, {n}, {m})"),
-            );
-        }
-
-        let statement = parse_sql_statement(
-            "SELECT grp, COUNT(*) AS c FROM seeded \
-             WHERE n + m >= 5 GROUP BY grp ORDER BY grp ASC",
-        )
-        .expect("parse grouped count with expression filter");
-        let crate::sql::ast::Statement::Query(query) = &statement else {
-            panic!("expected query statement");
-        };
-
-        let result = runtime
-            .try_execute_simple_grouped_count_query(query, &[])
-            .expect("execute grouped count with expression filter")
-            .expect("grouped count with expression filter should stay on fast path");
-
-        assert_eq!(result.columns(), &["grp".to_string(), "c".to_string()]);
-        assert_eq!(result.rows().len(), 1);
-        assert_eq!(
-            result.rows()[0].values(),
-            &[Value::Int64(0), Value::Int64(1)]
-        );
-    }
-
-    #[test]
-    fn simple_grouped_numeric_with_expression_filter_uses_fast_path() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE seeded (id INT64 PRIMARY KEY, grp INT64, n INT64, m INT64)",
-        );
-        for (id, grp, n, m) in [(0, 0, 1, 1), (1, 0, 2, 4), (2, 1, 3, 1), (3, 1, 1, 0)] {
-            execute_sql(
-                &mut runtime,
-                &format!("INSERT INTO seeded (id, grp, n, m) VALUES ({id}, {grp}, {n}, {m})"),
-            );
-        }
-
-        let statement = parse_sql_statement(
-            "SELECT grp, SUM(n) AS total FROM seeded \
-             WHERE n + m >= 4 GROUP BY grp ORDER BY grp ASC",
-        )
-        .expect("parse grouped numeric with expression filter");
-        let crate::sql::ast::Statement::Query(query) = &statement else {
-            panic!("expected query statement");
-        };
-
-        let result = runtime
-            .try_execute_simple_grouped_numeric_aggregate_query(query, &[])
-            .expect("execute grouped numeric with expression filter")
-            .expect("grouped numeric with expression filter should stay on fast path");
-
-        assert_eq!(result.columns(), &["grp".to_string(), "total".to_string()]);
-        assert_eq!(result.rows().len(), 2);
-        assert_eq!(
-            result.rows()[0].values(),
-            &[Value::Int64(0), Value::Int64(2)]
-        );
-        assert_eq!(
-            result.rows()[1].values(),
-            &[Value::Int64(1), Value::Int64(3)]
-        );
-    }
-
-    #[test]
-    fn simple_column_projection_with_expression_filter_uses_expression_fast_path() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE seeded (id INT64 PRIMARY KEY, n INT64, m INT64)",
-        );
-        for (id, n, m) in [(0, 1, 1), (1, 2, 4), (2, 3, 1), (3, 1, 0)] {
-            execute_sql(
-                &mut runtime,
-                &format!("INSERT INTO seeded (id, n, m) VALUES ({id}, {n}, {m})"),
-            );
-        }
-
-        let statement = parse_sql_statement("SELECT n FROM seeded WHERE n + m >= 5 ORDER BY n ASC")
-            .expect("parse filtered column projection");
-        let crate::sql::ast::Statement::Query(query) = &statement else {
-            panic!("expected query statement");
-        };
-
-        let result = runtime
-            .try_execute_simple_expression_projection_query(query, &[])
-            .expect("execute filtered column projection")
-            .expect("filtered column projection should stay on expression fast path");
-
-        assert_eq!(result.columns(), &["n".to_string()]);
-        assert_eq!(result.rows().len(), 1);
-        assert_eq!(result.rows()[0].values(), &[Value::Int64(2)]);
-    }
-
-    #[test]
-    fn distinct_column_projection_with_expression_filter_uses_expression_fast_path() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE seeded (id INT64 PRIMARY KEY, grp INT64, n INT64, m INT64)",
-        );
-        for (id, grp, n, m) in [(0, 0, 1, 1), (1, 0, 2, 4), (2, 1, 3, 1), (3, 1, 2, 3)] {
-            execute_sql(
-                &mut runtime,
-                &format!("INSERT INTO seeded (id, grp, n, m) VALUES ({id}, {grp}, {n}, {m})"),
-            );
-        }
-
-        let statement = parse_sql_statement("SELECT DISTINCT grp FROM seeded WHERE n + m >= 5")
-            .expect("parse distinct filtered column projection");
-        let crate::sql::ast::Statement::Query(query) = &statement else {
-            panic!("expected query statement");
-        };
-
-        let result = runtime
-            .try_execute_simple_expression_projection_query(query, &[])
-            .expect("execute distinct filtered column projection")
-            .expect("distinct filtered column projection should stay on expression fast path");
-
-        assert_eq!(result.columns(), &["grp".to_string()]);
-        assert_eq!(result.rows().len(), 2);
-        assert_eq!(result.rows()[0].values(), &[Value::Int64(0)]);
-        assert_eq!(result.rows()[1].values(), &[Value::Int64(1)]);
-    }
-
-    #[test]
-    fn simple_indexed_projection_order_by_limit_offset_uses_fast_path() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE artists (id INT64 PRIMARY KEY, name_normalized TEXT, raw_id TEXT)",
-        );
-        execute_sql(
-            &mut runtime,
-            "CREATE INDEX artists_name_normalized_idx ON artists (name_normalized)",
-        );
-        execute_sql(
-            &mut runtime,
-            "CREATE UNIQUE INDEX artists_raw_id_idx ON artists (raw_id)",
-        );
-        for (id, normalized, raw_id) in [
-            (10, "shared", "mbid-010"),
-            (20, "shared", "mbid-020"),
-            (30, "shared", "mbid-030"),
-            (40, "other", "mbid-040"),
-        ] {
-            execute_sql(
-                &mut runtime,
-                &format!(
-                    "INSERT INTO artists (id, name_normalized, raw_id) VALUES ({id}, '{normalized}', '{raw_id}')"
-                ),
-            );
-        }
-
-        let statement = parse_sql_statement(
-            "SELECT id, raw_id FROM artists \
-             WHERE name_normalized = 'shared' ORDER BY id DESC LIMIT 1 OFFSET 1",
-        )
-        .expect("parse ordered indexed projection");
-        let crate::sql::ast::Statement::Query(query) = &statement else {
-            panic!("expected query statement");
-        };
-
-        let result = runtime
-            .try_execute_simple_indexed_projection_query(query, &[])
-            .expect("execute ordered indexed projection")
-            .expect("ordered indexed projection should stay on fast path");
-
-        assert_eq!(result.columns(), &["id".to_string(), "raw_id".to_string()]);
-        assert_eq!(result.rows().len(), 1);
-        assert_eq!(
-            result.rows()[0].values(),
-            &[Value::Int64(20), Value::Text("mbid-020".to_string())]
-        );
-
-        let statement =
-            parse_sql_statement("SELECT id FROM artists WHERE raw_id = $1 ORDER BY id ASC LIMIT 1")
-                .expect("parse parameterized indexed projection");
-        let crate::sql::ast::Statement::Query(query) = &statement else {
-            panic!("expected query statement");
-        };
-
-        let result = runtime
-            .try_execute_simple_indexed_projection_query(
-                query,
-                &[Value::Text("mbid-030".to_string())],
-            )
-            .expect("execute parameterized indexed projection")
-            .expect("parameterized indexed projection should stay on fast path");
-
-        assert_eq!(result.columns(), &["id".to_string()]);
-        assert_eq!(result.rows().len(), 1);
-        assert_eq!(result.rows()[0].values(), &[Value::Int64(30)]);
-    }
-
-    #[test]
-    fn simple_projection_no_order_by_offset_limit_uses_fast_path() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE songs (id INT64 PRIMARY KEY, title TEXT)",
-        );
-        for id in 1..=5 {
-            execute_sql(
-                &mut runtime,
-                &format!("INSERT INTO songs (id, title) VALUES ({id}, 't{id}')"),
-            );
-        }
-
-        let statement =
-            parse_sql_statement("SELECT id FROM songs LIMIT 3 OFFSET 2").expect("parse query");
-        let crate::sql::ast::Statement::Query(query) = &statement else {
-            panic!("expected query");
-        };
-
-        let result = runtime
-            .try_execute_simple_table_projection_query(query, &[])
-            .expect("execute")
-            .expect("simple table projection should stay on fast path");
-
-        assert_eq!(result.columns(), &["id".to_string()]);
-        assert_eq!(result.rows().len(), 3);
-        assert_eq!(result.rows()[0].values(), &[Value::Int64(3)]);
-        assert_eq!(result.rows()[1].values(), &[Value::Int64(4)]);
-        assert_eq!(result.rows()[2].values(), &[Value::Int64(5)]);
-    }
-
-    #[test]
-    fn simple_filtered_projection_no_order_by_offset_limit_uses_fast_path() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE users (id INT64 PRIMARY KEY, age INT64)",
-        );
-        for (id, age) in [(1, 21), (2, 22), (3, 23), (4, 24), (5, 25)] {
-            execute_sql(
-                &mut runtime,
-                &format!("INSERT INTO users (id, age) VALUES ({id}, {age})"),
-            );
-        }
-
-        let statement = parse_sql_statement(
-            "SELECT id FROM users WHERE age >= 22 AND age <= 25 LIMIT 2 OFFSET 1",
-        )
-        .expect("parse filtered query");
-        let crate::sql::ast::Statement::Query(query) = &statement else {
-            panic!("expected query");
-        };
-
-        let result = runtime
-            .try_execute_simple_filtered_projection_query(query, &[])
-            .expect("execute")
-            .expect("filtered projection should stay on fast path");
-
-        assert_eq!(result.columns(), &["id".to_string()]);
-        assert_eq!(result.rows().len(), 2);
-        assert_eq!(result.rows()[0].values(), &[Value::Int64(3)]);
-        assert_eq!(result.rows()[1].values(), &[Value::Int64(4)]);
-    }
-
-    #[test]
-    fn simple_indexed_join_multi_order_by_uses_fast_path() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE docs (id INT64 PRIMARY KEY, body TEXT)",
-        );
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE archive (id INT64 PRIMARY KEY, doc_id INT64, note TEXT)",
-        );
-        execute_sql(
-            &mut runtime,
-            "CREATE INDEX archive_doc_idx ON archive (doc_id)",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO docs (id, body) VALUES (8, 'doc-8')",
-        );
-        for (id, note) in [(1000, "note-z"), (1001, "note-z"), (1002, "note-a")] {
-            execute_sql(
-                &mut runtime,
-                &format!("INSERT INTO archive (id, doc_id, note) VALUES ({id}, 8, '{note}')"),
-            );
-        }
-
-        let statement = parse_sql_statement(
-            "SELECT docs.id, archive.id AS archive_id, archive.note \
-             FROM docs JOIN archive ON docs.id = archive.doc_id \
-             WHERE docs.id = 8 \
-             ORDER BY archive.note DESC, archive_id ASC",
-        )
-        .expect("parse indexed join");
-        let crate::sql::ast::Statement::Query(query) = &statement else {
-            panic!("expected query statement");
-        };
-
-        let result = runtime
-            .try_execute_simple_indexed_join_projection_query(query, &[])
-            .expect("execute indexed join")
-            .expect("indexed join query should stay on fast path");
-
-        assert_eq!(
-            result.columns(),
-            &[
-                "id".to_string(),
-                "archive_id".to_string(),
-                "note".to_string()
-            ]
-        );
-        assert_eq!(result.rows().len(), 3);
-        assert_eq!(
-            result.rows()[0].values(),
-            &[
-                Value::Int64(8),
-                Value::Int64(1000),
-                Value::Text("note-z".to_string())
-            ]
-        );
-        assert_eq!(
-            result.rows()[1].values(),
-            &[
-                Value::Int64(8),
-                Value::Int64(1001),
-                Value::Text("note-z".to_string())
-            ]
-        );
-        assert_eq!(
-            result.rows()[2].values(),
-            &[
-                Value::Int64(8),
-                Value::Int64(1002),
-                Value::Text("note-a".to_string())
-            ]
-        );
-    }
-
-    #[test]
-    fn simple_indexed_join_filters_source_rowid_alias_without_secondary_index() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE join_users (id INT64 PRIMARY KEY, name TEXT)",
-        );
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE join_profiles (id INT64 PRIMARY KEY, bio TEXT)",
-        );
-        for id in 1..=3 {
-            execute_sql(
-                &mut runtime,
-                &format!("INSERT INTO join_users (id, name) VALUES ({id}, 'u{id}')"),
-            );
-            execute_sql(
-                &mut runtime,
-                &format!("INSERT INTO join_profiles (id, bio) VALUES ({id}, 'b{id}')"),
-            );
-        }
-
-        let statement = parse_sql_statement(
-            "SELECT u.name, p.bio \
-             FROM join_users AS u \
-             JOIN join_profiles AS p ON u.id = p.id \
-             WHERE u.id = $1",
-        )
-        .expect("parse indexed join");
-        let crate::sql::ast::Statement::Query(query) = &statement else {
-            panic!("expected query statement");
-        };
-
-        let result = runtime
-            .try_execute_simple_indexed_join_projection_query(query, &[Value::Int64(2)])
-            .expect("execute indexed join")
-            .expect("rowid-filtered join query should stay on fast path");
-
-        assert_eq!(result.rows().len(), 1);
-        assert_eq!(
-            result.rows()[0].values(),
-            &[Value::Text("u2".to_string()), Value::Text("b2".to_string())]
-        );
-    }
-
-    #[test]
-    fn indexed_table_lookup_filters_rowid_alias_without_secondary_index() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE lookup_users (id INT64 PRIMARY KEY, name TEXT)",
-        );
-        for id in 1..=3 {
-            execute_sql(
-                &mut runtime,
-                &format!("INSERT INTO lookup_users (id, name) VALUES ({id}, 'u{id}')"),
-            );
-        }
-
-        let lookup = runtime
-            .indexed_table_lookup(
-                "lookup_users",
-                &Some("u".to_string()),
-                "id",
-                &Expr::Parameter(1),
-                &[Value::Int64(2)],
-                &BTreeMap::new(),
-            )
-            .expect("lookup should execute")
-            .expect("rowid alias lookup should be handled without a secondary index");
-        assert_eq!(lookup.rows.len(), 1);
-        assert_eq!(
-            lookup.rows[0],
-            vec![Value::Int64(2), Value::Text("u2".to_string())]
-        );
-        assert!(lookup
-            .columns
-            .iter()
-            .all(|column| column.table.as_deref().is_some_and(|table| table == "u")));
-
-        let missing = runtime
-            .indexed_table_lookup(
-                "lookup_users",
-                &None,
-                "id",
-                &Expr::Parameter(1),
-                &[Value::Int64(99)],
-                &BTreeMap::new(),
-            )
-            .expect("missing lookup should execute")
-            .expect("rowid alias lookup should still claim the fast path");
-        assert!(missing.rows.is_empty());
-
-        let wrong_type = runtime
-            .indexed_table_lookup(
-                "lookup_users",
-                &None,
-                "id",
-                &Expr::Parameter(1),
-                &[Value::Text("2".to_string())],
-                &BTreeMap::new(),
-            )
-            .expect("typed miss should execute")
-            .expect("rowid alias lookup should return an empty fast-path result");
-        assert!(wrong_type.rows.is_empty());
-    }
-
-    #[test]
-    fn indexed_right_join_with_right_table_probe_preserves_unmatched_right_rows() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE docs (id INT64 PRIMARY KEY, body TEXT)",
-        );
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE archive (id INT64 PRIMARY KEY, doc_id INT64, note TEXT)",
-        );
-        execute_sql(
-            &mut runtime,
-            "CREATE INDEX archive_doc_idx ON archive (doc_id)",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO docs (id, body) VALUES (8, 'doc-8')",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO archive (id, doc_id, note) VALUES (1000, 8, 'match')",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO archive (id, doc_id, note) VALUES (1001, 99, 'orphan')",
-        );
-
-        let statement = parse_sql_statement(
-            "SELECT docs.id, archive.id \
-             FROM docs RIGHT JOIN archive ON docs.id = archive.doc_id",
-        )
-        .expect("parse indexed right join");
-        let crate::sql::ast::Statement::Query(query) = &statement else {
-            panic!("expected query statement");
-        };
-        let crate::sql::ast::QueryBody::Select(select) = &query.body else {
-            panic!("expected select query");
-        };
-        let FromItem::Join {
-            left,
-            right,
-            kind,
-            constraint,
-        } = &select.from[0]
-        else {
-            panic!("expected join");
-        };
-
-        let left_dataset = runtime
-            .evaluate_from_item(left.as_ref(), &[], &BTreeMap::new())
-            .expect("evaluate left dataset");
-        let result = runtime
-            .try_indexed_equi_join_with_right_table(
-                &left_dataset,
-                right.as_ref(),
-                *kind,
-                constraint,
-                &BTreeMap::new(),
-            )
-            .expect("execute indexed right join")
-            .expect("indexed right join should stay on probe path");
-
-        assert_eq!(result.columns.len(), 5);
-        assert_eq!(result.columns[0].name, "id");
-        assert_eq!(result.columns[1].name, "body");
-        assert_eq!(result.columns[2].name, "id");
-        assert_eq!(result.columns[3].name, "doc_id");
-        assert_eq!(result.columns[4].name, "note");
-        assert_eq!(result.rows.len(), 2);
-        assert_eq!(
-            result.rows[0].as_slice(),
-            &[
-                Value::Int64(8),
-                Value::Text("doc-8".to_string()),
-                Value::Int64(1000),
-                Value::Int64(8),
-                Value::Text("match".to_string()),
-            ]
-        );
-        assert_eq!(
-            result.rows[1].as_slice(),
-            &[
-                Value::Null,
-                Value::Null,
-                Value::Int64(1001),
-                Value::Int64(99),
-                Value::Text("orphan".to_string()),
-            ]
-        );
-    }
-
-    #[test]
-    fn indexed_full_join_with_right_table_probe_preserves_both_unmatched_sides() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE docs (id INT64 PRIMARY KEY, body TEXT)",
-        );
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE archive (id INT64 PRIMARY KEY, doc_id INT64, note TEXT)",
-        );
-        execute_sql(
-            &mut runtime,
-            "CREATE INDEX archive_doc_idx ON archive (doc_id)",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO docs (id, body) VALUES (8, 'doc-8')",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO docs (id, body) VALUES (9, 'doc-9')",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO archive (id, doc_id, note) VALUES (1000, 8, 'match')",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO archive (id, doc_id, note) VALUES (1001, 99, 'orphan')",
-        );
-
-        let statement = parse_sql_statement(
-            "SELECT docs.id, archive.id \
-             FROM docs FULL JOIN archive ON docs.id = archive.doc_id",
-        )
-        .expect("parse indexed full join");
-        let crate::sql::ast::Statement::Query(query) = &statement else {
-            panic!("expected query statement");
-        };
-        let crate::sql::ast::QueryBody::Select(select) = &query.body else {
-            panic!("expected select query");
-        };
-        let FromItem::Join {
-            left,
-            right,
-            kind,
-            constraint,
-        } = &select.from[0]
-        else {
-            panic!("expected join");
-        };
-
-        let left_dataset = runtime
-            .evaluate_from_item(left.as_ref(), &[], &BTreeMap::new())
-            .expect("evaluate left dataset");
-        let result = runtime
-            .try_indexed_equi_join_with_right_table(
-                &left_dataset,
-                right.as_ref(),
-                *kind,
-                constraint,
-                &BTreeMap::new(),
-            )
-            .expect("execute indexed full join")
-            .expect("indexed full join should stay on probe path");
-
-        assert_eq!(result.columns.len(), 5);
-        assert_eq!(result.columns[0].name, "id");
-        assert_eq!(result.columns[1].name, "body");
-        assert_eq!(result.columns[2].name, "id");
-        assert_eq!(result.columns[3].name, "doc_id");
-        assert_eq!(result.columns[4].name, "note");
-        assert_eq!(result.rows.len(), 3);
-        assert_eq!(
-            result.rows[0].as_slice(),
-            &[
-                Value::Int64(8),
-                Value::Text("doc-8".to_string()),
-                Value::Int64(1000),
-                Value::Int64(8),
-                Value::Text("match".to_string()),
-            ]
-        );
-        assert_eq!(
-            result.rows[1].as_slice(),
-            &[
-                Value::Int64(9),
-                Value::Text("doc-9".to_string()),
-                Value::Null,
-                Value::Null,
-                Value::Null
-            ]
-        );
-        assert_eq!(
-            result.rows[2].as_slice(),
-            &[
-                Value::Null,
-                Value::Null,
-                Value::Int64(1001),
-                Value::Int64(99),
-                Value::Text("orphan".to_string()),
-            ]
-        );
-    }
-
-    #[test]
-    fn hashed_full_join_with_right_table_probe_preserves_both_unmatched_sides() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE docs (id INT64 PRIMARY KEY, body TEXT)",
-        );
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE archive (id INT64 PRIMARY KEY, doc_id INT64, note TEXT)",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO docs (id, body) VALUES (8, 'doc-8')",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO docs (id, body) VALUES (9, 'doc-9')",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO archive (id, doc_id, note) VALUES (1000, 8, 'match')",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO archive (id, doc_id, note) VALUES (1001, 99, 'orphan')",
-        );
-
-        let statement = parse_sql_statement(
-            "SELECT docs.id, archive.id \
-             FROM docs FULL JOIN archive ON docs.id = archive.doc_id",
-        )
-        .expect("parse hashed full join");
-        let crate::sql::ast::Statement::Query(query) = &statement else {
-            panic!("expected query statement");
-        };
-        let crate::sql::ast::QueryBody::Select(select) = &query.body else {
-            panic!("expected select query");
-        };
-        let FromItem::Join {
-            left,
-            right,
-            kind,
-            constraint,
-        } = &select.from[0]
-        else {
-            panic!("expected join");
-        };
-
-        let left_dataset = runtime
-            .evaluate_from_item(left.as_ref(), &[], &BTreeMap::new())
-            .expect("evaluate left dataset");
-        let result = runtime
-            .try_indexed_equi_join_with_right_table(
-                &left_dataset,
-                right.as_ref(),
-                *kind,
-                constraint,
-                &BTreeMap::new(),
-            )
-            .expect("execute hashed full join")
-            .expect("hashed full join should stay on probe path");
-
-        assert_eq!(result.columns.len(), 5);
-        assert_eq!(result.rows.len(), 3);
-        assert_eq!(
-            result.rows[0].as_slice(),
-            &[
-                Value::Int64(8),
-                Value::Text("doc-8".to_string()),
-                Value::Int64(1000),
-                Value::Int64(8),
-                Value::Text("match".to_string()),
-            ]
-        );
-        assert_eq!(
-            result.rows[1].as_slice(),
-            &[
-                Value::Int64(9),
-                Value::Text("doc-9".to_string()),
-                Value::Null,
-                Value::Null,
-                Value::Null
-            ]
-        );
-        assert_eq!(
-            result.rows[2].as_slice(),
-            &[
-                Value::Null,
-                Value::Null,
-                Value::Int64(1001),
-                Value::Int64(99),
-                Value::Text("orphan".to_string()),
-            ]
-        );
-    }
-
-    #[test]
-    fn simple_indexed_join_distinct_uses_fast_path() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE docs (id INT64 PRIMARY KEY, body TEXT)",
-        );
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE archive (id INT64 PRIMARY KEY, doc_id INT64, note TEXT)",
-        );
-        execute_sql(
-            &mut runtime,
-            "CREATE INDEX archive_doc_idx ON archive (doc_id)",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO docs (id, body) VALUES (8, 'doc-8')",
-        );
-        for (id, note) in [(1000, "note-z"), (1001, "note-z"), (1002, "note-a")] {
-            execute_sql(
-                &mut runtime,
-                &format!("INSERT INTO archive (id, doc_id, note) VALUES ({id}, 8, '{note}')"),
-            );
-        }
-
-        let statement = parse_sql_statement(
-            "SELECT DISTINCT docs.id, archive.note \
-             FROM docs JOIN archive ON docs.id = archive.doc_id \
-             WHERE docs.id = 8 \
-             ORDER BY note DESC",
-        )
-        .expect("parse indexed join distinct");
-        let crate::sql::ast::Statement::Query(query) = &statement else {
-            panic!("expected query statement");
-        };
-
-        let result = runtime
-            .try_execute_simple_indexed_join_projection_query(query, &[])
-            .expect("execute indexed join distinct")
-            .expect("indexed join distinct should stay on fast path");
-
-        assert_eq!(result.columns(), &["id".to_string(), "note".to_string()]);
-        assert_eq!(result.rows().len(), 2);
-        assert_eq!(
-            result.rows()[0].values(),
-            &[Value::Int64(8), Value::Text("note-z".to_string())]
-        );
-        assert_eq!(
-            result.rows()[1].values(),
-            &[Value::Int64(8), Value::Text("note-a".to_string())]
-        );
-    }
-
-    #[test]
-    fn simple_indexed_join_using_uses_fast_path() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE docs (id INT64 PRIMARY KEY, body TEXT)",
-        );
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE archive (id INT64 PRIMARY KEY, note TEXT)",
-        );
-        execute_sql(&mut runtime, "CREATE INDEX archive_id_idx ON archive (id)");
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO docs (id, body) VALUES (8, 'doc-8')",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO archive (id, note) VALUES (8, 'note-z')",
-        );
-
-        let statement = parse_sql_statement(
-            "SELECT docs.id, archive.note \
-             FROM docs JOIN archive USING (id) \
-             WHERE docs.id = 8 \
-             ORDER BY archive.note DESC",
-        )
-        .expect("parse indexed join using");
-        let crate::sql::ast::Statement::Query(query) = &statement else {
-            panic!("expected query statement");
-        };
-
-        let result = runtime
-            .try_execute_simple_indexed_join_projection_query(query, &[])
-            .expect("execute indexed join using")
-            .expect("indexed join using should stay on fast path");
-
-        assert_eq!(result.columns(), &["id".to_string(), "note".to_string()]);
-        assert_eq!(result.rows().len(), 1);
-        assert_eq!(
-            result.rows()[0].values(),
-            &[Value::Int64(8), Value::Text("note-z".to_string())]
-        );
-    }
-
-    #[test]
-    fn simple_indexed_join_using_wildcard_uses_fast_path() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE docs (id INT64 PRIMARY KEY, body TEXT)",
-        );
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE archive (id INT64 PRIMARY KEY, note TEXT)",
-        );
-        execute_sql(&mut runtime, "CREATE INDEX archive_id_idx ON archive (id)");
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO docs (id, body) VALUES (8, 'doc-8')",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO archive (id, note) VALUES (8, 'note-z')",
-        );
-
-        let statement = parse_sql_statement(
-            "SELECT * \
-             FROM docs JOIN archive USING (id) \
-             WHERE docs.id = 8 \
-             ORDER BY note DESC",
-        )
-        .expect("parse indexed join using wildcard");
-        let crate::sql::ast::Statement::Query(query) = &statement else {
-            panic!("expected query statement");
-        };
-
-        let result = runtime
-            .try_execute_simple_indexed_join_projection_query(query, &[])
-            .expect("execute indexed join using wildcard")
-            .expect("indexed join using wildcard should stay on fast path");
-
-        assert_eq!(
-            result.columns(),
-            &["id".to_string(), "body".to_string(), "note".to_string()]
-        );
-        assert_eq!(result.rows().len(), 1);
-        assert_eq!(
-            result.rows()[0].values(),
-            &[
-                Value::Int64(8),
-                Value::Text("doc-8".to_string()),
-                Value::Text("note-z".to_string()),
-            ]
-        );
-    }
-
-    #[test]
-    fn simple_indexed_join_multi_column_using_wildcard_uses_fast_path() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE docs (pk INT64 PRIMARY KEY, org_id INT64, id INT64, body TEXT)",
-        );
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE archive (pk INT64 PRIMARY KEY, org_id INT64, id INT64, note TEXT)",
-        );
-        execute_sql(
-            &mut runtime,
-            "CREATE INDEX archive_org_id_id_idx ON archive (org_id, id)",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO docs (pk, org_id, id, body) VALUES (1, 7, 8, 'doc-8')",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO archive (pk, org_id, id, note) VALUES (1, 7, 8, 'note-z')",
-        );
-
-        let statement = parse_sql_statement(
-            "SELECT * \
-             FROM docs JOIN archive USING (org_id, id) \
-             ORDER BY note DESC",
-        )
-        .expect("parse indexed join multi-column using wildcard");
-        let crate::sql::ast::Statement::Query(query) = &statement else {
-            panic!("expected query statement");
-        };
-
-        let result = runtime
-            .try_execute_simple_indexed_join_projection_query(query, &[])
-            .expect("execute indexed join multi-column using wildcard")
-            .expect("indexed join multi-column using wildcard should stay on fast path");
-
-        assert_eq!(
-            result.columns(),
-            &[
-                "org_id".to_string(),
-                "id".to_string(),
-                "pk".to_string(),
-                "body".to_string(),
-                "pk".to_string(),
-                "note".to_string(),
-            ]
-        );
-        assert_eq!(result.rows().len(), 1);
-        assert_eq!(
-            result.rows()[0].values(),
-            &[
-                Value::Int64(7),
-                Value::Int64(8),
-                Value::Int64(1),
-                Value::Text("doc-8".to_string()),
-                Value::Int64(1),
-                Value::Text("note-z".to_string()),
-            ]
-        );
-    }
-
-    #[test]
-    fn simple_indexed_natural_join_wildcard_uses_fast_path() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE docs (pk INT64 PRIMARY KEY, org_id INT64, id INT64, body TEXT)",
-        );
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE archive (archive_pk INT64 PRIMARY KEY, org_id INT64, id INT64, note TEXT)",
-        );
-        execute_sql(
-            &mut runtime,
-            "CREATE INDEX archive_org_id_id_idx ON archive (org_id, id)",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO docs (pk, org_id, id, body) VALUES (1, 7, 8, 'doc-8')",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO archive (archive_pk, org_id, id, note) VALUES (1, 7, 8, 'note-z')",
-        );
-
-        let statement = parse_sql_statement(
-            "SELECT docs.pk, org_id, id, archive.note \
-             FROM docs NATURAL JOIN archive \
-             ORDER BY archive.note DESC",
-        )
-        .expect("parse indexed natural join");
-        let crate::sql::ast::Statement::Query(query) = &statement else {
-            panic!("expected query statement");
-        };
-
-        let result = runtime
-            .try_execute_simple_indexed_join_projection_query(query, &[])
-            .expect("execute indexed natural join")
-            .expect("indexed natural join should stay on fast path");
-
-        assert_eq!(
-            result.columns(),
-            &[
-                "pk".to_string(),
-                "org_id".to_string(),
-                "id".to_string(),
-                "note".to_string(),
-            ]
-        );
-        assert_eq!(result.rows().len(), 1);
-        assert_eq!(
-            result.rows()[0].values(),
-            &[
-                Value::Int64(1),
-                Value::Int64(7),
-                Value::Int64(8),
-                Value::Text("note-z".to_string()),
-            ]
-        );
-    }
-
-    #[test]
-    fn simple_indexed_join_without_filter_uses_fast_path() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE docs (id INT64 PRIMARY KEY, body TEXT)",
-        );
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE archive (id INT64 PRIMARY KEY, doc_id INT64, note TEXT)",
-        );
-        execute_sql(
-            &mut runtime,
-            "CREATE INDEX archive_doc_idx ON archive (doc_id)",
-        );
-        for id in 1..=3 {
-            execute_sql(
-                &mut runtime,
-                &format!("INSERT INTO docs (id, body) VALUES ({id}, 'doc-{id}')"),
-            );
-        }
-        for (id, doc_id, note) in [
-            (1000, 1, "note-a"),
-            (1001, 2, "note-b"),
-            (1002, 2, "note-c"),
-        ] {
-            execute_sql(
-                &mut runtime,
-                &format!(
-                    "INSERT INTO archive (id, doc_id, note) VALUES ({id}, {doc_id}, '{note}')"
-                ),
-            );
-        }
-
-        let statement = parse_sql_statement(
-            "SELECT docs.id, archive.note \
-             FROM docs JOIN archive ON docs.id = archive.doc_id \
-             ORDER BY docs.id ASC, archive.note ASC",
-        )
-        .expect("parse indexed join without filter");
-        let crate::sql::ast::Statement::Query(query) = &statement else {
-            panic!("expected query statement");
-        };
-
-        let result = runtime
-            .try_execute_simple_indexed_join_projection_query(query, &[])
-            .expect("execute indexed join without filter")
-            .expect("indexed join without filter should stay on fast path");
-
-        assert_eq!(result.columns(), &["id".to_string(), "note".to_string()]);
-        assert_eq!(result.rows().len(), 3);
-        assert_eq!(
-            result.rows()[0].values(),
-            &[Value::Int64(1), Value::Text("note-a".to_string())]
-        );
-        assert_eq!(
-            result.rows()[1].values(),
-            &[Value::Int64(2), Value::Text("note-b".to_string())]
-        );
-        assert_eq!(
-            result.rows()[2].values(),
-            &[Value::Int64(2), Value::Text("note-c".to_string())]
-        );
-    }
-
-    #[test]
-    fn simple_hashed_join_without_index_uses_fast_path() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE docs (id INT64 PRIMARY KEY, body TEXT)",
-        );
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE archive (id INT64 PRIMARY KEY, doc_id INT64, note TEXT)",
-        );
-        for id in 1..=3 {
-            execute_sql(
-                &mut runtime,
-                &format!("INSERT INTO docs (id, body) VALUES ({id}, 'doc-{id}')"),
-            );
-        }
-        for (id, doc_id, note) in [
-            (1000, 1, "note-a"),
-            (1001, 2, "note-b"),
-            (1002, 2, "note-c"),
-        ] {
-            execute_sql(
-                &mut runtime,
-                &format!(
-                    "INSERT INTO archive (id, doc_id, note) VALUES ({id}, {doc_id}, '{note}')"
-                ),
-            );
-        }
-
-        let statement = parse_sql_statement(
-            "SELECT docs.id, archive.note \
-             FROM docs JOIN archive ON docs.id = archive.doc_id \
-             ORDER BY docs.id ASC, archive.note ASC",
-        )
-        .expect("parse hashed join");
-        let crate::sql::ast::Statement::Query(query) = &statement else {
-            panic!("expected query statement");
-        };
-
-        let result = runtime
-            .try_execute_simple_indexed_join_projection_query(query, &[])
-            .expect("execute hashed join")
-            .expect("hashed join should stay on fast path");
-
-        assert_eq!(result.columns(), &["id".to_string(), "note".to_string()]);
-        assert_eq!(result.rows().len(), 3);
-        assert_eq!(
-            result.rows()[0].values(),
-            &[Value::Int64(1), Value::Text("note-a".to_string())]
-        );
-        assert_eq!(
-            result.rows()[1].values(),
-            &[Value::Int64(2), Value::Text("note-b".to_string())]
-        );
-        assert_eq!(
-            result.rows()[2].values(),
-            &[Value::Int64(2), Value::Text("note-c".to_string())]
-        );
-    }
-
-    #[test]
-    fn simple_hashed_full_join_without_index_uses_fast_path() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE docs (id INT64 PRIMARY KEY, body TEXT)",
-        );
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE archive (id INT64 PRIMARY KEY, doc_id INT64, note TEXT)",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO docs (id, body) VALUES (8, 'doc-8')",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO docs (id, body) VALUES (9, 'doc-9')",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO archive (id, doc_id, note) VALUES (1000, 8, 'match')",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO archive (id, doc_id, note) VALUES (1001, 99, 'orphan')",
-        );
-
-        let statement = parse_sql_statement(
-            "SELECT docs.id, archive.id \
-             FROM docs FULL JOIN archive ON docs.id = archive.doc_id \
-             ORDER BY COALESCE(docs.id, archive.doc_id) ASC",
-        )
-        .expect("parse hashed full join");
-        let crate::sql::ast::Statement::Query(query) = &statement else {
-            panic!("expected query statement");
-        };
-
-        let result = runtime
-            .try_execute_simple_indexed_join_projection_query(query, &[])
-            .expect("execute hashed full join")
-            .expect("hashed full join should stay on fast path");
-
-        assert_eq!(result.columns(), &["id".to_string(), "id".to_string()]);
-        assert_eq!(result.rows().len(), 3);
-        assert_eq!(
-            result.rows()[0].values(),
-            &[Value::Int64(8), Value::Int64(1000)]
-        );
-        assert_eq!(result.rows()[1].values(), &[Value::Int64(9), Value::Null]);
-        assert_eq!(
-            result.rows()[2].values(),
-            &[Value::Null, Value::Int64(1001)]
-        );
-    }
-
-    #[test]
-    fn simple_indexed_join_with_expression_filter_uses_fast_path() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE docs (id INT64 PRIMARY KEY, body TEXT)",
-        );
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE archive (id INT64 PRIMARY KEY, doc_id INT64, note TEXT)",
-        );
-        execute_sql(
-            &mut runtime,
-            "CREATE INDEX archive_doc_idx ON archive (doc_id)",
-        );
-        for id in 1..=3 {
-            execute_sql(
-                &mut runtime,
-                &format!("INSERT INTO docs (id, body) VALUES ({id}, 'doc-{id}')"),
-            );
-        }
-        for (id, doc_id, note) in [
-            (1000, 1, "note-a"),
-            (1001, 2, "note-b"),
-            (1002, 2, "note-c"),
-        ] {
-            execute_sql(
-                &mut runtime,
-                &format!(
-                    "INSERT INTO archive (id, doc_id, note) VALUES ({id}, {doc_id}, '{note}')"
-                ),
-            );
-        }
-
-        let statement = parse_sql_statement(
-            "SELECT docs.id, archive.note \
-             FROM docs JOIN archive ON docs.id = archive.doc_id \
-             WHERE docs.id + archive.doc_id >= 4 \
-             ORDER BY docs.id ASC, archive.note ASC",
-        )
-        .expect("parse indexed join with expression filter");
-        let crate::sql::ast::Statement::Query(query) = &statement else {
-            panic!("expected query statement");
-        };
-
-        let result = runtime
-            .try_execute_simple_indexed_join_projection_query(query, &[])
-            .expect("execute indexed join with expression filter")
-            .expect("indexed join with expression filter should stay on fast path");
-
-        assert_eq!(result.columns(), &["id".to_string(), "note".to_string()]);
-        assert_eq!(result.rows().len(), 2);
-        assert_eq!(
-            result.rows()[0].values(),
-            &[Value::Int64(2), Value::Text("note-b".to_string())]
-        );
-        assert_eq!(
-            result.rows()[1].values(),
-            &[Value::Int64(2), Value::Text("note-c".to_string())]
-        );
-    }
-
-    #[test]
-    fn composite_indexed_join_without_filter_uses_indexed_join_path() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE docs (id INT64 PRIMARY KEY, org_id INT64, body TEXT)",
-        );
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE archive (id INT64 PRIMARY KEY, org_id INT64, doc_id INT64, note TEXT)",
-        );
-        execute_sql(
-            &mut runtime,
-            "CREATE INDEX idx_archive_org_doc ON archive(org_id, doc_id)",
-        );
-        for (id, org_id, body) in [(1, 10, "doc-a"), (2, 10, "doc-b"), (3, 20, "doc-c")] {
-            execute_sql(
-                &mut runtime,
-                &format!("INSERT INTO docs (id, org_id, body) VALUES ({id}, {org_id}, '{body}')"),
-            );
-        }
-        for (id, org_id, doc_id, note) in [
-            (1000, 10, 1, "note-a"),
-            (1001, 10, 2, "note-b"),
-            (1002, 20, 9, "note-z"),
-        ] {
-            execute_sql(
-                &mut runtime,
-                &format!(
-                    "INSERT INTO archive (id, org_id, doc_id, note) VALUES ({id}, {org_id}, {doc_id}, '{note}')"
-                ),
-            );
-        }
-
-        let statement = parse_sql_statement(
-            "SELECT docs.id, archive.note \
-             FROM docs \
-             JOIN archive ON docs.org_id = archive.org_id AND docs.id = archive.doc_id",
-        )
-        .expect("parse composite indexed join");
-        let crate::sql::ast::Statement::Query(query) = &statement else {
-            panic!("expected query statement");
-        };
-        let crate::sql::ast::QueryBody::Select(select) = &query.body else {
-            panic!("expected select query");
-        };
-        let [FromItem::Join {
-            left,
-            right,
-            kind,
-            constraint,
-        }] = select.from.as_slice()
-        else {
-            panic!("expected join from item");
-        };
-
-        let left_dataset = runtime
-            .evaluate_from_item(left, &[], &BTreeMap::new())
-            .expect("evaluate left input");
-        let dataset = runtime
-            .try_indexed_equi_join_with_right_table(
-                &left_dataset,
-                right,
-                *kind,
-                constraint,
-                &BTreeMap::new(),
-            )
-            .expect("execute composite indexed equi-join")
-            .expect("composite indexed join should stay on indexed join path");
-        let result = runtime
-            .project_dataset(&dataset, &select.projection, &[], &BTreeMap::new(), None)
-            .expect("project composite indexed join result");
-
-        assert_eq!(
-            result.columns,
-            vec![
-                ColumnBinding::visible(None, "id".to_string()),
-                ColumnBinding::visible(None, "note".to_string()),
-            ]
-        );
-        assert_eq!(result.rows.len(), 2);
-        assert_eq!(
-            result.rows[0],
-            vec![Value::Int64(1), Value::Text("note-a".to_string())]
-        );
-        assert_eq!(
-            result.rows[1],
-            vec![Value::Int64(2), Value::Text("note-b".to_string())]
-        );
-    }
-
-    #[test]
-    fn composite_hashed_join_without_filter_uses_join_path() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE docs (id INT64 PRIMARY KEY, org_id INT64, body TEXT)",
-        );
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE archive (id INT64 PRIMARY KEY, org_id INT64, doc_id INT64, note TEXT)",
-        );
-        for (id, org_id, body) in [(1, 10, "doc-a"), (2, 10, "doc-b"), (9, 20, "doc-z")] {
-            execute_sql(
-                &mut runtime,
-                &format!("INSERT INTO docs (id, org_id, body) VALUES ({id}, {org_id}, '{body}')"),
-            );
-        }
-        for (id, org_id, doc_id, note) in [
-            (1000, 10, 1, "note-a"),
-            (1001, 10, 2, "note-b"),
-            (1002, 20, 9, "note-z"),
-        ] {
-            execute_sql(
-                &mut runtime,
-                &format!(
-                    "INSERT INTO archive (id, org_id, doc_id, note) VALUES ({id}, {org_id}, {doc_id}, '{note}')"
-                ),
-            );
-        }
-
-        let statement = parse_sql_statement(
-            "SELECT docs.id, archive.note \
-             FROM docs \
-             JOIN archive ON docs.org_id = archive.org_id AND docs.id = archive.doc_id",
-        )
-        .expect("parse composite hashed join");
-        let crate::sql::ast::Statement::Query(query) = &statement else {
-            panic!("expected query statement");
-        };
-        let crate::sql::ast::QueryBody::Select(select) = &query.body else {
-            panic!("expected select query");
-        };
-        let [FromItem::Join {
-            left,
-            right,
-            kind,
-            constraint,
-        }] = select.from.as_slice()
-        else {
-            panic!("expected join from item");
-        };
-
-        let left_dataset = runtime
-            .evaluate_from_item(left, &[], &BTreeMap::new())
-            .expect("evaluate left input");
-        let dataset = runtime
-            .try_indexed_equi_join_with_right_table(
-                &left_dataset,
-                right,
-                *kind,
-                constraint,
-                &BTreeMap::new(),
-            )
-            .expect("execute composite hashed equi-join")
-            .expect("composite hashed join should stay on join path");
-        let result = runtime
-            .project_dataset(&dataset, &select.projection, &[], &BTreeMap::new(), None)
-            .expect("project composite hashed join result");
-
-        assert_eq!(result.rows.len(), 3);
-        assert_eq!(
-            result.rows[0],
-            vec![Value::Int64(1), Value::Text("note-a".to_string())]
-        );
-        assert_eq!(
-            result.rows[1],
-            vec![Value::Int64(2), Value::Text("note-b".to_string())]
-        );
-        assert_eq!(
-            result.rows[2],
-            vec![Value::Int64(9), Value::Text("note-z".to_string())]
-        );
-    }
-
-    #[test]
-    fn composite_indexed_join_with_filter_uses_indexed_join_path() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE docs (id INT64 PRIMARY KEY, org_id INT64, body TEXT)",
-        );
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE archive (id INT64 PRIMARY KEY, org_id INT64, doc_id INT64, note TEXT)",
-        );
-        execute_sql(
-            &mut runtime,
-            "CREATE INDEX idx_archive_org_doc ON archive(org_id, doc_id)",
-        );
-        for (id, org_id, body) in [(1, 10, "doc-a"), (2, 10, "doc-b"), (3, 20, "doc-c")] {
-            execute_sql(
-                &mut runtime,
-                &format!("INSERT INTO docs (id, org_id, body) VALUES ({id}, {org_id}, '{body}')"),
-            );
-        }
-        for (id, org_id, doc_id, note) in [
-            (1000, 10, 1, "note-a"),
-            (1001, 10, 2, "note-b"),
-            (1002, 20, 3, "note-c"),
-        ] {
-            execute_sql(
-                &mut runtime,
-                &format!(
-                    "INSERT INTO archive (id, org_id, doc_id, note) VALUES ({id}, {org_id}, {doc_id}, '{note}')"
-                ),
-            );
-        }
-
-        let statement = parse_sql_statement(
-            "SELECT docs.id, archive.note \
-             FROM docs \
-             JOIN archive ON docs.org_id = archive.org_id AND docs.id = archive.doc_id \
-             WHERE docs.id = 2",
-        )
-        .expect("parse composite indexed join query");
-        let crate::sql::ast::Statement::Query(query) = &statement else {
-            panic!("expected query statement");
-        };
-        let crate::sql::ast::QueryBody::Select(select) = &query.body else {
-            panic!("expected select query");
-        };
-
-        let dataset = runtime
-            .try_indexed_join(select, &[], &BTreeMap::new())
-            .expect("execute composite indexed join query")
-            .expect("composite indexed join query should stay on indexed join path");
-        let result = runtime
-            .project_dataset(&dataset, &select.projection, &[], &BTreeMap::new(), None)
-            .expect("project composite indexed join query result");
-
-        assert_eq!(
-            result.columns,
-            vec![
-                ColumnBinding::visible(None, "id".to_string()),
-                ColumnBinding::visible(None, "note".to_string()),
-            ]
-        );
-        assert_eq!(result.rows.len(), 1);
-        assert_eq!(
-            result.rows[0],
-            vec![Value::Int64(2), Value::Text("note-b".to_string())]
-        );
-    }
-
-    #[test]
-    fn composite_hashed_join_with_filter_uses_join_path() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE docs (id INT64 PRIMARY KEY, org_id INT64, body TEXT)",
-        );
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE archive (id INT64 PRIMARY KEY, org_id INT64, doc_id INT64, note TEXT)",
-        );
-        for (id, org_id, body) in [(1, 10, "doc-a"), (2, 10, "doc-b"), (3, 20, "doc-c")] {
-            execute_sql(
-                &mut runtime,
-                &format!("INSERT INTO docs (id, org_id, body) VALUES ({id}, {org_id}, '{body}')"),
-            );
-        }
-        for (id, org_id, doc_id, note) in [
-            (1000, 10, 1, "note-a"),
-            (1001, 10, 2, "note-b"),
-            (1002, 20, 3, "note-c"),
-        ] {
-            execute_sql(
-                &mut runtime,
-                &format!(
-                    "INSERT INTO archive (id, org_id, doc_id, note) VALUES ({id}, {org_id}, {doc_id}, '{note}')"
-                ),
-            );
-        }
-
-        let statement = parse_sql_statement(
-            "SELECT docs.id, archive.note \
-             FROM docs \
-             JOIN archive ON docs.org_id = archive.org_id AND docs.id = archive.doc_id \
-             WHERE docs.id = 2",
-        )
-        .expect("parse composite hashed join query");
-        let crate::sql::ast::Statement::Query(query) = &statement else {
-            panic!("expected query statement");
-        };
-        let crate::sql::ast::QueryBody::Select(select) = &query.body else {
-            panic!("expected select query");
-        };
-
-        let dataset = runtime
-            .try_indexed_join(select, &[], &BTreeMap::new())
-            .expect("execute composite hashed join query")
-            .expect("composite hashed join query should stay on filtered join path");
-        let result = runtime
-            .project_dataset(&dataset, &select.projection, &[], &BTreeMap::new(), None)
-            .expect("project composite hashed join query result");
-
-        assert_eq!(
-            result.columns,
-            vec![
-                ColumnBinding::visible(None, "id".to_string()),
-                ColumnBinding::visible(None, "note".to_string()),
-            ]
-        );
-        assert_eq!(result.rows.len(), 1);
-        assert_eq!(
-            result.rows[0],
-            vec![Value::Int64(2), Value::Text("note-b".to_string())]
-        );
-    }
-
-    #[test]
-    fn aggregate_join_query_uses_grouped_evaluation() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE artists (id INT64 PRIMARY KEY, name TEXT)",
-        );
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE albums (id INT64 PRIMARY KEY, artist_id INT64, name TEXT)",
-        );
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE songs (id INT64 PRIMARY KEY, album_id INT64, title TEXT)",
-        );
-        execute_sql(&mut runtime, "INSERT INTO artists VALUES (1, 'one')");
-        execute_sql(&mut runtime, "INSERT INTO artists VALUES (2, 'two')");
-        execute_sql(&mut runtime, "INSERT INTO albums VALUES (10, 1, 'first')");
-        execute_sql(&mut runtime, "INSERT INTO albums VALUES (20, 2, 'second')");
-        execute_sql(&mut runtime, "INSERT INTO songs VALUES (100, 10, 'alpha')");
-        execute_sql(&mut runtime, "INSERT INTO songs VALUES (101, 10, 'beta')");
-        execute_sql(&mut runtime, "INSERT INTO songs VALUES (200, 20, 'gamma')");
-
-        let statement = parse_sql_statement(
-            "SELECT COUNT(*) \
-             FROM songs AS s \
-             INNER JOIN albums AS a ON s.album_id = a.id \
-             WHERE a.artist_id = 1",
-        )
-        .expect("parse aggregate join query");
-        let result = runtime
-            .execute_statement(&statement, &[], PAGE_SIZE)
-            .expect("execute aggregate join query");
-
-        assert_eq!(result.rows().len(), 1);
-        assert_eq!(result.rows()[0].values(), &[Value::Int64(2)]);
-    }
-
-    #[test]
-    fn base_table_join_filters_against_join_scope_before_projection() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE users (id INT64 PRIMARY KEY, name TEXT)",
-        );
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE shares (id INT64 PRIMARY KEY, user_id INT64, share_unique_id TEXT)",
-        );
-        execute_sql(&mut runtime, "INSERT INTO users VALUES (1, 'user-one')");
-        execute_sql(&mut runtime, "INSERT INTO users VALUES (2, 'user-two')");
-        execute_sql(&mut runtime, "INSERT INTO shares VALUES (10, 1, 'target')");
-        execute_sql(&mut runtime, "INSERT INTO shares VALUES (20, 2, 'other')");
-
-        let statement = parse_sql_statement(
-            "SELECT s.id, u.name \
-             FROM shares AS s \
-             INNER JOIN users AS u ON s.user_id = u.id \
-             WHERE s.share_unique_id = 'target' \
-             LIMIT 1",
-        )
-        .expect("parse filtered join query");
-        let result = runtime
-            .execute_statement(&statement, &[], PAGE_SIZE)
-            .expect("execute filtered join query");
-
-        assert_eq!(result.rows().len(), 1);
-        assert_eq!(
-            result.rows()[0].values(),
-            &[Value::Int64(10), Value::Text("user-one".to_string())]
-        );
-    }
-
-    #[test]
-    fn simple_indexed_left_join_without_filter_uses_fast_path() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE docs (id INT64 PRIMARY KEY, body TEXT)",
-        );
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE archive (id INT64 PRIMARY KEY, doc_id INT64, note TEXT)",
-        );
-        execute_sql(
-            &mut runtime,
-            "CREATE INDEX archive_doc_idx ON archive (doc_id)",
-        );
-        for id in 1..=3 {
-            execute_sql(
-                &mut runtime,
-                &format!("INSERT INTO docs (id, body) VALUES ({id}, 'doc-{id}')"),
-            );
-        }
-        for (id, doc_id, note) in [(1000, 1, "note-a"), (1001, 2, "note-b")] {
-            execute_sql(
-                &mut runtime,
-                &format!(
-                    "INSERT INTO archive (id, doc_id, note) VALUES ({id}, {doc_id}, '{note}')"
-                ),
-            );
-        }
-
-        let statement = parse_sql_statement(
-            "SELECT docs.id, archive.note \
-             FROM docs LEFT JOIN archive ON docs.id = archive.doc_id \
-             ORDER BY docs.id ASC",
-        )
-        .expect("parse indexed left join without filter");
-        let crate::sql::ast::Statement::Query(query) = &statement else {
-            panic!("expected query statement");
-        };
-
-        let result = runtime
-            .try_execute_simple_indexed_join_projection_query(query, &[])
-            .expect("execute indexed left join without filter")
-            .expect("indexed left join without filter should stay on fast path");
-
-        assert_eq!(result.columns(), &["id".to_string(), "note".to_string()]);
-        assert_eq!(result.rows().len(), 3);
-        assert_eq!(
-            result.rows()[0].values(),
-            &[Value::Int64(1), Value::Text("note-a".to_string())]
-        );
-        assert_eq!(
-            result.rows()[1].values(),
-            &[Value::Int64(2), Value::Text("note-b".to_string())]
-        );
-        assert_eq!(result.rows()[2].values(), &[Value::Int64(3), Value::Null]);
-    }
-
-    #[test]
-    fn simple_indexed_full_join_without_filter_uses_fast_path() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE docs (id INT64 PRIMARY KEY, body TEXT)",
-        );
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE archive (id INT64 PRIMARY KEY, doc_id INT64, note TEXT)",
-        );
-        execute_sql(
-            &mut runtime,
-            "CREATE INDEX archive_doc_idx ON archive (doc_id)",
-        );
-        for id in 1..=2 {
-            execute_sql(
-                &mut runtime,
-                &format!("INSERT INTO docs (id, body) VALUES ({id}, 'doc-{id}')"),
-            );
-        }
-        for (id, doc_id, note) in [(1000, 1, "note-a"), (1001, 99, "orphan")] {
-            execute_sql(
-                &mut runtime,
-                &format!(
-                    "INSERT INTO archive (id, doc_id, note) VALUES ({id}, {doc_id}, '{note}')"
-                ),
-            );
-        }
-
-        let statement = parse_sql_statement(
-            "SELECT docs.id, archive.note, COALESCE(docs.id, archive.doc_id) AS sort_key \
-             FROM docs FULL JOIN archive ON docs.id = archive.doc_id \
-             ORDER BY sort_key ASC",
-        )
-        .expect("parse indexed full join without filter");
-        let crate::sql::ast::Statement::Query(query) = &statement else {
-            panic!("expected query statement");
-        };
-
-        let result = runtime
-            .try_execute_simple_indexed_join_projection_query(query, &[])
-            .expect("execute indexed full join without filter")
-            .expect("indexed full join without filter should stay on fast path");
-
-        assert_eq!(
-            result.columns(),
-            &["id".to_string(), "note".to_string(), "sort_key".to_string()]
-        );
-        assert_eq!(result.rows().len(), 3);
-        assert_eq!(
-            result.rows()[0].values(),
-            &[
-                Value::Int64(1),
-                Value::Text("note-a".to_string()),
-                Value::Int64(1)
-            ]
-        );
-        assert_eq!(
-            result.rows()[1].values(),
-            &[Value::Int64(2), Value::Null, Value::Int64(2)]
-        );
-        assert_eq!(
-            result.rows()[2].values(),
-            &[
-                Value::Null,
-                Value::Text("orphan".to_string()),
-                Value::Int64(99)
-            ]
-        );
-    }
-
-    #[test]
-    fn legacy_runtime_payload_decode_still_round_trips() {
-        let mut runtime = EngineRuntime::empty(7);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE docs (id INT64 PRIMARY KEY, email TEXT, body TEXT)",
-        );
-        execute_sql(&mut runtime, "CREATE INDEX docs_email_idx ON docs (email)");
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO docs (id, email, body) VALUES (1, 'a@example.com', 'alphabet soup')",
-        );
-
-        let payload = encode_runtime_payload(&runtime).expect("encode legacy runtime payload");
-        let decoded = decode_runtime_payload(&payload).expect("decode legacy runtime payload");
-
-        assert_eq!(decoded.catalog.schema_cookie, runtime.catalog.schema_cookie);
-        assert_eq!(decoded.tables["docs"], runtime.tables["docs"]);
-        assert!(decoded.catalog.indexes.contains_key("docs_email_idx"));
-    }
-
-    #[test]
-    fn manifest_payload_decode_loads_per_table_rows() {
-        let mut runtime = EngineRuntime::empty(9);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE docs (id INT64 PRIMARY KEY, email TEXT, body TEXT)",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO docs (id, email, body) VALUES (1, 'a@example.com', 'alphabet soup')",
-        );
-
-        let mut store = InMemoryPageStore::new(PAGE_SIZE);
-        let table_payload = encode_table_payload(runtime.tables["docs"].resident_data())
-            .expect("encode table payload");
-        let pointer = crate::record::overflow::write_overflow(
-            &mut store,
-            &table_payload,
-            CompressionMode::Auto,
-        )
-        .expect("write table payload");
-        let tail = crate::record::overflow::read_uncompressed_overflow_tail(&store, pointer)
-            .expect("read table tail")
-            .expect("table tail");
-        let mut table_states = runtime.persisted_tables.as_ref().clone();
-        table_states.insert(
-            "docs".to_string(),
-            PersistedTableState {
-                pointer,
-                checksum: crate::storage::checksum::crc32c_parts(&[table_payload.as_slice()]),
-                row_count: runtime.tables["docs"].resident_data().rows.len(),
-                tail,
-                pk_index_root: None,
-            },
-        );
-
-        let manifest =
-            encode_manifest_payload(&runtime, &table_states).expect("encode manifest payload");
-        let decoded = decode_manifest_payload(&store, &manifest).expect("decode manifest payload");
-
-        assert_eq!(decoded.catalog.schema_cookie, runtime.catalog.schema_cookie);
-        // Table data is deferred — "docs" should not be in tables yet.
-        assert!(decoded.deferred_tables.contains("docs"));
-        assert!(!decoded.tables.contains_key("docs"));
-        // Schema and persisted state (pointer, checksum) are available immediately.
-        assert!(decoded.catalog.tables.contains_key("docs"));
-        assert_eq!(
-            decoded.persisted_tables["docs"].pointer,
-            table_states["docs"].pointer
-        );
-        assert_eq!(
-            decoded.persisted_tables["docs"].checksum,
-            table_states["docs"].checksum
-        );
-    }
-
-    #[test]
-    fn multi_chunk_paged_payload_reconstructs_legacy_table_payload() {
-        let body = "x".repeat(2048);
-        let data = TableData::from_rows(
-            (0_i64..96_i64)
-                .map(|row_id| StoredRow {
-                    row_id: row_id + 1,
-                    values: vec![
-                        Value::Int64(row_id),
-                        Value::Text(body.clone()),
-                        Value::Int64(row_id * 10),
-                    ],
-                })
-                .collect(),
-        );
-
-        let encoded_chunks =
-            encode_paged_table_chunks(&data, PAGE_SIZE).expect("encode paged table chunks");
-        assert!(
-            encoded_chunks.len() > 1,
-            "expected large table to be split across multiple paged chunks"
-        );
-        let chunk_payloads = encoded_chunks
-            .into_iter()
-            .map(|chunk| Arc::new(chunk.payload))
-            .collect::<Vec<_>>();
-
-        let chunk_manifest = TablePageManifest::from_chunks(
-            chunk_payloads
-                .into_iter()
-                .map(|payload| TablePageManifestChunk {
-                    pointer: OverflowPointer {
-                        head_page_id: 0,
-                        logical_len: 0,
-                        flags: 0,
-                    },
-                    checksum: 0,
-                    row_count: 0,
-                    payload,
-                    tombstoned_row_ids: Arc::new(BTreeSet::new()),
-                    overlay_pointer: None,
-                    overlay_checksum: None,
-                    overlay_payload: None,
-                })
-                .collect(),
-        )
-        .expect("build chunk manifest");
-
-        let reconstructed = encode_legacy_table_payload_from_manifest(&chunk_manifest)
-            .expect("reconstruct legacy payload");
-        let single_payload = encode_table_payload(&data).expect("encode legacy payload");
-
-        assert_eq!(reconstructed, single_payload);
-    }
-
-    #[test]
-    fn deferred_row_lookup_reads_compressed_table_payload() {
-        let data = TableData::from_rows(
-            (1_i64..=4_i64)
-                .map(|row_id| StoredRow {
-                    row_id,
-                    values: vec![Value::Int64(row_id), Value::Text("x".repeat(2048))],
-                })
-                .collect(),
-        );
-        let payload = encode_table_payload(&data).expect("encode table payload");
-        let mut store = InMemoryPageStore::new(PAGE_SIZE);
-        let pointer = crate::record::overflow::write_overflow(
-            &mut store,
-            &payload,
-            CompressionMode::AutoMinBytes(1),
-        )
-        .expect("write compressed table payload");
-        assert!(
-            pointer.is_compressed(),
-            "expected compressed overflow pointer"
-        );
-        let state = PersistedTableState {
-            pointer,
-            checksum: crc32c_parts(&[payload.as_slice()]),
-            row_count: data.rows.len(),
-            ..PersistedTableState::default()
-        };
-
-        let row = read_deferred_row_by_id_from_table_payload(&store, state, 3)
-            .expect("read deferred row")
-            .expect("row should exist");
-        assert_eq!(row.row_id, 3);
-        assert_eq!(row.values, data.rows[2].values);
-        assert!(
-            read_deferred_row_by_id_from_table_payload(&store, state, 99)
-                .expect("read missing deferred row")
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn persist_paged_table_writes_multi_chunk_manifest() {
-        let body = "x".repeat(2048);
-        let data = TableData::from_rows(
-            (0_i64..96_i64)
-                .map(|row_id| StoredRow {
-                    row_id: row_id + 1,
-                    values: vec![Value::Int64(row_id), Value::Text(body.clone())],
-                })
-                .collect(),
-        );
-        let mut store = InMemoryPageStore::new(PAGE_SIZE);
-
-        let encoded_chunks =
-            encode_paged_table_chunks(&data, PAGE_SIZE).expect("encode paged table chunks");
-        let state = persist_paged_table(
-            &mut store,
-            PersistedTableState::default(),
-            &encoded_chunks,
-            data.rows.len(),
-        )
-        .expect("persist paged table");
-        assert!(state.pointer.is_table_paged_manifest());
-        assert_eq!(state.row_count, data.rows.len());
-
-        let manifest_payload =
-            crate::record::overflow::read_overflow(&store, state.pointer).expect("read manifest");
-        let persisted_manifest =
-            decode_paged_table_manifest_payload(&manifest_payload).expect("decode paged manifest");
-        assert!(
-            persisted_manifest.chunks.len() > 1,
-            "expected persisted paged table to span multiple chunks"
-        );
-
-        let decoded_manifest =
-            read_table_page_manifest_from_state(&store, state).expect("read paged table manifest");
-        assert_eq!(decoded_manifest.row_count(), data.rows.len());
-        let last_row = decoded_manifest
-            .row_by_id(96)
-            .expect("read row by id")
-            .expect("row should exist");
-        assert_eq!(
-            last_row.values(),
-            &[Value::Int64(95), Value::Text(body.clone())]
-        );
-    }
-
-    #[test]
-    fn append_paged_table_chunks_preserves_existing_chunk_pointers() {
-        let body = "x".repeat(2048);
-        let mut store = InMemoryPageStore::new(PAGE_SIZE);
-        let initial = TableData::from_rows(
-            (0_i64..48_i64)
-                .map(|row_id| StoredRow {
-                    row_id: row_id + 1,
-                    values: vec![Value::Int64(row_id), Value::Text(body.clone())],
-                })
-                .collect(),
-        );
-        let initial_chunks =
-            encode_paged_table_chunks(&initial, PAGE_SIZE).expect("encode initial chunks");
-        let initial_state = persist_paged_table(
-            &mut store,
-            PersistedTableState::default(),
-            &initial_chunks,
-            initial.rows.len(),
-        )
-        .expect("persist initial paged table");
-        let initial_manifest_payload =
-            crate::record::overflow::read_overflow(&store, initial_state.pointer)
-                .expect("read initial manifest");
-        let initial_manifest = decode_paged_table_manifest_payload(&initial_manifest_payload)
-            .expect("decode initial manifest");
-        let initial_chunk_pointers = initial_manifest
-            .chunks
-            .iter()
-            .map(|chunk| chunk.pointer)
-            .collect::<Vec<_>>();
-
-        let appended_rows = (48_i64..96_i64)
-            .map(|row_id| StoredRow {
-                row_id: row_id + 1,
-                values: vec![Value::Int64(row_id), Value::Text(body.clone())],
-            })
-            .collect::<Vec<_>>();
-        let appended_chunks = encode_paged_table_chunks_from_rows(&appended_rows, PAGE_SIZE)
-            .expect("encode appended chunks");
-        let appended_state =
-            append_paged_table_chunks(&mut store, initial_state, &appended_chunks, 96)
-                .expect("append paged chunks");
-        let appended_manifest_payload =
-            crate::record::overflow::read_overflow(&store, appended_state.pointer)
-                .expect("read appended manifest");
-        let appended_manifest = decode_paged_table_manifest_payload(&appended_manifest_payload)
-            .expect("decode appended manifest");
-
-        assert!(
-            appended_manifest.chunks.len() > initial_chunk_pointers.len(),
-            "expected append path to add new chunk entries"
-        );
-        assert_eq!(
-            appended_manifest.chunks[..initial_chunk_pointers.len()]
-                .iter()
-                .map(|chunk| chunk.pointer)
-                .collect::<Vec<_>>(),
-            initial_chunk_pointers,
-            "append path should preserve existing paged chunk pointers"
-        );
-    }
-
-    #[test]
-    fn append_only_paged_manifest_rewrite_preserves_untouched_chunk_pointers() {
-        let body = "x".repeat(2048);
-        let mut store = InMemoryPageStore::new(PAGE_SIZE);
-        let initial = TableData::from_rows(
-            (0_i64..96_i64)
-                .map(|row_id| StoredRow {
-                    row_id: row_id + 1,
-                    values: vec![Value::Int64(row_id), Value::Text(body.clone())],
-                })
-                .collect(),
-        );
-        let initial_chunks =
-            encode_paged_table_chunks(&initial, PAGE_SIZE).expect("encode initial chunks");
-        let initial_state = persist_paged_table(
-            &mut store,
-            PersistedTableState::default(),
-            &initial_chunks,
-            initial.rows.len(),
-        )
-        .expect("persist initial paged table");
-        let initial_manifest_payload =
-            crate::record::overflow::read_overflow(&store, initial_state.pointer)
-                .expect("read initial manifest");
-        let initial_manifest = decode_paged_table_manifest_payload(&initial_manifest_payload)
-            .expect("decode initial manifest");
-        assert!(
-            initial_manifest.chunks.len() > 2,
-            "expected multiple chunks to observe pointer preservation"
-        );
-        let untouched_pointers = initial_manifest
-            .chunks
-            .iter()
-            .take(initial_manifest.chunks.len() - 1)
-            .map(|chunk| chunk.pointer)
-            .collect::<Vec<_>>();
-
-        let mut page_manifest =
-            read_table_page_manifest_from_state(&store, initial_state).expect("read manifest");
-        for row_id in 96_i64..144_i64 {
-            page_manifest
-                .append_row(
-                    &StoredRow {
-                        row_id: row_id + 1,
-                        values: vec![Value::Int64(row_id), Value::Text(body.clone())],
-                    },
-                    PAGE_SIZE,
-                )
-                .expect("append row to paged manifest");
-        }
-
-        let (appended_state, persisted_chunks) =
-            try_append_only_paged_table_from_manifest(&mut store, initial_state, &page_manifest)
-                .expect("append-only paged manifest rewrite")
-                .expect("append-only path should handle tail rewrite and new chunks");
-        let appended_manifest_payload =
-            crate::record::overflow::read_overflow(&store, appended_state.pointer)
-                .expect("read appended manifest");
-        let appended_manifest = decode_paged_table_manifest_payload(&appended_manifest_payload)
-            .expect("decode appended manifest");
-        let appended_page_manifest =
-            read_table_page_manifest_from_state(&store, appended_state).expect("read appended");
-        let preserved_untouched = appended_manifest
-            .chunks
-            .iter()
-            .take(untouched_pointers.len())
-            .map(|chunk| chunk.pointer)
-            .collect::<Vec<_>>();
-        let last_row = appended_page_manifest
-            .row_by_id(144)
-            .expect("read last row")
-            .expect("last row should exist");
-
-        assert_eq!(appended_state.row_count, 144);
-        assert_eq!(persisted_chunks.len(), appended_manifest.chunks.len());
-        assert_eq!(
-            preserved_untouched, untouched_pointers,
-            "append-only manifest rewrite should preserve chunks before the previous tail"
-        );
-        assert_eq!(
-            last_row.values(),
-            &[Value::Int64(143), Value::Text(body.clone())]
-        );
-    }
-
-    #[test]
-    fn rewrite_paged_table_from_resident_preserves_untouched_chunk_pointers() {
-        let body = "x".repeat(2048);
-        let mut store = InMemoryPageStore::new(PAGE_SIZE);
-        let initial = TableData::from_rows(
-            (0_i64..96_i64)
-                .map(|row_id| StoredRow {
-                    row_id: row_id + 1,
-                    values: vec![Value::Int64(row_id), Value::Text(body.clone())],
-                })
-                .collect(),
-        );
-        let initial_chunks =
-            encode_paged_table_chunks(&initial, PAGE_SIZE).expect("encode initial chunks");
-        let initial_state = persist_paged_table(
-            &mut store,
-            PersistedTableState::default(),
-            &initial_chunks,
-            initial.rows.len(),
-        )
-        .expect("persist initial paged table");
-        let initial_manifest_payload =
-            crate::record::overflow::read_overflow(&store, initial_state.pointer)
-                .expect("read initial manifest");
-        let initial_manifest = decode_paged_table_manifest_payload(&initial_manifest_payload)
-            .expect("decode initial manifest");
-        assert!(
-            initial_manifest.chunks.len() > 2,
-            "expected multiple chunks to observe pointer preservation"
-        );
-        let initial_untouched_pointers = initial_manifest
-            .chunks
-            .iter()
-            .skip(1)
-            .map(|chunk| chunk.pointer)
-            .collect::<Vec<_>>();
-
-        let mut updated = initial.clone();
-        updated
-            .replace_value(5, 0, Value::Int64(500))
-            .expect("replace integer value");
-        updated
-            .replace_value(5, 1, Value::Text("y".repeat(2600)))
-            .expect("replace text value");
-        updated.remove_row(6);
-
-        let rewritten_state =
-            rewrite_paged_table_from_resident(&mut store, initial_state, &updated, PAGE_SIZE)
-                .expect("rewrite paged table from resident rows");
-        let rewritten_manifest_payload =
-            crate::record::overflow::read_overflow(&store, rewritten_state.pointer)
-                .expect("read rewritten manifest");
-        let rewritten_manifest = decode_paged_table_manifest_payload(&rewritten_manifest_payload)
-            .expect("decode rewritten manifest");
-        let preserved_untouched = rewritten_manifest
-            .chunks
-            .iter()
-            .filter_map(|chunk| {
-                initial_untouched_pointers
-                    .contains(&chunk.pointer)
-                    .then_some(chunk.pointer)
-            })
-            .collect::<Vec<_>>();
-
-        assert_eq!(rewritten_state.row_count, updated.rows.len());
-        assert_eq!(
-            preserved_untouched, initial_untouched_pointers,
-            "unchanged paged chunks should retain their original pointers in order"
-        );
-    }
-
-    #[test]
-    fn persist_to_db_resident_paged_row_updates_preserves_untouched_chunk_pointers() {
-        let body = "x".repeat(2048);
-        let config = DbConfig {
-            paged_row_storage: true,
-            defer_table_materialization: false,
-            ..DbConfig::default()
-        };
-        let db = Db::open_or_create(":memory:", config).expect("open db");
-        db.execute("CREATE TABLE docs (id INT64 PRIMARY KEY, body TEXT)")
-            .expect("create table");
-        for row_id in 1_i64..=96_i64 {
-            db.execute(&format!(
-                "INSERT INTO docs (id, body) VALUES ({row_id}, '{}')",
-                body
-            ))
-            .expect("insert row");
-        }
-
-        let mut runtime = db.debug_engine_snapshot().expect("snapshot runtime");
-        let initial_state = runtime.persisted_tables["docs"];
-        let store = DbTxnPageStore { db: &db };
-        db.begin_write().expect("begin write transaction");
-        let initial_manifest_payload =
-            crate::record::overflow::read_overflow(&store, initial_state.pointer)
-                .expect("read manifest payload");
-        let initial_manifest = decode_paged_table_manifest_payload(&initial_manifest_payload)
-            .expect("decode manifest payload");
-        let initial_page_manifest =
-            read_table_page_manifest_from_state(&store, initial_state).expect("read manifest");
-        db.commit().expect("commit write transaction");
-        assert!(
-            initial_manifest.chunks.len() > 2,
-            "expected multiple chunks to observe pointer preservation"
-        );
-        let changed_chunk_index = initial_page_manifest.rows[5].chunk_index as usize;
-        let untouched_pointers = initial_manifest
-            .chunks
-            .iter()
-            .enumerate()
-            .filter_map(|(index, chunk)| (index != changed_chunk_index).then_some(chunk.pointer))
-            .collect::<Vec<_>>();
-
-        let updated_body = "y".repeat(2600);
-        let statement = parse_sql_statement(&format!(
-            "UPDATE docs SET body = '{}' WHERE id = 6",
-            updated_body
-        ))
-        .expect("parse update");
-        let crate::sql::ast::Statement::Update(update) = statement else {
-            panic!("expected update statement");
-        };
-        let prepared = runtime
-            .prepare_simple_update(&update)
-            .expect("prepare update")
-            .expect("expected prepared update");
-        runtime
-            .execute_prepared_simple_update(&prepared, &[], PAGE_SIZE)
-            .expect("execute prepared update");
-        assert_eq!(
-            runtime
-                .paged_mutations
-                .get("docs")
-                .map(|m| m.updated_rows.len()),
-            Some(1)
-        );
-
-        db.begin_write().expect("begin write txn");
-        runtime.persist_to_db(&db).expect("persist runtime");
-        db.commit().expect("commit write txn");
-
-        let rewritten_state = runtime.persisted_tables["docs"];
-        db.begin_write().expect("begin write transaction");
-        let rewritten_manifest_payload =
-            crate::record::overflow::read_overflow(&store, rewritten_state.pointer)
-                .expect("read manifest payload");
-        let rewritten_manifest = decode_paged_table_manifest_payload(&rewritten_manifest_payload)
-            .expect("decode manifest payload");
-        let rewritten_page_manifest =
-            read_table_page_manifest_from_state(&store, rewritten_state).expect("read manifest");
-        db.commit().expect("commit write transaction");
-        let preserved_untouched = rewritten_manifest
-            .chunks
-            .iter()
-            .filter_map(|chunk| {
-                untouched_pointers
-                    .contains(&chunk.pointer)
-                    .then_some(chunk.pointer)
-            })
-            .collect::<Vec<_>>();
-        let updated_row = rewritten_page_manifest
-            .row_by_id(6)
-            .expect("read updated row")
-            .expect("row should exist");
-
-        assert_eq!(
-            preserved_untouched, untouched_pointers,
-            "persisted paged row updates should preserve untouched chunk pointers"
-        );
-        assert_eq!(
-            updated_row.values(),
-            &[Value::Int64(6), Value::Text(updated_body)]
-        );
-    }
-
-    #[test]
-    fn index_include_columns_round_trip_manifest_and_legacy_payloads() {
-        let mut runtime = EngineRuntime::empty(13);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE cover_idx (id INT64 PRIMARY KEY, k TEXT, payload TEXT, flag BOOL)",
-        );
-        execute_sql(
-            &mut runtime,
-            "CREATE INDEX cover_idx_k ON cover_idx (k) INCLUDE (payload, flag)",
-        );
-
-        let legacy = encode_runtime_payload(&runtime).expect("encode legacy runtime payload");
-        let legacy_decoded =
-            decode_runtime_payload(&legacy).expect("decode legacy runtime payload");
-        assert_eq!(
-            legacy_decoded.catalog.indexes["cover_idx_k"].include_columns,
-            vec!["payload".to_string(), "flag".to_string()]
-        );
-
-        let store = InMemoryPageStore::new(PAGE_SIZE);
-        let manifest =
-            encode_manifest_payload(&runtime, &runtime.persisted_tables).expect("encode manifest");
-        let manifest_decoded =
-            decode_manifest_payload(&store, &manifest).expect("decode manifest payload");
-        assert_eq!(
-            manifest_decoded.catalog.indexes["cover_idx_k"].include_columns,
-            vec!["payload".to_string(), "flag".to_string()]
-        );
-    }
-
-    #[test]
-    fn manifest_decode_without_index_include_section_defaults_to_empty_include_columns() {
-        let mut runtime = EngineRuntime::empty(14);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE cover_legacy (id INT64 PRIMARY KEY, k TEXT, payload TEXT)",
-        );
-        execute_sql(
-            &mut runtime,
-            "CREATE INDEX cover_legacy_idx ON cover_legacy (k) INCLUDE (payload)",
-        );
-        let store = InMemoryPageStore::new(PAGE_SIZE);
-        let manifest =
-            encode_manifest_payload(&runtime, &runtime.persisted_tables).expect("encode manifest");
-        let legacy_manifest =
-            drop_index_include_columns_section(&manifest).expect("drop include section");
-        let decoded =
-            decode_manifest_payload(&store, &legacy_manifest).expect("decode legacy manifest");
-        assert!(decoded.catalog.indexes["cover_legacy_idx"]
-            .include_columns
-            .is_empty());
-    }
-
-    #[test]
-    fn schema_entries_round_trip_manifest_and_legacy_payloads() {
-        let mut runtime = EngineRuntime::empty(15);
-        execute_sql(&mut runtime, "CREATE SCHEMA app");
-        execute_sql(&mut runtime, "CREATE SCHEMA IF NOT EXISTS analytics");
-
-        let legacy = encode_runtime_payload(&runtime).expect("encode legacy runtime payload");
-        let legacy_decoded =
-            decode_runtime_payload(&legacy).expect("decode legacy runtime payload");
-        assert!(legacy_decoded.catalog.schemas.contains_key("app"));
-        assert!(legacy_decoded.catalog.schemas.contains_key("analytics"));
-
-        let store = InMemoryPageStore::new(PAGE_SIZE);
-        let manifest =
-            encode_manifest_payload(&runtime, &runtime.persisted_tables).expect("encode manifest");
-        let manifest_decoded =
-            decode_manifest_payload(&store, &manifest).expect("decode manifest payload");
-        assert!(manifest_decoded.catalog.schemas.contains_key("app"));
-        assert!(manifest_decoded.catalog.schemas.contains_key("analytics"));
-    }
-
-    #[test]
-    fn manifest_template_patch_updates_next_row_id() {
-        let mut runtime = EngineRuntime::empty(10);
-        execute_sql(&mut runtime, "CREATE TABLE docs (id INT64 PRIMARY KEY)");
-        runtime
-            .catalog_mut()
-            .tables
-            .get_mut("docs")
-            .expect("table should exist")
-            .next_row_id = 42;
-        let store = InMemoryPageStore::new(PAGE_SIZE);
-
-        let first_payload = runtime
-            .manifest_payload()
-            .expect("build first manifest payload")
-            .to_vec();
-        let first = decode_manifest_payload(&store, &first_payload).expect("decode first payload");
-        assert_eq!(first.catalog.tables["docs"].next_row_id, 42);
-
-        runtime
-            .catalog_mut()
-            .tables
-            .get_mut("docs")
-            .expect("table should exist")
-            .next_row_id = 99;
-        let second_payload = runtime
-            .manifest_payload()
-            .expect("build second manifest payload")
-            .to_vec();
-        let second =
-            decode_manifest_payload(&store, &second_payload).expect("decode second payload");
-        assert_eq!(second.catalog.tables["docs"].next_row_id, 99);
-    }
-
-    #[test]
-    fn non_correlated_in_subquery_does_not_capture_outer_scope() {
-        let mut runtime = EngineRuntime::empty(11);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE t (id INT64 PRIMARY KEY, name TEXT, grp INT64)",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO t VALUES (1, 'a', 1), (2, 'b', 2), (3, 'c', 1)",
-        );
-
-        let statement = parse_sql_statement(
-            "SELECT COUNT(*) FROM t WHERE grp IN (SELECT grp FROM t WHERE name = 'a')",
-        )
-        .expect("parse SQL");
-        let result = runtime
-            .execute_statement(&statement, &[], PAGE_SIZE)
-            .expect("execute SQL");
-
-        assert_eq!(result.rows().len(), 1);
-        assert_eq!(result.rows()[0].values(), &[Value::Int64(2)]);
-    }
-
-    #[test]
-    fn correlated_exists_uses_outer_table_name_when_inner_table_is_aliased() {
-        let mut runtime = EngineRuntime::empty(12);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE del_artists (Id INT64 PRIMARY KEY, LibraryId INT64)",
-        );
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE del_contributors (Id INT64 PRIMARY KEY, ArtistId INT64)",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO del_artists VALUES (1, 10), (2, 20)",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO del_contributors VALUES (1, 1), (2, 2)",
-        );
-
-        let delete = parse_sql_statement(
-            "DELETE FROM del_contributors WHERE EXISTS (\
-             SELECT 1 FROM del_contributors AS c \
-             INNER JOIN del_artists AS a ON c.ArtistId = a.Id \
-             WHERE a.LibraryId = $1 AND del_contributors.Id = c.Id)",
-        )
-        .expect("parse delete");
-        let result = runtime
-            .execute_statement(&delete, &[Value::Int64(10)], PAGE_SIZE)
-            .expect("execute delete");
-        assert_eq!(result.affected_rows(), 1);
-
-        let count =
-            parse_sql_statement("SELECT COUNT(*) FROM del_contributors").expect("parse count");
-        let result = runtime
-            .execute_statement(&count, &[], PAGE_SIZE)
-            .expect("execute count");
-        assert_eq!(result.rows()[0].values(), &[Value::Int64(1)]);
-    }
-
-    #[test]
-    fn simple_count_star_without_filter_uses_fast_path() {
-        let mut runtime = EngineRuntime::empty(16);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE t (id INT64 PRIMARY KEY, name TEXT)",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')",
-        );
-
-        let statement = parse_sql_statement("SELECT COUNT(*) FROM t").expect("parse count");
-        let result = runtime
-            .execute_statement(&statement, &[], PAGE_SIZE)
-            .expect("execute count");
-        assert_eq!(result.rows().len(), 1);
-        assert_eq!(result.rows()[0].values(), &[Value::Int64(3)]);
-    }
-
-    #[test]
-    fn engine_runtime_clone_is_shallow_when_unmutated() {
-        let mut runtime = EngineRuntime::empty(17);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE docs (id INT64 PRIMARY KEY, name TEXT)",
-        );
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE people (id INT64 PRIMARY KEY, email TEXT)",
-        );
-        execute_sql(&mut runtime, "CREATE INDEX docs_name_idx ON docs (name)");
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO docs (id, name) VALUES (1, 'alpha')",
-        );
-        execute_sql(
-            &mut runtime,
-            "CREATE TEMP TABLE temp_docs (id INT64 PRIMARY KEY, name TEXT)",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO temp_docs (id, name) VALUES (1, 'temp')",
-        );
-
-        let cloned = runtime.clone();
-
-        assert!(Arc::ptr_eq(&runtime.catalog, &cloned.catalog));
-        assert!(Arc::ptr_eq(&runtime.tables, &cloned.tables));
-        assert!(Arc::ptr_eq(
-            &runtime.temp_table_data,
-            &cloned.temp_table_data
-        ));
-        assert!(Arc::ptr_eq(&runtime.indexes, &cloned.indexes));
-        assert_eq!(Arc::strong_count(&runtime.catalog), 2);
-        assert_eq!(Arc::strong_count(&runtime.tables), 2);
-        assert_eq!(Arc::strong_count(&runtime.temp_table_data), 2);
-        assert_eq!(Arc::strong_count(&runtime.indexes), 2);
-    }
-
-    #[test]
-    fn engine_runtime_cow_isolates_mutations() {
-        let mut runtime = EngineRuntime::empty(18);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE docs (id INT64 PRIMARY KEY, name TEXT)",
-        );
-        execute_sql(
-            &mut runtime,
-            "CREATE TEMP TABLE temp_docs (id INT64 PRIMARY KEY, name TEXT)",
-        );
-
-        let mut cloned = runtime.clone();
-        execute_sql(&mut cloned, "CREATE INDEX docs_name_idx ON docs (name)");
-        execute_sql(
-            &mut cloned,
-            "INSERT INTO docs (id, name) VALUES (1, 'alpha')",
-        );
-        execute_sql(
-            &mut cloned,
-            "INSERT INTO temp_docs (id, name) VALUES (1, 'temp')",
-        );
-
-        assert!(!Arc::ptr_eq(&runtime.catalog, &cloned.catalog));
-        assert!(!Arc::ptr_eq(&runtime.tables, &cloned.tables));
-        assert!(!Arc::ptr_eq(
-            &runtime.temp_table_data,
-            &cloned.temp_table_data
-        ));
-        assert!(!Arc::ptr_eq(&runtime.indexes, &cloned.indexes));
-        assert!(!runtime.catalog.indexes.contains_key("docs_name_idx"));
-        assert!(cloned.catalog.indexes.contains_key("docs_name_idx"));
-        assert!(runtime
-            .table_data("docs")
-            .expect("original table data")
-            .rows
-            .is_empty());
-        assert_eq!(
-            cloned
-                .table_data("docs")
-                .expect("cloned table data")
-                .rows
-                .len(),
-            1
-        );
-        assert!(runtime
-            .temp_table_data("temp_docs")
-            .expect("original temp table data")
-            .rows
-            .is_empty());
-        assert_eq!(
-            cloned
-                .temp_table_data("temp_docs")
-                .expect("cloned temp table data")
-                .rows
-                .len(),
-            1
-        );
-
-        drop(cloned);
-
-        assert_eq!(Arc::strong_count(&runtime.catalog), 1);
-        assert_eq!(Arc::strong_count(&runtime.tables), 1);
-        assert_eq!(Arc::strong_count(&runtime.temp_table_data), 1);
-        assert_eq!(Arc::strong_count(&runtime.indexes), 1);
-    }
-
-    #[test]
-    fn engine_runtime_autocommit_select_does_not_grow_strong_counts_unboundedly() {
-        let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
-        db.execute("CREATE TABLE docs (id INT64 PRIMARY KEY, name TEXT)")
-            .expect("create table");
-        db.execute("INSERT INTO docs (id, name) VALUES (1, 'alpha')")
-            .expect("insert row 1");
-        db.execute("INSERT INTO docs (id, name) VALUES (2, 'beta')")
-            .expect("insert row 2");
-        db.execute("INSERT INTO docs (id, name) VALUES (3, 'gamma')")
-            .expect("insert row 3");
-
-        for _ in 0..100 {
-            let result = db
-                .execute("SELECT COUNT(*) FROM docs")
-                .expect("execute autocommit select");
-            assert_eq!(result.rows()[0].values(), &[Value::Int64(3)]);
-        }
-
-        let snapshot = db.debug_engine_snapshot().expect("snapshot runtime");
-        assert!(Arc::strong_count(&snapshot.catalog) <= 2);
-        assert!(Arc::strong_count(&snapshot.tables) <= 2);
-        assert!(Arc::strong_count(&snapshot.indexes) <= 2);
-    }
-
-    #[test]
-    fn cached_payloads_evicts_at_capacity() {
-        let mut config = DbConfig::default();
-        config.set_cached_payloads_max_entries_for_tests(4);
-        let mut runtime = EngineRuntime::from_config(20, &config);
-
-        for key in ["a", "b", "c", "d", "e"] {
-            runtime.cache_payload_insert(key.to_string(), Arc::new(vec![key.as_bytes()[0]]));
-        }
-
-        let cache = runtime
-            .payload_cache
-            .lock()
-            .expect("payload cache lock should not be poisoned");
-        assert_eq!(cache.len(), 4);
-        assert!(!cache.contains_key("a"));
-        assert!(cache.contains_key("e"));
-    }
-
-    #[test]
-    fn cached_payloads_lru_promotes_on_access() {
-        let mut config = DbConfig::default();
-        config.set_cached_payloads_max_entries_for_tests(4);
-        let mut runtime = EngineRuntime::from_config(21, &config);
-
-        for key in ["a", "b", "c", "d"] {
-            runtime.cache_payload_insert(key.to_string(), Arc::new(vec![key.as_bytes()[0]]));
-        }
-        assert!(runtime.cached_payload("a").is_some());
-
-        runtime.cache_payload_insert("e".to_string(), Arc::new(vec![b'e']));
-
-        let cache = runtime
-            .payload_cache
-            .lock()
-            .expect("payload cache lock should not be poisoned");
-        assert!(cache.contains_key("a"));
-        assert!(!cache.contains_key("b"));
-        assert!(cache.contains_key("e"));
-    }
-
-    #[test]
-    fn heap_bytes_cached_counter_accurate() {
-        let data = TableData::from_rows(vec![
-            StoredRow {
-                row_id: 1,
-                values: vec![
-                    Value::Int64(1),
-                    Value::Text("alpha".repeat(32)),
-                    Value::Blob(vec![0xAA; 128]),
-                ],
-            },
-            StoredRow {
-                row_id: 2,
-                values: vec![Value::Text("beta".repeat(16)), Value::Bool(true)],
-            },
-        ]);
-
-        assert_eq!(data.approximate_heap_bytes(), data.compute_heap_bytes());
-        assert!(data.approximate_heap_bytes() > data.rows.len() * std::mem::size_of::<StoredRow>());
-    }
-
-    #[test]
-    fn heap_bytes_updates_on_mutation() {
-        let mut data = TableData::default();
-        assert_eq!(data.approximate_heap_bytes(), 0);
-
-        data.push_row(StoredRow {
-            row_id: 1,
-            values: vec![Value::Int64(1), Value::Text("short".to_string())],
-        });
-        assert_eq!(data.approximate_heap_bytes(), data.compute_heap_bytes());
-        let after_insert = data.approximate_heap_bytes();
-
-        data.replace_value(0, 1, Value::Text("long".repeat(128)))
-            .expect("replace text value");
-        assert_eq!(data.approximate_heap_bytes(), data.compute_heap_bytes());
-        assert!(data.approximate_heap_bytes() > after_insert);
-
-        data.replace_row_values(0, vec![Value::Int64(1), Value::Blob(vec![0xBB; 256])])
-            .expect("replace row values");
-        assert_eq!(data.approximate_heap_bytes(), data.compute_heap_bytes());
-
-        data.push_row(StoredRow {
-            row_id: 2,
-            values: vec![Value::Text("keep".repeat(32))],
-        });
-        data.retain_rows(|row| row.row_id == 2);
-        assert_eq!(data.rows.len(), 1);
-        assert_eq!(data.rows[0].row_id, 2);
-        assert_eq!(data.approximate_heap_bytes(), data.compute_heap_bytes());
-
-        let removed = data.remove_row(0);
-        assert_eq!(removed.row_id, 2);
-        assert_eq!(data.approximate_heap_bytes(), data.compute_heap_bytes());
-    }
-
-    #[test]
-    fn payload_cache_touch_is_o1() {
-        let mut config = DbConfig::default();
-        config.set_cached_payloads_max_entries_for_tests(512);
-        let mut runtime = EngineRuntime::from_config(22, &config);
-
-        for idx in 0..512 {
-            let key = format!("k{idx:03}");
-            runtime.cache_payload_insert(key, Arc::new(vec![idx as u8]));
-        }
-
-        let before: Vec<(String, u64)> = {
-            let cache = runtime
-                .payload_cache
-                .lock()
-                .expect("payload cache lock should not be poisoned");
-            (0..512)
-                .map(|idx| {
-                    let key = format!("k{idx:03}");
-                    let touch_gen = cache
-                        .last_touch_gen(&key)
-                        .expect("inserted cache key should have a touch generation");
-                    (key, touch_gen)
-                })
-                .collect()
-        };
-
-        assert!(runtime.cached_payload("k000").is_some());
-
-        let cache = runtime
-            .payload_cache
-            .lock()
-            .expect("payload cache lock should not be poisoned");
-        for (key, touch_gen) in &before {
-            let after_touch_gen = cache
-                .last_touch_gen(key)
-                .expect("cache key should remain present");
-            if key == "k000" {
-                assert_ne!(after_touch_gen, *touch_gen);
-            } else {
-                assert_eq!(after_touch_gen, *touch_gen);
-            }
-        }
-    }
-
-    #[test]
-    fn payload_cache_eviction_is_lru() {
-        let mut config = DbConfig::default();
-        config.set_cached_payloads_max_entries_for_tests(512);
-        let mut runtime = EngineRuntime::from_config(23, &config);
-
-        for idx in 0..512 {
-            let key = format!("k{idx:03}");
-            runtime.cache_payload_insert(key, Arc::new(vec![idx as u8]));
-        }
-        assert!(runtime.cached_payload("k000").is_some());
-
-        runtime.cache_payload_insert("k512".to_string(), Arc::new(vec![0xFF]));
-
-        let cache = runtime
-            .payload_cache
-            .lock()
-            .expect("payload cache lock should not be poisoned");
-        assert_eq!(cache.len(), 512);
-        assert!(cache.contains_key("k000"));
-        assert!(!cache.contains_key("k001"));
-        assert!(cache.contains_key("k512"));
-    }
-
-    #[test]
-    fn transaction_clone_is_cheap() {
-        let mut runtime = EngineRuntime::empty(24);
-        for idx in 0..1_000 {
-            let table_name = format!("t{idx}");
-            runtime
-                .persisted_tables_mut()
-                .insert(table_name.clone(), PersistedTableState::default());
-            runtime.deferred_tables_mut().insert(table_name.clone());
-            runtime.dirty_tables_mut().insert(table_name);
-        }
-        runtime.cache_payload_insert("payload".to_string(), Arc::new(vec![0xAA; 4096]));
-
-        let cloned = runtime.clone();
-
-        assert!(Arc::ptr_eq(
-            &runtime.persisted_tables,
-            &cloned.persisted_tables
-        ));
-        assert!(Arc::ptr_eq(
-            &runtime.deferred_tables,
-            &cloned.deferred_tables
-        ));
-        assert!(Arc::ptr_eq(&runtime.dirty_tables, &cloned.dirty_tables));
-        assert!(Arc::ptr_eq(&runtime.payload_cache, &cloned.payload_cache));
-        assert_eq!(Arc::strong_count(&runtime.persisted_tables), 2);
-        assert_eq!(Arc::strong_count(&runtime.deferred_tables), 2);
-        assert_eq!(Arc::strong_count(&runtime.dirty_tables), 2);
-
-        runtime
-            .persisted_tables_mut()
-            .insert("new_table".to_string(), PersistedTableState::default());
-        assert!(!Arc::ptr_eq(
-            &runtime.persisted_tables,
-            &cloned.persisted_tables
-        ));
-        assert!(!cloned.persisted_tables.contains_key("new_table"));
-    }
-
-    #[test]
-    fn cte_alias_shares_row_storage() {
-        let runtime = EngineRuntime::empty(19);
-        let original = Dataset::with_rows(
-            vec![ColumnBinding::visible(
-                Some("cte".to_string()),
-                "id".to_string(),
-            )],
-            (0..1000).map(|id| vec![Value::Int64(id)]).collect(),
-        );
-        let mut ctes = BTreeMap::new();
-        ctes.insert("cte".to_string(), original.clone());
-
-        let aliased = runtime
-            .evaluate_from_item_in_scope(
-                &FromItem::Table {
-                    name: "cte".to_string(),
-                    alias: Some("alias_cte".to_string()),
-                },
-                &[],
-                &ctes,
-                &Dataset::empty(),
-                &[],
-            )
-            .expect("resolve aliased cte");
-
-        assert!(Arc::ptr_eq(&original.rows, &aliased.rows));
-        assert_eq!(aliased.columns[0].table.as_deref(), Some("alias_cte"));
-        assert_eq!(Arc::strong_count(&original.rows), 3);
-    }
-
-    #[test]
-    fn analyze_collects_table_and_index_stats() {
-        let mut runtime = EngineRuntime::empty(12);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE docs (id INT64 PRIMARY KEY, email TEXT)",
-        );
-        execute_sql(&mut runtime, "CREATE INDEX docs_email_idx ON docs (email)");
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO docs (id, email) VALUES (1, 'a@example.com')",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO docs (id, email) VALUES (2, 'a@example.com')",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO docs (id, email) VALUES (3, 'b@example.com')",
-        );
-
-        execute_sql(&mut runtime, "ANALYZE docs");
-
-        assert_eq!(
-            runtime.catalog.table_stats.get("docs"),
-            Some(&crate::catalog::TableStats { row_count: 3 })
-        );
-        assert_eq!(
-            runtime.catalog.index_stats.get("docs_email_idx"),
-            Some(&crate::catalog::IndexStats {
-                entry_count: 3,
-                distinct_key_count: 2,
-            })
-        );
-    }
-
-    #[test]
-    fn manifest_round_trip_preserves_analyze_stats() {
-        let mut runtime = EngineRuntime::empty(13);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE docs (id INT64 PRIMARY KEY, email TEXT)",
-        );
-        execute_sql(&mut runtime, "CREATE INDEX docs_email_idx ON docs (email)");
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO docs (id, email) VALUES (1, 'a@example.com')",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO docs (id, email) VALUES (2, 'b@example.com')",
-        );
-        execute_sql(&mut runtime, "ANALYZE");
-
-        let store = InMemoryPageStore::new(PAGE_SIZE);
-        let manifest = encode_manifest_payload(&runtime, &runtime.persisted_tables)
-            .expect("encode manifest payload");
-        let decoded = decode_manifest_payload(&store, &manifest).expect("decode manifest payload");
-
-        assert_eq!(
-            decoded.catalog.table_stats.get("docs"),
-            Some(&crate::catalog::TableStats { row_count: 2 })
-        );
-        assert_eq!(
-            decoded.catalog.index_stats.get("docs_email_idx"),
-            Some(&crate::catalog::IndexStats {
-                entry_count: 2,
-                distinct_key_count: 2,
-            })
-        );
-    }
-
-    fn execute_sql(runtime: &mut EngineRuntime, sql: &str) {
-        let statement = parse_sql_statement(sql).expect("parse SQL");
-        runtime
-            .execute_statement(&statement, &[], PAGE_SIZE)
-            .expect("execute SQL");
-    }
-
-    fn paged_row_source(rows: Vec<StoredRow>) -> TableRowSource {
-        let payload = encode_table_payload(&TableData::from_rows(rows.clone()))
-            .expect("encode paged test payload");
-        let manifest =
-            TablePageManifest::from_payload(Arc::new(payload)).expect("build paged test manifest");
-        TableRowSource::Paged(Arc::new(manifest))
-    }
-
-    #[test]
-    fn general_grouped_group_concat_from_source() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE items (id INT64 PRIMARY KEY, cat TEXT, name TEXT)",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO items (id, cat, name) VALUES (1, 'a', 'alpha')",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO items (id, cat, name) VALUES (2, 'a', 'aplomb')",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO items (id, cat, name) VALUES (3, 'b', 'bravo')",
-        );
-
-        let statement = parse_sql_statement(
-            "SELECT cat, GROUP_CONCAT(name) AS names FROM items GROUP BY cat ORDER BY cat",
-        )
-        .expect("parse");
-        let crate::sql::ast::Statement::Query(query) = &statement else {
-            panic!("expected query");
-        };
-        let result = runtime
-            .try_execute_general_grouped_query(query, &[])
-            .expect("execute")
-            .expect("general grouped path should handle GROUP_CONCAT");
-
-        assert_eq!(result.rows().len(), 2);
-        assert_eq!(
-            result.rows()[0].values(),
-            &[
-                Value::Text("a".to_string()),
-                Value::Text("alpha,aplomb".to_string())
-            ]
-        );
-        assert_eq!(
-            result.rows()[1].values(),
-            &[
-                Value::Text("b".to_string()),
-                Value::Text("bravo".to_string())
-            ]
-        );
-    }
-
-    #[test]
-    fn general_grouped_having_with_order_by() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE sales (id INT64 PRIMARY KEY, region TEXT, amount INT64)",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO sales (id, region, amount) VALUES (1, 'east', 10)",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO sales (id, region, amount) VALUES (2, 'east', 20)",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO sales (id, region, amount) VALUES (3, 'west', 5)",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO sales (id, region, amount) VALUES (4, 'north', 15)",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO sales (id, region, amount) VALUES (5, 'north', 15)",
-        );
-
-        let statement = parse_sql_statement(
-            "SELECT region, SUM(amount) AS total FROM sales GROUP BY region \
-             HAVING SUM(amount) > 20 ORDER BY total DESC",
-        )
-        .expect("parse");
-        let crate::sql::ast::Statement::Query(query) = &statement else {
-            panic!("expected query");
-        };
-        let result = runtime
-            .try_execute_general_grouped_query(query, &[])
-            .expect("execute")
-            .expect("general grouped path should handle HAVING + ORDER BY");
-
-        assert_eq!(result.rows().len(), 2);
-        assert_eq!(
-            result.rows()[0].values(),
-            &[Value::Text("east".to_string()), Value::Int64(30)]
-        );
-        assert_eq!(
-            result.rows()[1].values(),
-            &[Value::Text("north".to_string()), Value::Int64(30)]
-        );
-    }
-
-    #[test]
-    fn general_grouped_mixed_aggregates() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE metrics (id INT64 PRIMARY KEY, grp TEXT, val INT64)",
-        );
-        for (id, grp, val) in [(1, "x", 10), (2, "x", 20), (3, "x", 30), (4, "y", 5)] {
-            execute_sql(
-                &mut runtime,
-                &format!("INSERT INTO metrics (id, grp, val) VALUES ({id}, '{grp}', {val})"),
-            );
-        }
-
-        let statement = parse_sql_statement(
-            "SELECT grp, COUNT(*) AS cnt, AVG(val) AS avg_val, MIN(val) AS mn, MAX(val) AS mx \
-             FROM metrics GROUP BY grp ORDER BY grp",
-        )
-        .expect("parse");
-        let crate::sql::ast::Statement::Query(query) = &statement else {
-            panic!("expected query");
-        };
-
-        let result = runtime
-            .try_execute_general_grouped_query(query, &[])
-            .expect("execute")
-            .expect("general grouped path should handle mixed aggregates");
-
-        assert_eq!(result.rows().len(), 2);
-        assert_eq!(
-            result.rows()[0].values(),
-            &[
-                Value::Text("x".to_string()),
-                Value::Int64(3),
-                Value::Float64(20.0),
-                Value::Int64(10),
-                Value::Int64(30),
-            ]
-        );
-        assert_eq!(
-            result.rows()[1].values(),
-            &[
-                Value::Text("y".to_string()),
-                Value::Int64(1),
-                Value::Float64(5.0),
-                Value::Int64(5),
-                Value::Int64(5),
-            ]
-        );
-    }
-
-    #[test]
-    fn simple_numeric_aggregate_without_group_streams_rows() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE metrics (id INT64 PRIMARY KEY, val INT64)",
-        );
-        for (id, val) in [(1, 10), (2, 20), (3, 30)] {
-            execute_sql(
-                &mut runtime,
-                &format!("INSERT INTO metrics (id, val) VALUES ({id}, {val})"),
-            );
-        }
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO metrics (id, val) VALUES (4, NULL)",
-        );
-        let rows = runtime
-            .table_row_source("metrics")
-            .expect("metrics rows")
-            .resident_data()
-            .rows
-            .clone();
-        runtime
-            .replace_table_row_source("metrics", paged_row_source(rows))
-            .expect("replace metrics row source");
-
-        let statement = parse_sql_statement(
-            "SELECT COUNT(*), SUM(val), AVG(val), MIN(val), MAX(val) FROM metrics",
-        )
-        .expect("parse");
-        let crate::sql::ast::Statement::Query(query) = &statement else {
-            panic!("expected query");
-        };
-
-        let result = runtime
-            .try_execute_simple_grouped_numeric_aggregate_query(query, &[])
-            .expect("execute")
-            .expect("simple numeric aggregate path should handle scalar aggregates");
-
-        assert_eq!(result.rows().len(), 1);
-        assert_eq!(
-            result.rows()[0].values(),
-            &[
-                Value::Int64(4),
-                Value::Int64(60),
-                Value::Float64(20.0),
-                Value::Int64(10),
-                Value::Int64(30),
-            ]
-        );
-    }
-
-    #[test]
-    fn simple_numeric_aggregate_without_group_returns_empty_group_defaults() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE metrics (id INT64 PRIMARY KEY, val INT64)",
-        );
-
-        let statement = parse_sql_statement(
-            "SELECT COUNT(*), SUM(val), AVG(val), MIN(val), MAX(val) \
-             FROM metrics WHERE val > 100",
-        )
-        .expect("parse");
-        let crate::sql::ast::Statement::Query(query) = &statement else {
-            panic!("expected query");
-        };
-
-        let result = runtime
-            .try_execute_simple_grouped_numeric_aggregate_query(query, &[])
-            .expect("execute")
-            .expect("simple numeric aggregate path should keep scalar empty-group semantics");
-
-        assert_eq!(result.rows().len(), 1);
-        assert_eq!(
-            result.rows()[0].values(),
-            &[
-                Value::Int64(0),
-                Value::Null,
-                Value::Null,
-                Value::Null,
-                Value::Null,
-            ]
-        );
-    }
-
-    #[test]
-    fn simple_scalar_filtered_count_sum_uses_fast_path() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE orders (id INT64 PRIMARY KEY, user_id INT64, amount FLOAT64)",
-        );
-        for (id, user_id, amount) in [(1, 7, 1.5), (2, 8, 10.0), (3, 7, 2.25)] {
-            execute_sql(
-                &mut runtime,
-                &format!(
-                    "INSERT INTO orders (id, user_id, amount) VALUES ({id}, {user_id}, {amount})"
-                ),
-            );
-        }
-
-        let statement =
-            parse_sql_statement("SELECT COUNT(*), SUM(amount) FROM orders WHERE user_id = $1")
-                .expect("parse");
-        let crate::sql::ast::Statement::Query(query) = &statement else {
-            panic!("expected query");
-        };
-
-        let result = runtime
-            .try_execute_simple_grouped_numeric_aggregate_query(query, &[Value::Int64(7)])
-            .expect("execute")
-            .expect("simple scalar filtered aggregate should stay on fast path");
-
-        assert_eq!(result.rows().len(), 1);
-        assert_eq!(
-            result.rows()[0].values(),
-            &[Value::Int64(2), Value::Float64(3.75)]
-        );
-    }
-
-    #[test]
-    fn indexed_join_grouped_count_uses_child_index_counts() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE artists (id INT64 PRIMARY KEY, name TEXT NOT NULL)",
-        );
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE songs (id INT64 PRIMARY KEY, artist_id INT64 NOT NULL, title TEXT)",
-        );
-        execute_sql(
-            &mut runtime,
-            "CREATE INDEX idx_songs_artist ON songs (artist_id)",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO artists (id, name) VALUES (1, 'a')",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO artists (id, name) VALUES (2, 'b')",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO artists (id, name) VALUES (3, 'c')",
-        );
-        for (id, artist_id) in [(1, 1), (2, 1), (3, 2), (4, 2), (5, 2)] {
-            execute_sql(
-                &mut runtime,
-                &format!(
-                    "INSERT INTO songs (id, artist_id, title) VALUES ({id}, {artist_id}, 's')"
-                ),
-            );
-        }
-
-        let statement = parse_sql_statement(
-            "SELECT a.id, a.name, COUNT(s.id) AS song_count \
-             FROM artists a JOIN songs s ON s.artist_id = a.id \
-             GROUP BY a.id, a.name ORDER BY song_count DESC, a.id ASC LIMIT 2",
-        )
-        .expect("parse");
-        let crate::sql::ast::Statement::Query(query) = &statement else {
-            panic!("expected query");
-        };
-
-        assert_eq!(
-            runtime
-                .indexed_join_grouped_count_parent_table_name(query, &[])
-                .expect("analyze")
-                .expect("indexed grouped count parent table"),
-            "artists"
-        );
-        let result = runtime
-            .try_execute_indexed_join_grouped_count_query(query, &[])
-            .expect("execute")
-            .expect("indexed grouped join count path should match this query");
-
-        assert_eq!(result.rows().len(), 2);
-        assert_eq!(
-            result.rows()[0].values(),
-            &[
-                Value::Int64(2),
-                Value::Text("b".to_string()),
-                Value::Int64(3)
-            ]
-        );
-        assert_eq!(
-            result.rows()[1].values(),
-            &[
-                Value::Int64(1),
-                Value::Text("a".to_string()),
-                Value::Int64(2)
-            ]
-        );
-    }
-
-    #[test]
-    fn indexed_join_grouped_count_rejects_nullable_count_column() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE artists (id INT64 PRIMARY KEY, name TEXT NOT NULL)",
-        );
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE songs (id INT64 PRIMARY KEY, artist_id INT64 NOT NULL, title TEXT)",
-        );
-        execute_sql(
-            &mut runtime,
-            "CREATE INDEX idx_songs_artist ON songs (artist_id)",
-        );
-
-        let statement = parse_sql_statement(
-            "SELECT a.id, COUNT(s.title) AS titled_songs \
-             FROM artists a JOIN songs s ON s.artist_id = a.id \
-             GROUP BY a.id ORDER BY titled_songs DESC",
-        )
-        .expect("parse");
-        let crate::sql::ast::Statement::Query(query) = &statement else {
-            panic!("expected query");
-        };
-
-        assert!(
-            runtime
-                .try_execute_indexed_join_grouped_count_query(query, &[])
-                .expect("analyze")
-                .is_none(),
-            "nullable COUNT(child.column) must keep general SQL semantics"
-        );
-    }
-
-    #[test]
-    fn indexed_join_limit_projection_stops_after_limit() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE artists (id INT64 PRIMARY KEY, name TEXT NOT NULL)",
-        );
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE albums (id INT64 PRIMARY KEY, artist_id INT64 NOT NULL, title TEXT)",
-        );
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE songs (id INT64 PRIMARY KEY, album_id INT64 NOT NULL, title TEXT)",
-        );
-        execute_sql(
-            &mut runtime,
-            "CREATE INDEX idx_albums_artist ON albums (artist_id)",
-        );
-        execute_sql(
-            &mut runtime,
-            "CREATE INDEX idx_songs_album ON songs (album_id)",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO artists (id, name) VALUES (1, 'a')",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO artists (id, name) VALUES (2, 'b')",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO albums (id, artist_id, title) VALUES (10, 1, 'a1')",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO albums (id, artist_id, title) VALUES (20, 2, 'b1')",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO songs (id, album_id, title) VALUES (100, 10, 's1')",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO songs (id, album_id, title) VALUES (101, 10, 's2')",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO songs (id, album_id, title) VALUES (200, 20, 's3')",
-        );
-
-        let statement = parse_sql_statement(
-            "SELECT a.id AS artist_id, a.name AS artist_name, al.title AS album_title, \
-                    s.title AS song_title \
-             FROM artists a JOIN albums al ON al.artist_id = a.id \
-             JOIN songs s ON s.album_id = al.id LIMIT 2",
-        )
-        .expect("parse");
-        let crate::sql::ast::Statement::Query(query) = &statement else {
-            panic!("expected query");
-        };
-        let result = runtime
-            .try_execute_indexed_join_limit_projection_query(query, &[])
-            .expect("execute")
-            .expect("indexed join limit projection path should match this query");
-
-        assert_eq!(result.rows().len(), 2);
-        assert_eq!(
-            result.rows()[0].values(),
-            &[
-                Value::Int64(1),
-                Value::Text("a".to_string()),
-                Value::Text("a1".to_string()),
-                Value::Text("s1".to_string()),
-            ]
-        );
-        assert_eq!(
-            result.rows()[1].values(),
-            &[
-                Value::Int64(1),
-                Value::Text("a".to_string()),
-                Value::Text("a1".to_string()),
-                Value::Text("s2".to_string()),
-            ]
-        );
-    }
-
-    #[test]
-    fn view_projection_limit_pushes_into_indexed_join_chain() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE artists (id INT64 PRIMARY KEY, name TEXT NOT NULL)",
-        );
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE albums (id INT64 PRIMARY KEY, artist_id INT64 NOT NULL, title TEXT)",
-        );
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE songs (id INT64 PRIMARY KEY, album_id INT64 NOT NULL, title TEXT)",
-        );
-        execute_sql(
-            &mut runtime,
-            "CREATE INDEX idx_albums_artist ON albums (artist_id)",
-        );
-        execute_sql(
-            &mut runtime,
-            "CREATE INDEX idx_songs_album ON songs (album_id)",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO artists (id, name) VALUES (1, 'a')",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO albums (id, artist_id, title) VALUES (10, 1, 'a1')",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO songs (id, album_id, title) VALUES (100, 10, 's1')",
-        );
-        execute_sql(
-            &mut runtime,
-            "CREATE VIEW v_artist_songs AS \
-             SELECT a.id AS artist_id, a.name AS artist_name, al.title AS album_title, \
-                    s.title AS song_title \
-             FROM artists a JOIN albums al ON al.artist_id = a.id \
-             JOIN songs s ON s.album_id = al.id",
-        );
-
-        let statement = parse_sql_statement(
-            "SELECT artist_id, artist_name, album_title, song_title FROM v_artist_songs LIMIT 1",
-        )
-        .expect("parse");
-        let crate::sql::ast::Statement::Query(query) = &statement else {
-            panic!("expected query");
-        };
-
-        let result = runtime
-            .try_execute_simple_view_projection_limit_query(query, &[])
-            .expect("execute")
-            .expect("view projection limit path should match this query");
-
-        assert_eq!(result.rows().len(), 1);
-        assert_eq!(
-            result.rows()[0].values(),
-            &[
-                Value::Int64(1),
-                Value::Text("a".to_string()),
-                Value::Text("a1".to_string()),
-                Value::Text("s1".to_string()),
-            ]
-        );
-    }
-
-    #[test]
-    fn view_filter_pushdown_can_prefilter_rowid_alias_join_chain() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE artists (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
-        );
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE albums (id INTEGER PRIMARY KEY, artist_id INTEGER NOT NULL, title TEXT)",
-        );
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE songs (id INTEGER PRIMARY KEY, album_id INTEGER NOT NULL, title TEXT)",
-        );
-        execute_sql(
-            &mut runtime,
-            "CREATE INDEX idx_albums_artist ON albums (artist_id)",
-        );
-        execute_sql(
-            &mut runtime,
-            "CREATE INDEX idx_songs_album ON songs (album_id)",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO artists (id, name) VALUES (1, 'a')",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO artists (id, name) VALUES (2, 'b')",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO albums (id, artist_id, title) VALUES (10, 1, 'a1')",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO albums (id, artist_id, title) VALUES (20, 2, 'b1')",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO songs (id, album_id, title) VALUES (100, 10, 's1')",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO songs (id, album_id, title) VALUES (101, 10, 's2')",
-        );
-        execute_sql(
-            &mut runtime,
-            "INSERT INTO songs (id, album_id, title) VALUES (200, 20, 's3')",
-        );
-
-        let statement = parse_sql_statement(
-            "SELECT a.id AS artist_id, a.name AS artist_name, al.title AS album_title, \
-                    s.title AS song_title \
-             FROM artists a JOIN albums al ON al.artist_id = a.id \
-             JOIN songs s ON s.album_id = al.id \
-             WHERE a.id = $1",
-        )
-        .expect("parse");
-        let crate::sql::ast::Statement::Query(query) = &statement else {
-            panic!("expected query");
-        };
-        let crate::sql::ast::QueryBody::Select(select) = &query.body else {
-            panic!("expected select");
-        };
-
-        let dataset = runtime
-            .try_indexed_prefiltered_inner_join_tree(select, &[Value::Int64(1)], &BTreeMap::new())
-            .expect("execute")
-            .expect("rowid-filtered view join chain should stay on the prefiltered fast path");
-
-        assert_eq!(dataset.rows.len(), 2);
-        assert!(dataset
-            .rows
-            .iter()
-            .all(|row| row.first() == Some(&Value::Int64(1))));
-    }
-
-    #[test]
-    fn rowid_range_projection_allows_order_by_unprojected_key() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE users (id INT64 PRIMARY KEY, name TEXT NOT NULL)",
-        );
-        for id in 0..5 {
-            execute_sql(
-                &mut runtime,
-                &format!("INSERT INTO users (id, name) VALUES ({id}, 'u{id}')"),
-            );
-        }
-
-        let statement = parse_sql_statement(
-            "SELECT name FROM users WHERE id >= $1 AND id < $2 ORDER BY id LIMIT $3",
-        )
-        .expect("parse");
-        let crate::sql::ast::Statement::Query(query) = &statement else {
-            panic!("expected query");
-        };
-
-        let result = runtime
-            .try_execute_simple_filtered_projection_query(
-                query,
-                &[Value::Int64(1), Value::Int64(4), Value::Int64(2)],
-            )
-            .expect("execute")
-            .expect("rowid range projection path should handle ORDER BY id outside projection");
-
-        assert_eq!(result.rows().len(), 2);
-        assert_eq!(result.rows()[0].values(), &[Value::Text("u1".to_string())]);
-        assert_eq!(result.rows()[1].values(), &[Value::Text("u2".to_string())]);
-    }
-
-    #[test]
-    fn general_grouped_paged_row_source() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE paged_grp (id INT64 PRIMARY KEY, category TEXT, value INT64)",
-        );
-
-        let rows: Vec<StoredRow> = vec![
-            StoredRow {
-                row_id: 1,
-                values: vec![
-                    Value::Int64(1),
-                    Value::Text("a".to_string()),
-                    Value::Int64(10),
-                ],
-            },
-            StoredRow {
-                row_id: 2,
-                values: vec![
-                    Value::Int64(2),
-                    Value::Text("a".to_string()),
-                    Value::Int64(20),
-                ],
-            },
-            StoredRow {
-                row_id: 3,
-                values: vec![
-                    Value::Int64(3),
-                    Value::Text("b".to_string()),
-                    Value::Int64(30),
-                ],
-            },
-        ];
-        runtime
-            .tables_mut()
-            .insert("paged_grp".to_string(), paged_row_source(rows));
-
-        let statement = parse_sql_statement(
-            "SELECT category, SUM(value) AS total FROM paged_grp GROUP BY category ORDER BY category",
-        )
-        .expect("parse");
-        let crate::sql::ast::Statement::Query(query) = &statement else {
-            panic!("expected query");
-        };
-
-        let result = runtime
-            .try_execute_general_grouped_query(query, &[])
-            .expect("execute")
-            .expect("general grouped path should handle paged row source");
-
-        assert_eq!(result.rows().len(), 2);
-        assert_eq!(
-            result.rows()[0].values(),
-            &[Value::Text("a".to_string()), Value::Int64(30)]
-        );
-        assert_eq!(
-            result.rows()[1].values(),
-            &[Value::Text("b".to_string()), Value::Int64(30)]
-        );
-    }
-
-    #[test]
-    fn general_grouped_with_limit_offset() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE lo_data (id INT64 PRIMARY KEY, grp TEXT, val INT64)",
-        );
-        for (id, grp, val) in [(1, "a", 1), (2, "b", 2), (3, "c", 3), (4, "d", 4)] {
-            execute_sql(
-                &mut runtime,
-                &format!("INSERT INTO lo_data (id, grp, val) VALUES ({id}, '{grp}', {val})"),
-            );
-        }
-
-        let statement = parse_sql_statement(
-            "SELECT grp, SUM(val) AS total FROM lo_data GROUP BY grp ORDER BY grp LIMIT 2 OFFSET 1",
-        )
-        .expect("parse");
-        let crate::sql::ast::Statement::Query(query) = &statement else {
-            panic!("expected query");
-        };
-
-        let result = runtime
-            .try_execute_general_grouped_query(query, &[])
-            .expect("execute")
-            .expect("general grouped path should handle LIMIT/OFFSET");
-
-        assert_eq!(result.rows().len(), 2);
-        assert_eq!(
-            result.rows()[0].values(),
-            &[Value::Text("b".to_string()), Value::Int64(2)]
-        );
-        assert_eq!(
-            result.rows()[1].values(),
-            &[Value::Text("c".to_string()), Value::Int64(3)]
-        );
-    }
-
-    #[test]
-    fn general_grouped_distinct() {
-        let mut runtime = EngineRuntime::empty(1);
-        execute_sql(
-            &mut runtime,
-            "CREATE TABLE dist_data (id INT64 PRIMARY KEY, grp TEXT, val INT64)",
-        );
-        for (id, grp, val) in [(1, "a", 10), (2, "a", 5), (3, "a", 5), (4, "b", 20)] {
-            execute_sql(
-                &mut runtime,
-                &format!("INSERT INTO dist_data (id, grp, val) VALUES ({id}, '{grp}', {val})"),
-            );
-        }
-
-        let statement = parse_sql_statement(
-            "SELECT DISTINCT grp, SUM(val) AS total FROM dist_data GROUP BY grp, val ORDER BY grp",
-        )
-        .expect("parse");
-        let crate::sql::ast::Statement::Query(query) = &statement else {
-            panic!("expected query");
-        };
-
-        let result = runtime
-            .try_execute_general_grouped_query(query, &[])
-            .expect("execute")
-            .expect("general grouped path should handle DISTINCT");
-
-        assert_eq!(result.rows().len(), 2);
-        assert_eq!(
-            result.rows()[0].values(),
-            &[Value::Text("a".to_string()), Value::Int64(10)]
-        );
-        assert_eq!(
-            result.rows()[1].values(),
-            &[Value::Text("b".to_string()), Value::Int64(20)]
-        );
-    }
-}
-
-fn arithmetic(op: &BinaryOp, left: Value, right: Value) -> Result<Value> {
-    if matches!(left, Value::Null) || matches!(right, Value::Null) {
-        return Ok(Value::Null);
-    }
-    if let Some(result) = timestamp_interval_arithmetic(op, &left, &right)? {
-        return Ok(result);
-    }
-    match (left, right) {
-        (Value::Int64(left), Value::Int64(right)) => {
-            if matches!(op, BinaryOp::Div | BinaryOp::Mod) && right == 0 {
-                return Ok(Value::Null);
-            }
-            Ok(match op {
-                BinaryOp::Add => Value::Int64(left + right),
-                BinaryOp::Sub => Value::Int64(left - right),
-                BinaryOp::Mul => Value::Int64(left * right),
-                BinaryOp::Div => Value::Int64(left / right),
-                BinaryOp::Mod => Value::Int64(left % right),
-                _ => unreachable!(),
-            })
-        }
-        (Value::Int64(left), Value::Float64(right)) => {
-            arithmetic(op, Value::Float64(left as f64), Value::Float64(right))
-        }
-        (Value::Float64(left), Value::Int64(right)) => {
-            arithmetic(op, Value::Float64(left), Value::Float64(right as f64))
-        }
-        (Value::Float64(left), Value::Float64(right)) => {
-            if matches!(op, BinaryOp::Div | BinaryOp::Mod) && right == 0.0 {
-                return Ok(Value::Null);
-            }
-            Ok(match op {
-                BinaryOp::Add => Value::Float64(left + right),
-                BinaryOp::Sub => Value::Float64(left - right),
-                BinaryOp::Mul => Value::Float64(left * right),
-                BinaryOp::Div => Value::Float64(left / right),
-                BinaryOp::Mod => Value::Float64(left % right),
-                _ => unreachable!(),
-            })
-        }
-        other => Err(DbError::sql(format!(
-            "arithmetic is not defined for {other:?}"
-        ))),
-    }
-}
-
-fn timestamp_interval_arithmetic(
-    op: &BinaryOp,
-    left: &Value,
-    right: &Value,
-) -> Result<Option<Value>> {
-    match (op, left, right) {
-        (BinaryOp::Add, Value::TimestampMicros(timestamp), Value::Int64(interval_micros)) => {
-            Ok(Some(Value::TimestampMicros(apply_interval_micros(
-                *timestamp,
-                *interval_micros,
-                true,
-            )?)))
-        }
-        (BinaryOp::Sub, Value::TimestampMicros(timestamp), Value::Int64(interval_micros)) => {
-            Ok(Some(Value::TimestampMicros(apply_interval_micros(
-                *timestamp,
-                *interval_micros,
-                false,
-            )?)))
-        }
-        (BinaryOp::Add, Value::Int64(interval_micros), Value::TimestampMicros(timestamp)) => {
-            Ok(Some(Value::TimestampMicros(apply_interval_micros(
-                *timestamp,
-                *interval_micros,
-                true,
-            )?)))
-        }
-        (BinaryOp::Add, Value::Text(timestamp), Value::Int64(interval_micros)) => {
-            Ok(Some(Value::TimestampMicros(apply_interval_micros(
-                parse_datetime_text("interval arithmetic", timestamp)?.timestamp_micros(),
-                *interval_micros,
-                true,
-            )?)))
-        }
-        (BinaryOp::Sub, Value::Text(timestamp), Value::Int64(interval_micros)) => {
-            Ok(Some(Value::TimestampMicros(apply_interval_micros(
-                parse_datetime_text("interval arithmetic", timestamp)?.timestamp_micros(),
-                *interval_micros,
-                false,
-            )?)))
-        }
-        (BinaryOp::Add, Value::Int64(interval_micros), Value::Text(timestamp)) => {
-            Ok(Some(Value::TimestampMicros(apply_interval_micros(
-                parse_datetime_text("interval arithmetic", timestamp)?.timestamp_micros(),
-                *interval_micros,
-                true,
-            )?)))
-        }
-        (
-            BinaryOp::Add,
-            Value::TimestampMicros(timestamp),
-            Value::Interval {
-                months,
-                days,
-                micros,
-            },
-        ) => Ok(Some(Value::TimestampMicros(
-            apply_interval_to_timestamp_micros(*timestamp, *months, *days, *micros, true)?,
-        ))),
-        (
-            BinaryOp::Sub,
-            Value::TimestampMicros(timestamp),
-            Value::Interval {
-                months,
-                days,
-                micros,
-            },
-        ) => Ok(Some(Value::TimestampMicros(
-            apply_interval_to_timestamp_micros(*timestamp, *months, *days, *micros, false)?,
-        ))),
-        (
-            BinaryOp::Add,
-            Value::Interval {
-                months,
-                days,
-                micros,
-            },
-            Value::TimestampMicros(timestamp),
-        ) => Ok(Some(Value::TimestampMicros(
-            apply_interval_to_timestamp_micros(*timestamp, *months, *days, *micros, true)?,
-        ))),
-        (
-            BinaryOp::Add,
-            Value::TimestampTzMicros(timestamp),
-            Value::Interval {
-                months,
-                days,
-                micros,
-            },
-        ) => Ok(Some(Value::TimestampTzMicros(
-            apply_interval_to_timestamp_micros(*timestamp, *months, *days, *micros, true)?,
-        ))),
-        (
-            BinaryOp::Sub,
-            Value::TimestampTzMicros(timestamp),
-            Value::Interval {
-                months,
-                days,
-                micros,
-            },
-        ) => Ok(Some(Value::TimestampTzMicros(
-            apply_interval_to_timestamp_micros(*timestamp, *months, *days, *micros, false)?,
-        ))),
-        (
-            BinaryOp::Add,
-            Value::Interval {
-                months,
-                days,
-                micros,
-            },
-            Value::TimestampTzMicros(timestamp),
-        ) => Ok(Some(Value::TimestampTzMicros(
-            apply_interval_to_timestamp_micros(*timestamp, *months, *days, *micros, true)?,
-        ))),
-        (
-            BinaryOp::Add,
-            Value::DateDays(days_since_epoch),
-            Value::Interval {
-                months,
-                days,
-                micros,
-            },
-        ) => Ok(Some(Value::TimestampMicros(
-            apply_interval_to_timestamp_micros(
-                date_days_to_micros(*days_since_epoch)?,
-                *months,
-                *days,
-                *micros,
-                true,
-            )?,
-        ))),
-        (
-            BinaryOp::Sub,
-            Value::DateDays(days_since_epoch),
-            Value::Interval {
-                months,
-                days,
-                micros,
-            },
-        ) => Ok(Some(Value::TimestampMicros(
-            apply_interval_to_timestamp_micros(
-                date_days_to_micros(*days_since_epoch)?,
-                *months,
-                *days,
-                *micros,
-                false,
-            )?,
-        ))),
-        (
-            BinaryOp::Add,
-            Value::Interval {
-                months,
-                days,
-                micros,
-            },
-            Value::DateDays(days_since_epoch),
-        ) => Ok(Some(Value::TimestampMicros(
-            apply_interval_to_timestamp_micros(
-                date_days_to_micros(*days_since_epoch)?,
-                *months,
-                *days,
-                *micros,
-                true,
-            )?,
-        ))),
-        (BinaryOp::Add, Value::Text(timestamp), Value::Text(interval_text)) => {
-            let (months, days, micros) = parse_interval(interval_text)?;
-            Ok(Some(Value::TimestampMicros(
-                apply_interval_to_timestamp_micros(
-                    parse_datetime_text("interval arithmetic", timestamp)?.timestamp_micros(),
-                    months,
-                    days,
-                    micros,
-                    true,
-                )?,
-            )))
-        }
-        (BinaryOp::Sub, Value::Text(timestamp), Value::Text(interval_text)) => {
-            let (months, days, micros) = parse_interval(interval_text)?;
-            Ok(Some(Value::TimestampMicros(
-                apply_interval_to_timestamp_micros(
-                    parse_datetime_text("interval arithmetic", timestamp)?.timestamp_micros(),
-                    months,
-                    days,
-                    micros,
-                    false,
-                )?,
-            )))
-        }
-        (BinaryOp::Add, Value::TimestampMicros(timestamp), Value::Text(interval_text)) => {
-            let (months, days, micros) = parse_interval(interval_text)?;
-            Ok(Some(Value::TimestampMicros(
-                apply_interval_to_timestamp_micros(*timestamp, months, days, micros, true)?,
-            )))
-        }
-        (BinaryOp::Sub, Value::TimestampMicros(timestamp), Value::Text(interval_text)) => {
-            let (months, days, micros) = parse_interval(interval_text)?;
-            Ok(Some(Value::TimestampMicros(
-                apply_interval_to_timestamp_micros(*timestamp, months, days, micros, false)?,
-            )))
-        }
-        (BinaryOp::Add, Value::Text(interval_text), Value::TimestampMicros(timestamp)) => {
-            let (months, days, micros) = parse_interval(interval_text)?;
-            Ok(Some(Value::TimestampMicros(
-                apply_interval_to_timestamp_micros(*timestamp, months, days, micros, true)?,
-            )))
-        }
-        _ => Ok(None),
-    }
-}
-
-fn apply_interval_micros(timestamp_micros: i64, interval_micros: i64, add: bool) -> Result<i64> {
-    if add {
-        timestamp_micros
-            .checked_add(interval_micros)
-            .ok_or_else(|| DbError::sql("timestamp addition overflowed"))
-    } else {
-        timestamp_micros
-            .checked_sub(interval_micros)
-            .ok_or_else(|| DbError::sql("timestamp subtraction overflowed"))
-    }
-}
-
-fn apply_interval_to_timestamp_micros(
-    timestamp_micros: i64,
-    months: i32,
-    days: i32,
-    micros: i64,
-    add: bool,
-) -> Result<i64> {
-    let mut datetime = datetime_from_epoch_micros("interval arithmetic", timestamp_micros)?;
-    let month_delta = if add {
-        i64::from(months)
-    } else {
-        -i64::from(months)
-    };
-    if month_delta != 0 {
-        datetime = shift_datetime_by_months(datetime, month_delta)?;
-    }
-    let day_delta = if add {
-        i64::from(days)
-    } else {
-        -i64::from(days)
-    };
-    if day_delta != 0 {
-        datetime = shift_datetime_by_duration(
-            "interval arithmetic",
-            datetime,
-            ChronoDuration::days(day_delta),
-        )?;
-    }
-    let micros_delta = if add {
-        micros
-    } else {
-        micros
-            .checked_neg()
-            .ok_or_else(|| DbError::sql("INTERVAL value overflowed"))?
-    };
-    if micros_delta != 0 {
-        datetime = shift_datetime_by_duration(
-            "interval arithmetic",
-            datetime,
-            ChronoDuration::microseconds(micros_delta),
-        )?;
-    }
-    Ok(datetime.timestamp_micros())
-}
-
-fn date_days_to_micros(days: i32) -> Result<i64> {
-    i64::from(days)
-        .checked_mul(EXEC_MICROS_PER_DAY)
-        .ok_or_else(|| DbError::sql("DATE value is out of range"))
-}
-
-fn expr_collation(expr: &Expr) -> Option<Collation> {
-    match expr {
-        Expr::Collate { collation, .. } => Some(collation.clone()),
-        _ => None,
-    }
-}
-
-fn select_item_contains_collation(item: &SelectItem) -> bool {
-    match item {
-        SelectItem::Expr { expr, .. } => expr_contains_collation(expr),
-        SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => false,
-    }
-}
-
-fn select_item_contains_fulltext_function(item: &SelectItem) -> bool {
-    match item {
-        SelectItem::Expr { expr, .. } => expr_contains_fulltext_function(expr),
-        SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => false,
-    }
-}
-
-fn expr_contains_fulltext_function(expr: &Expr) -> bool {
-    match expr {
-        Expr::Function { name, args } => {
-            name.eq_ignore_ascii_case("fulltext_match")
-                || name.eq_ignore_ascii_case("bm25")
-                || args.iter().any(expr_contains_fulltext_function)
-        }
-        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
-            expr_contains_fulltext_function(expr)
-        }
-        Expr::Collate { expr, .. } => expr_contains_fulltext_function(expr),
-        Expr::Binary { left, right, .. } => {
-            expr_contains_fulltext_function(left) || expr_contains_fulltext_function(right)
-        }
-        Expr::Between {
-            expr, low, high, ..
-        } => {
-            expr_contains_fulltext_function(expr)
-                || expr_contains_fulltext_function(low)
-                || expr_contains_fulltext_function(high)
-        }
-        Expr::InList { expr, items, .. } => {
-            expr_contains_fulltext_function(expr)
-                || items.iter().any(expr_contains_fulltext_function)
-        }
-        Expr::InSubquery { expr, .. } | Expr::CompareSubquery { expr, .. } => {
-            expr_contains_fulltext_function(expr)
-        }
-        Expr::Like {
-            expr,
-            pattern,
-            escape,
-            ..
-        } => {
-            expr_contains_fulltext_function(expr)
-                || expr_contains_fulltext_function(pattern)
-                || escape
-                    .as_deref()
-                    .is_some_and(expr_contains_fulltext_function)
-        }
-        Expr::Aggregate { args, order_by, .. } => {
-            args.iter().any(expr_contains_fulltext_function)
-                || order_by
-                    .iter()
-                    .any(|order| expr_contains_fulltext_function(&order.expr))
-        }
-        Expr::RowNumber {
-            partition_by,
-            order_by,
-            ..
-        } => {
-            partition_by.iter().any(expr_contains_fulltext_function)
-                || order_by
-                    .iter()
-                    .any(|order| expr_contains_fulltext_function(&order.expr))
-        }
-        Expr::WindowFunction {
-            args,
-            partition_by,
-            order_by,
-            ..
-        } => {
-            args.iter().any(expr_contains_fulltext_function)
-                || partition_by.iter().any(expr_contains_fulltext_function)
-                || order_by
-                    .iter()
-                    .any(|order| expr_contains_fulltext_function(&order.expr))
-        }
-        Expr::Case {
-            operand,
-            branches,
-            else_expr,
-        } => {
-            operand
-                .as_deref()
-                .is_some_and(expr_contains_fulltext_function)
-                || branches.iter().any(|(when, then)| {
-                    expr_contains_fulltext_function(when) || expr_contains_fulltext_function(then)
-                })
-                || else_expr
-                    .as_deref()
-                    .is_some_and(expr_contains_fulltext_function)
-        }
-        Expr::Row(exprs) => exprs.iter().any(expr_contains_fulltext_function),
-        Expr::Literal(_)
-        | Expr::Column { .. }
-        | Expr::Parameter(_)
-        | Expr::ScalarSubquery(_)
-        | Expr::Exists(_) => false,
-    }
-}
-
-fn expr_contains_collation(expr: &Expr) -> bool {
-    match expr {
-        Expr::Collate { .. } => true,
-        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
-            expr_contains_collation(expr)
-        }
-        Expr::Binary { left, right, .. } => {
-            expr_contains_collation(left) || expr_contains_collation(right)
-        }
-        Expr::Between {
-            expr, low, high, ..
-        } => {
-            expr_contains_collation(expr)
-                || expr_contains_collation(low)
-                || expr_contains_collation(high)
-        }
-        Expr::InList { expr, items, .. } => {
-            expr_contains_collation(expr) || items.iter().any(expr_contains_collation)
-        }
-        Expr::InSubquery { expr, .. } | Expr::CompareSubquery { expr, .. } => {
-            expr_contains_collation(expr)
-        }
-        Expr::Like {
-            expr,
-            pattern,
-            escape,
-            ..
-        } => {
-            expr_contains_collation(expr)
-                || expr_contains_collation(pattern)
-                || escape.as_deref().is_some_and(expr_contains_collation)
-        }
-        Expr::Function { args, .. } => args.iter().any(expr_contains_collation),
-        Expr::Aggregate { args, order_by, .. } => {
-            args.iter().any(expr_contains_collation)
-                || order_by.iter().any(order_by_contains_collation)
-        }
-        Expr::RowNumber {
-            partition_by,
-            order_by,
-            ..
-        } => {
-            partition_by.iter().any(expr_contains_collation)
-                || order_by.iter().any(order_by_contains_collation)
-        }
-        Expr::WindowFunction {
-            args,
-            partition_by,
-            order_by,
-            ..
-        } => {
-            args.iter().any(expr_contains_collation)
-                || partition_by.iter().any(expr_contains_collation)
-                || order_by.iter().any(order_by_contains_collation)
-        }
-        Expr::Case {
-            operand,
-            branches,
-            else_expr,
-        } => {
-            operand.as_deref().is_some_and(expr_contains_collation)
-                || branches.iter().any(|(when, then)| {
-                    expr_contains_collation(when) || expr_contains_collation(then)
-                })
-                || else_expr.as_deref().is_some_and(expr_contains_collation)
-        }
-        Expr::Row(exprs) => exprs.iter().any(expr_contains_collation),
-        Expr::Literal(_)
-        | Expr::Column { .. }
-        | Expr::Parameter(_)
-        | Expr::ScalarSubquery(_)
-        | Expr::Exists(_) => false,
-    }
-}
-
-fn order_by_contains_collation(order_by: &OrderBy) -> bool {
-    order_by.collation.is_some() || expr_contains_collation(&order_by.expr)
-}
-
-fn compare_values_with_collation(
-    left: &Value,
-    right: &Value,
-    collation: Option<Collation>,
-) -> Result<std::cmp::Ordering> {
-    match (collation, left, right) {
-        (Some(Collation::Binary), Value::Text(left), Value::Text(right)) => Ok(left.cmp(right)),
-        (Some(Collation::NoCase), Value::Text(left), Value::Text(right)) => {
-            Ok(compare_ascii_nocase(left, right))
-        }
-        (Some(Collation::RTrim), Value::Text(left), Value::Text(right)) => {
-            Ok(left.trim_end_matches(' ').cmp(right.trim_end_matches(' ')))
-        }
-        (Some(Collation::Extension(name)), Value::Text(_), Value::Text(_)) => {
-            Err(DbError::sql(format!(
-                "extension collation {name} requires runtime-aware comparison and is not supported in this execution path"
-            )))
-        }
-        _ => compare_values(left, right),
-    }
-}
-
-fn compare_ascii_nocase(left: &str, right: &str) -> std::cmp::Ordering {
-    left.bytes()
-        .map(|byte| byte.to_ascii_lowercase())
-        .cmp(right.bytes().map(|byte| byte.to_ascii_lowercase()))
-}
-
-fn compare_values(left: &Value, right: &Value) -> Result<std::cmp::Ordering> {
-    use std::cmp::Ordering;
-    if let Some(ordering) = compare_numeric_text_values(left, right) {
-        return Ok(ordering);
-    }
-    match (left, right) {
-        (Value::Null, Value::Null) => Ok(Ordering::Equal),
-        (Value::Null, _) => Ok(Ordering::Less),
-        (_, Value::Null) => Ok(Ordering::Greater),
-        (Value::Int64(left), Value::Int64(right)) => Ok(left.cmp(right)),
-        (Value::Float64(left), Value::Float64(right)) => Ok(left.total_cmp(right)),
-        (Value::Int64(left), Value::Float64(right)) => Ok((*left as f64).total_cmp(right)),
-        (Value::Float64(left), Value::Int64(right)) => Ok(left.total_cmp(&(*right as f64))),
-        (
-            Value::Decimal {
-                scaled: left_scaled,
-                scale: left_scale,
-            },
-            Value::Decimal {
-                scaled: right_scaled,
-                scale: right_scale,
-            },
-        ) => Ok(compare_decimal(
-            *left_scaled,
-            *left_scale,
-            *right_scaled,
-            *right_scale,
-        )),
-        (
-            Value::Decimal {
-                scaled: left_scaled,
-                scale: left_scale,
-            },
-            Value::Float64(right),
-        ) => {
-            let left_f64 = decimal_to_f64(*left_scaled, *left_scale);
-            Ok(left_f64.total_cmp(right))
-        }
-        (
-            Value::Float64(left),
-            Value::Decimal {
-                scaled: right_scaled,
-                scale: right_scale,
-            },
-        ) => {
-            let right_f64 = decimal_to_f64(*right_scaled, *right_scale);
-            Ok(left.total_cmp(&right_f64))
-        }
-        (
-            Value::Decimal {
-                scaled: left_scaled,
-                scale: left_scale,
-            },
-            Value::Int64(right),
-        ) => {
-            let left_f64 = decimal_to_f64(*left_scaled, *left_scale);
-            Ok(left_f64.total_cmp(&(*right as f64)))
-        }
-        (
-            Value::Int64(left),
-            Value::Decimal {
-                scaled: right_scaled,
-                scale: right_scale,
-            },
-        ) => {
-            let right_f64 = decimal_to_f64(*right_scaled, *right_scale);
-            Ok((*left as f64).total_cmp(&right_f64))
-        }
-        (Value::Bool(left), Value::Bool(right)) => Ok(left.cmp(right)),
-        (Value::Text(left), Value::Text(right)) => Ok(left.cmp(right)),
-        (Value::Blob(left), Value::Blob(right)) => Ok(left.cmp(right)),
-        (Value::Uuid(left), Value::Uuid(right)) => Ok(left.cmp(right)),
-        (Value::TimestampMicros(left), Value::TimestampMicros(right)) => Ok(left.cmp(right)),
-        (Value::TimestampTzMicros(left), Value::TimestampTzMicros(right)) => Ok(left.cmp(right)),
-        (Value::DateDays(left), Value::DateDays(right)) => Ok(left.cmp(right)),
-        (Value::TimeMicros(left), Value::TimeMicros(right)) => Ok(left.cmp(right)),
-        (
-            Value::Enum {
-                enum_type_id: left_type,
-                label_id: left_label,
-            },
-            Value::Enum {
-                enum_type_id: right_type,
-                label_id: right_label,
-            },
-        ) => Ok(left_type.cmp(right_type).then_with(|| left_label.cmp(right_label))),
-        (
-            Value::IpAddr {
-                family: left_family,
-                addr: left_addr,
-            },
-            Value::IpAddr {
-                family: right_family,
-                addr: right_addr,
-            },
-        ) => compare_ip_addr(*left_family, left_addr, *right_family, right_addr),
-        (
-            Value::Cidr {
-                family: left_family,
-                prefix_len: left_prefix,
-                network: left_network,
-            },
-            Value::Cidr {
-                family: right_family,
-                prefix_len: right_prefix,
-                network: right_network,
-            },
-        ) => compare_cidr(
-            *left_family,
-            *left_prefix,
-            left_network,
-            *right_family,
-            *right_prefix,
-            right_network,
-        ),
-        (
-            Value::MacAddr {
-                len: left_len,
-                bytes: left_bytes,
-            },
-            Value::MacAddr {
-                len: right_len,
-                bytes: right_bytes,
-            },
-        ) => compare_mac_addr(*left_len, left_bytes, *right_len, right_bytes),
-        (
-            Value::Interval {
-                months: left_months,
-                days: left_days,
-                micros: left_micros,
-            },
-            Value::Interval {
-                months: right_months,
-                days: right_days,
-                micros: right_micros,
-            },
-        ) => Ok(compare_interval(
-            *left_months,
-            *left_days,
-            *left_micros,
-            *right_months,
-            *right_days,
-            *right_micros,
-        )),
-        (Value::Blob(left), Value::Uuid(right)) => Ok(left.as_slice().cmp(right.as_slice())),
-        (Value::Uuid(left), Value::Blob(right)) => Ok(left.as_slice().cmp(right.as_slice())),
-        (Value::Geometry(_), Value::Geometry(_)) | (Value::Geography(_), Value::Geography(_)) => {
-            Err(DbError::sql(
-                "spatial values do not have generic comparison semantics; use ST_Equals or spatial predicates",
-            ))
-        }
-        _ => Err(DbError::sql(format!(
-            "cannot compare values {left:?} and {right:?}"
-        ))),
-    }
-}
-
-fn window_order_keys_equal(left: &[Value], right: &[Value]) -> Result<bool> {
-    if left.len() != right.len() {
-        return Ok(false);
-    }
-    for (left_value, right_value) in left.iter().zip(right) {
-        if compare_values(left_value, right_value)? != std::cmp::Ordering::Equal {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
-fn compute_window_peer_bounds(order_keys: &[Vec<Value>]) -> Result<(Vec<usize>, Vec<usize>)> {
-    let mut starts = vec![0_usize; order_keys.len()];
-    let mut ends = vec![0_usize; order_keys.len()];
-    let mut ordinal = 0_usize;
-    while ordinal < order_keys.len() {
-        let mut peer_end = ordinal;
-        while peer_end + 1 < order_keys.len()
-            && window_order_keys_equal(&order_keys[ordinal], &order_keys[peer_end + 1])?
-        {
-            peer_end += 1;
-        }
-        for peer in ordinal..=peer_end {
-            starts[peer] = ordinal;
-            ends[peer] = peer_end;
-        }
-        ordinal = peer_end + 1;
-    }
-    Ok((starts, ends))
-}
-
-fn normalize_window_frame_range(
-    start: i64,
-    end: i64,
-    partition_len: usize,
-) -> Result<Option<(usize, usize)>> {
-    if partition_len == 0 {
-        return Ok(None);
-    }
-    let len_i64 = i64::try_from(partition_len)
-        .map_err(|_| DbError::internal("window partition is too large"))?;
-    let start = start.clamp(0, len_i64);
-    let end = end.clamp(-1, len_i64 - 1);
-    if start > end {
-        return Ok(None);
-    }
-    let start =
-        usize::try_from(start).map_err(|_| DbError::internal("window frame start is invalid"))?;
-    let end = usize::try_from(end).map_err(|_| DbError::internal("window frame end is invalid"))?;
-    Ok(Some((start, end)))
-}
-
-fn compare_numeric_text_values(left: &Value, right: &Value) -> Option<std::cmp::Ordering> {
-    use std::cmp::Ordering;
-
-    fn parsed_numeric_text(value: &str) -> Option<f64> {
-        let (scaled, scale) = parse_decimal_text(value).ok()?;
-        Some((scaled as f64) / 10_f64.powi(i32::from(scale)))
-    }
-
-    match (left, right) {
-        (Value::Int64(left), Value::Text(right)) => parsed_numeric_text(right)
-            .map(|right| (*left as f64).total_cmp(&right))
-            .or(Some(Ordering::Less)),
-        (Value::Float64(left), Value::Text(right)) => parsed_numeric_text(right)
-            .map(|right| left.total_cmp(&right))
-            .or(Some(Ordering::Less)),
-        (Value::Text(left), Value::Int64(right)) => parsed_numeric_text(left)
-            .map(|left| left.total_cmp(&(*right as f64)))
-            .or(Some(Ordering::Greater)),
-        (Value::Text(left), Value::Float64(right)) => parsed_numeric_text(left)
-            .map(|left| left.total_cmp(right))
-            .or(Some(Ordering::Greater)),
-        _ => None,
-    }
-}
-
-fn like_match(input: &str, pattern: &str, case_insensitive: bool, escape: Option<char>) -> bool {
-    if let Some(result) = like_match_simple_pattern(input, pattern, case_insensitive, escape) {
-        return result;
-    }
-    let input = if case_insensitive {
-        input.to_ascii_uppercase()
-    } else {
-        input.to_string()
-    };
-    let pattern = if case_insensitive {
-        pattern.to_ascii_uppercase()
-    } else {
-        pattern.to_string()
-    };
-    let input = input.chars().collect::<Vec<_>>();
-    let pattern = pattern.chars().collect::<Vec<_>>();
-    like_match_chars(&input, &pattern, escape)
-}
-
-fn like_match_simple_pattern(
-    input: &str,
-    pattern: &str,
-    case_insensitive: bool,
-    escape: Option<char>,
-) -> Option<bool> {
-    if escape.is_some() || pattern.as_bytes().contains(&b'_') {
-        return None;
-    }
-    if !pattern.is_empty() && pattern.as_bytes().iter().all(|byte| *byte == b'%') {
-        return Some(true);
-    }
-
-    let literal = pattern.trim_matches('%');
-    if literal.as_bytes().contains(&b'%') {
-        return None;
-    }
-
-    let starts_with_wildcard = pattern.starts_with('%');
-    let ends_with_wildcard = pattern.ends_with('%');
-    Some(match (starts_with_wildcard, ends_with_wildcard) {
-        (true, true) => like_contains_literal(input, literal, case_insensitive),
-        (true, false) => like_ends_with_literal(input, literal, case_insensitive),
-        (false, true) => like_starts_with_literal(input, literal, case_insensitive),
-        (false, false) => like_equals_literal(input, literal, case_insensitive),
-    })
-}
-
-fn like_equals_literal(input: &str, literal: &str, case_insensitive: bool) -> bool {
-    if case_insensitive {
-        input.eq_ignore_ascii_case(literal)
-    } else {
-        input == literal
-    }
-}
-
-fn like_starts_with_literal(input: &str, literal: &str, case_insensitive: bool) -> bool {
-    if case_insensitive {
-        input
-            .as_bytes()
-            .get(..literal.len())
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(literal.as_bytes()))
-    } else {
-        input.starts_with(literal)
-    }
-}
-
-fn like_ends_with_literal(input: &str, literal: &str, case_insensitive: bool) -> bool {
-    if case_insensitive {
-        input
-            .as_bytes()
-            .get(input.len().saturating_sub(literal.len())..)
-            .is_some_and(|suffix| suffix.eq_ignore_ascii_case(literal.as_bytes()))
-    } else {
-        input.ends_with(literal)
-    }
-}
-
-fn like_contains_literal(input: &str, literal: &str, case_insensitive: bool) -> bool {
-    if !case_insensitive {
-        return input.contains(literal);
-    }
-    if literal.is_empty() {
-        return true;
-    }
-    input
-        .as_bytes()
-        .windows(literal.len())
-        .any(|candidate| candidate.eq_ignore_ascii_case(literal.as_bytes()))
-}
-
-fn like_match_chars(input: &[char], pattern: &[char], escape: Option<char>) -> bool {
-    if pattern.is_empty() {
-        return input.is_empty();
-    }
-    let current = pattern[0];
-    if Some(current) == escape {
-        return match pattern.get(1) {
-            Some(literal) => {
-                !input.is_empty()
-                    && input[0] == *literal
-                    && like_match_chars(&input[1..], &pattern[2..], escape)
-            }
-            None => {
-                !input.is_empty()
-                    && input[0] == current
-                    && like_match_chars(&input[1..], &pattern[1..], escape)
-            }
-        };
-    }
-    match current {
-        '%' => (0..=input.len())
-            .any(|offset| like_match_chars(&input[offset..], &pattern[1..], escape)),
-        '_' => !input.is_empty() && like_match_chars(&input[1..], &pattern[1..], escape),
-        literal => {
-            !input.is_empty()
-                && input[0] == literal
-                && like_match_chars(&input[1..], &pattern[1..], escape)
-        }
-    }
-}
-
-fn row_identity(row: &[Value]) -> Result<Vec<u8>> {
-    Row::new(row.to_vec()).encode()
-}
-
-fn deduplicate_rows_stable(rows: Vec<Vec<Value>>) -> Result<Vec<Vec<Value>>> {
-    let mut seen = BTreeSet::new();
-    let mut distinct_rows = Vec::new();
-    for row in rows {
-        if seen.insert(row_identity(&row)?) {
-            distinct_rows.push(row);
-        }
-    }
-    Ok(distinct_rows)
-}
-
-fn count_row_identities(rows: &[Vec<Value>]) -> Result<HashMap<Vec<u8>, usize>> {
-    let mut counts = HashMap::new();
-    for row in rows {
-        *counts.entry(row_identity(row)?).or_insert(0) += 1;
-    }
-    Ok(counts)
-}
-
-fn consume_row_identity_count(counts: &mut HashMap<Vec<u8>, usize>, identity: &[u8]) -> bool {
-    if let Some(remaining) = counts.get_mut(identity) {
-        if *remaining > 0 {
-            *remaining -= 1;
-            return true;
-        }
-    }
-    false
-}
-
-fn deduplicate_rows(rows: Vec<Vec<Value>>) -> Result<Vec<Vec<Value>>> {
-    let mut seen = BTreeMap::<Vec<u8>, Vec<Value>>::new();
-    for row in rows {
-        seen.entry(row_identity(&row)?).or_insert(row);
-    }
-    Ok(seen.into_values().collect())
-}
+mod tests;
 
 pub(super) fn column_position(table: &TableSchema, column_name: &str) -> Option<usize> {
     table

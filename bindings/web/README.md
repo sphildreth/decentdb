@@ -141,6 +141,11 @@ The TypeScript API includes transactions, savepoints, prepared statement
 and production relay helpers. Browser branch/snapshot workflows and browser TDE
 open options are explicitly deferred and reported as disabled capability flags.
 
+Rows returned by `query()`, `Statement.step()`, `Statement.page()`, and async
+iteration are copied into JavaScript-owned objects before crossing the worker
+boundary. They can be retained after advancing, resetting, or closing the
+statement; no borrowed WASM row-view API is exposed in this browser profile.
+
 Relay subscriptions should apply locally before acking:
 
 ```ts

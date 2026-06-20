@@ -762,6 +762,126 @@ func TestOpenDirect_Checkpoint(t *testing.T) {
 	}
 }
 
+func TestOpenDirect_BranchCreateListDeleteAndExecuteOnBranch(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "decentdb-branch-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	dbPath := filepath.Join(tmpDir, "test.ddb")
+	db, err := OpenDirect(dbPath)
+	if err != nil {
+		t.Fatalf("OpenDirect failed: %v", err)
+	}
+	defer db.Close()
+
+	if _, err := db.Exec("CREATE TABLE items (id INT PRIMARY KEY, label TEXT)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("INSERT INTO items (id, label) VALUES (1, 'main')"); err != nil {
+		t.Fatal(err)
+	}
+
+	branch, err := db.CreateBranch("feature")
+	if err != nil {
+		t.Fatalf("CreateBranch failed: %v", err)
+	}
+	if branch.Name != "feature" {
+		t.Fatalf("CreateBranch returned %q, want feature", branch.Name)
+	}
+
+	branches, err := db.ListBranches()
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundMain := false
+	foundFeature := false
+	for _, item := range branches {
+		switch item.Name {
+		case "main":
+			foundMain = true
+		case "feature":
+			foundFeature = true
+		}
+	}
+	if !foundMain || !foundFeature {
+		t.Fatalf("ListBranches missing expected names: %+v", branches)
+	}
+
+	if _, err := db.ExecuteOnBranch("feature", "INSERT INTO items (id, label) VALUES ($1, $2)", 2, "branch"); err != nil {
+		t.Fatalf("ExecuteOnBranch failed: %v", err)
+	}
+
+	mainDB, err := sql.Open("decentdb", fmt.Sprintf("file:%s", dbPath))
+	if err != nil {
+		t.Fatalf("failed to open SQL handle: %v", err)
+	}
+	defer mainDB.Close()
+
+	var mainCount int
+	if err := mainDB.QueryRow("SELECT COUNT(*) FROM items").Scan(&mainCount); err != nil {
+		t.Fatal(err)
+	}
+	if mainCount != 1 {
+		t.Fatalf("main branch expected 1 row, got %d", mainCount)
+	}
+
+	branchCount, err := db.QueryOnBranchInt64("feature", "SELECT COUNT(*) FROM items")
+	if err != nil {
+		t.Fatalf("QueryOnBranchInt64 failed: %v", err)
+	}
+	if branchCount != 2 {
+		t.Fatalf("feature branch expected 2 rows, got %d", branchCount)
+	}
+
+	if _, err := db.QueryOnBranchInt64("feature", "SELECT 1.25"); err == nil || !strings.Contains(err.Error(), "non-integer") {
+		t.Fatalf("QueryOnBranchInt64 should reject non-integer scalar values, got %v", err)
+	}
+
+	_, branchErr := db.DeleteBranch("main")
+	if branchErr == nil {
+		t.Fatal("DeleteBranch(main) should fail")
+	}
+	var branchErrTyped *DecentDBError
+	if !errors.As(branchErr, &branchErrTyped) {
+		t.Fatalf("DeleteBranch(main) error type %T", branchErr)
+	}
+	if branchErrTyped.CodeName != "ERR_SQL" {
+		t.Fatalf("DeleteBranch(main) expected ERR_SQL, got %q", branchErrTyped.CodeName)
+	}
+
+	var unknownBranchErr error
+	if _, unknownBranchErr = db.QueryOnBranchInt64("not-a-branch", "SELECT 1"); unknownBranchErr == nil {
+		t.Fatal("QueryOnBranchInt64 on unknown branch should fail")
+	}
+	var unknownErr *DecentDBError
+	if !errors.As(unknownBranchErr, &unknownErr) {
+		t.Fatalf("expected DecentDBError for unknown branch execute, got %T %v", unknownBranchErr, unknownBranchErr)
+	}
+	if unknownErr.CodeName == "" {
+		t.Fatal("expected code name for unknown branch error")
+	}
+
+	deleted, err := db.DeleteBranch("feature")
+	if err != nil {
+		t.Fatalf("DeleteBranch failed: %v", err)
+	}
+	if !deleted {
+		t.Fatalf("expected branch delete to report true for feature")
+	}
+
+	branches, err = db.ListBranches()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range branches {
+		if item.Name == "feature" {
+			t.Fatal("feature branch still exists after delete")
+		}
+	}
+}
+
 func TestOpenDirect_ListTables(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "decentdb-test-*")
 	if err != nil {

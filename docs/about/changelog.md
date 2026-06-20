@@ -5,6 +5,55 @@ All notable changes to DecentDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [2.14.0] - [2026-06-20]
+
+### Added
+
+- Added Go direct binding branch helpers backed by existing C ABI functions:
+  `CreateBranch`, `ListBranches`, `DeleteBranch`, `ExecuteOnBranch`, and
+  `QueryOnBranchInt64`, with package tests and README examples.
+- Added a binding compatibility matrix covering Rust, C ABI, Python, Go, Java,
+  Node.js, Dart, .NET, and Web/WASM support status across core embedding
+  capabilities.
+- Added targeted WAL/VFS, extension trust, local security, TDE, error taxonomy,
+  record/value, B+Tree, SQL robustness, and spatial/EWKB tests from the
+  implementation review.
+- Documented browser/WASM row ownership and added browser smoke coverage proving
+  prepared-statement rows remain usable after advancing and closing the
+  statement.
+
+### Changed
+
+- Split large executor and database helper code into smaller internal Rust
+  modules without changing public API, SQL behavior, C ABI behavior, or on-disk
+  formats.
+- Moved large `db.rs` and `exec/mod.rs` in-file test modules into sibling test
+  modules for easier navigation.
+- Optimized aggregate read paths used by issue-tracker style reporting
+  workloads. Simple `GROUP BY <column>, COUNT(*)` queries can now answer from
+  fresh single-column B-tree index cardinalities, including deferred paged-table
+  snapshots without a resident row source, and status-report `LEFT JOIN`
+  aggregates can use the child join index instead of scanning the full child
+  table.
+
+### Fixed
+
+- Kept deferred read execution paths pinned to one WAL snapshot through final
+  statement execution. This prevents concurrent writer/checkpoint activity from
+  mixing runtime metadata with pages from a different snapshot, which could
+  surface as intermittent overflow payload length mismatch errors under
+  writer/reader stress.
+- Preserved hot same-handle paged-table runtime metadata across explicit WAL
+  checkpoint folds while still reloading after background or cross-connection
+  post-checkpoint WAL commits. Bulk-load-then-read workloads now keep deferred
+  row-count metadata and locator/index caches available after
+  `checkpoint_wal()`, restoring rust-baseline count, grouped-join, and
+  view-query performance.
+- Replaced selected production panic-like executor paths with typed SQL/internal
+  errors or explicit invariants, with regression tests for those error paths.
+
 ## [2.13.1] - [2026-06-15]
 
 ### Fixed
