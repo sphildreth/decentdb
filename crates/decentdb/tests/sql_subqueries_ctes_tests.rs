@@ -682,6 +682,54 @@ fn cte_with_join() {
 }
 
 #[test]
+fn cte_inner_join_materialized_result_uses_equi_path() {
+    let db = mem_db();
+    db.execute("CREATE TABLE roles(person_id INT64, movie_id INT64, job TEXT)")
+        .unwrap();
+    db.execute(
+        "INSERT INTO roles VALUES
+            (1, 10, 'Director'),
+            (1, 11, 'Director'),
+            (2, 12, 'Director'),
+            (2, 13, 'Director'),
+            (2, 14, 'Director'),
+            (3, 15, 'Actor')",
+    )
+    .unwrap();
+
+    let r = db
+        .execute(
+            "
+            WITH directed AS (
+                SELECT person_id, movie_id FROM roles WHERE job = 'Director'
+            ),
+            top_dirs AS (
+                SELECT person_id, COUNT(*) AS films
+                FROM directed
+                GROUP BY person_id
+                HAVING COUNT(*) >= 2
+            )
+            SELECT d.person_id, d.films, dir.movie_id
+            FROM top_dirs AS d
+            JOIN directed AS dir
+                ON dir.person_id = d.person_id
+            ORDER BY d.person_id, dir.movie_id
+        ",
+        )
+        .unwrap();
+    assert_eq!(
+        rows(&r),
+        vec![
+            vec![Value::Int64(1), Value::Int64(2), Value::Int64(10)],
+            vec![Value::Int64(1), Value::Int64(2), Value::Int64(11)],
+            vec![Value::Int64(2), Value::Int64(3), Value::Int64(12)],
+            vec![Value::Int64(2), Value::Int64(3), Value::Int64(13)],
+            vec![Value::Int64(2), Value::Int64(3), Value::Int64(14)],
+        ]
+    );
+}
+
+#[test]
 fn aliased_cte_self_join_returns_expected_rows() {
     let db = mem_db();
     exec(

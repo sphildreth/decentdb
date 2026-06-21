@@ -217,6 +217,7 @@ pub struct PreparedStatement {
     prepared_sql: String,
     simple_row_id_projection: Option<PreparedSimpleRowIdProjection>,
     simple_row_id_range_projection: Option<PreparedSimpleRowIdRangeProjection>,
+    simple_ordered_row_id_projection: Option<PreparedSimpleOrderedRowIdProjection>,
     simple_row_id_join_projection: Option<PreparedSimpleRowIdJoinProjection>,
     simple_scalar_filtered_aggregate: Option<PreparedSimpleScalarFilteredAggregate>,
     prepared_insert: Option<Arc<PreparedSimpleInsert>>,
@@ -230,6 +231,7 @@ struct PreparedPlanBundle {
     statement: Arc<SqlStatement>,
     simple_row_id_projection: Option<PreparedSimpleRowIdProjection>,
     simple_row_id_range_projection: Option<PreparedSimpleRowIdRangeProjection>,
+    simple_ordered_row_id_projection: Option<PreparedSimpleOrderedRowIdProjection>,
     simple_row_id_join_projection: Option<PreparedSimpleRowIdJoinProjection>,
     simple_scalar_filtered_aggregate: Option<PreparedSimpleScalarFilteredAggregate>,
     prepared_insert: Option<Arc<PreparedSimpleInsert>>,
@@ -457,6 +459,17 @@ struct PreparedSimpleRowIdRangeProjection {
     lower_bound: Option<PreparedSimpleRangeBoundParam>,
     upper_bound: Option<PreparedSimpleRangeBoundParam>,
     limit_param_index: usize,
+}
+
+#[derive(Clone, Debug)]
+struct PreparedSimpleOrderedRowIdProjection {
+    table_name: String,
+    order_column: String,
+    projection_indexes: Vec<usize>,
+    column_names: Arc<[String]>,
+    limit: Option<usize>,
+    offset: usize,
+    descending: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -4048,6 +4061,20 @@ impl Db {
                 return self.execute_autocommit_temp_only_statement(statement, params);
             }
         }
+        let extension_execution_enabled = self.inner.config.extension_unsigned_development_mode
+            || !self.inner.config.extension_trust_anchors.is_empty();
+        if self.inner.config.process_coordination == ProcessCoordinationMode::SingleProcessUnsafe
+            && !extension_execution_enabled
+        {
+            if let Some(runtime) =
+                self.try_resident_read_for_single_process_statement(statement, prepared)?
+            {
+                let result =
+                    runtime.execute_read_statement(statement, params, self.inner.config.page_size);
+                drop(runtime);
+                return self.finalize_row_source_autocommit_statement(statement, result);
+            }
+        }
         if !self.inner.config.defer_table_materialization {
             self.refresh_engine_from_storage()?;
             self.ensure_all_tables_loaded()?;
@@ -4073,8 +4100,6 @@ impl Db {
         // unresolved. Row-level security also requires the deferred path when
         // security catalog tables are deferred or active; otherwise policies
         // and masks could be treated as absent by the generic executor.
-        let extension_execution_enabled = self.inner.config.extension_unsigned_development_mode
-            || !self.inner.config.extension_trust_anchors.is_empty();
         #[cfg(feature = "bench-internals")]
         READ_PATH_WAL_READER_BEGIN_COUNT.fetch_add(1, Ordering::Relaxed);
         let mut reader = self.inner.wal.begin_reader_with_pager(&self.inner.pager)?;
@@ -5253,6 +5278,46 @@ impl Db {
         }
     }
 
+    fn try_execute_prepared_simple_ordered_row_id_projection(
+        &self,
+        prepared: &PreparedStatement,
+    ) -> Result<Option<QueryResult>> {
+        if self.inner.sql_txn_active.load(Ordering::Acquire)
+            || self.inner.config.process_coordination
+                != ProcessCoordinationMode::SingleProcessUnsafe
+            || self.inner.config.extension_unsigned_development_mode
+            || !self.inner.config.extension_trust_anchors.is_empty()
+        {
+            return Ok(None);
+        }
+        let Some(plan) = prepared.simple_ordered_row_id_projection.as_ref() else {
+            return Ok(None);
+        };
+        let Some(runtime) = self.try_resident_read_for_single_process_statement(
+            prepared.statement.as_ref(),
+            Some(prepared),
+        )?
+        else {
+            return Ok(None);
+        };
+        let result = runtime.execute_resolved_simple_ordered_row_id_projection(
+            plan.table_name.as_str(),
+            plan.order_column.as_str(),
+            &plan.projection_indexes,
+            Arc::clone(&plan.column_names),
+            plan.limit,
+            plan.offset,
+            plan.descending,
+        )?;
+        drop(runtime);
+        if let Some(result) = result {
+            return self
+                .finalize_row_source_autocommit_statement(prepared.statement.as_ref(), Ok(result))
+                .map(Some);
+        }
+        Ok(None)
+    }
+
     fn try_execute_prepared_simple_row_id_projection(
         &self,
         prepared: &PreparedStatement,
@@ -5267,6 +5332,38 @@ impl Db {
         let Some(Value::Int64(lookup_row_id)) = params.get(plan.param_index) else {
             return Ok(None);
         };
+
+        if self.inner.config.process_coordination == ProcessCoordinationMode::SingleProcessUnsafe
+            && !self.inner.config.extension_unsigned_development_mode
+            && self.inner.config.extension_trust_anchors.is_empty()
+        {
+            if let Some(runtime) = self.try_resident_read_for_single_process_statement(
+                prepared.statement.as_ref(),
+                Some(prepared),
+            )? {
+                let result = runtime.execute_resolved_simple_row_id_projection_at_snapshot(
+                    ResolvedSimpleRowIdProjectionRequest {
+                        table_name: plan.table_name.as_str(),
+                        projection_indexes: &plan.projection_indexes,
+                        column_names: Arc::clone(&plan.column_names),
+                        lookup_row_id: *lookup_row_id,
+                        pager: &self.inner.pager,
+                        wal: &self.inner.wal,
+                        snapshot_lsn: 0,
+                        use_persistent_pk_index: self.inner.config.persistent_pk_index,
+                    },
+                )?;
+                drop(runtime);
+                if let Some(result) = result {
+                    return self
+                        .finalize_row_source_autocommit_statement(
+                            prepared.statement.as_ref(),
+                            Ok(result),
+                        )
+                        .map(Some);
+                }
+            }
+        }
 
         let reader = self.inner.wal.begin_reader_with_pager(&self.inner.pager)?;
         let snapshot_lsn = reader.snapshot_lsn();
@@ -5601,6 +5698,13 @@ impl Db {
         prepared: &PreparedStatement,
         params: &[Value],
     ) -> Result<QueryResult> {
+        if params.is_empty() {
+            if let Some(result) =
+                self.try_execute_prepared_simple_ordered_row_id_projection(prepared)?
+            {
+                return Ok(result);
+            }
+        }
         if let Some(result) =
             self.try_execute_prepared_simple_row_id_projection(prepared, params)?
         {
@@ -7160,6 +7264,7 @@ impl Db {
             prepared_sql: prepared_sql.to_string(),
             simple_row_id_projection: bundle.simple_row_id_projection,
             simple_row_id_range_projection: bundle.simple_row_id_range_projection,
+            simple_ordered_row_id_projection: bundle.simple_ordered_row_id_projection,
             simple_row_id_join_projection: bundle.simple_row_id_join_projection,
             simple_scalar_filtered_aggregate: bundle.simple_scalar_filtered_aggregate,
             prepared_insert: bundle.prepared_insert,
@@ -7203,6 +7308,7 @@ impl Db {
                 prepared_sql,
                 simple_row_id_projection: bundle.simple_row_id_projection,
                 simple_row_id_range_projection: bundle.simple_row_id_range_projection,
+                simple_ordered_row_id_projection: bundle.simple_ordered_row_id_projection,
                 simple_row_id_join_projection: bundle.simple_row_id_join_projection,
                 simple_scalar_filtered_aggregate: bundle.simple_scalar_filtered_aggregate,
                 prepared_insert: bundle.prepared_insert,
@@ -7235,6 +7341,8 @@ impl Db {
             Self::prepared_simple_row_id_projection(&prepared_sql, runtime);
         let simple_row_id_range_projection =
             Self::prepared_simple_row_id_range_projection(&prepared_sql, runtime);
+        let simple_ordered_row_id_projection =
+            Self::prepared_simple_ordered_row_id_projection(statement.as_ref(), runtime);
         let simple_row_id_join_projection =
             Self::prepared_simple_row_id_join_projection(statement.as_ref(), runtime);
         let simple_scalar_filtered_aggregate =
@@ -7243,6 +7351,7 @@ impl Db {
             statement: Arc::clone(&statement),
             simple_row_id_projection,
             simple_row_id_range_projection,
+            simple_ordered_row_id_projection,
             simple_row_id_join_projection,
             simple_scalar_filtered_aggregate,
             prepared_insert,
@@ -7267,6 +7376,7 @@ impl Db {
             prepared_sql: prepared_sql.clone(),
             simple_row_id_projection: bundle.simple_row_id_projection,
             simple_row_id_range_projection: bundle.simple_row_id_range_projection,
+            simple_ordered_row_id_projection: bundle.simple_ordered_row_id_projection,
             simple_row_id_join_projection: bundle.simple_row_id_join_projection,
             simple_scalar_filtered_aggregate: bundle.simple_scalar_filtered_aggregate,
             prepared_insert: bundle.prepared_insert,
@@ -7363,6 +7473,115 @@ impl Db {
             lower_bound: plan.lower_bound,
             upper_bound: plan.upper_bound,
             limit_param_index: plan.limit_param_index,
+        })
+    }
+
+    fn prepared_simple_ordered_row_id_projection(
+        statement: &SqlStatement,
+        runtime: &EngineRuntime,
+    ) -> Option<PreparedSimpleOrderedRowIdProjection> {
+        let SqlStatement::Query(query) = statement else {
+            return None;
+        };
+        if !query.ctes.is_empty() || query.order_by.len() != 1 {
+            return None;
+        }
+        let crate::sql::ast::QueryBody::Select(select) = &query.body else {
+            return None;
+        };
+        if select.filter.is_some()
+            || !select.group_by.is_empty()
+            || select.having.is_some()
+            || select.distinct
+            || !select.distinct_on.is_empty()
+            || select.from.len() != 1
+        {
+            return None;
+        }
+        let crate::sql::ast::FromItem::Table { name, alias } = &select.from[0] else {
+            return None;
+        };
+        if runtime.temp_table_schema(name).is_some()
+            || runtime
+                .catalog
+                .views
+                .keys()
+                .any(|view_name| identifiers_equal(view_name, name))
+        {
+            return None;
+        }
+        let table = runtime.catalog.table(name)?;
+        if !prepared_table_generated_columns_are_stored(table) {
+            return None;
+        }
+        let mut projection_indexes = Vec::with_capacity(select.projection.len());
+        let mut column_names = Vec::with_capacity(select.projection.len());
+        for item in &select.projection {
+            let crate::sql::ast::SelectItem::Expr {
+                expr,
+                alias: select_alias,
+            } = item
+            else {
+                return None;
+            };
+            let crate::sql::ast::Expr::Column {
+                table: projection_table,
+                column,
+            } = expr
+            else {
+                return None;
+            };
+            if !prepared_scalar_column_matches_table(projection_table.as_deref(), name, alias) {
+                return None;
+            }
+            let index = table
+                .columns
+                .iter()
+                .position(|candidate| identifiers_equal(&candidate.name, column))?;
+            projection_indexes.push(index);
+            column_names.push(select_alias.clone().unwrap_or_else(|| column.clone()));
+        }
+
+        let order = &query.order_by[0];
+        if order.collation.is_some() {
+            return None;
+        }
+        let crate::sql::ast::Expr::Column {
+            table: order_table,
+            column: order_column,
+        } = &order.expr
+        else {
+            return None;
+        };
+        if !prepared_scalar_column_matches_table(order_table.as_deref(), name, alias) {
+            return None;
+        }
+        let order_column_index = table
+            .columns
+            .iter()
+            .position(|candidate| identifiers_equal(&candidate.name, order_column))?;
+        if !row_id_alias_column_name(table)
+            .is_some_and(|column_name| identifiers_equal(column_name, order_column))
+            || table.columns[order_column_index].column_type != ColumnType::Int64
+        {
+            return None;
+        }
+        let limit = match query.limit.as_ref() {
+            Some(expr) => Some(prepared_usize_literal(expr)?),
+            None => None,
+        };
+        let offset = match query.offset.as_ref() {
+            Some(expr) => prepared_usize_literal(expr)?,
+            None => 0,
+        };
+        Some(PreparedSimpleOrderedRowIdProjection {
+            table_name: table.name.clone(),
+            order_column: table.columns[order_column_index].name.clone(),
+            projection_indexes,
+            column_names: Arc::from(column_names),
+            limit,
+            offset,
+            descending: order.descending,
         })
     }
 
@@ -7638,6 +7857,16 @@ impl Db {
                 .saturating_add(160)
                 .saturating_add(string_bytes(&plan.table_name))
                 .saturating_add(string_bytes(&plan.filter_column))
+                .saturating_add(
+                    (plan.projection_indexes.len() * std::mem::size_of::<usize>()) as u64,
+                )
+                .saturating_add(string_slice_bytes(&plan.column_names));
+        }
+        if let Some(plan) = &bundle.simple_ordered_row_id_projection {
+            total = total
+                .saturating_add(160)
+                .saturating_add(string_bytes(&plan.table_name))
+                .saturating_add(string_bytes(&plan.order_column))
                 .saturating_add(
                     (plan.projection_indexes.len() * std::mem::size_of::<usize>()) as u64,
                 )
@@ -8710,6 +8939,44 @@ impl Db {
         {
             return Ok(None);
         }
+        self.validate_prepared_against_runtime(prepared, &runtime)?;
+        if Self::runtime_has_deferred_security_tables(&runtime)
+            || runtime.security_rules_active()?
+        {
+            return Ok(None);
+        }
+        let Some(base_tables) = self.safe_referenced_base_tables_in_runtime(&runtime, statement)
+        else {
+            return Ok(None);
+        };
+        if base_tables.is_empty() {
+            return Ok(Some(runtime));
+        }
+        let all_resident = base_tables.iter().all(|name| {
+            runtime
+                .canonical_catalog_table_name(name)
+                .is_some_and(|table_name| runtime.table_row_source(&table_name).is_some())
+        });
+        if all_resident {
+            Ok(Some(runtime))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn try_resident_read_for_single_process_statement(
+        &self,
+        statement: &SqlStatement,
+        prepared: Option<&PreparedStatement>,
+    ) -> Result<Option<RwLockReadGuard<'_, EngineRuntime>>> {
+        if !self.inner.config.defer_table_materialization {
+            return Ok(None);
+        }
+        let runtime = self
+            .inner
+            .engine
+            .read()
+            .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
         self.validate_prepared_against_runtime(prepared, &runtime)?;
         if Self::runtime_has_deferred_security_tables(&runtime)
             || runtime.security_rules_active()?
@@ -15063,6 +15330,13 @@ fn resolve_prepared_simple_value_for_fast_path(
             .cloned()
             .ok_or_else(|| DbError::sql(format!("parameter ${number} was not provided"))),
     }
+}
+
+fn prepared_usize_literal(expr: &crate::sql::ast::Expr) -> Option<usize> {
+    let crate::sql::ast::Expr::Literal(Value::Int64(value)) = expr else {
+        return None;
+    };
+    usize::try_from((*value).max(0)).ok()
 }
 
 /// Evicts the shared WAL registry entry for an on-disk database path.

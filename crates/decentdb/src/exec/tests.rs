@@ -4955,6 +4955,104 @@ fn indexed_join_limit_projection_stops_after_limit() {
 }
 
 #[test]
+fn indexed_join_projection_orders_three_table_chain_without_limit() {
+    let mut runtime = EngineRuntime::empty(1);
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE artists (id INT64 PRIMARY KEY, name TEXT NOT NULL)",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE albums (id INT64 PRIMARY KEY, artist_id INT64 NOT NULL, title TEXT)",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE songs (id INT64 PRIMARY KEY, album_id INT64 NOT NULL, title TEXT)",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE INDEX idx_albums_artist ON albums (artist_id)",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE INDEX idx_songs_album ON songs (album_id)",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO artists (id, name) VALUES (1, 'a')",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO artists (id, name) VALUES (2, 'b')",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO albums (id, artist_id, title) VALUES (10, 1, 'a1')",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO albums (id, artist_id, title) VALUES (20, 2, 'b1')",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO songs (id, album_id, title) VALUES (100, 10, 's1')",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO songs (id, album_id, title) VALUES (101, 10, 's2')",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO songs (id, album_id, title) VALUES (200, 20, 's3')",
+    );
+
+    let statement = parse_sql_statement(
+        "SELECT a.id AS artist_id, a.name AS artist_name, al.title AS album_title, \
+                    s.title AS song_title \
+             FROM artists a JOIN albums al ON al.artist_id = a.id \
+             JOIN songs s ON s.album_id = al.id \
+             ORDER BY a.id, s.title DESC",
+    )
+    .expect("parse");
+    let crate::sql::ast::Statement::Query(query) = &statement else {
+        panic!("expected query");
+    };
+    let result = runtime
+        .try_execute_three_table_indexed_join_projection_query(query, &[])
+        .expect("execute")
+        .expect("indexed join ordered projection path should match this query");
+
+    let actual = result
+        .rows()
+        .iter()
+        .map(|row| row.values().to_vec())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual,
+        vec![
+            vec![
+                Value::Int64(1),
+                Value::Text("a".to_string()),
+                Value::Text("a1".to_string()),
+                Value::Text("s2".to_string()),
+            ],
+            vec![
+                Value::Int64(1),
+                Value::Text("a".to_string()),
+                Value::Text("a1".to_string()),
+                Value::Text("s1".to_string()),
+            ],
+            vec![
+                Value::Int64(2),
+                Value::Text("b".to_string()),
+                Value::Text("b1".to_string()),
+                Value::Text("s3".to_string()),
+            ],
+        ]
+    );
+}
+
+#[test]
 fn view_projection_limit_pushes_into_indexed_join_chain() {
     let mut runtime = EngineRuntime::empty(1);
     execute_sql(

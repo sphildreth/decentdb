@@ -1938,6 +1938,38 @@ def setup_showdown_search_indexes(conn, engine_name):
     )
     cur.execute("INSERT INTO movies_fts(movies_fts) VALUES('rebuild')")
     cur.execute("INSERT INTO reviews_fts(reviews_fts) VALUES('rebuild')")
+    cur.executescript(
+        """
+        CREATE TRIGGER movies_fts_ai AFTER INSERT ON movies BEGIN
+            INSERT INTO movies_fts(rowid, title, overview)
+            VALUES (new.id, new.title, new.overview);
+        END;
+        CREATE TRIGGER movies_fts_ad AFTER DELETE ON movies BEGIN
+            INSERT INTO movies_fts(movies_fts, rowid, title, overview)
+            VALUES('delete', old.id, old.title, old.overview);
+        END;
+        CREATE TRIGGER movies_fts_au AFTER UPDATE OF title, overview ON movies BEGIN
+            INSERT INTO movies_fts(movies_fts, rowid, title, overview)
+            VALUES('delete', old.id, old.title, old.overview);
+            INSERT INTO movies_fts(rowid, title, overview)
+            VALUES (new.id, new.title, new.overview);
+        END;
+        CREATE TRIGGER reviews_fts_ai AFTER INSERT ON reviews BEGIN
+            INSERT INTO reviews_fts(rowid, body)
+            VALUES (new.id, new.body);
+        END;
+        CREATE TRIGGER reviews_fts_ad AFTER DELETE ON reviews BEGIN
+            INSERT INTO reviews_fts(reviews_fts, rowid, body)
+            VALUES('delete', old.id, old.body);
+        END;
+        CREATE TRIGGER reviews_fts_au AFTER UPDATE OF body ON reviews BEGIN
+            INSERT INTO reviews_fts(reviews_fts, rowid, body)
+            VALUES('delete', old.id, old.body);
+            INSERT INTO reviews_fts(rowid, body)
+            VALUES (new.id, new.body);
+        END;
+        """
+    )
     conn.commit()
 
 

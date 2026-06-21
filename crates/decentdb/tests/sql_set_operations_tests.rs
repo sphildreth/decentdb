@@ -890,6 +890,71 @@ fn limit_all_keeps_unbounded_results_and_still_allows_offset() {
 }
 
 #[test]
+fn ordered_projection_by_primary_key_with_limit_and_offset() {
+    let db = mem_db();
+    db.execute("CREATE TABLE t (id INT64 PRIMARY KEY, payload TEXT)")
+        .unwrap();
+    for i in [
+        10, 3, 1, 20, 8, 2, 15, 7, 11, 5, 13, 9, 4, 12, 6, 18, 16, 14, 17, 19,
+    ] {
+        db.execute(&format!("INSERT INTO t VALUES ({i}, 'row-{i}')"))
+            .unwrap();
+    }
+
+    let forward = exec(
+        &db,
+        "SELECT id, payload FROM t ORDER BY id LIMIT 4 OFFSET 7",
+    );
+    assert_eq!(forward.columns(), &["id", "payload"]);
+    assert_eq!(
+        forward
+            .rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>(),
+        vec![
+            vec![Value::Int64(8), Value::Text("row-8".to_string())],
+            vec![Value::Int64(9), Value::Text("row-9".to_string())],
+            vec![Value::Int64(10), Value::Text("row-10".to_string())],
+            vec![Value::Int64(11), Value::Text("row-11".to_string())],
+        ]
+    );
+}
+
+#[test]
+fn ordered_projection_by_primary_key_offset_out_of_range_and_negative_limit() {
+    let db = mem_db();
+    db.execute("CREATE TABLE t (id INT64 PRIMARY KEY)").unwrap();
+    db.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
+
+    let beyond = exec(&db, "SELECT id FROM t ORDER BY id LIMIT 10 OFFSET 5");
+    assert!(beyond.rows().is_empty());
+
+    let negative = db
+        .execute("SELECT id FROM t ORDER BY id LIMIT -3 OFFSET 0")
+        .unwrap();
+    assert!(negative.rows().is_empty());
+}
+
+#[test]
+fn ordered_projection_by_primary_key_descending_limit_and_offset() {
+    let db = mem_db();
+    db.execute("CREATE TABLE t (id INT64 PRIMARY KEY)").unwrap();
+    db.execute("INSERT INTO t VALUES (1), (2), (3), (4), (5)")
+        .unwrap();
+
+    let reverse = exec(&db, "SELECT id FROM t ORDER BY id DESC LIMIT 2 OFFSET 1");
+    assert_eq!(
+        reverse
+            .rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>(),
+        vec![vec![Value::Int64(4)], vec![Value::Int64(3)],]
+    );
+}
+
+#[test]
 fn offset_fetch_uses_existing_limit_offset_pipeline() {
     let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
     db.execute("CREATE TABLE t (id INT64 PRIMARY KEY)").unwrap();

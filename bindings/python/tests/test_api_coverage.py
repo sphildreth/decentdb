@@ -100,6 +100,75 @@ class TestCursorExecutemany:
         
         conn.close()
 
+    def test_executemany_generic_typed_batch_for_wide_rows(self, tmp_path):
+        """Unlisted int/text/float row shapes use the generic typed batch path."""
+        db_path = str(tmp_path / "executemany_generic_typed.ddb")
+
+        conn = decentdb.connect(db_path)
+        cur = conn.cursor()
+        native_batch = cur._native_execute_batch_typed_collected
+        if native_batch is None:
+            conn.close()
+            pytest.skip("fastdecode typed batch extension is not built")
+
+        seen_signatures = []
+
+        def wrapped_native_batch(stmt_addr, first_row, rows_iterable, signature):
+            seen_signatures.append(signature)
+            return native_batch(stmt_addr, first_row, rows_iterable, signature)
+
+        cur._native_execute_batch_typed_collected = wrapped_native_batch
+        cur.execute(
+            """
+            CREATE TABLE movies (
+                id INTEGER,
+                title TEXT,
+                overview TEXT,
+                released TEXT,
+                budget_cents INTEGER,
+                revenue_cents INTEGER,
+                runtime_minutes INTEGER,
+                status TEXT,
+                mpa_rating TEXT,
+                rating REAL,
+                vote_count INTEGER,
+                collection TEXT
+            )
+            """
+        )
+
+        rows = [
+            (
+                i,
+                f"title {i}",
+                "overview",
+                "2024-01-01",
+                1000 + i,
+                2000 + i,
+                90 + i,
+                "Released",
+                "PG",
+                7.5,
+                100 + i,
+                "Series",
+            )
+            for i in range(1, 4)
+        ]
+        cur.executemany(
+            """
+            INSERT INTO movies VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+        conn.commit()
+
+        assert seen_signatures == ["itttiiittfit"]
+        assert cur.rowcount == len(rows)
+        cur.execute("SELECT COUNT(*) FROM movies")
+        assert cur.fetchone() == (len(rows),)
+
+        conn.close()
+
 
 class TestCursorFetchmany:
     """Tests for cursor.fetchmany()."""

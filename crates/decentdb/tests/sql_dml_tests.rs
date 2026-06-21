@@ -133,6 +133,210 @@ fn delete_with_index() {
 }
 
 #[test]
+fn delete_many_rows_with_referencing_child_tables_present_and_no_matches() {
+    let db = mem_db();
+    db.execute("CREATE TABLE movies(id INT64 PRIMARY KEY)")
+        .unwrap();
+    db.execute(
+        "CREATE TABLE reviews(
+            id INT64 PRIMARY KEY,
+            movie_id INT64 REFERENCES movies(id) ON DELETE CASCADE
+        )",
+    )
+    .unwrap();
+    db.execute("CREATE INDEX idx_reviews_movie_id ON reviews(movie_id)")
+        .unwrap();
+
+    db.execute("INSERT INTO movies VALUES (1),(2),(3),(4),(5)")
+        .unwrap();
+    db.execute("INSERT INTO reviews VALUES (10, 1), (11, 5)")
+        .unwrap();
+
+    db.execute("DELETE FROM movies WHERE id BETWEEN 2 AND 4")
+        .unwrap();
+
+    let remaining_movies = db.execute("SELECT id FROM movies ORDER BY id").unwrap();
+    assert_eq!(
+        rows(&remaining_movies),
+        vec![vec![Value::Int64(1)], vec![Value::Int64(5)]]
+    );
+    let remaining_reviews = db.execute("SELECT COUNT(*) FROM reviews").unwrap();
+    assert_eq!(rows(&remaining_reviews)[0][0], Value::Int64(2));
+}
+
+#[test]
+fn delete_rowid_range_with_indexed_references_and_no_matches() {
+    let db = Db::open_or_create(
+        ":memory:",
+        DbConfig {
+            paged_row_storage: true,
+            ..DbConfig::default()
+        },
+    )
+    .unwrap();
+    db.execute("CREATE TABLE movies(id INTEGER PRIMARY KEY, status TEXT NOT NULL)")
+        .unwrap();
+    db.execute(
+        "CREATE TABLE roles(
+            id INTEGER PRIMARY KEY,
+            movie_id INT NOT NULL REFERENCES movies(id)
+        )",
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE reviews(
+            id INTEGER PRIMARY KEY,
+            movie_id INT NOT NULL REFERENCES movies(id)
+        )",
+    )
+    .unwrap();
+    db.execute("CREATE INDEX idx_roles_movie ON roles(movie_id)")
+        .unwrap();
+    db.execute("CREATE INDEX idx_reviews_movie ON reviews(movie_id)")
+        .unwrap();
+
+    let movie_values = (1..=1_600)
+        .map(|id| format!("({id}, 'Released')"))
+        .collect::<Vec<_>>()
+        .join(",");
+    db.execute(&format!("INSERT INTO movies VALUES {movie_values}"))
+        .unwrap();
+    db.execute("INSERT INTO roles VALUES (1, 1), (2, 2)")
+        .unwrap();
+    db.execute("INSERT INTO reviews VALUES (1, 3), (2, 4)")
+        .unwrap();
+
+    let result = db
+        .execute("DELETE FROM movies WHERE id BETWEEN 1101 AND 1600")
+        .unwrap();
+    assert_eq!(result.affected_rows(), 500);
+
+    let remaining_movies = db.execute("SELECT COUNT(*) FROM movies").unwrap();
+    assert_eq!(rows(&remaining_movies)[0][0], Value::Int64(1_100));
+    let remaining_refs = db
+        .execute(
+            "SELECT
+                (SELECT COUNT(*) FROM roles),
+                (SELECT COUNT(*) FROM reviews)",
+        )
+        .unwrap();
+    assert_eq!(
+        rows(&remaining_refs),
+        vec![vec![Value::Int64(2), Value::Int64(2)]]
+    );
+}
+
+#[test]
+fn delete_many_rows_with_indexed_cascade_children() {
+    let db = mem_db();
+    db.execute("CREATE TABLE movies(id INT64 PRIMARY KEY)")
+        .unwrap();
+    db.execute(
+        "CREATE TABLE reviews(
+            id INT64 PRIMARY KEY,
+            movie_id INT64 REFERENCES movies(id) ON DELETE CASCADE
+        )",
+    )
+    .unwrap();
+    db.execute("CREATE INDEX idx_reviews_movie_id ON reviews(movie_id)")
+        .unwrap();
+
+    db.execute("INSERT INTO movies VALUES (1),(2),(3),(4),(5)")
+        .unwrap();
+    db.execute(
+        "INSERT INTO reviews VALUES
+            (10, 1), (11, 2), (12, 2), (13, 3), (14, 4), (15, 5)",
+    )
+    .unwrap();
+
+    db.execute("DELETE FROM movies WHERE id BETWEEN 2 AND 4")
+        .unwrap();
+
+    let remaining_movies = db.execute("SELECT id FROM movies ORDER BY id").unwrap();
+    assert_eq!(
+        rows(&remaining_movies),
+        vec![vec![Value::Int64(1)], vec![Value::Int64(5)]]
+    );
+    let remaining_reviews = db.execute("SELECT id FROM reviews ORDER BY id").unwrap();
+    assert_eq!(
+        rows(&remaining_reviews),
+        vec![vec![Value::Int64(10)], vec![Value::Int64(15)]]
+    );
+}
+
+#[test]
+fn delete_many_rows_with_composite_pk_child_no_matches_without_fk_index() {
+    let db = mem_db();
+    db.execute("CREATE TABLE movies(id INT64 PRIMARY KEY)")
+        .unwrap();
+    db.execute(
+        "CREATE TABLE movie_genres(
+            movie_id INT64,
+            genre_id INT64,
+            PRIMARY KEY(movie_id, genre_id),
+            FOREIGN KEY(movie_id) REFERENCES movies(id) ON DELETE CASCADE
+        )",
+    )
+    .unwrap();
+
+    db.execute("INSERT INTO movies VALUES (1),(2),(3),(4),(5)")
+        .unwrap();
+    db.execute("INSERT INTO movie_genres VALUES (1, 10), (5, 20)")
+        .unwrap();
+
+    db.execute("DELETE FROM movies WHERE id BETWEEN 2 AND 4")
+        .unwrap();
+
+    let remaining_movies = db.execute("SELECT id FROM movies ORDER BY id").unwrap();
+    assert_eq!(
+        rows(&remaining_movies),
+        vec![vec![Value::Int64(1)], vec![Value::Int64(5)]]
+    );
+    let remaining_links = db.execute("SELECT COUNT(*) FROM movie_genres").unwrap();
+    assert_eq!(rows(&remaining_links)[0][0], Value::Int64(2));
+}
+
+#[test]
+fn delete_many_rows_with_composite_pk_child_cascade_matches_without_fk_index() {
+    let db = mem_db();
+    db.execute("CREATE TABLE movies(id INT64 PRIMARY KEY)")
+        .unwrap();
+    db.execute(
+        "CREATE TABLE movie_genres(
+            movie_id INT64,
+            genre_id INT64,
+            PRIMARY KEY(movie_id, genre_id),
+            FOREIGN KEY(movie_id) REFERENCES movies(id) ON DELETE CASCADE
+        )",
+    )
+    .unwrap();
+
+    db.execute("INSERT INTO movies VALUES (1),(2),(3),(4),(5)")
+        .unwrap();
+    db.execute("INSERT INTO movie_genres VALUES (1, 10), (2, 11), (4, 12), (5, 13)")
+        .unwrap();
+
+    db.execute("DELETE FROM movies WHERE id BETWEEN 2 AND 4")
+        .unwrap();
+
+    let remaining_movies = db.execute("SELECT id FROM movies ORDER BY id").unwrap();
+    assert_eq!(
+        rows(&remaining_movies),
+        vec![vec![Value::Int64(1)], vec![Value::Int64(5)]]
+    );
+    let remaining_links = db
+        .execute("SELECT movie_id, genre_id FROM movie_genres ORDER BY movie_id, genre_id")
+        .unwrap();
+    assert_eq!(
+        rows(&remaining_links),
+        vec![
+            vec![Value::Int64(1), Value::Int64(10)],
+            vec![Value::Int64(5), Value::Int64(13)]
+        ]
+    );
+}
+
+#[test]
 fn delete_with_returning_unsupported() {
     let db = mem_db();
     exec(&db, "CREATE TABLE retr (id INT PRIMARY KEY, val TEXT)");
@@ -720,6 +924,107 @@ fn update_returning() {
 }
 
 #[test]
+fn update_returning_email_fast_path() {
+    let db = mem_db();
+    db.execute("CREATE TABLE users(id INT64 PRIMARY KEY, email TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO users VALUES (1, 'a@example.com')")
+        .unwrap();
+    let r = db
+        .execute_with_params(
+            "UPDATE users SET email = $1 WHERE id = 1 RETURNING id, email",
+            &[Value::Text("b@example.com".into())],
+        )
+        .unwrap();
+    let returned = rows(&r);
+    assert_eq!(
+        returned,
+        vec![vec![Value::Int64(1), Value::Text("b@example.com".into())]]
+    );
+}
+
+#[test]
+fn update_int_arithmetic_many_rows_updates_matching_rows_only_and_keeps_indexes_fresh() {
+    let db = mem_db();
+    db.execute(
+        "CREATE TABLE movies(id INT64 PRIMARY KEY, status TEXT, vote_count INT64, collection TEXT)",
+    )
+    .unwrap();
+    db.execute("CREATE INDEX idx_movies_status ON movies(status)")
+        .unwrap();
+    db.execute("CREATE INDEX idx_movies_collection ON movies(collection) WHERE collection <> ''")
+        .unwrap();
+    db.execute(
+        "INSERT INTO movies(id, status, vote_count, collection) VALUES
+            (1, 'Released', 10, ''),
+            (2, 'Archived', 4, ''),
+            (3, 'Released', 20, 'Series'),
+            (4, 'Released', 30, ''),
+            (5, 'Archived', 6, 'Series')",
+    )
+    .unwrap();
+
+    let result = db
+        .execute("UPDATE movies SET vote_count = vote_count + 1 WHERE status = 'Released'")
+        .unwrap();
+    assert_eq!(result.affected_rows(), 3);
+    assert_eq!(
+        rows(
+            &db.execute("SELECT id, vote_count FROM movies ORDER BY id")
+                .unwrap()
+        ),
+        vec![
+            vec![Value::Int64(1), Value::Int64(11)],
+            vec![Value::Int64(2), Value::Int64(4)],
+            vec![Value::Int64(3), Value::Int64(21)],
+            vec![Value::Int64(4), Value::Int64(31)],
+            vec![Value::Int64(5), Value::Int64(6)],
+        ]
+    );
+    let verification = db.verify_index("idx_movies_status").unwrap();
+    assert!(verification.valid, "index idx_movies_status became invalid");
+    let verification = db.verify_index("idx_movies_collection").unwrap();
+    assert!(
+        verification.valid,
+        "partial index idx_movies_collection became invalid"
+    );
+}
+
+#[test]
+fn update_int_arithmetic_parameter_delta_updates_only_matching_rows() {
+    let db = mem_db();
+    db.execute("CREATE TABLE movies(id INT64 PRIMARY KEY, status TEXT, vote_count INT64)")
+        .unwrap();
+    db.execute(
+        "INSERT INTO movies(id, status, vote_count) VALUES
+            (1, 'Released', 10),
+            (2, 'Archived', 20),
+            (3, 'Released', 12)",
+    )
+    .unwrap();
+
+    let result = db
+        .execute_with_params(
+            "UPDATE movies SET vote_count = vote_count - $1 WHERE status = 'Released'",
+            &[Value::Int64(2)],
+        )
+        .unwrap();
+    assert_eq!(result.affected_rows(), 2);
+    let rows = rows(
+        &db.execute("SELECT id, vote_count FROM movies ORDER BY id")
+            .unwrap(),
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Int64(1), Value::Int64(8)],
+            vec![Value::Int64(2), Value::Int64(20)],
+            vec![Value::Int64(3), Value::Int64(10)],
+        ]
+    );
+}
+
+#[test]
 fn update_unknown_column() {
     let db = mem_db();
     exec(&db, "CREATE TABLE uuc (id INT PRIMARY KEY, val TEXT)");
@@ -840,6 +1145,37 @@ fn upsert_on_conflict_do_update() {
     let v = rows(&r);
     assert_eq!(v[0][0], Value::Text("v2".into()));
     assert_eq!(v[0][1], Value::Int64(2));
+}
+
+#[test]
+fn upsert_on_rowid_conflict_noop_without_returning() {
+    let db = mem_db();
+    db.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'v1')").unwrap();
+    let result = db
+        .execute("INSERT INTO t VALUES (1, 'v1') ON CONFLICT (id) DO UPDATE SET val = EXCLUDED.val")
+        .unwrap();
+    assert_eq!(result.affected_rows(), 1);
+    let rows = rows(&db.execute("SELECT id, val FROM t ORDER BY id").unwrap());
+    assert_eq!(rows, vec![vec![Value::Int64(1), Value::Text("v1".into())]]);
+}
+
+#[test]
+fn upsert_on_conflict_do_update_returning_noop() {
+    let db = mem_db();
+    db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, val TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'v1')").unwrap();
+    let r = db
+        .execute("INSERT INTO t VALUES (1, 'v1') ON CONFLICT (id) DO UPDATE SET val = EXCLUDED.val RETURNING id, val")
+        .unwrap();
+    assert_eq!(
+        rows(&r),
+        vec![vec![Value::Int64(1), Value::Text("v1".into())]]
+    );
+    let r2 = db.execute("SELECT val FROM t WHERE id = 1").unwrap();
+    assert_eq!(rows(&r2)[0][0], Value::Text("v1".into()));
 }
 
 #[test]

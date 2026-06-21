@@ -796,6 +796,11 @@ class Cursor:
             if _fastdecode_native is not None
             else None
         )
+        self._decode_row_i64_text_text_text_text_i64_native = (
+            getattr(_fastdecode_native, "decode_row_i64_text_text_text_text_i64", None)
+            if _fastdecode_native is not None
+            else None
+        )
         self._decode_matrix_i64_native = (
             getattr(_fastdecode_native, "decode_matrix_i64", None)
             if _fastdecode_native is not None
@@ -803,6 +808,11 @@ class Cursor:
         )
         self._decode_matrix_i64_f64_text_text_i64_f64_native = (
             getattr(_fastdecode_native, "decode_matrix_i64_f64_text_text_i64_f64", None)
+            if _fastdecode_native is not None
+            else None
+        )
+        self._decode_matrix_i64_text_text_text_text_i64_native = (
+            getattr(_fastdecode_native, "decode_matrix_i64_text_text_text_text_i64", None)
             if _fastdecode_native is not None
             else None
         )
@@ -980,6 +990,7 @@ class Cursor:
         self._decode_matrix_text_i64_f64_sql_support = {}
         self._decode_matrix_i64_sql_support = {}
         self._decode_matrix_i64_f64_text_text_i64_f64_sql_support = {}
+        self._decode_matrix_i64_text_text_text_text_i64_sql_support = {}
         self._native_bind_int64_step_row_view_sql_support = {}
         self._native_bind_text_step_row_view_sql_support = {}
         self._native_bind_int64_fetch_all_row_views_sql_support = {}
@@ -1015,6 +1026,7 @@ class Cursor:
         self._decode_matrix_text_i64_f64_sql_support.clear()
         self._decode_matrix_i64_sql_support.clear()
         self._decode_matrix_i64_f64_text_text_i64_f64_sql_support.clear()
+        self._decode_matrix_i64_text_text_text_text_i64_sql_support.clear()
         self._native_bind_int64_step_row_view_sql_support.clear()
         self._native_bind_text_step_row_view_sql_support.clear()
         self._native_bind_int64_fetch_all_row_views_sql_support.clear()
@@ -1776,6 +1788,21 @@ class Cursor:
         return True
 
     @staticmethod
+    def _infer_typed_signature(params):
+        signature = []
+        for value in params:
+            value_type = type(value)
+            if value_type is int:
+                signature.append("i")
+            elif value_type is str:
+                signature.append("t")
+            elif value_type is float:
+                signature.append("f")
+            else:
+                return None
+        return "".join(signature)
+
+    @staticmethod
     def _row_is_i64_text_f64(params):
         return Cursor._row_matches_signature(params, "itf")
 
@@ -2140,7 +2167,26 @@ class Cursor:
                     if stmt is not None:
                         try:
                             sv = stmt.value
-                            if frc == 1:
+                            if frc == 5:
+                                try:
+                                    parameter_count = len(parameters)
+                                except TypeError:
+                                    parameter_count = None
+                                if parameter_count != 0:
+                                    raise ValueError("zero-parameter repeat received parameters")
+                                rows = self._native_reset_step_fetch_all_row_views(sv)
+                                sel_info = self._select_fast_info.get(cached_sql)
+                                if sel_info is not None:
+                                    self._has_buffered_row = False
+                                    self._buffered_row = None
+                                    self._prefetched_rows = rows
+                                    self._query_active = True
+                                    self.description = sel_info[0]
+                                    self._col_count = sel_info[1]
+                                    self.rowcount = -1
+                                    return self
+                                affected = None
+                            elif frc == 1:
                                 affected, _ = (
                                     self._native_reset_bind_int64_step_affected(
                                         sv, parameters[0]
@@ -2548,6 +2594,26 @@ class Cursor:
             self.rowcount = fast_rowcount
             return self
 
+        typed_signature = self._infer_typed_signature(normalized_first)
+        if typed_signature is not None:
+            fast_rowcount = self._executemany_typed_iter(
+                expected_count,
+                normalized_first,
+                iterator,
+                typed_signature,
+                lambda params, signature=typed_signature: self._row_matches_signature(
+                    params, signature
+                ),
+            )
+            if fast_rowcount is not None:
+                self._col_count = 0
+                self.description = None
+                self._store_cached_non_query_metadata(sql)
+                self._query_active = False
+                self._has_buffered_row = False
+                self.rowcount = fast_rowcount
+                return self
+
         step_out = ctypes.c_uint8()
         step_stmt = self._lib.ddb_stmt_step
         byref = ctypes.byref
@@ -2826,6 +2892,29 @@ class Cursor:
                 return (v0.float64_value,)
             if tag == DDB_VALUE_NULL:
                 return (None,)
+
+        if count == 6:
+            v0 = values_ptr[0]
+            v1 = values_ptr[1]
+            v2 = values_ptr[2]
+            v3 = values_ptr[3]
+            v4 = values_ptr[4]
+            v5 = values_ptr[5]
+            if (
+                int(v0.tag) == DDB_VALUE_INT64
+                and int(v1.tag) == DDB_VALUE_TEXT
+                and int(v2.tag) == DDB_VALUE_TEXT
+                and int(v3.tag) == DDB_VALUE_TEXT
+                and int(v4.tag) == DDB_VALUE_TEXT
+                and int(v5.tag) == DDB_VALUE_INT64
+                and self._decode_row_i64_text_text_text_text_i64_native is not None
+            ):
+                try:
+                    return self._decode_row_i64_text_text_text_text_i64_native(
+                        ctypes.addressof(values_ptr.contents)
+                    )
+                except Exception:
+                    pass
 
         row = []
         append_row = row.append
@@ -3253,6 +3342,30 @@ class Cursor:
 
         if col_count == 6:
             sql = self._last_sql
+            native_supported = (
+                self._decode_matrix_i64_text_text_text_text_i64_sql_support.get(
+                    sql, True
+                )
+            )
+            if (
+                self._decode_matrix_i64_text_text_text_text_i64_native is not None
+                and native_supported
+                and int(values_ptr[0].tag) == DDB_VALUE_INT64
+                and int(values_ptr[1].tag) == DDB_VALUE_TEXT
+                and int(values_ptr[2].tag) == DDB_VALUE_TEXT
+                and int(values_ptr[3].tag) == DDB_VALUE_TEXT
+                and int(values_ptr[4].tag) == DDB_VALUE_TEXT
+                and int(values_ptr[5].tag) == DDB_VALUE_INT64
+            ):
+                try:
+                    return self._decode_matrix_i64_text_text_text_text_i64_native(
+                        ctypes.addressof(values_ptr.contents), row_count
+                    )
+                except Exception:
+                    self._decode_matrix_i64_text_text_text_text_i64_sql_support[sql] = (
+                        False
+                    )
+
             native_supported = (
                 self._decode_matrix_i64_f64_text_text_i64_f64_sql_support.get(sql, True)
             )

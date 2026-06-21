@@ -25,6 +25,7 @@ ALL_CURSOR_CACHES = [
     '_decode_matrix_text_i64_f64_sql_support',
     '_decode_matrix_i64_sql_support',
     '_decode_matrix_i64_f64_text_text_i64_f64_sql_support',
+    '_decode_matrix_i64_text_text_text_text_i64_sql_support',
     '_native_bind_int64_step_row_view_sql_support',
     '_native_bind_text_step_row_view_sql_support',
     '_native_bind_int64_fetch_all_row_views_sql_support',

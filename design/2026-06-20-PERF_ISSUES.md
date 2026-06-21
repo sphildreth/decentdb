@@ -593,6 +593,444 @@ Use this as the first execution checklist.
 - [ ] Promote any file-format, WAL, C ABI, unsafe, or dependency-impacting
   decision to an ADR before implementation.
 
+## 8.0 Implementation Phases
+
+These phases are intentionally narrow so coding agents can implement and
+validate one measurable improvement at a time.
+
+### Phase 1: Speed Up Showdown Search Index Build
+
+Benchmark target:
+
+```bash
+python bindings/python/benchmarks/bench_complex.py \
+  --workload showdown \
+  --showdown-movies 700 \
+  --showdown-people-mult 1 \
+  --showdown-reviews-per-movie 2 \
+  --showdown-point-reads 100 \
+  --db-prefix .tmp/bench_complex_showdown_phase1
+```
+
+Current reduced baseline from 2026-06-20:
+
+- DecentDB search index build: about 30.6 s.
+- SQLite search index build: about 0.008 s.
+- DecentDB fulltext BM25 query: about 0.002 s.
+- SQLite fulltext BM25 query: about 0.00035 s.
+
+Result after Phase 1:
+
+- `CREATE INDEX` now rebuilds only the newly created index instead of every
+  runtime index in the catalog.
+- `TrigramIndexBuilder::finish_into` now batches encoded postings into the
+  in-memory B-tree with one `replace_entries` call instead of rebuilding B-tree
+  pages once per token.
+- 700-movie reduced benchmark, rebuilt Release library:
+  - DecentDB search index build: about 0.047 s.
+  - SQLite search index build: about 0.007 s.
+  - DecentDB fulltext BM25 query: about 0.0016 s.
+  - SQLite fulltext BM25 query: about 0.00035 s.
+
+The catastrophic search-index build gap is fixed. SQLite is still about 6.8x
+faster on this row at the reduced scale, so follow-up work should target the
+remaining fulltext/trigram build/query overhead after higher-priority DML and
+query-planner gaps.
+
+Owned implementation scope:
+
+- `crates/decentdb/src/search/mod.rs`
+- `crates/decentdb/src/search/fulltext.rs`
+- `crates/decentdb/src/search/fulltext/analyzer.rs`
+- `crates/decentdb/src/search/trigram.rs`
+- `crates/decentdb/src/exec/mod.rs`
+- narrowly related tests under `crates/decentdb/tests/`
+
+Constraints:
+
+- Preserve correctness of `fulltext_match`, `bm25`, prefix queries, phrase
+  queries, and trigram `LIKE`/`ILIKE` behavior.
+- Do not change on-disk format, WAL format, public ABI, or durability semantics
+  in this phase.
+- Prefer in-memory build-path improvements, batching, avoiding repeated
+  parsing/analyzing, avoiding unnecessary row/value clones, and reducing
+  per-index DDL write amplification.
+- Add focused tests or benchmark-facing assertions when the change affects
+  search semantics.
+
+Acceptance criteria:
+
+- Targeted Rust tests for fulltext/trigram still pass.
+- The Showdown search index build row materially improves, ideally by at least
+  2x on the 700-movie reduced benchmark.
+- Fulltext BM25 query latency does not regress.
+- Any remaining large gap is documented with the next suspected bottleneck.
+
+### Phase 2: Speed Up Showdown DML And RETURNING Paths
+
+Benchmark target:
+
+```bash
+python bindings/python/benchmarks/bench_complex.py \
+  --workload showdown \
+  --showdown-movies 700 \
+  --showdown-people-mult 1 \
+  --showdown-reviews-per-movie 2 \
+  --showdown-point-reads 100 \
+  --db-prefix .tmp/bench_complex_showdown_phase2
+```
+
+Current reduced baseline after Phase 1:
+
+- DecentDB `INSERT ... RETURNING`: about 0.0195 s.
+- SQLite `INSERT ... RETURNING`: about 0.0011 s.
+- DecentDB `UPDATE ... RETURNING`: about 0.0147 s.
+- SQLite `UPDATE ... RETURNING`: about 0.00065 s.
+- DecentDB UPSERT: about 0.0027 s.
+- SQLite UPSERT: about 0.00004 s.
+- DecentDB bulk update: about 0.051 s.
+- SQLite bulk update: about 0.0020 s.
+- DecentDB bulk range delete: about 0.0255 s.
+- SQLite bulk range delete: about 0.0014 s.
+
+Phase 2 implementation result (2026-06-20 reduced showdown run, reviewed after
+removing an unnecessary non-`RETURNING` prepared-insert row clone):
+
+- DecentDB `INSERT ... RETURNING`: 0.019918 s (~16.9x slower than SQLite).
+- DecentDB `UPDATE ... RETURNING`: 0.014675 s (~23.2x slower than SQLite).
+- DecentDB UPSERT: 0.002908 s (~59.3x slower than SQLite).
+- DecentDB bulk update: 0.045177 s (~22.9x slower than SQLite).
+- DecentDB bulk range delete: 0.025424 s (~19.5x slower than SQLite).
+- Remaining gap is still substantial; the first executor-level DML fast paths
+  improved correctness and no-op behavior but did not materially change the
+  Showdown write-path rows.
+
+Owned implementation scope:
+
+- `crates/decentdb/src/exec/dml.rs`
+- narrowly related executor tests under `crates/decentdb/tests/`
+
+Constraints:
+
+- Preserve constraint checks, foreign-key actions, trigger behavior, generated
+  columns, sync capture, and `RETURNING` result semantics.
+- Do not change on-disk format, WAL format, public ABI, or durability semantics
+  in this phase.
+- Prefer simple prepared/in-place/paged-row-source improvements for common
+  single-row and batch DML shapes rather than broad planner rewrites.
+- Avoid benchmark-specific SQL special cases; the improvements must apply to
+  ordinary `INSERT`, `UPDATE`, `DELETE`, `ON CONFLICT`, and `RETURNING`
+  statements with the same shape.
+
+Acceptance criteria:
+
+- Add or update focused tests for any `RETURNING`, UPSERT, or bulk-DML path that
+  changes behavior.
+- Targeted Rust tests for DML, constraints, and foreign-key behavior still pass.
+- At least one of the Showdown DML rows improves materially on the reduced
+  benchmark without regressing the others.
+- Any remaining large gap is documented with the next suspected bottleneck.
+
+### Phase 3: Speed Up Ordered Primary-Key Pagination
+
+Benchmark target:
+
+```bash
+python bindings/python/benchmarks/bench_complex.py \
+  --workload showdown \
+  --showdown-movies 700 \
+  --showdown-people-mult 1 \
+  --showdown-reviews-per-movie 2 \
+  --showdown-point-reads 100 \
+  --db-prefix .tmp/bench_complex_showdown_phase3
+```
+
+Current reduced baseline after Phase 2:
+
+- DecentDB keyset pagination, `WHERE id > 500 ORDER BY id LIMIT 25`:
+  0.000042 s.
+- SQLite keyset pagination: 0.000028 s.
+- DecentDB offset pagination, `ORDER BY id LIMIT 25 OFFSET 500`: 0.001465 s.
+- SQLite offset pagination: 0.000033 s.
+
+The offset row is about 44x slower even though it is a single-table primary-key
+order with a small `LIMIT` and modest `OFFSET`. This is a good next target
+because it should be solved by ordered row-id traversal and offset skipping,
+not by broad cost-based join planning.
+
+Phase 3 result note:
+
+- `try_execute_simple_deferred_table_projection_query` and
+  `try_execute_simple_table_projection_query` both now support an unfiltered
+  single-table PK-order fast path for `ORDER BY <pk-int64> LIMIT/OFFSET`,
+  including `DESC`.
+- The new path uses persistent PK index when available, otherwise directional
+  runtime ordered index traversal or direct row-source traversal.
+- Added focused SQL coverage for:
+  - `ORDER BY id LIMIT/OFFSET`
+  - out-of-order primary-key inserts
+  - out-of-range `OFFSET`
+  - `LIMIT < 0` (maps to empty result)
+  - descending PK pagination
+- Benchmarked 700-movie reduced showdown run:
+  - DecentDB offset pagination is `0.001461s`.
+  - SQLite offset pagination is `0.000035s`.
+
+The path is now safer for resident row sources, but this phase did not produce
+a material benchmark improvement. The remaining offset-pagination gap appears
+to be dominated by per-query overhead and row-source traversal/projection cost
+at this small scale, not only by full-row sorting.
+
+Owned implementation scope:
+
+- `crates/decentdb/src/exec/mod.rs`
+- narrowly related SQL tests under `crates/decentdb/tests/`
+
+Constraints:
+
+- Preserve `ORDER BY`, `LIMIT`, `OFFSET`, `LIMIT ALL`, negative limit/offset
+  handling, expression ordering, and projection semantics.
+- Do not change on-disk format, WAL format, public ABI, or durability semantics
+  in this phase.
+- Optimize general single-table primary-key order shapes, not the Showdown SQL
+  string specifically.
+- Avoid changing join, aggregate, or window semantics in this phase unless the
+  same helper is directly shared.
+
+Acceptance criteria:
+
+- Add focused tests for `ORDER BY <row-id alias> LIMIT/OFFSET`, including an
+  out-of-range offset and descending order if the fast path supports it.
+- Targeted ordered-query tests still pass.
+- The Showdown offset pagination row improves materially on the reduced
+  benchmark, ideally by at least 5x, without regressing keyset pagination.
+- Any remaining gap is documented with the next suspected bottleneck.
+
+### Phase 4: Batch Foreign-Key Work During Parent Deletes
+
+Benchmark target:
+
+```bash
+python bindings/python/benchmarks/bench_complex.py \
+  --workload showdown \
+  --showdown-movies 700 \
+  --showdown-people-mult 1 \
+  --showdown-reviews-per-movie 2 \
+  --showdown-point-reads 100 \
+  --db-prefix .tmp/bench_complex_showdown_phase4
+```
+
+Secondary MovieDB target:
+
+```bash
+python bindings/python/benchmarks/bench_complex.py \
+  --workload movie \
+  --movie-movies 2000 \
+  --movie-people 1000 \
+  --movie-roles 8000 \
+  --movie-reviews 12000 \
+  --movie-tags 80 \
+  --movie-movie-tags 6000 \
+  --movie-watchlist 4000 \
+  --movie-point-reads 100 \
+  --movie-update-count 200 \
+  --movie-delete-count 10 \
+  --db-prefix .tmp/bench_complex_movie_phase4
+```
+
+Current reduced baseline after Phase 3:
+
+- Showdown bulk range delete, parent `movies` rows with child FK tables present
+  but no matching child rows for the inserted delete range: DecentDB 0.024629 s,
+  SQLite 0.001302 s.
+- MovieDB cascade delete remains one of the original slow rows; on the
+  earlier in-repo smoke run SQLite was about 12x faster.
+
+Likely cause:
+
+- `execute_delete` computes all parent row ids, but when a table has
+  referencing children it calls `apply_parent_delete_actions` once per parent
+  row.
+- `apply_parent_delete_actions` then resolves each referencing child table and
+  foreign key, probes or scans for matching children, and applies child table
+  changes per parent row.
+- `matching_foreign_key_children` can use a child FK B-tree index, but the
+  repeated per-parent call still repeats catalog lookup, key construction,
+  child row materialization, and child row-source mutation work.
+
+Owned implementation scope:
+
+- `crates/decentdb/src/exec/dml.rs`
+- narrowly related DML/FK tests under `crates/decentdb/tests/`
+
+Constraints:
+
+- Preserve `NO ACTION`, `RESTRICT`, `CASCADE`, and `SET NULL` semantics.
+- Preserve trigger, sync capture, generated column, validation, and
+  `RETURNING` behavior.
+- Do not change on-disk format, WAL format, public ABI, or durability
+  semantics.
+- Optimize general parent-delete/FK-action shapes, not benchmark SQL strings.
+
+Acceptance criteria:
+
+- Add focused tests for deleting multiple parent rows with no matching child
+  rows and with indexed cascading child rows.
+- Targeted FK/DML tests pass.
+- Showdown bulk delete improves materially on the reduced benchmark, ideally by
+  at least 2x, without regressing MovieDB cascade correctness.
+- Any remaining gap is documented with the next suspected bottleneck.
+
+Phase 4 result note:
+
+- Added batched parent-delete FK dispatch in `crates/decentdb/src/exec/dml.rs` by
+  pre-collecting direct child-table FK metadata once per parent table and applying
+  matching child work per child-table, including cascade recursion, rather than
+  per-parent-row recursion.
+- Added focused DML/FK tests for multi-parent delete with indexed FK children (no
+  matches and cascade matches) under `crates/decentdb/tests/sql_dml_tests.rs`.
+- Re-ran reduced Showdown benchmark:
+  - Showdown bulk DELETE (500-row parent delete range): DecentDB 0.022788 s
+    vs SQLite 0.001353 s, measured from
+    `.tmp/bench_complex_showdown_phase4b`.
+
+Phase 4B follow-up result:
+
+- The no-index FK child fallback now builds a parent-key set once and scans each
+  child row source once, preserving NULL and multi-column FK semantics.
+- Added tests for composite-primary-key child tables where the FK column has no
+  separate child index.
+- Reduced Showdown bulk DELETE still did not materially improve:
+  - DecentDB 0.022788 s vs SQLite 0.001353 s.
+
+The remaining delete gap is therefore not only the O(parent keys x child rows)
+fallback. Likely next causes are per-query delete setup, full table scans for
+FK child tables without prefix-usable indexes, index maintenance overhead, and
+row-source mutation/trigger bookkeeping.
+
+### Phase 5: Broaden Python `executemany` Typed Batching
+
+Benchmark target:
+
+```bash
+python bindings/python/benchmarks/bench_complex.py \
+  --workload showdown \
+  --showdown-movies 700 \
+  --showdown-people-mult 1 \
+  --showdown-reviews-per-movie 2 \
+  --showdown-point-reads 100 \
+  --db-prefix .tmp/bench_complex_showdown_phase5_typed_batch
+```
+
+Current reduced baseline after Phase 4B:
+
+- DecentDB bulk load: about 0.200 s before the Python binding change.
+- SQLite bulk load: about 0.027-0.029 s.
+- Many Showdown insert shapes were not covered by the Python binding's narrow
+  typed `executemany` signatures:
+  - `people`: `ittt`
+  - `genres` / `keywords`: `it`
+  - `movies`: `itttiiittfit`
+  - `movie_genres` / `movie_keywords`: `ii`
+  - `roles`: `iiittti`
+  - `reviews`: `iititt`
+
+Phase 5 result note:
+
+- Added generic typed-signature inference for Python positional `executemany`
+  rows containing only `int`, `str`, and `float` values.
+- The generic path now routes those batches through the existing native
+  `execute_batch_typed_collected` fast path instead of per-row Python bind/reset
+  loops.
+- Fixed the ctypes declaration for `ddb_stmt_execute_batch_typed` so the
+  non-extension fallback matches the C ABI.
+- Added a Python API test proving an unlisted wide Showdown-shaped signature
+  (`itttiiittfit`) uses the generic typed batch path.
+- Reduced Showdown benchmark:
+  - DecentDB bulk load improved from about 0.200 s to 0.063638 s.
+  - SQLite bulk load in the same run was 0.027287 s.
+
+This closes most of the accidental Python binding overhead for integer-key
+Showdown bulk loads, but SQLite is still about 2.3x faster. Follow-up bulk-load
+work should profile engine-side prepared batch execution, row validation, and
+index/foreign-key bookkeeping rather than only Python call overhead.
+
+### Phase 6: Speed Up Simple Bulk Arithmetic Updates
+
+Benchmark target:
+
+```bash
+python bindings/python/benchmarks/bench_complex.py \
+  --workload showdown \
+  --showdown-movies 700 \
+  --showdown-people-mult 1 \
+  --showdown-reviews-per-movie 2 \
+  --showdown-point-reads 100 \
+  --db-prefix .tmp/bench_complex_showdown_phase6c_partial_index
+```
+
+Current reduced baseline after Phase 5:
+
+- DecentDB bulk update: about 0.045 s.
+- SQLite bulk update: about 0.002 s.
+
+Phase 6 result note:
+
+- Added a general fast path for single-column integer arithmetic updates of the
+  form `col = col +/- <int literal/param>`.
+- Extended that path to paged row sources so it applies to the Showdown
+  benchmark with retained paged manifests.
+- Tightened `index_might_change_for_assignments` so partial and expression
+  indexes are only treated as changing when their indexed columns, included
+  columns, expression SQL, or partial predicate SQL reference an updated column.
+  Unknown/unparseable expressions still fall back to conservative behavior.
+- Added focused tests for resident arithmetic updates, parameter deltas, paged
+  arithmetic updates, and partial-index validity after updating an unrelated
+  column.
+- Reduced Showdown benchmark:
+  - DecentDB bulk UPDATE improved to 0.005974 s.
+  - SQLite bulk UPDATE in the same run was 0.001949 s.
+
+This removes most of the accidental index-maintenance overhead for this row.
+The remaining gap appears to be paged-manifest row-change/writeback overhead and
+general transaction/update bookkeeping rather than expression evaluation or
+unrelated partial-index maintenance.
+
+### Phase 7: Hash Join Materialized CTE Inputs
+
+Benchmark target:
+
+```bash
+python bindings/python/benchmarks/bench_complex.py \
+  --workload showdown \
+  --showdown-movies 700 \
+  --showdown-people-mult 1 \
+  --showdown-reviews-per-movie 2 \
+  --showdown-point-reads 100 \
+  --db-prefix .tmp/bench_complex_showdown_phase7
+```
+
+Current reduced baseline after Phase 6:
+
+- DecentDB directors CTE: about 0.049 s.
+- SQLite directors CTE: about 0.0036 s.
+
+Phase 7 result note:
+
+- Added an inner-join hash/equi-join path for generic materialized CTE RHS
+  inputs using simple `ON a.col = b.col` equality constraints.
+- The path is alias-aware, skips NULL join keys, preserves duplicate RHS rows,
+  and falls back for unsupported join kinds or non-equality predicates.
+- Added CTE regression coverage for a materialized CTE joined back to another
+  CTE result.
+- Reduced Showdown benchmark:
+  - DecentDB directors CTE improved to about 0.020 s.
+  - SQLite directors CTE remains about 0.0036 s.
+
+This cuts the CTE row by roughly 2.5x, but SQLite remains about 5.5x faster.
+Remaining work likely includes pushing base-table indexed join fast paths into
+non-recursive CTE materialization and reducing grouped `STRING_AGG` overhead.
+
 ## 8.1 In-Repo Movie Benchmark Path
 
 `bindings/python/benchmarks/bench_complex.py` now includes the MovieDB workload
@@ -722,6 +1160,105 @@ date range query and a DecentDB `DATE` cast for the same predicate. Python's
 `sqlite3` handling of `CAST('2010-01-01' AS DATE)` produced different filter
 cardinality, so the benchmark uses engine-specific equivalent literals to keep
 row counts comparable.
+
+## 8.3 Iteration Summary: Implemented Wins and Remaining Gaps
+
+This section is the running summary of the performance work done in response to
+the out-of-repo MovieDB and GLM52 Showdown harnesses.
+
+Implementation changes made in this iteration:
+
+- Added the GLM52 Showdown workload to
+  `bindings/python/benchmarks/bench_complex.py` so the in-repo Python benchmark
+  now exposes point reads, full/range scans, pagination, 3-table joins,
+  grouped aggregates, window functions, CTEs, fulltext, `RETURNING`, UPSERT,
+  bulk DML, checkpoint, and file-size comparisons.
+- Made the SQLite FTS benchmark maintain external-content FTS tables through
+  triggers after the initial rebuild, so SQLite pays live-index maintenance
+  costs for later insert/delete timing instead of only DecentDB paying them.
+- Added DecentDB search-index build improvements that rebuild only the new
+  index and batch trigram postings.
+- Added prepared/batch DML improvements and row-id range delete recognition.
+  The row-id delete changes pass targeted tests, but the Showdown bulk-delete
+  row remains dominated by commit/durability and FK/cascade work.
+- Added a fast 3-table indexed join projection path in the executor.
+- Added Python C fast decoders for important benchmark result shapes,
+  especially:
+  - `(INT64, TEXT, TEXT, TEXT, TEXT, INT64)` for the cast/crew 3-table join.
+  - `(INT64, TEXT, FLOAT64, INT64)` for Showdown integer primary-key point
+    reads.
+  - `(INT64, TEXT, FLOAT64, INT64, INT64)` for Showdown full-scan rows.
+- Fixed a Python cursor fast-repeat issue for zero-parameter repeated SELECTs
+  executed with `params=()`.
+- Added a single-process resident-read shortcut gated by
+  `process_coordination=single_process_unsafe`. Normal coordinated
+  multi-process reads still use the WAL snapshot path.
+- Added a prepared ordered row-id projection plan for
+  `SELECT ... FROM table ORDER BY int64_rowid_alias LIMIT/OFFSET`, with cache
+  accounting and regression coverage.
+- Added a single-process resident shortcut for prepared row-id point
+  projections. The Showdown point-read win still required the Python decoder
+  shape because the binding was falling back on the 4-column result.
+
+Validation commands run during this iteration:
+
+```bash
+cargo fmt --check
+cargo check -p decentdb
+cargo test -p decentdb prepared_ordered_row_id_projection_plan_resolves_limit_offset
+cargo test -p decentdb simple_indexed_projection_order_by_limit_offset_uses_fast_path
+cargo build -p decentdb --release
+python -m py_compile bindings/python/decentdb/__init__.py bindings/python/benchmarks/bench_complex.py
+python bindings/python/benchmarks/bench_complex.py \
+  --workload showdown \
+  --showdown-movies 700 \
+  --showdown-people-mult 1 \
+  --showdown-reviews-per-movie 2 \
+  --showdown-point-reads 100 \
+  --db-prefix .tmp/bench_complex_showdown_fullscan_decode
+```
+
+Latest reduced Showdown result after these changes:
+
+| Scenario | DecentDB | SQLite | Status |
+|---|---:|---:|---|
+| Point lookup by integer PK, 100 reads | 0.000279 s | 0.000451 s | DecentDB 1.6x faster |
+| Keyset pagination | 0.000028 s | 0.000027 s | parity |
+| Offset pagination | 0.000037 s | 0.000036 s | parity |
+| Movie genres 3-table join | 0.001023 s | 0.001644 s | DecentDB 1.6x faster |
+| Cast/crew 3-table join | 0.008976 s | 0.015657 s | DecentDB 1.7x faster |
+| Final file size | 1,306,656 bytes | 2,113,536 bytes | DecentDB smaller |
+
+Key micro-result:
+
+- Repeated `SELECT id, title, rating FROM movies ORDER BY id LIMIT 25 OFFSET
+  500` dropped from about 1.42 ms per native reset/fetch execution to about
+  11 us after the prepared ordered row-id projection plan.
+- Repeated `SELECT id, title, rating, runtime_minutes FROM movies WHERE id = ?`
+  dropped from about 15 us per Python cursor execution to about 2.7 us after
+  the resident prepared row-id shortcut plus the 4-column C decoder.
+
+Remaining reduced Showdown gaps after this iteration:
+
+| Scenario | Approximate gap | Current diagnosis |
+|---|---:|---|
+| Bulk load | SQLite about 2.4x faster | Python/binding batch insert and row/index maintenance overhead remain high. |
+| B-tree index build | SQLite about 4.5x faster | DecentDB runtime B-tree rebuild/build path needs bulk-build and allocation profiling. |
+| Search index build | SQLite about 6.4x faster | DecentDB trigram/fulltext build improved, but still much slower than SQLite FTS5 rebuild at this scale. |
+| Full table scan | SQLite about 3.8x faster | Adding C decoders did not move it; engine-side full result materialization dominates. |
+| Filtered range and indexed range/order | SQLite about 4-6x faster | Needs cached/simple range plans and less per-query planner/executor recognizer work. |
+| Review aggregate join and filmography | SQLite about 2-3x faster | Needs grouped aggregate over index prefixes plus late materialization. |
+| Window functions | SQLite about 1.5-2.2x faster | Needs partition/order execution without excess row cloning/sorting. |
+| Multi-CTE directors query | SQLite about 5.3x faster | CTE materialization and `STRING_AGG` still need planner/executor work. |
+| Fulltext BM25 | SQLite about 4.4x faster | Query-time fulltext scorer and result materialization need profiling. |
+| `INSERT/UPDATE ... RETURNING`, UPSERT, bulk update/delete | SQLite about 2.7-73x faster | Cold statement/RETURNING materialization, commit path, and FK/cascade work dominate. |
+| Checkpoint | SQLite about 1.2x faster | Compare semantics carefully before treating this as a pure engine gap. |
+
+The current evidence no longer supports a blanket statement that SQLite is
+faster on every small read: DecentDB now wins point lookup and the two 3-table
+join scenarios in the reduced Showdown benchmark. SQLite is still materially
+faster on the broad join/aggregation/search/window/CTE/write-maintenance parts
+of the workload.
 
 ## 9. Success Criteria
 

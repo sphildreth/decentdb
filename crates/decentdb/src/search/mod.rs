@@ -62,13 +62,13 @@ impl TrigramIndexBuilder {
     pub(crate) fn finish_into(self, index: &mut TrigramIndex) -> Result<()> {
         index.postings_tree.clear()?;
         index.pending.clear();
+        let mut entries = BTreeMap::<u64, Vec<u8>>::new();
         for (token, mut row_ids) in self.postings {
             row_ids.sort_unstable();
             row_ids.dedup();
-            index
-                .postings_tree
-                .insert(u64::from(token), encode_postings(&row_ids)?)?;
+            entries.insert(u64::from(token), encode_postings(&row_ids)?);
         }
+        index.postings_tree.replace_entries(entries)?;
         index.rebuild_state.mark_rebuilt();
         Ok(())
     }
@@ -305,6 +305,20 @@ mod tests {
 
         let result = index.query_candidates("%Motley%", false).expect("query");
         assert_eq!(result, TrigramQueryResult::Candidates(vec![1, 3]));
+    }
+
+    #[test]
+    fn bulk_builder_deduplicates_row_ids() {
+        let mut builder = TrigramIndexBuilder::new();
+        builder.insert(1, "alphabet soup");
+        builder.insert(1, "alphabet soup");
+        builder.insert(2, "alphabet city");
+
+        let mut index = TrigramIndex::new(1024, 100_000);
+        builder.finish_into(&mut index).expect("finish");
+
+        let result = index.query_candidates("alphabet", false).expect("query");
+        assert_eq!(result, TrigramQueryResult::Candidates(vec![1, 2]));
     }
 
     #[test]

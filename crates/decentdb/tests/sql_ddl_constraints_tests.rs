@@ -2883,6 +2883,86 @@ fn parse_create_index_if_not_exists() {
 }
 
 #[test]
+fn create_index_if_not_exists_does_not_change_existing_metadata() {
+    let db = mem_db();
+    db.execute("CREATE TABLE t(id INT64, val TEXT)").unwrap();
+    db.execute("CREATE INDEX idx ON t(id)").unwrap();
+
+    let index_count_before = db.list_indexes().unwrap().len();
+    let names_before = {
+        let indexes = db.list_indexes().unwrap();
+        indexes
+            .iter()
+            .map(|index| index.name.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+
+    db.execute("CREATE INDEX IF NOT EXISTS idx ON t(id)")
+        .unwrap();
+
+    let index_count_after = db.list_indexes().unwrap().len();
+    let names_after = {
+        let indexes = db.list_indexes().unwrap();
+        indexes
+            .iter()
+            .map(|index| index.name.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    assert_eq!(index_count_before, index_count_after);
+    assert_eq!(names_before, names_after);
+}
+
+#[test]
+fn create_index_rebuilds_only_new_index() {
+    let db = mem_db();
+    db.execute("CREATE TABLE t(id INT64, val TEXT)").unwrap();
+    db.execute("CREATE INDEX idx_existing ON t(id)").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')")
+        .unwrap();
+
+    db.execute("CREATE INDEX idx_new ON t(val)").unwrap();
+
+    let indexes = db.list_indexes().unwrap();
+    assert!(
+        indexes.iter().any(|index| index.name == "idx_existing"),
+        "existing index should remain present"
+    );
+    assert!(
+        indexes.iter().any(|index| index.name == "idx_new"),
+        "new index should be present"
+    );
+}
+
+#[test]
+fn create_index_if_not_exists_does_not_change_existing_freshness() {
+    let db = mem_db();
+    db.execute("CREATE TABLE t(id INT64, val TEXT)").unwrap();
+    db.execute("CREATE INDEX idx ON t(id)").unwrap();
+    db.execute("CREATE INDEX idx_new ON t(val)").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')")
+        .unwrap();
+
+    let indexes_before = db.list_indexes().unwrap();
+    let idx_existing_fresh_before = indexes_before
+        .iter()
+        .find(|index| index.name == "idx")
+        .expect("idx should exist")
+        .fresh;
+
+    db.execute("CREATE INDEX IF NOT EXISTS idx ON t(id)")
+        .unwrap();
+
+    let indexes_after = db.list_indexes().unwrap();
+    let idx_existing_fresh_after = indexes_after
+        .iter()
+        .find(|index| index.name == "idx")
+        .expect("idx should still exist")
+        .fresh;
+    assert_eq!(idx_existing_fresh_before, idx_existing_fresh_after);
+    assert!(indexes_after.iter().any(|index| index.name == "idx_new"));
+}
+
+#[test]
 fn parse_create_table_with_all_types() {
     let db = mem_db();
     db.execute(

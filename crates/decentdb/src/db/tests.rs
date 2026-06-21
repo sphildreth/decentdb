@@ -466,6 +466,26 @@ fn simple_row_id_range_projection_sql_parser_extracts_bounds_and_limit() {
 }
 
 #[test]
+fn prepared_ordered_row_id_projection_plan_resolves_limit_offset() -> Result<()> {
+    let db = Db::open_or_create(":memory:", DbConfig::default())?;
+    db.execute("CREATE TABLE movies (id INTEGER PRIMARY KEY, title TEXT, rating REAL)")?;
+    let prepared =
+        db.prepare("SELECT id, title, rating FROM movies ORDER BY id LIMIT 25 OFFSET 5")?;
+    let plan = prepared
+        .simple_ordered_row_id_projection
+        .as_ref()
+        .expect("prepared ordered rowid projection plan");
+    assert_eq!(plan.table_name, "movies");
+    assert_eq!(plan.order_column, "id");
+    assert_eq!(plan.projection_indexes, vec![0, 1, 2]);
+    assert_eq!(plan.column_names.as_ref(), &["id", "title", "rating"]);
+    assert_eq!(plan.limit, Some(25));
+    assert_eq!(plan.offset, 5);
+    assert!(!plan.descending);
+    Ok(())
+}
+
+#[test]
 fn single_statement_fast_path_accepts_optional_trailing_semicolon_only() {
     assert_eq!(
         simple_single_statement_fast_path_sql(" SELECT id FROM artists WHERE id = $1; "),

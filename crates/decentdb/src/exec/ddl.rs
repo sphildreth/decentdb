@@ -292,7 +292,7 @@ impl EngineRuntime {
         &mut self,
         statement: &CreateIndexStatement,
         _page_size: u32,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         let (index_qualifier, index_object) =
             super::compat_schema_qualified_name(&statement.index_name);
         if index_qualifier == Some(super::CompatSchemaQualifier::Temp) {
@@ -303,7 +303,7 @@ impl EngineRuntime {
         let index_name = index_object.to_string();
         if self.catalog.contains_object(&index_name) {
             if statement.if_not_exists && self.catalog.indexes.contains_key(&index_name) {
-                return Ok(());
+                return Ok(None);
             }
             return Err(DbError::sql(format!(
                 "object {} already exists",
@@ -545,7 +545,7 @@ impl EngineRuntime {
         }
 
         self.insert_index_schema(IndexSchema {
-            name: index_name,
+            name: index_name.clone(),
             table_name: table_name.clone(),
             kind,
             unique: statement.unique,
@@ -596,7 +596,7 @@ impl EngineRuntime {
         }
 
         self.bump_schema_cookie();
-        Ok(())
+        Ok(Some(index_name))
     }
 
     pub(super) fn execute_drop_table(

@@ -4546,8 +4546,9 @@ impl EngineRuntime {
                 Ok(result)
             }
             Statement::CreateIndex(statement) => {
-                self.execute_create_index(statement, page_size)?;
-                self.rebuild_indexes(page_size)?;
+                if let Some(index_name) = self.execute_create_index(statement, page_size)? {
+                    self.rebuild_index(&index_name, page_size)?;
+                }
                 Ok(QueryResult::with_affected_rows(0))
             }
             Statement::AlterIndexRebuild { name } => {
@@ -4836,6 +4837,11 @@ impl EngineRuntime {
                 }
                 if let Some(result) =
                     self.try_execute_simple_indexed_join_projection_query(query, params)?
+                {
+                    return Ok(result);
+                }
+                if let Some(result) =
+                    self.try_execute_three_table_indexed_join_projection_query(query, params)?
                 {
                     return Ok(result);
                 }
@@ -8608,6 +8614,16 @@ impl EngineRuntime {
         let Some(right_column_index) = schema_column_index(right_schema, right_ref.column) else {
             return Ok(None);
         };
+        if crate::exec::dml::row_id_alias_column_name(right_schema)
+            .is_some_and(|column| identifiers_equal(column, right_ref.column))
+        {
+            let _ = right_column_index;
+            return Ok(Some(IndexedJoinLimitStep {
+                previous_table_index,
+                previous_column_index,
+                right_index_name: None,
+            }));
+        }
         let Some(index) = self.catalog.indexes.values().find(|index| {
             identifiers_equal(&index.table_name, right_table.name)
                 && index.fresh
@@ -8627,7 +8643,7 @@ impl EngineRuntime {
         Ok(Some(IndexedJoinLimitStep {
             previous_table_index,
             previous_column_index,
-            right_index_name: index.name.clone(),
+            right_index_name: Some(index.name.clone()),
         }))
     }
 
@@ -8648,14 +8664,15 @@ impl EngineRuntime {
             .steps
             .iter()
             .map(|step| {
-                let Some(RuntimeIndex::Btree { keys, .. }) = self.index(&step.right_index_name)
-                else {
+                let Some(index_name) = step.right_index_name.as_deref() else {
+                    return Ok(None);
+                };
+                let Some(RuntimeIndex::Btree { keys, .. }) = self.index(index_name) else {
                     return Err(DbError::internal(format!(
-                        "index {} is missing for indexed join limit plan",
-                        step.right_index_name
+                        "index {index_name} is missing for indexed join limit plan",
                     )));
                 };
-                Ok(keys)
+                Ok(Some(keys))
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -8714,6 +8731,233 @@ impl EngineRuntime {
             }
         }
         Ok(indexed_join_limit_result(plan, rows))
+    }
+
+    fn execute_indexed_join_projection_rows(
+        &self,
+        plan: &IndexedJoinLimitPlan<'_>,
+        enforce_root_rowid_order: bool,
+        second_table_order_column: Option<usize>,
+    ) -> Result<Vec<QueryRow>> {
+        if plan.tables.len() != 3 || plan.steps.len() != 2 {
+            return Err(DbError::internal(
+                "indexed join projection rows path expects a three-table chain",
+            ));
+        }
+        let sources = plan
+            .tables
+            .iter()
+            .map(|table| {
+                self.visible_table_row_source(table.name).ok_or_else(|| {
+                    DbError::internal(format!("table {} row source is missing", table.name))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let keys = plan
+            .steps
+            .iter()
+            .map(|step| {
+                let Some(index_name) = step.right_index_name.as_deref() else {
+                    return Ok(None);
+                };
+                let Some(RuntimeIndex::Btree { keys, .. }) = self.index(index_name) else {
+                    return Err(DbError::internal(format!(
+                        "index {index_name} is missing for indexed join projection plan",
+                    )));
+                };
+                Ok(Some(keys))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut root_row_ids = Vec::with_capacity(sources[0].row_count());
+        for root_row in sources[0].rows() {
+            root_row_ids.push(root_row?.row_id());
+        }
+        if enforce_root_rowid_order {
+            root_row_ids.sort_unstable();
+        }
+
+        let mut rows = Vec::new();
+        for root_row_id in root_row_ids {
+            let Some(root_row) = sources[0].row_by_id(root_row_id)? else {
+                continue;
+            };
+            let step0 = &plan.steps[0];
+            let Some(probe_value0) = root_row.values().get(step0.previous_column_index) else {
+                return Err(DbError::internal("join probe row is shorter than schema"));
+            };
+            let mut row1_ids = indexed_join_row_ids_for_value(keys[0], probe_value0)?;
+            if let Some(column_index) = second_table_order_column {
+                row1_ids = sort_join_row_ids_by_column(sources[1], row1_ids, column_index)?;
+            }
+            for row1_id in row1_ids {
+                let Some(row1) = sources[1].row_by_id(row1_id)? else {
+                    continue;
+                };
+                let current01 = [root_row.values(), row1.values()];
+                let step1 = &plan.steps[1];
+                let Some(probe_value1) = current01
+                    .get(step1.previous_table_index)
+                    .and_then(|row| row.get(step1.previous_column_index))
+                else {
+                    return Err(DbError::internal("join probe row is shorter than schema"));
+                };
+                for row2_id in indexed_join_row_ids_for_value(keys[1], probe_value1)? {
+                    let Some(row2) = sources[2].row_by_id(row2_id)? else {
+                        continue;
+                    };
+                    let current = [root_row.values(), row1.values(), row2.values()];
+                    rows.push(project_indexed_join_row(&current, &plan.projections)?);
+                }
+            }
+        }
+        Ok(rows)
+    }
+
+    fn try_execute_three_table_indexed_join_projection_query(
+        &self,
+        query: &Query,
+        params: &[Value],
+    ) -> Result<Option<QueryResult>> {
+        if query.recursive || !query.ctes.is_empty() {
+            return Ok(None);
+        }
+        let QueryBody::Select(select) = &query.body else {
+            return Ok(None);
+        };
+        if select.from.len() != 1 {
+            return Ok(None);
+        }
+        let mut tables = Vec::new();
+        let mut constraints = Vec::new();
+        if !flatten_left_deep_inner_join_tables(&select.from[0], &mut tables, &mut constraints)
+            || tables.len() != 3
+            || constraints.len() != 2
+        {
+            return Ok(None);
+        }
+        let natural_order = if query.order_by.is_empty() {
+            None
+        } else {
+            self.three_table_join_natural_order(query, &tables)
+        };
+        let order_by = if query.order_by.is_empty() || natural_order.is_some() {
+            None
+        } else {
+            let Some(order_by) = projection_order_by_plan(&query.order_by, &select.projection)
+            else {
+                return Ok(None);
+            };
+            Some(order_by)
+        };
+        let Some(plan) = self.analyze_indexed_join_limit_projection_select(
+            select,
+            &select.projection,
+            usize::MAX,
+            0,
+        )?
+        else {
+            return Ok(None);
+        };
+        if plan.tables.len() != 3 {
+            return Ok(None);
+        }
+
+        let mut rows = self.execute_indexed_join_projection_rows(
+            &plan,
+            natural_order.is_some(),
+            natural_order.flatten(),
+        )?;
+        if let Some(order_by) = order_by.as_deref() {
+            sort_query_rows_by_projection_order(Some(self), &mut rows, order_by)?;
+        }
+
+        let ctes = BTreeMap::new();
+        let offset = query
+            .offset
+            .as_ref()
+            .map(|expr| self.eval_constant_i64(expr, params, &ctes))
+            .transpose()?
+            .map(|value| usize::try_from(value.max(0)).unwrap_or(usize::MAX))
+            .unwrap_or(0);
+        let limit = query
+            .limit
+            .as_ref()
+            .map(|expr| self.eval_constant_i64(expr, params, &ctes))
+            .transpose()?
+            .map(|value| usize::try_from(value.max(0)).unwrap_or(usize::MAX));
+        if offset > 0 || limit.is_some() {
+            rows = rows
+                .into_iter()
+                .skip(offset)
+                .take(limit.unwrap_or(usize::MAX))
+                .collect();
+        }
+        Ok(Some(QueryResult::with_rows(
+            plan.projections
+                .iter()
+                .map(|projection| projection.column_name.clone())
+                .collect(),
+            rows,
+        )))
+    }
+
+    fn three_table_join_natural_order(
+        &self,
+        query: &Query,
+        tables: &[IndexedJoinLimitTablePlan<'_>],
+    ) -> Option<Option<usize>> {
+        if !(1..=2).contains(&query.order_by.len()) {
+            return None;
+        }
+        if query
+            .order_by
+            .iter()
+            .any(|order| order.descending || order.collation.is_some())
+        {
+            return None;
+        }
+        let first_schema = self.table_schema(tables[0].name)?;
+        let first_rowid_column = crate::exec::dml::row_id_alias_column_name(first_schema)?;
+        let Expr::Column {
+            table: first_table,
+            column: first_column,
+        } = &query.order_by[0].expr
+        else {
+            return None;
+        };
+        if !matches_table_binding(
+            TableBindingRef {
+                name: tables[0].name,
+                alias: tables[0].alias,
+            },
+            first_table.as_deref(),
+        ) || !identifiers_equal(first_column, first_rowid_column)
+        {
+            return None;
+        }
+        if query.order_by.len() == 1 {
+            return Some(None);
+        }
+
+        let second_schema = self.table_schema(tables[1].name)?;
+        let Expr::Column {
+            table: second_table,
+            column: second_column,
+        } = &query.order_by[1].expr
+        else {
+            return None;
+        };
+        if !matches_table_binding(
+            TableBindingRef {
+                name: tables[1].name,
+                alias: tables[1].alias,
+            },
+            second_table.as_deref(),
+        ) {
+            return None;
+        }
+        schema_column_index(second_schema, second_column).map(Some)
     }
 
     fn try_execute_base_table_join(
@@ -10850,7 +11094,41 @@ impl EngineRuntime {
             alias.as_deref().unwrap_or(name),
             &projection_indexes,
         )?;
-        if !query.order_by.is_empty() && order_by.is_none() {
+        let row_id_order = if query.order_by.len() == 1 {
+            if let Expr::Column {
+                table: order_table,
+                column: order_column,
+            } = &query.order_by[0].expr
+            {
+                if order_table.as_deref().is_some_and(|qualifier| {
+                    !matches_table_binding(TableBindingRef { name, alias }, Some(qualifier))
+                }) {
+                    None
+                } else if let Some(filter_column_index) =
+                    schema_column_index(table_schema, order_column)
+                {
+                    if table_schema
+                        .primary_key_columns
+                        .iter()
+                        .any(|column| identifiers_equal(column, order_column))
+                        && table_schema.columns[filter_column_index].column_type
+                            == crate::catalog::ColumnType::Int64
+                    {
+                        Some((order_column.as_str(), query.order_by[0].descending))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if !query.order_by.is_empty() && order_by.is_none() && row_id_order.is_none() {
             return Ok(None);
         }
         let limit = query
@@ -10869,6 +11147,46 @@ impl EngineRuntime {
         let Some(row_source) = row_source else {
             return Ok(None);
         };
+        if let Some((filter_column, descending)) = row_id_order {
+            if limit != Some(0) {
+                if let Some(row_ids) = self.ordered_runtime_btree_row_ids(
+                    name,
+                    filter_column,
+                    limit,
+                    offset,
+                    descending,
+                )? {
+                    let mut rows = Vec::with_capacity(row_ids.len().min(64));
+                    for row_id in row_ids {
+                        if let Some(values) =
+                            row_source.projected_values_by_id(row_id, &projection_indexes)?
+                        {
+                            rows.push(QueryRow::new(values));
+                        }
+                    }
+                    return Ok(Some(QueryResult::with_rows(column_names, rows)));
+                }
+                let mut ordered_row_ids = Vec::with_capacity(row_source.row_count());
+                for stored_row in row_source.rows() {
+                    ordered_row_ids.push(stored_row?.row_id());
+                }
+                ordered_row_ids.sort_unstable();
+                if descending {
+                    ordered_row_ids.reverse();
+                }
+                let take = limit.unwrap_or(usize::MAX);
+                let mut rows = Vec::with_capacity(take.min(ordered_row_ids.len()));
+                for row_id in ordered_row_ids.into_iter().skip(offset).take(take) {
+                    if let Some(values) =
+                        row_source.projected_values_by_id(row_id, &projection_indexes)?
+                    {
+                        rows.push(QueryRow::new(values));
+                    }
+                }
+                return Ok(Some(QueryResult::with_rows(column_names, rows)));
+            }
+        }
+
         Ok(Some(self.simple_projection_result_from_source(
             row_source,
             &projection_indexes,
@@ -12899,6 +13217,84 @@ impl EngineRuntime {
         )
     }
 
+    pub(crate) fn execute_resolved_simple_ordered_row_id_projection(
+        &self,
+        table_name: &str,
+        order_column: &str,
+        projection_indexes: &[usize],
+        column_names: Arc<[String]>,
+        limit: Option<usize>,
+        offset: usize,
+        descending: bool,
+    ) -> Result<Option<QueryResult>> {
+        if self
+            .visible_view(table_name, NameResolutionScope::Session)
+            .is_some()
+            || self.visible_table_is_temporary(table_name)
+        {
+            return Ok(None);
+        }
+        let Some(table_schema) = self.table_schema(table_name) else {
+            return Ok(None);
+        };
+        if !generated_columns_are_stored(table_schema)
+            || projection_indexes
+                .iter()
+                .any(|index| *index >= table_schema.columns.len())
+        {
+            return Ok(None);
+        }
+        let Some(order_index) = schema_column_index(table_schema, order_column) else {
+            return Ok(None);
+        };
+        if !row_id_alias_column_name(table_schema)
+            .is_some_and(|column_name| identifiers_equal(column_name, order_column))
+            || table_schema.columns[order_index].column_type != ColumnType::Int64
+        {
+            return Ok(None);
+        }
+        if limit == Some(0) {
+            return Ok(Some(QueryResult::with_shared_columns(
+                column_names,
+                Vec::new(),
+            )));
+        }
+        let Some(row_source) = self.visible_table_row_source(table_schema.name.as_str()) else {
+            return Ok(None);
+        };
+        let take = limit.unwrap_or(usize::MAX);
+        let row_ids = if let Some(row_ids) = self.ordered_runtime_btree_row_ids(
+            table_schema.name.as_str(),
+            order_column,
+            limit,
+            offset,
+            descending,
+        )? {
+            row_ids
+        } else {
+            let mut ordered_row_ids = Vec::with_capacity(row_source.row_count());
+            for stored_row in row_source.rows() {
+                ordered_row_ids.push(stored_row?.row_id());
+            }
+            ordered_row_ids.sort_unstable();
+            if descending {
+                ordered_row_ids.reverse();
+            }
+            ordered_row_ids
+                .into_iter()
+                .skip(offset)
+                .take(take)
+                .collect()
+        };
+        let mut rows = Vec::with_capacity(row_ids.len().min(64));
+        for row_id in row_ids {
+            if let Some(values) = row_source.projected_values_by_id(row_id, projection_indexes)? {
+                rows.push(QueryRow::new(values));
+            }
+        }
+        Ok(Some(QueryResult::with_shared_columns(column_names, rows)))
+    }
+
     pub(crate) fn execute_resolved_simple_row_id_projection_at_snapshot(
         &self,
         request: ResolvedSimpleRowIdProjectionRequest<'_>,
@@ -14773,7 +15169,7 @@ impl EngineRuntime {
             alias.as_deref().unwrap_or(name),
             &projection_indexes,
         )?;
-        let row_id_order_column = if query.order_by.len() == 1 && !query.order_by[0].descending {
+        let row_id_order = if query.order_by.len() == 1 {
             if let Expr::Column {
                 table: order_table,
                 column: order_column,
@@ -14793,7 +15189,7 @@ impl EngineRuntime {
                         && table_schema.columns[filter_column_index].column_type
                             == crate::catalog::ColumnType::Int64
                     {
-                        Some(order_column.as_str())
+                        Some((order_column.as_str(), query.order_by[0].descending))
                     } else {
                         None
                     }
@@ -14807,7 +15203,7 @@ impl EngineRuntime {
             None
         };
 
-        if !query.order_by.is_empty() && order_by.is_none() && row_id_order_column.is_none() {
+        if !query.order_by.is_empty() && order_by.is_none() && row_id_order.is_none() {
             return Ok(None);
         }
         let limit = query
@@ -14836,7 +15232,7 @@ impl EngineRuntime {
             .table(name)
             .and_then(|table| self.deferred_paged_row_locator_caches.get(&table.name))
             .map(|cache| cache.as_ref());
-        if let Some(filter_column) = row_id_order_column {
+        if let Some((filter_column, descending)) = row_id_order {
             if limit != Some(0) && use_persistent_pk_index {
                 if let Some(result) = try_persistent_pk_ordered_projection_result(
                     &store,
@@ -14846,14 +15242,19 @@ impl EngineRuntime {
                     column_names.clone(),
                     limit,
                     offset,
+                    descending,
                 )? {
                     return Ok(Some(result));
                 }
             }
-            if limit.is_some() && limit != Some(0) {
-                if let Some(row_ids) =
-                    self.ordered_runtime_btree_row_ids(name, filter_column, limit, offset)?
-                {
+            if limit != Some(0) {
+                if let Some(row_ids) = self.ordered_runtime_btree_row_ids(
+                    name,
+                    filter_column,
+                    limit,
+                    offset,
+                    descending,
+                )? {
                     let mut rows = Vec::with_capacity(row_ids.len().min(64));
                     for row_id in row_ids {
                         if let Some(values) = read_deferred_projected_values_by_id(
@@ -14890,7 +15291,7 @@ impl EngineRuntime {
             }
         }
         if limit.is_some() && limit != Some(0) {
-            if let Some(filter_column) = row_id_order_column {
+            if let Some((filter_column, _descending)) = row_id_order {
                 if let Some(result) = self.try_simple_deferred_rowid_range_projection_result(
                     &store,
                     state,
@@ -15606,6 +16007,7 @@ impl EngineRuntime {
         column_name: &str,
         limit: Option<usize>,
         offset: usize,
+        descending: bool,
     ) -> Result<Option<Vec<i64>>> {
         let Some(index) = self.single_column_btree_index(table_name, column_name) else {
             return Ok(None);
@@ -15619,11 +16021,30 @@ impl EngineRuntime {
         }
         match keys {
             RuntimeBtreeKeys::UniqueInt64(entries) => {
+                let window = offset.saturating_add(take).min(entries.len());
+                if window == 0 {
+                    return Ok(Some(Vec::new()));
+                }
                 let mut ordered = entries
                     .iter()
                     .map(|(key, row_id)| (*key, *row_id))
                     .collect::<Vec<_>>();
-                ordered.sort_unstable_by_key(|(key, _)| *key);
+                if window < ordered.len() {
+                    if descending {
+                        ordered
+                            .select_nth_unstable_by(window - 1, |left, right| right.0.cmp(&left.0));
+                        ordered.truncate(window);
+                        ordered.sort_unstable_by(|left, right| right.0.cmp(&left.0));
+                    } else {
+                        ordered.select_nth_unstable_by_key(window - 1, |(key, _)| *key);
+                        ordered.truncate(window);
+                        ordered.sort_unstable_by_key(|(key, _)| *key);
+                    }
+                } else if descending {
+                    ordered.sort_unstable_by(|left, right| right.0.cmp(&left.0));
+                } else {
+                    ordered.sort_unstable_by_key(|(key, _)| *key);
+                }
                 Ok(Some(
                     ordered
                         .into_iter()
@@ -15641,6 +16062,11 @@ impl EngineRuntime {
                 ordered.sort_unstable_by_key(|(key, _)| *key);
                 let mut skipped = 0usize;
                 let mut row_ids = Vec::with_capacity(take.min(64));
+                let ordered = if descending {
+                    ordered.into_iter().rev().collect::<Vec<_>>()
+                } else {
+                    ordered
+                };
                 for (_, ids) in ordered {
                     let mut ids = ids.to_vec();
                     ids.sort_unstable();
@@ -17633,6 +18059,15 @@ impl EngineRuntime {
                     )? {
                         return Ok(dataset);
                     }
+                    if let Some(dataset) = self.try_indexed_equi_join_with_right_cte(
+                        &left_dataset,
+                        right,
+                        constraint,
+                        *kind,
+                        ctes,
+                    )? {
+                        return Ok(dataset);
+                    }
                 }
                 let right_dataset = self.evaluate_from_item_with_indexed_prefilter(
                     right,
@@ -18245,6 +18680,128 @@ impl EngineRuntime {
         Ok(Some(Dataset::with_rows(columns, rows)))
     }
 
+    fn try_indexed_equi_join_with_right_cte(
+        &self,
+        left: &Dataset,
+        right_item: &FromItem,
+        constraint: &JoinConstraint,
+        kind: JoinKind,
+        ctes: &BTreeMap<String, Dataset>,
+    ) -> Result<Option<Dataset>> {
+        let _ = self;
+        if !matches!(kind, JoinKind::Inner) {
+            return Ok(None);
+        }
+        let JoinConstraint::On(on) = constraint else {
+            return Ok(None);
+        };
+        let Some(join_equalities) = simple_join_equalities(on) else {
+            return Ok(None);
+        };
+        let FromItem::Table {
+            name: right_name,
+            alias: right_alias,
+        } = right_item
+        else {
+            return Ok(None);
+        };
+        let Some(right_dataset) = ctes.get(right_name) else {
+            return Ok(None);
+        };
+
+        let right_binding = TableBindingRef {
+            name: right_name,
+            alias: right_alias,
+        };
+        let mut left_probe_refs = Vec::with_capacity(join_equalities.len());
+        let mut right_probe_refs = Vec::with_capacity(join_equalities.len());
+        for (left_join_ref, right_join_ref) in join_equalities {
+            let (left_probe_ref, right_probe_ref) =
+                if matches_table_binding(right_binding, right_join_ref.table) {
+                    (left_join_ref, right_join_ref)
+                } else if matches_table_binding(right_binding, left_join_ref.table) {
+                    (right_join_ref, left_join_ref)
+                } else {
+                    return Ok(None);
+                };
+            left_probe_refs.push(left_probe_ref);
+            right_probe_refs.push(right_probe_ref);
+        }
+
+        let mut left_join_indexes = Vec::with_capacity(left_probe_refs.len());
+        for left_probe_ref in &left_probe_refs {
+            let Some(left_join_index) =
+                dataset_column_index(left, left_probe_ref.table, left_probe_ref.column)
+            else {
+                return Ok(None);
+            };
+            left_join_indexes.push(left_join_index);
+        }
+        let mut right_join_indexes = Vec::with_capacity(right_probe_refs.len());
+        let mut right_columns = right_dataset.columns.clone();
+        if let Some(alias) = right_alias {
+            for column in &mut right_columns {
+                column.table = Some(alias.clone());
+            }
+        }
+        for right_join_ref in &right_probe_refs {
+            let right_join_indexes_for_ref = right_columns
+                .iter()
+                .enumerate()
+                .filter(|(_, binding)| {
+                    if !identifiers_equal(&binding.name, right_join_ref.column) {
+                        return false;
+                    }
+                    if let Some(qualifier) = right_join_ref.table {
+                        binding
+                            .table
+                            .as_deref()
+                            .is_some_and(|table| identifiers_equal(table, qualifier))
+                    } else {
+                        !binding.hidden
+                    }
+                })
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            let [right_join_index] = right_join_indexes_for_ref.as_slice() else {
+                return Ok(None);
+            };
+            right_join_indexes.push(*right_join_index);
+        }
+
+        let mut hashed_right_rows: BTreeMap<Vec<u8>, Vec<Vec<Value>>> = BTreeMap::new();
+        for right_row in right_dataset.rows.iter() {
+            let Some(join_key) = simple_join_key_from_indexes(right_row, &right_join_indexes)?
+            else {
+                continue;
+            };
+            hashed_right_rows
+                .entry(join_key)
+                .or_default()
+                .push(right_row.clone());
+        }
+
+        let mut columns = left.columns.clone();
+        columns.extend(right_columns);
+        let right_column_count = columns.len().saturating_sub(left.columns.len());
+
+        let mut rows = Vec::new();
+        for left_row in left.rows.iter() {
+            let Some(join_key) = simple_join_key_from_indexes(left_row, &left_join_indexes)? else {
+                continue;
+            };
+            if let Some(matching_rows) = hashed_right_rows.get(&join_key) {
+                for right_row in matching_rows {
+                    let mut row = Vec::with_capacity(left_row.len() + right_column_count);
+                    row.extend_from_slice(left_row);
+                    row.extend_from_slice(right_row);
+                    rows.push(row);
+                }
+            }
+        }
+        Ok(Some(Dataset::with_rows(columns, rows)))
+    }
+
     fn evaluate_from_item(
         &self,
         item: &FromItem,
@@ -18390,6 +18947,11 @@ impl EngineRuntime {
                 ) {
                     if let Some(dataset) = self.try_indexed_equi_join_with_right_table(
                         &left, right, *kind, constraint, ctes,
+                    )? {
+                        return Ok(dataset);
+                    }
+                    if let Some(dataset) = self.try_indexed_equi_join_with_right_cte(
+                        &left, right, constraint, *kind, ctes,
                     )? {
                         return Ok(dataset);
                     }
@@ -19492,7 +20054,7 @@ struct IndexedJoinLimitTablePlan<'a> {
 struct IndexedJoinLimitStep {
     previous_table_index: usize,
     previous_column_index: usize,
-    right_index_name: String,
+    right_index_name: Option<String>,
 }
 
 struct IndexedJoinLimitProjection {
@@ -26347,12 +26909,21 @@ fn indexed_join_limit_projection_column(
 
 fn indexed_join_limit_rows_for_value(
     source: VisibleTableRowSource<'_>,
-    keys: &RuntimeBtreeKeys,
+    keys: Option<&RuntimeBtreeKeys>,
     value: &Value,
 ) -> Result<Vec<Vec<Value>>> {
     if matches!(value, Value::Null) {
         return Ok(Vec::new());
     }
+    let Some(keys) = keys else {
+        let Value::Int64(row_id) = value else {
+            return Ok(Vec::new());
+        };
+        return Ok(source
+            .row_by_id(*row_id)?
+            .map(|row| vec![row.values().to_vec()])
+            .unwrap_or_default());
+    };
     let row_ids = keys.row_ids_for_value_set(value)?;
     let mut rows = Vec::with_capacity(row_ids.len());
     let mut row_error = None;
@@ -26370,6 +26941,79 @@ fn indexed_join_limit_rows_for_value(
         return Err(error);
     }
     Ok(rows)
+}
+
+fn indexed_join_row_ids_for_value(
+    keys: Option<&RuntimeBtreeKeys>,
+    value: &Value,
+) -> Result<Vec<i64>> {
+    if matches!(value, Value::Null) {
+        return Ok(Vec::new());
+    }
+    let Some(keys) = keys else {
+        return Ok(match value {
+            Value::Int64(row_id) => vec![*row_id],
+            _ => Vec::new(),
+        });
+    };
+    let row_ids = keys.row_ids_for_value_set(value)?;
+    let mut values = Vec::with_capacity(row_ids.len());
+    row_ids.for_each(|row_id| values.push(row_id));
+    Ok(values)
+}
+
+fn sort_join_row_ids_by_column(
+    source: VisibleTableRowSource<'_>,
+    row_ids: Vec<i64>,
+    column_index: usize,
+) -> Result<Vec<i64>> {
+    let mut keyed = Vec::with_capacity(row_ids.len());
+    for row_id in row_ids {
+        let Some(row) = source.row_by_id(row_id)? else {
+            continue;
+        };
+        let Some(value) = row.values().get(column_index) else {
+            return Err(DbError::internal(
+                "indexed join order row is shorter than schema",
+            ));
+        };
+        keyed.push((row_id, value.clone()));
+    }
+    let mut sort_error = None;
+    keyed.sort_by(|(_, left), (_, right)| match compare_values(left, right) {
+        Ok(ordering) => ordering,
+        Err(error) => {
+            if sort_error.is_none() {
+                sort_error = Some(error);
+            }
+            std::cmp::Ordering::Equal
+        }
+    });
+    if let Some(error) = sort_error {
+        return Err(error);
+    }
+    Ok(keyed.into_iter().map(|(row_id, _)| row_id).collect())
+}
+
+fn project_indexed_join_row(
+    current_rows: &[&[Value]],
+    projections: &[IndexedJoinLimitProjection],
+) -> Result<QueryRow> {
+    let mut output = Vec::with_capacity(projections.len());
+    for projection in projections {
+        let Some(row) = current_rows.get(projection.table_index) else {
+            return Err(DbError::internal(
+                "indexed join projection table index is out of range",
+            ));
+        };
+        let Some(value) = row.get(projection.column_index) else {
+            return Err(DbError::internal(
+                "indexed join projection row is shorter than schema",
+            ));
+        };
+        output.push(value.clone());
+    }
+    Ok(QueryRow::new(output))
 }
 
 fn push_indexed_join_limit_projection(
@@ -26891,6 +27535,7 @@ fn try_persistent_pk_ordered_projection_result<S: PageStore>(
     column_names: Vec<String>,
     limit: Option<usize>,
     offset: usize,
+    descending: bool,
 ) -> Result<Option<QueryResult>> {
     let Some(pk_index_root) = table_schema.pk_index_root else {
         return Ok(None);
@@ -26900,10 +27545,18 @@ fn try_persistent_pk_ordered_projection_result<S: PageStore>(
         return Ok(Some(QueryResult::with_rows(column_names, Vec::new())));
     }
 
-    let mut cursor = BtreeCursor::from_start(store, Some(pk_index_root))?;
+    let mut cursor = if descending {
+        BtreeCursor::from_end(store, Some(pk_index_root))?
+    } else {
+        BtreeCursor::from_start(store, Some(pk_index_root))?
+    };
     let mut skipped = 0usize;
     let mut rows = Vec::with_capacity(take.min(64));
-    while let Some((_, payload)) = cursor.next()? {
+    while let Some((_, payload)) = if descending {
+        cursor.prev()?
+    } else {
+        cursor.next()?
+    } {
         if skipped < offset {
             skipped += 1;
             continue;
