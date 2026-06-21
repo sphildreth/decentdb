@@ -178,8 +178,8 @@ ddb_status_t ddb_db_open(const char *path, ddb_db_t **out_db);
 ddb_status_t ddb_db_open_or_create(const char *path, ddb_db_t **out_db);
 /*
  * Option-aware open variants. `options` is a UTF-8 key=value list separated
- * by whitespace, commas, or semicolons. Supported keys include cache_size,
- * retain_paged_row_sources_after_commit, paged_row_storage,
+ * by whitespace, commas, or semicolons. Supported keys include profile,
+ * cache_size, retain_paged_row_sources_after_commit, paged_row_storage,
  * persistent_pk_index, wal_autocheckpoint, wal_checkpoint_threshold_pages,
  * wal_checkpoint_threshold_bytes, process_coordination,
  * process_coordination_timeout_ms, write_queue_enabled, write_queue_capacity,

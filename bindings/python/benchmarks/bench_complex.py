@@ -13,6 +13,21 @@ Workloads:
 - Update: Row update operations.
 - Delete: Row delete operations.
 - Full Table Scan: Full table scan without filters.
+- MovieDB Bulk Load: Movie, People, Roles, Reviews, Tags, MovieTags, Watchlist.
+- MovieDB Point Reads: 1,000 UUID primary-key reads.
+- MovieDB Relational Queries: top-rated-by-year, tag search, busiest people,
+  watchlist with LEFT JOIN aggregate.
+- MovieDB Mutations: 1k box-office update batch and 10 movie ON DELETE CASCADE
+  batch deletes.
+- MovieDB Maintenance: checkpoint, checkpoint-after-mutations, compact/vacuum,
+  and final file size.
+- Showdown Bulk Load: Integer-key movie schema from the second .NET showdown
+  harness, including people, movies, genres, roles, reviews, keywords, and
+  bridge tables.
+- Showdown Query Matrix: full/range scans, pagination, 3-table joins,
+  COUNT DISTINCT, GROUP BY, window functions, recursive and multi-CTE queries,
+  substring search, fulltext BM25, UNION, RETURNING, UPSERT, bulk updates, and
+  bulk deletes.
 
 This benchmark is designed to predict performance across all metrics tested in the
 python_embedded_compare framework. If DecentDB leads in all these metrics, it is
@@ -28,11 +43,13 @@ enough for local comparison runs.
 """
 
 import argparse
+import datetime as _dt
 import gc
 import os
 import random
 import sqlite3
 import time
+import uuid
 
 import decentdb
 from decentdb.native import load_library as load_decentdb_library
@@ -40,6 +57,78 @@ from decentdb.native import load_library as load_decentdb_library
 DEFAULT_USERS = 1000
 DEFAULT_ITEMS = 50
 DEFAULT_ORDERS = 100
+
+DEFAULT_MOVIES = 2_000
+DEFAULT_PEOPLE = 1_000
+DEFAULT_ROLES = 10_000
+DEFAULT_REVIEWS = 20_000
+DEFAULT_TAGS = 100
+DEFAULT_MOVIE_TAGS = 6_000
+DEFAULT_WATCHLIST = 4_000
+DEFAULT_MOVIE_POINT_READS = 1_000
+DEFAULT_MOVIE_UPDATE_COUNT = 1_000
+DEFAULT_MOVIE_DELETE_COUNT = 10
+
+SCRATCH_MOVIES = 50_000
+SCRATCH_PEOPLE = 25_000
+SCRATCH_ROLES = 250_000
+SCRATCH_REVIEWS = 500_000
+SCRATCH_TAGS = 500
+SCRATCH_MOVIE_TAGS = 150_000
+SCRATCH_WATCHLIST = 100_000
+
+DEFAULT_SHOWDOWN_MOVIES = 700
+DEFAULT_SHOWDOWN_PEOPLE_MULT = 3
+DEFAULT_SHOWDOWN_REVIEWS_PER_MOVIE = 8
+DEFAULT_SHOWDOWN_POINT_READS = 1_000
+
+GLM52_SHOWDOWN_MOVIES = 20_000
+
+DECENTDB_EMBEDDED_FAST_OPTIONS = (
+    "cache_size=64MB;"
+    "retain_paged_row_sources_after_commit=true;"
+    "paged_row_storage=false;"
+    "wal_autocheckpoint=0;"
+    "process_coordination=single_process_unsafe"
+)
+
+MOVIE_FIRST_NAMES = [
+    "Emma", "Liam", "Olivia", "Noah", "Ava", "Ethan", "Sophia", "Mason",
+    "Isabella", "William", "Mia", "James", "Charlotte", "Benjamin",
+    "Amelia", "Lucas", "Harper", "Henry", "Evelyn", "Alexander",
+    "Abigail", "Michael", "Ella", "Daniel", "Scarlett", "Jackson",
+    "Grace", "Sebastian", "Chloe", "Aiden",
+]
+
+MOVIE_LAST_NAMES = [
+    "Smith", "Johnson", "Williams", "Brown", "Jones", "Garcia", "Miller",
+    "Davis", "Rodriguez", "Martinez", "Hernandez", "Lopez", "Gonzalez",
+    "Wilson", "Anderson", "Thomas", "Taylor", "Moore", "Jackson", "Martin",
+    "Lee", "Perez", "Thompson", "White", "Harris", "Sanchez", "Clark",
+    "Ramirez", "Lewis", "Robinson",
+]
+
+MOVIE_ADJECTIVES = [
+    "Dark", "Lost", "Hidden", "Silent", "Last", "Eternal", "Broken",
+    "Golden", "Forbidden", "Invisible", "Midnight", "Secret", "Frozen",
+    "Burning", "Shadow", "Rising", "Fallen", "Endless", "Wicked", "Brave",
+]
+
+MOVIE_NOUNS = [
+    "King", "Queen", "Knight", "Empire", "Garden", "City", "Dream", "Storm",
+    "Echo", "Horizon", "Legend", "Voyage", "Promise", "Memory",
+    "Reflection", "Odyssey", "Kingdom", "Whisper", "Destiny", "Chronicle",
+]
+
+MOVIE_TAG_NAMES = [
+    "Action", "Drama", "Comedy", "Sci-Fi", "Horror", "Thriller", "Romance",
+    "Mystery", "Adventure", "Fantasy", "Crime", "Documentary", "Animation",
+    "War", "Western", "Musical", "Biography", "Family", "Film-Noir",
+    "Sport", "Superhero", "Time Travel", "Space", "Heist", "Revenge",
+    "Survival", "Psychological", "Coming of Age", "Dystopian", "Noir",
+]
+
+MOVIE_RATINGS = ["G", "PG", "PG-13", "R", "NC-17"]
 
 
 def remove_if_exists(path):
@@ -166,40 +255,47 @@ def _cleanup_db_files(db_path):
             pass
 
 
-def _cleanup_db_files(db_path):
+def storage_size_bytes(db_path):
+    total = 0
     for suffix in ("", ".wal", "-wal", ".shm", "-shm"):
-        try:
-            os.unlink(db_path + suffix)
-        except OSError:
-            pass
+        path = db_path + suffix
+        if os.path.exists(path):
+            total += os.path.getsize(path)
+    return total
 
 
-def setup_decentdb(db_path):
+def setup_decentdb(db_path, *, options="", stmt_cache_size=128, initialize_complex=True):
     _cleanup_db_files(db_path)
-    conn = decentdb.connect(db_path)
-    setup_schema(conn, "decentdb")
+    conn = decentdb.connect(db_path, options=options, stmt_cache_size=stmt_cache_size)
+    if initialize_complex:
+        setup_schema(conn, "decentdb")
     return conn
 
 
-def setup_sqlite(db_path):
+def setup_sqlite(
+    db_path,
+    *,
+    profile="wal_full",
+    cache_mb=64,
+    initialize_complex=True,
+):
     _cleanup_db_files(db_path)
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
-    cur.execute("PRAGMA journal_mode=WAL")
-    cur.execute("PRAGMA synchronous=FULL")
-    cur.execute("PRAGMA wal_autocheckpoint=0")
-    setup_schema(conn, "sqlite")
-    return conn
-
-
-def setup_sqlite(db_path):
-    _cleanup_db_files(db_path)
-    conn = sqlite3.connect(db_path)
-    cur = conn.cursor()
-    cur.execute("PRAGMA journal_mode=WAL")
-    cur.execute("PRAGMA synchronous=FULL")
-    cur.execute("PRAGMA wal_autocheckpoint=0")
-    setup_schema(conn, "sqlite")
+    if profile in ("wal_full", "wal_normal"):
+        cur.execute("PRAGMA journal_mode=WAL")
+        cur.execute("PRAGMA synchronous=FULL" if profile == "wal_full" else "PRAGMA synchronous=NORMAL")
+        cur.execute("PRAGMA wal_autocheckpoint=0")
+    elif profile == "delete_full":
+        cur.execute("PRAGMA journal_mode=DELETE")
+        cur.execute("PRAGMA synchronous=FULL")
+    else:
+        raise ValueError(f"unknown SQLite profile: {profile}")
+    cur.execute("PRAGMA temp_store=MEMORY")
+    cur.execute(f"PRAGMA cache_size=-{cache_mb * 1000}")
+    cur.execute("PRAGMA foreign_keys=ON")
+    if initialize_complex:
+        setup_schema(conn, "sqlite")
     return conn
 
 
@@ -265,6 +361,10 @@ def run_engine_benchmark(
     table_scans,
     seed,
     keep_db,
+    decentdb_options,
+    decentdb_stmt_cache_size,
+    sqlite_profile,
+    sqlite_cache_mb,
 ):
     cleanup_db_files(db_path)
     print(f"\n=== {engine_name} ===")
@@ -281,9 +381,22 @@ def run_engine_benchmark(
         lib = load_decentdb_library()
         lib_path = getattr(lib, "_name", "<unknown>")
         print(f"DecentDB native library: {lib_path}")
-        conn = setup_decentdb(db_path)
+        print(
+            "DecentDB options: "
+            f"{decentdb_options or '<default>'}; stmt_cache_size={decentdb_stmt_cache_size}"
+        )
+        conn = setup_decentdb(
+            db_path,
+            options=decentdb_options,
+            stmt_cache_size=decentdb_stmt_cache_size,
+        )
     elif engine_name == "sqlite":
-        conn = setup_sqlite(db_path)
+        print(f"SQLite profile: {sqlite_profile}; cache_mb={sqlite_cache_mb}")
+        conn = setup_sqlite(
+            db_path,
+            profile=sqlite_profile,
+            cache_mb=sqlite_cache_mb,
+        )
     else:
         raise ValueError(f"Unknown engine: {engine_name}")
 
@@ -644,6 +757,652 @@ def run_engine_benchmark(
     }
 
 
+def _movie_table_suffix(engine_name):
+    return " WITHOUT ROWID" if engine_name == "sqlite" else ""
+
+
+def _movie_id_type(engine_name):
+    return "BLOB" if engine_name == "sqlite" else "UUID"
+
+
+def _movie_float_type(engine_name):
+    return "REAL" if engine_name == "sqlite" else "FLOAT64"
+
+
+def _movie_id_value(engine_name, value):
+    return value.bytes if engine_name == "sqlite" else value
+
+
+def _movie_uuid_expr(engine_name):
+    return "?" if engine_name == "sqlite" else "CAST(? AS UUID)"
+
+
+def _movie_convert_row(engine_name, row, uuid_indexes):
+    return tuple(
+        _movie_id_value(engine_name, value) if index in uuid_indexes else value
+        for index, value in enumerate(row)
+    )
+
+
+def _movie_convert_rows(engine_name, rows, uuid_indexes):
+    return [_movie_convert_row(engine_name, row, uuid_indexes) for row in rows]
+
+
+def _execute_script_statements(conn, sql):
+    cur = conn.cursor()
+    for statement in sql.split(";"):
+        statement = statement.strip()
+        if statement:
+            cur.execute(statement)
+
+
+def setup_movie_schema(conn, engine_name):
+    id_type = _movie_id_type(engine_name)
+    float_type = _movie_float_type(engine_name)
+    suffix = _movie_table_suffix(engine_name)
+    ddl = f"""
+        CREATE TABLE IF NOT EXISTS Movies (
+            Id {id_type} PRIMARY KEY,
+            Title TEXT NOT NULL,
+            ReleaseYear INTEGER NOT NULL,
+            Synopsis TEXT,
+            BudgetUsd {float_type} NOT NULL,
+            BoxOfficeUsd {float_type},
+            MpaaRating TEXT NOT NULL,
+            RuntimeMinutes INTEGER NOT NULL,
+            AddedAt TEXT NOT NULL
+        ){suffix};
+
+        CREATE TABLE IF NOT EXISTS People (
+            Id {id_type} PRIMARY KEY,
+            FullName TEXT NOT NULL,
+            BirthDate TEXT,
+            Biography TEXT
+        ){suffix};
+
+        CREATE TABLE IF NOT EXISTS Roles (
+            Id {id_type} PRIMARY KEY,
+            MovieId {id_type} NOT NULL REFERENCES Movies(Id) ON DELETE CASCADE,
+            PersonId {id_type} NOT NULL REFERENCES People(Id) ON DELETE CASCADE,
+            CharacterName TEXT NOT NULL,
+            BillingOrder INTEGER NOT NULL,
+            IsLead INTEGER NOT NULL
+        ){suffix};
+        CREATE INDEX IF NOT EXISTS ix_roles_movie ON Roles(MovieId);
+        CREATE INDEX IF NOT EXISTS ix_roles_person ON Roles(PersonId);
+
+        CREATE TABLE IF NOT EXISTS Reviews (
+            Id {id_type} PRIMARY KEY,
+            MovieId {id_type} NOT NULL REFERENCES Movies(Id) ON DELETE CASCADE,
+            ReviewerHandle TEXT NOT NULL,
+            Score INTEGER NOT NULL,
+            Text TEXT,
+            ReviewedAt TEXT NOT NULL,
+            Verified INTEGER NOT NULL
+        ){suffix};
+        CREATE INDEX IF NOT EXISTS ix_reviews_movie ON Reviews(MovieId);
+        CREATE INDEX IF NOT EXISTS ix_reviews_handle ON Reviews(ReviewerHandle);
+
+        CREATE TABLE IF NOT EXISTS Tags (
+            Id {id_type} PRIMARY KEY,
+            Name TEXT NOT NULL UNIQUE
+        ){suffix};
+
+        CREATE TABLE IF NOT EXISTS MovieTags (
+            MovieId {id_type} NOT NULL REFERENCES Movies(Id) ON DELETE CASCADE,
+            TagId {id_type} NOT NULL REFERENCES Tags(Id) ON DELETE CASCADE,
+            PRIMARY KEY (MovieId, TagId)
+        ){suffix};
+        CREATE INDEX IF NOT EXISTS ix_movietags_tag ON MovieTags(TagId);
+
+        CREATE TABLE IF NOT EXISTS Watchlist (
+            Id {id_type} PRIMARY KEY,
+            UserHandle TEXT NOT NULL,
+            MovieId {id_type} NOT NULL REFERENCES Movies(Id) ON DELETE CASCADE,
+            Priority INTEGER NOT NULL,
+            AddedAt TEXT NOT NULL
+        ){suffix};
+        CREATE INDEX IF NOT EXISTS ix_watchlist_user ON Watchlist(UserHandle);
+    """
+    if engine_name == "sqlite":
+        conn.execute("PRAGMA foreign_keys=ON")
+    _execute_script_statements(conn, ddl)
+
+
+def _movie_uuid(rng):
+    return uuid.UUID(int=rng.getrandbits(128))
+
+
+def _movie_iso_datetime(year, minute_offset):
+    return (_dt.datetime(year, 1, 1) + _dt.timedelta(minutes=minute_offset)).isoformat()
+
+
+def _movie_date(year, month, day):
+    return _dt.date(year, month, day).isoformat()
+
+
+def _movie_synopsis(rng):
+    phrases = [
+        f"{rng.choice(MOVIE_ADJECTIVES).lower()} {rng.choice(MOVIE_NOUNS).lower()}"
+        for _ in range(3 + rng.randrange(5))
+    ]
+    return f"A tale of {', '.join(phrases)}."
+
+
+def _movie_review_text(rng):
+    words = [rng.choice(MOVIE_ADJECTIVES).lower() for _ in range(10 + rng.randrange(50))]
+    return " ".join(words) + "."
+
+
+def _movie_bio(rng):
+    parts = [
+        f"{rng.choice(MOVIE_ADJECTIVES)} performer from {rng.choice(MOVIE_NOUNS)}."
+        for _ in range(2 + rng.randrange(3))
+    ]
+    return " ".join(parts)
+
+
+def generate_movie_data(
+    movies_count,
+    people_count,
+    roles_count,
+    reviews_count,
+    tags_count,
+    movie_tags_count,
+    watchlist_count,
+    seed,
+):
+    rng = random.Random(seed)
+    tags = []
+    for i in range(tags_count):
+        suffix = f"-{i // len(MOVIE_TAG_NAMES) + 1}" if i >= len(MOVIE_TAG_NAMES) else ""
+        tags.append((_movie_uuid(rng), MOVIE_TAG_NAMES[i % len(MOVIE_TAG_NAMES)] + suffix))
+
+    people = []
+    for _ in range(people_count):
+        birth = (
+            _movie_date(1950 + rng.randrange(50), 1 + rng.randrange(12), 1 + rng.randrange(27))
+            if rng.random() < 0.9
+            else None
+        )
+        people.append(
+            (
+                _movie_uuid(rng),
+                f"{rng.choice(MOVIE_FIRST_NAMES)} {rng.choice(MOVIE_LAST_NAMES)}",
+                birth,
+                _movie_bio(rng) if rng.random() < 0.5 else None,
+            )
+        )
+
+    movies = []
+    for i in range(movies_count):
+        movies.append(
+            (
+                _movie_uuid(rng),
+                f"{rng.choice(MOVIE_ADJECTIVES)} {rng.choice(MOVIE_NOUNS)} {i + 1:05d}",
+                1980 + rng.randrange(45),
+                _movie_synopsis(rng),
+                1_000_000 + rng.random() * 199_000_000,
+                None if rng.random() < 0.2 else 500_000 + rng.random() * 990_000_000,
+                rng.choice(MOVIE_RATINGS),
+                75 + rng.randrange(90),
+                _movie_iso_datetime(2020, rng.randrange(2_000_000)),
+            )
+        )
+
+    roles = []
+    if movies and people:
+        for i in range(roles_count):
+            movie = movies[i % len(movies)]
+            person = people[rng.randrange(len(people))]
+            billing_order = 1 + (i % 20)
+            roles.append(
+                (
+                    _movie_uuid(rng),
+                    movie[0],
+                    person[0],
+                    f"{rng.choice(MOVIE_ADJECTIVES)} {rng.choice(MOVIE_NOUNS)}",
+                    billing_order,
+                    1 if billing_order <= 3 else 0,
+                )
+            )
+
+    reviewer_handles = [f"user{i:05d}" for i in range(20_000)]
+    reviews = []
+    if movies:
+        for _ in range(reviews_count):
+            movie = movies[rng.randrange(len(movies))]
+            reviews.append(
+                (
+                    _movie_uuid(rng),
+                    movie[0],
+                    rng.choice(reviewer_handles),
+                    1 + rng.randrange(10),
+                    _movie_review_text(rng) if rng.random() < 0.7 else None,
+                    _movie_iso_datetime(2021, rng.randrange(2_000_000)),
+                    1 if rng.random() < 0.15 else 0,
+                )
+            )
+
+    movie_tags = []
+    seen_movie_tags = set()
+    if movies and tags:
+        target = min(movie_tags_count, len(movies) * len(tags))
+        attempts = 0
+        while len(movie_tags) < target and attempts < target * 20 + 100:
+            attempts += 1
+            movie = movies[rng.randrange(len(movies))]
+            tag = tags[rng.randrange(len(tags))]
+            key = (movie[0], tag[0])
+            if key in seen_movie_tags:
+                continue
+            seen_movie_tags.add(key)
+            movie_tags.append(key)
+
+        first_tag = tags[0][0]
+        if not any(tag_id == first_tag for _, tag_id in movie_tags):
+            movie_tags.append((movies[0][0], first_tag))
+
+    watchlist_users = [f"watcher{i:04d}" for i in range(5_000)]
+    watchlist = []
+    seen_watchlist = set()
+    if movies:
+        target = min(watchlist_count, len(movies) * len(watchlist_users))
+        attempts = 0
+        while len(watchlist) < target and attempts < target * 20 + 100:
+            attempts += 1
+            movie = movies[rng.randrange(len(movies))]
+            user = rng.choice(watchlist_users)
+            key = (user, movie[0])
+            if key in seen_watchlist:
+                continue
+            seen_watchlist.add(key)
+            watchlist.append(
+                (
+                    _movie_uuid(rng),
+                    user,
+                    movie[0],
+                    1 + rng.randrange(5),
+                    _movie_iso_datetime(2023, rng.randrange(1_000_000)),
+                )
+            )
+
+    return {
+        "movies": movies,
+        "people": people,
+        "roles": roles,
+        "reviews": reviews,
+        "tags": tags,
+        "movie_tags": movie_tags,
+        "watchlist": watchlist,
+    }
+
+
+def movie_total_rows(data):
+    return sum(len(rows) for rows in data.values())
+
+
+def _time_movie_operation(engine_name, label, rows, fn):
+    gc.collect()
+    gc_wait = getattr(gc, "wait_for_pending_finalizers", None)
+    if gc_wait:
+        gc_wait()
+    started = time.perf_counter()
+    result = fn()
+    elapsed = time.perf_counter() - started
+    rows_per_sec = rows / elapsed if rows and elapsed > 0 else 0.0
+    if rows:
+        print(f"  {label:<38} {elapsed:12.6f}s  ({rows:,} rows, {rows_per_sec:,.0f} rows/s)")
+    else:
+        print(f"  {label:<38} {elapsed:12.6f}s")
+    return elapsed, result
+
+
+def _movie_fetch_count(cur, sql, params=()):
+    cur.execute(sql, params)
+    rows = cur.fetchall()
+    return len(rows)
+
+
+def _movie_checkpoint(conn, engine_name):
+    if engine_name == "sqlite":
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    else:
+        conn.checkpoint()
+
+
+def _movie_vacuum(conn, engine_name, db_path):
+    if engine_name == "sqlite":
+        conn.execute("VACUUM")
+    else:
+        dest = db_path + ".vacuumed"
+        remove_if_exists(dest)
+        conn.save_as(dest)
+
+
+def _movie_insert_all(cur, engine_name, data):
+    uid = _movie_uuid_expr(engine_name)
+    cur.execute("BEGIN")
+    try:
+        cur.executemany(
+            f"INSERT INTO Movies (Id, Title, ReleaseYear, Synopsis, BudgetUsd, BoxOfficeUsd, MpaaRating, RuntimeMinutes, AddedAt) VALUES ({uid}, ?, ?, ?, ?, ?, ?, ?, ?)",
+            _movie_convert_rows(engine_name, data["movies"], {0}),
+        )
+        cur.executemany(
+            f"INSERT INTO People (Id, FullName, BirthDate, Biography) VALUES ({uid}, ?, ?, ?)",
+            _movie_convert_rows(engine_name, data["people"], {0}),
+        )
+        cur.executemany(
+            f"INSERT INTO Roles (Id, MovieId, PersonId, CharacterName, BillingOrder, IsLead) VALUES ({uid}, {uid}, {uid}, ?, ?, ?)",
+            _movie_convert_rows(engine_name, data["roles"], {0, 1, 2}),
+        )
+        cur.executemany(
+            f"INSERT INTO Reviews (Id, MovieId, ReviewerHandle, Score, Text, ReviewedAt, Verified) VALUES ({uid}, {uid}, ?, ?, ?, ?, ?)",
+            _movie_convert_rows(engine_name, data["reviews"], {0, 1}),
+        )
+        cur.executemany(
+            f"INSERT INTO Tags (Id, Name) VALUES ({uid}, ?)",
+            _movie_convert_rows(engine_name, data["tags"], {0}),
+        )
+        cur.executemany(
+            f"INSERT INTO MovieTags (MovieId, TagId) VALUES ({uid}, {uid})",
+            _movie_convert_rows(engine_name, data["movie_tags"], {0, 1}),
+        )
+        cur.executemany(
+            f"INSERT INTO Watchlist (Id, UserHandle, MovieId, Priority, AddedAt) VALUES ({uid}, ?, {uid}, ?, ?)",
+            _movie_convert_rows(engine_name, data["watchlist"], {0, 2}),
+        )
+        cur.execute("COMMIT")
+    except Exception:
+        cur.execute("ROLLBACK")
+        raise
+
+
+def run_movie_benchmark(
+    engine_name,
+    db_path,
+    data,
+    *,
+    point_reads,
+    update_count,
+    delete_count,
+    keep_db,
+    decentdb_options,
+    decentdb_stmt_cache_size,
+    sqlite_profile,
+    sqlite_cache_mb,
+):
+    cleanup_db_files(db_path)
+    remove_if_exists(db_path + ".vacuumed")
+    print(f"\n=== {engine_name} MovieDB ===")
+
+    if engine_name == "decentdb":
+        lib = load_decentdb_library()
+        lib_path = getattr(lib, "_name", "<unknown>")
+        print(f"DecentDB native library: {lib_path}")
+        print(
+            "DecentDB options: "
+            f"{decentdb_options or '<default>'}; stmt_cache_size={decentdb_stmt_cache_size}"
+        )
+        conn = setup_decentdb(
+            db_path,
+            options=decentdb_options,
+            stmt_cache_size=decentdb_stmt_cache_size,
+            initialize_complex=False,
+        )
+    elif engine_name == "sqlite":
+        print(f"SQLite profile: {sqlite_profile}; cache_mb={sqlite_cache_mb}")
+        conn = setup_sqlite(
+            db_path,
+            profile=sqlite_profile,
+            cache_mb=sqlite_cache_mb,
+            initialize_complex=False,
+        )
+        conn.execute("PRAGMA mmap_size=268435456")
+    else:
+        raise ValueError(f"Unknown engine: {engine_name}")
+
+    print("Initializing MovieDB schema...")
+    setup_movie_schema(conn, engine_name)
+    cur = conn.cursor()
+    results = {}
+    counts = {}
+
+    total_rows = movie_total_rows(data)
+    duration, _ = _time_movie_operation(
+        engine_name,
+        "MovieDB bulk load",
+        total_rows,
+        lambda: _movie_insert_all(cur, engine_name, data),
+    )
+    results["movie_bulk_load_s"] = duration
+    results["movie_bulk_load_rps"] = total_rows / duration if duration else 0.0
+
+    duration, _ = _time_movie_operation(
+        engine_name, "MovieDB checkpoint", 0, lambda: _movie_checkpoint(conn, engine_name)
+    )
+    results["movie_checkpoint_s"] = duration
+
+    cur.execute("SELECT COUNT(*) FROM Movies")
+    counts["movies_before"] = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM Reviews")
+    counts["reviews_before"] = cur.fetchone()[0]
+    print(
+        f"  Loaded {counts['movies_before']:,} movies / "
+        f"{counts['reviews_before']:,} reviews"
+    )
+
+    movies = data["movies"]
+    tags = data["tags"]
+    watchlist = data["watchlist"]
+    if not movies:
+        raise ValueError("Movie benchmark requires at least one movie")
+    if not tags:
+        raise ValueError("Movie benchmark requires at least one tag")
+    if not watchlist:
+        raise ValueError("Movie benchmark requires at least one watchlist entry")
+
+    point_ids = [row[0] for row in movies[: min(point_reads, len(movies))]]
+    point_sql = (
+        "SELECT Id, Title, ReleaseYear, Synopsis, BudgetUsd, BoxOfficeUsd, "
+        f"MpaaRating, RuntimeMinutes, AddedAt FROM Movies WHERE Id = {_movie_uuid_expr(engine_name)}"
+    )
+    cur.execute(point_sql, (_movie_id_value(engine_name, point_ids[0]),))
+    cur.fetchall()
+
+    def run_point_reads():
+        for movie_id in point_ids:
+            cur.execute(point_sql, (_movie_id_value(engine_name, movie_id),))
+            cur.fetchall()
+
+    duration, _ = _time_movie_operation(
+        engine_name,
+        "MovieDB point reads by UUID",
+        len(point_ids),
+        run_point_reads,
+    )
+    results["movie_point_reads_s"] = duration
+
+    year_counts = {}
+    for movie in movies:
+        year_counts[movie[2]] = year_counts.get(movie[2], 0) + 1
+    sample_year = max(year_counts, key=year_counts.get)
+    sample_tag = tags[0][1]
+    sample_user = watchlist[0][1]
+
+    top_rated_sql = """
+        SELECT m.Id, m.Title, m.ReleaseYear, m.Synopsis, m.BudgetUsd,
+               m.BoxOfficeUsd, m.MpaaRating, m.RuntimeMinutes, m.AddedAt,
+               AVG(r.Score) as AvgScore, COUNT(r.Id) as ReviewCount
+        FROM Movies m
+        JOIN Reviews r ON r.MovieId = m.Id
+        WHERE m.ReleaseYear = ?
+        GROUP BY m.Id
+        HAVING COUNT(r.Id) >= ?
+        ORDER BY AvgScore DESC, m.Title
+        LIMIT ?
+    """
+    top_params = (sample_year, 20, 25)
+    _movie_fetch_count(cur, top_rated_sql, top_params)
+    duration, rows = _time_movie_operation(
+        engine_name,
+        "MovieDB top-rated by year",
+        0,
+        lambda: _movie_fetch_count(cur, top_rated_sql, top_params),
+    )
+    results["movie_top_rated_s"] = duration
+    counts["top_rated_rows"] = rows
+
+    tag_sql = """
+        SELECT m.Id, m.Title, m.ReleaseYear, m.Synopsis, m.BudgetUsd,
+               m.BoxOfficeUsd, m.MpaaRating, m.RuntimeMinutes, m.AddedAt
+        FROM Movies m
+        JOIN MovieTags mt ON mt.MovieId = m.Id
+        JOIN Tags t ON t.Id = mt.TagId
+        WHERE t.Name = ?
+        ORDER BY m.ReleaseYear DESC
+        LIMIT ?
+    """
+    tag_params = (sample_tag, 50)
+    _movie_fetch_count(cur, tag_sql, tag_params)
+    duration, rows = _time_movie_operation(
+        engine_name,
+        "MovieDB search movies by tag",
+        0,
+        lambda: _movie_fetch_count(cur, tag_sql, tag_params),
+    )
+    results["movie_tag_search_s"] = duration
+    counts["tag_search_rows"] = rows
+
+    busiest_sql = """
+        SELECT p.Id, p.FullName, p.BirthDate, p.Biography, COUNT(r.Id) as RoleCount
+        FROM People p
+        JOIN Roles r ON r.PersonId = p.Id
+        GROUP BY p.Id
+        ORDER BY RoleCount DESC
+        LIMIT ?
+    """
+    busiest_params = (20,)
+    _movie_fetch_count(cur, busiest_sql, busiest_params)
+    duration, rows = _time_movie_operation(
+        engine_name,
+        "MovieDB busiest people",
+        0,
+        lambda: _movie_fetch_count(cur, busiest_sql, busiest_params),
+    )
+    results["movie_busiest_people_s"] = duration
+    counts["busiest_people_rows"] = rows
+
+    watchlist_sql = """
+        SELECT m.Id, m.Title, w.Priority, AVG(r.Score) as Avg
+        FROM Watchlist w
+        JOIN Movies m ON m.Id = w.MovieId
+        LEFT JOIN Reviews r ON r.MovieId = m.Id
+        WHERE w.UserHandle = ?
+        GROUP BY m.Id
+        ORDER BY w.Priority DESC, Avg DESC NULLS LAST
+        LIMIT ?
+    """
+    watchlist_params = (sample_user, 20)
+    _movie_fetch_count(cur, watchlist_sql, watchlist_params)
+    duration, rows = _time_movie_operation(
+        engine_name,
+        "MovieDB watchlist query",
+        0,
+        lambda: _movie_fetch_count(cur, watchlist_sql, watchlist_params),
+    )
+    results["movie_watchlist_s"] = duration
+    counts["watchlist_rows"] = rows
+
+    update_ids = [row[0] for row in movies[: min(update_count, len(movies))]]
+    update_sql = f"UPDATE Movies SET BoxOfficeUsd = ? WHERE Id = {_movie_uuid_expr(engine_name)}"
+
+    def run_updates():
+        cur.execute("BEGIN")
+        try:
+            for movie_id in update_ids:
+                cur.execute(
+                    update_sql,
+                    (123_456_789.0, _movie_id_value(engine_name, movie_id)),
+                )
+            cur.execute("COMMIT")
+        except Exception:
+            cur.execute("ROLLBACK")
+            raise
+
+    duration, _ = _time_movie_operation(
+        engine_name,
+        "MovieDB update box-office batch",
+        len(update_ids),
+        run_updates,
+    )
+    results["movie_update_batch_s"] = duration
+
+    delete_start = min(len(update_ids), len(movies))
+    delete_ids = [
+        row[0]
+        for row in movies[delete_start : delete_start + min(delete_count, len(movies) - delete_start)]
+    ]
+    delete_sql = f"DELETE FROM Movies WHERE Id = {_movie_uuid_expr(engine_name)}"
+
+    def run_deletes():
+        cur.execute("BEGIN")
+        try:
+            for movie_id in delete_ids:
+                cur.execute(delete_sql, (_movie_id_value(engine_name, movie_id),))
+            cur.execute("COMMIT")
+        except Exception:
+            cur.execute("ROLLBACK")
+            raise
+
+    duration, _ = _time_movie_operation(
+        engine_name,
+        "MovieDB delete movies cascade",
+        len(delete_ids),
+        run_deletes,
+    )
+    results["movie_delete_cascade_s"] = duration
+
+    duration, _ = _time_movie_operation(
+        engine_name,
+        "MovieDB checkpoint after mutations",
+        0,
+        lambda: _movie_checkpoint(conn, engine_name),
+    )
+    results["movie_checkpoint_after_mutations_s"] = duration
+
+    duration, _ = _time_movie_operation(
+        engine_name,
+        "MovieDB vacuum/compact",
+        0,
+        lambda: _movie_vacuum(conn, engine_name, db_path),
+    )
+    results["movie_vacuum_s"] = duration
+
+    cur.execute("SELECT COUNT(*) FROM Movies")
+    counts["movies_after"] = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM Reviews")
+    counts["reviews_after"] = cur.fetchone()[0]
+    print(
+        f"  Final counts: {counts['movies_after']:,} movies / "
+        f"{counts['reviews_after']:,} reviews"
+    )
+
+    conn.close()
+    results["movie_final_file_size_bytes"] = os.path.getsize(db_path) if os.path.exists(db_path) else 0
+    print(
+        f"  Final file size: {results['movie_final_file_size_bytes']:,} bytes "
+        f"({results['movie_final_file_size_bytes'] / (1024.0 * 1024.0):.2f} MiB)"
+    )
+
+    if not keep_db:
+        cleanup_db_files(db_path)
+        remove_if_exists(db_path + ".vacuumed")
+
+    results.update(counts)
+    return results
+
+
 def print_comparison(results, *, tie_threshold=0.0):
     if "decentdb" not in results or "sqlite" not in results:
         return
@@ -876,9 +1635,1341 @@ def print_comparison(results, *, tie_threshold=0.0):
             print(f"- {line}")
 
 
+def print_movie_comparison(results, *, tie_threshold=0.0):
+    if "decentdb" not in results or "sqlite" not in results:
+        return
+
+    d = results["decentdb"]
+    s = results["sqlite"]
+    metrics = [
+        ("MovieDB Bulk Load Time", "movie_bulk_load_s", "s", False, ".6f"),
+        ("MovieDB Bulk Load throughput", "movie_bulk_load_rps", " rows/s", True, ".2f"),
+        ("MovieDB Checkpoint", "movie_checkpoint_s", "s", False, ".6f"),
+        ("MovieDB Point Reads", "movie_point_reads_s", "s", False, ".6f"),
+        ("MovieDB Top-rated by year", "movie_top_rated_s", "s", False, ".6f"),
+        ("MovieDB Search by tag", "movie_tag_search_s", "s", False, ".6f"),
+        ("MovieDB Busiest people", "movie_busiest_people_s", "s", False, ".6f"),
+        ("MovieDB Watchlist query", "movie_watchlist_s", "s", False, ".6f"),
+        ("MovieDB Update batch", "movie_update_batch_s", "s", False, ".6f"),
+        ("MovieDB Cascade delete batch", "movie_delete_cascade_s", "s", False, ".6f"),
+        (
+            "MovieDB Checkpoint after mutations",
+            "movie_checkpoint_after_mutations_s",
+            "s",
+            False,
+            ".6f",
+        ),
+        ("MovieDB Vacuum/compact", "movie_vacuum_s", "s", False, ".6f"),
+        ("MovieDB Final file size", "movie_final_file_size_bytes", " bytes", False, ".0f"),
+    ]
+
+    decent_better = []
+    sqlite_better = []
+    ties = []
+    for name, key, unit, higher_is_better, fmt in metrics:
+        decent = d[key]
+        sqlite = s[key]
+        if decent == sqlite:
+            ties.append(f"{name}: tie ({decent:{fmt}}{unit})")
+            continue
+        max_val = max(abs(decent), abs(sqlite))
+        if tie_threshold > 0.0 and max_val > 0.0:
+            rel_delta = abs(decent - sqlite) / max_val
+            if rel_delta <= tie_threshold:
+                ties.append(
+                    f"{name}: statistical tie "
+                    f"({decent:{fmt}}{unit} vs {sqlite:{fmt}}{unit})"
+                )
+                continue
+
+        if higher_is_better:
+            decent_wins = decent > sqlite
+            winner_val = decent if decent_wins else sqlite
+            loser_val = sqlite if decent_wins else decent
+            ratio = winner_val / loser_val if loser_val else float("inf")
+            detail = (
+                f"{name}: {winner_val:{fmt}}{unit} vs {loser_val:{fmt}}{unit} "
+                f"({ratio:.3f}x higher)"
+            )
+        else:
+            decent_wins = decent < sqlite
+            winner_val = decent if decent_wins else sqlite
+            loser_val = sqlite if decent_wins else decent
+            ratio = loser_val / winner_val if winner_val else float("inf")
+            detail = (
+                f"{name}: {winner_val:{fmt}}{unit} vs {loser_val:{fmt}}{unit} "
+                f"({ratio:.3f}x faster/lower)"
+            )
+
+        if decent_wins:
+            decent_better.append(detail)
+        else:
+            sqlite_better.append(detail)
+
+    print("\n=== MovieDB Comparison (DecentDB vs SQLite) ===")
+    print("DecentDB better at:")
+    if decent_better:
+        for line in decent_better:
+            print(f"- {line}")
+    else:
+        print("- none")
+
+    print("SQLite better at:")
+    if sqlite_better:
+        for line in sqlite_better:
+            print(f"- {line}")
+    else:
+        print("- none")
+
+    if ties:
+        print("Ties:")
+        for line in ties:
+            print(f"- {line}")
+
+
+SHOWDOWN_GENRE_NAMES = [
+    "Action", "Adventure", "Animation", "Comedy", "Crime", "Documentary",
+    "Drama", "Family", "Fantasy", "History", "Horror", "Music", "Mystery",
+    "Romance", "Science Fiction", "Thriller", "War", "Western",
+]
+
+SHOWDOWN_FIRST_NAMES = [
+    "James", "Mary", "Robert", "Patricia", "John", "Jennifer", "Michael",
+    "Linda", "David", "Elizabeth", "William", "Barbara", "Richard", "Susan",
+    "Joseph", "Jessica", "Thomas", "Sarah", "Christopher", "Karen",
+]
+
+SHOWDOWN_LAST_NAMES = [
+    "Anderson", "Bennett", "Carter", "Daniels", "Evans", "Foster", "Grant",
+    "Harris", "Iverson", "Jenkins", "Keller", "Lawrence", "Mitchell",
+    "Nelson", "Owens", "Parker", "Quinn", "Reynolds", "Sullivan", "Thompson",
+]
+
+SHOWDOWN_TITLE_WORDS = [
+    "Last", "First", "Eternal", "Hidden", "Broken", "Silver", "Golden",
+    "Crimson", "Midnight", "Shadow", "Forgotten", "Lost", "Final", "Dark",
+    "Bright", "Silent", "Wild", "Brave", "Royal", "Secret", "Endless",
+    "Storm", "Thunder", "Dawn", "Dusk", "Reckoning", "Genesis", "Protocol",
+    "Paradox", "Horizon", "Legacy", "Empire", "Kingdom", "Rebellion",
+]
+
+SHOWDOWN_NOUNS = [
+    "Dawn", "Empire", "Protocol", "Reckoning", "Legacy", "Horizon", "Code",
+    "Gate", "Circle", "Crown", "Veil", "Storm", "Fire", "Ice", "Light",
+    "Shadow", "River", "Mountain", "City", "Road", "War", "Treaty", "Pact",
+    "Vow", "Promise", "Quest", "Journey", "Return", "Rising", "Fall",
+    "Awakening", "Conspiracy", "Mirage", "Echo", "Genesis", "Paradox",
+]
+
+SHOWDOWN_REVIEW_ADJECTIVES = [
+    "stunning", "boring", "thrilling", "predictable", "breathtaking",
+    "forgettable", "masterful", "mediocre", "riveting", "disappointing",
+    "brilliant", "tedious", "hilarious", "dull", "mesmerizing", "weak",
+    "powerful", "formulaic", "electric", "lifeless",
+]
+
+SHOWDOWN_REVIEW_NOUNS = [
+    "performances", "pacing", "cinematography", "score", "script", "ending",
+    "plot", "visuals", "dialogue", "action", "tension", "direction",
+    "characters", "world-building", "set pieces", "sound design",
+]
+
+SHOWDOWN_KEYWORD_TERMS = [
+    "time travel", "artificial intelligence", "space", "war", "love",
+    "betrayal", "revenge", "family", "friendship", "survival", "magic",
+    "robot", "alien", "spy", "heist", "courtroom", "escape", "disaster",
+    "island", "detective", "vampire", "zombie", "dragon", "ghost",
+    "amnesia", "undercover", "witness", "rivalry", "redemption", "sacrifice",
+]
+
+SHOWDOWN_COLLECTIONS = [
+    "", "", "", "Saga Collection", "Anthology", "Trilogy Box",
+    "Director Series", "Universe", "Chronicles", "Tales",
+]
+
+SHOWDOWN_STATUSES = ["Released", "Post Production", "Rumored", "Planned"]
+SHOWDOWN_MPA_RATINGS = ["G", "PG", "PG-13", "R", "NC-17", "NR"]
+SHOWDOWN_CHAR_FIRST = [
+    "Alex", "Sam", "Jordan", "Casey", "Taylor", "Morgan", "Riley", "Quinn",
+    "Avery", "Drew", "Reese", "Skyler", "Hayden", "Parker", "Rowan",
+]
+SHOWDOWN_CHAR_LAST = [
+    "Stone", "Cross", "Vance", "Hayes", "Reed", "Cole", "West", "Lane",
+    "Kane", "Mercer", "Sloan", "Drake", "Bishop", "Hart",
+]
+
+
+def _showdown_int_type(engine_name):
+    return "INTEGER" if engine_name == "sqlite" else "INT"
+
+
+def _showdown_int64_type(engine_name):
+    return "INTEGER" if engine_name == "sqlite" else "INT64"
+
+
+def _showdown_float_type(engine_name):
+    return "REAL" if engine_name == "sqlite" else "FLOAT64"
+
+
+def _showdown_date_type(engine_name):
+    return "TEXT" if engine_name == "sqlite" else "DATE"
+
+
+def _showdown_timestamp_type(engine_name):
+    return "TEXT" if engine_name == "sqlite" else "TIMESTAMP"
+
+
+def _showdown_date_param(engine_name):
+    return "?" if engine_name == "sqlite" else "CAST(? AS DATE)"
+
+
+def _showdown_timestamp_param(engine_name):
+    return "?" if engine_name == "sqlite" else "CAST(? AS TIMESTAMP)"
+
+
+def setup_showdown_schema(conn, engine_name):
+    int_type = _showdown_int_type(engine_name)
+    int64_type = _showdown_int64_type(engine_name)
+    float_type = _showdown_float_type(engine_name)
+    date_type = _showdown_date_type(engine_name)
+    timestamp_type = _showdown_timestamp_type(engine_name)
+
+    if engine_name == "sqlite":
+        conn.execute("PRAGMA foreign_keys=ON")
+
+    ddl = f"""
+        CREATE TABLE people (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            born {date_type} NOT NULL,
+            birthplace TEXT
+        );
+        CREATE TABLE movies (
+            id INTEGER PRIMARY KEY,
+            title TEXT NOT NULL,
+            overview TEXT NOT NULL,
+            released {date_type} NOT NULL,
+            budget_cents {int64_type} NOT NULL,
+            revenue_cents {int64_type} NOT NULL,
+            runtime_minutes {int_type} NOT NULL,
+            status TEXT NOT NULL,
+            mpa_rating TEXT NOT NULL,
+            rating {float_type} NOT NULL,
+            vote_count {int_type} NOT NULL,
+            collection TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE genres (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE
+        );
+        CREATE TABLE movie_genres (
+            movie_id {int_type} NOT NULL REFERENCES movies(id),
+            genre_id {int_type} NOT NULL REFERENCES genres(id),
+            PRIMARY KEY (movie_id, genre_id)
+        );
+        CREATE TABLE roles (
+            id INTEGER PRIMARY KEY,
+            movie_id {int_type} NOT NULL REFERENCES movies(id),
+            person_id {int_type} NOT NULL REFERENCES people(id),
+            character TEXT NOT NULL DEFAULT '',
+            department TEXT NOT NULL,
+            job TEXT NOT NULL,
+            billing_order {int_type} NOT NULL DEFAULT 0
+        );
+        CREATE TABLE reviews (
+            id INTEGER PRIMARY KEY,
+            movie_id {int_type} NOT NULL REFERENCES movies(id),
+            author TEXT NOT NULL,
+            score {int_type} NOT NULL CHECK (score BETWEEN 1 AND 10),
+            body TEXT NOT NULL,
+            created_at {timestamp_type} NOT NULL
+        );
+        CREATE TABLE keywords (
+            id INTEGER PRIMARY KEY,
+            term TEXT NOT NULL UNIQUE
+        );
+        CREATE TABLE movie_keywords (
+            movie_id {int_type} NOT NULL REFERENCES movies(id),
+            keyword_id {int_type} NOT NULL REFERENCES keywords(id),
+            PRIMARY KEY (movie_id, keyword_id)
+        );
+    """
+    _execute_script_statements(conn, ddl)
+
+
+def setup_showdown_indexes(conn):
+    ddl = """
+        CREATE INDEX idx_movies_released ON movies(released);
+        CREATE INDEX idx_movies_rating ON movies(rating);
+        CREATE INDEX idx_movies_status ON movies(status);
+        CREATE INDEX idx_movies_collection ON movies(collection) WHERE collection <> '';
+        CREATE INDEX idx_people_name ON people(name);
+        CREATE INDEX idx_roles_movie ON roles(movie_id);
+        CREATE INDEX idx_roles_person ON roles(person_id);
+        CREATE INDEX idx_roles_dept_job ON roles(department, job);
+        CREATE INDEX idx_reviews_movie ON reviews(movie_id);
+        CREATE INDEX idx_reviews_author ON reviews(author);
+        CREATE INDEX idx_reviews_score ON reviews(score);
+        CREATE INDEX idx_reviews_created ON reviews(created_at);
+        CREATE INDEX idx_mgenres_genre ON movie_genres(genre_id);
+        CREATE INDEX idx_mkeywords_keyword ON movie_keywords(keyword_id);
+    """
+    _execute_script_statements(conn, ddl)
+
+
+def setup_showdown_search_indexes(conn, engine_name):
+    if engine_name == "decentdb":
+        ddl = """
+            CREATE INDEX idx_movies_title_trgm ON movies USING trigram(title);
+            CREATE INDEX idx_movies_search_ft ON movies USING fulltext(title, overview) WITH (prefix='2,3');
+            CREATE INDEX idx_reviews_body_ft ON reviews USING fulltext(body) WITH (prefix='2,3');
+        """
+        _execute_script_statements(conn, ddl)
+        return
+
+    cur = conn.cursor()
+    cur.execute(
+        "CREATE VIRTUAL TABLE movies_fts USING fts5("
+        "title, overview, content='movies', content_rowid='id', tokenize='porter unicode61')"
+    )
+    cur.execute(
+        "CREATE VIRTUAL TABLE reviews_fts USING fts5("
+        "body, content='reviews', content_rowid='id', tokenize='porter unicode61')"
+    )
+    cur.execute("INSERT INTO movies_fts(movies_fts) VALUES('rebuild')")
+    cur.execute("INSERT INTO reviews_fts(reviews_fts) VALUES('rebuild')")
+    conn.commit()
+
+
+def _showdown_make_title(rng):
+    form = rng.randrange(6)
+    if form == 0:
+        return f"{rng.choice(SHOWDOWN_TITLE_WORDS)} {rng.choice(SHOWDOWN_NOUNS)}"
+    if form == 1:
+        return f"The {rng.choice(SHOWDOWN_NOUNS)}"
+    if form == 2:
+        return f"{rng.choice(SHOWDOWN_NOUNS)} of {rng.choice(SHOWDOWN_TITLE_WORDS)}"
+    if form == 3:
+        return (
+            f"{rng.choice(SHOWDOWN_TITLE_WORDS)} {rng.choice(SHOWDOWN_NOUNS)}: "
+            f"{rng.choice(SHOWDOWN_NOUNS)}"
+        )
+    if form == 4:
+        return f"A {rng.choice(SHOWDOWN_TITLE_WORDS)} {rng.choice(SHOWDOWN_NOUNS)}"
+    return f"{rng.choice(SHOWDOWN_NOUNS)} {rng.randrange(2, 6)}"
+
+
+def _showdown_make_overview(rng, force_search_terms=False):
+    sentences = []
+    for _ in range(3 + rng.randrange(4)):
+        if rng.random() < 0.5:
+            sentences.append(
+                "In a world of "
+                f"{rng.choice(SHOWDOWN_NOUNS).lower()}, a reluctant hero confronts "
+                f"the {rng.choice(SHOWDOWN_REVIEW_ADJECTIVES)} truth behind the "
+                f"{rng.choice(SHOWDOWN_NOUNS).lower()}."
+            )
+        else:
+            sentences.append(
+                f"When the {rng.choice(SHOWDOWN_NOUNS).lower()} threatens everything, "
+                f"an unlikely alliance races to protect the "
+                f"{rng.choice(SHOWDOWN_NOUNS).lower()} before dawn."
+            )
+    if force_search_terms:
+        sentences.append("War, revenge, and sacrifice reshape every choice.")
+    return " ".join(sentences)
+
+
+def _showdown_make_review(rng, force_search_terms=False):
+    adj = rng.choice(SHOWDOWN_REVIEW_ADJECTIVES)
+    noun = rng.choice(SHOWDOWN_REVIEW_NOUNS)
+    adj2 = rng.choice(SHOWDOWN_REVIEW_ADJECTIVES)
+    noun2 = rng.choice(SHOWDOWN_REVIEW_NOUNS)
+    text = (
+        f"A {adj} film elevated by its {noun}. "
+        f"Despite {adj2} {noun2}, every frame has intent."
+    )
+    if force_search_terms:
+        text += " War and revenge give the sacrifice real weight."
+    return text
+
+
+def _showdown_city(rng):
+    return rng.choice([
+        "Springfield", "Riverdale", "Fairview", "Kingston",
+        "Madison", "Georgetown", "Ashford", "Westbrook",
+    ])
+
+
+def _showdown_state(rng):
+    return rng.choice(["CA", "NY", "TX", "IL", "GA", "WA", "MA", "CO"])
+
+
+def _showdown_date(year, days):
+    return (_dt.date(year, 1, 1) + _dt.timedelta(days=days)).isoformat()
+
+
+def _showdown_timestamp(days, seconds):
+    return (
+        _dt.datetime(2000, 1, 1) + _dt.timedelta(days=days, seconds=seconds)
+    ).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def generate_showdown_data(movies_count, people_multiplier, reviews_per_movie, seed):
+    if movies_count <= 0:
+        raise ValueError("Showdown benchmark requires at least one movie")
+    if people_multiplier <= 0:
+        raise ValueError("Showdown benchmark requires a positive people multiplier")
+    if reviews_per_movie < 0:
+        raise ValueError("Showdown reviews per movie cannot be negative")
+
+    rng = random.Random(seed)
+    people_count = movies_count * people_multiplier
+    data = {
+        "people": [],
+        "movies": [],
+        "genres": [(i + 1, name) for i, name in enumerate(SHOWDOWN_GENRE_NAMES)],
+        "movie_genres": [],
+        "roles": [],
+        "reviews": [],
+        "keywords": [(i + 1, term) for i, term in enumerate(SHOWDOWN_KEYWORD_TERMS)],
+        "movie_keywords": [],
+    }
+
+    for person_id in range(1, people_count + 1):
+        name = f"{rng.choice(SHOWDOWN_FIRST_NAMES)} {rng.choice(SHOWDOWN_LAST_NAMES)}"
+        data["people"].append(
+            (
+                person_id,
+                name,
+                _showdown_date(1940, rng.randrange(28 * 365)),
+                f"{_showdown_city(rng)},{_showdown_state(rng)}",
+            )
+        )
+
+    for movie_id in range(1, movies_count + 1):
+        released = _showdown_date(1960, rng.randrange(63 * 365))
+        budget_cents = int(rng.random() * 300_000_000) * 100
+        revenue_cents = int(rng.random() * 1_200_000_000) * 100
+        status = (
+            "Released"
+            if rng.random() < 0.85
+            else rng.choice(SHOWDOWN_STATUSES[1:])
+        )
+        data["movies"].append(
+            (
+                movie_id,
+                f"{_showdown_make_title(rng)} {movie_id:05d}",
+                _showdown_make_overview(rng, movie_id % 17 == 0),
+                released,
+                budget_cents,
+                revenue_cents,
+                75 + rng.randrange(135),
+                status,
+                rng.choice(SHOWDOWN_MPA_RATINGS),
+                round(rng.random() * 9.0 + 1.0, 1),
+                rng.randrange(50, 500_000),
+                rng.choice(SHOWDOWN_COLLECTIONS),
+            )
+        )
+
+    for movie_id in range(1, movies_count + 1):
+        genre_count = 2 + rng.randrange(3)
+        for genre_id in rng.sample(range(1, len(data["genres"]) + 1), genre_count):
+            data["movie_genres"].append((movie_id, genre_id))
+
+    role_id = 0
+    for movie_id in range(1, movies_count + 1):
+        role_id += 1
+        data["roles"].append(
+            (role_id, movie_id, rng.randrange(1, people_count + 1), "", "Directing", "Director", 0)
+        )
+        role_id += 1
+        data["roles"].append(
+            (role_id, movie_id, rng.randrange(1, people_count + 1), "", "Writing", "Screenplay", 0)
+        )
+        cast_count = 8 + rng.randrange(8)
+        cast_people = rng.sample(range(1, people_count + 1), min(cast_count, people_count))
+        for billing_order, person_id in enumerate(cast_people, start=1):
+            role_id += 1
+            character = f"{rng.choice(SHOWDOWN_CHAR_FIRST)} {rng.choice(SHOWDOWN_CHAR_LAST)}"
+            data["roles"].append(
+                (role_id, movie_id, person_id, character, "Acting", "Actor", billing_order)
+            )
+
+    review_id = 0
+    for movie_id in range(1, movies_count + 1):
+        if reviews_per_movie == 0 or rng.random() < 0.12:
+            review_count = 0
+        else:
+            review_count = 1 + rng.randrange(reviews_per_movie)
+        for _ in range(review_count):
+            review_id += 1
+            data["reviews"].append(
+                (
+                    review_id,
+                    movie_id,
+                    f"{rng.choice(SHOWDOWN_FIRST_NAMES).lower()}{rng.randrange(1, 9999)}",
+                    1 + rng.randrange(10),
+                    _showdown_make_review(rng, review_id % 19 == 0),
+                    _showdown_timestamp(rng.randrange(9000), rng.randrange(86400)),
+                )
+            )
+
+    for movie_id in range(1, movies_count + 1):
+        keyword_count = 1 + rng.randrange(5)
+        for keyword_id in rng.sample(range(1, len(data["keywords"]) + 1), keyword_count):
+            data["movie_keywords"].append((movie_id, keyword_id))
+
+    return data
+
+
+def showdown_total_rows(data):
+    return sum(len(rows) for rows in data.values())
+
+
+def _showdown_insert_all(cur, engine_name, data):
+    date_param = _showdown_date_param(engine_name)
+    timestamp_param = _showdown_timestamp_param(engine_name)
+    cur.execute("BEGIN")
+    try:
+        cur.executemany(
+            f"INSERT INTO people (id, name, born, birthplace) VALUES (?, ?, {date_param}, ?)",
+            data["people"],
+        )
+        cur.executemany(
+            "INSERT INTO genres (id, name) VALUES (?, ?)",
+            data["genres"],
+        )
+        cur.executemany(
+            f"""
+            INSERT INTO movies (
+                id, title, overview, released, budget_cents, revenue_cents,
+                runtime_minutes, status, mpa_rating, rating, vote_count, collection
+            ) VALUES (?, ?, ?, {date_param}, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            data["movies"],
+        )
+        cur.executemany(
+            "INSERT INTO movie_genres (movie_id, genre_id) VALUES (?, ?)",
+            data["movie_genres"],
+        )
+        cur.executemany(
+            "INSERT INTO keywords (id, term) VALUES (?, ?)",
+            data["keywords"],
+        )
+        cur.executemany(
+            """
+            INSERT INTO roles (
+                id, movie_id, person_id, character, department, job, billing_order
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            data["roles"],
+        )
+        cur.executemany(
+            f"""
+            INSERT INTO reviews (id, movie_id, author, score, body, created_at)
+            VALUES (?, ?, ?, ?, ?, {timestamp_param})
+            """,
+            data["reviews"],
+        )
+        cur.executemany(
+            "INSERT INTO movie_keywords (movie_id, keyword_id) VALUES (?, ?)",
+            data["movie_keywords"],
+        )
+        cur.execute("COMMIT")
+    except Exception:
+        cur.execute("ROLLBACK")
+        raise
+
+
+def _showdown_fetch_count(cur, sql, params=()):
+    cur.execute(sql, params)
+    return len(cur.fetchall())
+
+
+def _showdown_time_query(engine_name, cur, label, sql, results, key, params=(), note=None):
+    _showdown_fetch_count(cur, sql, params)
+    duration, rows = _time_movie_operation(
+        engine_name,
+        label,
+        0,
+        lambda: _showdown_fetch_count(cur, sql, params),
+    )
+    suffix = f" ({note})" if note else ""
+    print(f"    rows={rows:,}{suffix}")
+    results[key] = duration
+    results[key + "_rows"] = rows
+    return duration, rows
+
+
+def _showdown_skip(results, key, label, exc):
+    print(f"  {label:<38} skipped: {exc}")
+    results[key] = None
+    results[key + "_error"] = str(exc)
+
+
+def _showdown_try_query(engine_name, cur, label, sql, results, key, params=(), note=None):
+    try:
+        return _showdown_time_query(engine_name, cur, label, sql, results, key, params, note)
+    except Exception as exc:
+        _showdown_skip(results, key, label, exc)
+        return None, 0
+
+
+def _showdown_exec(cur, sql, params=()):
+    cur.execute(sql, params)
+    try:
+        return len(cur.fetchall())
+    except Exception:
+        return 0
+
+
+def _showdown_commit_if_supported(conn):
+    commit = getattr(conn, "commit", None)
+    if callable(commit):
+        try:
+            commit()
+        except Exception:
+            pass
+
+
+def _showdown_rollback_if_supported(conn):
+    rollback = getattr(conn, "rollback", None)
+    if callable(rollback):
+        try:
+            rollback()
+        except Exception:
+            pass
+
+
+def run_showdown_benchmark(
+    engine_name,
+    db_path,
+    data,
+    *,
+    point_reads,
+    keep_db,
+    decentdb_options,
+    decentdb_stmt_cache_size,
+    sqlite_profile,
+    sqlite_cache_mb,
+):
+    cleanup_db_files(db_path)
+    print(f"\n=== {engine_name} Showdown ===")
+
+    if engine_name == "decentdb":
+        lib = load_decentdb_library()
+        lib_path = getattr(lib, "_name", "<unknown>")
+        print(f"DecentDB native library: {lib_path}")
+        print(
+            "DecentDB options: "
+            f"{decentdb_options or '<default>'}; stmt_cache_size={decentdb_stmt_cache_size}"
+        )
+        conn = setup_decentdb(
+            db_path,
+            options=decentdb_options,
+            stmt_cache_size=decentdb_stmt_cache_size,
+            initialize_complex=False,
+        )
+    elif engine_name == "sqlite":
+        print(f"SQLite profile: {sqlite_profile}; cache_mb={sqlite_cache_mb}")
+        conn = setup_sqlite(
+            db_path,
+            profile=sqlite_profile,
+            cache_mb=sqlite_cache_mb,
+            initialize_complex=False,
+        )
+        conn.execute("PRAGMA page_size=4096")
+        conn.execute("PRAGMA mmap_size=268435456")
+    else:
+        raise ValueError(f"Unknown engine: {engine_name}")
+
+    print("Initializing Showdown schema...")
+    setup_showdown_schema(conn, engine_name)
+    cur = conn.cursor()
+    results = {}
+    total_rows = showdown_total_rows(data)
+
+    duration, _ = _time_movie_operation(
+        engine_name,
+        "Showdown bulk load",
+        total_rows,
+        lambda: _showdown_insert_all(cur, engine_name, data),
+    )
+    results["showdown_bulk_load_s"] = duration
+    results["showdown_bulk_load_rps"] = total_rows / duration if duration else 0.0
+
+    duration, _ = _time_movie_operation(
+        engine_name,
+        "Showdown btree index build",
+        0,
+        lambda: setup_showdown_indexes(conn),
+    )
+    results["showdown_index_build_s"] = duration
+
+    duration, _ = _time_movie_operation(
+        engine_name,
+        "Showdown search index build",
+        0,
+        lambda: setup_showdown_search_indexes(conn, engine_name),
+    )
+    results["showdown_search_index_build_s"] = duration
+
+    try:
+        duration, _ = _time_movie_operation(
+            engine_name,
+            "Showdown ANALYZE",
+            0,
+            lambda: cur.execute("ANALYZE"),
+        )
+        results["showdown_analyze_s"] = duration
+    except Exception as exc:
+        _showdown_skip(results, "showdown_analyze_s", "Showdown ANALYZE", exc)
+
+    cur.execute("SELECT COUNT(*) FROM movies")
+    results["showdown_movies"] = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM reviews")
+    results["showdown_reviews"] = cur.fetchone()[0]
+    print(
+        f"  Loaded {results['showdown_movies']:,} movies / "
+        f"{results['showdown_reviews']:,} reviews"
+    )
+
+    point_limit = min(point_reads, len(data["movies"]))
+    point_ids = list(range(1, point_limit + 1))
+    point_sql = "SELECT id, title, rating, runtime_minutes FROM movies WHERE id = ?"
+    cur.execute(point_sql, (1,))
+    cur.fetchall()
+
+    def run_point_lookups():
+        total = 0
+        for movie_id in point_ids:
+            cur.execute(point_sql, (movie_id,))
+            total += len(cur.fetchall())
+        return total
+
+    duration, total = _time_movie_operation(
+        engine_name,
+        "Showdown point lookup by PK",
+        len(point_ids),
+        run_point_lookups,
+    )
+    print(f"    rows={total:,}")
+    results["showdown_point_lookup_s"] = duration
+    results["showdown_point_lookup_rows"] = total
+
+    year_expr = "strftime('%Y', released)"
+    decade_expr = f"(CAST({year_expr} AS INTEGER) / 10 * 10)"
+    date_2010 = "'2010-01-01'" if engine_name == "sqlite" else "CAST('2010-01-01' AS DATE)"
+
+    scenarios = [
+        (
+            "Showdown full table scan",
+            "showdown_full_scan_s",
+            "SELECT id, title, rating, runtime_minutes, vote_count FROM movies",
+            (),
+            None,
+        ),
+        (
+            "Showdown filtered range scan",
+            "showdown_filtered_range_s",
+            "SELECT id, title, rating FROM movies WHERE rating >= 7.5 AND rating <= 9.0 AND runtime_minutes > 120",
+            (),
+            None,
+        ),
+        (
+            "Showdown index range/order/limit",
+            "showdown_index_range_order_s",
+            f"SELECT id, title, rating, released FROM movies WHERE released >= {date_2010} ORDER BY rating DESC LIMIT 50",
+            (),
+            None,
+        ),
+        (
+            "Showdown keyset pagination",
+            "showdown_keyset_pagination_s",
+            "SELECT id, title, rating FROM movies WHERE id > 500 ORDER BY id LIMIT 25",
+            (),
+            None,
+        ),
+        (
+            "Showdown offset pagination",
+            "showdown_offset_pagination_s",
+            "SELECT id, title, rating FROM movies ORDER BY id LIMIT 25 OFFSET 500",
+            (),
+            None,
+        ),
+        (
+            "Showdown movie genres join",
+            "showdown_movie_genres_join_s",
+            """
+            SELECT m.id, m.title, g.name
+            FROM movies m
+            JOIN movie_genres mg ON mg.movie_id = m.id
+            JOIN genres g ON g.id = mg.genre_id
+            ORDER BY m.id
+            """,
+            (),
+            "3-table join",
+        ),
+        (
+            "Showdown cast/crew join",
+            "showdown_cast_crew_join_s",
+            """
+            SELECT m.id, m.title, p.name, r.character, r.job, r.billing_order
+            FROM movies m
+            JOIN roles r ON r.movie_id = m.id
+            JOIN people p ON p.id = r.person_id
+            ORDER BY m.id, r.billing_order
+            """,
+            (),
+            "3-table join",
+        ),
+        (
+            "Showdown review aggregate join",
+            "showdown_review_aggregate_join_s",
+            """
+            SELECT m.id, m.title, m.rating,
+                   COUNT(r.id) AS review_count,
+                   AVG(r.score) AS avg_review,
+                   MIN(r.score) AS min_score,
+                   MAX(r.score) AS max_score
+            FROM movies m
+            LEFT JOIN reviews r ON r.movie_id = m.id
+            GROUP BY m.id, m.title, m.rating
+            ORDER BY m.id
+            """,
+            (),
+            "LEFT JOIN + GROUP BY",
+        ),
+        (
+            "Showdown person filmography",
+            "showdown_person_filmography_s",
+            """
+            SELECT p.id, p.name, COUNT(DISTINCT r.movie_id) AS films, COUNT(*) AS roles
+            FROM people p
+            JOIN roles r ON r.person_id = p.id
+            GROUP BY p.id, p.name
+            ORDER BY films DESC, p.id
+            LIMIT 50
+            """,
+            (),
+            "COUNT DISTINCT",
+        ),
+        (
+            "Showdown genre popularity",
+            "showdown_genre_popularity_s",
+            """
+            SELECT g.name, COUNT(*) AS movie_count, AVG(m.rating) AS avg_rating
+            FROM genres g
+            JOIN movie_genres mg ON mg.genre_id = g.id
+            JOIN movies m ON m.id = mg.movie_id
+            GROUP BY g.name
+            ORDER BY movie_count DESC, g.name
+            """,
+            (),
+            "GROUP BY + AVG",
+        ),
+        (
+            "Showdown yearly counts",
+            "showdown_yearly_counts_s",
+            f"""
+            SELECT {year_expr} AS yr, COUNT(*) AS cnt
+            FROM movies
+            GROUP BY {year_expr}
+            ORDER BY yr
+            """,
+            (),
+            "strftime + GROUP BY",
+        ),
+        (
+            "Showdown top by decade",
+            "showdown_top_by_decade_s",
+            f"""
+            SELECT {decade_expr} AS decade,
+                   COUNT(*) AS films, AVG(rating) AS avg_rating
+            FROM movies
+            WHERE status = 'Released'
+            GROUP BY {decade_expr}
+            ORDER BY decade
+            """,
+            (),
+            "computed GROUP key",
+        ),
+        (
+            "Showdown review ranking",
+            "showdown_review_ranking_s",
+            """
+            SELECT movie_id, score, author,
+                   RANK() OVER (PARTITION BY movie_id ORDER BY score DESC) AS rk,
+                   DENSE_RANK() OVER (PARTITION BY movie_id ORDER BY score DESC) AS drk
+            FROM reviews
+            ORDER BY movie_id, rk
+            """,
+            (),
+            "RANK/DENSE_RANK",
+        ),
+        (
+            "Showdown cast billing window",
+            "showdown_cast_billing_window_s",
+            """
+            SELECT movie_id, person_id, billing_order,
+                   ROW_NUMBER() OVER (PARTITION BY movie_id ORDER BY billing_order) AS rn,
+                   LAG(billing_order) OVER (PARTITION BY movie_id ORDER BY billing_order) AS prev
+            FROM roles
+            WHERE department = 'Acting'
+            ORDER BY movie_id, rn
+            """,
+            (),
+            "ROW_NUMBER/LAG",
+        ),
+        (
+            "Showdown recursive CTE",
+            "showdown_recursive_cte_s",
+            """
+            WITH RECURSIVE series(n) AS (
+                SELECT 1
+                UNION ALL
+                SELECT n + 1 FROM series WHERE n < 100
+            )
+            SELECT n FROM series
+            """,
+            (),
+            "1..100",
+        ),
+        (
+            "Showdown directors CTE",
+            "showdown_directors_cte_s",
+            """
+            WITH directed AS (
+                SELECT r.person_id, r.movie_id, m.title, m.rating
+                FROM roles r
+                JOIN movies m ON m.id = r.movie_id
+                WHERE r.job = 'Director'
+            ),
+            top_dirs AS (
+                SELECT person_id, COUNT(*) AS films, AVG(rating) AS avg_rating
+                FROM directed
+                GROUP BY person_id
+                HAVING COUNT(*) >= 2
+            )
+            SELECT d.person_id, d.films, d.avg_rating,
+                   STRING_AGG(dir.title, ', ') AS titles
+            FROM top_dirs d
+            JOIN directed dir ON dir.person_id = d.person_id
+            GROUP BY d.person_id, d.films, d.avg_rating
+            ORDER BY d.avg_rating DESC
+            LIMIT 20
+            """,
+            (),
+            "multi-CTE + STRING_AGG",
+        ),
+        (
+            "Showdown substring LIKE",
+            "showdown_substring_like_s",
+            "SELECT id, title FROM movies WHERE title LIKE '%Shadow%'",
+            (),
+            "DecentDB trigram vs SQLite scan",
+        ),
+        (
+            "Showdown UNION",
+            "showdown_union_s",
+            """
+            SELECT genre_id FROM movie_genres WHERE genre_id <= 6
+            UNION
+            SELECT genre_id FROM movie_genres WHERE genre_id >= 13
+            ORDER BY genre_id
+            """,
+            (),
+            None,
+        ),
+        (
+            "Showdown rolling avg frame",
+            "showdown_rolling_average_s",
+            """
+            SELECT id, rating,
+                   AVG(rating) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS rolling
+            FROM movies
+            ORDER BY id
+            """,
+            (),
+            "ROWS BETWEEN frame",
+        ),
+    ]
+
+    for label, key, sql, params, note in scenarios:
+        _showdown_try_query(engine_name, cur, label, sql, results, key, params, note)
+
+    if engine_name == "decentdb":
+        fts_sql = """
+            SELECT id, title, bm25('idx_movies_search_ft') AS rank
+            FROM movies
+            WHERE fulltext_match('idx_movies_search_ft', ?)
+            ORDER BY rank DESC
+            LIMIT 50
+        """
+    else:
+        fts_sql = """
+            SELECT m.id, m.title, bm25(movies_fts) AS rank
+            FROM movies_fts
+            JOIN movies m ON m.id = movies_fts.rowid
+            WHERE movies_fts MATCH ?
+            ORDER BY rank
+            LIMIT 50
+        """
+    _showdown_try_query(
+        engine_name,
+        cur,
+        "Showdown fulltext BM25",
+        fts_sql,
+        results,
+        "showdown_fulltext_bm25_s",
+        ("war OR revenge OR sacrifice",),
+        "fulltext index",
+    )
+
+    insert_date = _showdown_date_param(engine_name)
+    start_id = len(data["movies"]) + 10_000
+    cur.execute(f"DELETE FROM movies WHERE id >= {start_id} AND id < {start_id + 100}")
+    _showdown_commit_if_supported(conn)
+    insert_sql = f"""
+        INSERT INTO movies (
+            id, title, overview, released, budget_cents, revenue_cents,
+            runtime_minutes, status, mpa_rating, rating, vote_count, collection
+        ) VALUES (?, ?, ?, {insert_date}, ?, ?, ?, ?, ?, ?, ?, ?)
+        RETURNING id, title
+    """
+
+    def run_insert_returning():
+        total = 0
+        cur.execute("BEGIN")
+        try:
+            for i in range(100):
+                cur.execute(
+                    insert_sql,
+                    (
+                        start_id + i,
+                        f"RETURNING Test {i}",
+                        "RETURNING benchmark row",
+                        "2024-01-01",
+                        100_000_000,
+                        500_000_000,
+                        120,
+                        "Released",
+                        "PG-13",
+                        7.5,
+                        100,
+                        "",
+                    ),
+                )
+                total += len(cur.fetchall())
+            cur.execute("COMMIT")
+            return total
+        except Exception:
+            cur.execute("ROLLBACK")
+            raise
+
+    try:
+        duration, rows = _time_movie_operation(
+            engine_name,
+            "Showdown INSERT RETURNING",
+            100,
+            run_insert_returning,
+        )
+        print(f"    rows={rows:,}")
+        results["showdown_insert_returning_s"] = duration
+        results["showdown_insert_returning_rows"] = rows
+    except Exception as exc:
+        _showdown_rollback_if_supported(conn)
+        _showdown_skip(results, "showdown_insert_returning_s", "Showdown INSERT RETURNING", exc)
+    cur.execute(f"DELETE FROM movies WHERE id >= {start_id}")
+    _showdown_commit_if_supported(conn)
+
+    def run_update_returning():
+        cur.execute("BEGIN")
+        try:
+            cur.execute(
+                """
+                UPDATE movies SET rating = rating + 0.01
+                WHERE id BETWEEN 1 AND 100
+                RETURNING id, rating
+                """
+            )
+            rows = len(cur.fetchall())
+            cur.execute("UPDATE movies SET rating = rating - 0.01 WHERE id BETWEEN 1 AND 100")
+            cur.execute("COMMIT")
+            return rows
+        except Exception:
+            cur.execute("ROLLBACK")
+            raise
+
+    try:
+        duration, rows = _time_movie_operation(
+            engine_name,
+            "Showdown UPDATE RETURNING",
+            100,
+            run_update_returning,
+        )
+        print(f"    rows={rows:,}")
+        results["showdown_update_returning_s"] = duration
+        results["showdown_update_returning_rows"] = rows
+    except Exception as exc:
+        _showdown_rollback_if_supported(conn)
+        _showdown_skip(results, "showdown_update_returning_s", "Showdown UPDATE RETURNING", exc)
+
+    try:
+        duration, rows = _time_movie_operation(
+            engine_name,
+            "Showdown UPSERT",
+            0,
+            lambda: _showdown_exec(
+                cur,
+                """
+                INSERT INTO genres (id, name) VALUES (1, 'Action')
+                ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name
+                """,
+            ),
+        )
+        print(f"    rows={rows:,}")
+        results["showdown_upsert_s"] = duration
+        results["showdown_upsert_rows"] = rows
+        _showdown_commit_if_supported(conn)
+    except Exception as exc:
+        _showdown_rollback_if_supported(conn)
+        _showdown_skip(results, "showdown_upsert_s", "Showdown UPSERT", exc)
+
+    cur.execute("SELECT COUNT(*) FROM movies WHERE status = 'Released'")
+    released_count = cur.fetchone()[0]
+
+    def run_bulk_update():
+        cur.execute("BEGIN")
+        try:
+            cur.execute("UPDATE movies SET vote_count = vote_count + 1 WHERE status = 'Released'")
+            cur.execute("UPDATE movies SET vote_count = vote_count - 1 WHERE status = 'Released'")
+            cur.execute("COMMIT")
+            return released_count
+        except Exception:
+            cur.execute("ROLLBACK")
+            raise
+
+    duration, rows = _time_movie_operation(
+        engine_name,
+        "Showdown bulk UPDATE",
+        released_count,
+        run_bulk_update,
+    )
+    print(f"    rows={rows:,}")
+    results["showdown_bulk_update_s"] = duration
+    results["showdown_bulk_update_rows"] = rows
+
+    base_delete_id = len(data["movies"]) + 20_000
+    delete_insert_sql = f"""
+        INSERT INTO movies (
+            id, title, overview, released, budget_cents, revenue_cents,
+            runtime_minutes, status, mpa_rating, rating, vote_count, collection
+        ) VALUES (?, 'DEL', 'x', {insert_date}, 0, 0, 1, 'Rumored', 'NR', 0, 0, '')
+    """
+    cur.execute("BEGIN")
+    try:
+        for i in range(500):
+            cur.execute(delete_insert_sql, (base_delete_id + i, "2024-01-01"))
+        cur.execute("COMMIT")
+    except Exception:
+        cur.execute("ROLLBACK")
+        raise
+
+    def run_bulk_delete():
+        cur.execute("BEGIN")
+        try:
+            cur.execute(
+                f"DELETE FROM movies WHERE id BETWEEN {base_delete_id} AND {base_delete_id + 499}"
+            )
+            cur.execute("COMMIT")
+            return 500
+        except Exception:
+            cur.execute("ROLLBACK")
+            raise
+
+    duration, rows = _time_movie_operation(
+        engine_name,
+        "Showdown bulk DELETE",
+        500,
+        run_bulk_delete,
+    )
+    print(f"    rows={rows:,}")
+    results["showdown_bulk_delete_s"] = duration
+    results["showdown_bulk_delete_rows"] = rows
+
+    if engine_name == "decentdb":
+        _showdown_try_query(
+            engine_name,
+            cur,
+            "Showdown stat aggregates",
+            """
+            SELECT STDDEV(score) AS stddev,
+                   VARIANCE(score) AS variance,
+                   MEDIAN(score) AS median,
+                   AVG(score) AS mean
+            FROM reviews
+            """,
+            results,
+            "showdown_stat_aggregates_s",
+            note="DecentDB built-in",
+        )
+    else:
+        print("  Showdown stat aggregates             skipped: n/a in stock SQLite")
+        results["showdown_stat_aggregates_s"] = None
+
+    duration, _ = _time_movie_operation(
+        engine_name,
+        "Showdown checkpoint",
+        0,
+        lambda: _movie_checkpoint(conn, engine_name),
+    )
+    results["showdown_checkpoint_s"] = duration
+
+    conn.close()
+    results["showdown_final_file_size_bytes"] = storage_size_bytes(db_path)
+    print(
+        f"  Final file size: {results['showdown_final_file_size_bytes']:,} bytes "
+        f"({results['showdown_final_file_size_bytes'] / (1024.0 * 1024.0):.2f} MiB)"
+    )
+
+    if not keep_db:
+        cleanup_db_files(db_path)
+
+    return results
+
+
+def print_showdown_comparison(results, *, tie_threshold=0.0):
+    if "decentdb" not in results or "sqlite" not in results:
+        return
+
+    d = results["decentdb"]
+    s = results["sqlite"]
+    metrics = [
+        ("Showdown Bulk Load Time", "showdown_bulk_load_s", "s", False, ".6f"),
+        ("Showdown Bulk Load throughput", "showdown_bulk_load_rps", " rows/s", True, ".2f"),
+        ("Showdown B-tree index build", "showdown_index_build_s", "s", False, ".6f"),
+        ("Showdown Search index build", "showdown_search_index_build_s", "s", False, ".6f"),
+        ("Showdown ANALYZE", "showdown_analyze_s", "s", False, ".6f"),
+        ("Showdown Point lookup", "showdown_point_lookup_s", "s", False, ".6f"),
+        ("Showdown Full table scan", "showdown_full_scan_s", "s", False, ".6f"),
+        ("Showdown Filtered range", "showdown_filtered_range_s", "s", False, ".6f"),
+        ("Showdown Index range/order", "showdown_index_range_order_s", "s", False, ".6f"),
+        ("Showdown Keyset pagination", "showdown_keyset_pagination_s", "s", False, ".6f"),
+        ("Showdown Offset pagination", "showdown_offset_pagination_s", "s", False, ".6f"),
+        ("Showdown Movie genres join", "showdown_movie_genres_join_s", "s", False, ".6f"),
+        ("Showdown Cast/crew join", "showdown_cast_crew_join_s", "s", False, ".6f"),
+        ("Showdown Review aggregate join", "showdown_review_aggregate_join_s", "s", False, ".6f"),
+        ("Showdown Person filmography", "showdown_person_filmography_s", "s", False, ".6f"),
+        ("Showdown Genre popularity", "showdown_genre_popularity_s", "s", False, ".6f"),
+        ("Showdown Yearly counts", "showdown_yearly_counts_s", "s", False, ".6f"),
+        ("Showdown Top by decade", "showdown_top_by_decade_s", "s", False, ".6f"),
+        ("Showdown Review ranking", "showdown_review_ranking_s", "s", False, ".6f"),
+        ("Showdown Cast billing window", "showdown_cast_billing_window_s", "s", False, ".6f"),
+        ("Showdown Recursive CTE", "showdown_recursive_cte_s", "s", False, ".6f"),
+        ("Showdown Directors CTE", "showdown_directors_cte_s", "s", False, ".6f"),
+        ("Showdown Substring LIKE", "showdown_substring_like_s", "s", False, ".6f"),
+        ("Showdown Fulltext BM25", "showdown_fulltext_bm25_s", "s", False, ".6f"),
+        ("Showdown UNION", "showdown_union_s", "s", False, ".6f"),
+        ("Showdown Rolling avg frame", "showdown_rolling_average_s", "s", False, ".6f"),
+        ("Showdown INSERT RETURNING", "showdown_insert_returning_s", "s", False, ".6f"),
+        ("Showdown UPDATE RETURNING", "showdown_update_returning_s", "s", False, ".6f"),
+        ("Showdown UPSERT", "showdown_upsert_s", "s", False, ".6f"),
+        ("Showdown Bulk UPDATE", "showdown_bulk_update_s", "s", False, ".6f"),
+        ("Showdown Bulk DELETE", "showdown_bulk_delete_s", "s", False, ".6f"),
+        ("Showdown Checkpoint", "showdown_checkpoint_s", "s", False, ".6f"),
+        ("Showdown Final file size", "showdown_final_file_size_bytes", " bytes", False, ".0f"),
+    ]
+
+    decent_better = []
+    sqlite_better = []
+    ties = []
+    skipped = []
+
+    for name, key, unit, higher_is_better, fmt in metrics:
+        decent = d.get(key)
+        sqlite = s.get(key)
+        if decent is None or sqlite is None:
+            skipped.append(f"{name}: skipped ({decent!r} vs {sqlite!r})")
+            continue
+        if decent == sqlite:
+            ties.append(f"{name}: tie ({decent:{fmt}}{unit})")
+            continue
+        max_val = max(abs(decent), abs(sqlite))
+        if tie_threshold > 0.0 and max_val > 0.0:
+            rel_delta = abs(decent - sqlite) / max_val
+            if rel_delta <= tie_threshold:
+                ties.append(
+                    f"{name}: statistical tie "
+                    f"({decent:{fmt}}{unit} vs {sqlite:{fmt}}{unit})"
+                )
+                continue
+
+        if higher_is_better:
+            decent_wins = decent > sqlite
+            winner_val = decent if decent_wins else sqlite
+            loser_val = sqlite if decent_wins else decent
+            ratio = winner_val / loser_val if loser_val else float("inf")
+            detail = (
+                f"{name}: {winner_val:{fmt}}{unit} vs {loser_val:{fmt}}{unit} "
+                f"({ratio:.3f}x higher)"
+            )
+        else:
+            decent_wins = decent < sqlite
+            winner_val = decent if decent_wins else sqlite
+            loser_val = sqlite if decent_wins else decent
+            ratio = loser_val / winner_val if winner_val else float("inf")
+            detail = (
+                f"{name}: {winner_val:{fmt}}{unit} vs {loser_val:{fmt}}{unit} "
+                f"({ratio:.3f}x faster/lower)"
+            )
+
+        if decent_wins:
+            decent_better.append(detail)
+        else:
+            sqlite_better.append(detail)
+
+    print("\n=== Showdown Comparison (DecentDB vs SQLite) ===")
+    print("DecentDB better at:")
+    if decent_better:
+        for line in decent_better:
+            print(f"- {line}")
+    else:
+        print("- none")
+
+    print("SQLite better at:")
+    if sqlite_better:
+        for line in sqlite_better:
+            print(f"- {line}")
+    else:
+        print("- none")
+
+    if ties:
+        print("Ties:")
+        for line in ties:
+            print(f"- {line}")
+
+    if skipped:
+        print("Skipped/unsupported:")
+        for line in skipped:
+            print(f"- {line}")
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Comprehensive Python benchmark: DecentDB bindings vs sqlite3"
+    )
+    parser.add_argument(
+        "--workload",
+        choices=["complex", "movie", "showdown", "both", "all"],
+        default="both",
+        help=(
+            "Benchmark workload to run. both runs complex+movie for backwards "
+            "compatibility; all also runs the GLM52-style showdown workload "
+            "(default: both)."
+        ),
     )
     parser.add_argument(
         "--engine",
@@ -903,6 +2994,33 @@ def parse_args():
         type=int,
         default=DEFAULT_ORDERS,
         help=f"Number of orders to generate (default: {DEFAULT_ORDERS})",
+    )
+    parser.add_argument(
+        "--decentdb-options",
+        default=DECENTDB_EMBEDDED_FAST_OPTIONS,
+        help=(
+            "DecentDB native open options. Default matches the embedded-fast "
+            "profile used to make this comparison fair against tuned SQLite. "
+            "Pass an empty string to test native defaults."
+        ),
+    )
+    parser.add_argument(
+        "--decentdb-stmt-cache-size",
+        type=int,
+        default=512,
+        help="DecentDB Python statement cache size (default: 512)",
+    )
+    parser.add_argument(
+        "--sqlite-profile",
+        choices=["wal_normal", "wal_full", "delete_full"],
+        default="wal_normal",
+        help="SQLite PRAGMA profile (default: wal_normal, matching the MovieDB harness)",
+    )
+    parser.add_argument(
+        "--sqlite-cache-mb",
+        type=int,
+        default=64,
+        help="SQLite page cache size in MiB (default: 64)",
     )
     parser.add_argument(
         "--history-reads",
@@ -968,45 +3086,242 @@ def parse_args():
         action="store_true",
         help="Keep generated database files after benchmark run",
     )
+    parser.add_argument(
+        "--movie-scale",
+        choices=["smoke", "scratch"],
+        default="smoke",
+        help=(
+            "MovieDB scale preset. scratch uses the out-of-repo .NET harness "
+            "sizes: 50k movies, 25k people, 250k roles, 500k reviews, "
+            "500 tags, 150k movie-tags, 100k watchlist entries."
+        ),
+    )
+    parser.add_argument("--movie-movies", type=int, default=None)
+    parser.add_argument("--movie-people", type=int, default=None)
+    parser.add_argument("--movie-roles", type=int, default=None)
+    parser.add_argument("--movie-reviews", type=int, default=None)
+    parser.add_argument("--movie-tags", type=int, default=None)
+    parser.add_argument("--movie-movie-tags", type=int, default=None)
+    parser.add_argument("--movie-watchlist", type=int, default=None)
+    parser.add_argument(
+        "--movie-point-reads",
+        type=int,
+        default=DEFAULT_MOVIE_POINT_READS,
+        help=f"MovieDB UUID point reads (default: {DEFAULT_MOVIE_POINT_READS})",
+    )
+    parser.add_argument(
+        "--movie-update-count",
+        type=int,
+        default=DEFAULT_MOVIE_UPDATE_COUNT,
+        help=f"MovieDB box-office batch updates (default: {DEFAULT_MOVIE_UPDATE_COUNT})",
+    )
+    parser.add_argument(
+        "--movie-delete-count",
+        type=int,
+        default=DEFAULT_MOVIE_DELETE_COUNT,
+        help=f"MovieDB cascade parent deletes (default: {DEFAULT_MOVIE_DELETE_COUNT})",
+    )
+    parser.add_argument(
+        "--showdown-scale",
+        choices=["smoke", "glm52"],
+        default="smoke",
+        help=(
+            "Showdown scale preset. glm52 uses the second out-of-repo "
+            ".NET project default of 20k movies with people=movies*3 and "
+            "up to 8 reviews/movie."
+        ),
+    )
+    parser.add_argument(
+        "--showdown-movies",
+        type=int,
+        default=None,
+        help=(
+            f"Showdown movie count (default: {DEFAULT_SHOWDOWN_MOVIES}; "
+            f"glm52 preset: {GLM52_SHOWDOWN_MOVIES})"
+        ),
+    )
+    parser.add_argument(
+        "--showdown-people-mult",
+        type=int,
+        default=DEFAULT_SHOWDOWN_PEOPLE_MULT,
+        help=(
+            "Showdown people multiplier, people=movies*mult "
+            f"(default: {DEFAULT_SHOWDOWN_PEOPLE_MULT})"
+        ),
+    )
+    parser.add_argument(
+        "--showdown-reviews-per-movie",
+        type=int,
+        default=DEFAULT_SHOWDOWN_REVIEWS_PER_MOVIE,
+        help=(
+            "Showdown max generated reviews per movie "
+            f"(default: {DEFAULT_SHOWDOWN_REVIEWS_PER_MOVIE})"
+        ),
+    )
+    parser.add_argument(
+        "--showdown-point-reads",
+        type=int,
+        default=DEFAULT_SHOWDOWN_POINT_READS,
+        help=f"Showdown integer PK point reads (default: {DEFAULT_SHOWDOWN_POINT_READS})",
+    )
     return parser.parse_args()
+
+
+def apply_movie_scale_defaults(args):
+    if args.movie_scale == "scratch":
+        defaults = {
+            "movie_movies": SCRATCH_MOVIES,
+            "movie_people": SCRATCH_PEOPLE,
+            "movie_roles": SCRATCH_ROLES,
+            "movie_reviews": SCRATCH_REVIEWS,
+            "movie_tags": SCRATCH_TAGS,
+            "movie_movie_tags": SCRATCH_MOVIE_TAGS,
+            "movie_watchlist": SCRATCH_WATCHLIST,
+        }
+    else:
+        defaults = {
+            "movie_movies": DEFAULT_MOVIES,
+            "movie_people": DEFAULT_PEOPLE,
+            "movie_roles": DEFAULT_ROLES,
+            "movie_reviews": DEFAULT_REVIEWS,
+            "movie_tags": DEFAULT_TAGS,
+            "movie_movie_tags": DEFAULT_MOVIE_TAGS,
+            "movie_watchlist": DEFAULT_WATCHLIST,
+        }
+    for name, value in defaults.items():
+        if getattr(args, name) is None:
+            setattr(args, name, value)
+
+
+def apply_showdown_scale_defaults(args):
+    if args.showdown_movies is None:
+        args.showdown_movies = (
+            GLM52_SHOWDOWN_MOVIES
+            if args.showdown_scale == "glm52"
+            else DEFAULT_SHOWDOWN_MOVIES
+        )
 
 
 def main():
     args = parse_args()
+    apply_movie_scale_defaults(args)
+    apply_showdown_scale_defaults(args)
     engines = ["decentdb", "sqlite"] if args.engine == "all" else [args.engine]
     results = {}
+    movie_results = {}
+    showdown_results = {}
 
-    print(
-        "Running benchmark with "
-        f"engines={','.join(engines)} users={args.users} items={args.items} "
-        f"orders={args.orders} history_reads={args.history_reads} "
-        f"point_lookups={args.point_lookups} range_scans={args.range_scans} "
-        f"joins={args.joins} aggregates={args.aggregates} updates={args.updates} "
-        f"deletes={args.deletes} table_scans={args.table_scans}"
-    )
-
-    for engine in engines:
-        suffix = "ddb" if engine == "decentdb" else "db"
-        path = f"{args.db_prefix}_{engine}.{suffix}"
-        results[engine] = run_engine_benchmark(
-            engine_name=engine,
-            db_path=path,
-            users_count=args.users,
-            items_count=args.items,
-            orders_count=args.orders,
-            history_reads=args.history_reads,
-            point_lookups=args.point_lookups,
-            range_scans=args.range_scans,
-            joins=args.joins,
-            aggregates=args.aggregates,
-            updates=args.updates,
-            deletes=args.deletes,
-            table_scans=args.table_scans,
-            seed=args.seed,
-            keep_db=args.keep_db,
+    if args.workload in ("complex", "both", "all"):
+        print(
+            "Running complex benchmark with "
+            f"engines={','.join(engines)} users={args.users} items={args.items} "
+            f"orders={args.orders} history_reads={args.history_reads} "
+            f"point_lookups={args.point_lookups} range_scans={args.range_scans} "
+            f"joins={args.joins} aggregates={args.aggregates} updates={args.updates} "
+            f"deletes={args.deletes} table_scans={args.table_scans}"
         )
 
-    print_comparison(results)
+        for engine in engines:
+            suffix = "ddb" if engine == "decentdb" else "db"
+            path = f"{args.db_prefix}_complex_{engine}.{suffix}"
+            results[engine] = run_engine_benchmark(
+                engine_name=engine,
+                db_path=path,
+                users_count=args.users,
+                items_count=args.items,
+                orders_count=args.orders,
+                history_reads=args.history_reads,
+                point_lookups=args.point_lookups,
+                range_scans=args.range_scans,
+                joins=args.joins,
+                aggregates=args.aggregates,
+                updates=args.updates,
+                deletes=args.deletes,
+                table_scans=args.table_scans,
+                seed=args.seed,
+                keep_db=args.keep_db,
+                decentdb_options=args.decentdb_options,
+                decentdb_stmt_cache_size=args.decentdb_stmt_cache_size,
+                sqlite_profile=args.sqlite_profile,
+                sqlite_cache_mb=args.sqlite_cache_mb,
+            )
+
+        print_comparison(results)
+
+    if args.workload in ("movie", "both", "all"):
+        print(
+            "\nRunning MovieDB benchmark with "
+            f"engines={','.join(engines)} scale={args.movie_scale} "
+            f"movies={args.movie_movies} people={args.movie_people} "
+            f"roles={args.movie_roles} reviews={args.movie_reviews} "
+            f"tags={args.movie_tags} movie_tags={args.movie_movie_tags} "
+            f"watchlist={args.movie_watchlist}"
+        )
+        print("Generating shared MovieDB dataset...")
+        movie_data = generate_movie_data(
+            movies_count=args.movie_movies,
+            people_count=args.movie_people,
+            roles_count=args.movie_roles,
+            reviews_count=args.movie_reviews,
+            tags_count=args.movie_tags,
+            movie_tags_count=args.movie_movie_tags,
+            watchlist_count=args.movie_watchlist,
+            seed=args.seed,
+        )
+        print(f"MovieDB dataset rows: {movie_total_rows(movie_data):,}")
+
+        for engine in engines:
+            suffix = "ddb" if engine == "decentdb" else "db"
+            path = f"{args.db_prefix}_movie_{engine}.{suffix}"
+            movie_results[engine] = run_movie_benchmark(
+                engine_name=engine,
+                db_path=path,
+                data=movie_data,
+                point_reads=args.movie_point_reads,
+                update_count=args.movie_update_count,
+                delete_count=args.movie_delete_count,
+                keep_db=args.keep_db,
+                decentdb_options=args.decentdb_options,
+                decentdb_stmt_cache_size=args.decentdb_stmt_cache_size,
+                sqlite_profile=args.sqlite_profile,
+                sqlite_cache_mb=args.sqlite_cache_mb,
+            )
+
+        print_movie_comparison(movie_results)
+
+    if args.workload in ("showdown", "all"):
+        print(
+            "\nRunning Showdown benchmark with "
+            f"engines={','.join(engines)} scale={args.showdown_scale} "
+            f"movies={args.showdown_movies} "
+            f"people_mult={args.showdown_people_mult} "
+            f"reviews_per_movie={args.showdown_reviews_per_movie}"
+        )
+        print("Generating shared Showdown dataset...")
+        showdown_data = generate_showdown_data(
+            movies_count=args.showdown_movies,
+            people_multiplier=args.showdown_people_mult,
+            reviews_per_movie=args.showdown_reviews_per_movie,
+            seed=args.seed,
+        )
+        print(f"Showdown dataset rows: {showdown_total_rows(showdown_data):,}")
+
+        for engine in engines:
+            suffix = "ddb" if engine == "decentdb" else "db"
+            path = f"{args.db_prefix}_showdown_{engine}.{suffix}"
+            showdown_results[engine] = run_showdown_benchmark(
+                engine_name=engine,
+                db_path=path,
+                data=showdown_data,
+                point_reads=args.showdown_point_reads,
+                keep_db=args.keep_db,
+                decentdb_options=args.decentdb_options,
+                decentdb_stmt_cache_size=args.decentdb_stmt_cache_size,
+                sqlite_profile=args.sqlite_profile,
+                sqlite_cache_mb=args.sqlite_cache_mb,
+            )
+
+        print_showdown_comparison(showdown_results)
 
 
 if __name__ == "__main__":

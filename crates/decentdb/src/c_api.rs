@@ -1446,6 +1446,20 @@ fn parse_extension_trust_anchor_option(
     }
 }
 
+fn db_config_profile(profile: &str) -> Result<DbConfig> {
+    let normalized = profile.trim().to_ascii_lowercase().replace(['-', ' '], "_");
+    match normalized.as_str() {
+        "default" => Ok(DbConfig::default()),
+        "balanced" => Ok(DbConfig::balanced()),
+        "low_memory" | "lowmemory" => Ok(DbConfig::low_memory()),
+        "embedded_fast" | "embeddedfast" => Ok(DbConfig::embedded_fast()),
+        "tuned_durable" | "tuneddurable" | "tuned" => Ok(DbConfig::tuned_durable()),
+        _ => Err(DbError::sql(format!(
+            "unknown database profile '{profile}'; expected default, low_memory, balanced, embedded_fast, or tuned_durable"
+        ))),
+    }
+}
+
 fn db_config_from_options(options: Option<&str>) -> Result<DbConfig> {
     let mut config = DbConfig::default();
     let Some(options) = options else {
@@ -1456,6 +1470,7 @@ fn db_config_from_options(options: Option<&str>) -> Result<DbConfig> {
         return Ok(config);
     }
 
+    let mut parsed_options = Vec::new();
     for token in trimmed.split(|ch: char| ch == ';' || ch == ',' || ch.is_whitespace()) {
         let token = token.trim();
         if token.is_empty() {
@@ -1467,81 +1482,92 @@ fn db_config_from_options(options: Option<&str>) -> Result<DbConfig> {
             )));
         };
         let key = key.trim().to_ascii_lowercase();
-        let value = value.trim();
+        let value = value.trim().to_string();
+        parsed_options.push((key, value));
+    }
+
+    for (key, value) in &parsed_options {
+        if key == "profile" || key == "performance_profile" {
+            config = db_config_profile(value)?;
+        }
+    }
+
+    for (key, value) in parsed_options {
         match key.as_str() {
+            "profile" | "performance_profile" => {}
             "cache_size" | "cache_size_mb" => {
-                config.cache_size_mb = parse_cache_size_mb_option(value, config.page_size)?;
+                config.cache_size_mb = parse_cache_size_mb_option(&value, config.page_size)?;
             }
             "retain_paged_row_sources_after_commit" => {
                 config.retain_paged_row_sources_after_commit =
-                    parse_bool_option(value, key.as_str())?;
+                    parse_bool_option(&value, key.as_str())?;
             }
             "paged_row_storage" => {
-                config.paged_row_storage = parse_bool_option(value, key.as_str())?;
+                config.paged_row_storage = parse_bool_option(&value, key.as_str())?;
             }
             "persistent_pk_index" => {
-                config.persistent_pk_index = parse_bool_option(value, key.as_str())?;
+                config.persistent_pk_index = parse_bool_option(&value, key.as_str())?;
             }
             "wal_autocheckpoint" => {
-                let pages = parse_u32_option(value, key.as_str())?;
+                let pages = parse_u32_option(&value, key.as_str())?;
                 config.wal_checkpoint_threshold_pages = pages;
                 if pages == 0 {
                     config.wal_checkpoint_threshold_bytes = 0;
                 }
             }
             "wal_checkpoint_threshold_pages" => {
-                config.wal_checkpoint_threshold_pages = parse_u32_option(value, key.as_str())?;
+                config.wal_checkpoint_threshold_pages = parse_u32_option(&value, key.as_str())?;
             }
             "wal_checkpoint_threshold_bytes" => {
-                config.wal_checkpoint_threshold_bytes = parse_u64_option(value, key.as_str())?;
+                config.wal_checkpoint_threshold_bytes = parse_u64_option(&value, key.as_str())?;
             }
             "process_coordination" => {
-                config.process_coordination = parse_process_coordination_option(value)?;
+                config.process_coordination = parse_process_coordination_option(&value)?;
             }
             "process_coordination_timeout_ms" => {
-                config.process_coordination_timeout_ms = parse_u64_option(value, key.as_str())?;
+                config.process_coordination_timeout_ms = parse_u64_option(&value, key.as_str())?;
             }
             "write_queue_enabled" => {
-                config.write_queue_enabled = parse_bool_option(value, key.as_str())?;
+                config.write_queue_enabled = parse_bool_option(&value, key.as_str())?;
             }
             "write_queue_capacity" => {
-                config.write_queue_capacity = parse_usize_option(value, key.as_str())?.max(1);
+                config.write_queue_capacity = parse_usize_option(&value, key.as_str())?.max(1);
             }
             "write_queue_default_timeout_ms" => {
-                config.write_queue_default_timeout_ms = parse_u64_option(value, key.as_str())?;
+                config.write_queue_default_timeout_ms = parse_u64_option(&value, key.as_str())?;
             }
             "write_queue_strict_group_commit" | "write_queue_group_commit" => {
-                config.write_queue_strict_group_commit = parse_bool_option(value, key.as_str())?;
+                config.write_queue_strict_group_commit = parse_bool_option(&value, key.as_str())?;
             }
             "write_queue_max_batch" => {
-                config.write_queue_max_batch = parse_usize_option(value, key.as_str())?.max(1);
+                config.write_queue_max_batch = parse_usize_option(&value, key.as_str())?.max(1);
             }
             "write_queue_max_group_delay_us" => {
-                config.write_queue_max_group_delay_us = parse_u64_option(value, key.as_str())?;
+                config.write_queue_max_group_delay_us = parse_u64_option(&value, key.as_str())?;
             }
             "encryption_key" | "tde_key" => {
                 config.encryption = Some(DbEncryptionConfig::from_key_bytes(value.as_bytes())?);
             }
             "encryption_key_hex" | "tde_key_hex" => {
                 config.encryption = Some(DbEncryptionConfig::from_key_bytes(parse_hex_option(
-                    value,
+                    &value,
                     key.as_str(),
                 )?)?);
             }
             "allow_extension" => {
                 config
                     .extension_trust_anchors
-                    .push(parse_extension_trust_anchor_option(value)?);
+                    .push(parse_extension_trust_anchor_option(&value)?);
             }
             "allow_unsigned_extensions" => {
                 config.extension_unsigned_development_mode =
-                    parse_bool_option(value, key.as_str())?;
+                    parse_bool_option(&value, key.as_str())?;
             }
             "plan_cache_enabled" => {
-                config.plan_cache.enabled = parse_bool_option(value, key.as_str())?;
+                config.plan_cache.enabled = parse_bool_option(&value, key.as_str())?;
             }
             "plan_cache_max_bytes" => {
-                config.plan_cache.max_size_bytes = parse_u64_option(value, key.as_str())?;
+                config.plan_cache.max_size_bytes = parse_u64_option(&value, key.as_str())?;
             }
             _ => {
                 return Err(DbError::sql(format!("unsupported database option: {key}")));
@@ -1563,7 +1589,7 @@ fn options_arg(options: *const c_char) -> Result<Option<String>> {
 /// Creates a database with open-time configuration options.
 ///
 /// Options are a UTF-8 string of `key=value` pairs separated by whitespace,
-/// comma, or semicolon. Supported keys include `cache_size`,
+/// comma, or semicolon. Supported keys include `profile`, `cache_size`,
 /// `retain_paged_row_sources_after_commit`, `paged_row_storage`,
 /// `persistent_pk_index`, `wal_autocheckpoint`,
 /// `wal_checkpoint_threshold_pages`, `wal_checkpoint_threshold_bytes`,
@@ -4083,6 +4109,32 @@ mod tests {
         assert_eq!(config.write_queue_max_batch, 9);
         assert_eq!(config.write_queue_max_group_delay_us, 1000);
         assert!(config.encryption.is_some());
+    }
+
+    #[test]
+    fn db_config_options_parse_named_profile_with_overrides() {
+        let config = db_config_from_options(Some(
+            "profile=embedded_fast;cache_size=64MB;process_coordination=single_process_unsafe",
+        ))
+        .expect("profile options should parse");
+
+        assert_eq!(config.cache_size_mb, 64);
+        assert!(config.retain_paged_row_sources_after_commit);
+        assert!(!config.paged_row_storage);
+        assert_eq!(config.wal_checkpoint_threshold_pages, 0);
+        assert_eq!(config.wal_checkpoint_threshold_bytes, 0);
+        assert_eq!(
+            config.process_coordination,
+            ProcessCoordinationMode::SingleProcessUnsafe
+        );
+    }
+
+    #[test]
+    fn db_config_options_reject_unknown_profile() {
+        let err = db_config_from_options(Some("profile=fastest")).expect_err("unknown profile");
+        assert!(err
+            .to_string()
+            .contains("unknown database profile 'fastest'"));
     }
 
     #[test]

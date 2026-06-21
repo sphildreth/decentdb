@@ -525,6 +525,12 @@ namespace DecentDB.AdoNet
         {
             var options = new StringBuilder();
 
+            var performanceProfile = GetFirstValue(kvps, "Performance Profile", "Profile");
+            if (!string.IsNullOrWhiteSpace(performanceProfile))
+            {
+                AppendPerformanceProfileOptions(options, performanceProfile);
+            }
+
             if (kvps.TryGetValue("Cache Size", out var cacheSize) && !string.IsNullOrWhiteSpace(cacheSize))
             {
                 // Delegate parsing to the native layer. Supports pages (int) or e.g. "64MB".
@@ -604,6 +610,42 @@ namespace DecentDB.AdoNet
             }
 
             return options.ToString();
+        }
+
+        private static void AppendPerformanceProfileOptions(StringBuilder options, string profile)
+        {
+            var normalized = profile.Trim().ToLowerInvariant().Replace("-", "_").Replace(" ", "_");
+            switch (normalized)
+            {
+                case "default":
+                    return;
+                case "low_memory":
+                case "lowmemory":
+                    AppendNativeOption(options, "cache_size", "4MB");
+                    return;
+                case "balanced":
+                    AppendNativeOption(options, "cache_size", "16MB");
+                    return;
+                case "embedded_fast":
+                case "embeddedfast":
+                    AppendNativeOption(options, "cache_size", "32MB");
+                    AppendNativeOption(options, "retain_paged_row_sources_after_commit", "true");
+                    AppendNativeOption(options, "paged_row_storage", "false");
+                    AppendNativeOption(options, "wal_autocheckpoint", "0");
+                    return;
+                case "tuned_durable":
+                case "tuneddurable":
+                case "tuned":
+                    AppendNativeOption(options, "cache_size", "64MB");
+                    AppendNativeOption(options, "retain_paged_row_sources_after_commit", "true");
+                    AppendNativeOption(options, "paged_row_storage", "false");
+                    AppendNativeOption(options, "wal_autocheckpoint", "0");
+                    return;
+                default:
+                    throw new ArgumentException(
+                        $"Unknown DecentDB performance profile '{profile}'. Expected default, low_memory, balanced, embedded_fast, or tuned_durable.",
+                        nameof(profile));
+            }
         }
 
         private static void AppendNativeOption(StringBuilder options, string key, string value)

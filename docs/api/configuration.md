@@ -55,11 +55,25 @@ use decentdb::DbConfig;
 let balanced = DbConfig::balanced();
 let low_memory = DbConfig::low_memory();
 let tuned = DbConfig::tuned_durable();
-# let _ = (balanced, low_memory, tuned);
+let embedded_fast = DbConfig::embedded_fast();
+# let _ = (balanced, low_memory, tuned, embedded_fast);
 ```
 
-All three keep full WAL sync. `tuned_durable` is explicit because it raises
-memory use and changes row-source/checkpoint behavior for hot read workloads.
+All profiles keep full WAL sync. `embedded_fast` is the recommended opt-in
+profile for single-process embedded applications with a hot working set and
+repeated small writes. `tuned_durable` is the higher-memory benchmark/power-user
+profile. Both are explicit because they raise memory use and change
+row-source/checkpoint behavior.
+
+C ABI and binding option strings can use the same profiles:
+
+```text
+profile=embedded_fast
+profile=tuned_durable;cache_size=128MB
+```
+
+Explicit options in the same string override profile values. .NET connection
+strings expose this as `Performance Profile=embedded_fast`.
 
 ## Durability and Checkpointing
 

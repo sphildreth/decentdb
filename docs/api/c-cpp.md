@@ -136,6 +136,23 @@ whitespace, commas, or semicolons:
 - `ddb_db_open_with_options`
 - `ddb_db_open_or_create_with_options`
 
+Named durable profiles are available through `profile`. Explicit options in the
+same string override the selected profile:
+
+```c
+ddb_db_t *db = NULL;
+check(ddb_db_open_or_create_with_options(
+          "app.ddb",
+          "profile=embedded_fast;cache_size=64MB",
+          &db),
+      "open tuned embedded db");
+```
+
+Available profiles are `default`, `low_memory`, `balanced`, `embedded_fast`, and
+`tuned_durable`. `embedded_fast` is the recommended opt-in starting point for
+single-process embedded applications with a hot working set and repeated small
+writes; it keeps durable WAL sync enabled.
+
 TDE can be enabled with `encryption_key_hex` or `encryption_key`:
 
 ```c
