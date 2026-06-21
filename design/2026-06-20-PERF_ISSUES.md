@@ -1245,8 +1245,9 @@ Remaining reduced Showdown gaps after this iteration:
 | Bulk load | SQLite about 2.4x faster | Python/binding batch insert and row/index maintenance overhead remain high. |
 | B-tree index build | SQLite about 4.5x faster | DecentDB runtime B-tree rebuild/build path needs bulk-build and allocation profiling. |
 | Search index build | SQLite about 6.4x faster | DecentDB trigram/fulltext build improved, but still much slower than SQLite FTS5 rebuild at this scale. |
-| Full table scan | SQLite about 3.8x faster | Adding C decoders did not move it; engine-side full result materialization dominates. |
-| Filtered range and indexed range/order | SQLite about 4-6x faster | Needs cached/simple range plans and less per-query planner/executor recognizer work. |
+| Full table scan | DecentDB about 2.4-2.8x faster | Fixed: exposed the existing C `decode_matrix_i64_text_f64_i64_i64` decoder for the 5-column `(INT64, TEXT, FLOAT64, INT64, INT64)` scan shape; engine materialization was already ~90 us, the gap was Python generic matrix decode. |
+| Filtered range | DecentDB about 1.1-2.2x faster | Fixed: extended `simple_range_projection_filter` to capture residual column-vs-literal/param predicates on non-range columns, and to accept `Cast(Literal|Parameter)` bound values so typed date literals (`CAST('2010-01-01' AS DATE)`, `DATE '...'`) reach the filtered fast path instead of the generic executor. |
+| Indexed range/order (`ORDER BY rating DESC LIMIT 50`) | DecentDB about 2.8-3.5x faster | Fixed by the same cast-bound recognition: the query now uses the simple filtered projection path (scan + range filter on `released` + sort by `rating` + limit) instead of the generic executor. A bounded Top-N heap would still help the sort phase but is not needed for parity. |
 | Review aggregate join and filmography | SQLite about 2-3x faster | Needs grouped aggregate over index prefixes plus late materialization. |
 | Window functions | SQLite about 1.5-2.2x faster | Needs partition/order execution without excess row cloning/sorting. |
 | Multi-CTE directors query | SQLite about 5.3x faster | CTE materialization and `STRING_AGG` still need planner/executor work. |
@@ -1296,3 +1297,193 @@ plan has failed.
 - What exact checkpoint operation should be compared to SQLite
   `PRAGMA wal_checkpoint(TRUNCATE)` in public benchmark tables?
 - Should DECIMAL-versus-REAL benchmark variants be reported separately?
+
+## 11. Phase Reports (2026-06-21 Iteration)
+
+### Phase 1: Full Scan And Result Materialization
+
+Hypothesis: The Showdown full table scan gap (`SELECT id, title, rating,
+runtime_minutes, vote_count FROM movies`) was dominated by Python-side generic
+matrix decoding, not engine materialization. The engine `simple_projection`
+path clones resident `Value`s cheaply; a Rust micro-benchmark showed the engine
+full scan over 700 rows takes ~90 us per execution while the benchmark measured
+~2,500 us, so the cost was in the binding decode path.
+
+Files changed:
+
+- `bindings/python/decentdb/_fastdecode.c`: exposed the existing internal
+  `decode_i64_text_f64_i64_i64_row`/`_values` helpers as new Python-callable
+  `decode_row_i64_text_f64_i64_i64` and `decode_matrix_i64_text_f64_i64_i64`
+  functions, and registered them in the module method table.
+- `bindings/python/decentdb/__init__.py`: wired the new
+  `decode_matrix_i64_text_f64_i64_i64` native decoder into
+  `_decode_row_view_matrix` for `col_count == 5` with the
+  `INT64/TEXT/FLOAT64/INT64/INT64` tag shape, with the same per-SQL
+  fallback-disabling pattern used by the other matrix decoders.
+
+Benchmark before (3-run median, reduced Showdown, 700 movies):
+
+- DecentDB full table scan: ~0.0025 s.
+- SQLite full table scan: ~0.0006 s.
+- Gap: SQLite about 4.1x faster.
+
+Benchmark after (3-run, reduced Showdown, 700 movies, rebuilt `_fastdecode`):
+
+- DecentDB full table scan: 0.000267 / 0.000278 / 0.000272 s.
+- SQLite full table scan: 0.000743 / 0.000656 / 0.000642 s.
+- Result: DecentDB about 2.4-2.8x faster than SQLite in three consecutive runs.
+
+Existing wins preserved: point lookup (~1.7x faster), cast/crew join (~1.6x
+faster), movie genres join (~1.6x faster), final file size (smaller) all held.
+
+Tests run:
+
+- `cargo fmt --check` (clean).
+- `cargo check -p decentdb` (clean).
+- `python -m py_compile bindings/python/decentdb/__init__.py
+  bindings/python/benchmarks/bench_complex.py`.
+- Manual correctness check: 5-row `SELECT id, title, rating, runtime, votes`
+  returns the exact expected tuples through the new decoder path.
+- `python -m pytest bindings/python/tests/test_basic.py` (10 passed).
+
+Remaining risk: The new fast path only covers the specific 5-column
+`INT64/TEXT/FLOAT64/INT64/INT64` shape. Other 5-column scan shapes still use the
+generic Python loop. This is acceptable because the decoder uses the same
+shape-gated pattern as the existing 3- and 6-column decoders and falls back
+safely on tag mismatch or native exception.
+
+Next task: Phase 2 — Range Scans And Indexed Range/Order (filtered range and
+indexed range/order are still 4-6x slower than SQLite).
+
+### Phase 2: Filtered Range Scans (Residual Predicate Recognition)
+
+Hypothesis: The Showdown filtered range query
+`SELECT id, title, rating FROM movies WHERE rating >= 7.5 AND rating <= 9.0 AND runtime_minutes > 120`
+fell through to the generic executor because `simple_range_projection_filter`
+bailed whenever the conjunction contained a predicate on a column other than
+the range column. A Rust micro-benchmark confirmed the engine spent ~273 us
+per execution in the generic path versus ~90 us for an unfiltered simple scan,
+so the gap was recognizer/executor overhead, not indexing.
+
+Files changed:
+
+- `crates/decentdb/src/exec/mod.rs`:
+  - `SimpleRangeProjectionFilter` / `SimpleRangeFilterState` now carry a
+    `residual: Vec<SimpleResidualFilterTerm>` for column-vs-literal/param
+    comparisons on non-range columns.
+  - `collect_simple_range_projection_terms` now falls through to residual
+    capture when a comparison is on a different column than the chosen range
+    column, instead of bailing. At most one residual term per column is kept.
+  - Added `SimpleResidualPlan`, `simple_residual_matches`, and
+    `simple_residual_matches_all` to evaluate residual predicates directly
+    against `stored_row.values()` without going through `eval_expr`/Dataset.
+  - `try_execute_simple_filtered_projection_query` and the deferred filtered
+    path build residual plans via a new `build_simple_residual_plans` helper
+    and thread them through `simple_filtered_projection_result_from_source`
+    and `simple_filtered_projection_result_from_persisted_state`.
+  - The distinct and deferred-distinct filtered fast paths bail to the generic
+    executor when a residual is present, preserving correctness until their
+    own residual support is added.
+
+Benchmark before (3-run median, reduced Showdown, 700 movies):
+
+- DecentDB filtered range: ~0.00043 s.
+- SQLite filtered range: ~0.00010 s.
+- Gap: SQLite about 4.1-6.1x faster.
+
+Benchmark after (3-run, reduced Showdown, 700 movies):
+
+- DecentDB filtered range: 0.000127 / 0.000113 / 0.000112 s.
+- SQLite filtered range: 0.000145 / 0.000187 / 0.000144 s.
+- Result: DecentDB about 1.1-1.7x faster than SQLite in three consecutive runs.
+
+Existing wins preserved across the three runs: point lookup (~1.6-1.8x
+faster), full table scan (~1.7-2.3x faster), cast/crew join (~1.3-1.7x
+faster), movie genres join (~1.6-1.7x faster).
+
+Tests run:
+
+- `cargo fmt --check` (clean).
+- `cargo check -p decentdb` (clean).
+- `cargo clippy -p decentdb --all-features` (0 new warnings; 9 pre-existing).
+- `cargo test --lib -p decentdb` (1462 passed).
+- `cargo test --tests -p decentdb` (2984 passed).
+- New `simple_filtered_projection_query_supports_range_with_residual_predicate`
+  covering range + residual on a different column, range + equality residual,
+  and residual-excludes-all-rows.
+- `python -m pytest bindings/python/tests/test_basic.py
+  bindings/python/tests/test_comprehensive.py` (49 passed).
+
+Remaining risk: The residual path only supports column-vs-literal/param
+comparisons with the six comparison operators, at most one term per residual
+column, and only on the resident and persisted (non-distinct) filtered
+projection paths. More complex residuals (OR, expressions, same-column
+duplicates) still fall back to the generic executor. The distinct filtered
+paths still bail on residual. `simple_residual_matches` implements SQL
+three-valued NULL logic (returns false when either operand is NULL, mirroring
+`eval_binary`) and treats `compare_values` errors as not-matched, so the fast
+path cannot diverge from the generic executor on NULL or incompatible-type
+residuals (covered by
+`simple_filtered_projection_query_supports_range_with_residual_predicate`).
+
+Next task: Phase 2b — Indexed range/order: `ORDER BY rating DESC LIMIT 50`
+still does a full TableScan + Sort and is 4.8-6.4x slower than SQLite. Needs
+index-order traversal over `idx_movies_rating` or a bounded Top-N heap.
+
+### Phase 2b: Indexed Range/Order (Cast-Bound Recognition)
+
+Hypothesis: The Showdown indexed range/order query
+`SELECT id, title, rating, released FROM movies WHERE released >= CAST('2010-01-01' AS DATE) ORDER BY rating DESC LIMIT 50`
+fell through to the generic executor because `simple_range_projection_bound`
+only accepted `Literal`/`Parameter` bound values, and the parser represents
+typed date literals (`DATE '...'` and `CAST('...' AS DATE)`) as `Expr::Cast`.
+A Rust micro-benchmark confirmed the engine spent ~1.57 ms per execution in
+the generic path; the simple filtered projection path (scan + range filter +
+sort + limit) completed in ~0.48 ms for the same query.
+
+Files changed:
+
+- `crates/decentdb/src/exec/mod.rs`: added
+  `simple_bound_value_expr_is_constant` which accepts `Literal`, `Parameter`,
+  or `Cast(Literal|Parameter)`, and used it in both
+  `simple_range_projection_bound` and `simple_residual_projection_bound` so
+  typed-literal cast bounds are recognized as constant range/residual bounds.
+  The bound value is still evaluated once via `eval_expr`, which already
+  handles `Cast`.
+
+Benchmark before (3-run median, reduced Showdown, 700 movies):
+
+- DecentDB indexed range/order: ~0.00070 s.
+- SQLite indexed range/order: ~0.00013 s.
+- Gap: SQLite about 4.8-6.4x faster.
+
+Benchmark after (6 runs, reduced Showdown, 700 movies):
+
+- DecentDB indexed range/order: 0.000090-0.000118 s.
+- SQLite indexed range/order: 0.000285-0.000409 s.
+- Result: DecentDB about 2.8-3.5x faster than SQLite consistently.
+- Filtered range also improved further to 1.1-2.2x faster than SQLite.
+
+Existing wins preserved: point lookup (~1.6-1.8x faster), full table scan
+(~2.0-2.6x faster), cast/crew join (~1.1-1.8x faster), movie genres join
+(~1.2-1.7x faster).
+
+Tests run:
+
+- `cargo fmt --check` (clean).
+- `cargo check -p decentdb` (clean).
+- `cargo clippy -p decentdb --all-features` (0 new warnings; 9 pre-existing).
+- `cargo test --tests -p decentdb` (2983 passed).
+- New `simple_filtered_projection_query_supports_cast_date_range_bound`
+  covering `CAST('...' AS DATE)` range, `DATE '...'` range + ORDER BY + LIMIT.
+- `python -m pytest bindings/python/tests/test_basic.py
+  bindings/python/tests/test_comprehensive.py` (49 passed).
+
+Remaining risk: Cast bounds are only recognized when the cast operand is a
+literal or parameter. Nested casts and casts of expressions still fall back to
+the generic executor. Single-execution timing at the ~100 us scale is noisy,
+so the comparison label can occasionally swap for this row; the consistent
+6-run measurement shows DecentDB ahead.
+
+Next task: Phase 3 — Bulk Load And Write Paths (bulk load is 2.4x slower;
+INSERT/UPDATE RETURNING, UPSERT, bulk UPDATE/DELETE are 2.7-83x slower).

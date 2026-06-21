@@ -308,6 +308,197 @@ fn simple_filtered_projection_query_supports_range_order_and_limit() {
 }
 
 #[test]
+fn simple_filtered_projection_query_supports_range_with_residual_predicate() {
+    let path = unique_db_path("phase3-simple-filtered-residual");
+    let db = Db::create(&path, DbConfig::default()).expect("create database");
+
+    db.execute(
+        "CREATE TABLE movies (id INT64 PRIMARY KEY, title TEXT NOT NULL, rating FLOAT64 NOT NULL, runtime_minutes INT64 NOT NULL, status TEXT NOT NULL)",
+    )
+    .expect("create movies");
+    db.execute(
+        "INSERT INTO movies (id, title, rating, runtime_minutes, status) VALUES \
+         (1, 'A', 7.5, 90, 'Released'), \
+         (2, 'B', 8.0, 130, 'Released'), \
+         (3, 'C', 8.5, 140, 'Released'), \
+         (4, 'D', 8.8, 60, 'Released'), \
+         (5, 'E', 9.0, 125, 'Cancelled'), \
+         (6, 'F', 7.0, 200, 'Released')",
+    )
+    .expect("insert movies");
+
+    // Range on rating + residual on runtime_minutes (different column).
+    let result = db
+        .execute(
+            "SELECT id, title, rating \
+             FROM movies \
+             WHERE rating >= 7.5 AND rating <= 9.0 AND runtime_minutes > 120 \
+             ORDER BY id",
+        )
+        .expect("range + residual filtered projection");
+    assert_eq!(
+        result
+            .rows()
+            .iter()
+            .map(|row| (row.values()[0].clone(), row.values()[2].clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            (Value::Int64(2), Value::Float64(8.0)),
+            (Value::Int64(3), Value::Float64(8.5)),
+            (Value::Int64(5), Value::Float64(9.0))
+        ]
+    );
+
+    // Range on rating + residual equality on status (different column).
+    let result = db
+        .execute(
+            "SELECT id \
+             FROM movies \
+             WHERE rating >= 7.0 AND rating <= 9.0 AND status = 'Released' \
+             ORDER BY id",
+        )
+        .expect("range + equality residual filtered projection");
+    assert_eq!(
+        result
+            .rows()
+            .iter()
+            .map(|row| row.values()[0].clone())
+            .collect::<Vec<_>>(),
+        vec![
+            Value::Int64(1),
+            Value::Int64(2),
+            Value::Int64(3),
+            Value::Int64(4),
+            Value::Int64(6)
+        ]
+    );
+
+    // Residual predicate that excludes all rows still yields an empty result.
+    let result = db
+        .execute(
+            "SELECT id FROM movies WHERE rating >= 7.5 AND rating <= 9.0 AND runtime_minutes > 500",
+        )
+        .expect("range + residual excluding all rows");
+    assert!(result.rows().is_empty());
+
+    // SQL three-valued logic: a residual on a nullable column must NOT include
+    // NULL rows, even for `<>` / `<` / `<=` which would otherwise match under
+    // a non-NULL-aware ordering. The fast path must mirror the generic
+    // executor's NULL short-circuit.
+    db.execute("CREATE TABLE nullable_t (id INT64 PRIMARY KEY, score INT64, tag TEXT)")
+        .expect("create nullable_t");
+    db.execute(
+        "INSERT INTO nullable_t (id, score, tag) VALUES \
+         (1, 10, 'a'), \
+         (2, NULL, 'b'), \
+         (3, 20, NULL), \
+         (4, 5, 'c')",
+    )
+    .expect("insert nullable_t");
+    // score IS NULL must be excluded by `score <> 10` (NULL <> 10 is unknown).
+    let result = db
+        .execute("SELECT id FROM nullable_t WHERE id > 0 AND score <> 10 ORDER BY id")
+        .expect("residual NotEq on nullable score");
+    assert_eq!(
+        result
+            .rows()
+            .iter()
+            .map(|row| row.values()[0].clone())
+            .collect::<Vec<_>>(),
+        vec![Value::Int64(3), Value::Int64(4)]
+    );
+    // tag IS NULL must be excluded by `tag <> 'a'` (NULL <> 'a' is unknown).
+    let result = db
+        .execute("SELECT id FROM nullable_t WHERE id > 0 AND tag <> 'a' ORDER BY id")
+        .expect("residual NotEq on nullable tag");
+    assert_eq!(
+        result
+            .rows()
+            .iter()
+            .map(|row| row.values()[0].clone())
+            .collect::<Vec<_>>(),
+        vec![Value::Int64(2), Value::Int64(4)]
+    );
+    // Equality residual against a NULL candidate yields no rows.
+    let result = db
+        .execute("SELECT id FROM nullable_t WHERE id > 0 AND score = 10 ORDER BY id")
+        .expect("residual Eq on nullable score");
+    assert_eq!(
+        result
+            .rows()
+            .iter()
+            .map(|row| row.values()[0].clone())
+            .collect::<Vec<_>>(),
+        vec![Value::Int64(1)]
+    );
+
+    cleanup_db(&path);
+}
+
+#[test]
+fn simple_filtered_projection_query_supports_cast_date_range_bound() {
+    let path = unique_db_path("phase3-simple-filtered-cast-date");
+    let db = Db::create(&path, DbConfig::default()).expect("create database");
+
+    db.execute(
+        "CREATE TABLE movies (id INT64 PRIMARY KEY, title TEXT NOT NULL, rating FLOAT64 NOT NULL, released DATE NOT NULL)",
+    )
+    .expect("create movies");
+    db.execute(
+        "INSERT INTO movies (id, title, rating, released) VALUES \
+         (1, 'A', 7.5, DATE '2010-01-01'), \
+         (2, 'B', 8.0, DATE '2012-06-15'), \
+         (3, 'C', 8.5, DATE '2009-12-31'), \
+         (4, 'D', 9.0, DATE '2015-03-01')",
+    )
+    .expect("insert movies");
+
+    // The parser represents `DATE '...'` and `CAST('...' AS DATE)` as a Cast
+    // of a literal. The filtered fast path must recognize the cast as a
+    // constant bound and evaluate it once.
+    let result = db
+        .execute(
+            "SELECT id, title, rating \
+             FROM movies \
+             WHERE released >= CAST('2010-01-01' AS DATE) \
+             ORDER BY id",
+        )
+        .expect("cast date range filtered projection");
+    assert_eq!(
+        result
+            .rows()
+            .iter()
+            .map(|row| row.values()[0].clone())
+            .collect::<Vec<_>>(),
+        vec![Value::Int64(1), Value::Int64(2), Value::Int64(4)]
+    );
+
+    // Range on released (cast bound) + ORDER BY rating DESC + LIMIT.
+    let result = db
+        .execute(
+            "SELECT id, rating \
+             FROM movies \
+             WHERE released >= DATE '2010-01-01' \
+             ORDER BY rating DESC \
+             LIMIT 2",
+        )
+        .expect("cast date range + order + limit");
+    assert_eq!(
+        result
+            .rows()
+            .iter()
+            .map(|row| (row.values()[0].clone(), row.values()[1].clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            (Value::Int64(4), Value::Float64(9.0)),
+            (Value::Int64(2), Value::Float64(8.0))
+        ]
+    );
+
+    cleanup_db(&path);
+}
+
+#[test]
 fn simple_grouped_numeric_aggregate_query_supports_range_filter() {
     let path = unique_db_path("phase3-simple-grouped-aggregate");
     let db = Db::create(&path, DbConfig::default()).expect("create database");

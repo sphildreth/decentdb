@@ -904,6 +904,42 @@ static PyObject *decode_matrix_i64_text_f64(PyObject *self, PyObject *args) {
     return rows;
 }
 
+static PyObject *decode_matrix_i64_text_f64_i64_i64(PyObject *self, PyObject *args) {
+    unsigned long long addr = 0;
+    Py_ssize_t row_count = 0;
+    if (!PyArg_ParseTuple(args, "Kn", &addr, &row_count)) {
+        return NULL;
+    }
+    if (row_count < 0) {
+        PyErr_SetString(PyExc_ValueError, "row_count must be non-negative");
+        return NULL;
+    }
+    if (row_count == 0) {
+        return PyList_New(0);
+    }
+    if (addr == 0) {
+        PyErr_SetString(PyExc_ValueError, "matrix pointer is null");
+        return NULL;
+    }
+
+    const ddb_value_view_t *values = (const ddb_value_view_t *)(uintptr_t)addr;
+    PyObject *rows = PyList_New(row_count);
+    if (rows == NULL) {
+        return NULL;
+    }
+
+    for (Py_ssize_t i = 0; i < row_count; i++) {
+        const ddb_value_view_t *row = values + (i * 5);
+        PyObject *tuple = decode_i64_text_f64_i64_i64_row(row);
+        if (tuple == NULL) {
+            Py_DECREF(rows);
+            return NULL;
+        }
+        PyList_SET_ITEM(rows, i, tuple);
+    }
+    return rows;
+}
+
 static PyObject *decode_row_i64_text_text(PyObject *self, PyObject *args) {
     unsigned long long addr = 0;
     if (!PyArg_ParseTuple(args, "K", &addr)) {
@@ -2394,6 +2430,8 @@ static PyMethodDef methods[] = {
      "Decode one INT64/TEXT/FLOAT64 row from a ddb_value_view_t pointer."},
     {"decode_matrix_i64_text_f64", decode_matrix_i64_text_f64, METH_VARARGS,
      "Decode row_count INT64/TEXT/FLOAT64 rows from a ddb_value_view_t pointer."},
+    {"decode_matrix_i64_text_f64_i64_i64", decode_matrix_i64_text_f64_i64_i64, METH_VARARGS,
+     "Decode row_count INT64/TEXT/FLOAT64/INT64/INT64 rows from a ddb_value_view_t pointer."},
     {"decode_row_i64_text_text", decode_row_i64_text_text, METH_VARARGS,
      "Decode one INT64/TEXT/TEXT row from a ddb_value_view_t pointer."},
     {"decode_matrix_i64_text_text", decode_matrix_i64_text_text, METH_VARARGS,

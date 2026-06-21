@@ -11305,6 +11305,19 @@ impl EngineRuntime {
             })
             .transpose()?;
 
+        let residual_plans = self.build_simple_residual_plans(
+            table_schema,
+            name,
+            binding_name,
+            &range_filter.residual,
+            params,
+        )?;
+        // If a residual predicate references an unknown/external table the
+        // builder silently stops; bail to the generic executor in that case.
+        if residual_plans.len() != range_filter.residual.len() {
+            return Ok(None);
+        }
+
         let limit = query
             .limit
             .as_ref()
@@ -11321,7 +11334,7 @@ impl EngineRuntime {
         let Some(row_source) = row_source else {
             return Ok(None);
         };
-        if !select.distinct {
+        if !select.distinct && residual_plans.is_empty() {
             if let Some(result) = self.try_simple_rowid_range_projection_result(
                 row_source,
                 table_schema,
@@ -11353,6 +11366,7 @@ impl EngineRuntime {
             filter_column_index,
             lower_bound.as_ref(),
             upper_bound.as_ref(),
+            &residual_plans,
             &projection_indexes,
             column_names,
             order_by,
@@ -11752,6 +11766,11 @@ impl EngineRuntime {
                 })
             })
             .transpose()?;
+        if !range_filter.residual.is_empty() {
+            // The distinct filtered fast path does not yet evaluate residual
+            // predicates; bail to the generic executor to preserve correctness.
+            return Ok(None);
+        }
         let order_by = self.simple_projection_order_by_plan(
             query,
             table_schema,
@@ -12561,6 +12580,7 @@ impl EngineRuntime {
         filter_column_index: usize,
         lower_bound: Option<&SimpleRangeBoundValue>,
         upper_bound: Option<&SimpleRangeBoundValue>,
+        residual_plans: &[SimpleResidualPlan],
         projection_indexes: &[usize],
         column_names: Vec<String>,
         order_by: Option<Vec<SimpleOrderByPlan>>,
@@ -12577,8 +12597,12 @@ impl EngineRuntime {
             let mut skipped = 0usize;
             for stored_row in row_source.rows() {
                 let stored_row = stored_row?;
-                let candidate = &stored_row.values()[filter_column_index];
+                let values = stored_row.values();
+                let candidate = &values[filter_column_index];
                 if !simple_range_bound_matches(candidate, lower_bound, upper_bound)? {
+                    continue;
+                }
+                if !simple_residual_matches_all(values, residual_plans)? {
                     continue;
                 }
                 if skipped < offset {
@@ -12588,24 +12612,22 @@ impl EngineRuntime {
                 if limit.is_some_and(|limit| rows.len() >= limit) {
                     break;
                 }
-                rows.push(project_simple_projection_values(
-                    stored_row.values(),
-                    projection_indexes,
-                ));
+                rows.push(project_simple_projection_values(values, projection_indexes));
             }
             return Ok(QueryResult::with_rows(column_names, rows));
         }
 
         for stored_row in row_source.rows() {
             let stored_row = stored_row?;
-            let candidate = &stored_row.values()[filter_column_index];
+            let values = stored_row.values();
+            let candidate = &values[filter_column_index];
             if !simple_range_bound_matches(candidate, lower_bound, upper_bound)? {
                 continue;
             }
-            rows.push(project_simple_projection_values(
-                stored_row.values(),
-                projection_indexes,
-            ));
+            if !simple_residual_matches_all(values, residual_plans)? {
+                continue;
+            }
+            rows.push(project_simple_projection_values(values, projection_indexes));
         }
         apply_simple_projection_postprocessing_with_order(
             Some(self),
@@ -12662,6 +12684,7 @@ impl EngineRuntime {
         filter_column_index: usize,
         lower_bound: Option<&SimpleRangeBoundValue>,
         upper_bound: Option<&SimpleRangeBoundValue>,
+        residual_plans: &[SimpleResidualPlan],
         projection_indexes: &[usize],
         column_names: Vec<String>,
         order_by: Option<Vec<SimpleOrderByPlan>>,
@@ -12681,6 +12704,9 @@ impl EngineRuntime {
                 if !simple_range_bound_matches(candidate, lower_bound, upper_bound)? {
                     return Ok(false);
                 }
+                if !simple_residual_matches_all(values, residual_plans)? {
+                    return Ok(false);
+                }
                 if skipped < offset {
                     skipped = skipped.saturating_add(1);
                     return Ok(false);
@@ -12698,6 +12724,9 @@ impl EngineRuntime {
             if !simple_range_bound_matches(candidate, lower_bound, upper_bound)? {
                 return Ok(());
             }
+            if !simple_residual_matches_all(values, residual_plans)? {
+                return Ok(());
+            }
             rows.push(project_simple_projection_values(values, projection_indexes));
             Ok(())
         })?;
@@ -12709,6 +12738,50 @@ impl EngineRuntime {
             limit,
             offset,
         )
+    }
+
+    fn build_simple_residual_plans(
+        &self,
+        table_schema: &TableSchema,
+        table_name: &str,
+        binding_name: &str,
+        residual: &[SimpleResidualFilterTerm<'_>],
+        params: &[Value],
+    ) -> Result<Vec<SimpleResidualPlan>> {
+        let mut plans = Vec::with_capacity(residual.len());
+        for term in residual {
+            if let Some(term_table) = term.table {
+                if !identifiers_equal(term_table, table_name)
+                    && !identifiers_equal(term_table, binding_name)
+                {
+                    return Ok(plans);
+                }
+            }
+            let column_index = table_schema
+                .columns
+                .iter()
+                .position(|candidate| identifiers_equal(&candidate.name, term.column))
+                .ok_or_else(|| {
+                    DbError::internal(format!(
+                        "simple filtered projection residual column {} missing from {table_name}",
+                        term.column
+                    ))
+                })?;
+            let value = self.eval_expr(
+                term.value_expr,
+                &Dataset::empty(),
+                &[],
+                params,
+                &BTreeMap::new(),
+                None,
+            )?;
+            plans.push(SimpleResidualPlan {
+                column_index,
+                op: term.op,
+                value,
+            });
+        }
+        Ok(plans)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -15428,6 +15501,12 @@ impl EngineRuntime {
                 })
             })
             .transpose()?;
+        if !range_filter.residual.is_empty() {
+            // The deferred distinct filtered fast path does not yet evaluate
+            // residual predicates; bail to the generic executor to preserve
+            // correctness.
+            return Ok(None);
+        }
         let order_by = self.simple_projection_order_by_plan(
             query,
             table_schema,
@@ -15607,23 +15686,25 @@ impl EngineRuntime {
             .table(name)
             .and_then(|table| self.deferred_paged_row_locator_caches.get(&table.name))
             .map(|cache| cache.as_ref());
-        if let Some(result) = self.try_simple_deferred_rowid_range_projection_result(
-            &store,
-            state,
-            table_schema,
-            TableBindingRef { name, alias },
-            filter_column,
-            lower_bound.as_ref(),
-            upper_bound.as_ref(),
-            &projection_indexes,
-            column_names.clone(),
-            &query.order_by,
-            limit,
-            offset,
-            use_persistent_pk_index,
-            paged_locator_cache,
-        )? {
-            return Ok(Some(result));
+        if range_filter.residual.is_empty() {
+            if let Some(result) = self.try_simple_deferred_rowid_range_projection_result(
+                &store,
+                state,
+                table_schema,
+                TableBindingRef { name, alias },
+                filter_column,
+                lower_bound.as_ref(),
+                upper_bound.as_ref(),
+                &projection_indexes,
+                column_names.clone(),
+                &query.order_by,
+                limit,
+                offset,
+                use_persistent_pk_index,
+                paged_locator_cache,
+            )? {
+                return Ok(Some(result));
+            }
         }
 
         let order_by = self.simple_projection_order_by_plan(
@@ -15636,6 +15717,16 @@ impl EngineRuntime {
         if !query.order_by.is_empty() && order_by.is_none() {
             return Ok(None);
         }
+        let residual_plans = self.build_simple_residual_plans(
+            table_schema,
+            name,
+            binding_name,
+            &range_filter.residual,
+            params,
+        )?;
+        if residual_plans.len() != range_filter.residual.len() {
+            return Ok(None);
+        }
         Ok(Some(
             self.simple_filtered_projection_result_from_persisted_state(
                 &store,
@@ -15643,6 +15734,7 @@ impl EngineRuntime {
                 filter_column_index,
                 lower_bound.as_ref(),
                 upper_bound.as_ref(),
+                &residual_plans,
                 &projection_indexes,
                 column_names,
                 order_by,
@@ -26300,12 +26392,74 @@ enum SimpleJoinProjectionSource {
     Expr(Expr),
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct SimpleRangeProjectionFilter<'a> {
     table: Option<&'a str>,
     column: &'a str,
     lower: Option<SimpleRangeBound<'a>>,
     upper: Option<SimpleRangeBound<'a>>,
+    residual: Vec<SimpleResidualFilterTerm<'a>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SimpleResidualFilterTerm<'a> {
+    table: Option<&'a str>,
+    column: &'a str,
+    op: BinaryOp,
+    value_expr: &'a Expr,
+}
+
+#[derive(Clone, Debug)]
+struct SimpleResidualPlan {
+    column_index: usize,
+    op: BinaryOp,
+    value: Value,
+}
+
+fn simple_residual_matches(candidate: &Value, plan: &SimpleResidualPlan) -> Result<bool> {
+    // SQL three-valued logic: any comparison with a NULL operand yields
+    // NULL (unknown), which a WHERE treats as false. Mirror the generic
+    // executor's NULL short-circuit (eval_binary, expressions.rs) so the
+    // residual fast path never includes rows that the generic path would
+    // exclude for `col <> v`, `col < v`, `col <= v` on a NULL candidate.
+    if matches!(candidate, Value::Null) || matches!(plan.value, Value::Null) {
+        return Ok(false);
+    }
+    // Incompatible-type comparisons return Err from compare_values. The
+    // generic executor may coerce some of these; rather than aborting the
+    // query on the fast path, treat the term as not satisfied so the row is
+    // excluded consistently with a WHERE that cannot match.
+    let Ok(ordering) = compare_values(candidate, &plan.value) else {
+        return Ok(false);
+    };
+    let truthy = match plan.op {
+        BinaryOp::Eq => ordering == std::cmp::Ordering::Equal,
+        BinaryOp::NotEq => ordering != std::cmp::Ordering::Equal,
+        BinaryOp::Gt => ordering == std::cmp::Ordering::Greater,
+        BinaryOp::GtEq => ordering != std::cmp::Ordering::Less,
+        BinaryOp::Lt => ordering == std::cmp::Ordering::Less,
+        BinaryOp::LtEq => ordering != std::cmp::Ordering::Greater,
+        _ => false,
+    };
+    Ok(truthy)
+}
+
+fn simple_residual_matches_all(
+    values: &[Value],
+    residual_plans: &[SimpleResidualPlan],
+) -> Result<bool> {
+    if residual_plans.is_empty() {
+        return Ok(true);
+    }
+    for plan in residual_plans {
+        let Some(candidate) = values.get(plan.column_index) else {
+            return Ok(false);
+        };
+        if !simple_residual_matches(candidate, plan)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn simple_range_projection_filter(filter: &Expr) -> Option<SimpleRangeProjectionFilter<'_>> {
@@ -26316,15 +26470,17 @@ fn simple_range_projection_filter(filter: &Expr) -> Option<SimpleRangeProjection
         column: state.column?,
         lower: state.lower,
         upper: state.upper,
+        residual: state.residual,
     })
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct SimpleRangeFilterState<'a> {
     table: Option<&'a str>,
     column: Option<&'a str>,
     lower: Option<SimpleRangeBound<'a>>,
     upper: Option<SimpleRangeBound<'a>>,
+    residual: Vec<SimpleResidualFilterTerm<'a>>,
 }
 
 fn collect_simple_range_projection_terms<'a>(
@@ -26342,44 +26498,127 @@ fn collect_simple_range_projection_terms<'a>(
             Some(())
         }
         Expr::Binary { left, op, right } => {
-            let (table, column, bound_kind, value_expr) =
-                simple_range_projection_bound(left, *op, right).or_else(|| {
-                    simple_range_projection_bound(right, reverse_binary_op(*op)?, left)
-                })?;
+            let bound = simple_range_projection_bound(left, *op, right)
+                .or_else(|| simple_range_projection_bound(right, reverse_binary_op(*op)?, left));
+            if let Some((table, column, bound_kind, value_expr)) = bound {
+                // Determine whether this term is on the same column as the
+                // range column we are building. If it is on a different
+                // column, do not bail; fall through to the residual handling
+                // below so conjunctive filters like
+                // `rating BETWEEN 7.5 AND 9.0 AND runtime_minutes > 120` can
+                // still use the filtered projection fast path with a residual
+                // predicate instead of falling back to the generic executor.
+                let same_as_range_column = state
+                    .column
+                    .is_some_and(|existing| identifiers_equal(existing, column));
+                if same_as_range_column {
+                    if let Some(existing_table) = state.table {
+                        if Some(existing_table) != table {
+                            return None;
+                        }
+                    } else {
+                        state.table = table;
+                    }
+                    match bound_kind {
+                        SimpleRangeBoundKind::Lower(inclusive) => {
+                            if state.lower.is_some() {
+                                return None;
+                            }
+                            state.lower = Some(SimpleRangeBound {
+                                inclusive,
+                                value_expr,
+                            });
+                        }
+                        SimpleRangeBoundKind::Upper(inclusive) => {
+                            if state.upper.is_some() {
+                                return None;
+                            }
+                            state.upper = Some(SimpleRangeBound {
+                                inclusive,
+                                value_expr,
+                            });
+                        }
+                    }
+                    return Some(());
+                }
+                if state.column.is_some() {
+                    // A range column is already chosen and this term is on a
+                    // different column; treat it as a residual below.
+                } else {
+                    // No range column chosen yet and this term is a range
+                    // bound; claim it as the range column.
+                    if let Some(existing_table) = state.table {
+                        if Some(existing_table) != table {
+                            return None;
+                        }
+                    } else {
+                        state.table = table;
+                    }
+                    state.column = Some(column);
+                    match bound_kind {
+                        SimpleRangeBoundKind::Lower(inclusive) => {
+                            if state.lower.is_some() {
+                                return None;
+                            }
+                            state.lower = Some(SimpleRangeBound {
+                                inclusive,
+                                value_expr,
+                            });
+                        }
+                        SimpleRangeBoundKind::Upper(inclusive) => {
+                            if state.upper.is_some() {
+                                return None;
+                            }
+                            state.upper = Some(SimpleRangeBound {
+                                inclusive,
+                                value_expr,
+                            });
+                        }
+                    }
+                    return Some(());
+                }
+            }
+            // Not a range bound on the range column. Try to capture it as a
+            // simple residual column-vs-literal/param comparison on a
+            // different column so the filtered projection fast path can
+            // still apply the range prefilter and evaluate the residual
+            // inline, avoiding the generic executor for conjunctive filters
+            // like `rating BETWEEN 7.5 AND 9.0 AND runtime_minutes > 120`.
+            let Some((res_table, res_column, res_op, res_value)) =
+                simple_residual_projection_bound(left, *op, right).or_else(|| {
+                    simple_residual_projection_bound(right, reverse_binary_op(*op)?, left)
+                })
+            else {
+                return None;
+            };
             if let Some(existing_table) = state.table {
-                if Some(existing_table) != table {
+                if Some(existing_table) != res_table && res_table.is_some() {
                     return None;
                 }
-            } else {
-                state.table = table;
             }
-            if let Some(existing_column) = state.column {
-                if !identifiers_equal(existing_column, column) {
-                    return None;
-                }
-            } else {
-                state.column = Some(column);
+            if state
+                .column
+                .is_some_and(|existing| identifiers_equal(existing, res_column))
+            {
+                // Residual on the same column as the range would duplicate a
+                // bound we already captured; bail to keep semantics simple.
+                return None;
             }
-            match bound_kind {
-                SimpleRangeBoundKind::Lower(inclusive) => {
-                    if state.lower.is_some() {
-                        return None;
-                    }
-                    state.lower = Some(SimpleRangeBound {
-                        inclusive,
-                        value_expr,
-                    });
-                }
-                SimpleRangeBoundKind::Upper(inclusive) => {
-                    if state.upper.is_some() {
-                        return None;
-                    }
-                    state.upper = Some(SimpleRangeBound {
-                        inclusive,
-                        value_expr,
-                    });
-                }
+            if state
+                .residual
+                .iter()
+                .any(|existing| identifiers_equal(existing.column, res_column))
+            {
+                // At most one residual term per column to avoid interaction
+                // edge cases (e.g. two predicates on the same column).
+                return None;
             }
+            state.residual.push(SimpleResidualFilterTerm {
+                table: res_table,
+                column: res_column,
+                op: res_op,
+                value_expr: res_value,
+            });
             Some(())
         }
         _ => None,
@@ -26400,7 +26639,7 @@ fn simple_range_projection_bound<'a>(
     let Expr::Column { table, column } = left else {
         return None;
     };
-    if !matches!(right, Expr::Literal(_) | Expr::Parameter(_)) {
+    if !simple_bound_value_expr_is_constant(right) {
         return None;
     }
     let bound_kind = match op {
@@ -26411,6 +26650,43 @@ fn simple_range_projection_bound<'a>(
         _ => return None,
     };
     Some((table.as_deref(), column.as_str(), bound_kind, right))
+}
+
+fn simple_residual_projection_bound<'a>(
+    left: &'a Expr,
+    op: BinaryOp,
+    right: &'a Expr,
+) -> Option<(Option<&'a str>, &'a str, BinaryOp, &'a Expr)> {
+    let Expr::Column { table, column } = left else {
+        return None;
+    };
+    if !simple_bound_value_expr_is_constant(right) {
+        return None;
+    }
+    if !matches!(
+        op,
+        BinaryOp::Eq
+            | BinaryOp::NotEq
+            | BinaryOp::Gt
+            | BinaryOp::GtEq
+            | BinaryOp::Lt
+            | BinaryOp::LtEq
+    ) {
+        return None;
+    }
+    Some((table.as_deref(), column.as_str(), op, right))
+}
+
+/// A range/residual bound value is "constant" if it can be evaluated once
+/// without row context: a literal, a parameter, or a cast of a literal or
+/// parameter (e.g. `CAST('2010-01-01' AS DATE)`, which is how the parser
+/// represents typed date literals).
+fn simple_bound_value_expr_is_constant(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(_) | Expr::Parameter(_) => true,
+        Expr::Cast { expr, .. } => simple_bound_value_expr_is_constant(expr),
+        _ => false,
+    }
 }
 
 fn reverse_binary_op(op: BinaryOp) -> Option<BinaryOp> {

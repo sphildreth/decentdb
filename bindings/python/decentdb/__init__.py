@@ -756,6 +756,12 @@ class Cursor:
             if _fastdecode_native is not None
             else None
         )
+        self._decode_matrix_i64_text_f64_i64_i64_native = (
+            getattr(_fastdecode_native, "decode_matrix_i64_text_f64_i64_i64", None)
+            if _fastdecode_native is not None
+            else None
+        )
+        self._decode_matrix_i64_text_f64_i64_i64_sql_support = {}
         self._decode_row_i64_text_text_native = (
             getattr(_fastdecode_native, "decode_row_i64_text_text", None)
             if _fastdecode_native is not None
@@ -3387,6 +3393,27 @@ class Cursor:
                     self._decode_matrix_i64_f64_text_text_i64_f64_sql_support[sql] = (
                         False
                     )
+
+        if col_count == 5:
+            sql = self._last_sql
+            native_supported = self._decode_matrix_i64_text_f64_i64_i64_sql_support.get(
+                sql, True
+            )
+            if (
+                self._decode_matrix_i64_text_f64_i64_i64_native is not None
+                and native_supported
+                and int(values_ptr[0].tag) == DDB_VALUE_INT64
+                and int(values_ptr[1].tag) == DDB_VALUE_TEXT
+                and int(values_ptr[2].tag) == DDB_VALUE_FLOAT64
+                and int(values_ptr[3].tag) == DDB_VALUE_INT64
+                and int(values_ptr[4].tag) == DDB_VALUE_INT64
+            ):
+                try:
+                    return self._decode_matrix_i64_text_f64_i64_i64_native(
+                        ctypes.addressof(values_ptr.contents), row_count
+                    )
+                except Exception:
+                    self._decode_matrix_i64_text_f64_i64_i64_sql_support[sql] = False
 
         for row_index in range(row_count):
             base = row_index * col_count
