@@ -991,6 +991,65 @@ fn update_int_arithmetic_many_rows_updates_matching_rows_only_and_keeps_indexes_
 }
 
 #[test]
+fn composite_plain_column_index_build_is_correct_and_supports_lookup() {
+    // Regression coverage for the composite plain-column index build fast path
+    // added in `plain_index_column_positions` / `build_runtime_index`. The
+    // fast path reads each indexed column value by position and encodes a
+    // composite key without building a Dataset, so this test asserts that the
+    // built index returns the correct row ids for exact and prefix lookups,
+    // handles duplicate composite keys, and remains valid after `verify_index`.
+    let db = mem_db();
+    db.execute(
+        "CREATE TABLE roles(id INT64 PRIMARY KEY, department TEXT NOT NULL, job TEXT NOT NULL, billing INT64)",
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO roles(id, department, job, billing) VALUES
+            (1, 'Camera', 'Operator', 5),
+            (2, 'Camera', 'Operator', 3),
+            (3, 'Camera', 'DP', 1),
+            (4, 'Sound', 'Mixer', 2),
+            (5, 'Sound', 'Mixer', 4)",
+    )
+    .unwrap();
+    db.execute("CREATE INDEX idx_roles_dept_job ON roles(department, job)")
+        .unwrap();
+
+    // Exact composite key returns both rows sharing (Camera, Operator) in id order.
+    let r = db
+        .execute(
+            "SELECT id FROM roles WHERE department = 'Camera' AND job = 'Operator' ORDER BY id",
+        )
+        .unwrap();
+    assert_eq!(rows(&r), vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]);
+
+    // Prefix lookup on the leading column returns all Camera rows.
+    let r = db
+        .execute("SELECT id FROM roles WHERE department = 'Camera' ORDER BY id")
+        .unwrap();
+    assert_eq!(
+        rows(&r),
+        vec![
+            vec![Value::Int64(1)],
+            vec![Value::Int64(2)],
+            vec![Value::Int64(3)]
+        ]
+    );
+
+    // A different prefix returns the Sound rows.
+    let r = db
+        .execute("SELECT id FROM roles WHERE department = 'Sound' ORDER BY id")
+        .unwrap();
+    assert_eq!(rows(&r), vec![vec![Value::Int64(4)], vec![Value::Int64(5)]]);
+
+    let verification = db.verify_index("idx_roles_dept_job").unwrap();
+    assert!(
+        verification.valid,
+        "composite index idx_roles_dept_job became invalid"
+    );
+}
+
+#[test]
 fn update_int_arithmetic_parameter_delta_updates_only_matching_rows() {
     let db = mem_db();
     db.execute("CREATE TABLE movies(id INT64 PRIMARY KEY, status TEXT, vote_count INT64)")
@@ -1222,4 +1281,73 @@ fn upsert_with_filter_rejects() {
     exec(&db, "INSERT INTO ufr VALUES (1, 200) ON CONFLICT (id) DO UPDATE SET val = EXCLUDED.val WHERE ufr.val > 999");
     let r = exec(&db, "SELECT val FROM ufr WHERE id = 1");
     assert_eq!(r.rows()[0].values()[0], Value::Int64(100)); // unchanged
+}
+
+#[test]
+fn resident_int_arithmetic_update_preserves_wide_row_non_updated_columns() {
+    // The no-index-touched arithmetic fast path writes the changed column
+    // in place. This guards against it corrupting the other wide-row columns
+    // (TEXT/DATE/FLOAT64) when the updated column is not part of any index.
+    let db = mem_db();
+    db.execute(
+        "CREATE TABLE movies (id INT64 PRIMARY KEY, title TEXT NOT NULL, overview TEXT, released DATE, rating FLOAT64, status TEXT, vote_count INT64)",
+    )
+    .unwrap();
+    db.execute("CREATE INDEX idx_movies_status ON movies(status)")
+        .unwrap();
+    db.execute("CREATE INDEX idx_movies_rating ON movies(rating)")
+        .unwrap();
+    db.execute(
+        "INSERT INTO movies (id, title, overview, released, rating, status, vote_count) VALUES \
+         (1, 'A', 'overview A', DATE '2010-01-01', 8.0, 'Released', 10), \
+         (2, 'B', 'overview B', DATE '2012-06-15', 7.5, 'Archived', 4), \
+         (3, 'C', 'overview C', DATE '2015-03-01', 9.0, 'Released', 20)",
+    )
+    .unwrap();
+
+    let result = db
+        .execute("UPDATE movies SET vote_count = vote_count + 5 WHERE status = 'Released'")
+        .unwrap();
+    assert_eq!(result.affected_rows(), 2);
+
+    let got = rows(
+        &db.execute("SELECT id, title, overview, released, rating, status, vote_count FROM movies ORDER BY id")
+            .unwrap(),
+    );
+    assert_eq!(
+        got,
+        vec![
+            vec![
+                Value::Int64(1),
+                Value::Text("A".to_string()),
+                Value::Text("overview A".to_string()),
+                Value::DateDays(14610),
+                Value::Float64(8.0),
+                Value::Text("Released".to_string()),
+                Value::Int64(15),
+            ],
+            vec![
+                Value::Int64(2),
+                Value::Text("B".to_string()),
+                Value::Text("overview B".to_string()),
+                Value::DateDays(15506),
+                Value::Float64(7.5),
+                Value::Text("Archived".to_string()),
+                Value::Int64(4),
+            ],
+            vec![
+                Value::Int64(3),
+                Value::Text("C".to_string()),
+                Value::Text("overview C".to_string()),
+                Value::DateDays(16495),
+                Value::Float64(9.0),
+                Value::Text("Released".to_string()),
+                Value::Int64(25),
+            ],
+        ]
+    );
+
+    // Indexes must remain valid since the updated column is not indexed.
+    assert!(db.verify_index("idx_movies_status").unwrap().valid);
+    assert!(db.verify_index("idx_movies_rating").unwrap().valid);
 }

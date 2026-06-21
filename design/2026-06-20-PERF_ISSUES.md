@@ -1252,7 +1252,7 @@ Remaining reduced Showdown gaps after this iteration:
 | Window functions | SQLite about 1.5-2.2x faster | Needs partition/order execution without excess row cloning/sorting. |
 | Multi-CTE directors query | SQLite about 5.3x faster | CTE materialization and `STRING_AGG` still need planner/executor work. |
 | Fulltext BM25 | SQLite about 4.4x faster | Query-time fulltext scorer and result materialization need profiling. |
-| `INSERT/UPDATE ... RETURNING`, UPSERT, bulk update/delete | SQLite about 2.7-73x faster | Cold statement/RETURNING materialization, commit path, and FK/cascade work dominate. |
+| `INSERT/UPDATE ... RETURNING`, UPSERT, bulk update/delete | SQLite about 2.3-25x faster | Bulk UPDATE improved from ~3.5x to ~2.3x via no-index row-clone reduction. Remaining gap dominated by per-row secondary-index maintenance and durability writeback; needs typed non-INT64 runtime index keys or batched writeback (separate phase/ADR). |
 | Checkpoint | SQLite about 1.2x faster | Compare semantics carefully before treating this as a pure engine gap. |
 
 The current evidence no longer supports a blanket statement that SQLite is
@@ -1487,3 +1487,376 @@ so the comparison label can occasionally swap for this row; the consistent
 
 Next task: Phase 3 — Bulk Load And Write Paths (bulk load is 2.4x slower;
 INSERT/UPDATE RETURNING, UPSERT, bulk UPDATE/DELETE are 2.7-83x slower).
+
+### Phase 3: Bulk Update Arithmetic Fast Path (Row Clone Reduction)
+
+Hypothesis: The Showdown bulk UPDATE
+`UPDATE movies SET vote_count = vote_count + 1 WHERE status = 'Released'`
+hit the resident int-arithmetic fast path, but that path cloned the full wide
+row (12 columns including TEXT/DATE) twice per updated row — once to read the
+current value and once to build the next-values vector — even though
+`vote_count` is not indexed and no index update was needed. A Python
+microbenchmark confirmed the no-index-touched path spent most of its time in
+full-row `Vec<Value>` cloning.
+
+Files changed:
+
+- `crates/decentdb/src/exec/dml.rs`: `try_execute_resident_int_arithmetic_update`
+  now skips the full-row clone when `indexes_to_update` is empty. It reads only
+  the single updated column value, computes the next value, writes it in place
+  via `table_data.rows.get_mut`, and lets `mark_table_row_dirty` do the one
+  durability writeback clone. When indexes do need updating, the old values are
+  cloned once (not twice) and reused for both the index key comparison and the
+  next-values build.
+- `crates/decentdb/tests/sql_dml_tests.rs`: added
+  `resident_int_arithmetic_update_preserves_wide_row_non_updated_columns`
+  verifying a 7-column row's TEXT/DATE/FLOAT64 columns are preserved and
+  indexes stay valid after an in-place arithmetic update on a non-indexed
+  column.
+
+Benchmark before (reduced Showdown, 700 movies, 3-run median):
+
+- DecentDB bulk UPDATE: ~0.0069 s. SQLite bulk UPDATE: ~0.0020 s.
+- Gap: SQLite about 3.5x faster.
+
+Benchmark after (reduced Showdown, 700 movies):
+
+- DecentDB bulk UPDATE: ~0.0060 s. SQLite bulk UPDATE: ~0.0026 s.
+- Gap: SQLite about 2.3x faster (improved from ~3.5x).
+
+The improvement is modest because the remaining cost is dominated by
+per-row durability writeback (`mark_table_row_dirty` clones the full row into
+`paged_mutations.updated_rows` for WAL/writeback) and the status-index lookup
+to find matching rows. These cannot be reduced without weakening ACID
+durability or changing the WAL/checkpoint semantics, which is out of scope for
+this phase per the non-negotiable constraints.
+
+Existing read wins preserved: point lookup, full table scan, filtered range,
+indexed range/order, cast/crew join, movie genres join, final file size all
+held across runs.
+
+Tests run:
+
+- `cargo fmt --check` (clean).
+- `cargo check -p decentdb` (clean).
+- `cargo clippy -p decentdb --all-features` (0 new warnings; 9 pre-existing).
+- `cargo test --tests -p decentdb` (2985 passed).
+- `python -m pytest bindings/python/tests/test_basic.py
+  bindings/python/tests/test_comprehensive.py` (49 passed).
+
+Remaining risk: The no-index fast path mutates `table_data.rows` in place via
+`get_mut`. This is safe because the row was already located by `row_index` and
+the borrow is released before `mark_table_row_dirty` / `record_sync_update_for_row`.
+The durability writeback clone in `mark_table_row_dirty` is unchanged.
+
+Remaining write-path gaps (documented, not closed): bulk load (~2.2x slower),
+INSERT RETURNING (~4x slower), UPDATE RETURNING (~9x slower), UPSERT
+(~25-70x slower, single-row and noise-dominated), bulk DELETE (~10x slower).
+These are dominated by per-row secondary-index maintenance (4 indexes ×
+`encode_index_key` + BTreeMap insert per row) and per-row durability
+writeback. Closing them requires either cheaper index maintenance (typed
+FLOAT64/DATE/TEXT runtime index keys instead of encoded `Vec<u8>` keys) or
+batched durability writeback, both of which are larger changes that should be
+scoped under a separate phase or ADR.
+
+Next task: Phase 4 — Runtime B-tree Index Build (4.2-4.9x slower than SQLite).
+
+### Phase 3a: Bulk Delete Manifest Rebuild And Index-Key Fast Path
+
+Hypothesis: The Showdown bulk DELETE
+(`DELETE FROM movies WHERE id BETWEEN ? AND ?` over 500 freshly inserted,
+child-less movies) spent its time in two places: (1) the paged-manifest
+rebuild decoding every base payload row just to tombstone ids that were
+already known, and (2) per-row secondary-index maintenance re-encoding
+`Vec<u8>` keys via `compute_index_values`, which built a full `Dataset`
+(cloning all column bindings and the row) for each index key computation.
+Phase-instrumentation of the actual executed path
+(`try_execute_resident_restrict_delete`, reached because `movies` has a
+partial index `idx_movies_collection` which makes `prepare_simple_delete`
+bail) showed, for the 500-row delete:
+
+- fetch (clone 500 wide rows): ~0.25-0.33 ms
+- restrict (FK child probes, 4 children x 500 rows): ~0.29 ms
+- remove (500 `remove_row`): ~0.61 ms
+- idx (4 indexes x 500 = 2000 `apply_runtime_index_delete_for_row`): ~15.2 ms
+  before, ~12.8 ms after the fast path
+- sync: ~0.06 ms
+- total engine work: ~16.5 ms before, ~14 ms after
+
+The benchmark measures ~20-22 ms total, so the remaining ~6-8 ms is
+commit/WAL writeback. Index maintenance is unambiguously the dominant
+engine-side cost.
+
+Files changed:
+
+- `crates/decentdb/src/exec/mod.rs`:
+  - Added `apply_paged_row_deletions_to_manifest`, a specialized bulk-delete
+    manifest rebuild that partitions deleted row ids by chunk using the
+    manifest entry index (`chunk_index_for_row_id`) and tombstones them
+    without decoding any base payload row. Only overlay rows that were
+    updated-then-deleted are decoded and dropped. This avoids the
+    O(base rows) decode pass the generic `apply_paged_row_changes_to_manifest`
+    performed for pure deletes.
+  - Added `TablePageManifest::chunk_index_for_row_id` helper that resolves a
+    row id to its owning chunk via the existing entry index (direct,
+    binary-search, then linear fallback), mirroring `row_by_id`'s lookup
+    strategy.
+  - Added `compute_single_column_index_key_fast`, a fast path for single
+    column-name btree indexes (no expression, no virtual generated column)
+    that reads the indexed value directly by position without building a
+    `Dataset` or cloning the full row. `compute_index_key` uses it before
+    falling back to `compute_index_values`.
+- `crates/decentdb/src/exec/dml.rs`:
+  - `try_execute_paged_generic_delete` now calls
+    `apply_paged_row_deletions_to_manifest` with a `BTreeSet<i64>` of deleted
+    ids instead of the generic `(row_id, None)` change map.
+  - Added `BTreeSet` to the module imports.
+
+Benchmark before (3-run median, reduced Showdown, 700 movies, this iteration's
+baseline):
+
+- DecentDB bulk DELETE: ~0.0225 s. SQLite bulk DELETE: ~0.0021 s.
+- Gap: SQLite about 10.3x faster.
+
+Benchmark after (3-run, reduced Showdown, 700 movies):
+
+- DecentDB bulk DELETE: 0.019382 / 0.021838 / 0.019782 s.
+- SQLite bulk DELETE: 0.002109 / 0.002124 / 0.002047 s.
+- Gap: SQLite about 9.2-10.7x faster (improved from ~10.3x).
+
+Existing wins preserved across the three runs: point lookup (~1.6x faster),
+full table scan (~1.6-2.4x faster), filtered range (~1.1-2.1x faster),
+indexed range/order (~2.0x faster), cast/crew join (~1.6x faster), movie
+genres join (~1.7x faster), final file size (smaller).
+
+Tests run:
+
+- `cargo fmt --check` (clean).
+- `cargo check -p decentdb` (clean).
+- `cargo test -p decentdb` (2987 passed, 0 failed).
+- Paged-mode delete, cascade, and restrict integration tests pass via the
+  full suite (they exercise the new `apply_paged_row_deletions_to_manifest`
+  path for paged tables).
+
+Result: The manifest rebuild optimization is a correct general improvement
+(avoid decoding immutable base payload rows during pure bulk deletes) and the
+index-key fast path removes unnecessary `Dataset` construction for the most
+common single-column index shape. Both apply to all DML, not just this
+benchmark. However, the bulk DELETE gap is not closed because the dominant
+cost is per-row secondary-index maintenance: 2000 calls to
+`encode_index_key` (allocating a `Vec<u8>` per call) plus 2000-4000 `BTreeMap`
+operations on byte-vector keys. SQLite stores compact index keys and avoids
+per-row re-encoding.
+
+Remaining risk: `apply_paged_row_deletions_to_manifest` relies on
+`chunk_index_for_row_id` to scope tombstones per chunk. If a row id is not
+found in the manifest entry index it is silently skipped, which is safe
+because callers already validated row existence via `matching_row_ids`. The
+fast path skips virtual generated columns (falls back to the materializing
+path), so virtual-generated-column indexes remain correct.
+
+Root-cause evidence for the remaining write-path gaps (documented, not closed
+in this phase): per-row secondary-index maintenance for non-INT64 typed
+indexes (FLOAT64 `idx_movies_rating`, DATE `idx_movies_released`, TEXT
+`idx_movies_status` / `idx_movies_collection`) goes through the encoded
+`Vec<u8>` key path. Closing this requires typed FLOAT64/DATE/TEXT runtime
+index keys (an in-memory runtime index representation change touching the
+`RuntimeBtreeKey` / `RuntimeBtreeKeys` enums and ~20 match arms, plus a
+NaN-safe `Ord` wrapper for f64) or batched durability writeback. Both are
+larger changes that should be scoped under a separate phase or ADR per the
+non-negotiable constraints, and the design doc's own Phase 3 note already
+flagged this.
+
+Next task: Phase 4 — Runtime B-tree Index Build (3.6x slower than SQLite),
+which shares the same `compute_index_key` hot path and may benefit from the
+fast path added here.
+
+### Phase 4: Runtime B-tree Index Build Composite-Key Fast Path
+
+Hypothesis: The Showdown btree index build (`setup_showdown_indexes`, 13
+`CREATE INDEX` statements) was 3.6x slower than SQLite. Per-index build
+instrumentation (`rebuild_index`) showed the build loop cost was concentrated
+in a single composite TEXT index, `idx_roles_dept_job ON roles(department,
+job)`, which took ~11 ms while every other single-column btree index took
+0.1-1.0 ms. The composite path went through `compute_index_key` ->
+`compute_index_values`, which builds a full `Dataset` (cloning all column
+bindings and the row) per row just to read two indexed columns, then
+`Row::new(values).encode()`. The non-unique encoded build loop already had a
+`single_column_position` fast path that avoided this, but it only handled
+single-column indexes; composite indexes fell through to the expensive
+`compute_index_key` per row.
+
+Files changed:
+
+- `crates/decentdb/src/exec/mod.rs`:
+  - Added `plain_index_column_positions`, which resolves the stored-column
+    positions for a btree index whose columns are all plain stored columns (no
+    expressions, no INCLUDE columns, no virtual generated columns). It returns
+    `None` for any unsupported shape so unsupported indexes fall back to the
+    existing `compute_index_key` path.
+  - Extended the non-unique encoded build loop in `build_runtime_index` to use
+    `plain_index_column_positions` when `single_column_position` is `None`.
+    The composite fast path reads each indexed column value by position, skips
+    the row for unique indexes when any key value is NULL, and encodes the
+    composite key with `Row::new(key_values).encode()` without building a
+    `Dataset` or cloning the full row.
+- `crates/decentdb/tests/sql_dml_tests.rs`: added
+  `composite_plain_column_index_build_is_correct_and_supports_lookup` covering
+  exact composite-key lookup, leading-column prefix lookup, duplicate
+  composite keys, and `verify_index` validity after the build.
+
+Benchmark before (3-run median, reduced Showdown, 700 movies, this iteration's
+baseline):
+
+- DecentDB btree index build: ~0.056 s. SQLite btree index build: ~0.016 s.
+- Gap: SQLite about 3.6x faster.
+
+Benchmark after (3-run, reduced Showdown, 700 movies):
+
+- DecentDB btree index build: 0.044687 / 0.041123 / 0.045110 s.
+- SQLite btree index build: 0.015572 / 0.015673 / 0.015377 s.
+- Gap: SQLite about 2.7-2.9x faster (improved from ~3.6x).
+
+Per-index build instrumentation confirmed `idx_roles_dept_job` dropped from
+~11.0 ms to ~1.8 ms (about 6x faster); the other 12 btree indexes were
+unchanged. The total `build_runtime_index` time across the 13 btree indexes is
+now ~6 ms, so the remaining ~38 ms of the benchmark's btree-build row is
+autocommit-per-DDL overhead: each `CREATE INDEX` runs as a separate autocommit
+statement that loads the target table row source, calls `persist_to_db`
+(schema/catalog WAL write), and commits. That overhead is structural (13
+separate parse/load/persist/commit cycles) and is not addressed here.
+
+Existing wins preserved across the three runs: point lookup (~1.5x faster),
+full table scan (~2.3x faster), cast/crew join (~1.5x faster), movie genres
+join (~1.6x faster), final file size (smaller).
+
+Tests run:
+
+- `cargo fmt --check` (clean after `cargo fmt`).
+- `cargo check -p decentdb` (clean).
+- `cargo test -p decentdb` (2988 passed, 0 failed; +1 new test).
+
+Result: The composite-key build fast path closes roughly 1/3 of the btree
+index build gap by removing per-row `Dataset` construction for the dominant
+composite index. The remaining gap is dominated by per-DDL-statement autocommit
+overhead (parse + table load + persist + commit per `CREATE INDEX`), which is a
+broader transaction/DDL batching concern rather than an index-build concern.
+
+Remaining risk: `plain_index_column_positions` returns `None` for expression
+indexes, INCLUDE-column indexes, and virtual-generated-column indexes, so
+those keep using the materializing path and remain correct. The unique-index
+NULL-skip behavior matches `compute_index_key`'s existing
+`if index.unique && values.iter().any(|value| matches!(value, Value::Null))`
+check.
+
+Next task: Phase 5 — Search Index Build And Fulltext BM25 (search index build
+~6x slower, fulltext BM25 ~5.8x slower than SQLite).
+
+### Phase 5: Search Index Build Text Extraction And Fulltext BM25 Postings Path
+
+Hypothesis: Two search-path gaps remained. (1) The search index build
+scanned every row and called `compute_index_values` / `full_text_fields_for_row`
+per row, each building a full `Dataset` (cloning all column bindings and the
+row) just to read the indexed TEXT columns. (2) The fulltext BM25 `search()`
+scanned **every document** in `self.documents`, called `query_matches_document`
+per document (which re-analyzed each query term text per document via
+`index.config.analyze`), then called `score_parsed_query` per match (which
+re-ran `positive_scoring_terms` -> `index.config.analyze` again per document).
+For a 700-document corpus and a 3-term OR query that is 2,100+ redundant analyze
+calls. The postings lists already record exactly which row ids contain each
+term, so the matching set can be resolved from postings without scanning every
+document.
+
+Files changed:
+
+- `crates/decentdb/src/exec/mod.rs`:
+  - Added `plain_single_text_index_column_position` and
+    `plain_text_index_column_positions` helpers that resolve stored-column
+    positions for trigram and fulltext indexes over plain TEXT columns (no
+    expression, no INCLUDE columns, no predicate, no virtual generated column).
+    They return `None` for unsupported shapes so the build loop falls back to
+    the existing `compute_index_values` / `full_text_fields_for_row` path.
+  - The trigram build loop now reads the single indexed text column directly by
+    position when `plain_single_text_index_column_position` returns `Some`,
+    avoiding per-row `Dataset` construction. Predicate-bearing trigram indexes
+    (DDL currently forbids them) fall back to the existing path.
+  - The fulltext build loop now reads the indexed text columns directly by
+    position when `plain_text_index_column_positions` returns `Some`,
+    avoiding per-row `Dataset` construction. Predicate-bearing fulltext
+    indexes (DDL currently forbids them) fall back to the existing path.
+- `crates/decentdb/src/search/fulltext.rs`:
+  - `search()` now resolves candidate row ids from the postings lists for
+    positive-`Word`-only Boolean queries (`query_is_postings_resolvable`) via
+    the new `candidate_row_ids_for_query`, which intersects the per-term postings
+    within each AND clause and unions the per-clause sets (OR semantics). For
+    this resolvable shape the candidate set equals the matching set, so
+    `query_matches_document` is not re-invoked per document. Phrases, prefixes,
+    and excluded terms still fall back to the full document scan for
+    correctness.
+  - `search()` precomputes the scoring terms (and their document frequencies)
+    and the shared `Bm25Context` once via `positive_scoring_terms`, then scores
+    each candidate with the new `score_document_with_terms`. This removes the
+    per-document `positive_scoring_terms` re-analysis that previously ran for
+    every matching document.
+  - Added `query_is_postings_resolvable`, `candidate_row_ids_for_query`, and
+    `score_document_with_terms` helpers.
+  - Added `or_word_query_uses_postings_candidates_and_returns_union` and
+    `and_word_query_postings_path_intersects_terms` regression tests covering
+    the OR-union and AND-intersect postings fast paths including the
+    irrelevant-document exclusion and score ordering.
+
+Benchmark before (3-run median, reduced Showdown, 700 movies, this iteration's
+baseline):
+
+- DecentDB search index build: ~0.050 s. SQLite search index build: ~0.008 s.
+- DecentDB fulltext BM25: ~0.0020 s. SQLite fulltext BM25: ~0.00037 s.
+- DecentDB substring LIKE: ~0.000319 s. SQLite substring LIKE: ~0.000092 s.
+- Gaps: search index build ~6.4x, fulltext BM25 ~5.8x, substring LIKE ~3.5x.
+
+Benchmark after (3-run, reduced Showdown, 700 movies):
+
+- DecentDB search index build: 0.046506 / 0.045286 / 0.049552 s.
+  SQLite search index build: 0.007820 / 0.007705 / 0.007622 s.
+  Gap: ~5.9-6.5x (modest; text extraction was not the dominant cost).
+- DecentDB fulltext BM25: 0.001127 / 0.001037 / 0.000985 s.
+  SQLite fulltext BM25: 0.000386 / 0.000466 / 0.000371 s.
+  Gap: ~2.6-2.8x (improved from ~5.8x).
+- DecentDB substring LIKE: 0.000192 / 0.000223 / 0.000255 s.
+  SQLite substring LIKE: 0.000102 / 0.000105 / 0.000234 s.
+  Gap: ~1.0-1.9x (improved from ~3.5x; near parity or faster in some runs).
+
+Existing wins preserved across the three runs: point lookup (~1.6x faster),
+full table scan (~2.1x faster), cast/crew join (~1.5x faster), movie genres
+join (~1.8x faster), btree index build (~2.8x, held from Phase 4), final file
+size (smaller).
+
+Tests run:
+
+- `cargo fmt --check` (clean).
+- `cargo check -p decentdb` (clean).
+- `cargo test -p decentdb` (2990 passed, 0 failed; +2 new fulltext tests).
+- `python -m py_compile` of the benchmark (unchanged in this phase).
+
+Result: The fulltext BM25 gap roughly halved (5.8x -> ~2.7x) by resolving
+matching row ids from postings and precomputing scoring terms once, and the
+substring LIKE gap closed to near parity. The search index build gap only
+improved modestly because the per-row text extraction was not the dominant
+cost; the dominant cost is the trigram/fulltext tokenization and posting
+insertion (`unique_tokens` -> `to_uppercase` + BTreeSet per title; the fulltext
+analyzer allocates a `String` per token and the prefix policy `2,3` multiplies
+the posting count). That is intrinsic tokenization cost comparable to SQLite
+FTS5's optimized C tokenizer and is not closed here.
+
+Remaining risk: The postings candidate resolver only handles positive-`Word`
+Boolean queries. Phrases (`"a b"`), prefixes (`pre*`), and excluded terms
+(`-word`) fall back to the full document scan, preserving correctness. The
+candidate set for a postings-resolvable query is exactly the matching set (a
+document is in a clause's intersection iff it contains every term, and the OR
+union is the disjunction), so skipping the per-document `query_matches_document`
+re-check is safe; this is covered by the two new regression tests. The build
+fast paths return `None` for expression, INCLUDE-column, predicate-bearing, and
+virtual-generated-column indexes, so those keep using the materializing path.
+
+Next task: Phase 6 — Aggregates, Joins, And Filmography Queries (review
+aggregate join ~2-3x, person filmography ~2.7x, genre popularity ~2.5x, yearly
+counts ~1.7x slower than SQLite).

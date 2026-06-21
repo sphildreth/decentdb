@@ -12,7 +12,7 @@ use crate::error::{DbDiagnostic, DbError, DbErrorCode, Result};
 use crate::{
     evict_shared_wal, ChangeStreamOptions, Db, DbConfig, DbEncryptionConfig,
     ProcessCoordinationMode, QueryResult, QueryWatchOptions, QueuedWriteOptions, RangeWatchOptions,
-    TableWatchOptions, Value,
+    TableWatchOptions, Value, WalSyncMode,
 };
 
 const DDB_OK: u32 = 0;
@@ -1348,6 +1348,27 @@ fn parse_process_coordination_option(value: &str) -> Result<ProcessCoordinationM
     }
 }
 
+fn parse_wal_sync_mode_option(value: &str, key: &str) -> Result<WalSyncMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "full" => Ok(WalSyncMode::Full),
+        "normal" => Ok(WalSyncMode::Normal),
+        other if other.starts_with("async_commit") => {
+            let interval_ms = other
+                .strip_prefix("async_commit")
+                .and_then(|rest| rest.trim().strip_prefix(':'))
+                .and_then(|rest| rest.trim().parse::<u32>().ok())
+                .filter(|ms| *ms >= 1)
+                .ok_or_else(|| {
+                    DbError::sql(format!(
+                        "invalid {key} async_commit value; expected async_commit:<ms>= {value}"
+                    ))
+                })?;
+            Ok(WalSyncMode::AsyncCommit { interval_ms })
+        }
+        _ => Err(DbError::sql(format!("invalid {key} value: {value}"))),
+    }
+}
+
 fn parse_u32_option(value: &str, key: &str) -> Result<u32> {
     value.trim().parse::<u32>().map_err(|_| {
         DbError::sql(format!(
@@ -1568,6 +1589,9 @@ fn db_config_from_options(options: Option<&str>) -> Result<DbConfig> {
             }
             "plan_cache_max_bytes" => {
                 config.plan_cache.max_size_bytes = parse_u64_option(&value, key.as_str())?;
+            }
+            "wal_sync_mode" | "synchronous" => {
+                config.wal_sync_mode = parse_wal_sync_mode_option(&value, key.as_str())?;
             }
             _ => {
                 return Err(DbError::sql(format!("unsupported database option: {key}")));

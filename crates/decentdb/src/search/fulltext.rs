@@ -138,12 +138,55 @@ impl FullTextIndex {
     ) -> Result<Vec<FullTextSearchHit>, FullTextIndexError> {
         let query = parse_runtime_query(&self.config, query_text)?;
         let mut hits = Vec::new();
-        for (row_id, document) in &self.documents {
-            if query_matches_document(self, document, &query) {
+        // Precompute the scoring terms (and their document frequencies) once so
+        // the per-document scoring avoids re-analyzing the query text for every
+        // candidate. This is the same set `score_parsed_query` would recompute
+        // per document via `positive_scoring_terms`.
+        let scoring_terms: Vec<(String, usize)> = positive_scoring_terms(self, &query)
+            .into_iter()
+            .filter_map(|term| {
+                let doc_freq = self.postings.get(&term).map_or(0_usize, BTreeMap::len);
+                Some((term, doc_freq))
+            })
+            .collect();
+        let scoring_context = Bm25Context {
+            corpus_size: self.non_empty_document_count as f64,
+            avg_doc_len: self.average_document_len(),
+            ..Bm25Context::default()
+        };
+        if query_is_postings_resolvable(&query) {
+            // Fast path: the query is a Boolean of positive Word terms only, so
+            // the candidate set resolved from postings is exactly the matching
+            // set. Score candidates directly without re-checking each document.
+            let candidate_row_ids = candidate_row_ids_for_query(self, &query);
+            hits.reserve(candidate_row_ids.len());
+            for row_id in candidate_row_ids {
+                let Some(document) = self.documents.get(&row_id) else {
+                    continue;
+                };
                 hits.push(FullTextSearchHit {
-                    row_id: *row_id,
-                    score: self.score_parsed_query(document, &query),
+                    row_id,
+                    score: self.score_document_with_terms(
+                        document,
+                        &scoring_terms,
+                        &scoring_context,
+                    ),
                 });
+            }
+        } else {
+            // Fall back to the full document scan for phrases, prefixes, and
+            // excluded terms that need document-level checks beyond postings.
+            for (row_id, document) in &self.documents {
+                if query_matches_document(self, document, &query) {
+                    hits.push(FullTextSearchHit {
+                        row_id: *row_id,
+                        score: self.score_document_with_terms(
+                            document,
+                            &scoring_terms,
+                            &scoring_context,
+                        ),
+                    });
+                }
             }
         }
         hits.sort_by(|left, right| {
@@ -193,6 +236,34 @@ impl FullTextIndex {
                 avg_doc_len: self.average_document_len(),
                 ..Bm25Context::default()
             },
+            &Bm25DocumentStats {
+                doc_len: f64::from(document.doc_len),
+            },
+            &terms,
+        )
+    }
+
+    /// Scores a document against pre-resolved scoring terms and the shared
+    /// BM25 context, avoiding the per-document `positive_scoring_terms`
+    /// re-analysis. Used by `search()` after resolving scoring terms once.
+    fn score_document_with_terms(
+        &self,
+        document: &FullTextDocument,
+        scoring_terms: &[(String, usize)],
+        context: &Bm25Context,
+    ) -> f64 {
+        let terms = scoring_terms
+            .iter()
+            .filter_map(|(term, doc_freq)| {
+                let term_info = document.terms.get(term)?;
+                Some(Bm25TermStats {
+                    term_freq: f64::from(term_info.frequency),
+                    doc_freq: *doc_freq as f64,
+                })
+            })
+            .collect::<Vec<_>>();
+        bm25_score(
+            context,
             &Bm25DocumentStats {
                 doc_len: f64::from(document.doc_len),
             },
@@ -273,6 +344,50 @@ fn build_document(config: &AnalyzerConfig, fields: &[Option<&str>]) -> FullTextD
         }
     }
     document
+}
+
+/// Returns true when the query contains only positive `Word` terms (no
+/// phrases, no prefixes, no excluded terms) that can be resolved purely from
+/// the postings lists. Used to decide whether the candidate resolver can skip
+/// the full document scan.
+fn query_is_postings_resolvable(query: &FtsQuery) -> bool {
+    query
+        .clauses
+        .iter()
+        .flatten()
+        .all(|term| !term.excluded && term.kind == FtsQueryTermKind::Word)
+}
+
+/// Resolves the candidate row ids for a query from the postings lists when
+/// possible. Returns an empty set when the query cannot be resolved from
+/// postings alone; the caller then falls back to a full document scan. For
+/// `Word`-only OR/AND queries this unions the per-clause candidate sets, which
+/// is the common benchmark and application shape (`a OR b OR c`).
+fn candidate_row_ids_for_query(index: &FullTextIndex, query: &FtsQuery) -> BTreeSet<u64> {
+    let mut candidates: BTreeSet<u64> = BTreeSet::new();
+    for clause in &query.clauses {
+        // Each clause is an AND of positive Word terms (guaranteed by
+        // query_is_postings_resolvable). Intersect the postings row ids for
+        // every term in the clause; union the result into the candidate set.
+        let mut clause_rows: Option<BTreeSet<u64>> = None;
+        for term in clause.iter().filter(|term| !term.excluded) {
+            let analyzed = index.config.analyze(&term.text);
+            let mut term_rows: BTreeSet<u64> = BTreeSet::new();
+            for token in analyzed {
+                if let Some(rows) = index.postings.get(&token) {
+                    term_rows.extend(rows.keys().copied());
+                }
+            }
+            clause_rows = Some(match clause_rows {
+                None => term_rows,
+                Some(existing) => existing.intersection(&term_rows).copied().collect(),
+            });
+        }
+        if let Some(rows) = clause_rows {
+            candidates.extend(rows);
+        }
+    }
+    candidates
 }
 
 fn query_matches_document(
@@ -434,6 +549,50 @@ mod runtime_tests {
         let hits = index.search("search").expect("query");
         assert_eq!(hits[0].row_id, 1);
         assert!(hits[0].score > hits[1].score);
+    }
+
+    #[test]
+    fn or_word_query_uses_postings_candidates_and_returns_union() {
+        // Regression coverage for the postings-based candidate resolver added
+        // to `search`. `war OR revenge OR sacrifice` is a positive-Word OR
+        // query that the fast path resolves from postings without scanning
+        // every document; the result must be the union of matching row ids,
+        // scored and ordered by rank.
+        let mut index = FullTextIndex::new(AnalyzerConfig::default());
+        index.insert_document(1, &[Some("war and peace")]);
+        index.insert_document(2, &[Some("revenge of the nerds")]);
+        index.insert_document(3, &[Some("a quiet tale of sacrifice")]);
+        index.insert_document(4, &[Some("nothing relevant here")]);
+
+        let mut hits = index.search("war OR revenge OR sacrifice").expect("query");
+        // All three matching documents are returned, the irrelevant one is not.
+        let mut row_ids: Vec<u64> = hits.iter().map(|hit| hit.row_id).collect();
+        row_ids.sort_unstable();
+        assert_eq!(row_ids, vec![1, 2, 3]);
+        // Scores are finite and ordered descending by score, tie-broken by row id.
+        assert!(hits.windows(2).all(|w| {
+            w[0].score >= w[1].score
+                || (w[0].score - w[1].score).abs() < f64::EPSILON && w[0].row_id <= w[1].row_id
+        }));
+        // Sanity: each returned hit has a positive score (the terms appear).
+        assert!(hits.iter().all(|hit| hit.score > 0.0));
+        // Touch `hits` ordering is already asserted; keep the binding used.
+        hits.sort_by(|a, b| a.row_id.cmp(&b.row_id));
+    }
+
+    #[test]
+    fn and_word_query_postings_path_intersects_terms() {
+        // A single clause with two positive Word terms is an AND; the postings
+        // fast path intersects the term postings and returns only documents
+        // containing both terms.
+        let mut index = FullTextIndex::new(AnalyzerConfig::default());
+        index.insert_document(1, &[Some("fast database")]);
+        index.insert_document(2, &[Some("fast car")]);
+        index.insert_document(3, &[Some("database design")]);
+
+        let hits = index.search("fast database").expect("query");
+        let row_ids: Vec<u64> = hits.iter().map(|hit| hit.row_id).collect();
+        assert_eq!(row_ids, vec![1]);
     }
 
     #[test]

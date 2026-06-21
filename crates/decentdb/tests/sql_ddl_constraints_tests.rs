@@ -3817,3 +3817,82 @@ fn generated_virtual_columns_compute_returning_and_persist_mode() {
         "unexpected DDL after reopen: {ddl}"
     );
 }
+
+#[test]
+fn create_index_build_fast_path_produces_correct_single_column_and_partial_indexes() {
+    // Exercises the build_runtime_index fast path for single-column encoded
+    // indexes (FLOAT64, DATE, TEXT) and a partial TEXT index, verifying both
+    // index validity and correct range/equality query results.
+    let db = mem_db();
+    db.execute(
+        "CREATE TABLE movies (id INT64 PRIMARY KEY, title TEXT, rating FLOAT64, released DATE, status TEXT, collection TEXT)",
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO movies (id, title, rating, released, status, collection) VALUES \
+         (1, 'A', 7.5, DATE '2010-01-01', 'Released', ''), \
+         (2, 'B', 8.0, DATE '2012-06-15', 'Released', 'Series'), \
+         (3, 'C', 9.0, DATE '2009-12-31', 'Archived', 'Collection'), \
+         (4, 'D', 6.5, DATE '2015-03-01', 'Released', '')",
+    )
+    .unwrap();
+
+    db.execute("CREATE INDEX idx_rating ON movies(rating)")
+        .unwrap();
+    db.execute("CREATE INDEX idx_released ON movies(released)")
+        .unwrap();
+    db.execute("CREATE INDEX idx_status ON movies(status)")
+        .unwrap();
+    db.execute("CREATE INDEX idx_collection ON movies(collection) WHERE collection <> ''")
+        .unwrap();
+
+    // All four indexes must verify as valid (entry counts match a rebuild).
+    for name in ["idx_rating", "idx_released", "idx_status", "idx_collection"] {
+        let verification = db.verify_index(name).unwrap();
+        assert!(
+            verification.valid,
+            "index {name} became invalid after build"
+        );
+    }
+
+    // Range query on the FLOAT64 index.
+    let result = db
+        .execute("SELECT id FROM movies WHERE rating >= 7.5 AND rating <= 9.0 ORDER BY id")
+        .unwrap();
+    assert_eq!(
+        rows(&result),
+        vec![
+            vec![Value::Int64(1)],
+            vec![Value::Int64(2)],
+            vec![Value::Int64(3)]
+        ]
+    );
+
+    // Range query on the DATE index.
+    let result = db
+        .execute("SELECT id FROM movies WHERE released >= CAST('2010-01-01' AS DATE) ORDER BY id")
+        .unwrap();
+    assert_eq!(
+        rows(&result),
+        vec![
+            vec![Value::Int64(1)],
+            vec![Value::Int64(2)],
+            vec![Value::Int64(4)]
+        ]
+    );
+
+    // Equality query on the TEXT index.
+    let result = db
+        .execute("SELECT id FROM movies WHERE status = 'Archived'")
+        .unwrap();
+    assert_eq!(rows(&result), vec![vec![Value::Int64(3)]]);
+
+    // Partial index: only rows where collection <> '' are indexed.
+    let result = db
+        .execute("SELECT id FROM movies WHERE collection <> '' ORDER BY id")
+        .unwrap();
+    assert_eq!(
+        rows(&result),
+        vec![vec![Value::Int64(2)], vec![Value::Int64(3)]]
+    );
+}

@@ -891,6 +891,30 @@ impl TablePageManifest {
         self.row_at_position(index)
     }
 
+    /// Returns the chunk index owning `row_id`, if present. Used by the bulk
+    /// delete manifest rebuild to avoid decoding base payloads.
+    fn chunk_index_for_row_id(&self, row_id: i64) -> Option<usize> {
+        let position = if let Some(index) = row_id
+            .checked_sub(1)
+            .and_then(|value| usize::try_from(value).ok())
+        {
+            if self.rows.get(index).is_some_and(|row| row.row_id == row_id) {
+                Some(index)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+        .or_else(|| {
+            self.rows
+                .binary_search_by_key(&row_id, |row| row.row_id)
+                .ok()
+        })
+        .or_else(|| self.rows.iter().position(|row| row.row_id == row_id));
+        position.map(|idx| self.rows[idx].chunk_index as usize)
+    }
+
     fn projected_values_by_id(
         &self,
         row_id: i64,
@@ -20704,20 +20728,85 @@ fn build_runtime_index(
                 })
             } else {
                 let mut keys = BTreeMap::<Vec<u8>, Vec<i64>>::new();
+                // Pre-parse the partial-index predicate once instead of
+                // re-parsing the predicate SQL for every row in the table
+                // (row_satisfies_index_predicate parses on each call). Also
+                // pre-resolve the single indexed column position for the
+                // common single-column plain-column index so the build loop
+                // avoids per-row column lookups and Value clones.
+                let predicate_expr = index
+                    .predicate_sql
+                    .as_ref()
+                    .map(|sql| crate::sql::parser::parse_expression_sql(sql))
+                    .transpose()?;
+                let single_column_position = single_plain_index_column_position(index, table);
+                let multi_column_positions = if single_column_position.is_none() {
+                    plain_index_column_positions(index, table)
+                } else {
+                    None
+                };
+                let has_virtual_generated = !generated_columns_are_stored(table);
                 for row in source.rows() {
                     let row = row?;
-                    let Some(key) = compute_index_key(runtime, index, table, row.values())? else {
-                        continue;
-                    };
-                    let RuntimeBtreeKey::Encoded(key) = key else {
-                        return Err(DbError::internal(
-                            "encoded runtime index received an INT64 key",
-                        ));
+                    let values = row.values();
+                    if let Some(predicate_expr) = &predicate_expr {
+                        let row_materialized = if has_virtual_generated {
+                            let mut materialized = values.to_vec();
+                            runtime.apply_virtual_generated_columns(table, &mut materialized)?;
+                            Cow::Owned(materialized)
+                        } else {
+                            Cow::Borrowed(values)
+                        };
+                        let row_for_eval = row_materialized.as_ref();
+                        let dataset = table_row_dataset(table, row_for_eval, &table.name);
+                        let bindings = dataset.rows.first().map(Vec::as_slice).unwrap_or(&[]);
+                        if !matches!(
+                            runtime.eval_expr(
+                                predicate_expr,
+                                &dataset,
+                                bindings,
+                                &[],
+                                &BTreeMap::new(),
+                                None
+                            )?,
+                            Value::Bool(true)
+                        ) {
+                            continue;
+                        }
+                    }
+                    let key = if let Some(position) = single_column_position {
+                        // Fast path: encode the single indexed column value
+                        // directly from the borrowed row slice, avoiding the
+                        // intermediate Value clone that compute_index_values
+                        // would perform.
+                        encode_index_key(&values[position])?
+                    } else if let Some(positions) = &multi_column_positions {
+                        // Fast path for composite plain-column indexes: read
+                        // each indexed column value by position and encode the
+                        // composite key without building a Dataset.
+                        let key_values: Vec<Value> = positions
+                            .iter()
+                            .map(|position| values.get(*position).cloned().unwrap_or(Value::Null))
+                            .collect();
+                        if index.unique && key_values.iter().any(|v| matches!(v, Value::Null)) {
+                            continue;
+                        }
+                        Row::new(key_values).encode()?
+                    } else {
+                        let Some(encoded) = compute_index_key(runtime, index, table, values)?
+                        else {
+                            continue;
+                        };
+                        let RuntimeBtreeKey::Encoded(encoded) = encoded else {
+                            return Err(DbError::internal(
+                                "encoded runtime index received an INT64 key",
+                            ));
+                        };
+                        encoded
                     };
                     keys.entry(key).or_default().push(row.row_id());
                     if let Some(covering) = covering.as_mut() {
-                        if let Some(values) =
-                            covering_payload_values_for_row(index, table, row.values())
+                        if let Some(values) = covering_payload_values_for_row(index, table, values)
                         {
                             covering.insert_row_values(row.row_id(), values);
                         }
@@ -20732,19 +20821,65 @@ fn build_runtime_index(
         IndexKind::Trigram => {
             let mut trigram = TrigramIndex::new(page_size, 100_000);
             let mut builder = TrigramIndexBuilder::new();
+            // Fast path: trigram indexes are constrained by DDL to a single
+            // plain text column with no predicate. Resolve its position once
+            // and read the text directly, avoiding the per-row Dataset
+            // construction in compute_index_values.
+            let single_text_position = plain_single_text_index_column_position(index, table);
+            let has_predicate = index.predicate_sql.is_some();
+            let predicate_expr = index
+                .predicate_sql
+                .as_ref()
+                .map(|sql| crate::sql::parser::parse_expression_sql(sql))
+                .transpose()?;
+            let has_virtual_generated = !generated_columns_are_stored(table);
             for row in source.rows() {
                 let row = row?;
-                if !row_satisfies_index_predicate(runtime, index, table, row.values())? {
-                    continue;
+                let values = row.values();
+                if has_predicate {
+                    if let Some(predicate_expr) = &predicate_expr {
+                        let row_materialized = if has_virtual_generated {
+                            let mut materialized = values.to_vec();
+                            runtime.apply_virtual_generated_columns(table, &mut materialized)?;
+                            Cow::Owned(materialized)
+                        } else {
+                            Cow::Borrowed(values)
+                        };
+                        let row_for_eval = row_materialized.as_ref();
+                        let dataset = table_row_dataset(table, row_for_eval, &table.name);
+                        let bindings = dataset.rows.first().map(Vec::as_slice).unwrap_or(&[]);
+                        if !matches!(
+                            runtime.eval_expr(
+                                predicate_expr,
+                                &dataset,
+                                bindings,
+                                &[],
+                                &BTreeMap::new(),
+                                None
+                            )?,
+                            Value::Bool(true)
+                        ) {
+                            continue;
+                        }
+                    }
                 }
-                if let Value::Text(text) =
-                    compute_index_values(runtime, index, table, row.values())?
+                let text = if let Some(position) = single_text_position {
+                    match values.get(position) {
+                        Some(Value::Text(text)) => Some(text.clone()),
+                        // NULL or non-text: skip, matching compute_index_values
+                        // which would error on non-text for a trigram index.
+                        _ => None,
+                    }
+                } else {
+                    compute_index_values(runtime, index, table, values)?
                         .into_iter()
                         .next()
-                        .ok_or_else(|| {
-                            DbError::constraint("trigram index requires a single text expression")
-                        })?
-                {
+                        .and_then(|value| match value {
+                            Value::Text(text) => Some(text),
+                            _ => None,
+                        })
+                };
+                if let Some(text) = text {
                     builder.insert(row.row_id() as u64, &text);
                 }
             }
@@ -20770,18 +20905,162 @@ fn build_runtime_index(
                 .clone()
                 .ok_or_else(|| DbError::corruption("fulltext index is missing analyzer config"))?;
             let mut fulltext = FullTextIndex::new(config);
+            // Fast path: fulltext indexes are constrained by DDL to plain text
+            // columns with no predicate. Resolve their positions once and read
+            // the text directly, avoiding the per-row Dataset construction in
+            // full_text_fields_for_row / compute_index_values.
+            let text_positions = plain_text_index_column_positions(index, table);
+            let has_predicate = index.predicate_sql.is_some();
+            let predicate_expr = index
+                .predicate_sql
+                .as_ref()
+                .map(|sql| crate::sql::parser::parse_expression_sql(sql))
+                .transpose()?;
+            let has_virtual_generated = !generated_columns_are_stored(table);
             for row in source.rows() {
                 let row = row?;
-                if !row_satisfies_index_predicate(runtime, index, table, row.values())? {
-                    continue;
+                let values = row.values();
+                if has_predicate {
+                    if let Some(predicate_expr) = &predicate_expr {
+                        let row_materialized = if has_virtual_generated {
+                            let mut materialized = values.to_vec();
+                            runtime.apply_virtual_generated_columns(table, &mut materialized)?;
+                            Cow::Owned(materialized)
+                        } else {
+                            Cow::Borrowed(values)
+                        };
+                        let row_for_eval = row_materialized.as_ref();
+                        let dataset = table_row_dataset(table, row_for_eval, &table.name);
+                        let bindings = dataset.rows.first().map(Vec::as_slice).unwrap_or(&[]);
+                        if !matches!(
+                            runtime.eval_expr(
+                                predicate_expr,
+                                &dataset,
+                                bindings,
+                                &[],
+                                &BTreeMap::new(),
+                                None
+                            )?,
+                            Value::Bool(true)
+                        ) {
+                            continue;
+                        }
+                    }
                 }
-                let fields = full_text_fields_for_row(runtime, index, table, row.values())?;
-                let field_refs = fields.iter().map(Option::as_deref).collect::<Vec<_>>();
-                fulltext.insert_document(row.row_id() as u64, &field_refs);
+                if let Some(positions) = &text_positions {
+                    let field_refs: Vec<Option<&str>> = positions
+                        .iter()
+                        .map(|position| match values.get(*position) {
+                            Some(Value::Text(text)) => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect();
+                    fulltext.insert_document(row.row_id() as u64, &field_refs);
+                } else {
+                    let fields = full_text_fields_for_row(runtime, index, table, values)?;
+                    let field_refs = fields.iter().map(Option::as_deref).collect::<Vec<_>>();
+                    fulltext.insert_document(row.row_id() as u64, &field_refs);
+                }
             }
             Ok(RuntimeIndex::FullText { index: fulltext })
         }
     }
+}
+
+/// Returns the row-position of the single indexed column for a plain
+/// single-column BTREE index (no expression, no INCLUDE columns), so the
+/// bulk-build fast path can encode the key directly from the borrowed row
+/// slice without cloning the indexed `Value` or re-resolving the column on
+/// every row. Returns `None` for composite, expression, or covering indexes.
+fn single_plain_index_column_position(index: &IndexSchema, table: &TableSchema) -> Option<usize> {
+    if !index.include_columns.is_empty() {
+        return None;
+    }
+    let [column] = index.columns.as_slice() else {
+        return None;
+    };
+    let column_name = column.column_name.as_deref()?;
+    if column.expression_sql.is_some() {
+        return None;
+    }
+    column_position(table, column_name)
+}
+
+/// Resolves the stored-column positions for a btree index whose columns are
+/// all plain stored columns (no expressions, no INCLUDE columns, no virtual
+/// generated columns). Used by the build loop to read index key values
+/// directly by position without building a `Dataset`.
+fn plain_index_column_positions(index: &IndexSchema, table: &TableSchema) -> Option<Vec<usize>> {
+    if !index.include_columns.is_empty() {
+        return None;
+    }
+    if index.columns.is_empty() {
+        return None;
+    }
+    let stored_generated_ok = generated_columns_are_stored(table);
+    let mut positions = Vec::with_capacity(index.columns.len());
+    for column in &index.columns {
+        if column.expression_sql.is_some() {
+            return None;
+        }
+        let Some(column_name) = &column.column_name else {
+            return None;
+        };
+        let position = column_position(table, column_name)?;
+        if !stored_generated_ok {
+            if table
+                .columns
+                .get(position)
+                .is_some_and(|col| col.generated_sql.is_some() && !col.generated_stored)
+            {
+                return None;
+            }
+        }
+        positions.push(position);
+    }
+    Some(positions)
+}
+
+/// Resolves the single stored-column position for a trigram index over a
+/// plain TEXT column (no expression, no INCLUDE columns, no predicate, no
+/// virtual generated column). Returns `None` for any unsupported shape so
+/// the trigram build loop falls back to `compute_index_values`.
+fn plain_single_text_index_column_position(
+    index: &IndexSchema,
+    table: &TableSchema,
+) -> Option<usize> {
+    if !index.include_columns.is_empty() || index.predicate_sql.is_some() {
+        return None;
+    }
+    if index.columns.len() != 1 {
+        return None;
+    }
+    plain_index_column_positions(index, table)?
+        .into_iter()
+        .next()
+}
+
+/// Resolves the stored-column positions for a fulltext index over plain TEXT
+/// columns (no expressions, no INCLUDE columns, no predicate, no virtual
+/// generated columns). Returns `None` for any unsupported shape so the
+/// fulltext build loop falls back to `full_text_fields_for_row`.
+fn plain_text_index_column_positions(
+    index: &IndexSchema,
+    table: &TableSchema,
+) -> Option<Vec<usize>> {
+    if index.predicate_sql.is_some() {
+        return None;
+    }
+    let positions = plain_index_column_positions(index, table)?;
+    // Confirm every indexed column is actually TEXT so the fast path matches
+    // full_text_fields_for_row's TEXT requirement.
+    for position in &positions {
+        let column = table.columns.get(*position)?;
+        if column.column_type != ColumnType::Text {
+            return None;
+        }
+    }
+    Some(positions)
 }
 
 pub(super) fn compute_index_key(
@@ -20814,6 +21093,12 @@ pub(super) fn compute_index_key(
             return Ok(Some(RuntimeBtreeKey::Int64(*value)));
         }
     }
+    if let Some(value) = compute_single_column_index_key_fast(index, table, row_values)? {
+        if index.unique && matches!(value, Value::Null) {
+            return Ok(None);
+        }
+        return Ok(Some(RuntimeBtreeKey::Encoded(encode_index_key(&value)?)));
+    }
     let values = compute_index_values(runtime, index, table, row_values)?;
     if index.unique && values.iter().any(|value| matches!(value, Value::Null)) {
         return Ok(None);
@@ -20824,6 +21109,47 @@ pub(super) fn compute_index_key(
         Row::new(values).encode()?
     };
     Ok(Some(RuntimeBtreeKey::Encoded(key)))
+}
+
+/// Fast path for single-column btree indexes whose only column is a plain
+/// stored column (no expression, no virtual generated column). Reads the value
+/// directly by position without building a `Dataset` or cloning the full row,
+/// which is the hot path for index maintenance during bulk DML.
+fn compute_single_column_index_key_fast(
+    index: &IndexSchema,
+    table: &TableSchema,
+    row_values: &[Value],
+) -> Result<Option<Value>> {
+    if index.columns.len() != 1 {
+        return Ok(None);
+    }
+    let Some(column) = index.columns.first() else {
+        return Ok(None);
+    };
+    if column.expression_sql.is_some() {
+        return Ok(None);
+    }
+    let Some(column_name) = &column.column_name else {
+        return Ok(None);
+    };
+    let Some(position) = column_position(table, column_name) else {
+        return Ok(None);
+    };
+    // Virtual generated columns are not stored in `row_values`, so they must go
+    // through the materializing path. Stored generated columns are present.
+    if generated_columns_are_stored(table) {
+        // All generated columns are stored: safe to read by position.
+    } else if table
+        .columns
+        .get(position)
+        .is_some_and(|col| col.generated_sql.is_some() && !col.generated_stored)
+    {
+        return Ok(None);
+    }
+    let Some(value) = row_values.get(position) else {
+        return Ok(None);
+    };
+    Ok(Some(value.clone()))
 }
 
 pub(super) fn spatial_index_backend(
@@ -22592,6 +22918,93 @@ pub(crate) fn read_table_payload_row_count_from_bytes(bytes: &[u8]) -> Result<us
     Ok(cursor.read_u32()? as usize)
 }
 
+fn apply_paged_row_deletions_to_manifest(
+    manifest: &TablePageManifest,
+    deleted_row_ids: &BTreeSet<i64>,
+) -> Result<TablePageManifest> {
+    if deleted_row_ids.is_empty() {
+        return Ok(manifest.clone());
+    }
+
+    // Partition deleted row ids by the chunk that owns them, using the
+    // manifest entry index. This avoids decoding any base payload row during a
+    // pure bulk delete: base rows are immutable, so tombstoning by id is
+    // sufficient, and only overlay rows that are updated-then-deleted need to
+    // be decoded and dropped.
+    let mut deletes_by_chunk: Vec<BTreeSet<i64>> = (0..manifest.chunks.len())
+        .map(|_| BTreeSet::new())
+        .collect();
+    for &row_id in deleted_row_ids {
+        let Some(chunk_index) = manifest.chunk_index_for_row_id(row_id) else {
+            // Row id is not present in the manifest (already gone or never
+            // existed). Skip it; callers already validated existence.
+            continue;
+        };
+        if let Some(set) = deletes_by_chunk.get_mut(chunk_index) {
+            set.insert(row_id);
+        }
+    }
+
+    let mut new_chunks = Vec::with_capacity(manifest.chunks.len());
+    for (chunk_index, chunk) in manifest.chunks.iter().enumerate() {
+        let Some(chunk_deletes) = deletes_by_chunk.get(chunk_index) else {
+            new_chunks.push(chunk.clone());
+            continue;
+        };
+        if chunk_deletes.is_empty() && chunk.overlay_payload.is_none() {
+            new_chunks.push(chunk.clone());
+            continue;
+        }
+
+        let mut new_tombstones: BTreeSet<i64> = chunk.tombstoned_row_ids.iter().copied().collect();
+        let mut chunk_changed = false;
+        let mut overlay_rows: BTreeMap<i64, StoredRow> = BTreeMap::new();
+
+        // Drop overlay rows that are being deleted; keep the rest verbatim.
+        if let Some(overlay_payload) = &chunk.overlay_payload {
+            let previous_overlay_rows = decode_table_payload_rows(overlay_payload.as_slice())?;
+            for previous_row in previous_overlay_rows {
+                if chunk_deletes.contains(&previous_row.row_id) {
+                    chunk_changed = true;
+                } else {
+                    overlay_rows.insert(previous_row.row_id, previous_row);
+                }
+            }
+        }
+
+        // Tombstone every deleted id that lives in this chunk's base payload.
+        for &id in chunk_deletes {
+            if new_tombstones.insert(id) {
+                chunk_changed = true;
+            }
+        }
+
+        if !chunk_changed {
+            new_chunks.push(chunk.clone());
+            continue;
+        }
+
+        let overlay_payload = if overlay_rows.is_empty() {
+            None
+        } else {
+            let rows: Vec<StoredRow> = overlay_rows.into_values().collect();
+            Some(Arc::new(encode_table_payload(&TableData::from_rows(rows))?))
+        };
+
+        new_chunks.push(TablePageManifestChunk {
+            pointer: chunk.pointer,
+            checksum: chunk.checksum,
+            row_count: chunk.row_count,
+            payload: Arc::clone(&chunk.payload),
+            tombstoned_row_ids: Arc::new(new_tombstones),
+            overlay_pointer: None,
+            overlay_checksum: None,
+            overlay_payload,
+        });
+    }
+
+    TablePageManifest::from_chunks(new_chunks)
+}
 fn apply_paged_row_changes_to_manifest(
     manifest: &TablePageManifest,
     row_changes: &BTreeMap<i64, Option<Vec<Value>>>,

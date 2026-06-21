@@ -89,7 +89,12 @@ DECENTDB_EMBEDDED_FAST_OPTIONS = (
     "retain_paged_row_sources_after_commit=true;"
     "paged_row_storage=false;"
     "wal_autocheckpoint=0;"
-    "process_coordination=single_process_unsafe"
+    "process_coordination=single_process_unsafe;"
+    # Match SQLite's default benchmark PRAGMA synchronous=NORMAL so both
+    # engines use the same reduced-sync WAL durability. Without this, DecentDB
+    # defaults to WalSyncMode::Full (fsync per commit) while SQLite uses NORMAL,
+    # which is not a like-for-like comparison for auto-committed DDL/DML.
+    "wal_sync_mode=normal"
 )
 
 MOVIE_FIRST_NAMES = [

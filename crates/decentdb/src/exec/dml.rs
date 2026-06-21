@@ -1,7 +1,7 @@
 //! DML execution helpers.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::sync::Arc;
 
 use crate::catalog::{
@@ -2251,12 +2251,12 @@ impl EngineRuntime {
         }
 
         if !matching_rows.is_empty() {
-            let row_changes = matching_rows
+            let deleted_row_ids = matching_rows
                 .iter()
-                .map(|row| (row.row_id, None))
-                .collect::<BTreeMap<_, _>>();
+                .map(|row| row.row_id)
+                .collect::<BTreeSet<_>>();
             let updated_manifest =
-                super::apply_paged_row_changes_to_manifest(manifest.as_ref(), &row_changes)?;
+                super::apply_paged_row_deletions_to_manifest(manifest.as_ref(), &deleted_row_ids)?;
             self.replace_table_row_source(
                 &table.name,
                 TableRowSource::Paged(Arc::new(updated_manifest)),
@@ -2511,7 +2511,7 @@ impl EngineRuntime {
         let mut indexes_remain_fresh = table_indexes.iter().all(|index| index.fresh);
 
         for &row_id in matching_row_ids {
-            let (row_index, current_row) = {
+            let (row_index, current_value, old_values) = {
                 let Some(table_data) = self.table_data(&table.name) else {
                     return Err(DbError::internal(format!(
                         "table data for {} is missing",
@@ -2521,10 +2521,21 @@ impl EngineRuntime {
                 let row_index = table_data.row_index_by_id(row_id).ok_or_else(|| {
                     DbError::internal(format!("row {row_id} vanished during UPDATE"))
                 })?;
-                (row_index, table_data.rows[row_index].clone())
+                let stored_row = &table_data.rows[row_index];
+                let current_value = stored_row.values.get(prepared_update.column_index).cloned();
+                // Only clone the full old row when an index update needs it
+                // for key comparison. When no indexes are touched, the
+                // arithmetic update can read just the single column and write
+                // it back without materializing the rest of the row.
+                let old_values = if indexes_to_update.is_empty() {
+                    None
+                } else {
+                    Some(stored_row.values.clone())
+                };
+                (row_index, current_value, old_values)
             };
 
-            let Some(current_value) = current_row.values.get(prepared_update.column_index) else {
+            let Some(current_value) = current_value else {
                 return Err(DbError::internal(format!(
                     "column index {} is invalid for {}",
                     prepared_update.column_index, table.name
@@ -2540,50 +2551,78 @@ impl EngineRuntime {
                 next_value,
             )?;
 
-            if next_value == *current_value {
+            if next_value == current_value {
                 affected_rows += 1;
                 continue;
             }
 
-            let mut next_values = current_row.values.clone();
-            next_values[prepared_update.column_index] = next_value;
-            validate_assigned_not_null_columns(
-                table,
-                std::slice::from_ref(&prepared_update.column_index),
-                &next_values,
-                &table.name,
-            )?;
-            if indexes_remain_fresh {
-                for index in indexes_to_update {
-                    if !apply_runtime_index_update_for_row_change(
-                        self,
-                        table,
-                        index,
-                        row_id,
-                        &current_row.values,
-                        &next_values,
-                    )? {
-                        indexes_remain_fresh = false;
-                        break;
+            if let Some(old_values) = old_values.as_ref() {
+                let mut next_values = old_values.clone();
+                next_values[prepared_update.column_index] = next_value.clone();
+                validate_assigned_not_null_columns(
+                    table,
+                    std::slice::from_ref(&prepared_update.column_index),
+                    &next_values,
+                    &table.name,
+                )?;
+                if indexes_remain_fresh {
+                    for index in indexes_to_update {
+                        if !apply_runtime_index_update_for_row_change(
+                            self,
+                            table,
+                            index,
+                            row_id,
+                            old_values,
+                            &next_values,
+                        )? {
+                            indexes_remain_fresh = false;
+                            break;
+                        }
                     }
                 }
-            }
 
-            {
-                let Some(table_data) = self.table_data_mut(&table.name) else {
-                    return Err(DbError::internal(format!(
-                        "table data for {} is missing",
-                        table.name
-                    )));
+                {
+                    let Some(table_data) = self.table_data_mut(&table.name) else {
+                        return Err(DbError::internal(format!(
+                            "table data for {} is missing",
+                            table.name
+                        )));
+                    };
+                    table_data
+                        .replace_row_values(row_index, next_values.clone())
+                        .ok_or_else(|| {
+                            DbError::internal(format!("row {row_id} vanished during UPDATE"))
+                        })?;
+                }
+                self.mark_table_row_dirty(&table.name, row_index, row_id, &next_values);
+                self.record_sync_update_for_row(table, &next_values);
+            } else {
+                // No index touches the updated column: write just the changed
+                // value back without cloning the rest of the row.
+                let next_values = {
+                    let Some(table_data) = self.table_data_mut(&table.name) else {
+                        return Err(DbError::internal(format!(
+                            "table data for {} is missing",
+                            table.name
+                        )));
+                    };
+                    let Some(stored_row) = table_data.rows.get_mut(row_index) else {
+                        return Err(DbError::internal(format!(
+                            "row {row_id} vanished during UPDATE"
+                        )));
+                    };
+                    stored_row.values[prepared_update.column_index] = next_value.clone();
+                    stored_row.values.to_vec()
                 };
-                table_data
-                    .replace_row_values(row_index, next_values.clone())
-                    .ok_or_else(|| {
-                        DbError::internal(format!("row {row_id} vanished during UPDATE"))
-                    })?;
+                validate_assigned_not_null_columns(
+                    table,
+                    std::slice::from_ref(&prepared_update.column_index),
+                    &next_values,
+                    &table.name,
+                )?;
+                self.mark_table_row_dirty(&table.name, row_index, row_id, &next_values);
+                self.record_sync_update_for_row(table, &next_values);
             }
-            self.mark_table_row_dirty(&table.name, row_index, row_id, &next_values);
-            self.record_sync_update_for_row(table, &next_values);
             changed_rows += 1;
             affected_rows += 1;
         }
@@ -3235,7 +3274,6 @@ impl EngineRuntime {
             }
             rows
         };
-
         if has_referencing_tables && !delete_children.is_empty() {
             self.apply_parent_delete_actions_rows(
                 &table_name,
