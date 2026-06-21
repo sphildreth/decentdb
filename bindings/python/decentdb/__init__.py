@@ -756,6 +756,11 @@ class Cursor:
             if _fastdecode_native is not None
             else None
         )
+        self._decode_matrix_i64_text_f64_date_native = (
+            getattr(_fastdecode_native, "decode_matrix_i64_text_f64_date", None)
+            if _fastdecode_native is not None
+            else None
+        )
         self._decode_matrix_i64_text_f64_i64_i64_native = (
             getattr(_fastdecode_native, "decode_matrix_i64_text_f64_i64_i64", None)
             if _fastdecode_native is not None
@@ -991,6 +996,7 @@ class Cursor:
         )
         self._native_fetch_rows_i64_text_f64_sql_support = {}
         self._decode_matrix_i64_text_f64_sql_support = {}
+        self._decode_matrix_i64_text_f64_date_sql_support = {}
         self._decode_matrix_i64_text_text_sql_support = {}
         self._decode_matrix_i64_f64_text_sql_support = {}
         self._decode_matrix_text_i64_f64_sql_support = {}
@@ -1027,6 +1033,7 @@ class Cursor:
         self._should_prefetch_zero_param_result_sql_cache.clear()
         self._native_fetch_rows_i64_text_f64_sql_support.clear()
         self._decode_matrix_i64_text_f64_sql_support.clear()
+        self._decode_matrix_i64_text_f64_date_sql_support.clear()
         self._decode_matrix_i64_text_text_sql_support.clear()
         self._decode_matrix_i64_f64_text_sql_support.clear()
         self._decode_matrix_text_i64_f64_sql_support.clear()
@@ -3288,6 +3295,28 @@ class Cursor:
                         append_row(_decode_ffi_value(self._lib, value))
                 append_rows(tuple(row))
             return rows
+
+        if col_count == 4:
+            sql = self._last_sql
+            if (
+                int(values_ptr[0].tag) == DDB_VALUE_INT64
+                and int(values_ptr[1].tag) == DDB_VALUE_TEXT
+                and int(values_ptr[2].tag) == DDB_VALUE_FLOAT64
+                and int(values_ptr[3].tag) == DDB_VALUE_DATE
+            ):
+                native_supported = (
+                    self._decode_matrix_i64_text_f64_date_sql_support.get(sql, True)
+                )
+                if (
+                    self._decode_matrix_i64_text_f64_date_native is not None
+                    and native_supported
+                ):
+                    try:
+                        return self._decode_matrix_i64_text_f64_date_native(
+                            ctypes.addressof(values_ptr.contents), row_count
+                        )
+                    except Exception:
+                        self._decode_matrix_i64_text_f64_date_sql_support[sql] = False
 
         if col_count == 1:
             sql = self._last_sql

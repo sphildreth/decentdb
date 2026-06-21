@@ -1562,6 +1562,128 @@ fn simple_filtered_projection_no_order_by_offset_limit_uses_fast_path() {
 }
 
 #[test]
+fn simple_filtered_projection_range_index_with_residual_uses_fast_path() {
+    let mut runtime = EngineRuntime::empty(1);
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE movies (id INT64 PRIMARY KEY, title TEXT, rating FLOAT64, runtime_minutes INT64)",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE INDEX idx_movies_rating ON movies(rating)",
+    );
+    for (id, title, rating, runtime_minutes) in [
+        (1, "short_good", 8.0, 100),
+        (2, "long_good", 7.6, 130),
+        (3, "too_high", 9.5, 150),
+        (4, "also_good", 8.5, 140),
+        (5, "edge_good", 7.8, 121),
+        (6, "too_low", 6.0, 150),
+    ] {
+        execute_sql(
+            &mut runtime,
+            &format!(
+                "INSERT INTO movies (id, title, rating, runtime_minutes) VALUES ({id}, '{title}', {rating}, {runtime_minutes})"
+            ),
+        );
+    }
+
+    let statement = parse_sql_statement(
+        "SELECT id, title, rating FROM movies WHERE rating >= 7.5 AND rating <= 9.0 AND runtime_minutes > 120",
+    )
+    .expect("parse filtered range query");
+    let crate::sql::ast::Statement::Query(query) = &statement else {
+        panic!("expected query");
+    };
+
+    let result = runtime
+        .try_execute_simple_filtered_projection_query(query, &[])
+        .expect("execute")
+        .expect("filtered range projection should stay on fast path");
+
+    assert_eq!(
+        result.columns(),
+        &["id".to_string(), "title".to_string(), "rating".to_string()]
+    );
+    assert_eq!(result.rows().len(), 3);
+    assert_eq!(
+        result.rows()[0].values(),
+        &[
+            Value::Int64(2),
+            Value::Text("long_good".to_string()),
+            Value::Float64(7.6),
+        ]
+    );
+    assert_eq!(
+        result.rows()[1].values(),
+        &[
+            Value::Int64(4),
+            Value::Text("also_good".to_string()),
+            Value::Float64(8.5),
+        ]
+    );
+    assert_eq!(
+        result.rows()[2].values(),
+        &[
+            Value::Int64(5),
+            Value::Text("edge_good".to_string()),
+            Value::Float64(7.8),
+        ]
+    );
+}
+
+#[test]
+fn simple_filtered_projection_order_by_limit_offset_uses_fast_path() {
+    let mut runtime = EngineRuntime::empty(1);
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE movies (id INT64 PRIMARY KEY, released INT64, rating FLOAT64)",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE INDEX idx_movies_rating ON movies(rating)",
+    );
+    for (id, released, rating) in [
+        (1, 2010, 9.5),
+        (2, 2011, 8.1),
+        (3, 2009, 10.0),
+        (4, 2015, 9.0),
+        (5, 2020, 7.0),
+    ] {
+        execute_sql(
+            &mut runtime,
+            &format!(
+                "INSERT INTO movies (id, released, rating) VALUES ({id}, {released}, {rating})"
+            ),
+        );
+    }
+
+    let statement = parse_sql_statement(
+        "SELECT id, rating FROM movies WHERE released >= 2010 ORDER BY rating DESC LIMIT 2 OFFSET 1",
+    )
+    .expect("parse filtered ordered query");
+    let crate::sql::ast::Statement::Query(query) = &statement else {
+        panic!("expected query");
+    };
+
+    let result = runtime
+        .try_execute_simple_filtered_projection_query(query, &[])
+        .expect("execute")
+        .expect("filtered ordered projection should stay on fast path");
+
+    assert_eq!(result.columns(), &["id".to_string(), "rating".to_string()]);
+    assert_eq!(result.rows().len(), 2);
+    assert_eq!(
+        result.rows()[0].values(),
+        &[Value::Int64(4), Value::Float64(9.0)]
+    );
+    assert_eq!(
+        result.rows()[1].values(),
+        &[Value::Int64(2), Value::Float64(8.1)]
+    );
+}
+
+#[test]
 fn simple_indexed_join_multi_order_by_uses_fast_path() {
     let mut runtime = EngineRuntime::empty(1);
     execute_sql(

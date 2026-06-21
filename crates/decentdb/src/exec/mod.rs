@@ -28,7 +28,7 @@ use expressions::*;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::hash::{BuildHasherDefault, Hasher};
-use std::ops::Range;
+use std::ops::{Bound, Range};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -4823,6 +4823,36 @@ impl EngineRuntime {
                     return Ok(result);
                 }
                 if let Some(result) =
+                    self.try_execute_simple_indexed_projection_query(query, params)?
+                {
+                    return Ok(result);
+                }
+                if let Some(result) =
+                    self.try_execute_simple_distinct_filtered_projection_query(query, params)?
+                {
+                    return Ok(result);
+                }
+                if let Some(result) =
+                    self.try_execute_simple_distinct_projection_query(query, params)?
+                {
+                    return Ok(result);
+                }
+                if let Some(result) =
+                    self.try_execute_simple_filtered_projection_query(query, params)?
+                {
+                    return Ok(result);
+                }
+                if let Some(result) =
+                    self.try_execute_simple_expression_projection_query(query, params)?
+                {
+                    return Ok(result);
+                }
+                if let Some(result) =
+                    self.try_execute_simple_table_projection_query(query, params)?
+                {
+                    return Ok(result);
+                }
+                if let Some(result) =
                     self.try_execute_left_join_status_aggregate_query(query, params)?
                 {
                     return Ok(result);
@@ -4873,36 +4903,6 @@ impl EngineRuntime {
                     return Ok(result);
                 }
                 if let Some(result) = self.try_execute_base_table_join(query, params)? {
-                    return Ok(result);
-                }
-                if let Some(result) =
-                    self.try_execute_simple_indexed_projection_query(query, params)?
-                {
-                    return Ok(result);
-                }
-                if let Some(result) =
-                    self.try_execute_simple_distinct_filtered_projection_query(query, params)?
-                {
-                    return Ok(result);
-                }
-                if let Some(result) =
-                    self.try_execute_simple_distinct_projection_query(query, params)?
-                {
-                    return Ok(result);
-                }
-                if let Some(result) =
-                    self.try_execute_simple_filtered_projection_query(query, params)?
-                {
-                    return Ok(result);
-                }
-                if let Some(result) =
-                    self.try_execute_simple_expression_projection_query(query, params)?
-                {
-                    return Ok(result);
-                }
-                if let Some(result) =
-                    self.try_execute_simple_table_projection_query(query, params)?
-                {
                     return Ok(result);
                 }
                 self.evaluate_query(query, params, &BTreeMap::new())
@@ -11715,6 +11715,40 @@ impl EngineRuntime {
         if !query.order_by.is_empty() && order_by.is_none() {
             return Ok(None);
         }
+        if order_by.is_none() {
+            if let Some(result) = self.try_simple_filtered_projection_range_index_result(
+                row_source,
+                name,
+                table_schema,
+                filter_column_index,
+                filter_column,
+                lower_bound.as_ref(),
+                upper_bound.as_ref(),
+                &residual_plans,
+                &projection_indexes,
+                column_names.clone(),
+                limit,
+                offset,
+            )? {
+                return Ok(Some(result));
+            }
+        }
+        if let Some(result) = self.try_simple_filtered_projection_ordered_index_result(
+            row_source,
+            name,
+            table_schema,
+            filter_column_index,
+            lower_bound.as_ref(),
+            upper_bound.as_ref(),
+            &residual_plans,
+            &projection_indexes,
+            column_names.clone(),
+            order_by.as_deref(),
+            limit,
+            offset,
+        )? {
+            return Ok(Some(result));
+        }
         Ok(Some(self.simple_filtered_projection_result_from_source(
             row_source,
             filter_column_index,
@@ -12928,6 +12962,226 @@ impl EngineRuntime {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn try_simple_filtered_projection_range_index_result(
+        &self,
+        row_source: VisibleTableRowSource<'_>,
+        table_name: &str,
+        table_schema: &TableSchema,
+        filter_column_index: usize,
+        filter_column_name: &str,
+        lower_bound: Option<&SimpleRangeBoundValue>,
+        upper_bound: Option<&SimpleRangeBoundValue>,
+        residual_plans: &[SimpleResidualPlan],
+        projection_indexes: &[usize],
+        column_names: Vec<String>,
+        limit: Option<usize>,
+        offset: usize,
+    ) -> Result<Option<QueryResult>> {
+        if limit == Some(0) {
+            return Ok(Some(QueryResult::with_rows(column_names, Vec::new())));
+        }
+        let Some(filter_column) = table_schema.columns.get(filter_column_index) else {
+            return Ok(None);
+        };
+        if !simple_range_bounds_match_column_type(
+            filter_column.column_type,
+            lower_bound,
+            upper_bound,
+        ) {
+            return Ok(None);
+        }
+        let Some(index) = self.single_column_btree_index(table_name, filter_column_name) else {
+            return Ok(None);
+        };
+        let Some(RuntimeIndex::Btree { keys, .. }) = self.index(&index.name) else {
+            return Ok(None);
+        };
+
+        let lower_key = lower_bound
+            .map(|bound| encode_index_key(&bound.value).map(|key| (key, bound.inclusive)))
+            .transpose()?;
+        let upper_key = upper_bound
+            .map(|bound| encode_index_key(&bound.value).map(|key| (key, bound.inclusive)))
+            .transpose()?;
+        let lower_range: Bound<&Vec<u8>> = match lower_key.as_ref() {
+            Some((key, true)) => Bound::Included(key),
+            Some((key, false)) => Bound::Excluded(key),
+            None => Bound::Unbounded,
+        };
+        let upper_range: Bound<&Vec<u8>> = match upper_key.as_ref() {
+            Some((key, true)) => Bound::Included(key),
+            Some((key, false)) => Bound::Excluded(key),
+            None => Bound::Unbounded,
+        };
+
+        let mut candidate_row_ids = Vec::new();
+        match keys {
+            RuntimeBtreeKeys::UniqueEncoded(entries) => {
+                candidate_row_ids.extend(
+                    entries
+                        .range::<Vec<u8>, _>((lower_range, upper_range))
+                        .map(|(_, row_id)| *row_id),
+                );
+            }
+            RuntimeBtreeKeys::NonUniqueEncoded(entries) => {
+                for row_ids in entries
+                    .range::<Vec<u8>, _>((lower_range, upper_range))
+                    .map(|(_, row_ids)| row_ids)
+                {
+                    candidate_row_ids.extend(row_ids.iter().copied());
+                }
+            }
+            RuntimeBtreeKeys::UniqueInt64(_) | RuntimeBtreeKeys::NonUniqueInt64(_) => {
+                return Ok(None);
+            }
+        }
+        if candidate_row_ids.len().saturating_mul(2) > row_source.row_count() {
+            return Ok(None);
+        }
+        candidate_row_ids.sort_unstable();
+
+        let take = limit.unwrap_or(usize::MAX);
+        let mut skipped = 0usize;
+        let mut rows = Vec::with_capacity(take.min(candidate_row_ids.len()).min(128));
+        for row_id in candidate_row_ids {
+            let Some(stored_row) = row_source.row_by_id(row_id)? else {
+                continue;
+            };
+            let values = stored_row.values();
+            let candidate = &values[filter_column_index];
+            if !simple_range_bound_matches(candidate, lower_bound, upper_bound)?
+                || !simple_residual_matches_all(values, residual_plans)?
+            {
+                continue;
+            }
+            if skipped < offset {
+                skipped = skipped.saturating_add(1);
+                continue;
+            }
+            rows.push(project_simple_projection_values(values, projection_indexes));
+            if rows.len() >= take {
+                break;
+            }
+        }
+
+        Ok(Some(QueryResult::with_rows(column_names, rows)))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_simple_filtered_projection_ordered_index_result(
+        &self,
+        row_source: VisibleTableRowSource<'_>,
+        table_name: &str,
+        table_schema: &TableSchema,
+        filter_column_index: usize,
+        lower_bound: Option<&SimpleRangeBoundValue>,
+        upper_bound: Option<&SimpleRangeBoundValue>,
+        residual_plans: &[SimpleResidualPlan],
+        projection_indexes: &[usize],
+        column_names: Vec<String>,
+        order_by: Option<&[SimpleOrderByPlan]>,
+        limit: Option<usize>,
+        offset: usize,
+    ) -> Result<Option<QueryResult>> {
+        let Some([order_by]) = order_by else {
+            return Ok(None);
+        };
+        if order_by.collation.is_some() {
+            return Ok(None);
+        }
+        if limit == Some(0) {
+            return Ok(Some(QueryResult::with_rows(column_names, Vec::new())));
+        }
+        let Some(order_column_index) = projection_indexes.get(order_by.projection_index).copied()
+        else {
+            return Ok(None);
+        };
+        let Some(order_column) = table_schema.columns.get(order_column_index) else {
+            return Ok(None);
+        };
+        let Some(index) = self.single_column_btree_index(table_name, &order_column.name) else {
+            return Ok(None);
+        };
+        let Some(RuntimeIndex::Btree { keys, .. }) = self.index(&index.name) else {
+            return Ok(None);
+        };
+        let take = limit.unwrap_or(usize::MAX);
+        let mut skipped = 0usize;
+        let mut rows = Vec::with_capacity(take.min(64));
+
+        let mut push_matching_row = |row_id| -> Result<bool> {
+            let Some(stored_row) = row_source.row_by_id(row_id)? else {
+                return Ok(false);
+            };
+            let values = stored_row.values();
+            let candidate = &values[filter_column_index];
+            if !simple_range_bound_matches(candidate, lower_bound, upper_bound)?
+                || !simple_residual_matches_all(values, residual_plans)?
+            {
+                return Ok(false);
+            }
+            if skipped < offset {
+                skipped = skipped.saturating_add(1);
+                return Ok(false);
+            }
+            rows.push(project_simple_projection_values(values, projection_indexes));
+            Ok(rows.len() >= take)
+        };
+
+        match keys {
+            RuntimeBtreeKeys::UniqueEncoded(entries) => {
+                if order_by.descending {
+                    for row_id in entries.values().rev() {
+                        if push_matching_row(*row_id)? {
+                            break;
+                        }
+                    }
+                } else {
+                    for row_id in entries.values() {
+                        if push_matching_row(*row_id)? {
+                            break;
+                        }
+                    }
+                }
+            }
+            RuntimeBtreeKeys::NonUniqueEncoded(entries) => {
+                if order_by.descending {
+                    let mut done = false;
+                    for row_ids in entries.values().rev() {
+                        for row_id in row_ids {
+                            if push_matching_row(*row_id)? {
+                                done = true;
+                                break;
+                            }
+                        }
+                        if done {
+                            break;
+                        }
+                    }
+                } else {
+                    let mut done = false;
+                    for row_ids in entries.values() {
+                        for row_id in row_ids {
+                            if push_matching_row(*row_id)? {
+                                done = true;
+                                break;
+                            }
+                        }
+                        if done {
+                            break;
+                        }
+                    }
+                }
+            }
+            RuntimeBtreeKeys::UniqueInt64(_) | RuntimeBtreeKeys::NonUniqueInt64(_) => {
+                return Ok(None);
+            }
+        }
+
+        Ok(Some(QueryResult::with_rows(column_names, rows)))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn simple_filtered_projection_result_from_source(
         &self,
         row_source: VisibleTableRowSource<'_>,
@@ -12981,7 +13235,23 @@ impl EngineRuntime {
             if !simple_residual_matches_all(values, residual_plans)? {
                 continue;
             }
-            rows.push(project_simple_projection_values(values, projection_indexes));
+            let row = project_simple_projection_values(values, projection_indexes);
+            if let (Some(order_by), Some(bounded_row_count)) = (
+                order_by.as_deref(),
+                bounded_row_count.filter(|bounded| {
+                    *bounded > 0 && row_source.row_count() > bounded.saturating_mul(4)
+                }),
+            ) {
+                push_bounded_projection_ordered_query_row(
+                    Some(self),
+                    &mut rows,
+                    row,
+                    order_by,
+                    bounded_row_count,
+                )?;
+            } else {
+                rows.push(row);
+            }
         }
         apply_simple_projection_postprocessing_with_order(
             Some(self),
@@ -13081,7 +13351,22 @@ impl EngineRuntime {
             if !simple_residual_matches_all(values, residual_plans)? {
                 return Ok(());
             }
-            rows.push(project_simple_projection_values(values, projection_indexes));
+            let row = project_simple_projection_values(values, projection_indexes);
+            if let (Some(order_by), Some(bounded_row_count)) = (
+                order_by.as_deref(),
+                bounded_row_count
+                    .filter(|bounded| *bounded > 0 && state.row_count > bounded.saturating_mul(4)),
+            ) {
+                push_bounded_projection_ordered_query_row(
+                    Some(self),
+                    &mut rows,
+                    row,
+                    order_by,
+                    bounded_row_count,
+                )?;
+            } else {
+                rows.push(row);
+            }
             Ok(())
         })?;
         apply_simple_projection_postprocessing_with_order(
@@ -27368,8 +27653,13 @@ fn simple_residual_matches(candidate: &Value, plan: &SimpleResidualPlan) -> Resu
     // generic executor may coerce some of these; rather than aborting the
     // query on the fast path, treat the term as not satisfied so the row is
     // excluded consistently with a WHERE that cannot match.
-    let Ok(ordering) = compare_values(candidate, &plan.value) else {
-        return Ok(false);
+    let ordering = if let Some(ordering) = simple_fast_compare_values(candidate, &plan.value) {
+        ordering
+    } else {
+        let Ok(ordering) = compare_values(candidate, &plan.value) else {
+            return Ok(false);
+        };
+        ordering
     };
     let truthy = match plan.op {
         BinaryOp::Eq => ordering == std::cmp::Ordering::Equal,
@@ -27381,6 +27671,18 @@ fn simple_residual_matches(candidate: &Value, plan: &SimpleResidualPlan) -> Resu
         _ => false,
     };
     Ok(truthy)
+}
+
+fn simple_fast_compare_values(left: &Value, right: &Value) -> Option<std::cmp::Ordering> {
+    match (left, right) {
+        (Value::Int64(left), Value::Int64(right)) => Some(left.cmp(right)),
+        (Value::Float64(left), Value::Float64(right)) => Some(left.total_cmp(right)),
+        (Value::DateDays(left), Value::DateDays(right)) => Some(left.cmp(right)),
+        (Value::TimestampMicros(left), Value::TimestampMicros(right)) => Some(left.cmp(right)),
+        (Value::TimeMicros(left), Value::TimeMicros(right)) => Some(left.cmp(right)),
+        (Value::TimestampTzMicros(left), Value::TimestampTzMicros(right)) => Some(left.cmp(right)),
+        _ => None,
+    }
 }
 
 fn simple_residual_matches_all(
@@ -27638,13 +27940,49 @@ fn reverse_binary_op(op: BinaryOp) -> Option<BinaryOp> {
     }
 }
 
+fn simple_range_bounds_match_column_type(
+    column_type: ColumnType,
+    lower_bound: Option<&SimpleRangeBoundValue>,
+    upper_bound: Option<&SimpleRangeBoundValue>,
+) -> bool {
+    lower_bound.is_none_or(|bound| simple_value_matches_column_type(column_type, &bound.value))
+        && upper_bound
+            .is_none_or(|bound| simple_value_matches_column_type(column_type, &bound.value))
+}
+
+fn simple_value_matches_column_type(column_type: ColumnType, value: &Value) -> bool {
+    matches!(
+        (column_type, value),
+        (ColumnType::Int64, Value::Int64(_))
+            | (ColumnType::Float64, Value::Float64(_))
+            | (ColumnType::Text, Value::Text(_))
+            | (ColumnType::Bool, Value::Bool(_))
+            | (ColumnType::Blob, Value::Blob(_))
+            | (ColumnType::Decimal, Value::Decimal { .. })
+            | (ColumnType::Uuid, Value::Uuid(_))
+            | (ColumnType::Timestamp, Value::TimestampMicros(_))
+            | (ColumnType::Enum, Value::Enum { .. })
+            | (ColumnType::IpAddr, Value::IpAddr { .. })
+            | (ColumnType::Cidr, Value::Cidr { .. })
+            | (ColumnType::MacAddr, Value::MacAddr { .. })
+            | (ColumnType::Date, Value::DateDays(_))
+            | (ColumnType::Time, Value::TimeMicros(_))
+            | (ColumnType::TimestampTz, Value::TimestampTzMicros(_))
+            | (ColumnType::Interval, Value::Interval { .. })
+            | (ColumnType::Geometry, Value::Geometry(_))
+            | (ColumnType::Geography, Value::Geography(_))
+    )
+}
+
 fn simple_range_bound_matches(
     candidate: &Value,
     lower_bound: Option<&SimpleRangeBoundValue>,
     upper_bound: Option<&SimpleRangeBoundValue>,
 ) -> Result<bool> {
     if let Some(lower_bound) = lower_bound {
-        let ordering = compare_values(candidate, &lower_bound.value)?;
+        let ordering = simple_fast_compare_values(candidate, &lower_bound.value)
+            .map(Ok)
+            .unwrap_or_else(|| compare_values(candidate, &lower_bound.value))?;
         let lower_matches = if lower_bound.inclusive {
             ordering != std::cmp::Ordering::Less
         } else {
@@ -27655,7 +27993,9 @@ fn simple_range_bound_matches(
         }
     }
     if let Some(upper_bound) = upper_bound {
-        let ordering = compare_values(candidate, &upper_bound.value)?;
+        let ordering = simple_fast_compare_values(candidate, &upper_bound.value)
+            .map(Ok)
+            .unwrap_or_else(|| compare_values(candidate, &upper_bound.value))?;
         let upper_matches = if upper_bound.inclusive {
             ordering != std::cmp::Ordering::Greater
         } else {

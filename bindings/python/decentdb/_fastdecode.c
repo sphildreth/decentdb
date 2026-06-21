@@ -1,5 +1,6 @@
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
+#include <datetime.h>
 #include <stdint.h>
 #include <string.h>
 #include "decentdb.h"
@@ -15,6 +16,12 @@ static PyObject *decode_i64_text_f64_i64_values(
     size_t text_len,
     double float_value,
     int64_t int2_value);
+static PyObject *decode_i64_text_f64_date_values(
+    int64_t id_value,
+    const uint8_t *text_data,
+    size_t text_len,
+    double float_value,
+    int32_t date_days);
 static PyObject *decode_i64_text_f64_i64_i64_values(
     int64_t id_value,
     const uint8_t *text_data,
@@ -67,6 +74,20 @@ static PyObject *decode_utf8_text_value(const uint8_t *text_data, size_t text_le
     return PyUnicode_FromStringAndSize((const char *)text_data, (Py_ssize_t)text_len);
 }
 
+static PyObject *decode_date_days_value(int32_t days) {
+    int64_t z = (int64_t)days + 719468;
+    int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+    uint64_t doe = (uint64_t)(z - era * 146097);
+    uint64_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    int64_t y = (int64_t)yoe + era * 400;
+    uint64_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    int64_t mp = (int64_t)((5 * doy + 2) / 153);
+    int64_t d = (int64_t)doy - (153 * mp + 2) / 5 + 1;
+    int64_t m = mp + (mp < 10 ? 3 : -9);
+    y += m <= 2;
+    return PyDate_FromDate((int)y, (int)m, (int)d);
+}
+
 static PyObject *decode_i64_text_f64_row(const ddb_value_view_t *row) {
     if (row[0].tag != DDB_VALUE_INT64 || row[1].tag != DDB_VALUE_TEXT ||
         row[2].tag != DDB_VALUE_FLOAT64) {
@@ -110,6 +131,61 @@ static PyObject *decode_i64_text_f64_values(
         return NULL;
     }
     PyTuple_SET_ITEM(tuple, 2, float_obj);
+    return tuple;
+}
+
+static PyObject *decode_i64_text_f64_date_row(const ddb_value_view_t *row) {
+    if (row[0].tag != DDB_VALUE_INT64 || row[1].tag != DDB_VALUE_TEXT ||
+        row[2].tag != DDB_VALUE_FLOAT64 || row[3].tag != DDB_VALUE_DATE) {
+        PyErr_SetString(PyExc_ValueError, "row tags are not INT64/TEXT/FLOAT64/DATE");
+        return NULL;
+    }
+    return decode_i64_text_f64_date_values(
+        row[0].int64_value,
+        row[1].data,
+        row[1].len,
+        row[2].float64_value,
+        row[3].date_days);
+}
+
+static PyObject *decode_i64_text_f64_date_values(
+    int64_t id_value,
+    const uint8_t *text_data,
+    size_t text_len,
+    double float_value,
+    int32_t date_days) {
+    PyObject *tuple = PyTuple_New(4);
+    if (tuple == NULL) {
+        return NULL;
+    }
+
+    PyObject *id_obj = PyLong_FromLongLong(id_value);
+    if (id_obj == NULL) {
+        Py_DECREF(tuple);
+        return NULL;
+    }
+    PyTuple_SET_ITEM(tuple, 0, id_obj);
+
+    PyObject *text_obj = decode_utf8_text_value(text_data, text_len);
+    if (text_obj == NULL) {
+        Py_DECREF(tuple);
+        return NULL;
+    }
+    PyTuple_SET_ITEM(tuple, 1, text_obj);
+
+    PyObject *float_obj = PyFloat_FromDouble(float_value);
+    if (float_obj == NULL) {
+        Py_DECREF(tuple);
+        return NULL;
+    }
+    PyTuple_SET_ITEM(tuple, 2, float_obj);
+
+    PyObject *date_obj = decode_date_days_value(date_days);
+    if (date_obj == NULL) {
+        Py_DECREF(tuple);
+        return NULL;
+    }
+    PyTuple_SET_ITEM(tuple, 3, date_obj);
     return tuple;
 }
 
@@ -582,6 +658,10 @@ static PyObject *decode_known_fast_row(const ddb_value_view_t *row, size_t colum
             row[2].tag == DDB_VALUE_FLOAT64 && row[3].tag == DDB_VALUE_INT64) {
             return decode_i64_text_f64_i64_row(row);
         }
+        if (row[0].tag == DDB_VALUE_INT64 && row[1].tag == DDB_VALUE_TEXT &&
+            row[2].tag == DDB_VALUE_FLOAT64 && row[3].tag == DDB_VALUE_DATE) {
+            return decode_i64_text_f64_date_row(row);
+        }
     }
     if (columns == 5) {
         if (row[0].tag == DDB_VALUE_INT64 && row[1].tag == DDB_VALUE_TEXT &&
@@ -895,6 +975,42 @@ static PyObject *decode_matrix_i64_text_f64(PyObject *self, PyObject *args) {
     for (Py_ssize_t i = 0; i < row_count; i++) {
         const ddb_value_view_t *row = values + (i * 3);
         PyObject *tuple = decode_i64_text_f64_row(row);
+        if (tuple == NULL) {
+            Py_DECREF(rows);
+            return NULL;
+        }
+        PyList_SET_ITEM(rows, i, tuple);
+    }
+    return rows;
+}
+
+static PyObject *decode_matrix_i64_text_f64_date(PyObject *self, PyObject *args) {
+    unsigned long long addr = 0;
+    Py_ssize_t row_count = 0;
+    if (!PyArg_ParseTuple(args, "Kn", &addr, &row_count)) {
+        return NULL;
+    }
+    if (row_count < 0) {
+        PyErr_SetString(PyExc_ValueError, "row_count must be non-negative");
+        return NULL;
+    }
+    if (row_count == 0) {
+        return PyList_New(0);
+    }
+    if (addr == 0) {
+        PyErr_SetString(PyExc_ValueError, "matrix pointer is null");
+        return NULL;
+    }
+
+    const ddb_value_view_t *values = (const ddb_value_view_t *)(uintptr_t)addr;
+    PyObject *rows = PyList_New(row_count);
+    if (rows == NULL) {
+        return NULL;
+    }
+
+    for (Py_ssize_t i = 0; i < row_count; i++) {
+        const ddb_value_view_t *row = values + (i * 4);
+        PyObject *tuple = decode_i64_text_f64_date_row(row);
         if (tuple == NULL) {
             Py_DECREF(rows);
             return NULL;
@@ -2430,6 +2546,8 @@ static PyMethodDef methods[] = {
      "Decode one INT64/TEXT/FLOAT64 row from a ddb_value_view_t pointer."},
     {"decode_matrix_i64_text_f64", decode_matrix_i64_text_f64, METH_VARARGS,
      "Decode row_count INT64/TEXT/FLOAT64 rows from a ddb_value_view_t pointer."},
+    {"decode_matrix_i64_text_f64_date", decode_matrix_i64_text_f64_date, METH_VARARGS,
+     "Decode row_count INT64/TEXT/FLOAT64/DATE rows from a ddb_value_view_t pointer."},
     {"decode_matrix_i64_text_f64_i64_i64", decode_matrix_i64_text_f64_i64_i64, METH_VARARGS,
      "Decode row_count INT64/TEXT/FLOAT64/INT64/INT64 rows from a ddb_value_view_t pointer."},
     {"decode_row_i64_text_text", decode_row_i64_text_text, METH_VARARGS,
@@ -2515,4 +2633,10 @@ static struct PyModuleDef module = {
     methods,
 };
 
-PyMODINIT_FUNC PyInit__fastdecode(void) { return PyModule_Create(&module); }
+PyMODINIT_FUNC PyInit__fastdecode(void) {
+    PyDateTime_IMPORT;
+    if (PyDateTimeAPI == NULL) {
+        return NULL;
+    }
+    return PyModule_Create(&module);
+}

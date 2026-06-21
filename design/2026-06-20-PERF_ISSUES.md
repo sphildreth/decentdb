@@ -1904,3 +1904,93 @@ Remaining Phase 6 gaps (documented, not closed):
 - Yearly counts (~1.4x slower): single-table GROUP BY with strftime expression key; the existing `try_execute_simple_grouped_count_query` should be covering this but may not support computed GROUP BY keys.
 
 Next task: Phase 7 — CTEs and STRING_AGG optimization.
+
+### Phase 2b: Range Scans and Indexed Range/Order
+
+Hypothesis: The reduced Showdown indexed range/order gap was primarily a
+combination of executor shape recognition and Python result materialization.
+The query:
+
+`SELECT id, title, rating, released FROM movies WHERE released >= CAST('2010-01-01' AS DATE) ORDER BY rating DESC LIMIT 50`
+
+was filtering after scanning/materializing more rows than necessary and then
+paid the generic Python DATE decode path. The filtered range query:
+
+`SELECT id, title, rating FROM movies WHERE rating >= 7.5 AND rating <= 9.0 AND runtime_minutes > 120`
+
+could also use the runtime B-tree on `movies(rating)` as a candidate prefilter
+before applying the residual predicate.
+
+Files changed:
+
+- `crates/decentdb/src/exec/mod.rs`:
+  - Moved simple single-table read fast paths earlier in read dispatch.
+  - Added an ordered secondary B-tree path for simple filtered projections with
+    `ORDER BY <projected-column> LIMIT/OFFSET`.
+  - Added a runtime B-tree range prefilter for simple filtered projections with
+    residual predicates, preserving row-id order for no-`ORDER BY` queries.
+  - Added same-type scalar comparison shortcuts for hot range/residual checks.
+- `crates/decentdb/src/exec/tests.rs`:
+  - Added coverage for ordered secondary-index filtered projection.
+  - Added coverage for range-index prefilter plus residual predicate.
+- `bindings/python/decentdb/_fastdecode.c`:
+  - Added native matrix decode for `INT64/TEXT/FLOAT64/DATE`.
+- `bindings/python/decentdb/__init__.py`:
+  - Routed the matching 4-column matrix shape through the native decoder.
+
+Benchmark before:
+
+- Baseline logs: `.tmp/perf-agent/20260621-150743/baseline-{1,2,3}.log`.
+- Reduced Showdown indexed range/order:
+  - DecentDB: 0.000294 / 0.000328 / 0.000312 s.
+  - SQLite: 0.000119 / 0.000096 / 0.000093 s.
+  - Gap: SQLite ~2.5-3.4x faster.
+- Reduced Showdown full table scan and filtered range were already competitive
+  in those baseline single-shot runs, so this phase focused on preserving them
+  while closing indexed range/order.
+
+Benchmark after:
+
+- Final raw log:
+  `.tmp/perf-agent/20260621-150743/after-rangeindex-final.log`.
+- This is the benchmark's embedded-fast profile, explicitly logged as
+  DecentDB `wal_sync_mode=normal;process_coordination=single_process_unsafe`
+  versus SQLite `wal_normal`; these are reduced-sync benchmark settings, not
+  full-durability settings.
+- Reduced Showdown final sample:
+  - Full table scan: DecentDB 0.000291 s vs SQLite 0.000625 s (2.15x faster).
+  - Filtered range: DecentDB 0.000066 s vs SQLite 0.000103 s (1.55x faster).
+  - Indexed range/order: DecentDB 0.000048 s vs SQLite 0.000096 s (2.01x faster).
+- Focused 1000-iteration timing under the same embedded-fast profile:
+  - Filtered range median: DecentDB 0.0293 ms vs SQLite 0.0724 ms.
+  - Indexed range/order median: DecentDB 0.0217 ms vs SQLite 0.0749 ms.
+- Existing wins preserved in the final sample: point lookup, full scan,
+  selected joins, and final file size all remained faster/smaller than SQLite.
+
+Tests run:
+
+- `cargo fmt --check`.
+- `cargo check -p decentdb`.
+- `cargo test -p decentdb simple_filtered_projection_`.
+- `cargo build -p decentdb --release`.
+- `python -m py_compile bindings/python/decentdb/__init__.py bindings/python/decentdb/native.py bindings/python/benchmarks/bench_complex.py`.
+- Rebuilt `_fastdecode` with `gcc -O3 -shared -fPIC ...`.
+- Python smoke test for `decode_matrix_i64_text_f64_date` and DATE round trip.
+
+Result: Phase 2 is closed for the reduced Showdown range workloads under the
+benchmark's labeled embedded-fast profile. Indexed range/order moved from a
+clear SQLite win to a DecentDB win, and filtered range remained a DecentDB win
+in the saved final run. Full scans were already faster locally and stayed
+faster.
+
+Remaining risk: The ordered secondary-index path currently handles only a
+single projected `ORDER BY` column backed by a fresh single-column runtime
+B-tree. The range prefilter handles encoded runtime B-tree keys and falls back
+for runtime INT64 hash indexes, broad ranges, mismatched bound types, persisted
+deferred row sources without loaded runtime indexes, and complex expressions.
+The Python DATE native decoder covers the hot `INT64/TEXT/FLOAT64/DATE` matrix
+shape only; other DATE-bearing shapes still use the generic decoder.
+
+Next task: Phase 3 — Bulk Load and Write Paths. Bulk load and most
+write/RETURNING/UPSERT/delete paths remain SQLite-faster in the saved final
+Showdown run.
