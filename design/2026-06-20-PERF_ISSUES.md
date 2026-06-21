@@ -1860,3 +1860,47 @@ virtual-generated-column indexes, so those keep using the materializing path.
 Next task: Phase 6 — Aggregates, Joins, And Filmography Queries (review
 aggregate join ~2-3x, person filmography ~2.7x, genre popularity ~2.5x, yearly
 counts ~1.7x slower than SQLite).
+
+### Phase 6a: Left Join Indexed Aggregate Fast Path
+
+Hypothesis: The Showdown review aggregate join query (`LEFT JOIN reviews ... GROUP BY m.id, m.title, m.rating`) fell through to the generic NestedLoopJoin executor, producing a 700×949 cross product before aggregation. A new indexed-join aggregate fast path that uses the B+tree index on `reviews(movie_id)` to look up child rows per parent, accumulating COUNT/AVG/MIN/MAX directly without materializing the join, should close most of the gap.
+
+Files changed:
+
+- `crates/decentdb/src/exec/mod.rs`:
+  - Added `IndexedJoinAggregateKind` enum for aggregate type classification (CountRows, CountNonNull, Sum, Avg, Min, Max).
+  - Added `LeftJoinAggregatePlan` struct to hold the analyzed plan.
+  - Added `IndexedJoinAggregateState` / `IndexedJoinAccumulator` to accumulate per-parent child-row aggregates.
+  - Added `indexed_join_aggregate_as_f64` and `compare_values_no_error` helpers.
+  - Added `try_execute_left_join_aggregate_query` execute function that iterates parent rows, looks up child rows via B+tree runtime index, accumulates aggregate state, and returns one output row per parent.
+  - Added `analyze_left_join_aggregate_query` analysis function that recognizes LEFT JOIN with GROUP BY on parent columns and aggregates (COUNT(*), COUNT(col), SUM, AVG, MIN, MAX) on child columns, requiring a single-column B+tree index on the child join column.
+  - Added `classify_indexed_join_aggregate` and `resolved_child_column_index` helpers.
+  - Wired `try_execute_left_join_aggregate_query` into `execute_read_statement` dispatch after the existing `try_execute_left_join_status_aggregate_query`.
+
+Benchmark before (3-run median, reduced Showdown, 700 movies):
+
+- DecentDB review aggregate join: ~0.0048 s. SQLite: ~0.0021 s. Gap: SQLite ~2.3x faster.
+
+Benchmark after (3-run, reduced Showdown, 700 movies):
+
+- DecentDB review aggregate join: 0.002821 / 0.003073 / 0.003026 s. SQLite: 0.002118 / 0.002023 / 0.002066 s.
+- Gap: SQLite ~1.33-1.52x faster (improved from ~2.3x).
+
+Existing wins preserved: point lookup, full table scan, filtered range, indexed range/order, cast/crew join, movie genres join, final file size all held.
+
+Tests run:
+
+- `cargo fmt --check` (clean after fmt).
+- `cargo check -p decentdb` (clean).
+- `cargo clippy -p decentdb --all-features` (0 new warnings; 9 pre-existing).
+- `cargo test -p decentdb` (2990 passed, 0 failed).
+- Key integration tests: `read_executor_supports_joins_aggregates_row_number_and_explain`, `complex_multi_join_with_aggregates` pass.
+
+Remaining risk: The fast path only handles LEFT JOIN with a single-column B+tree index on the child join column. INNER JOIN, multi-table joins (3+ tables), joins without B+tree indexes, and aggregates with DISTINCT fall back to the generic executor. CountDistinct, BoolAnd, BoolOr, Stddev, and Variance aggregates are not supported. The path skips parent rows with NULL join keys (LEFT JOIN semantics) producing NULL/0 aggregates for those rows, matching the generic executor.
+
+Remaining Phase 6 gaps (documented, not closed):
+- Person filmography (~2.3x slower): uses INNER JOIN with COUNT(DISTINCT), both unsupported by the current fast path. Needs INNER JOIN support and a HashSet-based CountDistinct accumulator.
+- Genre popularity (~2.3x slower): 3-table join (genres → movie_genres → movies) beyond the current 2-table scope.
+- Yearly counts (~1.4x slower): single-table GROUP BY with strftime expression key; the existing `try_execute_simple_grouped_count_query` should be covering this but may not support computed GROUP BY keys.
+
+Next task: Phase 7 — CTEs and STRING_AGG optimization.

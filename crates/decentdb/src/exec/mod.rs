@@ -4827,6 +4827,9 @@ impl EngineRuntime {
                 {
                     return Ok(result);
                 }
+                if let Some(result) = self.try_execute_left_join_aggregate_query(query, params)? {
+                    return Ok(result);
+                }
                 if let Some(result) = self.try_execute_simple_grouped_count_query(query, params)? {
                     return Ok(result);
                 }
@@ -7682,6 +7685,333 @@ impl EngineRuntime {
             plan.limit,
             plan.offset,
         )?))
+    }
+
+    pub(crate) fn try_execute_left_join_aggregate_query(
+        &self,
+        query: &Query,
+        params: &[Value],
+    ) -> Result<Option<QueryResult>> {
+        let Some(plan) = self.analyze_left_join_aggregate_query(query, params)? else {
+            return Ok(None);
+        };
+        let Some(parent_source) = self.visible_table_row_source(plan.parent_table_name) else {
+            return Ok(None);
+        };
+        let Some(child_source) = self.visible_table_row_source(plan.child_table_name) else {
+            return Ok(None);
+        };
+        let child_index_keys =
+            plan.child_index_name
+                .as_deref()
+                .and_then(|index_name| match self.index(index_name) {
+                    Some(RuntimeIndex::Btree { keys, .. }) => Some(keys),
+                    _ => None,
+                });
+
+        if child_index_keys.is_none() {
+            return Ok(None);
+        }
+        let keys = child_index_keys.unwrap();
+
+        let bounded_order = plan
+            .order_by
+            .as_deref()
+            .zip(plan.limit)
+            .filter(|(_, _)| plan.offset == 0);
+        let mut rows = Vec::new();
+
+        for parent_row in parent_source.rows() {
+            let parent_row = parent_row?;
+            let parent_values = parent_row.values();
+            let Some(join_value) = parent_values.get(plan.parent_join_index) else {
+                return Err(DbError::internal("parent join row is shorter than schema"));
+            };
+
+            let mut state = IndexedJoinAggregateState::new(&plan.aggregate_kinds);
+
+            if !matches!(join_value, Value::Null) {
+                let child_row_ids = keys.row_ids_for_value_set(join_value)?;
+                match child_row_ids {
+                    RuntimeRowIdSet::Empty => {}
+                    RuntimeRowIdSet::Single(child_row_id) => {
+                        let Some(child_row) = child_source.row_by_id(child_row_id)? else {
+                            return Err(DbError::internal("child index referenced missing row id"));
+                        };
+                        state.accumulate(child_row.values())?;
+                    }
+                    RuntimeRowIdSet::Many(row_ids) => {
+                        for child_row_id in row_ids {
+                            let Some(child_row) = child_source.row_by_id(*child_row_id)? else {
+                                return Err(DbError::internal(
+                                    "child index referenced missing row id",
+                                ));
+                            };
+                            state.accumulate(child_row.values())?;
+                        }
+                    }
+                }
+            }
+
+            let mut output =
+                Vec::with_capacity(plan.group_column_indexes.len() + plan.aggregate_kinds.len());
+            for index in &plan.group_column_indexes {
+                output.push(parent_values[*index].clone());
+            }
+            state.finalize_into(&mut output);
+            let row = QueryRow::new(output);
+
+            if let Some((order_by, limit)) = bounded_order {
+                push_bounded_projection_ordered_query_row(
+                    Some(self),
+                    &mut rows,
+                    row,
+                    order_by,
+                    limit,
+                )?;
+            } else {
+                rows.push(row);
+            }
+        }
+
+        if let Some((order_by, _)) = bounded_order {
+            sort_query_rows_by_projection_order(Some(self), &mut rows, order_by)?;
+            return Ok(Some(QueryResult::with_rows(plan.column_names, rows)));
+        }
+
+        Ok(Some(apply_simple_projection_postprocessing_with_order(
+            Some(self),
+            rows,
+            plan.column_names,
+            plan.order_by.as_deref(),
+            plan.limit,
+            plan.offset,
+        )?))
+    }
+
+    fn analyze_left_join_aggregate_query<'a>(
+        &'a self,
+        query: &'a Query,
+        params: &[Value],
+    ) -> Result<Option<LeftJoinAggregatePlan<'a>>> {
+        if !query.ctes.is_empty() || query.recursive {
+            return Ok(None);
+        }
+        let QueryBody::Select(select) = &query.body else {
+            return Ok(None);
+        };
+        if select.distinct
+            || !select.distinct_on.is_empty()
+            || select.filter.is_some()
+            || select.having.is_some()
+            || select.group_by.is_empty()
+            || select.from.len() != 1
+        {
+            return Ok(None);
+        }
+        let FromItem::Join {
+            left,
+            right,
+            kind,
+            constraint,
+        } = &select.from[0]
+        else {
+            return Ok(None);
+        };
+        if !matches!(kind, JoinKind::Left) {
+            return Ok(None);
+        }
+        let (left_name, left_alias) = match &**left {
+            FromItem::Table { name, alias } => (name.as_str(), alias),
+            _ => return Ok(None),
+        };
+        let (right_name, right_alias) = match &**right {
+            FromItem::Table { name, alias } => (name.as_str(), alias),
+            _ => return Ok(None),
+        };
+        if self
+            .visible_view(left_name, NameResolutionScope::Session)
+            .is_some()
+            || self
+                .visible_view(right_name, NameResolutionScope::Session)
+                .is_some()
+            || self.visible_table_is_temporary(left_name)
+            || self.visible_table_is_temporary(right_name)
+        {
+            return Ok(None);
+        }
+        let Some(left_schema) = self.table_schema(left_name) else {
+            return Ok(None);
+        };
+        let Some(right_schema) = self.table_schema(right_name) else {
+            return Ok(None);
+        };
+        if !generated_columns_are_stored(left_schema) || !generated_columns_are_stored(right_schema)
+        {
+            return Ok(None);
+        }
+        let left_binding = TableBindingRef {
+            name: left_name,
+            alias: left_alias,
+        };
+        let right_binding = TableBindingRef {
+            name: right_name,
+            alias: right_alias,
+        };
+        let left_group_indexes =
+            indexed_join_group_column_indexes(&select.group_by, left_binding, left_schema);
+        let right_group_indexes =
+            indexed_join_group_column_indexes(&select.group_by, right_binding, right_schema);
+        let (parent_name, parent_binding, parent_schema, child_name, child_binding, child_schema) =
+            match (left_group_indexes, right_group_indexes) {
+                (Some(_group_column_indexes), None) => (
+                    left_name,
+                    left_binding,
+                    left_schema,
+                    right_name,
+                    right_binding,
+                    right_schema,
+                ),
+                _ => return Ok(None),
+            };
+
+        let group_column_indexes =
+            indexed_join_group_column_indexes(&select.group_by, parent_binding, parent_schema)
+                .ok_or_else(|| DbError::internal("group column indexes mismatch"))?;
+
+        let num_group_cols = select.group_by.len();
+        if select.projection.len() <= num_group_cols {
+            return Ok(None);
+        }
+
+        for projection_item in select
+            .projection
+            .iter()
+            .take(num_group_cols)
+            .zip(&select.group_by)
+        {
+            let (projection_item, group_expr) = projection_item;
+            let SelectItem::Expr {
+                expr: projection_expr,
+                ..
+            } = projection_item
+            else {
+                return Ok(None);
+            };
+            if !grouped_projection_expr_matches_group_expr(
+                projection_expr,
+                group_expr,
+                parent_binding,
+            ) {
+                return Ok(None);
+            }
+        }
+
+        let mut aggregate_kinds = Vec::with_capacity(select.projection.len() - num_group_cols);
+        for projection_item in select.projection.iter().skip(num_group_cols) {
+            let SelectItem::Expr { expr, .. } = projection_item else {
+                return Ok(None);
+            };
+            let Some(kind) = classify_indexed_join_aggregate(expr, child_binding, child_schema)
+            else {
+                return Ok(None);
+            };
+            aggregate_kinds.push(kind);
+        }
+
+        let mut column_names = Vec::with_capacity(select.projection.len());
+        for (index, projection_item) in select.projection.iter().enumerate() {
+            let SelectItem::Expr { expr, alias } = projection_item else {
+                return Ok(None);
+            };
+            column_names.push(
+                alias
+                    .clone()
+                    .unwrap_or_else(|| infer_expr_name(expr, index + 1)),
+            );
+        }
+
+        let Some(join_equalities) = simple_indexed_join_constraint_equalities(
+            constraint,
+            left_binding,
+            right_binding,
+            left_schema,
+            right_schema,
+        ) else {
+            return Ok(None);
+        };
+        let Some((left_join_columns, right_join_columns)) =
+            orient_join_equalities(&join_equalities, left_binding, right_binding)
+        else {
+            return Ok(None);
+        };
+        if left_join_columns.len() != 1 || right_join_columns.len() != 1 {
+            return Ok(None);
+        }
+
+        let (parent_join_column, child_join_column) = if identifiers_equal(parent_name, left_name) {
+            (left_join_columns[0], right_join_columns[0])
+        } else {
+            (right_join_columns[0], left_join_columns[0])
+        };
+
+        let parent_join_index = parent_schema
+            .columns
+            .iter()
+            .position(|column| identifiers_equal(&column.name, parent_join_column))
+            .ok_or_else(|| {
+                DbError::internal(format!(
+                    "join column {}.{} not found",
+                    parent_name, parent_join_column
+                ))
+            })?;
+        let child_join_index = child_schema
+            .columns
+            .iter()
+            .position(|column| identifiers_equal(&column.name, child_join_column))
+            .ok_or_else(|| {
+                DbError::internal(format!(
+                    "join column {}.{} not found",
+                    child_name, child_join_column
+                ))
+            })?;
+
+        let child_index_name = self
+            .single_column_btree_index(child_name, child_join_column)
+            .map(|index| index.name.clone());
+
+        let order_by = projection_order_by_plan(&query.order_by, &select.projection);
+        if !query.order_by.is_empty() && order_by.is_none() {
+            return Ok(None);
+        }
+
+        let limit = query
+            .limit
+            .as_ref()
+            .map(|expr| self.eval_constant_i64(expr, params, &BTreeMap::new()))
+            .transpose()?
+            .map(|value| usize::try_from(value.max(0)).unwrap_or(usize::MAX));
+        let offset = query
+            .offset
+            .as_ref()
+            .map(|expr| self.eval_constant_i64(expr, params, &BTreeMap::new()))
+            .transpose()?
+            .map(|value| usize::try_from(value.max(0)).unwrap_or(usize::MAX))
+            .unwrap_or(0);
+
+        Ok(Some(LeftJoinAggregatePlan {
+            parent_table_name: parent_name,
+            parent_join_index,
+            child_table_name: child_name,
+            child_join_index,
+            child_index_name,
+            group_column_indexes,
+            aggregate_kinds,
+            column_names,
+            order_by,
+            limit,
+            offset,
+        }))
     }
 
     fn analyze_left_join_status_aggregate_query<'a>(
@@ -20041,6 +20371,202 @@ impl LeftJoinStatusCounts {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum IndexedJoinAggregateKind {
+    CountRows,
+    CountNonNull(usize),
+    Sum(usize),
+    Avg(usize),
+    Min(usize),
+    Max(usize),
+}
+
+#[allow(dead_code)]
+struct LeftJoinAggregatePlan<'a> {
+    parent_table_name: &'a str,
+    parent_join_index: usize,
+    child_table_name: &'a str,
+    child_join_index: usize,
+    child_index_name: Option<String>,
+    group_column_indexes: Vec<usize>,
+    aggregate_kinds: Vec<IndexedJoinAggregateKind>,
+    column_names: Vec<String>,
+    order_by: Option<Vec<SimpleOrderByPlan>>,
+    limit: Option<usize>,
+    offset: usize,
+}
+
+struct IndexedJoinAggregateState {
+    accumulators: Vec<IndexedJoinAccumulator>,
+}
+
+enum IndexedJoinAccumulator {
+    CountRows { count: i64 },
+    CountNonNull { col: usize, count: i64 },
+    Sum { col: usize, sum: f64, count: i64 },
+    Avg { col: usize, sum: f64, count: i64 },
+    Min { col: usize, value: Option<Value> },
+    Max { col: usize, value: Option<Value> },
+}
+
+impl IndexedJoinAggregateState {
+    fn new(kinds: &[IndexedJoinAggregateKind]) -> Self {
+        let accumulators = kinds
+            .iter()
+            .map(|kind| match kind {
+                IndexedJoinAggregateKind::CountRows => {
+                    IndexedJoinAccumulator::CountRows { count: 0 }
+                }
+                IndexedJoinAggregateKind::CountNonNull(col) => {
+                    IndexedJoinAccumulator::CountNonNull {
+                        col: *col,
+                        count: 0,
+                    }
+                }
+                IndexedJoinAggregateKind::Sum(col) => IndexedJoinAccumulator::Sum {
+                    col: *col,
+                    sum: 0.0,
+                    count: 0,
+                },
+                IndexedJoinAggregateKind::Avg(col) => IndexedJoinAccumulator::Avg {
+                    col: *col,
+                    sum: 0.0,
+                    count: 0,
+                },
+                IndexedJoinAggregateKind::Min(col) => IndexedJoinAccumulator::Min {
+                    col: *col,
+                    value: None,
+                },
+                IndexedJoinAggregateKind::Max(col) => IndexedJoinAccumulator::Max {
+                    col: *col,
+                    value: None,
+                },
+            })
+            .collect();
+        Self { accumulators }
+    }
+
+    fn accumulate(&mut self, child_values: &[Value]) -> Result<()> {
+        for acc in &mut self.accumulators {
+            match acc {
+                IndexedJoinAccumulator::CountRows { count } => {
+                    *count = count.saturating_add(1);
+                }
+                IndexedJoinAccumulator::CountNonNull { col, count } => {
+                    if let Some(value) = child_values.get(*col) {
+                        if !matches!(value, Value::Null) {
+                            *count = count.saturating_add(1);
+                        }
+                    }
+                }
+                IndexedJoinAccumulator::Sum { col, sum, count } => {
+                    if let Some(value) = child_values.get(*col) {
+                        if let Some(f) = indexed_join_aggregate_as_f64(value) {
+                            *sum += f;
+                            *count = count.saturating_add(1);
+                        }
+                    }
+                }
+                IndexedJoinAccumulator::Avg { col, sum, count } => {
+                    if let Some(value) = child_values.get(*col) {
+                        if let Some(f) = indexed_join_aggregate_as_f64(value) {
+                            *sum += f;
+                            *count = count.saturating_add(1);
+                        }
+                    }
+                }
+                IndexedJoinAccumulator::Min { col, value } => {
+                    if let Some(v) = child_values.get(*col) {
+                        if !matches!(v, Value::Null) {
+                            match value {
+                                None => *value = Some(v.clone()),
+                                Some(curr) => {
+                                    if compare_values_no_error(v, curr)
+                                        == Some(std::cmp::Ordering::Less)
+                                    {
+                                        *value = Some(v.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                IndexedJoinAccumulator::Max { col, value } => {
+                    if let Some(v) = child_values.get(*col) {
+                        if !matches!(v, Value::Null) {
+                            match value {
+                                None => *value = Some(v.clone()),
+                                Some(curr) => {
+                                    if compare_values_no_error(v, curr)
+                                        == Some(std::cmp::Ordering::Greater)
+                                    {
+                                        *value = Some(v.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn finalize_into(self, output: &mut Vec<Value>) {
+        for acc in self.accumulators {
+            match acc {
+                IndexedJoinAccumulator::CountRows { count } => {
+                    output.push(Value::Int64(count));
+                }
+                IndexedJoinAccumulator::CountNonNull { count, .. } => {
+                    output.push(Value::Int64(count));
+                }
+                IndexedJoinAccumulator::Sum { sum, count, .. } => {
+                    if count == 0 {
+                        output.push(Value::Null);
+                    } else {
+                        output.push(Value::Float64(sum));
+                    }
+                }
+                IndexedJoinAccumulator::Avg { sum, count, .. } => {
+                    if count == 0 {
+                        output.push(Value::Null);
+                    } else {
+                        output.push(Value::Float64(sum / count as f64));
+                    }
+                }
+                IndexedJoinAccumulator::Min { value, .. } => {
+                    output.push(value.unwrap_or(Value::Null));
+                }
+                IndexedJoinAccumulator::Max { value, .. } => {
+                    output.push(value.unwrap_or(Value::Null));
+                }
+            }
+        }
+    }
+}
+
+fn indexed_join_aggregate_as_f64(value: &Value) -> Option<f64> {
+    match value {
+        Value::Int64(v) => Some(*v as f64),
+        Value::Float64(v) => Some(*v),
+        Value::Decimal { scaled, scale } => {
+            let scaled_u = if *scaled >= 0 {
+                *scaled as u64
+            } else {
+                return None;
+            };
+            let divisor = 10u64.checked_pow(*scale as u32).unwrap_or(1);
+            Some(scaled_u as f64 / divisor as f64)
+        }
+        _ => None,
+    }
+}
+
+fn compare_values_no_error(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
+    crate::exec::expressions::compare_values(a, b).ok()
+}
+
 enum SimpleIndexedProjectionRowIds<'a> {
     Borrowed(RuntimeRowIdSet<'a>),
     Owned(Vec<i64>),
@@ -29518,6 +30044,74 @@ fn aggregate_matches_binding_product(
         && expr_matches_binding_column(right, right_binding, right_column))
         || (expr_matches_binding_column(left, right_binding, right_column)
             && expr_matches_binding_column(right, left_binding, left_column))
+}
+
+fn classify_indexed_join_aggregate(
+    expr: &Expr,
+    binding: TableBindingRef<'_>,
+    schema: &TableSchema,
+) -> Option<IndexedJoinAggregateKind> {
+    let Expr::Aggregate {
+        name,
+        args,
+        distinct,
+        star,
+        order_by,
+        within_group,
+    } = expr
+    else {
+        return None;
+    };
+    if !order_by.is_empty() || *within_group {
+        return None;
+    }
+    if *star && name.eq_ignore_ascii_case("count") && args.is_empty() && !*distinct {
+        return Some(IndexedJoinAggregateKind::CountRows);
+    }
+    if args.len() != 1 {
+        return None;
+    }
+    let col = resolved_child_column_index(args.first()?, binding, schema)?;
+    let name_lower = name.to_lowercase();
+    match name_lower.as_str() {
+        "count" if !*distinct => Some(IndexedJoinAggregateKind::CountNonNull(col)),
+        "sum" if !*distinct => Some(IndexedJoinAggregateKind::Sum(col)),
+        "avg" if !*distinct => Some(IndexedJoinAggregateKind::Avg(col)),
+        "min" if !*distinct => Some(IndexedJoinAggregateKind::Min(col)),
+        "max" if !*distinct => Some(IndexedJoinAggregateKind::Max(col)),
+        _ => None,
+    }
+}
+
+fn resolved_child_column_index(
+    expr: &Expr,
+    binding: TableBindingRef<'_>,
+    schema: &TableSchema,
+) -> Option<usize> {
+    let Expr::Column { table, column } = expr else {
+        return None;
+    };
+    if let Some(table_ref) = table {
+        if !identifiers_equal(table_ref, binding.name)
+            && !binding
+                .alias
+                .as_ref()
+                .is_some_and(|alias| identifiers_equal(table_ref, alias))
+        {
+            return None;
+        }
+    }
+    schema
+        .columns
+        .iter()
+        .position(|col| identifiers_equal(&col.name, column))
+        .or_else(|| {
+            let lowered = column.to_lowercase();
+            schema
+                .columns
+                .iter()
+                .position(|col| col.name.to_lowercase() == lowered)
+        })
 }
 
 fn order_by_matches_alias_or_projection(
