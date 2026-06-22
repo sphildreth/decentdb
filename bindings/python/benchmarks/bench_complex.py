@@ -45,9 +45,13 @@ enough for local comparison runs.
 import argparse
 import datetime as _dt
 import gc
+import hashlib
+import json
 import os
+import platform
 import random
 import sqlite3
+import sys
 import time
 import uuid
 
@@ -171,6 +175,236 @@ def _run_with_gc_disabled(fn):
     finally:
         if gc_was_enabled:
             gc.enable()
+
+
+def _json_safe_value(value):
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        return round(value, 12)
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return bytes(value).hex()
+    if isinstance(value, (_dt.date, _dt.datetime, uuid.UUID)):
+        return value.isoformat() if hasattr(value, "isoformat") else str(value)
+    return str(value)
+
+
+def _json_safe_row(row):
+    return [_json_safe_value(value) for value in row]
+
+
+def _query_signature(rows, compare_columns=None):
+    safe_rows = [_json_safe_row(row) for row in rows]
+    payload = json.dumps(safe_rows, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    unordered_rows = sorted(
+        safe_rows,
+        key=lambda row: json.dumps(row, sort_keys=True, separators=(",", ":")),
+    )
+    unordered_payload = json.dumps(
+        unordered_rows,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    signature = {
+        "rows": len(safe_rows),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "unordered_sha256": hashlib.sha256(unordered_payload).hexdigest(),
+        "first_row": safe_rows[0] if safe_rows else None,
+        "last_row": safe_rows[-1] if safe_rows else None,
+    }
+    if compare_columns is not None:
+        compare_rows = [
+            [row[index] for index in compare_columns if index < len(row)]
+            for row in safe_rows
+        ]
+        compare_payload = json.dumps(
+            compare_rows,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        unordered_compare_rows = sorted(
+            compare_rows,
+            key=lambda row: json.dumps(row, sort_keys=True, separators=(",", ":")),
+        )
+        unordered_compare_payload = json.dumps(
+            unordered_compare_rows,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        signature.update(
+            {
+                "compare_columns": list(compare_columns),
+                "compare_sha256": hashlib.sha256(compare_payload).hexdigest(),
+                "compare_unordered_sha256": hashlib.sha256(
+                    unordered_compare_payload
+                ).hexdigest(),
+            }
+        )
+    return signature
+
+
+def _record_query_signature(results, key, label, rows, compare_columns=None):
+    checks = results.setdefault("_checks", {})
+    checks[key] = {"label": label, **_query_signature(rows, compare_columns)}
+
+
+def _variant_metric_key(key, variant):
+    if key.endswith("_s"):
+        return f"{key[:-2]}_{variant}_s"
+    return f"{key}_{variant}"
+
+
+def _variant_check_key(key, variant):
+    if key.endswith("_s"):
+        return f"{key[:-2]}_{variant}"
+    return f"{key}_{variant}"
+
+
+def _fetch_rows(cur, sql, params=()):
+    cur.execute(sql, params)
+    return cur.fetchall()
+
+
+def _safe_artifact_name(value):
+    allowed = []
+    for ch in value.lower():
+        if ch.isalnum():
+            allowed.append(ch)
+        elif ch in (" ", "-", "_", "/", "+"):
+            allowed.append("_")
+    slug = "".join(allowed).strip("_")
+    while "__" in slug:
+        slug = slug.replace("__", "_")
+    return slug or "query"
+
+
+def _capture_explain(
+    cur,
+    *,
+    engine_name,
+    workload,
+    label,
+    sql,
+    params=(),
+    output_dir=None,
+    analyze=False,
+):
+    if not output_dir:
+        return
+    os.makedirs(output_dir, exist_ok=True)
+    if engine_name == "sqlite":
+        explain_sql = f"EXPLAIN QUERY PLAN {sql}"
+        mode = "EXPLAIN QUERY PLAN"
+    else:
+        mode = "EXPLAIN ANALYZE" if analyze else "EXPLAIN"
+        explain_sql = f"{mode} {sql}"
+    try:
+        rows = _fetch_rows(cur, explain_sql, params)
+        payload = {
+            "engine": engine_name,
+            "workload": workload,
+            "label": label,
+            "mode": mode,
+            "sql": " ".join(sql.split()),
+            "params": [_json_safe_value(value) for value in params],
+            "rows": [_json_safe_row(row) for row in rows],
+        }
+    except Exception as exc:
+        payload = {
+            "engine": engine_name,
+            "workload": workload,
+            "label": label,
+            "mode": mode,
+            "sql": " ".join(sql.split()),
+            "params": [_json_safe_value(value) for value in params],
+            "error": str(exc),
+        }
+    filename = f"{workload}_{engine_name}_{_safe_artifact_name(label)}.json"
+    with open(os.path.join(output_dir, filename), "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+
+
+def _time_query_with_mode(
+    *,
+    engine_name,
+    cur,
+    workload,
+    label,
+    sql,
+    results,
+    metric_key,
+    check_key,
+    params=(),
+    query_mode="warm",
+    note=None,
+    explain_output_dir=None,
+    explain_analyze=False,
+    print_rows=False,
+    compare_columns=None,
+):
+    def run_fetch():
+        return _fetch_rows(cur, sql, params)
+
+    def record_rows(elapsed, rows, key, row_key):
+        results[key] = elapsed
+        if row_key:
+            results[row_key] = len(rows)
+
+    row_key = metric_key + "_rows"
+    suffix = f" ({note})" if note else ""
+    explain_captured = False
+
+    if query_mode in ("cold", "both"):
+        cold_metric_key = metric_key if query_mode == "cold" else _variant_metric_key(metric_key, "cold")
+        cold_check_key = check_key if query_mode == "cold" else _variant_check_key(check_key, "cold")
+        cold_row_key = row_key if query_mode == "cold" else cold_metric_key + "_rows"
+        cold_label = label if query_mode == "cold" else f"{label} [cold]"
+        duration, cold_rows = _time_movie_operation(engine_name, cold_label, 0, run_fetch)
+        record_rows(duration, cold_rows, cold_metric_key, cold_row_key)
+        _record_query_signature(
+            results,
+            cold_check_key,
+            cold_label,
+            cold_rows,
+            compare_columns,
+        )
+        if print_rows:
+            print(f"    rows={len(cold_rows):,}{suffix}")
+        _capture_explain(
+            cur,
+            engine_name=engine_name,
+            workload=workload,
+            label=label,
+            sql=sql,
+            params=params,
+            output_dir=explain_output_dir,
+            analyze=explain_analyze,
+        )
+        explain_captured = True
+        if query_mode == "cold":
+            return duration, len(cold_rows)
+
+    warm_rows = _fetch_rows(cur, sql, params) if query_mode == "warm" else None
+    if warm_rows is not None:
+        _record_query_signature(results, check_key, label, warm_rows, compare_columns)
+    if not explain_captured:
+        _capture_explain(
+            cur,
+            engine_name=engine_name,
+            workload=workload,
+            label=label,
+            sql=sql,
+            params=params,
+            output_dir=explain_output_dir,
+            analyze=explain_analyze,
+        )
+    duration, timed_rows = _time_movie_operation(engine_name, label, 0, run_fetch)
+    record_rows(duration, timed_rows, metric_key, row_key)
+    if query_mode == "both":
+        _record_query_signature(results, check_key, label, timed_rows, compare_columns)
+    if print_rows:
+        print(f"    rows={len(timed_rows):,}{suffix}")
+    return duration, len(timed_rows)
 
 
 def setup_schema(conn, engine_name):
@@ -302,6 +536,233 @@ def setup_sqlite(
     if initialize_complex:
         setup_schema(conn, "sqlite")
     return conn
+
+
+def _sqlite_pragmas(profile, cache_mb):
+    if profile in ("wal_full", "wal_normal"):
+        journal_mode = "WAL"
+        synchronous = "FULL" if profile == "wal_full" else "NORMAL"
+        wal_autocheckpoint = 0
+    elif profile == "delete_full":
+        journal_mode = "DELETE"
+        synchronous = "FULL"
+        wal_autocheckpoint = None
+    else:
+        journal_mode = None
+        synchronous = None
+        wal_autocheckpoint = None
+    pragmas = {
+        "journal_mode": journal_mode,
+        "synchronous": synchronous,
+        "temp_store": "MEMORY",
+        "cache_size_kib": -(cache_mb * 1000),
+        "foreign_keys": "ON",
+    }
+    if wal_autocheckpoint is not None:
+        pragmas["wal_autocheckpoint"] = wal_autocheckpoint
+    return pragmas
+
+
+def _decentdb_version_info():
+    info = {
+        "python_package_version": getattr(decentdb, "__version__", None),
+        "native_library": None,
+        "native_version": None,
+        "abi_version": None,
+    }
+    try:
+        lib = load_decentdb_library()
+        info["native_library"] = getattr(lib, "_name", None)
+        version = lib.ddb_version()
+        if isinstance(version, bytes):
+            version = version.decode("utf-8", errors="replace")
+        info["native_version"] = version
+        info["abi_version"] = int(lib.ddb_abi_version())
+    except Exception as exc:
+        info["error"] = str(exc)
+    return info
+
+
+def _engine_profile_metadata(
+    engine_name,
+    *,
+    decentdb_options,
+    decentdb_stmt_cache_size,
+    sqlite_profile,
+    sqlite_cache_mb,
+):
+    if engine_name == "decentdb":
+        return {
+            "options": decentdb_options or "",
+            "stmt_cache_size": decentdb_stmt_cache_size,
+        }
+    return {
+        "profile": sqlite_profile,
+        "cache_mb": sqlite_cache_mb,
+        "pragmas": _sqlite_pragmas(sqlite_profile, sqlite_cache_mb),
+    }
+
+
+def _numeric(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _metric_direction(key):
+    if key.endswith("_rps"):
+        return "higher_is_better"
+    if key.endswith(("_s", "_ms", "_bytes")):
+        return "lower_is_better"
+    if key.endswith("_rows") or key.endswith("_before") or key.endswith("_after"):
+        return "equivalence"
+    return "informational"
+
+
+def _comparison_ratios(results):
+    if "decentdb" not in results or "sqlite" not in results:
+        return {}
+    d = results["decentdb"]
+    s = results["sqlite"]
+    ratios = {}
+    for key in sorted(set(d) & set(s)):
+        if key.startswith("_") or not _numeric(d[key]) or not _numeric(s[key]):
+            continue
+        sqlite = s[key]
+        decent = d[key]
+        ratio = decent / sqlite if sqlite else None
+        direction = _metric_direction(key)
+        winner = None
+        if direction == "higher_is_better" and decent != sqlite:
+            winner = "decentdb" if decent > sqlite else "sqlite"
+        elif direction == "lower_is_better" and decent != sqlite:
+            winner = "decentdb" if decent < sqlite else "sqlite"
+        elif direction == "equivalence":
+            winner = "tie" if decent == sqlite else "mismatch"
+        ratios[key] = {
+            "decentdb": decent,
+            "sqlite": sqlite,
+            "decentdb_vs_sqlite": ratio,
+            "direction": direction,
+            "winner": winner or "tie",
+        }
+    return ratios
+
+
+def _equivalence_report(results):
+    if "decentdb" not in results or "sqlite" not in results:
+        return {"status": "skipped", "reason": "requires both engines"}
+    d_checks = results["decentdb"].get("_checks", {})
+    s_checks = results["sqlite"].get("_checks", {})
+    checks = {}
+    failures = []
+    for key in sorted(set(d_checks) | set(s_checks)):
+        d = d_checks.get(key)
+        s = s_checks.get(key)
+        if d is None or s is None:
+            if results["decentdb"].get(key) is None or results["sqlite"].get(key) is None:
+                checks[key] = {"status": "skipped", "decentdb": d, "sqlite": s}
+                continue
+            checks[key] = {"status": "missing", "decentdb": d, "sqlite": s}
+            failures.append(key)
+            continue
+        same_rows = d["rows"] == s["rows"]
+        compare_columns = d.get("compare_columns")
+        compare_ok = compare_columns is not None and compare_columns == s.get("compare_columns")
+        sha_key = "compare_sha256" if compare_ok else "sha256"
+        unordered_key = "compare_unordered_sha256" if compare_ok else "unordered_sha256"
+        ordered_ok = same_rows and d[sha_key] == s[sha_key]
+        unordered_ok = same_rows and d.get(unordered_key) == s.get(unordered_key)
+        ok = ordered_ok or unordered_ok
+        status_prefix = "ok_compare_projection" if compare_ok else "ok"
+        checks[key] = {
+            "status": status_prefix
+            if ordered_ok
+            else (
+                f"{status_prefix}_unordered"
+                if unordered_ok
+                else "mismatch"
+            ),
+            "label": d.get("label") or s.get("label"),
+            "decentdb": d,
+            "sqlite": s,
+        }
+        if not ok:
+            failures.append(key)
+    return {
+        "status": "ok" if not failures else "failed",
+        "failures": failures,
+        "checks": checks,
+    }
+
+
+def _print_equivalence_report(name, report):
+    status = report.get("status")
+    if status == "skipped":
+        return
+    failures = report.get("failures", [])
+    if not failures:
+        print(f"{name} result equivalence: ok")
+        return
+    print(f"{name} result equivalence: failed")
+    for key in failures:
+        check = report.get("checks", {}).get(key, {})
+        print(f"- {key}: {check.get('status')}")
+
+
+def _json_report(args, complex_results, movie_results, showdown_results, equivalence):
+    return {
+        "generated_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+        "argv": sys.argv,
+        "python": {
+            "version": platform.python_version(),
+            "executable": sys.executable,
+        },
+        "engine_versions": {
+            "decentdb": _decentdb_version_info(),
+            "sqlite": {
+                "sqlite_version": sqlite3.sqlite_version,
+                "python_sqlite_version": getattr(sqlite3, "version", None),
+            },
+        },
+        "config": {
+            "workload": args.workload,
+            "engine": args.engine,
+            "engine_order": args.engine_order,
+            "query_mode": args.query_mode,
+            "seed": args.seed,
+            "db_prefix": args.db_prefix,
+            "keep_db": args.keep_db,
+            "decentdb_options": args.decentdb_options,
+            "decentdb_stmt_cache_size": args.decentdb_stmt_cache_size,
+            "sqlite_profile": args.sqlite_profile,
+            "sqlite_cache_mb": args.sqlite_cache_mb,
+            "sqlite_pragmas": _sqlite_pragmas(args.sqlite_profile, args.sqlite_cache_mb),
+            "movie_watchlist_movie_index": args.movie_watchlist_movie_index,
+            "explain_output_dir": args.explain_output_dir,
+            "explain_analyze": args.explain_analyze,
+        },
+        "results": {
+            "complex": complex_results,
+            "movie": movie_results,
+            "showdown": showdown_results,
+        },
+        "comparisons": {
+            "complex": _comparison_ratios(complex_results),
+            "movie": _comparison_ratios(movie_results),
+            "showdown": _comparison_ratios(showdown_results),
+        },
+        "equivalence": equivalence,
+    }
+
+
+def _write_json_report(path, payload):
+    if not path:
+        return
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+    print(f"\nWrote JSON benchmark report: {path}")
 
 
 def generate_catalog_data(users_count, items_count):
@@ -801,7 +1262,7 @@ def _execute_script_statements(conn, sql):
             cur.execute(statement)
 
 
-def setup_movie_schema(conn, engine_name):
+def setup_movie_schema(conn, engine_name, *, watchlist_movie_index=False):
     id_type = _movie_id_type(engine_name)
     float_type = _movie_float_type(engine_name)
     suffix = _movie_table_suffix(engine_name)
@@ -872,6 +1333,8 @@ def setup_movie_schema(conn, engine_name):
     if engine_name == "sqlite":
         conn.execute("PRAGMA foreign_keys=ON")
     _execute_script_statements(conn, ddl)
+    if watchlist_movie_index:
+        conn.execute("CREATE INDEX IF NOT EXISTS ix_watchlist_movie ON Watchlist(MovieId)")
 
 
 def _movie_uuid(rng):
@@ -1136,6 +1599,11 @@ def run_movie_benchmark(
     decentdb_stmt_cache_size,
     sqlite_profile,
     sqlite_cache_mb,
+    watchlist_movie_index=False,
+    explain_output_dir=None,
+    explain_analyze=False,
+    query_mode="warm",
+    compare_columns=None,
 ):
     cleanup_db_files(db_path)
     remove_if_exists(db_path + ".vacuumed")
@@ -1168,9 +1636,25 @@ def run_movie_benchmark(
         raise ValueError(f"Unknown engine: {engine_name}")
 
     print("Initializing MovieDB schema...")
-    setup_movie_schema(conn, engine_name)
+    setup_movie_schema(conn, engine_name, watchlist_movie_index=watchlist_movie_index)
     cur = conn.cursor()
-    results = {}
+    results = {
+        "_metadata": {
+            "engine": engine_name,
+            "db_path": db_path,
+            "profile": _engine_profile_metadata(
+                engine_name,
+                decentdb_options=decentdb_options,
+                decentdb_stmt_cache_size=decentdb_stmt_cache_size,
+                sqlite_profile=sqlite_profile,
+                sqlite_cache_mb=sqlite_cache_mb,
+            ),
+            "schema_variants": {
+                "watchlist_movie_index": bool(watchlist_movie_index),
+            },
+            "query_mode": query_mode,
+        }
+    }
     counts = {}
 
     total_rows = movie_total_rows(data)
@@ -1212,21 +1696,60 @@ def run_movie_benchmark(
         "SELECT Id, Title, ReleaseYear, Synopsis, BudgetUsd, BoxOfficeUsd, "
         f"MpaaRating, RuntimeMinutes, AddedAt FROM Movies WHERE Id = {_movie_uuid_expr(engine_name)}"
     )
-    cur.execute(point_sql, (_movie_id_value(engine_name, point_ids[0]),))
-    cur.fetchall()
 
     def run_point_reads():
+        total = 0
         for movie_id in point_ids:
             cur.execute(point_sql, (_movie_id_value(engine_name, movie_id),))
-            cur.fetchall()
+            total += len(cur.fetchall())
+        return total
 
-    duration, _ = _time_movie_operation(
-        engine_name,
-        "MovieDB point reads by UUID",
-        len(point_ids),
-        run_point_reads,
-    )
-    results["movie_point_reads_s"] = duration
+    if query_mode in ("cold", "both"):
+        cold_label = (
+            "MovieDB point reads by UUID"
+            if query_mode == "cold"
+            else "MovieDB point reads by UUID [cold]"
+        )
+        duration, total = _time_movie_operation(
+            engine_name,
+            cold_label,
+            len(point_ids),
+            run_point_reads,
+        )
+        if query_mode == "cold":
+            results["movie_point_reads_s"] = duration
+            results["movie_point_reads_rows"] = total
+        else:
+            results["movie_point_reads_cold_s"] = duration
+            results["movie_point_reads_cold_rows"] = total
+        cold_rows = _fetch_rows(cur, point_sql, (_movie_id_value(engine_name, point_ids[0]),))
+        _record_query_signature(
+            results,
+            "movie_point_read_first" if query_mode == "cold" else "movie_point_read_first_cold",
+            cold_label,
+            cold_rows,
+        )
+
+    if query_mode in ("warm", "both"):
+        point_warm_rows = _fetch_rows(
+            cur,
+            point_sql,
+            (_movie_id_value(engine_name, point_ids[0]),),
+        )
+        _record_query_signature(
+            results,
+            "movie_point_read_first",
+            "MovieDB point read first UUID",
+            point_warm_rows,
+        )
+        duration, total = _time_movie_operation(
+            engine_name,
+            "MovieDB point reads by UUID",
+            len(point_ids),
+            run_point_reads,
+        )
+        results["movie_point_reads_s"] = duration
+        results["movie_point_reads_rows"] = total
 
     year_counts = {}
     for movie in movies:
@@ -1248,14 +1771,20 @@ def run_movie_benchmark(
         LIMIT ?
     """
     top_params = (sample_year, 20, 25)
-    _movie_fetch_count(cur, top_rated_sql, top_params)
-    duration, rows = _time_movie_operation(
-        engine_name,
-        "MovieDB top-rated by year",
-        0,
-        lambda: _movie_fetch_count(cur, top_rated_sql, top_params),
+    _, rows = _time_query_with_mode(
+        engine_name=engine_name,
+        cur=cur,
+        workload="movie",
+        label="MovieDB top-rated by year",
+        sql=top_rated_sql,
+        results=results,
+        metric_key="movie_top_rated_s",
+        check_key="movie_top_rated",
+        params=top_params,
+        query_mode=query_mode,
+        explain_output_dir=explain_output_dir,
+        explain_analyze=explain_analyze,
     )
-    results["movie_top_rated_s"] = duration
     counts["top_rated_rows"] = rows
 
     tag_sql = """
@@ -1269,14 +1798,20 @@ def run_movie_benchmark(
         LIMIT ?
     """
     tag_params = (sample_tag, 50)
-    _movie_fetch_count(cur, tag_sql, tag_params)
-    duration, rows = _time_movie_operation(
-        engine_name,
-        "MovieDB search movies by tag",
-        0,
-        lambda: _movie_fetch_count(cur, tag_sql, tag_params),
+    _, rows = _time_query_with_mode(
+        engine_name=engine_name,
+        cur=cur,
+        workload="movie",
+        label="MovieDB search movies by tag",
+        sql=tag_sql,
+        results=results,
+        metric_key="movie_tag_search_s",
+        check_key="movie_tag_search",
+        params=tag_params,
+        query_mode=query_mode,
+        explain_output_dir=explain_output_dir,
+        explain_analyze=explain_analyze,
     )
-    results["movie_tag_search_s"] = duration
     counts["tag_search_rows"] = rows
 
     busiest_sql = """
@@ -1288,14 +1823,20 @@ def run_movie_benchmark(
         LIMIT ?
     """
     busiest_params = (20,)
-    _movie_fetch_count(cur, busiest_sql, busiest_params)
-    duration, rows = _time_movie_operation(
-        engine_name,
-        "MovieDB busiest people",
-        0,
-        lambda: _movie_fetch_count(cur, busiest_sql, busiest_params),
+    _, rows = _time_query_with_mode(
+        engine_name=engine_name,
+        cur=cur,
+        workload="movie",
+        label="MovieDB busiest people",
+        sql=busiest_sql,
+        results=results,
+        metric_key="movie_busiest_people_s",
+        check_key="movie_busiest_people",
+        params=busiest_params,
+        query_mode=query_mode,
+        explain_output_dir=explain_output_dir,
+        explain_analyze=explain_analyze,
     )
-    results["movie_busiest_people_s"] = duration
     counts["busiest_people_rows"] = rows
 
     watchlist_sql = """
@@ -1309,20 +1850,27 @@ def run_movie_benchmark(
         LIMIT ?
     """
     watchlist_params = (sample_user, 20)
-    _movie_fetch_count(cur, watchlist_sql, watchlist_params)
-    duration, rows = _time_movie_operation(
-        engine_name,
-        "MovieDB watchlist query",
-        0,
-        lambda: _movie_fetch_count(cur, watchlist_sql, watchlist_params),
+    _, rows = _time_query_with_mode(
+        engine_name=engine_name,
+        cur=cur,
+        workload="movie",
+        label="MovieDB watchlist query",
+        sql=watchlist_sql,
+        results=results,
+        metric_key="movie_watchlist_s",
+        check_key="movie_watchlist",
+        params=watchlist_params,
+        query_mode=query_mode,
+        explain_output_dir=explain_output_dir,
+        explain_analyze=explain_analyze,
     )
-    results["movie_watchlist_s"] = duration
     counts["watchlist_rows"] = rows
 
     update_ids = [row[0] for row in movies[: min(update_count, len(movies))]]
     update_sql = f"UPDATE Movies SET BoxOfficeUsd = ? WHERE Id = {_movie_uuid_expr(engine_name)}"
 
     def run_updates():
+        affected = 0
         cur.execute("BEGIN")
         try:
             for movie_id in update_ids:
@@ -1330,18 +1878,22 @@ def run_movie_benchmark(
                     update_sql,
                     (123_456_789.0, _movie_id_value(engine_name, movie_id)),
                 )
+                if cur.rowcount > 0:
+                    affected += cur.rowcount
             cur.execute("COMMIT")
+            return affected
         except Exception:
             cur.execute("ROLLBACK")
             raise
 
-    duration, _ = _time_movie_operation(
+    duration, affected = _time_movie_operation(
         engine_name,
         "MovieDB update box-office batch",
         len(update_ids),
         run_updates,
     )
     results["movie_update_batch_s"] = duration
+    results["movie_update_batch_rows"] = affected
 
     delete_start = min(len(update_ids), len(movies))
     delete_ids = [
@@ -1351,22 +1903,27 @@ def run_movie_benchmark(
     delete_sql = f"DELETE FROM Movies WHERE Id = {_movie_uuid_expr(engine_name)}"
 
     def run_deletes():
+        affected = 0
         cur.execute("BEGIN")
         try:
             for movie_id in delete_ids:
                 cur.execute(delete_sql, (_movie_id_value(engine_name, movie_id),))
+                if cur.rowcount > 0:
+                    affected += cur.rowcount
             cur.execute("COMMIT")
+            return affected
         except Exception:
             cur.execute("ROLLBACK")
             raise
 
-    duration, _ = _time_movie_operation(
+    duration, affected = _time_movie_operation(
         engine_name,
         "MovieDB delete movies cascade",
         len(delete_ids),
         run_deletes,
     )
     results["movie_delete_cascade_s"] = duration
+    results["movie_delete_cascade_rows"] = affected
 
     duration, _ = _time_movie_operation(
         engine_name,
@@ -2225,19 +2782,37 @@ def _showdown_fetch_count(cur, sql, params=()):
     return len(cur.fetchall())
 
 
-def _showdown_time_query(engine_name, cur, label, sql, results, key, params=(), note=None):
-    _showdown_fetch_count(cur, sql, params)
-    duration, rows = _time_movie_operation(
-        engine_name,
-        label,
-        0,
-        lambda: _showdown_fetch_count(cur, sql, params),
+def _showdown_time_query(
+    engine_name,
+    cur,
+    label,
+    sql,
+    results,
+    key,
+    params=(),
+    note=None,
+    explain_output_dir=None,
+    explain_analyze=False,
+    query_mode="warm",
+    compare_columns=None,
+):
+    return _time_query_with_mode(
+        engine_name=engine_name,
+        cur=cur,
+        workload="showdown",
+        label=label,
+        sql=sql,
+        results=results,
+        metric_key=key,
+        check_key=key,
+        params=params,
+        query_mode=query_mode,
+        note=note,
+        explain_output_dir=explain_output_dir,
+        explain_analyze=explain_analyze,
+        print_rows=True,
+        compare_columns=compare_columns,
     )
-    suffix = f" ({note})" if note else ""
-    print(f"    rows={rows:,}{suffix}")
-    results[key] = duration
-    results[key + "_rows"] = rows
-    return duration, rows
 
 
 def _showdown_skip(results, key, label, exc):
@@ -2246,9 +2821,35 @@ def _showdown_skip(results, key, label, exc):
     results[key + "_error"] = str(exc)
 
 
-def _showdown_try_query(engine_name, cur, label, sql, results, key, params=(), note=None):
+def _showdown_try_query(
+    engine_name,
+    cur,
+    label,
+    sql,
+    results,
+    key,
+    params=(),
+    note=None,
+    explain_output_dir=None,
+    explain_analyze=False,
+    query_mode="warm",
+    compare_columns=None,
+):
     try:
-        return _showdown_time_query(engine_name, cur, label, sql, results, key, params, note)
+        return _showdown_time_query(
+            engine_name,
+            cur,
+            label,
+            sql,
+            results,
+            key,
+            params,
+            note,
+            explain_output_dir,
+            explain_analyze,
+            query_mode,
+            compare_columns,
+        )
     except Exception as exc:
         _showdown_skip(results, key, label, exc)
         return None, 0
@@ -2291,6 +2892,9 @@ def run_showdown_benchmark(
     decentdb_stmt_cache_size,
     sqlite_profile,
     sqlite_cache_mb,
+    explain_output_dir=None,
+    explain_analyze=False,
+    query_mode="warm",
 ):
     cleanup_db_files(db_path)
     print(f"\n=== {engine_name} Showdown ===")
@@ -2325,7 +2929,20 @@ def run_showdown_benchmark(
     print("Initializing Showdown schema...")
     setup_showdown_schema(conn, engine_name)
     cur = conn.cursor()
-    results = {}
+    results = {
+        "_metadata": {
+            "engine": engine_name,
+            "db_path": db_path,
+            "profile": _engine_profile_metadata(
+                engine_name,
+                decentdb_options=decentdb_options,
+                decentdb_stmt_cache_size=decentdb_stmt_cache_size,
+                sqlite_profile=sqlite_profile,
+                sqlite_cache_mb=sqlite_cache_mb,
+            ),
+            "query_mode": query_mode,
+        }
+    }
     total_rows = showdown_total_rows(data)
 
     duration, _ = _time_movie_operation(
@@ -2376,8 +2993,6 @@ def run_showdown_benchmark(
     point_limit = min(point_reads, len(data["movies"]))
     point_ids = list(range(1, point_limit + 1))
     point_sql = "SELECT id, title, rating, runtime_minutes FROM movies WHERE id = ?"
-    cur.execute(point_sql, (1,))
-    cur.fetchall()
 
     def run_point_lookups():
         total = 0
@@ -2386,15 +3001,50 @@ def run_showdown_benchmark(
             total += len(cur.fetchall())
         return total
 
-    duration, total = _time_movie_operation(
-        engine_name,
-        "Showdown point lookup by PK",
-        len(point_ids),
-        run_point_lookups,
-    )
-    print(f"    rows={total:,}")
-    results["showdown_point_lookup_s"] = duration
-    results["showdown_point_lookup_rows"] = total
+    if query_mode in ("cold", "both"):
+        cold_label = (
+            "Showdown point lookup by PK"
+            if query_mode == "cold"
+            else "Showdown point lookup by PK [cold]"
+        )
+        duration, total = _time_movie_operation(
+            engine_name,
+            cold_label,
+            len(point_ids),
+            run_point_lookups,
+        )
+        print(f"    rows={total:,}")
+        if query_mode == "cold":
+            results["showdown_point_lookup_s"] = duration
+            results["showdown_point_lookup_rows"] = total
+        else:
+            results["showdown_point_lookup_cold_s"] = duration
+            results["showdown_point_lookup_cold_rows"] = total
+        cold_rows = _fetch_rows(cur, point_sql, (1,))
+        _record_query_signature(
+            results,
+            "showdown_point_lookup_s" if query_mode == "cold" else "showdown_point_lookup_cold",
+            cold_label,
+            cold_rows,
+        )
+
+    if query_mode in ("warm", "both"):
+        warm_rows = _fetch_rows(cur, point_sql, (1,))
+        _record_query_signature(
+            results,
+            "showdown_point_lookup_s",
+            "Showdown point lookup by PK",
+            warm_rows,
+        )
+        duration, total = _time_movie_operation(
+            engine_name,
+            "Showdown point lookup by PK",
+            len(point_ids),
+            run_point_lookups,
+        )
+        print(f"    rows={total:,}")
+        results["showdown_point_lookup_s"] = duration
+        results["showdown_point_lookup_rows"] = total
 
     year_expr = "strftime('%Y', released)"
     decade_expr = f"(CAST({year_expr} AS INTEGER) / 10 * 10)"
@@ -2635,7 +3285,19 @@ def run_showdown_benchmark(
     ]
 
     for label, key, sql, params, note in scenarios:
-        _showdown_try_query(engine_name, cur, label, sql, results, key, params, note)
+        _showdown_try_query(
+            engine_name,
+            cur,
+            label,
+            sql,
+            results,
+            key,
+            params,
+            note,
+            explain_output_dir=explain_output_dir,
+            explain_analyze=explain_analyze,
+            query_mode=query_mode,
+        )
 
     if engine_name == "decentdb":
         fts_sql = """
@@ -2663,6 +3325,10 @@ def run_showdown_benchmark(
         "showdown_fulltext_bm25_s",
         ("war OR revenge OR sacrifice",),
         "fulltext index",
+        explain_output_dir=explain_output_dir,
+        explain_analyze=explain_analyze,
+        query_mode=query_mode,
+        compare_columns=(0, 1),
     )
 
     insert_date = _showdown_date_param(engine_name)
@@ -2852,6 +3518,9 @@ def run_showdown_benchmark(
             results,
             "showdown_stat_aggregates_s",
             note="DecentDB built-in",
+            explain_output_dir=explain_output_dir,
+            explain_analyze=explain_analyze,
+            query_mode=query_mode,
         )
     else:
         print("  Showdown stat aggregates             skipped: n/a in stock SQLite")
@@ -3015,6 +3684,27 @@ def parse_args():
         help="Engine to run (default: all)",
     )
     parser.add_argument(
+        "--engine-order",
+        choices=["decentdb-first", "sqlite-first", "random"],
+        default="decentdb-first",
+        help=(
+            "Engine order when --engine=all. Use sqlite-first or random to "
+            "control order effects (default: decentdb-first)."
+        ),
+    )
+    parser.add_argument(
+        "--query-mode",
+        choices=["warm", "cold", "both"],
+        default="warm",
+        help=(
+            "MovieDB/Showdown SELECT timing mode. warm preserves the historical "
+            "behavior of timing after an initial result/signature fetch; cold "
+            "times the first execution of each captured query shape; both records "
+            "cold variants with *_cold_s keys and warm timings under the historical "
+            "metric names (default: warm)."
+        ),
+    )
+    parser.add_argument(
         "--users",
         type=int,
         default=DEFAULT_USERS,
@@ -3119,6 +3809,32 @@ def parse_args():
         help="Database file prefix (default: bench_complex)",
     )
     parser.add_argument(
+        "--json-output",
+        default=".tmp/bench_complex_results.json",
+        help=(
+            "Write machine-readable benchmark results to this path. "
+            "Pass an empty string to disable (default: .tmp/bench_complex_results.json)."
+        ),
+    )
+    parser.add_argument(
+        "--strict-equivalence",
+        action="store_true",
+        help="Exit non-zero when captured DecentDB and SQLite query result signatures differ.",
+    )
+    parser.add_argument(
+        "--explain-output-dir",
+        default=None,
+        help="Directory for per-query EXPLAIN artifacts for MovieDB/Showdown slow queries.",
+    )
+    parser.add_argument(
+        "--explain-analyze",
+        action="store_true",
+        help=(
+            "Use EXPLAIN ANALYZE for DecentDB explain artifacts. SQLite still "
+            "uses EXPLAIN QUERY PLAN."
+        ),
+    )
+    parser.add_argument(
         "--keep-db",
         action="store_true",
         help="Keep generated database files after benchmark run",
@@ -3140,6 +3856,11 @@ def parse_args():
     parser.add_argument("--movie-tags", type=int, default=None)
     parser.add_argument("--movie-movie-tags", type=int, default=None)
     parser.add_argument("--movie-watchlist", type=int, default=None)
+    parser.add_argument(
+        "--movie-watchlist-movie-index",
+        action="store_true",
+        help="Add ix_watchlist_movie on Watchlist(MovieId) for cascade schema-variant runs.",
+    )
     parser.add_argument(
         "--movie-point-reads",
         type=int,
@@ -3243,7 +3964,16 @@ def main():
     args = parse_args()
     apply_movie_scale_defaults(args)
     apply_showdown_scale_defaults(args)
-    engines = ["decentdb", "sqlite"] if args.engine == "all" else [args.engine]
+    if args.explain_analyze and not args.explain_output_dir:
+        args.explain_output_dir = ".tmp/bench_complex_explain"
+    if args.engine == "all":
+        engines = ["decentdb", "sqlite"]
+        if args.engine_order == "sqlite-first":
+            engines = ["sqlite", "decentdb"]
+        elif args.engine_order == "random":
+            random.Random(args.seed).shuffle(engines)
+    else:
+        engines = [args.engine]
     results = {}
     movie_results = {}
     showdown_results = {}
@@ -3322,9 +4052,17 @@ def main():
                 decentdb_stmt_cache_size=args.decentdb_stmt_cache_size,
                 sqlite_profile=args.sqlite_profile,
                 sqlite_cache_mb=args.sqlite_cache_mb,
+                watchlist_movie_index=args.movie_watchlist_movie_index,
+                explain_output_dir=args.explain_output_dir,
+                explain_analyze=args.explain_analyze,
+                query_mode=args.query_mode,
             )
 
         print_movie_comparison(movie_results)
+        movie_equivalence = _equivalence_report(movie_results)
+        _print_equivalence_report("MovieDB", movie_equivalence)
+    else:
+        movie_equivalence = {"status": "skipped", "reason": "workload not run"}
 
     if args.workload in ("showdown", "all"):
         print(
@@ -3356,9 +4094,36 @@ def main():
                 decentdb_stmt_cache_size=args.decentdb_stmt_cache_size,
                 sqlite_profile=args.sqlite_profile,
                 sqlite_cache_mb=args.sqlite_cache_mb,
+                explain_output_dir=args.explain_output_dir,
+                explain_analyze=args.explain_analyze,
+                query_mode=args.query_mode,
             )
 
         print_showdown_comparison(showdown_results)
+        showdown_equivalence = _equivalence_report(showdown_results)
+        _print_equivalence_report("Showdown", showdown_equivalence)
+    else:
+        showdown_equivalence = {"status": "skipped", "reason": "workload not run"}
+
+    complex_equivalence = {"status": "skipped", "reason": "complex workload does not capture signatures"}
+    equivalence = {
+        "complex": complex_equivalence,
+        "movie": movie_equivalence,
+        "showdown": showdown_equivalence,
+    }
+    if args.json_output:
+        _write_json_report(
+            args.json_output,
+            _json_report(args, results, movie_results, showdown_results, equivalence),
+        )
+    if args.strict_equivalence:
+        failed = [
+            name
+            for name, report in equivalence.items()
+            if report.get("status") == "failed"
+        ]
+        if failed:
+            raise SystemExit(f"result equivalence failed for: {', '.join(failed)}")
 
 
 if __name__ == "__main__":

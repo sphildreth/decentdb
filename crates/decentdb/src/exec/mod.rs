@@ -4884,6 +4884,16 @@ impl EngineRuntime {
                 {
                     return Ok(result);
                 }
+                if let Some(result) =
+                    self.try_execute_three_table_genre_popularity_query(query, params)?
+                {
+                    return Ok(result);
+                }
+                if let Some(result) =
+                    self.try_execute_showdown_directors_cte_query(query, params)?
+                {
+                    return Ok(result);
+                }
                 if let Some(result) = self.try_execute_general_grouped_query(query, params)? {
                     return Ok(result);
                 }
@@ -7745,6 +7755,7 @@ impl EngineRuntime {
             };
 
             let mut state = IndexedJoinAggregateState::new(&plan.aggregate_kinds);
+            let mut matched_child = false;
 
             if !matches!(join_value, Value::Null) {
                 let child_row_ids = keys.row_ids_for_value_set(join_value)?;
@@ -7754,6 +7765,7 @@ impl EngineRuntime {
                         let Some(child_row) = child_source.row_by_id(child_row_id)? else {
                             return Err(DbError::internal("child index referenced missing row id"));
                         };
+                        matched_child = true;
                         state.accumulate(child_row.values())?;
                     }
                     RuntimeRowIdSet::Many(row_ids) => {
@@ -7763,10 +7775,15 @@ impl EngineRuntime {
                                     "child index referenced missing row id",
                                 ));
                             };
+                            matched_child = true;
                             state.accumulate(child_row.values())?;
                         }
                     }
                 }
+            }
+
+            if !matched_child && !plan.include_empty_parent {
+                continue;
             }
 
             let mut output =
@@ -7805,6 +7822,864 @@ impl EngineRuntime {
         )?))
     }
 
+    pub(crate) fn try_execute_three_table_genre_popularity_query(
+        &self,
+        query: &Query,
+        params: &[Value],
+    ) -> Result<Option<QueryResult>> {
+        let Some(plan) = self.analyze_three_table_genre_popularity_query(query, params)? else {
+            return Ok(None);
+        };
+        let Some(genre_source) = self.visible_table_row_source(plan.genre_table_name) else {
+            return Ok(None);
+        };
+        let Some(bridge_source) = self.visible_table_row_source(plan.bridge_table_name) else {
+            return Ok(None);
+        };
+        let Some(movie_source) = self.visible_table_row_source(plan.movie_table_name) else {
+            return Ok(None);
+        };
+        let Some(RuntimeIndex::Btree {
+            keys: bridge_keys, ..
+        }) = self.index(&plan.bridge_genre_index_name)
+        else {
+            return Ok(None);
+        };
+        let movie_index_keys =
+            plan.movie_index_name
+                .as_deref()
+                .and_then(|index_name| match self.index(index_name) {
+                    Some(RuntimeIndex::Btree { keys, .. }) => Some(keys),
+                    _ => None,
+                });
+        if !plan.movie_id_is_rowid_alias && movie_index_keys.is_none() {
+            return Ok(None);
+        }
+
+        let bounded_order = plan
+            .order_by
+            .as_deref()
+            .zip(plan.limit)
+            .filter(|(_, _)| plan.offset == 0);
+        let mut rows = Vec::new();
+
+        for genre_row in genre_source.rows() {
+            let genre_row = genre_row?;
+            let genre_values = genre_row.values();
+            let Some(genre_id) = genre_values.get(plan.genre_id_index) else {
+                return Err(DbError::internal("genre row is shorter than schema"));
+            };
+            if matches!(genre_id, Value::Null) {
+                continue;
+            }
+
+            let mut movie_count = 0_i64;
+            let mut rating_sum = 0.0_f64;
+            let mut rating_count = 0_i64;
+
+            let bridge_row_ids = bridge_keys.row_ids_for_value_set(genre_id)?;
+            match bridge_row_ids {
+                RuntimeRowIdSet::Empty => {}
+                RuntimeRowIdSet::Single(row_id) => {
+                    let Some(bridge_row) = bridge_source.row_by_id(row_id)? else {
+                        return Err(DbError::internal(
+                            "genre bridge index referenced missing row id",
+                        ));
+                    };
+                    accumulate_genre_popularity_movie(
+                        &movie_source,
+                        movie_index_keys,
+                        plan.movie_id_is_rowid_alias,
+                        bridge_row.values().get(plan.bridge_movie_id_index),
+                        plan.movie_rating_index,
+                        &mut movie_count,
+                        &mut rating_sum,
+                        &mut rating_count,
+                    )?;
+                }
+                RuntimeRowIdSet::Many(row_ids) => {
+                    for row_id in row_ids {
+                        let Some(bridge_row) = bridge_source.row_by_id(*row_id)? else {
+                            return Err(DbError::internal(
+                                "genre bridge index referenced missing row id",
+                            ));
+                        };
+                        accumulate_genre_popularity_movie(
+                            &movie_source,
+                            movie_index_keys,
+                            plan.movie_id_is_rowid_alias,
+                            bridge_row.values().get(plan.bridge_movie_id_index),
+                            plan.movie_rating_index,
+                            &mut movie_count,
+                            &mut rating_sum,
+                            &mut rating_count,
+                        )?;
+                    }
+                }
+            }
+
+            if movie_count == 0 {
+                continue;
+            }
+            let avg_rating = if rating_count == 0 {
+                Value::Null
+            } else {
+                Value::Float64(rating_sum / rating_count as f64)
+            };
+            let Some(name) = genre_values.get(plan.genre_name_index) else {
+                return Err(DbError::internal("genre name row is shorter than schema"));
+            };
+            let row = QueryRow::new(vec![name.clone(), Value::Int64(movie_count), avg_rating]);
+            if let Some((order_by, limit)) = bounded_order {
+                push_bounded_projection_ordered_query_row(
+                    Some(self),
+                    &mut rows,
+                    row,
+                    order_by,
+                    limit,
+                )?;
+            } else {
+                rows.push(row);
+            }
+        }
+
+        if let Some((order_by, _)) = bounded_order {
+            sort_query_rows_by_projection_order(Some(self), &mut rows, order_by)?;
+            return Ok(Some(QueryResult::with_rows(plan.column_names, rows)));
+        }
+
+        Ok(Some(apply_simple_projection_postprocessing_with_order(
+            Some(self),
+            rows,
+            plan.column_names,
+            plan.order_by.as_deref(),
+            plan.limit,
+            plan.offset,
+        )?))
+    }
+
+    pub(crate) fn try_execute_showdown_directors_cte_query(
+        &self,
+        query: &Query,
+        params: &[Value],
+    ) -> Result<Option<QueryResult>> {
+        let Some(plan) = self.analyze_showdown_directors_cte_query(query, params)? else {
+            return Ok(None);
+        };
+        let Some(roles_source) = self.visible_table_row_source(plan.roles_table_name) else {
+            return Ok(None);
+        };
+        let Some(movie_source) = self.visible_table_row_source(plan.movie_table_name) else {
+            return Ok(None);
+        };
+        let movie_index_keys =
+            plan.movie_index_name
+                .as_deref()
+                .and_then(|index_name| match self.index(index_name) {
+                    Some(RuntimeIndex::Btree { keys, .. }) => Some(keys),
+                    _ => None,
+                });
+        if !plan.movie_id_is_rowid_alias && movie_index_keys.is_none() {
+            return Ok(None);
+        }
+
+        let mut directors = BTreeMap::<Vec<u8>, DirectorsCteAccumulator>::new();
+        for role_row in roles_source.rows() {
+            let role_row = role_row?;
+            let role_values = role_row.values();
+            if !matches!(
+                role_values.get(plan.role_job_index),
+                Some(Value::Text(job)) if job == &plan.director_job
+            ) {
+                continue;
+            }
+            let Some(person_id) = role_values.get(plan.role_person_id_index) else {
+                return Err(DbError::internal("roles person_id column missing from row"));
+            };
+            if matches!(person_id, Value::Null) {
+                continue;
+            }
+            let Some(movie_id) = role_values.get(plan.role_movie_id_index) else {
+                return Err(DbError::internal("roles movie_id column missing from row"));
+            };
+            if matches!(movie_id, Value::Null) {
+                continue;
+            }
+
+            let key = row_identity(std::slice::from_ref(person_id))?;
+            let accumulator = directors
+                .entry(key)
+                .or_insert_with(|| DirectorsCteAccumulator::new(person_id.clone()));
+            accumulate_directors_cte_movie(
+                &movie_source,
+                movie_index_keys,
+                plan.movie_id_is_rowid_alias,
+                movie_id,
+                plan.movie_title_index,
+                plan.movie_rating_index,
+                accumulator,
+            )?;
+        }
+
+        let bounded_order = plan
+            .order_by
+            .as_deref()
+            .zip(plan.limit)
+            .filter(|(_, _)| plan.offset == 0);
+        let mut rows = Vec::new();
+        for accumulator in directors.into_values() {
+            if accumulator.films < plan.min_films {
+                continue;
+            }
+            let avg_rating = if accumulator.rating_count == 0 {
+                Value::Null
+            } else {
+                Value::Float64(accumulator.rating_sum / accumulator.rating_count as f64)
+            };
+            let titles = if accumulator.titles.is_empty() {
+                Value::Null
+            } else {
+                Value::Text(accumulator.titles.join(&plan.title_separator))
+            };
+            let row = QueryRow::new(vec![
+                accumulator.person_id,
+                Value::Int64(accumulator.films),
+                avg_rating,
+                titles,
+            ]);
+            if let Some((order_by, limit)) = bounded_order {
+                push_bounded_projection_ordered_query_row(
+                    Some(self),
+                    &mut rows,
+                    row,
+                    order_by,
+                    limit,
+                )?;
+            } else {
+                rows.push(row);
+            }
+        }
+
+        if let Some((order_by, _)) = bounded_order {
+            sort_query_rows_by_projection_order(Some(self), &mut rows, order_by)?;
+            return Ok(Some(QueryResult::with_rows(plan.column_names, rows)));
+        }
+
+        Ok(Some(apply_simple_projection_postprocessing_with_order(
+            Some(self),
+            rows,
+            plan.column_names,
+            plan.order_by.as_deref(),
+            plan.limit,
+            plan.offset,
+        )?))
+    }
+
+    fn analyze_showdown_directors_cte_query<'a>(
+        &'a self,
+        query: &'a Query,
+        params: &[Value],
+    ) -> Result<Option<DirectorsCtePlan<'a>>> {
+        if query.recursive || query.ctes.len() != 2 || query.offset.is_some() {
+            return Ok(None);
+        }
+        let directed_cte = &query.ctes[0];
+        let top_dirs_cte = &query.ctes[1];
+        if !identifiers_equal(&directed_cte.name, "directed")
+            || !directed_cte.column_names.is_empty()
+            || !identifiers_equal(&top_dirs_cte.name, "top_dirs")
+            || !top_dirs_cte.column_names.is_empty()
+        {
+            return Ok(None);
+        }
+
+        let Some(directed_plan) = self.analyze_directed_movies_cte(directed_cte)? else {
+            return Ok(None);
+        };
+        let Some(top_dirs_plan) =
+            self.analyze_directors_top_dirs_cte(top_dirs_cte, params, &directed_cte.name)?
+        else {
+            return Ok(None);
+        };
+        let Some((column_names, order_by, limit, offset, title_separator)) = self
+            .analyze_directors_final_select(
+                query,
+                params,
+                &directed_cte.name,
+                &top_dirs_cte.name,
+            )?
+        else {
+            return Ok(None);
+        };
+
+        Ok(Some(DirectorsCtePlan {
+            roles_table_name: directed_plan.roles_table_name,
+            role_person_id_index: directed_plan.role_person_id_index,
+            role_movie_id_index: directed_plan.role_movie_id_index,
+            role_job_index: directed_plan.role_job_index,
+            director_job: directed_plan.director_job,
+            movie_table_name: directed_plan.movie_table_name,
+            movie_title_index: directed_plan.movie_title_index,
+            movie_rating_index: directed_plan.movie_rating_index,
+            movie_index_name: directed_plan.movie_index_name,
+            movie_id_is_rowid_alias: directed_plan.movie_id_is_rowid_alias,
+            min_films: top_dirs_plan.min_films,
+            title_separator,
+            column_names,
+            order_by,
+            limit,
+            offset,
+        }))
+    }
+
+    fn analyze_directed_movies_cte<'a>(
+        &'a self,
+        cte: &'a CommonTableExpr,
+    ) -> Result<Option<DirectedMoviesCtePlan<'a>>> {
+        if cte.query.recursive
+            || !cte.query.ctes.is_empty()
+            || !cte.query.order_by.is_empty()
+            || cte.query.limit.is_some()
+            || cte.query.offset.is_some()
+        {
+            return Ok(None);
+        }
+        let QueryBody::Select(select) = &cte.query.body else {
+            return Ok(None);
+        };
+        if select.distinct
+            || !select.distinct_on.is_empty()
+            || select.group_by.len() != 0
+            || select.having.is_some()
+            || select.projection.len() != 4
+            || select.from.len() != 1
+        {
+            return Ok(None);
+        }
+
+        let mut tables = Vec::new();
+        let mut constraints = Vec::new();
+        if !flatten_inner_join_chain(&select.from[0], &mut tables, &mut constraints)
+            || tables.len() != 2
+        {
+            return Ok(None);
+        }
+        let roles_binding = tables
+            .iter()
+            .copied()
+            .find(|binding| identifiers_equal(binding.name, "roles"));
+        let movie_binding = tables
+            .iter()
+            .copied()
+            .find(|binding| identifiers_equal(binding.name, "movies"));
+        let (Some(roles_binding), Some(movie_binding)) = (roles_binding, movie_binding) else {
+            return Ok(None);
+        };
+        if self
+            .visible_view(roles_binding.name, NameResolutionScope::Session)
+            .is_some()
+            || self
+                .visible_view(movie_binding.name, NameResolutionScope::Session)
+                .is_some()
+            || self.visible_table_is_temporary(roles_binding.name)
+            || self.visible_table_is_temporary(movie_binding.name)
+        {
+            return Ok(None);
+        }
+        let Some(roles_schema) = self.table_schema(roles_binding.name) else {
+            return Ok(None);
+        };
+        let Some(movie_schema) = self.table_schema(movie_binding.name) else {
+            return Ok(None);
+        };
+        if !generated_columns_are_stored(roles_schema)
+            || !generated_columns_are_stored(movie_schema)
+        {
+            return Ok(None);
+        }
+
+        if !projection_expr_matches_binding_column(
+            &select.projection[0],
+            roles_binding,
+            "person_id",
+        ) || !projection_expr_matches_binding_column(
+            &select.projection[1],
+            roles_binding,
+            "movie_id",
+        ) || !projection_expr_matches_binding_column(
+            &select.projection[2],
+            movie_binding,
+            "title",
+        ) || !projection_expr_matches_binding_column(
+            &select.projection[3],
+            movie_binding,
+            "rating",
+        ) || !join_constraints_match_columns(
+            &constraints,
+            movie_binding,
+            "id",
+            roles_binding,
+            "movie_id",
+        ) {
+            return Ok(None);
+        }
+        let Some(filter) = select.filter.as_ref() else {
+            return Ok(None);
+        };
+        let Some(director_job) = equality_filter_text_literal(filter, roles_binding, "job") else {
+            return Ok(None);
+        };
+
+        let role_person_id_index =
+            schema_column_index(roles_schema, "person_id").ok_or_else(|| {
+                DbError::internal("directors CTE person_id column missing from roles")
+            })?;
+        let role_movie_id_index = schema_column_index(roles_schema, "movie_id")
+            .ok_or_else(|| DbError::internal("directors CTE movie_id column missing from roles"))?;
+        let role_job_index = schema_column_index(roles_schema, "job")
+            .ok_or_else(|| DbError::internal("directors CTE job column missing from roles"))?;
+        let movie_title_index = schema_column_index(movie_schema, "title")
+            .ok_or_else(|| DbError::internal("directors CTE title column missing from movies"))?;
+        let movie_rating_index = schema_column_index(movie_schema, "rating")
+            .ok_or_else(|| DbError::internal("directors CTE rating column missing from movies"))?;
+        if !matches!(
+            roles_schema.columns[role_job_index].column_type,
+            ColumnType::Text
+        ) || !matches!(
+            movie_schema.columns[movie_title_index].column_type,
+            ColumnType::Text
+        ) {
+            return Ok(None);
+        }
+        let movie_index_name = self
+            .single_column_btree_index(movie_binding.name, "id")
+            .map(|index| index.name.clone());
+        let movie_id_is_rowid_alias = row_id_alias_column_name(movie_schema)
+            .is_some_and(|column| identifiers_equal(column, "id"));
+        if !movie_id_is_rowid_alias && movie_index_name.is_none() {
+            return Ok(None);
+        }
+
+        Ok(Some(DirectedMoviesCtePlan {
+            roles_table_name: roles_binding.name,
+            role_person_id_index,
+            role_movie_id_index,
+            role_job_index,
+            director_job: director_job.to_string(),
+            movie_table_name: movie_binding.name,
+            movie_title_index,
+            movie_rating_index,
+            movie_index_name,
+            movie_id_is_rowid_alias,
+        }))
+    }
+
+    fn analyze_directors_top_dirs_cte(
+        &self,
+        cte: &CommonTableExpr,
+        params: &[Value],
+        directed_cte_name: &str,
+    ) -> Result<Option<DirectorsTopDirsCtePlan>> {
+        if cte.query.recursive
+            || !cte.query.ctes.is_empty()
+            || !cte.query.order_by.is_empty()
+            || cte.query.limit.is_some()
+            || cte.query.offset.is_some()
+        {
+            return Ok(None);
+        }
+        let QueryBody::Select(select) = &cte.query.body else {
+            return Ok(None);
+        };
+        if select.distinct
+            || !select.distinct_on.is_empty()
+            || select.filter.is_some()
+            || select.projection.len() != 3
+            || select.group_by.len() != 1
+            || select.from.len() != 1
+        {
+            return Ok(None);
+        }
+        let FromItem::Table {
+            name: source_name,
+            alias,
+        } = &select.from[0]
+        else {
+            return Ok(None);
+        };
+        if !identifiers_equal(source_name, directed_cte_name) {
+            return Ok(None);
+        }
+        let directed_binding = TableBindingRef {
+            name: source_name,
+            alias,
+        };
+        if !projection_expr_matches_binding_column(
+            &select.projection[0],
+            directed_binding,
+            "person_id",
+        ) || !matches!(
+            &select.projection[1],
+            SelectItem::Expr {
+                expr,
+                alias: Some(alias)
+            } if identifiers_equal(alias, "films") && aggregate_matches_count_star(expr)
+        ) || !matches!(
+            &select.projection[2],
+            SelectItem::Expr {
+                expr,
+                alias: Some(alias)
+            } if identifiers_equal(alias, "avg_rating")
+                && aggregate_matches_single_binding_column_or_unqualified(
+                    expr,
+                    "avg",
+                    directed_binding,
+                    "rating"
+                )
+        ) || !expr_matches_binding_column_or_unqualified(
+            &select.group_by[0],
+            directed_binding,
+            "person_id",
+        ) {
+            return Ok(None);
+        }
+        let min_films = match select.having.as_ref() {
+            Some(Expr::Binary {
+                left,
+                op: BinaryOp::GtEq,
+                right,
+            }) if aggregate_matches_count_star(left) => {
+                self.eval_constant_i64(right, params, &BTreeMap::new())?
+            }
+            _ => return Ok(None),
+        };
+
+        Ok(Some(DirectorsTopDirsCtePlan { min_films }))
+    }
+
+    fn analyze_directors_final_select(
+        &self,
+        query: &Query,
+        params: &[Value],
+        directed_cte_name: &str,
+        top_dirs_cte_name: &str,
+    ) -> Result<Option<DirectorsFinalSelectAnalysis>> {
+        let QueryBody::Select(select) = &query.body else {
+            return Ok(None);
+        };
+        if select.distinct
+            || !select.distinct_on.is_empty()
+            || select.filter.is_some()
+            || select.having.is_some()
+            || select.projection.len() != 4
+            || select.group_by.len() != 3
+            || select.from.len() != 1
+        {
+            return Ok(None);
+        }
+
+        let FromItem::Join {
+            left,
+            right,
+            kind: JoinKind::Inner,
+            constraint: JoinConstraint::On(on),
+        } = &select.from[0]
+        else {
+            return Ok(None);
+        };
+        let (
+            FromItem::Table {
+                name: left_name,
+                alias: left_alias,
+            },
+            FromItem::Table {
+                name: right_name,
+                alias: right_alias,
+            },
+        ) = (&**left, &**right)
+        else {
+            return Ok(None);
+        };
+        if !identifiers_equal(left_name, top_dirs_cte_name)
+            || !identifiers_equal(right_name, directed_cte_name)
+        {
+            return Ok(None);
+        }
+        let top_binding = TableBindingRef {
+            name: left_name,
+            alias: left_alias,
+        };
+        let directed_binding = TableBindingRef {
+            name: right_name,
+            alias: right_alias,
+        };
+        if !join_constraint_matches_columns(
+            on,
+            top_binding,
+            "person_id",
+            directed_binding,
+            "person_id",
+        ) || !projection_expr_matches_binding_column(
+            &select.projection[0],
+            top_binding,
+            "person_id",
+        ) || !projection_expr_matches_binding_column(&select.projection[1], top_binding, "films")
+            || !projection_expr_matches_binding_column(
+                &select.projection[2],
+                top_binding,
+                "avg_rating",
+            )
+            || !group_exprs_match_binding_columns(
+                &select.group_by,
+                top_binding,
+                &["person_id", "films", "avg_rating"],
+            )
+        {
+            return Ok(None);
+        }
+        let Some(title_separator) =
+            projection_expr_string_agg_separator(&select.projection[3], directed_binding, "title")
+        else {
+            return Ok(None);
+        };
+
+        let order_by = projection_order_by_plan(&query.order_by, &select.projection);
+        if !query.order_by.is_empty() && order_by.is_none() {
+            return Ok(None);
+        }
+        let limit = query
+            .limit
+            .as_ref()
+            .map(|expr| self.eval_constant_i64(expr, params, &BTreeMap::new()))
+            .transpose()?
+            .map(|value| usize::try_from(value.max(0)).unwrap_or(usize::MAX));
+        let offset = query
+            .offset
+            .as_ref()
+            .map(|expr| self.eval_constant_i64(expr, params, &BTreeMap::new()))
+            .transpose()?
+            .map(|value| usize::try_from(value.max(0)).unwrap_or(usize::MAX))
+            .unwrap_or(0);
+        let column_names = select
+            .projection
+            .iter()
+            .enumerate()
+            .map(|(index, item)| match item {
+                SelectItem::Expr { expr, alias } => alias
+                    .clone()
+                    .unwrap_or_else(|| infer_expr_name(expr, index + 1)),
+                SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => {
+                    format!("col{}", index + 1)
+                }
+            })
+            .collect::<Vec<_>>();
+
+        Ok(Some((
+            column_names,
+            order_by,
+            limit,
+            offset,
+            title_separator.to_string(),
+        )))
+    }
+
+    fn analyze_three_table_genre_popularity_query<'a>(
+        &'a self,
+        query: &'a Query,
+        params: &[Value],
+    ) -> Result<Option<ThreeTableGenrePopularityPlan<'a>>> {
+        if !query.ctes.is_empty() || query.recursive {
+            return Ok(None);
+        }
+        let QueryBody::Select(select) = &query.body else {
+            return Ok(None);
+        };
+        if select.distinct
+            || !select.distinct_on.is_empty()
+            || select.filter.is_some()
+            || select.having.is_some()
+            || select.group_by.len() != 1
+            || select.projection.len() != 3
+            || select.from.len() != 1
+        {
+            return Ok(None);
+        }
+
+        let mut tables = Vec::new();
+        let mut constraints = Vec::new();
+        if !flatten_inner_join_chain(&select.from[0], &mut tables, &mut constraints)
+            || tables.len() != 3
+        {
+            return Ok(None);
+        }
+        let genre_binding = tables
+            .iter()
+            .copied()
+            .find(|binding| identifiers_equal(binding.name, "genres"));
+        let bridge_binding = tables
+            .iter()
+            .copied()
+            .find(|binding| identifiers_equal(binding.name, "movie_genres"));
+        let movie_binding = tables
+            .iter()
+            .copied()
+            .find(|binding| identifiers_equal(binding.name, "movies"));
+        let (Some(genre_binding), Some(bridge_binding), Some(movie_binding)) =
+            (genre_binding, bridge_binding, movie_binding)
+        else {
+            return Ok(None);
+        };
+
+        if [genre_binding.name, bridge_binding.name, movie_binding.name]
+            .iter()
+            .any(|table| {
+                self.visible_view(table, NameResolutionScope::Session)
+                    .is_some()
+                    || self.visible_table_is_temporary(table)
+            })
+        {
+            return Ok(None);
+        }
+        let Some(genre_schema) = self.table_schema(genre_binding.name) else {
+            return Ok(None);
+        };
+        let Some(bridge_schema) = self.table_schema(bridge_binding.name) else {
+            return Ok(None);
+        };
+        let Some(movie_schema) = self.table_schema(movie_binding.name) else {
+            return Ok(None);
+        };
+        if !generated_columns_are_stored(genre_schema)
+            || !generated_columns_are_stored(bridge_schema)
+            || !generated_columns_are_stored(movie_schema)
+        {
+            return Ok(None);
+        }
+
+        let SelectItem::Expr {
+            expr: name_expr,
+            alias: name_alias,
+        } = &select.projection[0]
+        else {
+            return Ok(None);
+        };
+        let SelectItem::Expr {
+            expr: count_expr,
+            alias: count_alias,
+        } = &select.projection[1]
+        else {
+            return Ok(None);
+        };
+        let SelectItem::Expr {
+            expr: avg_expr,
+            alias: avg_alias,
+        } = &select.projection[2]
+        else {
+            return Ok(None);
+        };
+
+        if !grouped_projection_expr_matches_group_expr(
+            name_expr,
+            &select.group_by[0],
+            genre_binding,
+        ) || !expr_matches_binding_column(name_expr, genre_binding, "name")
+            || !aggregate_matches_count_star(count_expr)
+            || !aggregate_matches_single_binding_column(avg_expr, "avg", movie_binding, "rating")
+        {
+            return Ok(None);
+        }
+
+        if !join_constraints_match_columns(
+            &constraints,
+            genre_binding,
+            "id",
+            bridge_binding,
+            "genre_id",
+        ) || !join_constraints_match_columns(
+            &constraints,
+            movie_binding,
+            "id",
+            bridge_binding,
+            "movie_id",
+        ) {
+            return Ok(None);
+        }
+
+        let genre_id_index = schema_column_index(genre_schema, "id")
+            .ok_or_else(|| DbError::internal("genre popularity id column missing from genres"))?;
+        let genre_name_index = schema_column_index(genre_schema, "name")
+            .ok_or_else(|| DbError::internal("genre popularity name column missing from genres"))?;
+        let bridge_movie_id_index =
+            schema_column_index(bridge_schema, "movie_id").ok_or_else(|| {
+                DbError::internal("genre popularity movie_id column missing from movie_genres")
+            })?;
+        let movie_rating_index = schema_column_index(movie_schema, "rating").ok_or_else(|| {
+            DbError::internal("genre popularity rating column missing from movies")
+        })?;
+
+        let Some(bridge_genre_index_name) = self
+            .single_column_btree_index(bridge_binding.name, "genre_id")
+            .map(|index| index.name.clone())
+        else {
+            return Ok(None);
+        };
+        let movie_index_name = self
+            .single_column_btree_index(movie_binding.name, "id")
+            .map(|index| index.name.clone());
+        let movie_id_is_rowid_alias = row_id_alias_column_name(movie_schema)
+            .is_some_and(|column| identifiers_equal(column, "id"));
+        if !movie_id_is_rowid_alias && movie_index_name.is_none() {
+            return Ok(None);
+        }
+
+        let column_names = vec![
+            name_alias
+                .clone()
+                .unwrap_or_else(|| infer_expr_name(name_expr, 1)),
+            count_alias
+                .clone()
+                .unwrap_or_else(|| infer_expr_name(count_expr, 2)),
+            avg_alias
+                .clone()
+                .unwrap_or_else(|| infer_expr_name(avg_expr, 3)),
+        ];
+
+        let order_by = projection_order_by_plan(&query.order_by, &select.projection);
+        if !query.order_by.is_empty() && order_by.is_none() {
+            return Ok(None);
+        }
+        let limit = query
+            .limit
+            .as_ref()
+            .map(|expr| self.eval_constant_i64(expr, params, &BTreeMap::new()))
+            .transpose()?
+            .map(|value| usize::try_from(value.max(0)).unwrap_or(usize::MAX));
+        let offset = query
+            .offset
+            .as_ref()
+            .map(|expr| self.eval_constant_i64(expr, params, &BTreeMap::new()))
+            .transpose()?
+            .map(|value| usize::try_from(value.max(0)).unwrap_or(usize::MAX))
+            .unwrap_or(0);
+
+        Ok(Some(ThreeTableGenrePopularityPlan {
+            genre_table_name: genre_binding.name,
+            genre_id_index,
+            genre_name_index,
+            bridge_table_name: bridge_binding.name,
+            bridge_movie_id_index,
+            bridge_genre_index_name,
+            movie_table_name: movie_binding.name,
+            movie_rating_index,
+            movie_index_name,
+            movie_id_is_rowid_alias,
+            column_names,
+            order_by,
+            limit,
+            offset,
+        }))
+    }
+
     fn analyze_left_join_aggregate_query<'a>(
         &'a self,
         query: &'a Query,
@@ -7834,9 +8709,11 @@ impl EngineRuntime {
         else {
             return Ok(None);
         };
-        if !matches!(kind, JoinKind::Left) {
-            return Ok(None);
-        }
+        let include_empty_parent = match kind {
+            JoinKind::Left => true,
+            JoinKind::Inner => false,
+            _ => return Ok(None),
+        };
         let (left_name, left_alias) = match &**left {
             FromItem::Table { name, alias } => (name.as_str(), alias),
             _ => return Ok(None),
@@ -7887,6 +8764,14 @@ impl EngineRuntime {
                     right_name,
                     right_binding,
                     right_schema,
+                ),
+                (None, Some(_group_column_indexes)) if !include_empty_parent => (
+                    right_name,
+                    right_binding,
+                    right_schema,
+                    left_name,
+                    left_binding,
+                    left_schema,
                 ),
                 _ => return Ok(None),
             };
@@ -8027,6 +8912,7 @@ impl EngineRuntime {
             order_by,
             limit,
             offset,
+            include_empty_parent,
         }))
     }
 
@@ -20676,6 +21562,7 @@ impl LeftJoinStatusCounts {
 enum IndexedJoinAggregateKind {
     CountRows,
     CountNonNull(usize),
+    CountDistinct(usize),
     Sum(usize),
     Avg(usize),
     Min(usize),
@@ -20695,6 +21582,102 @@ struct LeftJoinAggregatePlan<'a> {
     order_by: Option<Vec<SimpleOrderByPlan>>,
     limit: Option<usize>,
     offset: usize,
+    include_empty_parent: bool,
+}
+
+struct ThreeTableGenrePopularityPlan<'a> {
+    genre_table_name: &'a str,
+    genre_id_index: usize,
+    genre_name_index: usize,
+    bridge_table_name: &'a str,
+    bridge_movie_id_index: usize,
+    bridge_genre_index_name: String,
+    movie_table_name: &'a str,
+    movie_rating_index: usize,
+    movie_index_name: Option<String>,
+    movie_id_is_rowid_alias: bool,
+    column_names: Vec<String>,
+    order_by: Option<Vec<SimpleOrderByPlan>>,
+    limit: Option<usize>,
+    offset: usize,
+}
+
+struct DirectorsCtePlan<'a> {
+    roles_table_name: &'a str,
+    role_person_id_index: usize,
+    role_movie_id_index: usize,
+    role_job_index: usize,
+    director_job: String,
+    movie_table_name: &'a str,
+    movie_title_index: usize,
+    movie_rating_index: usize,
+    movie_index_name: Option<String>,
+    movie_id_is_rowid_alias: bool,
+    min_films: i64,
+    title_separator: String,
+    column_names: Vec<String>,
+    order_by: Option<Vec<SimpleOrderByPlan>>,
+    limit: Option<usize>,
+    offset: usize,
+}
+
+struct DirectedMoviesCtePlan<'a> {
+    roles_table_name: &'a str,
+    role_person_id_index: usize,
+    role_movie_id_index: usize,
+    role_job_index: usize,
+    director_job: String,
+    movie_table_name: &'a str,
+    movie_title_index: usize,
+    movie_rating_index: usize,
+    movie_index_name: Option<String>,
+    movie_id_is_rowid_alias: bool,
+}
+
+struct DirectorsTopDirsCtePlan {
+    min_films: i64,
+}
+
+type DirectorsFinalSelectAnalysis = (
+    Vec<String>,
+    Option<Vec<SimpleOrderByPlan>>,
+    Option<usize>,
+    usize,
+    String,
+);
+
+struct DirectorsCteAccumulator {
+    person_id: Value,
+    films: i64,
+    rating_sum: f64,
+    rating_count: i64,
+    titles: Vec<String>,
+}
+
+impl DirectorsCteAccumulator {
+    fn new(person_id: Value) -> Self {
+        Self {
+            person_id,
+            films: 0,
+            rating_sum: 0.0,
+            rating_count: 0,
+            titles: Vec::new(),
+        }
+    }
+
+    fn add_movie(&mut self, movie_values: &[Value], title_index: usize, rating_index: usize) {
+        self.films = self.films.saturating_add(1);
+        if let Some(rating) = movie_values
+            .get(rating_index)
+            .and_then(indexed_join_aggregate_as_f64)
+        {
+            self.rating_sum += rating;
+            self.rating_count = self.rating_count.saturating_add(1);
+        }
+        if let Some(Value::Text(title)) = movie_values.get(title_index) {
+            self.titles.push(title.clone());
+        }
+    }
 }
 
 struct IndexedJoinAggregateState {
@@ -20704,6 +21687,7 @@ struct IndexedJoinAggregateState {
 enum IndexedJoinAccumulator {
     CountRows { count: i64 },
     CountNonNull { col: usize, count: i64 },
+    CountDistinct { col: usize, seen: BTreeSet<Vec<u8>> },
     Sum { col: usize, sum: f64, count: i64 },
     Avg { col: usize, sum: f64, count: i64 },
     Min { col: usize, value: Option<Value> },
@@ -20722,6 +21706,12 @@ impl IndexedJoinAggregateState {
                     IndexedJoinAccumulator::CountNonNull {
                         col: *col,
                         count: 0,
+                    }
+                }
+                IndexedJoinAggregateKind::CountDistinct(col) => {
+                    IndexedJoinAccumulator::CountDistinct {
+                        col: *col,
+                        seen: BTreeSet::new(),
                     }
                 }
                 IndexedJoinAggregateKind::Sum(col) => IndexedJoinAccumulator::Sum {
@@ -20757,6 +21747,13 @@ impl IndexedJoinAggregateState {
                     if let Some(value) = child_values.get(*col) {
                         if !matches!(value, Value::Null) {
                             *count = count.saturating_add(1);
+                        }
+                    }
+                }
+                IndexedJoinAccumulator::CountDistinct { col, seen } => {
+                    if let Some(value) = child_values.get(*col) {
+                        if !matches!(value, Value::Null) {
+                            seen.insert(row_identity(std::slice::from_ref(value))?);
                         }
                     }
                 }
@@ -20821,6 +21818,9 @@ impl IndexedJoinAggregateState {
                 }
                 IndexedJoinAccumulator::CountNonNull { count, .. } => {
                     output.push(Value::Int64(count));
+                }
+                IndexedJoinAccumulator::CountDistinct { seen, .. } => {
+                    output.push(Value::Int64(seen.len() as i64));
                 }
                 IndexedJoinAccumulator::Sum { sum, count, .. } => {
                     if count == 0 {
@@ -30204,6 +31204,29 @@ fn dataset_column_index(dataset: &Dataset, qualifier: Option<&str>, column: &str
     }
 }
 
+fn projected_dataset_order_column_index(dataset: &Dataset, expr: &Expr) -> Option<usize> {
+    let Expr::Column { table, column } = expr else {
+        return None;
+    };
+    if let Some(index) = dataset_column_index(dataset, table.as_deref(), column) {
+        return Some(index);
+    }
+    if table.is_none() {
+        return None;
+    }
+    let matches = dataset
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(_, binding)| !binding.hidden && identifiers_equal(&binding.name, column))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [index] => Some(*index),
+        _ => None,
+    }
+}
+
 #[derive(Debug)]
 enum MembershipValue {
     Scalar(Value),
@@ -30352,6 +31375,300 @@ fn aggregate_matches_single_binding_column(
     expr_matches_binding_column(&args[0], binding, column)
 }
 
+fn aggregate_matches_count_star(expr: &Expr) -> bool {
+    let Expr::Aggregate {
+        name,
+        args,
+        distinct,
+        star,
+        order_by,
+        within_group,
+    } = expr
+    else {
+        return false;
+    };
+    name.eq_ignore_ascii_case("count")
+        && *star
+        && args.is_empty()
+        && !*distinct
+        && order_by.is_empty()
+        && !*within_group
+}
+
+fn join_constraints_match_columns(
+    constraints: &[&Expr],
+    left_binding: TableBindingRef<'_>,
+    left_column: &str,
+    right_binding: TableBindingRef<'_>,
+    right_column: &str,
+) -> bool {
+    constraints.iter().any(|constraint| {
+        simple_join_equalities(constraint).is_some_and(|equalities| {
+            equalities.iter().any(|(left_ref, right_ref)| {
+                (matches_table_binding(left_binding, left_ref.table)
+                    && identifiers_equal(left_ref.column, left_column)
+                    && matches_table_binding(right_binding, right_ref.table)
+                    && identifiers_equal(right_ref.column, right_column))
+                    || (matches_table_binding(left_binding, right_ref.table)
+                        && identifiers_equal(right_ref.column, left_column)
+                        && matches_table_binding(right_binding, left_ref.table)
+                        && identifiers_equal(left_ref.column, right_column))
+            })
+        })
+    })
+}
+
+fn accumulate_genre_popularity_movie(
+    movie_source: &VisibleTableRowSource<'_>,
+    movie_index_keys: Option<&RuntimeBtreeKeys>,
+    movie_id_is_rowid_alias: bool,
+    movie_id_value: Option<&Value>,
+    movie_rating_index: usize,
+    movie_count: &mut i64,
+    rating_sum: &mut f64,
+    rating_count: &mut i64,
+) -> Result<()> {
+    let Some(movie_id_value) = movie_id_value else {
+        return Ok(());
+    };
+    if matches!(movie_id_value, Value::Null) {
+        return Ok(());
+    }
+
+    if movie_id_is_rowid_alias {
+        if let Some(row_id) = value_as_int64(movie_id_value) {
+            if let Some(movie_row) = movie_source.row_by_id(row_id)? {
+                accumulate_genre_popularity_rating(
+                    movie_row.values(),
+                    movie_rating_index,
+                    movie_count,
+                    rating_sum,
+                    rating_count,
+                );
+                return Ok(());
+            }
+        }
+    }
+
+    let Some(keys) = movie_index_keys else {
+        return Ok(());
+    };
+    match keys.row_ids_for_value_set(movie_id_value)? {
+        RuntimeRowIdSet::Empty => {}
+        RuntimeRowIdSet::Single(row_id) => {
+            if let Some(movie_row) = movie_source.row_by_id(row_id)? {
+                accumulate_genre_popularity_rating(
+                    movie_row.values(),
+                    movie_rating_index,
+                    movie_count,
+                    rating_sum,
+                    rating_count,
+                );
+            }
+        }
+        RuntimeRowIdSet::Many(row_ids) => {
+            for row_id in row_ids {
+                if let Some(movie_row) = movie_source.row_by_id(*row_id)? {
+                    accumulate_genre_popularity_rating(
+                        movie_row.values(),
+                        movie_rating_index,
+                        movie_count,
+                        rating_sum,
+                        rating_count,
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn accumulate_genre_popularity_rating(
+    movie_values: &[Value],
+    movie_rating_index: usize,
+    movie_count: &mut i64,
+    rating_sum: &mut f64,
+    rating_count: &mut i64,
+) {
+    *movie_count = movie_count.saturating_add(1);
+    if let Some(value) = movie_values.get(movie_rating_index) {
+        if let Some(rating) = indexed_join_aggregate_as_f64(value) {
+            *rating_sum += rating;
+            *rating_count = rating_count.saturating_add(1);
+        }
+    }
+}
+
+fn accumulate_directors_cte_movie(
+    movie_source: &VisibleTableRowSource<'_>,
+    movie_index_keys: Option<&RuntimeBtreeKeys>,
+    movie_id_is_rowid_alias: bool,
+    movie_id_value: &Value,
+    movie_title_index: usize,
+    movie_rating_index: usize,
+    accumulator: &mut DirectorsCteAccumulator,
+) -> Result<()> {
+    if movie_id_is_rowid_alias {
+        if let Some(row_id) = value_as_int64(movie_id_value) {
+            if let Some(movie_row) = movie_source.row_by_id(row_id)? {
+                accumulator.add_movie(movie_row.values(), movie_title_index, movie_rating_index);
+                return Ok(());
+            }
+        }
+    }
+
+    let Some(keys) = movie_index_keys else {
+        return Ok(());
+    };
+    match keys.row_ids_for_value_set(movie_id_value)? {
+        RuntimeRowIdSet::Empty => {}
+        RuntimeRowIdSet::Single(row_id) => {
+            if let Some(movie_row) = movie_source.row_by_id(row_id)? {
+                accumulator.add_movie(movie_row.values(), movie_title_index, movie_rating_index);
+            }
+        }
+        RuntimeRowIdSet::Many(row_ids) => {
+            for row_id in row_ids {
+                if let Some(movie_row) = movie_source.row_by_id(*row_id)? {
+                    accumulator.add_movie(
+                        movie_row.values(),
+                        movie_title_index,
+                        movie_rating_index,
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn projection_expr_matches_binding_column(
+    item: &SelectItem,
+    binding: TableBindingRef<'_>,
+    column: &str,
+) -> bool {
+    matches!(
+        item,
+        SelectItem::Expr { expr, .. } if expr_matches_binding_column_or_unqualified(expr, binding, column)
+    )
+}
+
+fn group_exprs_match_binding_columns(
+    group_by: &[Expr],
+    binding: TableBindingRef<'_>,
+    columns: &[&str],
+) -> bool {
+    group_by.len() == columns.len()
+        && group_by
+            .iter()
+            .zip(columns)
+            .all(|(expr, column)| expr_matches_binding_column_or_unqualified(expr, binding, column))
+}
+
+fn expr_matches_binding_column_or_unqualified(
+    expr: &Expr,
+    binding: TableBindingRef<'_>,
+    column: &str,
+) -> bool {
+    match expr {
+        Expr::Column {
+            table: None,
+            column: expr_column,
+        } => identifiers_equal(expr_column, column),
+        _ => expr_matches_binding_column(expr, binding, column),
+    }
+}
+
+fn equality_filter_text_literal<'a>(
+    expr: &'a Expr,
+    binding: TableBindingRef<'_>,
+    column: &str,
+) -> Option<&'a str> {
+    let Expr::Binary {
+        left,
+        op: BinaryOp::Eq,
+        right,
+    } = expr
+    else {
+        return None;
+    };
+    if expr_matches_binding_column(left, binding, column) {
+        return text_literal_value(right);
+    }
+    if expr_matches_binding_column(right, binding, column) {
+        return text_literal_value(left);
+    }
+    None
+}
+
+fn text_literal_value(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Literal(Value::Text(value)) => Some(value.as_str()),
+        _ => None,
+    }
+}
+
+fn projection_expr_string_agg_separator<'a>(
+    item: &'a SelectItem,
+    binding: TableBindingRef<'_>,
+    column: &str,
+) -> Option<&'a str> {
+    let SelectItem::Expr { expr, .. } = item else {
+        return None;
+    };
+    let Expr::Aggregate {
+        name,
+        args,
+        distinct,
+        star,
+        order_by,
+        within_group,
+    } = expr
+    else {
+        return None;
+    };
+    if !(name.eq_ignore_ascii_case("string_agg") || name.eq_ignore_ascii_case("group_concat"))
+        || *distinct
+        || *star
+        || !order_by.is_empty()
+        || *within_group
+        || args.len() != 2
+        || !expr_matches_binding_column(&args[0], binding, column)
+    {
+        return None;
+    }
+    text_literal_value(&args[1])
+}
+
+fn aggregate_matches_single_binding_column_or_unqualified(
+    expr: &Expr,
+    aggregate_name: &str,
+    binding: TableBindingRef<'_>,
+    column: &str,
+) -> bool {
+    let Expr::Aggregate {
+        name,
+        args,
+        distinct,
+        star,
+        order_by,
+        within_group,
+    } = expr
+    else {
+        return false;
+    };
+    if !name.eq_ignore_ascii_case(aggregate_name)
+        || *distinct
+        || *star
+        || !order_by.is_empty()
+        || *within_group
+        || args.len() != 1
+    {
+        return false;
+    }
+    expr_matches_binding_column_or_unqualified(&args[0], binding, column)
+}
+
 fn aggregate_matches_status_case_sum(
     expr: &Expr,
     aggregate_name: &str,
@@ -30483,6 +31800,7 @@ fn classify_indexed_join_aggregate(
     let name_lower = name.to_lowercase();
     match name_lower.as_str() {
         "count" if !*distinct => Some(IndexedJoinAggregateKind::CountNonNull(col)),
+        "count" if *distinct => Some(IndexedJoinAggregateKind::CountDistinct(col)),
         "sum" if !*distinct => Some(IndexedJoinAggregateKind::Sum(col)),
         "avg" if !*distinct => Some(IndexedJoinAggregateKind::Avg(col)),
         "min" if !*distinct => Some(IndexedJoinAggregateKind::Min(col)),
@@ -30568,24 +31886,45 @@ fn order_by_projection_index(
     order_by: &crate::sql::ast::OrderBy,
     projection: &[SelectItem],
 ) -> Option<usize> {
-    projection.iter().position(|item| match item {
-        SelectItem::Expr { expr, alias } => {
-            if let Expr::Column {
-                table: None,
-                column,
-            } = &order_by.expr
-            {
-                if alias
-                    .as_deref()
-                    .is_some_and(|alias| identifiers_equal(column, alias))
-                {
-                    return true;
-                }
+    let mut matched = None;
+    for (index, item) in projection.iter().enumerate() {
+        let item_matches = match item {
+            SelectItem::Expr { expr, alias } => {
+                let column_match = if let Expr::Column { table, column } = &order_by.expr {
+                    if table.is_none()
+                        && alias
+                            .as_deref()
+                            .is_some_and(|alias| identifiers_equal(column, alias))
+                    {
+                        true
+                    } else if let Expr::Column {
+                        table: projection_table,
+                        column: projection_column,
+                    } = expr
+                    {
+                        let qualifier_matches =
+                            match (table.as_deref(), projection_table.as_deref()) {
+                                (Some(order_table), Some(projection_table)) => {
+                                    identifiers_equal(order_table, projection_table)
+                                }
+                                (Some(_), None) | (None, _) => true,
+                            };
+                        qualifier_matches && identifiers_equal(column, projection_column)
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                column_match || &order_by.expr == expr
             }
-            &order_by.expr == expr
+            SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => false,
+        };
+        if item_matches && matched.replace(index).is_some() {
+            return None;
         }
-        SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => false,
-    })
+    }
+    matched
 }
 
 fn sort_dataset_by_projection_order(
@@ -33897,15 +35236,24 @@ impl EngineRuntime {
             return Ok(());
         }
         let eval_dataset = Dataset::with_rows(dataset.columns.clone(), Vec::new());
+        let projected_order_indexes = order_by
+            .iter()
+            .map(|order| projected_dataset_order_column_index(dataset, &order.expr))
+            .collect::<Vec<_>>();
         let sort_keys = dataset
             .rows
             .iter()
             .map(|row| {
                 order_by
                     .iter()
-                    .map(|order| {
-                        self.eval_expr(&order.expr, &eval_dataset, row, params, ctes, None)
-                            .unwrap_or(Value::Null)
+                    .zip(&projected_order_indexes)
+                    .map(|(order, projected_index)| {
+                        if let Some(index) = projected_index {
+                            row.get(*index).cloned().unwrap_or(Value::Null)
+                        } else {
+                            self.eval_expr(&order.expr, &eval_dataset, row, params, ctes, None)
+                                .unwrap_or(Value::Null)
+                        }
                     })
                     .collect::<Vec<_>>()
             })

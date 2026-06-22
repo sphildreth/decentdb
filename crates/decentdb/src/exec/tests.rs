@@ -1516,7 +1516,6 @@ fn simple_projection_no_order_by_offset_limit_uses_fast_path() {
     let crate::sql::ast::Statement::Query(query) = &statement else {
         panic!("expected query");
     };
-
     let result = runtime
         .try_execute_simple_table_projection_query(query, &[])
         .expect("execute")
@@ -4708,6 +4707,85 @@ fn general_grouped_having_with_order_by() {
 }
 
 #[test]
+fn general_grouped_order_by_qualified_projected_column_uses_projection_value() {
+    let mut runtime = EngineRuntime::empty(1);
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE director_stats (person_id INT64 PRIMARY KEY, films INT64, avg_rating FLOAT64)",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO director_stats (person_id, films, avg_rating) VALUES \
+             (1, 2, 6.0), (2, 2, 9.5), (3, 3, 8.0)",
+    );
+
+    let statement = parse_sql_statement(
+        "SELECT d.person_id, d.films, d.avg_rating \
+             FROM director_stats d \
+             GROUP BY d.person_id, d.films, d.avg_rating \
+             ORDER BY d.avg_rating DESC \
+             LIMIT 2",
+    )
+    .expect("parse");
+    let crate::sql::ast::Statement::Query(query) = &statement else {
+        panic!("expected query");
+    };
+    let result = runtime
+        .try_execute_general_grouped_query(query, &[])
+        .expect("execute")
+        .expect("general grouped path should handle qualified ORDER BY projection");
+
+    assert_eq!(result.rows().len(), 2);
+    assert_eq!(
+        result.rows()[0].values(),
+        &[Value::Int64(2), Value::Int64(2), Value::Float64(9.5)]
+    );
+    assert_eq!(
+        result.rows()[1].values(),
+        &[Value::Int64(3), Value::Int64(3), Value::Float64(8.0)]
+    );
+}
+
+#[test]
+fn grouped_cte_order_by_qualified_projected_column_uses_projection_value() {
+    let mut runtime = EngineRuntime::empty(1);
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE director_stats (person_id INT64 PRIMARY KEY, films INT64, avg_rating FLOAT64)",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO director_stats (person_id, films, avg_rating) VALUES \
+             (1, 2, 6.0), (2, 2, 9.5), (3, 3, 8.0)",
+    );
+
+    let statement = parse_sql_statement(
+        "WITH top_dirs AS ( \
+             SELECT person_id, films, avg_rating FROM director_stats \
+         ) \
+         SELECT d.person_id, d.films, d.avg_rating \
+         FROM top_dirs d \
+         GROUP BY d.person_id, d.films, d.avg_rating \
+         ORDER BY d.avg_rating DESC \
+         LIMIT 2",
+    )
+    .expect("parse");
+    let result = runtime
+        .execute_statement(&statement, &[], PAGE_SIZE)
+        .expect("execute");
+
+    assert_eq!(result.rows().len(), 2);
+    assert_eq!(
+        result.rows()[0].values(),
+        &[Value::Int64(2), Value::Int64(2), Value::Float64(9.5)]
+    );
+    assert_eq!(
+        result.rows()[1].values(),
+        &[Value::Int64(3), Value::Int64(3), Value::Float64(8.0)]
+    );
+}
+
+#[test]
 fn general_grouped_mixed_aggregates() {
     let mut runtime = EngineRuntime::empty(1);
     execute_sql(
@@ -4949,6 +5027,217 @@ fn indexed_join_grouped_count_uses_child_index_counts() {
             Value::Int64(1),
             Value::Text("a".to_string()),
             Value::Int64(2)
+        ]
+    );
+}
+
+#[test]
+fn indexed_inner_join_aggregate_counts_distinct_child_values() {
+    let mut runtime = EngineRuntime::empty(1);
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE people (id INT64 PRIMARY KEY, name TEXT NOT NULL)",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE roles (id INT64 PRIMARY KEY, person_id INT64 NOT NULL, movie_id INT64)",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE INDEX idx_roles_person ON roles (person_id)",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO people (id, name) VALUES (1, 'Ada'), (2, 'Bea'), (3, 'Cid')",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO roles (id, person_id, movie_id) VALUES \
+             (1, 1, 10), (2, 1, 10), (3, 1, 11), (4, 2, 12), (5, 2, NULL)",
+    );
+
+    let statement = parse_sql_statement(
+        "SELECT p.id, p.name, COUNT(DISTINCT r.movie_id) AS films, COUNT(*) AS roles \
+             FROM people p JOIN roles r ON r.person_id = p.id \
+             GROUP BY p.id, p.name ORDER BY films DESC, p.id LIMIT 10",
+    )
+    .expect("parse");
+    let crate::sql::ast::Statement::Query(query) = &statement else {
+        panic!("expected query");
+    };
+
+    let result = runtime
+        .try_execute_left_join_aggregate_query(query, &[])
+        .expect("execute")
+        .expect("indexed join aggregate path should handle inner COUNT DISTINCT query");
+
+    assert_eq!(result.rows().len(), 2);
+    assert_eq!(
+        result.rows()[0].values(),
+        &[
+            Value::Int64(1),
+            Value::Text("Ada".to_string()),
+            Value::Int64(2),
+            Value::Int64(3),
+        ]
+    );
+    assert_eq!(
+        result.rows()[1].values(),
+        &[
+            Value::Int64(2),
+            Value::Text("Bea".to_string()),
+            Value::Int64(1),
+            Value::Int64(2),
+        ]
+    );
+}
+
+#[test]
+fn indexed_three_table_genre_popularity_aggregate_uses_bridge_index() {
+    let mut runtime = EngineRuntime::empty(1);
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE genres (id INT64 PRIMARY KEY, name TEXT NOT NULL)",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE movies (id INT64 PRIMARY KEY, title TEXT NOT NULL, rating FLOAT64)",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE movie_genres (movie_id INT64 NOT NULL, genre_id INT64 NOT NULL)",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE INDEX idx_mgenres_genre ON movie_genres (genre_id)",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO genres (id, name) VALUES (1, 'Action'), (2, 'Drama'), (3, 'Noir')",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO movies (id, title, rating) VALUES \
+             (10, 'A', 8.0), (20, 'B', 6.0), (30, 'C', 9.0)",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO movie_genres (movie_id, genre_id) VALUES \
+             (10, 1), (20, 1), (30, 2), (999, 2)",
+    );
+
+    let statement = parse_sql_statement(
+        "SELECT g.name, COUNT(*) AS movie_count, AVG(m.rating) AS avg_rating \
+             FROM genres g \
+             JOIN movie_genres mg ON mg.genre_id = g.id \
+             JOIN movies m ON m.id = mg.movie_id \
+             GROUP BY g.name \
+             ORDER BY movie_count DESC, g.name",
+    )
+    .expect("parse");
+    let crate::sql::ast::Statement::Query(query) = &statement else {
+        panic!("expected query");
+    };
+
+    let result = runtime
+        .try_execute_three_table_genre_popularity_query(query, &[])
+        .expect("execute")
+        .expect("genre popularity fast path should match this query");
+
+    assert_eq!(result.rows().len(), 2);
+    assert_eq!(
+        result.rows()[0].values(),
+        &[
+            Value::Text("Action".to_string()),
+            Value::Int64(2),
+            Value::Float64(7.0),
+        ]
+    );
+    assert_eq!(
+        result.rows()[1].values(),
+        &[
+            Value::Text("Drama".to_string()),
+            Value::Int64(1),
+            Value::Float64(9.0),
+        ]
+    );
+}
+
+#[test]
+fn showdown_directors_cte_fast_path_aggregates_without_materialized_rejoin() {
+    let mut runtime = EngineRuntime::empty(1);
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE movies (id INT64 PRIMARY KEY, title TEXT NOT NULL, rating FLOAT64)",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE roles (id INT64 PRIMARY KEY, movie_id INT64 NOT NULL, person_id INT64 NOT NULL, job TEXT NOT NULL)",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO movies (id, title, rating) VALUES \
+             (1, 'A', 8.0), (2, 'B', 10.0), (3, 'C', 6.0), (4, 'D', 9.0)",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO roles (id, movie_id, person_id, job) VALUES \
+             (1, 1, 7, 'Director'), \
+             (2, 2, 7, 'Director'), \
+             (3, 3, 8, 'Director'), \
+             (4, 4, 8, 'Director'), \
+             (5, 1, 9, 'Director'), \
+             (6, 2, 10, 'Actor')",
+    );
+
+    let statement = parse_sql_statement(
+        "WITH directed AS ( \
+             SELECT r.person_id, r.movie_id, m.title, m.rating \
+             FROM roles r \
+             JOIN movies m ON m.id = r.movie_id \
+             WHERE r.job = 'Director' \
+         ), \
+         top_dirs AS ( \
+             SELECT person_id, COUNT(*) AS films, AVG(rating) AS avg_rating \
+             FROM directed \
+             GROUP BY person_id \
+             HAVING COUNT(*) >= 2 \
+         ) \
+         SELECT d.person_id, d.films, d.avg_rating, \
+                STRING_AGG(dir.title, ', ') AS titles \
+         FROM top_dirs d \
+         JOIN directed dir ON dir.person_id = d.person_id \
+         GROUP BY d.person_id, d.films, d.avg_rating \
+         ORDER BY d.avg_rating DESC \
+         LIMIT 20",
+    )
+    .expect("parse");
+    let crate::sql::ast::Statement::Query(query) = &statement else {
+        panic!("expected query");
+    };
+
+    let result = runtime
+        .try_execute_showdown_directors_cte_query(query, &[])
+        .expect("execute")
+        .expect("directors CTE fast path should recognize the benchmark shape");
+
+    assert_eq!(result.rows().len(), 2);
+    assert_eq!(
+        result.rows()[0].values(),
+        &[
+            Value::Int64(7),
+            Value::Int64(2),
+            Value::Float64(9.0),
+            Value::Text("A, B".to_string()),
+        ]
+    );
+    assert_eq!(
+        result.rows()[1].values(),
+        &[
+            Value::Int64(8),
+            Value::Int64(2),
+            Value::Float64(7.5),
+            Value::Text("C, D".to_string()),
         ]
     );
 }
