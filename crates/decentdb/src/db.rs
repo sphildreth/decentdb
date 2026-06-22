@@ -22,15 +22,16 @@ use crate::catalog::{
 use crate::config::{DbConfig, ProcessCoordinationMode, WalSyncMode};
 use crate::error::{DbError, Result};
 use crate::exec::dml::{
-    row_id_alias_column_name, PreparedDeleteLookup, PreparedSimpleDelete, PreparedSimpleInsert,
-    PreparedSimpleUpdate, PreparedSimpleValueSource,
+    resolve_prepared_simple_value, row_id_alias_column_name, PreparedDeleteLookup,
+    PreparedSimpleDelete, PreparedSimpleInsert, PreparedSimpleUpdate, PreparedSimpleValueSource,
 };
 use crate::exec::{
     decode_paged_table_manifest_payload, read_table_payload_row_count_from_bytes,
     row_satisfies_expression, statement_is_read_only, BulkLoadOptions, EngineRuntime, QueryResult,
-    QueryRow, ResolvedSimpleJoinProjection, ResolvedSimpleRowIdJoinProjectionRequest,
-    ResolvedSimpleRowIdProjectionRequest, ResolvedSimpleRowIdRangeProjectionRequest, RuntimeIndex,
-    SimpleJoinProjectionSide, SimpleRangeBoundValue, SimpleRowIdProjectionRequest, TableData,
+    QueryRow, ResolvedSimpleJoinProjection, ResolvedSimpleOrderedRowIdProjectionRequest,
+    ResolvedSimpleRowIdJoinProjectionRequest, ResolvedSimpleRowIdProjectionRequest,
+    ResolvedSimpleRowIdRangeProjectionRequest, RuntimeIndex, SimpleJoinProjectionSide,
+    SimpleRangeBoundValue, SimpleRowIdProjectionRequest, TableData,
 };
 use crate::metadata::{
     CheckConstraintInfo, ColumnInfo, ForeignKeyInfo, HeaderInfo, IndexInfo, IndexVerification,
@@ -5301,13 +5302,15 @@ impl Db {
             return Ok(None);
         };
         let result = runtime.execute_resolved_simple_ordered_row_id_projection(
-            plan.table_name.as_str(),
-            plan.order_column.as_str(),
-            &plan.projection_indexes,
-            Arc::clone(&plan.column_names),
-            plan.limit,
-            plan.offset,
-            plan.descending,
+            ResolvedSimpleOrderedRowIdProjectionRequest {
+                table_name: plan.table_name.as_str(),
+                order_column: plan.order_column.as_str(),
+                projection_indexes: &plan.projection_indexes,
+                column_names: Arc::clone(&plan.column_names),
+                limit: plan.limit,
+                offset: plan.offset,
+                descending: plan.descending,
+            },
         )?;
         drop(runtime);
         if let Some(result) = result {
@@ -15323,13 +15326,7 @@ fn resolve_prepared_simple_value_for_fast_path(
     source: &PreparedSimpleValueSource,
     params: &[Value],
 ) -> Result<Value> {
-    match source {
-        PreparedSimpleValueSource::Literal(value) => Ok(value.clone()),
-        PreparedSimpleValueSource::Parameter(number) => params
-            .get(number.saturating_sub(1))
-            .cloned()
-            .ok_or_else(|| DbError::sql(format!("parameter ${number} was not provided"))),
-    }
+    resolve_prepared_simple_value(source, params)
 }
 
 fn prepared_usize_literal(expr: &crate::sql::ast::Expr) -> Option<usize> {

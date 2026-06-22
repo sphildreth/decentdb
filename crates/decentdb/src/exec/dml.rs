@@ -71,6 +71,10 @@ pub(crate) struct PreparedForeignKey {
 pub(crate) enum PreparedSimpleValueSource {
     Literal(Value),
     Parameter(usize),
+    Cast {
+        source: Box<PreparedSimpleValueSource>,
+        target_type: ColumnType,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -1833,14 +1837,7 @@ impl EngineRuntime {
             let table_data = self.temp_table_data_mut(table_name).ok_or_else(|| {
                 DbError::internal(format!("table data for {table_name} is missing"))
             })?;
-            for row in &mut table_data.rows {
-                if let Some(Some(next_values)) = row_changes.get(&row.row_id) {
-                    row.values = next_values.clone();
-                }
-            }
-            table_data
-                .rows
-                .retain(|row| !matches!(row_changes.get(&row.row_id), Some(None)));
+            Self::apply_row_changes_to_resident_table_data(table_data, row_changes);
             return Ok(());
         }
         if matches!(
@@ -1850,14 +1847,7 @@ impl EngineRuntime {
             let table_data = self.table_data_mut(table_name).ok_or_else(|| {
                 DbError::internal(format!("table data for {table_name} is missing"))
             })?;
-            for row in &mut table_data.rows {
-                if let Some(Some(next_values)) = row_changes.get(&row.row_id) {
-                    row.values = next_values.clone();
-                }
-            }
-            table_data
-                .rows
-                .retain(|row| !matches!(row_changes.get(&row.row_id), Some(None)));
+            Self::apply_row_changes_to_resident_table_data(table_data, row_changes);
             return Ok(());
         }
         let Some(TableRowSource::Paged(manifest)) = self.table_row_source(table_name) else {
@@ -1871,6 +1861,30 @@ impl EngineRuntime {
             table_name,
             TableRowSource::Paged(Arc::new(updated_manifest)),
         )
+    }
+
+    fn apply_row_changes_to_resident_table_data(
+        table_data: &mut super::TableData,
+        row_changes: &BTreeMap<i64, Option<Vec<Value>>>,
+    ) {
+        let mut delete_indices = Vec::new();
+        for (row_id, change) in row_changes {
+            let Some(row_index) = table_data.row_index_by_id(*row_id) else {
+                continue;
+            };
+            match change {
+                Some(next_values) => {
+                    table_data.replace_row_values(row_index, next_values.clone());
+                }
+                None => delete_indices.push(row_index),
+            }
+        }
+
+        delete_indices.sort_unstable_by(|left, right| right.cmp(left));
+        delete_indices.dedup();
+        for row_index in delete_indices {
+            table_data.remove_row(row_index);
+        }
     }
 
     pub(super) fn execute_insert(
@@ -2041,7 +2055,7 @@ impl EngineRuntime {
         assignment_only_validation: bool,
         _updates_foreign_key_columns: bool,
         has_referencing_tables: bool,
-        table_indexes: &[crate::catalog::IndexSchema],
+        _table_indexes: &[crate::catalog::IndexSchema],
         indexes_to_update: &[crate::catalog::IndexSchema],
         params: &[Value],
         page_size: u32,
@@ -2184,7 +2198,7 @@ impl EngineRuntime {
         params: &[Value],
         page_size: u32,
     ) -> Result<Option<QueryResult>> {
-        let t0 = std::time::Instant::now();
+        let _t0 = std::time::Instant::now();
         let Some(TableRowSource::Paged(manifest)) = self.table_row_source(&table.name).cloned()
         else {
             return Ok(None);
@@ -2355,7 +2369,7 @@ impl EngineRuntime {
         table: &crate::catalog::TableSchema,
         matching_row_ids: &[i64],
         prepared_update: &PreparedIntArithmeticUpdate,
-        table_indexes: &[crate::catalog::IndexSchema],
+        _table_indexes: &[crate::catalog::IndexSchema],
         indexes_to_update: &[crate::catalog::IndexSchema],
         params: &[Value],
         page_size: u32,
@@ -2467,7 +2481,7 @@ impl EngineRuntime {
         table: &crate::catalog::TableSchema,
         matching_row_ids: &[i64],
         prepared_update: &PreparedIntArithmeticUpdate,
-        table_indexes: &[crate::catalog::IndexSchema],
+        _table_indexes: &[crate::catalog::IndexSchema],
         indexes_to_update: &[crate::catalog::IndexSchema],
         params: &[Value],
         page_size: u32,
@@ -3750,6 +3764,21 @@ impl EngineRuntime {
                         params,
                         page_size,
                     )?;
+                    let child_table_indexes = self
+                        .catalog
+                        .indexes
+                        .values()
+                        .filter(|index| {
+                            identifiers_equal(&index.table_name, &child.child_table.name)
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    let stale_indexes = incremental_delete_indexes(
+                        self,
+                        &child.child_table,
+                        &child_table_indexes,
+                        &matching_children,
+                    )?;
                     let row_changes = matching_children
                         .iter()
                         .map(|row| (row.row_id, None))
@@ -3759,8 +3788,12 @@ impl EngineRuntime {
                         &row_changes,
                         page_size,
                     )?;
-                    self.mark_indexes_stale_for_table(&child.child_table.name);
-                    self.mark_table_dirty(&child.child_table.name);
+                    if !stale_indexes.is_empty() {
+                        self.mark_named_indexes_stale(&stale_indexes);
+                    }
+                    for child_row in &matching_children {
+                        self.mark_table_row_deleted(&child.child_table.name, child_row.row_id);
+                    }
                 }
                 crate::catalog::ForeignKeyAction::SetNull => {
                     let mut row_changes = BTreeMap::new();
@@ -4114,31 +4147,26 @@ fn compile_int_arithmetic_update(
     };
 
     let column_name = &table.columns.get(*assignment_column)?.name;
-    let delta_source = match &assignment.expr {
+    let (delta_source, op) = match &assignment.expr {
         Expr::Binary { left, op, right } if *op == BinaryOp::Add => {
-            if is_assignment_column_reference(left, &statement.table_name, column_name) {
-                compile_prepared_simple_value_source(right)?
-            } else if is_assignment_column_reference(right, &statement.table_name, column_name) {
-                compile_prepared_simple_value_source(left)?
-            } else {
-                return None;
-            }
+            let delta_source =
+                if is_assignment_column_reference(left, &statement.table_name, column_name) {
+                    compile_prepared_simple_value_source(right)?
+                } else if is_assignment_column_reference(right, &statement.table_name, column_name)
+                {
+                    compile_prepared_simple_value_source(left)?
+                } else {
+                    return None;
+                };
+            (delta_source, *op)
         }
-        Expr::Binary { left, op, right } if *op == BinaryOp::Sub => {
-            if is_assignment_column_reference(left, &statement.table_name, column_name) {
-                compile_prepared_simple_value_source(right)?
-            } else {
-                return None;
-            }
+        Expr::Binary { left, op, right }
+            if *op == BinaryOp::Sub
+                && is_assignment_column_reference(left, &statement.table_name, column_name) =>
+        {
+            (compile_prepared_simple_value_source(right)?, *op)
         }
         _ => return None,
-    };
-
-    let Some(op) = (match &assignment.expr {
-        Expr::Binary { op, .. } => Some(op.clone()),
-        _ => None,
-    }) else {
-        return None;
     };
 
     match &delta_source {
@@ -5265,8 +5293,7 @@ fn row_id_range_row_ids_for_filter(
         return Ok(None);
     }
 
-    let mut row_ids = Vec::new();
-    row_ids.reserve(width.min(row_count));
+    let mut row_ids = Vec::with_capacity(width.min(row_count));
     for row_id in low..=high {
         if row_source.row_by_id(row_id)?.is_some() {
             row_ids.push(row_id);
@@ -5331,14 +5358,10 @@ fn row_id_set_to_vec(row_ids: RuntimeRowIdSet<'_>) -> Vec<i64> {
 fn simple_btree_lookup_filter(filter: &Expr) -> Option<(Option<&str>, &str, &Expr)> {
     match filter {
         Expr::Binary { left, op, right } if *op == BinaryOp::Eq => match (&**left, &**right) {
-            (Expr::Column { table, column }, value)
-                if matches!(value, Expr::Literal(_) | Expr::Parameter(_)) =>
-            {
+            (Expr::Column { table, column }, value) if simple_btree_lookup_value_expr(value) => {
                 Some((table.as_deref(), column.as_str(), value))
             }
-            (value, Expr::Column { table, column })
-                if matches!(value, Expr::Literal(_) | Expr::Parameter(_)) =>
-            {
+            (value, Expr::Column { table, column }) if simple_btree_lookup_value_expr(value) => {
                 Some((table.as_deref(), column.as_str(), value))
             }
             _ => None,
@@ -5347,15 +5370,31 @@ fn simple_btree_lookup_filter(filter: &Expr) -> Option<(Option<&str>, &str, &Exp
     }
 }
 
+fn simple_btree_lookup_value_expr(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(_) | Expr::Parameter(_) => true,
+        Expr::Cast { expr, .. } => simple_btree_lookup_value_expr(expr),
+        _ => false,
+    }
+}
+
 fn compile_prepared_simple_value_source(expr: &Expr) -> Option<PreparedSimpleValueSource> {
     match expr {
         Expr::Literal(value) => Some(PreparedSimpleValueSource::Literal(value.clone())),
         Expr::Parameter(number) => Some(PreparedSimpleValueSource::Parameter(*number)),
+        Expr::Cast { expr, target_type } => {
+            compile_prepared_simple_value_source(expr).map(|source| {
+                PreparedSimpleValueSource::Cast {
+                    source: Box::new(source),
+                    target_type: *target_type,
+                }
+            })
+        }
         _ => None,
     }
 }
 
-fn resolve_prepared_simple_value(
+pub(crate) fn resolve_prepared_simple_value(
     source: &PreparedSimpleValueSource,
     params: &[Value],
 ) -> Result<Value> {
@@ -5365,6 +5404,12 @@ fn resolve_prepared_simple_value(
             .get(number.saturating_sub(1))
             .cloned()
             .ok_or_else(|| DbError::sql(format!("parameter ${number} was not provided"))),
+        PreparedSimpleValueSource::Cast {
+            source,
+            target_type,
+        } => {
+            cast_prepared_simple_value(resolve_prepared_simple_value(source, params)?, *target_type)
+        }
     }
 }
 
@@ -6083,6 +6128,7 @@ fn incremental_insert_indexes(
 /// updated incrementally.
 ///
 /// See [`incremental_delete_indexes`] for the rationale.
+#[allow(dead_code)]
 fn incremental_update_indexes(
     runtime: &mut EngineRuntime,
     table: &crate::catalog::TableSchema,
@@ -7330,6 +7376,68 @@ mod tests {
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].row_id(), 2);
         assert_eq!(remaining[0].values(), &[Value::Int64(2), Value::Int64(8)]);
+    }
+
+    #[test]
+    fn apply_parent_delete_cascade_updates_child_indexes_incrementally() {
+        let mut runtime = EngineRuntime::empty(1);
+        execute_sql(&mut runtime, "CREATE TABLE parent (id INT64 PRIMARY KEY)");
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE child (
+                id INT64 PRIMARY KEY,
+                parent_id INT64 NOT NULL REFERENCES parent(id) ON DELETE CASCADE,
+                tag TEXT NOT NULL
+            )",
+        );
+        execute_sql(
+            &mut runtime,
+            "CREATE INDEX idx_child_parent ON child(parent_id)",
+        );
+        execute_sql(&mut runtime, "CREATE INDEX idx_child_tag ON child(tag)");
+        execute_sql(&mut runtime, "INSERT INTO parent VALUES (1), (2)");
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO child VALUES
+                (10, 1, 'drop'),
+                (11, 1, 'drop'),
+                (12, 2, 'keep')",
+        );
+
+        execute_sql(&mut runtime, "DELETE FROM parent WHERE id = 1");
+
+        let remaining = query_sql(&mut runtime, "SELECT id FROM child ORDER BY id");
+        assert_eq!(remaining.rows().len(), 1);
+        assert_eq!(remaining.rows()[0].values(), &[Value::Int64(12)]);
+        for index_name in ["idx_child_parent", "idx_child_tag"] {
+            let index = runtime
+                .catalog
+                .indexes
+                .get(index_name)
+                .expect("child index schema");
+            assert!(index.fresh, "{index_name} should remain fresh");
+            assert!(
+                runtime.index(index_name).is_some(),
+                "{index_name} should remain resident"
+            );
+        }
+        let Some(RuntimeIndex::Btree { keys, .. }) = runtime.index("idx_child_parent") else {
+            panic!("expected child parent btree index");
+        };
+        assert!(keys.row_ids_for_value(&Value::Int64(1)).unwrap().is_empty());
+        assert_eq!(keys.row_ids_for_value(&Value::Int64(2)).unwrap(), vec![12]);
+        let Some(RuntimeIndex::Btree { keys, .. }) = runtime.index("idx_child_tag") else {
+            panic!("expected child tag btree index");
+        };
+        assert!(keys
+            .row_ids_for_value(&Value::Text("drop".to_string()))
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            keys.row_ids_for_value(&Value::Text("keep".to_string()))
+                .unwrap(),
+            vec![12]
+        );
     }
 
     #[test]
@@ -8654,6 +8762,30 @@ mod dml_private_tests {
     }
 
     #[test]
+    fn compile_and_resolve_prepared_simple_value_casted_uuid_parameter() {
+        let expr = Expr::Cast {
+            expr: Box::new(Expr::Parameter(1)),
+            target_type: ColumnType::Uuid,
+        };
+        let src = compile_prepared_simple_value_source(&expr).unwrap();
+        let v = resolve_prepared_simple_value(
+            &src,
+            &[Value::Blob(vec![
+                0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44,
+                0x00, 0x00,
+            ])],
+        )
+        .unwrap();
+        assert_eq!(
+            v,
+            Value::Uuid([
+                0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44,
+                0x00, 0x00,
+            ])
+        );
+    }
+
+    #[test]
     fn resolve_prepared_simple_value_missing_param_error() {
         let src = PreparedSimpleValueSource::Parameter(2);
         let res = resolve_prepared_simple_value(&src, &[]);
@@ -8682,6 +8814,31 @@ mod dml_private_tests {
         match res.2 {
             Expr::Literal(Value::Int64(1)) => (),
             _ => panic!("expected literal 1"),
+        }
+    }
+
+    #[test]
+    fn simple_btree_lookup_filter_matches_casted_parameter() {
+        let expr = Expr::Binary {
+            left: Box::new(Expr::Column {
+                table: Some("movies".to_string()),
+                column: "id".to_string(),
+            }),
+            op: BinaryOp::Eq,
+            right: Box::new(Expr::Cast {
+                expr: Box::new(Expr::Parameter(1)),
+                target_type: ColumnType::Uuid,
+            }),
+        };
+        let res = simple_btree_lookup_filter(&expr).unwrap();
+        assert_eq!(res.0, Some("movies"));
+        assert_eq!(res.1, "id");
+        match res.2 {
+            Expr::Cast { expr, target_type } => {
+                assert_eq!(*target_type, ColumnType::Uuid);
+                assert!(matches!(&**expr, Expr::Parameter(1)));
+            }
+            _ => panic!("expected UUID cast parameter"),
         }
     }
 

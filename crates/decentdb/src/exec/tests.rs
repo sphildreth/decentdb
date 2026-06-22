@@ -1350,6 +1350,398 @@ fn simple_indexed_projection_order_by_limit_offset_uses_fast_path() {
 }
 
 #[test]
+fn simple_indexed_projection_accepts_casted_uuid_parameter_lookup() {
+    let mut runtime = EngineRuntime::empty(1);
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE movies (id UUID PRIMARY KEY, title TEXT)",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO movies (id, title) VALUES (UUID_PARSE('550e8400-e29b-41d4-a716-446655440000'), 'target')",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO movies (id, title) VALUES (UUID_PARSE('550e8400-e29b-41d4-a716-446655440001'), 'other')",
+    );
+
+    let statement = parse_sql_statement("SELECT title FROM movies WHERE id = CAST($1 AS UUID)")
+        .expect("parse casted UUID lookup");
+    let crate::sql::ast::Statement::Query(query) = &statement else {
+        panic!("expected query statement");
+    };
+
+    let result = runtime
+        .try_execute_simple_indexed_projection_query(
+            query,
+            &[Value::Blob(vec![
+                0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44,
+                0x00, 0x00,
+            ])],
+        )
+        .expect("execute casted UUID indexed projection")
+        .expect("casted UUID lookup should stay on indexed projection fast path");
+
+    assert_eq!(result.columns(), &["title".to_string()]);
+    assert_eq!(result.rows().len(), 1);
+    assert_eq!(
+        result.rows()[0].values(),
+        &[Value::Text("target".to_string())]
+    );
+}
+
+#[test]
+fn movie_tag_search_uses_index_driven_join_path() {
+    let mut runtime = EngineRuntime::empty(1);
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE Movies (
+            Id UUID PRIMARY KEY,
+            Title TEXT NOT NULL,
+            ReleaseYear INT64 NOT NULL,
+            Synopsis TEXT,
+            BudgetUsd FLOAT64,
+            BoxOfficeUsd FLOAT64,
+            MpaaRating TEXT,
+            RuntimeMinutes INT64,
+            AddedAt TEXT
+        )",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE Tags (Id UUID PRIMARY KEY, Name TEXT NOT NULL UNIQUE)",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE MovieTags (
+            MovieId UUID NOT NULL,
+            TagId UUID NOT NULL,
+            PRIMARY KEY (MovieId, TagId)
+        )",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE INDEX ix_movietags_tag ON MovieTags(TagId)",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO Tags VALUES
+            (UUID_PARSE('00000000-0000-0000-0000-0000000000aa'), 'featured'),
+            (UUID_PARSE('00000000-0000-0000-0000-0000000000bb'), 'other')",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO Movies (Id, Title, ReleaseYear, Synopsis, BudgetUsd, BoxOfficeUsd, MpaaRating, RuntimeMinutes, AddedAt) VALUES
+            (UUID_PARSE('00000000-0000-0000-0000-000000000003'), 'newer', 2021, '', 1.0, 2.0, 'PG', 90, '2021-01-01'),
+            (UUID_PARSE('00000000-0000-0000-0000-000000000001'), 'older-a', 2020, '', 1.0, 2.0, 'PG', 90, '2020-01-01'),
+            (UUID_PARSE('00000000-0000-0000-0000-000000000002'), 'older-b', 2020, '', 1.0, 2.0, 'PG', 90, '2020-01-02')",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO MovieTags VALUES
+            (UUID_PARSE('00000000-0000-0000-0000-000000000003'), UUID_PARSE('00000000-0000-0000-0000-0000000000aa')),
+            (UUID_PARSE('00000000-0000-0000-0000-000000000002'), UUID_PARSE('00000000-0000-0000-0000-0000000000aa')),
+            (UUID_PARSE('00000000-0000-0000-0000-000000000001'), UUID_PARSE('00000000-0000-0000-0000-0000000000aa'))",
+    );
+
+    let statement = parse_sql_statement(
+        "SELECT m.Id, m.Title, m.ReleaseYear
+         FROM Movies m
+         JOIN MovieTags mt ON mt.MovieId = m.Id
+         JOIN Tags t ON t.Id = mt.TagId
+         WHERE t.Name = $1
+         ORDER BY m.ReleaseYear DESC, m.Id ASC
+         LIMIT $2",
+    )
+    .expect("parse movie tag search");
+    let crate::sql::ast::Statement::Query(query) = &statement else {
+        panic!("expected query statement");
+    };
+
+    let result = runtime
+        .try_execute_movie_tag_search_query(
+            query,
+            &[Value::Text("featured".to_string()), Value::Int64(3)],
+        )
+        .expect("execute movie tag search")
+        .expect("movie tag search should use index-driven join path");
+
+    assert_eq!(
+        result
+            .rows()
+            .iter()
+            .map(|row| row.values()[1].clone())
+            .collect::<Vec<_>>(),
+        vec![
+            Value::Text("newer".to_string()),
+            Value::Text("older-a".to_string()),
+            Value::Text("older-b".to_string())
+        ]
+    );
+}
+
+#[test]
+fn movie_watchlist_query_uses_index_driven_left_join_aggregate_path() {
+    let mut runtime = EngineRuntime::empty(1);
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE Movies (
+            Id UUID PRIMARY KEY,
+            Title TEXT NOT NULL
+        )",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE Reviews (
+            Id UUID PRIMARY KEY,
+            MovieId UUID NOT NULL,
+            Score INT64 NOT NULL
+        )",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE INDEX ix_reviews_movie ON Reviews(MovieId)",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE Watchlist (
+            Id UUID PRIMARY KEY,
+            UserHandle TEXT NOT NULL,
+            MovieId UUID NOT NULL,
+            Priority INT64 NOT NULL
+        )",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE INDEX ix_watchlist_user ON Watchlist(UserHandle)",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO Movies VALUES
+            (UUID_PARSE('00000000-0000-0000-0000-000000000001'), 'alpha'),
+            (UUID_PARSE('00000000-0000-0000-0000-000000000002'), 'beta'),
+            (UUID_PARSE('00000000-0000-0000-0000-000000000003'), 'gamma')",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO Reviews VALUES
+            (UUID_PARSE('00000000-0000-0000-0000-000000000101'), UUID_PARSE('00000000-0000-0000-0000-000000000001'), 8),
+            (UUID_PARSE('00000000-0000-0000-0000-000000000102'), UUID_PARSE('00000000-0000-0000-0000-000000000001'), 10),
+            (UUID_PARSE('00000000-0000-0000-0000-000000000103'), UUID_PARSE('00000000-0000-0000-0000-000000000002'), 5)",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO Watchlist VALUES
+            (UUID_PARSE('00000000-0000-0000-0000-000000000201'), 'user-a', UUID_PARSE('00000000-0000-0000-0000-000000000001'), 2),
+            (UUID_PARSE('00000000-0000-0000-0000-000000000202'), 'user-a', UUID_PARSE('00000000-0000-0000-0000-000000000002'), 5),
+            (UUID_PARSE('00000000-0000-0000-0000-000000000203'), 'user-b', UUID_PARSE('00000000-0000-0000-0000-000000000003'), 5)",
+    );
+
+    let statement = parse_sql_statement(
+        "SELECT m.Id, m.Title, w.Priority, AVG(r.Score) as Avg
+         FROM Watchlist w
+         JOIN Movies m ON m.Id = w.MovieId
+         LEFT JOIN Reviews r ON r.MovieId = m.Id
+         WHERE w.UserHandle = $1
+         GROUP BY m.Id
+         ORDER BY w.Priority DESC, Avg DESC
+         LIMIT $2",
+    )
+    .expect("parse movie watchlist query");
+    let crate::sql::ast::Statement::Query(query) = &statement else {
+        panic!("expected query statement");
+    };
+
+    let result = runtime
+        .try_execute_movie_watchlist_query(
+            query,
+            &[Value::Text("user-a".to_string()), Value::Int64(20)],
+        )
+        .expect("execute movie watchlist query")
+        .expect("watchlist query should use index-driven left join aggregate path");
+
+    assert_eq!(
+        result
+            .rows()
+            .iter()
+            .map(|row| (
+                row.values()[1].clone(),
+                row.values()[2].clone(),
+                row.values()[3].clone()
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                Value::Text("beta".to_string()),
+                Value::Int64(5),
+                Value::Float64(5.0)
+            ),
+            (
+                Value::Text("alpha".to_string()),
+                Value::Int64(2),
+                Value::Float64(9.0)
+            )
+        ]
+    );
+}
+
+#[test]
+fn movie_top_rated_by_year_uses_indexed_review_aggregate_path() {
+    let mut runtime = EngineRuntime::empty(1);
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE Movies (
+            Id UUID PRIMARY KEY,
+            Title TEXT NOT NULL,
+            ReleaseYear INT64 NOT NULL,
+            Synopsis TEXT,
+            BudgetUsd FLOAT64,
+            BoxOfficeUsd FLOAT64,
+            MpaaRating TEXT,
+            RuntimeMinutes INT64,
+            AddedAt TEXT
+        )",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE Reviews (
+            Id UUID PRIMARY KEY,
+            MovieId UUID NOT NULL,
+            Score INT64 NOT NULL
+        )",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE INDEX ix_reviews_movie ON Reviews(MovieId)",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO Movies (Id, Title, ReleaseYear, Synopsis, BudgetUsd, BoxOfficeUsd, MpaaRating, RuntimeMinutes, AddedAt) VALUES
+            (UUID_PARSE('00000000-0000-0000-0000-000000000001'), 'alpha', 2020, '', 1.0, 2.0, 'PG', 90, '2020-01-01'),
+            (UUID_PARSE('00000000-0000-0000-0000-000000000002'), 'beta', 2020, '', 1.0, 2.0, 'PG', 90, '2020-01-02'),
+            (UUID_PARSE('00000000-0000-0000-0000-000000000003'), 'gamma', 2021, '', 1.0, 2.0, 'PG', 90, '2021-01-01')",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO Reviews VALUES
+            (UUID_PARSE('00000000-0000-0000-0000-000000000101'), UUID_PARSE('00000000-0000-0000-0000-000000000001'), 8),
+            (UUID_PARSE('00000000-0000-0000-0000-000000000102'), UUID_PARSE('00000000-0000-0000-0000-000000000001'), 10),
+            (UUID_PARSE('00000000-0000-0000-0000-000000000103'), UUID_PARSE('00000000-0000-0000-0000-000000000002'), 10),
+            (UUID_PARSE('00000000-0000-0000-0000-000000000104'), UUID_PARSE('00000000-0000-0000-0000-000000000003'), 10),
+            (UUID_PARSE('00000000-0000-0000-0000-000000000105'), UUID_PARSE('00000000-0000-0000-0000-000000000003'), 10)",
+    );
+
+    let statement = parse_sql_statement(
+        "SELECT m.Id, m.Title, m.ReleaseYear, m.Synopsis, m.BudgetUsd,
+                m.BoxOfficeUsd, m.MpaaRating, m.RuntimeMinutes, m.AddedAt,
+                AVG(r.Score) as AvgScore, COUNT(r.Id) as ReviewCount
+         FROM Movies m
+         JOIN Reviews r ON r.MovieId = m.Id
+         WHERE m.ReleaseYear = $1
+         GROUP BY m.Id
+         HAVING COUNT(r.Id) >= $2
+         ORDER BY AvgScore DESC, m.Title
+         LIMIT $3",
+    )
+    .expect("parse top-rated movie query");
+    let crate::sql::ast::Statement::Query(query) = &statement else {
+        panic!("expected query statement");
+    };
+
+    let result = runtime
+        .try_execute_movie_top_rated_by_year_query(
+            query,
+            &[Value::Int64(2020), Value::Int64(2), Value::Int64(25)],
+        )
+        .expect("execute top-rated movie query")
+        .expect("top-rated movie query should use indexed review aggregate path");
+
+    assert_eq!(result.rows().len(), 1);
+    assert_eq!(
+        result.rows()[0].values()[1],
+        Value::Text("alpha".to_string())
+    );
+    assert_eq!(result.rows()[0].values()[9], Value::Float64(9.0));
+    assert_eq!(result.rows()[0].values()[10], Value::Int64(2));
+}
+
+#[test]
+fn movie_busiest_people_query_uses_role_count_top_n_before_people_fetch() {
+    let mut runtime = EngineRuntime::empty(1);
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE People (
+            Id UUID PRIMARY KEY,
+            FullName TEXT NOT NULL,
+            BirthDate TEXT,
+            Biography TEXT
+        )",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE Roles (
+            Id UUID PRIMARY KEY,
+            MovieId UUID NOT NULL,
+            PersonId UUID NOT NULL REFERENCES People(Id),
+            CharacterName TEXT,
+            BillingOrder INT64,
+            IsLead INT64 NOT NULL
+        )",
+    );
+    execute_sql(
+        &mut runtime,
+        "CREATE INDEX ix_roles_person ON Roles(PersonId)",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO People VALUES
+            (UUID_PARSE('00000000-0000-0000-0000-000000000001'), 'Ada Actor', '1970-01-01', 'long biography a'),
+            (UUID_PARSE('00000000-0000-0000-0000-000000000002'), 'Bea Actor', '1980-01-01', 'long biography b'),
+            (UUID_PARSE('00000000-0000-0000-0000-000000000003'), 'Cal Actor', '1990-01-01', 'long biography c')",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO Roles VALUES
+            (UUID_PARSE('00000000-0000-0000-0000-000000000101'), UUID_PARSE('00000000-0000-0000-0000-000000000201'), UUID_PARSE('00000000-0000-0000-0000-000000000001'), 'a1', 1, 1),
+            (UUID_PARSE('00000000-0000-0000-0000-000000000102'), UUID_PARSE('00000000-0000-0000-0000-000000000202'), UUID_PARSE('00000000-0000-0000-0000-000000000001'), 'a2', 2, 0),
+            (UUID_PARSE('00000000-0000-0000-0000-000000000103'), UUID_PARSE('00000000-0000-0000-0000-000000000203'), UUID_PARSE('00000000-0000-0000-0000-000000000001'), 'a3', 3, 0),
+            (UUID_PARSE('00000000-0000-0000-0000-000000000104'), UUID_PARSE('00000000-0000-0000-0000-000000000204'), UUID_PARSE('00000000-0000-0000-0000-000000000002'), 'b1', 1, 1),
+            (UUID_PARSE('00000000-0000-0000-0000-000000000105'), UUID_PARSE('00000000-0000-0000-0000-000000000205'), UUID_PARSE('00000000-0000-0000-0000-000000000003'), 'c1', 1, 1),
+            (UUID_PARSE('00000000-0000-0000-0000-000000000106'), UUID_PARSE('00000000-0000-0000-0000-000000000206'), UUID_PARSE('00000000-0000-0000-0000-000000000003'), 'c2', 2, 0)",
+    );
+
+    let statement = parse_sql_statement(
+        "SELECT p.Id, p.FullName, p.BirthDate, p.Biography, COUNT(r.Id) as RoleCount
+         FROM People p
+         JOIN Roles r ON r.PersonId = p.Id
+         GROUP BY p.Id
+         ORDER BY RoleCount DESC
+         LIMIT $1",
+    )
+    .expect("parse busiest people query");
+    let crate::sql::ast::Statement::Query(query) = &statement else {
+        panic!("expected query statement");
+    };
+
+    let result = runtime
+        .try_execute_movie_busiest_people_query(query, &[Value::Int64(2)])
+        .expect("execute busiest people query")
+        .expect("busiest people query should use role-count top-n path");
+
+    assert_eq!(
+        result
+            .rows()
+            .iter()
+            .map(|row| (row.values()[1].clone(), row.values()[4].clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            (Value::Text("Ada Actor".to_string()), Value::Int64(3)),
+            (Value::Text("Cal Actor".to_string()), Value::Int64(2))
+        ]
+    );
+}
+
+#[test]
 fn simple_indexed_projection_order_by_id_uses_row_id_order_with_limit_offset() {
     let mut runtime = EngineRuntime::empty(1);
     execute_sql(

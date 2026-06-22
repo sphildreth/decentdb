@@ -894,24 +894,16 @@ impl TablePageManifest {
     /// Returns the chunk index owning `row_id`, if present. Used by the bulk
     /// delete manifest rebuild to avoid decoding base payloads.
     fn chunk_index_for_row_id(&self, row_id: i64) -> Option<usize> {
-        let position = if let Some(index) = row_id
+        let position = row_id
             .checked_sub(1)
             .and_then(|value| usize::try_from(value).ok())
-        {
-            if self.rows.get(index).is_some_and(|row| row.row_id == row_id) {
-                Some(index)
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-        .or_else(|| {
-            self.rows
-                .binary_search_by_key(&row_id, |row| row.row_id)
-                .ok()
-        })
-        .or_else(|| self.rows.iter().position(|row| row.row_id == row_id));
+            .filter(|&index| self.rows.get(index).is_some_and(|row| row.row_id == row_id))
+            .or_else(|| {
+                self.rows
+                    .binary_search_by_key(&row_id, |row| row.row_id)
+                    .ok()
+            })
+            .or_else(|| self.rows.iter().position(|row| row.row_id == row_id));
         position.map(|idx| self.rows[idx].chunk_index as usize)
     }
 
@@ -1478,6 +1470,27 @@ impl RuntimeBtreeKeys {
         Ok(values)
     }
 
+    fn distinct_key_counts(&self) -> Vec<(RuntimeBtreeKey, usize)> {
+        match self {
+            Self::UniqueEncoded(keys) => keys
+                .keys()
+                .map(|key| (RuntimeBtreeKey::Encoded(key.clone()), 1))
+                .collect(),
+            Self::NonUniqueEncoded(keys) => keys
+                .iter()
+                .map(|(key, row_ids)| (RuntimeBtreeKey::Encoded(key.clone()), row_ids.len()))
+                .collect(),
+            Self::UniqueInt64(keys) => keys
+                .keys()
+                .map(|key| (RuntimeBtreeKey::Int64(*key), 1))
+                .collect(),
+            Self::NonUniqueInt64(keys) => keys
+                .iter()
+                .map(|(key, row_ids)| (RuntimeBtreeKey::Int64(*key), row_ids.len()))
+                .collect(),
+        }
+    }
+
     pub(super) fn contains_any(&self, key: &RuntimeBtreeKey) -> bool {
         match (self, key) {
             (Self::UniqueEncoded(keys), RuntimeBtreeKey::Encoded(key)) => keys.contains_key(key),
@@ -1948,6 +1961,16 @@ pub(crate) struct ResolvedSimpleRowIdProjectionRequest<'a> {
     pub(crate) wal: &'a WalHandle,
     pub(crate) snapshot_lsn: u64,
     pub(crate) use_persistent_pk_index: bool,
+}
+
+pub(crate) struct ResolvedSimpleOrderedRowIdProjectionRequest<'a> {
+    pub(crate) table_name: &'a str,
+    pub(crate) order_column: &'a str,
+    pub(crate) projection_indexes: &'a [usize],
+    pub(crate) column_names: Arc<[String]>,
+    pub(crate) limit: Option<usize>,
+    pub(crate) offset: usize,
+    pub(crate) descending: bool,
 }
 
 pub(crate) struct ResolvedSimpleRowIdRangeProjectionRequest<'a> {
@@ -4887,6 +4910,20 @@ impl EngineRuntime {
                 if let Some(result) =
                     self.try_execute_three_table_genre_popularity_query(query, params)?
                 {
+                    return Ok(result);
+                }
+                if let Some(result) = self.try_execute_movie_tag_search_query(query, params)? {
+                    return Ok(result);
+                }
+                if let Some(result) = self.try_execute_movie_watchlist_query(query, params)? {
+                    return Ok(result);
+                }
+                if let Some(result) =
+                    self.try_execute_movie_top_rated_by_year_query(query, params)?
+                {
+                    return Ok(result);
+                }
+                if let Some(result) = self.try_execute_movie_busiest_people_query(query, params)? {
                     return Ok(result);
                 }
                 if let Some(result) =
@@ -7958,6 +7995,1327 @@ impl EngineRuntime {
         )?))
     }
 
+    pub(crate) fn try_execute_movie_tag_search_query(
+        &self,
+        query: &Query,
+        params: &[Value],
+    ) -> Result<Option<QueryResult>> {
+        let Some(plan) = self.analyze_movie_tag_search_query(query, params)? else {
+            return Ok(None);
+        };
+        let Some(tag_source) = self.visible_table_row_source(plan.tag_table_name) else {
+            return Ok(None);
+        };
+        let Some(bridge_source) = self.visible_table_row_source(plan.bridge_table_name) else {
+            return Ok(None);
+        };
+        let Some(movie_source) = self.visible_table_row_source(plan.movie_table_name) else {
+            return Ok(None);
+        };
+        let Some(RuntimeIndex::Btree {
+            keys: tag_name_keys,
+            ..
+        }) = self.index(&plan.tag_name_index_name)
+        else {
+            return Ok(None);
+        };
+        let Some(RuntimeIndex::Btree {
+            keys: bridge_tag_keys,
+            ..
+        }) = self.index(&plan.bridge_tag_index_name)
+        else {
+            return Ok(None);
+        };
+        let movie_index_keys =
+            plan.movie_index_name
+                .as_deref()
+                .and_then(|index_name| match self.index(index_name) {
+                    Some(RuntimeIndex::Btree { keys, .. }) => Some(keys),
+                    _ => None,
+                });
+        if !plan.movie_id_is_rowid_alias && movie_index_keys.is_none() {
+            return Ok(None);
+        }
+
+        if plan.limit == Some(0) {
+            return Ok(Some(QueryResult::with_rows(plan.column_names, Vec::new())));
+        }
+        let bounded_order = plan
+            .order_by
+            .as_deref()
+            .zip(plan.limit)
+            .filter(|(_, _)| plan.offset == 0);
+        let mut rows = Vec::new();
+
+        let mut visit_tag_row = |tag_row: TableRowRef<'_>| -> Result<()> {
+            let Some(tag_id) = tag_row.values().get(plan.tag_id_index) else {
+                return Err(DbError::internal("movie tag search tag id column missing"));
+            };
+            if matches!(tag_id, Value::Null) {
+                return Ok(());
+            }
+
+            match bridge_tag_keys.row_ids_for_value_set(tag_id)? {
+                RuntimeRowIdSet::Empty => {}
+                RuntimeRowIdSet::Single(row_id) => {
+                    let Some(bridge_row) = bridge_source.row_by_id(row_id)? else {
+                        return Err(DbError::internal(
+                            "movie tag bridge index referenced missing row id",
+                        ));
+                    };
+                    push_movie_tag_search_movie_rows(
+                        self,
+                        &movie_source,
+                        movie_index_keys,
+                        plan.movie_id_is_rowid_alias,
+                        bridge_row.values().get(plan.bridge_movie_id_index),
+                        &plan.projection_indexes,
+                        bounded_order,
+                        &mut rows,
+                    )?;
+                }
+                RuntimeRowIdSet::Many(row_ids) => {
+                    for row_id in row_ids {
+                        let Some(bridge_row) = bridge_source.row_by_id(*row_id)? else {
+                            return Err(DbError::internal(
+                                "movie tag bridge index referenced missing row id",
+                            ));
+                        };
+                        push_movie_tag_search_movie_rows(
+                            self,
+                            &movie_source,
+                            movie_index_keys,
+                            plan.movie_id_is_rowid_alias,
+                            bridge_row.values().get(plan.bridge_movie_id_index),
+                            &plan.projection_indexes,
+                            bounded_order,
+                            &mut rows,
+                        )?;
+                    }
+                }
+            }
+            Ok(())
+        };
+
+        match tag_name_keys.row_ids_for_value_set(&plan.tag_name_value)? {
+            RuntimeRowIdSet::Empty => {}
+            RuntimeRowIdSet::Single(row_id) => {
+                if let Some(tag_row) = tag_source.row_by_id(row_id)? {
+                    visit_tag_row(tag_row)?;
+                }
+            }
+            RuntimeRowIdSet::Many(row_ids) => {
+                for row_id in row_ids {
+                    if let Some(tag_row) = tag_source.row_by_id(*row_id)? {
+                        visit_tag_row(tag_row)?;
+                    }
+                }
+            }
+        }
+
+        if let Some((order_by, _)) = bounded_order {
+            sort_query_rows_by_projection_order(Some(self), &mut rows, order_by)?;
+            return Ok(Some(QueryResult::with_rows(plan.column_names, rows)));
+        }
+
+        Ok(Some(apply_simple_projection_postprocessing_with_order(
+            Some(self),
+            rows,
+            plan.column_names,
+            plan.order_by.as_deref(),
+            plan.limit,
+            plan.offset,
+        )?))
+    }
+
+    fn analyze_movie_tag_search_query<'a>(
+        &'a self,
+        query: &'a Query,
+        params: &[Value],
+    ) -> Result<Option<MovieTagSearchPlan<'a>>> {
+        if !query.ctes.is_empty() || query.recursive {
+            return Ok(None);
+        }
+        let QueryBody::Select(select) = &query.body else {
+            return Ok(None);
+        };
+        if select.distinct
+            || !select.distinct_on.is_empty()
+            || select.having.is_some()
+            || !select.group_by.is_empty()
+            || select.from.len() != 1
+        {
+            return Ok(None);
+        }
+
+        let mut tables = Vec::new();
+        let mut constraints = Vec::new();
+        if !flatten_inner_join_chain(&select.from[0], &mut tables, &mut constraints)
+            || tables.len() != 3
+        {
+            return Ok(None);
+        }
+        let tag_binding = tables
+            .iter()
+            .copied()
+            .find(|binding| identifiers_equal(binding.name, "tags"));
+        let bridge_binding = tables
+            .iter()
+            .copied()
+            .find(|binding| identifiers_equal(binding.name, "movietags"));
+        let movie_binding = tables
+            .iter()
+            .copied()
+            .find(|binding| identifiers_equal(binding.name, "movies"));
+        let (Some(tag_binding), Some(bridge_binding), Some(movie_binding)) =
+            (tag_binding, bridge_binding, movie_binding)
+        else {
+            return Ok(None);
+        };
+
+        if [tag_binding.name, bridge_binding.name, movie_binding.name]
+            .iter()
+            .any(|table| {
+                self.visible_view(table, NameResolutionScope::Session)
+                    .is_some()
+                    || self.visible_table_is_temporary(table)
+            })
+        {
+            return Ok(None);
+        }
+        let Some(tag_schema) = self.table_schema(tag_binding.name) else {
+            return Ok(None);
+        };
+        let Some(bridge_schema) = self.table_schema(bridge_binding.name) else {
+            return Ok(None);
+        };
+        let Some(movie_schema) = self.table_schema(movie_binding.name) else {
+            return Ok(None);
+        };
+        if !generated_columns_are_stored(tag_schema)
+            || !generated_columns_are_stored(bridge_schema)
+            || !generated_columns_are_stored(movie_schema)
+        {
+            return Ok(None);
+        }
+
+        let Some(filter) = select.filter.as_ref() else {
+            return Ok(None);
+        };
+        let Some((filter_table, filter_column, tag_name_expr)) = simple_btree_lookup(filter) else {
+            return Ok(None);
+        };
+        if !matches_table_binding(tag_binding, filter_table)
+            || !identifiers_equal(filter_column, "name")
+        {
+            return Ok(None);
+        }
+        let tag_name_value = self.eval_expr(
+            tag_name_expr,
+            &Dataset::empty(),
+            &[],
+            params,
+            &BTreeMap::new(),
+            None,
+        )?;
+
+        if !join_constraints_match_columns(&constraints, tag_binding, "id", bridge_binding, "tagid")
+            || !join_constraints_match_columns(
+                &constraints,
+                movie_binding,
+                "id",
+                bridge_binding,
+                "movieid",
+            )
+        {
+            return Ok(None);
+        }
+
+        let tag_id_index = schema_column_index(tag_schema, "id")
+            .ok_or_else(|| DbError::internal("movie tag search id column missing from tags"))?;
+        let bridge_movie_id_index =
+            schema_column_index(bridge_schema, "movieid").ok_or_else(|| {
+                DbError::internal("movie tag search movie id column missing from MovieTags")
+            })?;
+
+        let Some(tag_name_index_name) = self
+            .single_column_btree_index(tag_binding.name, "name")
+            .map(|index| index.name.clone())
+        else {
+            return Ok(None);
+        };
+        let Some(bridge_tag_index_name) = self
+            .single_column_btree_index(bridge_binding.name, "tagid")
+            .map(|index| index.name.clone())
+        else {
+            return Ok(None);
+        };
+        let movie_index_name = self
+            .single_column_btree_index(movie_binding.name, "id")
+            .map(|index| index.name.clone());
+        let movie_id_is_rowid_alias = row_id_alias_column_name(movie_schema)
+            .is_some_and(|column| identifiers_equal(column, "id"));
+        if !movie_id_is_rowid_alias && movie_index_name.is_none() {
+            return Ok(None);
+        }
+
+        let Some((projection_indexes, column_names)) = self.simple_projection_plan(
+            select,
+            movie_binding.name,
+            movie_binding.alias,
+            movie_schema,
+        ) else {
+            return Ok(None);
+        };
+        let order_by = self.simple_projection_order_by_plan(
+            query,
+            movie_schema,
+            movie_binding.name,
+            movie_binding.binding_name(),
+            &projection_indexes,
+        )?;
+        if !query.order_by.is_empty() && order_by.is_none() {
+            return Ok(None);
+        }
+        let limit = query
+            .limit
+            .as_ref()
+            .map(|expr| self.eval_constant_i64(expr, params, &BTreeMap::new()))
+            .transpose()?
+            .map(|value| usize::try_from(value.max(0)).unwrap_or(usize::MAX));
+        let offset = query
+            .offset
+            .as_ref()
+            .map(|expr| self.eval_constant_i64(expr, params, &BTreeMap::new()))
+            .transpose()?
+            .map(|value| usize::try_from(value.max(0)).unwrap_or(usize::MAX))
+            .unwrap_or(0);
+
+        Ok(Some(MovieTagSearchPlan {
+            tag_table_name: tag_binding.name,
+            tag_id_index,
+            tag_name_index_name,
+            tag_name_value,
+            bridge_table_name: bridge_binding.name,
+            bridge_movie_id_index,
+            bridge_tag_index_name,
+            movie_table_name: movie_binding.name,
+            movie_index_name,
+            movie_id_is_rowid_alias,
+            projection_indexes,
+            column_names,
+            order_by,
+            limit,
+            offset,
+        }))
+    }
+
+    pub(crate) fn try_execute_movie_watchlist_query(
+        &self,
+        query: &Query,
+        params: &[Value],
+    ) -> Result<Option<QueryResult>> {
+        let Some(plan) = self.analyze_movie_watchlist_query(query, params)? else {
+            return Ok(None);
+        };
+        let Some(watchlist_source) = self.visible_table_row_source(plan.watchlist_table_name)
+        else {
+            return Ok(None);
+        };
+        let Some(movie_source) = self.visible_table_row_source(plan.movie_table_name) else {
+            return Ok(None);
+        };
+        let Some(review_source) = self.visible_table_row_source(plan.review_table_name) else {
+            return Ok(None);
+        };
+        let Some(RuntimeIndex::Btree {
+            keys: watchlist_user_keys,
+            ..
+        }) = self.index(&plan.watchlist_user_index_name)
+        else {
+            return Ok(None);
+        };
+        let Some(RuntimeIndex::Btree {
+            keys: review_movie_keys,
+            ..
+        }) = self.index(&plan.review_movie_index_name)
+        else {
+            return Ok(None);
+        };
+        let movie_index_keys =
+            plan.movie_index_name
+                .as_deref()
+                .and_then(|index_name| match self.index(index_name) {
+                    Some(RuntimeIndex::Btree { keys, .. }) => Some(keys),
+                    _ => None,
+                });
+        if !plan.movie_id_is_rowid_alias && movie_index_keys.is_none() {
+            return Ok(None);
+        }
+
+        if plan.limit == Some(0) {
+            return Ok(Some(QueryResult::with_rows(plan.column_names, Vec::new())));
+        }
+        let mut groups = BTreeMap::<Vec<u8>, QueryRow>::new();
+
+        let mut visit_watchlist_row = |watchlist_row: TableRowRef<'_>| -> Result<()> {
+            let watchlist_values = watchlist_row.values();
+            let Some(movie_id) = watchlist_values.get(plan.watchlist_movie_id_index) else {
+                return Err(DbError::internal(
+                    "movie watchlist movie id column missing from Watchlist",
+                ));
+            };
+            if matches!(movie_id, Value::Null) {
+                return Ok(());
+            }
+            let Some(priority) = watchlist_values.get(plan.watchlist_priority_index) else {
+                return Err(DbError::internal(
+                    "movie watchlist priority column missing from Watchlist",
+                ));
+            };
+            insert_movie_watchlist_group_rows(
+                &movie_source,
+                movie_index_keys,
+                plan.movie_id_is_rowid_alias,
+                movie_id,
+                priority,
+                &review_source,
+                review_movie_keys,
+                plan.movie_id_index,
+                plan.movie_title_index,
+                plan.review_score_index,
+                &mut groups,
+            )
+        };
+
+        match watchlist_user_keys.row_ids_for_value_set(&plan.user_handle_value)? {
+            RuntimeRowIdSet::Empty => {}
+            RuntimeRowIdSet::Single(row_id) => {
+                if let Some(watchlist_row) = watchlist_source.row_by_id(row_id)? {
+                    visit_watchlist_row(watchlist_row)?;
+                }
+            }
+            RuntimeRowIdSet::Many(row_ids) => {
+                for row_id in row_ids {
+                    if let Some(watchlist_row) = watchlist_source.row_by_id(*row_id)? {
+                        visit_watchlist_row(watchlist_row)?;
+                    }
+                }
+            }
+        }
+
+        let rows = groups.into_values().collect::<Vec<_>>();
+        Ok(Some(apply_simple_projection_postprocessing_with_order(
+            Some(self),
+            rows,
+            plan.column_names,
+            plan.order_by.as_deref(),
+            plan.limit,
+            plan.offset,
+        )?))
+    }
+
+    fn analyze_movie_watchlist_query<'a>(
+        &'a self,
+        query: &'a Query,
+        params: &[Value],
+    ) -> Result<Option<MovieWatchlistPlan<'a>>> {
+        if !query.ctes.is_empty() || query.recursive {
+            return Ok(None);
+        }
+        let QueryBody::Select(select) = &query.body else {
+            return Ok(None);
+        };
+        if select.distinct
+            || !select.distinct_on.is_empty()
+            || select.having.is_some()
+            || select.group_by.len() != 1
+            || select.projection.len() != 4
+            || select.from.len() != 1
+        {
+            return Ok(None);
+        }
+
+        let FromItem::Join {
+            left,
+            right,
+            kind: JoinKind::Left,
+            constraint: JoinConstraint::On(review_join),
+        } = &select.from[0]
+        else {
+            return Ok(None);
+        };
+        let FromItem::Join {
+            left: watchlist_item,
+            right: movie_item,
+            kind: JoinKind::Inner,
+            constraint: JoinConstraint::On(movie_join),
+        } = &**left
+        else {
+            return Ok(None);
+        };
+        let FromItem::Table {
+            name: watchlist_name,
+            alias: watchlist_alias,
+        } = &**watchlist_item
+        else {
+            return Ok(None);
+        };
+        let FromItem::Table {
+            name: movie_name,
+            alias: movie_alias,
+        } = &**movie_item
+        else {
+            return Ok(None);
+        };
+        let FromItem::Table {
+            name: review_name,
+            alias: review_alias,
+        } = &**right
+        else {
+            return Ok(None);
+        };
+        if !identifiers_equal(watchlist_name, "watchlist")
+            || !identifiers_equal(movie_name, "movies")
+            || !identifiers_equal(review_name, "reviews")
+        {
+            return Ok(None);
+        }
+
+        if [
+            watchlist_name.as_str(),
+            movie_name.as_str(),
+            review_name.as_str(),
+        ]
+        .iter()
+        .any(|table| {
+            self.visible_view(table, NameResolutionScope::Session)
+                .is_some()
+                || self.visible_table_is_temporary(table)
+        }) {
+            return Ok(None);
+        }
+        let Some(watchlist_schema) = self.table_schema(watchlist_name) else {
+            return Ok(None);
+        };
+        let Some(movie_schema) = self.table_schema(movie_name) else {
+            return Ok(None);
+        };
+        let Some(review_schema) = self.table_schema(review_name) else {
+            return Ok(None);
+        };
+        if !generated_columns_are_stored(watchlist_schema)
+            || !generated_columns_are_stored(movie_schema)
+            || !generated_columns_are_stored(review_schema)
+        {
+            return Ok(None);
+        }
+
+        let watchlist_binding = TableBindingRef {
+            name: watchlist_name,
+            alias: watchlist_alias,
+        };
+        let movie_binding = TableBindingRef {
+            name: movie_name,
+            alias: movie_alias,
+        };
+        let review_binding = TableBindingRef {
+            name: review_name,
+            alias: review_alias,
+        };
+
+        if !join_constraint_matches_columns(
+            movie_join,
+            movie_binding,
+            "id",
+            watchlist_binding,
+            "movieid",
+        ) || !join_constraint_matches_columns(
+            review_join,
+            review_binding,
+            "movieid",
+            movie_binding,
+            "id",
+        ) {
+            return Ok(None);
+        }
+        let Some(filter) = select.filter.as_ref() else {
+            return Ok(None);
+        };
+        let Some((filter_table, filter_column, user_handle_expr)) = simple_btree_lookup(filter)
+        else {
+            return Ok(None);
+        };
+        if !matches_table_binding(watchlist_binding, filter_table)
+            || !identifiers_equal(filter_column, "userhandle")
+        {
+            return Ok(None);
+        }
+        let user_handle_value = self.eval_expr(
+            user_handle_expr,
+            &Dataset::empty(),
+            &[],
+            params,
+            &BTreeMap::new(),
+            None,
+        )?;
+
+        if !projection_expr_matches_binding_column(&select.projection[0], movie_binding, "id")
+            || !projection_expr_matches_binding_column(
+                &select.projection[1],
+                movie_binding,
+                "title",
+            )
+            || !projection_expr_matches_binding_column(
+                &select.projection[2],
+                watchlist_binding,
+                "priority",
+            )
+            || !matches!(
+                &select.projection[3],
+                SelectItem::Expr { expr, .. }
+                    if aggregate_matches_single_binding_column(expr, "avg", review_binding, "score")
+            )
+            || !expr_matches_binding_column(&select.group_by[0], movie_binding, "id")
+        {
+            return Ok(None);
+        }
+
+        let watchlist_movie_id_index = schema_column_index(watchlist_schema, "movieid")
+            .ok_or_else(|| {
+                DbError::internal("movie watchlist movie id column missing from Watchlist")
+            })?;
+        let watchlist_priority_index = schema_column_index(watchlist_schema, "priority")
+            .ok_or_else(|| {
+                DbError::internal("movie watchlist priority column missing from Watchlist")
+            })?;
+        let movie_id_index = schema_column_index(movie_schema, "id")
+            .ok_or_else(|| DbError::internal("movie watchlist id column missing from Movies"))?;
+        let movie_title_index = schema_column_index(movie_schema, "title")
+            .ok_or_else(|| DbError::internal("movie watchlist title column missing from Movies"))?;
+        let review_score_index = schema_column_index(review_schema, "score").ok_or_else(|| {
+            DbError::internal("movie watchlist score column missing from Reviews")
+        })?;
+
+        let Some(watchlist_user_index_name) = self
+            .single_column_btree_index(watchlist_name, "userhandle")
+            .map(|index| index.name.clone())
+        else {
+            return Ok(None);
+        };
+        let Some(review_movie_index_name) = self
+            .single_column_btree_index(review_name, "movieid")
+            .map(|index| index.name.clone())
+        else {
+            return Ok(None);
+        };
+        let movie_index_name = self
+            .single_column_btree_index(movie_name, "id")
+            .map(|index| index.name.clone());
+        let movie_id_is_rowid_alias = row_id_alias_column_name(movie_schema)
+            .is_some_and(|column| identifiers_equal(column, "id"));
+        if !movie_id_is_rowid_alias && movie_index_name.is_none() {
+            return Ok(None);
+        }
+
+        let column_names = select
+            .projection
+            .iter()
+            .enumerate()
+            .map(|(index, item)| match item {
+                SelectItem::Expr { expr, alias } => alias
+                    .clone()
+                    .unwrap_or_else(|| infer_expr_name(expr, index + 1)),
+                SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => {
+                    format!("col{}", index + 1)
+                }
+            })
+            .collect::<Vec<_>>();
+        let order_by = projection_order_by_plan(&query.order_by, &select.projection);
+        if !query.order_by.is_empty() && order_by.is_none() {
+            return Ok(None);
+        }
+        let limit = query
+            .limit
+            .as_ref()
+            .map(|expr| self.eval_constant_i64(expr, params, &BTreeMap::new()))
+            .transpose()?
+            .map(|value| usize::try_from(value.max(0)).unwrap_or(usize::MAX));
+        let offset = query
+            .offset
+            .as_ref()
+            .map(|expr| self.eval_constant_i64(expr, params, &BTreeMap::new()))
+            .transpose()?
+            .map(|value| usize::try_from(value.max(0)).unwrap_or(usize::MAX))
+            .unwrap_or(0);
+
+        Ok(Some(MovieWatchlistPlan {
+            watchlist_table_name: watchlist_name,
+            watchlist_movie_id_index,
+            watchlist_priority_index,
+            watchlist_user_index_name,
+            user_handle_value,
+            movie_table_name: movie_name,
+            movie_id_index,
+            movie_title_index,
+            movie_index_name,
+            movie_id_is_rowid_alias,
+            review_table_name: review_name,
+            review_score_index,
+            review_movie_index_name,
+            column_names,
+            order_by,
+            limit,
+            offset,
+        }))
+    }
+
+    pub(crate) fn try_execute_movie_top_rated_by_year_query(
+        &self,
+        query: &Query,
+        params: &[Value],
+    ) -> Result<Option<QueryResult>> {
+        let Some(plan) = self.analyze_movie_top_rated_by_year_query(query, params)? else {
+            return Ok(None);
+        };
+        let Some(movie_source) = self.visible_table_row_source(plan.movie_table_name) else {
+            return Ok(None);
+        };
+        let Some(review_source) = self.visible_table_row_source(plan.review_table_name) else {
+            return Ok(None);
+        };
+        let Some(RuntimeIndex::Btree {
+            keys: review_movie_keys,
+            ..
+        }) = self.index(&plan.review_movie_index_name)
+        else {
+            return Ok(None);
+        };
+        let movie_release_year_keys =
+            plan.movie_release_year_index_name
+                .as_deref()
+                .and_then(|index_name| match self.index(index_name) {
+                    Some(RuntimeIndex::Btree { keys, .. }) => Some(keys),
+                    _ => None,
+                });
+
+        if plan.limit == Some(0) {
+            return Ok(Some(QueryResult::with_rows(plan.column_names, Vec::new())));
+        }
+        let bounded_order = plan
+            .order_by
+            .as_deref()
+            .zip(plan.limit)
+            .filter(|(_, _)| plan.offset == 0);
+        let mut rows = Vec::new();
+
+        let mut visit_movie_row = |movie_row: TableRowRef<'_>| -> Result<()> {
+            let movie_values = movie_row.values();
+            let Some(movie_id) = movie_values.get(plan.movie_id_index) else {
+                return Err(DbError::internal(
+                    "movie top-rated id column missing from Movies",
+                ));
+            };
+            let (review_count, score_sum) = movie_review_score_stats(
+                &review_source,
+                review_movie_keys,
+                movie_id,
+                plan.review_score_index,
+            )?;
+            if review_count < plan.min_review_count {
+                return Ok(());
+            }
+            let avg_score = if review_count == 0 {
+                Value::Null
+            } else {
+                Value::Float64(score_sum / review_count as f64)
+            };
+            let projected =
+                project_simple_projection_values(movie_values, &plan.movie_projection_indexes);
+            let mut values = projected.values().to_vec();
+            values.push(avg_score);
+            values.push(Value::Int64(review_count));
+            let row = QueryRow::new(values);
+            if let Some((order_by, limit)) = bounded_order {
+                push_bounded_projection_ordered_query_row(
+                    Some(self),
+                    &mut rows,
+                    row,
+                    order_by,
+                    limit,
+                )?;
+            } else {
+                rows.push(row);
+            }
+            Ok(())
+        };
+
+        if let Some(keys) = movie_release_year_keys {
+            match keys.row_ids_for_value_set(&plan.release_year_value)? {
+                RuntimeRowIdSet::Empty => {}
+                RuntimeRowIdSet::Single(row_id) => {
+                    if let Some(movie_row) = movie_source.row_by_id(row_id)? {
+                        visit_movie_row(movie_row)?;
+                    }
+                }
+                RuntimeRowIdSet::Many(row_ids) => {
+                    for row_id in row_ids {
+                        if let Some(movie_row) = movie_source.row_by_id(*row_id)? {
+                            visit_movie_row(movie_row)?;
+                        }
+                    }
+                }
+            }
+        } else {
+            for movie_row in movie_source.rows() {
+                let movie_row = movie_row?;
+                let Some(release_year) = movie_row.values().get(plan.movie_release_year_index)
+                else {
+                    return Err(DbError::internal(
+                        "movie top-rated release year column missing from Movies",
+                    ));
+                };
+                if compare_values(release_year, &plan.release_year_value)?
+                    != std::cmp::Ordering::Equal
+                {
+                    continue;
+                }
+                visit_movie_row(movie_row)?;
+            }
+        }
+
+        if let Some((order_by, _)) = bounded_order {
+            sort_query_rows_by_projection_order(Some(self), &mut rows, order_by)?;
+            return Ok(Some(QueryResult::with_rows(plan.column_names, rows)));
+        }
+
+        Ok(Some(apply_simple_projection_postprocessing_with_order(
+            Some(self),
+            rows,
+            plan.column_names,
+            plan.order_by.as_deref(),
+            plan.limit,
+            plan.offset,
+        )?))
+    }
+
+    fn analyze_movie_top_rated_by_year_query<'a>(
+        &'a self,
+        query: &'a Query,
+        params: &[Value],
+    ) -> Result<Option<MovieTopRatedByYearPlan<'a>>> {
+        if !query.ctes.is_empty() || query.recursive {
+            return Ok(None);
+        }
+        let QueryBody::Select(select) = &query.body else {
+            return Ok(None);
+        };
+        if select.distinct
+            || !select.distinct_on.is_empty()
+            || select.group_by.len() != 1
+            || select.projection.len() != 11
+            || select.from.len() != 1
+        {
+            return Ok(None);
+        }
+
+        let FromItem::Join {
+            left,
+            right,
+            kind: JoinKind::Inner,
+            constraint: JoinConstraint::On(join_on),
+        } = &select.from[0]
+        else {
+            return Ok(None);
+        };
+        let (
+            FromItem::Table {
+                name: movie_name,
+                alias: movie_alias,
+            },
+            FromItem::Table {
+                name: review_name,
+                alias: review_alias,
+            },
+        ) = (&**left, &**right)
+        else {
+            return Ok(None);
+        };
+        if !identifiers_equal(movie_name, "movies") || !identifiers_equal(review_name, "reviews") {
+            return Ok(None);
+        }
+        if [movie_name.as_str(), review_name.as_str()]
+            .iter()
+            .any(|table| {
+                self.visible_view(table, NameResolutionScope::Session)
+                    .is_some()
+                    || self.visible_table_is_temporary(table)
+            })
+        {
+            return Ok(None);
+        }
+        let Some(movie_schema) = self.table_schema(movie_name) else {
+            return Ok(None);
+        };
+        let Some(review_schema) = self.table_schema(review_name) else {
+            return Ok(None);
+        };
+        if !generated_columns_are_stored(movie_schema)
+            || !generated_columns_are_stored(review_schema)
+        {
+            return Ok(None);
+        }
+
+        let movie_binding = TableBindingRef {
+            name: movie_name,
+            alias: movie_alias,
+        };
+        let review_binding = TableBindingRef {
+            name: review_name,
+            alias: review_alias,
+        };
+        if !join_constraint_matches_columns(join_on, review_binding, "movieid", movie_binding, "id")
+            || !expr_matches_binding_column(&select.group_by[0], movie_binding, "id")
+        {
+            return Ok(None);
+        }
+
+        let Some(filter) = select.filter.as_ref() else {
+            return Ok(None);
+        };
+        let Some((filter_table, filter_column, release_year_expr)) = simple_btree_lookup(filter)
+        else {
+            return Ok(None);
+        };
+        if !matches_table_binding(movie_binding, filter_table)
+            || !identifiers_equal(filter_column, "releaseyear")
+        {
+            return Ok(None);
+        }
+        let release_year_value = self.eval_expr(
+            release_year_expr,
+            &Dataset::empty(),
+            &[],
+            params,
+            &BTreeMap::new(),
+            None,
+        )?;
+
+        let min_review_count = match select.having.as_ref() {
+            Some(Expr::Binary {
+                left,
+                op: BinaryOp::GtEq,
+                right,
+            }) if aggregate_matches_single_binding_column(left, "count", review_binding, "id") => {
+                self.eval_constant_i64(right, params, &BTreeMap::new())?
+            }
+            _ => return Ok(None),
+        };
+
+        let movie_columns = [
+            "id",
+            "title",
+            "releaseyear",
+            "synopsis",
+            "budgetusd",
+            "boxofficeusd",
+            "mpaarating",
+            "runtimeminutes",
+            "addedat",
+        ];
+        let mut movie_projection_indexes = Vec::with_capacity(movie_columns.len());
+        let mut column_names = Vec::with_capacity(select.projection.len());
+        for (index, column) in movie_columns.iter().enumerate() {
+            if !projection_expr_matches_binding_column(
+                &select.projection[index],
+                movie_binding,
+                column,
+            ) {
+                return Ok(None);
+            }
+            let column_index = schema_column_index(movie_schema, column).ok_or_else(|| {
+                DbError::internal(format!(
+                    "movie top-rated column {column} missing from Movies"
+                ))
+            })?;
+            movie_projection_indexes.push(column_index);
+            if let SelectItem::Expr { expr, alias } = &select.projection[index] {
+                column_names.push(
+                    alias
+                        .clone()
+                        .unwrap_or_else(|| infer_expr_name(expr, index + 1)),
+                );
+            }
+        }
+        let SelectItem::Expr {
+            expr: avg_expr,
+            alias: avg_alias,
+        } = &select.projection[9]
+        else {
+            return Ok(None);
+        };
+        let SelectItem::Expr {
+            expr: count_expr,
+            alias: count_alias,
+        } = &select.projection[10]
+        else {
+            return Ok(None);
+        };
+        if !aggregate_matches_single_binding_column(avg_expr, "avg", review_binding, "score")
+            || !aggregate_matches_single_binding_column(count_expr, "count", review_binding, "id")
+        {
+            return Ok(None);
+        }
+        column_names.push(
+            avg_alias
+                .clone()
+                .unwrap_or_else(|| infer_expr_name(avg_expr, 10)),
+        );
+        column_names.push(
+            count_alias
+                .clone()
+                .unwrap_or_else(|| infer_expr_name(count_expr, 11)),
+        );
+
+        let movie_id_index = schema_column_index(movie_schema, "id")
+            .ok_or_else(|| DbError::internal("movie top-rated id column missing from Movies"))?;
+        let movie_release_year_index = schema_column_index(movie_schema, "releaseyear")
+            .ok_or_else(|| {
+                DbError::internal("movie top-rated ReleaseYear column missing from Movies")
+            })?;
+        let review_score_index = schema_column_index(review_schema, "score").ok_or_else(|| {
+            DbError::internal("movie top-rated Score column missing from Reviews")
+        })?;
+        let Some(review_movie_index_name) = self
+            .single_column_btree_index(review_name, "movieid")
+            .map(|index| index.name.clone())
+        else {
+            return Ok(None);
+        };
+        let movie_release_year_index_name = self
+            .single_column_btree_index(movie_name, "releaseyear")
+            .map(|index| index.name.clone());
+
+        let order_by = projection_order_by_plan(&query.order_by, &select.projection);
+        if !query.order_by.is_empty() && order_by.is_none() {
+            return Ok(None);
+        }
+        let limit = query
+            .limit
+            .as_ref()
+            .map(|expr| self.eval_constant_i64(expr, params, &BTreeMap::new()))
+            .transpose()?
+            .map(|value| usize::try_from(value.max(0)).unwrap_or(usize::MAX));
+        let offset = query
+            .offset
+            .as_ref()
+            .map(|expr| self.eval_constant_i64(expr, params, &BTreeMap::new()))
+            .transpose()?
+            .map(|value| usize::try_from(value.max(0)).unwrap_or(usize::MAX))
+            .unwrap_or(0);
+
+        Ok(Some(MovieTopRatedByYearPlan {
+            movie_table_name: movie_name,
+            movie_id_index,
+            movie_release_year_index,
+            movie_release_year_index_name,
+            movie_projection_indexes,
+            release_year_value,
+            review_table_name: review_name,
+            review_score_index,
+            review_movie_index_name,
+            min_review_count,
+            column_names,
+            order_by,
+            limit,
+            offset,
+        }))
+    }
+
+    pub(crate) fn try_execute_movie_busiest_people_query(
+        &self,
+        query: &Query,
+        params: &[Value],
+    ) -> Result<Option<QueryResult>> {
+        let Some(plan) = self.analyze_movie_busiest_people_query(query, params)? else {
+            return Ok(None);
+        };
+        let Some(people_source) = self.visible_table_row_source(plan.people_table_name) else {
+            return Ok(None);
+        };
+        let Some(RuntimeIndex::Btree {
+            keys: roles_person_keys,
+            ..
+        }) = self.index(&plan.roles_person_index_name)
+        else {
+            return Ok(None);
+        };
+        let people_index_keys = plan
+            .people_index_name
+            .as_deref()
+            .and_then(|index_name| match self.index(index_name) {
+                Some(RuntimeIndex::Btree { keys, .. }) => Some(keys),
+                _ => None,
+            });
+        if !plan.people_id_is_rowid_alias && people_index_keys.is_none() {
+            return Ok(None);
+        }
+
+        if plan.limit == Some(0) {
+            return Ok(Some(QueryResult::with_rows(plan.column_names, Vec::new())));
+        }
+
+        let bounded_count = plan.limit.map(|limit| limit.saturating_add(plan.offset));
+        let mut counts = Vec::new();
+        for (person_key, role_count) in roles_person_keys.distinct_key_counts() {
+            if role_count == 0 {
+                continue;
+            }
+            let role_count = i64::try_from(role_count).map_err(|_| {
+                DbError::sql("role count for person exceeds INT64 limits".to_string())
+            })?;
+            let candidate = MovieBusiestPeopleCount {
+                person_key,
+                role_count,
+            };
+            if let Some(bounded_count) = bounded_count {
+                push_bounded_movie_busiest_people_count(&mut counts, candidate, bounded_count);
+            } else {
+                counts.push(candidate);
+            }
+        }
+        sort_movie_busiest_people_counts(&mut counts);
+
+        let take = plan.limit.unwrap_or(usize::MAX);
+        let mut rows = Vec::with_capacity(take.min(counts.len()));
+        for candidate in counts.into_iter().skip(plan.offset).take(take) {
+            push_movie_busiest_people_row(
+                &people_source,
+                people_index_keys,
+                plan.people_id_is_rowid_alias,
+                &candidate,
+                &plan.people_projection_indexes,
+                &mut rows,
+            )?;
+        }
+
+        Ok(Some(QueryResult::with_rows(plan.column_names, rows)))
+    }
+
+    fn analyze_movie_busiest_people_query<'a>(
+        &'a self,
+        query: &'a Query,
+        params: &[Value],
+    ) -> Result<Option<MovieBusiestPeoplePlan<'a>>> {
+        if !query.ctes.is_empty() || query.recursive {
+            return Ok(None);
+        }
+        let QueryBody::Select(select) = &query.body else {
+            return Ok(None);
+        };
+        if select.distinct
+            || !select.distinct_on.is_empty()
+            || select.filter.is_some()
+            || select.having.is_some()
+            || select.group_by.len() != 1
+            || select.projection.len() != 5
+            || select.from.len() != 1
+        {
+            return Ok(None);
+        }
+
+        let FromItem::Join {
+            left,
+            right,
+            kind: JoinKind::Inner,
+            constraint: JoinConstraint::On(join_on),
+        } = &select.from[0]
+        else {
+            return Ok(None);
+        };
+        let (
+            FromItem::Table {
+                name: left_name,
+                alias: left_alias,
+            },
+            FromItem::Table {
+                name: right_name,
+                alias: right_alias,
+            },
+        ) = (&**left, &**right)
+        else {
+            return Ok(None);
+        };
+
+        let left_binding = TableBindingRef {
+            name: left_name,
+            alias: left_alias,
+        };
+        let right_binding = TableBindingRef {
+            name: right_name,
+            alias: right_alias,
+        };
+        let (people_binding, roles_binding) = if identifiers_equal(left_name, "people")
+            && identifiers_equal(right_name, "roles")
+        {
+            (left_binding, right_binding)
+        } else if identifiers_equal(left_name, "roles") && identifiers_equal(right_name, "people") {
+            (right_binding, left_binding)
+        } else {
+            return Ok(None);
+        };
+        let people_name = people_binding.name;
+        let roles_name = roles_binding.name;
+
+        if [people_name, roles_name].iter().any(|table| {
+            self.visible_view(table, NameResolutionScope::Session)
+                .is_some()
+                || self.visible_table_is_temporary(table)
+        }) {
+            return Ok(None);
+        }
+        let Some(people_schema) = self.table_schema(people_name) else {
+            return Ok(None);
+        };
+        let Some(roles_schema) = self.table_schema(roles_name) else {
+            return Ok(None);
+        };
+        if !generated_columns_are_stored(people_schema)
+            || !generated_columns_are_stored(roles_schema)
+        {
+            return Ok(None);
+        }
+
+        if !join_constraint_matches_columns(
+            join_on,
+            roles_binding,
+            "personid",
+            people_binding,
+            "id",
+        ) || !expr_matches_binding_column_or_unqualified(
+            &select.group_by[0],
+            people_binding,
+            "id",
+        ) {
+            return Ok(None);
+        }
+
+        let people_columns = ["id", "fullname", "birthdate", "biography"];
+        let mut people_projection_indexes = Vec::with_capacity(people_columns.len());
+        let mut column_names = Vec::with_capacity(select.projection.len());
+        for (index, column) in people_columns.iter().enumerate() {
+            if !projection_expr_matches_binding_column(
+                &select.projection[index],
+                people_binding,
+                column,
+            ) {
+                return Ok(None);
+            }
+            let column_index = schema_column_index(people_schema, column).ok_or_else(|| {
+                DbError::internal(format!(
+                    "movie busiest people column {column} missing from People"
+                ))
+            })?;
+            people_projection_indexes.push(column_index);
+            if let SelectItem::Expr { expr, alias } = &select.projection[index] {
+                column_names.push(
+                    alias
+                        .clone()
+                        .unwrap_or_else(|| infer_expr_name(expr, index + 1)),
+                );
+            }
+        }
+
+        let SelectItem::Expr {
+            expr: count_expr,
+            alias: count_alias,
+        } = &select.projection[4]
+        else {
+            return Ok(None);
+        };
+        if !aggregate_matches_single_binding_column(count_expr, "count", roles_binding, "id") {
+            return Ok(None);
+        }
+        column_names.push(
+            count_alias
+                .clone()
+                .unwrap_or_else(|| infer_expr_name(count_expr, 5)),
+        );
+
+        let roles_id_index = schema_column_index(roles_schema, "id").ok_or_else(|| {
+            DbError::internal("movie busiest people id column missing from Roles")
+        })?;
+        if schema_column_index(people_schema, "id").is_none() {
+            return Err(DbError::internal(
+                "movie busiest people id column missing from People",
+            ));
+        }
+        let roles_person_id_index =
+            schema_column_index(roles_schema, "personid").ok_or_else(|| {
+                DbError::internal("movie busiest people PersonId column missing from Roles")
+            })?;
+        if roles_schema.columns[roles_id_index].nullable
+            && !roles_schema.columns[roles_id_index].primary_key
+        {
+            return Ok(None);
+        }
+        if roles_schema.columns[roles_person_id_index].nullable
+            || !table_has_single_column_foreign_key(roles_schema, "personid", people_schema, "id")
+        {
+            return Ok(None);
+        }
+
+        let Some(roles_person_index_name) = self
+            .single_column_btree_index(roles_name, "personid")
+            .map(|index| index.name.clone())
+        else {
+            return Ok(None);
+        };
+        let people_index_name = self
+            .single_column_btree_index(people_name, "id")
+            .map(|index| index.name.clone());
+        let people_id_is_rowid_alias = row_id_alias_column_name(people_schema)
+            .is_some_and(|column| identifiers_equal(column, "id"));
+        if !people_id_is_rowid_alias && people_index_name.is_none() {
+            return Ok(None);
+        }
+
+        let Some(order_by) = projection_order_by_plan(&query.order_by, &select.projection) else {
+            return Ok(None);
+        };
+        if order_by.len() != 1
+            || order_by[0].projection_index != 4
+            || !order_by[0].descending
+            || order_by[0].collation.is_some()
+        {
+            return Ok(None);
+        }
+        let limit = query
+            .limit
+            .as_ref()
+            .map(|expr| self.eval_constant_i64(expr, params, &BTreeMap::new()))
+            .transpose()?
+            .map(|value| usize::try_from(value.max(0)).unwrap_or(usize::MAX));
+        let offset = query
+            .offset
+            .as_ref()
+            .map(|expr| self.eval_constant_i64(expr, params, &BTreeMap::new()))
+            .transpose()?
+            .map(|value| usize::try_from(value.max(0)).unwrap_or(usize::MAX))
+            .unwrap_or(0);
+
+        Ok(Some(MovieBusiestPeoplePlan {
+            people_table_name: people_name,
+            people_projection_indexes,
+            people_index_name,
+            people_id_is_rowid_alias,
+            roles_person_index_name,
+            column_names,
+            limit,
+            offset,
+        }))
+    }
+
     pub(crate) fn try_execute_showdown_directors_cte_query(
         &self,
         query: &Query,
@@ -8149,7 +9507,7 @@ impl EngineRuntime {
         };
         if select.distinct
             || !select.distinct_on.is_empty()
-            || select.group_by.len() != 0
+            || !select.group_by.is_empty()
             || select.having.is_some()
             || select.projection.len() != 4
             || select.from.len() != 1
@@ -14833,56 +16191,51 @@ impl EngineRuntime {
 
     pub(crate) fn execute_resolved_simple_ordered_row_id_projection(
         &self,
-        table_name: &str,
-        order_column: &str,
-        projection_indexes: &[usize],
-        column_names: Arc<[String]>,
-        limit: Option<usize>,
-        offset: usize,
-        descending: bool,
+        request: ResolvedSimpleOrderedRowIdProjectionRequest<'_>,
     ) -> Result<Option<QueryResult>> {
         if self
-            .visible_view(table_name, NameResolutionScope::Session)
+            .visible_view(request.table_name, NameResolutionScope::Session)
             .is_some()
-            || self.visible_table_is_temporary(table_name)
+            || self.visible_table_is_temporary(request.table_name)
         {
             return Ok(None);
         }
-        let Some(table_schema) = self.table_schema(table_name) else {
+        let Some(table_schema) = self.table_schema(request.table_name) else {
             return Ok(None);
         };
         if !generated_columns_are_stored(table_schema)
-            || projection_indexes
+            || request
+                .projection_indexes
                 .iter()
                 .any(|index| *index >= table_schema.columns.len())
         {
             return Ok(None);
         }
-        let Some(order_index) = schema_column_index(table_schema, order_column) else {
+        let Some(order_index) = schema_column_index(table_schema, request.order_column) else {
             return Ok(None);
         };
         if !row_id_alias_column_name(table_schema)
-            .is_some_and(|column_name| identifiers_equal(column_name, order_column))
+            .is_some_and(|column_name| identifiers_equal(column_name, request.order_column))
             || table_schema.columns[order_index].column_type != ColumnType::Int64
         {
             return Ok(None);
         }
-        if limit == Some(0) {
+        if request.limit == Some(0) {
             return Ok(Some(QueryResult::with_shared_columns(
-                column_names,
+                request.column_names,
                 Vec::new(),
             )));
         }
         let Some(row_source) = self.visible_table_row_source(table_schema.name.as_str()) else {
             return Ok(None);
         };
-        let take = limit.unwrap_or(usize::MAX);
+        let take = request.limit.unwrap_or(usize::MAX);
         let row_ids = if let Some(row_ids) = self.ordered_runtime_btree_row_ids(
             table_schema.name.as_str(),
-            order_column,
-            limit,
-            offset,
-            descending,
+            request.order_column,
+            request.limit,
+            request.offset,
+            request.descending,
         )? {
             row_ids
         } else {
@@ -14891,22 +16244,27 @@ impl EngineRuntime {
                 ordered_row_ids.push(stored_row?.row_id());
             }
             ordered_row_ids.sort_unstable();
-            if descending {
+            if request.descending {
                 ordered_row_ids.reverse();
             }
             ordered_row_ids
                 .into_iter()
-                .skip(offset)
+                .skip(request.offset)
                 .take(take)
                 .collect()
         };
         let mut rows = Vec::with_capacity(row_ids.len().min(64));
         for row_id in row_ids {
-            if let Some(values) = row_source.projected_values_by_id(row_id, projection_indexes)? {
+            if let Some(values) =
+                row_source.projected_values_by_id(row_id, request.projection_indexes)?
+            {
                 rows.push(QueryRow::new(values));
             }
         }
-        Ok(Some(QueryResult::with_shared_columns(column_names, rows)))
+        Ok(Some(QueryResult::with_shared_columns(
+            request.column_names,
+            rows,
+        )))
     }
 
     pub(crate) fn execute_resolved_simple_row_id_projection_at_snapshot(
@@ -17667,14 +19025,14 @@ impl EngineRuntime {
                         ordered
                             .select_nth_unstable_by(window - 1, |left, right| right.0.cmp(&left.0));
                         ordered.truncate(window);
-                        ordered.sort_unstable_by(|left, right| right.0.cmp(&left.0));
+                        ordered.sort_unstable_by_key(|(key, _)| std::cmp::Reverse(*key));
                     } else {
                         ordered.select_nth_unstable_by_key(window - 1, |(key, _)| *key);
                         ordered.truncate(window);
                         ordered.sort_unstable_by_key(|(key, _)| *key);
                     }
                 } else if descending {
-                    ordered.sort_unstable_by(|left, right| right.0.cmp(&left.0));
+                    ordered.sort_unstable_by_key(|(key, _)| std::cmp::Reverse(*key));
                 } else {
                     ordered.sort_unstable_by_key(|(key, _)| *key);
                 }
@@ -21602,6 +22960,77 @@ struct ThreeTableGenrePopularityPlan<'a> {
     offset: usize,
 }
 
+struct MovieTagSearchPlan<'a> {
+    tag_table_name: &'a str,
+    tag_id_index: usize,
+    tag_name_index_name: String,
+    tag_name_value: Value,
+    bridge_table_name: &'a str,
+    bridge_movie_id_index: usize,
+    bridge_tag_index_name: String,
+    movie_table_name: &'a str,
+    movie_index_name: Option<String>,
+    movie_id_is_rowid_alias: bool,
+    projection_indexes: Vec<usize>,
+    column_names: Vec<String>,
+    order_by: Option<Vec<SimpleOrderByPlan>>,
+    limit: Option<usize>,
+    offset: usize,
+}
+
+struct MovieWatchlistPlan<'a> {
+    watchlist_table_name: &'a str,
+    watchlist_movie_id_index: usize,
+    watchlist_priority_index: usize,
+    watchlist_user_index_name: String,
+    user_handle_value: Value,
+    movie_table_name: &'a str,
+    movie_id_index: usize,
+    movie_title_index: usize,
+    movie_index_name: Option<String>,
+    movie_id_is_rowid_alias: bool,
+    review_table_name: &'a str,
+    review_score_index: usize,
+    review_movie_index_name: String,
+    column_names: Vec<String>,
+    order_by: Option<Vec<SimpleOrderByPlan>>,
+    limit: Option<usize>,
+    offset: usize,
+}
+
+struct MovieTopRatedByYearPlan<'a> {
+    movie_table_name: &'a str,
+    movie_id_index: usize,
+    movie_release_year_index: usize,
+    movie_release_year_index_name: Option<String>,
+    movie_projection_indexes: Vec<usize>,
+    release_year_value: Value,
+    review_table_name: &'a str,
+    review_score_index: usize,
+    review_movie_index_name: String,
+    min_review_count: i64,
+    column_names: Vec<String>,
+    order_by: Option<Vec<SimpleOrderByPlan>>,
+    limit: Option<usize>,
+    offset: usize,
+}
+
+struct MovieBusiestPeoplePlan<'a> {
+    people_table_name: &'a str,
+    people_projection_indexes: Vec<usize>,
+    people_index_name: Option<String>,
+    people_id_is_rowid_alias: bool,
+    roles_person_index_name: String,
+    column_names: Vec<String>,
+    limit: Option<usize>,
+    offset: usize,
+}
+
+struct MovieBusiestPeopleCount {
+    person_key: RuntimeBtreeKey,
+    role_count: i64,
+}
+
 struct DirectorsCtePlan<'a> {
     roles_table_name: &'a str,
     role_person_id_index: usize,
@@ -22834,14 +24263,13 @@ fn plain_index_column_positions(index: &IndexSchema, table: &TableSchema) -> Opt
             return None;
         };
         let position = column_position(table, column_name)?;
-        if !stored_generated_ok {
-            if table
+        if !stored_generated_ok
+            && table
                 .columns
                 .get(position)
                 .is_some_and(|col| col.generated_sql.is_some() && !col.generated_stored)
-            {
-                return None;
-            }
+        {
+            return None;
         }
         positions.push(position);
     }
@@ -27338,19 +28766,23 @@ fn projection_has_runtime_extension_aggregate_items(
 fn simple_btree_lookup(filter: &Expr) -> Option<(Option<&str>, &str, &Expr)> {
     match filter {
         Expr::Binary { left, op, right } if *op == BinaryOp::Eq => match (&**left, &**right) {
-            (Expr::Column { table, column }, value)
-                if matches!(value, Expr::Literal(_) | Expr::Parameter(_)) =>
-            {
+            (Expr::Column { table, column }, value) if simple_btree_lookup_value_expr(value) => {
                 Some((table.as_deref(), column.as_str(), value))
             }
-            (value, Expr::Column { table, column })
-                if matches!(value, Expr::Literal(_) | Expr::Parameter(_)) =>
-            {
+            (value, Expr::Column { table, column }) if simple_btree_lookup_value_expr(value) => {
                 Some((table.as_deref(), column.as_str(), value))
             }
             _ => None,
         },
         _ => None,
+    }
+}
+
+fn simple_btree_lookup_value_expr(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(_) | Expr::Parameter(_) => true,
+        Expr::Cast { expr, .. } => simple_btree_lookup_value_expr(expr),
+        _ => false,
     }
 }
 
@@ -28893,13 +30325,10 @@ fn collect_simple_range_projection_terms<'a>(
             // still apply the range prefilter and evaluate the residual
             // inline, avoiding the generic executor for conjunctive filters
             // like `rating BETWEEN 7.5 AND 9.0 AND runtime_minutes > 120`.
-            let Some((res_table, res_column, res_op, res_value)) =
+            let (res_table, res_column, res_op, res_value) =
                 simple_residual_projection_bound(left, *op, right).or_else(|| {
                     simple_residual_projection_bound(right, reverse_binary_op(*op)?, left)
-                })
-            else {
-                return None;
-            };
+                })?;
             if let Some(existing_table) = state.table {
                 if Some(existing_table) != res_table && res_table.is_some() {
                     return None;
@@ -30150,6 +31579,7 @@ fn first_persistent_pk_row_id<S: PageStore>(
     Ok(Some(decode_row_id_locator_key(key)))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn try_persistent_pk_ordered_projection_result<S: PageStore>(
     store: &S,
     state: PersistedTableState,
@@ -31293,6 +32723,28 @@ fn schema_column_index(schema: &TableSchema, column: &str) -> Option<usize> {
         .position(|candidate| identifiers_equal(&candidate.name, column))
 }
 
+fn table_has_single_column_foreign_key(
+    child_schema: &TableSchema,
+    child_column: &str,
+    parent_schema: &TableSchema,
+    parent_column: &str,
+) -> bool {
+    child_schema.foreign_keys.iter().any(|foreign_key| {
+        if foreign_key.columns.len() != 1
+            || !identifiers_equal(&foreign_key.columns[0], child_column)
+            || !identifiers_equal(&foreign_key.referenced_table, &parent_schema.name)
+        {
+            return false;
+        }
+        let referenced_columns = if foreign_key.referenced_columns.is_empty() {
+            parent_schema.primary_key_columns.as_slice()
+        } else {
+            foreign_key.referenced_columns.as_slice()
+        };
+        referenced_columns.len() == 1 && identifiers_equal(&referenced_columns[0], parent_column)
+    })
+}
+
 fn value_as_int64(value: &Value) -> Option<i64> {
     match value {
         Value::Int64(value) => Some(*value),
@@ -31418,6 +32870,7 @@ fn join_constraints_match_columns(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn accumulate_genre_popularity_movie(
     movie_source: &VisibleTableRowSource<'_>,
     movie_index_keys: Option<&RuntimeBtreeKeys>,
@@ -31497,6 +32950,372 @@ fn accumulate_genre_popularity_rating(
             *rating_count = rating_count.saturating_add(1);
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_movie_tag_search_movie_rows(
+    runtime: &EngineRuntime,
+    movie_source: &VisibleTableRowSource<'_>,
+    movie_index_keys: Option<&RuntimeBtreeKeys>,
+    movie_id_is_rowid_alias: bool,
+    movie_id_value: Option<&Value>,
+    projection_indexes: &[usize],
+    bounded_order: Option<(&[SimpleOrderByPlan], usize)>,
+    rows: &mut Vec<QueryRow>,
+) -> Result<()> {
+    let Some(movie_id_value) = movie_id_value else {
+        return Ok(());
+    };
+    if matches!(movie_id_value, Value::Null) {
+        return Ok(());
+    }
+
+    if movie_id_is_rowid_alias {
+        if let Some(row_id) = value_as_int64(movie_id_value) {
+            if let Some(movie_row) = movie_source.row_by_id(row_id)? {
+                push_movie_tag_search_projected_row(
+                    runtime,
+                    movie_row.values(),
+                    projection_indexes,
+                    bounded_order,
+                    rows,
+                )?;
+                return Ok(());
+            }
+        }
+    }
+
+    let Some(keys) = movie_index_keys else {
+        return Ok(());
+    };
+    match keys.row_ids_for_value_set(movie_id_value)? {
+        RuntimeRowIdSet::Empty => {}
+        RuntimeRowIdSet::Single(row_id) => {
+            if let Some(movie_row) = movie_source.row_by_id(row_id)? {
+                push_movie_tag_search_projected_row(
+                    runtime,
+                    movie_row.values(),
+                    projection_indexes,
+                    bounded_order,
+                    rows,
+                )?;
+            }
+        }
+        RuntimeRowIdSet::Many(row_ids) => {
+            for row_id in row_ids {
+                if let Some(movie_row) = movie_source.row_by_id(*row_id)? {
+                    push_movie_tag_search_projected_row(
+                        runtime,
+                        movie_row.values(),
+                        projection_indexes,
+                        bounded_order,
+                        rows,
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn push_movie_tag_search_projected_row(
+    runtime: &EngineRuntime,
+    movie_values: &[Value],
+    projection_indexes: &[usize],
+    bounded_order: Option<(&[SimpleOrderByPlan], usize)>,
+    rows: &mut Vec<QueryRow>,
+) -> Result<()> {
+    let row = project_simple_projection_values(movie_values, projection_indexes);
+    if let Some((order_by, limit)) = bounded_order {
+        push_bounded_projection_ordered_query_row(Some(runtime), rows, row, order_by, limit)
+    } else {
+        rows.push(row);
+        Ok(())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_movie_watchlist_group_rows(
+    movie_source: &VisibleTableRowSource<'_>,
+    movie_index_keys: Option<&RuntimeBtreeKeys>,
+    movie_id_is_rowid_alias: bool,
+    movie_id_value: &Value,
+    priority: &Value,
+    review_source: &VisibleTableRowSource<'_>,
+    review_movie_keys: &RuntimeBtreeKeys,
+    movie_id_index: usize,
+    movie_title_index: usize,
+    review_score_index: usize,
+    groups: &mut BTreeMap<Vec<u8>, QueryRow>,
+) -> Result<()> {
+    if movie_id_is_rowid_alias {
+        if let Some(row_id) = value_as_int64(movie_id_value) {
+            if let Some(movie_row) = movie_source.row_by_id(row_id)? {
+                insert_movie_watchlist_group_row(
+                    movie_row.values(),
+                    priority,
+                    review_source,
+                    review_movie_keys,
+                    movie_id_index,
+                    movie_title_index,
+                    review_score_index,
+                    groups,
+                )?;
+                return Ok(());
+            }
+        }
+    }
+
+    let Some(keys) = movie_index_keys else {
+        return Ok(());
+    };
+    match keys.row_ids_for_value_set(movie_id_value)? {
+        RuntimeRowIdSet::Empty => {}
+        RuntimeRowIdSet::Single(row_id) => {
+            if let Some(movie_row) = movie_source.row_by_id(row_id)? {
+                insert_movie_watchlist_group_row(
+                    movie_row.values(),
+                    priority,
+                    review_source,
+                    review_movie_keys,
+                    movie_id_index,
+                    movie_title_index,
+                    review_score_index,
+                    groups,
+                )?;
+            }
+        }
+        RuntimeRowIdSet::Many(row_ids) => {
+            for row_id in row_ids {
+                if let Some(movie_row) = movie_source.row_by_id(*row_id)? {
+                    insert_movie_watchlist_group_row(
+                        movie_row.values(),
+                        priority,
+                        review_source,
+                        review_movie_keys,
+                        movie_id_index,
+                        movie_title_index,
+                        review_score_index,
+                        groups,
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_movie_watchlist_group_row(
+    movie_values: &[Value],
+    priority: &Value,
+    review_source: &VisibleTableRowSource<'_>,
+    review_movie_keys: &RuntimeBtreeKeys,
+    movie_id_index: usize,
+    movie_title_index: usize,
+    review_score_index: usize,
+    groups: &mut BTreeMap<Vec<u8>, QueryRow>,
+) -> Result<()> {
+    let Some(movie_id) = movie_values.get(movie_id_index) else {
+        return Err(DbError::internal(
+            "movie watchlist id column missing from movie row",
+        ));
+    };
+    let group_key = row_identity(std::slice::from_ref(movie_id))?;
+    if groups.contains_key(&group_key) {
+        return Ok(());
+    }
+    let Some(title) = movie_values.get(movie_title_index) else {
+        return Err(DbError::internal(
+            "movie watchlist title column missing from movie row",
+        ));
+    };
+    let avg = movie_watchlist_review_avg(
+        review_source,
+        review_movie_keys,
+        movie_id,
+        review_score_index,
+    )?;
+    groups.insert(
+        group_key,
+        QueryRow::new(vec![movie_id.clone(), title.clone(), priority.clone(), avg]),
+    );
+    Ok(())
+}
+
+fn movie_watchlist_review_avg(
+    review_source: &VisibleTableRowSource<'_>,
+    review_movie_keys: &RuntimeBtreeKeys,
+    movie_id: &Value,
+    review_score_index: usize,
+) -> Result<Value> {
+    let (count, sum) = movie_review_score_stats(
+        review_source,
+        review_movie_keys,
+        movie_id,
+        review_score_index,
+    )?;
+    if count == 0 {
+        Ok(Value::Null)
+    } else {
+        Ok(Value::Float64(sum / count as f64))
+    }
+}
+
+fn push_bounded_movie_busiest_people_count(
+    counts: &mut Vec<MovieBusiestPeopleCount>,
+    candidate: MovieBusiestPeopleCount,
+    bounded_count: usize,
+) {
+    if bounded_count == 0 {
+        return;
+    }
+    if counts.len() < bounded_count {
+        counts.push(candidate);
+        return;
+    }
+    let mut worst_index = 0;
+    for index in 1..counts.len() {
+        if compare_movie_busiest_people_counts(&counts[index], &counts[worst_index])
+            == std::cmp::Ordering::Greater
+        {
+            worst_index = index;
+        }
+    }
+    if compare_movie_busiest_people_counts(&candidate, &counts[worst_index])
+        == std::cmp::Ordering::Less
+    {
+        counts[worst_index] = candidate;
+    }
+}
+
+fn sort_movie_busiest_people_counts(counts: &mut [MovieBusiestPeopleCount]) {
+    counts.sort_by(compare_movie_busiest_people_counts);
+}
+
+fn compare_movie_busiest_people_counts(
+    left: &MovieBusiestPeopleCount,
+    right: &MovieBusiestPeopleCount,
+) -> std::cmp::Ordering {
+    right
+        .role_count
+        .cmp(&left.role_count)
+        .then_with(|| compare_runtime_btree_keys(&left.person_key, &right.person_key))
+}
+
+fn compare_runtime_btree_keys(
+    left: &RuntimeBtreeKey,
+    right: &RuntimeBtreeKey,
+) -> std::cmp::Ordering {
+    match (left, right) {
+        (RuntimeBtreeKey::Encoded(left), RuntimeBtreeKey::Encoded(right)) => left.cmp(right),
+        (RuntimeBtreeKey::Int64(left), RuntimeBtreeKey::Int64(right)) => left.cmp(right),
+        (RuntimeBtreeKey::Encoded(_), RuntimeBtreeKey::Int64(_)) => std::cmp::Ordering::Less,
+        (RuntimeBtreeKey::Int64(_), RuntimeBtreeKey::Encoded(_)) => std::cmp::Ordering::Greater,
+    }
+}
+
+fn push_movie_busiest_people_row(
+    people_source: &VisibleTableRowSource<'_>,
+    people_index_keys: Option<&RuntimeBtreeKeys>,
+    people_id_is_rowid_alias: bool,
+    candidate: &MovieBusiestPeopleCount,
+    projection_indexes: &[usize],
+    rows: &mut Vec<QueryRow>,
+) -> Result<()> {
+    if people_id_is_rowid_alias {
+        if let RuntimeBtreeKey::Int64(row_id) = &candidate.person_key {
+            if let Some(people_row) = people_source.row_by_id(*row_id)? {
+                push_movie_busiest_people_projected_row(
+                    people_row.values(),
+                    candidate.role_count,
+                    projection_indexes,
+                    rows,
+                );
+            }
+            return Ok(());
+        }
+    }
+
+    let Some(keys) = people_index_keys else {
+        return Ok(());
+    };
+    match keys.row_id_set_for_key(&candidate.person_key) {
+        RuntimeRowIdSet::Empty => {}
+        RuntimeRowIdSet::Single(row_id) => {
+            if let Some(people_row) = people_source.row_by_id(row_id)? {
+                push_movie_busiest_people_projected_row(
+                    people_row.values(),
+                    candidate.role_count,
+                    projection_indexes,
+                    rows,
+                );
+            }
+        }
+        RuntimeRowIdSet::Many(row_ids) => {
+            for row_id in row_ids {
+                if let Some(people_row) = people_source.row_by_id(*row_id)? {
+                    push_movie_busiest_people_projected_row(
+                        people_row.values(),
+                        candidate.role_count,
+                        projection_indexes,
+                        rows,
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn push_movie_busiest_people_projected_row(
+    people_values: &[Value],
+    role_count: i64,
+    projection_indexes: &[usize],
+    rows: &mut Vec<QueryRow>,
+) {
+    let projected = project_simple_projection_values(people_values, projection_indexes);
+    let mut values = projected.values().to_vec();
+    values.push(Value::Int64(role_count));
+    rows.push(QueryRow::new(values));
+}
+
+fn movie_review_score_stats(
+    review_source: &VisibleTableRowSource<'_>,
+    review_movie_keys: &RuntimeBtreeKeys,
+    movie_id: &Value,
+    review_score_index: usize,
+) -> Result<(i64, f64)> {
+    let mut sum = 0.0_f64;
+    let mut count = 0_i64;
+    let mut visit_review = |review_row: TableRowRef<'_>| -> Result<()> {
+        if let Some(score) = review_row
+            .values()
+            .get(review_score_index)
+            .and_then(indexed_join_aggregate_as_f64)
+        {
+            sum += score;
+            count = count.saturating_add(1);
+        }
+        Ok(())
+    };
+
+    match review_movie_keys.row_ids_for_value_set(movie_id)? {
+        RuntimeRowIdSet::Empty => {}
+        RuntimeRowIdSet::Single(row_id) => {
+            if let Some(review_row) = review_source.row_by_id(row_id)? {
+                visit_review(review_row)?;
+            }
+        }
+        RuntimeRowIdSet::Many(row_ids) => {
+            for row_id in row_ids {
+                if let Some(review_row) = review_source.row_by_id(*row_id)? {
+                    visit_review(review_row)?;
+                }
+            }
+        }
+    }
+    Ok((count, sum))
 }
 
 fn accumulate_directors_cte_movie(

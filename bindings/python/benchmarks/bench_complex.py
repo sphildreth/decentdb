@@ -1794,7 +1794,7 @@ def run_movie_benchmark(
         JOIN MovieTags mt ON mt.MovieId = m.Id
         JOIN Tags t ON t.Id = mt.TagId
         WHERE t.Name = ?
-        ORDER BY m.ReleaseYear DESC
+        ORDER BY m.ReleaseYear DESC, m.Id ASC
         LIMIT ?
     """
     tag_params = (sample_tag, 50)
@@ -3068,7 +3068,7 @@ def run_showdown_benchmark(
         (
             "Showdown index range/order/limit",
             "showdown_index_range_order_s",
-            f"SELECT id, title, rating, released FROM movies WHERE released >= {date_2010} ORDER BY rating DESC LIMIT 50",
+            f"SELECT id, title, rating, released FROM movies WHERE released >= {date_2010} ORDER BY rating DESC, id ASC LIMIT 50",
             (),
             None,
         ),

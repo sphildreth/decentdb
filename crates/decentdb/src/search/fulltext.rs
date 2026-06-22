@@ -144,9 +144,9 @@ impl FullTextIndex {
         // per document via `positive_scoring_terms`.
         let scoring_terms: Vec<(String, usize)> = positive_scoring_terms(self, &query)
             .into_iter()
-            .filter_map(|term| {
+            .map(|term| {
                 let doc_freq = self.postings.get(&term).map_or(0_usize, BTreeMap::len);
-                Some((term, doc_freq))
+                (term, doc_freq)
             })
             .collect();
         let scoring_context = Bm25Context {
@@ -577,7 +577,7 @@ mod runtime_tests {
         // Sanity: each returned hit has a positive score (the terms appear).
         assert!(hits.iter().all(|hit| hit.score > 0.0));
         // Touch `hits` ordering is already asserted; keep the binding used.
-        hits.sort_by(|a, b| a.row_id.cmp(&b.row_id));
+        hits.sort_by_key(|hit| hit.row_id);
     }
 
     #[test]
