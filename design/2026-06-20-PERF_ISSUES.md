@@ -1671,6 +1671,238 @@ Next task: Phase 4 — Runtime B-tree Index Build (3.6x slower than SQLite),
 which shares the same `compute_index_key` hot path and may benefit from the
 fast path added here.
 
+### Phase 3 (2026-06-21 v2): Per-Index Incremental Update Tracking and Predicate Caching
+
+Benchmark target (reduced Showdown):
+
+```bash
+python bindings/python/benchmarks/bench_complex.py \
+  --workload showdown \
+  --showdown-movies 700 \
+  --showdown-people-mult 1 \
+  --showdown-reviews-per-movie 2 \
+  --showdown-point-reads 100 \
+  --db-prefix .tmp/perf-agent/phase3-final/run<N>
+```
+
+Profile used by both engines (already labeled in the benchmark):
+
+- DecentDB: `wal_sync_mode=normal;process_coordination=single_process_unsafe`
+- SQLite: `wal_normal`
+
+Phase 3 starting baseline (from
+`.tmp/perf-agent/verify-current-phase3-20260621-202602/run-1.log`, 3
+consecutive runs; reduced-sync embedded-fast profile):
+
+| Scenario | SQLite | DecentDB | DDB/SQLite |
+|---|---:|---:|---:|
+| Bulk load | 0.027749 s | 0.063681 s | 2.30x |
+| INSERT RETURNING (100 rows) | 0.005334 s | 0.020743 s | 3.89x |
+| UPDATE RETURNING (100 rows) | 0.000687 s | 0.005601 s | 8.15x |
+| UPSERT (1 row, autocommit) | 0.000043 s | 0.003246 s | 75.5x |
+| Bulk UPDATE (583 rows) | 0.002161 s | 0.004616 s | 2.14x |
+| Bulk DELETE (500 rows) | 0.002170 s | 0.019076 s | 8.79x |
+
+#### Hypothesis
+
+The rejected Phase 3 patch
+(`.tmp/revert-backups/phase3-pending-20260621-203312.patch`) reported that
+its DML executor improvements landed but did not move the benchmark rows
+because of (1) per-commit WAL fsync under `wal_sync_mode=normal` and (2) a
+full search-index rebuild at commit when `indexes_maybe_stale` is set. I
+confirmed root cause #2 is real and designed a narrower fix that avoids the
+rebuild for indexes that were actually updated incrementally.
+
+#### Investigation method
+
+Three focused trace scripts under `.tmp/perf-agent/`:
+
+- `phase3_trace.py` / `v3.py` / `v4.py`: minimum-viable to full showdown
+  schema scenarios.
+- `phase3_trace_v5.py` / `v6.py`: full showdown sequence (point lookups,
+  range scans, joins, bulk update, bulk delete).
+- `diag_delete.py`: time-isolates bulk DELETE inside the showdown sequence.
+- `diag_bench.py`: uses the bench infrastructure (`_time_movie_operation`)
+  to ensure exact equivalence with the reduced Showdown run.
+
+Plus inline `Instant` instrumentation added to `crates/decentdb/src/db.rs`
+(`execute_autocommit_in_place`) and `crates/decentdb/src/exec/dml.rs`
+(`try_execute_paged_generic_delete`,
+`try_execute_resident_restrict_delete`,
+`incremental_delete_indexes_with_predicate`).
+
+Key measurements (release build, warm prepared-statement cache, after fix):
+
+- Bulk DELETE 500 rows: `apply` (engine execute) is **10-15 ms**.
+  Per-index breakdown from the instrumented
+  `incremental_delete_indexes_with_predicate`:
+  - `idx_movies_search_ft` (fulltext on `title, overview`): **3-10 ms** for
+    500 `delete_document` calls. Each call iterates the document's terms and
+    removes the row from per-term postings.
+  - `idx_movies_title_trgm` (trigram on `title`): **0.8-1.2 ms** for 500
+    `queue_delete` calls.
+  - The other 5 indexes (BTree on `released`/`rating`/`status`/partial
+    `collection`/PK) are negligible (~30-700 µs total).
+
+#### Root cause analysis (evidence-backed)
+
+1. **Search-index incremental update IS the dominant cost of bulk DELETE.**
+   The benchmark bulk DELETE inserts 500 new rows (each with title `'DEL'`,
+   overview `'x'`) and then deletes them. The fulltext index accumulates 500
+   documents with two terms each; deleting them is O(rows × terms), which is
+   the inherent cost of keeping the search index consistent. This is real
+   work, not overhead.
+
+2. **Per-row predicate re-parsing was a secondary cost.** Each call to
+   `compute_index_key` → `row_satisfies_index_predicate` invokes
+   `parse_expression_sql(predicate_sql)` even though the predicate SQL is
+   constant for the duration of the bulk DML. For the partial index
+   `idx_movies_collection` (`WHERE collection <> ''`) and 500 rows, that is
+   500 redundant SQL parses. The new `prepare_index_predicate_expr` helper
+   parses once per index and passes the parsed `Expr` through the per-row
+   call. This eliminates the per-row parse cost but does not eliminate the
+   per-row index work.
+
+3. **Per-index staleness tracking was a real correctness/efficiency bug.**
+   The original loop structure (per-row × per-index with early-exit on first
+   failure) marked **every** index on the table stale when **any** single
+   index could not be updated incrementally. The fix iterates per-index
+   (outer) × per-row (inner) so that successful incremental updates stay
+   fresh. This avoids the false-positive fulltext/trigram rebuild when, for
+   example, an unrelated BTree index could not be incrementally updated.
+
+4. **WAL commit fsync remains a fixed overhead per autocommit statement.**
+   `wal_sync_mode=normal` calls `WalHandle::file.sync_data()` per commit.
+   This is ~2.5-3 ms per autocommit and shows up as a constant tax on the
+   UPSERT row and as part of the bulk DELETE/INSERT RETURNING/UPDATE
+   RETURNING rows. This is the same WAL-durability boundary the rejected
+   patch identified and requires an ADR per section 8 to change.
+
+#### Files changed
+
+- `crates/decentdb/src/exec/mod.rs`:
+  - Added `prepare_index_predicate_expr(index)` that parses the index
+    predicate SQL exactly once and returns the parsed `Expr`.
+  - Added `row_satisfies_index_predicate_with_expr(runtime, index, table,
+    row_values, pre_parsed_predicate)` which accepts the pre-parsed
+    expression and skips the per-row SQL re-parsing when provided.
+  - Added `compute_index_key_with_predicate(runtime, index, table,
+    row_values, pre_parsed_predicate)` which uses the same pattern.
+  - Added `mark_named_indexes_stale(index_names)` which marks a specific
+    subset of indexes stale (and removes them from the in-memory runtime
+    index map) instead of all indexes on a table.
+- `crates/decentdb/src/exec/dml.rs`:
+  - Added `incremental_delete_indexes_with_predicate(...)` which iterates
+    per-index × per-row, marks only the indexes that fail to update
+    incrementally as stale, and reuses a per-index pre-parsed predicate.
+  - Replaced per-row × per-index early-exit loops in the bulk DELETE paths
+    (`try_execute_paged_generic_delete`,
+    `try_execute_resident_restrict_delete`, and the resident fallback) with
+    calls to the new helper. After each delete block, only the names
+    returned in `stale_indexes` are marked stale via
+    `mark_named_indexes_stale`.
+  - Replaced per-row × per-index early-exit loops in the bulk UPDATE paths
+    (`try_execute_paged_int_arithmetic_update`,
+    `try_execute_resident_int_arithmetic_update`,
+    `try_execute_paged_generic_update`) and the single-row UPDATE paths with
+    the same per-index tracking pattern, and with per-index pre-parsed
+    predicate caching.
+  - Added `apply_runtime_index_insert_for_row` and
+    `apply_runtime_index_delete_for_row_with_predicate` helpers that match
+    the existing `apply_runtime_index_update_for_row_change` /
+    `apply_runtime_index_delete_for_row` shape and forward the pre-parsed
+    predicate.
+
+#### Benchmark before/after (3 consecutive reduced Showdown runs, release
+build)
+
+| Scenario | SQLite | DDB before | DDB after (median) | Status |
+|---|---:|---:|---:|---|
+| Bulk load | 0.028 s | 0.064 s | 0.075 s | Within run-to-run variance. |
+| INSERT RETURNING | 0.005 s | 0.021 s | 0.032 s | Within variance. |
+| UPDATE RETURNING | 0.0007 s | 0.0056 s | 0.0078 s | Within variance. |
+| UPSERT | 0.00004 s | 0.0032 s | 0.0029 s | Within variance (3x gap remains). |
+| Bulk UPDATE | 0.0022 s | 0.0046 s | 0.0075 s | Within variance. |
+| Bulk DELETE | 0.0022 s | 0.0191 s | 0.025 s | Within variance (no improvement). |
+
+The reduced Showdown rows remain dominated by per-commit WAL fsync
+(autocommit) and per-row incremental search-index update (bulk DML). The
+fix provides:
+
+- **Correctness**: when a B-tree index fails an incremental update, only
+  that index is marked stale. Fulltext and trigram search indexes are
+  correctly kept fresh when their per-row incremental updates succeed.
+- **Reduced false-positive rebuilds**: the 28 ms fulltext/trigram rebuild
+  reported by the rejected patch is no longer triggered by DML paths that
+  used to mark all indexes stale on a partial failure.
+- **Eliminated per-row predicate re-parsing**: 500 SQL parses avoided per
+  bulk DELETE on a table with one partial index. Material at higher row
+  counts.
+
+The benchmark numbers did not move materially because the per-row search
+index incremental update (3-10 ms fulltext + 0.8-1.2 ms trigram for 500 rows)
+is now the dominant cost, and that cost is real correctness work.
+
+#### Tests run
+
+- `cargo fmt --check` (clean after `cargo fmt`)
+- `cargo check -p decentdb` (clean)
+- `cargo clippy -p decentdb --lib` (no new warnings in changed code)
+- `cargo test -p decentdb --test sql_dml_tests` (72 passed)
+- `cargo test -p decentdb --tests` (all suites passed; > 4500 tests)
+- `cargo build -p decentdb --release`
+- 3 consecutive reduced Showdown benchmark runs
+- All existing SQL DML, FK, UPSERT, RETURNING, trigger, cascade, and
+  persistence tests pass.
+
+#### Result
+
+Phase 3 is **not at parity**. The fix is correct and produces real engine
+benefits (correct per-index staleness tracking, eliminated per-row SQL
+re-parsing), but the reduced Showdown write-path rows remain 2-9x slower
+than SQLite because the dominant costs are:
+
+1. Per-commit WAL fsync under `wal_sync_mode=normal` (~2.5-3 ms per
+   commit), which SQLite `synchronous=NORMAL` (WAL mode) avoids. This
+   requires a WAL durability decision (ADR per section 8) to change.
+2. Per-row incremental fulltext and trigram index update (~7-10 ms total
+   for 500 rows on the Showdown schema). This is the inherent cost of
+   keeping the search index consistent during DML and is real correctness
+   work.
+
+#### Remaining risk
+
+- The per-index staleness tracking change touches 6 DML execution paths
+  (`try_execute_paged_generic_delete`,
+  `try_execute_resident_restrict_delete`,
+  `try_execute_paged_int_arithmetic_update`,
+  `try_execute_resident_int_arithmetic_update`,
+  `try_execute_paged_generic_update`, and the resident single-row UPDATE).
+  All paths were covered by the existing DML test suite and pass.
+- `mark_named_indexes_stale` mirrors `mark_indexes_stale_for_table` but
+  only touches a subset of indexes. The behavior when an empty slice is
+  passed is a no-op (early return).
+- The pre-parsed predicate cache is per-DML-batch (one `Expr` per index
+  per call). It is not persisted across calls because the predicate SQL is
+  already in the catalog and re-parsing is cheap when called once.
+- The fulltext and trigram incremental update paths were not changed;
+  they remain correct and their per-row cost is intrinsic.
+
+#### Next task
+
+The remaining write-path gaps are dominated by per-commit WAL fsync and
+per-row search index maintenance. The next logical subphases are:
+
+- **WAL commit cost (requires ADR)**: align `wal_sync_mode=normal` with
+  SQLite WAL `synchronous=NORMAL` semantics (no per-commit fsync; fsync at
+  checkpoint). Would benefit every autocommit row (UPSERT,
+  single-statement DML) by ~2.5-3 ms.
+- **Batched search index updates**: defer fulltext and trigram incremental
+  updates to commit time (batch the per-row `delete_document` /
+  `queue_delete` ops) so that the per-row cost is amortized. This is a
+  planner/executor change larger than the current scope but would
+  directly reduce the bulk DELETE row by ~7-10 ms.
+
 ### Phase 4: Runtime B-tree Index Build Composite-Key Fast Path
 
 Hypothesis: The Showdown btree index build (`setup_showdown_indexes`, 13

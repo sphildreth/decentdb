@@ -4222,25 +4222,41 @@ impl EngineRuntime {
             .filter(|index| identifiers_equal(&index.table_name, &table_name))
             .map(|index| index.name.clone())
             .collect::<Vec<_>>();
+        self.mark_named_indexes_stale(&index_names);
+    }
+
+    /// Mark only the named indexes (and their catalog entries) as stale,
+    /// discarding any in-memory runtime index for them. Used when a DML
+    /// successfully incrementally updates some indexes on a table but fails to
+    /// incrementally update others — the successful ones stay fresh and the
+    /// failed ones are rebuilt on next access.
+    pub(super) fn mark_named_indexes_stale(&mut self, index_names: &[String]) {
         if index_names.is_empty() {
             return;
         }
-
         let mut changed = false;
-        for index in self.catalog_mut().indexes.values_mut() {
-            if identifiers_equal(&index.table_name, &table_name) && index.fresh {
-                index.fresh = false;
-                changed = true;
+        {
+            let catalog = self.catalog_mut();
+            for name in index_names {
+                if let Some(index) = catalog.indexes.get_mut(name) {
+                    if index.fresh {
+                        index.fresh = false;
+                        changed = true;
+                    }
+                }
             }
         }
         if changed {
             self.manifest_template = None;
         }
         let indexes = self.indexes_mut();
-        for index_name in index_names {
-            changed |= indexes.remove(&index_name).is_some();
+        let mut any_removed = false;
+        for name in index_names {
+            if indexes.remove(name).is_some() {
+                any_removed = true;
+            }
         }
-        if changed {
+        if changed || any_removed {
             self.index_state_epoch = self.index_state_epoch.wrapping_add(1);
         }
     }
@@ -21880,7 +21896,26 @@ pub(super) fn compute_index_key(
     table: &TableSchema,
     row_values: &[Value],
 ) -> Result<Option<RuntimeBtreeKey>> {
-    if !row_satisfies_index_predicate(runtime, index, table, row_values)? {
+    compute_index_key_with_predicate(runtime, index, table, row_values, None)
+}
+
+/// Like [`compute_index_key`], but optionally accepts a pre-parsed predicate
+/// expression. See [`prepare_index_predicate_expr`] and
+/// [`row_satisfies_index_predicate_with_expr`].
+pub(super) fn compute_index_key_with_predicate(
+    runtime: &EngineRuntime,
+    index: &IndexSchema,
+    table: &TableSchema,
+    row_values: &[Value],
+    pre_parsed_predicate: Option<&Expr>,
+) -> Result<Option<RuntimeBtreeKey>> {
+    if !row_satisfies_index_predicate_with_expr(
+        runtime,
+        index,
+        table,
+        row_values,
+        pre_parsed_predicate,
+    )? {
         return Ok(None);
     }
     if btree_uses_typed_int64_keys(index, table) {
@@ -22114,10 +22149,31 @@ pub(super) fn row_satisfies_index_predicate(
     table: &TableSchema,
     row_values: &[Value],
 ) -> Result<bool> {
+    row_satisfies_index_predicate_with_expr(runtime, index, table, row_values, None)
+}
+
+/// Like [`row_satisfies_index_predicate`], but accepts an optional pre-parsed
+/// predicate expression. When provided, the predicate SQL is not re-parsed for
+/// every row, which can dominate wall time for bulk DML on tables with partial
+/// or expression-indexed indexes.
+pub(super) fn row_satisfies_index_predicate_with_expr(
+    runtime: &EngineRuntime,
+    index: &IndexSchema,
+    table: &TableSchema,
+    row_values: &[Value],
+    pre_parsed_predicate: Option<&Expr>,
+) -> Result<bool> {
     let Some(predicate_sql) = &index.predicate_sql else {
         return Ok(true);
     };
-    let expr = crate::sql::parser::parse_expression_sql(predicate_sql)?;
+    let expr_owned;
+    let expr = match pre_parsed_predicate {
+        Some(expr) => expr,
+        None => {
+            expr_owned = crate::sql::parser::parse_expression_sql(predicate_sql)?;
+            &expr_owned
+        }
+    };
     let row_materialized = if generated_columns_are_stored(table) {
         Cow::Borrowed(row_values)
     } else {
@@ -22129,9 +22185,21 @@ pub(super) fn row_satisfies_index_predicate(
     let dataset = table_row_dataset(table, row_for_eval, &table.name);
     let bindings = dataset.rows.first().map(Vec::as_slice).unwrap_or(&[]);
     Ok(matches!(
-        runtime.eval_expr(&expr, &dataset, bindings, &[], &BTreeMap::new(), None)?,
+        runtime.eval_expr(expr, &dataset, bindings, &[], &BTreeMap::new(), None)?,
         Value::Bool(true)
     ))
+}
+
+/// Pre-parse an index's predicate expression once. Returns `Ok(None)` if the
+/// index has no predicate. The returned `Expr` can be reused across many rows
+/// to avoid re-parsing the predicate SQL on every per-row index update.
+pub(super) fn prepare_index_predicate_expr(index: &IndexSchema) -> Result<Option<Expr>> {
+    let Some(predicate_sql) = &index.predicate_sql else {
+        return Ok(None);
+    };
+    Ok(Some(crate::sql::parser::parse_expression_sql(
+        predicate_sql,
+    )?))
 }
 
 pub(crate) fn row_satisfies_expression(

@@ -2055,7 +2055,7 @@ impl EngineRuntime {
         let mut changed_rows = 0_u64;
         let mut returning_rows = Vec::new();
         let mut row_changes = BTreeMap::new();
-        let mut indexes_remain_fresh = table_indexes.iter().all(|index| index.fresh);
+        let mut stale_indexes: Vec<String> = Vec::new();
 
         for &row_id in matching_row_ids {
             let current_row = manifest
@@ -2109,19 +2109,23 @@ impl EngineRuntime {
                     page_size,
                 )?;
             }
-            if indexes_remain_fresh {
-                for index in indexes_to_update {
-                    if !apply_runtime_index_update_for_row_change(
-                        self,
-                        table,
-                        index,
-                        row_id,
-                        &current_row.values,
-                        &next_values,
-                    )? {
-                        indexes_remain_fresh = false;
-                        break;
+            for index in indexes_to_update {
+                if !index.fresh {
+                    if !stale_indexes.contains(&index.name) {
+                        stale_indexes.push(index.name.clone());
                     }
+                    continue;
+                }
+                if !apply_runtime_index_update_for_row_change(
+                    self,
+                    table,
+                    index,
+                    row_id,
+                    &current_row.values,
+                    &next_values,
+                )? && !stale_indexes.contains(&index.name)
+                {
+                    stale_indexes.push(index.name.clone());
                 }
             }
             if !statement.returning.is_empty() {
@@ -2148,8 +2152,8 @@ impl EngineRuntime {
                     self.mark_table_row_dirty(&table.name, 0, *row_id, values);
                 }
             }
-            if !indexes_remain_fresh {
-                self.mark_indexes_stale_for_table(&table.name);
+            if !stale_indexes.is_empty() {
+                self.mark_named_indexes_stale(&stale_indexes);
             }
         }
 
@@ -2180,6 +2184,7 @@ impl EngineRuntime {
         params: &[Value],
         page_size: u32,
     ) -> Result<Option<QueryResult>> {
+        let t0 = std::time::Instant::now();
         let Some(TableRowSource::Paged(manifest)) = self.table_row_source(&table.name).cloned()
         else {
             return Ok(None);
@@ -2209,26 +2214,7 @@ impl EngineRuntime {
             }
         }
 
-        let mut indexes_remain_fresh = table_indexes.iter().all(|index| index.fresh);
-        if indexes_remain_fresh {
-            for row in &matching_rows {
-                for index in table_indexes {
-                    if !apply_runtime_index_delete_for_row(
-                        self,
-                        table,
-                        index,
-                        row.row_id,
-                        &row.values,
-                    )? {
-                        indexes_remain_fresh = false;
-                        break;
-                    }
-                }
-                if !indexes_remain_fresh {
-                    break;
-                }
-            }
-        }
+        let stale_indexes = incremental_delete_indexes(self, table, table_indexes, &matching_rows)?;
         if has_referencing_tables && !delete_children.is_empty() {
             self.apply_parent_delete_actions_rows(
                 &table.name,
@@ -2265,8 +2251,8 @@ impl EngineRuntime {
                 self.mark_table_row_deleted(&table.name, row.row_id);
                 self.record_sync_delete_for_row(table, &row.values);
             }
-            if !indexes_remain_fresh {
-                self.mark_indexes_stale_for_table(&table.name);
+            if !stale_indexes.is_empty() {
+                self.mark_named_indexes_stale(&stale_indexes);
             }
         }
 
@@ -2344,28 +2330,9 @@ impl EngineRuntime {
             }
         }
 
-        let mut indexes_remain_fresh = table_indexes.iter().all(|index| index.fresh);
-        if indexes_remain_fresh {
-            for row in &removed_rows {
-                for index in table_indexes {
-                    if !apply_runtime_index_delete_for_row(
-                        self,
-                        table,
-                        index,
-                        row.row_id,
-                        &row.values,
-                    )? {
-                        indexes_remain_fresh = false;
-                        break;
-                    }
-                }
-                if !indexes_remain_fresh {
-                    break;
-                }
-            }
-        }
-        if !indexes_remain_fresh {
-            self.mark_indexes_stale_for_table(table_name);
+        let stale_indexes = incremental_delete_indexes(self, table, table_indexes, &removed_rows)?;
+        if !stale_indexes.is_empty() {
+            self.mark_named_indexes_stale(&stale_indexes);
         }
         for row in &removed_rows {
             self.mark_table_row_deleted(table_name, row.row_id);
@@ -2402,7 +2369,7 @@ impl EngineRuntime {
         let mut affected_rows = 0_u64;
         let mut changed_rows = 0_u64;
         let mut row_changes = BTreeMap::new();
-        let mut indexes_remain_fresh = table_indexes.iter().all(|index| index.fresh);
+        let mut stale_indexes: Vec<String> = Vec::new();
 
         for &row_id in matching_row_ids {
             let current_row = manifest
@@ -2442,19 +2409,23 @@ impl EngineRuntime {
                 &next_values,
                 &table.name,
             )?;
-            if indexes_remain_fresh {
-                for index in indexes_to_update {
-                    if !apply_runtime_index_update_for_row_change(
-                        self,
-                        table,
-                        index,
-                        row_id,
-                        &current_row.values,
-                        &next_values,
-                    )? {
-                        indexes_remain_fresh = false;
-                        break;
+            for index in indexes_to_update {
+                if !index.fresh {
+                    if !stale_indexes.contains(&index.name) {
+                        stale_indexes.push(index.name.clone());
                     }
+                    continue;
+                }
+                if !apply_runtime_index_update_for_row_change(
+                    self,
+                    table,
+                    index,
+                    row_id,
+                    &current_row.values,
+                    &next_values,
+                )? && !stale_indexes.contains(&index.name)
+                {
+                    stale_indexes.push(index.name.clone());
                 }
             }
 
@@ -2476,8 +2447,8 @@ impl EngineRuntime {
                     self.mark_table_row_dirty(&table.name, 0, *row_id, values);
                 }
             }
-            if !indexes_remain_fresh {
-                self.mark_indexes_stale_for_table(&table.name);
+            if !stale_indexes.is_empty() {
+                self.mark_named_indexes_stale(&stale_indexes);
             }
         }
 
@@ -2508,7 +2479,7 @@ impl EngineRuntime {
         let resolved_delta = resolve_prepared_simple_value(&prepared_update.delta_source, params)?;
         let mut affected_rows = 0_u64;
         let mut changed_rows = 0_u64;
-        let mut indexes_remain_fresh = table_indexes.iter().all(|index| index.fresh);
+        let mut stale_indexes: Vec<String> = Vec::new();
 
         for &row_id in matching_row_ids {
             let (row_index, current_value, old_values) = {
@@ -2565,19 +2536,23 @@ impl EngineRuntime {
                     &next_values,
                     &table.name,
                 )?;
-                if indexes_remain_fresh {
-                    for index in indexes_to_update {
-                        if !apply_runtime_index_update_for_row_change(
-                            self,
-                            table,
-                            index,
-                            row_id,
-                            old_values,
-                            &next_values,
-                        )? {
-                            indexes_remain_fresh = false;
-                            break;
+                for index in indexes_to_update {
+                    if !index.fresh {
+                        if !stale_indexes.contains(&index.name) {
+                            stale_indexes.push(index.name.clone());
                         }
+                        continue;
+                    }
+                    if !apply_runtime_index_update_for_row_change(
+                        self,
+                        table,
+                        index,
+                        row_id,
+                        old_values,
+                        &next_values,
+                    )? && !stale_indexes.contains(&index.name)
+                    {
+                        stale_indexes.push(index.name.clone());
                     }
                 }
 
@@ -2627,8 +2602,8 @@ impl EngineRuntime {
             affected_rows += 1;
         }
 
-        if changed_rows > 0 && !indexes_remain_fresh {
-            self.mark_indexes_stale_for_table(&table.name);
+        if changed_rows > 0 && !stale_indexes.is_empty() {
+            self.mark_named_indexes_stale(&stale_indexes);
         }
 
         self.execute_after_triggers(
@@ -2684,7 +2659,7 @@ impl EngineRuntime {
             .filter(|index| identifiers_equal(&index.table_name, &table.name))
             .cloned()
             .collect::<Vec<_>>();
-        let mut indexes_remain_fresh = table_indexes.iter().all(|index| index.fresh);
+        let mut stale_indexes: Vec<String> = Vec::new();
         let assignment_columns = statement
             .assignments
             .iter()
@@ -2915,8 +2890,14 @@ impl EngineRuntime {
                     &table_name,
                 )?;
 
-                if current_row.values != next_values && indexes_remain_fresh {
+                if current_row.values != next_values {
                     for index in &indexes_to_update {
+                        if !index.fresh {
+                            if !stale_indexes.contains(&index.name) {
+                                stale_indexes.push(index.name.clone());
+                            }
+                            continue;
+                        }
                         if !apply_runtime_index_update_for_row_change(
                             self,
                             &table,
@@ -2924,9 +2905,9 @@ impl EngineRuntime {
                             single_row_id,
                             &current_row.values,
                             &next_values,
-                        )? {
-                            indexes_remain_fresh = false;
-                            break;
+                        )? && !stale_indexes.contains(&index.name)
+                        {
+                            stale_indexes.push(index.name.clone());
                         }
                     }
                 }
@@ -2955,11 +2936,12 @@ impl EngineRuntime {
                                 ))
                             })?;
                         let updated_values = table_data.rows[target_index].values.clone();
+                        let stale_now = !stale_indexes.is_empty();
                         (
                             target_index,
                             table_data.rows[target_index].values.clone(),
                             Some(updated_values),
-                            !indexes_remain_fresh,
+                            stale_now,
                         )
                     } else {
                         (
@@ -3007,6 +2989,7 @@ impl EngineRuntime {
         let mut affected_rows = 0_u64;
         let mut changed_rows = 0_u64;
         let mut returning_rows = Vec::new();
+        let mut stale_indexes: Vec<String> = Vec::new();
         for row_id in matching_row_ids {
             let (row_index, current_row) = {
                 let table_data = self.table_data(&table_name).ok_or_else(|| {
@@ -3062,19 +3045,23 @@ impl EngineRuntime {
             } else {
                 self.validate_row(&table_name, &next_values, Some(row_id), params)?;
             }
-            if indexes_remain_fresh {
-                for index in &indexes_to_update {
-                    if !apply_runtime_index_update_for_row_change(
-                        self,
-                        &table,
-                        index,
-                        row_id,
-                        &current_row.values,
-                        &next_values,
-                    )? {
-                        indexes_remain_fresh = false;
-                        break;
+            for index in &indexes_to_update {
+                if !index.fresh {
+                    if !stale_indexes.contains(&index.name) {
+                        stale_indexes.push(index.name.clone());
                     }
+                    continue;
+                }
+                if !apply_runtime_index_update_for_row_change(
+                    self,
+                    &table,
+                    index,
+                    row_id,
+                    &current_row.values,
+                    &next_values,
+                )? && !stale_indexes.contains(&index.name)
+                {
+                    stale_indexes.push(index.name.clone());
                 }
             }
             let returning_values = if statement.returning.is_empty() {
@@ -3097,8 +3084,8 @@ impl EngineRuntime {
             changed_rows += 1;
         }
 
-        if changed_rows > 0 && !indexes_remain_fresh {
-            self.mark_indexes_stale_for_table(&table_name);
+        if changed_rows > 0 && !stale_indexes.is_empty() {
+            self.mark_named_indexes_stale(&stale_indexes);
         }
 
         self.execute_after_triggers(
@@ -3225,28 +3212,10 @@ impl EngineRuntime {
                     }
                     removed
                 };
-                let mut indexes_remain_fresh = table_indexes.iter().all(|index| index.fresh);
-                if indexes_remain_fresh {
-                    for row in &removed_rows {
-                        for index in &table_indexes {
-                            if !apply_runtime_index_delete_for_row(
-                                self,
-                                &table,
-                                index,
-                                row.row_id,
-                                &row.values,
-                            )? {
-                                indexes_remain_fresh = false;
-                                break;
-                            }
-                        }
-                        if !indexes_remain_fresh {
-                            break;
-                        }
-                    }
-                }
-                if !indexes_remain_fresh {
-                    self.mark_indexes_stale_for_table(&table_name);
+                let stale_indexes =
+                    incremental_delete_indexes(self, &table, &table_indexes, &removed_rows)?;
+                if !stale_indexes.is_empty() {
+                    self.mark_named_indexes_stale(&stale_indexes);
                 }
                 for row in &removed_rows {
                     self.mark_table_row_deleted(&table_name, row.row_id);
@@ -3294,26 +3263,8 @@ impl EngineRuntime {
                 )?;
             }
         }
-        let mut indexes_remain_fresh = table_indexes.iter().all(|index| index.fresh);
-        if indexes_remain_fresh {
-            for row in &matching_rows {
-                for index in &table_indexes {
-                    if !apply_runtime_index_delete_for_row(
-                        self,
-                        &table,
-                        index,
-                        row.row_id,
-                        &row.values,
-                    )? {
-                        indexes_remain_fresh = false;
-                        break;
-                    }
-                }
-                if !indexes_remain_fresh {
-                    break;
-                }
-            }
-        }
+        let stale_indexes =
+            incremental_delete_indexes(self, &table, &table_indexes, &matching_rows)?;
         let matching_row_id_set = matching_row_ids
             .iter()
             .copied()
@@ -3334,8 +3285,8 @@ impl EngineRuntime {
         }
 
         if !matching_row_ids.is_empty() {
-            if !indexes_remain_fresh {
-                self.mark_indexes_stale_for_table(&table_name);
+            if !stale_indexes.is_empty() {
+                self.mark_named_indexes_stale(&stale_indexes);
             }
             for row in &matching_rows {
                 self.mark_table_row_deleted(&table_name, row.row_id);
@@ -3663,8 +3614,12 @@ impl EngineRuntime {
                     .rows[row_index]
                     .values = next_values.clone();
                 if !indexes_to_update.is_empty() {
-                    let mut indexes_remain_fresh = table_indexes.iter().all(|index| index.fresh);
+                    let mut stale_indexes: Vec<String> = Vec::new();
                     for index in &indexes_to_update {
+                        if !index.fresh {
+                            stale_indexes.push(index.name.clone());
+                            continue;
+                        }
                         if !apply_runtime_index_update_for_row_change(
                             self,
                             &table,
@@ -3673,12 +3628,11 @@ impl EngineRuntime {
                             &current_row.values,
                             &next_values,
                         )? {
-                            indexes_remain_fresh = false;
-                            break;
+                            stale_indexes.push(index.name.clone());
                         }
                     }
-                    if !indexes_remain_fresh {
-                        self.mark_indexes_stale_for_table(table_name);
+                    if !stale_indexes.is_empty() {
+                        self.mark_named_indexes_stale(&stale_indexes);
                     }
                 }
                 self.mark_table_row_dirty(table_name, row_index, row_id, &next_values);
@@ -3692,8 +3646,12 @@ impl EngineRuntime {
                     return Ok(Some(current_row));
                 }
                 if !indexes_to_update.is_empty() {
-                    let mut indexes_remain_fresh = table_indexes.iter().all(|index| index.fresh);
+                    let mut stale_indexes: Vec<String> = Vec::new();
                     for index in &indexes_to_update {
+                        if !index.fresh {
+                            stale_indexes.push(index.name.clone());
+                            continue;
+                        }
                         if !apply_runtime_index_update_for_row_change(
                             self,
                             &table,
@@ -3702,12 +3660,11 @@ impl EngineRuntime {
                             &current_row.values,
                             &next_values,
                         )? {
-                            indexes_remain_fresh = false;
-                            break;
+                            stale_indexes.push(index.name.clone());
                         }
                     }
-                    if !indexes_remain_fresh {
-                        self.mark_indexes_stale_for_table(table_name);
+                    if !stale_indexes.is_empty() {
+                        self.mark_named_indexes_stale(&stale_indexes);
                     }
                 }
                 let mut row_changes = BTreeMap::new();
@@ -5891,9 +5848,29 @@ fn apply_runtime_index_delete_for_row(
     row_id: i64,
     row_values: &[Value],
 ) -> Result<bool> {
+    apply_runtime_index_delete_for_row_with_predicate(
+        runtime, table, index, row_id, row_values, None, None,
+    )
+}
+
+fn apply_runtime_index_delete_for_row_with_predicate(
+    runtime: &mut EngineRuntime,
+    table: &crate::catalog::TableSchema,
+    index: &crate::catalog::IndexSchema,
+    row_id: i64,
+    row_values: &[Value],
+    pre_parsed_predicate: Option<&Expr>,
+    _shared_predicate: Option<&Expr>,
+) -> Result<bool> {
     match index.kind {
         IndexKind::Btree => {
-            let key = compute_index_key(runtime, index, table, row_values)?;
+            let key = super::compute_index_key_with_predicate(
+                runtime,
+                index,
+                table,
+                row_values,
+                pre_parsed_predicate,
+            )?;
             let Some(RuntimeIndex::Btree { keys, covering }) = runtime.index_mut(&index.name)
             else {
                 return Ok(false);
@@ -5938,6 +5915,205 @@ fn apply_runtime_index_delete_for_row(
             Ok(true)
         }
     }
+}
+
+fn apply_runtime_index_insert_for_row(
+    runtime: &mut EngineRuntime,
+    table: &crate::catalog::TableSchema,
+    index: &crate::catalog::IndexSchema,
+    row: &StoredRow,
+) -> Result<bool> {
+    match index.kind {
+        IndexKind::Btree => {
+            let key = compute_index_key(runtime, index, table, &row.values)?;
+            let covering_values = covering_payload_values_for_row(index, table, &row.values);
+            let Some(RuntimeIndex::Btree { keys, covering }) = runtime.index_mut(&index.name)
+            else {
+                return Ok(false);
+            };
+            if let Some(key) = key {
+                keys.insert_row_id(key, row.row_id)?;
+                if let (Some(covering), Some(values)) = (covering.as_mut(), covering_values) {
+                    covering.insert_row_values(row.row_id, values);
+                }
+            } else if let Some(covering) = covering.as_mut() {
+                covering.remove_row_id(row.row_id);
+            }
+            Ok(true)
+        }
+        IndexKind::Trigram => {
+            let text = trigram_index_text_for_row(runtime, index, table, &row.values)?;
+            let Some(RuntimeIndex::Trigram { index: trigram }) = runtime.index_mut(&index.name)
+            else {
+                return Ok(false);
+            };
+            if let Some(text) = text {
+                let row_id = u64::try_from(row.row_id)
+                    .map_err(|_| DbError::internal(format!("row_id {} is invalid", row.row_id)))?;
+                trigram.queue_insert(row_id, &text);
+            }
+            Ok(true)
+        }
+        IndexKind::Spatial => {
+            let value = spatial_index_value_for_row(runtime, index, table, &row.values)?;
+            let Some(RuntimeIndex::Spatial { index: spatial }) = runtime.index_mut(&index.name)
+            else {
+                return Ok(false);
+            };
+            if let Some(value) = value {
+                spatial
+                    .insert(row.row_id, value)
+                    .map_err(|error| DbError::constraint(error.to_string()))?;
+            }
+            Ok(true)
+        }
+        IndexKind::FullText => {
+            let fields = full_text_fields_for_row(runtime, index, table, &row.values)?;
+            let Some(RuntimeIndex::FullText { index: fulltext }) = runtime.index_mut(&index.name)
+            else {
+                return Ok(false);
+            };
+            let row_id = u64::try_from(row.row_id)
+                .map_err(|_| DbError::internal(format!("row_id {} is invalid", row.row_id)))?;
+            let refs = fields.iter().map(Option::as_deref).collect::<Vec<_>>();
+            fulltext.insert_document(row_id, &refs);
+            Ok(true)
+        }
+    }
+}
+
+/// Apply per-row incremental index updates for a delete. Returns the names of
+/// indexes that could not be updated incrementally (and therefore need to be
+/// rebuilt on next access) as a deduplicated, catalog-stable-order list.
+///
+/// Indexes that successfully update incrementally stay in place — discarding
+/// them and rebuilding from scratch (the previous behavior) would force an
+/// expensive `rebuild_stale_indexes` pass at commit for indexes that are still
+/// correct, especially the fulltext and trigram search indexes whose
+/// incremental update is O(terms in document).
+fn incremental_delete_indexes(
+    runtime: &mut EngineRuntime,
+    table: &crate::catalog::TableSchema,
+    table_indexes: &[crate::catalog::IndexSchema],
+    rows: &[StoredRow],
+) -> Result<Vec<String>> {
+    incremental_delete_indexes_with_predicate(runtime, table, table_indexes, rows, None)
+}
+
+/// Same as [`incremental_delete_indexes`], but optionally accepts a pre-parsed
+/// predicate expression shared across all rows in the batch. The expression is
+/// parsed once instead of per-row.
+fn incremental_delete_indexes_with_predicate(
+    runtime: &mut EngineRuntime,
+    table: &crate::catalog::TableSchema,
+    table_indexes: &[crate::catalog::IndexSchema],
+    rows: &[StoredRow],
+    shared_predicate_expr: Option<&Expr>,
+) -> Result<Vec<String>> {
+    let mut stale_indexes: Vec<String> = Vec::new();
+    for index in table_indexes {
+        if !index.fresh {
+            stale_indexes.push(index.name.clone());
+            continue;
+        }
+        // Pre-parse this index's predicate once instead of re-parsing it for
+        // every row. `row_satisfies_index_predicate` re-parses via
+        // `parse_expression_sql` on every call, which dominated wall time for
+        // bulk DML on tables with partial indexes.
+        let per_index_predicate = if shared_predicate_expr.is_some() {
+            None
+        } else {
+            super::prepare_index_predicate_expr(index)?
+        };
+        let mut failed = false;
+        for row in rows {
+            if !apply_runtime_index_delete_for_row_with_predicate(
+                runtime,
+                table,
+                index,
+                row.row_id,
+                &row.values,
+                per_index_predicate.as_ref(),
+                shared_predicate_expr,
+            )? {
+                failed = true;
+                break;
+            }
+        }
+        if failed {
+            stale_indexes.push(index.name.clone());
+        }
+    }
+    Ok(stale_indexes)
+}
+
+/// Apply per-row incremental index updates for an insert. Returns the names of
+/// indexes that could not be updated incrementally.
+///
+/// See [`incremental_delete_indexes`] for the rationale.
+#[allow(dead_code)]
+fn incremental_insert_indexes(
+    runtime: &mut EngineRuntime,
+    table: &crate::catalog::TableSchema,
+    table_indexes: &[crate::catalog::IndexSchema],
+    rows: &[StoredRow],
+) -> Result<Vec<String>> {
+    let mut stale_indexes: Vec<String> = Vec::new();
+    for index in table_indexes {
+        if !index.fresh {
+            stale_indexes.push(index.name.clone());
+            continue;
+        }
+        let mut failed = false;
+        for row in rows {
+            if !apply_runtime_index_insert_for_row(runtime, table, index, row)? {
+                failed = true;
+                break;
+            }
+        }
+        if failed {
+            stale_indexes.push(index.name.clone());
+        }
+    }
+    Ok(stale_indexes)
+}
+
+/// Apply per-row incremental index updates for an update of the form
+/// `old_row -> new_row`. Returns the names of indexes that could not be
+/// updated incrementally.
+///
+/// See [`incremental_delete_indexes`] for the rationale.
+fn incremental_update_indexes(
+    runtime: &mut EngineRuntime,
+    table: &crate::catalog::TableSchema,
+    table_indexes: &[crate::catalog::IndexSchema],
+    changes: &[(StoredRow, StoredRow)],
+) -> Result<Vec<String>> {
+    let mut stale_indexes: Vec<String> = Vec::new();
+    for index in table_indexes {
+        if !index.fresh {
+            stale_indexes.push(index.name.clone());
+            continue;
+        }
+        let mut failed = false;
+        for (old_row, new_row) in changes {
+            if !apply_runtime_index_update_for_row_change(
+                runtime,
+                table,
+                index,
+                old_row.row_id,
+                &old_row.values,
+                &new_row.values,
+            )? {
+                failed = true;
+                break;
+            }
+        }
+        if failed {
+            stale_indexes.push(index.name.clone());
+        }
+    }
+    Ok(stale_indexes)
 }
 
 fn full_text_fields_for_row(
