@@ -1040,6 +1040,64 @@ Phase 5D result note (2026-06-22):
   checkpoint/writeback policy, UUID point-read lookup cost, and mutation
   bookkeeping for update/cascade paths.
 
+Phase 5E result note (2026-06-22):
+
+- Extended the prepared simple-update path so non-rowid predicates can use a
+  fresh unique single-column B-tree lookup. This covers UUID primary-key updates
+  with `CAST($n AS UUID)`, including the MovieDB shape
+  `UPDATE Movies SET BoxOfficeUsd = ? WHERE Id = CAST(? AS UUID)`.
+- Added regression coverage for prepared UUID primary-key SELECT and UPDATE
+  statements using casted text UUID parameters.
+- Focused MovieDB scratch run after the change:
+  `.tmp/bench_complex_movie_scratch_prepared_update.json`.
+  - DecentDB update batch improved relative to the prior full run:
+    `0.096519s` vs SQLite `0.021726s` (previous DecentDB was `0.114236s`).
+  - MovieDB remained at 7 DecentDB wins and 6 SQLite wins.
+  - Remaining high-impact gaps stayed concentrated in checkpoint/writeback,
+    UUID point reads, tag search, update bookkeeping, and cascade delete.
+- A follow-up resident-delete compaction experiment was profiled and reverted
+  because it did not improve MovieDB cascade delete. The next cascade work
+  should start from profiling child table mutation/writeback and statement-loop
+  batching, not from speculative row-vector compaction.
+
+Phase 5F result note (2026-06-22):
+
+- Added a simple filtered-projection exact-equality fast path so UUID primary-key
+  point reads with `CAST($n AS UUID)` can use the single-column runtime B-tree
+  directly instead of falling back to the generic filtered scan path.
+- Tightened checkpoint policy in two places:
+  - `PRAGMA wal_checkpoint(...)` now maps to the WAL-only checkpoint primitive,
+    matching SQLite benchmark semantics. API-level `checkpoint()` still runs the
+    optional pre-checkpoint payload compaction pass.
+  - The pre-compaction candidate check now inspects paged-table manifests and
+    skips the write transaction when chunks are already compacted and have no
+    tombstones/overlays.
+- Updated the Python MovieDB/Showdown benchmark checkpoint helper so both
+  engines use `PRAGMA wal_checkpoint(TRUNCATE)` for checkpoint rows.
+- Focused MovieDB scratch run after the change:
+  `.tmp/bench_complex_movie_scratch_phase5f_wal_pragma.json`.
+  - DecentDB initial checkpoint became a win: `0.499969s` vs SQLite
+    `0.920664s`. The preceding `conn.checkpoint()` run measured DecentDB at
+    `3.188441s` because it included compaction.
+  - DecentDB checkpoint after mutations improved from `3.078142s` to
+    `0.486147s`, but SQLite remained faster at `0.048196s`.
+  - DecentDB update batch improved in this run to `0.069056s` vs SQLite
+    `0.023189s`; cascade delete remained the largest MovieDB gap at
+    `2.663573s` vs `0.119368s`.
+  - MovieDB stayed at 8 DecentDB wins and 5 SQLite wins under WAL-checkpoint
+    semantics.
+- Full `scripts/benchmark_runner.py` run after the change:
+  `.tmp/perf-validate/20260622-113753`.
+  - Overall strict runner result improved from the user's reported 138 SQLite
+    wins to 128 SQLite wins.
+  - MovieDB scratch moved to 8 DecentDB wins and 5 SQLite wins.
+  - Material remaining win groups were concentrated in bulk load, index build,
+    point read, join/aggregate queries, DML, search, and the single remaining
+    checkpoint row (`MovieDB Checkpoint after mutations`, about `9.14x`).
+- Remaining common work should prioritize cascade delete/mutation writeback and
+  UUID point-read parse/evaluation overhead. The checkpoint comparison must keep
+  WAL-only and compaction/vacuum operations separate.
+
 ### Phase 6: Speed Up Simple Bulk Arithmetic Updates
 
 Benchmark target:

@@ -768,6 +768,10 @@ PRAGMA index_xinfo(users_name_idx);
 PRAGMA foreign_key_list(orders);
 ```
 
+`PRAGMA wal_checkpoint(...)` flushes committed WAL frames into the database
+file. It does not run DecentDB's optional payload compaction pass; use the
+embedding API or CLI checkpoint command for that maintenance operation.
+
 Assignment behavior is constrained:
 
 - `page_size` and `cache_size` assignments are no-ops only when the assigned

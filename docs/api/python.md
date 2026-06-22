@@ -230,7 +230,7 @@ into an inline enum column.
 ## Maintenance
 
 ```python
-conn.checkpoint()                      # WAL checkpoint
+conn.checkpoint()                      # Checkpoint plus maintenance compaction
 conn.save_as("/path/to/backup.ddb")   # Online backup
 decentdb.evict_shared_wal("/path/to/data.ddb")  # Evict shared WAL
 ```

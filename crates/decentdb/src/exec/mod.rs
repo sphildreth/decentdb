@@ -3553,25 +3553,36 @@ impl EngineRuntime {
         Ok(())
     }
 
-    pub(crate) fn has_checkpoint_compaction_candidates(&self) -> bool {
-        self.persisted_tables.values().any(|state| {
-            state.pointer.head_page_id != 0
-                && if state.pointer.is_table_paged_manifest() {
-                    true
-                } else {
-                    state.pk_index_root.is_none()
-                        && !state.pointer.is_compressed()
-                        && usize::try_from(state.pointer.logical_len)
-                            .ok()
-                            .is_some_and(|len| len >= AUTO_MIN_PAYLOAD_BYTES)
+    pub(crate) fn has_checkpoint_compaction_candidates<S: PageStore>(
+        &self,
+        store: &S,
+    ) -> Result<bool> {
+        for state in self.persisted_tables.values() {
+            if state.pointer.head_page_id == 0 {
+                continue;
+            }
+            if state.pointer.is_table_paged_manifest() {
+                if paged_table_state_needs_checkpoint_compaction(store, *state)? {
+                    return Ok(true);
                 }
-        }) || self.root_state.is_some_and(|root| {
+                continue;
+            }
+            if state.pk_index_root.is_none()
+                && !state.pointer.is_compressed()
+                && usize::try_from(state.pointer.logical_len)
+                    .ok()
+                    .is_some_and(|len| len >= AUTO_MIN_PAYLOAD_BYTES)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(self.root_state.is_some_and(|root| {
             root.pointer.head_page_id != 0
                 && !root.pointer.is_compressed()
                 && usize::try_from(root.pointer.logical_len)
                     .ok()
                     .is_some_and(|len| len >= AUTO_MIN_PAYLOAD_BYTES)
-        })
+        }))
     }
 
     pub(crate) fn backfill_missing_persistent_pk_index_for_table(
@@ -13805,7 +13816,6 @@ impl EngineRuntime {
         if !generated_columns_are_stored(table_schema) {
             return Ok(None);
         }
-        let row_source = self.visible_table_row_source(name);
         let Some((projection_indexes, column_names)) =
             self.simple_projection_plan(select, name, alias, table_schema)
         else {
@@ -13868,7 +13878,8 @@ impl EngineRuntime {
             .transpose()?
             .map(|value| usize::try_from(value.max(0)).unwrap_or(usize::MAX))
             .unwrap_or(0);
-        let Some(row_source) = row_source else {
+        let _row_source = self.visible_table_row_source(name);
+        let Some(row_source) = _row_source else {
             return Ok(None);
         };
         if let Some((filter_column, descending)) = row_id_order {
@@ -13967,13 +13978,57 @@ impl EngineRuntime {
         if !generated_columns_are_stored(table_schema) {
             return Ok(None);
         }
-        let row_source = self.visible_table_row_source(name);
         let Some((projection_indexes, column_names)) =
             self.simple_projection_plan(select, name, alias, table_schema)
         else {
             return Ok(None);
         };
         let binding_name = alias.as_deref().unwrap_or(name);
+        let order_by = self.simple_projection_order_by_plan(
+            query,
+            table_schema,
+            name,
+            binding_name,
+            &projection_indexes,
+        )?;
+        if !query.order_by.is_empty() && order_by.is_none() {
+            return Ok(None);
+        }
+        let limit = query
+            .limit
+            .as_ref()
+            .map(|expr| self.eval_constant_i64(expr, params, &BTreeMap::new()))
+            .transpose()?
+            .map(|value| usize::try_from(value.max(0)).unwrap_or(usize::MAX));
+        let offset = query
+            .offset
+            .as_ref()
+            .map(|expr| self.eval_constant_i64(expr, params, &BTreeMap::new()))
+            .transpose()?
+            .map(|value| usize::try_from(value.max(0)).unwrap_or(usize::MAX))
+            .unwrap_or(0);
+        let _row_source = self.visible_table_row_source(name);
+        if !select.distinct {
+            if let Some(row_source) = _row_source {
+                if let Some(result) = self.try_simple_filtered_projection_exact_index_result(
+                    row_source,
+                    name,
+                    table_schema,
+                    filter,
+                    &projection_indexes,
+                    column_names.clone(),
+                    order_by.as_deref(),
+                    params,
+                    limit,
+                    offset,
+                )? {
+                    return Ok(Some(result));
+                }
+            }
+        }
+        let Some(row_source) = _row_source else {
+            return Ok(None);
+        };
 
         let Some(range_filter) = simple_range_projection_filter(filter) else {
             return Ok(None);
@@ -14041,23 +14096,6 @@ impl EngineRuntime {
         if residual_plans.len() != range_filter.residual.len() {
             return Ok(None);
         }
-
-        let limit = query
-            .limit
-            .as_ref()
-            .map(|expr| self.eval_constant_i64(expr, params, &BTreeMap::new()))
-            .transpose()?
-            .map(|value| usize::try_from(value.max(0)).unwrap_or(usize::MAX));
-        let offset = query
-            .offset
-            .as_ref()
-            .map(|expr| self.eval_constant_i64(expr, params, &BTreeMap::new()))
-            .transpose()?
-            .map(|value| usize::try_from(value.max(0)).unwrap_or(usize::MAX))
-            .unwrap_or(0);
-        let Some(row_source) = row_source else {
-            return Ok(None);
-        };
         if !select.distinct && residual_plans.is_empty() {
             if let Some(result) = self.try_simple_rowid_range_projection_result(
                 row_source,
@@ -14074,16 +14112,6 @@ impl EngineRuntime {
             )? {
                 return Ok(Some(result));
             }
-        }
-        let order_by = self.simple_projection_order_by_plan(
-            query,
-            table_schema,
-            name,
-            binding_name,
-            &projection_indexes,
-        )?;
-        if !query.order_by.is_empty() && order_by.is_none() {
-            return Ok(None);
         }
         if order_by.is_none() {
             if let Some(result) = self.try_simple_filtered_projection_range_index_result(
@@ -14384,7 +14412,6 @@ impl EngineRuntime {
         if !generated_columns_are_stored(table_schema) {
             return Ok(None);
         }
-        let row_source = self.visible_table_row_source(name);
         let Some((projection_indexes, column_names)) =
             self.simple_projection_plan(select, name, alias, table_schema)
         else {
@@ -14413,7 +14440,8 @@ impl EngineRuntime {
             .transpose()?
             .map(|value| usize::try_from(value.max(0)).unwrap_or(usize::MAX))
             .unwrap_or(0);
-        let Some(row_source) = row_source else {
+        let _row_source = self.visible_table_row_source(name);
+        let Some(row_source) = _row_source else {
             return Ok(None);
         };
         Ok(Some(self.simple_distinct_projection_result_from_source(
@@ -14465,7 +14493,6 @@ impl EngineRuntime {
         if !generated_columns_are_stored(table_schema) {
             return Ok(None);
         }
-        let row_source = self.visible_table_row_source(name);
         let Some((projection_indexes, column_names)) =
             self.simple_projection_plan(select, name, alias, table_schema)
         else {
@@ -14552,7 +14579,8 @@ impl EngineRuntime {
             .transpose()?
             .map(|value| usize::try_from(value.max(0)).unwrap_or(usize::MAX))
             .unwrap_or(0);
-        let Some(row_source) = row_source else {
+        let _row_source = self.visible_table_row_source(name);
+        let Some(row_source) = _row_source else {
             return Ok(None);
         };
         Ok(Some(
@@ -15329,6 +15357,104 @@ impl EngineRuntime {
             }
         }
         Ok(output)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_simple_filtered_projection_exact_index_result(
+        &self,
+        row_source: VisibleTableRowSource<'_>,
+        table_name: &str,
+        table_schema: &TableSchema,
+        filter: &Expr,
+        projection_indexes: &[usize],
+        column_names: Vec<String>,
+        order_by: Option<&[SimpleOrderByPlan]>,
+        params: &[Value],
+        limit: Option<usize>,
+        offset: usize,
+    ) -> Result<Option<QueryResult>> {
+        if limit == Some(0) {
+            return Ok(Some(QueryResult::with_rows(column_names, Vec::new())));
+        }
+        let Some((filter_table, filter_column, value_expr)) = simple_btree_lookup(filter) else {
+            return Ok(None);
+        };
+        if let Some(filter_table) = filter_table {
+            if !identifiers_equal(filter_table, table_name) {
+                return Ok(None);
+            }
+        }
+
+        let value = self.eval_expr(
+            value_expr,
+            &Dataset::empty(),
+            &[],
+            params,
+            &BTreeMap::new(),
+            None,
+        )?;
+        if matches!(value, Value::Null) {
+            return Ok(Some(QueryResult::with_rows(column_names, Vec::new())));
+        }
+
+        let mut rows = Vec::new();
+        if row_id_alias_column_name(table_schema)
+            .is_some_and(|column_name| identifiers_equal(column_name, filter_column))
+        {
+            if let Value::Int64(row_id) = value {
+                if let Some(stored_row) = row_source.row_by_id(row_id)? {
+                    rows.push(project_simple_projection_values(
+                        stored_row.values(),
+                        projection_indexes,
+                    ));
+                }
+            }
+            return Ok(Some(apply_simple_projection_postprocessing_with_order(
+                Some(self),
+                rows,
+                column_names,
+                order_by,
+                limit,
+                offset,
+            )?));
+        }
+
+        let Some(index) = self.single_column_btree_index(table_name, filter_column) else {
+            return Ok(None);
+        };
+        let Some(RuntimeIndex::Btree { keys, .. }) = self.index(&index.name) else {
+            return Ok(None);
+        };
+        match keys.row_ids_for_value_set(&value)? {
+            RuntimeRowIdSet::Empty => {}
+            RuntimeRowIdSet::Single(row_id) => {
+                if let Some(stored_row) = row_source.row_by_id(row_id)? {
+                    rows.push(project_simple_projection_values(
+                        stored_row.values(),
+                        projection_indexes,
+                    ));
+                }
+            }
+            RuntimeRowIdSet::Many(row_ids) => {
+                rows.reserve(row_ids.len());
+                for row_id in row_ids {
+                    if let Some(stored_row) = row_source.row_by_id(*row_id)? {
+                        rows.push(project_simple_projection_values(
+                            stored_row.values(),
+                            projection_indexes,
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(Some(apply_simple_projection_postprocessing_with_order(
+            Some(self),
+            rows,
+            column_names,
+            order_by,
+            limit,
+            offset,
+        )?))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -27102,6 +27228,42 @@ fn compact_paged_table_state_for_checkpoint<S: PageStore>(
     }
 
     Ok((new_state, new_state != state || changed))
+}
+
+fn paged_table_state_needs_checkpoint_compaction<S: PageStore>(
+    store: &S,
+    state: PersistedTableState,
+) -> Result<bool> {
+    if state.pointer.head_page_id == 0 || !state.pointer.is_table_paged_manifest() {
+        return Ok(false);
+    }
+
+    let manifest_payload = read_overflow(store, state.pointer)?;
+    if crc32c_parts(&[manifest_payload.as_slice()]) != state.checksum {
+        return Err(DbError::corruption(
+            "paged table manifest checksum mismatch",
+        ));
+    }
+    let manifest = decode_paged_table_manifest_payload(&manifest_payload)?;
+    let chunk_compaction_min_bytes = paged_table_checkpoint_compaction_min_bytes(store.page_size());
+    for chunk in &manifest.chunks {
+        if !chunk.tombstoned_row_ids.is_empty() || chunk.overlay_pointer.is_some() {
+            return Ok(true);
+        }
+        if chunk.pointer.head_page_id != 0
+            && !chunk.pointer.is_compressed()
+            && usize::try_from(chunk.pointer.logical_len)
+                .ok()
+                .is_some_and(|len| len >= chunk_compaction_min_bytes)
+        {
+            return Ok(true);
+        }
+    }
+
+    Ok(!state.pointer.is_compressed()
+        && usize::try_from(state.pointer.logical_len)
+            .ok()
+            .is_some_and(|len| len >= AUTO_MIN_PAYLOAD_BYTES))
 }
 
 fn persist_paged_table<S: PageStore>(

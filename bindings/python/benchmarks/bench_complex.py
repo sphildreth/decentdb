@@ -1535,8 +1535,12 @@ def _movie_fetch_count(cur, sql, params=()):
 def _movie_checkpoint(conn, engine_name):
     if engine_name == "sqlite":
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-    else:
-        conn.checkpoint()
+        return
+    cur = conn.cursor()
+    try:
+        cur._execute_direct("PRAGMA wal_checkpoint(TRUNCATE)", ())
+    finally:
+        cur.close()
 
 
 def _movie_vacuum(conn, engine_name, db_path):

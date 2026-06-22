@@ -2299,6 +2299,77 @@ fn checkpoint_wal_flushes_without_compacting_large_persisted_payloads() {
 }
 
 #[test]
+fn pragma_wal_checkpoint_flushes_without_compacting_large_persisted_payloads() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let path = tempdir
+        .path()
+        .join("pragma-wal-checkpoint-skips-large-payload-compaction.ddb");
+    let db = Db::open_or_create(
+        &path,
+        DbConfig {
+            paged_row_storage: false,
+            ..DbConfig::default()
+        },
+    )
+    .expect("open db");
+    db.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT)")
+        .expect("create docs table");
+
+    let large_body = "x".repeat(2048);
+    let mut txn = db.transaction().expect("begin exclusive txn");
+    let insert = txn
+        .prepare("INSERT INTO docs VALUES ($1, $2)")
+        .expect("prepare insert");
+    for i in 0_i64..96_i64 {
+        insert
+            .execute_in(
+                &mut txn,
+                &[Value::Int64(i), Value::Text(large_body.clone())],
+            )
+            .expect("insert large row");
+    }
+    txn.commit().expect("commit rows");
+
+    let runtime_before = db
+        .runtime_for_metadata_inspection()
+        .expect("runtime before checkpoint");
+    let docs_before = runtime_before
+        .persisted_tables
+        .get("docs")
+        .expect("persisted docs table before checkpoint");
+    assert!(
+        !docs_before.pointer.is_compressed(),
+        "normal commits should leave table payloads uncompressed"
+    );
+
+    let checkpoint = db
+        .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        .expect("pragma wal checkpoint");
+    assert_eq!(
+        checkpoint.columns(),
+        &[
+            "busy".to_string(),
+            "log".to_string(),
+            "checkpointed".to_string()
+        ]
+    );
+    let storage = db.storage_info().expect("storage info");
+    assert_eq!(storage.wal_end_lsn, 0);
+
+    let runtime_after = db
+        .runtime_for_metadata_inspection()
+        .expect("runtime after checkpoint");
+    let docs_after = runtime_after
+        .persisted_tables
+        .get("docs")
+        .expect("persisted docs table after checkpoint");
+    assert!(
+        !docs_after.pointer.is_compressed(),
+        "PRAGMA wal_checkpoint should flush WAL without compacting large payloads"
+    );
+}
+
+#[test]
 fn save_as_flushes_wal_without_compacting_source_payloads() {
     let tempdir = TempDir::new().expect("tempdir");
     let path = tempdir
@@ -3047,6 +3118,12 @@ fn checkpoint_compacts_paged_table_chunks_and_preserves_persistent_pk_index() {
             .any(|chunk| !chunk.pointer.is_compressed()),
         "normal paged writes should leave chunk payloads uncompressed"
     );
+    assert!(
+        runtime_before
+            .has_checkpoint_compaction_candidates(&page_store)
+            .expect("inspect checkpoint candidates before checkpoint"),
+        "uncompressed paged chunks should be checkpoint compaction candidates"
+    );
 
     db.checkpoint().expect("checkpoint");
 
@@ -3075,6 +3152,12 @@ fn checkpoint_compacts_paged_table_chunks_and_preserves_persistent_pk_index() {
             .iter()
             .any(|chunk| chunk.pointer.is_compressed()),
         "checkpoint should compact large paged chunk payloads"
+    );
+    assert!(
+        !runtime_after
+            .has_checkpoint_compaction_candidates(&page_store)
+            .expect("inspect checkpoint candidates after checkpoint"),
+        "compacted paged chunks should not force another pre-checkpoint compaction pass"
     );
     assert_eq!(
         scalar_i64(

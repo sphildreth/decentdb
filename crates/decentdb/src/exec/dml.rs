@@ -104,7 +104,7 @@ pub(crate) struct PreparedSimpleInsert {
 #[derive(Clone, Debug)]
 pub(crate) struct PreparedSimpleUpdate {
     pub(crate) table_name: String,
-    pub(crate) row_id_source: PreparedSimpleValueSource,
+    pub(crate) lookup: PreparedSimpleUpdateLookup,
     pub(crate) assignments: Vec<PreparedSimpleUpdateAssignment>,
     pub(crate) indexes: Vec<PreparedBtreeIndex>,
     pub(crate) compiled_index_state_epoch: u64,
@@ -117,6 +117,15 @@ pub(crate) struct PreparedSimpleUpdateAssignment {
     pub(crate) column_type: ColumnType,
     pub(crate) nullable: bool,
     pub(crate) value_source: PreparedSimpleValueSource,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum PreparedSimpleUpdateLookup {
+    RowId(PreparedSimpleValueSource),
+    UniqueIndex {
+        index_name: String,
+        value_source: PreparedSimpleValueSource,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -791,13 +800,37 @@ impl EngineRuntime {
         if filter_table.is_some_and(|name| !identifiers_equal(name, &table.name)) {
             return Ok(None);
         }
-        if !row_id_alias_column_name(table).is_some_and(|name| identifiers_equal(name, column_name))
-        {
-            return Ok(None);
-        }
 
-        let Some(row_id_source) = compile_prepared_simple_value_source(value_expr) else {
-            return Ok(None);
+        let lookup = if row_id_alias_column_name(table)
+            .is_some_and(|name| identifiers_equal(name, column_name))
+        {
+            let Some(row_id_source) = compile_prepared_simple_value_source(value_expr) else {
+                return Ok(None);
+            };
+            PreparedSimpleUpdateLookup::RowId(row_id_source)
+        } else {
+            let Some(index) = self.catalog.indexes.values().find(|index| {
+                identifiers_equal(&index.table_name, &table.name)
+                    && index.fresh
+                    && index.unique
+                    && index.kind == IndexKind::Btree
+                    && index.predicate_sql.is_none()
+                    && index.columns.len() == 1
+                    && index.columns[0].expression_sql.is_none()
+                    && index.columns[0]
+                        .column_name
+                        .as_ref()
+                        .is_some_and(|entry| identifiers_equal(entry, column_name))
+            }) else {
+                return Ok(None);
+            };
+            let Some(value_source) = compile_prepared_simple_value_source(value_expr) else {
+                return Ok(None);
+            };
+            PreparedSimpleUpdateLookup::UniqueIndex {
+                index_name: index.name.clone(),
+                value_source,
+            }
         };
 
         let mut assignments = Vec::with_capacity(statement.assignments.len());
@@ -863,7 +896,7 @@ impl EngineRuntime {
 
         Ok(Some(PreparedSimpleUpdate {
             table_name: prepared_table_name,
-            row_id_source,
+            lookup,
             assignments,
             indexes,
             compiled_index_state_epoch: self.index_state_epoch,
@@ -887,9 +920,9 @@ impl EngineRuntime {
         params: &[Value],
         _page_size: u32,
     ) -> Result<QueryResult> {
-        let row_id = match resolve_prepared_simple_value(&prepared.row_id_source, params)? {
-            Value::Int64(value) => value,
-            _ => return Ok(QueryResult::with_affected_rows(0)),
+        let row_id = resolve_prepared_simple_update_row_id(self, prepared, params)?;
+        let Some(row_id) = row_id else {
+            return Ok(QueryResult::with_affected_rows(0));
         };
         let mut resolved_assignments = Vec::with_capacity(prepared.assignments.len());
         for assignment in &prepared.assignments {
@@ -5543,6 +5576,38 @@ pub(crate) fn resolve_prepared_simple_value(
             target_type,
         } => {
             cast_prepared_simple_value(resolve_prepared_simple_value(source, params)?, *target_type)
+        }
+    }
+}
+
+fn resolve_prepared_simple_update_row_id(
+    runtime: &EngineRuntime,
+    prepared: &PreparedSimpleUpdate,
+    params: &[Value],
+) -> Result<Option<i64>> {
+    match &prepared.lookup {
+        PreparedSimpleUpdateLookup::RowId(value_source) => {
+            Ok(match resolve_prepared_simple_value(value_source, params)? {
+                Value::Int64(value) => Some(value),
+                _ => None,
+            })
+        }
+        PreparedSimpleUpdateLookup::UniqueIndex {
+            index_name,
+            value_source,
+        } => {
+            let value = resolve_prepared_simple_value(value_source, params)?;
+            if matches!(value, Value::Null) {
+                return Ok(None);
+            }
+            let Some(RuntimeIndex::Btree { keys, .. }) = runtime.index(index_name) else {
+                return Ok(None);
+            };
+            let row_ids = row_id_set_to_vec(keys.row_ids_for_value_set(&value)?);
+            Ok(match row_ids.as_slice() {
+                [row_id] => Some(*row_id),
+                _ => None,
+            })
         }
     }
 }

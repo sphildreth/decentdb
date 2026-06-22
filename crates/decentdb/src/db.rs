@@ -4837,7 +4837,7 @@ impl Db {
         let active_readers = self.inner.wal.active_reader_count()?;
         let retained_snapshot = self.inner.wal.retained_snapshot_lsn().is_some();
         let before_versions = self.inner.wal.version_count()?;
-        self.checkpoint()?;
+        self.checkpoint_wal()?;
         let after_versions = self.inner.wal.version_count()?;
         let checkpointed = before_versions.saturating_sub(after_versions);
         Ok(QueryResult::with_rows(
@@ -6984,8 +6984,11 @@ impl Db {
             .engine
             .write()
             .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
-        if !runtime.has_checkpoint_compaction_candidates() {
-            return Ok(());
+        {
+            let store = PagerReadStore::new(self)?;
+            if !runtime.has_checkpoint_compaction_candidates(&store)? {
+                return Ok(());
+            }
         }
         self.begin_write()?;
         let changed = match runtime.compact_persisted_payloads_for_checkpoint(self) {

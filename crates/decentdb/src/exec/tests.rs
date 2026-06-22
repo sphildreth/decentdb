@@ -1391,6 +1391,47 @@ fn simple_indexed_projection_accepts_casted_uuid_parameter_lookup() {
 }
 
 #[test]
+fn simple_filtered_projection_accepts_casted_uuid_parameter_lookup() {
+    let mut runtime = EngineRuntime::empty(1);
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE movies (id UUID PRIMARY KEY, title TEXT)",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO movies (id, title) VALUES (UUID_PARSE('550e8400-e29b-41d4-a716-446655440000'), 'target')",
+    );
+    execute_sql(
+        &mut runtime,
+        "INSERT INTO movies (id, title) VALUES (UUID_PARSE('550e8400-e29b-41d4-a716-446655440001'), 'other')",
+    );
+
+    let statement = parse_sql_statement("SELECT title FROM movies WHERE id = CAST($1 AS UUID)")
+        .expect("parse casted UUID lookup");
+    let crate::sql::ast::Statement::Query(query) = &statement else {
+        panic!("expected query statement");
+    };
+
+    let result = runtime
+        .try_execute_simple_filtered_projection_query(
+            query,
+            &[Value::Blob(vec![
+                0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44,
+                0x00, 0x00,
+            ])],
+        )
+        .expect("execute casted UUID filtered projection")
+        .expect("casted UUID lookup should stay on filtered projection fast path");
+
+    assert_eq!(result.columns(), &["title".to_string()]);
+    assert_eq!(result.rows().len(), 1);
+    assert_eq!(
+        result.rows()[0].values(),
+        &[Value::Text("target".to_string())]
+    );
+}
+
+#[test]
 fn movie_tag_search_uses_index_driven_join_path() {
     let mut runtime = EngineRuntime::empty(1);
     execute_sql(

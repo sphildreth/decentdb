@@ -303,9 +303,11 @@ For very large databases, archived WAL segments could be:
 DecentDB supports safe SQLite-compatible PRAGMA probes for common WAL and
 configuration questions. `PRAGMA journal_mode` reports `wal`,
 `PRAGMA synchronous` reports the open-time sync mode, and
-`PRAGMA wal_checkpoint(...)` maps to DecentDB's safe checkpoint operation.
-Checkpoint and reader-retention policy are still configured through API/CLI
-settings; PRAGMA assignment does not weaken durability.
+`PRAGMA wal_checkpoint(...)` maps to a WAL-only checkpoint operation. The
+embedding API and CLI checkpoint command may also run optional payload
+compaction maintenance. Checkpoint and reader-retention policy are still
+configured through API/CLI settings; PRAGMA assignment does not weaken
+durability.
 
 ### Checkpointing
 

@@ -635,6 +635,51 @@ fn prepared_batch_insert_with_uuid_index() {
 }
 
 #[test]
+fn prepared_select_with_cast_uuid_param_uses_uuid_pk() {
+    let db = mem_db();
+    db.execute("CREATE TABLE movies (external_id UUID PRIMARY KEY, title TEXT NOT NULL)")
+        .unwrap();
+    db.execute(
+        "INSERT INTO movies VALUES (UUID_PARSE('550e8400-e29b-41d4-a716-446655440002'), 'Second')",
+    )
+    .unwrap();
+
+    let stmt = db
+        .prepare("SELECT title FROM movies WHERE external_id = CAST($1 AS UUID)")
+        .unwrap();
+    let result = stmt
+        .execute(&[Value::Text(
+            "550e8400-e29b-41d4-a716-446655440002".to_string(),
+        )])
+        .unwrap();
+
+    assert_eq!(rows(&result), vec![vec![Value::Text("Second".to_string())]]);
+}
+
+#[test]
+fn prepared_update_with_cast_uuid_param_uses_uuid_pk() {
+    let db = mem_db();
+    db.execute("CREATE TABLE movies (external_id UUID PRIMARY KEY, box INT64 NOT NULL)")
+        .unwrap();
+    db.execute("INSERT INTO movies VALUES (UUID_PARSE('550e8400-e29b-41d4-a716-446655440002'), 1)")
+        .unwrap();
+
+    let stmt = db
+        .prepare("UPDATE movies SET box = $1 WHERE external_id = CAST($2 AS UUID)")
+        .unwrap();
+    stmt.execute(&[
+        Value::Int64(7),
+        Value::Text("550e8400-e29b-41d4-a716-446655440002".to_string()),
+    ])
+    .unwrap();
+
+    let result = db
+        .execute("SELECT box FROM movies WHERE external_id = UUID_PARSE('550e8400-e29b-41d4-a716-446655440002')")
+        .unwrap();
+    assert_eq!(rows(&result), vec![vec![Value::Int64(7)]]);
+}
+
+#[test]
 fn prepared_delete_statement() {
     let db = mem_db();
     exec(&db, "CREATE TABLE pd (id INT PRIMARY KEY, val TEXT)");
