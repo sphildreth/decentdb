@@ -6,7 +6,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::super::*;
-    use crate::exec::dml::PreparedSimpleInsert;
+    use crate::exec::dml::{PreparedInsertValueSource, PreparedSimpleInsert};
     use crate::sql::ast::Statement;
     use crate::sql::parser::parse_sql_statement;
 
@@ -136,6 +136,93 @@ mod tests {
             "all value sources should be direct positional"
         );
         assert!(prepared.has_auto_increment);
+    }
+
+    #[test]
+    fn prepare_simple_insert_accepts_casted_uuid_positional_param() {
+        let mut runtime = EngineRuntime::empty(1);
+        runtime.catalog_mut().tables.insert(
+            "movies".to_string(),
+            crate::catalog::TableSchema {
+                name: "movies".to_string(),
+                temporary: false,
+                columns: vec![
+                    crate::catalog::ColumnSchema {
+                        name: "id".to_string(),
+                        column_type: crate::catalog::ColumnType::Int64,
+                        spatial_type: None,
+                        enum_type: None,
+                        nullable: false,
+                        default_sql: None,
+                        generated_sql: None,
+                        generated_stored: false,
+                        primary_key: true,
+                        unique: false,
+                        auto_increment: false,
+                        checks: vec![],
+                        foreign_key: None,
+                    },
+                    crate::catalog::ColumnSchema {
+                        name: "external_id".to_string(),
+                        column_type: crate::catalog::ColumnType::Uuid,
+                        spatial_type: None,
+                        enum_type: None,
+                        nullable: false,
+                        default_sql: None,
+                        generated_sql: None,
+                        generated_stored: false,
+                        primary_key: false,
+                        unique: false,
+                        auto_increment: false,
+                        checks: vec![],
+                        foreign_key: None,
+                    },
+                ],
+                checks: vec![],
+                foreign_keys: vec![],
+                primary_key_columns: vec!["id".to_string()],
+                next_row_id: 1,
+                pk_index_root: None,
+            },
+        );
+        runtime.tables_mut().insert(
+            "movies".to_string(),
+            TableRowSource::Resident(Arc::new(TableData::from_rows(Vec::new()))),
+        );
+
+        let stmt = parse_sql_statement(
+            "INSERT INTO movies (id, external_id) VALUES ($1, CAST($2 AS UUID))",
+        )
+        .expect("parse insert");
+        let Statement::Insert(insert) = stmt else {
+            panic!("expected insert");
+        };
+        let prepared = runtime
+            .prepare_simple_insert(&insert)
+            .expect("prepare insert")
+            .expect("simple insert");
+        assert_eq!(prepared.direct_positional_param_count, Some(2));
+        assert!(matches!(
+            &prepared.value_sources[1],
+            PreparedInsertValueSource::Cast {
+                target_type: crate::catalog::ColumnType::Uuid,
+                ..
+            }
+        ));
+
+        runtime
+            .execute_prepared_simple_insert(
+                &prepared,
+                &[
+                    Value::Int64(1),
+                    Value::Text("550e8400-e29b-41d4-a716-446655440002".to_string()),
+                ],
+                4096,
+            )
+            .expect("execute casted insert");
+        let stored = runtime.table_data("movies").expect("table data");
+        assert_eq!(stored.rows.len(), 1);
+        assert!(matches!(stored.rows[0].values[1], Value::Uuid(_)));
     }
 
     #[test]

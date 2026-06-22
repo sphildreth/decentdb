@@ -605,6 +605,36 @@ fn prepared_batch_insert() {
 }
 
 #[test]
+fn prepared_batch_insert_with_uuid_index() {
+    let db = mem_db();
+    db.execute("CREATE TABLE movies (id INT64 PRIMARY KEY, external_id UUID NOT NULL)")
+        .unwrap();
+    db.execute("CREATE UNIQUE INDEX idx_movies_external_id ON movies(external_id)")
+        .unwrap();
+
+    let mut txn = db.transaction().unwrap();
+    let stmt = txn
+        .prepare("INSERT INTO movies VALUES ($1, CAST($2 AS UUID))")
+        .unwrap();
+    for i in 1..=4 {
+        stmt.execute_in(
+            &mut txn,
+            &[
+                Value::Int64(i),
+                Value::Text(format!("550e8400-e29b-41d4-a716-44665544000{i}")),
+            ],
+        )
+        .unwrap();
+    }
+    txn.commit().unwrap();
+
+    let r = db
+        .execute("SELECT id FROM movies WHERE external_id = UUID_PARSE('550e8400-e29b-41d4-a716-446655440002')")
+        .unwrap();
+    assert_eq!(rows(&r), vec![vec![Value::Int64(2)]]);
+}
+
+#[test]
 fn prepared_delete_statement() {
     let db = mem_db();
     exec(&db, "CREATE TABLE pd (id INT PRIMARY KEY, val TEXT)");

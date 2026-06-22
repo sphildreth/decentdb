@@ -95,6 +95,16 @@ class BenchmarkResult:
 
 
 @dataclasses.dataclass(frozen=True)
+class SqliteGap:
+    run: str
+    section: str
+    detail: str
+    category: str
+    ratio: float
+    material: bool
+
+
+@dataclasses.dataclass(frozen=True)
 class BenchmarkSpec:
     label: str
     args: tuple[str, ...]
@@ -542,6 +552,245 @@ def render_detail_table(
     console.print(table)
 
 
+GAP_DETAIL_RE = re.compile(
+    r"^(?P<name>.*?): "
+    r"(?P<winner>[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)(?P<unit>[^0-9()]+?) "
+    r"vs "
+    r"(?P<loser>[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)(?P=unit) "
+    r"\((?P<ratio>[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)x "
+    r"(?P<direction>higher|faster/lower)\)$"
+)
+
+
+def _metric_category(name: str) -> str:
+    lower = name.lower()
+    if "equivalence" in lower or "mismatch" in lower:
+        return "equivalence_mismatch/other"
+    if "final file size" in lower or "file size" in lower:
+        return "file_size"
+    if "checkpoint" in lower:
+        return "checkpoint"
+    if "analyze" in lower:
+        return "analyze_stats"
+    if "bulk load" in lower or "insert throughput" in lower:
+        return "bulk_load"
+    if "search" in lower or "fulltext" in lower or "substring like" in lower:
+        return "search"
+    if "index build" in lower:
+        return "index_build"
+    if "point lookup" in lower or "point read" in lower:
+        return "point_read"
+    if any(
+        token in lower
+        for token in (
+            "insert ",
+            " update ",
+            "upsert",
+            " delete ",
+            " returning",
+            "bulk update",
+            "bulk delete",
+        )
+    ):
+        return "dml"
+    if any(
+        token in lower
+        for token in (
+            "join",
+            "aggregate",
+            "scan",
+            "range",
+            "pagination",
+            "cte",
+            "union",
+            "ranking",
+            "rolling avg",
+            "yearly counts",
+            "top by",
+            "top-rated",
+            "busiest",
+            "watchlist query",
+            "window",
+        )
+    ):
+        return "query_join_aggregate"
+    return "equivalence_mismatch/other"
+
+
+def _is_time_unit(unit: str) -> bool:
+    return unit.strip() in {"s", "ms", "us", "ns"}
+
+
+def _unit_to_seconds(unit: str, value: float) -> float:
+    normalized = unit.strip()
+    if normalized == "s":
+        return value
+    if normalized == "ms":
+        return value / 1000.0
+    if normalized == "us":
+        return value / 1_000_000.0
+    if normalized == "ns":
+        return value / 1_000_000_000.0
+    return value
+
+
+def _parse_sqlite_gap(detail: str) -> tuple[str, str, float, float, float] | None:
+    match = GAP_DETAIL_RE.match(detail)
+    if not match:
+        return None
+    name = match.group("name")
+    unit = match.group("unit")
+    winner = float(match.group("winner"))
+    loser = float(match.group("loser"))
+    ratio = float(match.group("ratio"))
+    return name, unit, winner, loser, ratio
+
+
+def _collect_sqlite_gaps(results: list[BenchmarkResult]) -> list[SqliteGap]:
+    gaps: list[SqliteGap] = []
+    for result in results:
+        for comparison in result.comparisons:
+            for detail in comparison.sqlite_better:
+                parsed = _parse_sqlite_gap(detail)
+                if parsed is None:
+                    continue
+                name, unit, winner, loser, ratio = parsed
+                material = ratio >= 1.25
+                if material and _is_time_unit(unit):
+                    winner_seconds = _unit_to_seconds(unit, winner)
+                    loser_seconds = _unit_to_seconds(unit, loser)
+                    material = abs(winner_seconds - loser_seconds) >= 0.00025
+                gaps.append(
+                    SqliteGap(
+                        run=result.label,
+                        section=comparison.name,
+                        detail=detail,
+                        category=_metric_category(name),
+                        ratio=ratio,
+                        material=material,
+                    )
+                )
+    return gaps
+
+
+def _group_sqlite_gaps(gaps: list[SqliteGap]) -> tuple[dict[str, list[SqliteGap]], list[str]]:
+    grouped: dict[str, list[SqliteGap]] = {}
+    for gap in gaps:
+        grouped.setdefault(gap.category, []).append(gap)
+
+    order = [
+        "bulk_load",
+        "index_build",
+        "analyze_stats",
+        "checkpoint",
+        "point_read",
+        "query_join_aggregate",
+        "dml",
+        "search",
+        "file_size",
+        "equivalence_mismatch/other",
+    ]
+
+    def sort_key(category: str) -> tuple[int, int, str]:
+        items = grouped[category]
+        return (-sum(1 for gap in items if gap.material), -len(items), category)
+
+    categories = [category for category in order if category in grouped]
+    categories.extend(sorted(set(grouped) - set(categories), key=sort_key))
+    return grouped, categories
+
+
+def render_sqlite_gap_groups(console: Console, results: list[BenchmarkResult]) -> None:
+    gaps = _collect_sqlite_gaps(results)
+    if not gaps:
+        return
+
+    grouped, categories = _group_sqlite_gaps(gaps)
+
+    summary = Table(
+        title="SQLite Win Groups",
+        box=box.SIMPLE_HEAVY,
+    )
+    summary.add_column("Category", style="bold")
+    summary.add_column("Wins", justify="right")
+    summary.add_column("Material", justify="right")
+    summary.add_column("Material gaps")
+
+    for category in categories:
+        items = grouped[category]
+        material_items = [gap for gap in items if gap.material]
+        examples = ", ".join(
+            f"{gap.detail.split(': ', 1)[0]} ({gap.ratio:.2f}x)"
+            for gap in material_items[:2]
+        )
+        summary.add_row(
+            category,
+            str(len(items)),
+            str(len(material_items)),
+            examples or "-",
+        )
+
+    console.print(
+        Panel(
+            "Material gaps use a 1.25x ratio threshold; second-based timings also require an absolute delta of at least 0.00025s.",
+            title="SQLite Gap Policy",
+            border_style="red",
+            box=box.ROUNDED,
+        )
+    )
+    console.print(summary)
+
+
+def _self_check_sqlite_gap_helpers() -> None:
+    parsed = _parse_sqlite_gap(
+        "Bulk load: 0.50s vs 0.40s (1.25x faster/lower)"
+    )
+    expected = ("Bulk load", "s", 0.50, 0.40, 1.25)
+    if parsed != expected:
+        raise AssertionError(f"unexpected parse result: {parsed!r}")
+
+    result = BenchmarkResult(
+        label="Smoke Run",
+        command_result=CommandResult(
+            label="Smoke Run",
+            command=["benchmark"],
+            log_path=None,
+            returncode=0,
+            duration_s=0.0,
+        ),
+        comparisons=[
+            Comparison(
+                name="Primary",
+                sqlite_better=[
+                    "Bulk load: 0.50s vs 0.40s (1.25x faster/lower)",
+                    "Point read: 0.000100s vs 0.000090s (1.25x faster/lower)",
+                    "Movie genres 3-table join: 0.010s vs 0.008s (1.25x faster/lower)",
+                    "Final file size: 1200 bytes vs 800 bytes (1.50x higher)",
+                ],
+            )
+        ],
+    )
+
+    gaps = _collect_sqlite_gaps([result])
+    grouped, categories = _group_sqlite_gaps(gaps)
+    expected_categories = [
+        "bulk_load",
+        "point_read",
+        "query_join_aggregate",
+        "file_size",
+    ]
+    if categories != expected_categories:
+        raise AssertionError(f"unexpected category order: {categories!r}")
+    if not grouped["bulk_load"][0].material:
+        raise AssertionError("bulk_load gap should be material")
+    if grouped["point_read"][0].material:
+        raise AssertionError("point_read gap should stay below the absolute delta threshold")
+    if not grouped["query_join_aggregate"][0].material:
+        raise AssertionError("query_join_aggregate gap should be material")
+    if not grouped["file_size"][0].material:
+        raise AssertionError("file_size gap should be material")
+
+
 def render_final(
     console: Console,
     benchmark_results: list[BenchmarkResult],
@@ -705,6 +954,11 @@ def parse_args() -> argparse.Namespace:
         help="Print the planned commands without running them.",
     )
     parser.add_argument(
+        "--self-check",
+        action="store_true",
+        help="Run the SQLite gap parsing/grouping smoke check and exit.",
+    )
+    parser.add_argument(
         "--echo",
         action="store_true",
         help="Echo subprocess output to the terminal as well as logs.",
@@ -720,6 +974,11 @@ def main() -> int:
         raise SystemExit("--max-details must be at least 1")
 
     console = Console()
+    if args.self_check:
+        _self_check_sqlite_gap_helpers()
+        console.print("SQLite gap helper self-check passed.")
+        return 0
+
     output_dir = (args.output_dir or default_output_dir()).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -822,6 +1081,7 @@ def main() -> int:
         "sqlite_better",
         args.max_details,
     )
+    render_sqlite_gap_groups(console, benchmark_results)
     render_detail_table(
         console,
         "Ties",

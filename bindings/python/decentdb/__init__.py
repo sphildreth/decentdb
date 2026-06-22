@@ -2,6 +2,7 @@ import collections
 import ctypes
 import datetime
 import decimal
+import itertools
 from dataclasses import dataclass
 import ipaddress
 import json
@@ -2147,6 +2148,148 @@ class Cursor:
         self._bound_param_count = expected_count
         return total_affected
 
+    @staticmethod
+    def _merge_typed_signature_code(existing, next_code):
+        if existing is None:
+            return next_code
+        if existing == next_code:
+            return existing
+        if {existing, next_code} == {"i", "f"}:
+            return "f"
+        return None
+
+    @staticmethod
+    def _typed_signature_code_for_value(value):
+        value_type = type(value)
+        if value is None:
+            return None
+        if value_type is int:
+            return "i"
+        if value_type is str:
+            return "t"
+        if value_type is float:
+            return "f"
+        return False
+
+    def _executemany_mixed_typed_iter(self, sql, expected_count, first_params, iterator):
+        if self._stmt is None or self._native_execute_batch_typed_collected is None:
+            return None
+
+        step_out = ctypes.c_uint8()
+        step_stmt = self._lib.ddb_stmt_step
+        bind_param = self._bind_param
+        reset_stmt = self._lib.ddb_stmt_reset
+        native_batch = self._native_execute_batch_typed_collected
+
+        total_affected = 0
+        signature_codes = [None] * expected_count
+        pending_rows = []
+        fast_batch = []
+        signature = None
+
+        def checked_len(params):
+            params_type = type(params)
+            if params_type is tuple or params_type is list:
+                param_len = len(params)
+            else:
+                if isinstance(params, Mapping):
+                    raise ProgrammingError(
+                        "Mixed parameter styles are not supported in executemany"
+                    )
+                try:
+                    param_len = len(params)
+                except TypeError:
+                    raise ProgrammingError(
+                        "Incorrect number of parameters: "
+                        f"expected {expected_count}, got unknown"
+                    )
+            if param_len != expected_count:
+                raise ProgrammingError(
+                    f"Incorrect number of parameters: expected {expected_count}, got {param_len}"
+                )
+
+        def execute_row_generic(params):
+            nonlocal total_affected
+            code = reset_stmt(self._stmt)
+            if code != ERR_OK:
+                _raise_error(code, sql=sql, params=params)
+            for i, param in enumerate(params, start=1):
+                bind_param(i, param, sql, params)
+            code = step_stmt(self._stmt, ctypes.byref(step_out))
+            if code != ERR_OK:
+                _raise_error(code, sql=sql, params=params)
+            affected = ctypes.c_uint64()
+            code = self._lib.ddb_stmt_affected_rows(self._stmt, ctypes.byref(affected))
+            if code != ERR_OK:
+                _raise_error(code, sql=sql, params=params)
+            total_affected += int(affected.value)
+
+        def flush_fast_batch():
+            nonlocal total_affected
+            if not fast_batch:
+                return
+            total_affected += int(
+                native_batch(
+                    self._stmt.value,
+                    fast_batch[0],
+                    iter(fast_batch[1:]),
+                    signature,
+                )
+            )
+            fast_batch.clear()
+
+        def row_matches(params):
+            return self._row_matches_signature(params, signature)
+
+        def process_with_signature(params):
+            if row_matches(params):
+                fast_batch.append(params)
+            else:
+                flush_fast_batch()
+                execute_row_generic(params)
+
+        def update_signature(params):
+            nonlocal signature
+            unsupported = False
+            for index, value in enumerate(params):
+                next_code = self._typed_signature_code_for_value(value)
+                if next_code is False:
+                    unsupported = True
+                    continue
+                if next_code is None:
+                    continue
+                merged = self._merge_typed_signature_code(
+                    signature_codes[index], next_code
+                )
+                if merged is None:
+                    unsupported = True
+                    continue
+                signature_codes[index] = merged
+            if not unsupported and all(code is not None for code in signature_codes):
+                signature = "".join(signature_codes)
+                return True
+            return False
+
+        for params in itertools.chain((first_params,), iterator):
+            checked_len(params)
+            if signature is None:
+                pending_rows.append(params)
+                if update_signature(params):
+                    for pending in pending_rows:
+                        process_with_signature(pending)
+                    pending_rows.clear()
+                continue
+            process_with_signature(params)
+
+        if signature is None:
+            for pending in pending_rows:
+                execute_row_generic(pending)
+        else:
+            flush_fast_batch()
+
+        self._bound_param_count = expected_count
+        return total_affected
+
     def execute(self, operation, parameters=None):
         if parameters is None and self._fast_repeat_cache:
             cached = self._fast_repeat_cache.get(id(operation))
@@ -2607,25 +2750,17 @@ class Cursor:
             self.rowcount = fast_rowcount
             return self
 
-        typed_signature = self._infer_typed_signature(normalized_first)
-        if typed_signature is not None:
-            fast_rowcount = self._executemany_typed_iter(
-                expected_count,
-                normalized_first,
-                iterator,
-                typed_signature,
-                lambda params, signature=typed_signature: self._row_matches_signature(
-                    params, signature
-                ),
-            )
-            if fast_rowcount is not None:
-                self._col_count = 0
-                self.description = None
-                self._store_cached_non_query_metadata(sql)
-                self._query_active = False
-                self._has_buffered_row = False
-                self.rowcount = fast_rowcount
-                return self
+        fast_rowcount = self._executemany_mixed_typed_iter(
+            sql, expected_count, normalized_first, iterator
+        )
+        if fast_rowcount is not None:
+            self._col_count = 0
+            self.description = None
+            self._store_cached_non_query_metadata(sql)
+            self._query_active = False
+            self._has_buffered_row = False
+            self.rowcount = fast_rowcount
+            return self
 
         step_out = ctypes.c_uint8()
         step_stmt = self._lib.ddb_stmt_step

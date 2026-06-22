@@ -1236,7 +1236,7 @@ def _movie_float_type(engine_name):
 
 
 def _movie_id_value(engine_name, value):
-    return value.bytes if engine_name == "sqlite" else value
+    return value.bytes if engine_name == "sqlite" else str(value)
 
 
 def _movie_uuid_expr(engine_name):

@@ -1341,6 +1341,7 @@ impl Default for PersistedTableState {
 pub(crate) enum RuntimeBtreeKey {
     Encoded(Vec<u8>),
     Int64(i64),
+    Uuid([u8; 16]),
 }
 
 #[derive(Default)]
@@ -1379,6 +1380,8 @@ pub(crate) enum RuntimeBtreeKeys {
     NonUniqueEncoded(BTreeMap<Vec<u8>, Vec<i64>>),
     UniqueInt64(Int64Map<i64>),
     NonUniqueInt64(Int64Map<Vec<i64>>),
+    UniqueUuid(BTreeMap<[u8; 16], i64>),
+    NonUniqueUuid(BTreeMap<[u8; 16], Vec<i64>>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1439,6 +1442,16 @@ impl RuntimeBtreeKeys {
                 .map(Vec::as_slice)
                 .map(RuntimeRowIdSet::Many)
                 .unwrap_or(RuntimeRowIdSet::Empty),
+            (Self::UniqueUuid(keys), RuntimeBtreeKey::Uuid(key)) => keys
+                .get(key)
+                .copied()
+                .map(RuntimeRowIdSet::Single)
+                .unwrap_or(RuntimeRowIdSet::Empty),
+            (Self::NonUniqueUuid(keys), RuntimeBtreeKey::Uuid(key)) => keys
+                .get(key)
+                .map(Vec::as_slice)
+                .map(RuntimeRowIdSet::Many)
+                .unwrap_or(RuntimeRowIdSet::Empty),
             _ => RuntimeRowIdSet::Empty,
         }
     }
@@ -1458,6 +1471,10 @@ impl RuntimeBtreeKeys {
             }
             Self::UniqueInt64(_) | Self::NonUniqueInt64(_) => match value {
                 Value::Int64(value) => Ok(self.row_id_set_for_key(&RuntimeBtreeKey::Int64(*value))),
+                _ => Ok(RuntimeRowIdSet::Empty),
+            },
+            Self::UniqueUuid(_) | Self::NonUniqueUuid(_) => match value {
+                Value::Uuid(value) => Ok(self.row_id_set_for_key(&RuntimeBtreeKey::Uuid(*value))),
                 _ => Ok(RuntimeRowIdSet::Empty),
             },
         }
@@ -1488,6 +1505,14 @@ impl RuntimeBtreeKeys {
                 .iter()
                 .map(|(key, row_ids)| (RuntimeBtreeKey::Int64(*key), row_ids.len()))
                 .collect(),
+            Self::UniqueUuid(keys) => keys
+                .keys()
+                .map(|key| (RuntimeBtreeKey::Uuid(*key), 1))
+                .collect(),
+            Self::NonUniqueUuid(keys) => keys
+                .iter()
+                .map(|(key, row_ids)| (RuntimeBtreeKey::Uuid(*key), row_ids.len()))
+                .collect(),
         }
     }
 
@@ -1499,6 +1524,10 @@ impl RuntimeBtreeKeys {
             }
             (Self::UniqueInt64(keys), RuntimeBtreeKey::Int64(key)) => keys.contains_key(key),
             (Self::NonUniqueInt64(keys), RuntimeBtreeKey::Int64(key)) => {
+                keys.get(key).is_some_and(|row_ids| !row_ids.is_empty())
+            }
+            (Self::UniqueUuid(keys), RuntimeBtreeKey::Uuid(key)) => keys.contains_key(key),
+            (Self::NonUniqueUuid(keys), RuntimeBtreeKey::Uuid(key)) => {
                 keys.get(key).is_some_and(|row_ids| !row_ids.is_empty())
             }
             _ => false,
@@ -1527,10 +1556,17 @@ impl RuntimeBtreeKeys {
             (Self::NonUniqueInt64(keys), RuntimeBtreeKey::Int64(key)) => {
                 keys.entry(key).or_default().push(row_id);
             }
-            (Self::UniqueEncoded(_), RuntimeBtreeKey::Int64(_))
-            | (Self::NonUniqueEncoded(_), RuntimeBtreeKey::Int64(_))
-            | (Self::UniqueInt64(_), RuntimeBtreeKey::Encoded(_))
-            | (Self::NonUniqueInt64(_), RuntimeBtreeKey::Encoded(_)) => {
+            (Self::UniqueUuid(keys), RuntimeBtreeKey::Uuid(key)) => {
+                if keys.insert(key, row_id).is_some() {
+                    return Err(DbError::internal(
+                        "unique runtime BTREE index received a duplicate key insert",
+                    ));
+                }
+            }
+            (Self::NonUniqueUuid(keys), RuntimeBtreeKey::Uuid(key)) => {
+                keys.entry(key).or_default().push(row_id);
+            }
+            _ => {
                 return Err(DbError::internal(
                     "runtime BTREE key type did not match the runtime index representation",
                 ));
@@ -1583,10 +1619,28 @@ impl RuntimeBtreeKeys {
                     keys.remove(key);
                 }
             }
-            (Self::UniqueEncoded(_), RuntimeBtreeKey::Int64(_))
-            | (Self::NonUniqueEncoded(_), RuntimeBtreeKey::Int64(_))
-            | (Self::UniqueInt64(_), RuntimeBtreeKey::Encoded(_))
-            | (Self::NonUniqueInt64(_), RuntimeBtreeKey::Encoded(_)) => {
+            (Self::UniqueUuid(keys), RuntimeBtreeKey::Uuid(key)) => {
+                if let Some(existing) = keys.get(key).copied() {
+                    if existing != row_id {
+                        return Err(DbError::internal(
+                            "unique runtime BTREE index row-id mismatch during delete",
+                        ));
+                    }
+                    keys.remove(key);
+                }
+            }
+            (Self::NonUniqueUuid(keys), RuntimeBtreeKey::Uuid(key)) => {
+                let remove_entry = if let Some(row_ids) = keys.get_mut(key) {
+                    row_ids.retain(|entry| *entry != row_id);
+                    row_ids.is_empty()
+                } else {
+                    false
+                };
+                if remove_entry {
+                    keys.remove(key);
+                }
+            }
+            _ => {
                 return Err(DbError::internal(
                     "runtime BTREE key type did not match the runtime index representation",
                 ));
@@ -1601,6 +1655,8 @@ impl RuntimeBtreeKeys {
             Self::NonUniqueEncoded(keys) => keys.values().map(Vec::len).sum(),
             Self::UniqueInt64(keys) => keys.len(),
             Self::NonUniqueInt64(keys) => keys.values().map(Vec::len).sum(),
+            Self::UniqueUuid(keys) => keys.len(),
+            Self::NonUniqueUuid(keys) => keys.values().map(Vec::len).sum(),
         }
     }
 
@@ -1610,6 +1666,8 @@ impl RuntimeBtreeKeys {
             Self::NonUniqueEncoded(keys) => keys.len(),
             Self::UniqueInt64(keys) => keys.len(),
             Self::NonUniqueInt64(keys) => keys.len(),
+            Self::UniqueUuid(keys) => keys.len(),
+            Self::NonUniqueUuid(keys) => keys.len(),
         }
     }
 
@@ -1620,6 +1678,8 @@ impl RuntimeBtreeKeys {
             Self::NonUniqueEncoded(keys) => keys.is_empty(),
             Self::UniqueInt64(keys) => keys.is_empty(),
             Self::NonUniqueInt64(keys) => keys.is_empty(),
+            Self::UniqueUuid(keys) => keys.is_empty(),
+            Self::NonUniqueUuid(keys) => keys.is_empty(),
         }
     }
 }
@@ -5745,6 +5805,31 @@ impl EngineRuntime {
                     });
                 }
             }
+            RuntimeBtreeKeys::UniqueUuid(entries) => {
+                groups.reserve(entries.len());
+                for key in entries.keys() {
+                    groups.push(SimpleGroupedCountAggregate {
+                        group_values: vec![Value::Uuid(*key)],
+                        count: 1,
+                    });
+                }
+            }
+            RuntimeBtreeKeys::NonUniqueUuid(entries) => {
+                groups.reserve(entries.len());
+                for (key, row_ids) in entries {
+                    if row_ids.is_empty() {
+                        continue;
+                    }
+                    groups.push(SimpleGroupedCountAggregate {
+                        group_values: vec![Value::Uuid(*key)],
+                        count: i64::try_from(row_ids.len()).map_err(|_| {
+                            DbError::constraint(
+                                "grouped COUNT index bucket exceeds INT64 row-count limits",
+                            )
+                        })?,
+                    });
+                }
+            }
             RuntimeBtreeKeys::UniqueEncoded(entries) => {
                 groups.reserve(entries.len());
                 for (key, row_id) in entries {
@@ -5843,6 +5928,31 @@ impl EngineRuntime {
                     }
                     groups.push(SimpleGroupedCountAggregate {
                         group_values: vec![Value::Int64(*key)],
+                        count: i64::try_from(row_ids.len()).map_err(|_| {
+                            DbError::constraint(
+                                "grouped COUNT index bucket exceeds INT64 row-count limits",
+                            )
+                        })?,
+                    });
+                }
+            }
+            RuntimeBtreeKeys::UniqueUuid(entries) => {
+                groups.reserve(entries.len());
+                for key in entries.keys() {
+                    groups.push(SimpleGroupedCountAggregate {
+                        group_values: vec![Value::Uuid(*key)],
+                        count: 1,
+                    });
+                }
+            }
+            RuntimeBtreeKeys::NonUniqueUuid(entries) => {
+                groups.reserve(entries.len());
+                for (key, row_ids) in entries {
+                    if row_ids.is_empty() {
+                        continue;
+                    }
+                    groups.push(SimpleGroupedCountAggregate {
+                        group_values: vec![Value::Uuid(*key)],
                         count: i64::try_from(row_ids.len()).map_err(|_| {
                             DbError::constraint(
                                 "grouped COUNT index bucket exceeds INT64 row-count limits",
@@ -15291,9 +15401,10 @@ impl EngineRuntime {
                     candidate_row_ids.extend(row_ids.iter().copied());
                 }
             }
-            RuntimeBtreeKeys::UniqueInt64(_) | RuntimeBtreeKeys::NonUniqueInt64(_) => {
-                return Ok(None);
-            }
+            RuntimeBtreeKeys::UniqueInt64(_)
+            | RuntimeBtreeKeys::NonUniqueInt64(_)
+            | RuntimeBtreeKeys::UniqueUuid(_)
+            | RuntimeBtreeKeys::NonUniqueUuid(_) => return Ok(None),
         }
         if candidate_row_ids.len().saturating_mul(2) > row_source.row_count() {
             return Ok(None);
@@ -15433,8 +15544,52 @@ impl EngineRuntime {
                     }
                 }
             }
+            RuntimeBtreeKeys::UniqueUuid(entries) => {
+                if order_by.descending {
+                    for row_id in entries.values().rev() {
+                        if push_matching_row(*row_id)? {
+                            break;
+                        }
+                    }
+                } else {
+                    for row_id in entries.values() {
+                        if push_matching_row(*row_id)? {
+                            break;
+                        }
+                    }
+                }
+            }
+            RuntimeBtreeKeys::NonUniqueUuid(entries) => {
+                if order_by.descending {
+                    let mut done = false;
+                    for row_ids in entries.values().rev() {
+                        for row_id in row_ids {
+                            if push_matching_row(*row_id)? {
+                                done = true;
+                                break;
+                            }
+                        }
+                        if done {
+                            break;
+                        }
+                    }
+                } else {
+                    let mut done = false;
+                    for row_ids in entries.values() {
+                        for row_id in row_ids {
+                            if push_matching_row(*row_id)? {
+                                done = true;
+                                break;
+                            }
+                        }
+                        if done {
+                            break;
+                        }
+                    }
+                }
+            }
             RuntimeBtreeKeys::UniqueInt64(_) | RuntimeBtreeKeys::NonUniqueInt64(_) => {
-                return Ok(None);
+                return Ok(None)
             }
         }
 
@@ -19074,7 +19229,10 @@ impl EngineRuntime {
                 }
                 Ok(Some(row_ids))
             }
-            RuntimeBtreeKeys::UniqueEncoded(_) | RuntimeBtreeKeys::NonUniqueEncoded(_) => Ok(None),
+            RuntimeBtreeKeys::UniqueEncoded(_)
+            | RuntimeBtreeKeys::NonUniqueEncoded(_)
+            | RuntimeBtreeKeys::UniqueUuid(_)
+            | RuntimeBtreeKeys::NonUniqueUuid(_) => Ok(None),
         }
     }
 
@@ -23890,6 +24048,7 @@ fn build_runtime_index(
     match index.kind {
         IndexKind::Btree => {
             let int64_keys = btree_uses_typed_int64_keys(index, table);
+            let uuid_keys = btree_uses_typed_uuid_keys(index, table);
             let mut covering = covering_payloads_for_index(index, table);
             if index.unique && int64_keys {
                 let mut keys = HashMap::with_capacity_and_hasher(
@@ -23922,6 +24081,36 @@ fn build_runtime_index(
                 }
                 Ok(RuntimeIndex::Btree {
                     keys: RuntimeBtreeKeys::UniqueInt64(keys),
+                    covering,
+                })
+            } else if index.unique && uuid_keys {
+                let mut keys = BTreeMap::<[u8; 16], i64>::new();
+                for row in source.rows() {
+                    let row = row?;
+                    let Some(key) = compute_index_key(runtime, index, table, row.values())? else {
+                        continue;
+                    };
+                    let RuntimeBtreeKey::Uuid(key) = key else {
+                        return Err(DbError::internal(
+                            "typed UUID runtime index received an encoded key",
+                        ));
+                    };
+                    if keys.insert(key, row.row_id()).is_some() {
+                        return Err(DbError::corruption(format!(
+                            "unique index {} contains duplicate keys",
+                            index.name
+                        )));
+                    }
+                    if let Some(covering) = covering.as_mut() {
+                        if let Some(values) =
+                            covering_payload_values_for_row(index, table, row.values())
+                        {
+                            covering.insert_row_values(row.row_id(), values);
+                        }
+                    }
+                }
+                Ok(RuntimeIndex::Btree {
+                    keys: RuntimeBtreeKeys::UniqueUuid(keys),
                     covering,
                 })
             } else if index.unique {
@@ -23980,6 +24169,31 @@ fn build_runtime_index(
                 }
                 Ok(RuntimeIndex::Btree {
                     keys: RuntimeBtreeKeys::NonUniqueInt64(keys),
+                    covering,
+                })
+            } else if uuid_keys {
+                let mut keys = BTreeMap::<[u8; 16], Vec<i64>>::new();
+                for row in source.rows() {
+                    let row = row?;
+                    let Some(key) = compute_index_key(runtime, index, table, row.values())? else {
+                        continue;
+                    };
+                    let RuntimeBtreeKey::Uuid(key) = key else {
+                        return Err(DbError::internal(
+                            "typed UUID runtime index received an encoded key",
+                        ));
+                    };
+                    keys.entry(key).or_default().push(row.row_id());
+                    if let Some(covering) = covering.as_mut() {
+                        if let Some(values) =
+                            covering_payload_values_for_row(index, table, row.values())
+                        {
+                            covering.insert_row_values(row.row_id(), values);
+                        }
+                    }
+                }
+                Ok(RuntimeIndex::Btree {
+                    keys: RuntimeBtreeKeys::NonUniqueUuid(keys),
                     covering,
                 })
             } else {
@@ -24367,6 +24581,27 @@ pub(super) fn compute_index_key_with_predicate(
             return Ok(Some(RuntimeBtreeKey::Int64(*value)));
         }
     }
+    if btree_uses_typed_uuid_keys(index, table) {
+        let [column] = index.columns.as_slice() else {
+            return Err(DbError::internal(
+                "typed UUID runtime indexes require exactly one indexed column",
+            ));
+        };
+        if let Some(column_name) = &column.column_name {
+            let position = column_position(table, column_name).ok_or_else(|| {
+                DbError::constraint(format!("index column {} does not exist", column_name))
+            })?;
+            let Value::Uuid(value) = row_values
+                .get(position)
+                .ok_or_else(|| DbError::internal("row is shorter than table schema"))?
+            else {
+                return Err(DbError::internal(
+                    "typed UUID runtime index expected a UUID row value",
+                ));
+            };
+            return Ok(Some(RuntimeBtreeKey::Uuid(*value)));
+        }
+    }
     if let Some(value) = compute_single_column_index_key_fast(index, table, row_values)? {
         if index.unique && matches!(value, Value::Null) {
             return Ok(None);
@@ -24512,6 +24747,21 @@ fn btree_uses_typed_int64_keys(index: &IndexSchema, table: &TableSchema) -> bool
     };
     column_schema(table, column_name).is_some_and(|column| {
         column.column_type == crate::catalog::ColumnType::Int64 && !column.nullable
+    })
+}
+
+fn btree_uses_typed_uuid_keys(index: &IndexSchema, table: &TableSchema) -> bool {
+    let [column] = index.columns.as_slice() else {
+        return false;
+    };
+    if column.expression_sql.is_some() {
+        return false;
+    }
+    let Some(column_name) = &column.column_name else {
+        return false;
+    };
+    column_schema(table, column_name).is_some_and(|column| {
+        column.column_type == crate::catalog::ColumnType::Uuid && !column.nullable
     })
 }
 
@@ -33210,8 +33460,13 @@ fn compare_runtime_btree_keys(
     match (left, right) {
         (RuntimeBtreeKey::Encoded(left), RuntimeBtreeKey::Encoded(right)) => left.cmp(right),
         (RuntimeBtreeKey::Int64(left), RuntimeBtreeKey::Int64(right)) => left.cmp(right),
+        (RuntimeBtreeKey::Uuid(left), RuntimeBtreeKey::Uuid(right)) => left.cmp(right),
         (RuntimeBtreeKey::Encoded(_), RuntimeBtreeKey::Int64(_)) => std::cmp::Ordering::Less,
+        (RuntimeBtreeKey::Encoded(_), RuntimeBtreeKey::Uuid(_)) => std::cmp::Ordering::Less,
         (RuntimeBtreeKey::Int64(_), RuntimeBtreeKey::Encoded(_)) => std::cmp::Ordering::Greater,
+        (RuntimeBtreeKey::Int64(_), RuntimeBtreeKey::Uuid(_)) => std::cmp::Ordering::Less,
+        (RuntimeBtreeKey::Uuid(_), RuntimeBtreeKey::Encoded(_)) => std::cmp::Ordering::Greater,
+        (RuntimeBtreeKey::Uuid(_), RuntimeBtreeKey::Int64(_)) => std::cmp::Ordering::Greater,
     }
 }
 

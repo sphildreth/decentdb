@@ -956,6 +956,90 @@ Showdown bulk loads, but SQLite is still about 2.3x faster. Follow-up bulk-load
 work should profile engine-side prepared batch execution, row validation, and
 index/foreign-key bookkeeping rather than only Python call overhead.
 
+Phase 5B result note (2026-06-22):
+
+- Broadened the generic Python typed `executemany` path so it can infer a
+  stable `int`/`str`/`float` signature from later non-NULL rows, batch
+  contiguous rows that match that signature, and fall back to generic execution
+  for NULL-bearing or unsupported rows without losing rowcount accuracy.
+- Changed the MovieDB Python workload to bind DecentDB UUID parameters as text
+  for `CAST(? AS UUID)` expressions, and added engine support for
+  `TEXT -> UUID` casts. This lets UUID-heavy MovieDB insert batches use the
+  existing typed batch C ABI without adding a new UUID parameter ABI.
+- Added Python API regression coverage for nullable typed batches, all-NULL
+  fallback, and unsupported `decimal.Decimal` fallback. Added Rust coverage for
+  valid and invalid text-to-UUID casts.
+- Reduced MovieDB smoke after the change:
+  - DecentDB bulk load: `0.545644s` for 33,080 rows.
+  - SQLite bulk load: `0.189564s`.
+  - Local pre-change reduced MovieDB bulk-load baseline was about `0.83s`, so
+    this is a material DecentDB improvement but still about `2.9x` behind
+    SQLite at smoke scale.
+- Full `scripts/benchmark_runner.py` run after the change:
+  - MovieDB scratch DecentDB bulk load: `21.872021s`.
+  - MovieDB scratch SQLite bulk load: `16.164311s`.
+  - The user's preceding full run reported MovieDB scratch DecentDB bulk load
+    at `29.609201s`, so the nullable/UUID typed batch path materially improved
+    the full MovieDB load while leaving a `1.35x` gap.
+  - MovieDB update batch was a DecentDB win in this run:
+    `0.114737s` vs SQLite `0.358330s`.
+- Remaining bulk-load work is now more clearly engine-side: per-row value
+  construction, constraint/FK checks, runtime index insertion, and persisted
+  mutation representation during prepared batch execution.
+
+Phase 5C result note (2026-06-22):
+
+- Added typed UUID runtime B-tree keys for prepared insert maintenance and
+  rebuilt runtime indexes. This avoids encoded `Vec<u8>` keys for non-null
+  single-column UUID B-tree indexes without changing the on-disk format, WAL
+  format, or C ABI.
+- Full `scripts/benchmark_runner.py` run after the change:
+  `.tmp/perf-validate/20260622-093902`.
+  - MovieDB scratch DecentDB bulk load improved from the Phase 5B
+    `21.872021s` run to `20.023415s`.
+  - MovieDB scratch SQLite bulk load in the same run was `16.296031s`, leaving
+    a `1.23x` gap.
+  - MovieDB cascade delete improved from about `2.90s` in the prior full run to
+    `2.466061s`, but SQLite was still `0.128657s`.
+  - MovieDB point reads were `0.030376s` vs SQLite `0.007429s`.
+  - MovieDB tag search was `0.001141s` vs SQLite `0.000682s`.
+  - MovieDB final file size remained a DecentDB win:
+    `187228160` bytes vs SQLite `235237376` bytes.
+  - Overall strict runner result: SQLite still led in 139 measured areas.
+- Remaining work is now concentrated in common engine paths rather than UUID
+  parameter encoding: prepared batch row construction, runtime index
+  maintenance, checkpoint/writeback cost, and selected query/search execution
+  paths.
+
+Phase 5D result note (2026-06-22):
+
+- Extended the prepared insert compiler to keep simple `CAST(...)` value
+  expressions on the prepared insert path. This specifically covers MovieDB
+  rows that bind UUIDs as text with `CAST($n AS UUID)`.
+- Casted positional parameters whose cast target matches the target column type
+  can still use the direct positional prepared-insert path, so `CAST($2 AS
+  UUID)` into a UUID column avoids the generic write executor.
+- Added coverage for preparing and executing `INSERT ... CAST($n AS UUID)` and
+  tightened the transaction prepared-insert UUID-index test to use the same SQL
+  shape as the benchmark.
+- Full `scripts/benchmark_runner.py` run after the change:
+  `.tmp/perf-validate/20260622-100019`.
+  - MovieDB scratch DecentDB bulk load became a DecentDB win:
+    `12.206661s` vs SQLite `19.298741s`.
+  - MovieDB scratch summary moved to 7 DecentDB wins and 6 SQLite wins.
+  - The overall strict runner still reported 143 SQLite-led measured areas
+    because Showdown/query rows moved around in this run; the grouped material
+    gaps remain concentrated in bulk load, DML, checkpoint, search, point read,
+    and join/aggregate categories.
+  - Remaining MovieDB gaps are now checkpoint/writeback
+    (`3.198380s` vs SQLite `0.837618s`), UUID point reads (`0.029115s` vs
+    `0.007483s`), tag search (`0.001213s` vs `0.000752s`), update batch
+    (`0.114236s` vs `0.022964s`), cascade delete (`2.633476s` vs `0.162036s`),
+    and checkpoint after mutations (`3.074125s` vs `0.050507s`).
+- Next common work should move away from insert parameter encoding and into
+  checkpoint/writeback policy, UUID point-read lookup cost, and mutation
+  bookkeeping for update/cascade paths.
+
 ### Phase 6: Speed Up Simple Bulk Arithmetic Updates
 
 Benchmark target:

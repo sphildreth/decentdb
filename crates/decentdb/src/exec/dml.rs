@@ -31,6 +31,10 @@ use super::{
 pub(crate) enum PreparedInsertValueSource {
     Literal(Value),
     Parameter(usize),
+    Cast {
+        source: Box<PreparedInsertValueSource>,
+        target_type: ColumnType,
+    },
     DefaultExpr(Expr),
     Null,
 }
@@ -40,6 +44,7 @@ pub(crate) struct PreparedBtreeIndex {
     pub(crate) name: String,
     pub(crate) column_indexes: Vec<usize>,
     pub(crate) int64_key: bool,
+    pub(crate) uuid_key: bool,
     pub(crate) has_covering_payload: bool,
     pub(crate) covering_payload_column_indexes: Vec<usize>,
     pub(crate) nullable: bool,
@@ -670,16 +675,20 @@ impl EngineRuntime {
                 })
             })
             .collect::<Vec<_>>();
-        let direct_positional_param_count = if value_sources
-            .iter()
-            .enumerate()
-            .all(|(index, source)| {
-                matches!(source, PreparedInsertValueSource::Parameter(position) if *position == index + 1)
-            }) {
-            Some(value_sources.len())
-        } else {
-            None
-        };
+        let direct_positional_param_count =
+            if value_sources
+                .iter()
+                .zip(&columns)
+                .enumerate()
+                .all(|(index, (source, column))| {
+                    prepared_insert_source_direct_positional_param(source, column.column_type)
+                        == Some(index + 1)
+                })
+            {
+                Some(value_sources.len())
+            } else {
+                None
+            };
         let has_auto_increment = columns.iter().any(|column| column.auto_increment);
         let mut row_source_dependency_tables: Vec<String> = Vec::new();
         for foreign_key in &table.foreign_keys {
@@ -4305,6 +4314,31 @@ fn compile_prepared_insert_value_source(expr: &Expr) -> Option<PreparedInsertVal
     match expr {
         Expr::Literal(value) => Some(PreparedInsertValueSource::Literal(value.clone())),
         Expr::Parameter(number) => Some(PreparedInsertValueSource::Parameter(*number)),
+        Expr::Cast { expr, target_type } => {
+            compile_prepared_insert_value_source(expr).map(|source| {
+                PreparedInsertValueSource::Cast {
+                    source: Box::new(source),
+                    target_type: *target_type,
+                }
+            })
+        }
+        _ => None,
+    }
+}
+
+fn prepared_insert_source_direct_positional_param(
+    source: &PreparedInsertValueSource,
+    column_type: ColumnType,
+) -> Option<usize> {
+    match source {
+        PreparedInsertValueSource::Parameter(position) => Some(*position),
+        PreparedInsertValueSource::Cast {
+            source,
+            target_type,
+        } if *target_type == column_type => match source.as_ref() {
+            PreparedInsertValueSource::Parameter(position) => Some(*position),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -4346,11 +4380,15 @@ fn prepare_btree_insert_index(
     let int64_key = index.columns.len() == 1
         && table.columns[column_indexes[0]].column_type == ColumnType::Int64
         && !table.columns[column_indexes[0]].nullable;
+    let uuid_key = index.columns.len() == 1
+        && table.columns[column_indexes[0]].column_type == ColumnType::Uuid
+        && !table.columns[column_indexes[0]].nullable;
 
     Ok(Some(PreparedBtreeIndex {
         name: index.name.clone(),
         column_indexes,
         int64_key,
+        uuid_key,
         has_covering_payload: !index.include_columns.is_empty(),
         covering_payload_column_indexes: prepare_btree_index_covering_payload_column_indexes(
             table, index,
@@ -4601,22 +4639,7 @@ fn materialize_prepared_insert_candidate(
                 "prepared insert column index {index} is out of range for {table_name}"
             ))
         })?;
-        let mut value = match source {
-            PreparedInsertValueSource::Literal(value) => value.clone(),
-            PreparedInsertValueSource::Parameter(number) => params
-                .get(number.saturating_sub(1))
-                .cloned()
-                .ok_or_else(|| DbError::sql(format!("parameter ${number} was not provided")))?,
-            PreparedInsertValueSource::DefaultExpr(expr) => runtime.eval_expr(
-                expr,
-                &Dataset::empty(),
-                &[],
-                params,
-                &std::collections::BTreeMap::new(),
-                None,
-            )?,
-            PreparedInsertValueSource::Null => Value::Null,
-        };
+        let mut value = resolve_prepared_insert_value_source(runtime, source, params)?;
 
         if column.auto_increment {
             match value {
@@ -4641,6 +4664,36 @@ fn materialize_prepared_insert_candidate(
         candidate.push(cast_prepared_owned_value(value, column.column_type)?);
     }
     Ok(candidate)
+}
+
+fn resolve_prepared_insert_value_source(
+    runtime: &EngineRuntime,
+    source: &PreparedInsertValueSource,
+    params: &[Value],
+) -> Result<Value> {
+    match source {
+        PreparedInsertValueSource::Literal(value) => Ok(value.clone()),
+        PreparedInsertValueSource::Parameter(number) => params
+            .get(number.saturating_sub(1))
+            .cloned()
+            .ok_or_else(|| DbError::sql(format!("parameter ${number} was not provided"))),
+        PreparedInsertValueSource::Cast {
+            source,
+            target_type,
+        } => cast_prepared_owned_value(
+            resolve_prepared_insert_value_source(runtime, source, params)?,
+            *target_type,
+        ),
+        PreparedInsertValueSource::DefaultExpr(expr) => runtime.eval_expr(
+            expr,
+            &Dataset::empty(),
+            &[],
+            params,
+            &std::collections::BTreeMap::new(),
+            None,
+        ),
+        PreparedInsertValueSource::Null => Ok(Value::Null),
+    }
 }
 
 fn materialize_direct_positional_insert_candidate(
@@ -4876,6 +4929,71 @@ fn apply_prepared_insert_index_updates(
             }
             continue;
         }
+        if index.uuid_key {
+            let [column_index] = index.column_indexes.as_slice() else {
+                return Err(DbError::internal(
+                    "typed UUID prepared index expected exactly one indexed column",
+                ));
+            };
+            let Value::Uuid(key) = row
+                .values
+                .get(*column_index)
+                .ok_or_else(|| DbError::internal("row is shorter than prepared insert plan"))?
+            else {
+                return Err(DbError::internal(
+                    "typed UUID prepared index expected a UUID value",
+                ));
+            };
+            let covering_values = if let Some(table) = table.as_ref() {
+                runtime
+                    .catalog
+                    .indexes
+                    .get(&index.name)
+                    .and_then(|index_schema| {
+                        covering_payload_values_for_row(index_schema, table, &row.values)
+                    })
+            } else {
+                None
+            };
+            let Some(super::RuntimeIndex::Btree { keys, covering }) =
+                runtime.index_mut(&index.name)
+            else {
+                return Err(DbError::internal(format!(
+                    "runtime index {} is missing",
+                    index.name
+                )));
+            };
+            match keys {
+                super::RuntimeBtreeKeys::UniqueUuid(entries) => {
+                    if check_unique && index.unique {
+                        if entries.insert(*key, row.row_id).is_some() {
+                            return Err(DbError::constraint(format!(
+                                "unique constraint {} on {} was violated",
+                                index.name, prepared.table_name
+                            )));
+                        }
+                    } else if entries.insert(*key, row.row_id).is_some() {
+                        return Err(DbError::internal(format!(
+                            "unique runtime BTREE index {} received a duplicate key insert",
+                            index.name
+                        )));
+                    }
+                }
+                super::RuntimeBtreeKeys::NonUniqueUuid(entries) => {
+                    entries.entry(*key).or_default().push(row.row_id);
+                }
+                _ => {
+                    return Err(DbError::internal(format!(
+                        "runtime index {} did not use typed UUID keys as expected",
+                        index.name
+                    )))
+                }
+            }
+            if let (Some(covering), Some(values)) = (covering.as_mut(), covering_values) {
+                covering.insert_row_values(row.row_id, values);
+            }
+            continue;
+        }
 
         if index.unique && prepared_index_contains_null(index, &row.values) {
             continue;
@@ -4935,6 +5053,22 @@ fn prepared_btree_index_key(index: &PreparedBtreeIndex, row: &[Value]) -> Result
             ));
         };
         return Ok(RuntimeBtreeKey::Int64(*value));
+    }
+    if index.uuid_key {
+        let [column_index] = index.column_indexes.as_slice() else {
+            return Err(DbError::internal(
+                "typed UUID prepared index expected exactly one indexed column",
+            ));
+        };
+        let Value::Uuid(value) = row
+            .get(*column_index)
+            .ok_or_else(|| DbError::internal("row is shorter than prepared insert plan"))?
+        else {
+            return Err(DbError::internal(
+                "typed UUID prepared index expected a UUID value",
+            ));
+        };
+        return Ok(RuntimeBtreeKey::Uuid(*value));
     }
     if let [column_index] = index.column_indexes.as_slice() {
         let value = row
@@ -6800,6 +6934,37 @@ mod tests {
     }
 
     #[test]
+    fn uuid_btree_index_uses_typed_runtime_keys() {
+        let mut runtime = EngineRuntime::empty(1);
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE movies(id INT64 PRIMARY KEY, external_id UUID NOT NULL)",
+        );
+        execute_sql(
+            &mut runtime,
+            "CREATE UNIQUE INDEX idx_movies_external_id ON movies(external_id)",
+        );
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO movies(id, external_id) VALUES \
+             (1, UUID_PARSE('550e8400-e29b-41d4-a716-446655440000')), \
+             (2, UUID_PARSE('550e8400-e29b-41d4-a716-446655440001'))",
+        );
+
+        let Some(RuntimeIndex::Btree { keys, .. }) = runtime.index("idx_movies_external_id") else {
+            panic!("expected runtime btree index");
+        };
+        let super::super::RuntimeBtreeKeys::UniqueUuid(entries) = keys else {
+            panic!("expected typed UUID runtime keys");
+        };
+        assert_eq!(entries.len(), 2);
+        assert!(entries.contains_key(&[
+            0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44,
+            0x00, 0x00,
+        ]));
+    }
+
+    #[test]
     fn paged_int_arithmetic_update_updates_matching_rows_only() {
         let mut runtime = EngineRuntime::empty(1);
         execute_sql(
@@ -6980,6 +7145,7 @@ mod tests {
             name: "i".to_string(),
             column_indexes: vec![1],
             int64_key: false,
+            uuid_key: false,
             has_covering_payload: false,
             covering_payload_column_indexes: vec![],
             nullable: true,
@@ -6992,6 +7158,7 @@ mod tests {
             name: "i2".to_string(),
             column_indexes: vec![0],
             int64_key: true,
+            uuid_key: false,
             has_covering_payload: false,
             covering_payload_column_indexes: vec![],
             nullable: false,
@@ -7000,10 +7167,28 @@ mod tests {
         let key = prepared_btree_index_key(&index2, &[Value::Int64(99)]).unwrap();
         assert_eq!(key, RuntimeBtreeKey::Int64(99));
 
+        let uuid = [
+            0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44,
+            0x00, 0x00,
+        ];
+        let index_uuid = PreparedBtreeIndex {
+            name: "uuid_idx".to_string(),
+            column_indexes: vec![0],
+            int64_key: false,
+            uuid_key: true,
+            has_covering_payload: false,
+            covering_payload_column_indexes: vec![],
+            nullable: false,
+            unique: false,
+        };
+        let key = prepared_btree_index_key(&index_uuid, &[Value::Uuid(uuid)]).unwrap();
+        assert_eq!(key, RuntimeBtreeKey::Uuid(uuid));
+
         let index3 = PreparedBtreeIndex {
             name: "i3".to_string(),
             column_indexes: vec![0],
             int64_key: false,
+            uuid_key: false,
             has_covering_payload: false,
             covering_payload_column_indexes: vec![],
             nullable: false,
@@ -8897,6 +9082,7 @@ mod dml_private_tests {
             name: "i".to_string(),
             column_indexes: vec![0],
             int64_key: true,
+            uuid_key: false,
             has_covering_payload: false,
             covering_payload_column_indexes: vec![],
             nullable: true,
@@ -8914,6 +9100,7 @@ mod dml_private_tests {
             name: "e".to_string(),
             column_indexes: vec![0],
             int64_key: false,
+            uuid_key: false,
             has_covering_payload: false,
             covering_payload_column_indexes: vec![],
             nullable: false,
@@ -8930,6 +9117,7 @@ mod dml_private_tests {
             name: "m".to_string(),
             column_indexes: vec![0, 1],
             int64_key: false,
+            uuid_key: false,
             has_covering_payload: false,
             covering_payload_column_indexes: vec![],
             nullable: false,
