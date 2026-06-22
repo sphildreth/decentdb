@@ -11,7 +11,8 @@ use crate::config::DbConfig;
 use crate::db::SqlTxnSlot;
 use crate::error::{DbError, Result};
 use crate::exec::{
-    decode_paged_table_manifest_payload, EngineRuntime, RuntimeIndex, TableData, TableRowSource,
+    decode_paged_table_manifest_payload, EngineRuntime, RuntimeBtreeKeys, RuntimeIndex, TableData,
+    TableRowSource,
 };
 use crate::record::overflow::read_overflow;
 use crate::storage::header::DB_HEADER_SIZE;
@@ -71,6 +72,128 @@ fn read_header_from_path(path: &Path) -> DatabaseHeader {
     let mut header = [0_u8; DB_HEADER_SIZE];
     header.copy_from_slice(&bytes[..DB_HEADER_SIZE]);
     DatabaseHeader::decode(&header).expect("decode database header")
+}
+
+#[test]
+fn runtime_has_stale_indexes_detects_only_missing_or_nonfresh_indexes() {
+    let mut runtime = EngineRuntime::empty(1);
+    let mut catalog = crate::catalog::CatalogState::empty(1);
+    catalog.tables.insert(
+        "movies".to_string(),
+        TableSchema {
+            name: "movies".to_string(),
+            temporary: false,
+            columns: vec![ColumnSchema {
+                name: "id".to_string(),
+                column_type: ColumnType::Int64,
+                spatial_type: None,
+                enum_type: None,
+                nullable: false,
+                default_sql: None,
+                generated_sql: None,
+                generated_stored: false,
+                primary_key: true,
+                unique: false,
+                auto_increment: false,
+                checks: vec![],
+                foreign_key: None,
+            }],
+            checks: vec![],
+            foreign_keys: vec![],
+            primary_key_columns: vec!["id".to_string()],
+            next_row_id: 1,
+            pk_index_root: None,
+        },
+    );
+    catalog.indexes.insert(
+        "movies_id_idx".to_string(),
+        IndexSchema {
+            name: "movies_id_idx".to_string(),
+            table_name: "movies".to_string(),
+            kind: IndexKind::Btree,
+            unique: true,
+            columns: vec![crate::catalog::IndexColumn {
+                column_name: Some("id".to_string()),
+                expression_sql: None,
+            }],
+            include_columns: vec![],
+            predicate_sql: None,
+            full_text: None,
+            fresh: true,
+        },
+    );
+    runtime.catalog = Arc::new(catalog.clone());
+    runtime.indexes = Arc::new(BTreeMap::from([(
+        "movies_id_idx".to_string(),
+        Arc::new(RuntimeIndex::Btree {
+            keys: RuntimeBtreeKeys::UniqueEncoded(BTreeMap::new()),
+            covering: None,
+        }),
+    )]));
+
+    assert!(!Db::runtime_has_stale_indexes(&runtime));
+
+    let mut deferred_catalog = catalog.clone();
+    deferred_catalog.tables.insert(
+        "deferred_movies".to_string(),
+        TableSchema {
+            name: "deferred_movies".to_string(),
+            temporary: false,
+            columns: vec![ColumnSchema {
+                name: "id".to_string(),
+                column_type: ColumnType::Int64,
+                spatial_type: None,
+                enum_type: None,
+                nullable: false,
+                default_sql: None,
+                generated_sql: None,
+                generated_stored: false,
+                primary_key: true,
+                unique: false,
+                auto_increment: false,
+                checks: vec![],
+                foreign_key: None,
+            }],
+            checks: vec![],
+            foreign_keys: vec![],
+            primary_key_columns: vec!["id".to_string()],
+            next_row_id: 1,
+            pk_index_root: None,
+        },
+    );
+    deferred_catalog.indexes.insert(
+        "deferred_movies_id_idx".to_string(),
+        IndexSchema {
+            name: "deferred_movies_id_idx".to_string(),
+            table_name: "deferred_movies".to_string(),
+            kind: IndexKind::Btree,
+            unique: true,
+            columns: vec![crate::catalog::IndexColumn {
+                column_name: Some("id".to_string()),
+                expression_sql: None,
+            }],
+            include_columns: vec![],
+            predicate_sql: None,
+            full_text: None,
+            fresh: true,
+        },
+    );
+    runtime.catalog = Arc::new(deferred_catalog);
+    runtime.deferred_tables = Arc::new(std::iter::once("deferred_movies".to_string()).collect());
+    assert!(!Db::runtime_has_stale_indexes(&runtime));
+
+    let mut stale_catalog = catalog.clone();
+    stale_catalog
+        .indexes
+        .get_mut("movies_id_idx")
+        .unwrap()
+        .fresh = false;
+    runtime.catalog = Arc::new(stale_catalog);
+    assert!(Db::runtime_has_stale_indexes(&runtime));
+
+    runtime.catalog = Arc::new(catalog);
+    runtime.indexes = Arc::new(BTreeMap::new());
+    assert!(Db::runtime_has_stale_indexes(&runtime));
 }
 
 #[test]
@@ -11232,6 +11355,114 @@ fn paged_row_storage_generic_delete_with_cascade_fk_keeps_tables_deferred() {
     assert!(
         json_after.contains("\"loaded_table_count\":0"),
         "expected generic delete with cascade fk to re-defer loaded tables, got: {json_after}"
+    );
+    assert!(
+        json_after.contains("\"deferred_table_count\":3"),
+        "expected parent, child, and grandchild tables to remain deferred, got: {json_after}"
+    );
+    assert_eq!(
+        scalar_i64(
+            &db.execute("SELECT COUNT(*) FROM parent")
+                .expect("count parent rows")
+        ),
+        95
+    );
+    assert_eq!(
+        scalar_i64(
+            &db.execute("SELECT COUNT(*) FROM child")
+                .expect("count child rows")
+        ),
+        47
+    );
+    assert_eq!(
+        scalar_i64(
+            &db.execute("SELECT COUNT(*) FROM grandchild")
+                .expect("count grandchild rows")
+        ),
+        47
+    );
+}
+
+#[test]
+fn paged_row_storage_explicit_sql_transaction_delete_with_cascade_fk_keeps_tables_deferred() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let path = tempdir
+        .path()
+        .join("paged-row-storage-explicit-sql-txn-delete-cascade-fk.ddb");
+    let config = DbConfig {
+        paged_row_storage: true,
+        ..DbConfig::default()
+    };
+
+    {
+        let db = Db::open_or_create(&path, config.clone()).expect("open db");
+        db.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY, body TEXT)")
+            .expect("create parent");
+        db.execute(
+                "CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id) ON DELETE CASCADE, body TEXT)",
+            )
+            .expect("create child");
+        db.execute(
+                "CREATE TABLE grandchild (id INTEGER PRIMARY KEY, child_id INTEGER REFERENCES child(id) ON DELETE CASCADE, body TEXT)",
+            )
+            .expect("create grandchild");
+        let parent_body = "p".repeat(2048);
+        let child_body = "c".repeat(2048);
+        let grandchild_body = "g".repeat(2048);
+        let mut txn = db.transaction().expect("begin txn");
+        let parent_insert = txn
+            .prepare("INSERT INTO parent VALUES ($1, $2)")
+            .expect("prepare parent insert");
+        let child_insert = txn
+            .prepare("INSERT INTO child VALUES ($1, $2, $3)")
+            .expect("prepare child insert");
+        let grandchild_insert = txn
+            .prepare("INSERT INTO grandchild VALUES ($1, $2, $3)")
+            .expect("prepare grandchild insert");
+        for i in 0_i64..96_i64 {
+            parent_insert
+                .execute_in(
+                    &mut txn,
+                    &[Value::Int64(i + 1), Value::Text(parent_body.clone())],
+                )
+                .expect("insert parent row");
+            if i < 48 {
+                child_insert
+                    .execute_in(
+                        &mut txn,
+                        &[
+                            Value::Int64(i + 1),
+                            Value::Int64(i + 1),
+                            Value::Text(child_body.clone()),
+                        ],
+                    )
+                    .expect("insert child row");
+                grandchild_insert
+                    .execute_in(
+                        &mut txn,
+                        &[
+                            Value::Int64(i + 1),
+                            Value::Int64(i + 1),
+                            Value::Text(grandchild_body.clone()),
+                        ],
+                    )
+                    .expect("insert grandchild row");
+            }
+        }
+        txn.commit().expect("commit seed txn");
+        db.checkpoint().expect("checkpoint");
+    }
+
+    let db = Db::open_or_create(&path, config).expect("reopen db");
+    db.execute("BEGIN").expect("begin explicit sql txn");
+    db.execute("DELETE FROM parent WHERE id = 1")
+        .expect("explicit sql txn delete with cascade fk");
+    db.execute("COMMIT").expect("commit explicit sql txn");
+
+    let json_after = db.inspect_storage_state_json().expect("json after delete");
+    assert!(
+        json_after.contains("\"loaded_table_count\":0"),
+        "expected explicit SQL transaction delete with cascade fk to re-defer loaded tables, got: {json_after}"
     );
     assert!(
         json_after.contains("\"deferred_table_count\":3"),

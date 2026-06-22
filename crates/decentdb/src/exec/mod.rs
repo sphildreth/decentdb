@@ -931,6 +931,74 @@ impl TablePageManifest {
         self.projected_values_at_position(index, projection_indexes)
     }
 
+    fn row_bytes_for_entry<'a>(
+        &'a self,
+        entry: &'a TablePageEntry,
+        chunk: &'a TablePageManifestChunk,
+    ) -> Result<Option<&'a [u8]>> {
+        if entry.is_overlay {
+            let payload = chunk
+                .overlay_payload
+                .as_ref()
+                .ok_or_else(|| DbError::corruption("paged table overlay chunk is missing"))?;
+            return Self::row_bytes_from_locator(payload.as_slice(), entry.locator).map(Some);
+        }
+
+        if chunk.tombstoned_row_ids.contains(&entry.row_id) {
+            let Some(overlay_payload) = &chunk.overlay_payload else {
+                return Ok(None);
+            };
+            return Self::row_bytes_from_tombstoned_base(overlay_payload.as_slice(), entry.row_id)
+                .map(Some);
+        }
+
+        let start = entry.locator.byte_offset as usize;
+        let end = start + entry.locator.byte_len as usize;
+        let row_bytes = chunk
+            .payload
+            .as_slice()
+            .get(start..end)
+            .ok_or_else(|| DbError::corruption("paged row locator exceeded payload length"))?;
+        Ok(Some(row_bytes))
+    }
+
+    fn row_bytes_from_locator<'a>(payload: &'a [u8], locator: RowLocatorV1) -> Result<&'a [u8]> {
+        let start = locator.byte_offset as usize;
+        let end = start + locator.byte_len as usize;
+        payload
+            .get(start..end)
+            .ok_or_else(|| DbError::corruption("paged row locator exceeded payload length"))
+    }
+
+    fn row_bytes_from_tombstoned_base<'a>(
+        overlay_payload: &'a [u8],
+        row_id: i64,
+    ) -> Result<&'a [u8]> {
+        if overlay_payload.is_empty() {
+            return Err(DbError::corruption(
+                "paged table overlay row is missing from overlay payload",
+            ));
+        }
+        let mut cursor = Cursor::new(overlay_payload);
+        let magic = cursor.read_slice(TABLE_PAYLOAD_MAGIC.len())?;
+        if magic != TABLE_PAYLOAD_MAGIC {
+            return Err(DbError::corruption("table payload magic is invalid"));
+        }
+        let row_count = cursor.read_u32()? as usize;
+        let mut matched_row_bytes = None;
+        for _ in 0..row_count {
+            let current_row_id = cursor.read_i64()?;
+            let row_bytes_len = cursor.read_u32()? as usize;
+            let row_bytes = cursor.read_slice(row_bytes_len)?;
+            if current_row_id == row_id {
+                matched_row_bytes = Some(row_bytes);
+            }
+        }
+        matched_row_bytes.ok_or_else(|| {
+            DbError::corruption("paged table overlay row is missing from overlay payload")
+        })
+    }
+
     fn row_at_position(&self, position: usize) -> Result<Option<TableRowRef<'_>>> {
         let Some(entry) = self.rows.get(position) else {
             return Ok(None);
@@ -938,20 +1006,9 @@ impl TablePageManifest {
         let chunk = self.chunks.get(entry.chunk_index as usize).ok_or_else(|| {
             DbError::corruption("paged table chunk index exceeded chunk list length")
         })?;
-        let payload = if entry.is_overlay {
-            chunk
-                .overlay_payload
-                .as_ref()
-                .ok_or_else(|| DbError::corruption("paged table overlay chunk is missing"))?
-        } else {
-            &chunk.payload
+        let Some(row_bytes) = self.row_bytes_for_entry(entry, chunk)? else {
+            return Ok(None);
         };
-        let start = entry.locator.byte_offset as usize;
-        let end = start + entry.locator.byte_len as usize;
-        let row_bytes = payload
-            .as_slice()
-            .get(start..end)
-            .ok_or_else(|| DbError::corruption("paged row locator exceeded payload length"))?;
         let row = Row::decode(row_bytes)?;
         Ok(Some(TableRowRef::Decoded(StoredRow {
             row_id: entry.row_id,
@@ -970,20 +1027,9 @@ impl TablePageManifest {
         let chunk = self.chunks.get(entry.chunk_index as usize).ok_or_else(|| {
             DbError::corruption("paged table chunk index exceeded chunk list length")
         })?;
-        let payload = if entry.is_overlay {
-            chunk
-                .overlay_payload
-                .as_ref()
-                .ok_or_else(|| DbError::corruption("paged table overlay chunk is missing"))?
-        } else {
-            &chunk.payload
+        let Some(row_bytes) = self.row_bytes_for_entry(entry, chunk)? else {
+            return Ok(None);
         };
-        let start = entry.locator.byte_offset as usize;
-        let end = start + entry.locator.byte_len as usize;
-        let row_bytes = payload
-            .as_slice()
-            .get(start..end)
-            .ok_or_else(|| DbError::corruption("paged row locator exceeded payload length"))?;
         Row::decode_projection_with_overflow::<page::InMemoryPageStore>(
             row_bytes,
             None,
@@ -1000,20 +1046,9 @@ impl TablePageManifest {
             let chunk = self.chunks.get(entry.chunk_index as usize).ok_or_else(|| {
                 DbError::corruption("paged table chunk index exceeded chunk list length")
             })?;
-            let payload = if entry.is_overlay {
-                chunk
-                    .overlay_payload
-                    .as_ref()
-                    .ok_or_else(|| DbError::corruption("paged table overlay chunk is missing"))?
-            } else {
-                &chunk.payload
+            let Some(row_bytes) = self.row_bytes_for_entry(entry, chunk)? else {
+                continue;
             };
-            let start = entry.locator.byte_offset as usize;
-            let end = start + entry.locator.byte_len as usize;
-            let row_bytes = payload
-                .as_slice()
-                .get(start..end)
-                .ok_or_else(|| DbError::corruption("paged row locator exceeded payload length"))?;
             visitor(entry.row_id, Row::decode_int64_at(row_bytes, column_index)?)?;
         }
         Ok(())
@@ -1034,6 +1069,93 @@ impl TablePageManifest {
             + self.tombstoned_row_ids.len() * std::mem::size_of::<i64>()
             + self.rows.capacity() * std::mem::size_of::<TablePageEntry>()
     }
+}
+
+fn table_page_entries_for_chunk(
+    chunk_index: usize,
+    chunk: &TablePageManifestChunk,
+) -> Result<Vec<TablePageEntry>> {
+    let mut overlay_ids = BTreeSet::new();
+    if let Some(overlay_payload) = &chunk.overlay_payload {
+        if !overlay_payload.is_empty() {
+            let mut cursor = Cursor::new(overlay_payload.as_slice());
+            let magic = cursor.read_slice(TABLE_PAYLOAD_MAGIC.len())?;
+            if magic != TABLE_PAYLOAD_MAGIC {
+                return Err(DbError::corruption("table payload magic is invalid"));
+            }
+            let row_count = cursor.read_u32()? as usize;
+            for _ in 0..row_count {
+                let row_id = cursor.read_i64()?;
+                let row_bytes_len = cursor.read_u32()? as usize;
+                cursor.read_slice(row_bytes_len)?;
+                overlay_ids.insert(row_id);
+            }
+        }
+    }
+
+    let mut entries = Vec::new();
+    if !chunk.payload.is_empty() {
+        let mut cursor = Cursor::new(chunk.payload.as_slice());
+        let magic = cursor.read_slice(TABLE_PAYLOAD_MAGIC.len())?;
+        if magic != TABLE_PAYLOAD_MAGIC {
+            return Err(DbError::corruption("table payload magic is invalid"));
+        }
+        let row_count = cursor.read_u32()? as usize;
+        for _ in 0..row_count {
+            let row_id = cursor.read_i64()?;
+            let row_bytes_len = cursor.read_u32()? as usize;
+            let row_bytes_offset = cursor.offset;
+            let row_bytes = cursor.read_slice(row_bytes_len)?;
+            Row::decode(row_bytes)?;
+            if chunk.tombstoned_row_ids.contains(&row_id) || overlay_ids.contains(&row_id) {
+                continue;
+            }
+            entries.push(TablePageEntry {
+                row_id,
+                chunk_index: u32::try_from(chunk_index)
+                    .map_err(|_| DbError::constraint("table chunk index exceeds u32"))?,
+                is_overlay: false,
+                locator: RowLocatorV1 {
+                    byte_offset: u32::try_from(row_bytes_offset)
+                        .map_err(|_| DbError::constraint("row locator offset exceeds u32"))?,
+                    byte_len: u32::try_from(row_bytes_len)
+                        .map_err(|_| DbError::constraint("row locator length exceeds u32"))?,
+                },
+            });
+        }
+    }
+
+    if let Some(overlay_payload) = &chunk.overlay_payload {
+        if !overlay_payload.is_empty() {
+            let mut cursor = Cursor::new(overlay_payload.as_slice());
+            let magic = cursor.read_slice(TABLE_PAYLOAD_MAGIC.len())?;
+            if magic != TABLE_PAYLOAD_MAGIC {
+                return Err(DbError::corruption("table payload magic is invalid"));
+            }
+            let row_count = cursor.read_u32()? as usize;
+            for _ in 0..row_count {
+                let row_id = cursor.read_i64()?;
+                let row_bytes_len = cursor.read_u32()? as usize;
+                let row_bytes_offset = cursor.offset;
+                let row_bytes = cursor.read_slice(row_bytes_len)?;
+                Row::decode(row_bytes)?;
+                entries.push(TablePageEntry {
+                    row_id,
+                    chunk_index: u32::try_from(chunk_index)
+                        .map_err(|_| DbError::constraint("table chunk index exceeds u32"))?,
+                    is_overlay: true,
+                    locator: RowLocatorV1 {
+                        byte_offset: u32::try_from(row_bytes_offset)
+                            .map_err(|_| DbError::constraint("row locator offset exceeds u32"))?,
+                        byte_len: u32::try_from(row_bytes_len)
+                            .map_err(|_| DbError::constraint("row locator length exceeds u32"))?,
+                    },
+                });
+            }
+        }
+    }
+
+    Ok(entries)
 }
 
 fn append_encoded_table_payload_row(
@@ -1064,6 +1186,109 @@ fn append_encoded_table_payload_row(
         byte_len: u32::try_from(encoded_values.len())
             .map_err(|_| DbError::constraint("row locator length exceeds u32"))?,
     })
+}
+
+fn try_apply_paged_row_changes_to_manifest_update_only(
+    manifest: &TablePageManifest,
+    row_changes: &BTreeMap<i64, Option<Vec<Value>>>,
+) -> Result<Option<TablePageManifest>> {
+    if row_changes.is_empty() {
+        return Ok(None);
+    }
+
+    let mut planned_changes = Vec::with_capacity(row_changes.len());
+    for (row_id, change) in row_changes {
+        let Some(next_values) = change.as_ref() else {
+            return Ok(None);
+        };
+        let Ok(entry_index) = manifest
+            .rows
+            .binary_search_by_key(row_id, |entry| entry.row_id)
+        else {
+            return Ok(None);
+        };
+        let entry = manifest.rows[entry_index];
+        if entry.is_overlay {
+            return Ok(None);
+        }
+        let chunk_index = usize::try_from(entry.chunk_index).map_err(|_| {
+            DbError::corruption("paged table chunk index exceeded chunk list length")
+        })?;
+        planned_changes.push((*row_id, chunk_index, next_values.clone()));
+    }
+
+    let mut updated_manifest = manifest.clone();
+    let chunks = Arc::make_mut(&mut updated_manifest.chunks);
+    let tombstoned_row_ids = Arc::make_mut(&mut updated_manifest.tombstoned_row_ids);
+
+    for (row_id, chunk_index, next_values) in planned_changes {
+        let chunk = chunks.get_mut(chunk_index).ok_or_else(|| {
+            DbError::corruption("paged table chunk index exceeded chunk list length")
+        })?;
+        if chunk.tombstoned_row_ids.contains(&row_id) {
+            return Ok(None);
+        }
+
+        let overlay_payload = chunk.overlay_payload.get_or_insert_with(|| {
+            let mut payload = Vec::with_capacity(TABLE_PAYLOAD_MAGIC.len() + 4 + 128);
+            payload.extend_from_slice(TABLE_PAYLOAD_MAGIC);
+            payload.extend_from_slice(&0_u32.to_le_bytes());
+            Arc::new(payload)
+        });
+        let mut encoded_values = Vec::with_capacity(128);
+        Row::encode_values_into(&next_values, &mut encoded_values)?;
+        append_encoded_table_payload_row(Arc::make_mut(overlay_payload), row_id, &encoded_values)?;
+        Arc::make_mut(&mut chunk.tombstoned_row_ids).insert(row_id);
+        chunk.overlay_pointer = None;
+        chunk.overlay_checksum = None;
+        tombstoned_row_ids.insert(row_id);
+    }
+
+    Ok(Some(updated_manifest))
+}
+
+fn try_apply_single_paged_row_update_to_manifest(
+    manifest: &TablePageManifest,
+    row_id: i64,
+    next_values: &[Value],
+) -> Result<Option<TablePageManifest>> {
+    let Ok(entry_index) = manifest
+        .rows
+        .binary_search_by_key(&row_id, |entry| entry.row_id)
+    else {
+        return Ok(None);
+    };
+    let entry = manifest.rows[entry_index];
+    if entry.is_overlay {
+        return Ok(None);
+    }
+    let chunk_index = usize::try_from(entry.chunk_index)
+        .map_err(|_| DbError::corruption("paged table chunk index exceeded chunk list length"))?;
+    let mut updated_manifest = manifest.clone();
+    let chunks = Arc::make_mut(&mut updated_manifest.chunks);
+    let tombstoned_row_ids = Arc::make_mut(&mut updated_manifest.tombstoned_row_ids);
+    let chunk = chunks
+        .get_mut(chunk_index)
+        .ok_or_else(|| DbError::corruption("paged table chunk index exceeded chunk list length"))?;
+    if chunk.tombstoned_row_ids.contains(&row_id) {
+        return Ok(None);
+    }
+
+    let overlay_payload = chunk.overlay_payload.get_or_insert_with(|| {
+        let mut payload = Vec::with_capacity(TABLE_PAYLOAD_MAGIC.len() + 4 + 128);
+        payload.extend_from_slice(TABLE_PAYLOAD_MAGIC);
+        payload.extend_from_slice(&0_u32.to_le_bytes());
+        Arc::new(payload)
+    });
+    let mut encoded_values = Vec::with_capacity(128);
+    Row::encode_values_into(next_values, &mut encoded_values)?;
+    append_encoded_table_payload_row(Arc::make_mut(overlay_payload), row_id, &encoded_values)?;
+    Arc::make_mut(&mut chunk.tombstoned_row_ids).insert(row_id);
+    chunk.overlay_pointer = None;
+    chunk.overlay_checksum = None;
+    tombstoned_row_ids.insert(row_id);
+
+    Ok(Some(updated_manifest))
 }
 
 pub(crate) enum TableRowIter<'a> {
@@ -1235,7 +1460,7 @@ impl TableRowSource {
         }
     }
 
-    fn row_by_id(&self, row_id: i64) -> Result<Option<TableRowRef<'_>>> {
+    pub(crate) fn row_by_id(&self, row_id: i64) -> Result<Option<TableRowRef<'_>>> {
         match self {
             Self::Resident(data) => Ok(data.row_by_id(row_id).map(TableRowRef::Resident)),
             Self::Paged(manifest) => manifest.row_by_id(row_id),
@@ -1461,6 +1686,44 @@ impl RuntimeBtreeKeys {
         let mut values = Vec::with_capacity(row_ids.len());
         row_ids.for_each(|row_id| values.push(row_id));
         values
+    }
+
+    pub(super) fn row_ids_for_encoded_key_prefix(&self, prefix: &[Value]) -> Result<Vec<i64>> {
+        if prefix.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let projection_indexes: Vec<usize> = (0..prefix.len()).collect();
+        let mut row_ids = Vec::new();
+        let mut collect_matching_row_ids =
+            |encoded_key: &[u8], entry_row_ids: &[i64]| -> Result<()> {
+                let decoded_prefix = Row::decode_projection_with_overflow::<
+                    crate::storage::page::InMemoryPageStore,
+                >(encoded_key, None, &projection_indexes)?;
+                if decoded_prefix.as_slice() == prefix {
+                    row_ids.extend(entry_row_ids.iter().copied());
+                }
+                Ok(())
+            };
+
+        match self {
+            Self::UniqueEncoded(keys) => {
+                for (encoded_key, row_id) in keys {
+                    collect_matching_row_ids(encoded_key, std::slice::from_ref(row_id))?;
+                }
+            }
+            Self::NonUniqueEncoded(keys) => {
+                for (encoded_key, entry_row_ids) in keys {
+                    collect_matching_row_ids(encoded_key, entry_row_ids)?;
+                }
+            }
+            Self::UniqueInt64(_)
+            | Self::NonUniqueInt64(_)
+            | Self::UniqueUuid(_)
+            | Self::NonUniqueUuid(_) => {}
+        }
+
+        Ok(row_ids)
     }
 
     pub(super) fn row_ids_for_value_set(&self, value: &Value) -> Result<RuntimeRowIdSet<'_>> {
@@ -4362,6 +4625,7 @@ impl EngineRuntime {
         let Some(table_name) = self.canonical_catalog_table_name(table_name) else {
             return;
         };
+        self.catalog_mut().table_stats.remove(&table_name);
         self.paged_mutations.remove(&table_name);
         self.dirty_tables_mut().insert(table_name);
     }
@@ -4379,6 +4643,7 @@ impl EngineRuntime {
         let Some(table_name) = self.canonical_catalog_table_name(table_name) else {
             return;
         };
+        self.catalog_mut().table_stats.remove(&table_name);
         if self.dirty_tables.contains(&table_name)
             && !self.paged_mutations.contains_key(&table_name)
         {
@@ -4399,6 +4664,7 @@ impl EngineRuntime {
         let Some(table_name) = self.canonical_catalog_table_name(table_name) else {
             return;
         };
+        self.catalog_mut().table_stats.remove(&table_name);
         if self.dirty_tables.contains(&table_name)
             && !self.paged_mutations.contains_key(&table_name)
         {
@@ -4416,9 +4682,12 @@ impl EngineRuntime {
         if self.visible_table_is_temporary(table_name) {
             return;
         }
-        if let Some(delta) = self.paged_mutations.get_mut(table_name) {
-            delta.append_count += 1;
-            return;
+        if self.paged_mutations.contains_key(table_name) {
+            self.catalog_mut().table_stats.remove(table_name);
+            if let Some(delta) = self.paged_mutations.get_mut(table_name) {
+                delta.append_count += 1;
+                return;
+            }
         }
         if self.dirty_tables.contains(table_name) {
             return;
@@ -4426,6 +4695,7 @@ impl EngineRuntime {
         let Some(table_name) = self.canonical_catalog_table_name(table_name) else {
             return;
         };
+        self.catalog_mut().table_stats.remove(&table_name);
         if let Some(delta) = self.paged_mutations.get_mut(table_name.as_str()) {
             delta.append_count += 1;
             return;
@@ -5362,30 +5632,44 @@ impl EngineRuntime {
         let Some(state) = self.persisted_table_state(plan.table_name) else {
             return Ok(None);
         };
-        let row_count = self
-            .catalog
-            .table_stats
-            .iter()
-            .find(|(name, _)| identifiers_equal(name, plan.table_name))
-            .map(|(_, stats)| stats.row_count)
-            .or_else(|| {
-                if state.row_count == 0
-                    && state.pointer.head_page_id != 0
-                    && state.pointer.logical_len != 0
-                {
-                    let store = SnapshotPageStore {
-                        pager,
-                        wal,
-                        snapshot_lsn,
-                    };
-                    read_persisted_table_row_count(&store, state)
-                        .ok()
-                        .and_then(|count| i64::try_from(count).ok())
-                } else {
-                    i64::try_from(state.row_count).ok()
-                }
-            })
-            .unwrap_or(0);
+        let row_count = if state.pointer.is_table_paged_manifest()
+            && state.pointer.head_page_id != 0
+            && state.pointer.logical_len != 0
+        {
+            let store = SnapshotPageStore {
+                pager,
+                wal,
+                snapshot_lsn,
+            };
+            read_persisted_table_row_count(&store, state)
+                .ok()
+                .and_then(|count| i64::try_from(count).ok())
+                .unwrap_or(0)
+        } else {
+            self.catalog
+                .table_stats
+                .iter()
+                .find(|(name, _)| identifiers_equal(name, plan.table_name))
+                .map(|(_, stats)| stats.row_count)
+                .or_else(|| {
+                    if state.row_count == 0
+                        && state.pointer.head_page_id != 0
+                        && state.pointer.logical_len != 0
+                    {
+                        let store = SnapshotPageStore {
+                            pager,
+                            wal,
+                            snapshot_lsn,
+                        };
+                        read_persisted_table_row_count(&store, state)
+                            .ok()
+                            .and_then(|count| i64::try_from(count).ok())
+                    } else {
+                        i64::try_from(state.row_count).ok()
+                    }
+                })
+                .unwrap_or(0)
+        };
         Ok(Some(QueryResult::with_rows(
             vec![plan.column_name],
             vec![QueryRow::new(vec![Value::Int64(row_count)])],
@@ -14598,6 +14882,287 @@ impl EngineRuntime {
         ))
     }
 
+    fn try_execute_simple_union_range_projection_query(
+        &self,
+        query: &Query,
+        params: &[Value],
+        ctes: &BTreeMap<String, Dataset>,
+    ) -> Result<Option<Dataset>> {
+        if !query.ctes.is_empty() || query.order_by.len() != 1 {
+            return Ok(None);
+        }
+
+        let QueryBody::SetOperation {
+            op: crate::sql::ast::SetOperation::Union,
+            all: false,
+            left,
+            right,
+        } = &query.body
+        else {
+            return Ok(None);
+        };
+
+        let analyze_side = |body: &QueryBody| -> Result<
+            Option<(
+                String,
+                Option<String>,
+                Vec<usize>,
+                Vec<String>,
+                usize,
+                Option<SimpleRangeBoundValue>,
+                Option<SimpleRangeBoundValue>,
+            )>,
+        > {
+            let QueryBody::Select(select) = body else {
+                return Ok(None);
+            };
+            if select.filter.is_none()
+                || !select.group_by.is_empty()
+                || select.having.is_some()
+                || select.distinct
+                || !select.distinct_on.is_empty()
+                || select.from.len() != 1
+            {
+                return Ok(None);
+            }
+            let FromItem::Table { name, alias } = &select.from[0] else {
+                return Ok(None);
+            };
+            if ctes.contains_key(name)
+                || self
+                    .visible_view(name, NameResolutionScope::Session)
+                    .is_some()
+            {
+                return Ok(None);
+            }
+            let Some(table_schema) = self.table_schema(name) else {
+                return Ok(None);
+            };
+            if !generated_columns_are_stored(table_schema) {
+                return Ok(None);
+            }
+            let Some((projection_indexes, column_names)) =
+                self.simple_projection_plan(select, name, alias, table_schema)
+            else {
+                return Ok(None);
+            };
+            if projection_indexes.len() != 1 {
+                return Ok(None);
+            }
+            let Some(filter) = select.filter.as_ref() else {
+                return Ok(None);
+            };
+            let Some(range_filter) = simple_range_projection_filter(filter) else {
+                return Ok(None);
+            };
+            if !range_filter.residual.is_empty() {
+                return Ok(None);
+            }
+            let binding_name = alias.as_deref().unwrap_or(name);
+            if let Some(filter_table) = range_filter.table {
+                if !identifiers_equal(filter_table, name)
+                    && !identifiers_equal(filter_table, binding_name)
+                {
+                    return Ok(None);
+                }
+            }
+            let Some(filter_column_index) = table_schema
+                .columns
+                .iter()
+                .position(|candidate| identifiers_equal(&candidate.name, range_filter.column))
+            else {
+                return Ok(None);
+            };
+            if projection_indexes[0] != filter_column_index {
+                return Ok(None);
+            }
+            let lower_bound = range_filter
+                .lower
+                .map(|bound| {
+                    Ok(SimpleRangeBoundValue {
+                        inclusive: bound.inclusive,
+                        value: self.eval_expr(
+                            bound.value_expr,
+                            &Dataset::empty(),
+                            &[],
+                            params,
+                            &BTreeMap::new(),
+                            None,
+                        )?,
+                    })
+                })
+                .transpose()?;
+            let upper_bound = range_filter
+                .upper
+                .map(|bound| {
+                    Ok(SimpleRangeBoundValue {
+                        inclusive: bound.inclusive,
+                        value: self.eval_expr(
+                            bound.value_expr,
+                            &Dataset::empty(),
+                            &[],
+                            params,
+                            &BTreeMap::new(),
+                            None,
+                        )?,
+                    })
+                })
+                .transpose()?;
+            if !simple_range_bounds_match_column_type(
+                table_schema.columns[filter_column_index].column_type,
+                lower_bound.as_ref(),
+                upper_bound.as_ref(),
+            ) {
+                return Ok(None);
+            }
+            Ok(Some((
+                name.clone(),
+                alias.clone(),
+                projection_indexes,
+                column_names,
+                filter_column_index,
+                lower_bound,
+                upper_bound,
+            )))
+        };
+
+        let Some((
+            left_table_name,
+            left_alias,
+            left_projection_indexes,
+            left_column_names,
+            left_filter_column_index,
+            left_lower_bound,
+            left_upper_bound,
+        )) = analyze_side(left)?
+        else {
+            return Ok(None);
+        };
+        let Some((
+            right_table_name,
+            _right_alias,
+            right_projection_indexes,
+            _right_column_names,
+            right_filter_column_index,
+            right_lower_bound,
+            right_upper_bound,
+        )) = analyze_side(right)?
+        else {
+            return Ok(None);
+        };
+        if !identifiers_equal(&left_table_name, &right_table_name)
+            || left_projection_indexes != right_projection_indexes
+            || left_filter_column_index != right_filter_column_index
+        {
+            return Ok(None);
+        }
+
+        let order_by = &query.order_by[0];
+        if order_by.collation.is_some() || order_by.descending {
+            return Ok(None);
+        }
+        let Expr::Column {
+            table: order_table,
+            column: order_column,
+        } = &order_by.expr
+        else {
+            return Ok(None);
+        };
+        if let Some(order_table) = order_table.as_deref() {
+            if !identifiers_equal(order_table, &left_table_name)
+                && !left_alias
+                    .as_deref()
+                    .is_some_and(|alias| identifiers_equal(order_table, alias))
+            {
+                return Ok(None);
+            }
+        }
+        if !identifiers_equal(order_column, &left_column_names[0]) {
+            return Ok(None);
+        }
+
+        let Some(index) = self.single_column_btree_index(&left_table_name, &left_column_names[0])
+        else {
+            return Ok(None);
+        };
+        let Some(RuntimeIndex::Btree { keys, .. }) = self.index(&index.name) else {
+            return Ok(None);
+        };
+        let Some(left_start) = simple_int64_range_start(left_lower_bound.as_ref()) else {
+            return Ok(None);
+        };
+        let Some(left_end_exclusive) = simple_int64_range_end_exclusive(left_upper_bound.as_ref())
+        else {
+            return Ok(None);
+        };
+        let Some(right_start) = simple_int64_range_start(right_lower_bound.as_ref()) else {
+            return Ok(None);
+        };
+        let Some(right_end_exclusive) =
+            simple_int64_range_end_exclusive(right_upper_bound.as_ref())
+        else {
+            return Ok(None);
+        };
+
+        let mut distinct_values = BTreeSet::new();
+        let mut supported = true;
+        let mut collect_range = |range_start: i64, range_end_exclusive: i64| {
+            if range_start >= range_end_exclusive {
+                return;
+            }
+            match keys {
+                RuntimeBtreeKeys::UniqueInt64(entries) => {
+                    for value in entries.keys() {
+                        if *value >= range_start && *value < range_end_exclusive {
+                            distinct_values.insert(*value);
+                        }
+                    }
+                }
+                RuntimeBtreeKeys::NonUniqueInt64(entries) => {
+                    for (value, row_ids) in entries {
+                        if !row_ids.is_empty()
+                            && *value >= range_start
+                            && *value < range_end_exclusive
+                        {
+                            distinct_values.insert(*value);
+                        }
+                    }
+                }
+                _ => supported = false,
+            }
+        };
+        collect_range(left_start, left_end_exclusive);
+        collect_range(right_start, right_end_exclusive);
+        if !supported {
+            return Ok(None);
+        }
+
+        let limit = query
+            .limit
+            .as_ref()
+            .map(|expr| self.eval_constant_i64(expr, params, &BTreeMap::new()))
+            .transpose()?
+            .map(|value| usize::try_from(value.max(0)).unwrap_or(usize::MAX));
+        let offset = query
+            .offset
+            .as_ref()
+            .map(|expr| self.eval_constant_i64(expr, params, &BTreeMap::new()))
+            .transpose()?
+            .map(|value| usize::try_from(value.max(0)).unwrap_or(usize::MAX))
+            .unwrap_or(0);
+        let rows = distinct_values
+            .into_iter()
+            .skip(offset)
+            .take(limit.unwrap_or(usize::MAX))
+            .map(|value| vec![Value::Int64(value)])
+            .collect();
+        let columns = left_column_names
+            .into_iter()
+            .map(|name| ColumnBinding::visible(None, name))
+            .collect();
+        Ok(Some(Dataset::with_rows(columns, rows)))
+    }
+
     fn try_execute_simple_expression_projection_query(
         &self,
         query: &Query,
@@ -19911,6 +20476,12 @@ impl EngineRuntime {
             ctes.insert(cte.name.clone(), dataset);
         }
 
+        if let Some(dataset) =
+            self.try_execute_simple_union_range_projection_query(query, params, &ctes)?
+        {
+            return Ok(dataset);
+        }
+
         let mut sorted_during_select = false;
         let mut dataset = match &query.body {
             QueryBody::Select(select) => {
@@ -20137,6 +20708,16 @@ impl EngineRuntime {
         let mut sorted_during_select = false;
         let mut dataset = match &query.body {
             QueryBody::Select(select) => {
+                if let Some(dataset) = self.try_fulltext_bm25_top_k_select(
+                    select,
+                    &query.order_by,
+                    query.limit.as_ref(),
+                    query.offset.as_ref(),
+                    params,
+                    &ctes,
+                )? {
+                    return Ok(dataset);
+                }
                 if select_requires_grouped_evaluation(self, select)? {
                     self.evaluate_select_with_outer(
                         select,
@@ -20771,6 +21352,208 @@ impl EngineRuntime {
         }
 
         Ok(None)
+    }
+
+    fn try_fulltext_bm25_top_k_select(
+        &self,
+        select: &Select,
+        order_by: &[crate::sql::ast::OrderBy],
+        limit: Option<&Expr>,
+        offset: Option<&Expr>,
+        params: &[Value],
+        ctes: &BTreeMap<String, Dataset>,
+    ) -> Result<Option<Dataset>> {
+        if offset.is_some()
+            || select.distinct
+            || !select.distinct_on.is_empty()
+            || !select.group_by.is_empty()
+            || select.having.is_some()
+            || select.from.len() != 1
+            || order_by.len() != 1
+        {
+            return Ok(None);
+        }
+        let Some(limit_expr) = limit else {
+            return Ok(None);
+        };
+        let limit = self.eval_constant_i64(limit_expr, params, ctes)?;
+        if limit <= 0 {
+            return Ok(None);
+        }
+        let Ok(limit) = usize::try_from(limit) else {
+            return Ok(None);
+        };
+        let FromItem::Table { name, alias } = &select.from[0] else {
+            return Ok(None);
+        };
+        if ctes.contains_key(name)
+            || self
+                .visible_view(name, NameResolutionScope::Session)
+                .is_some()
+            || self.visible_table_is_temporary(name)
+        {
+            return Ok(None);
+        }
+        let Some(table_schema) = self.table_schema(name) else {
+            return Ok(None);
+        };
+        if !generated_columns_are_stored(table_schema) {
+            return Ok(None);
+        }
+        let Some(row_source) = self.table_row_source(name) else {
+            return Ok(None);
+        };
+        let binding_name = alias.as_deref().unwrap_or(name.as_str());
+        let Some(fulltext_lookup) = exact_fulltext_lookup(select.filter.as_ref()) else {
+            return Ok(None);
+        };
+        let index_value = self.eval_expr(
+            fulltext_lookup.index_name_expr,
+            &Dataset::empty(),
+            &[],
+            params,
+            ctes,
+            None,
+        )?;
+        let query_value = self.eval_expr(
+            fulltext_lookup.query_expr,
+            &Dataset::empty(),
+            &[],
+            params,
+            ctes,
+            None,
+        )?;
+        let Some(index_name) = expect_text_arg("FULLTEXT_MATCH", "first", &index_value)? else {
+            return Ok(None);
+        };
+        let Some(query_text) = expect_text_arg("FULLTEXT_MATCH", "second", &query_value)? else {
+            return Ok(None);
+        };
+        let Some(index_schema) = self.catalog.index(index_name) else {
+            return Ok(None);
+        };
+        if !identifiers_equal(&index_schema.table_name, name)
+            || !index_schema.fresh
+            || index_schema.kind != IndexKind::FullText
+        {
+            return Ok(None);
+        }
+        if !order_by[0].descending {
+            return Ok(None);
+        }
+        let Some(RuntimeIndex::FullText { index }) = self.index(&index_schema.name) else {
+            return Ok(None);
+        };
+
+        enum ProjectionKind {
+            Column(usize),
+            Score,
+        }
+
+        let mut projection_kinds = Vec::with_capacity(select.projection.len());
+        let mut column_names = Vec::with_capacity(select.projection.len());
+        let mut score_alias = None;
+        let mut score_expr = None;
+        for (item_index, item) in select.projection.iter().enumerate() {
+            match item {
+                SelectItem::Expr { expr, alias } => match expr {
+                    Expr::Column {
+                        table: column_table,
+                        column,
+                    } => {
+                        let Some(column_index) = simple_expression_projection_column_index(
+                            table_schema,
+                            name,
+                            binding_name,
+                            column_table.as_deref(),
+                            column,
+                        ) else {
+                            return Ok(None);
+                        };
+                        projection_kinds.push(ProjectionKind::Column(column_index));
+                        column_names.push(alias.clone().unwrap_or_else(|| column.clone()));
+                    }
+                    Expr::Function { name, args }
+                        if name.eq_ignore_ascii_case("bm25") && args.len() == 1 =>
+                    {
+                        if score_expr.is_some() {
+                            return Ok(None);
+                        }
+                        if !order_by_matches_alias_or_projection(
+                            &order_by[0],
+                            alias.as_deref(),
+                            expr,
+                            true,
+                        ) {
+                            return Ok(None);
+                        }
+                        score_alias = alias.clone();
+                        score_expr = Some(expr);
+                        projection_kinds.push(ProjectionKind::Score);
+                        column_names.push(
+                            alias
+                                .clone()
+                                .unwrap_or_else(|| infer_expr_name(expr, item_index + 1)),
+                        );
+                    }
+                    _ => return Ok(None),
+                },
+                SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => return Ok(None),
+            }
+        }
+        let Some(score_expr) = score_expr else {
+            return Ok(None);
+        };
+        if score_alias.is_none()
+            && !order_by_matches_alias_or_projection(&order_by[0], None, score_expr, true)
+        {
+            return Ok(None);
+        }
+        let Expr::Function { args, .. } = score_expr else {
+            return Ok(None);
+        };
+        let score_index_value =
+            self.eval_expr(&args[0], &Dataset::empty(), &[], params, ctes, None)?;
+        let Some(score_index_name) = expect_text_arg("BM25", "first", &score_index_value)? else {
+            return Ok(None);
+        };
+        if !identifiers_equal(score_index_name, index_name) {
+            return Ok(None);
+        }
+
+        let hits = index
+            .search_top_k(query_text, limit)
+            .map_err(|error| DbError::sql(error.message))?;
+        let mut rows = Vec::with_capacity(hits.len());
+        for hit in hits {
+            let Some(row_id) = i64::try_from(hit.row_id).ok() else {
+                continue;
+            };
+            let Some(row) = row_source.row_by_id(row_id)? else {
+                continue;
+            };
+            let mut values = Vec::with_capacity(projection_kinds.len());
+            for projection_kind in &projection_kinds {
+                match projection_kind {
+                    ProjectionKind::Column(index) => {
+                        let Some(value) = row.values().get(*index) else {
+                            return Err(DbError::internal(
+                                "fulltext fast path projection index is out of bounds",
+                            ));
+                        };
+                        values.push(value.clone());
+                    }
+                    ProjectionKind::Score => values.push(Value::Float64(hit.score)),
+                }
+            }
+            rows.push(values);
+        }
+
+        let columns = column_names
+            .into_iter()
+            .map(|name| ColumnBinding::visible(None, name))
+            .collect();
+        Ok(Some(Dataset::with_rows(columns, rows)))
     }
 
     fn trigram_candidate_row_ids_for_filter(
@@ -24551,11 +25334,11 @@ fn build_runtime_index(
                             _ => None,
                         })
                         .collect();
-                    fulltext.insert_document(row.row_id() as u64, &field_refs);
+                    fulltext.insert_document_fresh(row.row_id() as u64, &field_refs);
                 } else {
                     let fields = full_text_fields_for_row(runtime, index, table, values)?;
                     let field_refs = fields.iter().map(Option::as_deref).collect::<Vec<_>>();
-                    fulltext.insert_document(row.row_id() as u64, &field_refs);
+                    fulltext.insert_document_fresh(row.row_id() as u64, &field_refs);
                 }
             }
             Ok(RuntimeIndex::FullText { index: fulltext })
@@ -26609,6 +27392,12 @@ fn apply_paged_row_deletions_to_manifest(
         return Ok(manifest.clone());
     }
 
+    if let Some(updated) =
+        try_apply_paged_row_deletions_to_manifest_without_base_decode(manifest, deleted_row_ids)?
+    {
+        return Ok(updated);
+    }
+
     // Partition deleted row ids by the chunk that owns them, using the
     // manifest entry index. This avoids decoding any base payload row during a
     // pure bulk delete: base rows are immutable, so tombstoning by id is
@@ -26629,6 +27418,7 @@ fn apply_paged_row_deletions_to_manifest(
     }
 
     let mut new_chunks = Vec::with_capacity(manifest.chunks.len());
+    let mut changed_chunk_indexes = BTreeSet::new();
     for (chunk_index, chunk) in manifest.chunks.iter().enumerate() {
         let Some(chunk_deletes) = deletes_by_chunk.get(chunk_index) else {
             new_chunks.push(chunk.clone());
@@ -26684,10 +27474,78 @@ fn apply_paged_row_deletions_to_manifest(
             overlay_checksum: None,
             overlay_payload,
         });
+        changed_chunk_indexes.insert(chunk_index);
     }
 
-    TablePageManifest::from_chunks(new_chunks)
+    rebuild_table_page_manifest_after_sparse_chunk_changes(
+        manifest,
+        new_chunks,
+        &changed_chunk_indexes,
+    )
 }
+
+fn try_apply_paged_row_deletions_to_manifest_without_base_decode(
+    manifest: &TablePageManifest,
+    deleted_row_ids: &BTreeSet<i64>,
+) -> Result<Option<TablePageManifest>> {
+    let mut planned_deletions = Vec::with_capacity(deleted_row_ids.len());
+    for &row_id in deleted_row_ids {
+        let Ok(entry_index) = manifest
+            .rows
+            .binary_search_by_key(&row_id, |entry| entry.row_id)
+        else {
+            continue;
+        };
+        let entry = manifest.rows[entry_index];
+        if entry.is_overlay {
+            return Ok(None);
+        }
+        let chunk_index = usize::try_from(entry.chunk_index).map_err(|_| {
+            DbError::corruption("paged table chunk index exceeded chunk list length")
+        })?;
+        planned_deletions.push((entry_index, chunk_index, row_id));
+    }
+
+    if planned_deletions.is_empty() {
+        return Ok(Some(manifest.clone()));
+    }
+
+    planned_deletions.sort_unstable_by_key(|(entry_index, _, _)| *entry_index);
+
+    let mut updated_manifest = manifest.clone();
+    let chunks = Arc::make_mut(&mut updated_manifest.chunks);
+    let tombstoned_row_ids = Arc::make_mut(&mut updated_manifest.tombstoned_row_ids);
+
+    let mut remaining_deletions = planned_deletions.iter().peekable();
+    let source_rows = manifest.rows.as_ref();
+    let mut rebuilt_rows = Vec::with_capacity(source_rows.len() - planned_deletions.len());
+    for (entry_index, entry) in source_rows.iter().copied().enumerate() {
+        if remaining_deletions
+            .peek()
+            .is_some_and(|(delete_entry_index, _, _)| *delete_entry_index == entry_index)
+        {
+            remaining_deletions.next();
+            continue;
+        }
+        rebuilt_rows.push(entry);
+    }
+    updated_manifest.rows = Arc::new(rebuilt_rows);
+
+    for &(_, chunk_index, row_id) in &planned_deletions {
+        let chunk = chunks.get_mut(chunk_index).ok_or_else(|| {
+            DbError::corruption("paged table chunk index exceeded chunk list length")
+        })?;
+        chunk.row_count = chunk
+            .row_count
+            .checked_sub(1)
+            .ok_or_else(|| DbError::corruption("paged table chunk row count underflow"))?;
+        Arc::make_mut(&mut chunk.tombstoned_row_ids).insert(row_id);
+        tombstoned_row_ids.insert(row_id);
+    }
+
+    Ok(Some(updated_manifest))
+}
+
 fn apply_paged_row_changes_to_manifest(
     manifest: &TablePageManifest,
     row_changes: &BTreeMap<i64, Option<Vec<Value>>>,
@@ -26695,9 +27553,36 @@ fn apply_paged_row_changes_to_manifest(
     if row_changes.is_empty() {
         return Ok(manifest.clone());
     }
+    if let Some(updated) =
+        try_apply_paged_row_changes_to_manifest_update_only(manifest, row_changes)?
+    {
+        return Ok(updated);
+    }
+
+    let mut changes_by_chunk: Vec<BTreeMap<i64, &Option<Vec<Value>>>> = (0..manifest.chunks.len())
+        .map(|_| BTreeMap::new())
+        .collect();
+    for (row_id, change) in row_changes {
+        let Some(chunk_index) = manifest.chunk_index_for_row_id(*row_id) else {
+            continue;
+        };
+        if let Some(chunk_changes) = changes_by_chunk.get_mut(chunk_index) {
+            chunk_changes.insert(*row_id, change);
+        }
+    }
 
     let mut new_chunks = Vec::with_capacity(manifest.chunks.len());
-    for chunk in manifest.chunks.iter() {
+    let mut changed_chunk_indexes = BTreeSet::new();
+    for (chunk_index, chunk) in manifest.chunks.iter().enumerate() {
+        let Some(chunk_changes) = changes_by_chunk.get(chunk_index) else {
+            new_chunks.push(chunk.clone());
+            continue;
+        };
+        if chunk_changes.is_empty() {
+            new_chunks.push(chunk.clone());
+            continue;
+        }
+
         let mut new_tombstones: BTreeSet<i64> = chunk.tombstoned_row_ids.iter().copied().collect();
         // Use BTreeMap so each row_id appears at most once in the overlay.
         let mut overlay_rows: BTreeMap<i64, StoredRow> = BTreeMap::new();
@@ -26707,7 +27592,7 @@ fn apply_paged_row_changes_to_manifest(
         // replacements in the overlay map.
         let previous_rows = decode_table_payload_rows(chunk.payload.as_slice())?;
         for previous_row in previous_rows {
-            match row_changes.get(&previous_row.row_id) {
+            match chunk_changes.get(&previous_row.row_id).copied() {
                 Some(Some(next_values)) => {
                     chunk_changed = true;
                     new_tombstones.insert(previous_row.row_id);
@@ -26732,7 +27617,7 @@ fn apply_paged_row_changes_to_manifest(
         if let Some(overlay_payload) = &chunk.overlay_payload {
             let previous_overlay_rows = decode_table_payload_rows(overlay_payload.as_slice())?;
             for previous_row in previous_overlay_rows {
-                match row_changes.get(&previous_row.row_id) {
+                match chunk_changes.get(&previous_row.row_id).copied() {
                     Some(Some(next_values)) => {
                         chunk_changed = true;
                         overlay_rows.insert(
@@ -26778,9 +27663,63 @@ fn apply_paged_row_changes_to_manifest(
             overlay_checksum: None,
             overlay_payload,
         });
+        changed_chunk_indexes.insert(chunk_index);
     }
 
-    TablePageManifest::from_chunks(new_chunks)
+    rebuild_table_page_manifest_after_sparse_chunk_changes(
+        manifest,
+        new_chunks,
+        &changed_chunk_indexes,
+    )
+}
+
+fn rebuild_table_page_manifest_after_sparse_chunk_changes(
+    manifest: &TablePageManifest,
+    mut new_chunks: Vec<TablePageManifestChunk>,
+    changed_chunk_indexes: &BTreeSet<usize>,
+) -> Result<TablePageManifest> {
+    if changed_chunk_indexes.is_empty() {
+        return Ok(manifest.clone());
+    }
+
+    let tombstoned_row_ids = new_chunks
+        .iter()
+        .flat_map(|chunk| chunk.tombstoned_row_ids.iter().copied())
+        .collect::<BTreeSet<_>>();
+    let mut rows = Vec::with_capacity(manifest.rows.len());
+    for entry in manifest.rows.iter() {
+        if !changed_chunk_indexes.contains(&(entry.chunk_index as usize)) {
+            rows.push(*entry);
+        }
+    }
+    for chunk_index in changed_chunk_indexes {
+        let Some(chunk) = new_chunks.get(*chunk_index) else {
+            return Err(DbError::corruption(
+                "paged table changed chunk index exceeded chunk list length",
+            ));
+        };
+        let chunk_rows = table_page_entries_for_chunk(*chunk_index, chunk)?;
+        if let Some(chunk) = new_chunks.get_mut(*chunk_index) {
+            chunk.row_count = chunk_rows.len();
+        }
+        rows.extend(chunk_rows);
+    }
+    rows.sort_by_key(|entry| entry.row_id);
+    #[cfg(debug_assertions)]
+    {
+        for window in rows.windows(2) {
+            assert_ne!(
+                window[0].row_id, window[1].row_id,
+                "duplicate row_id in TablePageManifest rows"
+            );
+        }
+    }
+
+    Ok(TablePageManifest {
+        chunks: Arc::new(new_chunks),
+        rows: Arc::new(rows),
+        tombstoned_row_ids: Arc::new(tombstoned_row_ids),
+    })
 }
 
 fn read_table_page_manifest_from_state<S: PageStore>(
@@ -32943,7 +33882,7 @@ fn read_table_payload_row_count<S: PageStore>(
     Ok(cursor.read_u32()? as usize)
 }
 
-fn read_persisted_table_row_count<S: PageStore>(
+pub(crate) fn read_persisted_table_row_count<S: PageStore>(
     store: &S,
     state: PersistedTableState,
 ) -> Result<usize> {
@@ -32961,7 +33900,24 @@ fn read_persisted_table_row_count<S: PageStore>(
         ));
     }
     let manifest = decode_paged_table_manifest_payload(&manifest_payload)?;
-    Ok(manifest.chunks.iter().map(|chunk| chunk.row_count).sum())
+    let mut row_count = 0usize;
+    for chunk in manifest.chunks {
+        if chunk.tombstoned_row_ids.is_empty() && chunk.overlay_pointer.is_none() {
+            row_count = row_count.saturating_add(chunk.row_count);
+            continue;
+        }
+        let base_count = read_table_payload_row_count(store, chunk.pointer)?;
+        let overlay_count = match chunk.overlay_pointer {
+            Some(pointer) => read_table_payload_row_count(store, pointer)?,
+            None => 0,
+        };
+        row_count = row_count.saturating_add(
+            base_count
+                .saturating_sub(chunk.tombstoned_row_ids.len())
+                .saturating_add(overlay_count),
+        );
+    }
+    Ok(row_count)
 }
 
 fn read_deferred_row_by_id_from_table_payload<S: PageStore>(
@@ -35573,6 +36529,19 @@ struct SimpleFullTextLookup<'a> {
     query_expr: &'a Expr,
 }
 
+fn exact_fulltext_lookup(filter: Option<&Expr>) -> Option<SimpleFullTextLookup<'_>> {
+    let Some(Expr::Function { name, args }) = filter else {
+        return None;
+    };
+    if !name.eq_ignore_ascii_case("fulltext_match") || args.len() != 2 {
+        return None;
+    }
+    Some(SimpleFullTextLookup {
+        index_name_expr: &args[0],
+        query_expr: &args[1],
+    })
+}
+
 fn simple_fulltext_lookup(filter: &Expr) -> Option<SimpleFullTextLookup<'_>> {
     match filter {
         Expr::Function { name, args }
@@ -36395,56 +37364,7 @@ impl EngineRuntime {
                 return Ok(projected);
             }
         }
-        let window_values = items
-            .iter()
-            .map(|item| match item {
-                SelectItem::Expr {
-                    expr:
-                        Expr::RowNumber {
-                            partition_by,
-                            order_by,
-                            frame,
-                        },
-                    ..
-                } => self
-                    .compute_row_number_values(
-                        dataset,
-                        partition_by,
-                        order_by,
-                        frame.as_ref(),
-                        params,
-                        ctes,
-                    )
-                    .map(Some),
-                SelectItem::Expr {
-                    expr:
-                        Expr::WindowFunction {
-                            name,
-                            args,
-                            partition_by,
-                            order_by,
-                            frame,
-                            distinct,
-                            star,
-                        },
-                    ..
-                } => self
-                    .compute_window_function_values(
-                        dataset,
-                        name,
-                        args,
-                        partition_by,
-                        order_by,
-                        frame.as_ref(),
-                        *distinct,
-                        *star,
-                        params,
-                        ctes,
-                    )
-                    .map(Some),
-                _ => Ok(None),
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let window_values = self.compute_projection_window_values(dataset, items, params, ctes)?;
         let mut columns = Vec::new();
         for (index, item) in items.iter().enumerate() {
             match item {
@@ -36540,6 +37460,457 @@ impl EngineRuntime {
         Ok(Dataset::with_rows(columns, rows))
     }
 
+    fn compute_projection_window_values(
+        &self,
+        dataset: &Dataset,
+        items: &[SelectItem],
+        params: &[Value],
+        ctes: &BTreeMap<String, Dataset>,
+    ) -> Result<Vec<Option<Vec<Value>>>> {
+        let mut window_values = vec![None; items.len()];
+        for item_index in 0..items.len() {
+            if window_values[item_index].is_some() {
+                continue;
+            }
+            match &items[item_index] {
+                SelectItem::Expr {
+                    expr:
+                        Expr::RowNumber {
+                            partition_by,
+                            order_by,
+                            frame,
+                        },
+                    ..
+                } => {
+                    if let Some(peer_index) = Self::find_row_number_lag_peer(items, item_index) {
+                        let (row_number_values, lag_values) = self.compute_row_number_lag_values(
+                            dataset,
+                            partition_by,
+                            order_by,
+                            peer_index,
+                            items,
+                            params,
+                            ctes,
+                        )?;
+                        window_values[item_index] = Some(row_number_values);
+                        window_values[peer_index] = Some(lag_values);
+                        continue;
+                    }
+                    window_values[item_index] = Some(self.compute_row_number_values(
+                        dataset,
+                        partition_by,
+                        order_by,
+                        frame.as_ref(),
+                        params,
+                        ctes,
+                    )?);
+                }
+                SelectItem::Expr {
+                    expr:
+                        Expr::WindowFunction {
+                            name,
+                            args,
+                            partition_by,
+                            order_by,
+                            frame,
+                            distinct,
+                            star,
+                        },
+                    ..
+                } => {
+                    if let Some(peer_index) = Self::find_rank_dense_rank_peer(items, item_index) {
+                        let (rank_values, dense_rank_values) = self
+                            .compute_rank_dense_rank_values(
+                                dataset,
+                                partition_by,
+                                order_by,
+                                params,
+                                ctes,
+                            )?;
+                        if name.eq_ignore_ascii_case("rank") {
+                            window_values[item_index] = Some(rank_values);
+                            window_values[peer_index] = Some(dense_rank_values);
+                        } else {
+                            window_values[item_index] = Some(dense_rank_values);
+                            window_values[peer_index] = Some(rank_values);
+                        }
+                        continue;
+                    }
+                    if name.eq_ignore_ascii_case("lag") {
+                        if let Some(peer_index) = Self::find_lag_row_number_peer(items, item_index)
+                        {
+                            let (row_number_values, lag_values) = self
+                                .compute_row_number_lag_values(
+                                    dataset,
+                                    partition_by,
+                                    order_by,
+                                    item_index,
+                                    items,
+                                    params,
+                                    ctes,
+                                )?;
+                            window_values[item_index] = Some(lag_values);
+                            window_values[peer_index] = Some(row_number_values);
+                            continue;
+                        }
+                    }
+                    window_values[item_index] = Some(self.compute_window_function_values(
+                        dataset,
+                        name,
+                        args,
+                        partition_by,
+                        order_by,
+                        frame.as_ref(),
+                        *distinct,
+                        *star,
+                        params,
+                        ctes,
+                    )?);
+                }
+                _ => {}
+            }
+        }
+        Ok(window_values)
+    }
+
+    fn find_row_number_lag_peer(items: &[SelectItem], item_index: usize) -> Option<usize> {
+        let SelectItem::Expr {
+            expr:
+                Expr::RowNumber {
+                    partition_by,
+                    order_by,
+                    frame,
+                },
+            ..
+        } = items.get(item_index)?
+        else {
+            return None;
+        };
+        items.iter().enumerate().find_map(|(peer_index, item)| {
+            if peer_index == item_index {
+                return None;
+            }
+            let SelectItem::Expr {
+                expr:
+                    Expr::WindowFunction {
+                        name,
+                        args,
+                        partition_by: peer_partition_by,
+                        order_by: peer_order_by,
+                        frame: peer_frame,
+                        distinct,
+                        star,
+                    },
+                ..
+            } = item
+            else {
+                return None;
+            };
+            (!*distinct
+                && !*star
+                && name.eq_ignore_ascii_case("lag")
+                && args.len() == 1
+                && peer_partition_by == partition_by
+                && peer_order_by == order_by
+                && peer_frame == frame)
+                .then_some(peer_index)
+        })
+    }
+
+    fn find_lag_row_number_peer(items: &[SelectItem], item_index: usize) -> Option<usize> {
+        let SelectItem::Expr {
+            expr:
+                Expr::WindowFunction {
+                    name,
+                    args,
+                    partition_by,
+                    order_by,
+                    frame,
+                    distinct,
+                    star,
+                },
+            ..
+        } = items.get(item_index)?
+        else {
+            return None;
+        };
+        if *distinct || *star || !name.eq_ignore_ascii_case("lag") || args.len() != 1 {
+            return None;
+        }
+        items.iter().enumerate().find_map(|(peer_index, item)| {
+            if peer_index == item_index {
+                return None;
+            }
+            let SelectItem::Expr {
+                expr:
+                    Expr::RowNumber {
+                        partition_by: peer_partition_by,
+                        order_by: peer_order_by,
+                        frame: peer_frame,
+                    },
+                ..
+            } = item
+            else {
+                return None;
+            };
+            (peer_partition_by == partition_by && peer_order_by == order_by && peer_frame == frame)
+                .then_some(peer_index)
+        })
+    }
+
+    fn find_rank_dense_rank_peer(items: &[SelectItem], item_index: usize) -> Option<usize> {
+        let SelectItem::Expr {
+            expr:
+                Expr::WindowFunction {
+                    name,
+                    args,
+                    partition_by,
+                    order_by,
+                    frame,
+                    distinct,
+                    star,
+                },
+            ..
+        } = items.get(item_index)?
+        else {
+            return None;
+        };
+        if *distinct || *star || !args.is_empty() {
+            return None;
+        }
+        let target_name = if name.eq_ignore_ascii_case("rank") {
+            "dense_rank"
+        } else if name.eq_ignore_ascii_case("dense_rank") {
+            "rank"
+        } else {
+            return None;
+        };
+        items.iter().enumerate().find_map(|(peer_index, item)| {
+            if peer_index == item_index {
+                return None;
+            }
+            let SelectItem::Expr {
+                expr:
+                    Expr::WindowFunction {
+                        name: peer_name,
+                        args: peer_args,
+                        partition_by: peer_partition_by,
+                        order_by: peer_order_by,
+                        frame: peer_frame,
+                        distinct: peer_distinct,
+                        star: peer_star,
+                    },
+                ..
+            } = item
+            else {
+                return None;
+            };
+            (!*peer_distinct
+                && !*peer_star
+                && peer_args.is_empty()
+                && peer_name.eq_ignore_ascii_case(target_name)
+                && peer_partition_by == partition_by
+                && peer_order_by == order_by
+                && peer_frame == frame)
+                .then_some(peer_index)
+        })
+    }
+
+    fn compute_rank_dense_rank_values(
+        &self,
+        dataset: &Dataset,
+        partition_by: &[Expr],
+        order_by: &[crate::sql::ast::OrderBy],
+        params: &[Value],
+        ctes: &BTreeMap<String, Dataset>,
+    ) -> Result<(Vec<Value>, Vec<Value>)> {
+        let mut partitions = BTreeMap::<Vec<u8>, Vec<usize>>::new();
+        for (row_index, row) in dataset.rows.iter().enumerate() {
+            let key = if partition_by.is_empty() {
+                vec![0]
+            } else {
+                let values = partition_by
+                    .iter()
+                    .map(|expr| self.eval_expr(expr, dataset, row, params, ctes, None))
+                    .collect::<Result<Vec<_>>>()?;
+                row_identity(&values)?
+            };
+            partitions.entry(key).or_default().push(row_index);
+        }
+
+        let mut rank_results = vec![Value::Null; dataset.rows.len()];
+        let mut dense_rank_results = vec![Value::Null; dataset.rows.len()];
+        for indices in partitions.into_values() {
+            let mut sorted = indices;
+            sorted.sort_by(|left, right| {
+                for order in order_by {
+                    let left_value = self
+                        .eval_expr(
+                            &order.expr,
+                            dataset,
+                            &dataset.rows[*left],
+                            params,
+                            ctes,
+                            None,
+                        )
+                        .unwrap_or(Value::Null);
+                    let right_value = self
+                        .eval_expr(
+                            &order.expr,
+                            dataset,
+                            &dataset.rows[*right],
+                            params,
+                            ctes,
+                            None,
+                        )
+                        .unwrap_or(Value::Null);
+                    let ordering = compare_values(&left_value, &right_value)
+                        .unwrap_or(std::cmp::Ordering::Equal);
+                    if ordering != std::cmp::Ordering::Equal {
+                        return if order.descending {
+                            ordering.reverse()
+                        } else {
+                            ordering
+                        };
+                    }
+                }
+                left.cmp(right)
+            });
+
+            let order_keys = sorted
+                .iter()
+                .map(|row_index| {
+                    order_by
+                        .iter()
+                        .map(|order| {
+                            self.eval_expr(
+                                &order.expr,
+                                dataset,
+                                &dataset.rows[*row_index],
+                                params,
+                                ctes,
+                                None,
+                            )
+                        })
+                        .collect::<Result<Vec<_>>>()
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let mut current_rank = 1_i64;
+            let mut current_dense_rank = 1_i64;
+            for (ordinal, row_index) in sorted.iter().enumerate() {
+                if ordinal > 0
+                    && !window_order_keys_equal(&order_keys[ordinal - 1], &order_keys[ordinal])?
+                {
+                    current_rank = (ordinal + 1) as i64;
+                    current_dense_rank += 1;
+                }
+                rank_results[*row_index] = Value::Int64(current_rank);
+                dense_rank_results[*row_index] = Value::Int64(current_dense_rank);
+            }
+        }
+        Ok((rank_results, dense_rank_results))
+    }
+
+    fn compute_row_number_lag_values(
+        &self,
+        dataset: &Dataset,
+        partition_by: &[Expr],
+        order_by: &[crate::sql::ast::OrderBy],
+        lag_item_index: usize,
+        items: &[SelectItem],
+        params: &[Value],
+        ctes: &BTreeMap<String, Dataset>,
+    ) -> Result<(Vec<Value>, Vec<Value>)> {
+        let SelectItem::Expr {
+            expr: Expr::WindowFunction { args, .. },
+            ..
+        } = items
+            .get(lag_item_index)
+            .ok_or_else(|| DbError::internal("window lag item index is invalid"))?
+        else {
+            return Err(DbError::internal("window lag item index is invalid"));
+        };
+        let lag_expr = args
+            .first()
+            .ok_or_else(|| DbError::internal("window lag expression is missing"))?;
+        let mut partitions = BTreeMap::<Vec<u8>, Vec<usize>>::new();
+        for (row_index, row) in dataset.rows.iter().enumerate() {
+            let key = if partition_by.is_empty() {
+                vec![0]
+            } else {
+                let values = partition_by
+                    .iter()
+                    .map(|expr| self.eval_expr(expr, dataset, row, params, ctes, None))
+                    .collect::<Result<Vec<_>>>()?;
+                row_identity(&values)?
+            };
+            partitions.entry(key).or_default().push(row_index);
+        }
+
+        let mut row_number_results = vec![Value::Null; dataset.rows.len()];
+        let mut lag_results = vec![Value::Null; dataset.rows.len()];
+        for indices in partitions.into_values() {
+            let mut sorted = indices;
+            sorted.sort_by(|left, right| {
+                for order in order_by {
+                    let left_value = self
+                        .eval_expr(
+                            &order.expr,
+                            dataset,
+                            &dataset.rows[*left],
+                            params,
+                            ctes,
+                            None,
+                        )
+                        .unwrap_or(Value::Null);
+                    let right_value = self
+                        .eval_expr(
+                            &order.expr,
+                            dataset,
+                            &dataset.rows[*right],
+                            params,
+                            ctes,
+                            None,
+                        )
+                        .unwrap_or(Value::Null);
+                    let ordering = compare_values(&left_value, &right_value)
+                        .unwrap_or(std::cmp::Ordering::Equal);
+                    if ordering != std::cmp::Ordering::Equal {
+                        return if order.descending {
+                            ordering.reverse()
+                        } else {
+                            ordering
+                        };
+                    }
+                }
+                left.cmp(right)
+            });
+
+            let ordered_values = sorted
+                .iter()
+                .map(|row_index| {
+                    self.eval_expr(
+                        lag_expr,
+                        dataset,
+                        &dataset.rows[*row_index],
+                        params,
+                        ctes,
+                        None,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
+            for (ordinal, row_index) in sorted.iter().enumerate() {
+                row_number_results[*row_index] = Value::Int64((ordinal + 1) as i64);
+                lag_results[*row_index] = ordinal
+                    .checked_sub(1)
+                    .and_then(|previous| ordered_values.get(previous))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+            }
+        }
+        Ok((row_number_results, lag_results))
+    }
+
     fn compute_row_number_values(
         &self,
         dataset: &Dataset,
@@ -36616,7 +37987,7 @@ impl EngineRuntime {
         args: &[Expr],
         partition_by: &[Expr],
         order_by: &[crate::sql::ast::OrderBy],
-        _frame: Option<&crate::sql::ast::WindowFrame>,
+        frame: Option<&crate::sql::ast::WindowFrame>,
         _distinct: bool,
         _star: bool,
         params: &[Value],
@@ -36909,7 +38280,7 @@ impl EngineRuntime {
                             &peer_starts,
                             &peer_ends,
                             ordinal,
-                            _frame,
+                            frame,
                             params,
                             ctes,
                         )?;
@@ -36966,7 +38337,7 @@ impl EngineRuntime {
                             &peer_starts,
                             &peer_ends,
                             ordinal,
-                            _frame,
+                            frame,
                             params,
                             ctes,
                         )?;
@@ -36993,7 +38364,7 @@ impl EngineRuntime {
                             &peer_starts,
                             &peer_ends,
                             ordinal,
-                            _frame,
+                            frame,
                             params,
                             ctes,
                         )?;

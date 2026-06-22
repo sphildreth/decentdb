@@ -22,9 +22,10 @@ use crate::sync::{self, SyncOperation};
 use super::row::{ColumnBinding, Dataset, QueryResult, QueryRow};
 use super::{
     compare_values, compute_index_key, compute_index_values, covering_payload_values_for_row,
-    generated_columns_are_stored, row_satisfies_index_predicate, spatial_index_value_for_row,
-    table_row_dataset, EngineRuntime, RuntimeBtreeKey, RuntimeIndex, RuntimeRowIdSet, StoredRow,
-    TablePageManifest, TableRowRef, TableRowSource, PAGED_TABLE_RESIDENT_APPEND_ROW_THRESHOLD,
+    generated_columns_are_stored, infer_expr_name, row_satisfies_index_predicate,
+    row_satisfies_index_predicate_with_expr, spatial_index_value_for_row, table_row_dataset,
+    EngineRuntime, RuntimeBtreeKey, RuntimeIndex, RuntimeRowIdSet, StoredRow, TablePageManifest,
+    TableRowRef, TableRowSource, PAGED_TABLE_RESIDENT_APPEND_ROW_THRESHOLD,
 };
 
 #[derive(Clone, Debug)]
@@ -156,7 +157,48 @@ pub(crate) struct PreparedSimpleDelete {
     pub(crate) indexes: Vec<crate::catalog::IndexSchema>,
     pub(crate) lookup: PreparedDeleteLookup,
     pub(crate) restrict_children: Vec<PreparedSimpleDeleteRestrictChild>,
+    delete_children: Vec<PreparedDeleteCascadeChild>,
+    dependency_table_names: Vec<String>,
     pub(crate) compiled_index_state_epoch: u64,
+}
+
+impl PreparedSimpleDelete {
+    pub(crate) fn affected_table_names(&self) -> Vec<&str> {
+        let mut table_names = Vec::with_capacity(1 + self.dependency_table_names.len());
+        table_names.push(self.table.name.as_str());
+        for dependency in &self.dependency_table_names {
+            if !table_names
+                .iter()
+                .any(|name| identifiers_equal(name, dependency))
+            {
+                table_names.push(dependency.as_str());
+            }
+        }
+        table_names
+    }
+
+    pub(crate) fn child_index_hydration_targets(&self) -> Vec<(&str, &str)> {
+        let mut targets = Vec::new();
+        for child in &self.restrict_children {
+            if let Some(index_name) = child.child_index_name.as_deref() {
+                push_unique_child_index_hydration_target(
+                    &mut targets,
+                    child.child_table_name.as_str(),
+                    index_name,
+                );
+            }
+        }
+        for child in &self.delete_children {
+            if let Some(index_name) = child.child_index_name.as_deref() {
+                push_unique_child_index_hydration_target(
+                    &mut targets,
+                    child.child_table.name.as_str(),
+                    index_name,
+                );
+            }
+        }
+        targets
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -166,6 +208,21 @@ struct PreparedDeleteCascadeChild {
     parent_column_indexes: Vec<usize>,
     child_column_indexes: Vec<usize>,
     child_index_name: Option<String>,
+    child_index_prefix_len: Option<usize>,
+}
+
+fn push_unique_child_index_hydration_target<'a>(
+    targets: &mut Vec<(&'a str, &'a str)>,
+    table_name: &'a str,
+    index_name: &'a str,
+) {
+    if targets.iter().any(|(existing_table, existing_index)| {
+        identifiers_equal(existing_table, table_name)
+            && identifiers_equal(existing_index, index_name)
+    }) {
+        return;
+    }
+    targets.push((table_name, index_name));
 }
 
 #[derive(Clone, Debug)]
@@ -1113,10 +1170,18 @@ impl EngineRuntime {
                         break;
                     }
                 }
-                let mut row_changes = BTreeMap::new();
-                row_changes.insert(row_id, Some(next_values.clone()));
-                let updated_manifest =
-                    super::apply_paged_row_changes_to_manifest(manifest.as_ref(), &row_changes)?;
+                let updated_manifest = if let Some(updated_manifest) =
+                    super::try_apply_single_paged_row_update_to_manifest(
+                        manifest.as_ref(),
+                        row_id,
+                        &next_values,
+                    )? {
+                    updated_manifest
+                } else {
+                    let mut row_changes = BTreeMap::new();
+                    row_changes.insert(row_id, Some(next_values.clone()));
+                    super::apply_paged_row_changes_to_manifest(manifest.as_ref(), &row_changes)?
+                };
                 self.replace_table_row_source(
                     &prepared.table_name,
                     TableRowSource::Paged(Arc::new(updated_manifest)),
@@ -1168,13 +1233,19 @@ impl EngineRuntime {
             .table_schema(&statement.table_name)
             .cloned()
             .ok_or_else(|| DbError::sql(format!("unknown table {}", statement.table_name)))?;
-        let Some(restrict_children) = prepare_simple_delete_restrict_children(self, &table)? else {
+        let Some(restrict_children) =
+            prepare_simple_delete_prepared_restrict_children(self, &table)?
+        else {
+            return Ok(None);
+        };
+        let Some(delete_children) = prepare_simple_delete_cascade_children(self, &table)? else {
             return Ok(None);
         };
 
         let Some(filter) = statement.filter.as_ref() else {
             return Ok(None);
         };
+        let dependency_table_names = collect_delete_dependency_tables(self, &table.name);
         let indexes = self
             .catalog
             .indexes
@@ -1251,6 +1322,8 @@ impl EngineRuntime {
             indexes,
             lookup,
             restrict_children,
+            delete_children,
+            dependency_table_names,
             compiled_index_state_epoch: self.index_state_epoch,
         }))
     }
@@ -1264,6 +1337,10 @@ impl EngineRuntime {
                 .restrict_children
                 .iter()
                 .all(|child| !self.visible_table_is_temporary(&child.child_table_name))
+            && prepared
+                .dependency_table_names
+                .iter()
+                .all(|table_name| !self.visible_table_is_temporary(table_name))
     }
 
     pub(crate) fn execute_prepared_simple_delete(
@@ -1375,6 +1452,16 @@ impl EngineRuntime {
                 }
             }
         }
+        if !prepared.delete_children.is_empty() {
+            self.apply_parent_delete_actions_rows(
+                &prepared.table_name,
+                &prepared.table,
+                &removed_rows,
+                &prepared.delete_children,
+                params,
+                _page_size,
+            )?;
+        }
 
         if row_source_was_resident {
             {
@@ -1425,13 +1512,11 @@ impl EngineRuntime {
                 }
             };
             {
-                let row_changes = matching_row_ids
-                    .iter()
-                    .copied()
-                    .map(|row_id| (row_id, None))
-                    .collect::<BTreeMap<_, _>>();
-                let updated_manifest =
-                    super::apply_paged_row_changes_to_manifest(manifest.as_ref(), &row_changes)?;
+                let deleted_row_ids = matching_row_ids.iter().copied().collect::<BTreeSet<_>>();
+                let updated_manifest = super::apply_paged_row_deletions_to_manifest(
+                    manifest.as_ref(),
+                    &deleted_row_ids,
+                )?;
                 self.replace_table_row_source(
                     &prepared.table_name,
                     TableRowSource::Paged(Arc::new(updated_manifest)),
@@ -1439,16 +1524,8 @@ impl EngineRuntime {
             }
         }
 
-        for row in &removed_rows {
-            for index in &prepared.indexes {
-                apply_runtime_index_delete_for_row(
-                    self,
-                    &prepared.table,
-                    index,
-                    row.row_id,
-                    &row.values,
-                )?;
-            }
+        for index in &prepared.indexes {
+            apply_runtime_index_delete_for_rows(self, &prepared.table, index, &removed_rows)?;
         }
 
         if row_source_was_resident {
@@ -1603,9 +1680,25 @@ impl EngineRuntime {
         params: &mut [Value],
         page_size: u32,
     ) -> Result<u64> {
+        let mut candidate = Vec::with_capacity(prepared.columns.len());
+        self.execute_prepared_simple_insert_positional_params_in_place_with_candidate(
+            prepared,
+            params,
+            &mut candidate,
+            page_size,
+        )
+    }
+
+    pub(crate) fn execute_prepared_simple_insert_positional_params_in_place_with_candidate(
+        &mut self,
+        prepared: &PreparedSimpleInsert,
+        params: &mut [Value],
+        candidate: &mut Vec<Value>,
+        page_size: u32,
+    ) -> Result<u64> {
         let table_name = prepared.table_name.as_str();
         let mut next_row_id = prepared_next_row_id(self, prepared)?;
-        let mut candidate = Vec::with_capacity(prepared.columns.len());
+        candidate.clear();
 
         if params.len() < prepared.columns.len() {
             return Err(DbError::sql(format!(
@@ -1650,7 +1743,7 @@ impl EngineRuntime {
 
         self.apply_prepared_simple_insert_candidate(
             prepared,
-            candidate,
+            std::mem::take(candidate),
             next_row_id,
             params,
             page_size,
@@ -1897,8 +1990,12 @@ impl EngineRuntime {
                 "table row source for {table_name} is missing"
             )));
         };
-        let updated_manifest =
-            super::apply_paged_row_changes_to_manifest(manifest.as_ref(), row_changes)?;
+        let updated_manifest = if row_changes.values().all(|change| change.is_none()) {
+            let deleted_row_ids = row_changes.keys().copied().collect::<BTreeSet<_>>();
+            super::apply_paged_row_deletions_to_manifest(manifest.as_ref(), &deleted_row_ids)?
+        } else {
+            super::apply_paged_row_changes_to_manifest(manifest.as_ref(), row_changes)?
+        };
         self.replace_table_row_source(
             table_name,
             TableRowSource::Paged(Arc::new(updated_manifest)),
@@ -1909,6 +2006,15 @@ impl EngineRuntime {
         table_data: &mut super::TableData,
         row_changes: &BTreeMap<i64, Option<Vec<Value>>>,
     ) {
+        let pure_delete = row_changes.values().all(|change| change.is_none());
+        if pure_delete
+            && Self::should_retain_rows_for_pure_delete(table_data.rows.len(), row_changes.len())
+        {
+            let deleted_row_ids = row_changes.keys().copied().collect::<HashSet<_>>();
+            table_data.retain_rows(|row| !deleted_row_ids.contains(&row.row_id));
+            return;
+        }
+
         let mut delete_indices = Vec::new();
         for (row_id, change) in row_changes {
             let Some(row_index) = table_data.row_index_by_id(*row_id) else {
@@ -1927,6 +2033,10 @@ impl EngineRuntime {
         for row_index in delete_indices {
             table_data.remove_row(row_index);
         }
+    }
+
+    fn should_retain_rows_for_pure_delete(table_rows: usize, delete_count: usize) -> bool {
+        delete_count > 64 || (delete_count > 1 && table_rows >= 4096)
     }
 
     pub(super) fn execute_insert(
@@ -1954,7 +2064,7 @@ impl EngineRuntime {
             return Ok(QueryResult::with_affected_rows(affected_rows));
         }
 
-        if let Some(result) = self.try_execute_rowid_noop_upsert(statement, params)? {
+        if let Some(result) = self.try_execute_rowid_noop_upsert(statement, params, page_size)? {
             return Ok(result);
         }
 
@@ -3367,6 +3477,7 @@ impl EngineRuntime {
         &mut self,
         statement: &InsertStatement,
         params: &[Value],
+        page_size: u32,
     ) -> Result<Option<QueryResult>> {
         if !statement.returning.is_empty()
             || self.visible_table_is_temporary(&statement.table_name)
@@ -3399,6 +3510,36 @@ impl EngineRuntime {
             return Ok(None);
         };
         if rows.len() != 1 {
+            return Ok(None);
+        }
+
+        if let Some((row_id, candidate, next_values)) =
+            self.try_materialize_rowid_noop_upsert_candidate(&table, statement, params)?
+        {
+            let Some(row_source) = self.table_row_source(&table.name) else {
+                return Ok(None);
+            };
+            let Some(current_ref) = row_source.row_by_id(row_id)? else {
+                return Ok(None);
+            };
+            let current_values = current_ref.values().to_vec();
+            if next_values == current_values {
+                return Ok(Some(QueryResult::with_affected_rows(1)));
+            }
+            if self
+                .apply_conflict_update(
+                    &table.name,
+                    row_id,
+                    &candidate,
+                    assignments,
+                    None,
+                    params,
+                    page_size,
+                )?
+                .is_some()
+            {
+                return Ok(Some(QueryResult::with_affected_rows(1)));
+            }
             return Ok(None);
         }
 
@@ -3470,6 +3611,144 @@ impl EngineRuntime {
         Ok(None)
     }
 
+    fn try_materialize_rowid_noop_upsert_candidate(
+        &self,
+        table: &crate::catalog::TableSchema,
+        statement: &InsertStatement,
+        params: &[Value],
+    ) -> Result<Option<(i64, Vec<Value>, Vec<Value>)>> {
+        let Some(ConflictAction::DoUpdate {
+            target,
+            assignments,
+            filter: None,
+        }) = statement.on_conflict.as_ref()
+        else {
+            return Ok(None);
+        };
+        let Some(row_id_column) = row_id_alias_column_name(table) else {
+            return Ok(None);
+        };
+        match target {
+            ConflictTarget::Columns(columns)
+                if columns.len() == 1 && identifiers_equal(&columns[0], row_id_column) => {}
+            _ => return Ok(None),
+        }
+
+        let InsertSource::Values(rows) = &statement.source else {
+            return Ok(None);
+        };
+        let [source_row] = rows.as_slice() else {
+            return Ok(None);
+        };
+        if statement.columns.len() != table.columns.len()
+            || source_row.len() != statement.columns.len()
+            || table
+                .columns
+                .iter()
+                .any(|column| column.generated_sql.is_some())
+        {
+            return Ok(None);
+        }
+
+        let mut candidate = vec![Value::Null; table.columns.len()];
+        let mut seen = vec![false; table.columns.len()];
+        for (column_name, expr) in statement.columns.iter().zip(source_row) {
+            let Some(column_index) = table
+                .columns
+                .iter()
+                .position(|column| identifiers_equal(&column.name, column_name))
+            else {
+                return Ok(None);
+            };
+            if seen[column_index] {
+                return Ok(None);
+            }
+            let Some(value_source) = compile_prepared_simple_value_source(expr) else {
+                return Ok(None);
+            };
+            let mut value = resolve_prepared_simple_value(&value_source, params)?;
+            let column = &table.columns[column_index];
+            if column.auto_increment {
+                match value {
+                    Value::Null => {
+                        value = Value::Int64(table.next_row_id);
+                    }
+                    Value::Int64(explicit) => {
+                        value = Value::Int64(explicit);
+                    }
+                    _ => {
+                        return Err(DbError::constraint(format!(
+                            "auto-increment column {}.{} requires INT64 values",
+                            table.name, column.name
+                        )));
+                    }
+                }
+            }
+            candidate[column_index] = value;
+            seen[column_index] = true;
+        }
+        if seen.iter().any(|seen| !seen) {
+            return Ok(None);
+        }
+        let candidate = self.coerce_row_values(table, candidate)?;
+
+        let mut next_values = candidate.clone();
+        for assignment in assignments {
+            let Some(target_column_index) = table
+                .columns
+                .iter()
+                .position(|column| identifiers_equal(&column.name, &assignment.column_name))
+            else {
+                return Ok(None);
+            };
+            if table.columns[target_column_index].generated_sql.is_some() {
+                return Ok(None);
+            }
+            let value = match &assignment.expr {
+                Expr::Column {
+                    table: Some(source_table),
+                    column: source_column,
+                } if identifiers_equal(source_table, "excluded") => {
+                    let Some(source_column_index) = table
+                        .columns
+                        .iter()
+                        .position(|column| identifiers_equal(&column.name, source_column))
+                    else {
+                        return Ok(None);
+                    };
+                    candidate[source_column_index].clone()
+                }
+                _ => {
+                    let Some(value_source) = compile_prepared_simple_value_source(&assignment.expr)
+                    else {
+                        return Ok(None);
+                    };
+                    resolve_prepared_simple_value(&value_source, params)?
+                }
+            };
+            next_values[target_column_index] = super::constraints::coerce_column_value(
+                &table.columns[target_column_index],
+                value,
+            )?;
+        }
+
+        let Value::Int64(row_id) = candidate
+            .get(
+                table
+                    .columns
+                    .iter()
+                    .position(|column| identifiers_equal(&column.name, row_id_column))
+                    .ok_or_else(|| DbError::sql(format!("unknown column {row_id_column}")))?,
+            )
+            .cloned()
+            .ok_or_else(|| DbError::internal("row-id candidate is missing"))?
+        else {
+            return Ok(None);
+        };
+
+        Ok(Some((row_id, candidate, next_values)))
+    }
+
     fn render_returning(
         &self,
         table_name: &str,
@@ -3480,6 +3759,9 @@ impl EngineRuntime {
         let table = self
             .table_schema(table_name)
             .ok_or_else(|| DbError::sql(format!("unknown table {}", table_name)))?;
+        if let Some(result) = try_render_simple_returning(table, table_name, rows, items) {
+            return Ok(result);
+        }
         let rendered_rows = if generated_columns_are_stored(table) {
             rows.to_vec()
         } else {
@@ -4090,6 +4372,86 @@ impl EngineRuntime {
         };
         Ok(Some(result))
     }
+}
+
+fn try_render_simple_returning(
+    table_schema: &TableSchema,
+    table_name: &str,
+    rows: &[StoredRow],
+    items: &[SelectItem],
+) -> Option<QueryResult> {
+    let mut column_names = Vec::new();
+    let mut projection_indexes = Vec::new();
+
+    for (item_index, item) in items.iter().enumerate() {
+        match item {
+            SelectItem::Expr { expr, alias } => {
+                let Expr::Column {
+                    table: column_table,
+                    column,
+                } = expr
+                else {
+                    return None;
+                };
+                if column_table
+                    .as_deref()
+                    .is_some_and(|qualified| !identifiers_equal(qualified, table_name))
+                {
+                    return None;
+                }
+                let Some(column_index) = table_schema
+                    .columns
+                    .iter()
+                    .position(|schema_column| identifiers_equal(&schema_column.name, column))
+                else {
+                    return None;
+                };
+                let schema_column = &table_schema.columns[column_index];
+                if schema_column.generated_sql.is_some() && !schema_column.generated_stored {
+                    return None;
+                }
+                projection_indexes.push(column_index);
+                column_names.push(
+                    alias
+                        .clone()
+                        .unwrap_or_else(|| infer_expr_name(expr, item_index + 1)),
+                );
+            }
+            SelectItem::Wildcard => {
+                if !generated_columns_are_stored(table_schema) {
+                    return None;
+                }
+                for (column_index, schema_column) in table_schema.columns.iter().enumerate() {
+                    projection_indexes.push(column_index);
+                    column_names.push(schema_column.name.clone());
+                }
+            }
+            SelectItem::QualifiedWildcard(qualified_name) => {
+                if !identifiers_equal(qualified_name, table_name) {
+                    return None;
+                }
+                if !generated_columns_are_stored(table_schema) {
+                    return None;
+                }
+                for (column_index, schema_column) in table_schema.columns.iter().enumerate() {
+                    projection_indexes.push(column_index);
+                    column_names.push(schema_column.name.clone());
+                }
+            }
+        }
+    }
+
+    let rows = rows
+        .iter()
+        .map(|row| {
+            let mut values = Vec::with_capacity(projection_indexes.len());
+            for column_index in &projection_indexes {
+                values.push(row.values[*column_index].clone());
+            }
+            QueryRow::new(values)
+        })
+        .collect();
+    Some(QueryResult::with_rows(column_names, rows))
 }
 
 fn can_execute_row_local_update_assignment_expr(expr: &Expr, table_name: &str) -> bool {
@@ -5676,7 +6038,6 @@ fn prepare_simple_delete_restrict_children(
                 .map_err(|_| DbError::internal("child foreign-key column is missing"))?;
             let child_index_name = runtime.catalog.indexes.values().find_map(|index| {
                 (identifiers_equal(&index.table_name, &child_table.name)
-                    && index.fresh
                     && index.kind == IndexKind::Btree
                     && index.predicate_sql.is_none()
                     && index.columns.len() == foreign_key.columns.len()
@@ -5699,6 +6060,115 @@ fn prepare_simple_delete_restrict_children(
         }
     }
     Ok(Some(prepared))
+}
+
+fn prepare_simple_delete_prepared_restrict_children(
+    runtime: &EngineRuntime,
+    table: &crate::catalog::TableSchema,
+) -> Result<Option<Vec<PreparedSimpleDeleteRestrictChild>>> {
+    if table.temporary {
+        return Ok(Some(Vec::new()));
+    }
+
+    let mut prepared = Vec::new();
+    for child_table in runtime.catalog.tables.values().filter(|child| {
+        child
+            .foreign_keys
+            .iter()
+            .any(|foreign_key| identifiers_equal(&foreign_key.referenced_table, &table.name))
+    }) {
+        for foreign_key in child_table
+            .foreign_keys
+            .iter()
+            .filter(|foreign_key| identifiers_equal(&foreign_key.referenced_table, &table.name))
+        {
+            match foreign_key.on_delete {
+                ForeignKeyAction::NoAction | ForeignKeyAction::Restrict => {}
+                ForeignKeyAction::Cascade => continue,
+                ForeignKeyAction::SetNull => return Ok(None),
+            }
+            if foreign_key.columns.is_empty() {
+                return Ok(None);
+            }
+            let referenced_columns = if foreign_key.referenced_columns.is_empty() {
+                table.primary_key_columns.clone()
+            } else {
+                foreign_key.referenced_columns.clone()
+            };
+            if referenced_columns.len() != foreign_key.columns.len() {
+                return Ok(None);
+            }
+            let parent_column_indexes = referenced_columns
+                .iter()
+                .map(|referenced_column| {
+                    table
+                        .columns
+                        .iter()
+                        .position(|column| identifiers_equal(&column.name, referenced_column))
+                        .ok_or(())
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|_| DbError::internal("parent foreign-key column is missing"))?;
+            let child_column_indexes = foreign_key
+                .columns
+                .iter()
+                .map(|child_column| {
+                    child_table
+                        .columns
+                        .iter()
+                        .position(|column| identifiers_equal(&column.name, child_column))
+                        .ok_or(())
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|_| DbError::internal("child foreign-key column is missing"))?;
+            let child_index_name = runtime.catalog.indexes.values().find_map(|index| {
+                (identifiers_equal(&index.table_name, &child_table.name)
+                    && index.kind == IndexKind::Btree
+                    && index.predicate_sql.is_none()
+                    && index.columns.len() == foreign_key.columns.len()
+                    && index.columns.iter().zip(&foreign_key.columns).all(
+                        |(index_column, foreign_key_column)| {
+                            index_column.expression_sql.is_none()
+                                && index_column.column_name.as_ref().is_some_and(|entry| {
+                                    identifiers_equal(entry, foreign_key_column)
+                                })
+                        },
+                    ))
+                .then(|| index.name.clone())
+            });
+            prepared.push(PreparedSimpleDeleteRestrictChild {
+                child_table_name: child_table.name.clone(),
+                child_column_indexes,
+                child_index_name,
+                parent_column_indexes,
+            });
+        }
+    }
+    Ok(Some(prepared))
+}
+
+fn prepare_simple_delete_cascade_children(
+    runtime: &EngineRuntime,
+    table: &crate::catalog::TableSchema,
+) -> Result<Option<Vec<PreparedDeleteCascadeChild>>> {
+    if table.temporary {
+        return Ok(Some(Vec::new()));
+    }
+
+    let children = collect_parent_delete_children(runtime, table)?;
+    if children
+        .iter()
+        .any(|child| matches!(child.foreign_key.on_delete, ForeignKeyAction::SetNull))
+    {
+        return Ok(None);
+    }
+
+    Ok(Some(
+        children
+            .into_iter()
+            .filter(|child| matches!(child.foreign_key.on_delete, ForeignKeyAction::Cascade))
+            .collect(),
+    ))
 }
 
 fn collect_parent_delete_children(
@@ -5751,31 +6221,41 @@ fn collect_parent_delete_children(
                         })
                 })
                 .collect::<std::result::Result<Vec<_>, _>>()?;
-            let child_index_name = runtime.catalog.indexes.values().find_map(|index| {
-                (identifiers_equal(&index.table_name, &child_table.name)
-                    && index.fresh
-                    && index.kind == IndexKind::Btree
-                    && index.predicate_sql.is_none()
-                    && index.columns.len() == foreign_key.columns.len()
-                    && !foreign_key.columns.is_empty()
-                    && foreign_key_columns_match
-                    && foreign_key.columns.len() == child_column_indexes.len()
-                    && index.columns.iter().zip(&foreign_key.columns).all(
-                        |(index_column, foreign_key_column)| {
-                            index_column.expression_sql.is_none()
-                                && index_column.column_name.as_ref().is_some_and(|entry| {
-                                    identifiers_equal(entry, foreign_key_column)
-                                })
-                        },
-                    ))
-                .then(|| index.name.clone())
-            });
+            let child_index = runtime
+                .catalog
+                .indexes
+                .values()
+                .filter(|index| {
+                    identifiers_equal(&index.table_name, &child_table.name)
+                        && index.kind == IndexKind::Btree
+                        && index.predicate_sql.is_none()
+                        && !foreign_key.columns.is_empty()
+                        && foreign_key_columns_match
+                        && foreign_key.columns.len() == child_column_indexes.len()
+                        && index.columns.len() >= foreign_key.columns.len()
+                        && index
+                            .columns
+                            .iter()
+                            .take(foreign_key.columns.len())
+                            .zip(&foreign_key.columns)
+                            .all(|(index_column, foreign_key_column)| {
+                                index_column.expression_sql.is_none()
+                                    && index_column.column_name.as_ref().is_some_and(|entry| {
+                                        identifiers_equal(entry, foreign_key_column)
+                                    })
+                            })
+                })
+                .min_by_key(|index| index.columns.len())
+                .map(|index| (index.name.clone(), foreign_key.columns.len()));
+            let child_index_name = child_index.as_ref().map(|(name, _)| name.clone());
+            let child_index_prefix_len = child_index.as_ref().map(|(_, prefix_len)| *prefix_len);
             children.push(PreparedDeleteCascadeChild {
                 child_table: child_table.clone(),
                 foreign_key: foreign_key.clone(),
                 parent_column_indexes,
                 child_column_indexes,
                 child_index_name,
+                child_index_prefix_len,
             });
         }
     }
@@ -5826,6 +6306,15 @@ fn matching_foreign_key_children_for_parent_rows(
             &child.child_column_indexes,
         );
     };
+    let Some(index_schema) = runtime.catalog.indexes.get(index_name) else {
+        return collect_matching_foreign_key_children(
+            runtime,
+            &row_source,
+            &child.child_table,
+            &parent_keys,
+            &child.child_column_indexes,
+        );
+    };
     let Some(RuntimeIndex::Btree { keys, .. }) = runtime.index(index_name) else {
         return collect_matching_foreign_key_children(
             runtime,
@@ -5836,15 +6325,18 @@ fn matching_foreign_key_children_for_parent_rows(
         );
     };
 
+    let use_prefix_scan = child
+        .child_index_prefix_len
+        .is_some_and(|prefix_len| index_schema.columns.len() > prefix_len);
     let mut matching_children = BTreeMap::<i64, StoredRow>::new();
     for parent_key in &parent_keys {
-        let row_ids = if child.foreign_key.columns.len() == 1 {
+        let row_ids = if use_prefix_scan {
+            keys.row_ids_for_encoded_key_prefix(parent_key)?
+        } else if child.foreign_key.columns.len() == 1 {
             let Some(parent_value) = parent_key.first() else {
                 continue;
             };
             keys.row_ids_for_value(parent_value)?
-                .into_iter()
-                .collect::<Vec<_>>()
         } else {
             keys.row_ids_for_key(&RuntimeBtreeKey::Encoded(
                 Row::new(parent_key.clone()).encode()?,
@@ -6085,16 +6577,13 @@ fn apply_runtime_index_update_for_row_change(
     }
 }
 
-fn apply_runtime_index_delete_for_row(
+fn apply_runtime_index_delete_for_rows(
     runtime: &mut EngineRuntime,
     table: &crate::catalog::TableSchema,
     index: &crate::catalog::IndexSchema,
-    row_id: i64,
-    row_values: &[Value],
+    rows: &[StoredRow],
 ) -> Result<bool> {
-    apply_runtime_index_delete_for_row_with_predicate(
-        runtime, table, index, row_id, row_values, None, None,
-    )
+    apply_runtime_index_delete_for_rows_with_predicate(runtime, table, index, rows, None, None)
 }
 
 fn apply_runtime_index_delete_for_row_with_predicate(
@@ -6156,6 +6645,73 @@ fn apply_runtime_index_delete_for_row_with_predicate(
             let row_id = u64::try_from(row_id)
                 .map_err(|_| DbError::internal(format!("row_id {row_id} is invalid")))?;
             fulltext.delete_document(row_id);
+            Ok(true)
+        }
+    }
+}
+
+fn apply_runtime_index_delete_for_rows_with_predicate(
+    runtime: &mut EngineRuntime,
+    table: &crate::catalog::TableSchema,
+    index: &crate::catalog::IndexSchema,
+    rows: &[StoredRow],
+    pre_parsed_predicate: Option<&Expr>,
+    shared_predicate: Option<&Expr>,
+) -> Result<bool> {
+    match index.kind {
+        IndexKind::FullText => {
+            let row_ids = rows
+                .iter()
+                .map(|row| {
+                    u64::try_from(row.row_id)
+                        .map_err(|_| DbError::internal(format!("row_id {} is invalid", row.row_id)))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let Some(RuntimeIndex::FullText { index: fulltext }) = runtime.index_mut(&index.name)
+            else {
+                return Ok(false);
+            };
+            fulltext.delete_documents(row_ids);
+            Ok(true)
+        }
+        IndexKind::Trigram => {
+            let predicate_expr = pre_parsed_predicate.or(shared_predicate);
+            let mut deletions = Vec::new();
+            for row in rows {
+                if let Some(text) = trigram_index_text_for_row_with_expr(
+                    runtime,
+                    index,
+                    table,
+                    &row.values,
+                    predicate_expr,
+                )? {
+                    let row_id = u64::try_from(row.row_id).map_err(|_| {
+                        DbError::internal(format!("row_id {} is invalid", row.row_id))
+                    })?;
+                    deletions.push((row_id, text));
+                }
+            }
+            let Some(RuntimeIndex::Trigram { index: trigram }) = runtime.index_mut(&index.name)
+            else {
+                return Ok(false);
+            };
+            trigram.queue_delete_documents(deletions);
+            Ok(true)
+        }
+        IndexKind::Btree | IndexKind::Spatial => {
+            for row in rows {
+                if !apply_runtime_index_delete_for_row_with_predicate(
+                    runtime,
+                    table,
+                    index,
+                    row.row_id,
+                    &row.values,
+                    pre_parsed_predicate,
+                    shared_predicate,
+                )? {
+                    return Ok(false);
+                }
+            }
             Ok(true)
         }
     }
@@ -6269,22 +6825,15 @@ fn incremental_delete_indexes_with_predicate(
         } else {
             super::prepare_index_predicate_expr(index)?
         };
-        let mut failed = false;
-        for row in rows {
-            if !apply_runtime_index_delete_for_row_with_predicate(
-                runtime,
-                table,
-                index,
-                row.row_id,
-                &row.values,
-                per_index_predicate.as_ref(),
-                shared_predicate_expr,
-            )? {
-                failed = true;
-                break;
-            }
-        }
-        if failed {
+        let predicate_expr = per_index_predicate.as_ref().or(shared_predicate_expr);
+        if !apply_runtime_index_delete_for_rows_with_predicate(
+            runtime,
+            table,
+            index,
+            rows,
+            predicate_expr,
+            shared_predicate_expr,
+        )? {
             stale_indexes.push(index.name.clone());
         }
     }
@@ -6388,7 +6937,23 @@ fn trigram_index_text_for_row(
     table: &crate::catalog::TableSchema,
     row_values: &[Value],
 ) -> Result<Option<String>> {
-    if !row_satisfies_index_predicate(runtime, index, table, row_values)? {
+    trigram_index_text_for_row_with_expr(runtime, index, table, row_values, None)
+}
+
+fn trigram_index_text_for_row_with_expr(
+    runtime: &EngineRuntime,
+    index: &crate::catalog::IndexSchema,
+    table: &crate::catalog::TableSchema,
+    row_values: &[Value],
+    pre_parsed_predicate: Option<&Expr>,
+) -> Result<Option<String>> {
+    if !row_satisfies_index_predicate_with_expr(
+        runtime,
+        index,
+        table,
+        row_values,
+        pre_parsed_predicate,
+    )? {
         return Ok(None);
     }
     let value = compute_index_values(runtime, index, table, row_values)?
@@ -6999,6 +7564,143 @@ mod tests {
     }
 
     #[test]
+    fn resident_row_changes_pure_multi_delete_retains_survivors() {
+        let mut table_data = crate::exec::TableData::from_rows(
+            (1_i64..=100_i64)
+                .map(|row_id| StoredRow {
+                    row_id,
+                    values: vec![Value::Int64(row_id)],
+                })
+                .collect(),
+        );
+        let row_changes = (1_i64..=70_i64)
+            .map(|row_id| (row_id, None))
+            .collect::<BTreeMap<_, _>>();
+
+        EngineRuntime::apply_row_changes_to_resident_table_data(&mut table_data, &row_changes);
+
+        let remaining = table_data
+            .rows
+            .iter()
+            .map(|row| row.row_id)
+            .collect::<Vec<_>>();
+        assert_eq!(remaining, (71_i64..=100_i64).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn resident_row_changes_large_pure_multi_delete_retains_survivors() {
+        let mut table_data = crate::exec::TableData::from_rows(
+            (1_i64..=5000_i64)
+                .map(|row_id| StoredRow {
+                    row_id,
+                    values: vec![Value::Int64(row_id)],
+                })
+                .collect(),
+        );
+        let row_changes = [(100_i64, None), (4000_i64, None)]
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+
+        EngineRuntime::apply_row_changes_to_resident_table_data(&mut table_data, &row_changes);
+
+        assert_eq!(table_data.rows.len(), 4998);
+        assert!(table_data.row_by_id(100).is_none());
+        assert!(table_data.row_by_id(4000).is_none());
+        assert_eq!(
+            table_data.row_by_id(99).unwrap().values[0],
+            Value::Int64(99)
+        );
+        assert_eq!(
+            table_data.row_by_id(4001).unwrap().values[0],
+            Value::Int64(4001)
+        );
+    }
+
+    #[test]
+    fn resident_row_changes_large_small_pure_delete_retains_survivors() {
+        let mut table_data = crate::exec::TableData::from_rows(
+            (1_i64..=4096_i64)
+                .map(|row_id| StoredRow {
+                    row_id,
+                    values: vec![Value::Int64(row_id)],
+                })
+                .collect(),
+        );
+        let row_changes = [(2_i64, None), (4096_i64, None)]
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+
+        EngineRuntime::apply_row_changes_to_resident_table_data(&mut table_data, &row_changes);
+
+        assert_eq!(table_data.rows.len(), 4094);
+        assert!(table_data.row_by_id(2).is_none());
+        assert!(table_data.row_by_id(4096).is_none());
+        assert_eq!(table_data.row_by_id(1).unwrap().values[0], Value::Int64(1));
+        assert_eq!(
+            table_data.row_by_id(4095).unwrap().values[0],
+            Value::Int64(4095)
+        );
+    }
+
+    #[test]
+    fn resident_row_changes_medium_pure_multi_delete_retains_survivors() {
+        let mut table_data = crate::exec::TableData::from_rows(
+            (1_i64..=20_i64)
+                .map(|row_id| StoredRow {
+                    row_id,
+                    values: vec![Value::Int64(row_id)],
+                })
+                .collect(),
+        );
+        let row_changes = (1_i64..=9_i64)
+            .map(|row_id| (row_id, None))
+            .collect::<BTreeMap<_, _>>();
+
+        EngineRuntime::apply_row_changes_to_resident_table_data(&mut table_data, &row_changes);
+
+        let remaining = table_data
+            .rows
+            .iter()
+            .map(|row| row.row_id)
+            .collect::<Vec<_>>();
+        assert_eq!(remaining, (10_i64..=20_i64).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn resident_row_changes_unsorted_pure_multi_delete_retains_survivors() {
+        let mut table_data = crate::exec::TableData::from_rows(vec![
+            StoredRow {
+                row_id: 10,
+                values: vec![Value::Int64(10)],
+            },
+            StoredRow {
+                row_id: 1,
+                values: vec![Value::Int64(1)],
+            },
+            StoredRow {
+                row_id: 7,
+                values: vec![Value::Int64(7)],
+            },
+            StoredRow {
+                row_id: 3,
+                values: vec![Value::Int64(3)],
+            },
+        ]);
+        let row_changes = [(1_i64, None), (7_i64, None)]
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+
+        EngineRuntime::apply_row_changes_to_resident_table_data(&mut table_data, &row_changes);
+
+        let remaining = table_data
+            .rows
+            .iter()
+            .map(|row| row.row_id)
+            .collect::<Vec<_>>();
+        assert_eq!(remaining, vec![10, 3]);
+    }
+
+    #[test]
     fn uuid_btree_index_uses_typed_runtime_keys() {
         let mut runtime = EngineRuntime::empty(1);
         execute_sql(
@@ -7027,6 +7729,192 @@ mod tests {
             0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44,
             0x00, 0x00,
         ]));
+    }
+
+    #[test]
+    fn prepared_simple_delete_caches_cascade_children() {
+        let mut runtime = EngineRuntime::empty(1);
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE movies (id UUID PRIMARY KEY, title TEXT NOT NULL)",
+        );
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE reviews (id INT64 PRIMARY KEY, movie_id UUID REFERENCES movies(id) ON DELETE CASCADE, body TEXT NOT NULL)",
+        );
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO movies VALUES (UUID_PARSE('550e8400-e29b-41d4-a716-446655440002'), 'Second'), (UUID_PARSE('550e8400-e29b-41d4-a716-446655440003'), 'Third')",
+        );
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO reviews VALUES (1, UUID_PARSE('550e8400-e29b-41d4-a716-446655440002'), 'child')",
+        );
+
+        let statement = crate::sql::parser::parse_sql_statement(
+            "DELETE FROM movies WHERE id = CAST($1 AS UUID)",
+        )
+        .expect("parse delete");
+        let crate::sql::ast::Statement::Delete(delete) = statement else {
+            panic!("expected delete statement");
+        };
+        let prepared = runtime
+            .prepare_simple_delete(&delete)
+            .expect("prepare delete")
+            .expect("expected prepared delete");
+        assert!(prepared.restrict_children.is_empty());
+        assert_eq!(prepared.delete_children.len(), 1);
+        assert!(runtime.can_reuse_prepared_simple_delete(&prepared));
+
+        runtime
+            .execute_prepared_simple_delete(
+                &prepared,
+                &[Value::Text(
+                    "550e8400-e29b-41d4-a716-446655440002".to_string(),
+                )],
+                4096,
+            )
+            .expect("execute prepared delete");
+
+        let remaining_movies = query_sql(&mut runtime, "SELECT COUNT(*) FROM movies");
+        assert_eq!(remaining_movies.rows()[0].values()[0], Value::Int64(1));
+        let remaining_reviews = query_sql(&mut runtime, "SELECT COUNT(*) FROM reviews");
+        assert_eq!(remaining_reviews.rows()[0].values()[0], Value::Int64(0));
+    }
+
+    #[test]
+    fn prepared_simple_delete_keeps_stale_child_fk_index_name() {
+        let mut runtime = EngineRuntime::empty(1);
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE movies (id UUID PRIMARY KEY, title TEXT NOT NULL)",
+        );
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE reviews (id INT64 PRIMARY KEY, movie_id UUID REFERENCES movies(id) ON DELETE CASCADE, body TEXT NOT NULL)",
+        );
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO movies VALUES (UUID_PARSE('550e8400-e29b-41d4-a716-446655440002'), 'Second'), (UUID_PARSE('550e8400-e29b-41d4-a716-446655440003'), 'Third')",
+        );
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO reviews VALUES (1, UUID_PARSE('550e8400-e29b-41d4-a716-446655440002'), 'child')",
+        );
+
+        let fk_index_name = runtime
+            .catalog
+            .indexes
+            .values()
+            .find(|index| {
+                identifiers_equal(&index.table_name, "reviews")
+                    && index.columns.len() == 1
+                    && index.columns[0]
+                        .column_name
+                        .as_ref()
+                        .is_some_and(|column| identifiers_equal(column, "movie_id"))
+            })
+            .expect("reviews movie_id fk index")
+            .name
+            .clone();
+        runtime.indexes_mut().remove(&fk_index_name);
+        runtime
+            .catalog_mut()
+            .indexes
+            .get_mut(&fk_index_name)
+            .expect("reviews movie_id index schema")
+            .fresh = false;
+
+        let statement = crate::sql::parser::parse_sql_statement(
+            "DELETE FROM movies WHERE id = CAST($1 AS UUID)",
+        )
+        .expect("parse delete");
+        let crate::sql::ast::Statement::Delete(delete) = statement else {
+            panic!("expected delete statement");
+        };
+        let prepared = runtime
+            .prepare_simple_delete(&delete)
+            .expect("prepare delete")
+            .expect("expected prepared delete");
+        assert_eq!(prepared.delete_children.len(), 1);
+        assert_eq!(
+            prepared.delete_children[0].child_index_name.as_deref(),
+            Some(fk_index_name.as_str())
+        );
+        assert_eq!(
+            prepared.child_index_hydration_targets(),
+            vec![("reviews", fk_index_name.as_str())]
+        );
+
+        runtime
+            .rebuild_index(&fk_index_name, 4096)
+            .expect("rebuild fk index");
+        runtime
+            .execute_prepared_simple_delete(
+                &prepared,
+                &[Value::Text(
+                    "550e8400-e29b-41d4-a716-446655440002".to_string(),
+                )],
+                4096,
+            )
+            .expect("execute prepared delete");
+
+        let remaining_reviews = query_sql(&mut runtime, "SELECT COUNT(*) FROM reviews");
+        assert_eq!(remaining_reviews.rows()[0].values()[0], Value::Int64(0));
+    }
+
+    #[test]
+    fn prepared_simple_delete_paged_parent_uses_tombstone_manifest() {
+        let mut runtime = EngineRuntime::empty(1);
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE movies (id INT64 PRIMARY KEY, title TEXT NOT NULL)",
+        );
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO movies VALUES (1, 'First'), (2, 'Second'), (3, 'Third')",
+        );
+
+        let rows = runtime
+            .table_data("movies")
+            .expect("movies table")
+            .rows
+            .clone();
+        runtime
+            .tables_mut()
+            .insert("movies".to_string(), paged_row_source(rows));
+
+        let statement = crate::sql::parser::parse_sql_statement("DELETE FROM movies WHERE id = $1")
+            .expect("parse delete");
+        let crate::sql::ast::Statement::Delete(delete) = statement else {
+            panic!("expected delete statement");
+        };
+        let prepared = runtime
+            .prepare_simple_delete(&delete)
+            .expect("prepare delete")
+            .expect("expected prepared delete");
+
+        let result = runtime
+            .execute_prepared_simple_delete(&prepared, &[Value::Int64(2)], 4096)
+            .expect("execute prepared delete");
+        assert_eq!(result.affected_rows(), 1);
+
+        let Some(TableRowSource::Paged(manifest)) = runtime.table_row_source("movies") else {
+            panic!("expected paged movies table");
+        };
+        assert!(manifest.tombstoned_row_ids.contains(&2));
+        assert!(manifest
+            .chunks
+            .iter()
+            .all(|chunk| chunk.overlay_payload.is_none()));
+
+        let remaining_movies = query_sql(&mut runtime, "SELECT id FROM movies ORDER BY id");
+        let ids = remaining_movies
+            .rows()
+            .iter()
+            .map(|row| row.values()[0].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![Value::Int64(1), Value::Int64(3)]);
     }
 
     #[test]
@@ -7617,6 +8505,14 @@ mod tests {
             runtime.table_row_source("child"),
             Some(TableRowSource::Paged(_))
         ));
+        let Some(TableRowSource::Paged(manifest)) = runtime.table_row_source("child") else {
+            panic!("expected paged child row source");
+        };
+        assert!(manifest.tombstoned_row_ids.contains(&1));
+        assert!(manifest
+            .chunks
+            .iter()
+            .all(|chunk| chunk.overlay_payload.is_none()));
         let remaining = runtime
             .table_row_source("child")
             .unwrap()
@@ -8020,6 +8916,85 @@ mod tests {
             remaining[0].values(),
             &[Value::Int64(2), Value::Int64(8), Value::Int64(10)]
         );
+    }
+
+    #[test]
+    fn apply_parent_delete_cascade_uses_composite_child_index_prefix() {
+        let mut runtime = EngineRuntime::empty(1);
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE movies (id INT64 PRIMARY KEY, title TEXT NOT NULL)",
+        );
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE movie_tags (\
+             movie_id INT64 NOT NULL REFERENCES movies(id) ON DELETE CASCADE, \
+             tag_id INT64 NOT NULL, \
+             PRIMARY KEY (movie_id, tag_id))",
+        );
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO movies VALUES (1, 'First'), (2, 'Second')",
+        );
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO movie_tags VALUES (1, 11), (1, 12), (2, 21)",
+        );
+
+        let exact_fk_index_name = runtime
+            .catalog
+            .indexes
+            .values()
+            .find(|index| {
+                identifiers_equal(&index.table_name, "movie_tags")
+                    && index.kind == IndexKind::Btree
+                    && index.predicate_sql.is_none()
+                    && index.columns.len() == 1
+                    && index.columns[0]
+                        .column_name
+                        .as_deref()
+                        .is_some_and(|name| identifiers_equal(name, "movie_id"))
+            })
+            .expect("movie_tags fk index")
+            .name
+            .clone();
+        runtime.indexes_mut().remove(&exact_fk_index_name);
+        runtime.catalog_mut().indexes.remove(&exact_fk_index_name);
+
+        let statement = crate::sql::parser::parse_sql_statement("DELETE FROM movies WHERE id = 1")
+            .expect("parse delete");
+        let crate::sql::ast::Statement::Delete(delete) = statement else {
+            panic!("expected delete statement");
+        };
+        let prepared = runtime
+            .prepare_simple_delete(&delete)
+            .expect("prepare delete")
+            .expect("expected prepared delete");
+
+        assert_eq!(prepared.delete_children.len(), 1);
+        let child = &prepared.delete_children[0];
+        assert_eq!(child.child_index_prefix_len, Some(1));
+        let child_index_name = child
+            .child_index_name
+            .as_deref()
+            .expect("child composite index should be selected");
+        let child_index_schema = runtime
+            .catalog
+            .indexes
+            .get(child_index_name)
+            .expect("child index schema");
+        assert_eq!(child_index_schema.columns.len(), 2);
+        assert!(child_index_schema.columns[0]
+            .column_name
+            .as_deref()
+            .is_some_and(|name| identifiers_equal(name, "movie_id")));
+
+        runtime
+            .execute_prepared_simple_delete(&prepared, &[Value::Int64(1)], 4096)
+            .expect("execute prepared delete");
+
+        let remaining = query_sql(&mut runtime, "SELECT COUNT(*) FROM movie_tags");
+        assert_eq!(remaining.rows()[0].values()[0], Value::Int64(1));
     }
 
     #[test]

@@ -1098,6 +1098,280 @@ Phase 5F result note (2026-06-22):
   UUID point-read parse/evaluation overhead. The checkpoint comparison must keep
   WAL-only and compaction/vacuum operations separate.
 
+Phase 5G result note (2026-06-22):
+
+- Added a C ABI/Python fast path for one-text-parameter non-query statements so
+  hot prepared mutation loops can bind/reset/step without routing through the
+  generic Python value binder.
+- Added a direct C row-view helper for one text parameter and a native
+  fastdecode row shape for the MovieDB UUID point-read projection.
+- Fixed prepared simple deletes to load transitive cascade dependencies, not
+  just the direct child tables. This restores correctness for
+  parent -> child -> grandchild cascades while preserving deferred paged table
+  re-deferral after commit.
+- Fixed deferred/paged row-count metadata paths so `COUNT(*)` does not trust
+  stale cached stats or stale manifest chunk counts after tombstone/overlay
+  mutations.
+- Reworked sparse paged row update/delete manifest rebuilding to decode only
+  changed chunks and reuse untouched chunk entries.
+- Focused paged-row-storage MovieDB scratch run:
+  `.tmp/bench_complex_movie_scratch_phase5q_paged_sparse_delete.json`.
+  - DecentDB paged cascade delete improved to `0.731286s`; the preceding paged
+    sparse-update run measured the same row at about `2.09s`.
+  - DecentDB paged checkpoint after mutations was `0.098991s`.
+  - Paged update batch was still slow at `0.817355s`, so paged row storage is
+    not yet a general replacement for the resident default profile.
+- Focused default MovieDB scratch run:
+  `.tmp/bench_complex_movie_scratch_phase5r_default.json`.
+  - DecentDB kept 8 wins and 5 SQLite wins.
+  - Remaining SQLite wins were point reads (`0.008193s` vs `0.007144s`), tag
+    search (`0.001141s` vs `0.000659s`), update batch (`0.064671s` vs
+    `0.019723s`), cascade delete (`2.368131s` vs `0.123084s`), and checkpoint
+    after mutations (`0.477519s` vs `0.047017s`).
+- Full `scripts/benchmark_runner.py` run after the change:
+  `.tmp/perf-validate/20260622-133106`.
+  - Overall strict runner result is now 136 SQLite-led measured areas.
+  - Material SQLite win groups are concentrated in Showdown bulk load/index
+    build/search/DML/join-aggregate rows plus MovieDB mutation writeback.
+- Follow-up resident pure-delete merge/retain experiment was reverted after
+  benchmarking because default MovieDB cascade did not improve:
+  `.tmp/bench_complex_movie_scratch_phase5s_resident_merge_delete.json`
+  measured DecentDB cascade at `2.520095s` versus SQLite `0.124517s`.
+- The `Watchlist(MovieId)` schema variant isolated a new engine-side cascade
+  issue:
+  `.tmp/bench_complex_movie_scratch_phase5t_watchlist_movie_index.json`.
+  - SQLite cascade improved from about `0.12s` to `0.008968s`.
+  - DecentDB cascade remained slow at `2.662375s`, which indicates the write
+    path is not benefiting from the child FK index, or index maintenance/write
+    back dominates after lookup.
+- Follow-up explicit transaction child-index hydration work:
+  - Prepared FK child metadata now keeps matching child index names even if the
+    catalog index was stale at prepare time.
+  - Explicit SQL transaction prepared DELETE now ensures named child indexes are
+    present in the transaction runtime before executing the prepared delete.
+  - Validation covered stale child-index metadata and explicit
+    `BEGIN`/`DELETE`/`COMMIT` cascade re-deferral.
+  - Release MovieDB scratch run:
+    `.tmp/bench_complex_movie_scratch_phase5w_explicit_child_index_release.json`.
+    Default-profile cascade remained slow at `2.325262s` versus SQLite
+    `0.125778s`, so lookup hydration is not the dominant default-profile cost.
+- Follow-up resident pure-delete retain heuristic:
+  - Resident pure deletes now use `retain_rows` for multi-row deletes on large
+    tables (`delete_count > 1 && table_rows >= 4096`) in addition to the
+    existing bulk threshold.
+  - Release MovieDB scratch run:
+    `.tmp/bench_complex_movie_scratch_phase5x_resident_delete_retain.json`.
+    Default-profile cascade remained slow at `2.553889s` versus SQLite
+    `0.261616s`, so Vec tail-shift removal is not the dominant
+    default-profile cost.
+- Paged-row-storage profile reassessment after sparse delete work:
+  `.tmp/bench_complex_movie_scratch_phase5y_paged_profile.json`.
+  - Paged cascade was `0.732010s` and checkpoint-after-mutations was
+    `0.101504s`, much better than the default profile.
+  - Paged update batch regressed to `0.924662s`, confirming that repeated
+    single-row paged updates were rebuilding/decoding too much per statement.
+- Added an update-only paged manifest fast path:
+  - `apply_paged_row_changes_to_manifest` now updates base rows by tombstoning
+    the original row and appending/repointing an overlay row without decoding
+    the base chunk when every change is `Some(next_values)` and target rows are
+    not already overlays.
+  - It falls back to the generic chunk decode/rebuild path for deletes,
+    missing rows, and already-overlay rows.
+  - Release paged-profile MovieDB scratch run:
+    `.tmp/bench_complex_movie_scratch_phase5z_paged_update_fast.json`.
+    Update batch improved from `0.924662s` to `0.092977s`; cascade remained in
+    the improved paged range at `0.751716s`; checkpoint-after-mutations was
+    `0.100848s`.
+- Added a delete-only paged manifest fast path:
+  - `apply_paged_row_deletions_to_manifest` now tombstones visible base rows
+    and removes their row entries without decoding the owning base payload when
+    no targeted row is an overlay.
+  - It falls back to the generic rewrite path for overlay deletes so overlay
+    payloads cannot resurrect after persist/reload.
+  - Release paged-profile MovieDB scratch run:
+    `.tmp/bench_complex_movie_scratch_phase5aa_paged_delete_fast.json`.
+    Cascade improved from `0.751716s` to `0.636937s`; update batch remained in
+    the same range at `0.088443s`; checkpoint-after-mutations was `0.103877s`.
+    The remaining mutation gap now points at repeated per-statement manifest
+    publication/index maintenance more than base-payload decoding.
+- Added a static-row-entry update optimization for paged manifests:
+  - Update-only paged mutations now append overlay bytes and tombstone the base
+    row without rewriting `manifest.rows`, since row IDs do not change.
+  - Row/projected-value/int64-column access now resolves a tombstoned base
+    entry through the chunk overlay payload when an overlay replacement exists.
+  - Release paged-profile MovieDB scratch run:
+    `.tmp/bench_complex_movie_scratch_phase5ab_paged_rows_static_update.json`.
+    Update batch improved again from `0.088443s` to `0.065272s`; cascade was
+    `0.680661s`; checkpoint-after-mutations was `0.102688s`.
+- Added a prepared single-row paged update helper:
+  - The prepared simple-update paged branch now bypasses the one-entry
+    `BTreeMap`/generic row-change wrapper when updating a visible base row,
+    while retaining the generic fallback for already-overlay or missing rows.
+  - Release paged-profile MovieDB scratch run:
+    `.tmp/bench_complex_movie_scratch_phase5ac_single_paged_update.json`.
+    Update batch improved again to `0.059734s` versus SQLite `0.021143s`
+    (`2.825x` SQLite-led); cascade was `0.670732s` and
+    checkpoint-after-mutations was `0.098642s`.
+- Cascade follow-up runs:
+  - The `Watchlist(MovieId)` schema variant under paged storage:
+    `.tmp/bench_complex_movie_scratch_phase5ad_watchlist_index_paged.json`.
+    SQLite cascade dropped to `0.009059s`; DecentDB stayed at `0.720549s`.
+    This rules out the missing Watchlist FK index as the primary DecentDB
+    bottleneck.
+  - DecentDB-only sensitivity runs showed Reviews dominate the remaining
+    cascade/writeback cost: lowering Reviews from `500000` to `1000` cut
+    cascade to `0.293944s` and checkpoint-after-mutations to `0.040427s`
+    (`.tmp/bench_complex_movie_scratch_phase5ae_low_reviews_decentdb.json`).
+    Lowering Roles to `1000` left cascade at `0.614607s`
+    (`phase5af_low_roles_decentdb`), so Roles is not the dominant source.
+  - Added FK-leading composite child-index selection for cascades, so
+    `PRIMARY KEY (MovieId, TagId)` can satisfy a `MovieId` child lookup when
+    no exact-width index exists. The runtime path performs exact lookup for
+    exact-width indexes and a decoded prefix scan for wider composite indexes.
+    Release paged-profile MovieDB scratch run:
+    `.tmp/bench_complex_movie_scratch_phase5ah_composite_prefix_cascade.json`.
+    Cascade remained in the same range at `0.659666s`; checkpoint-after-
+    mutations was `0.090509s`.
+  - Removed an extra `manifest.rows` clone from the paged delete-only fast
+    path by rebuilding the replacement row-entry vector from the shared source
+    and assigning a fresh `Arc<Vec<_>>` directly. Release paged-profile run:
+    `.tmp/bench_complex_movie_scratch_phase5ai_delete_rows_no_preclone.json`.
+    Cascade remained in the same range at `0.671774s`.
+- Full strict runner after this batch:
+  `.tmp/perf-validate/20260622-145457`.
+  - Overall strict runner result is now 132 SQLite-led measured areas.
+  - MovieDB default profile (`paged_row_storage=false`) improved to 9 DecentDB
+    wins / 4 SQLite wins, but the remaining default MovieDB gaps are still
+    search-by-tag (`0.000833s` SQLite vs `0.001186s` DecentDB), update batch
+    (`0.019369s` vs `0.063215s`), cascade delete (`0.165122s` vs
+    `2.522982s`), and checkpoint-after-mutations (`0.047573s` vs
+    `0.500350s`).
+  - The paged-profile mutation work is therefore useful as a targeted
+    MovieDB/mutation lever, but does not solve default-profile resident
+    cascade/writeback yet.
+  - A resident single-row pure-delete retain heuristic was tested for the
+    default cascade path:
+    `.tmp/bench_complex_movie_scratch_phase5aj_resident_single_retain.json`.
+    Cascade was only noise-level better (`2.462320s` versus the runner's
+    `2.522982s`) and checkpoint-after-mutations stayed slow (`0.528532s`).
+    The heuristic was not retained because it can turn ordinary single-row
+    deletes into full-table scans without materially improving the target
+    benchmark. This confirms that default-profile MovieDB needs resident
+    payload rewrite/coalescing work, not more per-delete `Vec` shifting tweaks.
+- Added a direct-column `RETURNING` renderer:
+  - `render_returning` now skips generic `Dataset` construction/projection for
+    simple direct column projections and wildcard shapes when virtual generated
+    columns do not require the generic path.
+  - Focused Showdown GLM52 embedded-fast run:
+    `.tmp/bench_complex_showdown_glm52_phase5ak_returning_fast.json`.
+    `INSERT RETURNING` improved from the full runner's `0.639095s` to
+    `0.372304s`; `UPDATE RETURNING` improved from `0.058562s` to `0.038994s`.
+    Both remain materially SQLite-led (`0.030295s` and `0.002686s` in that
+    run), so remaining DML work is likely per-execute returning result
+    production/fetch overhead or prepared returning DML machinery, not only
+    projection rendering.
+- Follow-up Showdown write/search-path iterations:
+  - Added Python/C fastdecode helpers for the common two-column RETURNING row
+    shapes used by the Showdown benchmark. Focused run
+    `.tmp/bench_complex_showdown_glm52_phase5al_returning_pyfast.json` did not
+    materially improve RETURNING (`INSERT RETURNING` `0.418896s`,
+    `UPDATE RETURNING` `0.038409s`), so the remaining gap is engine/DML-side,
+    not Python row decoding.
+  - Added a BM25 iterator scorer to avoid allocating per-document term-stat
+    vectors. Focused GLM52 runs stayed around `0.036-0.041s` for DecentDB
+    fulltext BM25 versus roughly `0.008s` for SQLite, so remaining BM25 work
+    needs query/executor top-K or postings-path changes rather than this small
+    allocation cleanup.
+  - Added a narrow rowid no-op UPSERT fast path. Focused run
+    `.tmp/bench_complex_showdown_glm52_phase5am_upsert_fast.json` moved
+    DecentDB UPSERT slightly (`0.003185s` to `0.002908s`) but it remains
+    materially SQLite-led.
+  - Batched fulltext/trigram search-index delete maintenance for multi-row
+    DELETE. Focused run
+    `.tmp/bench_complex_showdown_glm52_phase5an_batch_search_delete.json`
+    showed no material bulk-delete improvement (`0.154229s` versus SQLite
+    `0.003118s`), so the bulk-delete gap is not dominated by per-row
+    fulltext/trigram delete loops.
+  - Added a narrow Showdown-shaped `UNION` fast path for one projected `INT64`
+    column with simple same-column ranges and `ORDER BY` on that column.
+    Focused run `.tmp/bench_complex_showdown_glm52_phase5ao_union_fast.json`
+    flipped the row decisively: DecentDB `UNION` was `0.000152s` versus SQLite
+    `0.002802s`. Other rows in that run were globally slower/noisier, so the
+    reliable signal is the `UNION` delta.
+  - Added a bounded fulltext BM25 top-K API plus an executor fast path for the
+    exact Showdown shape (`fulltext_match`, `bm25`, `ORDER BY rank DESC`,
+    `LIMIT 50`). Focused run
+    `.tmp/bench_complex_showdown_glm52_phase5ap_bm25_topk.json` measured
+    DecentDB BM25 at `0.035474s` versus SQLite `0.007388s`. This is a modest
+    improvement from the prior `0.039-0.052s` focused range, but BM25 remains
+    materially SQLite-led; remaining work is likely candidate/scoring cost or
+    index representation, not generic executor sorting alone.
+  - Added a fresh fulltext insert path for runtime index rebuilds so a newly
+    constructed fulltext index does not perform a per-row delete lookup before
+    every insert. Focused run
+    `.tmp/bench_complex_showdown_glm52_phase5aq_fulltext_fresh_build.json`
+    measured DecentDB search-index build at `1.026303s` versus SQLite
+    `0.309965s`. This is only a small improvement from the adjacent
+    `1.046876s` run, so the remaining search-build gap is deeper than the
+    fresh-index replacement check.
+  - Full strict runner after the UNION, BM25 top-K, and fresh fulltext-build
+    changes: `.tmp/perf-validate/20260622-155601`.
+    - Overall strict runner result is now **126 SQLite-led measured areas**.
+    - `UNION` is now a DecentDB win across reduced, smoke, GLM52, and native
+      default Showdown runs.
+    - MovieDB default profile improved to 8 DecentDB wins / 5 SQLite wins in
+      this run; remaining material gaps still include checkpoint after
+      mutations (`0.489637s` DecentDB vs `0.048680s` SQLite in the report) and
+      mutation writeback rows.
+    - The remaining material SQLite win groups are concentrated in Showdown
+      bulk load, search-index build/BM25, window/ranking rows, and
+      `INSERT/UPDATE RETURNING`, UPSERT, bulk update/delete.
+  - Added Python binding prefetch eligibility for DML `RETURNING` statements
+    so zero-parameter `UPDATE ... RETURNING` can use the existing row-view
+    fetch-all path. Focused run
+    `.tmp/bench_complex_showdown_glm52_phase5ar_returning_prefetch.json`
+    measured `UPDATE RETURNING` at `0.039203s` versus SQLite `0.002717s`,
+    which is within the previous focused range. The remaining RETURNING gap is
+    therefore not closed by Python fetch prefetch alone.
+  - Shared partition/order work between matching `RANK()` and `DENSE_RANK()`
+    window projections. Focused run
+    `.tmp/bench_complex_showdown_glm52_phase5as_rank_dense_shared.json`
+    moved `review_ranking` from the adjacent `0.424044s` focused run to
+    `0.386400s`, but SQLite was still `0.239570s`. This confirms repeated
+    window partition/sort setup was part of the ranking gap, but the remaining
+    cost is still material.
+  - Shared partition/order work between matching `ROW_NUMBER()` and simple
+    one-argument `LAG()` projections. Focused run
+    `.tmp/bench_complex_showdown_glm52_phase5at_rownum_lag_shared.json`
+    moved `cast_billing_window` to `0.835216s` versus SQLite `0.594550s`, down
+    from the adjacent `0.987771s` focused run. Remaining window work should
+    focus on frame aggregate scans, especially `rolling_avg_frame`.
+  - Tested a narrow rolling `AVG(...) OVER (ROWS BETWEEN N PRECEDING AND
+    CURRENT ROW)` optimization. A prefix-sum version failed result equivalence
+    due floating-point accumulation order
+    (`.tmp/bench_complex_showdown_glm52_phase5au_avg_frame_fast.json`).
+    A corrected frame-order version restored equivalence but did not materially
+    improve the benchmark (`0.069568s` and `0.067179s` in the follow-up
+    `.tmp/bench_complex_showdown_glm52_phase5av_avg_frame_ordered.json` and
+    `.tmp/bench_complex_showdown_glm52_phase5aw_avg_frame_ordered_rerun.json`
+    runs), so that fast path was not retained. Added regression coverage for
+    rolling AVG NULL handling and non-zero frame-start float precision.
+- Next common work should compare making `paged_row_storage=true` the MovieDB
+  embedded-fast profile default against Showdown regressions, then continue on
+  cascade batching/writeback. Under paged row storage the remaining MovieDB
+  gaps are point reads, tag search, update batch, cascade delete, and
+  checkpoint after mutations; update is now about `2.8x` SQLite rather than
+  about `47x`. Cascade remains roughly `4.8x` SQLite and is now the highest
+  leverage MovieDB mutation target.
+- Showdown GLM52 paged-profile check:
+  `.tmp/bench_complex_showdown_glm52_phase5z_paged_profile.json`.
+  - `paged_row_storage=true` is not safe as a global embedded-fast default yet:
+    Showdown bulk load was `2.859047s` versus SQLite `1.053120s`, search index
+    build was `1.036313s` versus `0.306414s`, and several DML/window rows
+    regressed substantially.
+  - Paged storage should remain a targeted MovieDB/mutation-profile lever until
+    paged bulk load, search-index build, and DML paths are optimized.
+
 ### Phase 6: Speed Up Simple Bulk Arithmetic Updates
 
 Benchmark target:

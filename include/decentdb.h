@@ -273,6 +273,14 @@ ddb_status_t ddb_stmt_bind_int64_step_row_view(
     const ddb_value_view_t **out_values,
     size_t *out_columns,
     uint8_t *out_has_row);
+ddb_status_t ddb_stmt_bind_text_step_row_view(
+    ddb_stmt_t *stmt,
+    size_t index_1_based,
+    const char *value,
+    size_t byte_len,
+    const ddb_value_view_t **out_values,
+    size_t *out_columns,
+    uint8_t *out_has_row);
 ddb_status_t ddb_stmt_bind_int64_step_i64_text_f64(
     ddb_stmt_t *stmt,
     size_t index_1_based,

@@ -396,6 +396,110 @@ mod tests {
     }
 
     #[test]
+    fn insert_and_update_returning_project_direct_columns() {
+        let mut runtime = EngineRuntime::empty(1);
+        runtime.catalog_mut().tables.insert(
+            "movies".to_string(),
+            crate::catalog::TableSchema {
+                name: "movies".to_string(),
+                temporary: false,
+                columns: vec![
+                    crate::catalog::ColumnSchema {
+                        name: "id".to_string(),
+                        column_type: crate::catalog::ColumnType::Int64,
+                        spatial_type: None,
+                        enum_type: None,
+                        nullable: false,
+                        default_sql: None,
+                        generated_sql: None,
+                        generated_stored: false,
+                        primary_key: true,
+                        unique: false,
+                        auto_increment: false,
+                        checks: vec![],
+                        foreign_key: None,
+                    },
+                    crate::catalog::ColumnSchema {
+                        name: "title".to_string(),
+                        column_type: crate::catalog::ColumnType::Text,
+                        spatial_type: None,
+                        enum_type: None,
+                        nullable: false,
+                        default_sql: None,
+                        generated_sql: None,
+                        generated_stored: false,
+                        primary_key: false,
+                        unique: false,
+                        auto_increment: false,
+                        checks: vec![],
+                        foreign_key: None,
+                    },
+                    crate::catalog::ColumnSchema {
+                        name: "rating".to_string(),
+                        column_type: crate::catalog::ColumnType::Float64,
+                        spatial_type: None,
+                        enum_type: None,
+                        nullable: false,
+                        default_sql: None,
+                        generated_sql: None,
+                        generated_stored: false,
+                        primary_key: false,
+                        unique: false,
+                        auto_increment: false,
+                        checks: vec![],
+                        foreign_key: None,
+                    },
+                ],
+                checks: vec![],
+                foreign_keys: vec![],
+                primary_key_columns: vec!["id".to_string()],
+                next_row_id: 1,
+                pk_index_root: None,
+            },
+        );
+        runtime.tables_mut().insert(
+            "movies".to_string(),
+            TableRowSource::Resident(Arc::new(TableData::from_rows(Vec::new()))),
+        );
+
+        let insert = parse_sql_statement(
+            "INSERT INTO movies (id, title, rating) VALUES (1, 'RETURNING Test', 3.5) RETURNING id, title",
+        )
+        .expect("parse insert returning");
+        let insert_result = runtime
+            .execute_statement(&insert, &[], 4096)
+            .expect("execute insert returning");
+        assert_eq!(
+            insert_result.columns(),
+            &["id".to_string(), "title".to_string()]
+        );
+        assert_eq!(
+            insert_result.rows()[0].values(),
+            &[Value::Int64(1), Value::Text("RETURNING Test".to_string())]
+        );
+
+        let update = parse_sql_statement(
+            "UPDATE movies SET rating = rating + 0.5 WHERE id = 1 RETURNING id, rating",
+        )
+        .expect("parse update returning");
+        let update_result = runtime
+            .execute_statement(&update, &[], 4096)
+            .expect("execute update returning");
+        assert_eq!(
+            update_result.columns(),
+            &["id".to_string(), "rating".to_string()]
+        );
+        assert_eq!(
+            update_result.rows()[0].values(),
+            &[Value::Int64(1), Value::Float64(4.0)]
+        );
+        assert_eq!(
+            runtime.table_data("movies").expect("table data").rows[0].values[2],
+            Value::Float64(4.0)
+        );
+    }
+
+    #[test]
     fn resident_prepared_simple_insert_keeps_table_data_arc_stable() {
         let mut runtime = EngineRuntime::empty(1);
         runtime.catalog_mut().tables.insert(

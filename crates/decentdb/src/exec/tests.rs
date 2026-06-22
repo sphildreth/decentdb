@@ -10,12 +10,14 @@ use crate::storage::page::InMemoryPageStore;
 use crate::{Db, DbConfig, Value};
 
 use super::{
-    append_paged_table_chunks, decode_manifest_payload, decode_paged_table_manifest_payload,
-    decode_runtime_payload, drop_index_include_columns_section,
-    encode_legacy_table_payload_from_manifest, encode_manifest_payload, encode_paged_table_chunks,
-    encode_paged_table_chunks_from_rows, encode_runtime_payload, encode_table_payload, like_match,
-    persist_paged_table, read_deferred_row_by_id_from_table_payload,
-    read_table_page_manifest_from_state, rewrite_paged_table_from_resident, simple_trigram_lookup,
+    append_paged_table_chunks, apply_paged_row_changes_to_manifest,
+    apply_paged_row_deletions_to_manifest, decode_manifest_payload,
+    decode_paged_table_manifest_payload, decode_runtime_payload,
+    drop_index_include_columns_section, encode_legacy_table_payload_from_manifest,
+    encode_manifest_payload, encode_paged_table_chunks, encode_paged_table_chunks_from_rows,
+    encode_runtime_payload, encode_table_payload, like_match, persist_paged_table,
+    read_deferred_row_by_id_from_table_payload, read_table_page_manifest_from_state,
+    rewrite_paged_table_from_resident, simple_trigram_lookup,
     try_append_only_paged_table_from_manifest, ColumnBinding, Dataset, DbTxnPageStore,
     EngineRuntime, OverflowPointer, PersistedTableState, RuntimeBtreeKeys, RuntimeIndex, StoredRow,
     TableData, TablePageManifest, TablePageManifestChunk, TableRowSource,
@@ -4050,6 +4052,224 @@ fn rewrite_paged_table_from_resident_preserves_untouched_chunk_pointers() {
         preserved_untouched, initial_untouched_pointers,
         "unchanged paged chunks should retain their original pointers in order"
     );
+}
+
+#[test]
+fn sparse_paged_row_changes_do_not_decode_untouched_chunks() {
+    let body = "x".repeat(2048);
+    let rows = (1_i64..=96_i64)
+        .map(|row_id| StoredRow {
+            row_id,
+            values: vec![Value::Int64(row_id), Value::Text(body.clone())],
+        })
+        .collect::<Vec<_>>();
+    let manifest = TablePageManifest::from_rows(&rows, PAGE_SIZE).expect("build manifest");
+    assert!(
+        manifest.chunks.len() > 2,
+        "expected multiple chunks to isolate sparse update"
+    );
+
+    let changed_chunk = manifest
+        .chunk_index_for_row_id(1)
+        .expect("changed row chunk");
+    let corrupt_chunk = (0..manifest.chunks.len())
+        .find(|index| *index != changed_chunk)
+        .expect("untouched chunk");
+    let mut chunks = manifest.chunks.as_ref().clone();
+    chunks[corrupt_chunk].payload = Arc::new(vec![0, 1, 2, 3]);
+    let corrupted_manifest = TablePageManifest {
+        chunks: Arc::new(chunks),
+        rows: Arc::clone(&manifest.rows),
+        tombstoned_row_ids: Arc::clone(&manifest.tombstoned_row_ids),
+    };
+    let mut row_changes = BTreeMap::new();
+    row_changes.insert(
+        1,
+        Some(vec![Value::Int64(1), Value::Text("updated".to_string())]),
+    );
+
+    let updated =
+        apply_paged_row_changes_to_manifest(&corrupted_manifest, &row_changes).expect("update");
+    let row = updated
+        .row_by_id(1)
+        .expect("lookup updated row")
+        .expect("updated row");
+    assert_eq!(row.values()[1], Value::Text("updated".to_string()));
+    assert!(Arc::ptr_eq(
+        &updated.chunks[corrupt_chunk].payload,
+        &corrupted_manifest.chunks[corrupt_chunk].payload
+    ));
+}
+
+#[test]
+fn sparse_paged_row_update_does_not_decode_changed_base_chunk() {
+    let body = "x".repeat(2048);
+    let rows = (1_i64..=96_i64)
+        .map(|row_id| StoredRow {
+            row_id,
+            values: vec![Value::Int64(row_id), Value::Text(body.clone())],
+        })
+        .collect::<Vec<_>>();
+    let manifest = TablePageManifest::from_rows(&rows, PAGE_SIZE).expect("build manifest");
+    assert!(
+        manifest.chunks.len() > 2,
+        "expected multiple chunks to isolate sparse update"
+    );
+
+    let changed_chunk = manifest
+        .chunk_index_for_row_id(1)
+        .expect("changed row chunk");
+    let mut chunks = manifest.chunks.as_ref().clone();
+    chunks[changed_chunk].payload = Arc::new(vec![0, 1, 2, 3]);
+    let corrupted_manifest = TablePageManifest {
+        chunks: Arc::new(chunks),
+        rows: Arc::clone(&manifest.rows),
+        tombstoned_row_ids: Arc::clone(&manifest.tombstoned_row_ids),
+    };
+    let mut row_changes = BTreeMap::new();
+    row_changes.insert(
+        1,
+        Some(vec![Value::Int64(1), Value::Text("updated".to_string())]),
+    );
+
+    let updated =
+        apply_paged_row_changes_to_manifest(&corrupted_manifest, &row_changes).expect("update");
+    let row = updated
+        .row_by_id(1)
+        .expect("lookup updated row")
+        .expect("updated row");
+    assert_eq!(row.values()[1], Value::Text("updated".to_string()));
+    assert!(updated.chunks[changed_chunk]
+        .tombstoned_row_ids
+        .contains(&1));
+    assert!(updated.chunks[changed_chunk].overlay_payload.is_some());
+}
+
+#[test]
+fn sparse_paged_row_deletions_do_not_decode_untouched_chunks() {
+    let body = "x".repeat(2048);
+    let rows = (1_i64..=96_i64)
+        .map(|row_id| StoredRow {
+            row_id,
+            values: vec![Value::Int64(row_id), Value::Text(body.clone())],
+        })
+        .collect::<Vec<_>>();
+    let manifest = TablePageManifest::from_rows(&rows, PAGE_SIZE).expect("build manifest");
+    assert!(
+        manifest.chunks.len() > 2,
+        "expected multiple chunks to isolate sparse delete"
+    );
+
+    let changed_chunk = manifest
+        .chunk_index_for_row_id(1)
+        .expect("deleted row chunk");
+    let corrupt_chunk = (0..manifest.chunks.len())
+        .find(|index| *index != changed_chunk)
+        .expect("untouched chunk");
+    let mut chunks = manifest.chunks.as_ref().clone();
+    chunks[corrupt_chunk].payload = Arc::new(vec![0, 1, 2, 3]);
+    let corrupted_manifest = TablePageManifest {
+        chunks: Arc::new(chunks),
+        rows: Arc::clone(&manifest.rows),
+        tombstoned_row_ids: Arc::clone(&manifest.tombstoned_row_ids),
+    };
+    let deleted_row_ids = [1_i64].into_iter().collect::<BTreeSet<_>>();
+
+    let updated = apply_paged_row_deletions_to_manifest(&corrupted_manifest, &deleted_row_ids)
+        .expect("delete");
+    assert!(updated.row_by_id(1).expect("lookup deleted row").is_none());
+    assert!(Arc::ptr_eq(
+        &updated.chunks[corrupt_chunk].payload,
+        &corrupted_manifest.chunks[corrupt_chunk].payload
+    ));
+}
+
+#[test]
+fn sparse_paged_row_multi_deletions_do_not_decode_untouched_chunks() {
+    let body = "x".repeat(2048);
+    let rows = (1_i64..=96_i64)
+        .map(|row_id| StoredRow {
+            row_id,
+            values: vec![Value::Int64(row_id), Value::Text(body.clone())],
+        })
+        .collect::<Vec<_>>();
+    let manifest = TablePageManifest::from_rows(&rows, PAGE_SIZE).expect("build manifest");
+    assert!(
+        manifest.chunks.len() > 2,
+        "expected multiple chunks to isolate sparse delete"
+    );
+
+    let changed_chunk = manifest
+        .chunk_index_for_row_id(1)
+        .expect("deleted row chunk");
+    let corrupt_chunk = (0..manifest.chunks.len())
+        .find(|index| *index != changed_chunk)
+        .expect("untouched chunk");
+    let mut chunks = manifest.chunks.as_ref().clone();
+    chunks[corrupt_chunk].payload = Arc::new(vec![0, 1, 2, 3]);
+    let corrupted_manifest = TablePageManifest {
+        chunks: Arc::new(chunks),
+        rows: Arc::clone(&manifest.rows),
+        tombstoned_row_ids: Arc::clone(&manifest.tombstoned_row_ids),
+    };
+    let deleted_row_ids = [1_i64, 2_i64, 3_i64].into_iter().collect::<BTreeSet<_>>();
+
+    let updated = apply_paged_row_deletions_to_manifest(&corrupted_manifest, &deleted_row_ids)
+        .expect("delete");
+    for row_id in &deleted_row_ids {
+        assert!(updated
+            .row_by_id(*row_id)
+            .expect("lookup deleted row")
+            .is_none());
+    }
+    assert_eq!(
+        updated.row_count(),
+        manifest.row_count() - deleted_row_ids.len()
+    );
+    assert!(Arc::ptr_eq(
+        &updated.chunks[corrupt_chunk].payload,
+        &corrupted_manifest.chunks[corrupt_chunk].payload
+    ));
+}
+
+#[test]
+fn sparse_paged_row_deletions_do_not_decode_changed_base_chunk() {
+    let body = "x".repeat(2048);
+    let rows = (1_i64..=96_i64)
+        .map(|row_id| StoredRow {
+            row_id,
+            values: vec![Value::Int64(row_id), Value::Text(body.clone())],
+        })
+        .collect::<Vec<_>>();
+    let manifest = TablePageManifest::from_rows(&rows, PAGE_SIZE).expect("build manifest");
+    assert!(
+        manifest.chunks.len() > 2,
+        "expected multiple chunks to isolate sparse delete"
+    );
+
+    let deleted_row_chunk = manifest
+        .chunk_index_for_row_id(1)
+        .expect("deleted row chunk");
+    let mut chunks = manifest.chunks.as_ref().clone();
+    chunks[deleted_row_chunk].payload = Arc::new(vec![0, 1, 2, 3]);
+    let corrupted_manifest = TablePageManifest {
+        chunks: Arc::new(chunks),
+        rows: Arc::clone(&manifest.rows),
+        tombstoned_row_ids: Arc::clone(&manifest.tombstoned_row_ids),
+    };
+    let deleted_row_ids = [1_i64].into_iter().collect::<BTreeSet<_>>();
+
+    let updated = apply_paged_row_deletions_to_manifest(&corrupted_manifest, &deleted_row_ids)
+        .expect("delete");
+    assert!(updated.row_by_id(1).expect("lookup deleted row").is_none());
+    assert_eq!(
+        updated.chunks[deleted_row_chunk].row_count,
+        manifest.chunks[deleted_row_chunk].row_count - 1
+    );
+    assert!(Arc::ptr_eq(
+        &updated.chunks[deleted_row_chunk].payload,
+        &corrupted_manifest.chunks[deleted_row_chunk].payload
+    ));
 }
 
 #[test]

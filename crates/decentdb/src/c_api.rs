@@ -2939,6 +2939,55 @@ pub extern "C" fn ddb_stmt_bind_int64_step_row_view(
 }
 
 #[no_mangle]
+pub extern "C" fn ddb_stmt_bind_text_step_row_view(
+    stmt: *mut StmtHandle,
+    index_1_based: usize,
+    value: *const c_char,
+    byte_len: usize,
+    out_values: *mut *const DdbValueView,
+    out_columns: *mut usize,
+    out_has_row: *mut u8,
+) -> u32 {
+    ffi_boundary(|| {
+        let bytes = borrowed_bytes(value.cast::<u8>(), byte_len)?;
+        let text = std::str::from_utf8(bytes)
+            .map_err(|error| DbError::sql(format!("TEXT parameter is not valid UTF-8: {error}")))?;
+        let stmt = handle_mut(stmt, "stmt")?;
+        let slot = ensure_stmt_binding_slot(stmt, index_1_based)?;
+        stmt.bindings[slot] = Value::Text(text.to_string());
+        invalidate_stmt_result(stmt);
+        execute_stmt_if_needed(stmt)?;
+
+        let row_count = stmt
+            .result
+            .as_ref()
+            .ok_or_else(|| DbError::internal("statement execution did not produce a result"))?
+            .rows()
+            .len();
+        if stmt.next_row_index >= row_count {
+            stmt.current_row = None;
+            *out_ptr(out_has_row, "out_has_row")? = 0;
+            *out_ptr(out_columns, "out_columns")? = 0;
+            *out_ptr(out_values, "out_values")? = ptr::null();
+            return Ok(());
+        }
+
+        stmt.current_row = Some(stmt.next_row_index);
+        stmt.next_row_index += 1;
+        populate_stmt_row_views(stmt)?;
+
+        *out_ptr(out_has_row, "out_has_row")? = 1;
+        *out_ptr(out_columns, "out_columns")? = stmt.row_views.len();
+        *out_ptr(out_values, "out_values")? = if stmt.row_views.is_empty() {
+            ptr::null()
+        } else {
+            stmt.row_views.as_ptr()
+        };
+        Ok(())
+    })
+}
+
+#[no_mangle]
 pub extern "C" fn ddb_stmt_bind_int64_step_i64_text_f64(
     stmt: *mut StmtHandle,
     index_1_based: usize,
@@ -4108,6 +4157,76 @@ mod tests {
     #[test]
     fn abi_version_is_stable() {
         assert_eq!(ddb_abi_version(), DDB_ABI_VERSION);
+    }
+
+    #[test]
+    fn ffi_bind_text_step_row_view_returns_first_row() {
+        let mut db = ptr::null_mut();
+        let path = CString::new(":memory:").expect("path");
+        assert_eq!(ddb_db_open_or_create(path.as_ptr(), &mut db), DDB_OK);
+
+        let mut result = ptr::null_mut();
+        for sql in [
+            "CREATE TABLE lookup (id TEXT PRIMARY KEY, value INT64)",
+            "INSERT INTO lookup VALUES ('alpha', 7), ('beta', 11)",
+        ] {
+            let sql = CString::new(sql).expect("sql");
+            assert_eq!(
+                ddb_db_execute(db, sql.as_ptr(), ptr::null(), 0, &mut result),
+                DDB_OK
+            );
+            assert_eq!(ddb_result_free(&mut result), DDB_OK);
+        }
+
+        let sql = CString::new("SELECT id, value FROM lookup WHERE id = $1").expect("sql");
+        let mut stmt = ptr::null_mut();
+        assert_eq!(ddb_db_prepare(db, sql.as_ptr(), &mut stmt), DDB_OK);
+
+        let param = CString::new("beta").expect("param");
+        let mut values = ptr::null();
+        let mut columns = 0_usize;
+        let mut has_row = 0_u8;
+        assert_eq!(
+            ddb_stmt_bind_text_step_row_view(
+                stmt,
+                1,
+                param.as_ptr(),
+                4,
+                &mut values,
+                &mut columns,
+                &mut has_row,
+            ),
+            DDB_OK
+        );
+        assert_eq!(has_row, 1);
+        assert_eq!(columns, 2);
+        assert!(!values.is_null());
+        let row = unsafe { std::slice::from_raw_parts(values, columns) };
+        assert_eq!(row[0].tag, DdbValueTag::Text as u32);
+        let text = unsafe { std::slice::from_raw_parts(row[0].data, row[0].len) };
+        assert_eq!(text, b"beta");
+        assert_eq!(row[1].tag, DdbValueTag::Int64 as u32);
+        assert_eq!(row[1].int64_value, 11);
+
+        let missing = CString::new("missing").expect("param");
+        assert_eq!(
+            ddb_stmt_bind_text_step_row_view(
+                stmt,
+                1,
+                missing.as_ptr(),
+                7,
+                &mut values,
+                &mut columns,
+                &mut has_row,
+            ),
+            DDB_OK
+        );
+        assert_eq!(has_row, 0);
+        assert_eq!(columns, 0);
+        assert!(values.is_null());
+
+        assert_eq!(ddb_stmt_free(&mut stmt), DDB_OK);
+        assert_eq!(ddb_db_free(&mut db), DDB_OK);
     }
 
     #[test]

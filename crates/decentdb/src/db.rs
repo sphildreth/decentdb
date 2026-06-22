@@ -26,12 +26,12 @@ use crate::exec::dml::{
     PreparedSimpleDelete, PreparedSimpleInsert, PreparedSimpleUpdate, PreparedSimpleValueSource,
 };
 use crate::exec::{
-    decode_paged_table_manifest_payload, read_table_payload_row_count_from_bytes,
+    read_persisted_table_row_count, read_table_payload_row_count_from_bytes,
     row_satisfies_expression, statement_is_read_only, BulkLoadOptions, EngineRuntime, QueryResult,
     QueryRow, ResolvedSimpleJoinProjection, ResolvedSimpleOrderedRowIdProjectionRequest,
     ResolvedSimpleRowIdJoinProjectionRequest, ResolvedSimpleRowIdProjectionRequest,
-    ResolvedSimpleRowIdRangeProjectionRequest, RuntimeIndex, SimpleJoinProjectionSide,
-    SimpleRangeBoundValue, SimpleRowIdProjectionRequest, TableData,
+    ResolvedSimpleRowIdRangeProjectionRequest, RuntimeIndex, RuntimeRowIdSet,
+    SimpleJoinProjectionSide, SimpleRangeBoundValue, SimpleRowIdProjectionRequest, TableData,
 };
 use crate::metadata::{
     CheckConstraintInfo, ColumnInfo, ForeignKeyInfo, HeaderInfo, IndexInfo, IndexVerification,
@@ -56,7 +56,7 @@ use crate::search::fulltext::analyzer::{
     AnalyzerConfig, AnalyzerDiacritics, AnalyzerLanguage, AnalyzerStemmer, AnalyzerStopwords,
     AnalyzerTokenization,
 };
-use crate::sql::ast::Statement as SqlStatement;
+use crate::sql::ast::{BinaryOp, Expr, FromItem, QueryBody, SelectItem, Statement as SqlStatement};
 use crate::sql::parser::{parse_expression_sql, parse_sql_statement, rewrite_legacy_trigger_body};
 use crate::storage::freelist::{decode_freelist_next, encode_freelist_page};
 use crate::storage::page::{self, PageId, PageStore};
@@ -217,6 +217,7 @@ pub struct PreparedStatement {
     statement: Arc<SqlStatement>,
     prepared_sql: String,
     simple_row_id_projection: Option<PreparedSimpleRowIdProjection>,
+    simple_indexed_projection: Option<PreparedSimpleIndexedProjection>,
     simple_row_id_range_projection: Option<PreparedSimpleRowIdRangeProjection>,
     simple_ordered_row_id_projection: Option<PreparedSimpleOrderedRowIdProjection>,
     simple_row_id_join_projection: Option<PreparedSimpleRowIdJoinProjection>,
@@ -231,6 +232,7 @@ pub struct PreparedStatement {
 struct PreparedPlanBundle {
     statement: Arc<SqlStatement>,
     simple_row_id_projection: Option<PreparedSimpleRowIdProjection>,
+    simple_indexed_projection: Option<PreparedSimpleIndexedProjection>,
     simple_row_id_range_projection: Option<PreparedSimpleRowIdRangeProjection>,
     simple_ordered_row_id_projection: Option<PreparedSimpleOrderedRowIdProjection>,
     simple_row_id_join_projection: Option<PreparedSimpleRowIdJoinProjection>,
@@ -443,6 +445,25 @@ struct PreparedSimpleRowIdProjection {
     projection_indexes: Vec<usize>,
     column_names: Arc<[String]>,
     param_index: usize,
+}
+
+#[derive(Clone, Debug)]
+struct PreparedSimpleIndexedProjection {
+    table_name: String,
+    projection_indexes: Vec<usize>,
+    column_names: Arc<[String]>,
+    lookup: PreparedSimpleIndexedProjectionLookup,
+}
+
+#[derive(Clone, Debug)]
+enum PreparedSimpleIndexedProjectionLookup {
+    RowId {
+        value_source: PreparedSimpleValueSource,
+    },
+    Index {
+        index_name: String,
+        value_source: PreparedSimpleValueSource,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5141,13 +5162,16 @@ impl Db {
                                 prepared_insert.as_ref(),
                                 param_count,
                             ) {
+                                let mut candidate =
+                                    Vec::with_capacity(prepared_insert.columns.len());
                                 for row_index in 0..row_count {
                                     build_params(row_index, &mut params)?;
                                     let affected = state
                                         .runtime
-                                        .execute_prepared_simple_insert_positional_params_in_place(
+                                        .execute_prepared_simple_insert_positional_params_in_place_with_candidate(
                                             prepared_insert.as_ref(),
                                             &mut params,
+                                            &mut candidate,
                                             self.inner.config.page_size,
                                         )?;
                                     total_affected = total_affected.saturating_add(affected);
@@ -5427,6 +5451,163 @@ impl Db {
         drop(runtime);
         drop(reader);
         Ok(result)
+    }
+
+    fn try_execute_prepared_simple_indexed_projection(
+        &self,
+        prepared: &PreparedStatement,
+        params: &[Value],
+    ) -> Result<Option<QueryResult>> {
+        if self.inner.sql_txn_active.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let Some(plan) = prepared.simple_indexed_projection.as_ref() else {
+            return Ok(None);
+        };
+
+        if self.inner.config.process_coordination == ProcessCoordinationMode::SingleProcessUnsafe
+            && !self.inner.config.extension_unsigned_development_mode
+            && self.inner.config.extension_trust_anchors.is_empty()
+        {
+            if let Some(runtime) = self.try_resident_read_for_single_process_statement(
+                prepared.statement.as_ref(),
+                Some(prepared),
+            )? {
+                let result = self.execute_prepared_simple_indexed_projection_in_runtime(
+                    &runtime, plan, params,
+                )?;
+                drop(runtime);
+                if let Some(result) = result {
+                    return self
+                        .finalize_row_source_autocommit_statement(
+                            prepared.statement.as_ref(),
+                            Ok(result),
+                        )
+                        .map(Some);
+                }
+            }
+        }
+
+        let reader = self.inner.wal.begin_reader_with_pager(&self.inner.pager)?;
+        let snapshot_lsn = reader.snapshot_lsn();
+        if let Some(runtime) = self.runtime_read_for_prepared_row_sources_at_snapshot(
+            &[plan.table_name.as_str()],
+            snapshot_lsn,
+        )? {
+            self.validate_prepared_schema_cookie(
+                prepared,
+                runtime.catalog.schema_cookie,
+                runtime.temp_schema_cookie,
+            )?;
+            let result =
+                self.execute_prepared_simple_indexed_projection_in_runtime(&runtime, plan, params)?;
+            if result.is_some() {
+                drop(runtime);
+                drop(reader);
+                return Ok(result);
+            }
+            drop(runtime);
+        }
+
+        self.refresh_engine_from_snapshot(snapshot_lsn)?;
+        self.try_load_prepared_read_row_sources_at_snapshot(
+            &[plan.table_name.as_str()],
+            snapshot_lsn,
+        )?;
+        let Some(runtime) = self.runtime_read_for_fast_read_at_snapshot(snapshot_lsn)? else {
+            drop(reader);
+            return Ok(None);
+        };
+        self.validate_prepared_schema_cookie(
+            prepared,
+            runtime.catalog.schema_cookie,
+            runtime.temp_schema_cookie,
+        )?;
+        let result =
+            self.execute_prepared_simple_indexed_projection_in_runtime(&runtime, plan, params)?;
+        drop(runtime);
+        drop(reader);
+        Ok(result)
+    }
+
+    fn execute_prepared_simple_indexed_projection_in_runtime(
+        &self,
+        runtime: &EngineRuntime,
+        plan: &PreparedSimpleIndexedProjection,
+        params: &[Value],
+    ) -> Result<Option<QueryResult>> {
+        let lookup_value = match &plan.lookup {
+            PreparedSimpleIndexedProjectionLookup::RowId { value_source }
+            | PreparedSimpleIndexedProjectionLookup::Index { value_source, .. } => {
+                resolve_prepared_simple_value_for_fast_path(value_source, params)?
+            }
+        };
+        if matches!(lookup_value, Value::Null) {
+            return Ok(Some(QueryResult::with_rows(
+                plan.column_names.to_vec(),
+                Vec::new(),
+            )));
+        }
+
+        let Some(row_source) = runtime.table_row_source(plan.table_name.as_str()) else {
+            return Ok(None);
+        };
+
+        let mut rows = Vec::new();
+        match &plan.lookup {
+            PreparedSimpleIndexedProjectionLookup::RowId { .. } => {
+                let Value::Int64(row_id) = lookup_value else {
+                    return Ok(Some(QueryResult::with_rows(
+                        plan.column_names.to_vec(),
+                        Vec::new(),
+                    )));
+                };
+                if let Some(stored_row) = row_source.row_by_id(row_id)? {
+                    rows.push(QueryRow::new(
+                        plan.projection_indexes
+                            .iter()
+                            .map(|index| stored_row.values()[*index].clone())
+                            .collect(),
+                    ));
+                }
+            }
+            PreparedSimpleIndexedProjectionLookup::Index { index_name, .. } => {
+                let Some(RuntimeIndex::Btree { keys, .. }) = runtime.index(index_name) else {
+                    return Ok(None);
+                };
+                match keys.row_ids_for_value_set(&lookup_value)? {
+                    RuntimeRowIdSet::Empty => {}
+                    RuntimeRowIdSet::Single(row_id) => {
+                        if let Some(stored_row) = row_source.row_by_id(row_id)? {
+                            rows.push(QueryRow::new(
+                                plan.projection_indexes
+                                    .iter()
+                                    .map(|index| stored_row.values()[*index].clone())
+                                    .collect(),
+                            ));
+                        }
+                    }
+                    RuntimeRowIdSet::Many(row_ids) => {
+                        rows.reserve(row_ids.len());
+                        for row_id in row_ids {
+                            if let Some(stored_row) = row_source.row_by_id(*row_id)? {
+                                rows.push(QueryRow::new(
+                                    plan.projection_indexes
+                                        .iter()
+                                        .map(|index| stored_row.values()[*index].clone())
+                                        .collect(),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(Some(QueryResult::with_rows(
+            plan.column_names.to_vec(),
+            rows,
+        )))
     }
 
     fn try_execute_prepared_simple_row_id_range_projection(
@@ -5710,6 +5891,11 @@ impl Db {
         }
         if let Some(result) =
             self.try_execute_prepared_simple_row_id_projection(prepared, params)?
+        {
+            return Ok(result);
+        }
+        if let Some(result) =
+            self.try_execute_prepared_simple_indexed_projection(prepared, params)?
         {
             return Ok(result);
         }
@@ -6310,11 +6496,12 @@ impl Db {
         prepared_delete: &PreparedSimpleDelete,
         params: &[Value],
     ) -> Result<QueryResult> {
-        let mut table_names = vec![prepared_delete.table.name.as_str()];
-        for child in &prepared_delete.restrict_children {
-            table_names.push(child.child_table_name.as_str());
-        }
-        self.load_simple_write_row_sources_at_latest_snapshot(&table_names)?;
+        let table_names = prepared_delete.affected_table_names();
+        let child_index_targets = prepared_delete.child_index_hydration_targets();
+        self.load_simple_write_row_sources_and_child_indexes_at_latest_snapshot(
+            &table_names,
+            &child_index_targets,
+        )?;
         let mut runtime = self
             .inner
             .engine
@@ -6653,11 +6840,12 @@ impl Db {
         )? {
             return Ok(Some(result));
         }
-        let mut table_names = vec![prepared_delete.table.name.as_str()];
-        for child in &prepared_delete.restrict_children {
-            table_names.push(child.child_table_name.as_str());
-        }
-        self.load_simple_write_row_sources_at_latest_snapshot(&table_names)?;
+        let table_names = prepared_delete.affected_table_names();
+        let child_index_targets = prepared_delete.child_index_hydration_targets();
+        self.load_simple_write_row_sources_and_child_indexes_at_latest_snapshot(
+            &table_names,
+            &child_index_targets,
+        )?;
         let mut runtime = self
             .inner
             .engine
@@ -6841,6 +7029,15 @@ impl Db {
             return Ok(true);
         }
         Ok(self.inner.catalog.schema_cookie()? != runtime.catalog.schema_cookie)
+    }
+
+    fn runtime_has_stale_indexes(runtime: &EngineRuntime) -> bool {
+        runtime.catalog.indexes.iter().any(|(name, index)| {
+            let table_deferred = runtime
+                .deferred_table_names()
+                .any(|table_name| identifiers_equal(table_name, &index.table_name));
+            !table_deferred && (!index.fresh || !runtime.indexes.contains_key(name))
+        })
     }
 
     fn backfill_missing_persistent_pk_index_for_table(&self, table_name: &str) -> Result<()> {
@@ -7269,6 +7466,7 @@ impl Db {
             statement: Arc::clone(&bundle.statement),
             prepared_sql: prepared_sql.to_string(),
             simple_row_id_projection: bundle.simple_row_id_projection,
+            simple_indexed_projection: bundle.simple_indexed_projection,
             simple_row_id_range_projection: bundle.simple_row_id_range_projection,
             simple_ordered_row_id_projection: bundle.simple_ordered_row_id_projection,
             simple_row_id_join_projection: bundle.simple_row_id_join_projection,
@@ -7313,6 +7511,7 @@ impl Db {
                 statement: Arc::clone(&bundle.statement),
                 prepared_sql,
                 simple_row_id_projection: bundle.simple_row_id_projection,
+                simple_indexed_projection: bundle.simple_indexed_projection,
                 simple_row_id_range_projection: bundle.simple_row_id_range_projection,
                 simple_ordered_row_id_projection: bundle.simple_ordered_row_id_projection,
                 simple_row_id_join_projection: bundle.simple_row_id_join_projection,
@@ -7345,6 +7544,8 @@ impl Db {
         };
         let simple_row_id_projection =
             Self::prepared_simple_row_id_projection(&prepared_sql, runtime);
+        let simple_indexed_projection =
+            Self::prepared_simple_indexed_projection(statement.as_ref(), runtime);
         let simple_row_id_range_projection =
             Self::prepared_simple_row_id_range_projection(&prepared_sql, runtime);
         let simple_ordered_row_id_projection =
@@ -7356,6 +7557,7 @@ impl Db {
         let bundle = PreparedPlanBundle {
             statement: Arc::clone(&statement),
             simple_row_id_projection,
+            simple_indexed_projection,
             simple_row_id_range_projection,
             simple_ordered_row_id_projection,
             simple_row_id_join_projection,
@@ -7381,6 +7583,7 @@ impl Db {
             statement: Arc::clone(&statement),
             prepared_sql: prepared_sql.clone(),
             simple_row_id_projection: bundle.simple_row_id_projection,
+            simple_indexed_projection: bundle.simple_indexed_projection,
             simple_row_id_range_projection: bundle.simple_row_id_range_projection,
             simple_ordered_row_id_projection: bundle.simple_ordered_row_id_projection,
             simple_row_id_join_projection: bundle.simple_row_id_join_projection,
@@ -7429,6 +7632,161 @@ impl Db {
             projection_indexes,
             column_names: Arc::from(column_names),
             param_index: plan.param_index,
+        })
+    }
+
+    fn prepared_simple_indexed_projection(
+        statement: &SqlStatement,
+        runtime: &EngineRuntime,
+    ) -> Option<PreparedSimpleIndexedProjection> {
+        let SqlStatement::Query(query) = statement else {
+            return None;
+        };
+        if !query.ctes.is_empty()
+            || !query.order_by.is_empty()
+            || query.limit.is_some()
+            || query.offset.is_some()
+        {
+            return None;
+        }
+        let QueryBody::Select(select) = &query.body else {
+            return None;
+        };
+        if select.distinct
+            || !select.distinct_on.is_empty()
+            || !select.group_by.is_empty()
+            || select.having.is_some()
+            || select.from.len() != 1
+        {
+            return None;
+        }
+        let Some(filter) = select.filter.as_ref() else {
+            return None;
+        };
+        let FromItem::Table { name, alias } = &select.from[0] else {
+            return None;
+        };
+        if runtime.temp_table_schema(name).is_some()
+            || runtime
+                .catalog
+                .views
+                .keys()
+                .any(|view_name| identifiers_equal(view_name, name))
+        {
+            return None;
+        }
+        let table = runtime.catalog.table(name)?;
+        if !prepared_table_generated_columns_are_stored(table) {
+            return None;
+        }
+        let binding_name = alias.as_deref().unwrap_or(name);
+
+        let (filter_table, filter_column, value_expr) = match filter {
+            Expr::Binary { left, op, right } if *op == BinaryOp::Eq => match (&**left, &**right) {
+                (Expr::Column { table, column }, value_expr) => {
+                    (table.as_deref(), column.as_str(), value_expr)
+                }
+                (value_expr, Expr::Column { table, column }) => {
+                    (table.as_deref(), column.as_str(), value_expr)
+                }
+                _ => return None,
+            },
+            _ => return None,
+        };
+        if let Some(filter_table) = filter_table {
+            if !identifiers_equal(filter_table, name)
+                && !identifiers_equal(filter_table, binding_name)
+            {
+                return None;
+            }
+        }
+        let Some(value_source) = prepared_simple_value_source(value_expr) else {
+            return None;
+        };
+
+        let mut projection_indexes = Vec::with_capacity(select.projection.len());
+        let mut column_names = Vec::with_capacity(select.projection.len());
+        for item in &select.projection {
+            match item {
+                SelectItem::Expr {
+                    expr,
+                    alias: select_alias,
+                } => {
+                    let Expr::Column {
+                        table: projection_table,
+                        column,
+                    } = expr
+                    else {
+                        return None;
+                    };
+                    if let Some(projection_table) = projection_table.as_deref() {
+                        if !identifiers_equal(projection_table, name)
+                            && !identifiers_equal(projection_table, binding_name)
+                        {
+                            return None;
+                        }
+                    }
+                    let index = table
+                        .columns
+                        .iter()
+                        .position(|candidate| identifiers_equal(&candidate.name, column))?;
+                    projection_indexes.push(index);
+                    column_names.push(select_alias.clone().unwrap_or_else(|| column.clone()));
+                }
+                SelectItem::Wildcard => {
+                    for (index, column) in table.columns.iter().enumerate() {
+                        projection_indexes.push(index);
+                        column_names.push(column.name.clone());
+                    }
+                }
+                SelectItem::QualifiedWildcard(qualified_name) => {
+                    if !identifiers_equal(qualified_name, name)
+                        && !identifiers_equal(qualified_name, binding_name)
+                    {
+                        return None;
+                    }
+                    for (index, column) in table.columns.iter().enumerate() {
+                        projection_indexes.push(index);
+                        column_names.push(column.name.clone());
+                    }
+                }
+            }
+        }
+
+        let lookup =
+            if row_id_alias_column_name(table)
+                .is_some_and(|column_name| identifiers_equal(column_name, filter_column))
+            {
+                PreparedSimpleIndexedProjectionLookup::RowId { value_source }
+            } else {
+                let index_name =
+                    runtime
+                        .catalog
+                        .indexes
+                        .values()
+                        .find(|index| {
+                            index.fresh
+                                && index.kind == crate::catalog::IndexKind::Btree
+                                && identifiers_equal(&index.table_name, &table.name)
+                                && index.predicate_sql.is_none()
+                                && index.columns.len() == 1
+                                && index.columns[0].expression_sql.is_none()
+                                && index.columns[0].column_name.as_ref().is_some_and(
+                                    |column_name| identifiers_equal(column_name, filter_column),
+                                )
+                        })
+                        .map(|index| index.name.clone())?;
+                PreparedSimpleIndexedProjectionLookup::Index {
+                    index_name,
+                    value_source,
+                }
+            };
+
+        Some(PreparedSimpleIndexedProjection {
+            table_name: table.name.clone(),
+            projection_indexes,
+            column_names: Arc::from(column_names),
+            lookup,
         })
     }
 
@@ -7858,6 +8216,15 @@ impl Db {
                 )
                 .saturating_add(string_slice_bytes(&plan.column_names));
         }
+        if let Some(plan) = &bundle.simple_indexed_projection {
+            total = total
+                .saturating_add(192)
+                .saturating_add(string_bytes(&plan.table_name))
+                .saturating_add(
+                    (plan.projection_indexes.len() * std::mem::size_of::<usize>()) as u64,
+                )
+                .saturating_add(string_slice_bytes(&plan.column_names));
+        }
         if let Some(plan) = &bundle.simple_row_id_range_projection {
             total = total
                 .saturating_add(160)
@@ -8227,6 +8594,25 @@ impl Db {
                 .map_or(0, |data| data.rows.len()));
         }
 
+        if let Some(source) = runtime.table_row_source(table_name) {
+            return Ok(source.row_count());
+        }
+
+        let state = runtime.persisted_table_state(table_name);
+        if let Some(state) = state {
+            if state.pointer.is_table_paged_manifest()
+                && state.pointer.head_page_id != 0
+                && state.pointer.logical_len != 0
+            {
+                let store = if let Some(lsn) = snapshot_lsn {
+                    PagerReadStore::with_snapshot_lsn(self, lsn)
+                } else {
+                    PagerReadStore::new(self)?
+                };
+                return read_persisted_table_row_count(&store, state);
+            }
+        }
+
         if let Some(table) = runtime.catalog.table(table_name) {
             if let Some(stats) = runtime.catalog.table_stats.get(&table.name) {
                 let row_count = usize::try_from(stats.row_count.max(0)).unwrap_or(usize::MAX);
@@ -8236,11 +8622,7 @@ impl Db {
             }
         }
 
-        if let Some(source) = runtime.table_row_source(table_name) {
-            return Ok(source.row_count());
-        }
-
-        let Some(state) = runtime.persisted_table_state(table_name) else {
+        let Some(state) = state else {
             return Ok(0);
         };
         if state.row_count != 0 || state.pointer.head_page_id == 0 {
@@ -8253,12 +8635,7 @@ impl Db {
             PagerReadStore::new(self)?
         };
         let payload = read_overflow(&store, state.pointer)?;
-        if state.pointer.is_table_paged_manifest() {
-            let manifest = decode_paged_table_manifest_payload(&payload)?;
-            Ok(manifest.chunks.iter().map(|chunk| chunk.row_count).sum())
-        } else {
-            read_table_payload_row_count_from_bytes(&payload)
-        }
+        read_table_payload_row_count_from_bytes(&payload)
     }
 
     fn runtime_for_prepare(&self) -> Result<EngineRuntime> {
@@ -9059,6 +9436,42 @@ impl Db {
         Ok(())
     }
 
+    fn load_simple_write_row_sources_and_child_indexes_at_latest_snapshot(
+        &self,
+        names: &[&str],
+        child_index_targets: &[(&str, &str)],
+    ) -> Result<()> {
+        if !self.inner.config.defer_table_materialization {
+            self.refresh_engine_from_storage()?;
+            self.ensure_tables_loaded_at_snapshot(names, None)?;
+            return Ok(());
+        }
+
+        let indexes_loaded = {
+            let runtime = self
+                .inner
+                .engine
+                .read()
+                .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+            child_index_targets
+                .iter()
+                .all(|(_, index_name)| runtime.index(index_name).is_some())
+        };
+        if self.simple_write_row_sources_loaded_for_current_runtime(names)? && indexes_loaded {
+            return Ok(());
+        }
+
+        let reader = self.inner.wal.begin_reader_with_pager(&self.inner.pager)?;
+        let snapshot_lsn = reader.snapshot_lsn();
+        self.refresh_engine_from_snapshot(snapshot_lsn)?;
+        for (table_name, index_name) in child_index_targets {
+            self.hydrate_deferred_runtime_index_at_snapshot(table_name, index_name, snapshot_lsn)?;
+        }
+        self.ensure_table_row_sources_loaded_at_snapshot(names, snapshot_lsn)?;
+        drop(reader);
+        Ok(())
+    }
+
     fn simple_write_row_sources_loaded_for_current_runtime(&self, names: &[&str]) -> Result<bool> {
         let latest_lsn = self.inner.wal.latest_snapshot();
         let latest_checkpoint_epoch = self.inner.wal.checkpoint_epoch();
@@ -9415,6 +9828,22 @@ impl Db {
             &filter,
             snapshot_lsn,
         )
+    }
+
+    fn load_runtime_table_row_sources_and_child_indexes_at_snapshot(
+        &self,
+        runtime: &mut EngineRuntime,
+        names: &[&str],
+        child_index_targets: &[(&str, &str)],
+        snapshot_lsn: u64,
+    ) -> Result<()> {
+        self.load_runtime_table_row_sources_at_snapshot(runtime, names, snapshot_lsn)?;
+        for (_, index_name) in child_index_targets {
+            if runtime.index(index_name).is_none() {
+                runtime.rebuild_index(index_name, self.inner.config.page_size)?;
+            }
+        }
+        Ok(())
     }
 
     fn load_all_runtime_row_sources_at_snapshot(
@@ -9842,10 +10271,7 @@ impl Db {
             }
             SqlStatement::Delete(delete) => {
                 if let Some(prepared_delete) = runtime.prepare_simple_delete(delete)? {
-                    let mut table_names = vec![prepared_delete.table.name.as_str()];
-                    for child in &prepared_delete.restrict_children {
-                        table_names.push(child.child_table_name.as_str());
-                    }
+                    let table_names = prepared_delete.affected_table_names();
                     self.load_runtime_table_row_sources_at_snapshot(
                         runtime,
                         &table_names,
@@ -10107,6 +10533,32 @@ impl Db {
         )? {
             return Ok(result);
         }
+        if let Some(prepared_update) = prepared.prepared_update.as_deref() {
+            if let Some(result) = self.try_execute_prepared_update_in_runtime_state(
+                prepared,
+                prepared_update,
+                params,
+                &mut state.runtime,
+                snapshot_lsn,
+                &mut state.persistent_changed,
+                &mut state.indexes_maybe_stale,
+            )? {
+                return Ok(result);
+            }
+        }
+        if let Some(prepared_delete) = prepared.prepared_delete.as_deref() {
+            if let Some(result) = self.try_execute_prepared_delete_in_runtime_state(
+                prepared,
+                prepared_delete,
+                params,
+                &mut state.runtime,
+                snapshot_lsn,
+                &mut state.persistent_changed,
+                &mut state.indexes_maybe_stale,
+            )? {
+                return Ok(result);
+            }
+        }
         self.execute_write_in_runtime_state(
             prepared.statement.as_ref(),
             params,
@@ -10208,6 +10660,32 @@ impl Db {
             &mut state.prepared_insert_runtime_cache,
         )? {
             return Ok(result);
+        }
+        if let Some(prepared_update) = prepared.prepared_update.as_deref() {
+            if let Some(result) = self.try_execute_prepared_update_in_runtime_state(
+                prepared,
+                prepared_update,
+                params,
+                &mut state.runtime,
+                snapshot_lsn,
+                &mut state.persistent_changed,
+                &mut state.indexes_maybe_stale,
+            )? {
+                return Ok(result);
+            }
+        }
+        if let Some(prepared_delete) = prepared.prepared_delete.as_deref() {
+            if let Some(result) = self.try_execute_prepared_delete_in_runtime_state(
+                prepared,
+                prepared_delete,
+                params,
+                &mut state.runtime,
+                snapshot_lsn,
+                &mut state.persistent_changed,
+                &mut state.indexes_maybe_stale,
+            )? {
+                return Ok(result);
+            }
         }
         self.execute_write_in_runtime_state(
             prepared.statement.as_ref(),
@@ -10346,6 +10824,79 @@ impl Db {
         *persistent_changed |=
             Self::prepared_insert_changes_persistent_table(runtime, insert_plan.as_ref());
         Ok(Some(QueryResult::with_affected_rows(result)))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_execute_prepared_update_in_runtime_state(
+        &self,
+        prepared_statement: &PreparedStatement,
+        prepared_update: &PreparedSimpleUpdate,
+        params: &[Value],
+        runtime: &mut EngineRuntime,
+        snapshot_lsn: u64,
+        persistent_changed: &mut bool,
+        indexes_maybe_stale: &mut bool,
+    ) -> Result<Option<QueryResult>> {
+        self.load_runtime_table_row_sources_at_snapshot(
+            runtime,
+            &[prepared_update.table_name.as_str()],
+            snapshot_lsn,
+        )?;
+        self.validate_prepared_schema_cookie(
+            prepared_statement,
+            runtime.catalog.schema_cookie,
+            runtime.temp_schema_cookie,
+        )?;
+        if !runtime.can_reuse_prepared_simple_update(prepared_update) {
+            return Ok(None);
+        }
+        let temp_only = self.statement_is_temp_only(runtime, prepared_statement.statement.as_ref());
+        let result = runtime.execute_prepared_simple_update(
+            prepared_update,
+            params,
+            self.inner.config.page_size,
+        )?;
+        *persistent_changed |= !temp_only;
+        *indexes_maybe_stale |= Self::runtime_has_stale_indexes(runtime);
+        Ok(Some(result))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_execute_prepared_delete_in_runtime_state(
+        &self,
+        prepared_statement: &PreparedStatement,
+        prepared_delete: &PreparedSimpleDelete,
+        params: &[Value],
+        runtime: &mut EngineRuntime,
+        snapshot_lsn: u64,
+        persistent_changed: &mut bool,
+        indexes_maybe_stale: &mut bool,
+    ) -> Result<Option<QueryResult>> {
+        let table_names = prepared_delete.affected_table_names();
+        let child_index_targets = prepared_delete.child_index_hydration_targets();
+        self.load_runtime_table_row_sources_and_child_indexes_at_snapshot(
+            runtime,
+            &table_names,
+            &child_index_targets,
+            snapshot_lsn,
+        )?;
+        self.validate_prepared_schema_cookie(
+            prepared_statement,
+            runtime.catalog.schema_cookie,
+            runtime.temp_schema_cookie,
+        )?;
+        if !runtime.can_reuse_prepared_simple_delete(prepared_delete) {
+            return Ok(None);
+        }
+        let temp_only = self.statement_is_temp_only(runtime, prepared_statement.statement.as_ref());
+        let result = runtime.execute_prepared_simple_delete(
+            prepared_delete,
+            params,
+            self.inner.config.page_size,
+        )?;
+        *persistent_changed |= !temp_only;
+        *indexes_maybe_stale |= Self::runtime_has_stale_indexes(runtime);
+        Ok(Some(result))
     }
 
     fn exclusive_sql_txn_error(&self) -> DbError {
@@ -15330,6 +15881,20 @@ fn resolve_prepared_simple_value_for_fast_path(
     params: &[Value],
 ) -> Result<Value> {
     resolve_prepared_simple_value(source, params)
+}
+
+fn prepared_simple_value_source(expr: &Expr) -> Option<PreparedSimpleValueSource> {
+    match expr {
+        Expr::Literal(value) => Some(PreparedSimpleValueSource::Literal(value.clone())),
+        Expr::Parameter(number) => Some(PreparedSimpleValueSource::Parameter(*number)),
+        Expr::Cast { expr, target_type } => {
+            prepared_simple_value_source(expr).map(|source| PreparedSimpleValueSource::Cast {
+                source: Box::new(source),
+                target_type: *target_type,
+            })
+        }
+        _ => None,
+    }
 }
 
 fn prepared_usize_literal(expr: &crate::sql::ast::Expr) -> Option<usize> {

@@ -162,6 +162,9 @@ fn multiple_window_functions() {
     let v = rows(&r);
     assert_eq!(v.len(), 4);
     assert_eq!(v[0][2], Value::Int64(1)); // rn
+    assert_eq!(v[0][3], Value::Null); // prev_val
+    assert_eq!(v[1][3], Value::Int64(10));
+    assert_eq!(v[3][3], Value::Int64(30));
 }
 
 #[test]
@@ -613,6 +616,37 @@ fn window_rows_frame_for_running_sum() {
     assert_eq!(v[1][1], Value::Int64(30));
     assert_eq!(v[2][1], Value::Int64(50));
     assert_eq!(v[3][1], Value::Int64(70));
+}
+
+#[test]
+fn window_rows_frame_for_rolling_avg() {
+    let db = mem_db();
+    db.execute("CREATE TABLE t(id INT64, val FLOAT64)").unwrap();
+    db.execute("INSERT INTO t VALUES (1,10.0),(2,NULL),(3,30.0),(4,50.0)")
+        .unwrap();
+    let r = db
+        .execute(
+            "SELECT id, AVG(val) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS a
+             FROM t ORDER BY id",
+        )
+        .unwrap();
+    let v = rows(&r);
+    assert_eq!(v[0][1], Value::Float64(10.0));
+    assert_eq!(v[1][1], Value::Float64(10.0));
+    assert_eq!(v[2][1], Value::Float64(20.0));
+    assert_eq!(v[3][1], Value::Float64(40.0));
+
+    db.execute("CREATE TABLE p(id INT64, val FLOAT64)").unwrap();
+    db.execute("INSERT INTO p VALUES (1,1.1),(2,5.3),(3,7.0),(4,7.4)")
+        .unwrap();
+    let r = db
+        .execute(
+            "SELECT id, AVG(val) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS a
+             FROM p ORDER BY id",
+        )
+        .unwrap();
+    let v = rows(&r);
+    assert_eq!(v[3][1], Value::Float64((5.3_f64 + 7.0 + 7.4) / 3.0));
 }
 
 #[test]

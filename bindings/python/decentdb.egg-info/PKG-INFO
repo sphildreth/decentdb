@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: decentdb
-Version: 2.4.2
+Version: 2.14.0
 Summary: Python DB-API 2.0 driver and SQLAlchemy dialect for DecentDB
 Author: DecentDB Contributors
 Classifier: Development Status :: 4 - Beta
@@ -38,14 +38,98 @@ with engine.connect() as conn:
         print(row)
 ```
 
+## Semantic result values
+
+The DB-API driver decodes semantic native types directly:
+
+- `ENUM` -> `decentdb.EnumValue(type_id, label_id)`
+- `IPADDR` / `INET` -> `ipaddress` address objects
+- `CIDR` -> `ipaddress` network objects
+- `DATE`, `TIME`, `TIMESTAMPTZ` -> `datetime.date`, `datetime.time`, and
+  timezone-aware UTC `datetime.datetime`
+- `INTERVAL` -> `decentdb.IntervalValue(months, days, micros)`
+- `MACADDR` / `MACADDR8` -> canonical lowercase `str`
+
+SQLAlchemy `Date`, `Time`, and `DateTime(timezone=True)` now compile to the
+native `DATE`, `TIME`, and `TIMESTAMPTZ` column types.
+
 ## Concurrency Model
 
 DecentDB operates as an embedded database with the following concurrency model:
 - **Single Writer**: Only one connection can write to the database at a time.
 - **Multiple Readers**: Multiple connections can read simultaneously (Snapshot Isolation).
-- **Process Model**: Currently optimized for single-process usage. Multi-process sharing is not guaranteed safe yet.
+- **Process Model**: Local on-disk databases coordinate native OS processes through the WAL coordination sidecar when the VFS supports file locks.
 
-**Recommendation**: Ensure your application architecture enforces a single-writer pattern (e.g. via a dedicated writer thread or queue).
+Use `process_coordination="required"` when multi-process safety is required:
+
+```python
+with connect(
+    "app.ddb",
+    process_coordination="required",
+    process_coordination_timeout_ms=30_000,
+) as con:
+    print(con.execute("SELECT * FROM sys.process_coordination").fetchone())
+```
+
+## Bounded Write Queue (DDB v3)
+
+Python now exposes write-queue execution through both low-level C bindings and the DB-API path.
+
+```python
+from decentdb import connect
+
+with connect(
+    "queue_demo.ddb",
+    write_queue_enabled=True,
+    write_queue_capacity=128,
+    write_queue_default_timeout_ms=500,
+    write_queue_group_commit=True,
+) as con:
+    con.execute("CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY, payload TEXT)")
+    con.execute_queued(
+        "INSERT INTO events(id, payload) VALUES (?, ?)",
+        (1, "queued"),
+        timeout_ms=250,
+    )
+    metrics = con.write_queue_metrics()
+    print(metrics["admitted"], metrics["committed"])
+```
+
+`write_queue_default_timeout_ms` can be omitted to use the engine default; pass
+`DDB_WRITE_QUEUE_TIMEOUT_DEFAULT` to leave a single `execute_queued` call at the native
+default.
+
+- `write_queue_enabled`
+  Enables queued writer mode for the connection.
+- `write_queue_capacity`
+  Maximum in-flight queued write entries.
+- `write_queue_group_commit`
+  Enables queue grouping for durable batching behavior.
+- `write_queue_max_batch`
+  Maximum statements per commit group.
+- `write_queue_max_group_delay_us`
+  Maximum delay before a partial batch is forced to commit.
+- `write_queue_default_timeout_ms`
+  Default timeout applied by direct queued API calls when no explicit timeout is passed.
+
+## Reactive Subscriptions
+
+Python exposes watch handles for committed-state reactive updates:
+
+```python
+with connect("reactive_demo.ddb") as con:
+    con.execute("CREATE TABLE IF NOT EXISTS events(id INT64 PRIMARY KEY, payload TEXT)")
+    watch = con.watch_query("SELECT id, payload FROM events ORDER BY id")
+    print(watch.next(timeout_ms=1000))  # initial event
+
+    con.execute("INSERT INTO events VALUES (?, ?)", (1, "created"))
+    print(watch.next(timeout_ms=1000))  # invalidation event
+    watch.close()
+```
+
+Use `watch_table`, `watch_range`, `watch_query`, and `change_stream` for table,
+range, query, and ordered change-stream events. `Watch.next` returns `None` on
+timeout.
 
 ## Benchmarks
 

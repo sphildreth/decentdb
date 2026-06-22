@@ -14,7 +14,7 @@ pub(crate) use analyzer::{
     AnalyzerConfig, AnalyzerDiacritics, AnalyzerStopwords, AnalyzerTokenization,
 };
 use query::{parse_fts_query, FtsQuery, FtsQueryTerm, FtsQueryTermKind};
-use ranking::{bm25_score, Bm25Context, Bm25DocumentStats, Bm25TermStats};
+use ranking::{bm25_score_iter, Bm25Context, Bm25DocumentStats, Bm25TermStats};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct FullTextIndexError {
@@ -65,8 +65,7 @@ impl FullTextIndex {
         &self.config
     }
 
-    pub(crate) fn insert_document(&mut self, row_id: u64, fields: &[Option<&str>]) {
-        self.delete_document(row_id);
+    pub(crate) fn insert_document_fresh(&mut self, row_id: u64, fields: &[Option<&str>]) {
         let document = build_document(&self.config, fields);
         if document.doc_len > 0 {
             self.non_empty_document_count += 1;
@@ -79,6 +78,11 @@ impl FullTextIndex {
                 .insert(row_id, info.clone());
         }
         self.documents.insert(row_id, document);
+    }
+
+    pub(crate) fn insert_document(&mut self, row_id: u64, fields: &[Option<&str>]) {
+        self.delete_document(row_id);
+        self.insert_document_fresh(row_id, fields);
     }
 
     pub(crate) fn delete_document(&mut self, row_id: u64) {
@@ -100,6 +104,41 @@ impl FullTextIndex {
             };
             if remove_term {
                 self.postings.remove(term);
+            }
+        }
+    }
+
+    pub(crate) fn delete_documents<I>(&mut self, row_ids: I)
+    where
+        I: IntoIterator<Item = u64>,
+    {
+        let mut term_row_ids = BTreeMap::<String, Vec<u64>>::new();
+        for row_id in row_ids {
+            let Some(document) = self.documents.remove(&row_id) else {
+                continue;
+            };
+            if document.doc_len > 0 {
+                self.non_empty_document_count = self.non_empty_document_count.saturating_sub(1);
+                self.total_document_len = self
+                    .total_document_len
+                    .saturating_sub(u64::from(document.doc_len));
+            }
+            for term in document.terms.keys() {
+                term_row_ids.entry(term.clone()).or_default().push(row_id);
+            }
+        }
+
+        for (term, row_ids) in term_row_ids {
+            let remove_term = if let Some(rows) = self.postings.get_mut(&term) {
+                for row_id in row_ids {
+                    rows.remove(&row_id);
+                }
+                rows.is_empty()
+            } else {
+                false
+            };
+            if remove_term {
+                self.postings.remove(&term);
             }
         }
     }
@@ -135,6 +174,14 @@ impl FullTextIndex {
     pub(crate) fn search(
         &self,
         query_text: &str,
+    ) -> Result<Vec<FullTextSearchHit>, FullTextIndexError> {
+        self.search_top_k(query_text, usize::MAX)
+    }
+
+    pub(crate) fn search_top_k(
+        &self,
+        query_text: &str,
+        limit: usize,
     ) -> Result<Vec<FullTextSearchHit>, FullTextIndexError> {
         let query = parse_runtime_query(&self.config, query_text)?;
         let mut hits = Vec::new();
@@ -189,11 +236,23 @@ impl FullTextIndex {
                 }
             }
         }
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        if hits.len() > limit {
+            let cmp = |left: &FullTextSearchHit, right: &FullTextSearchHit| {
+                right
+                    .score
+                    .total_cmp(&left.score)
+                    .then_with(|| left.row_id.cmp(&right.row_id))
+            };
+            hits.select_nth_unstable_by(limit - 1, cmp);
+            hits.truncate(limit);
+        }
         hits.sort_by(|left, right| {
             right
                 .score
-                .partial_cmp(&left.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
+                .total_cmp(&left.score)
                 .then_with(|| left.row_id.cmp(&right.row_id))
         });
         Ok(hits)
@@ -219,18 +278,7 @@ impl FullTextIndex {
     }
 
     fn score_parsed_query(&self, document: &FullTextDocument, query: &FtsQuery) -> f64 {
-        let terms = positive_scoring_terms(self, query)
-            .into_iter()
-            .filter_map(|term| {
-                let term_info = document.terms.get(&term)?;
-                let doc_freq = self.postings.get(&term).map_or(0_usize, BTreeMap::len);
-                Some(Bm25TermStats {
-                    term_freq: f64::from(term_info.frequency),
-                    doc_freq: doc_freq as f64,
-                })
-            })
-            .collect::<Vec<_>>();
-        bm25_score(
+        bm25_score_iter(
             &Bm25Context {
                 corpus_size: self.non_empty_document_count as f64,
                 avg_doc_len: self.average_document_len(),
@@ -239,7 +287,16 @@ impl FullTextIndex {
             &Bm25DocumentStats {
                 doc_len: f64::from(document.doc_len),
             },
-            &terms,
+            positive_scoring_terms(self, query)
+                .into_iter()
+                .filter_map(|term| {
+                    let term_info = document.terms.get(&term)?;
+                    let doc_freq = self.postings.get(&term).map_or(0_usize, BTreeMap::len);
+                    Some(Bm25TermStats {
+                        term_freq: f64::from(term_info.frequency),
+                        doc_freq: doc_freq as f64,
+                    })
+                }),
         )
     }
 
@@ -252,22 +309,18 @@ impl FullTextIndex {
         scoring_terms: &[(String, usize)],
         context: &Bm25Context,
     ) -> f64 {
-        let terms = scoring_terms
-            .iter()
-            .filter_map(|(term, doc_freq)| {
+        bm25_score_iter(
+            context,
+            &Bm25DocumentStats {
+                doc_len: f64::from(document.doc_len),
+            },
+            scoring_terms.iter().filter_map(|(term, doc_freq)| {
                 let term_info = document.terms.get(term)?;
                 Some(Bm25TermStats {
                     term_freq: f64::from(term_info.frequency),
                     doc_freq: *doc_freq as f64,
                 })
-            })
-            .collect::<Vec<_>>();
-        bm25_score(
-            context,
-            &Bm25DocumentStats {
-                doc_len: f64::from(document.doc_len),
-            },
-            &terms,
+            }),
         )
     }
 }
@@ -581,6 +634,30 @@ mod runtime_tests {
     }
 
     #[test]
+    fn search_top_k_matches_full_search_prefix_and_tie_ordering() {
+        let mut index = FullTextIndex::new(AnalyzerConfig::default());
+        index.insert_document(1, &[Some("alpha")]);
+        index.insert_document(2, &[Some("beta")]);
+        index.insert_document(3, &[Some("gamma")]);
+
+        let full_hits = index.search("alpha OR beta").expect("query");
+        let top_hits = index.search_top_k("alpha OR beta", 2).expect("query");
+
+        assert_eq!(top_hits.len(), 2);
+        assert_eq!(
+            top_hits.iter().map(|hit| hit.row_id).collect::<Vec<_>>(),
+            full_hits
+                .iter()
+                .take(2)
+                .map(|hit| hit.row_id)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(top_hits[0].row_id, 1);
+        assert_eq!(top_hits[1].row_id, 2);
+        assert!((top_hits[0].score - top_hits[1].score).abs() < f64::EPSILON);
+    }
+
+    #[test]
     fn and_word_query_postings_path_intersects_terms() {
         // A single clause with two positive Word terms is an AND; the postings
         // fast path intersects the term postings and returns only documents
@@ -603,5 +680,67 @@ mod runtime_tests {
         assert_eq!(index.entry_count(), 1);
         assert_eq!(index.average_document_len(), 0.0);
         assert!(!index.matches_query(1, "anything").expect("query"));
+    }
+
+    #[test]
+    fn batch_delete_documents_clears_postings_and_stats() {
+        let mut index = FullTextIndex::new(AnalyzerConfig::default());
+        index.insert_document(1, &[Some("alpha beta")]);
+        index.insert_document(2, &[Some("alpha gamma")]);
+        index.insert_document(3, &[Some("delta")]);
+
+        index.delete_documents([1, 2, 9]);
+
+        assert_eq!(index.entry_count(), 1);
+        assert_eq!(index.term_count(), 1);
+        assert_eq!(index.average_document_len(), 1.0);
+        assert!(!index.matches_query(1, "alpha").expect("query"));
+        assert!(index.matches_query(3, "delta").expect("query"));
+    }
+
+    #[test]
+    fn fulltext_insert_fresh_matches_insert_and_replaces_existing_document() {
+        let mut fresh_index = FullTextIndex::new(AnalyzerConfig::default());
+        fresh_index.insert_document_fresh(1, &[Some("alpha beta")]);
+        fresh_index.insert_document_fresh(2, &[Some("beta gamma")]);
+
+        let mut normal_index = FullTextIndex::new(AnalyzerConfig::default());
+        normal_index.insert_document(1, &[Some("alpha beta")]);
+        normal_index.insert_document(2, &[Some("beta gamma")]);
+
+        let fresh_beta_hits = fresh_index.search("beta").expect("query");
+        let normal_beta_hits = normal_index.search("beta").expect("query");
+        assert_eq!(
+            fresh_beta_hits
+                .iter()
+                .map(|hit| (hit.row_id, hit.score))
+                .collect::<Vec<_>>(),
+            normal_beta_hits
+                .iter()
+                .map(|hit| (hit.row_id, hit.score))
+                .collect::<Vec<_>>()
+        );
+        let fresh_union_hits = fresh_index.search("alpha OR gamma").expect("query");
+        let normal_union_hits = normal_index.search("alpha OR gamma").expect("query");
+        assert_eq!(
+            fresh_union_hits
+                .iter()
+                .map(|hit| (hit.row_id, hit.score))
+                .collect::<Vec<_>>(),
+            normal_union_hits
+                .iter()
+                .map(|hit| (hit.row_id, hit.score))
+                .collect::<Vec<_>>()
+        );
+
+        normal_index.insert_document(1, &[Some("delta")]);
+        assert!(normal_index.search("alpha").expect("query").is_empty());
+        let delta_hits = normal_index.search("delta").expect("query");
+        assert_eq!(delta_hits.len(), 1);
+        assert_eq!(delta_hits[0].row_id, 1);
+        assert!(
+            (delta_hits[0].score - normal_index.score_query(1, "delta").expect("query")).abs()
+                < f64::EPSILON
+        );
     }
 }

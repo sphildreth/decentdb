@@ -1221,6 +1221,27 @@ fn upsert_on_rowid_conflict_noop_without_returning() {
 }
 
 #[test]
+fn upsert_on_rowid_conflict_noop_with_unique_secondary_index() {
+    let db = mem_db();
+    db.execute("CREATE TABLE genres(id INTEGER PRIMARY KEY, name TEXT UNIQUE)")
+        .unwrap();
+    db.execute("INSERT INTO genres VALUES (1, 'Action')")
+        .unwrap();
+    let result = db
+        .execute("INSERT INTO genres (id, name) VALUES (1, 'Action') ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name")
+        .unwrap();
+    assert_eq!(result.affected_rows(), 1);
+    let rows = rows(
+        &db.execute("SELECT id, name FROM genres ORDER BY id")
+            .unwrap(),
+    );
+    assert_eq!(
+        rows,
+        vec![vec![Value::Int64(1), Value::Text("Action".into())]]
+    );
+}
+
+#[test]
 fn upsert_on_conflict_do_update_returning_noop() {
     let db = mem_db();
     db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, val TEXT)")

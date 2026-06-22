@@ -2,6 +2,7 @@ import os
 import pathlib
 import subprocess
 import sys
+import uuid
 
 import pytest
 
@@ -94,6 +95,29 @@ def test_parameters_named_reuse(db_path):
 
     conn.close()
 
+
+def test_single_text_param_non_query_repeat_cache(db_path):
+    conn = decentdb.connect(db_path)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE movies (id UUID PRIMARY KEY, title TEXT)")
+
+    movie_id = str(uuid.uuid4())
+    cur.execute(
+        "INSERT INTO movies VALUES (CAST(? AS UUID), ?)",
+        (movie_id, "first"),
+    )
+    conn.commit()
+
+    delete_sql = "DELETE FROM movies WHERE id = CAST(? AS UUID)"
+    cur.execute(delete_sql, (movie_id,))
+    assert cur.rowcount == 1
+    cur.execute(delete_sql, (movie_id,))
+    assert cur.rowcount == 0
+    cur.execute(delete_sql, (movie_id,))
+    assert cur.rowcount == 0
+
+    conn.close()
+
 def test_fetchmany(db_path):
     conn = decentdb.connect(db_path)
     cur = conn.cursor()
@@ -140,6 +164,38 @@ def test_types(db_path):
     assert row[4] is True
     assert row[5] is None
     
+    conn.close()
+
+
+def test_returning_two_scalar_columns(db_path):
+    conn = decentdb.connect(db_path)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE items (id INT64, title TEXT, rating FLOAT64)")
+
+    assert cur.execute(
+        "INSERT INTO items VALUES (?, ?, ?) RETURNING id, title",
+        (1, "alpha", 1.25),
+    ).fetchone() == (1, "alpha")
+    assert cur.execute(
+        "INSERT INTO items VALUES (?, ?, ?) RETURNING id, title",
+        (2, "beta", 2.5),
+    ).fetchone() == (2, "beta")
+    assert cur.execute(
+        "INSERT INTO items VALUES (?, ?, ?) RETURNING id, title",
+        (3, "gamma", 3.75),
+    ).fetchone() == (3, "gamma")
+
+    rows = cur.execute(
+        "UPDATE items SET rating = rating + 1 RETURNING id, rating"
+    ).fetchall()
+    assert sorted(rows) == [(1, 2.25), (2, 3.5), (3, 4.75)]
+
+    update_sql = "UPDATE items SET rating = rating + 0.5 RETURNING id, rating"
+    rows = cur.execute(update_sql).fetchall()
+    assert sorted(rows) == [(1, 2.75), (2, 4.0), (3, 5.25)]
+    rows = cur.execute(update_sql).fetchall()
+    assert sorted(rows) == [(1, 3.25), (2, 4.5), (3, 5.75)]
+
     conn.close()
 
 

@@ -780,6 +780,50 @@ fn union_deduplicates() {
 }
 
 #[test]
+fn union_range_projection_matches_showdown_shape() {
+    let db = mem_db();
+    exec(
+        &db,
+        "CREATE TABLE movie_genres (movie_id INT64, genre_id INT64)",
+    );
+    exec(
+        &db,
+        "CREATE INDEX idx_mgenres_genre ON movie_genres(genre_id)",
+    );
+    exec(
+        &db,
+        "INSERT INTO movie_genres VALUES
+            (1, 1),
+            (2, 2),
+            (3, 2),
+            (4, 5),
+            (5, 13),
+            (6, 13),
+            (7, 20)",
+    );
+
+    let r = exec(
+        &db,
+        "SELECT genre_id FROM movie_genres WHERE genre_id <= 6
+         UNION
+         SELECT genre_id FROM movie_genres WHERE genre_id >= 13
+         ORDER BY genre_id",
+    );
+
+    let v = rows(&r);
+    assert_eq!(
+        v,
+        vec![
+            vec![Value::Int64(1)],
+            vec![Value::Int64(2)],
+            vec![Value::Int64(5)],
+            vec![Value::Int64(13)],
+            vec![Value::Int64(20)],
+        ]
+    );
+}
+
+#[test]
 fn union_vs_union_all() {
     let db = mem_db();
     let r1 = db

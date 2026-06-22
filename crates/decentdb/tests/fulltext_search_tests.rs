@@ -29,6 +29,34 @@ fn fulltext_match_and_bm25_rank_results() {
 }
 
 #[test]
+fn fulltext_match_bm25_limit_uses_same_top_row_as_full_query() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
+    create_docs(&db);
+
+    let limited = db
+        .execute(
+            "SELECT id, title, bm25('idx_docs_search') AS rank \
+             FROM docs \
+             WHERE fulltext_match('idx_docs_search', 'rust OR database') \
+             ORDER BY rank DESC \
+             LIMIT 1",
+        )
+        .expect("limited fulltext query");
+    let full = db
+        .execute(
+            "SELECT id, title, bm25('idx_docs_search') AS rank \
+             FROM docs \
+             WHERE fulltext_match('idx_docs_search', 'rust OR database') \
+             ORDER BY rank DESC",
+        )
+        .expect("full fulltext query");
+
+    assert_eq!(limited.columns(), &["id", "title", "rank"]);
+    assert_eq!(limited.rows().len(), 1);
+    assert_eq!(limited.rows()[0], full.rows()[0]);
+}
+
+#[test]
 fn fulltext_prefix_phrase_update_delete_and_verify_work() {
     let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
     create_docs(&db);

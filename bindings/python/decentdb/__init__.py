@@ -579,6 +579,12 @@ def _is_direct_execute_sql(sql):
     return _TXN_CONTROL_RE.match(sql) is not None
 
 
+def _is_dml_returning_sql(normalized_sql):
+    return normalized_sql.startswith(("insert ", "update ", "delete ")) and (
+        " returning " in f" {normalized_sql} "
+    )
+
+
 def _decode_ip_address_value(value):
     family = int(value.ip_family)
     if family == 4:
@@ -768,6 +774,16 @@ class Cursor:
             else None
         )
         self._decode_matrix_i64_text_f64_i64_i64_sql_support = {}
+        self._decode_row_i64_text_native = (
+            getattr(_fastdecode_native, "decode_row_i64_text", None)
+            if _fastdecode_native is not None
+            else None
+        )
+        self._decode_matrix_i64_text_native = (
+            getattr(_fastdecode_native, "decode_matrix_i64_text", None)
+            if _fastdecode_native is not None
+            else None
+        )
         self._decode_row_i64_text_text_native = (
             getattr(_fastdecode_native, "decode_row_i64_text_text", None)
             if _fastdecode_native is not None
@@ -785,6 +801,16 @@ class Cursor:
         )
         self._decode_matrix_i64_f64_text_native = (
             getattr(_fastdecode_native, "decode_matrix_i64_f64_text", None)
+            if _fastdecode_native is not None
+            else None
+        )
+        self._decode_row_i64_f64_native = (
+            getattr(_fastdecode_native, "decode_row_i64_f64", None)
+            if _fastdecode_native is not None
+            else None
+        )
+        self._decode_matrix_i64_f64_native = (
+            getattr(_fastdecode_native, "decode_matrix_i64_f64", None)
             if _fastdecode_native is not None
             else None
         )
@@ -996,6 +1022,8 @@ class Cursor:
             self._native_reset_bind_int64_step_affected is not None
         )
         self._native_fetch_rows_i64_text_f64_sql_support = {}
+        self._decode_matrix_i64_text_sql_support = {}
+        self._decode_matrix_i64_f64_sql_support = {}
         self._decode_matrix_i64_text_f64_sql_support = {}
         self._decode_matrix_i64_text_f64_date_sql_support = {}
         self._decode_matrix_i64_text_text_sql_support = {}
@@ -1033,6 +1061,8 @@ class Cursor:
         self._should_prefetch_small_result_sql_cache.clear()
         self._should_prefetch_zero_param_result_sql_cache.clear()
         self._native_fetch_rows_i64_text_f64_sql_support.clear()
+        self._decode_matrix_i64_text_sql_support.clear()
+        self._decode_matrix_i64_f64_sql_support.clear()
         self._decode_matrix_i64_text_f64_sql_support.clear()
         self._decode_matrix_i64_text_f64_date_sql_support.clear()
         self._decode_matrix_i64_text_text_sql_support.clear()
@@ -1639,6 +1669,7 @@ class Cursor:
             or "count(" in normalized
             or " limit " in f" {normalized} "
             or "order by o.id desc" in normalized
+            or _is_dml_returning_sql(normalized)
         )
         self._should_prefetch_small_result_sql_cache[sql] = cached
         return cached
@@ -1648,7 +1679,11 @@ class Cursor:
         if cached is not None:
             return cached
         normalized = " ".join(sql.lower().split())
-        cached = "count(" in normalized or " limit " in f" {normalized} "
+        cached = (
+            "count(" in normalized
+            or " limit " in f" {normalized} "
+            or _is_dml_returning_sql(normalized)
+        )
         self._should_prefetch_zero_param_result_sql_cache[sql] = cached
         return cached
 
@@ -3023,6 +3058,33 @@ class Cursor:
                 else:
                     text0 = string_at(v0.data, v0.len).decode("utf-8")
                 return (text0, v1.int64_value, v2.float64_value)
+        if count == 2:
+            v0 = values_ptr[0]
+            v1 = values_ptr[1]
+            t0 = int(v0.tag)
+            t1 = int(v1.tag)
+            if t0 == DDB_VALUE_INT64 and t1 == DDB_VALUE_TEXT:
+                if self._decode_row_i64_text_native is not None:
+                    try:
+                        return self._decode_row_i64_text_native(
+                            ctypes.addressof(values_ptr.contents)
+                        )
+                    except Exception:
+                        pass
+                if not v1.data or v1.len == 0:
+                    text_value = ""
+                else:
+                    text_value = string_at(v1.data, v1.len).decode("utf-8")
+                return (v0.int64_value, text_value)
+            if t0 == DDB_VALUE_INT64 and t1 == DDB_VALUE_FLOAT64:
+                if self._decode_row_i64_f64_native is not None:
+                    try:
+                        return self._decode_row_i64_f64_native(
+                            ctypes.addressof(values_ptr.contents)
+                        )
+                    except Exception:
+                        pass
+                return (v0.int64_value, v1.float64_value)
 
         if count == 1:
             v0 = values_ptr[0]
@@ -3113,6 +3175,85 @@ class Cursor:
         rows = []
         append_rows = rows.append
         string_at = ctypes.string_at
+
+        if col_count == 2:
+            sql = self._last_sql
+            first_t0 = int(values_ptr[0].tag)
+            first_t1 = int(values_ptr[1].tag)
+            if first_t0 == DDB_VALUE_INT64 and first_t1 == DDB_VALUE_TEXT:
+                native_supported = self._decode_matrix_i64_text_sql_support.get(sql, True)
+                if self._decode_matrix_i64_text_native is not None and native_supported:
+                    try:
+                        return self._decode_matrix_i64_text_native(
+                            ctypes.addressof(values_ptr.contents), row_count
+                        )
+                    except Exception:
+                        self._decode_matrix_i64_text_sql_support[sql] = False
+            if first_t0 == DDB_VALUE_INT64 and first_t1 == DDB_VALUE_FLOAT64:
+                native_supported = self._decode_matrix_i64_f64_sql_support.get(sql, True)
+                if self._decode_matrix_i64_f64_native is not None and native_supported:
+                    try:
+                        return self._decode_matrix_i64_f64_native(
+                            ctypes.addressof(values_ptr.contents), row_count
+                        )
+                    except Exception:
+                        self._decode_matrix_i64_f64_sql_support[sql] = False
+            for row_index in range(row_count):
+                base = row_index * 2
+                v0 = values_ptr[base]
+                v1 = values_ptr[base + 1]
+                if int(v0.tag) == DDB_VALUE_INT64 and int(v1.tag) == DDB_VALUE_TEXT:
+                    if not v1.data or v1.len == 0:
+                        text_value = ""
+                    else:
+                        text_value = string_at(v1.data, v1.len).decode("utf-8")
+                    append_rows((v0.int64_value, text_value))
+                    continue
+                if int(v0.tag) == DDB_VALUE_INT64 and int(v1.tag) == DDB_VALUE_FLOAT64:
+                    append_rows((v0.int64_value, v1.float64_value))
+                    continue
+
+                row = []
+                append_row = row.append
+                for col_index in range(2):
+                    value = values_ptr[base + col_index]
+                    tag = int(value.tag)
+                    if tag == DDB_VALUE_NULL:
+                        append_row(None)
+                    elif tag == DDB_VALUE_INT64:
+                        append_row(value.int64_value)
+                    elif tag == DDB_VALUE_FLOAT64:
+                        append_row(value.float64_value)
+                    elif tag == DDB_VALUE_BOOL:
+                        append_row(value.bool_value != 0)
+                    elif tag == DDB_VALUE_TEXT:
+                        if not value.data or value.len == 0:
+                            append_row("")
+                        else:
+                            append_row(string_at(value.data, value.len).decode("utf-8"))
+                    elif tag in _BINARY_BYTES_TAGS:
+                        if not value.data or value.len == 0:
+                            append_row(b"")
+                        else:
+                            append_row(bytes(string_at(value.data, value.len)))
+                    elif tag == DDB_VALUE_DECIMAL:
+                        append_row(
+                            decimal.Decimal(int(value.decimal_scaled))
+                            / (decimal.Decimal(10) ** int(value.decimal_scale))
+                        )
+                    elif tag == DDB_VALUE_UUID:
+                        append_row(bytes(value.uuid_bytes))
+                    elif tag == DDB_VALUE_TIMESTAMP_MICROS:
+                        append_row(
+                            _UNIX_EPOCH_UTC
+                            + datetime.timedelta(
+                                microseconds=int(value.timestamp_micros)
+                            )
+                        )
+                    else:
+                        append_row(_decode_ffi_value(self._lib, value))
+                append_rows(tuple(row))
+            return rows
 
         if col_count == 3:
             sql = self._last_sql

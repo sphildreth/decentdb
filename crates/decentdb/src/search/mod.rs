@@ -102,6 +102,25 @@ impl TrigramIndex {
         }
     }
 
+    pub(crate) fn queue_delete_documents<I, T>(&mut self, deletions: I)
+    where
+        I: IntoIterator<Item = (u64, T)>,
+        T: AsRef<str>,
+    {
+        let mut grouped = BTreeMap::<u32, Vec<u64>>::new();
+        for (row_id, text) in deletions {
+            for token in unique_tokens(text.as_ref()) {
+                grouped.entry(token).or_default().push(row_id);
+            }
+        }
+        for (token, row_ids) in grouped {
+            self.pending
+                .entry(token)
+                .or_default()
+                .extend(row_ids.into_iter().map(PendingOp::Remove));
+        }
+    }
+
     pub(crate) fn queue_replace(&mut self, row_id: u64, old_text: &str, new_text: &str) {
         self.queue_delete(row_id, old_text);
         self.queue_insert(row_id, new_text);
@@ -358,5 +377,19 @@ mod tests {
             index.query_candidates("alphabet", false).expect("query"),
             TrigramQueryResult::Capped(_)
         ));
+    }
+
+    #[test]
+    fn batch_delete_documents_removes_pending_postings() {
+        let mut index = TrigramIndex::new(1024, 100_000);
+        index.queue_insert(1, "alphabet");
+        index.queue_insert(2, "alphanumeric");
+        index.checkpoint().expect("checkpoint");
+
+        index.queue_delete_documents([(1, "alphabet"), (2, "alphanumeric")]);
+        index.checkpoint().expect("checkpoint");
+
+        let result = index.query_candidates("alphabet", false).expect("query");
+        assert_eq!(result, TrigramQueryResult::Candidates(Vec::new()));
     }
 }
