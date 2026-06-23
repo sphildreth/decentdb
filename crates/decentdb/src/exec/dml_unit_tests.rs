@@ -848,7 +848,7 @@ mod tests {
     }
 
     #[test]
-    fn prepare_simple_delete_with_cascade_child_falls_back() {
+    fn prepare_simple_delete_with_cascade_child_succeeds() {
         let mut runtime = EngineRuntime::empty(1);
         let parent = crate::catalog::TableSchema {
             name: "parent".to_string(),
@@ -939,8 +939,14 @@ mod tests {
 
         let prepared = runtime
             .prepare_simple_delete(&delete)
-            .expect("prepare delete");
-        assert!(prepared.is_none());
+            .expect("prepare delete")
+            .expect("expected prepared delete");
+        assert!(prepared.restrict_children.is_empty());
+        assert_eq!(
+            prepared.child_index_hydration_targets(),
+            Vec::<(&str, &str)>::new()
+        );
+        assert_eq!(prepared.affected_table_names(), vec!["parent", "child"]);
     }
 
     #[test]

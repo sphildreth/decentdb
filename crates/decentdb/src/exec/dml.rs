@@ -120,6 +120,12 @@ pub(crate) struct PreparedSimpleUpdateAssignment {
     pub(crate) value_source: PreparedSimpleValueSource,
 }
 
+struct RowIdNoopUpsertCandidate {
+    row_id: i64,
+    candidate: Vec<Value>,
+    next_values: Vec<Value>,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) enum PreparedSimpleUpdateLookup {
     RowId(PreparedSimpleValueSource),
@@ -3513,24 +3519,24 @@ impl EngineRuntime {
             return Ok(None);
         }
 
-        if let Some((row_id, candidate, next_values)) =
+        if let Some(noop_candidate) =
             self.try_materialize_rowid_noop_upsert_candidate(&table, statement, params)?
         {
             let Some(row_source) = self.table_row_source(&table.name) else {
                 return Ok(None);
             };
-            let Some(current_ref) = row_source.row_by_id(row_id)? else {
+            let Some(current_ref) = row_source.row_by_id(noop_candidate.row_id)? else {
                 return Ok(None);
             };
             let current_values = current_ref.values().to_vec();
-            if next_values == current_values {
+            if noop_candidate.next_values == current_values {
                 return Ok(Some(QueryResult::with_affected_rows(1)));
             }
             if self
                 .apply_conflict_update(
                     &table.name,
-                    row_id,
-                    &candidate,
+                    noop_candidate.row_id,
+                    &noop_candidate.candidate,
                     assignments,
                     None,
                     params,
@@ -3616,7 +3622,7 @@ impl EngineRuntime {
         table: &crate::catalog::TableSchema,
         statement: &InsertStatement,
         params: &[Value],
-    ) -> Result<Option<(i64, Vec<Value>, Vec<Value>)>> {
+    ) -> Result<Option<RowIdNoopUpsertCandidate>> {
         let Some(ConflictAction::DoUpdate {
             target,
             assignments,
@@ -3746,7 +3752,11 @@ impl EngineRuntime {
             return Ok(None);
         };
 
-        Ok(Some((row_id, candidate, next_values)))
+        Ok(Some(RowIdNoopUpsertCandidate {
+            row_id,
+            candidate,
+            next_values,
+        }))
     }
 
     fn render_returning(
@@ -4399,13 +4409,10 @@ fn try_render_simple_returning(
                 {
                     return None;
                 }
-                let Some(column_index) = table_schema
+                let column_index = table_schema
                     .columns
                     .iter()
-                    .position(|schema_column| identifiers_equal(&schema_column.name, column))
-                else {
-                    return None;
-                };
+                    .position(|schema_column| identifiers_equal(&schema_column.name, column))?;
                 let schema_column = &table_schema.columns[column_index];
                 if schema_column.generated_sql.is_some() && !schema_column.generated_stored {
                     return None;

@@ -575,6 +575,11 @@ struct EncodedPagedTableChunk {
 
 impl TablePageManifest {
     fn from_payload(payload: Arc<Vec<u8>>) -> Result<Self> {
+        let row_count = if payload.is_empty() {
+            0
+        } else {
+            read_table_payload_row_count_from_bytes(payload.as_slice())?
+        };
         let chunk = TablePageManifestChunk {
             pointer: OverflowPointer {
                 head_page_id: 0,
@@ -582,7 +587,7 @@ impl TablePageManifest {
                 flags: 0,
             },
             checksum: 0,
-            row_count: 0,
+            row_count,
             payload,
             tombstoned_row_ids: Arc::new(BTreeSet::new()),
             overlay_pointer: None,
@@ -962,7 +967,7 @@ impl TablePageManifest {
         Ok(Some(row_bytes))
     }
 
-    fn row_bytes_from_locator<'a>(payload: &'a [u8], locator: RowLocatorV1) -> Result<&'a [u8]> {
+    fn row_bytes_from_locator(payload: &[u8], locator: RowLocatorV1) -> Result<&[u8]> {
         let start = locator.byte_offset as usize;
         let end = start + locator.byte_len as usize;
         payload
@@ -970,10 +975,7 @@ impl TablePageManifest {
             .ok_or_else(|| DbError::corruption("paged row locator exceeded payload length"))
     }
 
-    fn row_bytes_from_tombstoned_base<'a>(
-        overlay_payload: &'a [u8],
-        row_id: i64,
-    ) -> Result<&'a [u8]> {
+    fn row_bytes_from_tombstoned_base(overlay_payload: &[u8], row_id: i64) -> Result<&[u8]> {
         if overlay_payload.is_empty() {
             return Err(DbError::corruption(
                 "paged table overlay row is missing from overlay payload",
@@ -14275,9 +14277,7 @@ impl EngineRuntime {
             binding_name,
             &projection_indexes,
         )?;
-        if !query.order_by.is_empty() && order_by.is_none() {
-            return Ok(None);
-        }
+        let order_by_requires_rowid_range = !query.order_by.is_empty() && order_by.is_none();
         let limit = query
             .limit
             .as_ref()
@@ -14294,19 +14294,21 @@ impl EngineRuntime {
         let _row_source = self.visible_table_row_source(name);
         if !select.distinct {
             if let Some(row_source) = _row_source {
-                if let Some(result) = self.try_simple_filtered_projection_exact_index_result(
-                    row_source,
-                    name,
-                    table_schema,
-                    filter,
-                    &projection_indexes,
-                    column_names.clone(),
-                    order_by.as_deref(),
-                    params,
-                    limit,
-                    offset,
-                )? {
-                    return Ok(Some(result));
+                if !order_by_requires_rowid_range {
+                    if let Some(result) = self.try_simple_filtered_projection_exact_index_result(
+                        row_source,
+                        name,
+                        table_schema,
+                        filter,
+                        &projection_indexes,
+                        column_names.clone(),
+                        order_by.as_deref(),
+                        params,
+                        limit,
+                        offset,
+                    )? {
+                        return Ok(Some(result));
+                    }
                 }
             }
         }
@@ -14396,6 +14398,9 @@ impl EngineRuntime {
             )? {
                 return Ok(Some(result));
             }
+        }
+        if order_by_requires_rowid_range {
+            return Ok(None);
         }
         if order_by.is_none() {
             if let Some(result) = self.try_simple_filtered_projection_range_index_result(
@@ -14902,17 +14907,7 @@ impl EngineRuntime {
             return Ok(None);
         };
 
-        let analyze_side = |body: &QueryBody| -> Result<
-            Option<(
-                String,
-                Option<String>,
-                Vec<usize>,
-                Vec<String>,
-                usize,
-                Option<SimpleRangeBoundValue>,
-                Option<SimpleRangeBoundValue>,
-            )>,
-        > {
+        let analyze_side = |body: &QueryBody| -> Result<Option<SimpleUnionRangeProjectionSide>> {
             let QueryBody::Select(select) = body else {
                 return Ok(None);
             };
@@ -15015,44 +15010,26 @@ impl EngineRuntime {
             ) {
                 return Ok(None);
             }
-            Ok(Some((
-                name.clone(),
-                alias.clone(),
+            Ok(Some(SimpleUnionRangeProjectionSide {
+                table_name: name.clone(),
+                alias: alias.clone(),
                 projection_indexes,
                 column_names,
                 filter_column_index,
                 lower_bound,
                 upper_bound,
-            )))
+            }))
         };
 
-        let Some((
-            left_table_name,
-            left_alias,
-            left_projection_indexes,
-            left_column_names,
-            left_filter_column_index,
-            left_lower_bound,
-            left_upper_bound,
-        )) = analyze_side(left)?
-        else {
+        let Some(left_side) = analyze_side(left)? else {
             return Ok(None);
         };
-        let Some((
-            right_table_name,
-            _right_alias,
-            right_projection_indexes,
-            _right_column_names,
-            right_filter_column_index,
-            right_lower_bound,
-            right_upper_bound,
-        )) = analyze_side(right)?
-        else {
+        let Some(right_side) = analyze_side(right)? else {
             return Ok(None);
         };
-        if !identifiers_equal(&left_table_name, &right_table_name)
-            || left_projection_indexes != right_projection_indexes
-            || left_filter_column_index != right_filter_column_index
+        if !identifiers_equal(&left_side.table_name, &right_side.table_name)
+            || left_side.projection_indexes != right_side.projection_indexes
+            || left_side.filter_column_index != right_side.filter_column_index
         {
             return Ok(None);
         }
@@ -15069,37 +15046,40 @@ impl EngineRuntime {
             return Ok(None);
         };
         if let Some(order_table) = order_table.as_deref() {
-            if !identifiers_equal(order_table, &left_table_name)
-                && !left_alias
+            if !identifiers_equal(order_table, &left_side.table_name)
+                && !left_side
+                    .alias
                     .as_deref()
                     .is_some_and(|alias| identifiers_equal(order_table, alias))
             {
                 return Ok(None);
             }
         }
-        if !identifiers_equal(order_column, &left_column_names[0]) {
+        if !identifiers_equal(order_column, &left_side.column_names[0]) {
             return Ok(None);
         }
 
-        let Some(index) = self.single_column_btree_index(&left_table_name, &left_column_names[0])
+        let Some(index) =
+            self.single_column_btree_index(&left_side.table_name, &left_side.column_names[0])
         else {
             return Ok(None);
         };
         let Some(RuntimeIndex::Btree { keys, .. }) = self.index(&index.name) else {
             return Ok(None);
         };
-        let Some(left_start) = simple_int64_range_start(left_lower_bound.as_ref()) else {
+        let Some(left_start) = simple_int64_range_start(left_side.lower_bound.as_ref()) else {
             return Ok(None);
         };
-        let Some(left_end_exclusive) = simple_int64_range_end_exclusive(left_upper_bound.as_ref())
+        let Some(left_end_exclusive) =
+            simple_int64_range_end_exclusive(left_side.upper_bound.as_ref())
         else {
             return Ok(None);
         };
-        let Some(right_start) = simple_int64_range_start(right_lower_bound.as_ref()) else {
+        let Some(right_start) = simple_int64_range_start(right_side.lower_bound.as_ref()) else {
             return Ok(None);
         };
         let Some(right_end_exclusive) =
-            simple_int64_range_end_exclusive(right_upper_bound.as_ref())
+            simple_int64_range_end_exclusive(right_side.upper_bound.as_ref())
         else {
             return Ok(None);
         };
@@ -15156,7 +15136,8 @@ impl EngineRuntime {
             .take(limit.unwrap_or(usize::MAX))
             .map(|value| vec![Value::Int64(value)])
             .collect();
-        let columns = left_column_names
+        let columns = left_side
+            .column_names
             .into_iter()
             .map(|name| ColumnBinding::visible(None, name))
             .collect();
@@ -23920,6 +23901,16 @@ struct SimpleIndexedProjectionPlan<'a> {
     offset: usize,
 }
 
+struct SimpleUnionRangeProjectionSide {
+    table_name: String,
+    alias: Option<String>,
+    projection_indexes: Vec<usize>,
+    column_names: Vec<String>,
+    filter_column_index: usize,
+    lower_bound: Option<SimpleRangeBoundValue>,
+    upper_bound: Option<SimpleRangeBoundValue>,
+}
+
 struct LeftJoinStatusAggregatePlan<'a> {
     parent_table_name: &'a str,
     parent_join_index: usize,
@@ -24471,6 +24462,13 @@ struct GeneralGroupedSingleTablePlan<'a> {
     distinct: bool,
     limit: Option<&'a Expr>,
     offset: Option<&'a Expr>,
+}
+
+#[derive(Clone, Copy)]
+struct WindowEvalContext<'a> {
+    dataset: &'a Dataset,
+    params: &'a [Value],
+    ctes: &'a BTreeMap<String, Dataset>,
 }
 
 struct IndexedJoinGroupedCountPlan<'a> {
@@ -37484,13 +37482,15 @@ impl EngineRuntime {
                 } => {
                     if let Some(peer_index) = Self::find_row_number_lag_peer(items, item_index) {
                         let (row_number_values, lag_values) = self.compute_row_number_lag_values(
-                            dataset,
+                            WindowEvalContext {
+                                dataset,
+                                params,
+                                ctes,
+                            },
                             partition_by,
                             order_by,
                             peer_index,
                             items,
-                            params,
-                            ctes,
                         )?;
                         window_values[item_index] = Some(row_number_values);
                         window_values[peer_index] = Some(lag_values);
@@ -37541,13 +37541,15 @@ impl EngineRuntime {
                         {
                             let (row_number_values, lag_values) = self
                                 .compute_row_number_lag_values(
-                                    dataset,
+                                    WindowEvalContext {
+                                        dataset,
+                                        params,
+                                        ctes,
+                                    },
                                     partition_by,
                                     order_by,
                                     item_index,
                                     items,
-                                    params,
-                                    ctes,
                                 )?;
                             window_values[item_index] = Some(lag_values);
                             window_values[peer_index] = Some(row_number_values);
@@ -37813,14 +37815,13 @@ impl EngineRuntime {
 
     fn compute_row_number_lag_values(
         &self,
-        dataset: &Dataset,
+        context: WindowEvalContext<'_>,
         partition_by: &[Expr],
         order_by: &[crate::sql::ast::OrderBy],
         lag_item_index: usize,
         items: &[SelectItem],
-        params: &[Value],
-        ctes: &BTreeMap<String, Dataset>,
     ) -> Result<(Vec<Value>, Vec<Value>)> {
+        let dataset = context.dataset;
         let SelectItem::Expr {
             expr: Expr::WindowFunction { args, .. },
             ..
@@ -37840,7 +37841,9 @@ impl EngineRuntime {
             } else {
                 let values = partition_by
                     .iter()
-                    .map(|expr| self.eval_expr(expr, dataset, row, params, ctes, None))
+                    .map(|expr| {
+                        self.eval_expr(expr, dataset, row, context.params, context.ctes, None)
+                    })
                     .collect::<Result<Vec<_>>>()?;
                 row_identity(&values)?
             };
@@ -37858,8 +37861,8 @@ impl EngineRuntime {
                             &order.expr,
                             dataset,
                             &dataset.rows[*left],
-                            params,
-                            ctes,
+                            context.params,
+                            context.ctes,
                             None,
                         )
                         .unwrap_or(Value::Null);
@@ -37868,8 +37871,8 @@ impl EngineRuntime {
                             &order.expr,
                             dataset,
                             &dataset.rows[*right],
-                            params,
-                            ctes,
+                            context.params,
+                            context.ctes,
                             None,
                         )
                         .unwrap_or(Value::Null);
@@ -37893,8 +37896,8 @@ impl EngineRuntime {
                         lag_expr,
                         dataset,
                         &dataset.rows[*row_index],
-                        params,
-                        ctes,
+                        context.params,
+                        context.ctes,
                         None,
                     )
                 })

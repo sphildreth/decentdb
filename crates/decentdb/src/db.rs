@@ -7654,9 +7654,7 @@ impl Db {
         {
             return None;
         }
-        let Some(filter) = select.filter.as_ref() else {
-            return None;
-        };
+        let filter = select.filter.as_ref()?;
         let FromItem::Table { name, alias } = &select.from[0] else {
             return None;
         };
@@ -7694,9 +7692,7 @@ impl Db {
                 return None;
             }
         }
-        let Some(value_source) = prepared_simple_value_source(value_expr) else {
-            return None;
-        };
+        let value_source = prepared_simple_value_source(value_expr)?;
 
         let mut projection_indexes = Vec::with_capacity(select.projection.len());
         let mut column_names = Vec::with_capacity(select.projection.len());
