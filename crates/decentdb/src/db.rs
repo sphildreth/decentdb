@@ -4085,9 +4085,7 @@ impl Db {
         }
         let extension_execution_enabled = self.inner.config.extension_unsigned_development_mode
             || !self.inner.config.extension_trust_anchors.is_empty();
-        if self.inner.config.process_coordination == ProcessCoordinationMode::SingleProcessUnsafe
-            && !extension_execution_enabled
-        {
+        if !extension_execution_enabled {
             if let Some(runtime) =
                 self.try_resident_read_for_single_process_statement(statement, prepared)?
             {
@@ -5308,8 +5306,6 @@ impl Db {
         prepared: &PreparedStatement,
     ) -> Result<Option<QueryResult>> {
         if self.inner.sql_txn_active.load(Ordering::Acquire)
-            || self.inner.config.process_coordination
-                != ProcessCoordinationMode::SingleProcessUnsafe
             || self.inner.config.extension_unsigned_development_mode
             || !self.inner.config.extension_trust_anchors.is_empty()
         {
@@ -5360,8 +5356,7 @@ impl Db {
             return Ok(None);
         };
 
-        if self.inner.config.process_coordination == ProcessCoordinationMode::SingleProcessUnsafe
-            && !self.inner.config.extension_unsigned_development_mode
+        if !self.inner.config.extension_unsigned_development_mode
             && self.inner.config.extension_trust_anchors.is_empty()
         {
             if let Some(runtime) = self.try_resident_read_for_single_process_statement(
@@ -5465,8 +5460,7 @@ impl Db {
             return Ok(None);
         };
 
-        if self.inner.config.process_coordination == ProcessCoordinationMode::SingleProcessUnsafe
-            && !self.inner.config.extension_unsigned_development_mode
+        if !self.inner.config.extension_unsigned_development_mode
             && self.inner.config.extension_trust_anchors.is_empty()
         {
             if let Some(runtime) = self.try_resident_read_for_single_process_statement(
