@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: decentdb
-Version: 2.14.0
+Version: 2.15.0
 Summary: Python DB-API 2.0 driver and SQLAlchemy dialect for DecentDB
 Author: DecentDB Contributors
 Classifier: Development Status :: 4 - Beta

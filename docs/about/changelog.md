@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.15.0] - [UNRELEASED]
+
+### Added
+
+- Added named database profile configuration across the C ABI and .NET
+  connection-string surfaces, including profile documentation for C/C++,
+  .NET, and general configuration users.
+- Added UUID handling for prepared statements, runtime indexes, and Python
+  result decoding paths, with API coverage and SQL regression tests.
+- Added `scripts/benchmark_runner.py`, expanded complex/movie workload
+  benchmark coverage, and checked in the latest rust-baseline benchmark
+  result artifacts.
+
+### Changed
+
+- Improved SQL execution fast paths for residual predicates, filtered
+  projections, indexed range/order queries, grouped and distinct aggregates,
+  left-join aggregate lookups, and set-operation workloads.
+- Enhanced full-text search scoring, ranking, document deletion handling, and
+  movie-query coverage.
+- Aligned WAL sync benchmarking behavior with SQLite semantics and documented
+  the benchmark-driven performance work in the design notes.
+
+### Fixed
+
+- Preserved non-updated wide-row columns during arithmetic updates.
+- Improved checkpoint and runtime-index refresh behavior used by prepared
+  statements and benchmark-heavy read paths.
+- Simplified resident read checks by removing stale `SingleProcessUnsafe`
+  gating from the relevant read-path logic.
+
 ## [2.14.0] - [2026-06-19]
 
 ### Added
