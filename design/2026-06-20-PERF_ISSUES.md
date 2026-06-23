@@ -2960,3 +2960,144 @@ Remaining risk:
 - Fulltext BM25 equivalence intentionally validates only result ids/titles;
   engine-specific rank scales remain in the full `_checks` payload and should
   not be treated as cross-engine equality requirements.
+
+## 12. Phase 5Z: Align WAL Sync Mode With SQLite Semantics (2026-06-22)
+
+### Hypothesis
+
+The benchmark used `wal_sync_mode=normal` to "match SQLite's PRAGMA
+synchronous=NORMAL." However, DecentDB's `WalSyncMode::Normal` still performs
+`sync_data()` (fsync) per commit (omitting only the `sync_metadata` call that
+`Full` mode includes), while SQLite's `synchronous=NORMAL` in WAL mode does NOT
+fsync per commit. This semantic mismatch imposed a per-commit fsync penalty on
+every autocommit DML statement (UPSERT, DDL, single-row RETURNING) and every
+transaction commit in the DecentDB embedded-fast benchmark profile.
+
+### Change
+
+Updated `DECENTDB_EMBEDDED_FAST_OPTIONS` in
+`bindings/python/benchmarks/bench_complex.py`:
+- **Before:** `wal_sync_mode=normal`
+- **After:** `wal_sync_mode=async_commit:10`
+
+`WalSyncMode::AsyncCommit { interval_ms: 10 }` acknowledges commits immediately
+after the WAL write (no fsync) and delegates durability to a background flusher
+thread that fsyncs the WAL every 10 ms. This matches SQLite WAL mode
+`synchronous=NORMAL` semantics: per-commit latency is not gated on fsync, and
+durability is restored at checkpoint or by the background flusher.
+
+The benchmark now records the correct profile description for DecentDB, noting
+that `async_commit:10` provides SQLite-equivalent durability.
+
+### Benchmark Results
+
+Full `scripts/benchmark_runner.py --profile full` runs before and after
+(warm query mode, embedded-fast profile):
+
+| Run | Time | Output | Total SQLite Wins |
+|---|---|---|---|
+| Before | 2026-06-22 15:56 | `.tmp/perf-validate/20260622-155601` | 126 |
+| Before | 2026-06-22 17:43 | `.tmp/perf-validate/runner_current` | 129 |
+| After  | 2026-06-22 18:04 | `.tmp/perf-validate/20260622-180405` | 111 |
+| After  | 2026-06-22 18:51 | `.tmp/perf-validate/20260622-185110` | 118 |
+
+Reduced Showdown per-metric changes (three consecutive runs, median):
+
+| Metric | Before (normal) | After (async_commit:10) |
+|---|---|---|
+| UPSERT | ~30-59x SQLite win | ~4-8x SQLite win |
+| INSERT RETURNING | ~4.2-4.5x | ~3.3-3.4x |
+| UPDATE RETURNING | ~6.9-7.8x | ~3.3-4.3x |
+| Bulk UPDATE | ~2.5-3.1x | ~1.0-1.2x (flip in some runs) |
+| Bulk DELETE | ~6-9x | ~4-5x |
+| B-tree index build | ~1.0-3.2x SQLite win | DDB win (~1.2-1.6x) |
+
+MovieDB scratch per-metric changes:
+
+| Metric | Before | After |
+|---|---|---|
+| Point reads | ~1.1x SQLite win | DDB win (~1.05x) |
+| Bulk load | ~1.54x DDB win | ~1.58x DDB win |
+| Update batch | ~2.9x | ~2.6x |
+| Cascade delete | ~20x | ~19x |
+| Checkpoint after mutations | ~10x | ~13x (regression from async flusher) |
+| Total DDB wins / SQLite wins | 8 / 5 | 9 / 4 |
+
+### Remaining Gaps After Phase 5Z
+
+The async_commit change closed ~18 SQLite wins (from 129 to 111 in the initial
+post-change run). The remaining 111-118 SQLite-led measured areas are
+concentrated in:
+
+1. **Bulk load (12 wins, all material)**: Per-row index maintenance dominates at
+   larger scales. Typed FLOAT64/TEXT/DATE runtime B-tree keys would reduce
+   per-row allocation and encoding, but a prototype implementation (reverted in
+   this iteration) regressed the btree index build path by ~2x because the
+   build blocks did not reuse the existing `single_column_position` fast path.
+   A corrected implementation that uses direct position-based key extraction in
+   the typed build blocks should close most of the bulk load gap without the
+   regression.
+
+2. **DML RETURNING / UPSERT / bulk DELETE (32 wins, 28 material)**: Remaining
+   overhead is in RETURNING rendering, per-statement DML setup, and per-row
+   search index maintenance (fulltext `delete_document`, trigram `queue_delete`)
+   during bulk DELETE. The search index delta cost is intrinsic correctness
+   work; deferring search-index maintenance to commit-time batching would
+   amortize it.
+
+3. **Search index build / fulltext BM25 (16 wins, 13 material)**: DecentDB
+   trigram/fulltext tokenization and postings insertion remain slower than
+   SQLite FTS5's optimized C tokenizer. The postings-resolved BM25 query path
+   already avoids full document scans, but candidate scoring still allocates
+   per-document term-stat vectors.
+
+4. **Query join/aggregate/window (53 wins, 27 material)**: The remaining gaps
+   are small (1.0-1.5x for many rows) and concentrated in:
+   - Window function partition/sort setup (review_ranking, cast_billing_window,
+     rolling_avg_frame).
+   - Recursive CTE evaluation loop overhead.
+   - Yearly counts/top-by-decade computed-key grouped aggregates.
+   - Many of the 26 non-material wins are within measurement noise and may flip
+     across runs.
+
+5. **MovieDB cascade delete and checkpoint (19x and 13x)**: The resident profile
+   cascade delete cost is dominated by `apply_row_changes_to_table_row_source`
+   rebuilding the entire resident row vector (O(table size)) for each child
+   table affected by the cascade. The paged-row-storage profile reduces cascade
+   to ~0.67s but regresses Showdown bulk load and DML. Checkpoint cost increased
+   modestly with async_commit because the checkpoint now writes back WAL pages
+   that accumulated without prior fsync.
+
+6. **Native defaults (22 wins)**: The benchmark's native-defaults validation run
+   uses untuned DecentDB defaults (`wal_sync_mode=Full`,
+   `process_coordination=Auto`). The `process_coordination=Auto` mode requires
+   coordination file I/O for every WAL reader, causing ~100-1000x regressions
+   for offset pagination, recursive CTE, and bulk DELETE compared to the
+   embedded-fast profile. These are expected tradeoffs: the engine's defaults
+   prioritize multi-process safety over single-process performance. Closing
+   these would require either changing default options (ADR-required) or making
+   the coordinated reader path cheaper.
+
+### Next Recommended Work
+
+1. Revisit typed FLOAT64/TEXT/DATE runtime B-tree keys with corrected
+   single-column-position fast-path build blocks. This should close a
+   significant portion of the bulk load and index-maintenance gap.
+
+2. Defer fulltext/trigram search-index maintenance to commit time for batched
+   DML (DELETE/UPDATE). This would reduce the bulk DELETE gap from ~4-50x to
+   ~2-3x.
+
+3. Profile and reduce RETURNING rendering overhead for simple
+   INSERT/UPDATE/DELETE shapes.
+
+4. Add a bounded Top-N sort for `ORDER BY ... LIMIT` aggregations and window
+   frame accumulators.
+
+5. Evaluate making `paged_row_storage=true` the MovieDB embedded-fast default
+   (trading Showdown bulk load/DML regressions against cascade delete wins) and
+   document the tradeoff.
+
+6. Profile and reduce coordinator file I/O in `process_coordination=Auto` mode
+   to close the native defaults gaps without changing default durability or
+   process-safety settings.

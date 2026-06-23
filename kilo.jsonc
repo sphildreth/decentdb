@@ -3,5 +3,6 @@
   "instructions": [
     ".kilo/rules/*.md",
     ".kilocode/rules/*.md"
-  ]
+  ],
+  "snapshot": false
 }

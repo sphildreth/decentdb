@@ -95,10 +95,13 @@ DECENTDB_EMBEDDED_FAST_OPTIONS = (
     "wal_autocheckpoint=0;"
     "process_coordination=single_process_unsafe;"
     # Match SQLite's default benchmark PRAGMA synchronous=NORMAL so both
-    # engines use the same reduced-sync WAL durability. Without this, DecentDB
-    # defaults to WalSyncMode::Full (fsync per commit) while SQLite uses NORMAL,
-    # which is not a like-for-like comparison for auto-committed DDL/DML.
-    "wal_sync_mode=normal"
+    # engines use the same reduced-sync WAL durability. SQLite WAL mode with
+    # synchronous=NORMAL does NOT fsync per commit; it fsyncs the WAL only at
+    # checkpoint. WalSyncMode::Normal still fsyncs per commit (only omitting
+    # metadata sync), which is inconsistent with the target. Use async_commit
+    # with a 10ms background flusher so per-commit latency matches SQLite while
+    # retaining a tight durability window via the background flusher.
+    "wal_sync_mode=async_commit:10"
 )
 
 MOVIE_FIRST_NAMES = [
