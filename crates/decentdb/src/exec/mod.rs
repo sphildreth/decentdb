@@ -28448,24 +28448,40 @@ fn rewrite_paged_table_from_manifest<S: PageStore>(
 
     let mut new_chunks = Vec::with_capacity(manifest.chunks.len());
     let mut persisted_chunks = Vec::with_capacity(manifest.chunks.len());
+
     for current_chunk in manifest.chunks.iter() {
         let checksum = crc32c_parts(&[current_chunk.payload.as_slice()]);
-        let _overlay_checksum = current_chunk
+        let current_overlay_checksum = current_chunk
             .overlay_payload
             .as_ref()
-            .map(|p| crc32c_parts(&[p.as_slice()]));
+            .map(|payload| crc32c_parts(&[payload.as_slice()]));
         let reused_index =
             reusable_previous
                 .iter()
                 .enumerate()
                 .find_map(|(index, (chunk_state, payload))| {
-                    let overlay_match = matches!(
-                        (&chunk_state.overlay_pointer, &current_chunk.overlay_payload),
-                        (None, None)
-                    );
+                    let overlay_match = match (
+                        &payload.overlay_payload,
+                        &current_chunk.overlay_payload,
+                        chunk_state.overlay_checksum,
+                        current_overlay_checksum,
+                    ) {
+                        (None, None, None, None) => true,
+                        (
+                            Some(previous),
+                            Some(current),
+                            Some(previous_checksum),
+                            Some(checksum),
+                        ) => {
+                            previous_checksum == checksum
+                                && previous.as_slice() == current.as_slice()
+                        }
+                        _ => false,
+                    };
                     (!reused_previous[index]
                         && chunk_state.checksum == checksum
                         && payload.payload.as_slice() == current_chunk.payload.as_slice()
+                        && chunk_state.row_count == current_chunk.row_count
                         && chunk_state.tombstoned_row_ids.len()
                             == current_chunk.tombstoned_row_ids.len()
                         && chunk_state
