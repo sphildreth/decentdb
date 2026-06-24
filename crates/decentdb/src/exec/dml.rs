@@ -153,6 +153,7 @@ pub(crate) struct PreparedSimpleDeleteRestrictChild {
     pub(crate) child_table_name: String,
     pub(crate) child_column_indexes: Vec<usize>,
     pub(crate) child_index_name: Option<String>,
+    pub(crate) child_index_prefix_len: Option<usize>,
     pub(crate) parent_column_indexes: Vec<usize>,
 }
 
@@ -172,6 +173,32 @@ impl PreparedSimpleDelete {
     pub(crate) fn affected_table_names(&self) -> Vec<&str> {
         let mut table_names = Vec::with_capacity(1 + self.dependency_table_names.len());
         table_names.push(self.table.name.as_str());
+        for dependency in &self.dependency_table_names {
+            if !table_names
+                .iter()
+                .any(|name| identifiers_equal(name, dependency))
+            {
+                table_names.push(dependency.as_str());
+            }
+        }
+        table_names
+    }
+
+    pub(crate) fn required_row_source_table_names(&self) -> Vec<&str> {
+        let mut table_names = Vec::new();
+        table_names.push(self.table.name.as_str());
+        if self.delete_children.is_empty() {
+            for child in &self.restrict_children {
+                if child.child_index_name.is_none()
+                    && !table_names
+                        .iter()
+                        .any(|name| identifiers_equal(name, &child.child_table_name))
+                {
+                    table_names.push(child.child_table_name.as_str());
+                }
+            }
+            return table_names;
+        }
         for dependency in &self.dependency_table_names {
             if !table_names
                 .iter()
@@ -1382,31 +1409,7 @@ impl EngineRuntime {
                 let Some(row_source) = self.visible_table_row_source(&prepared.table_name) else {
                     return Ok(QueryResult::with_affected_rows(0));
                 };
-                let width = high
-                    .checked_sub(low)
-                    .and_then(|value| value.checked_add(1))
-                    .and_then(|value| usize::try_from(value).ok());
-                let max_enumerated_range = row_source.row_count().saturating_mul(4).max(1024);
-                if width.is_some_and(|width| width <= max_enumerated_range) {
-                    let width = width.unwrap_or(0);
-                    let mut row_ids = Vec::with_capacity(width.min(row_source.row_count()));
-                    for row_id in low..=high {
-                        if row_source.row_by_id(row_id)?.is_some() {
-                            row_ids.push(row_id);
-                        }
-                    }
-                    row_ids
-                } else {
-                    let mut row_ids = Vec::new();
-                    for row in row_source.rows() {
-                        let row = row?;
-                        let row_id = row.row_id();
-                        if row_id >= low && row_id <= high {
-                            row_ids.push(row_id);
-                        }
-                    }
-                    row_ids
-                }
+                row_source.row_ids_in_range(low, high)
             }
             PreparedDeleteLookup::Index {
                 index_name,
@@ -1424,6 +1427,91 @@ impl EngineRuntime {
         };
         if matching_row_ids.is_empty() {
             return Ok(QueryResult::with_affected_rows(0));
+        }
+
+        let can_fast_delete_by_row_id = prepared.delete_children.is_empty()
+            && !self.should_record_sync_mutation_for_table(&prepared.table)
+            && self.prepared_simple_delete_restrict_children_are_row_id_index_checks(prepared);
+        if can_fast_delete_by_row_id {
+            for child in &prepared.restrict_children {
+                let Some(index_name) = child.child_index_name.as_deref() else {
+                    continue;
+                };
+                let Some(index_schema) = self.catalog.indexes.get(index_name) else {
+                    continue;
+                };
+                let Some(RuntimeIndex::Btree { keys, .. }) = self.index(index_name) else {
+                    continue;
+                };
+                let use_prefix_scan = child
+                    .child_index_prefix_len
+                    .is_some_and(|prefix_len| index_schema.columns.len() > prefix_len);
+                for &row_id in &matching_row_ids {
+                    let has_referencing_child = if use_prefix_scan {
+                        !keys
+                            .row_ids_for_encoded_key_prefix(&[Value::Int64(row_id)])?
+                            .is_empty()
+                    } else {
+                        !keys
+                            .row_ids_for_value_set(&Value::Int64(row_id))?
+                            .is_empty()
+                    };
+                    if has_referencing_child {
+                        return Err(DbError::constraint(format!(
+                            "DELETE on {} violates a foreign key from {}",
+                            prepared.table.name, child.child_table_name
+                        )));
+                    }
+                }
+            }
+
+            let affected_rows = matching_row_ids.len();
+            let deleted_row_ids = matching_row_ids.iter().copied().collect::<BTreeSet<_>>();
+            match self.table_row_source(&prepared.table_name) {
+                Some(TableRowSource::Resident(_)) => {
+                    let table_data =
+                        self.table_data_mut(&prepared.table_name).ok_or_else(|| {
+                            DbError::internal(format!(
+                                "table data for {} is missing",
+                                prepared.table_name
+                            ))
+                        })?;
+                    table_data.retain_rows(|row| !deleted_row_ids.contains(&row.row_id));
+                    for &row_id in &matching_row_ids {
+                        self.mark_table_row_deleted(&prepared.table_name, row_id);
+                    }
+                }
+                Some(TableRowSource::Paged(manifest)) => {
+                    let updated_manifest = super::apply_paged_row_deletions_to_manifest(
+                        manifest.as_ref(),
+                        &deleted_row_ids,
+                    )?;
+                    self.replace_table_row_source(
+                        &prepared.table_name,
+                        TableRowSource::Paged(Arc::new(updated_manifest)),
+                    )?;
+                    self.mark_table_dirty(&prepared.table_name);
+                }
+                None => {
+                    return Err(DbError::internal(format!(
+                        "table data for {} is missing",
+                        prepared.table_name
+                    )));
+                }
+            }
+            let stale_indexes = prepared
+                .indexes
+                .iter()
+                .map(|index| index.name.clone())
+                .collect::<Vec<_>>();
+            self.mark_named_indexes_stale(&stale_indexes);
+            self.execute_after_triggers(
+                &prepared.table_name,
+                TriggerEvent::Delete,
+                affected_rows,
+                _page_size,
+            )?;
+            return Ok(QueryResult::with_affected_rows(affected_rows as u64));
         }
 
         let (removed_rows, row_source_was_resident) = {
@@ -1554,6 +1642,26 @@ impl EngineRuntime {
             }
         }
         Ok(QueryResult::with_affected_rows(removed_rows.len() as u64))
+    }
+
+    fn prepared_simple_delete_restrict_children_are_row_id_index_checks(
+        &self,
+        prepared: &PreparedSimpleDelete,
+    ) -> bool {
+        let Some(row_id_column) = row_id_alias_column_name(&prepared.table) else {
+            return prepared.restrict_children.is_empty();
+        };
+        prepared.restrict_children.iter().all(|child| {
+            child.parent_column_indexes.len() == 1
+                && child.child_index_name.as_deref().is_some_and(|index_name| {
+                    matches!(self.index(index_name), Some(RuntimeIndex::Btree { .. }))
+                })
+                && child
+                    .parent_column_indexes
+                    .first()
+                    .and_then(|index| prepared.table.columns.get(*index))
+                    .is_some_and(|column| identifiers_equal(&column.name, row_id_column))
+        })
     }
 
     pub(crate) fn prepared_btree_index_is_fresh(&self, prepared: &PreparedBtreeIndex) -> bool {
@@ -2356,7 +2464,6 @@ impl EngineRuntime {
         params: &[Value],
         page_size: u32,
     ) -> Result<Option<QueryResult>> {
-        let _t0 = std::time::Instant::now();
         let Some(TableRowSource::Paged(manifest)) = self.table_row_source(&table.name).cloned()
         else {
             return Ok(None);
@@ -2385,7 +2492,6 @@ impl EngineRuntime {
                 }
             }
         }
-
         let stale_indexes = incremental_delete_indexes(self, table, table_indexes, &matching_rows)?;
         if has_referencing_tables && !delete_children.is_empty() {
             self.apply_parent_delete_actions_rows(
@@ -2427,7 +2533,6 @@ impl EngineRuntime {
                 self.mark_named_indexes_stale(&stale_indexes);
             }
         }
-
         self.execute_after_triggers(
             &table.name,
             TriggerEvent::Delete,
@@ -2478,7 +2583,6 @@ impl EngineRuntime {
                 removed_rows.push(table_data.rows[row_index].clone());
             }
         }
-
         if !restrict_children.is_empty() {
             for row in &removed_rows {
                 for child in restrict_children {
@@ -2491,7 +2595,6 @@ impl EngineRuntime {
                 }
             }
         }
-
         row_indices.sort_unstable_by(|left, right| right.cmp(left));
         {
             let table_data = self.table_data_mut(table_name).ok_or_else(|| {
@@ -2501,7 +2604,6 @@ impl EngineRuntime {
                 table_data.remove_row(row_index);
             }
         }
-
         let stale_indexes = incremental_delete_indexes(self, table, table_indexes, &removed_rows)?;
         if !stale_indexes.is_empty() {
             self.mark_named_indexes_stale(&stale_indexes);
@@ -6043,25 +6145,36 @@ fn prepare_simple_delete_restrict_children(
                 })
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(|_| DbError::internal("child foreign-key column is missing"))?;
-            let child_index_name = runtime.catalog.indexes.values().find_map(|index| {
-                (identifiers_equal(&index.table_name, &child_table.name)
-                    && index.kind == IndexKind::Btree
-                    && index.predicate_sql.is_none()
-                    && index.columns.len() == foreign_key.columns.len()
-                    && index.columns.iter().zip(&foreign_key.columns).all(
-                        |(index_column, foreign_key_column)| {
-                            index_column.expression_sql.is_none()
-                                && index_column.column_name.as_ref().is_some_and(|entry| {
-                                    identifiers_equal(entry, foreign_key_column)
-                                })
-                        },
-                    ))
-                .then(|| index.name.clone())
-            });
+            let child_index = runtime
+                .catalog
+                .indexes
+                .values()
+                .filter(|index| {
+                    identifiers_equal(&index.table_name, &child_table.name)
+                        && index.kind == IndexKind::Btree
+                        && index.predicate_sql.is_none()
+                        && index.columns.len() >= foreign_key.columns.len()
+                        && index
+                            .columns
+                            .iter()
+                            .take(foreign_key.columns.len())
+                            .zip(&foreign_key.columns)
+                            .all(|(index_column, foreign_key_column)| {
+                                index_column.expression_sql.is_none()
+                                    && index_column.column_name.as_ref().is_some_and(|entry| {
+                                        identifiers_equal(entry, foreign_key_column)
+                                    })
+                            })
+                })
+                .min_by_key(|index| index.columns.len())
+                .map(|index| (index.name.clone(), foreign_key.columns.len()));
+            let child_index_name = child_index.as_ref().map(|(name, _)| name.clone());
+            let child_index_prefix_len = child_index.as_ref().map(|(_, prefix_len)| *prefix_len);
             prepared.push(PreparedSimpleDeleteRestrictChild {
                 child_table_name: child_table.name.clone(),
                 child_column_indexes,
                 child_index_name,
+                child_index_prefix_len,
                 parent_column_indexes,
             });
         }
@@ -6128,25 +6241,36 @@ fn prepare_simple_delete_prepared_restrict_children(
                 })
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(|_| DbError::internal("child foreign-key column is missing"))?;
-            let child_index_name = runtime.catalog.indexes.values().find_map(|index| {
-                (identifiers_equal(&index.table_name, &child_table.name)
-                    && index.kind == IndexKind::Btree
-                    && index.predicate_sql.is_none()
-                    && index.columns.len() == foreign_key.columns.len()
-                    && index.columns.iter().zip(&foreign_key.columns).all(
-                        |(index_column, foreign_key_column)| {
-                            index_column.expression_sql.is_none()
-                                && index_column.column_name.as_ref().is_some_and(|entry| {
-                                    identifiers_equal(entry, foreign_key_column)
-                                })
-                        },
-                    ))
-                .then(|| index.name.clone())
-            });
+            let child_index = runtime
+                .catalog
+                .indexes
+                .values()
+                .filter(|index| {
+                    identifiers_equal(&index.table_name, &child_table.name)
+                        && index.kind == IndexKind::Btree
+                        && index.predicate_sql.is_none()
+                        && index.columns.len() >= foreign_key.columns.len()
+                        && index
+                            .columns
+                            .iter()
+                            .take(foreign_key.columns.len())
+                            .zip(&foreign_key.columns)
+                            .all(|(index_column, foreign_key_column)| {
+                                index_column.expression_sql.is_none()
+                                    && index_column.column_name.as_ref().is_some_and(|entry| {
+                                        identifiers_equal(entry, foreign_key_column)
+                                    })
+                            })
+                })
+                .min_by_key(|index| index.columns.len())
+                .map(|index| (index.name.clone(), foreign_key.columns.len()));
+            let child_index_name = child_index.as_ref().map(|(name, _)| name.clone());
+            let child_index_prefix_len = child_index.as_ref().map(|(_, prefix_len)| *prefix_len);
             prepared.push(PreparedSimpleDeleteRestrictChild {
                 child_table_name: child_table.name.clone(),
                 child_column_indexes,
                 child_index_name,
+                child_index_prefix_len,
                 parent_column_indexes,
             });
         }
@@ -6455,9 +6579,25 @@ fn prepared_delete_has_referencing_child(
         return Ok(false);
     }
     if let Some(index_name) = &child.child_index_name {
+        let Some(index_schema) = runtime.catalog.indexes.get(index_name) else {
+            return Ok(false);
+        };
         let Some(RuntimeIndex::Btree { keys, .. }) = runtime.index(index_name) else {
             return Ok(false);
         };
+        let use_prefix_scan = child
+            .child_index_prefix_len
+            .is_some_and(|prefix_len| index_schema.columns.len() > prefix_len);
+        if use_prefix_scan {
+            return Ok(!keys
+                .row_ids_for_encoded_key_prefix(
+                    &parent_values
+                        .iter()
+                        .map(|value| (*value).clone())
+                        .collect::<Vec<_>>(),
+                )?
+                .is_empty());
+        }
         if parent_values.len() == 1 {
             return Ok(!keys.row_ids_for_value_set(parent_values[0])?.is_empty());
         }

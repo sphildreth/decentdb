@@ -6491,9 +6491,10 @@ impl Db {
         params: &[Value],
     ) -> Result<QueryResult> {
         let table_names = prepared_delete.affected_table_names();
+        let row_source_table_names = prepared_delete.required_row_source_table_names();
         let child_index_targets = prepared_delete.child_index_hydration_targets();
         self.load_simple_write_row_sources_and_child_indexes_at_latest_snapshot(
-            &table_names,
+            &row_source_table_names,
             &child_index_targets,
         )?;
         let mut runtime = self
@@ -6835,9 +6836,10 @@ impl Db {
             return Ok(Some(result));
         }
         let table_names = prepared_delete.affected_table_names();
+        let row_source_table_names = prepared_delete.required_row_source_table_names();
         let child_index_targets = prepared_delete.child_index_hydration_targets();
         self.load_simple_write_row_sources_and_child_indexes_at_latest_snapshot(
-            &table_names,
+            &row_source_table_names,
             &child_index_targets,
         )?;
         let mut runtime = self
@@ -6983,6 +6985,13 @@ impl Db {
                 return Err(error);
             }
         };
+        if !self.runtime_has_persistent_commit_work(&runtime)?
+            && runtime.sync_mutations.is_empty()
+            && !Self::runtime_has_stale_indexes(&runtime)
+        {
+            self.sync_temp_state_from_runtime(&runtime)?;
+            return Ok(result);
+        }
         runtime.rebuild_stale_indexes(self.inner.config.page_size)?;
         let reactive_pending = self.take_reactive_pending_commit(&mut runtime);
         self.begin_write()?;
@@ -10261,10 +10270,12 @@ impl Db {
             }
             SqlStatement::Delete(delete) => {
                 if let Some(prepared_delete) = runtime.prepare_simple_delete(delete)? {
-                    let table_names = prepared_delete.affected_table_names();
-                    self.load_runtime_table_row_sources_at_snapshot(
+                    let table_names = prepared_delete.required_row_source_table_names();
+                    let child_index_targets = prepared_delete.child_index_hydration_targets();
+                    self.load_runtime_table_row_sources_and_child_indexes_at_snapshot(
                         runtime,
                         &table_names,
+                        &child_index_targets,
                         snapshot_lsn,
                     )?;
                     if let Some(prepared_delete) = runtime.prepare_simple_delete(delete)? {
@@ -10862,11 +10873,11 @@ impl Db {
         persistent_changed: &mut bool,
         indexes_maybe_stale: &mut bool,
     ) -> Result<Option<QueryResult>> {
-        let table_names = prepared_delete.affected_table_names();
+        let row_source_table_names = prepared_delete.required_row_source_table_names();
         let child_index_targets = prepared_delete.child_index_hydration_targets();
         self.load_runtime_table_row_sources_and_child_indexes_at_snapshot(
             runtime,
-            &table_names,
+            &row_source_table_names,
             &child_index_targets,
             snapshot_lsn,
         )?;

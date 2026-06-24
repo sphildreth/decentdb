@@ -659,8 +659,15 @@ impl TablePageManifest {
                     let row_id = cursor.read_i64()?;
                     let row_bytes_len = cursor.read_u32()? as usize;
                     let row_bytes_offset = cursor.offset;
-                    let row_bytes = cursor.read_slice(row_bytes_len)?;
-                    Row::decode(row_bytes)?;
+                    #[cfg(debug_assertions)]
+                    {
+                        let row_bytes = cursor.read_slice(row_bytes_len)?;
+                        Row::decode(row_bytes)?;
+                    }
+                    #[cfg(not(debug_assertions))]
+                    {
+                        cursor.read_slice(row_bytes_len)?;
+                    }
                     if tombstones.contains(&row_id) || overlay_ids.contains(&row_id) {
                         continue; // skip tombstoned and overlaid base rows
                     }
@@ -693,8 +700,15 @@ impl TablePageManifest {
                         let row_id = cursor.read_i64()?;
                         let row_bytes_len = cursor.read_u32()? as usize;
                         let row_bytes_offset = cursor.offset;
-                        let row_bytes = cursor.read_slice(row_bytes_len)?;
-                        Row::decode(row_bytes)?;
+                        #[cfg(debug_assertions)]
+                        {
+                            let row_bytes = cursor.read_slice(row_bytes_len)?;
+                            Row::decode(row_bytes)?;
+                        }
+                        #[cfg(not(debug_assertions))]
+                        {
+                            cursor.read_slice(row_bytes_len)?;
+                        }
                         overlay_row_entries.push(TablePageEntry {
                             row_id,
                             chunk_index: u32::try_from(chunk_index).map_err(|_| {
@@ -894,6 +908,16 @@ impl TablePageManifest {
             return Ok(None);
         };
         self.row_at_position(index)
+    }
+
+    pub(crate) fn row_ids_in_range(&self, low: i64, high: i64) -> Vec<i64> {
+        if low > high {
+            return Vec::new();
+        }
+        let rows = self.rows.as_ref();
+        let start = rows.partition_point(|row| row.row_id < low);
+        let end = start + rows[start..].partition_point(|row| row.row_id <= high);
+        rows[start..end].iter().map(|row| row.row_id).collect()
     }
 
     /// Returns the chunk index owning `row_id`, if present. Used by the bulk
@@ -1396,6 +1420,26 @@ impl<'a> VisibleTableRowSource<'a> {
         }
     }
 
+    fn row_ids_in_range(&self, low: i64, high: i64) -> Vec<i64> {
+        if low > high {
+            return Vec::new();
+        }
+        match self {
+            Self::Temp(data) => data
+                .rows
+                .iter()
+                .filter_map(|row| {
+                    if row.row_id >= low && row.row_id <= high {
+                        Some(row.row_id)
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
+            Self::Base(source) => source.row_ids_in_range(low, high),
+        }
+    }
+
     fn projected_values_by_id(
         &self,
         row_id: i64,
@@ -1466,6 +1510,26 @@ impl TableRowSource {
         match self {
             Self::Resident(data) => Ok(data.row_by_id(row_id).map(TableRowRef::Resident)),
             Self::Paged(manifest) => manifest.row_by_id(row_id),
+        }
+    }
+
+    pub(crate) fn row_ids_in_range(&self, low: i64, high: i64) -> Vec<i64> {
+        if low > high {
+            return Vec::new();
+        }
+        match self {
+            Self::Resident(data) => data
+                .rows
+                .iter()
+                .filter_map(|row| {
+                    if row.row_id >= low && row.row_id <= high {
+                        Some(row.row_id)
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
+            Self::Paged(manifest) => manifest.row_ids_in_range(low, high),
         }
     }
 
@@ -3492,6 +3556,16 @@ impl EngineRuntime {
                                 db.config().page_size,
                             )?
                         }
+                    } else if delta.updated_rows.is_empty() && !delta.deleted_rows.is_empty() {
+                        // Delete-only delta: avoid decoding values for chunks that
+                        // contain no deleted rows by scanning row ids only.
+                        rewrite_paged_table_from_resident_delete_only(
+                            &mut store,
+                            previous_state,
+                            data,
+                            db.config().page_size,
+                            &delta.deleted_rows,
+                        )?
                     } else {
                         rewrite_paged_table_from_resident(
                             &mut store,
@@ -28337,6 +28411,151 @@ fn rewrite_paged_table_from_resident<S: PageStore>(
     if !appended_rows.is_empty() {
         changed = true;
         for encoded_chunk in encode_paged_table_chunks_from_rows(&appended_rows, page_size)? {
+            let pointer = write_overflow(store, &encoded_chunk.payload, CompressionMode::Never)?;
+            new_chunks.push(PersistedTableChunkState {
+                pointer,
+                checksum: encoded_chunk.checksum,
+                row_count: encoded_chunk.row_count,
+                tombstoned_row_ids: Vec::new(),
+                overlay_pointer: None,
+                overlay_checksum: None,
+            });
+        }
+    }
+
+    if !changed {
+        return Ok(previous_state);
+    }
+
+    if new_chunks.is_empty() {
+        free_persisted_table_bytes(store, previous_state)?;
+        return Ok(PersistedTableState {
+            pointer: OverflowPointer {
+                head_page_id: 0,
+                logical_len: 0,
+                flags: 0,
+            },
+            checksum: 0,
+            row_count: 0,
+            tail: OverflowTailInfo::default(),
+            pk_index_root: previous_state.pk_index_root,
+        });
+    }
+
+    let updated_manifest_payload =
+        encode_paged_table_manifest_payload(&PersistedPagedTableManifest { chunks: new_chunks })?;
+    let checksum = crc32c_parts(&[updated_manifest_payload.as_slice()]);
+    let pointer = rewrite_overflow(
+        store,
+        previous_state.pointer.with_table_paged_manifest(false),
+        &updated_manifest_payload,
+        CompressionMode::Never,
+    )?
+    .with_table_paged_manifest(true);
+    let tail = read_uncompressed_overflow_tail(store, pointer)?.unwrap_or_default();
+
+    for replaced_pointer in replaced_chunk_pointers {
+        if replaced_pointer.head_page_id != 0 {
+            free_overflow(store, replaced_pointer.head_page_id)?;
+        }
+    }
+
+    Ok(PersistedTableState {
+        pointer,
+        checksum,
+        row_count: data.rows.len(),
+        tail,
+        pk_index_root: previous_state.pk_index_root,
+    })
+}
+
+/// Scan a table payload's row ids without decoding row values. Returns the set
+/// of row ids stored in the payload (excluding any tombstoned/overlaid rows
+/// the caller already handles). Used to decide whether a chunk contains deleted
+/// rows without paying the cost of decoding every row's values.
+fn scan_table_payload_row_ids(payload: &[u8]) -> Result<BTreeSet<i64>> {
+    if payload.len() < TABLE_PAYLOAD_MAGIC.len() + 4 {
+        return Ok(BTreeSet::new());
+    }
+    let mut cursor = Cursor::new(payload);
+    let magic = cursor.read_slice(TABLE_PAYLOAD_MAGIC.len())?;
+    if magic != TABLE_PAYLOAD_MAGIC {
+        return Err(DbError::corruption("table payload magic is invalid"));
+    }
+    let row_count = cursor.read_u32()? as usize;
+    let mut row_ids = BTreeSet::new();
+    for _ in 0..row_count {
+        let row_id = cursor.read_i64()?;
+        let row_bytes_len = cursor.read_u32()? as usize;
+        cursor.read_slice(row_bytes_len)?;
+        row_ids.insert(row_id);
+    }
+    Ok(row_ids)
+}
+
+/// Delete-only variant of [`rewrite_paged_table_from_resident`]. When the
+/// transaction only deleted rows (no updates, no appends), the surviving rows
+/// are a strict subset of the previous on-disk rows. Chunks that contain no
+/// deleted row id are byte-for-byte unchanged and can be reused verbatim
+/// without decoding their row values; only chunks that actually hold deleted
+/// rows are re-encoded. This avoids decoding every row's values during a bulk
+/// delete on a paged table, which previously dominated commit wall time.
+fn rewrite_paged_table_from_resident_delete_only<S: PageStore>(
+    store: &mut S,
+    previous_state: PersistedTableState,
+    data: &TableData,
+    page_size: u32,
+    deleted_row_ids: &BTreeSet<i64>,
+) -> Result<PersistedTableState> {
+    if previous_state.pointer.head_page_id == 0 || !previous_state.pointer.is_table_paged_manifest()
+    {
+        let encoded_chunks = encode_paged_table_chunks(data, page_size)?;
+        return persist_paged_table(store, previous_state, &encoded_chunks, data.rows.len());
+    }
+
+    let manifest_payload = read_overflow(store, previous_state.pointer)?;
+    if crc32c_parts(&[manifest_payload.as_slice()]) != previous_state.checksum {
+        return Err(DbError::corruption(
+            "paged table manifest checksum mismatch",
+        ));
+    }
+    let manifest = decode_paged_table_manifest_payload(&manifest_payload)?;
+
+    // Index the surviving rows by id so we can re-encode affected chunks from
+    // the resident data without re-reading them from disk.
+    let mut current_rows_by_id = Int64Map::default();
+    for row in &data.rows {
+        current_rows_by_id.insert(row.row_id, row);
+    }
+
+    let mut new_chunks = Vec::with_capacity(manifest.chunks.len());
+    let mut replaced_chunk_pointers = Vec::new();
+    let mut changed = false;
+
+    for chunk in manifest.chunks {
+        let payload = read_overflow(store, chunk.pointer)?;
+        if crc32c_parts(&[payload.as_slice()]) != chunk.checksum {
+            return Err(DbError::corruption("paged table chunk checksum mismatch"));
+        }
+        // Fast path: scan row ids only (skip value decode) to determine whether
+        // this chunk contains any deleted row. If not, reuse the chunk as-is.
+        let chunk_row_ids = scan_table_payload_row_ids(payload.as_slice())?;
+        let chunk_has_deletes = chunk_row_ids.iter().any(|id| deleted_row_ids.contains(id));
+        if !chunk_has_deletes {
+            new_chunks.push(chunk);
+            continue;
+        }
+
+        changed = true;
+        replaced_chunk_pointers.push(chunk.pointer);
+        let previous_rows = decode_table_payload_rows(payload.as_slice())?;
+        let mut current_chunk_rows = Vec::with_capacity(previous_rows.len());
+        for previous_row in &previous_rows {
+            if let Some(current_row) = current_rows_by_id.get(&previous_row.row_id).copied() {
+                current_chunk_rows.push(current_row.clone());
+            }
+        }
+        for encoded_chunk in encode_paged_table_chunks_from_rows(&current_chunk_rows, page_size)? {
             let pointer = write_overflow(store, &encoded_chunk.payload, CompressionMode::Never)?;
             new_chunks.push(PersistedTableChunkState {
                 pointer,
