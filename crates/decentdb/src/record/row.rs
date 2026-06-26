@@ -188,6 +188,44 @@ impl Row {
             .collect()
     }
 
+    pub(crate) fn encoded_prefix_matches(bytes: &[u8], prefix: &[Value]) -> Result<bool> {
+        if prefix.is_empty() {
+            return Ok(true);
+        }
+        let (field_count, mut offset) = decode_varint_u64(bytes)?;
+        let field_count = usize::try_from(field_count)
+            .map_err(|_| DbError::corruption("row field count exceeds usize"))?;
+        if prefix.len() > field_count {
+            return Ok(false);
+        }
+
+        for expected in prefix {
+            let tag = *bytes
+                .get(offset)
+                .ok_or_else(|| DbError::corruption("truncated row field tag"))?;
+            offset += 1;
+
+            let (payload_len, len_bytes) = decode_varint_u64(&bytes[offset..])?;
+            offset += len_bytes;
+            let payload_len = usize::try_from(payload_len)
+                .map_err(|_| DbError::corruption("field payload length exceeds usize"))?;
+            let payload_end = offset + payload_len;
+            let payload = bytes
+                .get(offset..payload_end)
+                .ok_or_else(|| DbError::corruption("truncated row field payload"))?;
+            offset = payload_end;
+
+            let actual = Self::decode_value_with_overflow::<crate::storage::page::InMemoryPageStore>(
+                tag, payload, None,
+            )?;
+            if &actual != expected {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
+    }
+
     pub(crate) fn encode_with_overflow<S: PageStore>(
         &self,
         store: Option<&mut S>,
@@ -860,6 +898,37 @@ mod tests {
         assert_eq!(Row::decode_int64_at(&encoded, 1).expect("decode"), Some(42));
         assert_eq!(Row::decode_int64_at(&encoded, 2).expect("decode"), None);
         assert!(Row::decode_int64_at(&encoded, 0).is_err());
+    }
+
+    #[test]
+    fn encoded_prefix_matches_leading_fields_without_full_projection() {
+        let uuid = [7_u8; 16];
+        let row = Row::new(vec![
+            Value::Uuid(uuid),
+            Value::Text("tail".to_string()),
+            Value::Int64(9),
+        ]);
+        let encoded = row.encode().expect("encode");
+
+        assert!(Row::encoded_prefix_matches(&encoded, &[Value::Uuid(uuid)]).expect("prefix"));
+        assert!(Row::encoded_prefix_matches(
+            &encoded,
+            &[Value::Uuid(uuid), Value::Text("tail".to_string())]
+        )
+        .expect("prefix"));
+        assert!(
+            !Row::encoded_prefix_matches(&encoded, &[Value::Uuid([8_u8; 16])]).expect("prefix")
+        );
+        assert!(!Row::encoded_prefix_matches(
+            &encoded,
+            &[
+                Value::Uuid(uuid),
+                Value::Text("tail".to_string()),
+                Value::Int64(9),
+                Value::Null,
+            ]
+        )
+        .expect("prefix"));
     }
 
     #[test]

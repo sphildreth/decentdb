@@ -213,7 +213,7 @@ fn non_nullable_int64_btree_indexes_use_typed_runtime_keys() {
         panic!("expected BTREE runtime index");
     };
 
-    let RuntimeBtreeKeys::UniqueInt64(entries) = keys else {
+    let RuntimeBtreeKeys::UniqueInt64(entries, _) = keys else {
         panic!("expected typed INT64 runtime keys");
     };
     assert_eq!(entries.get(&7), Some(&7));
@@ -5511,6 +5511,7 @@ fn simple_numeric_aggregate_without_group_streams_rows() {
         .expect("metrics rows")
         .resident_data()
         .rows
+        .as_ref()
         .clone();
     runtime
         .replace_table_row_source("metrics", paged_row_source(rows))

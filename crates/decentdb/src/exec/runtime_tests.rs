@@ -6,12 +6,14 @@ mod tests {
         append_table_payload, decode_table_payload, encode_table_payload,
         generated_columns_are_stored, map_get_ci, map_get_ci_mut, splice_deleted_rows_payload,
         splice_deleted_rows_payload_in_place, splice_updated_rows_payload,
-        splice_updated_rows_payload_in_place, EngineRuntime, Int64IdentityHasher, Int64Map,
+        splice_updated_rows_payload_in_place, split_table_payload_row_len,
+        tombstone_deleted_rows_payload_in_place, EngineRuntime, Int64IdentityHasher, Int64Map,
         PendingIndexInsert, PersistedTableState, RuntimeBtreeKey, RuntimeBtreeKeys,
-        RuntimeRowIdSet, StoredRow, TableData,
+        RuntimeRowIdSet, StoredRow, TableData, TABLE_PAYLOAD_ROW_TOMBSTONE_FLAG,
     };
     use std::collections::{BTreeMap, BTreeSet};
     use std::hash::Hasher;
+    use std::sync::Arc;
 
     use crate::catalog::{
         ColumnSchema, ColumnType, IndexColumn, IndexKind, IndexSchema, TableSchema,
@@ -55,7 +57,7 @@ mod tests {
         // UniqueEncoded
         let mut map = BTreeMap::<Vec<u8>, i64>::new();
         map.insert(vec![1, 2, 3], 7);
-        let keys = RuntimeBtreeKeys::UniqueEncoded(map);
+        let keys = RuntimeBtreeKeys::UniqueEncoded(Arc::new(map), BTreeSet::new());
         let key = RuntimeBtreeKey::Encoded(vec![1, 2, 3]);
         match keys.row_id_set_for_key(&key) {
             RuntimeRowIdSet::Single(v) => assert_eq!(v, 7),
@@ -65,7 +67,7 @@ mod tests {
         assert!(keys.contains_any(&key));
 
         // insert duplicate into unique should error
-        let mut keys2 = RuntimeBtreeKeys::UniqueEncoded(BTreeMap::new());
+        let mut keys2 = RuntimeBtreeKeys::UniqueEncoded(Arc::new(BTreeMap::new()), BTreeSet::new());
         assert!(keys2
             .insert_row_id(RuntimeBtreeKey::Encoded(vec![9, 9]), 1)
             .is_ok());
@@ -76,7 +78,7 @@ mod tests {
         // NonUniqueEncoded
         let mut ne = BTreeMap::<Vec<u8>, Vec<i64>>::new();
         ne.insert(vec![4], vec![1, 2]);
-        let keys3 = RuntimeBtreeKeys::NonUniqueEncoded(ne);
+        let keys3 = RuntimeBtreeKeys::NonUniqueEncoded(Arc::new(ne), BTreeSet::new());
         let key4 = RuntimeBtreeKey::Encoded(vec![4]);
         match keys3.row_id_set_for_key(&key4) {
             RuntimeRowIdSet::Many(s) => assert_eq!(s, &[1, 2]),
@@ -87,19 +89,19 @@ mod tests {
         // UniqueInt64
         let mut ui: Int64Map<i64> = Int64Map::default();
         ui.insert(5, 33);
-        let keys4 = RuntimeBtreeKeys::UniqueInt64(ui);
+        let keys4 = RuntimeBtreeKeys::UniqueInt64(Arc::new(ui), BTreeSet::new());
         let keyi = RuntimeBtreeKey::Int64(5);
         assert_eq!(keys4.row_ids_for_key(&keyi), vec![33]);
 
         // NonUniqueInt64
         let mut nui: Int64Map<Vec<i64>> = Int64Map::default();
         nui.insert(7, vec![100, 101]);
-        let keys5 = RuntimeBtreeKeys::NonUniqueInt64(nui);
+        let keys5 = RuntimeBtreeKeys::NonUniqueInt64(Arc::new(nui), BTreeSet::new());
         let keyi2 = RuntimeBtreeKey::Int64(7);
         assert_eq!(keys5.row_ids_for_key(&keyi2), vec![100, 101]);
 
         // mismatch type errors
-        let mut keys6 = RuntimeBtreeKeys::UniqueEncoded(BTreeMap::new());
+        let mut keys6 = RuntimeBtreeKeys::UniqueEncoded(Arc::new(BTreeMap::new()), BTreeSet::new());
         assert!(keys6.insert_row_id(RuntimeBtreeKey::Int64(10), 10).is_err());
         assert!(keys6
             .remove_row_id(&RuntimeBtreeKey::Int64(10), 10)
@@ -114,14 +116,14 @@ mod tests {
             crate::record::key::encode_index_key(&Value::Int64(123)).unwrap(),
             55,
         );
-        let ke = RuntimeBtreeKeys::UniqueEncoded(map);
+        let ke = RuntimeBtreeKeys::UniqueEncoded(Arc::new(map), BTreeSet::new());
         let v = Value::Int64(123);
         assert_eq!(ke.row_ids_for_value(&v).unwrap(), vec![55]);
 
         // UniqueInt64 representation
         let mut map2: Int64Map<i64> = Int64Map::default();
         map2.insert(123, 66);
-        let keysii = RuntimeBtreeKeys::UniqueInt64(map2);
+        let keysii = RuntimeBtreeKeys::UniqueInt64(Arc::new(map2), BTreeSet::new());
         assert_eq!(keysii.row_ids_for_value(&v).unwrap(), vec![66]);
     }
 
@@ -229,7 +231,7 @@ mod tests {
     fn runtime_btree_remove_mismatch_errors() {
         let mut ui: Int64Map<i64> = Int64Map::default();
         ui.insert(10, 99);
-        let mut keys = RuntimeBtreeKeys::UniqueInt64(ui);
+        let mut keys = RuntimeBtreeKeys::UniqueInt64(Arc::new(ui), BTreeSet::new());
         assert!(keys.remove_row_id(&RuntimeBtreeKey::Int64(10), 98).is_err());
     }
 
@@ -238,14 +240,14 @@ mod tests {
         // UniqueEncoded
         let mut map = BTreeMap::<Vec<u8>, i64>::new();
         map.insert(vec![1], 1);
-        let keys = RuntimeBtreeKeys::UniqueEncoded(map);
+        let keys = RuntimeBtreeKeys::UniqueEncoded(Arc::new(map), BTreeSet::new());
         assert_eq!(keys.total_row_id_count(), 1);
         assert_eq!(keys.distinct_key_count(), 1);
 
         // NonUniqueEncoded
         let mut ne = BTreeMap::<Vec<u8>, Vec<i64>>::new();
         ne.insert(vec![2], vec![1, 2, 3]);
-        let kn = RuntimeBtreeKeys::NonUniqueEncoded(ne);
+        let kn = RuntimeBtreeKeys::NonUniqueEncoded(Arc::new(ne), BTreeSet::new());
         assert_eq!(kn.total_row_id_count(), 3);
         assert_eq!(kn.distinct_key_count(), 1);
     }
@@ -513,11 +515,11 @@ mod tests {
     #[test]
     fn encode_decode_table_payload_roundtrip() {
         let mut td = TableData::default();
-        td.rows.push(StoredRow {
+        td.push_row(StoredRow {
             row_id: 1,
             values: vec![Value::Int64(10), Value::Text("x".to_string())],
         });
-        td.rows.push(StoredRow {
+        td.push_row(StoredRow {
             row_id: 2,
             values: vec![Value::Null],
         });
@@ -532,12 +534,12 @@ mod tests {
     #[test]
     fn append_table_payload_appends_new_rows() {
         let mut base = TableData::default();
-        base.rows.push(StoredRow {
+        base.push_row(StoredRow {
             row_id: 1,
             values: vec![Value::Int64(1)],
         });
         let mut extended = base.clone();
-        extended.rows.push(StoredRow {
+        extended.push_row(StoredRow {
             row_id: 2,
             values: vec![Value::Int64(2)],
         });
@@ -551,11 +553,11 @@ mod tests {
     #[test]
     fn splice_updated_rows_payload_preserves_padded_row_slot() {
         let mut before = TableData::default();
-        before.rows.push(StoredRow {
+        before.push_row(StoredRow {
             row_id: 1,
             values: vec![Value::Text("a".to_string()), Value::Int64(10)],
         });
-        before.rows.push(StoredRow {
+        before.push_row(StoredRow {
             row_id: 2,
             values: vec![Value::Text("keep".to_string()), Value::Int64(20)],
         });
@@ -602,11 +604,11 @@ mod tests {
     #[test]
     fn splice_updated_rows_payload_in_place_preserves_padded_row_slot() {
         let mut before = TableData::default();
-        before.rows.push(StoredRow {
+        before.push_row(StoredRow {
             row_id: 1,
             values: vec![Value::Text("a".to_string()), Value::Int64(10)],
         });
-        before.rows.push(StoredRow {
+        before.push_row(StoredRow {
             row_id: 2,
             values: vec![Value::Text("keep".to_string()), Value::Int64(20)],
         });
@@ -635,7 +637,7 @@ mod tests {
     #[test]
     fn splice_updated_rows_payload_in_place_returns_none_when_row_grows_past_slot() {
         let mut before = TableData::default();
-        before.rows.push(StoredRow {
+        before.push_row(StoredRow {
             row_id: 1,
             values: vec![Value::Text("a".to_string()), Value::Int64(10)],
         });
@@ -658,7 +660,7 @@ mod tests {
     #[test]
     fn splice_updated_rows_payload_falls_back_on_bad_header() {
         let mut data = TableData::default();
-        data.rows.push(StoredRow {
+        data.push_row(StoredRow {
             row_id: 1,
             values: vec![Value::Int64(1)],
         });
@@ -673,7 +675,7 @@ mod tests {
     fn splice_deleted_rows_payload_removes_multiple_rows() {
         let mut before = TableData::default();
         for row_id in 1_i64..=5_i64 {
-            before.rows.push(StoredRow {
+            before.push_row(StoredRow {
                 row_id,
                 values: vec![Value::Int64(row_id)],
             });
@@ -723,7 +725,7 @@ mod tests {
     fn splice_deleted_rows_payload_in_place_removes_multiple_rows() {
         let mut before = TableData::default();
         for row_id in 1_i64..=5_i64 {
-            before.rows.push(StoredRow {
+            before.push_row(StoredRow {
                 row_id,
                 values: vec![Value::Int64(row_id)],
             });
@@ -817,11 +819,11 @@ mod tests {
     #[test]
     fn splice_deleted_rows_payload_falls_back_on_missing_deleted_row() {
         let mut before = TableData::default();
-        before.rows.push(StoredRow {
+        before.push_row(StoredRow {
             row_id: 1,
             values: vec![Value::Int64(1)],
         });
-        before.rows.push(StoredRow {
+        before.push_row(StoredRow {
             row_id: 2,
             values: vec![Value::Int64(2)],
         });
@@ -841,6 +843,103 @@ mod tests {
         assert_eq!(result.first_dirty_byte, 0);
         assert_eq!(decoded.rows.len(), 1);
         assert_eq!(decoded.rows[0].row_id, 1);
+    }
+
+    #[test]
+    fn tombstone_payload_in_place_marks_rows_and_preserves_length() {
+        let mut before = TableData::default();
+        for row_id in 1_i64..=5_i64 {
+            before.push_row(StoredRow {
+                row_id,
+                values: vec![Value::Int64(row_id), Value::Text(format!("v{row_id}"))],
+            });
+        }
+        let mut payload = encode_table_payload(&before).expect("encode payload");
+        let original_len = payload.len();
+
+        let mut deleted = BTreeSet::new();
+        deleted.insert(2);
+        deleted.insert(4);
+
+        let dirty = tombstone_deleted_rows_payload_in_place(&mut payload, &deleted)
+            .expect("tombstone")
+            .expect("applied");
+        // Length-field-only patches; payload length is unchanged (no shifting).
+        assert_eq!(payload.len(), original_len);
+        assert_eq!(dirty.len(), 2);
+        for range in &dirty {
+            assert_eq!(range.end - range.start, 4);
+        }
+
+        // Decoding skips the tombstoned slots and yields only the live rows.
+        let decoded = decode_table_payload(&payload).expect("decode tombstoned payload");
+        assert_eq!(
+            decoded.rows.iter().map(|r| r.row_id).collect::<Vec<_>>(),
+            vec![1, 3, 5]
+        );
+    }
+
+    #[test]
+    fn tombstone_payload_in_place_returns_none_for_missing_row() {
+        let before = TableData::from_rows(vec![
+            StoredRow {
+                row_id: 1,
+                values: vec![Value::Int64(1)],
+            },
+            StoredRow {
+                row_id: 2,
+                values: vec![Value::Int64(2)],
+            },
+        ]);
+        let mut payload = encode_table_payload(&before).expect("encode payload");
+
+        let mut deleted = BTreeSet::new();
+        deleted.insert(2);
+        deleted.insert(99); // not present
+        assert!(
+            tombstone_deleted_rows_payload_in_place(&mut payload, &deleted)
+                .expect("tombstone")
+                .is_none(),
+            "missing row id must force a fallback"
+        );
+    }
+
+    #[test]
+    fn tombstone_then_decode_round_trips_through_all_readers() {
+        // A doubly-tombstoned payload must read consistently everywhere; this
+        // also guards the fail-loud length masking in the row-stream readers.
+        let before = TableData::from_rows(
+            (1_i64..=6)
+                .map(|row_id| StoredRow {
+                    row_id,
+                    values: vec![Value::Int64(row_id)],
+                })
+                .collect(),
+        );
+        let mut payload = encode_table_payload(&before).expect("encode payload");
+        let mut deleted = BTreeSet::new();
+        deleted.insert(1);
+        deleted.insert(6);
+        tombstone_deleted_rows_payload_in_place(&mut payload, &deleted)
+            .expect("tombstone")
+            .expect("applied");
+
+        let decoded = decode_table_payload(&payload).expect("decode");
+        assert_eq!(
+            decoded.rows.iter().map(|r| r.row_id).collect::<Vec<_>>(),
+            vec![2, 3, 4, 5]
+        );
+    }
+
+    #[test]
+    fn split_table_payload_row_len_round_trips_flag() {
+        let (is_tombstone, len) = split_table_payload_row_len(123);
+        assert!(!is_tombstone);
+        assert_eq!(len, 123);
+        let (is_tombstone, len) =
+            split_table_payload_row_len(123 | TABLE_PAYLOAD_ROW_TOMBSTONE_FLAG);
+        assert!(is_tombstone);
+        assert_eq!(len, 123);
     }
 
     #[test]

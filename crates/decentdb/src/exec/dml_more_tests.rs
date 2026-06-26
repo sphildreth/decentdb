@@ -161,13 +161,7 @@ mod tests {
             .execute_prepared_simple_delete(&prepared, &[], 1024)
             .expect("execute succeeded");
         assert_eq!(res.affected_rows(), 1);
-        assert!(runtime
-            .tables
-            .get("t")
-            .unwrap()
-            .resident_data()
-            .rows
-            .is_empty());
+        assert!(runtime.tables.get("t").unwrap().resident_data().row_count() == 0);
         assert!(runtime
             .paged_mutations
             .get("t")

@@ -26,7 +26,7 @@ use crate::exec::dml::{
     PreparedSimpleDelete, PreparedSimpleInsert, PreparedSimpleUpdate, PreparedSimpleValueSource,
 };
 use crate::exec::{
-    read_persisted_table_row_count, read_table_payload_row_count_from_bytes,
+    read_persisted_table_row_count, read_table_payload_live_row_count_from_bytes,
     row_satisfies_expression, statement_is_read_only, BulkLoadOptions, EngineRuntime, QueryResult,
     QueryRow, ResolvedSimpleJoinProjection, ResolvedSimpleOrderedRowIdProjectionRequest,
     ResolvedSimpleRowIdJoinProjectionRequest, ResolvedSimpleRowIdProjectionRequest,
@@ -4856,6 +4856,7 @@ impl Db {
         let active_readers = self.inner.wal.active_reader_count()?;
         let retained_snapshot = self.inner.wal.retained_snapshot_lsn().is_some();
         let before_versions = self.inner.wal.version_count()?;
+        self.prepare_resident_payload_offset_caches_for_wal_checkpoint()?;
         self.checkpoint_wal()?;
         let after_versions = self.inner.wal.version_count()?;
         let checkpointed = before_versions.saturating_sub(after_versions);
@@ -4871,6 +4872,17 @@ impl Db {
                 Value::Int64(i64::try_from(checkpointed).unwrap_or(i64::MAX)),
             ])],
         ))
+    }
+
+    fn prepare_resident_payload_offset_caches_for_wal_checkpoint(&self) -> Result<()> {
+        let mut runtime = self
+            .inner
+            .engine
+            .write()
+            .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+        let store = PagerReadStore::new(self)?;
+        runtime.prepare_resident_payload_offset_caches(&store, self.config())?;
+        Ok(())
     }
 
     fn integrity_check_results(&self) -> Result<QueryResult> {
@@ -5585,6 +5597,19 @@ impl Db {
                         rows.reserve(row_ids.len());
                         for row_id in row_ids {
                             if let Some(stored_row) = row_source.row_by_id(*row_id)? {
+                                rows.push(QueryRow::new(
+                                    plan.projection_indexes
+                                        .iter()
+                                        .map(|index| stored_row.values()[*index].clone())
+                                        .collect(),
+                                ));
+                            }
+                        }
+                    }
+                    RuntimeRowIdSet::Owned(row_ids) => {
+                        rows.reserve(row_ids.len());
+                        for row_id in row_ids {
+                            if let Some(stored_row) = row_source.row_by_id(row_id)? {
                                 rows.push(QueryRow::new(
                                     plan.projection_indexes
                                         .iter()
@@ -7186,7 +7211,7 @@ impl Db {
             .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
         {
             let store = PagerReadStore::new(self)?;
-            if !runtime.has_checkpoint_compaction_candidates(&store)? {
+            if !runtime.has_checkpoint_compaction_candidates(&store, self.config())? {
                 return Ok(());
             }
         }
@@ -8634,7 +8659,7 @@ impl Db {
             PagerReadStore::new(self)?
         };
         let payload = read_overflow(&store, state.pointer)?;
-        read_table_payload_row_count_from_bytes(&payload)
+        read_table_payload_live_row_count_from_bytes(&payload)
     }
 
     fn runtime_for_prepare(&self) -> Result<EngineRuntime> {

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Barrier};
@@ -126,7 +126,7 @@ fn runtime_has_stale_indexes_detects_only_missing_or_nonfresh_indexes() {
     runtime.indexes = Arc::new(BTreeMap::from([(
         "movies_id_idx".to_string(),
         Arc::new(RuntimeIndex::Btree {
-            keys: RuntimeBtreeKeys::UniqueEncoded(BTreeMap::new()),
+            keys: RuntimeBtreeKeys::UniqueEncoded(Arc::new(BTreeMap::new()), BTreeSet::new()),
             covering: None,
         }),
     )]));
@@ -3243,7 +3243,7 @@ fn checkpoint_compacts_paged_table_chunks_and_preserves_persistent_pk_index() {
     );
     assert!(
         runtime_before
-            .has_checkpoint_compaction_candidates(&page_store)
+            .has_checkpoint_compaction_candidates(&page_store, db.config())
             .expect("inspect checkpoint candidates before checkpoint"),
         "uncompressed paged chunks should be checkpoint compaction candidates"
     );
@@ -3278,7 +3278,7 @@ fn checkpoint_compacts_paged_table_chunks_and_preserves_persistent_pk_index() {
     );
     assert!(
         !runtime_after
-            .has_checkpoint_compaction_candidates(&page_store)
+            .has_checkpoint_compaction_candidates(&page_store, db.config())
             .expect("inspect checkpoint candidates after checkpoint"),
         "compacted paged chunks should not force another pre-checkpoint compaction pass"
     );
@@ -18369,5 +18369,152 @@ fn plan_cache_doctor_reports_disabled_cache() {
             Some(Value::Text(id)) if id == "plan-cache.disabled"
         )),
         "disabled plan cache should be visible through sys.doctor_findings"
+    );
+}
+
+#[test]
+fn resident_delete_tombstones_persist_and_survive_reopen() {
+    // ADR 0200: deletes on a resident table persist as in-place payload
+    // tombstones. Verify same-transaction visibility, post-commit visibility,
+    // durability across reopen, and that survivors/aggregates stay correct.
+    let tempdir = TempDir::new().expect("tempdir");
+    let path = tempdir.path().join("resident-tombstones.ddb");
+    let resident_config = || DbConfig {
+        paged_row_storage: false,
+        ..DbConfig::default()
+    };
+
+    {
+        let db = Db::open_or_create(&path, resident_config()).expect("create db");
+        db.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, label TEXT NOT NULL, n INTEGER NOT NULL)",
+        )
+        .expect("create table");
+        db.execute("CREATE INDEX ix_t_n ON t(n)")
+            .expect("create index");
+        for id in 1_i64..=200 {
+            db.execute(&format!(
+                "INSERT INTO t (id, label, n) VALUES ({id}, 'row-{id}', {})",
+                id % 10
+            ))
+            .expect("insert");
+        }
+        db.checkpoint().expect("checkpoint");
+
+        // Delete a scattered set inside one explicit transaction; deletions must
+        // be visible to later statements in the same transaction.
+        db.begin_transaction().expect("begin");
+        for id in [3_i64, 17, 42, 99, 150, 200] {
+            db.execute(&format!("DELETE FROM t WHERE id = {id}"))
+                .expect("delete");
+            let still = db
+                .execute(&format!("SELECT COUNT(*) FROM t WHERE id = {id}"))
+                .expect("select deleted");
+            assert_eq!(
+                scalar_i64(&still),
+                0,
+                "row {id} must be gone mid-transaction"
+            );
+        }
+        let count_in_txn = db.execute("SELECT COUNT(*) FROM t").expect("count in txn");
+        assert_eq!(scalar_i64(&count_in_txn), 194);
+        db.commit_transaction().expect("commit");
+
+        let count = db.execute("SELECT COUNT(*) FROM t").expect("count");
+        assert_eq!(scalar_i64(&count), 194);
+        // Index-driven lookup must not resurface a deleted row.
+        let by_index = db
+            .execute("SELECT COUNT(*) FROM t WHERE n = 0")
+            .expect("count by index");
+        // ids divisible by 10 -> 10,20,...,200 == 20 rows; deleted ids 150 and
+        // 200 both have n=0, so 20 - 2 = 18 remain.
+        assert_eq!(scalar_i64(&by_index), 18);
+    }
+
+    // Reopen: tombstoned rows must remain absent and survivors intact.
+    {
+        let db = Db::open_or_create(&path, resident_config()).expect("reopen db");
+        let count = db
+            .execute("SELECT COUNT(*) FROM t")
+            .expect("count after reopen");
+        assert_eq!(scalar_i64(&count), 194);
+        for id in [3_i64, 17, 42, 99, 150, 200] {
+            let r = db
+                .execute(&format!("SELECT COUNT(*) FROM t WHERE id = {id}"))
+                .expect("select");
+            assert_eq!(
+                scalar_i64(&r),
+                0,
+                "deleted row {id} reappeared after reopen"
+            );
+        }
+        let survivor = db
+            .execute("SELECT label FROM t WHERE id = 4")
+            .expect("survivor");
+        assert_eq!(scalar_text(&survivor), "row-4");
+
+        // A second round of deletes (now over an already-tombstoned payload)
+        // must also persist correctly and reopen cleanly.
+        db.execute("DELETE FROM t WHERE id < 50")
+            .expect("bulk delete");
+        let count = db
+            .execute("SELECT COUNT(*) FROM t")
+            .expect("count after bulk");
+        // 194 survivors minus ids in 1..=49 still present. Deleted-already in
+        // 1..50: 3,17,42 (3 rows). So 49 - 3 = 46 removed now.
+        assert_eq!(scalar_i64(&count), 148);
+        db.checkpoint().expect("checkpoint after bulk delete");
+    }
+
+    {
+        let db = Db::open_or_create(&path, resident_config()).expect("reopen db 2");
+        let count = db
+            .execute("SELECT COUNT(*) FROM t")
+            .expect("count after reopen 2");
+        assert_eq!(scalar_i64(&count), 148);
+        let gone = db
+            .execute("SELECT COUNT(*) FROM t WHERE id < 50")
+            .expect("count low ids");
+        assert_eq!(scalar_i64(&gone), 0);
+    }
+}
+
+#[test]
+fn resident_delete_rollback_restores_rows() {
+    // A rolled-back transaction must not tombstone anything.
+    let tempdir = TempDir::new().expect("tempdir");
+    let path = tempdir.path().join("resident-tombstone-rollback.ddb");
+    let resident_config = || DbConfig {
+        paged_row_storage: false,
+        ..DbConfig::default()
+    };
+    let db = Db::open_or_create(&path, resident_config()).expect("create db");
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")
+        .expect("create table");
+    for id in 1_i64..=50 {
+        db.execute(&format!("INSERT INTO t (id, v) VALUES ({id}, 'v{id}')"))
+            .expect("insert");
+    }
+    db.checkpoint().expect("checkpoint");
+
+    db.begin_transaction().expect("begin");
+    db.execute("DELETE FROM t WHERE id <= 25").expect("delete");
+    assert_eq!(
+        scalar_i64(&db.execute("SELECT COUNT(*) FROM t").expect("count")),
+        25
+    );
+    db.rollback_transaction().expect("rollback");
+
+    assert_eq!(
+        scalar_i64(&db.execute("SELECT COUNT(*) FROM t").expect("count")),
+        50,
+        "rollback must restore all rows"
+    );
+    drop(db);
+    let db = Db::open_or_create(&path, resident_config()).expect("reopen");
+    assert_eq!(
+        scalar_i64(&db.execute("SELECT COUNT(*) FROM t").expect("count")),
+        50,
+        "rolled-back delete must not persist"
     );
 }

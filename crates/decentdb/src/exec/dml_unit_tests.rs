@@ -2,7 +2,7 @@
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
 
     use super::super::*;
@@ -1236,7 +1236,7 @@ mod tests {
         runtime.indexes_mut().insert(
             "parent_ab_unique".to_string(),
             Arc::new(RuntimeIndex::Btree {
-                keys: RuntimeBtreeKeys::UniqueEncoded(BTreeMap::new()),
+                keys: RuntimeBtreeKeys::UniqueEncoded(Arc::new(BTreeMap::new()), BTreeSet::new()),
                 covering: None,
             }),
         );
@@ -1409,7 +1409,10 @@ mod tests {
         runtime.indexes_mut().insert(
             "parent_ab_unique".to_string(),
             Arc::new(RuntimeIndex::Btree {
-                keys: RuntimeBtreeKeys::UniqueEncoded(parent_index_entries),
+                keys: RuntimeBtreeKeys::UniqueEncoded(
+                    Arc::new(parent_index_entries),
+                    BTreeSet::new(),
+                ),
                 covering: None,
             }),
         );

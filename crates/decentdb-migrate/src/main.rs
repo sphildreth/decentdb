@@ -117,6 +117,10 @@ fn main() -> Result<()> {
             println!("Detected DecentDB Version 12 format.");
             migrate_v12_file(&source_path, &dest_path)?;
         }
+        13 => {
+            println!("Detected DecentDB Version 13 format.");
+            migrate_v13_file(&source_path, &dest_path)?;
+        }
         _ => {
             return Err(anyhow!("Migration for format version {} is not supported by this version of decentdb-migrate.", header.format_version));
         }
@@ -181,6 +185,15 @@ fn migrate_v11_file(source: &Path, dest: &Path) -> Result<()> {
 
 fn migrate_v12_file(source: &Path, dest: &Path) -> Result<()> {
     copy_file_and_patch_format_version(source, dest, 12)
+}
+
+fn migrate_v13_file(source: &Path, dest: &Path) -> Result<()> {
+    // Format 13 -> 14 introduced resident-table delete tombstones (ADR 0200).
+    // Version-13 payloads never contain tombstone slots, so the version-14
+    // engine reads them unchanged; the migration is a header-version patch plus
+    // WAL-sidecar carry-forward, matching the version-10/11 precedent.
+    copy_file_and_patch_format_version(source, dest, 13)?;
+    copy_wal_sidecar_if_present(source, dest)
 }
 
 fn copy_file_and_patch_format_version(
@@ -717,8 +730,8 @@ const fn build_crc32c_table() -> [u32; 256] {
 #[cfg(test)]
 mod tests {
     use super::{
-        migrate_v10_file, migrate_v11_file, migrate_v12_file, migrate_v8_file, migrate_v9_file,
-        patch_header_format_version, wal_path_for_db,
+        migrate_v10_file, migrate_v11_file, migrate_v12_file, migrate_v13_file, migrate_v8_file,
+        migrate_v9_file, patch_header_format_version, wal_path_for_db,
     };
     use decentdb::{Db, DbConfig, DB_FORMAT_VERSION};
     use std::path::Path;
@@ -972,6 +985,48 @@ mod tests {
         assert_eq!(
             result.rows()[0].values()[0],
             decentdb::Value::Text("alpha".to_string())
+        );
+    }
+
+    #[test]
+    fn migrate_v13_copy_upgrades_header_version() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let source = tempdir.path().join("source-v13.ddb");
+        let dest = tempdir.path().join("dest-v13.ddb");
+
+        let db = Db::open_or_create(&source, DbConfig::default()).expect("create source");
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+            .expect("create table");
+        db.execute("INSERT INTO t VALUES (1, 'alpha')")
+            .expect("insert row");
+        db.execute("INSERT INTO t VALUES (2, 'beta')")
+            .expect("insert row");
+        db.execute("DELETE FROM t WHERE id = 2")
+            .expect("delete row");
+        db.checkpoint().expect("checkpoint");
+        drop(db);
+
+        rewrite_source_as_legacy_format(&source, 13);
+
+        migrate_v13_file(&source, &dest).expect("migrate v13 file");
+        let header = Db::read_header_info(&dest).expect("read migrated header");
+        assert_eq!(header.format_version, DB_FORMAT_VERSION);
+        assert_database_id_nonzero(&dest);
+
+        let reopened = Db::open_or_create(&dest, DbConfig::default()).expect("open migrated db");
+        let result = reopened
+            .execute("SELECT val FROM t WHERE id = 1")
+            .expect("query migrated row");
+        assert_eq!(
+            result.rows()[0].values()[0],
+            decentdb::Value::Text("alpha".to_string())
+        );
+        let deleted = reopened
+            .execute("SELECT val FROM t WHERE id = 2")
+            .expect("query deleted row");
+        assert!(
+            deleted.rows().is_empty(),
+            "deleted row must remain absent after migration"
         );
     }
 

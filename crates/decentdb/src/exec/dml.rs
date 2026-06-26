@@ -5,8 +5,8 @@ use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::sync::Arc;
 
 use crate::catalog::{
-    identifiers_equal, ColumnType, ForeignKeyAction, ForeignKeyConstraint, IndexKind, TableSchema,
-    TriggerEvent,
+    identifiers_equal, ColumnType, ForeignKeyAction, ForeignKeyConstraint, IndexKind, IndexSchema,
+    TableSchema, TriggerEvent,
 };
 use crate::error::{DbError, Result};
 use crate::record::key::encode_index_key;
@@ -164,6 +164,8 @@ pub(crate) struct PreparedSimpleDelete {
     pub(crate) indexes: Vec<crate::catalog::IndexSchema>,
     pub(crate) lookup: PreparedDeleteLookup,
     pub(crate) restrict_children: Vec<PreparedSimpleDeleteRestrictChild>,
+    delete_children_by_table: DeleteChildrenByTable,
+    table_indexes_by_table: TableIndexesByTable,
     delete_children: Vec<PreparedDeleteCascadeChild>,
     dependency_table_names: Vec<String>,
     pub(crate) compiled_index_state_epoch: u64,
@@ -243,6 +245,9 @@ struct PreparedDeleteCascadeChild {
     child_index_name: Option<String>,
     child_index_prefix_len: Option<usize>,
 }
+
+type DeleteChildrenByTable = BTreeMap<String, Vec<PreparedDeleteCascadeChild>>;
+type TableIndexesByTable = BTreeMap<String, Vec<IndexSchema>>;
 
 fn push_unique_child_index_hydration_target<'a>(
     targets: &mut Vec<(&'a str, &'a str)>,
@@ -1274,6 +1279,8 @@ impl EngineRuntime {
         let Some(delete_children) = prepare_simple_delete_cascade_children(self, &table)? else {
             return Ok(None);
         };
+        let (delete_children_by_table, table_indexes_by_table) =
+            prepare_delete_children_and_indexes(self, &table)?;
 
         let Some(filter) = statement.filter.as_ref() else {
             return Ok(None);
@@ -1355,6 +1362,8 @@ impl EngineRuntime {
             indexes,
             lookup,
             restrict_children,
+            delete_children_by_table,
+            table_indexes_by_table,
             delete_children,
             dependency_table_names,
             compiled_index_state_epoch: self.index_state_epoch,
@@ -1425,6 +1434,18 @@ impl EngineRuntime {
                 row_id_set_to_vec(keys.row_ids_for_value_set(&value)?)
             }
         };
+        let matching_row_ids = match self.visible_table_row_source(&prepared.table_name) {
+            Some(row_source) => {
+                let mut live_row_ids = Vec::with_capacity(matching_row_ids.len());
+                for row_id in matching_row_ids {
+                    if row_source.row_by_id(row_id)?.is_some() {
+                        live_row_ids.push(row_id);
+                    }
+                }
+                live_row_ids
+            }
+            None => Vec::new(),
+        };
         if matching_row_ids.is_empty() {
             return Ok(QueryResult::with_affected_rows(0));
         }
@@ -1448,13 +1469,17 @@ impl EngineRuntime {
                     .is_some_and(|prefix_len| index_schema.columns.len() > prefix_len);
                 for &row_id in &matching_row_ids {
                     let has_referencing_child = if use_prefix_scan {
-                        !keys
-                            .row_ids_for_encoded_key_prefix(&[Value::Int64(row_id)])?
-                            .is_empty()
+                        row_ids_have_live_row(
+                            self,
+                            &child.child_table_name,
+                            keys.row_ids_for_encoded_key_prefix(&[Value::Int64(row_id)])?,
+                        )?
                     } else {
-                        !keys
-                            .row_ids_for_value_set(&Value::Int64(row_id))?
-                            .is_empty()
+                        row_id_set_has_live_row(
+                            self,
+                            &child.child_table_name,
+                            keys.row_ids_for_value_set(&Value::Int64(row_id))?,
+                        )?
                     };
                     if has_referencing_child {
                         return Err(DbError::constraint(format!(
@@ -1467,8 +1492,38 @@ impl EngineRuntime {
 
             let affected_rows = matching_row_ids.len();
             let deleted_row_ids = matching_row_ids.iter().copied().collect::<BTreeSet<_>>();
+            let removed_rows_for_indexes = if prepared.indexes.is_empty() {
+                Vec::new()
+            } else if matches!(
+                self.table_row_source(&prepared.table_name),
+                Some(TableRowSource::Resident(_))
+            ) {
+                let row_source = self.table_row_source(&prepared.table_name).ok_or_else(|| {
+                    DbError::internal(format!("table data for {} is missing", prepared.table_name))
+                })?;
+                let mut rows = Vec::with_capacity(matching_row_ids.len());
+                for &row_id in &matching_row_ids {
+                    let row = row_source.row_by_id(row_id)?.ok_or_else(|| {
+                        DbError::internal(format!("row {row_id} vanished during DELETE"))
+                    })?;
+                    rows.push(StoredRow {
+                        row_id,
+                        values: row.values().to_vec(),
+                    });
+                }
+                rows
+            } else {
+                Vec::new()
+            };
+            let mut stale_indexes = Vec::new();
             match self.table_row_source(&prepared.table_name) {
                 Some(TableRowSource::Resident(_)) => {
+                    stale_indexes.extend(incremental_delete_indexes(
+                        self,
+                        &prepared.table,
+                        &prepared.indexes,
+                        &removed_rows_for_indexes,
+                    )?);
                     let table_data =
                         self.table_data_mut(&prepared.table_name).ok_or_else(|| {
                             DbError::internal(format!(
@@ -1476,7 +1531,7 @@ impl EngineRuntime {
                                 prepared.table_name
                             ))
                         })?;
-                    table_data.retain_rows(|row| !deleted_row_ids.contains(&row.row_id));
+                    table_data.mark_rows_deleted(deleted_row_ids.iter());
                     for &row_id in &matching_row_ids {
                         self.mark_table_row_deleted(&prepared.table_name, row_id);
                     }
@@ -1491,6 +1546,7 @@ impl EngineRuntime {
                         TableRowSource::Paged(Arc::new(updated_manifest)),
                     )?;
                     self.mark_table_dirty(&prepared.table_name);
+                    stale_indexes.extend(prepared.indexes.iter().map(|index| index.name.clone()));
                 }
                 None => {
                     return Err(DbError::internal(format!(
@@ -1499,12 +1555,9 @@ impl EngineRuntime {
                     )));
                 }
             }
-            let stale_indexes = prepared
-                .indexes
-                .iter()
-                .map(|index| index.name.clone())
-                .collect::<Vec<_>>();
-            self.mark_named_indexes_stale(&stale_indexes);
+            if !stale_indexes.is_empty() {
+                self.mark_named_indexes_stale(&stale_indexes);
+            }
             self.execute_after_triggers(
                 &prepared.table_name,
                 TriggerEvent::Delete,
@@ -1552,43 +1605,18 @@ impl EngineRuntime {
                 &prepared.table,
                 &removed_rows,
                 &prepared.delete_children,
+                Some(&prepared.delete_children_by_table),
+                Some(&prepared.table_indexes_by_table),
                 params,
                 _page_size,
             )?;
         }
 
         if row_source_was_resident {
-            {
-                let mut row_indices = {
-                    let table_data = self.table_data(&prepared.table_name).ok_or_else(|| {
-                        DbError::internal(format!(
-                            "table data for {} is missing",
-                            prepared.table_name
-                        ))
-                    })?;
-                    let mut indices = Vec::with_capacity(matching_row_ids.len());
-                    for &row_id in &matching_row_ids {
-                        let row_index = table_data.row_index_by_id(row_id).ok_or_else(|| {
-                            DbError::internal(format!("row {row_id} vanished during DELETE"))
-                        })?;
-                        indices.push(row_index);
-                    }
-                    indices
-                };
-                row_indices.sort_unstable_by(|left, right| right.cmp(left));
-                {
-                    let table_data =
-                        self.table_data_mut(&prepared.table_name).ok_or_else(|| {
-                            DbError::internal(format!(
-                                "table data for {} is missing",
-                                prepared.table_name
-                            ))
-                        })?;
-                    for &row_index in &row_indices {
-                        table_data.remove_row(row_index);
-                    }
-                }
-            }
+            let table_data = self.table_data_mut(&prepared.table_name).ok_or_else(|| {
+                DbError::internal(format!("table data for {} is missing", prepared.table_name))
+            })?;
+            table_data.mark_rows_deleted(matching_row_ids.iter());
         } else {
             let manifest = match self.table_row_source(&prepared.table_name) {
                 Some(TableRowSource::Paged(manifest)) => Arc::clone(manifest),
@@ -1997,12 +2025,14 @@ impl EngineRuntime {
         match row_source {
             TableRowSource::Resident(data) => {
                 let data = Arc::make_mut(data);
-                data.rows.push(stored_row);
+                data.push_row(stored_row);
                 if use_paged_row_storage
-                    && data.rows.len() >= PAGED_TABLE_RESIDENT_APPEND_ROW_THRESHOLD
+                    && data.row_count() >= PAGED_TABLE_RESIDENT_APPEND_ROW_THRESHOLD
                 {
+                    let visible_rows = data.visible_rows().cloned().collect::<Vec<_>>();
                     *row_source = TableRowSource::Paged(Arc::new(TablePageManifest::from_rows(
-                        &data.rows, page_size,
+                        &visible_rows,
+                        page_size,
                     )?));
                 }
                 Ok(())
@@ -2039,8 +2069,7 @@ impl EngineRuntime {
                 .ok_or_else(|| {
                     DbError::internal(format!("table data for {table_name} is missing"))
                 })?
-                .rows
-                .push(stored_row);
+                .push_row(stored_row);
             return Ok(());
         }
         let Some(canonical_table_name) = self.canonical_catalog_table_name(table_name) else {
@@ -2057,12 +2086,14 @@ impl EngineRuntime {
         match row_source {
             TableRowSource::Resident(data) => {
                 let data = Arc::make_mut(data);
-                data.rows.push(stored_row);
+                data.push_row(stored_row);
                 if use_paged_row_storage
-                    && data.rows.len() >= PAGED_TABLE_RESIDENT_APPEND_ROW_THRESHOLD
+                    && data.row_count() >= PAGED_TABLE_RESIDENT_APPEND_ROW_THRESHOLD
                 {
+                    let visible_rows = data.visible_rows().cloned().collect::<Vec<_>>();
                     *row_source = TableRowSource::Paged(Arc::new(TablePageManifest::from_rows(
-                        &data.rows, page_size,
+                        &visible_rows,
+                        page_size,
                     )?));
                 }
                 Ok(())
@@ -2121,15 +2152,12 @@ impl EngineRuntime {
         row_changes: &BTreeMap<i64, Option<Vec<Value>>>,
     ) {
         let pure_delete = row_changes.values().all(|change| change.is_none());
-        if pure_delete
-            && Self::should_retain_rows_for_pure_delete(table_data.rows.len(), row_changes.len())
-        {
-            let deleted_row_ids = row_changes.keys().copied().collect::<HashSet<_>>();
-            table_data.retain_rows(|row| !deleted_row_ids.contains(&row.row_id));
+        if pure_delete {
+            table_data.mark_rows_deleted(row_changes.keys());
             return;
         }
 
-        let mut delete_indices = Vec::new();
+        let mut deleted_row_ids = Vec::new();
         for (row_id, change) in row_changes {
             let Some(row_index) = table_data.row_index_by_id(*row_id) else {
                 continue;
@@ -2138,19 +2166,11 @@ impl EngineRuntime {
                 Some(next_values) => {
                     table_data.replace_row_values(row_index, next_values.clone());
                 }
-                None => delete_indices.push(row_index),
+                None => deleted_row_ids.push(*row_id),
             }
         }
 
-        delete_indices.sort_unstable_by(|left, right| right.cmp(left));
-        delete_indices.dedup();
-        for row_index in delete_indices {
-            table_data.remove_row(row_index);
-        }
-    }
-
-    fn should_retain_rows_for_pure_delete(table_rows: usize, delete_count: usize) -> bool {
-        delete_count > 64 || (delete_count > 1 && table_rows >= 4096)
+        table_data.mark_rows_deleted(deleted_row_ids.iter());
     }
 
     pub(super) fn execute_insert(
@@ -2499,6 +2519,8 @@ impl EngineRuntime {
                 table,
                 &matching_rows,
                 delete_children,
+                None,
+                None,
                 params,
                 page_size,
             )?;
@@ -2570,7 +2592,6 @@ impl EngineRuntime {
         }
 
         let mut removed_rows = Vec::with_capacity(matching_row_ids.len());
-        let mut row_indices = Vec::with_capacity(matching_row_ids.len());
         {
             let table_data = self.table_data(table_name).ok_or_else(|| {
                 DbError::internal(format!("table data for {table_name} is missing"))
@@ -2579,7 +2600,6 @@ impl EngineRuntime {
                 let row_index = table_data.row_index_by_id(row_id).ok_or_else(|| {
                     DbError::internal(format!("row {row_id} vanished during DELETE"))
                 })?;
-                row_indices.push(row_index);
                 removed_rows.push(table_data.rows[row_index].clone());
             }
         }
@@ -2595,22 +2615,19 @@ impl EngineRuntime {
                 }
             }
         }
-        row_indices.sort_unstable_by(|left, right| right.cmp(left));
+        let stale_indexes = incremental_delete_indexes(self, table, table_indexes, &removed_rows)?;
         {
             let table_data = self.table_data_mut(table_name).ok_or_else(|| {
                 DbError::internal(format!("table data for {table_name} is missing"))
             })?;
-            for row_index in row_indices {
-                table_data.remove_row(row_index);
-            }
-        }
-        let stale_indexes = incremental_delete_indexes(self, table, table_indexes, &removed_rows)?;
-        if !stale_indexes.is_empty() {
-            self.mark_named_indexes_stale(&stale_indexes);
+            table_data.mark_rows_deleted(matching_row_ids.iter());
         }
         for row in &removed_rows {
             self.mark_table_row_deleted(table_name, row.row_id);
             self.record_sync_delete_for_row(table, &row.values);
+        }
+        if !stale_indexes.is_empty() {
+            self.mark_named_indexes_stale(&stale_indexes);
         }
         self.execute_after_triggers(
             table_name,
@@ -2855,13 +2872,12 @@ impl EngineRuntime {
                             table.name
                         )));
                     };
-                    let Some(stored_row) = table_data.rows.get_mut(row_index) else {
-                        return Err(DbError::internal(format!(
-                            "row {row_id} vanished during UPDATE"
-                        )));
-                    };
-                    stored_row.values[prepared_update.column_index] = next_value.clone();
-                    stored_row.values.to_vec()
+                    table_data
+                        .replace_value(row_index, prepared_update.column_index, next_value.clone())
+                        .ok_or_else(|| {
+                            DbError::internal(format!("row {row_id} vanished during UPDATE"))
+                        })?;
+                    table_data.rows[row_index].values.clone()
                 };
                 validate_assigned_not_null_columns(
                     table,
@@ -3482,18 +3498,19 @@ impl EngineRuntime {
                     })?;
                     let mut removed = Vec::with_capacity(row_indices.len());
                     for &row_index in &row_indices {
-                        removed.push(table_data.remove_row(row_index));
+                        removed.push(table_data.rows[row_index].clone());
                     }
+                    table_data.mark_rows_deleted(matching_row_ids.iter());
                     removed
                 };
                 let stale_indexes =
                     incremental_delete_indexes(self, &table, &table_indexes, &removed_rows)?;
-                if !stale_indexes.is_empty() {
-                    self.mark_named_indexes_stale(&stale_indexes);
-                }
                 for row in &removed_rows {
                     self.mark_table_row_deleted(&table_name, row.row_id);
                     self.record_sync_delete_for_row(&table, &row.values);
+                }
+                if !stale_indexes.is_empty() {
+                    self.mark_named_indexes_stale(&stale_indexes);
                 }
             }
             self.execute_after_triggers(
@@ -3523,6 +3540,8 @@ impl EngineRuntime {
                 &table,
                 &matching_rows,
                 &delete_children,
+                None,
+                None,
                 params,
                 page_size,
             )?;
@@ -3543,29 +3562,18 @@ impl EngineRuntime {
             .iter()
             .copied()
             .collect::<std::collections::BTreeSet<_>>();
-        if matching_row_ids.len() == 1 {
-            let table_data = self.table_data_mut(&table_name).ok_or_else(|| {
-                DbError::internal(format!("table data for {table_name} is missing"))
-            })?;
-            if let Some(row_index) = table_data.row_index_by_id(matching_row_ids[0]) {
-                table_data.remove_row(row_index);
-            }
-        } else {
-            self.table_data_mut(&table_name)
-                .ok_or_else(|| {
-                    DbError::internal(format!("table data for {table_name} is missing"))
-                })?
-                .retain_rows(|row| !matching_row_id_set.contains(&row.row_id));
-        }
+        self.table_data_mut(&table_name)
+            .ok_or_else(|| DbError::internal(format!("table data for {table_name} is missing")))?
+            .mark_rows_deleted(matching_row_id_set.iter());
 
         if !matching_row_ids.is_empty() {
-            if !stale_indexes.is_empty() {
-                self.mark_named_indexes_stale(&stale_indexes);
-            }
             for row in &matching_rows {
                 self.mark_table_row_deleted(&table_name, row.row_id);
                 self.record_sync_delete_for_row(&table, &row.values);
             }
+        }
+        if !stale_indexes.is_empty() {
+            self.mark_named_indexes_stale(&stale_indexes);
         }
 
         self.execute_after_triggers(
@@ -4053,7 +4061,7 @@ impl EngineRuntime {
                 }
                 let row_index = self
                     .table_data(table_name)
-                    .and_then(|data| data.rows.iter().position(|row| row.row_id == row_id))
+                    .and_then(|data| data.row_index_by_id(row_id))
                     .ok_or_else(|| {
                         DbError::internal(format!("row {row_id} vanished during UPSERT"))
                     })?;
@@ -4061,8 +4069,10 @@ impl EngineRuntime {
                     .ok_or_else(|| {
                         DbError::internal(format!("table data for {table_name} is missing"))
                     })?
-                    .rows[row_index]
-                    .values = next_values.clone();
+                    .replace_row_values(row_index, next_values.clone())
+                    .ok_or_else(|| {
+                        DbError::internal(format!("row {row_id} vanished during UPSERT"))
+                    })?;
                 if !indexes_to_update.is_empty() {
                     let mut stale_indexes: Vec<String> = Vec::new();
                     for index in &indexes_to_update {
@@ -4155,17 +4165,22 @@ impl EngineRuntime {
             table,
             std::slice::from_ref(&parent_row),
             &delete_children,
+            None,
+            None,
             params,
             page_size,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn apply_parent_delete_actions_rows(
         &mut self,
         table_name: &str,
         table: &crate::catalog::TableSchema,
         rows: &[StoredRow],
         delete_children: &[PreparedDeleteCascadeChild],
+        delete_children_by_table: Option<&DeleteChildrenByTable>,
+        table_indexes_by_table: Option<&TableIndexesByTable>,
         params: &[Value],
         page_size: u32,
     ) -> Result<()> {
@@ -4190,29 +4205,45 @@ impl EngineRuntime {
                     )))
                 }
                 crate::catalog::ForeignKeyAction::Cascade => {
-                    let child_delete_children =
-                        collect_parent_delete_children(self, &child.child_table)?;
+                    let child_delete_children = match delete_children_by_table
+                        .and_then(|cache| cache.get(&child.child_table.name))
+                    {
+                        Some(child_delete_children) => {
+                            Cow::Borrowed(child_delete_children.as_slice())
+                        }
+                        None => {
+                            Cow::Owned(collect_parent_delete_children(self, &child.child_table)?)
+                        }
+                    };
                     self.apply_parent_delete_actions_rows(
                         &child.child_table.name,
                         &child.child_table,
                         &matching_children,
-                        &child_delete_children,
+                        child_delete_children.as_ref(),
+                        delete_children_by_table,
+                        table_indexes_by_table,
                         params,
                         page_size,
                     )?;
-                    let child_table_indexes = self
-                        .catalog
-                        .indexes
-                        .values()
-                        .filter(|index| {
-                            identifiers_equal(&index.table_name, &child.child_table.name)
-                        })
-                        .cloned()
-                        .collect::<Vec<_>>();
+                    let child_table_indexes = match table_indexes_by_table
+                        .and_then(|cache| cache.get(&child.child_table.name))
+                    {
+                        Some(indexes) => Cow::Borrowed(indexes.as_slice()),
+                        None => Cow::Owned(
+                            self.catalog
+                                .indexes
+                                .values()
+                                .filter(|index| {
+                                    identifiers_equal(&index.table_name, &child.child_table.name)
+                                })
+                                .cloned()
+                                .collect::<Vec<_>>(),
+                        ),
+                    };
                     let stale_indexes = incremental_delete_indexes(
                         self,
                         &child.child_table,
-                        &child_table_indexes,
+                        child_table_indexes.as_ref(),
                         &matching_children,
                     )?;
                     let row_changes = matching_children
@@ -5022,7 +5053,8 @@ fn validate_prepared_insert(
                     index.name
                 )));
             };
-            if keys.contains_any(&key) {
+            let row_ids = keys.row_ids_for_key(&key);
+            if row_ids_have_live_row(runtime, &prepared.table_name, row_ids)? {
                 return Err(DbError::constraint(format!(
                     "unique constraint {} on {} was violated",
                     index.name, prepared.table_name
@@ -5076,20 +5108,6 @@ fn validate_prepared_insert(
                 prepared.table_name, foreign_key.parent_table_name
             )));
         }
-        // When the parent table has not been modified in this transaction,
-        // the index is guaranteed to be consistent with the actual rows.
-        // Also safe when the parent table only had append-only inserts:
-        // inserts never remove rows, so any indexed row_id still exists.
-        if !runtime
-            .dirty_tables
-            .contains(&foreign_key.parent_table_name)
-            || runtime
-                .paged_mutations
-                .get(&foreign_key.parent_table_name)
-                .is_some_and(|delta| delta.updated_rows.is_empty() && delta.deleted_rows.is_empty())
-        {
-            continue;
-        }
         let Some(parent_rows) = runtime.visible_table_row_source(&foreign_key.parent_table_name)
         else {
             return Err(DbError::constraint(format!(
@@ -5097,6 +5115,23 @@ fn validate_prepared_insert(
                 foreign_key.parent_table_name
             )));
         };
+        // When the parent table has not been modified in this transaction,
+        // the index is guaranteed to be consistent with the actual rows.
+        // Also safe when the parent table only had append-only inserts:
+        // inserts never remove rows, so any indexed row_id still exists.
+        if !parent_rows.has_tombstoned_rows()
+            && (!runtime
+                .dirty_tables
+                .contains(&foreign_key.parent_table_name)
+                || runtime
+                    .paged_mutations
+                    .get(&foreign_key.parent_table_name)
+                    .is_some_and(|delta| {
+                        delta.updated_rows.is_empty() && delta.deleted_rows.is_empty()
+                    }))
+        {
+            continue;
+        }
         let mut exists = false;
         for row_id in matched_row_ids {
             if parent_rows.row_by_id(row_id)?.is_some() {
@@ -5394,6 +5429,14 @@ fn apply_prepared_insert_index_updates(
             } else {
                 None
             };
+            if index.unique {
+                remove_tombstoned_unique_btree_entries_for_key(
+                    runtime,
+                    &prepared.table_name,
+                    &index.name,
+                    &RuntimeBtreeKey::Int64(*key),
+                )?;
+            }
             let Some(super::RuntimeIndex::Btree { keys, covering }) =
                 runtime.index_mut(&index.name)
             else {
@@ -5402,31 +5445,16 @@ fn apply_prepared_insert_index_updates(
                     index.name
                 )));
             };
-            match keys {
-                super::RuntimeBtreeKeys::UniqueInt64(entries) => {
-                    if check_unique && index.unique {
-                        if entries.insert(*key, row.row_id).is_some() {
-                            return Err(DbError::constraint(format!(
-                                "unique constraint {} on {} was violated",
-                                index.name, prepared.table_name
-                            )));
-                        }
-                    } else if entries.insert(*key, row.row_id).is_some() {
-                        return Err(DbError::internal(format!(
-                            "unique runtime BTREE index {} received a duplicate key insert",
-                            index.name
-                        )));
-                    }
+            let key = RuntimeBtreeKey::Int64(*key);
+            if check_unique && index.unique {
+                if keys.insert_row_id(key, row.row_id).is_err() {
+                    return Err(DbError::constraint(format!(
+                        "unique constraint {} on {} was violated",
+                        index.name, prepared.table_name
+                    )));
                 }
-                super::RuntimeBtreeKeys::NonUniqueInt64(entries) => {
-                    entries.entry(*key).or_default().push(row.row_id);
-                }
-                _ => {
-                    return Err(DbError::internal(format!(
-                        "runtime index {} did not use typed INT64 keys as expected",
-                        index.name
-                    )))
-                }
+            } else {
+                keys.insert_row_id(key, row.row_id)?;
             }
             if let (Some(covering), Some(values)) = (covering.as_mut(), covering_values) {
                 covering.insert_row_values(row.row_id, values);
@@ -5459,6 +5487,14 @@ fn apply_prepared_insert_index_updates(
             } else {
                 None
             };
+            if index.unique {
+                remove_tombstoned_unique_btree_entries_for_key(
+                    runtime,
+                    &prepared.table_name,
+                    &index.name,
+                    &RuntimeBtreeKey::Uuid(*key),
+                )?;
+            }
             let Some(super::RuntimeIndex::Btree { keys, covering }) =
                 runtime.index_mut(&index.name)
             else {
@@ -5467,31 +5503,16 @@ fn apply_prepared_insert_index_updates(
                     index.name
                 )));
             };
-            match keys {
-                super::RuntimeBtreeKeys::UniqueUuid(entries) => {
-                    if check_unique && index.unique {
-                        if entries.insert(*key, row.row_id).is_some() {
-                            return Err(DbError::constraint(format!(
-                                "unique constraint {} on {} was violated",
-                                index.name, prepared.table_name
-                            )));
-                        }
-                    } else if entries.insert(*key, row.row_id).is_some() {
-                        return Err(DbError::internal(format!(
-                            "unique runtime BTREE index {} received a duplicate key insert",
-                            index.name
-                        )));
-                    }
+            let key = RuntimeBtreeKey::Uuid(*key);
+            if check_unique && index.unique {
+                if keys.insert_row_id(key, row.row_id).is_err() {
+                    return Err(DbError::constraint(format!(
+                        "unique constraint {} on {} was violated",
+                        index.name, prepared.table_name
+                    )));
                 }
-                super::RuntimeBtreeKeys::NonUniqueUuid(entries) => {
-                    entries.entry(*key).or_default().push(row.row_id);
-                }
-                _ => {
-                    return Err(DbError::internal(format!(
-                        "runtime index {} did not use typed UUID keys as expected",
-                        index.name
-                    )))
-                }
+            } else {
+                keys.insert_row_id(key, row.row_id)?;
             }
             if let (Some(covering), Some(values)) = (covering.as_mut(), covering_values) {
                 covering.insert_row_values(row.row_id, values);
@@ -5514,6 +5535,14 @@ fn apply_prepared_insert_index_updates(
         } else {
             None
         };
+        if index.unique {
+            remove_tombstoned_unique_btree_entries_for_key(
+                runtime,
+                &prepared.table_name,
+                &index.name,
+                &key,
+            )?;
+        }
         let Some(super::RuntimeIndex::Btree { keys, covering }) = runtime.index_mut(&index.name)
         else {
             return Err(DbError::internal(format!(
@@ -5859,7 +5888,7 @@ fn indexed_row_ids_for_filter(
     };
     if matches!(
         keys,
-        super::RuntimeBtreeKeys::UniqueInt64(_) | super::RuntimeBtreeKeys::NonUniqueInt64(_)
+        super::RuntimeBtreeKeys::UniqueInt64(..) | super::RuntimeBtreeKeys::NonUniqueInt64(..)
     ) && !matches!(value, Value::Int64(_))
     {
         return Ok(None);
@@ -5991,6 +6020,66 @@ fn row_id_set_to_vec(row_ids: RuntimeRowIdSet<'_>) -> Vec<i64> {
     let mut values = Vec::with_capacity(row_ids.len());
     row_ids.for_each(|row_id| values.push(row_id));
     values
+}
+
+fn row_ids_have_live_row<I>(runtime: &EngineRuntime, table_name: &str, row_ids: I) -> Result<bool>
+where
+    I: IntoIterator<Item = i64>,
+{
+    let mut row_ids = row_ids.into_iter();
+    let Some(row_source) = runtime.visible_table_row_source(table_name) else {
+        return Ok(row_ids.next().is_some());
+    };
+    for row_id in row_ids {
+        if row_source.row_by_id(row_id)?.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn row_id_set_has_live_row(
+    runtime: &EngineRuntime,
+    table_name: &str,
+    row_ids: RuntimeRowIdSet<'_>,
+) -> Result<bool> {
+    row_ids_have_live_row(runtime, table_name, row_id_set_to_vec(row_ids))
+}
+
+fn remove_tombstoned_unique_btree_entries_for_key(
+    runtime: &mut EngineRuntime,
+    table_name: &str,
+    index_name: &str,
+    key: &RuntimeBtreeKey,
+) -> Result<()> {
+    let Some(row_source) = runtime.visible_table_row_source(table_name) else {
+        return Ok(());
+    };
+    if !row_source.has_tombstoned_rows() {
+        return Ok(());
+    }
+    let Some(RuntimeIndex::Btree { keys, .. }) = runtime.index(index_name) else {
+        return Ok(());
+    };
+    let mut stale_row_ids = Vec::new();
+    for row_id in keys.row_ids_for_key(key) {
+        if row_source.row_by_id(row_id)?.is_none() {
+            stale_row_ids.push(row_id);
+        }
+    }
+    if stale_row_ids.is_empty() {
+        return Ok(());
+    }
+    let Some(RuntimeIndex::Btree { keys, covering }) = runtime.index_mut(index_name) else {
+        return Ok(());
+    };
+    for row_id in stale_row_ids {
+        keys.remove_row_id(key, row_id)?;
+        if let Some(covering) = covering.as_mut() {
+            covering.remove_row_id(row_id);
+        }
+    }
+    Ok(())
 }
 
 fn simple_btree_lookup_filter(filter: &Expr) -> Option<(Option<&str>, &str, &Expr)> {
@@ -6393,6 +6482,50 @@ fn collect_parent_delete_children(
     Ok(children)
 }
 
+fn prepare_delete_children_and_indexes(
+    runtime: &EngineRuntime,
+    root_table: &crate::catalog::TableSchema,
+) -> Result<(DeleteChildrenByTable, TableIndexesByTable)> {
+    let mut delete_children_by_table = BTreeMap::new();
+    let mut table_indexes_by_table = BTreeMap::new();
+    let mut queue = VecDeque::from([root_table.name.clone()]);
+    let mut visited = HashSet::new();
+
+    while let Some(table_name) = queue.pop_front() {
+        if !visited.insert(table_name.clone()) {
+            continue;
+        }
+
+        let Some(table) = runtime.table_schema(&table_name) else {
+            return Err(DbError::internal(format!("table {table_name} is missing")));
+        };
+
+        let children = collect_parent_delete_children(runtime, table)?;
+        let child_names = children
+            .iter()
+            .map(|child| child.child_table.name.clone())
+            .collect::<Vec<_>>();
+        delete_children_by_table.insert(table_name.clone(), children);
+
+        let table_indexes = runtime
+            .catalog
+            .indexes
+            .values()
+            .filter(|index| identifiers_equal(&index.table_name, &table.name))
+            .cloned()
+            .collect::<Vec<_>>();
+        table_indexes_by_table.insert(table_name.clone(), table_indexes);
+
+        for child_name in child_names {
+            if !visited.contains(&child_name) {
+                queue.push_back(child_name);
+            }
+        }
+    }
+
+    Ok((delete_children_by_table, table_indexes_by_table))
+}
+
 fn matching_foreign_key_children_for_parent_rows(
     runtime: &EngineRuntime,
     _table: &crate::catalog::TableSchema,
@@ -6460,30 +6593,50 @@ fn matching_foreign_key_children_for_parent_rows(
         .child_index_prefix_len
         .is_some_and(|prefix_len| index_schema.columns.len() > prefix_len);
     let mut matching_children = BTreeMap::<i64, StoredRow>::new();
-    for parent_key in &parent_keys {
-        let row_ids = if use_prefix_scan {
-            keys.row_ids_for_encoded_key_prefix(parent_key)?
-        } else if child.foreign_key.columns.len() == 1 {
-            let Some(parent_value) = parent_key.first() else {
-                continue;
-            };
-            keys.row_ids_for_value(parent_value)?
-        } else {
-            keys.row_ids_for_key(&RuntimeBtreeKey::Encoded(
-                Row::new(parent_key.clone()).encode()?,
-            ))
-        };
+    if use_prefix_scan {
+        let parent_key_refs = parent_keys.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let row_ids = keys.row_ids_for_encoded_key_prefixes(&parent_key_refs)?;
         for row_id in row_ids {
             let Some(row) = row_source.row_by_id(row_id)? else {
                 continue;
             };
             let stored_row = materialize_foreign_key_child_row(runtime, &child.child_table, row)?;
-            if foreign_key_child_matches_parent_key(
-                &stored_row.values,
-                &child.child_column_indexes,
-                parent_key,
-            )? {
-                matching_children.insert(stored_row.row_id, stored_row);
+            for parent_key in &parent_keys {
+                if foreign_key_child_matches_parent_key(
+                    &stored_row.values,
+                    &child.child_column_indexes,
+                    parent_key,
+                )? {
+                    matching_children.insert(stored_row.row_id, stored_row);
+                    break;
+                }
+            }
+        }
+    } else {
+        for parent_key in &parent_keys {
+            let row_ids = if child.foreign_key.columns.len() == 1 {
+                let Some(parent_value) = parent_key.first() else {
+                    continue;
+                };
+                keys.row_ids_for_value(parent_value)?
+            } else {
+                keys.row_ids_for_key(&RuntimeBtreeKey::Encoded(
+                    Row::new(parent_key.clone()).encode()?,
+                ))
+            };
+            for row_id in row_ids {
+                let Some(row) = row_source.row_by_id(row_id)? else {
+                    continue;
+                };
+                let stored_row =
+                    materialize_foreign_key_child_row(runtime, &child.child_table, row)?;
+                if foreign_key_child_matches_parent_key(
+                    &stored_row.values,
+                    &child.child_column_indexes,
+                    parent_key,
+                )? {
+                    matching_children.insert(stored_row.row_id, stored_row);
+                }
             }
         }
     }
@@ -6589,23 +6742,25 @@ fn prepared_delete_has_referencing_child(
             .child_index_prefix_len
             .is_some_and(|prefix_len| index_schema.columns.len() > prefix_len);
         if use_prefix_scan {
-            return Ok(!keys
-                .row_ids_for_encoded_key_prefix(
-                    &parent_values
-                        .iter()
-                        .map(|value| (*value).clone())
-                        .collect::<Vec<_>>(),
-                )?
-                .is_empty());
+            let row_ids = keys.row_ids_for_encoded_key_prefix(
+                &parent_values
+                    .iter()
+                    .map(|value| (*value).clone())
+                    .collect::<Vec<_>>(),
+            )?;
+            return row_ids_have_live_row(runtime, &child.child_table_name, row_ids);
         }
         if parent_values.len() == 1 {
-            return Ok(!keys.row_ids_for_value_set(parent_values[0])?.is_empty());
+            return row_id_set_has_live_row(
+                runtime,
+                &child.child_table_name,
+                keys.row_ids_for_value_set(parent_values[0])?,
+            );
         }
-        return Ok(!keys
-            .row_ids_for_key(&RuntimeBtreeKey::Encoded(
-                Row::new(parent_values.iter().map(|value| (*value).clone()).collect()).encode()?,
-            ))
-            .is_empty());
+        let row_ids = keys.row_ids_for_key(&RuntimeBtreeKey::Encoded(
+            Row::new(parent_values.iter().map(|value| (*value).clone()).collect()).encode()?,
+        ));
+        return row_ids_have_live_row(runtime, &child.child_table_name, row_ids);
     }
     let Some(row_source) = runtime.visible_table_row_source(&child.child_table_name) else {
         return Ok(false);
@@ -6733,70 +6888,6 @@ fn apply_runtime_index_delete_for_rows(
     apply_runtime_index_delete_for_rows_with_predicate(runtime, table, index, rows, None, None)
 }
 
-fn apply_runtime_index_delete_for_row_with_predicate(
-    runtime: &mut EngineRuntime,
-    table: &crate::catalog::TableSchema,
-    index: &crate::catalog::IndexSchema,
-    row_id: i64,
-    row_values: &[Value],
-    pre_parsed_predicate: Option<&Expr>,
-    _shared_predicate: Option<&Expr>,
-) -> Result<bool> {
-    match index.kind {
-        IndexKind::Btree => {
-            let key = super::compute_index_key_with_predicate(
-                runtime,
-                index,
-                table,
-                row_values,
-                pre_parsed_predicate,
-            )?;
-            let Some(RuntimeIndex::Btree { keys, covering }) = runtime.index_mut(&index.name)
-            else {
-                return Ok(false);
-            };
-            if let Some(key) = key.as_ref() {
-                keys.remove_row_id(key, row_id)?;
-            }
-            if let Some(covering) = covering.as_mut() {
-                covering.remove_row_id(row_id);
-            }
-            Ok(true)
-        }
-        IndexKind::Trigram => {
-            let text = trigram_index_text_for_row(runtime, index, table, row_values)?;
-            let Some(RuntimeIndex::Trigram { index: trigram }) = runtime.index_mut(&index.name)
-            else {
-                return Ok(false);
-            };
-            if let Some(text) = text {
-                let row_id = u64::try_from(row_id)
-                    .map_err(|_| DbError::internal(format!("row_id {row_id} is invalid")))?;
-                trigram.queue_delete(row_id, &text);
-            }
-            Ok(true)
-        }
-        IndexKind::Spatial => {
-            let Some(RuntimeIndex::Spatial { index: spatial }) = runtime.index_mut(&index.name)
-            else {
-                return Ok(false);
-            };
-            spatial.remove(row_id);
-            Ok(true)
-        }
-        IndexKind::FullText => {
-            let Some(RuntimeIndex::FullText { index: fulltext }) = runtime.index_mut(&index.name)
-            else {
-                return Ok(false);
-            };
-            let row_id = u64::try_from(row_id)
-                .map_err(|_| DbError::internal(format!("row_id {row_id} is invalid")))?;
-            fulltext.delete_document(row_id);
-            Ok(true)
-        }
-    }
-}
-
 fn apply_runtime_index_delete_for_rows_with_predicate(
     runtime: &mut EngineRuntime,
     table: &crate::catalog::TableSchema,
@@ -6845,19 +6936,42 @@ fn apply_runtime_index_delete_for_rows_with_predicate(
             trigram.queue_delete_documents(deletions);
             Ok(true)
         }
-        IndexKind::Btree | IndexKind::Spatial => {
-            for row in rows {
-                if !apply_runtime_index_delete_for_row_with_predicate(
-                    runtime,
-                    table,
-                    index,
-                    row.row_id,
-                    &row.values,
-                    pre_parsed_predicate,
-                    shared_predicate,
-                )? {
-                    return Ok(false);
+        IndexKind::Btree => {
+            let predicate_expr = pre_parsed_predicate.or(shared_predicate);
+            let prepared_keys = rows
+                .iter()
+                .map(|row| {
+                    let key = super::compute_index_key_with_predicate(
+                        runtime,
+                        index,
+                        table,
+                        &row.values,
+                        predicate_expr,
+                    )?;
+                    Ok((row.row_id, key))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let Some(RuntimeIndex::Btree { keys, covering }) = runtime.index_mut(&index.name)
+            else {
+                return Ok(false);
+            };
+            for (row_id, key) in prepared_keys {
+                if let Some(key) = key {
+                    keys.remove_row_id(&key, row_id)?;
                 }
+                if let Some(covering) = covering.as_mut() {
+                    covering.remove_row_id(row_id);
+                }
+            }
+            Ok(true)
+        }
+        IndexKind::Spatial => {
+            let Some(RuntimeIndex::Spatial { index: spatial }) = runtime.index_mut(&index.name)
+            else {
+                return Ok(false);
+            };
+            for row in rows {
+                spatial.remove(row.row_id);
             }
             Ok(true)
         }
@@ -7727,8 +7841,7 @@ mod tests {
         EngineRuntime::apply_row_changes_to_resident_table_data(&mut table_data, &row_changes);
 
         let remaining = table_data
-            .rows
-            .iter()
+            .visible_rows()
             .map(|row| row.row_id)
             .collect::<Vec<_>>();
         assert_eq!(remaining, (71_i64..=100_i64).collect::<Vec<_>>());
@@ -7750,7 +7863,7 @@ mod tests {
 
         EngineRuntime::apply_row_changes_to_resident_table_data(&mut table_data, &row_changes);
 
-        assert_eq!(table_data.rows.len(), 4998);
+        assert_eq!(table_data.row_count(), 4998);
         assert!(table_data.row_by_id(100).is_none());
         assert!(table_data.row_by_id(4000).is_none());
         assert_eq!(
@@ -7779,7 +7892,7 @@ mod tests {
 
         EngineRuntime::apply_row_changes_to_resident_table_data(&mut table_data, &row_changes);
 
-        assert_eq!(table_data.rows.len(), 4094);
+        assert_eq!(table_data.row_count(), 4094);
         assert!(table_data.row_by_id(2).is_none());
         assert!(table_data.row_by_id(4096).is_none());
         assert_eq!(table_data.row_by_id(1).unwrap().values[0], Value::Int64(1));
@@ -7806,8 +7919,7 @@ mod tests {
         EngineRuntime::apply_row_changes_to_resident_table_data(&mut table_data, &row_changes);
 
         let remaining = table_data
-            .rows
-            .iter()
+            .visible_rows()
             .map(|row| row.row_id)
             .collect::<Vec<_>>();
         assert_eq!(remaining, (10_i64..=20_i64).collect::<Vec<_>>());
@@ -7840,8 +7952,7 @@ mod tests {
         EngineRuntime::apply_row_changes_to_resident_table_data(&mut table_data, &row_changes);
 
         let remaining = table_data
-            .rows
-            .iter()
+            .visible_rows()
             .map(|row| row.row_id)
             .collect::<Vec<_>>();
         assert_eq!(remaining, vec![10, 3]);
@@ -7868,7 +7979,7 @@ mod tests {
         let Some(RuntimeIndex::Btree { keys, .. }) = runtime.index("idx_movies_external_id") else {
             panic!("expected runtime btree index");
         };
-        let super::super::RuntimeBtreeKeys::UniqueUuid(entries) = keys else {
+        let super::super::RuntimeBtreeKeys::UniqueUuid(entries, _) = keys else {
             panic!("expected typed UUID runtime keys");
         };
         assert_eq!(entries.len(), 2);
@@ -7927,6 +8038,68 @@ mod tests {
         assert_eq!(remaining_movies.rows()[0].values()[0], Value::Int64(1));
         let remaining_reviews = query_sql(&mut runtime, "SELECT COUNT(*) FROM reviews");
         assert_eq!(remaining_reviews.rows()[0].values()[0], Value::Int64(0));
+    }
+
+    #[test]
+    fn prepared_simple_delete_reuses_cascade_cache_for_multiple_executes() {
+        let mut runtime = EngineRuntime::empty(1);
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE movies (id INT64 PRIMARY KEY, title TEXT NOT NULL)",
+        );
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE reviews (id INT64 PRIMARY KEY, movie_id INT64 REFERENCES movies(id) ON DELETE CASCADE, body TEXT NOT NULL)",
+        );
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE review_votes (id INT64 PRIMARY KEY, review_id INT64 REFERENCES reviews(id) ON DELETE CASCADE, score INT64 NOT NULL)",
+        );
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO movies VALUES (1, 'A'), (2, 'B'), (3, 'C')",
+        );
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO reviews VALUES (1, 1, 'm1-r1'), (2, 1, 'm1-r2'), (3, 2, 'm2-r1')",
+        );
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO review_votes VALUES (1, 1, 1), (2, 1, 2), (3, 2, 3), (4, 3, 4)",
+        );
+
+        let statement = crate::sql::parser::parse_sql_statement("DELETE FROM movies WHERE id = $1")
+            .expect("parse delete");
+        let crate::sql::ast::Statement::Delete(delete) = statement else {
+            panic!("expected delete statement");
+        };
+        let prepared = runtime
+            .prepare_simple_delete(&delete)
+            .expect("prepare delete")
+            .expect("expected prepared delete");
+
+        assert!(prepared.delete_children_by_table.contains_key("movies"));
+        assert!(prepared.delete_children_by_table.contains_key("reviews"));
+        assert!(prepared
+            .delete_children_by_table
+            .contains_key("review_votes"));
+        assert!(prepared.table_indexes_by_table.contains_key("movies"));
+        assert!(prepared.table_indexes_by_table.contains_key("reviews"));
+        assert!(prepared.table_indexes_by_table.contains_key("review_votes"));
+
+        for movie_id in 1_i64..=3 {
+            let result = runtime
+                .execute_prepared_simple_delete(&prepared, &[Value::Int64(movie_id)], 4096)
+                .expect("execute prepared delete");
+            assert_eq!(result.affected_rows(), 1);
+        }
+
+        let remaining_movies = query_sql(&mut runtime, "SELECT COUNT(*) FROM movies");
+        assert_eq!(remaining_movies.rows()[0].values()[0], Value::Int64(0));
+        let remaining_reviews = query_sql(&mut runtime, "SELECT COUNT(*) FROM reviews");
+        assert_eq!(remaining_reviews.rows()[0].values()[0], Value::Int64(0));
+        let remaining_votes = query_sql(&mut runtime, "SELECT COUNT(*) FROM review_votes");
+        assert_eq!(remaining_votes.rows()[0].values()[0], Value::Int64(0));
     }
 
     #[test]
@@ -8026,6 +8199,7 @@ mod tests {
             .table_data("movies")
             .expect("movies table")
             .rows
+            .as_ref()
             .clone();
         runtime
             .tables_mut()
@@ -8435,7 +8609,7 @@ mod tests {
             .apply_parent_delete_actions("parent", &parent, &[Value::Int64(7)], &[], 4096)
             .unwrap();
 
-        assert!(runtime.table_data("child").unwrap().rows.is_empty());
+        assert_eq!(runtime.table_data("child").unwrap().row_count(), 0);
     }
 
     #[test]
@@ -8843,7 +9017,10 @@ mod tests {
         runtime.indexes_mut().insert(
             "child_parent_fk_idx".to_string(),
             Arc::new(RuntimeIndex::Btree {
-                keys: super::super::RuntimeBtreeKeys::NonUniqueEncoded(entries),
+                keys: super::super::RuntimeBtreeKeys::NonUniqueEncoded(
+                    Arc::new(entries),
+                    BTreeSet::new(),
+                ),
                 covering: None,
             }),
         );
@@ -9018,7 +9195,10 @@ mod tests {
         runtime.indexes_mut().insert(
             "child_parent_fk_idx".to_string(),
             Arc::new(RuntimeIndex::Btree {
-                keys: super::super::RuntimeBtreeKeys::NonUniqueEncoded(entries),
+                keys: super::super::RuntimeBtreeKeys::NonUniqueEncoded(
+                    Arc::new(entries),
+                    BTreeSet::new(),
+                ),
                 covering: None,
             }),
         );
