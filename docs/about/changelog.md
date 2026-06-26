@@ -19,6 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added `scripts/benchmark_runner.py`, expanded complex/movie workload
   benchmark coverage, and checked in the latest rust-baseline benchmark
   result artifacts.
+- Added ADR 0200 and format-14 resident table delete tombstones, including the
+  v13-to-v14 migration parser path and DELETE_BATCH design documentation.
 
 ### Changed
 
@@ -29,6 +31,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   movie-query coverage.
 - Aligned WAL sync benchmarking behavior with SQLite semantics and documented
   the benchmark-driven performance work in the design notes.
+- Accelerated resident-storage cascade deletes with logical `TableData`
+  tombstones, tombstone-aware runtime index overlays, sparse resident overflow
+  patching, and CRC32C byte-patch updates. The MovieDB scratch cascade-delete
+  metric now beats SQLite in the benchmark runner.
+- Accelerated Showdown bulk deletes on resident tables by avoiding redundant
+  SQL parser work, deleting runtime index entries by row id, applying logical
+  full-text/trigram delete overlays, and patching resident overflow payloads
+  in place.
 
 ### Fixed
 
@@ -37,6 +47,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   statements and benchmark-heavy read paths.
 - Simplified resident read checks by removing stale `SingleProcessUnsafe`
   gating from the relevant read-path logic.
+- Kept tombstone-aware runtime indexes from returning stale rows after
+  delete/update/reinsert sequences while preserving resident checkpoint and
+  compaction fallbacks.
 
 ## [2.14.0] - [2026-06-19]
 

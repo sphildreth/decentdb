@@ -1,6 +1,7 @@
 //! Full-text analyzer, query parser, scoring, and runtime index primitives.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 pub(crate) const FTS_DDL_ERROR_PREFIX: &str = "FTS DDL error:";
 pub(crate) const FTS_QUERY_ERROR_PREFIX: &str = "FTS query error:";
@@ -42,8 +43,10 @@ struct FullTextDocument {
 #[derive(Clone, Debug)]
 pub(crate) struct FullTextIndex {
     config: AnalyzerConfig,
-    documents: BTreeMap<u64, FullTextDocument>,
-    postings: BTreeMap<String, BTreeMap<u64, TermDocumentInfo>>,
+    documents: Arc<BTreeMap<u64, FullTextDocument>>,
+    postings: Arc<BTreeMap<String, BTreeMap<u64, TermDocumentInfo>>>,
+    deleted_row_ids: BTreeSet<u64>,
+    deleted_term_counts: BTreeMap<String, usize>,
     non_empty_document_count: u64,
     total_document_len: u64,
 }
@@ -53,8 +56,10 @@ impl FullTextIndex {
     pub(crate) fn new(config: AnalyzerConfig) -> Self {
         Self {
             config: config.canonicalize(),
-            documents: BTreeMap::new(),
-            postings: BTreeMap::new(),
+            documents: Arc::new(BTreeMap::new()),
+            postings: Arc::new(BTreeMap::new()),
+            deleted_row_ids: BTreeSet::new(),
+            deleted_term_counts: BTreeMap::new(),
             non_empty_document_count: 0,
             total_document_len: 0,
         }
@@ -66,27 +71,30 @@ impl FullTextIndex {
     }
 
     pub(crate) fn insert_document_fresh(&mut self, row_id: u64, fields: &[Option<&str>]) {
+        self.remove_existing_document_for_replace(row_id);
         let document = build_document(&self.config, fields);
         if document.doc_len > 0 {
             self.non_empty_document_count += 1;
             self.total_document_len += u64::from(document.doc_len);
         }
         for (term, info) in &document.terms {
-            self.postings
+            Arc::make_mut(&mut self.postings)
                 .entry(term.clone())
                 .or_default()
                 .insert(row_id, info.clone());
         }
-        self.documents.insert(row_id, document);
+        Arc::make_mut(&mut self.documents).insert(row_id, document);
     }
 
     pub(crate) fn insert_document(&mut self, row_id: u64, fields: &[Option<&str>]) {
-        self.delete_document(row_id);
         self.insert_document_fresh(row_id, fields);
     }
 
     pub(crate) fn delete_document(&mut self, row_id: u64) {
-        let Some(document) = self.documents.remove(&row_id) else {
+        if self.deleted_row_ids.contains(&row_id) {
+            return;
+        }
+        let Some(document) = self.documents.get(&row_id) else {
             return;
         };
         if document.doc_len > 0 {
@@ -96,25 +104,20 @@ impl FullTextIndex {
                 .saturating_sub(u64::from(document.doc_len));
         }
         for term in document.terms.keys() {
-            let remove_term = if let Some(rows) = self.postings.get_mut(term) {
-                rows.remove(&row_id);
-                rows.is_empty()
-            } else {
-                false
-            };
-            if remove_term {
-                self.postings.remove(term);
-            }
+            *self.deleted_term_counts.entry(term.clone()).or_default() += 1;
         }
+        self.deleted_row_ids.insert(row_id);
     }
 
     pub(crate) fn delete_documents<I>(&mut self, row_ids: I)
     where
         I: IntoIterator<Item = u64>,
     {
-        let mut term_row_ids = BTreeMap::<String, Vec<u64>>::new();
         for row_id in row_ids {
-            let Some(document) = self.documents.remove(&row_id) else {
+            if self.deleted_row_ids.contains(&row_id) {
+                continue;
+            }
+            let Some(document) = self.documents.get(&row_id) else {
                 continue;
             };
             if document.doc_len > 0 {
@@ -124,22 +127,9 @@ impl FullTextIndex {
                     .saturating_sub(u64::from(document.doc_len));
             }
             for term in document.terms.keys() {
-                term_row_ids.entry(term.clone()).or_default().push(row_id);
+                *self.deleted_term_counts.entry(term.clone()).or_default() += 1;
             }
-        }
-
-        for (term, row_ids) in term_row_ids {
-            let remove_term = if let Some(rows) = self.postings.get_mut(&term) {
-                for row_id in row_ids {
-                    rows.remove(&row_id);
-                }
-                rows.is_empty()
-            } else {
-                false
-            };
-            if remove_term {
-                self.postings.remove(&term);
-            }
+            self.deleted_row_ids.insert(row_id);
         }
     }
 
@@ -154,8 +144,7 @@ impl FullTextIndex {
     ) -> Result<bool, FullTextIndexError> {
         let query = parse_runtime_query(&self.config, query_text)?;
         Ok(self
-            .documents
-            .get(&row_id)
+            .live_document(row_id)
             .is_some_and(|document| query_matches_document(self, document, &query)))
     }
 
@@ -165,7 +154,7 @@ impl FullTextIndex {
         query_text: &str,
     ) -> Result<f64, FullTextIndexError> {
         let query = parse_runtime_query(&self.config, query_text)?;
-        let Some(document) = self.documents.get(&row_id) else {
+        let Some(document) = self.live_document(row_id) else {
             return Ok(0.0);
         };
         Ok(self.score_parsed_query(document, &query))
@@ -192,7 +181,7 @@ impl FullTextIndex {
         let scoring_terms: Vec<(String, usize)> = positive_scoring_terms(self, &query)
             .into_iter()
             .map(|term| {
-                let doc_freq = self.postings.get(&term).map_or(0_usize, BTreeMap::len);
+                let doc_freq = self.live_doc_freq(&term);
                 (term, doc_freq)
             })
             .collect();
@@ -208,7 +197,7 @@ impl FullTextIndex {
             let candidate_row_ids = candidate_row_ids_for_query(self, &query);
             hits.reserve(candidate_row_ids.len());
             for row_id in candidate_row_ids {
-                let Some(document) = self.documents.get(&row_id) else {
+                let Some(document) = self.live_document(row_id) else {
                     continue;
                 };
                 hits.push(FullTextSearchHit {
@@ -223,7 +212,10 @@ impl FullTextIndex {
         } else {
             // Fall back to the full document scan for phrases, prefixes, and
             // excluded terms that need document-level checks beyond postings.
-            for (row_id, document) in &self.documents {
+            for (row_id, document) in self.documents.iter() {
+                if self.deleted_row_ids.contains(row_id) {
+                    continue;
+                }
                 if query_matches_document(self, document, &query) {
                     hits.push(FullTextSearchHit {
                         row_id: *row_id,
@@ -260,12 +252,17 @@ impl FullTextIndex {
 
     #[must_use]
     pub(crate) fn entry_count(&self) -> usize {
-        self.documents.len()
+        self.documents
+            .len()
+            .saturating_sub(self.deleted_row_ids.len())
     }
 
     #[must_use]
     pub(crate) fn term_count(&self) -> usize {
-        self.postings.len()
+        self.postings
+            .keys()
+            .filter(|term| self.live_doc_freq(term) > 0)
+            .count()
     }
 
     #[must_use]
@@ -291,7 +288,7 @@ impl FullTextIndex {
                 .into_iter()
                 .filter_map(|term| {
                     let term_info = document.terms.get(&term)?;
-                    let doc_freq = self.postings.get(&term).map_or(0_usize, BTreeMap::len);
+                    let doc_freq = self.live_doc_freq(&term);
                     Some(Bm25TermStats {
                         term_freq: f64::from(term_info.frequency),
                         doc_freq: doc_freq as f64,
@@ -322,6 +319,60 @@ impl FullTextIndex {
                 })
             }),
         )
+    }
+
+    fn live_document(&self, row_id: u64) -> Option<&FullTextDocument> {
+        if self.deleted_row_ids.contains(&row_id) {
+            return None;
+        }
+        self.documents.get(&row_id)
+    }
+
+    fn live_doc_freq(&self, term: &str) -> usize {
+        self.postings
+            .get(term)
+            .map_or(0, BTreeMap::len)
+            .saturating_sub(self.deleted_term_counts.get(term).copied().unwrap_or(0))
+    }
+
+    fn remove_existing_document_for_replace(&mut self, row_id: u64) {
+        let was_deleted = self.deleted_row_ids.remove(&row_id);
+        let Some(document) = self.documents.get(&row_id).cloned() else {
+            return;
+        };
+        if !was_deleted && document.doc_len > 0 {
+            self.non_empty_document_count = self.non_empty_document_count.saturating_sub(1);
+            self.total_document_len = self
+                .total_document_len
+                .saturating_sub(u64::from(document.doc_len));
+        }
+        for term in document.terms.keys() {
+            if was_deleted {
+                decrement_deleted_term_count(&mut self.deleted_term_counts, term);
+            }
+            let remove_term = if let Some(rows) = Arc::make_mut(&mut self.postings).get_mut(term) {
+                rows.remove(&row_id);
+                rows.is_empty()
+            } else {
+                false
+            };
+            if remove_term {
+                Arc::make_mut(&mut self.postings).remove(term);
+            }
+        }
+        Arc::make_mut(&mut self.documents).remove(&row_id);
+    }
+}
+
+fn decrement_deleted_term_count(counts: &mut BTreeMap<String, usize>, term: &str) {
+    let remove = if let Some(count) = counts.get_mut(term) {
+        *count = count.saturating_sub(1);
+        *count == 0
+    } else {
+        false
+    };
+    if remove {
+        counts.remove(term);
     }
 }
 
@@ -694,8 +745,12 @@ mod runtime_tests {
         assert_eq!(index.entry_count(), 1);
         assert_eq!(index.term_count(), 1);
         assert_eq!(index.average_document_len(), 1.0);
+        assert!(index.search("alpha").expect("query").is_empty());
         assert!(!index.matches_query(1, "alpha").expect("query"));
+        assert_eq!(index.score_query(1, "alpha").expect("score"), 0.0);
         assert!(index.matches_query(3, "delta").expect("query"));
+        assert_eq!(index.search("delta").expect("query")[0].row_id, 3);
+        assert!(index.score_query(3, "delta").expect("score") > 0.0);
     }
 
     #[test]

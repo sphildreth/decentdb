@@ -39,6 +39,7 @@ pub(crate) enum TrigramQueryResult {
 pub(crate) struct TrigramIndex {
     postings_tree: Btree<InMemoryPageStore>,
     pending: BTreeMap<u32, Vec<PendingOp>>,
+    deleted_postings: BTreeMap<u32, BTreeSet<u64>>,
     rebuild_state: RebuildState,
     postings_threshold: usize,
 }
@@ -62,6 +63,7 @@ impl TrigramIndexBuilder {
     pub(crate) fn finish_into(self, index: &mut TrigramIndex) -> Result<()> {
         index.postings_tree.clear()?;
         index.pending.clear();
+        index.deleted_postings.clear();
         let mut entries = BTreeMap::<u64, Vec<u8>>::new();
         for (token, mut row_ids) in self.postings {
             row_ids.sort_unstable();
@@ -79,6 +81,7 @@ impl TrigramIndex {
         Self {
             postings_tree: Btree::with_page_size(page_size),
             pending: BTreeMap::new(),
+            deleted_postings: BTreeMap::new(),
             rebuild_state: RebuildState::default(),
             postings_threshold,
         }
@@ -86,6 +89,12 @@ impl TrigramIndex {
 
     pub(crate) fn queue_insert(&mut self, row_id: u64, text: &str) {
         for token in unique_tokens(text) {
+            if let Some(deleted) = self.deleted_postings.get_mut(&token) {
+                deleted.remove(&row_id);
+                if deleted.is_empty() {
+                    self.deleted_postings.remove(&token);
+                }
+            }
             self.pending
                 .entry(token)
                 .or_default()
@@ -95,6 +104,10 @@ impl TrigramIndex {
 
     pub(crate) fn queue_delete(&mut self, row_id: u64, text: &str) {
         for token in unique_tokens(text) {
+            self.deleted_postings
+                .entry(token)
+                .or_default()
+                .insert(row_id);
             self.pending
                 .entry(token)
                 .or_default()
@@ -111,6 +124,10 @@ impl TrigramIndex {
         for (row_id, text) in deletions {
             for token in unique_tokens(text.as_ref()) {
                 grouped.entry(token).or_default().push(row_id);
+                self.deleted_postings
+                    .entry(token)
+                    .or_default()
+                    .insert(row_id);
             }
         }
         for (token, row_ids) in grouped {
@@ -137,10 +154,9 @@ impl TrigramIndex {
     }
 
     pub(crate) fn mark_recovered_from_loss(&mut self) {
-        if !self.pending.is_empty() {
-            self.pending.clear();
-            self.rebuild_state.mark_stale();
-        }
+        self.pending.clear();
+        self.deleted_postings.clear();
+        self.rebuild_state.mark_stale();
     }
 
     pub(crate) fn ensure_fresh<F>(&mut self, rebuild: F) -> Result<()>
@@ -159,6 +175,8 @@ impl TrigramIndex {
         I: IntoIterator<Item = (u64, T)>,
         T: AsRef<str>,
     {
+        self.deleted_postings.clear();
+        self.pending.clear();
         let mut builder = TrigramIndexBuilder::new();
         for (row_id, text) in documents {
             builder.insert(row_id, text.as_ref());
@@ -190,12 +208,21 @@ impl TrigramIndex {
                 )?;
             }
         }
+        self.deleted_postings.clear();
         Ok(())
     }
 
     #[must_use]
     pub(crate) fn entry_count(&self) -> usize {
-        self.postings_tree.entry_count() + self.pending.values().map(Vec::len).sum::<usize>()
+        self.postings_tree
+            .entry_count()
+            .saturating_add(self.pending.values().map(Vec::len).sum::<usize>())
+            .saturating_sub(
+                self.deleted_postings
+                    .values()
+                    .map(BTreeSet::len)
+                    .sum::<usize>(),
+            )
     }
 
     pub(crate) fn query_candidates(
@@ -215,7 +242,7 @@ impl TrigramIndex {
         let mut postings = tokens
             .iter()
             .map(|&token| {
-                self.materialized_postings(token)
+                self.materialized_live_postings(token)
                     .map(|set| set.into_iter().collect::<Vec<_>>())
             })
             .collect::<Result<Vec<_>>>()?;
@@ -267,6 +294,30 @@ impl TrigramIndex {
             }
         }
 
+        Ok(postings)
+    }
+
+    fn materialized_live_postings(&self, token: u32) -> Result<BTreeSet<u64>> {
+        let mut postings = self
+            .postings_tree
+            .get(u64::from(token))?
+            .map(|bytes| decode_postings(&bytes))
+            .transpose()?
+            .unwrap_or_default()
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+
+        if let Some(operations) = self.pending.get(&token) {
+            for operation in operations {
+                if let PendingOp::Add(row_id) = operation {
+                    postings.insert(*row_id);
+                }
+            }
+        }
+
+        if let Some(deleted) = self.deleted_postings.get(&token) {
+            postings.retain(|row_id| !deleted.contains(row_id));
+        }
         Ok(postings)
     }
 }
@@ -391,5 +442,54 @@ mod tests {
 
         let result = index.query_candidates("alphabet", false).expect("query");
         assert_eq!(result, TrigramQueryResult::Candidates(Vec::new()));
+    }
+
+    #[test]
+    fn candidate_lookup_skips_bulk_deleted_row_ids() {
+        let mut index = TrigramIndex::new(1024, 100_000);
+        for row_id in 1_u64..=20 {
+            index.queue_insert(row_id, "alphabet");
+        }
+        index.checkpoint().expect("checkpoint");
+
+        index.queue_delete_documents((1_u64..=10).map(|row_id| (row_id, "alphabet")));
+
+        let result = index.query_candidates("alpha", false).expect("query");
+        assert_eq!(
+            result,
+            TrigramQueryResult::Candidates((11..=20).collect::<Vec<u64>>())
+        );
+    }
+
+    #[test]
+    fn delete_then_reinsert_restores_trigram_visibility() {
+        let mut index = TrigramIndex::new(1024, 100_000);
+        index.queue_insert(1, "alphabet");
+        index.queue_insert(2, "alphanumeric");
+        index.checkpoint().expect("checkpoint");
+
+        index.queue_delete(1, "alphabet");
+        let deleted = index.query_candidates("alpha", false).expect("query");
+        assert_eq!(deleted, TrigramQueryResult::Candidates(vec![2]));
+
+        index.queue_insert(1, "alphabet");
+        let restored = index.query_candidates("alpha", false).expect("query");
+        assert_eq!(restored, TrigramQueryResult::Candidates(vec![1, 2]));
+    }
+
+    #[test]
+    fn replace_row_removes_old_token_candidates_and_readds_new_ones() {
+        let mut index = TrigramIndex::new(1024, 100_000);
+        index.queue_insert(1, "alphabet");
+        index.queue_insert(2, "alphanumeric");
+        index.checkpoint().expect("checkpoint");
+
+        index.queue_replace(1, "alphabet", "zyx");
+
+        let old_pattern = index.query_candidates("alpha", false).expect("query");
+        assert_eq!(old_pattern, TrigramQueryResult::Candidates(vec![2]));
+
+        let new_pattern = index.query_candidates("zyx", false).expect("query");
+        assert_eq!(new_pattern, TrigramQueryResult::Candidates(vec![1]));
     }
 }

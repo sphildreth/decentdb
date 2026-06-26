@@ -56,7 +56,9 @@ use crate::search::fulltext::analyzer::{
     AnalyzerConfig, AnalyzerDiacritics, AnalyzerLanguage, AnalyzerStemmer, AnalyzerStopwords,
     AnalyzerTokenization,
 };
-use crate::sql::ast::{BinaryOp, Expr, FromItem, QueryBody, SelectItem, Statement as SqlStatement};
+use crate::sql::ast::{
+    BinaryOp, DeleteStatement, Expr, FromItem, QueryBody, SelectItem, Statement as SqlStatement,
+};
 use crate::sql::parser::{parse_expression_sql, parse_sql_statement, rewrite_legacy_trigger_body};
 use crate::storage::freelist::{decode_freelist_next, encode_freelist_page};
 use crate::storage::page::{self, PageId, PageStore};
@@ -1121,6 +1123,77 @@ impl PreparedInsertCache {
         self.entries.insert(key, Arc::clone(&plan));
         Ok(Some(plan))
     }
+}
+
+struct SimpleRowIdRangeDeleteSql {
+    table_name: String,
+    column_name: String,
+    low: i64,
+    high: i64,
+}
+
+fn parse_simple_row_id_range_delete_sql(sql: &str) -> Option<SimpleRowIdRangeDeleteSql> {
+    let tokens = sql.split_ascii_whitespace().collect::<Vec<_>>();
+    if tokens.len() != 9
+        || !tokens[0].eq_ignore_ascii_case("DELETE")
+        || !tokens[1].eq_ignore_ascii_case("FROM")
+        || !tokens[3].eq_ignore_ascii_case("WHERE")
+        || !tokens[5].eq_ignore_ascii_case("BETWEEN")
+        || !tokens[7].eq_ignore_ascii_case("AND")
+    {
+        return None;
+    }
+    let table_name = parse_simple_sql_identifier(tokens[2])?;
+    let column_name = parse_simple_sql_identifier(tokens[4])?;
+    let low = tokens[6].parse::<i64>().ok()?;
+    let high = tokens[8].parse::<i64>().ok()?;
+    Some(SimpleRowIdRangeDeleteSql {
+        table_name,
+        column_name,
+        low,
+        high,
+    })
+}
+
+fn parse_simple_sql_identifier(token: &str) -> Option<String> {
+    if token.is_empty() {
+        return None;
+    }
+    let mut parts = token.split('.');
+    let first = parts.next()?;
+    let second = parts.next();
+    if parts.next().is_some() {
+        return None;
+    }
+    let identifier = second.unwrap_or(first);
+    if identifier.is_empty() {
+        return None;
+    }
+    let mut chars = identifier.chars();
+    let first = chars.next()?;
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return None;
+    }
+    if chars.any(|ch| !(ch == '_' || ch.is_ascii_alphanumeric())) {
+        return None;
+    }
+    Some(identifier.to_string())
+}
+
+fn simple_row_id_range_delete_statement(request: &SimpleRowIdRangeDeleteSql) -> SqlStatement {
+    SqlStatement::Delete(DeleteStatement {
+        table_name: request.table_name.clone(),
+        filter: Some(Expr::Between {
+            expr: Box::new(Expr::Column {
+                table: None,
+                column: request.column_name.clone(),
+            }),
+            low: Box::new(Expr::Literal(Value::Int64(request.low))),
+            high: Box::new(Expr::Literal(Value::Int64(request.high))),
+            negated: false,
+        }),
+        returning: Vec::new(),
+    })
 }
 
 impl Db {
@@ -2706,6 +2779,21 @@ impl Db {
                 results.push(result);
                 continue;
             }
+            if params.is_empty() {
+                if let Some(result) =
+                    self.try_execute_simple_row_id_range_delete_sql_fast_path(trimmed)?
+                {
+                    self.record_statement_trace(
+                        trimmed,
+                        false,
+                        std::time::Duration::ZERO,
+                        0,
+                        Ok(&result),
+                    );
+                    results.push(result);
+                    continue;
+                }
+            }
             if !self.inner.sql_txn_active.load(Ordering::Acquire) && params.is_empty() {
                 if let Ok(prepared_sql) = prepared_statement_sql(trimmed) {
                     if let Some(prepared) = self.try_prepare_from_plan_cache(&prepared_sql)? {
@@ -2854,6 +2942,99 @@ impl Db {
 
         self.commit_exclusive_sql_txn(state)?;
         Ok(Some(results))
+    }
+
+    fn try_execute_simple_row_id_range_delete_sql_fast_path(
+        &self,
+        sql: &str,
+    ) -> Result<Option<QueryResult>> {
+        let Some(request) = parse_simple_row_id_range_delete_sql(sql) else {
+            return Ok(None);
+        };
+        if self.inner.sql_txn_active.load(Ordering::Acquire) {
+            let mut txn = self
+                .inner
+                .sql_txn
+                .lock()
+                .map_err(|_| DbError::internal("SQL transaction lock poisoned"))?;
+            return match &mut *txn {
+                SqlTxnSlot::Shared(state) => {
+                    self.try_execute_simple_row_id_range_delete_in_state(&request, state)
+                }
+                SqlTxnSlot::Exclusive => Err(self.exclusive_sql_txn_error()),
+                SqlTxnSlot::None => Ok(None),
+            };
+        }
+
+        let prepared = {
+            let runtime = self
+                .inner
+                .engine
+                .read()
+                .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+            runtime.prepare_simple_row_id_range_delete(
+                &request.table_name,
+                &request.column_name,
+                request.low,
+                request.high,
+            )?
+        };
+        let Some(prepared) = prepared else {
+            return Ok(None);
+        };
+        self.execute_autocommit_simple_delete_in_place(&prepared, &[])
+            .map(Some)
+    }
+
+    fn try_execute_simple_row_id_range_delete_in_state(
+        &self,
+        request: &SimpleRowIdRangeDeleteSql,
+        state: &mut SqlTxnState,
+    ) -> Result<Option<QueryResult>> {
+        if state.indexes_maybe_stale {
+            state
+                .runtime
+                .rebuild_stale_indexes(self.inner.config.page_size)?;
+            state.indexes_maybe_stale = false;
+        }
+        let Some(mut prepared) = state.runtime.prepare_simple_row_id_range_delete(
+            &request.table_name,
+            &request.column_name,
+            request.low,
+            request.high,
+        )?
+        else {
+            return Ok(None);
+        };
+        let table_names = prepared.required_row_source_table_names();
+        let child_index_targets = prepared.child_index_hydration_targets();
+        let snapshot_lsn = state.snapshot_lsn();
+        self.load_runtime_table_row_sources_and_child_indexes_at_snapshot(
+            &mut state.runtime,
+            &table_names,
+            &child_index_targets,
+            snapshot_lsn,
+        )?;
+        if !state.runtime.can_reuse_prepared_simple_delete(&prepared) {
+            let Some(reprepared) = state.runtime.prepare_simple_row_id_range_delete(
+                &request.table_name,
+                &request.column_name,
+                request.low,
+                request.high,
+            )?
+            else {
+                return Ok(None);
+            };
+            prepared = reprepared;
+        }
+        let temp_only = prepared.table.temporary;
+        let result = state.runtime.execute_prepared_simple_delete(
+            &prepared,
+            &[],
+            self.inner.config.page_size,
+        )?;
+        state.persistent_changed |= !temp_only;
+        Ok(Some(result))
     }
 
     fn dispatch_plan_cache_invalidation(&self, statement: &SqlStatement) {
@@ -7550,6 +7731,53 @@ impl Db {
                 read_only: bundle.read_only,
             });
         }
+        if let Some(request) = parse_simple_row_id_range_delete_sql(&prepared_sql) {
+            if let Some(prepared_delete) = runtime.prepare_simple_row_id_range_delete(
+                &request.table_name,
+                &request.column_name,
+                request.low,
+                request.high,
+            )? {
+                let statement = Arc::new(simple_row_id_range_delete_statement(&request));
+                let bundle = PreparedPlanBundle {
+                    statement: Arc::clone(&statement),
+                    simple_row_id_projection: None,
+                    simple_indexed_projection: None,
+                    simple_row_id_range_projection: None,
+                    simple_ordered_row_id_projection: None,
+                    simple_row_id_join_projection: None,
+                    simple_scalar_filtered_aggregate: None,
+                    prepared_insert: None,
+                    prepared_update: None,
+                    prepared_delete: Some(Arc::new(prepared_delete)),
+                    read_only: false,
+                };
+                if let Ok(mut cache) = self.inner.prepared_plan_cache.lock() {
+                    cache.insert(
+                        key,
+                        bundle.clone(),
+                        Self::prepared_plan_accounted_size(&bundle),
+                    );
+                }
+                return Ok(PreparedStatement {
+                    db: self.clone(),
+                    schema_cookie: runtime.catalog.schema_cookie,
+                    temp_schema_cookie: runtime.temp_schema_cookie,
+                    statement,
+                    prepared_sql: prepared_sql.clone(),
+                    simple_row_id_projection: None,
+                    simple_indexed_projection: None,
+                    simple_row_id_range_projection: None,
+                    simple_ordered_row_id_projection: None,
+                    simple_row_id_join_projection: None,
+                    simple_scalar_filtered_aggregate: None,
+                    prepared_insert: None,
+                    prepared_update: None,
+                    prepared_delete: bundle.prepared_delete,
+                    read_only: false,
+                });
+            }
+        }
         let statement = self.parsed_statement(&prepared_sql)?;
         let read_only = statement_is_read_only(statement.as_ref());
         let (prepared_insert, prepared_update, prepared_delete) = match statement.as_ref() {
@@ -10303,6 +10531,15 @@ impl Db {
                         &child_index_targets,
                         snapshot_lsn,
                     )?;
+                    if runtime.can_reuse_prepared_simple_delete(&prepared_delete) {
+                        let result = runtime.execute_prepared_simple_delete(
+                            &prepared_delete,
+                            params,
+                            self.inner.config.page_size,
+                        )?;
+                        *persistent_changed |= !temp_only;
+                        return Ok(result);
+                    }
                     if let Some(prepared_delete) = runtime.prepare_simple_delete(delete)? {
                         let result = runtime.execute_prepared_simple_delete(
                             &prepared_delete,

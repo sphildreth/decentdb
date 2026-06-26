@@ -39,6 +39,59 @@ mod tests {
     }
 
     #[test]
+    fn table_data_row_lookup_after_tombstone_handles_sparse_high_row_ids() {
+        let mut rows = (1_i64..=10)
+            .chain(40_000_i64..40_005)
+            .map(|row_id| StoredRow {
+                row_id,
+                values: vec![Value::Int64(row_id)],
+            })
+            .collect::<Vec<_>>();
+        rows.sort_by_key(|row| row.row_id);
+        let mut data = TableData::from_rows(rows);
+
+        assert_eq!(data.mark_rows_deleted([&40_000].into_iter()), 1);
+        let row = data
+            .row_by_id(40_004)
+            .expect("high row should remain visible");
+        assert_eq!(row.values, vec![Value::Int64(40_004)]);
+        assert!(data.row_by_id(40_000).is_none());
+    }
+
+    #[test]
+    fn table_data_row_ids_in_range_uses_sorted_fast_path_and_unsorted_fallback() {
+        let mut sorted = TableData::from_rows(
+            [1_i64, 2, 3, 40_000, 40_001, 40_002]
+                .into_iter()
+                .map(|row_id| StoredRow {
+                    row_id,
+                    values: vec![Value::Int64(row_id)],
+                })
+                .collect(),
+        );
+        assert_eq!(
+            sorted.row_ids_in_range(40_000, 40_002),
+            vec![40_000, 40_001, 40_002]
+        );
+        sorted.mark_existing_row_set_deleted(&BTreeSet::from([40_001]));
+        assert_eq!(
+            sorted.row_ids_in_range(40_000, 40_002),
+            vec![40_000, 40_002]
+        );
+
+        let unsorted = TableData::from_rows(
+            [10_i64, 3, 8, 4]
+                .into_iter()
+                .map(|row_id| StoredRow {
+                    row_id,
+                    values: vec![Value::Int64(row_id)],
+                })
+                .collect(),
+        );
+        assert_eq!(unsorted.row_ids_in_range(3, 8), vec![3, 8, 4]);
+    }
+
+    #[test]
     fn runtime_row_id_set_basic() {
         assert_eq!(RuntimeRowIdSet::Empty.len(), 0);
         assert!(RuntimeRowIdSet::Empty.is_empty());
@@ -85,6 +138,9 @@ mod tests {
             other => panic!("unexpected: {:?}", other),
         }
         assert_eq!(keys3.row_ids_for_key(&key4), vec![1, 2]);
+        let mut keys3_deleted = keys3.clone();
+        keys3_deleted.mark_row_ids_deleted([2]);
+        assert_eq!(keys3_deleted.row_ids_for_key(&key4), vec![1]);
 
         // UniqueInt64
         let mut ui: Int64Map<i64> = Int64Map::default();

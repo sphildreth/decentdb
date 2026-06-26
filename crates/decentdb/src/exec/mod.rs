@@ -82,7 +82,7 @@ use crate::sql::ast::{
     Select, SelectItem, Statement, SubqueryQuantifier, TruncateIdentityMode, UnaryOp,
 };
 use crate::sql::parser::parse_sql_statement;
-use crate::storage::checksum::crc32c_parts;
+use crate::storage::checksum::{crc32c_parts, crc32c_patch_bytes};
 use crate::storage::page::{self, PageId, PageStore};
 use crate::storage::PagerHandle;
 use crate::wal::WalHandle;
@@ -349,11 +349,23 @@ impl DeferredPagedRowLocatorCache {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct TableData {
     pub(crate) rows: Arc<Vec<StoredRow>>,
     tombstoned_row_ids: BTreeSet<i64>,
+    rows_sorted_by_id: bool,
     cached_heap_bytes: usize,
+}
+
+impl Default for TableData {
+    fn default() -> Self {
+        Self {
+            rows: Arc::new(Vec::new()),
+            tombstoned_row_ids: BTreeSet::new(),
+            rows_sorted_by_id: true,
+            cached_heap_bytes: 0,
+        }
+    }
 }
 
 impl Clone for TableData {
@@ -361,6 +373,7 @@ impl Clone for TableData {
         Self {
             rows: Arc::clone(&self.rows),
             tombstoned_row_ids: self.tombstoned_row_ids.clone(),
+            rows_sorted_by_id: self.rows_sorted_by_id,
             cached_heap_bytes: self.cached_heap_bytes,
         }
     }
@@ -368,15 +381,19 @@ impl Clone for TableData {
 
 impl PartialEq for TableData {
     fn eq(&self, other: &Self) -> bool {
-        self.rows == other.rows && self.tombstoned_row_ids == other.tombstoned_row_ids
+        self.rows == other.rows
+            && self.tombstoned_row_ids == other.tombstoned_row_ids
+            && self.rows_sorted_by_id == other.rows_sorted_by_id
     }
 }
 
 impl TableData {
     pub(crate) fn from_rows(rows: Vec<StoredRow>) -> Self {
+        let rows_sorted_by_id = rows.windows(2).all(|pair| pair[0].row_id <= pair[1].row_id);
         let mut data = Self {
             rows: Arc::new(rows),
             tombstoned_row_ids: BTreeSet::new(),
+            rows_sorted_by_id,
             cached_heap_bytes: 0,
         };
         data.cached_heap_bytes = data.compute_heap_bytes();
@@ -421,6 +438,19 @@ impl TableData {
             .count()
     }
 
+    pub(crate) fn mark_existing_row_set_deleted(&mut self, row_ids: &BTreeSet<i64>) -> usize {
+        if row_ids.is_empty() {
+            return 0;
+        }
+        let before = self.tombstoned_row_ids.len();
+        if self.tombstoned_row_ids.is_empty() {
+            self.tombstoned_row_ids = row_ids.clone();
+        } else {
+            self.tombstoned_row_ids.extend(row_ids.iter().copied());
+        }
+        self.tombstoned_row_ids.len().saturating_sub(before)
+    }
+
     #[cfg(test)]
     pub(crate) fn reserve_rows(&mut self, additional: usize) {
         let rows = Arc::make_mut(&mut self.rows);
@@ -436,6 +466,7 @@ impl TableData {
     pub(crate) fn clear_rows(&mut self) {
         self.rows = Arc::new(Vec::new());
         self.tombstoned_row_ids.clear();
+        self.rows_sorted_by_id = true;
         self.cached_heap_bytes = 0;
     }
 
@@ -457,9 +488,6 @@ impl TableData {
         if self.is_row_tombstoned(row_id) {
             return None;
         }
-        if !self.tombstoned_row_ids.is_empty() {
-            return self.rows.iter().position(|row| row.row_id == row_id);
-        }
         if let Some(index) = row_id
             .checked_sub(1)
             .and_then(|value| usize::try_from(value).ok())
@@ -471,11 +499,44 @@ impl TableData {
             }
         }
 
-        if let Ok(index) = self.rows.binary_search_by_key(&row_id, |row| row.row_id) {
-            return Some(index);
+        if self.rows_sorted_by_id {
+            if let Ok(index) = self.rows.binary_search_by_key(&row_id, |row| row.row_id) {
+                return Some(index);
+            }
         }
 
         self.rows.iter().position(|row| row.row_id == row_id)
+    }
+
+    pub(crate) fn row_ids_in_range(&self, low: i64, high: i64) -> Vec<i64> {
+        if low > high {
+            return Vec::new();
+        }
+        if self.rows_sorted_by_id {
+            let rows = self.rows.as_ref();
+            let start = rows.partition_point(|row| row.row_id < low);
+            let end = start + rows[start..].partition_point(|row| row.row_id <= high);
+            return rows[start..end]
+                .iter()
+                .filter_map(|row| {
+                    if self.is_row_tombstoned(row.row_id) {
+                        None
+                    } else {
+                        Some(row.row_id)
+                    }
+                })
+                .collect();
+        }
+        self.rows
+            .iter()
+            .filter_map(|row| {
+                if row.row_id >= low && row.row_id <= high && !self.is_row_tombstoned(row.row_id) {
+                    Some(row.row_id)
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     pub(super) fn row_by_id(&self, row_id: i64) -> Option<&StoredRow> {
@@ -554,6 +615,12 @@ impl TableData {
         let rows = Arc::make_mut(&mut self.rows);
         let old_capacity = rows.capacity();
         let row_heap_bytes = Self::row_heap_bytes(&row);
+        if rows
+            .last()
+            .is_some_and(|previous| previous.row_id > row.row_id)
+        {
+            self.rows_sorted_by_id = false;
+        }
         rows.push(row);
         self.cached_heap_bytes = self
             .cached_heap_bytes
@@ -1738,20 +1805,7 @@ impl TableRowSource {
             return Vec::new();
         }
         match self {
-            Self::Resident(data) => data
-                .rows
-                .iter()
-                .filter_map(|row| {
-                    if row.row_id >= low
-                        && row.row_id <= high
-                        && !data.is_row_tombstoned(row.row_id)
-                    {
-                        Some(row.row_id)
-                    } else {
-                        None
-                    }
-                })
-                .collect(),
+            Self::Resident(data) => data.row_ids_in_range(low, high),
             Self::Paged(manifest) => manifest.row_ids_in_range(low, high),
         }
     }
@@ -2354,6 +2408,22 @@ impl RuntimeBtreeKeys {
             }
         }
         Ok(())
+    }
+
+    pub(super) fn mark_row_ids_deleted<I>(&mut self, row_ids: I)
+    where
+        I: IntoIterator<Item = i64>,
+    {
+        match self {
+            Self::UniqueEncoded(_, deleted)
+            | Self::NonUniqueEncoded(_, deleted)
+            | Self::UniqueInt64(_, deleted)
+            | Self::NonUniqueInt64(_, deleted)
+            | Self::UniqueUuid(_, deleted)
+            | Self::NonUniqueUuid(_, deleted) => {
+                deleted.extend(row_ids);
+            }
+        }
     }
 
     pub(crate) fn total_row_id_count(&self) -> usize {
@@ -4130,6 +4200,127 @@ impl EngineRuntime {
                         && previous_pointer.head_page_id != 0
                         && !previous_pointer.is_compressed()
                     {
+                        if let (Some(cached), Some(locators)) = (
+                            self.cached_payload_take(&canonical_table_name),
+                            resident_tombstone_locators.as_deref(),
+                        ) {
+                            let mut payload = Arc::try_unwrap(cached)
+                                .unwrap_or_else(|arc| arc.as_slice().to_vec());
+                            if let Some((dirty_ranges, checksum)) =
+                                tombstone_deleted_rows_cached_payload_by_locator(
+                                    &mut payload,
+                                    &delta.deleted_rows,
+                                    locators,
+                                    previous_state.checksum,
+                                )?
+                            {
+                                let chain_cache =
+                                    match self.overflow_chain_caches.get(&canonical_table_name) {
+                                        Some(cache) => cache.clone(),
+                                        None => build_overflow_chain_cache(
+                                            &store,
+                                            previous_pointer.head_page_id,
+                                        )?,
+                                    };
+                                let (pointer, new_chain_cache, tail) =
+                                    rewrite_overflow_cached_with_dirty_byte_ranges(
+                                        &mut store,
+                                        previous_pointer,
+                                        &payload,
+                                        &chain_cache.page_ids,
+                                        0,
+                                        Some(dirty_ranges.as_slice()),
+                                    )?;
+                                self.overflow_chain_caches
+                                    .insert(canonical_table_name.clone(), new_chain_cache);
+                                self.persisted_tables_mut().insert(
+                                    canonical_table_name.clone(),
+                                    PersistedTableState {
+                                        pointer,
+                                        checksum,
+                                        row_count: data.row_count(),
+                                        tail,
+                                        pk_index_root: previous_state.pk_index_root,
+                                    },
+                                );
+                                replace_table_pk_index_root(self, db, &canonical_table_name, None)?;
+                                self.cache_payload_insert(
+                                    canonical_table_name.clone(),
+                                    Arc::new(payload),
+                                );
+                                continue;
+                            }
+                            self.cache_payload_insert(
+                                canonical_table_name.clone(),
+                                Arc::new(payload),
+                            );
+                        }
+                    }
+
+                    if !db.config().paged_row_storage
+                        && !db.config().persistent_pk_index
+                        && previous_pointer.head_page_id != 0
+                        && !previous_pointer.is_compressed()
+                    {
+                        if let Some(cached) = self.cached_payload_take(&canonical_table_name) {
+                            let mut payload = Arc::try_unwrap(cached)
+                                .unwrap_or_else(|arc| arc.as_slice().to_vec());
+                            if let Some(dirty_ranges) = truncate_tail_deleted_rows_payload(
+                                &mut payload,
+                                &delta.deleted_rows,
+                                data.row_count(),
+                            )? {
+                                let checksum = crc32c_parts(&[payload.as_slice()]);
+                                let chain_cache =
+                                    match self.overflow_chain_caches.get(&canonical_table_name) {
+                                        Some(cache) => cache.clone(),
+                                        None => build_overflow_chain_cache(
+                                            &store,
+                                            previous_pointer.head_page_id,
+                                        )?,
+                                    };
+                                let (pointer, new_chain_cache, tail) =
+                                    rewrite_overflow_cached_with_dirty_byte_ranges(
+                                        &mut store,
+                                        previous_pointer,
+                                        &payload,
+                                        &chain_cache.page_ids,
+                                        0,
+                                        Some(dirty_ranges.as_slice()),
+                                    )?;
+                                self.overflow_chain_caches
+                                    .insert(canonical_table_name.clone(), new_chain_cache);
+                                self.persisted_tables_mut().insert(
+                                    canonical_table_name.clone(),
+                                    PersistedTableState {
+                                        pointer,
+                                        checksum,
+                                        row_count: data.row_count(),
+                                        tail,
+                                        pk_index_root: previous_state.pk_index_root,
+                                    },
+                                );
+                                replace_table_pk_index_root(self, db, &canonical_table_name, None)?;
+                                self.resident_tombstone_locators_mut()
+                                    .remove(&canonical_table_name);
+                                self.cache_payload_insert(
+                                    canonical_table_name.clone(),
+                                    Arc::new(payload),
+                                );
+                                continue;
+                            }
+                            self.cache_payload_insert(
+                                canonical_table_name.clone(),
+                                Arc::new(payload),
+                            );
+                        }
+                    }
+
+                    if !db.config().paged_row_storage
+                        && !db.config().persistent_pk_index
+                        && previous_pointer.head_page_id != 0
+                        && !previous_pointer.is_compressed()
+                    {
                         let chain_cache =
                             match self.overflow_chain_caches.get(&canonical_table_name) {
                                 Some(cache) => Some(cache.clone()),
@@ -5333,6 +5524,32 @@ impl EngineRuntime {
             .or_default()
             .deleted_rows
             .insert(row_id);
+    }
+
+    pub(super) fn mark_table_rows_deleted(&mut self, table_name: &str, row_ids: &BTreeSet<i64>) {
+        if row_ids.is_empty() || self.visible_table_is_temporary(table_name) {
+            return;
+        }
+        let Some(table_name) = self.canonical_catalog_table_name(table_name) else {
+            return;
+        };
+        self.catalog_mut().table_stats.remove(&table_name);
+        if self.dirty_tables.contains(&table_name)
+            && !self.paged_mutations.contains_key(&table_name)
+        {
+            return;
+        }
+        self.dirty_tables_mut().insert(table_name.clone());
+        let deleted_rows = &mut self
+            .paged_mutations
+            .entry(table_name)
+            .or_default()
+            .deleted_rows;
+        if deleted_rows.is_empty() {
+            *deleted_rows = row_ids.clone();
+        } else {
+            deleted_rows.extend(row_ids.iter().copied());
+        }
     }
 
     pub(super) fn mark_table_row_appended(&mut self, table_name: &str) {
@@ -26335,7 +26552,7 @@ fn plain_index_column_positions(index: &IndexSchema, table: &TableSchema) -> Opt
 /// plain TEXT column (no expression, no INCLUDE columns, no predicate, no
 /// virtual generated column). Returns `None` for any unsupported shape so
 /// the trigram build loop falls back to `compute_index_values`.
-fn plain_single_text_index_column_position(
+pub(super) fn plain_single_text_index_column_position(
     index: &IndexSchema,
     table: &TableSchema,
 ) -> Option<usize> {
@@ -30048,6 +30265,168 @@ fn tombstone_deleted_rows_payload_by_locator(
         let flagged = raw_len | TABLE_PAYLOAD_ROW_TOMBSTONE_FLAG;
         payload[len_field_offset..len_field_offset + 4].copy_from_slice(&flagged.to_le_bytes());
         dirty_ranges.push(len_field_offset..len_field_offset + 4);
+    }
+    Ok(Some(dirty_ranges))
+}
+
+fn tombstone_deleted_rows_cached_payload_by_locator(
+    payload: &mut [u8],
+    deleted_row_ids: &BTreeSet<i64>,
+    locators: &Int64Map<u32>,
+    previous_checksum: u32,
+) -> Result<Option<(Vec<Range<usize>>, u32)>> {
+    const HEADER_LEN: usize = 8 /* magic */ + 4 /* row_count */;
+
+    if deleted_row_ids.is_empty() {
+        return Ok(Some((Vec::new(), previous_checksum)));
+    }
+    if payload.len() < HEADER_LEN || payload[..8] != *TABLE_PAYLOAD_MAGIC {
+        return Ok(None);
+    }
+
+    let mut patches = Vec::with_capacity(deleted_row_ids.len());
+    let mut span_start = usize::MAX;
+    let mut span_end = 0usize;
+    for row_id in deleted_row_ids {
+        let Some(&len_field_offset) = locators.get(row_id) else {
+            return Ok(None);
+        };
+        let len_field_offset = len_field_offset as usize;
+        if len_field_offset < 8 || len_field_offset + 4 > payload.len() {
+            return Ok(None);
+        }
+        let row_id_offset = len_field_offset - 8;
+        let actual_row_id = i64::from_le_bytes(
+            payload[row_id_offset..row_id_offset + 8]
+                .try_into()
+                .expect("row id length"),
+        );
+        if actual_row_id != *row_id {
+            return Ok(None);
+        }
+        let raw_len = u32::from_le_bytes(
+            payload[len_field_offset..len_field_offset + 4]
+                .try_into()
+                .expect("row data len"),
+        );
+        let (is_tombstone, body_len) = split_table_payload_row_len(raw_len);
+        let Some(row_end) = len_field_offset
+            .checked_add(4)
+            .and_then(|value| value.checked_add(body_len))
+        else {
+            return Ok(None);
+        };
+        if row_end > payload.len() || is_tombstone {
+            return Ok(None);
+        }
+        let new_bytes = (raw_len | TABLE_PAYLOAD_ROW_TOMBSTONE_FLAG).to_le_bytes();
+        span_start = span_start.min(len_field_offset);
+        span_end = span_end.max(len_field_offset + 4);
+        patches.push((len_field_offset, new_bytes));
+    }
+
+    if patches.is_empty() {
+        return Ok(Some((Vec::new(), previous_checksum)));
+    }
+    let old_span = payload[span_start..span_end].to_vec();
+    let mut dirty_ranges = Vec::with_capacity(patches.len());
+    for (offset, new_bytes) in patches {
+        if payload[offset..offset + 4] != new_bytes {
+            payload[offset..offset + 4].copy_from_slice(&new_bytes);
+            dirty_ranges.push(offset..offset + 4);
+        }
+    }
+    let checksum = crc32c_patch_bytes(
+        previous_checksum,
+        payload.len(),
+        span_start,
+        &old_span,
+        &payload[span_start..span_end],
+    )
+    .ok_or_else(|| DbError::internal("resident tombstone checksum patch failed"))?;
+    Ok(Some((dirty_ranges, checksum)))
+}
+
+fn truncate_tail_deleted_rows_payload(
+    payload: &mut Vec<u8>,
+    deleted_row_ids: &BTreeSet<i64>,
+    live_row_count: usize,
+) -> Result<Option<Vec<Range<usize>>>> {
+    const HEADER_LEN: usize = 8 /* magic */ + 4 /* row_count */;
+
+    if deleted_row_ids.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    if payload.len() < HEADER_LEN || payload[..8] != *TABLE_PAYLOAD_MAGIC {
+        return Ok(None);
+    }
+    let physical_row_count =
+        u32::from_le_bytes(payload[8..12].try_into().expect("row-count header length")) as usize;
+    if physical_row_count != live_row_count.saturating_add(deleted_row_ids.len()) {
+        return Ok(None);
+    }
+
+    let mut offset = HEADER_LEN;
+    let mut first_deleted_offset = None;
+    let mut deleted_seen = 0usize;
+    for _ in 0..physical_row_count {
+        if offset + 12 > payload.len() {
+            return Ok(None);
+        }
+        let row_start = offset;
+        let row_id = i64::from_le_bytes(
+            payload[offset..offset + 8]
+                .try_into()
+                .expect("row id length"),
+        );
+        let len_field_offset = offset + 8;
+        let raw_len = u32::from_le_bytes(
+            payload[len_field_offset..len_field_offset + 4]
+                .try_into()
+                .expect("row data len"),
+        );
+        let (is_tombstone, body_len) = split_table_payload_row_len(raw_len);
+        if is_tombstone {
+            return Ok(None);
+        }
+        let Some(row_end) = len_field_offset
+            .checked_add(4)
+            .and_then(|value| value.checked_add(body_len))
+        else {
+            return Ok(None);
+        };
+        if row_end > payload.len() {
+            return Ok(None);
+        }
+        if deleted_row_ids.contains(&row_id) {
+            if first_deleted_offset.is_none() {
+                first_deleted_offset = Some(row_start);
+            }
+            deleted_seen += 1;
+        } else if first_deleted_offset.is_some() {
+            return Ok(None);
+        }
+        offset = row_end;
+    }
+    if offset != payload.len() || deleted_seen != deleted_row_ids.len() {
+        return Ok(None);
+    }
+    let Some(truncate_at) = first_deleted_offset else {
+        return Ok(None);
+    };
+
+    payload[8..12].copy_from_slice(
+        &u32::try_from(live_row_count)
+            .map_err(|_| DbError::constraint("table row count exceeds u32"))?
+            .to_le_bytes(),
+    );
+    payload.truncate(truncate_at);
+
+    let mut dirty_ranges = Vec::with_capacity(2);
+    dirty_ranges.push(8..12);
+    if !payload.is_empty() {
+        let tail_start = payload.len().saturating_sub(1);
+        dirty_ranges.push(tail_start..payload.len());
     }
     Ok(Some(dirty_ranges))
 }

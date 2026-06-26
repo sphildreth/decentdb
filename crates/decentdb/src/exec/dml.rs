@@ -22,10 +22,11 @@ use crate::sync::{self, SyncOperation};
 use super::row::{ColumnBinding, Dataset, QueryResult, QueryRow};
 use super::{
     compare_values, compute_index_key, compute_index_values, covering_payload_values_for_row,
-    generated_columns_are_stored, infer_expr_name, row_satisfies_index_predicate,
-    row_satisfies_index_predicate_with_expr, spatial_index_value_for_row, table_row_dataset,
-    EngineRuntime, RuntimeBtreeKey, RuntimeIndex, RuntimeRowIdSet, StoredRow, TablePageManifest,
-    TableRowRef, TableRowSource, PAGED_TABLE_RESIDENT_APPEND_ROW_THRESHOLD,
+    generated_columns_are_stored, infer_expr_name, plain_single_text_index_column_position,
+    row_satisfies_index_predicate, row_satisfies_index_predicate_with_expr,
+    spatial_index_value_for_row, table_row_dataset, EngineRuntime, RuntimeBtreeKey, RuntimeIndex,
+    RuntimeRowIdSet, StoredRow, TablePageManifest, TableRowRef, TableRowSource,
+    PAGED_TABLE_RESIDENT_APPEND_ROW_THRESHOLD,
 };
 
 #[derive(Clone, Debug)]
@@ -1370,6 +1371,61 @@ impl EngineRuntime {
         }))
     }
 
+    pub(crate) fn prepare_simple_row_id_range_delete(
+        &self,
+        table_name: &str,
+        column_name: &str,
+        low: i64,
+        high: i64,
+    ) -> Result<Option<PreparedSimpleDelete>> {
+        let table = self
+            .table_schema(table_name)
+            .cloned()
+            .ok_or_else(|| DbError::sql(format!("unknown table {table_name}")))?;
+        if !row_id_alias_column_name(&table)
+            .is_some_and(|name| identifiers_equal(name, column_name))
+        {
+            return Ok(None);
+        }
+        let Some(restrict_children) =
+            prepare_simple_delete_prepared_restrict_children(self, &table)?
+        else {
+            return Ok(None);
+        };
+        let Some(delete_children) = prepare_simple_delete_cascade_children(self, &table)? else {
+            return Ok(None);
+        };
+        let (delete_children_by_table, table_indexes_by_table) =
+            prepare_delete_children_and_indexes(self, &table)?;
+        let dependency_table_names = collect_delete_dependency_tables(self, &table.name);
+        let indexes = self
+            .catalog
+            .indexes
+            .values()
+            .filter(|index| identifiers_equal(&index.table_name, &table.name))
+            .cloned()
+            .collect::<Vec<_>>();
+        let prepared_table_name = match super::compat_schema_qualified_name(table_name).0 {
+            Some(super::CompatSchemaQualifier::Main) => format!("main.{}", table.name),
+            _ => table.name.clone(),
+        };
+        Ok(Some(PreparedSimpleDelete {
+            table_name: prepared_table_name,
+            table,
+            indexes,
+            lookup: PreparedDeleteLookup::RowIdRange {
+                low_source: PreparedSimpleValueSource::Literal(Value::Int64(low)),
+                high_source: PreparedSimpleValueSource::Literal(Value::Int64(high)),
+            },
+            restrict_children,
+            delete_children_by_table,
+            table_indexes_by_table,
+            delete_children,
+            dependency_table_names,
+            compiled_index_state_epoch: self.index_state_epoch,
+        }))
+    }
+
     pub(crate) fn can_reuse_prepared_simple_delete(&self, prepared: &PreparedSimpleDelete) -> bool {
         // Schema cookie is validated before this is called, so the table exists.
         // Only check temp-table shadowing and index state.
@@ -1391,6 +1447,8 @@ impl EngineRuntime {
         params: &[Value],
         _page_size: u32,
     ) -> Result<QueryResult> {
+        let lookup_validated_live_rows =
+            !matches!(prepared.lookup, PreparedDeleteLookup::Index { .. });
         let matching_row_ids = match &prepared.lookup {
             PreparedDeleteLookup::RowId(value_source) => {
                 let Value::Int64(row_id) = resolve_prepared_simple_value(value_source, params)?
@@ -1434,17 +1492,21 @@ impl EngineRuntime {
                 row_id_set_to_vec(keys.row_ids_for_value_set(&value)?)
             }
         };
-        let matching_row_ids = match self.visible_table_row_source(&prepared.table_name) {
-            Some(row_source) => {
-                let mut live_row_ids = Vec::with_capacity(matching_row_ids.len());
-                for row_id in matching_row_ids {
-                    if row_source.row_by_id(row_id)?.is_some() {
-                        live_row_ids.push(row_id);
+        let matching_row_ids = if lookup_validated_live_rows {
+            matching_row_ids
+        } else {
+            match self.visible_table_row_source(&prepared.table_name) {
+                Some(row_source) => {
+                    let mut live_row_ids = Vec::with_capacity(matching_row_ids.len());
+                    for row_id in matching_row_ids {
+                        if row_source.row_by_id(row_id)?.is_some() {
+                            live_row_ids.push(row_id);
+                        }
                     }
+                    live_row_ids
                 }
-                live_row_ids
+                None => Vec::new(),
             }
-            None => Vec::new(),
         };
         if matching_row_ids.is_empty() {
             return Ok(QueryResult::with_affected_rows(0));
@@ -1492,37 +1554,24 @@ impl EngineRuntime {
 
             let affected_rows = matching_row_ids.len();
             let deleted_row_ids = matching_row_ids.iter().copied().collect::<BTreeSet<_>>();
-            let removed_rows_for_indexes = if prepared.indexes.is_empty() {
-                Vec::new()
-            } else if matches!(
-                self.table_row_source(&prepared.table_name),
-                Some(TableRowSource::Resident(_))
-            ) {
-                let row_source = self.table_row_source(&prepared.table_name).ok_or_else(|| {
-                    DbError::internal(format!("table data for {} is missing", prepared.table_name))
-                })?;
-                let mut rows = Vec::with_capacity(matching_row_ids.len());
-                for &row_id in &matching_row_ids {
-                    let row = row_source.row_by_id(row_id)?.ok_or_else(|| {
-                        DbError::internal(format!("row {row_id} vanished during DELETE"))
-                    })?;
-                    rows.push(StoredRow {
-                        row_id,
-                        values: row.values().to_vec(),
-                    });
-                }
-                rows
-            } else {
-                Vec::new()
-            };
             let mut stale_indexes = Vec::new();
             match self.table_row_source(&prepared.table_name) {
                 Some(TableRowSource::Resident(_)) => {
-                    stale_indexes.extend(incremental_delete_indexes(
+                    let row_source = self
+                        .table_row_source(&prepared.table_name)
+                        .cloned()
+                        .ok_or_else(|| {
+                            DbError::internal(format!(
+                                "table data for {} is missing",
+                                prepared.table_name
+                            ))
+                        })?;
+                    stale_indexes.extend(incremental_delete_indexes_by_row_id(
                         self,
                         &prepared.table,
                         &prepared.indexes,
-                        &removed_rows_for_indexes,
+                        &deleted_row_ids,
+                        &row_source,
                     )?);
                     let table_data =
                         self.table_data_mut(&prepared.table_name).ok_or_else(|| {
@@ -1531,10 +1580,8 @@ impl EngineRuntime {
                                 prepared.table_name
                             ))
                         })?;
-                    table_data.mark_rows_deleted(deleted_row_ids.iter());
-                    for &row_id in &matching_row_ids {
-                        self.mark_table_row_deleted(&prepared.table_name, row_id);
-                    }
+                    table_data.mark_existing_row_set_deleted(&deleted_row_ids);
+                    self.mark_table_rows_deleted(&prepared.table_name, &deleted_row_ids);
                 }
                 Some(TableRowSource::Paged(manifest)) => {
                     let updated_manifest = super::apply_paged_row_deletions_to_manifest(
@@ -6888,6 +6935,113 @@ fn apply_runtime_index_delete_for_rows(
     apply_runtime_index_delete_for_rows_with_predicate(runtime, table, index, rows, None, None)
 }
 
+fn incremental_delete_indexes_by_row_id(
+    runtime: &mut EngineRuntime,
+    table: &crate::catalog::TableSchema,
+    table_indexes: &[crate::catalog::IndexSchema],
+    row_ids: &BTreeSet<i64>,
+    row_source: &TableRowSource,
+) -> Result<Vec<String>> {
+    let mut stale_indexes = Vec::new();
+    for index in table_indexes {
+        if !index.fresh {
+            stale_indexes.push(index.name.clone());
+            continue;
+        }
+        let applied = match index.kind {
+            IndexKind::Btree => {
+                if let Some(RuntimeIndex::Btree { keys, covering }) = runtime.index_mut(&index.name)
+                {
+                    keys.mark_row_ids_deleted(row_ids.iter().copied());
+                    if let Some(covering) = covering.as_mut() {
+                        for row_id in row_ids {
+                            covering.remove_row_id(*row_id);
+                        }
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
+            IndexKind::FullText => {
+                let row_ids = row_ids
+                    .iter()
+                    .map(|row_id| {
+                        u64::try_from(*row_id)
+                            .map_err(|_| DbError::internal(format!("row_id {row_id} is invalid")))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                if let Some(RuntimeIndex::FullText { index: fulltext }) =
+                    runtime.index_mut(&index.name)
+                {
+                    fulltext.delete_documents(row_ids);
+                    true
+                } else {
+                    false
+                }
+            }
+            IndexKind::Trigram => {
+                apply_trigram_delete_by_row_id(runtime, table, index, row_ids, row_source)?
+            }
+            IndexKind::Spatial => {
+                let rows = materialize_rows_for_delete(row_ids, row_source)?;
+                apply_runtime_index_delete_for_rows(runtime, table, index, &rows)?
+            }
+        };
+        if !applied {
+            stale_indexes.push(index.name.clone());
+        }
+    }
+    Ok(stale_indexes)
+}
+
+fn apply_trigram_delete_by_row_id(
+    runtime: &mut EngineRuntime,
+    table: &crate::catalog::TableSchema,
+    index: &crate::catalog::IndexSchema,
+    row_ids: &BTreeSet<i64>,
+    row_source: &TableRowSource,
+) -> Result<bool> {
+    let Some(position) = plain_single_text_index_column_position(index, table) else {
+        let rows = materialize_rows_for_delete(row_ids, row_source)?;
+        return apply_runtime_index_delete_for_rows(runtime, table, index, &rows);
+    };
+    let mut deletions = Vec::new();
+    for row_id in row_ids {
+        let row = row_source
+            .row_by_id(*row_id)?
+            .ok_or_else(|| DbError::internal(format!("row {row_id} vanished during DELETE")))?;
+        let Some(Value::Text(text)) = row.values().get(position) else {
+            continue;
+        };
+        let row_id = u64::try_from(*row_id)
+            .map_err(|_| DbError::internal(format!("row_id {row_id} is invalid")))?;
+        deletions.push((row_id, text.clone()));
+    }
+    let Some(RuntimeIndex::Trigram { index: trigram }) = runtime.index_mut(&index.name) else {
+        return Ok(false);
+    };
+    trigram.queue_delete_documents(deletions);
+    Ok(true)
+}
+
+fn materialize_rows_for_delete(
+    row_ids: &BTreeSet<i64>,
+    row_source: &TableRowSource,
+) -> Result<Vec<StoredRow>> {
+    let mut rows = Vec::with_capacity(row_ids.len());
+    for row_id in row_ids {
+        let row = row_source
+            .row_by_id(*row_id)?
+            .ok_or_else(|| DbError::internal(format!("row {row_id} vanished during DELETE")))?;
+        rows.push(StoredRow {
+            row_id: *row_id,
+            values: row.values().to_vec(),
+        });
+    }
+    Ok(rows)
+}
+
 fn apply_runtime_index_delete_for_rows_with_predicate(
     runtime: &mut EngineRuntime,
     table: &crate::catalog::TableSchema,
@@ -6937,6 +7091,19 @@ fn apply_runtime_index_delete_for_rows_with_predicate(
             Ok(true)
         }
         IndexKind::Btree => {
+            if index.predicate_sql.is_none() && !index.unique {
+                let Some(RuntimeIndex::Btree { keys, covering }) = runtime.index_mut(&index.name)
+                else {
+                    return Ok(false);
+                };
+                keys.mark_row_ids_deleted(rows.iter().map(|row| row.row_id));
+                if let Some(covering) = covering.as_mut() {
+                    for row in rows {
+                        covering.remove_row_id(row.row_id);
+                    }
+                }
+                return Ok(true);
+            }
             let predicate_expr = pre_parsed_predicate.or(shared_predicate);
             let prepared_keys = rows
                 .iter()
