@@ -413,20 +413,6 @@ def build_benchmark_specs(args: argparse.Namespace, output_dir: Path) -> list[Be
                     ),
                     notes="Large MovieDB workload matching the first .NET harness.",
                 ),
-                BenchmarkSpec(
-                    label="Showdown GLM52 native defaults",
-                    args=(
-                        "--workload",
-                        "showdown",
-                        "--showdown-scale",
-                        "glm52",
-                        "--decentdb-options",
-                        "",
-                        "--db-prefix",
-                        str(output_dir / "showdown_native_defaults"),
-                    ),
-                    notes="Checks DecentDB defaults, not the embedded-fast profile.",
-                ),
             ]
         )
 
@@ -444,7 +430,7 @@ def benchmark_command(
         command.extend(["--sqlite-profile", args.sqlite_profile])
     if args.sqlite_cache_mb is not None:
         command.extend(["--sqlite-cache-mb", str(args.sqlite_cache_mb)])
-    if args.decentdb_options is not None and "Showdown GLM52 native defaults" != spec.label:
+    if args.decentdb_options is not None:
         command.extend(["--decentdb-options", args.decentdb_options])
     return command
 
@@ -864,8 +850,8 @@ def parse_args() -> argparse.Namespace:
         default="full",
         help=(
             "quick: reduced Showdown repetitions only; standard: quick plus "
-            "Showdown smoke; full: standard plus GLM52, MovieDB scratch, and "
-            "native-defaults validation (default: full)"
+            "Showdown smoke; full: standard plus comparable-profile GLM52 and "
+            "MovieDB scratch validations (default: full)"
         ),
     )
     parser.add_argument(
@@ -943,10 +929,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--decentdb-options",
         default=None,
-        help=(
-            "Override DecentDB options for regular benchmark runs. The native-defaults "
-            "validation still passes an empty options string."
-        ),
+        help="Override DecentDB options for benchmark runs.",
     )
     parser.add_argument(
         "--dry-run",

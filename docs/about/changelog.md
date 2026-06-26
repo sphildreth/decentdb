@@ -39,6 +39,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   SQL parser work, deleting runtime index entries by row id, applying logical
   full-text/trigram delete overlays, and patching resident overflow payloads
   in place.
+- Removed the DecentDB native-defaults Showdown run from
+  `scripts/benchmark_runner.py` comparison profiles so SQLite gap rankings
+  compare like-for-like benchmark configurations.
 
 ### Fixed
 
