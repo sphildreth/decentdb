@@ -154,7 +154,7 @@ plan_cache_max_bytes=<bytes>
 The plan cache options are additive: old binaries that do not set them
 get the new default behavior (connection-local plan caching enabled,
 default 256 KiB). To opt out, set `plan_cache_enabled=false`. See
-`design/WIN_QUERY_PLAN_CACHING_AND_STATEMENT_REUSE.md` and ADR 0190-0194
+`design/_archive/WIN_QUERY_PLAN_CACHING_AND_STATEMENT_REUSE.md` and ADR 0190-0194
 for the full contract.
 
 Use `required` for applications that must fail when cross-process protection is

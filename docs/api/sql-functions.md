@@ -176,7 +176,7 @@ hit count, last-used timestamp, and a closed-enum statement category.
 `total_size_bytes`, `max_size_bytes`, `total_oversized_refusals`,
 `hit_rate`). Neither view exposes the full SQL text of cached
 statements. Use `PRAGMA flush_plan_cache` to evict all entries and
-reset the counters. See `design/WIN_QUERY_PLAN_CACHING_AND_STATEMENT_REUSE.md`
+reset the counters. See `design/_archive/WIN_QUERY_PLAN_CACHING_AND_STATEMENT_REUSE.md`
 and ADR 0190-0194 for the full contract.
 
 `sys.doctor_findings` includes current-connection plan-cache guidance when the

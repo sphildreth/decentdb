@@ -143,7 +143,7 @@ repair it by holding the initialization lock and scanning the database/WAL.
 
 ### References
 
-- `design/WIN_CROSS_PROCESS_WAL_COORDINATION_SPEC.md`
+- `design/_archive/WIN_CROSS_PROCESS_WAL_COORDINATION_SPEC.md`
 - `design/adr/0117-shared-wal-registry.md`
 - `design/adr/0119-rust-vfs-pread-pwrite.md`
 - `design/adr/0162-engine-owned-write-queue-strict-group-commit.md`

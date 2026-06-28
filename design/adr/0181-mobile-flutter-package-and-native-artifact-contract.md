@@ -130,7 +130,7 @@ artifact workflow.
 
 ### References
 
-- `design/WIN_MOBILE_PRODUCTION_RUNTIME_SDK_HARDENING_SPEC.md`
+- `design/_archive/WIN_MOBILE_PRODUCTION_RUNTIME_SDK_HARDENING_SPEC.md`
 - `include/decentdb.h`
 - `bindings/dart/README.md`
 - `docs/api/dart.md`

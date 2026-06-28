@@ -425,7 +425,7 @@ maintenance window.
 DecentDB ships a connection-local plan cache that reuses parsed parameterized
 statements and reusable prepared plans across calls within a single `Db` handle.
 The cache is enabled by default with a conservative 256 KiB total budget. See
-`design/WIN_QUERY_PLAN_CACHING_AND_STATEMENT_REUSE.md` and ADR 0190-0194 for
+`design/_archive/WIN_QUERY_PLAN_CACHING_AND_STATEMENT_REUSE.md` and ADR 0190-0194 for
 the full contract.
 
 Cache configuration:

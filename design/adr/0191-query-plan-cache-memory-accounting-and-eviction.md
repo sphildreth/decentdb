@@ -2,7 +2,7 @@
 
 **Date:** 2026-06-13
 **Status:** Accepted
-**Related spec:** [`../WIN_QUERY_PLAN_CACHING_AND_STATEMENT_REUSE.md`](../WIN_QUERY_PLAN_CACHING_AND_STATEMENT_REUSE.md)
+**Related spec:** [`../_archive/WIN_QUERY_PLAN_CACHING_AND_STATEMENT_REUSE.md`](../_archive/WIN_QUERY_PLAN_CACHING_AND_STATEMENT_REUSE.md)
 **Companion ADRs:** [0190](./0190-query-plan-cache-scope-key-and-lifecycle.md), [0192](./0192-query-plan-cache-security-generation-and-tde.md), [0193](./0193-query-plan-cache-c-abi-surface-and-binding-contract.md)
 
 ## Decision
@@ -221,7 +221,7 @@ memory subsystem:
 
 ## References
 
-- `design/WIN_QUERY_PLAN_CACHING_AND_STATEMENT_REUSE.md` §5.4,
+- `design/_archive/WIN_QUERY_PLAN_CACHING_AND_STATEMENT_REUSE.md` §5.4,
   §8.2, §8.3
 - `design/adr/0190-query-plan-cache-scope-key-and-lifecycle.md`
 - `design/adr/0184-default-fast-planner-and-runtime-contract.md`

@@ -120,7 +120,7 @@ into data loss.
 
 ### References
 
-- `design/WIN_MOBILE_PRODUCTION_RUNTIME_SDK_HARDENING_SPEC.md`
+- `design/_archive/WIN_MOBILE_PRODUCTION_RUNTIME_SDK_HARDENING_SPEC.md`
 - `design/adr/0174-local-data-security-tde-policies-masking-audit-context.md`
 - `docs/user-guide/security.md`
 - `docs/api/configuration.md`

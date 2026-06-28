@@ -4,7 +4,7 @@
 **Status:** DELIVERED
 **Delivered Version:** 2.8.0
 **Delivery note:** Implemented with stable structured diagnostics across Rust/C ABI, CLI/HTTP/WASM, and maintained bindings. Docs, fixtures, and validation now cover the first-slice contract.
-**Roadmap:** [`FUTURE_WINS.md`](FUTURE_WINS.md)
+**Roadmap:** [`FUTURE_WINS.md`](../FUTURE_WINS.md)
 **Document Type:** Implementation SPEC
 **Audience:** Core engine maintainers, C ABI maintainers, CLI maintainers,
 binding maintainers, WASM/browser maintainers, sync maintainers, Doctor and
@@ -15,9 +15,9 @@ future subcode is already covered.
 
 **Governing ADRs:**
 
-- [`adr/0010-error-handling-strategy.md`](adr/0010-error-handling-strategy.md)
-- [`adr/0118-rust-ffi-panic-safety.md`](adr/0118-rust-ffi-panic-safety.md)
-- [`adr/0185-rich-structured-error-diagnostics-contract.md`](adr/0185-rich-structured-error-diagnostics-contract.md)
+- [`adr/0010-error-handling-strategy.md`](../adr/0010-error-handling-strategy.md)
+- [`adr/0118-rust-ffi-panic-safety.md`](../adr/0118-rust-ffi-panic-safety.md)
+- [`adr/0185-rich-structured-error-diagnostics-contract.md`](../adr/0185-rich-structured-error-diagnostics-contract.md)
 
 **ADR-required follow-up decisions:**
 
@@ -34,16 +34,16 @@ future subcode is already covered.
 
 **Related inputs:**
 
-- [`FUTURE_WINS.md`](FUTURE_WINS.md)
-- [`docs/api/error-codes.md`](../docs/api/error-codes.md)
-- [`include/decentdb.h`](../include/decentdb.h)
-- [`design/adr/0163-operational-sys-metrics.md`](adr/0163-operational-sys-metrics.md)
-- [`design/adr/0174-local-data-security-tde-policies-masking-audit-context.md`](adr/0174-local-data-security-tde-policies-masking-audit-context.md)
-- [`design/adr/0179-cross-process-public-contract-bindings-and-diagnostics.md`](adr/0179-cross-process-public-contract-bindings-and-diagnostics.md)
-- [`docs/user-guide/write-concurrency.md`](../docs/user-guide/write-concurrency.md)
-- [`docs/user-guide/security.md`](../docs/user-guide/security.md)
-- [`docs/user-guide/sync/operations.md`](../docs/user-guide/sync/operations.md)
-- [`STABLE_TOOLING_METADATA_CONTRACT.md`](STABLE_TOOLING_METADATA_CONTRACT.md)
+- [`FUTURE_WINS.md`](../FUTURE_WINS.md)
+- [`docs/api/error-codes.md`](../../docs/api/error-codes.md)
+- [`include/decentdb.h`](../../include/decentdb.h)
+- [`design/adr/0163-operational-sys-metrics.md`](../adr/0163-operational-sys-metrics.md)
+- [`design/adr/0174-local-data-security-tde-policies-masking-audit-context.md`](../adr/0174-local-data-security-tde-policies-masking-audit-context.md)
+- [`design/adr/0179-cross-process-public-contract-bindings-and-diagnostics.md`](../adr/0179-cross-process-public-contract-bindings-and-diagnostics.md)
+- [`docs/user-guide/write-concurrency.md`](../../docs/user-guide/write-concurrency.md)
+- [`docs/user-guide/security.md`](../../docs/user-guide/security.md)
+- [`docs/user-guide/sync/operations.md`](../../docs/user-guide/sync/operations.md)
+- [`STABLE_TOOLING_METADATA_CONTRACT.md`](../STABLE_TOOLING_METADATA_CONTRACT.md)
 
 ---
 

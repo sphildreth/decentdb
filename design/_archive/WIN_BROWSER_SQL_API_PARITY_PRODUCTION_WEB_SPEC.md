@@ -3,7 +3,7 @@
 **Date:** 2026-05-27
 **Status:** Implemented
 **Future Version:** vNext
-**Roadmap:** [`FUTURE_WINS.md`](FUTURE_WINS.md)
+**Roadmap:** [`FUTURE_WINS.md`](../FUTURE_WINS.md)
 **Document Type:** Implementation SPEC
 **Audience:** Browser binding maintainers, wasm/VFS maintainers, SQL parser and
 executor maintainers, sync maintainers, documentation authors, benchmark
@@ -11,8 +11,8 @@ maintainers, coding agents
 
 **Governing ADRs:**
 
-- [`adr/0161-browser-wasm-opfs-runtime.md`](adr/0161-browser-wasm-opfs-runtime.md)
-- [`adr/0165-production-browser-runtime-contract.md`](adr/0165-production-browser-runtime-contract.md)
+- [`adr/0161-browser-wasm-opfs-runtime.md`](../adr/0161-browser-wasm-opfs-runtime.md)
+- [`adr/0165-production-browser-runtime-contract.md`](../adr/0165-production-browser-runtime-contract.md)
 
 **Required follow-up ADRs before implementation:**
 
@@ -32,15 +32,15 @@ recipes, a checked-in SQL parity corpus, and browser benchmark guardrails.
 
 **Related inputs:**
 
-- [`FUTURE_WINS.md`](FUTURE_WINS.md)
-- [`docs/api/wasm.md`](../docs/api/wasm.md)
-- [`bindings/web/README.md`](../bindings/web/README.md)
-- [`tests/bindings/web/README.md`](../tests/bindings/web/README.md)
-- [`docs/user-guide/sync/relay.md`](../docs/user-guide/sync/relay.md)
-- [`docs/user-guide/sync/changesets.md`](../docs/user-guide/sync/changesets.md)
+- [`FUTURE_WINS.md`](../FUTURE_WINS.md)
+- [`docs/api/wasm.md`](../../docs/api/wasm.md)
+- [`bindings/web/README.md`](../../bindings/web/README.md)
+- [`tests/bindings/web/README.md`](../../tests/bindings/web/README.md)
+- [`docs/user-guide/sync/relay.md`](../../docs/user-guide/sync/relay.md)
+- [`docs/user-guide/sync/changesets.md`](../../docs/user-guide/sync/changesets.md)
 - [`WIN_CROSS_PROCESS_WAL_COORDINATION_SPEC.md`](WIN_CROSS_PROCESS_WAL_COORDINATION_SPEC.md)
 - [`WIN_FULL_TEXT_SEARCH_BM25_SPEC.md`](WIN_FULL_TEXT_SEARCH_BM25_SPEC.md)
-- [`STABLE_TOOLING_METADATA_CONTRACT.md`](STABLE_TOOLING_METADATA_CONTRACT.md)
+- [`STABLE_TOOLING_METADATA_CONTRACT.md`](../STABLE_TOOLING_METADATA_CONTRACT.md)
 
 ---
 

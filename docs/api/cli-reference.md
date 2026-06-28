@@ -458,7 +458,7 @@ Supported options:
 Inspect or reset the connection-local plan cache. The plan cache is
 **enabled by default** and reduces redundant parse, resolve, and
 planner work for repeated prepared statements within a `Db` handle.
-See `design/WIN_QUERY_PLAN_CACHING_AND_STATEMENT_REUSE.md` and
+See `design/_archive/WIN_QUERY_PLAN_CACHING_AND_STATEMENT_REUSE.md` and
 ADR 0190-0194.
 
 ```bash

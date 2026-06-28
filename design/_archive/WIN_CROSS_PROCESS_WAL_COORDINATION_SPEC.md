@@ -3,7 +3,7 @@
 **Date:** 2026-05-27
 **Status:** Implemented
 **Future Version:** vNext
-**Roadmap:** [`FUTURE_WINS.md`](FUTURE_WINS.md)
+**Roadmap:** [`FUTURE_WINS.md`](../FUTURE_WINS.md)
 **Document Type:** Implementation SPEC
 **Audience:** Core engine developers, WAL/pager maintainers, VFS maintainers,
 CLI maintainers, binding maintainers, documentation authors, benchmark
@@ -11,10 +11,10 @@ maintainers, coding agents
 
 **Governing ADRs:**
 
-- [`adr/0177-cross-process-coordination-sidecar-and-locking.md`](adr/0177-cross-process-coordination-sidecar-and-locking.md)
-- [`adr/0178-cross-process-reader-retention-and-wal-refresh.md`](adr/0178-cross-process-reader-retention-and-wal-refresh.md)
-- [`adr/0179-cross-process-public-contract-bindings-and-diagnostics.md`](adr/0179-cross-process-public-contract-bindings-and-diagnostics.md)
-- [`adr/0180-database-identity-for-coordination-sidecars.md`](adr/0180-database-identity-for-coordination-sidecars.md)
+- [`adr/0177-cross-process-coordination-sidecar-and-locking.md`](../adr/0177-cross-process-coordination-sidecar-and-locking.md)
+- [`adr/0178-cross-process-reader-retention-and-wal-refresh.md`](../adr/0178-cross-process-reader-retention-and-wal-refresh.md)
+- [`adr/0179-cross-process-public-contract-bindings-and-diagnostics.md`](../adr/0179-cross-process-public-contract-bindings-and-diagnostics.md)
+- [`adr/0180-database-identity-for-coordination-sidecars.md`](../adr/0180-database-identity-for-coordination-sidecars.md)
 
 **Implementation status, 2026-05-27:** Implemented. DecentDB now has native
 VFS byte-range locks, a rebuildable `.coord` sidecar, database header identity,
@@ -24,21 +24,21 @@ options, documentation, and regression coverage.
 
 **Related inputs:**
 
-- [`FUTURE_WINS.md`](FUTURE_WINS.md)
-- [`SPEC.md`](SPEC.md)
-- [`TESTING_STRATEGY.md`](TESTING_STRATEGY.md)
-- [`adr/0016-database-header-checksum.md`](adr/0016-database-header-checksum.md)
-- [`adr/0018-checkpointing-reader-count-mechanism.md`](adr/0018-checkpointing-reader-count-mechanism.md)
-- [`adr/0019-wal-retention-for-active-readers.md`](adr/0019-wal-retention-for-active-readers.md)
-- [`adr/0117-shared-wal-registry.md`](adr/0117-shared-wal-registry.md)
-- [`adr/0119-rust-vfs-pread-pwrite.md`](adr/0119-rust-vfs-pread-pwrite.md)
-- [`adr/0131-legacy-format-migrations.md`](adr/0131-legacy-format-migrations.md)
-- [`adr/0141-paged-on-disk-wal-index.md`](adr/0141-paged-on-disk-wal-index.md)
-- [`adr/0058-background-incremental-checkpoint-worker.md`](adr/0058-background-incremental-checkpoint-worker.md)
-- [`adr/0162-engine-owned-write-queue-strict-group-commit.md`](adr/0162-engine-owned-write-queue-strict-group-commit.md)
-- [`adr/0163-operational-sys-metrics.md`](adr/0163-operational-sys-metrics.md)
-- [`docs/user-guide/write-concurrency.md`](../docs/user-guide/write-concurrency.md)
-- [`docs/architecture/wal.md`](../docs/architecture/wal.md)
+- [`FUTURE_WINS.md`](../FUTURE_WINS.md)
+- [`SPEC.md`](../SPEC.md)
+- [`TESTING_STRATEGY.md`](../TESTING_STRATEGY.md)
+- [`adr/0016-database-header-checksum.md`](../adr/0016-database-header-checksum.md)
+- [`adr/0018-checkpointing-reader-count-mechanism.md`](../adr/0018-checkpointing-reader-count-mechanism.md)
+- [`adr/0019-wal-retention-for-active-readers.md`](../adr/0019-wal-retention-for-active-readers.md)
+- [`adr/0117-shared-wal-registry.md`](../adr/0117-shared-wal-registry.md)
+- [`adr/0119-rust-vfs-pread-pwrite.md`](../adr/0119-rust-vfs-pread-pwrite.md)
+- [`adr/0131-legacy-format-migrations.md`](../adr/0131-legacy-format-migrations.md)
+- [`adr/0141-paged-on-disk-wal-index.md`](../adr/0141-paged-on-disk-wal-index.md)
+- [`adr/0058-background-incremental-checkpoint-worker.md`](../adr/0058-background-incremental-checkpoint-worker.md)
+- [`adr/0162-engine-owned-write-queue-strict-group-commit.md`](../adr/0162-engine-owned-write-queue-strict-group-commit.md)
+- [`adr/0163-operational-sys-metrics.md`](../adr/0163-operational-sys-metrics.md)
+- [`docs/user-guide/write-concurrency.md`](../../docs/user-guide/write-concurrency.md)
+- [`docs/architecture/wal.md`](../../docs/architecture/wal.md)
 
 ---
 
