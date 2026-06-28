@@ -51,7 +51,8 @@ micro-optimizations.
 **Related inputs:**
 
 - [`FUTURE_WINS.md`](FUTURE_WINS.md)
-- [`METRIC_IMPROVEMENTS_PLAN.md`](METRIC_IMPROVEMENTS_PLAN.md)
+- Historical metric tracker:
+  [`METRIC_IMPROVEMENTS_PLAN.md`](_archive/METRIC_IMPROVEMENTS_PLAN.md)
 - [`WIN_DEFAULT_FAST_PERFORMANCE_STORAGE_EFFICIENCY_SPEC.md`](_archive/WIN_DEFAULT_FAST_PERFORMANCE_STORAGE_EFFICIENCY_SPEC.md)
 - [`WIN_QUERY_PLAN_CACHING_AND_STATEMENT_REUSE.md`](_archive/WIN_QUERY_PLAN_CACHING_AND_STATEMENT_REUSE.md)
 - [`BENCHMARKING_GUIDE.md`](BENCHMARKING_GUIDE.md)
@@ -78,17 +79,20 @@ DecentDB has already delivered several targeted performance wins:
 - default-on connection-local plan caching and prepared-plan reuse;
 - native benchmark guardrails and the larger rust-baseline comparison suite.
 
-Those wins made many public benchmark metrics competitive or faster than
-SQLite. The remaining bottleneck is not one missing micro-optimization. The
-remaining bottleneck is that DecentDB is fastest only when a query happens to
-match a narrow specialized path. When a query falls back to the generic
-executor, it still tends to build full intermediate `Dataset` values,
-`Vec<Vec<Value>>` row buffers, and `Vec<QueryRow>` output buffers. It clones
-rows, decodes columns that may not be needed, and keeps intermediate query
-state alive longer than necessary. At the same time, the planner is still
-primarily structural/rule-based even though `ANALYZE` and persisted statistics
-exist. The write path is close to SQLite on durable commit latency, but not yet
-clearly ahead once both engines hit the single-`fsync` floor.
+Those wins made the public README benchmark metrics faster than SQLite across
+the balanced, low-memory, and tuned DecentDB profiles in the 2026-06-20
+`data/bench_summary.json` summary. The remaining performance credibility gap is
+now narrower: rust-baseline still exposes SQLite-faster view expansion/execution
+paths and tiny smoke-scale fixed-overhead reads. The remaining bottleneck is
+that DecentDB is fastest only when a query happens to match a narrow specialized
+path. When a query falls back to the generic executor, it still tends to build
+full intermediate `Dataset` values, `Vec<Vec<Value>>` row buffers, and
+`Vec<QueryRow>` output buffers. It clones rows, decodes columns that may not be
+needed, and keeps intermediate query state alive longer than necessary. At the
+same time, the planner is still primarily structural/rule-based even though
+`ANALYZE` and persisted statistics exist. Public durable commit p95 is currently
+ahead of SQLite, but it remains close enough to the single-`fsync` floor that it
+must stay a regression guardrail rather than an invitation to weaken durability.
 
 This win has three implementation streams:
 
@@ -117,11 +121,12 @@ not considered successful.
 
 - Make DecentDB's default core engine performance less dependent on narrow
   one-off fast paths.
-- Improve every current public benchmark class without weakening durability:
-  point lookup, range scan, join, aggregate, concurrent read, insert
-  throughput, and durable commit latency.
-- Materially improve rust-baseline full and huge scale total runtime, view
-  query latency, peak RSS, and per-step read-query memory growth.
+- Preserve the current public benchmark wins without weakening durability:
+  point lookup, range scan, join, aggregate, concurrent read, insert throughput,
+  and durable commit latency.
+- Materially improve rust-baseline view query latency, tiny smoke-scale
+  fixed-overhead reads, peak RSS, and per-step read-query memory growth while
+  preserving full and huge total-runtime wins.
 - Make ordinary SQL views competitive by pushing predicates, projections,
   ordering, and limits through view expansion where semantics allow it.
 - Make complex joins competitive through cost-based join ordering and explicit
@@ -174,9 +179,11 @@ python scripts/make_readme_chart.py
 python scripts/visualize_alternative.py
 ```
 
-`METRIC_IMPROVEMENTS_PLAN.md` records a recent local run where DecentDB wins
-read-side public metrics but durable commit latency is at parity rather than a
-clear win:
+The current public summary is `data/bench_summary.json`, aggregated on
+2026-06-20 from run id `1781967814749`. It shows DecentDB ahead of SQLite on
+every rendered metric for balanced, low-memory, and tuned profiles. These
+metrics are no longer the primary gap list; they are guardrails that must not
+regress:
 
 | Metric | Required Direction |
 |---|---|
@@ -189,7 +196,8 @@ clear win:
 | `concurrent_read_p95_ms` | Decrease |
 
 This spec treats all seven metrics as active guardrails. A change that improves
-one read metric by regressing another headline metric is not complete.
+rust-baseline view paths or tiny smoke-scale reads by regressing a public
+headline metric is not complete.
 
 ### 4.2 Rust-Baseline Surface
 
@@ -214,6 +222,22 @@ The README explicitly notes that query timing materializes every returned
 column before counting rows and that peak RSS can climb sharply during query
 evaluation. This is direct evidence that eager intermediate materialization is
 a core-engine performance and memory bottleneck visible to every binding.
+
+The latest folded-in diagnostic comparison uses the checked-in DecentDB run
+from `benchmarks/rust-baseline/results/2026-06-23-*` and the latest available
+local SQLite reference in
+`.tmp/rust-baseline-sqlite-compare-20260611-152618/results`. It is a current
+diagnostic comparison, not a freshly paired benchmark run. The active gaps are:
+
+| Scale | `query_artist_by_id` SQLite / DecentDB | `query_view_first_1000` SQLite / DecentDB | `query_songs_for_artist_via_view` SQLite / DecentDB | Interpretation |
+|---|---:|---:|---:|---|
+| smoke | 0.50x | 0.05x | 0.10x | SQLite wins tiny lookup and view paths |
+| medium | 1.06x | 0.19x | 0.18x | DecentDB barely wins point lookup; SQLite still wins view paths |
+| full | 1.37x | 0.14x | 0.23x | DecentDB wins point lookup; SQLite still wins view paths |
+| huge | 1.87x | 0.14x | 0.18x | DecentDB wins point lookup; SQLite still wins view paths |
+
+DecentDB still wins rust-baseline total runtime at every scale in this
+comparison: 1.23x smoke, 1.93x medium, 1.89x full, and 1.29x huge.
 
 ### 4.3 Code Hotspots That Must Be Addressed
 
@@ -319,19 +343,23 @@ All of these must be true:
 
 - Public benchmark headline metrics show no regression greater than 3% against
   the recorded before baseline.
-- At least five of the seven public benchmark headline metrics improve by at
-  least 10%.
-- `commit_p95_ms` improves by at least 5% **or** the final report proves with
-  syscall-level profiling that the remaining time is the durable sync floor and
-  all non-sync engine overhead was reduced by at least 10%.
+- Balanced, low-memory, and tuned DecentDB remain at or above SQLite on every
+  public headline metric, or any exception is explicitly documented as
+  measurement noise with a follow-up task.
+- `commit_p95_ms` remains at or above SQLite under `WalSyncMode::Full`, or the
+  final report proves with syscall-level profiling that any remaining gap is
+  the durable sync floor and that non-sync engine overhead did not regress.
 - Rust-baseline default DecentDB total runtime improves by at least:
-  - 10% on smoke;
-  - 15% on medium;
-  - 20% on full;
-  - 20% on huge.
+  - 5% on smoke;
+  - 10% on medium;
+  - 15% on full;
+  - 15% on huge.
 - Rust-baseline full and huge peak RSS decrease by at least 25%.
 - Rust-baseline DecentDB remains faster than SQLite in total runtime at every
   scale.
+- Rust-baseline view-path losses are materially reduced, and the tiny
+  smoke-scale `query_artist_by_id` / `query_count_songs` fixed-overhead losses
+  are either eliminated or explicitly profiled with a bounded follow-up.
 - No correctness, crash-recovery, or durability test is weakened, skipped, or
   reclassified to pass the performance work.
 
@@ -361,9 +389,9 @@ Each implementation stream has its own gates.
 
 **Durable commit gates:**
 
-- Public `commit_p95_ms` improves by at least 5% or meets the documented
+- Public `commit_p95_ms` stays at or above SQLite, or meets the documented
   durable-sync-floor exception in §6.1.
-- `insert_rows_per_sec` does not regress and should improve by at least 5%.
+- `insert_rows_per_sec` does not regress.
 - Crash/recovery tests prove the same committed/uncommitted visibility and WAL
   replay semantics as before the change.
 - No benchmark profile uses weaker durability to claim the win.
@@ -790,7 +818,8 @@ Required outputs:
 
 - final before/after public benchmark table;
 - final before/after rust-baseline report;
-- updated `METRIC_IMPROVEMENTS_PLAN.md` with accepted numbers;
+- updated current-baseline and active-gap sections in this spec with accepted
+  numbers;
 - updated `FUTURE_WINS.md` status if this win is added to the roadmap;
 - updated `docs/user-guide/performance.md` only for user-visible behavior or
   new configuration;
@@ -876,4 +905,3 @@ This win is complete only when all of the following are true:
 If the required marked/significant before/after benchmark improvements are not
 present, the work is not done even if the code is cleaner or the architecture
 looks better.
-
