@@ -2,7 +2,7 @@
 
 DecentDB supports a PostgreSQL-like SQL subset.
 
-See also: [Comparison: DecentDB vs SQLite vs DuckDB](comparison.md)
+See also: [Comparison Overview](comparison.md)
 
 ## Data Definition Language (DDL)
 

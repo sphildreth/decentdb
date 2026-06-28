@@ -21,6 +21,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   result artifacts.
 - Added ADR 0200 and format-14 resident table delete tombstones, including the
   v13-to-v14 migration parser path and DELETE_BATCH design documentation.
+- Added a `DecentDB vs Turso Database` user-guide comparison that distinguishes
+  Turso Database, libSQL, and Turso Cloud while positioning DecentDB's local
+  durability, branch, sync, policy, and SQL tradeoffs.
+- Added detailed `DecentDB vs libSQL`, `DecentDB vs PGlite`,
+  `DecentDB vs H2`, `DecentDB vs LiteDB`, and `DecentDB vs Firebird Embedded`
+  comparison guides, and expanded the comparison overview/navigation so users
+  can evaluate DecentDB against more embedded database alternatives.
 
 ### Changed
 

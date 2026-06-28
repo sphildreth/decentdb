@@ -1,6 +1,8 @@
-# Comparison: DecentDB vs SQLite vs DuckDB
+# Comparison Overview
 
-This page summarizes high-level feature differences between **DecentDB**, **SQLite**, and **DuckDB**.
+This page summarizes high-level feature differences between **DecentDB**,
+**SQLite**, and **DuckDB**, then points to deeper comparison guides for other
+embedded databases that developers may consider instead of DecentDB.
 
 ## Versions (as of 2026-06-28)
 
@@ -20,7 +22,9 @@ DecentDB is intentionally scoped around:
 
 SQLite and DuckDB are used as behavioral baselines for many SQL features, but DecentDB does **not** aim to be a drop-in replacement for either.
 
-> **See also:** [SQL Feature Matrix](sql-feature-matrix.md) for a concise per-feature support grid comparing DecentDB, SQLite, and DuckDB.
+> **See also:** [SQL Feature Matrix](sql-feature-matrix.md) for a concise
+> per-feature support grid comparing DecentDB, SQLite, and DuckDB. For
+> product-specific decision guides, see the comparison pages listed below.
 
 ## Quick summary
 
@@ -42,6 +46,30 @@ Notes:
 What “extensions” means here:
 - The ability to add new SQL features without modifying the database core (e.g., new scalar/aggregate functions, new table-like modules such as SQLite virtual tables, or optional subsystems like full-text search).
 - DecentDB's extension answer is a sandboxed Lua package model with manifest-declared SQL objects and explicit content-hash trust. It is not SQLite `.load`, DuckDB native extensions, or host-language callbacks.
+
+## Detailed Comparison Pages
+
+These pages are decision guides, not scorecards. They focus on fit, tradeoffs,
+and migration implications.
+
+- [DecentDB vs SQLite](decentdb-vs-sqlite.md) - the baseline embedded SQL
+  comparison.
+- [DecentDB vs libSQL](decentdb-vs-libsql.md) - the production-ready SQLite
+  fork maintained by Turso.
+- [DecentDB vs Turso Database](decentdb-vs-tursodatabase.md) - the newer Rust
+  SQLite-compatible rewrite.
+- [DecentDB vs PGlite](decentdb-vs-pglite.md) - WASM Postgres for JavaScript,
+  browser, and local-first web workloads.
+- [DecentDB vs DuckDB](decentdb-vs-duckdb.md) - embedded OLTP vs embedded
+  OLAP.
+- [DecentDB vs H2](decentdb-vs-h2.md) - Java/JDBC embedded and in-memory SQL.
+- [DecentDB vs Firebird Embedded](decentdb-vs-firebird-embedded.md) - embedded
+  Firebird SQL and PSQL workflows.
+- [DecentDB vs LiteDB](decentdb-vs-litedb.md) - .NET embedded document
+  storage.
+- [DecentDB vs RocksDB](decentdb-vs-rocksdb.md), [LMDB](decentdb-vs-lmdb.md),
+  [LevelDB](decentdb-vs-leveldb.md), and [sled](decentdb-vs-sled.md) -
+  key-value storage-engine alternatives.
 
 ## Local-first sync
 
