@@ -70,7 +70,9 @@ use crate::record::value::{
     parse_decimal_text, parse_interval, parse_ip_addr, parse_mac_addr, parse_time_micros,
     parse_timestamp_tz_micros, Value,
 };
-use crate::search::fulltext::{AnalyzerConfig, FullTextIndex, FTS_SEMANTIC_ERROR_PREFIX};
+use crate::search::fulltext::{
+    AnalyzerConfig, FullTextIndex, FullTextIndexBuilder, FTS_SEMANTIC_ERROR_PREFIX,
+};
 use crate::search::{TrigramIndex, TrigramIndexBuilder, TrigramQueryResult};
 use crate::spatial::index::{SpatialEnvelope, SpatialIndexBackend, SpatialRuntimeIndex};
 use crate::spatial::types::{
@@ -26432,7 +26434,7 @@ fn build_runtime_index(
                 .full_text
                 .clone()
                 .ok_or_else(|| DbError::corruption("fulltext index is missing analyzer config"))?;
-            let mut fulltext = FullTextIndex::new(config);
+            let mut fulltext = FullTextIndexBuilder::with_capacity(config, source.row_count());
             // Fast path: fulltext indexes are constrained by DDL to plain text
             // columns with no predicate. Resolve their positions once and read
             // the text directly, avoiding the per-row Dataset construction in
@@ -26476,21 +26478,42 @@ fn build_runtime_index(
                     }
                 }
                 if let Some(positions) = &text_positions {
-                    let field_refs: Vec<Option<&str>> = positions
-                        .iter()
-                        .map(|position| match values.get(*position) {
-                            Some(Value::Text(text)) => Some(text.as_str()),
-                            _ => None,
-                        })
-                        .collect();
-                    fulltext.insert_document_fresh(row.row_id() as u64, &field_refs);
+                    match positions.len() {
+                        1 => {
+                            let text_ref = positions
+                                .first()
+                                .and_then(|position| values.get(*position))
+                                .and_then(|value| value.as_text());
+                            let fields = [text_ref];
+                            fulltext.add_row(row.row_id() as u64, &fields);
+                        }
+                        2 => {
+                            let fields = [
+                                values.get(positions[0]).and_then(Value::as_text),
+                                values.get(positions[1]).and_then(Value::as_text),
+                            ];
+                            fulltext.add_row(row.row_id() as u64, &fields);
+                        }
+                        _ => {
+                            let field_refs: Vec<Option<&str>> = positions
+                                .iter()
+                                .map(|position| match values.get(*position) {
+                                    Some(Value::Text(text)) => Some(text.as_str()),
+                                    _ => None,
+                                })
+                                .collect();
+                            fulltext.add_row(row.row_id() as u64, &field_refs);
+                        }
+                    }
                 } else {
                     let fields = full_text_fields_for_row(runtime, index, table, values)?;
                     let field_refs = fields.iter().map(Option::as_deref).collect::<Vec<_>>();
-                    fulltext.insert_document_fresh(row.row_id() as u64, &field_refs);
+                    fulltext.add_row(row.row_id() as u64, &field_refs);
                 }
             }
-            Ok(RuntimeIndex::FullText { index: fulltext })
+            Ok(RuntimeIndex::FullText {
+                index: fulltext.finish(),
+            })
         }
     }
 }

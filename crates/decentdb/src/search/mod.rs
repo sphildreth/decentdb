@@ -10,15 +10,12 @@ pub(crate) mod trigram;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::btree::write::Btree;
 use crate::error::Result;
-use crate::search::postings::{decode_postings, encode_postings};
 use crate::search::rebuild::{Freshness, RebuildState};
 use crate::search::trigram::{
     decide_guardrails_for_len, like_required_char_len, like_required_tokens, unique_tokens,
     GuardrailDecision,
 };
-use crate::storage::page::InMemoryPageStore;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PendingOp {
@@ -37,7 +34,7 @@ pub(crate) enum TrigramQueryResult {
 
 #[derive(Clone, Debug)]
 pub(crate) struct TrigramIndex {
-    postings_tree: Btree<InMemoryPageStore>,
+    postings: BTreeMap<u32, Vec<u64>>,
     pending: BTreeMap<u32, Vec<PendingOp>>,
     deleted_postings: BTreeMap<u32, BTreeSet<u64>>,
     rebuild_state: RebuildState,
@@ -61,25 +58,25 @@ impl TrigramIndexBuilder {
     }
 
     pub(crate) fn finish_into(self, index: &mut TrigramIndex) -> Result<()> {
-        index.postings_tree.clear()?;
+        index.postings.clear();
         index.pending.clear();
         index.deleted_postings.clear();
-        let mut entries = BTreeMap::<u64, Vec<u8>>::new();
         for (token, mut row_ids) in self.postings {
             row_ids.sort_unstable();
             row_ids.dedup();
-            entries.insert(u64::from(token), encode_postings(&row_ids)?);
+            if !row_ids.is_empty() {
+                index.postings.insert(token, row_ids);
+            }
         }
-        index.postings_tree.replace_entries(entries)?;
         index.rebuild_state.mark_rebuilt();
         Ok(())
     }
 }
 
 impl TrigramIndex {
-    pub(crate) fn new(page_size: u32, postings_threshold: usize) -> Self {
+    pub(crate) fn new(_page_size: u32, postings_threshold: usize) -> Self {
         Self {
-            postings_tree: Btree::with_page_size(page_size),
+            postings: BTreeMap::new(),
             pending: BTreeMap::new(),
             deleted_postings: BTreeMap::new(),
             rebuild_state: RebuildState::default(),
@@ -200,12 +197,10 @@ impl TrigramIndex {
             }
 
             if postings.is_empty() {
-                self.postings_tree.delete(u64::from(token))?;
+                self.postings.remove(&token);
             } else {
-                self.postings_tree.insert(
-                    u64::from(token),
-                    encode_postings(&postings.into_iter().collect::<Vec<_>>())?,
-                )?;
+                self.postings
+                    .insert(token, postings.into_iter().collect::<Vec<_>>());
             }
         }
         self.deleted_postings.clear();
@@ -214,8 +209,8 @@ impl TrigramIndex {
 
     #[must_use]
     pub(crate) fn entry_count(&self) -> usize {
-        self.postings_tree
-            .entry_count()
+        self.postings
+            .len()
             .saturating_add(self.pending.values().map(Vec::len).sum::<usize>())
             .saturating_sub(
                 self.deleted_postings
@@ -273,10 +268,9 @@ impl TrigramIndex {
 
     fn materialized_postings(&self, token: u32) -> Result<BTreeSet<u64>> {
         let mut postings = self
-            .postings_tree
-            .get(u64::from(token))?
-            .map(|bytes| decode_postings(&bytes))
-            .transpose()?
+            .postings
+            .get(&token)
+            .cloned()
             .unwrap_or_default()
             .into_iter()
             .collect::<BTreeSet<_>>();
@@ -299,10 +293,9 @@ impl TrigramIndex {
 
     fn materialized_live_postings(&self, token: u32) -> Result<BTreeSet<u64>> {
         let mut postings = self
-            .postings_tree
-            .get(u64::from(token))?
-            .map(|bytes| decode_postings(&bytes))
-            .transpose()?
+            .postings
+            .get(&token)
+            .cloned()
             .unwrap_or_default()
             .into_iter()
             .collect::<BTreeSet<_>>();

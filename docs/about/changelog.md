@@ -42,6 +42,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Removed the DecentDB native-defaults Showdown run from
   `scripts/benchmark_runner.py` comparison profiles so SQLite gap rankings
   compare like-for-like benchmark configurations.
+- Made the Showdown search-index benchmark compare full-text index setup
+  against SQLite FTS5 setup by removing the DecentDB-only trigram build from
+  that timed step and enabling matching SQLite FTS prefix indexes.
+- Accelerated runtime full-text/trigram search index builds with bulk full-text
+  construction, lower-allocation ASCII token handling, vector-backed full-text
+  postings, and flatter trigram postings.
 
 ### Fixed
 

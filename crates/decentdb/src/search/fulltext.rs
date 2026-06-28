@@ -1,6 +1,7 @@
 //! Full-text analyzer, query parser, scoring, and runtime index primitives.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::Arc;
 
 pub(crate) const FTS_DDL_ERROR_PREFIX: &str = "FTS DDL error:";
@@ -34,21 +35,148 @@ struct TermDocumentInfo {
     positions: Vec<u32>,
 }
 
+#[derive(Clone, Default)]
+struct FullTextHasher(u64);
+
+type FullTextBuildHasher = BuildHasherDefault<FullTextHasher>;
+type TermMap<V> = HashMap<String, V, FullTextBuildHasher>;
+type RowIdList = Vec<u64>;
+type DocumentMap = HashMap<u64, FullTextDocument, FullTextBuildHasher>;
+
+fn term_map_with_capacity<V>(capacity: usize) -> TermMap<V> {
+    HashMap::with_capacity_and_hasher(capacity, FullTextBuildHasher::default())
+}
+
+fn document_map_with_capacity(capacity: usize) -> DocumentMap {
+    HashMap::with_capacity_and_hasher(capacity, FullTextBuildHasher::default())
+}
+
+impl Hasher for FullTextHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        const OFFSET: u64 = 0xcbf29ce484222325;
+        const PRIME: u64 = 0x100000001b3;
+        if self.0 == 0 {
+            self.0 = OFFSET;
+        }
+        for byte in bytes {
+            self.0 ^= u64::from(*byte);
+            self.0 = self.0.wrapping_mul(PRIME);
+        }
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.write(&value.to_le_bytes());
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct FullTextDocument {
     doc_len: u32,
-    terms: BTreeMap<String, TermDocumentInfo>,
+    terms: TermMap<TermDocumentInfo>,
+}
+
+fn document_term<'a>(document: &'a FullTextDocument, term: &str) -> Option<&'a TermDocumentInfo> {
+    document.terms.get(term)
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct FullTextIndex {
     config: AnalyzerConfig,
-    documents: Arc<BTreeMap<u64, FullTextDocument>>,
-    postings: Arc<BTreeMap<String, BTreeMap<u64, TermDocumentInfo>>>,
+    documents: Arc<DocumentMap>,
+    postings: Arc<TermMap<RowIdList>>,
     deleted_row_ids: BTreeSet<u64>,
     deleted_term_counts: BTreeMap<String, usize>,
     non_empty_document_count: u64,
     total_document_len: u64,
+}
+
+#[derive(Debug)]
+pub(crate) struct FullTextIndexBuilder {
+    config: AnalyzerConfig,
+    documents: DocumentMap,
+    postings: TermMap<RowIdList>,
+    non_empty_document_count: u64,
+    total_document_len: u64,
+}
+
+impl FullTextIndexBuilder {
+    #[must_use]
+    pub(crate) fn new(config: AnalyzerConfig) -> Self {
+        Self::with_capacity(config, 0)
+    }
+
+    #[must_use]
+    pub(crate) fn with_capacity(config: AnalyzerConfig, row_count: usize) -> Self {
+        let postings_capacity = row_count.saturating_mul(12).max(16);
+        Self {
+            config: config.canonicalize(),
+            documents: document_map_with_capacity(row_count),
+            postings: term_map_with_capacity(postings_capacity),
+            non_empty_document_count: 0,
+            total_document_len: 0,
+        }
+    }
+
+    pub(crate) fn add_row(&mut self, row_id: u64, fields: &[Option<&str>]) {
+        self.insert_fresh_document(row_id, fields);
+    }
+
+    fn insert_fresh_document(&mut self, row_id: u64, fields: &[Option<&str>]) {
+        let document = build_document(&self.config, fields);
+        if document.doc_len > 0 {
+            self.non_empty_document_count += 1;
+            self.total_document_len += u64::from(document.doc_len);
+        }
+        for term in document.terms.keys() {
+            insert_posting_row(&mut self.postings, term, row_id);
+        }
+        self.documents.insert(row_id, document);
+    }
+
+    pub(crate) fn insert_document(&mut self, row_id: u64, fields: &[Option<&str>]) {
+        self.remove_existing_document(row_id);
+        self.insert_fresh_document(row_id, fields);
+    }
+
+    #[must_use]
+    pub(crate) fn finish(self) -> FullTextIndex {
+        FullTextIndex {
+            config: self.config,
+            documents: Arc::new(self.documents),
+            postings: Arc::new(self.postings),
+            deleted_row_ids: BTreeSet::new(),
+            deleted_term_counts: BTreeMap::new(),
+            non_empty_document_count: self.non_empty_document_count,
+            total_document_len: self.total_document_len,
+        }
+    }
+
+    fn remove_existing_document(&mut self, row_id: u64) {
+        let Some(document) = self.documents.remove(&row_id) else {
+            return;
+        };
+        if document.doc_len > 0 {
+            self.non_empty_document_count = self.non_empty_document_count.saturating_sub(1);
+            self.total_document_len = self
+                .total_document_len
+                .saturating_sub(u64::from(document.doc_len));
+        }
+        for term in document.terms.keys() {
+            let remove_term = if let Some(rows) = self.postings.get_mut(term) {
+                remove_posting_row(rows, row_id);
+                rows.is_empty()
+            } else {
+                false
+            };
+            if remove_term {
+                self.postings.remove(term);
+            }
+        }
+    }
 }
 
 impl FullTextIndex {
@@ -56,8 +184,8 @@ impl FullTextIndex {
     pub(crate) fn new(config: AnalyzerConfig) -> Self {
         Self {
             config: config.canonicalize(),
-            documents: Arc::new(BTreeMap::new()),
-            postings: Arc::new(BTreeMap::new()),
+            documents: Arc::new(DocumentMap::default()),
+            postings: Arc::new(TermMap::default()),
             deleted_row_ids: BTreeSet::new(),
             deleted_term_counts: BTreeMap::new(),
             non_empty_document_count: 0,
@@ -77,11 +205,8 @@ impl FullTextIndex {
             self.non_empty_document_count += 1;
             self.total_document_len += u64::from(document.doc_len);
         }
-        for (term, info) in &document.terms {
-            Arc::make_mut(&mut self.postings)
-                .entry(term.clone())
-                .or_default()
-                .insert(row_id, info.clone());
+        for term in document.terms.keys() {
+            insert_posting_row(Arc::make_mut(&mut self.postings), term, row_id);
         }
         Arc::make_mut(&mut self.documents).insert(row_id, document);
     }
@@ -287,7 +412,7 @@ impl FullTextIndex {
             positive_scoring_terms(self, query)
                 .into_iter()
                 .filter_map(|term| {
-                    let term_info = document.terms.get(&term)?;
+                    let term_info = document_term(document, term.as_str())?;
                     let doc_freq = self.live_doc_freq(&term);
                     Some(Bm25TermStats {
                         term_freq: f64::from(term_info.frequency),
@@ -312,7 +437,7 @@ impl FullTextIndex {
                 doc_len: f64::from(document.doc_len),
             },
             scoring_terms.iter().filter_map(|(term, doc_freq)| {
-                let term_info = document.terms.get(term)?;
+                let term_info = document_term(document, term.as_str())?;
                 Some(Bm25TermStats {
                     term_freq: f64::from(term_info.frequency),
                     doc_freq: *doc_freq as f64,
@@ -331,7 +456,7 @@ impl FullTextIndex {
     fn live_doc_freq(&self, term: &str) -> usize {
         self.postings
             .get(term)
-            .map_or(0, BTreeMap::len)
+            .map_or(0_usize, Vec::len)
             .saturating_sub(self.deleted_term_counts.get(term).copied().unwrap_or(0))
     }
 
@@ -351,7 +476,7 @@ impl FullTextIndex {
                 decrement_deleted_term_count(&mut self.deleted_term_counts, term);
             }
             let remove_term = if let Some(rows) = Arc::make_mut(&mut self.postings).get_mut(term) {
-                rows.remove(&row_id);
+                remove_posting_row(rows, row_id);
                 rows.is_empty()
             } else {
                 false
@@ -362,6 +487,18 @@ impl FullTextIndex {
         }
         Arc::make_mut(&mut self.documents).remove(&row_id);
     }
+}
+
+fn insert_posting_row(postings: &mut TermMap<RowIdList>, term: &str, row_id: u64) {
+    if let Some(rows) = postings.get_mut(term) {
+        rows.push(row_id);
+        return;
+    }
+    postings.insert(term.to_string(), vec![row_id]);
+}
+
+fn remove_posting_row(rows: &mut RowIdList, row_id: u64) {
+    rows.retain(|existing| *existing != row_id);
 }
 
 fn decrement_deleted_term_count(counts: &mut BTreeMap<String, usize>, term: &str) {
@@ -428,7 +565,16 @@ fn query_error(message: &str) -> FullTextIndexError {
 }
 
 fn build_document(config: &AnalyzerConfig, fields: &[Option<&str>]) -> FullTextDocument {
-    let mut document = FullTextDocument::default();
+    let estimated_terms = fields
+        .iter()
+        .filter_map(|field| field.map(str::len))
+        .map(|len| len / 6)
+        .sum::<usize>()
+        .clamp(4, 64);
+    let mut document = FullTextDocument {
+        doc_len: 0,
+        terms: term_map_with_capacity(estimated_terms),
+    };
     let mut position = 0_u32;
     let field_gap = u32::try_from(config.field_position_gap).unwrap_or(u32::MAX / 2);
 
@@ -439,15 +585,86 @@ fn build_document(config: &AnalyzerConfig, fields: &[Option<&str>]) -> FullTextD
         let Some(text) = field else {
             continue;
         };
-        for token in config.analyze(text) {
-            let info = document.terms.entry(token).or_default();
-            info.frequency = info.frequency.saturating_add(1);
-            info.positions.push(position);
-            document.doc_len = document.doc_len.saturating_add(1);
-            position = position.saturating_add(1);
+        if can_use_ascii_document_fast_path(config) && text.is_ascii() {
+            position = add_ascii_document_tokens(text, &mut document, position);
+        } else {
+            config.for_each_token(text, |token| {
+                add_document_term_owned(&mut document, token, position);
+                position = position.saturating_add(1);
+            });
         }
     }
     document
+}
+
+fn can_use_ascii_document_fast_path(config: &AnalyzerConfig) -> bool {
+    config.case_folded
+        && matches!(config.diacritics, analyzer::AnalyzerDiacritics::Preserve)
+        && matches!(config.stopwords, analyzer::AnalyzerStopwords::None)
+}
+
+fn add_ascii_document_tokens(
+    text: &str,
+    document: &mut FullTextDocument,
+    mut position: u32,
+) -> u32 {
+    let bytes = text.as_bytes();
+    let mut index = 0_usize;
+    while index < bytes.len() {
+        while index < bytes.len() && !is_ascii_token_byte(bytes[index]) {
+            index += 1;
+        }
+        let start = index;
+        let mut has_uppercase = false;
+        while index < bytes.len() && is_ascii_token_byte(bytes[index]) {
+            has_uppercase |= bytes[index].is_ascii_uppercase();
+            index += 1;
+        }
+        if start == index {
+            continue;
+        }
+        let token = &text[start..index];
+        if has_uppercase {
+            let mut normalized = token.to_string();
+            normalized.make_ascii_lowercase();
+            add_document_term_owned(document, normalized, position);
+        } else {
+            add_document_term_borrowed(document, token, position);
+        }
+        position = position.saturating_add(1);
+    }
+    position
+}
+
+fn is_ascii_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn add_document_term_borrowed(document: &mut FullTextDocument, token: &str, position: u32) {
+    if let Some(info) = document.terms.get_mut(token) {
+        add_term_position(info, position);
+    } else {
+        let mut info = TermDocumentInfo::default();
+        add_term_position(&mut info, position);
+        document.terms.insert(token.to_string(), info);
+    }
+    document.doc_len = document.doc_len.saturating_add(1);
+}
+
+fn add_document_term_owned(document: &mut FullTextDocument, token: String, position: u32) {
+    if let Some(info) = document.terms.get_mut(token.as_str()) {
+        add_term_position(info, position);
+    } else {
+        let mut info = TermDocumentInfo::default();
+        add_term_position(&mut info, position);
+        document.terms.insert(token, info);
+    }
+    document.doc_len = document.doc_len.saturating_add(1);
+}
+
+fn add_term_position(info: &mut TermDocumentInfo, position: u32) {
+    info.frequency = info.frequency.saturating_add(1);
+    info.positions.push(position);
 }
 
 /// Returns true when the query contains only positive `Word` terms (no
@@ -467,19 +684,28 @@ fn query_is_postings_resolvable(query: &FtsQuery) -> bool {
 /// postings alone; the caller then falls back to a full document scan. For
 /// `Word`-only OR/AND queries this unions the per-clause candidate sets, which
 /// is the common benchmark and application shape (`a OR b OR c`).
-fn candidate_row_ids_for_query(index: &FullTextIndex, query: &FtsQuery) -> BTreeSet<u64> {
-    let mut candidates: BTreeSet<u64> = BTreeSet::new();
+fn candidate_row_ids_for_query(index: &FullTextIndex, query: &FtsQuery) -> Vec<u64> {
+    let mut candidates = Vec::new();
     for clause in &query.clauses {
         // Each clause is an AND of positive Word terms (guaranteed by
         // query_is_postings_resolvable). Intersect the postings row ids for
         // every term in the clause; union the result into the candidate set.
+        if clause.len() == 1 {
+            let analyzed = index.config.analyze(&clause[0].text);
+            if analyzed.len() == 1 {
+                if let Some(rows) = index.postings.get(analyzed[0].as_str()) {
+                    candidates.extend(rows.iter().copied());
+                }
+                continue;
+            }
+        }
         let mut clause_rows: Option<BTreeSet<u64>> = None;
         for term in clause.iter().filter(|term| !term.excluded) {
             let analyzed = index.config.analyze(&term.text);
             let mut term_rows: BTreeSet<u64> = BTreeSet::new();
             for token in analyzed {
-                if let Some(rows) = index.postings.get(&token) {
-                    term_rows.extend(rows.keys().copied());
+                if let Some(rows) = index.postings.get(token.as_str()) {
+                    term_rows.extend(rows.iter().copied());
                 }
             }
             clause_rows = Some(match clause_rows {
@@ -491,6 +717,8 @@ fn candidate_row_ids_for_query(index: &FullTextIndex, query: &FtsQuery) -> BTree
             candidates.extend(rows);
         }
     }
+    candidates.sort_unstable();
+    candidates.dedup();
     candidates
 }
 
@@ -533,7 +761,7 @@ fn term_matches_document(
             .config
             .analyze(&term.text)
             .into_iter()
-            .all(|token| document.terms.contains_key(&token)),
+            .all(|token| document_term(document, token.as_str()).is_some()),
         FtsQueryTermKind::Prefix => {
             let normalized = index.config.analyze(&term.text);
             let Some(prefix) = normalized.first() else {
@@ -554,7 +782,7 @@ fn phrase_matches_document(
     let Some(first_term) = terms.first() else {
         return false;
     };
-    let Some(first_info) = document.terms.get(first_term) else {
+    let Some(first_info) = document_term(document, first_term.as_str()) else {
         return false;
     };
     let position_sets = terms
@@ -562,7 +790,7 @@ fn phrase_matches_document(
         .map(|term| {
             document
                 .terms
-                .get(term)
+                .get(term.as_str())
                 .map(|info| info.positions.iter().copied().collect::<BTreeSet<_>>())
         })
         .collect::<Option<Vec<_>>>();
@@ -604,7 +832,7 @@ fn positive_scoring_terms(index: &FullTextIndex, query: &FtsQuery) -> Vec<String
 #[cfg(test)]
 mod runtime_tests {
     use super::analyzer::PrefixPolicy;
-    use super::{AnalyzerConfig, FullTextIndex};
+    use super::{AnalyzerConfig, FullTextIndex, FullTextIndexBuilder};
 
     #[test]
     fn fulltext_index_matches_terms_and_phrases() {
@@ -796,6 +1024,57 @@ mod runtime_tests {
         assert!(
             (delta_hits[0].score - normal_index.score_query(1, "delta").expect("query")).abs()
                 < f64::EPSILON
+        );
+    }
+
+    #[test]
+    fn fulltext_builder_matches_insert_document_fresh() {
+        let builder_index = {
+            let mut builder = FullTextIndexBuilder::new(AnalyzerConfig::default());
+            builder.add_row(1, &[Some("alpha beta")]);
+            builder.add_row(2, &[Some("beta gamma")]);
+            builder.add_row(3, &[Some("gamma delta"), Some("alpha")]);
+            builder.insert_document(1, &[Some("epsilon replacement")]);
+            builder.finish()
+        };
+        let mut insert_index = FullTextIndex::new(AnalyzerConfig::default());
+        insert_index.insert_document(1, &[Some("alpha beta")]);
+        insert_index.insert_document(2, &[Some("beta gamma")]);
+        insert_index.insert_document(3, &[Some("gamma delta"), Some("alpha")]);
+        insert_index.insert_document(1, &[Some("epsilon replacement")]);
+
+        assert_eq!(
+            builder_index.search("alpha").expect("query").len(),
+            insert_index.search("alpha").expect("query").len()
+        );
+        assert_eq!(
+            builder_index
+                .search("alpha")
+                .expect("query")
+                .iter()
+                .map(|hit| hit.row_id)
+                .collect::<Vec<_>>(),
+            insert_index
+                .search("alpha")
+                .expect("query")
+                .iter()
+                .map(|hit| hit.row_id)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(builder_index.entry_count(), insert_index.entry_count());
+        assert_eq!(builder_index.term_count(), insert_index.term_count());
+        assert!(
+            (builder_index.average_document_len() - insert_index.average_document_len()).abs()
+                < f64::EPSILON
+        );
+        assert_eq!(
+            builder_index
+                .search("epsilon")
+                .expect("query")
+                .iter()
+                .map(|hit| hit.row_id)
+                .collect::<Vec<_>>(),
+            vec![1]
         );
     }
 }

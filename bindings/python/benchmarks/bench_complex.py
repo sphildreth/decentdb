@@ -2489,7 +2489,6 @@ def setup_showdown_indexes(conn):
 def setup_showdown_search_indexes(conn, engine_name):
     if engine_name == "decentdb":
         ddl = """
-            CREATE INDEX idx_movies_title_trgm ON movies USING trigram(title);
             CREATE INDEX idx_movies_search_ft ON movies USING fulltext(title, overview) WITH (prefix='2,3');
             CREATE INDEX idx_reviews_body_ft ON reviews USING fulltext(body) WITH (prefix='2,3');
         """
@@ -2499,11 +2498,13 @@ def setup_showdown_search_indexes(conn, engine_name):
     cur = conn.cursor()
     cur.execute(
         "CREATE VIRTUAL TABLE movies_fts USING fts5("
-        "title, overview, content='movies', content_rowid='id', tokenize='porter unicode61')"
+        "title, overview, content='movies', content_rowid='id', "
+        "tokenize='porter unicode61', prefix='2 3')"
     )
     cur.execute(
         "CREATE VIRTUAL TABLE reviews_fts USING fts5("
-        "body, content='reviews', content_rowid='id', tokenize='porter unicode61')"
+        "body, content='reviews', content_rowid='id', "
+        "tokenize='porter unicode61', prefix='2 3')"
     )
     cur.execute("INSERT INTO movies_fts(movies_fts) VALUES('rebuild')")
     cur.execute("INSERT INTO reviews_fts(reviews_fts) VALUES('rebuild')")
