@@ -2,7 +2,7 @@
 
 This document helps developers decide between **DecentDB** and **sled** for embedded storage workloads in the Rust ecosystem. Both are written in Rust, but they serve different purposes.
 
-> **Versions compared:** DecentDB 2.0.0 vs sled 0.34.x (as of 2024).
+> **Versions compared:** DecentDB 2.15.x vs sled 0.34.x.
 >
 > **See also:** [SQL Feature Matrix](sql-feature-matrix.md) for DecentDB's full SQL surface, and [DecentDB vs SQLite](decentdb-vs-sqlite.md) for the comparison with SQLite.
 
@@ -21,12 +21,12 @@ If you want DecentDB's feature set on top of sled, you would need to build the S
 | **Data model** | Tables, rows, columns, types | Arbitrary key-value pairs |
 | **Query language** | SQL | None (get/insert/remove/scan API) |
 | **Indexing** | B-tree secondary indexes, trigram, expression, covering | Single sorted key-space |
-| **Durability** | WAL + fsync-on-commit, always | Configurable (flush/flush_async) |
+| **Durability** | WAL + full sync on commit by default; relaxed open-time modes are explicit | Configurable (flush/flush_async) |
 | **Architecture** | B-tree | B-link tree (lock-free) |
-| **Concurrency** | One writer, many concurrent reader threads | Lock-free reads, concurrent writes |
+| **Concurrency** | One writer, many readers; local native cross-process WAL coordination when supported | Lock-free reads, concurrent writes |
 | **Transactions** | Full ACID (SQL-level) | ACID (atomic batches, compare-and-swap) |
-| **Event notifications** | No | Yes (watch_prefix) |
-| **Background work** | None (B-tree manages space in-place) | Background segment merging |
+| **Event notifications** | In-process table/range/query/change-stream watches | Key-prefix watches (`watch_prefix`) |
+| **Background work** | No LSM compaction; optional background checkpointing | Background segment merging |
 | **Bindings** | C ABI, Rust, Python, .NET, Go, Java, Node.js, Dart | Rust only |
 | **License** | MIT or Apache-2.0 | MIT or Apache-2.0 |
 | **Binary size** | ~2-3 MB | ~500 KB - 1 MB |
@@ -96,7 +96,8 @@ SELECT * FROM users WHERE id BETWEEN 100 AND 200;
 - Aggregations (COUNT, SUM, AVG, etc.)
 - GROUP BY and HAVING
 - Subqueries
-- Window functions (planned)
+- Window functions (`ROW_NUMBER`, `RANK`, `DENSE_RANK`, `LAG`, `LEAD`,
+  `FIRST_VALUE`, `LAST_VALUE`, `NTH_VALUE`)
 
 ### Event Notifications
 
@@ -113,7 +114,9 @@ while let Some(event) = (&mut subscriber).await {
 }
 ```
 
-**DecentDB** does not have built-in change notifications. You would implement this at the application layer.
+**DecentDB** has in-process reactive watches for table, range, query, and
+change-stream invalidation. That is a SQL/database-level notification surface,
+not sled's key-prefix stream API.
 
 ### Maturity and Stability
 
@@ -150,9 +153,10 @@ db.insert("config:language", b"en")?;
 let theme = db.get("config:theme")?;
 ```
 
-### 2. You need event notifications
+### 2. You need key-prefix event notifications
 
-sled's `watch_prefix` provides real-time notifications when keys change:
+sled's `watch_prefix` provides real-time notifications when keys with a
+particular byte-prefix change:
 
 ```rust
 let mut sub = db.watch_prefix("cache:");
@@ -233,7 +237,8 @@ DecentDB's C ABI enables access from Python, .NET, Go, Java, Node.js, and Dart. 
 
 ### 5. You need a stable, production-ready release
 
-DecentDB 2.0.0 has a stable file format and API. sled is still pre-1.0 with potential API changes.
+DecentDB has had a stable file-format baseline since 2.0.0. sled is still
+pre-1.0 with potential API changes.
 
 ### 6. You need JOINs
 
@@ -256,7 +261,7 @@ With sled, you would implement join logic in application code, potentially with 
 | Write throughput | Good (WAL) | Good (lock-free) |
 | Concurrent reads | Excellent | Excellent (lock-free) |
 | Concurrent writes | Single writer | Multiple writers |
-| Event notifications | Not supported | Built-in |
+| Key-prefix event notifications | Use DecentDB watch APIs for SQL/table/query changes | sled |
 
 ## Decision Matrix
 

@@ -379,14 +379,16 @@ label ids; catalog metadata carries the human-readable label mapping.
 ## Maintenance
 
 ```csharp
-// Checkpoint (flush WAL)
+// Checkpoint committed WAL frames into the database file
 conn.Checkpoint();
 
 // Online backup
 conn.SaveAs("/path/to/backup.ddb");
 
-// File-backed vacuum/compaction helper
-await DecentDBMaintenance.VacuumAtomicAsync("/path/to/shop.ddb");
+// Binding-native file maintenance helpers
+await DecentDBMaintenance.CheckpointAsync("/path/to/shop.ddb");
+await DecentDBMaintenance.CompactAsync("/path/to/shop.ddb", "/path/to/shop.compact.ddb");
+await DecentDBMaintenance.VacuumAsync("/path/to/shop.ddb", createBackup: true);
 ```
 
 ## Sync SDK

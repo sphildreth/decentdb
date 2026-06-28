@@ -2408,6 +2408,62 @@ impl RuntimeBtreeKeys {
         Ok(())
     }
 
+    pub(super) fn move_row_id(
+        &mut self,
+        old_key: &RuntimeBtreeKey,
+        new_key: RuntimeBtreeKey,
+        row_id: i64,
+    ) -> Result<bool> {
+        match (self, old_key, new_key) {
+            (
+                Self::NonUniqueEncoded(keys, deleted),
+                RuntimeBtreeKey::Encoded(old_key),
+                RuntimeBtreeKey::Encoded(new_key),
+            ) if !deleted.contains(&row_id) => {
+                let keys = Arc::make_mut(keys);
+                if let Some(row_ids) = keys.get_mut(old_key) {
+                    row_ids.retain(|existing| *existing != row_id);
+                }
+                if keys.get(old_key).is_some_and(Vec::is_empty) {
+                    keys.remove(old_key);
+                }
+                keys.entry(new_key).or_default().push(row_id);
+                Ok(true)
+            }
+            (
+                Self::NonUniqueInt64(keys, deleted),
+                RuntimeBtreeKey::Int64(old_key),
+                RuntimeBtreeKey::Int64(new_key),
+            ) if !deleted.contains(&row_id) => {
+                let keys = Arc::make_mut(keys);
+                if let Some(row_ids) = keys.get_mut(old_key) {
+                    row_ids.retain(|existing| *existing != row_id);
+                }
+                if keys.get(old_key).is_some_and(Vec::is_empty) {
+                    keys.remove(old_key);
+                }
+                keys.entry(new_key).or_default().push(row_id);
+                Ok(true)
+            }
+            (
+                Self::NonUniqueUuid(keys, deleted),
+                RuntimeBtreeKey::Uuid(old_key),
+                RuntimeBtreeKey::Uuid(new_key),
+            ) if !deleted.contains(&row_id) => {
+                let keys = Arc::make_mut(keys);
+                if let Some(row_ids) = keys.get_mut(old_key) {
+                    row_ids.retain(|existing| *existing != row_id);
+                }
+                if keys.get(old_key).is_some_and(Vec::is_empty) {
+                    keys.remove(old_key);
+                }
+                keys.entry(new_key).or_default().push(row_id);
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
     pub(super) fn remove_row_id(&mut self, key: &RuntimeBtreeKey, row_id: i64) -> Result<()> {
         match (self, key) {
             (Self::UniqueEncoded(keys, deleted), RuntimeBtreeKey::Encoded(key)) => {
@@ -2816,6 +2872,7 @@ pub(crate) struct PagedMutationDelta {
     pub(crate) append_count: usize,
     pub(crate) updated_rows: BTreeMap<i64, Vec<Value>>,
     pub(crate) deleted_rows: BTreeSet<i64>,
+    pub(crate) original_rows: BTreeMap<i64, Vec<Value>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3939,6 +3996,18 @@ impl EngineRuntime {
                         rewrite_paged_table_from_manifest(&mut store, previous_state, manifest)?;
                     self.persisted_tables_mut()
                         .insert(canonical_table_name.clone(), new_state);
+                    if new_state == previous_state {
+                        if db.config().persistent_pk_index {
+                            replace_table_pk_index_root(
+                                self,
+                                db,
+                                &canonical_table_name,
+                                previous_state.pk_index_root,
+                            )?;
+                        }
+                        self.cache_payload_remove(&canonical_table_name);
+                        continue;
+                    }
                     let pk_index_root = self.refresh_paged_lookup_cache_and_pk_index_from_chunks(
                         db,
                         &canonical_table_name,
@@ -5568,6 +5637,57 @@ impl EngineRuntime {
             .insert(row_id, values.to_vec());
     }
 
+    pub(super) fn mark_table_row_dirty_with_original_values(
+        &mut self,
+        table_name: &str,
+        _row_index: usize,
+        row_id: i64,
+        original_values: &[Value],
+        values: &[Value],
+    ) {
+        if self.visible_table_is_temporary(table_name) {
+            return;
+        }
+        let Some(table_name) = self.canonical_catalog_table_name(table_name) else {
+            return;
+        };
+        self.catalog_mut().table_stats.remove(&table_name);
+        if self.dirty_tables.contains(&table_name)
+            && !self.paged_mutations.contains_key(&table_name)
+        {
+            return;
+        }
+
+        let restores_original = self
+            .paged_mutations
+            .get(&table_name)
+            .and_then(|delta| delta.original_rows.get(&row_id))
+            .is_some_and(|original| original == values);
+
+        if restores_original || values == original_values {
+            if let Some(delta) = self.paged_mutations.get_mut(&table_name) {
+                delta.updated_rows.remove(&row_id);
+                delta.original_rows.remove(&row_id);
+                if delta.updated_rows.is_empty()
+                    && delta.deleted_rows.is_empty()
+                    && delta.append_count == 0
+                {
+                    self.paged_mutations.remove(&table_name);
+                    self.dirty_tables_mut().remove(&table_name);
+                }
+            }
+            return;
+        }
+
+        self.dirty_tables_mut().insert(table_name.clone());
+        let delta = self.paged_mutations.entry(table_name.clone()).or_default();
+        delta
+            .original_rows
+            .entry(row_id)
+            .or_insert_with(|| original_values.to_vec());
+        delta.updated_rows.insert(row_id, values.to_vec());
+    }
+
     pub(super) fn mark_table_row_deleted(&mut self, table_name: &str, row_id: i64) {
         if self.visible_table_is_temporary(table_name) {
             return;
@@ -6175,6 +6295,9 @@ impl EngineRuntime {
                     return self
                         .evaluate_query(query, params, &BTreeMap::new())
                         .map(dataset_to_result);
+                }
+                if let Some(result) = Self::try_execute_simple_integer_series_query(query) {
+                    return Ok(result);
                 }
                 if let Some(result) = self.try_execute_simple_count_query(query)? {
                     return Ok(result);
@@ -16013,6 +16136,41 @@ impl EngineRuntime {
             return Ok(None);
         };
 
+        if !select.distinct
+            && query.order_by.is_empty()
+            && limit.is_none()
+            && offset == 0
+            && residual_like_filter_can_use_direct_scan(filter)
+        {
+            if let Some((filter_table, filter_column, literal)) =
+                simple_contains_like_projection_filter(filter)
+            {
+                if filter_table.is_none_or(|table_name| {
+                    identifiers_equal(table_name, name)
+                        || identifiers_equal(table_name, binding_name)
+                }) {
+                    let filter_column_index = table_schema
+                        .columns
+                        .iter()
+                        .position(|candidate| identifiers_equal(&candidate.name, filter_column))
+                        .ok_or_else(|| {
+                            DbError::internal(format!(
+                                "simple LIKE projection column {filter_column} missing from {name}"
+                            ))
+                        })?;
+                    return Ok(Some(
+                        self.simple_contains_like_projection_result_from_source(
+                            row_source,
+                            filter_column_index,
+                            literal,
+                            &projection_indexes,
+                            column_names,
+                        )?,
+                    ));
+                }
+            }
+        }
+
         let Some(range_filter) = simple_range_projection_filter(filter) else {
             return Ok(None);
         };
@@ -18088,6 +18246,28 @@ impl EngineRuntime {
             limit,
             offset,
         )
+    }
+
+    fn simple_contains_like_projection_result_from_source(
+        &self,
+        row_source: VisibleTableRowSource<'_>,
+        filter_column_index: usize,
+        literal: &str,
+        projection_indexes: &[usize],
+        column_names: Vec<String>,
+    ) -> Result<QueryResult> {
+        let mut rows = Vec::new();
+        for stored_row in row_source.rows() {
+            let stored_row = stored_row?;
+            let values = stored_row.values();
+            let Some(Value::Text(candidate)) = values.get(filter_column_index) else {
+                continue;
+            };
+            if candidate.contains(literal) {
+                rows.push(project_simple_projection_values(values, projection_indexes));
+            }
+        }
+        Ok(QueryResult::with_rows(column_names, rows))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -22304,6 +22484,9 @@ impl EngineRuntime {
         params: &[Value],
         inherited_ctes: &BTreeMap<String, Dataset>,
     ) -> Result<Dataset> {
+        if let Some(dataset) = Self::try_evaluate_simple_integer_series_cte(cte) {
+            return Ok(dataset);
+        }
         if !cte.query.order_by.is_empty() || cte.query.limit.is_some() || cte.query.offset.is_some()
         {
             return Err(DbError::sql(format!(
@@ -22407,6 +22590,208 @@ impl EngineRuntime {
             "recursive CTE {} exceeded the {} iteration limit",
             cte.name, RECURSIVE_CTE_MAX_ITERATIONS
         )))
+    }
+
+    fn try_execute_simple_integer_series_query(query: &Query) -> Option<QueryResult> {
+        if !query.recursive
+            || query.ctes.len() != 1
+            || !query.order_by.is_empty()
+            || query.limit.is_some()
+            || query.offset.is_some()
+        {
+            return None;
+        }
+        let cte = query.ctes.first()?;
+        let (column_name, start, step, upper_exclusive) = Self::simple_integer_series_bounds(cte)?;
+
+        let QueryBody::Select(select) = &query.body else {
+            return None;
+        };
+        if select.from.len() != 1
+            || select.filter.is_some()
+            || !select.group_by.is_empty()
+            || select.having.is_some()
+            || select.distinct
+            || !select.distinct_on.is_empty()
+        {
+            return None;
+        }
+        let [FromItem::Table { name, alias }] = select.from.as_slice() else {
+            return None;
+        };
+        if !identifiers_equal(name, &cte.name) {
+            return None;
+        }
+        let binding_name = alias.as_deref().unwrap_or(name);
+        let [SelectItem::Expr { expr, alias }] = select.projection.as_slice() else {
+            return None;
+        };
+        if !Self::simple_integer_series_column_ref(expr, binding_name, &column_name) {
+            return None;
+        }
+
+        let max_rows = upper_exclusive
+            .checked_sub(start)?
+            .checked_div(step)?
+            .checked_add(1)?;
+        let capacity = usize::try_from(max_rows)
+            .ok()
+            .filter(|rows| *rows <= RECURSIVE_CTE_MAX_ITERATIONS)?;
+        let mut rows = Vec::with_capacity(capacity);
+        let mut value = start;
+        rows.push(QueryRow::new(vec![Value::Int64(value)]));
+        while value < upper_exclusive {
+            value = value.checked_add(step)?;
+            rows.push(QueryRow::new(vec![Value::Int64(value)]));
+            if rows.len() > RECURSIVE_CTE_MAX_ITERATIONS {
+                return None;
+            }
+        }
+
+        Some(QueryResult::with_rows(
+            vec![alias.clone().unwrap_or(column_name)],
+            rows,
+        ))
+    }
+
+    fn try_evaluate_simple_integer_series_cte(cte: &CommonTableExpr) -> Option<Dataset> {
+        let (column_name, start, step, upper_exclusive) = Self::simple_integer_series_bounds(cte)?;
+        let mut rows = Vec::new();
+        let mut value = start;
+        rows.push(vec![Value::Int64(value)]);
+        while value < upper_exclusive {
+            if rows.len() >= RECURSIVE_CTE_MAX_ITERATIONS {
+                return None;
+            }
+            value = value.checked_add(step)?;
+            rows.push(vec![Value::Int64(value)]);
+        }
+
+        Some(Dataset::with_rows(
+            vec![ColumnBinding::visible(Some(cte.name.clone()), column_name)],
+            rows,
+        ))
+    }
+
+    fn simple_integer_series_bounds(cte: &CommonTableExpr) -> Option<(String, i64, i64, i64)> {
+        if cte.column_names.len() != 1
+            || !cte.query.recursive
+            || !cte.query.order_by.is_empty()
+            || cte.query.limit.is_some()
+            || cte.query.offset.is_some()
+        {
+            return None;
+        }
+        let QueryBody::SetOperation {
+            op: crate::sql::ast::SetOperation::Union,
+            all: true,
+            left,
+            right,
+        } = &cte.query.body
+        else {
+            return None;
+        };
+
+        let start = Self::simple_integer_series_anchor(left)?;
+        let (step, upper_exclusive) =
+            Self::simple_integer_series_recursive_term(right, &cte.name, &cte.column_names[0])?;
+        if step <= 0 {
+            return None;
+        }
+        Some((cte.column_names[0].clone(), start, step, upper_exclusive))
+    }
+
+    fn simple_integer_series_anchor(body: &QueryBody) -> Option<i64> {
+        let QueryBody::Select(select) = body else {
+            return None;
+        };
+        if !select.from.is_empty()
+            || select.filter.is_some()
+            || !select.group_by.is_empty()
+            || select.having.is_some()
+            || select.distinct
+            || !select.distinct_on.is_empty()
+        {
+            return None;
+        }
+        let [SelectItem::Expr { expr, .. }] = select.projection.as_slice() else {
+            return None;
+        };
+        let Expr::Literal(Value::Int64(value)) = expr else {
+            return None;
+        };
+        Some(*value)
+    }
+
+    fn simple_integer_series_recursive_term(
+        body: &QueryBody,
+        cte_name: &str,
+        column_name: &str,
+    ) -> Option<(i64, i64)> {
+        let QueryBody::Select(select) = body else {
+            return None;
+        };
+        if select.from.len() != 1
+            || !select.group_by.is_empty()
+            || select.having.is_some()
+            || select.distinct
+            || !select.distinct_on.is_empty()
+        {
+            return None;
+        }
+        let [FromItem::Table { name, alias }] = select.from.as_slice() else {
+            return None;
+        };
+        if !identifiers_equal(name, cte_name) {
+            return None;
+        }
+        let binding_name = alias.as_deref().unwrap_or(name);
+
+        let [SelectItem::Expr { expr, .. }] = select.projection.as_slice() else {
+            return None;
+        };
+        let step = match expr {
+            Expr::Binary { left, op, right } if *op == BinaryOp::Add => {
+                if Self::simple_integer_series_column_ref(left, binding_name, column_name) {
+                    Self::simple_int64_literal(right)?
+                } else if Self::simple_integer_series_column_ref(right, binding_name, column_name) {
+                    Self::simple_int64_literal(left)?
+                } else {
+                    return None;
+                }
+            }
+            _ => return None,
+        };
+
+        let filter = select.filter.as_ref()?;
+        let upper_exclusive = match filter {
+            Expr::Binary { left, op, right } if *op == BinaryOp::Lt => {
+                if !Self::simple_integer_series_column_ref(left, binding_name, column_name) {
+                    return None;
+                }
+                Self::simple_int64_literal(right)?
+            }
+            _ => return None,
+        };
+        Some((step, upper_exclusive))
+    }
+
+    fn simple_integer_series_column_ref(expr: &Expr, table_name: &str, column_name: &str) -> bool {
+        matches!(
+            expr,
+            Expr::Column { table, column }
+                if identifiers_equal(column, column_name)
+                    && table
+                        .as_deref()
+                        .is_none_or(|candidate| identifiers_equal(candidate, table_name))
+        )
+    }
+
+    fn simple_int64_literal(expr: &Expr) -> Option<i64> {
+        match expr {
+            Expr::Literal(Value::Int64(value)) => Some(*value),
+            _ => None,
+        }
     }
 
     fn evaluate_query_with_outer(
@@ -29523,6 +29908,7 @@ fn apply_paged_row_changes_to_manifest(
         let mut new_tombstones: BTreeSet<i64> = chunk.tombstoned_row_ids.iter().copied().collect();
         // Use BTreeMap so each row_id appears at most once in the overlay.
         let mut overlay_rows: BTreeMap<i64, StoredRow> = BTreeMap::new();
+        let mut reactivated_base_rows = BTreeSet::new();
         let mut chunk_changed = false;
 
         // Scan the base payload: tombstone touched rows and queue their
@@ -29532,14 +29918,22 @@ fn apply_paged_row_changes_to_manifest(
             match chunk_changes.get(&previous_row.row_id).copied() {
                 Some(Some(next_values)) => {
                     chunk_changed = true;
-                    new_tombstones.insert(previous_row.row_id);
-                    overlay_rows.insert(
-                        previous_row.row_id,
-                        StoredRow {
-                            row_id: previous_row.row_id,
-                            values: next_values.clone(),
-                        },
-                    );
+                    if chunk.tombstoned_row_ids.contains(&previous_row.row_id)
+                        && previous_row.values == *next_values
+                    {
+                        new_tombstones.remove(&previous_row.row_id);
+                        reactivated_base_rows.insert(previous_row.row_id);
+                        overlay_rows.remove(&previous_row.row_id);
+                    } else {
+                        new_tombstones.insert(previous_row.row_id);
+                        overlay_rows.insert(
+                            previous_row.row_id,
+                            StoredRow {
+                                row_id: previous_row.row_id,
+                                values: next_values.clone(),
+                            },
+                        );
+                    }
                 }
                 Some(None) => {
                     chunk_changed = true;
@@ -29557,13 +29951,17 @@ fn apply_paged_row_changes_to_manifest(
                 match chunk_changes.get(&previous_row.row_id).copied() {
                     Some(Some(next_values)) => {
                         chunk_changed = true;
-                        overlay_rows.insert(
-                            previous_row.row_id,
-                            StoredRow {
-                                row_id: previous_row.row_id,
-                                values: next_values.clone(),
-                            },
-                        );
+                        if reactivated_base_rows.contains(&previous_row.row_id) {
+                            overlay_rows.remove(&previous_row.row_id);
+                        } else {
+                            overlay_rows.insert(
+                                previous_row.row_id,
+                                StoredRow {
+                                    row_id: previous_row.row_id,
+                                    values: next_values.clone(),
+                                },
+                            );
+                        }
                     }
                     Some(None) => {
                         chunk_changed = true;
@@ -29816,6 +30214,22 @@ fn table_page_manifest_chunk_is_plain(chunk: &TablePageManifestChunk) -> bool {
         && chunk.overlay_pointer.is_none()
         && chunk.overlay_checksum.is_none()
         && chunk.overlay_payload.is_none()
+}
+
+fn persisted_chunk_metadata_matches_current(
+    persisted: &PersistedTableChunkState,
+    current: &TablePageManifestChunk,
+) -> bool {
+    persisted.pointer == current.pointer
+        && persisted.checksum == current.checksum
+        && persisted.row_count == current.row_count
+        && persisted.overlay_pointer == current.overlay_pointer
+        && persisted.overlay_checksum == current.overlay_checksum
+        && persisted.tombstoned_row_ids.len() == current.tombstoned_row_ids.len()
+        && persisted
+            .tombstoned_row_ids
+            .iter()
+            .all(|row_id| current.tombstoned_row_ids.contains(row_id))
 }
 
 fn persisted_chunk_from_current(
@@ -30519,67 +30933,81 @@ fn rewrite_paged_table_from_manifest<S: PageStore>(
     } else {
         Vec::new()
     };
-    let previous_payloads = if previous_state.pointer.head_page_id != 0
-        && previous_state.pointer.is_table_paged_manifest()
-    {
-        read_paged_table_chunk_payloads(store, previous_state)?
-    } else {
-        Vec::new()
-    };
-    let reusable_previous = previous_chunks
-        .into_iter()
-        .zip(previous_payloads)
-        .collect::<Vec<_>>();
-    let mut reused_previous = vec![false; reusable_previous.len()];
+    let mut previous_payloads = None;
+    let mut reused_previous = vec![false; previous_chunks.len()];
 
     let mut new_chunks = Vec::with_capacity(manifest.chunks.len());
     let mut persisted_chunks = Vec::with_capacity(manifest.chunks.len());
 
-    for current_chunk in manifest.chunks.iter() {
+    for (current_index, current_chunk) in manifest.chunks.iter().enumerate() {
+        if let Some(chunk_state) = previous_chunks.get(current_index) {
+            if persisted_chunk_metadata_matches_current(chunk_state, current_chunk) {
+                reused_previous[current_index] = true;
+                persisted_chunks.push(TablePageManifestChunk {
+                    pointer: chunk_state.pointer,
+                    checksum: chunk_state.checksum,
+                    row_count: chunk_state.row_count,
+                    payload: Arc::clone(&current_chunk.payload),
+                    tombstoned_row_ids: Arc::clone(&current_chunk.tombstoned_row_ids),
+                    overlay_pointer: chunk_state.overlay_pointer,
+                    overlay_checksum: chunk_state.overlay_checksum,
+                    overlay_payload: current_chunk.overlay_payload.clone(),
+                });
+                new_chunks.push(chunk_state.clone());
+                continue;
+            }
+        }
+
+        if previous_payloads.is_none() {
+            if previous_state.pointer.head_page_id != 0
+                && previous_state.pointer.is_table_paged_manifest()
+            {
+                previous_payloads = Some(read_paged_table_chunk_payloads(store, previous_state)?);
+            } else {
+                previous_payloads = Some(Vec::new());
+            }
+        }
+        let reusable_previous = previous_payloads
+            .as_ref()
+            .expect("previous payloads loaded");
         let checksum = crc32c_parts(&[current_chunk.payload.as_slice()]);
         let current_overlay_checksum = current_chunk
             .overlay_payload
             .as_ref()
             .map(|payload| crc32c_parts(&[payload.as_slice()]));
-        let reused_index =
-            reusable_previous
-                .iter()
-                .enumerate()
-                .find_map(|(index, (chunk_state, payload))| {
-                    let overlay_match = match (
-                        &payload.overlay_payload,
-                        &current_chunk.overlay_payload,
-                        chunk_state.overlay_checksum,
-                        current_overlay_checksum,
-                    ) {
-                        (None, None, None, None) => true,
-                        (
-                            Some(previous),
-                            Some(current),
-                            Some(previous_checksum),
-                            Some(checksum),
-                        ) => {
-                            previous_checksum == checksum
-                                && previous.as_slice() == current.as_slice()
-                        }
-                        _ => false,
-                    };
-                    (!reused_previous[index]
-                        && chunk_state.checksum == checksum
-                        && payload.payload.as_slice() == current_chunk.payload.as_slice()
-                        && chunk_state.row_count == current_chunk.row_count
-                        && chunk_state.tombstoned_row_ids.len()
-                            == current_chunk.tombstoned_row_ids.len()
-                        && chunk_state
-                            .tombstoned_row_ids
-                            .iter()
-                            .all(|id| current_chunk.tombstoned_row_ids.contains(id))
-                        && overlay_match)
-                        .then_some(index)
-                });
+        let reused_index = reusable_previous
+            .iter()
+            .enumerate()
+            .find_map(|(index, payload)| {
+                let chunk_state = previous_chunks.get(index)?;
+                let overlay_match = match (
+                    &payload.overlay_payload,
+                    &current_chunk.overlay_payload,
+                    chunk_state.overlay_checksum,
+                    current_overlay_checksum,
+                ) {
+                    (None, None, None, None) => true,
+                    (Some(previous), Some(current), Some(previous_checksum), Some(checksum)) => {
+                        previous_checksum == checksum && previous.as_slice() == current.as_slice()
+                    }
+                    _ => false,
+                };
+                (!reused_previous[index]
+                    && chunk_state.checksum == checksum
+                    && payload.payload.as_slice() == current_chunk.payload.as_slice()
+                    && chunk_state.row_count == current_chunk.row_count
+                    && chunk_state.tombstoned_row_ids.len()
+                        == current_chunk.tombstoned_row_ids.len()
+                    && chunk_state
+                        .tombstoned_row_ids
+                        .iter()
+                        .all(|id| current_chunk.tombstoned_row_ids.contains(id))
+                    && overlay_match)
+                    .then_some(index)
+            });
         if let Some(index) = reused_index {
             reused_previous[index] = true;
-            let chunk_state = reusable_previous[index].0.clone();
+            let chunk_state = previous_chunks[index].clone();
             persisted_chunks.push(TablePageManifestChunk {
                 pointer: chunk_state.pointer,
                 checksum: chunk_state.checksum,
@@ -30633,6 +31061,10 @@ fn rewrite_paged_table_from_manifest<S: PageStore>(
         });
     }
 
+    if new_chunks == previous_chunks {
+        return Ok((previous_state, persisted_chunks));
+    }
+
     let updated_manifest_payload =
         encode_paged_table_manifest_payload(&PersistedPagedTableManifest { chunks: new_chunks })?;
     let checksum = crc32c_parts(&[updated_manifest_payload.as_slice()]);
@@ -30645,7 +31077,7 @@ fn rewrite_paged_table_from_manifest<S: PageStore>(
     .with_table_paged_manifest(true);
     let tail = read_uncompressed_overflow_tail(store, pointer)?.unwrap_or_default();
 
-    for (index, (chunk_state, _)) in reusable_previous.iter().enumerate() {
+    for (index, chunk_state) in previous_chunks.iter().enumerate() {
         if reused_previous[index] || chunk_state.pointer.head_page_id == 0 {
             continue;
         }
@@ -34174,6 +34606,39 @@ fn simple_range_projection_filter(filter: &Expr) -> Option<SimpleRangeProjection
         upper: state.upper,
         residual: state.residual,
     })
+}
+
+fn residual_like_filter_can_use_direct_scan(filter: &Expr) -> bool {
+    simple_contains_like_projection_filter(filter).is_some()
+}
+
+fn simple_contains_like_projection_filter(filter: &Expr) -> Option<(Option<&str>, &str, &str)> {
+    let Expr::Like {
+        expr,
+        pattern,
+        escape: None,
+        case_insensitive: false,
+        negated: false,
+    } = filter
+    else {
+        return None;
+    };
+    let Expr::Column { table, column } = expr.as_ref() else {
+        return None;
+    };
+    let Expr::Literal(Value::Text(pattern)) = pattern.as_ref() else {
+        return None;
+    };
+    let literal = simple_contains_like_literal(pattern)?;
+    Some((table.as_deref(), column.as_str(), literal))
+}
+
+fn simple_contains_like_literal(pattern: &str) -> Option<&str> {
+    let literal = pattern.strip_prefix('%')?.strip_suffix('%')?;
+    if literal.is_empty() || literal.bytes().any(|byte| matches!(byte, b'%' | b'_')) {
+        return None;
+    }
+    Some(literal)
 }
 
 #[derive(Clone, Debug, Default)]

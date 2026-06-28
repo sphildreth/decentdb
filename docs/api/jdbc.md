@@ -27,8 +27,12 @@ Supported connection properties:
 - `readOnly` — `true` or `false` (default `false`)
 - `write_queue_enabled`, `write_queue_capacity`,
   `write_queue_default_timeout_ms`, `write_queue_strict_group_commit`,
+  `write_queue_group_commit`,
   `write_queue_max_batch`, and `write_queue_max_group_delay_us` are passed
   through to the native open options.
+
+`cachePages` and `busyTimeoutMs` are recognized by the URL parser but currently
+rejected by the driver as unsupported open-time configuration.
 
 The JNI bridge maps the stable write-queue status codes distinctly:
 `DDB_ERR_BUSY`, `DDB_ERR_TIMEOUT`, `DDB_ERR_CANCELED`,
@@ -230,7 +234,9 @@ standard JDBC `Connection` surface:
 
 ## Thread-safety and pooling
 
-DecentDB uses a single-process, one-writer / many-readers model.
+DecentDB uses a one-writer / many-readers model. Local native on-disk
+databases coordinate across OS processes when the selected VFS supports the
+required locks; in-memory databases remain process-local.
 
 - `Connection` methods are serialized internally per connection
 - `Statement`, `PreparedStatement`, and `ResultSet` are not thread-safe

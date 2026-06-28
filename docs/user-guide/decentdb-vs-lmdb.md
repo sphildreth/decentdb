@@ -2,7 +2,7 @@
 
 This document helps developers decide between **DecentDB** and **LMDB** (Lightning Memory-Mapped Database) for embedded storage workloads. Both use B-tree variants and prioritize read performance, but they operate at different abstraction levels.
 
-> **Versions compared:** DecentDB 2.0.0 vs LMDB 0.9.33 (as of 2024).
+> **Versions compared:** DecentDB 2.15.x vs LMDB 0.9.33.
 >
 > **See also:** [SQL Feature Matrix](sql-feature-matrix.md) for DecentDB's full SQL surface, and [DecentDB vs SQLite](decentdb-vs-sqlite.md) for the comparison with SQLite.
 
@@ -21,12 +21,12 @@ If you want DecentDB's feature set on top of LMDB, you would need to build the S
 | **Data model** | Tables, rows, columns, types | Arbitrary key-value byte pairs |
 | **Query language** | SQL | None (get/put/del/range API) |
 | **Indexing** | B-tree secondary indexes, trigram, expression, covering | Single sorted key-space per database; multiple named databases |
-| **Durability** | WAL + fsync-on-commit, always | Copy-on-write with configurable sync |
+| **Durability** | WAL + full sync on commit by default; relaxed open-time modes are explicit | Copy-on-write with configurable sync |
 | **Architecture** | B-tree | B+tree with copy-on-write |
 | **Memory model** | Page cache (configurable) | Memory-mapped (OS-managed) |
-| **Concurrency** | One writer, many concurrent reader threads (single process) | One writer, many readers (multi-process safe) |
+| **Concurrency** | One writer, many readers; local native cross-process WAL coordination when supported | One writer, many readers (multi-process safe) |
 | **Transactions** | Full ACID (SQL-level) | ACID with MVCC |
-| **Background work** | None (B-tree manages space in-place) | None (no compaction, no logs) |
+| **Background work** | No LSM compaction; optional background checkpointing | None (no compaction, no logs) |
 | **Bindings** | C ABI, Rust, Python, .NET, Go, Java, Node.js, Dart | C, C++, Python, Rust, Go, Java, Node.js, Ruby, and many others |
 | **License** | MIT or Apache-2.0 | OpenLDAP Public License (permissive) |
 | **Binary size** | ~2-3 MB | ~64 KB |
@@ -81,10 +81,13 @@ Unlike LSM-tree databases, neither requires background compaction:
 - Readers and writers from different processes coordinate via shared memory
 - MVCC ensures readers see consistent snapshots
 
-**DecentDB** is single-process:
-- One process owns the database file
-- Multiple threads within that process can read concurrently
-- Simpler model, no cross-process coordination overhead
+**DecentDB** keeps the same one-writer/many-readers model:
+- One writer is serialized by the engine
+- Multiple readers can run concurrently under snapshots
+- Native local database files coordinate multiple OS processes when the VFS
+  supports the required locks
+- `process_coordination=single_process_unsafe` remains available only when one
+  OS process can access the file
 
 ### File Format Portability
 
@@ -209,9 +212,13 @@ With LMDB, you would maintain separate databases for each index and keep them co
 
 If your database files might be moved between different architectures (e.g., x86_64 to ARM), DecentDB's portable format avoids export/import steps.
 
-### 5. You want a single-process, multi-threaded model
+### 5. You want SQL with a one-writer/many-readers model
 
-If your application is a single process with multiple threads, DecentDB's simpler concurrency model avoids the complexity of cross-process coordination.
+If your application needs SQL and can fit DecentDB's one-writer/many-readers
+model, DecentDB gives you typed relational access with less application code
+than building tables and indexes on top of LMDB. For supported native files,
+DecentDB can coordinate local processes; LMDB is still the stronger fit when
+multi-process memory-mapped key-value access is the main requirement.
 
 ## Performance Characteristics
 
@@ -231,7 +238,7 @@ If your application is a single process with multiple threads, DecentDB's simple
 | SQL queries, joins, aggregations | DecentDB |
 | Key-value with range scans | LMDB |
 | Multi-process access | LMDB |
-| Single-process, multi-threaded | Either (DecentDB for SQL) |
+| One-writer/many-readers SQL workload | DecentDB |
 | Zero-copy large value reads | LMDB |
 | Typed data with constraints | DecentDB |
 | Secondary indexes | DecentDB (automatic) |

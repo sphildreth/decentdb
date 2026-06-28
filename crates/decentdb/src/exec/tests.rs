@@ -69,6 +69,38 @@ fn simple_expression_projection_fast_path_handles_wildcard_like_order_limit() {
 }
 
 #[test]
+fn simple_filtered_projection_fast_path_handles_literal_contains_like() {
+    let mut runtime = EngineRuntime::empty(1);
+    execute_sql(
+        &mut runtime,
+        "CREATE TABLE movies (id INT64 PRIMARY KEY, title TEXT)",
+    );
+    execute_sql(&mut runtime, "INSERT INTO movies VALUES (1, 'Shadow One')");
+    execute_sql(&mut runtime, "INSERT INTO movies VALUES (2, 'Other')");
+    execute_sql(&mut runtime, "INSERT INTO movies VALUES (3, 'Long Shadow')");
+
+    let statement = parse_sql_statement("SELECT id, title FROM movies WHERE title LIKE '%Shadow%'")
+        .expect("parse");
+    let crate::sql::ast::Statement::Query(query) = &statement else {
+        panic!("expected query");
+    };
+    let result = runtime
+        .try_execute_simple_filtered_projection_query(query, &[])
+        .expect("execute")
+        .expect("literal contains LIKE should use filtered projection fast path");
+
+    assert_eq!(result.columns(), &["id".to_string(), "title".to_string()]);
+    assert_eq!(
+        result
+            .rows()
+            .iter()
+            .map(|row| row.values()[0].clone())
+            .collect::<Vec<_>>(),
+        vec![Value::Int64(1), Value::Int64(3)]
+    );
+}
+
+#[test]
 fn trigram_candidate_lookup_handles_like_wildcards() {
     let mut runtime = EngineRuntime::empty(1);
     execute_sql(

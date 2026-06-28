@@ -65,6 +65,12 @@ conn = decentdb.connect("/path/to/data.ddb", mode="open")
 
 # Or use Connection directly
 conn = decentdb.Connection("/path/to/data.ddb", mode="open_or_create", stmt_cache_size=256)
+
+# Pass native open options when you need profiles or low-level knobs
+conn = decentdb.connect(
+    "/path/to/data.ddb",
+    options="profile=embedded_fast;cache_size=64MB",
+)
 ```
 
 ### Cross-Process WAL Coordination
@@ -94,6 +100,7 @@ conn = decentdb.connect(
     write_queue_enabled=True,
     write_queue_capacity=128,
     write_queue_default_timeout_ms=1000,
+    write_queue_group_commit=True,
 )
 
 conn.execute_queued(
@@ -106,6 +113,8 @@ metrics = conn.write_queue_metrics()
 
 Queued writes preserve DecentDB's one-writer model and use strict group commit
 without weakening default durable acknowledgement semantics.
+The Python keyword `write_queue_group_commit` maps to the native
+`write_queue_strict_group_commit` option.
 
 ### Reactive Subscriptions
 
@@ -138,16 +147,16 @@ cur.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
 conn.commit()
 
 # Insert with parameters
-cur.execute("INSERT INTO users (name) VALUES ($1)", ["Alice"])
+cur.execute("INSERT INTO users (name) VALUES (?)", ["Alice"])
 
 # Select
-cur.execute("SELECT id, name FROM users WHERE id = $1", [1])
+cur.execute("SELECT id, name FROM users WHERE id = ?", [1])
 row = cur.fetchone()  # (1, "Alice")
 rows = cur.fetchall() # [(1, "Alice"), ...]
 
 # Many inserts
 cur.executemany(
-    "INSERT INTO users (name) VALUES ($1)",
+    "INSERT INTO users (name) VALUES (?)",
     [["Bob"], ["Carol"], ["Dave"]]
 )
 conn.commit()
@@ -163,12 +172,12 @@ result objects.
 ```python
 # Using methods
 conn.begin_transaction()
-cur.execute("UPDATE users SET name = $1 WHERE id = $2", ["Bob", 1])
+cur.execute("UPDATE users SET name = ? WHERE id = ?", ["Bob", 1])
 conn.commit()
 
 # Using context manager
 with conn:
-    cur.execute("UPDATE users SET name = $1 WHERE id = $2", ["Carol", 2])
+    cur.execute("UPDATE users SET name = ? WHERE id = ?", ["Carol", 2])
 
 # Check transaction state (queries the engine)
 if conn.in_transaction:
@@ -230,7 +239,7 @@ into an inline enum column.
 ## Maintenance
 
 ```python
-conn.checkpoint()                      # Checkpoint plus maintenance compaction
+conn.checkpoint()                      # Fold committed WAL frames into the database file
 conn.save_as("/path/to/backup.ddb")   # Online backup
 decentdb.evict_shared_wal("/path/to/data.ddb")  # Evict shared WAL
 ```

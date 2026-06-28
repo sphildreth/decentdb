@@ -191,7 +191,7 @@ and `head_id`.
 ### branch
 
 Manage branch metadata and branch state. Branch creation is metadata-only after
-the source state is checkpointed for durability.
+the source state is checkpointed into a stable branch base.
 
 ```bash
 decentdb branch create --db=<path> --name=<branch> [--from=<main|branch|snapshot|head>] [--format=<json|table>]

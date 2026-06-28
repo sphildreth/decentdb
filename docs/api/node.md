@@ -58,6 +58,15 @@ Native open options can include write-queue settings such as
 `write_queue_enabled=true`, `write_queue_capacity=128`, and
 `write_queue_default_timeout_ms=1000`. The wrapper also accepts camel-cased
 constructor fields such as `writeQueueEnabled` and `writeQueueCapacity`.
+Use the object constructor for profiles or other native open options:
+
+```js
+const db = new Database({
+  path: 'app.ddb',
+  mode: 'openOrCreate',
+  options: { profile: 'embedded_fast', cache_size: '64MB' },
+});
+```
 
 The N-API layer maps queue status codes distinctly, including timeout,
 canceled, queue-full, and queue-closed outcomes. `Database.execQueued(sql)`

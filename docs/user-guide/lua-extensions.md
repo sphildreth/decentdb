@@ -1,7 +1,7 @@
 # Lua Extensions
 
-DecentDB 2.6.0 includes a sandboxed Lua extension model for adding SQL-visible
-behavior without loading arbitrary native code.
+Current native DecentDB builds include a sandboxed Lua extension model for
+adding SQL-visible behavior without loading arbitrary native code.
 
 Extensions are ordinary package directories with a `decentdb-extension.toml`
 manifest and Lua source. Installing a package stores a canonical copy in the
@@ -126,12 +126,12 @@ Top-level manifest fields:
 |---|---|
 | `name` | SQL extension name. It must be a valid DecentDB identifier. |
 | `version` | Package author's version string. DecentDB stores it for inspection and lifecycle output. |
-| `language` | Must be `lua` in DecentDB 2.6.0. |
-| `api_version` | Must equal DecentDB's supported extension API version. 2.6.0 supports API version `1`; mismatches fail validation and install. |
+| `language` | Must be `lua`. |
+| `api_version` | Must equal DecentDB's supported extension API version. Current builds support API version `1`; mismatches fail validation and install. |
 | `entry` | Lua file loaded as the package entry module. It must return a table of exports. |
-| `strict_types` | Must be `true` in 2.6.0. DecentDB validates arguments and results against manifest-declared SQL types instead of allowing Lua-side implicit coercion. |
+| `strict_types` | Must be `true`. DecentDB validates arguments and results against manifest-declared SQL types instead of allowing Lua-side implicit coercion. |
 
-All permission fields must remain `false` in DecentDB 2.6.0. A package that
+All permission fields must remain `false`. A package that
 requests filesystem, network, process, database, native-module, clock, or random
 permissions fails validation before any Lua code runs.
 
@@ -168,8 +168,8 @@ volatile = true
 Use `deterministic = true` when equal arguments always produce equal results.
 Use `stable = true` for behavior that should be treated as stable for a
 statement or package revision but not necessarily timeless. Use
-`volatile = true` for behavior that can change from call to call. In 2.6.0
-these markers are validation and inspection metadata; they do not make Lua
+`volatile = true` for behavior that can change from call to call. These markers
+are validation and inspection metadata; they do not make Lua
 functions eligible for persisted generated columns or persisted index keys.
 
 Packages can also declare package-level dependencies:
@@ -231,7 +231,7 @@ small `ddb` namespace for strict typed wrappers. Denied Lua libraries include
 module loading.
 
 `math.random` and `math.randomseed` are disabled. They raise Lua runtime errors
-because `permissions.random = true` is rejected in the 2.6.0 sandbox.
+because `permissions.random = true` is rejected by the sandbox.
 
 The `ddb` namespace includes:
 
@@ -254,8 +254,7 @@ Decimal wrappers expose `to_string()`, `add(...)`, `sub(...)`, `mul(...)`,
 `decentdb extension test` looks for `tests/behavior.sql` in the package
 directory. Use that file for smoke tests that exercise every exported SQL
 object before installing the package into an application database.
-Lua-native test files such as `tests/main_test.lua` are not executed by the
-2.6.0 CLI.
+Lua-native test files such as `tests/main_test.lua` are not executed by the CLI.
 
 ```sql
 CREATE TABLE words(name TEXT);
@@ -498,7 +497,7 @@ decentdb extension rebuild --db app.ddb text_tools
 ```
 
 `extension rebuild` currently reports recorded persisted objects that depend on
-the named extension. Because DecentDB 2.6.0 rejects persisted Lua-backed
+the named extension. Because DecentDB rejects persisted Lua-backed
 collations, generated columns, and indexes, this command normally reports an
 empty set. It is present so package upgrades and future persisted-object
 compatibility have an explicit inspection/rebuild surface instead of silently
@@ -587,7 +586,7 @@ FROM words
 ORDER BY name COLLATE reverse_text;
 ```
 
-The following persistent-collation forms are intentionally rejected in 2.6.0:
+The following persistent-collation forms are intentionally rejected:
 
 ```sql
 CREATE TABLE words(name TEXT COLLATE reverse_text);
@@ -716,14 +715,14 @@ ddb_db_open_or_create_with_options(
 
 ## Current Boundaries
 
-Lua extensions in 2.6.0 are enabled by default for native builds. Embedders can
+Lua extensions are enabled by default for native builds. Embedders can
 build without Lua support by disabling the `lua-extensions` cargo feature; in
 that build, package lifecycle APIs remain available but SQL execution of Lua
 objects returns an explicit unsupported-runtime error.
 
 Browser/WASM artifacts keep the same package catalog and trust model, but do
-not execute Lua in 2.6.0. This avoids shipping a second, less-audited browser
-runtime behind the same trust contract. Applications that need browser-side
+not execute Lua. This avoids shipping a second, less-audited browser runtime
+behind the same trust contract. Applications that need browser-side
 extension execution should treat that as a separate target-support decision.
 
 Lua collations work for query-time comparisons and ordering. Persistent column

@@ -52,6 +52,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ORDER BY ... LIMIT` queries through the existing top-k full-text fast path
   and adding strict fast paths for simple `RANK`/`DENSE_RANK`, `ROW_NUMBER`/
   `LAG`, and rolling `AVG` window query shapes.
+- Improved Showdown DML/query hot paths with arithmetic `UPDATE ... RETURNING`
+  fast paths, cheaper row-id range matching, incremental runtime B-tree row-id
+  moves, resident in-transaction update/revert dirty-state cleanup, no-op
+  row-id UPSERT checks, paged-manifest chunk metadata reuse, a strict
+  integer-series recursive CTE fast path, and a direct literal substring
+  `LIKE` projection path.
 
 ### Fixed
 

@@ -124,7 +124,6 @@ pub(crate) struct PreparedSimpleUpdateAssignment {
 struct RowIdNoopUpsertCandidate {
     row_id: i64,
     candidate: Vec<Value>,
-    next_values: Vec<Value>,
 }
 
 #[derive(Clone, Debug)]
@@ -2695,6 +2694,7 @@ impl EngineRuntime {
         prepared_update: &PreparedIntArithmeticUpdate,
         _table_indexes: &[crate::catalog::IndexSchema],
         indexes_to_update: &[crate::catalog::IndexSchema],
+        returning: &[crate::sql::ast::SelectItem],
         params: &[Value],
         page_size: u32,
     ) -> Result<Option<QueryResult>> {
@@ -2707,6 +2707,7 @@ impl EngineRuntime {
         let mut affected_rows = 0_u64;
         let mut changed_rows = 0_u64;
         let mut row_changes = BTreeMap::new();
+        let mut returning_rows = Vec::new();
         let mut stale_indexes: Vec<String> = Vec::new();
 
         for &row_id in matching_row_ids {
@@ -2736,6 +2737,9 @@ impl EngineRuntime {
 
             if next_value == *current_value {
                 affected_rows += 1;
+                if !returning.is_empty() {
+                    returning_rows.push(current_row);
+                }
                 continue;
             }
 
@@ -2768,7 +2772,13 @@ impl EngineRuntime {
             }
 
             self.record_sync_update_for_row(table, &next_values);
-            row_changes.insert(row_id, Some(next_values));
+            row_changes.insert(row_id, Some(next_values.clone()));
+            if !returning.is_empty() {
+                returning_rows.push(StoredRow {
+                    row_id,
+                    values: next_values,
+                });
+            }
             changed_rows += 1;
             affected_rows += 1;
         }
@@ -2796,7 +2806,16 @@ impl EngineRuntime {
             affected_rows as usize,
             page_size,
         )?;
-        Ok(Some(QueryResult::with_affected_rows(affected_rows)))
+        if returning.is_empty() {
+            Ok(Some(QueryResult::with_affected_rows(affected_rows)))
+        } else {
+            Ok(Some(self.render_returning(
+                &table.name,
+                &returning_rows,
+                returning,
+                params,
+            )?))
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2807,6 +2826,7 @@ impl EngineRuntime {
         prepared_update: &PreparedIntArithmeticUpdate,
         _table_indexes: &[crate::catalog::IndexSchema],
         indexes_to_update: &[crate::catalog::IndexSchema],
+        returning: &[crate::sql::ast::SelectItem],
         params: &[Value],
         page_size: u32,
     ) -> Result<Option<QueryResult>> {
@@ -2817,6 +2837,7 @@ impl EngineRuntime {
         let resolved_delta = resolve_prepared_simple_value(&prepared_update.delta_source, params)?;
         let mut affected_rows = 0_u64;
         let mut changed_rows = 0_u64;
+        let mut returning_rows = Vec::new();
         let mut stale_indexes: Vec<String> = Vec::new();
 
         for &row_id in matching_row_ids {
@@ -2862,6 +2883,20 @@ impl EngineRuntime {
 
             if next_value == current_value {
                 affected_rows += 1;
+                if !returning.is_empty() {
+                    let values = if let Some(values) = old_values.as_ref() {
+                        values.clone()
+                    } else {
+                        let Some(table_data) = self.table_data(&table.name) else {
+                            return Err(DbError::internal(format!(
+                                "table data for {} is missing",
+                                table.name
+                            )));
+                        };
+                        table_data.rows[row_index].values.clone()
+                    };
+                    returning_rows.push(StoredRow { row_id, values });
+                }
                 continue;
             }
 
@@ -2874,6 +2909,12 @@ impl EngineRuntime {
                     &next_values,
                     &table.name,
                 )?;
+                if !returning.is_empty() {
+                    returning_rows.push(StoredRow {
+                        row_id,
+                        values: next_values.clone(),
+                    });
+                }
                 for index in indexes_to_update {
                     if !index.fresh {
                         if !stale_indexes.contains(&index.name) {
@@ -2907,7 +2948,13 @@ impl EngineRuntime {
                             DbError::internal(format!("row {row_id} vanished during UPDATE"))
                         })?;
                 }
-                self.mark_table_row_dirty(&table.name, row_index, row_id, &next_values);
+                self.mark_table_row_dirty_with_original_values(
+                    &table.name,
+                    row_index,
+                    row_id,
+                    old_values,
+                    &next_values,
+                );
                 self.record_sync_update_for_row(table, &next_values);
             } else {
                 // No index touches the updated column: write just the changed
@@ -2919,20 +2966,35 @@ impl EngineRuntime {
                             table.name
                         )));
                     };
+                    let old_values = table_data.rows[row_index].values.clone();
                     table_data
                         .replace_value(row_index, prepared_update.column_index, next_value.clone())
                         .ok_or_else(|| {
                             DbError::internal(format!("row {row_id} vanished during UPDATE"))
                         })?;
-                    table_data.rows[row_index].values.clone()
+                    let next_values = table_data.rows[row_index].values.clone();
+                    (next_values, old_values)
                 };
+                let (next_values, old_values) = next_values;
                 validate_assigned_not_null_columns(
                     table,
                     std::slice::from_ref(&prepared_update.column_index),
                     &next_values,
                     &table.name,
                 )?;
-                self.mark_table_row_dirty(&table.name, row_index, row_id, &next_values);
+                if !returning.is_empty() {
+                    returning_rows.push(StoredRow {
+                        row_id,
+                        values: next_values.clone(),
+                    });
+                }
+                self.mark_table_row_dirty_with_original_values(
+                    &table.name,
+                    row_index,
+                    row_id,
+                    &old_values,
+                    &next_values,
+                );
                 self.record_sync_update_for_row(table, &next_values);
             }
             changed_rows += 1;
@@ -2949,7 +3011,16 @@ impl EngineRuntime {
             affected_rows as usize,
             page_size,
         )?;
-        Ok(Some(QueryResult::with_affected_rows(affected_rows)))
+        if returning.is_empty() {
+            Ok(Some(QueryResult::with_affected_rows(affected_rows)))
+        } else {
+            Ok(Some(self.render_returning(
+                &table.name,
+                &returning_rows,
+                returning,
+                params,
+            )?))
+        }
     }
 
     pub(super) fn execute_update(
@@ -3043,7 +3114,6 @@ impl EngineRuntime {
             && !updates_foreign_key_columns
             && matching_row_ids.len() == 1;
         if !table.temporary
-            && statement.returning.is_empty()
             && assignment_only_validation
             && !has_referencing_tables
             && !updates_foreign_key_columns
@@ -3057,6 +3127,7 @@ impl EngineRuntime {
                     &prepared_update,
                     &table_indexes,
                     &indexes_to_update,
+                    &statement.returning,
                     params,
                     page_size,
                 )? {
@@ -3081,11 +3152,7 @@ impl EngineRuntime {
                 return Ok(result);
             }
         }
-        if statement.returning.is_empty()
-            && assignment_only_validation
-            && !has_referencing_tables
-            && !updates_foreign_key_columns
-        {
+        if assignment_only_validation && !has_referencing_tables && !updates_foreign_key_columns {
             if let Some(prepared_update) =
                 compile_int_arithmetic_update(statement, &table, &assignment_columns)
             {
@@ -3095,6 +3162,7 @@ impl EngineRuntime {
                     &prepared_update,
                     &table_indexes,
                     &indexes_to_update,
+                    &statement.returning,
                     params,
                     page_size,
                 )? {
@@ -3685,8 +3753,52 @@ impl EngineRuntime {
             let Some(current_ref) = row_source.row_by_id(noop_candidate.row_id)? else {
                 return Ok(None);
             };
-            let current_values = current_ref.values().to_vec();
-            if noop_candidate.next_values == current_values {
+            let current_values = current_ref.values();
+            let mut noop_update = true;
+            for assignment in assignments {
+                let Some(target_column_index) = table
+                    .columns
+                    .iter()
+                    .position(|column| identifiers_equal(&column.name, &assignment.column_name))
+                else {
+                    return Ok(None);
+                };
+                if table.columns[target_column_index].generated_sql.is_some() {
+                    return Ok(None);
+                }
+                let value = match &assignment.expr {
+                    Expr::Column {
+                        table: Some(source_table),
+                        column: source_column,
+                    } if identifiers_equal(source_table, "excluded") => {
+                        let Some(source_column_index) = table
+                            .columns
+                            .iter()
+                            .position(|column| identifiers_equal(&column.name, source_column))
+                        else {
+                            return Ok(None);
+                        };
+                        noop_candidate.candidate[source_column_index].clone()
+                    }
+                    _ => {
+                        let Some(value_source) =
+                            compile_prepared_simple_value_source(&assignment.expr)
+                        else {
+                            return Ok(None);
+                        };
+                        resolve_prepared_simple_value(&value_source, params)?
+                    }
+                };
+                let value = super::constraints::coerce_column_value(
+                    &table.columns[target_column_index],
+                    value,
+                )?;
+                if current_values.get(target_column_index) != Some(&value) {
+                    noop_update = false;
+                    break;
+                }
+            }
+            if noop_update {
                 return Ok(Some(QueryResult::with_affected_rows(1)));
             }
             if self
@@ -3704,6 +3816,12 @@ impl EngineRuntime {
                 return Ok(Some(QueryResult::with_affected_rows(1)));
             }
             return Ok(None);
+        }
+
+        if let Some(result) =
+            self.try_execute_rowid_noop_upsert_partial_columns(&table, statement, params)?
+        {
+            return Ok(Some(result));
         }
 
         let mut source_rows = materialize_insert_source(self, &statement.source, params)?;
@@ -3774,6 +3892,207 @@ impl EngineRuntime {
         Ok(None)
     }
 
+    fn try_execute_rowid_noop_upsert_partial_columns(
+        &mut self,
+        table: &crate::catalog::TableSchema,
+        statement: &InsertStatement,
+        params: &[Value],
+    ) -> Result<Option<QueryResult>> {
+        if table
+            .columns
+            .iter()
+            .any(|column| column.generated_sql.is_some())
+        {
+            return Ok(None);
+        }
+
+        let InsertSource::Values(rows) = &statement.source else {
+            return Ok(None);
+        };
+        let [source_row] = rows.as_slice() else {
+            return Ok(None);
+        };
+
+        let Some(row_source) = self.table_row_source(&table.name) else {
+            return Ok(None);
+        };
+        let Some(row_id_column_name) = row_id_alias_column_name(table) else {
+            return Ok(None);
+        };
+
+        let row_id_column_index = table
+            .columns
+            .iter()
+            .position(|column| identifiers_equal(&column.name, row_id_column_name))
+            .ok_or_else(|| DbError::sql(format!("unknown column {}", row_id_column_name)))?;
+
+        let Some(row_id) = self.try_resolve_rowid_noop_upsert_row_id(
+            table,
+            statement,
+            source_row,
+            row_id_column_name,
+            row_id_column_index,
+            params,
+        )?
+        else {
+            return Ok(None);
+        };
+        let Some(current_ref) = row_source.row_by_id(row_id)? else {
+            return Ok(None);
+        };
+        let current_values = current_ref.values();
+        let mut next_values = current_values.to_vec();
+
+        let ConflictAction::DoUpdate { assignments, .. } = statement
+            .on_conflict
+            .as_ref()
+            .ok_or_else(|| DbError::constraint("duplicate key"))?
+        else {
+            return Ok(None);
+        };
+
+        for assignment in assignments {
+            let Some(target_column_index) = table
+                .columns
+                .iter()
+                .position(|column| identifiers_equal(&column.name, &assignment.column_name))
+            else {
+                return Ok(None);
+            };
+            if table.columns[target_column_index].generated_sql.is_some() {
+                return Ok(None);
+            }
+
+            let Some(value) = self.try_resolve_rowid_noop_upsert_assignment_value(
+                table,
+                statement,
+                source_row,
+                &assignment.expr,
+                params,
+            )?
+            else {
+                return Ok(None);
+            };
+            let value = super::constraints::coerce_column_value(
+                &table.columns[target_column_index],
+                value,
+            )?;
+            next_values[target_column_index] = value;
+        }
+
+        if next_values == current_values {
+            return Ok(Some(QueryResult::with_affected_rows(1)));
+        }
+        Ok(None)
+    }
+
+    fn try_resolve_rowid_noop_upsert_row_id(
+        &self,
+        table: &crate::catalog::TableSchema,
+        statement: &InsertStatement,
+        source_row: &[Expr],
+        row_id_column_name: &str,
+        row_id_column_index: usize,
+        params: &[Value],
+    ) -> Result<Option<i64>> {
+        let Some(expr) =
+            statement
+                .columns
+                .iter()
+                .zip(source_row)
+                .find_map(|(column_name, expr)| {
+                    identifiers_equal(column_name, row_id_column_name).then_some(expr)
+                })
+        else {
+            return Ok(None);
+        };
+        let Some(value_source) = compile_prepared_simple_value_source(expr) else {
+            return Ok(None);
+        };
+        let mut value = resolve_prepared_simple_value(&value_source, params)?;
+        let column = &table.columns[row_id_column_index];
+        if column.auto_increment {
+            match value {
+                Value::Null => {
+                    value = Value::Int64(table.next_row_id);
+                }
+                Value::Int64(explicit) => {
+                    value = Value::Int64(explicit);
+                }
+                _ => {
+                    return Err(DbError::constraint(format!(
+                        "auto-increment column {}.{} requires INT64 values",
+                        table.name, column.name
+                    )));
+                }
+            }
+        }
+        let value = super::constraints::coerce_column_value(column, value)?;
+        Ok(match value {
+            Value::Int64(row_id) => Some(row_id),
+            _ => None,
+        })
+    }
+
+    fn try_resolve_rowid_noop_upsert_assignment_value(
+        &self,
+        table: &crate::catalog::TableSchema,
+        statement: &InsertStatement,
+        source_row: &[Expr],
+        expr: &Expr,
+        params: &[Value],
+    ) -> Result<Option<Value>> {
+        match expr {
+            Expr::Column {
+                table: Some(source_table),
+                column: source_column,
+            } if identifiers_equal(source_table, "excluded") => {
+                let Some((_, (_, source_expr))) =
+                    statement.columns.iter().zip(source_row).enumerate().find(
+                        |(_, (column_name, _))| identifiers_equal(column_name, source_column),
+                    )
+                else {
+                    return Ok(None);
+                };
+                let Some(source_column_index) = table
+                    .columns
+                    .iter()
+                    .position(|column| identifiers_equal(&column.name, source_column))
+                else {
+                    return Ok(None);
+                };
+                let Some(value_source) = compile_prepared_simple_value_source(source_expr) else {
+                    return Ok(None);
+                };
+                let mut value = resolve_prepared_simple_value(&value_source, params)?;
+                let source_column_schema = &table.columns[source_column_index];
+                if source_column_schema.auto_increment {
+                    match value {
+                        Value::Null => {
+                            value = Value::Int64(table.next_row_id);
+                        }
+                        Value::Int64(explicit) => {
+                            value = Value::Int64(explicit);
+                        }
+                        _ => {
+                            return Err(DbError::constraint(format!(
+                                "auto-increment column {}.{} requires INT64 values",
+                                table.name, source_column_schema.name
+                            )));
+                        }
+                    }
+                }
+                super::constraints::coerce_column_value(source_column_schema, value).map(Some)
+            }
+            _ => {
+                let Some(value_source) = compile_prepared_simple_value_source(expr) else {
+                    return Ok(None);
+                };
+                resolve_prepared_simple_value(&value_source, params).map(Some)
+            }
+        }
+    }
+
     fn try_materialize_rowid_noop_upsert_candidate(
         &self,
         table: &crate::catalog::TableSchema,
@@ -3782,8 +4101,8 @@ impl EngineRuntime {
     ) -> Result<Option<RowIdNoopUpsertCandidate>> {
         let Some(ConflictAction::DoUpdate {
             target,
-            assignments,
             filter: None,
+            ..
         }) = statement.on_conflict.as_ref()
         else {
             return Ok(None);
@@ -3855,46 +4174,6 @@ impl EngineRuntime {
         }
         let candidate = self.coerce_row_values(table, candidate)?;
 
-        let mut next_values = candidate.clone();
-        for assignment in assignments {
-            let Some(target_column_index) = table
-                .columns
-                .iter()
-                .position(|column| identifiers_equal(&column.name, &assignment.column_name))
-            else {
-                return Ok(None);
-            };
-            if table.columns[target_column_index].generated_sql.is_some() {
-                return Ok(None);
-            }
-            let value = match &assignment.expr {
-                Expr::Column {
-                    table: Some(source_table),
-                    column: source_column,
-                } if identifiers_equal(source_table, "excluded") => {
-                    let Some(source_column_index) = table
-                        .columns
-                        .iter()
-                        .position(|column| identifiers_equal(&column.name, source_column))
-                    else {
-                        return Ok(None);
-                    };
-                    candidate[source_column_index].clone()
-                }
-                _ => {
-                    let Some(value_source) = compile_prepared_simple_value_source(&assignment.expr)
-                    else {
-                        return Ok(None);
-                    };
-                    resolve_prepared_simple_value(&value_source, params)?
-                }
-            };
-            next_values[target_column_index] = super::constraints::coerce_column_value(
-                &table.columns[target_column_index],
-                value,
-            )?;
-        }
-
         let Value::Int64(row_id) = candidate
             .get(
                 table
@@ -3909,11 +4188,7 @@ impl EngineRuntime {
             return Ok(None);
         };
 
-        Ok(Some(RowIdNoopUpsertCandidate {
-            row_id,
-            candidate,
-            next_values,
-        }))
+        Ok(Some(RowIdNoopUpsertCandidate { row_id, candidate }))
     }
 
     fn render_returning(
@@ -4761,7 +5036,11 @@ fn compile_int_arithmetic_update(
     };
 
     match &delta_source {
-        PreparedSimpleValueSource::Literal(value) if !matches!(value, Value::Int64(_)) => None,
+        PreparedSimpleValueSource::Literal(value)
+            if !matches!(value, Value::Int64(_) | Value::Float64(_)) =>
+        {
+            None
+        }
         _ => Some(PreparedIntArithmeticUpdate {
             column_index: *assignment_column,
             op,
@@ -6007,13 +6286,7 @@ fn row_id_range_row_ids_for_filter(
         return Ok(None);
     }
 
-    let mut row_ids = Vec::with_capacity(width.min(row_count));
-    for row_id in low..=high {
-        if row_source.row_by_id(row_id)?.is_some() {
-            row_ids.push(row_id);
-        }
-    }
-    Ok(Some(row_ids))
+    Ok(Some(row_source.row_ids_in_range(low, high)))
 }
 
 pub(crate) fn row_id_alias_column_name(table: &crate::catalog::TableSchema) -> Option<&str> {
@@ -6857,11 +7130,23 @@ fn apply_runtime_index_update_for_row_change(
             else {
                 return Ok(false);
             };
-            if let Some(old_key) = old_key.as_ref() {
-                keys.remove_row_id(old_key, row_id)?;
+            let new_key_present = new_key.is_some();
+            match (old_key.as_ref(), new_key) {
+                (Some(old_key), Some(new_key)) => {
+                    if !keys.move_row_id(old_key, new_key.clone(), row_id)? {
+                        keys.remove_row_id(old_key, row_id)?;
+                        keys.insert_row_id(new_key, row_id)?;
+                    }
+                }
+                (Some(old_key), None) => {
+                    keys.remove_row_id(old_key, row_id)?;
+                }
+                (None, Some(new_key)) => {
+                    keys.insert_row_id(new_key, row_id)?;
+                }
+                (None, None) => {}
             }
-            if let Some(new_key) = new_key {
-                keys.insert_row_id(new_key, row_id)?;
+            if new_key_present {
                 if let (Some(covering), Some(values)) = (covering.as_mut(), covering_values) {
                     covering.insert_row_values(row_id, values);
                 }

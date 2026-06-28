@@ -2,13 +2,17 @@
 **Date:** 2026-01-27  
 **Status:** Draft (v0.1)
 
-> Note: This repo is past the initial milestone. This document describes the current 0.x (pre-1.0) baseline scope.
+> Note: This repo is past the initial milestone. This document describes the
+> current Rust-native 2.x product baseline and still preserves some phased
+> roadmap context from the original planning document.
 
 ## 1. Product summary
 DecentDB is an embedded, single-machine relational database engine focused on:
 - **Durable ACID writes** (priority #1)
 - **Fast reads** (priority #2)
-- **Single writer + many concurrent readers** (single process, multi-threaded)
+- **Single writer + many concurrent readers** (optimized for embedded
+  single-process use, with native local cross-process coordination when
+  supported)
 - **PostgreSQL-like SQL syntax** (subset, “good enough” for common CRUD + joins)
 - **Efficient substring search** for user-facing “contains” queries (e.g., `LIKE '%FOO%'`) on selected text columns
 - **WAL-based durability** (Write-Ahead Log) for ACID compliance
@@ -20,7 +24,7 @@ The initial target workload is music-library style data:
 The project emphasizes **testing and correctness from day 1**, using a **Python-driven test harness** plus engine-level unit and property tests.
 
 ## 2. Goals
-### 2.1 Functional goals (0.x baseline)
+### 2.1 Functional goals
 1. **Relational core**
    - Tables with typed columns (baseline types: NULL, INT64, BOOL, FLOAT64, TEXT (UTF-8), BLOB)
    - Primary keys (rowid or explicit PK)
@@ -141,8 +145,9 @@ ORDER BY a.name, al.name, t.trackNumber;
 - Point lookup by primary key: P95 < 10ms
 - FK join expansion (artist→albums→tracks): P95 < 100ms
 - Substring search with trigram index: P95 < 200ms
-- Bulk load (100k records): < 20 seconds using `bulk_load()` API with deferred durability
-- Normal transaction insert: < 1ms per row (with fsync-on-commit)
+- Bulk load (100k records): < 20 seconds using the bulk-load API
+- Normal transaction insert: target < 1ms per row where storage sync latency
+  permits
 - Crash recovery time: < 5 seconds for 100MB database
 
 ## 9. Milestones (phased delivery)
