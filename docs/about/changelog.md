@@ -61,6 +61,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Archived the completed metric-improvement tracker and folded the remaining
   diagnostic rust-baseline view/fixed-overhead gaps into
   `design/WIN_PERFORMANCE_IMPROVEMENTS_01.md`.
+- Reprioritized `design/FUTURE_WINS.md` around the next adoption-critical
+  backlog: core read/query performance, cross-binding cursor parity,
+  Postgres-backed local-first sync, migration workflow, Doctor/advisors, JSONB,
+  hybrid search, and packaging/ORM adoption work.
 
 ### Fixed
 
