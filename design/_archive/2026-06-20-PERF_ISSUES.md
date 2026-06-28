@@ -36,7 +36,7 @@ SQLite on this workload while preserving durable ACID semantics.
   persisted stats, cost-based index selection, and join reordering.
 - `design/WIN_PERFORMANCE_IMPROVEMENTS_01.md`: broader plan for streaming
   executor, cost-based planning, and durable commit fast paths.
-- `design/2026-06-PERF_TESTING_RESULTS.md`: prior issue-tracker benchmark
+- `design/_archive/2026-06-PERF_TESTING_RESULTS.md`: prior issue-tracker benchmark
   evidence and current branch status.
 
 ## 2. Workload Summary

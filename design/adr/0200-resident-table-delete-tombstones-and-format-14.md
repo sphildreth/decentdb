@@ -27,7 +27,7 @@ that matter for the `embedded_fast` resident-storage profile:
 `persist_to_db` alone exceeded SQLite's whole target runtime before this ADR.
 ADR 0196 requires a follow-up ADR for row payload layout changes. This ADR is
 that format-change decision for the resident tombstone payload semantics used by
-`design/DELETE_BATCH.md`.
+`design/_archive/DELETE_BATCH.md`.
 
 ## Decision
 
@@ -46,7 +46,7 @@ This ADR authorizes the format-sensitive part of the DELETE_BATCH work:
 
 The in-memory `TableData` tombstone set, `Arc<Vec<StoredRow>>` row storage,
 tombstone-aware reads, and locator-driven sparse overflow patching are
-non-format follow-on phases described in `design/DELETE_BATCH.md`. They do not
+non-format follow-on phases described in `design/_archive/DELETE_BATCH.md`. They do not
 change the on-disk format beyond the format-14 row-length tombstone bit. If a
 future version stores checksum sidecars, changes overflow page layout, or
 changes WAL/checkpoint semantics, that future work requires a separate ADR and
@@ -165,7 +165,7 @@ the v10/v11 precedent. The v14 engine reads migrated v13 payloads unchanged.
 
 ## Implementation Follow-Up
 
-`design/DELETE_BATCH.md` tracks the full implementation history. After this ADR
+`design/_archive/DELETE_BATCH.md` tracks the full implementation history. After this ADR
 landed, the DELETE_BATCH track added:
 
 1. **Phase B:** logical in-memory tombstones with `TableData` using shared row
@@ -200,7 +200,7 @@ profile=embedded_fast --sqlite-profile wal_normal --strict-equivalence`.
 
 ## References
 
-- `design/DELETE_BATCH.md`
+- `design/_archive/DELETE_BATCH.md`
 - `design/adr/0131-legacy-format-migrations.md`
 - `design/adr/0143-on-disk-row-scan-executor.md`
 - `design/adr/0145-paged-table-row-source.md`

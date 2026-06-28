@@ -23,7 +23,7 @@ Recent work has already improved some small-read paths, so do not treat this as 
 - Use `rg`/`rg --files` for search.
 - Use `apply_patch` for manual file edits.
 - Keep changes incremental and tied to a measured gap.
-- Update `design/2026-06-20-PERF_ISSUES.md` after every completed phase with before/after numbers and what changed.
+- Update `design/_archive/2026-06-20-PERF_ISSUES.md` after every completed phase with before/after numbers and what changed.
 
 ## Primary Files And Surfaces
 
@@ -34,7 +34,7 @@ Recent work has already improved some small-read paths, so do not treat this as 
 - Core engine: `crates/decentdb/src/`
 - Executor paths: `crates/decentdb/src/exec/`
 - Search/fulltext/trigram: `crates/decentdb/src/search/`
-- Design running summary: `design/2026-06-20-PERF_ISSUES.md`
+- Design running summary: `design/_archive/2026-06-20-PERF_ISSUES.md`
 
 ## Establish The Baseline First
 
@@ -97,7 +97,7 @@ Work one gap family at a time. For each phase:
 6. Build in release mode.
 7. Rerun the reduced Showdown benchmark.
 8. Compare before/after numbers.
-9. Update `design/2026-06-20-PERF_ISSUES.md` with:
+9. Update `design/_archive/2026-06-20-PERF_ISSUES.md` with:
    - hypothesis
    - files changed
    - before/after benchmark numbers
@@ -361,7 +361,7 @@ The work is complete only when all of the following are true:
 - Existing DecentDB wins on point lookup, pagination, selected joins, and file size are preserved.
 - Correctness tests pass for every changed engine behavior.
 - Python binding tests pass for every changed binding behavior.
-- `design/2026-06-20-PERF_ISSUES.md` contains the final before/after table and remaining caveats.
+- `design/_archive/2026-06-20-PERF_ISSUES.md` contains the final before/after table and remaining caveats.
 - Any user-facing behavior change is reflected in the appropriate docs. Do not update `CHANGELOG.md`; use `docs/about/changelog.md` if a changelog entry is required.
 
 ## Agent Delegation Guidance
