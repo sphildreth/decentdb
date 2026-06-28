@@ -1093,11 +1093,32 @@ clone checklist:
 - SQLite-compatible ecosystems such as libSQL/Turso create pressure around
   sync, embedded deployment, native vector search, encryption-at-rest, and
   SQLite familiarity.
+- libSQL should be treated as a separate adoption competitor from the newer
+  Turso Database rewrite: libSQL's strength is production-ready SQLite fork
+  compatibility, same-file/API continuity, native vector search, and Turso
+  embedded-replica workflows where local reads can pair with cloud-primary
+  writes or newer explicit push/pull sync. This reinforces the need for a
+  concrete SQLite adoption kit, hybrid search, and a clear local-first sync
+  bridge rather than another generic "SQLite alternative" message.
 - DuckDB has strong ingestion, extension, FTS, vector, and analytics stories.
   Decent Bench, not DecentDB core, should own rich import/export and conversion workflows.
 - Local-first stacks such as PGlite/Electric and PowerSync make reactive
   queries, browser/mobile sync, shape/subset sync, central-backend bridges, and
   developer tooling part of the expected conversation.
+- PGlite adds another specific pressure point: browser and JS developers can
+  run a real Postgres-shaped engine in WASM, use IndexedDB/filesystem
+  persistence, live queries, and Postgres extensions such as pgvector/PostGIS.
+  DecentDB should not chase full Postgres compatibility, but browser
+  persistence diagnostics, quota/resource governance, reactive APIs, and
+  Postgres bridge examples need to be strong enough that this comparison is
+  about product fit rather than missing local-first basics.
+- H2, LiteDB, and Firebird Embedded are narrower but useful adoption signals:
+  H2 wins Java/JDBC and in-memory test-fixture decisions, LiteDB wins .NET
+  document/POCO storage decisions, and Firebird Embedded wins Firebird SQL/PSQL
+  and embedded-to-server continuity decisions. These do not change the top
+  roadmap priorities, but they strengthen the case for ORM/framework
+  certification kits, JDBC/.NET examples, and honest comparison docs that avoid
+  pretending every embedded database is competing on the same axis.
 - SQLite and DuckDB have mature extension ecosystems. DecentDB's shipped
   response is one official Lua extension language with strict manifests,
   sandboxing, and explicit trust rather than arbitrary native extension loading.
@@ -1139,12 +1160,21 @@ Useful references:
 - SQLite Geopoly: https://www3.sqlite.org/geopoly/
 - Electric shapes: https://electric.ax/docs/sync/guides/shapes
 - PGlite: https://pglite.dev/
+- PGlite filesystems and IndexedDB persistence: https://pglite.dev/docs/filesystems
+- PGlite live queries: https://pglite.dev/docs/live-queries
+- PGlite extensions: https://pglite.dev/extensions/
+- Electric PGlite sync: https://electric.ax/sync/pglite
 - PowerSync sync streams: https://docs.powersync.com/sync/streams/overview
 - Turso/libSQL: https://docs.turso.tech/libsql
+- Turso embedded replicas: https://docs.turso.tech/features/embedded-replicas/introduction
+- Turso SDK embedded replica reference: https://docs.turso.tech/sdk/ts/reference
 - Turso AI and embeddings: https://docs.turso.tech/features/ai-and-embeddings
 - SpatiaLite: https://www.gaia-gis.it/fossil/libspatialite/index
 - PostGIS: https://postgis.net/
 - DuckDB full-text search: https://duckdb.org/docs/stable/core_extensions/full_text_search.html
 - DuckDB vector similarity search: https://duckdb.org/docs/stable/core_extensions/vss.html
 - LiteDB: https://www.litedb.org/docs/
+- LiteDB SQL-like query syntax: https://www.litedb.org/api/query/
 - H2: https://www.h2database.com/html/features.html
+- Firebird Embedded server notes: https://github.com/FirebirdSQL/firebird/blob/master/doc/README.user.embedded
+- Firebird features: https://www.firebirdsql.org/en/features/
