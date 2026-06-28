@@ -1943,7 +1943,7 @@ impl Db {
         {
             return Ok(wal_page);
         }
-        self.inner.pager.read_page(page_id)
+        self.inner.pager.read_page_from_disk(page_id)
     }
 
     fn write_txn_visible_page(&self, txn: &WriteTxn, page_id: PageId) -> Result<Arc<[u8]>> {
@@ -1963,7 +1963,7 @@ impl Db {
         {
             return Ok(wal_page);
         }
-        self.inner.pager.read_page(page_id)
+        self.inner.pager.read_page_from_disk(page_id)
     }
 
     fn write_txn_header(&self, txn: &WriteTxn) -> Result<DatabaseHeader> {
@@ -2017,7 +2017,7 @@ impl Db {
         {
             return Ok(wal_page);
         }
-        self.inner.pager.read_page(page_id)
+        self.inner.pager.read_page_from_disk(page_id)
     }
 
     /// Performs a reader-aware checkpoint.
@@ -7341,6 +7341,11 @@ impl Db {
             return Ok(());
         }
 
+        let base_lsn = self.inner.last_runtime_lsn.load(Ordering::Acquire);
+        let base_checkpoint_epoch = self
+            .inner
+            .last_seen_checkpoint_epoch
+            .load(Ordering::Acquire);
         self.begin_write()?;
         let changed = match runtime.backfill_paged_row_storage(self) {
             Ok(changed) => changed,
@@ -7359,12 +7364,16 @@ impl Db {
             self.restore_runtime_from_storage(&mut runtime)?;
             return Err(error);
         }
-        let committed_lsn = match self.commit() {
+        let committed_lsn = match self.commit_if_latest(base_lsn, base_checkpoint_epoch) {
             Ok(lsn) => lsn,
             Err(error) => {
-                let _ = self.rollback();
                 self.restore_runtime_from_storage(&mut runtime)?;
-                return Err(error);
+                return if matches!(&error, DbError::Transaction { message } if message.starts_with("transaction conflict: WAL advanced"))
+                {
+                    Ok(())
+                } else {
+                    Err(error)
+                };
             }
         };
         self.inner

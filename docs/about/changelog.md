@@ -48,9 +48,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Accelerated runtime full-text/trigram search index builds with bulk full-text
   construction, lower-allocation ASCII token handling, vector-backed full-text
   postings, and flatter trigram postings.
+- Accelerated Showdown read-query metrics by routing top-level BM25 full-text
+  `ORDER BY ... LIMIT` queries through the existing top-k full-text fast path
+  and adding strict fast paths for simple `RANK`/`DENSE_RANK`, `ROW_NUMBER`/
+  `LAG`, and rolling `AVG` window query shapes.
 
 ### Fixed
 
+- Prevented paged-row snapshot reads from mixing cached main-db pages with
+  WAL-pinned snapshots under rapid same-process open/close churn, and made
+  open-time paged-storage backfill abandon stale writes when another writer
+  advances the WAL first.
 - Preserved non-updated wide-row columns during arithmetic updates.
 - Improved checkpoint and runtime-index refresh behavior used by prepared
   statements and benchmark-heavy read paths.

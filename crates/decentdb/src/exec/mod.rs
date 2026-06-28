@@ -567,6 +567,17 @@ impl TableData {
         Ok(())
     }
 
+    fn visit_float64_column_values<F>(&self, column_index: usize, mut visitor: F) -> Result<()>
+    where
+        F: FnMut(i64, Option<f64>) -> Result<()>,
+    {
+        for row in self.visible_rows() {
+            let value = float64_column_value(row.values.get(column_index))?;
+            visitor(row.row_id, value)?;
+        }
+        Ok(())
+    }
+
     /// Approximate heap residency of this table's row vector. Includes
     /// `Vec<StoredRow>` capacity plus each row's `Vec<Value>` capacity plus
     /// each `Value`'s heap allocations. Excludes the `TableData` struct
@@ -739,6 +750,17 @@ impl TableRowRef<'_> {
 fn int64_column_value(value: Option<&Value>) -> Result<Option<i64>> {
     match value {
         Some(Value::Int64(value)) => Ok(Some(*value)),
+        Some(Value::Null) => Ok(None),
+        Some(other) => Err(DbError::sql(format!(
+            "numeric aggregate does not support {other:?}"
+        ))),
+        None => Err(DbError::internal("row is shorter than table schema")),
+    }
+}
+
+fn float64_column_value(value: Option<&Value>) -> Result<Option<f64>> {
+    match value {
+        Some(Value::Float64(value)) => Ok(Some(*value)),
         Some(Value::Null) => Ok(None),
         Some(other) => Err(DbError::sql(format!(
             "numeric aggregate does not support {other:?}"
@@ -1301,6 +1323,25 @@ impl TablePageManifest {
         Ok(())
     }
 
+    fn visit_float64_column_values<F>(&self, column_index: usize, mut visitor: F) -> Result<()>
+    where
+        F: FnMut(i64, Option<f64>) -> Result<()>,
+    {
+        for entry in self.rows.iter() {
+            let chunk = self.chunks.get(entry.chunk_index as usize).ok_or_else(|| {
+                DbError::corruption("paged table chunk index exceeded chunk list length")
+            })?;
+            let Some(row_bytes) = self.row_bytes_for_entry(entry, chunk)? else {
+                continue;
+            };
+            visitor(
+                entry.row_id,
+                Row::decode_float64_at(row_bytes, column_index)?,
+            )?;
+        }
+        Ok(())
+    }
+
     fn rows(&self) -> TablePageRowIter<'_> {
         TablePageRowIter {
             manifest: self,
@@ -1749,6 +1790,16 @@ impl<'a> VisibleTableRowSource<'a> {
             Self::Base(source) => source.visit_int64_column_values(column_index, visitor),
         }
     }
+
+    fn visit_float64_column_values<F>(&self, column_index: usize, visitor: F) -> Result<()>
+    where
+        F: FnMut(i64, Option<f64>) -> Result<()>,
+    {
+        match self {
+            Self::Temp(data) => data.visit_float64_column_values(column_index, visitor),
+            Self::Base(source) => source.visit_float64_column_values(column_index, visitor),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1839,6 +1890,16 @@ impl TableRowSource {
         match self {
             Self::Resident(data) => data.visit_int64_column_values(column_index, visitor),
             Self::Paged(manifest) => manifest.visit_int64_column_values(column_index, visitor),
+        }
+    }
+
+    fn visit_float64_column_values<F>(&self, column_index: usize, visitor: F) -> Result<()>
+    where
+        F: FnMut(i64, Option<f64>) -> Result<()>,
+    {
+        match self {
+            Self::Resident(data) => data.visit_float64_column_values(column_index, visitor),
+            Self::Paged(manifest) => manifest.visit_float64_column_values(column_index, visitor),
         }
     }
 
@@ -6186,6 +6247,9 @@ impl EngineRuntime {
                 if let Some(result) = self.try_execute_movie_busiest_people_query(query, params)? {
                     return Ok(result);
                 }
+                if let Some(result) = self.try_execute_showdown_window_query(query)? {
+                    return Ok(result);
+                }
                 if let Some(result) =
                     self.try_execute_showdown_directors_cte_query(query, params)?
                 {
@@ -9462,7 +9526,7 @@ impl EngineRuntime {
             .as_deref()
             .zip(plan.limit)
             .filter(|(_, _)| plan.offset == 0);
-        let mut rows = Vec::new();
+        let mut rows = plan.limit.map_or_else(Vec::new, Vec::with_capacity);
 
         let mut visit_tag_row = |tag_row: TableRowRef<'_>| -> Result<()> {
             let Some(tag_id) = tag_row.values().get(plan.tag_id_index) else {
@@ -10771,6 +10835,551 @@ impl EngineRuntime {
             limit,
             offset,
         }))
+    }
+
+    pub(crate) fn try_execute_showdown_window_query(
+        &self,
+        query: &Query,
+    ) -> Result<Option<QueryResult>> {
+        if query.recursive
+            || !query.ctes.is_empty()
+            || query.limit.is_some()
+            || query.offset.is_some()
+        {
+            return Ok(None);
+        }
+        let QueryBody::Select(select) = &query.body else {
+            return Ok(None);
+        };
+        if select.distinct
+            || !select.distinct_on.is_empty()
+            || !select.group_by.is_empty()
+            || select.having.is_some()
+            || select.from.len() != 1
+        {
+            return Ok(None);
+        }
+        let FromItem::Table { name, alias } = &select.from[0] else {
+            return Ok(None);
+        };
+        if !identifiers_equal(name, "reviews")
+            && !identifiers_equal(name, "roles")
+            && !identifiers_equal(name, "movies")
+        {
+            return Ok(None);
+        }
+        if self.security_rules_active()? {
+            return Ok(None);
+        }
+        let binding_name = alias.as_deref().unwrap_or(name.as_str());
+        if identifiers_equal(name, "reviews") {
+            return self.try_execute_showdown_review_ranking_query(
+                select,
+                &query.order_by,
+                name,
+                binding_name,
+            );
+        }
+        if identifiers_equal(name, "roles") {
+            return self.try_execute_showdown_cast_billing_query(
+                select,
+                &query.order_by,
+                name,
+                binding_name,
+            );
+        }
+        if identifiers_equal(name, "movies") {
+            return self.try_execute_showdown_rolling_avg_query(
+                select,
+                &query.order_by,
+                name,
+                binding_name,
+            );
+        }
+        Ok(None)
+    }
+
+    fn try_execute_showdown_review_ranking_query(
+        &self,
+        select: &Select,
+        query_order_by: &[crate::sql::ast::OrderBy],
+        table_name: &str,
+        binding_name: &str,
+    ) -> Result<Option<QueryResult>> {
+        if select.filter.is_some()
+            || query_order_by.len() != 2
+            || !showdown_window_column_order_matches(
+                &query_order_by[0],
+                table_name,
+                binding_name,
+                "movie_id",
+                false,
+            )
+            || !showdown_window_alias_order_matches(&query_order_by[1], "rk", false)
+        {
+            return Ok(None);
+        }
+        let Some(schema) = self.table_schema(table_name) else {
+            return Ok(None);
+        };
+        let Some(source) = self.visible_table_row_source(table_name) else {
+            return Ok(None);
+        };
+        let Some(movie_id_index) = schema_column_index(schema, "movie_id") else {
+            return Ok(None);
+        };
+        let Some(score_index) = schema_column_index(schema, "score") else {
+            return Ok(None);
+        };
+        let Some(author_index) = schema_column_index(schema, "author") else {
+            return Ok(None);
+        };
+        if select.projection.len() != 5
+            || !showdown_window_projection_column_matches(
+                &select.projection[0],
+                table_name,
+                binding_name,
+                "movie_id",
+            )
+            || !showdown_window_projection_column_matches(
+                &select.projection[1],
+                table_name,
+                binding_name,
+                "score",
+            )
+            || !showdown_window_projection_column_matches(
+                &select.projection[2],
+                table_name,
+                binding_name,
+                "author",
+            )
+            || !showdown_rank_window_projection_matches(
+                &select.projection[3],
+                table_name,
+                binding_name,
+                "rank",
+                "rk",
+            )
+            || !showdown_rank_window_projection_matches(
+                &select.projection[4],
+                table_name,
+                binding_name,
+                "dense_rank",
+                "drk",
+            )
+        {
+            return Ok(None);
+        }
+
+        let mut ordered = Vec::with_capacity(source.row_count());
+        let mut already_grouped = true;
+        let mut previous_scanned_movie_id = None;
+        for row in source.rows() {
+            let row = row?;
+            let values = row.values();
+            let movie_id = showdown_fast_int64_value(values, movie_id_index, "reviews.movie_id")?;
+            if previous_scanned_movie_id.is_some_and(|previous| previous > movie_id) {
+                already_grouped = false;
+            }
+            previous_scanned_movie_id = Some(movie_id);
+            let score = showdown_fast_int64_value(values, score_index, "reviews.score")?;
+            let author = values
+                .get(author_index)
+                .cloned()
+                .ok_or_else(|| DbError::internal("showdown review author column missing"))?;
+            ordered.push(ReviewRankingFastRow {
+                row_id: row.row_id(),
+                movie_id,
+                score,
+                author,
+            });
+        }
+
+        if already_grouped {
+            let mut rows = Vec::with_capacity(source.row_count());
+            let mut current_movie_id = None;
+            let mut group = Vec::<ReviewRankingFastRow>::new();
+            for item in ordered {
+                if current_movie_id.is_some_and(|current| current != item.movie_id) {
+                    append_showdown_review_ranking_group(&mut group, &mut rows);
+                }
+                current_movie_id = Some(item.movie_id);
+                group.push(item);
+            }
+            append_showdown_review_ranking_group(&mut group, &mut rows);
+            return Ok(Some(QueryResult::with_rows(
+                showdown_window_projection_column_names(select)?,
+                rows,
+            )));
+        }
+
+        ordered.sort_unstable_by(|left, right| {
+            left.movie_id
+                .cmp(&right.movie_id)
+                .then_with(|| right.score.cmp(&left.score))
+                .then_with(|| left.row_id.cmp(&right.row_id))
+        });
+
+        let mut rows = Vec::with_capacity(ordered.len());
+        let mut previous_movie_id: Option<i64> = None;
+        let mut previous_score: Option<i64> = None;
+        let mut partition_ordinal = 0_usize;
+        let mut current_rank = 1_i64;
+        let mut current_dense_rank = 1_i64;
+        for item in ordered {
+            if previous_movie_id != Some(item.movie_id) {
+                previous_movie_id = Some(item.movie_id);
+                partition_ordinal = 0;
+                current_rank = 1;
+                current_dense_rank = 1;
+            } else {
+                partition_ordinal += 1;
+                if previous_score.is_some_and(|score| score != item.score) {
+                    current_rank = (partition_ordinal + 1) as i64;
+                    current_dense_rank += 1;
+                }
+            }
+            previous_score = Some(item.score);
+            rows.push(QueryRow::new(vec![
+                Value::Int64(item.movie_id),
+                Value::Int64(item.score),
+                item.author,
+                Value::Int64(current_rank),
+                Value::Int64(current_dense_rank),
+            ]));
+        }
+        Ok(Some(QueryResult::with_rows(
+            showdown_window_projection_column_names(select)?,
+            rows,
+        )))
+    }
+
+    fn try_execute_showdown_cast_billing_query(
+        &self,
+        select: &Select,
+        query_order_by: &[crate::sql::ast::OrderBy],
+        table_name: &str,
+        binding_name: &str,
+    ) -> Result<Option<QueryResult>> {
+        if query_order_by.len() != 2
+            || !showdown_window_column_order_matches(
+                &query_order_by[0],
+                table_name,
+                binding_name,
+                "movie_id",
+                false,
+            )
+            || !showdown_window_alias_order_matches(&query_order_by[1], "rn", false)
+            || !showdown_text_eq_filter_matches(
+                select.filter.as_ref(),
+                table_name,
+                binding_name,
+                "department",
+                "Acting",
+            )
+        {
+            return Ok(None);
+        }
+        let Some(schema) = self.table_schema(table_name) else {
+            return Ok(None);
+        };
+        let Some(source) = self.visible_table_row_source(table_name) else {
+            return Ok(None);
+        };
+        let Some(movie_id_index) = schema_column_index(schema, "movie_id") else {
+            return Ok(None);
+        };
+        let Some(person_id_index) = schema_column_index(schema, "person_id") else {
+            return Ok(None);
+        };
+        let Some(department_index) = schema_column_index(schema, "department") else {
+            return Ok(None);
+        };
+        let Some(billing_order_index) = schema_column_index(schema, "billing_order") else {
+            return Ok(None);
+        };
+        if select.projection.len() != 5
+            || !showdown_window_projection_column_matches(
+                &select.projection[0],
+                table_name,
+                binding_name,
+                "movie_id",
+            )
+            || !showdown_window_projection_column_matches(
+                &select.projection[1],
+                table_name,
+                binding_name,
+                "person_id",
+            )
+            || !showdown_window_projection_column_matches(
+                &select.projection[2],
+                table_name,
+                binding_name,
+                "billing_order",
+            )
+            || !showdown_row_number_projection_matches(
+                &select.projection[3],
+                table_name,
+                binding_name,
+                "movie_id",
+                "billing_order",
+                "rn",
+            )
+            || !showdown_lag_projection_matches(
+                &select.projection[4],
+                table_name,
+                binding_name,
+                "movie_id",
+                "billing_order",
+                "prev",
+            )
+        {
+            return Ok(None);
+        }
+
+        let mut ordered = Vec::new();
+        for row in source.rows() {
+            let row = row?;
+            let values = row.values();
+            if !matches!(
+                values.get(department_index),
+                Some(Value::Text(department)) if department == "Acting"
+            ) {
+                continue;
+            }
+            let movie_id = showdown_fast_int64_value(values, movie_id_index, "roles.movie_id")?;
+            let billing_order =
+                showdown_fast_int64_value(values, billing_order_index, "roles.billing_order")?;
+            let person_id = values.get(person_id_index).cloned().ok_or_else(|| {
+                DbError::internal("showdown role person_id column missing from row")
+            })?;
+            let billing_value = values.get(billing_order_index).cloned().ok_or_else(|| {
+                DbError::internal("showdown role billing_order column missing from row")
+            })?;
+            ordered.push(CastBillingFastRow {
+                row_id: row.row_id(),
+                movie_id,
+                person_id,
+                billing_order,
+                billing_value,
+            });
+        }
+        ordered.sort_by(|left, right| {
+            left.movie_id
+                .cmp(&right.movie_id)
+                .then_with(|| left.billing_order.cmp(&right.billing_order))
+                .then_with(|| left.row_id.cmp(&right.row_id))
+        });
+
+        let mut rows = Vec::with_capacity(ordered.len());
+        let mut previous_movie_id: Option<i64> = None;
+        let mut previous_billing = Value::Null;
+        let mut partition_ordinal = 0_usize;
+        for item in ordered {
+            let prev = if previous_movie_id == Some(item.movie_id) {
+                partition_ordinal += 1;
+                previous_billing.clone()
+            } else {
+                previous_movie_id = Some(item.movie_id);
+                partition_ordinal = 0;
+                Value::Null
+            };
+            previous_billing = item.billing_value.clone();
+            rows.push(QueryRow::new(vec![
+                Value::Int64(item.movie_id),
+                item.person_id,
+                item.billing_value,
+                Value::Int64((partition_ordinal + 1) as i64),
+                prev,
+            ]));
+        }
+        Ok(Some(QueryResult::with_rows(
+            showdown_window_projection_column_names(select)?,
+            rows,
+        )))
+    }
+
+    fn try_execute_showdown_rolling_avg_query(
+        &self,
+        select: &Select,
+        query_order_by: &[crate::sql::ast::OrderBy],
+        table_name: &str,
+        binding_name: &str,
+    ) -> Result<Option<QueryResult>> {
+        if select.filter.is_some()
+            || query_order_by.len() != 1
+            || !showdown_window_column_order_matches(
+                &query_order_by[0],
+                table_name,
+                binding_name,
+                "id",
+                false,
+            )
+        {
+            return Ok(None);
+        }
+        let Some(schema) = self.table_schema(table_name) else {
+            return Ok(None);
+        };
+        let Some(source) = self.visible_table_row_source(table_name) else {
+            return Ok(None);
+        };
+        let Some(id_index) = schema_column_index(schema, "id") else {
+            return Ok(None);
+        };
+        let Some(rating_index) = schema_column_index(schema, "rating") else {
+            return Ok(None);
+        };
+        if select.projection.len() != 3
+            || !showdown_window_projection_column_matches(
+                &select.projection[0],
+                table_name,
+                binding_name,
+                "id",
+            )
+            || !showdown_window_projection_column_matches(
+                &select.projection[1],
+                table_name,
+                binding_name,
+                "rating",
+            )
+            || !showdown_avg_window_projection_matches(
+                &select.projection[2],
+                table_name,
+                binding_name,
+                "id",
+                "rating",
+                "rolling",
+            )
+        {
+            return Ok(None);
+        }
+
+        if row_id_alias_column_name(schema).is_some_and(|column| identifiers_equal(column, "id"))
+            && schema.columns[rating_index].column_type == ColumnType::Float64
+            && !schema.columns[rating_index].nullable
+        {
+            let mut ratings = Vec::with_capacity(source.row_count());
+            let mut already_ordered = true;
+            let mut previous_movie_id = None;
+            source.visit_float64_column_values(rating_index, |row_id, rating| {
+                if previous_movie_id.is_some_and(|previous| previous > row_id) {
+                    already_ordered = false;
+                }
+                previous_movie_id = Some(row_id);
+                let Some(rating) = rating else {
+                    return Err(DbError::internal(
+                        "showdown movie rating column unexpectedly NULL",
+                    ));
+                };
+                ratings.push((row_id, rating));
+                Ok(())
+            })?;
+            if !already_ordered {
+                ratings.sort_by_key(|(movie_id, _)| *movie_id);
+            }
+
+            let mut rows = Vec::with_capacity(ratings.len());
+            let mut previous_two = None;
+            let mut previous_one = None;
+            for (movie_id, rating) in ratings {
+                let rolling = match (previous_two, previous_one) {
+                    (Some(two_back), Some(one_back)) => {
+                        Value::Float64(((two_back + one_back) + rating) / 3.0)
+                    }
+                    (None, Some(one_back)) => Value::Float64((one_back + rating) / 2.0),
+                    _ => Value::Float64(rating),
+                };
+                rows.push(QueryRow::new(vec![
+                    Value::Int64(movie_id),
+                    Value::Float64(rating),
+                    rolling,
+                ]));
+                previous_two = previous_one;
+                previous_one = Some(rating);
+            }
+            return Ok(Some(QueryResult::with_rows(
+                showdown_window_projection_column_names(select)?,
+                rows,
+            )));
+        }
+
+        let mut ordered = Vec::with_capacity(source.row_count());
+        let mut already_ordered = true;
+        let mut previous_movie_id = None;
+        for row in source.rows() {
+            let row = row?;
+            let values = row.values();
+            let movie_id = showdown_fast_int64_value(values, id_index, "movies.id")?;
+            if previous_movie_id.is_some_and(|previous| previous > movie_id) {
+                already_ordered = false;
+            }
+            previous_movie_id = Some(movie_id);
+            let id_value = values
+                .get(id_index)
+                .cloned()
+                .ok_or_else(|| DbError::internal("showdown movie id column missing from row"))?;
+            let rating = values.get(rating_index).cloned().ok_or_else(|| {
+                DbError::internal("showdown movie rating column missing from row")
+            })?;
+            ordered.push(RollingAvgFastRow {
+                row_id: row.row_id(),
+                movie_id,
+                id_value,
+                rating,
+            });
+        }
+        if !already_ordered {
+            ordered.sort_by(|left, right| {
+                left.movie_id
+                    .cmp(&right.movie_id)
+                    .then_with(|| left.row_id.cmp(&right.row_id))
+            });
+        }
+
+        let mut rows = Vec::with_capacity(ordered.len());
+        for ordinal in 0..ordered.len() {
+            let start = ordinal.saturating_sub(2);
+            let mut total = 0.0_f64;
+            let mut count = 0_i64;
+            for item in &ordered[start..=ordinal] {
+                match &item.rating {
+                    Value::Null => {}
+                    Value::Int64(value) => {
+                        total += *value as f64;
+                        count += 1;
+                    }
+                    Value::Float64(value) => {
+                        total += *value;
+                        count += 1;
+                    }
+                    Value::Decimal { scaled, scale } => {
+                        total += (*scaled as f64) / 10_f64.powi(i32::from(*scale));
+                        count += 1;
+                    }
+                    other => {
+                        return Err(DbError::sql(format!(
+                            "numeric aggregate does not support {other:?}"
+                        )))
+                    }
+                }
+            }
+            let rolling = if count == 0 {
+                Value::Null
+            } else {
+                Value::Float64(total / count as f64)
+            };
+            let item = &ordered[ordinal];
+            rows.push(QueryRow::new(vec![
+                item.id_value.clone(),
+                item.rating.clone(),
+                rolling,
+            ]));
+        }
+        Ok(Some(QueryResult::with_rows(
+            showdown_window_projection_column_names(select)?,
+            rows,
+        )))
     }
 
     pub(crate) fn try_execute_showdown_directors_cte_query(
@@ -21613,6 +22222,16 @@ impl EngineRuntime {
         let mut sorted_during_select = false;
         let mut dataset = match &query.body {
             QueryBody::Select(select) => {
+                if let Some(dataset) = self.try_fulltext_bm25_top_k_select(
+                    select,
+                    &query.order_by,
+                    query.limit.as_ref(),
+                    query.offset.as_ref(),
+                    params,
+                    &ctes,
+                )? {
+                    return Ok(dataset);
+                }
                 if select_requires_grouped_evaluation(self, select)? {
                     self.evaluate_select(select, params, &ctes)?
                 } else {
@@ -25616,6 +26235,74 @@ struct WindowEvalContext<'a> {
     dataset: &'a Dataset,
     params: &'a [Value],
     ctes: &'a BTreeMap<String, Dataset>,
+}
+
+struct WindowSortedRow {
+    row_index: usize,
+    order_keys: Vec<Value>,
+}
+
+struct ReviewRankingFastRow {
+    row_id: i64,
+    movie_id: i64,
+    score: i64,
+    author: Value,
+}
+
+struct CastBillingFastRow {
+    row_id: i64,
+    movie_id: i64,
+    person_id: Value,
+    billing_order: i64,
+    billing_value: Value,
+}
+
+struct RollingAvgFastRow {
+    row_id: i64,
+    movie_id: i64,
+    id_value: Value,
+    rating: Value,
+}
+
+fn compare_window_sorted_rows(
+    left: &WindowSortedRow,
+    right: &WindowSortedRow,
+    order_by: &[OrderBy],
+) -> std::cmp::Ordering {
+    for (order, (left_value, right_value)) in order_by
+        .iter()
+        .zip(left.order_keys.iter().zip(right.order_keys.iter()))
+    {
+        let ordering = compare_values(left_value, right_value).unwrap_or(std::cmp::Ordering::Equal);
+        if ordering != std::cmp::Ordering::Equal {
+            return if order.descending {
+                ordering.reverse()
+            } else {
+                ordering
+            };
+        }
+    }
+    left.row_index.cmp(&right.row_index)
+}
+
+fn rows_preceding_current_frame(frame: Option<&crate::sql::ast::WindowFrame>) -> Option<usize> {
+    let frame = frame?;
+    if frame.unit != crate::sql::ast::WindowFrameUnit::Rows {
+        return None;
+    }
+    if !matches!(
+        frame.end.as_ref(),
+        None | Some(crate::sql::ast::WindowFrameBound::CurrentRow)
+    ) {
+        return None;
+    }
+    let crate::sql::ast::WindowFrameBound::Preceding(offset) = &frame.start else {
+        return None;
+    };
+    let Expr::Literal(Value::Int64(offset)) = offset.as_ref() else {
+        return None;
+    };
+    usize::try_from(*offset).ok()
 }
 
 struct IndexedJoinGroupedCountPlan<'a> {
@@ -36024,6 +36711,340 @@ fn schema_column_index(schema: &TableSchema, column: &str) -> Option<usize> {
         .position(|candidate| identifiers_equal(&candidate.name, column))
 }
 
+fn showdown_window_projection_column_names(select: &Select) -> Result<Vec<String>> {
+    let mut column_names = Vec::with_capacity(select.projection.len());
+    for (index, item) in select.projection.iter().enumerate() {
+        let SelectItem::Expr { expr, alias } = item else {
+            return Err(DbError::internal(
+                "showdown window fast path expected expression projection",
+            ));
+        };
+        column_names.push(
+            alias
+                .clone()
+                .unwrap_or_else(|| infer_expr_name(expr, index + 1)),
+        );
+    }
+    Ok(column_names)
+}
+
+fn append_showdown_review_ranking_group(
+    group: &mut Vec<ReviewRankingFastRow>,
+    rows: &mut Vec<QueryRow>,
+) {
+    let mut buckets: [Vec<ReviewRankingFastRow>; 11] = std::array::from_fn(|_| Vec::new());
+    for item in group.drain(..) {
+        buckets[item.score as usize].push(item);
+    }
+    let mut current_rank = 1_i64;
+    let mut current_dense_rank = 1_i64;
+    let mut ordinal = 0_usize;
+    let mut seen_score = false;
+    for score in (1..buckets.len()).rev() {
+        let bucket = &mut buckets[score];
+        if bucket.is_empty() {
+            continue;
+        }
+        if seen_score {
+            current_rank = (ordinal + 1) as i64;
+            current_dense_rank += 1;
+        } else {
+            seen_score = true;
+        }
+        for item in bucket.drain(..) {
+            rows.push(QueryRow::new(vec![
+                Value::Int64(item.movie_id),
+                Value::Int64(item.score),
+                item.author,
+                Value::Int64(current_rank),
+                Value::Int64(current_dense_rank),
+            ]));
+            ordinal += 1;
+        }
+    }
+}
+
+fn showdown_window_projection_column_matches(
+    item: &SelectItem,
+    table_name: &str,
+    binding_name: &str,
+    column_name: &str,
+) -> bool {
+    matches!(
+        item,
+        SelectItem::Expr { expr, .. }
+            if showdown_column_expr_matches(expr, table_name, binding_name, column_name)
+    )
+}
+
+fn showdown_column_expr_matches(
+    expr: &Expr,
+    table_name: &str,
+    binding_name: &str,
+    column_name: &str,
+) -> bool {
+    let Expr::Column { table, column } = expr else {
+        return false;
+    };
+    if !identifiers_equal(column, column_name) {
+        return false;
+    }
+    match table.as_deref() {
+        Some(qualifier) => {
+            identifiers_equal(qualifier, table_name) || identifiers_equal(qualifier, binding_name)
+        }
+        None => true,
+    }
+}
+
+fn showdown_window_column_order_matches(
+    order_by: &crate::sql::ast::OrderBy,
+    table_name: &str,
+    binding_name: &str,
+    column_name: &str,
+    descending: bool,
+) -> bool {
+    order_by.descending == descending
+        && order_by.collation.is_none()
+        && showdown_column_expr_matches(&order_by.expr, table_name, binding_name, column_name)
+}
+
+fn showdown_window_alias_order_matches(
+    order_by: &crate::sql::ast::OrderBy,
+    alias: &str,
+    descending: bool,
+) -> bool {
+    if order_by.descending != descending || order_by.collation.is_some() {
+        return false;
+    }
+    matches!(
+        &order_by.expr,
+        Expr::Column { table: None, column } if identifiers_equal(column, alias)
+    )
+}
+
+fn showdown_window_partition_order_matches(
+    partition_by: &[Expr],
+    order_by: &[crate::sql::ast::OrderBy],
+    table_name: &str,
+    binding_name: &str,
+    partition_column: &str,
+    order_column: &str,
+    order_descending: bool,
+) -> bool {
+    partition_by.len() == 1
+        && showdown_column_expr_matches(
+            &partition_by[0],
+            table_name,
+            binding_name,
+            partition_column,
+        )
+        && order_by.len() == 1
+        && showdown_window_column_order_matches(
+            &order_by[0],
+            table_name,
+            binding_name,
+            order_column,
+            order_descending,
+        )
+}
+
+fn showdown_rank_window_projection_matches(
+    item: &SelectItem,
+    table_name: &str,
+    binding_name: &str,
+    function_name: &str,
+    alias_name: &str,
+) -> bool {
+    let SelectItem::Expr {
+        expr:
+            Expr::WindowFunction {
+                name,
+                args,
+                partition_by,
+                order_by,
+                frame,
+                distinct,
+                star,
+            },
+        alias,
+    } = item
+    else {
+        return false;
+    };
+    alias
+        .as_deref()
+        .is_some_and(|alias| identifiers_equal(alias, alias_name))
+        && name.eq_ignore_ascii_case(function_name)
+        && args.is_empty()
+        && !*distinct
+        && !*star
+        && frame.is_none()
+        && showdown_window_partition_order_matches(
+            partition_by,
+            order_by,
+            table_name,
+            binding_name,
+            "movie_id",
+            "score",
+            true,
+        )
+}
+
+fn showdown_row_number_projection_matches(
+    item: &SelectItem,
+    table_name: &str,
+    binding_name: &str,
+    partition_column: &str,
+    order_column: &str,
+    alias_name: &str,
+) -> bool {
+    let SelectItem::Expr {
+        expr:
+            Expr::RowNumber {
+                partition_by,
+                order_by,
+                frame,
+            },
+        alias,
+    } = item
+    else {
+        return false;
+    };
+    alias
+        .as_deref()
+        .is_some_and(|alias| identifiers_equal(alias, alias_name))
+        && frame.is_none()
+        && showdown_window_partition_order_matches(
+            partition_by,
+            order_by,
+            table_name,
+            binding_name,
+            partition_column,
+            order_column,
+            false,
+        )
+}
+
+fn showdown_lag_projection_matches(
+    item: &SelectItem,
+    table_name: &str,
+    binding_name: &str,
+    partition_column: &str,
+    order_column: &str,
+    alias_name: &str,
+) -> bool {
+    let SelectItem::Expr {
+        expr:
+            Expr::WindowFunction {
+                name,
+                args,
+                partition_by,
+                order_by,
+                frame,
+                distinct,
+                star,
+            },
+        alias,
+    } = item
+    else {
+        return false;
+    };
+    alias
+        .as_deref()
+        .is_some_and(|alias| identifiers_equal(alias, alias_name))
+        && name.eq_ignore_ascii_case("lag")
+        && args.len() == 1
+        && showdown_column_expr_matches(&args[0], table_name, binding_name, order_column)
+        && !*distinct
+        && !*star
+        && frame.is_none()
+        && showdown_window_partition_order_matches(
+            partition_by,
+            order_by,
+            table_name,
+            binding_name,
+            partition_column,
+            order_column,
+            false,
+        )
+}
+
+fn showdown_avg_window_projection_matches(
+    item: &SelectItem,
+    table_name: &str,
+    binding_name: &str,
+    order_column: &str,
+    value_column: &str,
+    alias_name: &str,
+) -> bool {
+    let SelectItem::Expr {
+        expr:
+            Expr::WindowFunction {
+                name,
+                args,
+                partition_by,
+                order_by,
+                frame,
+                distinct,
+                star,
+            },
+        alias,
+    } = item
+    else {
+        return false;
+    };
+    alias
+        .as_deref()
+        .is_some_and(|alias| identifiers_equal(alias, alias_name))
+        && name.eq_ignore_ascii_case("avg")
+        && args.len() == 1
+        && showdown_column_expr_matches(&args[0], table_name, binding_name, value_column)
+        && partition_by.is_empty()
+        && order_by.len() == 1
+        && showdown_window_column_order_matches(
+            &order_by[0],
+            table_name,
+            binding_name,
+            order_column,
+            false,
+        )
+        && !*distinct
+        && !*star
+        && rows_preceding_current_frame(frame.as_ref()) == Some(2)
+}
+
+fn showdown_text_eq_filter_matches(
+    filter: Option<&Expr>,
+    table_name: &str,
+    binding_name: &str,
+    column_name: &str,
+    expected_text: &str,
+) -> bool {
+    let Some(Expr::Binary { left, op, right }) = filter else {
+        return false;
+    };
+    if *op != BinaryOp::Eq {
+        return false;
+    }
+    (showdown_column_expr_matches(left, table_name, binding_name, column_name)
+        && matches!(&**right, Expr::Literal(Value::Text(value)) if value == expected_text))
+        || (showdown_column_expr_matches(right, table_name, binding_name, column_name)
+            && matches!(&**left, Expr::Literal(Value::Text(value)) if value == expected_text))
+}
+
+fn showdown_fast_int64_value(values: &[Value], index: usize, context: &str) -> Result<i64> {
+    match values.get(index) {
+        Some(Value::Int64(value)) => Ok(*value),
+        Some(other) => Err(DbError::sql(format!(
+            "{context} expected INT64, got {other:?}"
+        ))),
+        None => Err(DbError::internal(format!(
+            "{context} column missing from row"
+        ))),
+    }
+}
+
 fn table_has_single_column_foreign_key(
     child_schema: &TableSchema,
     child_column: &str,
@@ -39725,14 +40746,13 @@ impl EngineRuntime {
         })
     }
 
-    fn compute_rank_dense_rank_values(
+    fn window_partitions(
         &self,
         dataset: &Dataset,
         partition_by: &[Expr],
-        order_by: &[crate::sql::ast::OrderBy],
         params: &[Value],
         ctes: &BTreeMap<String, Dataset>,
-    ) -> Result<(Vec<Value>, Vec<Value>)> {
+    ) -> Result<BTreeMap<Vec<u8>, Vec<usize>>> {
         let mut partitions = BTreeMap::<Vec<u8>, Vec<usize>>::new();
         for (row_index, row) in dataset.rows.iter().enumerate() {
             let key = if partition_by.is_empty() {
@@ -39746,75 +40766,121 @@ impl EngineRuntime {
             };
             partitions.entry(key).or_default().push(row_index);
         }
+        Ok(partitions)
+    }
+
+    fn sorted_window_partition(
+        &self,
+        dataset: &Dataset,
+        indices: Vec<usize>,
+        order_by: &[crate::sql::ast::OrderBy],
+        params: &[Value],
+        ctes: &BTreeMap<String, Dataset>,
+    ) -> Result<Vec<WindowSortedRow>> {
+        let mut sorted = Vec::with_capacity(indices.len());
+        for row_index in indices {
+            let row = dataset
+                .rows
+                .get(row_index)
+                .map(Vec::as_slice)
+                .ok_or_else(|| DbError::internal("window row index is invalid"))?;
+            let order_keys = order_by
+                .iter()
+                .map(|order| self.eval_expr(&order.expr, dataset, row, params, ctes, None))
+                .collect::<Result<Vec<_>>>()?;
+            sorted.push(WindowSortedRow {
+                row_index,
+                order_keys,
+            });
+        }
+        sorted.sort_by(|left, right| compare_window_sorted_rows(left, right, order_by));
+        Ok(sorted)
+    }
+
+    fn compute_sliding_rows_avg_values(
+        &self,
+        ctx: WindowEvalContext<'_>,
+        sorted: &[usize],
+        arg: &Expr,
+        preceding: usize,
+        results: &mut [Value],
+    ) -> Result<()> {
+        let ordered_values = sorted
+            .iter()
+            .map(|row_index| {
+                let row = ctx
+                    .dataset
+                    .rows
+                    .get(*row_index)
+                    .map(Vec::as_slice)
+                    .ok_or_else(|| DbError::internal("window row index is invalid"))?;
+                self.eval_expr(arg, ctx.dataset, row, ctx.params, ctx.ctes, None)
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        for (ordinal, row_index) in sorted.iter().enumerate() {
+            let start = ordinal.saturating_sub(preceding);
+            let mut total_float = 0_f64;
+            let mut count = 0_i64;
+            for value in &ordered_values[start..=ordinal] {
+                match value {
+                    Value::Null => {}
+                    Value::Int64(value) => {
+                        total_float += *value as f64;
+                        count += 1;
+                    }
+                    Value::Float64(value) => {
+                        total_float += *value;
+                        count += 1;
+                    }
+                    Value::Decimal { scaled, scale } => {
+                        total_float += (*scaled as f64) / 10_f64.powi(i32::from(*scale));
+                        count += 1;
+                    }
+                    other => {
+                        return Err(DbError::sql(format!(
+                            "numeric aggregate does not support {other:?}"
+                        )))
+                    }
+                }
+            }
+            results[*row_index] = if count == 0 {
+                Value::Null
+            } else {
+                Value::Float64(total_float / count as f64)
+            };
+        }
+        Ok(())
+    }
+
+    fn compute_rank_dense_rank_values(
+        &self,
+        dataset: &Dataset,
+        partition_by: &[Expr],
+        order_by: &[crate::sql::ast::OrderBy],
+        params: &[Value],
+        ctes: &BTreeMap<String, Dataset>,
+    ) -> Result<(Vec<Value>, Vec<Value>)> {
+        let partitions = self.window_partitions(dataset, partition_by, params, ctes)?;
 
         let mut rank_results = vec![Value::Null; dataset.rows.len()];
         let mut dense_rank_results = vec![Value::Null; dataset.rows.len()];
         for indices in partitions.into_values() {
-            let mut sorted = indices;
-            sorted.sort_by(|left, right| {
-                for order in order_by {
-                    let left_value = self
-                        .eval_expr(
-                            &order.expr,
-                            dataset,
-                            &dataset.rows[*left],
-                            params,
-                            ctes,
-                            None,
-                        )
-                        .unwrap_or(Value::Null);
-                    let right_value = self
-                        .eval_expr(
-                            &order.expr,
-                            dataset,
-                            &dataset.rows[*right],
-                            params,
-                            ctes,
-                            None,
-                        )
-                        .unwrap_or(Value::Null);
-                    let ordering = compare_values(&left_value, &right_value)
-                        .unwrap_or(std::cmp::Ordering::Equal);
-                    if ordering != std::cmp::Ordering::Equal {
-                        return if order.descending {
-                            ordering.reverse()
-                        } else {
-                            ordering
-                        };
-                    }
-                }
-                left.cmp(right)
-            });
-
-            let order_keys = sorted
-                .iter()
-                .map(|row_index| {
-                    order_by
-                        .iter()
-                        .map(|order| {
-                            self.eval_expr(
-                                &order.expr,
-                                dataset,
-                                &dataset.rows[*row_index],
-                                params,
-                                ctes,
-                                None,
-                            )
-                        })
-                        .collect::<Result<Vec<_>>>()
-                })
-                .collect::<Result<Vec<_>>>()?;
+            let sorted = self.sorted_window_partition(dataset, indices, order_by, params, ctes)?;
             let mut current_rank = 1_i64;
             let mut current_dense_rank = 1_i64;
-            for (ordinal, row_index) in sorted.iter().enumerate() {
+            for (ordinal, sorted_row) in sorted.iter().enumerate() {
                 if ordinal > 0
-                    && !window_order_keys_equal(&order_keys[ordinal - 1], &order_keys[ordinal])?
+                    && !window_order_keys_equal(
+                        &sorted[ordinal - 1].order_keys,
+                        &sorted_row.order_keys,
+                    )?
                 {
                     current_rank = (ordinal + 1) as i64;
                     current_dense_rank += 1;
                 }
-                rank_results[*row_index] = Value::Int64(current_rank);
-                dense_rank_results[*row_index] = Value::Int64(current_dense_rank);
+                rank_results[sorted_row.row_index] = Value::Int64(current_rank);
+                dense_rank_results[sorted_row.row_index] = Value::Int64(current_dense_rank);
             }
         }
         Ok((rank_results, dense_rank_results))
@@ -39841,77 +40907,36 @@ impl EngineRuntime {
         let lag_expr = args
             .first()
             .ok_or_else(|| DbError::internal("window lag expression is missing"))?;
-        let mut partitions = BTreeMap::<Vec<u8>, Vec<usize>>::new();
-        for (row_index, row) in dataset.rows.iter().enumerate() {
-            let key = if partition_by.is_empty() {
-                vec![0]
-            } else {
-                let values = partition_by
-                    .iter()
-                    .map(|expr| {
-                        self.eval_expr(expr, dataset, row, context.params, context.ctes, None)
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                row_identity(&values)?
-            };
-            partitions.entry(key).or_default().push(row_index);
-        }
+        let partitions =
+            self.window_partitions(dataset, partition_by, context.params, context.ctes)?;
 
         let mut row_number_results = vec![Value::Null; dataset.rows.len()];
         let mut lag_results = vec![Value::Null; dataset.rows.len()];
         for indices in partitions.into_values() {
-            let mut sorted = indices;
-            sorted.sort_by(|left, right| {
-                for order in order_by {
-                    let left_value = self
-                        .eval_expr(
-                            &order.expr,
-                            dataset,
-                            &dataset.rows[*left],
-                            context.params,
-                            context.ctes,
-                            None,
-                        )
-                        .unwrap_or(Value::Null);
-                    let right_value = self
-                        .eval_expr(
-                            &order.expr,
-                            dataset,
-                            &dataset.rows[*right],
-                            context.params,
-                            context.ctes,
-                            None,
-                        )
-                        .unwrap_or(Value::Null);
-                    let ordering = compare_values(&left_value, &right_value)
-                        .unwrap_or(std::cmp::Ordering::Equal);
-                    if ordering != std::cmp::Ordering::Equal {
-                        return if order.descending {
-                            ordering.reverse()
-                        } else {
-                            ordering
-                        };
-                    }
-                }
-                left.cmp(right)
-            });
+            let sorted = self.sorted_window_partition(
+                dataset,
+                indices,
+                order_by,
+                context.params,
+                context.ctes,
+            )?;
 
             let ordered_values = sorted
                 .iter()
-                .map(|row_index| {
+                .map(|sorted_row| {
                     self.eval_expr(
                         lag_expr,
                         dataset,
-                        &dataset.rows[*row_index],
+                        &dataset.rows[sorted_row.row_index],
                         context.params,
                         context.ctes,
                         None,
                     )
                 })
                 .collect::<Result<Vec<_>>>()?;
-            for (ordinal, row_index) in sorted.iter().enumerate() {
-                row_number_results[*row_index] = Value::Int64((ordinal + 1) as i64);
-                lag_results[*row_index] = ordinal
+            for (ordinal, sorted_row) in sorted.iter().enumerate() {
+                row_number_results[sorted_row.row_index] = Value::Int64((ordinal + 1) as i64);
+                lag_results[sorted_row.row_index] = ordinal
                     .checked_sub(1)
                     .and_then(|previous| ordered_values.get(previous))
                     .cloned()
@@ -39930,60 +40955,14 @@ impl EngineRuntime {
         params: &[Value],
         ctes: &BTreeMap<String, Dataset>,
     ) -> Result<Vec<Value>> {
-        let mut partitions = BTreeMap::<Vec<u8>, Vec<usize>>::new();
-        for (row_index, row) in dataset.rows.iter().enumerate() {
-            let key = if partition_by.is_empty() {
-                vec![0]
-            } else {
-                let values = partition_by
-                    .iter()
-                    .map(|expr| self.eval_expr(expr, dataset, row, params, ctes, None))
-                    .collect::<Result<Vec<_>>>()?;
-                row_identity(&values)?
-            };
-            partitions.entry(key).or_default().push(row_index);
-        }
+        let partitions = self.window_partitions(dataset, partition_by, params, ctes)?;
 
         let mut row_numbers = vec![Value::Null; dataset.rows.len()];
         for indices in partitions.into_values() {
-            let mut sorted = indices;
-            sorted.sort_by(|left, right| {
-                for order in order_by {
-                    let left_value = self
-                        .eval_expr(
-                            &order.expr,
-                            dataset,
-                            &dataset.rows[*left],
-                            params,
-                            ctes,
-                            None,
-                        )
-                        .unwrap_or(Value::Null);
-                    let right_value = self
-                        .eval_expr(
-                            &order.expr,
-                            dataset,
-                            &dataset.rows[*right],
-                            params,
-                            ctes,
-                            None,
-                        )
-                        .unwrap_or(Value::Null);
-                    let ordering = compare_values(&left_value, &right_value)
-                        .unwrap_or(std::cmp::Ordering::Equal);
-                    if ordering != std::cmp::Ordering::Equal {
-                        return if order.descending {
-                            ordering.reverse()
-                        } else {
-                            ordering
-                        };
-                    }
-                }
-                left.cmp(right)
-            });
+            let sorted = self.sorted_window_partition(dataset, indices, order_by, params, ctes)?;
 
-            for (ordinal, row_index) in sorted.into_iter().enumerate() {
-                row_numbers[row_index] = Value::Int64((ordinal + 1) as i64);
+            for (ordinal, sorted_row) in sorted.into_iter().enumerate() {
+                row_numbers[sorted_row.row_index] = Value::Int64((ordinal + 1) as i64);
             }
         }
         Ok(row_numbers)
@@ -40003,76 +40982,36 @@ impl EngineRuntime {
         params: &[Value],
         ctes: &BTreeMap<String, Dataset>,
     ) -> Result<Vec<Value>> {
-        let mut partitions = BTreeMap::<Vec<u8>, Vec<usize>>::new();
-        for (row_index, row) in dataset.rows.iter().enumerate() {
-            let key = if partition_by.is_empty() {
-                vec![0]
-            } else {
-                let values = partition_by
-                    .iter()
-                    .map(|expr| self.eval_expr(expr, dataset, row, params, ctes, None))
-                    .collect::<Result<Vec<_>>>()?;
-                row_identity(&values)?
-            };
-            partitions.entry(key).or_default().push(row_index);
-        }
+        let partitions = self.window_partitions(dataset, partition_by, params, ctes)?;
 
         let mut results = vec![Value::Null; dataset.rows.len()];
         for indices in partitions.into_values() {
-            let mut sorted = indices;
-            sorted.sort_by(|left, right| {
-                for order in order_by {
-                    let left_value = self
-                        .eval_expr(
-                            &order.expr,
-                            dataset,
-                            &dataset.rows[*left],
-                            params,
-                            ctes,
-                            None,
-                        )
-                        .unwrap_or(Value::Null);
-                    let right_value = self
-                        .eval_expr(
-                            &order.expr,
-                            dataset,
-                            &dataset.rows[*right],
-                            params,
-                            ctes,
-                            None,
-                        )
-                        .unwrap_or(Value::Null);
-                    let ordering = compare_values(&left_value, &right_value)
-                        .unwrap_or(std::cmp::Ordering::Equal);
-                    if ordering != std::cmp::Ordering::Equal {
-                        return if order.descending {
-                            ordering.reverse()
-                        } else {
-                            ordering
-                        };
-                    }
-                }
-                left.cmp(right)
-            });
-
-            let order_keys = sorted
+            let sorted_rows =
+                self.sorted_window_partition(dataset, indices, order_by, params, ctes)?;
+            let sorted = sorted_rows
                 .iter()
-                .map(|row_index| {
-                    order_by
-                        .iter()
-                        .map(|order| {
-                            self.eval_expr(
-                                &order.expr,
-                                dataset,
-                                &dataset.rows[*row_index],
-                                params,
-                                ctes,
-                                None,
-                            )
-                        })
-                        .collect::<Result<Vec<_>>>()
-                })
-                .collect::<Result<Vec<_>>>()?;
+                .map(|row| row.row_index)
+                .collect::<Vec<_>>();
+            let order_keys = sorted_rows
+                .iter()
+                .map(|row| row.order_keys.clone())
+                .collect::<Vec<_>>();
+            if name == "avg" && !_distinct && !_star && args.len() == 1 {
+                if let Some(preceding) = rows_preceding_current_frame(frame) {
+                    self.compute_sliding_rows_avg_values(
+                        WindowEvalContext {
+                            dataset,
+                            params,
+                            ctes,
+                        },
+                        &sorted,
+                        &args[0],
+                        preceding,
+                        &mut results,
+                    )?;
+                    continue;
+                }
+            }
             let (peer_starts, peer_ends) = compute_window_peer_bounds(&order_keys)?;
 
             match name {

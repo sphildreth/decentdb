@@ -732,7 +732,7 @@ impl WalHandle {
                 )? {
                     previous
                 } else {
-                    pager.read_page(page_id)?
+                    pager.read_page_from_disk(page_id)?
                 };
                 self.materialize_delta_page_with_scratch(base, &frame.payload)
             }
