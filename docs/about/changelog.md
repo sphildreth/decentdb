@@ -58,6 +58,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   row-id UPSERT checks, paged-manifest chunk metadata reuse, a strict
   integer-series recursive CTE fast path, and a direct literal substring
   `LIKE` projection path.
+- Archived the completed metric-improvement tracker and folded the remaining
+  diagnostic rust-baseline view/fixed-overhead gaps into
+  `design/WIN_PERFORMANCE_IMPROVEMENTS_01.md`.
 
 ### Fixed
 
@@ -261,9 +264,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added regression tests for indexed seek performance on checkpointed/paged
   tables with 300K+ rows, verifying bounded lookup time after checkpoint and
   reopen.
-- Added `design/METRIC_IMPROVEMENTS_PLAN.md` to track DecentDB's current
-  benchmark standing against SQLite and the priority order for closing or
-  exceeding each public-facing metric.
+- Added the now-archived `design/_archive/METRIC_IMPROVEMENTS_PLAN.md` to track
+  DecentDB's benchmark standing against SQLite and the priority order for
+  closing or exceeding each public-facing metric.
 - Added `benchmarks/rust-baseline --benchmark`, which runs `smoke`, `medium`,
   `full`, and `huge` scales in order for the selected engine/profile and then
   generates the HTML report.

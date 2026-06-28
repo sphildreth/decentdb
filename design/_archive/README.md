@@ -17,13 +17,14 @@ Active roadmap, architecture, and validation inputs remain in the parent
 | `2026-05-28.RELEASE_PLANS.md` | Historical release-process reset proposal. Current release behavior should be read from workflows, scripts, and release docs rather than this dated plan. |
 | `2026-06-18_REVIEW.md` | Historical repository and binding review snapshot. The implementation follow-up has been completed and current quality expectations live in `AGENTS.md`, docs, and validation scripts. |
 | `2026-06-18_REVIEW_IMPLEMENTATION_PLAN.md` | Completed implementation plan for the 2026-06-18 review. All phases are marked complete, so it is no longer active planning material. |
-| `2026-06-20-PERF_ISSUES.md` | Historical performance investigation log with many completed phases. Active performance direction now lives in `../METRIC_IMPROVEMENTS_PLAN.md`, `../WIN_PERFORMANCE_IMPROVEMENTS_01.md`, and benchmark docs. |
+| `2026-06-20-PERF_ISSUES.md` | Historical performance investigation log with many completed phases. Active performance direction now lives in `../WIN_PERFORMANCE_IMPROVEMENTS_01.md` and benchmark docs. |
 | `2026-06-20-PERF_ISSUES_PROMPT.md` | Historical coding-agent prompt for a completed performance push. Useful as prompt provenance, but not an active task definition. |
-| `2026-06-PERF_TESTING_RESULTS.md` | Historical benchmark investigation that informed ADR 0195. Current performance evidence should be read from active metric trackers and benchmark outputs. |
+| `2026-06-PERF_TESTING_RESULTS.md` | Historical benchmark investigation that informed ADR 0195. Current performance evidence should be read from `../WIN_PERFORMANCE_IMPROVEMENTS_01.md` and benchmark outputs. |
 | `BRANCH_CHECKS_PRE_PR_PROMPT.md` | Historical agent prompt for pre-PR branch checks. Useful as a checklist seed, but current validation commands live in `AGENTS.md`, `.cargo/config.toml`, and repo scripts. |
 | `COMPARISON_BENCHMARK_PLAN.md` | Historical Python-based embedded database comparison plan. The active benchmark overview is `design/BENCHMARKING_GUIDE.md`; this file preserves the original comparison rationale and workload notes. |
 | `DECENTDB_SHOWCASE_BENCHMARK_PROMPT.md` | Historical prompt template for generating language-specific benchmark showcases. Useful for future sample generation, but not an authoritative design contract. |
 | `DELETE_BATCH.md` | Completed resident cascade/bulk-delete performance design note. ADR 0200 and engine tests are now the active contract; this preserves implementation history and measurements. |
+| `METRIC_IMPROVEMENTS_PLAN.md` | Historical metric tracker. Public chart metrics now beat SQLite across DecentDB profiles in the recorded summary; remaining active diagnostic gaps were folded into `../WIN_PERFORMANCE_IMPROVEMENTS_01.md`. |
 | `RUST_BASELINE_IMPROVEMENTS.md` | Completed rust-baseline improvement plan. The active benchmark surface is now documented in `benchmarks/rust-baseline/README.md` and `../BENCHMARKING_GUIDE.md`. |
 | `RUST_BENCHMARK_PLAN.md` | Historical Rust-native benchmark system proposal. The benchmark crate and `design/BENCHMARKING_GUIDE.md` are now the active references. |
 | `WIN_CONCURRENT_WRITE_ERGONOMICS_PHASED_APPROACH.md` | Delivered implementation plan for the queued SQL/write-queue foundation. Future concurrency prioritization now lives in `design/FUTURE_WINS.md` and ADR 0162. |

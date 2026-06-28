@@ -63,7 +63,7 @@ Do not duplicate work that already belongs elsewhere.
 | Rust music-library baseline | `benchmarks/rust-baseline` | Large deterministic raw-engine diagnostic for realistic joins, views, aggregates, bulk load, and total runtime. | Extend here. This document is about this surface. |
 | Python embedded comparison | `benchmarks/python_embedded_compare` | Cross-runtime and binding-aware comparison across SQLite, DuckDB, DecentDB, JDBC engines, Firebird, LiteDB, and related drivers. | Keep binding and cross-runtime overhead work there. Do not add Python, Node, Go, or .NET binding measurements to rust-baseline. |
 | Agent benchmark loop | `design/AGENT_BENCHMARK_LOOP.md` | Broader desired benchmark taxonomy for commit, cold lookup, recovery, and read-under-write. | Reuse metric semantics where they fit. Do not implement the whole archived taxonomy in one patch. |
-| Metric improvement tracker | `design/METRIC_IMPROVEMENTS_PLAN.md` | Tracks current performance work against public metrics and rust-baseline totals. | Update after benchmark implementation lands and new evidence exists. |
+| Metric improvement tracker | `design/_archive/METRIC_IMPROVEMENTS_PLAN.md` | Historical tracker for public metrics and rust-baseline totals. | Active performance work now lives in `design/WIN_PERFORMANCE_IMPROVEMENTS_01.md`. |
 
 ## Consolidated Findings
 
@@ -272,7 +272,7 @@ Edit `benchmarks/rust-baseline/README.md`.
 5. Move the "Engine memory observation" section out of the README prose:
 
    - Keep a short link-style note:
-     `Memory behavior is tracked in JSON and in design/METRIC_IMPROVEMENTS_PLAN.md.`
+     `Memory behavior is tracked in JSON and in design/WIN_PERFORMANCE_IMPROVEMENTS_01.md.`
    - Do not delete the concern. Preserve it in this document or the metric plan
      after implementation adds structured memory reporting.
 
